@@ -1067,6 +1067,7 @@ class SeqVaeTeb(nn.Module):
         predictions = self.decoder(z)
         
         return {
+            "z": z,
             "predictions": predictions,
             "mu_prior": mu_y,
             "logvar_prior": logvar_y_prior,
