@@ -1,0 +1,68 @@
+general_config:
+  tag: test_runs
+  cuda_devices: [0]
+  train_classifier: False
+  lr: 0.00025
+  lr_milestone: [12000]
+  weight_decay: 0.3
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 10
+  accumulate_grad_batches: 4
+  batch_size:
+    train: 20
+    test: 20
+
+model_config:
+  VAE_model:
+    Y_module_only: False
+    raw_input_size: 4800
+    input_size: 300
+    channel_num: 2
+    input_dim: 76
+    RNN_hidden_dim: 100
+    latent_size: 25
+    num_RNN_layers: 5
+    kld_beta: 0.004
+    freeze_seqvae: False
+    zero_source: True
+
+  seqvae_checkpoint: null
+  base_model_checkpoint: null
+  classification_checkpoint: null
+
+inv_scattering_model:
+  do_inv_st: False
+  inv_st_checkpoint: null
+  train_inv_st: False
+
+folders_config:
+  out_dir_base: output
+
+dataset_config:
+    vae_train_datasets:
+      - hdf5_dataset/hie_cs.hdf5
+    vae_test_datasets:
+      - hdf5_dataset/hie_cs.hdf5
+    stat_path: hdf5_dataset/stats.hdf5
+    dataloader_config:
+      num_workers: 0
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+      # These are for CombinedHDF5Dataset
+      dataset_kwargs:
+        load_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'epoch', 'guid']
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: null
+        label: null
+        cache_size: 2000
+        pin_memory: true
+        trim_minutes: 2.0  # how much to trim from start and end of the signal
+
+seqvae_testing:
+  test_data_dir:
+  test_data_selected_dir:
+  HIE_test_data_dir:
+  test_checkpoint_path: null
