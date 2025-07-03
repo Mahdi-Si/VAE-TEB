@@ -313,8 +313,8 @@ class SeqVAEGraphModel:
             mode="min",
             dirpath=self.model_checkpoint_dir,
             filename="base-model-best-{epoch:02d}-{val/total_loss:.2f}",
-            save_top_k=2,
-            save_last=True,
+            save_top_k=1,
+            save_last=False,
         )
 
         # Callback for plotting losses using Plotly
@@ -994,21 +994,13 @@ class SeqVAEGraphModel:
         self.seqvae_mse_test(test_dataloader, tag='__', device=cuda_device)
 
 
-def main():
+def main(train_SeqVAE=-1, test_SeqVAE=-1):
     np.random.seed(42)
     torch.manual_seed(42)
     sklearn.utils.check_random_state(42)
     start = time.time()
-    parser = argparse.ArgumentParser(description="Train SeqVAE model.")
-    parser.add_argument('--cuda_devices', required=True, default=0, type=int, nargs='+',
-                        help="Cuda devices participating in training")
-    parser.add_argument('--config', type=str, default='model/config.yaml',
-                        help="Path to config file")
-    parser.add_argument('--train_SeqVAE', type=int, default=-1, help="Run the training code")
-    parser.add_argument('--test_SeqVAE', type=int, default=-1, help="Run the test code")
-    args = parser.parse_args()
 
-    config_file_path = args.config
+    config_file_path = 'model/config.yaml'
     project_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     if not os.path.isabs(config_file_path):
         config_file_path = os.path.join(project_root, config_file_path)
@@ -1016,9 +1008,9 @@ def main():
     config_file_path = os.path.normpath(config_file_path)
     if not os.path.exists(config_file_path):
         logger.error(f"Configuration file not found at the resolved path: {config_file_path}")
-        logger.error("This might be because the --config argument is incorrect or the file is missing.")
-        logger.error(f"The default path is 'model/config.yaml'. The argument provided was '{args.config}'.")
-        logger.error("Please check your run configuration in your IDE or your command-line arguments.")
+        logger.error("This might be because the file is missing or the path is incorrect.")
+        logger.error(f"The path was set to 'model/config.yaml'.")
+        logger.error("Please check your project structure and the config path.")
         sys.exit(1)
 
     with open(config_file_path, 'r') as yaml_file:
@@ -1043,8 +1035,8 @@ def main():
     if 'seqvae_testing' in config and 'test_data_dir' in config['seqvae_testing']:
         config['seqvae_testing']['test_data_dir'] = resolve_path(config['seqvae_testing']['test_data_dir'])
     
-    if args.train_SeqVAE > -1:
-        cuda_device_list = args.cuda_devices
+    if train_SeqVAE > -1:
+        cuda_device_list = config['general_config']['cuda_devices']
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
@@ -1057,7 +1049,7 @@ def main():
         # Assuming DDP, these would be set by the environment.
         # Lightning takes care of this, but for create_optimized_dataloader we need them.
         rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = len(cuda_device_list) if len(cuda_device_list) > 0 else 1
+        world_size = len(cuda_device_list) if cuda_device_list and len(cuda_device_list) > 0 else 1
         if world_size > 1 and not dist.is_initialized():
             backend = "gloo" if sys.platform == "win32" else "nccl"
             dist.init_process_group(backend=backend, init_method='env://')
@@ -1091,10 +1083,6 @@ def main():
         graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
         graph_model.create_model()
         graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
-
-
-
-
 
 
 if __name__ == '__main__':

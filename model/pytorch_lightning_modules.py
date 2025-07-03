@@ -465,7 +465,7 @@ class PlottingCallBack(Callback):
                 # Extract predicted means for plotting
                 fhr_st_mean_pred = avg_preds['scattering_mu']
                 fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
-                z_latent = forward_outputs.z.permute(0, 2, 1)[0].detach().cpu().numpy()
+                z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
 
                 # Call the revised plotting function
                 from utils.data_utils import plot_forward_pass
