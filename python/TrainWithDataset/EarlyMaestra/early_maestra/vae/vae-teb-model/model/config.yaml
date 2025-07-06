@@ -41,9 +41,9 @@ folders_config:
 
 dataset_config:
     vae_train_datasets:
-      - hdf5_dataset/hie_cs.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
     vae_test_datasets:
-      - hdf5_dataset/hie_cs.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
     stat_path: hdf5_dataset/stats.hdf5
     dataloader_config:
       num_workers: 0

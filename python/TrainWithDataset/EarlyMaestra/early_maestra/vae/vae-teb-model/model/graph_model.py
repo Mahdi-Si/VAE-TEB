@@ -485,7 +485,10 @@ class SeqVAEGraphModel:
             
             # --- Training Loop ---
             for batch_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Train]", disable=(rank != 0)):
-                y_st, y_ph, x_ph = batch_data[0].to(device), batch_data[1].to(device), batch_data[2].to(device)
+                # Access data using correct HDF5 dataset field names
+                y_st = batch_data.fhr_st.to(device)      # Scattering transform features
+                y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
+                x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
 
                 optimizer.zero_grad()
 
@@ -585,7 +588,10 @@ class SeqVAEGraphModel:
             }
             with torch.no_grad():
                 for batch_data in tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0)):
-                    y_st, y_ph, x_ph = batch_data[0].to(device), batch_data[1].to(device), batch_data[2].to(device)
+                    # Access data using correct HDF5 dataset field names
+                    y_st = batch_data.fhr_st.to(device)      # Scattering transform features
+                    y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
+                    x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
                     
                     # Use mixed precision for validation if available
                     if scaler is not None:
