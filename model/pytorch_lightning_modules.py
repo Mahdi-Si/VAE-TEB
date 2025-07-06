@@ -875,7 +875,11 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def _common_step(self, batch, batch_idx):
         """Common logic for training and validation steps."""
-        y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+        # Access data using correct HDF5 dataset field names  
+        y_st = batch.fhr_st      # Scattering transform features
+        y_ph = batch.fhr_ph      # Phase harmonic features
+        x_ph = batch.fhr_up_ph   # Cross-phase features
+        
         forward_outputs = self.model(y_st, y_ph, x_ph)
         loss_dict = self.model.compute_loss(
             forward_outputs, y_st, y_ph,
