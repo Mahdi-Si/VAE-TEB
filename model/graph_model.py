@@ -434,19 +434,24 @@ class SeqVAEGraphModel:
         """
         logger.info("Setting up PyTorch DDP training for the base model with optimized loss computation...")
 
-        is_distributed = len(self.cuda_devices) > 1
+        is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+
         if is_distributed:
-            rank = dist.get_rank()
-            device = rank
+            # In a distributed setup, device is the local rank
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            device = local_rank
             torch.cuda.set_device(device)
             self.base_model.to(device)
             # Find all buffer tensors and move them to the correct device
             for buffer in self.base_model.buffers():
                 buffer.to(device)
+            # Wrap the model with DDP
             model = DDP(self.base_model, device_ids=[device], find_unused_parameters=False)
+            rank = dist.get_rank()
         else:
+            # For single GPU or CPU
             rank = 0
-            device = f"cuda:{self.cuda_devices[0]}" if self.cuda_devices else "cpu"
+            device = f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu"
             self.base_model.to(device)
             model = self.base_model
 
@@ -1257,6 +1262,19 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
     with open(config_file_path, 'r') as yaml_file:
         config = yaml.safe_load(yaml_file)
     
+    # DDP setup: Initialize process group if launched with torchrun
+    is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
+    if is_ddp:
+        # The 'env://' init method is used by default and reads the DDP env vars
+        # set by torchrun.
+        dist.init_process_group(backend="gloo" if sys.platform == "win32" else "nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        logger.info(f"Initialized DDP on rank {rank}/{world_size}.")
+    else:
+        rank = 0
+        world_size = 1
+
     # Set matmul precision for Tensor Cores
     torch.set_float32_matmul_precision('high')
 
@@ -1286,17 +1304,9 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
-        # For distributed training, rank and world_size are needed.
-        # Assuming DDP, these would be set by the environment.
-        # Lightning takes care of this, but for create_optimized_dataloader we need them.
-        rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = len(cuda_device_list) if cuda_device_list and len(cuda_device_list) > 0 else 1
-        if world_size > 1 and not dist.is_initialized():
-            backend = "gloo" if sys.platform == "win32" else "nccl"
-            dist.init_process_group(backend=backend, init_method='env://')
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-
+        # For distributed training, rank and world_size are now correctly set
+        # before this point. The dataloader will use a DistributedSampler if world_size > 1.
+        
         train_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_train_datasets'],
             batch_size=config['general_config']['batch_size']['train'],
@@ -1325,6 +1335,10 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model.create_model()
         graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
+    # Clean up the process group
+    if is_ddp:
+        dist.destroy_process_group()
+
 
 def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
     """
@@ -1351,6 +1365,19 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
     with open(config_file_path, 'r') as yaml_file:
         config = yaml.safe_load(yaml_file)
     
+    # DDP setup: Initialize process group if launched with torchrun
+    is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
+    if is_ddp:
+        # The 'env://' init method is used by default and reads the DDP env vars
+        # set by torchrun.
+        dist.init_process_group(backend="gloo" if sys.platform == "win32" else "nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        logger.info(f"Initialized DDP on rank {rank}/{world_size}.")
+    else:
+        rank = 0
+        world_size = 1
+
     # Set matmul precision for Tensor Cores
     torch.set_float32_matmul_precision('high')
 
@@ -1380,17 +1407,9 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
-        # For distributed training, rank and world_size are needed.
-        # Assuming DDP, these would be set by the environment.
-        # Lightning takes care of this, but for create_optimized_dataloader we need them.
-        rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = len(cuda_device_list) if cuda_device_list and len(cuda_device_list) > 0 else 1
-        if world_size > 1 and not dist.is_initialized():
-            backend = "gloo" if sys.platform == "win32" else "nccl"
-            dist.init_process_group(backend=backend, init_method='env://')
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-
+        # For distributed training, rank and world_size are now correctly set
+        # before this point. The dataloader will use a DistributedSampler if world_size > 1.
+        
         train_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_train_datasets'],
             batch_size=config['general_config']['batch_size']['train'],
@@ -1419,6 +1438,10 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model.create_model()
         # Use the PyTorch DDP training method instead of PyTorch Lightning
         graph_model.train_base_model_pytorch(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
+
+    # Clean up the process group
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
