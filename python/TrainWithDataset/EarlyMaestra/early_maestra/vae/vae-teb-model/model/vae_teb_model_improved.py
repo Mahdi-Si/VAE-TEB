@@ -1,9 +1,53 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 from typing import Tuple, Optional, Union, Dict
 import math
 import warnings
+
+
+def improved_initialization(model):
+    """
+    Improved initialization scheme for all modules in the model.
+    
+    Args:
+        model: The neural network model to initialize
+    """
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            # Xavier/Glorot normal initialization for linear layers
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Conv1d):
+            # He initialization for convolutional layers
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LSTM):
+            # Orthogonal initialization for LSTM weights
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    # Input-hidden weights: Xavier initialization
+                    nn.init.xavier_normal_(param)
+                elif 'weight_hh' in name:
+                    # Hidden-hidden weights: Orthogonal initialization
+                    nn.init.orthogonal_(param)
+                elif 'bias' in name:
+                    # Initialize biases to zero, except forget gate bias to 1
+                    nn.init.constant_(param, 0)
+                    # Set forget gate bias to 1 for better gradient flow
+                    if 'bias_ih' in name:
+                        hidden_size = param.size(0) // 4
+                        param.data[hidden_size:2*hidden_size].fill_(1.0)
+        elif isinstance(module, nn.LayerNorm):
+            # Standard initialization for layer normalization
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.Embedding):
+            # Normal initialization for embeddings
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
 
@@ -26,10 +70,10 @@ class CausalConv1d(nn.Module):
         self.left_padding = (kernel_size - 1) * dilation
 
         # Use grouped convolution for efficiency when possible
-        self.conv = nn.Conv1d(
+        self.conv = spectral_norm(nn.Conv1d(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=0, dilation=dilation, bias=bias, groups=groups
-        )
+        ))
 
         # Pre-allocate padding tensor for efficiency
         self.register_buffer('padding_zeros', torch.zeros(1, in_channels, self.left_padding))
@@ -73,20 +117,20 @@ class CausalResidualBlock(nn.Module):
         # Efficient depthwise + pointwise convolution option
         if use_depthwise:
             self.conv1 = CausalConv1d(channels, channels, kernel_size, groups=channels, dilation=dilation)
-            self.pointwise1 = nn.Conv1d(channels, self.expansion_channels, 1)
+            self.pointwise1 = spectral_norm(nn.Conv1d(channels, self.expansion_channels, 1))
             self.conv2 = CausalConv1d(self.expansion_channels, self.expansion_channels, kernel_size, groups=self.expansion_channels, dilation=dilation)
-            self.pointwise2 = nn.Conv1d(self.expansion_channels, channels, 1)
+            self.pointwise2 = spectral_norm(nn.Conv1d(self.expansion_channels, channels, 1))
         else:
             self.conv1 = CausalConv1d(channels, self.expansion_channels, kernel_size, dilation=dilation)
             self.conv2 = CausalConv1d(self.expansion_channels, channels, kernel_size, dilation=dilation)
 
         # GLU (Gated Linear Unit) for efficient gating
-        self.gate_linear = nn.Linear(channels, channels)
+        self.gate_linear = spectral_norm(nn.Linear(channels, channels))
 
         self.dropout = nn.Dropout(dropout)
 
         # Skip connection projection if needed
-        self.skip_proj = nn.Linear(channels, channels) if expansion_factor != 1.0 else nn.Identity()
+        self.skip_proj = spectral_norm(nn.Linear(channels, channels)) if expansion_factor != 1.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -138,7 +182,7 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden_dim = out_dim * hidden_dim_factor
         self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
+            spectral_norm(nn.Linear(in_dim, out_dim)),
             activation(),
             nn.Dropout(dropout),
             # nn.Linear(hidden_dim, out_dim),
@@ -165,7 +209,7 @@ class ResidualMLP(nn.Module):
         dims = [input_dim, *hidden_dims]
         for i in range(len(hidden_dims)):
             layers += [
-                nn.Linear(dims[i], dims[i+1]),
+                spectral_norm(nn.Linear(dims[i], dims[i+1])),
                 nn.LayerNorm(dims[i+1]),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -175,7 +219,7 @@ class ResidualMLP(nn.Module):
         # if input_dim ≠ final hidden_dims[-1], project it
         final_dim = hidden_dims[-1]
         if input_dim != final_dim:
-            self.skip_proj = nn.Linear(input_dim, final_dim)
+            self.skip_proj = spectral_norm(nn.Linear(input_dim, final_dim))
         else:
             self.skip_proj = nn.Identity()
 
@@ -300,7 +344,7 @@ class TargetEncoder(nn.Module):
         # Final projection to target dimension
         layers.append(nn.Sequential(
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, output_dim),
+            spectral_norm(nn.Linear(input_dim, output_dim)),
             nn.GELU(),
             nn.Dropout(dropout)
         ))
@@ -476,7 +520,7 @@ class SourceEncoder(nn.Module):
         # Final projection to target dimension
         layers.append(nn.Sequential(
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, output_dim),
+            spectral_norm(nn.Linear(input_dim, output_dim)),
             nn.GELU(),
             nn.Dropout(dropout)
         ))
@@ -634,23 +678,23 @@ class ConditionalEncoder(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Professional VAE decoder for multi-modal future prediction with uncertainty quantification.
+    Professional VAE decoder for multi-modal future prediction with mean-only output.
     
     This decoder uses only linear layers, LSTM, and causal convolutions (no transformers).
-    Designed by a deep learning expert with 100+ years of experience, incorporating:
+    Simplified architecture for better stability and accuracy:
     
     Architecture:
     1. **Dual-Path Processing:** Linear + Causal convolution paths with residual fusion
     2. **Bidirectional LSTM:** Captures complex temporal dependencies 
     3. **Multi-Layer Prediction Head:** Deep MLP with layer normalization and skip connections
-    4. **Uncertainty Quantification:** Separate heads for mu and logvar with proper regularization
+    4. **Mean-Only Prediction:** Single output head for deterministic predictions
     5. **Professional Design:** Layer norm, dropout, skip connections, and proper initialization
     
     Key Features:
     - Causal temporal convolutions with exponential dilation
     - Bidirectional LSTM for rich temporal modeling
     - Multi-path feature fusion with learnable weights
-    - Uncertainty-aware prediction with temperature scaling
+    - Simplified prediction with mean-only output
     - Gradient-friendly architecture with skip connections
     """
     
@@ -685,59 +729,57 @@ class Decoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_bidirectional = use_bidirectional
         
-        # Input processing with dual paths
-        self.linear_path = ResidualMLP(latent_dim, (147, 230, 313, 396, 480), dropout=dropout, final_activation=True)
+        # Simplified input processing with smaller dimensions
+        self.linear_path = ResidualMLP(latent_dim, (96, 128, 160), dropout=dropout, final_activation=True)
         
-        # Causal convolution paths for multiple kernel sizes
+        # Simplified causal convolution paths
         if not isinstance(tcn_kernel_size, list):
             tcn_kernel_size = [tcn_kernel_size]
         
         self.conv_paths = nn.ModuleList([
-            self._build_causal_conv_path(64, 120, tcn_num_layers, ks, dropout)
+            self._build_causal_conv_path(latent_dim, 80, tcn_num_layers, ks, dropout)
             for ks in tcn_kernel_size
         ])
 
         num_conv_paths = len(tcn_kernel_size)
-        self.conv_fusion = ResidualMLP(input_dim=120*num_conv_paths, hidden_dims=(120*num_conv_paths, 120*num_conv_paths), dropout=dropout, final_activation=True)
+        self.conv_fusion = ResidualMLP(input_dim=80*num_conv_paths, hidden_dims=(160, 160), dropout=dropout, final_activation=True)
         
-        # Path fusion
-        self.path_fusion = ResidualMLP(input_dim=480*2, hidden_dims=(1043, 1126, 1209, 1292), dropout=dropout, final_activation=True)
+        # Simplified path fusion
+        self.path_fusion = ResidualMLP(input_dim=320, hidden_dims=(256, 192), dropout=dropout, final_activation=True)
         
         # Bidirectional LSTM for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=1292,
-            hidden_size=1292,
+            input_size=192,
+            hidden_size=256,
             num_layers=lstm_num_layers,
             batch_first=True,
             dropout=dropout if lstm_num_layers > 1 else 0,
             bidirectional=use_bidirectional
         )
         
-        lstm_output_dim = 1292 * (2 if use_bidirectional else 1)
+        lstm_output_dim = 256 * (2 if use_bidirectional else 1)
         
         # Post-LSTM processing
-        self.post_lstm = ResidualMLP(input_dim=1292, hidden_dims=(1375, 1458, 1541, 1624), dropout=dropout, final_activation=True)
+        self.post_lstm = ResidualMLP(input_dim=lstm_output_dim, hidden_dims=(384, 320, 256), dropout=dropout, final_activation=True)
         
         # Prediction head
-        self.prediction_head = ResidualMLP(input_dim=1624, hidden_dims=(1707, 1790, 1873, 1956), dropout=dropout, final_activation=True)
+        self.prediction_head = ResidualMLP(input_dim=256, hidden_dims=(192, 160, 128), dropout=dropout, final_activation=True)
         
         # Output dimensions
         output_size = prediction_horizon * output_channels
         
-        # Scattering transform prediction heads
-        self.scattering_mu_head = ResidualMLP(input_dim=1956, hidden_dims=(2037, 2118, 2199, 2280), dropout=dropout, final_activation=False)
+        # Simplified prediction heads - mean only
+        self.scattering_head = ResidualMLP(input_dim=128, hidden_dims=(output_size,), dropout=dropout, final_activation=False)
         
-        self.scattering_logvar_head = ResidualMLP(input_dim=1956, hidden_dims=(2037, 2118, 2199, 2280), dropout=dropout, final_activation=False)
-        
-        # Phase harmonic prediction heads
-        self.phase_mu_head = ResidualMLP(input_dim=1956, hidden_dims=(2037, 2118, 2199, 2280), dropout=dropout, final_activation=False)
-        
-        self.phase_logvar_head = ResidualMLP(input_dim=1956, hidden_dims=(2037, 2118, 2199, 2280), dropout=dropout, final_activation=False)
+        self.phase_head = ResidualMLP(input_dim=128, hidden_dims=(output_size,), dropout=dropout, final_activation=False)
         
     def _build_causal_conv_path(self, input_dim: int, output_dim: int, num_layers: int, kernel_size: int, dropout: float):
-        """Build causal convolution path with residual blocks."""
+        """Build simplified causal convolution path with residual blocks."""
         layers = []
         current_dim = input_dim
+        
+        # Reduce number of layers for simplicity
+        num_layers = min(num_layers, 2)
         
         for i in range(num_layers):
             dilation = 2 ** i
@@ -747,7 +789,7 @@ class Decoder(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     dropout=dropout,
-                    expansion_factor=1.5,
+                    expansion_factor=1.2,
                     use_depthwise=True
                 )
             )
@@ -756,7 +798,7 @@ class Decoder(nn.Module):
         if current_dim != output_dim:
             layers.append(nn.Sequential(
                 nn.LayerNorm(current_dim),
-                nn.Linear(current_dim, output_dim),
+                spectral_norm(nn.Linear(current_dim, output_dim)),
                 nn.GELU(),
                 nn.Dropout(dropout)
             ))
@@ -771,11 +813,9 @@ class Decoder(nn.Module):
             z: Latent representation tensor (batch_size, sequence_length, latent_dim)
             
         Returns:
-            Dictionary containing predicted parameters for each modality:
-            - scattering_mu: (batch_size, sequence_length, prediction_horizon, output_channels)
-            - scattering_logvar: (batch_size, sequence_length, prediction_horizon, output_channels)
-            - phase_harmonic_mu: (batch_size, sequence_length, prediction_horizon, output_channels)
-            - phase_harmonic_logvar: (batch_size, sequence_length, prediction_horizon, output_channels)
+            Dictionary containing predicted means for each modality:
+            - scattering_pred: (batch_size, sequence_length, prediction_horizon, output_channels)
+            - phase_harmonic_pred: (batch_size, sequence_length, prediction_horizon, output_channels)
         """
         B, S, _ = z.shape
         H, C = self.prediction_horizon, self.output_channels
@@ -801,61 +841,51 @@ class Decoder(nn.Module):
         # Prediction head
         pred_features = self.prediction_head(processed)  # (B, S, hidden_dim)
         
-        # Generate predictions for each modality
-        scatter_mu = self.scattering_mu_head(pred_features)      # (B, S, H*C)
-        scatter_logvar = self.scattering_logvar_head(pred_features)  # (B, S, H*C)
-        phase_mu = self.phase_mu_head(pred_features)            # (B, S, H*C)
-        phase_logvar = self.phase_logvar_head(pred_features)    # (B, S, H*C)
-        
-        # Clamp logvar for numerical stability
-        scatter_logvar = torch.clamp(scatter_logvar, min=-10.0, max=10.0)
-        phase_logvar = torch.clamp(phase_logvar, min=-10.0, max=10.0)
+        # Generate mean predictions for each modality
+        scatter_pred = self.scattering_head(pred_features)      # (B, S, H*C)
+        phase_pred = self.phase_head(pred_features)            # (B, S, H*C)
         
         # Reshape to include prediction horizon dimension
         predictions = {
-            "scattering_mu": scatter_mu.view(B, S, H, C),
-            "scattering_logvar": scatter_logvar.view(B, S, H, C),
-            "phase_harmonic_mu": phase_mu.view(B, S, H, C),
-            "phase_harmonic_logvar": phase_logvar.view(B, S, H, C)
+            "scattering_pred": scatter_pred.view(B, S, H, C),
+            "phase_harmonic_pred": phase_pred.view(B, S, H, C)
         }
         
         return predictions
     
-    def _gaussian_nll(self, mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _mse_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Compute Gaussian negative log-likelihood loss with numerical stability.
+        Compute Mean Squared Error loss.
         
         Args:
-            mu: Predicted mean
-            logvar: Predicted log variance
+            pred: Predicted values
             target: Ground truth target
             
         Returns:
-            Negative log-likelihood loss
+            MSE loss
         """
-        # Ensure numerical stability
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
-        
-        # Compute NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-        nll = 0.5 * (logvar + (target - mu).pow(2) / logvar.exp())
-        return nll.mean()
+        return F.mse_loss(pred, target)
     
     def compute_loss(self,
                      predictions: Dict[str, torch.Tensor],
                      target_scattering: torch.Tensor,
                      target_phase: torch.Tensor,
-                     warmup_period: int) -> Dict[str, torch.Tensor]:
+                     warmup_period: int,
+                     compute_scattering_loss: bool = True,
+                     compute_phase_loss: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Compute Gaussian negative log-likelihood loss with numerical stability.
+        Compute Mean Squared Error loss for mean-only predictions with selective computation.
         
         Args:
-            predictions: Dictionary of predicted parameters from forward pass
+            predictions: Dictionary of predicted means from forward pass
             target_scattering: Ground truth scattering transform (B, S, C)
             target_phase: Ground truth phase harmonic (B, S, C) 
             warmup_period: Number of initial timesteps to ignore
+            compute_scattering_loss: Whether to compute scattering loss
+            compute_phase_loss: Whether to compute phase loss
             
         Returns:
-            Negative log-likelihood loss
+            MSE loss dictionary with selective computation
         """
         S = target_scattering.shape[1]
         H = self.prediction_horizon
@@ -874,10 +904,8 @@ class Decoder(nn.Module):
             }
         
         # Extract predictions for valid range
-        pred_scatter_mu = predictions['scattering_mu'][:, start_idx:end_idx]
-        pred_scatter_logvar = predictions['scattering_logvar'][:, start_idx:end_idx]
-        pred_phase_mu = predictions['phase_harmonic_mu'][:, start_idx:end_idx]
-        pred_phase_logvar = predictions['phase_harmonic_logvar'][:, start_idx:end_idx]
+        pred_scatter = predictions['scattering_pred'][:, start_idx:end_idx]
+        pred_phase = predictions['phase_harmonic_pred'][:, start_idx:end_idx]
         
         # Create target windows efficiently
         def create_target_windows(target_tensor: torch.Tensor) -> torch.Tensor:
@@ -898,10 +926,19 @@ class Decoder(nn.Module):
         true_scatter_windows = create_target_windows(target_scattering)[:, start_idx:end_idx]
         true_phase_windows = create_target_windows(target_phase)[:, start_idx:end_idx]
         
-        # Compute losses
-        scattering_loss = self._gaussian_nll(pred_scatter_mu, pred_scatter_logvar, true_scatter_windows)
-        phase_loss = self._gaussian_nll(pred_phase_mu, pred_phase_logvar, true_phase_windows)
+        # Initialize losses
+        device = target_scattering.device
+        scattering_loss = torch.tensor(0.0, device=device)
+        phase_loss = torch.tensor(0.0, device=device)
         
+        # Compute losses selectively
+        if compute_scattering_loss:
+            scattering_loss = self._mse_loss(pred_scatter, true_scatter_windows)
+        
+        if compute_phase_loss:
+            phase_loss = self._mse_loss(pred_phase, true_phase_windows)
+        
+        # Total loss is sum of computed losses
         total_loss = scattering_loss + phase_loss
         
         return {
@@ -920,10 +957,8 @@ class Decoder(nn.Module):
             
         Returns:
             Dictionary containing predictions at the specified index:
-            - scattering_mu: (B, prediction_horizon, output_channels)
-            - scattering_logvar: (B, prediction_horizon, output_channels)
-            - phase_harmonic_mu: (B, prediction_horizon, output_channels)
-            - phase_harmonic_logvar: (B, prediction_horizon, output_channels)
+            - scattering_pred: (B, prediction_horizon, output_channels)
+            - phase_harmonic_pred: (B, prediction_horizon, output_channels)
         """
         if not (0 <= index < z.shape[1]):
             raise IndexError(f"Index {index} out of bounds for sequence length {z.shape[1]}")
@@ -1017,19 +1052,34 @@ class SeqVaeTeb(nn.Module):
             latent_dim=latent_dim_z, output_channels=input_channels,
             prediction_horizon=prediction_horizon, **decoder_params
         )
+        
+        # Apply improved initialization to all modules
+        improved_initialization(self)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Applies the reparameterization trick to sample from a Gaussian."""
+        """Applies the reparameterization trick to sample from a Gaussian with numerical stability."""
+        # Clamp logvar to prevent numerical instability
+        logvar = torch.clamp(logvar, min=-10, max=10)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def _kld_loss(self, mu_prior: torch.Tensor, logvar_prior: torch.Tensor, 
                   mu_post: torch.Tensor, logvar_post: torch.Tensor) -> torch.Tensor:
-        """Computes the KL divergence between two Gaussian distributions."""
-        kld = logvar_post - logvar_prior - 1 + (logvar_prior.exp() + (mu_prior - mu_post).pow(2)) / logvar_post.exp()
-        kld = 0.5 * kld.sum(dim=-1)
-        return kld.mean()
+        """Computes the KL divergence between two Gaussian distributions with numerical stability."""
+        # Clamp logvar to prevent numerical instability
+        logvar_prior = torch.clamp(logvar_prior, min=-10, max=10)
+        logvar_post = torch.clamp(logvar_post, min=-10, max=10)
+        
+        # More numerically stable KLD computation
+        # KL(q||p) = 0.5 * [log(σ²_p/σ²_q) - 1 + σ²_q/σ²_p + (μ_p - μ_q)²/σ²_p]
+        var_ratio = (logvar_post - logvar_prior).exp()  # σ²_q/σ²_p
+        mu_diff_sq = (mu_prior - mu_post).pow(2)
+        var_prior = logvar_prior.exp()
+        
+        kld = 0.5 * (logvar_prior - logvar_post - 1 + var_ratio + mu_diff_sq / (var_prior + 1e-8))
+        kld = kld.sum(dim=-1)  # Sum over latent dimensions
+        return kld.mean()  # Average over batch and sequence
 
     def forward(self, y_st: torch.Tensor, y_ph: torch.Tensor, x_ph: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -1076,14 +1126,20 @@ class SeqVaeTeb(nn.Module):
         }
 
     def compute_loss(self, forward_outputs: Dict[str, torch.Tensor], 
-                     y_st: torch.Tensor, y_ph: torch.Tensor) -> Dict[str, torch.Tensor]:
+                     y_st: torch.Tensor, y_ph: torch.Tensor,
+                     compute_scattering_loss: bool = False,
+                     compute_phase_loss: bool = False,
+                     compute_kld_loss: bool = False) -> Dict[str, torch.Tensor]:
         """
-        Computes the total training loss.
+        Computes the total training loss with selective computation.
         
         Args:
             forward_outputs: The dictionary returned by the forward pass.
             y_st: Ground truth target scattering data (B, C, L).
             y_ph: Ground truth target phase harmonic data (B, C, L).
+            compute_scattering_loss: Whether to compute scattering reconstruction loss
+            compute_phase_loss: Whether to compute phase reconstruction loss
+            compute_kld_loss: Whether to compute KLD loss
             
         Returns:
             A dictionary of computed losses (total, reconstruction, KLD).
@@ -1092,32 +1148,45 @@ class SeqVaeTeb(nn.Module):
         y_st = y_st.permute(0, 2, 1)
         y_ph = y_ph.permute(0, 2, 1)
 
-        # Reconstruction loss
-        recon_loss_dict = self.decoder.compute_loss(
-            forward_outputs["predictions"],
-            target_scattering=y_st,
-            target_phase=y_ph,
-            warmup_period=self.warmup_period
-        )
-        recon_loss = recon_loss_dict['total_loss']
+        # Initialize losses
+        device = y_st.device
+        recon_loss = torch.tensor(0.0, device=device)
+        kld_loss = torch.tensor(0.0, device=device)
+        scattering_loss = torch.tensor(0.0, device=device)
+        phase_loss = torch.tensor(0.0, device=device)
         
-        # KLD loss
-        kld_loss = self._kld_loss(
-            mu_prior=forward_outputs["mu_prior"],
-            logvar_prior=forward_outputs["logvar_prior"],
-            mu_post=forward_outputs["mu_post"],
-            logvar_post=forward_outputs["logvar_post"]
-        )
+        # Compute reconstruction loss selectively
+        if compute_scattering_loss or compute_phase_loss:
+            recon_loss_dict = self.decoder.compute_loss(
+                forward_outputs["predictions"],
+                target_scattering=y_st,
+                target_phase=y_ph,
+                warmup_period=self.warmup_period,
+                compute_scattering_loss=compute_scattering_loss,
+                compute_phase_loss=compute_phase_loss
+            )
+            recon_loss = recon_loss_dict['total_loss']
+            scattering_loss = recon_loss_dict['scattering_loss']
+            phase_loss = recon_loss_dict['phase_loss']
         
-        # Total loss
+        # Compute KLD loss selectively
+        if compute_kld_loss:
+            kld_loss = self._kld_loss(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"]
+            )
+        
+        # Total loss is sum of computed losses
         total_loss = recon_loss + self.kld_beta * kld_loss
         
         return {
             "total_loss": total_loss,
             "reconstruction_loss": recon_loss,
             "kld_loss": kld_loss,
-            "scattering_loss": recon_loss_dict.get('scattering_loss', torch.tensor(0.0)),
-            "phase_loss": recon_loss_dict.get('phase_loss', torch.tensor(0.0))
+            "scattering_loss": scattering_loss,
+            "phase_loss": phase_loss
         }
 
     def get_average_predictions(self, forward_outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1136,12 +1205,12 @@ class SeqVaeTeb(nn.Module):
                              contains the multi-step predictions.
 
         Returns:
-            A dictionary containing four tensors of averaged predictions, each with
+            A dictionary containing two tensors of averaged predictions, each with
             shape (batch_size, sequence_length, channels).
         """
         predictions = forward_outputs["predictions"]
-        B, S, H, C = predictions['scattering_mu'].shape
-        device = predictions['scattering_mu'].device
+        B, S, H, C = predictions['scattering_pred'].shape
+        device = predictions['scattering_pred'].device
 
         avg_preds = {}
         for key in predictions:
@@ -1181,7 +1250,7 @@ class SeqVaeTeb(nn.Module):
                 # Replace the warmup part of the predictions
                 avg_pred_tensor[:, :self.warmup_period, :] = warmup_preds
 
-            avg_preds[key.replace('_logvar', '_std')] = avg_pred_tensor
+            avg_preds[key] = avg_pred_tensor
 
         return avg_preds
 
@@ -1201,27 +1270,39 @@ if __name__ == "__main__":
         sequence_length=seq_len,
         prediction_horizon=prediction_horizon,
         warmup_period=warmup_period,
-        kld_beta=1.0
+        kld_beta=0.1  # Reduced from 1.0 to prevent overwhelming reconstruction loss
     )
     print("Model initialized successfully.")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Create Dummy Data ---
-    y_st_input = torch.randn(batch_size, seq_len, channels)
-    y_ph_input = torch.randn(batch_size, seq_len, channels)
-    x_ph_input = torch.randn(batch_size, seq_len, channels)
-    print(f"\nInput shapes: ({batch_size}, {seq_len}, {channels})")
+    y_st_input = torch.randn(batch_size, channels, seq_len)  # Note: (B, C, L) format
+    y_ph_input = torch.randn(batch_size, channels, seq_len)
+    x_ph_input = torch.randn(batch_size, channels, seq_len)
+    print(f"\nInput shapes: ({batch_size}, {channels}, {seq_len})")
+
+    # --- Test Forward Pass ---
+    print("\n--- Testing Forward Pass ---")
+    model.eval()
+    with torch.no_grad():
+        forward_outputs = model(y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input)
+        predictions = forward_outputs["predictions"]
+        print(f"Scattering predictions shape: {predictions['scattering_pred'].shape}")
+        print(f"Phase harmonic predictions shape: {predictions['phase_harmonic_pred'].shape}")
+        print(f"Latent z shape: {forward_outputs['z'].shape}")
+        
+        # Test average predictions
+        avg_preds = model.get_average_predictions(forward_outputs)
+        print(f"Average scattering predictions shape: {avg_preds['scattering_pred'].shape}")
+        print(f"Average phase harmonic predictions shape: {avg_preds['phase_harmonic_pred'].shape}")
 
     # --- Simple Training Loop ---
     print("\n--- Starting Simple Training Loop ---")
+    model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     num_epochs = 5
 
     for epoch in range(num_epochs):
-        model.train()  # Set the model to training mode
-
-        # In a real training loop, you would load a new batch of data here
-        # For this example, we reuse the same dummy data batch
-
         # 1. Zero the gradients
         optimizer.zero_grad()
 
@@ -1232,23 +1313,58 @@ if __name__ == "__main__":
         loss_dict = model.compute_loss(
             forward_outputs,
             y_st=y_st_input,
-            y_ph=y_ph_input
+            y_ph=y_ph_input,
+            compute_scattering_loss=True,
+            compute_phase_loss=True,
+            compute_kld_loss=True
         )
         total_loss = loss_dict['total_loss']
+        
+        # 4. Check for NaN
+        if torch.isnan(total_loss):
+            print(f"NaN detected at epoch {epoch+1}! Stopping training.")
+            break
 
-        # 4. Backward pass
+        # 5. Backward pass
         total_loss.backward()
+        
+        # 6. Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        # 5. Update weights
+        # 7. Update weights
         optimizer.step()
 
         print(
             f"Epoch [{epoch+1}/{num_epochs}], "
             f"Total Loss: {loss_dict['total_loss']:.4f}, "
             f"Recon Loss: {loss_dict['reconstruction_loss']:.4f}, "
+            f"Scattering Loss: {loss_dict['scattering_loss']:.4f}, "
+            f"Phase Loss: {loss_dict['phase_loss']:.4f}, "
             f"KLD Loss: {loss_dict['kld_loss']:.4f}"
         )
 
     print("--- Training loop finished ---")
+    print("\n--- Testing Individual Decoder ---")
+    
+    # Test standalone decoder
+    decoder = Decoder(
+        latent_dim=64,
+        output_channels=channels,
+        prediction_horizon=prediction_horizon
+    )
+    
+    # Test with random latent input
+    z_test = torch.randn(batch_size, seq_len, 64)
+    decoder_output = decoder(z_test)
+    print(f"Decoder scattering output shape: {decoder_output['scattering_pred'].shape}")
+    print(f"Decoder phase output shape: {decoder_output['phase_harmonic_pred'].shape}")
+    
+    # Test decoder loss computation
+    target_scatter = torch.randn(batch_size, seq_len, channels)
+    target_phase = torch.randn(batch_size, seq_len, channels)
+    decoder_loss = decoder.compute_loss(decoder_output, target_scatter, target_phase, warmup_period)
+    print(f"Decoder MSE loss: {decoder_loss['total_loss']:.4f}")
+    
+    print("\n--- All tests completed successfully! ---")
 
 

@@ -35,7 +35,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from vae_teb_model import SeqVaeTeb
+from vae_teb_model_improved import SeqVaeTeb
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -445,45 +445,50 @@ class PlottingCallBack(Callback):
         self.plot_every_epoch = plot_every_epoch
         self.input_channel_num = input_channel_num
 
-    def on_train_batch_end(self, pl_trainer, pl_module, outputs, batch, batch_idx, window=None):
-        if pl_trainer.current_epoch % self.plot_every_epoch == 0 and batch_idx == 0 and pl_trainer.is_global_zero:
-            # Check if we are using the new LightSeqVaeTeb model
+    def on_validation_epoch_end(self, pl_trainer, pl_module):
+        if pl_trainer.current_epoch % self.plot_every_epoch != 0 or not pl_trainer.is_global_zero:
+            return
+
+        # Fetch a single batch from the validation dataloader
+        val_dataloader = pl_trainer.datamodule.val_dataloader() if hasattr(pl_trainer.datamodule, 'val_dataloader') else pl_trainer.val_dataloaders[0]
+        try:
+            batch = next(iter(val_dataloader))
+        except StopIteration:
+            logger.warning("Could not get a batch from validation dataloader for plotting.")
+            return
+
+        # Ensure batch is on the correct device
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, 0)
+
+        pl_module.eval()
+        with torch.no_grad():
             if not isinstance(pl_module, LightSeqVaeTeb):
-                return  # Or handle old plotting logic here if needed
+                return
 
-            pl_module.eval()
-            with torch.no_grad():
-                # Inputs for the model
-                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+            y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+            forward_outputs = pl_module.model(y_st, y_ph, x_ph)
+            avg_preds = pl_module.model.get_average_predictions(forward_outputs)
 
-                # Get model outputs
-                forward_outputs = pl_module.model(y_st, y_ph, x_ph)
-                
-                # get_average_predictions is now a method of the model
-                avg_preds = pl_module.model.get_average_predictions(forward_outputs)
+            fhr_st_mean_pred = avg_preds['scattering_mu']
+            fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
+            z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
 
-                # Extract predicted means for plotting
-                fhr_st_mean_pred = avg_preds['scattering_mu']
-                fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
-                z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
+            from utils.data_utils import plot_forward_pass
+            plot_forward_pass(
+                raw_fhr=batch.fhr[0].detach().cpu().numpy(),
+                raw_up=batch.up[0].detach().cpu().numpy(),
+                fhr_st=y_st[0].detach().cpu().numpy(),
+                fhr_ph=y_ph[0].detach().cpu().numpy(),
+                fhr_st_mean_pred=fhr_st_mean_pred[0].detach().cpu().numpy(),
+                fhr_ph_mean_pred=fhr_ph_mean_pred[0].detach().cpu().numpy(),
+                z_latent=z_latent,
+                plot_dir=self.output_dir,
+                plot_title=f"GUID: {batch.guid[0]}, Epoch: {batch.epoch[0].item()}",
+                tag=f'e-{pl_trainer.current_epoch}'
+            )
+            plt.close('all')
 
-                # Call the revised plotting function
-                from utils.data_utils import plot_forward_pass
-                plot_forward_pass(
-                    raw_fhr=batch.fhr[0].detach().cpu().numpy(),
-                    raw_up=batch.up[0].detach().cpu().numpy(),
-                    fhr_st=y_st[0].detach().cpu().numpy(),
-                    fhr_ph=y_ph[0].detach().cpu().numpy(),
-                    fhr_st_mean_pred=fhr_st_mean_pred[0].detach().cpu().numpy(),
-                    fhr_ph_mean_pred=fhr_ph_mean_pred[0].detach().cpu().numpy(),
-                    z_latent=z_latent,
-                    plot_dir=self.output_dir,
-                    plot_title=f"GUID: {batch.guid[0]}, Epoch: {batch.epoch[0].item()}",
-                    tag=f'e-{pl_trainer.current_epoch}_b_{batch_idx}'
-                )
-                plt.close('all')
-
-            pl_module.train()
+        pl_module.train()
 
 
 
@@ -872,7 +877,12 @@ class LightSeqVaeTeb(L.LightningModule):
         """Common logic for training and validation steps."""
         y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
         forward_outputs = self.model(y_st, y_ph, x_ph)
-        loss_dict = self.model.compute_loss(forward_outputs, y_st, y_ph)
+        loss_dict = self.model.compute_loss(
+            forward_outputs, y_st, y_ph,
+            compute_scattering_loss=True,
+            compute_phase_loss=True,
+            compute_kld_loss=True
+        )
         return loss_dict
 
     def training_step(self, batch, batch_idx):
