@@ -652,34 +652,54 @@ class SeqVAEGraphModel:
                     val_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
                     val_loss_dict['total_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss'] + kld_loss_dict['kld_loss']).item()
             
+            # Create tensors of the summed losses for this process
+            train_losses_local = torch.tensor(list(train_loss_dict.values()), device=device)
+            val_losses_local = torch.tensor(list(val_loss_dict.values()), device=device)
+
+            # Sum losses across all processes
+            if is_distributed:
+                dist.all_reduce(train_losses_local, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_losses_local, op=dist.ReduceOp.SUM)
+
             scheduler.step()
 
             # --- Logging & Checkpointing (on rank 0) ---
             if rank == 0:
-                # Average losses
-                for k in train_loss_dict: train_loss_dict[k] /= len(train_loader)
-                for k in val_loss_dict: val_loss_dict[k] /= len(validation_loader)
+                # Average losses over all batches across all GPUs
+                world_size_val = dist.get_world_size() if is_distributed else 1
+                
+                # The length of the dataloader is per-process, so multiply by world_size for total batches
+                num_total_train_batches = len(train_loader) * world_size_val
+                num_total_val_batches = len(validation_loader) * world_size_val
+                
+                # Avoid division by zero
+                if num_total_train_batches == 0: num_total_train_batches = 1
+                if num_total_val_batches == 0: num_total_val_batches = 1
+
+                # Calculate final average losses
+                avg_train_losses = {k: v.item() / num_total_train_batches for k, v in zip(train_loss_dict.keys(), train_losses_local)}
+                avg_val_losses = {k: v.item() / num_total_val_batches for k, v in zip(val_loss_dict.keys(), val_losses_local)}
 
                 logger.info(
-                    f"Epoch {epoch+1}: Train Loss: {train_loss_dict['total_loss']:.4f} "
-                    f"(Scat: {train_loss_dict['scattering_loss']:.4f}, "
-                    f"Phase: {train_loss_dict['phase_loss']:.4f}, "
-                    f"KLD: {train_loss_dict['kld_loss']:.4f}), "
-                    f"Val Loss: {val_loss_dict['total_loss']:.4f} "
-                    f"(Scat: {val_loss_dict['scattering_loss']:.4f}, "
-                    f"Phase: {val_loss_dict['phase_loss']:.4f}, "
-                    f"KLD: {val_loss_dict['kld_loss']:.4f})"
+                    f"Epoch {epoch+1}: Train Loss: {avg_train_losses['total_loss']:.4f} "
+                    f"(Scat: {avg_train_losses['scattering_loss']:.4f}, "
+                    f"Phase: {avg_train_losses['phase_loss']:.4f}, "
+                    f"KLD: {avg_train_losses['kld_loss']:.4f}), "
+                    f"Val Loss: {avg_val_losses['total_loss']:.4f} "
+                    f"(Scat: {avg_val_losses['scattering_loss']:.4f}, "
+                    f"Phase: {avg_val_losses['phase_loss']:.4f}, "
+                    f"KLD: {avg_val_losses['kld_loss']:.4f})"
                 )
                 
                 # Update history for plotting
                 loss_plotter.history['epoch'].append(epoch)
-                for k,v in train_loss_dict.items(): loss_plotter.history[f'train/{k}'].append(v)
-                for k,v in val_loss_dict.items(): loss_plotter.history[f'val/{k}'].append(v)
+                for k,v in avg_train_losses.items(): loss_plotter.history[f'train/{k}'].append(v)
+                for k,v in avg_val_losses.items(): loss_plotter.history[f'val/{k}'].append(v)
                 loss_plotter.plot_losses()
 
                 # Checkpointing
-                if val_loss_dict['total_loss'] < best_val_loss:
-                    best_val_loss = val_loss_dict['total_loss']
+                if avg_val_losses['total_loss'] < best_val_loss:
+                    best_val_loss = avg_val_losses['total_loss']
                     patience_counter = 0
                     save_path = os.path.join(self.model_checkpoint_dir, "base-model-best-pytorch.pt")
                     torch.save(plain_model.state_dict(), save_path)
@@ -1318,14 +1338,13 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             **dataset_kwargs
         )
 
-        # For validation, we typically don't need a distributed sampler,
-        # and run it on a single GPU (rank 0).
+        # For validation, we also use a distributed sampler so all GPUs are utilized.
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
             num_workers=num_workers,
-            rank=0,
-            world_size=1,
+            rank=rank,
+            world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
             **dataset_kwargs
@@ -1421,14 +1440,13 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
             **dataset_kwargs
         )
 
-        # For validation, we typically don't need a distributed sampler,
-        # and run it on a single GPU (rank 0).
+        # For validation, we also use a distributed sampler so all GPUs are utilized.
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
             num_workers=num_workers,
-            rank=0,
-            world_size=1,
+            rank=rank,
+            world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
             **dataset_kwargs
