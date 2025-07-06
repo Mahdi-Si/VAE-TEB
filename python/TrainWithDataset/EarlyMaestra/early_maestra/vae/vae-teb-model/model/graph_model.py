@@ -441,6 +441,8 @@ class SeqVAEGraphModel:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             device = local_rank
             torch.cuda.set_device(device)
+            # Add diagnostic logging
+            logger.info(f"[Process Rank: {dist.get_rank()}] - Running on GPU: {device}")
             self.base_model.to(device)
             # Find all buffer tensors and move them to the correct device
             for buffer in self.base_model.buffers():
@@ -452,6 +454,7 @@ class SeqVAEGraphModel:
             # For single GPU or CPU
             rank = 0
             device = f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu"
+            logger.info(f"[Single Process] - Running on device: {device}")
             self.base_model.to(device)
             model = self.base_model
 
@@ -501,37 +504,20 @@ class SeqVAEGraphModel:
                     with torch.cuda.amp.autocast():
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
-                        # Compute all losses separately for optimal gradient flow
+                        # Compute all losses and combine them for a single backward pass
                         scattering_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=True,
-                            compute_phase_loss=False,
-                            compute_kld_loss=False
-                        )
-                        
+                            forward_outputs, y_st, y_ph, True, False, False)
                         phase_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=False,
-                            compute_phase_loss=True,
-                            compute_kld_loss=False
-                        )
-                        
+                            forward_outputs, y_st, y_ph, False, True, False)
                         kld_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=False,
-                            compute_phase_loss=False,
-                            compute_kld_loss=True
-                        )
-                    
-                    # Separate backward passes with gradient scaling
-                    if scattering_loss_dict['scattering_loss'].item() > 0:
-                        scaler.scale(scattering_loss_dict['scattering_loss']).backward(retain_graph=True)
-                    
-                    if phase_loss_dict['phase_loss'].item() > 0:
-                        scaler.scale(phase_loss_dict['phase_loss']).backward(retain_graph=True)
-                    
-                    if kld_loss_dict['kld_loss'].item() > 0:
-                        scaler.scale(kld_loss_dict['kld_loss']).backward()
+                            forward_outputs, y_st, y_ph, False, False, True)
+                        
+                        total_loss = (scattering_loss_dict['scattering_loss'] + 
+                                      phase_loss_dict['phase_loss'] + 
+                                      kld_loss_dict['kld_loss'])
+
+                    # Single backward pass on the combined loss
+                    scaler.scale(total_loss).backward()
                     
                     # Gradient clipping and optimizer step with scaling
                     scaler.unscale_(optimizer)
@@ -543,36 +529,20 @@ class SeqVAEGraphModel:
                     # Forward pass (shared computation)
                     forward_outputs = model(y_st, y_ph, x_ph)
                     
-                    # Separate loss computation and backward passes for optimal PyTorch performance
-                    # 1. Scattering loss backward pass
+                    # Compute and combine losses for a single backward pass
                     scattering_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph,
-                        compute_scattering_loss=True,
-                        compute_phase_loss=False,
-                        compute_kld_loss=False
-                    )
-                    if scattering_loss_dict['scattering_loss'].item() > 0:
-                        scattering_loss_dict['scattering_loss'].backward(retain_graph=True)
-                    
-                    # 2. Phase loss backward pass
+                        forward_outputs, y_st, y_ph, True, False, False)
                     phase_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph,
-                        compute_scattering_loss=False,
-                        compute_phase_loss=True,
-                        compute_kld_loss=False
-                    )
-                    if phase_loss_dict['phase_loss'].item() > 0:
-                        phase_loss_dict['phase_loss'].backward(retain_graph=True)
-                    
-                    # 3. KLD loss backward pass
+                        forward_outputs, y_st, y_ph, False, True, False)
                     kld_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph,
-                        compute_scattering_loss=False,
-                        compute_phase_loss=False,
-                        compute_kld_loss=True
-                    )
-                    if kld_loss_dict['kld_loss'].item() > 0:
-                        kld_loss_dict['kld_loss'].backward()
+                        forward_outputs, y_st, y_ph, False, False, True)
+
+                    total_loss = (scattering_loss_dict['scattering_loss'] + 
+                                  phase_loss_dict['phase_loss'] + 
+                                  kld_loss_dict['kld_loss'])
+
+                    # Single backward pass
+                    total_loss.backward()
                     
                     # Gradient clipping and optimizer step
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -583,7 +553,7 @@ class SeqVAEGraphModel:
                 train_loss_dict['phase_loss'] += phase_loss_dict['phase_loss'].item()
                 train_loss_dict['kld_loss'] += kld_loss_dict['kld_loss'].item()
                 train_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
-                train_loss_dict['total_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss'] + kld_loss_dict['kld_loss']).item()
+                train_loss_dict['total_loss'] += total_loss.item()
             
             # --- Validation Loop ---
             model.eval()
@@ -658,8 +628,11 @@ class SeqVAEGraphModel:
 
             # Sum losses across all processes
             if is_distributed:
+                # Add diagnostic logging to debug potential hangs
+                if rank == 0: logger.debug(f"Epoch {epoch+1}: Rank 0 entering all_reduce.")
                 dist.all_reduce(train_losses_local, op=dist.ReduceOp.SUM)
                 dist.all_reduce(val_losses_local, op=dist.ReduceOp.SUM)
+                if rank == 0: logger.debug(f"Epoch {epoch+1}: Rank 0 finished all_reduce.")
 
             scheduler.step()
 
@@ -707,10 +680,24 @@ class SeqVAEGraphModel:
                 else:
                     patience_counter += 1
 
-                # Early Stopping
+                # Early Stopping Check
+                should_stop_tensor = torch.tensor(0, device=device)
                 if patience_counter >= early_stop_patience:
                     logger.info("Early stopping triggered.")
-                    break
+                    should_stop_tensor = torch.tensor(1, device=device)
+            else:
+                # Other ranks need a placeholder tensor
+                should_stop_tensor = torch.tensor(0, device=device)
+            
+            # Broadcast the stop signal from rank 0 to all other processes
+            if is_distributed:
+                dist.broadcast(should_stop_tensor, src=0)
+
+            # All processes check the signal and break the loop if needed
+            if should_stop_tensor.item() == 1:
+                if rank == 0:
+                    logger.info("All processes are stopping.")
+                break
         
         if rank == 0:
             logger.info("Finished training the base model with PyTorch DDP.")
@@ -1282,18 +1269,11 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
     with open(config_file_path, 'r') as yaml_file:
         config = yaml.safe_load(yaml_file)
     
-    # DDP setup: Initialize process group if launched with torchrun
-    is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
-    if is_ddp:
-        # The 'env://' init method is used by default and reads the DDP env vars
-        # set by torchrun.
-        dist.init_process_group(backend="gloo" if sys.platform == "win32" else "nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        logger.info(f"Initialized DDP on rank {rank}/{world_size}.")
-    else:
-        rank = 0
-        world_size = 1
+    # For PyTorch Lightning, DDP is handled by the Trainer.
+    # We initialize rank and world_size for single-process dataloader creation.
+    # Lightning will correctly handle distributed sampling when the DDP strategy is active.
+    rank = 0
+    world_size = 1
 
     # Set matmul precision for Tensor Cores
     torch.set_float32_matmul_precision('high')
@@ -1355,7 +1335,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
     # Clean up the process group
-    if is_ddp:
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 
@@ -1458,7 +1438,7 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model.train_base_model_pytorch(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
     # Clean up the process group
-    if is_ddp:
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 
