@@ -63,8 +63,14 @@ from sklearn.manifold import TSNE
 import pandas as pd
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-from vae_teb_model import SeqVaeTeb
+from vae_teb_model_improved import SeqVaeTeb
 from pytorch_lightning_modules import LightSeqVaeTeb
+
+from torch.optim.lr_scheduler import MultiStepLR
+import torch.distributed as dist
+
+# Add this line to enable cuDNN benchmark
+torch.backends.cudnn.benchmark = True
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -72,7 +78,6 @@ os.environ['PYDEVD_USE_CYTHON']="NO"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "7"
 
 matplotlib.use('Agg')
-torch.backends.cudnn.enabled = False
 
 
 
@@ -413,6 +418,279 @@ class SeqVAEGraphModel:
 
         return training_hist
 
+    def train_base_model_pytorch(self, train_loader, validation_loader):
+        """
+        Trains the base SeqVaeTeb model using a pure PyTorch DDP setup.
+
+        This function manually implements the training loop, including multi-GPU
+        support via DDP, checkpointing, early stopping, and loss plotting.
+
+        Args:
+            train_loader (DataLoader): DataLoader for the training dataset.
+            validation_loader (DataLoader): DataLoader for the validation dataset.
+
+        Returns:
+            dict: A dictionary containing the training history.
+        """
+        logger.info("Setting up PyTorch DDP training for the base model with optimized loss computation...")
+
+        is_distributed = len(self.cuda_devices) > 1
+        if is_distributed:
+            rank = dist.get_rank()
+            device = rank
+            torch.cuda.set_device(device)
+            self.base_model.to(device)
+            # Find all buffer tensors and move them to the correct device
+            for buffer in self.base_model.buffers():
+                buffer.to(device)
+            model = DDP(self.base_model, device_ids=[device], find_unused_parameters=False)
+        else:
+            rank = 0
+            device = f"cuda:{self.cuda_devices[0]}" if self.cuda_devices else "cpu"
+            self.base_model.to(device)
+            model = self.base_model
+
+        # Use AdamW with weight decay for better optimization
+        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4, eps=1e-8)
+        scheduler = MultiStepLR(optimizer, milestones=self.lr_milestones, gamma=0.5)
+        
+        # Enable mixed precision for faster training
+        scaler = torch.cuda.amp.GradScaler() if device != "cpu" else None
+
+        # Re-create callbacks/utilities for PyTorch loop
+        loss_plotter = LossPlotCallback(output_dir=self.train_results_dir, plot_frequency=1)
+        best_val_loss = float('inf')
+        early_stop_patience = 100
+        patience_counter = 0
+
+        logger.info(f"Starting optimized PyTorch DDP training on device: {device}")
+        logger.info(f"Using separate loss computation and backward passes for optimal gradient flow")
+        logger.info(f"Mixed precision enabled: {scaler is not None}")
+        logger.info(f"Gradient clipping enabled with max_norm=1.0")
+        logger.info(f"Using AdamW optimizer with weight_decay=1e-4")
+        
+        # Correctly get the underlying model in both DDP and single-GPU cases
+        plain_model = model.module if is_distributed else model
+
+        for epoch in range(self.epochs_num):
+            model.train()
+            
+            # Note: A distributed sampler is automatically applied by the trainer,
+            # so we don't need to manually set the epoch.
+            
+            train_loss_dict = {
+                'total_loss': 0.0, 'recon_loss': 0.0, 'kld_loss': 0.0,
+                'scattering_loss': 0.0, 'phase_loss': 0.0
+            }
+            
+            # --- Training Loop ---
+            for batch_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Train]", disable=(rank != 0)):
+                y_st, y_ph, x_ph = batch_data[0].to(device), batch_data[1].to(device), batch_data[2].to(device)
+
+                optimizer.zero_grad()
+
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        forward_outputs = model(y_st, y_ph, x_ph)
+                        
+                        # Compute all losses separately for optimal gradient flow
+                        scattering_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=True,
+                            compute_phase_loss=False,
+                            compute_kld_loss=False
+                        )
+                        
+                        phase_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=False,
+                            compute_phase_loss=True,
+                            compute_kld_loss=False
+                        )
+                        
+                        kld_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=False,
+                            compute_phase_loss=False,
+                            compute_kld_loss=True
+                        )
+                    
+                    # Separate backward passes with gradient scaling
+                    if scattering_loss_dict['scattering_loss'].item() > 0:
+                        scaler.scale(scattering_loss_dict['scattering_loss']).backward(retain_graph=True)
+                    
+                    if phase_loss_dict['phase_loss'].item() > 0:
+                        scaler.scale(phase_loss_dict['phase_loss']).backward(retain_graph=True)
+                    
+                    if kld_loss_dict['kld_loss'].item() > 0:
+                        scaler.scale(kld_loss_dict['kld_loss']).backward()
+                    
+                    # Gradient clipping and optimizer step with scaling
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                else:
+                    # Forward pass (shared computation)
+                    forward_outputs = model(y_st, y_ph, x_ph)
+                    
+                    # Separate loss computation and backward passes for optimal PyTorch performance
+                    # 1. Scattering loss backward pass
+                    scattering_loss_dict = plain_model.compute_loss(
+                        forward_outputs, y_st, y_ph,
+                        compute_scattering_loss=True,
+                        compute_phase_loss=False,
+                        compute_kld_loss=False
+                    )
+                    if scattering_loss_dict['scattering_loss'].item() > 0:
+                        scattering_loss_dict['scattering_loss'].backward(retain_graph=True)
+                    
+                    # 2. Phase loss backward pass
+                    phase_loss_dict = plain_model.compute_loss(
+                        forward_outputs, y_st, y_ph,
+                        compute_scattering_loss=False,
+                        compute_phase_loss=True,
+                        compute_kld_loss=False
+                    )
+                    if phase_loss_dict['phase_loss'].item() > 0:
+                        phase_loss_dict['phase_loss'].backward(retain_graph=True)
+                    
+                    # 3. KLD loss backward pass
+                    kld_loss_dict = plain_model.compute_loss(
+                        forward_outputs, y_st, y_ph,
+                        compute_scattering_loss=False,
+                        compute_phase_loss=False,
+                        compute_kld_loss=True
+                    )
+                    if kld_loss_dict['kld_loss'].item() > 0:
+                        kld_loss_dict['kld_loss'].backward()
+                    
+                    # Gradient clipping and optimizer step
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                # Accumulate losses for logging
+                train_loss_dict['scattering_loss'] += scattering_loss_dict['scattering_loss'].item()
+                train_loss_dict['phase_loss'] += phase_loss_dict['phase_loss'].item()
+                train_loss_dict['kld_loss'] += kld_loss_dict['kld_loss'].item()
+                train_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
+                train_loss_dict['total_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss'] + kld_loss_dict['kld_loss']).item()
+            
+            # --- Validation Loop ---
+            model.eval()
+            val_loss_dict = {
+                'total_loss': 0.0, 'recon_loss': 0.0, 'kld_loss': 0.0,
+                'scattering_loss': 0.0, 'phase_loss': 0.0
+            }
+            with torch.no_grad():
+                for batch_data in tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0)):
+                    y_st, y_ph, x_ph = batch_data[0].to(device), batch_data[1].to(device), batch_data[2].to(device)
+                    
+                    # Use mixed precision for validation if available
+                    if scaler is not None:
+                        with torch.cuda.amp.autocast():
+                            forward_outputs = model(y_st, y_ph, x_ph)
+                            
+                            # Compute all losses separately for validation (no backward pass needed)
+                            scattering_loss_dict = plain_model.compute_loss(
+                                forward_outputs, y_st, y_ph,
+                                compute_scattering_loss=True,
+                                compute_phase_loss=False,
+                                compute_kld_loss=False
+                            )
+                            phase_loss_dict = plain_model.compute_loss(
+                                forward_outputs, y_st, y_ph,
+                                compute_scattering_loss=False,
+                                compute_phase_loss=True,
+                                compute_kld_loss=False
+                            )
+                            kld_loss_dict = plain_model.compute_loss(
+                                forward_outputs, y_st, y_ph,
+                                compute_scattering_loss=False,
+                                compute_phase_loss=False,
+                                compute_kld_loss=True
+                            )
+                    else:
+                        forward_outputs = model(y_st, y_ph, x_ph)
+                        
+                        # Compute all losses separately for validation (no backward pass needed)
+                        scattering_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=True,
+                            compute_phase_loss=False,
+                            compute_kld_loss=False
+                        )
+                        phase_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=False,
+                            compute_phase_loss=True,
+                            compute_kld_loss=False
+                        )
+                        kld_loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_st, y_ph,
+                            compute_scattering_loss=False,
+                            compute_phase_loss=False,
+                            compute_kld_loss=True
+                        )
+                    
+                    # Accumulate losses
+                    val_loss_dict['scattering_loss'] += scattering_loss_dict['scattering_loss'].item()
+                    val_loss_dict['phase_loss'] += phase_loss_dict['phase_loss'].item()
+                    val_loss_dict['kld_loss'] += kld_loss_dict['kld_loss'].item()
+                    val_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
+                    val_loss_dict['total_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss'] + kld_loss_dict['kld_loss']).item()
+            
+            scheduler.step()
+
+            # --- Logging & Checkpointing (on rank 0) ---
+            if rank == 0:
+                # Average losses
+                for k in train_loss_dict: train_loss_dict[k] /= len(train_loader)
+                for k in val_loss_dict: val_loss_dict[k] /= len(validation_loader)
+
+                logger.info(
+                    f"Epoch {epoch+1}: Train Loss: {train_loss_dict['total_loss']:.4f} "
+                    f"(Scat: {train_loss_dict['scattering_loss']:.4f}, "
+                    f"Phase: {train_loss_dict['phase_loss']:.4f}, "
+                    f"KLD: {train_loss_dict['kld_loss']:.4f}), "
+                    f"Val Loss: {val_loss_dict['total_loss']:.4f} "
+                    f"(Scat: {val_loss_dict['scattering_loss']:.4f}, "
+                    f"Phase: {val_loss_dict['phase_loss']:.4f}, "
+                    f"KLD: {val_loss_dict['kld_loss']:.4f})"
+                )
+                
+                # Update history for plotting
+                loss_plotter.history['epoch'].append(epoch)
+                for k,v in train_loss_dict.items(): loss_plotter.history[f'train/{k}'].append(v)
+                for k,v in val_loss_dict.items(): loss_plotter.history[f'val/{k}'].append(v)
+                loss_plotter.plot_losses()
+
+                # Checkpointing
+                if val_loss_dict['total_loss'] < best_val_loss:
+                    best_val_loss = val_loss_dict['total_loss']
+                    patience_counter = 0
+                    save_path = os.path.join(self.model_checkpoint_dir, "base-model-best-pytorch.pt")
+                    torch.save(plain_model.state_dict(), save_path)
+                    logger.info(f"Saved new best model to {save_path} with val_loss: {best_val_loss:.4f}")
+                else:
+                    patience_counter += 1
+
+                # Early Stopping
+                if patience_counter >= early_stop_patience:
+                    logger.info("Early stopping triggered.")
+                    break
+        
+        if rank == 0:
+            logger.info("Finished training the base model with PyTorch DDP.")
+            training_hist = loss_plotter.history
+            path_save_hist = os.path.join(self.train_results_dir, 'base_model_history_pytorch.pkl')
+            with open(path_save_hist, 'wb') as f: pickle.dump(training_hist, f)
+            logger.info(f"Training history saved to {path_save_hist}")
+            return training_hist
+        
+        return None
+
     def train_seqvae_model(self, train_loader_seqvae=None,
                            validation_loader_seqvae=None):
         self.early_stop_callback = EarlyStopping(
@@ -479,49 +757,6 @@ class SeqVAEGraphModel:
         with open(path_save_hist, 'wb') as f:
             pickle.dump(training_hist, f)
         return training_hist
-
-
-    def do_train_with_dataset(self, train_dataset, validation_dataset, tag='', weights_filename=None):
-        # self.calculate_latent_stats(train_dataset)
-        self.lr = self.config['general_config']['lr']
-        guid_lists, epoch_numbs_list, labels_list = train_dataset.dataset.get_the_lists()
-        labels_true_list = []
-        for label_i in labels_list:
-            class_labels = np.argmax(label_i, axis=1)
-            label_epoch = np.bincount(class_labels).argmax()
-            if label_epoch == 0:
-                labels_true_list.append('pad')
-            elif label_epoch == 1:
-                labels_true_list.append('Healthy')
-            elif label_epoch == 2:
-                labels_true_list.append('HIE')
-        train_df = pd.DataFrame({
-            "guid": guid_lists,
-            "epoch": epoch_numbs_list,
-            "label": labels_true_list,
-        })
-        train_df.to_csv(os.path.join(self.train_results_dir, 'train_dataset.csv'), index=False)
-
-        guid_lists, epoch_numbs_list, labels_list = validation_dataset.dataset.get_the_lists()
-        labels_true_list = []
-        for label_i in labels_list:
-            class_labels = np.argmax(label_i, axis=1)
-            label_epoch = np.bincount(class_labels).argmax()
-            if label_epoch == 0:
-                labels_true_list.append('pad')
-            elif label_epoch == 1:
-                labels_true_list.append('Healthy')
-            elif label_epoch == 2:
-                labels_true_list.append('HIE')
-        train_df = pd.DataFrame({
-            "guid": guid_lists,
-            "epoch": epoch_numbs_list,
-            "label": labels_true_list,
-        })
-        train_df.to_csv(os.path.join(self.train_results_dir, 'validation_dataset.csv'), index=False)
-        self.create_model()
-        history_dict = self.train_seqvae_model(train_dataset, validation_dataset)
-        return history_dict
 
 
     def seqvae_prediction_plot(self, dataloader, prediction_idx, device):
@@ -1085,5 +1320,108 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
 
+def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
+    """
+    Alternative main function that uses the PyTorch DDP implementation instead of PyTorch Lightning.
+    """
+    np.random.seed(42)
+    torch.manual_seed(42)
+    sklearn.utils.check_random_state(42)
+    start = time.time()
+
+    config_file_path = 'model/config.yaml'
+    project_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if not os.path.isabs(config_file_path):
+        config_file_path = os.path.join(project_root, config_file_path)
+
+    config_file_path = os.path.normpath(config_file_path)
+    if not os.path.exists(config_file_path):
+        logger.error(f"Configuration file not found at the resolved path: {config_file_path}")
+        logger.error("This might be because the file is missing or the path is incorrect.")
+        logger.error(f"The path was set to 'model/config.yaml'.")
+        logger.error("Please check your project structure and the config path.")
+        sys.exit(1)
+
+    with open(config_file_path, 'r') as yaml_file:
+        config = yaml.safe_load(yaml_file)
+    
+    # Set matmul precision for Tensor Cores
+    torch.set_float32_matmul_precision('high')
+
+    def resolve_path(p):
+        if not p or os.path.isabs(p):
+            return p
+        return os.path.normpath(os.path.join(project_root, p))
+
+    if 'dataset_config' in config:
+        if 'vae_train_datasets' in config['dataset_config']:
+            config['dataset_config']['vae_train_datasets'] = [resolve_path(p) for p in config['dataset_config']['vae_train_datasets']]
+        if 'vae_test_datasets' in config['dataset_config']:
+            config['dataset_config']['vae_test_datasets'] = [resolve_path(p) for p in config['dataset_config']['vae_test_datasets']]
+        if 'stat_path' in config['dataset_config']:
+            config['dataset_config']['stat_path'] = resolve_path(config['dataset_config']['stat_path'])
+    
+    if 'seqvae_testing' in config and 'test_data_dir' in config['seqvae_testing']:
+        config['seqvae_testing']['test_data_dir'] = resolve_path(config['seqvae_testing']['test_data_dir'])
+    
+    if train_SeqVAE > -1:
+        cuda_device_list = config['general_config']['cuda_devices']
+        # Dataloader configuration
+        dataloader_config = config['dataset_config'].get('dataloader_config', {})
+        dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
+        # Set num_workers to 0 to avoid multiprocessing pickling issues on Windows
+        num_workers = 0  # Changed from dataloader_config.get('num_workers', 4)
+        normalize_fields = dataloader_config.get('normalize_fields', None)
+        stat_path = config['dataset_config'].get('stat_path')
+
+        # For distributed training, rank and world_size are needed.
+        # Assuming DDP, these would be set by the environment.
+        # Lightning takes care of this, but for create_optimized_dataloader we need them.
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = len(cuda_device_list) if cuda_device_list and len(cuda_device_list) > 0 else 1
+        if world_size > 1 and not dist.is_initialized():
+            backend = "gloo" if sys.platform == "win32" else "nccl"
+            dist.init_process_group(backend=backend, init_method='env://')
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+
+        train_loader_seqvae = create_optimized_dataloader(
+            hdf5_files=config['dataset_config']['vae_train_datasets'],
+            batch_size=config['general_config']['batch_size']['train'],
+            num_workers=num_workers,
+            rank=rank,
+            world_size=world_size,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            **dataset_kwargs
+        )
+
+        # For validation, we typically don't need a distributed sampler,
+        # and run it on a single GPU (rank 0).
+        validation_loader_seqvae = create_optimized_dataloader(
+            hdf5_files=config['dataset_config']['vae_test_datasets'],
+            batch_size=config['general_config']['batch_size']['test'],
+            num_workers=num_workers,
+            rank=0,
+            world_size=1,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            **dataset_kwargs
+        )
+
+        graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
+        graph_model.create_model()
+        # Use the PyTorch DDP training method instead of PyTorch Lightning
+        graph_model.train_base_model_pytorch(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
+
+
 if __name__ == '__main__':
-    main()
+    # Set training parameters directly
+    use_pytorch_ddp = True  # Set to True to use PyTorch DDP, False for PyTorch Lightning
+    train_model = 1  # 1 to train, -1 to skip
+    test_model = -1  # 1 to test, -1 to skip
+    
+    if use_pytorch_ddp:
+        main_pytorch(train_SeqVAE=train_model, test_SeqVAE=test_model)
+    else:
+        main(train_SeqVAE=train_model, test_SeqVAE=test_model)
