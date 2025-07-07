@@ -844,7 +844,9 @@ class Decoder(nn.Module):
                      predictions: Dict[str, torch.Tensor],
                      target_scattering: torch.Tensor,
                      target_phase: torch.Tensor,
-                     warmup_period: int) -> Dict[str, torch.Tensor]:
+                     warmup_period: int,
+                     compute_scattering_loss: bool = True,
+                     compute_phase_loss: bool = True) -> Dict[str, torch.Tensor]:
         """
         Compute Gaussian negative log-likelihood loss with numerical stability.
         
@@ -853,33 +855,32 @@ class Decoder(nn.Module):
             target_scattering: Ground truth scattering transform (B, S, C)
             target_phase: Ground truth phase harmonic (B, S, C) 
             warmup_period: Number of initial timesteps to ignore
+            compute_scattering_loss: Flag to compute scattering loss.
+            compute_phase_loss: Flag to compute phase loss.
             
         Returns:
-            Negative log-likelihood loss
+            A dictionary of computed losses.
         """
         S = target_scattering.shape[1]
         H = self.prediction_horizon
+        device = target_scattering.device
         
         # Determine valid prediction range
         start_idx = warmup_period
         end_idx = S - H
         
+        # Initialize losses
+        scattering_loss = torch.tensor(0.0, device=device)
+        phase_loss = torch.tensor(0.0, device=device)
+
         if start_idx >= end_idx:
             warnings.warn("Insufficient sequence length for loss computation after warmup.")
-            device = target_scattering.device
             return {
                 'total_loss': torch.tensor(0.0, device=device),
-                'scattering_loss': torch.tensor(0.0, device=device),
-                'phase_loss': torch.tensor(0.0, device=device),
+                'scattering_loss': scattering_loss,
+                'phase_loss': phase_loss,
             }
         
-        # Extract predictions for valid range
-        pred_scatter_mu = predictions['scattering_mu'][:, start_idx:end_idx]
-        pred_scatter_logvar = predictions['scattering_logvar'][:, start_idx:end_idx]
-        pred_phase_mu = predictions['phase_harmonic_mu'][:, start_idx:end_idx]
-        pred_phase_logvar = predictions['phase_harmonic_logvar'][:, start_idx:end_idx]
-        
-        # Create target windows efficiently
         def create_target_windows(target_tensor: torch.Tensor) -> torch.Tensor:
             """Create sliding windows of target data."""
             B, S_full, C = target_tensor.shape
@@ -893,14 +894,18 @@ class Decoder(nn.Module):
             # Gather windows
             expanded_target = target_tensor.unsqueeze(1).expand(-1, S_full - H, -1, -1)
             return torch.gather(expanded_target, 2, indices)
-        
-        # Create target windows
-        true_scatter_windows = create_target_windows(target_scattering)[:, start_idx:end_idx]
-        true_phase_windows = create_target_windows(target_phase)[:, start_idx:end_idx]
-        
-        # Compute losses
-        scattering_loss = self._gaussian_nll(pred_scatter_mu, pred_scatter_logvar, true_scatter_windows)
-        phase_loss = self._gaussian_nll(pred_phase_mu, pred_phase_logvar, true_phase_windows)
+
+        if compute_scattering_loss:
+            pred_scatter_mu = predictions['scattering_mu'][:, start_idx:end_idx]
+            pred_scatter_logvar = predictions['scattering_logvar'][:, start_idx:end_idx]
+            true_scatter_windows = create_target_windows(target_scattering)[:, start_idx:end_idx]
+            scattering_loss = self._gaussian_nll(pred_scatter_mu, pred_scatter_logvar, true_scatter_windows)
+
+        if compute_phase_loss:
+            pred_phase_mu = predictions['phase_harmonic_mu'][:, start_idx:end_idx]
+            pred_phase_logvar = predictions['phase_harmonic_logvar'][:, start_idx:end_idx]
+            true_phase_windows = create_target_windows(target_phase)[:, start_idx:end_idx]
+            phase_loss = self._gaussian_nll(pred_phase_mu, pred_phase_logvar, true_phase_windows)
         
         total_loss = scattering_loss + phase_loss
         
@@ -1076,7 +1081,10 @@ class SeqVaeTeb(nn.Module):
         }
 
     def compute_loss(self, forward_outputs: Dict[str, torch.Tensor], 
-                     y_st: torch.Tensor, y_ph: torch.Tensor) -> Dict[str, torch.Tensor]:
+                     y_st: torch.Tensor, y_ph: torch.Tensor,
+                     compute_scattering_loss: bool = True,
+                     compute_phase_loss: bool = True,
+                     compute_kld_loss: bool = True) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss.
         
@@ -1084,30 +1092,46 @@ class SeqVaeTeb(nn.Module):
             forward_outputs: The dictionary returned by the forward pass.
             y_st: Ground truth target scattering data (B, C, L).
             y_ph: Ground truth target phase harmonic data (B, C, L).
+            compute_scattering_loss (bool): Whether to compute scattering loss.
+            compute_phase_loss (bool): Whether to compute phase loss.
+            compute_kld_loss (bool): Whether to compute KLD loss.
             
         Returns:
             A dictionary of computed losses (total, reconstruction, KLD).
         """
+        device = y_st.device
         # Permute from (B, C, L) to (B, L, C) for loss computation
         y_st = y_st.permute(0, 2, 1)
         y_ph = y_ph.permute(0, 2, 1)
 
-        # Reconstruction loss
-        recon_loss_dict = self.decoder.compute_loss(
-            forward_outputs["predictions"],
-            target_scattering=y_st,
-            target_phase=y_ph,
-            warmup_period=self.warmup_period
-        )
-        recon_loss = recon_loss_dict['total_loss']
+        # Initialize losses
+        recon_loss = torch.tensor(0.0, device=device)
+        kld_loss = torch.tensor(0.0, device=device)
+        scattering_loss = torch.tensor(0.0, device=device)
+        phase_loss = torch.tensor(0.0, device=device)
         
+        # Reconstruction loss
+        if compute_scattering_loss or compute_phase_loss:
+            recon_loss_dict = self.decoder.compute_loss(
+                forward_outputs["predictions"],
+                target_scattering=y_st,
+                target_phase=y_ph,
+                warmup_period=self.warmup_period,
+                compute_scattering_loss=compute_scattering_loss,
+                compute_phase_loss=compute_phase_loss
+            )
+            recon_loss = recon_loss_dict['total_loss']
+            scattering_loss = recon_loss_dict['scattering_loss']
+            phase_loss = recon_loss_dict['phase_loss']
+
         # KLD loss
-        kld_loss = self._kld_loss(
-            mu_prior=forward_outputs["mu_prior"],
-            logvar_prior=forward_outputs["logvar_prior"],
-            mu_post=forward_outputs["mu_post"],
-            logvar_post=forward_outputs["logvar_post"]
-        )
+        if compute_kld_loss:
+            kld_loss = self._kld_loss(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"]
+            )
         
         # Total loss
         total_loss = recon_loss + self.kld_beta * kld_loss
@@ -1116,8 +1140,8 @@ class SeqVaeTeb(nn.Module):
             "total_loss": total_loss,
             "reconstruction_loss": recon_loss,
             "kld_loss": kld_loss,
-            "scattering_loss": recon_loss_dict.get('scattering_loss', torch.tensor(0.0)),
-            "phase_loss": recon_loss_dict.get('phase_loss', torch.tensor(0.0))
+            "scattering_loss": scattering_loss,
+            "phase_loss": phase_loss
         }
 
     def get_average_predictions(self, forward_outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

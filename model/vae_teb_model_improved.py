@@ -70,10 +70,10 @@ class CausalConv1d(nn.Module):
         self.left_padding = (kernel_size - 1) * dilation
 
         # Use grouped convolution for efficiency when possible
-        self.conv = spectral_norm(nn.Conv1d(
+        self.conv = nn.Conv1d(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=0, dilation=dilation, bias=bias, groups=groups
-        ))
+        )
 
         # Pre-allocate padding tensor for efficiency
         self.register_buffer('padding_zeros', torch.zeros(1, in_channels, self.left_padding))
@@ -117,20 +117,20 @@ class CausalResidualBlock(nn.Module):
         # Efficient depthwise + pointwise convolution option
         if use_depthwise:
             self.conv1 = CausalConv1d(channels, channels, kernel_size, groups=channels, dilation=dilation)
-            self.pointwise1 = spectral_norm(nn.Conv1d(channels, self.expansion_channels, 1))
+            self.pointwise1 = nn.Conv1d(channels, self.expansion_channels, 1)
             self.conv2 = CausalConv1d(self.expansion_channels, self.expansion_channels, kernel_size, groups=self.expansion_channels, dilation=dilation)
-            self.pointwise2 = spectral_norm(nn.Conv1d(self.expansion_channels, channels, 1))
+            self.pointwise2 = nn.Conv1d(self.expansion_channels, channels, 1)
         else:
             self.conv1 = CausalConv1d(channels, self.expansion_channels, kernel_size, dilation=dilation)
             self.conv2 = CausalConv1d(self.expansion_channels, channels, kernel_size, dilation=dilation)
 
         # GLU (Gated Linear Unit) for efficient gating
-        self.gate_linear = spectral_norm(nn.Linear(channels, channels))
+        self.gate_linear = nn.Linear(channels, channels)
 
         self.dropout = nn.Dropout(dropout)
 
         # Skip connection projection if needed
-        self.skip_proj = spectral_norm(nn.Linear(channels, channels)) if expansion_factor != 1.0 else nn.Identity()
+        self.skip_proj = nn.Linear(channels, channels) if expansion_factor != 1.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -182,7 +182,7 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden_dim = out_dim * hidden_dim_factor
         self.net = nn.Sequential(
-            spectral_norm(nn.Linear(in_dim, out_dim)),
+            nn.Linear(in_dim, out_dim),
             activation(),
             nn.Dropout(dropout),
             # nn.Linear(hidden_dim, out_dim),
@@ -209,7 +209,7 @@ class ResidualMLP(nn.Module):
         dims = [input_dim, *hidden_dims]
         for i in range(len(hidden_dims)):
             layers += [
-                spectral_norm(nn.Linear(dims[i], dims[i+1])),
+                nn.Linear(dims[i], dims[i+1]),
                 nn.LayerNorm(dims[i+1]),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -219,7 +219,7 @@ class ResidualMLP(nn.Module):
         # if input_dim ≠ final hidden_dims[-1], project it
         final_dim = hidden_dims[-1]
         if input_dim != final_dim:
-            self.skip_proj = spectral_norm(nn.Linear(input_dim, final_dim))
+            self.skip_proj = nn.Linear(input_dim, final_dim)
         else:
             self.skip_proj = nn.Identity()
 
@@ -294,6 +294,9 @@ class TargetEncoder(nn.Module):
         self.conv_path_scattering = self._build_causal_conv_path(input_channels, 64, conv_kernel_size, dropout, use_depthwise=True)
         self.conv_path_phase = self._build_causal_conv_path(input_channels, 64, conv_kernel_size, dropout, use_depthwise=True)
         
+        # Intra-modal fusion for scattering and phase paths
+        self.scatter_fusion = ResidualMLP(input_dim=128, hidden_dims=(120, 100, 64), dropout=dropout, final_activation=False)
+        self.phase_fusion = ResidualMLP(input_dim=128, hidden_dims=(120, 100, 64), dropout=dropout, final_activation=False)
         
         # Cross-modal fusion (combining scattering and phase harmonic)
         self.cross_modal_fusion = ResidualMLP(input_dim=64*2, hidden_dims=(64*2, 120, 110, 100), dropout=dropout, final_activation=False)
@@ -316,7 +319,7 @@ class TargetEncoder(nn.Module):
         
         # Variational parameters
         self.mu_layer = ResidualMLP(input_dim=100, hidden_dims=(91, 82, 73, latent_dim), dropout=dropout, final_activation=False)
-        self.logvar_layer =  ResidualMLP(input_dim=100, hidden_dims=(107, 114, 121, 128), dropout=dropout, final_activation=False)
+        self.logvar_layer =  ResidualMLP(input_dim=100, hidden_dims=(107, 114, 121, latent_dim * 2), dropout=dropout, final_activation=False)
     
     def _build_causal_conv_path(
         self, input_dim: int, output_dim: int, kernel_sizes: Union[int, list[int]],
@@ -344,7 +347,7 @@ class TargetEncoder(nn.Module):
         # Final projection to target dimension
         layers.append(nn.Sequential(
             nn.LayerNorm(input_dim),
-            spectral_norm(nn.Linear(input_dim, output_dim)),
+            nn.Linear(input_dim, output_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         ))
@@ -376,12 +379,14 @@ class TargetEncoder(nn.Module):
         # Process scattering transform
         scatter_linear = self.linear_path_scattering(scattering_input)
         scatter_conv = self.conv_path_scattering(scattering_input)
-        scatter_fused = scatter_linear + scatter_conv
+        scatter_combined = torch.cat([scatter_linear, scatter_conv], dim=-1)
+        scatter_fused = self.scatter_fusion(scatter_combined)
         
         # Process phase harmonic
         phase_linear = self.linear_path_phase(phase_harmonic_input)
         phase_conv = self.conv_path_phase(phase_harmonic_input)
-        phase_fused = phase_linear + phase_conv
+        phase_combined = torch.cat([phase_linear, phase_conv], dim=-1)
+        phase_fused = self.phase_fusion(phase_combined)
         
         if return_hidden:
             hidden_states['scatter_fused'] = scatter_fused
@@ -520,7 +525,7 @@ class SourceEncoder(nn.Module):
         # Final projection to target dimension
         layers.append(nn.Sequential(
             nn.LayerNorm(input_dim),
-            spectral_norm(nn.Linear(input_dim, output_dim)),
+            nn.Linear(input_dim, output_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         ))
@@ -798,7 +803,7 @@ class Decoder(nn.Module):
         if current_dim != output_dim:
             layers.append(nn.Sequential(
                 nn.LayerNorm(current_dim),
-                spectral_norm(nn.Linear(current_dim, output_dim)),
+                nn.Linear(current_dim, output_dim),
                 nn.GELU(),
                 nn.Dropout(dropout)
             ))
@@ -1371,5 +1376,3 @@ if __name__ == "__main__":
     print(f"Decoder MSE loss: {decoder_loss['total_loss']:.4f}")
     
     print("\n--- All tests completed successfully! ---")
-
-
