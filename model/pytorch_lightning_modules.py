@@ -545,9 +545,7 @@ class LossPlotCallback(Callback):
         # Create a Plotly figure and add a trace for each metric.
         fig = go.Figure()
         
-        colors = {
-            'train': 'blue',
-            'val': 'red',
+        metric_colors = {
             'total_loss': 'black',
             'recon_loss': 'green',
             'kld_loss': 'orange',
@@ -556,20 +554,29 @@ class LossPlotCallback(Callback):
         }
 
         for key, values in self.history.items():
-            if key == "epoch":
+            if key == "epoch" or not any(v is not None and not np.isnan(v) for v in values):
                 continue
             
             parts = key.split('/')
             split_name = parts[0] # train or val
             metric_name = parts[1] # loss type
+            
+            # Use different line styles for train and val
+            line_style = 'solid' if split_name == 'train' else 'dash'
 
             fig.add_trace(go.Scatter(
                 x=self.history["epoch"],
                 y=values,
                 mode='lines+markers',
                 name=key.replace('/', ' ').title(),
-                line=dict(color=colors.get(split_name)),
-                marker=dict(symbol='circle' if split_name == 'train' else 'diamond')
+                line=dict(
+                    color=metric_colors.get(metric_name, 'grey'), # Default color
+                    dash=line_style
+                ),
+                marker=dict(
+                    symbol='circle' if split_name == 'train' else 'diamond',
+                    size=6
+                )
             ))
 
 
@@ -579,7 +586,14 @@ class LossPlotCallback(Callback):
             xaxis_title="Epoch",
             yaxis_title="Loss",
             legend_title="Metrics",
-            template="plotly_white"
+            template="plotly_white",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
         )
 
         # Save the figure as an HTML file
@@ -872,6 +886,13 @@ class LightSeqVaeTeb(L.LightningModule):
         """Called at the beginning of each training epoch."""
         beta = self._calculate_beta()
         self.log('kld_beta', beta, on_epoch=True, prog_bar=True)
+        # Log learning rate at the start of each epoch
+        try:
+            lr = self.optimizers().param_groups[0]['lr']
+            self.log('lr', lr, on_epoch=True, prog_bar=True, logger=True)
+        except IndexError:
+            # This can happen if the optimizer is not yet configured
+            pass
 
     def _common_step(self, batch, batch_idx):
         """Common logic for training and validation steps."""
@@ -896,8 +917,8 @@ class LightSeqVaeTeb(L.LightningModule):
 
         # Log training metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=False, on_epoch=True, logger=True)
-        self.log('train/kld_loss', loss_dict['kld_loss'], on_step=False, on_epoch=True, logger=True)
+        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/scattering_loss', loss_dict['scattering_loss'], on_step=False, on_epoch=True, logger=True)
         self.log('train/phase_loss', loss_dict['phase_loss'], on_step=False, on_epoch=True, logger=True)
 
@@ -910,8 +931,8 @@ class LightSeqVaeTeb(L.LightningModule):
 
         # Log validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, logger=True)
-        self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, logger=True)
+        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
+        self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/scattering_loss', loss_dict['scattering_loss'], on_epoch=True, logger=True)
         self.log('val/phase_loss', loss_dict['phase_loss'], on_epoch=True, logger=True)
 

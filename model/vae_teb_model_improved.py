@@ -745,33 +745,33 @@ class Decoder(nn.Module):
         self.conv_fusion = ResidualMLP(input_dim=80*num_conv_paths, hidden_dims=(160, 160), dropout=dropout, final_activation=True)
         
         # Simplified path fusion
-        self.path_fusion = ResidualMLP(input_dim=320, hidden_dims=(256, 192), dropout=dropout, final_activation=True)
+        self.path_fusion = ResidualMLP(input_dim=320, hidden_dims=(256, 512), dropout=dropout, final_activation=True)
         
         # Bidirectional LSTM for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=192,
-            hidden_size=256,
+            input_size=512,
+            hidden_size=512,
             num_layers=lstm_num_layers,
             batch_first=True,
             dropout=dropout if lstm_num_layers > 1 else 0,
             bidirectional=use_bidirectional
         )
         
-        lstm_output_dim = 256 * (2 if use_bidirectional else 1)
+        lstm_output_dim = 512 * (2 if use_bidirectional else 1)
         
         # Post-LSTM processing
-        self.post_lstm = ResidualMLP(input_dim=lstm_output_dim, hidden_dims=(384, 320, 256), dropout=dropout, final_activation=True)
+        self.post_lstm = ResidualMLP(input_dim=lstm_output_dim, hidden_dims=(600, 700, 800), dropout=dropout, final_activation=True)
         
         # Prediction head
-        self.prediction_head = ResidualMLP(input_dim=256, hidden_dims=(192, 160, 128), dropout=dropout, final_activation=True)
+        self.prediction_head = ResidualMLP(input_dim=800, hidden_dims=(900, 1000, 1024), dropout=dropout, final_activation=True)
         
         # Output dimensions
         output_size = prediction_horizon * output_channels
         
         # Simplified prediction heads - mean only
-        self.scattering_head = ResidualMLP(input_dim=128, hidden_dims=(output_size,), dropout=dropout, final_activation=False)
+        self.scattering_head = ResidualMLP(input_dim=1024, hidden_dims=(1524, 2000, output_size,), dropout=dropout, final_activation=False)
         
-        self.phase_head = ResidualMLP(input_dim=128, hidden_dims=(output_size,), dropout=dropout, final_activation=False)
+        self.phase_head = ResidualMLP(input_dim=1024, hidden_dims=(1524, 2000, output_size,), dropout=dropout, final_activation=False)
         
     def _build_causal_conv_path(self, input_dim: int, output_dim: int, num_layers: int, kernel_size: int, dropout: float):
         """Build simplified causal convolution path with residual blocks."""
