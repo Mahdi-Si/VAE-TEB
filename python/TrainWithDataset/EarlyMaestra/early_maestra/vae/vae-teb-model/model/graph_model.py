@@ -465,7 +465,7 @@ class SeqVAEGraphModel:
         scheduler = MultiStepLR(optimizer, milestones=self.lr_milestones, gamma=0.5)
         
         # Enable mixed precision for faster training
-        scaler = torch.cuda.amp.GradScaler() if device != "cpu" else None
+        scaler = torch.amp.GradScaler('cuda') if device != "cpu" else None
 
         # Re-create callbacks/utilities for PyTorch loop
         loss_plotter = LossPlotCallback(output_dir=self.train_results_dir, plot_frequency=1)
@@ -494,7 +494,8 @@ class SeqVAEGraphModel:
             }
             
             # --- Training Loop ---
-            for batch_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Train]", disable=(rank != 0)):
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Train]", disable=(rank != 0))
+            for i, batch_data in enumerate(progress_bar):
                 # Access data using correct HDF5 dataset field names
                 y_st = batch_data.fhr_st.to(device)      # Scattering transform features
                 y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
@@ -503,7 +504,7 @@ class SeqVAEGraphModel:
                 optimizer.zero_grad()
 
                 if scaler is not None:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
                         # Compute all losses and combine them for a single backward pass
@@ -551,11 +552,28 @@ class SeqVAEGraphModel:
                     optimizer.step()
 
                 # Accumulate losses for logging
-                train_loss_dict['scattering_loss'] += scattering_loss_dict['scattering_loss'].item()
-                train_loss_dict['phase_loss'] += phase_loss_dict['phase_loss'].item()
-                train_loss_dict['kld_loss'] += kld_loss_dict['kld_loss'].item()
-                train_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
+                scattering_loss_item = scattering_loss_dict['scattering_loss'].item()
+                phase_loss_item = phase_loss_dict['phase_loss'].item()
+                kld_loss_item = kld_loss_dict['kld_loss'].item()
+                current_recon_loss = scattering_loss_item + phase_loss_item
+
+                train_loss_dict['scattering_loss'] += scattering_loss_item
+                train_loss_dict['phase_loss'] += phase_loss_item
+                train_loss_dict['kld_loss'] += kld_loss_item
+                train_loss_dict['recon_loss'] += current_recon_loss
                 train_loss_dict['total_loss'] += total_loss.item()
+                
+                # Update progress bar
+                if rank == 0:
+                    lr = scheduler.get_last_lr()[0]
+                    num_batches_processed = i + 1
+                    postfix_dict = {
+                        'lr': f'{lr:.2e}',
+                        'mse': f'{train_loss_dict["recon_loss"] / num_batches_processed:.4f}',
+                        'kld': f'{train_loss_dict["kld_loss"] / num_batches_processed:.4f}',
+                        'total': f'{train_loss_dict["total_loss"] / num_batches_processed:.4f}'
+                    }
+                    progress_bar.set_postfix(postfix_dict)
             
             # --- Validation Loop ---
             model.eval()
@@ -564,7 +582,8 @@ class SeqVAEGraphModel:
                 'scattering_loss': 0.0, 'phase_loss': 0.0
             }
             with torch.no_grad():
-                for batch_data in tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0)):
+                val_progress_bar = tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0))
+                for i, batch_data in enumerate(val_progress_bar):
                     # Access data using correct HDF5 dataset field names
                     y_st = batch_data.fhr_st.to(device)      # Scattering transform features
                     y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
@@ -572,7 +591,7 @@ class SeqVAEGraphModel:
                     
                     # Use mixed precision for validation if available
                     if scaler is not None:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast('cuda'):
                             forward_outputs = model(y_st, y_ph, x_ph)
                             
                             # Compute all losses separately for validation (no backward pass needed)
@@ -618,11 +637,26 @@ class SeqVAEGraphModel:
                         )
                     
                     # Accumulate losses
-                    val_loss_dict['scattering_loss'] += scattering_loss_dict['scattering_loss'].item()
-                    val_loss_dict['phase_loss'] += phase_loss_dict['phase_loss'].item()
-                    val_loss_dict['kld_loss'] += kld_loss_dict['kld_loss'].item()
-                    val_loss_dict['recon_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss']).item()
-                    val_loss_dict['total_loss'] += (scattering_loss_dict['scattering_loss'] + phase_loss_dict['phase_loss'] + kld_loss_dict['kld_loss']).item()
+                    scattering_loss_item = scattering_loss_dict['scattering_loss'].item()
+                    phase_loss_item = phase_loss_dict['phase_loss'].item()
+                    kld_loss_item = kld_loss_dict['kld_loss'].item()
+                    current_recon_loss = scattering_loss_item + phase_loss_item
+                    current_total_loss = current_recon_loss + kld_loss_item
+
+                    val_loss_dict['scattering_loss'] += scattering_loss_item
+                    val_loss_dict['phase_loss'] += phase_loss_item
+                    val_loss_dict['kld_loss'] += kld_loss_item
+                    val_loss_dict['recon_loss'] += current_recon_loss
+                    val_loss_dict['total_loss'] += current_total_loss
+
+                    if rank == 0:
+                        num_batches_processed = i + 1
+                        postfix_dict = {
+                            'mse': f'{val_loss_dict["recon_loss"] / num_batches_processed:.4f}',
+                            'kld': f'{val_loss_dict["kld_loss"] / num_batches_processed:.4f}',
+                            'total': f'{val_loss_dict["total_loss"] / num_batches_processed:.4f}'
+                        }
+                        val_progress_bar.set_postfix(postfix_dict)
             
             # Create tensors of the summed losses for this process
             train_losses_local = torch.tensor(list(train_loss_dict.values()), device=device)
