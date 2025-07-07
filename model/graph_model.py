@@ -79,7 +79,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "7"
 
 matplotlib.use('Agg')
 
-
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = '29500'
 
 class SeqVAEGraphModel:
     def __init__(self, config_file_path=None):
@@ -437,19 +438,20 @@ class SeqVAEGraphModel:
         is_distributed = dist.is_initialized() and dist.get_world_size() > 1
 
         if is_distributed:
-            # In a distributed setup, device is the local rank
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            device = local_rank
+            # In a distributed setup, get rank and determine device from config
+            rank = dist.get_rank()
+            device_id = self.cuda_devices[rank]
+            device = f"cuda:{device_id}"
             torch.cuda.set_device(device)
+
             # Add diagnostic logging
-            logger.info(f"[Process Rank: {dist.get_rank()}] - Running on GPU: {device}")
+            logger.info(f"[Process Rank: {rank}] - Running on GPU: {device}")
             self.base_model.to(device)
             # Find all buffer tensors and move them to the correct device
             for buffer in self.base_model.buffers():
                 buffer.to(device)
             # Wrap the model with DDP
-            model = DDP(self.base_model, device_ids=[device], find_unused_parameters=False)
-            rank = dist.get_rank()
+            model = DDP(self.base_model, device_ids=[device_id], find_unused_parameters=False)
         else:
             # For single GPU or CPU
             rank = 0
@@ -1339,7 +1341,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         dist.destroy_process_group()
 
 
-def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
+def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
     """
     Alternative main function that uses the PyTorch DDP implementation instead of PyTorch Lightning.
     """
@@ -1363,19 +1365,23 @@ def main_pytorch(train_SeqVAE=-1, test_SeqVAE=-1):
 
     with open(config_file_path, 'r') as yaml_file:
         config = yaml.safe_load(yaml_file)
-    
-    # DDP setup: Initialize process group if launched with torchrun
-    is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
-    if is_ddp:
-        # The 'env://' init method is used by default and reads the DDP env vars
-        # set by torchrun.
-        dist.init_process_group(backend="gloo" if sys.platform == "win32" else "nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        logger.info(f"Initialized DDP on rank {rank}/{world_size}.")
+
+    # DDP setup for torch.multiprocessing.spawn
+    dist.init_process_group(
+        backend="gloo" if sys.platform == "win32" else "nccl",
+        world_size=world_size,
+        rank=rank
+    )
+
+    # Set the device for this process based on its rank and the config file
+    cuda_devices = config['general_config']['cuda_devices']
+    if rank < len(cuda_devices):
+        device = cuda_devices[rank]
+        torch.cuda.set_device(device)
+        logger.info(f"Initialized DDP on rank {rank}/{world_size} using GPU {device}.")
     else:
-        rank = 0
-        world_size = 1
+        logger.error(f"Rank {rank} is out of range for configured cuda_devices with length {len(cuda_devices)}")
+        return
 
     # Set matmul precision for Tensor Cores
     torch.set_float32_matmul_precision('high')
@@ -1449,6 +1455,31 @@ if __name__ == '__main__':
     test_model = -1  # 1 to test, -1 to skip
     
     if use_pytorch_ddp:
-        main_pytorch(train_SeqVAE=train_model, test_SeqVAE=test_model)
+        import yaml
+        from torch import multiprocessing as mp
+
+        # Load config to determine the number of GPUs to use
+        config_file_path = 'model/config.yaml'
+        project_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        if not os.path.isabs(config_file_path):
+            config_file_path = os.path.join(project_root, config_file_path)
+
+        with open(config_file_path, 'r') as yaml_file:
+            config = yaml.safe_load(yaml_file)
+        
+        # Determine world size from the number of specified CUDA devices
+        cuda_devices = config['general_config'].get('cuda_devices', [])
+        world_size = len(cuda_devices)
+
+        if world_size == 0:
+            logger.error("No CUDA devices specified in the config file for DDP training.")
+        else:
+            logger.info(f"Spawning {world_size} processes for DDP training on devices: {cuda_devices}")
+            mp.spawn(
+                main_pytorch,
+                args=(world_size, train_model, test_model),
+                nprocs=world_size,
+                join=True
+            )
     else:
         main(train_SeqVAE=train_model, test_SeqVAE=test_model)

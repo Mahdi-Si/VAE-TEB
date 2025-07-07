@@ -1250,7 +1250,12 @@ class SeqVaeTeb(nn.Module):
                 # Replace the warmup part of the predictions
                 avg_pred_tensor[:, :self.warmup_period, :] = warmup_preds
 
-            avg_preds[key] = avg_pred_tensor
+            if key == 'scattering_pred':
+                avg_preds['scattering_mu'] = avg_pred_tensor
+            elif key == 'phase_harmonic_pred':
+                avg_preds['phase_harmonic_mu'] = avg_pred_tensor
+            else:
+                avg_preds[key] = avg_pred_tensor
 
         return avg_preds
 
@@ -1293,8 +1298,8 @@ if __name__ == "__main__":
         
         # Test average predictions
         avg_preds = model.get_average_predictions(forward_outputs)
-        print(f"Average scattering predictions shape: {avg_preds['scattering_pred'].shape}")
-        print(f"Average phase harmonic predictions shape: {avg_preds['phase_harmonic_pred'].shape}")
+        print(f"Average scattering predictions shape: {avg_preds['scattering_mu'].shape}")
+        print(f"Average phase harmonic predictions shape: {avg_preds['phase_harmonic_mu'].shape}")
 
     # --- Simple Training Loop ---
     print("\n--- Starting Simple Training Loop ---")
