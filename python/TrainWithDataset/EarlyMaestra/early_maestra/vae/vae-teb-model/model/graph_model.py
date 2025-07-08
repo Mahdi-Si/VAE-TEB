@@ -82,6 +82,35 @@ matplotlib.use('Agg')
 os.environ['MASTER_ADDR'] = '127.0.0.1'
 os.environ['MASTER_PORT'] = '29500'
 
+def log_gpu_memory_usage(prefix=""):
+    """Log current GPU memory usage for debugging memory issues."""
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved(device) / 1024**3   # GB
+        max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3  # GB
+        logger.info(f"{prefix} GPU {device}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB")
+    else:
+        logger.info(f"{prefix} CUDA not available")
+
+def clear_gpu_memory():
+    """Clear GPU memory cache and run garbage collection."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def check_memory_threshold(threshold_gb=10.0):
+    """Check if GPU memory usage exceeds threshold and clear cache if needed."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        if allocated > threshold_gb:
+            logger.warning(f"GPU memory usage ({allocated:.2f}GB) exceeds threshold ({threshold_gb}GB). Clearing cache...")
+            clear_gpu_memory()
+            return True
+    return False
+
 class SeqVAEGraphModel:
     def __init__(self, config_file_path=None):
         super(SeqVAEGraphModel, self).__init__()
@@ -200,6 +229,17 @@ class SeqVAEGraphModel:
         # sys.stdout = StreamToLogger(self.logger, logging.INFO)
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
         logger.info('==' * 50)
+        
+        # Log initial GPU memory status
+        log_gpu_memory_usage("Initial setup")
+        
+        # Clear any residual GPU memory
+        clear_gpu_memory()
+        
+        # Reset memory statistics
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
 
     def load_checkpoint(self):
         """
@@ -295,6 +335,9 @@ class SeqVAEGraphModel:
             dict: A dictionary containing the training history.
         """
         logger.info("Setting up trainer for the base model...")
+        
+        # Log memory before setting up training
+        log_gpu_memory_usage("Before training setup")
 
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
@@ -303,6 +346,12 @@ class SeqVAEGraphModel:
         )
 
         self.metrics_callback = MetricsLoggingCallback()
+
+        # Memory monitoring callback to prevent OOM errors
+        self.memory_monitor_callback = MemoryMonitorCallback(
+            threshold_gb=8.0,  # Adjust based on your GPU memory
+            log_frequency=100  # Log every 100 batches
+        )
 
         # Callback for early stopping to prevent overfitting
         self.early_stop_callback = EarlyStopping(
@@ -323,10 +372,11 @@ class SeqVAEGraphModel:
             save_last=False,
         )
 
-        # Callback for plotting losses using Plotly
+        # Callback for plotting losses using Plotly with memory optimization
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
-            plot_frequency=1
+            plot_frequency=1,
+            max_history_size=500  # Limit history to prevent memory issues
         )
 
         # Profiler for performance analysis
@@ -350,19 +400,24 @@ class SeqVAEGraphModel:
 
         callbacks_list = [
             ModelSummary(max_depth=-1),
+            self.memory_monitor_callback,
             self.plotting_callback,
             self.checkpoint_callback,
             self.loss_plot_callback,
             self.early_stop_callback,
         ]
 
-        # Instantiate the PyTorch Lightning Trainer
+        # Log memory after callback setup
+        log_gpu_memory_usage("After callback setup")
+
+        # Instantiate the PyTorch Lightning Trainer with memory optimizations
         trainer = L.Trainer(
             devices=devices,
             accelerator=accelerator,
             strategy=strategy,
             log_every_n_steps=loging_steps,
             gradient_clip_val=0.5,
+            gradient_clip_algorithm="norm",  # Specify clipping algorithm
             max_epochs=self.epochs_num,
             enable_checkpointing=True,
             enable_progress_bar=True,
@@ -372,7 +427,19 @@ class SeqVAEGraphModel:
             callbacks=callbacks_list,
             precision="16-mixed",
             accumulate_grad_batches=self.accumulate_grad_batches,
+            # Memory optimization settings
+            limit_train_batches=1.0,  # Use full dataset but can be reduced for debugging
+            limit_val_batches=1.0,    # Use full validation set
+            val_check_interval=1.0,   # Validate once per epoch
+            check_val_every_n_epoch=1,  # Validate every epoch
+            sync_batchnorm=True if len(self.cuda_devices) > 1 else False,  # Only for multi-GPU
+            detect_anomaly=False,     # Disable for performance
+            deterministic=False,      # Allow non-deterministic for performance
+            benchmark=True,           # Enable cudnn benchmark for performance
         )
+
+        # Log memory after trainer setup
+        log_gpu_memory_usage("After trainer setup")
 
         # Find optimal learning rate
         logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
@@ -398,8 +465,14 @@ class SeqVAEGraphModel:
             fig.savefig(plot_path)
             plt.close(fig)
             logger.info(f"Learning rate finder plot saved to {plot_path}")
+            
+            # Clean up lr_finder to free memory
+            del lr_finder, fig
         else:
             logger.warning("Could not find a new learning rate. Using the one from config.")
+
+        # Log memory before training starts
+        log_gpu_memory_usage("Before training starts")
 
         logger.info(f"Starting training of the base model for {self.epochs_num} epochs.")
         trainer.fit(
@@ -409,6 +482,9 @@ class SeqVAEGraphModel:
         )
         logger.info("Finished training the base model.")
 
+        # Log memory after training completes
+        log_gpu_memory_usage("After training completes")
+
         # Save training history
         training_hist = self.loss_plot_callback.history
         path_save_hist = os.path.join(self.train_results_dir, 'base_model_history.pkl')
@@ -416,6 +492,10 @@ class SeqVAEGraphModel:
             pickle.dump(training_hist, f)
         
         logger.info(f"Training history saved to {path_save_hist}")
+
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return training_hist
 
