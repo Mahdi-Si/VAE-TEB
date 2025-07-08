@@ -461,47 +461,66 @@ class PlottingCallBack(Callback):
         batch = pl_module.transfer_batch_to_device(batch, pl_module.device, 0)
 
         pl_module.eval()
-        with torch.no_grad():
-            if not isinstance(pl_module, LightSeqVaeTeb):
-                return
+        try:
+            with torch.no_grad():
+                if not isinstance(pl_module, LightSeqVaeTeb):
+                    return
 
-            y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
-            forward_outputs = pl_module.model(y_st, y_ph, x_ph)
-            avg_preds = pl_module.model.get_average_predictions(forward_outputs)
+                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+                forward_outputs = pl_module.model(y_st, y_ph, x_ph)
+                avg_preds = pl_module.model.get_average_predictions(forward_outputs)
 
-            fhr_st_mean_pred = avg_preds['scattering_mu']
-            fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
-            z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
+                fhr_st_mean_pred = avg_preds['scattering_mu']
+                fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
+                z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
 
-            from utils.data_utils import plot_forward_pass
-            plot_forward_pass(
-                raw_fhr=batch.fhr[0].detach().cpu().numpy(),
-                raw_up=batch.up[0].detach().cpu().numpy(),
-                fhr_st=y_st[0].detach().cpu().numpy(),
-                fhr_ph=y_ph[0].detach().cpu().numpy(),
-                fhr_st_mean_pred=fhr_st_mean_pred[0].detach().cpu().numpy(),
-                fhr_ph_mean_pred=fhr_ph_mean_pred[0].detach().cpu().numpy(),
-                z_latent=z_latent,
-                plot_dir=self.output_dir,
-                plot_title=f"GUID: {batch.guid[0]}, Epoch: {batch.epoch[0].item()}",
-                tag=f'e-{pl_trainer.current_epoch}'
-            )
+                from utils.data_utils import plot_forward_pass
+                plot_forward_pass(
+                    raw_fhr=batch.fhr[0].detach().cpu().numpy(),
+                    raw_up=batch.up[0].detach().cpu().numpy(),
+                    fhr_st=y_st[0].detach().cpu().numpy(),
+                    fhr_ph=y_ph[0].detach().cpu().numpy(),
+                    fhr_st_mean_pred=fhr_st_mean_pred[0].detach().cpu().numpy(),
+                    fhr_ph_mean_pred=fhr_ph_mean_pred[0].detach().cpu().numpy(),
+                    z_latent=z_latent,
+                    plot_dir=self.output_dir,
+                    plot_title=f"GUID: {batch.guid[0]}, Epoch: {batch.epoch[0].item()}",
+                    tag=f'e-{pl_trainer.current_epoch}'
+                )
+                
+                # Explicit cleanup of matplotlib figures and memory
+                plt.close('all')
+                
+                # Clean up tensors to free GPU memory
+                del forward_outputs, avg_preds, fhr_st_mean_pred, fhr_ph_mean_pred, z_latent
+                del y_st, y_ph, x_ph
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+        except Exception as e:
+            logger.error(f"Error during plotting: {e}")
+            # Ensure cleanup even if plotting fails
             plt.close('all')
-
-        pl_module.train()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        finally:
+            # Ensure we return to training mode
+            pl_module.train()
+            # Clean up the batch from memory
+            del batch
 
 
 
 class LossPlotCallback(Callback):
-    def __init__(self, output_dir, plot_frequency=10):
+    def __init__(self, output_dir, plot_frequency=10, max_history_size=1000):
         """
         Args:
             output_dir (str): Directory where the loss plot HTML files will be saved.
             plot_frequency (int): Frequency (in epochs) to generate the loss plot.
+            max_history_size (int): Maximum number of epochs to keep in history to prevent memory issues.
         """
         super().__init__()
         self.output_dir = output_dir
         self.plot_frequency = plot_frequency
+        self.max_history_size = max_history_size
         self.history = {
             "epoch": [],
             "train/total_loss": [],
@@ -516,12 +535,18 @@ class LossPlotCallback(Callback):
             "val/phase_loss": []
         }
 
+    def _trim_history(self):
+        """Trim history to prevent unlimited memory growth."""
+        if len(self.history["epoch"]) > self.max_history_size:
+            # Keep only the last max_history_size entries
+            trim_size = len(self.history["epoch"]) - self.max_history_size
+            for key in self.history:
+                self.history[key] = self.history[key][trim_size:]
+
     def on_validation_epoch_end(self, trainer, pl_module):
         # Extract the current epoch number
         epoch = trainer.current_epoch
-        if (epoch + 1) % self.plot_frequency != 0:
-            return
-
+        
         # Retrieve logged metrics from the trainer
         metrics = trainer.callback_metrics
 
@@ -534,6 +559,9 @@ class LossPlotCallback(Callback):
             if key != "epoch":
                 self.history[key].append(to_float(metrics.get(key)))
 
+        # Trim history to prevent memory issues
+        self._trim_history()
+
         # Check if it's time to plot the losses and only do so on the main process
         if (epoch + 1) % self.plot_frequency == 0 and trainer.is_global_zero:
             self.plot_losses()
@@ -541,44 +569,21 @@ class LossPlotCallback(Callback):
     def plot_losses(self):
         import os
         import plotly.graph_objects as go
+        import gc
 
         # Create a Plotly figure and add a trace for each metric.
         fig = go.Figure()
-        
-        metric_colors = {
-            'total_loss': 'black',
-            'recon_loss': 'green',
-            'kld_loss': 'orange',
-            'scattering_loss': 'purple',
-            'phase_loss': 'brown'
-        }
 
         for key, values in self.history.items():
             if key == "epoch" or not any(v is not None and not np.isnan(v) for v in values):
                 continue
-            
-            parts = key.split('/')
-            split_name = parts[0] # train or val
-            metric_name = parts[1] # loss type
-            
-            # Use different line styles for train and val
-            line_style = 'solid' if split_name == 'train' else 'dash'
 
             fig.add_trace(go.Scatter(
                 x=self.history["epoch"],
                 y=values,
                 mode='lines+markers',
-                name=key.replace('/', ' ').title(),
-                line=dict(
-                    color=metric_colors.get(metric_name, 'grey'), # Default color
-                    dash=line_style
-                ),
-                marker=dict(
-                    symbol='circle' if split_name == 'train' else 'diamond',
-                    size=6
-                )
+                name=key.replace('/', ' ').title()
             ))
-
 
         # Customize layout
         fig.update_layout(
@@ -600,6 +605,10 @@ class LossPlotCallback(Callback):
         plot_path = os.path.join(self.output_dir, f"loss_plot_epoch.html")
         fig.write_html(plot_path)
         logger.info(f"Loss plot saved to {plot_path}")
+        
+        # Clean up figure to free memory
+        del fig
+        gc.collect()
 
 
 
@@ -893,13 +902,21 @@ class LightSeqVaeTeb(L.LightningModule):
         except IndexError:
             # This can happen if the optimizer is not yet configured
             pass
+        
+        # Clear GPU cache at the start of each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _common_step(self, batch, batch_idx):
-        """Common logic for training and validation steps."""
+        """Common logic for training and validation steps with memory optimization."""
         # Access data using correct HDF5 dataset field names  
         y_st = batch.fhr_st      # Scattering transform features
         y_ph = batch.fhr_ph      # Phase harmonic features
         x_ph = batch.fhr_up_ph   # Cross-phase features
+        
+        # Clear any cached computations
+        if hasattr(self.model, 'clear_cache'):
+            self.model.clear_cache()
         
         forward_outputs = self.model(y_st, y_ph, x_ph)
         loss_dict = self.model.compute_loss(
@@ -908,10 +925,19 @@ class LightSeqVaeTeb(L.LightningModule):
             compute_phase_loss=True,
             compute_kld_loss=True
         )
+        
+        # Clean up intermediate tensors to free memory
+        del y_st, y_ph, x_ph
+        if 'forward_outputs' in locals():
+            # Only delete if we have a reference to avoid errors
+            for key in list(forward_outputs.keys()):
+                if key not in ['mu', 'logvar', 'z']:  # Keep essential outputs for loss computation
+                    forward_outputs.pop(key, None)
+        
         return loss_dict
 
     def training_step(self, batch, batch_idx):
-        """Defines the training loop."""
+        """Defines the training loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
         total_loss = loss_dict['total_loss']
 
@@ -922,10 +948,13 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/scattering_loss', loss_dict['scattering_loss'], on_step=False, on_epoch=True, logger=True)
         self.log('train/phase_loss', loss_dict['phase_loss'], on_step=False, on_epoch=True, logger=True)
 
+        # Clear loss_dict to free memory
+        del loss_dict
+        
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        """Defines the validation loop."""
+        """Defines the validation loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
         total_loss = loss_dict['total_loss']
 
@@ -936,7 +965,22 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/scattering_loss', loss_dict['scattering_loss'], on_epoch=True, logger=True)
         self.log('val/phase_loss', loss_dict['phase_loss'], on_epoch=True, logger=True)
 
+        # Clear loss_dict to free memory
+        del loss_dict
+        
         return total_loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Clean up after each training batch."""
+        # Periodic GPU cache clearing to prevent memory buildup
+        if batch_idx % 10 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def on_validation_batch_end(self, outputs, batch, batch_idx):
+        """Clean up after each validation batch."""
+        # Periodic GPU cache clearing to prevent memory buildup
+        if batch_idx % 5 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
@@ -956,3 +1000,64 @@ class LightSeqVaeTeb(L.LightningModule):
                 },
             }
         return optimizer
+
+
+class MemoryMonitorCallback(Callback):
+    """
+    Callback to monitor GPU memory usage and automatically clear cache when needed.
+    """
+    def __init__(self, threshold_gb=10.0, log_frequency=50):
+        """
+        Args:
+            threshold_gb (float): GPU memory threshold in GB above which cache is cleared.
+            log_frequency (int): Frequency (in batches) to log memory usage.
+        """
+        super().__init__()
+        self.threshold_gb = threshold_gb
+        self.log_frequency = log_frequency
+        self.batch_count = 0
+        
+    def _log_memory_usage(self, prefix=""):
+        """Log current GPU memory usage."""
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved(device) / 1024**3   # GB
+            logger.info(f"{prefix} GPU {device}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            return allocated
+        return 0.0
+    
+    def _clear_memory_if_needed(self):
+        """Clear GPU memory if usage exceeds threshold."""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            if allocated > self.threshold_gb:
+                logger.warning(f"GPU memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
+                torch.cuda.empty_cache()
+                return True
+        return False
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Monitor memory after each training batch."""
+        self.batch_count += 1
+        
+        # Log memory usage periodically
+        if self.batch_count % self.log_frequency == 0:
+            self._log_memory_usage(f"Train batch {batch_idx}")
+        
+        # Clear memory if needed
+        self._clear_memory_if_needed()
+    
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Monitor memory after each validation batch."""
+        # Clear memory if needed during validation
+        self._clear_memory_if_needed()
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        """Log memory at the start of each epoch."""
+        self._log_memory_usage(f"Epoch {trainer.current_epoch} start")
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Clear memory and log usage at the end of each epoch."""
+        self._log_memory_usage(f"Epoch {trainer.current_epoch} end")
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
