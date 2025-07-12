@@ -373,16 +373,18 @@ def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, fil
                                                    )
             mimo_adaptor.read_single_input(record, out_dec_factor=16, out_dec_factor_offset=0, target_is_onehot=True,
                                            dtype=np.float32)
-            mimo_prepared, n_padded = mimo_adaptor.mimo.prepare_data(batch_size=1, do_evaluate=True, align_left=True,
-                                                                     do_split=True,
-                                                                     do_pad=True,
-                                                                     do_reflect=True,
-                                                                     base_length=base_block_size,
-                                                                     do_equalize=True,
-                                                                     do_merge=True,
-                                                                     min_domain_start=[-44640, -44640],
-                                                                     max_domain_start=[np.inf, np.inf],
-                                                                     overlap_percentage=overlap_percentage)
+            mimo_prepared, n_padded = mimo_adaptor.mimo.prepare_data(
+                batch_size=1, do_evaluate=True, align_left=True,
+                do_split=True,
+                do_pad=True,
+                do_reflect=True,
+                base_length=base_block_size,
+                do_equalize=True,
+                do_merge=True,
+                min_domain_start=[-44640, -44640],
+                max_domain_start=[np.inf, np.inf],
+                overlap_percentage=overlap_percentage,
+                )
 
             epoch_samples = mimo_prepared.block_input.shape[1]
             fhr = mimo_prepared.block_input[:, :, 1]
