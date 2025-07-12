@@ -7,7 +7,7 @@ import math
 import warnings
 
 
-def improved_initialization(model):
+def initialization(model):
     """
     Improved initialization scheme for all modules in the model.
     
@@ -1059,7 +1059,7 @@ class SeqVaeTeb(nn.Module):
         )
         
         # Apply improved initialization to all modules
-        improved_initialization(self)
+        initialization(self)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Applies the reparameterization trick to sample from a Gaussian with numerical stability."""

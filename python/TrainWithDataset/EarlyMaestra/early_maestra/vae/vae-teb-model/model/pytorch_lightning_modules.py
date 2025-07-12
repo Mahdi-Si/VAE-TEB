@@ -450,7 +450,7 @@ class PlottingCallBack(Callback):
             return
 
         # Fetch a single batch from the validation dataloader
-        val_dataloader = pl_trainer.datamodule.val_dataloader() if hasattr(pl_trainer.datamodule, 'val_dataloader') else pl_trainer.val_dataloaders[0]
+        val_dataloader = pl_trainer.datamodule.val_dataloader() if hasattr(pl_trainer.datamodule, 'val_dataloader') else pl_trainer.val_dataloaders
         try:
             batch = next(iter(val_dataloader))
         except StopIteration:
