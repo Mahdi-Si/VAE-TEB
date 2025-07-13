@@ -35,7 +35,7 @@ from sklearn.metrics import (
     recall_score
 )
 
-from vae_teb_model_improved import SeqVaeTeb
+from vae_teb_model import SeqVaeTeb
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -449,12 +449,22 @@ class PlottingCallBack(Callback):
         if pl_trainer.current_epoch % self.plot_every_epoch != 0 or not pl_trainer.is_global_zero:
             return
 
+        logger.info(f"Starting plotting callback for epoch {pl_trainer.current_epoch}")
+
         # Fetch a single batch from the validation dataloader
-        val_dataloader = pl_trainer.datamodule.val_dataloader() if hasattr(pl_trainer.datamodule, 'val_dataloader') else pl_trainer.val_dataloaders
         try:
+            if hasattr(pl_trainer, 'datamodule') and pl_trainer.datamodule is not None:
+                val_dataloader = pl_trainer.datamodule.val_dataloader()
+            else:
+                # Access validation dataloader directly from trainer
+                val_dataloader = pl_trainer.val_dataloaders
+                if isinstance(val_dataloader, list):
+                    val_dataloader = val_dataloader[0]
+                    
             batch = next(iter(val_dataloader))
-        except StopIteration:
-            logger.warning("Could not get a batch from validation dataloader for plotting.")
+            logger.info("Successfully fetched batch from validation dataloader")
+        except (StopIteration, AttributeError, IndexError) as e:
+            logger.warning(f"Could not get a batch from validation dataloader for plotting: {e}")
             return
 
         # Ensure batch is on the correct device
@@ -463,41 +473,324 @@ class PlottingCallBack(Callback):
         pl_module.eval()
         try:
             with torch.no_grad():
+                # Check if this is the correct Lightning module type
                 if not isinstance(pl_module, LightSeqVaeTeb):
+                    logger.warning(f"PlottingCallback received unexpected module type: {type(pl_module)}. Expected LightSeqVaeTeb.")
                     return
 
+                logger.info("Accessing batch data...")
                 y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
-                forward_outputs = pl_module.model(y_st, y_ph, x_ph)
-                avg_preds = pl_module.model.get_average_predictions(forward_outputs)
-
-                fhr_st_mean_pred = avg_preds['scattering_mu']
-                fhr_ph_mean_pred = avg_preds['phase_harmonic_mu']
-                z_latent = forward_outputs['z'].permute(0, 2, 1)[0].detach().cpu().numpy()
-
-                from utils.data_utils import plot_forward_pass
-                plot_forward_pass(
-                    raw_fhr=batch.fhr[0].detach().cpu().numpy(),
-                    raw_up=batch.up[0].detach().cpu().numpy(),
-                    fhr_st=y_st[0].detach().cpu().numpy(),
-                    fhr_ph=y_ph[0].detach().cpu().numpy(),
-                    fhr_st_mean_pred=fhr_st_mean_pred[0].detach().cpu().numpy(),
-                    fhr_ph_mean_pred=fhr_ph_mean_pred[0].detach().cpu().numpy(),
-                    z_latent=z_latent,
-                    plot_dir=self.output_dir,
-                    plot_title=f"GUID: {batch.guid[0]}, Epoch: {batch.epoch[0].item()}",
-                    tag=f'e-{pl_trainer.current_epoch}'
-                )
+                y_raw_normalized = batch.fhr  # This is the normalized FHR from dataset
                 
-                # Explicit cleanup of matplotlib figures and memory
+                logger.info(f"Batch shapes - y_st: {y_st.shape}, y_ph: {y_ph.shape}, x_ph: {x_ph.shape}, y_raw: {y_raw_normalized.shape}")
+
+                # Implement windowed prediction logic
+                logger.info("Running windowed prediction...")
+                
+                # Parameters for windowed prediction
+                sampling_rate_hz = 4
+                decimation_factor = 16
+                warmup_minutes = 2
+                prediction_window_minutes = 2
+                
+                # Calculate indices
+                warmup_steps_raw = int(warmup_minutes * 60 * sampling_rate_hz)  # t=2*60*4 = 480
+                warmup_steps_decimated = warmup_steps_raw // decimation_factor  # t=2*60*4/16 = 30
+                prediction_window_steps_raw = int(prediction_window_minutes * 60 * sampling_rate_hz)  # 480 steps
+                prediction_window_steps_decimated = prediction_window_steps_raw // decimation_factor  # 30 steps
+                
+                total_decimated_len = y_st.shape[2]
+                total_raw_len = y_raw_normalized.shape[1]
+                
+                logger.info(f"Windowed prediction setup: warmup_raw={warmup_steps_raw}, warmup_decimated={warmup_steps_decimated}")
+                logger.info(f"Prediction window: raw={prediction_window_steps_raw}, decimated={prediction_window_steps_decimated}")
+                
+                # Calculate number of prediction windows
+                num_predictions = max(1, (total_decimated_len - warmup_steps_decimated) // prediction_window_steps_decimated)
+                logger.info(f"Number of prediction windows: {num_predictions}")
+                
+                predicted_segments_mu = []
+                predicted_segments_std = []
+                prediction_start_times_minutes = []
+                prediction_start_times_decimated = []
+                model_outputs = None  # To store last output
+                
+                for i in range(num_predictions):
+                    # Current prediction window start in decimated coordinates
+                    current_input_end_decimated = warmup_steps_decimated + i * prediction_window_steps_decimated
+                    
+                    # Prepare windowed inputs (truncate to current time)
+                    y_st_window = y_st[:, :, :current_input_end_decimated]
+                    y_ph_window = y_ph[:, :, :current_input_end_decimated]
+                    x_ph_window = x_ph[:, :, :current_input_end_decimated]
+                    
+                    logger.info(f"Window {i+1}: input ends at decimated step {current_input_end_decimated}")
+                    
+                    # Run model on the window
+                    model_outputs = pl_module.model(y_st_window, y_ph_window, x_ph_window)
+                    
+                    if 'raw_predictions' not in model_outputs:
+                        logger.error(f"Window {i+1}: Model output missing 'raw_predictions' key")
+                        continue
+                    
+                    raw_predictions = model_outputs['raw_predictions']
+                    if 'raw_signal_mu' not in raw_predictions or 'raw_signal_logvar' not in raw_predictions:
+                        logger.error(f"Window {i+1}: Raw predictions missing required keys")
+                        continue
+                    
+                    pred_mu_full = raw_predictions['raw_signal_mu'][0].squeeze()
+                    pred_logvar_full = raw_predictions['raw_signal_logvar'][0].squeeze()
+                    
+                    # Extract the prediction for the next 2-minute window in raw coordinates
+                    prediction_start_raw = current_input_end_decimated * decimation_factor
+                    prediction_end_raw = prediction_start_raw + prediction_window_steps_raw
+                    
+                    # Ensure we don't exceed the predicted signal length
+                    if prediction_end_raw <= pred_mu_full.size(0):
+                        segment_mu = pred_mu_full[prediction_start_raw:prediction_end_raw].detach().cpu().numpy()
+                        segment_logvar = pred_logvar_full[prediction_start_raw:prediction_end_raw].detach().cpu().numpy()
+                        segment_std = np.exp(0.5 * segment_logvar)
+                        
+                        predicted_segments_mu.append(segment_mu)
+                        predicted_segments_std.append(segment_std)
+                        
+                        # Store timing information
+                        start_time_minutes = (current_input_end_decimated * decimation_factor) / sampling_rate_hz / 60.0
+                        prediction_start_times_minutes.append(start_time_minutes)
+                        prediction_start_times_decimated.append(current_input_end_decimated)
+                        
+                        logger.info(f"Window {i+1}: extracted segment of {len(segment_mu)} samples starting at {start_time_minutes:.2f} min")
+                
+                # Check if we have any predictions
+                if not predicted_segments_mu:
+                    logger.warning("No prediction segments were generated. Using full forward pass.")
+                    # Fallback to full forward pass
+                    model_outputs = pl_module.model(y_st, y_ph, x_ph)
+                    raw_predictions = model_outputs['raw_predictions']
+                    pred_mu = raw_predictions['raw_signal_mu'][0].squeeze().detach().cpu().numpy()
+                    pred_logvar = raw_predictions['raw_signal_logvar'][0].squeeze().detach().cpu().numpy()
+                    pred_std = np.exp(0.5 * pred_logvar)
+                    prediction_start_times_minutes = []
+                else:
+                    # Stitch predictions together
+                    pred_mu = np.concatenate(predicted_segments_mu)
+                    pred_std = np.concatenate(predicted_segments_std)
+                    logger.info(f"Stitched predictions: {len(pred_mu)} samples from {len(predicted_segments_mu)} windows")
+                
+                # Ground truth (first sample in batch)
+                ground_truth = y_raw_normalized[0].squeeze().detach().cpu().numpy()
+                
+                # Get latent representation from the final prediction window
+                z_latent = None
+                if model_outputs and 'z' in model_outputs:
+                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
+                
+                logger.info(f"Data shapes for plotting - pred_mu: {pred_mu.shape}, ground_truth: {ground_truth.shape}")
+                if z_latent is not None:
+                    logger.info(f"Latent shape: {z_latent.shape}")
+
+                # --- Create plots with proper data handling and professional styling ---
+                # Professional pastel color palette for research papers
+                colors = {
+                    'ground_truth': '#2E5984',      # Deep blue-gray (professional)
+                    'prediction': '#C7522A',       # Muted red-orange  
+                    'uncertainty': '#E5B181',      # Light peach
+                    'grid': '#E8E8E8',             # Light gray for grid
+                    'background': '#FAFAFA'        # Very light gray background
+                }
+                
+                # Set the overall style
+                plt.style.use('default')  # Reset to default first
+                plt.rcParams.update({
+                    'figure.facecolor': colors['background'],
+                    'axes.facecolor': 'white',
+                    'axes.edgecolor': '#CCCCCC',
+                    'axes.linewidth': 0.8,
+                    'grid.color': colors['grid'],
+                    'grid.linewidth': 0.5,
+                    'font.size': 10,
+                    'axes.titlesize': 11,
+                    'axes.labelsize': 10,
+                    'legend.fontsize': 9,
+                    'xtick.labelsize': 9,
+                    'ytick.labelsize': 9
+                })
+                
+                fig = plt.figure(figsize=(16, 12), facecolor=colors['background'])
+                
+                # Create a grid layout with very thin colorbar and wider main plots
+                gs = fig.add_gridspec(4, 40, hspace=0.35, wspace=0.05)
+                
+                # Main plots take up most of the width (columns 0-37), colorbar is very thin (38-39)
+                ax1 = fig.add_subplot(gs[0, :37])
+                ax2 = fig.add_subplot(gs[1, :37])
+                ax3 = fig.add_subplot(gs[2, :37])
+                ax4 = fig.add_subplot(gs[3, :37])
+                
+                # Very thin colorbar axis
+                cbar_ax = fig.add_subplot(gs[3, 38:])
+
+                # Time axis in minutes (assuming 4Hz sampling rate)
+                time_axis = np.arange(len(ground_truth)) / 4.0 / 60  # Convert to minutes
+                pred_time_axis = np.arange(len(pred_mu)) / 4.0 / 60  # Prediction time axis
+
+                # Plot 1: Ground truth raw signal
+                ax1.plot(time_axis, ground_truth, color=colors['ground_truth'], 
+                        linewidth=1.2, label='Ground Truth', alpha=0.9)
+                ax1.set_title('Ground Truth Raw FHR Signal', fontweight='medium', pad=15)
+                ax1.set_ylabel('Normalized Amplitude')
+                ax1.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
+                ax1.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
+                ax1.set_facecolor('white')
+                
+                # Plot 2: Predicted raw signal with uncertainty
+                # Ensure arrays have compatible lengths
+                min_len = min(len(pred_time_axis), len(pred_mu), len(pred_std))
+                if min_len > 0:
+                    pred_time_cropped = pred_time_axis[:min_len]
+                    pred_mu_cropped = pred_mu[:min_len]
+                    pred_std_cropped = pred_std[:min_len]
+                    
+                    # Plot uncertainty band first (so it appears behind the line)
+                    ax2.fill_between(pred_time_cropped, 
+                                   pred_mu_cropped - pred_std_cropped, 
+                                   pred_mu_cropped + pred_std_cropped,
+                                   alpha=0.25, color=colors['uncertainty'], 
+                                   label='±1σ Uncertainty', edgecolor='none')
+                    
+                    # Plot prediction line on top
+                    ax2.plot(pred_time_cropped, pred_mu_cropped, 
+                            color=colors['prediction'], linewidth=1.2, 
+                            label='Predicted Mean', alpha=0.9)
+                    
+                    # Add vertical lines to show all prediction window starts
+                    if prediction_start_times_minutes:
+                        for i, start_time in enumerate(prediction_start_times_minutes):
+                            # Only show lines that are within the current plot range
+                            if start_time <= pred_time_cropped[-1]:
+                                line_label = 'Prediction Windows' if i == 0 else ""
+                                ax2.axvline(x=start_time, color='#2D8B2D', linestyle='--', 
+                                          linewidth=1.2, alpha=0.7, label=line_label)
+                        
+                        # Add annotation for the first prediction window
+                        if prediction_start_times_minutes[0] <= pred_time_cropped[-1]:
+                            y_range = pred_mu_cropped.max() - pred_mu_cropped.min()
+                            annotation_y = pred_mu_cropped.min() + y_range * 0.85
+                            first_start = prediction_start_times_minutes[0]
+                            ax2.annotate(f'2-min Windows\n({len(prediction_start_times_minutes)} total)', 
+                                       xy=(first_start, annotation_y),
+                                       xytext=(first_start + pred_time_cropped[-1] * 0.05, annotation_y),
+                                       fontsize=8, color='#2D8B2D', alpha=0.8,
+                                       arrowprops=dict(arrowstyle='->', color='#2D8B2D', alpha=0.6, lw=0.8),
+                                       ha='left', va='center')
+                    
+                    ax2.set_title('Predicted Raw FHR Signal with Uncertainty', fontweight='medium', pad=15)
+                    ax2.set_ylabel('Normalized Amplitude')
+                    ax2.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
+                    ax2.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
+                    ax2.set_facecolor('white')
+                else:
+                    ax2.text(0.5, 0.5, 'No prediction data available', 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax2.transAxes, fontsize=11, color='#666666')
+                    ax2.set_title('Predicted Raw FHR Signal (No Data)', fontweight='medium', pad=15)
+                    ax2.set_facecolor('white')
+                
+                # Plot 3: Comparison overlay with refined styling
+                # Match the lengths for comparison
+                comparison_len = min(len(time_axis), len(pred_time_axis), len(ground_truth), len(pred_mu))
+                if comparison_len > 0:
+                    time_comp = time_axis[:comparison_len]
+                    gt_comp = ground_truth[:comparison_len]
+                    pred_comp = pred_mu[:comparison_len]
+                    
+                    # Ground truth with slightly thicker line
+                    ax3.plot(time_comp, gt_comp, color=colors['ground_truth'], 
+                            linewidth=1.4, alpha=0.85, label='Ground Truth')
+                    
+                    # Prediction with thinner solid line for better comparison
+                    ax3.plot(time_comp, pred_comp, color=colors['prediction'], 
+                            linewidth=0.9, alpha=0.9, label='Predicted', linestyle='-')
+                    
+                    ax3.set_title('Ground Truth vs Predicted Raw FHR Signal', fontweight='medium', pad=15)
+                    ax3.set_ylabel('Normalized Amplitude')
+                    ax3.set_xlabel('Time (minutes)')
+                    ax3.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
+                    ax3.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
+                    ax3.set_facecolor('white')
+                    
+                    # Calculate metrics
+                    mse = np.mean((gt_comp - pred_comp) ** 2)
+                    mae = np.mean(np.abs(gt_comp - pred_comp))
+                    correlation = np.corrcoef(gt_comp, pred_comp)[0, 1] if len(gt_comp) > 1 else 0
+                else:
+                    ax3.text(0.5, 0.5, 'Insufficient data for comparison', 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax3.transAxes, fontsize=11, color='#666666')
+                    ax3.set_title('Ground Truth vs Predicted (No Data)', fontweight='medium', pad=15)
+                    ax3.set_facecolor('white')
+                    mse, mae, correlation = np.nan, np.nan, np.nan
+                
+                # Plot 4: Latent representation with professional colormap and thin colorbar
+                if z_latent is not None and z_latent.size > 0:
+                    # Use a professional colormap suitable for research papers
+                    im = ax4.imshow(z_latent, aspect='auto', cmap='RdYlBu_r', 
+                                  interpolation='nearest', alpha=0.9)
+                    ax4.set_title('Latent Representation', fontweight='medium', pad=15)
+                    ax4.set_xlabel('Time Steps')
+                    ax4.set_ylabel('Latent Dimensions')
+                    ax4.set_facecolor('white')
+                    
+                    # Add thin colorbar to the dedicated axis on the right
+                    cbar = plt.colorbar(im, cax=cbar_ax, orientation='vertical')
+                    cbar_ax.set_ylabel('Latent Value', rotation=270, labelpad=12, fontsize=9)
+                    cbar.ax.tick_params(labelsize=8)
+                    
+                    # Style the colorbar
+                    cbar.outline.set_linewidth(0.5)
+                    cbar.outline.set_edgecolor('#CCCCCC')
+                else:
+                    ax4.text(0.5, 0.5, 'Latent representation not available', 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax4.transAxes, fontsize=11, color='#666666')
+                    ax4.set_title('Latent Representation (N/A)', fontweight='medium', pad=15)
+                    ax4.set_xlabel('Time Steps')
+                    ax4.set_ylabel('Latent Dimensions')
+                    ax4.set_facecolor('white')
+                    # Hide the colorbar axis if no latent data
+                    cbar_ax.set_visible(False)
+                
+                # Get batch info
+                try:
+                    guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
+                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
+                except:
+                    guid = 'unknown'
+                    epoch_info = 'unknown'
+                
+                # Overall title with metrics
+                plt.suptitle(f"Raw Signal Prediction - GUID: {guid}, Epoch: {epoch_info}\n"
+                           f"MSE: {mse:.6f}, MAE: {mae:.6f}, Correlation: {correlation:.4f}", 
+                           fontsize=14, y=0.98)
+                
+                plot_path = f"{self.output_dir}/raw_signal_prediction_e-{pl_trainer.current_epoch}.png"
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                logger.info(f"Raw signal prediction plot saved to {plot_path}")
+                
+                # Explicit cleanup
                 plt.close('all')
                 
                 # Clean up tensors to free GPU memory
-                del forward_outputs, avg_preds, fhr_st_mean_pred, fhr_ph_mean_pred, z_latent
-                del y_st, y_ph, x_ph
+                del model_outputs, raw_predictions
+                if z_latent is not None:
+                    del z_latent
+                del y_st, y_ph, x_ph, y_raw_normalized, pred_mu, pred_std, ground_truth
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             # Ensure cleanup even if plotting fails
             plt.close('all')
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -506,6 +799,7 @@ class PlottingCallBack(Callback):
             pl_module.train()
             # Clean up the batch from memory
             del batch
+
 
 
 
@@ -526,13 +820,11 @@ class LossPlotCallback(Callback):
             "train/total_loss": [],
             "train/recon_loss": [],
             "train/kld_loss": [],
-            "train/scattering_loss": [],
-            "train/phase_loss": [],
+            "train/raw_signal_loss": [],
             "val/total_loss": [],
             "val/recon_loss": [],
             "val/kld_loss": [],
-            "val/scattering_loss": [],
-            "val/phase_loss": []
+            "val/raw_signal_loss": []
         }
 
     def _trim_history(self):
@@ -913,6 +1205,7 @@ class LightSeqVaeTeb(L.LightningModule):
         y_st = batch.fhr_st      # Scattering transform features
         y_ph = batch.fhr_ph      # Phase harmonic features
         x_ph = batch.fhr_up_ph   # Cross-phase features
+        y_raw = batch.fhr        # Raw signal for reconstruction
         
         # Clear any cached computations
         if hasattr(self.model, 'clear_cache'):
@@ -920,18 +1213,15 @@ class LightSeqVaeTeb(L.LightningModule):
         
         forward_outputs = self.model(y_st, y_ph, x_ph)
         loss_dict = self.model.compute_loss(
-            forward_outputs, y_st, y_ph,
-            compute_scattering_loss=True,
-            compute_phase_loss=True,
-            compute_kld_loss=True
+            forward_outputs, y_raw, compute_kld_loss=True
         )
         
         # Clean up intermediate tensors to free memory
-        del y_st, y_ph, x_ph
+        del y_st, y_ph, x_ph, y_raw
         if 'forward_outputs' in locals():
             # Only delete if we have a reference to avoid errors
             for key in list(forward_outputs.keys()):
-                if key not in ['mu', 'logvar', 'z']:  # Keep essential outputs for loss computation
+                if key not in ['z', 'raw_predictions']:  # Keep essential outputs for loss computation
                     forward_outputs.pop(key, None)
         
         return loss_dict
@@ -945,8 +1235,7 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/scattering_loss', loss_dict['scattering_loss'], on_step=False, on_epoch=True, logger=True)
-        self.log('train/phase_loss', loss_dict['phase_loss'], on_step=False, on_epoch=True, logger=True)
+        self.log('train/raw_signal_loss', loss_dict['raw_signal_loss'], on_step=False, on_epoch=True, logger=True)
 
         # Clear loss_dict to free memory
         del loss_dict
@@ -962,8 +1251,7 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
         self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/scattering_loss', loss_dict['scattering_loss'], on_epoch=True, logger=True)
-        self.log('val/phase_loss', loss_dict['phase_loss'], on_epoch=True, logger=True)
+        self.log('val/raw_signal_loss', loss_dict['raw_signal_loss'], on_epoch=True, logger=True)
 
         # Clear loss_dict to free memory
         del loss_dict

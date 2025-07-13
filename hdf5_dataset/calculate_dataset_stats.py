@@ -889,8 +889,8 @@ def calculate_and_save_dataset_stats(
 if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    input_files = [r'hie_cs.hdf5']
-    output_file = 'stats.hdf5'
+    input_files = [r"C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5"]
+    output_file = r'C:\Users\mahdi\Desktop\McGill\data\data\stats.hdf5'
     # Calculate and save stats
     stats = calculate_and_save_dataset_stats(
         input_files,
