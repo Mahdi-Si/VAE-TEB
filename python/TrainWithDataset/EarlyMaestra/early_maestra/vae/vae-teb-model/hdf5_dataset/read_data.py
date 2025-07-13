@@ -17,7 +17,7 @@ import numpy as np
 # todo: import the correct model
 # from SeqVAE_model_2_Channel import VRNNGauss, ClassifierBlock, VRNNClassifier
 import random
-from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
+# from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
 import shutil
 import logging
 import math

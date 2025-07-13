@@ -1129,12 +1129,16 @@ class Decoder(nn.Module):
 
         Args:
             predictions: Dictionary containing raw_signal_mu and raw_signal_logvar
-            target_raw_signal: Ground truth raw signal (B, S*16, 1)
+            target_raw_signal: Ground truth raw signal (B, S*16, 1) or (B, S*16)
         Returns:
             NLL loss tensor
         """
         mu = predictions["raw_signal_mu"]
         logvar = predictions["raw_signal_logvar"]
+
+        # Ensure target has a channel dimension for broadcasting
+        if target_raw_signal.dim() == mu.dim() - 1:
+            target_raw_signal = target_raw_signal.unsqueeze(-1)
 
         # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
         # Use more memory-efficient computation

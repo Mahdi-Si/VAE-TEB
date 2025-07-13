@@ -1,6 +1,6 @@
 general_config:
-  tag: test_runs
-  cuda_devices: [0, 1, 2, 3, 4, 5]
+  tag: test_runs___
+  cuda_devices: [0]
   train_classifier: False
   lr: 0.00025
   lr_milestone: [12000]
@@ -10,8 +10,8 @@ general_config:
   epochs: 10
   accumulate_grad_batches: 4
   batch_size:
-    train: 20
-    test: 20
+    train: 50
+    test: 50
 
 model_config:
   VAE_model:
@@ -44,7 +44,7 @@ dataset_config:
       - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
     vae_test_datasets:
       - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
-    stat_path: hdf5_dataset/stats.hdf5
+    stat_path: C:\Users\mahdi\Desktop\McGill\data\data\stats.hdf5
     dataloader_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']

@@ -63,7 +63,7 @@ from sklearn.manifold import TSNE
 import pandas as pd
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-from vae_teb_model_improved import SeqVaeTeb
+from vae_teb_model import SeqVaeTeb
 from pytorch_lightning_modules import LightSeqVaeTeb
 
 from torch.optim.lr_scheduler import MultiStepLR
@@ -79,8 +79,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "7"
 
 matplotlib.use('Agg')
 
-os.environ['MASTER_ADDR'] = '127.0.0.1'
-os.environ['MASTER_PORT'] = '29500'
+# os.environ['MASTER_ADDR'] = '127.0.0.1'
+# os.environ['MASTER_PORT'] = '29500'
 
 def log_gpu_memory_usage(prefix=""):
     """Log current GPU memory usage for debugging memory issues."""
@@ -256,8 +256,7 @@ class SeqVAEGraphModel:
             base_model_for_loading = SeqVaeTeb(
                 input_channels=76,  # Replace with config values if available
                 sequence_length=300,
-                prediction_horizon=30,
-                warmup_period=30,
+                decimation_factor=16,
                 kld_beta=1.0
             )
 
@@ -268,6 +267,7 @@ class SeqVAEGraphModel:
                     strict=False 
                 )
                 self.base_model = self.lightning_base_model.model
+                self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
             except Exception as e:
                 logger.error(f"Failed to load checkpoint: {e}")
@@ -284,8 +284,8 @@ class SeqVAEGraphModel:
             self.base_model = SeqVaeTeb(
                 input_channels=76,
                 sequence_length=300,
-                prediction_horizon=30,
-                warmup_period=30,
+                decimation_factor=16,
+                warmup_period=60,
                 kld_beta=1.0
             )
             self.lightning_base_model = LightSeqVaeTeb(
@@ -295,6 +295,7 @@ class SeqVAEGraphModel:
                 beta_schedule="constant",
                 beta_const_val=self.kld_beta_
             )
+            self.pytorch_model = self.base_model  # Set pytorch_model reference
 
     def load_pytorch_checkpoint(self):
         if self.seqvae_ckp is not None:
@@ -441,35 +442,35 @@ class SeqVAEGraphModel:
         # Log memory after trainer setup
         log_gpu_memory_usage("After trainer setup")
 
-        # Find optimal learning rate
-        logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
-        tuner = Tuner(trainer)
-
-        # Run learning rate finder
-        lr_finder = tuner.lr_find(
-            self.lightning_base_model,
-            train_dataloaders=train_loader,
-            val_dataloaders=validation_loader
-        )
-
-        # Get suggestion and update model
-        if lr_finder and lr_finder.suggestion():
-            new_lr = lr_finder.suggestion()
-            self.lightning_base_model.hparams.lr = new_lr
-            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-            logger.info(f"Found new optimal learning rate: {new_lr}")
-
-            # Plot results
-            fig = lr_finder.plot(suggest=True)
-            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-            fig.savefig(plot_path)
-            plt.close(fig)
-            logger.info(f"Learning rate finder plot saved to {plot_path}")
-            
-            # Clean up lr_finder to free memory
-            del lr_finder, fig
-        else:
-            logger.warning("Could not find a new learning rate. Using the one from config.")
+        # # Find optimal learning rate
+        # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
+        # tuner = Tuner(trainer)
+        #
+        # # Run learning rate finder
+        # lr_finder = tuner.lr_find(
+        #     self.lightning_base_model,
+        #     train_dataloaders=train_loader,
+        #     val_dataloaders=validation_loader
+        # )
+        #
+        # # Get suggestion and update model
+        # if lr_finder and lr_finder.suggestion():
+        #     new_lr = lr_finder.suggestion()
+        #     self.lightning_base_model.hparams.lr = new_lr
+        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+        #     logger.info(f"Found new optimal learning rate: {new_lr}")
+        #
+        #     # Plot results
+        #     fig = lr_finder.plot(suggest=True)
+        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+        #     fig.savefig(plot_path)
+        #     plt.close(fig)
+        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
+        #
+        #     # Clean up lr_finder to free memory
+        #     del lr_finder, fig
+        # else:
+        #     logger.warning("Could not find a new learning rate. Using the one from config.")
 
         # Log memory before training starts
         log_gpu_memory_usage("Before training starts")
@@ -569,8 +570,8 @@ class SeqVAEGraphModel:
             # so we don't need to manually set the epoch.
             
             train_loss_dict = {
-                'total_loss': 0.0, 'recon_loss': 0.0, 'kld_loss': 0.0,
-                'scattering_loss': 0.0, 'phase_loss': 0.0
+                'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kld_loss': 0.0,
+                'raw_signal_loss': 0.0
             }
             
             # --- Training Loop ---
@@ -580,6 +581,7 @@ class SeqVAEGraphModel:
                 y_st = batch_data.fhr_st.to(device)      # Scattering transform features
                 y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
                 x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
+                y_raw = batch_data.fhr.to(device)        # Raw signal for reconstruction
 
                 optimizer.zero_grad()
 
@@ -587,17 +589,11 @@ class SeqVAEGraphModel:
                     with torch.amp.autocast('cuda'):
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
-                        # Compute all losses and combine them for a single backward pass
-                        scattering_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph, True, False, False)
-                        phase_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph, False, True, False)
-                        kld_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph, False, False, True)
+                        # Compute loss with new API for raw signal reconstruction
+                        loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_raw, compute_kld_loss=True)
                         
-                        total_loss = (scattering_loss_dict['scattering_loss'] + 
-                                      phase_loss_dict['phase_loss'] + 
-                                      kld_loss_dict['kld_loss'])
+                        total_loss = loss_dict['total_loss']
 
                     # Single backward pass on the combined loss
                     scaler.scale(total_loss).backward()
@@ -612,17 +608,11 @@ class SeqVAEGraphModel:
                     # Forward pass (shared computation)
                     forward_outputs = model(y_st, y_ph, x_ph)
                     
-                    # Compute and combine losses for a single backward pass
-                    scattering_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph, True, False, False)
-                    phase_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph, False, True, False)
-                    kld_loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph, False, False, True)
+                    # Compute loss with new API for raw signal reconstruction
+                    loss_dict = plain_model.compute_loss(
+                        forward_outputs, y_raw, compute_kld_loss=True)
 
-                    total_loss = (scattering_loss_dict['scattering_loss'] + 
-                                  phase_loss_dict['phase_loss'] + 
-                                  kld_loss_dict['kld_loss'])
+                    total_loss = loss_dict['total_loss']
 
                     # Single backward pass
                     total_loss.backward()
@@ -632,15 +622,13 @@ class SeqVAEGraphModel:
                     optimizer.step()
 
                 # Accumulate losses for logging
-                scattering_loss_item = scattering_loss_dict['scattering_loss'].item()
-                phase_loss_item = phase_loss_dict['phase_loss'].item()
-                kld_loss_item = kld_loss_dict['kld_loss'].item()
-                current_recon_loss = scattering_loss_item + phase_loss_item
+                reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
+                kld_loss_item = loss_dict['kld_loss'].item()
+                raw_signal_loss_item = loss_dict['raw_signal_loss'].item()
 
-                train_loss_dict['scattering_loss'] += scattering_loss_item
-                train_loss_dict['phase_loss'] += phase_loss_item
+                train_loss_dict['reconstruction_loss'] += reconstruction_loss_item
                 train_loss_dict['kld_loss'] += kld_loss_item
-                train_loss_dict['recon_loss'] += current_recon_loss
+                train_loss_dict['raw_signal_loss'] += raw_signal_loss_item
                 train_loss_dict['total_loss'] += total_loss.item()
                 
                 # Update progress bar
@@ -649,7 +637,7 @@ class SeqVAEGraphModel:
                     num_batches_processed = i + 1
                     postfix_dict = {
                         'lr': f'{lr:.2e}',
-                        'mse': f'{train_loss_dict["recon_loss"] / num_batches_processed:.4f}',
+                        'recon': f'{train_loss_dict["reconstruction_loss"] / num_batches_processed:.4f}',
                         'kld': f'{train_loss_dict["kld_loss"] / num_batches_processed:.4f}',
                         'total': f'{train_loss_dict["total_loss"] / num_batches_processed:.4f}'
                     }
@@ -658,8 +646,8 @@ class SeqVAEGraphModel:
             # --- Validation Loop ---
             model.eval()
             val_loss_dict = {
-                'total_loss': 0.0, 'recon_loss': 0.0, 'kld_loss': 0.0,
-                'scattering_loss': 0.0, 'phase_loss': 0.0
+                'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kld_loss': 0.0,
+                'raw_signal_loss': 0.0
             }
             with torch.no_grad():
                 val_progress_bar = tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0))
@@ -668,71 +656,38 @@ class SeqVAEGraphModel:
                     y_st = batch_data.fhr_st.to(device)      # Scattering transform features
                     y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
                     x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
+                    y_raw = batch_data.fhr.to(device)        # Raw signal for reconstruction
                     
                     # Use mixed precision for validation if available
                     if scaler is not None:
                         with torch.amp.autocast('cuda'):
                             forward_outputs = model(y_st, y_ph, x_ph)
                             
-                            # Compute all losses separately for validation (no backward pass needed)
-                            scattering_loss_dict = plain_model.compute_loss(
-                                forward_outputs, y_st, y_ph,
-                                compute_scattering_loss=True,
-                                compute_phase_loss=False,
-                                compute_kld_loss=False
-                            )
-                            phase_loss_dict = plain_model.compute_loss(
-                                forward_outputs, y_st, y_ph,
-                                compute_scattering_loss=False,
-                                compute_phase_loss=True,
-                                compute_kld_loss=False
-                            )
-                            kld_loss_dict = plain_model.compute_loss(
-                                forward_outputs, y_st, y_ph,
-                                compute_scattering_loss=False,
-                                compute_phase_loss=False,
-                                compute_kld_loss=True
-                            )
+                            # Compute loss with new API for raw signal reconstruction
+                            loss_dict = plain_model.compute_loss(
+                                forward_outputs, y_raw, compute_kld_loss=True)
                     else:
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
-                        # Compute all losses separately for validation (no backward pass needed)
-                        scattering_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=True,
-                            compute_phase_loss=False,
-                            compute_kld_loss=False
-                        )
-                        phase_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=False,
-                            compute_phase_loss=True,
-                            compute_kld_loss=False
-                        )
-                        kld_loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph,
-                            compute_scattering_loss=False,
-                            compute_phase_loss=False,
-                            compute_kld_loss=True
-                        )
+                        # Compute loss with new API for raw signal reconstruction
+                        loss_dict = plain_model.compute_loss(
+                            forward_outputs, y_raw, compute_kld_loss=True)
                     
                     # Accumulate losses
-                    scattering_loss_item = scattering_loss_dict['scattering_loss'].item()
-                    phase_loss_item = phase_loss_dict['phase_loss'].item()
-                    kld_loss_item = kld_loss_dict['kld_loss'].item()
-                    current_recon_loss = scattering_loss_item + phase_loss_item
-                    current_total_loss = current_recon_loss + kld_loss_item
+                    reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
+                    kld_loss_item = loss_dict['kld_loss'].item()
+                    raw_signal_loss_item = loss_dict['raw_signal_loss'].item()
+                    current_total_loss = loss_dict['total_loss'].item()
 
-                    val_loss_dict['scattering_loss'] += scattering_loss_item
-                    val_loss_dict['phase_loss'] += phase_loss_item
+                    val_loss_dict['reconstruction_loss'] += reconstruction_loss_item
                     val_loss_dict['kld_loss'] += kld_loss_item
-                    val_loss_dict['recon_loss'] += current_recon_loss
+                    val_loss_dict['raw_signal_loss'] += raw_signal_loss_item
                     val_loss_dict['total_loss'] += current_total_loss
 
                     if rank == 0:
                         num_batches_processed = i + 1
                         postfix_dict = {
-                            'mse': f'{val_loss_dict["recon_loss"] / num_batches_processed:.4f}',
+                            'recon': f'{val_loss_dict["reconstruction_loss"] / num_batches_processed:.4f}',
                             'kld': f'{val_loss_dict["kld_loss"] / num_batches_processed:.4f}',
                             'total': f'{val_loss_dict["total_loss"] / num_batches_processed:.4f}'
                         }
@@ -771,12 +726,12 @@ class SeqVAEGraphModel:
 
                 logger.info(
                     f"Epoch {epoch+1}: Train Loss: {avg_train_losses['total_loss']:.4f} "
-                    f"(Scat: {avg_train_losses['scattering_loss']:.4f}, "
-                    f"Phase: {avg_train_losses['phase_loss']:.4f}, "
+                    f"(Recon: {avg_train_losses['reconstruction_loss']:.4f}, "
+                    f"Raw: {avg_train_losses['raw_signal_loss']:.4f}, "
                     f"KLD: {avg_train_losses['kld_loss']:.4f}), "
                     f"Val Loss: {avg_val_losses['total_loss']:.4f} "
-                    f"(Scat: {avg_val_losses['scattering_loss']:.4f}, "
-                    f"Phase: {avg_val_losses['phase_loss']:.4f}, "
+                    f"(Recon: {avg_val_losses['reconstruction_loss']:.4f}, "
+                    f"Raw: {avg_val_losses['raw_signal_loss']:.4f}, "
                     f"KLD: {avg_val_losses['kld_loss']:.4f})"
                 )
                 
@@ -826,474 +781,675 @@ class SeqVAEGraphModel:
         return None
 
 
-    def seqvae_prediction_plot(self, dataloader, prediction_idx, device):
-        self.pytorch_model.eval()
-        num_predictions_ = int((300 - prediction_idx) / 30)
-        for idx, batched_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-            input_data = batched_data[0].to(device)
-            guids_list = batched_data[2]
-            epoch_nums_list = batched_data[3].to(device)
-            save_dir_prediction = os.path.join(self.test_results_dir, 'predictions_st')
-            os.makedirs(save_dir_prediction, exist_ok=True)
-
-            predicted_list_mean = []
-            predicted_list_var = []
-            selected_idx = [1, 10, 20, 30, 35, 58, 62, 29, 50, 60, 69, 100, 119, 169, 170, 179, 190]
-            with torch.no_grad():
-                vline_indices = []
-                for j in range(num_predictions_):
-                    prediction_idx_m = prediction_idx + (j*30)
-                    vline_indices.append(prediction_idx_m)
-                    scattering_original, prediction_mean, prediction_logvar = \
-                        self.pytorch_model.predict_next(input_data, prediction_index=prediction_idx_m, epoch_num=epoch_nums_list, zero_source=self.zero_source)
-                    predicted_list_mean.append(prediction_mean)
-                    predicted_list_var.append(torch.exp(prediction_logvar))
-                prediction_mean = torch.cat(predicted_list_mean, dim=2)
-                prediction_var = torch.cat(predicted_list_var, dim=2)
-                # prediction_mean = prediction_mean.permute(0, 2, 1)
-                for k in selected_idx:
-                    try:
-                        plot_prediction_st(input_data[k].unsqueeze(-1).detach().cpu().numpy(),
-                                           sx=scattering_original[k].permute(1, 0).detach().cpu().numpy(),
-                                           sx_pmean=prediction_mean[k].detach().cpu().numpy(),
-                                           sx_pvar=prediction_var[k].detach().cpu().numpy(),
-                                           plot_second_channel= (self.input_channel_num==2),
-                                           plot_dir=save_dir_prediction,
-                                           prediction_idx=prediction_idx,
-                                           vline_indices=vline_indices,
-                                           plot_title=f'{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}',
-                                           tag=f'{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}')
-                    except Exception as e:
-                        logger.info(f'{e}')
-
-                result = self.pytorch_model(input_data, epoch_num=epoch_nums_list, zero_source=self.zero_source)
-                # if window is not None:
-                #     sxr = result.decoder_mean[0].detach().cpu().numpy()
-                #     sxr_std = result.decoder_std[0].detach().cpu().numpy()
-                save_dir_prediction = os.path.join(self.test_results_dir, 'test_results')
-                os.makedirs(save_dir_prediction, exist_ok=True)
-                for k in selected_idx:
-                    try:
-                        plot_forward_pass(signal=input_data[k].detach().cpu().numpy(),
-                                          fhr_st=result.sx.permute(1, 2, 0)[k][:, :].detach().cpu().numpy(),
-                                          meta=None,
-                                          plot_second_channel=(self.input_channel_num == 2),
-                                          fhr_st_pr=result.decoder_mean[k][:, :].detach().cpu().numpy(),
-                                          Sxr_std=result.decoder_std[k][:, :].detach().cpu().numpy(),
-                                          z_latent=result.z_latent[k][:, :].detach().cpu().numpy(),
-                                          plot_dir=save_dir_prediction,
-                                          plot_title=f"",
-                                          tag=f'{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}')
-                        plt.close('all')
-                    except Exception as e:
-                        logger.info(f'{e}')
-
-    def test_seqvae_torch_model(self, dataloader, device):
-        save_dir_prediction = os.path.join(self.test_results_dir, 'testing_kls')
+    def seqvae_raw_signal_plot(self, dataloader, device):
+        """
+        Plot raw signal predictions using the new SeqVaeTeb model.
+        This replaces the old seqvae_prediction_plot method to work with raw signal architecture.
+        """
+        if not hasattr(self, 'base_model') or self.base_model is None:
+            logger.error("Base model not initialized. Cannot perform raw signal plotting.")
+            return
+            
+        self.base_model.eval()
+        save_dir_prediction = os.path.join(self.test_results_dir, 'raw_signal_predictions')
         os.makedirs(save_dir_prediction, exist_ok=True)
-        self.pytorch_model.eval()
-        with torch.no_grad():
-            for idx, batched_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-                input_data = batched_data[0].to(device)
-                guids_list = batched_data[2]
-                epoch_nums_list = batched_data[3].to(device)
-                result = self.pytorch_model(input_data, zero_source=False, epoch_num=epoch_nums_list)
-                result_no_source = self.pytorch_model(input_data, zero_source=True, epoch_num=epoch_nums_list)
-                selected_idx = [119, 169, 170, 179, 190]
+        
+        selected_idx = [1, 10, 20, 30, 35, 58, 62, 29, 50, 60, 69, 100, 119, 169, 170, 179, 190]
+        
+        for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
+            # Access data using correct HDF5 dataset field names
+            y_st = batch_data.fhr_st.to(device)      # Scattering transform features
+            y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
+            x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
+            y_raw = batch_data.fhr.to(device)        # Raw signal ground truth
+            guids_list = batch_data.guid if hasattr(batch_data, 'guid') else [f'sample_{i}' for i in range(y_st.size(0))]
+            epochs_list = batch_data.epoch if hasattr(batch_data, 'epoch') else torch.zeros(y_st.size(0))
+            
+            with torch.no_grad():
+                # Forward pass to get raw signal predictions
+                forward_outputs = self.base_model(y_st, y_ph, x_ph)
+                raw_predictions = forward_outputs['raw_predictions']
+                
+                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, S*16, 1)
+                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, S*16, 1)
+                raw_signal_std = torch.exp(0.5 * raw_signal_logvar)
+                z_latent = forward_outputs['z']  # (B, S, latent_dim)
+                
+                # Plot for selected samples
                 for k in selected_idx:
+                    if k >= y_raw.size(0):
+                        continue
+                        
                     try:
-                        kld_diff_mean = result.decoder_mean[k][:, 3:] - result_no_source.decoder_mean[k][:, 3:]
-                        kld_diff_std = result.decoder_std[k][:, 3:] - result_no_source.decoder_std[k][:, 3:]
-                        latent_diff = result.z_latent[k][:, 3:] - result_no_source.z_latent[k][:, 3:]
-                        kld_kld_diff = result.kld_values[k][:, 3:] - result_no_source.kld_values[k][:, 3:]
-                        plot_forward_pass_kld(signal=input_data[k].detach().cpu().numpy(),
-                                              Sx=result.sx.permute(1, 2, 0)[k][:, 3:].detach().cpu().numpy(),
-                                              meta=None,
-                                              plot_second_channel=(self.input_channel_num == 2),
-                                              Sxr=result.decoder_mean[k][:, 3:].detach().cpu().numpy(),
-                                              Sxr_std=result.decoder_std[k][:, 3:].detach().cpu().numpy(),
-                                              z_latent=result.z_latent[k][:, 3:].detach().cpu().numpy(),
-                                              plot_dir=save_dir_prediction,
-                                              plot_title=f"{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}",
-                                              kld_elements=result.kld_values[k][:, 3:].detach().cpu().numpy(),
-                                              tag=f'{k}--{idx}-with-source',)
-                        plot_forward_pass_kld(signal=input_data[k].detach().cpu().numpy(),
-                                              Sx=result_no_source.sx.permute(1, 2, 0)[k][:, 3:].detach().cpu().numpy(),
-                                              meta=None,
-                                              plot_second_channel=(self.input_channel_num == 2),
-                                              Sxr=result_no_source.decoder_mean[k][:, 3:].detach().cpu().numpy(),
-                                              Sxr_std=result_no_source.decoder_std[k][:, 3:].detach().cpu().numpy(),
-                                              z_latent=result_no_source.z_latent[k][:, 3:].detach().cpu().numpy(),
-                                              plot_dir=save_dir_prediction,
-                                              plot_title=f"{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}",
-                                              kld_elements=result_no_source.kld_values[k][:, 3:].detach().cpu().numpy(),
-                                              tag=f'{k}--{idx}-without-source')
-
-                        plot_forward_pass_kld(signal=input_data[k].detach().cpu().numpy(),
-                                              Sx=result.sx.permute(1, 2, 0)[k][:, 3:].detach().cpu().numpy(),
-                                              meta=None,
-                                              plot_second_channel=(self.input_channel_num == 2),
-                                              Sxr=kld_diff_mean.detach().cpu().numpy(),
-                                              Sxr_std=kld_diff_std.detach().cpu().numpy(),
-                                              z_latent=latent_diff.detach().cpu().numpy(),
-                                              plot_dir=save_dir_prediction,
-                                              plot_title=f"{guids_list[k]}-{epoch_nums_list[k].item()}-{idx}",
-                                              kld_elements=kld_kld_diff.detach().cpu().numpy(),
-                                              tag=f'{k}--{idx}-difference')
+                        # Prepare data for plotting
+                        y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()  # Ground truth raw signal
+                        raw_pred_mean = raw_signal_mu[k].squeeze().detach().cpu().numpy()  # Predicted mean
+                        raw_pred_std = raw_signal_std[k].squeeze().detach().cpu().numpy()  # Predicted std
+                        z_sample = z_latent[k].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
+                        
+                        # Create a comprehensive plot
+                        fig, axes = plt.subplots(4, 1, figsize=(15, 12))
+                        
+                        # Plot 1: Ground truth raw signal
+                        axes[0].plot(y_raw_sample, 'b-', linewidth=1, label='Ground Truth')
+                        axes[0].set_title('Ground Truth Raw Signal')
+                        axes[0].set_ylabel('Amplitude')
+                        axes[0].legend()
+                        axes[0].grid(True, alpha=0.3)
+                        
+                        # Plot 2: Predicted raw signal with uncertainty
+                        time_steps = np.arange(len(raw_pred_mean))
+                        axes[1].plot(raw_pred_mean, 'r-', linewidth=1, label='Predicted Mean')
+                        axes[1].fill_between(time_steps, 
+                                           raw_pred_mean - raw_pred_std, 
+                                           raw_pred_mean + raw_pred_std, 
+                                           alpha=0.3, color='red', label='±1 Std')
+                        axes[1].set_title('Predicted Raw Signal with Uncertainty')
+                        axes[1].set_ylabel('Amplitude')
+                        axes[1].legend()
+                        axes[1].grid(True, alpha=0.3)
+                        
+                        # Plot 3: Comparison overlay
+                        axes[2].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth')
+                        axes[2].plot(raw_pred_mean, 'r--', linewidth=1, alpha=0.7, label='Predicted')
+                        axes[2].set_title('Ground Truth vs Predicted Raw Signal')
+                        axes[2].set_ylabel('Amplitude')
+                        axes[2].legend()
+                        axes[2].grid(True, alpha=0.3)
+                        
+                        # Plot 4: Latent representation
+                        im = axes[3].imshow(z_sample, aspect='auto', cmap='viridis', interpolation='nearest')
+                        axes[3].set_title('Latent Representation')
+                        axes[3].set_xlabel('Time Steps')
+                        axes[3].set_ylabel('Latent Dimensions')
+                        plt.colorbar(im, ax=axes[3])
+                        
+                        # Overall title
+                        guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
+                        epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
+                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}')
+                        
+                        plt.tight_layout()
+                        
+                        # Save plot
+                        plot_filename = f'raw_signal_pred_{guid}_{epoch}_{idx}_sample_{k}.png'
+                        plot_path = os.path.join(save_dir_prediction, plot_filename)
+                        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                        plt.close('all')
+                        
+                        logger.info(f"Saved raw signal plot: {plot_path}")
+                        
                     except Exception as e:
-                        logger.info(e)
-                logger.info('done')
+                        logger.error(f'Error plotting sample {k}: {e}')
+                        plt.close('all')
+                
+                # Cleanup
+                del forward_outputs, raw_predictions, raw_signal_mu, raw_signal_logvar, raw_signal_std, z_latent
+
+    def test_raw_signal_model(self, dataloader, device):
+        """
+        Test raw signal model by analyzing KLD differences and raw signal reconstruction quality.
+        This replaces the old test_seqvae_torch_model method.
+        """
+        if not hasattr(self, 'base_model') or self.base_model is None:
+            logger.error("Base model not initialized. Cannot perform testing.")
+            return
+            
+        save_dir_prediction = os.path.join(self.test_results_dir, 'raw_signal_testing')
+        os.makedirs(save_dir_prediction, exist_ok=True)
+        
+        self.base_model.eval()
+        selected_idx = [1, 10, 20, 30, 35] # Reduced for efficiency
+        
+        with torch.no_grad():
+            for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
+                # Access data using correct HDF5 dataset field names
+                y_st = batch_data.fhr_st.to(device)
+                y_ph = batch_data.fhr_ph.to(device)
+                x_ph = batch_data.fhr_up_ph.to(device)
+                y_raw = batch_data.fhr.to(device)
+                guids_list = batch_data.guid if hasattr(batch_data, 'guid') else [f'sample_{i}' for i in range(y_st.size(0))]
+                epochs_list = batch_data.epoch if hasattr(batch_data, 'epoch') else torch.zeros(y_st.size(0))
+                
+                # Forward pass with and without source information (zero out x_ph)
+                forward_outputs = self.base_model(y_st, y_ph, x_ph)
+                forward_outputs_no_source = self.base_model(y_st, y_ph, torch.zeros_like(x_ph))
+                
+                # Extract predictions
+                raw_pred = forward_outputs['raw_predictions']['raw_signal_mu']
+                raw_pred_no_source = forward_outputs_no_source['raw_predictions']['raw_signal_mu']
+                z_latent = forward_outputs['z']
+                z_latent_no_source = forward_outputs_no_source['z']
+                
+                # Compute differences
+                raw_signal_diff = raw_pred - raw_pred_no_source
+                latent_diff = z_latent - z_latent_no_source
+                
+                for k in selected_idx:
+                    if k >= y_raw.size(0):
+                        continue
+                        
+                    try:
+                        # Prepare data for plotting
+                        guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
+                        epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
+                        
+                        # Create comprehensive comparison plots
+                        fig, axes = plt.subplots(5, 1, figsize=(15, 20))
+                        
+                        # Plot 1: Ground truth
+                        y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()
+                        axes[0].plot(y_raw_sample, 'k-', linewidth=1, label='Ground Truth')
+                        axes[0].set_title('Ground Truth Raw Signal')
+                        axes[0].set_ylabel('Amplitude')
+                        axes[0].legend()
+                        axes[0].grid(True, alpha=0.3)
+                        
+                        # Plot 2: With source vs without source
+                        raw_with_source = raw_pred[k].squeeze().detach().cpu().numpy()
+                        raw_without_source = raw_pred_no_source[k].squeeze().detach().cpu().numpy()
+                        
+                        axes[1].plot(raw_with_source, 'b-', linewidth=1, alpha=0.7, label='With Source')
+                        axes[1].plot(raw_without_source, 'r-', linewidth=1, alpha=0.7, label='Without Source')
+                        axes[1].set_title('Predicted Raw Signal: With vs Without Source')
+                        axes[1].set_ylabel('Amplitude')
+                        axes[1].legend()
+                        axes[1].grid(True, alpha=0.3)
+                        
+                        # Plot 3: Source influence (difference)
+                        raw_diff = raw_signal_diff[k].squeeze().detach().cpu().numpy()
+                        axes[2].plot(raw_diff, 'g-', linewidth=1, label='Source Influence')
+                        axes[2].set_title('Source Influence on Raw Signal Prediction')
+                        axes[2].set_ylabel('Amplitude Difference')
+                        axes[2].legend()
+                        axes[2].grid(True, alpha=0.3)
+                        
+                        # Plot 4: Latent space differences
+                        latent_diff_sample = latent_diff[k].permute(1, 0).detach().cpu().numpy()
+                        im1 = axes[3].imshow(latent_diff_sample, aspect='auto', cmap='RdBu_r', 
+                                           interpolation='nearest', vmin=-latent_diff_sample.std(), 
+                                           vmax=latent_diff_sample.std())
+                        axes[3].set_title('Latent Space Difference (With - Without Source)')
+                        axes[3].set_ylabel('Latent Dimensions')
+                        plt.colorbar(im1, ax=axes[3])
+                        
+                        # Plot 5: Reconstruction quality comparison
+                        axes[4].plot(y_raw_sample, 'k-', linewidth=1.5, alpha=0.8, label='Ground Truth')
+                        axes[4].plot(raw_with_source, 'b--', linewidth=1, alpha=0.7, label='With Source')
+                        axes[4].plot(raw_without_source, 'r:', linewidth=1, alpha=0.7, label='Without Source')
+                        axes[4].set_title('Reconstruction Quality Comparison')
+                        axes[4].set_xlabel('Time Steps')
+                        axes[4].set_ylabel('Amplitude')
+                        axes[4].legend()
+                        axes[4].grid(True, alpha=0.3)
+                        
+                        plt.suptitle(f'Raw Signal Model Test - GUID: {guid}, Epoch: {epoch}, Batch: {idx}')
+                        plt.tight_layout()
+                        
+                        # Save plot
+                        plot_filename = f'raw_signal_test_{guid}_{epoch}_{idx}_sample_{k}.png'
+                        plot_path = os.path.join(save_dir_prediction, plot_filename)
+                        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                        plt.close('all')
+                        
+                        # Compute and log quality metrics
+                        mse_with_source = np.mean((y_raw_sample - raw_with_source) ** 2)
+                        mse_without_source = np.mean((y_raw_sample - raw_without_source) ** 2)
+                        source_influence_magnitude = np.mean(np.abs(raw_diff))
+                        
+                        logger.info(f"Sample {k}: MSE with source: {mse_with_source:.6f}, "
+                                  f"MSE without source: {mse_without_source:.6f}, "
+                                  f"Source influence: {source_influence_magnitude:.6f}")
+                        
+                    except Exception as e:
+                        logger.error(f'Error testing sample {k}: {e}')
+                        plt.close('all')
+                
+                # Cleanup
+                del forward_outputs, forward_outputs_no_source, raw_pred, raw_pred_no_source
+                del z_latent, z_latent_no_source, raw_signal_diff, latent_diff
+                
+        logger.info('Raw signal model testing completed.')
 
 
-    def seqvae_mse_test(self, seqvae_mse_test_dataloader,  tag="error_stats", device=None):
+    def raw_signal_evaluation_test(self, dataloader, tag="raw_signal_error_stats", device=None):
+        """
+        Comprehensive evaluation of raw signal reconstruction quality.
+        This replaces the old seqvae_mse_test method to work with raw signal architecture.
+        """
+        if not hasattr(self, 'base_model') or self.base_model is None:
+            logger.error("Base model not initialized. Cannot perform evaluation.")
+            return None
+            
         base_dir = self.test_results_dir
-        self.pytorch_model.to(device)
-        self.pytorch_model.eval()
+        self.base_model.to(device)
+        self.base_model.eval()
+        
+        # Metrics for raw signal evaluation
         mse_all_list = []
         mse_energy_norm_list = []
         vaf_all_list = []
         log_likelihood_list = []
-        st_list = []
+        raw_signal_list = []
         snr_all_list = []
+        pearson_corr_list = []
 
         with torch.no_grad():
-            for idx, batched_data in tqdm(enumerate(seqvae_mse_test_dataloader), total=len(seqvae_mse_test_dataloader)):
-                input_data = batched_data[0].to(device)
-                guids_list = batched_data[2]
-                epoch_nums_list = batched_data[3].to(device)
-                results_t = self.pytorch_model(input_data, zero_source=self.zero_source, epoch_num=epoch_nums_list)
-                dec_mean_t_ = results_t.decoder_mean[:, :, 20:280]  # (batch, input_dim, length)
-                dec_std_t_ = torch.sqrt(torch.exp(results_t.decoder_std))[:, :, 20:280]
-                sx_t_ = results_t.sx.permute(1, 2, 0)[:, :, 20:280]  # (batch, input_dim, length)
-                # MSE per channel
-                mse_per_ce = torch.mean((sx_t_ - dec_mean_t_) ** 2, dim=2)  # (batch, input_dim)
+            for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
+                # Access data using correct HDF5 dataset field names
+                y_st = batch_data.fhr_st.to(device)
+                y_ph = batch_data.fhr_ph.to(device) 
+                x_ph = batch_data.fhr_up_ph.to(device)
+                y_raw = batch_data.fhr.to(device)  # Ground truth raw signal
+                
+                # Forward pass to get raw signal predictions
+                forward_outputs = self.base_model(y_st, y_ph, x_ph)
+                raw_predictions = forward_outputs['raw_predictions']
+                
+                # Extract predictions and ground truth
+                raw_pred_mu = raw_predictions['raw_signal_mu']  # (B, S*16, 1)
+                raw_pred_logvar = raw_predictions['raw_signal_logvar']  # (B, S*16, 1)
+                
+                # Ground truth y_raw is expected to be (B, S*16).
+                # Squeeze predictions to match for metric calculations.
+                raw_pred_squeezed = raw_pred_mu.squeeze(-1)  # (B, S*16)
+                raw_std_squeezed = torch.exp(0.5 * raw_pred_logvar.squeeze(-1))  # (B, S*16)
+                
+                # MSE calculation
+                mse_per_sample = torch.mean((y_raw - raw_pred_squeezed) ** 2, dim=1)  # (B,)
+                
                 # Energy of the original signal
-                energy_per_coeff = torch.mean(sx_t_ ** 2, dim=2)  # (batch, input_dim)
-
+                energy_per_sample = torch.mean(y_raw ** 2, dim=1)  # (B,)
+                
                 # Energy-normalized MSE
-                energy_normalized_mse = mse_per_ce / (energy_per_coeff + 1e-12)
-
-                # VAF calculation
-                _, vaf = calculate_vaf(sx_t_, dec_mean_t_)  # (input_dim,)
-                # vaf = vaf.unsqueeze(0)  # make it (1, input_dim) for concatenation
-
-                # Log-likelihood calculation
-                log_likelihoods = calculate_log_likelihood(dec_mean_t_, dec_std_t_, sx_t_)
-
+                energy_normalized_mse = mse_per_sample / (energy_per_sample + 1e-12)
+                
+                # VAF calculation (Variance Accounted For)
+                y_raw_centered = y_raw - torch.mean(y_raw, dim=1, keepdim=True)
+                pred_centered = raw_pred_squeezed - torch.mean(raw_pred_squeezed, dim=1, keepdim=True)
+                
+                numerator = torch.sum(y_raw_centered * pred_centered, dim=1) ** 2
+                denominator = torch.sum(y_raw_centered ** 2, dim=1) * torch.sum(pred_centered ** 2, dim=1)
+                vaf = numerator / (denominator + 1e-12)  # (B,)
+                
+                # Log-likelihood calculation using predicted mean and std
+                log_likelihood = -0.5 * (raw_pred_logvar.squeeze(-1) + 
+                                        ((y_raw - raw_pred_squeezed) ** 2) / 
+                                        (torch.exp(raw_pred_logvar.squeeze(-1)) + 1e-12))
+                log_likelihood_per_sample = torch.mean(log_likelihood, dim=1)  # (B,)
+                
                 # SNR calculation (in dB)
-                signal_power = torch.mean(sx_t_ ** 2, dim=2)  # (batch, input_dim)
-                noise_power = torch.mean((sx_t_ - dec_mean_t_) ** 2, dim=2)  # (batch, input_dim)
-                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))  # (batch, input_dim)
-
+                signal_power = torch.mean(y_raw ** 2, dim=1)  # (B,)
+                noise_power = torch.mean((y_raw - raw_pred_squeezed) ** 2, dim=1)  # (B,)
+                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))  # (B,)
+                
+                # Pearson correlation coefficient
+                pearson_corr = torch.zeros(y_raw.size(0), device=device)
+                for i in range(y_raw.size(0)):
+                    y_true = y_raw[i]
+                    y_pred = raw_pred_squeezed[i]
+                    
+                    y_true_centered = y_true - torch.mean(y_true)
+                    y_pred_centered = y_pred - torch.mean(y_pred)
+                    
+                    numerator = torch.sum(y_true_centered * y_pred_centered)
+                    denominator = torch.sqrt(torch.sum(y_true_centered ** 2) * torch.sum(y_pred_centered ** 2))
+                    pearson_corr[i] = numerator / (denominator + 1e-12)
+                
                 # Accumulate results
-                mse_all_list.append(mse_per_ce)
+                mse_all_list.append(mse_per_sample)
                 mse_energy_norm_list.append(energy_normalized_mse)
                 vaf_all_list.append(vaf)
-                log_likelihood_list.extend(log_likelihoods)
-                st_list.append(sx_t_)
+                log_likelihood_list.append(log_likelihood_per_sample)
+                raw_signal_list.append(y_raw)
                 snr_all_list.append(snr)
+                pearson_corr_list.append(pearson_corr)
 
-        tag_hist = tag + 'loglikelihood_'
-        save_dir_hist = os.path.join(base_dir, tag_hist)
+        # Create results directory
+        save_dir_hist = os.path.join(base_dir, f'{tag}_results')
         os.makedirs(save_dir_hist, exist_ok=True)
 
         # Concatenate all data
-        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N, input_dim)
-        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N, input_dim)
-        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N, input_dim)
-        all_st_tensor = torch.cat(st_list, dim=0)  # (N, input_dim, length)
-        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N, input_dim)
-        save_path_ttest = os.path.join(save_dir_hist, f'{tag}-snr-t-test.npy')
-        np.save(save_path_ttest, snr_all_data.detach().cpu().numpy())
-        # Mean and std of the entire dataset
-        all_st_mean = all_st_tensor.mean(dim=0)  # (input_dim, length)
-        all_st_std = all_st_tensor.std(dim=0)  # (input_dim, length)
-
-        # Plot distributions of Sx
-        plot_distributions(
-            sx_mean=all_st_mean.detach().cpu().numpy(),
-            sx_std=all_st_std.detach().cpu().numpy(),
-            plot_second_channel=False,
-            plot_sample=False,
-            plot_dir=save_dir_hist,
-            plot_dataset_average=True,
-            tag='st_mean'
-        )
-
-        # Plot histogram of log-likelihood
+        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N,)
+        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N,)
+        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N,)
+        log_likelihood_all = torch.cat(log_likelihood_list, dim=0)  # (N,)
+        all_raw_signals = torch.cat(raw_signal_list, dim=0)  # (N, signal_length)
+        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N,)
+        pearson_all_data = torch.cat(pearson_corr_list, dim=0)  # (N,)
+        
+        # Convert to numpy for saving
+        mse_np = mse_all_data.detach().cpu().numpy()
+        mse_energy_norm_np = mse_energy_normalized.detach().cpu().numpy()
+        vaf_np = vaf_all_data.detach().cpu().numpy()
+        log_likelihood_np = log_likelihood_all.detach().cpu().numpy()
+        snr_np = snr_all_data.detach().cpu().numpy()
+        pearson_np = pearson_all_data.detach().cpu().numpy()
+        
+        # Calculate statistics
+        stats = {
+            'mse_mean': np.mean(mse_np),
+            'mse_std': np.std(mse_np),
+            'mse_energy_norm_mean': np.mean(mse_energy_norm_np),
+            'mse_energy_norm_std': np.std(mse_energy_norm_np),
+            'vaf_mean': np.mean(vaf_np),
+            'vaf_std': np.std(vaf_np),
+            'log_likelihood_mean': np.mean(log_likelihood_np),
+            'log_likelihood_std': np.std(log_likelihood_np),
+            'snr_mean': np.mean(snr_np),
+            'snr_std': np.std(snr_np),
+            'pearson_mean': np.mean(pearson_np),
+            'pearson_std': np.std(pearson_np),
+        }
+        
+        # Log statistics
+        logger.info("Raw Signal Evaluation Results:")
+        logger.info(f"MSE: {stats['mse_mean']:.6f} ± {stats['mse_std']:.6f}")
+        logger.info(f"Energy-normalized MSE: {stats['mse_energy_norm_mean']:.6f} ± {stats['mse_energy_norm_std']:.6f}")
+        logger.info(f"VAF: {stats['vaf_mean']:.4f} ± {stats['vaf_std']:.4f}")
+        logger.info(f"Log-likelihood: {stats['log_likelihood_mean']:.4f} ± {stats['log_likelihood_std']:.4f}")
+        logger.info(f"SNR (dB): {stats['snr_mean']:.2f} ± {stats['snr_std']:.2f}")
+        logger.info(f"Pearson correlation: {stats['pearson_mean']:.4f} ± {stats['pearson_std']:.4f}")
+        
+        # Save raw data
+        np.save(os.path.join(save_dir_hist, f'{tag}_mse.npy'), mse_np)
+        np.save(os.path.join(save_dir_hist, f'{tag}_mse_energy_norm.npy'), mse_energy_norm_np)
+        np.save(os.path.join(save_dir_hist, f'{tag}_vaf.npy'), vaf_np)
+        np.save(os.path.join(save_dir_hist, f'{tag}_log_likelihood.npy'), log_likelihood_np)
+        np.save(os.path.join(save_dir_hist, f'{tag}_snr.npy'), snr_np)
+        np.save(os.path.join(save_dir_hist, f'{tag}_pearson_corr.npy'), pearson_np)
+        
+        # Save statistics
+        import json
+        with open(os.path.join(save_dir_hist, f'{tag}_statistics.json'), 'w') as f:
+            json.dump(stats, f, indent=2)
+        
+        # Create plots using the available plotting utilities
         plot_histogram(
-            data=np.array(log_likelihood_list),
+            data=log_likelihood_np,
             single_channel=True,
-            bins=160,
+            bins=50,
             save_dir=save_dir_hist,
-            tag='loglikelihood_original'
+            tag=f'{tag}_log_likelihood'
         )
-
-        # Save VAF data
-        vaf_path = os.path.join(save_dir_hist, f'{tag}-vaf_all_data_all_channels.npy')
-        np.save(vaf_path, vaf_all_data.detach().cpu().numpy())
-
-        # Averages across channels for MSE
-        mse_all_data_averaged = torch.mean(mse_all_data, dim=1)  # (N,)
-        mse_energy_normalized_averaged = torch.mean(mse_energy_normalized, dim=1)  # (N,)
-
-        # Save MSE averaged data
-        mse_avg_path = os.path.join(save_dir_hist, f'{tag}-mse_all_data_averaged.npy')
-        np.save(mse_avg_path, mse_all_data_averaged.detach().cpu().numpy())
-
-        mse_norm_avg_path = os.path.join(save_dir_hist, f'{tag}-mse_all_data_normalized_averaged.npy')
-        np.save(mse_norm_avg_path, mse_energy_normalized_averaged.detach().cpu().numpy())
-
-        # Plot histograms for MSE distributions
+        
         plot_histogram(
-            data=mse_all_data_averaged.detach().cpu().numpy(),
+            data=mse_np,
             single_channel=True,
-            bins=160,
+            bins=50,
             save_dir=save_dir_hist,
-            tag='mse-all_dist'
+            tag=f'{tag}_mse'
         )
-
+        
         plot_histogram(
-            data=mse_all_data.detach().cpu().numpy(),
-            single_channel=False,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='mse-all-data-per'
-        )
-
-        # ---------- NEW: SNR and VAF single-channel averaged distributions ----------
-
-        # SNR averaged per sample
-        snr_all_data_averaged = torch.mean(snr_all_data, dim=1)  # (N,)
-        snr_hist_path = os.path.join(save_dir_hist, f'{tag}-snr_all_data.npy')
-        np.save(snr_hist_path, snr_all_data.detach().cpu().numpy())
-
-        # Plot SNR histogram for all data (per-channel)
-        plot_histogram(
-            data=snr_all_data.detach().cpu().numpy(),
-            single_channel=False,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='snr-all-data-per'
-        )
-
-        # Plot SNR histogram averaged over channels (similar to mse-all_dist)
-        plot_histogram(
-            data=snr_all_data_averaged.detach().cpu().numpy(),
+            data=snr_np,
             single_channel=True,
-            bins=160,
+            bins=50,
             save_dir=save_dir_hist,
-            tag='snr-all_dist'
+            tag=f'{tag}_snr'
         )
-
-        # VAF averaged per sample
-        vaf_all_data_averaged = torch.mean(vaf_all_data, dim=1)  # (N,)
-        vaf_hist_path = os.path.join(save_dir_hist, f'{tag}-vaf_all_data_all_channels_averaged.npy')
-        np.save(vaf_hist_path, vaf_all_data_averaged.detach().cpu().numpy())
-
-        # Plot VAF histogram for all data (per-channel)
+        
         plot_histogram(
-            data=vaf_all_data.detach().cpu().numpy(),
-            single_channel=False,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='vaf-all-data-per'
-        )
-
-        # Plot VAF histogram averaged over channels (similar to mse-all_dist)
-        plot_histogram(
-            data=vaf_all_data_averaged.detach().cpu().numpy(),
+            data=vaf_np,
             single_channel=True,
-            bins=160,
+            bins=50,
             save_dir=save_dir_hist,
-            tag='vaf-all_dist'
+            tag=f'{tag}_vaf'
+        )
+        
+        plot_histogram(
+            data=pearson_np,
+            single_channel=True,
+            bins=50,
+            save_dir=save_dir_hist,
+            tag=f'{tag}_pearson_correlation'
         )
 
-        return all_st_tensor
+        return all_raw_signals
 
     # todo: you can make one function for accuracy analysis and combine both
-    def seqvae_prediction_accuracy_test(self, seqvae_mse_test_dataloader,  tag="prediction_error_stats", prediction_idx=30, device=None):
+    def raw_signal_prediction_accuracy_test(self, test_dataloader, tag="raw_signal_prediction_accuracy", prediction_idx=30, device=None):
+        """
+        Test raw signal prediction accuracy over sliding windows with comprehensive evaluation metrics.
+        
+        Args:
+            test_dataloader: DataLoader containing test data
+            tag: Tag for saving results  
+            prediction_idx: Starting index for predictions
+            device: Device for computation
+        """
         base_dir = self.test_results_dir
         self.pytorch_model.to(device)
         self.pytorch_model.eval()
+        
+        # Initialize metric collections
         mse_all_list = []
         mse_energy_norm_list = []
         vaf_all_list = []
         log_likelihood_list = []
-        st_list = []
+        raw_signals_list = []
         snr_all_list = []
-        num_predictions = int((300 - prediction_idx) / 30)
+        pearson_all_list = []
+        
+        # Calculate number of prediction windows
+        warmup_period = getattr(self.pytorch_model, 'warmup_period', 60)
+        decimation_factor = getattr(self.pytorch_model, 'decimation_factor', 16)
+        window_size = 30
+        num_predictions = max(1, int((300 - prediction_idx) / window_size))
+        
+        logger.info(f"Running prediction accuracy test with {num_predictions} prediction windows")
+        
         with torch.no_grad():
-            for idx, batched_data in tqdm(enumerate(seqvae_mse_test_dataloader), total=len(seqvae_mse_test_dataloader)):
-                input_data = batched_data[0].to(device)
-                guids_list = batched_data[2]
-                epoch_nums_list = batched_data[3].to(device)
+            for idx, batched_data in tqdm(enumerate(test_dataloader), total=len(test_dataloader)):
+                y_st, y_ph, x_ph, y_raw = [data.to(device) for data in batched_data[:4]]
+                
+                # Ensure y_raw has a channel dimension as expected by the rest of the function
+                if y_raw.dim() == 2:
+                    y_raw = y_raw.unsqueeze(-1)
+                
+                # Collect predictions for sliding windows
                 predicted_list_mean = []
-                predicted_list_var = []
+                predicted_list_logvar = []
+                
                 for j in range(num_predictions):
-                    prediction_idx_m = prediction_idx + (j * 30)
-                    scattering_original, prediction_mean, prediction_logvar = \
-                        self.pytorch_model.predict_next(input_data, prediction_index=prediction_idx_m, epoch_num=epoch_nums_list, zero_source=self.zero_source)
-                    predicted_list_mean.append(prediction_mean)
-                    predicted_list_var.append(torch.exp(prediction_logvar))
-                dec_mean_t_ = torch.cat(predicted_list_mean, dim=2)  # (batch, input_dim, length)
-                dec_std_t_ = torch.cat(predicted_list_var, dim=2)
-                sx_t_ = scattering_original.permute(0, 2, 1)[:, :, prediction_idx:]
-                # MSE per channel
-                mse_per_ce = torch.mean((sx_t_ - dec_mean_t_) ** 2, dim=2)  # (batch, input_dim)
-                # Energy of the original signal
-                energy_per_coeff = torch.mean(sx_t_ ** 2, dim=2)  # (batch, input_dim)
-
-                # Energy-normalized MSE
-                energy_normalized_mse = mse_per_ce / (energy_per_coeff + 1e-12)
-
+                    prediction_idx_m = prediction_idx + (j * window_size)
+                    
+                    # Get window inputs
+                    y_st_window = y_st[:, :, :prediction_idx_m]
+                    y_ph_window = y_ph[:, :, :prediction_idx_m] 
+                    x_ph_window = x_ph[:, :, :prediction_idx_m]
+                    
+                    # Forward pass through model
+                    forward_outputs = self.pytorch_model(y_st_window, y_ph_window, x_ph_window)
+                    raw_predictions = forward_outputs['raw_predictions']
+                    
+                    # Extract predictions for this window
+                    raw_signal_mu = raw_predictions['raw_signal_mu']  # (batch, 4800, 1)
+                    raw_signal_logvar = raw_predictions['raw_signal_logvar']
+                    
+                    # Extract the prediction segment corresponding to current window
+                    start_raw = prediction_idx_m * decimation_factor
+                    end_raw = start_raw + (window_size * decimation_factor)
+                    
+                    if end_raw <= raw_signal_mu.size(1):
+                        predicted_list_mean.append(raw_signal_mu[:, start_raw:end_raw, :])
+                        predicted_list_logvar.append(raw_signal_logvar[:, start_raw:end_raw, :])
+                
+                if not predicted_list_mean:
+                    continue
+                    
+                # Concatenate predictions across time
+                dec_mean_t = torch.cat(predicted_list_mean, dim=1)  # (batch, total_length, 1)
+                dec_logvar_t = torch.cat(predicted_list_logvar, dim=1)
+                dec_std_t = torch.exp(0.5 * dec_logvar_t)
+                
+                # Extract corresponding ground truth segment
+                start_raw = prediction_idx * decimation_factor
+                end_raw = start_raw + dec_mean_t.size(1)
+                y_raw_target = y_raw[:, start_raw:end_raw, :]
+                
+                if dec_mean_t.size(1) != y_raw_target.size(1):
+                    min_len = min(dec_mean_t.size(1), y_raw_target.size(1))
+                    dec_mean_t = dec_mean_t[:, :min_len, :]
+                    dec_std_t = dec_std_t[:, :min_len, :]
+                    y_raw_target = y_raw_target[:, :min_len, :]
+                
+                # Calculate comprehensive metrics
+                
+                # MSE (single channel for raw signals)
+                mse_per_sample = torch.mean((y_raw_target - dec_mean_t) ** 2, dim=1)  # (batch, 1)
+                
+                # Energy normalization
+                energy_per_sample = torch.mean(y_raw_target ** 2, dim=1)  # (batch, 1)
+                energy_normalized_mse = mse_per_sample / (energy_per_sample + 1e-12)
+                
                 # VAF calculation
-                _, vaf = calculate_vaf(sx_t_, dec_mean_t_)  # (input_dim,)
-                # vaf = vaf.unsqueeze(0)  # make it (1, input_dim) for concatenation
-
+                _, vaf = calculate_vaf(y_raw_target.permute(0, 2, 1), dec_mean_t.permute(0, 2, 1))
+                
                 # Log-likelihood calculation
-                log_likelihoods = calculate_log_likelihood(dec_mean_t_, dec_std_t_, sx_t_)
-
+                log_likelihoods = calculate_log_likelihood(
+                    dec_mean_t.permute(0, 2, 1), 
+                    dec_std_t.permute(0, 2, 1), 
+                    y_raw_target.permute(0, 2, 1)
+                )
+                
                 # SNR calculation (in dB)
-                signal_power = torch.mean(sx_t_ ** 2, dim=2)  # (batch, input_dim)
-                noise_power = torch.mean((sx_t_ - dec_mean_t_) ** 2, dim=2)  # (batch, input_dim)
-                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))  # (batch, input_dim)
-
+                signal_power = torch.mean(y_raw_target ** 2, dim=1)  # (batch, 1)
+                noise_power = torch.mean((y_raw_target - dec_mean_t) ** 2, dim=1)  # (batch, 1)
+                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))
+                
+                # Pearson correlation
+                y_flat = y_raw_target.view(y_raw_target.size(0), -1)  # (batch, length)
+                pred_flat = dec_mean_t.view(dec_mean_t.size(0), -1)
+                
+                pearson_corr = []
+                for b in range(y_flat.size(0)):
+                    y_centered = y_flat[b] - torch.mean(y_flat[b])
+                    pred_centered = pred_flat[b] - torch.mean(pred_flat[b])
+                    correlation = torch.sum(y_centered * pred_centered) / (
+                        torch.sqrt(torch.sum(y_centered ** 2)) * 
+                        torch.sqrt(torch.sum(pred_centered ** 2)) + 1e-12
+                    )
+                    pearson_corr.append(correlation.unsqueeze(0))
+                
+                pearson_batch = torch.cat(pearson_corr, dim=0).unsqueeze(1)  # (batch, 1)
+                
                 # Accumulate results
-                mse_all_list.append(mse_per_ce)
+                mse_all_list.append(mse_per_sample)
                 mse_energy_norm_list.append(energy_normalized_mse)
                 vaf_all_list.append(vaf)
                 log_likelihood_list.extend(log_likelihoods)
-                st_list.append(sx_t_)
+                raw_signals_list.append(y_raw_target)
                 snr_all_list.append(snr)
+                pearson_all_list.append(pearson_batch)
 
-        tag_hist = tag + 'loglikelihood_'
+        # Create results directory
+        tag_hist = tag + '_results'
         save_dir_hist = os.path.join(base_dir, tag_hist)
         os.makedirs(save_dir_hist, exist_ok=True)
 
-        # Concatenate all data
-        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N, input_dim)
-        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N, input_dim)
-        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N, input_dim)
-        all_st_tensor = torch.cat(st_list, dim=0)  # (N, input_dim, length)
-        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N, input_dim)
-        save_path_ttest = os.path.join(save_dir_hist, f'{tag}-snr-t-test.npy')
-        np.save(save_path_ttest, snr_all_data.detach().cpu().numpy())
-        # Mean and std of the entire dataset
-        all_st_mean = all_st_tensor.mean(dim=0)  # (input_dim, length)
-        all_st_std = all_st_tensor.std(dim=0)  # (input_dim, length)
+        # Concatenate all metrics
+        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N, 1)
+        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N, 1)
+        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N, 1)
+        all_raw_signals = torch.cat(raw_signals_list, dim=0)  # (N, length, 1)
+        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N, 1)
+        pearson_all_data = torch.cat(pearson_all_list, dim=0)  # (N, 1)
 
-        # Plot distributions of Sx
+        # Save metrics
+        np.save(os.path.join(save_dir_hist, f'{tag}_mse_all_data.npy'), mse_all_data.detach().cpu().numpy())
+        np.save(os.path.join(save_dir_hist, f'{tag}_mse_energy_normalized.npy'), mse_energy_normalized.detach().cpu().numpy())
+        np.save(os.path.join(save_dir_hist, f'{tag}_vaf_all_data.npy'), vaf_all_data.detach().cpu().numpy())
+        np.save(os.path.join(save_dir_hist, f'{tag}_snr_all_data.npy'), snr_all_data.detach().cpu().numpy())
+        np.save(os.path.join(save_dir_hist, f'{tag}_pearson_all_data.npy'), pearson_all_data.detach().cpu().numpy())
+
+        # Calculate signal statistics
+        all_raw_mean = all_raw_signals.mean(dim=0)  # (length, 1)
+        all_raw_std = all_raw_signals.std(dim=0)   # (length, 1)
+
+        # Plot raw signal distributions
         plot_distributions(
-            sx_mean=all_st_mean.detach().cpu().numpy(),
-            sx_std=all_st_std.detach().cpu().numpy(),
+            sx_mean=all_raw_mean.squeeze(-1).detach().cpu().numpy(),
+            sx_std=all_raw_std.squeeze(-1).detach().cpu().numpy(),
             plot_second_channel=False,
             plot_sample=False,
             plot_dir=save_dir_hist,
             plot_dataset_average=True,
-            tag='st_mean'
+            tag='raw_signal_mean'
         )
 
-        # Plot histogram of log-likelihood
+        # Plot metric histograms
         plot_histogram(
             data=np.array(log_likelihood_list),
             single_channel=True,
             bins=160,
             save_dir=save_dir_hist,
-            tag='loglikelihood_original'
-        )
-
-        # Save VAF data
-        vaf_path = os.path.join(save_dir_hist, f'{tag}-vaf_all_data_all_channels.npy')
-        np.save(vaf_path, vaf_all_data.detach().cpu().numpy())
-
-        # Averages across channels for MSE
-        mse_all_data_averaged = torch.mean(mse_all_data, dim=1)  # (N,)
-        mse_energy_normalized_averaged = torch.mean(mse_energy_normalized, dim=1)  # (N,)
-
-        # Save MSE averaged data
-        mse_avg_path = os.path.join(save_dir_hist, f'{tag}-mse_all_data_averaged.npy')
-        np.save(mse_avg_path, mse_all_data_averaged.detach().cpu().numpy())
-
-        mse_norm_avg_path = os.path.join(save_dir_hist, f'{tag}-mse_all_data_normalized_averaged.npy')
-        np.save(mse_norm_avg_path, mse_energy_normalized_averaged.detach().cpu().numpy())
-
-        # Plot histograms for MSE distributions
-        plot_histogram(
-            data=mse_all_data_averaged.detach().cpu().numpy(),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='mse-all_dist'
+            tag=f'{tag}_loglikelihood'
         )
 
         plot_histogram(
             data=mse_all_data.detach().cpu().numpy(),
-            single_channel=False,
+            single_channel=True,
             bins=160,
             save_dir=save_dir_hist,
-            tag='mse-all-data-per'
+            tag=f'{tag}_mse'
         )
 
-        # ---------- NEW: SNR and VAF single-channel averaged distributions ----------
-
-        # SNR averaged per sample
-        snr_all_data_averaged = torch.mean(snr_all_data, dim=1)  # (N,)
-        snr_hist_path = os.path.join(save_dir_hist, f'{tag}-snr_all_data.npy')
-        np.save(snr_hist_path, snr_all_data.detach().cpu().numpy())
-
-        # Plot SNR histogram for all data (per-channel)
         plot_histogram(
             data=snr_all_data.detach().cpu().numpy(),
-            single_channel=False,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='snr-all-data-per'
-        )
-
-        # Plot SNR histogram averaged over channels (similar to mse-all_dist)
-        plot_histogram(
-            data=snr_all_data_averaged.detach().cpu().numpy(),
             single_channel=True,
             bins=160,
             save_dir=save_dir_hist,
-            tag='snr-all_dist'
+            tag=f'{tag}_snr'
         )
 
-        # VAF averaged per sample
-        vaf_all_data_averaged = torch.mean(vaf_all_data, dim=1)  # (N,)
-        vaf_hist_path = os.path.join(save_dir_hist, f'{tag}-vaf_all_data_all_channels_averaged.npy')
-        np.save(vaf_hist_path, vaf_all_data_averaged.detach().cpu().numpy())
-
-        # Plot VAF histogram for all data (per-channel)
         plot_histogram(
             data=vaf_all_data.detach().cpu().numpy(),
-            single_channel=False,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag='vaf-all-data-per'
-        )
-
-        # Plot VAF histogram averaged over channels (similar to mse-all_dist)
-        plot_histogram(
-            data=vaf_all_data_averaged.detach().cpu().numpy(),
             single_channel=True,
             bins=160,
             save_dir=save_dir_hist,
-            tag='vaf-all_dist'
+            tag=f'{tag}_vaf'
         )
 
-        return all_st_tensor
+        plot_histogram(
+            data=pearson_all_data.detach().cpu().numpy(),
+            single_channel=True,
+            bins=160,
+            save_dir=save_dir_hist,
+            tag=f'{tag}_pearson_correlation'
+        )
+
+        logger.info(f"Raw signal prediction accuracy test completed. Results saved to {save_dir_hist}")
+        return all_raw_signals
 
 
-    def do_seqvae_tests(self, test_dataloader):
+    def do_raw_signal_tests(self, test_dataloader):
+        """
+        Run comprehensive testing suite for raw signal TEB-VAE model.
+        
+        Args:
+            test_dataloader: DataLoader containing test data
+        """
+        logger.info("Starting comprehensive raw signal testing suite")
+        
         self.load_pytorch_checkpoint()
         cuda_device = f"cuda:{self.cuda_devices[0]}"
         self.pytorch_model.to(cuda_device)
-        self.seqvae_prediction_accuracy_test(seqvae_mse_test_dataloader=test_dataloader, device=cuda_device)
-        self.seqvae_prediction_plot(test_dataloader, 30, device=cuda_device)
-        self.test_seqvae_torch_model(test_dataloader, device=cuda_device)
-        self.seqvae_mse_test(test_dataloader, tag='__', device=cuda_device)
+        
+        # Run all raw signal evaluation methods
+        logger.info("Running raw signal prediction accuracy test...")
+        self.raw_signal_prediction_accuracy_test(test_dataloader=test_dataloader, device=cuda_device)
+        
+        logger.info("Running raw signal prediction plots...")
+        self.seqvae_raw_signal_plot(test_dataloader, device=cuda_device)
+        
+        logger.info("Running raw signal model testing...")
+        self.test_raw_signal_model(test_dataloader, device=cuda_device)
+        
+        logger.info("Running comprehensive raw signal evaluation...")
+        self.raw_signal_evaluation_test(test_dataloader, tag='comprehensive_eval', device=cuda_device)
+        
+        logger.info("Raw signal testing suite completed successfully")
 
 
 def main(train_SeqVAE=-1, test_SeqVAE=-1):
@@ -1382,6 +1538,33 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
         graph_model.create_model()
         graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
+
+    if test_SeqVAE > -1:
+        # Dataloader configuration for testing
+        dataloader_config = config['dataset_config'].get('dataloader_config', {})
+        dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
+        num_workers = 0
+        normalize_fields = dataloader_config.get('normalize_fields', None)
+        stat_path = config['dataset_config'].get('stat_path')
+
+        # Create test dataloader
+        test_loader_seqvae = create_optimized_dataloader(
+            hdf5_files=config['dataset_config']['vae_test_datasets'],
+            batch_size=config['general_config']['batch_size']['test'],
+            num_workers=num_workers,
+            rank=0,
+            world_size=1,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            **dataset_kwargs
+        )
+
+        # Initialize model for testing
+        graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
+        graph_model.create_model()
+        
+        # Run comprehensive raw signal testing suite
+        graph_model.do_raw_signal_tests(test_loader_seqvae)
 
     # Clean up the process group
     if dist.is_initialized():
@@ -1490,6 +1673,33 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         # Use the PyTorch DDP training method instead of PyTorch Lightning
         graph_model.train_base_model_pytorch(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
+    if test_SeqVAE > -1 and rank == 0:  # Only run testing on rank 0 to avoid duplicate tests
+        # Dataloader configuration for testing
+        dataloader_config = config['dataset_config'].get('dataloader_config', {})
+        dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
+        num_workers = 0
+        normalize_fields = dataloader_config.get('normalize_fields', None)
+        stat_path = config['dataset_config'].get('stat_path')
+
+        # Create test dataloader
+        test_loader_seqvae = create_optimized_dataloader(
+            hdf5_files=config['dataset_config']['vae_test_datasets'],
+            batch_size=config['general_config']['batch_size']['test'],
+            num_workers=num_workers,
+            rank=0,
+            world_size=1,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            **dataset_kwargs
+        )
+
+        # Initialize model for testing
+        graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
+        graph_model.create_model()
+        
+        # Run comprehensive raw signal testing suite
+        graph_model.do_raw_signal_tests(test_loader_seqvae)
+
     # Clean up the process group
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -1497,7 +1707,7 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
 
 if __name__ == '__main__':
     # Set training parameters directly
-    use_pytorch_ddp = True  # Set to True to use PyTorch DDP, False for PyTorch Lightning
+    use_pytorch_ddp = False  # Set to True to use PyTorch DDP, False for PyTorch Lightning
     train_model = 1  # 1 to train, -1 to skip
     test_model = -1  # 1 to test, -1 to skip
     
