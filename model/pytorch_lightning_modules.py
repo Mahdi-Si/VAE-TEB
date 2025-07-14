@@ -53,8 +53,8 @@ class PlottingCallBack(Callback):
             logger.warning(f"Could not get a batch from validation dataloader for plotting: {e}")
             return
 
-        # Ensure batch is on the correct device
-        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, 0)
+        # Ensure batch is on the correct device (use proper device, not hardcoded 0)
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, pl_module.local_rank)
 
         pl_module.eval()
         try:
@@ -75,6 +75,13 @@ class PlottingCallBack(Callback):
                 logger.info("Running model forward pass...")
                 model_outputs = pl_module.model(y_st, y_ph, x_ph)
                 logger.info(f"Model forward pass successful. Output keys: {list(model_outputs.keys())}")
+                
+                # OPTIMIZATION: Move data to CPU immediately after forward pass to reduce GPU 0 load
+                # Transfer all required data to CPU for plotting operations
+                device_info = {
+                    'device_id': pl_module.device.index if hasattr(pl_module.device, 'index') else 0,
+                    'device_type': pl_module.device.type
+                }
 
                 if 'raw_predictions' not in model_outputs:
                     logger.error("Model output missing 'raw_predictions' key")
@@ -92,15 +99,37 @@ class PlottingCallBack(Callback):
                 
                 logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}, sequence_length: {sequence_length}")
 
-                # Extract predictions for the first sample in the batch
+                # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
+                # Extract predictions for the first sample in the batch and move to CPU
                 # raw_predictions contain (B, S, 480) - predictions of next 480 samples from each timestep
                 pred_mu_all = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, 480)
                 pred_logvar_all = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, 480)
                 pred_std_all = np.exp(0.5 * pred_logvar_all)
 
-                # Ground truth (first sample in batch) - normalized raw signals
+                # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
                 ground_truth_up = up_raw_normalized[0].squeeze().detach().cpu().numpy()
+                
+                # Get latent representation and move to CPU immediately
+                z_latent = None
+                if 'z' in model_outputs:
+                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
+                
+                # Get batch info and move to CPU
+                try:
+                    guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
+                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
+                except:
+                    guid = 'unknown'
+                    epoch_info = 'unknown'
+                
+                # Free GPU memory early by deleting GPU tensors
+                del model_outputs, raw_predictions
+                del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized
+                # Force GPU memory cleanup before heavy CPU plotting
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
 
                 # Create average predictions considering warmup period
                 # For timesteps after warmup, average all predictions that contribute to each raw signal sample
@@ -126,11 +155,6 @@ class PlottingCallBack(Callback):
                 avg_pred_mu[valid_mask] /= prediction_counts[valid_mask]
                 avg_pred_var[valid_mask] /= prediction_counts[valid_mask]
                 avg_pred_std = np.sqrt(avg_pred_var)
-
-                # Get latent representation
-                z_latent = None
-                if 'z' in model_outputs:
-                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
 
                 logger.info(f"Data shapes for plotting - avg_pred_mu: {avg_pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
                 if z_latent is not None:
@@ -410,13 +434,7 @@ class PlottingCallBack(Callback):
                     # Hide the colorbar axis if no latent data
                     cbar_ax.set_visible(False)
 
-                # Get batch info
-                try:
-                    guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
-                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
-                except:
-                    guid = 'unknown'
-                    epoch_info = 'unknown'
+                # Batch info already retrieved above
 
                 # Overall title with metrics and warmup info
                 plt.suptitle(f"Raw Signal Prediction - GUID: {guid}, Epoch: {epoch_info}\n"
@@ -427,16 +445,16 @@ class PlottingCallBack(Callback):
                 plt.savefig(plot_path, dpi=150, bbox_inches='tight')
                 logger.info(f"Raw signal prediction plot saved to {plot_path}")
 
-                # Explicit cleanup
+                # Explicit cleanup - GPU tensors already cleaned up earlier
                 plt.close('all')
 
-                # Clean up tensors to free GPU memory
-                del model_outputs, raw_predictions
+                # Clean up remaining CPU arrays
                 if z_latent is not None:
                     del z_latent
-                del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized, ground_truth_fhr, ground_truth_up
+                del ground_truth_fhr, ground_truth_up
                 del pred_mu_all, pred_logvar_all, pred_std_all
                 del avg_pred_mu, avg_pred_var, avg_pred_std, prediction_counts
+                # Final GPU cache cleanup
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         except Exception as e:
@@ -645,9 +663,12 @@ class LightSeqVaeTeb(L.LightningModule):
             # This can happen if the optimizer is not yet configured
             pass
         
-        # Clear GPU cache at the start of each epoch
+        # Clear GPU cache at the start of each epoch - device-aware
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            device_count = torch.cuda.device_count()
+            for device_id in range(device_count):
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
 
     def _common_step(self, batch, batch_idx):
         """Common logic for training and validation steps with memory optimization."""
@@ -710,15 +731,23 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """Clean up after each training batch."""
-        # Periodic GPU cache clearing to prevent memory buildup
+        # Periodic GPU cache clearing to prevent memory buildup - device-aware
         if batch_idx % 10 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Clear cache on current device, not just device 0
+            current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+            if current_device is not None:
+                with torch.cuda.device(current_device):
+                    torch.cuda.empty_cache()
 
     def on_validation_batch_end(self, outputs, batch, batch_idx):
         """Clean up after each validation batch."""
-        # Periodic GPU cache clearing to prevent memory buildup
+        # Periodic GPU cache clearing to prevent memory buildup - device-aware
         if batch_idx % 5 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Clear cache on current device, not just device 0
+            current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+            if current_device is not None:
+                with torch.cuda.device(current_device):
+                    torch.cuda.empty_cache()
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
@@ -756,23 +785,31 @@ class MemoryMonitorCallback(Callback):
         self.batch_count = 0
         
     def _log_memory_usage(self, prefix=""):
-        """Log current GPU memory usage."""
+        """Log current GPU memory usage for all devices."""
         if torch.cuda.is_available():
-            device = torch.cuda.current_device()
-            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
-            reserved = torch.cuda.memory_reserved(device) / 1024**3   # GB
-            logger.info(f"{prefix} GPU {device}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-            return allocated
+            total_allocated = 0.0
+            device_count = torch.cuda.device_count()
+            for device_id in range(device_count):
+                allocated = torch.cuda.memory_allocated(device_id) / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved(device_id) / 1024**3   # GB
+                logger.info(f"{prefix} GPU {device_id}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+                total_allocated += allocated
+            return total_allocated
         return 0.0
     
     def _clear_memory_if_needed(self):
-        """Clear GPU memory if usage exceeds threshold."""
+        """Clear GPU memory on all devices if usage exceeds threshold."""
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-            if allocated > self.threshold_gb:
-                logger.warning(f"GPU memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
-                torch.cuda.empty_cache()
-                return True
+            device_count = torch.cuda.device_count()
+            cleared_any = False
+            for device_id in range(device_count):
+                allocated = torch.cuda.memory_allocated(device_id) / 1024**3  # GB
+                if allocated > self.threshold_gb:
+                    logger.warning(f"GPU {device_id} memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
+                    with torch.cuda.device(device_id):
+                        torch.cuda.empty_cache()
+                    cleared_any = True
+            return cleared_any
         return False
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
