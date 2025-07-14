@@ -367,7 +367,7 @@ class SeqVAEGraphModel:
             monitor="val/total_loss",
             mode="min",
             dirpath=self.model_checkpoint_dir,
-            filename="base-model-best-{epoch:02d}-{val/total_loss:.2f}",
+            filename="base-model-best-{epoch}",
             save_top_k=1,
             save_last=False,
         )

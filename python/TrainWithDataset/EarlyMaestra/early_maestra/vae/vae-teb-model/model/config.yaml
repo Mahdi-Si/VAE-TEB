@@ -1,17 +1,17 @@
 general_config:
-  tag: test_runs___
+  tag: test_runs___qqq
   cuda_devices: [0]
   train_classifier: False
-  lr: 0.00025
+  lr: 0.0001
   lr_milestone: [12000]
   weight_decay: 0.3
   checkpoint_frequency: 1
   plot_frequency: 1
-  epochs: 10
-  accumulate_grad_batches: 4
+  epochs: 50
+  accumulate_grad_batches: 1
   batch_size:
-    train: 50
-    test: 50
+    train: 20
+    test: 20
 
 model_config:
   VAE_model:
@@ -21,9 +21,9 @@ model_config:
     channel_num: 2
     input_dim: 76
     RNN_hidden_dim: 100
-    latent_size: 25
+    latent_size: 16
     num_RNN_layers: 5
-    kld_beta: 0.004
+    kld_beta: 0.0001
     freeze_seqvae: False
     zero_source: True
 

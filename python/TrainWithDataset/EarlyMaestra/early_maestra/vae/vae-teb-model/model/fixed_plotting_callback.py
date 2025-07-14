@@ -106,7 +106,7 @@ class FixedPlottingCallBack(Callback):
                 # Plot 2: Predicted raw signal with uncertainty
                 axes[1].plot(time_axis, pred_mu, 'r-', linewidth=1, label='Predicted Mean')
                 axes[1].fill_between(time_axis, pred_mu - pred_std, pred_mu + pred_std,
-                                   alpha=0.3, color='red', label='±1σ Uncertainty')
+                                     alpha=0.3, color='red', label='±1σ Uncertainty')
                 axes[1].set_title('Predicted Raw FHR Signal with Uncertainty')
                 axes[1].set_ylabel('Normalized Amplitude')
                 axes[1].set_xlabel('Time (minutes)')
