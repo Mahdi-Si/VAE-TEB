@@ -5,6 +5,42 @@ from typing import Tuple, Optional, Union, Dict
 import math
 import warnings
 
+import math
+from typing import List
+
+def geometric_schedule(
+    input_size: int,
+    output_size: int,
+    n_hidden: int,
+    *,
+    round_fn=round
+) -> List[int]:
+    """
+    Compute a geometric progression of layer sizes from `input_size` down/up to `output_size`,
+    with `n_hidden` intermediate layers.
+
+    Returns a list of length n_hidden+2: [input_size, h1, h2, ..., h_n, output_size].
+    
+    Arguments:
+    - input_size:  starting dimension (e.g. 16)
+    - output_size: ending dimension (e.g. 64)
+    - n_hidden:    number of hidden layers (e.g. 6)
+    - round_fn:    function to turn floats into ints (default=round)
+    """
+    # total steps = hidden layers + the final map to output
+    steps = n_hidden + 1
+    # constant ratio r so that input_size * r^steps = output_size
+    r = (output_size / input_size) ** (1 / steps)
+
+    # build the full list
+    sizes = [
+        int(round_fn(input_size * (r ** k)))
+        for k in range(steps + 1)
+    ]
+    # ensure exact endpoints
+    sizes[0] = input_size
+    sizes[-1] = output_size
+    return tuple(sizes[1:])
 
 def initialization(model: nn.Module) -> None:
     """
@@ -382,14 +418,14 @@ class TargetEncoder(nn.Module):
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim: int = 64,
+        latent_dim: int = 16,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 3,
-        conv_kernel_size: Union[int, Tuple[int, ...]] = (7, 5, 3),
+        conv_kernel_size: Union[int, Tuple[int, ...]] = (11, 9, 7, 5, 3),
         dropout: float = 0.1,
-        use_bidirectional_lstm: bool = True,
+        use_bidirectional_lstm: bool = False,
         activation: str = "gelu",
-        reduced_channels: int = 48,  # Reduced from 76 to capture essential features
+        reduced_channels: int = 32,  # Reduced from 76 to capture essential features
     ):
         super(TargetEncoder, self).__init__()
 
@@ -404,29 +440,41 @@ class TargetEncoder(nn.Module):
         self.activation = getattr(F, activation)
         
         # Channel reduction blocks for both modalities
-        self.channel_reducer_scattering = ChannelReductionBlock(
+        self.channel_reducer_scattering = nn.Sequential(
+            ChannelReductionBlock(
             in_channels=input_channels,
+            out_channels=64,
+            dropout=dropout,
+            use_attention=True),
+            ChannelReductionBlock(
+            in_channels=64,
             out_channels=reduced_channels,
             dropout=dropout,
-            use_attention=True,
+            use_attention=True)
         )
-        self.channel_reducer_phase = ChannelReductionBlock(
+        self.channel_reducer_phase = nn.Sequential(
+            ChannelReductionBlock(
             in_channels=input_channels,
+            out_channels=64,
+            dropout=dropout,
+            use_attention=True),
+            ChannelReductionBlock(
+            in_channels=64,
             out_channels=reduced_channels,
             dropout=dropout,
-            use_attention=True,
+            use_attention=True)
         )
 
         # Path 1: Linear projection path for both inputs (after channel reduction)
         self.linear_path_scattering = ResidualMLP(
             input_dim=reduced_channels,
-            hidden_dims=(int(reduced_channels * 0.9), int(reduced_channels * 0.8), 32),
+            hidden_dims=(32, 32, 32, 32),
             dropout=dropout,
             final_activation=False,
         )
         self.linear_path_phase = ResidualMLP(
             input_dim=reduced_channels,
-            hidden_dims=(int(reduced_channels * 0.9), int(reduced_channels * 0.8), 32),
+            hidden_dims=(32, 32, 32),
             dropout=dropout,
             final_activation=False,
         )
@@ -442,13 +490,13 @@ class TargetEncoder(nn.Module):
         # Cross-modal fusion (combining scattering and phase harmonic)
         self.cross_modal_fusion = ResidualMLP(
             input_dim=32 * 2,  # Updated to reflect 32-channel outputs from each path
-            hidden_dims=(64, 80, 70, 60),  # Smaller intermediate dimensions
+            hidden_dims=(64, 60, 55, 50),  # Smaller intermediate dimensions
             dropout=dropout,
             final_activation=False,
         )
 
         self.lstm = nn.LSTM(
-            input_size=60,  # Updated to match cross_modal_fusion output
+            input_size=50,  # Updated to match cross_modal_fusion output
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
@@ -461,21 +509,21 @@ class TargetEncoder(nn.Module):
         # Pre-output processing
         self.pre_output = ResidualMLP(
             input_dim=lstm_output_dim,
-            hidden_dims=(120, 112, 100),
+            hidden_dims=geometric_schedule(lstm_output_dim, 66, 3),
             dropout=dropout,
             final_activation=True,
         )
 
         # Variational parameters
         self.mu_layer = ResidualMLP(
-            input_dim=100,
-            hidden_dims=(91, 82, 73, latent_dim),
+            input_dim=66,
+            hidden_dims=geometric_schedule(66, 16, 5),
             dropout=dropout,
             final_activation=False,
         )
         self.logvar_layer = ResidualMLP(
-            input_dim=100,
-            hidden_dims=(107, 114, 121, 128),
+            input_dim=66,
+            hidden_dims=geometric_schedule(66, 32, 5),
             dropout=dropout,
             final_activation=False,
         )
@@ -635,13 +683,13 @@ class SourceEncoder(nn.Module):
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim: int = 64,
-        lstm_hidden_dim: int = 256,
-        lstm_num_layers: int = 2,
+        latent_dim: int = 16,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 3,
         conv_kernel_size: list[int] = [9, 7, 5, 3],
         dropout: float = 0.1,
         activation: str = "gelu",
-        reduced_channels: int = 48,  # Reduced from 76 to capture essential features
+        reduced_channels: int = 32,  # Reduced from 76 to capture essential features
     ):
         super(SourceEncoder, self).__init__()
 
@@ -664,7 +712,7 @@ class SourceEncoder(nn.Module):
 
         self.linear_path = ResidualMLP(
             input_dim=reduced_channels,
-            hidden_dims=(int(reduced_channels * 0.8), 32),
+            hidden_dims=(int(reduced_channels * 0.8), 32, 32),
             dropout=dropout,
             final_activation=False,
         )
@@ -676,14 +724,14 @@ class SourceEncoder(nn.Module):
 
         self.fusion_path = ResidualMLP(
             input_dim=32 * 2,  # Updated for 32-channel outputs
-            hidden_dims=(64, 80, 60),  # Smaller intermediate dimensions
+            hidden_dims=(64, 60, 50),  # Smaller intermediate dimensions
             dropout=dropout,
             final_activation=False,
         )
 
         # Unidirectional LSTM for causal temporal encoding
         self.lstm = nn.LSTM(
-            input_size=60,  # Updated to match fusion_path output
+            input_size=50,  # Updated to match fusion_path output
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
@@ -693,14 +741,14 @@ class SourceEncoder(nn.Module):
 
         self.pre_output = ResidualMLP(
             input_dim=lstm_hidden_dim,
-            hidden_dims=(120, 112, 100),
+            hidden_dims=(102, 82, 66, 53),
             dropout=dropout,
             final_activation=True,
         )
 
         self.mu_layer = ResidualMLP(
-            input_dim=100,
-            hidden_dims=(91, 82, 73, latent_dim),
+            input_dim=53,
+            hidden_dims=(43, 35, 27, 21, latent_dim),
             dropout=dropout,
             final_activation=False,
         )
@@ -856,21 +904,21 @@ class ConditionalEncoder(nn.Module):
         # Build a small MLP to merge h_x and h_y
         self.mlp = ResidualMLP(
             input_dim=dim_hx + dim_hy,
-            hidden_dims=(120, 110, 100),
+            hidden_dims=(55, 47, 41, 35),
             dropout=dropout,
             final_activation=True,
         )
 
         # Final linear layers to produce mu and logvar for the latent variable z
         self.fc_mu = ResidualMLP(
-            input_dim=100,
-            hidden_dims=(89, 77, dim_z),
+            input_dim=35,
+            hidden_dims=(30, 26, 22, 19, dim_z),
             dropout=dropout,
             final_activation=False,
         )
         self.fc_logvar = ResidualMLP(
-            input_dim=100,
-            hidden_dims=(89, 77, dim_z),
+            input_dim=35,
+            hidden_dims=(30, 26, 22, 19, dim_z),
             dropout=dropout,
             final_activation=False,
         )
@@ -1013,18 +1061,102 @@ class UpsamplingBlock(nn.Module):
         return output
 
 
+class FastTemporalSmoother(nn.Module):
+    """
+    Fast temporal smoothing module without attention mechanisms.
+    Uses efficient weighted convolution averaging for noise reduction
+    while maintaining computational efficiency.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 20,
+        kernel_size: int = 11,
+        dropout: float = 0.1,
+    ):
+        """
+        Args:
+            in_channels: Input feature channels
+            kernel_size: Smoothing kernel size (larger = more smoothing)
+            dropout: Dropout rate for regularization
+        """
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        
+        # Simple but effective smoothing convolution
+        self.smooth_conv = nn.Conv1d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=in_channels,  # Depthwise for efficiency
+            bias=False
+        )
+        
+        # Feature enhancement after smoothing
+        self.enhance_conv = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels * 2, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(in_channels * 2, in_channels, kernel_size=1),
+            nn.Dropout(dropout)
+        )
+        
+        # Simple learnable smoothing strength
+        self.smoothing_strength = nn.Parameter(torch.tensor(0.3))
+        
+        # Initialize smoothing kernel with gaussian-like weights
+        self._init_smooth_kernel()
+        
+    def _init_smooth_kernel(self):
+        """Initialize smoothing kernel with gaussian-like weights for each channel."""
+        with torch.no_grad():
+            # Create gaussian-like kernel
+            kernel_radius = self.kernel_size // 2
+            x = torch.arange(-kernel_radius, kernel_radius + 1, dtype=torch.float32)
+            gaussian_kernel = torch.exp(-(x ** 2) / (2 * (kernel_radius / 3) ** 2))
+            gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
+            
+            # Apply to all input channels
+            for i in range(self.in_channels):
+                self.smooth_conv.weight[i, 0, :] = gaussian_kernel
+                
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor (B*S, in_channels, 480)
+        Returns:
+            Smoothed tensor (B*S, in_channels, 480)
+        """
+        # Apply fast depthwise smoothing
+        smoothed = self.smooth_conv(x)
+        
+        # Enhance features after smoothing
+        enhanced = self.enhance_conv(smoothed)
+        
+        # Learnable blend between original and smoothed signal
+        # Clamp smoothing strength to [0, 1] range
+        alpha = torch.sigmoid(self.smoothing_strength)
+        output = (1 - alpha) * x + alpha * enhanced
+        
+        return output
+
+
 class Decoder(nn.Module):
     """
-    Raw Signal Decoder that reconstructs raw temporal signal from latent variables
-    with 16x upsampling. Implements progressive upsampling with learnable interpolation
-    and maintains causal constraints during signal generation.
+    Raw Signal Decoder that predicts the next 2 minutes (480 samples) of raw signal
+    from each timestep in the latent representation. For each timestep i in the 
+    latent sequence (B, S, Z), predicts the next 480 samples of raw signal.
+    
+    Features advanced temporal smoothing via TCN-based architecture.
     """
 
     def __init__(
         self,
-        latent_dim: int,
-        sequence_length: int,
-        decimation_factor: int = 16,
+        latent_dim: int = 16,
+        sequence_length: int = 300,
+        prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
         hidden_dim: int = 128,
         dropout: float = 0.1,
     ):
@@ -1032,7 +1164,7 @@ class Decoder(nn.Module):
         Args:
             latent_dim: Input latent dimension
             sequence_length: Input sequence length
-            decimation_factor: Temporal upsampling factor (default 16)
+            prediction_horizon: Number of future samples to predict (default 480 = 2 minutes at 4Hz)
             hidden_dim: Hidden processing dimension
             dropout: Dropout rate
         """
@@ -1040,39 +1172,104 @@ class Decoder(nn.Module):
 
         self.latent_dim = latent_dim
         self.sequence_length = sequence_length
-        self.decimation_factor = decimation_factor
+        self.prediction_horizon = prediction_horizon
         self.hidden_dim = hidden_dim
 
-        # Latent processing path
+        # Enhanced latent processing for each timestep with increased capacity
         self.latent_processor = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=(96, 80, 64),
+            hidden_dims=geometric_schedule(latent_dim, 128, 6),  # Increased from 96 to 128, more layers
+            dropout=dropout,
+            final_activation=True,
+        )
+        
+        # Additional deep processing for latent features
+        self.latent_deep_processor = ResidualMLP(
+            input_dim=128,
+            hidden_dims=(140, 152, 164, 176),  # Progressive expansion
             dropout=dropout,
             final_activation=True,
         )
 
-        # Progressive upsampling: 1x → 4x → 16x
-        self.upsample_4x = UpsamplingBlock(
-            in_channels=64, out_channels=32, upsample_factor=4, dropout=dropout
+        # Process latent features to prediction horizon length with more capacity
+        self.prediction_expander = ResidualMLP(
+            input_dim=176,  # Updated input from latent_deep_processor
+            hidden_dims=geometric_schedule(176, prediction_horizon, 10),  # More layers for smoother transition
+            dropout=dropout,
+            final_activation=True,
         )
 
-        self.upsample_16x = UpsamplingBlock(
-            in_channels=32,
-            out_channels=16,
-            upsample_factor=4,
-            dropout=dropout,  # Total 16x
-        )
-
-        # Signal refinement with causal convolutions
+        # Enhanced signal refinement with increased capacity
+        # Convert to channel-first for convolutions: (B*S, 1, 480)
         self.signal_refiner = nn.Sequential(
-            CausalResidualBlock(channels=16, kernel_size=7, dropout=dropout),
-            CausalResidualBlock(channels=16, kernel_size=5, dropout=dropout),
-            CausalResidualBlock(channels=16, kernel_size=3, dropout=dropout),
+            # First conv block with increased channels
+            nn.Conv1d(1, 24, kernel_size=11, padding=5),
+            nn.LayerNorm([24, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            
+            # Second conv block with higher capacity
+            nn.Conv1d(24, 48, kernel_size=9, padding=4),
+            nn.LayerNorm([48, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            
+            # Third conv block
+            nn.Conv1d(48, 32, kernel_size=7, padding=3),
+            nn.LayerNorm([32, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            
+            # Additional conv block for more processing depth
+            nn.Conv1d(32, 24, kernel_size=5, padding=2),
+            nn.LayerNorm([24, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Additional signal processing with ResidualMLP after convolutions
+        self.signal_post_processor = ResidualMLP(
+            input_dim=24,  # Matches output channels from signal_refiner
+            hidden_dims=(32, 28, 24, 20),  # Progressive refinement
+            dropout=dropout,
+            final_activation=True,
+        )
+        
+        # Fast temporal smoothing module for noise reduction
+        self.temporal_smoother = FastTemporalSmoother(
+            in_channels=20,
+            kernel_size=11,  # Single-scale efficient smoothing
+            dropout=dropout,
         )
 
-        # Final output heads for mean and log variance
-        self.output_mu = nn.Conv1d(16, 1, kernel_size=1)
-        self.output_logvar = nn.Conv1d(16, 1, kernel_size=1)
+        # Enhanced output heads with increased capacity
+        # Signal mean head with deeper processing
+        self.output_mu = nn.Sequential(
+            nn.Conv1d(20, 16, kernel_size=3, padding=1),  # Updated input channels from signal_post_processor
+            nn.LayerNorm([16, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),  # Lower dropout for signal reconstruction
+            
+            nn.Conv1d(16, 8, kernel_size=3, padding=1),
+            nn.LayerNorm([8, prediction_horizon]),
+            nn.GELU(),
+            
+            nn.Conv1d(8, 1, kernel_size=1)
+        )
+        
+        # Signal log-variance head with specialized processing for uncertainty
+        self.output_logvar = nn.Sequential(
+            nn.Conv1d(20, 16, kernel_size=5, padding=2),  # Larger kernel for uncertainty estimation
+            nn.LayerNorm([16, prediction_horizon]),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            
+            nn.Conv1d(16, 8, kernel_size=3, padding=1),
+            nn.LayerNorm([8, prediction_horizon]),
+            nn.GELU(),
+            
+            nn.Conv1d(8, 1, kernel_size=1)
+        )
 
     def forward(self, latent_z: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -1080,71 +1277,115 @@ class Decoder(nn.Module):
             latent_z: Latent variables (batch_size, sequence_length, latent_dim)
         Returns:
             Dictionary containing:
-            - raw_signal_mu: (batch_size, sequence_length*16, 1)
-            - raw_signal_logvar: (batch_size, sequence_length*16, 1)
+            - raw_signal_mu: (batch_size, sequence_length, prediction_horizon)
+            - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon)
         """
         B, S, Z = latent_z.shape
 
-        # Process latent features
-        processed = self.latent_processor(latent_z)  # (B, S, 64)
-
-        # Convert to channel-first for convolutions
-        processed = processed.transpose(1, 2)  # (B, 64, S)
-
-        # Progressive upsampling with memory cleanup
-        upsampled_4x = self.upsample_4x(processed)  # (B, 32, S*4)
-        del processed  # Free memory
-        upsampled_16x = self.upsample_16x(upsampled_4x)  # (B, 16, S*16)
-        del upsampled_4x  # Free memory
-
-        # Signal refinement
-        refined = upsampled_16x
-        for refiner_block in self.signal_refiner:
-            # Convert to sequence-first for CausalResidualBlock
-            refined_seq = refined.transpose(1, 2)  # (B, S*16, 16)
-            refined_seq = refiner_block(refined_seq)
-            refined = refined_seq.transpose(1, 2)  # (B, 16, S*16)
-
-        # Generate mean and log variance predictions
-        raw_mu = self.output_mu(refined)  # (B, 1, S*16)
-        raw_logvar = self.output_logvar(refined)  # (B, 1, S*16)
-
+        # Process each timestep independently to predict next 480 samples
+        # Reshape to process all timesteps in parallel
+        latent_flat = latent_z.view(B * S, Z)  # (B*S, Z)
+        
+        # Enhanced latent processing pipeline
+        processed = self.latent_processor(latent_flat)  # (B*S, 128)
+        deep_processed = self.latent_deep_processor(processed)  # (B*S, 176)
+        
+        # Expand to prediction horizon with enhanced capacity
+        predictions = self.prediction_expander(deep_processed)  # (B*S, 480)
+        
+        # Reshape back to have channel dimension for convolutions
+        predictions = predictions.view(B * S, 1, self.prediction_horizon)  # (B*S, 1, 480)
+        
+        # Apply enhanced signal refinement with convolutions
+        refined = self.signal_refiner(predictions)  # (B*S, 24, 480)
+        
+        # Apply post-processing with ResidualMLP (convert to sequence-first format)
+        refined_seq = refined.transpose(1, 2)  # (B*S, 480, 24)
+        post_processed = self.signal_post_processor(refined_seq)  # (B*S, 480, 20)
+        post_processed_conv = post_processed.transpose(1, 2)  # (B*S, 20, 480)
+        
+        # Apply advanced temporal smoothing for noise reduction
+        smoothed_features = self.temporal_smoother(post_processed_conv)  # (B*S, 20, 480)
+        
+        # Generate mean and log variance predictions with enhanced heads
+        raw_mu = self.output_mu(smoothed_features)  # (B*S, 1, 480)
+        raw_logvar = self.output_logvar(smoothed_features)  # (B*S, 1, 480)
+        
         # Clamp log variance for numerical stability
         raw_logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
-
-        # Convert to sequence-first format
-        raw_mu = raw_mu.transpose(1, 2)  # (B, S*16, 1)
-        raw_logvar = raw_logvar.transpose(1, 2)  # (B, S*16, 1)
+        
+        # Reshape back to (B, S, 480)
+        raw_mu = raw_mu.view(B, S, self.prediction_horizon)
+        raw_logvar = raw_logvar.view(B, S, self.prediction_horizon)
         
         # Clean up intermediate tensors
-        del refined
+        del refined, refined_seq, post_processed, post_processed_conv, smoothed_features, predictions, processed, deep_processed, latent_flat
 
         return {"raw_signal_mu": raw_mu, "raw_signal_logvar": raw_logvar}
 
     def compute_loss(
-        self, predictions: Dict[str, torch.Tensor], target_raw_signal: torch.Tensor
+        self, predictions: Dict[str, torch.Tensor], target_raw_signal: torch.Tensor, warmup_period: int = 30
     ) -> torch.Tensor:
         """
-        Compute negative log-likelihood loss for raw signal reconstruction.
+        Compute negative log-likelihood loss for raw signal prediction.
+        For each timestep i, compares the predicted next 480 samples against
+        the actual next 480 samples from the raw signal.
 
         Args:
             predictions: Dictionary containing raw_signal_mu and raw_signal_logvar
-            target_raw_signal: Ground truth raw signal (B, S*16, 1) or (B, S*16)
+                        Both have shape (B, S, 480)
+            target_raw_signal:  Ground truth raw signal (B, raw_signal_length)
+                                where raw_signal_length = S * 16
+            warmup_period:  Number of initial timesteps to skip (default: 30)
+                            We don't compute loss for early timesteps as there's 
+                            insufficient history for meaningful predictions
         Returns:
             NLL loss tensor
         """
-        mu = predictions["raw_signal_mu"]
-        logvar = predictions["raw_signal_logvar"]
+        mu = predictions["raw_signal_mu"]  # (B, S, 480)
+        logvar = predictions["raw_signal_logvar"]  # (B, S, 480)
+        
+        B, S, prediction_horizon = mu.shape
+        
+        # Apply warmup period - only compute loss for timesteps after warmup
+        start_timestep = max(0, warmup_period)
+        if start_timestep >= S:
+            # If warmup period is longer than sequence, return zero loss
+            return torch.tensor(0.0, device=mu.device, requires_grad=True)
+        
+        # Create target tensor for comparison (only for timesteps after warmup)
+        effective_timesteps = S - start_timestep
+        target_predictions = torch.zeros(B, effective_timesteps, prediction_horizon, device=mu.device)
+        
+        for idx, i in enumerate(range(start_timestep, S)):
+            start_idx = i * 16 + 1  # Start from next sample after current timestep
+            end_idx = start_idx + prediction_horizon  # Next 480 samples
+            
+            # Check bounds to avoid indexing errors
+            if end_idx <= target_raw_signal.shape[1]:
+                target_predictions[:, idx, :] = target_raw_signal[:, start_idx:end_idx]
+            else:
+                # Handle edge case where we don't have enough future samples
+                available_samples = target_raw_signal.shape[1] - start_idx
+                if available_samples > 0:
+                    target_predictions[:, idx, :available_samples] = target_raw_signal[:, start_idx:]
+                    # Pad with last available sample if needed
+                    if available_samples < prediction_horizon:
+                        last_sample = target_raw_signal[:, -1:].expand(B, prediction_horizon - available_samples)
+                        target_predictions[:, idx, available_samples:] = last_sample
 
-        # Ensure target has a channel dimension for broadcasting
-        if target_raw_signal.dim() == mu.dim() - 1:
-            target_raw_signal = target_raw_signal.unsqueeze(-1)
+        # Extract predictions only for timesteps after warmup
+        mu_effective = mu[:, start_timestep:, :]  # (B, effective_timesteps, 480)
+        logvar_effective = logvar[:, start_timestep:, :]  # (B, effective_timesteps, 480)
 
         # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-        # Use more memory-efficient computation
-        diff = target_raw_signal - mu
-        var = logvar.exp()
-        nll = 0.5 * (logvar + diff.pow(2) / var)
+        diff = target_predictions - mu_effective
+        var = logvar_effective.exp()
+        nll = 0.5 * (logvar_effective + diff.pow(2) / var)
+        
+        # Clean up
+        del target_predictions, diff, var
+        
         return nll.mean()
 
 
@@ -1166,10 +1407,10 @@ class SeqVaeTeb(nn.Module):
     The architecture is based on the following flow:
     1. A source encoder processes input `x_ph` to get `mu_x`.
     2. A target encoder processes `y_st` and `y_ph` to model the prior `p(z|y)`.
-       It outputs `mu_y` and a `logvar_y` that is split into a prior log-variance
-       and a conditional feature `c_logvar`.
+        It outputs `mu_y` and a `logvar_y` that is split into a prior log-variance
+        and a conditional feature `c_logvar`.
     3. A conditional encoder combines `mu_x` and `c_logvar` to model the posterior
-       `q(z|x,y)`, outputting `mu_post` and `logvar_post`.
+        `q(z|x,y)`, outputting `mu_post` and `logvar_post`.
     4. A latent variable `z` is sampled from the posterior using the reparameterization trick.
     5. A decoder takes `z` and predicts future sequences for `y_st` and `y_ph`.
 
@@ -1181,11 +1422,11 @@ class SeqVaeTeb(nn.Module):
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim_source: int = 64,
-        latent_dim_target: int = 64,
-        latent_dim_z: int = 64,
+        latent_dim_source: int = 16,
+        latent_dim_target: int = 16,
+        latent_dim_z: int = 16,
         decimation_factor: int = 16,
-        warmup_period: int = 60,
+        warmup_period: int = 30,
         kld_beta: float = 1.0,
         source_encoder_params: Optional[dict] = None,
         target_encoder_params: Optional[dict] = None,
@@ -1204,16 +1445,11 @@ class SeqVaeTeb(nn.Module):
         # Default parameters if not provided
         if source_encoder_params is None:
             source_encoder_params = {
-                "lstm_hidden_dim": 256,
-                "lstm_num_layers": 3,
-                "dropout": 0.1,
+                "lstm_hidden_dim": 128
             }
         if target_encoder_params is None:
             target_encoder_params = {
-                "lstm_hidden_dim": 256,
-                "lstm_num_layers": 3,
-                "conv_kernel_size": (9, 7, 5, 3),
-                "dropout": 0.1,
+                "lstm_hidden_dim": 128,
             }
         if cond_encoder_params is None:
             cond_encoder_params = {"dropout": 0.1}
@@ -1241,7 +1477,7 @@ class SeqVaeTeb(nn.Module):
         self.decoder = Decoder(
             latent_dim=latent_dim_z,
             sequence_length=sequence_length,
-            decimation_factor=decimation_factor,
+            prediction_horizon=480,  # 2 minutes at 4Hz
             **decoder_params,
         )
 
@@ -1331,11 +1567,12 @@ class SeqVaeTeb(nn.Module):
         compute_kld_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Computes the total training loss for raw signal reconstruction.
+        Computes the total training loss for raw signal prediction.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
-            y_raw: Ground truth raw signal data (B, L, 1).
+            y_raw: Ground truth raw signal data (B, raw_signal_length) where
+                   raw_signal_length = sequence_length * decimation_factor.
             compute_kld_loss (bool): Whether to compute KLD loss.
 
         Returns:
@@ -1346,9 +1583,13 @@ class SeqVaeTeb(nn.Module):
         # Initialize losses
         kld_loss = torch.tensor(0.0, device=device)
 
-        # Raw signal reconstruction loss
+        # Ensure y_raw has the right shape (B, raw_signal_length)
+        if y_raw.dim() == 3 and y_raw.size(-1) == 1:
+            y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
+
+        # Raw signal prediction loss with warmup period
         raw_signal_loss = self.decoder.compute_loss(
-            forward_outputs["raw_predictions"], y_raw
+            forward_outputs["raw_predictions"], y_raw, warmup_period=self.warmup_period
         )
 
         # KLD loss
@@ -1376,22 +1617,18 @@ class SeqVaeTeb(nn.Module):
         self, forward_outputs: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """
-        Computes average predictions over the prediction horizon for visualization.
-
-        For each time step in the sequence, this method averages all predictions
-        made for that time step from previous time steps that fall within the
-        prediction horizon.
-
-        For the warmup period, predictions are held constant using the first
-        valid prediction available after the warmup phase.
+        Returns the raw signal predictions for visualization.
+        
+        The decoder now outputs predictions for the next 480 samples (2 minutes)
+        from each timestep in the latent sequence.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass, which
-                             contains the multi-step predictions.
+                                contains the raw signal predictions.
 
         Returns:
-            A dictionary containing four tensors of averaged predictions, each with
-            shape (batch_size, sequence_length, channels).
+            A dictionary containing raw signal predictions with shape 
+            (batch_size, sequence_length, 480).
         """
         return forward_outputs["raw_predictions"]
 
@@ -1413,6 +1650,86 @@ class SeqVaeTeb(nn.Module):
             # Get latent representation
             forward_outputs = self.forward(y_st, y_ph, x_ph)
             return forward_outputs["raw_predictions"]
+
+    def predict_single_timestep(
+        self, 
+        x_ph: torch.Tensor, 
+        y_st: torch.Tensor, 
+        y_ph: torch.Tensor,
+        raw_timestep: int,
+        raw_signal_length: int = 4800
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Predict the next 2 minutes (480 samples) of raw FHR signal from a single timestep.
+        
+        This method allows you to specify a specific timestep in the raw signal,
+        finds the corresponding timestep in the decimated scattering transform,
+        and predicts the next 2 minutes (480 samples at 4Hz) of raw signal.
+
+        Args:
+            x_ph: Source phase harmonic input (B, C, L) - full sequence
+            y_st: Target scattering input (B, C, L) - full sequence  
+            y_ph: Target phase harmonic input (B, C, L) - full sequence
+            raw_timestep: Timestep in the raw signal (0 to raw_signal_length-1)
+            raw_signal_length: Length of the original raw signal (default: 4800)
+
+        Returns:
+            Dictionary containing:
+            - raw_signal_mu: Predicted signal mean for next 2 minutes (B, 480)
+            - raw_signal_logvar: Predicted log-variance for next 2 minutes (B, 480) 
+            - decimated_timestep: Corresponding timestep in decimated sequence
+            - z_single: Latent variable at the specific timestep (B, 1, latent_dim)
+        """
+        with torch.no_grad():
+            # Calculate corresponding timestep in decimated sequence
+            # Decimation factor is typically 16 (from 4800 raw samples to 300 decimated)
+            decimated_timestep = raw_timestep // self.decimation_factor
+            
+            # Ensure timestep is within bounds
+            max_decimated_timestep = x_ph.size(-1) - 1
+            decimated_timestep = min(decimated_timestep, max_decimated_timestep)
+            
+            # Extract single timestep from inputs
+            # Inputs are in (B, C, L) format, we need timestep from dimension L
+            x_ph_single = x_ph[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1)
+            y_st_single = y_st[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1) 
+            y_ph_single = y_ph[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1)
+            
+            # Convert to sequence-first format for model compatibility
+            x_ph_single = x_ph_single.transpose(1, 2)  # (B, 1, C)
+            y_st_single = y_st_single.transpose(1, 2)  # (B, 1, C)
+            y_ph_single = y_ph_single.transpose(1, 2)  # (B, 1, C)
+            
+            # Source encoder for single timestep
+            mu_x_single = self.source_encoder(x_ph_single)  # (B, 1, latent_dim)
+            
+            # Target encoder for single timestep  
+            mu_y_single, logvar_y_full_single = self.target_encoder(y_st_single, y_ph_single)
+            
+            # Split target logvar for prior and conditional feature
+            logvar_y_prior_single, c_logvar_single = torch.split(
+                logvar_y_full_single, self.latent_dim_target, dim=-1
+            )
+            
+            # Conditional encoder for single timestep
+            mu_post_single, logvar_post_single = self.conditional_encoder(
+                mu_x_single, c_logvar_single
+            )
+            
+            # Sample z from posterior for single timestep
+            z_single = self.reparameterize(mu_post_single, logvar_post_single)  # (B, 1, latent_dim)
+            
+            # Decode to get raw signal prediction for next 480 samples
+            raw_predictions = self.decoder(z_single)  # Will output (B, 1, 480)
+            
+            return {
+                "raw_signal_mu": raw_predictions["raw_signal_mu"].squeeze(1),      # (B, 480) 
+                "raw_signal_logvar": raw_predictions["raw_signal_logvar"].squeeze(1), # (B, 480)
+                "decimated_timestep": decimated_timestep,
+                "z_single": z_single,  # (B, 1, latent_dim)
+                "mu_post_single": mu_post_single,
+                "logvar_post_single": logvar_post_single
+            }
 
 
 if __name__ == "__main__":
@@ -1443,8 +1760,8 @@ if __name__ == "__main__":
     y_ph_input = torch.randn(batch_size, channels, seq_len)
     x_ph_input = torch.randn(batch_size, channels, seq_len)
     y_raw_input = torch.randn(
-        batch_size, seq_len * 16, 1
-    )  # Raw signal at 16x resolution
+        batch_size, seq_len * 16
+    )  # Raw signal at 16x resolution (B, 4800)
     print(f"\nInput shapes: y_st={y_st_input.shape}, y_ph={y_ph_input.shape}, x_ph={x_ph_input.shape}")
     print(f"Raw signal shape: {y_raw_input.shape}")
 
@@ -1459,6 +1776,7 @@ if __name__ == "__main__":
         
         # Print output shapes
         print(f"Raw signal prediction shape: {forward_outputs['raw_predictions']['raw_signal_mu'].shape}")
+        print(f"Expected shape: (B, S, 480) = ({batch_size}, {seq_len}, 480)")
         print(f"Latent z shape: {forward_outputs['z'].shape}")
         
     except Exception as e:

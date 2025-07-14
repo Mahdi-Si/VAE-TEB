@@ -4,70 +4,40 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.callbacks import ModelSummary
 from lightning.pytorch.profilers import SimpleProfiler
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from lightning.pytorch.tuner import Tuner
 
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-import torch.nn as nn
+from lightning.pytorch.callbacks import ModelCheckpoint
 import torch
-from torch.utils.data import \
-    DataLoader, \
-    random_split, \
-    Dataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-import torch.multiprocessing as mp
-import torch.utils
-import torch.utils.data
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib
-import logging
 import os
-from collections import OrderedDict
 import yaml
-import logging
 from datetime import datetime
 import sys
 import pickle
-import argparse
 from tqdm import tqdm
 import time
 import numpy as np
 
-from utils.custom_logger import setup_logging, InterceptHandler
-
 from utils.data_utils import \
-    plot_forward_pass, \
-    plot_averaged_results, \
-    plot_generated_samples, \
     plot_distributions, \
-    plot_histogram, \
-    plot_loss_dict, \
-    plot_latent_interpolation, \
-    animate_latent_interpolation, \
-    plot_original_reconstructed, \
-    plot_prediction_st, \
-    plot_forward_pass_kld
+    plot_histogram
 
 from utils.graph_model_utils import \
     calculate_log_likelihood, \
-    interpolate_latent, \
     calculate_vaf
 
 from loguru import logger
 
 from pytorch_lightning_modules import *
 
-from sklearn.manifold import TSNE
-import pandas as pd
-
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import SeqVaeTeb
 from pytorch_lightning_modules import LightSeqVaeTeb
 
 from torch.optim.lr_scheduler import MultiStepLR
-import torch.distributed as dist
 
 # Add this line to enable cuDNN benchmark
 torch.backends.cudnn.benchmark = True
@@ -257,7 +227,7 @@ class SeqVAEGraphModel:
                 input_channels=76,  # Replace with config values if available
                 sequence_length=300,
                 decimation_factor=16,
-                kld_beta=1.0
+                kld_beta=self.kld_beta_
             )
 
             try:
@@ -285,7 +255,7 @@ class SeqVAEGraphModel:
                 input_channels=76,
                 sequence_length=300,
                 decimation_factor=16,
-                warmup_period=60,
+                warmup_period=30,
                 kld_beta=1.0
             )
             self.lightning_base_model = LightSeqVaeTeb(
@@ -368,16 +338,16 @@ class SeqVAEGraphModel:
             monitor="val/total_loss",
             mode="min",
             dirpath=self.model_checkpoint_dir,
-            filename="base-model-best-{epoch:02d}-{val/total_loss:.2f}",
-            save_top_k=1,
+            filename="base-model-best-{epoch}",
+            save_top_k=2,
             save_last=False,
         )
 
         # Callback for plotting losses using Plotly with memory optimization
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
-            plot_frequency=1,
-            max_history_size=500  # Limit history to prevent memory issues
+            plot_frequency=self.plot_every_epoch,
+            max_history_size=19900  # Limit history to prevent memory issues
         )
 
         # Profiler for performance analysis
@@ -810,10 +780,15 @@ class SeqVAEGraphModel:
                 forward_outputs = self.base_model(y_st, y_ph, x_ph)
                 raw_predictions = forward_outputs['raw_predictions']
                 
-                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, S*16, 1)
-                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, S*16, 1)
+                # Note: raw_predictions now contains (B, S, 480) predictions of next 480 samples from each timestep
+                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, S, 480)
+                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, S, 480)
                 raw_signal_std = torch.exp(0.5 * raw_signal_logvar)
                 z_latent = forward_outputs['z']  # (B, S, latent_dim)
+                
+                # Get model parameters for plotting
+                warmup_period = getattr(self.base_model, 'warmup_period', 30)
+                decimation_factor = getattr(self.base_model, 'decimation_factor', 16)
                 
                 # Plot for selected samples
                 for k in selected_idx:
@@ -823,12 +798,38 @@ class SeqVAEGraphModel:
                     try:
                         # Prepare data for plotting
                         y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()  # Ground truth raw signal
-                        raw_pred_mean = raw_signal_mu[k].squeeze().detach().cpu().numpy()  # Predicted mean
-                        raw_pred_std = raw_signal_std[k].squeeze().detach().cpu().numpy()  # Predicted std
+                        
+                        # Extract prediction data for this sample
+                        pred_mu_all = raw_signal_mu[k].detach().cpu().numpy()  # (S, 480)
+                        pred_std_all = raw_signal_std[k].detach().cpu().numpy()  # (S, 480)
                         z_sample = z_latent[k].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
                         
-                        # Create a comprehensive plot
-                        fig, axes = plt.subplots(4, 1, figsize=(15, 12))
+                        # Create average predictions considering warmup period
+                        sequence_length = pred_mu_all.shape[0]
+                        raw_signal_length = len(y_raw_sample)
+                        avg_pred_mu = np.zeros(raw_signal_length)
+                        avg_pred_var = np.zeros(raw_signal_length)
+                        prediction_counts = np.zeros(raw_signal_length)
+
+                        # Only use predictions from timesteps after warmup period
+                        for t in range(warmup_period, sequence_length):
+                            start_raw = t * decimation_factor + 1  # Start from next sample after current timestep
+                            end_raw = start_raw + 480  # Next 480 samples
+                            
+                            if end_raw <= raw_signal_length:
+                                # Add this prediction to the average
+                                avg_pred_mu[start_raw:end_raw] += pred_mu_all[t, :]
+                                avg_pred_var[start_raw:end_raw] += pred_std_all[t, :] ** 2  # Add variances
+                                prediction_counts[start_raw:end_raw] += 1
+
+                        # Normalize by count to get average
+                        valid_mask = prediction_counts > 0
+                        avg_pred_mu[valid_mask] /= prediction_counts[valid_mask]
+                        avg_pred_var[valid_mask] /= prediction_counts[valid_mask]
+                        avg_pred_std = np.sqrt(avg_pred_var)
+                        
+                        # Create a comprehensive plot with 5 subplots
+                        fig, axes = plt.subplots(5, 1, figsize=(15, 18))
                         
                         # Plot 1: Ground truth raw signal
                         axes[0].plot(y_raw_sample, 'b-', linewidth=1, label='Ground Truth')
@@ -837,37 +838,71 @@ class SeqVAEGraphModel:
                         axes[0].legend()
                         axes[0].grid(True, alpha=0.3)
                         
-                        # Plot 2: Predicted raw signal with uncertainty
-                        time_steps = np.arange(len(raw_pred_mean))
-                        axes[1].plot(raw_pred_mean, 'r-', linewidth=1, label='Predicted Mean')
-                        axes[1].fill_between(time_steps, 
-                                           raw_pred_mean - raw_pred_std, 
-                                           raw_pred_mean + raw_pred_std, 
-                                           alpha=0.3, color='red', label='±1 Std')
-                        axes[1].set_title('Predicted Raw Signal with Uncertainty')
+                        # Plot 2: Average predicted raw signal with uncertainty (considering warmup)
+                        if np.any(valid_mask):
+                            time_steps = np.arange(len(avg_pred_mu))
+                            valid_time = time_steps[valid_mask]
+                            valid_avg_mu = avg_pred_mu[valid_mask]
+                            valid_avg_std = avg_pred_std[valid_mask]
+                            
+                            axes[1].plot(valid_time, valid_avg_mu, 'r-', linewidth=1, label='Average Predicted Mean')
+                            axes[1].fill_between(valid_time, 
+                                               valid_avg_mu - valid_avg_std, 
+                                               valid_avg_mu + valid_avg_std, 
+                                               alpha=0.3, color='red', label='±1 Std')
+                        axes[1].set_title(f'Average Predicted Raw Signal with Uncertainty (After {warmup_period} timestep warmup)')
                         axes[1].set_ylabel('Amplitude')
                         axes[1].legend()
                         axes[1].grid(True, alpha=0.3)
                         
-                        # Plot 3: Comparison overlay
-                        axes[2].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth')
-                        axes[2].plot(raw_pred_mean, 'r--', linewidth=1, alpha=0.7, label='Predicted')
-                        axes[2].set_title('Ground Truth vs Predicted Raw Signal')
+                        # Plot 3: Single predictions (non-overlapping) with uncertainty
+                        single_pred_timesteps = [warmup_period, warmup_period + 30, warmup_period + 60]
+                        colors = ['red', 'blue', 'green']
+                        
+                        for i, t in enumerate(single_pred_timesteps):
+                            if t < sequence_length:
+                                start_raw = t * decimation_factor + 1
+                                end_raw = start_raw + 480
+                                
+                                if end_raw <= raw_signal_length:
+                                    # Extract single prediction for this timestep
+                                    single_pred = pred_mu_all[t, :]  # (480,)
+                                    single_std = pred_std_all[t, :]  # (480,)
+                                    single_time = np.arange(start_raw, end_raw)
+                                    
+                                    # Plot uncertainty band
+                                    axes[2].fill_between(single_time, single_pred - single_std, single_pred + single_std,
+                                                        alpha=0.2, color=colors[i])
+                                    
+                                    # Plot prediction line
+                                    axes[2].plot(single_time, single_pred, color=colors[i], linewidth=1,
+                                                label=f'Prediction from t={t}', alpha=0.8)
+                        
+                        axes[2].set_title('Single Non-Overlapping Predictions with Uncertainty')
                         axes[2].set_ylabel('Amplitude')
                         axes[2].legend()
                         axes[2].grid(True, alpha=0.3)
                         
-                        # Plot 4: Latent representation
-                        im = axes[3].imshow(z_sample, aspect='auto', cmap='viridis', interpolation='nearest')
-                        axes[3].set_title('Latent Representation')
-                        axes[3].set_xlabel('Time Steps')
-                        axes[3].set_ylabel('Latent Dimensions')
-                        plt.colorbar(im, ax=axes[3])
+                        # Plot 4: Comparison overlay with average predictions
+                        axes[3].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth')
+                        if np.any(valid_mask):
+                            axes[3].plot(valid_time, valid_avg_mu, 'r--', linewidth=1, alpha=0.7, label='Average Predicted')
+                        axes[3].set_title('Ground Truth vs Average Predicted Raw Signal')
+                        axes[3].set_ylabel('Amplitude')
+                        axes[3].legend()
+                        axes[3].grid(True, alpha=0.3)
+                        
+                        # Plot 5: Latent representation
+                        im = axes[4].imshow(z_sample, aspect='auto', cmap='viridis', interpolation='nearest')
+                        axes[4].set_title('Latent Representation')
+                        axes[4].set_xlabel('Time Steps')
+                        axes[4].set_ylabel('Latent Dimensions')
+                        plt.colorbar(im, ax=axes[4])
                         
                         # Overall title
                         guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
                         epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
-                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}')
+                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}\nWarmup Period: {warmup_period} timesteps')
                         
                         plt.tight_layout()
                         
@@ -1208,219 +1243,6 @@ class SeqVAEGraphModel:
         return all_raw_signals
 
     # todo: you can make one function for accuracy analysis and combine both
-    def raw_signal_prediction_accuracy_test(self, test_dataloader, tag="raw_signal_prediction_accuracy", prediction_idx=30, device=None):
-        """
-        Test raw signal prediction accuracy over sliding windows with comprehensive evaluation metrics.
-        
-        Args:
-            test_dataloader: DataLoader containing test data
-            tag: Tag for saving results  
-            prediction_idx: Starting index for predictions
-            device: Device for computation
-        """
-        base_dir = self.test_results_dir
-        self.pytorch_model.to(device)
-        self.pytorch_model.eval()
-        
-        # Initialize metric collections
-        mse_all_list = []
-        mse_energy_norm_list = []
-        vaf_all_list = []
-        log_likelihood_list = []
-        raw_signals_list = []
-        snr_all_list = []
-        pearson_all_list = []
-        
-        # Calculate number of prediction windows
-        warmup_period = getattr(self.pytorch_model, 'warmup_period', 60)
-        decimation_factor = getattr(self.pytorch_model, 'decimation_factor', 16)
-        window_size = 30
-        num_predictions = max(1, int((300 - prediction_idx) / window_size))
-        
-        logger.info(f"Running prediction accuracy test with {num_predictions} prediction windows")
-        
-        with torch.no_grad():
-            for idx, batched_data in tqdm(enumerate(test_dataloader), total=len(test_dataloader)):
-                y_st, y_ph, x_ph, y_raw = [data.to(device) for data in batched_data[:4]]
-                
-                # Ensure y_raw has a channel dimension as expected by the rest of the function
-                if y_raw.dim() == 2:
-                    y_raw = y_raw.unsqueeze(-1)
-                
-                # Collect predictions for sliding windows
-                predicted_list_mean = []
-                predicted_list_logvar = []
-                
-                for j in range(num_predictions):
-                    prediction_idx_m = prediction_idx + (j * window_size)
-                    
-                    # Get window inputs
-                    y_st_window = y_st[:, :, :prediction_idx_m]
-                    y_ph_window = y_ph[:, :, :prediction_idx_m] 
-                    x_ph_window = x_ph[:, :, :prediction_idx_m]
-                    
-                    # Forward pass through model
-                    forward_outputs = self.pytorch_model(y_st_window, y_ph_window, x_ph_window)
-                    raw_predictions = forward_outputs['raw_predictions']
-                    
-                    # Extract predictions for this window
-                    raw_signal_mu = raw_predictions['raw_signal_mu']  # (batch, 4800, 1)
-                    raw_signal_logvar = raw_predictions['raw_signal_logvar']
-                    
-                    # Extract the prediction segment corresponding to current window
-                    start_raw = prediction_idx_m * decimation_factor
-                    end_raw = start_raw + (window_size * decimation_factor)
-                    
-                    if end_raw <= raw_signal_mu.size(1):
-                        predicted_list_mean.append(raw_signal_mu[:, start_raw:end_raw, :])
-                        predicted_list_logvar.append(raw_signal_logvar[:, start_raw:end_raw, :])
-                
-                if not predicted_list_mean:
-                    continue
-                    
-                # Concatenate predictions across time
-                dec_mean_t = torch.cat(predicted_list_mean, dim=1)  # (batch, total_length, 1)
-                dec_logvar_t = torch.cat(predicted_list_logvar, dim=1)
-                dec_std_t = torch.exp(0.5 * dec_logvar_t)
-                
-                # Extract corresponding ground truth segment
-                start_raw = prediction_idx * decimation_factor
-                end_raw = start_raw + dec_mean_t.size(1)
-                y_raw_target = y_raw[:, start_raw:end_raw, :]
-                
-                if dec_mean_t.size(1) != y_raw_target.size(1):
-                    min_len = min(dec_mean_t.size(1), y_raw_target.size(1))
-                    dec_mean_t = dec_mean_t[:, :min_len, :]
-                    dec_std_t = dec_std_t[:, :min_len, :]
-                    y_raw_target = y_raw_target[:, :min_len, :]
-                
-                # Calculate comprehensive metrics
-                
-                # MSE (single channel for raw signals)
-                mse_per_sample = torch.mean((y_raw_target - dec_mean_t) ** 2, dim=1)  # (batch, 1)
-                
-                # Energy normalization
-                energy_per_sample = torch.mean(y_raw_target ** 2, dim=1)  # (batch, 1)
-                energy_normalized_mse = mse_per_sample / (energy_per_sample + 1e-12)
-                
-                # VAF calculation
-                _, vaf = calculate_vaf(y_raw_target.permute(0, 2, 1), dec_mean_t.permute(0, 2, 1))
-                
-                # Log-likelihood calculation
-                log_likelihoods = calculate_log_likelihood(
-                    dec_mean_t.permute(0, 2, 1), 
-                    dec_std_t.permute(0, 2, 1), 
-                    y_raw_target.permute(0, 2, 1)
-                )
-                
-                # SNR calculation (in dB)
-                signal_power = torch.mean(y_raw_target ** 2, dim=1)  # (batch, 1)
-                noise_power = torch.mean((y_raw_target - dec_mean_t) ** 2, dim=1)  # (batch, 1)
-                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))
-                
-                # Pearson correlation
-                y_flat = y_raw_target.view(y_raw_target.size(0), -1)  # (batch, length)
-                pred_flat = dec_mean_t.view(dec_mean_t.size(0), -1)
-                
-                pearson_corr = []
-                for b in range(y_flat.size(0)):
-                    y_centered = y_flat[b] - torch.mean(y_flat[b])
-                    pred_centered = pred_flat[b] - torch.mean(pred_flat[b])
-                    correlation = torch.sum(y_centered * pred_centered) / (
-                        torch.sqrt(torch.sum(y_centered ** 2)) * 
-                        torch.sqrt(torch.sum(pred_centered ** 2)) + 1e-12
-                    )
-                    pearson_corr.append(correlation.unsqueeze(0))
-                
-                pearson_batch = torch.cat(pearson_corr, dim=0).unsqueeze(1)  # (batch, 1)
-                
-                # Accumulate results
-                mse_all_list.append(mse_per_sample)
-                mse_energy_norm_list.append(energy_normalized_mse)
-                vaf_all_list.append(vaf)
-                log_likelihood_list.extend(log_likelihoods)
-                raw_signals_list.append(y_raw_target)
-                snr_all_list.append(snr)
-                pearson_all_list.append(pearson_batch)
-
-        # Create results directory
-        tag_hist = tag + '_results'
-        save_dir_hist = os.path.join(base_dir, tag_hist)
-        os.makedirs(save_dir_hist, exist_ok=True)
-
-        # Concatenate all metrics
-        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N, 1)
-        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N, 1)
-        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N, 1)
-        all_raw_signals = torch.cat(raw_signals_list, dim=0)  # (N, length, 1)
-        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N, 1)
-        pearson_all_data = torch.cat(pearson_all_list, dim=0)  # (N, 1)
-
-        # Save metrics
-        np.save(os.path.join(save_dir_hist, f'{tag}_mse_all_data.npy'), mse_all_data.detach().cpu().numpy())
-        np.save(os.path.join(save_dir_hist, f'{tag}_mse_energy_normalized.npy'), mse_energy_normalized.detach().cpu().numpy())
-        np.save(os.path.join(save_dir_hist, f'{tag}_vaf_all_data.npy'), vaf_all_data.detach().cpu().numpy())
-        np.save(os.path.join(save_dir_hist, f'{tag}_snr_all_data.npy'), snr_all_data.detach().cpu().numpy())
-        np.save(os.path.join(save_dir_hist, f'{tag}_pearson_all_data.npy'), pearson_all_data.detach().cpu().numpy())
-
-        # Calculate signal statistics
-        all_raw_mean = all_raw_signals.mean(dim=0)  # (length, 1)
-        all_raw_std = all_raw_signals.std(dim=0)   # (length, 1)
-
-        # Plot raw signal distributions
-        plot_distributions(
-            sx_mean=all_raw_mean.squeeze(-1).detach().cpu().numpy(),
-            sx_std=all_raw_std.squeeze(-1).detach().cpu().numpy(),
-            plot_second_channel=False,
-            plot_sample=False,
-            plot_dir=save_dir_hist,
-            plot_dataset_average=True,
-            tag='raw_signal_mean'
-        )
-
-        # Plot metric histograms
-        plot_histogram(
-            data=np.array(log_likelihood_list),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_loglikelihood'
-        )
-
-        plot_histogram(
-            data=mse_all_data.detach().cpu().numpy(),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_mse'
-        )
-
-        plot_histogram(
-            data=snr_all_data.detach().cpu().numpy(),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_snr'
-        )
-
-        plot_histogram(
-            data=vaf_all_data.detach().cpu().numpy(),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_vaf'
-        )
-
-        plot_histogram(
-            data=pearson_all_data.detach().cpu().numpy(),
-            single_channel=True,
-            bins=160,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_pearson_correlation'
-        )
-
-        logger.info(f"Raw signal prediction accuracy test completed. Results saved to {save_dir_hist}")
-        return all_raw_signals
 
 
     def do_raw_signal_tests(self, test_dataloader):
@@ -1437,9 +1259,6 @@ class SeqVAEGraphModel:
         self.pytorch_model.to(cuda_device)
         
         # Run all raw signal evaluation methods
-        logger.info("Running raw signal prediction accuracy test...")
-        self.raw_signal_prediction_accuracy_test(test_dataloader=test_dataloader, device=cuda_device)
-        
         logger.info("Running raw signal prediction plots...")
         self.seqvae_raw_signal_plot(test_dataloader, device=cuda_device)
         
