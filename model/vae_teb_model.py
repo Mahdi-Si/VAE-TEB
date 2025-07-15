@@ -474,7 +474,7 @@ class TargetEncoder(nn.Module):
         )
         self.linear_path_phase = ResidualMLP(
             input_dim=reduced_channels,
-            hidden_dims=(32, 32, 32),
+            hidden_dims=(32, 32, 32, 32),
             dropout=dropout,
             final_activation=False,
         )
@@ -1061,95 +1061,16 @@ class UpsamplingBlock(nn.Module):
         return output
 
 
-class FastTemporalSmoother(nn.Module):
-    """
-    Fast temporal smoothing module without attention mechanisms.
-    Uses efficient weighted convolution averaging for noise reduction
-    while maintaining computational efficiency.
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 20,
-        kernel_size: int = 11,
-        dropout: float = 0.1,
-    ):
-        """
-        Args:
-            in_channels: Input feature channels
-            kernel_size: Smoothing kernel size (larger = more smoothing)
-            dropout: Dropout rate for regularization
-        """
-        super().__init__()
-        
-        self.in_channels = in_channels
-        self.kernel_size = kernel_size
-        
-        # Simple but effective smoothing convolution
-        self.smooth_conv = nn.Conv1d(
-            in_channels,
-            in_channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=in_channels,  # Depthwise for efficiency
-            bias=False
-        )
-        
-        # Feature enhancement after smoothing
-        self.enhance_conv = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels * 2, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(in_channels * 2, in_channels, kernel_size=1),
-            nn.Dropout(dropout)
-        )
-        
-        # Simple learnable smoothing strength
-        self.smoothing_strength = nn.Parameter(torch.tensor(0.3))
-        
-        # Initialize smoothing kernel with gaussian-like weights
-        self._init_smooth_kernel()
-        
-    def _init_smooth_kernel(self):
-        """Initialize smoothing kernel with gaussian-like weights for each channel."""
-        with torch.no_grad():
-            # Create gaussian-like kernel
-            kernel_radius = self.kernel_size // 2
-            x = torch.arange(-kernel_radius, kernel_radius + 1, dtype=torch.float32)
-            gaussian_kernel = torch.exp(-(x ** 2) / (2 * (kernel_radius / 3) ** 2))
-            gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
-            
-            # Apply to all input channels
-            for i in range(self.in_channels):
-                self.smooth_conv.weight[i, 0, :] = gaussian_kernel
-                
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor (B*S, in_channels, 480)
-        Returns:
-            Smoothed tensor (B*S, in_channels, 480)
-        """
-        # Apply fast depthwise smoothing
-        smoothed = self.smooth_conv(x)
-        
-        # Enhance features after smoothing
-        enhanced = self.enhance_conv(smoothed)
-        
-        # Learnable blend between original and smoothed signal
-        # Clamp smoothing strength to [0, 1] range
-        alpha = torch.sigmoid(self.smoothing_strength)
-        output = (1 - alpha) * x + alpha * enhanced
-        
-        return output
-
-
 class Decoder(nn.Module):
     """
-    Raw Signal Decoder that predicts the next 2 minutes (480 samples) of raw signal
-    from each timestep in the latent representation. For each timestep i in the 
-    latent sequence (B, S, Z), predicts the next 480 samples of raw signal.
+    Optimized Raw Signal Decoder that predicts the next 2 minutes (480 samples) of raw signal
+    from each timestep in the latent representation. 
     
-    Features advanced temporal smoothing via TCN-based architecture.
+    Key optimizations:
+    - Reduced intermediate dimensions for lower memory usage
+    - Fewer layers for faster training
+    - Shared computation between mu and logvar heads
+    - More efficient convolution architecture
     """
 
     def __init__(
@@ -1157,7 +1078,7 @@ class Decoder(nn.Module):
         latent_dim: int = 16,
         sequence_length: int = 300,
         prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,  # Reduced from 128
         dropout: float = 0.1,
     ):
         """
@@ -1165,7 +1086,7 @@ class Decoder(nn.Module):
             latent_dim: Input latent dimension
             sequence_length: Input sequence length
             prediction_horizon: Number of future samples to predict (default 480 = 2 minutes at 4Hz)
-            hidden_dim: Hidden processing dimension
+            hidden_dim: Hidden processing dimension (reduced for efficiency)
             dropout: Dropout rate
         """
         super().__init__()
@@ -1175,104 +1096,48 @@ class Decoder(nn.Module):
         self.prediction_horizon = prediction_horizon
         self.hidden_dim = hidden_dim
 
-        # Enhanced latent processing for each timestep with increased capacity
+        # Streamlined latent processing - fewer layers, smaller dimensions
         self.latent_processor = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, 128, 6),  # Increased from 96 to 128, more layers
-            dropout=dropout,
-            final_activation=True,
-        )
-        
-        # Additional deep processing for latent features
-        self.latent_deep_processor = ResidualMLP(
-            input_dim=128,
-            hidden_dims=(140, 152, 164, 176),  # Progressive expansion
+            hidden_dims=geometric_schedule(latent_dim, 64, 6),  # Much simpler progression
             dropout=dropout,
             final_activation=True,
         )
 
-        # Process latent features to prediction horizon length with more capacity
+        self.lstm =  nn.LSTM(
+            input_size=64,  # Updated to match fusion_path output
+            hidden_size=128,
+            num_layers=3,
+            batch_first=True,
+            bidirectional=False,
+        )
+        
+        # Direct expansion to prediction horizon - skip intermediate processing
         self.prediction_expander = ResidualMLP(
-            input_dim=176,  # Updated input from latent_deep_processor
-            hidden_dims=geometric_schedule(176, prediction_horizon, 10),  # More layers for smoother transition
-            dropout=dropout,
-            final_activation=True,
-        )
-
-        # Enhanced signal refinement with increased capacity
-        # Convert to channel-first for convolutions: (B*S, 1, 480)
-        self.signal_refiner = nn.Sequential(
-            # First conv block with increased channels
-            nn.Conv1d(1, 24, kernel_size=11, padding=5),
-            nn.LayerNorm([24, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            # Second conv block with higher capacity
-            nn.Conv1d(24, 48, kernel_size=9, padding=4),
-            nn.LayerNorm([48, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            # Third conv block
-            nn.Conv1d(48, 32, kernel_size=7, padding=3),
-            nn.LayerNorm([32, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            # Additional conv block for more processing depth
-            nn.Conv1d(32, 24, kernel_size=5, padding=2),
-            nn.LayerNorm([24, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        
-        # Additional signal processing with ResidualMLP after convolutions
-        self.signal_post_processor = ResidualMLP(
-            input_dim=24,  # Matches output channels from signal_refiner
-            hidden_dims=(32, 28, 24, 20),  # Progressive refinement
+            input_dim=128,
+            hidden_dims=geometric_schedule(128, 256, 5),  # Direct path, fewer layers
             dropout=dropout,
             final_activation=True,
         )
         
-        # Fast temporal smoothing module for noise reduction
-        self.temporal_smoother = FastTemporalSmoother(
-            in_channels=20,
-            kernel_size=11,  # Single-scale efficient smoothing
+        # Simplified output heads
+        self.output_mu = ResidualMLP(
+            input_dim=256,
+            hidden_dims=geometric_schedule(256, prediction_horizon, 6),  # Direct path, fewer layers
             dropout=dropout,
+            final_activation=False,
         )
-
-        # Enhanced output heads with increased capacity
-        # Signal mean head with deeper processing
-        self.output_mu = nn.Sequential(
-            nn.Conv1d(20, 16, kernel_size=3, padding=1),  # Updated input channels from signal_post_processor
-            nn.LayerNorm([16, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),  # Lower dropout for signal reconstruction
-            
-            nn.Conv1d(16, 8, kernel_size=3, padding=1),
-            nn.LayerNorm([8, prediction_horizon]),
-            nn.GELU(),
-            
-            nn.Conv1d(8, 1, kernel_size=1)
-        )
-        
-        # Signal log-variance head with specialized processing for uncertainty
-        self.output_logvar = nn.Sequential(
-            nn.Conv1d(20, 16, kernel_size=5, padding=2),  # Larger kernel for uncertainty estimation
-            nn.LayerNorm([16, prediction_horizon]),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            nn.Conv1d(16, 8, kernel_size=3, padding=1),
-            nn.LayerNorm([8, prediction_horizon]),
-            nn.GELU(),
-            
-            nn.Conv1d(8, 1, kernel_size=1)
+        self.output_logvar = ResidualMLP(
+            input_dim=256,
+            hidden_dims=geometric_schedule(256, prediction_horizon, 6),  # Direct path, fewer layers
+            dropout=dropout,
+            final_activation=False,
         )
 
     def forward(self, latent_z: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
+        Simplified forward pass using only LSTM and linear layers for maximum efficiency.
+        
         Args:
             latent_z: Latent variables (batch_size, sequence_length, latent_dim)
         Returns:
@@ -1282,44 +1147,24 @@ class Decoder(nn.Module):
         """
         B, S, Z = latent_z.shape
 
-        # Process each timestep independently to predict next 480 samples
-        # Reshape to process all timesteps in parallel
-        latent_flat = latent_z.view(B * S, Z)  # (B*S, Z)
+        # Initial latent processing
+        processed = self.latent_processor(latent_z)  # (B, S, 64)
         
-        # Enhanced latent processing pipeline
-        processed = self.latent_processor(latent_flat)  # (B*S, 128)
-        deep_processed = self.latent_deep_processor(processed)  # (B*S, 176)
+        # LSTM processing for temporal context
+        lstm_out, (hidden, cell) = self.lstm(processed)  # (B, S, 128)
         
-        # Expand to prediction horizon with enhanced capacity
-        predictions = self.prediction_expander(deep_processed)  # (B*S, 480)
+        # Expand to intermediate features
+        expanded = self.prediction_expander(lstm_out)  # (B, S, 256)
         
-        # Reshape back to have channel dimension for convolutions
-        predictions = predictions.view(B * S, 1, self.prediction_horizon)  # (B*S, 1, 480)
-        
-        # Apply enhanced signal refinement with convolutions
-        refined = self.signal_refiner(predictions)  # (B*S, 24, 480)
-        
-        # Apply post-processing with ResidualMLP (convert to sequence-first format)
-        refined_seq = refined.transpose(1, 2)  # (B*S, 480, 24)
-        post_processed = self.signal_post_processor(refined_seq)  # (B*S, 480, 20)
-        post_processed_conv = post_processed.transpose(1, 2)  # (B*S, 20, 480)
-        
-        # Apply advanced temporal smoothing for noise reduction
-        smoothed_features = self.temporal_smoother(post_processed_conv)  # (B*S, 20, 480)
-        
-        # Generate mean and log variance predictions with enhanced heads
-        raw_mu = self.output_mu(smoothed_features)  # (B*S, 1, 480)
-        raw_logvar = self.output_logvar(smoothed_features)  # (B*S, 1, 480)
+        # Generate outputs using separate MLPs
+        raw_mu = self.output_mu(expanded)  # (B, S, 480)
+        raw_logvar = self.output_logvar(expanded)  # (B, S, 480)
         
         # Clamp log variance for numerical stability
-        raw_logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
+        raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
         
-        # Reshape back to (B, S, 480)
-        raw_mu = raw_mu.view(B, S, self.prediction_horizon)
-        raw_logvar = raw_logvar.view(B, S, self.prediction_horizon)
-        
-        # Clean up intermediate tensors
-        del refined, refined_seq, post_processed, post_processed_conv, smoothed_features, predictions, processed, deep_processed, latent_flat
+        # Clean up intermediate tensors for memory efficiency
+        del processed, lstm_out, expanded, hidden, cell
 
         return {"raw_signal_mu": raw_mu, "raw_signal_logvar": raw_logvar}
 

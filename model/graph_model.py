@@ -8,6 +8,7 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
 import torch
 import torch.distributed as dist
+from lightning.pytorch.tuner import Tuner
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -80,6 +81,73 @@ def check_memory_threshold(threshold_gb=10.0):
             clear_gpu_memory()
             return True
     return False
+
+def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_batch_size=1):
+    """
+    Find the optimal batch size that fits in GPU memory.
+    
+    Args:
+        model: The model to test
+        sample_batch: A sample batch to use for testing
+        device: The device to test on
+        max_batch_size: Maximum batch size to try
+        min_batch_size: Minimum batch size to try
+    
+    Returns:
+        int: Optimal batch size
+    """
+    model.eval()
+    optimal_batch_size = min_batch_size
+    
+    for batch_size in range(min_batch_size, max_batch_size + 1, 2):
+        try:
+            # Clear memory before test
+            clear_gpu_memory()
+            
+            # Create test batch with current batch size
+            test_y_st = sample_batch.fhr_st[:batch_size].to(device)
+            test_y_ph = sample_batch.fhr_ph[:batch_size].to(device)
+            test_x_ph = sample_batch.fhr_up_ph[:batch_size].to(device)
+            test_y_raw = sample_batch.fhr[:batch_size].to(device)
+            
+            # Test forward pass
+            with torch.no_grad():
+                forward_outputs = model(test_y_st, test_y_ph, test_x_ph)
+                loss_dict = model.compute_loss(forward_outputs, test_y_raw, compute_kld_loss=True)
+                loss = loss_dict['total_loss']
+                
+            # Test backward pass (without updating weights)
+            loss.backward()
+            
+            # If we get here, this batch size works
+            optimal_batch_size = batch_size
+            logger.info(f"Batch size {batch_size} successful")
+            
+            # Clean up test tensors
+            del test_y_st, test_y_ph, test_x_ph, test_y_raw
+            del forward_outputs, loss_dict, loss
+            clear_gpu_memory()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning(f"Batch size {batch_size} failed: OOM")
+                break
+            else:
+                logger.error(f"Batch size {batch_size} failed with error: {e}")
+                break
+        except Exception as e:
+            logger.error(f"Batch size {batch_size} failed with unexpected error: {e}")
+            break
+    
+    # Use 80% of the maximum working batch size for safety margin
+    safe_batch_size = max(1, int(optimal_batch_size * 0.8))
+    logger.info(f"Optimal batch size found: {safe_batch_size} (80% of max working size {optimal_batch_size})")
+    
+    # Reset model to training mode
+    model.train()
+    clear_gpu_memory()
+    
+    return safe_batch_size
 
 class SeqVAEGraphModel:
     def __init__(self, config_file_path=None):
@@ -318,10 +386,10 @@ class SeqVAEGraphModel:
 
         self.metrics_callback = MetricsLoggingCallback()
 
-        # Memory monitoring callback to prevent OOM errors
+        # Optimized memory monitoring for smaller batch sizes
         self.memory_monitor_callback = MemoryMonitorCallback(
-            threshold_gb=8.0,  # Adjust based on your GPU memory
-            log_frequency=100  # Log every 100 batches
+            threshold_gb=6.0,  # Lower threshold for aggressive cleanup
+            log_frequency=50   # More frequent monitoring
         )
 
         # Callback for early stopping to prevent overfitting
@@ -397,22 +465,24 @@ class SeqVAEGraphModel:
             num_sanity_val_steps=0,
             callbacks=callbacks_list,
             precision="16-mixed",
-            accumulate_grad_batches=self.accumulate_grad_batches,
-            # Memory optimization settings
-            limit_train_batches=1.0,  # Use full dataset but can be reduced for debugging
-            limit_val_batches=1.0,    # Use full validation set
-            val_check_interval=1.0,   # Validate once per epoch
-            check_val_every_n_epoch=1,  # Validate every epoch
-            sync_batchnorm=True if len(self.cuda_devices) > 1 else False,  # Only for multi-GPU
-            detect_anomaly=False,     # Disable for performance
-            deterministic=False,      # Allow non-deterministic for performance
-            benchmark=True,           # Enable cudnn benchmark for performance
+            accumulate_grad_batches=max(self.accumulate_grad_batches, 4),  # Force higher accumulation
+            # Enhanced memory optimization settings
+            limit_train_batches=1.0,
+            limit_val_batches=1.0,
+            val_check_interval=1.0,
+            check_val_every_n_epoch=1,
+            sync_batchnorm=True if len(self.cuda_devices) > 1 else False,
+            detect_anomaly=False,
+            deterministic=False,
+            benchmark=True,
+            # Additional memory optimizations
+            enable_model_summary=False,  # Disable to save memory
         )
 
         # Log memory after trainer setup
         log_gpu_memory_usage("After trainer setup")
 
-        # # Find optimal learning rate
+        # Find optimal learning rate
         # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
         # tuner = Tuner(trainer)
         #
@@ -511,9 +581,21 @@ class SeqVAEGraphModel:
             self.base_model.to(device)
             model = self.base_model
 
-        # Use AdamW with weight decay for better optimization
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4, eps=1e-8)
-        scheduler = MultiStepLR(optimizer, milestones=self.lr_milestones, gamma=0.5)
+        # Optimized AdamW configuration for memory efficiency
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=self.lr, 
+            weight_decay=1e-4, 
+            eps=1e-8,
+            betas=(0.9, 0.98)  # Slightly modified for VAE training
+        )
+        
+        # Use cosine annealing for better convergence
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.epochs_num, 
+            eta_min=self.lr * 0.01
+        )
         
         # Enable mixed precision for faster training
         scaler = torch.amp.GradScaler('cuda') if device != "cpu" else None
