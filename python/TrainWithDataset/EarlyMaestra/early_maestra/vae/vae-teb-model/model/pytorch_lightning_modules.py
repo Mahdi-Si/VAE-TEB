@@ -671,29 +671,42 @@ class LightSeqVaeTeb(L.LightningModule):
                     torch.cuda.empty_cache()
 
     def _common_step(self, batch, batch_idx):
-        """Common logic for training and validation steps with memory optimization."""
+        """Optimized common logic for training and validation steps with aggressive memory management."""
         # Access data using correct HDF5 dataset field names  
         y_st = batch.fhr_st      # Scattering transform features
         y_ph = batch.fhr_ph      # Phase harmonic features
         x_ph = batch.fhr_up_ph   # Cross-phase features
         y_raw = batch.fhr        # Raw signal for reconstruction
         
-        # Clear any cached computations
-        if hasattr(self.model, 'clear_cache'):
-            self.model.clear_cache()
+        # Use gradient checkpointing for forward pass to save memory
+        if self.training:
+            forward_outputs = torch.utils.checkpoint.checkpoint(
+                self.model, y_st, y_ph, x_ph, use_reentrant=False
+            )
+        else:
+            forward_outputs = self.model(y_st, y_ph, x_ph)
         
-        forward_outputs = self.model(y_st, y_ph, x_ph)
         loss_dict = self.model.compute_loss(
             forward_outputs, y_raw, compute_kld_loss=True
         )
         
-        # Clean up intermediate tensors to free memory
+        # Aggressive cleanup to free memory immediately
         del y_st, y_ph, x_ph, y_raw
-        if 'forward_outputs' in locals():
-            # Only delete if we have a reference to avoid errors
+        
+        # Clean up forward outputs except what's needed for loss
+        if isinstance(forward_outputs, dict):
+            keys_to_keep = set()  # Don't keep anything after loss computation
             for key in list(forward_outputs.keys()):
-                if key not in ['z', 'raw_predictions']:  # Keep essential outputs for loss computation
-                    forward_outputs.pop(key, None)
+                if key not in keys_to_keep:
+                    if key in forward_outputs:
+                        del forward_outputs[key]
+        
+        # Force garbage collection on every 10th step
+        if batch_idx % 10 == 0:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         return loss_dict
 
@@ -730,40 +743,57 @@ class LightSeqVaeTeb(L.LightningModule):
         return total_loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Clean up after each training batch."""
-        # Periodic GPU cache clearing to prevent memory buildup - device-aware
-        if batch_idx % 10 == 0 and torch.cuda.is_available():
-            # Clear cache on current device, not just device 0
-            current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
-            if current_device is not None:
-                with torch.cuda.device(current_device):
-                    torch.cuda.empty_cache()
+        """Optimized cleanup after each training batch."""
+        # More aggressive memory management for training
+        if batch_idx % 5 == 0 and torch.cuda.is_available():  # More frequent clearing
+            current_device = torch.cuda.current_device()
+            with torch.cuda.device(current_device):
+                torch.cuda.empty_cache()
+        
+        # Clean up batch references
+        del batch
+        
+        # Periodic garbage collection
+        if batch_idx % 20 == 0:
+            import gc
+            gc.collect()
 
     def on_validation_batch_end(self, outputs, batch, batch_idx):
-        """Clean up after each validation batch."""
-        # Periodic GPU cache clearing to prevent memory buildup - device-aware
-        if batch_idx % 5 == 0 and torch.cuda.is_available():
-            # Clear cache on current device, not just device 0
-            current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
-            if current_device is not None:
-                with torch.cuda.device(current_device):
-                    torch.cuda.empty_cache()
+        """Optimized cleanup after each validation batch."""
+        # Aggressive validation cleanup
+        if batch_idx % 3 == 0 and torch.cuda.is_available():  # More frequent for validation
+            current_device = torch.cuda.current_device()
+            with torch.cuda.device(current_device):
+                torch.cuda.empty_cache()
+        
+        # Clean up batch references
+        del batch
 
     def configure_optimizers(self):
-        """Configure optimizers and learning rate schedulers."""
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        """Configure optimizers and learning rate schedulers with memory-efficient settings."""
+        # Use AdamW with weight decay for better generalization and memory efficiency
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.hparams.lr,
+            weight_decay=1e-4,  # L2 regularization
+            eps=1e-8,          # Numerical stability
+            betas=(0.9, 0.999) # Default Adam betas
+        )
         
         if self.hparams.lr_milestones:
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            # Use cosine annealing with restarts for better convergence
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
-                milestones=self.hparams.lr_milestones,
-                gamma=0.5
+                T_0=max(self.hparams.lr_milestones) // 4,  # Restart every quarter of training
+                T_mult=1,
+                eta_min=self.hparams.lr * 0.01  # Minimum LR is 1% of initial
             )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "interval": "epoch",
+                    "interval": "step",  # Step-wise for smoother updates
+                    "frequency": 1,
                 },
             }
         return optimizer
