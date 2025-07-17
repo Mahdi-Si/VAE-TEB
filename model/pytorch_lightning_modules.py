@@ -95,16 +95,16 @@ class PlottingCallBack(Callback):
                 # Get model parameters for plotting
                 warmup_period = getattr(pl_module.model, 'warmup_period', 30)
                 decimation_factor = getattr(pl_module.model, 'decimation_factor', 16)
-                prediction_horizon = raw_predictions['raw_signal_mu'].shape[1]  # prediction_horizon samples
-                
-                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}, prediction_horizon: {prediction_horizon}")
+                B, S, prediction_horizon = raw_predictions['raw_signal_mu'].shape
+                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}")
+                logger.info(f"Prediction shape: (B={B}, S={S}, prediction_horizon={prediction_horizon})")
 
                 # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
                 # Extract predictions for the first sample in the batch and move to CPU
-                # raw_predictions now contain (B, 480) - single future window prediction
-                pred_mu_future = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (480,)
-                pred_logvar_future = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (480,)
-                pred_std_future = np.exp(0.5 * pred_logvar_future)
+                # raw_predictions now contain (B, S, prediction_horizon) - predictions from each timestep
+                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, prediction_horizon)
+                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, prediction_horizon)
+                pred_std = np.exp(0.5 * pred_logvar)
 
                 # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
@@ -131,42 +131,24 @@ class PlottingCallBack(Callback):
                 
                 logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
 
-                # Create future window for plotting
-                # The model now predicts a single future window after the sequence ends
-                raw_signal_length = len(ground_truth_fhr)
-                sequence_end = raw_signal_length - prediction_horizon
-                
-                # Create extended ground truth that includes the future window
-                if sequence_end > 0:
-                    # We have enough data to show both sequence and future prediction
-                    extended_length = raw_signal_length + prediction_horizon
-                    extended_ground_truth = np.zeros(extended_length)
-                    extended_ground_truth[:raw_signal_length] = ground_truth_fhr
-                    
-                    # Create prediction array aligned with extended ground truth
-                    extended_prediction = np.zeros(extended_length)
-                    extended_prediction_std = np.zeros(extended_length)
-                    
-                    # Place the future prediction at the end
-                    extended_prediction[raw_signal_length:] = pred_mu_future
-                    extended_prediction_std[raw_signal_length:] = pred_std_future
-                    
-                    # Create masks for visualization
-                    sequence_mask = np.arange(extended_length) < raw_signal_length
-                    future_mask = np.arange(extended_length) >= raw_signal_length
+                # Select a representative timepoint for simple visualization
+                # Use a middle timepoint after warmup for plotting
+                if S > warmup_period + 10:
+                    selected_timestep = min(int(S * 0.6), S - 1)  # Use 60% through sequence
                 else:
-                    # Fallback if data is too short
-                    extended_length = max(raw_signal_length, prediction_horizon)
-                    extended_ground_truth = np.zeros(extended_length)
-                    extended_ground_truth[:len(ground_truth_fhr)] = ground_truth_fhr
-                    extended_prediction = np.zeros(extended_length)
-                    extended_prediction_std = np.zeros(extended_length)
-                    extended_prediction[:len(pred_mu_future)] = pred_mu_future
-                    extended_prediction_std[:len(pred_std_future)] = pred_std_future
-                    sequence_mask = np.arange(extended_length) < len(ground_truth_fhr)
-                    future_mask = np.arange(extended_length) >= len(ground_truth_fhr)
+                    selected_timestep = max(warmup_period, S - 1)
+                
+                # Extract prediction for the selected timestep
+                pred_mu_selected = pred_mu[selected_timestep]  # (prediction_horizon,)
+                pred_std_selected = pred_std[selected_timestep]  # (prediction_horizon,)
+                
+                # Calculate where this prediction should be placed in the raw signal
+                raw_start = selected_timestep * decimation_factor
+                raw_end = raw_start + prediction_horizon
+                
+                logger.info(f"Selected timestep {selected_timestep} for plotting, raw_start: {raw_start}, raw_end: {raw_end}")
 
-                logger.info(f"Data shapes for plotting - extended_prediction: {extended_prediction.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
+                logger.info(f"Data shapes for plotting - pred_mu: {pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
                 if z_latent is not None:
                     logger.info(f"Latent shape: {z_latent.shape}")
 
