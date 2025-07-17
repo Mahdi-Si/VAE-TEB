@@ -13,13 +13,13 @@ from vae_teb_model import SeqVaeTeb
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['PYDEVD_USE_CYTHON']="NO"
-
+os.environ['PYDEVD_USE_CYTHON'] = "NO"
 
 matplotlib.use('Agg')
 torch.backends.cudnn.enabled = False
 
 from loguru import logger
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
 # Callbacks
@@ -67,7 +67,7 @@ class PlottingCallBack(Callback):
                 logger.info("Accessing batch data...")
                 y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
                 y_raw_normalized = batch.fhr  # This is the normalized FHR from dataset
-                up_raw_normalized = batch.up   # This is the normalized UP from dataset
+                up_raw_normalized = batch.up  # This is the normalized UP from dataset
 
                 logger.info(f"Batch shapes - y_st: {y_st.shape}, y_ph: {y_ph.shape}, x_ph: {x_ph.shape}, y_raw: {y_raw_normalized.shape}")
 
@@ -75,7 +75,7 @@ class PlottingCallBack(Callback):
                 logger.info("Running model forward pass...")
                 model_outputs = pl_module.model(y_st, y_ph, x_ph)
                 logger.info(f"Model forward pass successful. Output keys: {list(model_outputs.keys())}")
-                
+
                 # OPTIMIZATION: Move data to CPU immediately after forward pass to reduce GPU 0 load
                 # Transfer all required data to CPU for plotting operations
                 device_info = {
@@ -109,12 +109,12 @@ class PlottingCallBack(Callback):
                 # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
                 ground_truth_up = up_raw_normalized[0].squeeze().detach().cpu().numpy()
-                
+
                 # Get latent representation and move to CPU immediately
                 z_latent = None
                 if 'z' in model_outputs:
                     z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
-                
+
                 # Get batch info and move to CPU
                 try:
                     guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
@@ -122,13 +122,13 @@ class PlottingCallBack(Callback):
                 except:
                     guid = 'unknown'
                     epoch_info = 'unknown'
-                
+
                 # Free GPU memory early by deleting GPU tensors
                 del model_outputs, raw_predictions
                 del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized
                 # Force GPU memory cleanup before heavy CPU plotting
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
+
                 logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
 
                 # Select a representative timepoint for simple visualization
@@ -137,18 +137,19 @@ class PlottingCallBack(Callback):
                     selected_timestep = min(int(S * 0.6), S - 1)  # Use 60% through sequence
                 else:
                     selected_timestep = max(warmup_period, S - 1)
-                
+
                 # Extract prediction for the selected timestep
                 pred_mu_selected = pred_mu[selected_timestep]  # (prediction_horizon,)
                 pred_std_selected = pred_std[selected_timestep]  # (prediction_horizon,)
-                
+
                 # Calculate where this prediction should be placed in the raw signal
                 raw_start = selected_timestep * decimation_factor
                 raw_end = raw_start + prediction_horizon
-                
+
                 logger.info(f"Selected timestep {selected_timestep} for plotting, raw_start: {raw_start}, raw_end: {raw_end}")
 
-                logger.info(f"Data shapes for plotting - pred_mu: {pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
+                logger.info(
+                    f"Data shapes for plotting - pred_mu: {pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
                 if z_latent is not None:
                     logger.info(f"Latent shape: {z_latent.shape}")
 
@@ -194,67 +195,11 @@ class PlottingCallBack(Callback):
                 # Thinner colorbar axis
                 cbar_ax = fig.add_subplot(gs[4, 28:])
 
-                # Plot 1: Ground Truth FHR
-                ax1.plot(ground_truth_fhr, color=colors['ground_truth'], label='Ground Truth FHR')
-                ax1.set_title('Ground Truth Fetal Heart Rate (FHR)')
-                ax1.set_ylabel('Normalized Value')
-                ax1.grid(True)
-                ax1.legend()
-
-                # Plot 2: Ground Truth UP
-                ax2.plot(ground_truth_up, color='purple', label='Ground Truth UP')
-                ax2.set_title('Ground Truth Uterine Pressure (UP)')
-                ax2.set_ylabel('Normalized Value')
-                ax2.grid(True)
-                ax2.legend()
-
-                # Plot 3: Zoomed-in Prediction
-                prediction_indices = np.arange(raw_start, raw_end)
-                if len(prediction_indices) == len(pred_mu_selected):
-                    zoom_context = 100
-                    zoom_start = max(0, raw_start - zoom_context)
-                    zoom_end = min(len(ground_truth_fhr), raw_end + zoom_context)
-                    zoom_indices = np.arange(zoom_start, zoom_end)
-
-                    ax3.plot(zoom_indices, ground_truth_fhr[zoom_start:zoom_end], color=colors['ground_truth'], label='Ground Truth')
-                    ax3.plot(prediction_indices, pred_mu_selected, color=colors['prediction'], label=f'Prediction (from t={selected_timestep})')
-                    ax3.fill_between(prediction_indices, pred_mu_selected - pred_std_selected, pred_mu_selected + pred_std_selected, color=colors['uncertainty'], alpha=0.5, label='±1 Std. Dev.')
-                    ax3.axvline(x=raw_start, color='red', linestyle='--', linewidth=1, label='Prediction Start')
-                    ax3.set_title(f'Zoomed View: Prediction from Latent Timestep {selected_timestep}')
-                    ax3.set_ylabel('Normalized Value')
-                    ax3.legend()
-                    ax3.grid(True)
-
-                # Plot 4: Full Timeline with Prediction Overlay
-                ax4.plot(ground_truth_fhr, color=colors['ground_truth'], label='Full Ground Truth', alpha=0.7)
-                if len(prediction_indices) == len(pred_mu_selected):
-                    ax4.plot(prediction_indices, pred_mu_selected, color=colors['prediction'], linewidth=2, label=f'Prediction Window (from t={selected_timestep})')
-                ax4.set_title('Full Timeline with Prediction Window Overlay')
-                ax4.set_xlabel('Raw Signal Timesteps')
-                ax4.set_ylabel('Normalized Value')
-                ax4.legend()
-                ax4.grid(True)
-
-                # Plot 5: Latent Representation
-                if z_latent is not None:
-                    im = ax5.imshow(z_latent, aspect='auto', cmap='viridis', interpolation='nearest')
-                    ax5.set_title('Latent Representation (z)')
-                    ax5.set_xlabel('Latent Timesteps (S)')
-                    ax5.set_ylabel('Latent Dimensions')
-                    fig.colorbar(im, cax=cbar_ax)
-
-                # Final figure setup
-                fig.suptitle(f"Raw Signal Prediction - GUID: {guid}, Epoch: {pl_trainer.current_epoch}, Val Batch Sample 0", fontsize=14)
-                fig.tight_layout(rect=[0, 0.03, 1, 0.97])
-
-                # Save the figure
-                save_dir = os.path.join(self.output_dir, "validation_plots")
-                os.makedirs(save_dir, exist_ok=True)
-                plot_path = os.path.join(save_dir, f'plot_epoch_{pl_trainer.current_epoch}_guid_{guid}.png')
-                fig.savefig(plot_path, dpi=150)
-                plt.close(fig)
-
-                logger.info(f"Saved validation plot to {plot_path}")
+                # Use the fixed plotting callback implementation
+                from fixed_plotting_callback import FixedPlottingCallBack
+                fixed_plotter = FixedPlottingCallBack(self.output_dir, 1, self.input_channel_num)
+                fixed_plotter.on_validation_epoch_end(pl_trainer, pl_module)
+                return
 
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
@@ -299,7 +244,7 @@ class LossPlotCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         # Extract the current epoch number
         epoch = trainer.current_epoch
-        
+
         # Retrieve logged metrics from the trainer
         metrics = trainer.callback_metrics
 
@@ -358,11 +303,10 @@ class LossPlotCallback(Callback):
         plot_path = os.path.join(self.output_dir, f"loss_plot_epoch.html")
         fig.write_html(plot_path)
         logger.info(f"Loss plot saved to {plot_path}")
-        
+
         # Clean up figure to free memory
         del fig
         gc.collect()
-
 
 
 class MetricsLoggingCallback(Callback):
@@ -389,6 +333,7 @@ class LightSeqVaeTeb(L.LightningModule):
     This module handles the training, validation, and optimization loops,
     including learning rate scheduling and KLD beta annealing.
     """
+
     def __init__(self,
                  seqvae_teb_model: SeqVaeTeb,
                  lr: float = 1e-4,
@@ -399,7 +344,7 @@ class LightSeqVaeTeb(L.LightningModule):
                  beta_anneal_epochs: int = 100,
                  beta_cycle_len: int = 1000,
                  beta_const_val: float = 1.0
-                ):
+                 ):
         """
         Args:
             seqvae_teb_model: An instance of the SeqVaeTeb model.
@@ -455,7 +400,7 @@ class LightSeqVaeTeb(L.LightningModule):
         except IndexError:
             # This can happen if the optimizer is not yet configured
             pass
-        
+
         # Clear GPU cache at the start of each epoch - device-aware
         if torch.cuda.is_available():
             device_count = torch.cuda.device_count()
@@ -465,12 +410,12 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def _common_step(self, batch, batch_idx):
         """Optimized common logic for training and validation steps with aggressive memory management."""
-        # Access data using correct HDF5 dataset field names  
-        y_st = batch.fhr_st      # Scattering transform features
-        y_ph = batch.fhr_ph      # Phase harmonic features
-        x_ph = batch.fhr_up_ph   # Cross-phase features
-        y_raw = batch.fhr        # Raw signal for reconstruction
-        
+        # Access data using correct HDF5 dataset field names
+        y_st = batch.fhr_st  # Scattering transform features
+        y_ph = batch.fhr_ph  # Phase harmonic features
+        x_ph = batch.fhr_up_ph  # Cross-phase features
+        y_raw = batch.fhr  # Raw signal for reconstruction
+
         # Use gradient checkpointing for forward pass to save memory
         if self.training:
             forward_outputs = torch.utils.checkpoint.checkpoint(
@@ -478,14 +423,14 @@ class LightSeqVaeTeb(L.LightningModule):
             )
         else:
             forward_outputs = self.model(y_st, y_ph, x_ph)
-        
+
         loss_dict = self.model.compute_loss(
             forward_outputs, y_raw, compute_kld_loss=True
         )
-        
+
         # Aggressive cleanup to free memory immediately
         del y_st, y_ph, x_ph, y_raw
-        
+
         # Clean up forward outputs except what's needed for loss
         if isinstance(forward_outputs, dict):
             keys_to_keep = set()  # Don't keep anything after loss computation
@@ -493,14 +438,14 @@ class LightSeqVaeTeb(L.LightningModule):
                 if key not in keys_to_keep:
                     if key in forward_outputs:
                         del forward_outputs[key]
-        
+
         # Force garbage collection on every 10th step
         if batch_idx % 10 == 0:
             import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        
+
         return loss_dict
 
     def training_step(self, batch, batch_idx):
@@ -516,7 +461,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
         # Clear loss_dict to free memory
         del loss_dict
-        
+
         return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -532,7 +477,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
         # Clear loss_dict to free memory
         del loss_dict
-        
+
         return total_loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -542,10 +487,10 @@ class LightSeqVaeTeb(L.LightningModule):
             current_device = torch.cuda.current_device()
             with torch.cuda.device(current_device):
                 torch.cuda.empty_cache()
-        
+
         # Clean up batch references
         del batch
-        
+
         # Periodic garbage collection
         if batch_idx % 20 == 0:
             import gc
@@ -558,7 +503,7 @@ class LightSeqVaeTeb(L.LightningModule):
             current_device = torch.cuda.current_device()
             with torch.cuda.device(current_device):
                 torch.cuda.empty_cache()
-        
+
         # Clean up batch references
         del batch
 
@@ -566,13 +511,13 @@ class LightSeqVaeTeb(L.LightningModule):
         """Configure optimizers and learning rate schedulers with memory-efficient settings."""
         # Use AdamW with weight decay for better generalization and memory efficiency
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            self.parameters(),
             lr=self.hparams.lr,
             weight_decay=1e-4,  # L2 regularization
-            eps=1e-8,          # Numerical stability
-            betas=(0.9, 0.999) # Default Adam betas
+            eps=1e-8,  # Numerical stability
+            betas=(0.9, 0.999)  # Default Adam betas
         )
-        
+
         if self.hparams.lr_milestones:
             # Use cosine annealing with restarts for better convergence
             scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -596,6 +541,7 @@ class MemoryMonitorCallback(Callback):
     """
     Callback to monitor GPU memory usage and automatically clear cache when needed.
     """
+
     def __init__(self, threshold_gb=10.0, log_frequency=50):
         """
         Args:
@@ -606,55 +552,56 @@ class MemoryMonitorCallback(Callback):
         self.threshold_gb = threshold_gb
         self.log_frequency = log_frequency
         self.batch_count = 0
-        
+
     def _log_memory_usage(self, prefix=""):
         """Log current GPU memory usage for all devices."""
         if torch.cuda.is_available():
             total_allocated = 0.0
             device_count = torch.cuda.device_count()
             for device_id in range(device_count):
-                allocated = torch.cuda.memory_allocated(device_id) / 1024**3  # GB
-                reserved = torch.cuda.memory_reserved(device_id) / 1024**3   # GB
+                allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3  # GB
+                reserved = torch.cuda.memory_reserved(device_id) / 1024 ** 3  # GB
                 logger.info(f"{prefix} GPU {device_id}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
                 total_allocated += allocated
             return total_allocated
         return 0.0
-    
+
     def _clear_memory_if_needed(self):
         """Clear GPU memory on all devices if usage exceeds threshold."""
         if torch.cuda.is_available():
             device_count = torch.cuda.device_count()
             cleared_any = False
             for device_id in range(device_count):
-                allocated = torch.cuda.memory_allocated(device_id) / 1024**3  # GB
+                allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3  # GB
                 if allocated > self.threshold_gb:
-                    logger.warning(f"GPU {device_id} memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
+                    logger.warning(
+                        f"GPU {device_id} memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
                     with torch.cuda.device(device_id):
                         torch.cuda.empty_cache()
                     cleared_any = True
             return cleared_any
         return False
-    
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Monitor memory after each training batch."""
         self.batch_count += 1
-        
+
         # Log memory usage periodically
         if self.batch_count % self.log_frequency == 0:
             self._log_memory_usage(f"Train batch {batch_idx}")
-        
+
         # Clear memory if needed
         self._clear_memory_if_needed()
-    
+
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """Monitor memory after each validation batch."""
         # Clear memory if needed during validation
         self._clear_memory_if_needed()
-    
+
     def on_train_epoch_start(self, trainer, pl_module):
         """Log memory at the start of each epoch."""
         self._log_memory_usage(f"Epoch {trainer.current_epoch} start")
-    
+
     def on_train_epoch_end(self, trainer, pl_module):
         """Clear memory and log usage at the end of each epoch."""
         self._log_memory_usage(f"Epoch {trainer.current_epoch} end")
