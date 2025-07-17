@@ -87,54 +87,49 @@ class PlottingCallBack(Callback):
                     logger.error("Model output missing 'raw_predictions' key")
                     return
 
+                raw_predictions = model_outputs['raw_predictions']
+                if 'raw_signal_mu' not in raw_predictions or 'raw_signal_logvar' not in raw_predictions:
+                    logger.error(f"Raw predictions missing required keys. Available keys: {list(raw_predictions.keys())}")
+                    return
+
                 # Get model parameters for plotting
                 warmup_period = getattr(pl_module.model, 'warmup_period', 30)
                 decimation_factor = getattr(pl_module.model, 'decimation_factor', 16)
-                
-                # --- START: Data Extraction and GPU Memory Management ---
-                # Extract all necessary data from GPU tensors to CPU numpy arrays
-                # BEFORE deleting the GPU tensors to avoid UnboundLocalError.
-                raw_predictions = model_outputs['raw_predictions']
                 B, S, prediction_horizon = raw_predictions['raw_signal_mu'].shape
-                
-                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()
-                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()
+                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}")
+                logger.info(f"Prediction shape: (B={B}, S={S}, prediction_horizon={prediction_horizon})")
+
+                # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
+                # Extract predictions for the first sample in the batch and move to CPU
+                # raw_predictions now contain (B, S, prediction_horizon) - predictions from each timestep
+                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, prediction_horizon)
+                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, prediction_horizon)
                 pred_std = np.exp(0.5 * pred_logvar)
 
-                z_latent = model_outputs.get('z', [None])[0]
-                if z_latent is not None:
-                    z_latent = z_latent.permute(1, 0).detach().cpu().numpy()
-
-                mu_post = model_outputs.get('mu_post', [None])[0]
-                if mu_post is not None:
-                    mu_post = mu_post.detach().cpu().numpy()
-
-                logvar_post = model_outputs.get('logvar_post', [None])[0]
-                if logvar_post is not None:
-                    logvar_post = logvar_post.detach().cpu().numpy()
-
-                mu_prior = model_outputs.get('mu_prior', [None])[0]
-                if mu_prior is not None:
-                    mu_prior = mu_prior.detach().cpu().numpy()
-
-                logvar_prior = model_outputs.get('logvar_prior', [None])[0]
-                if logvar_prior is not None:
-                    logvar_prior = logvar_prior.detach().cpu().numpy()
-                
+                # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
                 ground_truth_up = up_raw_normalized[0].squeeze().detach().cpu().numpy()
-
+                
+                # Get latent representation and move to CPU immediately
+                z_latent = None
+                if 'z' in model_outputs:
+                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
+                
+                # Get batch info and move to CPU
                 try:
                     guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
+                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
                 except:
                     guid = 'unknown'
-
-                # Now that all data is on CPU, delete the large GPU tensors.
-                del model_outputs, raw_predictions, batch
+                    epoch_info = 'unknown'
+                
+                # Free GPU memory early by deleting GPU tensors
+                del model_outputs, raw_predictions
                 del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized
+                # Force GPU memory cleanup before heavy CPU plotting
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                logger.info(f"Data moved to CPU and GPU memory cleared. Device was: {device_info}")
-                # --- END: Data Extraction ---
+                
+                logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
 
                 # Select a representative timepoint for simple visualization
                 # Use a middle timepoint after warmup for plotting
@@ -184,107 +179,82 @@ class PlottingCallBack(Callback):
                     'ytick.labelsize': 9
                 })
 
-                # Create a 3x2 grid for a more comprehensive dashboard
-                fig, axes = plt.subplots(3, 2, figsize=(22, 18), facecolor=colors['background'])
-                ax = axes.flatten()
+                fig = plt.figure(figsize=(16, 15), facecolor=colors['background'])
 
-                # --- Plot 1: Main Prediction View (Ground Truth vs. Prediction) ---
-                ax[0].plot(ground_truth_fhr, color='gray', linewidth=1, alpha=0.8, label='Full Ground Truth')
-                # Show history leading up to the prediction
-                context_window = 150
-                context_start = max(0, raw_start - context_window)
-                ax[0].plot(range(context_start, raw_start), ground_truth_fhr[context_start:raw_start], color='black', linestyle='--', label='History Window')
-                
-                # Plot the ground truth for the predicted window for direct comparison
-                if raw_end <= len(ground_truth_fhr):
-                    ax[0].plot(range(raw_start, raw_end), ground_truth_fhr[raw_start:raw_end], color=colors['ground_truth'], linewidth=1.5, label='Actual Future')
-                
-                # Plot the prediction with uncertainty
-                prediction_indices = range(raw_start, raw_end)
-                ax[0].plot(prediction_indices, pred_mu_selected, color=colors['prediction'], linewidth=1.5, label='Predicted Future (μ)')
-                ax[0].fill_between(prediction_indices, 
-                                 pred_mu_selected - pred_std_selected, 
-                                 pred_mu_selected + pred_std_selected,
-                                 color=colors['uncertainty'], alpha=0.6, label='Uncertainty (±1σ)')
-                ax[0].axvline(x=raw_start, color='red', linestyle=':', linewidth=1.5, label='Prediction Start')
-                ax[0].set_title(f'Main Prediction View (from Timestep {selected_timestep})')
-                ax[0].set_ylabel('FHR (Normalized)')
-                ax[0].legend(fontsize=8)
-                ax[0].grid(True)
+                # Create a grid layout with 5 rows for the new subplot
+                gs = fig.add_gridspec(5, 30, hspace=0.4, wspace=0.05)
 
-                # --- Plot 2: Prediction Error Analysis ---
-                if raw_end <= len(ground_truth_fhr):
-                    target_window = ground_truth_fhr[raw_start:raw_end]
-                    error = target_window - pred_mu_selected
-                    mse = np.mean(error**2)
-                    
-                    ax[1].plot(prediction_indices, error, color='purple', label='Prediction Error (Actual - Predicted)')
-                    ax[1].axhline(0, color='black', linestyle='--', linewidth=1)
-                    ax[1].set_title(f'Prediction Error (MSE: {mse:.4f})')
-                    ax[1].set_ylabel('Error')
-                    ax[1].legend(fontsize=8)
-                    ax[1].grid(True)
-                else:
-                    ax[1].text(0.5, 0.5, 'Ground truth not available for error plot', ha='center', va='center')
-                    ax[1].set_title('Prediction Error')
+                # Main plots take up most of the width (columns 0-27), colorbar is thinner (28-29)
+                ax1 = fig.add_subplot(gs[0, :27])  # Ground truth
+                ax2 = fig.add_subplot(gs[1, :27])  # Average predictions with uncertainty
+                ax3 = fig.add_subplot(gs[2, :27])  # Single predictions (non-overlapping)
+                ax4 = fig.add_subplot(gs[3, :27])  # Comparison overlay
+                ax5 = fig.add_subplot(gs[4, :27])  # Latent representation
 
-                # --- Plot 3: Latent Space (z) Heatmap ---
+                # Thinner colorbar axis
+                cbar_ax = fig.add_subplot(gs[4, 28:])
+
+                # Plot 1: Ground Truth FHR
+                ax1.plot(ground_truth_fhr, color=colors['ground_truth'], label='Ground Truth FHR')
+                ax1.set_title('Ground Truth Fetal Heart Rate (FHR)')
+                ax1.set_ylabel('Normalized Value')
+                ax1.grid(True)
+                ax1.legend()
+
+                # Plot 2: Ground Truth UP
+                ax2.plot(ground_truth_up, color='purple', label='Ground Truth UP')
+                ax2.set_title('Ground Truth Uterine Pressure (UP)')
+                ax2.set_ylabel('Normalized Value')
+                ax2.grid(True)
+                ax2.legend()
+
+                # Plot 3: Zoomed-in Prediction
+                prediction_indices = np.arange(raw_start, raw_end)
+                if len(prediction_indices) == len(pred_mu_selected):
+                    zoom_context = 100
+                    zoom_start = max(0, raw_start - zoom_context)
+                    zoom_end = min(len(ground_truth_fhr), raw_end + zoom_context)
+                    zoom_indices = np.arange(zoom_start, zoom_end)
+
+                    ax3.plot(zoom_indices, ground_truth_fhr[zoom_start:zoom_end], color=colors['ground_truth'], label='Ground Truth')
+                    ax3.plot(prediction_indices, pred_mu_selected, color=colors['prediction'], label=f'Prediction (from t={selected_timestep})')
+                    ax3.fill_between(prediction_indices, pred_mu_selected - pred_std_selected, pred_mu_selected + pred_std_selected, color=colors['uncertainty'], alpha=0.5, label='±1 Std. Dev.')
+                    ax3.axvline(x=raw_start, color='red', linestyle='--', linewidth=1, label='Prediction Start')
+                    ax3.set_title(f'Zoomed View: Prediction from Latent Timestep {selected_timestep}')
+                    ax3.set_ylabel('Normalized Value')
+                    ax3.legend()
+                    ax3.grid(True)
+
+                # Plot 4: Full Timeline with Prediction Overlay
+                ax4.plot(ground_truth_fhr, color=colors['ground_truth'], label='Full Ground Truth', alpha=0.7)
+                if len(prediction_indices) == len(pred_mu_selected):
+                    ax4.plot(prediction_indices, pred_mu_selected, color=colors['prediction'], linewidth=2, label=f'Prediction Window (from t={selected_timestep})')
+                ax4.set_title('Full Timeline with Prediction Window Overlay')
+                ax4.set_xlabel('Raw Signal Timesteps')
+                ax4.set_ylabel('Normalized Value')
+                ax4.legend()
+                ax4.grid(True)
+
+                # Plot 5: Latent Representation
                 if z_latent is not None:
-                    im = ax[2].imshow(z_latent.T, aspect='auto', cmap='viridis', interpolation='nearest', origin='lower')
-                    ax[2].set_title('Latent Representation (z)')
-                    ax[2].set_xlabel('Time Steps')
-                    ax[2].set_ylabel('Latent Dimensions')
-                    fig.colorbar(im, ax=ax[2])
-                else:
-                    ax[2].text(0.5, 0.5, 'Latent z not available', ha='center', va='center')
-                    ax[2].set_title('Latent Representation (z)')
+                    im = ax5.imshow(z_latent, aspect='auto', cmap='viridis', interpolation='nearest')
+                    ax5.set_title('Latent Representation (z)')
+                    ax5.set_xlabel('Latent Timesteps (S)')
+                    ax5.set_ylabel('Latent Dimensions')
+                    fig.colorbar(im, cax=cbar_ax)
 
-                # --- Plot 4: Latent Variable Distributions (Posterior) ---
-                if mu_post is not None and logvar_post is not None:
-                    ax[3].hist(mu_post.flatten(), bins=50, alpha=0.7, label='Posterior μ', color='skyblue', density=True)
-                    ax[3].set_xlabel('Value')
-                    ax[3].set_ylabel('Density')
-                    ax[3].legend(loc='upper left', fontsize=8)
-                    
-                    ax3_twin = ax[3].twinx()
-                    ax3_twin.hist(logvar_post.flatten(), bins=50, alpha=0.7, label='Posterior log(σ²)', color='salmon', density=True)
-                    ax3_twin.set_ylabel('Density')
-                    ax3_twin.legend(loc='upper right', fontsize=8)
-                    ax[3].set_title('Posterior Latent Distributions')
-                    ax[3].grid(True)
+                # Final figure setup
+                fig.suptitle(f"Raw Signal Prediction - GUID: {guid}, Epoch: {pl_trainer.current_epoch}, Val Batch Sample 0", fontsize=14)
+                fig.tight_layout(rect=[0, 0.03, 1, 0.97])
 
-                # --- Plot 5: Prior vs. Posterior (Mu) ---
-                if mu_prior is not None and mu_post is not None:
-                    dims_to_plot = min(3, mu_prior.shape[1])
-                    for i in range(dims_to_plot):
-                        ax[4].plot(mu_prior[:, i], '--', color=f'C{i}', label=f'Prior μ (dim {i})')
-                        ax[4].plot(mu_post[:, i], '-', color=f'C{i}', label=f'Posterior μ (dim {i})')
-                    ax[4].set_title('Prior vs. Posterior (μ)')
-                    ax[4].set_xlabel('Time Steps')
-                    ax[4].set_ylabel('Value')
-                    ax[4].legend(fontsize=8)
-                    ax[4].grid(True)
-
-                # --- Plot 6: Prior vs. Posterior (Logvar) ---
-                if logvar_prior is not None and logvar_post is not None:
-                    dims_to_plot = min(3, logvar_prior.shape[1])
-                    for i in range(dims_to_plot):
-                        ax[5].plot(logvar_prior[:, i], '--', color=f'C{i}', label=f'Prior log(σ²) (dim {i})')
-                        ax[5].plot(logvar_post[:, i], '-', color=f'C{i}', label=f'Posterior log(σ²) (dim {i})')
-                    ax[5].set_title('Prior vs. Posterior (log σ²)')
-                    ax[5].set_xlabel('Time Steps')
-                    ax[5].set_ylabel('Value')
-                    ax[5].legend(fontsize=8)
-                    ax[5].grid(True)
-                
-                # Finalize and save the plot
-                fig.suptitle(f"SeqVaeTeb Performance Dashboard - Epoch {pl_trainer.current_epoch} - GUID: {guid}", fontsize=16)
-                plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle and legend
-                
-                save_path = os.path.join(self.output_dir, f"epoch_{pl_trainer.current_epoch}_dashboard.png")
-                plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+                # Save the figure
+                save_dir = os.path.join(self.output_dir, "validation_plots")
+                os.makedirs(save_dir, exist_ok=True)
+                plot_path = os.path.join(save_dir, f'plot_epoch_{pl_trainer.current_epoch}_guid_{guid}.png')
+                fig.savefig(plot_path, dpi=150)
                 plt.close(fig)
-                logger.info(f"Saved performance dashboard to {save_path}")
+
+                logger.info(f"Saved validation plot to {plot_path}")
 
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
