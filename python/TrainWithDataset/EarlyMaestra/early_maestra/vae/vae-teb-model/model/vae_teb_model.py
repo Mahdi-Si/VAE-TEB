@@ -1063,14 +1063,13 @@ class UpsamplingBlock(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Optimized Raw Signal Decoder that predicts the next 2 minutes (480 samples) of raw signal
-    from each timestep in the latent representation. 
+    Simplified Raw Signal Decoder that predicts a fixed-size future window from the entire sequence.
     
-    Key optimizations:
-    - Reduced intermediate dimensions for lower memory usage
-    - Fewer layers for faster training
-    - Shared computation between mu and logvar heads
-    - More efficient convolution architecture
+    Key changes:
+    - Predicts a single future window instead of overlapping predictions from each timestep
+    - Much simpler and more efficient architecture
+    - Clear alignment between predictions and targets
+    - Reduced memory usage and computational complexity
     """
 
     def __init__(
@@ -1078,7 +1077,7 @@ class Decoder(nn.Module):
         latent_dim: int = 16,
         sequence_length: int = 300,
         prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
-        hidden_dim: int = 64,  # Reduced from 128
+        hidden_dim: int = 128,
         dropout: float = 0.1,
     ):
         """
@@ -1086,7 +1085,7 @@ class Decoder(nn.Module):
             latent_dim: Input latent dimension
             sequence_length: Input sequence length
             prediction_horizon: Number of future samples to predict (default 480 = 2 minutes at 4Hz)
-            hidden_dim: Hidden processing dimension (reduced for efficiency)
+            hidden_dim: Hidden processing dimension
             dropout: Dropout rate
         """
         super().__init__()
@@ -1096,75 +1095,79 @@ class Decoder(nn.Module):
         self.prediction_horizon = prediction_horizon
         self.hidden_dim = hidden_dim
 
-        # Streamlined latent processing - fewer layers, smaller dimensions
+        # Process latent sequence to extract temporal features
         self.latent_processor = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, 64, 6),  # Much simpler progression
+            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 4),
             dropout=dropout,
             final_activation=True,
         )
 
-        self.lstm =  nn.LSTM(
-            input_size=64,  # Updated to match fusion_path output
-            hidden_size=128,
-            num_layers=3,
+        # LSTM to process temporal sequence
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=2,
             batch_first=True,
             bidirectional=False,
         )
         
-        # Direct expansion to prediction horizon - skip intermediate processing
-        self.prediction_expander = ResidualMLP(
-            input_dim=128,
-            hidden_dims=geometric_schedule(128, 256, 5),  # Direct path, fewer layers
+        # Use only the final LSTM output (last timestep) for prediction
+        self.final_processor = ResidualMLP(
+            input_dim=hidden_dim,
+            hidden_dims=geometric_schedule(hidden_dim, hidden_dim * 2, 3),
             dropout=dropout,
             final_activation=True,
         )
         
-        # Simplified output heads
+        # Direct prediction heads for the future window
         self.output_mu = ResidualMLP(
-            input_dim=256,
-            hidden_dims=geometric_schedule(256, prediction_horizon, 6),  # Direct path, fewer layers
+            input_dim=hidden_dim * 2,
+            hidden_dims=geometric_schedule(hidden_dim * 2, prediction_horizon, 5),
             dropout=dropout,
             final_activation=False,
         )
         self.output_logvar = ResidualMLP(
-            input_dim=256,
-            hidden_dims=geometric_schedule(256, prediction_horizon, 6),  # Direct path, fewer layers
+            input_dim=hidden_dim * 2,
+            hidden_dims=geometric_schedule(hidden_dim * 2, prediction_horizon, 5),
             dropout=dropout,
             final_activation=False,
         )
 
     def forward(self, latent_z: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Simplified forward pass using only LSTM and linear layers for maximum efficiency.
+        Simplified forward pass that predicts a single future window from the entire sequence.
         
         Args:
             latent_z: Latent variables (batch_size, sequence_length, latent_dim)
         Returns:
             Dictionary containing:
-            - raw_signal_mu: (batch_size, sequence_length, prediction_horizon)
-            - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon)
+            - raw_signal_mu: (batch_size, prediction_horizon) - single future window
+            - raw_signal_logvar: (batch_size, prediction_horizon) - single future window
         """
         B, S, Z = latent_z.shape
 
-        # Initial latent processing
-        processed = self.latent_processor(latent_z)  # (B, S, 64)
+        # Process latent sequence
+        processed = self.latent_processor(latent_z)  # (B, S, hidden_dim)
         
         # LSTM processing for temporal context
-        lstm_out, (hidden, cell) = self.lstm(processed)  # (B, S, 128)
+        lstm_out, (hidden, cell) = self.lstm(processed)  # (B, S, hidden_dim)
         
-        # Expand to intermediate features
-        expanded = self.prediction_expander(lstm_out)  # (B, S, 256)
+        # Use only the final output (last timestep) for prediction
+        final_output = lstm_out[:, -1, :]  # (B, hidden_dim)
         
-        # Generate outputs using separate MLPs
-        raw_mu = self.output_mu(expanded)  # (B, S, 480)
-        raw_logvar = self.output_logvar(expanded)  # (B, S, 480)
+        # Process final output
+        final_features = self.final_processor(final_output)  # (B, hidden_dim * 2)
+        
+        # Generate single future window predictions
+        raw_mu = self.output_mu(final_features)  # (B, prediction_horizon)
+        raw_logvar = self.output_logvar(final_features)  # (B, prediction_horizon)
         
         # Clamp log variance for numerical stability
         raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
         
         # Clean up intermediate tensors for memory efficiency
-        del processed, lstm_out, expanded, hidden, cell
+        del processed, lstm_out, final_output, final_features, hidden, cell
 
         return {"raw_signal_mu": raw_mu, "raw_signal_logvar": raw_logvar}
 
@@ -1173,63 +1176,49 @@ class Decoder(nn.Module):
     ) -> torch.Tensor:
         """
         Compute negative log-likelihood loss for raw signal prediction.
-        For each timestep i, compares the predicted next 480 samples against
-        the actual next 480 samples from the raw signal.
+        Now simplified to predict a single future window after the entire sequence.
 
         Args:
             predictions: Dictionary containing raw_signal_mu and raw_signal_logvar
-                        Both have shape (B, S, 480)
+                        Both have shape (B, prediction_horizon)
             target_raw_signal:  Ground truth raw signal (B, raw_signal_length)
                                 where raw_signal_length = S * 16
-            warmup_period:  Number of initial timesteps to skip (default: 30)
-                            We don't compute loss for early timesteps as there's 
-                            insufficient history for meaningful predictions
+            warmup_period:  Not used in simplified version, kept for API compatibility
         Returns:
             NLL loss tensor
         """
-        mu = predictions["raw_signal_mu"]  # (B, S, 480)
-        logvar = predictions["raw_signal_logvar"]  # (B, S, 480)
+        mu = predictions["raw_signal_mu"]  # (B, prediction_horizon)
+        logvar = predictions["raw_signal_logvar"]  # (B, prediction_horizon)
         
-        B, S, prediction_horizon = mu.shape
+        B, prediction_horizon = mu.shape
+        raw_signal_length = target_raw_signal.shape[1]
         
-        # Apply warmup period - only compute loss for timesteps after warmup
-        start_timestep = max(0, warmup_period)
-        if start_timestep >= S:
-            # If warmup period is longer than sequence, return zero loss
+        # Extract the future window after the sequence ends
+        # Sequence length is typically 300 timesteps * 16 decimation = 4800 samples
+        # We predict the next 480 samples after this
+        sequence_end = raw_signal_length - prediction_horizon
+        
+        if sequence_end <= 0:
+            # If target signal is too short, return zero loss
             return torch.tensor(0.0, device=mu.device, requires_grad=True)
         
-        # Create target tensor for comparison (only for timesteps after warmup)
-        effective_timesteps = S - start_timestep
-        target_predictions = torch.zeros(B, effective_timesteps, prediction_horizon, device=mu.device)
+        # Extract the target future window
+        target_future = target_raw_signal[:, sequence_end:sequence_end + prediction_horizon]  # (B, prediction_horizon)
         
-        for idx, i in enumerate(range(start_timestep, S)):
-            start_idx = i * 16 + 1  # Start from next sample after current timestep
-            end_idx = start_idx + prediction_horizon  # Next 480 samples
-            
-            # Check bounds to avoid indexing errors
-            if end_idx <= target_raw_signal.shape[1]:
-                target_predictions[:, idx, :] = target_raw_signal[:, start_idx:end_idx]
-            else:
-                # Handle edge case where we don't have enough future samples
-                available_samples = target_raw_signal.shape[1] - start_idx
-                if available_samples > 0:
-                    target_predictions[:, idx, :available_samples] = target_raw_signal[:, start_idx:]
-                    # Pad with last available sample if needed
-                    if available_samples < prediction_horizon:
-                        last_sample = target_raw_signal[:, -1:].expand(B, prediction_horizon - available_samples)
-                        target_predictions[:, idx, available_samples:] = last_sample
-
-        # Extract predictions only for timesteps after warmup
-        mu_effective = mu[:, start_timestep:, :]  # (B, effective_timesteps, 480)
-        logvar_effective = logvar[:, start_timestep:, :]  # (B, effective_timesteps, 480)
-
+        # Handle case where target is shorter than expected
+        if target_future.shape[1] < prediction_horizon:
+            # Pad with the last available sample
+            padding_size = prediction_horizon - target_future.shape[1]
+            last_sample = target_future[:, -1:].expand(B, padding_size)
+            target_future = torch.cat([target_future, last_sample], dim=1)
+        
         # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-        diff = target_predictions - mu_effective
-        var = logvar_effective.exp()
-        nll = 0.5 * (logvar_effective + diff.pow(2) / var)
+        diff = target_future - mu
+        var = logvar.exp()
+        nll = 0.5 * (logvar + diff.pow(2) / var)
         
         # Clean up
-        del target_predictions, diff, var
+        del target_future, diff, var
         
         return nll.mean()
 
@@ -1464,8 +1453,8 @@ class SeqVaeTeb(nn.Module):
         """
         Returns the raw signal predictions for visualization.
         
-        The decoder now outputs predictions for the next 480 samples (2 minutes)
-        from each timestep in the latent sequence.
+        The decoder now outputs a single prediction for the next 480 samples (2 minutes)
+        after the entire sequence.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass, which
@@ -1473,7 +1462,7 @@ class SeqVaeTeb(nn.Module):
 
         Returns:
             A dictionary containing raw signal predictions with shape 
-            (batch_size, sequence_length, 480).
+            (batch_size, prediction_horizon).
         """
         return forward_outputs["raw_predictions"]
 
@@ -1496,84 +1485,40 @@ class SeqVaeTeb(nn.Module):
             forward_outputs = self.forward(y_st, y_ph, x_ph)
             return forward_outputs["raw_predictions"]
 
-    def predict_single_timestep(
+    def predict_future_window(
         self, 
         x_ph: torch.Tensor, 
         y_st: torch.Tensor, 
-        y_ph: torch.Tensor,
-        raw_timestep: int,
-        raw_signal_length: int = 4800
+        y_ph: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Predict the next 2 minutes (480 samples) of raw FHR signal from a single timestep.
+        Predict the next 2 minutes (480 samples) of raw FHR signal after the entire sequence.
         
-        This method allows you to specify a specific timestep in the raw signal,
-        finds the corresponding timestep in the decimated scattering transform,
-        and predicts the next 2 minutes (480 samples at 4Hz) of raw signal.
+        This method processes the full sequence and predicts a single future window.
+        Much simpler than the previous timestep-based prediction.
 
         Args:
             x_ph: Source phase harmonic input (B, C, L) - full sequence
             y_st: Target scattering input (B, C, L) - full sequence  
             y_ph: Target phase harmonic input (B, C, L) - full sequence
-            raw_timestep: Timestep in the raw signal (0 to raw_signal_length-1)
-            raw_signal_length: Length of the original raw signal (default: 4800)
 
         Returns:
             Dictionary containing:
             - raw_signal_mu: Predicted signal mean for next 2 minutes (B, 480)
             - raw_signal_logvar: Predicted log-variance for next 2 minutes (B, 480) 
-            - decimated_timestep: Corresponding timestep in decimated sequence
-            - z_single: Latent variable at the specific timestep (B, 1, latent_dim)
+            - z: Latent variable from full sequence (B, seq_len, latent_dim)
         """
         with torch.no_grad():
-            # Calculate corresponding timestep in decimated sequence
-            # Decimation factor is typically 16 (from 4800 raw samples to 300 decimated)
-            decimated_timestep = raw_timestep // self.decimation_factor
-            
-            # Ensure timestep is within bounds
-            max_decimated_timestep = x_ph.size(-1) - 1
-            decimated_timestep = min(decimated_timestep, max_decimated_timestep)
-            
-            # Extract single timestep from inputs
-            # Inputs are in (B, C, L) format, we need timestep from dimension L
-            x_ph_single = x_ph[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1)
-            y_st_single = y_st[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1) 
-            y_ph_single = y_ph[:, :, decimated_timestep:decimated_timestep+1]  # (B, C, 1)
-            
-            # Convert to sequence-first format for model compatibility
-            x_ph_single = x_ph_single.transpose(1, 2)  # (B, 1, C)
-            y_st_single = y_st_single.transpose(1, 2)  # (B, 1, C)
-            y_ph_single = y_ph_single.transpose(1, 2)  # (B, 1, C)
-            
-            # Source encoder for single timestep
-            mu_x_single = self.source_encoder(x_ph_single)  # (B, 1, latent_dim)
-            
-            # Target encoder for single timestep  
-            mu_y_single, logvar_y_full_single = self.target_encoder(y_st_single, y_ph_single)
-            
-            # Split target logvar for prior and conditional feature
-            logvar_y_prior_single, c_logvar_single = torch.split(
-                logvar_y_full_single, self.latent_dim_target, dim=-1
-            )
-            
-            # Conditional encoder for single timestep
-            mu_post_single, logvar_post_single = self.conditional_encoder(
-                mu_x_single, c_logvar_single
-            )
-            
-            # Sample z from posterior for single timestep
-            z_single = self.reparameterize(mu_post_single, logvar_post_single)  # (B, 1, latent_dim)
-            
-            # Decode to get raw signal prediction for next 480 samples
-            raw_predictions = self.decoder(z_single)  # Will output (B, 1, 480)
+            # Process full sequence
+            forward_outputs = self.forward(y_st, y_ph, x_ph)
+            raw_predictions = forward_outputs["raw_predictions"]
             
             return {
-                "raw_signal_mu": raw_predictions["raw_signal_mu"].squeeze(1),      # (B, 480) 
-                "raw_signal_logvar": raw_predictions["raw_signal_logvar"].squeeze(1), # (B, 480)
-                "decimated_timestep": decimated_timestep,
-                "z_single": z_single,  # (B, 1, latent_dim)
-                "mu_post_single": mu_post_single,
-                "logvar_post_single": logvar_post_single
+                "raw_signal_mu": raw_predictions["raw_signal_mu"],      # (B, 480) 
+                "raw_signal_logvar": raw_predictions["raw_signal_logvar"], # (B, 480)
+                "z": forward_outputs["z"],  # (B, seq_len, latent_dim)
+                "mu_post": forward_outputs["mu_post"],
+                "logvar_post": forward_outputs["logvar_post"]
             }
 
 
@@ -1621,7 +1566,7 @@ if __name__ == "__main__":
         
         # Print output shapes
         print(f"Raw signal prediction shape: {forward_outputs['raw_predictions']['raw_signal_mu'].shape}")
-        print(f"Expected shape: (B, S, 480) = ({batch_size}, {seq_len}, 480)")
+        print(f"Expected shape: (B, 480) = ({batch_size}, 480)")
         print(f"Latent z shape: {forward_outputs['z'].shape}")
         
     except Exception as e:

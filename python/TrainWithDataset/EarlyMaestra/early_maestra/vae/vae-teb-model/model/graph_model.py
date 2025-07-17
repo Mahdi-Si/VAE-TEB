@@ -862,9 +862,9 @@ class SeqVAEGraphModel:
                 forward_outputs = self.base_model(y_st, y_ph, x_ph)
                 raw_predictions = forward_outputs['raw_predictions']
                 
-                # Note: raw_predictions now contains (B, S, 480) predictions of next 480 samples from each timestep
-                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, S, 480)
-                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, S, 480)
+                # Note: raw_predictions now contains (B, 480) single future window predictions
+                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, 480)
+                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, 480)
                 raw_signal_std = torch.exp(0.5 * raw_signal_logvar)
                 z_latent = forward_outputs['z']  # (B, S, latent_dim)
                 
@@ -882,33 +882,41 @@ class SeqVAEGraphModel:
                         y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()  # Ground truth raw signal
                         
                         # Extract prediction data for this sample
-                        pred_mu_all = raw_signal_mu[k].detach().cpu().numpy()  # (S, 480)
-                        pred_std_all = raw_signal_std[k].detach().cpu().numpy()  # (S, 480)
+                        pred_mu_future = raw_signal_mu[k].detach().cpu().numpy()  # (480,)
+                        pred_std_future = raw_signal_std[k].detach().cpu().numpy()  # (480,)
                         z_sample = z_latent[k].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
                         
-                        # Create average predictions considering warmup period
-                        sequence_length = pred_mu_all.shape[0]
+                        # Create extended arrays for plotting
                         raw_signal_length = len(y_raw_sample)
-                        avg_pred_mu = np.zeros(raw_signal_length)
-                        avg_pred_var = np.zeros(raw_signal_length)
-                        prediction_counts = np.zeros(raw_signal_length)
-
-                        # Only use predictions from timesteps after warmup period
-                        for t in range(warmup_period, sequence_length):
-                            start_raw = t * decimation_factor + 1  # Start from next sample after current timestep
-                            end_raw = start_raw + 480  # Next 480 samples
+                        prediction_horizon = len(pred_mu_future)
+                        
+                        # The model predicts the future window after the sequence ends
+                        sequence_end = raw_signal_length - prediction_horizon
+                        
+                        if sequence_end > 0:
+                            # Create extended ground truth and prediction arrays
+                            extended_length = raw_signal_length + prediction_horizon
+                            extended_ground_truth = np.zeros(extended_length)
+                            extended_ground_truth[:raw_signal_length] = y_raw_sample
                             
-                            if end_raw <= raw_signal_length:
-                                # Add this prediction to the average
-                                avg_pred_mu[start_raw:end_raw] += pred_mu_all[t, :]
-                                avg_pred_var[start_raw:end_raw] += pred_std_all[t, :] ** 2  # Add variances
-                                prediction_counts[start_raw:end_raw] += 1
-
-                        # Normalize by count to get average
-                        valid_mask = prediction_counts > 0
-                        avg_pred_mu[valid_mask] /= prediction_counts[valid_mask]
-                        avg_pred_var[valid_mask] /= prediction_counts[valid_mask]
-                        avg_pred_std = np.sqrt(avg_pred_var)
+                            extended_prediction = np.zeros(extended_length)
+                            extended_prediction_std = np.zeros(extended_length)
+                            extended_prediction[raw_signal_length:] = pred_mu_future
+                            extended_prediction_std[raw_signal_length:] = pred_std_future
+                            
+                            sequence_mask = np.arange(extended_length) < raw_signal_length
+                            future_mask = np.arange(extended_length) >= raw_signal_length
+                        else:
+                            # Fallback for short sequences
+                            extended_length = max(raw_signal_length, prediction_horizon)
+                            extended_ground_truth = np.zeros(extended_length)
+                            extended_ground_truth[:len(y_raw_sample)] = y_raw_sample
+                            extended_prediction = np.zeros(extended_length)
+                            extended_prediction_std = np.zeros(extended_length)
+                            extended_prediction[:len(pred_mu_future)] = pred_mu_future
+                            extended_prediction_std[:len(pred_std_future)] = pred_std_future
+                            sequence_mask = np.arange(extended_length) < len(y_raw_sample)
+                            future_mask = np.arange(extended_length) >= len(y_raw_sample)
                         
                         # Create a comprehensive plot with 5 subplots
                         fig, axes = plt.subplots(5, 1, figsize=(15, 18))
@@ -920,56 +928,67 @@ class SeqVAEGraphModel:
                         axes[0].legend()
                         axes[0].grid(True, alpha=0.3)
                         
-                        # Plot 2: Average predicted raw signal with uncertainty (considering warmup)
-                        if np.any(valid_mask):
-                            time_steps = np.arange(len(avg_pred_mu))
-                            valid_time = time_steps[valid_mask]
-                            valid_avg_mu = avg_pred_mu[valid_mask]
-                            valid_avg_std = avg_pred_std[valid_mask]
+                        # Plot 2: Future window prediction with uncertainty
+                        if np.any(future_mask):
+                            # Plot the sequence part in gray
+                            sequence_indices = np.arange(extended_length)[sequence_mask]
+                            axes[1].plot(sequence_indices, extended_ground_truth[sequence_mask], 'gray', linewidth=1, alpha=0.6, label='Historical Ground Truth')
                             
-                            axes[1].plot(valid_time, valid_avg_mu, 'r-', linewidth=1, label='Average Predicted Mean')
-                            axes[1].fill_between(valid_time, 
-                                               valid_avg_mu - valid_avg_std, 
-                                               valid_avg_mu + valid_avg_std, 
+                            # Plot the future prediction
+                            future_pred = extended_prediction[future_mask]
+                            future_std = extended_prediction_std[future_mask]
+                            future_indices = np.arange(extended_length)[future_mask]
+                            
+                            axes[1].plot(future_indices, future_pred, 'r-', linewidth=1, label='Future Prediction')
+                            axes[1].fill_between(future_indices, 
+                                               future_pred - future_std, 
+                                               future_pred + future_std, 
                                                alpha=0.3, color='red', label='±1 Std')
-                        axes[1].set_title(f'Average Predicted Raw Signal with Uncertainty (After {warmup_period} timestep warmup)')
+                            
+                            # Add vertical line to separate sequence from prediction
+                            axes[1].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.5, label='Prediction Start')
+                            
+                        axes[1].set_title('Future Window Prediction with Uncertainty')
                         axes[1].set_ylabel('Amplitude')
                         axes[1].legend()
                         axes[1].grid(True, alpha=0.3)
                         
-                        # Plot 3: Single predictions (non-overlapping) with uncertainty
-                        single_pred_timesteps = [warmup_period, warmup_period + 30, warmup_period + 60]
-                        colors = ['red', 'blue', 'green']
-                        
-                        for i, t in enumerate(single_pred_timesteps):
-                            if t < sequence_length:
-                                start_raw = t * decimation_factor + 1
-                                end_raw = start_raw + 480
-                                
-                                if end_raw <= raw_signal_length:
-                                    # Extract single prediction for this timestep
-                                    single_pred = pred_mu_all[t, :]  # (480,)
-                                    single_std = pred_std_all[t, :]  # (480,)
-                                    single_time = np.arange(start_raw, end_raw)
-                                    
-                                    # Plot uncertainty band
-                                    axes[2].fill_between(single_time, single_pred - single_std, single_pred + single_std,
-                                                        alpha=0.2, color=colors[i])
-                                    
-                                    # Plot prediction line
-                                    axes[2].plot(single_time, single_pred, color=colors[i], linewidth=1,
-                                                label=f'Prediction from t={t}', alpha=0.8)
-                        
-                        axes[2].set_title('Single Non-Overlapping Predictions with Uncertainty')
+                        # Plot 3: Prediction detail view
+                        if np.any(future_mask):
+                            # Show transition from sequence to prediction
+                            transition_samples = 100
+                            transition_start = max(0, raw_signal_length - transition_samples)
+                            
+                            # Plot the transition region
+                            axes[2].plot(range(transition_start, raw_signal_length), 
+                                        y_raw_sample[transition_start:], 
+                                        'b-', linewidth=1, label='Ground Truth (End of Sequence)', alpha=0.8)
+                            
+                            # Plot the future prediction
+                            future_pred = extended_prediction[future_mask]
+                            future_std = extended_prediction_std[future_mask]
+                            future_indices = np.arange(extended_length)[future_mask]
+                            
+                            axes[2].fill_between(future_indices, future_pred - future_std, future_pred + future_std,
+                                                alpha=0.2, color='red', label='±1 Std')
+                            axes[2].plot(future_indices, future_pred, 'r-', linewidth=1, label='Future Prediction', alpha=0.8)
+                            
+                            # Add vertical line to separate sequence from prediction
+                            axes[2].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.7, label='Prediction Boundary')
+                            
+                        axes[2].set_title('Transition from Sequence to Future Prediction')
                         axes[2].set_ylabel('Amplitude')
                         axes[2].legend()
                         axes[2].grid(True, alpha=0.3)
                         
-                        # Plot 4: Comparison overlay with average predictions
-                        axes[3].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth')
-                        if np.any(valid_mask):
-                            axes[3].plot(valid_time, valid_avg_mu, 'r--', linewidth=1, alpha=0.7, label='Average Predicted')
-                        axes[3].set_title('Ground Truth vs Average Predicted Raw Signal')
+                        # Plot 4: Full sequence overview
+                        axes[3].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth (Full Sequence)')
+                        if np.any(future_mask):
+                            future_pred = extended_prediction[future_mask]
+                            future_indices = np.arange(extended_length)[future_mask]
+                            axes[3].plot(future_indices, future_pred, 'r--', linewidth=1, alpha=0.7, label='Future Prediction')
+                            axes[3].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.5, label='Prediction Start')
+                        axes[3].set_title('Full Sequence with Future Prediction')
                         axes[3].set_ylabel('Amplitude')
                         axes[3].legend()
                         axes[3].grid(True, alpha=0.3)
@@ -984,7 +1003,7 @@ class SeqVAEGraphModel:
                         # Overall title
                         guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
                         epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
-                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}\nWarmup Period: {warmup_period} timesteps')
+                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}\nFuture Window: {prediction_horizon} samples ({prediction_horizon/4.0/60.0:.1f} min)')
                         
                         plt.tight_layout()
                         
@@ -1164,47 +1183,55 @@ class SeqVAEGraphModel:
                 raw_predictions = forward_outputs['raw_predictions']
                 
                 # Extract predictions and ground truth
-                raw_pred_mu = raw_predictions['raw_signal_mu']  # (B, S*16, 1)
-                raw_pred_logvar = raw_predictions['raw_signal_logvar']  # (B, S*16, 1)
+                raw_pred_mu = raw_predictions['raw_signal_mu']  # (B, 480)
+                raw_pred_logvar = raw_predictions['raw_signal_logvar']  # (B, 480)
                 
                 # Ground truth y_raw is expected to be (B, S*16).
-                # Squeeze predictions to match for metric calculations.
-                raw_pred_squeezed = raw_pred_mu.squeeze(-1)  # (B, S*16)
-                raw_std_squeezed = torch.exp(0.5 * raw_pred_logvar.squeeze(-1))  # (B, S*16)
+                # Extract the corresponding future window for evaluation
+                B, prediction_horizon = raw_pred_mu.shape
+                raw_signal_length = y_raw.shape[1]
                 
-                # MSE calculation
-                mse_per_sample = torch.mean((y_raw - raw_pred_squeezed) ** 2, dim=1)  # (B,)
+                # Extract the future window from ground truth
+                sequence_end = raw_signal_length - prediction_horizon
+                if sequence_end <= 0:
+                    continue  # Skip if not enough data
+                    
+                target_future = y_raw[:, sequence_end:sequence_end + prediction_horizon]  # (B, 480)
+                raw_std = torch.exp(0.5 * raw_pred_logvar)  # (B, 480)
                 
-                # Energy of the original signal
-                energy_per_sample = torch.mean(y_raw ** 2, dim=1)  # (B,)
+                # MSE calculation on future window
+                mse_per_sample = torch.mean((target_future - raw_pred_mu) ** 2, dim=1)  # (B,)
+                
+                # Energy of the target future window
+                energy_per_sample = torch.mean(target_future ** 2, dim=1)  # (B,)
                 
                 # Energy-normalized MSE
                 energy_normalized_mse = mse_per_sample / (energy_per_sample + 1e-12)
                 
                 # VAF calculation (Variance Accounted For)
-                y_raw_centered = y_raw - torch.mean(y_raw, dim=1, keepdim=True)
-                pred_centered = raw_pred_squeezed - torch.mean(raw_pred_squeezed, dim=1, keepdim=True)
+                target_centered = target_future - torch.mean(target_future, dim=1, keepdim=True)
+                pred_centered = raw_pred_mu - torch.mean(raw_pred_mu, dim=1, keepdim=True)
                 
-                numerator = torch.sum(y_raw_centered * pred_centered, dim=1) ** 2
-                denominator = torch.sum(y_raw_centered ** 2, dim=1) * torch.sum(pred_centered ** 2, dim=1)
+                numerator = torch.sum(target_centered * pred_centered, dim=1) ** 2
+                denominator = torch.sum(target_centered ** 2, dim=1) * torch.sum(pred_centered ** 2, dim=1)
                 vaf = numerator / (denominator + 1e-12)  # (B,)
                 
                 # Log-likelihood calculation using predicted mean and std
-                log_likelihood = -0.5 * (raw_pred_logvar.squeeze(-1) + 
-                                        ((y_raw - raw_pred_squeezed) ** 2) / 
-                                        (torch.exp(raw_pred_logvar.squeeze(-1)) + 1e-12))
+                log_likelihood = -0.5 * (raw_pred_logvar + 
+                                        ((target_future - raw_pred_mu) ** 2) / 
+                                        (torch.exp(raw_pred_logvar) + 1e-12))
                 log_likelihood_per_sample = torch.mean(log_likelihood, dim=1)  # (B,)
                 
                 # SNR calculation (in dB)
-                signal_power = torch.mean(y_raw ** 2, dim=1)  # (B,)
-                noise_power = torch.mean((y_raw - raw_pred_squeezed) ** 2, dim=1)  # (B,)
+                signal_power = torch.mean(target_future ** 2, dim=1)  # (B,)
+                noise_power = torch.mean((target_future - raw_pred_mu) ** 2, dim=1)  # (B,)
                 snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))  # (B,)
                 
                 # Pearson correlation coefficient
-                pearson_corr = torch.zeros(y_raw.size(0), device=device)
-                for i in range(y_raw.size(0)):
-                    y_true = y_raw[i]
-                    y_pred = raw_pred_squeezed[i]
+                pearson_corr = torch.zeros(target_future.size(0), device=device)
+                for i in range(target_future.size(0)):
+                    y_true = target_future[i]
+                    y_pred = raw_pred_mu[i]
                     
                     y_true_centered = y_true - torch.mean(y_true)
                     y_pred_centered = y_pred - torch.mean(y_pred)
@@ -1218,7 +1245,7 @@ class SeqVAEGraphModel:
                 mse_energy_norm_list.append(energy_normalized_mse)
                 vaf_all_list.append(vaf)
                 log_likelihood_list.append(log_likelihood_per_sample)
-                raw_signal_list.append(y_raw)
+                raw_signal_list.append(target_future)
                 snr_all_list.append(snr)
                 pearson_corr_list.append(pearson_corr)
 

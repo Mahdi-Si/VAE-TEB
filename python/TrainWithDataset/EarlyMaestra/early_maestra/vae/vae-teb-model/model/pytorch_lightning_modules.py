@@ -95,16 +95,16 @@ class PlottingCallBack(Callback):
                 # Get model parameters for plotting
                 warmup_period = getattr(pl_module.model, 'warmup_period', 30)
                 decimation_factor = getattr(pl_module.model, 'decimation_factor', 16)
-                sequence_length = raw_predictions['raw_signal_mu'].shape[1]  # S timesteps
+                prediction_horizon = raw_predictions['raw_signal_mu'].shape[1]  # prediction_horizon samples
                 
-                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}, sequence_length: {sequence_length}")
+                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}, prediction_horizon: {prediction_horizon}")
 
                 # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
                 # Extract predictions for the first sample in the batch and move to CPU
-                # raw_predictions contain (B, S, 480) - predictions of next 480 samples from each timestep
-                pred_mu_all = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, 480)
-                pred_logvar_all = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, 480)
-                pred_std_all = np.exp(0.5 * pred_logvar_all)
+                # raw_predictions now contain (B, 480) - single future window prediction
+                pred_mu_future = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (480,)
+                pred_logvar_future = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (480,)
+                pred_std_future = np.exp(0.5 * pred_logvar_future)
 
                 # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
@@ -131,32 +131,42 @@ class PlottingCallBack(Callback):
                 
                 logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
 
-                # Create average predictions considering warmup period
-                # For timesteps after warmup, average all predictions that contribute to each raw signal sample
+                # Create future window for plotting
+                # The model now predicts a single future window after the sequence ends
                 raw_signal_length = len(ground_truth_fhr)
-                avg_pred_mu = np.zeros(raw_signal_length)
-                avg_pred_var = np.zeros(raw_signal_length)
-                prediction_counts = np.zeros(raw_signal_length)
-
-                # Only use predictions from timesteps after warmup period
-                for t in range(warmup_period, sequence_length):
-                    # Each timestep t predicts the next 480 samples starting from its position
-                    start_raw = t * decimation_factor  # Start from current timestep position
-                    end_raw = start_raw + 480  # Next 480 samples
+                sequence_end = raw_signal_length - prediction_horizon
+                
+                # Create extended ground truth that includes the future window
+                if sequence_end > 0:
+                    # We have enough data to show both sequence and future prediction
+                    extended_length = raw_signal_length + prediction_horizon
+                    extended_ground_truth = np.zeros(extended_length)
+                    extended_ground_truth[:raw_signal_length] = ground_truth_fhr
                     
-                    if end_raw <= raw_signal_length:
-                        # Add this prediction to the average
-                        avg_pred_mu[start_raw:end_raw] += pred_mu_all[t, :]
-                        avg_pred_var[start_raw:end_raw] += pred_std_all[t, :] ** 2  # Add variances
-                        prediction_counts[start_raw:end_raw] += 1
+                    # Create prediction array aligned with extended ground truth
+                    extended_prediction = np.zeros(extended_length)
+                    extended_prediction_std = np.zeros(extended_length)
+                    
+                    # Place the future prediction at the end
+                    extended_prediction[raw_signal_length:] = pred_mu_future
+                    extended_prediction_std[raw_signal_length:] = pred_std_future
+                    
+                    # Create masks for visualization
+                    sequence_mask = np.arange(extended_length) < raw_signal_length
+                    future_mask = np.arange(extended_length) >= raw_signal_length
+                else:
+                    # Fallback if data is too short
+                    extended_length = max(raw_signal_length, prediction_horizon)
+                    extended_ground_truth = np.zeros(extended_length)
+                    extended_ground_truth[:len(ground_truth_fhr)] = ground_truth_fhr
+                    extended_prediction = np.zeros(extended_length)
+                    extended_prediction_std = np.zeros(extended_length)
+                    extended_prediction[:len(pred_mu_future)] = pred_mu_future
+                    extended_prediction_std[:len(pred_std_future)] = pred_std_future
+                    sequence_mask = np.arange(extended_length) < len(ground_truth_fhr)
+                    future_mask = np.arange(extended_length) >= len(ground_truth_fhr)
 
-                # Normalize by count to get average
-                valid_mask = prediction_counts > 0
-                avg_pred_mu[valid_mask] /= prediction_counts[valid_mask]
-                avg_pred_var[valid_mask] /= prediction_counts[valid_mask]
-                avg_pred_std = np.sqrt(avg_pred_var)
-
-                logger.info(f"Data shapes for plotting - avg_pred_mu: {avg_pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
+                logger.info(f"Data shapes for plotting - extended_prediction: {extended_prediction.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
                 if z_latent is not None:
                     logger.info(f"Latent shape: {z_latent.shape}")
 
@@ -204,6 +214,7 @@ class PlottingCallBack(Callback):
 
                 # Time axis in minutes (assuming 4Hz sampling rate)
                 time_axis = np.arange(len(ground_truth_fhr)) / 4.0 / 60  # Convert to minutes
+                extended_time_axis = np.arange(extended_length) / 4.0 / 60  # Convert to minutes for extended view
 
                 # Plot 1: Ground truth raw signals (FHR and UP)
                 colors['ground_truth_up'] = '#8E44AD'  # Purple for UP signal
@@ -218,190 +229,135 @@ class PlottingCallBack(Callback):
                 ax1.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
                 ax1.set_facecolor('white')
 
-                # Plot 2: Average predicted raw signal with uncertainty
-                if np.any(valid_mask):
-                    # Only plot where we have valid predictions
-                    valid_time = time_axis[valid_mask]
-                    valid_avg_mu = avg_pred_mu[valid_mask]
-                    valid_avg_std = avg_pred_std[valid_mask]
+                # Plot 2: Future window prediction with uncertainty
+                if np.any(future_mask):
+                    # Plot the sequence part in gray
+                    ax2.plot(extended_time_axis[sequence_mask], extended_ground_truth[sequence_mask],
+                             color='gray', linewidth=1.0, alpha=0.6, label='Historical Ground Truth')
+                    
+                    # Plot the future prediction with uncertainty
+                    future_time = extended_time_axis[future_mask]
+                    future_pred = extended_prediction[future_mask] 
+                    future_std = extended_prediction_std[future_mask]
 
                     # Plot uncertainty band first (so it appears behind the line)
-                    ax2.fill_between(valid_time,
-                                     valid_avg_mu - valid_avg_std,
-                                     valid_avg_mu + valid_avg_std,
+                    ax2.fill_between(future_time,
+                                     future_pred - future_std,
+                                     future_pred + future_std,
                                      alpha=0.25, color=colors['uncertainty'],
                                      label='±1σ Uncertainty', edgecolor='none')
 
                     # Plot prediction line on top
-                    ax2.plot(valid_time, valid_avg_mu,
+                    ax2.plot(future_time, future_pred,
                              color=colors['prediction'], linewidth=1.2,
-                             label='Average Predicted Mean', alpha=0.9)
+                             label='Future Prediction', alpha=0.9)
+                    
+                    # Add vertical line to separate sequence from prediction
+                    ax2.axvline(x=time_axis[-1], color='red', linestyle='--', alpha=0.5, label='Prediction Start')
 
-                    ax2.set_title('Average Predicted Raw FHR Signal with Uncertainty (After Warmup)', fontweight='medium', pad=15)
+                    ax2.set_title('Future Window Prediction with Uncertainty', fontweight='medium', pad=15)
                     ax2.set_ylabel('Normalized Amplitude')
                     ax2.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
                     ax2.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
                     ax2.set_facecolor('white')
                 else:
-                    ax2.text(0.5, 0.5, 'No valid predictions after warmup period',
+                    ax2.text(0.5, 0.5, 'No valid future predictions',
                              horizontalalignment='center', verticalalignment='center',
                              transform=ax2.transAxes, fontsize=11, color='#666666')
-                    ax2.set_title('Average Predicted Raw FHR Signal (No Valid Data)', fontweight='medium', pad=15)
+                    ax2.set_title('Future Window Prediction (No Valid Data)', fontweight='medium', pad=15)
                     ax2.set_facecolor('white')
 
-                # Plot 3: Non-overlapping single predictions with gaps
-                # Use current warmup period from model
-                warmup_raw_samples = warmup_period * decimation_factor  # warmup in raw signal samples
-                
-                colors['single_pred1'] = '#E74C3C'  # Red
-                colors['single_pred2'] = '#3498DB'  # Blue  
-                colors['single_pred3'] = '#2ECC71'  # Green
-                colors['single_pred4'] = '#F39C12'  # Orange
-                colors['single_pred5'] = '#9B59B6'  # Purple
-                colors['raw_signal'] = '#34495E'     # Dark gray for raw signal
-                
-                # Calculate truly non-overlapping prediction windows
-                # Start from warmup period and create consecutive 2-minute (480-sample) windows
-                prediction_windows = []
-                
-                # Start right after warmup period and create non-overlapping windows
-                current_timestep = warmup_period
-                
-                # Create consecutive 2-minute prediction windows to cover entire signal
-                # Each timestep predicts NEXT 480 samples, so we need to account for gaps
-                while current_timestep < sequence_length:
-                    start_raw = current_timestep * decimation_factor
-                    end_raw = start_raw + 480
+                # Plot 3: Prediction Detail View
+                if np.any(future_mask):
+                    # Show the transition from sequence to prediction
+                    transition_samples = 100  # Show last 100 samples of sequence
+                    transition_start = max(0, len(ground_truth_fhr) - transition_samples)
                     
-                    if end_raw <= raw_signal_length:
-                        # Calculate the gap before next window
-                        next_window_start = end_raw  # Next window should start where this one ends
-                        next_timestep = next_window_start // decimation_factor
-                        
-                        prediction_windows.append({
-                            'timestep': current_timestep,
-                            'raw_start': start_raw,
-                            'raw_end': end_raw,
-                            'gap_start': end_raw,
-                            'gap_end': next_timestep * decimation_factor  # Gap until next aligned timestep
-                        })
-                        
-                        # Move to next timestep that aligns with end of current window
-                        current_timestep = next_timestep
-                    else:
-                        break
-
-                if prediction_windows:
-                    pred_colors = [colors['single_pred1'], colors['single_pred2'], colors['single_pred3'], 
-                                  colors['single_pred4'], colors['single_pred5']]
+                    # Plot the transition region
+                    transition_time = time_axis[transition_start:]
+                    transition_ground_truth = ground_truth_fhr[transition_start:]
                     
-                    # Plot the raw FHR signal as background
-                    ax3.plot(time_axis, ground_truth_fhr, color=colors['raw_signal'], 
-                            linewidth=0.8, alpha=0.6, label='Ground Truth FHR', zorder=1)
+                    ax3.plot(transition_time, transition_ground_truth, 
+                             color=colors['ground_truth'], linewidth=1.2, 
+                             label='Ground Truth (End of Sequence)', alpha=0.8)
                     
-                    # Plot each non-overlapping prediction window - show all windows to cover full 20 minutes
-                    for i, window in enumerate(prediction_windows):  # Show all available windows
-                        t = window['timestep']
-                        start_raw = window['raw_start']
-                        end_raw = window['raw_end']
-                        color = pred_colors[i % len(pred_colors)]
-                        
-                        # Extract prediction for this timestep
-                        if t < pred_mu_all.shape[0]:
-                            single_pred = pred_mu_all[t, :]  # (480,)
-                            single_std = pred_std_all[t, :]  # (480,)
-                            single_time = time_axis[start_raw:end_raw]
-                            
-                            # Plot uncertainty band
-                            ax3.fill_between(single_time, single_pred - single_std, single_pred + single_std,
-                                            alpha=0.2, color=color, edgecolor='none', zorder=2)
-                            
-                            # Plot prediction line
-                            ax3.plot(single_time, single_pred, color=color, linewidth=1.2,
-                                    label=f'Window {i+1} (t={t})' if i < 5 else "", alpha=0.9, zorder=3)
+                    # Plot the future prediction
+                    future_time = extended_time_axis[future_mask]
+                    future_pred = extended_prediction[future_mask]
+                    future_std = extended_prediction_std[future_mask]
                     
-                    # Mark gaps between prediction windows
-                    for i, window in enumerate(prediction_windows):
-                        if 'gap_start' in window and 'gap_end' in window:
-                            gap_start = window['gap_start']
-                            gap_end = window['gap_end']
-                            
-                            # Only show gap if it's meaningful (more than a few samples)
-                            if gap_end > gap_start and gap_start < len(time_axis) and gap_end <= len(time_axis):
-                                gap_time_start = time_axis[gap_start]
-                                gap_time_end = time_axis[gap_end-1] if gap_end-1 < len(time_axis) else time_axis[-1]
-                                ax3.axvspan(gap_time_start, gap_time_end, alpha=0.3, color='red', 
-                                           label='Gap (no predictions)' if i == 0 else "", zorder=0)
-
-                    ax3.set_title(f'Non-Overlapping 2-Min Prediction Windows (After {warmup_period}-timestep Warmup)', 
-                                 fontweight='medium', pad=15)
+                    # Plot uncertainty band
+                    ax3.fill_between(future_time, future_pred - future_std, future_pred + future_std,
+                                    alpha=0.25, color=colors['uncertainty'], edgecolor='none',
+                                    label='±1σ Uncertainty')
+                    
+                    # Plot prediction line
+                    ax3.plot(future_time, future_pred, color=colors['prediction'], 
+                            linewidth=1.2, label='Future Prediction', alpha=0.9)
+                    
+                    # Add vertical line to separate sequence from prediction
+                    ax3.axvline(x=time_axis[-1], color='red', linestyle='--', alpha=0.7, 
+                               label='Prediction Boundary')
+                    
+                    ax3.set_title('Transition from Sequence to Future Prediction', fontweight='medium', pad=15)
                     ax3.set_ylabel('Normalized Amplitude')
-                    ax3.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9, fontsize=8)
+                    ax3.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
                     ax3.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
                     ax3.set_facecolor('white')
                     
-                    # Add annotation about the implementation
-                    warmup_minutes = warmup_raw_samples / 4.0 / 60.0  # Convert to minutes
-                    total_gaps = sum(1 for w in prediction_windows if w.get('gap_end', 0) > w.get('gap_start', 0))
-                    ax3.text(0.02, 0.98, f'Warmup: {warmup_period} timesteps ({warmup_raw_samples} samples = {warmup_minutes:.1f} min)\nEach window: 480 samples (2 min)\nWindows: {len(prediction_windows)} total, Gaps: {total_gaps}', 
+                    # Add annotation about the prediction
+                    future_minutes = prediction_horizon / 4.0 / 60.0  # Convert to minutes
+                    ax3.text(0.02, 0.98, f'Future window: {prediction_horizon} samples ({future_minutes:.1f} min)\nPrediction type: Single future window', 
                             transform=ax3.transAxes, fontsize=8, verticalalignment='top',
                             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
                 else:
-                    ax3.text(0.5, 0.5, 'No valid prediction windows available',
+                    ax3.text(0.5, 0.5, 'No future prediction available',
                              horizontalalignment='center', verticalalignment='center',
                              transform=ax3.transAxes, fontsize=11, color='#666666')
-                    ax3.set_title('Single Predictions (No Valid Data)', fontweight='medium', pad=15)
+                    ax3.set_title('Future Prediction Detail (No Valid Data)', fontweight='medium', pad=15)
                     ax3.set_facecolor('white')
 
-                # Plot 4: Comparison overlay with refined styling
-                if np.any(valid_mask):
-                    # Use valid predictions for comparison
-                    comparison_len = min(len(time_axis), len(avg_pred_mu))
-                    time_comp = time_axis[:comparison_len]
-                    gt_comp = ground_truth_fhr[:comparison_len]
-                    pred_comp = avg_pred_mu[:comparison_len]
+                # Plot 4: Full sequence overview
+                # Show the complete sequence plus the future prediction
+                ax4.plot(time_axis, ground_truth_fhr, color=colors['ground_truth'],
+                        linewidth=1.4, alpha=0.85, label='Ground Truth (Full Sequence)')
+                
+                if np.any(future_mask):
+                    # Show the future prediction
+                    future_time = extended_time_axis[future_mask]
+                    future_pred = extended_prediction[future_mask]
                     
-                    # Only plot where we have valid predictions
-                    valid_comp_mask = valid_mask[:comparison_len]
+                    ax4.plot(future_time, future_pred, color=colors['prediction'], 
+                            linewidth=1.2, alpha=0.9, label='Future Prediction')
                     
-                    if np.any(valid_comp_mask):
-                        # Ground truth with slightly thicker line
-                        ax4.plot(time_comp, gt_comp, color=colors['ground_truth'],
-                                linewidth=1.4, alpha=0.85, label='Ground Truth')
-
-                        # Average prediction with thinner solid line for better comparison
-                        ax4.plot(time_comp[valid_comp_mask], pred_comp[valid_comp_mask],
-                                color=colors['prediction'], linewidth=0.9, alpha=0.9, 
-                                label='Average Predicted', linestyle='-')
-
-                        ax4.set_title('Ground Truth vs Average Predicted Raw FHR Signal', fontweight='medium', pad=15)
-                        ax4.set_ylabel('Normalized Amplitude')
-                        ax4.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
-                        ax4.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
-                        ax4.set_facecolor('white')
-
-                        # Calculate metrics on valid data only
-                        gt_valid = gt_comp[valid_comp_mask]
-                        pred_valid = pred_comp[valid_comp_mask]
-                        
-                        if len(gt_valid) > 0:
-                            mse = np.mean((gt_valid - pred_valid) ** 2)
-                            mae = np.mean(np.abs(gt_valid - pred_valid))
-                            correlation = np.corrcoef(gt_valid, pred_valid)[0, 1] if len(gt_valid) > 1 else 0
-                        else:
-                            mse, mae, correlation = np.nan, np.nan, np.nan
-                    else:
-                        ax4.text(0.5, 0.5, 'No valid predictions for comparison',
-                                horizontalalignment='center', verticalalignment='center',
-                                transform=ax4.transAxes, fontsize=11, color='#666666')
-                        ax4.set_title('Ground Truth vs Predicted (No Valid Data)', fontweight='medium', pad=15)
-                        ax4.set_facecolor('white')
-                        mse, mae, correlation = np.nan, np.nan, np.nan
+                    # Add vertical line to separate sequence from prediction
+                    ax4.axvline(x=time_axis[-1], color='red', linestyle='--', alpha=0.5, 
+                               label='Prediction Start')
+                    
+                    # Calculate metrics on the future prediction only
+                    # For evaluation, we would need ground truth for the future window
+                    # For now, we'll show the prediction characteristics
+                    pred_mean = np.mean(future_pred)
+                    pred_std = np.std(future_pred)
+                    pred_range = np.max(future_pred) - np.min(future_pred)
+                    
+                    mse, mae, correlation = np.nan, np.nan, np.nan  # Can't compute without future ground truth
+                    
+                    ax4.set_title('Full Sequence with Future Prediction', fontweight='medium', pad=15)
+                    ax4.set_ylabel('Normalized Amplitude')
+                    ax4.legend(frameon=True, fancybox=True, shadow=False, framealpha=0.9)
+                    ax4.grid(True, alpha=0.4, linestyle='-', linewidth=0.5)
+                    ax4.set_facecolor('white')
+                    
+                    # Add prediction statistics
+                    ax4.text(0.02, 0.98, f'Prediction Stats:\nMean: {pred_mean:.3f}\nStd: {pred_std:.3f}\nRange: {pred_range:.3f}', 
+                            transform=ax4.transAxes, fontsize=8, verticalalignment='top',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
                 else:
-                    ax4.text(0.5, 0.5, 'No valid predictions for comparison',
+                    ax4.text(0.5, 0.5, 'No future prediction available',
                              horizontalalignment='center', verticalalignment='center',
                              transform=ax4.transAxes, fontsize=11, color='#666666')
-                    ax4.set_title('Ground Truth vs Predicted (No Valid Data)', fontweight='medium', pad=15)
+                    ax4.set_title('Full Sequence (No Prediction)', fontweight='medium', pad=15)
                     ax4.set_facecolor('white')
                     mse, mae, correlation = np.nan, np.nan, np.nan
 
@@ -436,9 +392,9 @@ class PlottingCallBack(Callback):
 
                 # Batch info already retrieved above
 
-                # Overall title with metrics and warmup info
+                # Overall title with model info
                 plt.suptitle(f"Raw Signal Prediction - GUID: {guid}, Epoch: {epoch_info}\n"
-                             f"Warmup Period: {warmup_period} timesteps, MSE: {mse:.6f}, MAE: {mae:.6f}, Correlation: {correlation:.4f}",
+                             f"Future Window: {prediction_horizon} samples ({prediction_horizon/4.0/60.0:.1f} min), MSE: {mse:.6f}, MAE: {mae:.6f}, Correlation: {correlation:.4f}",
                              fontsize=13, y=0.98)
 
                 plot_path = f"{self.output_dir}/raw_signal_prediction_e-{pl_trainer.current_epoch}.png"
@@ -452,8 +408,8 @@ class PlottingCallBack(Callback):
                 if z_latent is not None:
                     del z_latent
                 del ground_truth_fhr, ground_truth_up
-                del pred_mu_all, pred_logvar_all, pred_std_all
-                del avg_pred_mu, avg_pred_var, avg_pred_std, prediction_counts
+                del pred_mu_future, pred_logvar_future, pred_std_future
+                del extended_ground_truth, extended_prediction, extended_prediction_std
                 # Final GPU cache cleanup
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
