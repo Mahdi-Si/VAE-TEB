@@ -179,26 +179,114 @@ class PlottingCallBack(Callback):
                     'ytick.labelsize': 9
                 })
 
-                fig = plt.figure(figsize=(16, 15), facecolor=colors['background'])
+                # Create a 3x2 grid for a more comprehensive dashboard
+                fig, axes = plt.subplots(3, 2, figsize=(22, 18), facecolor=colors['background'])
+                ax = axes.flatten()
 
-                # Create a grid layout with 5 rows for the new subplot
-                gs = fig.add_gridspec(5, 30, hspace=0.4, wspace=0.05)
+                # --- Plot 1: Main Prediction View (Ground Truth vs. Prediction) ---
+                ax[0].plot(ground_truth_fhr, color='gray', linewidth=1, alpha=0.8, label='Full Ground Truth')
+                # Show history leading up to the prediction
+                context_window = 150
+                context_start = max(0, raw_start - context_window)
+                ax[0].plot(range(context_start, raw_start), ground_truth_fhr[context_start:raw_start], color='black', linestyle='--', label='History Window')
+                
+                # Plot the ground truth for the predicted window for direct comparison
+                if raw_end <= len(ground_truth_fhr):
+                    ax[0].plot(range(raw_start, raw_end), ground_truth_fhr[raw_start:raw_end], color=colors['ground_truth'], linewidth=1.5, label='Actual Future')
+                
+                # Plot the prediction with uncertainty
+                prediction_indices = range(raw_start, raw_end)
+                ax[0].plot(prediction_indices, pred_mu_selected, color=colors['prediction'], linewidth=1.5, label='Predicted Future (μ)')
+                ax[0].fill_between(prediction_indices, 
+                                 pred_mu_selected - pred_std_selected, 
+                                 pred_mu_selected + pred_std_selected,
+                                 color=colors['uncertainty'], alpha=0.6, label='Uncertainty (±1σ)')
+                ax[0].axvline(x=raw_start, color='red', linestyle=':', linewidth=1.5, label='Prediction Start')
+                ax[0].set_title(f'Main Prediction View (from Timestep {selected_timestep})')
+                ax[0].set_ylabel('FHR (Normalized)')
+                ax[0].legend(fontsize=8)
+                ax[0].grid(True)
 
-                # Main plots take up most of the width (columns 0-27), colorbar is thinner (28-29)
-                ax1 = fig.add_subplot(gs[0, :27])  # Ground truth
-                ax2 = fig.add_subplot(gs[1, :27])  # Average predictions with uncertainty
-                ax3 = fig.add_subplot(gs[2, :27])  # Single predictions (non-overlapping)
-                ax4 = fig.add_subplot(gs[3, :27])  # Comparison overlay
-                ax5 = fig.add_subplot(gs[4, :27])  # Latent representation
+                # --- Plot 2: Prediction Error Analysis ---
+                if raw_end <= len(ground_truth_fhr):
+                    target_window = ground_truth_fhr[raw_start:raw_end]
+                    error = target_window - pred_mu_selected
+                    mse = np.mean(error**2)
+                    
+                    ax[1].plot(prediction_indices, error, color='purple', label='Prediction Error (Actual - Predicted)')
+                    ax[1].axhline(0, color='black', linestyle='--', linewidth=1)
+                    ax[1].set_title(f'Prediction Error (MSE: {mse:.4f})')
+                    ax[1].set_ylabel('Error')
+                    ax[1].legend(fontsize=8)
+                    ax[1].grid(True)
+                else:
+                    ax[1].text(0.5, 0.5, 'Ground truth not available for error plot', ha='center', va='center')
+                    ax[1].set_title('Prediction Error')
 
-                # Thinner colorbar axis
-                cbar_ax = fig.add_subplot(gs[4, 28:])
+                # --- Plot 3: Latent Space (z) Heatmap ---
+                if z_latent is not None:
+                    im = ax[2].imshow(z_latent.T, aspect='auto', cmap='viridis', interpolation='nearest', origin='lower')
+                    ax[2].set_title('Latent Representation (z)')
+                    ax[2].set_xlabel('Time Steps')
+                    ax[2].set_ylabel('Latent Dimensions')
+                    fig.colorbar(im, ax=ax[2])
+                else:
+                    ax[2].text(0.5, 0.5, 'Latent z not available', ha='center', va='center')
+                    ax[2].set_title('Latent Representation (z)')
 
-                # Use the fixed plotting callback implementation
-                from fixed_plotting_callback import FixedPlottingCallBack
-                fixed_plotter = FixedPlottingCallBack(self.output_dir, 1, self.input_channel_num)
-                fixed_plotter.on_validation_epoch_end(pl_trainer, pl_module)
-                return
+                # --- Plot 4: Latent Variable Distributions (Posterior) ---
+                if 'mu_post' in model_outputs and 'logvar_post' in model_outputs:
+                    mu_post_sample = model_outputs['mu_post'][0].detach().cpu().numpy().flatten()
+                    logvar_post_sample = model_outputs['logvar_post'][0].detach().cpu().numpy().flatten()
+                    
+                    ax[3].hist(mu_post_sample, bins=50, alpha=0.7, label='Posterior μ', color='skyblue', density=True)
+                    ax[3].set_xlabel('Value')
+                    ax[3].set_ylabel('Density')
+                    ax[3].legend(loc='upper left', fontsize=8)
+                    
+                    ax3_twin = ax[3].twinx()
+                    ax3_twin.hist(logvar_post_sample, bins=50, alpha=0.7, label='Posterior log(σ²)', color='salmon', density=True)
+                    ax3_twin.set_ylabel('Density')
+                    ax3_twin.legend(loc='upper right', fontsize=8)
+                    ax[3].set_title('Posterior Latent Distributions')
+                    ax[3].grid(True)
+
+                # --- Plot 5: Prior vs. Posterior (Mu) ---
+                if 'mu_prior' in model_outputs and 'mu_post' in model_outputs:
+                    mu_prior_sample = model_outputs['mu_prior'][0].detach().cpu().numpy()
+                    mu_post_sample = model_outputs['mu_post'][0].detach().cpu().numpy()
+                    dims_to_plot = min(3, mu_prior_sample.shape[1])
+                    for i in range(dims_to_plot):
+                        ax[4].plot(mu_prior_sample[:, i], '--', color=f'C{i}', label=f'Prior μ (dim {i})')
+                        ax[4].plot(mu_post_sample[:, i], '-', color=f'C{i}', label=f'Posterior μ (dim {i})')
+                    ax[4].set_title('Prior vs. Posterior (μ)')
+                    ax[4].set_xlabel('Time Steps')
+                    ax[4].set_ylabel('Value')
+                    ax[4].legend(fontsize=8)
+                    ax[4].grid(True)
+
+                # --- Plot 6: Prior vs. Posterior (Logvar) ---
+                if 'logvar_prior' in model_outputs and 'logvar_post' in model_outputs:
+                    logvar_prior_sample = model_outputs['logvar_prior'][0].detach().cpu().numpy()
+                    logvar_post_sample = model_outputs['logvar_post'][0].detach().cpu().numpy()
+                    dims_to_plot = min(3, logvar_prior_sample.shape[1])
+                    for i in range(dims_to_plot):
+                        ax[5].plot(logvar_prior_sample[:, i], '--', color=f'C{i}', label=f'Prior log(σ²) (dim {i})')
+                        ax[5].plot(logvar_post_sample[:, i], '-', color=f'C{i}', label=f'Posterior log(σ²) (dim {i})')
+                    ax[5].set_title('Prior vs. Posterior (log σ²)')
+                    ax[5].set_xlabel('Time Steps')
+                    ax[5].set_ylabel('Value')
+                    ax[5].legend(fontsize=8)
+                    ax[5].grid(True)
+                
+                # Finalize and save the plot
+                fig.suptitle(f"SeqVaeTeb Performance Dashboard - Epoch {pl_trainer.current_epoch} - GUID: {guid}", fontsize=16)
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle and legend
+                
+                save_path = os.path.join(self.output_dir, f"epoch_{pl_trainer.current_epoch}_dashboard.png")
+                plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+                plt.close(fig)
+                logger.info(f"Saved performance dashboard to {save_path}")
 
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
