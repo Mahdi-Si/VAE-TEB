@@ -87,49 +87,54 @@ class PlottingCallBack(Callback):
                     logger.error("Model output missing 'raw_predictions' key")
                     return
 
-                raw_predictions = model_outputs['raw_predictions']
-                if 'raw_signal_mu' not in raw_predictions or 'raw_signal_logvar' not in raw_predictions:
-                    logger.error(f"Raw predictions missing required keys. Available keys: {list(raw_predictions.keys())}")
-                    return
-
                 # Get model parameters for plotting
                 warmup_period = getattr(pl_module.model, 'warmup_period', 30)
                 decimation_factor = getattr(pl_module.model, 'decimation_factor', 16)
+                
+                # --- START: Data Extraction and GPU Memory Management ---
+                # Extract all necessary data from GPU tensors to CPU numpy arrays
+                # BEFORE deleting the GPU tensors to avoid UnboundLocalError.
+                raw_predictions = model_outputs['raw_predictions']
                 B, S, prediction_horizon = raw_predictions['raw_signal_mu'].shape
-                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}")
-                logger.info(f"Prediction shape: (B={B}, S={S}, prediction_horizon={prediction_horizon})")
-
-                # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
-                # Extract predictions for the first sample in the batch and move to CPU
-                # raw_predictions now contain (B, S, prediction_horizon) - predictions from each timestep
-                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, prediction_horizon)
-                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, prediction_horizon)
+                
+                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()
+                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()
                 pred_std = np.exp(0.5 * pred_logvar)
 
-                # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
+                z_latent = model_outputs.get('z', [None])[0]
+                if z_latent is not None:
+                    z_latent = z_latent.permute(1, 0).detach().cpu().numpy()
+
+                mu_post = model_outputs.get('mu_post', [None])[0]
+                if mu_post is not None:
+                    mu_post = mu_post.detach().cpu().numpy()
+
+                logvar_post = model_outputs.get('logvar_post', [None])[0]
+                if logvar_post is not None:
+                    logvar_post = logvar_post.detach().cpu().numpy()
+
+                mu_prior = model_outputs.get('mu_prior', [None])[0]
+                if mu_prior is not None:
+                    mu_prior = mu_prior.detach().cpu().numpy()
+
+                logvar_prior = model_outputs.get('logvar_prior', [None])[0]
+                if logvar_prior is not None:
+                    logvar_prior = logvar_prior.detach().cpu().numpy()
+                
                 ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
                 ground_truth_up = up_raw_normalized[0].squeeze().detach().cpu().numpy()
-                
-                # Get latent representation and move to CPU immediately
-                z_latent = None
-                if 'z' in model_outputs:
-                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
-                
-                # Get batch info and move to CPU
+
                 try:
                     guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
-                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
                 except:
                     guid = 'unknown'
-                    epoch_info = 'unknown'
-                
-                # Free GPU memory early by deleting GPU tensors
-                del model_outputs, raw_predictions
+
+                # Now that all data is on CPU, delete the large GPU tensors.
+                del model_outputs, raw_predictions, batch
                 del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized
-                # Force GPU memory cleanup before heavy CPU plotting
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
-                logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
+                logger.info(f"Data moved to CPU and GPU memory cleared. Device was: {device_info}")
+                # --- END: Data Extraction ---
 
                 # Select a representative timepoint for simple visualization
                 # Use a middle timepoint after warmup for plotting
@@ -235,30 +240,25 @@ class PlottingCallBack(Callback):
                     ax[2].set_title('Latent Representation (z)')
 
                 # --- Plot 4: Latent Variable Distributions (Posterior) ---
-                if 'mu_post' in model_outputs and 'logvar_post' in model_outputs:
-                    mu_post_sample = model_outputs['mu_post'][0].detach().cpu().numpy().flatten()
-                    logvar_post_sample = model_outputs['logvar_post'][0].detach().cpu().numpy().flatten()
-                    
-                    ax[3].hist(mu_post_sample, bins=50, alpha=0.7, label='Posterior μ', color='skyblue', density=True)
+                if mu_post is not None and logvar_post is not None:
+                    ax[3].hist(mu_post.flatten(), bins=50, alpha=0.7, label='Posterior μ', color='skyblue', density=True)
                     ax[3].set_xlabel('Value')
                     ax[3].set_ylabel('Density')
                     ax[3].legend(loc='upper left', fontsize=8)
                     
                     ax3_twin = ax[3].twinx()
-                    ax3_twin.hist(logvar_post_sample, bins=50, alpha=0.7, label='Posterior log(σ²)', color='salmon', density=True)
+                    ax3_twin.hist(logvar_post.flatten(), bins=50, alpha=0.7, label='Posterior log(σ²)', color='salmon', density=True)
                     ax3_twin.set_ylabel('Density')
                     ax3_twin.legend(loc='upper right', fontsize=8)
                     ax[3].set_title('Posterior Latent Distributions')
                     ax[3].grid(True)
 
                 # --- Plot 5: Prior vs. Posterior (Mu) ---
-                if 'mu_prior' in model_outputs and 'mu_post' in model_outputs:
-                    mu_prior_sample = model_outputs['mu_prior'][0].detach().cpu().numpy()
-                    mu_post_sample = model_outputs['mu_post'][0].detach().cpu().numpy()
-                    dims_to_plot = min(3, mu_prior_sample.shape[1])
+                if mu_prior is not None and mu_post is not None:
+                    dims_to_plot = min(3, mu_prior.shape[1])
                     for i in range(dims_to_plot):
-                        ax[4].plot(mu_prior_sample[:, i], '--', color=f'C{i}', label=f'Prior μ (dim {i})')
-                        ax[4].plot(mu_post_sample[:, i], '-', color=f'C{i}', label=f'Posterior μ (dim {i})')
+                        ax[4].plot(mu_prior[:, i], '--', color=f'C{i}', label=f'Prior μ (dim {i})')
+                        ax[4].plot(mu_post[:, i], '-', color=f'C{i}', label=f'Posterior μ (dim {i})')
                     ax[4].set_title('Prior vs. Posterior (μ)')
                     ax[4].set_xlabel('Time Steps')
                     ax[4].set_ylabel('Value')
@@ -266,13 +266,11 @@ class PlottingCallBack(Callback):
                     ax[4].grid(True)
 
                 # --- Plot 6: Prior vs. Posterior (Logvar) ---
-                if 'logvar_prior' in model_outputs and 'logvar_post' in model_outputs:
-                    logvar_prior_sample = model_outputs['logvar_prior'][0].detach().cpu().numpy()
-                    logvar_post_sample = model_outputs['logvar_post'][0].detach().cpu().numpy()
-                    dims_to_plot = min(3, logvar_prior_sample.shape[1])
+                if logvar_prior is not None and logvar_post is not None:
+                    dims_to_plot = min(3, logvar_prior.shape[1])
                     for i in range(dims_to_plot):
-                        ax[5].plot(logvar_prior_sample[:, i], '--', color=f'C{i}', label=f'Prior log(σ²) (dim {i})')
-                        ax[5].plot(logvar_post_sample[:, i], '-', color=f'C{i}', label=f'Posterior log(σ²) (dim {i})')
+                        ax[5].plot(logvar_prior[:, i], '--', color=f'C{i}', label=f'Prior log(σ²) (dim {i})')
+                        ax[5].plot(logvar_post[:, i], '-', color=f'C{i}', label=f'Posterior log(σ²) (dim {i})')
                     ax[5].set_title('Prior vs. Posterior (log σ²)')
                     ax[5].set_xlabel('Time Steps')
                     ax[5].set_ylabel('Value')
