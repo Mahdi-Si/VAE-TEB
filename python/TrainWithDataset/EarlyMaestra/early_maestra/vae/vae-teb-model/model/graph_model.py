@@ -241,8 +241,8 @@ class SeqVAEGraphModel:
             self.train_results_dir,
             self.test_results_dir,
             self.model_checkpoint_dir,
-            self.aux_dir,
-            self.tensorboard_dir
+            # self.aux_dir,
+            # self.tensorboard_dir
         ]
         for folder in folders_list:
             os.makedirs(folder, exist_ok=True)
@@ -295,7 +295,6 @@ class SeqVAEGraphModel:
                 input_channels=76,  # Replace with config values if available
                 sequence_length=300,
                 decimation_factor=16,
-                kld_beta=self.kld_beta_
             )
 
             try:
@@ -324,7 +323,6 @@ class SeqVAEGraphModel:
                 sequence_length=300,
                 decimation_factor=16,
                 warmup_period=30,
-                kld_beta=1.0
             )
             self.lightning_base_model = LightSeqVaeTeb(
                 seqvae_teb_model=self.base_model,
@@ -465,7 +463,7 @@ class SeqVAEGraphModel:
             num_sanity_val_steps=0,
             callbacks=callbacks_list,
             precision="16-mixed",
-            accumulate_grad_batches=max(self.accumulate_grad_batches, 4),  # Force higher accumulation
+            accumulate_grad_batches=max(self.accumulate_grad_batches, 1),  # Force higher accumulation
             # Enhanced memory optimization settings
             limit_train_batches=1.0,
             limit_val_batches=1.0,

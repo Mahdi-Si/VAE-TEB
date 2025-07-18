@@ -624,3 +624,34 @@ print(f"LSTM output shape: {intermediates['lstm_output'].shape}")
 - **Interface Compliance**: Standardized loss dictionary format
 
 This architecture provides a production-ready foundation for raw signal reconstruction with the TEB framework, enabling high-quality temporal signal generation with comprehensive uncertainty quantification and memory-efficient training.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+In   in PlottingCallBack, we have a callback to plot results during training in pytorch lightning. Here the y_raw_normalized and up_raw_normalized are tensor with shape (Batch, 4800) which 4800 is length of raw signals. mu_pr_means and log_var_means are with shape (Batch, 4800) as well which are reconstructions and logvar of uncertainty on them for y_raw_normalized. mu_pr and logvar_pr are shape (Batch, 300, 4800) which are 300 different reconstructions of the y_raw_normalized. latent_z is shape (Batch, 300, 32) which is the latent representation with 300 time steps and 32 channels. We want to plot the following with the same style as plot_forward_pass in @  with same style of stack of plots. Here is the list of subplots we want, consider one sample from the batch and plot:
+  1- y_raw_normalized and up_raw_normalized
+  2- y_raw_normalized and mu_pr_means, consider the uncertainty and show it with fill between based on it for showing the uncertainty of reconstruction based on log_var_means
+  3- from mu_pr and logvar_pr have nan values, consider (selected_batch, [30, 60, 90, 120, 150, 180, 210, 240, 270], :) and add them together to have one (selected_batch, 1, 4800) and plot y_raw_normalized and the added tensor , note that there are nans so we adding them be careful
+  4- latent_z with imshow
+
+plot and save as pdf and close the plot to save memeory
