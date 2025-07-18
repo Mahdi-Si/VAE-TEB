@@ -111,11 +111,6 @@ class CausalConv1d(nn.Module):
             groups=groups,
         )
 
-        # Remove pre-allocated padding to save memory - compute on demand
-        # self.register_buffer(
-        #     "padding_zeros", torch.zeros(1, in_channels, self.left_padding)
-        # )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -123,122 +118,97 @@ class CausalConv1d(nn.Module):
         Returns:
             Causal convolution output
         """
-        batch_size = x.size(0)
-
-        # Memory-efficient left padding using F.pad
         if self.left_padding > 0:
             x = F.pad(x, (self.left_padding, 0))
 
         return self.conv(x)
 
 
-class CausalResidualBlock(nn.Module):
+class CausalMultiChannelConvBlock(nn.Module):
     """
-    Optimized residual block with causal convolutions, reduced transposes, and efficient gating.
-    Now supports dilations for building Temporal Convolutional Networks (TCNs) and channel reduction.
+    Causal version of MultiChannelConvBlock that ensures no future information leaks.
+    Uses causal padding instead of reflection padding and supports upsampling.
     """
-
+    
     def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 3,
+        self, 
+        in_channels: int = 1, 
+        out_channels: int = 1, 
+        groups: int = 1, 
+        filter_size: int = 3, 
+        up_sampling: bool = False, 
+        up_sample_scale: int = 2, 
+        activation: nn.Module = nn.ReLU,
+        use_batch_norm: bool = True,
         dilation: int = 1,
-        dropout: float = 0.1,
-        expansion_factor: float = 1.0,
-        contraction_factor: float = 1.0,
-        use_depthwise: bool = False,
+        stride: int = 1,
+        bias: bool = False
     ):
-        super(CausalResidualBlock, self).__init__()
-
-        self.channels = channels
-        self.expansion_channels = int(channels * expansion_factor)
-        self.contraction_channels = int(channels * contraction_factor)
-        self.use_depthwise = use_depthwise
-        self.use_contraction = contraction_factor < 1.0
-
-        # Pre-norm design for better gradient flow
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(self.expansion_channels)
-        output_channels = self.contraction_channels if self.use_contraction else channels
-        self.norm3 = nn.LayerNorm(output_channels)
-
-        # Efficient depthwise + pointwise convolution option
-        final_output_channels = self.contraction_channels if self.use_contraction else channels
+        super(CausalMultiChannelConvBlock, self).__init__()
         
-        if use_depthwise:
-            self.conv1 = CausalConv1d(
-                channels, channels, kernel_size, groups=channels, dilation=dilation
-            )
-            self.pointwise1 = nn.Conv1d(channels, self.expansion_channels, 1)
-            self.conv2 = CausalConv1d(
-                self.expansion_channels,
-                self.expansion_channels,
-                kernel_size,
-                groups=self.expansion_channels,
-                dilation=dilation,
-            )
-            self.pointwise2 = nn.Conv1d(self.expansion_channels, final_output_channels, 1)
-        else:
-            self.conv1 = CausalConv1d(
-                channels, self.expansion_channels, kernel_size, dilation=dilation
-            )
-            self.conv2 = CausalConv1d(
-                self.expansion_channels, final_output_channels, kernel_size, dilation=dilation
-            )
-
-        # GLU (Gated Linear Unit) for efficient gating
-        self.gate_linear = nn.Linear(final_output_channels, final_output_channels)
-
-        self.dropout = nn.Dropout(dropout)
-
-        # Skip connection projection if needed
-        self.skip_proj = (
-            nn.Linear(channels, final_output_channels) 
-            if final_output_channels != channels else nn.Identity()
+        self.up_sampling = up_sampling
+        self.up_sample_scale = up_sample_scale
+        self.filter_size = filter_size
+        self.activation = activation
+        self.use_batch_norm = use_batch_norm
+        self.dilation = dilation
+        self.stride = stride
+        
+        # Calculate causal padding (left padding only)
+        self.left_padding = (filter_size - 1) * dilation
+        
+        # Main convolution layer
+        self.conv = nn.Conv1d(
+            in_channels, 
+            out_channels, 
+            kernel_size=filter_size,
+            groups=groups,
+            bias=bias,
+            padding=0,  # We handle padding manually
+            dilation=dilation,
+            stride=stride
         )
-
+        
+        # Optional batch normalization
+        if use_batch_norm:
+            self.bn_layer = nn.BatchNorm1d(out_channels, momentum=0.9)
+        else:
+            self.bn_layer = None
+            
+        # Activation function
+        self.act_fn = activation()
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input tensor (batch_size, seq_len, channels)
+            x: Input tensor (batch_size, channels, length)
         Returns:
-            Output with residual connection
+            Causal convolution output with optional upsampling
         """
-        residual = x
-
-        # Pre-norm + first convolution block
-        x = self.norm1(x)
-        x_transposed = x.transpose(1, 2)  # Single transpose
-
-        if self.use_depthwise:
-            x_conv = self.conv1(x_transposed)
-            x_conv = self.pointwise1(x_conv)
-        else:
-            x_conv = self.conv1(x_transposed)
-
-        x_conv = x_conv.transpose(1, 2)  # Back to (batch, seq_len, channels)
-        x_conv = self.norm2(x_conv)
-        x_conv = F.gelu(x_conv)  # GELU doesn't support inplace
-        x_conv = self.dropout(x_conv)
-
-        # Second convolution block
-        x_conv_transposed = x_conv.transpose(1, 2)
-
-        if self.use_depthwise:
-            x_conv2 = self.conv2(x_conv_transposed)
-            x_conv2 = self.pointwise2(x_conv2)
-        else:
-            x_conv2 = self.conv2(x_conv_transposed)
-
-        x_conv2 = x_conv2.transpose(1, 2)
-        x_conv2 = self.norm3(x_conv2)
-
-        # Efficient gating using GLU-style activation
-        gate = torch.sigmoid(self.gate_linear(x_conv2))
-        x_conv2 = x_conv2 * gate  # Remove in-place operation
-
-        # Residual connection with optional projection
-        return self.skip_proj(residual) + x_conv2  # Remove in-place operation
+        # Apply upsampling first if requested
+        if self.up_sampling:
+            x = F.interpolate(
+                x, 
+                scale_factor=self.up_sample_scale, 
+                mode='linear', 
+                align_corners=False
+            )
+        
+        # Apply causal padding (left padding only)
+        if self.left_padding > 0:
+            x = F.pad(x, (self.left_padding, 0))
+        
+        # Apply convolution
+        output = self.conv(x)
+        
+        # Apply batch normalization if enabled
+        if self.bn_layer is not None:
+            output = self.bn_layer(output)
+        
+        # Apply activation function
+        output = self.act_fn(output)
+        
+        return output
 
 
 class ChannelReductionBlock(nn.Module):
@@ -266,7 +236,7 @@ class ChannelReductionBlock(nn.Module):
             self.channel_attention = nn.Sequential(
                 nn.AdaptiveAvgPool1d(1),
                 nn.Conv1d(in_channels, in_channels // 4, 1),
-                nn.GELU(),
+                nn.ReLU(),
                 nn.Conv1d(in_channels // 4, in_channels, 1),
                 nn.Sigmoid()
             )
@@ -319,65 +289,53 @@ class ChannelReductionBlock(nn.Module):
         return x_out
 
 
-class FeedForward(nn.Module):
-    """A simple feed-forward network with pre-LayerNorm and residual connection."""
-
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        hidden_dim_factor: int = 1,
-        dropout: float = 0.1,
-        activation=nn.GELU,
-    ):
-        super().__init__()
-        hidden_dim = out_dim * hidden_dim_factor
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            activation(),
-            nn.Dropout(dropout),
-            # nn.Linear(hidden_dim, out_dim),
-        )
-        self.norm = nn.LayerNorm(in_dim)
-        # self.skip_connection = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with pre-norm and residual connection."""
-        # residual = self.skip_connection(x)
-        x_norm = self.norm(x)
-        return self.net(x_norm)
-
-
 class ResidualMLP(nn.Module):
     def __init__(
-        self, input_dim, hidden_dims=(72, 68, 64), dropout=0.1, final_activation=True
+        self, input_dim, hidden_dims=(72, 68, 64), final_activation=True, activation=nn.ReLU, use_skip_connection=True
     ):
         super().__init__()
         # initial layer-norm on raw input
         self.input_norm = nn.LayerNorm(input_dim)
         self.final_activation = final_activation
-        # build the sequence of (Linear → LayerNorm → GELU → Dropout)
+        self.activation = activation
+        self.use_skip_connection = use_skip_connection
+        # build the sequence of (Linear → LayerNorm → activation → Dropout)
         layers = []
         dims = [input_dim, *hidden_dims]
         for i in range(len(hidden_dims)):
-            layers += [
-                nn.Linear(dims[i], dims[i + 1]),
-                nn.LayerNorm(dims[i + 1]),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ]
+            # For final layer, skip activation and layernorm if final_activation=False
+            is_final_layer = (i == len(hidden_dims) - 1)
+            if is_final_layer and not final_activation:
+                layers += [
+                    nn.Linear(dims[i], dims[i + 1]),
+                ]
+            elif is_final_layer and final_activation:
+                layers += [
+                    nn.Linear(dims[i], dims[i + 1]),
+                    nn.LayerNorm(dims[i + 1]),
+                ]
+            else:
+                layers += [
+                    nn.Linear(dims[i], dims[i + 1]),
+                    nn.LayerNorm(dims[i + 1]),
+                    self.activation(),
+                ]
         self.body = nn.Sequential(*layers)
 
-        # if input_dim ≠ final hidden_dims[-1], project it
+        # if input_dim ≠ final hidden_dims[-1], project it (only if using skip connection)
         final_dim = hidden_dims[-1]
-        if input_dim != final_dim:
-            self.skip_proj = nn.Linear(input_dim, final_dim)
+        if self.use_skip_connection:
+            if input_dim != final_dim:
+                self.skip_proj = nn.Linear(input_dim, final_dim)
+            else:
+                self.skip_proj = nn.Identity()
         else:
-            self.skip_proj = nn.Identity()
+            self.skip_proj = None
 
-        # optional post-sum norm / activation
-        self.post_norm = nn.LayerNorm(final_dim)
-        self.post_act = nn.GELU()
+        # only norm, no activation after skip connection
+        # self.post_norm = nn.LayerNorm(final_dim)
+        # final activation applied before skip connection if needed
+        self.final_act = self.activation() if final_activation else None
 
     def forward(self, x):
         # 1) normalize raw input
@@ -386,121 +344,91 @@ class ResidualMLP(nn.Module):
         # 2) run through MLP body
         y = self.body(x0)
 
-        # 3) project + add skip
-        skip = self.skip_proj(x0)
-        z = y + skip
-
+        # 3) apply final activation before skip connection if needed
         if self.final_activation:
-            return self.post_act(self.post_norm(z))
+            y = self.final_act(y)
+
+        # 4) conditionally add skip connection
+        if self.use_skip_connection:
+            skip = self.skip_proj(x0)
+            z = y + skip
         else:
-            return self.post_norm(z)
+            z = y
+
+        # 5) only apply normalization, no activation after skip connection
+        return z
 
 
 class TargetEncoder(nn.Module):
-    """
-    Advanced VAE encoder with dual-path processing for scattering transform and phase harmonic inputs.
-
-    Architecture:
-    1. Dual-path processing: Linear projection + Causal convolution paths
-    2. Multi-layer linear transformations with residual connections
-    3. Bidirectional LSTM for temporal encoding
-    4. Variational outputs (mu and logvar) with proper initialization
-
-    Incorporates modern techniques:
-    - Layer normalization for training stability
-    - Skip connections for gradient flow
-    - Dropout for regularization
-    - GELU activation for improved performance
-    - Gradient clipping-friendly architecture
-    """
 
     def __init__(
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim: int = 16,
+        latent_dim: int = 32,
         lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 3,
-        conv_kernel_size: Union[int, Tuple[int, ...]] = (11, 9, 7, 5, 3),
-        dropout: float = 0.1,
+        lstm_num_layers: int = 32,
         use_bidirectional_lstm: bool = False,
-        activation: str = "gelu",
-        reduced_channels: int = 32,  # Reduced from 76 to capture essential features
+        activation: nn.Module = nn.GELU,
     ):
         super(TargetEncoder, self).__init__()
 
         self.input_channels = input_channels
-        self.reduced_channels = reduced_channels
         self.sequence_length = sequence_length
         self.latent_dim = latent_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.lstm_num_layers = lstm_num_layers
         self.use_bidirectional = use_bidirectional_lstm
 
-        self.activation = getattr(F, activation)
+        self.activation = activation
         
-        # Channel reduction blocks for both modalities
-        self.channel_reducer_scattering = nn.Sequential(
-            ChannelReductionBlock(
-            in_channels=input_channels,
-            out_channels=64,
-            dropout=dropout,
-            use_attention=True),
-            ChannelReductionBlock(
-            in_channels=64,
-            out_channels=reduced_channels,
-            dropout=dropout,
-            use_attention=True)
+        self.mlp_scattering = nn.Sequential(
+            ResidualMLP(
+                input_dim=input_channels,
+                hidden_dims=geometric_schedule(76, 20, 4),
+                final_activation=False,
+                use_skip_connection=True,
+                activation=nn.GELU
+                )
         )
-        self.channel_reducer_phase = nn.Sequential(
-            ChannelReductionBlock(
-            in_channels=input_channels,
-            out_channels=64,
-            dropout=dropout,
-            use_attention=True),
-            ChannelReductionBlock(
-            in_channels=64,
-            out_channels=reduced_channels,
-            dropout=dropout,
-            use_attention=True)
-        )
-
-        # Path 1: Linear projection path for both inputs (after channel reduction)
-        self.linear_path_scattering = ResidualMLP(
-            input_dim=reduced_channels,
-            hidden_dims=(32, 32, 32, 32),
-            dropout=dropout,
+        
+        self.mlp_phase = ResidualMLP(
+            input_dim=input_channels,
+            hidden_dims=geometric_schedule(76, 20, 4),
             final_activation=False,
+            use_skip_connection=True,
+            activation=nn.ReLU
+            )
+
+        self.conv_scattering = nn.Sequential(
+            CausalMultiChannelConvBlock(in_channels=76, out_channels=20, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=29, dilation=1),
         )
-        self.linear_path_phase = ResidualMLP(
-            input_dim=reduced_channels,
-            hidden_dims=(32, 32, 32, 32),
-            dropout=dropout,
-            final_activation=False,
+        
+        self.conv_phase = nn.Sequential(
+            CausalMultiChannelConvBlock(in_channels=76, out_channels=20, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=29, dilation=1),
         )
 
-        # Path 2: Causal convolution path for both inputs (after channel reduction)
-        self.conv_path_scattering = self._build_causal_conv_path(
-            reduced_channels, 32, conv_kernel_size, dropout, use_depthwise=True
-        )
-        self.conv_path_phase = self._build_causal_conv_path(
-            reduced_channels, 32, conv_kernel_size, dropout, use_depthwise=True
-        )
-
-        # Cross-modal fusion (combining scattering and phase harmonic)
         self.cross_modal_fusion = ResidualMLP(
-            input_dim=32 * 2,  # Updated to reflect 32-channel outputs from each path
-            hidden_dims=(64, 60, 55, 50),  # Smaller intermediate dimensions
-            dropout=dropout,
+            input_dim=20 * 2,  # Updated to reflect 32-channel outputs from each path
+            hidden_dims=geometric_schedule(40, 32, 3),  # Smaller intermediate dimensions
             final_activation=False,
+            activation=nn.ReLU,
+            use_skip_connection=True
         )
 
         self.lstm = nn.LSTM(
-            input_size=50,  # Updated to match cross_modal_fusion output
+            input_size=32,  # Updated to match cross_modal_fusion output
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
-            dropout=dropout if lstm_num_layers > 1 else 0,
             bidirectional=use_bidirectional_lstm,
         )
 
@@ -509,63 +437,25 @@ class TargetEncoder(nn.Module):
         # Pre-output processing
         self.pre_output = ResidualMLP(
             input_dim=lstm_output_dim,
-            hidden_dims=geometric_schedule(lstm_output_dim, 66, 3),
-            dropout=dropout,
+            hidden_dims=geometric_schedule(lstm_output_dim, 64, 4),
             final_activation=True,
+            activation=nn.ReLU
         )
 
         # Variational parameters
         self.mu_layer = ResidualMLP(
-            input_dim=66,
-            hidden_dims=geometric_schedule(66, 16, 5),
-            dropout=dropout,
+            input_dim=64,
+            hidden_dims=geometric_schedule(64, 32, 5),
             final_activation=False,
+            activation=nn.ReLU
         )
+        
         self.logvar_layer = ResidualMLP(
-            input_dim=66,
-            hidden_dims=geometric_schedule(66, 32, 5),
-            dropout=dropout,
+            input_dim=64,
+            hidden_dims=(64, 64, 64, 64),
             final_activation=False,
+            activation=nn.ReLU
         )
-
-    def _build_causal_conv_path(
-        self,
-        input_dim: int,
-        output_dim: int,
-        kernel_sizes: Union[int, list[int]],
-        dropout: float,
-        use_depthwise: bool,
-    ) -> nn.Module:
-        """Build causal convolution path with a sequence of residual blocks."""
-        if isinstance(kernel_sizes, int):
-            kernel_sizes = [kernel_sizes]
-
-        layers = []
-        current_dim = input_dim
-        # Create a block for each kernel size provided
-        for i, kernel_size in enumerate(kernel_sizes):
-            expansion_factor = 2.0 if i % 2 == 0 else 1.5  # Alternate expansion
-            layers.append(
-                CausalResidualBlock(
-                    channels=current_dim,
-                    kernel_size=kernel_size,
-                    dropout=dropout,
-                    expansion_factor=expansion_factor,
-                    use_depthwise=use_depthwise,
-                )
-            )
-
-        # Final projection to target dimension
-        layers.append(
-            nn.Sequential(
-                nn.LayerNorm(input_dim),
-                nn.Linear(input_dim, output_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            )
-        )
-
-        return nn.Sequential(*layers)
 
     def forward(
         self,
@@ -589,41 +479,34 @@ class TargetEncoder(nn.Module):
             logvar: Log variance of latent distribution (batch_size, seq_len, 2*latent_dim)
             hidden_states: Dictionary of intermediate states (if return_hidden=True)
         """
-        batch_size, seq_len, channels = scattering_input.shape
         hidden_states = {} if return_hidden else None
 
-        # Apply channel reduction first
-        scattering_reduced = self.channel_reducer_scattering(scattering_input)
-        phase_reduced = self.channel_reducer_phase(phase_harmonic_input)
+        scatter_linear = self.mlp_scattering(scattering_input)
+        phase_linear = self.mlp_phase(phase_harmonic_input)
         
         if return_hidden:
-            hidden_states["scattering_reduced"] = scattering_reduced
-            hidden_states["phase_reduced"] = phase_reduced
+            hidden_states["scattering_reduced"] = scatter_linear
+            hidden_states["phase_reduced"] = phase_linear
 
-        # Process scattering transform with reduced channels
-        scatter_linear = self.linear_path_scattering(scattering_reduced)
-        scatter_conv = self.conv_path_scattering(scattering_reduced)
-        scatter_fused = scatter_linear + scatter_conv  # Remove in-place operation
-        del scatter_conv  # Explicit cleanup
-
-        # Process phase harmonic with reduced channels
-        phase_linear = self.linear_path_phase(phase_reduced)
-        phase_conv = self.conv_path_phase(phase_reduced)
-        phase_fused = phase_linear + phase_conv  # Remove in-place operation
-        del phase_conv  # Explicit cleanup
+        scatter_conv = self.conv_scattering(scattering_input.permute(0, 2, 1))
+        scatter_fused = scatter_linear + scatter_conv.permute(0, 2, 1)
+        del scatter_conv, scatter_linear
+        
+        phase_conv = self.conv_phase(phase_harmonic_input.permute(0, 2, 1))
+        phase_fused = phase_linear + phase_conv.permute(0, 2, 1)
+        del phase_conv, phase_linear
 
         if return_hidden:
             hidden_states["scatter_fused"] = scatter_fused
             hidden_states["phase_fused"] = phase_fused
 
-        # Cross-modal fusion
         combined = torch.cat([scatter_fused, phase_fused], dim=-1)
-        del scatter_fused, phase_fused  # Free memory
+        del scatter_fused, phase_fused
         x = self.cross_modal_fusion(combined)
-        del combined  # Free memory
+        del combined
 
         # LSTM processing
-        x, (hidden, cell) = self.lstm(x)
+        x, (hidden, cell) = self.lstm(x)  # (batch, length, channel)
 
         if return_hidden:
             hidden_states["lstm_out"] = x
@@ -683,114 +566,58 @@ class SourceEncoder(nn.Module):
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim: int = 16,
+        latent_dim: int = 32,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 3,
-        conv_kernel_size: list[int] = [9, 7, 5, 3],
-        dropout: float = 0.1,
-        activation: str = "gelu",
+        activation: nn.Module = nn.GELU,
         reduced_channels: int = 32,  # Reduced from 76 to capture essential features
     ):
         super(SourceEncoder, self).__init__()
 
         self.input_channels = input_channels
-        self.reduced_channels = reduced_channels
         self.sequence_length = sequence_length
         self.latent_dim = latent_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.lstm_num_layers = lstm_num_layers
 
-        self.activation = getattr(F, activation)
-        
         # Channel reduction block
-        self.channel_reducer = ChannelReductionBlock(
-            in_channels=input_channels,
-            out_channels=reduced_channels,
-            dropout=dropout,
-            use_attention=True,
-        )
-
-        self.linear_path = ResidualMLP(
-            input_dim=reduced_channels,
-            hidden_dims=(int(reduced_channels * 0.8), 32, 32),
-            dropout=dropout,
+        self.mlp = ResidualMLP(
+            input_dim=input_channels,
+            hidden_dims=geometric_schedule(76, 32, 4),
             final_activation=False,
+            use_skip_connection=True,
+            activation=nn.ReLU
+            )
+        
+        self.conv = nn.Sequential(
+            CausalMultiChannelConvBlock(in_channels=76, out_channels=32, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=29, dilation=1),
         )
-
-        # Path 2: Causal convolution path with advanced residual blocks
-        self.conv_path = self._build_causal_conv_path(
-            reduced_channels, 32, conv_kernel_size, dropout, use_depthwise=True
-        )
-
-        self.fusion_path = ResidualMLP(
-            input_dim=32 * 2,  # Updated for 32-channel outputs
-            hidden_dims=(64, 60, 50),  # Smaller intermediate dimensions
-            dropout=dropout,
-            final_activation=False,
-        )
-
         # Unidirectional LSTM for causal temporal encoding
         self.lstm = nn.LSTM(
-            input_size=50,  # Updated to match fusion_path output
+            input_size=32,  # Updated to match fusion_path output
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
-            dropout=dropout if lstm_num_layers > 1 else 0,
             bidirectional=False,
         )
 
         self.pre_output = ResidualMLP(
             input_dim=lstm_hidden_dim,
-            hidden_dims=(102, 82, 66, 53),
-            dropout=dropout,
+            hidden_dims=geometric_schedule(lstm_hidden_dim, 64, 4),
             final_activation=True,
+            activation=nn.ReLU
         )
 
         self.mu_layer = ResidualMLP(
-            input_dim=53,
-            hidden_dims=(43, 35, 27, 21, latent_dim),
-            dropout=dropout,
+            input_dim=64,
+            hidden_dims=geometric_schedule(64, 32, 4),
             final_activation=False,
+            activation=nn.ReLU
         )
-
-    def _build_causal_conv_path(
-        self,
-        input_dim: int,
-        output_dim: int,
-        kernel_sizes: Union[int, list[int]],
-        dropout: float,
-        use_depthwise: bool,
-    ) -> nn.Module:
-        """Build causal convolution path with a sequence of residual blocks."""
-        if isinstance(kernel_sizes, int):
-            kernel_sizes = [kernel_sizes]
-
-        layers = []
-        current_dim = input_dim
-        # Create a block for each kernel size provided
-        for i, kernel_size in enumerate(kernel_sizes):
-            expansion_factor = 2.0 if i % 2 == 0 else 1.5  # Alternate expansion
-            layers.append(
-                CausalResidualBlock(
-                    channels=current_dim,
-                    kernel_size=kernel_size,
-                    dropout=dropout,
-                    expansion_factor=expansion_factor,
-                    use_depthwise=use_depthwise,
-                )
-            )
-
-        # Final projection to target dimension
-        layers.append(
-            nn.Sequential(
-                nn.LayerNorm(input_dim),
-                nn.Linear(input_dim, output_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            )
-        )
-
-        return nn.Sequential(*layers)
 
     def forward(
         self, x: torch.Tensor, return_intermediate: bool = False
@@ -806,36 +633,26 @@ class SourceEncoder(nn.Module):
             mu: Latent mean representations (batch_size, seq_len, latent_dim)
             intermediates: Dictionary of intermediate activations (if requested)
         """
-        batch_size, seq_len, channels = x.shape
         intermediates = {} if return_intermediate else None
 
         if return_intermediate:
             intermediates["input_with_bias"] = x
 
         # Apply channel reduction first
-        x_reduced = self.channel_reducer(x)
+        x_linear = self.mlp(x)
         
         if return_intermediate:
-            intermediates["channel_reduced"] = x_reduced
-
-        # Path 1: Multi-layer linear projection with reduced channels
-        linear_out = self.linear_path(x_reduced)
-        if return_intermediate:
-            intermediates["linear_path"] = linear_out
+            intermediates["channel_reduced"] = x_linear
 
         # Path 2: Causal convolution with reduced channels
-        conv_out = self.conv_path(x_reduced)
+        conv_out = self.conv(x.permute(0, 2, 1))
 
         if return_intermediate:
             intermediates["conv_path"] = conv_out
 
         # Memory-efficient path fusion
-        x = torch.cat([linear_out, conv_out], dim=-1)
-        del linear_out, conv_out  # Explicit cleanup
-
-        x = self.fusion_path(x)
-        if return_intermediate:
-            intermediates["path_fusion"] = x
+        x = x_linear + conv_out.permute(0, 2, 1)
+        del x_linear, conv_out  # Explicit cleanup
 
         # LSTM forward pass (unidirectional for causal encoding)
         x, (hidden, cell) = self.lstm(x)
@@ -889,7 +706,7 @@ class ConditionalEncoder(nn.Module):
     transformations are applied independently at each time step.
     """
 
-    def __init__(self, dim_hx: int, dim_hy: int, dim_z: int, dropout: float = 0.1):
+    def __init__(self, dim_hx: int, dim_hy: int, dim_z: int):
         """
         Args:
             dim_hx: Dimensionality of the source encoder's output (h_x).
@@ -902,25 +719,29 @@ class ConditionalEncoder(nn.Module):
         # The input dimension to the MLP is the sum of source and target feature dimensions
 
         # Build a small MLP to merge h_x and h_y
+        hidden_dims = geometric_schedule(dim_hx + dim_hy, 32, 7)
         self.mlp = ResidualMLP(
             input_dim=dim_hx + dim_hy,
-            hidden_dims=(55, 47, 41, 35),
-            dropout=dropout,
+            hidden_dims=hidden_dims[0:4],
             final_activation=True,
+            use_skip_connection=True, 
+            activation=nn.ReLU,
         )
 
         # Final linear layers to produce mu and logvar for the latent variable z
         self.fc_mu = ResidualMLP(
-            input_dim=35,
-            hidden_dims=(30, 26, 22, 19, dim_z),
-            dropout=dropout,
+            input_dim=hidden_dims[3],
+            hidden_dims=hidden_dims[4:],
             final_activation=False,
+            use_skip_connection=False, 
+            activation=nn.ReLU,
         )
         self.fc_logvar = ResidualMLP(
-            input_dim=35,
-            hidden_dims=(30, 26, 22, 19, dim_z),
-            dropout=dropout,
+            input_dim=hidden_dims[3],
+            hidden_dims=hidden_dims[4:],
             final_activation=False,
+            use_skip_connection=False, 
+            activation=nn.ReLU,
         )
 
     def forward(
@@ -931,16 +752,16 @@ class ConditionalEncoder(nn.Module):
 
         Args:
             h_x: Latent representation from the source encoder.
-                 Shape: (batch_size, sequence_length, dim_hx)
+                    Shape: (batch_size, sequence_length, dim_hx)
             h_y: Latent representation from the target encoder.
-                 Shape: (batch_size, sequence_length, dim_hy)
+                    Shape: (batch_size, sequence_length, dim_hy)
 
         Returns:
             A tuple containing:
             - mu (torch.Tensor): The mean of the posterior distribution.
-                                 Shape: (batch_size, sequence_length, dim_z)
+                                    Shape: (batch_size, sequence_length, dim_z)
             - logvar (torch.Tensor): The log-variance of the posterior distribution.
-                                     Shape: (batch_size, sequence_length, dim_z)
+                                        Shape: (batch_size, sequence_length, dim_z)
         """
         # Concatenate along the feature dimension (-1)
         h_combined = torch.cat([h_x, h_y], dim=-1)
@@ -954,111 +775,6 @@ class ConditionalEncoder(nn.Module):
 
         return mu, logvar
 
-
-class UpsamplingBlock(nn.Module):
-    """
-    Upsampling block with learnable transposed convolutions and anti-aliasing.
-    Implements progressive upsampling with residual connections for high-quality reconstruction.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        upsample_factor: int,
-        kernel_size: int = 4,
-        dropout: float = 0.1,
-    ):
-        """
-        Args:
-            in_channels: Input channels
-            out_channels: Output channels
-            upsample_factor: Upsampling factor (2, 4, 8, etc.)
-            kernel_size: Transposed convolution kernel size
-            dropout: Dropout rate
-        """
-        super().__init__()
-
-        self.upsample_factor = upsample_factor
-
-        # Transposed convolution for learnable upsampling
-        self.transpose_conv = nn.ConvTranspose1d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=upsample_factor,
-            padding=kernel_size // 2,
-            output_padding=upsample_factor - 1,
-        )
-
-        # Anti-aliasing filter to prevent reconstruction artifacts
-        self.anti_alias = nn.Conv1d(
-            out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels
-        )
-
-        # Residual connection projection if needed
-        if in_channels != out_channels:
-            self.skip_proj = nn.Conv1d(in_channels, out_channels, 1)
-        else:
-            self.skip_proj = nn.Identity()
-
-        # Upsampling for skip connection
-        self.skip_upsample = nn.Upsample(
-            scale_factor=upsample_factor, mode="linear", align_corners=False
-        )
-
-        # Normalization and activation
-        self.norm = nn.GroupNorm(
-            num_groups=min(8, out_channels), num_channels=out_channels
-        )
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor (batch_size, channels, length)
-        Returns:
-            Upsampled tensor (batch_size, out_channels, length * upsample_factor)
-        """
-        target_length = x.size(-1) * self.upsample_factor
-        
-        # Apply transposed convolution
-        upsampled = self.transpose_conv(x)
-        
-        # Ensure exact target length by cropping or padding
-        current_length = upsampled.size(-1)
-        if current_length > target_length:
-            upsampled = upsampled[..., :target_length]
-        elif current_length < target_length:
-            # Pad to exact length
-            pad_amount = target_length - current_length
-            upsampled = F.pad(upsampled, (0, pad_amount))
-
-        # Apply anti-aliasing filter
-        upsampled = self.anti_alias(upsampled)
-
-        # Residual connection with proper upsampling
-        skip = self.skip_proj(x)
-        skip_upsampled = self.skip_upsample(skip)
-        
-        # Ensure skip connection matches target length too
-        if skip_upsampled.size(-1) != target_length:
-            if skip_upsampled.size(-1) > target_length:
-                skip_upsampled = skip_upsampled[..., :target_length]
-            else:
-                pad_amount = target_length - skip_upsampled.size(-1)
-                skip_upsampled = F.pad(skip_upsampled, (0, pad_amount))
-
-        # Add residual connection
-        output = upsampled + skip_upsampled
-
-        # Apply normalization, activation, and dropout
-        output = self.norm(output)
-        output = self.activation(output)
-        output = self.dropout(output)
-
-        return output
 
 
 class Decoder(nn.Module):
@@ -1074,7 +790,7 @@ class Decoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 16,
+        latent_dim: int = 32,
         sequence_length: int = 300,
         prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
         hidden_dim: int = 128,
@@ -1096,45 +812,58 @@ class Decoder(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Process latent sequence to extract temporal features
-        self.latent_processor = ResidualMLP(
+        self.linear = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 4),
-            dropout=dropout,
+            hidden_dims=geometric_schedule(latent_dim, 256, 4),
             final_activation=True,
+            use_skip_connection=True, 
+            activation=nn.ReLU,
         )
 
         # LSTM to process temporal sequence
         self.lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,
+            input_size=latent_dim,
+            hidden_size=256,
+            num_layers=3,
             batch_first=True,
             bidirectional=False,
         )
         
+        self.conv = nn.Sequential(
+            CausalMultiChannelConvBlock(in_channels=latent_dim, out_channels=256, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=5, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=29, dilation=1),
+        )
+        
         # Use only the final LSTM output (last timestep) for prediction
         self.final_processor = ResidualMLP(
-            input_dim=hidden_dim,
-            hidden_dims=geometric_schedule(hidden_dim, hidden_dim * 2, 3),
-            dropout=dropout,
+            input_dim=256,
+            hidden_dims=geometric_schedule(256, 360, 4),
             final_activation=True,
+            activation=nn.ReLU,
+            use_skip_connection=True
         )
         
         # Direct prediction heads for the future window
         self.output_mu = ResidualMLP(
-            input_dim=hidden_dim * 2,
-            hidden_dims=geometric_schedule(hidden_dim * 2, prediction_horizon, 5),
-            dropout=dropout,
+            input_dim=360,
+            hidden_dims=geometric_schedule(360, prediction_horizon, 5),
             final_activation=False,
+            use_skip_connection=False,
+            activation=nn.ReLU
         )
         self.output_logvar = ResidualMLP(
-            input_dim=hidden_dim * 2,
-            hidden_dims=geometric_schedule(hidden_dim * 2, prediction_horizon, 5),
-            dropout=dropout,
+            input_dim=360,
+            hidden_dims=geometric_schedule(360, prediction_horizon, 5),
             final_activation=False,
+            use_skip_connection=False,
+            activation=nn.ReLU
         )
 
-    def forward(self, latent_z: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, latent_z: torch.Tensor):
         """
         Forward pass that predicts future windows from each timestep in the sequence.
         
@@ -1145,74 +874,47 @@ class Decoder(nn.Module):
             - raw_signal_mu: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
             - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
         """
-        B, S, Z = latent_z.shape
 
-        # Process latent sequence
-        processed = self.latent_processor(latent_z)  # (B, S, hidden_dim)
+        x_linear = self.linear(latent_z)
+
+        x_lstm, (hidden, cell) = self.lstm(latent_z)
         
-        # LSTM processing for temporal context
-        lstm_out, (hidden, cell) = self.lstm(processed)  # (B, S, hidden_dim)
+        x_conv = self.conv(latent_z.permute(0, 2, 1))
         
-        # Process each timestep for prediction (instead of just final timestep)
-        timestep_features = self.final_processor(lstm_out)  # (B, S, hidden_dim * 2)
+        x = x_linear + x_lstm + x_conv.permute(0, 2, 1)
         
-        # Generate predictions for each timestep
-        raw_mu = self.output_mu(timestep_features)  # (B, S, prediction_horizon)
-        raw_logvar = self.output_logvar(timestep_features)  # (B, S, prediction_horizon)
-        
-        # Clamp log variance for numerical stability
+        del x_linear, x_lstm, x_conv, hidden, cell
+        timestep_features = self.final_processor(x)  # (B, S, hidden_dim * 2)
+
+        raw_mu = self.output_mu(timestep_features)
+        raw_logvar = self.output_logvar(timestep_features)  
+
         raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
         
-        # Clean up intermediate tensors for memory efficiency
-        del processed, lstm_out, timestep_features, hidden, cell
+        del timestep_features
 
-        return {"raw_signal_mu": raw_mu, "raw_signal_logvar": raw_logvar}
+        return raw_mu, raw_logvar
 
-    def compute_loss(
-        self, predictions: Dict[str, torch.Tensor], target_raw_signal: torch.Tensor, warmup_period: int = 30
-    ) -> torch.Tensor:
-        """
-        Compute negative log-likelihood loss for raw signal prediction from each timestep.
-
-        Args:
-            predictions: Dictionary containing raw_signal_mu and raw_signal_logvar
-                        Both have shape (B, S, prediction_horizon)
-            target_raw_signal:  Ground truth raw signal (B, raw_signal_length)
-                                where raw_signal_length = S * 16
-            warmup_period:  Number of initial timesteps to skip (default: 30)
-        Returns:
-            NLL loss tensor
-        """
-        mu = predictions["raw_signal_mu"]  # (B, S, prediction_horizon)
-        logvar = predictions["raw_signal_logvar"]  # (B, S, prediction_horizon)
-        
-        B, S, prediction_horizon = mu.shape
+    @staticmethod
+    def compute_loss(raw_mu_predicted: torch.Tensor, raw_logvar_predicted: torch.Tensor,
+                     target_raw_signal: torch.Tensor, warmup_period: int = 30):
+        B, S, prediction_horizon = raw_mu_predicted.shape
         raw_signal_length = target_raw_signal.shape[1]
-        decimation_factor = 16  # Fixed decimation factor
+        decimation_factor = 16
         
-        # Skip warmup period timesteps
         if warmup_period >= S:
-            return torch.tensor(0.0, device=mu.device, requires_grad=True)
-        
-        # Calculate loss only for timesteps after warmup period
-        valid_timesteps = S - warmup_period
+            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
+
         total_loss = 0.0
         valid_predictions = 0
         
         for t in range(warmup_period, S):
-            # For timestep t, predict the next prediction_horizon samples
-            # Timestep t corresponds to raw signal position t * decimation_factor
             raw_start = t * decimation_factor
-            raw_end = raw_start + prediction_horizon
-            
-            # Check if we have enough target data for this prediction
+            raw_end = raw_start + prediction_horizon            
             if raw_end <= raw_signal_length:
-                # Extract target window for this timestep
-                target_window = target_raw_signal[:, raw_start:raw_end]  # (B, prediction_horizon)
-                
-                # Get predictions for this timestep
-                mu_t = mu[:, t, :]  # (B, prediction_horizon)
-                logvar_t = logvar[:, t, :]  # (B, prediction_horizon)
+                target_window = target_raw_signal[:, raw_start:raw_end]  # (B, prediction_horizon)                
+                mu_t = raw_mu_predicted[:, t, :]
+                logvar_t = raw_logvar_predicted[:, t, :]
                 
                 # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
                 diff = target_window - mu_t
@@ -1229,7 +931,7 @@ class Decoder(nn.Module):
         if valid_predictions > 0:
             return total_loss / valid_predictions
         else:
-            return torch.tensor(0.0, device=mu.device, requires_grad=True)
+            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
 
 
 class SeqVaeTeb(nn.Module):
@@ -1265,16 +967,11 @@ class SeqVaeTeb(nn.Module):
         self,
         input_channels: int = 76,
         sequence_length: int = 300,
-        latent_dim_source: int = 16,
-        latent_dim_target: int = 16,
-        latent_dim_z: int = 16,
+        latent_dim_source: int = 32,
+        latent_dim_target: int = 32,
+        latent_dim_z: int = 32,
         decimation_factor: int = 16,
         warmup_period: int = 30,
-        kld_beta: float = 1.0,
-        source_encoder_params: Optional[dict] = None,
-        target_encoder_params: Optional[dict] = None,
-        cond_encoder_params: Optional[dict] = None,
-        decoder_params: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -1283,48 +980,28 @@ class SeqVaeTeb(nn.Module):
         self.latent_dim_z = latent_dim_z
         self.decimation_factor = decimation_factor
         self.warmup_period = warmup_period
-        self.kld_beta = kld_beta
-
-        # Default parameters if not provided
-        if source_encoder_params is None:
-            source_encoder_params = {
-                "lstm_hidden_dim": 128
-            }
-        if target_encoder_params is None:
-            target_encoder_params = {
-                "lstm_hidden_dim": 128,
-            }
-        if cond_encoder_params is None:
-            cond_encoder_params = {"dropout": 0.1}
-        if decoder_params is None:
-            decoder_params = {"hidden_dim": 128, "dropout": 0.1}
 
         self.source_encoder = SourceEncoder(
             input_channels=input_channels,
             sequence_length=sequence_length,
             latent_dim=latent_dim_source,
-            **source_encoder_params,
         )
         self.target_encoder = TargetEncoder(
             input_channels=input_channels,
             sequence_length=sequence_length,
             latent_dim=latent_dim_target,
-            **target_encoder_params,
         )
         self.conditional_encoder = ConditionalEncoder(
             dim_hx=latent_dim_source,
             dim_hy=latent_dim_target,
             dim_z=latent_dim_z,
-            **cond_encoder_params,
         )
         self.decoder = Decoder(
             latent_dim=latent_dim_z,
             sequence_length=sequence_length,
-            prediction_horizon=480,  # 2 minutes at 4Hz
-            **decoder_params,
+            prediction_horizon=480,
         )
 
-        # Apply improved initialization
         initialization(self)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -1342,10 +1019,11 @@ class SeqVaeTeb(nn.Module):
     ) -> torch.Tensor:
         """Computes the KL divergence between two Gaussian distributions."""
         kld = (
-            logvar_post
-            - logvar_prior
-            - 1
-            + (logvar_prior.exp() + (mu_prior - mu_post).pow(2)) / logvar_post.exp()
+                logvar_prior
+                - logvar_post
+                - 1
+                + (logvar_post.exp() + (mu_post - mu_prior).pow(2))
+                / logvar_prior.exp()
         )
         kld = 0.5 * kld.sum(dim=-1)
         return kld.mean()
@@ -1361,18 +1039,13 @@ class SeqVaeTeb(nn.Module):
         Full forward pass of the SeqVaeTeb model.
 
         Args:
-            y_st: Target scattering input (B, C, L)
-            y_ph: Target phase harmonic input (B, C, L)
-            x_ph: Source phase harmonic input (B, C, L)
+            y_st: Target scattering input (Batch, sequence_len, channel)
+            y_ph: Target phase harmonic input (Batch, sequence_len, channel)
+            x_ph: Source phase harmonic input (Batch, sequence_len, channel)
 
         Returns:
             A dictionary containing tensors needed for loss computation.
         """
-        # Permute inputs from (B, C, L) to (B, L, C) for module compatibility
-        # Use transpose for better memory efficiency
-        y_st = y_st.transpose(1, 2)
-        y_ph = y_ph.transpose(1, 2)
-        x_ph = x_ph.transpose(1, 2)
 
         # Source encoder for q(h_x|x)
         mu_x = self.source_encoder(x_ph)
@@ -1387,16 +1060,17 @@ class SeqVaeTeb(nn.Module):
 
         # Conditional encoder for q(z|x, y)
         mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
 
-        # Sample z from posterior
         z = self.reparameterize(mu_post, logvar_post)
 
         # Decode raw signal predictions from z
-        raw_predictions = self.decoder(z)
+        mu_pr, logvar_pr = self.decoder(z)
 
         return {
-            "z": z,
-            "raw_predictions": raw_predictions,
+            "z": z,  # (batch, length, channel)
+            "mu_pr": mu_pr, # (batch, length, prediction for each time step)
+            "logvar_pr": logvar_pr,  # (batch, length, prediction for each time step)
             "mu_prior": mu_y,
             "logvar_prior": logvar_y_prior,
             "mu_post": mu_post,
@@ -1422,18 +1096,13 @@ class SeqVaeTeb(nn.Module):
             A dictionary of computed losses (total, reconstruction, KLD).
         """
         device = y_raw.device
-
-        # Initialize losses
         kld_loss = torch.tensor(0.0, device=device)
 
-        # Ensure y_raw has the right shape (B, raw_signal_length)
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
 
         # Raw signal prediction loss with warmup period
-        raw_signal_loss = self.decoder.compute_loss(
-            forward_outputs["raw_predictions"], y_raw, warmup_period=self.warmup_period
-        )
+        raw_signal_loss = self.decoder.compute_loss(forward_outputs['mu_pr'], forward_outputs['logvar_pr'], y_raw)
 
         # KLD loss
         if compute_kld_loss:
@@ -1444,191 +1113,120 @@ class SeqVaeTeb(nn.Module):
                 logvar_post=forward_outputs["logvar_post"],
             )
 
-        # Total loss
-        total_loss = raw_signal_loss + self.kld_beta * kld_loss
-
         return {
-            "total_loss": total_loss,
-            "reconstruction_error": raw_signal_loss,  # Maps to required interface
             "reconstruction_loss": raw_signal_loss,  # Keep for backward compatibility
             "kld_loss": kld_loss,
             "classification_loss": None,  # Required by interface
-            "raw_signal_loss": raw_signal_loss,
         }
 
-    def get_average_predictions(
-        self, forward_outputs: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    @staticmethod
+    def get_predictions(x, stride=16, new_C=4800):
         """
-        Returns the raw signal predictions for visualization.
-        
-        The decoder now outputs predictions for each timestep in the sequence.
-
-        Args:
-            forward_outputs: The dictionary returned by the forward pass, which
-                                contains the raw signal predictions.
-
-        Returns:
-            A dictionary containing raw signal predictions with shape 
-            (batch_size, sequence_length, prediction_horizon).
+        x: (B, N, C)
+        returns:
+          y:      (B, N, new_C)  — with NaNs where no data was placed
+          mean:   (B, new_C)      — nan-mean over dim=1
         """
-        return forward_outputs["raw_predictions"]
-
-    def predict_raw_signal(
-        self, x_ph: torch.Tensor, y_st: torch.Tensor, y_ph: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Predict raw signal from latent representation.
-
-        Args:
-            x_ph: Source phase harmonic input (B, C, L)
-            y_st: Target scattering input (B, C, L)
-            y_ph: Target phase harmonic input (B, C, L)
-
-        Returns:
-            Dictionary containing raw signal predictions
-        """
-        with torch.no_grad():
-            # Get latent representation
-            forward_outputs = self.forward(y_st, y_ph, x_ph)
-            return forward_outputs["raw_predictions"]
-
-    def predict_future_window(
-        self, 
-        x_ph: torch.Tensor, 
-        y_st: torch.Tensor, 
-        y_ph: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Predict the next 2 minutes (480 samples) of raw FHR signal from each timestep.
-        
-        This method processes the full sequence and predicts future windows from each timestep.
-
-        Args:
-            x_ph: Source phase harmonic input (B, C, L) - full sequence
-            y_st: Target scattering input (B, C, L) - full sequence  
-            y_ph: Target phase harmonic input (B, C, L) - full sequence
-
-        Returns:
-            Dictionary containing:
-            - raw_signal_mu: Predicted signal mean for next 2 minutes (B, S, 480)
-            - raw_signal_logvar: Predicted log-variance for next 2 minutes (B, S, 480) 
-            - z: Latent variable from full sequence (B, seq_len, latent_dim)
-        """
-        with torch.no_grad():
-            # Process full sequence
-            forward_outputs = self.forward(y_st, y_ph, x_ph)
-            raw_predictions = forward_outputs["raw_predictions"]
-            
-            return {
-                "raw_signal_mu": raw_predictions["raw_signal_mu"],      # (B, S, 480) 
-                "raw_signal_logvar": raw_predictions["raw_signal_logvar"], # (B, S, 480)
-                "z": forward_outputs["z"],  # (B, seq_len, latent_dim)
-                "mu_post": forward_outputs["mu_post"],
-                "logvar_post": forward_outputs["logvar_post"]
-            }
-
+        B, N, C = x.shape
+        y = x.new_full((B, N, new_C), float('nan'))
+        for i in range(N):
+            start = i * stride
+            if start >= new_C:
+                break
+            end = min(start + C, new_C)
+            length = end - start
+            y[:, i, start:end] = x[:, i, :length]
+        mean = torch.nanmean(y, dim=1)  # → shape (B, new_C)
+        return y, mean
 
 if __name__ == "__main__":
-    # Common configuration
+
     batch_size = 4
     seq_len = 300
     channels = 76
     prediction_horizon = 30
-    warmup_period = 50
+    warmup_period = 30
 
-    # --- SeqVaeTeb Model Initialization with Channel Reduction ---
-    print("--- Initializing SeqVaeTeb Model with Channel Reduction ---")
+    y_st_input = torch.randn(batch_size, seq_len, channels)  # (B, C, L) format
+    y_ph_input = torch.randn(batch_size, seq_len, channels)
+    x_ph_input = torch.randn(batch_size, seq_len, channels)
+    y_raw_input = torch.randn(
+        batch_size, seq_len * 16
+    )
+
+    # target encoder test: -------------------------------------------------------
+    # model = TargetEncoder(input_channels=channels,
+    #                       sequence_length=seq_len)
+    #
+    # mu, logvar = model(scattering_input=y_st_input,
+    #                                phase_harmonic_input=y_ph_input)
+
+    # source encoder test: -------------------------------------------------------
+    # model = SourceEncoder()
+    # mu = model(x_ph_input)
+
+    # conditional encoder test: --------------------------------------------------
+    # model = ConditionalEncoder(32, 32, 32)
+    # mu, logvar = model(
+    #     torch.randn(batch_size, seq_len, 32),
+    #     torch.randn(batch_size, seq_len, 32)
+    # )
+
+    # decoder test: --------------------------------------------------------------
+    # model = Decoder()
+    # mu, logvar = model(
+    #     torch.randn(batch_size, seq_len, 32),
+    # )
+    
+    # Test VAE model:
     model = SeqVaeTeb(
         input_channels=channels,
         sequence_length=seq_len,
         decimation_factor=16,
         warmup_period=warmup_period,
-        kld_beta=1.0,
     )
-    print("Model initialized successfully.")
-    
-    # Print model parameter count
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
-
-    # --- Create Dummy Data ---
-    y_st_input = torch.randn(batch_size, channels, seq_len)  # (B, C, L) format
-    y_ph_input = torch.randn(batch_size, channels, seq_len)
-    x_ph_input = torch.randn(batch_size, channels, seq_len)
-    y_raw_input = torch.randn(
-        batch_size, seq_len * 16
-    )  # Raw signal at 16x resolution (B, 4800)
-    print(f"\nInput shapes: y_st={y_st_input.shape}, y_ph={y_ph_input.shape}, x_ph={x_ph_input.shape}")
-    print(f"Raw signal shape: {y_raw_input.shape}")
-
-    # --- Test Channel Reduction ---
-    print("\n--- Testing Channel Reduction ---")
-    print("Testing forward pass with channel reduction...")
-    try:
-        forward_outputs = model(
-            y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
-        )
-        print("✓ Forward pass successful")
-        
-        # Print output shapes
-        print(f"Raw signal prediction shape: {forward_outputs['raw_predictions']['raw_signal_mu'].shape}")
-        print(f"Expected shape: (B, S, 480) = ({batch_size}, {seq_len}, 480)")
-        print(f"Latent z shape: {forward_outputs['z'].shape}")
-        
-    except Exception as e:
-        print(f"✗ Forward pass failed: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
-
-    # --- Test Loss Computation ---
-    print("\n--- Testing Loss Computation ---")
-    try:
-        loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
-        print("✓ Loss computation successful")
-        print(f"Total Loss: {loss_dict['total_loss']:.4f}")
-        print(f"Reconstruction Loss: {loss_dict['reconstruction_loss']:.4f}")
-        print(f"KLD Loss: {loss_dict['kld_loss']:.4f}")
-        
-    except Exception as e:
-        print(f"✗ Loss computation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
-
-    # --- Simple Training Loop ---
-    print("\n--- Starting Simple Training Loop with Channel Reduction ---")
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    num_epochs = 3
-
-    for epoch in range(num_epochs):
-        model.train()  # Set the model to training mode
-
-        # 1. Zero the gradients
-        optimizer.zero_grad()
-
-        # 2. Forward pass
-        forward_outputs = model(
-            y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
-        )
-
-        # 3. Compute loss
-        loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
-        total_loss = loss_dict["total_loss"]
-
-        # 4. Backward pass
-        total_loss.backward()
-
-        # 5. Update weights
-        optimizer.step()
-
-        print(
-            f"Epoch [{epoch+1}/{num_epochs}], "
-            f"Total Loss: {loss_dict['total_loss']:.4f}, "
-            f"Recon Loss: {loss_dict['reconstruction_loss']:.4f}, "
-            f"KLD Loss: {loss_dict['kld_loss']:.4f}, "
-            f"Raw Signal Loss: {loss_dict['raw_signal_loss']:.4f}"
-        )
-
-    print("--- Channel Reduction Training Test Completed Successfully ---")
+    forward_outputs = model(
+        y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
+    )
+    prd_x_mu = model.get_average_predictions(forward_outputs['mu_pr'])
+    prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
+    loss = model.compute_loss(forward_outputs, y_raw_input)
+    print('done')
+    #
+    # except Exception as e:
+    #     import traceback
+    #     traceback.print_exc()
+    #     exit(1)
+    #
+    # # --- Test Loss Computation ---
+    # try:
+    #     loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
+    #
+    # except Exception as e:
+    #     import traceback
+    #     traceback.print_exc()
+    #     exit(1)
+    #
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # num_epochs = 3
+    #
+    # for epoch in range(num_epochs):
+    #     model.train()  # Set the model to training mode
+    #
+    #     # 1. Zero the gradients
+    #     optimizer.zero_grad()
+    #
+    #     # 2. Forward pass
+    #     forward_outputs = model(
+    #         y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
+    #     )
+    #
+    #     # 3. Compute loss
+    #     loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
+    #     total_loss = loss_dict["total_loss"]
+    #
+    #     # 4. Backward pass
+    #     total_loss.backward()
+    #
+    #     # 5. Update weights
+    #     optimizer.step()

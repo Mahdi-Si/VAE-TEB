@@ -37,12 +37,10 @@ class PlottingCallBack(Callback):
 
         logger.info(f"Starting plotting callback for epoch {pl_trainer.current_epoch}")
 
-        # Fetch a single batch from the validation dataloader
         try:
             if hasattr(pl_trainer, 'datamodule') and pl_trainer.datamodule is not None:
                 val_dataloader = pl_trainer.datamodule.val_dataloader()
             else:
-                # Access validation dataloader directly from trainer
                 val_dataloader = pl_trainer.val_dataloaders
                 if isinstance(val_dataloader, list):
                     val_dataloader = val_dataloader[0]
@@ -53,7 +51,6 @@ class PlottingCallBack(Callback):
             logger.warning(f"Could not get a batch from validation dataloader for plotting: {e}")
             return
 
-        # Ensure batch is on the correct device (use proper device, not hardcoded 0)
         batch = pl_module.transfer_batch_to_device(batch, pl_module.device, pl_module.local_rank)
 
         pl_module.eval()
@@ -65,141 +62,20 @@ class PlottingCallBack(Callback):
                     return
 
                 logger.info("Accessing batch data...")
-                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
-                y_raw_normalized = batch.fhr  # This is the normalized FHR from dataset
-                up_raw_normalized = batch.up  # This is the normalized UP from dataset
+                y_st, y_ph, x_ph = batch.fhr_st.permute(0, 2, 1), batch.fhr_ph.permute(0, 2, 1), batch.fhr_up_ph.permute(0, 2, 1)
+                y_raw_normalized = batch.fhr
+                up_raw_normalized = batch.up
 
-                logger.info(f"Batch shapes - y_st: {y_st.shape}, y_ph: {y_ph.shape}, x_ph: {x_ph.shape}, y_raw: {y_raw_normalized.shape}")
-
-                # Simple full forward pass - no windowed prediction
-                logger.info("Running model forward pass...")
                 model_outputs = pl_module.model(y_st, y_ph, x_ph)
-                logger.info(f"Model forward pass successful. Output keys: {list(model_outputs.keys())}")
+                latent_z = model_outputs['z']
+                mu_pr, mu_pr_means = pl_module.model.get_predictions(model_outputs['mu_pr'])
+                logvar_pr, log_var_means = pl_module.model.get_predictions(model_outputs['logvar_pr'])
+                
+                # Plot results
+                self._plot_results(y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means, 
+                                 mu_pr, logvar_pr, latent_z, pl_trainer.current_epoch)
+                
 
-                # OPTIMIZATION: Move data to CPU immediately after forward pass to reduce GPU 0 load
-                # Transfer all required data to CPU for plotting operations
-                device_info = {
-                    'device_id': pl_module.device.index if hasattr(pl_module.device, 'index') else 0,
-                    'device_type': pl_module.device.type
-                }
-
-                if 'raw_predictions' not in model_outputs:
-                    logger.error("Model output missing 'raw_predictions' key")
-                    return
-
-                raw_predictions = model_outputs['raw_predictions']
-                if 'raw_signal_mu' not in raw_predictions or 'raw_signal_logvar' not in raw_predictions:
-                    logger.error(f"Raw predictions missing required keys. Available keys: {list(raw_predictions.keys())}")
-                    return
-
-                # Get model parameters for plotting
-                warmup_period = getattr(pl_module.model, 'warmup_period', 30)
-                decimation_factor = getattr(pl_module.model, 'decimation_factor', 16)
-                B, S, prediction_horizon = raw_predictions['raw_signal_mu'].shape
-                logger.info(f"Model parameters - warmup_period: {warmup_period}, decimation_factor: {decimation_factor}")
-                logger.info(f"Prediction shape: (B={B}, S={S}, prediction_horizon={prediction_horizon})")
-
-                # OPTIMIZATION: Move all tensor operations to CPU immediately to reduce GPU load
-                # Extract predictions for the first sample in the batch and move to CPU
-                # raw_predictions now contain (B, S, prediction_horizon) - predictions from each timestep
-                pred_mu = raw_predictions['raw_signal_mu'][0].detach().cpu().numpy()  # (S, prediction_horizon)
-                pred_logvar = raw_predictions['raw_signal_logvar'][0].detach().cpu().numpy()  # (S, prediction_horizon)
-                pred_std = np.exp(0.5 * pred_logvar)
-
-                # Ground truth (first sample in batch) - normalized raw signals - move to CPU immediately
-                ground_truth_fhr = y_raw_normalized[0].squeeze().detach().cpu().numpy()
-                ground_truth_up = up_raw_normalized[0].squeeze().detach().cpu().numpy()
-
-                # Get latent representation and move to CPU immediately
-                z_latent = None
-                if 'z' in model_outputs:
-                    z_latent = model_outputs['z'][0].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
-
-                # Get batch info and move to CPU
-                try:
-                    guid = batch.guid[0] if hasattr(batch, 'guid') else 'unknown'
-                    epoch_info = batch.epoch[0].item() if hasattr(batch, 'epoch') else 'unknown'
-                except:
-                    guid = 'unknown'
-                    epoch_info = 'unknown'
-
-                # Free GPU memory early by deleting GPU tensors
-                del model_outputs, raw_predictions
-                del y_st, y_ph, x_ph, y_raw_normalized, up_raw_normalized
-                # Force GPU memory cleanup before heavy CPU plotting
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-                logger.info(f"Moved data to CPU for plotting. Device was: {device_info}")
-
-                # Select a representative timepoint for simple visualization
-                # Use a middle timepoint after warmup for plotting
-                if S > warmup_period + 10:
-                    selected_timestep = min(int(S * 0.6), S - 1)  # Use 60% through sequence
-                else:
-                    selected_timestep = max(warmup_period, S - 1)
-
-                # Extract prediction for the selected timestep
-                pred_mu_selected = pred_mu[selected_timestep]  # (prediction_horizon,)
-                pred_std_selected = pred_std[selected_timestep]  # (prediction_horizon,)
-
-                # Calculate where this prediction should be placed in the raw signal
-                raw_start = selected_timestep * decimation_factor
-                raw_end = raw_start + prediction_horizon
-
-                logger.info(f"Selected timestep {selected_timestep} for plotting, raw_start: {raw_start}, raw_end: {raw_end}")
-
-                logger.info(
-                    f"Data shapes for plotting - pred_mu: {pred_mu.shape}, ground_truth_fhr: {ground_truth_fhr.shape}, ground_truth_up: {ground_truth_up.shape}")
-                if z_latent is not None:
-                    logger.info(f"Latent shape: {z_latent.shape}")
-
-                # --- Create plots with proper data handling and professional styling ---
-                # Professional pastel color palette for research papers
-                colors = {
-                    'ground_truth': '#2E5984',  # Deep blue-gray (professional)
-                    'prediction': '#C7522A',  # Muted red-orange
-                    'uncertainty': '#E5B181',  # Light peach
-                    'grid': '#E8E8E8',  # Light gray for grid
-                    'background': '#FAFAFA'  # Very light gray background
-                }
-
-                # Set the overall style
-                plt.style.use('default')  # Reset to default first
-                plt.rcParams.update({
-                    'figure.facecolor': colors['background'],
-                    'axes.facecolor': 'white',
-                    'axes.edgecolor': '#CCCCCC',
-                    'axes.linewidth': 0.8,
-                    'grid.color': colors['grid'],
-                    'grid.linewidth': 0.5,
-                    'font.size': 10,
-                    'axes.titlesize': 11,
-                    'axes.labelsize': 10,
-                    'legend.fontsize': 9,
-                    'xtick.labelsize': 9,
-                    'ytick.labelsize': 9
-                })
-
-                fig = plt.figure(figsize=(16, 15), facecolor=colors['background'])
-
-                # Create a grid layout with 5 rows for the new subplot
-                gs = fig.add_gridspec(5, 30, hspace=0.4, wspace=0.05)
-
-                # Main plots take up most of the width (columns 0-27), colorbar is thinner (28-29)
-                ax1 = fig.add_subplot(gs[0, :27])  # Ground truth
-                ax2 = fig.add_subplot(gs[1, :27])  # Average predictions with uncertainty
-                ax3 = fig.add_subplot(gs[2, :27])  # Single predictions (non-overlapping)
-                ax4 = fig.add_subplot(gs[3, :27])  # Comparison overlay
-                ax5 = fig.add_subplot(gs[4, :27])  # Latent representation
-
-                # Thinner colorbar axis
-                cbar_ax = fig.add_subplot(gs[4, 28:])
-
-                # Use the fixed plotting callback implementation
-                from fixed_plotting_callback import FixedPlottingCallBack
-                fixed_plotter = FixedPlottingCallBack(self.output_dir, 1, self.input_channel_num)
-                fixed_plotter.on_validation_epoch_end(pl_trainer, pl_module)
-                return
 
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
@@ -207,6 +83,160 @@ class PlottingCallBack(Callback):
             logger.error(f"Traceback: {traceback.format_exc()}")
         finally:
             pl_module.train()
+
+    def _plot_results(self, y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means, 
+                     mu_pr, logvar_pr, latent_z, epoch):
+        """Plot model results with 4 subplots following the style of plot_forward_pass"""
+        import os
+        import gc
+        
+        # Select one sample from the batch (first sample)
+        batch_idx = 0
+        
+        # Convert tensors to numpy and move to CPU
+        y_raw = y_raw_normalized[batch_idx].cpu().numpy()  # Shape: (4800,)
+        up_raw = up_raw_normalized[batch_idx].cpu().numpy()  # Shape: (4800,)
+        mu_means = mu_pr_means[batch_idx].cpu().numpy()  # Shape: (4800,)
+        log_var = log_var_means[batch_idx].cpu().numpy()  # Shape: (4800,)
+        mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
+        logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
+        z_latent = latent_z[batch_idx].cpu().numpy()  # Shape: (300, 32)
+        
+        # Setup plotting parameters following the style from data_utils
+        Fs = 4
+        N = len(y_raw)
+        t_in = np.arange(0, N) / Fs
+        
+        # Professional color palette
+        colors = {
+            'fhr': '#2E86AB',           # Deep blue
+            'up': '#A23B72',            # Deep magenta 
+            'gt': '#2E86AB',            # Deep blue (same as FHR)
+            'recon': '#F18F01',         # Warm orange
+            'uncertainty': '#F18F01',    # Warm orange (same as recon)
+            'samples': '#C73E1D',       # Deep red
+            'background': '#FAFAFA'     # Very light gray
+        }
+        
+        # Set professional plot styling
+        plt.style.use('default')  # Reset to default first
+        plt.rcParams.update({
+            'font.family': 'serif',
+            'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'],
+            'font.size': 12,
+            'axes.titlesize': 14,
+            'axes.labelsize': 12,
+            'axes.linewidth': 0.8,
+            'axes.edgecolor': '#333333',
+            'axes.facecolor': colors['background'],
+            'grid.color': '#CCCCCC',
+            'grid.linewidth': 0.5,
+            'grid.alpha': 0.8,
+            'legend.frameon': True,
+            'legend.fancybox': True,
+            'legend.shadow': False,
+            'legend.framealpha': 0.9,
+            'legend.edgecolor': '#DDDDDD',
+            'figure.facecolor': 'white',
+            'savefig.facecolor': 'white',
+            'savefig.dpi': 300
+        })
+        
+        # Create figure with 4 rows, 2 columns (main plot + colorbar)
+        n_rows = 4
+        fig, ax = plt.subplots(nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
+                              gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
+        
+        # Configure grid style for all subplots
+        for i in range(n_rows):
+            ax[i, 0].grid(True, linestyle='-', alpha=0.3, linewidth=0.5)
+            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.2, linewidth=0.3)
+            ax[i, 0].minorticks_on()
+            ax[i, 0].set_axisbelow(True)
+            ax[i, 0].spines['top'].set_visible(False)
+            ax[i, 0].spines['right'].set_visible(False)
+            ax[i, 0].spines['left'].set_color('#666666')
+            ax[i, 0].spines['bottom'].set_color('#666666')
+        
+        # Subplot 1: y_raw_normalized and up_raw_normalized
+        ax[0, 1].set_axis_off()
+        ax[0, 0].plot(t_in, y_raw, linewidth=2.0, color=colors['fhr'], label='FHR', alpha=0.9)
+        ax[0, 0].plot(t_in, up_raw, linewidth=2.0, color=colors['up'], label='UP', alpha=0.9)
+        ax[0, 0].set_ylabel('Amplitude', fontweight='bold')
+        ax[0, 0].set_title('Raw FHR and UP Signals', fontweight='bold', pad=15)
+        ax[0, 0].legend(loc='upper right', framealpha=0.95)
+        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
+        
+        # Subplot 2: y_raw_normalized and mu_pr_means with uncertainty
+        ax[1, 1].set_axis_off()
+        ax[1, 0].plot(t_in, y_raw, linewidth=2.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=3)
+        ax[1, 0].plot(t_in, mu_means, linewidth=2.0, color=colors['recon'], label='Reconstruction', alpha=0.9, zorder=2)
+        
+        # Add uncertainty visualization using log_var_means
+        std_dev = np.exp(0.5 * log_var)  # Convert log variance to standard deviation
+        ax[1, 0].fill_between(t_in, mu_means - std_dev, mu_means + std_dev, 
+                             alpha=0.25, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
+        
+        ax[1, 0].set_ylabel('FHR (bpm)', fontweight='bold')
+        ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='bold', pad=15)
+        ax[1, 0].legend(loc='upper right', framealpha=0.95)
+        ax[1, 0].autoscale(enable=True, axis='x', tight=True)
+        
+        # Subplot 3: y_raw_normalized and selected mu_pr samples (handling NaN values)
+        ax[2, 1].set_axis_off()
+        ax[2, 0].plot(t_in, y_raw, linewidth=2.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=2)
+        
+        # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
+        selected_indices = [30, 60, 90, 120, 150, 180, 210, 240, 270]
+        
+        # Handle NaN values and sum selected samples
+        selected_samples = mu_samples[selected_indices, :]  # Shape: (9, 4800)
+        
+        # Remove NaN values and compute mean
+        valid_mask = ~np.isnan(selected_samples)
+        summed_samples = np.zeros(4800)
+        
+        for i in range(4800):
+            valid_values = selected_samples[:, i][valid_mask[:, i]]
+            if len(valid_values) > 0:
+                summed_samples[i] = np.sum(valid_values)
+            else:
+                summed_samples[i] = 0  # or np.nan if you prefer
+        
+        ax[2, 0].plot(t_in, summed_samples, linewidth=2.0, color=colors['samples'], 
+                     label='Selected Samples Sum', alpha=0.9, zorder=1)
+        
+        ax[2, 0].set_ylabel('FHR (bpm)', fontweight='bold')
+        ax[2, 0].set_title('FHR vs Selected Sample Reconstructions', fontweight='bold', pad=15)
+        ax[2, 0].legend(loc='upper right', framealpha=0.95)
+        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
+        
+        # Subplot 4: latent_z with imshow
+        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='plasma', 
+                                 origin='lower', interpolation='bilinear')
+        ax[3, 1].set_axis_on()
+        cbar = fig.colorbar(imgplot, cax=ax[3, 1])
+        cbar.ax.tick_params(labelsize=10)
+        cbar.set_label('Activation', fontweight='bold', fontsize=11)
+        ax[3, 0].set_ylabel('Latent Dimensions', fontweight='bold')
+        ax[3, 0].set_xlabel('Time Steps', fontweight='bold')
+        ax[3, 0].set_title('Latent Space Representation', fontweight='bold', pad=15)
+        
+        # Set overall title with professional styling
+        fig.suptitle(f'Model Performance Analysis — Epoch {epoch}', 
+                    fontsize=18, fontweight='bold', y=0.98)
+        
+        # Save plot as PDF with high quality
+        save_path = os.path.join(self.output_dir, f'model_results_epoch_{epoch}.pdf')
+        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', 
+                   dpi=300, facecolor='white', edgecolor='none')
+        plt.close(fig)
+        
+        # Clean up memory
+        del y_raw, up_raw, mu_means, log_var, mu_samples, logvar_samples, z_latent
+        gc.collect()
+        
+        logger.info(f"Model results plot saved to {save_path}")
 
 
 class LossPlotCallback(Callback):
@@ -360,7 +390,6 @@ class LightSeqVaeTeb(L.LightningModule):
         super().__init__()
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
-
         self.model = seqvae_teb_model
 
     def forward(self, y_st, y_ph, x_ph):
@@ -386,13 +415,12 @@ class LightSeqVaeTeb(L.LightningModule):
             raise ValueError(f"Unknown beta schedule: {schedule}")
 
         # Update beta in the underlying model
-        self.model.kld_beta = beta
         return beta
 
     def on_train_epoch_start(self):
         """Called at the beginning of each training epoch."""
-        beta = self._calculate_beta()
-        self.log('kld_beta', beta, on_epoch=True, prog_bar=True)
+        self.hparams.beta = self._calculate_beta()
+        self.log('kld_beta', self.hparams.beta, on_epoch=True, prog_bar=True)
         # Log learning rate at the start of each epoch
         try:
             lr = self.optimizers().param_groups[0]['lr']
@@ -411,9 +439,9 @@ class LightSeqVaeTeb(L.LightningModule):
     def _common_step(self, batch, batch_idx):
         """Optimized common logic for training and validation steps with aggressive memory management."""
         # Access data using correct HDF5 dataset field names
-        y_st = batch.fhr_st  # Scattering transform features
-        y_ph = batch.fhr_ph  # Phase harmonic features
-        x_ph = batch.fhr_up_ph  # Cross-phase features
+        y_st = batch.fhr_st.permute(0, 2, 1)  # Scattering transform features
+        y_ph = batch.fhr_ph.permute(0, 2, 1)  # Phase harmonic features
+        x_ph = batch.fhr_up_ph.permute(0, 2, 1)  # Cross-phase features
         y_raw = batch.fhr  # Raw signal for reconstruction
 
         # Use gradient checkpointing for forward pass to save memory
@@ -451,14 +479,12 @@ class LightSeqVaeTeb(L.LightningModule):
     def training_step(self, batch, batch_idx):
         """Defines the training loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['total_loss']
+        total_loss = loss_dict['reconstruction_loss'] + self.hparams.beta * loss_dict['kld_loss']
 
         # Log training metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/raw_signal_loss', loss_dict['raw_signal_loss'], on_step=False, on_epoch=True, logger=True)
-
         # Clear loss_dict to free memory
         del loss_dict
 
@@ -467,13 +493,12 @@ class LightSeqVaeTeb(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         """Defines the validation loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['total_loss']
+        total_loss = loss_dict['reconstruction_loss'] + self.hparams.beta * loss_dict['kld_loss']
 
         # Log validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
         self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/raw_signal_loss', loss_dict['raw_signal_loss'], on_epoch=True, logger=True)
 
         # Clear loss_dict to free memory
         del loss_dict
