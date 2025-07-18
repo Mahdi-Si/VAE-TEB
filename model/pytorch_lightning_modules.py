@@ -107,36 +107,37 @@ class PlottingCallBack(Callback):
         N = len(y_raw)
         t_in = np.arange(0, N) / Fs
         
-        # Professional color palette
+        # Professional scientific paper color palette
         colors = {
-            'fhr': '#2E86AB',           # Deep blue
-            'up': '#A23B72',            # Deep magenta 
-            'gt': '#2E86AB',            # Deep blue (same as FHR)
-            'recon': '#F18F01',         # Warm orange
-            'uncertainty': '#F18F01',    # Warm orange (same as recon)
-            'samples': '#C73E1D',       # Deep red
-            'background': '#FAFAFA'     # Very light gray
+            'fhr': '#1B3C53',           # Deep blue-gray
+            'up': '#4A9782',            # Sage green
+            'gt': '#456882',            # Medium blue-gray
+            'recon': '#BB3E00',         # Deep orange-red
+            'uncertainty': '#F7AD45',    # Golden yellow
+            'samples': '#657C6A',       # Muted green-gray
+            'background': '#F9F3EF'     # Warm off-white
         }
         
-        # Set professional plot styling
+        # Set professional scientific paper styling
         plt.style.use('default')  # Reset to default first
         plt.rcParams.update({
-            'font.family': 'serif',
-            'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'],
-            'font.size': 12,
-            'axes.titlesize': 14,
-            'axes.labelsize': 12,
-            'axes.linewidth': 0.8,
-            'axes.edgecolor': '#333333',
+            'font.family': 'sans-serif',
+            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+            'font.size': 11,
+            'axes.titlesize': 12,
+            'axes.labelsize': 11,
+            'axes.linewidth': 0.7,
+            'axes.edgecolor': '#666666',
             'axes.facecolor': colors['background'],
-            'grid.color': '#CCCCCC',
-            'grid.linewidth': 0.5,
-            'grid.alpha': 0.8,
+            'grid.color': '#D2C1B6',
+            'grid.linewidth': 0.4,
+            'grid.alpha': 0.6,
             'legend.frameon': True,
-            'legend.fancybox': True,
+            'legend.fancybox': False,
             'legend.shadow': False,
-            'legend.framealpha': 0.9,
-            'legend.edgecolor': '#DDDDDD',
+            'legend.framealpha': 0.95,
+            'legend.edgecolor': '#A2B9A7',
+            'legend.facecolor': colors['background'],
             'figure.facecolor': 'white',
             'savefig.facecolor': 'white',
             'savefig.dpi': 300
@@ -147,44 +148,46 @@ class PlottingCallBack(Callback):
         fig, ax = plt.subplots(nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
                               gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
         
-        # Configure grid style for all subplots
+        # Configure scientific paper grid style for all subplots
         for i in range(n_rows):
-            ax[i, 0].grid(True, linestyle='-', alpha=0.3, linewidth=0.5)
-            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.2, linewidth=0.3)
+            ax[i, 0].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
             ax[i, 0].minorticks_on()
             ax[i, 0].set_axisbelow(True)
             ax[i, 0].spines['top'].set_visible(False)
             ax[i, 0].spines['right'].set_visible(False)
-            ax[i, 0].spines['left'].set_color('#666666')
-            ax[i, 0].spines['bottom'].set_color('#666666')
+            ax[i, 0].spines['left'].set_color('#A2B9A7')
+            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
+            ax[i, 0].spines['left'].set_linewidth(0.7)
+            ax[i, 0].spines['bottom'].set_linewidth(0.7)
         
         # Subplot 1: y_raw_normalized and up_raw_normalized
         ax[0, 1].set_axis_off()
-        ax[0, 0].plot(t_in, y_raw, linewidth=2.0, color=colors['fhr'], label='FHR', alpha=0.9)
-        ax[0, 0].plot(t_in, up_raw, linewidth=2.0, color=colors['up'], label='UP', alpha=0.9)
-        ax[0, 0].set_ylabel('Amplitude', fontweight='bold')
-        ax[0, 0].set_title('Raw FHR and UP Signals', fontweight='bold', pad=15)
+        ax[0, 0].plot(t_in, y_raw, linewidth=1.2, color=colors['fhr'], label='FHR', alpha=0.85)
+        ax[0, 0].plot(t_in, up_raw, linewidth=1.2, color=colors['up'], label='UP', alpha=0.85)
+        ax[0, 0].set_ylabel('Amplitude', fontweight='normal')
+        ax[0, 0].set_title('Raw FHR and UP Signals', fontweight='normal', pad=12)
         ax[0, 0].legend(loc='upper right', framealpha=0.95)
         ax[0, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Subplot 2: y_raw_normalized and mu_pr_means with uncertainty
         ax[1, 1].set_axis_off()
-        ax[1, 0].plot(t_in, y_raw, linewidth=2.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=3)
-        ax[1, 0].plot(t_in, mu_means, linewidth=2.0, color=colors['recon'], label='Reconstruction', alpha=0.9, zorder=2)
+        ax[1, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.85, zorder=3)
+        ax[1, 0].plot(t_in, mu_means, linewidth=1.5, color=colors['recon'], label='Reconstruction', alpha=0.85, zorder=2)
         
         # Add uncertainty visualization using log_var_means
         std_dev = np.exp(0.5 * log_var)  # Convert log variance to standard deviation
         ax[1, 0].fill_between(t_in, mu_means - std_dev, mu_means + std_dev, 
-                             alpha=0.25, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
+                             alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
         
-        ax[1, 0].set_ylabel('FHR (bpm)', fontweight='bold')
-        ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='bold', pad=15)
+        ax[1, 0].set_ylabel('FHR (bpm)', fontweight='normal')
+        ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='normal', pad=12)
         ax[1, 0].legend(loc='upper right', framealpha=0.95)
         ax[1, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Subplot 3: y_raw_normalized and selected mu_pr samples (handling NaN values)
         ax[2, 1].set_axis_off()
-        ax[2, 0].plot(t_in, y_raw, linewidth=2.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=2)
+        ax[2, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.85, zorder=2)
         
         # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
         selected_indices = [30, 60, 90, 120, 150, 180, 210, 240, 270]
@@ -203,28 +206,30 @@ class PlottingCallBack(Callback):
             else:
                 summed_samples[i] = 0  # or np.nan if you prefer
         
-        ax[2, 0].plot(t_in, summed_samples, linewidth=2.0, color=colors['samples'], 
-                     label='Selected Samples Sum', alpha=0.9, zorder=1)
+        ax[2, 0].plot(t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
+                     label='Selected Samples Sum', alpha=0.85, zorder=1)
         
-        ax[2, 0].set_ylabel('FHR (bpm)', fontweight='bold')
-        ax[2, 0].set_title('FHR vs Selected Sample Reconstructions', fontweight='bold', pad=15)
+        ax[2, 0].set_ylabel('FHR (bpm)', fontweight='normal')
+        ax[2, 0].set_title('FHR vs Selected Sample Reconstructions', fontweight='normal', pad=12)
         ax[2, 0].legend(loc='upper right', framealpha=0.95)
         ax[2, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Subplot 4: latent_z with imshow
-        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='plasma', 
+        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='viridis', 
                                  origin='lower', interpolation='bilinear')
         ax[3, 1].set_axis_on()
         cbar = fig.colorbar(imgplot, cax=ax[3, 1])
-        cbar.ax.tick_params(labelsize=10)
-        cbar.set_label('Activation', fontweight='bold', fontsize=11)
-        ax[3, 0].set_ylabel('Latent Dimensions', fontweight='bold')
-        ax[3, 0].set_xlabel('Time Steps', fontweight='bold')
-        ax[3, 0].set_title('Latent Space Representation', fontweight='bold', pad=15)
+        cbar.ax.tick_params(labelsize=10, colors='#666666')
+        cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
+        cbar.outline.set_color('#A2B9A7')
+        cbar.outline.set_linewidth(0.7)
+        ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
+        ax[3, 0].set_xlabel('Time Steps', fontweight='normal')
+        ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
         
-        # Set overall title with professional styling
+        # Set overall title with scientific paper styling
         fig.suptitle(f'Model Performance Analysis — Epoch {epoch}', 
-                    fontsize=18, fontweight='bold', y=0.98)
+                    fontsize=14, fontweight='normal', y=0.97, color='#456882')
         
         # Save plot as PDF with high quality
         save_path = os.path.join(self.output_dir, f'model_results_epoch_{epoch}.pdf')
