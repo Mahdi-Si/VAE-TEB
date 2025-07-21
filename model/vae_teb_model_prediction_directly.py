@@ -211,37 +211,6 @@ class CausalMultiChannelConvBlock(nn.Module):
         return output
 
 
-class MultiChannelConvBlock(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, groups=1, filter_size=3, up_sampling=False, up_sample_scale=2, tanh=False):
-        super(MultiChannelConvBlock, self).__init__()
-        self.tanh = tanh
-        self.up_sampling = up_sampling
-        self.up_sample_scale = up_sample_scale
-
-        self.filter_size = filter_size
-        padding = (filter_size - 1) // 2
-
-        self.pad = nn.ReflectionPad1d(padding)
-        self.conv = nn.Conv1d(in_channels, out_channels, groups=groups, kernel_size=filter_size, bias=False)
-        self.bn_layer = nn.BatchNorm1d(out_channels, momentum=0.9)
-
-    def forward(self, x):
-        if self.up_sampling:
-            output = F.interpolate(x, scale_factor=self.up_sample_scale, mode='linear', align_corners=False)
-        else:
-            output = x
-        output = self.pad(output)
-        output = self.conv(output)
-        output = self.bn_layer(output)
-        if self.tanh:
-            output = torch.tanh(output)
-        else:
-            output = F.relu(output)
-
-        return output
-
-
-
 class ChannelReductionBlock(nn.Module):
     """
     Efficient channel reduction block for reducing input dimensionality.
@@ -416,7 +385,7 @@ class TargetEncoder(nn.Module):
         self.mlp_scattering = nn.Sequential(
             ResidualMLP(
                 input_dim=input_channels,
-                hidden_dims=geometric_schedule(76, 32, 4),
+                hidden_dims=geometric_schedule(76, 20, 4),
                 final_activation=False,
                 use_skip_connection=True,
                 activation=nn.GELU
@@ -425,40 +394,31 @@ class TargetEncoder(nn.Module):
         
         self.mlp_phase = ResidualMLP(
             input_dim=input_channels,
-            hidden_dims=geometric_schedule(76, 32, 4),
+            hidden_dims=geometric_schedule(76, 20, 4),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.ReLU
             )
 
-        # Sequential convolutions for scattering
         self.conv_scattering = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=76, out_channels=64, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=64, out_channels=54, filter_size=7, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=54, out_channels=45, filter_size=11, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=45, out_channels=58, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=58, out_channels=32, filter_size=29, dilation=1)
+            CausalMultiChannelConvBlock(in_channels=76, out_channels=20, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=29, dilation=1),
         )
-
-        # Sequential convolutions for phase
+        
         self.conv_phase = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=76, out_channels=64, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=64, out_channels=54, filter_size=7, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=54, out_channels=45, filter_size=11, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=45, out_channels=58, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=58, out_channels=32, filter_size=29, dilation=1)
+            CausalMultiChannelConvBlock(in_channels=76, out_channels=20, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=20, out_channels=20, filter_size=29, dilation=1),
         )
-        
-        # LayerNorm for fused outputs
-        self.scatter_fused_norm = nn.LayerNorm(32)
-        self.phase_fused_norm = nn.LayerNorm(32)
-        
-        # LayerNorm for LSTM output
-        self.lstm_norm = nn.LayerNorm(lstm_hidden_dim * (2 if use_bidirectional_lstm else 1))
 
         self.cross_modal_fusion = ResidualMLP(
-            input_dim=32 * 2,  # Updated to reflect 32-channel outputs from each path
-            hidden_dims=geometric_schedule(32*2, 32, 3),  # Smaller intermediate dimensions
+            input_dim=20 * 2,  # Updated to reflect 32-channel outputs from each path
+            hidden_dims=geometric_schedule(40, 32, 3),  # Smaller intermediate dimensions
             final_activation=False,
             activation=nn.ReLU,
             use_skip_connection=True
@@ -528,18 +488,12 @@ class TargetEncoder(nn.Module):
             hidden_states["scattering_reduced"] = scatter_linear
             hidden_states["phase_reduced"] = phase_linear
 
-        # Parallel convolution processing for scattering
-        scatter_conv = self.conv_scattering(scattering_input.permute(0, 2, 1)).permute(0, 2, 1)
-        scatter_fused = scatter_linear + scatter_conv
-        # Apply LayerNorm after fusion
-        scatter_fused = self.scatter_fused_norm(scatter_fused)
+        scatter_conv = self.conv_scattering(scattering_input.permute(0, 2, 1))
+        scatter_fused = scatter_linear + scatter_conv.permute(0, 2, 1)
         del scatter_conv, scatter_linear
         
-        # Parallel convolution processing for phase
-        phase_conv = self.conv_phase(phase_harmonic_input.permute(0, 2, 1)).permute(0, 2, 1)
-        phase_fused = phase_linear + phase_conv
-        # Apply LayerNorm after fusion
-        phase_fused = self.phase_fused_norm(phase_fused)
+        phase_conv = self.conv_phase(phase_harmonic_input.permute(0, 2, 1))
+        phase_fused = phase_linear + phase_conv.permute(0, 2, 1)
         del phase_conv, phase_linear
 
         if return_hidden:
@@ -553,7 +507,6 @@ class TargetEncoder(nn.Module):
 
         # LSTM processing
         x, (hidden, cell) = self.lstm(x)  # (batch, length, channel)
-        x = self.lstm_norm(x)
 
         if return_hidden:
             hidden_states["lstm_out"] = x
@@ -636,17 +589,13 @@ class SourceEncoder(nn.Module):
             activation=nn.ReLU
             )
         
-        # Sequential convolutions for source encoder
         self.conv = nn.Sequential(
             CausalMultiChannelConvBlock(in_channels=76, out_channels=32, filter_size=3, dilation=1),
             CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1),
             CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=11, dilation=1),
             CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=29, dilation=1)
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=29, dilation=1),
         )
-        
-        self.fused_norm = nn.LayerNorm(32)
-        self.lstm_norm = nn.LayerNorm(lstm_hidden_dim)
         # Unidirectional LSTM for causal temporal encoding
         self.lstm = nn.LSTM(
             input_size=32,  # Updated to match fusion_path output
@@ -695,24 +644,18 @@ class SourceEncoder(nn.Module):
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
 
-        # Parallel convolution processing
+        # Path 2: Causal convolution with reduced channels
         conv_out = self.conv(x.permute(0, 2, 1))
-        conv_out = conv_out
-        
-        # Apply GroupNorm before fusion
 
         if return_intermediate:
             intermediates["conv_path"] = conv_out
 
         # Memory-efficient path fusion
         x = x_linear + conv_out.permute(0, 2, 1)
-        # Apply LayerNorm after fusion
-        x = self.fused_norm(x)
         del x_linear, conv_out  # Explicit cleanup
 
         # LSTM forward pass (unidirectional for causal encoding)
         x, (hidden, cell) = self.lstm(x)
-        x = self.lstm_norm(x)
 
         if return_intermediate:
             intermediates["lstm_output"] = x
@@ -833,6 +776,7 @@ class ConditionalEncoder(nn.Module):
         return mu, logvar
 
 
+
 class Decoder(nn.Module):
     """
     Simplified Raw Signal Decoder that predicts a fixed-size future window from the entire sequence.
@@ -849,67 +793,71 @@ class Decoder(nn.Module):
         latent_dim: int = 32,
         sequence_length: int = 300,
         prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
     ):
         """
         Args:
             latent_dim: Input latent dimension
             sequence_length: Input sequence length
             prediction_horizon: Number of future samples to predict (default 480 = 2 minutes at 4Hz)
+            hidden_dim: Hidden processing dimension
+            dropout: Dropout rate
         """
         super().__init__()
 
         self.latent_dim = latent_dim
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
-
+        self.hidden_dim = hidden_dim
 
         # Process latent sequence to extract temporal features
-        self.linear = nn.Sequential(
-            ResidualMLP(
+        self.linear = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, 256, 5),
+            hidden_dims=geometric_schedule(latent_dim, 256, 4),
             final_activation=True,
             use_skip_connection=True, 
-            activation=nn.ReLU,),
-            
-            ResidualMLP(
+            activation=nn.ReLU,
+        )
+
+        # LSTM to process temporal sequence
+        self.lstm = nn.LSTM(
+            input_size=latent_dim,
+            hidden_size=256,
+            num_layers=3,
+            batch_first=True,
+            bidirectional=False,
+        )
+        
+        self.conv = nn.Sequential(
+            CausalMultiChannelConvBlock(in_channels=latent_dim, out_channels=256, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=5, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=7, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=11, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=19, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=256, out_channels=256, filter_size=29, dilation=1),
+        )
+        
+        # Use only the final LSTM output (last timestep) for prediction
+        self.final_processor = ResidualMLP(
             input_dim=256,
-            hidden_dims=geometric_schedule(256, 480, 5),
+            hidden_dims=geometric_schedule(256, 360, 4),
             final_activation=True,
             activation=nn.ReLU,
             use_skip_connection=True
         )
-        )
-
-        self.conv = nn.Sequential(
-            MultiChannelConvBlock(in_channels=16, out_channels=12, filter_size=11, up_sampling=False),
-            MultiChannelConvBlock(in_channels=12, out_channels=10, filter_size=9, up_sampling=True),
-            MultiChannelConvBlock(in_channels=10, out_channels=8, filter_size=7, up_sampling=True),
-            MultiChannelConvBlock(in_channels=8, out_channels=6, filter_size=5, up_sampling=False),
-            MultiChannelConvBlock(in_channels=6, out_channels=4, filter_size=3, up_sampling=True),
-            MultiChannelConvBlock(in_channels=4, out_channels=1, filter_size=3, up_sampling=True)
-        )
         
-        self.pre_output = ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480),
-            final_activation=False,
-            use_skip_connection=False,
-            activation=nn.ReLU
-        )
-
         # Direct prediction heads for the future window
         self.output_mu = ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480, 480),
+            input_dim=360,
+            hidden_dims=geometric_schedule(360, prediction_horizon, 5),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
         )
-        
-        self.output_logvar =ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480, 480),
+        self.output_logvar = ResidualMLP(
+            input_dim=360,
+            hidden_dims=geometric_schedule(360, prediction_horizon, 5),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
@@ -926,30 +874,30 @@ class Decoder(nn.Module):
             - raw_signal_mu: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
             - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
         """
-        B, T, C = latent_z.shape
+
+        x_linear = self.linear(latent_z)
+
+        x_lstm, (hidden, cell) = self.lstm(latent_z)
         
-        x_linear = self.linear(latent_z).reshape(B, T, 16, 30)
-        B, T, C, L = x_linear.shape
-        x_linear = x_linear.reshape(B * T, C, L)
-        x_conv = self.conv(x_linear)
-        del x_linear
-        x_conv = x_conv.view(B, T, 1, -1).squeeze(2)
-        x_preoutput = self.pre_output(x_conv)
-        del x_conv
+        x_conv = self.conv(latent_z.permute(0, 2, 1))
+        
+        x = x_linear + x_lstm + x_conv.permute(0, 2, 1)
+        
+        del x_linear, x_lstm, x_conv, hidden, cell
+        timestep_features = self.final_processor(x)  # (B, S, hidden_dim * 2)
 
-        raw_mu = self.output_mu(x_preoutput)
-        raw_logvar = self.output_logvar(x_preoutput)
-
-        del x_preoutput
+        raw_mu = self.output_mu(timestep_features)
+        raw_logvar = self.output_logvar(timestep_features)  
 
         raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
+        
+        del timestep_features
 
         return raw_mu, raw_logvar
 
     @staticmethod
-    def compute_loss(
-        raw_mu_predicted: torch.Tensor, raw_logvar_predicted: torch.Tensor,
-        target_raw_signal: torch.Tensor, warmup_period: int = 30):
+    def compute_loss(raw_mu_predicted: torch.Tensor, raw_logvar_predicted: torch.Tensor,
+                     target_raw_signal: torch.Tensor, warmup_period: int = 30):
         B, S, prediction_horizon = raw_mu_predicted.shape
         raw_signal_length = target_raw_signal.shape[1]
         decimation_factor = 16
@@ -1048,7 +996,11 @@ class SeqVaeTeb(nn.Module):
             dim_hy=latent_dim_target,
             dim_z=latent_dim_z,
         )
-        self.decoder = Decoder()
+        self.decoder = Decoder(
+            latent_dim=latent_dim_z,
+            sequence_length=sequence_length,
+            prediction_horizon=480,
+        )
 
         initialization(self)
 
@@ -1172,8 +1124,8 @@ class SeqVaeTeb(nn.Module):
         """
         x: (B, N, C)
         returns:
-            y:      (B, N, new_C)  — with NaNs where no data was placed
-            mean:   (B, new_C)      — nan-mean over dim=1
+          y:      (B, N, new_C)  — with NaNs where no data was placed
+          mean:   (B, new_C)      — nan-mean over dim=1
         """
         B, N, C = x.shape
         y = x.new_full((B, N, new_C), float('nan'))
@@ -1221,25 +1173,25 @@ if __name__ == "__main__":
     # )
 
     # decoder test: --------------------------------------------------------------
-    model = Decoder()
-    mu, logvar = model(
-        torch.randn(batch_size, seq_len, 32),
-    )
+    # model = Decoder()
+    # mu, logvar = model(
+    #     torch.randn(batch_size, seq_len, 32),
+    # )
     
-    # Test VAE model: ------------------------------------------------------------
-    # model = SeqVaeTeb(
-    #     input_channels=channels,
-    #     sequence_length=seq_len,
-    #     decimation_factor=16,
-    #     warmup_period=warmup_period,
-    # )
-    # forward_outputs = model(
-    #     y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
-    # )
-    # prd_x_mu = model.get_average_predictions(forward_outputs['mu_pr'])
-    # prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
-    # loss = model.compute_loss(forward_outputs, y_raw_input)
-    # print('done')
+    # Test VAE model:
+    model = SeqVaeTeb(
+        input_channels=channels,
+        sequence_length=seq_len,
+        decimation_factor=16,
+        warmup_period=warmup_period,
+    )
+    forward_outputs = model(
+        y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
+    )
+    prd_x_mu = model.get_average_predictions(forward_outputs['mu_pr'])
+    prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
+    loss = model.compute_loss(forward_outputs, y_raw_input)
+    print('done')
     #
     # except Exception as e:
     #     import traceback
