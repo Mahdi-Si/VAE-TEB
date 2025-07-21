@@ -46,7 +46,7 @@ torch.backends.cudnn.benchmark = True
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYDEVD_USE_CYTHON']="NO"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "7"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"   # set to 1 only in debugging 
 
 matplotlib.use('Agg')
 
@@ -268,11 +268,11 @@ class SeqVAEGraphModel:
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
         logger.info('==' * 50)
         
-        # Log initial GPU memory status
-        log_gpu_memory_usage("Initial setup")
+        # Log initial GPU memory status - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("Initial setup")
         
-        # Clear any residual GPU memory
-        clear_gpu_memory()
+        # Clear any residual GPU memory - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # clear_gpu_memory()
         
         # Reset memory statistics
         if torch.cuda.is_available():
@@ -373,8 +373,8 @@ class SeqVAEGraphModel:
         """
         logger.info("Setting up trainer for the base model...")
         
-        # Log memory before setting up training
-        log_gpu_memory_usage("Before training setup")
+        # Log memory before setting up training - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("Before training setup")
 
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
@@ -384,11 +384,11 @@ class SeqVAEGraphModel:
 
         self.metrics_callback = MetricsLoggingCallback()
 
-        # Optimized memory monitoring for smaller batch sizes
-        self.memory_monitor_callback = MemoryMonitorCallback(
-            threshold_gb=6.0,  # Lower threshold for aggressive cleanup
-            log_frequency=50   # More frequent monitoring
-        )
+        # Optimized memory monitoring for smaller batch sizes - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # self.memory_monitor_callback = MemoryMonitorCallback(
+        #     threshold_gb=6.0,  # Lower threshold for aggressive cleanup
+        #     log_frequency=50   # More frequent monitoring
+        # )
 
         # Callback for early stopping to prevent overfitting
         self.early_stop_callback = EarlyStopping(
@@ -437,15 +437,15 @@ class SeqVAEGraphModel:
 
         callbacks_list = [
             ModelSummary(max_depth=-1),
-            self.memory_monitor_callback,
+            # self.memory_monitor_callback,  # COMMENTED OUT FOR MULTI-GPU PERFORMANCE
             self.plotting_callback,
             self.checkpoint_callback,
             self.loss_plot_callback,
             self.early_stop_callback,
         ]
 
-        # Log memory after callback setup
-        log_gpu_memory_usage("After callback setup")
+        # Log memory after callback setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("After callback setup")
 
         # Instantiate the PyTorch Lightning Trainer with memory optimizations
         trainer = L.Trainer(
@@ -477,41 +477,41 @@ class SeqVAEGraphModel:
             enable_model_summary=False,  # Disable to save memory
         )
 
-        # Log memory after trainer setup
-        log_gpu_memory_usage("After trainer setup")
+        # Log memory after trainer setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("After trainer setup")
 
         # Find optimal learning rate
-        # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
-        # tuner = Tuner(trainer)
-        #
-        # # Run learning rate finder
-        # lr_finder = tuner.lr_find(
-        #     self.lightning_base_model,
-        #     train_dataloaders=train_loader,
-        #     val_dataloaders=validation_loader
-        # )
-        #
-        # # Get suggestion and update model
-        # if lr_finder and lr_finder.suggestion():
-        #     new_lr = lr_finder.suggestion()
-        #     self.lightning_base_model.hparams.lr = new_lr
-        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-        #     logger.info(f"Found new optimal learning rate: {new_lr}")
-        #
-        #     # Plot results
-        #     fig = lr_finder.plot(suggest=True)
-        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-        #     fig.savefig(plot_path)
-        #     plt.close(fig)
-        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
-        #
-        #     # Clean up lr_finder to free memory
-        #     del lr_finder, fig
-        # else:
-        #     logger.warning("Could not find a new learning rate. Using the one from config.")
+        logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
+        tuner = Tuner(trainer)
 
-        # Log memory before training starts
-        log_gpu_memory_usage("Before training starts")
+        # Run learning rate finder
+        lr_finder = tuner.lr_find(
+            self.lightning_base_model,
+            train_dataloaders=train_loader,
+            val_dataloaders=validation_loader
+        )
+
+        # Get suggestion and update model
+        if lr_finder and lr_finder.suggestion():
+            new_lr = lr_finder.suggestion()
+            self.lightning_base_model.hparams.lr = new_lr
+            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+            logger.info(f"Found new optimal learning rate: {new_lr}")
+
+            # Plot results
+            fig = lr_finder.plot(suggest=True)
+            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+            fig.savefig(plot_path)
+            plt.close(fig)
+            logger.info(f"Learning rate finder plot saved to {plot_path}")
+
+            # Clean up lr_finder to free memory
+            del lr_finder, fig
+        else:
+            logger.warning("Could not find a new learning rate. Using the one from config.")
+
+        # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("Before training starts")
 
         logger.info(f"Starting training of the base model for {self.epochs_num} epochs.")
         trainer.fit(
@@ -521,8 +521,8 @@ class SeqVAEGraphModel:
         )
         logger.info("Finished training the base model.")
 
-        # Log memory after training completes
-        log_gpu_memory_usage("After training completes")
+        # Log memory after training completes - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("After training completes")
 
         # Save training history
         training_hist = self.loss_plot_callback.history

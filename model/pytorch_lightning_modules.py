@@ -441,50 +441,20 @@ class LightSeqVaeTeb(L.LightningModule):
             # This can happen if the optimizer is not yet configured
             pass
 
-        # Clear GPU cache at the start of each epoch - device-aware
-        if torch.cuda.is_available():
-            device_count = torch.cuda.device_count()
-            for device_id in range(device_count):
-                with torch.cuda.device(device_id):
-                    torch.cuda.empty_cache()
-
     def _common_step(self, batch, batch_idx):
-        """Optimized common logic for training and validation steps with aggressive memory management."""
+        """Optimized common logic for training and validation steps - removed aggressive memory management for multi-GPU."""
         # Access data using correct HDF5 dataset field names
         y_st = batch.fhr_st.permute(0, 2, 1)  # Scattering transform features
         y_ph = batch.fhr_ph.permute(0, 2, 1)  # Phase harmonic features
         x_ph = batch.fhr_up_ph.permute(0, 2, 1)  # Cross-phase features
         y_raw = batch.fhr  # Raw signal for reconstruction
 
-        # Use gradient checkpointing for forward pass to save memory
-        if self.training:
-            forward_outputs = torch.utils.checkpoint.checkpoint(
-                self.model, y_st, y_ph, x_ph, use_reentrant=False
-            )
-        else:
-            forward_outputs = self.model(y_st, y_ph, x_ph)
+        # Remove gradient checkpointing for multi-GPU training (causes DDP issues)
+        forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
             forward_outputs, y_raw, compute_kld_loss=True
         )
-
-        # Aggressive cleanup to free memory immediately
-        del y_st, y_ph, x_ph, y_raw
-
-        # Clean up forward outputs except what's needed for loss
-        if isinstance(forward_outputs, dict):
-            keys_to_keep = set()  # Don't keep anything after loss computation
-            for key in list(forward_outputs.keys()):
-                if key not in keys_to_keep:
-                    if key in forward_outputs:
-                        del forward_outputs[key]
-
-        # Force garbage collection on every 10th step
-        if batch_idx % 10 == 0:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         return loss_dict
 
@@ -518,30 +488,13 @@ class LightSeqVaeTeb(L.LightningModule):
         return total_loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Optimized cleanup after each training batch."""
-        # More aggressive memory management for training
-        if batch_idx % 5 == 0 and torch.cuda.is_available():  # More frequent clearing
-            current_device = torch.cuda.current_device()
-            with torch.cuda.device(current_device):
-                torch.cuda.empty_cache()
-
-        # Clean up batch references
+        """Minimal cleanup after each training batch - removed frequent cache clearing for multi-GPU."""
+        # Only clean up batch references - no cache clearing for better multi-GPU performance
         del batch
 
-        # Periodic garbage collection
-        if batch_idx % 20 == 0:
-            import gc
-            gc.collect()
-
     def on_validation_batch_end(self, outputs, batch, batch_idx):
-        """Optimized cleanup after each validation batch."""
-        # Aggressive validation cleanup
-        if batch_idx % 3 == 0 and torch.cuda.is_available():  # More frequent for validation
-            current_device = torch.cuda.current_device()
-            with torch.cuda.device(current_device):
-                torch.cuda.empty_cache()
-
-        # Clean up batch references
+        """Minimal cleanup after each validation batch - removed frequent cache clearing for multi-GPU."""
+        # Only clean up batch references - no cache clearing for better multi-GPU performance
         del batch
 
     def configure_optimizers(self):
@@ -577,9 +530,10 @@ class LightSeqVaeTeb(L.LightningModule):
 class MemoryMonitorCallback(Callback):
     """
     Callback to monitor GPU memory usage and automatically clear cache when needed.
+    Optimized for multi-GPU training with reduced monitoring frequency.
     """
 
-    def __init__(self, threshold_gb=10.0, log_frequency=50):
+    def __init__(self, threshold_gb=12.0, log_frequency=200):
         """
         Args:
             threshold_gb (float): GPU memory threshold in GB above which cache is cleared.
@@ -640,6 +594,8 @@ class MemoryMonitorCallback(Callback):
         self._log_memory_usage(f"Epoch {trainer.current_epoch} start")
 
     def on_train_epoch_end(self, trainer, pl_module):
-        """Clear memory and log usage at the end of each epoch."""
+        """Log usage at the end of each epoch - reduced cache clearing for multi-GPU."""
         self._log_memory_usage(f"Epoch {trainer.current_epoch} end")
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # Only clear cache at epoch end, not during training for better multi-GPU performance
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
