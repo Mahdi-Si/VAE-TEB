@@ -1,5 +1,5 @@
 general_config:
-  tag: test_runs___qqq
+  tag: conv_and_conv
   cuda_devices: [0]
   train_classifier: False
   lr: 0.01

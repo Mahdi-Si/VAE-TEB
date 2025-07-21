@@ -72,8 +72,15 @@ class PlottingCallBack(Callback):
                 logvar_pr, log_var_means = pl_module.model.get_predictions(model_outputs['logvar_pr'])
                 
                 # Plot results
-                self._plot_results(y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means, 
-                                 mu_pr, logvar_pr, latent_z, pl_trainer.current_epoch)
+                self._plot_results(
+                    y_raw_normalized,
+                    up_raw_normalized,
+                    mu_pr_means,
+                    log_var_means,
+                    mu_pr,
+                    logvar_pr,
+                    latent_z,
+                    pl_trainer.current_epoch)
                 
 
 
@@ -84,8 +91,9 @@ class PlottingCallBack(Callback):
         finally:
             pl_module.train()
 
-    def _plot_results(self, y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means, 
-                     mu_pr, logvar_pr, latent_z, epoch):
+    def _plot_results(
+        self, y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means,
+        mu_pr, logvar_pr, latent_z, epoch):
         """Plot model results with 4 subplots following the style of plot_forward_pass"""
         import os
         import gc
@@ -109,12 +117,12 @@ class PlottingCallBack(Callback):
         
         # Professional scientific paper color palette
         colors = {
-            'fhr': '#1B3C53',           # Deep blue-gray
-            'up': '#4A9782',            # Sage green
+            'fhr': "#055C9A",           # Deep blue-gray
+            'up': "#0DD8A2",            # Sage green
             'gt': '#456882',            # Medium blue-gray
             'recon': '#BB3E00',         # Deep orange-red
             'uncertainty': '#F7AD45',    # Golden yellow
-            'samples': '#657C6A',       # Muted green-gray
+            'samples': "#4BD605",       # Muted green-gray
             'background': '#F9F3EF'     # Warm off-white
         }
         
@@ -127,9 +135,9 @@ class PlottingCallBack(Callback):
             'axes.titlesize': 12,
             'axes.labelsize': 11,
             'axes.linewidth': 0.7,
-            'axes.edgecolor': '#666666',
+            'axes.edgecolor': "#9E9D9D",
             'axes.facecolor': colors['background'],
-            'grid.color': '#D2C1B6',
+            'grid.color': "#838383",
             'grid.linewidth': 0.4,
             'grid.alpha': 0.6,
             'legend.frameon': True,
@@ -178,7 +186,7 @@ class PlottingCallBack(Callback):
         # Add uncertainty visualization using log_var_means
         std_dev = np.exp(0.5 * log_var)  # Convert log variance to standard deviation
         ax[1, 0].fill_between(t_in, mu_means - std_dev, mu_means + std_dev, 
-                             alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
+                                alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
         
         ax[1, 0].set_ylabel('FHR (bpm)', fontweight='normal')
         ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='normal', pad=12)
@@ -215,8 +223,7 @@ class PlottingCallBack(Callback):
         ax[2, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Subplot 4: latent_z with imshow
-        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='viridis', 
-                                 origin='lower', interpolation='bilinear')
+        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='viridis', origin='lower', interpolation='bilinear')
         ax[3, 1].set_axis_on()
         cbar = fig.colorbar(imgplot, cax=ax[3, 1])
         cbar.ax.tick_params(labelsize=10, colors='#666666')
@@ -233,8 +240,7 @@ class PlottingCallBack(Callback):
         
         # Save plot as PDF with high quality
         save_path = os.path.join(self.output_dir, f'model_results_epoch_{epoch}.pdf')
-        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', 
-                   dpi=300, facecolor='white', edgecolor='none')
+        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=300, facecolor='white', edgecolor='none')
         plt.close(fig)
         
         # Clean up memory
@@ -369,17 +375,18 @@ class LightSeqVaeTeb(L.LightningModule):
     including learning rate scheduling and KLD beta annealing.
     """
 
-    def __init__(self,
-                 seqvae_teb_model: SeqVaeTeb,
-                 lr: float = 1e-4,
-                 lr_milestones: list = None,
-                 beta_schedule: str = "linear",
-                 beta_start: float = 0.0,
-                 beta_end: float = 1.0,
-                 beta_anneal_epochs: int = 100,
-                 beta_cycle_len: int = 1000,
-                 beta_const_val: float = 1.0
-                 ):
+    def __init__(
+        self,
+        seqvae_teb_model: SeqVaeTeb,
+        lr: float = 1e-4,
+        lr_milestones: list = None,
+        beta_schedule: str = "linear",
+        beta_start: float = 0.0,
+        beta_end: float = 1.0,
+        beta_anneal_epochs: int = 100,
+        beta_cycle_len: int = 1000,
+        beta_const_val: float = 1.0
+        ):
         """
         Args:
             seqvae_teb_model: An instance of the SeqVaeTeb model.

@@ -30,8 +30,9 @@ class KymatioPhaseScattering1D(nn.Module):
             A value between 0.1 and 0.25 is a good starting point. Defaults to None.
     """
     
-    def __init__(self, J, Q, T, shape, device=None, oversampling=0, max_order=2, 
-                 border_mode='reflect', tukey_alpha=None):
+    def __init__(
+        self, J, Q, T, shape, device=None, oversampling=0, max_order=2, 
+        border_mode='reflect', tukey_alpha=None):
         super().__init__()
         self.J = J
         
