@@ -210,35 +210,47 @@ class CausalMultiChannelConvBlock(nn.Module):
         
         return output
 
-
 class MultiChannelConvBlock(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, groups=1, filter_size=3, up_sampling=False, up_sample_scale=2, tanh=False):
-        super(MultiChannelConvBlock, self).__init__()
+    def __init__(
+        self, in_channels=1, out_channels=1, groups=1,
+        filter_size=3, up_sampling=False, up_sample_scale=2,
+        tanh=False):
+        super().__init__()
         self.tanh = tanh
         self.up_sampling = up_sampling
-        self.up_sample_scale = up_sample_scale
-
+        self.up_scale = up_sample_scale
         self.filter_size = filter_size
-        padding = (filter_size - 1) // 2
+        self.padding = (filter_size - 1) // 2
 
-        self.pad = nn.ReflectionPad1d(padding)
-        self.conv = nn.Conv1d(in_channels, out_channels, groups=groups, kernel_size=filter_size, bias=False)
-        self.bn_layer = nn.BatchNorm1d(out_channels, momentum=0.9)
+        self.conv = nn.Conv1d(
+            in_channels, out_channels,
+            kernel_size=filter_size,
+            groups=groups, bias=False)
+        self.bn_layer  = nn.BatchNorm1d(out_channels, momentum=0.9)
 
     def forward(self, x):
         if self.up_sampling:
-            output = F.interpolate(x, scale_factor=self.up_sample_scale, mode='linear', align_corners=False)
-        else:
-            output = x
-        output = self.pad(output)
-        output = self.conv(output)
-        output = self.bn_layer(output)
-        if self.tanh:
-            output = torch.tanh(output)
-        else:
-            output = F.relu(output)
+            x = F.interpolate(
+                x, scale_factor=self.up_scale,
+                mode='linear', align_corners=False)
 
-        return output
+        p = self.padding
+        if p > 0:
+            if x.shape[-1] <= p:
+                # too-short fallback: still safe on CUDA
+                x = F.pad(x, (p, p), mode='replicate')
+            else:
+                # manual reflect-pad:
+                #   left  = reverse of x[..., 1 : p+1]
+                #   right = reverse of x[..., -p-1 : -1]
+                left  = x[..., 1 : p+1].flip(dims=[-1])
+                right = x[..., -p-1 : -1].flip(dims=[-1])
+                x = torch.cat([left, x, right], dim=-1)
+
+        x = self.conv(x)
+        x = self.bn_layer(x)
+        return torch.tanh(x) if self.tanh else F.relu(x)
+
 
 
 
