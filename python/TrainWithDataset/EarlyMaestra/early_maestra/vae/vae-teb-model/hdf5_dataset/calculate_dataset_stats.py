@@ -15,12 +15,18 @@ class DatasetStatsCalculator:
     """
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
     
+    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+    - FHR scattering: 45 coefficients (first order, channel 0 regular, others log-transformed)
+    - FHR phase: 44 selected coefficients (all asinh-transformed)
+    - FHR-UP cross-phase: 130 selected coefficients (all asinh-transformed)
+    
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
     
-    For scattering coefficients:
-    - Order 0 coefficients (typically channel 0 of fhr_st): regular normalization
-    - Order 1+ coefficients (remaining channels): log normalization with log(x + 1e-6)
+    Transformation strategy:
+    - fhr_st (45 channels): channel 0 regular, channels 1-44 log-transformed  
+    - fhr_ph (44 channels): all asinh-transformed for phase stability
+    - fhr_up_ph (130 channels): all asinh-transformed for cross-phase correlation
     """
     
     def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
@@ -41,15 +47,16 @@ class DatasetStatsCalculator:
             self.trim_samples_raw = 0
             self.trim_samples_decimated = 0
         
-        # Define which channels should use LOG normalization.
+        # Define transformations for optimal coefficient selection
+        # LOG normalization for scattering coefficients (except order 0)
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # Special keyword
+            'fhr_st': 'all_except_0',  # 44 of 45 scattering coefficients (exclude channel 0)
         }
         
-        # Define which channels should use hyperbolic sine (asinh) normalization.
+        # ASINH normalization for phase coefficients (better for phase data)
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',    # All channels for fhr_ph
-            'fhr_up_ph': 'all'  # All channels for fhr_up_ph
+            'fhr_ph': 'all',    # All 44 selected phase coefficients
+            'fhr_up_ph': 'all'  # All 130 selected cross-phase coefficients
         }
         
     def _initialize_stats(self, field_shapes: Dict[str, Tuple[int, ...]]) -> Dict[str, Dict[str, Any]]:
@@ -388,7 +395,7 @@ class DatasetStatsCalculator:
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
-            f.attrs['description'] = 'Statistics calculated with log transformation for order 1+ scattering coefficients'
+            f.attrs['description'] = 'Statistics for optimal coefficient selection: 45 scattering (log), 44 phase (asinh), 130 cross-phase (asinh)'
             
             # Save statistics for each field
             for field, field_stats in stats.items():
@@ -515,9 +522,10 @@ class DatasetStatsCalculator:
         print("\n" + "="*60)
         print("DATASET STATISTICS SUMMARY")
         print("="*60)
-        print("Note: Some scattering coefficients use log- or asinh-transformed statistics")
-        print("Log transformation: log(x + 1e-6)")
-        print("Asinh transformation: asinh(x)")
+        print("Note: Optimal coefficient selection with specialized transformations:")
+        print("- FHR scattering (45 ch): channel 0 regular, others log(x + 1e-6)")
+        print("- FHR phase (44 ch): all asinh(x) transformed")
+        print("- FHR-UP cross-phase (130 ch): all asinh(x) transformed")
         
         for field, field_stats in stats.items():
             print(f"\n{field.upper()}:")
@@ -898,7 +906,7 @@ if __name__ == "__main__":
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            'description': 'Statistics with log/asinh transformation for scattering coefficients'
+            'description': 'Statistics for optimal coefficient selection (J=11, Q=4, T=16): 219 total features'
         },
         trim_minutes=2,
         device=device
