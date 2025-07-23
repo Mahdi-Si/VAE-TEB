@@ -414,17 +414,24 @@ def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, fil
 
             st_input = torch.from_numpy(np.stack([fhr, up], axis=1)).float().to(device)
             
-            # Compute all coefficients in one pass for efficiency
-            st_results = st_model(x=st_input,
-                                  compute_phase=True,
-                                  compute_cross_phase=True,
-                                  scattering_channel=0,
-                                  phase_channels=[0, 1])
+            # Compute scattering and phase coefficients (FHR channel only)
+            st_results_phase = st_model(x=st_input,
+                                        compute_phase=True,
+                                        compute_cross_phase=False,
+                                        scattering_channel=0,
+                                        phase_channels=[0])
             
-            # Extract and apply optimal coefficient selection
-            fhr_st = st_results.get('scattering')  # Use all scattering coefficients (first order)
-            fhr_st_phase_full = st_results.get('phase_corr')
-            fhr_up_cc_phase_full = st_results.get('cross_phase_corr')
+            # Compute cross-channel phase coefficients (FHR-UP)
+            st_results_cross = st_model(x=st_input,
+                                        compute_phase=False,
+                                        compute_cross_phase=True,
+                                        scattering_channel=0,
+                                        phase_channels=[0, 1])
+            
+            # Extract coefficients
+            fhr_st = st_results_phase.get('scattering')  # Use all scattering coefficients (first order)
+            fhr_st_phase_full = st_results_phase.get('phase_corr')
+            fhr_up_cc_phase_full = st_results_cross.get('cross_phase_corr')
             
             # Apply optimal selection masks to reduce coefficients
             fhr_st_phase = fhr_st_phase_full[:, phase_mask, :] if fhr_st_phase_full is not None else None
