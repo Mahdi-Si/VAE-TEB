@@ -349,9 +349,10 @@ def create_cv_splits(
 # ----------------------------------------------------------------------------------------------------------------------
 # Dataset creation method
 #-----------------------------------------------------------------------------------------------------------------------
-def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, file_limit=-1,
-                                          base_block_size=3840, save_name=None, min_domain_start=None,
-                                          cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=0.5):
+def create_hdf5_dataset_from_records_list(
+    hdf5_path=None, records_list=None, file_limit=-1,
+    base_block_size=3840, save_name=None, min_domain_start=None,
+    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=0.5):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -376,16 +377,18 @@ def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, fil
         counter_rec += 1
         logger.info(f'The count is  --------->  {counter_rec}')
         try:
-            mimo_adaptor = EarlyMaestraMimoAdaptor(do_transpose=True,
-                                                   process_targets=True,
-                                                   n_aux_labels=None,
-                                                   signal_indices=range(0, 2),
-                                                   n_input_chan=2,
-                                                   labels=["HIE", "ACIDOSIS", "HEALTHY"],
-                                                   # labels=["HIE", "ACIDOSIS"],
-                                                   )
-            mimo_adaptor.read_single_input(record, out_dec_factor=16, out_dec_factor_offset=0, target_is_onehot=True,
-                                           dtype=np.float32)
+            mimo_adaptor = EarlyMaestraMimoAdaptor(
+                do_transpose=True,
+                process_targets=True,
+                n_aux_labels=None,
+                signal_indices=range(0, 2),
+                n_input_chan=2,
+                labels=["HIE", "ACIDOSIS", "HEALTHY"],
+                # labels=["HIE", "ACIDOSIS"],
+                )
+            mimo_adaptor.read_single_input(
+                record, out_dec_factor=16, out_dec_factor_offset=0, target_is_onehot=True,
+                dtype=np.float32)
             mimo_prepared, n_padded = mimo_adaptor.mimo.prepare_data(
                 batch_size=1, do_evaluate=True, align_left=True,
                 do_split=True,
@@ -434,8 +437,8 @@ def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, fil
             fhr_up_cc_phase_full = st_results_cross.get('cross_phase_corr')
             
             # Apply optimal selection masks to reduce coefficients
-            fhr_st_phase = fhr_st_phase_full[:, phase_mask, :] if fhr_st_phase_full is not None else None
-            fhr_up_cc_phase = fhr_up_cc_phase_full[:, cross_mask, :] if fhr_up_cc_phase_full is not None else None
+            fhr_ph = fhr_st_phase_full[:, phase_mask, :] if fhr_st_phase_full is not None else None
+            fhr_up_ph = fhr_up_cc_phase_full[:, cross_mask, :] if fhr_up_cc_phase_full is not None else None
             # ===========================================
             # Testing the overlap plot:
 
@@ -485,18 +488,19 @@ def create_hdf5_dataset_from_records_list(hdf5_path=None, records_list=None, fil
                     # plot_stacked_channels(fhr_up_cc_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_up_ph_chs_{os.path.splitext(os.path.split(record)[1])}.png")
                     # # plotting for test =============================================================================================================================================
 
-                    append_sample(path=hdf5_path,
-                                  fhr=fhr[i, :],
-                                  up=up[i, :],
-                                  fhr_st=fhr_st[i, :, :].detach().cpu().numpy(),
-                                  fhr_ph=fhr_st_phase[i, :, :].detach().cpu().numpy(),
-                                  fhr_up_ph=fhr_up_cc_phase[i, :, :].detach().cpu().numpy(),
-                                  target=pre_defined_target * sample_weights[i, :],
-                                  weight=sample_weights[i, :],
-                                  guid=record_name[0],
-                                  epoch=domain_starts[i],
-                                  bg_label=bg_label,
-                                  cs_label=cs_label)
+                    append_sample(
+                        path=hdf5_path,
+                        fhr=fhr[i, :],
+                        up=up[i, :],
+                        fhr_st=fhr_st[i, :, :].detach().cpu().numpy(),
+                        fhr_ph=fhr_ph[i, :, :].detach().cpu().numpy(),
+                        fhr_up_ph=fhr_up_ph[i, :, :].detach().cpu().numpy(),
+                        target=pre_defined_target * sample_weights[i, :],
+                        weight=sample_weights[i, :],
+                        guid=record_name[0],
+                        epoch=domain_starts[i],
+                        bg_label=bg_label,
+                        cs_label=cs_label)
 
         except Exception as e:
             errors_list.append(record)
@@ -615,11 +619,12 @@ def create_records(records_base_path_ = None, output_base_path_ = None):
     # Calculate optimal number of channels based on coefficient selection
     total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
     create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
-    create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_train,
-                                          hdf5_path=pre_training_dataset,
-                                          cs_label=True,
-                                          bg_label=True,
-                                          pre_defined_target=1)
+    create_hdf5_dataset_from_records_list(
+        records_list=healthy_bg_cs_files_vae_train,
+        hdf5_path=pre_training_dataset,
+        cs_label=True,
+        bg_label=True,
+        pre_defined_target=1)
 
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
     # Calculate optimal number of channels based on coefficient selection
