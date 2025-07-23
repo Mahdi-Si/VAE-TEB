@@ -16,7 +16,7 @@ class DatasetStatsCalculator:
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
     
     Updated for optimal coefficient selection (J=11, Q=4, T=16):
-    - FHR scattering: 45 coefficients (first order, channel 0 regular, others log-transformed)
+    - FHR scattering: 43 coefficients (first order, channel 0 regular, others log-transformed)
     - FHR phase: 44 selected coefficients (all asinh-transformed)
     - FHR-UP cross-phase: 130 selected coefficients (all asinh-transformed)
     
@@ -24,7 +24,7 @@ class DatasetStatsCalculator:
     that may not fit entirely in memory.
     
     Transformation strategy:
-    - fhr_st (45 channels): channel 0 regular, channels 1-44 log-transformed  
+    - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed  
     - fhr_ph (44 channels): all asinh-transformed for phase stability
     - fhr_up_ph (130 channels): all asinh-transformed for cross-phase correlation
     """
@@ -50,7 +50,7 @@ class DatasetStatsCalculator:
         # Define transformations for optimal coefficient selection
         # LOG normalization for scattering coefficients (except order 0)
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # 44 of 45 scattering coefficients (exclude channel 0)
+            'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude channel 0)
         }
         
         # ASINH normalization for phase coefficients (better for phase data)
@@ -395,7 +395,7 @@ class DatasetStatsCalculator:
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
-            f.attrs['description'] = 'Statistics for optimal coefficient selection: 45 scattering (log), 44 phase (asinh), 130 cross-phase (asinh)'
+            f.attrs['description'] = 'Statistics for optimal coefficient selection: 43 scattering (log), 44 phase (asinh), 130 cross-phase (asinh)'
             
             # Save statistics for each field
             for field, field_stats in stats.items():
@@ -523,7 +523,7 @@ class DatasetStatsCalculator:
         print("DATASET STATISTICS SUMMARY")
         print("="*60)
         print("Note: Optimal coefficient selection with specialized transformations:")
-        print("- FHR scattering (45 ch): channel 0 regular, others log(x + 1e-6)")
+        print("- FHR scattering (43 ch): channel 0 regular, others log(x + 1e-6)")
         print("- FHR phase (44 ch): all asinh(x) transformed")
         print("- FHR-UP cross-phase (130 ch): all asinh(x) transformed")
         
@@ -906,7 +906,7 @@ if __name__ == "__main__":
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            'description': 'Statistics for optimal coefficient selection (J=11, Q=4, T=16): 219 total features'
+            'description': 'Statistics for optimal coefficient selection (J=11, Q=4, T=16): 217 total features'
         },
         trim_minutes=2,
         device=device
