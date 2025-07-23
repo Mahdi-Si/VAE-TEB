@@ -481,7 +481,7 @@ def print_detailed_analysis(analysis: Dict):
 if __name__ == "__main__":
     # Your specific parameters
     J = 11
-    Q = 1
+    Q = 4
     T = 16
     sampling_rate = 4.0  # Hz
     signal_duration_minutes = 20.0  # minutes

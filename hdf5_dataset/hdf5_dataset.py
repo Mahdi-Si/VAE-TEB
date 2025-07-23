@@ -147,7 +147,7 @@ def create_initial_hdf5(
     Create a new HDF5 file with empty, resizable datasets for signal storage.
     
     Updated for optimal coefficient selection (J=11, Q=4, T=16):
-    - FHR scattering: 45 coefficients (first order only)
+    - FHR scattering: 43 coefficients (first order only)
     - FHR phase: 44 coefficients (95.1% reduction from optimal selection)
     - FHR-UP cross-phase: 130 coefficients (UP→FHR coupling)
     - Total phase/cross-phase channels: 174
@@ -155,7 +155,7 @@ def create_initial_hdf5(
     Datasets created (first dim unlimited):
       - "fhr"       : float32, shape (N, len_signal)
       - "up"        : float32, shape (N, len_signal)
-      - "fhr_st"    : float32, shape (N, 45, len_sequence) - Scattering coefficients
+      - "fhr_st"    : float32, shape (N, 43, len_sequence) - Scattering coefficients
       - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
       - "fhr_up_ph" : float32, shape (N, 130, len_sequence) - Selected cross-phase coefficients
       - "target"    : float32, shape (N, len_sequence)
@@ -189,10 +189,10 @@ def create_initial_hdf5(
             dtype="f4", chunks=(1, len_signal), compression="lzf"
         )
         # Create datasets with optimal channel counts
-        # fhr_st: 45 scattering coefficients (first order)
+        # fhr_st: 43 scattering coefficients (first order)
         h5f.create_dataset(
-            "fhr_st", shape=(0, 45, len_sequence), maxshape=(None, 45, len_sequence),
-            dtype="f4", chunks=(1, 45, len_sequence), compression="lzf"
+            "fhr_st", shape=(0, 43, len_sequence), maxshape=(None, 43, len_sequence),
+            dtype="f4", chunks=(1, 43, len_sequence), compression="lzf"
         )
         # fhr_ph: 44 selected phase coefficients  
         h5f.create_dataset(
@@ -297,7 +297,7 @@ class CombinedHDF5Dataset(Dataset):
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
     
     Updated for optimal coefficient selection (J=11, Q=4, T=16):
-    - FHR scattering: 45 coefficients (first order)
+    - FHR scattering: 43 coefficients (first order)
     - FHR phase: 44 selected coefficients (95.1% reduction)
     - FHR-UP cross-phase: 130 selected coefficients (UP→FHR coupling)
     
@@ -380,7 +380,7 @@ class CombinedHDF5Dataset(Dataset):
         # Define which channels should use LOG normalization for optimal coefficients.
         # Updated for optimal coefficient selection (44 phase + 130 cross-phase channels).
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # 44 of 45 scattering coefficients (exclude order 0)
+            'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude order 0)
         }
         self.asinh_norm_channels_config = {
             'fhr_ph': 'all',     # All 44 selected phase coefficients
