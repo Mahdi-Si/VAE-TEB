@@ -145,13 +145,19 @@ def create_initial_hdf5(
 ) -> None:
     """
     Create a new HDF5 file with empty, resizable datasets for signal storage.
+    
+    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+    - FHR scattering: 45 coefficients (first order only)
+    - FHR phase: 44 coefficients (95.1% reduction from optimal selection)
+    - FHR-UP cross-phase: 130 coefficients (UP→FHR coupling)
+    - Total phase/cross-phase channels: 174
 
     Datasets created (first dim unlimited):
       - "fhr"       : float32, shape (N, len_signal)
       - "up"        : float32, shape (N, len_signal)
-      - "fhr_st"    : float32, shape (N, n_channels, len_sequence)
-      - "fhr_ph"    : float32, shape (N, n_channels, len_sequence)
-      - "fhr_up_ph" : float32, shape (N, n_channels, len_sequence)
+      - "fhr_st"    : float32, shape (N, 45, len_sequence) - Scattering coefficients
+      - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
+      - "fhr_up_ph" : float32, shape (N, 130, len_sequence) - Selected cross-phase coefficients
       - "target"    : float32, shape (N, len_sequence)
       - "weight"    : float32, shape (N, len_sequence)
       - "epoch"     : float32, shape (N,)
@@ -164,7 +170,7 @@ def create_initial_hdf5(
     Args:
         path:         Path to output HDF5 file (overwrites if exists).
         len_signal:   Length of raw signal arrays (e.g. 4800).
-        n_channels:   Number of channels in scattering/ph arrays.
+        n_channels:   Number of channels in combined phase/cross-phase arrays (174).
         len_sequence: Length of sequence dimension (default: 300).
     """
     try:
@@ -182,11 +188,22 @@ def create_initial_hdf5(
             "up", shape=(0, len_signal), maxshape=(None, len_signal),
             dtype="f4", chunks=(1, len_signal), compression="lzf"
         )
-        for name in ("fhr_st", "fhr_ph", "fhr_up_ph"):  # scattering/phase
-            h5f.create_dataset(
-                name, shape=(0, n_channels, len_sequence), maxshape=(None, n_channels, len_sequence),
-                dtype="f4", chunks=(1, n_channels, len_sequence), compression="lzf"
-            )
+        # Create datasets with optimal channel counts
+        # fhr_st: 45 scattering coefficients (first order)
+        h5f.create_dataset(
+            "fhr_st", shape=(0, 45, len_sequence), maxshape=(None, 45, len_sequence),
+            dtype="f4", chunks=(1, 45, len_sequence), compression="lzf"
+        )
+        # fhr_ph: 44 selected phase coefficients  
+        h5f.create_dataset(
+            "fhr_ph", shape=(0, 44, len_sequence), maxshape=(None, 44, len_sequence),
+            dtype="f4", chunks=(1, 44, len_sequence), compression="lzf"
+        )
+        # fhr_up_ph: 130 selected cross-phase coefficients
+        h5f.create_dataset(
+            "fhr_up_ph", shape=(0, 130, len_sequence), maxshape=(None, 130, len_sequence),
+            dtype="f4", chunks=(1, 130, len_sequence), compression="lzf"
+        )
         h5f.create_dataset(
             "target", shape=(0, len_sequence), maxshape=(None, len_sequence),
             dtype="f4", chunks=(1, len_sequence), compression="lzf"
@@ -279,12 +296,17 @@ class CombinedHDF5Dataset(Dataset):
     """
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
     
+    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+    - FHR scattering: 45 coefficients (first order)
+    - FHR phase: 44 selected coefficients (95.1% reduction)
+    - FHR-UP cross-phase: 130 selected coefficients (UP→FHR coupling)
+    
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
     - Multi-worker data loading
     - Memory efficiency and fast I/O
     - Advanced filtering and selective loading
-    - Data normalization using precomputed statistics with log transformation for scattering coefficients
+    - Data normalization using precomputed statistics with optimal coefficient selection
     
     Args:
         paths: Path(s) to HDF5 file(s).
@@ -355,14 +377,14 @@ class CombinedHDF5Dataset(Dataset):
         self.normalization_stats: Optional[Dict[str, Dict[str, Any]]] = None
         self.normalization_enabled = False
         
-        # Define which channels should use LOG normalization.
-        # This configuration should ideally match the one in DatasetStatsCalculator.
+        # Define which channels should use LOG normalization for optimal coefficients.
+        # Updated for optimal coefficient selection (44 phase + 130 cross-phase channels).
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',
+            'fhr_st': 'all_except_0',  # 44 of 45 scattering coefficients (exclude order 0)
         }
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',
-            'fhr_up_ph': 'all'
+            'fhr_ph': 'all',     # All 44 selected phase coefficients
+            'fhr_up_ph': 'all'   # All 130 selected cross-phase coefficients
         }
         
         # This will be populated from the stats file, but the config above provides a fallback.
