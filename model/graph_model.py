@@ -40,8 +40,11 @@ from pytorch_lightning_modules import LightSeqVaeTeb
 
 from torch.optim.lr_scheduler import MultiStepLR
 
-# Add this line to enable cuDNN benchmark
+# SPEED OPTIMIZATION: Enable cuDNN benchmarking and other optimizations for maximum training speed
 torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
+torch.backends.cudnn.allow_tf32 = True  # Enable TF32 on Ampere GPUs for speed
+torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matrix operations
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -324,6 +327,14 @@ class SeqVAEGraphModel:
                 decimation_factor=16,
                 warmup_period=30,
             )
+            
+            # SPEED OPTIMIZATION: Compile model for faster execution (PyTorch 2.0+)
+            try:
+                self.base_model = torch.compile(self.base_model, mode='max-autotune')
+                logger.info("Model successfully compiled with torch.compile for maximum speed")
+            except Exception as e:
+                logger.warning(f"torch.compile failed, proceeding without compilation: {e}")
+            
             self.lightning_base_model = LightSeqVaeTeb(
                 seqvae_teb_model=self.base_model,
                 lr=self.lr,
@@ -1434,14 +1445,16 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # Set num_workers to 0 to avoid multiprocessing pickling issues on Windows
-        num_workers = 0  # Changed from dataloader_config.get('num_workers', 4)
+        # Optimized num_workers for maximum throughput - use 8-12 workers per GPU
+        cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
+        num_workers = min(12, max(8, cuda_device_count * 4))  # 8-12 workers per GPU
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
         # For distributed training, rank and world_size are now correctly set
         # before this point. The dataloader will use a DistributedSampler if world_size > 1.
         
+        # SPEED OPTIMIZED: Enhanced dataloader with prefetching and pinned memory
         train_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_train_datasets'],
             batch_size=config['general_config']['batch_size']['train'],
@@ -1450,18 +1463,24 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=4,  # Speed optimization
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
-        # For validation, we also use a distributed sampler so all GPUs are utilized.
+        # SPEED OPTIMIZED: Enhanced validation dataloader with prefetching
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=num_workers,
+            num_workers=max(4, num_workers // 2),  # Fewer workers for validation
             rank=rank,
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=2,  # Speed optimization for validation
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
@@ -1477,15 +1496,18 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
-        # Create test dataloader
+        # SPEED OPTIMIZED: Enhanced test dataloader
         test_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=num_workers,
+            num_workers=max(4, num_workers // 2),  # Fewer workers for testing
             rank=0,
             world_size=1,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=2,  # Speed optimization
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
@@ -1567,14 +1589,16 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # Set num_workers to 0 to avoid multiprocessing pickling issues on Windows
-        num_workers = 0  # Changed from dataloader_config.get('num_workers', 4)
+        # Optimized num_workers for maximum throughput - use 8-12 workers per GPU
+        cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
+        num_workers = min(12, max(8, cuda_device_count * 4))  # 8-12 workers per GPU
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
         # For distributed training, rank and world_size are now correctly set
         # before this point. The dataloader will use a DistributedSampler if world_size > 1.
         
+        # SPEED OPTIMIZED: Enhanced dataloader with prefetching and pinned memory
         train_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_train_datasets'],
             batch_size=config['general_config']['batch_size']['train'],
@@ -1583,18 +1607,24 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=4,  # Speed optimization
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
-        # For validation, we also use a distributed sampler so all GPUs are utilized.
+        # SPEED OPTIMIZED: Enhanced validation dataloader with prefetching
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=num_workers,
+            num_workers=max(4, num_workers // 2),  # Fewer workers for validation
             rank=rank,
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=2,  # Speed optimization for validation
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
@@ -1611,15 +1641,18 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
-        # Create test dataloader
+        # SPEED OPTIMIZED: Enhanced test dataloader
         test_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=num_workers,
+            num_workers=max(4, num_workers // 2),  # Fewer workers for testing
             rank=0,
             world_size=1,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
+            pin_memory=True,  # Speed optimization
+            prefetch_factor=2,  # Speed optimization
+            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 

@@ -62,9 +62,11 @@ class PlottingCallBack(Callback):
                     return
 
                 logger.info("Accessing batch data...")
-                y_st, y_ph, x_ph = batch.fhr_st.permute(0, 2, 1), batch.fhr_ph.permute(0, 2, 1), batch.fhr_up_ph.permute(0, 2, 1)
-                y_raw_normalized = batch.fhr
-                up_raw_normalized = batch.up
+                # SPEED OPTIMIZATION: Data now comes pre-permuted from dataset - no permute needed
+                # Optimized dataloader provides tensors in (batch, sequence, channels) format:
+                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph  # All (B, seq, channels)
+                y_raw_normalized = batch.fhr  # (B, 4800)
+                up_raw_normalized = batch.up  # (B, 4800)
 
                 model_outputs = pl_module.model(y_st, y_ph, x_ph)
                 latent_z = model_outputs['z']
@@ -81,8 +83,8 @@ class PlottingCallBack(Callback):
                     up_raw_normalized,
                     mu_pr_means,
                     log_var_means,
-                    mu_pr_raw.unsqueeze(1),  # Add dummy time dimension for compatibility
-                    logvar_pr_raw.unsqueeze(1),  # Add dummy time dimension for compatibility
+                    mu_pr_raw,  # Remove unsqueeze since we'll handle this in plotting
+                    logvar_pr_raw,  # Remove unsqueeze since we'll handle this in plotting
                     latent_z,
                     pl_trainer.current_epoch)
                 
@@ -110,8 +112,13 @@ class PlottingCallBack(Callback):
         up_raw = up_raw_normalized[batch_idx].cpu().numpy()  # Shape: (4800,)
         mu_means = mu_pr_means[batch_idx].cpu().numpy()  # Shape: (4800,)
         log_var = log_var_means[batch_idx].cpu().numpy()  # Shape: (4800,)
-        mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
-        logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
+        # Handle the case where mu_pr and logvar_pr are now (B, 4800) instead of (B, 300, 4800)
+        if len(mu_pr.shape) == 2:  # (B, 4800) format
+            mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (4800,)
+            logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (4800,)
+        else:  # (B, 300, 4800) format (legacy)
+            mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
+            logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
         z_latent = latent_z[batch_idx].cpu().numpy()  # Shape: (300, 32)
         
         # Setup plotting parameters following the style from data_utils
@@ -197,32 +204,42 @@ class PlottingCallBack(Callback):
         ax[1, 0].legend(loc='upper right', framealpha=0.95)
         ax[1, 0].autoscale(enable=True, axis='x', tight=True)
         
-        # Subplot 3: y_raw_normalized and selected mu_pr samples (handling NaN values)
+        # Subplot 3: y_raw_normalized and mu_pr samples
         ax[2, 1].set_axis_off()
         ax[2, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.85, zorder=2)
         
-        # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
-        selected_indices = [30, 60, 90, 120, 150, 180, 210, 240, 270]
-        
-        # Handle NaN values and sum selected samples
-        selected_samples = mu_samples[selected_indices, :]  # Shape: (9, 4800)
-        
-        # Remove NaN values and compute mean
-        valid_mask = ~np.isnan(selected_samples)
-        summed_samples = np.zeros(4800)
-        
-        for i in range(4800):
-            valid_values = selected_samples[:, i][valid_mask[:, i]]
-            if len(valid_values) > 0:
-                summed_samples[i] = np.sum(valid_values)
+        # Handle different formats of mu_samples
+        if len(mu_samples.shape) == 1:  # (4800,) format - single prediction
+            ax[2, 0].plot(t_in, mu_samples, linewidth=1.5, color=colors['samples'], 
+                         label='Model Prediction', alpha=0.85, zorder=1)
+        else:  # (300, 4800) format - multiple predictions
+            # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
+            selected_indices = [idx for idx in [30, 60, 90, 120, 150, 180, 210, 240, 270] if idx < mu_samples.shape[0]]
+            
+            if selected_indices:
+                # Handle NaN values and sum selected samples
+                selected_samples = mu_samples[selected_indices, :]  # Shape: (len(selected_indices), 4800)
+                
+                # Remove NaN values and compute mean
+                valid_mask = ~np.isnan(selected_samples)
+                summed_samples = np.zeros(4800)
+                
+                for i in range(4800):
+                    valid_values = selected_samples[:, i][valid_mask[:, i]]
+                    if len(valid_values) > 0:
+                        summed_samples[i] = np.sum(valid_values)
+                    else:
+                        summed_samples[i] = 0
+                
+                ax[2, 0].plot(t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
+                             label='Selected Samples Sum', alpha=0.85, zorder=1)
             else:
-                summed_samples[i] = 0  # or np.nan if you prefer
-        
-        ax[2, 0].plot(t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
-                     label='Selected Samples Sum', alpha=0.85, zorder=1)
+                # Fallback to first sample if no valid indices
+                ax[2, 0].plot(t_in, mu_samples[0, :], linewidth=1.5, color=colors['samples'], 
+                             label='First Sample', alpha=0.85, zorder=1)
         
         ax[2, 0].set_ylabel('FHR (bpm)', fontweight='normal')
-        ax[2, 0].set_title('FHR vs Selected Sample Reconstructions', fontweight='normal', pad=12)
+        ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
         ax[2, 0].legend(loc='upper right', framealpha=0.95)
         ax[2, 0].autoscale(enable=True, axis='x', tight=True)
         
@@ -247,8 +264,12 @@ class PlottingCallBack(Callback):
         plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=300, facecolor='white', edgecolor='none')
         plt.close(fig)
         
-        # Clean up memory
-        del y_raw, up_raw, mu_means, log_var, mu_samples, logvar_samples, z_latent
+        # Clean up memory  
+        del y_raw, up_raw, mu_means, log_var, z_latent
+        if 'mu_samples' in locals():
+            del mu_samples
+        if 'logvar_samples' in locals():
+            del logvar_samples
         gc.collect()
         
         logger.info(f"Model results plot saved to {save_path}")
@@ -448,14 +469,16 @@ class LightSeqVaeTeb(L.LightningModule):
             pass
 
     def _common_step(self, batch, batch_idx):
-        """Optimized common logic for training and validation steps - removed aggressive memory management for multi-GPU."""
-        # Access data using correct HDF5 dataset field names
-        y_st = batch.fhr_st.permute(0, 2, 1)  # Scattering transform features
-        y_ph = batch.fhr_ph.permute(0, 2, 1)  # Phase harmonic features
-        x_ph = batch.fhr_up_ph.permute(0, 2, 1)  # Cross-phase features
-        y_raw = batch.fhr  # Raw signal for reconstruction
+        """SPEED OPTIMIZED: Removed expensive permute operations - data comes pre-permuted from dataset."""
+        # SPEED OPTIMIZATION: Data now comes in the correct format from the optimized dataset
+        # No expensive permute operations needed - significant speedup!
+        # Optimized dataloader provides tensors in model-ready format:
+        y_st = batch.fhr_st    # Scattering transform features (batch, sequence, channels) - ready for model
+        y_ph = batch.fhr_ph    # Phase harmonic features (batch, sequence, channels) - ready for model
+        x_ph = batch.fhr_up_ph # Cross-phase features (batch, sequence, channels) - ready for model
+        y_raw = batch.fhr      # Raw signal for reconstruction (batch, sequence_length)
 
-        # Remove gradient checkpointing for multi-GPU training (causes DDP issues)
+        # Forward pass without gradient checkpointing for speed
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
