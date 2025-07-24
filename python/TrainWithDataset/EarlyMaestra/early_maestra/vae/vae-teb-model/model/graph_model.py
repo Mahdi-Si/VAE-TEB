@@ -489,40 +489,66 @@ class SeqVAEGraphModel:
         )
 
         # Log memory after trainer setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("After trainer setup")
+        log_gpu_memory_usage("After trainer setup")
+
+        # Find optimal batch size first
+        logger.info("Finding optimal batch size using PyTorch Lightning's tuner...")
+        tuner = Tuner(trainer)
+        
+        try:
+            # Use the built-in batch size finder
+            optimal_batch_size = tuner.scale_batch_size(
+                self.lightning_base_model,
+                train_dataloaders=train_loader,
+                val_dataloaders=validation_loader,
+                mode='power',  # Use 'power' mode (doubles batch size) or 'binary' for binary search
+                init_val=self.batch_size_train,
+                max_trials=10,
+                batch_arg_name=None  # We'll handle batch size manually
+            )
+            
+            if optimal_batch_size and optimal_batch_size != self.batch_size_train:
+                logger.info(f"Found optimal batch size: {optimal_batch_size} (was {self.batch_size_train})")
+                # Note: You would need to recreate dataloaders with new batch size
+                # For now, we'll log the suggestion but keep using current batch size
+                logger.info("Continuing with current batch size. Consider updating config for next run.")
+            else:
+                logger.info(f"Current batch size {self.batch_size_train} appears optimal")
+                
+        except Exception as e:
+            logger.warning(f"Batch size finding failed: {e}. Using configured batch size {self.batch_size_train}")
 
         # Find optimal learning rate
-        # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
-        # tuner = Tuner(trainer)
+        logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
 
-        # # Run learning rate finder
-        # lr_finder = tuner.lr_find(
-        #     self.lightning_base_model,
-        #     train_dataloaders=train_loader,
-        #     val_dataloaders=validation_loader
-        # )
+        # Run learning rate finder
+        lr_finder = tuner.lr_find(
+            self.lightning_base_model,
+            train_dataloaders=train_loader,
+            val_dataloaders=validation_loader
+        )
 
-        # # Get suggestion and update model
-        # if lr_finder and lr_finder.suggestion():
-        #     new_lr = lr_finder.suggestion()
-        #     self.lightning_base_model.hparams.lr = new_lr
-        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-        #     logger.info(f"Found new optimal learning rate: {new_lr}")
+        # Get suggestion and update model
+        if lr_finder and lr_finder.suggestion():
+            new_lr = lr_finder.suggestion()
+            self.lightning_base_model.hparams.lr = new_lr
+            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+            logger.info(f"Found new optimal learning rate: {new_lr}")
 
-        #     # Plot results
-        #     fig = lr_finder.plot(suggest=True)
-        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-        #     fig.savefig(plot_path)
-        #     plt.close(fig)
-        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
+            # Plot results
+            fig = lr_finder.plot(suggest=True)
+            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+            fig.savefig(plot_path)
+            plt.close(fig)
+            logger.info(f"Learning rate finder plot saved to {plot_path}")
 
-        #     # Clean up lr_finder to free memory
-        #     del lr_finder, fig
-        # else:
-        #     logger.warning("Could not find a new learning rate. Using the one from config.")
+            # Clean up lr_finder to free memory
+            del lr_finder, fig
+        else:
+            logger.warning("Could not find a new learning rate. Using the one from config.")
 
         # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("Before training starts")
+        log_gpu_memory_usage("Before training starts")
 
         logger.info(f"Starting training of the base model for {self.epochs_num} epochs.")
         trainer.fit(
