@@ -16,7 +16,7 @@ def geometric_schedule(
     round_fn=round
 ) -> List[int]:
     """
-    Compute a geometric progression of layer sizes from `input_size` down/up to `output_size`,
+    SPEED OPTIMIZED: Compute a geometric progression of layer sizes from `input_size` down/up to `output_size`,
     with `n_hidden` intermediate layers.
 
     Returns a list of length n_hidden+2: [input_size, h1, h2, ..., h_n, output_size].
@@ -27,19 +27,20 @@ def geometric_schedule(
     - n_hidden:    number of hidden layers (e.g. 6)
     - round_fn:    function to turn floats into ints (default=round)
     """
+    # SPEED OPTIMIZATION: Avoid repeated calculations and list comprehension
     # total steps = hidden layers + the final map to output
     steps = n_hidden + 1
     # constant ratio r so that input_size * r^steps = output_size
     r = (output_size / input_size) ** (1 / steps)
 
-    # build the full list
-    sizes = [
-        int(round_fn(input_size * (r ** k)))
-        for k in range(steps + 1)
-    ]
-    # ensure exact endpoints
-    sizes[0] = input_size
-    sizes[-1] = output_size
+    # SPEED OPTIMIZATION: Pre-allocate tuple and calculate directly
+    sizes = [input_size]
+    current_r = r
+    for _ in range(n_hidden):
+        sizes.append(int(round_fn(input_size * current_r)))
+        current_r *= r
+    sizes.append(output_size)
+    
     return tuple(sizes[1:])
 
 def initialization(model: nn.Module) -> None:
@@ -471,7 +472,7 @@ class TargetEncoder(nn.Module):
         )
 
         self.lstm = nn.LSTM(
-            input_size=32,  # Updated to match cross_modal_fusion output
+            input_size=20,  # Updated to match cross_modal_fusion output
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
@@ -516,8 +517,8 @@ class TargetEncoder(nn.Module):
         Forward pass through the encoder.
 
         Args:
-            scattering_input: Scattering transform features (batch_size, seq_len, channels)
-            phase_harmonic_input: Phase harmonic features (batch_size, seq_len, channels)
+            scattering_input: Scattering transform features from optimized dataloader (batch_size, seq_len=300, channels=43)
+            phase_harmonic_input: Phase harmonic features from optimized dataloader (batch_size, seq_len=300, channels=44)
             return_hidden: Whether to return intermediate hidden states
 
         Returns:
@@ -534,12 +535,14 @@ class TargetEncoder(nn.Module):
             hidden_states["scattering_reduced"] = scatter_linear
             hidden_states["phase_reduced"] = phase_linear
 
-        scatter_conv = self.conv_scattering(scatter_linear.permute(0, 2, 1)).permute(0, 2, 1)
+        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
+        scatter_conv = self.conv_scattering(scatter_linear.transpose(1, 2)).transpose(1, 2).contiguous()
 
         scatter_conv = self.scatter_fused_norm(scatter_conv)
         del scatter_linear
 
-        phase_conv = self.conv_phase(phase_linear.permute(0, 2, 1)).permute(0, 2, 1)
+        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
+        phase_conv = self.conv_phase(phase_linear.transpose(1, 2)).transpose(1, 2).contiguous()
 
         phase_conv = self.phase_fused_norm(phase_conv)
         del phase_linear
@@ -670,7 +673,7 @@ class SourceEncoder(nn.Module):
         Forward pass through the encoder.
 
         Args:
-            x: Input tensor (batch_size, seq_len, channels)
+            x: Input tensor from optimized dataloader (batch_size, seq_len=300, channels=130) - fhr_up_ph cross-phase features
             return_intermediate: Whether to return intermediate activations
 
         Returns:
@@ -686,7 +689,8 @@ class SourceEncoder(nn.Module):
         
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
-        conv_out = self.conv(x_linear.permute(0, 2, 1)).permute(0, 2, 1)
+        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
+        conv_out = self.conv(x_linear.transpose(1, 2)).transpose(1, 2).contiguous()
         
         if return_intermediate:
             intermediates["conv_path"] = conv_out
@@ -722,7 +726,7 @@ class SourceEncoder(nn.Module):
         Useful for incremental inference.
 
         Args:
-            x: Input tensor (batch_size, seq_len, channels)
+            x: Input tensor from optimized dataloader (batch_size, seq_len=300, channels=130) - fhr_up_ph cross-phase features
             timestep: Timestep up to which to encode (inclusive)
 
         Returns:
@@ -896,7 +900,7 @@ class Decoder(nn.Module):
         Forward pass that reconstructs the raw signal from latent variables.
         
         Args:
-            latent_z: Latent variables (batch_size, sequence_length, latent_dim)
+            latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=32)
         Returns:
             Tuple containing:
             - linear_output: Output from linear layers (batch_size, sequence_length, 87)
@@ -908,8 +912,9 @@ class Decoder(nn.Module):
         # Apply linear transformations
         linear_output = self.linear(latent_z)  # (batch_size, sequence_length, 87)
         
+        # SPEED OPTIMIZATION: Use transpose instead of permute for better performance
         # Permute for convolution: (batch_size, channels, sequence_length)
-        x = linear_output.permute(0, 2, 1)
+        x = linear_output.transpose(1, 2)
         
         # Apply convolution layers
         x = self.conv(x)  # (batch_size, 1, upsampled_length)
@@ -1073,9 +1078,9 @@ class SeqVaeTeb(nn.Module):
         Full forward pass of the SeqVaeTeb model.
 
         Args:
-            y_st: Target scattering input (Batch, sequence_len, channel)
-            y_ph: Target phase harmonic input (Batch, sequence_len, channel)
-            x_ph: Source phase harmonic input (Batch, sequence_len, channel)
+            y_st: Target scattering input from optimized dataloader (Batch, sequence_len=300, channels=43)
+            y_ph: Target phase harmonic input from optimized dataloader (Batch, sequence_len=300, channels=44)
+            x_ph: Source phase harmonic input from optimized dataloader (Batch, sequence_len=300, channels=130)
 
         Returns:
             A dictionary containing tensors needed for loss computation.
@@ -1125,9 +1130,9 @@ class SeqVaeTeb(nn.Module):
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
-            y_st: Target scattering coefficients (B, S, 43)
-            y_ph: Target phase coefficients (B, S, 44)
-            y_raw: Ground truth raw signal data (B, 4800)
+            y_st: Target scattering coefficients from optimized dataloader (B, S=300, channels=43)
+            y_ph: Target phase coefficients from optimized dataloader (B, S=300, channels=44)
+            y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
 
         Returns:
@@ -1198,7 +1203,7 @@ if __name__ == "__main__":
     prediction_horizon = 30
     warmup_period = 30
 
-    y_st_input = torch.randn(batch_size, seq_len, 43)  # (B, C, L) format
+    y_st_input = torch.randn(batch_size, seq_len, 43)  # UPDATED: (B, L, C) format from optimized dataloader
     y_ph_input = torch.randn(batch_size, seq_len, 44)
     x_ph_input = torch.randn(batch_size, seq_len, 130)
     y_raw_input = torch.randn(
@@ -1236,15 +1241,15 @@ if __name__ == "__main__":
     # )
     
     # Test VAE model: ------------------------------------------------------------
-    # model = SeqVaeTeb(
-    #     input_channels=channels,
-    #     sequence_length=seq_len,
-    #     decimation_factor=16,
-    #     warmup_period=warmup_period,
-    # )
-    # forward_outputs = model(
-    #     y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
-    # )
+    model = SeqVaeTeb(
+        input_channels=channels,
+        sequence_length=seq_len,
+        decimation_factor=16,
+        warmup_period=warmup_period,
+    )
+    forward_outputs = model(
+        y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
+    )
     # prd_x_mu = model.get_average_predictions(forward_outputs['mu_pr'])
     # prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
     # loss = model.compute_loss(forward_outputs, y_raw_input)

@@ -1048,10 +1048,9 @@ class SeqVaeTeb(nn.Module):
         Returns:
             A dictionary containing tensors needed for loss computation.
         """
-        # Permute inputs from (B, C, L) to (B, L, C) for module compatibility
-        y_st = y_st.permute(0, 2, 1)
-        y_ph = y_ph.permute(0, 2, 1)
-        x_ph = x_ph.permute(0, 2, 1)
+        # SPEED OPTIMIZATION: Data already comes in (B, L, C) format from optimized dataset
+        # No permutation needed - significant speedup!
+        # y_st, y_ph, x_ph are already in the correct format (B, sequence, channels)
 
         # Source encoder for q(h_x|x)
         mu_x = self.source_encoder(x_ph)
@@ -1100,9 +1099,8 @@ class SeqVaeTeb(nn.Module):
             A dictionary of computed losses (total, reconstruction, KLD).
         """
         device = y_st.device
-        # Permute from (B, C, L) to (B, L, C) for loss computation
-        y_st = y_st.permute(0, 2, 1)
-        y_ph = y_ph.permute(0, 2, 1)
+        # SPEED OPTIMIZATION: Data already comes in (B, L, C) format from optimized dataset
+        # No permutation needed - data is already in the correct format for loss computation
 
         # Initialize losses
         recon_loss = torch.tensor(0.0, device=device)

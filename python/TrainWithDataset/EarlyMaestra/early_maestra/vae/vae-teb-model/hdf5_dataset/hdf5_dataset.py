@@ -753,6 +753,11 @@ class CombinedHDF5Dataset(Dataset):
                         name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']):
                         tensor = self._normalize_data(name, tensor)
                     
+                    # SPEED OPTIMIZATION: Apply permutation here once instead of multiple times in training
+                    # Convert from HDF5 format (channels, sequence) to model format (sequence, channels)
+                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph'] and tensor.dim() == 2:
+                        tensor = tensor.transpose(0, 1)  # (channels, seq) -> (seq, channels)
+                    
                     out[name] = tensor
                     
         except Exception as e:
