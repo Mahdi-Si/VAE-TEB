@@ -682,10 +682,35 @@ class DatasetStatsCalculator:
                     else:
                         warnings.warn(f"Unexpected tensor shape for {field}: {data_tensor.shape}")
 
+                    # Create device-compatible stats - ensure tensors are created on the correct device
+                    device_compatible_stats = {}
+                    for stat_field, stat_data in stats.items():
+                        device_compatible_stats[stat_field] = {}
+                        for key, value in stat_data.items():
+                            device_compatible_stats[stat_field][key] = value
+                        
+                        # Pre-create mean_tensor and std_tensor on the correct device
+                        if stat_field in ['fhr', 'up']:
+                            device_compatible_stats[stat_field]['mean_tensor'] = torch.tensor(
+                                stat_data['mean'], dtype=torch.float32, device=self.device
+                            )
+                            device_compatible_stats[stat_field]['std_tensor'] = torch.tensor(
+                                np.sqrt(stat_data['variance']), dtype=torch.float32, device=self.device
+                            )
+                        else:
+                            mean_array = np.array(stat_data['mean'], dtype=np.float32)
+                            std_array = np.array(np.sqrt(stat_data['variance']), dtype=np.float32)
+                            device_compatible_stats[stat_field]['mean_tensor'] = torch.from_numpy(mean_array).to(
+                                dtype=torch.float32, device=self.device
+                            ).unsqueeze(-1)
+                            device_compatible_stats[stat_field]['std_tensor'] = torch.from_numpy(std_array).to(
+                                dtype=torch.float32, device=self.device
+                            ).unsqueeze(-1)
+                    
                     normalized_tensor = normalize_tensor_data(
                         data=data_tensor,
                         field_name=field,
-                        normalization_stats=stats,
+                        normalization_stats=device_compatible_stats,
                         log_norm_channels_config=self.log_norm_channels_config,
                         asinh_norm_channels_config=self.asinh_norm_channels_config,
                         log_epsilon=1e-6,
@@ -851,10 +876,13 @@ def calculate_and_save_dataset_stats(
     metadata: Optional[Dict[str, Any]] = None,
     progress_bar: bool = True,
     trim_minutes: Optional[float] = None,
-    device: Optional[str] = None
+    device: Optional[str] = None,
+    plot_histograms: bool = True,
+    histograms_dir: Optional[str] = None,
+    max_histogram_samples: int = 50000
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Convenience function to calculate and save dataset statistics.
+    Convenience function to calculate and save dataset statistics and plot histograms.
     
     Args:
         hdf5_files: List of paths to HDF5 dataset files
@@ -864,6 +892,9 @@ def calculate_and_save_dataset_stats(
         progress_bar: Whether to show progress bars
         trim_minutes: Optional trimming time in minutes
         device: The device to use for calculation (e.g., 'cpu', 'cuda:0'). Autodetects if None.
+        plot_histograms: Whether to generate histogram plots
+        histograms_dir: Directory to save histogram plots (defaults to same dir as output_path)
+        max_histogram_samples: Maximum number of samples to use for histogram plotting
         
     Returns:
         Dictionary containing calculated statistics
@@ -873,7 +904,8 @@ def calculate_and_save_dataset_stats(
         >>> stats = calculate_and_save_dataset_stats(
         ...     hdf5_files, 
         ...     'dataset_stats.h5',
-        ...     metadata={'description': 'Training dataset statistics'}
+        ...     metadata={'description': 'Training dataset statistics'},
+        ...     plot_histograms=True
         ... )
     """
     calculator = DatasetStatsCalculator(trim_minutes=trim_minutes, device=device)
@@ -891,15 +923,36 @@ def calculate_and_save_dataset_stats(
     metadata['trim_minutes'] = trim_minutes
     calculator.save_stats(stats, output_path, metadata)
     
+    # Plot histograms if requested
+    if plot_histograms:
+        if histograms_dir is None:
+            # Default to same directory as output file
+            histograms_dir = os.path.dirname(output_path)
+            if not histograms_dir:
+                histograms_dir = '.'
+            histograms_dir = os.path.join(histograms_dir, 'histograms')
+        
+        print(f"\n--- Generating Histograms (all channels) ---")
+        plot_dataset_histograms(
+            hdf5_files=hdf5_files,
+            save_path=histograms_dir,
+            max_channels=None,  # Plot all channels
+            max_samples=max_histogram_samples,
+            bins=50,
+            trim_minutes=trim_minutes,
+            device=device
+        )
+    
     return stats
 
 
 if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    input_files = [r"C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5"]
-    output_file = r'C:\Users\mahdi\Desktop\McGill\data\data\stats.hdf5'
-    # Calculate and save stats
+    input_files = [r"C:\Users\mahdi\Desktop\teb_vae_model\hdf5_dataset\train_dataset_cs.hdf5"]
+    output_file = r'C:\Users\mahdi\Desktop\teb_vae_model\output\stats.hdf5'
+    
+    # Calculate and save stats with histogram plotting enabled
     stats = calculate_and_save_dataset_stats(
         input_files,
         output_file,
@@ -909,24 +962,16 @@ if __name__ == "__main__":
             'description': 'Statistics for optimal coefficient selection (J=11, Q=4, T=16): 217 total features'
         },
         trim_minutes=2,
-        device=device
+        device=device,
+        plot_histograms=True,  # Enable histogram plotting
+        max_histogram_samples=50000
     )
+    
+    # Verify saved stats by reloading
     calculator = DatasetStatsCalculator(device=device)
     loaded_stats = calculator.load_stats(output_file)
     print("\n--- Verifying saved stats by reloading and printing summary ---")
     calculator.print_stats_summary(loaded_stats)
-
-    # Plot histograms
-    # print("\n--- Generating Histograms ---")
-    # plot_dataset_histograms(
-    #     hdf5_files=args.input_files,
-    #     save_path=args.histograms_dir,
-    #     max_channels=76,
-    #     max_samples=50000,
-    #     bins=50,
-    #     trim_minutes=args.trim_minutes,
-    #     device=args.device
-    # )
 
     print("\nScript finished successfully.")
     
