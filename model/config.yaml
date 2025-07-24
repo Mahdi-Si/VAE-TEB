@@ -41,10 +41,10 @@ folders_config:
 
 dataset_config:
     vae_train_datasets:
-      - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5
     vae_test_datasets:
-      - C:\Users\mahdi\Desktop\McGill\data\data\hie_cs.hdf5
-    stat_path: C:\Users\mahdi\Desktop\McGill\data\data\stats.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5
+    stat_path: C:\Users\mahdi\Desktop\McGill\data\stats.hdf5
     dataloader_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
@@ -58,7 +58,6 @@ dataset_config:
         epoch_max: null
         label: null
         cache_size: 2000
-        pin_memory: true
         trim_minutes: 2.0  # how much to trim from start and end of the signal
 
 seqvae_testing:
