@@ -856,7 +856,7 @@ class Decoder(nn.Module):
             activation=nn.ReLU,),
             
             ResidualMLP(
-            input_dim=256,
+            input_dim=50,
             hidden_dims=geometric_schedule(50, 87, 5),
             final_activation=True,
             activation=nn.ReLU,
@@ -883,7 +883,7 @@ class Decoder(nn.Module):
             activation=nn.ReLU
         )
         
-        self.output_logvar =ResidualMLP(
+        self.output_logvar = ResidualMLP(
             input_dim=4800,
             hidden_dims=(4800, 4800),
             final_activation=False,
@@ -1022,12 +1022,10 @@ class SeqVaeTeb(nn.Module):
         self.warmup_period = warmup_period
 
         self.source_encoder = SourceEncoder(
-            input_channels=input_channels,
             sequence_length=sequence_length,
             latent_dim=latent_dim_source,
         )
         self.target_encoder = TargetEncoder(
-            input_channels=input_channels,
             sequence_length=sequence_length,
             latent_dim=latent_dim_target,
         )

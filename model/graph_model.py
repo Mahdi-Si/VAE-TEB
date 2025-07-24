@@ -621,7 +621,7 @@ class SeqVAEGraphModel:
             
             train_loss_dict = {
                 'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kld_loss': 0.0,
-                'raw_signal_loss': 0.0
+                'mse_loss': 0.0, 'nll_loss': 0.0
             }
             
             # --- Training Loop ---
@@ -674,11 +674,13 @@ class SeqVAEGraphModel:
                 # Accumulate losses for logging
                 reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
                 kld_loss_item = loss_dict['kld_loss'].item()
-                raw_signal_loss_item = loss_dict['raw_signal_loss'].item()
+                mse_loss_item = loss_dict['mse_loss'].item()
+                nll_loss_item = loss_dict['nll_loss'].item()
 
                 train_loss_dict['reconstruction_loss'] += reconstruction_loss_item
                 train_loss_dict['kld_loss'] += kld_loss_item
-                train_loss_dict['raw_signal_loss'] += raw_signal_loss_item
+                train_loss_dict['mse_loss'] += mse_loss_item
+                train_loss_dict['nll_loss'] += nll_loss_item
                 train_loss_dict['total_loss'] += total_loss.item()
                 
                 # Update progress bar
@@ -697,7 +699,7 @@ class SeqVAEGraphModel:
             model.eval()
             val_loss_dict = {
                 'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kld_loss': 0.0,
-                'raw_signal_loss': 0.0
+                'mse_loss': 0.0, 'nll_loss': 0.0
             }
             with torch.no_grad():
                 val_progress_bar = tqdm(validation_loader, desc=f"Epoch {epoch+1}/{self.epochs_num} [Val]", disable=(rank != 0))
@@ -726,12 +728,14 @@ class SeqVAEGraphModel:
                     # Accumulate losses
                     reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
                     kld_loss_item = loss_dict['kld_loss'].item()
-                    raw_signal_loss_item = loss_dict['raw_signal_loss'].item()
+                    mse_loss_item = loss_dict['mse_loss'].item()
+                    nll_loss_item = loss_dict['nll_loss'].item()
                     current_total_loss = loss_dict['total_loss'].item()
 
                     val_loss_dict['reconstruction_loss'] += reconstruction_loss_item
                     val_loss_dict['kld_loss'] += kld_loss_item
-                    val_loss_dict['raw_signal_loss'] += raw_signal_loss_item
+                    val_loss_dict['mse_loss'] += mse_loss_item
+                    val_loss_dict['nll_loss'] += nll_loss_item
                     val_loss_dict['total_loss'] += current_total_loss
 
                     if rank == 0:
@@ -777,11 +781,13 @@ class SeqVAEGraphModel:
                 logger.info(
                     f"Epoch {epoch+1}: Train Loss: {avg_train_losses['total_loss']:.4f} "
                     f"(Recon: {avg_train_losses['reconstruction_loss']:.4f}, "
-                    f"Raw: {avg_train_losses['raw_signal_loss']:.4f}, "
+                    f"MSE: {avg_train_losses['mse_loss']:.4f}, "
+                    f"NLL: {avg_train_losses['nll_loss']:.4f}, "
                     f"KLD: {avg_train_losses['kld_loss']:.4f}), "
                     f"Val Loss: {avg_val_losses['total_loss']:.4f} "
                     f"(Recon: {avg_val_losses['reconstruction_loss']:.4f}, "
-                    f"Raw: {avg_val_losses['raw_signal_loss']:.4f}, "
+                    f"MSE: {avg_val_losses['mse_loss']:.4f}, "
+                    f"NLL: {avg_val_losses['nll_loss']:.4f}, "
                     f"KLD: {avg_val_losses['kld_loss']:.4f})"
                 )
                 
@@ -858,11 +864,10 @@ class SeqVAEGraphModel:
             with torch.no_grad():
                 # Forward pass to get raw signal predictions
                 forward_outputs = self.base_model(y_st, y_ph, x_ph)
-                raw_predictions = forward_outputs['raw_predictions']
                 
-                # Note: raw_predictions now contains (B, 480) single future window predictions
-                raw_signal_mu = raw_predictions['raw_signal_mu']  # (B, 480)
-                raw_signal_logvar = raw_predictions['raw_signal_logvar']  # (B, 480)
+                # Note: model now returns mu_pr and logvar_pr directly
+                raw_signal_mu = forward_outputs['mu_pr']  # (B, 4800)
+                raw_signal_logvar = forward_outputs['logvar_pr']  # (B, 4800)
                 raw_signal_std = torch.exp(0.5 * raw_signal_logvar)
                 z_latent = forward_outputs['z']  # (B, S, latent_dim)
                 
@@ -1018,7 +1023,7 @@ class SeqVAEGraphModel:
                         plt.close('all')
                 
                 # Cleanup
-                del forward_outputs, raw_predictions, raw_signal_mu, raw_signal_logvar, raw_signal_std, z_latent
+                del forward_outputs, raw_signal_mu, raw_signal_logvar, raw_signal_std, z_latent
 
     def test_raw_signal_model(self, dataloader, device):
         """
@@ -1050,8 +1055,8 @@ class SeqVAEGraphModel:
                 forward_outputs_no_source = self.base_model(y_st, y_ph, torch.zeros_like(x_ph))
                 
                 # Extract predictions
-                raw_pred = forward_outputs['raw_predictions']['raw_signal_mu']
-                raw_pred_no_source = forward_outputs_no_source['raw_predictions']['raw_signal_mu']
+                raw_pred = forward_outputs['mu_pr']
+                raw_pred_no_source = forward_outputs_no_source['mu_pr']
                 z_latent = forward_outputs['z']
                 z_latent_no_source = forward_outputs_no_source['z']
                 
@@ -1178,11 +1183,10 @@ class SeqVAEGraphModel:
                 
                 # Forward pass to get raw signal predictions
                 forward_outputs = self.base_model(y_st, y_ph, x_ph)
-                raw_predictions = forward_outputs['raw_predictions']
                 
                 # Extract predictions and ground truth
-                raw_pred_mu = raw_predictions['raw_signal_mu']  # (B, 480)
-                raw_pred_logvar = raw_predictions['raw_signal_logvar']  # (B, 480)
+                raw_pred_mu = forward_outputs['mu_pr']  # (B, 4800)
+                raw_pred_logvar = forward_outputs['logvar_pr']  # (B, 4800)
                 
                 # Ground truth y_raw is expected to be (B, S*16).
                 # Extract the corresponding future window for evaluation
