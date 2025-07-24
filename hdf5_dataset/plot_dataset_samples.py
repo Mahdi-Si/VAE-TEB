@@ -149,7 +149,8 @@ def plot_random_dataset_samples(
         axes[1].autoscale(enable=True, axis='x', tight=True)
         
         # Plot 3: Normalized FHR Scattering Transform
-        im1 = axes[2].imshow(fhr_st_norm, aspect='auto', cmap='viridis', origin='lower', interpolation='bilinear')
+        # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
+        im1 = axes[2].imshow(fhr_st_norm.T, aspect='auto', cmap='viridis', origin='upper', interpolation='none')
         axes[2].set_ylabel('Scattering Channels', fontweight='normal')
         axes[2].set_title('Normalized FHR Scattering Transform', fontweight='normal', pad=12)
         cbar1 = plt.colorbar(im1, ax=axes[2], shrink=0.8)
@@ -159,7 +160,8 @@ def plot_random_dataset_samples(
         cbar1.outline.set_linewidth(0.7)
         
         # Plot 4: Normalized FHR Phase Harmonics
-        im2 = axes[3].imshow(fhr_ph_norm, aspect='auto', cmap='plasma', origin='lower', interpolation='bilinear')
+        # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
+        im2 = axes[3].imshow(fhr_ph_norm.T, aspect='auto', cmap='plasma', origin='upper', interpolation='none')
         axes[3].set_ylabel('Phase Channels', fontweight='normal')
         axes[3].set_title('Normalized FHR Phase Harmonics', fontweight='normal', pad=12)
         cbar2 = plt.colorbar(im2, ax=axes[3], shrink=0.8)
@@ -169,7 +171,8 @@ def plot_random_dataset_samples(
         cbar2.outline.set_linewidth(0.7)
         
         # Plot 5: Normalized FHR-UP Cross-Phase
-        im3 = axes[4].imshow(fhr_up_ph_norm, aspect='auto', cmap='inferno', origin='lower', interpolation='bilinear')
+        # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
+        im3 = axes[4].imshow(fhr_up_ph_norm.T, aspect='auto', cmap='inferno', origin='upper', interpolation='none')
         axes[4].set_ylabel('Cross-Phase Channels', fontweight='normal')
         axes[4].set_xlabel('Time Steps', fontweight='normal')
         axes[4].set_title('Normalized FHR-UP Cross-Phase', fontweight='normal', pad=12)
@@ -197,9 +200,9 @@ def plot_random_dataset_samples(
 
 if __name__ == "__main__":
     # Configuration
-    hdf5_file = r"C:\Users\mahdi\Desktop\teb_vae_model\hdf5_dataset\train_dataset_cs.hdf5"
-    stats_file = r"C:\Users\mahdi\Desktop\teb_vae_model\output\stats.hdf5"
-    output_directory = "./dataset_sample_plots"
+    hdf5_file = r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5"
+    stats_file = r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5"
+    output_directory = r"C:\Users\mahdi\Desktop\McGill\data\plots_samples"
     
     # Plot 10 random samples
     plot_random_dataset_samples(
