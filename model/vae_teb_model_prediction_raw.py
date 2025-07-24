@@ -869,23 +869,31 @@ class Decoder(nn.Module):
             MultiChannelConvBlock(in_channels=77, out_channels=66, filter_size=9, up_sampling=True),
             MultiChannelConvBlock(in_channels=66, out_channels=55, filter_size=7, up_sampling=True),
             MultiChannelConvBlock(in_channels=55, out_channels=44, filter_size=5, up_sampling=False),
-            MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=5, up_sampling=True),
-            MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True),
-            MultiChannelConvBlock(in_channels=22, out_channels=11, filter_size=3, up_sampling=False),
-            MultiChannelConvBlock(in_channels=11, out_channels=1, filter_size=3, up_sampling=False),
+            MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=3, up_sampling=True),
+            MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True)
+            MultiChannelConvBlock(in_channels=22, out_channels=44, filter_size=5, up_sampling=False),
         )
         
+        self.pre_output = ResidualMLP(
+            input_dim=480,
+            hidden_dims=(480, 480),
+            final_activation=False,
+            use_skip_connection=False,
+            activation=nn.ReLU
+        )
+
+        # Direct prediction heads for the future window
         self.output_mu = ResidualMLP(
-            input_dim=4800,
-            hidden_dims=(4800, 4080),
+            input_dim=480,
+            hidden_dims=(480, 480, 480),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
         )
         
         self.output_logvar =ResidualMLP(
-            input_dim=4800,
-            hidden_dims=(4800, 4800),
+            input_dim=480,
+            hidden_dims=(480, 480, 480),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
@@ -893,85 +901,73 @@ class Decoder(nn.Module):
 
     def forward(self, latent_z: torch.Tensor):
         """
-        Forward pass that reconstructs the raw signal from latent variables.
+        Forward pass that predicts future windows from each timestep in the sequence.
         
         Args:
             latent_z: Latent variables (batch_size, sequence_length, latent_dim)
         Returns:
-            Tuple containing:
-            - linear_output: Output from linear layers (batch_size, sequence_length, 87)
-            - raw_signal_mu: Raw signal reconstruction mean (batch_size, 4800)
-            - raw_signal_logvar: Raw signal reconstruction log variance (batch_size, 4800)
+            Dictionary containing:
+            - raw_signal_mu: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
+            - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
         """
-        batch_size, sequence_length, _ = latent_z.shape
+        B, T, C = latent_z.shape
         
-        # Apply linear transformations
-        linear_output = self.linear(latent_z)  # (batch_size, sequence_length, 87)
-        
-        # Permute for convolution: (batch_size, channels, sequence_length)
-        x = linear_output.permute(0, 2, 1)
-        
-        # Apply convolution layers
-        x = self.conv(x)  # (batch_size, 1, upsampled_length)
-        
-        # Flatten for final prediction
-        x = x.flatten(start_dim=1)  # (batch_size, flattened_features)
-        
-        # Generate mu and logvar predictions for full raw signal (4800 samples)
-        mu = self.output_mu(x)  # (batch_size, 4800)
-        logvar = self.output_logvar(x)  # (batch_size, 4800)
-        
-        return linear_output, mu, logvar
-        
+        x_linear = self.linear(latent_z).reshape(B, T, 16, 30)
+        B, T, C, L = x_linear.shape
+        x_linear = x_linear.reshape(B * T, C, L)
+        x_conv = self.conv(x_linear)
+        del x_linear
+        x_conv = x_conv.view(B, T, 1, -1).squeeze(2)
+        x_preoutput = self.pre_output(x_conv)
+        del x_conv
+
+        raw_mu = self.output_mu(x_preoutput)
+        raw_logvar = self.output_logvar(x_preoutput)
+
+        del x_preoutput
+
+        raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
+
+        return raw_mu, raw_logvar
 
     @staticmethod
     def compute_loss(
-        linear_output: torch.Tensor,
-        raw_mu_predicted: torch.Tensor, 
-        raw_logvar_predicted: torch.Tensor,
-        target_fhr_st: torch.Tensor,
-        target_fhr_ph: torch.Tensor,
-        target_raw_signal: torch.Tensor):
-        """
-        Compute two-part loss: MSE loss for linear output and NLL loss for raw signal reconstruction.
+        raw_mu_predicted: torch.Tensor, raw_logvar_predicted: torch.Tensor,
+        target_raw_signal: torch.Tensor, warmup_period: int = 30):
+        B, S, prediction_horizon = raw_mu_predicted.shape
+        raw_signal_length = target_raw_signal.shape[1]
+        decimation_factor = 16
         
-        Args:
-            linear_output: Output from linear layers (B, S, 87)
-            raw_mu_predicted: Predicted raw signal mean (B, 4800)
-            raw_logvar_predicted: Predicted raw signal log variance (B, 4800)
-            target_fhr_st: Target scattering coefficients (B, S, 43)
-            target_fhr_ph: Target phase coefficients (B, S, 44)
-            target_raw_signal: Target raw signal (B, 4800)
-            
-        Returns:
-            Dictionary containing individual loss components
-        """
-        device = raw_mu_predicted.device
+        if warmup_period >= S:
+            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
+
+        total_loss = 0.0
+        valid_predictions = 0
         
-        # MSE Loss: Compare linear output with stacked fhr_st and fhr_ph
-        if linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
-            # Stack fhr_st and fhr_ph along the last dimension (43 + 44 = 87)
-            stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
-            mse_loss = F.mse_loss(linear_output, stacked_target)
+        for t in range(warmup_period, S):
+            raw_start = t * decimation_factor
+            raw_end = raw_start + prediction_horizon            
+            if raw_end <= raw_signal_length:
+                target_window = target_raw_signal[:, raw_start:raw_end]  # (B, prediction_horizon)                
+                mu_t = raw_mu_predicted[:, t, :]
+                logvar_t = raw_logvar_predicted[:, t, :]
+                
+                # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
+                diff = target_window - mu_t
+                var = logvar_t.exp()
+                nll_t = 0.5 * (logvar_t + diff.pow(2) / var)
+                
+                total_loss += nll_t.mean()
+                valid_predictions += 1
+                
+                # Clean up timestep tensors
+                del target_window, mu_t, logvar_t, diff, var, nll_t
+        
+        # Average loss over valid predictions
+        if valid_predictions > 0:
+            return total_loss / valid_predictions
         else:
-            mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # NLL Loss: Full raw signal reconstruction (no warmup period)
-        # Ensure target_raw_signal is the right shape
-        if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
-            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
-        
-        # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-        diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
-        var = raw_logvar_predicted.exp()  # (B, 4800)
-        nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
-        nll_loss = nll_loss.mean()  # Average over all samples and time points
-        
-        return {
-            'mse_loss': mse_loss,
-            'nll_loss': nll_loss,
-            'total_decoder_loss': mse_loss + nll_loss
-        }
+            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
 
 
 class SeqVaeTeb(nn.Module):
@@ -1101,13 +1097,12 @@ class SeqVaeTeb(nn.Module):
         z = self.reparameterize(mu_post, logvar_post)
 
         # Decode raw signal predictions from z
-        linear_output, mu_pr, logvar_pr = self.decoder(z)
+        mu_pr, logvar_pr = self.decoder(z)
 
         return {
             "z": z,  # (batch, length, channel)
-            "linear_output": linear_output,  # (batch, length, 87)
-            "mu_pr": mu_pr, # (batch, 4800) - raw signal reconstruction
-            "logvar_pr": logvar_pr,  # (batch, 4800) - raw signal reconstruction
+            "mu_pr": mu_pr, # (batch, length, prediction for each time step)
+            "logvar_pr": logvar_pr,  # (batch, length, prediction for each time step)
             "mu_prior": mu_y,
             "logvar_prior": logvar_y_prior,
             "mu_post": mu_post,
@@ -1117,23 +1112,20 @@ class SeqVaeTeb(nn.Module):
     def compute_loss(
         self,
         forward_outputs: Dict[str, torch.Tensor],
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor, 
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Computes the total training loss with MSE and NLL components.
+        Computes the total training loss for raw signal prediction.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
-            y_st: Target scattering coefficients (B, S, 43)
-            y_ph: Target phase coefficients (B, S, 44)
-            y_raw: Ground truth raw signal data (B, 4800)
+            y_raw: Ground truth raw signal data (B, raw_signal_length) where
+                   raw_signal_length = sequence_length * decimation_factor.
             compute_kld_loss (bool): Whether to compute KLD loss.
 
         Returns:
-            A dictionary of computed losses.
+            A dictionary of computed losses (total, reconstruction, KLD).
         """
         device = y_raw.device
         kld_loss = torch.tensor(0.0, device=device)
@@ -1141,15 +1133,8 @@ class SeqVaeTeb(nn.Module):
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
 
-        # Decoder losses (MSE + NLL)
-        decoder_losses = self.decoder.compute_loss(
-            linear_output=forward_outputs['linear_output'],
-            raw_mu_predicted=forward_outputs['mu_pr'], 
-            raw_logvar_predicted=forward_outputs['logvar_pr'],
-            target_fhr_st=y_st,
-            target_fhr_ph=y_ph,
-            target_raw_signal=y_raw
-        )
+        # Raw signal prediction loss with warmup period
+        raw_signal_loss = self.decoder.compute_loss(forward_outputs['mu_pr'], forward_outputs['logvar_pr'], y_raw)
 
         # KLD loss
         if compute_kld_loss:
@@ -1160,15 +1145,9 @@ class SeqVaeTeb(nn.Module):
                 logvar_post=forward_outputs["logvar_post"],
             )
 
-        # Total loss
-        total_loss = decoder_losses['total_decoder_loss'] + kld_loss
-
         return {
-            "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
-            "mse_loss": decoder_losses['mse_loss'],
-            "nll_loss": decoder_losses['nll_loss'], 
+            "reconstruction_loss": raw_signal_loss,  # Keep for backward compatibility
             "kld_loss": kld_loss,
-            "total_loss": total_loss,
             "classification_loss": None,  # Required by interface
         }
 
@@ -1226,15 +1205,8 @@ if __name__ == "__main__":
 
     # decoder test: --------------------------------------------------------------
     # model = Decoder()
-    # linear_output, mu, logvar = model(
+    # mu, logvar = model(
     #     torch.randn(batch_size, seq_len, 32),
-    # )
-    # loss_dict = model.compute_loss(
-    #     linear_output,
-    #     mu, logvar,
-    #     torch.randn(batch_size, seq_len, 43),  # target_fhr_st
-    #     torch.randn(batch_size, seq_len, 44),  # target_fhr_ph
-    #     torch.randn(batch_size, 4800)  # target_raw_signal
     # )
     
     # Test VAE model: ------------------------------------------------------------

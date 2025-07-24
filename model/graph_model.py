@@ -113,7 +113,7 @@ def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_
             # Test forward pass
             with torch.no_grad():
                 forward_outputs = model(test_y_st, test_y_ph, test_x_ph)
-                loss_dict = model.compute_loss(forward_outputs, test_y_raw, compute_kld_loss=True)
+                loss_dict = model.compute_loss(forward_outputs, test_y_st, test_y_ph, test_y_raw, compute_kld_loss=True)
                 loss = loss_dict['total_loss']
                 
             # Test backward pass (without updating weights)
@@ -641,7 +641,7 @@ class SeqVAEGraphModel:
                         
                         # Compute loss with new API for raw signal reconstruction
                         loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_raw, compute_kld_loss=True)
+                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
                         
                         total_loss = loss_dict['total_loss']
 
@@ -660,7 +660,7 @@ class SeqVAEGraphModel:
                     
                     # Compute loss with new API for raw signal reconstruction
                     loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_raw, compute_kld_loss=True)
+                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
 
                     total_loss = loss_dict['total_loss']
 
@@ -715,13 +715,13 @@ class SeqVAEGraphModel:
                             
                             # Compute loss with new API for raw signal reconstruction
                             loss_dict = plain_model.compute_loss(
-                                forward_outputs, y_raw, compute_kld_loss=True)
+                                forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
                     else:
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
                         # Compute loss with new API for raw signal reconstruction
                         loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_raw, compute_kld_loss=True)
+                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
                     
                     # Accumulate losses
                     reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
