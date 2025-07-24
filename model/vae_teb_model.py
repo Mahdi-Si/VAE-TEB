@@ -881,7 +881,7 @@ class Decoder(nn.Module):
         
         self.output_mu = ResidualMLP(
             input_dim=4800,
-            hidden_dims=(4800, 4080),
+            hidden_dims=(4800, 4800),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU

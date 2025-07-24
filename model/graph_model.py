@@ -1445,9 +1445,9 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # Optimized num_workers for maximum throughput - use 8-12 workers per GPU
+        # For DDP training, set num_workers=0 to avoid pickle issues with thread locks
         cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
-        num_workers = min(12, max(8, cuda_device_count * 4))  # 8-12 workers per GPU
+        num_workers = 0 if world_size > 1 else min(12, max(8, cuda_device_count * 4))  # 0 for DDP, optimized for single GPU
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
@@ -1465,7 +1465,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
             prefetch_factor=4,  # Speed optimization
-            persistent_workers=True,  # Speed optimization
+            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1480,7 +1480,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
             prefetch_factor=2,  # Speed optimization for validation
-            persistent_workers=True,  # Speed optimization
+            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1507,7 +1507,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
             prefetch_factor=2,  # Speed optimization
-            persistent_workers=True,  # Speed optimization
+            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1589,9 +1589,9 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # Optimized num_workers for maximum throughput - use 8-12 workers per GPU
+        # For DDP training, set num_workers=0 to avoid pickle issues with thread locks
         cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
-        num_workers = min(12, max(8, cuda_device_count * 4))  # 8-12 workers per GPU
+        num_workers = 0 if world_size > 1 else min(12, max(8, cuda_device_count * 4))  # 0 for DDP, optimized for single GPU
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
@@ -1607,9 +1607,8 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
-            pin_memory=True,  # Speed optimization
             prefetch_factor=4,  # Speed optimization
-            persistent_workers=True,  # Speed optimization
+            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1622,9 +1621,6 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
-            pin_memory=True,  # Speed optimization
-            prefetch_factor=2,  # Speed optimization for validation
-            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
@@ -1650,9 +1646,6 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
             world_size=1,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
-            pin_memory=True,  # Speed optimization
-            prefetch_factor=2,  # Speed optimization
-            persistent_workers=True,  # Speed optimization
             **dataset_kwargs
         )
 
