@@ -492,34 +492,34 @@ class SeqVAEGraphModel:
         # log_gpu_memory_usage("After trainer setup")
 
         # Find optimal learning rate
-        logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
-        tuner = Tuner(trainer)
+        # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
+        # tuner = Tuner(trainer)
 
-        # Run learning rate finder
-        lr_finder = tuner.lr_find(
-            self.lightning_base_model,
-            train_dataloaders=train_loader,
-            val_dataloaders=validation_loader
-        )
+        # # Run learning rate finder
+        # lr_finder = tuner.lr_find(
+        #     self.lightning_base_model,
+        #     train_dataloaders=train_loader,
+        #     val_dataloaders=validation_loader
+        # )
 
-        # Get suggestion and update model
-        if lr_finder and lr_finder.suggestion():
-            new_lr = lr_finder.suggestion()
-            self.lightning_base_model.hparams.lr = new_lr
-            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-            logger.info(f"Found new optimal learning rate: {new_lr}")
+        # # Get suggestion and update model
+        # if lr_finder and lr_finder.suggestion():
+        #     new_lr = lr_finder.suggestion()
+        #     self.lightning_base_model.hparams.lr = new_lr
+        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+        #     logger.info(f"Found new optimal learning rate: {new_lr}")
 
-            # Plot results
-            fig = lr_finder.plot(suggest=True)
-            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-            fig.savefig(plot_path)
-            plt.close(fig)
-            logger.info(f"Learning rate finder plot saved to {plot_path}")
+        #     # Plot results
+        #     fig = lr_finder.plot(suggest=True)
+        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+        #     fig.savefig(plot_path)
+        #     plt.close(fig)
+        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
 
-            # Clean up lr_finder to free memory
-            del lr_finder, fig
-        else:
-            logger.warning("Could not find a new learning rate. Using the one from config.")
+        #     # Clean up lr_finder to free memory
+        #     del lr_finder, fig
+        # else:
+        #     logger.warning("Could not find a new learning rate. Using the one from config.")
 
         # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
         # log_gpu_memory_usage("Before training starts")
@@ -1445,9 +1445,8 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # For DDP training, set num_workers=0 to avoid pickle issues with thread locks
-        cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
-        num_workers = 0 if world_size > 1 else min(12, max(8, cuda_device_count * 4))  # 0 for DDP, optimized for single GPU
+        # Set num_workers=0 to avoid pickle issues with thread locks
+        num_workers = 0
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
@@ -1464,8 +1463,6 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
             stats_path=stat_path,
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
-            prefetch_factor=4,  # Speed optimization
-            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1473,14 +1470,12 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=max(4, num_workers // 2),  # Fewer workers for validation
+            num_workers=0,  # Set to 0 to avoid pickle issues
             rank=rank,
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
-            prefetch_factor=2,  # Speed optimization for validation
-            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1500,14 +1495,12 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
         test_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=max(4, num_workers // 2),  # Fewer workers for testing
+            num_workers=0,  # Set to 0 to avoid pickle issues
             rank=0,
             world_size=1,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
             pin_memory=True,  # Speed optimization
-            prefetch_factor=2,  # Speed optimization
-            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1589,9 +1582,8 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         # Dataloader configuration
         dataloader_config = config['dataset_config'].get('dataloader_config', {})
         dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-        # For DDP training, set num_workers=0 to avoid pickle issues with thread locks
-        cuda_device_count = len(cuda_device_list) if 'cuda_device_list' in locals() else len(config['general_config']['cuda_devices'])
-        num_workers = 0 if world_size > 1 else min(12, max(8, cuda_device_count * 4))  # 0 for DDP, optimized for single GPU
+        # Set num_workers=0 to avoid pickle issues with thread locks
+        num_workers = 0
         normalize_fields = dataloader_config.get('normalize_fields', None)
         stat_path = config['dataset_config'].get('stat_path')
 
@@ -1607,8 +1599,6 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
             world_size=world_size,
             stats_path=stat_path,
             normalize_fields=normalize_fields,
-            prefetch_factor=4,  # Speed optimization
-            persistent_workers=False if world_size > 1 else True,  # Disable for DDP to avoid pickle issues
             **dataset_kwargs
         )
 
@@ -1616,7 +1606,7 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         validation_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=max(4, num_workers // 2),  # Fewer workers for validation
+            num_workers=0,  # Set to 0 to avoid pickle issues
             rank=rank,
             world_size=world_size,
             stats_path=stat_path,
@@ -1641,7 +1631,7 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
         test_loader_seqvae = create_optimized_dataloader(
             hdf5_files=config['dataset_config']['vae_test_datasets'],
             batch_size=config['general_config']['batch_size']['test'],
-            num_workers=max(4, num_workers // 2),  # Fewer workers for testing
+            num_workers=0,  # Set to 0 to avoid pickle issues
             rank=0,
             world_size=1,
             stats_path=stat_path,

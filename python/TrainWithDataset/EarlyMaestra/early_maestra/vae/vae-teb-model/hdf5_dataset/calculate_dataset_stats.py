@@ -949,8 +949,8 @@ def calculate_and_save_dataset_stats(
 if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    input_files = [r"C:\Users\mahdi\Desktop\teb_vae_model\hdf5_dataset\train_dataset_cs.hdf5"]
-    output_file = r'C:\Users\mahdi\Desktop\teb_vae_model\output\stats.hdf5'
+    input_files = [r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5"]
+    output_file = r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5"
     
     # Calculate and save stats with histogram plotting enabled
     stats = calculate_and_save_dataset_stats(
