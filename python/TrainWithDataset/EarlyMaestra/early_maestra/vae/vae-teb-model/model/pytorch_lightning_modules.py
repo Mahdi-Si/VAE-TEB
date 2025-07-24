@@ -68,8 +68,12 @@ class PlottingCallBack(Callback):
 
                 model_outputs = pl_module.model(y_st, y_ph, x_ph)
                 latent_z = model_outputs['z']
-                mu_pr, mu_pr_means = pl_module.model.get_predictions(model_outputs['mu_pr'])
-                logvar_pr, log_var_means = pl_module.model.get_predictions(model_outputs['logvar_pr'])
+                # Note: mu_pr and logvar_pr are now (B, 4800) raw signal reconstructions
+                mu_pr_raw = model_outputs['mu_pr']  # (B, 4800)
+                logvar_pr_raw = model_outputs['logvar_pr']  # (B, 4800)
+                # For compatibility with existing plotting, create dummy means
+                mu_pr_means = mu_pr_raw
+                log_var_means = logvar_pr_raw
                 
                 # Plot results
                 self._plot_results(
@@ -77,8 +81,8 @@ class PlottingCallBack(Callback):
                     up_raw_normalized,
                     mu_pr_means,
                     log_var_means,
-                    mu_pr,
-                    logvar_pr,
+                    mu_pr_raw.unsqueeze(1),  # Add dummy time dimension for compatibility
+                    logvar_pr_raw.unsqueeze(1),  # Add dummy time dimension for compatibility
                     latent_z,
                     pl_trainer.current_epoch)
                 
@@ -266,12 +270,14 @@ class LossPlotCallback(Callback):
             "epoch": [],
             "train/total_loss": [],
             "train/recon_loss": [],
+            "train/mse_loss": [],
+            "train/nll_loss": [],
             "train/kld_loss": [],
-            "train/raw_signal_loss": [],
             "val/total_loss": [],
             "val/recon_loss": [],
-            "val/kld_loss": [],
-            "val/raw_signal_loss": []
+            "val/mse_loss": [],
+            "val/nll_loss": [],
+            "val/kld_loss": []
         }
 
     def _trim_history(self):
@@ -453,7 +459,7 @@ class LightSeqVaeTeb(L.LightningModule):
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
-            forward_outputs, y_raw, compute_kld_loss=True
+            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True
         )
 
         return loss_dict
@@ -466,6 +472,8 @@ class LightSeqVaeTeb(L.LightningModule):
         # Log training metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         # Clear loss_dict to free memory
         del loss_dict
@@ -480,6 +488,8 @@ class LightSeqVaeTeb(L.LightningModule):
         # Log validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
         self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
+        self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=True, logger=True)
+        self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
 
         # Clear loss_dict to free memory

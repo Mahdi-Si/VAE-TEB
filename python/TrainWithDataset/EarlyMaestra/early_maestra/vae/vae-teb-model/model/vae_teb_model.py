@@ -406,17 +406,15 @@ class TargetEncoder(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 76,
         sequence_length: int = 300,
         latent_dim: int = 32,
-        lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 32,
+        lstm_hidden_dim: int = 64,
+        lstm_num_layers: int = 4,
         use_bidirectional_lstm: bool = False,
         activation: nn.Module = nn.GELU,
     ):
         super(TargetEncoder, self).__init__()
 
-        self.input_channels = input_channels
         self.sequence_length = sequence_length
         self.latent_dim = latent_dim
         self.lstm_hidden_dim = lstm_hidden_dim
@@ -427,8 +425,8 @@ class TargetEncoder(nn.Module):
         
         self.mlp_scattering = nn.Sequential(
             ResidualMLP(
-                input_dim=input_channels,
-                hidden_dims=geometric_schedule(76, 32, 4),
+                input_dim=43,
+                hidden_dims=geometric_schedule(43, 16, 4),
                 final_activation=False,
                 use_skip_connection=True,
                 activation=nn.GELU
@@ -436,8 +434,8 @@ class TargetEncoder(nn.Module):
         )
         
         self.mlp_phase = ResidualMLP(
-            input_dim=input_channels,
-            hidden_dims=geometric_schedule(76, 32, 4),
+            input_dim=44,
+            hidden_dims=geometric_schedule(44, 16, 4),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.ReLU
@@ -445,32 +443,28 @@ class TargetEncoder(nn.Module):
 
         # Sequential convolutions for scattering
         self.conv_scattering = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=76, out_channels=64, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=64, out_channels=54, filter_size=7, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=54, out_channels=45, filter_size=11, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=45, out_channels=58, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=58, out_channels=32, filter_size=29, dilation=1)
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1),
         )
 
         # Sequential convolutions for phase
         self.conv_phase = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=76, out_channels=64, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=64, out_channels=54, filter_size=7, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=54, out_channels=45, filter_size=11, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=45, out_channels=58, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=58, out_channels=32, filter_size=29, dilation=1)
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1),
         )
         
         # LayerNorm for fused outputs
-        self.scatter_fused_norm = nn.LayerNorm(32)
-        self.phase_fused_norm = nn.LayerNorm(32)
+        self.scatter_fused_norm = nn.LayerNorm(16)
+        self.phase_fused_norm = nn.LayerNorm(16)
         
         # LayerNorm for LSTM output
         self.lstm_norm = nn.LayerNorm(lstm_hidden_dim * (2 if use_bidirectional_lstm else 1))
 
         self.cross_modal_fusion = ResidualMLP(
-            input_dim=32 * 2,  # Updated to reflect 32-channel outputs from each path
-            hidden_dims=geometric_schedule(32*2, 32, 3),  # Smaller intermediate dimensions
+            input_dim=16 * 2,  # Updated to reflect 32-channel outputs from each path
+            hidden_dims=geometric_schedule(16*2, 20, 5),  # Smaller intermediate dimensions
             final_activation=False,
             activation=nn.ReLU,
             use_skip_connection=True
@@ -489,22 +483,22 @@ class TargetEncoder(nn.Module):
         # Pre-output processing
         self.pre_output = ResidualMLP(
             input_dim=lstm_output_dim,
-            hidden_dims=geometric_schedule(lstm_output_dim, 64, 4),
+            hidden_dims=geometric_schedule(lstm_output_dim, 32, 5),
             final_activation=True,
             activation=nn.ReLU
         )
 
         # Variational parameters
         self.mu_layer = ResidualMLP(
-            input_dim=64,
-            hidden_dims=geometric_schedule(64, 32, 5),
+            input_dim=32,
+            hidden_dims=geometric_schedule(32, 32, 32),
             final_activation=False,
             activation=nn.ReLU
         )
         
         self.logvar_layer = ResidualMLP(
-            input_dim=64,
-            hidden_dims=(64, 64, 64, 64),
+            input_dim=32,
+            hidden_dims=geometric_schedule(32, 64, 4),
             final_activation=False,
             activation=nn.ReLU
         )
@@ -540,30 +534,21 @@ class TargetEncoder(nn.Module):
             hidden_states["scattering_reduced"] = scatter_linear
             hidden_states["phase_reduced"] = phase_linear
 
-        # Parallel convolution processing for scattering
-        scatter_conv = self.conv_scattering(scattering_input.permute(0, 2, 1)).permute(0, 2, 1)
-        scatter_fused = scatter_linear + scatter_conv
-        # Apply LayerNorm after fusion
-        scatter_fused = self.scatter_fused_norm(scatter_fused)
-        del scatter_conv, scatter_linear
-        
-        # Parallel convolution processing for phase
-        phase_conv = self.conv_phase(phase_harmonic_input.permute(0, 2, 1)).permute(0, 2, 1)
-        phase_fused = phase_linear + phase_conv
-        # Apply LayerNorm after fusion
-        phase_fused = self.phase_fused_norm(phase_fused)
-        del phase_conv, phase_linear
+        scatter_conv = self.conv_scattering(scatter_linear.permute(0, 2, 1)).permute(0, 2, 1)
 
-        if return_hidden:
-            hidden_states["scatter_fused"] = scatter_fused
-            hidden_states["phase_fused"] = phase_fused
+        scatter_conv = self.scatter_fused_norm(scatter_conv)
+        del scatter_linear
 
-        combined = torch.cat([scatter_fused, phase_fused], dim=-1)
-        del scatter_fused, phase_fused
+        phase_conv = self.conv_phase(phase_linear.permute(0, 2, 1)).permute(0, 2, 1)
+
+        phase_conv = self.phase_fused_norm(phase_conv)
+        del phase_linear
+
+        combined = torch.cat([scatter_conv, phase_conv], dim=-1)
+        del scatter_conv, phase_conv
         x = self.cross_modal_fusion(combined)
         del combined
 
-        # LSTM processing
         x, (hidden, cell) = self.lstm(x)  # (batch, length, channel)
         x = self.lstm_norm(x)
 
@@ -572,7 +557,6 @@ class TargetEncoder(nn.Module):
             hidden_states["lstm_hidden"] = hidden
             hidden_states["lstm_cell"] = cell
 
-        # Pre-output processing
         x = self.pre_output(x)
 
         mu = self.mu_layer(x)
@@ -623,13 +607,12 @@ class SourceEncoder(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 76,
+        input_channels: int = 130,
         sequence_length: int = 300,
         latent_dim: int = 32,
-        lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 3,
+        lstm_hidden_dim: int = 64,
+        lstm_num_layers: int = 4,
         activation: nn.Module = nn.GELU,
-        reduced_channels: int = 32,  # Reduced from 76 to capture essential features
     ):
         super(SourceEncoder, self).__init__()
 
@@ -642,7 +625,7 @@ class SourceEncoder(nn.Module):
         # Channel reduction block
         self.mlp = ResidualMLP(
             input_dim=input_channels,
-            hidden_dims=geometric_schedule(76, 32, 4),
+            hidden_dims=geometric_schedule(130, 32, 5),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.ReLU
@@ -650,11 +633,9 @@ class SourceEncoder(nn.Module):
         
         # Sequential convolutions for source encoder
         self.conv = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=76, out_channels=32, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=3, dilation=1),
+            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=5, dilation=1),
             CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=11, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=19, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=29, dilation=1)
         )
         
         self.fused_norm = nn.LayerNorm(32)
@@ -670,14 +651,14 @@ class SourceEncoder(nn.Module):
 
         self.pre_output = ResidualMLP(
             input_dim=lstm_hidden_dim,
-            hidden_dims=geometric_schedule(lstm_hidden_dim, 64, 4),
+            hidden_dims=geometric_schedule(lstm_hidden_dim, 32, 4),
             final_activation=True,
             activation=nn.ReLU
         )
 
         self.mu_layer = ResidualMLP(
-            input_dim=64,
-            hidden_dims=geometric_schedule(64, 32, 4),
+            input_dim=32,
+            hidden_dims=geometric_schedule(32, 32, 4),
             final_activation=False,
             activation=nn.ReLU
         )
@@ -701,28 +682,18 @@ class SourceEncoder(nn.Module):
         if return_intermediate:
             intermediates["input_with_bias"] = x
 
-        # Apply channel reduction first
         x_linear = self.mlp(x)
         
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
-
-        # Parallel convolution processing
-        conv_out = self.conv(x.permute(0, 2, 1))
-        conv_out = conv_out
+        conv_out = self.conv(x_linear.permute(0, 2, 1)).permute(0, 2, 1)
         
-        # Apply GroupNorm before fusion
-
         if return_intermediate:
             intermediates["conv_path"] = conv_out
 
-        # Memory-efficient path fusion
-        x = x_linear + conv_out.permute(0, 2, 1)
-        # Apply LayerNorm after fusion
-        x = self.fused_norm(x)
+        x = self.fused_norm(conv_out)
         del x_linear, conv_out  # Explicit cleanup
 
-        # LSTM forward pass (unidirectional for causal encoding)
         x, (hidden, cell) = self.lstm(x)
         x = self.lstm_norm(x)
 
@@ -788,10 +759,10 @@ class ConditionalEncoder(nn.Module):
         # The input dimension to the MLP is the sum of source and target feature dimensions
 
         # Build a small MLP to merge h_x and h_y
-        hidden_dims = geometric_schedule(dim_hx + dim_hy, 32, 7)
+        hidden_dims = geometric_schedule(dim_hx + dim_hy, 32, 8)
         self.mlp = ResidualMLP(
             input_dim=dim_hx + dim_hy,
-            hidden_dims=hidden_dims[0:4],
+            hidden_dims=hidden_dims[0:5],
             final_activation=True,
             use_skip_connection=True, 
             activation=nn.ReLU,
@@ -799,15 +770,15 @@ class ConditionalEncoder(nn.Module):
 
         # Final linear layers to produce mu and logvar for the latent variable z
         self.fc_mu = ResidualMLP(
-            input_dim=hidden_dims[3],
-            hidden_dims=hidden_dims[4:],
+            input_dim=hidden_dims[4],
+            hidden_dims=hidden_dims[5:],
             final_activation=False,
             use_skip_connection=False, 
             activation=nn.ReLU,
         )
         self.fc_logvar = ResidualMLP(
-            input_dim=hidden_dims[3],
-            hidden_dims=hidden_dims[4:],
+            input_dim=hidden_dims[4],
+            hidden_dims=hidden_dims[5:],
             final_activation=False,
             use_skip_connection=False, 
             activation=nn.ReLU,
@@ -879,14 +850,14 @@ class Decoder(nn.Module):
         self.linear = nn.Sequential(
             ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, 256, 5),
+            hidden_dims=geometric_schedule(latent_dim, 50, 5),
             final_activation=True,
             use_skip_connection=True, 
             activation=nn.ReLU,),
             
             ResidualMLP(
             input_dim=256,
-            hidden_dims=geometric_schedule(256, 480, 5),
+            hidden_dims=geometric_schedule(50, 87, 5),
             final_activation=True,
             activation=nn.ReLU,
             use_skip_connection=True
@@ -894,34 +865,27 @@ class Decoder(nn.Module):
         )
 
         self.conv = nn.Sequential(
-            MultiChannelConvBlock(in_channels=16, out_channels=12, filter_size=11, up_sampling=False),
-            MultiChannelConvBlock(in_channels=12, out_channels=10, filter_size=9, up_sampling=True),
-            MultiChannelConvBlock(in_channels=10, out_channels=8, filter_size=7, up_sampling=True),
-            MultiChannelConvBlock(in_channels=8, out_channels=6, filter_size=5, up_sampling=False),
-            MultiChannelConvBlock(in_channels=6, out_channels=4, filter_size=3, up_sampling=True),
-            MultiChannelConvBlock(in_channels=4, out_channels=1, filter_size=3, up_sampling=True)
+            MultiChannelConvBlock(in_channels=87, out_channels=77, filter_size=11, up_sampling=False),
+            MultiChannelConvBlock(in_channels=77, out_channels=66, filter_size=9, up_sampling=True),
+            MultiChannelConvBlock(in_channels=66, out_channels=55, filter_size=7, up_sampling=True),
+            MultiChannelConvBlock(in_channels=55, out_channels=44, filter_size=5, up_sampling=False),
+            MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=5, up_sampling=True),
+            MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True),
+            MultiChannelConvBlock(in_channels=22, out_channels=11, filter_size=3, up_sampling=False),
+            MultiChannelConvBlock(in_channels=11, out_channels=1, filter_size=3, up_sampling=False),
         )
         
-        self.pre_output = ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480),
-            final_activation=False,
-            use_skip_connection=False,
-            activation=nn.ReLU
-        )
-
-        # Direct prediction heads for the future window
         self.output_mu = ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480, 480),
+            input_dim=4800,
+            hidden_dims=(4800, 4080),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
         )
         
         self.output_logvar =ResidualMLP(
-            input_dim=480,
-            hidden_dims=(480, 480, 480),
+            input_dim=4800,
+            hidden_dims=(4800, 4800),
             final_activation=False,
             use_skip_connection=False,
             activation=nn.ReLU
@@ -929,73 +893,85 @@ class Decoder(nn.Module):
 
     def forward(self, latent_z: torch.Tensor):
         """
-        Forward pass that predicts future windows from each timestep in the sequence.
+        Forward pass that reconstructs the raw signal from latent variables.
         
         Args:
             latent_z: Latent variables (batch_size, sequence_length, latent_dim)
         Returns:
-            Dictionary containing:
-            - raw_signal_mu: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
-            - raw_signal_logvar: (batch_size, sequence_length, prediction_horizon) - future predictions per timestep
+            Tuple containing:
+            - linear_output: Output from linear layers (batch_size, sequence_length, 87)
+            - raw_signal_mu: Raw signal reconstruction mean (batch_size, 4800)
+            - raw_signal_logvar: Raw signal reconstruction log variance (batch_size, 4800)
         """
-        B, T, C = latent_z.shape
+        batch_size, sequence_length, _ = latent_z.shape
         
-        x_linear = self.linear(latent_z).reshape(B, T, 16, 30)
-        B, T, C, L = x_linear.shape
-        x_linear = x_linear.reshape(B * T, C, L)
-        x_conv = self.conv(x_linear)
-        del x_linear
-        x_conv = x_conv.view(B, T, 1, -1).squeeze(2)
-        x_preoutput = self.pre_output(x_conv)
-        del x_conv
-
-        raw_mu = self.output_mu(x_preoutput)
-        raw_logvar = self.output_logvar(x_preoutput)
-
-        del x_preoutput
-
-        raw_logvar = torch.clamp(raw_logvar, min=-8.0, max=8.0)
-
-        return raw_mu, raw_logvar
+        # Apply linear transformations
+        linear_output = self.linear(latent_z)  # (batch_size, sequence_length, 87)
+        
+        # Permute for convolution: (batch_size, channels, sequence_length)
+        x = linear_output.permute(0, 2, 1)
+        
+        # Apply convolution layers
+        x = self.conv(x)  # (batch_size, 1, upsampled_length)
+        
+        # Flatten for final prediction
+        x = x.flatten(start_dim=1)  # (batch_size, flattened_features)
+        
+        # Generate mu and logvar predictions for full raw signal (4800 samples)
+        mu = self.output_mu(x)  # (batch_size, 4800)
+        logvar = self.output_logvar(x)  # (batch_size, 4800)
+        
+        return linear_output, mu, logvar
+        
 
     @staticmethod
     def compute_loss(
-        raw_mu_predicted: torch.Tensor, raw_logvar_predicted: torch.Tensor,
-        target_raw_signal: torch.Tensor, warmup_period: int = 30):
-        B, S, prediction_horizon = raw_mu_predicted.shape
-        raw_signal_length = target_raw_signal.shape[1]
-        decimation_factor = 16
+        linear_output: torch.Tensor,
+        raw_mu_predicted: torch.Tensor, 
+        raw_logvar_predicted: torch.Tensor,
+        target_fhr_st: torch.Tensor,
+        target_fhr_ph: torch.Tensor,
+        target_raw_signal: torch.Tensor):
+        """
+        Compute two-part loss: MSE loss for linear output and NLL loss for raw signal reconstruction.
         
-        if warmup_period >= S:
-            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
-
-        total_loss = 0.0
-        valid_predictions = 0
+        Args:
+            linear_output: Output from linear layers (B, S, 87)
+            raw_mu_predicted: Predicted raw signal mean (B, 4800)
+            raw_logvar_predicted: Predicted raw signal log variance (B, 4800)
+            target_fhr_st: Target scattering coefficients (B, S, 43)
+            target_fhr_ph: Target phase coefficients (B, S, 44)
+            target_raw_signal: Target raw signal (B, 4800)
+            
+        Returns:
+            Dictionary containing individual loss components
+        """
+        device = raw_mu_predicted.device
         
-        for t in range(warmup_period, S):
-            raw_start = t * decimation_factor
-            raw_end = raw_start + prediction_horizon            
-            if raw_end <= raw_signal_length:
-                target_window = target_raw_signal[:, raw_start:raw_end]  # (B, prediction_horizon)                
-                mu_t = raw_mu_predicted[:, t, :]
-                logvar_t = raw_logvar_predicted[:, t, :]
-                
-                # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-                diff = target_window - mu_t
-                var = logvar_t.exp()
-                nll_t = 0.5 * (logvar_t + diff.pow(2) / var)
-                
-                total_loss += nll_t.mean()
-                valid_predictions += 1
-                
-                # Clean up timestep tensors
-                del target_window, mu_t, logvar_t, diff, var, nll_t
-        
-        # Average loss over valid predictions
-        if valid_predictions > 0:
-            return total_loss / valid_predictions
+        # MSE Loss: Compare linear output with stacked fhr_st and fhr_ph
+        if linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
+            # Stack fhr_st and fhr_ph along the last dimension (43 + 44 = 87)
+            stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
+            mse_loss = F.mse_loss(linear_output, stacked_target)
         else:
-            return torch.tensor(0.0, device=raw_mu_predicted.device, requires_grad=True)
+            mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # NLL Loss: Full raw signal reconstruction (no warmup period)
+        # Ensure target_raw_signal is the right shape
+        if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
+            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
+        
+        # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
+        diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
+        var = raw_logvar_predicted.exp()  # (B, 4800)
+        nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
+        nll_loss = nll_loss.mean()  # Average over all samples and time points
+        
+        return {
+            'mse_loss': mse_loss,
+            'nll_loss': nll_loss,
+            'total_decoder_loss': mse_loss + nll_loss
+        }
 
 
 class SeqVaeTeb(nn.Module):
@@ -1125,12 +1101,13 @@ class SeqVaeTeb(nn.Module):
         z = self.reparameterize(mu_post, logvar_post)
 
         # Decode raw signal predictions from z
-        mu_pr, logvar_pr = self.decoder(z)
+        linear_output, mu_pr, logvar_pr = self.decoder(z)
 
         return {
             "z": z,  # (batch, length, channel)
-            "mu_pr": mu_pr, # (batch, length, prediction for each time step)
-            "logvar_pr": logvar_pr,  # (batch, length, prediction for each time step)
+            "linear_output": linear_output,  # (batch, length, 87)
+            "mu_pr": mu_pr, # (batch, 4800) - raw signal reconstruction
+            "logvar_pr": logvar_pr,  # (batch, 4800) - raw signal reconstruction
             "mu_prior": mu_y,
             "logvar_prior": logvar_y_prior,
             "mu_post": mu_post,
@@ -1140,20 +1117,23 @@ class SeqVaeTeb(nn.Module):
     def compute_loss(
         self,
         forward_outputs: Dict[str, torch.Tensor],
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor, 
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Computes the total training loss for raw signal prediction.
+        Computes the total training loss with MSE and NLL components.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
-            y_raw: Ground truth raw signal data (B, raw_signal_length) where
-                   raw_signal_length = sequence_length * decimation_factor.
+            y_st: Target scattering coefficients (B, S, 43)
+            y_ph: Target phase coefficients (B, S, 44)
+            y_raw: Ground truth raw signal data (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
 
         Returns:
-            A dictionary of computed losses (total, reconstruction, KLD).
+            A dictionary of computed losses.
         """
         device = y_raw.device
         kld_loss = torch.tensor(0.0, device=device)
@@ -1161,8 +1141,15 @@ class SeqVaeTeb(nn.Module):
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
 
-        # Raw signal prediction loss with warmup period
-        raw_signal_loss = self.decoder.compute_loss(forward_outputs['mu_pr'], forward_outputs['logvar_pr'], y_raw)
+        # Decoder losses (MSE + NLL)
+        decoder_losses = self.decoder.compute_loss(
+            linear_output=forward_outputs['linear_output'],
+            raw_mu_predicted=forward_outputs['mu_pr'], 
+            raw_logvar_predicted=forward_outputs['logvar_pr'],
+            target_fhr_st=y_st,
+            target_fhr_ph=y_ph,
+            target_raw_signal=y_raw
+        )
 
         # KLD loss
         if compute_kld_loss:
@@ -1173,9 +1160,15 @@ class SeqVaeTeb(nn.Module):
                 logvar_post=forward_outputs["logvar_post"],
             )
 
+        # Total loss
+        total_loss = decoder_losses['total_decoder_loss'] + kld_loss
+
         return {
-            "reconstruction_loss": raw_signal_loss,  # Keep for backward compatibility
+            "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
+            "mse_loss": decoder_losses['mse_loss'],
+            "nll_loss": decoder_losses['nll_loss'], 
             "kld_loss": kld_loss,
+            "total_loss": total_loss,
             "classification_loss": None,  # Required by interface
         }
 
@@ -1207,16 +1200,15 @@ if __name__ == "__main__":
     prediction_horizon = 30
     warmup_period = 30
 
-    y_st_input = torch.randn(batch_size, seq_len, channels)  # (B, C, L) format
-    y_ph_input = torch.randn(batch_size, seq_len, channels)
-    x_ph_input = torch.randn(batch_size, seq_len, channels)
+    y_st_input = torch.randn(batch_size, seq_len, 43)  # (B, C, L) format
+    y_ph_input = torch.randn(batch_size, seq_len, 44)
+    x_ph_input = torch.randn(batch_size, seq_len, 130)
     y_raw_input = torch.randn(
         batch_size, seq_len * 16
     )
 
     # target encoder test: -------------------------------------------------------
-    # model = TargetEncoder(input_channels=channels,
-    #                       sequence_length=seq_len)
+    # model = TargetEncoder(sequence_length=seq_len)
     #
     # mu, logvar = model(scattering_input=y_st_input,
     #                                phase_harmonic_input=y_ph_input)
@@ -1233,10 +1225,17 @@ if __name__ == "__main__":
     # )
 
     # decoder test: --------------------------------------------------------------
-    model = Decoder()
-    mu, logvar = model(
-        torch.randn(batch_size, seq_len, 32),
-    )
+    # model = Decoder()
+    # linear_output, mu, logvar = model(
+    #     torch.randn(batch_size, seq_len, 32),
+    # )
+    # loss_dict = model.compute_loss(
+    #     linear_output,
+    #     mu, logvar,
+    #     torch.randn(batch_size, seq_len, 43),  # target_fhr_st
+    #     torch.randn(batch_size, seq_len, 44),  # target_fhr_ph
+    #     torch.randn(batch_size, 4800)  # target_raw_signal
+    # )
     
     # Test VAE model: ------------------------------------------------------------
     # model = SeqVaeTeb(
