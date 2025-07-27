@@ -22,14 +22,7 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from utils.data_utils import \
-    plot_distributions, \
-    plot_histogram
-
-from utils.graph_model_utils import \
-    calculate_log_likelihood, \
-    calculate_vaf
-
+from  utils.plot_utils import plot_model_analysis
 from loguru import logger
 
 from pytorch_lightning_modules import *
@@ -270,12 +263,6 @@ class SeqVAEGraphModel:
         # sys.stdout = StreamToLogger(self.logger, logging.INFO)
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
         logger.info('==' * 50)
-        
-        # Log initial GPU memory status - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("Initial setup")
-        
-        # Clear any residual GPU memory - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # clear_gpu_memory()
         
         # Reset memory statistics
         if torch.cuda.is_available():
@@ -873,550 +860,125 @@ class SeqVAEGraphModel:
         
         return None
 
-
-    def seqvae_raw_signal_plot(self, dataloader, device):
+    def run_tests(self, test_loader):
         """
-        Plot raw signal predictions using the new SeqVaeTeb model.
-        This replaces the old seqvae_prediction_plot method to work with raw signal architecture.
+        Runs tests on the SeqVaeTeb model by performing analysis and plotting on random samples.
         """
-        if not hasattr(self, 'base_model') or self.base_model is None:
-            logger.error("Base model not initialized. Cannot perform raw signal plotting.")
-            return
-            
-        self.base_model.eval()
-        save_dir_prediction = os.path.join(self.test_results_dir, 'raw_signal_predictions')
-        os.makedirs(save_dir_prediction, exist_ok=True)
-        
-        selected_idx = [1, 10, 20, 30, 35, 58, 62, 29, 50, 60, 69, 100, 119, 169, 170, 179, 190]
-        
-        for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-            # Access data using correct HDF5 dataset field names
-            y_st = batch_data.fhr_st.to(device)      # Scattering transform features
-            y_ph = batch_data.fhr_ph.to(device)      # Phase harmonic features  
-            x_ph = batch_data.fhr_up_ph.to(device)   # Cross-phase features
-            y_raw = batch_data.fhr.to(device)        # Raw signal ground truth
-            guids_list = batch_data.guid if hasattr(batch_data, 'guid') else [f'sample_{i}' for i in range(y_st.size(0))]
-            epochs_list = batch_data.epoch if hasattr(batch_data, 'epoch') else torch.zeros(y_st.size(0))
-            
-            with torch.no_grad():
-                # Forward pass to get raw signal predictions
-                forward_outputs = self.base_model(y_st, y_ph, x_ph)
-                
-                # Note: model now returns mu_pr and logvar_pr directly
-                raw_signal_mu = forward_outputs['mu_pr']  # (B, 4800)
-                raw_signal_logvar = forward_outputs['logvar_pr']  # (B, 4800)
-                raw_signal_std = torch.exp(0.5 * raw_signal_logvar)
-                z_latent = forward_outputs['z']  # (B, S, latent_dim)
-                
-                # Get model parameters for plotting
-                warmup_period = getattr(self.base_model, 'warmup_period', 30)
-                decimation_factor = getattr(self.base_model, 'decimation_factor', 16)
-                
-                # Plot for selected samples
-                for k in selected_idx:
-                    if k >= y_raw.size(0):
-                        continue
-                        
-                    try:
-                        # Prepare data for plotting
-                        y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()  # Ground truth raw signal
-                        
-                        # Extract prediction data for this sample
-                        pred_mu_future = raw_signal_mu[k].detach().cpu().numpy()  # (480,)
-                        pred_std_future = raw_signal_std[k].detach().cpu().numpy()  # (480,)
-                        z_sample = z_latent[k].permute(1, 0).detach().cpu().numpy()  # (latent_dim, seq_len)
-                        
-                        # Create extended arrays for plotting
-                        raw_signal_length = len(y_raw_sample)
-                        prediction_horizon = len(pred_mu_future)
-                        
-                        # The model predicts the future window after the sequence ends
-                        sequence_end = raw_signal_length - prediction_horizon
-                        
-                        if sequence_end > 0:
-                            # Create extended ground truth and prediction arrays
-                            extended_length = raw_signal_length + prediction_horizon
-                            extended_ground_truth = np.zeros(extended_length)
-                            extended_ground_truth[:raw_signal_length] = y_raw_sample
-                            
-                            extended_prediction = np.zeros(extended_length)
-                            extended_prediction_std = np.zeros(extended_length)
-                            extended_prediction[raw_signal_length:] = pred_mu_future
-                            extended_prediction_std[raw_signal_length:] = pred_std_future
-                            
-                            sequence_mask = np.arange(extended_length) < raw_signal_length
-                            future_mask = np.arange(extended_length) >= raw_signal_length
-                        else:
-                            # Fallback for short sequences
-                            extended_length = max(raw_signal_length, prediction_horizon)
-                            extended_ground_truth = np.zeros(extended_length)
-                            extended_ground_truth[:len(y_raw_sample)] = y_raw_sample
-                            extended_prediction = np.zeros(extended_length)
-                            extended_prediction_std = np.zeros(extended_length)
-                            extended_prediction[:len(pred_mu_future)] = pred_mu_future
-                            extended_prediction_std[:len(pred_std_future)] = pred_std_future
-                            sequence_mask = np.arange(extended_length) < len(y_raw_sample)
-                            future_mask = np.arange(extended_length) >= len(y_raw_sample)
-                        
-                        # Create a comprehensive plot with 5 subplots
-                        fig, axes = plt.subplots(5, 1, figsize=(15, 18))
-                        
-                        # Plot 1: Ground truth raw signal
-                        axes[0].plot(y_raw_sample, 'b-', linewidth=1, label='Ground Truth')
-                        axes[0].set_title('Ground Truth Raw Signal')
-                        axes[0].set_ylabel('Amplitude')
-                        axes[0].legend()
-                        axes[0].grid(True, alpha=0.3)
-                        
-                        # Plot 2: Future window prediction with uncertainty
-                        if np.any(future_mask):
-                            # Plot the sequence part in gray
-                            sequence_indices = np.arange(extended_length)[sequence_mask]
-                            axes[1].plot(sequence_indices, extended_ground_truth[sequence_mask], 'gray', linewidth=1, alpha=0.6, label='Historical Ground Truth')
-                            
-                            # Plot the future prediction
-                            future_pred = extended_prediction[future_mask]
-                            future_std = extended_prediction_std[future_mask]
-                            future_indices = np.arange(extended_length)[future_mask]
-                            
-                            axes[1].plot(future_indices, future_pred, 'r-', linewidth=1, label='Future Prediction')
-                            axes[1].fill_between(future_indices, 
-                                               future_pred - future_std, 
-                                               future_pred + future_std, 
-                                               alpha=0.3, color='red', label='±1 Std')
-                            
-                            # Add vertical line to separate sequence from prediction
-                            axes[1].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.5, label='Prediction Start')
-                            
-                        axes[1].set_title('Future Window Prediction with Uncertainty')
-                        axes[1].set_ylabel('Amplitude')
-                        axes[1].legend()
-                        axes[1].grid(True, alpha=0.3)
-                        
-                        # Plot 3: Prediction detail view
-                        if np.any(future_mask):
-                            # Show transition from sequence to prediction
-                            transition_samples = 100
-                            transition_start = max(0, raw_signal_length - transition_samples)
-                            
-                            # Plot the transition region
-                            axes[2].plot(range(transition_start, raw_signal_length), 
-                                        y_raw_sample[transition_start:], 
-                                        'b-', linewidth=1, label='Ground Truth (End of Sequence)', alpha=0.8)
-                            
-                            # Plot the future prediction
-                            future_pred = extended_prediction[future_mask]
-                            future_std = extended_prediction_std[future_mask]
-                            future_indices = np.arange(extended_length)[future_mask]
-                            
-                            axes[2].fill_between(future_indices, future_pred - future_std, future_pred + future_std,
-                                                alpha=0.2, color='red', label='±1 Std')
-                            axes[2].plot(future_indices, future_pred, 'r-', linewidth=1, label='Future Prediction', alpha=0.8)
-                            
-                            # Add vertical line to separate sequence from prediction
-                            axes[2].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.7, label='Prediction Boundary')
-                            
-                        axes[2].set_title('Transition from Sequence to Future Prediction')
-                        axes[2].set_ylabel('Amplitude')
-                        axes[2].legend()
-                        axes[2].grid(True, alpha=0.3)
-                        
-                        # Plot 4: Full sequence overview
-                        axes[3].plot(y_raw_sample, 'b-', linewidth=1, alpha=0.7, label='Ground Truth (Full Sequence)')
-                        if np.any(future_mask):
-                            future_pred = extended_prediction[future_mask]
-                            future_indices = np.arange(extended_length)[future_mask]
-                            axes[3].plot(future_indices, future_pred, 'r--', linewidth=1, alpha=0.7, label='Future Prediction')
-                            axes[3].axvline(x=raw_signal_length, color='blue', linestyle='--', alpha=0.5, label='Prediction Start')
-                        axes[3].set_title('Full Sequence with Future Prediction')
-                        axes[3].set_ylabel('Amplitude')
-                        axes[3].legend()
-                        axes[3].grid(True, alpha=0.3)
-                        
-                        # Plot 5: Latent representation
-                        im = axes[4].imshow(z_sample, aspect='auto', cmap='viridis', interpolation='nearest')
-                        axes[4].set_title('Latent Representation')
-                        axes[4].set_xlabel('Time Steps')
-                        axes[4].set_ylabel('Latent Dimensions')
-                        plt.colorbar(im, ax=axes[4])
-                        
-                        # Overall title
-                        guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
-                        epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
-                        plt.suptitle(f'Raw Signal Prediction - GUID: {guid}, Epoch: {epoch}, Batch: {idx}\nFuture Window: {prediction_horizon} samples ({prediction_horizon/4.0/60.0:.1f} min)')
-                        
-                        plt.tight_layout()
-                        
-                        # Save plot
-                        plot_filename = f'raw_signal_pred_{guid}_{epoch}_{idx}_sample_{k}.png'
-                        plot_path = os.path.join(save_dir_prediction, plot_filename)
-                        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                        plt.close('all')
-                        
-                        logger.info(f"Saved raw signal plot: {plot_path}")
-                        
-                    except Exception as e:
-                        logger.error(f'Error plotting sample {k}: {e}')
-                        plt.close('all')
-                
-                # Cleanup
-                del forward_outputs, raw_signal_mu, raw_signal_logvar, raw_signal_std, z_latent
+        self.run_analysis_and_plot(test_loader)
 
-    def test_raw_signal_model(self, dataloader, device):
+
+    def run_analysis_and_plot(self, test_loader, num_samples=50):
         """
-        Test raw signal model by analyzing KLD differences and raw signal reconstruction quality.
-        This replaces the old test_seqvae_torch_model method.
-        """
-        if not hasattr(self, 'base_model') or self.base_model is None:
-            logger.error("Base model not initialized. Cannot perform testing.")
-            return
-            
-        save_dir_prediction = os.path.join(self.test_results_dir, 'raw_signal_testing')
-        os.makedirs(save_dir_prediction, exist_ok=True)
-        
-        self.base_model.eval()
-        selected_idx = [1, 10, 20, 30, 35] # Reduced for efficiency
-        
-        with torch.no_grad():
-            for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-                # Access data using correct HDF5 dataset field names
-                y_st = batch_data.fhr_st.to(device)
-                y_ph = batch_data.fhr_ph.to(device)
-                x_ph = batch_data.fhr_up_ph.to(device)
-                y_raw = batch_data.fhr.to(device)
-                guids_list = batch_data.guid if hasattr(batch_data, 'guid') else [f'sample_{i}' for i in range(y_st.size(0))]
-                epochs_list = batch_data.epoch if hasattr(batch_data, 'epoch') else torch.zeros(y_st.size(0))
-                
-                # Forward pass with and without source information (zero out x_ph)
-                forward_outputs = self.base_model(y_st, y_ph, x_ph)
-                forward_outputs_no_source = self.base_model(y_st, y_ph, torch.zeros_like(x_ph))
-                
-                # Extract predictions
-                raw_pred = forward_outputs['mu_pr']
-                raw_pred_no_source = forward_outputs_no_source['mu_pr']
-                z_latent = forward_outputs['z']
-                z_latent_no_source = forward_outputs_no_source['z']
-                
-                # Compute differences
-                raw_signal_diff = raw_pred - raw_pred_no_source
-                latent_diff = z_latent - z_latent_no_source
-                
-                for k in selected_idx:
-                    if k >= y_raw.size(0):
-                        continue
-                        
-                    try:
-                        # Prepare data for plotting
-                        guid = guids_list[k] if isinstance(guids_list, list) else guids_list[k].item()
-                        epoch = epochs_list[k].item() if hasattr(epochs_list[k], 'item') else epochs_list[k]
-                        
-                        # Create comprehensive comparison plots
-                        fig, axes = plt.subplots(5, 1, figsize=(15, 20))
-                        
-                        # Plot 1: Ground truth
-                        y_raw_sample = y_raw[k].squeeze().detach().cpu().numpy()
-                        axes[0].plot(y_raw_sample, 'k-', linewidth=1, label='Ground Truth')
-                        axes[0].set_title('Ground Truth Raw Signal')
-                        axes[0].set_ylabel('Amplitude')
-                        axes[0].legend()
-                        axes[0].grid(True, alpha=0.3)
-                        
-                        # Plot 2: With source vs without source
-                        raw_with_source = raw_pred[k].squeeze().detach().cpu().numpy()
-                        raw_without_source = raw_pred_no_source[k].squeeze().detach().cpu().numpy()
-                        
-                        axes[1].plot(raw_with_source, 'b-', linewidth=1, alpha=0.7, label='With Source')
-                        axes[1].plot(raw_without_source, 'r-', linewidth=1, alpha=0.7, label='Without Source')
-                        axes[1].set_title('Predicted Raw Signal: With vs Without Source')
-                        axes[1].set_ylabel('Amplitude')
-                        axes[1].legend()
-                        axes[1].grid(True, alpha=0.3)
-                        
-                        # Plot 3: Source influence (difference)
-                        raw_diff = raw_signal_diff[k].squeeze().detach().cpu().numpy()
-                        axes[2].plot(raw_diff, 'g-', linewidth=1, label='Source Influence')
-                        axes[2].set_title('Source Influence on Raw Signal Prediction')
-                        axes[2].set_ylabel('Amplitude Difference')
-                        axes[2].legend()
-                        axes[2].grid(True, alpha=0.3)
-                        
-                        # Plot 4: Latent space differences
-                        latent_diff_sample = latent_diff[k].permute(1, 0).detach().cpu().numpy()
-                        im1 = axes[3].imshow(latent_diff_sample, aspect='auto', cmap='RdBu_r', 
-                                           interpolation='nearest', vmin=-latent_diff_sample.std(), 
-                                           vmax=latent_diff_sample.std())
-                        axes[3].set_title('Latent Space Difference (With - Without Source)')
-                        axes[3].set_ylabel('Latent Dimensions')
-                        plt.colorbar(im1, ax=axes[3])
-                        
-                        # Plot 5: Reconstruction quality comparison
-                        axes[4].plot(y_raw_sample, 'k-', linewidth=1.5, alpha=0.8, label='Ground Truth')
-                        axes[4].plot(raw_with_source, 'b--', linewidth=1, alpha=0.7, label='With Source')
-                        axes[4].plot(raw_without_source, 'r:', linewidth=1, alpha=0.7, label='Without Source')
-                        axes[4].set_title('Reconstruction Quality Comparison')
-                        axes[4].set_xlabel('Time Steps')
-                        axes[4].set_ylabel('Amplitude')
-                        axes[4].legend()
-                        axes[4].grid(True, alpha=0.3)
-                        
-                        plt.suptitle(f'Raw Signal Model Test - GUID: {guid}, Epoch: {epoch}, Batch: {idx}')
-                        plt.tight_layout()
-                        
-                        # Save plot
-                        plot_filename = f'raw_signal_test_{guid}_{epoch}_{idx}_sample_{k}.png'
-                        plot_path = os.path.join(save_dir_prediction, plot_filename)
-                        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                        plt.close('all')
-                        
-                        # Compute and log quality metrics
-                        mse_with_source = np.mean((y_raw_sample - raw_with_source) ** 2)
-                        mse_without_source = np.mean((y_raw_sample - raw_without_source) ** 2)
-                        source_influence_magnitude = np.mean(np.abs(raw_diff))
-                        
-                        logger.info(f"Sample {k}: MSE with source: {mse_with_source:.6f}, "
-                                  f"MSE without source: {mse_without_source:.6f}, "
-                                  f"Source influence: {source_influence_magnitude:.6f}")
-                        
-                    except Exception as e:
-                        logger.error(f'Error testing sample {k}: {e}')
-                        plt.close('all')
-                
-                # Cleanup
-                del forward_outputs, forward_outputs_no_source, raw_pred, raw_pred_no_source
-                del z_latent, z_latent_no_source, raw_signal_diff, latent_diff
-                
-        logger.info('Raw signal model testing completed.')
-
-
-    def raw_signal_evaluation_test(self, dataloader, tag="raw_signal_error_stats", device=None):
-        """
-        Comprehensive evaluation of raw signal reconstruction quality.
-        This replaces the old seqvae_mse_test method to work with raw signal architecture.
-        """
-        if not hasattr(self, 'base_model') or self.base_model is None:
-            logger.error("Base model not initialized. Cannot perform evaluation.")
-            return None
-            
-        base_dir = self.test_results_dir
-        self.base_model.to(device)
-        self.base_model.eval()
-        
-        # Metrics for raw signal evaluation
-        mse_all_list = []
-        mse_energy_norm_list = []
-        vaf_all_list = []
-        log_likelihood_list = []
-        raw_signal_list = []
-        snr_all_list = []
-        pearson_corr_list = []
-
-        with torch.no_grad():
-            for idx, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
-                # Access data using correct HDF5 dataset field names
-                y_st = batch_data.fhr_st.to(device)
-                y_ph = batch_data.fhr_ph.to(device) 
-                x_ph = batch_data.fhr_up_ph.to(device)
-                y_raw = batch_data.fhr.to(device)  # Ground truth raw signal
-                
-                # Forward pass to get raw signal predictions
-                forward_outputs = self.base_model(y_st, y_ph, x_ph)
-                
-                # Extract predictions and ground truth
-                raw_pred_mu = forward_outputs['mu_pr']  # (B, 4800)
-                raw_pred_logvar = forward_outputs['logvar_pr']  # (B, 4800)
-                
-                # Ground truth y_raw is expected to be (B, S*16).
-                # Extract the corresponding future window for evaluation
-                B, prediction_horizon = raw_pred_mu.shape
-                raw_signal_length = y_raw.shape[1]
-                
-                # Extract the future window from ground truth
-                sequence_end = raw_signal_length - prediction_horizon
-                if sequence_end <= 0:
-                    continue  # Skip if not enough data
-                    
-                target_future = y_raw[:, sequence_end:sequence_end + prediction_horizon]  # (B, 480)
-                raw_std = torch.exp(0.5 * raw_pred_logvar)  # (B, 480)
-                
-                # MSE calculation on future window
-                mse_per_sample = torch.mean((target_future - raw_pred_mu) ** 2, dim=1)  # (B,)
-                
-                # Energy of the target future window
-                energy_per_sample = torch.mean(target_future ** 2, dim=1)  # (B,)
-                
-                # Energy-normalized MSE
-                energy_normalized_mse = mse_per_sample / (energy_per_sample + 1e-12)
-                
-                # VAF calculation (Variance Accounted For)
-                target_centered = target_future - torch.mean(target_future, dim=1, keepdim=True)
-                pred_centered = raw_pred_mu - torch.mean(raw_pred_mu, dim=1, keepdim=True)
-                
-                numerator = torch.sum(target_centered * pred_centered, dim=1) ** 2
-                denominator = torch.sum(target_centered ** 2, dim=1) * torch.sum(pred_centered ** 2, dim=1)
-                vaf = numerator / (denominator + 1e-12)  # (B,)
-                
-                # Log-likelihood calculation using predicted mean and std
-                log_likelihood = -0.5 * (raw_pred_logvar + 
-                                        ((target_future - raw_pred_mu) ** 2) / 
-                                        (torch.exp(raw_pred_logvar) + 1e-12))
-                log_likelihood_per_sample = torch.mean(log_likelihood, dim=1)  # (B,)
-                
-                # SNR calculation (in dB)
-                signal_power = torch.mean(target_future ** 2, dim=1)  # (B,)
-                noise_power = torch.mean((target_future - raw_pred_mu) ** 2, dim=1)  # (B,)
-                snr = 10.0 * torch.log10((signal_power + 1e-12) / (noise_power + 1e-12))  # (B,)
-                
-                # Pearson correlation coefficient
-                pearson_corr = torch.zeros(target_future.size(0), device=device)
-                for i in range(target_future.size(0)):
-                    y_true = target_future[i]
-                    y_pred = raw_pred_mu[i]
-                    
-                    y_true_centered = y_true - torch.mean(y_true)
-                    y_pred_centered = y_pred - torch.mean(y_pred)
-                    
-                    numerator = torch.sum(y_true_centered * y_pred_centered)
-                    denominator = torch.sqrt(torch.sum(y_true_centered ** 2) * torch.sum(y_pred_centered ** 2))
-                    pearson_corr[i] = numerator / (denominator + 1e-12)
-                
-                # Accumulate results
-                mse_all_list.append(mse_per_sample)
-                mse_energy_norm_list.append(energy_normalized_mse)
-                vaf_all_list.append(vaf)
-                log_likelihood_list.append(log_likelihood_per_sample)
-                raw_signal_list.append(target_future)
-                snr_all_list.append(snr)
-                pearson_corr_list.append(pearson_corr)
-
-        # Create results directory
-        save_dir_hist = os.path.join(base_dir, f'{tag}_results')
-        os.makedirs(save_dir_hist, exist_ok=True)
-
-        # Concatenate all data
-        mse_all_data = torch.cat(mse_all_list, dim=0)  # (N,)
-        mse_energy_normalized = torch.cat(mse_energy_norm_list, dim=0)  # (N,)
-        vaf_all_data = torch.cat(vaf_all_list, dim=0)  # (N,)
-        log_likelihood_all = torch.cat(log_likelihood_list, dim=0)  # (N,)
-        all_raw_signals = torch.cat(raw_signal_list, dim=0)  # (N, signal_length)
-        snr_all_data = torch.cat(snr_all_list, dim=0)  # (N,)
-        pearson_all_data = torch.cat(pearson_corr_list, dim=0)  # (N,)
-        
-        # Convert to numpy for saving
-        mse_np = mse_all_data.detach().cpu().numpy()
-        mse_energy_norm_np = mse_energy_normalized.detach().cpu().numpy()
-        vaf_np = vaf_all_data.detach().cpu().numpy()
-        log_likelihood_np = log_likelihood_all.detach().cpu().numpy()
-        snr_np = snr_all_data.detach().cpu().numpy()
-        pearson_np = pearson_all_data.detach().cpu().numpy()
-        
-        # Calculate statistics
-        stats = {
-            'mse_mean': np.mean(mse_np),
-            'mse_std': np.std(mse_np),
-            'mse_energy_norm_mean': np.mean(mse_energy_norm_np),
-            'mse_energy_norm_std': np.std(mse_energy_norm_np),
-            'vaf_mean': np.mean(vaf_np),
-            'vaf_std': np.std(vaf_np),
-            'log_likelihood_mean': np.mean(log_likelihood_np),
-            'log_likelihood_std': np.std(log_likelihood_np),
-            'snr_mean': np.mean(snr_np),
-            'snr_std': np.std(snr_np),
-            'pearson_mean': np.mean(pearson_np),
-            'pearson_std': np.std(pearson_np),
-        }
-        
-        # Log statistics
-        logger.info("Raw Signal Evaluation Results:")
-        logger.info(f"MSE: {stats['mse_mean']:.6f} ± {stats['mse_std']:.6f}")
-        logger.info(f"Energy-normalized MSE: {stats['mse_energy_norm_mean']:.6f} ± {stats['mse_energy_norm_std']:.6f}")
-        logger.info(f"VAF: {stats['vaf_mean']:.4f} ± {stats['vaf_std']:.4f}")
-        logger.info(f"Log-likelihood: {stats['log_likelihood_mean']:.4f} ± {stats['log_likelihood_std']:.4f}")
-        logger.info(f"SNR (dB): {stats['snr_mean']:.2f} ± {stats['snr_std']:.2f}")
-        logger.info(f"Pearson correlation: {stats['pearson_mean']:.4f} ± {stats['pearson_std']:.4f}")
-        
-        # Save raw data
-        np.save(os.path.join(save_dir_hist, f'{tag}_mse.npy'), mse_np)
-        np.save(os.path.join(save_dir_hist, f'{tag}_mse_energy_norm.npy'), mse_energy_norm_np)
-        np.save(os.path.join(save_dir_hist, f'{tag}_vaf.npy'), vaf_np)
-        np.save(os.path.join(save_dir_hist, f'{tag}_log_likelihood.npy'), log_likelihood_np)
-        np.save(os.path.join(save_dir_hist, f'{tag}_snr.npy'), snr_np)
-        np.save(os.path.join(save_dir_hist, f'{tag}_pearson_corr.npy'), pearson_np)
-        
-        # Save statistics
-        import json
-        with open(os.path.join(save_dir_hist, f'{tag}_statistics.json'), 'w') as f:
-            json.dump(stats, f, indent=2)
-        
-        # Create plots using the available plotting utilities
-        plot_histogram(
-            data=log_likelihood_np,
-            single_channel=True,
-            bins=50,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_log_likelihood'
-        )
-        
-        plot_histogram(
-            data=mse_np,
-            single_channel=True,
-            bins=50,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_mse'
-        )
-        
-        plot_histogram(
-            data=snr_np,
-            single_channel=True,
-            bins=50,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_snr'
-        )
-        
-        plot_histogram(
-            data=vaf_np,
-            single_channel=True,
-            bins=50,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_vaf'
-        )
-        
-        plot_histogram(
-            data=pearson_np,
-            single_channel=True,
-            bins=50,
-            save_dir=save_dir_hist,
-            tag=f'{tag}_pearson_correlation'
-        )
-
-        return all_raw_signals
-
-    # todo: you can make one function for accuracy analysis and combine both
-
-
-    def do_raw_signal_tests(self, test_dataloader):
-        """
-        Run comprehensive testing suite for raw signal TEB-VAE model.
+        Runs a full analysis on randomly selected samples from the test loader and plots the results.
         
         Args:
-            test_dataloader: DataLoader containing test data
+            test_loader: DataLoader for test data
+            num_samples: Number of random samples to analyze and plot (default: 50)
         """
-        logger.info("Starting comprehensive raw signal testing suite")
+        logger.info(f"Starting model analysis and plotting on {num_samples} random samples...")
+        self.create_model()
+
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting analysis.")
+            return
+
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        self.pytorch_model.to(device)
+        self.pytorch_model.eval()
+
+        # Collect all samples from the test loader
+        logger.info("Collecting all samples from test loader...")
+        all_samples = []
+        try:
+            with torch.no_grad():
+                for batch_data in tqdm(test_loader, desc="Collecting samples"):
+                    batch_size = batch_data.fhr_st.size(0)
+                    for i in range(batch_size):
+                        sample = {
+                            'fhr_st': batch_data.fhr_st[i],
+                            'fhr_ph': batch_data.fhr_ph[i],
+                            'fhr_up_ph': batch_data.fhr_up_ph[i],
+                            'fhr': batch_data.fhr[i],
+                            'up': batch_data.up[i]
+                        }
+                        all_samples.append(sample)
+        except Exception as e:
+            logger.error(f"Error collecting samples: {e}")
+            return
+
+        if len(all_samples) == 0:
+            logger.error("No samples found in test loader. Cannot perform analysis.")
+            return
+
+        np.random.seed(42)  # For reproducibility
+        total_samples = len(all_samples)
+        num_samples = min(num_samples, total_samples)
+        selected_indices = np.random.choice(total_samples, size=num_samples, replace=False)
         
-        self.load_pytorch_checkpoint()
-        cuda_device = f"cuda:{self.cuda_devices[0]}"
-        self.pytorch_model.to(cuda_device)
-        
-        # Run all raw signal evaluation methods
-        logger.info("Running raw signal prediction plots...")
-        self.seqvae_raw_signal_plot(test_dataloader, device=cuda_device)
-        
-        logger.info("Running raw signal model testing...")
-        self.test_raw_signal_model(test_dataloader, device=cuda_device)
-        
-        logger.info("Running comprehensive raw signal evaluation...")
-        self.raw_signal_evaluation_test(test_dataloader, tag='comprehensive_eval', device=cuda_device)
-        
-        logger.info("Raw signal testing suite completed successfully")
+        logger.info(f"Selected {num_samples} random samples from {total_samples} total samples")
+        logger.info(f"Selected sample indices: {selected_indices[:10]}..." if num_samples > 10 else f"Selected sample indices: {selected_indices}")
+
+        # Process each selected sample
+        with torch.no_grad():
+            for plot_idx, sample_idx in enumerate(tqdm(selected_indices, desc="Processing selected samples")):
+                try:
+                    sample = all_samples[sample_idx]
+                    
+                    # Move sample data to device and add batch dimension
+                    y_st = sample['fhr_st'].unsqueeze(0).to(device)
+                    y_ph = sample['fhr_ph'].unsqueeze(0).to(device)
+                    x_ph = sample['fhr_up_ph'].unsqueeze(0).to(device)
+                    y_raw = sample['fhr'].unsqueeze(0).to(device)
+                    up_raw = sample['up'].unsqueeze(0).to(device)
+
+                    # Get model outputs
+                    forward_outputs = self.pytorch_model(y_st, y_ph, x_ph)
+                    latent_z = forward_outputs['z']
+                    reconstructed_fhr_mu = forward_outputs['mu_pr']
+                    reconstructed_fhr_logvar = forward_outputs['logvar_pr']
+
+                    # Get KLD
+                    kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
+                    kld_mean_over_channels = kld_tensor.mean(dim=-1)
+
+                    # Move data to CPU and convert to numpy for plotting (remove batch dimension)
+                    raw_fhr_np = y_raw[0].cpu().numpy()
+                    raw_up_np = up_raw[0].cpu().numpy()
+                    fhr_st_np = y_st[0].cpu().numpy().T
+                    fhr_ph_np = y_ph[0].cpu().numpy().T
+                    fhr_up_ph_np = x_ph[0].cpu().numpy().T
+                    latent_z_np = latent_z[0].cpu().numpy().T
+                    reconstructed_fhr_mu_np = reconstructed_fhr_mu[0].cpu().numpy()
+                    reconstructed_fhr_logvar_np = reconstructed_fhr_logvar[0].cpu().numpy()
+                    kld_tensor_np = kld_tensor[0].cpu().numpy().T
+                    kld_mean_over_channels_np = kld_mean_over_channels[0].cpu().numpy()
+
+                    # Generate plots for this sample
+                    plot_model_analysis(
+                        output_dir=self.test_results_dir,
+                        raw_fhr=raw_fhr_np,
+                        raw_up=raw_up_np,
+                        fhr_st=fhr_st_np,
+                        fhr_ph=fhr_ph_np,
+                        fhr_up_ph=fhr_up_ph_np,
+                        latent_z=latent_z_np,
+                        reconstructed_fhr_mu=reconstructed_fhr_mu_np,
+                        reconstructed_fhr_logvar=reconstructed_fhr_logvar_np,
+                        kld_tensor=kld_tensor_np,
+                        kld_mean_over_channels=kld_mean_over_channels_np,
+                        batch_idx=sample_idx  # Use original sample index for unique file naming
+                    )
+                    
+                    # Log progress every 10 samples
+                    if (plot_idx + 1) % 10 == 0:
+                        logger.info(f"Completed analysis for {plot_idx + 1}/{num_samples} samples")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to process sample {sample_idx}: {e}")
+                    continue
+
+        logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
+        logger.info(f"Plots saved to: {self.test_results_dir}")
 
 
 def main(train_SeqVAE=-1, test_SeqVAE=-1):
@@ -1532,10 +1094,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
 
         # Initialize model for testing
         graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
-        graph_model.create_model()
-        
-        # Run comprehensive raw signal testing suite
-        graph_model.do_raw_signal_tests(test_loader_seqvae)
+        graph_model.run_analysis_and_plot(test_loader_seqvae)
 
     # Clean up the process group
     if dist.is_initialized():
@@ -1667,10 +1226,7 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
 
         # Initialize model for testing
         graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
-        graph_model.create_model()
-        
-        # Run comprehensive raw signal testing suite
-        graph_model.do_raw_signal_tests(test_loader_seqvae)
+        graph_model.run_analysis_and_plot(test_loader_seqvae)
 
     # Clean up the process group
     if dist.is_initialized():
