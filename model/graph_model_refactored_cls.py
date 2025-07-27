@@ -439,12 +439,43 @@ class SeqVAEGraphModel:
                     batch_size_test=self.batch_size_test,
                     kl_beta=self.kld_beta_,
                 )
-        print('==' * 50)
+        logger.info('==' * 50)
         trainable_params = sum(p.numel() for p in self.seqvae_lightning_model.parameters() if p.requires_grad)
-        print(f'Trainable params of SeqVAE: {trainable_params}')
-        print('==' * 50)
-        print(self.seqvae_lightning_model)
-        print('\n\n')
+        logger.info(f'Trainable params of SeqVAE: {trainable_params:,}')
+        total_params = sum(p.numel() for p in self.seqvae_lightning_model.parameters())
+        logger.info(f'Total params of SeqVAE: {total_params:,}')
+        model_size_mb = sum(p.numel() * p.element_size() for p in self.seqvae_lightning_model.parameters()) / (1024 * 1024)
+        logger.info(f'Model size: {model_size_mb:.2f} MB')
+        logger.info('==' * 50)
+        logger.info('MODEL ARCHITECTURE:')
+        logger.info(str(self.seqvae_lightning_model))
+        
+        # Log detailed module breakdown
+        logger.info('\n' + '==' * 50)
+        logger.info('DETAILED MODULE BREAKDOWN:')
+        for name, module in self.seqvae_lightning_model.named_modules():
+            if len(list(module.children())) == 0:  # Only leaf modules
+                params = sum(p.numel() for p in module.parameters())
+                if params > 0:
+                    logger.info(f'{name}: {type(module).__name__} - {params:,} parameters')
+        
+        # Log model blocks if available
+        logger.info('\n' + '==' * 50)
+        logger.info('MODEL BLOCKS:')
+        if hasattr(self.seqvae_lightning_model, 'model'):
+            model = self.seqvae_lightning_model.model
+            if hasattr(model, 'encoder'):
+                logger.info(f'Encoder: {type(model.encoder).__name__}')
+                logger.info(str(model.encoder))
+            if hasattr(model, 'decoder'):
+                logger.info(f'Decoder: {type(model.decoder).__name__}')
+                logger.info(str(model.decoder))
+            if hasattr(model, 'prediction_head') or hasattr(model, 'predictor'):
+                pred_head = getattr(model, 'prediction_head', getattr(model, 'predictor', None))
+                if pred_head:
+                    logger.info(f'Prediction Head: {type(pred_head).__name__}')
+                    logger.info(str(pred_head))
+        logger.info('==' * 50)
 
 
     def set_cuda_devices(self, device_list=None):

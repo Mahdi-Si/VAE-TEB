@@ -12,3 +12,5 @@ hdf5_dataset/hie_cs.hdf5
 hdf5_dataset/stats_with_log_transform.hdf5
 hdf5_dataset/stats.hdf5
 model/output/ 
+.output
+documents/

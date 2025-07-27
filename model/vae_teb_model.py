@@ -1055,8 +1055,19 @@ class SeqVaeTeb(nn.Module):
         logvar_prior: torch.Tensor,
         mu_post: torch.Tensor,
         logvar_post: torch.Tensor,
+        reduce_mean: bool = True,
     ) -> torch.Tensor:
-        """Computes the KL divergence between two Gaussian distributions."""
+        """
+        Computes the KL divergence between two Gaussian distributions.
+
+        Args:
+            mu_prior: Mean of the prior distribution.
+            logvar_prior: Log variance of the prior distribution.
+            mu_post: Mean of the posterior distribution.
+            logvar_post: Log variance of the posterior distribution.
+            reduce_mean: If True, returns the mean KLD (scalar). 
+                         If False, returns the KLD tensor (batch, seq_len, latent_dim).
+        """
         kld = (
                 logvar_prior
                 - logvar_post
@@ -1064,15 +1075,17 @@ class SeqVaeTeb(nn.Module):
                 + (logvar_post.exp() + (mu_post - mu_prior).pow(2))
                 / logvar_prior.exp()
         )
-        kld = 0.5 * kld.sum(dim=-1)
-        return kld.mean()
+        kld = 0.5 * kld
+
+        if reduce_mean:
+            return kld.sum(dim=-1).mean()
+        return kld
 
     def forward(
         self,
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
-        y_raw: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass of the SeqVaeTeb model.
@@ -1161,6 +1174,7 @@ class SeqVaeTeb(nn.Module):
                 logvar_prior=forward_outputs["logvar_prior"],
                 mu_post=forward_outputs["mu_post"],
                 logvar_post=forward_outputs["logvar_post"],
+                reduce_mean=True,  # Ensure scalar loss for training
             )
 
         # Total loss
@@ -1174,6 +1188,40 @@ class SeqVaeTeb(nn.Module):
             "total_loss": total_loss,
             "classification_loss": None,  # Required by interface
         }
+
+    def measure_transfer_entropy(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        reduce_mean: bool = False,
+    ) -> torch.Tensor:
+        """
+        Measures the transfer entropy from source (x) to the latent representation (z).
+        This is equivalent to the KL divergence between the posterior q(z|x,y) and the prior p(z|y).
+
+        Args:
+            y_st: Target scattering input (Batch, sequence_len, channels)
+            y_ph: Target phase harmonic input (Batch, sequence_len, channels)
+            x_ph: Source phase harmonic input (Batch, sequence_len, channels)
+            reduce_mean: If True, returns the mean KLD (a scalar). 
+                        If False, returns the KLD for each latent dim at each timestep.
+
+        Returns:
+            The transfer entropy value. A scalar if reduce_mean is True, 
+            or a tensor of shape (batch, seq_len, latent_dim) otherwise.
+        """
+        self.eval()  # Set the model to evaluation mode
+        with torch.no_grad():
+            forward_outputs = self.forward(y_st, y_ph, x_ph)
+            transfer_entropy = self._kld_loss(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"],
+                reduce_mean=reduce_mean,
+            )
+        return transfer_entropy
 
     @staticmethod
     def get_predictions(x, stride=16, new_C=4800):
@@ -1194,6 +1242,286 @@ class SeqVaeTeb(nn.Module):
             y[:, i, start:end] = x[:, i, :length]
         mean = torch.nanmean(y, dim=1)  # → shape (B, new_C)
         return y, mean
+
+class SeqVaeTebClassifier(nn.Module):
+    """
+    Combined model that integrates SeqVaeTeb encoder with FHR Inception Time classifier.
+    
+    This model can:
+    1. Load a pretrained SeqVaeTeb model for feature extraction
+    2. Freeze the SeqVaeTeb encoder during classification training
+    3. Fine-tune the entire model end-to-end
+    4. Perform classification on learned latent representations
+    """
+    
+    def __init__(
+        self,
+        # SeqVaeTeb parameters
+        input_channels: int = 76,
+        sequence_length: int = 300,
+        latent_dim_source: int = 32,
+        latent_dim_target: int = 32,
+        latent_dim_z: int = 32,
+        decimation_factor: int = 16,
+        warmup_period: int = 30,
+        # Classifier parameters
+        num_classes: int = 2,
+        classifier_filters: int = 32,
+        classifier_depth: int = 6,
+        classifier_dropout: float = 0.2,
+        use_attention: bool = True,
+        # Training parameters
+        freeze_vae: bool = True,
+        pretrained_vae_path: Optional[str] = None,
+    ):
+        super().__init__()
+        
+        self.freeze_vae = freeze_vae
+        self.num_classes = num_classes
+        self.latent_dim_z = latent_dim_z
+        
+        # Initialize SeqVaeTeb encoder
+        self.vae_model = SeqVaeTeb(
+            input_channels=input_channels,
+            sequence_length=sequence_length,
+            latent_dim_source=latent_dim_source,
+            latent_dim_target=latent_dim_target,
+            latent_dim_z=latent_dim_z,
+            decimation_factor=decimation_factor,
+            warmup_period=warmup_period,
+        )
+        
+        # Load pretrained VAE if provided
+        if pretrained_vae_path is not None:
+            self.load_pretrained_vae(pretrained_vae_path)
+        
+        # Freeze VAE parameters if specified
+        if freeze_vae:
+            self.freeze_vae_parameters()
+        
+        # Import FHRInceptionTimeClassifier
+        try:
+            from .inception_time import FHRInceptionTimeClassifier
+        except ImportError:
+            from inception_time import FHRInceptionTimeClassifier
+        
+        # Initialize classifier
+        self.classifier = FHRInceptionTimeClassifier(
+            input_size=latent_dim_z,
+            num_classes=num_classes,
+            filters=classifier_filters,
+            depth=classifier_depth,
+            dropout=classifier_dropout,
+            use_attention=use_attention
+        )
+        
+        # Loss function for classification
+        self.classification_criterion = nn.CrossEntropyLoss()
+        
+    def load_pretrained_vae(self, pretrained_path: str):
+        """Load pretrained SeqVaeTeb weights."""
+        try:
+            checkpoint = torch.load(pretrained_path, map_location='cpu')
+            
+            if 'model_state_dict' in checkpoint:
+                vae_state_dict = checkpoint['model_state_dict']
+            elif 'state_dict' in checkpoint:
+                vae_state_dict = checkpoint['state_dict']
+            else:
+                vae_state_dict = checkpoint
+            
+            # Load weights with strict=False to allow for missing keys
+            missing_keys, unexpected_keys = self.vae_model.load_state_dict(vae_state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"Warning: Missing keys when loading VAE: {missing_keys}")
+            if unexpected_keys:
+                print(f"Warning: Unexpected keys when loading VAE: {unexpected_keys}")
+                
+            print(f"Successfully loaded pretrained VAE from {pretrained_path}")
+            
+        except Exception as e:
+            print(f"Error loading pretrained VAE: {e}")
+            print("Continuing with random initialization...")
+    
+    def freeze_vae_parameters(self):
+        """Freeze all VAE parameters to prevent updates during classification training."""
+        for param in self.vae_model.parameters():
+            param.requires_grad = False
+        print("Frozen VAE parameters for classification training")
+    
+    def unfreeze_vae_parameters(self):
+        """Unfreeze VAE parameters for end-to-end fine-tuning."""
+        for param in self.vae_model.parameters():
+            param.requires_grad = True
+        print("Unfrozen VAE parameters for end-to-end training")
+    
+    def extract_latent_features(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        return_all_outputs: bool = False
+    ):
+        """
+        Extract latent features from the VAE encoder.
+        
+        Args:
+            y_st: Target scattering input (batch, 300, 43)
+            y_ph: Target phase harmonic input (batch, 300, 44)
+            x_ph: Source phase harmonic input (batch, 300, 130)
+            return_all_outputs: Whether to return all VAE outputs or just latent z
+            
+        Returns:
+            latent_z: Latent representations (batch, 300, 32)
+            vae_outputs: Full VAE outputs (if return_all_outputs=True)
+        """
+        # Set VAE to eval mode if frozen
+        if self.freeze_vae:
+            self.vae_model.eval()
+        
+        # Forward pass through VAE
+        with torch.set_grad_enabled(not self.freeze_vae):
+            vae_outputs = self.vae_model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        
+        latent_z = vae_outputs['z']  # (batch, 300, 32)
+        
+        if return_all_outputs:
+            return latent_z, vae_outputs
+        return latent_z
+    
+    def forward(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        return_latent: bool = False
+    ):
+        """
+        Forward pass for classification.
+        
+        Args:
+            y_st: Target scattering input (batch, 300, 43)
+            y_ph: Target phase harmonic input (batch, 300, 44)  
+            x_ph: Source phase harmonic input (batch, 300, 130)
+            labels: Ground truth labels for loss computation (batch,)
+            return_latent: Whether to return latent representations
+            
+        Returns:
+            Dictionary containing classification results and optionally latent features
+        """
+        # Extract latent features
+        latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
+        
+        # Classification
+        logits = self.classifier(latent_z)  # (batch, num_classes)
+        
+        # Compute loss if labels provided
+        classification_loss = None
+        if labels is not None:
+            classification_loss = self.classification_criterion(logits, labels)
+        
+        # Prepare outputs
+        outputs = {
+            'logits': logits,
+            'probabilities': F.softmax(logits, dim=-1),
+            'predictions': torch.argmax(logits, dim=-1),
+            'classification_loss': classification_loss,
+        }
+        
+        if return_latent:
+            outputs['latent_z'] = latent_z
+            
+        return outputs
+    
+    def compute_loss(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        labels: torch.Tensor,
+        y_raw: Optional[torch.Tensor] = None,
+        compute_vae_loss: bool = False,
+        vae_loss_weight: float = 0.1
+    ):
+        """
+        Compute combined loss for classification and optionally VAE reconstruction.
+        
+        Args:
+            y_st, y_ph, x_ph: Input tensors
+            labels: Classification labels (batch,)
+            y_raw: Raw signal for VAE loss computation (batch, 4800)
+            compute_vae_loss: Whether to include VAE reconstruction loss
+            vae_loss_weight: Weight for VAE loss component
+            
+        Returns:
+            Dictionary of loss components
+        """
+        # Get classification outputs
+        if compute_vae_loss and y_raw is not None:
+            # Need full VAE outputs for reconstruction loss
+            latent_z, vae_outputs = self.extract_latent_features(
+                y_st, y_ph, x_ph, return_all_outputs=True
+            )
+            
+            # Compute VAE losses
+            vae_losses = self.vae_model.compute_loss(
+                forward_outputs=vae_outputs,
+                y_st=y_st,
+                y_ph=y_ph,
+                y_raw=y_raw,
+                compute_kld_loss=True
+            )
+            vae_total_loss = vae_losses['total_loss']
+        else:
+            latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
+            vae_total_loss = torch.tensor(0.0, device=latent_z.device)
+        
+        # Classification loss
+        logits = self.classifier(latent_z)
+        classification_loss = self.classification_criterion(logits, labels)
+        
+        # Combined loss
+        total_loss = classification_loss + vae_loss_weight * vae_total_loss
+        
+        return {
+            'classification_loss': classification_loss,
+            'vae_loss': vae_total_loss,
+            'total_loss': total_loss,
+            'logits': logits,
+            'probabilities': F.softmax(logits, dim=-1),
+            'predictions': torch.argmax(logits, dim=-1),
+        }
+    
+    def predict(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        return_probabilities: bool = True
+    ):
+        """
+        Make predictions on input data.
+        
+        Args:
+            y_st, y_ph, x_ph: Input tensors
+            return_probabilities: Whether to return class probabilities
+            
+        Returns:
+            Predictions and optionally probabilities
+        """
+        self.eval()
+        with torch.no_grad():
+            outputs = self.forward(
+                y_st=y_st, y_ph=y_ph, x_ph=x_ph,
+                labels=None, return_latent=False
+            )
+        
+        if return_probabilities:
+            return outputs['predictions'], outputs['probabilities']
+        return outputs['predictions']
+
 
 if __name__ == "__main__":
 
