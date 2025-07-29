@@ -108,8 +108,9 @@ def plot_model_analysis(
         if y_raw_unnormalized is None or up_raw_unnormalized is None:
             raise ValueError("Training mode requires y_raw_unnormalized and up_raw_unnormalized for the first plot")
     else:
-        # Original analysis mode: 4x2 layout for 8 subplots  
-        fig, ax = plt.subplots(4, 2, figsize=(18, 20), constrained_layout=True)
+        # Original analysis mode: 8 rows, single column layout like _plot_results  
+        n_rows = 8
+        fig, ax = plt.subplots(n_rows, 1, figsize=(16, n_rows * 3), constrained_layout=True)
 
     # Common settings for subplots
     if training_mode:
@@ -126,18 +127,18 @@ def plot_model_analysis(
             ax[i, 0].spines['left'].set_linewidth(0.7)
             ax[i, 0].spines['bottom'].set_linewidth(0.7)
     else:
-        # Original mode: apply to all subplots
-        for axis in ax.flatten():
-            axis.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-            axis.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
-            axis.minorticks_on()
-            axis.set_axisbelow(True)
-            axis.spines['top'].set_visible(False)
-            axis.spines['right'].set_visible(False)
-            axis.spines['left'].set_color('#A2B9A7')
-            axis.spines['bottom'].set_color('#A2B9A7')
-            axis.spines['left'].set_linewidth(0.7)
-            axis.spines['bottom'].set_linewidth(0.7)
+        # Original mode: apply to all subplots (now single column)
+        for i in range(n_rows):
+            ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+            ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[i].minorticks_on()
+            ax[i].set_axisbelow(True)
+            ax[i].spines['top'].set_visible(False)
+            ax[i].spines['right'].set_visible(False)
+            ax[i].spines['left'].set_color('#A2B9A7')
+            ax[i].spines['bottom'].set_color('#A2B9A7')
+            ax[i].spines['left'].set_linewidth(0.7)
+            ax[i].spines['bottom'].set_linewidth(0.7)
 
     if training_mode:
         # Training callback mode: 4 specific subplots in single column layout
@@ -286,77 +287,77 @@ def plot_model_analysis(
         
         # 1. Raw FHR and UP
         t_raw = np.arange(raw_fhr.shape[0]) / 4.0  # Assuming 4Hz
-        ax[0, 0].plot(t_raw, raw_fhr, color=colors['fhr'], label='Raw FHR', linewidth=1.2)
-        ax[0, 0].plot(t_raw, raw_up, color=colors['up'], label='Raw UP', linewidth=1.2)
-        ax[0, 0].set_title('Raw Input Signals')
-        ax[0, 0].set_xlabel('Time (s)')
-        ax[0, 0].set_ylabel('Amplitude')
-        ax[0, 0].legend()
-        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[0].plot(t_raw, raw_fhr, color=colors['fhr'], label='Raw FHR', linewidth=1.2)
+        ax[0].plot(t_raw, raw_up, color=colors['up'], label='Raw UP', linewidth=1.2)
+        ax[0].set_title('Raw Input Signals')
+        ax[0].set_xlabel('Time (s)')
+        ax[0].set_ylabel('Amplitude')
+        ax[0].legend()
+        ax[0].autoscale(enable=True, axis='x', tight=True)
 
         # Calculate KLD mean for display in original mode
         kld_overall_mean = np.mean(kld_mean_over_channels) if kld_mean_over_channels is not None else 0
         
         # 2. FHR Reconstruction with Uncertainty
-        ax[0, 1].plot(t_raw, raw_fhr, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
-        ax[0, 1].plot(t_raw, reconstructed_fhr_mu, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5)
+        ax[1].plot(t_raw, raw_fhr, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
+        ax[1].plot(t_raw, reconstructed_fhr_mu, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5)
         std_dev = np.exp(0.5 * reconstructed_fhr_logvar)
-        ax[0, 1].fill_between(
+        ax[1].fill_between(
             t_raw, reconstructed_fhr_mu - std_dev, reconstructed_fhr_mu + std_dev,
             color=colors['uncertainty'], alpha=0.4, label='Uncertainty (±1σ)')
-        ax[0, 1].set_title('FHR Reconstruction')
-        ax[0, 1].set_xlabel('Time (s)')
-        ax[0, 1].set_ylabel('Amplitude')
-        ax[0, 1].legend()
-        ax[0, 1].autoscale(enable=True, axis='x', tight=True)
+        ax[1].set_title('FHR Reconstruction')
+        ax[1].set_xlabel('Time (s)')
+        ax[1].set_ylabel('Amplitude')
+        ax[1].legend()
+        ax[1].autoscale(enable=True, axis='x', tight=True)
 
         # 3. Latent Space z
-        im_z = ax[1, 0].imshow(latent_z, aspect='auto', cmap='bwr', origin='lower')
-        ax[1, 0].grid(False)  # Remove grid lines
-        ax[1, 0].set_title('Latent Space (z)')
-        ax[1, 0].set_xlabel('Time Steps')
-        ax[1, 0].set_ylabel('Latent Dimensions')
-        fig.colorbar(im_z, ax=ax[1, 0])
+        im_z = ax[2].imshow(latent_z, aspect='auto', cmap='bwr', origin='lower')
+        ax[2].grid(False)  # Remove grid lines
+        ax[2].set_title('Latent Space (z)')
+        ax[2].set_xlabel('Time Steps')
+        ax[2].set_ylabel('Latent Dimensions')
+        fig.colorbar(im_z, ax=ax[2])
 
         # 4. KLD Tensor
-        im_kld = ax[1, 1].imshow(kld_tensor, aspect='auto', cmap='bwr', origin='lower')
-        ax[1, 1].grid(False)  # Remove grid lines
-        ax[1, 1].set_title(f'KLD Tensor (Mean: {kld_overall_mean:.4f})')
-        ax[1, 1].set_xlabel('Time Steps')
-        ax[1, 1].set_ylabel('Latent Dimensions')
-        fig.colorbar(im_kld, ax=ax[1, 1])
+        im_kld = ax[3].imshow(kld_tensor, aspect='auto', cmap='bwr', origin='lower')
+        ax[3].grid(False)  # Remove grid lines
+        ax[3].set_title(f'KLD Tensor (Mean: {kld_overall_mean:.4f})')
+        ax[3].set_xlabel('Time Steps')
+        ax[3].set_ylabel('Latent Dimensions')
+        fig.colorbar(im_kld, ax=ax[3])
 
         # 5. Mean KLD over time
         t_latent = np.arange(kld_mean_over_channels.shape[0])
-        ax[2, 0].plot(t_latent, kld_mean_over_channels, color=colors['kld'], linewidth=1.5)
-        ax[2, 0].set_title(f'Mean KLD Across Channels (Overall Mean: {kld_overall_mean:.4f})')
-        ax[2, 0].set_xlabel('Time Steps')
-        ax[2, 0].set_ylabel('KLD')
-        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[4].plot(t_latent, kld_mean_over_channels, color=colors['kld'], linewidth=1.5)
+        ax[4].set_title(f'Mean KLD Across Channels (Overall Mean: {kld_overall_mean:.4f})')
+        ax[4].set_xlabel('Time Steps')
+        ax[4].set_ylabel('KLD')
+        ax[4].autoscale(enable=True, axis='x', tight=True)
 
         # 6. fhr_st
-        im_st = ax[2, 1].imshow(fhr_st, aspect='auto', cmap='bwr', origin='lower')
-        ax[2, 1].grid(False)  # Remove grid lines
-        ax[2, 1].set_title('FHR Scattering Transform (fhr_st)')
-        ax[2, 1].set_xlabel('Time Steps')
-        ax[2, 1].set_ylabel('Channels')
-        fig.colorbar(im_st, ax=ax[2, 1])
+        im_st = ax[5].imshow(fhr_st, aspect='auto', cmap='bwr', origin='lower')
+        ax[5].grid(False)  # Remove grid lines
+        ax[5].set_title('FHR Scattering Transform (fhr_st)')
+        ax[5].set_xlabel('Time Steps')
+        ax[5].set_ylabel('Channels')
+        fig.colorbar(im_st, ax=ax[5])
 
         # 7. fhr_ph
-        im_ph = ax[3, 0].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='lower')
-        ax[3, 0].grid(False)  # Remove grid lines
-        ax[3, 0].set_title('FHR Phase Harmonics (fhr_ph)')
-        ax[3, 0].set_xlabel('Time Steps')
-        ax[3, 0].set_ylabel('Channels')
-        fig.colorbar(im_ph, ax=ax[3, 0])
+        im_ph = ax[6].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='lower')
+        ax[6].grid(False)  # Remove grid lines
+        ax[6].set_title('FHR Phase Harmonics (fhr_ph)')
+        ax[6].set_xlabel('Time Steps')
+        ax[6].set_ylabel('Channels')
+        fig.colorbar(im_ph, ax=ax[6])
 
         # 8. fhr_up_ph
-        im_up_ph = ax[3, 1].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='lower')
-        ax[3, 1].grid(False)  # Remove grid lines
-        ax[3, 1].set_title('UP Phase Harmonics (fhr_up_ph)')
-        ax[3, 1].set_xlabel('Time Steps')
-        ax[3, 1].set_ylabel('Channels')
-        fig.colorbar(im_up_ph, ax=ax[3, 1])
+        im_up_ph = ax[7].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='lower')
+        ax[7].grid(False)  # Remove grid lines
+        ax[7].set_title('UP Phase Harmonics (fhr_up_ph)')
+        ax[7].set_xlabel('Time Steps')
+        ax[7].set_ylabel('Channels')
+        fig.colorbar(im_up_ph, ax=ax[7])
 
         fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='bold')
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
