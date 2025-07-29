@@ -27,7 +27,10 @@ def plot_model_analysis(
     logvar_pr: np.ndarray = None,
     loss_dict: dict = None,
     epoch: int = 0,
-    training_mode: bool = False
+    training_mode: bool = False,
+    # New parameters for analysis mode with both normalized and unnormalized data
+    raw_fhr_normalized: np.ndarray = None,
+    raw_up_normalized: np.ndarray = None
 ):
     """
     Generates and saves a comprehensive plot for model analysis.
@@ -35,8 +38,8 @@ def plot_model_analysis(
     Args:
         output_dir (str): Directory to save the plot.
         # Original analysis mode parameters
-        raw_fhr (np.ndarray): Raw FHR signal. Shape: (N,).
-        raw_up (np.ndarray): Raw UP signal. Shape: (N,).
+        raw_fhr (np.ndarray): Raw FHR signal (unnormalized for first plot). Shape: (N,).
+        raw_up (np.ndarray): Raw UP signal (unnormalized for first plot). Shape: (N,).
         fhr_st (np.ndarray): Scattering transform of FHR. Shape: (C, L).
         fhr_ph (np.ndarray): Phase harmonics of FHR. Shape: (C, L).
         fhr_up_ph (np.ndarray): Phase harmonics of UP. Shape: (C, L).
@@ -58,6 +61,9 @@ def plot_model_analysis(
         loss_dict (dict): Dictionary containing loss values (KLD, MSE, NLL, total_rec, total_loss).
         epoch (int): Current training epoch.
         training_mode (bool): Whether to use training callback mode (4 subplots) or analysis mode (8 subplots).
+        # Analysis mode additional parameters
+        raw_fhr_normalized (np.ndarray): Normalized FHR signal for reconstruction comparison. Shape: (N,).
+        raw_up_normalized (np.ndarray): Normalized UP signal (if needed). Shape: (N,).
     """
     
     # Professional scientific paper color palette
@@ -289,9 +295,9 @@ def plot_model_analysis(
         t_raw = np.arange(raw_fhr.shape[0]) / 4.0  # Assuming 4Hz
         ax[0].plot(t_raw, raw_fhr, color=colors['fhr'], label='Raw FHR', linewidth=1.2)
         ax[0].plot(t_raw, raw_up, color=colors['up'], label='Raw UP', linewidth=1.2)
-        ax[0].set_title('Raw Input Signals')
+        ax[0].set_title('Raw Input Signals (Unnormalized)')
         ax[0].set_xlabel('Time (s)')
-        ax[0].set_ylabel('Amplitude')
+        ax[0].set_ylabel('Original Amplitude')
         ax[0].legend()
         ax[0].autoscale(enable=True, axis='x', tight=True)
 
@@ -299,15 +305,17 @@ def plot_model_analysis(
         kld_overall_mean = np.mean(kld_mean_over_channels) if kld_mean_over_channels is not None else 0
         
         # 2. FHR Reconstruction with Uncertainty
-        ax[1].plot(t_raw, raw_fhr, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
+        # Use normalized FHR for reconstruction comparison if available, otherwise use raw_fhr
+        fhr_for_reconstruction = raw_fhr_normalized if raw_fhr_normalized is not None else raw_fhr
+        ax[1].plot(t_raw, fhr_for_reconstruction, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
         ax[1].plot(t_raw, reconstructed_fhr_mu, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5)
         std_dev = np.exp(0.5 * reconstructed_fhr_logvar)
         ax[1].fill_between(
             t_raw, reconstructed_fhr_mu - std_dev, reconstructed_fhr_mu + std_dev,
             color=colors['uncertainty'], alpha=0.4, label='Uncertainty (±1σ)')
-        ax[1].set_title('FHR Reconstruction')
+        ax[1].set_title('FHR Reconstruction (Normalized Space)')
         ax[1].set_xlabel('Time (s)')
-        ax[1].set_ylabel('Amplitude')
+        ax[1].set_ylabel('Normalized Amplitude')
         ax[1].legend()
         ax[1].autoscale(enable=True, axis='x', tight=True)
 
