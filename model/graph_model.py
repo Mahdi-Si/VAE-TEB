@@ -39,6 +39,43 @@ torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms
 torch.backends.cudnn.allow_tf32 = True  # Enable TF32 on Ampere GPUs for speed
 torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matrix operations
 
+def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, normalization_stats: dict) -> torch.Tensor:
+    """
+    Denormalize FHR or UP signal data using normalization statistics.
+    
+    Args:
+        normalized_data: Normalized tensor data (shape: any)
+        field_name: Name of the field ('fhr' or 'up')
+        normalization_stats: Dictionary containing normalization statistics
+        
+    Returns:
+        Denormalized tensor data
+    """
+    if field_name not in normalization_stats:
+        logger.warning(f"No normalization stats found for field '{field_name}'. Returning data as-is.")
+        return normalized_data
+    
+    if field_name not in ['fhr', 'up']:
+        logger.warning(f"Denormalization only supported for 'fhr' and 'up' fields, got '{field_name}'. Returning data as-is.")
+        return normalized_data
+    
+    stats = normalization_stats[field_name]
+    
+    # Get mean and std tensors (these should be scalars for fhr/up)
+    if 'mean_tensor' in stats and 'std_tensor' in stats:
+        mean_tensor = stats['mean_tensor']
+        std_tensor = stats['std_tensor']
+    else:
+        # Fallback to creating tensors from scalar values
+        mean_tensor = torch.tensor(stats['mean'], dtype=normalized_data.dtype, device=normalized_data.device)
+        std_tensor = torch.tensor(stats['std'], dtype=normalized_data.dtype, device=normalized_data.device)
+    
+    # Denormalize: original = normalized * std + mean
+    epsilon = 1e-8
+    denormalized_data = normalized_data * (std_tensor + epsilon) + mean_tensor
+    
+    return denormalized_data
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYDEVD_USE_CYTHON']="NO"
@@ -886,6 +923,15 @@ class SeqVAEGraphModel:
         self.pytorch_model.to(device)
         self.pytorch_model.eval()
 
+        # Get normalization stats from the dataset for denormalization
+        normalization_stats = None
+        if hasattr(test_loader.dataset, 'get_normalization_stats'):
+            normalization_stats = test_loader.dataset.get_normalization_stats()
+            if normalization_stats:
+                logger.info("Found normalization stats for denormalizing FHR and UP signals")
+            else:
+                logger.warning("No normalization stats available - will use normalized data for plotting")
+
         # Collect all samples from the test loader
         logger.info("Collecting all samples from test loader...")
         all_samples = []
@@ -945,9 +991,29 @@ class SeqVAEGraphModel:
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
                     kld_mean_over_channels = kld_tensor.mean(dim=-1)
 
-                    # Move data to CPU and convert to numpy for plotting (remove batch dimension)
-                    raw_fhr_np = y_raw[0].cpu().numpy()
-                    raw_up_np = up_raw[0].cpu().numpy()
+                    # Denormalize FHR and UP signals if normalization stats are available
+                    if normalization_stats:
+                        # Denormalize the normalized signals to get the original raw signals
+                        raw_fhr_denormalized = denormalize_signal_data(y_raw[0], 'fhr', normalization_stats)
+                        raw_up_denormalized = denormalize_signal_data(up_raw[0], 'up', normalization_stats)
+                        raw_fhr_np = raw_fhr_denormalized.cpu().numpy()
+                        raw_up_np = raw_up_denormalized.cpu().numpy()
+                        
+                        # Log info for first sample to confirm denormalization is working
+                        if plot_idx == 0:
+                            logger.info(f"Using denormalized FHR and UP signals for plotting")
+                            logger.info(f"FHR range: [{raw_fhr_np.min():.2f}, {raw_fhr_np.max():.2f}]")
+                            logger.info(f"UP range: [{raw_up_np.min():.2f}, {raw_up_np.max():.2f}]")
+                    else:
+                        # Use normalized data if no stats available
+                        raw_fhr_np = y_raw[0].cpu().numpy()
+                        raw_up_np = up_raw[0].cpu().numpy()
+                        
+                        # Log warning for first sample
+                        if plot_idx == 0:
+                            logger.warning("Using normalized FHR and UP signals for plotting (no denormalization stats available)")
+                        
+                    # Move other data to CPU and convert to numpy for plotting (remove batch dimension)
                     fhr_st_np = y_st[0].cpu().numpy().T
                     fhr_ph_np = y_ph[0].cpu().numpy().T
                     fhr_up_ph_np = x_ph[0].cpu().numpy().T
