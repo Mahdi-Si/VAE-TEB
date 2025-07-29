@@ -164,8 +164,9 @@ class PlottingCallBack(Callback):
         
         # Create figure with 4 rows, 2 columns (main plot + colorbar)
         n_rows = 4
-        fig, ax = plt.subplots(nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
-                              gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
+        fig, ax = plt.subplots(
+            nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
+            gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
         
         # Configure scientific paper grid style for all subplots
         for i in range(n_rows):
@@ -210,8 +211,9 @@ class PlottingCallBack(Callback):
         
         # Handle different formats of mu_samples
         if len(mu_samples.shape) == 1:  # (4800,) format - single prediction
-            ax[2, 0].plot(t_in, mu_samples, linewidth=1.5, color=colors['samples'], 
-                         label='Model Prediction', alpha=0.85, zorder=1)
+            ax[2, 0].plot(
+                t_in, mu_samples, linewidth=1.5, color=colors['samples'], 
+                label='Model Prediction', alpha=0.85, zorder=1)
         else:  # (300, 4800) format - multiple predictions
             # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
             selected_indices = [idx for idx in [30, 60, 90, 120, 150, 180, 210, 240, 270] if idx < mu_samples.shape[0]]
@@ -231,12 +233,14 @@ class PlottingCallBack(Callback):
                     else:
                         summed_samples[i] = 0
                 
-                ax[2, 0].plot(t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
-                             label='Selected Samples Sum', alpha=0.85, zorder=1)
+                ax[2, 0].plot(
+                    t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
+                    label='Selected Samples Sum', alpha=0.85, zorder=1)
             else:
                 # Fallback to first sample if no valid indices
-                ax[2, 0].plot(t_in, mu_samples[0, :], linewidth=1.5, color=colors['samples'], 
-                             label='First Sample', alpha=0.85, zorder=1)
+                ax[2, 0].plot(
+                    t_in, mu_samples[0, :], linewidth=1.5, color=colors['samples'], 
+                    label='First Sample', alpha=0.85, zorder=1)
         
         ax[2, 0].set_ylabel('FHR (bpm)', fontweight='normal')
         ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
@@ -244,7 +248,7 @@ class PlottingCallBack(Callback):
         ax[2, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Subplot 4: latent_z with imshow
-        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='viridis', origin='lower', interpolation='bilinear')
+        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='bwr', origin='lower')
         ax[3, 1].set_axis_on()
         cbar = fig.colorbar(imgplot, cax=ax[3, 1])
         cbar.ax.tick_params(labelsize=10, colors='#666666')
