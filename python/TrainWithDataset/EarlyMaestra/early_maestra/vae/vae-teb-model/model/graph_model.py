@@ -864,10 +864,10 @@ class SeqVAEGraphModel:
         """
         Runs tests on the SeqVaeTeb model by performing analysis and plotting on random samples.
         """
-        self.run_analysis_and_plot(test_loader)
+        self.run_analysis_and_plot(test_loader, 200)
 
 
-    def run_analysis_and_plot(self, test_loader, num_samples=50):
+    def run_analysis_and_plot(self, test_loader, num_samples=200):
         """
         Runs a full analysis on randomly selected samples from the test loader and plots the results.
         
@@ -937,7 +937,11 @@ class SeqVAEGraphModel:
                     reconstructed_fhr_mu = forward_outputs['mu_pr']
                     reconstructed_fhr_logvar = forward_outputs['logvar_pr']
 
-                    # Get KLD
+                    # Compute loss the same way as training to get consistent KLD values
+                    loss_dict = self.pytorch_model.compute_loss(
+                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                    
+                    # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
                     kld_mean_over_channels = kld_tensor.mean(dim=-1)
 
@@ -966,7 +970,8 @@ class SeqVAEGraphModel:
                         reconstructed_fhr_logvar=reconstructed_fhr_logvar_np,
                         kld_tensor=kld_tensor_np,
                         kld_mean_over_channels=kld_mean_over_channels_np,
-                        batch_idx=sample_idx  # Use original sample index for unique file naming
+                        batch_idx=sample_idx,  # Use original sample index for unique file naming
+                        loss_dict=loss_dict  # Pass training-consistent loss values
                     )
                     
                     # Log progress every 10 samples
@@ -981,7 +986,7 @@ class SeqVAEGraphModel:
         logger.info(f"Plots saved to: {self.test_results_dir}")
 
 
-def main(train_SeqVAE=-1, test_SeqVAE=-1):
+def main(train_SeqVAE=1, test_SeqVAE=-1):
     np.random.seed(42)
     torch.manual_seed(42)
     sklearn.utils.check_random_state(42)
@@ -1094,7 +1099,7 @@ def main(train_SeqVAE=-1, test_SeqVAE=-1):
 
         # Initialize model for testing
         graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
-        graph_model.run_analysis_and_plot(test_loader_seqvae)
+        graph_model.run_tests(test_loader_seqvae)
 
     # Clean up the process group
     if dist.is_initialized():
@@ -1236,8 +1241,8 @@ def main_pytorch(rank, world_size, train_SeqVAE, test_SeqVAE):
 if __name__ == '__main__':
     # Set training parameters directly
     use_pytorch_ddp = False  # Set to True to use PyTorch DDP, False for PyTorch Lightning
-    train_model = 1  # 1 to train, -1 to skip
-    test_model = -1  # 1 to test, -1 to skip
+    train_model = -1  # 1 to train, -1 to skip
+    test_model = 1  # 1 to test, -1 to skip
     
     if use_pytorch_ddp:
         import yaml

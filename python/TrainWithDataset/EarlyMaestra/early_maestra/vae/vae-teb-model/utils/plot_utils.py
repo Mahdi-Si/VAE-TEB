@@ -19,6 +19,8 @@ def plot_model_analysis(
     # New parameters for training callback
     y_raw_normalized: np.ndarray = None,
     up_raw_normalized: np.ndarray = None,
+    y_raw_unnormalized: np.ndarray = None,
+    up_raw_unnormalized: np.ndarray = None,
     mu_pr_means: np.ndarray = None,
     log_var_means: np.ndarray = None,
     mu_pr: np.ndarray = None,
@@ -45,8 +47,10 @@ def plot_model_analysis(
         kld_mean_over_channels (np.ndarray): KLD mean over channels. Shape: (L,).
         batch_idx (int): Index of the sample in the batch for file naming.
         # Training callback mode parameters
-        y_raw_normalized (np.ndarray): Raw FHR signal. Shape: (4800,).
-        up_raw_normalized (np.ndarray): Raw UP signal. Shape: (4800,).
+        y_raw_normalized (np.ndarray): Normalized raw FHR signal. Shape: (4800,).
+        up_raw_normalized (np.ndarray): Normalized raw UP signal. Shape: (4800,).
+        y_raw_unnormalized (np.ndarray): Unnormalized raw FHR signal. Shape: (4800,).
+        up_raw_unnormalized (np.ndarray): Unnormalized raw UP signal. Shape: (4800,).
         mu_pr_means (np.ndarray): Mean reconstruction of FHR. Shape: (4800,).
         log_var_means (np.ndarray): Log variance of reconstruction. Shape: (4800,).
         mu_pr (np.ndarray): Per-timestep reconstructions. Shape: (300, 4800).
@@ -92,130 +96,190 @@ def plot_model_analysis(
     })
 
     if training_mode:
-        # Training callback mode: 2x2 layout for 4 specific subplots
-        fig, ax = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=True)
-        ax = ax.flatten()
+        # Training callback mode: 4 rows, 2 columns (main plot + colorbar) like PlottingCallBack
+        n_rows = 4
+        fig, ax = plt.subplots(
+            nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
+            gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
         
         # Use training callback data
         if y_raw_normalized is None or up_raw_normalized is None:
             raise ValueError("Training mode requires y_raw_normalized and up_raw_normalized")
+        if y_raw_unnormalized is None or up_raw_unnormalized is None:
+            raise ValueError("Training mode requires y_raw_unnormalized and up_raw_unnormalized for the first plot")
     else:
         # Original analysis mode: 4x2 layout for 8 subplots  
         fig, ax = plt.subplots(4, 2, figsize=(18, 20), constrained_layout=True)
 
     # Common settings for subplots
-    for axis in ax.flatten():
-        axis.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        axis.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
-        axis.minorticks_on()
-        axis.set_axisbelow(True)
-        axis.spines['top'].set_visible(False)
-        axis.spines['right'].set_visible(False)
-        axis.spines['left'].set_color('#A2B9A7')
-        axis.spines['bottom'].set_color('#A2B9A7')
-        axis.spines['left'].set_linewidth(0.7)
-        axis.spines['bottom'].set_linewidth(0.7)
+    if training_mode:
+        # Configure scientific paper grid style for main plots only (left column)
+        for i in range(n_rows):
+            ax[i, 0].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[i, 0].minorticks_on()
+            ax[i, 0].set_axisbelow(True)
+            ax[i, 0].spines['top'].set_visible(False)
+            ax[i, 0].spines['right'].set_visible(False)
+            ax[i, 0].spines['left'].set_color('#A2B9A7')
+            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
+            ax[i, 0].spines['left'].set_linewidth(0.7)
+            ax[i, 0].spines['bottom'].set_linewidth(0.7)
+    else:
+        # Original mode: apply to all subplots
+        for axis in ax.flatten():
+            axis.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+            axis.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            axis.minorticks_on()
+            axis.set_axisbelow(True)
+            axis.spines['top'].set_visible(False)
+            axis.spines['right'].set_visible(False)
+            axis.spines['left'].set_color('#A2B9A7')
+            axis.spines['bottom'].set_color('#A2B9A7')
+            axis.spines['left'].set_linewidth(0.7)
+            axis.spines['bottom'].set_linewidth(0.7)
 
     if training_mode:
-        # Training callback mode: 4 specific subplots
+        # Training callback mode: 4 specific subplots in single column layout
         
-        # Calculate KLD mean across all dimensions for display
-        kld_mean_value = loss_dict.get('kld_loss', 0) if loss_dict else 0
-        if isinstance(kld_mean_value, (np.ndarray, list)):
-            kld_mean_value = np.mean(kld_mean_value)
+        # Calculate KLD mean the same way as during training
+        # Use the exact same procedure as in training to match logged values
+        if loss_dict and 'kld_loss' in loss_dict:
+            kld_mean_value = loss_dict['kld_loss']
+            # If it's a tensor or array, convert to scalar (it should already be scalar from training)
+            if hasattr(kld_mean_value, 'item'):
+                kld_mean_value = kld_mean_value.item()
+            elif isinstance(kld_mean_value, (np.ndarray, list)):
+                kld_mean_value = float(np.mean(kld_mean_value))
+            else:
+                kld_mean_value = float(kld_mean_value)
+        else:
+            kld_mean_value = 0.0
         
         # Time axis for raw signals (assuming 4Hz sampling)
-        t_raw = np.arange(len(y_raw_normalized)) / 4.0
+        t_raw = np.arange(len(y_raw_unnormalized)) / 4.0
 
-        # 1. Raw FHR and UP signals
-        ax[0].plot(t_raw, y_raw_normalized, color=colors['fhr'], label='Raw FHR', linewidth=1.2)
-        ax[0].plot(t_raw, up_raw_normalized, color=colors['up'], label='Raw UP', linewidth=1.2)
-        ax[0].set_title('Raw Input Signals')
-        ax[0].set_xlabel('Time (s)')
-        ax[0].set_ylabel('Amplitude')
-        ax[0].legend()
-        ax[0].autoscale(enable=True, axis='x', tight=True)
+        # 1. Raw unnormalized FHR and UP signals
+        ax[0, 1].set_axis_off()  # Turn off colorbar column for this plot
+        ax[0, 0].plot(t_raw, y_raw_unnormalized, color=colors['fhr'], label='Raw FHR', linewidth=1.2, alpha=0.85)
+        ax[0, 0].plot(t_raw, up_raw_unnormalized, color=colors['up'], label='Raw UP', linewidth=1.2, alpha=0.85)
+        ax[0, 0].set_title('Raw Unnormalized FHR and UP Signals', fontweight='normal', pad=12)
+        ax[0, 0].set_ylabel('Amplitude', fontweight='normal')
+        ax[0, 0].legend(loc='upper right', framealpha=0.95)
+        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
         
         # Add loss info at bottom
         if loss_dict:
             loss_text = f"KLD: {kld_mean_value:.4f} | MSE: {loss_dict.get('mse_loss', 0):.4f}"
-            ax[0].text(0.5, -0.15, loss_text, transform=ax[0].transAxes, ha='center', 
+            ax[0, 0].text(0.5, -0.15, loss_text, transform=ax[0, 0].transAxes, ha='center', 
                        fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 2. FHR Reconstruction with Uncertainty
         if mu_pr_means is not None and log_var_means is not None:
-            ax[1].plot(t_raw, y_raw_normalized, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
-            ax[1].plot(t_raw, mu_pr_means, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5)
-            std_dev = np.exp(0.5 * log_var_means)
-            ax[1].fill_between(
-                t_raw, mu_pr_means - std_dev, mu_pr_means + std_dev,
-                color=colors['uncertainty'], alpha=0.4, label='Uncertainty (±1σ)')
-            ax[1].set_title('FHR Reconstruction with Uncertainty')
-            ax[1].set_xlabel('Time (s)')
-            ax[1].set_ylabel('Amplitude')
-            ax[1].legend()
-            ax[1].autoscale(enable=True, axis='x', tight=True)
+            # Time axis for normalized signals (may be different length)
+            t_raw_norm = np.arange(len(y_raw_normalized)) / 4.0
+            
+            ax[1, 1].set_axis_off()  # Turn off colorbar column for this plot
+            ax[1, 0].plot(t_raw_norm, y_raw_normalized, color=colors['gt'], label='Ground Truth', linewidth=1.5, alpha=0.85, zorder=3)
+            ax[1, 0].plot(t_raw_norm, mu_pr_means, color=colors['recon'], label='Reconstruction', linewidth=1.5, alpha=0.85, zorder=2)
+            
+            # Add uncertainty visualization using log_var_means
+            std_dev = np.exp(0.5 * log_var_means)  # Convert log variance to standard deviation
+            ax[1, 0].fill_between(t_raw_norm, mu_pr_means - std_dev, mu_pr_means + std_dev, 
+                                alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
+            
+            ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='normal', pad=12)
+            ax[1, 0].set_ylabel('FHR (bpm)', fontweight='normal')
+            ax[1, 0].legend(loc='upper right', framealpha=0.95)
+            ax[1, 0].autoscale(enable=True, axis='x', tight=True)
             
             # Add loss info at bottom
             if loss_dict:
                 loss_text = f"NLL: {loss_dict.get('nll_loss', 0):.4f} | Total Rec: {loss_dict.get('total_rec', loss_dict.get('reconstruction_loss', 0)):.4f}"
-                ax[1].text(0.5, -0.15, loss_text, transform=ax[1].transAxes, ha='center',
+                ax[1, 0].text(0.5, -0.15, loss_text, transform=ax[1, 0].transAxes, ha='center',
                            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 3. Selected timesteps aggregation (handling NaN values)
         if mu_pr is not None:
+            ax[2, 1].set_axis_off()  # Turn off colorbar column for this plot
             selected_timesteps = [30, 60, 90, 120, 150, 180, 210, 240, 270]
-            # Filter timesteps that are within bounds
-            valid_timesteps = [t for t in selected_timesteps if t < mu_pr.shape[0]]
             
-            if valid_timesteps:
-                # Extract selected timesteps and handle NaN values
-                selected_mu = mu_pr[valid_timesteps, :]  # Shape: (n_valid_timesteps, 4800)
+            # Handle different formats of mu_pr
+            if len(mu_pr.shape) == 1:  # (4800,) format - single prediction
+                t_raw_norm = np.arange(len(y_raw_normalized)) / 4.0
+                ax[2, 0].plot(t_raw_norm, y_raw_normalized, color=colors['gt'], label='Ground Truth', linewidth=1.5, alpha=0.85, zorder=2)
+                ax[2, 0].plot(t_raw_norm, mu_pr, linewidth=1.5, color=colors['recon'], 
+                            label='Model Prediction', alpha=0.85, zorder=1)
+                ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
+            else:  # (300, 4800) format - multiple predictions
+                # Filter timesteps that are within bounds
+                valid_timesteps = [t for t in selected_timesteps if t < mu_pr.shape[0]]
                 
-                # Use nanmean to aggregate, ignoring NaN values
-                aggregated_mu = np.nanmean(selected_mu, axis=0)  # Shape: (4800,)
-                
-                # Only plot if we have valid data
-                if not np.all(np.isnan(aggregated_mu)):
-                    ax[2].plot(t_raw, y_raw_normalized, color=colors['gt'], label='Ground Truth FHR', linewidth=1.5)
-                    ax[2].plot(t_raw, aggregated_mu, color=colors['recon'], label='Aggregated Reconstruction', linewidth=1.5)
-                    ax[2].set_title(f'Aggregated Reconstruction (Timesteps: {valid_timesteps})')
+                if valid_timesteps:
+                    # Handle NaN values and sum selected samples - matching PlottingCallBack logic
+                    selected_samples = mu_pr[valid_timesteps, :]  # Shape: (len(valid_timesteps), 4800)
+                    
+                    # Remove NaN values and compute sum
+                    valid_mask = ~np.isnan(selected_samples)
+                    summed_samples = np.zeros(len(y_raw_normalized))
+                    
+                    for i in range(len(y_raw_normalized)):
+                        valid_values = selected_samples[:, i][valid_mask[:, i]]
+                        if len(valid_values) > 0:
+                            summed_samples[i] = np.sum(valid_values)
+                        else:
+                            summed_samples[i] = 0
+                    
+                    t_raw_norm = np.arange(len(y_raw_normalized)) / 4.0
+                    ax[2, 0].plot(t_raw_norm, y_raw_normalized, color=colors['gt'], label='Ground Truth', linewidth=1.5, alpha=0.85, zorder=2)
+                    ax[2, 0].plot(t_raw_norm, summed_samples, linewidth=1.5, color=colors['recon'], 
+                                label='Selected Samples Sum', alpha=0.85, zorder=1)
+                    ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
                 else:
-                    ax[2].text(0.5, 0.5, 'No valid data (all NaN)', transform=ax[2].transAxes, 
-                              ha='center', va='center', fontsize=12)
-                    ax[2].set_title('Aggregated Reconstruction (No Valid Data)')
-            else:
-                ax[2].text(0.5, 0.5, 'No valid timesteps', transform=ax[2].transAxes, 
-                          ha='center', va='center', fontsize=12)
-                ax[2].set_title('Aggregated Reconstruction (No Valid Timesteps)')
+                    # Fallback to first sample if no valid indices
+                    t_raw_norm = np.arange(len(y_raw_normalized)) / 4.0
+                    ax[2, 0].plot(t_raw_norm, y_raw_normalized, color=colors['gt'], label='Ground Truth', linewidth=1.5, alpha=0.85, zorder=2)
+                    ax[2, 0].plot(t_raw_norm, mu_pr[0, :], linewidth=1.5, color=colors['recon'], 
+                                label='First Sample', alpha=0.85, zorder=1)
+                    ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
             
-            ax[2].set_xlabel('Time (s)')
-            ax[2].set_ylabel('Amplitude')
-            ax[2].legend()
-            ax[2].autoscale(enable=True, axis='x', tight=True)
+            ax[2, 0].set_ylabel('FHR (bpm)', fontweight='normal')
+            ax[2, 0].legend(loc='upper right', framealpha=0.95)
+            ax[2, 0].autoscale(enable=True, axis='x', tight=True)
             
             # Add loss info at bottom
             if loss_dict:
                 loss_text = f"Total Loss: {loss_dict.get('total_loss', 0):.4f}"
-                ax[2].text(0.5, -0.15, loss_text, transform=ax[2].transAxes, ha='center',
+                ax[2, 0].text(0.5, -0.15, loss_text, transform=ax[2, 0].transAxes, ha='center',
                            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 4. Latent Space z
         if latent_z is not None:
-            im_z = ax[3].imshow(latent_z.T, aspect='auto', cmap='bwr', origin='lower')
-            ax[3].set_title('Latent Space (z)')
-            ax[3].set_xlabel('Time Steps')
-            ax[3].set_ylabel('Latent Dimensions')
-            fig.colorbar(im_z, ax=ax[3])
+            imgplot = ax[3, 0].imshow(latent_z.T, aspect='auto', cmap='bwr', origin='lower')
+            
+            # Remove grid lines from imshow plot
+            ax[3, 0].grid(False)
+            
+            ax[3, 1].set_axis_on()
+            cbar = fig.colorbar(imgplot, cax=ax[3, 1])
+            cbar.ax.tick_params(labelsize=10, colors='#666666')
+            cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
+            cbar.outline.set_color('#A2B9A7')
+            cbar.outline.set_linewidth(0.7)
+            ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
+            ax[3, 0].set_xlabel('Time Steps', fontweight='normal')
+            ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
             
             # Add KLD mean to latent space plot
             if loss_dict:
                 loss_text = f"KLD Mean: {kld_mean_value:.4f} | Epoch: {epoch}"
-                ax[3].text(0.5, -0.15, loss_text, transform=ax[3].transAxes, ha='center',
+                ax[3, 0].text(0.5, -0.15, loss_text, transform=ax[3, 0].transAxes, ha='center',
                            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
-        fig.suptitle(f'Training Analysis - Epoch {epoch} - Sample {batch_idx}', fontsize=16, fontweight='bold')
-        save_path = os.path.join(output_dir, f'training_analysis_epoch_{epoch}_sample_{batch_idx}.pdf')
+        # Set overall title with scientific paper styling
+        fig.suptitle(f'Model Performance Analysis — Epoch {epoch}', 
+                    fontsize=14, fontweight='normal', y=0.97, color='#456882')
+        save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.pdf')
         
     else:
         # Original analysis mode: 8 subplots
@@ -248,6 +312,7 @@ def plot_model_analysis(
 
         # 3. Latent Space z
         im_z = ax[1, 0].imshow(latent_z, aspect='auto', cmap='bwr', origin='lower')
+        ax[1, 0].grid(False)  # Remove grid lines
         ax[1, 0].set_title('Latent Space (z)')
         ax[1, 0].set_xlabel('Time Steps')
         ax[1, 0].set_ylabel('Latent Dimensions')
@@ -255,6 +320,7 @@ def plot_model_analysis(
 
         # 4. KLD Tensor
         im_kld = ax[1, 1].imshow(kld_tensor, aspect='auto', cmap='bwr', origin='lower')
+        ax[1, 1].grid(False)  # Remove grid lines
         ax[1, 1].set_title(f'KLD Tensor (Mean: {kld_overall_mean:.4f})')
         ax[1, 1].set_xlabel('Time Steps')
         ax[1, 1].set_ylabel('Latent Dimensions')
@@ -270,6 +336,7 @@ def plot_model_analysis(
 
         # 6. fhr_st
         im_st = ax[2, 1].imshow(fhr_st, aspect='auto', cmap='bwr', origin='lower')
+        ax[2, 1].grid(False)  # Remove grid lines
         ax[2, 1].set_title('FHR Scattering Transform (fhr_st)')
         ax[2, 1].set_xlabel('Time Steps')
         ax[2, 1].set_ylabel('Channels')
@@ -277,6 +344,7 @@ def plot_model_analysis(
 
         # 7. fhr_ph
         im_ph = ax[3, 0].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='lower')
+        ax[3, 0].grid(False)  # Remove grid lines
         ax[3, 0].set_title('FHR Phase Harmonics (fhr_ph)')
         ax[3, 0].set_xlabel('Time Steps')
         ax[3, 0].set_ylabel('Channels')
@@ -284,6 +352,7 @@ def plot_model_analysis(
 
         # 8. fhr_up_ph
         im_up_ph = ax[3, 1].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='lower')
+        ax[3, 1].grid(False)  # Remove grid lines
         ax[3, 1].set_title('UP Phase Harmonics (fhr_up_ph)')
         ax[3, 1].set_xlabel('Time Steps')
         ax[3, 1].set_ylabel('Channels')
@@ -293,7 +362,32 @@ def plot_model_analysis(
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
     
     # Save and close (common for both modes)
-    plt.savefig(save_path, bbox_inches='tight')
-    plt.close(fig)
+    if training_mode:
+        # Save plot as PDF with high quality - matching PlottingCallBack
+        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=300, facecolor='white', edgecolor='none')
+        plt.close(fig)
+        
+        # Clean up memory like PlottingCallBack
+        import gc
+        if 'y_raw_normalized' in locals():
+            del y_raw_normalized
+        if 'up_raw_normalized' in locals():
+            del up_raw_normalized
+        if 'y_raw_unnormalized' in locals():
+            del y_raw_unnormalized
+        if 'up_raw_unnormalized' in locals():
+            del up_raw_unnormalized
+        if 'mu_pr_means' in locals():
+            del mu_pr_means
+        if 'log_var_means' in locals():
+            del log_var_means
+        if 'mu_pr' in locals():
+            del mu_pr
+        if 'latent_z' in locals():
+            del latent_z
+        gc.collect()
+    else:
+        plt.savefig(save_path, bbox_inches='tight')
+        plt.close(fig)
     
     print(f"Analysis plot saved to {save_path}")
