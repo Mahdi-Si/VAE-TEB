@@ -991,23 +991,28 @@ class SeqVAEGraphModel:
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
                     kld_mean_over_channels = kld_tensor.mean(dim=-1)
 
+                    # Always keep normalized versions for reconstruction comparison
+                    raw_fhr_normalized_np = y_raw[0].cpu().numpy()
+                    raw_up_normalized_np = up_raw[0].cpu().numpy()
+                    
                     # Denormalize FHR and UP signals if normalization stats are available
                     if normalization_stats:
-                        # Denormalize the normalized signals to get the original raw signals
+                        # Denormalize the normalized signals to get the original raw signals for first plot
                         raw_fhr_denormalized = denormalize_signal_data(y_raw[0], 'fhr', normalization_stats)
                         raw_up_denormalized = denormalize_signal_data(up_raw[0], 'up', normalization_stats)
-                        raw_fhr_np = raw_fhr_denormalized.cpu().numpy()
-                        raw_up_np = raw_up_denormalized.cpu().numpy()
+                        raw_fhr_unnormalized_np = raw_fhr_denormalized.cpu().numpy()
+                        raw_up_unnormalized_np = raw_up_denormalized.cpu().numpy()
                         
                         # Log info for first sample to confirm denormalization is working
                         if plot_idx == 0:
-                            logger.info(f"Using denormalized FHR and UP signals for plotting")
-                            logger.info(f"FHR range: [{raw_fhr_np.min():.2f}, {raw_fhr_np.max():.2f}]")
-                            logger.info(f"UP range: [{raw_up_np.min():.2f}, {raw_up_np.max():.2f}]")
+                            logger.info(f"Using denormalized FHR and UP signals for first plot, normalized for reconstruction plot")
+                            logger.info(f"Unnormalized FHR range: [{raw_fhr_unnormalized_np.min():.2f}, {raw_fhr_unnormalized_np.max():.2f}]")
+                            logger.info(f"Unnormalized UP range: [{raw_up_unnormalized_np.min():.2f}, {raw_up_unnormalized_np.max():.2f}]")
+                            logger.info(f"Normalized FHR range: [{raw_fhr_normalized_np.min():.2f}, {raw_fhr_normalized_np.max():.2f}]")
                     else:
                         # Use normalized data if no stats available
-                        raw_fhr_np = y_raw[0].cpu().numpy()
-                        raw_up_np = up_raw[0].cpu().numpy()
+                        raw_fhr_unnormalized_np = raw_fhr_normalized_np
+                        raw_up_unnormalized_np = raw_up_normalized_np
                         
                         # Log warning for first sample
                         if plot_idx == 0:
@@ -1026,8 +1031,8 @@ class SeqVAEGraphModel:
                     # Generate plots for this sample
                     plot_model_analysis(
                         output_dir=self.test_results_dir,
-                        raw_fhr=raw_fhr_np,
-                        raw_up=raw_up_np,
+                        raw_fhr=raw_fhr_unnormalized_np,  # Unnormalized for first plot
+                        raw_up=raw_up_unnormalized_np,    # Unnormalized for first plot
                         fhr_st=fhr_st_np,
                         fhr_ph=fhr_ph_np,
                         fhr_up_ph=fhr_up_ph_np,
@@ -1037,7 +1042,10 @@ class SeqVAEGraphModel:
                         kld_tensor=kld_tensor_np,
                         kld_mean_over_channels=kld_mean_over_channels_np,
                         batch_idx=sample_idx,  # Use original sample index for unique file naming
-                        loss_dict=loss_dict  # Pass training-consistent loss values
+                        loss_dict=loss_dict,  # Pass training-consistent loss values
+                        # Pass normalized versions for reconstruction comparison
+                        raw_fhr_normalized=raw_fhr_normalized_np,
+                        raw_up_normalized=raw_up_normalized_np
                     )
                     
                     # Log progress every 10 samples
