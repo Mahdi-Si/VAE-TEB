@@ -400,3 +400,243 @@ def plot_model_analysis(
         plt.close(fig)
     
     print(f"Analysis plot saved to {save_path}")
+
+
+def plot_vae_reconstruction(
+    output_dir: str,
+    raw_fhr_unnormalized: np.ndarray,
+    raw_up_unnormalized: np.ndarray,
+    raw_fhr_normalized: np.ndarray,
+    raw_up_normalized: np.ndarray,
+    reconstructed_fhr: np.ndarray,
+    original_scattering_transform: np.ndarray,  # Shape: (43, 300)
+    reconstructed_scattering_transform: np.ndarray,  # Shape: (43, 300)
+    original_phase_harmonic: np.ndarray,  # Shape: (44, 300)
+    reconstructed_phase_harmonic: np.ndarray,  # Shape: (44, 300)
+    scattering_channel_data: dict = None,  # From frequency analysis
+    batch_idx: int = 0,
+    loss_dict: dict = None
+):
+    """
+    Generates and saves comprehensive VAE reconstruction analysis plots.
+    
+    Args:
+        output_dir (str): Directory to save the plot.
+        raw_fhr_unnormalized (np.ndarray): Raw unnormalized FHR signal. Shape: (4800,).
+        raw_up_unnormalized (np.ndarray): Raw unnormalized UP signal. Shape: (4800,).
+        raw_fhr_normalized (np.ndarray): Raw normalized FHR signal. Shape: (4800,).
+        raw_up_normalized (np.ndarray): Raw normalized UP signal. Shape: (4800,).
+        reconstructed_fhr (np.ndarray): Reconstructed FHR signal. Shape: (4800,).
+        original_scattering_transform (np.ndarray): Original scattering coeffs. Shape: (43, 300).
+        reconstructed_scattering_transform (np.ndarray): Reconstructed scattering coeffs. Shape: (43, 300).
+        original_phase_harmonic (np.ndarray): Original phase harmonic coeffs. Shape: (44, 300).
+        reconstructed_phase_harmonic (np.ndarray): Reconstructed phase harmonic coeffs. Shape: (44, 300).
+        scattering_channel_data (dict): Frequency analysis data for channel annotations.
+        batch_idx (int): Index of the sample for file naming.
+        loss_dict (dict): Dictionary containing loss values.
+    """
+    
+    # Professional scientific paper color palette
+    colors = {
+        'fhr': "#055C9A",
+        'up': "#0DD8A2",
+        'gt': '#456882',
+        'recon': '#BB3E00',
+        'uncertainty': '#F7AD45',
+        'kld': '#D95319',
+        'background': '#F9F3EF'
+    }
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'axes.linewidth': 0.7,
+        'axes.edgecolor': "#9E9D9D",
+        'axes.facecolor': colors['background'],
+        'grid.color': "#838383",
+        'grid.linewidth': 0.4,
+        'grid.alpha': 0.6,
+        'legend.frameon': True,
+        'legend.fancybox': False,
+        'legend.shadow': False,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#A2B9A7',
+        'legend.facecolor': colors['background'],
+        'figure.facecolor': 'white',
+        'savefig.facecolor': 'white',
+        'savefig.dpi': 300
+    })
+
+    # Create figure with multiple rows for comprehensive analysis
+    # Total: 8 + N channel plots (where N is number of scattering channels to plot)
+    n_main_plots = 8
+    n_channel_plots = min(10, original_scattering_transform.shape[0])  # Show first 10 channels
+    n_rows = n_main_plots + n_channel_plots
+    
+    fig, ax = plt.subplots(n_rows, 1, figsize=(16, n_rows * 2.5), constrained_layout=True)
+
+    # Configure scientific paper grid style for all plots
+    for i in range(n_rows):
+        ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+        ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax[i].minorticks_on()
+        ax[i].set_axisbelow(True)
+        ax[i].spines['top'].set_visible(False)
+        ax[i].spines['right'].set_visible(False)
+        ax[i].spines['left'].set_color('#A2B9A7')
+        ax[i].spines['bottom'].set_color('#A2B9A7')
+        ax[i].spines['left'].set_linewidth(0.7)
+        ax[i].spines['bottom'].set_linewidth(0.7)
+
+    # Time axes
+    t_raw = np.arange(len(raw_fhr_unnormalized)) / 4.0  # 4Hz sampling
+    t_coeffs = np.arange(original_scattering_transform.shape[1])  # Time steps for coefficients
+
+    # 1. Raw unnormalized FHR and UP signals
+    ax[0].plot(t_raw, raw_fhr_unnormalized, color=colors['fhr'], label='Raw FHR', linewidth=1.2, alpha=0.85)
+    ax[0].plot(t_raw, raw_up_unnormalized, color=colors['up'], label='Raw UP', linewidth=1.2, alpha=0.85)
+    ax[0].set_title('Raw Unnormalized FHR and UP Signals', fontweight='normal', pad=12)
+    ax[0].set_ylabel('Amplitude', fontweight='normal')
+    ax[0].set_xlabel('Time (s)', fontweight='normal')
+    ax[0].legend(loc='upper right', framealpha=0.95)
+    ax[0].autoscale(enable=True, axis='x', tight=True)
+
+    # 2. Raw normalized FHR and reconstructed
+    ax[1].plot(t_raw, raw_fhr_normalized, color=colors['gt'], label='Normalized FHR', linewidth=1.5, alpha=0.85)
+    ax[1].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5, alpha=0.85)
+    ax[1].set_title('Normalized FHR vs Reconstructed FHR', fontweight='normal', pad=12)
+    ax[1].set_ylabel('Normalized Amplitude', fontweight='normal')
+    ax[1].set_xlabel('Time (s)', fontweight='normal')
+    ax[1].legend(loc='upper right', framealpha=0.95)
+    ax[1].autoscale(enable=True, axis='x', tight=True)
+
+    # 3. Only reconstructed FHR
+    ax[2].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5, alpha=0.85)
+    ax[2].set_title('Reconstructed FHR Signal', fontweight='normal', pad=12)
+    ax[2].set_ylabel('Normalized Amplitude', fontweight='normal')
+    ax[2].set_xlabel('Time (s)', fontweight='normal')
+    ax[2].legend(loc='upper right', framealpha=0.95)
+    ax[2].autoscale(enable=True, axis='x', tight=True)
+
+    # 4. Original scattering transform (imshow)
+    im_st_orig = ax[3].imshow(original_scattering_transform, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    ax[3].grid(False)  # Remove grid lines for imshow
+    ax[3].set_title('Original Scattering Transform Coefficients', fontweight='normal', pad=12)
+    ax[3].set_xlabel('Time Steps', fontweight='normal')
+    ax[3].set_ylabel('Scattering Channels', fontweight='normal')
+    fig.colorbar(im_st_orig, ax=ax[3], shrink=0.8)
+
+    # 5. Reconstructed scattering transform (imshow)
+    im_st_recon = ax[4].imshow(reconstructed_scattering_transform, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    ax[4].grid(False)  # Remove grid lines for imshow
+    ax[4].set_title('Reconstructed Scattering Transform Coefficients', fontweight='normal', pad=12)
+    ax[4].set_xlabel('Time Steps', fontweight='normal')
+    ax[4].set_ylabel('Scattering Channels', fontweight='normal')
+    fig.colorbar(im_st_recon, ax=ax[4], shrink=0.8)
+
+    # 6. Original phase harmonic (imshow)
+    im_ph_orig = ax[5].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    ax[5].grid(False)  # Remove grid lines for imshow
+    ax[5].set_title('Original Phase Harmonic Coefficients', fontweight='normal', pad=12)
+    ax[5].set_xlabel('Time Steps', fontweight='normal')
+    ax[5].set_ylabel('Phase Harmonic Channels', fontweight='normal')
+    fig.colorbar(im_ph_orig, ax=ax[5], shrink=0.8)
+
+    # 7. Reconstructed phase harmonic (imshow)
+    im_ph_recon = ax[6].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    ax[6].grid(False)  # Remove grid lines for imshow
+    ax[6].set_title('Reconstructed Phase Harmonic Coefficients', fontweight='normal', pad=12)
+    ax[6].set_xlabel('Time Steps', fontweight='normal')
+    ax[6].set_ylabel('Phase Harmonic Channels', fontweight='normal')
+    fig.colorbar(im_ph_recon, ax=ax[6], shrink=0.8)
+
+    # 8. Reconstruction error heatmap
+    st_error = np.abs(original_scattering_transform - reconstructed_scattering_transform)
+    ph_error = np.abs(original_phase_harmonic - reconstructed_phase_harmonic)
+    combined_error = np.vstack([st_error, ph_error])
+    
+    im_error = ax[7].imshow(combined_error, aspect='auto', cmap='Reds', origin='lower')
+    ax[7].grid(False)  # Remove grid lines for imshow
+    ax[7].set_title('Reconstruction Error (|Original - Reconstructed|)', fontweight='normal', pad=12)
+    ax[7].set_xlabel('Time Steps', fontweight='normal')
+    ax[7].set_ylabel('All Channels (ST + PH)', fontweight='normal')
+    # Add horizontal line to separate ST and PH
+    ax[7].axhline(y=original_scattering_transform.shape[0]-0.5, color='white', linewidth=2, alpha=0.8)
+    ax[7].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0]/2, 'ST', 
+               color='white', fontweight='bold', fontsize=10, va='center')
+    ax[7].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0] + original_phase_harmonic.shape[0]/2, 
+               'PH', color='white', fontweight='bold', fontsize=10, va='center')
+    fig.colorbar(im_error, ax=ax[7], shrink=0.8)
+
+    # 9-N. Individual scattering channel plots with frequency information
+    for i in range(n_channel_plots):
+        plot_idx = n_main_plots + i
+        channel = i
+        
+        # Plot original and reconstructed for this channel
+        ax[plot_idx].plot(t_coeffs, original_scattering_transform[channel, :], 
+                         color=colors['gt'], label='Original', linewidth=1.2, alpha=0.85)
+        ax[plot_idx].plot(t_coeffs, reconstructed_scattering_transform[channel, :], 
+                         color=colors['recon'], label='Reconstructed', linewidth=1.2, alpha=0.85)
+        
+        # Add frequency information from scattering analysis if available
+        freq_info = ""
+        if scattering_channel_data and 'first_order_filters' in scattering_channel_data:
+            if channel < len(scattering_channel_data['first_order_filters']):
+                filter_info = scattering_channel_data['first_order_filters'][channel]
+                freq_hz = filter_info.get('center_freq_hz', 0)
+                bandwidth_hz = filter_info.get('bandwidth_hz', 0)
+                freq_range = filter_info.get('frequency_range_hz', (0, 0))
+                physiol_band = filter_info.get('physiological_band', 'Unknown')
+                freq_info = f" (f={freq_hz:.3f}Hz, BW={bandwidth_hz:.3f}Hz, {physiol_band})"
+        
+        ax[plot_idx].set_title(f'Scattering Channel {channel}{freq_info}', fontweight='normal', pad=8)
+        ax[plot_idx].set_ylabel('Coefficient Value', fontweight='normal')
+        if i == n_channel_plots - 1:  # Only add xlabel to the last plot
+            ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
+        ax[plot_idx].legend(loc='upper right', framealpha=0.95, fontsize=9)
+        ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
+        
+        # Add error metrics for this channel
+        mse_channel = np.mean((original_scattering_transform[channel, :] - 
+                              reconstructed_scattering_transform[channel, :])**2)
+        mae_channel = np.mean(np.abs(original_scattering_transform[channel, :] - 
+                                   reconstructed_scattering_transform[channel, :]))
+        
+        # Add small text box with error metrics
+        error_text = f"MSE: {mse_channel:.4f}, MAE: {mae_channel:.4f}"
+        ax[plot_idx].text(0.98, 0.95, error_text, transform=ax[plot_idx].transAxes, 
+                         ha='right', va='top', fontsize=8,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], 
+                                 alpha=0.8, edgecolor='#A2B9A7'))
+
+    # Add overall loss information if available
+    loss_text = ""
+    if loss_dict:
+        if 'mse_loss' in loss_dict and 'nll_loss' in loss_dict:
+            loss_text = f"MSE Loss: {loss_dict['mse_loss']:.4f}, NLL Loss: {loss_dict['nll_loss']:.4f}"
+        elif 'total_loss' in loss_dict:
+            loss_text = f"Total Loss: {loss_dict['total_loss']:.4f}"
+
+    # Set overall title with scientific paper styling
+    title_text = f'VAE Reconstruction Analysis — Sample {batch_idx}'
+    if loss_text:
+        title_text += f" — {loss_text}"
+    
+    fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color='#456882')
+    
+    # Save plot
+    save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.pdf')
+    plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
+    plt.close(fig)
+    
+    # Clean up memory
+    import gc
+    del fig, ax
+    gc.collect()
+    
+    print(f"VAE reconstruction analysis plot saved to {save_path}")

@@ -22,8 +22,9 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from  utils.plot_utils import plot_model_analysis
+from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction
 from loguru import logger
+from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 
 from pytorch_lightning_modules import *
 
@@ -932,6 +933,19 @@ class SeqVAEGraphModel:
             else:
                 logger.warning("No normalization stats available - will use normalized data for plotting")
 
+        # Get scattering transform frequency analysis for channel annotations
+        scattering_analysis = None
+        try:
+            # Parameters from fhr_st_setting.md - J=11, Q=4, T=16, sampling_rate=4Hz
+            scattering_analysis = analyze_scattering_frequencies(
+                J=11, Q=4, T=16, sampling_rate=4.0, signal_duration_minutes=20.0,
+                analyze_phase_harmonics=True, analyze_cross_phase=True
+            )
+            logger.info("Generated scattering transform frequency analysis for channel annotations")
+        except Exception as e:
+            logger.warning(f"Could not generate scattering frequency analysis: {e}")
+            scattering_analysis = None
+
         # Collect all samples from the test loader
         logger.info("Collecting all samples from test loader...")
         all_samples = []
@@ -1027,6 +1041,14 @@ class SeqVAEGraphModel:
                     reconstructed_fhr_logvar_np = reconstructed_fhr_logvar[0].cpu().numpy()
                     kld_tensor_np = kld_tensor[0].cpu().numpy().T
                     kld_mean_over_channels_np = kld_mean_over_channels[0].cpu().numpy()
+                    
+                    # Extract reconstructed scattering and phase harmonic coefficients from linear_output
+                    linear_output = forward_outputs['linear_output']  # Shape: (1, 300, 87)
+                    linear_output_np = linear_output[0].cpu().numpy()  # Shape: (300, 87)
+                    
+                    # Split into scattering (43) and phase harmonic (44) components
+                    reconstructed_st_np = linear_output_np[:, :43].T  # Shape: (43, 300)
+                    reconstructed_ph_np = linear_output_np[:, 43:].T  # Shape: (44, 300)
 
                     # Generate plots for this sample
                     plot_model_analysis(
@@ -1046,6 +1068,23 @@ class SeqVAEGraphModel:
                         # Pass normalized versions for reconstruction comparison
                         raw_fhr_normalized=raw_fhr_normalized_np,
                         raw_up_normalized=raw_up_normalized_np
+                    )
+                    
+                    # Generate VAE reconstruction plots for this sample
+                    plot_vae_reconstruction(
+                        output_dir=self.test_results_dir,
+                        raw_fhr_unnormalized=raw_fhr_unnormalized_np,
+                        raw_up_unnormalized=raw_up_unnormalized_np,
+                        raw_fhr_normalized=raw_fhr_normalized_np,
+                        raw_up_normalized=raw_up_normalized_np,
+                        reconstructed_fhr=reconstructed_fhr_mu_np,
+                        original_scattering_transform=fhr_st_np,  # Already transposed to (43, 300)
+                        reconstructed_scattering_transform=reconstructed_st_np,  # Shape: (43, 300)
+                        original_phase_harmonic=fhr_ph_np,  # Already transposed to (44, 300)
+                        reconstructed_phase_harmonic=reconstructed_ph_np,  # Shape: (44, 300)
+                        scattering_channel_data=scattering_analysis,  # Frequency analysis data
+                        batch_idx=sample_idx,
+                        loss_dict=loss_dict
                     )
                     
                     # Log progress every 10 samples
