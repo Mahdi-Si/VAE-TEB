@@ -566,8 +566,9 @@ def plot_vae_reconstruction(
     ax[7].set_ylabel('All Channels (ST + PH)', fontweight='normal')
     # Add horizontal line to separate ST and PH
     ax[7].axhline(y=original_scattering_transform.shape[0]-0.5, color='white', linewidth=2, alpha=0.8)
-    ax[7].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0]/2, 'ST', 
-               color='white', fontweight='bold', fontsize=10, va='center')
+    ax[7].text(
+        combined_error.shape[1]*0.02, original_scattering_transform.shape[0]/2, 'ST', 
+        color='white', fontweight='bold', fontsize=10, va='center')
     ax[7].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0] + original_phase_harmonic.shape[0]/2, 
                'PH', color='white', fontweight='bold', fontsize=10, va='center')
     fig.colorbar(im_error, ax=ax[7], shrink=0.8)
@@ -640,3 +641,137 @@ def plot_vae_reconstruction(
     gc.collect()
     
     print(f"VAE reconstruction analysis plot saved to {save_path}")
+
+
+def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
+    """
+    Plot transfer entropy (KLD) as a function of temporal shift.
+    
+    Args:
+        shifts_seconds: List of shift values in seconds
+        kld_values: List of corresponding KLD values
+        output_dir: Directory to save the plot
+    
+    Returns:
+        str: Path to the saved plot
+    """
+    # Professional scientific paper color palette
+    colors = {
+        'main_line': "#055C9A",
+        'minimum_point': "#BB3E00",
+        'background': '#F9F3EF'
+    }
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'axes.linewidth': 0.7,
+        'axes.edgecolor': "#9E9D9D",
+        'axes.facecolor': colors['background'],
+        'grid.color': "#838383",
+        'grid.linewidth': 0.4,
+        'grid.alpha': 0.6,
+        'legend.frameon': True,
+        'legend.fancybox': False,
+        'legend.shadow': False,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#A2B9A7',
+        'legend.facecolor': colors['background'],
+        'figure.facecolor': 'white',
+        'savefig.facecolor': 'white',
+        'savefig.dpi': 300
+    })
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), constrained_layout=True)
+    
+    # Configure scientific paper grid style for both plots
+    for ax in [ax1, ax2]:
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#A2B9A7')
+        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_linewidth(0.7)
+        ax.spines['bottom'].set_linewidth(0.7)
+    
+    # Main plot
+    ax1.plot(shifts_seconds, kld_values, color=colors['main_line'], linewidth=2, 
+             marker='o', markersize=3, alpha=0.8, label='Transfer Entropy')
+    ax1.set_xlabel('UP Signal Shift (seconds)', fontweight='normal')
+    ax1.set_ylabel('Average Transfer Entropy (KLD)', fontweight='normal')
+    ax1.set_title('Transfer Entropy vs UP Signal Temporal Shift', fontweight='normal', pad=12)
+    
+    # Find and mark minimum
+    min_idx = np.argmin(kld_values)
+    min_shift = shifts_seconds[min_idx]
+    min_kld = kld_values[min_idx]
+    ax1.plot(min_shift, min_kld, color=colors['minimum_point'], marker='o', markersize=8, 
+             label=f'Minimum: {min_shift}s (KLD={min_kld:.6f})', zorder=5)
+    ax1.legend(loc='upper right', framealpha=0.95)
+    ax1.autoscale(enable=True, axis='x', tight=True)
+    
+    # Add physiological interpretation zones
+    ax1.axvspan(-30, -10, alpha=0.1, color='green', label='Early contraction effect')
+    ax1.axvspan(-10, 10, alpha=0.1, color='blue', label='Immediate coupling')  
+    ax1.axvspan(10, 30, alpha=0.1, color='orange', label='Delayed response')
+    
+    # Zoomed plot around minimum
+    zoom_range = 15  # ±15 seconds around minimum
+    zoom_mask = np.abs(np.array(shifts_seconds) - min_shift) <= zoom_range
+    zoom_shifts = np.array(shifts_seconds)[zoom_mask]
+    zoom_klds = np.array(kld_values)[zoom_mask]
+    
+    if len(zoom_shifts) > 1:
+        ax2.plot(zoom_shifts, zoom_klds, color=colors['main_line'], linewidth=2, 
+                 marker='o', markersize=4, alpha=0.8)
+        ax2.plot(min_shift, min_kld, color=colors['minimum_point'], marker='o', 
+                 markersize=8, zorder=5)
+        ax2.set_xlabel('UP Signal Shift (seconds)', fontweight='normal')
+        ax2.set_ylabel('Average Transfer Entropy (KLD)', fontweight='normal')
+        ax2.set_title(f'Zoomed View: ±{zoom_range}s around minimum', fontweight='normal', pad=12)
+        ax2.autoscale(enable=True, axis='x', tight=True)
+        
+        # Add vertical line at minimum
+        ax2.axvline(x=min_shift, color=colors['minimum_point'], linestyle='--', 
+                   alpha=0.7, linewidth=1.5)
+        
+        # Add text annotation for the optimal shift
+        ax2.text(min_shift, min_kld, f'  Optimal: {min_shift}s\n  KLD: {min_kld:.6f}', 
+                 verticalalignment='bottom', horizontalalignment='left',
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], 
+                          alpha=0.9, edgecolor='#A2B9A7'), fontsize=10)
+    
+    # Add overall title with physiological context
+    fig.suptitle('Fetal-Maternal Coupling: Transfer Entropy Analysis', 
+                fontsize=14, fontweight='normal', y=0.97, color='#456882')
+    
+    # Add interpretation text
+    interpretation_text = (
+        "Negative shifts: UP leads FHR (contraction precedes heart rate change)\n"
+        "Positive shifts: FHR leads UP (heart rate change precedes contraction)\n" 
+        "Minimum KLD indicates optimal temporal coupling for information transfer"
+    )
+    
+    fig.text(0.02, 0.02, interpretation_text, fontsize=9, 
+             bbox=dict(boxstyle="round,pad=0.5", facecolor=colors['background'], 
+                      alpha=0.9, edgecolor='#A2B9A7'),
+             verticalalignment='bottom', horizontalalignment='left')
+    
+    # Save plot
+    plot_path = os.path.join(output_dir, 'transfer_entropy_vs_shift.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig)
+    
+    # Clean up memory
+    import gc
+    del fig, ax1, ax2
+    gc.collect()
+    
+    return plot_path

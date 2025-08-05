@@ -22,9 +22,11 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction
+from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction, plot_transfer_entropy_vs_shift
 from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
+from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
+from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 
 from pytorch_lightning_modules import *
 
@@ -903,6 +905,7 @@ class SeqVAEGraphModel:
         Runs tests on the SeqVaeTeb model by performing analysis and plotting on random samples.
         """
         self.run_analysis_and_plot(test_loader, 200)
+        self.run_transfer_entropy_shift_analysis(test_loader)
 
 
     def run_analysis_and_plot(self, test_loader, num_samples=200):
@@ -1097,6 +1100,251 @@ class SeqVAEGraphModel:
 
         logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
         logger.info(f"Plots saved to: {self.test_results_dir}")
+
+    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=50):
+        """
+        Analyze transfer entropy as a function of UP signal temporal shift.
+        
+        This test examines how the amount of temporal shift in the UP signal affects 
+        the transfer entropy from the source (shifted UP cross-phase) to the latent 
+        representation. The test:
+        
+        1. Loads raw unnormalized UP and FHR signals without 2-minute trim
+        2. Shifts UP signal by various delays (-60s to +60s in 1s increments)
+        3. Recomputes cross-channel phase coefficients for each shift
+        4. Normalizes the new coefficients with existing stats
+        5. Measures transfer entropy (KLD) for each shift
+        6. Plots average KLD as function of shift/delay
+        
+        Args:
+            test_loader: DataLoader for test data
+            num_samples: Number of samples to analyze (default: 50)
+        """
+        logger.info(f"Starting transfer entropy shift analysis on {num_samples} samples...")
+        self.create_model()
+        
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting shift analysis.")
+            return
+            
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        self.pytorch_model.to(device)
+        self.pytorch_model.eval()
+        
+        # Get normalization stats for the fhr_up_ph field
+        normalization_stats = None
+        if hasattr(test_loader.dataset, 'get_normalization_stats'):
+            normalization_stats = test_loader.dataset.get_normalization_stats()
+            if not normalization_stats or 'fhr_up_ph' not in normalization_stats:
+                logger.error("No normalization stats found for fhr_up_ph field. Cannot proceed with analysis.")
+                return
+        else:
+            logger.error("Dataset does not provide normalization stats. Cannot proceed with analysis.")
+            return
+            
+        # Initialize scattering transform for cross-phase computation
+        # Use parameters from fhr_st_setting.md: J=11, Q=4, T=16, sampling_rate=4Hz
+        scattering_transform = KymatioPhaseScattering1D(
+            J=11, Q=4, T=16, shape=4800, device=device
+        )
+        scattering_transform.to(device)
+        scattering_transform.eval()
+        
+        # Create a temporary dataset without trimming to get raw signals
+        logger.info("Creating dataset without trimming to access raw signals...")
+        from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
+        
+        # Get dataset config from test_loader
+        dataset_paths = test_loader.dataset.paths
+        stats_path = test_loader.dataset.stats_path
+        allowed_guids = None
+        if hasattr(test_loader.dataset, 'allowed_guids'):
+            allowed_guids = list(test_loader.dataset.allowed_guids) if test_loader.dataset.allowed_guids else None
+            
+        # Create dataset without trimming for raw signal access
+        raw_dataset = CombinedHDF5Dataset(
+            paths=dataset_paths,
+            load_fields=['fhr', 'up', 'fhr_st', 'fhr_ph'],  # Load necessary fields
+            allowed_guids=allowed_guids,
+            stats_path=stats_path,
+            trim_minutes=None,  # No trimming to get full raw signals
+            normalize_fields=['fhr_st', 'fhr_ph']  # Only normalize what we need
+        )
+        
+        # Collect samples for analysis
+        logger.info("Collecting samples for shift analysis...")
+        all_samples = []
+        sample_count = 0
+        
+        try:
+            for i in range(len(raw_dataset)):
+                if sample_count >= num_samples:
+                    break
+                    
+                sample = raw_dataset[i]
+                # Store both raw (unnormalized) and normalized versions
+                all_samples.append({
+                    'fhr_raw': sample['fhr'],           # Raw FHR signal
+                    'up_raw': sample['up'],             # Raw UP signal  
+                    'fhr_st': sample['fhr_st'],         # Normalized scattering coefficients
+                    'fhr_ph': sample['fhr_ph'],         # Normalized phase coefficients
+                })
+                sample_count += 1
+                
+        except Exception as e:
+            logger.error(f"Error collecting raw samples: {e}")
+            return
+            
+        if len(all_samples) == 0:
+            logger.error("No samples collected for analysis.")
+            return
+            
+        logger.info(f"Collected {len(all_samples)} samples for analysis")
+        
+        # Define shift range: -60 to +60 seconds in 1-second increments
+        # At 4Hz sampling rate: 1 second = 4 samples
+        sampling_rate = 4.0  # Hz
+        shift_seconds = np.arange(-60, 61, 1)  # -60s to +60s in 1s steps
+        shift_samples = (shift_seconds * sampling_rate).astype(int)
+        
+        logger.info(f"Testing {len(shift_samples)} different shifts from {shift_seconds[0]}s to {shift_seconds[-1]}s")
+        
+        # Storage for results
+        kld_results = []
+        valid_shifts = []
+        
+        with torch.no_grad():
+            for shift_idx, (shift_sec, shift_samp) in enumerate(zip(shift_seconds, shift_samples)):
+                logger.info(f"Processing shift {shift_idx+1}/{len(shift_samples)}: {shift_sec}s ({shift_samp} samples)")
+                
+                sample_klds = []
+                
+                for sample_idx, sample in enumerate(all_samples):
+                    try:
+                        # Get raw signals (these are already tensors from the dataset)
+                        fhr_raw = sample['fhr_raw'].cpu().numpy()  # Shape: (4800,)
+                        up_raw = sample['up_raw'].cpu().numpy()    # Shape: (4800,)
+                        fhr_st = sample['fhr_st']  # Already normalized, shape: (300, 43)
+                        fhr_ph = sample['fhr_ph']  # Already normalized, shape: (300, 44)
+                        
+                        # Apply shift to UP signal
+                        up_shifted = self._apply_temporal_shift(up_raw, shift_samp)
+                        
+                        # Prepare signals for scattering transform (need batch dimension and proper shape)
+                        # Scattering expects (batch, channels, length) format
+                        fhr_tensor = torch.from_numpy(fhr_raw).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 4800)
+                        up_shifted_tensor = torch.from_numpy(up_shifted).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 4800)
+                        
+                        # Stack FHR and UP for cross-channel processing
+                        combined_signals = torch.cat([fhr_tensor, up_shifted_tensor], dim=1)  # (1, 2, 4800)
+                        
+                        # Compute cross-channel phase coefficients
+                        scattering_output = scattering_transform.forward(
+                            combined_signals,
+                            compute_phase=False,
+                            compute_cross_phase=True,
+                            cross_phase_same_pairs_only=False,
+                            cross_phase_low_pass=True
+                        )
+                        
+                        # Extract cross-phase coefficients
+                        cross_phase_raw = scattering_output['cross_phase_corr']  # Shape: (1, 130, 300)
+                        
+                        # Convert to expected format: (batch, seq_len, channels)
+                        cross_phase_formatted = cross_phase_raw.transpose(1, 2)  # (1, 300, 130)
+                        
+                        # Normalize using existing stats
+                        cross_phase_normalized = normalize_tensor_data(
+                            data=cross_phase_formatted,
+                            field_name='fhr_up_ph',
+                            normalization_stats=normalization_stats,
+                            log_norm_channels_config=raw_dataset.log_norm_channels_config,
+                            asinh_norm_channels_config=raw_dataset.asinh_norm_channels_config,
+                            log_epsilon=raw_dataset.log_epsilon,
+                            pin_memory=False,
+                            normalize_fields=raw_dataset.normalize_fields,
+                            dtype=torch.float32
+                        )
+                        
+                        # Prepare inputs for model (add batch dimension to existing normalized data)
+                        y_st_input = fhr_st.unsqueeze(0).to(device)  # (1, 300, 43)
+                        y_ph_input = fhr_ph.unsqueeze(0).to(device)  # (1, 300, 44)
+                        x_ph_input = cross_phase_normalized.to(device)  # (1, 300, 130)
+                        
+                        # Measure transfer entropy (KLD) for this shift
+                        kld_tensor = self.pytorch_model.measure_transfer_entropy(
+                            y_st=y_st_input,
+                            y_ph=y_ph_input, 
+                            x_ph=x_ph_input,
+                            reduce_mean=False  # Get full tensor for analysis
+                        )
+                        
+                        # Average KLD over sequence length and latent dimensions
+                        sample_kld = kld_tensor.mean().item()
+                        sample_klds.append(sample_kld)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to process sample {sample_idx} with shift {shift_sec}s: {e}")
+                        continue
+                
+                if len(sample_klds) > 0:
+                    # Average KLD across all samples for this shift
+                    avg_kld = np.mean(sample_klds)
+                    kld_results.append(avg_kld)
+                    valid_shifts.append(shift_sec)
+                    logger.info(f"Shift {shift_sec}s: Average KLD = {avg_kld:.6f} ({len(sample_klds)} samples)")
+                else:
+                    logger.warning(f"No valid samples for shift {shift_sec}s")
+        
+        # Plot results
+        if len(kld_results) > 0:
+            plot_path = plot_transfer_entropy_vs_shift(valid_shifts, kld_results, self.test_results_dir)
+            
+            # Save results to file
+            results_data = {
+                'shifts_seconds': valid_shifts,
+                'average_kld': kld_results,
+                'num_samples': len(all_samples),
+                'sampling_rate': sampling_rate
+            }
+            
+            results_path = os.path.join(self.test_results_dir, 'transfer_entropy_shift_analysis.pkl')
+            with open(results_path, 'wb') as f:
+                pickle.dump(results_data, f)
+            
+            logger.info(f"Transfer entropy shift analysis complete.")
+            logger.info(f"Results saved to: {results_path}")
+            logger.info(f"Plot saved to: {plot_path}")
+        else:
+            logger.error("No valid results obtained from shift analysis.")
+
+    def _apply_temporal_shift(self, signal, shift_samples):
+        """
+        Apply temporal shift to a signal.
+        
+        Args:
+            signal: 1D numpy array of signal values
+            shift_samples: Number of samples to shift (positive = shift right/delay, negative = shift left/advance)
+        
+        Returns:
+            Shifted signal of the same length
+        """
+        if shift_samples == 0:
+            return signal.copy()
+        
+        shifted_signal = np.zeros_like(signal)
+        
+        if shift_samples > 0:
+            # Shift right (delay): fill beginning with zeros, copy signal to end
+            if shift_samples < len(signal):
+                shifted_signal[shift_samples:] = signal[:-shift_samples]
+        else:
+            # Shift left (advance): copy end of signal to beginning, fill end with zeros  
+            shift_samples = abs(shift_samples)
+            if shift_samples < len(signal):
+                shifted_signal[:-shift_samples] = signal[shift_samples:]
+        
+        return shifted_signal
 
 
 def main(train_SeqVAE=1, test_SeqVAE=-1):
