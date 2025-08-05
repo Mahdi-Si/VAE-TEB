@@ -1107,14 +1107,15 @@ class SeqVAEGraphModel:
         
         This test examines how the amount of temporal shift in the UP signal affects 
         the transfer entropy from the source (shifted UP cross-phase) to the latent 
-        representation. The test:
+        representation. The revised workflow:
         
         1. Loads raw unnormalized UP and FHR signals without 2-minute trim
-        2. Shifts UP signal by various delays (-60s to +60s in 1s increments)
-        3. Recomputes cross-channel phase coefficients for each shift
-        4. Normalizes the new coefficients with existing stats
-        5. Measures transfer entropy (KLD) for each shift
-        6. Plots average KLD as function of shift/delay
+        2. Applies circular shifts to UP signal by various delays (-60s to +60s)
+        3. Recomputes cross-channel phase coefficients using KymatioPhaseScattering1D
+        4. Normalizes the new coefficients with existing fhr_up_ph stats
+        5. Applies 2-minute trimming to both signals and coefficients
+        6. Measures transfer entropy (KLD) for each shift
+        7. Plots signals and KLD as function of shift/delay
         
         Args:
             test_loader: DataLoader for test data
@@ -1209,9 +1210,18 @@ class SeqVAEGraphModel:
         
         logger.info(f"Testing {len(shift_samples)} different shifts from {shift_seconds[0]}s to {shift_seconds[-1]}s")
         
+        # Calculate 2-minute trimming parameters
+        trim_minutes = 2.0
+        trim_samples_raw = int(4 * 60 * trim_minutes)  # 480 samples at 4Hz
+        trim_samples_decimated = trim_samples_raw // 16  # 30 samples for coefficients
+        
         # Storage for results
         kld_results = []
         valid_shifts = []
+        
+        # For plotting individual signals (save first few samples)
+        plot_samples = min(3, len(all_samples))
+        signal_plot_data = []
         
         with torch.no_grad():
             for shift_idx, (shift_sec, shift_samp) in enumerate(zip(shift_seconds, shift_samples)):
@@ -1227,8 +1237,8 @@ class SeqVAEGraphModel:
                         fhr_st = sample['fhr_st']  # Already normalized, shape: (300, 43)
                         fhr_ph = sample['fhr_ph']  # Already normalized, shape: (300, 44)
                         
-                        # Apply shift to UP signal
-                        up_shifted = self._apply_temporal_shift(up_raw, shift_samp)
+                        # Apply circular shift to UP signal
+                        up_shifted = self._apply_circular_shift(up_raw, shift_samp)
                         
                         # Prepare signals for scattering transform (need batch dimension and proper shape)
                         # Scattering expects (batch, channels, length) format
@@ -1266,10 +1276,20 @@ class SeqVAEGraphModel:
                             dtype=torch.float32
                         )
                         
-                        # Prepare inputs for model (add batch dimension to existing normalized data)
-                        y_st_input = fhr_st.unsqueeze(0).to(device)  # (1, 300, 43)
-                        y_ph_input = fhr_ph.unsqueeze(0).to(device)  # (1, 300, 44)
-                        x_ph_input = cross_phase_normalized.to(device)  # (1, 300, 130)
+                        # Apply 2-minute trimming to coefficients (remove beginning and end)
+                        if trim_samples_decimated > 0:
+                            cross_phase_trimmed = cross_phase_normalized[:, trim_samples_decimated:-trim_samples_decimated, :]
+                            fhr_st_trimmed = fhr_st[trim_samples_decimated:-trim_samples_decimated, :]
+                            fhr_ph_trimmed = fhr_ph[trim_samples_decimated:-trim_samples_decimated, :]
+                        else:
+                            cross_phase_trimmed = cross_phase_normalized
+                            fhr_st_trimmed = fhr_st
+                            fhr_ph_trimmed = fhr_ph
+                        
+                        # Prepare inputs for model 
+                        y_st_input = fhr_st_trimmed.unsqueeze(0).to(device)  # (1, seq_len, 43)
+                        y_ph_input = fhr_ph_trimmed.unsqueeze(0).to(device)  # (1, seq_len, 44)
+                        x_ph_input = cross_phase_trimmed.to(device)  # (1, seq_len, 130)
                         
                         # Measure transfer entropy (KLD) for this shift
                         kld_tensor = self.pytorch_model.measure_transfer_entropy(
@@ -1282,6 +1302,28 @@ class SeqVAEGraphModel:
                         # Average KLD over sequence length and latent dimensions
                         sample_kld = kld_tensor.mean().item()
                         sample_klds.append(sample_kld)
+                        
+                        # Store data for plotting (first few samples and shifts)
+                        if sample_idx < plot_samples and len(signal_plot_data) < plot_samples * 5:  # Store 5 shifts per sample
+                            if shift_idx % (len(shift_seconds) // 5) == 0:  # Sample every few shifts
+                                # Apply trimming to raw signals for plotting
+                                if trim_samples_raw > 0:
+                                    fhr_trimmed = fhr_raw[trim_samples_raw:-trim_samples_raw]
+                                    up_trimmed = up_raw[trim_samples_raw:-trim_samples_raw]
+                                    up_shifted_trimmed = up_shifted[trim_samples_raw:-trim_samples_raw]
+                                else:
+                                    fhr_trimmed = fhr_raw
+                                    up_trimmed = up_raw
+                                    up_shifted_trimmed = up_shifted
+                                    
+                                signal_plot_data.append({
+                                    'sample_idx': sample_idx,
+                                    'shift_sec': shift_sec,
+                                    'fhr': fhr_trimmed,
+                                    'up_original': up_trimmed,
+                                    'up_shifted': up_shifted_trimmed,
+                                    'kld': sample_kld
+                                })
                         
                     except Exception as e:
                         logger.warning(f"Failed to process sample {sample_idx} with shift {shift_sec}s: {e}")
@@ -1298,14 +1340,20 @@ class SeqVAEGraphModel:
         
         # Plot results
         if len(kld_results) > 0:
+            # Plot transfer entropy vs shift
             plot_path = plot_transfer_entropy_vs_shift(valid_shifts, kld_results, self.test_results_dir)
+            
+            # Plot individual signal examples
+            if signal_plot_data:
+                self._plot_signal_shift_examples(signal_plot_data, sampling_rate)
             
             # Save results to file
             results_data = {
                 'shifts_seconds': valid_shifts,
                 'average_kld': kld_results,
                 'num_samples': len(all_samples),
-                'sampling_rate': sampling_rate
+                'sampling_rate': sampling_rate,
+                'signal_examples': signal_plot_data
             }
             
             results_path = os.path.join(self.test_results_dir, 'transfer_entropy_shift_analysis.pkl')
@@ -1318,33 +1366,71 @@ class SeqVAEGraphModel:
         else:
             logger.error("No valid results obtained from shift analysis.")
 
-    def _apply_temporal_shift(self, signal, shift_samples):
+    def _apply_circular_shift(self, signal, shift_samples):
         """
-        Apply temporal shift to a signal.
+        Apply circular shift to a signal (no zero-padding, preserves all information).
         
         Args:
             signal: 1D numpy array of signal values
             shift_samples: Number of samples to shift (positive = shift right/delay, negative = shift left/advance)
         
         Returns:
-            Shifted signal of the same length
+            Circularly shifted signal of the same length
         """
         if shift_samples == 0:
             return signal.copy()
         
-        shifted_signal = np.zeros_like(signal)
+        # Use numpy's roll for circular shift
+        return np.roll(signal, shift_samples)
+
+    def _plot_signal_shift_examples(self, signal_plot_data, sampling_rate):
+        """
+        Plot examples of FHR, original UP, and shifted UP signals.
         
-        if shift_samples > 0:
-            # Shift right (delay): fill beginning with zeros, copy signal to end
-            if shift_samples < len(signal):
-                shifted_signal[shift_samples:] = signal[:-shift_samples]
-        else:
-            # Shift left (advance): copy end of signal to beginning, fill end with zeros  
-            shift_samples = abs(shift_samples)
-            if shift_samples < len(signal):
-                shifted_signal[:-shift_samples] = signal[shift_samples:]
+        Args:
+            signal_plot_data: List of dictionaries containing signal data for different shifts
+            sampling_rate: Sampling rate in Hz
+        """
+        if not signal_plot_data:
+            return
+            
+        # Group data by sample
+        samples_data = {}
+        for data in signal_plot_data:
+            sample_idx = data['sample_idx']
+            if sample_idx not in samples_data:
+                samples_data[sample_idx] = []
+            samples_data[sample_idx].append(data)
         
-        return shifted_signal
+        # Plot each sample
+        for sample_idx, sample_shifts in samples_data.items():
+            fig, axes = plt.subplots(len(sample_shifts), 1, figsize=(16, len(sample_shifts) * 4), constrained_layout=True)
+            if len(sample_shifts) == 1:
+                axes = [axes]
+                
+            for i, data in enumerate(sample_shifts):
+                t = np.arange(len(data['fhr'])) / sampling_rate
+                
+                axes[i].plot(t, data['fhr'], color='#055C9A', label='FHR', linewidth=1.2, alpha=0.8)
+                axes[i].plot(t, data['up_original'], color='#0DD8A2', label='UP Original', linewidth=1.2, alpha=0.8)
+                axes[i].plot(t, data['up_shifted'], color='#BB3E00', label=f'UP Shifted ({data["shift_sec"]}s)', linewidth=1.2, alpha=0.8)
+                
+                axes[i].set_title(f'Sample {sample_idx} - Shift: {data["shift_sec"]}s - KLD: {data["kld"]:.6f}', fontweight='normal', pad=12)
+                axes[i].set_ylabel('Amplitude', fontweight='normal')
+                axes[i].legend(loc='upper right', framealpha=0.95)
+                axes[i].grid(True, alpha=0.3)
+                
+                if i == len(sample_shifts) - 1:
+                    axes[i].set_xlabel('Time (s)', fontweight='normal')
+            
+            fig.suptitle(f'Signal Shift Examples - Sample {sample_idx}', fontsize=14, fontweight='normal', y=0.98)
+            
+            # Save plot
+            plot_path = os.path.join(self.test_results_dir, f'signal_shift_examples_sample_{sample_idx}.png')
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+            plt.close(fig)
+            
+            logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
 
 
 def main(train_SeqVAE=1, test_SeqVAE=-1):
