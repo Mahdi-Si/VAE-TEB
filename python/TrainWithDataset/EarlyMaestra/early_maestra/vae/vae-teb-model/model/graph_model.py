@@ -1144,9 +1144,9 @@ class SeqVAEGraphModel:
             return
             
         # Initialize scattering transform for cross-phase computation
-        # Use parameters from fhr_st_setting.md: J=11, Q=4, T=16, sampling_rate=4Hz
+        # Use parameters matching dataset creation: J=11, Q=4, T=16, shape=5760 (not 4800)
         scattering_transform = KymatioPhaseScattering1D(
-            J=11, Q=4, T=16, shape=4800, device=device
+            J=11, Q=4, T=16, shape=5760, device=device
         )
         scattering_transform.to(device)
         scattering_transform.eval()
@@ -1169,7 +1169,7 @@ class SeqVAEGraphModel:
             allowed_guids=allowed_guids,
             stats_path=stats_path,
             trim_minutes=None,  # No trimming to get full raw signals
-            normalize_fields=['fhr_st', 'fhr_ph']  # Only normalize what we need
+            normalize_fields=['fhr_st', 'fhr_ph']  # Only normalize what we need, keep fhr/up raw
         )
         
         # Collect samples for analysis
@@ -1185,8 +1185,8 @@ class SeqVAEGraphModel:
                 sample = raw_dataset[i]
                 # Store both raw (unnormalized) and normalized versions
                 all_samples.append({
-                    'fhr_raw': sample['fhr'],           # Raw FHR signal
-                    'up_raw': sample['up'],             # Raw UP signal  
+                    'fhr': sample['fhr'],           # Raw FHR signal
+                    'up': sample['up'],             # Raw UP signal  
                     'fhr_st': sample['fhr_st'],         # Normalized scattering coefficients
                     'fhr_ph': sample['fhr_ph'],         # Normalized phase coefficients
                 })
@@ -1232,8 +1232,8 @@ class SeqVAEGraphModel:
                 for sample_idx, sample in enumerate(all_samples):
                     try:
                         # Get raw signals (these are already tensors from the dataset)
-                        fhr_raw = sample['fhr_raw'].cpu().numpy()  # Shape: (4800,)
-                        up_raw = sample['up_raw'].cpu().numpy()    # Shape: (4800,)
+                        fhr_raw = sample['fhr'].cpu().numpy()  # Shape: (5760,)
+                        up_raw = sample['up'].cpu().numpy()    # Shape: (5760,)
                         fhr_st = sample['fhr_st']  # Already normalized, shape: (300, 43)
                         fhr_ph = sample['fhr_ph']  # Already normalized, shape: (300, 44)
                         
@@ -1242,11 +1242,11 @@ class SeqVAEGraphModel:
                         
                         # Prepare signals for scattering transform (need batch dimension and proper shape)
                         # Scattering expects (batch, channels, length) format
-                        fhr_tensor = torch.from_numpy(fhr_raw).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 4800)
-                        up_shifted_tensor = torch.from_numpy(up_shifted).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 4800)
+                        fhr_tensor = torch.from_numpy(fhr_raw).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 5760)
+                        up_shifted_tensor = torch.from_numpy(up_shifted).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 5760)
                         
                         # Stack FHR and UP for cross-channel processing
-                        combined_signals = torch.cat([fhr_tensor, up_shifted_tensor], dim=1)  # (1, 2, 4800)
+                        combined_signals = torch.cat([fhr_tensor, up_shifted_tensor], dim=1)  # (1, 2, 5760)
                         
                         # Compute cross-channel phase coefficients
                         scattering_output = scattering_transform.forward(
