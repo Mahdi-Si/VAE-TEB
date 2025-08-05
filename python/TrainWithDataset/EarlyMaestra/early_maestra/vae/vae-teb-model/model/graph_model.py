@@ -1144,12 +1144,17 @@ class SeqVAEGraphModel:
             return
             
         # Initialize scattering transform for cross-phase computation
-        # Use parameters matching dataset creation: J=11, Q=4, T=16, shape=5760 (not 4800)
+        # Use parameters matching dataset creation: J=11, Q=4, T=16, shape=5760, max_order=1
         scattering_transform = KymatioPhaseScattering1D(
-            J=11, Q=4, T=16, shape=5760, device=device
+            J=11, Q=4, T=16, shape=5760, device=device, tukey_alpha=None, max_order=1
         )
         scattering_transform.to(device)
         scattering_transform.eval()
+        
+        # Get optimal coefficient selection masks (same as dataset creation)
+        optimal_selection = scattering_transform.get_optimal_coefficients_for_fhr(11, 4, 16)
+        cross_mask = optimal_selection['recommendations']['use_cross_mask']
+        logger.info(f"Using cross-channel mask with {cross_mask.sum().item()} selected coefficients")
         
         # Create a temporary dataset without trimming to get raw signals
         logger.info("Creating dataset without trimming to access raw signals...")
@@ -1240,25 +1245,22 @@ class SeqVAEGraphModel:
                         # Apply circular shift to UP signal
                         up_shifted = self._apply_circular_shift(up_raw, shift_samp)
                         
-                        # Prepare signals for scattering transform (need batch dimension and proper shape)
-                        # Scattering expects (batch, channels, length) format
-                        fhr_tensor = torch.from_numpy(fhr_raw).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 5760)
-                        up_shifted_tensor = torch.from_numpy(up_shifted).float().unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 5760)
+                        # Prepare signals exactly as in dataset creation
+                        # Stack [fhr, up_shifted] as in create_hdf5_dataset.py line 418
+                        st_input = torch.from_numpy(np.stack([fhr_raw, up_shifted], axis=0)).float().unsqueeze(0).to(device)  # (1, 2, 5760)
                         
-                        # Stack FHR and UP for cross-channel processing
-                        combined_signals = torch.cat([fhr_tensor, up_shifted_tensor], dim=1)  # (1, 2, 5760)
+                        # Compute cross-channel phase coefficients exactly as in dataset creation (lines 427-432)
+                        st_results_cross = scattering_transform(x=st_input,
+                                                               compute_phase=False,
+                                                               compute_cross_phase=True,
+                                                               scattering_channel=0,
+                                                               phase_channels=[0, 1])
                         
-                        # Compute cross-channel phase coefficients
-                        scattering_output = scattering_transform.forward(
-                            combined_signals,
-                            compute_phase=False,
-                            compute_cross_phase=True,
-                            cross_phase_same_pairs_only=False,
-                            cross_phase_low_pass=True
-                        )
+                        # Extract the full cross-phase coefficients (line 437)
+                        fhr_up_cc_phase_full = st_results_cross.get('cross_phase_corr')
                         
-                        # Extract cross-phase coefficients
-                        cross_phase_raw = scattering_output['cross_phase_corr']  # Shape: (1, 130, 300)
+                        # Apply optimal selection mask exactly as in dataset creation (line 441)
+                        cross_phase_raw = fhr_up_cc_phase_full[:, cross_mask, :] if fhr_up_cc_phase_full is not None else None
                         
                         # Convert to expected format: (batch, seq_len, channels)
                         cross_phase_formatted = cross_phase_raw.transpose(1, 2)  # (1, 300, 130)
