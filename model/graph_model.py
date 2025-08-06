@@ -149,7 +149,7 @@ def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_
             # Test forward pass
             with torch.no_grad():
                 forward_outputs = model(test_y_st, test_y_ph, test_x_ph)
-                loss_dict = model.compute_loss(forward_outputs, test_y_st, test_y_ph, test_y_raw, compute_kld_loss=True)
+                loss_dict = model.compute_loss(forward_outputs, test_y_st, test_y_ph, test_y_raw, compute_kld_loss=True, beta=1.0)
                 loss = loss_dict['total_loss']
                 
             # Test backward pass (without updating weights)
@@ -705,7 +705,7 @@ class SeqVAEGraphModel:
                         
                         # Compute loss with new API for raw signal reconstruction
                         loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
                         
                         total_loss = loss_dict['total_loss']
 
@@ -724,7 +724,7 @@ class SeqVAEGraphModel:
                     
                     # Compute loss with new API for raw signal reconstruction
                     loss_dict = plain_model.compute_loss(
-                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
 
                     total_loss = loss_dict['total_loss']
 
@@ -781,13 +781,13 @@ class SeqVAEGraphModel:
                             
                             # Compute loss with new API for raw signal reconstruction
                             loss_dict = plain_model.compute_loss(
-                                forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                                forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
                     else:
                         forward_outputs = model(y_st, y_ph, x_ph)
                         
                         # Compute loss with new API for raw signal reconstruction
                         loss_dict = plain_model.compute_loss(
-                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
                     
                     # Accumulate losses
                     reconstruction_loss_item = loss_dict['reconstruction_loss'].item()
@@ -1002,7 +1002,7 @@ class SeqVAEGraphModel:
 
                     # Compute loss the same way as training to get consistent KLD values
                     loss_dict = self.pytorch_model.compute_loss(
-                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True)
+                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
                     
                     # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
