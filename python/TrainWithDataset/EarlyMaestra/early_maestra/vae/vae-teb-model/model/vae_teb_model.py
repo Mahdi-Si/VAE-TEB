@@ -1137,6 +1137,7 @@ class SeqVaeTeb(nn.Module):
         y_ph: torch.Tensor, 
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
+        beta: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss with MSE and NLL components.
@@ -1147,6 +1148,7 @@ class SeqVaeTeb(nn.Module):
             y_ph: Target phase coefficients from optimized dataloader (B, S=300, channels=44)
             y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
+            beta (float): Beta weight for KLD loss in VAE training.
 
         Returns:
             A dictionary of computed losses.
@@ -1177,8 +1179,8 @@ class SeqVaeTeb(nn.Module):
                 reduce_mean=True,  # Ensure scalar loss for training
             )
 
-        # Total loss
-        total_loss = decoder_losses['total_decoder_loss'] + kld_loss
+        # Total loss with beta-weighted KLD
+        total_loss = decoder_losses['total_decoder_loss'] + beta * kld_loss
 
         return {
             "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
@@ -1471,7 +1473,8 @@ class SeqVaeTebClassifier(nn.Module):
                 y_st=y_st,
                 y_ph=y_ph,
                 y_raw=y_raw,
-                compute_kld_loss=True
+                compute_kld_loss=True,
+                beta=1.0  # Default beta for classifier training
             )
             vae_total_loss = vae_losses['total_loss']
         else:

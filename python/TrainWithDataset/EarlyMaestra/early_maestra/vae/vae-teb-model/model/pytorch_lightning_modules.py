@@ -486,7 +486,7 @@ class LightSeqVaeTeb(L.LightningModule):
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
-            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True
+            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.hparams.beta
         )
 
         return loss_dict
@@ -494,7 +494,7 @@ class LightSeqVaeTeb(L.LightningModule):
     def training_step(self, batch, batch_idx):
         """Defines the training loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['reconstruction_loss'] + self.hparams.beta * loss_dict['kld_loss']
+        total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
 
         # Log training metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -510,7 +510,7 @@ class LightSeqVaeTeb(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         """Defines the validation loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['reconstruction_loss'] + self.hparams.beta * loss_dict['kld_loss']
+        total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
 
         # Log validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
