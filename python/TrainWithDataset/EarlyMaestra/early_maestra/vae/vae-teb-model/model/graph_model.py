@@ -22,7 +22,7 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction, plot_transfer_entropy_vs_shift
+from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction, plot_transfer_entropy_vs_shift, plot_metrics_histograms
 from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
@@ -906,6 +906,7 @@ class SeqVAEGraphModel:
         """
         self.run_analysis_and_plot(test_loader, 200)
         self.run_transfer_entropy_shift_analysis(test_loader)
+        self.run_metrics_histogram_analysis(test_loader)
 
 
     def run_analysis_and_plot(self, test_loader, num_samples=200):
@@ -1433,6 +1434,171 @@ class SeqVAEGraphModel:
             plt.close(fig)
             
             logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
+
+    def run_metrics_histogram_analysis(self, test_loader, num_samples=None):
+        """
+        Calculate VAF, MSE, SNR between normalized raw FHR and reconstructed FHR,
+        and KLD loss for each sample, then plot histograms of these metrics.
+        
+        Args:
+            test_loader: DataLoader for test data
+            num_samples: Number of samples to analyze (None = all samples)
+        """
+        logger.info("Starting metrics histogram analysis...")
+        self.create_model()
+        
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting metrics analysis.")
+            return
+            
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        self.pytorch_model.to(device)
+        self.pytorch_model.eval()
+        
+        # Get normalization stats for denormalization
+        normalization_stats = None
+        if hasattr(test_loader.dataset, 'get_normalization_stats'):
+            normalization_stats = test_loader.dataset.get_normalization_stats()
+            
+        # Collect all samples
+        all_samples = []
+        sample_count = 0
+        max_samples = num_samples if num_samples is not None else float('inf')
+        
+        try:
+            with torch.no_grad():
+                for batch_data in tqdm(test_loader, desc="Collecting samples"):
+                    if sample_count >= max_samples:
+                        break
+                        
+                    batch_size = batch_data.fhr_st.size(0)
+                    for i in range(batch_size):
+                        if sample_count >= max_samples:
+                            break
+                            
+                        sample = {
+                            'fhr_st': batch_data.fhr_st[i],
+                            'fhr_ph': batch_data.fhr_ph[i], 
+                            'fhr_up_ph': batch_data.fhr_up_ph[i],
+                            'fhr': batch_data.fhr[i]
+                        }
+                        all_samples.append(sample)
+                        sample_count += 1
+                        
+        except Exception as e:
+            logger.error(f"Error collecting samples: {e}")
+            return
+            
+        if len(all_samples) == 0:
+            logger.error("No samples found in test loader.")
+            return
+            
+        logger.info(f"Analyzing {len(all_samples)} samples for metrics calculation")
+        
+        # Storage for metrics
+        vaf_values = []
+        mse_values = []
+        snr_values = []
+        kld_values = []
+        
+        # Process each sample
+        with torch.no_grad():
+            for sample_idx, sample in enumerate(tqdm(all_samples, desc="Computing metrics")):
+                try:
+                    # Move sample data to device and add batch dimension
+                    y_st = sample['fhr_st'].unsqueeze(0).to(device)
+                    y_ph = sample['fhr_ph'].unsqueeze(0).to(device) 
+                    x_ph = sample['fhr_up_ph'].unsqueeze(0).to(device)
+                    y_raw = sample['fhr'].unsqueeze(0).to(device)
+                    
+                    # Get model outputs
+                    forward_outputs = self.pytorch_model(y_st, y_ph, x_ph)
+                    reconstructed_fhr_mu = forward_outputs['mu_pr']  # (1, 4800)
+                    
+                    # Compute KLD using the model's method
+                    kld_tensor = self.pytorch_model.measure_transfer_entropy(
+                        y_st, y_ph, x_ph, reduce_mean=False
+                    )
+                    # Average KLD over sequence length and latent dimensions
+                    sample_kld = kld_tensor.mean().item()
+                    kld_values.append(sample_kld)
+                    
+                    # Move to CPU for metric calculations
+                    y_raw_np = y_raw[0].cpu().numpy()  # (4800,)
+                    reconstructed_fhr_np = reconstructed_fhr_mu[0].cpu().numpy()  # (4800,)
+                    
+                    # Handle normalization - we want normalized versions for fair comparison
+                    if normalization_stats and 'fhr' in normalization_stats:
+                        # Both signals should be normalized to compute metrics fairly
+                        original_fhr_normalized = y_raw_np  # Already normalized from dataset
+                        reconstructed_fhr_normalized = reconstructed_fhr_np  # Model output should be in same scale
+                    else:
+                        # Use as-is if no normalization stats
+                        original_fhr_normalized = y_raw_np
+                        reconstructed_fhr_normalized = reconstructed_fhr_np
+                    
+                    # Calculate VAF (Variance Accounted For)
+                    # VAF = 1 - var(original - reconstructed) / var(original)
+                    residual = original_fhr_normalized - reconstructed_fhr_normalized
+                    var_residual = np.var(residual)
+                    var_original = np.var(original_fhr_normalized)
+                    
+                    if var_original > 1e-12:  # Avoid division by zero
+                        vaf = 1.0 - (var_residual / var_original)
+                        vaf = max(0.0, min(1.0, vaf))  # Clamp to [0, 1]
+                    else:
+                        vaf = 0.0
+                    vaf_values.append(vaf)
+                    
+                    # Calculate MSE
+                    mse = np.mean((original_fhr_normalized - reconstructed_fhr_normalized) ** 2)
+                    mse_values.append(mse)
+                    
+                    # Calculate SNR (Signal-to-Noise Ratio) in dB
+                    # SNR = 10 * log10(signal_power / noise_power)
+                    signal_power = np.mean(original_fhr_normalized ** 2)
+                    noise_power = np.mean(residual ** 2)
+                    
+                    if noise_power > 1e-12:  # Avoid division by zero
+                        snr_db = 10.0 * np.log10(signal_power / noise_power)
+                    else:
+                        snr_db = 100.0  # Very high SNR when noise is negligible
+                    snr_values.append(snr_db)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to process sample {sample_idx}: {e}")
+                    continue
+        
+        # Log statistics
+        logger.info(f"Computed metrics for {len(vaf_values)} samples")
+        logger.info(f"VAF - Mean: {np.mean(vaf_values):.4f}, Std: {np.std(vaf_values):.4f}")
+        logger.info(f"MSE - Mean: {np.mean(mse_values):.6f}, Std: {np.std(mse_values):.6f}")
+        logger.info(f"SNR - Mean: {np.mean(snr_values):.2f} dB, Std: {np.std(snr_values):.2f} dB")
+        logger.info(f"KLD - Mean: {np.mean(kld_values):.6f}, Std: {np.std(kld_values):.6f}")
+        
+        # Plot histograms using the plotting function from utils
+        plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, self.test_results_dir)
+        
+        # Save metrics data
+        metrics_data = {
+            'vaf': vaf_values,
+            'mse': mse_values, 
+            'snr': snr_values,
+            'kld': kld_values,
+            'num_samples': len(vaf_values),
+            'statistics': {
+                'vaf': {'mean': np.mean(vaf_values), 'std': np.std(vaf_values)},
+                'mse': {'mean': np.mean(mse_values), 'std': np.std(mse_values)},
+                'snr': {'mean': np.mean(snr_values), 'std': np.std(snr_values)},
+                'kld': {'mean': np.mean(kld_values), 'std': np.std(kld_values)}
+            }
+        }
+        
+        results_path = os.path.join(self.test_results_dir, 'metrics_histogram_analysis.pkl')
+        with open(results_path, 'wb') as f:
+            pickle.dump(metrics_data, f)
+            
+        logger.info(f"Metrics histogram analysis complete. Results saved to: {results_path}")
 
 
 def main(train_SeqVAE=1, test_SeqVAE=-1):
