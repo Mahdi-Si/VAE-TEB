@@ -775,3 +775,121 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     gc.collect()
     
     return plot_path
+
+
+def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, output_dir):
+    """
+    Plot histograms for VAF, MSE, SNR, and KLD metrics using the same style as other plots.
+    
+    Args:
+        vaf_values: List of VAF values
+        mse_values: List of MSE values 
+        snr_values: List of SNR values in dB
+        kld_values: List of KLD values
+        output_dir: Directory to save plots
+    """
+    # Professional scientific paper color palette
+    colors = {
+        'vaf': '#055C9A',      # Deep blue
+        'mse': '#BB3E00',      # Deep orange-red
+        'snr': '#0DD8A2',      # Sage green
+        'kld': '#F7AD45',      # Golden yellow
+        'background': '#F9F3EF'
+    }
+    
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'axes.linewidth': 0.7,
+        'axes.edgecolor': "#9E9D9D",
+        'axes.facecolor': colors['background'],
+        'grid.color': "#838383",
+        'grid.linewidth': 0.4,
+        'grid.alpha': 0.6,
+        'legend.frameon': True,
+        'legend.fancybox': False,
+        'legend.shadow': False,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#A2B9A7',
+        'legend.facecolor': colors['background'],
+        'figure.facecolor': 'white',
+        'savefig.facecolor': 'white',
+        'savefig.dpi': 300
+    })
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    axes = axes.flatten()
+    
+    metrics_data = [
+        (vaf_values, 'VAF (Variance Accounted For)', colors['vaf'], 'VAF', axes[0]),
+        (mse_values, 'MSE (Mean Squared Error)', colors['mse'], 'MSE', axes[1]), 
+        (snr_values, 'SNR (Signal-to-Noise Ratio) [dB]', colors['snr'], 'SNR (dB)', axes[2]),
+        (kld_values, 'KLD (Kullback-Leibler Divergence)', colors['kld'], 'KLD', axes[3])
+    ]
+    
+    # Configure scientific paper grid style for all subplots
+    for ax in axes:
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#A2B9A7')
+        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_linewidth(0.7)
+        ax.spines['bottom'].set_linewidth(0.7)
+    
+    for values, title, color, xlabel, ax in metrics_data:
+        if len(values) == 0:
+            continue
+            
+        # Calculate statistics
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+        min_val = np.min(values)
+        max_val = np.max(values)
+        
+        # Plot histogram
+        n, bins, patches = ax.hist(values, bins=50, alpha=0.7, color=color, 
+                                 edgecolor='white', linewidth=0.5, density=True)
+        
+        # Add vertical lines for mean and ±1std
+        ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, 
+                  label=f'Mean: {mean_val:.4f}')
+        ax.axvline(mean_val + std_val, color='red', linestyle=':', linewidth=1.5,
+                  alpha=0.7, label=f'±1σ: {std_val:.4f}')
+        ax.axvline(mean_val - std_val, color='red', linestyle=':', linewidth=1.5,
+                  alpha=0.7)
+        
+        # Styling
+        ax.set_title(title, fontweight='normal', fontsize=12, pad=12)
+        ax.set_xlabel(xlabel, fontweight='normal')
+        ax.set_ylabel('Density', fontweight='normal')
+        ax.legend(framealpha=0.95, loc='upper right')
+        
+        # Add text box with statistics
+        stats_text = f'Min: {min_val:.4f}\nMax: {max_val:.4f}\nStd: {std_val:.4f}\nSamples: {len(values)}'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+               verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # Overall title
+    fig.suptitle('Reconstruction Quality Metrics Distribution', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+    
+    # Save plot
+    save_path = os.path.join(output_dir, 'metrics_histograms.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig)
+    
+    # Clean up memory
+    import gc
+    del fig, axes
+    gc.collect()
+    
+    print(f"Metrics histograms saved to: {save_path}")
+    return save_path
