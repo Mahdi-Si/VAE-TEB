@@ -911,15 +911,25 @@ class SeqVAEGraphModel:
         """
         Runs tests on the SeqVaeTeb model by performing analysis and plotting on random samples.
         """
-        self.run_analysis_and_plot(test_loader, 200)
-        self.run_transfer_entropy_shift_analysis(test_loader)
-        self.run_metrics_histogram_analysis(test_loader)
-        # New: Demonstrate information flow using UP ablation and gain sweep
-        self.run_up_ablation_analysis(test_loader)
-        self.run_up_gain_sweep_analysis(test_loader)
+        # Create per-test subfolders
+        analysis_dir = os.path.join(self.test_results_dir, 'analysis_and_plot')
+        te_shift_dir = os.path.join(self.test_results_dir, 'te_shift_left')
+        metrics_dir = os.path.join(self.test_results_dir, 'metrics_histograms')
+        ablation_dir = os.path.join(self.test_results_dir, 'up_ablation')
+        gain_sweep_dir = os.path.join(self.test_results_dir, 'up_gain_sweep')
+
+        for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir]:
+            os.makedirs(d, exist_ok=True)
+
+        self.run_analysis_and_plot(test_loader, 200, output_dir=analysis_dir)
+        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir)
+        self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
+        # Demonstrate information flow using UP ablation and gain sweep
+        self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
+        self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir)
 
 
-    def run_analysis_and_plot(self, test_loader, num_samples=200):
+    def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None):
         """
         Runs a full analysis on randomly selected samples from the test loader and plots the results.
         
@@ -927,6 +937,7 @@ class SeqVAEGraphModel:
             test_loader: DataLoader for test data
             num_samples: Number of random samples to analyze and plot (default: 50)
         """
+        out_dir = output_dir or self.test_results_dir
         logger.info(f"Starting model analysis and plotting on {num_samples} random samples...")
         self.create_model()
 
@@ -1066,7 +1077,7 @@ class SeqVAEGraphModel:
 
                     # Generate plots for this sample
                     plot_model_analysis(
-                        output_dir=self.test_results_dir,
+                        output_dir=out_dir,
                         raw_fhr=raw_fhr_unnormalized_np,  # Unnormalized for first plot
                         raw_up=raw_up_unnormalized_np,    # Unnormalized for first plot
                         fhr_st=fhr_st_np,
@@ -1086,7 +1097,7 @@ class SeqVAEGraphModel:
                     
                     # Generate VAE reconstruction plots for this sample
                     plot_vae_reconstruction(
-                        output_dir=self.test_results_dir,
+                        output_dir=out_dir,
                         raw_fhr_unnormalized=raw_fhr_unnormalized_np,
                         raw_up_unnormalized=raw_up_unnormalized_np,
                         raw_fhr_normalized=raw_fhr_normalized_np,
@@ -1110,9 +1121,9 @@ class SeqVAEGraphModel:
                     continue
 
         logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
-        logger.info(f"Plots saved to: {self.test_results_dir}")
+        logger.info(f"Plots saved to: {out_dir}")
 
-    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1):
+    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None):
         """
         Analyze transfer entropy (KLD) vs left shifts of UP (UP lags FHR).
 
@@ -1131,6 +1142,7 @@ class SeqVAEGraphModel:
             max_left_shift_seconds (int): Max left shift in seconds (default: 60)
             step_seconds (int): Step size in seconds (default: 1)
         """
+        out_dir = output_dir or self.test_results_dir
         logger.info(
             f"Starting transfer entropy shift analysis (LEFT shifts only) on {('ALL' if num_samples is None else num_samples)} samples, max_left_shift_seconds={max_left_shift_seconds}, step={step_seconds}..."
         )
@@ -1360,7 +1372,7 @@ class SeqVAEGraphModel:
             
             # Plot individual signal examples
             if signal_plot_data:
-                self._plot_signal_shift_examples(signal_plot_data, sampling_rate)
+                self._plot_signal_shift_examples(signal_plot_data, sampling_rate, output_dir=out_dir)
             
             # Save results to file
             results_data = {
@@ -1371,7 +1383,7 @@ class SeqVAEGraphModel:
                 'signal_examples': signal_plot_data
             }
             
-            results_path = os.path.join(self.test_results_dir, 'transfer_entropy_shift_analysis.pkl')
+            results_path = os.path.join(out_dir, 'transfer_entropy_shift_analysis.pkl')
             with open(results_path, 'wb') as f:
                 pickle.dump(results_data, f)
             
@@ -1398,7 +1410,7 @@ class SeqVAEGraphModel:
         # Use numpy's roll for circular shift
         return np.roll(signal, shift_samples)
 
-    def _plot_signal_shift_examples(self, signal_plot_data, sampling_rate):
+    def _plot_signal_shift_examples(self, signal_plot_data, sampling_rate, output_dir=None):
         """
         Plot examples of FHR, original UP, and shifted UP signals.
         
@@ -1406,6 +1418,7 @@ class SeqVAEGraphModel:
             signal_plot_data: List of dictionaries containing signal data for different shifts
             sampling_rate: Sampling rate in Hz
         """
+        out_dir = output_dir or self.test_results_dir
         if not signal_plot_data:
             return
             
@@ -1441,13 +1454,13 @@ class SeqVAEGraphModel:
             fig.suptitle(f'Signal Shift Examples - Sample {sample_idx}', fontsize=14, fontweight='normal', y=0.98)
             
             # Save plot
-            plot_path = os.path.join(self.test_results_dir, f'signal_shift_examples_sample_{sample_idx}.png')
+            plot_path = os.path.join(out_dir, f'signal_shift_examples_sample_{sample_idx}.png')
             plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
             plt.close(fig)
             
             logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
 
-    def run_metrics_histogram_analysis(self, test_loader, num_samples=None):
+    def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None):
         """
         Calculate VAF, MSE, SNR between normalized raw FHR and reconstructed FHR,
         and KLD loss for each sample, then plot histograms of these metrics.
@@ -1456,6 +1469,7 @@ class SeqVAEGraphModel:
             test_loader: DataLoader for test data
             num_samples: Number of samples to analyze (None = all samples)
         """
+        out_dir = output_dir or self.test_results_dir
         logger.info("Starting metrics histogram analysis...")
         self.create_model()
         
@@ -1589,7 +1603,7 @@ class SeqVAEGraphModel:
         logger.info(f"KLD - Mean: {np.mean(kld_values):.6f}, Std: {np.std(kld_values):.6f}")
         
         # Plot histograms using the plotting function from utils
-        plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, self.test_results_dir)
+        plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, out_dir)
         
         # Save metrics data
         metrics_data = {
@@ -1606,13 +1620,13 @@ class SeqVAEGraphModel:
             }
         }
         
-        results_path = os.path.join(self.test_results_dir, 'metrics_histogram_analysis.pkl')
+        results_path = os.path.join(out_dir, 'metrics_histogram_analysis.pkl')
         with open(results_path, 'wb') as f:
             pickle.dump(metrics_data, f)
             
         logger.info(f"Metrics histogram analysis complete. Results saved to: {results_path}")
 
-    def run_up_ablation_analysis(self, test_loader, num_samples=None):
+    def run_up_ablation_analysis(self, test_loader, num_samples=None, output_dir=None):
         """Compare TE (KLD) and reconstruction quality (VAF) with and without UP input.
 
         Args:
@@ -1622,6 +1636,7 @@ class SeqVAEGraphModel:
         Returns:
             None: Saves an ablation plot showing distributions and mean±std bars.
         """
+        out_dir = output_dir or self.test_results_dir
         logger.info("Starting UP ablation analysis (with vs without UP)...")
         self.create_model()
 
@@ -1693,12 +1708,12 @@ class SeqVAEGraphModel:
 
         # Plot
         try:
-            plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_without_up, self.test_results_dir)
+            plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_without_up, out_dir)
             logger.info("UP ablation analysis complete.")
         except Exception as e:
             logger.warning(f"Failed to plot ablation analysis: {e}")
 
-    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None):
+    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None):
         """Sweep multiplicative gains on UP features and track TE (KLD) and VAF trends.
 
         Args:
@@ -1709,6 +1724,7 @@ class SeqVAEGraphModel:
         Returns:
             None: Saves a plot of mean KLD and VAF vs gain.
         """
+        out_dir = output_dir or self.test_results_dir
         logger.info("Starting UP gain sweep analysis...")
         self.create_model()
 
@@ -1775,7 +1791,7 @@ class SeqVAEGraphModel:
         vaf_means = [vaf_sums[g] / counts for g in gains_list]
 
         try:
-            plot_te_gain_sweep(gains_list, kld_means, vaf_means, self.test_results_dir)
+            plot_te_gain_sweep(gains_list, kld_means, vaf_means, out_dir)
             logger.info("UP gain sweep analysis complete.")
         except Exception as e:
             logger.warning(f"Failed to plot gain sweep analysis: {e}")
