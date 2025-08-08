@@ -921,15 +921,41 @@ class SeqVAEGraphModel:
         for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir]:
             os.makedirs(d, exist_ok=True)
 
-        self.run_analysis_and_plot(test_loader, 200, output_dir=analysis_dir)
+        # Collect a consistent set of GUIDs to use across all tests
+        target_count = 50  # keep consistent with per-sample visualization count
+        selected_guids = []
+        try:
+            for batch in tqdm(test_loader, desc="Selecting GUIDs for tests"):
+                # batch.guid could be a list of strings or a tensor-like; ensure list[str]
+                guids_batch = batch.guid
+                if isinstance(guids_batch, (list, tuple)):
+                    guids_iter = guids_batch
+                else:
+                    try:
+                        guids_iter = [str(g) for g in guids_batch]
+                    except Exception:
+                        guids_iter = []
+                for g in guids_iter:
+                    if g not in selected_guids:
+                        selected_guids.append(g)
+                        if len(selected_guids) >= target_count:
+                            break
+                if len(selected_guids) >= target_count:
+                    break
+        except Exception as e:
+            logger.warning(f"Could not preselect GUIDs: {e}. Tests will pick samples as available.")
+
+        # Run tests on the same selected GUIDs
+        # Use selected_guids only for per-sample visualization; aggregate tests use full dataset
+        self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
         self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir)
         self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
-        # Demonstrate information flow using UP ablation and gain sweep
+        # Demonstrate information flow using UP ablation and gain sweep over whole dataset
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
         self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir)
 
 
-    def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None):
+    def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None):
         """
         Runs a full analysis on randomly selected samples from the test loader and plots the results.
         
@@ -997,6 +1023,13 @@ class SeqVAEGraphModel:
                 for batch_data in tqdm(test_loader, desc="Collecting samples"):
                     batch_size = batch_data.fhr_st.size(0)
                     for i in range(batch_size):
+                        guid_val = None
+                        try:
+                            guid_val = batch_data.guid[i] if isinstance(batch_data.guid, (list, tuple)) else str(batch_data.guid[i])
+                        except Exception:
+                            guid_val = None
+                        if selected_guids and guid_val not in selected_guids:
+                            continue
                         sample = {
                             'fhr_st': batch_data.fhr_st[i],
                             'fhr_ph': batch_data.fhr_ph[i],
@@ -1145,7 +1178,7 @@ class SeqVAEGraphModel:
         logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
         logger.info(f"Plots saved to: {out_dir}")
 
-    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None):
+    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None, selected_guids=None):
         """
         Analyze transfer entropy (KLD) vs left shifts of UP (UP lags FHR).
 
@@ -1217,7 +1250,7 @@ class SeqVAEGraphModel:
         raw_dataset = CombinedHDF5Dataset(
             paths=dataset_paths,
             load_fields=['fhr', 'up', 'fhr_st', 'fhr_ph'],  # Load necessary fields
-            allowed_guids=allowed_guids,
+            allowed_guids=selected_guids if selected_guids else allowed_guids,
             stats_path=stats_path,
             trim_minutes=None,  # No trimming to get full raw signals
             normalize_fields=['fhr_st', 'fhr_ph']  # Only normalize what we need, keep fhr/up raw
@@ -1482,7 +1515,7 @@ class SeqVAEGraphModel:
             
             logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
 
-    def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None):
+    def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None):
         """
         Calculate VAF, MSE, SNR between normalized raw FHR and reconstructed FHR,
         and KLD loss for each sample, then plot histograms of these metrics.
@@ -1523,7 +1556,13 @@ class SeqVAEGraphModel:
                     for i in range(batch_size):
                         if sample_count >= max_samples:
                             break
-                            
+                        guid_val = None
+                        try:
+                            guid_val = batch_data.guid[i] if isinstance(batch_data.guid, (list, tuple)) else str(batch_data.guid[i])
+                        except Exception:
+                            guid_val = None
+                        if selected_guids and guid_val not in selected_guids:
+                            continue
                         sample = {
                             'fhr_st': batch_data.fhr_st[i],
                             'fhr_ph': batch_data.fhr_ph[i], 
@@ -1648,7 +1687,7 @@ class SeqVAEGraphModel:
             
         logger.info(f"Metrics histogram analysis complete. Results saved to: {results_path}")
 
-    def run_up_ablation_analysis(self, test_loader, num_samples=None, output_dir=None):
+    def run_up_ablation_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None):
         """Compare TE (KLD) and reconstruction quality (VAF) with and without UP input.
 
         Args:
@@ -1684,10 +1723,20 @@ class SeqVAEGraphModel:
                     break
                 take = min(batch_size, int(max_samples - processed))
 
-                y_st = batch.fhr_st[:take].to(device)
-                y_ph = batch.fhr_ph[:take].to(device)
-                x_ph = batch.fhr_up_ph[:take].to(device)
-                y_raw = batch.fhr[:take].to(device)
+                # Build a mask for selected GUIDs
+                if selected_guids:
+                    guids_batch = batch.guid if isinstance(batch.guid, (list, tuple)) else [str(g) for g in batch.guid]
+                    idx_keep = [i for i in range(take) if guids_batch[i] in selected_guids]
+                else:
+                    idx_keep = list(range(take))
+
+                if len(idx_keep) == 0:
+                    continue
+
+                y_st = batch.fhr_st[idx_keep].to(device)
+                y_ph = batch.fhr_ph[idx_keep].to(device)
+                x_ph = batch.fhr_up_ph[idx_keep].to(device)
+                y_raw = batch.fhr[idx_keep].to(device)
 
                 # With UP
                 out_up = model(y_st, y_ph, x_ph)
@@ -1703,7 +1752,7 @@ class SeqVAEGraphModel:
                 kld_no = kld_tensor_no.mean(dim=(1, 2))
 
                 # VAF per-sample (normalized space)
-                for i in range(take):
+                for i in range(y_st.size(0)):
                     gt = y_raw[i].detach().cpu().numpy()
                     pr_up = mu_pr_up[i].detach().cpu().numpy()
                     pr_no = mu_pr_no[i].detach().cpu().numpy()
@@ -1726,7 +1775,7 @@ class SeqVAEGraphModel:
                     kld_with_up.append(float(kld_up[i].item()))
                     kld_without_up.append(float(kld_no[i].item()))
 
-                processed += take
+                processed += y_st.size(0)
 
         # Plot
         try:
@@ -1735,7 +1784,7 @@ class SeqVAEGraphModel:
         except Exception as e:
             logger.warning(f"Failed to plot ablation analysis: {e}")
 
-    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None):
+    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None, selected_guids=None):
         """Sweep multiplicative gains on UP features and track TE (KLD) and VAF trends.
 
         Args:
@@ -1773,10 +1822,20 @@ class SeqVAEGraphModel:
                 batch_size = batch.fhr_st.size(0)
                 take = min(batch_size, int(max_samples - counts))
 
-                y_st = batch.fhr_st[:take].to(device)
-                y_ph = batch.fhr_ph[:take].to(device)
-                x_ph_base = batch.fhr_up_ph[:take].to(device)
-                y_raw = batch.fhr[:take].to(device)
+                # Filter by selected GUIDs if provided
+                if selected_guids:
+                    guids_batch = batch.guid if isinstance(batch.guid, (list, tuple)) else [str(g) for g in batch.guid]
+                    idx_keep = [i for i in range(take) if guids_batch[i] in selected_guids]
+                else:
+                    idx_keep = list(range(take))
+
+                if len(idx_keep) == 0:
+                    continue
+
+                y_st = batch.fhr_st[idx_keep].to(device)
+                y_ph = batch.fhr_ph[idx_keep].to(device)
+                x_ph_base = batch.fhr_up_ph[idx_keep].to(device)
+                y_raw = batch.fhr[idx_keep].to(device)
 
                 for g in gains:
                     x_scaled = x_ph_base * float(g)
@@ -1802,7 +1861,7 @@ class SeqVAEGraphModel:
                         kld_sums[g] += float(kld_ps[i].item())
                         vaf_sums[g] += vaf
 
-                counts += take
+                counts += y_st.size(0)
 
         if counts == 0:
             logger.warning("No samples processed for gain sweep.")
