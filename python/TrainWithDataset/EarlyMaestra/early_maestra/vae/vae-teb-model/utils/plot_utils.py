@@ -893,3 +893,221 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
     
     print(f"Metrics histograms saved to: {save_path}")
     return save_path
+
+
+def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_without_up, output_dir):
+    """
+    Visualize transfer entropy (KLD) and reconstruction quality (VAF) distributions
+    with and without UP input (ablation), using the same plot style.
+
+    Args:
+        kld_with_up (List[float]): KLD per-sample with UP features present. e.g. [0.12, 0.08, ...]
+        kld_without_up (List[float]): KLD per-sample with UP features ablated (zeros). e.g. [0.01, 0.00, ...]
+        vaf_with_up (List[float]): VAF per-sample with UP features present. e.g. [0.65, 0.71, ...]
+        vaf_without_up (List[float]): VAF per-sample with UP features ablated. e.g. [0.52, 0.58, ...]
+        output_dir (str): Directory to save the figure. e.g. 'output/run_123/test_results'
+
+    Returns:
+        str: Path to the saved plot. e.g. '.../te_ablation_results.png'
+    """
+    import numpy as np
+
+    # Professional scientific paper color palette (consistent styling)
+    colors = {
+        'kld_up': '#F7AD45',    # Golden yellow
+        'kld_no': '#D95319',    # Darker orange/red
+        'vaf_up': '#055C9A',    # Deep blue
+        'vaf_no': '#0DD8A2',    # Sage green
+        'background': '#F9F3EF'
+    }
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'axes.linewidth': 0.7,
+        'axes.edgecolor': '#9E9D9D',
+        'axes.facecolor': colors['background'],
+        'grid.color': '#838383',
+        'grid.linewidth': 0.4,
+        'grid.alpha': 0.6,
+        'legend.frameon': True,
+        'legend.fancybox': False,
+        'legend.shadow': False,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#A2B9A7',
+        'legend.facecolor': colors['background'],
+        'figure.facecolor': 'white',
+        'savefig.facecolor': 'white',
+        'savefig.dpi': 300
+    })
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    axes = axes.flatten()
+
+    # Grid/spine style
+    for ax in axes:
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#A2B9A7')
+        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_linewidth(0.7)
+        ax.spines['bottom'].set_linewidth(0.7)
+
+    # 1) KLD histogram overlay
+    if len(kld_with_up) > 0 or len(kld_without_up) > 0:
+        axes[0].hist(kld_with_up, bins=50, alpha=0.6, color=colors['kld_up'],
+                     edgecolor='white', linewidth=0.5, density=True, label='KLD (with UP)')
+        axes[0].hist(kld_without_up, bins=50, alpha=0.6, color=colors['kld_no'],
+                     edgecolor='white', linewidth=0.5, density=True, label='KLD (ablated)')
+        axes[0].set_title('Transfer Entropy (KLD) Distribution')
+        axes[0].set_xlabel('KLD')
+        axes[0].set_ylabel('Density')
+        axes[0].legend(loc='upper right', framealpha=0.95)
+
+    # 2) VAF histogram overlay
+    if len(vaf_with_up) > 0 or len(vaf_without_up) > 0:
+        axes[1].hist(vaf_with_up, bins=50, alpha=0.6, color=colors['vaf_up'],
+                     edgecolor='white', linewidth=0.5, density=True, label='VAF (with UP)')
+        axes[1].hist(vaf_without_up, bins=50, alpha=0.6, color=colors['vaf_no'],
+                     edgecolor='white', linewidth=0.5, density=True, label='VAF (ablated)')
+        axes[1].set_title('Reconstruction Quality (VAF) Distribution')
+        axes[1].set_xlabel('VAF')
+        axes[1].set_ylabel('Density')
+        axes[1].legend(loc='upper right', framealpha=0.95)
+
+    # 3) KLD mean ± std bars
+    if len(kld_with_up) > 0 or len(kld_without_up) > 0:
+        means = [np.mean(kld_with_up) if len(kld_with_up) else 0.0,
+                 np.mean(kld_without_up) if len(kld_without_up) else 0.0]
+        stds = [np.std(kld_with_up) if len(kld_with_up) else 0.0,
+                np.std(kld_without_up) if len(kld_without_up) else 0.0]
+        axes[2].bar([0, 1], means, yerr=stds, color=[colors['kld_up'], colors['kld_no']],
+                    alpha=0.8, edgecolor='white', linewidth=0.5)
+        axes[2].set_xticks([0, 1])
+        axes[2].set_xticklabels(['with UP', 'ablated'])
+        axes[2].set_title('KLD: Mean ± 1σ')
+        axes[2].set_ylabel('KLD')
+
+    # 4) VAF mean ± std bars
+    if len(vaf_with_up) > 0 or len(vaf_without_up) > 0:
+        means = [np.mean(vaf_with_up) if len(vaf_with_up) else 0.0,
+                 np.mean(vaf_without_up) if len(vaf_without_up) else 0.0]
+        stds = [np.std(vaf_with_up) if len(vaf_with_up) else 0.0,
+                np.std(vaf_without_up) if len(vaf_without_up) else 0.0]
+        axes[3].bar([0, 1], means, yerr=stds, color=[colors['vaf_up'], colors['vaf_no']],
+                    alpha=0.8, edgecolor='white', linewidth=0.5)
+        axes[3].set_xticks([0, 1])
+        axes[3].set_xticklabels(['with UP', 'ablated'])
+        axes[3].set_title('VAF: Mean ± 1σ')
+        axes[3].set_ylabel('VAF')
+
+    fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, 'te_ablation_results.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig)
+    # Clean up
+    import gc
+    del fig, axes
+    gc.collect()
+    print(f"TE ablation results saved to: {save_path}")
+    return save_path
+
+
+def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
+    """
+    Plot KLD and VAF as a function of scaling applied to UP features.
+
+    Args:
+        gains (List[float]): Multiplicative gains applied to UP features. e.g. [0.0, 0.5, 1.0, 1.5]
+        kld_means (List[float]): Average KLD per gain. e.g. [0.00, 0.05, 0.10, 0.13]
+        vaf_means (List[float]): Average VAF per gain. e.g. [0.55, 0.62, 0.68, 0.67]
+        output_dir (str): Directory to save the figure.
+
+    Returns:
+        str: Path to the saved plot.
+    """
+    import numpy as np
+
+    colors = {
+        'kld': '#F7AD45',
+        'vaf': '#055C9A',
+        'background': '#F9F3EF'
+    }
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'axes.linewidth': 0.7,
+        'axes.edgecolor': '#9E9D9D',
+        'axes.facecolor': colors['background'],
+        'grid.color': '#838383',
+        'grid.linewidth': 0.4,
+        'grid.alpha': 0.6,
+        'legend.frameon': True,
+        'legend.fancybox': False,
+        'legend.shadow': False,
+        'legend.framealpha': 0.95,
+        'legend.edgecolor': '#A2B9A7',
+        'legend.facecolor': colors['background'],
+        'figure.facecolor': 'white',
+        'savefig.facecolor': 'white',
+        'savefig.dpi': 300
+    })
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+    for ax in (ax1, ax2):
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#A2B9A7')
+        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_linewidth(0.7)
+        ax.spines['bottom'].set_linewidth(0.7)
+
+    gains_np = np.array(gains, dtype=float)
+
+    # KLD vs gain
+    ax1.plot(gains_np, kld_means, color=colors['kld'], marker='o', linewidth=2, label='KLD')
+    ax1.set_xlabel('UP Gain')
+    ax1.set_ylabel('Average KLD')
+    ax1.set_title('Transfer Entropy vs UP Gain')
+    ax1.legend(loc='upper left', framealpha=0.95)
+
+    # VAF vs gain
+    ax2.plot(gains_np, vaf_means, color=colors['vaf'], marker='o', linewidth=2, label='VAF')
+    ax2.set_xlabel('UP Gain')
+    ax2.set_ylabel('Average VAF')
+    ax2.set_title('Reconstruction Quality vs UP Gain')
+    ax2.legend(loc='lower right', framealpha=0.95)
+
+    fig.suptitle('UP Gain Sweep: Information Flow and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, 'te_gain_sweep.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig)
+
+    # Clean up
+    import gc
+    del fig, ax1, ax2
+    gc.collect()
+    print(f"TE gain sweep saved to: {save_path}")
+    return save_path
