@@ -119,8 +119,10 @@ def plot_model_analysis(
         if y_raw_unnormalized is None or up_raw_unnormalized is None:
             raise ValueError("Training mode requires y_raw_unnormalized and up_raw_unnormalized for the first plot")
     else:
-        # Original analysis mode: 8 rows, single column layout like _plot_results  
-        n_rows = 8
+        # Original analysis mode: base 8 rows; add extra rows if we split phase/cross into two subplots each
+        split_phase = (phase_auto_indices is not None and phase_cross_indices is not None)
+        split_cross = (cross_auto_indices is not None and cross_cross_indices is not None)
+        n_rows = 8 + (1 if split_phase else 0) + (1 if split_cross else 0)
         fig, ax = plt.subplots(n_rows, 1, figsize=(16, n_rows * 3), constrained_layout=True)
 
     # Common settings for subplots
@@ -357,57 +359,77 @@ def plot_model_analysis(
         fig.colorbar(im_st, ax=ax[5])
 
         # 7-8. fhr_ph split into autocorr (same freq) and cross (different freq)
-        if phase_auto_indices is not None and phase_cross_indices is not None:
+        next_idx = 6
+        if split_phase:
             ph_auto = fhr_ph[phase_auto_indices, :] if len(phase_auto_indices) > 0 else None
             ph_cross = fhr_ph[phase_cross_indices, :] if len(phase_cross_indices) > 0 else None
             # Autocorr
             if ph_auto is not None and ph_auto.size > 0:
-                im_ph_auto = ax[6].imshow(ph_auto, aspect='auto', cmap='bwr', origin='upper')
-                ax[6].grid(False)
-                ax[6].set_title('FHR Phase Harmonics — Autocorr (same freq)')
-                ax[6].set_xlabel('Time Steps')
-                ax[6].set_ylabel('Channels')
-                fig.colorbar(im_ph_auto, ax=ax[6])
+                im_ph_auto = ax[next_idx].imshow(ph_auto, aspect='auto', cmap='bwr', origin='upper')
+                ax[next_idx].grid(False)
+                ax[next_idx].set_title('FHR Phase Harmonics — Autocorr (same freq)')
+                ax[next_idx].set_xlabel('Time Steps')
+                ax[next_idx].set_ylabel('Channels')
+                fig.colorbar(im_ph_auto, ax=ax[next_idx])
             else:
-                ax[6].set_title('FHR Phase Harmonics — Autocorr (none)')
-                ax[6].set_axis_off()
+                ax[next_idx].set_title('FHR Phase Harmonics — Autocorr (none)')
+                ax[next_idx].set_axis_off()
+            next_idx += 1
             # Cross
             if ph_cross is not None and ph_cross.size > 0:
-                im_ph_cross = ax[7].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper')
-                ax[7].grid(False)
-                ax[7].set_title('FHR Phase Harmonics — Cross (different freq)')
-                ax[7].set_xlabel('Time Steps')
-                ax[7].set_ylabel('Channels')
-                fig.colorbar(im_ph_cross, ax=ax[7])
+                im_ph_cross = ax[next_idx].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper')
+                ax[next_idx].grid(False)
+                ax[next_idx].set_title('FHR Phase Harmonics — Cross (different freq)')
+                ax[next_idx].set_xlabel('Time Steps')
+                ax[next_idx].set_ylabel('Channels')
+                fig.colorbar(im_ph_cross, ax=ax[next_idx])
             else:
-                ax[7].set_title('FHR Phase Harmonics — Cross (none)')
-                ax[7].set_axis_off()
+                ax[next_idx].set_title('FHR Phase Harmonics — Cross (none)')
+                ax[next_idx].set_axis_off()
+            next_idx += 1
         else:
-            im_ph = ax[6].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='upper')
-            ax[6].grid(False)  # Remove grid lines
-            ax[6].set_title('FHR Phase Harmonics (fhr_ph)')
-            ax[6].set_xlabel('Time Steps')
-            ax[6].set_ylabel('Channels')
-            fig.colorbar(im_ph, ax=ax[6])
+            im_ph = ax[next_idx].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='upper')
+            ax[next_idx].grid(False)
+            ax[next_idx].set_title('FHR Phase Harmonics (fhr_ph)')
+            ax[next_idx].set_xlabel('Time Steps')
+            ax[next_idx].set_ylabel('Channels')
+            fig.colorbar(im_ph, ax=ax[next_idx])
+            next_idx += 1
 
-        # 9-10. fhr_up_ph split into autocorr (same freq) and cross (different freq)
-        if phase_auto_indices is not None and phase_cross_indices is not None and \
-           cross_auto_indices is not None and cross_cross_indices is not None:
-            # Shift indices for positions (axes 8 and 9 weren't defined originally)
-            # Extend figure if needed
-            # If we already used ax[7] above for phase split, we need more rows.
-            pass
-        
-        # Backward compatible single-plot for cross if splits not provided
-        if cross_auto_indices is None or cross_cross_indices is None:
-            # If we used two slots for phase above, the next available axis index is 8
-            # But since the figure was created with fixed rows earlier, we keep legacy placement
-            im_up_ph = ax[7].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='upper')
-            ax[7].grid(False)
-            ax[7].set_title('UP→FHR Cross-Phase Harmonics (fhr_up_ph)')
-            ax[7].set_xlabel('Time Steps')
-            ax[7].set_ylabel('Channels')
-            fig.colorbar(im_up_ph, ax=ax[7])
+        # Cross-channel phase harmonics in same figure (split or single)
+        if split_cross:
+            cp_auto = fhr_up_ph[cross_auto_indices, :] if len(cross_auto_indices) > 0 else None
+            cp_cross = fhr_up_ph[cross_cross_indices, :] if len(cross_cross_indices) > 0 else None
+            if cp_auto is not None and cp_auto.size > 0:
+                im_cp_auto = ax[next_idx].imshow(cp_auto, aspect='auto', cmap='bwr', origin='upper')
+                ax[next_idx].grid(False)
+                ax[next_idx].set_title('UP→FHR Cross-Phase — Autocorr (same filter)')
+                ax[next_idx].set_xlabel('Time Steps')
+                ax[next_idx].set_ylabel('Channels')
+                fig.colorbar(im_cp_auto, ax=ax[next_idx])
+            else:
+                ax[next_idx].set_title('UP→FHR Cross-Phase — Autocorr (none)')
+                ax[next_idx].set_axis_off()
+            next_idx += 1
+            if cp_cross is not None and cp_cross.size > 0:
+                im_cp_cross = ax[next_idx].imshow(cp_cross, aspect='auto', cmap='bwr', origin='upper')
+                ax[next_idx].grid(False)
+                ax[next_idx].set_title('UP→FHR Cross-Phase — Cross (different filters)')
+                ax[next_idx].set_xlabel('Time Steps')
+                ax[next_idx].set_ylabel('Channels')
+                fig.colorbar(im_cp_cross, ax=ax[next_idx])
+            else:
+                ax[next_idx].set_title('UP→FHR Cross-Phase — Cross (none)')
+                ax[next_idx].set_axis_off()
+            next_idx += 1
+        else:
+            im_up_ph = ax[next_idx].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='upper')
+            ax[next_idx].grid(False)
+            ax[next_idx].set_title('UP→FHR Cross-Phase Harmonics (fhr_up_ph)')
+            ax[next_idx].set_xlabel('Time Steps')
+            ax[next_idx].set_ylabel('Channels')
+            fig.colorbar(im_up_ph, ax=ax[next_idx])
+            next_idx += 1
 
         fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='bold')
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
@@ -440,81 +462,6 @@ def plot_model_analysis(
     else:
         plt.savefig(save_path, bbox_inches='tight')
         plt.close(fig)
-
-        # Additional separate figures for phase/cross-phase splits when indices are provided
-        try:
-            # Phase harmonic split
-            if phase_auto_indices is not None and phase_cross_indices is not None and fhr_ph is not None:
-                if isinstance(phase_auto_indices, (list, tuple)):
-                    phase_auto_idx = np.array(phase_auto_indices)
-                else:
-                    phase_auto_idx = phase_auto_indices
-                if isinstance(phase_cross_indices, (list, tuple)):
-                    phase_cross_idx = np.array(phase_cross_indices)
-                else:
-                    phase_cross_idx = phase_cross_indices
-
-                if phase_auto_idx.size > 0:
-                    fig_pa, ax_pa = plt.subplots(1, 1, figsize=(12, 4), constrained_layout=True)
-                    im_pa = ax_pa.imshow(fhr_ph[phase_auto_idx, :], aspect='auto', cmap='bwr', origin='upper')
-                    ax_pa.grid(False)
-                    ax_pa.set_title('FHR Phase Harmonics — Autocorr (same freq)')
-                    ax_pa.set_xlabel('Time Steps')
-                    ax_pa.set_ylabel('Channels')
-                    fig_pa.colorbar(im_pa, ax=ax_pa)
-                    pa_path = os.path.join(output_dir, f'phase_harmonics_autocorr_sample_{batch_idx}.png')
-                    plt.savefig(pa_path, bbox_inches='tight')
-                    plt.close(fig_pa)
-
-                if phase_cross_idx.size > 0:
-                    fig_pc, ax_pc = plt.subplots(1, 1, figsize=(12, 4), constrained_layout=True)
-                    im_pc = ax_pc.imshow(fhr_ph[phase_cross_idx, :], aspect='auto', cmap='bwr', origin='upper')
-                    ax_pc.grid(False)
-                    ax_pc.set_title('FHR Phase Harmonics — Cross (different freq)')
-                    ax_pc.set_xlabel('Time Steps')
-                    ax_pc.set_ylabel('Channels')
-                    fig_pc.colorbar(im_pc, ax=ax_pc)
-                    pc_path = os.path.join(output_dir, f'phase_harmonics_cross_sample_{batch_idx}.png')
-                    plt.savefig(pc_path, bbox_inches='tight')
-                    plt.close(fig_pc)
-
-            # Cross-channel phase split
-            if cross_auto_indices is not None and cross_cross_indices is not None and fhr_up_ph is not None:
-                if isinstance(cross_auto_indices, (list, tuple)):
-                    cross_auto_idx = np.array(cross_auto_indices)
-                else:
-                    cross_auto_idx = cross_auto_indices
-                if isinstance(cross_cross_indices, (list, tuple)):
-                    cross_cross_idx = np.array(cross_cross_indices)
-                else:
-                    cross_cross_idx = cross_cross_indices
-
-                if cross_auto_idx.size > 0:
-                    fig_cpa, ax_cpa = plt.subplots(1, 1, figsize=(12, 4), constrained_layout=True)
-                    im_cpa = ax_cpa.imshow(fhr_up_ph[cross_auto_idx, :], aspect='auto', cmap='bwr', origin='upper')
-                    ax_cpa.grid(False)
-                    ax_cpa.set_title('UP→FHR Cross-Phase — Autocorr (same filter)')
-                    ax_cpa.set_xlabel('Time Steps')
-                    ax_cpa.set_ylabel('Channels')
-                    fig_cpa.colorbar(im_cpa, ax=ax_cpa)
-                    cpa_path = os.path.join(output_dir, f'cross_phase_autocorr_sample_{batch_idx}.png')
-                    plt.savefig(cpa_path, bbox_inches='tight')
-                    plt.close(fig_cpa)
-
-                if cross_cross_idx.size > 0:
-                    fig_cpc, ax_cpc = plt.subplots(1, 1, figsize=(12, 4), constrained_layout=True)
-                    im_cpc = ax_cpc.imshow(fhr_up_ph[cross_cross_idx, :], aspect='auto', cmap='bwr', origin='upper')
-                    ax_cpc.grid(False)
-                    ax_cpc.set_title('UP→FHR Cross-Phase — Cross (different filters)')
-                    ax_cpc.set_xlabel('Time Steps')
-                    ax_cpc.set_ylabel('Channels')
-                    fig_cpc.colorbar(im_cpc, ax=ax_cpc)
-                    cpc_path = os.path.join(output_dir, f'cross_phase_cross_sample_{batch_idx}.png')
-                    plt.savefig(cpc_path, bbox_inches='tight')
-                    plt.close(fig_cpc)
-        except Exception as e:
-            # Avoid breaking analysis if extra plots fail
-            print(f"Warning: failed to save split phase/cross-phase plots: {e}")
 
     print(f"Analysis plot saved to {save_path}")
 

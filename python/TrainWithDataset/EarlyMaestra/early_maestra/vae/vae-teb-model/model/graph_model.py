@@ -907,9 +907,18 @@ class SeqVAEGraphModel:
         
         return None
 
-    def run_tests(self, test_loader):
-        """
-        Runs tests on the SeqVaeTeb model by performing analysis and plotting on random samples.
+    def run_tests(self, test_loader, cuda_device=None):
+        """Run SeqVAE test analyses and plots with optional CUDA device selection.
+
+        Args:
+            test_loader (DataLoader): Loader providing required tensors (e.g., `fhr_st`, `fhr_ph`,
+                `fhr_up_ph`, `fhr`, `up`, `guid`). Example: created via `create_optimized_dataloader(...)`.
+            cuda_device (int | str | None): Desired device index or 'cpu'. If `None`, uses the first
+                configured GPU in `self.cuda_devices` when available. Examples: `0`, `1`, `'cpu'`.
+
+        Returns:
+            None: Saves analysis figures and artifacts into the test results directory. For example,
+            plots are written under `.../test_results/...`.
         """
         # Create per-test subfolders
         analysis_dir = os.path.join(self.test_results_dir, 'analysis_and_plot')
@@ -920,6 +929,26 @@ class SeqVAEGraphModel:
 
         for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir]:
             os.makedirs(d, exist_ok=True)
+
+        # Optional device selection for tests
+        try:
+            if cuda_device is not None:
+                if isinstance(cuda_device, str) and cuda_device.lower() == 'cpu':
+                    self.set_cuda_devices([])
+                    logger.info("run_tests: Using CPU as requested.")
+                else:
+                    device_index = int(cuda_device)
+                    if torch.cuda.is_available() and 0 <= device_index < torch.cuda.device_count():
+                        self.set_cuda_devices([device_index])
+                        logger.info(f"run_tests: Using CUDA device cuda:{device_index} as requested.")
+                    else:
+                        logger.warning(
+                            f"run_tests: Requested CUDA device {cuda_device} is not available. "
+                            "Falling back to default device configuration."
+                        )
+            torch.set_float32_matmul_precision('high')
+        except Exception as e:
+            logger.warning(f"run_tests: Device selection setup failed: {e}")
 
         # Collect a consistent set of GUIDs to use across all tests
         target_count = 50  # keep consistent with per-sample visualization count
@@ -948,7 +977,7 @@ class SeqVAEGraphModel:
         # Run tests on the same selected GUIDs
         # Use selected_guids only for per-sample visualization; aggregate tests use full dataset
         self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
-        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir)
+        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids)
         self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
         # Demonstrate information flow using UP ablation and gain sweep over whole dataset
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
@@ -1019,7 +1048,7 @@ class SeqVAEGraphModel:
         logger.info("Collecting all samples from test loader...")
         all_samples = []
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 for batch_data in tqdm(test_loader, desc="Collecting samples"):
                     batch_size = batch_data.fhr_st.size(0)
                     for i in range(batch_size):
@@ -1055,7 +1084,7 @@ class SeqVAEGraphModel:
         logger.info(f"Selected sample indices: {selected_indices[:10]}..." if num_samples > 10 else f"Selected sample indices: {selected_indices}")
 
         # Process each selected sample
-        with torch.no_grad():
+        with torch.inference_mode():
             for plot_idx, sample_idx in enumerate(tqdm(selected_indices, desc="Processing selected samples")):
                 try:
                     sample = all_samples[sample_idx]
@@ -1179,27 +1208,19 @@ class SeqVAEGraphModel:
         logger.info(f"Plots saved to: {out_dir}")
 
     def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None, selected_guids=None):
-        """
-        Analyze transfer entropy (KLD) vs left shifts of UP (UP lags FHR).
-
-        Workflow:
-        1) Load raw unnormalized UP and FHR without trimming
-        2) Apply circular LEFT shifts to UP only (negative seconds → left)
-        3) Recompute cross-channel phase coefficients via KymatioPhaseScattering1D
-        4) Normalize new coefficients with existing fhr_up_ph stats
-        5) Apply 2-minute trimming to both signals and coefficients
-        6) Measure KLD per shift and average across samples
-        7) Plot KLD vs shift and example signals
+        """Measure and plot TE (KLD) vs UP left-shift per sample (no averaging).
 
         Args:
-            test_loader: DataLoader for test data
-            num_samples (int | None): Number of samples to analyze (None = all)
-            max_left_shift_seconds (int): Max left shift in seconds (default: 60)
-            step_seconds (int): Step size in seconds (default: 1)
+            test_loader: DataLoader with normalized coeffs and raw signals.
+            num_samples (int | None): Limit number of samples to analyze (None = all).
+            max_left_shift_seconds (int): Maximum LEFT shift seconds (negative direction).
+            step_seconds (int): Shift step in seconds.
+            output_dir (str | None): Directory to save figures.
+            selected_guids (List[str] | None): Subset of GUIDs to analyze (e.g., the 50 chosen in run_tests).
         """
         out_dir = output_dir or self.test_results_dir
         logger.info(
-            f"Starting transfer entropy shift analysis (LEFT shifts only) on {('ALL' if num_samples is None else num_samples)} samples, max_left_shift_seconds={max_left_shift_seconds}, step={step_seconds}..."
+            f"Starting per-sample TE vs shift (LEFT only). Samples: {('ALL' if num_samples is None else num_samples)}, max_left_shift_seconds={max_left_shift_seconds}, step={step_seconds}"
         )
         self.create_model()
         
@@ -1249,43 +1270,15 @@ class SeqVAEGraphModel:
         # Create dataset without trimming for raw signal access
         raw_dataset = CombinedHDF5Dataset(
             paths=dataset_paths,
-            load_fields=['fhr', 'up', 'fhr_st', 'fhr_ph'],  # Load necessary fields
+            load_fields=['fhr', 'up', 'fhr_st', 'fhr_ph', 'guid'],  # Include guid for per-sample outputs
             allowed_guids=selected_guids if selected_guids else allowed_guids,
             stats_path=stats_path,
             trim_minutes=None,  # No trimming to get full raw signals
             normalize_fields=['fhr_st', 'fhr_ph']  # Only normalize what we need, keep fhr/up raw
         )
-        
-        # Collect samples for analysis
-        logger.info("Collecting samples for shift analysis...")
-        all_samples = []
-        sample_count = 0
-        
-        try:
-            total_items = len(raw_dataset)
-            for i in range(total_items):
-                if num_samples is not None and sample_count >= num_samples:
-                    break
-                    
-                sample = raw_dataset[i]
-                # Store both raw (unnormalized) and normalized versions
-                all_samples.append({
-                    'fhr': sample['fhr'],           # Raw FHR signal
-                    'up': sample['up'],             # Raw UP signal  
-                    'fhr_st': sample['fhr_st'],         # Normalized scattering coefficients
-                    'fhr_ph': sample['fhr_ph'],         # Normalized phase coefficients
-                })
-                sample_count += 1
-                
-        except Exception as e:
-            logger.error(f"Error collecting raw samples: {e}")
-            return
-            
-        if len(all_samples) == 0:
-            logger.error("No samples collected for analysis.")
-            return
-            
-        logger.info(f"Collected {len(all_samples)} samples for analysis")
+
+        # Iterate samples on-the-fly (no averaging across samples)
+        logger.info("Processing samples for per-sample shift analysis...")
         
         # Define LEFT shift range only: [-max_left_shift_seconds, 0] in step_seconds increments
         # At 4Hz sampling rate: 1 second = 4 samples
@@ -1300,52 +1293,50 @@ class SeqVAEGraphModel:
         trim_samples_raw = int(4 * 60 * trim_minutes)  # 480 samples at 4Hz
         trim_samples_decimated = trim_samples_raw // 16  # 30 samples for coefficients
         
-        # Storage for results
-        kld_results = []
-        valid_shifts = []
-        
-        # For plotting individual signals (save first few samples)
-        plot_samples = min(3, len(all_samples))
-        signal_plot_data = []
-        
-        with torch.no_grad():
-            for shift_idx, (shift_sec, shift_samp) in enumerate(zip(shift_seconds, shift_samples)):
-                logger.info(f"Processing left shift {shift_idx+1}/{len(shift_samples)}: {shift_sec}s ({shift_samp} samples)")
-                
-                sample_klds = []
-                
-                for sample_idx, sample in enumerate(all_samples):
-                    try:
-                        # Get raw signals (these are already tensors from the dataset)
-                        fhr_raw = sample['fhr'].cpu().numpy()  # Shape: (5760,)
-                        up_raw = sample['up'].cpu().numpy()    # Shape: (5760,)
-                        fhr_st = sample['fhr_st']  # Already normalized, shape: (300, 43)
-                        fhr_ph = sample['fhr_ph']  # Already normalized, shape: (300, 44)
-                        
-                        # Apply circular shift to UP signal
+
+        # Iterate samples, compute per-sample KLD vs shift, and plot per-sample figures
+        with torch.inference_mode():
+            total_items = len(raw_dataset)
+            processed = 0
+            for sample_idx in range(total_items):
+                if num_samples is not None and processed >= num_samples:
+                    break
+
+                try:
+                    sample = raw_dataset[sample_idx]
+
+                    # Prepare raw and coeff data
+                    fhr_raw = sample['fhr'].cpu().numpy()  # (5760,)
+                    up_raw = sample['up'].cpu().numpy()    # (5760,)
+                    fhr_st = sample['fhr_st']              # (300, 43) normalized
+                    fhr_ph = sample['fhr_ph']              # (300, 44) normalized
+                    guid = sample.get('guid', None)
+                    guid_safe = ''.join([c if str(c).isalnum() else '_' for c in str(guid)]) if guid is not None else 'NA'
+
+                    # Per-sample accumulators
+                    kld_per_shift = []
+                    per_sample_signal_plot_data = []
+
+                    for shift_idx, (shift_sec, shift_samp) in enumerate(zip(shift_seconds, shift_samples)):
+                        # Shift UP
                         up_shifted = self._apply_circular_shift(up_raw, shift_samp)
-                        
-                        # Prepare signals exactly as in dataset creation
-                        # Stack [fhr, up_shifted] as in create_hdf5_dataset.py line 418
+
+                        # Stack raw for scattering
                         st_input = torch.from_numpy(np.stack([fhr_raw, up_shifted], axis=0)).float().unsqueeze(0).to(device)  # (1, 2, 5760)
-                        
-                        # Compute cross-channel phase coefficients exactly as in dataset creation (lines 427-432)
-                        st_results_cross = scattering_transform(x=st_input,
-                                                               compute_phase=False,
-                                                               compute_cross_phase=True,
-                                                               scattering_channel=0,
-                                                               phase_channels=[0, 1])
-                        
-                        # Extract the full cross-phase coefficients (line 437)
+
+                        # Cross-phase computation (as in dataset creation)
+                        st_results_cross = scattering_transform(
+                            x=st_input,
+                            compute_phase=False,
+                            compute_cross_phase=True,
+                            scattering_channel=0,
+                            phase_channels=[0, 1]
+                        )
                         fhr_up_cc_phase_full = st_results_cross.get('cross_phase_corr')
-                        
-                        # Apply optimal selection mask exactly as in dataset creation (line 441)
                         cross_phase_raw = fhr_up_cc_phase_full[:, cross_mask, :] if fhr_up_cc_phase_full is not None else None
-                        
-                        # Convert to expected format: (batch, seq_len, channels)
                         cross_phase_formatted = cross_phase_raw.transpose(1, 2)  # (1, 300, 130)
-                        
-                        # Normalize using existing stats
+
+                        # Normalize with existing stats
                         cross_phase_normalized = normalize_tensor_data(
                             data=cross_phase_formatted,
                             field_name='fhr_up_ph',
@@ -1357,8 +1348,8 @@ class SeqVAEGraphModel:
                             normalize_fields=raw_dataset.normalize_fields,
                             dtype=torch.float32
                         )
-                        
-                        # Apply 2-minute trimming to coefficients (remove beginning and end)
+
+                        # Trim 2 minutes from both ends
                         if trim_samples_decimated > 0:
                             cross_phase_trimmed = cross_phase_normalized[:, trim_samples_decimated:-trim_samples_decimated, :]
                             fhr_st_trimmed = fhr_st[trim_samples_decimated:-trim_samples_decimated, :]
@@ -1367,86 +1358,87 @@ class SeqVAEGraphModel:
                             cross_phase_trimmed = cross_phase_normalized
                             fhr_st_trimmed = fhr_st
                             fhr_ph_trimmed = fhr_ph
-                        
-                        # Prepare inputs for model 
-                        y_st_input = fhr_st_trimmed.unsqueeze(0).to(device)  # (1, seq_len, 43)
-                        y_ph_input = fhr_ph_trimmed.unsqueeze(0).to(device)  # (1, seq_len, 44)
-                        x_ph_input = cross_phase_trimmed.to(device)  # (1, seq_len, 130)
-                        
-                        # Measure transfer entropy (KLD) for this shift
+
+                        # Inputs for model
+                        y_st_input = fhr_st_trimmed.unsqueeze(0).to(device)
+                        y_ph_input = fhr_ph_trimmed.unsqueeze(0).to(device)
+                        x_ph_input = cross_phase_trimmed.to(device)
+
+                        # TE (KLD)
                         kld_tensor = self.pytorch_model.measure_transfer_entropy(
-                            y_st=y_st_input,
-                            y_ph=y_ph_input, 
-                            x_ph=x_ph_input,
-                            reduce_mean=False  # Get full tensor for analysis
+                            y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input, reduce_mean=False
                         )
-                        
-                        # Average KLD over sequence length and latent dimensions
-                        sample_kld = kld_tensor.mean().item()
-                        sample_klds.append(sample_kld)
-                        
-                        # Store data for plotting (first few samples and shifts)
-                        if sample_idx < plot_samples and len(signal_plot_data) < plot_samples * 5:  # Store 5 shifts per sample
-                            if len(shift_seconds) > 1 and shift_idx % max(1, (len(shift_seconds) // 5)) == 0:  # Sample every few shifts
-                                # Apply trimming to raw signals for plotting
-                                if trim_samples_raw > 0:
-                                    fhr_trimmed = fhr_raw[trim_samples_raw:-trim_samples_raw]
-                                    up_trimmed = up_raw[trim_samples_raw:-trim_samples_raw]
-                                    up_shifted_trimmed = up_shifted[trim_samples_raw:-trim_samples_raw]
-                                else:
-                                    fhr_trimmed = fhr_raw
-                                    up_trimmed = up_raw
-                                    up_shifted_trimmed = up_shifted
-                                    
-                                signal_plot_data.append({
-                                    'sample_idx': sample_idx,
-                                    'shift_sec': shift_sec,
-                                    'fhr': fhr_trimmed,
-                                    'up_original': up_trimmed,
-                                    'up_shifted': up_shifted_trimmed,
-                                    'kld': sample_kld
-                                })
-                        
+                        kld_value = kld_tensor.mean().item()
+                        kld_per_shift.append(kld_value)
+
+                        # Store trimmed signals for the second plot
+                        if trim_samples_raw > 0:
+                            fhr_trimmed = fhr_raw[trim_samples_raw:-trim_samples_raw]
+                            up_trimmed = up_raw[trim_samples_raw:-trim_samples_raw]
+                            up_shifted_trimmed = up_shifted[trim_samples_raw:-trim_samples_raw]
+                        else:
+                            fhr_trimmed = fhr_raw
+                            up_trimmed = up_raw
+                            up_shifted_trimmed = up_shifted
+
+                        per_sample_signal_plot_data.append({
+                            'sample_idx': sample_idx,
+                            'shift_sec': shift_sec,
+                            'fhr': fhr_trimmed,
+                            'up_original': up_trimmed,
+                            'up_shifted': up_shifted_trimmed,
+                            'kld': kld_value
+                        })
+
+                    # Per-sample plot: TE vs shift
+                    try:
+                        import matplotlib.pyplot as plt
+                        os.makedirs(out_dir, exist_ok=True)
+                        fig, ax = plt.subplots(1, 1, figsize=(12, 5), constrained_layout=True)
+                        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
+                        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+                        ax.minorticks_on()
+                        ax.set_axisbelow(True)
+                        ax.spines['top'].set_visible(False)
+                        ax.spines['right'].set_visible(False)
+                        ax.spines['left'].set_color('#A2B9A7')
+                        ax.spines['bottom'].set_color('#A2B9A7')
+                        ax.spines['left'].set_linewidth(0.7)
+                        ax.spines['bottom'].set_linewidth(0.7)
+
+                        ax.plot(shift_seconds, kld_per_shift, color="#055C9A", marker='o', linewidth=2)
+                        ax.set_xlabel('UP Shift (seconds)')
+                        ax.set_ylabel('Transfer Entropy (KLD)')
+                        ax.set_title(f'TE vs Shift — Sample {sample_idx} — GUID: {guid_safe}')
+                        # Mark minimum
+                        min_idx = int(np.argmin(kld_per_shift)) if len(kld_per_shift) > 0 else None
+                        if min_idx is not None:
+                            ax.plot(shift_seconds[min_idx], kld_per_shift[min_idx], color="#BB3E00", marker='o', markersize=8)
+                            ax.text(
+                                shift_seconds[min_idx], kld_per_shift[min_idx],
+                                f'  Min {shift_seconds[min_idx]}s\n  KLD {kld_per_shift[min_idx]:.6f}',
+                                va='bottom', ha='left',
+                                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.9, edgecolor='#A2B9A7'), fontsize=9
+                            )
+
+                        save_path_curve = os.path.join(out_dir, f'te_vs_shift_sample_{sample_idx}_{guid_safe}.png')
+                        plt.savefig(save_path_curve, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+                        plt.close(fig)
+                        logger.info(f"Saved TE vs shift for sample {sample_idx} (GUID: {guid_safe}) → {save_path_curve}")
                     except Exception as e:
-                        logger.warning(f"Failed to process sample {sample_idx} with shift {shift_sec}s: {e}")
-                        continue
-                
-                if len(sample_klds) > 0:
-                    # Average KLD across all samples for this shift
-                    avg_kld = np.mean(sample_klds)
-                    kld_results.append(avg_kld)
-                    valid_shifts.append(shift_sec)
-                    logger.info(f"Shift {shift_sec}s: Average KLD = {avg_kld:.6f} ({len(sample_klds)} samples)")
-                else:
-                    logger.warning(f"No valid samples for shift {shift_sec}s")
-        
-        # Plot results
-        if len(kld_results) > 0:
-            # Plot transfer entropy vs shift
-            plot_path = plot_transfer_entropy_vs_shift(valid_shifts, kld_results, self.test_results_dir)
-            
-            # Plot individual signal examples
-            if signal_plot_data:
-                self._plot_signal_shift_examples(signal_plot_data, sampling_rate, output_dir=out_dir)
-            
-            # Save results to file
-            results_data = {
-                'shifts_seconds': valid_shifts,
-                'average_kld': kld_results,
-                'num_samples': len(all_samples),
-                'sampling_rate': sampling_rate,
-                'signal_examples': signal_plot_data
-            }
-            
-            results_path = os.path.join(out_dir, 'transfer_entropy_shift_analysis.pkl')
-            with open(results_path, 'wb') as f:
-                pickle.dump(results_data, f)
-            
-            logger.info(f"Transfer entropy shift analysis complete.")
-            logger.info(f"Results saved to: {results_path}")
-            logger.info(f"Plot saved to: {plot_path}")
-        else:
-            logger.error("No valid results obtained from shift analysis.")
+                        logger.warning(f"Failed to plot TE vs shift for sample {sample_idx}: {e}")
+
+                    # Per-sample plot: shifted UP vs FHR with KLD annotations
+                    try:
+                        self._plot_signal_shift_examples(per_sample_signal_plot_data, sampling_rate, output_dir=out_dir)
+                    except Exception as e:
+                        logger.warning(f"Failed to plot signal shift examples for sample {sample_idx}: {e}")
+
+                    processed += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to process sample index {sample_idx}: {e}")
+                    continue
 
     def _apply_circular_shift(self, signal, shift_samples):
         """
@@ -1547,7 +1539,7 @@ class SeqVAEGraphModel:
         max_samples = num_samples if num_samples is not None else float('inf')
         
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 for batch_data in tqdm(test_loader, desc="Collecting samples"):
                     if sample_count >= max_samples:
                         break
@@ -1589,7 +1581,7 @@ class SeqVAEGraphModel:
         kld_values = []
         
         # Process each sample
-        with torch.no_grad():
+        with torch.inference_mode():
             for sample_idx, sample in enumerate(tqdm(all_samples, desc="Computing metrics")):
                 try:
                     # Move sample data to device and add batch dimension
@@ -1715,7 +1707,7 @@ class SeqVAEGraphModel:
         processed = 0
         max_samples = num_samples if num_samples is not None else float('inf')
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in tqdm(test_loader, desc="UP Ablation"):
                 # Respect sample cap
                 batch_size = batch.fhr_st.size(0)
@@ -1815,7 +1807,7 @@ class SeqVAEGraphModel:
         counts = 0
         max_samples = num_samples if num_samples is not None else float('inf')
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in tqdm(test_loader, desc="UP Gain Sweep"):
                 if counts >= max_samples:
                     break
