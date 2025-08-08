@@ -22,7 +22,14 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from  utils.plot_utils import plot_model_analysis, plot_vae_reconstruction, plot_transfer_entropy_vs_shift, plot_metrics_histograms
+from  utils.plot_utils import (
+    plot_model_analysis,
+    plot_vae_reconstruction,
+    plot_transfer_entropy_vs_shift,
+    plot_metrics_histograms,
+    plot_te_ablation_results,
+    plot_te_gain_sweep,
+)
 from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
@@ -907,6 +914,9 @@ class SeqVAEGraphModel:
         self.run_analysis_and_plot(test_loader, 200)
         self.run_transfer_entropy_shift_analysis(test_loader)
         self.run_metrics_histogram_analysis(test_loader)
+        # New: Demonstrate information flow using UP ablation and gain sweep
+        self.run_up_ablation_analysis(test_loader)
+        self.run_up_gain_sweep_analysis(test_loader)
 
 
     def run_analysis_and_plot(self, test_loader, num_samples=200):
@@ -1102,27 +1112,28 @@ class SeqVAEGraphModel:
         logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
         logger.info(f"Plots saved to: {self.test_results_dir}")
 
-    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=50):
+    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1):
         """
-        Analyze transfer entropy as a function of UP signal temporal shift.
-        
-        This test examines how the amount of temporal shift in the UP signal affects 
-        the transfer entropy from the source (shifted UP cross-phase) to the latent 
-        representation. The revised workflow:
-        
-        1. Loads raw unnormalized UP and FHR signals without 2-minute trim
-        2. Applies circular shifts to UP signal by various delays (-60s to +60s)
-        3. Recomputes cross-channel phase coefficients using KymatioPhaseScattering1D
-        4. Normalizes the new coefficients with existing fhr_up_ph stats
-        5. Applies 2-minute trimming to both signals and coefficients
-        6. Measures transfer entropy (KLD) for each shift
-        7. Plots signals and KLD as function of shift/delay
-        
+        Analyze transfer entropy (KLD) vs left shifts of UP (UP lags FHR).
+
+        Workflow:
+        1) Load raw unnormalized UP and FHR without trimming
+        2) Apply circular LEFT shifts to UP only (negative seconds → left)
+        3) Recompute cross-channel phase coefficients via KymatioPhaseScattering1D
+        4) Normalize new coefficients with existing fhr_up_ph stats
+        5) Apply 2-minute trimming to both signals and coefficients
+        6) Measure KLD per shift and average across samples
+        7) Plot KLD vs shift and example signals
+
         Args:
             test_loader: DataLoader for test data
-            num_samples: Number of samples to analyze (default: 50)
+            num_samples (int | None): Number of samples to analyze (None = all)
+            max_left_shift_seconds (int): Max left shift in seconds (default: 60)
+            step_seconds (int): Step size in seconds (default: 1)
         """
-        logger.info(f"Starting transfer entropy shift analysis on {num_samples} samples...")
+        logger.info(
+            f"Starting transfer entropy shift analysis (LEFT shifts only) on {('ALL' if num_samples is None else num_samples)} samples, max_left_shift_seconds={max_left_shift_seconds}, step={step_seconds}..."
+        )
         self.create_model()
         
         if self.pytorch_model is None:
@@ -1184,8 +1195,9 @@ class SeqVAEGraphModel:
         sample_count = 0
         
         try:
-            for i in range(len(raw_dataset)):
-                if sample_count >= num_samples:
+            total_items = len(raw_dataset)
+            for i in range(total_items):
+                if num_samples is not None and sample_count >= num_samples:
                     break
                     
                 sample = raw_dataset[i]
@@ -1208,13 +1220,13 @@ class SeqVAEGraphModel:
             
         logger.info(f"Collected {len(all_samples)} samples for analysis")
         
-        # Define shift range: -60 to +60 seconds in 1-second increments
+        # Define LEFT shift range only: [-max_left_shift_seconds, 0] in step_seconds increments
         # At 4Hz sampling rate: 1 second = 4 samples
         sampling_rate = 4.0  # Hz
-        shift_seconds = np.arange(-60, 61, 1)  # -60s to +60s in 1s steps
+        shift_seconds = np.arange(-int(max_left_shift_seconds), 0 + 1, int(step_seconds))
         shift_samples = (shift_seconds * sampling_rate).astype(int)
         
-        logger.info(f"Testing {len(shift_samples)} different shifts from {shift_seconds[0]}s to {shift_seconds[-1]}s")
+        logger.info(f"Testing {len(shift_samples)} left shifts from {shift_seconds[0]}s to {shift_seconds[-1]}s")
         
         # Calculate 2-minute trimming parameters
         trim_minutes = 2.0
@@ -1231,7 +1243,7 @@ class SeqVAEGraphModel:
         
         with torch.no_grad():
             for shift_idx, (shift_sec, shift_samp) in enumerate(zip(shift_seconds, shift_samples)):
-                logger.info(f"Processing shift {shift_idx+1}/{len(shift_samples)}: {shift_sec}s ({shift_samp} samples)")
+                logger.info(f"Processing left shift {shift_idx+1}/{len(shift_samples)}: {shift_sec}s ({shift_samp} samples)")
                 
                 sample_klds = []
                 
@@ -1308,7 +1320,7 @@ class SeqVAEGraphModel:
                         
                         # Store data for plotting (first few samples and shifts)
                         if sample_idx < plot_samples and len(signal_plot_data) < plot_samples * 5:  # Store 5 shifts per sample
-                            if shift_idx % (len(shift_seconds) // 5) == 0:  # Sample every few shifts
+                            if len(shift_seconds) > 1 and shift_idx % max(1, (len(shift_seconds) // 5)) == 0:  # Sample every few shifts
                                 # Apply trimming to raw signals for plotting
                                 if trim_samples_raw > 0:
                                     fhr_trimmed = fhr_raw[trim_samples_raw:-trim_samples_raw]
@@ -1599,6 +1611,174 @@ class SeqVAEGraphModel:
             pickle.dump(metrics_data, f)
             
         logger.info(f"Metrics histogram analysis complete. Results saved to: {results_path}")
+
+    def run_up_ablation_analysis(self, test_loader, num_samples=None):
+        """Compare TE (KLD) and reconstruction quality (VAF) with and without UP input.
+
+        Args:
+            test_loader (DataLoader): Loader providing normalized tensors. e.g., create_optimized_dataloader(...)
+            num_samples (int | None): Limit number of samples evaluated. e.g., 200; None = all.
+
+        Returns:
+            None: Saves an ablation plot showing distributions and mean±std bars.
+        """
+        logger.info("Starting UP ablation analysis (with vs without UP)...")
+        self.create_model()
+
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting ablation analysis.")
+            return
+
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        model = self.pytorch_model.to(device)
+        model.eval()
+
+        kld_with_up, kld_without_up = [], []
+        vaf_with_up, vaf_without_up = [], []
+
+        processed = 0
+        max_samples = num_samples if num_samples is not None else float('inf')
+
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="UP Ablation"):
+                # Respect sample cap
+                batch_size = batch.fhr_st.size(0)
+                if processed >= max_samples:
+                    break
+                take = min(batch_size, int(max_samples - processed))
+
+                y_st = batch.fhr_st[:take].to(device)
+                y_ph = batch.fhr_ph[:take].to(device)
+                x_ph = batch.fhr_up_ph[:take].to(device)
+                y_raw = batch.fhr[:take].to(device)
+
+                # With UP
+                out_up = model(y_st, y_ph, x_ph)
+                mu_pr_up = out_up['mu_pr']  # (B, 4800)
+                kld_tensor_up = model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
+                kld_up = kld_tensor_up.mean(dim=(1, 2))  # per-sample
+
+                # Without UP (zeroed source)
+                x_zero = torch.zeros_like(x_ph)
+                out_no = model(y_st, y_ph, x_zero)
+                mu_pr_no = out_no['mu_pr']
+                kld_tensor_no = model.measure_transfer_entropy(y_st, y_ph, x_zero, reduce_mean=False)
+                kld_no = kld_tensor_no.mean(dim=(1, 2))
+
+                # VAF per-sample (normalized space)
+                for i in range(take):
+                    gt = y_raw[i].detach().cpu().numpy()
+                    pr_up = mu_pr_up[i].detach().cpu().numpy()
+                    pr_no = mu_pr_no[i].detach().cpu().numpy()
+
+                    res_up = gt - pr_up
+                    res_no = gt - pr_no
+                    var_gt = np.var(gt)
+                    if var_gt > 1e-12:
+                        vaf_w = 1.0 - (np.var(res_up) / var_gt)
+                        vaf_wo = 1.0 - (np.var(res_no) / var_gt)
+                        # Keep within [0,1] as elsewhere
+                        vaf_w = max(0.0, min(1.0, float(vaf_w)))
+                        vaf_wo = max(0.0, min(1.0, float(vaf_wo)))
+                    else:
+                        vaf_w = 0.0
+                        vaf_wo = 0.0
+
+                    vaf_with_up.append(vaf_w)
+                    vaf_without_up.append(vaf_wo)
+                    kld_with_up.append(float(kld_up[i].item()))
+                    kld_without_up.append(float(kld_no[i].item()))
+
+                processed += take
+
+        # Plot
+        try:
+            plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_without_up, self.test_results_dir)
+            logger.info("UP ablation analysis complete.")
+        except Exception as e:
+            logger.warning(f"Failed to plot ablation analysis: {e}")
+
+    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None):
+        """Sweep multiplicative gains on UP features and track TE (KLD) and VAF trends.
+
+        Args:
+            test_loader (DataLoader): Loader for normalized tensors.
+            gains (List[float] | None): Multiplicative gains to apply to UP features. e.g., [0.0, 0.5, 1.0, 1.5, 2.0]
+            num_samples (int | None): Limit the number of samples. None = all.
+
+        Returns:
+            None: Saves a plot of mean KLD and VAF vs gain.
+        """
+        logger.info("Starting UP gain sweep analysis...")
+        self.create_model()
+
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting gain sweep analysis.")
+            return
+
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        model = self.pytorch_model.to(device)
+        model.eval()
+
+        gains = gains if gains is not None else [0.0, 0.5, 1.0, 1.5, 2.0]
+
+        # Accumulators per gain
+        kld_sums = {g: 0.0 for g in gains}
+        vaf_sums = {g: 0.0 for g in gains}
+        counts = 0
+        max_samples = num_samples if num_samples is not None else float('inf')
+
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="UP Gain Sweep"):
+                if counts >= max_samples:
+                    break
+                batch_size = batch.fhr_st.size(0)
+                take = min(batch_size, int(max_samples - counts))
+
+                y_st = batch.fhr_st[:take].to(device)
+                y_ph = batch.fhr_ph[:take].to(device)
+                x_ph_base = batch.fhr_up_ph[:take].to(device)
+                y_raw = batch.fhr[:take].to(device)
+
+                for g in gains:
+                    x_scaled = x_ph_base * float(g)
+                    out = model(y_st, y_ph, x_scaled)
+                    mu_pr = out['mu_pr']
+                    kld_tensor = model.measure_transfer_entropy(y_st, y_ph, x_scaled, reduce_mean=False)
+
+                    # Per-sample KLD mean
+                    kld_ps = kld_tensor.mean(dim=(1, 2))  # (B,)
+
+                    # Per-sample VAF
+                    for i in range(take):
+                        gt = y_raw[i].detach().cpu().numpy()
+                        pr = mu_pr[i].detach().cpu().numpy()
+                        res = gt - pr
+                        var_gt = np.var(gt)
+                        if var_gt > 1e-12:
+                            vaf = 1.0 - (np.var(res) / var_gt)
+                            vaf = max(0.0, min(1.0, float(vaf)))
+                        else:
+                            vaf = 0.0
+
+                        kld_sums[g] += float(kld_ps[i].item())
+                        vaf_sums[g] += vaf
+
+                counts += take
+
+        if counts == 0:
+            logger.warning("No samples processed for gain sweep.")
+            return
+
+        gains_list = list(gains)
+        kld_means = [kld_sums[g] / counts for g in gains_list]
+        vaf_means = [vaf_sums[g] / counts for g in gains_list]
+
+        try:
+            plot_te_gain_sweep(gains_list, kld_means, vaf_means, self.test_results_dir)
+            logger.info("UP gain sweep analysis complete.")
+        except Exception as e:
+            logger.warning(f"Failed to plot gain sweep analysis: {e}")
 
 
 def main(train_SeqVAE=1, test_SeqVAE=-1):
