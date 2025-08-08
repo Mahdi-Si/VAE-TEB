@@ -960,6 +960,11 @@ class SeqVAEGraphModel:
 
         # Get scattering transform frequency analysis for channel annotations
         scattering_analysis = None
+        # Build phase/cross indices for splitting plots
+        phase_auto_indices = None
+        phase_cross_indices = None
+        cross_auto_indices = None
+        cross_cross_indices = None
         try:
             # Parameters from fhr_st_setting.md - J=11, Q=4, T=16, sampling_rate=4Hz
             scattering_analysis = analyze_scattering_frequencies(
@@ -967,6 +972,19 @@ class SeqVAEGraphModel:
                 analyze_phase_harmonics=True, analyze_cross_phase=True
             )
             logger.info("Generated scattering transform frequency analysis for channel annotations")
+            # Also get selection masks to derive auto/cross indices matching dataset channel order
+            st_helper = KymatioPhaseScattering1D(J=11, Q=4, T=16, shape=5760, device=device, tukey_alpha=None, max_order=1)
+            sel = st_helper.get_optimal_coefficients_for_fhr(11, 4, 16)
+            # Phase selected order
+            i_phase = sel['phase_selection']['i_idx_selected'].detach().cpu().numpy()
+            j_phase = sel['phase_selection']['j_idx_selected'].detach().cpu().numpy()
+            phase_auto_indices = np.where(i_phase == j_phase)[0]
+            phase_cross_indices = np.where(i_phase != j_phase)[0]
+            # Cross selected order
+            i_cross = sel['cross_selection']['i_idx_selected'].detach().cpu().numpy()
+            j_cross = sel['cross_selection']['j_idx_selected'].detach().cpu().numpy()
+            cross_auto_indices = np.where(i_cross == j_cross)[0]
+            cross_cross_indices = np.where(i_cross != j_cross)[0]
         except Exception as e:
             logger.warning(f"Could not generate scattering frequency analysis: {e}")
             scattering_analysis = None
@@ -1092,7 +1110,11 @@ class SeqVAEGraphModel:
                         loss_dict=loss_dict,  # Pass training-consistent loss values
                         # Pass normalized versions for reconstruction comparison
                         raw_fhr_normalized=raw_fhr_normalized_np,
-                        raw_up_normalized=raw_up_normalized_np
+                        raw_up_normalized=raw_up_normalized_np,
+                        phase_auto_indices=phase_auto_indices,
+                        phase_cross_indices=phase_cross_indices,
+                        cross_auto_indices=cross_auto_indices,
+                        cross_cross_indices=cross_cross_indices
                     )
                     
                     # Generate VAE reconstruction plots for this sample
