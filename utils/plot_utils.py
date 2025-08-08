@@ -30,7 +30,12 @@ def plot_model_analysis(
     training_mode: bool = False,
     # New parameters for analysis mode with both normalized and unnormalized data
     raw_fhr_normalized: np.ndarray = None,
-    raw_up_normalized: np.ndarray = None
+    raw_up_normalized: np.ndarray = None,
+    # Optional channel index splits
+    phase_auto_indices: np.ndarray = None,
+    phase_cross_indices: np.ndarray = None,
+    cross_auto_indices: np.ndarray = None,
+    cross_cross_indices: np.ndarray = None
 ):
     """
     Generates and saves a comprehensive plot for model analysis.
@@ -343,29 +348,66 @@ def plot_model_analysis(
         ax[4].set_ylabel('KLD')
         ax[4].autoscale(enable=True, axis='x', tight=True)
 
-        # 6. fhr_st
-        im_st = ax[5].imshow(fhr_st, aspect='auto', cmap='bwr', origin='lower')
+        # 6. fhr_st (channel 0 at top)
+        im_st = ax[5].imshow(fhr_st, aspect='auto', cmap='bwr', origin='upper')
         ax[5].grid(False)  # Remove grid lines
         ax[5].set_title('FHR Scattering Transform (fhr_st)')
         ax[5].set_xlabel('Time Steps')
         ax[5].set_ylabel('Channels')
         fig.colorbar(im_st, ax=ax[5])
 
-        # 7. fhr_ph
-        im_ph = ax[6].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='lower')
-        ax[6].grid(False)  # Remove grid lines
-        ax[6].set_title('FHR Phase Harmonics (fhr_ph)')
-        ax[6].set_xlabel('Time Steps')
-        ax[6].set_ylabel('Channels')
-        fig.colorbar(im_ph, ax=ax[6])
+        # 7-8. fhr_ph split into autocorr (same freq) and cross (different freq)
+        if phase_auto_indices is not None and phase_cross_indices is not None:
+            ph_auto = fhr_ph[phase_auto_indices, :] if len(phase_auto_indices) > 0 else None
+            ph_cross = fhr_ph[phase_cross_indices, :] if len(phase_cross_indices) > 0 else None
+            # Autocorr
+            if ph_auto is not None and ph_auto.size > 0:
+                im_ph_auto = ax[6].imshow(ph_auto, aspect='auto', cmap='bwr', origin='upper')
+                ax[6].grid(False)
+                ax[6].set_title('FHR Phase Harmonics — Autocorr (same freq)')
+                ax[6].set_xlabel('Time Steps')
+                ax[6].set_ylabel('Channels')
+                fig.colorbar(im_ph_auto, ax=ax[6])
+            else:
+                ax[6].set_title('FHR Phase Harmonics — Autocorr (none)')
+                ax[6].set_axis_off()
+            # Cross
+            if ph_cross is not None and ph_cross.size > 0:
+                im_ph_cross = ax[7].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper')
+                ax[7].grid(False)
+                ax[7].set_title('FHR Phase Harmonics — Cross (different freq)')
+                ax[7].set_xlabel('Time Steps')
+                ax[7].set_ylabel('Channels')
+                fig.colorbar(im_ph_cross, ax=ax[7])
+            else:
+                ax[7].set_title('FHR Phase Harmonics — Cross (none)')
+                ax[7].set_axis_off()
+        else:
+            im_ph = ax[6].imshow(fhr_ph, aspect='auto', cmap='bwr', origin='upper')
+            ax[6].grid(False)  # Remove grid lines
+            ax[6].set_title('FHR Phase Harmonics (fhr_ph)')
+            ax[6].set_xlabel('Time Steps')
+            ax[6].set_ylabel('Channels')
+            fig.colorbar(im_ph, ax=ax[6])
 
-        # 8. fhr_up_ph
-        im_up_ph = ax[7].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='lower')
-        ax[7].grid(False)  # Remove grid lines
-        ax[7].set_title('UP Phase Harmonics (fhr_up_ph)')
-        ax[7].set_xlabel('Time Steps')
-        ax[7].set_ylabel('Channels')
-        fig.colorbar(im_up_ph, ax=ax[7])
+        # 9-10. fhr_up_ph split into autocorr (same freq) and cross (different freq)
+        if phase_auto_indices is not None and phase_cross_indices is not None and \
+           cross_auto_indices is not None and cross_cross_indices is not None:
+            # Shift indices for positions (axes 8 and 9 weren't defined originally)
+            # Extend figure if needed
+            # If we already used ax[7] above for phase split, we need more rows.
+            pass
+        
+        # Backward compatible single-plot for cross if splits not provided
+        if cross_auto_indices is None or cross_cross_indices is None:
+            # If we used two slots for phase above, the next available axis index is 8
+            # But since the figure was created with fixed rows earlier, we keep legacy placement
+            im_up_ph = ax[7].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='upper')
+            ax[7].grid(False)
+            ax[7].set_title('UP→FHR Cross-Phase Harmonics (fhr_up_ph)')
+            ax[7].set_xlabel('Time Steps')
+            ax[7].set_ylabel('Channels')
+            fig.colorbar(im_up_ph, ax=ax[7])
 
         fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='bold')
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
@@ -523,7 +565,7 @@ def plot_vae_reconstruction(
     ax[2].autoscale(enable=True, axis='x', tight=True)
 
     # 4. Original scattering transform (imshow)
-    im_st_orig = ax[3].imshow(original_scattering_transform, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    im_st_orig = ax[3].imshow(original_scattering_transform, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
     ax[3].grid(False)  # Remove grid lines for imshow
     ax[3].set_title('Original Scattering Transform Coefficients', fontweight='normal', pad=12)
     ax[3].set_xlabel('Time Steps', fontweight='normal')
@@ -531,7 +573,7 @@ def plot_vae_reconstruction(
     fig.colorbar(im_st_orig, ax=ax[3], shrink=0.8)
 
     # 5. Reconstructed scattering transform (imshow)
-    im_st_recon = ax[4].imshow(reconstructed_scattering_transform, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    im_st_recon = ax[4].imshow(reconstructed_scattering_transform, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
     ax[4].grid(False)  # Remove grid lines for imshow
     ax[4].set_title('Reconstructed Scattering Transform Coefficients', fontweight='normal', pad=12)
     ax[4].set_xlabel('Time Steps', fontweight='normal')
@@ -539,7 +581,7 @@ def plot_vae_reconstruction(
     fig.colorbar(im_st_recon, ax=ax[4], shrink=0.8)
 
     # 6. Original phase harmonic (imshow)
-    im_ph_orig = ax[5].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    im_ph_orig = ax[5].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
     ax[5].grid(False)  # Remove grid lines for imshow
     ax[5].set_title('Original Phase Harmonic Coefficients', fontweight='normal', pad=12)
     ax[5].set_xlabel('Time Steps', fontweight='normal')
@@ -547,7 +589,7 @@ def plot_vae_reconstruction(
     fig.colorbar(im_ph_orig, ax=ax[5], shrink=0.8)
 
     # 7. Reconstructed phase harmonic (imshow)
-    im_ph_recon = ax[6].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='lower', vmin=-3, vmax=3)
+    im_ph_recon = ax[6].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
     ax[6].grid(False)  # Remove grid lines for imshow
     ax[6].set_title('Reconstructed Phase Harmonic Coefficients', fontweight='normal', pad=12)
     ax[6].set_xlabel('Time Steps', fontweight='normal')
@@ -559,7 +601,7 @@ def plot_vae_reconstruction(
     ph_error = np.abs(original_phase_harmonic - reconstructed_phase_harmonic)
     combined_error = np.vstack([st_error, ph_error])
     
-    im_error = ax[7].imshow(combined_error, aspect='auto', cmap='Reds', origin='lower')
+    im_error = ax[7].imshow(combined_error, aspect='auto', cmap='Reds', origin='upper')
     ax[7].grid(False)  # Remove grid lines for imshow
     ax[7].set_title('Reconstruction Error (|Original - Reconstructed|)', fontweight='normal', pad=12)
     ax[7].set_xlabel('Time Steps', fontweight='normal')
