@@ -479,7 +479,10 @@ def plot_vae_reconstruction(
     reconstructed_phase_harmonic: np.ndarray,  # Shape: (44, 300)
     scattering_channel_data: dict = None,  # From frequency analysis
     batch_idx: int = 0,
-    loss_dict: dict = None
+    loss_dict: dict = None,
+    # Optional phase split indices
+    phase_auto_indices: np.ndarray = None,
+    phase_cross_indices: np.ndarray = None
 ):
     """
     Generates and saves comprehensive VAE reconstruction analysis plots.
@@ -536,8 +539,9 @@ def plot_vae_reconstruction(
     })
 
     # Create figure with multiple rows for comprehensive analysis
-    # Total: 8 + N channel plots (where N is number of scattering channels to plot)
-    n_main_plots = 8
+    # Total: base 8 + 2 if splitting phase (orig & recon each into 2) + N channel plots
+    split_phase = (phase_auto_indices is not None and phase_cross_indices is not None)
+    n_main_plots = 8 + (2 if split_phase else 0)
     n_channel_plots = min(10, original_scattering_transform.shape[0])  # Show first 10 channels
     n_rows = n_main_plots + n_channel_plots
     
@@ -602,40 +606,95 @@ def plot_vae_reconstruction(
     ax[4].set_ylabel('Scattering Channels', fontweight='normal')
     fig.colorbar(im_st_recon, ax=ax[4], shrink=0.8)
 
-    # 6. Original phase harmonic (imshow)
-    im_ph_orig = ax[5].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
-    ax[5].grid(False)  # Remove grid lines for imshow
-    ax[5].set_title('Original Phase Harmonic Coefficients', fontweight='normal', pad=12)
-    ax[5].set_xlabel('Time Steps', fontweight='normal')
-    ax[5].set_ylabel('Phase Harmonic Channels', fontweight='normal')
-    fig.colorbar(im_ph_orig, ax=ax[5], shrink=0.8)
+    idx = 5
+    if split_phase:
+        # 6-7. Original phase split
+        ph_auto = original_phase_harmonic[phase_auto_indices, :] if len(phase_auto_indices) > 0 else None
+        ph_cross = original_phase_harmonic[phase_cross_indices, :] if len(phase_cross_indices) > 0 else None
+        if ph_auto is not None and ph_auto.size > 0:
+            im_ph_auto = ax[idx].imshow(ph_auto, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+            ax[idx].grid(False)
+            ax[idx].set_title('Original Phase Harmonics — Autocorr (same freq)')
+            ax[idx].set_xlabel('Time Steps')
+            ax[idx].set_ylabel('Channels')
+            fig.colorbar(im_ph_auto, ax=ax[idx], shrink=0.8)
+        else:
+            ax[idx].set_title('Original Phase Harmonics — Autocorr (none)')
+            ax[idx].set_axis_off()
+        idx += 1
+        if ph_cross is not None and ph_cross.size > 0:
+            im_ph_cross = ax[idx].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+            ax[idx].grid(False)
+            ax[idx].set_title('Original Phase Harmonics — Cross (different freq)')
+            ax[idx].set_xlabel('Time Steps')
+            ax[idx].set_ylabel('Channels')
+            fig.colorbar(im_ph_cross, ax=ax[idx], shrink=0.8)
+        else:
+            ax[idx].set_title('Original Phase Harmonics — Cross (none)')
+            ax[idx].set_axis_off()
+        idx += 1
+        # 8-9. Reconstructed phase split
+        ph_auto_r = reconstructed_phase_harmonic[phase_auto_indices, :] if len(phase_auto_indices) > 0 else None
+        ph_cross_r = reconstructed_phase_harmonic[phase_cross_indices, :] if len(phase_cross_indices) > 0 else None
+        if ph_auto_r is not None and ph_auto_r.size > 0:
+            im_ph_auto_r = ax[idx].imshow(ph_auto_r, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+            ax[idx].grid(False)
+            ax[idx].set_title('Reconstructed Phase Harmonics — Autocorr (same freq)')
+            ax[idx].set_xlabel('Time Steps')
+            ax[idx].set_ylabel('Channels')
+            fig.colorbar(im_ph_auto_r, ax=ax[idx], shrink=0.8)
+        else:
+            ax[idx].set_title('Reconstructed Phase Harmonics — Autocorr (none)')
+            ax[idx].set_axis_off()
+        idx += 1
+        if ph_cross_r is not None and ph_cross_r.size > 0:
+            im_ph_cross_r = ax[idx].imshow(ph_cross_r, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+            ax[idx].grid(False)
+            ax[idx].set_title('Reconstructed Phase Harmonics — Cross (different freq)')
+            ax[idx].set_xlabel('Time Steps')
+            ax[idx].set_ylabel('Channels')
+            fig.colorbar(im_ph_cross_r, ax=ax[idx], shrink=0.8)
+        else:
+            ax[idx].set_title('Reconstructed Phase Harmonics — Cross (none)')
+            ax[idx].set_axis_off()
+        idx += 1
+    else:
+        # 6. Original phase harmonic (single)
+        im_ph_orig = ax[5].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+        ax[5].grid(False)
+        ax[5].set_title('Original Phase Harmonic Coefficients', fontweight='normal', pad=12)
+        ax[5].set_xlabel('Time Steps', fontweight='normal')
+        ax[5].set_ylabel('Phase Harmonic Channels', fontweight='normal')
+        fig.colorbar(im_ph_orig, ax=ax[5], shrink=0.8)
 
-    # 7. Reconstructed phase harmonic (imshow)
-    im_ph_recon = ax[6].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
-    ax[6].grid(False)  # Remove grid lines for imshow
-    ax[6].set_title('Reconstructed Phase Harmonic Coefficients', fontweight='normal', pad=12)
-    ax[6].set_xlabel('Time Steps', fontweight='normal')
-    ax[6].set_ylabel('Phase Harmonic Channels', fontweight='normal')
-    fig.colorbar(im_ph_recon, ax=ax[6], shrink=0.8)
+        # 7. Reconstructed phase harmonic (single)
+        im_ph_recon = ax[6].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+        ax[6].grid(False)
+        ax[6].set_title('Reconstructed Phase Harmonic Coefficients', fontweight='normal', pad=12)
+        ax[6].set_xlabel('Time Steps', fontweight='normal')
+        ax[6].set_ylabel('Phase Harmonic Channels', fontweight='normal')
+        fig.colorbar(im_ph_recon, ax=ax[6], shrink=0.8)
 
     # 8. Reconstruction error heatmap
     st_error = np.abs(original_scattering_transform - reconstructed_scattering_transform)
     ph_error = np.abs(original_phase_harmonic - reconstructed_phase_harmonic)
     combined_error = np.vstack([st_error, ph_error])
     
-    im_error = ax[7].imshow(combined_error, aspect='auto', cmap='Reds', origin='upper')
-    ax[7].grid(False)  # Remove grid lines for imshow
-    ax[7].set_title('Reconstruction Error (|Original - Reconstructed|)', fontweight='normal', pad=12)
-    ax[7].set_xlabel('Time Steps', fontweight='normal')
-    ax[7].set_ylabel('All Channels (ST + PH)', fontweight='normal')
+    # Determine current row index for error heatmap
+    err_idx = 9 if split_phase else 7
+    im_error = ax[err_idx].imshow(combined_error, aspect='auto', cmap='Reds', origin='upper')
+    ax[err_idx].grid(False)  # Remove grid lines for imshow
+    ax[err_idx].set_title('Reconstruction Error (|Original - Reconstructed|)', fontweight='normal', pad=12)
+    ax[err_idx].set_xlabel('Time Steps', fontweight='normal')
+    ax[err_idx].set_ylabel('All Channels (ST + PH)', fontweight='normal')
     # Add horizontal line to separate ST and PH
-    ax[7].axhline(y=original_scattering_transform.shape[0]-0.5, color='white', linewidth=2, alpha=0.8)
-    ax[7].text(
+    ax[err_idx].axhline(y=original_scattering_transform.shape[0]-0.5, color='white', linewidth=2, alpha=0.8)
+    ax[err_idx].text(
         combined_error.shape[1]*0.02, original_scattering_transform.shape[0]/2, 'ST', 
         color='white', fontweight='bold', fontsize=10, va='center')
-    ax[7].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0] + original_phase_harmonic.shape[0]/2, 
+    ax[err_idx].text(combined_error.shape[1]*0.02, original_scattering_transform.shape[0] + original_phase_harmonic.shape[0]/2, 
                'PH', color='white', fontweight='bold', fontsize=10, va='center')
-    fig.colorbar(im_error, ax=ax[7], shrink=0.8)
+    fig.colorbar(im_error, ax=ax[err_idx], shrink=0.8)
 
     # 9-N. Individual scattering channel plots with frequency information
     for i in range(n_channel_plots):
