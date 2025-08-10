@@ -238,15 +238,6 @@ class SeqVAEGraphModel:
         self.lr = self.config['general_config']['lr']
         self.lr_milestones = self.config['general_config']['lr_milestone']
         self.kld_beta_ = float(self.config['model_config']['VAE_model']['kld_beta'])
-        # Beta scheduling configuration (optional in config). Defaults keep current behavior.
-        vae_cfg = self.config['model_config']['VAE_model']
-        self.beta_schedule = vae_cfg.get('beta_schedule', 'constant')
-        self.beta_start = float(vae_cfg.get('beta_start', 0.0))
-        self.beta_end = float(vae_cfg.get('beta_end', 1.0))
-        self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 100))
-        self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
-        # If beta_const_val not provided, fall back to kld_beta_ from config for constant schedule
-        self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
         self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
 
         self.train_classifier = self.config['general_config']['train_classifier']
@@ -349,16 +340,6 @@ class SeqVAEGraphModel:
                     seqvae_teb_model=base_model_for_loading,
                     strict=False 
                 )
-                # Override beta scheduling from current config (allow changing strategy and values when resuming)
-                try:
-                    self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
-                    self.lightning_base_model.hparams.beta_start = self.beta_start
-                    self.lightning_base_model.hparams.beta_end = self.beta_end
-                    self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
-                    self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
-                    self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                except Exception:
-                    pass
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
