@@ -349,16 +349,23 @@ class SeqVAEGraphModel:
                     seqvae_teb_model=base_model_for_loading,
                     strict=False 
                 )
-                # Override beta scheduling from current config (allow changing strategy and values when resuming)
+                # Override hyperparameters from current config (allow changing values when resuming)
                 try:
+                    # Override learning rate and scheduler parameters
+                    self.lightning_base_model.hparams.lr = self.lr
+                    self.lightning_base_model.hparams.lr_milestones = self.lr_milestones
+                    logger.info(f"Updated learning rate to {self.lr} from config")
+                    
+                    # Override beta scheduling parameters
                     self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
                     self.lightning_base_model.hparams.beta_start = self.beta_start
                     self.lightning_base_model.hparams.beta_end = self.beta_end
                     self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
                     self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
                     self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                except Exception:
-                    pass
+                    logger.info("Updated beta scheduling parameters from config")
+                except Exception as e:
+                    logger.warning(f"Failed to override some hyperparameters: {e}")
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")

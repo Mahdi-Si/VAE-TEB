@@ -404,7 +404,32 @@ class ResidualMLP(nn.Module):
 
 
 class TargetEncoder(nn.Module):
+    """
+    Encodes the target signal (y) to produce the parameters of the prior distribution p(z|y).
 
+    The target signal is composed of two parts: scattering transform features (y_st) and 
+    phase harmonic features (y_ph). These are processed through parallel MLP and causal convolution
+    stacks, fused, and then passed through an LSTM to produce the final representations.
+
+    The encoder outputs the mean (μ_y) and a composite log-variance vector. This vector is
+    later split into the log-variance for the prior (log(σ^2_y)) and a conditioning
+    feature (c_y) used by the ConditionalEncoder.
+
+    **Mathematical Formulation:**
+
+    The encoder models the prior distribution over the latent variable z, conditioned on y:
+    $$ p(\mathbf{z}_t | \mathbf{y}_t) = \mathcal{N}(\mathbf{z}_t | \boldsymbol{\mu}^{y}_t, \text{diag}(\boldsymbol{\sigma}^{2,y}_t)) $$
+
+    The encoder function f_t maps the input features to the parameters of this distribution:
+    $$ (\boldsymbol{\mu}^{y}_t, [\log\boldsymbol{\sigma}^{2,y}_t, \mathbf{c}_t]) = f_t(\mathbf{y}^{st}_t, \mathbf{y}^{ph}_t) $$
+
+    where:
+    -  **y_st_t**: Scattering transform features of the target signal at time t.
+    -  **y_ph_t**: Phase harmonic features of the target signal at time t.
+    -  **μ_y_t**: The mean of the prior distribution.
+    -  **log(o^2_y_t)**: The log-variance of the prior distribution.
+    -  **c_t**: A conditioning feature passed to the ConditionalEncoder.
+    """
     def __init__(
         self,
         sequence_length: int = 300,
@@ -588,24 +613,22 @@ class TargetEncoder(nn.Module):
 
 class SourceEncoder(nn.Module):
     """
-    Professional VAE encoder with single input and mu-only output.
+    Encodes the source signal (x) to produce a deterministic latent representation h_x.
 
-    Architecture:
-    1. Dual-path processing: Multi-layer linear projection + Causal convolution paths (summed)
-    2. Multi-layer linear transformations with residual connections
-    3. Unidirectional LSTM for causal temporal encoding (encodes info up to each timestep)
-    4. Multi-layer linear processing with advanced normalization
-    5. Final linear layer outputting mu latent representations
+    This encoder processes the source signal features (x_ph) through an MLP, a stack of causal
+    convolutions, and an LSTM to capture the temporal dependencies in the source signal.
+    The output is a deterministic vector, which is used to condition the posterior distribution.
+    In the code, this output is named `mu_x` for consistency, but it is not the mean of a
+    distribution.
 
-    State-of-the-art techniques incorporated:
-    - Pre-LayerNorm design for superior gradient flow
-    - Residual connections with proper skip projections
-    - Causal convolutions with depthwise separable operations
-    - Advanced weight initialization (Xavier + Orthogonal for LSTM)
-    - Gradient clipping-friendly architecture
-    - GLU-style gating mechanisms
-    - Learnable positional biases
-    - Adaptive dropout scheduling
+    **Mathematical Formulation:**
+
+    The encoder function f_s maps the source features x_t to a deterministic representation h^x_t:
+    $$ \mathbf{h}^x_t = f_s(\mathbf{x}_t) $$
+
+    where:
+    - **x_t**: Source signal features at time t.
+    - **h^x_t**: The deterministic latent representation of the source signal.
     """
 
     def __init__(
@@ -743,11 +766,29 @@ class SourceEncoder(nn.Module):
 class ConditionalEncoder(nn.Module):
     """
     Implements the conditional encoder q(z | x, y) for the TEB framework.
-    It maps concatenated source (x) and target (y) latent representations
-    to the parameters of the posterior Gaussian distribution for z.
 
-    This module is designed to work with sequence data, where the linear
-    transformations are applied independently at each time step.
+    This module models the posterior distribution over the latent variable z, conditioned on both
+    the source signal (x) and the target signal (y). It takes the latent representation of the
+    source (h_x) and a conditioning feature from the target (c_y) as input. It outputs the
+    parameters of the posterior distribution, which is a diagonal Gaussian.
+
+    **Mathematical Formulation:**
+
+    The posterior distribution is defined as:
+    $$ q(\mathbf{z}_t | \mathbf{x}_t, \mathbf{y}_t) = \mathcal{N}(\mathbf{z}_t | \boldsymbol{\mu}^{post}_t, \text{diag}(\boldsymbol{\sigma}^{2,post}_t)) $$
+
+    The encoder function f_c computes the parameters of this distribution from the combined
+    latent representations:
+    $$ (\tilde{\boldsymbol{\mu}}^{post}_t, \log\boldsymbol{\sigma}^{2,post}_t) = f_c([\mathbf{h}^x_t, \mathbf{c}_t]) $$
+
+    The final posterior mean is shifted by the prior mean to center it:
+    $$ \boldsymbol{\mu}^{post}_t = \tilde{\boldsymbol{\mu}}^{post}_t + \boldsymbol{\mu}^{y}_t $$
+
+    where:
+    - **h^x_t**: Latent representation from the SourceEncoder.
+    - **c_t**: Conditioning feature from the TargetEncoder.
+    - **μ^post_t**: The mean of the posterior distribution.
+    - **log(σ^2_post_t)**: The log-variance of the posterior distribution.
     """
 
     def __init__(self, dim_hx: int, dim_hy: int, dim_z: int):
@@ -822,13 +863,28 @@ class ConditionalEncoder(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Simplified Raw Signal Decoder that predicts a fixed-size future window from the entire sequence.
-    
-    Key changes:
-    - Predicts a single future window instead of overlapping predictions from each timestep
-    - Much simpler and more efficient architecture
-    - Clear alignment between predictions and targets
-    - Reduced memory usage and computational complexity
+    Reconstructs the raw target signal and auxiliary features from the latent sequence z.
+
+    The decoder takes the full latent sequence z as input and performs two tasks:
+    1.  **Auxiliary Feature Reconstruction**: It predicts the concatenated target features 
+        (scattering and phase harmonics) at each time step. This is used as an auxiliary
+        loss to stabilize training.
+    2.  **Raw Signal Reconstruction**: It upsamples the latent sequence and predicts the mean 
+        and log-variance of the raw FHR signal over a fixed window.
+
+    **Mathematical Formulation:**
+
+    The decoder models the likelihood of the raw signal given the latent sequence:
+    $$ p(\mathbf{r} | \mathbf{z}_{1:T}) = \mathcal{N}(\mathbf{r} | \boldsymbol{\mu}^{raw}, \text{diag}(\boldsymbol{\sigma}^{2,raw})) $$
+
+    The decoder function f_d maps the latent sequence to the reconstruction outputs:
+    $$ (\widehat{\mathbf{y}}_{1:T}, \boldsymbol{\mu}^{raw}, \log\boldsymbol{\sigma}^{2,raw}) = f_d(\mathbf{z}_{1:T}) $$
+
+    where:
+    - **z_{1:T}**: The full latent sequence.
+    - **ŷ_{1:T}**: The reconstructed auxiliary features.
+    - **μ^raw**: The mean of the reconstructed raw signal.
+    - **log(σ^2_raw)**: The log-variance of the reconstructed raw signal.
     """
 
     def __init__(
@@ -981,31 +1037,30 @@ class Decoder(nn.Module):
 
 class SeqVaeTeb(nn.Module):
     """
-    Memory-optimized Sequence VAE with Target-Encoder-Bank (TEB) framework.
+    Sequence VAE with Transfer Entropy Bottleneck (TEB).
 
-    This model integrates a source encoder, a target encoder, a conditional
-    encoder, and a decoder to perform future prediction with uncertainty.
+    This model implements the full SeqVaeTeb framework, which learns a latent representation
+    of a target signal (y) that is predictive of the signal's future, while minimizing the
+    information it contains about a source signal (x). This is achieved by minimizing the
+    KL divergence between a posterior distribution q(z|x,y) and a prior distribution p(z|y).
 
-    Memory optimizations applied:
-    - Gradient checkpointing in residual blocks
-    - In-place operations where possible
-    - Explicit memory cleanup with del statements
-    - F.pad instead of pre-allocated padding tensors
-    - Mixed precision training support
-    - Efficient tensor transpose operations
+    **Core Components:**
+    - **SourceEncoder**: Encodes the source signal `x` into a latent representation `h_x`.
+    - **TargetEncoder**: Encodes the target signal `y` into the parameters of the prior `p(z|y)`.
+    - **ConditionalEncoder**: Combines `h_x` and a feature from `y` to define the posterior `q(z|x,y)`.
+    - **Decoder**: Reconstructs the target signal from samples of the latent variable `z`.
 
-    The architecture is based on the following flow:
-    1. A source encoder processes input `x_ph` to get `mu_x`.
-    2. A target encoder processes `y_st` and `y_ph` to model the prior `p(z|y)`.
-        It outputs `mu_y` and a `logvar_y` that is split into a prior log-variance
-        and a conditional feature `c_logvar`.
-    3. A conditional encoder combines `mu_x` and `c_logvar` to model the posterior
-        `q(z|x,y)`, outputting `mu_post` and `logvar_post`.
-    4. A latent variable `z` is sampled from the posterior using the reparameterization trick.
-    5. A decoder takes `z` and predicts future sequences for `y_st` and `y_ph`.
+    **Mathematical Formulation:**
 
-    Loss is composed of reconstruction loss (from the decoder) and a KL-divergence
-    term between the prior and posterior distributions.
+    The model is trained by maximizing the Evidence Lower Bound (ELBO), which is equivalent
+    to minimizing the following loss function:
+
+    $$ \mathcal{L}_{\text{total}} = \mathbb{E}_{q(\mathbf{z}|\mathbf{x},\mathbf{y})}[-\log p(\mathbf{r}|\mathbf{z})] + \beta \cdot \text{KL}[q(\mathbf{z}|\mathbf{x},\mathbf{y}) || p(\mathbf{z}|\mathbf{y})] $$
+
+    where:
+    - The first term is the reconstruction loss (NLL of the raw signal + MSE of auxiliary features).
+    - The second term is the KL divergence, which acts as a proxy for transfer entropy.
+    - β is a hyperparameter that controls the strength of the information bottleneck.
     """
 
     def __init__(
