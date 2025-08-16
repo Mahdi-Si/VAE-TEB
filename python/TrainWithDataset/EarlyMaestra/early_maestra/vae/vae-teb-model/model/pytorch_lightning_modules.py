@@ -280,30 +280,54 @@ class PlottingCallBack(Callback):
 
 
 class LossPlotCallback(Callback):
-    def __init__(self, output_dir, plot_frequency=10, max_history_size=1000):
+    def __init__(self, output_dir, plot_frequency=10, max_history_size=1000, use_tcvae=True):
         """
         Args:
             output_dir (str): Directory where the loss plot HTML files will be saved.
             plot_frequency (int): Frequency (in epochs) to generate the loss plot.
             max_history_size (int): Maximum number of epochs to keep in history to prevent memory issues.
+            use_tcvae (bool): Whether to track β-TCVAE specific metrics.
         """
         super().__init__()
         self.output_dir = output_dir
         self.plot_frequency = plot_frequency
         self.max_history_size = max_history_size
+        self.use_tcvae = use_tcvae
+        
+        # Base metrics (common to both modes)
         self.history = {
             "epoch": [],
             "train/total_loss": [],
             "train/recon_loss": [],
             "train/mse_loss": [],
             "train/nll_loss": [],
-            "train/kld_loss": [],
             "val/total_loss": [],
             "val/recon_loss": [],
             "val/mse_loss": [],
-            "val/nll_loss": [],
-            "val/kld_loss": []
+            "val/nll_loss": []
         }
+        
+        # Add mode-specific metrics
+        if use_tcvae:
+            # β-TCVAE specific metrics
+            tcvae_metrics = {
+                "train/mi_loss": [],
+                "train/tc_loss": [],
+                "train/dw_kl_loss": [],
+                "train/regularization_loss": [],
+                "val/mi_loss": [],
+                "val/tc_loss": [],
+                "val/dw_kl_loss": [],
+                "val/regularization_loss": []
+            }
+            self.history.update(tcvae_metrics)
+        else:
+            # Standard TEB metrics
+            teb_metrics = {
+                "train/kld_loss": [],
+                "val/kld_loss": []
+            }
+            self.history.update(teb_metrics)
 
     def _trim_history(self):
         """Trim history to prevent unlimited memory growth."""
@@ -404,6 +428,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
     This module handles the training, validation, and optimization loops,
     including learning rate scheduling and KLD beta annealing.
+    Supports both standard TEB and β-TCVAE training modes.
     """
 
     def __init__(
@@ -416,7 +441,12 @@ class LightSeqVaeTeb(L.LightningModule):
         beta_end: float = 1.0,
         beta_anneal_epochs: int = 100,
         beta_cycle_len: int = 1000,
-        beta_const_val: float = 1.0
+        beta_const_val: float = 1.0,
+        # β-TCVAE specific parameters
+        use_tcvae: bool = True,
+        alpha: float = 1.0,
+        gamma: float = 1.0,
+        dataset_size: int = 10000
         ):
         """
         Args:
@@ -429,6 +459,10 @@ class LightSeqVaeTeb(L.LightningModule):
             beta_anneal_epochs: Number of epochs for linear annealing.
             beta_cycle_len: Length of a cycle for cyclic annealing.
             beta_const_val: Constant value for beta if schedule is 'constant'.
+            use_tcvae: Whether to use β-TCVAE decomposed loss instead of standard TEB.
+            alpha: Weight for Index-Code MI term in β-TCVAE.
+            gamma: Weight for Dimension-wise KL term in β-TCVAE.
+            dataset_size: Total dataset size for MWS computation.
         """
         super().__init__()
         # Using save_hyperparameters to automatically save arguments to self.hparams
@@ -485,9 +519,32 @@ class LightSeqVaeTeb(L.LightningModule):
         # Forward pass without gradient checkpointing for speed
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
-        loss_dict = self.model.compute_loss(
-            forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.hparams.beta
-        )
+        # Choose loss computation based on mode
+        if self.hparams.use_tcvae:
+            # β-TCVAE decomposed loss
+            loss_dict = self.model.compute_loss(
+                forward_outputs=forward_outputs,
+                y_st=y_st,
+                y_ph=y_ph,
+                y_raw=y_raw,
+                compute_kld_loss=True,
+                use_tcvae=True,
+                alpha=self.hparams.alpha,
+                beta=self.hparams.beta,
+                gamma=self.hparams.gamma,
+                dataset_size=self.hparams.dataset_size
+            )
+        else:
+            # Standard TEB loss
+            loss_dict = self.model.compute_loss(
+                forward_outputs=forward_outputs,
+                y_st=y_st,
+                y_ph=y_ph,
+                y_raw=y_raw,
+                compute_kld_loss=True,
+                use_tcvae=False,
+                beta=self.hparams.beta
+            )
 
         return loss_dict
 
@@ -496,12 +553,26 @@ class LightSeqVaeTeb(L.LightningModule):
         loss_dict = self._common_step(batch, batch_idx)
         total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
 
-        # Log training metrics
+        # Log common training metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        
+        # Log appropriate KL-related metrics based on training mode
+        if self.hparams.use_tcvae:
+            # β-TCVAE specific metrics
+            self.log('train/mi_loss', loss_dict['mi_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/tc_loss', loss_dict['tc_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/dw_kl_loss', loss_dict['dw_kl_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/regularization_loss', loss_dict['regularization_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+            # Log hyperparameters for monitoring
+            self.log('train/alpha', self.hparams.alpha, on_epoch=True, prog_bar=False, logger=True)
+            self.log('train/gamma', self.hparams.gamma, on_epoch=True, prog_bar=False, logger=True)
+        else:
+            # Standard TEB metrics
+            self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        
         # Clear loss_dict to free memory
         del loss_dict
 
@@ -512,12 +583,22 @@ class LightSeqVaeTeb(L.LightningModule):
         loss_dict = self._common_step(batch, batch_idx)
         total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
 
-        # Log validation metrics
+        # Log common validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
         self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=True, logger=True)
         self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
+        
+        # Log appropriate KL-related metrics based on training mode
+        if self.hparams.use_tcvae:
+            # β-TCVAE specific metrics
+            self.log('val/mi_loss', loss_dict['mi_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/tc_loss', loss_dict['tc_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/dw_kl_loss', loss_dict['dw_kl_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/regularization_loss', loss_dict['regularization_loss'], on_epoch=True, prog_bar=False, logger=True)
+        else:
+            # Standard TEB metrics
+            self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
 
         # Clear loss_dict to free memory
         del loss_dict

@@ -242,13 +242,19 @@ class SeqVAEGraphModel:
         self.kld_beta_ = float(self.config['model_config']['VAE_model']['kld_beta'])
         # Beta scheduling configuration (optional in config). Defaults keep current behavior.
         vae_cfg = self.config['model_config']['VAE_model']
-        self.beta_schedule = vae_cfg.get('beta_schedule', 'constant')
+        self.beta_schedule = vae_cfg.get('beta_schedule', 'linear')
         self.beta_start = float(vae_cfg.get('beta_start', 0.0))
-        self.beta_end = float(vae_cfg.get('beta_end', 1.0))
-        self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 100))
+        self.beta_end = float(vae_cfg.get('beta_end', 6.0))  # Default β-TCVAE value
+        self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 50))
         self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
         # If beta_const_val not provided, fall back to kld_beta_ from config for constant schedule
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
+        
+        # β-TCVAE specific configuration
+        self.use_tcvae = vae_cfg.get('use_tcvae', True)
+        self.alpha = float(vae_cfg.get('alpha', 1.0))  # Index-Code MI weight
+        self.gamma = float(vae_cfg.get('gamma', 1.0))  # Dimension-wise KL weight
+        self.dataset_size = int(vae_cfg.get('dataset_size', 10000))  # Will be updated from actual data
         self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
 
         self.train_classifier = self.config['general_config']['train_classifier']
@@ -365,7 +371,13 @@ class SeqVAEGraphModel:
                     self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
                     self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
                     self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                    logger.info("Updated beta scheduling parameters from config")
+                    
+                    # Override β-TCVAE parameters
+                    self.lightning_base_model.hparams.use_tcvae = self.use_tcvae
+                    self.lightning_base_model.hparams.alpha = self.alpha
+                    self.lightning_base_model.hparams.gamma = self.gamma
+                    self.lightning_base_model.hparams.dataset_size = getattr(self, 'dataset_size', self.dataset_size)
+                    logger.info("Updated beta scheduling and β-TCVAE parameters from config")
                 except Exception as e:
                     logger.warning(f"Failed to override some hyperparameters: {e}")
                 self.base_model = self.lightning_base_model.model
@@ -401,8 +413,17 @@ class SeqVAEGraphModel:
                 seqvae_teb_model=self.base_model,
                 lr=self.lr,
                 lr_milestones=self.lr_milestones,
-                beta_schedule="constant",
-                beta_const_val=self.kld_beta_
+                beta_schedule=self.beta_schedule,
+                beta_start=self.beta_start,
+                beta_end=self.beta_end,
+                beta_anneal_epochs=self.beta_anneal_epochs,
+                beta_cycle_len=self.beta_cycle_len,
+                beta_const_val=self.beta_const_val,
+                # β-TCVAE parameters
+                use_tcvae=self.use_tcvae,
+                alpha=self.alpha,
+                gamma=self.gamma,
+                dataset_size=getattr(self, 'dataset_size', self.dataset_size)
             )
             self.pytorch_model = self.base_model  # Set pytorch_model reference
 
@@ -486,7 +507,8 @@ class SeqVAEGraphModel:
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
             plot_frequency=self.plot_every_epoch,
-            max_history_size=19900  # Limit history to prevent memory issues
+            max_history_size=19900,  # Limit history to prevent memory issues
+            use_tcvae=self.use_tcvae  # Track β-TCVAE specific metrics
         )
 
         # Profiler for performance analysis
@@ -709,6 +731,10 @@ def main():
         pin_memory=True,  # Speed optimization
         **dataset_kwargs
     )
+    
+    # Update dataset size for β-TCVAE MWS computation
+    dataset_size = len(train_loader_seqvae.dataset)
+    logger.info(f"Training dataset size: {dataset_size} samples")
 
     # SPEED OPTIMIZED: Enhanced validation dataloader with prefetching
     validation_loader_seqvae = create_optimized_dataloader(
@@ -724,6 +750,8 @@ def main():
     )
 
     graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
+    # Update dataset size in the model configuration
+    graph_model.dataset_size = dataset_size
     graph_model.create_model()
     graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 

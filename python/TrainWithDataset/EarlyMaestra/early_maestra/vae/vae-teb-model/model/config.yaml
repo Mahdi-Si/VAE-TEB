@@ -21,11 +21,25 @@ model_config:
     channel_num: 2
     input_dim: 76
     RNN_hidden_dim: 100
-    latent_size: 16
+    latent_size: 32  # Updated to match current implementation
     num_RNN_layers: 5
-    kld_beta: 0.00001
+    kld_beta: 1.0  # Standard TEB beta value
     freeze_seqvae: False
     zero_source: True
+    
+    # Beta scheduling configuration for annealing
+    beta_schedule: linear  # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0        # Starting beta value for annealing
+    beta_end: 6.0          # Final beta value (recommended for β-TCVAE)
+    beta_anneal_epochs: 50 # Number of epochs for linear annealing
+    beta_cycle_len: 1000   # Cycle length for cyclic annealing
+    beta_const_val: 1.0    # Constant beta value when schedule is 'constant'
+    
+    # β-TCVAE specific configuration
+    use_tcvae: true        # Enable β-TCVAE decomposed loss (set to false for standard TEB)
+    alpha: 1.0             # Index-Code MI weight (information bottleneck)
+    gamma: 1.0             # Dimension-wise KL weight (complexity penalty)
+    dataset_size: 10000    # Initial estimate (will be updated from actual data)
 
   seqvae_checkpoint: null
   base_model_checkpoint: null

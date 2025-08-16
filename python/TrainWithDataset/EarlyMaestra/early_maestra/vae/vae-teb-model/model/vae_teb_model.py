@@ -1136,6 +1136,128 @@ class SeqVaeTeb(nn.Module):
             return kld.sum(dim=-1).mean()
         return kld
 
+    def compute_tc_loss(self, z, mu, logvar, dataset_size):
+        """
+        Computes the β-TCVAE loss components using Minibatch Weighted Sampling.
+        
+        Mathematical Foundation:
+        - I_q(z;n) = E[log q(z|x,y) - log q(z)]
+        - TC(z) = E[log q(z) - log ∏_j q(z_j)]  
+        - DW_KL = E[log ∏_j q(z_j) - log p(z)]
+
+        Args:
+            z (torch.Tensor): Latent samples from the posterior. Shape: (batch_size, seq_len, latent_dim)
+            mu (torch.Tensor): Mean of the posterior. Shape: (batch_size, seq_len, latent_dim)
+            logvar (torch.Tensor): Log-variance of the posterior. Shape: (batch_size, seq_len, latent_dim)
+            dataset_size (int): The total number of samples in the training dataset.
+
+        Returns:
+            dict: A dictionary containing mi_loss, tc_loss, and dw_kl_loss.
+        """
+        batch_size, seq_len, latent_dim = z.shape
+        
+        # Reshape for minibatch processing: (batch_size * seq_len, latent_dim)
+        z_flat = z.reshape(batch_size * seq_len, latent_dim)
+        mu_flat = mu.reshape(batch_size * seq_len, latent_dim)
+        logvar_flat = logvar.reshape(batch_size * seq_len, latent_dim)
+        
+        # Numerical stability: clamp log variance
+        logvar_flat = torch.clamp(logvar_flat, min=-10, max=10)
+        
+        num_samples = batch_size * seq_len
+        
+        # Log-density of the posterior q(z|x,y) for each sample
+        log_q_z_xy = self._gaussian_log_density(z_flat, mu_flat, logvar_flat)
+
+        # MWS: Compute log q(z_i) under all encoders q(z|x_j,y_j) in the minibatch
+        # Shape: (num_samples, num_samples, latent_dim)
+        z_expanded = z_flat.unsqueeze(1)  # (num_samples, 1, latent_dim)
+        mu_expanded = mu_flat.unsqueeze(0)  # (1, num_samples, latent_dim)
+        logvar_expanded = logvar_flat.unsqueeze(0)  # (1, num_samples, latent_dim)
+        
+        # Compute log densities: log q(z_i | x_j, y_j) for all i,j pairs
+        _log_q_z = self._gaussian_log_density_broadcast(z_expanded, mu_expanded, logvar_expanded)
+        # Shape: (num_samples, num_samples)
+
+        # MWS estimator for log q(z): logsumexp over j, then normalize
+        log_q_z = torch.logsumexp(_log_q_z, dim=1) - math.log(dataset_size * num_samples)
+
+        # MWS estimator for log ∏_j q(z_j): sum over dimensions of individual logsumexp
+        # For each dimension d: log q(z_d) = logsumexp_j(log q(z_d | x_j, y_j)) - log(N*M)
+        # Compute marginal log densities for each dimension separately
+        log_q_z_marginals = []
+        for d in range(latent_dim):
+            z_d = z_flat[:, d:d+1].unsqueeze(1)  # (num_samples, 1, 1)
+            mu_d = mu_flat[:, d:d+1].unsqueeze(0)  # (1, num_samples, 1)
+            logvar_d = logvar_flat[:, d:d+1].unsqueeze(0)  # (1, num_samples, 1)
+            
+            log_q_zd = self._gaussian_log_density_broadcast(z_d, mu_d, logvar_d)  # (num_samples, num_samples)
+            log_q_zd_marginal = torch.logsumexp(log_q_zd, dim=1) - math.log(dataset_size * num_samples)  # (num_samples,)
+            log_q_z_marginals.append(log_q_zd_marginal)
+        
+        log_q_z_marginals = torch.stack(log_q_z_marginals, dim=1)  # (num_samples, latent_dim)
+        log_prod_q_z_j = log_q_z_marginals.sum(dim=1)  # (num_samples,)
+
+        # Log-density of the prior p(z) = N(0, I)
+        log_p_z = self._standard_normal_log_density(z_flat)
+
+        # Decomposed loss terms (sign convention: positive = penalty)
+        mi_loss = (log_q_z_xy - log_q_z).mean()
+        tc_loss = (log_q_z - log_prod_q_z_j).mean()
+        dw_kl_loss = (log_prod_q_z_j - log_p_z).mean()
+
+        return {
+            'mi_loss': mi_loss,
+            'tc_loss': tc_loss,
+            'dw_kl_loss': dw_kl_loss
+        }
+
+    def _gaussian_log_density(self, samples, mu, logvar):
+        """
+        Compute log density of samples under Gaussian distribution.
+        
+        Args:
+            samples: (N, D) tensor
+            mu: (N, D) tensor
+            logvar: (N, D) tensor
+        
+        Returns:
+            log_density: (N,) tensor
+        """
+        normalization = -0.5 * (math.log(2 * math.pi) + logvar)
+        inv_var = torch.exp(-logvar)
+        log_density = normalization - 0.5 * ((samples - mu) ** 2 * inv_var)
+        return log_density.sum(dim=-1)
+
+    def _gaussian_log_density_broadcast(self, samples, mu, logvar):
+        """
+        Compute log density with broadcasting for MWS.
+        
+        Args:
+            samples: (N, 1, D) tensor
+            mu: (1, M, D) tensor  
+            logvar: (1, M, D) tensor
+        
+        Returns:
+            log_density: (N, M) tensor
+        """
+        normalization = -0.5 * (math.log(2 * math.pi) + logvar)
+        inv_var = torch.exp(-logvar)
+        log_density = normalization - 0.5 * ((samples - mu) ** 2 * inv_var)
+        return log_density.sum(dim=-1)
+
+    def _standard_normal_log_density(self, samples):
+        """
+        Compute log density under standard normal N(0, I).
+        
+        Args:
+            samples: (N, D) tensor
+        
+        Returns:
+            log_density: (N,) tensor
+        """
+        return -0.5 * (math.log(2 * math.pi) + samples.pow(2)).sum(dim=1)
+
     def forward(
         self,
         y_st: torch.Tensor,
@@ -1193,9 +1315,14 @@ class SeqVaeTeb(nn.Module):
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
+        use_tcvae: bool = False,
+        alpha: float = 1.0,
+        gamma: float = 1.0,
+        dataset_size: int = 1000,
     ) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss with MSE and NLL components.
+        Supports both standard TEB and β-TCVAE loss computation.
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
@@ -1204,12 +1331,19 @@ class SeqVaeTeb(nn.Module):
             y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
             beta (float): Beta weight for KLD loss in VAE training.
+            use_tcvae (bool): Whether to use β-TCVAE decomposed loss instead of standard KLD.
+            alpha (float): Weight for Index-Code MI term in β-TCVAE.
+            gamma (float): Weight for Dimension-wise KL term in β-TCVAE.
+            dataset_size (int): Total dataset size for MWS computation.
 
         Returns:
             A dictionary of computed losses.
         """
         device = y_raw.device
         kld_loss = torch.tensor(0.0, device=device)
+        mi_loss = torch.tensor(0.0, device=device)
+        tc_loss = torch.tensor(0.0, device=device)
+        dw_kl_loss = torch.tensor(0.0, device=device)
 
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
@@ -1224,24 +1358,48 @@ class SeqVaeTeb(nn.Module):
             target_raw_signal=y_raw
         )
 
-        # KLD loss
+        # Choose loss computation method
         if compute_kld_loss:
-            kld_loss = self._kld_loss(
-                mu_prior=forward_outputs["mu_prior"],
-                logvar_prior=forward_outputs["logvar_prior"],
-                mu_post=forward_outputs["mu_post"],
-                logvar_post=forward_outputs["logvar_post"],
-                reduce_mean=True,  # Ensure scalar loss for training
-            )
+            if use_tcvae:
+                # β-TCVAE decomposed loss
+                tc_loss_dict = self.compute_tc_loss(
+                    z=forward_outputs['z'],
+                    mu=forward_outputs['mu_post'],
+                    logvar=forward_outputs['logvar_post'],
+                    dataset_size=dataset_size
+                )
+                
+                mi_loss = tc_loss_dict['mi_loss']
+                tc_loss = tc_loss_dict['tc_loss']
+                dw_kl_loss = tc_loss_dict['dw_kl_loss']
+                
+                # Total regularization loss
+                regularization_loss = alpha * mi_loss + beta * tc_loss + gamma * dw_kl_loss
+            else:
+                # Standard TEB KLD loss
+                kld_loss = self._kld_loss(
+                    mu_prior=forward_outputs["mu_prior"],
+                    logvar_prior=forward_outputs["logvar_prior"],
+                    mu_post=forward_outputs["mu_post"],
+                    logvar_post=forward_outputs["logvar_post"],
+                    reduce_mean=True,  # Ensure scalar loss for training
+                )
+                regularization_loss = beta * kld_loss
+        else:
+            regularization_loss = torch.tensor(0.0, device=device)
 
-        # Total loss with beta-weighted KLD
-        total_loss = decoder_losses['total_decoder_loss'] + beta * kld_loss
+        # Total loss
+        total_loss = decoder_losses['total_decoder_loss'] + regularization_loss
 
         return {
             "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
             "mse_loss": decoder_losses['mse_loss'],
             "nll_loss": decoder_losses['nll_loss'], 
             "kld_loss": kld_loss,
+            "mi_loss": mi_loss,
+            "tc_loss": tc_loss,
+            "dw_kl_loss": dw_kl_loss,
+            "regularization_loss": regularization_loss,
             "total_loss": total_loss,
             "classification_loss": None,  # Required by interface
         }
