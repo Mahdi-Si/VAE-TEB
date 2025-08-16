@@ -140,7 +140,6 @@ class CausalMultiChannelConvBlock(nn.Module):
         up_sampling: bool = False, 
         up_sample_scale: int = 2, 
         activation: nn.Module = nn.ReLU,
-        use_batch_norm: bool = True,
         dilation: int = 1,
         stride: int = 1,
         bias: bool = False
@@ -151,12 +150,14 @@ class CausalMultiChannelConvBlock(nn.Module):
         self.up_sample_scale = up_sample_scale
         self.filter_size = filter_size
         self.activation = activation
-        self.use_batch_norm = use_batch_norm
         self.dilation = dilation
         self.stride = stride
         
         # Calculate causal padding (left padding only)
         self.left_padding = (filter_size - 1) * dilation
+        
+        # Pre-normalization (consistent with MultiChannelConvBlock)
+        self.pre_norm = nn.GroupNorm(num_groups=min(8, in_channels), num_channels=in_channels)
         
         # Main convolution layer
         self.conv = nn.Conv1d(
@@ -169,12 +170,6 @@ class CausalMultiChannelConvBlock(nn.Module):
             dilation=dilation,
             stride=stride
         )
-        
-        # Optional batch normalization
-        if use_batch_norm:
-            self.bn_layer = nn.BatchNorm1d(out_channels, momentum=0.9)
-        else:
-            self.bn_layer = None
             
         # Activation function
         self.act_fn = activation()
@@ -195,19 +190,18 @@ class CausalMultiChannelConvBlock(nn.Module):
                 align_corners=False
             )
         
+        # Apply pre-normalization (PreNorm architecture - consistent with MultiChannelConvBlock)
+        x = self.pre_norm(x)
+        
+        # Apply activation before convolution (PreAct architecture)
+        x = self.act_fn(x)
+        
         # Apply causal padding (left padding only)
         if self.left_padding > 0:
             x = F.pad(x, (self.left_padding, 0))
         
         # Apply convolution
         output = self.conv(x)
-        
-        # Apply batch normalization if enabled
-        if self.bn_layer is not None:
-            output = self.bn_layer(output)
-        
-        # Apply activation function
-        output = self.act_fn(output)
         
         return output
 
@@ -223,17 +217,25 @@ class MultiChannelConvBlock(nn.Module):
         self.filter_size = filter_size
         self.padding = (filter_size - 1) // 2
 
+        # Pre-normalization for better gradient flow
+        self.pre_norm = nn.GroupNorm(num_groups=min(8, in_channels), num_channels=in_channels)
+        
         self.conv = nn.Conv1d(
             in_channels, out_channels,
             kernel_size=filter_size,
             groups=groups, bias=False)
-        self.bn_layer  = nn.BatchNorm1d(out_channels, momentum=0.9)
 
     def forward(self, x):
         if self.up_sampling:
             x = F.interpolate(
                 x, scale_factor=self.up_scale,
                 mode='linear', align_corners=False)
+
+        # Apply pre-normalization
+        x = self.pre_norm(x)
+        
+        # Apply activation before convolution (PreAct)
+        x = torch.tanh(x) if self.tanh else F.relu(x)
 
         p = self.padding
         if p > 0:
@@ -249,8 +251,7 @@ class MultiChannelConvBlock(nn.Module):
                 x = torch.cat([left, x, right], dim=-1)
 
         x = self.conv(x)
-        x = self.bn_layer(x)
-        return torch.tanh(x) if self.tanh else F.relu(x)
+        return x
 
 
 
@@ -467,19 +468,23 @@ class TargetEncoder(nn.Module):
             activation=nn.ReLU
             )
 
-        # Sequential convolutions for scattering
-        self.conv_scattering = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1),
-        )
+        # Sequential convolutions for scattering with skip connections
+        self.conv_scattering_1 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1)
+        self.conv_scattering_2 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1)
+        self.conv_scattering_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1)
+        
+        # Skip connection normalization for scattering path
+        self.scatter_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
+        self.scatter_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
 
-        # Sequential convolutions for phase
-        self.conv_phase = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1),
-        )
+        # Sequential convolutions for phase with skip connections
+        self.conv_phase_1 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1)
+        self.conv_phase_2 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1)
+        self.conv_phase_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1)
+        
+        # Skip connection normalization for phase path
+        self.phase_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
+        self.phase_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
         
         # LayerNorm for fused outputs
         self.scatter_fused_norm = nn.LayerNorm(16)
@@ -522,9 +527,17 @@ class TargetEncoder(nn.Module):
             activation=nn.ReLU
         )
         
-        self.logvar_layer = ResidualMLP(
+        # Separate layers for prior and conditioning features (TEB compliance)
+        self.prior_logvar_layer = ResidualMLP(
             input_dim=32,
-            hidden_dims=geometric_schedule(32, 64, 4),
+            hidden_dims=geometric_schedule(32, 32, 4),
+            final_activation=False,
+            activation=nn.ReLU
+        )
+        
+        self.conditioning_layer = ResidualMLP(
+            input_dim=32,
+            hidden_dims=geometric_schedule(32, 32, 4),
             final_activation=False,
             activation=nn.ReLU
         )
@@ -560,17 +573,45 @@ class TargetEncoder(nn.Module):
             hidden_states["scattering_reduced"] = scatter_linear
             hidden_states["phase_reduced"] = phase_linear
 
-        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
-        scatter_conv = self.conv_scattering(scatter_linear.transpose(1, 2)).transpose(1, 2).contiguous()
-
+        # Apply convolutions with skip connections for scattering path
+        x_scatter = scatter_linear.transpose(1, 2)  # (B, C, L)
+        
+        # First conv block
+        scatter_conv_1 = self.conv_scattering_1(x_scatter)
+        
+        # Second conv block with normalized skip connection
+        scatter_conv_2 = self.conv_scattering_2(scatter_conv_1)
+        skip_1_norm = self.scatter_skip_norm_1(scatter_conv_1)
+        scatter_conv_2 = scatter_conv_2 + skip_1_norm  # Normalized skip connection
+        
+        # Third conv block with normalized skip connection
+        scatter_conv_3 = self.conv_scattering_3(scatter_conv_2)
+        skip_2_norm = self.scatter_skip_norm_2(scatter_conv_2)
+        scatter_conv_3 = scatter_conv_3 + skip_2_norm  # Normalized skip connection
+        
+        scatter_conv = scatter_conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
         scatter_conv = self.scatter_fused_norm(scatter_conv)
-        del scatter_linear
+        del scatter_linear, x_scatter, scatter_conv_1, scatter_conv_2, scatter_conv_3
 
-        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
-        phase_conv = self.conv_phase(phase_linear.transpose(1, 2)).transpose(1, 2).contiguous()
-
+        # Apply convolutions with skip connections for phase path
+        x_phase = phase_linear.transpose(1, 2)  # (B, C, L)
+        
+        # First conv block
+        phase_conv_1 = self.conv_phase_1(x_phase)
+        
+        # Second conv block with normalized skip connection
+        phase_conv_2 = self.conv_phase_2(phase_conv_1)
+        skip_1_norm = self.phase_skip_norm_1(phase_conv_1)
+        phase_conv_2 = phase_conv_2 + skip_1_norm  # Normalized skip connection
+        
+        # Third conv block with normalized skip connection
+        phase_conv_3 = self.conv_phase_3(phase_conv_2)
+        skip_2_norm = self.phase_skip_norm_2(phase_conv_2)
+        phase_conv_3 = phase_conv_3 + skip_2_norm  # Normalized skip connection
+        
+        phase_conv = phase_conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
         phase_conv = self.phase_fused_norm(phase_conv)
-        del phase_linear
+        del phase_linear, x_phase, phase_conv_1, phase_conv_2, phase_conv_3
 
         combined = torch.cat([scatter_conv, phase_conv], dim=-1)
         del scatter_conv, phase_conv
@@ -588,16 +629,19 @@ class TargetEncoder(nn.Module):
         x = self.pre_output(x)
 
         mu = self.mu_layer(x)
-        logvar = self.logvar_layer(x)
+        prior_logvar = self.prior_logvar_layer(x)
+        conditioning_features = self.conditioning_layer(x)
 
-        logvar = torch.clamp(logvar, min=-10, max=10)
+        # Clamp only the prior logvar for numerical stability
+        prior_logvar = torch.clamp(prior_logvar, min=-10, max=10)
 
         if return_hidden:
             hidden_states["mu"] = mu
-            hidden_states["logvar"] = logvar
-            return mu, logvar, hidden_states
+            hidden_states["prior_logvar"] = prior_logvar
+            hidden_states["conditioning_features"] = conditioning_features
+            return mu, prior_logvar, conditioning_features, hidden_states
 
-        return mu, logvar
+        return mu, prior_logvar, conditioning_features
 
     def get_encoder_features(
         self, scattering_input: torch.Tensor, phase_harmonic_input: torch.Tensor
@@ -607,7 +651,7 @@ class TargetEncoder(nn.Module):
         Useful for analysis and visualization.
         """
         with torch.no_grad():
-            mu, _ = self.forward(scattering_input, phase_harmonic_input)
+            mu, _, _ = self.forward(scattering_input, phase_harmonic_input)
             return mu
 
 
@@ -657,12 +701,14 @@ class SourceEncoder(nn.Module):
             activation=nn.ReLU
             )
         
-        # Sequential convolutions for source encoder
-        self.conv = nn.Sequential(
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=3, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=5, dilation=1),
-            CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1),
-        )
+        # Sequential convolutions for source encoder with skip connections
+        self.conv_1 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=3, dilation=1)
+        self.conv_2 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=5, dilation=1)
+        self.conv_3 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1)
+        
+        # Skip connection normalization for source encoder
+        self.source_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
+        self.source_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
         
         self.fused_norm = nn.LayerNorm(32)
         self.lstm_norm = nn.LayerNorm(lstm_hidden_dim)
@@ -712,14 +758,30 @@ class SourceEncoder(nn.Module):
         
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
-        # SPEED OPTIMIZATION: Avoid double permutation - use contiguous for better performance
-        conv_out = self.conv(x_linear.transpose(1, 2)).transpose(1, 2).contiguous()
+        
+        # Apply convolutions with skip connections
+        x_conv = x_linear.transpose(1, 2)  # (B, C, L)
+        
+        # First conv block
+        conv_1 = self.conv_1(x_conv)
+        
+        # Second conv block with normalized skip connection
+        conv_2 = self.conv_2(conv_1)
+        skip_1_norm = self.source_skip_norm_1(conv_1)
+        conv_2 = conv_2 + skip_1_norm  # Normalized skip connection
+        
+        # Third conv block with normalized skip connection
+        conv_3 = self.conv_3(conv_2)
+        skip_2_norm = self.source_skip_norm_2(conv_2)
+        conv_3 = conv_3 + skip_2_norm  # Normalized skip connection
+        
+        conv_out = conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
         
         if return_intermediate:
             intermediates["conv_path"] = conv_out
 
         x = self.fused_norm(conv_out)
-        del x_linear, conv_out  # Explicit cleanup
+        del x_linear, x_conv, conv_1, conv_2, conv_3, conv_out  # Explicit cleanup
 
         x, (hidden, cell) = self.lstm(x)
         x = self.lstm_norm(x)
@@ -924,16 +986,27 @@ class Decoder(nn.Module):
         )
         )
 
-        self.conv = nn.Sequential(
-            MultiChannelConvBlock(in_channels=87, out_channels=77, filter_size=11, up_sampling=False),
-            MultiChannelConvBlock(in_channels=77, out_channels=66, filter_size=9, up_sampling=True),
-            MultiChannelConvBlock(in_channels=66, out_channels=55, filter_size=7, up_sampling=True),
-            MultiChannelConvBlock(in_channels=55, out_channels=44, filter_size=5, up_sampling=False),
-            MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=5, up_sampling=True),
-            MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True),
-            MultiChannelConvBlock(in_channels=22, out_channels=11, filter_size=3, up_sampling=False),
-            MultiChannelConvBlock(in_channels=11, out_channels=1, filter_size=3, up_sampling=False),
-        )
+        # Individual conv blocks for skip connections
+        self.conv_1 = MultiChannelConvBlock(in_channels=87, out_channels=77, filter_size=11, up_sampling=False)
+        self.conv_2 = MultiChannelConvBlock(in_channels=77, out_channels=66, filter_size=9, up_sampling=True)
+        self.conv_3 = MultiChannelConvBlock(in_channels=66, out_channels=55, filter_size=7, up_sampling=True)
+        self.conv_4 = MultiChannelConvBlock(in_channels=55, out_channels=44, filter_size=5, up_sampling=False)
+        self.conv_5 = MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=5, up_sampling=True)
+        self.conv_6 = MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True)
+        self.conv_7 = MultiChannelConvBlock(in_channels=22, out_channels=11, filter_size=3, up_sampling=False)
+        self.conv_8 = MultiChannelConvBlock(in_channels=11, out_channels=1, filter_size=3, up_sampling=False)
+        
+        # Skip connection projection layers for dimension matching
+        self.skip_proj_77_to_66 = nn.Conv1d(77, 66, kernel_size=1)  # For conv_1 -> conv_3
+        self.skip_proj_55_to_44 = nn.Conv1d(55, 44, kernel_size=1)  # For conv_3 -> conv_4
+        self.skip_proj_33_to_22 = nn.Conv1d(33, 22, kernel_size=1)  # For conv_5 -> conv_6
+        
+        # Normalization for decoder skip connections
+        self.decoder_skip_norm_77 = nn.GroupNorm(num_groups=min(8, 77), num_channels=77)
+        self.decoder_skip_norm_55 = nn.GroupNorm(num_groups=min(8, 55), num_channels=55)
+        self.decoder_skip_norm_33 = nn.GroupNorm(num_groups=min(8, 33), num_channels=33)
+        
+        # Note: No encoder-decoder skip connections to preserve TEB information bottleneck
         
         self.output_mu = ResidualMLP(
             input_dim=4800,
@@ -953,7 +1026,7 @@ class Decoder(nn.Module):
 
     def forward(self, latent_z: torch.Tensor):
         """
-        Forward pass that reconstructs the raw signal from latent variables.
+        Forward pass that reconstructs the raw signal from latent variables only.
         
         Args:
             latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=32)
@@ -972,8 +1045,39 @@ class Decoder(nn.Module):
         # Permute for convolution: (batch_size, channels, sequence_length)
         x = linear_output.transpose(1, 2)
         
-        # Apply convolution layers
-        x = self.conv(x)  # (batch_size, 1, upsampled_length)
+        # Apply convolution layers with skip connections (no encoder-decoder skips)
+        # Conv block 1: 87 -> 77
+        x1 = self.conv_1(x)
+        
+        # Conv block 2: 77 -> 66 (with upsampling)
+        x2 = self.conv_2(x1)
+        
+        # Conv block 3: 66 -> 55 (with upsampling) + skip from x1
+        x3 = self.conv_3(x2)
+        if x1.shape[-1] == x3.shape[-1]:  # Check if sequence lengths match after upsampling
+            skip_x1_norm = self.decoder_skip_norm_77(x1)
+            x3 = x3 + self.skip_proj_77_to_66(skip_x1_norm)  # Normalized skip connection with projection
+        
+        # Conv block 4: 55 -> 44 + skip from x3
+        x4 = self.conv_4(x3)
+        if x3.shape[-1] == x4.shape[-1]:  # Check if sequence lengths match
+            skip_x3_norm = self.decoder_skip_norm_55(x3)
+            x4 = x4 + self.skip_proj_55_to_44(skip_x3_norm)  # Normalized skip connection with projection
+        
+        # Conv block 5: 44 -> 33 (with upsampling)
+        x5 = self.conv_5(x4)
+        
+        # Conv block 6: 33 -> 22 (with upsampling) + skip from x5
+        x6 = self.conv_6(x5)
+        if x5.shape[-1] == x6.shape[-1]:  # Check if sequence lengths match after upsampling
+            skip_x5_norm = self.decoder_skip_norm_33(x5)
+            x6 = x6 + self.skip_proj_33_to_22(skip_x5_norm)  # Normalized skip connection with projection
+        
+        # Conv block 7: 22 -> 11
+        x7 = self.conv_7(x6)
+        
+        # Conv block 8: 11 -> 1
+        x = self.conv_8(x7)  # (batch_size, 1, upsampled_length)
         
         # Flatten for final prediction
         x = x.flatten(start_dim=1)  # (batch_size, flattened_features)
@@ -1094,7 +1198,7 @@ class SeqVaeTeb(nn.Module):
             dim_hy=latent_dim_target,
             dim_z=latent_dim_z,
         )
-        self.decoder = Decoder()
+        self.decoder = Decoder()  # No encoder features to preserve information bottleneck
 
         initialization(self)
 
@@ -1279,13 +1383,8 @@ class SeqVaeTeb(nn.Module):
         # Source encoder for q(h_x|x)
         mu_x = self.source_encoder(x_ph)
 
-        # Target encoder for p(z|y)
-        mu_y, logvar_y_full = self.target_encoder(y_st, y_ph)
-
-        # Split target logvar for prior and conditional feature
-        logvar_y_prior, c_logvar = torch.split(
-            logvar_y_full, self.latent_dim_target, dim=-1
-        )
+        # Target encoder for p(z|y) - now returns separate outputs for TEB compliance
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
 
         # Conditional encoder for q(z|x, y)
         mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
@@ -1293,7 +1392,7 @@ class SeqVaeTeb(nn.Module):
 
         z = self.reparameterize(mu_post, logvar_post)
 
-        # Decode raw signal predictions from z
+        # Decode raw signal predictions from z (no encoder features to preserve information bottleneck)
         linear_output, mu_pr, logvar_pr = self.decoder(z)
 
         return {
