@@ -304,7 +304,12 @@ class LossPlotCallback(Callback):
             "val/total_loss": [],
             "val/recon_loss": [],
             "val/mse_loss": [],
-            "val/nll_loss": []
+            "val/nll_loss": [],
+            # Hyperparameters
+            "hyperparams/beta": [],
+            "hyperparams/lr": [],
+            "hyperparams/alpha": [],
+            "hyperparams/gamma": []
         }
         
         # Add mode-specific metrics
@@ -359,6 +364,7 @@ class LossPlotCallback(Callback):
         # Check if it's time to plot the losses and only do so on the main process
         if (epoch + 1) % self.plot_frequency == 0 and trainer.is_global_zero:
             self.plot_losses()
+            self.plot_hyperparameters()
 
     def plot_losses(self):
         import os
@@ -401,6 +407,222 @@ class LossPlotCallback(Callback):
         logger.info(f"Loss plot saved to {plot_path}")
 
         # Clean up figure to free memory
+        del fig
+        gc.collect()
+
+    def plot_hyperparameters(self):
+        """Create a plot of hyperparameter evolution"""
+        import os
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import gc
+
+        if len(self.history["epoch"]) == 0:
+            return
+
+        # Check if we have hyperparameter data
+        has_beta = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/beta", []))
+        has_lr = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/lr", []))
+        has_alpha = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/alpha", []))
+        has_gamma = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/gamma", []))
+
+        if not (has_beta or has_lr or has_alpha or has_gamma):
+            logger.info("No hyperparameter data available for plotting")
+            return
+
+        # Create subplots for different hyperparameters
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Beta (KLD Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL Weight)'),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10
+        )
+
+        # Plot Beta if available
+        if has_beta:
+            fig.add_trace(
+                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/beta"],
+                          mode='lines+markers', name='Beta', line=dict(color='red', width=2)),
+                row=1, col=1
+            )
+
+        # Plot Learning Rate if available
+        if has_lr:
+            fig.add_trace(
+                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/lr"],
+                          mode='lines+markers', name='Learning Rate', line=dict(color='blue', width=2)),
+                row=1, col=2
+            )
+
+        # Plot Alpha if available
+        if has_alpha:
+            fig.add_trace(
+                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/alpha"],
+                          mode='lines+markers', name='Alpha', line=dict(color='green', width=2)),
+                row=2, col=1
+            )
+
+        # Plot Gamma if available
+        if has_gamma:
+            fig.add_trace(
+                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/gamma"],
+                          mode='lines+markers', name='Gamma', line=dict(color='orange', width=2)),
+                row=2, col=2
+            )
+
+        # Update layout
+        fig.update_layout(
+            title="Training Hyperparameters Evolution",
+            showlegend=False,
+            template="plotly_white",
+            height=600
+        )
+
+        # Update axes labels
+        fig.update_xaxes(title_text="Epoch", row=1, col=1)
+        fig.update_xaxes(title_text="Epoch", row=1, col=2)
+        fig.update_xaxes(title_text="Epoch", row=2, col=1)
+        fig.update_xaxes(title_text="Epoch", row=2, col=2)
+
+        fig.update_yaxes(title_text="Beta Value", row=1, col=1)
+        fig.update_yaxes(title_text="Learning Rate", row=1, col=2, type="log")
+        fig.update_yaxes(title_text="Alpha Value", row=2, col=1)
+        fig.update_yaxes(title_text="Gamma Value", row=2, col=2)
+
+        # Save the figure
+        plot_path = os.path.join(self.output_dir, "hyperparameters_evolution.html")
+        fig.write_html(plot_path)
+        logger.info(f"Hyperparameters plot saved to {plot_path}")
+
+        # Clean up
+        del fig
+        gc.collect()
+
+
+class HyperparameterLoggingCallback(Callback):
+    """
+    Callback to track and log hyperparameters like beta, learning rate, alpha, gamma, etc.
+    """
+    def __init__(self):
+        super().__init__()
+        self.history = {
+            "epoch": [],
+            "beta": [],
+            "lr": [],
+            "alpha": [],
+            "gamma": [],
+            "dataset_size": []
+        }
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        """Log hyperparameters at the start of each epoch"""
+        if trainer.is_global_zero:  # Only log on main process for multi-GPU
+            epoch = trainer.current_epoch
+            
+            # Get current beta value (always calculate fresh to reflect any config changes)
+            beta = pl_module._calculate_beta()
+            
+            # Get current learning rate
+            lr = 0.0
+            try:
+                if hasattr(trainer, 'optimizers') and trainer.optimizers:
+                    optimizer = trainer.optimizers[0] if isinstance(trainer.optimizers, list) else trainer.optimizers
+                    lr = optimizer.param_groups[0]['lr']
+            except (IndexError, AttributeError):
+                pass
+            
+            # Get other hyperparameters
+            alpha = getattr(pl_module.hparams, 'alpha', 1.0)
+            gamma = getattr(pl_module.hparams, 'gamma', 1.0)
+            dataset_size = getattr(pl_module.hparams, 'dataset_size', 10000)
+            
+            # Store in history
+            self.history["epoch"].append(epoch)
+            self.history["beta"].append(beta)
+            self.history["lr"].append(lr)
+            self.history["alpha"].append(alpha)
+            self.history["gamma"].append(gamma)
+            self.history["dataset_size"].append(dataset_size)
+            
+            # Log to trainer for tensorboard/wandb
+            pl_module.log('hyperparams/beta', beta, on_epoch=True, logger=True)
+            pl_module.log('hyperparams/lr', lr, on_epoch=True, logger=True)
+            pl_module.log('hyperparams/alpha', alpha, on_epoch=True, logger=True)
+            pl_module.log('hyperparams/gamma', gamma, on_epoch=True, logger=True)
+            
+            logger.info(f"Epoch {epoch}: β={beta:.4f}, lr={lr:.6f}, α={alpha:.2f}, γ={gamma:.2f}")
+
+    def plot_hyperparameters(self, output_dir):
+        """Create a plot of hyperparameter evolution"""
+        import os
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import gc
+
+        if len(self.history["epoch"]) == 0:
+            return
+
+        # Create subplots for different hyperparameters
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Beta (KLD Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL Weight)'),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10
+        )
+
+        # Plot Beta
+        fig.add_trace(
+            go.Scatter(x=self.history["epoch"], y=self.history["beta"],
+                      mode='lines+markers', name='Beta', line=dict(color='red', width=2)),
+            row=1, col=1
+        )
+
+        # Plot Learning Rate
+        fig.add_trace(
+            go.Scatter(x=self.history["epoch"], y=self.history["lr"],
+                      mode='lines+markers', name='Learning Rate', line=dict(color='blue', width=2)),
+            row=1, col=2
+        )
+
+        # Plot Alpha
+        fig.add_trace(
+            go.Scatter(x=self.history["epoch"], y=self.history["alpha"],
+                      mode='lines+markers', name='Alpha', line=dict(color='green', width=2)),
+            row=2, col=1
+        )
+
+        # Plot Gamma
+        fig.add_trace(
+            go.Scatter(x=self.history["epoch"], y=self.history["gamma"],
+                      mode='lines+markers', name='Gamma', line=dict(color='orange', width=2)),
+            row=2, col=2
+        )
+
+        # Update layout
+        fig.update_layout(
+            title="Training Hyperparameters Evolution",
+            showlegend=False,
+            template="plotly_white",
+            height=600
+        )
+
+        # Update axes labels
+        fig.update_xaxes(title_text="Epoch", row=1, col=1)
+        fig.update_xaxes(title_text="Epoch", row=1, col=2)
+        fig.update_xaxes(title_text="Epoch", row=2, col=1)
+        fig.update_xaxes(title_text="Epoch", row=2, col=2)
+
+        fig.update_yaxes(title_text="Beta Value", row=1, col=1)
+        fig.update_yaxes(title_text="Learning Rate", row=1, col=2, type="log")
+        fig.update_yaxes(title_text="Alpha Value", row=2, col=1)
+        fig.update_yaxes(title_text="Gamma Value", row=2, col=2)
+
+        # Save the figure
+        plot_path = os.path.join(output_dir, "hyperparameters_evolution.html")
+        fig.write_html(plot_path)
+        logger.info(f"Hyperparameters plot saved to {plot_path}")
+
+        # Clean up
         del fig
         gc.collect()
 
