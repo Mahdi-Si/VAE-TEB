@@ -352,34 +352,31 @@ class SeqVAEGraphModel:
             )
 
             try:
+                # Load from checkpoint but override ALL hyperparameters with current config values
                 self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
                     self.base_model_checkpoint,
                     seqvae_teb_model=base_model_for_loading,
-                    strict=False 
+                    strict=False,
+                    # Override hyperparameters directly during loading
+                    lr=self.lr,
+                    lr_milestones=self.lr_milestones,
+                    beta_schedule=self.beta_schedule,
+                    beta_start=self.beta_start,
+                    beta_end=self.beta_end,
+                    beta_anneal_epochs=self.beta_anneal_epochs,
+                    beta_cycle_len=self.beta_cycle_len,
+                    beta_const_val=self.beta_const_val,
+                    use_tcvae=self.use_tcvae,
+                    alpha=self.alpha,
+                    gamma=self.gamma,
+                    dataset_size=getattr(self, 'dataset_size', self.dataset_size)
                 )
-                # Override hyperparameters from current config (allow changing values when resuming)
-                try:
-                    # Override learning rate and scheduler parameters
-                    self.lightning_base_model.hparams.lr = self.lr
-                    self.lightning_base_model.hparams.lr_milestones = self.lr_milestones
-                    logger.info(f"Updated learning rate to {self.lr} from config")
-                    
-                    # Override beta scheduling parameters
-                    self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
-                    self.lightning_base_model.hparams.beta_start = self.beta_start
-                    self.lightning_base_model.hparams.beta_end = self.beta_end
-                    self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
-                    self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
-                    self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                    
-                    # Override β-TCVAE parameters
-                    self.lightning_base_model.hparams.use_tcvae = self.use_tcvae
-                    self.lightning_base_model.hparams.alpha = self.alpha
-                    self.lightning_base_model.hparams.gamma = self.gamma
-                    self.lightning_base_model.hparams.dataset_size = getattr(self, 'dataset_size', self.dataset_size)
-                    logger.info("Updated beta scheduling and β-TCVAE parameters from config")
-                except Exception as e:
-                    logger.warning(f"Failed to override some hyperparameters: {e}")
+                logger.info(f"Loaded checkpoint with NEW hyperparameters from config:")
+                logger.info(f"  lr: {self.lr}")
+                logger.info(f"  beta_schedule: {self.beta_schedule}")
+                logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
+                logger.info(f"  beta_anneal_epochs: {self.beta_anneal_epochs}")
+                logger.info(f"  use_tcvae: {self.use_tcvae}, alpha: {self.alpha}, gamma: {self.gamma}")
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
@@ -477,6 +474,7 @@ class SeqVAEGraphModel:
         )
 
         self.metrics_callback = MetricsLoggingCallback()
+        self.hyperparameter_callback = HyperparameterLoggingCallback()
 
         # Optimized memory monitoring for smaller batch sizes - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
         # self.memory_monitor_callback = MemoryMonitorCallback(
@@ -536,6 +534,7 @@ class SeqVAEGraphModel:
             self.plotting_callback,
             self.checkpoint_callback,
             self.loss_plot_callback,
+            self.hyperparameter_callback,
             # self.early_stop_callback,
         ]
 
@@ -652,6 +651,18 @@ class SeqVAEGraphModel:
             pickle.dump(training_hist, f)
         
         logger.info(f"Training history saved to {path_save_hist}")
+        
+        # Save hyperparameter history
+        hyperparameter_hist = self.hyperparameter_callback.history
+        path_save_hyperparams = os.path.join(self.train_results_dir, 'hyperparameter_history.pkl')
+        with open(path_save_hyperparams, 'wb') as f:
+            pickle.dump(hyperparameter_hist, f)
+        
+        logger.info(f"Hyperparameter history saved to {path_save_hyperparams}")
+        
+        # Generate final hyperparameter plot
+        if trainer.is_global_zero:
+            self.hyperparameter_callback.plot_hyperparameters(self.train_results_dir)
 
         # Final cleanup
         if torch.cuda.is_available():

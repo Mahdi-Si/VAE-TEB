@@ -412,29 +412,16 @@ class TargetEncoder(nn.Module):
     phase harmonic features (y_ph). These are processed through parallel MLP and causal convolution
     stacks, fused, and then passed through an LSTM to produce the final representations.
 
-    The encoder outputs the mean (μ_y) and a composite log-variance vector. This vector is
-    later split into the log-variance for the prior (log(σ^2_y)) and a conditioning
-    feature (c_y) used by the ConditionalEncoder.
+    The encoder outputs the mean and a composite log-variance vector. This vector is
+    later split into the log-variance for the prior and a conditioning
+    feature used by the ConditionalEncoder.
 
     **Mathematical Formulation:**
-
-    The encoder models the prior distribution over the latent variable z, conditioned on y:
-    $$ p(\mathbf{z}_t | \mathbf{y}_t) = \mathcal{N}(\mathbf{z}_t | \boldsymbol{\mu}^{y}_t, \text{diag}(\boldsymbol{\sigma}^{2,y}_t)) $$
-
-    The encoder function f_t maps the input features to the parameters of this distribution:
-    $$ (\boldsymbol{\mu}^{y}_t, [\log\boldsymbol{\sigma}^{2,y}_t, \mathbf{c}_t]) = f_t(\mathbf{y}^{st}_t, \mathbf{y}^{ph}_t) $$
-
-    where:
-    -  **y_st_t**: Scattering transform features of the target signal at time t.
-    -  **y_ph_t**: Phase harmonic features of the target signal at time t.
-    -  **μ_y_t**: The mean of the prior distribution.
-    -  **log(o^2_y_t)**: The log-variance of the prior distribution.
-    -  **c_t**: A conditioning feature passed to the ConditionalEncoder.
     """
     def __init__(
         self,
         sequence_length: int = 300,
-        latent_dim: int = 32,
+        latent_dim: int = 16,
         lstm_hidden_dim: int = 64,
         lstm_num_layers: int = 4,
         use_bidirectional_lstm: bool = False,
@@ -664,15 +651,6 @@ class SourceEncoder(nn.Module):
     The output is a deterministic vector, which is used to condition the posterior distribution.
     In the code, this output is named `mu_x` for consistency, but it is not the mean of a
     distribution.
-
-    **Mathematical Formulation:**
-
-    The encoder function f_s maps the source features x_t to a deterministic representation h^x_t:
-    $$ \mathbf{h}^x_t = f_s(\mathbf{x}_t) $$
-
-    where:
-    - **x_t**: Source signal features at time t.
-    - **h^x_t**: The deterministic latent representation of the source signal.
     """
 
     def __init__(
@@ -833,24 +811,6 @@ class ConditionalEncoder(nn.Module):
     the source signal (x) and the target signal (y). It takes the latent representation of the
     source (h_x) and a conditioning feature from the target (c_y) as input. It outputs the
     parameters of the posterior distribution, which is a diagonal Gaussian.
-
-    **Mathematical Formulation:**
-
-    The posterior distribution is defined as:
-    $$ q(\mathbf{z}_t | \mathbf{x}_t, \mathbf{y}_t) = \mathcal{N}(\mathbf{z}_t | \boldsymbol{\mu}^{post}_t, \text{diag}(\boldsymbol{\sigma}^{2,post}_t)) $$
-
-    The encoder function f_c computes the parameters of this distribution from the combined
-    latent representations:
-    $$ (\tilde{\boldsymbol{\mu}}^{post}_t, \log\boldsymbol{\sigma}^{2,post}_t) = f_c([\mathbf{h}^x_t, \mathbf{c}_t]) $$
-
-    The final posterior mean is shifted by the prior mean to center it:
-    $$ \boldsymbol{\mu}^{post}_t = \tilde{\boldsymbol{\mu}}^{post}_t + \boldsymbol{\mu}^{y}_t $$
-
-    where:
-    - **h^x_t**: Latent representation from the SourceEncoder.
-    - **c_t**: Conditioning feature from the TargetEncoder.
-    - **μ^post_t**: The mean of the posterior distribution.
-    - **log(σ^2_post_t)**: The log-variance of the posterior distribution.
     """
 
     def __init__(self, dim_hx: int, dim_hy: int, dim_z: int):
@@ -933,20 +893,6 @@ class Decoder(nn.Module):
         loss to stabilize training.
     2.  **Raw Signal Reconstruction**: It upsamples the latent sequence and predicts the mean 
         and log-variance of the raw FHR signal over a fixed window.
-
-    **Mathematical Formulation:**
-
-    The decoder models the likelihood of the raw signal given the latent sequence:
-    $$ p(\mathbf{r} | \mathbf{z}_{1:T}) = \mathcal{N}(\mathbf{r} | \boldsymbol{\mu}^{raw}, \text{diag}(\boldsymbol{\sigma}^{2,raw})) $$
-
-    The decoder function f_d maps the latent sequence to the reconstruction outputs:
-    $$ (\widehat{\mathbf{y}}_{1:T}, \boldsymbol{\mu}^{raw}, \log\boldsymbol{\sigma}^{2,raw}) = f_d(\mathbf{z}_{1:T}) $$
-
-    where:
-    - **z_{1:T}**: The full latent sequence.
-    - **ŷ_{1:T}**: The reconstructed auxiliary features.
-    - **μ^raw**: The mean of the reconstructed raw signal.
-    - **log(σ^2_raw)**: The log-variance of the reconstructed raw signal.
     """
 
     def __init__(
@@ -1153,18 +1099,6 @@ class SeqVaeTeb(nn.Module):
     - **TargetEncoder**: Encodes the target signal `y` into the parameters of the prior `p(z|y)`.
     - **ConditionalEncoder**: Combines `h_x` and a feature from `y` to define the posterior `q(z|x,y)`.
     - **Decoder**: Reconstructs the target signal from samples of the latent variable `z`.
-
-    **Mathematical Formulation:**
-
-    The model is trained by maximizing the Evidence Lower Bound (ELBO), which is equivalent
-    to minimizing the following loss function:
-
-    $$ \mathcal{L}_{\text{total}} = \mathbb{E}_{q(\mathbf{z}|\mathbf{x},\mathbf{y})}[-\log p(\mathbf{r}|\mathbf{z})] + \beta \cdot \text{KL}[q(\mathbf{z}|\mathbf{x},\mathbf{y}) || p(\mathbf{z}|\mathbf{y})] $$
-
-    where:
-    - The first term is the reconstruction loss (NLL of the raw signal + MSE of auxiliary features).
-    - The second term is the KL divergence, which acts as a proxy for transfer entropy.
-    - β is a hyperparameter that controls the strength of the information bottleneck.
     """
 
     def __init__(
@@ -1242,12 +1176,7 @@ class SeqVaeTeb(nn.Module):
 
     def compute_tc_loss(self, z, mu, logvar, dataset_size):
         """
-        Computes the β-TCVAE loss components using Minibatch Weighted Sampling.
-        
-        Mathematical Foundation:
-        - I_q(z;n) = E[log q(z|x,y) - log q(z)]
-        - TC(z) = E[log q(z) - log ∏_j q(z_j)]  
-        - DW_KL = E[log ∏_j q(z_j) - log p(z)]
+        Computes the B-TCVAE loss components using Minibatch Weighted Sampling.
 
         Args:
             z (torch.Tensor): Latent samples from the posterior. Shape: (batch_size, seq_len, latent_dim)
