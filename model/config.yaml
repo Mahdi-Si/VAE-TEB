@@ -28,7 +28,7 @@ model_config:
     zero_source: True
     
     # Beta scheduling configuration for annealing
-    beta_schedule: linear  # Options: 'constant', 'linear', 'cyclic'
+    beta_schedule: constant  # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0        # Starting beta value for annealing
     beta_end: 6.0          # Final beta value (recommended for β-TCVAE)
     beta_anneal_epochs: 50 # Number of epochs for linear annealing

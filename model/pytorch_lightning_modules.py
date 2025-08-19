@@ -849,18 +849,18 @@ class LightSeqVaeTeb(L.LightningModule):
         )
 
         if self.hparams.lr_milestones:
-            # Use cosine annealing with restarts for better convergence
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            # Use simple milestone-based learning rate scheduler
+            from torch.optim.lr_scheduler import MultiStepLR
+            scheduler = MultiStepLR(
                 optimizer,
-                T_0=max(self.hparams.lr_milestones) // 4,  # Restart every quarter of training
-                T_mult=1,
-                eta_min=self.hparams.lr * 0.01  # Minimum LR is 1% of initial
+                milestones=self.hparams.lr_milestones,
+                gamma=0.1  # Decay factor at each milestone
             )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "interval": "step",  # Step-wise for smoother updates
+                    "interval": "epoch",  # Epoch-wise for milestone scheduling
                     "frequency": 1,
                 },
             }
