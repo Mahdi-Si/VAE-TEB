@@ -402,11 +402,13 @@ class SeqVAEGraphModel:
             )
             
             # SPEED OPTIMIZATION: Compile model for faster execution (PyTorch 2.0+)
-            try:
-                self.base_model = torch.compile(self.base_model, mode='max-autotune')
-                logger.info("Model successfully compiled with torch.compile for maximum speed")
-            except Exception as e:
-                logger.warning(f"torch.compile failed, proceeding without compilation: {e}")
+            # Disabled due to CUDA Graphs tensor overwriting issues
+            # try:
+            #     self.base_model = torch.compile(self.base_model, mode='max-autotune')
+            #     logger.info("Model successfully compiled with torch.compile for maximum speed")
+            # except Exception as e:
+            #     logger.warning(f"torch.compile failed, proceeding without compilation: {e}")
+            logger.info("torch.compile disabled to avoid CUDA Graphs tensor overwriting issues")
             
             self.lightning_base_model = LightSeqVaeTeb(
                 seqvae_teb_model=self.base_model,
