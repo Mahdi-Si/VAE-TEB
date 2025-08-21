@@ -1018,7 +1018,7 @@ class Decoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 32,
+        latent_dim: int = 16,
         sequence_length: int = 300,
         target_length: int = 4800,
     ):
@@ -1038,20 +1038,28 @@ class Decoder(nn.Module):
         # Force all information through 32D latent space - no shortcuts!
         self.feature_expansion = nn.Sequential(
             ResidualMLP(
-            input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, 50, 5),
-            final_activation=True,
-            use_skip_connection=True, 
-            activation=nn.ReLU,
+                input_dim=latent_dim,
+                hidden_dims=geometric_schedule(latent_dim, 50, 5),
+                final_activation=True,
+                use_skip_connection=True, 
+                activation=nn.ReLU,
             ),
             
             ResidualMLP(
-            input_dim=50,
-            hidden_dims=geometric_schedule(50, 87, 5),
-            final_activation=True,
+                input_dim=50,
+                hidden_dims=geometric_schedule(50, 87, 5),
+                final_activation=True,
+                activation=nn.ReLU,
+                use_skip_connection=True
+            )
+        )
+        
+        self.pre_linear = ResidualMLP(
+            input_dim=87,
+            hidden_dims=(87, 128, 3), 
+            final_activation=False,
             activation=nn.ReLU,
             use_skip_connection=True
-            )
         )
         
         # Stage 2: Progressive temporal upsampling with ConvTranspose1d
@@ -1095,7 +1103,8 @@ class Decoder(nn.Module):
             - raw_signal_logvar: Raw signal reconstruction log variance (batch_size, 4800)
         """
         z_expanded = self.feature_expansion(latent_z)  # (B, 300, 128)
-        z_conv = z_expanded.transpose(1, 2)  # (B, 128, 300) for conv operations
+        z_expanded_pre = self.pre_linear(z_expanded)
+        z_conv = z_expanded_pre.transpose(1, 2)  # (B, 128, 300) for conv operations
         
         # Stage 2: Progressive temporal upsampling
         # Each step doubles the temporal resolution while reducing channels
@@ -1188,9 +1197,9 @@ class SeqVaeTeb(nn.Module):
     def __init__(
         self,
         sequence_length: int = 300,
-        latent_dim_source: int = 32,
-        latent_dim_target: int = 32,
-        latent_dim_z: int = 32,
+        latent_dim_source: int = 16,
+        latent_dim_target: int = 16,
+        latent_dim_z: int = 16,
         decimation_factor: int = 16,
         warmup_period: int = 30,
     ):
