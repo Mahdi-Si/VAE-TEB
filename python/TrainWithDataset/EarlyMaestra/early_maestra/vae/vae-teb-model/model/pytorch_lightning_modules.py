@@ -437,7 +437,7 @@ class LossPlotCallback(Callback):
         # Create subplots for different hyperparameters
         fig = make_subplots(
             rows=2, cols=2,
-            subplot_titles=('Beta (KLD Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL Weight)'),
+            subplot_titles=('Beta (TC Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL/TC Weight)'),
             vertical_spacing=0.12,
             horizontal_spacing=0.10
         )
@@ -569,7 +569,7 @@ class HyperparameterLoggingCallback(Callback):
         # Create subplots for different hyperparameters
         fig = make_subplots(
             rows=2, cols=2,
-            subplot_titles=('Beta (KLD Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL Weight)'),
+            subplot_titles=('Beta (TC Weight)', 'Learning Rate', 'Alpha (MI Weight)', 'Gamma (DW-KL/TC Weight)'),
             vertical_spacing=0.12,
             horizontal_spacing=0.10
         )
