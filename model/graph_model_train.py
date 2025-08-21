@@ -252,8 +252,9 @@ class SeqVAEGraphModel:
         
         # β-TCVAE specific configuration
         self.use_tcvae = vae_cfg.get('use_tcvae', True)
+        self.use_hybrid_tcvae = vae_cfg.get('use_hybrid_tcvae', False)  # New Hybrid β-TCVAE option
         self.alpha = float(vae_cfg.get('alpha', 1.0))  # Index-Code MI weight
-        self.gamma = float(vae_cfg.get('gamma', 1.0))  # Dimension-wise KL weight
+        self.gamma = float(vae_cfg.get('gamma', 1.0))  # Dimension-wise KL weight or TC weight for hybrid
         self.dataset_size = int(vae_cfg.get('dataset_size', 10000))  # Will be updated from actual data
         self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
 
@@ -367,6 +368,7 @@ class SeqVAEGraphModel:
                     beta_cycle_len=self.beta_cycle_len,
                     beta_const_val=self.beta_const_val,
                     use_tcvae=self.use_tcvae,
+                    use_hybrid_tcvae=self.use_hybrid_tcvae,
                     alpha=self.alpha,
                     gamma=self.gamma,
                     dataset_size=getattr(self, 'dataset_size', self.dataset_size)
@@ -376,7 +378,7 @@ class SeqVAEGraphModel:
                 logger.info(f"  beta_schedule: {self.beta_schedule}")
                 logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
                 logger.info(f"  beta_anneal_epochs: {self.beta_anneal_epochs}")
-                logger.info(f"  use_tcvae: {self.use_tcvae}, alpha: {self.alpha}, gamma: {self.gamma}")
+                logger.info(f"  use_tcvae: {self.use_tcvae}, use_hybrid_tcvae: {self.use_hybrid_tcvae}, alpha: {self.alpha}, gamma: {self.gamma}")
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
@@ -418,6 +420,7 @@ class SeqVAEGraphModel:
                 beta_const_val=self.beta_const_val,
                 # β-TCVAE parameters
                 use_tcvae=self.use_tcvae,
+                use_hybrid_tcvae=self.use_hybrid_tcvae,
                 alpha=self.alpha,
                 gamma=self.gamma,
                 dataset_size=getattr(self, 'dataset_size', self.dataset_size)

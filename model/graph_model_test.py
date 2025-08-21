@@ -231,7 +231,14 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
 
                     # Compute loss the same way as training to get consistent KLD values
                     loss_dict = self.pytorch_model.compute_loss(
-                        forward_outputs, y_st, y_ph, y_raw, compute_kld_loss=True, beta=self.kld_beta_)
+                        forward_outputs, y_st, y_ph, y_raw, 
+                        compute_kld_loss=True, 
+                        beta=self.kld_beta_,
+                        use_tcvae=self.use_tcvae,
+                        use_hybrid_tcvae=self.use_hybrid_tcvae,
+                        alpha=self.alpha,
+                        gamma=self.gamma,
+                        dataset_size=self.dataset_size)
                     
                     # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
