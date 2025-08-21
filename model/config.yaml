@@ -34,7 +34,7 @@ model_config:
     beta_end: 6.0              # Final beta value (β-TCVAE recommendation)
     beta_anneal_epochs: 50     # Number of epochs for linear annealing
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
-    beta_const_val: 1.0        # Constant beta value when schedule='constant'
+    beta_const_val: 2.0        # Constant beta value when schedule='constant'
     kld_beta: 1.0              # Fallback beta value (legacy parameter)
     
     # Three-Mode Training Configuration
@@ -61,12 +61,12 @@ model_config:
     # - Balanced transfer entropy measurement + disentanglement
     # - Computational cost: O(BTD) + O(B²T²D)
     
-    use_tcvae: false           # Enable Full β-TCVAE (Approach 1)
-    use_hybrid_tcvae: true     # Enable Hybrid β-TCVAE (Approach 2: TEB + TC)
+    use_tcvae: true            # Enable Full β-TCVAE (Approach 1)
+    use_hybrid_tcvae: false    # Enable Hybrid β-TCVAE (Approach 2: TEB + TC)
     
     # Hyperparameter Weights
     alpha: 1.0                 # Index-Code MI weight (Full β-TCVAE only)
-    gamma: 2.0                 # TC weight (Hybrid) or DW-KL weight (Full β-TCVAE)
+    gamma: 1.0                 # DW-KL weight (Full β-TCVAE) or TC weight (Hybrid)
     dataset_size: 10000        # Dataset size estimate (auto-updated from actual data)
 
   seqvae_checkpoint: null
