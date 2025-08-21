@@ -327,10 +327,14 @@ class LossPlotCallback(Callback):
             }
             self.history.update(tcvae_metrics)
         else:
-            # Standard TEB metrics
+            # Standard TEB and Hybrid β-TCVAE metrics
             teb_metrics = {
                 "train/kld_loss": [],
-                "val/kld_loss": []
+                "val/kld_loss": [],
+                "train/tc_loss": [],
+                "val/tc_loss": [],
+                "train/regularization_loss": [],
+                "val/regularization_loss": []
             }
             self.history.update(teb_metrics)
 
@@ -666,6 +670,7 @@ class LightSeqVaeTeb(L.LightningModule):
         beta_const_val: float = 1.0,
         # β-TCVAE specific parameters
         use_tcvae: bool = True,
+        use_hybrid_tcvae: bool = False,
         alpha: float = 1.0,
         gamma: float = 1.0,
         dataset_size: int = 10000
@@ -682,8 +687,9 @@ class LightSeqVaeTeb(L.LightningModule):
             beta_cycle_len: Length of a cycle for cyclic annealing.
             beta_const_val: Constant value for beta if schedule is 'constant'.
             use_tcvae: Whether to use β-TCVAE decomposed loss instead of standard TEB.
+            use_hybrid_tcvae: Whether to use Hybrid β-TCVAE (TEB + TC penalty).
             alpha: Weight for Index-Code MI term in β-TCVAE.
-            gamma: Weight for Dimension-wise KL term in β-TCVAE.
+            gamma: Weight for Dimension-wise KL term in β-TCVAE or TC term in Hybrid mode.
             dataset_size: Total dataset size for MWS computation.
         """
         super().__init__()
@@ -742,8 +748,22 @@ class LightSeqVaeTeb(L.LightningModule):
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         # Choose loss computation based on mode
-        if self.hparams.use_tcvae:
-            # β-TCVAE decomposed loss
+        if self.hparams.use_hybrid_tcvae:
+            # Hybrid β-TCVAE loss (TEB + TC penalty)
+            loss_dict = self.model.compute_loss(
+                forward_outputs=forward_outputs,
+                y_st=y_st,
+                y_ph=y_ph,
+                y_raw=y_raw,
+                compute_kld_loss=True,
+                use_tcvae=False,
+                use_hybrid_tcvae=True,
+                beta=self.hparams.beta,
+                gamma=self.hparams.gamma,
+                dataset_size=self.hparams.dataset_size
+            )
+        elif self.hparams.use_tcvae:
+            # Full β-TCVAE decomposed loss
             loss_dict = self.model.compute_loss(
                 forward_outputs=forward_outputs,
                 y_st=y_st,
@@ -751,6 +771,7 @@ class LightSeqVaeTeb(L.LightningModule):
                 y_raw=y_raw,
                 compute_kld_loss=True,
                 use_tcvae=True,
+                use_hybrid_tcvae=False,
                 alpha=self.hparams.alpha,
                 beta=self.hparams.beta,
                 gamma=self.hparams.gamma,
@@ -765,6 +786,7 @@ class LightSeqVaeTeb(L.LightningModule):
                 y_raw=y_raw,
                 compute_kld_loss=True,
                 use_tcvae=False,
+                use_hybrid_tcvae=False,
                 beta=self.hparams.beta
             )
 
@@ -782,8 +804,15 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         
         # Log appropriate KL-related metrics based on training mode
-        if self.hparams.use_tcvae:
-            # β-TCVAE specific metrics
+        if self.hparams.use_hybrid_tcvae:
+            # Hybrid β-TCVAE specific metrics
+            self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/tc_loss', loss_dict['tc_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/regularization_loss', loss_dict['regularization_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+            # Log hyperparameters for monitoring
+            self.log('train/gamma', self.hparams.gamma, on_epoch=True, prog_bar=False, logger=True)
+        elif self.hparams.use_tcvae:
+            # Full β-TCVAE specific metrics
             self.log('train/mi_loss', loss_dict['mi_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
             self.log('train/tc_loss', loss_dict['tc_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
             self.log('train/dw_kl_loss', loss_dict['dw_kl_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -812,8 +841,13 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=True, logger=True)
         
         # Log appropriate KL-related metrics based on training mode
-        if self.hparams.use_tcvae:
-            # β-TCVAE specific metrics
+        if self.hparams.use_hybrid_tcvae:
+            # Hybrid β-TCVAE specific metrics
+            self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/tc_loss', loss_dict['tc_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/regularization_loss', loss_dict['regularization_loss'], on_epoch=True, prog_bar=False, logger=True)
+        elif self.hparams.use_tcvae:
+            # Full β-TCVAE specific metrics
             self.log('val/mi_loss', loss_dict['mi_loss'], on_epoch=True, prog_bar=True, logger=True)
             self.log('val/tc_loss', loss_dict['tc_loss'], on_epoch=True, prog_bar=True, logger=True)
             self.log('val/dw_kl_loss', loss_dict['dw_kl_loss'], on_epoch=True, prog_bar=True, logger=True)
