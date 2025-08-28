@@ -565,7 +565,7 @@ class SourceEncoder(nn.Module):
         self.lstm_num_layers = lstm_num_layers
 
         self.mlp = ResidualMLP(
-            input_dim=input_channels,
+            input_dim=130,
             hidden_dims=geometric_schedule(130, 32, 5),
             final_activation=False,
             use_skip_connection=True,
@@ -629,7 +629,6 @@ class SourceEncoder(nn.Module):
 
         if return_intermediate:
             intermediates["input_with_bias"] = x
-
         x_linear = self.mlp(x)
         
         if return_intermediate:
