@@ -248,6 +248,84 @@ class MultiChannelConvBlock(nn.Module):
 
 
 
+class ChannelReductionBlock(nn.Module):
+    """
+    Efficient channel reduction block for reducing input dimensionality.
+    Uses depthwise separable convolutions and learns optimal channel combinations.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        use_attention: bool = True,
+    ):
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.use_attention = use_attention
+        
+        # Channel attention for learning which channels are most important
+        if use_attention:
+            self.channel_attention = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1),
+                nn.Conv1d(in_channels, in_channels // 4, 1),
+                nn.ReLU(),
+                nn.Conv1d(in_channels // 4, in_channels, 1),
+                nn.Sigmoid()
+            )
+        
+        # Depthwise separable convolution for efficient processing
+        self.depthwise = CausalConv1d(
+            in_channels, in_channels, kernel_size, groups=in_channels
+        )
+        
+        # Pointwise convolution for channel reduction
+        self.pointwise = nn.Conv1d(in_channels, out_channels, 1)
+        
+        # Normalization and activation
+        self.norm1 = nn.LayerNorm(in_channels)
+        self.norm2 = nn.LayerNorm(out_channels)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, in_channels)
+        Returns:
+            Reduced tensor (batch_size, seq_len, out_channels)
+        """
+        # Apply layer norm first
+        x_norm = self.norm1(x)
+        
+        # Convert to channel-first for convolutions
+        x_conv = x_norm.transpose(1, 2)  # (B, C, L)
+        
+        # Apply channel attention if enabled
+        if self.use_attention:
+            attention = self.channel_attention(x_conv)
+            x_conv = x_conv * attention
+        
+        # Depthwise convolution
+        x_conv = self.depthwise(x_conv)
+        
+        # Pointwise convolution for channel reduction
+        x_conv = self.pointwise(x_conv)
+        
+        # Convert back to sequence-first
+        x_out = x_conv.transpose(1, 2)  # (B, L, C_out)
+        
+        # Apply final normalization and dropout
+        x_out = self.norm2(x_out)
+        x_out = F.gelu(x_out)
+        x_out = self.dropout(x_out)
+        
+        return x_out
+
+
 class ResidualMLP(nn.Module):
     def __init__(
         self, input_dim, hidden_dims=(72, 68, 64), final_activation=True, activation=nn.ReLU, use_skip_connection=True
@@ -351,14 +429,16 @@ class TargetEncoder(nn.Module):
 
         self.activation = activation
         
-        self.mlp_scattering = ResidualMLP(
+        self.mlp_scattering = nn.Sequential(
+            ResidualMLP(
                 input_dim=43,
                 hidden_dims=geometric_schedule(43, 16, 4),
                 final_activation=False,
                 use_skip_connection=True,
                 activation=nn.ReLU
                 )
-
+        )
+        
         self.mlp_phase = ResidualMLP(
             input_dim=44,
             hidden_dims=geometric_schedule(44, 16, 4),
@@ -765,6 +845,174 @@ class ConditionalEncoder(nn.Module):
         return mu, logvar
 
 
+class DecodeOld(nn.Module):
+    """
+    Reconstructs the raw target signal and auxiliary features from the latent sequence z.
+
+    The decoder takes the full latent sequence z as input and performs two tasks:
+    1.  **Auxiliary Feature Reconstruction**: It predicts the concatenated target features 
+        (scattering and phase harmonics) at each time step. This is used as an auxiliary
+        loss to stabilize training.
+    2.  **Raw Signal Reconstruction**: It upsamples the latent sequence and predicts the mean 
+        and log-variance of the raw FHR signal over a fixed window.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 16,
+        sequence_length: int = 300,
+        prediction_horizon: int = 480,  # 2 minutes at 4Hz = 480 samples
+    ):
+        """
+        Args:
+            latent_dim: Input latent dimension
+            sequence_length: Input sequence length
+            prediction_horizon: Number of future samples to predict (default 480 = 2 minutes at 4Hz)
+        """
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.sequence_length = sequence_length
+        self.prediction_horizon = prediction_horizon
+
+
+        # Process latent sequence to extract temporal features
+        self.linear = nn.Sequential(
+            ResidualMLP(
+            input_dim=latent_dim,
+            hidden_dims=geometric_schedule(latent_dim, 50, 5),
+            final_activation=True,
+            use_skip_connection=True, 
+            activation=nn.ReLU,
+            ),
+            
+            ResidualMLP(
+            input_dim=50,
+            hidden_dims=geometric_schedule(50, 87, 5),
+            final_activation=True,
+            activation=nn.ReLU,
+            use_skip_connection=True
+            )
+        )
+
+        # Individual conv blocks for skip connections
+        self.conv_1 = MultiChannelConvBlock(in_channels=87, out_channels=77, filter_size=11, up_sampling=False)
+        self.conv_2 = MultiChannelConvBlock(in_channels=77, out_channels=66, filter_size=9, up_sampling=True)
+        self.conv_3 = MultiChannelConvBlock(in_channels=66, out_channels=55, filter_size=7, up_sampling=True)
+        self.conv_4 = MultiChannelConvBlock(in_channels=55, out_channels=44, filter_size=5, up_sampling=False)
+        self.conv_5 = MultiChannelConvBlock(in_channels=44, out_channels=33, filter_size=5, up_sampling=True)
+        self.conv_6 = MultiChannelConvBlock(in_channels=33, out_channels=22, filter_size=3, up_sampling=True)
+        self.conv_7 = MultiChannelConvBlock(in_channels=22, out_channels=11, filter_size=3, up_sampling=False)
+        
+        # Skip connection projection layers for dimension matching
+        self.skip_proj_77_to_66 = nn.Conv1d(77, 66, kernel_size=1)  # For conv_1 -> conv_3
+        self.skip_proj_55_to_44 = nn.Conv1d(55, 44, kernel_size=1)  # For conv_3 -> conv_4
+        self.skip_proj_33_to_22 = nn.Conv1d(33, 22, kernel_size=1)  # For conv_5 -> conv_6
+        
+        # Normalization for decoder skip connections
+        self.decoder_skip_norm_77 = nn.GroupNorm(num_groups=min(8, 77), num_channels=77)
+        self.decoder_skip_norm_55 = nn.GroupNorm(num_groups=min(8, 55), num_channels=55)
+        self.decoder_skip_norm_33 = nn.GroupNorm(num_groups=min(8, 33), num_channels=33)
+        
+
+    def forward(self, latent_z: torch.Tensor):
+        """
+        Forward pass that reconstructs the raw signal from latent variables only.
+        
+        Args:
+            latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=32)
+        Returns:
+            Tuple containing:
+            - linear_output: Output from linear layers (batch_size, sequence_length, 87)
+            - raw_signal_mu: Raw signal reconstruction mean (batch_size, 4800)
+            - raw_signal_logvar: Raw signal reconstruction log variance (batch_size, 4800)
+        """
+        
+        linear_output = self.linear(latent_z)  # (batch_size, sequence_length, 87)
+        x = linear_output.transpose(1, 2)        
+        # Conv block 1: 87 -> 77
+        x1 = self.conv_1(x)
+        # Conv block 2: 77 -> 66 (with upsampling)
+        x2 = self.conv_2(x1)
+        # Conv block 3: 66 -> 55 (with upsampling) + skip from x1
+        x3 = self.conv_3(x2)
+        if x1.shape[-1] == x3.shape[-1]:  # Check if sequence lengths match after upsampling
+            skip_x1_norm = self.decoder_skip_norm_77(x1)
+            x3 = x3 + self.skip_proj_77_to_66(skip_x1_norm)  # Normalized skip connection with projection
+        # Conv block 4: 55 -> 44 + skip from x3
+        x4 = self.conv_4(x3)
+        if x3.shape[-1] == x4.shape[-1]:  # Check if sequence lengths match
+            skip_x3_norm = self.decoder_skip_norm_55(x3)
+            x4 = x4 + self.skip_proj_55_to_44(skip_x3_norm)  # Normalized skip connection with projection
+        # Conv block 5: 44 -> 33 (with upsampling)
+        x5 = self.conv_5(x4)
+        # Conv block 6: 33 -> 22 (with upsampling) + skip from x5
+        x6 = self.conv_6(x5)
+        if x5.shape[-1] == x6.shape[-1]:  # Check if sequence lengths match after upsampling
+            skip_x5_norm = self.decoder_skip_norm_33(x5)
+            x6 = x6 + self.skip_proj_33_to_22(skip_x5_norm)  # Normalized skip connection with projection
+        # Conv block 7: 22 -> 11
+        x7 = self.conv_7(x6)
+        # Conv block 8: 11 -> 1
+        x = self.conv_8(x7)  # (batch_size, 1, upsampled_length)
+        # Flatten for final prediction
+        x = x.flatten(start_dim=1)  # (batch_size, flattened_features)
+        # Generate mu and logvar predictions for full raw signal (4800 samples)
+        mu = self.output_mu(x)  # (batch_size, 4800)
+        logvar = self.output_logvar(x)  # (batch_size, 4800)
+        
+        return linear_output, mu, logvar
+        
+
+    @staticmethod
+    def compute_loss(
+        linear_output: torch.Tensor,
+        raw_mu_predicted: torch.Tensor, 
+        raw_logvar_predicted: torch.Tensor,
+        target_fhr_st: torch.Tensor,
+        target_fhr_ph: torch.Tensor,
+        target_raw_signal: torch.Tensor):
+        """
+        Compute two-part loss: MSE loss for linear output and NLL loss for raw signal reconstruction.
+        
+        Args:
+            linear_output: Output from linear layers (B, S, 87)
+            raw_mu_predicted: Predicted raw signal mean (B, 4800)
+            raw_logvar_predicted: Predicted raw signal log variance (B, 4800)
+            target_fhr_st: Target scattering coefficients (B, S, 43)
+            target_fhr_ph: Target phase coefficients (B, S, 44)
+            target_raw_signal: Target raw signal (B, 4800)
+            
+        Returns:
+            Dictionary containing individual loss components
+        """
+        device = raw_mu_predicted.device
+        
+        # MSE Loss: Compare linear output with stacked fhr_st and fhr_ph
+        if linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
+            # Stack fhr_st and fhr_ph along the last dimension (43 + 44 = 87)
+            stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
+            mse_loss = F.mse_loss(linear_output, stacked_target)
+        else:
+            mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # NLL Loss: Full raw signal reconstruction (no warmup period)
+        # Ensure target_raw_signal is the right shape
+        if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
+            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
+        
+        # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
+        diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
+        var = raw_logvar_predicted.exp()  # (B, 4800)
+        nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
+        nll_loss = nll_loss.mean()  # Average over all samples and time points
+        
+        return {
+            'mse_loss': mse_loss,
+            'nll_loss': nll_loss,
+            'total_decoder_loss': mse_loss + nll_loss
+        }
+
 
 class Decoder(nn.Module):
     """
@@ -1078,6 +1326,339 @@ class SeqVaeTeb(nn.Module):
             return kld.sum(dim=-1).mean()
         return kld
 
+    def compute_tc_loss(self, z, mu, logvar, dataset_size, use_chunked=True, chunk_size=1000):
+        """
+        Computes the B-TCVAE loss components using Minibatch Weighted Sampling.
+        
+        Optimized version with chunked processing to reduce memory usage.
+
+        Args:
+            z (torch.Tensor): Latent samples from the posterior. Shape: (batch_size, seq_len, latent_dim)
+            mu (torch.Tensor): Mean of the posterior. Shape: (batch_size, seq_len, latent_dim)
+            logvar (torch.Tensor): Log-variance of the posterior. Shape: (batch_size, seq_len, latent_dim)
+            dataset_size (int): The total number of samples in the training dataset.
+            use_chunked (bool): Whether to use chunked processing for large batches.
+            chunk_size (int): Maximum chunk size for processing.
+
+        Returns:
+            dict: A dictionary containing mi_loss, tc_loss, and dw_kl_loss.
+        """
+        batch_size, seq_len, latent_dim = z.shape
+        
+        # Reshape for minibatch processing: (batch_size * seq_len, latent_dim)
+        z_flat = z.reshape(batch_size * seq_len, latent_dim)
+        mu_flat = mu.reshape(batch_size * seq_len, latent_dim)
+        logvar_flat = logvar.reshape(batch_size * seq_len, latent_dim)
+        
+        # Numerical stability: clamp log variance
+        logvar_flat = torch.clamp(logvar_flat, min=-10, max=10)
+        
+        num_samples = batch_size * seq_len
+        
+        # Use chunked processing for large batches to reduce memory usage
+        if use_chunked and num_samples > chunk_size:
+            return self._compute_tc_loss_chunked(z_flat, mu_flat, logvar_flat, dataset_size, chunk_size)
+        else:
+            return self._compute_tc_loss_full(z_flat, mu_flat, logvar_flat, dataset_size)
+
+    def _compute_tc_loss_full(self, z_flat, mu_flat, logvar_flat, dataset_size):
+        """Full MWS computation for smaller batches."""
+        num_samples = z_flat.shape[0]
+        latent_dim = z_flat.shape[1]
+        
+        # Log-density of the posterior q(z|x,y) for each sample
+        log_q_z_xy = self._gaussian_log_density(z_flat, mu_flat, logvar_flat)
+
+        # MWS: Compute log q(z_i) under all encoders q(z|x_j,y_j) in the minibatch
+        # Shape: (num_samples, num_samples, latent_dim)
+        z_expanded = z_flat.unsqueeze(1)  # (num_samples, 1, latent_dim)
+        mu_expanded = mu_flat.unsqueeze(0)  # (1, num_samples, latent_dim)
+        logvar_expanded = logvar_flat.unsqueeze(0)  # (1, num_samples, latent_dim)
+        
+        # Compute log densities: log q(z_i | x_j, y_j) for all i,j pairs
+        _log_q_z = self._gaussian_log_density_broadcast(z_expanded, mu_expanded, logvar_expanded)
+        # Shape: (num_samples, num_samples)
+
+        # MWS estimator for log q(z): logsumexp over j, then normalize
+        log_q_z = torch.logsumexp(_log_q_z, dim=1) - math.log(dataset_size * num_samples)
+        del _log_q_z  # Clean up large intermediate tensor
+
+        # MWS estimator for log ∏_j q(z_j): sum over dimensions of individual logsumexp
+        # For each dimension d: log q(z_d) = logsumexp_j(log q(z_d | x_j, y_j)) - log(N*M)
+        # Compute marginal log densities for each dimension separately
+        log_q_z_marginals = []
+        for d in range(latent_dim):
+            z_d = z_flat[:, d:d+1].unsqueeze(1)  # (num_samples, 1, 1)
+            mu_d = mu_flat[:, d:d+1].unsqueeze(0)  # (1, num_samples, 1)
+            logvar_d = logvar_flat[:, d:d+1].unsqueeze(0)  # (1, num_samples, 1)
+            
+            log_q_zd = self._gaussian_log_density_broadcast(z_d, mu_d, logvar_d)  # (num_samples, num_samples)
+            log_q_zd_marginal = torch.logsumexp(log_q_zd, dim=1) - math.log(dataset_size * num_samples)  # (num_samples,)
+            log_q_z_marginals.append(log_q_zd_marginal)
+            del z_d, mu_d, logvar_d, log_q_zd  # Clean up dimension-specific tensors
+        
+        log_q_z_marginals = torch.stack(log_q_z_marginals, dim=1)  # (num_samples, latent_dim)
+        log_prod_q_z_j = log_q_z_marginals.sum(dim=1)  # (num_samples,)
+        del log_q_z_marginals  # Clean up intermediate tensor
+
+        # Log-density of the prior p(z) = N(0, I)
+        log_p_z = self._standard_normal_log_density(z_flat)
+
+        # Decomposed loss terms (sign convention: positive = penalty)
+        mi_loss = (log_q_z_xy - log_q_z).mean()
+        tc_loss = (log_q_z - log_prod_q_z_j).mean()
+        dw_kl_loss = (log_prod_q_z_j - log_p_z).mean()
+        
+        # Clean up computation tensors
+        del z_flat, mu_flat, logvar_flat, z_expanded, mu_expanded, logvar_expanded
+        del log_q_z_xy, log_q_z, log_prod_q_z_j, log_p_z
+
+        return {
+            'mi_loss': mi_loss,
+            'tc_loss': tc_loss,
+            'dw_kl_loss': dw_kl_loss
+        }
+
+    def _compute_tc_loss_chunked(self, z_flat, mu_flat, logvar_flat, dataset_size, chunk_size):
+        """Memory-efficient chunked MWS computation for large batches."""
+        num_samples, latent_dim = z_flat.shape
+        device = z_flat.device
+        
+        # Initialize accumulators
+        log_q_z_xy_list = []
+        log_q_z_list = []
+        log_prod_q_z_j_list = []
+        
+        # Process in chunks to avoid OOM
+        for i in range(0, num_samples, chunk_size):
+            end_i = min(i + chunk_size, num_samples)
+            z_chunk = z_flat[i:end_i]
+            mu_chunk = mu_flat[i:end_i]
+            logvar_chunk = logvar_flat[i:end_i]
+            
+            # Log-density of the posterior q(z|x,y) for each sample in chunk
+            log_q_z_xy_chunk = self._gaussian_log_density(z_chunk, mu_chunk, logvar_chunk)
+            log_q_z_xy_list.append(log_q_z_xy_chunk)
+            
+            # Compute log q(z) for this chunk against all samples (in sub-chunks)
+            log_q_z_chunk_list = []
+            for j in range(0, num_samples, chunk_size):
+                end_j = min(j + chunk_size, num_samples)
+                z_expanded = z_chunk.unsqueeze(1)  # (chunk_i, 1, latent_dim)
+                mu_expanded = mu_flat[j:end_j].unsqueeze(0)  # (1, chunk_j, latent_dim)
+                logvar_expanded = logvar_flat[j:end_j].unsqueeze(0)  # (1, chunk_j, latent_dim)
+                
+                log_q_z_ij = self._gaussian_log_density_broadcast(z_expanded, mu_expanded, logvar_expanded)
+                log_q_z_chunk_list.append(log_q_z_ij)
+                del z_expanded, mu_expanded, logvar_expanded, log_q_z_ij
+            
+            # Combine chunks and compute logsumexp
+            log_q_z_chunk_full = torch.cat(log_q_z_chunk_list, dim=1)
+            log_q_z_chunk = torch.logsumexp(log_q_z_chunk_full, dim=1) - math.log(dataset_size * num_samples)
+            log_q_z_list.append(log_q_z_chunk)
+            del log_q_z_chunk_full, log_q_z_chunk_list
+            
+            # Compute marginal densities for this chunk
+            log_q_z_marginals_chunk = []
+            for d in range(latent_dim):
+                log_q_zd_chunk_list = []
+                for j in range(0, num_samples, chunk_size):
+                    end_j = min(j + chunk_size, num_samples)
+                    z_d = z_chunk[:, d:d+1].unsqueeze(1)  # (chunk_i, 1, 1)
+                    mu_d = mu_flat[j:end_j, d:d+1].unsqueeze(0)  # (1, chunk_j, 1)
+                    logvar_d = logvar_flat[j:end_j, d:d+1].unsqueeze(0)  # (1, chunk_j, 1)
+                    
+                    log_q_zd_ij = self._gaussian_log_density_broadcast(z_d, mu_d, logvar_d)
+                    log_q_zd_chunk_list.append(log_q_zd_ij)
+                    del z_d, mu_d, logvar_d, log_q_zd_ij
+                
+                log_q_zd_chunk_full = torch.cat(log_q_zd_chunk_list, dim=1)
+                log_q_zd_marginal = torch.logsumexp(log_q_zd_chunk_full, dim=1) - math.log(dataset_size * num_samples)
+                log_q_z_marginals_chunk.append(log_q_zd_marginal)
+                del log_q_zd_chunk_full, log_q_zd_chunk_list
+            
+            log_q_z_marginals_chunk = torch.stack(log_q_z_marginals_chunk, dim=1)
+            log_prod_q_z_j_chunk = log_q_z_marginals_chunk.sum(dim=1)
+            log_prod_q_z_j_list.append(log_prod_q_z_j_chunk)
+            del log_q_z_marginals_chunk
+        
+        # Combine all chunks
+        log_q_z_xy = torch.cat(log_q_z_xy_list)
+        log_q_z = torch.cat(log_q_z_list)
+        log_prod_q_z_j = torch.cat(log_prod_q_z_j_list)
+        
+        # Log-density of the prior p(z) = N(0, I)
+        log_p_z = self._standard_normal_log_density(z_flat)
+        
+        # Decomposed loss terms (sign convention: positive = penalty)
+        mi_loss = (log_q_z_xy - log_q_z).mean()
+        tc_loss = (log_q_z - log_prod_q_z_j).mean()
+        dw_kl_loss = (log_prod_q_z_j - log_p_z).mean()
+        
+        # Clean up
+        del log_q_z_xy, log_q_z, log_prod_q_z_j, log_p_z
+        del log_q_z_xy_list, log_q_z_list, log_prod_q_z_j_list
+        
+        return {
+            'mi_loss': mi_loss,
+            'tc_loss': tc_loss,
+            'dw_kl_loss': dw_kl_loss
+        }
+
+    def compute_tc_loss_fast_approx(self, z, mu, logvar, dataset_size, method='gaussian'):
+        """
+        Fast approximation methods for β-TCVAE loss computation.
+        
+        Args:
+            z, mu, logvar: Standard inputs
+            dataset_size: Dataset size
+            method: 'gaussian' for Gaussian approximation, 'sampling' for sampling-based
+        """
+        if method == 'gaussian':
+            return self._compute_tc_loss_gaussian_approx(z, mu, logvar, dataset_size)
+        elif method == 'sampling':
+            return self._compute_tc_loss_sampling_approx(z, mu, logvar, dataset_size)
+        else:
+            raise ValueError(f"Unknown approximation method: {method}")
+
+    def _compute_tc_loss_gaussian_approx(self, z, mu, logvar, dataset_size):
+        """
+        Gaussian approximation: assume q(z) ~ N(μ_avg, Σ_avg)
+        Much faster but less accurate than full MWS.
+        """
+        batch_size, seq_len, latent_dim = z.shape
+        z_flat = z.reshape(-1, latent_dim)
+        mu_flat = mu.reshape(-1, latent_dim)
+        logvar_flat = logvar.reshape(-1, latent_dim)
+        
+        # Posterior log density
+        log_q_z_xy = self._gaussian_log_density(z_flat, mu_flat, logvar_flat)
+        
+        # Approximate q(z) with Gaussian using batch statistics
+        mu_avg = mu_flat.mean(dim=0, keepdim=True)  # (1, latent_dim)
+        var_avg = logvar_flat.exp().mean(dim=0, keepdim=True)  # (1, latent_dim)
+        logvar_avg = var_avg.log()
+        
+        # Repeat for all samples
+        mu_avg_expanded = mu_avg.expand_as(mu_flat)
+        logvar_avg_expanded = logvar_avg.expand_as(logvar_flat)
+        
+        log_q_z = self._gaussian_log_density(z_flat, mu_avg_expanded, logvar_avg_expanded)
+        
+        # For marginals, assume independence
+        log_prod_q_z_j = sum(
+            self._gaussian_log_density(
+                z_flat[:, d:d+1], 
+                mu_avg_expanded[:, d:d+1], 
+                logvar_avg_expanded[:, d:d+1]
+            ) for d in range(latent_dim)
+        )
+        
+        # Prior
+        log_p_z = self._standard_normal_log_density(z_flat)
+        
+        # Loss terms
+        mi_loss = (log_q_z_xy - log_q_z).mean()
+        tc_loss = (log_q_z - log_prod_q_z_j).mean()
+        dw_kl_loss = (log_prod_q_z_j - log_p_z).mean()
+        
+        return {
+            'mi_loss': mi_loss,
+            'tc_loss': tc_loss,
+            'dw_kl_loss': dw_kl_loss
+        }
+
+    def _compute_tc_loss_sampling_approx(self, z, mu, logvar, dataset_size, n_samples=100):
+        """
+        Sampling-based approximation: sample subset for MWS computation.
+        Trades accuracy for speed.
+        """
+        batch_size, seq_len, latent_dim = z.shape
+        z_flat = z.reshape(-1, latent_dim)
+        mu_flat = mu.reshape(-1, latent_dim)
+        logvar_flat = logvar.reshape(-1, latent_dim)
+        
+        num_samples = z_flat.shape[0]
+        
+        # Sample subset indices
+        if num_samples > n_samples:
+            indices = torch.randperm(num_samples, device=z.device)[:n_samples]
+            z_sampled = z_flat[indices]
+            mu_sampled = mu_flat[indices]
+            logvar_sampled = logvar_flat[indices]
+        else:
+            z_sampled = z_flat
+            mu_sampled = mu_flat
+            logvar_sampled = logvar_flat
+        
+        # Run full MWS on sampled subset
+        return self._compute_tc_loss_full(z_sampled, mu_sampled, logvar_sampled, dataset_size)
+
+    def _gaussian_log_density(self, samples, mu, logvar):
+        """
+        Optimized log density computation with numerical stability.
+        
+        Args:
+            samples: (N, D) tensor
+            mu: (N, D) tensor
+            logvar: (N, D) tensor
+        
+        Returns:
+            log_density: (N,) tensor
+        """
+        # Numerical stability: clamp logvar
+        logvar_clamped = torch.clamp(logvar, min=-10, max=10)
+        
+        # Optimized computation: avoid repeated exp operations
+        diff = samples - mu
+        inv_var = torch.exp(-logvar_clamped)
+        
+        # Vectorized normalization constant
+        normalization = -0.5 * (math.log(2 * math.pi) + logvar_clamped)
+        
+        # Mahalanobis distance term
+        mahalanobis = -0.5 * (diff.pow(2) * inv_var)
+        
+        log_density = normalization + mahalanobis
+        return log_density.sum(dim=-1)
+
+    def _gaussian_log_density_broadcast(self, samples, mu, logvar):
+        """
+        Optimized broadcast log density computation.
+        
+        Args:
+            samples: (N, 1, D) tensor
+            mu: (1, M, D) tensor  
+            logvar: (1, M, D) tensor
+        
+        Returns:
+            log_density: (N, M) tensor
+        """
+        # Numerical stability
+        logvar_clamped = torch.clamp(logvar, min=-10, max=10)
+        
+        # Efficient broadcasting computation
+        diff = samples - mu  # (N, M, D)
+        inv_var = torch.exp(-logvar_clamped)  # (1, M, D)
+        
+        # Vectorized operations
+        normalization = -0.5 * (math.log(2 * math.pi) + logvar_clamped)  # (1, M, D)
+        mahalanobis = -0.5 * (diff.pow(2) * inv_var)  # (N, M, D)
+        
+        log_density = normalization + mahalanobis  # (N, M, D)
+        return log_density.sum(dim=-1)  # (N, M)
+
+    def _standard_normal_log_density(self, samples):
+        """
+        Compute log density under standard normal N(0, I).
+        
+        Args:
+            samples: (N, D) tensor
+        
+        Returns:
+            log_density: (N,) tensor
+        """
+        return -0.5 * (math.log(2 * math.pi) + samples.pow(2)).sum(dim=1)
     
     def compute_loss(
         self,
@@ -1087,9 +1668,18 @@ class SeqVaeTeb(nn.Module):
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
+        use_tcvae: bool = False,
+        use_hybrid_tcvae: bool = False,
+        alpha: float = 1.0,
+        gamma: float = 1.0,
+        dataset_size: int = 1000,
     ) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss with MSE and NLL components.
+        Supports three loss computation modes:
+        1. Standard TEB: Original KL(q(z|x,y) || p(z|y)) with conditional prior
+        2. β-TCVAE (Approach 1): Full decomposition with standard normal prior
+        3. Hybrid β-TCVAE (Approach 2): TEB + TC penalty with conditional prior
 
         Args:
             forward_outputs: The dictionary returned by the forward pass.
@@ -1097,13 +1687,21 @@ class SeqVaeTeb(nn.Module):
             y_ph: Target phase coefficients from optimized dataloader (B, S=300, channels=44)
             y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
-            beta (float): Beta weight for KLD loss in VAE training.
+            beta (float): Beta weight for KLD loss (TEB) or TC weight (β-TCVAE).
+            use_tcvae (bool): Whether to use full β-TCVAE decomposed loss (Approach 1).
+            use_hybrid_tcvae (bool): Whether to use Hybrid β-TCVAE (Approach 2: TEB + TC).
+            alpha (float): Weight for Index-Code MI term in β-TCVAE.
+            gamma (float): Weight for TC term in Hybrid mode or Dimension-wise KL in full β-TCVAE.
+            dataset_size (int): Total dataset size for MWS computation.
 
         Returns:
             A dictionary of computed losses.
         """
         device = y_raw.device
         kld_loss = torch.tensor(0.0, device=device)
+        mi_loss = torch.tensor(0.0, device=device)
+        tc_loss = torch.tensor(0.0, device=device)
+        dw_kl_loss = torch.tensor(0.0, device=device)
 
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
@@ -1118,25 +1716,120 @@ class SeqVaeTeb(nn.Module):
             target_raw_signal=y_raw
         )
 
-        # KLD loss
+        # Choose loss computation method
         if compute_kld_loss:
-            kld_loss = self._kld_loss(
-                mu_prior=forward_outputs["mu_prior"],
-                logvar_prior=forward_outputs["logvar_prior"],
-                mu_post=forward_outputs["mu_post"],
-                logvar_post=forward_outputs["logvar_post"],
-                reduce_mean=True,  # Ensure scalar loss for training
-            )
+            if use_tcvae and not use_hybrid_tcvae:
+                # Approach 1: Full β-TCVAE decomposed loss with standard normal prior
+                # Choose computation method based on batch size
+                batch_size = forward_outputs['z'].shape[0] * forward_outputs['z'].shape[1]
+                
+                if batch_size > 800:
+                    # Use chunked computation for large batches  
+                    tc_loss_dict = self.compute_tc_loss(
+                        z=forward_outputs['z'],
+                        mu=forward_outputs['mu_post'],
+                        logvar=forward_outputs['logvar_post'],
+                        dataset_size=dataset_size,
+                        use_chunked=True,
+                        chunk_size=500
+                    )
+                elif batch_size > 2000:
+                    # Use fast approximation for very large batches
+                    tc_loss_dict = self.compute_tc_loss_fast_approx(
+                        z=forward_outputs['z'],
+                        mu=forward_outputs['mu_post'],
+                        logvar=forward_outputs['logvar_post'],
+                        dataset_size=dataset_size,
+                        method='gaussian'
+                    )
+                else:
+                    # Use full computation for smaller batches
+                    tc_loss_dict = self.compute_tc_loss(
+                        z=forward_outputs['z'],
+                        mu=forward_outputs['mu_post'],
+                        logvar=forward_outputs['logvar_post'],
+                        dataset_size=dataset_size,
+                        use_chunked=False
+                    )
+                
+                mi_loss = tc_loss_dict['mi_loss']
+                tc_loss = tc_loss_dict['tc_loss']
+                dw_kl_loss = tc_loss_dict['dw_kl_loss']
+                
+                # Total regularization loss (Approach 1)
+                regularization_loss = alpha * mi_loss + beta * tc_loss + gamma * dw_kl_loss
+                
+            elif use_hybrid_tcvae:
+                # Approach 2: Hybrid Disentangled TEB (TEB + TC penalty)
+                # Preserve original TEB KL divergence with conditional prior
+                kld_loss = self._kld_loss(
+                    mu_prior=forward_outputs["mu_prior"],
+                    logvar_prior=forward_outputs["logvar_prior"],
+                    mu_post=forward_outputs["mu_post"],
+                    logvar_post=forward_outputs["logvar_post"],
+                    reduce_mean=True,
+                )
+                
+                # Add Total Correlation penalty for disentanglement
+                # Use chunked computation for large batches
+                batch_size = forward_outputs['z'].shape[0] * forward_outputs['z'].shape[1]
+                
+                if batch_size > 800:
+                    tc_loss_dict = self.compute_tc_loss(
+                        z=forward_outputs['z'],
+                        mu=forward_outputs['mu_post'],
+                        logvar=forward_outputs['logvar_post'],
+                        dataset_size=dataset_size,
+                        use_chunked=True,
+                        chunk_size=500
+                    )
+                else:
+                    tc_loss_dict = self.compute_tc_loss(
+                        z=forward_outputs['z'],
+                        mu=forward_outputs['mu_post'],
+                        logvar=forward_outputs['logvar_post'],
+                        dataset_size=dataset_size,
+                        use_chunked=False
+                    )
+                tc_loss = tc_loss_dict['tc_loss']
+                
+                # Total regularization loss (Approach 2): TEB + TC penalty
+                regularization_loss = beta * kld_loss + gamma * tc_loss
+                
+            else:
+                # Standard TEB KLD loss
+                kld_loss = self._kld_loss(
+                    mu_prior=forward_outputs["mu_prior"],
+                    logvar_prior=forward_outputs["logvar_prior"],
+                    mu_post=forward_outputs["mu_post"],
+                    logvar_post=forward_outputs["logvar_post"],
+                    reduce_mean=True,  # Ensure scalar loss for training
+                )
+                regularization_loss = beta * kld_loss
+        else:
+            regularization_loss = torch.tensor(0.0, device=device)
 
-        # Total loss with beta-weighted KLD
-        total_loss = decoder_losses['total_decoder_loss'] + beta * kld_loss
+        # Total loss
+        total_loss = decoder_losses['total_decoder_loss'] + regularization_loss
+
+        # Determine which approach was used for logging
+        approach_used = "standard_teb"
+        if use_tcvae and not use_hybrid_tcvae:
+            approach_used = "full_beta_tcvae"  # Approach 1
+        elif use_hybrid_tcvae:
+            approach_used = "hybrid_beta_tcvae"  # Approach 2
 
         return {
             "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
             "mse_loss": decoder_losses['mse_loss'],
             "nll_loss": decoder_losses['nll_loss'], 
             "kld_loss": kld_loss,
+            "mi_loss": mi_loss,
+            "tc_loss": tc_loss,
+            "dw_kl_loss": dw_kl_loss,
+            "regularization_loss": regularization_loss,
             "total_loss": total_loss,
+            "approach_used": approach_used,
             "classification_loss": None,  # Required by interface
         }
 

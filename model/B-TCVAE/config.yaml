@@ -1,5 +1,5 @@
 general_config:
-  tag: seqvae_teb_experiment  # Descriptive experiment name
+  tag: hybrid_tcvae_experiment  # Descriptive experiment name
   cuda_devices: [0]  # List of GPU device IDs to use
   train_classifier: False  # Whether to train classifier component
   lr: 0.0001  # Learning rate (reduced for stability)
@@ -10,48 +10,64 @@ general_config:
   epochs: 100  # Increased for better convergence
   accumulate_grad_batches: 4  # Gradient accumulation for effective larger batch size
   batch_size:
-    train: 4  # Increased from 2 for better training stability  
+    train: 4  # Increased from 2 for better training stability
     test: 8   # Can be larger for testing since no gradients
-  
-  # SOTA Training Optimizations
-  optimization:
-    compile_model: true              # Enable torch.compile
-    compile_mode: "max-autotune"     # Most aggressive optimization
-    fused_optimizer: true            # Enable fused AdamW
-    channels_last: false             # Memory format optimization (not beneficial for 1D data)
 
 model_config:
   VAE_model:
-    # Model Architecture Parameters - TEB Specific
+    # Model Architecture Parameters
     Y_module_only: False        # Whether to use only target encoder (deprecated)
     raw_input_size: 4800        # Raw FHR signal length (20 min at 4Hz)
     input_size: 300             # Sequence length for coefficients (decimated by 16)
     channel_num: 2              # Number of input channels (deprecated)
     input_dim: 76               # Total input dimensions (deprecated)
     RNN_hidden_dim: 128         # LSTM hidden dimension (deprecated)
-    latent_size: 16             # Latent space dimensionality for ALL encoders
+    latent_size: 16             # Latent space dimensionality
     num_RNN_layers: 5           # Number of LSTM layers (deprecated)
     freeze_seqvae: False        # Whether to freeze VAE during classifier training
     zero_source: True           # Whether to zero source during certain experiments
-    
-    # Fixed TEB Model Parameters (do not change)
-    decimation_factor: 16       # Fixed decimation factor for TEB
-    warmup_period: 30           # Fixed warmup period for TEB
     
     # Beta Scheduling Configuration
     # Controls the strength of regularization terms across training
     beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0            # Starting beta value for annealing schedules
-    beta_end: 1.0              # Final beta value for TEB
+    beta_end: 6.0              # Final beta value (β-TCVAE recommendation)
     beta_anneal_epochs: 50     # Number of epochs for linear annealing
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
     beta_const_val: 2.0        # Constant beta value when schedule='constant'
     kld_beta: 1.0              # Fallback beta value (legacy parameter)
     
-    # Standard TEB Configuration
-    # Original TEB formulation with conditional prior p(z|y)
-    # Single KL divergence: KL(q(z|x,y) || p(z|y))
-    # Direct transfer entropy measurement
+    # Three-Mode Training Configuration
+    # IMPORTANT: Only one of the following should be true at a time:
+    # 
+    # Option 1: Standard TEB (Transfer Entropy Bottleneck)
+    # use_tcvae: false, use_hybrid_tcvae: false
+    # - Original TEB formulation with conditional prior p(z|y)
+    # - Single KL divergence: KL(q(z|x,y) || p(z|y))
+    # - Direct transfer entropy measurement
+    # - Computational cost: O(BTD)
+    #
+    # Option 2: Full β-TCVAE (Complete Disentanglement - Approach 1)
+    # use_tcvae: true, use_hybrid_tcvae: false
+    # - Complete ELBO decomposition with standard normal prior p(z) = N(0,I)
+    # - Three terms: α·MI + β·TC + γ·DW-KL
+    # - Maximum disentanglement capability
+    # - Computational cost: O(B²T²D)
+    #
+    # Option 3: Hybrid β-TCVAE (TEB + Disentanglement - Approach 2)
+    # use_tcvae: false, use_hybrid_tcvae: true  
+    # - Preserves TEB framework + adds Total Correlation penalty
+    # - Two terms: β·KL(q(z|x,y)||p(z|y)) + γ·TC(z)
+    # - Balanced transfer entropy measurement + disentanglement
+    # - Computational cost: O(BTD) + O(B²T²D)
+    
+    use_tcvae: true            # Enable Full β-TCVAE (Approach 1)
+    use_hybrid_tcvae: false    # Enable Hybrid β-TCVAE (Approach 2: TEB + TC)
+    
+    # Hyperparameter Weights
+    alpha: 1.0                 # Index-Code MI weight (Full β-TCVAE only)
+    gamma: 1.0                 # DW-KL weight (Full β-TCVAE) or TC weight (Hybrid)
+    dataset_size: 10000        # Dataset size estimate (auto-updated from actual data)
 
   seqvae_checkpoint: null
   base_model_checkpoint: null

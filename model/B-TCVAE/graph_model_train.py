@@ -250,6 +250,12 @@ class SeqVAEGraphModel:
         # If beta_const_val not provided, fall back to kld_beta_ from config for constant schedule
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
         
+        # β-TCVAE specific configuration
+        self.use_tcvae = vae_cfg.get('use_tcvae', True)
+        self.use_hybrid_tcvae = vae_cfg.get('use_hybrid_tcvae', False)  # New Hybrid β-TCVAE option
+        self.alpha = float(vae_cfg.get('alpha', 1.0))  # Index-Code MI weight
+        self.gamma = float(vae_cfg.get('gamma', 1.0))  # Dimension-wise KL weight or TC weight for hybrid
+        self.dataset_size = int(vae_cfg.get('dataset_size', 10000))  # Will be updated from actual data
         self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
 
         self.train_classifier = self.config['general_config']['train_classifier']
@@ -258,10 +264,6 @@ class SeqVAEGraphModel:
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
         self.accumulate_grad_batches = self.config['general_config'].get('accumulate_grad_batches', 1)
-        
-        # Additional model parameters from config
-        self.decimation_factor = int(vae_cfg.get('decimation_factor', 16))  # From config or default
-        self.warmup_period = int(vae_cfg.get('warmup_period', 30))          # From config or default
 
         self.test_checkpoint_path = None
         self.seqvae_testing_checkpoint = self.config['seqvae_testing']['test_checkpoint_path']
@@ -335,29 +337,28 @@ class SeqVAEGraphModel:
     def load_checkpoint(self):
         """
         Loads a checkpoint for both the PyTorch and PyTorch Lightning models.
-        IMPORTANT: Config file hyperparameters ALWAYS override checkpoint hyperparameters.
+        If a checkpoint path is provided in the configuration, this function will:
+        1. Load the PyTorch Lightning module (`LightSeqVaeTeb`) from the checkpoint.
+        2. The underlying PyTorch model (`SeqVaeTeb`) will be part of the loaded Lightning module.
         """
         if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
             logger.info(f"Loading model from checkpoint: {self.base_model_checkpoint}")
-            logger.info("⚠️  Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
-            # Create base model with current config parameters
+            # Instantiate a base model to pass to load_from_checkpoint
+            # The actual weights will be overwritten by the checkpoint's state_dict.
             base_model_for_loading = SeqVaeTeb(
-                sequence_length=self.input_size,  # Use config values
-                latent_dim_source=self.latent_dim,
-                latent_dim_target=self.latent_dim, 
-                latent_dim_z=self.latent_dim,
-                decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
-                warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
+                input_channels=76,  # Replace with config values if available
+                sequence_length=300,
+                decimation_factor=16,
             )
 
             try:
-                # Load from checkpoint but FORCE all hyperparameters from current config
+                # Load from checkpoint but override ALL hyperparameters with current config values
                 self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
                     self.base_model_checkpoint,
                     seqvae_teb_model=base_model_for_loading,
                     strict=False,
-                    # FORCE config hyperparameters (these override checkpoint values)
+                    # Override hyperparameters directly during loading
                     lr=self.lr,
                     lr_milestones=self.lr_milestones,
                     beta_schedule=self.beta_schedule,
@@ -366,98 +367,73 @@ class SeqVAEGraphModel:
                     beta_anneal_epochs=self.beta_anneal_epochs,
                     beta_cycle_len=self.beta_cycle_len,
                     beta_const_val=self.beta_const_val,
+                    use_tcvae=self.use_tcvae,
+                    use_hybrid_tcvae=self.use_hybrid_tcvae,
+                    alpha=self.alpha,
+                    gamma=self.gamma,
+                    dataset_size=getattr(self, 'dataset_size', self.dataset_size)
                 )
-                
-                # CRITICAL: Manually override hparams to ensure config takes precedence
-                logger.info("🔧 Enforcing config hyperparameters over checkpoint...")
-                self.lightning_base_model.hparams.lr = self.lr
-                self.lightning_base_model.hparams.lr_milestones = self.lr_milestones
-                self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
-                self.lightning_base_model.hparams.beta_start = self.beta_start
-                self.lightning_base_model.hparams.beta_end = self.beta_end
-                self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
-                self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
-                self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                
-                logger.info("✅ Successfully ENFORCED config hyperparameters:")
+                logger.info(f"Loaded checkpoint with NEW hyperparameters from config:")
                 logger.info(f"  lr: {self.lr}")
                 logger.info(f"  beta_schedule: {self.beta_schedule}")
                 logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
                 logger.info(f"  beta_anneal_epochs: {self.beta_anneal_epochs}")
-                logger.info(f"  beta_const_val: {self.beta_const_val}")
-                
+                logger.info(f"  use_tcvae: {self.use_tcvae}, use_hybrid_tcvae: {self.use_hybrid_tcvae}, alpha: {self.alpha}, gamma: {self.gamma}")
                 self.base_model = self.lightning_base_model.model
-                self.pytorch_model = self.base_model
-                logger.info("Successfully loaded checkpoint with CONFIG hyperparameters enforced.")
-                
+                self.pytorch_model = self.base_model  # Set pytorch_model reference
+                logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
             except Exception as e:
                 logger.error(f"Failed to load checkpoint: {e}")
                 logger.error("Initializing models from scratch.")
-                self.base_model_checkpoint = None
-                self._create_fresh_model()
+                self.base_model_checkpoint = None  # Reset checkpoint path to prevent further errors
+                self.create_model() # Re-initialize models without checkpoint
 
         else:
             if self.base_model_checkpoint:
                 logger.warning(f"Checkpoint file not found at {self.base_model_checkpoint}. Initializing models from scratch.")
             else:
                 logger.info("No checkpoint provided. Initializing models from scratch.")
-            self._create_fresh_model()
-
-    def _create_fresh_model(self):
-        """Create fresh model instance with config parameters."""
-        logger.info("🔧 Creating fresh model with config parameters...")
-        
-        self.base_model = SeqVaeTeb(
-            sequence_length=self.input_size,  # Use config values
-            latent_dim_source=self.latent_dim,
-            latent_dim_target=self.latent_dim, 
-            latent_dim_z=self.latent_dim,
-            decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
-            warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
-        )
-        
-        # SPEED OPTIMIZATION: Advanced model compilation (PyTorch 2.0+)
-        try:
-            # Try aggressive optimization first
-            compile_options = {
-                'mode': 'max-autotune',  # Most aggressive optimization
-                'fullgraph': False,      # Allow graph breaks for complex models
-                'dynamic': True,         # Handle dynamic shapes efficiently
-            }
-            self.base_model = torch.compile(self.base_model, **compile_options)
-            logger.info("Model successfully compiled with torch.compile (max-autotune mode)")
-        except Exception as e:
-            logger.warning(f"max-autotune compilation failed: {e}, trying reduce-overhead mode...")
+            
+            self.base_model = SeqVaeTeb(
+                input_channels=76,
+                sequence_length=300,
+                decimation_factor=16,
+                warmup_period=30,
+            )
+            
+            # SPEED OPTIMIZATION: Compile model for faster execution (PyTorch 2.0+)
             try:
-                # Fallback to safer compilation
+                # Options to avoid CUDA Graphs tensor overwriting:
+                # 1. 'reduce-overhead': Fast compilation, good speedup, no CUDA Graphs
+                # 2. 'default': Safe compilation mode
+                # 3. Disable CUDA Graphs explicitly with options
                 compile_options = {
                     'mode': 'reduce-overhead',
-                    'options': {'triton.cudagraphs': False}
+                    'options': {'triton.cudagraphs': False}  # Explicitly disable CUDA Graphs
                 }
                 self.base_model = torch.compile(self.base_model, **compile_options)
-                logger.info("Model compiled with reduce-overhead mode")
-            except Exception as e2:
-                logger.warning(f"All compilation failed, proceeding without compilation: {e2}")
-        
-        self.lightning_base_model = LightSeqVaeTeb(
-            seqvae_teb_model=self.base_model,
-            lr=self.lr,
-            lr_milestones=self.lr_milestones,
-            beta_schedule=self.beta_schedule,
-            beta_start=self.beta_start,
-            beta_end=self.beta_end,
-            beta_anneal_epochs=self.beta_anneal_epochs,
-            beta_cycle_len=self.beta_cycle_len,
-            beta_const_val=self.beta_const_val,
-        )
-        self.pytorch_model = self.base_model  # Set pytorch_model reference
-        
-        logger.info("✅ Fresh model created with config parameters:")
-        logger.info(f"  sequence_length: {self.input_size}")
-        logger.info(f"  latent_dim: {self.latent_dim}")
-        logger.info(f"  lr: {self.lr}")
-        logger.info(f"  beta_schedule: {self.beta_schedule}")
-        logger.info(f"  beta_const_val: {self.beta_const_val}")
+                logger.info("Model successfully compiled with torch.compile (CUDA Graphs disabled)")
+            except Exception as e:
+                logger.warning(f"torch.compile failed, proceeding without compilation: {e}")
+            
+            self.lightning_base_model = LightSeqVaeTeb(
+                seqvae_teb_model=self.base_model,
+                lr=self.lr,
+                lr_milestones=self.lr_milestones,
+                beta_schedule=self.beta_schedule,
+                beta_start=self.beta_start,
+                beta_end=self.beta_end,
+                beta_anneal_epochs=self.beta_anneal_epochs,
+                beta_cycle_len=self.beta_cycle_len,
+                beta_const_val=self.beta_const_val,
+                # β-TCVAE parameters
+                use_tcvae=self.use_tcvae,
+                use_hybrid_tcvae=self.use_hybrid_tcvae,
+                alpha=self.alpha,
+                gamma=self.gamma,
+                dataset_size=getattr(self, 'dataset_size', self.dataset_size)
+            )
+            self.pytorch_model = self.base_model  # Set pytorch_model reference
 
     def load_pytorch_checkpoint(self):
         if self.seqvae_ckp is not None:
@@ -471,22 +447,8 @@ class SeqVAEGraphModel:
             logger.info(f"Loaded checkpoint '{self.seqvae_ckp}' (epoch {checkpoint['epoch']})")
 
     def create_model(self):
-        """Create model ensuring config parameters take precedence over any checkpoint values."""
-        logger.info("🚀 Creating SeqVaeTeb model with config enforcement...")
-        logger.info(f"📋 Using config parameters:")
-        logger.info(f"  - sequence_length: {self.input_size}")
-        logger.info(f"  - latent_dim: {self.latent_dim}")
-        logger.info(f"  - decimation_factor: {self.decimation_factor}")
-        logger.info(f"  - lr: {self.lr}")
-        logger.info(f"  - beta_schedule: {self.beta_schedule}")
-        logger.info(f"  - beta_const_val: {self.beta_const_val}")
-        
         self.setup_config()
         self.load_checkpoint()
-        
-        # Final validation that our model has correct parameters
-        if self.pytorch_model is not None:
-            logger.info("✅ Model created successfully with enforced config parameters")
 
     def set_cuda_devices(self, device_list=None):
         self.cuda_devices = device_list if device_list is not None else [0]
@@ -554,7 +516,8 @@ class SeqVAEGraphModel:
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
             plot_frequency=self.plot_every_epoch,
-            max_history_size=19900  # Limit history to prevent memory issues
+            max_history_size=19900,  # Limit history to prevent memory issues
+            use_tcvae=self.use_tcvae  # Track β-TCVAE specific metrics
         )
 
         # Profiler for performance analysis
@@ -589,7 +552,7 @@ class SeqVAEGraphModel:
         # Log memory after callback setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
         # log_gpu_memory_usage("After callback setup")
 
-        # Instantiate the PyTorch Lightning Trainer with SOTA optimizations
+        # Instantiate the PyTorch Lightning Trainer with memory optimizations
         trainer = L.Trainer(
             devices=devices,
             accelerator=accelerator,
@@ -605,8 +568,8 @@ class SeqVAEGraphModel:
             num_sanity_val_steps=0,
             callbacks=callbacks_list,
             precision="16-mixed",
-            accumulate_grad_batches=max(self.accumulate_grad_batches, 1),
-            # Enhanced memory and speed optimization settings
+            accumulate_grad_batches=max(self.accumulate_grad_batches, 1),  # Force higher accumulation
+            # Enhanced memory optimization settings
             limit_train_batches=1.0,
             limit_val_batches=1.0,
             val_check_interval=1.0,
@@ -615,12 +578,8 @@ class SeqVAEGraphModel:
             detect_anomaly=False,
             deterministic=False,
             benchmark=True,
+            # Additional memory optimizations
             enable_model_summary=False,  # Disable to save memory
-            # SOTA optimizations for faster training
-            reload_dataloaders_every_n_epochs=0,  # Don't reload dataloaders
-            use_distributed_sampler=True if len(self.cuda_devices) > 1 else False,
-            inference_mode=False,        # Use training mode for better performance
-            barebones=False,            # Use full trainer features
         )
 
         # Log memory after trainer setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
@@ -782,7 +741,7 @@ def main():
     # For distributed training, rank and world_size are now correctly set
     # before this point. The dataloader will use a DistributedSampler if world_size > 1.
     
-    # SPEED OPTIMIZED: Enhanced dataloader with advanced prefetching and memory optimizations
+    # SPEED OPTIMIZED: Enhanced dataloader with prefetching and pinned memory
     train_loader_seqvae = create_optimized_dataloader(
         hdf5_files=config['dataset_config']['vae_train_datasets'],
         batch_size=config['general_config']['batch_size']['train'],
@@ -791,10 +750,7 @@ def main():
         world_size=world_size,
         stats_path=stat_path,
         normalize_fields=normalize_fields,
-        pin_memory=True,           # Speed optimization
-        persistent_workers=True,   # SOTA: Keep workers alive between epochs
-        prefetch_factor=4,         # SOTA: Prefetch multiple batches per worker
-        drop_last=True,           # SOTA: Avoid irregular batch sizes
+        pin_memory=True,  # Speed optimization
         **dataset_kwargs
     )
     
@@ -802,23 +758,22 @@ def main():
     dataset_size = len(train_loader_seqvae.dataset)
     logger.info(f"Training dataset size: {dataset_size} samples")
 
-    # SPEED OPTIMIZED: Enhanced validation dataloader with optimizations
+    # SPEED OPTIMIZED: Enhanced validation dataloader with prefetching
     validation_loader_seqvae = create_optimized_dataloader(
         hdf5_files=config['dataset_config']['vae_test_datasets'],
         batch_size=config['general_config']['batch_size']['test'],
-        num_workers=0,             # Set to 0 to avoid pickle issues
+        num_workers=0,  # Set to 0 to avoid pickle issues
         rank=rank,
         world_size=world_size,
         stats_path=stat_path,
         normalize_fields=normalize_fields,
-        pin_memory=True,           # Speed optimization
-        persistent_workers=False,  # Not needed for validation
-        prefetch_factor=2,         # Lower prefetch for validation
-        drop_last=False,          # Keep all validation samples
+        pin_memory=True,  # Speed optimization
         **dataset_kwargs
     )
 
     graph_model = SeqVAEGraphModel(config_file_path=config_file_path)
+    # Update dataset size in the model configuration
+    graph_model.dataset_size = dataset_size
     graph_model.create_model()
     graph_model.train_base_model(train_loader=train_loader_seqvae, validation_loader=validation_loader_seqvae)
 
