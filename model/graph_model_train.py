@@ -656,31 +656,31 @@ class SeqVAEGraphModel:
         # # Find optimal learning rate
         # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
 
-        # # Run learning rate finder
-        # lr_finder = tuner.lr_find(
-        #     self.lightning_base_model,
-        #     train_dataloaders=train_loader,
-        #     val_dataloaders=validation_loader
-        # )
+        # Run learning rate finder
+        lr_finder = tuner.lr_find(
+            self.lightning_base_model,
+            train_dataloaders=train_loader,
+            val_dataloaders=validation_loader
+        )
 
-        # # Get suggestion and update model
-        # if lr_finder and lr_finder.suggestion():
-        #     new_lr = lr_finder.suggestion()
-        #     self.lightning_base_model.hparams.lr = new_lr
-        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-        #     logger.info(f"Found new optimal learning rate: {new_lr}")
+        # Get suggestion and update model
+        if lr_finder and lr_finder.suggestion():
+            new_lr = lr_finder.suggestion()
+            self.lightning_base_model.hparams.lr = new_lr
+            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+            logger.info(f"Found new optimal learning rate: {new_lr}")
 
-        #     # Plot results
-        #     fig = lr_finder.plot(suggest=True)
-        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-        #     fig.savefig(plot_path)
-        #     plt.close(fig)
-        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
+            # Plot results
+            fig = lr_finder.plot(suggest=True)
+            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+            fig.savefig(plot_path)
+            plt.close(fig)
+            logger.info(f"Learning rate finder plot saved to {plot_path}")
 
-        #     # Clean up lr_finder to free memory
-        #     del lr_finder, fig
-        # else:
-        #     logger.warning("Could not find a new learning rate. Using the one from config.")
+            # Clean up lr_finder to free memory
+            del lr_finder, fig
+        else:
+            logger.warning("Could not find a new learning rate. Using the one from config.")
 
         # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
         log_gpu_memory_usage("Before training starts")
