@@ -339,7 +339,7 @@ class SeqVAEGraphModel:
         """
         if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
             logger.info(f"Loading model from checkpoint: {self.base_model_checkpoint}")
-            logger.info("⚠️  Config hyperparameters will OVERRIDE checkpoint hyperparameters")
+            logger.info("Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
             # Create base model with current config parameters
             base_model_for_loading = SeqVaeTeb(
@@ -369,7 +369,7 @@ class SeqVAEGraphModel:
                 )
                 
                 # CRITICAL: Manually override hparams to ensure config takes precedence
-                logger.info("🔧 Enforcing config hyperparameters over checkpoint...")
+                logger.info("Enforcing config hyperparameters over checkpoint...")
                 self.lightning_base_model.hparams.lr = self.lr
                 self.lightning_base_model.hparams.lr_milestones = self.lr_milestones
                 self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
@@ -379,7 +379,7 @@ class SeqVAEGraphModel:
                 self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
                 self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
                 
-                logger.info("✅ Successfully ENFORCED config hyperparameters:")
+                logger.info("Successfully ENFORCED config hyperparameters:")
                 logger.info(f"  lr: {self.lr}")
                 logger.info(f"  beta_schedule: {self.beta_schedule}")
                 logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
@@ -405,7 +405,7 @@ class SeqVAEGraphModel:
 
     def _create_fresh_model(self):
         """Create fresh model instance with config parameters."""
-        logger.info("🔧 Creating fresh model with config parameters...")
+        logger.info("Creating fresh model with config parameters...")
         
         self.base_model = SeqVaeTeb(
             sequence_length=self.input_size,  # Use config values
@@ -414,11 +414,8 @@ class SeqVAEGraphModel:
             latent_dim_z=self.latent_dim,
             decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
             warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
-        )
-        
-        # SPEED OPTIMIZATION: Model compilation with DDP-compatible settings (PyTorch 2.0+)
+        )        
         try:
-            # Use max-autotune-no-cudagraphs mode - optimal for DDP without CUDA graphs issues
             compile_options = {
                 'mode': 'max-autotune-no-cudagraphs',  # Max optimization without CUDA graphs
                 'fullgraph': False,      # Allow graph breaks for complex models
@@ -429,7 +426,6 @@ class SeqVAEGraphModel:
         except Exception as e:
             logger.warning(f"max-autotune-no-cudagraphs compilation failed: {e}, trying reduce-overhead with disabled CUDA graphs...")
             try:
-                # Fallback: explicitly disable CUDA graphs for DDP compatibility
                 compile_options = {
                     'mode': 'reduce-overhead',
                     'fullgraph': False,
@@ -453,13 +449,6 @@ class SeqVAEGraphModel:
             beta_const_val=self.beta_const_val,
         )
         self.pytorch_model = self.base_model  # Set pytorch_model reference
-        
-        logger.info("✅ Fresh model created with config parameters:")
-        logger.info(f"  sequence_length: {self.input_size}")
-        logger.info(f"  latent_dim: {self.latent_dim}")
-        logger.info(f"  lr: {self.lr}")
-        logger.info(f"  beta_schedule: {self.beta_schedule}")
-        logger.info(f"  beta_const_val: {self.beta_const_val}")
 
     def load_pytorch_checkpoint(self):
         if self.seqvae_ckp is not None:
@@ -472,16 +461,8 @@ class SeqVAEGraphModel:
             self.pytorch_model.load_state_dict(state_dict)
             logger.info(f"Loaded checkpoint '{self.seqvae_ckp}' (epoch {checkpoint['epoch']})")
 
-    def screate_model(self):
+    def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
-        logger.info("🚀 Creating SeqVaeTeb model with config enforcement...")
-        logger.info(f"📋 Using config parameters:")
-        logger.info(f"  - sequence_length: {self.input_size}")
-        logger.info(f"  - latent_dim: {self.latent_dim}")
-        logger.info(f"  - decimation_factor: {self.decimation_factor}")
-        logger.info(f"  - lr: {self.lr}")
-        logger.info(f"  - beta_schedule: {self.beta_schedule}")
-        logger.info(f"  - beta_const_val: {self.beta_const_val}")
         
         self.setup_config()
         self.load_checkpoint()
