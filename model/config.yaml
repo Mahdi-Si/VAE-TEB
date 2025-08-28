@@ -2,13 +2,13 @@ general_config:
   tag: seqvae_teb_experiment_latent_16  # Descriptive experiment name
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   train_classifier: False  # Whether to train classifier component
-  lr: 0.0001  # Learning rate (reduced for stability)
+  lr: 0.001  # Learning rate (reduced for stability)
   lr_milestone: [400, 800]  # Epochs at which to decay learning rate
   weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
   checkpoint_frequency: 1
   plot_frequency: 5  # Plot every 5 epochs to reduce I/O
   epochs: 10000  # Increased for better convergence
-  accumulate_grad_batches: 4  # Gradient accumulation for effective larger batch size
+  accumulate_grad_batches: 1  # Gradient accumulation for effective larger batch size
   batch_size:
     train: 2000  # Increased from 2 for better training stability
     test: 2000   # Can be larger for testing since no gradients
@@ -45,7 +45,7 @@ model_config:
     beta_end: 1.0              # Final beta value for TEB
     beta_anneal_epochs: 50     # Number of epochs for linear annealing
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
-    beta_const_val: 2.0        # Constant beta value when schedule='constant'
+    beta_const_val: 0.001        # Constant beta value when schedule='constant'
     kld_beta: 1.0              # Fallback beta value (legacy parameter)
     
     # Standard TEB Configuration
@@ -118,7 +118,7 @@ advanced_config:
   # Memory Optimization
   memory:
     enable_memory_monitoring: false    # Enable memory monitoring callback
-    memory_threshold_gb: 10.0          # Memory threshold for cache clearing
+    memory_threshold_gb: 20.0          # Memory threshold for cache clearing
     memory_log_frequency: 200          # Frequency of memory logging
   
   # Callbacks Configuration
