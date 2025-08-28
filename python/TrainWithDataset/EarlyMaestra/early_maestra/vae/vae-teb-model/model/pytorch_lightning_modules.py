@@ -732,7 +732,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers with SOTA optimizations."""
-        # SOTA OPTIMIZATION: Use AdamW with optimized hyperparameters
+        # OPTIMIZATION: Use AdamW with gradient clipping compatibility
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams.lr,
@@ -744,7 +744,7 @@ class LightSeqVaeTeb(L.LightningModule):
             maximize=False,
             capturable=False,      # Standard mode for compatibility
             differentiable=False,
-            fused=torch.cuda.is_available(),  # SOTA: Fused optimizer for CUDA (much faster)
+            fused=False,           # Disable fused for gradient clipping compatibility
         )
 
         if self.hparams.lr_milestones:

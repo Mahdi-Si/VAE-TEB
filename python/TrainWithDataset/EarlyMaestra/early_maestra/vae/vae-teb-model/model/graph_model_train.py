@@ -472,7 +472,7 @@ class SeqVAEGraphModel:
             self.pytorch_model.load_state_dict(state_dict)
             logger.info(f"Loaded checkpoint '{self.seqvae_ckp}' (epoch {checkpoint['epoch']})")
 
-    def create_model(self):
+    def screate_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
         logger.info("🚀 Creating SeqVaeTeb model with config enforcement...")
         logger.info(f"📋 Using config parameters:")
