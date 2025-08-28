@@ -1,17 +1,17 @@
 general_config:
-  tag: seqvae_teb_experiment  # Descriptive experiment name
-  cuda_devices: [0]  # List of GPU device IDs to use
+  tag: seqvae_teb_experiment_latent_16  # Descriptive experiment name
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   train_classifier: False  # Whether to train classifier component
   lr: 0.0001  # Learning rate (reduced for stability)
-  lr_milestone: [100, 200]  # Epochs at which to decay learning rate
+  lr_milestone: [400, 800]  # Epochs at which to decay learning rate
   weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
   checkpoint_frequency: 1
   plot_frequency: 5  # Plot every 5 epochs to reduce I/O
-  epochs: 100  # Increased for better convergence
+  epochs: 10000  # Increased for better convergence
   accumulate_grad_batches: 4  # Gradient accumulation for effective larger batch size
   batch_size:
-    train: 4  # Increased from 2 for better training stability  
-    test: 8   # Can be larger for testing since no gradients
+    train: 2000  # Increased from 2 for better training stability
+    test: 2000   # Can be larger for testing since no gradients
   
   # SOTA Training Optimizations
   optimization:
@@ -63,14 +63,16 @@ inv_scattering_model:
   train_inv_st: False
 
 folders_config:
-  out_dir_base: output
+  out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
 
 dataset_config:
     vae_train_datasets:
-      - C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_no_cs.hdf5
     vae_test_datasets:
-      - C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5
-    stat_path: C:\Users\mahdi\Desktop\McGill\data\stats.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_cs.hdf5
+    stat_path: /data/deid/isilon/MS_model/Q4_stats/stats.hdf5
     dataloader_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']

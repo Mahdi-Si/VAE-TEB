@@ -9,7 +9,7 @@ import matplotlib
 import os
 import plotly.graph_objects as go
 
-from vae_teb_model import SeqVaeTeb
+from vae_teb_model_original import SeqVaeTeb
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'

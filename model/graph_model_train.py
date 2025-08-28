@@ -657,33 +657,33 @@ class SeqVAEGraphModel:
         # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
 
         # Run learning rate finder
-        lr_finder = tuner.lr_find(
-            self.lightning_base_model,
-            train_dataloaders=train_loader,
-            val_dataloaders=validation_loader
-        )
-
-        # Get suggestion and update model
-        if lr_finder and lr_finder.suggestion():
-            new_lr = lr_finder.suggestion()
-            self.lightning_base_model.hparams.lr = new_lr
-            self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
-            logger.info(f"Found new optimal learning rate: {new_lr}")
-
-            # Plot results
-            fig = lr_finder.plot(suggest=True)
-            plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
-            fig.savefig(plot_path)
-            plt.close(fig)
-            logger.info(f"Learning rate finder plot saved to {plot_path}")
-
-            # Clean up lr_finder to free memory
-            del lr_finder, fig
-        else:
-            logger.warning("Could not find a new learning rate. Using the one from config.")
-
-        # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        log_gpu_memory_usage("Before training starts")
+        # lr_finder = tuner.lr_find(
+        #     self.lightning_base_model,
+        #     train_dataloaders=train_loader,
+        #     val_dataloaders=validation_loader
+        # )
+        #
+        # # Get suggestion and update model
+        # if lr_finder and lr_finder.suggestion():
+        #     new_lr = lr_finder.suggestion()
+        #     self.lightning_base_model.hparams.lr = new_lr
+        #     self.lightning_base_model.lr = new_lr  # Also update attribute if used directly
+        #     logger.info(f"Found new optimal learning rate: {new_lr}")
+        #
+        #     # Plot results
+        #     fig = lr_finder.plot(suggest=True)
+        #     plot_path = os.path.join(self.train_results_dir, 'lr_finder_plot.png')
+        #     fig.savefig(plot_path)
+        #     plt.close(fig)
+        #     logger.info(f"Learning rate finder plot saved to {plot_path}")
+        #
+        #     # Clean up lr_finder to free memory
+        #     del lr_finder, fig
+        # else:
+        #     logger.warning("Could not find a new learning rate. Using the one from config.")
+        #
+        # # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
+        # log_gpu_memory_usage("Before training starts")
 
         logger.info(f"Starting training of the base model for {self.epochs_num} epochs.")
         trainer.fit(
@@ -792,9 +792,9 @@ def main():
         stats_path=stat_path,
         normalize_fields=normalize_fields,
         pin_memory=True,           # Speed optimization
-        persistent_workers=True,   # SOTA: Keep workers alive between epochs
-        prefetch_factor=4,         # SOTA: Prefetch multiple batches per worker
-        drop_last=True,           # SOTA: Avoid irregular batch sizes
+        # persistent_workers=True,   # SOTA: Keep workers alive between epochs
+        # prefetch_factor=4,         # SOTA: Prefetch multiple batches per worker
+        # drop_last=True,           # SOTA: Avoid irregular batch sizes
         **dataset_kwargs
     )
     
@@ -810,11 +810,11 @@ def main():
         rank=rank,
         world_size=world_size,
         stats_path=stat_path,
-        normalize_fields=normalize_fields,
-        pin_memory=True,           # Speed optimization
-        persistent_workers=False,  # Not needed for validation
-        prefetch_factor=2,         # Lower prefetch for validation
-        drop_last=False,          # Keep all validation samples
+        # normalize_fields=normalize_fields,
+        # pin_memory=True,           # Speed optimization
+        # persistent_workers=False,  # Not needed for validation
+        # prefetch_factor=2,         # Lower prefetch for validation
+        # drop_last=False,          # Keep all validation samples
         **dataset_kwargs
     )
 

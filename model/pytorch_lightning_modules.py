@@ -740,7 +740,7 @@ class LightSeqVaeTeb(L.LightningModule):
             eps=1e-8,              # Numerical stability
             betas=(0.9, 0.95),     # SOTA: Slightly higher β2 for better convergence
             amsgrad=False,         # Standard AdamW
-            foreach=True,          # SOTA: Vectorized optimizer updates (faster)
+            # foreach=True,          # SOTA: Vectorized optimizer updates (faster)
             maximize=False,
             capturable=False,      # Standard mode for compatibility
             differentiable=False,

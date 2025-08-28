@@ -1055,7 +1055,7 @@ class SeqVaeTeb(nn.Module):
     The model is trained by maximizing the Evidence Lower Bound (ELBO), which is equivalent
     to minimizing the following loss function:
 
-    $$ \mathcal{L}_{\text{total}} = \mathbb{E}_{q(\mathbf{z}|\mathbf{x},\mathbf{y})}[-\log p(\mathbf{r}|\mathbf{z})] + \beta \cdot \text{KL}[q(\mathbf{z}|\mathbf{x},\mathbf{y}) || p(\mathbf{z}|\mathbf{y})] $$
+    # $$ \mathcal{L}_{\text{total}} = \mathbb{E}_{q(\mathbf{z}|\mathbf{x},\mathbf{y})}[-\log p(\mathbf{r}|\mathbf{z})] + \beta \cdot \text{KL}[q(\mathbf{z}|\mathbf{x},\mathbf{y}) || p(\mathbf{z}|\mathbf{y})] $$
 
     where:
     - The first term is the reconstruction loss (NLL of the raw signal + MSE of auxiliary features).

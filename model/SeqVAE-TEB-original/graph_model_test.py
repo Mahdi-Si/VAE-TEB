@@ -6,6 +6,7 @@ import time
 import sys
 import os
 import yaml
+from matplotlib import pyplot as plt
 from tqdm import tqdm
 import pickle
 import matplotlib
@@ -103,8 +104,8 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
 
         # Run tests on the same selected GUIDs
         # Use selected_guids only for per-sample visualization; aggregate tests use full dataset
-        self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
-        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids)
+        # self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
+        # self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids)
         self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
         # Demonstrate information flow using UP ablation and gain sweep over whole dataset
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
@@ -1015,7 +1016,7 @@ def main():
     sklearn.utils.check_random_state(42)
     start = time.time()
 
-    config_file_path = 'model/config.yaml'
+    config_file_path = 'SeqVAE-TEB-original/config_v.yaml'
     project_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     if not os.path.isabs(config_file_path):
         config_file_path = os.path.join(project_root, config_file_path)
