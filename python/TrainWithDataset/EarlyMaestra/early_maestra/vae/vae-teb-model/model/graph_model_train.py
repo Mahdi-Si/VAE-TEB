@@ -416,26 +416,28 @@ class SeqVAEGraphModel:
             warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
         )
         
-        # SPEED OPTIMIZATION: Advanced model compilation (PyTorch 2.0+)
+        # SPEED OPTIMIZATION: Model compilation with DDP-compatible settings (PyTorch 2.0+)
         try:
-            # Try aggressive optimization first
+            # Use max-autotune-no-cudagraphs mode - optimal for DDP without CUDA graphs issues
             compile_options = {
-                'mode': 'max-autotune',  # Most aggressive optimization
+                'mode': 'max-autotune-no-cudagraphs',  # Max optimization without CUDA graphs
                 'fullgraph': False,      # Allow graph breaks for complex models
                 'dynamic': True,         # Handle dynamic shapes efficiently
             }
             self.base_model = torch.compile(self.base_model, **compile_options)
-            logger.info("Model successfully compiled with torch.compile (max-autotune mode)")
+            logger.info("Model successfully compiled with torch.compile (max-autotune-no-cudagraphs mode)")
         except Exception as e:
-            logger.warning(f"max-autotune compilation failed: {e}, trying reduce-overhead mode...")
+            logger.warning(f"max-autotune-no-cudagraphs compilation failed: {e}, trying reduce-overhead with disabled CUDA graphs...")
             try:
-                # Fallback to safer compilation
+                # Fallback: explicitly disable CUDA graphs for DDP compatibility
                 compile_options = {
                     'mode': 'reduce-overhead',
-                    'options': {'triton.cudagraphs': False}
+                    'fullgraph': False,
+                    'dynamic': True,
+                    'options': {'triton.cudagraphs': False}  # Explicitly disable CUDA graphs
                 }
                 self.base_model = torch.compile(self.base_model, **compile_options)
-                logger.info("Model compiled with reduce-overhead mode")
+                logger.info("Model compiled with reduce-overhead mode (CUDA graphs disabled for DDP)")
             except Exception as e2:
                 logger.warning(f"All compilation failed, proceeding without compilation: {e2}")
         
