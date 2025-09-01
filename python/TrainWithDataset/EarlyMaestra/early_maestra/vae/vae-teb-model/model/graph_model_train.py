@@ -353,6 +353,7 @@ class SeqVAEGraphModel:
                 self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
                     self.base_model_checkpoint,
                     seqvae_teb_model=base_model_for_loading,  # Required for LightSeqVaeTeb init
+                    strict=False,  # Allow missing keys in checkpoint
                     # FORCE config hyperparameters (these override checkpoint values)
                     lr=self.lr,
                     lr_milestones=self.lr_milestones,
@@ -404,12 +405,12 @@ class SeqVAEGraphModel:
         logger.info("Creating fresh model with config parameters...")
         
         self.base_model = SeqVaeTeb(
-            sequence_length=self.input_size,  # Use config values
-            latent_dim_source=self.latent_dim,
-            latent_dim_target=self.latent_dim, 
-            latent_dim_z=self.latent_dim,
-            decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
-            warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
+                sequence_length=self.input_size,  # Use config values
+                latent_dim_source=self.latent_dim,
+                latent_dim_target=self.latent_dim, 
+                latent_dim_z=self.latent_dim,
+                decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
+                warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
         )        
         try:
             compile_options = {
