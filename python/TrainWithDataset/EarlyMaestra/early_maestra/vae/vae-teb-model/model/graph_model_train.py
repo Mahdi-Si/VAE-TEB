@@ -267,10 +267,6 @@ class SeqVAEGraphModel:
         self.seqvae_testing_checkpoint = self.config['seqvae_testing']['test_checkpoint_path']
         self.base_model_checkpoint = self.config['model_config']['base_model_checkpoint']
 
-        self.inv_scattering_checkpoint = self.config['inv_scattering_model']['inv_st_checkpoint']
-        self.do_inv_st = self.config['inv_scattering_model']['do_inv_st']
-        self.train_inv_st = self.config['inv_scattering_model']['train_inv_st']
-
         self.zero_source = self.config['model_config']['VAE_model']['zero_source']
         self.clip = 10
         plt.ion()
@@ -463,6 +459,14 @@ class SeqVAEGraphModel:
 
     def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
+        logger.info("Creating SeqVaeTeb model with config enforcement...")
+        logger.info(f"Using config parameters:")
+        logger.info(f"  - sequence_length: {self.input_size}")
+        logger.info(f"  - latent_dim: {self.latent_dim}")
+        logger.info(f"  - decimation_factor: {self.decimation_factor}")
+        logger.info(f"  - lr: {self.lr}")
+        logger.info(f"  - beta_schedule: {self.beta_schedule}")
+        logger.info(f"  - beta_const_val: {self.beta_const_val}")
         
         self.setup_config()
         self.load_checkpoint()
@@ -636,8 +640,8 @@ class SeqVAEGraphModel:
         # except Exception as e:
         #     logger.warning(f"Batch size finding failed: {e}. Using configured batch size {self.batch_size_train}")
 
-        # # Find optimal learning rate
-        # logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
+        # Find optimal learning rate
+        logger.info("Finding optimal learning rate using PyTorch Lightning's tuner...")
 
         # Run learning rate finder
         # lr_finder = tuner.lr_find(

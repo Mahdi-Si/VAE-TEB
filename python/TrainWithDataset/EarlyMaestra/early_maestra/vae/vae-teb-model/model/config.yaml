@@ -1,17 +1,17 @@
 general_config:
-  tag: seqvae_teb_experiment_latent_16  # Descriptive experiment name
+  tag: seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__  # Descriptive experiment name
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   train_classifier: False  # Whether to train classifier component
-  lr: 0.001  # Learning rate (reduced for stability)
+  lr: 0.000001  # Learning rate (reduced for stability)
   lr_milestone: [400, 800]  # Epochs at which to decay learning rate
   weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
   checkpoint_frequency: 1
-  plot_frequency: 5  # Plot every 5 epochs to reduce I/O
+  plot_frequency: 1  # Plot every 5 epochs to reduce I/O
   epochs: 10000  # Increased for better convergence
   accumulate_grad_batches: 1  # Gradient accumulation for effective larger batch size
   batch_size:
-    train: 2000  # Increased from 2 for better training stability
-    test: 2000   # Can be larger for testing since no gradients
+    train: 1700  # Increased from 2 for better training stability
+    test: 1700   # Can be larger for testing since no gradients
   
   # SOTA Training Optimizations
   optimization:
@@ -46,21 +46,16 @@ model_config:
     beta_anneal_epochs: 50     # Number of epochs for linear annealing
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
     beta_const_val: 0.001        # Constant beta value when schedule='constant'
-    kld_beta: 1.0              # Fallback beta value (legacy parameter)
+    kld_beta: 0.001              # Fallback beta value (legacy parameter)
     
     # Standard TEB Configuration
     # Original TEB formulation with conditional prior p(z|y)
     # Single KL divergence: KL(q(z|x,y) || p(z|y))
     # Direct transfer entropy measurement
 
-  seqvae_checkpoint: null
-  base_model_checkpoint: null
-  classification_checkpoint: null
-
-inv_scattering_model:
-  do_inv_st: False
-  inv_st_checkpoint: null
-  train_inv_st: False
+  seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
+  base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
+  classification_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
 
 folders_config:
   out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
@@ -92,7 +87,7 @@ seqvae_testing:
   test_data_dir: null                    # Directory for test data (optional)
   test_data_selected_dir: null           # Directory for selected test data (optional)
   HIE_test_data_dir: null                # Directory for HIE test data (optional)
-  test_checkpoint_path: null             # Path to checkpoint for testing
+  test_checkpoint_path: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
   
   # Test Analysis Configuration
   analysis_config:
