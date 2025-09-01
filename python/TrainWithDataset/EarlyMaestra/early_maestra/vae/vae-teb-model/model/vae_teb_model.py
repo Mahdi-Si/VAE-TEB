@@ -968,6 +968,8 @@ class SeqVaeTeb(nn.Module):
         latent_dim_z: int = 16,
         decimation_factor: int = 16,
         warmup_period: int = 30,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 5,
     ):
         super().__init__()
 
@@ -980,10 +982,14 @@ class SeqVaeTeb(nn.Module):
         self.source_encoder = SourceEncoder(
             sequence_length=sequence_length,
             latent_dim=latent_dim_source,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
         )
         self.target_encoder = TargetEncoder(
             sequence_length=sequence_length,
             latent_dim=latent_dim_target,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
         )
         self.conditional_encoder = ConditionalEncoder(
             dim_hx=latent_dim_source,
@@ -991,7 +997,7 @@ class SeqVaeTeb(nn.Module):
             dim_z=latent_dim_z,
         )
         
-        self.decoder = Decoder()  # Original decoder for backward compatibility
+        self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)  # Original decoder for backward compatibility
 
         initialization(self)
 

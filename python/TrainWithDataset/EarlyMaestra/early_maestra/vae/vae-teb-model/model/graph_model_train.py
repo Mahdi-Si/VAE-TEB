@@ -346,6 +346,30 @@ class SeqVAEGraphModel:
                 decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
                 warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
             )
+            
+            # CRITICAL: Compile the model BEFORE loading checkpoint to match saved state_dict structure
+            try:
+                compile_options = {
+                    'mode': 'max-autotune-no-cudagraphs',
+                    'fullgraph': False,
+                    'dynamic': True,
+                }
+                base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
+                logger.info("Model compiled before checkpoint loading to match saved structure")
+            except Exception as e:
+                logger.warning(f"Compilation failed before checkpoint loading: {e}, trying reduce-overhead...")
+                try:
+                    compile_options = {
+                        'mode': 'reduce-overhead',
+                        'fullgraph': False,
+                        'dynamic': True,
+                        'options': {'triton.cudagraphs': False}
+                    }
+                    base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
+                    logger.info("Model compiled with reduce-overhead before checkpoint loading")
+                except Exception as e2:
+                    logger.warning(f"All compilation failed before checkpoint loading: {e2}")
+                    logger.warning("Loading checkpoint into uncompiled model - this may cause key mismatches")
 
             try:
                 # Load from checkpoint but FORCE all hyperparameters from current config
@@ -385,6 +409,8 @@ class SeqVAEGraphModel:
                 
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model
+                # Skip compilation in _create_fresh_model since model is already compiled
+                self._skip_compilation = True
                 logger.info("Successfully loaded checkpoint with CONFIG hyperparameters enforced.")
                 
             except Exception as e:
@@ -411,28 +437,34 @@ class SeqVAEGraphModel:
                 latent_dim_z=self.latent_dim,
                 decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
                 warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
+                lstm_hidden_dim=self.rnn_hidden_dim,
+                lstm_num_layers=self.num_layers,
         )        
-        try:
-            compile_options = {
-                'mode': 'max-autotune-no-cudagraphs',  # Max optimization without CUDA graphs
-                'fullgraph': False,      # Allow graph breaks for complex models
-                'dynamic': True,         # Handle dynamic shapes efficiently
-            }
-            self.base_model = torch.compile(self.base_model, **compile_options)
-            logger.info("Model successfully compiled with torch.compile (max-autotune-no-cudagraphs mode)")
-        except Exception as e:
-            logger.warning(f"max-autotune-no-cudagraphs compilation failed: {e}, trying reduce-overhead with disabled CUDA graphs...")
+        # Only compile if not already compiled from checkpoint loading
+        if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:
                 compile_options = {
-                    'mode': 'reduce-overhead',
-                    'fullgraph': False,
-                    'dynamic': True,
-                    'options': {'triton.cudagraphs': False}  # Explicitly disable CUDA graphs
+                    'mode': 'max-autotune-no-cudagraphs',  # Max optimization without CUDA graphs
+                    'fullgraph': False,      # Allow graph breaks for complex models
+                    'dynamic': True,         # Handle dynamic shapes efficiently
                 }
                 self.base_model = torch.compile(self.base_model, **compile_options)
-                logger.info("Model compiled with reduce-overhead mode (CUDA graphs disabled for DDP)")
-            except Exception as e2:
-                logger.warning(f"All compilation failed, proceeding without compilation: {e2}")
+                logger.info("Model successfully compiled with torch.compile (max-autotune-no-cudagraphs mode)")
+            except Exception as e:
+                logger.warning(f"max-autotune-no-cudagraphs compilation failed: {e}, trying reduce-overhead with disabled CUDA graphs...")
+                try:
+                    compile_options = {
+                        'mode': 'reduce-overhead',
+                        'fullgraph': False,
+                        'dynamic': True,
+                        'options': {'triton.cudagraphs': False}  # Explicitly disable CUDA graphs
+                    }
+                    self.base_model = torch.compile(self.base_model, **compile_options)
+                    logger.info("Model compiled with reduce-overhead mode (CUDA graphs disabled for DDP)")
+                except Exception as e2:
+                    logger.warning(f"All compilation failed, proceeding without compilation: {e2}")
+        else:
+            logger.info("Skipping compilation - model already compiled from checkpoint loading")
         
         self.lightning_base_model = LightSeqVaeTeb(
             seqvae_teb_model=self.base_model,
