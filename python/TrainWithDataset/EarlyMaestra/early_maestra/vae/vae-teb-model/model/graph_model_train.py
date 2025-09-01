@@ -569,6 +569,12 @@ class SeqVAEGraphModel:
             save_top_k=2,
             save_last=False,
         )
+        
+        # Reset checkpoint callback's best score when loading from checkpoint
+        if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
+            logger.info("Resetting checkpoint callback to start fresh monitoring from current validation loss")
+            self.checkpoint_callback.best_model_score = None
+            self.checkpoint_callback.best_model_path = None
 
         # Callback for plotting losses using Plotly with memory optimization
         self.loss_plot_callback = LossPlotCallback(
