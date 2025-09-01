@@ -349,10 +349,10 @@ class SeqVAEGraphModel:
 
             try:
                 # Load from checkpoint but FORCE all hyperparameters from current config
+                # Lightning will reconstruct the model automatically from checkpoint
                 self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
                     self.base_model_checkpoint,
-                    seqvae_teb_model=base_model_for_loading,
-                    strict=False,
+                    strict=False,  # Allow missing/extra keys due to architecture evolution
                     # FORCE config hyperparameters (these override checkpoint values)
                     lr=self.lr,
                     lr_milestones=self.lr_milestones,
