@@ -47,7 +47,6 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
             None: Saves analysis figures and artifacts into the test results directory. For example,
             plots are written under `.../test_results/...`.
         """
-        # Create per-test subfolders
         analysis_dir = os.path.join(self.test_results_dir, 'analysis_and_plot')
         te_shift_dir = os.path.join(self.test_results_dir, 'te_shift_left')
         metrics_dir = os.path.join(self.test_results_dir, 'metrics_histograms')
@@ -57,7 +56,6 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir]:
             os.makedirs(d, exist_ok=True)
 
-        # Optional device selection for tests
         try:
             if cuda_device is not None:
                 if isinstance(cuda_device, str) and cuda_device.lower() == 'cpu':
@@ -77,12 +75,10 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         except Exception as e:
             logger.warning(f"run_tests: Device selection setup failed: {e}")
 
-        # Collect a consistent set of GUIDs to use across all tests
-        target_count = 50  # keep consistent with per-sample visualization count
+        target_count = 50
         selected_guids = []
         try:
             for batch in tqdm(test_loader, desc="Selecting GUIDs for tests"):
-                # batch.guid could be a list of strings or a tensor-like; ensure list[str]
                 guids_batch = batch.guid
                 if isinstance(guids_batch, (list, tuple)):
                     guids_iter = guids_batch
@@ -101,12 +97,9 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         except Exception as e:
             logger.warning(f"Could not preselect GUIDs: {e}. Tests will pick samples as available.")
 
-        # Run tests on the same selected GUIDs
-        # Use selected_guids only for per-sample visualization; aggregate tests use full dataset
         self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
         self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids)
         self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
-        # Demonstrate information flow using UP ablation and gain sweep over whole dataset
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
         self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir)
 
