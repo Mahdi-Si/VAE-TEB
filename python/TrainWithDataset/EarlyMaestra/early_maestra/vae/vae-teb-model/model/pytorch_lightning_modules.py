@@ -25,11 +25,10 @@ from loguru import logger
 # Callbacks
 # ------------------------------------------------------------------------------------------------------------------------------------------
 class PlottingCallBack(Callback):
-    def __init__(self, output_dir, plot_every_epoch, input_channel_num):
+    def __init__(self, output_dir, plot_every_epoch):
         super().__init__()
         self.output_dir = output_dir
         self.plot_every_epoch = plot_every_epoch
-        self.input_channel_num = input_channel_num
 
     def on_validation_epoch_end(self, pl_trainer, pl_module):
         if pl_trainer.current_epoch % self.plot_every_epoch != 0 or not pl_trainer.is_global_zero:

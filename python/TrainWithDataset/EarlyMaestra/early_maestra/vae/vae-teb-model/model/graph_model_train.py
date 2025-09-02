@@ -43,11 +43,10 @@ from pytorch_lightning_modules import LightSeqVaeTeb
 
 from torch.optim.lr_scheduler import MultiStepLR
 
-# SPEED OPTIMIZATION: Enable cuDNN benchmarking and other optimizations for maximum training speed
 torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
-torch.backends.cudnn.allow_tf32 = True  # Enable TF32 on Ampere GPUs for speed
-torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matrix operations
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -226,48 +225,29 @@ class SeqVAEGraphModel:
 
         self.plot_every_epoch = self.config['general_config']['plot_frequency']
 
-        self.raw_input_size = self.config['model_config']['VAE_model']['raw_input_size']
-        self.input_size = self.config['model_config']['VAE_model']['input_size']
-
-        self.input_dim = self.config['model_config']['VAE_model']['input_dim']
-        self.input_channel_num = self.config['model_config']['VAE_model']['channel_num']
-
-        self.latent_dim = self.config['model_config']['VAE_model']['latent_size']
-        self.num_layers = self.config['model_config']['VAE_model']['num_RNN_layers']
-        self.rnn_hidden_dim = self.config['model_config']['VAE_model']['RNN_hidden_dim']
-        self.y_module_only = self.config['model_config']['VAE_model']['Y_module_only']
         self.epochs_num = self.config['general_config']['epochs']
         self.lr = self.config['general_config']['lr']
         self.lr_milestones = self.config['general_config']['lr_milestone']
         self.kld_beta_ = float(self.config['model_config']['VAE_model']['kld_beta'])
-        # Beta scheduling configuration (optional in config). Defaults keep current behavior.
         vae_cfg = self.config['model_config']['VAE_model']
         self.beta_schedule = vae_cfg.get('beta_schedule', 'linear')
         self.beta_start = float(vae_cfg.get('beta_start', 0.0))
         self.beta_end = float(vae_cfg.get('beta_end', 6.0))  # Default β-TCVAE value
         self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 50))
         self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
-        # If beta_const_val not provided, fall back to kld_beta_ from config for constant schedule
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
         
         self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
-
-        self.train_classifier = self.config['general_config']['train_classifier']
 
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
         self.accumulate_grad_batches = self.config['general_config'].get('accumulate_grad_batches', 1)
-        
-        # Additional model parameters from config
-        self.decimation_factor = int(vae_cfg.get('decimation_factor', 16))  # From config or default
-        self.warmup_period = int(vae_cfg.get('warmup_period', 30))          # From config or default
 
         self.test_checkpoint_path = None
         self.seqvae_testing_checkpoint = self.config['seqvae_testing']['test_checkpoint_path']
         self.base_model_checkpoint = self.config['model_config']['base_model_checkpoint']
 
-        self.zero_source = self.config['model_config']['VAE_model']['zero_source']
         self.clip = 10
         plt.ion()
 
@@ -296,34 +276,28 @@ class SeqVAEGraphModel:
             self.train_results_dir,
             self.test_results_dir,
             self.model_checkpoint_dir,
-            # self.aux_dir,
-            # self.tensorboard_dir
         ]
         for folder in folders_list:
             os.makedirs(folder, exist_ok=True)
 
         self.log_file = os.path.join(self.train_results_dir, 'full.log')
         
-        # Reconfiguring logger to be multiprocessing-safe
-        logger.remove() # Removes the default handler
-        logger.add(sys.stderr, level="INFO") # Keep console logging
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
         logger.add(
             self.log_file,
             level="INFO",
             rotation="100 MB",
             retention="14 days",
             compression="zip",
-            enqueue=True,  # This is the key for multiprocessing safety
+            enqueue=True,
             backtrace=True,
             diagnose=True,
             serialize=False,
         )
-
-        # sys.stdout = StreamToLogger(self.logger, logging.INFO)
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
         logger.info('==' * 50)
         
-        # Reset memory statistics
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()
@@ -338,14 +312,7 @@ class SeqVAEGraphModel:
             logger.info("Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
             # Create base model with current config parameters
-            base_model_for_loading = SeqVaeTeb(
-                sequence_length=self.input_size,  # Use config values
-                latent_dim_source=self.latent_dim,
-                latent_dim_target=self.latent_dim, 
-                latent_dim_z=self.latent_dim,
-                decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
-                warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
-            )
+            base_model_for_loading = SeqVaeTeb()
             
             # CRITICAL: Compile the model BEFORE loading checkpoint to match saved state_dict structure
             try:
@@ -430,16 +397,7 @@ class SeqVAEGraphModel:
         """Create fresh model instance with config parameters."""
         logger.info("Creating fresh model with config parameters...")
         
-        self.base_model = SeqVaeTeb(
-                sequence_length=self.input_size,  # Use config values
-                latent_dim_source=self.latent_dim,
-                latent_dim_target=self.latent_dim, 
-                latent_dim_z=self.latent_dim,
-                decimation_factor=self.decimation_factor if hasattr(self, 'decimation_factor') else 16,
-                warmup_period=self.warmup_period if hasattr(self, 'warmup_period') else 30,
-                lstm_hidden_dim=self.rnn_hidden_dim,
-                lstm_num_layers=self.num_layers,
-        )        
+        self.base_model = SeqVaeTeb()        
         # Only compile if not already compiled from checkpoint loading
         if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:
@@ -492,21 +450,10 @@ class SeqVAEGraphModel:
 
     def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
-        logger.info("Creating SeqVaeTeb model with config enforcement...")
-        logger.info(f"Using config parameters:")
-        logger.info(f"  - sequence_length: {self.input_size}")
-        logger.info(f"  - latent_dim: {self.latent_dim}")
-        logger.info(f"  - decimation_factor: {self.decimation_factor}")
-        logger.info(f"  - lr: {self.lr}")
-        logger.info(f"  - beta_schedule: {self.beta_schedule}")
-        logger.info(f"  - beta_const_val: {self.beta_const_val}")
-        
         self.setup_config()
         self.load_checkpoint()
-        
-        # Final validation that our model has correct parameters
         if self.pytorch_model is not None:
-            logger.info("✅ Model created successfully with enforced config parameters")
+            logger.info("Model created successfully with enforced config parameters")
 
     def set_cuda_devices(self, device_list=None):
         self.cuda_devices = device_list if device_list is not None else [0]
@@ -532,26 +479,14 @@ class SeqVAEGraphModel:
             dict: A dictionary containing the training history.
         """
         logger.info("Setting up trainer for the base model...")
-        
-        # Log memory before setting up training - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("Before training setup")
-
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
             plot_every_epoch=self.plot_every_epoch,
-            input_channel_num=self.input_channel_num,
         )
 
         self.metrics_callback = MetricsLoggingCallback()
         self.hyperparameter_callback = HyperparameterLoggingCallback()
 
-        # Optimized memory monitoring for smaller batch sizes - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # self.memory_monitor_callback = MemoryMonitorCallback(
-        #     threshold_gb=6.0,  # Lower threshold for aggressive cleanup
-        #     log_frequency=50   # More frequent monitoring
-        # )
-
-        # Callback for early stopping to prevent overfitting
         self.early_stop_callback = EarlyStopping(
             monitor="val/total_loss",
             min_delta=0.0001,
@@ -560,7 +495,6 @@ class SeqVAEGraphModel:
             mode="min"
         )
 
-        # Callback for saving the best model checkpoint
         self.checkpoint_callback = ModelCheckpoint(
             monitor="val/total_loss",
             mode="min",
@@ -570,23 +504,20 @@ class SeqVAEGraphModel:
             save_last=False,
         )
         
-        # Reset checkpoint callback's best score when loading from checkpoint
         if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
-            logger.info("Resetting checkpoint callback to start fresh monitoring from current validation loss")
-            self.checkpoint_callback.best_model_score = None
-            self.checkpoint_callback.best_model_path = None
+            logger.info("Created fresh checkpoint callback - will monitor validation loss from retrain start")
+            logger.info("New checkpoints will be saved based on validation loss improvements from current point")
+        else:
+            logger.info("Created fresh checkpoint callback for new training")
 
-        # Callback for plotting losses using Plotly with memory optimization
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
             plot_frequency=self.plot_every_epoch,
-            max_history_size=19900  # Limit history to prevent memory issues
+            max_history_size=19900 
         )
 
-        # Profiler for performance analysis
         profiler = SimpleProfiler(dirpath=self.train_results_dir, filename="profiler_base_model.txt")
 
-        # Configure devices and strategy for training
         if self.cuda_devices and len(self.cuda_devices) > 0:
             loging_steps = (len(train_loader.dataset) // self.batch_size_train) // len(self.cuda_devices) if self.batch_size_train > 0 else 1
             process_group_backend = "gloo" if sys.platform == "win32" else "nccl"
@@ -604,7 +535,6 @@ class SeqVAEGraphModel:
 
         callbacks_list = [
             ModelSummary(max_depth=-1),
-            # self.memory_monitor_callback,  # COMMENTED OUT FOR MULTI-GPU PERFORMANCE
             self.plotting_callback,
             self.checkpoint_callback,
             self.loss_plot_callback,
@@ -612,10 +542,6 @@ class SeqVAEGraphModel:
             # self.early_stop_callback,
         ]
 
-        # Log memory after callback setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("After callback setup")
-
-        # Instantiate the PyTorch Lightning Trainer with SOTA optimizations
         trainer = L.Trainer(
             devices=devices,
             accelerator=accelerator,
@@ -632,7 +558,6 @@ class SeqVAEGraphModel:
             callbacks=callbacks_list,
             precision="16-mixed",
             accumulate_grad_batches=max(self.accumulate_grad_batches, 1),
-            # Enhanced memory and speed optimization settings
             limit_train_batches=1.0,
             limit_val_batches=1.0,
             val_check_interval=1.0,
@@ -642,17 +567,14 @@ class SeqVAEGraphModel:
             deterministic=False,
             benchmark=True,
             enable_model_summary=False,  # Disable to save memory
-            # SOTA optimizations for faster training
             reload_dataloaders_every_n_epochs=0,  # Don't reload dataloaders
             use_distributed_sampler=True if len(self.cuda_devices) > 1 else False,
             inference_mode=False,        # Use training mode for better performance
             barebones=False,            # Use full trainer features
         )
 
-        # Log memory after trainer setup - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
         log_gpu_memory_usage("After trainer setup")
 
-        # Find optimal batch size first
         logger.info("Finding optimal batch size using PyTorch Lightning's tuner...")
         tuner = Tuner(trainer)
         
@@ -719,10 +641,6 @@ class SeqVAEGraphModel:
         )
         logger.info("Finished training the base model.")
 
-        # Log memory after training completes - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("After training completes")
-
-        # Save training history
         training_hist = self.loss_plot_callback.history
         path_save_hist = os.path.join(self.train_results_dir, 'base_model_history.pkl')
         with open(path_save_hist, 'wb') as f:
@@ -730,7 +648,6 @@ class SeqVAEGraphModel:
         
         logger.info(f"Training history saved to {path_save_hist}")
         
-        # Save hyperparameter history
         hyperparameter_hist = self.hyperparameter_callback.history
         path_save_hyperparams = os.path.join(self.train_results_dir, 'hyperparameter_history.pkl')
         with open(path_save_hyperparams, 'wb') as f:
@@ -738,7 +655,6 @@ class SeqVAEGraphModel:
         
         logger.info(f"Hyperparameter history saved to {path_save_hyperparams}")
         
-        # Generate final hyperparameter plot
         if trainer.is_global_zero:
             self.hyperparameter_callback.plot_hyperparameters(self.train_results_dir)
 
