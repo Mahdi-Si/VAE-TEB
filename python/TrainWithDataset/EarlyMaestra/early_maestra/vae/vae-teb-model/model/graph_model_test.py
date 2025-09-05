@@ -71,9 +71,52 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                             f"run_tests: Requested CUDA device {cuda_device} is not available. "
                             "Falling back to default device configuration."
                         )
+            else:
+                # Use CUDA devices from config.yaml if no specific device requested
+                if self.cuda_devices and len(self.cuda_devices) > 0 and torch.cuda.is_available():
+                    # For testing, use the first available GPU from config
+                    available_devices = [d for d in self.cuda_devices if d < torch.cuda.device_count()]
+                    if available_devices:
+                        self.set_cuda_devices([available_devices[0]])  # Use first available GPU for testing
+                        logger.info(f"run_tests: Using CUDA device cuda:{available_devices[0]} from config (available: {available_devices})")
+                    else:
+                        logger.warning("run_tests: No configured CUDA devices available. Using CPU.")
+                        self.set_cuda_devices([])
+                else:
+                    logger.info("run_tests: No CUDA devices configured or CUDA not available. Using CPU.")
+                    
             torch.set_float32_matmul_precision('high')
         except Exception as e:
             logger.warning(f"run_tests: Device selection setup failed: {e}")
+
+        # CRITICAL FIX: Create model ONCE at the beginning to ensure consistency
+        logger.info("Creating model once for all test analyses...")
+        logger.info(f"Config CUDA devices: {self.config['general_config']['cuda_devices']}")
+        logger.info(f"Selected CUDA devices for testing: {self.cuda_devices}")
+        
+        self.create_model()
+        
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting all tests.")
+            return
+            
+        # Set model to eval mode and log the beta value being used
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        logger.info(f"Moving model to device: {device}")
+        self.pytorch_model.to(device)
+        self.pytorch_model.eval()
+        
+        # Log beta value for debugging
+        effective_beta = getattr(self.lightning_base_model, 'current_beta', self.kld_beta_) if hasattr(self, 'lightning_base_model') else self.kld_beta_
+        logger.info(f"Using beta value for testing: {effective_beta}")
+        logger.info(f"Config beta_const_val: {getattr(self, 'beta_const_val', 'N/A')}")
+        logger.info(f"Config beta_schedule: {getattr(self, 'beta_schedule', 'N/A')}")
+        
+        # Verify model is in correct mode and device
+        logger.info(f"Model training mode: {self.pytorch_model.training}")
+        if hasattr(self.pytorch_model, 'parameters'):
+            sample_param = next(iter(self.pytorch_model.parameters()))
+            logger.info(f"Model device: {sample_param.device}")
 
         target_count = 50
         selected_guids = []
@@ -97,32 +140,37 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         except Exception as e:
             logger.warning(f"Could not preselect GUIDs: {e}. Tests will pick samples as available.")
 
-        self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids)
-        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids)
-        self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir)
-        self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
-        self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir)
+        # Pass the created model to avoid re-creation in each analysis function
+        self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids, model_created=True)
+        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids, model_created=True)
+        self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir, model_created=True)
+        self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir, model_created=True)
+        self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir, model_created=True)
 
 
-    def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None):
+    def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None, model_created=False):
         """
         Runs a full analysis on randomly selected samples from the test loader and plots the results.
         
         Args:
             test_loader: DataLoader for test data
             num_samples: Number of random samples to analyze and plot (default: 50)
+            model_created: If True, skip model creation (model already created)
         """
         out_dir = output_dir or self.test_results_dir
         logger.info(f"Starting model analysis and plotting on {num_samples} random samples...")
-        self.create_model()
+        
+        if not model_created:
+            self.create_model()
 
         if self.pytorch_model is None:
             logger.error("PyTorch model could not be created or loaded. Aborting analysis.")
             return
 
         device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
-        self.pytorch_model.to(device)
-        self.pytorch_model.eval()
+        if not model_created:
+            self.pytorch_model.to(device)
+            self.pytorch_model.eval()
 
         # Get normalization stats from the dataset for denormalization
         normalization_stats = None
@@ -223,10 +271,12 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     reconstructed_fhr_logvar = forward_outputs['logvar_pr']
 
                     # Compute loss the same way as training to get consistent KLD values
+                    # CRITICAL FIX: Use the same beta as training (beta_const_val from config)
+                    effective_beta = getattr(self, 'beta_const_val', self.kld_beta_)
                     loss_dict = self.pytorch_model.compute_loss(
                         forward_outputs, y_st, y_ph, y_raw, 
                         compute_kld_loss=True, 
-                        beta=self.kld_beta_)
+                        beta=effective_beta)
                     
                     # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
@@ -329,7 +379,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         logger.info(f"Model analysis and plotting complete for {num_samples} samples.")
         logger.info(f"Plots saved to: {out_dir}")
 
-    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None, selected_guids=None):
+    def run_transfer_entropy_shift_analysis(self, test_loader, num_samples=None, max_left_shift_seconds=60, step_seconds=1, output_dir=None, selected_guids=None, model_created=False):
         """Measure and plot TE (KLD) vs UP left-shift per sample (no averaging).
 
         Args:
@@ -344,15 +394,18 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         logger.info(
             f"Starting per-sample TE vs shift (LEFT only). Samples: {('ALL' if num_samples is None else num_samples)}, max_left_shift_seconds={max_left_shift_seconds}, step={step_seconds}"
         )
-        self.create_model()
+        
+        if not model_created:
+            self.create_model()
         
         if self.pytorch_model is None:
             logger.error("PyTorch model could not be created or loaded. Aborting shift analysis.")
             return
             
         device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
-        self.pytorch_model.to(device)
-        self.pytorch_model.eval()
+        if not model_created:
+            self.pytorch_model.to(device)
+            self.pytorch_model.eval()
         
         # Get normalization stats for the fhr_up_ph field
         normalization_stats = None
@@ -629,7 +682,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
             
             logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
 
-    def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None):
+    def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None, model_created=False):
         """
         Calculate VAF, MSE, SNR between normalized raw FHR and reconstructed FHR,
         and KLD loss for each sample, then plot histograms of these metrics.
@@ -640,15 +693,18 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         """
         out_dir = output_dir or self.test_results_dir
         logger.info("Starting metrics histogram analysis...")
-        self.create_model()
+        
+        if not model_created:
+            self.create_model()
         
         if self.pytorch_model is None:
             logger.error("PyTorch model could not be created or loaded. Aborting metrics analysis.")
             return
             
         device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
-        self.pytorch_model.to(device)
-        self.pytorch_model.eval()
+        if not model_created:
+            self.pytorch_model.to(device)
+            self.pytorch_model.eval()
         
         # Get normalization stats for denormalization
         normalization_stats = None
@@ -801,7 +857,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
             
         logger.info(f"Metrics histogram analysis complete. Results saved to: {results_path}")
 
-    def run_up_ablation_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None):
+    def run_up_ablation_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None, model_created=False):
         """Compare TE (KLD) and reconstruction quality (VAF) with and without UP input.
 
         Args:
@@ -813,14 +869,16 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         """
         out_dir = output_dir or self.test_results_dir
         logger.info("Starting UP ablation analysis (with vs without UP)...")
-        self.create_model()
+        
+        if not model_created:
+            self.create_model()
 
         if self.pytorch_model is None:
             logger.error("PyTorch model could not be created or loaded. Aborting ablation analysis.")
             return
 
         device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
-        model = self.pytorch_model.to(device)
+        model = self.pytorch_model.to(device) if not model_created else self.pytorch_model
         model.eval()
 
         kld_with_up, kld_without_up = [], []
@@ -904,7 +962,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         except Exception as e:
             logger.warning(f"Failed to plot ablation analysis: {e}")
 
-    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None, selected_guids=None):
+    def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None, selected_guids=None, model_created=False):
         """Sweep multiplicative gains on UP features and track TE (KLD) and VAF trends.
 
         Args:
@@ -917,14 +975,16 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         """
         out_dir = output_dir or self.test_results_dir
         logger.info("Starting UP gain sweep analysis...")
-        self.create_model()
+        
+        if not model_created:
+            self.create_model()
 
         if self.pytorch_model is None:
             logger.error("PyTorch model could not be created or loaded. Aborting gain sweep analysis.")
             return
 
         device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
-        model = self.pytorch_model.to(device)
+        model = self.pytorch_model.to(device) if not model_created else self.pytorch_model
         model.eval()
 
         gains = gains if gains is not None else [0.0, 0.5, 1.0, 1.5, 2.0]
