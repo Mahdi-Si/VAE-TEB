@@ -2,12 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Union, Dict
-import math
-import warnings
-import gc
 
 import math
 from typing import List
+
+from utils.custom_logger import setup_logging
+
+setup_logging(
+    log_to_file=True,
+    log_to_console=True,
+    file_path="my_service.log",
+    file_level="DEBUG",
+    console_level="INFO",
+    rotation="100 MB",
+    retention="14 days",
+    compression="zip",
+    serialize=False,   # True → JSON output
+    backtrace=True,    # include full stack backtraces
+    diagnose=False,    # include local vars in tracebacks
+)
+
+# Now all logging goes through Loguru
+from loguru import logger as log
+import logging as std_logging
 
 def geometric_schedule(
     input_size: int,
@@ -16,18 +33,6 @@ def geometric_schedule(
     *,
     round_fn=round
 ) -> List[int]:
-    """
-    SPEED OPTIMIZED: Compute a geometric progression of layer sizes from `input_size` down/up to `output_size`,
-    with `n_hidden` intermediate layers.
-
-    Returns a list of length n_hidden+2: [input_size, h1, h2, ..., h_n, output_size].
-    
-    Arguments:
-    - input_size:  starting dimension (e.g. 16)
-    - output_size: ending dimension (e.g. 64)
-    - n_hidden:    number of hidden layers (e.g. 6)
-    - round_fn:    function to turn floats into ints (default=round)
-    """
     steps = n_hidden + 1
     r = (output_size / input_size) ** (1 / steps)
 
@@ -41,13 +46,6 @@ def geometric_schedule(
     return tuple(sizes[1:])
 
 def initialization(model: nn.Module) -> None:
-    """
-    Applies state-of-the-art initialization schemes to all model components.
-    Called automatically during model instantiation to ensure proper gradient flow.
-
-    Args:
-        model: PyTorch model to initialize
-    """
     for name, module in model.named_modules():
         if isinstance(module, (nn.Linear, nn.Conv1d, nn.ConvTranspose1d)):
             nn.init.xavier_uniform_(module.weight)
@@ -68,10 +66,6 @@ def initialization(model: nn.Module) -> None:
 
 
 class CausalConv1d(nn.Module):
-    """
-    Optimized causal 1D convolution that ensures no future information leaks.
-    Uses efficient padding strategy and supports mixed precision.
-    """
 
     def __init__(
         self,
@@ -1200,7 +1194,6 @@ class SeqVaeTeb(nn.Module):
         return y, mean
 
 
-
 class SeqVaeTebClassifier(nn.Module):
     """
     Combined model that integrates SeqVaeTeb encoder with FHR Inception Time classifier.
@@ -1214,14 +1207,6 @@ class SeqVaeTebClassifier(nn.Module):
     
     def __init__(
         self,
-        # SeqVaeTeb parameters
-        input_channels: int = 76,
-        sequence_length: int = 300,
-        latent_dim_source: int = 32,
-        latent_dim_target: int = 32,
-        latent_dim_z: int = 32,
-        decimation_factor: int = 16,
-        warmup_period: int = 30,
         # Classifier parameters
         num_classes: int = 2,
         classifier_filters: int = 32,
@@ -1229,25 +1214,18 @@ class SeqVaeTebClassifier(nn.Module):
         classifier_dropout: float = 0.2,
         use_attention: bool = True,
         # Training parameters
+        latent_dim_z: int = 16,
         freeze_vae: bool = True,
         pretrained_vae_path: Optional[str] = None,
+        class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         
         self.freeze_vae = freeze_vae
         self.num_classes = num_classes
-        self.latent_dim_z = latent_dim_z
         
         # Initialize SeqVaeTeb encoder
-        self.vae_model = SeqVaeTeb(
-            input_channels=input_channels,
-            sequence_length=sequence_length,
-            latent_dim_source=latent_dim_source,
-            latent_dim_target=latent_dim_target,
-            latent_dim_z=latent_dim_z,
-            decimation_factor=decimation_factor,
-            warmup_period=warmup_period,
-        )
+        self.vae_model = SeqVaeTeb()
         
         # Load pretrained VAE if provided
         if pretrained_vae_path is not None:
@@ -1259,7 +1237,7 @@ class SeqVaeTebClassifier(nn.Module):
         
         # Import FHRInceptionTimeClassifier
         try:
-            from .inception_time import FHRInceptionTimeClassifier
+            from model.inception_time import FHRInceptionTimeClassifier
         except ImportError:
             from inception_time import FHRInceptionTimeClassifier
         
@@ -1273,46 +1251,62 @@ class SeqVaeTebClassifier(nn.Module):
             use_attention=use_attention
         )
         
-        # Loss function for classification
-        self.classification_criterion = nn.CrossEntropyLoss()
+        self.classification_criterion = nn.CrossEntropyLoss(weight=class_weights)
         
     def load_pretrained_vae(self, pretrained_path: str):
-        """Load pretrained SeqVaeTeb weights."""
+        """Load pretrained SeqVaeTeb weights (handles Lightning checkpoints).
+
+        Notes:
+        - Lightning `state_dict` usually prefixes model params with 'model.'.
+        - We strip that prefix when loading directly into a bare SeqVaeTeb.
+        - torch.compile does not affect state_dict; compile after loading if desired.
+        """
         try:
-            checkpoint = torch.load(pretrained_path, map_location='cpu')
-            
-            if 'model_state_dict' in checkpoint:
-                vae_state_dict = checkpoint['model_state_dict']
-            elif 'state_dict' in checkpoint:
-                vae_state_dict = checkpoint['state_dict']
-            else:
-                vae_state_dict = checkpoint
-            
-            # Load weights with strict=False to allow for missing keys
-            missing_keys, unexpected_keys = self.vae_model.load_state_dict(vae_state_dict, strict=False)
-            
+            ckpt = torch.load(pretrained_path, map_location="cpu")
+            # Prefer Lightning's 'state_dict' if present; otherwise treat the whole object as a state dict
+            sd = ckpt.get("state_dict", ckpt)
+
+            # Strip leading 'model.' if present on keys
+            new_sd = {}
+            for k, v in sd.items():
+                nk = k[6:] if k.startswith("model.") else k
+                new_sd[nk] = v
+
+            # Load with strict=False to tolerate non-matching classifier-related keys, etc.
+            incompatible = self.vae_model.load_state_dict(new_sd, strict=False)
+
+            # Support both tuple and IncompatibleKeys return types
+            try:
+                missing_keys = getattr(incompatible, "missing_keys", [])
+                unexpected_keys = getattr(incompatible, "unexpected_keys", [])
+            except Exception:
+                try:
+                    missing_keys, unexpected_keys = incompatible
+                except Exception:
+                    missing_keys, unexpected_keys = [], []
+
             if missing_keys:
-                print(f"Warning: Missing keys when loading VAE: {missing_keys}")
+                log.warning(f"[SeqVaeTebClassifier] Missing keys when loading VAE: {missing_keys}")
             if unexpected_keys:
-                print(f"Warning: Unexpected keys when loading VAE: {unexpected_keys}")
-                
-            print(f"Successfully loaded pretrained VAE from {pretrained_path}")
-            
+                log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading VAE: {unexpected_keys}")
+
+            log.info(f"Loaded pretrained VAE weights from {pretrained_path}")
+
         except Exception as e:
-            print(f"Error loading pretrained VAE: {e}")
-            print("Continuing with random initialization...")
+            log.error(f"Error loading pretrained VAE from '{pretrained_path}': {e}")
+            log.warning("Continuing with randomly initialized VAE parameters…")
     
     def freeze_vae_parameters(self):
         """Freeze all VAE parameters to prevent updates during classification training."""
         for param in self.vae_model.parameters():
             param.requires_grad = False
-        print("Frozen VAE parameters for classification training")
+        log.info("Frozen VAE parameters for classification training")
     
     def unfreeze_vae_parameters(self):
         """Unfreeze VAE parameters for end-to-end fine-tuning."""
         for param in self.vae_model.parameters():
             param.requires_grad = True
-        print("Unfrozen VAE parameters for end-to-end training")
+        log.info("Unfrozen VAE parameters for end-to-end training")
     
     def extract_latent_features(
         self,

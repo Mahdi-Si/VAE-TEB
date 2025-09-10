@@ -1,16 +1,16 @@
 general_config:
-  tag: seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__  # Descriptive experiment name
-  cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
-  lr: 0.000001  # Learning rate (reduced for stability)
-  lr_milestone: [400, 800]  # Epochs at which to decay learning rate
-  weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
+  tag: seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  lr: 0.0001
+  lr_milestone: [400, 800]
+  weight_decay: 0.0001
   checkpoint_frequency: 1
-  plot_frequency: 1  # Plot every 5 epochs to reduce I/O
-  epochs: 10000  # Increased for better convergence
-  accumulate_grad_batches: 1  # Gradient accumulation for effective larger batch size
+  plot_frequency: 1
+  epochs: 10000
+  accumulate_grad_batches: 1
   batch_size:
-    train: 1700  # Increased from 2 for better training stability
-    test: 1700   # Can be larger for testing since no gradients
+    train: 1700
+    test: 1700
   
   # SOTA Training Optimizations
   optimization:
@@ -21,11 +21,10 @@ general_config:
 
 model_config:
   VAE_model:
-    freeze_seqvae: False        # Whether to freeze VAE during classifier training
-    zero_source: False           # Whether to zero source during certain experiments
+    freeze_seqvae: False
+    zero_source: False
     
     # Beta Scheduling Configuration
-    # Controls the strength of regularization terms across training
     beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0            # Starting beta value for annealing schedules
     beta_end: 1.0              # Final beta value for TEB
@@ -33,13 +32,7 @@ model_config:
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
     beta_const_val: 0.001        # Constant beta value when schedule='constant'
     kld_beta: 0.001              # Fallback beta value (legacy parameter)
-    
-    # Standard TEB Configuration
-    # Original TEB formulation with conditional prior p(z|y)
-    # Single KL divergence: KL(q(z|x,y) || p(z|y))
-    # Direct transfer entropy measurement
 
-  seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
   base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
 
 folders_config:
