@@ -22,14 +22,6 @@ from tqdm import tqdm
 import time
 import numpy as np
 
-from  utils.plot_utils import (
-    plot_model_analysis,
-    plot_vae_reconstruction,
-    plot_transfer_entropy_vs_shift,
-    plot_metrics_histograms,
-    plot_te_ablation_results,
-    plot_te_gain_sweep,
-)
 from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
@@ -40,8 +32,6 @@ from pytorch_lightning_modules import *
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import SeqVaeTeb
 from pytorch_lightning_modules import LightSeqVaeTeb
-
-from torch.optim.lr_scheduler import MultiStepLR
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -81,16 +71,12 @@ def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, norm
     
     stats = normalization_stats[field_name]
     
-    # Get mean and std tensors (these should be scalars for fhr/up)
     if 'mean_tensor' in stats and 'std_tensor' in stats:
         mean_tensor = stats['mean_tensor']
         std_tensor = stats['std_tensor']
     else:
-        # Fallback to creating tensors from scalar values
         mean_tensor = torch.tensor(stats['mean'], dtype=normalized_data.dtype, device=normalized_data.device)
-        std_tensor = torch.tensor(stats['std'], dtype=normalized_data.dtype, device=normalized_data.device)
-    
-    # Denormalize: original = normalized * std + mean
+        std_tensor = torch.tensor(stats['std'], dtype=normalized_data.dtype, device=normalized_data.device)    
     epsilon = 1e-8
     denormalized_data = normalized_data * (std_tensor + epsilon) + mean_tensor
     
@@ -116,15 +102,6 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-def check_memory_threshold(threshold_gb=10.0):
-    """Check if GPU memory usage exceeds threshold and clear cache if needed."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        if allocated > threshold_gb:
-            logger.warning(f"GPU memory usage ({allocated:.2f}GB) exceeds threshold ({threshold_gb}GB). Clearing cache...")
-            clear_gpu_memory()
-            return True
-    return False
 
 def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_batch_size=1):
     """
@@ -145,29 +122,23 @@ def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_
     
     for batch_size in range(min_batch_size, max_batch_size + 1, 2):
         try:
-            # Clear memory before test
             clear_gpu_memory()
             
-            # Create test batch with current batch size
             test_y_st = sample_batch.fhr_st[:batch_size].to(device)
             test_y_ph = sample_batch.fhr_ph[:batch_size].to(device)
             test_x_ph = sample_batch.fhr_up_ph[:batch_size].to(device)
             test_y_raw = sample_batch.fhr[:batch_size].to(device)
             
-            # Test forward pass
             with torch.no_grad():
                 forward_outputs = model(test_y_st, test_y_ph, test_x_ph)
                 loss_dict = model.compute_loss(forward_outputs, test_y_st, test_y_ph, test_y_raw, compute_kld_loss=True, beta=1.0)
                 loss = loss_dict['total_loss']
                 
-            # Test backward pass (without updating weights)
             loss.backward()
             
-            # If we get here, this batch size works
             optimal_batch_size = batch_size
             logger.info(f"Batch size {batch_size} successful")
             
-            # Clean up test tensors
             del test_y_st, test_y_ph, test_x_ph, test_y_raw
             del forward_outputs, loss_dict, loss
             clear_gpu_memory()
@@ -187,7 +158,6 @@ def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_
     safe_batch_size = max(1, int(optimal_batch_size * 0.8))
     logger.info(f"Optimal batch size found: {safe_batch_size} (80% of max working size {optimal_batch_size})")
     
-    # Reset model to training mode
     model.train()
     clear_gpu_memory()
     
@@ -218,7 +188,6 @@ class SeqVAEGraphModel:
         self.log_file = None
         self.logger = None
 
-        # logger.info yaml file properly -------------------------------------------------------------------------------------
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
         logger.info('==' * 50)
         self.stat_path = os.path.normpath(self.config['dataset_config']['stat_path'])
@@ -236,16 +205,12 @@ class SeqVAEGraphModel:
         self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 50))
         self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
-        
-        self.seqvae_ckp = self.config['model_config']['seqvae_checkpoint']
 
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
         self.accumulate_grad_batches = self.config['general_config'].get('accumulate_grad_batches', 1)
 
-        self.test_checkpoint_path = None
-        self.seqvae_testing_checkpoint = self.config['seqvae_testing']['test_checkpoint_path']
         self.base_model_checkpoint = self.config['model_config']['base_model_checkpoint']
 
         self.clip = 10
@@ -339,13 +304,11 @@ class SeqVAEGraphModel:
                     logger.warning("Loading checkpoint into uncompiled model - this may cause key mismatches")
 
             try:
-                # Load from checkpoint but FORCE all hyperparameters from current config
                 logger.info("Loading Lightning checkpoint with strict architecture matching...")
                 self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
                     self.base_model_checkpoint,
-                    seqvae_teb_model=base_model_for_loading,  # Required for LightSeqVaeTeb init
-                    strict=False,  # Allow missing keys in checkpoint
-                    # FORCE config hyperparameters (these override checkpoint values)
+                    seqvae_teb_model=base_model_for_loading,
+                    strict=False,
                     lr=self.lr,
                     lr_milestones=self.lr_milestones,
                     beta_schedule=self.beta_schedule,
@@ -376,7 +339,6 @@ class SeqVAEGraphModel:
                 
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model
-                # Skip compilation in _create_fresh_model since model is already compiled
                 self._skip_compilation = True
                 logger.info("Successfully loaded checkpoint with CONFIG hyperparameters enforced.")
                 
@@ -398,13 +360,12 @@ class SeqVAEGraphModel:
         logger.info("Creating fresh model with config parameters...")
         
         self.base_model = SeqVaeTeb()        
-        # Only compile if not already compiled from checkpoint loading
         if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:
                 compile_options = {
-                    'mode': 'max-autotune-no-cudagraphs',  # Max optimization without CUDA graphs
-                    'fullgraph': False,      # Allow graph breaks for complex models
-                    'dynamic': True,         # Handle dynamic shapes efficiently
+                    'mode': 'max-autotune-no-cudagraphs',
+                    'fullgraph': False,
+                    'dynamic': True,
                 }
                 self.base_model = torch.compile(self.base_model, **compile_options)
                 logger.info("Model successfully compiled with torch.compile (max-autotune-no-cudagraphs mode)")
@@ -415,7 +376,7 @@ class SeqVAEGraphModel:
                         'mode': 'reduce-overhead',
                         'fullgraph': False,
                         'dynamic': True,
-                        'options': {'triton.cudagraphs': False}  # Explicitly disable CUDA graphs
+                        'options': {'triton.cudagraphs': False}
                     }
                     self.base_model = torch.compile(self.base_model, **compile_options)
                     logger.info("Model compiled with reduce-overhead mode (CUDA graphs disabled for DDP)")
@@ -437,16 +398,6 @@ class SeqVAEGraphModel:
         )
         self.pytorch_model = self.base_model  # Set pytorch_model reference
 
-    def load_pytorch_checkpoint(self):
-        if self.seqvae_ckp is not None:
-            logger.info(f"Loading checkpoint: {self.seqvae_ckp}")
-            # checkpoint = torch.load(self.seqvae_checkpoint_path,  map_location=self.device)
-            checkpoint = torch.load(self.seqvae_ckp)
-            state_dict = checkpoint['state_dict']
-            # filtered_state_dict = {k: v for k, v in checkpoint['state_dict'].items() if 'scattering_transform' not in k}
-            state_dict = {k.replace('seqvae_model.', ''): v for k, v in state_dict.items()}
-            self.pytorch_model.load_state_dict(state_dict)
-            logger.info(f"Loaded checkpoint '{self.seqvae_ckp}' (epoch {checkpoint['epoch']})")
 
     def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
@@ -531,7 +482,7 @@ class SeqVAEGraphModel:
             devices = "auto"
         
         if loging_steps == 0:
-            loging_steps = 1 # log at least once per epoch.
+            loging_steps = 1
 
         callbacks_list = [
             ModelSummary(max_depth=-1),
@@ -548,7 +499,7 @@ class SeqVAEGraphModel:
             strategy=strategy,
             log_every_n_steps=loging_steps,
             gradient_clip_val=0.5,
-            gradient_clip_algorithm="norm",  # Specify clipping algorithm
+            gradient_clip_algorithm="norm",
             max_epochs=self.epochs_num,
             enable_checkpointing=True,
             enable_progress_bar=True,
