@@ -36,7 +36,7 @@ data_config:
     val: 128
     test: 128
   dataset_kwargs:
-    load_fields: [fhr, up, fhr_st, fhr_ph, fhr_up_ph, target, weight, guid]
+    load_fields: [fhr, up, fhr_st, fhr_ph, fhr_up_ph, target, weight, guid, epoch, cs_label, bg_label]
     cache_size: 2000
     trim_minutes: 2.0
 
