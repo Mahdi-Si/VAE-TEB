@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import csv
 import yaml
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -252,6 +253,147 @@ def train_one_fold(
     else:
         trainer.fit(lm, train_dataloaders=train_loader, val_dataloaders=val_loader)
     trainer.test(lm, dataloaders=test_loader, ckpt_path="best")
+
+    # After testing, export predictions CSV for the test set using best checkpoint
+    try:
+        # Find best checkpoint path
+        best_ckpt = None
+        for cb in callbacks:
+            if isinstance(cb, ModelCheckpoint):
+                best_ckpt = cb.best_model_path
+                break
+        if not best_ckpt:
+            if hasattr(trainer, "checkpoint_callback") and trainer.checkpoint_callback:
+                best_ckpt = trainer.checkpoint_callback.best_model_path
+
+        export_ckpt = best_ckpt if (best_ckpt and os.path.exists(best_ckpt)) else None
+        out_csv = os.path.join(out_dir, "test_predictions.csv")
+        export_test_predictions(
+            export_ckpt=export_ckpt,
+            base_model_cfg=model_cfg,
+            lm_current=lm,
+            test_loader=test_loader,
+            out_csv_path=out_csv,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        logger.info(f"Saved test predictions to {out_csv}")
+    except Exception as e:
+        logger.warning(f"Failed to export test predictions CSV: {e}")
+
+
+def export_test_predictions(
+    export_ckpt: Optional[str],
+    base_model_cfg: Dict[str, Any],
+    lm_current: "LightSeqVaeTebClassifier",
+    test_loader,
+    out_csv_path: str,
+    device: str = "cpu",
+):
+    """Run inference on test_loader and write CSV with requested columns."""
+    # Build a fresh classifier matching training config
+    num_classes = int(base_model_cfg.get("num_classes", 2))
+    filters = int(base_model_cfg.get("filters", 32))
+    depth = int(base_model_cfg.get("depth", 6))
+    dropout = float(base_model_cfg.get("dropout", 0.2))
+    use_attention = bool(base_model_cfg.get("use_attention", True))
+    freeze_vae_flag = bool(base_model_cfg.get("freeze_vae", True))
+    pretrained_vae_ckpt = base_model_cfg.get("pretrained_vae_ckpt")
+    class_weights = base_model_cfg.get("class_weights")
+
+    classifier = SeqVaeTebClassifier(
+        num_classes=num_classes,
+        classifier_filters=filters,
+        classifier_depth=depth,
+        classifier_dropout=dropout,
+        use_attention=use_attention,
+        freeze_vae=freeze_vae_flag,
+        pretrained_vae_path=pretrained_vae_ckpt,
+        class_weights=torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None,
+    )
+
+    if export_ckpt and os.path.exists(export_ckpt):
+        lm = LightSeqVaeTebClassifier.load_from_checkpoint(export_ckpt, model=classifier, strict=False)
+    else:
+        lm = lm_current
+
+    lm.eval().to(device)
+
+    header = [
+        "guid",
+        "epoch",
+        "cs_label",
+        "bg_label",
+        "target",
+        "target_model",
+        "probability",
+    ]
+
+    with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        with torch.no_grad():
+            for batch in test_loader:
+                y_st = batch.fhr_st.to(device)
+                y_ph = batch.fhr_ph.to(device)
+                x_ph = batch.fhr_up_ph.to(device)
+
+                # Metadata fields may be tensors/lists/bytes
+                guid = getattr(batch, "guid", None)
+                epoch = getattr(batch, "epoch", None)
+                cs_label = getattr(batch, "cs_label", None)
+                bg_label = getattr(batch, "bg_label", None)
+                target_ts = getattr(batch, "target", None)
+
+                out = lm.model(y_st, y_ph, x_ph, labels=None, return_latent=False)
+                probs = out["probabilities"].detach().cpu()
+                preds = out["predictions"].detach().cpu()
+
+                # Dataset target scalar = max over time (1..C)
+                if target_ts is not None:
+                    if torch.is_tensor(target_ts):
+                        target_vals = target_ts.max(dim=1).values.detach().cpu().long()
+                    else:
+                        import numpy as np
+                        tt = np.asarray(target_ts)
+                        target_vals = torch.from_numpy(tt.max(axis=1)).long()
+                else:
+                    target_vals = torch.zeros(preds.shape[0], dtype=torch.long)
+
+                B = preds.shape[0]
+                for i in range(B):
+                    pred = int(preds[i].item())
+                    prob = float(probs[i, pred].item())
+
+                    def norm_val(v, idx):
+                        try:
+                            if v is None:
+                                return ""
+                            vi = v[idx]
+                            if torch.is_tensor(vi):
+                                vi = vi.detach().cpu()
+                                if vi.dtype == torch.uint8:
+                                    return vi.numpy().tobytes().decode("utf-8", errors="ignore")
+                                try:
+                                    return vi.item()
+                                except Exception:
+                                    return str(vi)
+                            if isinstance(vi, bytes):
+                                return vi.decode("utf-8", errors="ignore")
+                            return str(vi)
+                        except Exception:
+                            return ""
+
+                    row = [
+                        norm_val(guid, i),
+                        norm_val(epoch, i),
+                        norm_val(cs_label, i),
+                        norm_val(bg_label, i),
+                        int(target_vals[i].item()),
+                        pred,
+                        f"{prob:.6f}",
+                    ]
+                    writer.writerow(row)
 
 
 def _run_fold_process(fold_path: str, fold_out: str, cfg: Dict[str, Any], assigned_gpus: List[int]):
