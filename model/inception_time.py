@@ -1,4 +1,5 @@
 import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import warnings
@@ -33,7 +34,7 @@ class FHRInception(nn.Module):
             out_channels=filters,
             kernel_size=5,  # ~5 time steps
             stride=1,
-            padding=2,
+            padding='same',
             bias=False
         )
         
@@ -43,7 +44,7 @@ class FHRInception(nn.Module):
             out_channels=filters,
             kernel_size=15,  # ~15 time steps
             stride=1,
-            padding=7,
+            padding='same',
             bias=False
         )
         
@@ -53,7 +54,7 @@ class FHRInception(nn.Module):
             out_channels=filters,
             kernel_size=40,  # ~40 time steps
             stride=1,
-            padding=20,
+            padding='same',
             bias=False
         )
         
@@ -186,7 +187,7 @@ class FHRInceptionTimeClassifier(nn.Module):
     """
     Optimized Inception Time model for FHR signal classification from latent representations.
     
-    Designed to work with SeqVaeTeb latent outputs (batch, 300, 32) and classify
+    Designed to work with SeqVaeTeb latent outputs (batch, 300, input_size) and classify
     FHR patterns for clinical decision making.
     """
     def __init__(

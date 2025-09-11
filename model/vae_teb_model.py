@@ -847,7 +847,7 @@ class Decoder(nn.Module):
         latent representation learning.
         
         Args:
-            latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=32)
+            latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=latent_dim)
         Returns:
             Tuple containing:
             - linear_output: Auxiliary features (batch_size, sequence_length, 87)
@@ -1363,7 +1363,7 @@ class SeqVaeTebClassifier(nn.Module):
             return_all_outputs: Whether to return all VAE outputs or just latent z
             
         Returns:
-            latent_z: Latent representations (batch, 300, 32)
+            latent_z: Latent representations (batch, 300, latent_dim_z)
             vae_outputs: Full VAE outputs (if return_all_outputs=True)
         """
         # Set VAE to eval mode if frozen
@@ -1374,7 +1374,7 @@ class SeqVaeTebClassifier(nn.Module):
         with torch.set_grad_enabled(not self.freeze_vae):
             vae_outputs = self.vae_model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
         
-        latent_z = vae_outputs['z']  # (batch, 300, 32)
+        latent_z = vae_outputs['z']  # (batch, 300, latent_dim_z)
         
         if return_all_outputs:
             return latent_z, vae_outputs

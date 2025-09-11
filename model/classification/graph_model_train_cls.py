@@ -71,7 +71,7 @@ def build_dataloaders_for_fold(
     common_kwargs = dict(
         rank=rank,
         world_size=world_size,
-        stats_path=stats_path,
+        stats_path=stats_pat
         normalize_fields=normalize_fields,
         **dataset_kwargs,
     )
@@ -80,18 +80,21 @@ def build_dataloaders_for_fold(
         hdf5_files=train_files,
         batch_size=batch_sizes.get("train", 32),
         num_workers=num_workers,
+        shuffle=True,
         **common_kwargs,
     )
     val_loader = create_optimized_dataloader(
         hdf5_files=val_files,
         batch_size=batch_sizes.get("val", batch_sizes.get("train", 32)),
         num_workers=max(0, num_workers // 2),
+        shuffle=False,
         **common_kwargs,
     )
     test_loader = create_optimized_dataloader(
         hdf5_files=test_files,
         batch_size=batch_sizes.get("test", batch_sizes.get("val", 32)),
         num_workers=max(0, num_workers // 2),
+        shuffle=False,
         **common_kwargs,
     )
     return train_loader, val_loader, test_loader
