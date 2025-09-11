@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Union, Dict
+from typing import Tuple, Optional, Union, Dict, Any
 
 import math
 from typing import List
@@ -1254,25 +1254,61 @@ class SeqVaeTebClassifier(nn.Module):
         self.classification_criterion = nn.CrossEntropyLoss(weight=class_weights)
         
     def load_pretrained_vae(self, pretrained_path: str):
-        """Load pretrained SeqVaeTeb weights (handles Lightning checkpoints).
+        """Load pretrained SeqVaeTeb weights (Lightning/DataParallel/torch.compile safe).
 
         Notes:
-        - Lightning `state_dict` usually prefixes model params with 'model.'.
-        - We strip that prefix when loading directly into a bare SeqVaeTeb.
-        - torch.compile does not affect state_dict; compile after loading if desired.
+        - Lightning checkpoints typically store weights under 'state_dict' and prefix with
+          'model.'; nested modules may appear as 'model.vae_model.' etc.
+        - DataParallel adds 'module.' and torch.compile can add an '_orig_mod.' wrapper.
+        - This method strips these known prefixes and filters keys to the bare `SeqVaeTeb`.
+        - Shape mismatches raise with details; other discrepancies are logged as warnings.
         """
         try:
             ckpt = torch.load(pretrained_path, map_location="cpu")
             # Prefer Lightning's 'state_dict' if present; otherwise treat the whole object as a state dict
             sd = ckpt.get("state_dict", ckpt)
 
-            # Strip leading 'model.' if present on keys
+            # Normalize key prefixes from common wrappers
+            def _normalize_key(k: str) -> str:
+                prefixes = (
+                    "model.",
+                    "module.",
+                    "_orig_mod.",
+                    "seqvae_model.",
+                    "vae_model.",
+                )
+                changed = True
+                while changed:
+                    changed = False
+                    for p in prefixes:
+                        if k.startswith(p):
+                            k = k[len(p):]
+                            changed = True
+                return k
+
+            # Get current model state_dict to check compatibility
+            current_sd = self.vae_model.state_dict()
+            expected_keys = set(current_sd.keys())
+            
+            # Strip prefixes and filter only keys that belong to the VAE module
             new_sd = {}
             for k, v in sd.items():
-                nk = k[6:] if k.startswith("model.") else k
-                new_sd[nk] = v
+                nk = _normalize_key(k)
+                if nk in expected_keys:
+                    new_sd[nk] = v
+            
+            # Check for shape mismatches in existing keys
+            shape_mismatches = []
+            for k, v in new_sd.items():
+                if k in current_sd and current_sd[k].shape != v.shape:
+                    shape_mismatches.append(f"{k}: current {current_sd[k].shape} vs checkpoint {v.shape}")
+            
+            if shape_mismatches:
+                raise ValueError(f"VAE architecture mismatch - parameter shape conflicts:\n" + 
+                               "\n".join(shape_mismatches[:5]) + 
+                               (f"\n... and {len(shape_mismatches)-5} more" if len(shape_mismatches) > 5 else ""))
 
-            # Load with strict=False to tolerate non-matching classifier-related keys, etc.
+            # Load with strict=False to get missing/unexpected keys info
             incompatible = self.vae_model.load_state_dict(new_sd, strict=False)
 
             # Support both tuple and IncompatibleKeys return types
@@ -1285,16 +1321,18 @@ class SeqVaeTebClassifier(nn.Module):
                 except Exception:
                     missing_keys, unexpected_keys = [], []
 
+            # Log any remaining discrepancies (should be minimal after normalization)
             if missing_keys:
                 log.warning(f"[SeqVaeTebClassifier] Missing keys when loading VAE: {missing_keys}")
             if unexpected_keys:
                 log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading VAE: {unexpected_keys}")
 
-            log.info(f"Loaded pretrained VAE weights from {pretrained_path}")
+            log.info(f"Successfully loaded all VAE parameters from {pretrained_path}")
 
         except Exception as e:
-            log.error(f"Error loading pretrained VAE from '{pretrained_path}': {e}")
-            log.warning("Continuing with randomly initialized VAE parameters…")
+            log.error(f"Failed to load pretrained VAE from '{pretrained_path}': {e}")
+            raise RuntimeError(f"Cannot load incompatible VAE checkpoint. Please use a checkpoint that matches "
+                             f"the current VAE architecture, or train from scratch.") from e
     
     def freeze_vae_parameters(self):
         """Freeze all VAE parameters to prevent updates during classification training."""
@@ -1474,6 +1512,86 @@ class SeqVaeTebClassifier(nn.Module):
         if return_probabilities:
             return outputs['predictions'], outputs['probabilities']
         return outputs['predictions']
+
+    # ---------------------- Loading utilities ----------------------
+    @classmethod
+    def from_lightning_checkpoint(
+        cls,
+        ckpt_path: str,
+        *,
+        map_location: Union[str, torch.device] = "cpu",
+        strict: bool = False,
+        compile_model: bool = False,
+        compile_mode: str = "max-autotune-no-cudagraphs",
+        init_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "SeqVaeTebClassifier":
+        """
+        Construct a SeqVaeTebClassifier and load weights from a Lightning checkpoint
+        produced by LightSeqVaeTebClassifier.
+
+        The Lightning checkpoint's state_dict is under the 'model.' prefix since the
+        LightningModule wraps the classifier as self.model. This method strips that
+        prefix and loads into a bare SeqVaeTebClassifier.
+
+        Args:
+            ckpt_path: Path to the .ckpt file saved by Lightning
+            map_location: torch.load map_location
+            strict: Whether to enforce exact key matching
+            compile_model: If True, wraps the returned model with torch.compile
+            compile_mode: torch.compile mode (default: 'max-autotune-no-cudagraphs')
+            init_kwargs: Keyword args to instantiate the classifier (e.g., num_classes,...)
+
+        Returns:
+            Loaded SeqVaeTebClassifier instance (optionally compiled)
+        """
+        init_kwargs = init_kwargs or {}
+        model = cls(**init_kwargs)
+
+        ckpt = torch.load(ckpt_path, map_location=map_location)
+        sd = ckpt.get("state_dict", ckpt)
+
+        # Normalize common wrapper prefixes and filter to classifier keys
+        def _normalize_key(k: str) -> str:
+            prefixes = (
+                "model.",
+                "module.",
+                "_orig_mod.",
+            )
+            changed = True
+            while changed:
+                changed = False
+                for p in prefixes:
+                    if k.startswith(p):
+                        k = k[len(p):]
+                        changed = True
+            return k
+
+        expected_keys = set(model.state_dict().keys())
+        new_sd = {(_normalize_key(k)): v for k, v in sd.items() if _normalize_key(k) in expected_keys}
+
+        incompatible = model.load_state_dict(new_sd, strict=strict)
+        try:
+            missing_keys = getattr(incompatible, "missing_keys", [])
+            unexpected_keys = getattr(incompatible, "unexpected_keys", [])
+        except Exception:
+            try:
+                missing_keys, unexpected_keys = incompatible
+            except Exception:
+                missing_keys, unexpected_keys = [], []
+
+        if missing_keys:
+            log.warning(f"[SeqVaeTebClassifier] Missing keys when loading classifier: {missing_keys}")
+        if unexpected_keys:
+            log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading classifier: {unexpected_keys}")
+
+        if compile_model:
+            try:
+                model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=True)
+                log.info(f"Compiled SeqVaeTebClassifier with torch.compile mode={compile_mode}")
+            except Exception as e:
+                log.warning(f"torch.compile failed for classifier: {e}. Proceeding without compilation.")
+
+        return model
 
 
 if __name__ == "__main__":
