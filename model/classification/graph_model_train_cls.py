@@ -263,7 +263,7 @@ def train_one_fold(
         trainer.fit(lm, train_dataloaders=train_loader, val_dataloaders=val_loader)
     trainer.test(lm, dataloaders=test_loader, ckpt_path="best")
 
-    # After testing, export predictions CSV for the test set using best checkpoint
+    # After testing, export predictions CSVs for validation and test sets using best checkpoint
     try:
         # Find best checkpoint path
         best_ckpt = None
@@ -276,16 +276,31 @@ def train_one_fold(
                 best_ckpt = trainer.checkpoint_callback.best_model_path
 
         export_ckpt = best_ckpt if (best_ckpt and os.path.exists(best_ckpt)) else None
-        out_csv = os.path.join(out_dir, "test_predictions.csv")
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Validation predictions CSV
+        val_csv = os.path.join(out_dir, "val_predictions.csv")
+        export_test_predictions(
+            export_ckpt=export_ckpt,
+            base_model_cfg=model_cfg,
+            lm_current=lm,
+            test_loader=val_loader,
+            out_csv_path=val_csv,
+            device=device_str,
+        )
+        logger.info(f"Saved validation predictions to {val_csv}")
+
+        # Test predictions CSV
+        test_csv = os.path.join(out_dir, "test_predictions.csv")
         export_test_predictions(
             export_ckpt=export_ckpt,
             base_model_cfg=model_cfg,
             lm_current=lm,
             test_loader=test_loader,
-            out_csv_path=out_csv,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            out_csv_path=test_csv,
+            device=device_str,
         )
-        logger.info(f"Saved test predictions to {out_csv}")
+        logger.info(f"Saved test predictions to {test_csv}")
     except Exception as e:
         logger.warning(f"Failed to export test predictions CSV: {e}")
 
