@@ -110,6 +110,22 @@ class LightSeqVaeTebClassifier(L.LightningModule):
         # Compile after checkpoint weights are loaded (safe for load_from_checkpoint and resume)
         self._compile_if_requested()
 
+    def on_fit_start(self) -> None:
+        """Ensure optimizer LR and freeze flags match current hparams when resuming from checkpoint.
+
+        When resuming with Trainer.fit(..., ckpt_path=...), Lightning restores optimizer state
+        from the checkpoint, including learning rates. This method enforces the LR from the
+        current config (self.hparams.lr) to override any checkpoint LR to keep config authoritative.
+        """
+        try:
+            if hasattr(self, 'trainer') and self.trainer is not None and self.trainer.optimizers:
+                for opt in self.trainer.optimizers:
+                    for pg in opt.param_groups:
+                        pg['lr'] = float(getattr(self.hparams, 'lr', pg.get('lr', 1e-3)))
+                logger.info(f"Overrode optimizer LR from checkpoint with config LR={self.hparams.lr}")
+        except Exception as e:
+            logger.warning(f"Failed to override optimizer LR on fit start: {e}")
+
     # -------------------- utilities --------------------
     @staticmethod
     def _extract_labels(batch) -> torch.Tensor:
