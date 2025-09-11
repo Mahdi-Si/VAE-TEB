@@ -476,18 +476,34 @@ def main():
     else:
         max_workers = max_parallel
 
-    logger.info(f"Launching up to {max_workers} parallel folds ...")
-    with mp.get_context("spawn").Pool(processes=max_workers) as pool:
-        results = []
-        for fd in fold_dirs:
-            fold_path = os.path.join(folds_root, fd)
-            fold_out = os.path.join(session_dir, fd)
-            assigned = assign_devices_for_fold(fd)
-            logger.info(f"Scheduling {fd} on GPUs {assigned if assigned else 'CPU'}")
-            results.append(pool.apply_async(_run_fold_process, (fold_path, fold_out, cfg, assigned)))
-        # Wait for completion
-        for r in results:
-            r.get()
+    logger.info(f"Launching up to {max_workers} parallel folds using non-daemonic processes ...")
+    ctx = mp.get_context("spawn")
+    procs = []
+
+    def _start_for_fd(fd: str):
+        fold_path = os.path.join(folds_root, fd)
+        fold_out = os.path.join(session_dir, fd)
+        assigned = assign_devices_for_fold(fd)
+        logger.info(f"Starting {fd} on GPUs {assigned if assigned else 'CPU'}")
+        p = ctx.Process(target=_run_fold_process, args=(fold_path, fold_out, cfg, assigned), daemon=False)
+        p.start()
+        return p
+
+    # Launch with concurrency limit
+    for fd in fold_dirs:
+        while len([p for p in procs if p.is_alive()]) >= max_workers:
+            # Reap finished processes
+            for p in list(procs):
+                if not p.is_alive():
+                    p.join()
+                    procs.remove(p)
+            if len([p for p in procs if p.is_alive()]) >= max_workers:
+                import time; time.sleep(0.5)
+        procs.append(_start_for_fd(fd))
+
+    # Wait for all to complete
+    for p in procs:
+        p.join()
 
 
 if __name__ == "__main__":
