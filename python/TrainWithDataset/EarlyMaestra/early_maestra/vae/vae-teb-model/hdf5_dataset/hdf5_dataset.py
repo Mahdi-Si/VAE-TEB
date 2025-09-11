@@ -896,5 +896,6 @@ def create_optimized_dataloader(
         drop_last=False,
         prefetch_factor=2 if num_workers > 0 else None,
         multiprocessing_context='spawn' if num_workers > 0 else None,
+        persistent_workers=True if num_workers > 0 else False,
         collate_fn=attribute_dict_collate
     )
