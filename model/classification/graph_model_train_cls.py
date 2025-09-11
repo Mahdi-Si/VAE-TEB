@@ -132,7 +132,8 @@ def train_one_fold(
     normalize_fields = data_cfg.get("normalize_fields", ["fhr", "up", "fhr_st", "fhr_ph", "fhr_up_ph"])
     dataset_kwargs = data_cfg.get("dataset_kwargs", {})
     batch_sizes = data_cfg.get("batch_size", {"train": 32, "val": 64, "test": 64})
-    num_workers = int(data_cfg.get("num_workers", 0))
+    # Force single-process data loading to avoid multiprocessing issues
+    num_workers = 0
 
     # Build dataloaders
     train_loader, val_loader, test_loader = build_dataloaders_for_fold(
