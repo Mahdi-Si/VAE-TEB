@@ -71,7 +71,7 @@ def build_dataloaders_for_fold(
     common_kwargs = dict(
         rank=rank,
         world_size=world_size,
-        stats_path=stats_pat
+        stats_path=stats_path,
         normalize_fields=normalize_fields,
         **dataset_kwargs,
     )
@@ -238,6 +238,11 @@ def train_one_fold(
 
     resume_ckpt = train_cfg.get("resume_ckpt")
 
+    logger.info(
+        f"Trainer config (from config file): max_epochs={max_epochs}, precision={precision}, "
+        f"devices={devices}, strategy={strategy}, resume_ckpt={resume_ckpt or 'None'}"
+    )
+
     trainer = L.Trainer(
         max_epochs=max_epochs,
         precision=precision,
@@ -316,7 +321,21 @@ def export_test_predictions(
     )
 
     if export_ckpt and os.path.exists(export_ckpt):
-        lm = LightSeqVaeTebClassifier.load_from_checkpoint(export_ckpt, model=classifier, strict=False)
+        # Override any saved hyperparameters in the checkpoint with current config
+        h = getattr(lm_current, 'hparams', None)
+        lm = LightSeqVaeTebClassifier.load_from_checkpoint(
+            export_ckpt,
+            model=classifier,
+            strict=False,
+            lr=float(getattr(h, 'lr', 1e-3)) if h is not None else 1e-3,
+            lr_milestones=list(getattr(h, 'lr_milestones', [])) if h is not None else [],
+            vae_loss_weight=float(getattr(h, 'vae_loss_weight', 0.0)) if h is not None else 0.0,
+            freeze_vae=bool(getattr(h, 'freeze_vae', classifier.freeze_vae)) if h is not None else classifier.freeze_vae,
+            class_weights=None,  # Already baked into classifier.criterion if provided
+            compile_classifier=bool(getattr(h, 'compile_classifier', False)) if h is not None else False,
+            compile_vae=bool(getattr(h, 'compile_vae', False)) if h is not None else False,
+            compile_mode=str(getattr(h, 'compile_mode', 'max-autotune-no-cudagraphs')) if h is not None else 'max-autotune-no-cudagraphs',
+        )
     else:
         lm = lm_current
 
