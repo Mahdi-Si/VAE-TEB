@@ -840,6 +840,7 @@ def create_optimized_dataloader(
     hdf5_files: List[str],
     batch_size: int = 32,
     num_workers: int = 4,
+    shuffle: Optional[bool] = None,
     rank: int = 0,
     world_size: int = 1,
     stats_path: Optional[str] = None,
@@ -875,7 +876,6 @@ def create_optimized_dataloader(
     
     # Setup distributed sampler if multi-GPU
     sampler = None
-    shuffle = True
     if world_size > 1:
         sampler = DistributedSampler(
             dataset,
@@ -884,7 +884,12 @@ def create_optimized_dataloader(
             shuffle=True,
             drop_last=True  # Ensures consistent batch sizes across GPUs
         )
-        shuffle = False
+        default_shuffle = False
+    else:
+        default_shuffle = True
+
+    if shuffle is None:
+        shuffle = default_shuffle
     
     # Optimal DataLoader settings
     return DataLoader(
