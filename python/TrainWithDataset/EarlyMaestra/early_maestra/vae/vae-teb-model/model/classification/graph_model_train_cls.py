@@ -196,12 +196,13 @@ def train_one_fold(
 
     # Callbacks
     callbacks = []
-    callbacks.append(LossPlotCallback(output_dir=plots_dir, plot_frequency=int(cfg.get("plot_frequency", 1))))
-    callbacks.append(ClassificationMetricsCallback(output_dir=metrics_dir, class_names=train_cfg.get("class_names")))
+    plot_freq = int(cfg.get("plot_frequency", 1))
+    callbacks.append(LossPlotCallback(output_dir=plots_dir, plot_frequency=plot_freq))
+    callbacks.append(ClassificationMetricsCallback(output_dir=metrics_dir, class_names=train_cfg.get("class_names"), plot_frequency=plot_freq))
     callbacks.append(HyperparameterLoggingCallback())
     # VAE recon plots only make sense if we are fine-tuning VAE or using aux VAE loss
     from model.classification.pytorch_lightning_modules_cls import ReconstructionPlotCallback
-    callbacks.append(ReconstructionPlotCallback(output_dir=os.path.join(plots_dir, "vae"), plot_every_epoch=int(cfg.get("plot_frequency", 1))))
+    callbacks.append(ReconstructionPlotCallback(output_dir=os.path.join(plots_dir, "vae"), plot_every_epoch=plot_freq))
     callbacks.append(MemoryMonitorCallback(threshold_gb=12.0, log_frequency=200))
 
     # Early stopping and checkpoints
@@ -314,6 +315,35 @@ def export_test_predictions(
     device: str = "cpu",
 ):
     """Run inference on test_loader and write CSV with requested columns."""
+    # Build guid -> subgroup mapping using the HDF5 file names in this loader's dataset
+    def _guid_to_subgroup_map(loader) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        try:
+            import os
+            import h5py  # type: ignore
+            ds = getattr(loader, "dataset", None)
+            paths = getattr(ds, "paths", None)
+            if not paths:
+                return mapping
+            for p in paths:
+                try:
+                    subgroup = os.path.splitext(os.path.basename(p))[0]
+                    with h5py.File(p, "r") as f:
+                        if "guid" in f:
+                            gids = f["guid"][()]
+                            for g in gids:
+                                if isinstance(g, bytes):
+                                    g = g.decode("utf-8", errors="ignore")
+                                else:
+                                    g = str(g)
+                                mapping[g] = subgroup
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return mapping
+
+    guid_to_subgroup = _guid_to_subgroup_map(test_loader)
     # Build a fresh classifier matching training config
     num_classes = int(base_model_cfg.get("num_classes", 2))
     filters = int(base_model_cfg.get("filters", 32))
@@ -358,6 +388,7 @@ def export_test_predictions(
 
     header = [
         "guid",
+        "subgroup",
         "epoch",
         "cs_label",
         "bg_label",
@@ -398,6 +429,11 @@ def export_test_predictions(
                 else:
                     target_vals = torch.zeros(preds.shape[0], dtype=torch.long)
 
+                # If binary classification (num_classes == 2), map dataset labels to binary:
+                # HEALTHY (1) -> 0, ACIDOSIS (2) + HIE (3) -> 1. Masked 0 -> 0.
+                if num_classes == 2:
+                    target_vals = torch.where(target_vals >= 2, 1, 0).long()
+
                 B = preds.shape[0]
                 for i in range(B):
                     pred = int(preds[i].item())
@@ -422,8 +458,11 @@ def export_test_predictions(
                         except Exception:
                             return ""
 
+                    gstr = norm_val(guid, i)
+                    subgroup = guid_to_subgroup.get(gstr, "")
                     row = [
-                        norm_val(guid, i),
+                        gstr,
+                        subgroup,
                         norm_val(epoch, i),
                         norm_val(cs_label, i),
                         norm_val(bg_label, i),

@@ -7,7 +7,7 @@ import random
 import torch
 from typing import List, Optional
 
-from hdf5_dataset import CombinedHDF5Dataset, normalize_tensor_data
+from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset, normalize_tensor_data
 from calculate_dataset_stats import DatasetStatsCalculator
 
 matplotlib.use('Agg')

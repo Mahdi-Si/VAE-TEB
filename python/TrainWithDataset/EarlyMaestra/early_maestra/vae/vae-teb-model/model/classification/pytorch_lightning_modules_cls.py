@@ -14,6 +14,11 @@ try:
 except Exception:
     _HAVE_PLOT_UTILS = False
 try:
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+try:
     from sklearn.metrics import (
         roc_auc_score,
         roc_curve,
@@ -110,6 +115,53 @@ class LightSeqVaeTebClassifier(L.LightningModule):
         # Compile after checkpoint weights are loaded (safe for load_from_checkpoint and resume)
         self._compile_if_requested()
 
+    # -------------------- checkpoint I/O normalization --------------------
+    def _normalize_ckpt_keys(self, state_dict):
+        """
+        Normalize checkpoint keys to current module structure by removing wrappers like
+        'model._orig_mod.' (torch.compile) and 'model.module.' (DataParallel) so they
+        map cleanly onto 'model.' keys without generating Lightning warnings.
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        def _fix(k: str) -> str:
+            # Only operate under the top-level 'model.' prefix used by this LightningModule
+            if not k.startswith("model."):
+                return k
+            # Remove known wrapper segments right after 'model.'
+            parts = k.split(".")
+            # parts[0] == 'model'
+            new_parts = [parts[0]]
+            # drop any immediate wrappers like _orig_mod or module that may repeat
+            i = 1
+            while i < len(parts) and parts[i] in {"_orig_mod", "module"}:
+                i += 1
+            # append the rest
+            new_parts.extend(parts[i:])
+            return ".".join(new_parts)
+
+        # Fast-path: only rewrite when necessary
+        needs_rewrite = any("model._orig_mod." in k or "model.module." in k for k in state_dict.keys())
+        if not needs_rewrite:
+            return state_dict
+
+        return { _fix(k): v for k, v in state_dict.items() }
+
+    def on_load_checkpoint(self, checkpoint) -> None:  # type: ignore[override]
+        try:
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+                checkpoint["state_dict"] = self._normalize_ckpt_keys(checkpoint["state_dict"])  # in-place normalization
+        except Exception as e:
+            logger.warning(f"Failed to normalize checkpoint keys on load: {e}")
+
+    def on_save_checkpoint(self, checkpoint) -> None:  # type: ignore[override]
+        try:
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+                checkpoint["state_dict"] = self._normalize_ckpt_keys(checkpoint["state_dict"])  # save clean keys
+        except Exception as e:
+            logger.warning(f"Failed to normalize checkpoint keys on save: {e}")
+
     def on_fit_start(self) -> None:
         """Ensure optimizer LR and freeze flags match current hparams when resuming from checkpoint.
 
@@ -154,6 +206,16 @@ class LightSeqVaeTebClassifier(L.LightningModule):
     def _forward_with_optional_vae_loss(self, batch):
         y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
         labels = self._extract_labels(batch)
+
+        # Sanity: we expect binary outputs when using binary labels
+        try:
+            if getattr(self.model, "num_classes", 2) != 2:
+                logger.warning(
+                    f"Binary labels extracted but classifier is configured with num_classes={getattr(self.model, 'num_classes', 'N/A')}. "
+                    "Set num_classes=2 in the config to align outputs and loss."
+                )
+        except Exception:
+            pass
 
         if self.use_aux_vae_loss and hasattr(batch, "fhr") and batch.fhr is not None:
             out = self.model.compute_loss(
@@ -424,10 +486,11 @@ class ClassificationMetricsCallback(Callback):
     Saves plots and JSON metrics to `output_dir` at the end of each epoch.
     """
 
-    def __init__(self, output_dir: str, class_names: Optional[Sequence[str]] = None):
+    def __init__(self, output_dir: str, class_names: Optional[Sequence[str]] = None, plot_frequency: int = 1):
         super().__init__()
         self.output_dir = output_dir
         self.class_names = list(class_names) if class_names is not None else None
+        self.plot_frequency = max(1, int(plot_frequency))
         os.makedirs(self.output_dir, exist_ok=True)
 
     @staticmethod
@@ -461,49 +524,134 @@ class ClassificationMetricsCallback(Callback):
                 "f1_macro": float(pr_macro[2]),
             })
 
-        # Confusion matrix
-        if _HAVE_SKLEARN:
+        # Confusion matrix (Matplotlib with plot_utils style)
+        if _HAVE_SKLEARN and _HAVE_MPL:
             cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
             metrics["confusion_matrix"] = cm.tolist()
-            if _HAVE_PLOTLY:
-                fig_cm = go.Figure(data=go.Heatmap(z=cm, x=class_names, y=class_names, colorscale="Blues"))
-                fig_cm.update_layout(title=f"{split.upper()} Confusion Matrix (epoch {epoch})", xaxis_title="Predicted", yaxis_title="True")
-                cm_path = os.path.join(self.output_dir, f"{split}_confusion_matrix_epoch_{epoch}.html")
-                try:
-                    fig_cm.write_html(cm_path)
-                    logger.info(f"Saved {split} confusion matrix to {cm_path}")
-                finally:
-                    del fig_cm
+            # Apply a consistent style similar to plot_utils
+            try:
+                plt.style.use('default')
+                plt.rcParams.update({
+                    'font.family': 'sans-serif',
+                    'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+                    'font.size': 11,
+                    'axes.titlesize': 12,
+                    'axes.labelsize': 11,
+                    'axes.linewidth': 0.7,
+                    'axes.edgecolor': "#9E9D9D",
+                    'grid.color': "#838383",
+                    'grid.linewidth': 0.4,
+                    'grid.alpha': 0.6,
+                    'legend.frameon': True,
+                    'legend.fancybox': False,
+                    'legend.shadow': False,
+                    'legend.framealpha': 0.95,
+                    'legend.edgecolor': '#A2B9A7',
+                })
+            except Exception:
+                pass
+            fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+            im = ax_cm.imshow(cm, cmap='Blues')
+            ax_cm.set_title(f"{split.upper()} Confusion Matrix (epoch {epoch})")
+            ax_cm.set_xlabel("Predicted")
+            ax_cm.set_ylabel("True")
+            ax_cm.set_xticks(range(n_classes)); ax_cm.set_xticklabels(class_names, rotation=45, ha='right')
+            ax_cm.set_yticks(range(n_classes)); ax_cm.set_yticklabels(class_names)
+            for i in range(n_classes):
+                for j in range(n_classes):
+                    ax_cm.text(j, i, str(cm[i, j]), ha='center', va='center', color='black', fontsize=9)
+            fig_cm.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+            cm_path = os.path.join(self.output_dir, f"{split}_confusion_matrix_epoch_{epoch}.png")
+            try:
+                fig_cm.tight_layout()
+                fig_cm.savefig(cm_path, dpi=200)
+                logger.info(f"Saved {split} confusion matrix to {cm_path}")
+            finally:
+                plt.close(fig_cm)
 
-        # ROC / AUC and PR / AUPRC
-        if _HAVE_SKLEARN:
+        # ROC / AUC and PR / AUPRC (Matplotlib with plot_utils style)
+        if _HAVE_SKLEARN and _HAVE_MPL:
             try:
                 if n_classes == 2:
                     auc_roc = roc_auc_score(y_true, y_prob[:, 1])
                     auc_pr = average_precision_score(y_true, y_prob[:, 1])
                     metrics["auroc_macro"] = float(auc_roc)
                     metrics["auprc_macro"] = float(auc_pr)
-                    if _HAVE_PLOTLY:
-                        fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
-                        prec, rec, _ = precision_recall_curve(y_true, y_prob[:, 1])
-                        fig = make_subplots(rows=1, cols=2, subplot_titles=("ROC", "PR"))
-                        fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"AUC={auc_roc:.3f}"), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=rec, y=prec, name=f"AUPRC={auc_pr:.3f}"), row=1, col=2)
-                        fig.update_layout(title=f"{split.upper()} Curves (epoch {epoch})", template="plotly_white")
-                        path = os.path.join(self.output_dir, f"{split}_roc_pr_epoch_{epoch}.html")
-                        try:
-                            fig.write_html(path)
-                            logger.info(f"Saved {split} ROC/PR plots to {path}")
-                        finally:
-                            del fig
+                    fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
+                    prec, rec, _ = precision_recall_curve(y_true, y_prob[:, 1])
+                    # Style
+                    try:
+                        plt.style.use('default')
+                        plt.rcParams.update({
+                            'font.family': 'sans-serif',
+                            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+                            'font.size': 11,
+                            'axes.titlesize': 12,
+                            'axes.labelsize': 11,
+                            'axes.linewidth': 0.7,
+                            'axes.edgecolor': "#9E9D9D",
+                            'grid.color': "#838383",
+                            'grid.linewidth': 0.4,
+                            'grid.alpha': 0.6,
+                            'legend.frameon': True,
+                            'legend.fancybox': False,
+                            'legend.shadow': False,
+                            'legend.framealpha': 0.95,
+                            'legend.edgecolor': '#A2B9A7',
+                        })
+                    except Exception:
+                        pass
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                    # ROC
+                    axes[0].plot(fpr, tpr, label=f"AUC={auc_roc:.3f}")
+                    axes[0].plot([0,1],[0,1], linestyle='--', color='#999999', linewidth=1)
+                    axes[0].set_title("ROC")
+                    axes[0].set_xlabel("FPR")
+                    axes[0].set_ylabel("TPR")
+                    axes[0].legend()
+                    # PR
+                    axes[1].plot(rec, prec, label=f"AUPRC={auc_pr:.3f}")
+                    axes[1].set_title("PR")
+                    axes[1].set_xlabel("Recall")
+                    axes[1].set_ylabel("Precision")
+                    axes[1].legend()
+                    fig.suptitle(f"{split.upper()} Curves (epoch {epoch})")
+                    path = os.path.join(self.output_dir, f"{split}_roc_pr_epoch_{epoch}.png")
+                    try:
+                        fig.tight_layout()
+                        fig.savefig(path, dpi=200)
+                        logger.info(f"Saved {split} ROC/PR plots to {path}")
+                    finally:
+                        plt.close(fig)
                 else:
                     # one-vs-rest
                     from sklearn.preprocessing import label_binarize
                     y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
                     aucs = []
                     auprs = []
-                    if _HAVE_PLOTLY:
-                        fig = make_subplots(rows=1, cols=2, subplot_titles=("ROC", "PR"))
+                    # Style
+                    try:
+                        plt.style.use('default')
+                        plt.rcParams.update({
+                            'font.family': 'sans-serif',
+                            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+                            'font.size': 11,
+                            'axes.titlesize': 12,
+                            'axes.labelsize': 11,
+                            'axes.linewidth': 0.7,
+                            'axes.edgecolor': "#9E9D9D",
+                            'grid.color': "#838383",
+                            'grid.linewidth': 0.4,
+                            'grid.alpha': 0.6,
+                            'legend.frameon': True,
+                            'legend.fancybox': False,
+                            'legend.shadow': False,
+                            'legend.framealpha': 0.95,
+                            'legend.edgecolor': '#A2B9A7',
+                        })
+                    except Exception:
+                        pass
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
                     for c in range(n_classes):
                         try:
                             auc_c = roc_auc_score(y_true_bin[:, c], y_prob[:, c])
@@ -512,24 +660,32 @@ class ClassificationMetricsCallback(Callback):
                             auc_c, apr_c = float("nan"), float("nan")
                         aucs.append(auc_c)
                         auprs.append(apr_c)
-                        if _HAVE_PLOTLY:
-                            try:
-                                fpr, tpr, _ = roc_curve(y_true_bin[:, c], y_prob[:, c])
-                                prec, rec, _ = precision_recall_curve(y_true_bin[:, c], y_prob[:, c])
-                                fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"{class_names[c]} AUC={auc_c:.3f}"), row=1, col=1)
-                                fig.add_trace(go.Scatter(x=rec, y=prec, name=f"{class_names[c]} AUPRC={apr_c:.3f}"), row=1, col=2)
-                            except Exception:
-                                pass
+                        try:
+                            fpr, tpr, _ = roc_curve(y_true_bin[:, c], y_prob[:, c])
+                            prec, rec, _ = precision_recall_curve(y_true_bin[:, c], y_prob[:, c])
+                            axes[0].plot(fpr, tpr, label=f"{class_names[c]} AUC={auc_c:.3f}")
+                            axes[1].plot(rec, prec, label=f"{class_names[c]} AUPRC={apr_c:.3f}")
+                        except Exception:
+                            pass
                     metrics["auroc_macro"] = float(np.nanmean(aucs))
                     metrics["auprc_macro"] = float(np.nanmean(auprs))
-                    if _HAVE_PLOTLY:
-                        fig.update_layout(title=f"{split.upper()} Curves (epoch {epoch})", template="plotly_white")
-                        path = os.path.join(self.output_dir, f"{split}_roc_pr_epoch_{epoch}.html")
-                        try:
-                            fig.write_html(path)
-                            logger.info(f"Saved {split} ROC/PR plots to {path}")
-                        finally:
-                            del fig
+                    axes[0].plot([0,1],[0,1], linestyle='--', color='#999999', linewidth=1)
+                    axes[0].set_title("ROC")
+                    axes[0].set_xlabel("FPR")
+                    axes[0].set_ylabel("TPR")
+                    axes[0].legend()
+                    axes[1].set_title("PR")
+                    axes[1].set_xlabel("Recall")
+                    axes[1].set_ylabel("Precision")
+                    axes[1].legend()
+                    fig.suptitle(f"{split.upper()} Curves (epoch {epoch})")
+                    path = os.path.join(self.output_dir, f"{split}_roc_pr_epoch_{epoch}.png")
+                    try:
+                        fig.tight_layout()
+                        fig.savefig(path, dpi=200)
+                        logger.info(f"Saved {split} ROC/PR plots to {path}")
+                    finally:
+                        plt.close(fig)
             except Exception as e:
                 logger.warning(f"Failed to compute ROC/PR metrics for {split}: {e}")
 
@@ -561,7 +717,9 @@ class ClassificationMetricsCallback(Callback):
         # clear buffers
         pl_module._val_logits.clear()
         pl_module._val_labels.clear()
-        self._compute_and_save(trainer, "val", trainer.current_epoch, logits, labels)
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.plot_frequency == 0:
+            self._compute_and_save(trainer, "val", epoch, logits, labels)
 
     def on_test_epoch_end(self, trainer: L.Trainer, pl_module: LightSeqVaeTebClassifier):
         if not trainer.is_global_zero:
@@ -573,7 +731,9 @@ class ClassificationMetricsCallback(Callback):
         # clear buffers
         pl_module._test_logits.clear()
         pl_module._test_labels.clear()
-        self._compute_and_save(trainer, "test", trainer.current_epoch, logits, labels)
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.plot_frequency == 0:
+            self._compute_and_save(trainer, "test", epoch, logits, labels)
 
 
 class ReconstructionPlotCallback(Callback):

@@ -2,6 +2,9 @@ tag: seqvae_teb_classifier
 out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/classification
 folds_root: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset
 
+# Plotting frequency (every N epochs)
+plot_frequency: 5
+
 classifier_config:
   num_classes: 2               # Binary classification: HEALTHY vs ACIDOSIS+HIE
   filters: 32
@@ -23,7 +26,7 @@ training_config:
   accumulate_grad_batches: 1
   class_names: [HEALTHY, UNHEALTHY]  # Binary: HEALTHY vs ACIDOSIS+HIE
   # Compilation options
-  compile_classifier: false
+  compile_classifier: true
   compile_mode: max-autotune-no-cudagraphs
   resume_ckpt: null
 
