@@ -147,23 +147,23 @@ def create_initial_hdf5(
     Create a new HDF5 file with empty, resizable datasets for signal storage.
     
     Updated for optimal coefficient selection (J=11, Q=4, T=16):
-    - FHR scattering: 43 coefficients (first order only)
-    - FHR phase: 44 coefficients (95.1% reduction from optimal selection)
-    - FHR-UP cross-phase: 130 coefficients (UP→FHR coupling)
-    - Total phase/cross-phase channels: 174
+        - FHR scattering: 43 coefficients (first order only)
+        - FHR phase: 44 coefficients (95.1% reduction from optimal selection)
+        - FHR-UP cross-phase: 130 coefficients (UP→FHR coupling)
+        - Total phase/cross-phase channels: 174
 
     Datasets created (first dim unlimited):
-      - "fhr"       : float32, shape (N, len_signal)
-      - "up"        : float32, shape (N, len_signal)
-      - "fhr_st"    : float32, shape (N, 43, len_sequence) - Scattering coefficients
-      - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
-      - "fhr_up_ph" : float32, shape (N, 130, len_sequence) - Selected cross-phase coefficients
-      - "target"    : float32, shape (N, len_sequence)
-      - "weight"    : float32, shape (N, len_sequence)
-      - "epoch"     : float32, shape (N,)
-      - "cs_label"  : uint8 (0 or 1), shape (N,)
-      - "bg_label"  : uint8 (0 or 1), shape (N,)
-      - "guid"      : variable-length UTF-8 strings, shape (N,)
+        - "fhr"       : float32, shape (N, len_signal)
+        - "up"        : float32, shape (N, len_signal)
+        - "fhr_st"    : float32, shape (N, 43, len_sequence) - Scattering coefficients
+        - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
+        - "fhr_up_ph" : float32, shape (N, 130, len_sequence) - Selected cross-phase coefficients
+        - "target"    : float32, shape (N, len_sequence)
+        - "weight"    : float32, shape (N, len_sequence)
+        - "epoch"     : float32, shape (N,)
+        - "cs_label"  : uint8 (0 or 1), shape (N,)
+        - "bg_label"  : uint8 (0 or 1), shape (N,)
+        - "guid"      : variable-length UTF-8 strings, shape (N,)
 
     All datasets use per-sample chunking and LZF compression.
 
