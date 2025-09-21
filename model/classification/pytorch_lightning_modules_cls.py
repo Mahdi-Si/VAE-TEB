@@ -148,7 +148,7 @@ class LightSeqVaeTebClassifier(L.LightningModule):
 
         return { _fix(k): v for k, v in state_dict.items() }
 
-    def on_load_checkpoint(self, checkpoint) -> None:  # type: ignore[override]
+    def on_load_checkpoint(self, checkpoint) -> None:
         try:
             if isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
                 checkpoint["state_dict"] = self._normalize_ckpt_keys(checkpoint["state_dict"])  # in-place normalization

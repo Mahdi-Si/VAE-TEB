@@ -67,25 +67,43 @@ class PlottingCallBack(Callback):
                 y_raw_normalized = batch.fhr  # (B, 4800)
                 up_raw_normalized = batch.up  # (B, 4800)
 
-                model_outputs = pl_module.model(y_st, y_ph, x_ph)
-                latent_z = model_outputs['z']
-                # Note: mu_pr and logvar_pr are now (B, 4800) raw signal reconstructions
-                mu_pr_raw = model_outputs['mu_pr']  # (B, 4800)
-                logvar_pr_raw = model_outputs['logvar_pr']  # (B, 4800)
-                # For compatibility with existing plotting, create dummy means
-                mu_pr_means = mu_pr_raw
-                log_var_means = logvar_pr_raw
-                
-                # Plot results
-                self._plot_results(
+                # Forecast across all valid anchors using posterior mean latents for stability
+                forecast_out = pl_module.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
+                anchors = forecast_out["anchors"]
+                mu_future = forecast_out["mu_future"]          # (B,N,480)
+                logvar_future = forecast_out["logvar_future"]  # (B,N,480)
+                enc = forecast_out["enc"]
+
+                # Aggregate forecasts to full raw timeline
+                canvas_mu, mean_mu = pl_module.model.aggregate_forecasts_to_canvas(
+                    mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+
+                # Uncertainty: aggregate variances then sqrt to get std
+                var_future = logvar_future.exp()
+                _, mean_var = pl_module.model.aggregate_forecasts_to_canvas(
+                    var_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+                std_mu = mean_var.clamp_min(1e-8).sqrt()
+
+                # Plot forecast results
+                self._plot_forecast_results(
                     y_raw_normalized,
-                    up_raw_normalized,
-                    mu_pr_means,
-                    log_var_means,
-                    mu_pr_raw,  # Remove unsqueeze since we'll handle this in plotting
-                    logvar_pr_raw,  # Remove unsqueeze since we'll handle this in plotting
-                    latent_z,
+                    mean_mu,
+                    std_mu,
+                    canvas_mu,
+                    anchors,
+                    enc.get('mu_post'),
                     pl_trainer.current_epoch)
+
+                # Additionally, plot batch-aggregated forecast across samples
+                try:
+                    self._plot_batch_aggregated_forecast(
+                        y_raw_batch=y_raw_normalized,
+                        mean_mu_batch=mean_mu,
+                        std_mu_batch=std_mu,
+                        epoch=pl_trainer.current_epoch,
+                    )
+                except Exception as e:
+                    logger.warning(f"Batch-aggregated forecast plotting failed: {e}")
                 
 
 
@@ -96,10 +114,17 @@ class PlottingCallBack(Callback):
         finally:
             pl_module.train()
 
-    def _plot_results(
-        self, y_raw_normalized, up_raw_normalized, mu_pr_means, log_var_means,
-        mu_pr, logvar_pr, latent_z, epoch):
-        """Plot model results with 4 subplots following the style of plot_forward_pass"""
+    def _plot_forecast_results(
+        self,
+        y_raw_normalized: torch.Tensor,
+        mean_mu: torch.Tensor,
+        std_mu: torch.Tensor,
+        canvas_mu: torch.Tensor,
+        anchors: torch.Tensor,
+        latent_z: torch.Tensor,
+        epoch: int,
+    ):
+        """Plot forecast results: ground truth vs aggregated forecast with uncertainty; sample windows; latent heatmap."""
         import os
         import gc
         
@@ -107,18 +132,12 @@ class PlottingCallBack(Callback):
         batch_idx = 0
         
         # Convert tensors to numpy and move to CPU
-        y_raw = y_raw_normalized[batch_idx].cpu().numpy()  # Shape: (4800,)
-        up_raw = up_raw_normalized[batch_idx].cpu().numpy()  # Shape: (4800,)
-        mu_means = mu_pr_means[batch_idx].cpu().numpy()  # Shape: (4800,)
-        log_var = log_var_means[batch_idx].cpu().numpy()  # Shape: (4800,)
-        # Handle the case where mu_pr and logvar_pr are now (B, 4800) instead of (B, 300, 4800)
-        if len(mu_pr.shape) == 2:  # (B, 4800) format
-            mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (4800,)
-            logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (4800,)
-        else:  # (B, 300, 4800) format (legacy)
-            mu_samples = mu_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
-            logvar_samples = logvar_pr[batch_idx].cpu().numpy()  # Shape: (300, 4800)
-        z_latent = latent_z[batch_idx].cpu().numpy()  # Shape: (300, 32)
+        y_raw = y_raw_normalized[batch_idx].cpu().numpy()  # (4800,)
+        pred_mean = mean_mu[batch_idx].cpu().numpy()       # (4800,)
+        pred_std = std_mu[batch_idx].cpu().numpy()         # (4800,)
+        z_latent = None
+        if latent_z is not None:
+            z_latent = latent_z[batch_idx].detach().cpu().numpy()  # (T,D)
         
         # Setup plotting parameters following the style from data_utils
         Fs = 4
@@ -161,8 +180,8 @@ class PlottingCallBack(Callback):
             'savefig.dpi': 300
         })
         
-        # Create figure with 4 rows, 2 columns (main plot + colorbar)
-        n_rows = 4
+        # Create figure with 3 rows, 2 columns (main plot + colorbar)
+        n_rows = 3
         fig, ax = plt.subplots(
             nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
             gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
@@ -180,71 +199,45 @@ class PlottingCallBack(Callback):
             ax[i, 0].spines['left'].set_linewidth(0.7)
             ax[i, 0].spines['bottom'].set_linewidth(0.7)
         
-        # Subplot 1: y_raw_normalized and up_raw_normalized
+        # Subplot 1: GT vs aggregated forecast with uncertainty band
         ax[0, 1].set_axis_off()
-        ax[0, 0].plot(t_in, y_raw, linewidth=1.2, color=colors['fhr'], label='FHR', alpha=0.85)
-        ax[0, 0].plot(t_in, up_raw, linewidth=1.2, color=colors['up'], label='UP', alpha=0.85)
-        ax[0, 0].set_ylabel('Amplitude', fontweight='normal')
-        ax[0, 0].set_title('Raw FHR and UP Signals', fontweight='normal', pad=12)
+        ax[0, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9)
+        ax[0, 0].plot(t_in, pred_mean, linewidth=1.2, color='#BB3E00', label='Forecast (mean)', alpha=0.9)
+        ax[0, 0].fill_between(t_in, pred_mean - pred_std, pred_mean + pred_std, alpha=0.3, color=colors['uncertainty'], label='±1σ')
+        ax[0, 0].set_ylabel('FHR (bpm)')
+        ax[0, 0].set_title('Raw FHR vs Aggregated Forecast')
         ax[0, 0].legend(loc='upper right', framealpha=0.95)
         ax[0, 0].autoscale(enable=True, axis='x', tight=True)
-        
-        # Subplot 2: y_raw_normalized and mu_pr_means with uncertainty
+
+        # Subplot 2: show some example windows overlayed
         ax[1, 1].set_axis_off()
-        ax[1, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.85, zorder=3)
-        ax[1, 0].plot(t_in, mu_means, linewidth=1.5, color=colors['recon'], label='Reconstruction', alpha=0.85, zorder=2)
-        
-        # Add uncertainty visualization using log_var_means
-        std_dev = np.exp(0.5 * log_var)  # Convert log variance to standard deviation
-        ax[1, 0].fill_between(t_in, mu_means - std_dev, mu_means + std_dev, 
-                                alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
-        
-        ax[1, 0].set_ylabel('FHR (bpm)', fontweight='normal')
-        ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='normal', pad=12)
-        ax[1, 0].legend(loc='upper right', framealpha=0.95)
+        ax[1, 0].plot(t_in, y_raw, color=colors['gt'], alpha=0.4, linewidth=1.0)
+        if anchors.numel() > 0:
+            anc = anchors.detach().cpu().numpy()
+            cmu = canvas_mu[batch_idx].detach().cpu().numpy()  # (N,4800)
+            picks = [anc[0], anc[len(anc)//2], anc[-1]] if len(anc) >= 3 else list(anc)
+            for a in picks:
+                idx = int(np.where(anc == a)[0][0])
+                w = cmu[idx]
+                ax[1, 0].plot(t_in, w, color='#D7263D', linewidth=1.0, alpha=0.8)
+        ax[1, 0].set_ylabel('FHR (bpm)')
+        ax[1, 0].set_title('Sample Forecast Windows')
         ax[1, 0].autoscale(enable=True, axis='x', tight=True)
-        
-        # Subplot 3: y_raw_normalized and mu_pr samples
-        ax[2, 1].set_axis_off()
-        ax[2, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.85, zorder=2)
-        
-        # Handle different formats of mu_samples
-        if len(mu_samples.shape) == 1:  # (4800,) format - single prediction
-            ax[2, 0].plot(
-                t_in, mu_samples, linewidth=1.5, color=colors['samples'], 
-                label='Model Prediction', alpha=0.85, zorder=1)
-        else:  # (300, 4800) format - multiple predictions
-            # Select specific time indices: [30, 60, 90, 120, 150, 180, 210, 240, 270]
-            selected_indices = [idx for idx in [30, 60, 90, 120, 150, 180, 210, 240, 270] if idx < mu_samples.shape[0]]
-            
-            if selected_indices:
-                # Handle NaN values and sum selected samples
-                selected_samples = mu_samples[selected_indices, :]  # Shape: (len(selected_indices), 4800)
-                
-                # Remove NaN values and compute mean
-                valid_mask = ~np.isnan(selected_samples)
-                summed_samples = np.zeros(4800)
-                
-                for i in range(4800):
-                    valid_values = selected_samples[:, i][valid_mask[:, i]]
-                    if len(valid_values) > 0:
-                        summed_samples[i] = np.sum(valid_values)
-                    else:
-                        summed_samples[i] = 0
-                
-                ax[2, 0].plot(
-                    t_in, summed_samples, linewidth=1.5, color=colors['samples'], 
-                    label='Selected Samples Sum', alpha=0.85, zorder=1)
-            else:
-                # Fallback to first sample if no valid indices
-                ax[2, 0].plot(
-                    t_in, mu_samples[0, :], linewidth=1.5, color=colors['samples'], 
-                    label='First Sample', alpha=0.85, zorder=1)
-        
-        ax[2, 0].set_ylabel('FHR (bpm)', fontweight='normal')
-        ax[2, 0].set_title('FHR vs Model Reconstructions', fontweight='normal', pad=12)
-        ax[2, 0].legend(loc='upper right', framealpha=0.95)
-        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
+
+        # Subplot 3: latent heatmap (posterior mean)
+        if z_latent is not None:
+            imgplot = ax[2, 0].imshow(z_latent.T, aspect='auto', cmap='bwr', origin='lower')
+            ax[2, 1].set_axis_on()
+            cbar = fig.colorbar(imgplot, cax=ax[2, 1])
+            cbar.ax.tick_params(labelsize=10, colors='#666666')
+            cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
+            cbar.outline.set_color('#A2B9A7')
+            cbar.outline.set_linewidth(0.7)
+            ax[2, 0].set_ylabel('Latent Dimensions')
+            ax[2, 0].set_xlabel('Decimated steps')
+            ax[2, 0].set_title('Latent μ_post (T×D)')
+        else:
+            ax[2, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center')
         
         # Subplot 4: latent_z with imshow
         imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='bwr', origin='lower')
@@ -259,23 +252,71 @@ class PlottingCallBack(Callback):
         ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
         
         # Set overall title with scientific paper styling
-        fig.suptitle(f'Model Performance Analysis — Epoch {epoch}', 
-                    fontsize=14, fontweight='normal', y=0.97, color='#456882')
-        
+        fig.suptitle(f'Forecasting Results – Epoch {epoch}', fontsize=14, fontweight='normal', y=0.97, color='#456882')
         # Save plot as PDF with high quality
-        save_path = os.path.join(self.output_dir, f'model_results_epoch_{epoch}.pdf')
-        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=300, facecolor='white', edgecolor='none')
+        save_path = os.path.join(self.output_dir, f'forecast_results_epoch_{epoch}.pdf')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
         plt.close(fig)
         
         # Clean up memory  
-        del y_raw, up_raw, mu_means, log_var, z_latent
-        if 'mu_samples' in locals():
-            del mu_samples
-        if 'logvar_samples' in locals():
-            del logvar_samples
+        del y_raw, pred_mean, pred_std
+        if z_latent is not None:
+            del z_latent
         gc.collect()
-        
-        logger.info(f"Model results plot saved to {save_path}")
+        logger.info(f"Forecast results plot saved to {save_path}")
+
+    def _plot_batch_aggregated_forecast(
+        self,
+        y_raw_batch: torch.Tensor,
+        mean_mu_batch: torch.Tensor,
+        std_mu_batch: torch.Tensor,
+        epoch: int,
+    ):
+        """Plot average aggregated forecast across validation batch with uncertainty band.
+
+        Uses per-sample coverage masks from mean_mu_batch (NaNs denote uncovered points).
+        Uncertainty combines within-sample variance and across-sample variability (law of total variance).
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import os
+
+        # Compute per-time coverage mask and masked batch means
+        mask = ~torch.isnan(mean_mu_batch)  # (B,4800)
+        # Predicted mean across samples (nanmean)
+        pred_mean = torch.nanmean(mean_mu_batch, dim=0)  # (4800,)
+        # Ground-truth mean across samples restricted to covered points
+        gt_masked = y_raw_batch.masked_fill(~mask, float('nan'))
+        gt_mean = torch.nanmean(gt_masked, dim=0)  # (4800,)
+
+        # Uncertainty via total variance: E[var] + var(E)
+        # E[var] term
+        e_var = torch.nanmean(std_mu_batch.pow(2), dim=0)
+        # var(E) term: variability of per-sample predicted means
+        mean_centered = mean_mu_batch - pred_mean.unsqueeze(0)
+        mean_centered = mean_centered.masked_fill(~mask, float('nan'))
+        var_e = torch.nanmean(mean_centered.pow(2), dim=0)
+        total_var = (e_var + var_e).clamp_min(0.0)
+        pred_std = total_var.sqrt()
+
+        t = np.arange(pred_mean.shape[0]) / 4.0
+        pm = pred_mean.detach().cpu().numpy()
+        ps = pred_std.detach().cpu().numpy()
+        gm = gt_mean.detach().cpu().numpy()
+
+        fig, ax = plt.subplots(1, 1, figsize=(16, 4.5), constrained_layout=True)
+        ax.plot(t, gm, color='#2E86AB', label='GT (batch mean)', linewidth=1.5)
+        ax.plot(t, pm, color='#BB3E00', label='Forecast (batch mean)', linewidth=1.2)
+        ax.fill_between(t, pm - ps, pm + ps, color='#F5B7B1', alpha=0.4, label='±1σ (total)')
+        ax.set_title('Batch-Aggregated Forecast vs Ground Truth')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('FHR (bpm)')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        save_path = os.path.join(self.output_dir, f'forecast_results_epoch_{epoch}_avg.pdf')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Batch-aggregated forecast plot saved to {save_path}")
 
 
 class LossPlotCallback(Callback):
@@ -297,12 +338,16 @@ class LossPlotCallback(Callback):
             "train/recon_loss": [],
             "train/mse_loss": [],
             "train/nll_loss": [],
+            "train/forecast_nll": [],
             "train/kld_loss": [],
+            "train/agg_mse": [],
             "val/total_loss": [],
             "val/recon_loss": [],
             "val/mse_loss": [],
             "val/nll_loss": [],
+            "val/forecast_nll": [],
             "val/kld_loss": [],
+            "val/agg_mse": [],
             # Hyperparameters
             "hyperparams/beta": [],
             "hyperparams/lr": []
@@ -657,43 +702,52 @@ class LightSeqVaeTeb(L.LightningModule):
         logger.info("✅ Hyperparameter validation complete")
 
     def _common_step(self, batch, batch_idx):
-        """SPEED OPTIMIZED: Removed expensive permute operations - data comes pre-permuted from dataset."""
-        # SPEED OPTIMIZATION: Data now comes in the correct format from the optimized dataset
-        # No expensive permute operations needed - significant speedup!
-        # Optimized dataloader provides tensors in model-ready format:
-        y_st = batch.fhr_st    # Scattering transform features (batch, sequence, channels) - ready for model
-        y_ph = batch.fhr_ph    # Phase harmonic features (batch, sequence, channels) - ready for model
-        x_ph = batch.fhr_up_ph # Cross-phase features (batch, sequence, channels) - ready for model
-        y_raw = batch.fhr      # Raw signal for reconstruction (batch, sequence_length)
+        """Forecasting mode: compute forecast NLL over windowed predictions + optional KL."""
+        y_st = batch.fhr_st
+        y_ph = batch.fhr_ph
+        x_ph = batch.fhr_up_ph
+        y_raw = batch.fhr
 
-        # Forward pass without gradient checkpointing for speed
-        forward_outputs = self.model(y_st, y_ph, x_ph)
-
-        # Standard TEB loss
-        loss_dict = self.model.compute_loss(
-            forward_outputs=forward_outputs,
-            y_st=y_st,
-            y_ph=y_ph,
+        # Forecast using posterior means for stability during training
+        forecast_outputs = self.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
+        loss_dict = self.model.compute_forecast_loss(
+            forecast_outputs=forecast_outputs,
             y_raw=y_raw,
-            compute_kld_loss=True,
-            beta=self.hparams.beta
+            anchors=forecast_outputs["anchors"],
+            beta=self.hparams.beta,
+            include_kld=True,
         )
+
+        # Additional evaluation metric: aggregated MSE over covered region
+        with torch.no_grad():
+            mu_future = forecast_outputs["mu_future"]  # (B,N,W)
+            anchors = forecast_outputs["anchors"]
+            _, mean_mu = self.model.aggregate_forecasts_to_canvas(
+                mu_future, anchors, total_len=y_raw.shape[1], stride=self.model.decimation_factor)
+            mask = ~torch.isnan(mean_mu)
+            if mask.any():
+                diff = (mean_mu - y_raw).masked_fill(~mask, 0.0)
+                mse = (diff.pow(2)[mask]).mean()
+            else:
+                mse = torch.tensor(float('nan'), device=y_raw.device)
+        loss_dict['agg_mse'] = mse
 
         return loss_dict
 
     def training_step(self, batch, batch_idx):
         """Defines the training loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
+        total_loss = loss_dict['total_loss']
 
-        # Log common training metrics
+        # Log forecasting metrics
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Standard TEB metrics
+        if 'forecast_nll' in loss_dict:
+            self.log('train/forecast_nll', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            # Backward-compat alias for prior dashboards
+            self.log('train/nll_loss', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if 'agg_mse' in loss_dict:
+            self.log('train/agg_mse', loss_dict['agg_mse'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         
         # Clear loss_dict to free memory
         del loss_dict
@@ -703,16 +757,17 @@ class LightSeqVaeTeb(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         """Defines the validation loop with memory optimization."""
         loss_dict = self._common_step(batch, batch_idx)
-        total_loss = loss_dict['total_loss']  # Total loss already includes beta-weighted KLD
+        total_loss = loss_dict['total_loss']
 
-        # Log common validation metrics
+        # Log forecasting validation metrics
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=True, logger=True)
-        
-        # Standard TEB metrics
+        if 'forecast_nll' in loss_dict:
+            self.log('val/forecast_nll', loss_dict['forecast_nll'], on_epoch=True, prog_bar=True, logger=True)
+            # Backward-compat alias
+            self.log('val/nll_loss', loss_dict['forecast_nll'], on_epoch=True, prog_bar=False, logger=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
+        if 'agg_mse' in loss_dict:
+            self.log('val/agg_mse', loss_dict['agg_mse'], on_epoch=True, prog_bar=False, logger=True)
 
         # Clear loss_dict to free memory
         del loss_dict

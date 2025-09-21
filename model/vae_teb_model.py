@@ -26,6 +26,22 @@ setup_logging(
 from loguru import logger as log
 import logging as std_logging
 
+# -----------------------------------------------------------------------------
+# Shape conventions used throughout this module
+# -----------------------------------------------------------------------------
+# B  = batch size
+# T  = decimated sequence length (typically 300 for 20 min @ 4 Hz with /16)
+# H  = forecasting horizon in decimated steps (e.g., 30 -> 2 min)
+# L  = generic latent sequence length (T for reconstruction, H for forecasting)
+# C  = feature channels
+#   C_st = 43  (FHR scattering channels)
+#   C_ph = 44  (FHR phase channels)
+#   C_x  = 130 (UP+FHR cross-phase channels)
+# D  = latent/hidden dimensionality (typically 16)
+# R  = raw length at 4 Hz (4800 for 20 min). Relationship: R = L * s, s=16.
+# s  = decimation factor (default 16)
+# -----------------------------------------------------------------------------
+
 def geometric_schedule(
     input_size: int,
     output_size: int,
@@ -66,6 +82,15 @@ def initialization(model: nn.Module) -> None:
 
 
 class CausalConv1d(nn.Module):
+    """
+    1D convolution with explicit left-only padding to enforce causality.
+
+    Shapes
+    - Input:  x  (B, Cin, L)
+    - Output: y  (B, Cout, Lout)
+        Lout = floor((L + left_padding - dilation*(k-1) - 1)/stride + 1)
+        With stride=1 and our left-padding choice, Lout == L.
+    """
 
     def __init__(
         self,
@@ -83,11 +108,8 @@ class CausalConv1d(nn.Module):
         self.stride = stride
         self.dilation = dilation
         self.groups = groups
-
-        # Calculate left padding for causal convolution (more efficient)
+        # left padding for causal convolution
         self.left_padding = (kernel_size - 1) * dilation
-
-        # Use grouped convolution for efficiency when possible
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -102,13 +124,12 @@ class CausalConv1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input tensor (batch_size, channels, seq_len)
+            x: (B, Cin, L)
         Returns:
-            Causal convolution output
+            (B, Cout, Lout)
         """
         if self.left_padding > 0:
             x = F.pad(x, (self.left_padding, 0))
-
         return self.conv(x)
 
 
@@ -116,6 +137,11 @@ class CausalMultiChannelConvBlock(nn.Module):
     """
     Causal version of MultiChannelConvBlock that ensures no future information leaks.
     Uses causal padding instead of reflection padding and supports upsampling.
+
+    Shapes
+    - Input:  x  (B, Cin, L)
+    - Output: y  (B, Cout, L') where L' depends on stride and optional upsampling.
+        If up_sampling is False and stride=1, L' == L.
     """
     
     def __init__(
@@ -139,13 +165,10 @@ class CausalMultiChannelConvBlock(nn.Module):
         self.activation = activation
         self.dilation = dilation
         self.stride = stride
-        
-        # Calculate causal padding (left padding only)
+        # Ccausal padding (left padding only)
         self.left_padding = (filter_size - 1) * dilation
-        
-        # Pre-normalization (consistent with MultiChannelConvBlock)
+        # Pre-normalization
         self.pre_norm = nn.GroupNorm(num_groups=min(8, in_channels), num_channels=in_channels)
-        
         # Main convolution layer
         self.conv = nn.Conv1d(
             in_channels, 
@@ -157,18 +180,17 @@ class CausalMultiChannelConvBlock(nn.Module):
             dilation=dilation,
             stride=stride
         )
-            
         # Activation function
         self.act_fn = activation()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input tensor (batch_size, channels, length)
+            x: (B, Cin, L)
         Returns:
-            Causal convolution output with optional upsampling
+            (B, Cout, L') with strict causality
         """
-        # Apply upsampling first if requested
+        # Apply upsampling first
         if self.up_sampling:
             x = F.interpolate(
                 x, 
@@ -176,23 +198,22 @@ class CausalMultiChannelConvBlock(nn.Module):
                 mode='linear', 
                 align_corners=False
             )
-        
-        # Apply pre-normalization (PreNorm architecture - consistent with MultiChannelConvBlock)
-        x = self.pre_norm(x)
-        
-        # Apply activation before convolution (PreAct architecture)
+        # Apply pre-normalization
+        x = self.pre_norm(x)  # (B, Cin, L or upsampled L)
         x = self.act_fn(x)
-        
-        # Apply causal padding (left padding only)
         if self.left_padding > 0:
             x = F.pad(x, (self.left_padding, 0))
-        
-        # Apply convolution
-        output = self.conv(x)
-        
+        output = self.conv(x)  # (B, Cout, L')
         return output
 
 class MultiChannelConvBlock(nn.Module):
+    """
+    Non-causal multi-channel conv block (not used in prediction path).
+
+    Shapes
+    - Input:  (B, Cin, L)
+    - Output: (B, Cout, L')
+    """
     def __init__(
         self, in_channels=1, out_channels=1, groups=1,
         filter_size=3, up_sampling=False, up_sample_scale=2,
@@ -243,20 +264,25 @@ class MultiChannelConvBlock(nn.Module):
 
 
 class ResidualMLP(nn.Module):
+    """
+    Residual MLP operating per time step with optional skip connection.
+
+    Shapes
+    - Input:  x  (B, L, Cin)
+    - Output: y  (B, L, Cout) where Cout = hidden_dims[-1]
+    """
     def __init__(
-        self, input_dim, hidden_dims=(72, 68, 64), final_activation=True, activation=nn.ReLU, use_skip_connection=True
+        self, input_dim, hidden_dims=(72, 68, 64), final_activation=True, activation=nn.GELU, use_skip_connection=True
     ):
         super().__init__()
-        # initial layer-norm on raw input
         self.input_norm = nn.LayerNorm(input_dim)
         self.final_activation = final_activation
         self.activation = activation
         self.use_skip_connection = use_skip_connection
-        # build the sequence of (Linear → LayerNorm → activation → Dropout)
+        # Sequence of (Linear → LayerNorm → activation → Dropout)
         layers = []
         dims = [input_dim, *hidden_dims]
         for i in range(len(hidden_dims)):
-            # For final layer, skip activation and layernorm if final_activation=False
             is_final_layer = (i == len(hidden_dims) - 1)
             if is_final_layer and not final_activation:
                 layers += [
@@ -275,7 +301,6 @@ class ResidualMLP(nn.Module):
                 ]
         self.body = nn.Sequential(*layers)
 
-        # if input_dim ≠ final hidden_dims[-1], project it (only if using skip connection)
         final_dim = hidden_dims[-1]
         if self.use_skip_connection:
             if input_dim != final_dim:
@@ -285,31 +310,24 @@ class ResidualMLP(nn.Module):
         else:
             self.skip_proj = None
 
-        # only norm, no activation after skip connection
-        # self.post_norm = nn.LayerNorm(final_dim)
-        # final activation applied before skip connection if needed
         self.final_act = self.activation() if final_activation else None
 
     def forward(self, x):
-        # 1) normalize raw input
-        x0 = self.input_norm(x)
+        # x: (B, L, Cin)
+        x0 = self.input_norm(x)          # (B, L, Cin)
 
-        # 2) run through MLP body
-        y = self.body(x0)
+        y = self.body(x0)                # (B, L, Cout)
 
-        # 3) apply final activation before skip connection if needed
         if self.final_activation:
-            y = self.final_act(y)
+            y = self.final_act(y)       # (B, L, Cout)
 
-        # 4) conditionally add skip connection
         if self.use_skip_connection:
-            skip = self.skip_proj(x0)
-            z = y + skip
+            skip = self.skip_proj(x0)   # (B, L, Cout)
+            z = y + skip               # (B, L, Cout)
         else:
             z = y
 
-        # 5) only apply normalization, no activation after skip connection
-        return z
+        return z                         # (B, L, Cout)
 
 
 class TargetEncoder(nn.Module):
@@ -324,7 +342,14 @@ class TargetEncoder(nn.Module):
     later split into the log-variance for the prior and a conditioning
     feature used by the ConditionalEncoder.
 
-    **Mathematical Formulation:**
+    Shapes
+    - Inputs:
+        y_st: (B, T, 43)
+        y_ph: (B, T, 44)
+    - Outputs:
+        mu:             (B, T, D)
+        prior_logvar:   (B, T, D)
+        cond_features:  (B, T, D)  # used by ConditionalEncoder
     """
     def __init__(
         self,
@@ -350,7 +375,7 @@ class TargetEncoder(nn.Module):
                 hidden_dims=geometric_schedule(43, 16, 4),
                 final_activation=False,
                 use_skip_connection=True,
-                activation=nn.ReLU
+                activation=nn.GELU
                 )
 
         self.mlp_phase = ResidualMLP(
@@ -358,7 +383,7 @@ class TargetEncoder(nn.Module):
             hidden_dims=geometric_schedule(44, 16, 4),
             final_activation=False,
             use_skip_connection=True,
-            activation=nn.ReLU
+            activation=nn.GELU
             )
 
         self.conv_scattering_1 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1)
@@ -384,7 +409,7 @@ class TargetEncoder(nn.Module):
             input_dim=16 * 2,
             hidden_dims=(32, 32, 32),
             final_activation=False,
-            activation=nn.ReLU,
+            activation=nn.GELU,
             use_skip_connection=True
         )
 
@@ -402,28 +427,28 @@ class TargetEncoder(nn.Module):
             input_dim=lstm_output_dim,
             hidden_dims=geometric_schedule(lstm_output_dim, 32, 5),
             final_activation=True,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
 
         self.mu_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, 16, 4),
             final_activation=False,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
         
         self.prior_logvar_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, 16, 4),
             final_activation=False,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
         
         self.conditioning_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, 16, 4),
             final_activation=False,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
 
     def forward(
@@ -450,64 +475,64 @@ class TargetEncoder(nn.Module):
         """
         hidden_states = {} if return_hidden else None
 
-        scatter_linear = self.mlp_scattering(scattering_input)
-        phase_linear = self.mlp_phase(phase_harmonic_input)
+        scatter_linear = self.mlp_scattering(scattering_input)      # (B, T, 16)
+        phase_linear = self.mlp_phase(phase_harmonic_input)          # (B, T, 16)
         
         if return_hidden:
             hidden_states["scattering_reduced"] = scatter_linear
             hidden_states["phase_reduced"] = phase_linear
 
-        x_scatter = scatter_linear.transpose(1, 2)  # (B, C, L)
+        x_scatter = scatter_linear.transpose(1, 2)  # (B, 16, T)
         
         scatter_conv_1 = self.conv_scattering_1(x_scatter)
         scatter_conv_2 = self.conv_scattering_2(scatter_conv_1)
         skip_1_norm = self.scatter_skip_norm_1(scatter_conv_1)
-        scatter_conv_2 = scatter_conv_2 + skip_1_norm  # Normalized skip connection
+        scatter_conv_2 = scatter_conv_2 + skip_1_norm
         
         scatter_conv_3 = self.conv_scattering_3(scatter_conv_2)
         skip_2_norm = self.scatter_skip_norm_2(scatter_conv_2)
-        scatter_conv_3 = scatter_conv_3 + skip_2_norm  # Normalized skip connection
-        
-        scatter_conv = scatter_conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
-        scatter_conv = self.scatter_fused_norm(scatter_conv)
+        scatter_conv_3 = scatter_conv_3 + skip_2_norm
+
+        scatter_conv = scatter_conv_3.transpose(1, 2).contiguous()  # (B, T, 16)
+        scatter_conv = self.scatter_fused_norm(scatter_conv)        # (B, T, 16)
         del scatter_linear, x_scatter, scatter_conv_1, scatter_conv_2, scatter_conv_3, skip_1_norm, skip_2_norm
 
-        x_phase = phase_linear.transpose(1, 2)  # (B, C, L)
+        x_phase = phase_linear.transpose(1, 2)  # (B, 16, T)
         
         phase_conv_1 = self.conv_phase_1(x_phase)
         
         phase_conv_2 = self.conv_phase_2(phase_conv_1)
         skip_1_norm = self.phase_skip_norm_1(phase_conv_1)
-        phase_conv_2 = phase_conv_2 + skip_1_norm  # Normalized skip connection
+        phase_conv_2 = phase_conv_2 + skip_1_norm
         
         phase_conv_3 = self.conv_phase_3(phase_conv_2)
         skip_2_norm = self.phase_skip_norm_2(phase_conv_2)
-        phase_conv_3 = phase_conv_3 + skip_2_norm  # Normalized skip connection
+        phase_conv_3 = phase_conv_3 + skip_2_norm
         
-        phase_conv = phase_conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
-        phase_conv = self.phase_fused_norm(phase_conv)
+        phase_conv = phase_conv_3.transpose(1, 2).contiguous()  # (B, T, 16)
+        phase_conv = self.phase_fused_norm(phase_conv)          # (B, T, 16)
         del phase_linear, x_phase, phase_conv_1, phase_conv_2, phase_conv_3, skip_1_norm, skip_2_norm
 
-        combined = torch.cat([scatter_conv, phase_conv], dim=-1)
+        combined = torch.cat([scatter_conv, phase_conv], dim=-1)    # (B, T, 32)
         del scatter_conv, phase_conv
         x = self.cross_modal_fusion(combined)
         del combined
 
-        x, (hidden, cell) = self.lstm(x)  # (batch, length, channel)
-        x = self.lstm_norm(x)
+        x, (hidden, cell) = self.lstm(x)                           # (B, T, lstm_hidden_dim*(1 or 2))
+        x = self.lstm_norm(x)                                      # (B, T, lstm_hidden_dim*(1 or 2))
 
         if return_hidden:
             hidden_states["lstm_out"] = x
             hidden_states["lstm_hidden"] = hidden
             hidden_states["lstm_cell"] = cell
         else:
-            del hidden, cell  # Clean up LSTM states if not needed
+            del hidden, cell
 
-        x = self.pre_output(x)
+        x = self.pre_output(x)                                      # (B, T, 32)
 
-        mu = self.mu_layer(x)
-        prior_logvar = self.prior_logvar_layer(x)
-        conditioning_features = self.conditioning_layer(x)
+        mu = self.mu_layer(x)                                       # (B, T, D)
+        prior_logvar = self.prior_logvar_layer(x)                   # (B, T, D)
+        conditioning_features = self.conditioning_layer(x)          # (B, T, D)
 
         prior_logvar = torch.clamp(prior_logvar, min=-10, max=10)
 
@@ -540,6 +565,10 @@ class SourceEncoder(nn.Module):
     The output is a deterministic vector, which is used to condition the posterior distribution.
     In the code, this output is named `mu_x` for consistency, but it is not the mean of a
     distribution.
+
+    Shapes
+    - Input:  x_ph (B, T, 130)
+    - Output: mu_x (B, T, D)
     """
 
     def __init__(
@@ -563,7 +592,7 @@ class SourceEncoder(nn.Module):
             hidden_dims=geometric_schedule(130, 32, 5),
             final_activation=False,
             use_skip_connection=True,
-            activation=nn.ReLU
+            activation=nn.GELU
             )
         
         self.conv_1 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=3, dilation=1)
@@ -579,12 +608,12 @@ class SourceEncoder(nn.Module):
             input_dim=32, 
             hidden_dims=(32, 32),
             final_activation=False,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
         self.lstm_norm = nn.LayerNorm(lstm_hidden_dim)
         
         self.lstm = nn.LSTM(
-            input_size=32,  # Updated to match fusion_path output
+            input_size=32,
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
@@ -595,14 +624,14 @@ class SourceEncoder(nn.Module):
             input_dim=lstm_hidden_dim,
             hidden_dims=geometric_schedule(lstm_hidden_dim, 32, 4),
             final_activation=True,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
 
         self.mu_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, 16, 4),
             final_activation=False,
-            activation=nn.ReLU
+            activation=nn.GELU
         )
 
     def forward(
@@ -623,47 +652,47 @@ class SourceEncoder(nn.Module):
 
         if return_intermediate:
             intermediates["input_with_bias"] = x
-        x_linear = self.mlp(x)
+        x_linear = self.mlp(x)                        # (B, T, 32)
         
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
         
-        x_conv = x_linear.transpose(1, 2)  # (B, C, L)        
+        x_conv = x_linear.transpose(1, 2)  # (B, 32, T)
         conv_1 = self.conv_1(x_conv)
 
         conv_2 = self.conv_2(conv_1)
         skip_1_norm = self.source_skip_norm_1(conv_1)
-        conv_2 = conv_2 + skip_1_norm  # Normalized skip connection
+        conv_2 = conv_2 + skip_1_norm
         
         conv_3 = self.conv_3(conv_2)
         skip_2_norm = self.source_skip_norm_2(conv_2)
-        conv_3 = conv_3 + skip_2_norm  # Normalized skip connection
+        conv_3 = conv_3 + skip_2_norm
         
-        conv_out = conv_3.transpose(1, 2).contiguous()  # Back to (B, L, C)
+        conv_out = conv_3.transpose(1, 2).contiguous()  # (B, T, 32)
         
         if return_intermediate:
             intermediates["conv_path"] = conv_out
 
-        x = self.fused_norm(conv_out)
-        x = self.linear_after_conv(x)
+        x = self.fused_norm(conv_out)                 # (B, T, 32)
+        x = self.linear_after_conv(x)                 # (B, T, 32)
         del x_linear, x_conv, conv_1, conv_2, conv_3, conv_out, skip_1_norm, skip_2_norm  # Explicit cleanup
 
-        x, (hidden, cell) = self.lstm(x)
-        x = self.lstm_norm(x)
+        x, (hidden, cell) = self.lstm(x)              # (B, T, lstm_hidden_dim)
+        x = self.lstm_norm(x)                         # (B, T, lstm_hidden_dim)
 
         if return_intermediate:
             intermediates["lstm_output"] = x
             intermediates["lstm_hidden"] = hidden
             intermediates["lstm_cell"] = cell
         else:
-            del hidden, cell  # Clean up LSTM states if not needed
+            del hidden, cell
 
-        x = self.pre_output(x)
+        x = self.pre_output(x)                        # (B, T, 32)
 
         if return_intermediate:
             intermediates["post_lstm"] = x
 
-        mu = self.mu_layer(x)
+        mu = self.mu_layer(x)                         # (B, T, D)
 
         if return_intermediate:
             intermediates["mu"] = mu
@@ -696,6 +725,10 @@ class ConditionalEncoder(nn.Module):
     the source signal (x) and the target signal (y). It takes the latent representation of the
     source (h_x) and a conditioning feature from the target (c_y) as input. It outputs the
     parameters of the posterior distribution, which is a diagonal Gaussian.
+
+    Shapes
+    - Inputs: h_x (B, T, D), h_y (B, T, D)
+    - Outputs: mu_post (B, T, D), logvar_post (B, T, D)
     """
 
     def __init__(self, dim_hx: int, dim_hy: int, dim_z: int):
@@ -712,7 +745,7 @@ class ConditionalEncoder(nn.Module):
             hidden_dims=geometric_schedule(dim_hx + dim_hy, 20, 4),
             final_activation=True,
             use_skip_connection=True, 
-            activation=nn.ReLU,
+            activation=nn.GELU,
         )
 
         self.fc_mu = ResidualMLP(
@@ -720,14 +753,14 @@ class ConditionalEncoder(nn.Module):
             hidden_dims=geometric_schedule(20, 16, 4),
             final_activation=False,
             use_skip_connection=False, 
-            activation=nn.ReLU,
+            activation=nn.GELU,
         )
         self.fc_logvar = ResidualMLP(
             input_dim=20,
             hidden_dims=geometric_schedule(20, 16, 4),
             final_activation=False,
             use_skip_connection=False, 
-            activation=nn.ReLU,
+            activation=nn.GELU,
         )
 
     def forward(
@@ -751,23 +784,14 @@ class ConditionalEncoder(nn.Module):
         """
         h_combined = torch.cat([h_x, h_y], dim=-1)
         h_merged = self.mlp(h_combined)
-        del h_combined  # Clean up concatenated tensor
+        del h_combined
         mu = self.fc_mu(h_merged)
         logvar = self.fc_logvar(h_merged)
-        del h_merged  # Clean up intermediate tensor
+        del h_merged
         return mu, logvar
 
 
-
 class Decoder(nn.Module):
-    """
-    Research-backed decoder with progressive upsampling for optimal information bottleneck preservation.
-    
-    This decoder enforces strict latent compression by using progressive temporal upsampling
-    through ConvTranspose1d layers, preventing any information shortcuts that would bypass 
-    the TEB bottleneck principle. Based on 2024-2025 VAE research findings.
-    """
-
     def __init__(
         self,
         latent_dim: int = 16,
@@ -786,55 +810,49 @@ class Decoder(nn.Module):
         self.sequence_length = sequence_length
         self.target_length = target_length
 
-        # Stage 1: Feature expansion from latent bottleneck
-        # Force all information through 32D latent space - no shortcuts!
-        self.feature_expansion = nn.Sequential(
-            ResidualMLP(
+        self.feature_expansion_1 = ResidualMLP(
                 input_dim=latent_dim,
                 hidden_dims=geometric_schedule(latent_dim, 50, 5),
                 final_activation=True,
                 use_skip_connection=True, 
-                activation=nn.ReLU,
-            ),
-            
-            ResidualMLP(
+                activation=nn.GELU,
+                )
+
+        self.feature_expansion_2 = ResidualMLP(
                 input_dim=50,
                 hidden_dims=geometric_schedule(50, 87, 5),
                 final_activation=True,
-                activation=nn.ReLU,
+                activation=nn.GELU,
                 use_skip_connection=True
-            )
-        )
+                )
+
+        self.skip_con_exp = nn.Linear(latent_dim, 87, bias=False)
+        self.feature_expansion_layer_norm = nn.LayerNorm(87)
         
         self.pre_linear = ResidualMLP(
             input_dim=87,
             hidden_dims=geometric_schedule(87, 128, 3), 
             final_activation=False,
-            activation=nn.ReLU,
+            activation=nn.GELU,
             use_skip_connection=True
         )
-        
-        # Stage 2: Progressive temporal upsampling with ConvTranspose1d
-        # 300 → 600 → 1200 → 2400 → 4800 (16x total upsampling)
-        # Research shows this is optimal for physiological signal reconstruction
+
         self.upsample_1 = nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1)
         self.norm_1 = nn.GroupNorm(num_groups=8, num_channels=64)
-        
+
         self.upsample_2 = nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1) 
         self.norm_2 = nn.GroupNorm(num_groups=8, num_channels=32)
-        
+
         self.upsample_3 = nn.ConvTranspose1d(32, 16, kernel_size=4, stride=2, padding=1)
         self.norm_3 = nn.GroupNorm(num_groups=4, num_channels=16)
-        
+
         self.upsample_4 = nn.ConvTranspose1d(16, 8, kernel_size=4, stride=2, padding=1)
         self.norm_4 = nn.GroupNorm(num_groups=2, num_channels=8)
-        
-        # Stage 3: Multi-scale refinement for physiological signal quality
+
+
         self.refine_conv = nn.Conv1d(8, 4, kernel_size=7, padding=3)
         self.final_conv = nn.Conv1d(4, 1, kernel_size=5, padding=2)
-        
-        # Stage 4: Gaussian parameter prediction for raw FHR signal
-        # Separate heads for mean and log-variance of reconstructed signal
+
         self.signal_mu = nn.Conv1d(1, 1, kernel_size=1)
         self.signal_logvar = nn.Conv1d(1, 1, kernel_size=1)
 
@@ -847,51 +865,46 @@ class Decoder(nn.Module):
         latent representation learning.
         
         Args:
-            latent_z: Latent variables (batch_size, sequence_length=300, latent_dim=latent_dim)
+            latent_z: Latent variables (B, L, D)
         Returns:
             Tuple containing:
-            - linear_output: Auxiliary features (batch_size, sequence_length, 87)
-            - raw_signal_mu: Raw signal reconstruction mean (batch_size, 4800)
-            - raw_signal_logvar: Raw signal reconstruction log variance (batch_size, 4800)
+            - linear_output: Auxiliary features (B, L, 87)
+            - raw_signal_mu: Raw signal reconstruction mean (B, 16L)
+            - raw_signal_logvar: Raw signal reconstruction log variance (B, 16L)
         """
-        z_expanded = self.feature_expansion(latent_z)  # (B, 300, 87)
-        z_expanded_pre = self.pre_linear(z_expanded)  # (B, 300, 128)
-        z_conv = z_expanded_pre.transpose(1, 2)  # (B, 128, 300) for conv operations
-        del z_expanded_pre  # Clean up intermediate tensor
-        
-        # Stage 2: Progressive temporal upsampling
-        # Each step doubles the temporal resolution while reducing channels
-        # 300 → 600 samples
-        x1 = F.gelu(self.norm_1(self.upsample_1(z_conv)))      # (B, 64, 600)
-        del z_conv  # Clean up input tensor
-        # 600 → 1200 samples  
-        x2 = F.gelu(self.norm_2(self.upsample_2(x1)))          # (B, 32, 1200)  
-        del x1  # Clean up intermediate tensor
-        # 1200 → 2400 samples
-        x3 = F.gelu(self.norm_3(self.upsample_3(x2)))          # (B, 16, 2400)
-        del x2  # Clean up intermediate tensor
-        # 2400 → 4800 samples
-        x4 = F.gelu(self.norm_4(self.upsample_4(x3)))          # (B, 8, 4800)
-        del x3  # Clean up intermediate tensor
-        
-        # Stage 3: Multi-scale refinement for physiological signal quality
-        # Capture both coarse trends and fine temporal details
-        refined = F.gelu(self.refine_conv(x4))                  # (B, 4, 4800)
-        del x4  # Clean up intermediate tensor
-        features = self.final_conv(refined)                     # (B, 1, 4800)
-        del refined  # Clean up intermediate tensor
-        
-        # Stage 4: Gaussian parameter prediction
-        # Separate prediction heads for mean and log-variance
-        mu = self.signal_mu(features).squeeze(1)                # (B, 4800)
-        logvar = self.signal_logvar(features).squeeze(1)        # (B, 4800)
-        del features  # Clean up intermediate tensor
-        
-        # Clamp log-variance for numerical stability (as in original TEB model)
+        L = latent_z.size(1)
+        z_expanded = self.feature_expansion_1(latent_z)
+        z_expanded = self.feature_expansion_2(z_expanded)
+        z_expanded = self.feature_expansion_layer_norm(z_expanded + self.skip_con_exp(latent_z)) # (B, L, 87)
+        z_expanded_pre = self.pre_linear(z_expanded)  # (B, L, 128)
+        z_conv = z_expanded_pre.transpose(1, 2)       # (B, 128, L) for conv operations
+        del z_expanded_pre
+
+        x1 = F.gelu(self.norm_1(self.upsample_1(z_conv)))      # (B, 64, 2L)
+        del z_conv
+
+        x2 = F.gelu(self.norm_2(self.upsample_2(x1)))          # (B, 32, 4L)  
+        del x1 
+
+        x3 = F.gelu(self.norm_3(self.upsample_3(x2)))          # (B, 16, 8L)
+        del x2 
+
+        x4 = F.gelu(self.norm_4(self.upsample_4(x3)))          # (B, 8, 16L)
+        del x3
+
+        refined = F.gelu(self.refine_conv(x4))                  # (B, 4, 16L)
+        del x4
+        features = self.final_conv(refined)                     # (B, 1, 16L)
+        del refined
+
+        mu = self.signal_mu(features).squeeze(1)                # (B, 16L)
+        logvar = self.signal_logvar(features).squeeze(1)        # (B, 16L)
+        del features
+
         logvar = torch.clamp(logvar, min=-10, max=10)
-        
+
         return z_expanded, mu, logvar
-    
+
     @staticmethod
     def compute_loss(
         linear_output: torch.Tensor,
@@ -899,7 +912,8 @@ class Decoder(nn.Module):
         raw_logvar_predicted: torch.Tensor,
         target_fhr_st: torch.Tensor,
         target_fhr_ph: torch.Tensor,
-        target_raw_signal: torch.Tensor):
+        target_raw_signal: torch.Tensor,
+        compute_st_mse: bool = True):
         """
         Compute two-part loss: MSE loss for linear output and NLL loss for raw signal reconstruction.
         
@@ -918,24 +932,19 @@ class Decoder(nn.Module):
         """
         device = raw_mu_predicted.device
         
-        # MSE Loss: Compare linear output with stacked fhr_st and fhr_ph
-        if linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
-            # Stack fhr_st and fhr_ph along the last dimension (43 + 44 = 87)
+        if compute_st_mse and linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
             stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
             mse_loss = F.mse_loss(linear_output, stacked_target)
         else:
             mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
-        # NLL Loss: Full raw signal reconstruction (no warmup period)
-        # Ensure target_raw_signal is the right shape
         if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
             target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
         
-        # Compute Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
         diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
         var = raw_logvar_predicted.exp()  # (B, 4800)
         nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
-        nll_loss = nll_loss.mean()  # Average over all samples and time points
+        nll_loss = nll_loss.mean()
         
         return {
             'mse_loss': mse_loss,
@@ -944,15 +953,77 @@ class Decoder(nn.Module):
         }
 
 
-class SeqVaeTeb(nn.Module):
+class LatentForecaster(nn.Module):
     """
-    Sequence VAE with Transfer Entropy Bottleneck (TEB).
+    Simple autoregressive forecaster on latent space.
 
-    This model implements the full SeqVaeTeb framework, which learns a latent representation
-    of a target signal (y) that is predictive of the signal's future, while minimizing the
-    information it contains about a source signal (x). This is achieved by minimizing the
-    KL divergence between a posterior distribution q(z|x,y) and a prior distribution p(z|y).
+    - Encodes the past context z_{t-Lc+1:t} with a GRU encoder
+    - Decodes future H steps autoregressively with a GRU decoder
+    - Each step predicts a D-dimensional latent vector
+
+    Shapes:
+        context: (B, Lc, D)
+        returns: (B, H, D)
     """
+
+    def __init__(
+        self,
+        latent_dim: int = 16,
+        hidden_dim: int = 128,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+
+        self.encoder = nn.GRU(
+            input_size=latent_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.decoder = nn.GRU(
+            input_size=latent_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.proj = ResidualMLP(hidden_dim, geometric_schedule(hidden_dim, latent_dim, 4), final_activation=False)
+
+    def forward(self, z_context: torch.Tensor, horizon: int) -> torch.Tensor:
+        """
+        Args:
+            z_context: (B, Lc, D)
+            horizon: number of future steps to predict (H)
+        Returns:
+            z_future: (B, H, D)
+        """
+        B, Lc, D = z_context.shape
+
+        # Encode context
+        _, h_n = self.encoder(z_context)  # h_n: (num_layers, B, hidden_dim)
+
+        # Initialize decoder with last context latent as first input
+        dec_input = z_context[:, -1:, :]  # (B, 1, D)
+        h = h_n
+
+        outputs = []
+        for _ in range(horizon):
+            out, h = self.decoder(dec_input, h)   # out: (B, 1, hidden_dim)
+            z_hat = self.proj(out)                # (B, 1, D)
+            outputs.append(z_hat)
+            # Autoregressive: feed back the predicted latent
+            dec_input = z_hat
+
+        z_future = torch.cat(outputs, dim=1)  # (B, H, D)
+        return z_future
+
+
+class SeqVaeTeb(nn.Module):
 
     def __init__(
         self,
@@ -964,6 +1035,12 @@ class SeqVaeTeb(nn.Module):
         warmup_period: int = 30,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
+        # Forecasting params
+        context_len: int = 75,
+        horizon_len: int = 30,
+        forecaster_hidden_dim: int = 128,
+        forecaster_layers: int = 1,
+        forecaster_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -972,6 +1049,9 @@ class SeqVaeTeb(nn.Module):
         self.latent_dim_z = latent_dim_z
         self.decimation_factor = decimation_factor
         self.warmup_period = warmup_period
+        self.sequence_length = sequence_length
+        self.context_len = context_len
+        self.horizon_len = horizon_len
 
         self.source_encoder = SourceEncoder(
             sequence_length=sequence_length,
@@ -993,6 +1073,14 @@ class SeqVaeTeb(nn.Module):
         
         self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)  # Original decoder for backward compatibility
 
+        # Latent forecaster for prediction mode
+        self.latent_forecaster = LatentForecaster(
+            latent_dim=latent_dim_z,
+            hidden_dim=forecaster_hidden_dim,
+            num_layers=forecaster_layers,
+            dropout=forecaster_dropout,
+        )
+
         initialization(self)
 
     def forward(
@@ -1002,15 +1090,23 @@ class SeqVaeTeb(nn.Module):
         x_ph: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        Full forward pass of the SeqVaeTeb model.
+        Full forward pass (reconstruction mode; decodes full length T to raw 4800).
 
         Args:
-            y_st: Target scattering input from optimized dataloader (Batch, sequence_len=300, channels=43)
-            y_ph: Target phase harmonic input from optimized dataloader (Batch, sequence_len=300, channels=44)
-            x_ph: Source phase harmonic input from optimized dataloader (Batch, sequence_len=300, channels=130)
+            y_st: (B, T, 43)
+            y_ph: (B, T, 44)
+            x_ph: (B, T, 130)
 
         Returns:
-            A dictionary containing tensors needed for loss computation.
+            dict with:
+                z:            (B, T, D)
+                linear_output:(B, T, 87)
+                mu_pr:        (B, 4800)
+                logvar_pr:    (B, 4800)
+                mu_prior:     (B, T, D)
+                logvar_prior: (B, T, D)
+                mu_post:      (B, T, D)
+                logvar_post:  (B, T, D)
         """
 
         # Source encoder for q(h_x|x)
@@ -1039,8 +1135,137 @@ class SeqVaeTeb(nn.Module):
             "logvar_post": logvar_post,
         }
 
+    # ------------------------
+    # Encoding utilities
+    # ------------------------
+    def encode_only(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        sample_z: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run only encoders and posterior sampling (no decoding).
+
+        Returns keys: mu_prior, logvar_prior, mu_post, logvar_post, z
+        """
+        mu_x = self.source_encoder(x_ph)
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
+        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
+        z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
+        return {
+            "mu_prior": mu_y,
+            "logvar_prior": logvar_y_prior,
+            "mu_post": mu_post,
+            "logvar_post": logvar_post,
+            "z": z,
+        }
+
+    # ------------------------
+    # Forecasting helpers
+    # ------------------------
+    @staticmethod
+    def anchor_range(T: int, Lc: int, H: int) -> torch.Tensor:
+        """Return valid anchor indices t in [Lc-1, T-1-H] as (N,)."""
+        start = max(0, Lc - 1)
+        end = max(start - 1, T - 1 - H)  # inclusive
+        if end < start:
+            return torch.zeros(0, dtype=torch.long)
+        return torch.arange(start, end + 1, dtype=torch.long)
+
+    @staticmethod
+    def raw_window_from_anchor(t: int, stride: int = 16, H: int = 30) -> Tuple[int, int]:
+        """Given decimated anchor t, return raw [start, end) indices for the H-step forecast (length H*stride)."""
+        start = stride * (t + 1)
+        end = start + stride * H
+        return start, end
+
+    def _gather_context(self, z_seq: torch.Tensor, anchors: torch.Tensor, Lc: int) -> torch.Tensor:
+        """
+        Gather contexts for anchors from z sequence.
+
+        Args:
+            z_seq: (B, T, D)
+            anchors: (N,)
+        Returns:
+            contexts: (B, N, Lc, D)
+        """
+        B, T, D = z_seq.shape
+        N = anchors.numel()
+        contexts = []
+        for t in anchors.tolist():
+            ctx = z_seq[:, t - Lc + 1 : t + 1, :]
+            contexts.append(ctx.unsqueeze(1))  # (B,1,Lc,D)
+        return torch.cat(contexts, dim=1) if contexts else z_seq.new_zeros(B, 0, Lc, D)
+
+    def forecast(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        anchors: Optional[torch.Tensor] = None,
+        use_posterior_mean: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forecast future raw FHR windows at the given anchors.
+
+        Shapes
+            y_*: (B, T, ...)
+            anchors: (N,) — if None, computed from (T, Lc, H)
+            returns:
+            anchors: (N,)
+            z_future: (B, N, H, D)
+            mu_future/logvar_future: (B, N, W) with W = 16*H
+            enc: dict with full-sequence priors/posteriors
+        """
+        B, T, _ = y_st.shape
+        H = self.horizon_len
+        Lc = self.context_len
+
+        enc = self.encode_only(y_st, y_ph, x_ph, sample_z=not use_posterior_mean)
+        z_seq = enc["z"] if not use_posterior_mean else enc["mu_post"]  # (B,T,D)
+
+        if anchors is None:
+            anchors = self.anchor_range(T, Lc, H).to(z_seq.device)
+        if anchors.numel() == 0:
+            return {
+                "anchors": anchors,
+                "z_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
+                "mu_future": z_seq.new_zeros(B, 0, H * self.decimation_factor),
+                "logvar_future": z_seq.new_zeros(B, 0, H * self.decimation_factor),
+                "enc": enc,
+            }
+
+        # Gather contexts: (B,N,Lc,D) -> flatten anchors for forecaster
+        contexts = self._gather_context(z_seq, anchors, Lc)  # (B,N,Lc,D)
+        B, N, Lc, D = contexts.shape
+        contexts_flat = contexts.reshape(B * N, Lc, D)
+
+        # Predict future latents per anchor
+        z_future_flat = self.latent_forecaster(contexts_flat, horizon=H)  # (B*N, H, D)
+        z_future = z_future_flat.reshape(B, N, H, D)
+
+        # Decode per-anchor future latents into raw windows
+        z_future_flat_for_dec = z_future_flat  # (B*N, H, D)
+        _, mu_flat, logvar_flat = self.decoder(z_future_flat_for_dec)  # mu/logvar: (B*N, 16*H)
+        mu_future = mu_flat.reshape(B, N, -1)
+        logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
+
+        return {
+            "anchors": anchors,
+            "z_future": z_future,
+            "mu_future": mu_future,
+            "logvar_future": logvar_future,
+            "enc": enc,
+        }
+
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Applies the reparameterization trick to sample from a Gaussian."""
+        """
+        Reparameterization trick.
+        Shapes: mu/logvar (B, L, D) -> z (B, L, D)
+        """
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std  # Remove in-place operation
@@ -1054,15 +1279,12 @@ class SeqVaeTeb(nn.Module):
         reduce_mean: bool = True,
     ) -> torch.Tensor:
         """
-        Computes the KL divergence between two Gaussian distributions.
+        KL divergence between diagonal Gaussians.
 
-        Args:
-            mu_prior: Mean of the prior distribution.
-            logvar_prior: Log variance of the prior distribution.
-            mu_post: Mean of the posterior distribution.
-            logvar_post: Log variance of the posterior distribution.
-            reduce_mean: If True, returns the mean KLD (scalar). 
-                        If False, returns the KLD tensor (batch, seq_len, latent_dim).
+        Shapes
+            mu_prior/logvar_prior: (B, L, D)
+            mu_post/logvar_post:   (B, L, D)
+            returns: scalar if reduce_mean=True else (B, L, D)
         """
         kld = (
                 logvar_prior
@@ -1077,6 +1299,235 @@ class SeqVaeTeb(nn.Module):
             return kld.sum(dim=-1).mean()
         return kld
 
+    @staticmethod
+    def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Elementwise Gaussian NLL averaged over batch and time.
+
+        Shapes: mu/logvar/target (B, R) or (B, W) must match; optional mask same shape.
+        If mask provided, returns weighted mean over valid points.
+        """
+        var = logvar.exp()
+        nll = 0.5 * (logvar + (target - mu) ** 2 / var)
+        if mask is not None:
+            nll = nll * mask
+            denom = mask.sum().clamp_min(1.0)
+            return nll.sum() / denom
+        return nll.mean()
+
+    def compute_forecast_loss(
+        self,
+        forecast_outputs: Dict[str, torch.Tensor],
+        y_raw: torch.Tensor,
+        anchors: Optional[torch.Tensor] = None,
+        beta: float = 0.0,
+        include_kld: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute forecasting loss.
+
+        - Gaussian NLL averaged over predicted windows at N anchors
+        - Optional KL(q||p) over full encoded sequence
+
+        Shapes
+            mu_future/logvar_future in forecast_outputs: (B, N, W) with W = 16*H
+            y_raw: (B, R=4800)
+            anchors: (N,)
+        """
+        mu_future = forecast_outputs["mu_future"]  # (B,N,480)
+        logvar_future = forecast_outputs["logvar_future"]  # (B,N,480)
+        enc = forecast_outputs["enc"]
+        if anchors is None:
+            anchors = forecast_outputs["anchors"]
+
+        B, N, W = mu_future.shape
+        H = self.horizon_len
+        stride = self.decimation_factor
+
+        # Accumulate NLL over anchors
+        nll_total = 0.0
+        for i, t in enumerate(anchors.tolist()):
+            start, end = self.raw_window_from_anchor(t, stride=stride, H=H)
+            target_win = y_raw[:, start:end]
+            mu_win = mu_future[:, i, :]
+            logvar_win = logvar_future[:, i, :]
+            nll_total = nll_total + self.gaussian_nll(mu_win, logvar_win, target_win)
+
+        forecast_nll = nll_total / max(1, N)
+
+        kld_loss = torch.tensor(0.0, device=y_raw.device)
+        if include_kld:
+            kld_loss = self._kld_loss(
+                mu_prior=enc["mu_prior"],
+                logvar_prior=enc["logvar_prior"],
+                mu_post=enc["mu_post"],
+                logvar_post=enc["logvar_post"],
+                reduce_mean=True,
+            )
+
+        total = forecast_nll + beta * kld_loss
+        return {
+            "forecast_nll": forecast_nll,
+            "kld_loss": kld_loss,
+            "total_loss": total,
+        }
+
+    def aggregate_forecasts_to_canvas(
+        self,
+        mu_future: torch.Tensor,
+        anchors: torch.Tensor,
+        total_len: int = 4800,
+        stride: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Place per-anchor windows on a raw-length canvas with NaNs in gaps.
+
+        Args
+            mu_future: (B, N, W) where W = 16*H
+            anchors: (N,)
+            total_len: raw timeline length (default 4800)
+            stride: samples per decimated step (default 16)
+        Returns
+            stacked: (B, N, total_len) with NaNs where not covered
+            mean:    (B, total_len) nanmean over anchors
+        """
+        B, N, W = mu_future.shape
+        canvas = mu_future.new_full((B, N, total_len), float("nan"))
+        for i, t in enumerate(anchors.tolist()):
+            start, end = self.raw_window_from_anchor(t, stride=stride, H=W // stride)
+            end = min(end, total_len)
+            length = end - start
+            if length > 0:
+                canvas[:, i, start:end] = mu_future[:, i, :length]
+        mean = torch.nanmean(canvas, dim=1)
+        return canvas, mean
+
+    # ------------------------
+    # Convenience: full forecast + aggregation + metrics
+    # ------------------------
+    def forecast_full(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        anchors: Optional[torch.Tensor] = None,
+        use_posterior_mean: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Runs forecast and returns aggregated mean/std on the raw timeline.
+
+        Returns keys
+            anchors:      (N,)
+            mu_future:    (B, N, 16*H)
+            logvar_future:(B, N, 16*H)
+            canvas_mu:    (B, N, 4800)
+            mean_mu:      (B, 4800)
+            canvas_var:   (B, N, 4800)
+            std_mu:       (B, 4800)
+            enc:          dict with priors/posteriors
+        """
+        out = self.forecast(y_st, y_ph, x_ph, anchors=anchors, use_posterior_mean=use_posterior_mean)
+        anchors = out["anchors"]
+        mu_future = out["mu_future"]
+        logvar_future = out["logvar_future"]
+        enc = out["enc"]
+
+        canvas_mu, mean_mu = self.aggregate_forecasts_to_canvas(
+            mu_future, anchors, total_len=4800, stride=self.decimation_factor
+        )
+        var_future = logvar_future.exp()
+        canvas_var, mean_var = self.aggregate_forecasts_to_canvas(
+            var_future, anchors, total_len=4800, stride=self.decimation_factor
+        )
+        std_mu = mean_var.clamp_min(1e-8).sqrt()
+        return {
+            "anchors": anchors,
+            "mu_future": mu_future,
+            "logvar_future": logvar_future,
+            "canvas_mu": canvas_mu,
+            "mean_mu": mean_mu,
+            "canvas_var": canvas_var,
+            "std_mu": std_mu,
+            "enc": enc,
+        }
+
+    @staticmethod
+    def _masked_corrcoef(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Pearson correlation over masked elements per batch.
+        a, b: (B, L), mask: (B, L) boolean
+        Returns (B,) correlations; NaN if fewer than 2 valid points.
+        """
+        a = a.clone()
+        b = b.clone()
+        mask = mask.bool()
+        # Replace invalid with 0 for sums, track counts
+        a_masked = a.masked_fill(~mask, 0.0)
+        b_masked = b.masked_fill(~mask, 0.0)
+        n = mask.sum(dim=1).clamp_min(1)
+        # Means
+        mean_a = a_masked.sum(dim=1) / n
+        mean_b = b_masked.sum(dim=1) / n
+        # Centered
+        a_c = a_masked - mean_a.unsqueeze(1)
+        b_c = b_masked - mean_b.unsqueeze(1)
+        a_c = a_c.masked_fill(~mask, 0.0)
+        b_c = b_c.masked_fill(~mask, 0.0)
+        # Covariance and variances
+        cov = (a_c * b_c).sum(dim=1) / n.clamp_min(2)
+        var_a = (a_c.pow(2)).sum(dim=1) / n.clamp_min(2)
+        var_b = (b_c.pow(2)).sum(dim=1) / n.clamp_min(2)
+        denom = (var_a.clamp_min(1e-12) * var_b.clamp_min(1e-12)).sqrt()
+        corr = cov / denom
+        # If fewer than 2 points, set NaN
+        corr = torch.where(n >= 2, corr, torch.full_like(corr, float('nan')))
+        return corr
+
+    def evaluate_forecast_batch(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        y_raw: torch.Tensor,
+        anchors: Optional[torch.Tensor] = None,
+        use_posterior_mean: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forecasts and computes per-sample metrics on the aggregated prediction over the raw timeline.
+
+        Returns:
+            - mean_mu: (B,4800), std_mu: (B,4800), mask: (B,4800) valid-coverage mask
+            - mse: (B,), mae: (B,), corr: (B,) over covered region
+            - anchors, enc (for further analysis)
+        """
+        out = self.forecast_full(y_st, y_ph, x_ph, anchors=anchors, use_posterior_mean=use_posterior_mean)
+        mean_mu = out["mean_mu"]  # (B,4800)
+        std_mu = out["std_mu"]    # (B,4800)
+        anchors = out["anchors"]
+        enc = out["enc"]
+
+        # Coverage mask
+        mask = ~torch.isnan(mean_mu)
+        # Replace NaNs for arithmetic
+        pred = mean_mu.masked_fill(~mask, 0.0)
+        gt = y_raw.masked_fill(~mask, 0.0)
+        denom = mask.sum(dim=1).clamp_min(1)
+        # MSE and MAE over covered points
+        mse = ((pred - gt).pow(2).sum(dim=1) / denom)
+        mae = ((pred - gt).abs().sum(dim=1) / denom)
+        # Correlation over covered points
+        corr = self._masked_corrcoef(pred, gt, mask)
+
+        return {
+            "mean_mu": mean_mu,
+            "std_mu": std_mu,
+            "mask": mask,
+            "mse": mse,
+            "mae": mae,
+            "corr": corr,
+            "anchors": anchors,
+            "enc": enc,
+        }
     
     def compute_loss(
         self,
@@ -1086,6 +1537,10 @@ class SeqVaeTeb(nn.Module):
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
+        predictive_weight: float = 0.0,
+        predictive_horizon: int = 1,
+        latent_consistency_weight: float = 0.0,
+        predictive_context_len: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss with MSE and NLL components.
@@ -1097,12 +1552,19 @@ class SeqVaeTeb(nn.Module):
             y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
             compute_kld_loss (bool): Whether to compute KLD loss.
             beta (float): Beta weight for KLD loss in VAE training.
+            predictive_weight (float): Weight for auxiliary raw-forecast NLL (0 disables).
+            predictive_horizon (int): Number of decimated steps to forecast (H >= 1).
+            latent_consistency_weight (float): Weight for latent forecast MSE (0 disables).
+            predictive_context_len (Optional[int]): Context length for latent forecaster; defaults to
+                ``self.context_len`` when ``None``.
 
         Returns:
             A dictionary of computed losses.
         """
         device = y_raw.device
         kld_loss = torch.tensor(0.0, device=device)
+        predictive_loss = torch.tensor(0.0, device=device)
+        latent_consistency_loss = torch.tensor(0.0, device=device)
 
         if y_raw.dim() == 3 and y_raw.size(-1) == 1:
             y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
@@ -1127,14 +1589,72 @@ class SeqVaeTeb(nn.Module):
                 reduce_mean=True,  # Ensure scalar loss for training
             )
 
+        # Auxiliary predictive objectives to encourage temporally informative latents
+        needs_predictive = (predictive_weight > 0.0 or latent_consistency_weight > 0.0)
+        if needs_predictive:
+            if predictive_horizon < 1:
+                raise ValueError("predictive_horizon must be >= 1 when predictive losses are enabled")
+
+            mu_post = forward_outputs["mu_post"]  # (B, T, D)
+            B, T, D = mu_post.shape
+            stride = self.decimation_factor
+            context_len = predictive_context_len or self.context_len
+
+            anchors = self.anchor_range(T, context_len, predictive_horizon)
+            if anchors.numel() > 0:
+                anchors = anchors.to(mu_post.device)
+
+                # Gather contexts for latent forecaster
+                contexts = self._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
+                B_ctx, N, Lc, _ = contexts.shape
+                contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
+
+                # Predict future latents z_{t+1:t+H}
+                z_future_pred = self.latent_forecaster(contexts_flat, horizon=predictive_horizon)
+                z_future_pred = z_future_pred.reshape(B_ctx, N, predictive_horizon, D)
+
+                # Collect ground-truth future latent means (stop gradient)
+                future_targets = []
+                for t in anchors.tolist():
+                    future_targets.append(mu_post[:, t + 1 : t + 1 + predictive_horizon, :].unsqueeze(1))
+                future_targets = torch.cat(future_targets, dim=1).detach()  # (B, N, H, D)
+
+                if latent_consistency_weight > 0.0:
+                    latent_consistency_loss = F.mse_loss(z_future_pred, future_targets)
+
+                if predictive_weight > 0.0:
+                    # Decode forecasted latents to raw space and score against ground truth
+                    z_future_flat = z_future_pred.reshape(B_ctx * N, predictive_horizon, D)
+                    _, mu_flat, logvar_flat = self.decoder(z_future_flat)
+                    mu_future = mu_flat.reshape(B_ctx, N, -1)
+                    logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
+
+                    nll_total = torch.tensor(0.0, device=device)
+                    for idx, t in enumerate(anchors.tolist()):
+                        start = stride * (t + 1)
+                        end = start + stride * predictive_horizon
+                        target_window = y_raw[:, start:end]
+                        mu_window = mu_future[:, idx, : target_window.size(-1)]
+                        logvar_window = logvar_future[:, idx, : target_window.size(-1)]
+                        nll_total = nll_total + self.gaussian_nll(mu_window, logvar_window, target_window)
+
+                    predictive_loss = nll_total / max(1, anchors.numel())
+
         # Total loss with beta-weighted KLD
-        total_loss = decoder_losses['total_decoder_loss'] + beta * kld_loss
+        total_loss = (
+            decoder_losses['total_decoder_loss']
+            + beta * kld_loss
+            + predictive_weight * predictive_loss
+            + latent_consistency_weight * latent_consistency_loss
+        )
 
         return {
             "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
             "mse_loss": decoder_losses['mse_loss'],
             "nll_loss": decoder_losses['nll_loss'], 
             "kld_loss": kld_loss,
+            "predictive_loss": predictive_loss,
+            "latent_consistency_loss": latent_consistency_loss,
             "total_loss": total_loss,
             "classification_loss": None,  # Required by interface
         }
@@ -1258,7 +1778,7 @@ class SeqVaeTebClassifier(nn.Module):
 
         Notes:
         - Lightning checkpoints typically store weights under 'state_dict' and prefix with
-          'model.'; nested modules may appear as 'model.vae_model.' etc.
+            'model.'; nested modules may appear as 'model.vae_model.' etc.
         - DataParallel adds 'module.' and torch.compile can add an '_orig_mod.' wrapper.
         - This method strips these known prefixes and filters keys to the bare `SeqVaeTeb`.
         - Shape mismatches raise with details; other discrepancies are logged as warnings.
@@ -1305,8 +1825,8 @@ class SeqVaeTebClassifier(nn.Module):
             
             if shape_mismatches:
                 raise ValueError(f"VAE architecture mismatch - parameter shape conflicts:\n" + 
-                               "\n".join(shape_mismatches[:5]) + 
-                               (f"\n... and {len(shape_mismatches)-5} more" if len(shape_mismatches) > 5 else ""))
+                                "\n".join(shape_mismatches[:5]) + 
+                                (f"\n... and {len(shape_mismatches)-5} more" if len(shape_mismatches) > 5 else ""))
 
             # Load with strict=False to get missing/unexpected keys info
             incompatible = self.vae_model.load_state_dict(new_sd, strict=False)
@@ -1332,7 +1852,7 @@ class SeqVaeTebClassifier(nn.Module):
         except Exception as e:
             log.error(f"Failed to load pretrained VAE from '{pretrained_path}': {e}")
             raise RuntimeError(f"Cannot load incompatible VAE checkpoint. Please use a checkpoint that matches "
-                             f"the current VAE architecture, or train from scratch.") from e
+                                f"the current VAE architecture, or train from scratch.") from e
     
     def freeze_vae_parameters(self):
         """Freeze all VAE parameters to prevent updates during classification training."""
