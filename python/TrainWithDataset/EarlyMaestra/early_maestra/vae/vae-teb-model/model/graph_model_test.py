@@ -147,6 +147,11 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir, model_created=True)
         self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir, model_created=True)
 
+        # New: forecasting evaluation and plots (keeps legacy tests intact)
+        forecast_dir = os.path.join(self.test_results_dir, 'forecast_eval')
+        os.makedirs(forecast_dir, exist_ok=True)
+        self.run_forecast_evaluation_and_plot(test_loader, num_samples=100, output_dir=forecast_dir, selected_guids=selected_guids, model_created=True)
+
 
     def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None, model_created=False):
         """
@@ -681,6 +686,149 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
             plt.close(fig)
             
             logger.info(f"Signal shift examples for sample {sample_idx} saved to: {plot_path}")
+
+    # ------------------------------
+    # New: Forecasting evaluation and plotting
+    # ------------------------------
+    def run_forecast_evaluation_and_plot(self, test_loader, num_samples=100, output_dir=None, selected_guids=None, model_created=False):
+        out_dir = output_dir or os.path.join(self.test_results_dir, 'forecast_eval')
+        os.makedirs(out_dir, exist_ok=True)
+        logger.info(f"Starting forecasting evaluation on up to {num_samples} samples...")
+
+        if not model_created:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model could not be created or loaded. Aborting forecast evaluation.")
+            return
+
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else "cpu")
+        if not model_created:
+            self.pytorch_model.to(device)
+            self.pytorch_model.eval()
+
+        # Collect samples
+        samples = []
+        count = 0
+        with torch.inference_mode():
+            for batch in tqdm(test_loader, desc="Collecting samples for forecast eval"):
+                bsz = batch.fhr_st.size(0)
+                for i in range(bsz):
+                    if count >= num_samples:
+                        break
+                    guid_ok = True
+                    if selected_guids is not None:
+                        try:
+                            guid_val = batch.guid[i] if isinstance(batch.guid, (list, tuple)) else str(batch.guid[i])
+                            guid_ok = (guid_val in selected_guids)
+                        except Exception:
+                            guid_ok = True
+                    if not guid_ok:
+                        continue
+                    samples.append({
+                        'fhr_st': batch.fhr_st[i],
+                        'fhr_ph': batch.fhr_ph[i],
+                        'fhr_up_ph': batch.fhr_up_ph[i],
+                        'fhr': batch.fhr[i],
+                    })
+                    count += 1
+                if count >= num_samples:
+                    break
+
+        if len(samples) == 0:
+            logger.warning("No samples collected for forecasting evaluation.")
+            return
+
+        # Metrics arrays
+        mse_list, mae_list, corr_list = [], [], []
+
+        # Plot a few examples
+        example_indices = list(range(min(6, len(samples))))
+
+        with torch.inference_mode():
+            for idx, sample in enumerate(tqdm(samples, desc="Forecasting eval")):
+                y_st = sample['fhr_st'].unsqueeze(0).to(device)
+                y_ph = sample['fhr_ph'].unsqueeze(0).to(device)
+                x_ph = sample['fhr_up_ph'].unsqueeze(0).to(device)
+                y_raw = sample['fhr'].unsqueeze(0).to(device)
+
+                # Evaluate forecast metrics and get aggregated predictions
+                out = self.pytorch_model.evaluate_forecast_batch(y_st, y_ph, x_ph, y_raw, use_posterior_mean=True)
+                mse = float(out['mse'][0].item())
+                mae = float(out['mae'][0].item())
+                corr = float(out['corr'][0].item()) if not torch.isnan(out['corr'][0]) else float('nan')
+                mse_list.append(mse)
+                mae_list.append(mae)
+                corr_list.append(corr)
+
+                # Plot sample forecasts for first few samples
+                if idx in example_indices:
+                    self._plot_forecast_example(
+                        y_raw=y_raw[0].detach().cpu(),
+                        mean_mu=out['mean_mu'][0].detach().cpu(),
+                        std_mu=out['std_mu'][0].detach().cpu(),
+                        anchors=out['anchors'].detach().cpu(),
+                        canvas_mu=self.pytorch_model.aggregate_forecasts_to_canvas(
+                            self.pytorch_model.forecast(y_st, y_ph, x_ph, use_posterior_mean=True)["mu_future"],
+                            out['anchors'], total_len=y_raw.shape[1], stride=self.pytorch_model.decimation_factor
+                        )[0][0].detach().cpu(),
+                        save_path=os.path.join(out_dir, f'forecast_sample_{idx}.pdf')
+                    )
+
+        # Save metrics summary and histograms
+        self._plot_forecast_metrics_histograms(mse_list, mae_list, corr_list, out_dir)
+        with open(os.path.join(out_dir, 'forecast_metrics.pkl'), 'wb') as f:
+            pickle.dump({"mse": mse_list, "mae": mae_list, "corr": corr_list}, f)
+        logger.info(
+            f"Forecast metrics — MSE: mean={np.nanmean(mse_list):.6f}, std={np.nanstd(mse_list):.6f}; "
+            f"MAE: mean={np.nanmean(mae_list):.6f}, std={np.nanstd(mae_list):.6f}; "
+            f"Corr: mean={np.nanmean(corr_list):.4f}, std={np.nanstd(corr_list):.4f}"
+        )
+
+    def _plot_forecast_example(self, y_raw, mean_mu, std_mu, anchors, canvas_mu, save_path):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        t = np.arange(y_raw.shape[0]) / 4.0
+        fig, ax = plt.subplots(2, 1, figsize=(16, 7), constrained_layout=True)
+        # Aggregated view
+        ax[0].plot(t, y_raw.numpy(), color='#2E86AB', label='GT', linewidth=1.5)
+        ax[0].plot(t, mean_mu.numpy(), color='#D7263D', label='Forecast mean', linewidth=1.2)
+        ax[0].fill_between(t, (mean_mu - std_mu).numpy(), (mean_mu + std_mu).numpy(), color='#F5B7B1', alpha=0.4, label='±1σ')
+        ax[0].set_title('Forecast: Aggregated prediction with uncertainty')
+        ax[0].legend(loc='upper right')
+        ax[0].set_ylabel('FHR (bpm)')
+        # Overlay a few windows
+        ax[1].plot(t, y_raw.numpy(), color='#2E86AB', alpha=0.3, linewidth=1.0)
+        cmu = canvas_mu.numpy()  # (N,4800) with NaNs
+        if anchors.numel() > 0:
+            anc = anchors.numpy()
+            picks = [anc[0], anc[len(anc)//2], anc[-1]] if len(anc) >= 3 else list(anc)
+            for a in picks:
+                idx = int(np.where(anc == a)[0][0])
+                ax[1].plot(t, cmu[idx], color='#D7263D', linewidth=1.0, alpha=0.8)
+        ax[1].set_title('Sample forecast windows')
+        ax[1].set_ylabel('FHR (bpm)')
+        ax[1].set_xlabel('Time (s)')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved forecast example to {save_path}")
+
+    def _plot_forecast_metrics_histograms(self, mse_list, mae_list, corr_list, out_dir):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        fig, ax = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)
+        ax[0].hist([v for v in mse_list if np.isfinite(v)], bins=40, color='#6AAED6')
+        ax[0].set_title('MSE (forecast)')
+        ax[1].hist([v for v in mae_list if np.isfinite(v)], bins=40, color='#FF9F80')
+        ax[1].set_title('MAE (forecast)')
+        ax[2].hist([v for v in corr_list if np.isfinite(v)], bins=40, color='#A0D683')
+        ax[2].set_title('Pearson Corr (forecast)')
+        for a in ax:
+            a.grid(True, alpha=0.3)
+        save_path = os.path.join(out_dir, 'forecast_metrics_histograms.png')
+        fig.suptitle('Forecasting Metrics')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved forecast metrics histograms to {save_path}")
 
     def run_metrics_histogram_analysis(self, test_loader, num_samples=None, output_dir=None, selected_guids=None, model_created=False):
         """
