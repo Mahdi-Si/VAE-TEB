@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 import os
 import plotly.graph_objects as go
+from typing import Dict, Optional, Tuple
 
 from vae_teb_model import SeqVaeTeb
 
@@ -27,7 +28,7 @@ from loguru import logger
 class PlottingCallBack(Callback):
     def __init__(self, output_dir, plot_every_epoch):
         super().__init__()
-        self.output_dir = output_dir
+        self.output_dir = output_dir    
         self.plot_every_epoch = plot_every_epoch
 
     def on_validation_epoch_end(self, pl_trainer, pl_module):
@@ -338,6 +339,8 @@ class LossPlotCallback(Callback):
             "train/recon_loss": [],
             "train/mse_loss": [],
             "train/nll_loss": [],
+            "train/predictive_loss": [],
+            "train/latent_consistency_loss": [],
             "train/forecast_nll": [],
             "train/kld_loss": [],
             "train/agg_mse": [],
@@ -345,9 +348,15 @@ class LossPlotCallback(Callback):
             "val/recon_loss": [],
             "val/mse_loss": [],
             "val/nll_loss": [],
+            "val/predictive_loss": [],
+            "val/latent_consistency_loss": [],
             "val/forecast_nll": [],
             "val/kld_loss": [],
             "val/agg_mse": [],
+            "val/agg_mae": [],
+            "val/agg_corr": [],
+            "val/agg_std": [],
+            "val/agg_coverage": [],
             # Hyperparameters
             "hyperparams/beta": [],
             "hyperparams/lr": []
@@ -629,7 +638,12 @@ class LightSeqVaeTeb(L.LightningModule):
         beta_end: float = 1.0,
         beta_anneal_epochs: int = 100,
         beta_cycle_len: int = 1000,
-        beta_const_val: float = 1.0
+        beta_const_val: float = 1.0,
+        predictive_weight: float = 0.0,
+        latent_consistency_weight: float = 0.0,
+        predictive_horizon: Optional[int] = None,
+        predictive_context_len: Optional[int] = None,
+        log_forecast_metrics: bool = True,
         ):
         """
         Args:
@@ -642,8 +656,26 @@ class LightSeqVaeTeb(L.LightningModule):
             beta_anneal_epochs: Number of epochs for linear annealing.
             beta_cycle_len: Length of a cycle for cyclic annealing.
             beta_const_val: Constant value for beta if schedule is 'constant'.
+            predictive_weight: Weight for auxiliary raw forecasting NLL during training.
+            latent_consistency_weight: Weight for latent forecast consistency (MSE) term.
+            predictive_horizon: Forecast horizon (decimated steps) used for auxiliary objectives.
+            predictive_context_len: Context length supplied to the latent forecaster (decimated steps).
+            log_forecast_metrics: Whether to compute/log aggregated forecast metrics during validation.
         """
         super().__init__()
+
+        # Default predictive settings to model attributes when not provided
+        model_horizon = getattr(seqvae_teb_model, "horizon_len", None)
+        model_context = getattr(seqvae_teb_model, "context_len", None)
+
+        if predictive_horizon is None:
+            predictive_horizon = model_horizon if model_horizon is not None else 1
+        if predictive_context_len is None:
+            if model_context is not None:
+                predictive_context_len = model_context
+            else:
+                predictive_context_len = max(predictive_horizon, 1)
+
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
         self.model = seqvae_teb_model
@@ -677,11 +709,13 @@ class LightSeqVaeTeb(L.LightningModule):
         """Called at the beginning of each training epoch."""
         self.hparams.beta = self._calculate_beta()
         self.log('kld_beta', self.hparams.beta, on_epoch=True, prog_bar=True)
+        self.log('hyperparams/beta', self.hparams.beta, on_epoch=True, prog_bar=False, logger=True)
         
         # Log learning rate at the start of each epoch
         try:
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr', lr, on_epoch=True, prog_bar=True, logger=True)
+            self.log('hyperparams/lr', lr, on_epoch=True, prog_bar=False, logger=True)
         except IndexError:
             # This can happen if the optimizer is not yet configured
             pass
@@ -701,76 +735,140 @@ class LightSeqVaeTeb(L.LightningModule):
         logger.info(f"  Current lr_milestones: {self.hparams.lr_milestones}")
         logger.info("✅ Hyperparameter validation complete")
 
-    def _common_step(self, batch, batch_idx):
-        """Forecasting mode: compute forecast NLL over windowed predictions + optional KL."""
+    def _compute_forecast_metrics(
+        self,
+        mu_post: torch.Tensor,
+        y_raw: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Evaluate aggregated forecast metrics from posterior means without autograd."""
+        metrics: Dict[str, torch.Tensor] = {}
+
+        horizon = max(int(self.hparams.predictive_horizon), 1)
+        context_len = max(int(self.hparams.predictive_context_len), 1)
+        stride = self.model.decimation_factor
+
+        # Ensure requested horizons fit within available sequence length
+        horizon = min(horizon, mu_post.size(1))
+        context_len = min(context_len, mu_post.size(1))
+
+        anchors = self.model.anchor_range(mu_post.size(1), context_len, horizon)
+        if anchors.numel() == 0:
+            return metrics
+
+        anchors = anchors.to(mu_post.device)
+        contexts = self.model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
+        B, N, Lc, D = contexts.shape
+        contexts_flat = contexts.reshape(B * N, Lc, D)
+
+        z_future_flat = self.model.latent_forecaster(contexts_flat, horizon=horizon)
+        _, mu_flat, logvar_flat = self.model.decoder(z_future_flat)
+        mu_future = mu_flat.reshape(B, N, -1)
+        logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
+
+        canvas_mu, mean_mu = self.model.aggregate_forecasts_to_canvas(
+            mu_future, anchors, total_len=y_raw.shape[1], stride=stride
+        )
+        var_future = logvar_future.exp()
+        _, mean_var = self.model.aggregate_forecasts_to_canvas(
+            var_future, anchors, total_len=y_raw.shape[1], stride=stride
+        )
+
+        mask = ~torch.isnan(mean_mu)
+        if mask.any():
+            pred = mean_mu.masked_fill(~mask, 0.0)
+            gt = y_raw.masked_fill(~mask, 0.0)
+            denom = mask.sum(dim=1).clamp_min(1)
+            mse = (pred - gt).pow(2).sum(dim=1) / denom
+            mae = (pred - gt).abs().sum(dim=1) / denom
+            corr = self.model._masked_corrcoef(pred, gt, mask)
+            coverage = mask.float().mean(dim=1)
+
+            metrics['agg_mse'] = torch.nanmean(mse)
+            metrics['agg_mae'] = torch.nanmean(mae)
+            metrics['agg_corr'] = torch.nanmean(corr)
+            metrics['agg_coverage'] = torch.nanmean(coverage)
+
+        metrics['agg_std'] = torch.nanmean(mean_var.clamp_min(1e-8).sqrt())
+        return metrics
+
+    def _compute_losses_and_metrics(self, batch, stage: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Run forward pass, compute losses, and (optionally) auxiliary forecast metrics."""
         y_st = batch.fhr_st
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
         y_raw = batch.fhr
 
-        # Forecast using posterior means for stability during training
-        forecast_outputs = self.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
-        loss_dict = self.model.compute_forecast_loss(
-            forecast_outputs=forecast_outputs,
+        forward_outputs = self.model(y_st, y_ph, x_ph)
+
+        loss_dict = self.model.compute_loss(
+            forward_outputs=forward_outputs,
+            y_st=y_st,
+            y_ph=y_ph,
             y_raw=y_raw,
-            anchors=forecast_outputs["anchors"],
+            compute_kld_loss=True,
             beta=self.hparams.beta,
-            include_kld=True,
+            predictive_weight=self.hparams.predictive_weight,
+            predictive_horizon=max(1, int(self.hparams.predictive_horizon)),
+            latent_consistency_weight=self.hparams.latent_consistency_weight,
+            predictive_context_len=max(1, int(self.hparams.predictive_context_len)),
         )
 
-        # Additional evaluation metric: aggregated MSE over covered region
-        with torch.no_grad():
-            mu_future = forecast_outputs["mu_future"]  # (B,N,W)
-            anchors = forecast_outputs["anchors"]
-            _, mean_mu = self.model.aggregate_forecasts_to_canvas(
-                mu_future, anchors, total_len=y_raw.shape[1], stride=self.model.decimation_factor)
-            mask = ~torch.isnan(mean_mu)
-            if mask.any():
-                diff = (mean_mu - y_raw).masked_fill(~mask, 0.0)
-                mse = (diff.pow(2)[mask]).mean()
-            else:
-                mse = torch.tensor(float('nan'), device=y_raw.device)
-        loss_dict['agg_mse'] = mse
+        aux_metrics: Dict[str, torch.Tensor] = {}
+        if self.hparams.log_forecast_metrics and stage != "train":
+            with torch.no_grad():
+                aux_metrics = self._compute_forecast_metrics(
+                    mu_post=forward_outputs["mu_post"].detach(),
+                    y_raw=y_raw,
+                )
 
-        return loss_dict
+        return loss_dict, aux_metrics
 
     def training_step(self, batch, batch_idx):
         """Defines the training loop with memory optimization."""
-        loss_dict = self._common_step(batch, batch_idx)
+        loss_dict, aux_metrics = self._compute_losses_and_metrics(batch, stage="train")
         total_loss = loss_dict['total_loss']
 
-        # Log forecasting metrics
+        # Core reconstruction / KL logging
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        if 'forecast_nll' in loss_dict:
-            self.log('train/forecast_nll', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            # Backward-compat alias for prior dashboards
-            self.log('train/nll_loss', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        if 'agg_mse' in loss_dict:
-            self.log('train/agg_mse', loss_dict['agg_mse'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        
-        # Clear loss_dict to free memory
-        del loss_dict
+
+        # Forecast-specific losses
+        if 'predictive_loss' in loss_dict:
+            self.log('train/predictive_loss', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+            # Backward-compat alias for prior dashboards
+            self.log('train/forecast_nll', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if 'latent_consistency_loss' in loss_dict:
+            self.log('train/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+
+        # Auxiliary metrics (if any were computed)
+        for name, value in aux_metrics.items():
+            self.log(f'train/{name}', value, on_epoch=True, prog_bar=False, logger=True)
 
         return total_loss
 
     def validation_step(self, batch, batch_idx):
         """Defines the validation loop with memory optimization."""
-        loss_dict = self._common_step(batch, batch_idx)
+        loss_dict, aux_metrics = self._compute_losses_and_metrics(batch, stage="val")
         total_loss = loss_dict['total_loss']
 
-        # Log forecasting validation metrics
+        # Core reconstruction / KL logging
         self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
-        if 'forecast_nll' in loss_dict:
-            self.log('val/forecast_nll', loss_dict['forecast_nll'], on_epoch=True, prog_bar=True, logger=True)
-            # Backward-compat alias
-            self.log('val/nll_loss', loss_dict['forecast_nll'], on_epoch=True, prog_bar=False, logger=True)
+        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=False, logger=True)
+        self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=False, logger=True)
+        self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=False, logger=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
-        if 'agg_mse' in loss_dict:
-            self.log('val/agg_mse', loss_dict['agg_mse'], on_epoch=True, prog_bar=False, logger=True)
 
-        # Clear loss_dict to free memory
-        del loss_dict
+        if 'predictive_loss' in loss_dict:
+            self.log('val/predictive_loss', loss_dict['predictive_loss'], on_epoch=True, prog_bar=False, logger=True)
+            self.log('val/forecast_nll', loss_dict['predictive_loss'], on_epoch=True, prog_bar=True, logger=True)
+        if 'latent_consistency_loss' in loss_dict:
+            self.log('val/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_epoch=True, prog_bar=False, logger=True)
+
+        for name, value in aux_metrics.items():
+            self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True)
 
         return total_loss
 
