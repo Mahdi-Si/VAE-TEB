@@ -1206,7 +1206,7 @@ class SeqVaeTeb(nn.Module):
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
         anchors: Optional[torch.Tensor] = None,
-        use_posterior_mean: bool = True,
+        use_posterior_mean: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forecast future raw FHR windows at the given anchors.
@@ -1882,8 +1882,7 @@ class SeqVaeTebClassifier(nn.Module):
             x_ph: Source phase harmonic input (batch, 300, 130)
             return_all_outputs: Whether to return all VAE outputs or just latent z
             
-        Returns:
-            latent_z: Latent representations (batch, 300, latent_dim_z)
+        Returns:wZA
             vae_outputs: Full VAE outputs (if return_all_outputs=True)
         """
         # Set VAE to eval mode if frozen
