@@ -206,6 +206,28 @@ class SeqVAEGraphModel:
         self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
 
+        # SeqVAE forecasting parameters
+        self.model_context_len = int(vae_cfg.get('context_len', 75))
+        self.model_horizon_len = int(vae_cfg.get('horizon_len', 30))
+        self.predictive_weight = float(vae_cfg.get('predictive_weight', 0.0))
+        self.latent_consistency_weight = float(vae_cfg.get('latent_consistency_weight', 0.0))
+
+        predictive_horizon_cfg = vae_cfg.get('predictive_horizon')
+        if predictive_horizon_cfg is None:
+            self.predictive_horizon = self.model_horizon_len
+        else:
+            self.predictive_horizon = max(1, int(predictive_horizon_cfg))
+
+        predictive_context_cfg = vae_cfg.get('predictive_context_len')
+        if predictive_context_cfg is None:
+            self.predictive_context_len = self.model_context_len
+        else:
+            self.predictive_context_len = max(1, int(predictive_context_cfg))
+
+        self.log_forecast_metrics = bool(vae_cfg.get('log_forecast_metrics', True))
+        self.monitor_metric = vae_cfg.get('monitor_metric', 'val/predictive_loss')
+        self.monitor_mode = vae_cfg.get('monitor_mode', 'min')
+
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
@@ -277,7 +299,10 @@ class SeqVAEGraphModel:
             logger.info("Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
             # Create base model with current config parameters
-            base_model_for_loading = SeqVaeTeb()
+            base_model_for_loading = SeqVaeTeb(
+                context_len=self.model_context_len,
+                horizon_len=self.model_horizon_len,
+            )
             
             # CRITICAL: Compile the model BEFORE loading checkpoint to match saved state_dict structure
             try:
@@ -317,25 +342,15 @@ class SeqVAEGraphModel:
                     beta_anneal_epochs=self.beta_anneal_epochs,
                     beta_cycle_len=self.beta_cycle_len,
                     beta_const_val=self.beta_const_val,
+                    predictive_weight=self.predictive_weight,
+                    latent_consistency_weight=self.latent_consistency_weight,
+                    predictive_horizon=self.predictive_horizon,
+                    predictive_context_len=self.predictive_context_len,
+                    log_forecast_metrics=self.log_forecast_metrics,
                 )
                 
-                # CRITICAL: Manually override hparams to ensure config takes precedence
                 logger.info("Enforcing config hyperparameters over checkpoint...")
-                self.lightning_base_model.hparams.lr = self.lr
-                self.lightning_base_model.hparams.lr_milestones = self.lr_milestones
-                self.lightning_base_model.hparams.beta_schedule = self.beta_schedule
-                self.lightning_base_model.hparams.beta_start = self.beta_start
-                self.lightning_base_model.hparams.beta_end = self.beta_end
-                self.lightning_base_model.hparams.beta_anneal_epochs = self.beta_anneal_epochs
-                self.lightning_base_model.hparams.beta_cycle_len = self.beta_cycle_len
-                self.lightning_base_model.hparams.beta_const_val = self.beta_const_val
-                
-                logger.info("Successfully ENFORCED config hyperparameters:")
-                logger.info(f"  lr: {self.lr}")
-                logger.info(f"  beta_schedule: {self.beta_schedule}")
-                logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
-                logger.info(f"  beta_anneal_epochs: {self.beta_anneal_epochs}")
-                logger.info(f"  beta_const_val: {self.beta_const_val}")
+                self._enforce_lightning_hparams(self.lightning_base_model)
                 
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model
@@ -353,13 +368,16 @@ class SeqVAEGraphModel:
                 logger.warning(f"Checkpoint file not found at {self.base_model_checkpoint}. Initializing models from scratch.")
             else:
                 logger.info("No checkpoint provided. Initializing models from scratch.")
-            self._create_fresh_model()
+        self._create_fresh_model()
 
     def _create_fresh_model(self):
         """Create fresh model instance with config parameters."""
         logger.info("Creating fresh model with config parameters...")
         
-        self.base_model = SeqVaeTeb()        
+        self.base_model = SeqVaeTeb(
+            context_len=self.model_context_len,
+            horizon_len=self.model_horizon_len,
+        )
         if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:
                 compile_options = {
@@ -395,8 +413,51 @@ class SeqVAEGraphModel:
             beta_anneal_epochs=self.beta_anneal_epochs,
             beta_cycle_len=self.beta_cycle_len,
             beta_const_val=self.beta_const_val,
+            predictive_weight=self.predictive_weight,
+            latent_consistency_weight=self.latent_consistency_weight,
+            predictive_horizon=self.predictive_horizon,
+            predictive_context_len=self.predictive_context_len,
+            log_forecast_metrics=self.log_forecast_metrics,
         )
+        self._enforce_lightning_hparams(self.lightning_base_model)
         self.pytorch_model = self.base_model  # Set pytorch_model reference
+
+    def _enforce_lightning_hparams(self, lightning_model: LightSeqVaeTeb) -> None:
+        """Force Lightning module hyperparameters/attributes to match current config."""
+        if lightning_model is None:
+            return
+
+        enforce_map = {
+            'lr': self.lr,
+            'lr_milestones': self.lr_milestones,
+            'beta_schedule': self.beta_schedule,
+            'beta_start': self.beta_start,
+            'beta_end': self.beta_end,
+            'beta_anneal_epochs': self.beta_anneal_epochs,
+            'beta_cycle_len': self.beta_cycle_len,
+            'beta_const_val': self.beta_const_val,
+            'predictive_weight': self.predictive_weight,
+            'latent_consistency_weight': self.latent_consistency_weight,
+            'predictive_horizon': self.predictive_horizon,
+            'predictive_context_len': self.predictive_context_len,
+            'log_forecast_metrics': self.log_forecast_metrics,
+        }
+
+        for key, value in enforce_map.items():
+            try:
+                setattr(lightning_model.hparams, key, value)
+            except AttributeError:
+                pass
+
+        # Synchronize model attributes if present
+        if hasattr(lightning_model, 'model') and lightning_model.model is not None:
+            lightning_model.model.context_len = self.model_context_len
+            lightning_model.model.horizon_len = self.model_horizon_len
+
+        logger.info(
+            "Enforced Lightning hparams from config: %s",
+            {k: getattr(lightning_model.hparams, k, None) for k in enforce_map.keys()},
+        )
 
 
     def create_model(self):
@@ -430,30 +491,57 @@ class SeqVAEGraphModel:
             dict: A dictionary containing the training history.
         """
         logger.info("Setting up trainer for the base model...")
+        logger.info(
+            "Forecasting configuration | predictive_weight=%.4f | latent_consistency_weight=%.4f | horizon=%s | context=%s | log_metrics=%s",
+            self.predictive_weight,
+            self.latent_consistency_weight,
+            self.predictive_horizon,
+            self.predictive_context_len,
+            self.log_forecast_metrics,
+        )
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
             plot_every_epoch=self.plot_every_epoch,
+            predictive_horizon=self.predictive_horizon,
         )
 
         self.metrics_callback = MetricsLoggingCallback()
         self.hyperparameter_callback = HyperparameterLoggingCallback()
 
-        self.early_stop_callback = EarlyStopping(
-            monitor="val/total_loss",
-            min_delta=0.0001,
-            patience=100,
-            verbose=True,
-            mode="min"
-        )
+        callbacks_cfg = self.config.get('advanced_config', {}).get('callbacks', {})
+        early_cfg = callbacks_cfg.get('early_stopping', {})
+        ckpt_cfg = callbacks_cfg.get('model_checkpoint', {})
+
+        monitor_metric = ckpt_cfg.get('monitor', self.monitor_metric)
+        monitor_mode = ckpt_cfg.get('mode', self.monitor_mode)
+        self.monitor_metric = monitor_metric
+        self.monitor_mode = monitor_mode
+
+        ckpt_filename = ckpt_cfg.get('filename', 'base-model-best-{epoch}')
+        ckpt_save_top_k = ckpt_cfg.get('save_top_k', 2)
+        ckpt_save_last = ckpt_cfg.get('save_last', False)
 
         self.checkpoint_callback = ModelCheckpoint(
-            monitor="val/total_loss",
-            mode="min",
+            monitor=monitor_metric,
+            mode=monitor_mode,
             dirpath=self.model_checkpoint_dir,
-            filename="base-model-best-{epoch}",
-            save_top_k=2,
-            save_last=False,
+            filename=ckpt_filename,
+            save_top_k=ckpt_save_top_k,
+            save_last=ckpt_save_last,
         )
+        logger.info(f"Checkpoint callback monitoring '{monitor_metric}' (mode={monitor_mode})")
+
+        early_enabled = bool(early_cfg.get('enabled', False))
+        self.early_stop_callback = None
+        if early_enabled:
+            self.early_stop_callback = EarlyStopping(
+                monitor=early_cfg.get('monitor', monitor_metric),
+                min_delta=float(early_cfg.get('min_delta', 1e-4)),
+                patience=int(early_cfg.get('patience', 100)),
+                verbose=True,
+                mode=early_cfg.get('mode', monitor_mode),
+            )
+            logger.info(f"Early stopping enabled: monitoring '{self.early_stop_callback.monitor}' (mode={self.early_stop_callback.mode})")
         
         if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
             logger.info("Created fresh checkpoint callback - will monitor validation loss from retrain start")
@@ -490,8 +578,11 @@ class SeqVAEGraphModel:
             self.checkpoint_callback,
             self.loss_plot_callback,
             self.hyperparameter_callback,
-            # self.early_stop_callback,
         ]
+        if self.metrics_callback is not None:
+            callbacks_list.append(self.metrics_callback)
+        if self.early_stop_callback is not None:
+            callbacks_list.append(self.early_stop_callback)
 
         trainer = L.Trainer(
             devices=devices,
