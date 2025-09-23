@@ -26,10 +26,11 @@ from loguru import logger
 # Callbacks
 # ------------------------------------------------------------------------------------------------------------------------------------------
 class PlottingCallBack(Callback):
-    def __init__(self, output_dir, plot_every_epoch):
+    def __init__(self, output_dir, plot_every_epoch, predictive_horizon: Optional[int] = None):
         super().__init__()
         self.output_dir = output_dir    
         self.plot_every_epoch = plot_every_epoch
+        self.predictive_horizon = predictive_horizon
 
     def on_validation_epoch_end(self, pl_trainer, pl_module):
         if pl_trainer.current_epoch % self.plot_every_epoch != 0 or not pl_trainer.is_global_zero:
@@ -139,7 +140,37 @@ class PlottingCallBack(Callback):
         z_latent = None
         if latent_z is not None:
             z_latent = latent_z[batch_idx].detach().cpu().numpy()  # (T,D)
-        
+
+        mask = ~np.isnan(pred_mean)
+        coverage = float(np.mean(mask)) if mask.size > 0 else float('nan')
+        coverage_display = f"{coverage:.2%}" if not np.isnan(coverage) else "nan"
+        if np.any(mask):
+            gt_masked = y_raw.copy()
+            pred_masked = pred_mean.copy()
+            gt_masked[~mask] = np.nan
+            pred_masked[~mask] = np.nan
+            sample_mse = float(np.nanmean((pred_masked - gt_masked) ** 2))
+            sample_mae = float(np.nanmean(np.abs(pred_masked - gt_masked)))
+            if np.sum(mask) > 2:
+                sample_corr = float(np.corrcoef(gt_masked[mask], pred_masked[mask])[0, 1])
+            else:
+                sample_corr = float('nan')
+        else:
+            sample_mse = float('nan')
+            sample_mae = float('nan')
+            sample_corr = float('nan')
+
+        logger.info(
+            "[PlottingCallback] Epoch {} sample forecast diagnostics | horizon={} | MSE={:.4f} | MAE={:.4f} | Corr={:.4f} | Coverage={:.2%}".format(
+                epoch,
+                self.predictive_horizon if self.predictive_horizon is not None else 'model',
+                sample_mse,
+                sample_mae,
+                sample_corr,
+                coverage if not np.isnan(coverage) else float('nan'),
+            )
+        )
+
         # Setup plotting parameters following the style from data_utils
         Fs = 4
         N = len(y_raw)
@@ -253,7 +284,17 @@ class PlottingCallBack(Callback):
         ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
         
         # Set overall title with scientific paper styling
-        fig.suptitle(f'Forecasting Results – Epoch {epoch}', fontsize=14, fontweight='normal', y=0.97, color='#456882')
+        diag_str = (
+            f"H={self.predictive_horizon if self.predictive_horizon is not None else 'model'} | "
+            f"MSE={sample_mse:.4f} | MAE={sample_mae:.4f} | Corr={sample_corr:.4f} | Cov={coverage_display}"
+        )
+        fig.suptitle(
+            f'Forecasting Results – Epoch {epoch}\n{diag_str}',
+            fontsize=14,
+            fontweight='normal',
+            y=0.98,
+            color='#456882'
+        )
         # Save plot as PDF with high quality
         save_path = os.path.join(self.output_dir, f'forecast_results_epoch_{epoch}.pdf')
         plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')

@@ -23,7 +23,9 @@ model_config:
   VAE_model:
     freeze_seqvae: False
     zero_source: False
-    
+    context_len: 75            # Latent forecaster context length (decimated steps)
+    horizon_len: 30            # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
+
     # Beta Scheduling Configuration
     beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0            # Starting beta value for annealing schedules
@@ -32,6 +34,15 @@ model_config:
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
     beta_const_val: 0.001        # Constant beta value when schedule='constant'
     kld_beta: 0.001              # Fallback beta value (legacy parameter)
+
+    # Forecasting auxiliary objectives
+    predictive_weight: 0.5              # Weight on raw forecast NLL auxiliary loss
+    latent_consistency_weight: 0.1      # Weight on latent-space consistency loss
+    predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
+    predictive_context_len: null        # Override context length (defaults to context_len)
+    log_forecast_metrics: true          # Log aggregated forecast metrics during validation
+    monitor_metric: "val/predictive_loss"  # Metric to monitor for checkpoints / early stopping
+    monitor_mode: "min"                 # Direction for monitored metric
 
   base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
 
@@ -95,12 +106,12 @@ advanced_config:
   callbacks:
     early_stopping:
       enabled: false                   # Enable early stopping
-      monitor: "val/total_loss"        # Metric to monitor
+      monitor: "val/predictive_loss"  # Metric to monitor
       patience: 20                     # Epochs to wait for improvement
       min_delta: 0.0001               # Minimum change to qualify as improvement
     
     model_checkpoint:
-      monitor: "val/total_loss"        # Metric to monitor for best model
+      monitor: "val/predictive_loss"  # Metric to monitor for best model
       save_top_k: 3                   # Number of best models to keep
       mode: "min"                     # Minimize the monitored metric
     

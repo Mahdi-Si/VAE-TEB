@@ -58,7 +58,7 @@ def geometric_schedule(
         sizes.append(int(round_fn(input_size * current_r)))
         current_r *= r
     sizes.append(output_size)
-    
+
     return tuple(sizes[1:])
 
 def initialization(model: nn.Module) -> None:
@@ -182,7 +182,7 @@ class CausalMultiChannelConvBlock(nn.Module):
         )
         # Activation function
         self.act_fn = activation()
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -328,6 +328,7 @@ class ResidualMLP(nn.Module):
             z = y
 
         return z                         # (B, L, Cout)
+
 
 
 class TargetEncoder(nn.Module):
@@ -556,6 +557,7 @@ class TargetEncoder(nn.Module):
             return mu
 
 
+
 class SourceEncoder(nn.Module):
     """
     Encodes the source signal (x) to produce a deterministic latent representation h_x.
@@ -594,11 +596,11 @@ class SourceEncoder(nn.Module):
             use_skip_connection=True,
             activation=nn.GELU
             )
-        
+
         self.conv_1 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=3, dilation=1)
         self.conv_2 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=5, dilation=1)
         self.conv_3 = CausalMultiChannelConvBlock(in_channels=32, out_channels=32, filter_size=7, dilation=1)
-        
+
         self.source_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
         self.source_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
         
@@ -656,7 +658,7 @@ class SourceEncoder(nn.Module):
         
         if return_intermediate:
             intermediates["channel_reduced"] = x_linear
-        
+
         x_conv = x_linear.transpose(1, 2)  # (B, 32, T)
         conv_1 = self.conv_1(x_conv)
 
@@ -931,21 +933,21 @@ class Decoder(nn.Module):
             Dictionary containing individual loss components
         """
         device = raw_mu_predicted.device
-        
+
         if compute_st_mse and linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
             stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
             mse_loss = F.mse_loss(linear_output, stacked_target)
         else:
             mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        
+
         if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
             target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
-        
+
         diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
         var = raw_logvar_predicted.exp()  # (B, 4800)
         nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
         nll_loss = nll_loss.mean()
-        
+
         return {
             'mse_loss': mse_loss,
             'nll_loss': nll_loss,
@@ -1021,6 +1023,7 @@ class LatentForecaster(nn.Module):
 
         z_future = torch.cat(outputs, dim=1)  # (B, H, D)
         return z_future
+
 
 
 class SeqVaeTeb(nn.Module):
@@ -1528,7 +1531,7 @@ class SeqVaeTeb(nn.Module):
             "anchors": anchors,
             "enc": enc,
         }
-    
+
     def compute_loss(
         self,
         forward_outputs: Dict[str, torch.Tensor],
@@ -1740,27 +1743,26 @@ class SeqVaeTebClassifier(nn.Module):
         class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-        
         self.freeze_vae = freeze_vae
         self.num_classes = num_classes
-        
+
         # Initialize SeqVaeTeb encoder
         self.vae_model = SeqVaeTeb()
-        
+
         # Load pretrained VAE if provided
         if pretrained_vae_path is not None:
             self.load_pretrained_vae(pretrained_vae_path)
-        
+
         # Freeze VAE parameters if specified
         if freeze_vae:
             self.freeze_vae_parameters()
-        
+
         # Import FHRInceptionTimeClassifier
         try:
             from model.inception_time import FHRInceptionTimeClassifier
         except ImportError:
             from inception_time import FHRInceptionTimeClassifier
-        
+
         # Initialize classifier
         self.classifier = FHRInceptionTimeClassifier(
             input_size=latent_dim_z,
@@ -1770,7 +1772,7 @@ class SeqVaeTebClassifier(nn.Module):
             dropout=classifier_dropout,
             use_attention=use_attention
         )
-        
+
         self.classification_criterion = nn.CrossEntropyLoss(weight=class_weights)
         
     def load_pretrained_vae(self, pretrained_path: str):
@@ -1816,7 +1818,7 @@ class SeqVaeTebClassifier(nn.Module):
                 nk = _normalize_key(k)
                 if nk in expected_keys:
                     new_sd[nk] = v
-            
+
             # Check for shape mismatches in existing keys
             shape_mismatches = []
             for k, v in new_sd.items():
@@ -1853,19 +1855,19 @@ class SeqVaeTebClassifier(nn.Module):
             log.error(f"Failed to load pretrained VAE from '{pretrained_path}': {e}")
             raise RuntimeError(f"Cannot load incompatible VAE checkpoint. Please use a checkpoint that matches "
                                 f"the current VAE architecture, or train from scratch.") from e
-    
+
     def freeze_vae_parameters(self):
         """Freeze all VAE parameters to prevent updates during classification training."""
         for param in self.vae_model.parameters():
             param.requires_grad = False
         log.info("Frozen VAE parameters for classification training")
-    
+
     def unfreeze_vae_parameters(self):
         """Unfreeze VAE parameters for end-to-end fine-tuning."""
         for param in self.vae_model.parameters():
             param.requires_grad = True
         log.info("Unfrozen VAE parameters for end-to-end training")
-    
+
     def extract_latent_features(
         self,
         y_st: torch.Tensor,
@@ -1888,17 +1890,17 @@ class SeqVaeTebClassifier(nn.Module):
         # Set VAE to eval mode if frozen
         if self.freeze_vae:
             self.vae_model.eval()
-        
+
         # Forward pass through VAE
         with torch.set_grad_enabled(not self.freeze_vae):
             vae_outputs = self.vae_model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
-        
+
         latent_z = vae_outputs['z']  # (batch, 300, latent_dim_z)
-        
+
         if return_all_outputs:
             return latent_z, vae_outputs
         return latent_z
-    
+
     def forward(
         self,
         y_st: torch.Tensor,
@@ -1922,7 +1924,7 @@ class SeqVaeTebClassifier(nn.Module):
         """
         # Extract latent features
         latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
-        
+
         # Classification
         logits = self.classifier(latent_z)  # (batch, num_classes)
         
@@ -1930,7 +1932,7 @@ class SeqVaeTebClassifier(nn.Module):
         classification_loss = None
         if labels is not None:
             classification_loss = self.classification_criterion(logits, labels)
-        
+
         # Prepare outputs
         outputs = {
             'logits': logits,
@@ -1938,12 +1940,12 @@ class SeqVaeTebClassifier(nn.Module):
             'predictions': torch.argmax(logits, dim=-1),
             'classification_loss': classification_loss,
         }
-        
+
         if return_latent:
             outputs['latent_z'] = latent_z
             
         return outputs
-    
+
     def compute_loss(
         self,
         y_st: torch.Tensor,
@@ -1956,14 +1958,13 @@ class SeqVaeTebClassifier(nn.Module):
     ):
         """
         Compute combined loss for classification and optionally VAE reconstruction.
-        
         Args:
             y_st, y_ph, x_ph: Input tensors
             labels: Classification labels (batch,)
             y_raw: Raw signal for VAE loss computation (batch, 4800)
             compute_vae_loss: Whether to include VAE reconstruction loss
             vae_loss_weight: Weight for VAE loss component
-            
+
         Returns:
             Dictionary of loss components
         """
@@ -1973,7 +1974,7 @@ class SeqVaeTebClassifier(nn.Module):
             latent_z, vae_outputs = self.extract_latent_features(
                 y_st, y_ph, x_ph, return_all_outputs=True
             )
-            
+
             # Compute VAE losses
             vae_losses = self.vae_model.compute_loss(
                 forward_outputs=vae_outputs,
@@ -1987,11 +1988,11 @@ class SeqVaeTebClassifier(nn.Module):
         else:
             latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
             vae_total_loss = torch.tensor(0.0, device=latent_z.device)
-        
+
         # Classification loss
         logits = self.classifier(latent_z)
         classification_loss = self.classification_criterion(logits, labels)
-        
+
         # Combined loss
         total_loss = classification_loss + vae_loss_weight * vae_total_loss
         
@@ -2003,7 +2004,7 @@ class SeqVaeTebClassifier(nn.Module):
             'probabilities': F.softmax(logits, dim=-1),
             'predictions': torch.argmax(logits, dim=-1),
         }
-    
+
     def predict(
         self,
         y_st: torch.Tensor,
@@ -2013,11 +2014,11 @@ class SeqVaeTebClassifier(nn.Module):
     ):
         """
         Make predictions on input data.
-        
+
         Args:
             y_st, y_ph, x_ph: Input tensors
             return_probabilities: Whether to return class probabilities
-            
+
         Returns:
             Predictions and optionally probabilities
         """
@@ -2027,7 +2028,7 @@ class SeqVaeTebClassifier(nn.Module):
                 y_st=y_st, y_ph=y_ph, x_ph=x_ph,
                 labels=None, return_latent=False
             )
-        
+
         if return_probabilities:
             return outputs['predictions'], outputs['probabilities']
         return outputs['predictions']
