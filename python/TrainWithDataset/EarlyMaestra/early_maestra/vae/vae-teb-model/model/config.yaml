@@ -40,6 +40,7 @@ model_config:
     latent_consistency_weight: 0.1      # Weight on latent-space consistency loss
     predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
     predictive_context_len: null        # Override context length (defaults to context_len)
+    predictive_max_anchors: 0           # Max anchors (0 = use all) for auxiliary losses
     log_forecast_metrics: true          # Log aggregated forecast metrics during validation
     monitor_metric: "val/predictive_loss"  # Metric to monitor for checkpoints / early stopping
     monitor_mode: "min"                 # Direction for monitored metric

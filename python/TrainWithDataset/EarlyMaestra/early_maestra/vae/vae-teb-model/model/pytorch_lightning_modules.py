@@ -568,9 +568,7 @@ class HyperparameterLoggingCallback(Callback):
             self.history["beta"].append(beta)
             self.history["lr"].append(lr)
             
-            # Log to trainer for tensorboard/wandb
-            pl_module.log('hyperparams/beta', beta, on_epoch=True, logger=True)
-            pl_module.log('hyperparams/lr', lr, on_epoch=True, logger=True)
+            # LightningModule handles logging; callback only tracks history
             
             logger.info(f"Epoch {epoch}: β={beta:.4f}, lr={lr:.6f}")
 
@@ -673,6 +671,7 @@ class LightSeqVaeTeb(L.LightningModule):
         predictive_horizon: Optional[int] = None,
         predictive_context_len: Optional[int] = None,
         log_forecast_metrics: bool = True,
+        predictive_max_anchors: Optional[int] = None,
         ):
         """
         Args:
@@ -690,6 +689,7 @@ class LightSeqVaeTeb(L.LightningModule):
             predictive_horizon: Forecast horizon (decimated steps) used for auxiliary objectives.
             predictive_context_len: Context length supplied to the latent forecaster (decimated steps).
             log_forecast_metrics: Whether to compute/log aggregated forecast metrics during validation.
+            predictive_max_anchors: Optional cap on anchors sampled for auxiliary loss to control memory.
         """
         super().__init__()
 
@@ -704,6 +704,8 @@ class LightSeqVaeTeb(L.LightningModule):
                 predictive_context_len = model_context
             else:
                 predictive_context_len = max(predictive_horizon, 1)
+        if predictive_max_anchors is None:
+            predictive_max_anchors = 0
 
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
@@ -785,6 +787,11 @@ class LightSeqVaeTeb(L.LightningModule):
             return metrics
 
         anchors = anchors.to(mu_post.device)
+
+        max_anchors = int(getattr(self.hparams, 'predictive_max_anchors', 0) or 0)
+        if max_anchors > 0 and anchors.numel() > max_anchors:
+            perm = torch.randperm(anchors.numel(), device=anchors.device)
+            anchors = anchors[perm[:max_anchors]]
         contexts = self.model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
         B, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B * N, Lc, D)
@@ -840,6 +847,7 @@ class LightSeqVaeTeb(L.LightningModule):
             predictive_horizon=max(1, int(self.hparams.predictive_horizon)),
             latent_consistency_weight=self.hparams.latent_consistency_weight,
             predictive_context_len=max(1, int(self.hparams.predictive_context_len)),
+            predictive_max_anchors=int(self.hparams.predictive_max_anchors) if getattr(self.hparams, 'predictive_max_anchors', None) is not None else None,
         )
 
         aux_metrics: Dict[str, torch.Tensor] = {}

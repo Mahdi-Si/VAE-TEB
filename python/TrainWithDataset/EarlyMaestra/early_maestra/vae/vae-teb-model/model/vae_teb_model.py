@@ -1544,6 +1544,7 @@ class SeqVaeTeb(nn.Module):
         predictive_horizon: int = 1,
         latent_consistency_weight: float = 0.0,
         predictive_context_len: Optional[int] = None,
+        predictive_max_anchors: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Computes the total training loss with MSE and NLL components.
@@ -1606,6 +1607,12 @@ class SeqVaeTeb(nn.Module):
             anchors = self.anchor_range(T, context_len, predictive_horizon)
             if anchors.numel() > 0:
                 anchors = anchors.to(mu_post.device)
+
+                if predictive_max_anchors is not None and predictive_max_anchors > 0:
+                    max_anchors = min(int(predictive_max_anchors), anchors.numel())
+                    if max_anchors < anchors.numel():
+                        perm = torch.randperm(anchors.numel(), device=anchors.device)
+                        anchors = anchors[perm[:max_anchors]]
 
                 # Gather contexts for latent forecaster
                 contexts = self._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
