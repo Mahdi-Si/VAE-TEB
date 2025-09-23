@@ -271,18 +271,6 @@ class PlottingCallBack(Callback):
         else:
             ax[2, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center')
         
-        # Subplot 4: latent_z with imshow
-        imgplot = ax[3, 0].imshow(z_latent.T, aspect='auto', cmap='bwr', origin='lower')
-        ax[3, 1].set_axis_on()
-        cbar = fig.colorbar(imgplot, cax=ax[3, 1])
-        cbar.ax.tick_params(labelsize=10, colors='#666666')
-        cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
-        cbar.outline.set_color('#A2B9A7')
-        cbar.outline.set_linewidth(0.7)
-        ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
-        ax[3, 0].set_xlabel('Time Steps', fontweight='normal')
-        ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
-        
         # Set overall title with scientific paper styling
         diag_str = (
             f"H={self.predictive_horizon if self.predictive_horizon is not None else 'model'} | "
