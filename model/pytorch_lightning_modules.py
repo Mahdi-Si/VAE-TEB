@@ -737,14 +737,14 @@ class LightSeqVaeTeb(L.LightningModule):
     def on_train_epoch_start(self):
         """Called at the beginning of each training epoch."""
         self.hparams.beta = self._calculate_beta()
-        self.log('kld_beta', self.hparams.beta, on_epoch=True, prog_bar=True)
-        self.log('hyperparams/beta', self.hparams.beta, on_epoch=True, prog_bar=False, logger=True)
+        self.log('kld_beta', self.hparams.beta, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('hyperparams/beta', self.hparams.beta, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         
         # Log learning rate at the start of each epoch
         try:
             lr = self.optimizers().param_groups[0]['lr']
-            self.log('lr', lr, on_epoch=True, prog_bar=True, logger=True)
-            self.log('hyperparams/lr', lr, on_epoch=True, prog_bar=False, logger=True)
+            self.log('lr', lr, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            self.log('hyperparams/lr', lr, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         except IndexError:
             # This can happen if the optimizer is not yet configured
             pass
@@ -858,23 +858,23 @@ class LightSeqVaeTeb(L.LightningModule):
         total_loss = loss_dict['total_loss']
 
         # Core reconstruction / KL logging
-        self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train/recon_loss', loss_dict['reconstruction_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/mse_loss', loss_dict['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
         # Forecast-specific losses
         if 'predictive_loss' in loss_dict:
-            self.log('train/predictive_loss', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+            self.log('train/predictive_loss', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
             # Backward-compat alias for prior dashboards
-            self.log('train/forecast_nll', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train/forecast_nll', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_consistency_loss' in loss_dict:
-            self.log('train/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+            self.log('train/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # Auxiliary metrics (if any were computed)
         for name, value in aux_metrics.items():
-            self.log(f'train/{name}', value, on_epoch=True, prog_bar=False, logger=True)
+            self.log(f'train/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         return total_loss
 
@@ -884,20 +884,20 @@ class LightSeqVaeTeb(L.LightningModule):
         total_loss = loss_dict['total_loss']
 
         # Core reconstruction / KL logging
-        self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=False, logger=True)
-        self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=False, logger=True)
-        self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=False, logger=True)
-        self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True)
+        self.log('val/total_loss', total_loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val/recon_loss', loss_dict['reconstruction_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/mse_loss', loss_dict['mse_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
         if 'predictive_loss' in loss_dict:
-            self.log('val/predictive_loss', loss_dict['predictive_loss'], on_epoch=True, prog_bar=False, logger=True)
-            self.log('val/forecast_nll', loss_dict['predictive_loss'], on_epoch=True, prog_bar=True, logger=True)
+            self.log('val/predictive_loss', loss_dict['predictive_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+            self.log('val/forecast_nll', loss_dict['predictive_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_consistency_loss' in loss_dict:
-            self.log('val/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_epoch=True, prog_bar=False, logger=True)
+            self.log('val/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         for name, value in aux_metrics.items():
-            self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True)
+            self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         return total_loss
 
