@@ -224,6 +224,11 @@ class SeqVAEGraphModel:
         else:
             self.predictive_context_len = max(1, int(predictive_context_cfg))
 
+        predictive_max_cfg = vae_cfg.get('predictive_max_anchors', 0)
+        if predictive_max_cfg in (None, "", False):
+            self.predictive_max_anchors = 0
+        else:
+            self.predictive_max_anchors = int(predictive_max_cfg)
         self.log_forecast_metrics = bool(vae_cfg.get('log_forecast_metrics', True))
         self.monitor_metric = vae_cfg.get('monitor_metric', 'val/predictive_loss')
         self.monitor_mode = vae_cfg.get('monitor_mode', 'min')
@@ -303,6 +308,7 @@ class SeqVAEGraphModel:
                 context_len=self.model_context_len,
                 horizon_len=self.model_horizon_len,
             )
+            self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
             
             # CRITICAL: Compile the model BEFORE loading checkpoint to match saved state_dict structure
             try:
@@ -346,6 +352,7 @@ class SeqVAEGraphModel:
                     latent_consistency_weight=self.latent_consistency_weight,
                     predictive_horizon=self.predictive_horizon,
                     predictive_context_len=self.predictive_context_len,
+                    predictive_max_anchors=self.predictive_max_anchors,
                     log_forecast_metrics=self.log_forecast_metrics,
                 )
                 
@@ -368,16 +375,44 @@ class SeqVAEGraphModel:
                 logger.warning(f"Checkpoint file not found at {self.base_model_checkpoint}. Initializing models from scratch.")
             else:
                 logger.info("No checkpoint provided. Initializing models from scratch.")
-        self._create_fresh_model()
+            self._create_fresh_model()
+
+    def _resolve_predictive_anchor_cap(self, sequence_length: int) -> None:
+        """Set predictive_max_anchors to the maximum feasible value if unset or oversized."""
+        seq_len = max(1, int(sequence_length))
+        context = max(1, int(self.predictive_context_len))
+        horizon = max(1, int(self.predictive_horizon))
+
+        start = max(0, context - 1)
+        end = max(start - 1, seq_len - 1 - horizon)
+        if end < start:
+            max_possible = 0
+        else:
+            max_possible = end - start + 1
+
+        if self.predictive_max_anchors <= 0:
+            self.predictive_max_anchors = max_possible
+        else:
+            self.predictive_max_anchors = min(self.predictive_max_anchors, max_possible)
+
+        logger.info(
+            "Resolved predictive_max_anchors=%s (max possible=%s, sequence_len=%s, context=%s, horizon=%s)",
+            self.predictive_max_anchors,
+            max_possible,
+            seq_len,
+            context,
+            horizon,
+        )
 
     def _create_fresh_model(self):
         """Create fresh model instance with config parameters."""
         logger.info("Creating fresh model with config parameters...")
-        
+
         self.base_model = SeqVaeTeb(
             context_len=self.model_context_len,
             horizon_len=self.model_horizon_len,
         )
+        self._resolve_predictive_anchor_cap(getattr(self.base_model, 'sequence_length', 300))
         if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:
                 compile_options = {
@@ -417,6 +452,7 @@ class SeqVAEGraphModel:
             latent_consistency_weight=self.latent_consistency_weight,
             predictive_horizon=self.predictive_horizon,
             predictive_context_len=self.predictive_context_len,
+            predictive_max_anchors=self.predictive_max_anchors,
             log_forecast_metrics=self.log_forecast_metrics,
         )
         self._enforce_lightning_hparams(self.lightning_base_model)
@@ -440,6 +476,7 @@ class SeqVAEGraphModel:
             'latent_consistency_weight': self.latent_consistency_weight,
             'predictive_horizon': self.predictive_horizon,
             'predictive_context_len': self.predictive_context_len,
+            'predictive_max_anchors': self.predictive_max_anchors,
             'log_forecast_metrics': self.log_forecast_metrics,
         }
 
@@ -492,11 +529,12 @@ class SeqVAEGraphModel:
         """
         logger.info("Setting up trainer for the base model...")
         logger.info(
-            "Forecasting configuration | predictive_weight=%.4f | latent_consistency_weight=%.4f | horizon=%s | context=%s | log_metrics=%s",
+            "Forecasting configuration | predictive_weight=%.4f | latent_consistency_weight=%.4f | horizon=%s | context=%s | max_anchors=%s | log_metrics=%s",
             self.predictive_weight,
             self.latent_consistency_weight,
             self.predictive_horizon,
             self.predictive_context_len,
+            self.predictive_max_anchors,
             self.log_forecast_metrics,
         )
         self.plotting_callback = PlottingCallBack(
