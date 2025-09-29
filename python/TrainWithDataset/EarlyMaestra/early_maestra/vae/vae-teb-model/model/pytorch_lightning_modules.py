@@ -177,7 +177,7 @@ class PlottingCallBack(Callback):
             return
 
         std = np.exp(0.5 * logvar)
-        residual = y_raw - recon
+        diff = y_raw - recon
 
         up_raw = None
         if up_raw_normalized is not None:
@@ -215,8 +215,8 @@ class PlottingCallBack(Callback):
             except Exception:
                 corr = float('nan')
 
-        rmse = float(np.sqrt(np.mean(residual ** 2)))
-        mae = float(np.mean(np.abs(residual)))
+        rmse = float(np.sqrt(np.mean(diff ** 2)))
+        mae = float(np.mean(np.abs(diff)))
 
         colors = {
             'fhr': "#055C9A",
@@ -224,7 +224,6 @@ class PlottingCallBack(Callback):
             'gt': '#456882',
             'recon': '#BB3E00',
             'uncertainty': '#F7AD45',
-            'residual': '#6C3483',
             'background': '#F9F3EF'
         }
 
@@ -295,12 +294,8 @@ class PlottingCallBack(Callback):
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
         )
 
+        ax[2, 0].set_axis_off()
         ax[2, 1].set_axis_off()
-        ax[2, 0].plot(t, residual, color=colors['residual'], linewidth=1.0, alpha=0.85)
-        ax[2, 0].axhline(0.0, color='#999999', linewidth=0.8, linestyle='--')
-        ax[2, 0].set_ylabel('Residual')
-        ax[2, 0].set_title('Residual (GT - Reconstruction)')
-        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
 
         if prior_matrix is not None and latent_matrix is not None and ax.shape[1] > 1:
             ax[2, 1].set_axis_on()
@@ -402,8 +397,11 @@ class PlottingCallBack(Callback):
             return
 
         n_rows = len(valid_segments)
-        fig, axes = plt.subplots(n_rows, 3, figsize=(18, n_rows * 3.0),
-                                 gridspec_kw={'width_ratios': [1, 1, 1]}, constrained_layout=True)
+        fig, axes = plt.subplots(
+            n_rows, 4, figsize=(22, n_rows * 3.2),
+            gridspec_kw={'width_ratios': [1, 1, 1, 1.3]},
+            constrained_layout=True,
+        )
         if n_rows == 1:
             axes = np.expand_dims(axes, axis=0)
 
@@ -419,12 +417,34 @@ class PlottingCallBack(Callback):
             axes[row, 1].set_title('Forecast mu_future')
             axes[row, 1].set_xlabel('Forecast step')
 
-            im2 = axes[row, 2].imshow(np.abs(err).T, aspect='auto', origin='lower', cmap='magma')
+            abs_err = np.abs(err)
+            im2 = axes[row, 2].imshow(abs_err.T, aspect='auto', origin='lower', cmap='magma')
             axes[row, 2].set_title('Absolute error')
             axes[row, 2].set_xlabel('Forecast step')
 
             for c in range(3):
                 axes[row, c].grid(False)
+
+            if abs_err.size > 0:
+                per_channel_energy = abs_err.sum(axis=0)
+                best_channel = int(np.argmax(per_channel_energy))
+            else:
+                best_channel = 0
+            time_axis = np.arange(horizon)
+            axes[row, 3].plot(time_axis, gt[:, best_channel], color='#2E86AB', linewidth=1.4, label='GT')
+            axes[row, 3].plot(time_axis, pred[:, best_channel], color='#BB3E00', linewidth=1.2, linestyle='--', label='Forecast')
+            axes[row, 3].fill_between(
+                time_axis,
+                gt[:, best_channel],
+                pred[:, best_channel],
+                color='#F5B7B1',
+                alpha=0.3,
+            )
+            axes[row, 3].set_title(f'Latent dim {best_channel} trajectory')
+            axes[row, 3].set_xlabel('Forecast step')
+            axes[row, 3].set_ylabel('Activation')
+            axes[row, 3].grid(True, alpha=0.3)
+            axes[row, 3].legend(loc='upper right', fontsize=8, framealpha=0.85)
 
             if row == 0:
                 fig.colorbar(im0, ax=axes[row, 0], fraction=0.046, pad=0.04)

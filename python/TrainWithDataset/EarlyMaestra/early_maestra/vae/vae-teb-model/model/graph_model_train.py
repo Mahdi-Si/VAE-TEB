@@ -21,6 +21,7 @@ import pickle
 from tqdm import tqdm
 import time
 import numpy as np
+from typing import Optional
 
 from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
@@ -318,69 +319,101 @@ class SeqVAEGraphModel:
             logger.info(f"Loading model from checkpoint: {self.base_model_checkpoint}")
             logger.info("Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
-            # Create base model with current config parameters
-            base_model_for_loading = SeqVaeTeb(
-                context_len=self.model_context_len,
-                horizon_len=self.model_horizon_len,
-            )
-            self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
-            
-            # CRITICAL: Compile the model BEFORE loading checkpoint to match saved state_dict structure
-            try:
-                compile_options = {
+            compile_attempts = [
+                None,
+                {
                     'mode': 'max-autotune-no-cudagraphs',
                     'fullgraph': False,
                     'dynamic': True,
-                }
-                base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
-                logger.info("Model compiled before checkpoint loading to match saved structure")
-            except Exception as e:
-                logger.warning(f"Compilation failed before checkpoint loading: {e}, trying reduce-overhead...")
-                try:
-                    compile_options = {
-                        'mode': 'reduce-overhead',
-                        'fullgraph': False,
-                        'dynamic': True,
-                        'options': {'triton.cudagraphs': False}
-                    }
-                    base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
-                    logger.info("Model compiled with reduce-overhead before checkpoint loading")
-                except Exception as e2:
-                    logger.warning(f"All compilation failed before checkpoint loading: {e2}")
-                    logger.warning("Loading checkpoint into uncompiled model - this may cause key mismatches")
+                },
+                {
+                    'mode': 'reduce-overhead',
+                    'fullgraph': False,
+                    'dynamic': True,
+                    'options': {'triton.cudagraphs': False}
+                },
+            ]
 
-            try:
-                logger.info("Loading Lightning checkpoint with strict architecture matching...")
-                self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
-                    self.base_model_checkpoint,
-                    seqvae_teb_model=base_model_for_loading,
-                    strict=False,
-                    lr=self.lr,
-                    lr_milestones=self.lr_milestones,
-                    beta_schedule=self.beta_schedule,
-                    beta_start=self.beta_start,
-                    beta_end=self.beta_end,
-                    beta_anneal_epochs=self.beta_anneal_epochs,
-                    beta_cycle_len=self.beta_cycle_len,
-                    beta_const_val=self.beta_const_val,
-                    predictive_weight=self.predictive_weight,
-                    latent_consistency_weight=self.latent_consistency_weight,
-                    predictive_horizon=self.predictive_horizon,
-                    predictive_context_len=self.predictive_context_len,
-                    predictive_max_anchors=self.predictive_max_anchors,
-                    log_forecast_metrics=self.log_forecast_metrics,
+            load_success = False
+            loaded_with_precompile = False
+            last_error: Optional[Exception] = None
+
+            for compile_options in compile_attempts:
+                base_model_for_loading = SeqVaeTeb(
+                    context_len=self.model_context_len,
+                    horizon_len=self.model_horizon_len,
                 )
-                
+                self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
+
+                if compile_options is not None:
+                    try:
+                        base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
+                        loaded_with_precompile = True
+                        logger.info(
+                            "Compiled base model prior to checkpoint load with options=%s",
+                            compile_options,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Pre-load compilation failed with options {compile_options}: {e}")
+                        loaded_with_precompile = False
+                        continue
+
+                try:
+                    logger.info("Loading Lightning checkpoint with strict architecture matching...")
+                    self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
+                        self.base_model_checkpoint,
+                        seqvae_teb_model=base_model_for_loading,
+                        strict=False,
+                        lr=self.lr,
+                        lr_milestones=self.lr_milestones,
+                        beta_schedule=self.beta_schedule,
+                        beta_start=self.beta_start,
+                        beta_end=self.beta_end,
+                        beta_anneal_epochs=self.beta_anneal_epochs,
+                        beta_cycle_len=self.beta_cycle_len,
+                        beta_const_val=self.beta_const_val,
+                        predictive_weight=self.predictive_weight,
+                        latent_consistency_weight=self.latent_consistency_weight,
+                        predictive_horizon=self.predictive_horizon,
+                        predictive_context_len=self.predictive_context_len,
+                        predictive_max_anchors=self.predictive_max_anchors,
+                        log_forecast_metrics=self.log_forecast_metrics,
+                    )
+                    load_success = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Checkpoint load failed with compile options={compile_options}: {e}")
+
+            if load_success:
                 logger.info("Enforcing config hyperparameters over checkpoint...")
                 self._enforce_lightning_hparams(self.lightning_base_model)
-                
+
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model
-                self._skip_compilation = True
+
+                if hasattr(self.base_model, "_orig_mod") or loaded_with_precompile:
+                    self._skip_compilation = True
+                else:
+                    try:
+                        compile_options = {
+                            'mode': 'max-autotune-no-cudagraphs',
+                            'fullgraph': False,
+                            'dynamic': True,
+                        }
+                        compiled_model = torch.compile(self.base_model, **compile_options)
+                        self.base_model = compiled_model
+                        self.lightning_base_model.model = compiled_model
+                        self._skip_compilation = True
+                        logger.info("Compiled loaded SeqVaeTeb model post-checkpoint load")
+                    except Exception as e:
+                        logger.warning(f"Post-load compilation failed: {e}. Continuing with eager model.")
+                        self.lightning_base_model.model = self.base_model
+                        self._skip_compilation = False
+
                 logger.info("Successfully loaded checkpoint with CONFIG hyperparameters enforced.")
-                
-            except Exception as e:
-                logger.error(f"Failed to load checkpoint: {e}")
+            else:
+                logger.error(f"Failed to load checkpoint: {last_error}")
                 logger.error("Initializing models from scratch.")
                 self.base_model_checkpoint = None
                 self._create_fresh_model()

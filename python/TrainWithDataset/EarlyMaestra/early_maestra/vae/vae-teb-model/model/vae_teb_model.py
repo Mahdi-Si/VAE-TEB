@@ -1475,16 +1475,25 @@ class SeqVaeTeb(nn.Module):
         H = self.horizon_len
         stride = self.decimation_factor
 
-        # Accumulate NLL over anchors
-        nll_total = 0.0
-        for i, t in enumerate(anchors.tolist()):
-            start, end = self.raw_window_from_anchor(t, stride=stride, H=H)
-            target_win = y_raw[:, start:end]
-            mu_win = mu_future[:, i, :]
-            logvar_win = logvar_future[:, i, :]
-            nll_total = nll_total + self.gaussian_nll(mu_win, logvar_win, target_win)
+        if N == 0:
+            forecast_nll = torch.tensor(0.0, device=y_raw.device)
+        else:
+            window_len = mu_future.size(-1)
+            anchor_positions = stride * (anchors.to(mu_future.device).long() + 1)
+            offsets = torch.arange(window_len, device=mu_future.device, dtype=torch.long)
+            gather_idx = anchor_positions[:, None] + offsets[None, :]  # (N, W)
+            gather_idx = gather_idx.unsqueeze(0).expand(B, -1, -1)
+            target_windows = torch.gather(
+                y_raw.unsqueeze(1).expand(-1, N, -1),
+                2,
+                gather_idx
+            )
 
-        forecast_nll = nll_total / max(1, N)
+            forecast_nll = self.gaussian_nll(
+                mu_future.reshape(B * N, window_len),
+                logvar_future.reshape(B * N, window_len),
+                target_windows.reshape(B * N, window_len),
+            )
 
         kld_loss = torch.tensor(0.0, device=y_raw.device)
         if include_kld:
@@ -1523,13 +1532,40 @@ class SeqVaeTeb(nn.Module):
             mean:    (B, total_len) nanmean over anchors
         """
         B, N, W = mu_future.shape
-        canvas = mu_future.new_full((B, N, total_len), float("nan"))
-        for i, t in enumerate(anchors.tolist()):
-            start, end = self.raw_window_from_anchor(t, stride=stride, H=W // stride)
-            end = min(end, total_len)
-            length = end - start
-            if length > 0:
-                canvas[:, i, start:end] = mu_future[:, i, :length]
+        if N == 0:
+            canvas = mu_future.new_full((B, 0, total_len), float('nan'))
+            return canvas, canvas.new_full((B, total_len), float('nan'))
+
+        device = mu_future.device
+        anchor_positions = stride * (anchors.to(device).long() + 1)
+        offsets = torch.arange(W, device=device, dtype=torch.long)
+        index = anchor_positions[:, None] + offsets[None, :]  # (N, W)
+
+        valid_mask = (index >= 0) & (index < total_len)
+        index = index.clamp_(min=0, max=total_len - 1)
+
+        expanded_index = index.unsqueeze(0).expand(B, -1, -1)  # (B, N, W)
+        expanded_mask = valid_mask.unsqueeze(0).expand(B, -1, -1)
+
+        canvas = mu_future.new_full((B, N, total_len), float('nan'))
+        row_indices = torch.arange(B, device=device).unsqueeze(1).unsqueeze(2).expand(B, N, W)
+        anchor_indices = torch.arange(N, device=device).unsqueeze(0).unsqueeze(2).expand(B, N, W)
+
+        flat_canvas = canvas.view(B * N, total_len)
+        flat_rows = (row_indices * N + anchor_indices).view(B * N, W)
+        flat_cols = expanded_index.view(B * N, W)
+        flat_mask = expanded_mask.view(B * N, W)
+        flat_values = mu_future.view(B * N, W)
+
+        flat_rows = flat_rows.view(-1).long()
+        flat_cols = flat_cols.view(-1).long()
+        flat_values = flat_values.view(-1)
+        flat_mask = flat_mask.view(-1)
+
+        if flat_mask.any():
+            flat_canvas[flat_rows[flat_mask], flat_cols[flat_mask]] = flat_values[flat_mask]
+
+        canvas = flat_canvas.view(B, N, total_len)
         mean = torch.nanmean(canvas, dim=1)
         return canvas, mean
 
@@ -1752,10 +1788,11 @@ class SeqVaeTeb(nn.Module):
                 z_future_pred = z_future_pred.reshape(B_ctx, N, predictive_horizon, D)
 
                 # Collect ground-truth future latent means (stop gradient)
-                future_targets = []
-                for t in anchors.tolist():
-                    future_targets.append(mu_post[:, t + 1 : t + 1 + predictive_horizon, :].unsqueeze(1))
-                future_targets = torch.cat(future_targets, dim=1).detach()  # (B, N, H, D)
+                future_offsets = torch.arange(1, predictive_horizon + 1, device=mu_post.device, dtype=torch.long)
+                step_indices = anchors.to(mu_post.device).long().unsqueeze(1) + future_offsets.unsqueeze(0)  # (N, H)
+                gather_idx = step_indices.unsqueeze(0).unsqueeze(-1).expand(B_ctx, -1, -1, D)
+                expanded_mu_post = mu_post.unsqueeze(1).expand(-1, N, -1, -1)
+                future_targets = torch.gather(expanded_mu_post, 2, gather_idx).detach()  # (B, N, H, D)
 
                 if latent_consistency_weight > 0.0:
                     latent_consistency_loss = F.mse_loss(z_future_pred, future_targets)
@@ -1767,16 +1804,23 @@ class SeqVaeTeb(nn.Module):
                     mu_future = mu_flat.reshape(B_ctx, N, -1)
                     logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
 
-                    nll_total = torch.tensor(0.0, device=device)
-                    for idx, t in enumerate(anchors.tolist()):
-                        start = stride * (t + 1)
-                        end = start + stride * predictive_horizon
-                        target_window = y_raw[:, start:end]
-                        mu_window = mu_future[:, idx, : target_window.size(-1)]
-                        logvar_window = logvar_future[:, idx, : target_window.size(-1)]
-                        nll_total = nll_total + self.gaussian_nll(mu_window, logvar_window, target_window)
+                    window_len = mu_future.size(-1)
+                    start_positions = stride * (anchors.to(device=device).long() + 1)
+                    raw_offsets = torch.arange(window_len, device=device, dtype=torch.long)
+                    raw_indices = start_positions[:, None] + raw_offsets[None, :]  # (N, window_len)
+                    raw_indices = raw_indices.unsqueeze(0).expand(B_ctx, -1, -1)
 
-                    predictive_loss = nll_total / max(1, anchors.numel())
+                    target_windows = torch.gather(
+                        y_raw.unsqueeze(1).expand(-1, N, -1),
+                        2,
+                        raw_indices
+                    )
+
+                    predictive_loss = self.gaussian_nll(
+                        mu_future.reshape(B_ctx * N, window_len),
+                        logvar_future.reshape(B_ctx * N, window_len),
+                        target_windows.reshape(B_ctx * N, window_len),
+                    )
 
         # Total loss with beta-weighted KLD
         total_loss = (
