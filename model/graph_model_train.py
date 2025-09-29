@@ -238,7 +238,22 @@ class SeqVAEGraphModel:
         self.batch_size_test = self.config['general_config']['batch_size']['test']
         self.accumulate_grad_batches = self.config['general_config'].get('accumulate_grad_batches', 1)
 
-        self.base_model_checkpoint = self.config['model_config']['base_model_checkpoint']
+        model_cfg = self.config.get('model_config', {})
+        self.base_model_checkpoint = model_cfg.get('base_model_checkpoint')
+        if self.base_model_checkpoint:
+            if not os.path.isabs(self.base_model_checkpoint):
+                base_dir = os.path.dirname(self.config_file_path)
+                self.base_model_checkpoint = os.path.normpath(os.path.join(base_dir, self.base_model_checkpoint))
+            else:
+                self.base_model_checkpoint = os.path.normpath(self.base_model_checkpoint)
+
+        self.legacy_seqvae_checkpoint = model_cfg.get('legacy_seqvae_checkpoint')
+        if self.legacy_seqvae_checkpoint:
+            if not os.path.isabs(self.legacy_seqvae_checkpoint):
+                base_dir = os.path.dirname(self.config_file_path)
+                self.legacy_seqvae_checkpoint = os.path.normpath(os.path.join(base_dir, self.legacy_seqvae_checkpoint))
+            else:
+                self.legacy_seqvae_checkpoint = os.path.normpath(self.legacy_seqvae_checkpoint)
 
         self.clip = 10
         plt.ion()
@@ -408,10 +423,31 @@ class SeqVAEGraphModel:
         """Create fresh model instance with config parameters."""
         logger.info("Creating fresh model with config parameters...")
 
-        self.base_model = SeqVaeTeb(
-            context_len=self.model_context_len,
-            horizon_len=self.model_horizon_len,
-        )
+        init_kwargs = {
+            'context_len': self.model_context_len,
+            'horizon_len': self.model_horizon_len,
+        }
+        base_model = None
+        legacy_ckpt = getattr(self, 'legacy_seqvae_checkpoint', None)
+        if legacy_ckpt:
+            if os.path.exists(legacy_ckpt):
+                try:
+                    logger.info(f"Initializing SeqVaeTeb from legacy checkpoint: {legacy_ckpt}")
+                    base_model = SeqVaeTeb.from_legacy_checkpoint(
+                        legacy_ckpt,
+                        strict=False,
+                        init_kwargs=init_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to load legacy SeqVaeTeb checkpoint {legacy_ckpt}: {exc}")
+                    logger.warning("Falling back to random initialization.")
+            else:
+                logger.warning(f"Legacy SeqVaeTeb checkpoint not found at {legacy_ckpt}. Proceeding with random initialization.")
+
+        if base_model is None:
+            base_model = SeqVaeTeb(**init_kwargs)
+
+        self.base_model = base_model
         self._resolve_predictive_anchor_cap(getattr(self.base_model, 'sequence_length', 300))
         if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
             try:

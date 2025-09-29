@@ -46,6 +46,7 @@ model_config:
     monitor_mode: "min"                 # Direction for monitored metric
 
   base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
+  legacy_seqvae_checkpoint: null  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
 
 folders_config:
   out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
