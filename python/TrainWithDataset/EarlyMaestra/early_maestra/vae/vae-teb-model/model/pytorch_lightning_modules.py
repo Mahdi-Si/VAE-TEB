@@ -69,11 +69,30 @@ class PlottingCallBack(Callback):
                 y_raw_normalized = batch.fhr  # (B, 4800)
                 up_raw_normalized = batch.up  # (B, 4800)
 
+                model_outputs = pl_module.model(y_st, y_ph, x_ph)
+                mu_pr = model_outputs.get("mu_pr")
+                logvar_pr = model_outputs.get("logvar_pr")
+                latent_z_full = model_outputs.get("z")
+                mu_post_full = model_outputs.get("mu_post")
+                mu_prior_full = model_outputs.get("mu_prior")
+
+                self._plot_reconstruction_overview(
+                    y_raw_normalized=y_raw_normalized,
+                    up_raw_normalized=up_raw_normalized,
+                    mu_pr=mu_pr,
+                    logvar_pr=logvar_pr,
+                    latent_z=latent_z_full,
+                    mu_post=mu_post_full,
+                    mu_prior=mu_prior_full,
+                    epoch=pl_trainer.current_epoch,
+                )
+
                 # Forecast across all valid anchors using posterior mean latents for stability
                 forecast_out = pl_module.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
                 anchors = forecast_out["anchors"]
                 mu_future = forecast_out["mu_future"]          # (B,N,480)
                 logvar_future = forecast_out["logvar_future"]  # (B,N,480)
+                z_future = forecast_out.get("z_future")
                 enc = forecast_out["enc"]
 
                 # Aggregate forecasts to full raw timeline
@@ -85,6 +104,19 @@ class PlottingCallBack(Callback):
                 _, mean_var = pl_module.model.aggregate_forecasts_to_canvas(
                     var_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
                 std_mu = mean_var.clamp_min(1e-8).sqrt()
+
+                self._plot_latent_forecast_samples(
+                    mu_post_sequence=enc.get("mu_post"),
+                    z_future=z_future,
+                    anchors=anchors,
+                    epoch=pl_trainer.current_epoch,
+                )
+
+                self._plot_latent_statistics(
+                    mu_prior=mu_prior_full if mu_prior_full is not None else enc.get("mu_prior"),
+                    mu_post=mu_post_full if mu_post_full is not None else enc.get("mu_post"),
+                    epoch=pl_trainer.current_epoch,
+                )
 
                 # Plot forecast results
                 self._plot_forecast_results(
@@ -115,6 +147,376 @@ class PlottingCallBack(Callback):
             logger.error(f"Traceback: {traceback.format_exc()}")
         finally:
             pl_module.train()
+
+    def _plot_reconstruction_overview(
+        self,
+        y_raw_normalized: torch.Tensor,
+        up_raw_normalized: Optional[torch.Tensor],
+        mu_pr: Optional[torch.Tensor],
+        logvar_pr: Optional[torch.Tensor],
+        latent_z: Optional[torch.Tensor],
+        mu_post: Optional[torch.Tensor],
+        mu_prior: Optional[torch.Tensor],
+        epoch: int,
+    ):
+        """Plot ground-truth vs reconstruction along with latent diagnostics."""
+        import os
+        import gc
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if y_raw_normalized is None or mu_pr is None or logvar_pr is None:
+            return
+
+        batch_idx = 0
+        try:
+            y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
+            recon = mu_pr[batch_idx].detach().cpu().numpy()
+            logvar = logvar_pr[batch_idx].detach().cpu().numpy()
+        except Exception:
+            return
+
+        std = np.exp(0.5 * logvar)
+        residual = y_raw - recon
+
+        up_raw = None
+        if up_raw_normalized is not None:
+            try:
+                up_raw = up_raw_normalized[batch_idx].detach().cpu().numpy()
+            except Exception:
+                up_raw = None
+
+        latent_matrix = None
+        if latent_z is not None:
+            try:
+                latent_matrix = latent_z[batch_idx].detach().cpu().numpy()
+            except Exception:
+                latent_matrix = None
+        if latent_matrix is None and mu_post is not None:
+            try:
+                latent_matrix = mu_post[batch_idx].detach().cpu().numpy()
+            except Exception:
+                latent_matrix = None
+
+        prior_matrix = None
+        if mu_prior is not None:
+            try:
+                prior_matrix = mu_prior[batch_idx].detach().cpu().numpy()
+            except Exception:
+                prior_matrix = None
+
+        Fs = 4.0
+        t = np.arange(y_raw.shape[0]) / Fs
+
+        corr = float('nan')
+        if np.std(y_raw) > 1e-8 and np.std(recon) > 1e-8:
+            try:
+                corr = float(np.corrcoef(y_raw, recon)[0, 1])
+            except Exception:
+                corr = float('nan')
+
+        rmse = float(np.sqrt(np.mean(residual ** 2)))
+        mae = float(np.mean(np.abs(residual)))
+
+        colors = {
+            'fhr': "#055C9A",
+            'up': "#0DD8A2",
+            'gt': '#456882',
+            'recon': '#BB3E00',
+            'uncertainty': '#F7AD45',
+            'residual': '#6C3483',
+            'background': '#F9F3EF'
+        }
+
+        plt.style.use('default')
+        plt.rcParams.update({
+            'font.family': 'sans-serif',
+            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+            'font.size': 11,
+            'axes.titlesize': 12,
+            'axes.labelsize': 11,
+            'axes.linewidth': 0.7,
+            'axes.edgecolor': "#9E9D9D",
+            'axes.facecolor': colors['background'],
+            'grid.color': "#838383",
+            'grid.linewidth': 0.4,
+            'grid.alpha': 0.6,
+            'legend.frameon': True,
+            'legend.fancybox': False,
+            'legend.shadow': False,
+            'legend.framealpha': 0.95,
+            'legend.edgecolor': '#A2B9A7',
+            'legend.facecolor': colors['background'],
+            'figure.facecolor': 'white',
+            'savefig.facecolor': 'white',
+            'savefig.dpi': 300
+        })
+
+        n_rows = 4
+        fig, ax = plt.subplots(
+            nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.2),
+            gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
+
+        for i in range(n_rows):
+            ax[i, 0].grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#D2C1B6')
+            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[i, 0].minorticks_on()
+            ax[i, 0].set_axisbelow(True)
+            ax[i, 0].spines['top'].set_visible(False)
+            ax[i, 0].spines['right'].set_visible(False)
+            ax[i, 0].spines['left'].set_color('#A2B9A7')
+            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
+            ax[i, 0].spines['left'].set_linewidth(0.7)
+            ax[i, 0].spines['bottom'].set_linewidth(0.7)
+
+        ax[0, 1].set_axis_off()
+        ax[0, 0].plot(t, y_raw, linewidth=1.2, color=colors['fhr'], label='FHR', alpha=0.9)
+        if up_raw is not None:
+            ax[0, 0].plot(t, up_raw, linewidth=1.0, color=colors['up'], label='UP', alpha=0.75)
+        ax[0, 0].set_ylabel('Amplitude')
+        ax[0, 0].set_title('Raw FHR/UP Signals')
+        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[0, 0].legend(loc='upper right', framealpha=0.95)
+
+        ax[1, 1].set_axis_off()
+        ax[1, 0].plot(t, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=3)
+        ax[1, 0].plot(t, recon, linewidth=1.3, color=colors['recon'], label='Reconstruction', alpha=0.85, zorder=2)
+        ax[1, 0].fill_between(t, recon - std, recon + std, color=colors['uncertainty'], alpha=0.25, label='+/- 1 sigma')
+        ax[1, 0].set_ylabel('FHR (bpm)')
+        ax[1, 0].set_title('Ground Truth vs Reconstruction')
+        ax[1, 0].legend(loc='upper right', framealpha=0.95)
+        ax[1, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[1, 0].text(
+            0.01,
+            0.92,
+            f"RMSE: {rmse:.3f}\nMAE: {mae:.3f}\nCorr: {corr:.3f}",
+            transform=ax[1, 0].transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+        )
+
+        ax[2, 1].set_axis_off()
+        ax[2, 0].plot(t, residual, color=colors['residual'], linewidth=1.0, alpha=0.85)
+        ax[2, 0].axhline(0.0, color='#999999', linewidth=0.8, linestyle='--')
+        ax[2, 0].set_ylabel('Residual')
+        ax[2, 0].set_title('Residual (GT - Reconstruction)')
+        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
+
+        if prior_matrix is not None and latent_matrix is not None and ax.shape[1] > 1:
+            ax[2, 1].set_axis_on()
+            step_idx = np.arange(latent_matrix.shape[0])
+            prior_norm = np.linalg.norm(prior_matrix, axis=1)
+            post_norm = np.linalg.norm(latent_matrix, axis=1)
+            delta_norm = np.linalg.norm(latent_matrix - prior_matrix, axis=1)
+            ax[2, 1].plot(step_idx, prior_norm, color='#7F8C8D', linewidth=1.0, label='||mu_prior||')
+            ax[2, 1].plot(step_idx, post_norm, color='#BB3E00', linewidth=1.2, label='||mu_post||')
+            ax[2, 1].plot(step_idx, delta_norm, color='#2E86AB', linewidth=1.2, linestyle='--', label='||delta||')
+            ax[2, 1].set_title('Latent Norm Dynamics')
+            ax[2, 1].set_xlabel('Decimated step')
+            ax[2, 1].grid(True, alpha=0.3)
+            ax[2, 1].legend(loc='upper right', fontsize=9, framealpha=0.9)
+
+        ax[3, 1].set_axis_off()
+        if latent_matrix is not None:
+            img = ax[3, 0].imshow(latent_matrix.T, aspect='auto', cmap='RdBu_r', origin='lower')
+            ax[3, 0].set_ylabel('Latent dim')
+            ax[3, 0].set_xlabel('Decimated step')
+            title_suffix = ''
+            if prior_matrix is not None:
+                mean_delta = float(np.mean(np.abs(latent_matrix - prior_matrix)))
+                title_suffix = f' | mean |delta| = {mean_delta:.3f}'
+            ax[3, 0].set_title(f'Posterior Latent Trajectory{title_suffix}')
+            cbar = fig.colorbar(img, cax=ax[3, 1])
+            cbar.ax.tick_params(labelsize=9, colors='#666666')
+            cbar.set_label('Activation', fontsize=10, color='#666666')
+        else:
+            ax[3, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center', fontsize=12)
+            ax[3, 0].set_axis_off()
+
+        fig.suptitle(f'Reconstruction Overview - Epoch {epoch}', fontsize=14, color='#456882')
+        save_path = os.path.join(self.output_dir, f'reconstruction_overview_epoch_{epoch}.pdf')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Reconstruction plot saved to {save_path}")
+
+    def _plot_latent_forecast_samples(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        z_future: Optional[torch.Tensor],
+        anchors: Optional[torch.Tensor],
+        epoch: int,
+    ):
+        """Visualize forecasted latent trajectories against ground truth for spaced anchors."""
+        import os
+        import gc
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if mu_post_sequence is None or z_future is None or anchors is None or anchors.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+            z_future_np = z_future[batch_idx].detach().cpu().numpy()
+            anchors_np = anchors.detach().cpu().numpy().astype(int)
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2 or z_future_np.ndim != 3:
+            return
+
+        horizon = z_future_np.shape[1]
+        step = 30
+        selected = []
+        last_anchor = -step
+        for idx, anchor in enumerate(anchors_np):
+            if anchor - last_anchor >= step and anchor + 1 + horizon <= mu_post_np.shape[0]:
+                selected.append((idx, anchor))
+                last_anchor = anchor
+            if len(selected) >= 4:
+                break
+
+        if not selected:
+            for idx, anchor in enumerate(anchors_np[:4]):
+                if anchor + 1 + horizon <= mu_post_np.shape[0]:
+                    selected.append((idx, anchor))
+
+        if not selected:
+            return
+
+        global_max = 1e-6
+        valid_segments = []
+        for idx, anchor in selected:
+            start = anchor + 1
+            end = start + horizon
+            gt = mu_post_np[start:end]
+            if gt.shape[0] != horizon:
+                continue
+            pred = z_future_np[idx]
+            global_max = max(global_max, np.abs(gt).max(), np.abs(pred).max())
+            valid_segments.append((idx, anchor, gt, pred))
+
+        if not valid_segments:
+            return
+
+        n_rows = len(valid_segments)
+        fig, axes = plt.subplots(n_rows, 3, figsize=(18, n_rows * 3.0),
+                                 gridspec_kw={'width_ratios': [1, 1, 1]}, constrained_layout=True)
+        if n_rows == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for row, (idx, anchor, gt, pred) in enumerate(valid_segments):
+            err = pred - gt
+
+            im0 = axes[row, 0].imshow(gt.T, aspect='auto', origin='lower', cmap='RdBu_r', vmin=-global_max, vmax=global_max)
+            axes[row, 0].set_title(f'Ground truth mu_post | anchor={anchor}')
+            axes[row, 0].set_ylabel('Latent dim')
+            axes[row, 0].set_xlabel('Forecast step')
+
+            im1 = axes[row, 1].imshow(pred.T, aspect='auto', origin='lower', cmap='RdBu_r', vmin=-global_max, vmax=global_max)
+            axes[row, 1].set_title('Forecast mu_future')
+            axes[row, 1].set_xlabel('Forecast step')
+
+            im2 = axes[row, 2].imshow(np.abs(err).T, aspect='auto', origin='lower', cmap='magma')
+            axes[row, 2].set_title('Absolute error')
+            axes[row, 2].set_xlabel('Forecast step')
+
+            for c in range(3):
+                axes[row, c].grid(False)
+
+            if row == 0:
+                fig.colorbar(im0, ax=axes[row, 0], fraction=0.046, pad=0.04)
+                fig.colorbar(im2, ax=axes[row, 2], fraction=0.046, pad=0.04)
+
+        save_path = os.path.join(self.output_dir, f'latent_forecast_samples_epoch_{epoch}.pdf')
+        fig.suptitle(f'Latent Forecast Diagnostics - Epoch {epoch}', fontsize=14, color='#456882')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Latent forecast comparison saved to {save_path}")
+
+    def _plot_latent_statistics(
+        self,
+        mu_prior: Optional[torch.Tensor],
+        mu_post: Optional[torch.Tensor],
+        epoch: int,
+    ):
+        """Plot summary statistics for latent trajectories (prior vs posterior)."""
+        import os
+        import gc
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if mu_post is None:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post[batch_idx].detach().cpu().numpy()
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2:
+            return
+
+        if mu_prior is not None:
+            try:
+                mu_prior_np = mu_prior[batch_idx].detach().cpu().numpy()
+            except Exception:
+                mu_prior_np = np.zeros_like(mu_post_np)
+        else:
+            mu_prior_np = np.zeros_like(mu_post_np)
+
+        delta = mu_post_np - mu_prior_np
+        prior_norm = np.linalg.norm(mu_prior_np, axis=1)
+        post_norm = np.linalg.norm(mu_post_np, axis=1)
+        delta_norm = np.linalg.norm(delta, axis=1)
+        steps = np.arange(mu_post_np.shape[0])
+
+        with np.errstate(all='ignore'):
+            corr = np.corrcoef(mu_post_np.T)
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        delta_heatmap = delta.T
+        energy_per_dim = np.sum(delta ** 2, axis=0)
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+
+        axes[0, 0].plot(steps, prior_norm, color='#7F8C8D', linewidth=1.0, label='||mu_prior||')
+        axes[0, 0].plot(steps, post_norm, color='#BB3E00', linewidth=1.2, label='||mu_post||')
+        axes[0, 0].plot(steps, delta_norm, color='#2E86AB', linewidth=1.2, linestyle='--', label='||delta||')
+        axes[0, 0].set_title('Latent Norms over Time')
+        axes[0, 0].set_xlabel('Decimated step')
+        axes[0, 0].set_ylabel('Norm')
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].legend(loc='upper right', framealpha=0.9)
+
+        im_corr = axes[0, 1].imshow(corr, aspect='auto', origin='lower', cmap='Spectral', vmin=-1.0, vmax=1.0)
+        axes[0, 1].set_title('Posterior Latent Correlation')
+        axes[0, 1].set_xlabel('Latent dim')
+        axes[0, 1].set_ylabel('Latent dim')
+        fig.colorbar(im_corr, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+        im_delta = axes[1, 0].imshow(delta_heatmap, aspect='auto', origin='lower', cmap='RdBu_r')
+        axes[1, 0].set_title('delta = mu_post - mu_prior')
+        axes[1, 0].set_xlabel('Decimated step')
+        axes[1, 0].set_ylabel('Latent dim')
+        fig.colorbar(im_delta, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+        axes[1, 1].bar(np.arange(delta_heatmap.shape[0]), energy_per_dim, color='#3C6E71')
+        axes[1, 1].set_title('Energy per Latent Dimension')
+        axes[1, 1].set_xlabel('Latent dim')
+        axes[1, 1].set_ylabel('Energy')
+        axes[1, 1].grid(True, axis='y', alpha=0.3)
+
+        fig.suptitle(f'Latent Statistics - Epoch {epoch}', fontsize=14, color='#456882')
+        save_path = os.path.join(self.output_dir, f'latent_statistics_epoch_{epoch}.pdf')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Latent statistics plot saved to {save_path}")
 
     def _plot_forecast_results(
         self,
