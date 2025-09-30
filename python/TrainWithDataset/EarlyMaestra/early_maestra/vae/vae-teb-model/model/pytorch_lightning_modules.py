@@ -10,7 +10,7 @@ import os
 import plotly.graph_objects as go
 from typing import Dict, Optional, Tuple
 
-from vae_teb_model import SeqVaeTeb, ensure_compiled_module
+from vae_teb_model import SeqVaeTeb, ensure_compiled_module, is_compiled_module
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
