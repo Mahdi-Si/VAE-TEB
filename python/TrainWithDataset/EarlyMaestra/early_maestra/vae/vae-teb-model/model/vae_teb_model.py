@@ -1551,21 +1551,21 @@ class SeqVaeTeb(nn.Module):
         row_indices = torch.arange(B, device=device).unsqueeze(1).unsqueeze(2).expand(B, N, W)
         anchor_indices = torch.arange(N, device=device).unsqueeze(0).unsqueeze(2).expand(B, N, W)
 
-        flat_canvas = canvas.view(B * N, total_len)
-        flat_rows = (row_indices * N + anchor_indices).view(B * N, W)
-        flat_cols = expanded_index.view(B * N, W)
-        flat_mask = expanded_mask.view(B * N, W)
-        flat_values = mu_future.view(B * N, W)
+        flat_canvas = canvas.reshape(B * N, total_len)
+        flat_rows = (row_indices * N + anchor_indices).reshape(B * N, W)
+        flat_cols = expanded_index.reshape(B * N, W)
+        flat_mask = expanded_mask.reshape(B * N, W)
+        flat_values = mu_future.reshape(B * N, W)
 
-        flat_rows = flat_rows.view(-1).long()
-        flat_cols = flat_cols.view(-1).long()
-        flat_values = flat_values.view(-1)
-        flat_mask = flat_mask.view(-1)
+        flat_rows = flat_rows.reshape(-1).long()
+        flat_cols = flat_cols.reshape(-1).long()
+        flat_values = flat_values.reshape(-1)
+        flat_mask = flat_mask.reshape(-1)
 
         if flat_mask.any():
             flat_canvas[flat_rows[flat_mask], flat_cols[flat_mask]] = flat_values[flat_mask]
 
-        canvas = flat_canvas.view(B, N, total_len)
+        canvas = flat_canvas.reshape(B, N, total_len)
         mean = torch.nanmean(canvas, dim=1)
         return canvas, mean
 
