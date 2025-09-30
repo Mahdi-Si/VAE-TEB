@@ -21,6 +21,7 @@ import pickle
 from tqdm import tqdm
 import time
 import numpy as np
+from collections import OrderedDict
 
 from  utils.plot_utils import (
     plot_model_analysis,
@@ -327,6 +328,24 @@ class SeqVAEGraphModel:
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()
 
+    @staticmethod
+    def _normalize_checkpoint_state_dict(state_dict):
+        normalized = OrderedDict()
+        renamed = False
+        for key, value in state_dict.items():
+            new_key = key
+            for old_prefix, new_prefix in (
+                ('model._orig_mod.', 'model.'),
+                ('_orig_mod.', ''),
+                ('model.model.', 'model.'),
+            ):
+                if new_key.startswith(old_prefix):
+                    new_key = new_prefix + new_key[len(old_prefix):]
+                    renamed = True
+                    break
+            normalized[new_key] = value
+        return normalized, renamed
+
     def load_checkpoint(self):
         """
         Loads a checkpoint for both the PyTorch and PyTorch Lightning models.
@@ -337,8 +356,6 @@ class SeqVAEGraphModel:
         if self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint):
             logger.info(f"Loading model from checkpoint: {self.base_model_checkpoint}")
 
-            # Instantiate a base model to pass to load_from_checkpoint
-            # The actual weights will be overwritten by the checkpoint's state_dict.
             base_model_for_loading = SeqVaeTeb(
                 input_channels=76,  # Replace with config values if available
                 sequence_length=300,
@@ -346,12 +363,14 @@ class SeqVAEGraphModel:
             )
 
             try:
-                # Load from checkpoint but override ALL hyperparameters with current config values
-                self.lightning_base_model = LightSeqVaeTeb.load_from_checkpoint(
-                    self.base_model_checkpoint,
+                checkpoint = torch.load(self.base_model_checkpoint, map_location='cpu')
+                state_dict = checkpoint.get('state_dict', checkpoint)
+                normalized_state_dict, renamed = self._normalize_checkpoint_state_dict(state_dict)
+                if renamed:
+                    logger.info('Normalized checkpoint parameter prefixes for compatibility (model._orig_mod -> model).')
+
+                self.lightning_base_model = LightSeqVaeTeb(
                     seqvae_teb_model=base_model_for_loading,
-                    strict=False,
-                    # Override hyperparameters directly during loading
                     lr=self.lr,
                     lr_milestones=self.lr_milestones,
                     beta_schedule=self.beta_schedule,
@@ -361,11 +380,13 @@ class SeqVAEGraphModel:
                     beta_cycle_len=self.beta_cycle_len,
                     beta_const_val=self.beta_const_val
                 )
-                logger.info(f"Loaded checkpoint with NEW hyperparameters from config:")
-                logger.info(f"  lr: {self.lr}")
-                logger.info(f"  beta_schedule: {self.beta_schedule}")
-                logger.info(f"  beta_start: {self.beta_start}, beta_end: {self.beta_end}")
-                logger.info(f"  beta_anneal_epochs: {self.beta_anneal_epochs}")
+
+                missing_keys, unexpected_keys = self.lightning_base_model.load_state_dict(normalized_state_dict, strict=False)
+                if missing_keys:
+                    logger.warning(f"Missing keys when loading checkpoint: {missing_keys}")
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
+
                 self.base_model = self.lightning_base_model.model
                 self.pytorch_model = self.base_model  # Set pytorch_model reference
                 logger.info("Successfully loaded Lightning model and base PyTorch model from checkpoint.")
@@ -373,28 +394,28 @@ class SeqVAEGraphModel:
                 logger.error(f"Failed to load checkpoint: {e}")
                 logger.error("Initializing models from scratch.")
                 self.base_model_checkpoint = None  # Reset checkpoint path to prevent further errors
-                self.create_model() # Re-initialize models without checkpoint
+                self.create_model()  # Re-initialize models without checkpoint
 
         else:
             if self.base_model_checkpoint:
                 logger.warning(f"Checkpoint file not found at {self.base_model_checkpoint}. Initializing models from scratch.")
             else:
                 logger.info("No checkpoint provided. Initializing models from scratch.")
-            
+
             self.base_model = SeqVaeTeb(
                 input_channels=76,
                 sequence_length=300,
                 decimation_factor=16,
                 warmup_period=30,
             )
-            
+
             # SPEED OPTIMIZATION: Compile model for faster execution (PyTorch 2.0+)
             try:
                 self.base_model = torch.compile(self.base_model, mode='max-autotune')
                 logger.info("Model successfully compiled with torch.compile for maximum speed")
             except Exception as e:
                 logger.warning(f"torch.compile failed, proceeding without compilation: {e}")
-            
+
             self.lightning_base_model = LightSeqVaeTeb(
                 seqvae_teb_model=self.base_model,
                 lr=self.lr,
