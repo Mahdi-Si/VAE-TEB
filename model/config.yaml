@@ -1,16 +1,16 @@
 general_config:
-  tag: seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__
-  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
-  lr: 0.0001
-  lr_milestone: [400, 800]
-  weight_decay: 0.0001
+  tag: latent_forecast_with_checkpoint
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
+  lr: 0.0001  # Learning rate (reduced for stability)
+  lr_milestone: [1000]  # Epochs at which to decay learning rate
+  weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
   checkpoint_frequency: 1
-  plot_frequency: 1
-  epochs: 10000
-  accumulate_grad_batches: 1
+  plot_frequency: 1  # Plot every 5 epochs to reduce I/O
+  epochs: 10000  # Increased for better convergence
+  accumulate_grad_batches: 20  # Gradient accumulation for effective larger batch size
   batch_size:
-    train: 1700
-    test: 1700
+    train: 210  # Increased from 2 for better training stability
+    test: 210   # Can be larger for testing since no gradients
   
   # SOTA Training Optimizations
   optimization:
@@ -21,44 +21,56 @@ general_config:
 
 model_config:
   VAE_model:
-    freeze_seqvae: False
-    zero_source: False
+    freeze_seqvae: False        # Whether to freeze VAE during classifier training
+    zero_source: False           # Whether to zero source during certain experiments
     context_len: 75            # Latent forecaster context length (decimated steps)
     horizon_len: 30            # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
 
     # Beta Scheduling Configuration
+    # Controls the strength of regularization terms across training
     beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0            # Starting beta value for annealing schedules
     beta_end: 1.0              # Final beta value for TEB
     beta_anneal_epochs: 50     # Number of epochs for linear annealing
     beta_cycle_len: 1000       # Cycle length for cyclic annealing
-    beta_const_val: 0.001        # Constant beta value when schedule='constant'
-    kld_beta: 0.001              # Fallback beta value (legacy parameter)
+    beta_const_val: 0.005        # Constant beta value when schedule='constant'
+    kld_beta: 0.005              # Fallback beta value (legacy parameter)
+
+    # Standard TEB Configuration
+    # Original TEB formulation with conditional prior p(z|y)
+    # Single KL divergence: KL(q(z|x,y) || p(z|y))
+    # Direct transfer entropy measurement
 
     # Forecasting auxiliary objectives
-    predictive_weight: 0.5              # Weight on raw forecast NLL auxiliary loss
+    predictive_weight: 0.8              # Weight on raw forecast NLL auxiliary loss
     latent_consistency_weight: 0.1      # Weight on latent-space consistency loss
     predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
     predictive_context_len: null        # Override context length (defaults to context_len)
     predictive_max_anchors: 0           # Max anchors (0 = use all) for auxiliary losses
+    max_predictive_contexts_per_batch: 4096  # Safety cap on total contexts processed per batch
     log_forecast_metrics: true          # Log aggregated forecast metrics during validation
-    monitor_metric: "val/predictive_loss"  # Metric to monitor for checkpoints / early stopping
+    monitor_metric: "val/total_loss"  # Metric to monitor for checkpoints / early stopping
     monitor_mode: "min"                 # Direction for monitored metric
 
   base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
-  legacy_seqvae_checkpoint: null  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
+  legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
 
 folders_config:
   out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
 
 dataset_config:
     vae_train_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
     vae_test_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_cs.hdf5
-    stat_path: /data/deid/isilon/MS_model/Q4_stats/stats.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
     dataloader_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
@@ -71,11 +83,11 @@ dataset_config:
         epoch_min: null
         epoch_max: null
         label: null
-        cache_size: 2000
+        cache_size: 20000
         trim_minutes: 2.0  # how much to trim from start and end of the signal
 
 seqvae_testing:
-  test_checkpoint_path: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
+  test_checkpoint_path: null
   
   # Test Analysis Configuration
   analysis_config:
@@ -101,8 +113,8 @@ advanced_config:
   # Memory Optimization
   memory:
     enable_memory_monitoring: false    # Enable memory monitoring callback
-    memory_threshold_gb: 20.0          # Memory threshold for cache clearing
-    memory_log_frequency: 200          # Frequency of memory logging
+    memory_threshold_gb: 60.0          # Memory threshold for cache clearing
+    memory_log_frequency: 500          # Frequency of memory logging
   
   # Callbacks Configuration
   callbacks:
@@ -113,7 +125,7 @@ advanced_config:
       min_delta: 0.0001               # Minimum change to qualify as improvement
     
     model_checkpoint:
-      monitor: "val/predictive_loss"  # Metric to monitor for best model
+      monitor: "val/total_loss"  # Metric to monitor for best model
       save_top_k: 3                   # Number of best models to keep
       mode: "min"                     # Minimize the monitored metric
     
