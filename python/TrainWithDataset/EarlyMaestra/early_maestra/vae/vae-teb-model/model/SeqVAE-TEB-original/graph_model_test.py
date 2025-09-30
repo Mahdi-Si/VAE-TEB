@@ -5,6 +5,8 @@ import sklearn.utils
 import time
 import sys
 import os
+import math
+from collections import defaultdict
 import yaml
 from matplotlib import pyplot as plt
 from tqdm import tqdm
@@ -54,8 +56,9 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         metrics_dir = os.path.join(self.test_results_dir, 'metrics_histograms')
         ablation_dir = os.path.join(self.test_results_dir, 'up_ablation')
         gain_sweep_dir = os.path.join(self.test_results_dir, 'up_gain_sweep')
+        latent_trajectory_dir = os.path.join(self.test_results_dir, 'latent_trajectory')
 
-        for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir]:
+        for d in [analysis_dir, te_shift_dir, metrics_dir, ablation_dir, gain_sweep_dir, latent_trajectory_dir]:
             os.makedirs(d, exist_ok=True)
 
         # Optional device selection for tests
@@ -110,6 +113,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         # Demonstrate information flow using UP ablation and gain sweep over whole dataset
         self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir)
         self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir)
+        self.plot_latent_representations_by_guid(test_loader=test_loader, output_dir=latent_trajectory_dir)
 
 
     def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None):
@@ -909,6 +913,152 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
             logger.info("UP ablation analysis complete.")
         except Exception as e:
             logger.warning(f"Failed to plot ablation analysis: {e}")
+
+
+    def plot_latent_representations_by_guid(self, test_loader, target_guids=None, output_dir=None):
+        """
+        Plot latent representations for each requested GUID ordered by epoch (seconds before birth).
+
+        Args:
+            test_loader (DataLoader): Source dataloader providing required tensors.
+            target_guids (str | Sequence[str]): GUID or GUIDs to visualize. If None, all GUIDs are used.
+            output_dir (str | None): Optional override for the output directory.
+        """
+        out_dir = output_dir or self.test_results_dir
+        os.makedirs(out_dir, exist_ok=True)
+
+        include_all_guids = target_guids is None
+
+        if isinstance(target_guids, str):
+            target_guids = [target_guids]
+
+        if target_guids is None:
+            target_guids = []
+
+        target_guids = [str(g).strip() for g in target_guids if g]
+        if not include_all_guids and not target_guids:
+            logger.warning('plot_latent_representations_by_guid: No valid GUIDs after filtering.')
+            return
+
+        target_guid_set = set(target_guids) if not include_all_guids else None
+        latent_by_guid = defaultdict(list)
+
+        def _normalize_guid(value):
+            if isinstance(value, bytes):
+                return value.decode('utf-8', errors='ignore')
+            return str(value)
+
+        self.create_model()
+        if self.pytorch_model is None:
+            logger.error('PyTorch model could not be created or loaded. Aborting latent plotting.')
+            return
+
+        device = torch.device(f"cuda:{self.cuda_devices[0]}" if self.cuda_devices and torch.cuda.is_available() else 'cpu')
+        model = self.pytorch_model.to(device)
+        model.eval()
+
+        with torch.inference_mode():
+            for batch in tqdm(test_loader, desc='Latent Epoch Collection'):
+                if not hasattr(batch, 'guid'):
+                    continue
+
+                raw_guids = batch.guid
+                try:
+                    if isinstance(raw_guids, (list, tuple)):
+                        guids_list = [_normalize_guid(g) for g in raw_guids]
+                    elif isinstance(raw_guids, torch.Tensor):
+                        guids_list = [_normalize_guid(g) for g in raw_guids.tolist()]
+                    elif isinstance(raw_guids, np.ndarray):
+                        guids_list = [_normalize_guid(g) for g in raw_guids.tolist()]
+                    else:
+                        guids_list = [_normalize_guid(raw_guids)]
+                except Exception:
+                    continue
+
+                if not guids_list:
+                    continue
+
+                epoch_data = getattr(batch, 'epoch', None)
+                if epoch_data is None:
+                    logger.error("plot_latent_representations_by_guid requires the dataset to provide an 'epoch' field.")
+                    return
+
+                if isinstance(epoch_data, torch.Tensor):
+                    epoch_list = epoch_data.detach().cpu().tolist()
+                elif isinstance(epoch_data, np.ndarray):
+                    epoch_list = epoch_data.tolist()
+                else:
+                    epoch_list = [float(e) for e in epoch_data]
+
+                if len(epoch_list) != len(guids_list):
+                    logger.warning('GUID and epoch counts do not match for the current batch; skipping.')
+                    continue
+
+                if target_guid_set is None:
+                    relevant_indices = list(range(len(guids_list)))
+                else:
+                    relevant_indices = [i for i, guid in enumerate(guids_list) if guid in target_guid_set]
+
+                if not relevant_indices:
+                    continue
+
+                if not all(hasattr(batch, attr) for attr in ('fhr_st', 'fhr_ph', 'fhr_up_ph')):
+                    logger.error('Required fields (fhr_st, fhr_ph, fhr_up_ph) missing from batch.')
+                    return
+
+                y_st = batch.fhr_st[relevant_indices].to(device)
+                y_ph = batch.fhr_ph[relevant_indices].to(device)
+                x_ph = batch.fhr_up_ph[relevant_indices].to(device)
+
+                outputs = model(y_st, y_ph, x_ph)
+                latent_batch = outputs['z'].detach().cpu()
+
+                for local_idx, batch_idx in enumerate(relevant_indices):
+                    guid = guids_list[batch_idx]
+                    epoch_val = float(epoch_list[batch_idx])
+                    latent_np = latent_batch[local_idx].numpy().T
+                    latent_by_guid[guid].append((epoch_val, latent_np))
+
+        if target_guid_set is None:
+            guids_to_plot = sorted(latent_by_guid.keys())
+        else:
+            guids_to_plot = target_guids
+
+        if not guids_to_plot:
+            logger.warning('plot_latent_representations_by_guid: No GUIDs found in test loader.')
+            return
+
+        for guid in guids_to_plot:
+            entries = latent_by_guid.get(guid, [])
+            if not entries:
+                logger.warning(f"No samples found for GUID {guid}; skipping latent plot.")
+                continue
+
+            entries.sort(key=lambda item: item[0])
+            num_epochs = len(entries)
+            rows = math.ceil(num_epochs / 3)
+            fig, axes = plt.subplots(rows, 3, figsize=(18, 4 * rows))
+            axes_flat = np.array(axes).reshape(-1)
+
+            for ax, (epoch_val, latent_np) in zip(axes_flat, entries):
+                ax.imshow(latent_np, aspect='auto', cmap='viridis')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_title(f'Epoch {epoch_val:.0f}s', fontsize=10)
+
+            for ax in axes_flat[num_epochs:]:
+                ax.axis('off')
+
+            fig.suptitle(guid, fontsize=14)
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+            safe_guid = guid.replace('/', '_').replace('\\', '_').replace(':', '_')
+            pdf_path = os.path.join(out_dir, f'{safe_guid}_latent_epochs.pdf')
+            fig.savefig(pdf_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+            plt.close(fig)
+
+            logger.info(f'Latent representations for GUID {guid} saved to: {pdf_path}')
+
 
     def run_up_gain_sweep_analysis(self, test_loader, gains=None, num_samples=None, output_dir=None, selected_guids=None):
         """Sweep multiplicative gains on UP features and track TE (KLD) and VAF trends.
