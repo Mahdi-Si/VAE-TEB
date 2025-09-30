@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Union, Dict, Any
+from typing import Tuple, Optional, Union, Dict, Any, Sequence
 
 import math
 from typing import List
@@ -25,6 +25,67 @@ setup_logging(
 # Now all logging goes through Loguru
 from loguru import logger as log
 import logging as std_logging
+
+try:
+    from torch._dynamo.eval_frame import OptimizedModule as _TorchOptimizedModule
+except Exception:
+    _TorchOptimizedModule = tuple()
+
+DEFAULT_COMPILE_ATTEMPTS: Tuple[Dict[str, Any], ...] = (
+    {
+        "mode": "max-autotune-no-cudagraphs",
+        "fullgraph": False,
+        "dynamic": True,
+    },
+    {
+        "mode": "reduce-overhead",
+        "fullgraph": False,
+        "dynamic": True,
+        "options": {"triton.cudagraphs": False},
+    },
+)
+
+def is_compiled_module(module: nn.Module) -> bool:
+    """Return True if `module` is already wrapped by torch.compile."""
+    if module is None:
+        return False
+    if hasattr(module, "_orig_mod"):
+        return True
+    try:
+        return isinstance(module, _TorchOptimizedModule) if _TorchOptimizedModule else False
+    except TypeError:
+        return False
+
+def ensure_compiled_module(
+    module: nn.Module,
+    *,
+    compile_flag: bool = True,
+    module_name: str = "module",
+    attempts: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Tuple[nn.Module, bool]:
+    """Wrap `module` with torch.compile using the provided attempts."""
+    if module is None:
+        return module, False
+    if not compile_flag:
+        return module, is_compiled_module(module)
+    if not hasattr(torch, "compile"):
+        log.warning(f"[{module_name}] torch.compile unavailable in this PyTorch build; running in eager mode")
+        return module, False
+    if is_compiled_module(module):
+        return module, True
+
+    compile_attempts = tuple(attempts) if attempts is not None else DEFAULT_COMPILE_ATTEMPTS
+    for opts in compile_attempts:
+        try:
+            compiled = torch.compile(module, **opts)
+            setattr(compiled, "_compile_options", opts)
+            log.info(f"[{module_name}] Compiled with torch.compile options={opts}")
+            return compiled, True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[{module_name}] torch.compile failed with options={opts}: {exc}")
+
+    log.warning(f"[{module_name}] Falling back to eager mode after all torch.compile attempts failed")
+    return module, False
 
 # -----------------------------------------------------------------------------
 # Shape conventions used throughout this module
@@ -1197,20 +1258,20 @@ class SeqVaeTeb(nn.Module):
         )
 
         if compile_model:
-            try:
-                model = torch.compile(
-                    model,
-                    mode=compile_mode,
-                    fullgraph=False,
-                    dynamic=True,
-                )
-                log.info(
-                    f"Compiled SeqVaeTeb with torch.compile mode={compile_mode}"
-                )
-            except Exception as exc:
-                log.warning(
-                    f"torch.compile failed for SeqVaeTeb legacy load: {exc}. Proceeding without compilation."
-                )
+            primary_attempt = {
+                "mode": compile_mode,
+                "fullgraph": False,
+                "dynamic": True,
+            }
+            attempt_chain = [primary_attempt]
+            for default_opts in DEFAULT_COMPILE_ATTEMPTS:
+                if default_opts != primary_attempt:
+                    attempt_chain.append(default_opts)
+            model, _ = ensure_compiled_module(
+                model,
+                module_name="SeqVaeTeb legacy load",
+                attempts=attempt_chain,
+            )
 
         return model
 
@@ -2284,11 +2345,20 @@ class SeqVaeTebClassifier(nn.Module):
             log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading classifier: {unexpected_keys}")
 
         if compile_model:
-            try:
-                model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=True)
-                log.info(f"Compiled SeqVaeTebClassifier with torch.compile mode={compile_mode}")
-            except Exception as e:
-                log.warning(f"torch.compile failed for classifier: {e}. Proceeding without compilation.")
+            primary_attempt = {
+                "mode": compile_mode,
+                "fullgraph": False,
+                "dynamic": True,
+            }
+            attempt_chain = [primary_attempt]
+            for default_opts in DEFAULT_COMPILE_ATTEMPTS:
+                if default_opts != primary_attempt:
+                    attempt_chain.append(default_opts)
+            model, _ = ensure_compiled_module(
+                model,
+                module_name="SeqVaeTebClassifier load",
+                attempts=attempt_chain,
+            )
 
         return model
 

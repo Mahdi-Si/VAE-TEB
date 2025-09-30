@@ -31,7 +31,11 @@ from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 from pytorch_lightning_modules import *
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-from vae_teb_model import SeqVaeTeb
+from vae_teb_model import (
+    SeqVaeTeb,
+    DEFAULT_COMPILE_ATTEMPTS,
+    ensure_compiled_module,
+)
 from pytorch_lightning_modules import LightSeqVaeTeb
 
 torch.backends.cudnn.benchmark = True
@@ -276,6 +280,7 @@ class SeqVAEGraphModel:
         self.loss_plot_callback = None
         self.metrics_callback = None
         self.lightning_base_model = None
+        self._skip_compilation = False
 
 
     def setup_config(self):
@@ -319,23 +324,10 @@ class SeqVAEGraphModel:
             logger.info(f"Loading model from checkpoint: {self.base_model_checkpoint}")
             logger.info("Config hyperparameters will OVERRIDE checkpoint hyperparameters")
 
-            compile_attempts = [
-                None,
-                {
-                    'mode': 'max-autotune-no-cudagraphs',
-                    'fullgraph': False,
-                    'dynamic': True,
-                },
-                {
-                    'mode': 'reduce-overhead',
-                    'fullgraph': False,
-                    'dynamic': True,
-                    'options': {'triton.cudagraphs': False}
-                },
-            ]
+            compile_attempts = [None]
+            compile_attempts.extend(DEFAULT_COMPILE_ATTEMPTS)
 
             load_success = False
-            loaded_with_precompile = False
             last_error: Optional[Exception] = None
 
             for compile_options in compile_attempts:
@@ -346,17 +338,15 @@ class SeqVAEGraphModel:
                 self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
 
                 if compile_options is not None:
-                    try:
-                        base_model_for_loading = torch.compile(base_model_for_loading, **compile_options)
-                        loaded_with_precompile = True
-                        logger.info(
-                            "Compiled base model prior to checkpoint load with options=%s",
-                            compile_options,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Pre-load compilation failed with options {compile_options}: {e}")
-                        loaded_with_precompile = False
+                    compiled_module, compiled_ok = ensure_compiled_module(
+                        base_model_for_loading,
+                        module_name="SeqVaeTeb preload",
+                        attempts=[compile_options],
+                    )
+                    if not compiled_ok:
+                        logger.warning(f"Pre-load compilation failed with options {compile_options}; retrying with next strategy")
                         continue
+                    base_model_for_loading = compiled_module
 
                 try:
                     logger.info("Loading Lightning checkpoint with strict architecture matching...")
@@ -390,26 +380,13 @@ class SeqVAEGraphModel:
                 self._enforce_lightning_hparams(self.lightning_base_model)
 
                 self.base_model = self.lightning_base_model.model
+                self.base_model, compiled_flag = ensure_compiled_module(
+                    self.base_model,
+                    module_name="SeqVaeTeb post-checkpoint",
+                )
+                self.lightning_base_model.model = self.base_model
+                self._skip_compilation = compiled_flag
                 self.pytorch_model = self.base_model
-
-                if hasattr(self.base_model, "_orig_mod") or loaded_with_precompile:
-                    self._skip_compilation = True
-                else:
-                    try:
-                        compile_options = {
-                            'mode': 'max-autotune-no-cudagraphs',
-                            'fullgraph': False,
-                            'dynamic': True,
-                        }
-                        compiled_model = torch.compile(self.base_model, **compile_options)
-                        self.base_model = compiled_model
-                        self.lightning_base_model.model = compiled_model
-                        self._skip_compilation = True
-                        logger.info("Compiled loaded SeqVaeTeb model post-checkpoint load")
-                    except Exception as e:
-                        logger.warning(f"Post-load compilation failed: {e}. Continuing with eager model.")
-                        self.lightning_base_model.model = self.base_model
-                        self._skip_compilation = False
 
                 logger.info("Successfully loaded checkpoint with CONFIG hyperparameters enforced.")
             else:
@@ -482,30 +459,44 @@ class SeqVAEGraphModel:
 
         self.base_model = base_model
         self._resolve_predictive_anchor_cap(getattr(self.base_model, 'sequence_length', 300))
-        if not hasattr(self, '_skip_compilation') or not self._skip_compilation:
+
+        # Apply robust compilation with fallback attempts (matching checkpoint loading logic)
+        compile_attempts = [None]
+        compile_attempts.extend(DEFAULT_COMPILE_ATTEMPTS)
+
+        compilation_success = False
+        last_error: Optional[Exception] = None
+
+        for compile_options in compile_attempts:
             try:
-                compile_options = {
-                    'mode': 'max-autotune-no-cudagraphs',
-                    'fullgraph': False,
-                    'dynamic': True,
-                }
-                self.base_model = torch.compile(self.base_model, **compile_options)
-                logger.info("Model successfully compiled with torch.compile (max-autotune-no-cudagraphs mode)")
-            except Exception as e:
-                logger.warning(f"max-autotune-no-cudagraphs compilation failed: {e}, trying reduce-overhead with disabled CUDA graphs...")
-                try:
-                    compile_options = {
-                        'mode': 'reduce-overhead',
-                        'fullgraph': False,
-                        'dynamic': True,
-                        'options': {'triton.cudagraphs': False}
-                    }
-                    self.base_model = torch.compile(self.base_model, **compile_options)
-                    logger.info("Model compiled with reduce-overhead mode (CUDA graphs disabled for DDP)")
-                except Exception as e2:
-                    logger.warning(f"All compilation failed, proceeding without compilation: {e2}")
-        else:
-            logger.info("Skipping compilation - model already compiled from checkpoint loading")
+                if compile_options is not None:
+                    # Try specific compilation options
+                    compiled_module, compiled_ok = ensure_compiled_module(
+                        self.base_model,
+                        module_name="SeqVaeTeb fresh init",
+                        attempts=[compile_options],
+                    )
+                    if compiled_ok:
+                        self.base_model = compiled_module
+                        compilation_success = True
+                        break
+                else:
+                    # Try default compilation
+                    self.base_model, compiled_flag = ensure_compiled_module(
+                        self.base_model,
+                        module_name="SeqVaeTeb fresh init",
+                    )
+                    compilation_success = compiled_flag
+                    break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Fresh model compilation failed with options={compile_options}: {exc}")
+
+        if not compilation_success:
+            logger.warning(f"All fresh model compilation attempts failed. Last error: {last_error}")
+            logger.warning("Proceeding with uncompiled model.")
+
+        self._skip_compilation = compilation_success
         
         self.lightning_base_model = LightSeqVaeTeb(
             seqvae_teb_model=self.base_model,
@@ -565,6 +556,38 @@ class SeqVAEGraphModel:
             {k: getattr(lightning_model.hparams, k, None) for k in enforce_map.keys()},
         )
 
+    def _validate_compilation_state(self) -> None:
+        """Validate that the model compilation state is correct and log status."""
+        if self.pytorch_model is None:
+            logger.error("Cannot validate compilation: pytorch_model is None")
+            return
+
+        from vae_teb_model import is_compiled_module
+
+        is_compiled = is_compiled_module(self.pytorch_model)
+        expected_compiled = self._skip_compilation
+
+        if is_compiled:
+            logger.info("✓ Model compilation validation: Model is compiled")
+            if hasattr(self.pytorch_model, '_compile_options'):
+                compile_opts = getattr(self.pytorch_model, '_compile_options', {})
+                logger.info(f"  Compilation options: {compile_opts}")
+        else:
+            logger.warning("⚠ Model compilation validation: Model is NOT compiled")
+            if expected_compiled:
+                logger.warning("  Expected compiled=True but found compiled=False")
+            else:
+                logger.info("  Running in eager mode (compilation was skipped/failed)")
+
+        # Validate Lightning model compilation state matches
+        if hasattr(self, 'lightning_base_model') and self.lightning_base_model is not None:
+            lightning_compiled = is_compiled_module(self.lightning_base_model.model)
+            if lightning_compiled != is_compiled:
+                logger.warning(
+                    f"⚠ Compilation state mismatch: pytorch_model compiled={is_compiled}, "
+                    f"lightning_model compiled={lightning_compiled}"
+                )
+
 
     def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
@@ -572,6 +595,11 @@ class SeqVAEGraphModel:
         self.load_checkpoint()
         if self.pytorch_model is not None:
             logger.info("Model created successfully with enforced config parameters")
+
+            # Validate compilation state
+            self._validate_compilation_state()
+        else:
+            logger.error("Failed to create model - pytorch_model is None")
 
     def set_cuda_devices(self, device_list=None):
         self.cuda_devices = device_list if device_list is not None else [0]

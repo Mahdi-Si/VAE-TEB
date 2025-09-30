@@ -10,7 +10,7 @@ import os
 import plotly.graph_objects as go
 from typing import Dict, Optional, Tuple
 
-from vae_teb_model import SeqVaeTeb
+from vae_teb_model import SeqVaeTeb, ensure_compiled_module
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -1353,6 +1353,16 @@ class LightSeqVaeTeb(L.LightningModule):
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
         self.model = seqvae_teb_model
+
+        # Only compile if not already compiled to avoid double compilation
+        if not is_compiled_module(self.model):
+            self.model, self._model_compiled = ensure_compiled_module(
+                self.model,
+                module_name="SeqVaeTeb Lightning wrapper",
+            )
+        else:
+            self._model_compiled = True
+            logger.info("[LightSeqVaeTeb] Model already compiled, skipping compilation")
 
     def forward(self, y_st, y_ph, x_ph):
         """Forward pass through the SeqVaeTeb model."""
