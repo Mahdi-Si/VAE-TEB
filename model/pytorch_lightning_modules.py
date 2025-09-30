@@ -111,6 +111,17 @@ class PlottingCallBack(Callback):
                     anchors=anchors,
                     epoch=pl_trainer.current_epoch,
                 )
+                self._plot_channel_forecasts(
+                    mu_post_sequence=enc.get("mu_post"),
+                    z_future=z_future,
+                    anchors=anchors,
+                    epoch=pl_trainer.current_epoch,
+                )
+                self._plot_latent_trajectory_analysis(
+                    mu_post_sequence=enc.get("mu_post"),
+                    mu_prior_sequence=enc.get("mu_prior"),
+                    epoch=pl_trainer.current_epoch,
+                )
 
                 self._plot_latent_statistics(
                     mu_prior=mu_prior_full if mu_prior_full is not None else enc.get("mu_prior"),
@@ -457,6 +468,216 @@ class PlottingCallBack(Callback):
         gc.collect()
         logger.info(f"Latent forecast comparison saved to {save_path}")
 
+    def _plot_channel_forecasts(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        z_future: Optional[torch.Tensor],
+        anchors: Optional[torch.Tensor],
+        epoch: int,
+    ) -> None:
+        """Plot per-dimension latent trajectories for specific anchors (75 and 224)."""
+        import os
+        import gc
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if mu_post_sequence is None or z_future is None or anchors is None or anchors.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+            z_future_np = z_future[batch_idx].detach().cpu().numpy()
+            anchors_np = anchors.detach().cpu().numpy().astype(int)
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2 or z_future_np.ndim != 3:
+            return
+
+        horizon = z_future_np.shape[1]
+        latent_dim = z_future_np.shape[2]
+        desired_anchors = [75, 224]
+        anchor_pairs = []
+        for anchor_val in desired_anchors:
+            if anchor_val in anchors_np:
+                idx_anchor = int(np.where(anchors_np == anchor_val)[0][0])
+                start = anchor_val + 1
+                end = start + horizon
+                if end <= mu_post_np.shape[0]:
+                    anchor_pairs.append((anchor_val, mu_post_np[start:end], z_future_np[idx_anchor]))
+
+        if len(anchor_pairs) != len(desired_anchors):
+            return
+
+        fig, axes = plt.subplots(
+            latent_dim,
+            len(anchor_pairs),
+            figsize=(len(anchor_pairs) * 5.5, latent_dim * 1.6),
+            sharex=True,
+            constrained_layout=True,
+        )
+        if latent_dim == 1:
+            axes = axes.reshape(1, -1)
+
+        time_axis = np.arange(horizon)
+        colors = {
+            'gt': '#2E86AB',
+            'pred': '#BB3E00',
+        }
+
+        for col, (anchor_val, gt, pred) in enumerate(anchor_pairs):
+            for row in range(latent_dim):
+                ax = axes[row, col]
+                ax.plot(time_axis, gt[:, row], color=colors['gt'], linewidth=1.2, label='GT')
+                ax.plot(time_axis, pred[:, row], color=colors['pred'], linewidth=1.0, linestyle='--', label='Forecast')
+                ax.grid(True, alpha=0.3)
+                if row == 0:
+                    ax.set_title(f'Anchor {anchor_val}')
+                if col == 0:
+                    ax.set_ylabel(f'Latent {row}')
+                if row == latent_dim - 1:
+                    ax.set_xlabel('Forecast step')
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc='upper center', ncol=2)
+
+        save_path = os.path.join(self.output_dir, f'latent_forecast_channels_epoch_{epoch}.pdf')
+        fig.suptitle(f'Per-channel Latent Forecasts - Epoch {epoch}', fontsize=14, color='#456882')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Latent forecast per-channel plot saved to {save_path}")
+    def _plot_latent_trajectory_analysis(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        mu_prior_sequence: Optional[torch.Tensor],
+        epoch: int,
+    ) -> None:
+        """Comprehensive latent trajectory diagnostics for a single validation sample."""
+        import os
+        import gc
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if mu_post_sequence is None or mu_post_sequence.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2:
+            return
+
+        prior_np = None
+        if mu_prior_sequence is not None:
+            try:
+                prior_np = mu_prior_sequence[batch_idx].detach().cpu().numpy()
+                if prior_np.ndim != 2 or prior_np.shape != mu_post_np.shape:
+                    prior_np = None
+            except Exception:
+                prior_np = None
+
+        time_axis = np.arange(mu_post_np.shape[0])
+        latent_dim = mu_post_np.shape[1]
+        if latent_dim == 0:
+            return
+
+        if prior_np is not None:
+            delta_np = mu_post_np - prior_np
+            ranking_signal = delta_np.var(axis=0)
+        else:
+            delta_np = None
+            ranking_signal = mu_post_np.var(axis=0)
+        order = np.argsort(ranking_signal)[::-1]
+        top_k = int(min(latent_dim, 8))
+        total_rows = top_k + 1
+
+        fig, axes = plt.subplots(
+            total_rows,
+            2,
+            figsize=(12, 2.2 * total_rows),
+            constrained_layout=True,
+        )
+        axes = np.asarray(axes)
+
+        colors = {'posterior': '#1f77b4', 'prior': '#ff7f0e', 'delta': '#2ca02c'}
+        legend_handles = []
+        legend_labels = []
+
+        for row, dim in enumerate(order[:top_k]):
+            ax_left = axes[row, 0]
+            line_post, = ax_left.plot(time_axis, mu_post_np[:, dim], color=colors['posterior'], linewidth=1.2, label='mu_post')
+            if 'mu_post' not in legend_labels:
+                legend_handles.append(line_post)
+                legend_labels.append('mu_post')
+            if prior_np is not None:
+                line_prior, = ax_left.plot(time_axis, prior_np[:, dim], color=colors['prior'], linewidth=1.0, linestyle='--', label='mu_prior')
+                if 'mu_prior' not in legend_labels:
+                    legend_handles.append(line_prior)
+                    legend_labels.append('mu_prior')
+            ax_left.grid(True, alpha=0.3)
+            if row == 0:
+                ax_left.set_title('Latent trajectory')
+            if row == top_k - 1:
+                ax_left.set_xlabel('Decimated step')
+            ax_left.set_ylabel(f'z[{dim}]')
+
+            ax_right = axes[row, 1]
+            if delta_np is not None:
+                line_delta, = ax_right.plot(time_axis, delta_np[:, dim], color=colors['delta'], linewidth=1.2, label='delta')
+                if row == 0:
+                    ax_right.set_title('Delta (mu_post - mu_prior)')
+            else:
+                centered = mu_post_np[:, dim] - mu_post_np[:, dim].mean()
+                line_delta, = ax_right.plot(time_axis, centered, color=colors['delta'], linewidth=1.2, label='delta')
+                if row == 0:
+                    ax_right.set_title('Centered trajectory')
+            if 'delta' not in legend_labels:
+                legend_handles.append(line_delta)
+                legend_labels.append('delta')
+            ax_right.grid(True, alpha=0.3)
+            if row == top_k - 1:
+                ax_right.set_xlabel('Decimated step')
+
+        energy = np.sum(mu_post_np ** 2, axis=0)
+        summary_ax = axes[top_k, 0]
+        summary_ax.bar(np.arange(latent_dim), energy, color='#345995')
+        summary_ax.set_title('Posterior energy per latent')
+        summary_ax.set_xlabel('Latent dim')
+        summary_ax.set_ylabel('Energy')
+        summary_ax.grid(True, axis='y', alpha=0.3)
+
+        heat_ax = axes[top_k, 1]
+        heat_data = mu_post_np[:, order[:top_k]].T
+        im = heat_ax.imshow(heat_data, aspect='auto', origin='lower', cmap='RdBu_r')
+        heat_ax.set_title('Posterior heatmap (top dims)')
+        heat_ax.set_xlabel('Decimated step')
+        heat_ax.set_yticks(range(top_k))
+        heat_ax.set_yticklabels([f'z[{dim}]' for dim in order[:top_k]])
+        fig.colorbar(im, ax=heat_ax, fraction=0.046, pad=0.04, label='Activation')
+
+        if legend_handles:
+            fig.legend(legend_handles, legend_labels, loc='upper center', ncol=len(legend_handles))
+
+        overall_energy = float(np.linalg.norm(mu_post_np))
+        if delta_np is not None:
+            delta_energy = float(np.linalg.norm(delta_np))
+            stats_text = f'||mu_post||_2={overall_energy:.2f}  |  ||delta||_2={delta_energy:.2f}'
+        else:
+            stats_text = f'||mu_post||_2={overall_energy:.2f}'
+
+        save_path = os.path.join(self.output_dir, f'latent_trajectory_analysis_epoch_{epoch}.pdf')
+        fig.suptitle(f'Latent Trajectory Analysis - Epoch {epoch}\n{stats_text}', fontsize=14, color='#456882')
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f'Latent trajectory analysis plot saved to {save_path}')
+
     def _plot_latent_statistics(
         self,
         mu_prior: Optional[torch.Tensor],
@@ -657,7 +878,7 @@ class PlottingCallBack(Callback):
         ax[0, 1].set_axis_off()
         ax[0, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9)
         ax[0, 0].plot(t_in, pred_mean, linewidth=1.2, color='#BB3E00', label='Forecast (mean)', alpha=0.9)
-        ax[0, 0].fill_between(t_in, pred_mean - pred_std, pred_mean + pred_std, alpha=0.3, color=colors['uncertainty'], label='±1σ')
+        ax[0, 0].fill_between(t_in, pred_mean - pred_std, pred_mean + pred_std, alpha=0.3, color=colors['uncertainty'], label='Ã‚Â±1ÃÆ’')
         ax[0, 0].set_ylabel('FHR (bpm)')
         ax[0, 0].set_title('Raw FHR vs Aggregated Forecast')
         ax[0, 0].legend(loc='upper right', framealpha=0.95)
@@ -689,7 +910,7 @@ class PlottingCallBack(Callback):
             cbar.outline.set_linewidth(0.7)
             ax[2, 0].set_ylabel('Latent Dimensions')
             ax[2, 0].set_xlabel('Decimated steps')
-            ax[2, 0].set_title('Latent μ_post (T×D)')
+            ax[2, 0].set_title('Latent ÃŽÂ¼_post (TÃƒâ€”D)')
         else:
             ax[2, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center')
         
@@ -699,7 +920,7 @@ class PlottingCallBack(Callback):
             f"MSE={sample_mse:.4f} | MAE={sample_mae:.4f} | Corr={sample_corr:.4f} | Cov={coverage_display}"
         )
         fig.suptitle(
-            f'Forecasting Results – Epoch {epoch}\n{diag_str}',
+            f'Forecasting Results Ã¢â‚¬â€œ Epoch {epoch}\n{diag_str}',
             fontsize=14,
             fontweight='normal',
             y=0.98,
@@ -759,7 +980,7 @@ class PlottingCallBack(Callback):
         fig, ax = plt.subplots(1, 1, figsize=(16, 4.5), constrained_layout=True)
         ax.plot(t, gm, color='#2E86AB', label='GT (batch mean)', linewidth=1.5)
         ax.plot(t, pm, color='#BB3E00', label='Forecast (batch mean)', linewidth=1.2)
-        ax.fill_between(t, pm - ps, pm + ps, color='#F5B7B1', alpha=0.4, label='±1σ (total)')
+        ax.fill_between(t, pm - ps, pm + ps, color='#F5B7B1', alpha=0.4, label='Ã‚Â±1ÃÆ’ (total)')
         ax.set_title('Batch-Aggregated Forecast vs Ground Truth')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('FHR (bpm)')
@@ -992,7 +1213,7 @@ class HyperparameterLoggingCallback(Callback):
             
             # LightningModule handles logging; callback only tracks history
             
-            logger.info(f"Epoch {epoch}: β={beta:.4f}, lr={lr:.6f}")
+            logger.info(f"Epoch {epoch}: ÃŽÂ²={beta:.4f}, lr={lr:.6f}")
 
     def plot_hyperparameters(self, output_dir):
         """Create a plot of hyperparameter evolution"""
@@ -1074,7 +1295,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
     This module handles the training, validation, and optimization loops,
     including learning rate scheduling and KLD beta annealing.
-    Supports both standard TEB and β-TCVAE training modes.
+    Supports both standard TEB and ÃŽÂ²-TCVAE training modes.
     """
 
     def __init__(
@@ -1179,14 +1400,14 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def _validate_hyperparameters(self):
         """Validate that hyperparameters are correctly set from config."""
-        logger.info("🔍 Validating hyperparameters...")
+        logger.info("Ã°Å¸â€Â Validating hyperparameters...")
         logger.info(f"  Current beta_schedule: {self.hparams.beta_schedule}")
         logger.info(f"  Current beta_const_val: {self.hparams.beta_const_val}")
         logger.info(f"  Current beta_start: {self.hparams.beta_start}")
         logger.info(f"  Current beta_end: {self.hparams.beta_end}")
         logger.info(f"  Current lr: {self.hparams.lr}")
         logger.info(f"  Current lr_milestones: {self.hparams.lr_milestones}")
-        logger.info("✅ Hyperparameter validation complete")
+        logger.info("Ã¢Å“â€¦ Hyperparameter validation complete")
 
     def _compute_forecast_metrics(
         self,
@@ -1349,7 +1570,7 @@ class LightSeqVaeTeb(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=1e-4,     # L2 regularization
             eps=1e-8,              # Numerical stability
-            betas=(0.9, 0.95),     # SOTA: Slightly higher β2 for better convergence
+            betas=(0.9, 0.95),     # SOTA: Slightly higher ÃŽÂ²2 for better convergence
             amsgrad=False,         # Standard AdamW
             # foreach=True,          # SOTA: Vectorized optimizer updates (faster)
             maximize=False,
