@@ -1698,9 +1698,11 @@ class LatentTrajectoryAnalyzer:
     def _generate_plots(self) -> None:
         plotting_cfg = self.config.get("plotting", {})
         if self.latents_with_dyn is None or self.latents_with_dyn.empty:
+            logger.info("Skipping plot generation; no latent dynamics available.")
             return
         signals = self._select_signals_for_plots()
         if not signals:
+            logger.info("Skipping plot generation; no signals selected.")
             return
         prefer_embeddings = plotting_cfg.get("prefer_embeddings", ["pca", "umap", "tsne"])
         color_by = plotting_cfg.get("color_by", "te")
@@ -1712,6 +1714,16 @@ class LatentTrajectoryAnalyzer:
         recurrence_dir = ensure_dir(self.plots_dir / "recurrence")
         stitched_dir = ensure_dir(self.plots_dir / "per_signal")
         class_dir = ensure_dir(self.plots_dir / "classes")
+        plot_counts: Dict[str, int] = defaultdict(int)
+        skip_counts: Dict[str, int] = defaultdict(int)
+        embeddings_note = ",".join(sorted(self.reduction_frames.keys())) or "<none>"
+        logger.info(
+            "Generating latent plots | signals=%d | embeddings=%s | output=%s",
+            len(signals),
+            embeddings_note,
+            self.plots_dir,
+        )
+        logger.debug("Signals selected for plotting: %s", signals)
         for emb_name, df_emb in self.reduction_frames.items():
             if emb_name not in prefer_embeddings:
                 continue
@@ -1724,15 +1736,19 @@ class LatentTrajectoryAnalyzer:
             else:
                 xcol = ycol = None
             if not xcol or xcol not in df_emb or ycol not in df_emb:
+                skip_counts[f"missing_embedding_{emb_name}"] += 1
                 continue
             for signal in signals:
                 epochs = (
                     df_emb[df_emb.signal_id == signal]["epoch_idx"].drop_duplicates().sort_values().tolist()
                 )
+                if not epochs:
+                    skip_counts["empty_signal"] += 1
+                    continue
                 for epoch in epochs[:max_epochs]:
                     epoch_path = latent_dir / emb_name / signal
                     ensure_dir(epoch_path)
-                    plot_epoch_trajectory(
+                    if plot_epoch_trajectory(
                         df_emb,
                         signal_id=signal,
                         epoch_idx=epoch,
@@ -1740,50 +1756,65 @@ class LatentTrajectoryAnalyzer:
                         ycol=ycol,
                         color_by=color_by,
                         save_path=epoch_path / f"epoch_{epoch}.png",
-                    )
+                    ):
+                        plot_counts["epoch"] += 1
+                    else:
+                        skip_counts["epoch"] += 1
                     if plotting_cfg.get("dynamics_curves", True):
                         dyn_path = dynamics_dir / signal
                         ensure_dir(dyn_path)
-                        plot_dynamics(
+                        if plot_dynamics(
                             self.latents_with_dyn,
                             signal_id=signal,
                             epoch_idx=epoch,
                             save_path_speed=dyn_path / f"speed_epoch_{epoch}.png",
                             save_path_accel=dyn_path / f"accel_epoch_{epoch}.png",
-                        )
+                        ):
+                            plot_counts["dynamics"] += 1
+                        else:
+                            skip_counts["dynamics"] += 1
                     if plotting_cfg.get("uncertainty_path", True):
                         un_path = uncertainty_dir / emb_name / signal
                         ensure_dir(un_path)
-                        plot_uncertainty_path(
+                        if plot_uncertainty_path(
                             df_emb,
                             signal_id=signal,
                             epoch_idx=epoch,
                             xcol=xcol,
                             ycol=ycol,
                             save_path=un_path / f"unc_epoch_{epoch}.png",
-                        )
+                        ):
+                            plot_counts["uncertainty"] += 1
+                        else:
+                            skip_counts["uncertainty"] += 1
                     if plotting_cfg.get("recurrence", True):
                         rec_path = recurrence_dir / signal
                         ensure_dir(rec_path)
-                        plot_recurrence(
+                        if plot_recurrence(
                             self.latents_df,
                             signal_id=signal,
                             epoch_idx=epoch,
                             latent_dim=self.latent_dim,
                             save_path=rec_path / f"rec_epoch_{epoch}.png",
-                        )
+                        ):
+                            plot_counts["recurrence"] += 1
+                        else:
+                            skip_counts["recurrence"] += 1
                 stitched_path = stitched_dir / emb_name
                 ensure_dir(stitched_path)
-                plot_signal_epochs(
+                if plot_signal_epochs(
                     df_emb,
                     signal_id=signal,
                     xcol=xcol,
                     ycol=ycol,
                     save_path=stitched_path / f"{signal}.png",
-                )
+                ):
+                    plot_counts["per_signal"] += 1
+                else:
+                    skip_counts["per_signal"] += 1
                 if guid_cfg.get("enabled", True) and guid_cfg.get("embedding", "pca") == emb_name:
                     guid_path = ensure_dir(self.plots_dir / "per_guid_absolute" / emb_name)
-                    plot_guid_absolute_trajectory(
+                    if plot_guid_absolute_trajectory(
                         df_emb,
                         signal_id=signal,
                         xcol=xcol,
@@ -1791,12 +1822,15 @@ class LatentTrajectoryAnalyzer:
                         color_by=guid_cfg.get("color_by", "t_abs_s"),
                         show_epoch_boundaries=guid_cfg.get("show_epoch_boundaries", True),
                         save_path=guid_path / f"{signal}.png",
-                    )
+                    ):
+                        plot_counts["guid_absolute"] += 1
+                    else:
+                        skip_counts["guid_absolute"] += 1
                     ts_cfg = guid_cfg.get("time_series", {})
                     if ts_cfg.get("enabled", True):
                         dims = ts_cfg.get("include_dims", [xcol, ycol])
                         guid_ts_path = ensure_dir(self.plots_dir / "per_guid_time_series")
-                        plot_guid_time_series(
+                        if plot_guid_time_series(
                             self.latents_with_dyn,
                             df_emb,
                             signal_id=signal,
@@ -1804,25 +1838,38 @@ class LatentTrajectoryAnalyzer:
                             show_speed=ts_cfg.get("include_speed", True),
                             show_te=ts_cfg.get("include_te", True),
                             save_path=guid_ts_path / f"{signal}.png",
-                        )
+                        ):
+                            plot_counts["guid_time_series"] += 1
+                        else:
+                            skip_counts["guid_time_series"] += 1
             vect_cfg = plotting_cfg.get("vector_field", {})
             if vect_cfg.get("enabled", True) and vect_cfg.get("embedding", "pca") == emb_name:
                 vf_path = ensure_dir(self.plots_dir / "vector_field")
-                plot_vector_field(
+                if plot_vector_field(
                     df_emb,
                     xcol=xcol,
                     ycol=ycol,
                     grid=vect_cfg.get("grid_size", 30),
                     neighbors=vect_cfg.get("neighbors", 20),
                     save_path=vf_path / f"vector_field_{emb_name}.png",
-                )
+                ):
+                    plot_counts["vector_field"] += 1
+                else:
+                    skip_counts["vector_field"] += 1
             if "label" in df_emb:
-                plot_class_scatter(
+                if plot_class_scatter(
                     df_emb,
                     xcol=xcol,
                     ycol=ycol,
                     save_path=class_dir / f"class_scatter_{emb_name}.png",
-                )
+                ):
+                    plot_counts["class_scatter"] += 1
+                else:
+                    skip_counts["class_scatter"] += 1
+        if plot_counts:
+            logger.info("Plot summary: %s", dict(sorted(plot_counts.items())))
+        if skip_counts:
+            logger.debug("Skipped plot requests: %s", dict(sorted(skip_counts.items())))
         zcols = [f"z{i}" for i in range(self.latent_dim) if f"z{i}" in self.latents_with_dyn.columns]
         if zcols:
             kmeans_cfg = plotting_cfg.get("kmeans_states", {})
