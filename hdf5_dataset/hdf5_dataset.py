@@ -764,6 +764,10 @@ class CombinedHDF5Dataset(Dataset):
             warnings.warn(f"Error loading sample {idx} from {self.paths[file_idx]}: {e}")
             raise
         
+        out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
+        out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))
+        out.setdefault('source_file_index', file_idx)
+
         sample = AttributeDict(out)
 
         # Cache management
