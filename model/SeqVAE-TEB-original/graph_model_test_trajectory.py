@@ -13,7 +13,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -397,19 +396,28 @@ def add_dynamics(df: pd.DataFrame, latent_dim: int = 16) -> pd.DataFrame:
         g["accel"] = np.linalg.norm(d2, axis=1)
         max_t = float(g["t_in_epoch"].max()) if len(g) else 0.0
         g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
-        g["signal_id"] = group["signal_id"].iloc[0] if "signal_id" in group else None
-        g["epoch_idx"] = group["epoch_idx"].iloc[0] if "epoch_idx" in group else None
+        # Note: signal_id and epoch_idx are preserved from the group automatically
+        # when include_groups=True or without include_groups parameter
         return g
 
     grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
-    try:
-        result = grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
-    except TypeError:
-        result = grouped.apply(_one_epoch)
+    # Don't use include_groups=False as it drops groupby columns even if explicitly set
+    result = grouped.apply(_one_epoch)
+
+    # Reset index to ensure signal_id and epoch_idx are preserved as columns
     if isinstance(result.index, pd.MultiIndex):
-        result = result.reset_index(drop=True)
+        result = result.reset_index(drop=False)
     else:
         result = result.reset_index(drop=True)
+
+    # Ensure signal_id and epoch_idx are present
+    if "signal_id" not in result.columns and "signal_id" in df.columns:
+        # Reconstruct from index if needed
+        if isinstance(df.index, pd.MultiIndex):
+            result["signal_id"] = result.index.get_level_values(0)
+            result["epoch_idx"] = result.index.get_level_values(1)
+            result = result.reset_index(drop=True)
+
     return result
 
 
