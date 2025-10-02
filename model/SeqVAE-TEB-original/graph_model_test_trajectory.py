@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import time
+import importlib.util
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -67,13 +68,29 @@ except ImportError:  # pragma: no cover - optional dependency
     rpt = None
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-from model.graph_model_train import SeqVAEGraphModel
 
 plt.switch_backend("Agg")
 
 LATENT_STEP_SECONDS = 4.0
 EPS = 1e-9
 DEFAULT_CLASS_NAMES = ["class_0", "class_1", "class_2"]
+
+
+
+def _load_seqvae_graph_model():
+    module_name = "seqvae_teb_graph_model_train"
+    module_path = Path(__file__).resolve().parent / "graph_model_train.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load SeqVAE graph model from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
+
+_graph_model_module = _load_seqvae_graph_model()
+SeqVAEGraphModel = getattr(_graph_model_module, "SeqVAEGraphModel")
+
 
 DEFAULT_ANALYSIS_CONFIG: Dict[str, Any] = {
     "enabled": True,
