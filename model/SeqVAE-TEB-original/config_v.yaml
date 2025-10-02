@@ -101,6 +101,10 @@ latent_analysis:
     save_parquet: true
     save_csv: false
     compression: snappy
+  performance:
+    forward_chunk_size: 128
+    use_amp: true
+    amp_dtype: float16
   reducers:
     pca:
       enabled: true
