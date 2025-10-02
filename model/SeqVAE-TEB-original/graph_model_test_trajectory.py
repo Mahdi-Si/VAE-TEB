@@ -1190,14 +1190,23 @@ class LatentTrajectoryAnalyzer:
         use_amp = self.use_amp and device.type == "cuda"
         max_sequences_reached = False
 
+        key_y_st = self.keys.get("y_st") or "fhr_st"
+        key_y_ph = self.keys.get("y_ph") or "fhr_ph"
+        key_x_ph = self.keys.get("x_ph") or "fhr_up_ph"
+        key_signal = self.keys.get("signal_id") or "guid"
+        key_epoch = self.keys.get("epoch_idx") or "epoch"
+        key_label = self.keys.get("label") or "target"
+        key_t0 = self.keys.get("t0")
+        key_source = self.keys.get("source_file") or "source_file"
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Collecting latents")):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
-                y_st_src = getattr(batch, self.keys.get("y_st", "fhr_st"))
-                y_ph_src = getattr(batch, self.keys.get("y_ph", "fhr_ph"))
-                x_ph_src = getattr(batch, self.keys.get("x_ph", "fhr_up_ph"))
+                y_st_src = getattr(batch, key_y_st, None)
+                y_ph_src = getattr(batch, key_y_ph, None)
+                x_ph_src = getattr(batch, key_x_ph, None)
 
                 if y_st_src is None or y_ph_src is None or x_ph_src is None:
                     continue
@@ -1206,11 +1215,12 @@ class LatentTrajectoryAnalyzer:
                 if B_total == 0:
                     continue
 
-                signal_ids = tensor_list_from_batch(getattr(batch, self.keys.get("signal_id", "guid"), None), B_total)
-                epoch_vals = tensor_list_from_batch(getattr(batch, self.keys.get("epoch_idx", "epoch"), None), B_total)
-                labels_raw = tensor_list_from_batch(getattr(batch, self.keys.get("label"), None), B_total)
-                t0_vals = tensor_list_from_batch(getattr(batch, self.keys.get("t0"), None), B_total)
-                source_list = tensor_list_from_batch(getattr(batch, self.keys.get("source_file", "source_file"), None), B_total)
+                signal_ids = tensor_list_from_batch(getattr(batch, key_signal, None), B_total)
+                epoch_vals = tensor_list_from_batch(getattr(batch, key_epoch, None), B_total)
+                labels_raw = tensor_list_from_batch(getattr(batch, key_label, None), B_total)
+                t0_attr = getattr(batch, key_t0, None) if key_t0 else None
+                t0_vals = tensor_list_from_batch(t0_attr, B_total)
+                source_list = tensor_list_from_batch(getattr(batch, key_source, None), B_total)
 
                 chunk_size = self.forward_chunk_size or B_total
                 chunk_size = max(1, min(chunk_size, B_total))
