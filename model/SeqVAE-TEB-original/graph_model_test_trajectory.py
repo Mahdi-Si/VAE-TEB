@@ -388,30 +388,29 @@ def add_dynamics(df: pd.DataFrame, latent_dim: int = 16) -> pd.DataFrame:
     if not zcols:
         return df
 
+    def _one_epoch(group: pd.DataFrame) -> pd.DataFrame:
+        g = group.sort_values("t_in_epoch").copy()
+        Z = g[zcols].to_numpy()
+        d1 = np.diff(Z, axis=0, prepend=Z[[0]])
+        d2 = np.diff(d1, axis=0, prepend=d1[[0]])
+        g["speed"] = np.linalg.norm(d1, axis=1)
+        g["accel"] = np.linalg.norm(d2, axis=1)
+        max_t = float(g["t_in_epoch"].max()) if len(g) else 0.0
+        g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
+        g["signal_id"] = group["signal_id"].iloc[0] if "signal_id" in group else None
+        g["epoch_idx"] = group["epoch_idx"].iloc[0] if "epoch_idx" in group else None
+        return g
 
-def _one_epoch(group: pd.DataFrame) -> pd.DataFrame:
-    g = group.sort_values("t_in_epoch").copy()
-    Z = g[zcols].to_numpy()
-    d1 = np.diff(Z, axis=0, prepend=Z[[0]])
-    d2 = np.diff(d1, axis=0, prepend=d1[[0]])
-    g["speed"] = np.linalg.norm(d1, axis=1)
-    g["accel"] = np.linalg.norm(d2, axis=1)
-    max_t = float(g["t_in_epoch"].max()) if len(g) else 0.0
-    g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
-    g["signal_id"] = group["signal_id"].iloc[0] if "signal_id" in group else None
-    g["epoch_idx"] = group["epoch_idx"].iloc[0] if "epoch_idx" in group else None
-    return g
-
-grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
-try:
-    result = grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
-except TypeError:
-    result = grouped.apply(_one_epoch)
-if isinstance(result.index, pd.MultiIndex):
-    result = result.reset_index(drop=True)
-else:
-    result = result.reset_index(drop=True)
-return result
+    grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
+    try:
+        result = grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
+    except TypeError:
+        result = grouped.apply(_one_epoch)
+    if isinstance(result.index, pd.MultiIndex):
+        result = result.reset_index(drop=True)
+    else:
+        result = result.reset_index(drop=True)
+    return result
 
 
 def summarize_epoch(df_epoch: pd.DataFrame, latent_dim: int = 16) -> Dict[str, float]:
