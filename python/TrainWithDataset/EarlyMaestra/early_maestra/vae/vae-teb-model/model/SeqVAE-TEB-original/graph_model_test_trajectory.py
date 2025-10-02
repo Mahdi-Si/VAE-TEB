@@ -78,8 +78,6 @@ LATENT_STEP_SECONDS = 4.0
 EPS = 1e-9
 DEFAULT_CLASS_NAMES = ["class_0", "class_1", "class_2"]
 
-
-
 def _load_seqvae_graph_model():
     module_name = "seqvae_teb_graph_model_train"
     module_path = Path(__file__).resolve().parent / "graph_model_train.py"
@@ -390,23 +388,30 @@ def add_dynamics(df: pd.DataFrame, latent_dim: int = 16) -> pd.DataFrame:
     if not zcols:
         return df
 
-    def _one_epoch(group: pd.DataFrame) -> pd.DataFrame:
-        g = group.sort_values("t_in_epoch").copy()
-        Z = g[zcols].to_numpy()
-        d1 = np.diff(Z, axis=0, prepend=Z[[0]])
-        d2 = np.diff(d1, axis=0, prepend=d1[[0]])
-        g["speed"] = np.linalg.norm(d1, axis=1)
-        g["accel"] = np.linalg.norm(d2, axis=1)
-        max_t = float(g["t_in_epoch"].max()) if len(g) else 0.0
-        g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
-        return g
 
+def _one_epoch(group: pd.DataFrame) -> pd.DataFrame:
+    g = group.sort_values("t_in_epoch").copy()
+    Z = g[zcols].to_numpy()
+    d1 = np.diff(Z, axis=0, prepend=Z[[0]])
+    d2 = np.diff(d1, axis=0, prepend=d1[[0]])
+    g["speed"] = np.linalg.norm(d1, axis=1)
+    g["accel"] = np.linalg.norm(d2, axis=1)
+    max_t = float(g["t_in_epoch"].max()) if len(g) else 0.0
+    g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
+    g["signal_id"] = group["signal_id"].iloc[0] if "signal_id" in group else None
+    g["epoch_idx"] = group["epoch_idx"].iloc[0] if "epoch_idx" in group else None
+    return g
 
-    grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
-    try:
-        return grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
-    except TypeError:
-        return grouped.apply(_one_epoch)
+grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
+try:
+    result = grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
+except TypeError:
+    result = grouped.apply(_one_epoch)
+if isinstance(result.index, pd.MultiIndex):
+    result = result.reset_index(drop=True)
+else:
+    result = result.reset_index(drop=True)
+return result
 
 
 def summarize_epoch(df_epoch: pd.DataFrame, latent_dim: int = 16) -> Dict[str, float]:
@@ -437,7 +442,10 @@ def summarize_all_epochs(df: pd.DataFrame, latent_dim: int = 16) -> pd.DataFrame
     rows = []
     for (sid, eidx), group in df.groupby(["signal_id", "epoch_idx"]):
         s = summarize_epoch(group, latent_dim)
-        s.update(signal_id=sid, epoch_idx=eidx, label=group["label"].iloc[0], label_idx=group.get("label_idx", pd.Series(dtype=float)).iloc[0] if "label_idx" in group else np.nan)
+        label_value = group["label"].iloc[0] if "label" in group else None
+        label_idx_series = group["label_idx"] if "label_idx" in group else pd.Series([np.nan])
+        label_idx_value = float(label_idx_series.iloc[0]) if not label_idx_series.empty else float("nan")
+        s.update(signal_id=sid, epoch_idx=eidx, label=label_value, label_idx=label_idx_value)
         rows.append(s)
     return pd.DataFrame(rows)
 
@@ -821,8 +829,6 @@ def plot_guid_time_series(
     plt.close(fig)
     return True
 
-
-
 def plot_guid_absolute_trajectory(
     df_emb: pd.DataFrame,
     *,
@@ -880,8 +886,6 @@ def plot_guid_absolute_trajectory(
     fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return True
-
-
 
 
 
@@ -1067,6 +1071,15 @@ class LatentTrajectoryAnalyzer:
         self.dataloader = dataloader
         self.output_dir = ensure_dir(output_dir)
         self.config = merge_analysis_config(config)
+
+        # Validate latent_dim consistency
+        config_latent_dim = self.config.get("latent_dim", latent_dim)
+        if config_latent_dim != latent_dim:
+            logger.warning(
+                f"Config latent_dim ({config_latent_dim}) differs from model latent_dim ({latent_dim}). "
+                f"Using model latent_dim={latent_dim}."
+            )
+            self.config["latent_dim"] = latent_dim
         self.latent_dim = latent_dim
         self.keys = self.config.get("keys", {})
         class_names = self.config.get("class_names") or []
@@ -1189,6 +1202,13 @@ class LatentTrajectoryAnalyzer:
         max_epochs_per_signal = sampling_cfg.get("max_epochs_per_signal")
         stride = max(1, int(sampling_cfg.get("stride", 1)))
 
+        # Log collection parameters
+        logger.info(
+            f"Starting latent collection - max_batches: {max_batches}, "
+            f"max_sequences: {max_sequences}, stride: {stride}, "
+            f"latent_dim: {self.latent_dim}"
+        )
+
         rows: List[pd.DataFrame] = []
         device = self.device
         total_sequences = 0
@@ -1210,12 +1230,49 @@ class LatentTrajectoryAnalyzer:
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
+                # Validate batch has required attributes
                 y_st_src = getattr(batch, key_y_st, None)
                 y_ph_src = getattr(batch, key_y_ph, None)
                 x_ph_src = getattr(batch, key_x_ph, None)
 
                 if y_st_src is None or y_ph_src is None or x_ph_src is None:
+                    missing_keys = []
+                    if y_st_src is None:
+                        missing_keys.append(key_y_st)
+                    if y_ph_src is None:
+                        missing_keys.append(key_y_ph)
+                    if x_ph_src is None:
+                        missing_keys.append(key_x_ph)
+                    if batch_idx == 0:
+                        logger.error(
+                            f"Batch missing required attributes: {missing_keys}. "
+                            f"Available attributes: {[k for k in dir(batch) if not k.startswith('_')]}"
+                        )
                     continue
+
+                # Validate shapes on first batch
+                if batch_idx == 0:
+                    expected_channels = {"y_st": 43, "y_ph": 44, "x_ph": 130}
+                    actual_shapes = {
+                        "y_st": y_st_src.shape,
+                        "y_ph": y_ph_src.shape,
+                        "x_ph": x_ph_src.shape
+                    }
+                    logger.info(f"First batch shapes - y_st: {y_st_src.shape}, y_ph: {y_ph_src.shape}, x_ph: {x_ph_src.shape}")
+
+                    # Validate feature dimensions
+                    if y_st_src.shape[-1] != expected_channels["y_st"]:
+                        logger.warning(
+                            f"y_st has {y_st_src.shape[-1]} channels, expected {expected_channels['y_st']}"
+                        )
+                    if y_ph_src.shape[-1] != expected_channels["y_ph"]:
+                        logger.warning(
+                            f"y_ph has {y_ph_src.shape[-1]} channels, expected {expected_channels['y_ph']}"
+                        )
+                    if x_ph_src.shape[-1] != expected_channels["x_ph"]:
+                        logger.warning(
+                            f"x_ph has {x_ph_src.shape[-1]} channels, expected {expected_channels['x_ph']}"
+                        )
 
                 B_total = y_st_src.shape[0]
                 if B_total == 0:
@@ -1235,9 +1292,15 @@ class LatentTrajectoryAnalyzer:
                     chunk_end = min(chunk_start + chunk_size, B_total)
                     local_slice = slice(chunk_start, chunk_end)
 
-                    y_st = y_st_src[local_slice].to(device, non_blocking=True)
-                    y_ph = y_ph_src[local_slice].to(device, non_blocking=True)
-                    x_ph = x_ph_src[local_slice].to(device, non_blocking=True)
+                    # Safe device transfer - only use non_blocking if source is pinned memory
+                    use_non_blocking = (
+                        device.type == "cuda"
+                        and hasattr(y_st_src, 'is_pinned')
+                        and y_st_src.is_pinned()
+                    )
+                    y_st = y_st_src[local_slice].to(device, non_blocking=use_non_blocking)
+                    y_ph = y_ph_src[local_slice].to(device, non_blocking=use_non_blocking)
+                    x_ph = x_ph_src[local_slice].to(device, non_blocking=use_non_blocking)
 
                     autocast_ctx = (
                         torch.cuda.amp.autocast(device_type="cuda", dtype=self.amp_dtype)
@@ -1246,6 +1309,31 @@ class LatentTrajectoryAnalyzer:
                     )
                     with autocast_ctx:
                         outputs_chunk = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+
+                    # Validate model output on first chunk
+                    if batch_idx == 0 and chunk_start == 0:
+                        if which_key not in outputs_chunk:
+                            logger.error(
+                                f"Model output missing key '{which_key}'. "
+                                f"Available keys: {list(outputs_chunk.keys())}"
+                            )
+                            raise KeyError(f"Model output missing required key: {which_key}")
+
+                        traj_shape = outputs_chunk[which_key].shape
+                        if len(traj_shape) != 3:
+                            logger.error(f"Expected 3D trajectory tensor, got shape {traj_shape}")
+                            raise ValueError(f"Invalid trajectory shape: {traj_shape}")
+
+                        if traj_shape[-1] != self.latent_dim:
+                            logger.error(
+                                f"Model output latent dim ({traj_shape[-1]}) doesn't match "
+                                f"expected latent_dim ({self.latent_dim})"
+                            )
+                            raise ValueError(
+                                f"Latent dimension mismatch: model={traj_shape[-1]}, expected={self.latent_dim}"
+                            )
+
+                        logger.info(f"Model output validated - {which_key} shape: {traj_shape}")
 
                     outputs_cpu: Dict[str, Any] = {}
                     for key, value in outputs_chunk.items():
@@ -1287,12 +1375,19 @@ class LatentTrajectoryAnalyzer:
                         if label_name != "unknown" and label_idx is not None:
                             label_idx = self._ensure_label_index(label_name)
                         else:
+                            # Try to get label from file path mapping
                             mapped_label = self._label_from_source_path(source_val)
                             if mapped_label:
                                 label_name = mapped_label
                                 label_idx = self._ensure_label_index(mapped_label)
                             else:
                                 label_idx = None
+                                # Only warn once about unknown labels
+                                if batch_idx == 0 and local_idx == 0:
+                                    logger.warning(
+                                        f"Could not determine label for sample. Label value type: {type(label_val)}, "
+                                        f"value: {label_val}. Labels will be set to 'unknown'."
+                                    )
 
                         epoch_value_raw = epoch_vals[global_idx] if global_idx < len(epoch_vals) else None
                         if isinstance(epoch_value_raw, torch.Tensor):
@@ -1365,9 +1460,13 @@ class LatentTrajectoryAnalyzer:
                             logvar = logvar[:, ::stride]
                         unc = logvar.exp().sum(-1).detach().cpu().numpy().reshape(-1)
 
-                    t_in_epoch = np.tile(np.arange(T_eff), B_keep)
+                    # Generate timestep indices accounting for stride
+                    # After striding, we have T_eff samples at intervals of 'stride' original steps
                     if stride > 1:
-                        t_in_epoch = t_in_epoch * stride
+                        # Timesteps are [0, stride, 2*stride, ...] in original sequence
+                        t_in_epoch = np.tile(np.arange(T_eff) * stride, B_keep)
+                    else:
+                        t_in_epoch = np.tile(np.arange(T_eff), B_keep)
                     signal_rep = np.repeat(guid_list, T_eff)
                     epoch_rep = np.repeat(epoch_list, T_eff)
                     label_rep = np.repeat(label_names, T_eff)
@@ -1403,11 +1502,33 @@ class LatentTrajectoryAnalyzer:
                 if max_sequences_reached:
                     break
 
+                # Periodic GPU memory cleanup to prevent accumulation
+                if device.type == "cuda" and batch_idx > 0 and batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+
         df_latents = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
         epoch_meta_df = pd.DataFrame(self._epoch_records)
+
+        # Log collection summary
+        logger.info(
+            f"Latent collection complete - Collected {total_sequences} sequences from "
+            f"{len(self._signal_epoch_counts)} unique signals across {len(rows)} batches"
+        )
+
         if not df_latents.empty:
             df_latents["label_idx"] = pd.to_numeric(df_latents["label_idx"], errors="coerce")
             df_latents["epoch_idx"] = pd.to_numeric(df_latents["epoch_idx"], errors="coerce")
+
+            # Validate final dataframe
+            expected_zcols = [f"z{i}" for i in range(self.latent_dim)]
+            missing_zcols = [c for c in expected_zcols if c not in df_latents.columns]
+            if missing_zcols:
+                logger.error(f"Missing latent columns in output dataframe: {missing_zcols}")
+            else:
+                logger.info(f"Successfully collected all {self.latent_dim} latent dimensions")
+        else:
+            logger.warning("No latent data was collected - dataframe is empty!")
+
         return LatentCollectionResult(
             df_latents=df_latents,
             epoch_metadata=epoch_meta_df,
@@ -1722,31 +1843,34 @@ class LatentTrajectoryAnalyzer:
                         save_path=state_dir / f"{signal}.png",
                     )
             hmm_cfg = plotting_cfg.get("hmm_states", {})
-            if hmm_cfg.get("enabled", False) and GaussianHMM is not None:
-                df_sorted = self.latents_with_dyn.sort_values(["signal_id", "epoch_idx", "t_in_epoch"])
-                if hmm_cfg.get("sample_size") and hmm_cfg["sample_size"] < len(df_sorted):
-                    df_hmm = df_sorted.sample(hmm_cfg["sample_size"], random_state=0)
+            if hmm_cfg.get("enabled", False):
+                if GaussianHMM is None:
+                    logger.warning("HMM analysis requested but hmmlearn not installed. Skipping HMM states plotting.")
                 else:
-                    df_hmm = df_sorted
-                Z = df_hmm[zcols].to_numpy()
-                hmm = GaussianHMM(
-                    n_components=hmm_cfg.get("n_states", 6),
-                    covariance_type=hmm_cfg.get("covariance_type", "diag"),
-                    random_state=0,
-                    n_iter=200,
-                )
-                hmm.fit(Z)
-                states = hmm.predict(self.latents_with_dyn[zcols].to_numpy())
-                df_hmm_states = self.latents_with_dyn.copy()
-                df_hmm_states["state_hmm"] = states
-                hmm_dir = ensure_dir(self.plots_dir / "states" / "hmm")
-                for signal in signals:
-                    plot_state_timeline(
-                        df_hmm_states,
-                        signal_id=signal,
-                        state_col="state_hmm",
-                        save_path=hmm_dir / f"{signal}.png",
+                    df_sorted = self.latents_with_dyn.sort_values(["signal_id", "epoch_idx", "t_in_epoch"])
+                    if hmm_cfg.get("sample_size") and hmm_cfg["sample_size"] < len(df_sorted):
+                        df_hmm = df_sorted.sample(hmm_cfg["sample_size"], random_state=0)
+                    else:
+                        df_hmm = df_sorted
+                    Z = df_hmm[zcols].to_numpy()
+                    hmm = GaussianHMM(
+                        n_components=hmm_cfg.get("n_states", 6),
+                        covariance_type=hmm_cfg.get("covariance_type", "diag"),
+                        random_state=0,
+                        n_iter=200,
                     )
+                    hmm.fit(Z)
+                    states = hmm.predict(self.latents_with_dyn[zcols].to_numpy())
+                    df_hmm_states = self.latents_with_dyn.copy()
+                    df_hmm_states["state_hmm"] = states
+                    hmm_dir = ensure_dir(self.plots_dir / "states" / "hmm")
+                    for signal in signals:
+                        plot_state_timeline(
+                            df_hmm_states,
+                            signal_id=signal,
+                            state_col="state_hmm",
+                            save_path=hmm_dir / f"{signal}.png",
+                        )
         lda_res = lda_projection(self.latents_with_dyn, zcols)
         if lda_res[1] is not None:
             lda_df = lda_res[1]
@@ -1877,12 +2001,13 @@ def main() -> None:
     np.random.seed(42)
     torch.manual_seed(42)
     random.seed(42)
-    config_file_path = 'SeqVAE-TEB-original/config_v.yaml'
-    project_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    if not os.path.isabs(config_file_path):
-        config_file_path = os.path.join(project_root, config_file_path)
-    config_file_path = os.path.normpath(config_file_path)
-    if not os.path.exists(config_file_path):
+
+    # Use Path for cross-platform compatibility
+    script_path = Path(__file__).resolve()
+    project_root = script_path.parent.parent
+    config_file_path = project_root / "SeqVAE-TEB-original" / "config_v.yaml"
+
+    if not config_file_path.exists():
         logger.error(f"Configuration file not found at: {config_file_path}")
         sys.exit(1)
     with open(config_file_path, 'r', encoding='utf-8') as yaml_file:
@@ -1892,9 +2017,10 @@ def main() -> None:
     def resolve_path(path_value: Optional[str]) -> Optional[str]:
         if not path_value:
             return path_value
-        if os.path.isabs(path_value):
-            return os.path.normpath(path_value)
-        return os.path.normpath(os.path.join(project_root, path_value))
+        path_obj = Path(path_value)
+        if path_obj.is_absolute():
+            return str(path_obj)
+        return str(project_root / path_value)
 
     dataset_cfg = config.get('dataset_config', {})
     for key in ['vae_train_datasets', 'vae_test_datasets']:
@@ -1930,4 +2056,6 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
 
