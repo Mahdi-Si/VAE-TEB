@@ -401,7 +401,12 @@ def add_dynamics(df: pd.DataFrame, latent_dim: int = 16) -> pd.DataFrame:
         g["t_norm"] = g["t_in_epoch"] / (max_t + EPS)
         return g
 
-    return df.groupby(["signal_id", "epoch_idx"], group_keys=False).apply(_one_epoch)
+
+    grouped = df.groupby(["signal_id", "epoch_idx"], group_keys=False)
+    try:
+        return grouped.apply(_one_epoch, include_groups=False)  # pandas>=2.2
+    except TypeError:
+        return grouped.apply(_one_epoch)
 
 
 def summarize_epoch(df_epoch: pd.DataFrame, latent_dim: int = 16) -> Dict[str, float]:
@@ -674,7 +679,7 @@ def plot_dynamics(
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.plot(tsec, g["accel"], label="acceleration ||d²z||")
+    ax.plot(tsec, g["accel"], label="acceleration ||d^2z||")
     ax.set_xlabel("time (s)")
     ax.set_ylabel("accel")
     ax.grid(True)
@@ -898,7 +903,7 @@ def plot_signal_epochs(
         ax.scatter(g[xcol].iloc[0], g[ycol].iloc[0], s=20)
     ax.set_xlabel(xcol.upper())
     ax.set_ylabel(ycol.upper())
-    ax.set_title(f"All epochs  signal {signal_id}")
+    ax.set_title(f"All epochs - signal {signal_id}")
     ax.grid(True)
     ax.legend(ncol=2, fontsize=8)
     fig.tight_layout()
@@ -943,7 +948,7 @@ def plot_state_timeline(
         ax.step(g["t_abs_s"], g[state_col], where="post", linewidth=1.5, label=f"epoch {epoch_idx}")
     ax.set_xlabel("absolute time (s)")
     ax.set_ylabel("state")
-    ax.set_title(f"Latent state timeline  signal {signal_id}")
+    ax.set_title(f"Latent state timeline - signal {signal_id}")
     ax.grid(True)
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
@@ -967,7 +972,8 @@ def plot_vector_field(
     pairs = df_sorted[["signal_id", "epoch_idx"]].to_numpy()
     diffs = np.vstack([P[1:] - P[:-1], np.zeros((1, 2))])
     continuity = np.all(pairs[1:] == pairs[:-1], axis=1)
-    diffs[~continuity] = 0.0
+    continuity_mask = np.concatenate([continuity, [False]])
+    diffs[~continuity_mask] = 0.0
     xg = np.linspace(P[:, 0].min(), P[:, 0].max(), grid)
     yg = np.linspace(P[:, 1].min(), P[:, 1].max(), grid)
     Xg, Yg = np.meshgrid(xg, yg)
