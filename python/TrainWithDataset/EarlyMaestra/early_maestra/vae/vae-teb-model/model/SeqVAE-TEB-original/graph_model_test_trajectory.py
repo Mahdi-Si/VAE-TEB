@@ -1,5 +1,6 @@
 
 import copy
+import contextlib
 import json
 import math
 import os
@@ -7,6 +8,8 @@ import random
 import sys
 import time
 import importlib.util
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -123,6 +126,11 @@ DEFAULT_ANALYSIS_CONFIG: Dict[str, Any] = {
         "save_parquet": True,
         "save_csv": False,
         "compression": "snappy",
+    },
+    "performance": {
+        "forward_chunk_size": None,
+        "use_amp": True,
+        "amp_dtype": "float16",
     },
     "reducers": {
         "pca": {
@@ -1097,6 +1105,24 @@ class LatentTrajectoryAnalyzer:
         self.reductions: Dict[str, Dict[str, Any]] = {}
         self.reduction_frames: Dict[str, pd.DataFrame] = {}
 
+        perf_cfg = self.config.get("performance", {})
+        chunk_cfg = perf_cfg.get("forward_chunk_size")
+        self.forward_chunk_size: Optional[int] = None
+        if chunk_cfg:
+            try:
+                candidate = int(chunk_cfg)
+                if candidate > 0:
+                    self.forward_chunk_size = candidate
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid forward_chunk_size value '{chunk_cfg}'; defaulting to full batch processing.")
+        use_amp_default = self.device.type == "cuda"
+        self.use_amp = bool(perf_cfg.get("use_amp", use_amp_default)) and self.device.type == "cuda"
+        amp_dtype_name = str(perf_cfg.get("amp_dtype", "float16")).lower()
+        if amp_dtype_name == "bfloat16":
+            self.amp_dtype = torch.bfloat16
+        else:
+            self.amp_dtype = torch.float16
+
     def _resolve_device(self) -> torch.device:
         device_cfg = self.config.get("device")
         if isinstance(device_cfg, str):
@@ -1160,150 +1186,207 @@ class LatentTrajectoryAnalyzer:
         rows: List[pd.DataFrame] = []
         device = self.device
         total_sequences = 0
+        which_key = self.config.get("which", "mu_post")
+        use_amp = self.use_amp and device.type == "cuda"
+        max_sequences_reached = False
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Collecting latents")):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
-                y_st = getattr(batch, self.keys.get("y_st", "fhr_st"))
-                y_ph = getattr(batch, self.keys.get("y_ph", "fhr_ph"))
-                x_ph = getattr(batch, self.keys.get("x_ph", "fhr_up_ph"))
-                y_st = y_st.to(device)
-                y_ph = y_ph.to(device)
-                x_ph = x_ph.to(device)
-                outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
-                traj = outputs[self.config.get("which", "mu_post")]
-                B, T, D = traj.shape
-                signal_ids = tensor_list_from_batch(getattr(batch, self.keys.get("signal_id", "guid"), None), B)
-                epoch_vals = tensor_list_from_batch(getattr(batch, self.keys.get("epoch_idx", "epoch"), None), B)
-                labels_raw = tensor_list_from_batch(getattr(batch, self.keys.get("label"), None), B)
-                t0_vals = tensor_list_from_batch(getattr(batch, self.keys.get("t0"), None), B)
 
-                source_list = tensor_list_from_batch(getattr(batch, self.keys.get("source_file", "source_file"), None), B)
-                keep_indices: List[int] = []
-                guid_list: List[str] = []
-                epoch_list: List[Any] = []
-                label_names: List[str] = []
-                label_indices: List[Optional[int]] = []
-                t0_list: List[float] = []
-                source_values: List[Optional[str]] = []
-                for i in range(B):
-                    guid = normalize_guid(signal_ids[i] if i < len(signal_ids) else None)
-                    if target_guids and guid not in target_guids:
-                        continue
-                    if exclude_guids and guid in exclude_guids:
-                        continue
-                    if max_epochs_per_signal is not None and self._signal_epoch_counts[guid] >= max_epochs_per_signal:
-                        continue
-                    source_val = source_list[i] if i < len(source_list) else None
-                    if source_val is not None and not isinstance(source_val, str):
-                        source_val = str(source_val)
-                    label_name, label_idx = derive_label(labels_raw[i] if i < len(labels_raw) else None, self.class_names)
-                    if label_name != "unknown" and label_idx is not None:
-                        label_idx = self._ensure_label_index(label_name)
-                    else:
-                        mapped_label = self._label_from_source_path(source_val)
-                        if mapped_label:
-                            label_name = mapped_label
-                            label_idx = self._ensure_label_index(mapped_label)
-                        else:
-                            label_idx = None
-                    epoch_value_raw = epoch_vals[i] if i < len(epoch_vals) else None
-                    if isinstance(epoch_value_raw, torch.Tensor):
-                        epoch_value = float(epoch_value_raw.item())
-                    elif isinstance(epoch_value_raw, np.ndarray):
-                        epoch_value = float(np.asarray(epoch_value_raw).squeeze().item())
-                    else:
-                        epoch_value = float(epoch_value_raw) if epoch_value_raw is not None else float(self._signal_epoch_counts[guid])
-                    t0_raw = t0_vals[i] if i < len(t0_vals) else None
-                    if isinstance(t0_raw, torch.Tensor):
-                        t0_value = float(t0_raw.item())
-                    elif isinstance(t0_raw, np.ndarray):
-                        t0_value = float(np.asarray(t0_raw).squeeze().item())
-                    elif t0_raw is None:
-                        t0_value = epoch_value
-                    else:
-                        t0_value = float(t0_raw)
-                    keep_indices.append(i)
-                    guid_list.append(guid)
-                    epoch_list.append(epoch_value)
-                    label_names.append(label_name)
-                    label_indices.append(label_idx if label_idx is not None else np.nan)
-                    t0_list.append(t0_value)
-                    source_values.append(source_val)
-                    self._signal_epoch_counts[guid] += 1
-                    self._epoch_records.append(
-                        {
-                            "sample_idx": self._sequence_counter,
-                            "signal_id": guid,
-                            "epoch_idx": epoch_value,
-                            "label": label_name,
-                            "label_idx": label_idx if label_idx is not None else np.nan,
-                            "t0": t0_value,
-                            "source_file": source_val,
-                        }
-                    )
-                    self._sequence_counter += 1
+                y_st_src = getattr(batch, self.keys.get("y_st", "fhr_st"))
+                y_ph_src = getattr(batch, self.keys.get("y_ph", "fhr_ph"))
+                x_ph_src = getattr(batch, self.keys.get("x_ph", "fhr_up_ph"))
 
-                if not keep_indices:
+                if y_st_src is None or y_ph_src is None or x_ph_src is None:
                     continue
-                traj_keep = traj[keep_indices].detach().cpu().numpy()
-                B_keep = traj_keep.shape[0]
-                if stride > 1:
-                    traj_keep = traj_keep[:, ::stride]
-                    T_eff = traj_keep.shape[1]
-                else:
-                    T_eff = T
-                flat_Z = traj_keep.reshape(-1, D)
-                te = None
-                if self.config.get("keep_te", True):
-                    kld = self.model._kld_loss(
-                        outputs["mu_prior"][keep_indices],
-                        outputs["logvar_prior"][keep_indices],
-                        outputs["mu_post"][keep_indices],
-                        outputs["logvar_post"][keep_indices],
-                        reduce_mean=False,
+
+                B_total = y_st_src.shape[0]
+                if B_total == 0:
+                    continue
+
+                signal_ids = tensor_list_from_batch(getattr(batch, self.keys.get("signal_id", "guid"), None), B_total)
+                epoch_vals = tensor_list_from_batch(getattr(batch, self.keys.get("epoch_idx", "epoch"), None), B_total)
+                labels_raw = tensor_list_from_batch(getattr(batch, self.keys.get("label"), None), B_total)
+                t0_vals = tensor_list_from_batch(getattr(batch, self.keys.get("t0"), None), B_total)
+                source_list = tensor_list_from_batch(getattr(batch, self.keys.get("source_file", "source_file"), None), B_total)
+
+                chunk_size = self.forward_chunk_size or B_total
+                chunk_size = max(1, min(chunk_size, B_total))
+
+                for chunk_start in range(0, B_total, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, B_total)
+                    local_slice = slice(chunk_start, chunk_end)
+
+                    y_st = y_st_src[local_slice].to(device, non_blocking=True)
+                    y_ph = y_ph_src[local_slice].to(device, non_blocking=True)
+                    x_ph = x_ph_src[local_slice].to(device, non_blocking=True)
+
+                    autocast_ctx = (
+                        torch.cuda.amp.autocast(device_type="cuda", dtype=self.amp_dtype)
+                        if use_amp
+                        else contextlib.nullcontext()
                     )
+                    with autocast_ctx:
+                        outputs_chunk = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+
+                    outputs_cpu: Dict[str, Any] = {}
+                    for key, value in outputs_chunk.items():
+                        if torch.is_tensor(value):
+                            value_cpu = value.detach().cpu()
+                            if value_cpu.dtype in (torch.float16, torch.bfloat16):
+                                value_cpu = value_cpu.float()
+                            outputs_cpu[key] = value_cpu
+                        else:
+                            outputs_cpu[key] = value
+                    del outputs_chunk
+
+                    traj = outputs_cpu[which_key]
+                    B_chunk, T, D = traj.shape
+
+                    keep_indices: List[int] = []
+                    guid_list: List[str] = []
+                    epoch_list: List[Any] = []
+                    label_names: List[str] = []
+                    label_indices: List[Optional[int]] = []
+                    t0_list: List[float] = []
+                    source_values: List[Optional[str]] = []
+
+                    for local_idx, global_idx in enumerate(range(chunk_start, chunk_end)):
+                        guid = normalize_guid(signal_ids[global_idx] if global_idx < len(signal_ids) else None)
+                        if target_guids and guid not in target_guids:
+                            continue
+                        if exclude_guids and guid in exclude_guids:
+                            continue
+                        if max_epochs_per_signal is not None and self._signal_epoch_counts[guid] >= max_epochs_per_signal:
+                            continue
+
+                        source_val = source_list[global_idx] if global_idx < len(source_list) else None
+                        if source_val is not None and not isinstance(source_val, str):
+                            source_val = str(source_val)
+
+                        label_val = labels_raw[global_idx] if global_idx < len(labels_raw) else None
+                        label_name, label_idx = derive_label(label_val, self.class_names)
+                        if label_name != "unknown" and label_idx is not None:
+                            label_idx = self._ensure_label_index(label_name)
+                        else:
+                            mapped_label = self._label_from_source_path(source_val)
+                            if mapped_label:
+                                label_name = mapped_label
+                                label_idx = self._ensure_label_index(mapped_label)
+                            else:
+                                label_idx = None
+
+                        epoch_value_raw = epoch_vals[global_idx] if global_idx < len(epoch_vals) else None
+                        if isinstance(epoch_value_raw, torch.Tensor):
+                            epoch_value = float(epoch_value_raw.item())
+                        elif isinstance(epoch_value_raw, np.ndarray):
+                            epoch_value = float(np.asarray(epoch_value_raw).squeeze().item())
+                        else:
+                            epoch_value = float(epoch_value_raw) if epoch_value_raw is not None else float(self._signal_epoch_counts[guid])
+
+                        t0_raw = t0_vals[global_idx] if global_idx < len(t0_vals) else None
+                        if isinstance(t0_raw, torch.Tensor):
+                            t0_value = float(t0_raw.item())
+                        elif isinstance(t0_raw, np.ndarray):
+                            t0_value = float(np.asarray(t0_raw).squeeze().item())
+                        elif t0_raw is None:
+                            t0_value = epoch_value
+                        else:
+                            t0_value = float(t0_raw)
+
+                        keep_indices.append(local_idx)
+                        guid_list.append(guid)
+                        epoch_list.append(epoch_value)
+                        label_names.append(label_name)
+                        label_indices.append(label_idx if label_idx is not None else np.nan)
+                        t0_list.append(t0_value)
+                        source_values.append(source_val)
+                        self._signal_epoch_counts[guid] += 1
+                        self._epoch_records.append(
+                            {
+                                "sample_idx": self._sequence_counter,
+                                "signal_id": guid,
+                                "epoch_idx": epoch_value,
+                                "label": label_name,
+                                "label_idx": label_idx if label_idx is not None else np.nan,
+                                "t0": t0_value,
+                                "source_file": source_val,
+                            }
+                        )
+                        self._sequence_counter += 1
+
+                    if not keep_indices:
+                        continue
+
+                    traj_keep = traj[keep_indices].numpy()
+                    B_keep = traj_keep.shape[0]
                     if stride > 1:
-                        kld = kld[:, ::stride]
-                    te = kld.sum(-1).detach().cpu().numpy().reshape(-1)
-                unc = None
-                if self.config.get("keep_uncertainty", True) and "logvar_post" in outputs:
-                    logvar = outputs["logvar_post"][keep_indices]
+                        traj_keep = traj_keep[:, ::stride]
+                        T_eff = traj_keep.shape[1]
+                    else:
+                        T_eff = T
+                    flat_Z = traj_keep.reshape(-1, D)
+
+                    te = None
+                    if self.config.get("keep_te", True):
+                        kld = self.model._kld_loss(
+                            outputs_cpu["mu_prior"][keep_indices],
+                            outputs_cpu["logvar_prior"][keep_indices],
+                            outputs_cpu["mu_post"][keep_indices],
+                            outputs_cpu["logvar_post"][keep_indices],
+                            reduce_mean=False,
+                        )
+                        if stride > 1:
+                            kld = kld[:, ::stride]
+                        te = kld.sum(-1).detach().cpu().numpy().reshape(-1)
+
+                    unc = None
+                    if self.config.get("keep_uncertainty", True) and "logvar_post" in outputs_cpu:
+                        logvar = outputs_cpu["logvar_post"][keep_indices]
+                        if stride > 1:
+                            logvar = logvar[:, ::stride]
+                        unc = logvar.exp().sum(-1).detach().cpu().numpy().reshape(-1)
+
+                    t_in_epoch = np.tile(np.arange(T_eff), B_keep)
                     if stride > 1:
-                        logvar = logvar[:, ::stride]
-                    unc = logvar.exp().sum(-1).detach().cpu().numpy().reshape(-1)
-                t_in_epoch = np.tile(np.arange(T_eff), B_keep)
-                if stride > 1:
-                    t_in_epoch = t_in_epoch * stride
-                signal_rep = np.repeat(guid_list, T_eff)
-                epoch_rep = np.repeat(epoch_list, T_eff)
-                label_rep = np.repeat(label_names, T_eff)
-                label_idx_rep = np.repeat(label_indices, T_eff)
-                t0_rep = np.repeat(t0_list, T_eff)
-                source_rep = np.repeat(source_values, T_eff)
-                t_abs = t0_rep + LATENT_STEP_SECONDS * t_in_epoch
-                data: Dict[str, Any] = {
-                    "signal_id": signal_rep,
-                    "epoch_idx": epoch_rep,
-                    "label": label_rep,
-                    "label_idx": label_idx_rep,
-                    "t_in_epoch": t_in_epoch,
-                    "t_abs_s": t_abs,
-                    "source_file": source_rep,
-                    "sample_idx": np.repeat(np.arange(total_sequences, total_sequences + B_keep), T_eff),
-                    "batch_idx": batch_idx,
-                }
-                total_sequences += B_keep
-                for d_idx in range(D):
-                    data[f"z{d_idx}"] = flat_Z[:, d_idx]
-                if te is not None:
-                    data["te"] = te
-                if unc is not None:
-                    data["uncertainty"] = unc
-                df_batch = pd.DataFrame(data)
-                rows.append(df_batch)
-                if max_sequences is not None and total_sequences >= max_sequences:
+                        t_in_epoch = t_in_epoch * stride
+                    signal_rep = np.repeat(guid_list, T_eff)
+                    epoch_rep = np.repeat(epoch_list, T_eff)
+                    label_rep = np.repeat(label_names, T_eff)
+                    label_idx_rep = np.repeat(label_indices, T_eff)
+                    t0_rep = np.repeat(t0_list, T_eff)
+                    source_rep = np.repeat(source_values, T_eff)
+                    t_abs = t0_rep + LATENT_STEP_SECONDS * t_in_epoch
+                    data: Dict[str, Any] = {
+                        "signal_id": signal_rep,
+                        "epoch_idx": epoch_rep,
+                        "label": label_rep,
+                        "label_idx": label_idx_rep,
+                        "t_in_epoch": t_in_epoch,
+                        "t_abs_s": t_abs,
+                        "source_file": source_rep,
+                        "sample_idx": np.repeat(np.arange(total_sequences, total_sequences + B_keep), T_eff),
+                        "batch_idx": batch_idx,
+                    }
+                    total_sequences += B_keep
+                    for d_idx in range(D):
+                        data[f"z{d_idx}"] = flat_Z[:, d_idx]
+                    if te is not None:
+                        data["te"] = te
+                    if unc is not None:
+                        data["uncertainty"] = unc
+                    df_batch = pd.DataFrame(data)
+                    rows.append(df_batch)
+
+                    if max_sequences is not None and total_sequences >= max_sequences:
+                        max_sequences_reached = True
+                        break
+
+                if max_sequences_reached:
                     break
+
         df_latents = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
         epoch_meta_df = pd.DataFrame(self._epoch_records)
         if not df_latents.empty:
@@ -1831,3 +1914,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
