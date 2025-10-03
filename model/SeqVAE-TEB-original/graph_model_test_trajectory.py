@@ -44,6 +44,15 @@ try:
     import umap  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     umap = None
+    UMAP = None
+else:
+    try:
+        from umap import UMAP as UMAP  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - fallback for alternate package layouts
+        try:
+            from umap.umap_ import UMAP as UMAP  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - optional dependency
+            UMAP = getattr(umap, "UMAP", None)
 
 try:
     from hmmlearn.hmm import GaussianHMM  # type: ignore
@@ -631,10 +640,10 @@ def fit_global_umap(
     random_state: int = 0,
     **kwargs: Any,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[pd.DataFrame]]:
-    if umap is None:  # pragma: no cover - optional dependency
-        logger.warning("UMAP is not installed; skipping UMAP embedding.")
+    if umap is None or UMAP is None:  # pragma: no cover - optional dependency
+        logger.warning("UMAP is not installed or misconfigured; skipping UMAP embedding.")
         return None, None
-    reducer = umap.UMAP(n_components=n_components, random_state=random_state, **kwargs)
+    reducer = UMAP(n_components=n_components, random_state=random_state, **kwargs)
     Z = df[zcols].to_numpy()
     X = reducer.fit_transform(Z)
     out = df.copy()
