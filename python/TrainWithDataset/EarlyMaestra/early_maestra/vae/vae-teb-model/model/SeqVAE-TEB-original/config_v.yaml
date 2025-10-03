@@ -113,14 +113,14 @@ latent_analysis:
       incremental: false
       batch_size: 8192
     umap:
-      enabled: false
+      enabled: true
       n_components: 2
       n_neighbors: 30
       min_dist: 0.1
       metric: euclidean
       random_state: 0
     tsne:
-      enabled: false
+      enabled: true
       n_components: 2
       perplexity: 40
       n_iter: 1500
@@ -133,7 +133,7 @@ latent_analysis:
     max_signals: 12
     max_epochs_per_signal: 4
     epoch_examples: 16
-    prefer_embeddings: [pca, umap]
+    prefer_embeddings: [pca, umap, tsne]
     color_by: te
     vector_field:
       enabled: true
