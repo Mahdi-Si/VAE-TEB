@@ -69,13 +69,62 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     rpt = None
 
+try:
+    import seaborn as sns  # type: ignore
+    sns.set_theme(style="whitegrid", context="paper", palette="colorblind")
+except ImportError:  # pragma: no cover - optional dependency
+    sns = None
+
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 
 plt.switch_backend("Agg")
 
+# Professional plot styling
+if sns is None:
+    # Fallback matplotlib styling if seaborn not available
+    plt.rcParams.update({
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'axes.edgecolor': '#333333',
+        'axes.linewidth': 1.2,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'grid.linestyle': '--',
+        'font.size': 10,
+        'axes.labelsize': 11,
+        'axes.titlesize': 12,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 9,
+        'lines.linewidth': 1.5,
+    })
+
 LATENT_STEP_SECONDS = 4.0
 EPS = 1e-9
 DEFAULT_CLASS_NAMES = ["class_0", "class_1", "class_2"]
+
+
+def get_clean_dataset_name(source_file_path: str) -> str:
+    """
+    Extract a clean, human-readable dataset name from a file path.
+
+    Examples:
+        '/data1/.../acidosis_cs.hdf5' -> 'acidosis_cs'
+        '/data1/.../test_dataset_no_cs.hdf5' -> 'test_no_cs'
+        'synthetic.hdf5' -> 'synthetic'
+    """
+    if not source_file_path or pd.isna(source_file_path):
+        return "unknown"
+
+    basename = os.path.basename(str(source_file_path))
+    name_without_ext = os.path.splitext(basename)[0]
+
+    # Simplify common patterns
+    name_without_ext = name_without_ext.replace("_dataset", "")
+    name_without_ext = name_without_ext.replace("test_", "")
+    name_without_ext = name_without_ext.replace("train_", "")
+
+    return name_without_ext
 
 def _load_seqvae_graph_model():
     module_name = "seqvae_teb_graph_model_train"
@@ -652,19 +701,38 @@ def plot_epoch_trajectory(
     if len(points) < 2:
         return False
     segs = np.concatenate([points[:-1], points[1:]], axis=1)
-    lc = LineCollection(segs, cmap="viridis")
+
+    # Use better colormap
+    cmap = "plasma" if sns is None else "viridis"
+    lc = LineCollection(segs, cmap=cmap, linewidths=2.5)
     lc.set_array(clr[:-1])
-    lc.set_linewidth(2)
-    fig, ax = plt.subplots(figsize=(6, 5))
+
+    fig, ax = plt.subplots(figsize=(7, 6))
     ax.add_collection(lc)
-    ax.scatter(X[0, 0], X[0, 1], s=60, marker="o", label="start")
-    ax.scatter(X[-1, 0], X[-1, 1], s=80, marker="X", label="end")
-    ax.set_xlabel(xcol.upper())
-    ax.set_ylabel(ycol.upper())
-    ax.set_title(f"Signal {signal_id} epoch {epoch_idx}")
+
+    # Enhanced markers
+    ax.scatter(X[0, 0], X[0, 1], s=100, marker="o", c='green', edgecolors='white', linewidth=2, label="start", zorder=5)
+    ax.scatter(X[-1, 0], X[-1, 1], s=120, marker="X", c='red', edgecolors='white', linewidth=2, label="end", zorder=5)
+
+    ax.set_xlabel(xcol.upper(), fontweight='bold', fontsize=11)
+    ax.set_ylabel(ycol.upper(), fontweight='bold', fontsize=11)
+
+    # Add dataset info to title if available
+    dataset_name = ""
+    if "source_file" in subset.columns and not subset["source_file"].isna().all():
+        dataset_name = get_clean_dataset_name(subset["source_file"].iloc[0])
+        dataset_name = f" [{dataset_name}]"
+
+    ax.set_title(f"Latent Trajectory: {signal_id}{dataset_name} | Epoch {epoch_idx}",
+                 fontsize=12, fontweight='bold', pad=12)
     ax.autoscale()
-    ax.grid(True)
-    ax.legend()
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(frameon=True, fancybox=True, shadow=True)
+
+    # Add colorbar
+    cbar = fig.colorbar(lc, ax=ax, label=color_by, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=9)
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -682,23 +750,47 @@ def plot_dynamics(
     g = df_dyn[(df_dyn.signal_id == signal_id) & (df_dyn.epoch_idx == epoch_idx)].sort_values("t_in_epoch")
     if g.empty or "speed" not in g or "accel" not in g:
         return False
+
     tsec = g["t_in_epoch"].to_numpy() * LATENT_STEP_SECONDS
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.plot(tsec, g["speed"], label="speed ||dz||")
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("speed")
-    ax.grid(True)
-    ax.legend()
+
+    # Get dataset name if available
+    dataset_name = ""
+    if "source_file" in g.columns and not g["source_file"].isna().all():
+        dataset_name = get_clean_dataset_name(g["source_file"].iloc[0])
+        dataset_name = f" [{dataset_name}]"
+
+    # Speed plot
+    fig, ax = plt.subplots(figsize=(9, 4))
+    if sns is not None:
+        ax.plot(tsec, g["speed"], linewidth=2, color=sns.color_palette("husl", 8)[0])
+        ax.fill_between(tsec, g["speed"], alpha=0.2, color=sns.color_palette("husl", 8)[0])
+    else:
+        ax.plot(tsec, g["speed"], linewidth=2, color='#1f77b4')
+        ax.fill_between(tsec, g["speed"], alpha=0.2, color='#1f77b4')
+
+    ax.set_xlabel("Time (seconds)", fontweight='bold', fontsize=11)
+    ax.set_ylabel("Speed ||dz/dt||", fontweight='bold', fontsize=11)
+    ax.set_title(f"Latent Speed: {signal_id}{dataset_name} | Epoch {epoch_idx}",
+                 fontsize=12, fontweight='bold', pad=12)
+    ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(save_path_speed, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.plot(tsec, g["accel"], label="acceleration ||d^2z||")
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("accel")
-    ax.grid(True)
-    ax.legend()
+    # Acceleration plot
+    fig, ax = plt.subplots(figsize=(9, 4))
+    if sns is not None:
+        ax.plot(tsec, g["accel"], linewidth=2, color=sns.color_palette("husl", 8)[2])
+        ax.fill_between(tsec, g["accel"], alpha=0.2, color=sns.color_palette("husl", 8)[2])
+    else:
+        ax.plot(tsec, g["accel"], linewidth=2, color='#ff7f0e')
+        ax.fill_between(tsec, g["accel"], alpha=0.2, color='#ff7f0e')
+
+    ax.set_xlabel("Time (seconds)", fontweight='bold', fontsize=11)
+    ax.set_ylabel("Acceleration ||d²z/dt²||", fontweight='bold', fontsize=11)
+    ax.set_title(f"Latent Acceleration: {signal_id}{dataset_name} | Epoch {epoch_idx}",
+                 fontsize=12, fontweight='bold', pad=12)
+    ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(save_path_accel, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1015,14 +1107,184 @@ def plot_class_scatter(
 ) -> bool:
     if df_emb.empty or xcol not in df_emb or ycol not in df_emb or "label" not in df_emb:
         return False
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for lab, group in df_emb.groupby("label"):
-        ax.scatter(group[xcol], group[ycol], s=5, alpha=0.2, label=str(lab))
-    ax.set_xlabel(xcol.upper())
-    ax.set_ylabel(ycol.upper())
-    ax.set_title("Class-wise latent occupancy")
-    ax.grid(True)
-    ax.legend()
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    # Use seaborn scatterplot if available for better styling
+    if sns is not None:
+        sns.scatterplot(
+            data=df_emb,
+            x=xcol,
+            y=ycol,
+            hue="label",
+            s=10,
+            alpha=0.3,
+            ax=ax,
+            palette="Set2"
+        )
+    else:
+        for lab, group in df_emb.groupby("label"):
+            ax.scatter(group[xcol], group[ycol], s=5, alpha=0.2, label=str(lab))
+        ax.legend()
+
+    ax.set_xlabel(xcol.upper(), fontweight='bold')
+    ax.set_ylabel(ycol.upper(), fontweight='bold')
+    ax.set_title("Class-wise Latent Space Distribution", fontsize=13, fontweight='bold', pad=15)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return True
+
+
+def plot_dataset_comparison(
+    df_emb: pd.DataFrame,
+    *,
+    xcol: str,
+    ycol: str,
+    save_path: Path,
+) -> bool:
+    """
+    Plot latent space colored by source dataset file.
+    This allows visual comparison of how different datasets occupy the latent space.
+    """
+    if df_emb.empty or xcol not in df_emb or ycol not in df_emb or "source_file" not in df_emb:
+        return False
+
+    # Add clean dataset names
+    df_plot = df_emb.copy()
+    df_plot["dataset"] = df_plot["source_file"].apply(get_clean_dataset_name)
+
+    # Count unique datasets
+    unique_datasets = df_plot["dataset"].nunique()
+    if unique_datasets < 2:
+        # Skip if only one dataset (not a comparison)
+        return False
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Use seaborn if available for professional color palettes
+    if sns is not None:
+        palette = sns.color_palette("tab10", unique_datasets)
+        sns.scatterplot(
+            data=df_plot,
+            x=xcol,
+            y=ycol,
+            hue="dataset",
+            s=8,
+            alpha=0.4,
+            ax=ax,
+            palette=palette,
+            edgecolor=None
+        )
+    else:
+        # Fallback to matplotlib
+        for dataset, group in df_plot.groupby("dataset"):
+            ax.scatter(group[xcol], group[ycol], s=6, alpha=0.3, label=str(dataset))
+        ax.legend(title="Dataset", frameon=True, loc='best')
+
+    ax.set_xlabel(xcol.upper(), fontweight='bold', fontsize=11)
+    ax.set_ylabel(ycol.upper(), fontweight='bold', fontsize=11)
+    ax.set_title("Dataset Comparison in Latent Space", fontsize=14, fontweight='bold', pad=20)
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+    # Add subtitle with dataset counts
+    dataset_counts = df_plot.groupby("dataset").size().to_dict()
+    subtitle = "  |  ".join([f"{name}: {count:,} points" for name, count in sorted(dataset_counts.items())])
+    ax.text(
+        0.5, 1.02, subtitle,
+        transform=ax.transAxes,
+        fontsize=8,
+        ha='center',
+        style='italic',
+        color='#555555'
+    )
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return True
+
+
+def plot_dataset_class_matrix(
+    df_emb: pd.DataFrame,
+    *,
+    xcol: str,
+    ycol: str,
+    save_path: Path,
+) -> bool:
+    """
+    Create a grid comparing datasets and classes together.
+    Shows how each dataset's different classes are distributed in latent space.
+    """
+    if df_emb.empty or xcol not in df_emb or ycol not in df_emb:
+        return False
+    if "source_file" not in df_emb or "label" not in df_emb:
+        return False
+
+    df_plot = df_emb.copy()
+    df_plot["dataset"] = df_plot["source_file"].apply(get_clean_dataset_name)
+
+    unique_datasets = df_plot["dataset"].nunique()
+    unique_labels = df_plot["label"].nunique()
+
+    if unique_datasets < 2 or unique_labels < 2:
+        return False
+
+    # Create grid: one subplot per dataset
+    n_datasets = unique_datasets
+    ncols = min(3, n_datasets)
+    nrows = int(np.ceil(n_datasets / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
+    fig.suptitle(
+        f"Dataset-Class Comparison: {xcol.upper()} vs {ycol.upper()}",
+        fontsize=15,
+        fontweight='bold',
+        y=0.995
+    )
+
+    datasets_sorted = sorted(df_plot["dataset"].unique())
+
+    for idx, dataset in enumerate(datasets_sorted):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        df_subset = df_plot[df_plot["dataset"] == dataset]
+
+        if sns is not None:
+            sns.scatterplot(
+                data=df_subset,
+                x=xcol,
+                y=ycol,
+                hue="label",
+                s=12,
+                alpha=0.4,
+                ax=ax,
+                palette="Set2",
+                legend=(idx == 0)  # Only show legend on first plot
+            )
+        else:
+            for lab, group in df_subset.groupby("label"):
+                ax.scatter(
+                    group[xcol],
+                    group[ycol],
+                    s=8,
+                    alpha=0.3,
+                    label=str(lab) if idx == 0 else None
+                )
+            if idx == 0:
+                ax.legend(title="Class", frameon=True)
+
+        ax.set_title(f"{dataset} (n={len(df_subset):,})", fontweight='bold', fontsize=11)
+        ax.set_xlabel(xcol.upper(), fontweight='bold')
+        ax.set_ylabel(ycol.upper(), fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--')
+
+    # Hide unused subplots
+    for idx in range(n_datasets, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1877,6 +2139,32 @@ class LatentTrajectoryAnalyzer:
                     plot_counts["class_scatter"] += 1
                 else:
                     skip_counts["class_scatter"] += 1
+
+            # NEW: Dataset comparison plots
+            if "source_file" in df_emb:
+                dataset_dir = ensure_dir(self.plots_dir / "datasets")
+                if plot_dataset_comparison(
+                    df_emb,
+                    xcol=xcol,
+                    ycol=ycol,
+                    save_path=dataset_dir / f"dataset_comparison_{emb_name}.png",
+                ):
+                    plot_counts["dataset_comparison"] += 1
+                else:
+                    skip_counts["dataset_comparison"] += 1
+
+                # Dataset-class matrix plot
+                if "label" in df_emb:
+                    if plot_dataset_class_matrix(
+                        df_emb,
+                        xcol=xcol,
+                        ycol=ycol,
+                        save_path=dataset_dir / f"dataset_class_matrix_{emb_name}.png",
+                    ):
+                        plot_counts["dataset_class_matrix"] += 1
+                    else:
+                        skip_counts["dataset_class_matrix"] += 1
+
         if plot_counts:
             logger.info("Plot summary: %s", dict(sorted(plot_counts.items())))
         if skip_counts:
