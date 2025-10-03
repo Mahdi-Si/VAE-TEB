@@ -1196,6 +1196,9 @@ class LatentTrajectoryAnalyzer:
         }
         save_json(self.summary, self.output_dir / "analysis_summary.json")
 
+        # Save plot explanations
+        self._save_plot_explanations()
+
     def collect_latents(self) -> LatentCollectionResult:
         sampling_cfg = self.config.get("sampling", {})
         target_guids = sampling_cfg.get("target_guids")
@@ -1979,6 +1982,16 @@ class LatentTrajectoryAnalyzer:
                 metrics["pairwise"] = class_metrics
         save_json(metrics, self.metrics_dir / "latent_metrics.json")
         return metrics
+
+    def _save_plot_explanations(self) -> None:
+        """Save README.txt files in each plot subdirectory explaining the visualizations."""
+        # Import the explanations module
+        try:
+            from plot_explanations import save_plot_explanations
+            save_plot_explanations(self.output_dir)
+            logger.info("Saved plot explanation files in plots subdirectories")
+        except Exception as e:
+            logger.warning(f"Could not save plot explanations: {e}")
 
 
 class SeqVAEGraphModelTest(SeqVAEGraphModel):
