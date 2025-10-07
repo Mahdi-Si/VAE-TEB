@@ -938,7 +938,8 @@ class GuidBatchSampler(Sampler[List[int]]):
 
 def build_guid_filtered_dataloader(
     dataset_paths: Sequence[str],
-    min_samples: int = 22,
+    min_samples: int = 5,
+    max_guids: Optional[int] = None,
     sampler_shuffle: bool = False,
     stats_path: Optional[str] = None,
     normalize_fields: Optional[Sequence[str]] = None,
@@ -948,6 +949,16 @@ def build_guid_filtered_dataloader(
     """
     Create a DataLoader that yields one batch per GUID for GUIDs with > min_samples.
     Returns (eligible_guid_list, dataloader).
+
+    Args:
+        dataset_paths: Sequence of paths to HDF5 dataset files.
+        min_samples: Minimum number of samples required for a GUID to be eligible.
+        max_guids: Maximum number of GUIDs to include (None for no limit).
+        sampler_shuffle: Whether to shuffle the GUID order in the sampler.
+        stats_path: Path to normalization statistics file.
+        normalize_fields: Fields to normalize.
+        dataloader_overrides: Override default DataLoader kwargs.
+        **dataset_kwargs: Additional kwargs for CombinedHDF5Dataset.
     """
     dataset = CombinedHDF5Dataset(
         paths=list(dataset_paths),
@@ -960,9 +971,14 @@ def build_guid_filtered_dataloader(
     counts = Counter(guids)
     eligible_guids = [guid for guid, count in counts.items() if count > min_samples]
 
+    # Limit to max_guids if specified
+    if max_guids is not None and len(eligible_guids) > max_guids:
+        eligible_guids = eligible_guids[:max_guids]
+
     guid_to_indices: Dict[str, List[int]] = defaultdict(list)
+    eligible_guids_set = set(eligible_guids)
     for idx, guid in enumerate(guids):
-        if counts[guid] > min_samples:
+        if guid in eligible_guids_set:
             guid_to_indices[guid].append(idx)
 
     batch_sampler = GuidBatchSampler(guid_to_indices, shuffle=sampler_shuffle)

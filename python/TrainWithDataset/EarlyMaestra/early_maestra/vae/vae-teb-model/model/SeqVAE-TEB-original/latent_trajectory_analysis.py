@@ -892,6 +892,7 @@ def main():
 
         eligible_guids, test_dataloader = build_guid_filtered_dataloader(
             [test_dataset_path],
+            max_guids=11,
             min_samples=22,
             stats_path=dataset_config.get('stat_path'),
             normalize_fields=dataloader_config.get('normalize_fields'),
