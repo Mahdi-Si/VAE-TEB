@@ -433,7 +433,8 @@ def plot_latent_trajectory(
     title='Latent Trajectory',
     color_by_time=True,
     point_size=20,
-    arrow_scale=0.3
+    arrow_scale=0.3,
+    plot_animation=True
 ):
     """
     Plot and save latent trajectory with arrows showing temporal evolution.
@@ -447,10 +448,11 @@ def plot_latent_trajectory(
         color_by_time: bool, color points by time progression
         point_size: int, size of trajectory points
         arrow_scale: float, scale factor for arrow size
+        plot_animation: bool, whether to generate animated GIF (default: True)
 
     Saves:
         - Static plot: {save_path}/trajectory_{sample_id}.png
-        - Animated GIF: {save_path}/trajectory_{sample_id}_animated.gif
+        - Animated GIF (if plot_animation=True): {save_path}/trajectory_{sample_id}_animated.gif
         - 3D HTML (if 3D): {save_path}/trajectory_{sample_id}_3d.html
     """
     # Convert sample_id to string
@@ -478,14 +480,14 @@ def plot_latent_trajectory(
     os.makedirs(save_path, exist_ok=True)
 
     if color_by_time:
-        colors = plt.cm.bwr(np.linspace(0, 1, time_steps))
+        colors = plt.cm.viridis(np.linspace(0, 1, time_steps))
     else:
         colors = ['blue'] * time_steps
 
     if n_dims == 2:
         fig, ax = plt.subplots(figsize=(10, 8))
         scatter = ax.scatter(latent_trajectory[:, 0], latent_trajectory[:, 1],
-                            c=np.arange(time_steps), cmap='bwr',
+                            c=np.arange(time_steps), cmap='viridis',
                             s=point_size, zorder=3)
 
         for i in range(time_steps - 1):
@@ -525,36 +527,37 @@ def plot_latent_trajectory(
         plt.close()
 
         # 2D Animation
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.set_xlim(latent_trajectory[:, 0].min() - 0.5, latent_trajectory[:, 0].max() + 0.5)
-        ax.set_ylim(latent_trajectory[:, 1].min() - 0.5, latent_trajectory[:, 1].max() + 0.5)
-        ax.set_xlabel('Latent Dim 1')
-        ax.set_ylabel('Latent Dim 2')
-        ax.set_title(f'{title} - {sample_id} (Animated)')
-        ax.grid(True, alpha=0.3)
+        if plot_animation:
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.set_xlim(latent_trajectory[:, 0].min() - 0.5, latent_trajectory[:, 0].max() + 0.5)
+            ax.set_ylim(latent_trajectory[:, 1].min() - 0.5, latent_trajectory[:, 1].max() + 0.5)
+            ax.set_xlabel('Latent Dim 1')
+            ax.set_ylabel('Latent Dim 2')
+            ax.set_title(f'{title} - {sample_id} (Animated)')
+            ax.grid(True, alpha=0.3)
 
-        line, = ax.plot([], [], 'b-', alpha=0.6, lw=2)
-        point, = ax.plot([], [], 'ro', markersize=8)
+            line, = ax.plot([], [], 'b-', alpha=0.6, lw=2)
+            point, = ax.plot([], [], 'ro', markersize=8)
 
-        def init():
-            line.set_data([], [])
-            point.set_data([], [])
-            return line, point
+            def init():
+                line.set_data([], [])
+                point.set_data([], [])
+                return line, point
 
-        def animate(i):
-            line.set_data(latent_trajectory[:i+1, 0], latent_trajectory[:i+1, 1])
-            point.set_data([latent_trajectory[i, 0]], [latent_trajectory[i, 1]])
-            return line, point
+            def animate(i):
+                line.set_data(latent_trajectory[:i+1, 0], latent_trajectory[:i+1, 1])
+                point.set_data([latent_trajectory[i, 0]], [latent_trajectory[i, 1]])
+                return line, point
 
-        anim = animation.FuncAnimation(
-            fig, animate, init_func=init,
-            frames=time_steps, interval=50, blit=True
-        )
-        anim.save(
-            f'{save_path}/trajectory_{sample_id}_animated.gif',
-            writer='pillow', fps=20
-        )
-        plt.close()
+            anim = animation.FuncAnimation(
+                fig, animate, init_func=init,
+                frames=time_steps, interval=50, blit=True
+            )
+            anim.save(
+                f'{save_path}/trajectory_{sample_id}_animated.gif',
+                writer='pillow', fps=20
+            )
+            plt.close()
 
     elif n_dims == 3:
         # 3D Static Plot
@@ -563,7 +566,7 @@ def plot_latent_trajectory(
         scatter = ax.scatter(
             latent_trajectory[:, 0], latent_trajectory[:, 1],
             latent_trajectory[:, 2], c=np.arange(time_steps),
-            cmap='bwr', s=point_size
+            cmap='viridis', s=point_size
         )
 
         # Draw arrows in 3D
@@ -602,38 +605,39 @@ def plot_latent_trajectory(
         plt.close()
 
         # 3D Animation
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.set_xlim(latent_trajectory[:, 0].min() - 0.5, latent_trajectory[:, 0].max() + 0.5)
-        ax.set_ylim(latent_trajectory[:, 1].min() - 0.5, latent_trajectory[:, 1].max() + 0.5)
-        ax.set_zlim(latent_trajectory[:, 2].min() - 0.5, latent_trajectory[:, 2].max() + 0.5)
-        ax.set_xlabel('Latent Dim 1')
-        ax.set_ylabel('Latent Dim 2')
-        ax.set_zlabel('Latent Dim 3')
-        ax.set_title(f'{title} - {sample_id} (Animated)')
+        if plot_animation:
+            fig = plt.figure(figsize=(12, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.set_xlim(latent_trajectory[:, 0].min() - 0.5, latent_trajectory[:, 0].max() + 0.5)
+            ax.set_ylim(latent_trajectory[:, 1].min() - 0.5, latent_trajectory[:, 1].max() + 0.5)
+            ax.set_zlim(latent_trajectory[:, 2].min() - 0.5, latent_trajectory[:, 2].max() + 0.5)
+            ax.set_xlabel('Latent Dim 1')
+            ax.set_ylabel('Latent Dim 2')
+            ax.set_zlabel('Latent Dim 3')
+            ax.set_title(f'{title} - {sample_id} (Animated)')
 
-        line, = ax.plot([], [], [], 'b-', alpha=0.6, lw=2)
-        point, = ax.plot([], [], [], 'ro', markersize=8)
+            line, = ax.plot([], [], [], 'b-', alpha=0.6, lw=2)
+            point, = ax.plot([], [], [], 'ro', markersize=8)
 
-        def init():
-            line.set_data([], [])
-            line.set_3d_properties([])
-            point.set_data([], [])
-            point.set_3d_properties([])
-            return line, point
+            def init():
+                line.set_data([], [])
+                line.set_3d_properties([])
+                point.set_data([], [])
+                point.set_3d_properties([])
+                return line, point
 
-        def animate(i):
-            line.set_data(latent_trajectory[:i+1, 0], latent_trajectory[:i+1, 1])
-            line.set_3d_properties(latent_trajectory[:i+1, 2])
-            point.set_data([latent_trajectory[i, 0]], [latent_trajectory[i, 1]])
-            point.set_3d_properties([latent_trajectory[i, 2]])
-            return line, point
+            def animate(i):
+                line.set_data(latent_trajectory[:i+1, 0], latent_trajectory[:i+1, 1])
+                line.set_3d_properties(latent_trajectory[:i+1, 2])
+                point.set_data([latent_trajectory[i, 0]], [latent_trajectory[i, 1]])
+                point.set_3d_properties([latent_trajectory[i, 2]])
+                return line, point
 
-        anim = animation.FuncAnimation(fig, animate, init_func=init,
-                                      frames=time_steps, interval=50, blit=True)
-        anim.save(f'{save_path}/trajectory_{sample_id}_animated.gif',
-                 writer='pillow', fps=20)
-        plt.close()
+            anim = animation.FuncAnimation(fig, animate, init_func=init,
+                                          frames=time_steps, interval=50, blit=True)
+            anim.save(f'{save_path}/trajectory_{sample_id}_animated.gif',
+                     writer='pillow', fps=20)
+            plt.close()
 
         # 3D Interactive HTML using plotly
         try:
@@ -647,7 +651,7 @@ def plot_latent_trajectory(
                 marker=dict(
                     size=5,
                     color=np.arange(time_steps),
-                    colorscale='RdBu',
+                    colorscale='Viridis',
                     showscale=True,
                     colorbar=dict(
                         title="Time Step",
@@ -804,7 +808,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                     title='Latent Trajectory',
                     color_by_time=True,
                     point_size=100,
-                    arrow_scale=0.3
+                    arrow_scale=0.3,
+                    plot_animation=False
                 )                
                 
                 reduced_latent_mean_summary = summarize_trajectory(
