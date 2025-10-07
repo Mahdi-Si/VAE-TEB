@@ -1,7 +1,7 @@
 import os
 import h5py
 import numpy as np
-from typing import Union, Sequence, List, Tuple, Dict, Any, Optional
+from typing import Union, Sequence, List, Tuple, Dict, Any, Optional, Iterable
 import torch
 from torch.utils.data import Dataset
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
@@ -13,6 +13,9 @@ from functools import lru_cache
 import gc
 from torch.utils.data.dataloader import default_collate
 import yaml
+import random
+from torch.utils.data import DataLoader, Sampler
+from collections import Counter, defaultdict
 
 
 def normalize_tensor_data(
@@ -908,3 +911,70 @@ def create_optimized_dataloader(
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=attribute_dict_collate
     )
+
+
+# ---------------------------------------
+# Get per guid batches
+# ---------------------------------------
+
+class GuidBatchSampler(Sampler[List[int]]):
+    """Yield one batch—that GUID’s samples—at a time."""
+    def __init__(self, guid_to_indices: Dict[str, List[int]], shuffle: bool = False) -> None:
+        super().__init__(None)
+        self._guid_to_indices = {g: idxs[:] for g, idxs in guid_to_indices.items() if idxs}
+        self._guid_order = sorted(self._guid_to_indices)
+        self._shuffle = shuffle
+
+    def __iter__(self) -> Iterable[List[int]]:
+        order = self._guid_order[:]
+        if self._shuffle:
+            random.shuffle(order)
+        for guid in order:
+            yield self._guid_to_indices[guid]
+
+    def __len__(self) -> int:
+        return len(self._guid_to_indices)
+
+
+def build_guid_filtered_dataloader(
+    dataset_paths: Sequence[str],
+    min_samples: int = 22,
+    sampler_shuffle: bool = False,
+    stats_path: Optional[str] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    dataloader_overrides: Optional[Dict[str, Any]] = None,
+    **dataset_kwargs: Any,
+) -> Tuple[List[str], DataLoader]:
+    """
+    Create a DataLoader that yields one batch per GUID for GUIDs with > min_samples.
+    Returns (eligible_guid_list, dataloader).
+    """
+    dataset = CombinedHDF5Dataset(
+        paths=list(dataset_paths),
+        stats_path=stats_path,
+        normalize_fields=normalize_fields,
+        **dataset_kwargs,
+    )
+
+    guids, _, _ = dataset.get_the_lists()
+    counts = Counter(guids)
+    eligible_guids = [guid for guid, count in counts.items() if count > min_samples]
+
+    guid_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for idx, guid in enumerate(guids):
+        if counts[guid] > min_samples:
+            guid_to_indices[guid].append(idx)
+
+    batch_sampler = GuidBatchSampler(guid_to_indices, shuffle=sampler_shuffle)
+
+    loader_kwargs: Dict[str, Any] = {
+        "batch_sampler": batch_sampler,
+        "collate_fn": attribute_dict_collate,
+        "pin_memory": getattr(dataset, "pin_memory", False),
+        "num_workers": 0,
+    }
+    if dataloader_overrides:
+        loader_kwargs.update(dataloader_overrides)
+
+    dataloader = DataLoader(dataset, **loader_kwargs)
+    return eligible_guids, dataloader

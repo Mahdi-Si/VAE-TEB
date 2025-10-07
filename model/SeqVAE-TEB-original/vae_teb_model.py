@@ -1193,405 +1193,405 @@ class SeqVaeTeb(nn.Module):
         mean = torch.nanmean(y, dim=1)  # → shape (B, new_C)
         return y, mean
 
-
-class SeqVaeTebClassifier(nn.Module):
-    """
-    Combined model that integrates SeqVaeTeb encoder with FHR Inception Time classifier.
-    
-    This model can:
-    1. Load a pretrained SeqVaeTeb model for feature extraction
-    2. Freeze the SeqVaeTeb encoder during classification training
-    3. Fine-tune the entire model end-to-end
-    4. Perform classification on learned latent representations
-    """
-    
-    def __init__(
-        self,
-        # Classifier parameters
-        num_classes: int = 2,
-        classifier_filters: int = 32,
-        classifier_depth: int = 6,
-        classifier_dropout: float = 0.2,
-        use_attention: bool = True,
-        # Training parameters
-        latent_dim_z: int = 16,
-        freeze_vae: bool = True,
-        pretrained_vae_path: Optional[str] = None,
-        class_weights: Optional[torch.Tensor] = None,
-    ):
-        super().__init__()
-        
-        self.freeze_vae = freeze_vae
-        self.num_classes = num_classes
-        
-        # Initialize SeqVaeTeb encoder
-        self.vae_model = SeqVaeTeb()
-        
-        # Load pretrained VAE if provided
-        if pretrained_vae_path is not None:
-            self.load_pretrained_vae(pretrained_vae_path)
-        
-        # Freeze VAE parameters if specified
-        if freeze_vae:
-            self.freeze_vae_parameters()
-        
-        # Import FHRInceptionTimeClassifier
-        try:
-            from model.inception_time import FHRInceptionTimeClassifier
-        except ImportError:
-            from inception_time import FHRInceptionTimeClassifier
-        
-        # Initialize classifier
-        self.classifier = FHRInceptionTimeClassifier(
-            input_size=latent_dim_z,
-            num_classes=num_classes,
-            filters=classifier_filters,
-            depth=classifier_depth,
-            dropout=classifier_dropout,
-            use_attention=use_attention
-        )
-        
-        self.classification_criterion = nn.CrossEntropyLoss(weight=class_weights)
-        
-    def load_pretrained_vae(self, pretrained_path: str):
-        """Load pretrained SeqVaeTeb weights (Lightning/DataParallel/torch.compile safe).
-
-        Notes:
-        - Lightning checkpoints typically store weights under 'state_dict' and prefix with
-          'model.'; nested modules may appear as 'model.vae_model.' etc.
-        - DataParallel adds 'module.' and torch.compile can add an '_orig_mod.' wrapper.
-        - This method strips these known prefixes and filters keys to the bare `SeqVaeTeb`.
-        - Shape mismatches raise with details; other discrepancies are logged as warnings.
-        """
-        try:
-            ckpt = torch.load(pretrained_path, map_location="cpu")
-            # Prefer Lightning's 'state_dict' if present; otherwise treat the whole object as a state dict
-            sd = ckpt.get("state_dict", ckpt)
-
-            # Normalize key prefixes from common wrappers
-            def _normalize_key(k: str) -> str:
-                prefixes = (
-                    "model.",
-                    "module.",
-                    "_orig_mod.",
-                    "seqvae_model.",
-                    "vae_model.",
-                )
-                changed = True
-                while changed:
-                    changed = False
-                    for p in prefixes:
-                        if k.startswith(p):
-                            k = k[len(p):]
-                            changed = True
-                return k
-
-            # Get current model state_dict to check compatibility
-            current_sd = self.vae_model.state_dict()
-            expected_keys = set(current_sd.keys())
-            
-            # Strip prefixes and filter only keys that belong to the VAE module
-            new_sd = {}
-            for k, v in sd.items():
-                nk = _normalize_key(k)
-                if nk in expected_keys:
-                    new_sd[nk] = v
-            
-            # Check for shape mismatches in existing keys
-            shape_mismatches = []
-            for k, v in new_sd.items():
-                if k in current_sd and current_sd[k].shape != v.shape:
-                    shape_mismatches.append(f"{k}: current {current_sd[k].shape} vs checkpoint {v.shape}")
-            
-            if shape_mismatches:
-                raise ValueError(f"VAE architecture mismatch - parameter shape conflicts:\n" + 
-                               "\n".join(shape_mismatches[:5]) + 
-                               (f"\n... and {len(shape_mismatches)-5} more" if len(shape_mismatches) > 5 else ""))
-
-            # Load with strict=False to get missing/unexpected keys info
-            incompatible = self.vae_model.load_state_dict(new_sd, strict=False)
-
-            # Support both tuple and IncompatibleKeys return types
-            try:
-                missing_keys = getattr(incompatible, "missing_keys", [])
-                unexpected_keys = getattr(incompatible, "unexpected_keys", [])
-            except Exception:
-                try:
-                    missing_keys, unexpected_keys = incompatible
-                except Exception:
-                    missing_keys, unexpected_keys = [], []
-
-            # Log any remaining discrepancies (should be minimal after normalization)
-            if missing_keys:
-                log.warning(f"[SeqVaeTebClassifier] Missing keys when loading VAE: {missing_keys}")
-            if unexpected_keys:
-                log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading VAE: {unexpected_keys}")
-
-            log.info(f"Successfully loaded all VAE parameters from {pretrained_path}")
-
-        except Exception as e:
-            log.error(f"Failed to load pretrained VAE from '{pretrained_path}': {e}")
-            raise RuntimeError(f"Cannot load incompatible VAE checkpoint. Please use a checkpoint that matches "
-                             f"the current VAE architecture, or train from scratch.") from e
-    
-    def freeze_vae_parameters(self):
-        """Freeze all VAE parameters to prevent updates during classification training."""
-        for param in self.vae_model.parameters():
-            param.requires_grad = False
-        log.info("Frozen VAE parameters for classification training")
-    
-    def unfreeze_vae_parameters(self):
-        """Unfreeze VAE parameters for end-to-end fine-tuning."""
-        for param in self.vae_model.parameters():
-            param.requires_grad = True
-        log.info("Unfrozen VAE parameters for end-to-end training")
-    
-    def extract_latent_features(
-        self,
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor,
-        x_ph: torch.Tensor,
-        return_all_outputs: bool = False
-    ):
-        """
-        Extract latent features from the VAE encoder.
-        
-        Args:
-            y_st: Target scattering input (batch, 300, 43)
-            y_ph: Target phase harmonic input (batch, 300, 44)
-            x_ph: Source phase harmonic input (batch, 300, 130)
-            return_all_outputs: Whether to return all VAE outputs or just latent z
-            
-        Returns:
-            latent_z: Latent representations (batch, 300, latent_dim_z)
-            vae_outputs: Full VAE outputs (if return_all_outputs=True)
-        """
-        # Set VAE to eval mode if frozen
-        if self.freeze_vae:
-            self.vae_model.eval()
-        
-        # Forward pass through VAE
-        with torch.set_grad_enabled(not self.freeze_vae):
-            vae_outputs = self.vae_model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
-        
-        latent_z = vae_outputs['z']  # (batch, 300, latent_dim_z)
-        
-        if return_all_outputs:
-            return latent_z, vae_outputs
-        return latent_z
-    
-    def forward(
-        self,
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor,
-        x_ph: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        return_latent: bool = False
-    ):
-        """
-        Forward pass for classification.
-        
-        Args:
-            y_st: Target scattering input (batch, 300, 43)
-            y_ph: Target phase harmonic input (batch, 300, 44)  
-            x_ph: Source phase harmonic input (batch, 300, 130)
-            labels: Ground truth labels for loss computation (batch,)
-            return_latent: Whether to return latent representations
-            
-        Returns:
-            Dictionary containing classification results and optionally latent features
-        """
-        # Extract latent features
-        latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
-        
-        # Classification
-        logits = self.classifier(latent_z)  # (batch, num_classes)
-        
-        # Compute loss if labels provided
-        classification_loss = None
-        if labels is not None:
-            classification_loss = self.classification_criterion(logits, labels)
-        
-        # Prepare outputs
-        outputs = {
-            'logits': logits,
-            'probabilities': F.softmax(logits, dim=-1),
-            'predictions': torch.argmax(logits, dim=-1),
-            'classification_loss': classification_loss,
-        }
-        
-        if return_latent:
-            outputs['latent_z'] = latent_z
-            
-        return outputs
-    
-    def compute_loss(
-        self,
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor,
-        x_ph: torch.Tensor,
-        labels: torch.Tensor,
-        y_raw: Optional[torch.Tensor] = None,
-        compute_vae_loss: bool = False,
-        vae_loss_weight: float = 0.1
-    ):
-        """
-        Compute combined loss for classification and optionally VAE reconstruction.
-        
-        Args:
-            y_st, y_ph, x_ph: Input tensors
-            labels: Classification labels (batch,)
-            y_raw: Raw signal for VAE loss computation (batch, 4800)
-            compute_vae_loss: Whether to include VAE reconstruction loss
-            vae_loss_weight: Weight for VAE loss component
-            
-        Returns:
-            Dictionary of loss components
-        """
-        # Get classification outputs
-        if compute_vae_loss and y_raw is not None:
-            # Need full VAE outputs for reconstruction loss
-            latent_z, vae_outputs = self.extract_latent_features(
-                y_st, y_ph, x_ph, return_all_outputs=True
-            )
-            
-            # Compute VAE losses
-            vae_losses = self.vae_model.compute_loss(
-                forward_outputs=vae_outputs,
-                y_st=y_st,
-                y_ph=y_ph,
-                y_raw=y_raw,
-                compute_kld_loss=True,
-                beta=1.0  # Default beta for classifier training
-            )
-            vae_total_loss = vae_losses['total_loss']
-        else:
-            latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
-            vae_total_loss = torch.tensor(0.0, device=latent_z.device)
-        
-        # Classification loss
-        logits = self.classifier(latent_z)
-        classification_loss = self.classification_criterion(logits, labels)
-        
-        # Combined loss
-        total_loss = classification_loss + vae_loss_weight * vae_total_loss
-        
-        return {
-            'classification_loss': classification_loss,
-            'vae_loss': vae_total_loss,
-            'total_loss': total_loss,
-            'logits': logits,
-            'probabilities': F.softmax(logits, dim=-1),
-            'predictions': torch.argmax(logits, dim=-1),
-        }
-    
-    def predict(
-        self,
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor,
-        x_ph: torch.Tensor,
-        return_probabilities: bool = True
-    ):
-        """
-        Make predictions on input data.
-        
-        Args:
-            y_st, y_ph, x_ph: Input tensors
-            return_probabilities: Whether to return class probabilities
-            
-        Returns:
-            Predictions and optionally probabilities
-        """
-        self.eval()
-        with torch.no_grad():
-            outputs = self.forward(
-                y_st=y_st, y_ph=y_ph, x_ph=x_ph,
-                labels=None, return_latent=False
-            )
-        
-        if return_probabilities:
-            return outputs['predictions'], outputs['probabilities']
-        return outputs['predictions']
-
-    # ---------------------- Loading utilities ----------------------
-    @classmethod
-    def from_lightning_checkpoint(
-        cls,
-        ckpt_path: str,
-        *,
-        map_location: Union[str, torch.device] = "cpu",
-        strict: bool = False,
-        compile_model: bool = False,
-        compile_mode: str = "max-autotune-no-cudagraphs",
-        init_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> "SeqVaeTebClassifier":
-        """
-        Construct a SeqVaeTebClassifier and load weights from a Lightning checkpoint
-        produced by LightSeqVaeTebClassifier.
-
-        The Lightning checkpoint's state_dict is under the 'model.' prefix since the
-        LightningModule wraps the classifier as self.model. This method strips that
-        prefix and loads into a bare SeqVaeTebClassifier.
-
-        Args:
-            ckpt_path: Path to the .ckpt file saved by Lightning
-            map_location: torch.load map_location
-            strict: Whether to enforce exact key matching
-            compile_model: If True, wraps the returned model with torch.compile
-            compile_mode: torch.compile mode (default: 'max-autotune-no-cudagraphs')
-            init_kwargs: Keyword args to instantiate the classifier (e.g., num_classes,...)
-
-        Returns:
-            Loaded SeqVaeTebClassifier instance (optionally compiled)
-        """
-        init_kwargs = init_kwargs or {}
-        model = cls(**init_kwargs)
-
-        ckpt = torch.load(ckpt_path, map_location=map_location)
-        sd = ckpt.get("state_dict", ckpt)
-
-        # Normalize common wrapper prefixes and filter to classifier keys
-        def _normalize_key(k: str) -> str:
-            prefixes = (
-                "model.",
-                "module.",
-                "_orig_mod.",
-            )
-            changed = True
-            while changed:
-                changed = False
-                for p in prefixes:
-                    if k.startswith(p):
-                        k = k[len(p):]
-                        changed = True
-            return k
-
-        expected_keys = set(model.state_dict().keys())
-        new_sd = {(_normalize_key(k)): v for k, v in sd.items() if _normalize_key(k) in expected_keys}
-
-        incompatible = model.load_state_dict(new_sd, strict=strict)
-        try:
-            missing_keys = getattr(incompatible, "missing_keys", [])
-            unexpected_keys = getattr(incompatible, "unexpected_keys", [])
-        except Exception:
-            try:
-                missing_keys, unexpected_keys = incompatible
-            except Exception:
-                missing_keys, unexpected_keys = [], []
-
-        if missing_keys:
-            log.warning(f"[SeqVaeTebClassifier] Missing keys when loading classifier: {missing_keys}")
-        if unexpected_keys:
-            log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading classifier: {unexpected_keys}")
-
-        if compile_model:
-            try:
-                model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=True)
-                log.info(f"Compiled SeqVaeTebClassifier with torch.compile mode={compile_mode}")
-            except Exception as e:
-                log.warning(f"torch.compile failed for classifier: {e}. Proceeding without compilation.")
-
-        return model
+#
+# class SeqVaeTebClassifier(nn.Module):
+#     """
+#     Combined model that integrates SeqVaeTeb encoder with FHR Inception Time classifier.
+#
+#     This model can:
+#     1. Load a pretrained SeqVaeTeb model for feature extraction
+#     2. Freeze the SeqVaeTeb encoder during classification training
+#     3. Fine-tune the entire model end-to-end
+#     4. Perform classification on learned latent representations
+#     """
+#
+#     def __init__(
+#         self,
+#         # Classifier parameters
+#         num_classes: int = 2,
+#         classifier_filters: int = 32,
+#         classifier_depth: int = 6,
+#         classifier_dropout: float = 0.2,
+#         use_attention: bool = True,
+#         # Training parameters
+#         latent_dim_z: int = 16,
+#         freeze_vae: bool = True,
+#         pretrained_vae_path: Optional[str] = None,
+#         class_weights: Optional[torch.Tensor] = None,
+#     ):
+#         super().__init__()
+#
+#         self.freeze_vae = freeze_vae
+#         self.num_classes = num_classes
+#
+#         # Initialize SeqVaeTeb encoder
+#         self.vae_model = SeqVaeTeb()
+#
+#         # Load pretrained VAE if provided
+#         if pretrained_vae_path is not None:
+#             self.load_pretrained_vae(pretrained_vae_path)
+#
+#         # Freeze VAE parameters if specified
+#         if freeze_vae:
+#             self.freeze_vae_parameters()
+#
+#         # Import FHRInceptionTimeClassifier
+#         try:
+#             from model.inception_time import FHRInceptionTimeClassifier
+#         except ImportError:
+#             from inception_time import FHRInceptionTimeClassifier
+#
+#         # Initialize classifier
+#         self.classifier = FHRInceptionTimeClassifier(
+#             input_size=latent_dim_z,
+#             num_classes=num_classes,
+#             filters=classifier_filters,
+#             depth=classifier_depth,
+#             dropout=classifier_dropout,
+#             use_attention=use_attention
+#         )
+#
+#         self.classification_criterion = nn.CrossEntropyLoss(weight=class_weights)
+#
+#     def load_pretrained_vae(self, pretrained_path: str):
+#         """Load pretrained SeqVaeTeb weights (Lightning/DataParallel/torch.compile safe).
+#
+#         Notes:
+#         - Lightning checkpoints typically store weights under 'state_dict' and prefix with
+#           'model.'; nested modules may appear as 'model.vae_model.' etc.
+#         - DataParallel adds 'module.' and torch.compile can add an '_orig_mod.' wrapper.
+#         - This method strips these known prefixes and filters keys to the bare `SeqVaeTeb`.
+#         - Shape mismatches raise with details; other discrepancies are logged as warnings.
+#         """
+#         try:
+#             ckpt = torch.load(pretrained_path, map_location="cpu")
+#             # Prefer Lightning's 'state_dict' if present; otherwise treat the whole object as a state dict
+#             sd = ckpt.get("state_dict", ckpt)
+#
+#             # Normalize key prefixes from common wrappers
+#             def _normalize_key(k: str) -> str:
+#                 prefixes = (
+#                     "model.",
+#                     "module.",
+#                     "_orig_mod.",
+#                     "seqvae_model.",
+#                     "vae_model.",
+#                 )
+#                 changed = True
+#                 while changed:
+#                     changed = False
+#                     for p in prefixes:
+#                         if k.startswith(p):
+#                             k = k[len(p):]
+#                             changed = True
+#                 return k
+#
+#             # Get current model state_dict to check compatibility
+#             current_sd = self.vae_model.state_dict()
+#             expected_keys = set(current_sd.keys())
+#
+#             # Strip prefixes and filter only keys that belong to the VAE module
+#             new_sd = {}
+#             for k, v in sd.items():
+#                 nk = _normalize_key(k)
+#                 if nk in expected_keys:
+#                     new_sd[nk] = v
+#
+#             # Check for shape mismatches in existing keys
+#             shape_mismatches = []
+#             for k, v in new_sd.items():
+#                 if k in current_sd and current_sd[k].shape != v.shape:
+#                     shape_mismatches.append(f"{k}: current {current_sd[k].shape} vs checkpoint {v.shape}")
+#
+#             if shape_mismatches:
+#                 raise ValueError(f"VAE architecture mismatch - parameter shape conflicts:\n" +
+#                                "\n".join(shape_mismatches[:5]) +
+#                                (f"\n... and {len(shape_mismatches)-5} more" if len(shape_mismatches) > 5 else ""))
+#
+#             # Load with strict=False to get missing/unexpected keys info
+#             incompatible = self.vae_model.load_state_dict(new_sd, strict=False)
+#
+#             # Support both tuple and IncompatibleKeys return types
+#             try:
+#                 missing_keys = getattr(incompatible, "missing_keys", [])
+#                 unexpected_keys = getattr(incompatible, "unexpected_keys", [])
+#             except Exception:
+#                 try:
+#                     missing_keys, unexpected_keys = incompatible
+#                 except Exception:
+#                     missing_keys, unexpected_keys = [], []
+#
+#             # Log any remaining discrepancies (should be minimal after normalization)
+#             if missing_keys:
+#                 log.warning(f"[SeqVaeTebClassifier] Missing keys when loading VAE: {missing_keys}")
+#             if unexpected_keys:
+#                 log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading VAE: {unexpected_keys}")
+#
+#             log.info(f"Successfully loaded all VAE parameters from {pretrained_path}")
+#
+#         except Exception as e:
+#             log.error(f"Failed to load pretrained VAE from '{pretrained_path}': {e}")
+#             raise RuntimeError(f"Cannot load incompatible VAE checkpoint. Please use a checkpoint that matches "
+#                              f"the current VAE architecture, or train from scratch.") from e
+#
+#     def freeze_vae_parameters(self):
+#         """Freeze all VAE parameters to prevent updates during classification training."""
+#         for param in self.vae_model.parameters():
+#             param.requires_grad = False
+#         log.info("Frozen VAE parameters for classification training")
+#
+#     def unfreeze_vae_parameters(self):
+#         """Unfreeze VAE parameters for end-to-end fine-tuning."""
+#         for param in self.vae_model.parameters():
+#             param.requires_grad = True
+#         log.info("Unfrozen VAE parameters for end-to-end training")
+#
+#     def extract_latent_features(
+#         self,
+#         y_st: torch.Tensor,
+#         y_ph: torch.Tensor,
+#         x_ph: torch.Tensor,
+#         return_all_outputs: bool = False
+#     ):
+#         """
+#         Extract latent features from the VAE encoder.
+#
+#         Args:
+#             y_st: Target scattering input (batch, 300, 43)
+#             y_ph: Target phase harmonic input (batch, 300, 44)
+#             x_ph: Source phase harmonic input (batch, 300, 130)
+#             return_all_outputs: Whether to return all VAE outputs or just latent z
+#
+#         Returns:
+#             latent_z: Latent representations (batch, 300, latent_dim_z)
+#             vae_outputs: Full VAE outputs (if return_all_outputs=True)
+#         """
+#         # Set VAE to eval mode if frozen
+#         if self.freeze_vae:
+#             self.vae_model.eval()
+#
+#         # Forward pass through VAE
+#         with torch.set_grad_enabled(not self.freeze_vae):
+#             vae_outputs = self.vae_model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+#
+#         latent_z = vae_outputs['z']  # (batch, 300, latent_dim_z)
+#
+#         if return_all_outputs:
+#             return latent_z, vae_outputs
+#         return latent_z
+#
+#     def forward(
+#         self,
+#         y_st: torch.Tensor,
+#         y_ph: torch.Tensor,
+#         x_ph: torch.Tensor,
+#         labels: Optional[torch.Tensor] = None,
+#         return_latent: bool = False
+#     ):
+#         """
+#         Forward pass for classification.
+#
+#         Args:
+#             y_st: Target scattering input (batch, 300, 43)
+#             y_ph: Target phase harmonic input (batch, 300, 44)
+#             x_ph: Source phase harmonic input (batch, 300, 130)
+#             labels: Ground truth labels for loss computation (batch,)
+#             return_latent: Whether to return latent representations
+#
+#         Returns:
+#             Dictionary containing classification results and optionally latent features
+#         """
+#         # Extract latent features
+#         latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
+#
+#         # Classification
+#         logits = self.classifier(latent_z)  # (batch, num_classes)
+#
+#         # Compute loss if labels provided
+#         classification_loss = None
+#         if labels is not None:
+#             classification_loss = self.classification_criterion(logits, labels)
+#
+#         # Prepare outputs
+#         outputs = {
+#             'logits': logits,
+#             'probabilities': F.softmax(logits, dim=-1),
+#             'predictions': torch.argmax(logits, dim=-1),
+#             'classification_loss': classification_loss,
+#         }
+#
+#         if return_latent:
+#             outputs['latent_z'] = latent_z
+#
+#         return outputs
+#
+#     def compute_loss(
+#         self,
+#         y_st: torch.Tensor,
+#         y_ph: torch.Tensor,
+#         x_ph: torch.Tensor,
+#         labels: torch.Tensor,
+#         y_raw: Optional[torch.Tensor] = None,
+#         compute_vae_loss: bool = False,
+#         vae_loss_weight: float = 0.1
+#     ):
+#         """
+#         Compute combined loss for classification and optionally VAE reconstruction.
+#
+#         Args:
+#             y_st, y_ph, x_ph: Input tensors
+#             labels: Classification labels (batch,)
+#             y_raw: Raw signal for VAE loss computation (batch, 4800)
+#             compute_vae_loss: Whether to include VAE reconstruction loss
+#             vae_loss_weight: Weight for VAE loss component
+#
+#         Returns:
+#             Dictionary of loss components
+#         """
+#         # Get classification outputs
+#         if compute_vae_loss and y_raw is not None:
+#             # Need full VAE outputs for reconstruction loss
+#             latent_z, vae_outputs = self.extract_latent_features(
+#                 y_st, y_ph, x_ph, return_all_outputs=True
+#             )
+#
+#             # Compute VAE losses
+#             vae_losses = self.vae_model.compute_loss(
+#                 forward_outputs=vae_outputs,
+#                 y_st=y_st,
+#                 y_ph=y_ph,
+#                 y_raw=y_raw,
+#                 compute_kld_loss=True,
+#                 beta=1.0  # Default beta for classifier training
+#             )
+#             vae_total_loss = vae_losses['total_loss']
+#         else:
+#             latent_z = self.extract_latent_features(y_st, y_ph, x_ph)
+#             vae_total_loss = torch.tensor(0.0, device=latent_z.device)
+#
+#         # Classification loss
+#         logits = self.classifier(latent_z)
+#         classification_loss = self.classification_criterion(logits, labels)
+#
+#         # Combined loss
+#         total_loss = classification_loss + vae_loss_weight * vae_total_loss
+#
+#         return {
+#             'classification_loss': classification_loss,
+#             'vae_loss': vae_total_loss,
+#             'total_loss': total_loss,
+#             'logits': logits,
+#             'probabilities': F.softmax(logits, dim=-1),
+#             'predictions': torch.argmax(logits, dim=-1),
+#         }
+#
+#     def predict(
+#         self,
+#         y_st: torch.Tensor,
+#         y_ph: torch.Tensor,
+#         x_ph: torch.Tensor,
+#         return_probabilities: bool = True
+#     ):
+#         """
+#         Make predictions on input data.
+#
+#         Args:
+#             y_st, y_ph, x_ph: Input tensors
+#             return_probabilities: Whether to return class probabilities
+#
+#         Returns:
+#             Predictions and optionally probabilities
+#         """
+#         self.eval()
+#         with torch.no_grad():
+#             outputs = self.forward(
+#                 y_st=y_st, y_ph=y_ph, x_ph=x_ph,
+#                 labels=None, return_latent=False
+#             )
+#
+#         if return_probabilities:
+#             return outputs['predictions'], outputs['probabilities']
+#         return outputs['predictions']
+#
+#     # ---------------------- Loading utilities ----------------------
+#     @classmethod
+#     def from_lightning_checkpoint(
+#         cls,
+#         ckpt_path: str,
+#         *,
+#         map_location: Union[str, torch.device] = "cpu",
+#         strict: bool = False,
+#         compile_model: bool = False,
+#         compile_mode: str = "max-autotune-no-cudagraphs",
+#         init_kwargs: Optional[Dict[str, Any]] = None,
+#     ) -> "SeqVaeTebClassifier":
+#         """
+#         Construct a SeqVaeTebClassifier and load weights from a Lightning checkpoint
+#         produced by LightSeqVaeTebClassifier.
+#
+#         The Lightning checkpoint's state_dict is under the 'model.' prefix since the
+#         LightningModule wraps the classifier as self.model. This method strips that
+#         prefix and loads into a bare SeqVaeTebClassifier.
+#
+#         Args:
+#             ckpt_path: Path to the .ckpt file saved by Lightning
+#             map_location: torch.load map_location
+#             strict: Whether to enforce exact key matching
+#             compile_model: If True, wraps the returned model with torch.compile
+#             compile_mode: torch.compile mode (default: 'max-autotune-no-cudagraphs')
+#             init_kwargs: Keyword args to instantiate the classifier (e.g., num_classes,...)
+#
+#         Returns:
+#             Loaded SeqVaeTebClassifier instance (optionally compiled)
+#         """
+#         init_kwargs = init_kwargs or {}
+#         model = cls(**init_kwargs)
+#
+#         ckpt = torch.load(ckpt_path, map_location=map_location)
+#         sd = ckpt.get("state_dict", ckpt)
+#
+#         # Normalize common wrapper prefixes and filter to classifier keys
+#         def _normalize_key(k: str) -> str:
+#             prefixes = (
+#                 "model.",
+#                 "module.",
+#                 "_orig_mod.",
+#             )
+#             changed = True
+#             while changed:
+#                 changed = False
+#                 for p in prefixes:
+#                     if k.startswith(p):
+#                         k = k[len(p):]
+#                         changed = True
+#             return k
+#
+#         expected_keys = set(model.state_dict().keys())
+#         new_sd = {(_normalize_key(k)): v for k, v in sd.items() if _normalize_key(k) in expected_keys}
+#
+#         incompatible = model.load_state_dict(new_sd, strict=strict)
+#         try:
+#             missing_keys = getattr(incompatible, "missing_keys", [])
+#             unexpected_keys = getattr(incompatible, "unexpected_keys", [])
+#         except Exception:
+#             try:
+#                 missing_keys, unexpected_keys = incompatible
+#             except Exception:
+#                 missing_keys, unexpected_keys = [], []
+#
+#         if missing_keys:
+#             log.warning(f"[SeqVaeTebClassifier] Missing keys when loading classifier: {missing_keys}")
+#         if unexpected_keys:
+#             log.warning(f"[SeqVaeTebClassifier] Unexpected keys when loading classifier: {unexpected_keys}")
+#
+#         if compile_model:
+#             try:
+#                 model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=True)
+#                 log.info(f"Compiled SeqVaeTebClassifier with torch.compile mode={compile_mode}")
+#             except Exception as e:
+#                 log.warning(f"torch.compile failed for classifier: {e}. Proceeding without compilation.")
+#
+#         return model
 
 
 if __name__ == "__main__":

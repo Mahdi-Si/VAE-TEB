@@ -26,7 +26,7 @@ from loguru import logger
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data, create_optimized_dataloader
-from model.graph_model_train import SeqVAEGraphModel, denormalize_signal_data
+from graph_model_train import SeqVAEGraphModel, denormalize_signal_data
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
