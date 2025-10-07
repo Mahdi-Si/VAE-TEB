@@ -478,14 +478,14 @@ def plot_latent_trajectory(
     os.makedirs(save_path, exist_ok=True)
 
     if color_by_time:
-        colors = plt.cm.viridis(np.linspace(0, 1, time_steps))
+        colors = plt.cm.bwr(np.linspace(0, 1, time_steps))
     else:
         colors = ['blue'] * time_steps
 
     if n_dims == 2:
         fig, ax = plt.subplots(figsize=(10, 8))
         scatter = ax.scatter(latent_trajectory[:, 0], latent_trajectory[:, 1],
-                            c=np.arange(time_steps), cmap='viridis',
+                            c=np.arange(time_steps), cmap='bwr',
                             s=point_size, zorder=3)
 
         for i in range(time_steps - 1):
@@ -563,7 +563,7 @@ def plot_latent_trajectory(
         scatter = ax.scatter(
             latent_trajectory[:, 0], latent_trajectory[:, 1],
             latent_trajectory[:, 2], c=np.arange(time_steps),
-            cmap='viridis', s=point_size
+            cmap='bwr', s=point_size
         )
 
         # Draw arrows in 3D
@@ -647,13 +647,21 @@ def plot_latent_trajectory(
                 marker=dict(
                     size=5,
                     color=np.arange(time_steps),
-                    colorscale='Viridis',
+                    colorscale='RdBu',
                     showscale=True,
-                    colorbar=dict(title="Time Step")
+                    colorbar=dict(
+                        title="Time Step",
+                        x=1.15,
+                        xanchor='left',
+                        thickness=15,
+                        len=0.7
+                    )
                 ),
                 line=dict(color='blue', width=2),
                 text=[f'Time: {i}' for i in range(time_steps)],
-                hoverinfo='text'
+                hoverinfo='text',
+                name='Trajectory',
+                showlegend=True
             )])
 
             fig.add_trace(go.Scatter3d(
@@ -673,7 +681,16 @@ def plot_latent_trajectory(
                     yaxis_title='Latent Dim 2',
                     zaxis_title='Latent Dim 3'
                 ),
-                width=1000, height=800
+                width=1200, height=800,
+                legend=dict(
+                    x=0.02,
+                    y=0.98,
+                    xanchor='left',
+                    yanchor='top',
+                    bgcolor='rgba(255, 255, 255, 0.8)',
+                    bordercolor='black',
+                    borderwidth=1
+                )
             )
 
             fig.write_html(f'{save_path}/trajectory_{sample_id}_3d.html')
@@ -711,8 +728,12 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
             os.makedirs(save_dir, exist_ok=True)
         else:
             save_dir = self.test_results_dir
+
+        all_batches = list(test_dataloader)
+        selected_batches = random.sample(all_batches, min(10, len(all_batches)))
+
         with torch.inference_mode():
-            for batch in test_dataloader:
+            for batch in selected_batches:
                 fhr_st = batch.fhr_st.to(self.device)
                 fhr_ph = batch.fhr_ph.to(self.device)
                 fhr_up_ph = batch.fhr_up_ph.to(self.device)
@@ -752,13 +773,40 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 plot_latent_trajectory(
                     reduced_latent_mean[0],
                     epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[0]}",
+                    sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
+                    title='Latent Trajectory',
+                    color_by_time=True,
+                    point_size=100,
+                    arrow_scale=0.3
+                )
+                
+                plot_latent_trajectory(
+                    reduced_latent_mean[-1],
+                    epoch_laten_trajectory_path,
+                    sample_id=f"_{guid_in_batch}-{epoch[1]}-end",
                     title='Latent Trajectory',
                     color_by_time=True,
                     point_size=100,
                     arrow_scale=0.3
                 )
 
+                
+                
+                batch_size, reduced_time_steps, reduced_latent_dim = reduced_latent_mean.shape
+                all_reduced_latent_mean = reduced_latent_mean.reshape(
+                    batch_size * reduced_time_steps, reduced_latent_dim
+                )
+                all_laten_trajectory_path = os.path.join(save_dir, "all_epochs_trajectory_complete")
+                plot_latent_trajectory(
+                    all_reduced_latent_mean,
+                    all_laten_trajectory_path,
+                    sample_id=f"_{guid_in_batch}",
+                    title='Latent Trajectory',
+                    color_by_time=True,
+                    point_size=100,
+                    arrow_scale=0.3
+                )                
+                
                 reduced_latent_mean_summary = summarize_trajectory(
                     reduced_latent_mean,
                     k=10,
@@ -772,7 +820,17 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 plot_latent_trajectory(
                     reduced_latent_mean_summary[0],
                     epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[0]}",
+                    sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
+                    title='Latent Trajectory',
+                    color_by_time=True,
+                    point_size=100,
+                    arrow_scale=0.3
+                )
+                
+                plot_latent_trajectory(
+                    reduced_latent_mean_summary[-1],
+                    epoch_laten_trajectory_path,
+                    sample_id=f"_{guid_in_batch}-{epoch[-1]}-end",
                     title='Latent Trajectory',
                     color_by_time=True,
                     point_size=100,
