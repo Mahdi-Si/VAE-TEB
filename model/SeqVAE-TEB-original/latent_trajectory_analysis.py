@@ -426,6 +426,184 @@ def summarize_trajectory(
 # plotting methods
 # ------------------------------------------------------
 
+def plot_complete_fhr_up_timeline(
+    fhr,
+    up,
+    epoch,
+    save_path,
+    sample_id='sample_0',
+    title='Complete FHR and UP Timeline',
+    segment_duration_minutes=20,
+    sampling_rate_hz=4
+):
+    """
+    Plot complete FHR and UP signals along timeline with missing segments as gaps.
+
+    Args:
+        fhr: torch.Tensor or np.ndarray of shape (Batch_size, time_steps)
+             Fetal heart rate signal
+        up: torch.Tensor or np.ndarray of shape (Batch_size, time_steps)
+            Uterine pressure signal
+        epoch: torch.Tensor or np.ndarray of shape (Batch_size,)
+               Seconds before birth for each segment
+        save_path: str, directory path to save plot
+        sample_id: str or int, identifier for the sample
+        title: str, plot title
+        segment_duration_minutes: int, duration of each segment in minutes (default: 20)
+        sampling_rate_hz: float, sampling rate in Hz (default: 4 Hz)
+
+    Saves:
+        - Interactive HTML plot: {save_path}/timeline_{sample_id}.html
+
+    Notes:
+        - Missing segments will appear as gaps in the timeline
+        - The plot is wide and zoomable for detailed inspection
+        - X-axis shows time in minutes before birth (negative values)
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        logger.error("plotly not installed. Install with: pip install plotly")
+        return
+
+    # Convert to numpy if needed
+    if torch.is_tensor(fhr):
+        fhr = fhr.cpu().numpy()
+    if torch.is_tensor(up):
+        up = up.cpu().numpy()
+    if torch.is_tensor(epoch):
+        epoch = epoch.cpu().numpy()
+
+    sample_id = str(sample_id)
+    os.makedirs(save_path, exist_ok=True)
+
+    batch_size, time_steps = fhr.shape
+
+    # Calculate time points for each sample
+    time_per_step = 1.0 / sampling_rate_hz  # seconds per time step
+
+    # Create subplot figure with 2 rows (FHR and UP)
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=('Fetal Heart Rate (FHR)', 'Uterine Pressure (UP)'),
+        row_heights=[0.5, 0.5]
+    )
+
+    # Plot each segment individually so they don't connect
+    for i in range(batch_size):
+        # Epoch is already negative (e.g., -3600 = 3600 seconds before birth)
+        # Convert to minutes: -3600 seconds = -60 minutes
+        segment_start_minutes = epoch[i] / 60.0  # Already negative
+
+        # Create time array for this segment in minutes
+        segment_times_minutes = segment_start_minutes + np.arange(time_steps) * time_per_step / 60.0
+
+        # Add FHR trace for this segment
+        fig.add_trace(
+            go.Scatter(
+                x=segment_times_minutes,
+                y=fhr[i],
+                mode='lines',
+                name='FHR' if i == 0 else None,  # Only show legend for first segment
+                legendgroup='FHR',
+                showlegend=(i == 0),
+                line=dict(color='#E74C3C', width=1.5),
+                hovertemplate=f'Epoch {i}<br>Time: %{{x:.2f}} min before birth<br>FHR: %{{y:.1f}} bpm<extra></extra>'
+            ),
+            row=1, col=1
+        )
+
+        # Add UP trace for this segment
+        fig.add_trace(
+            go.Scatter(
+                x=segment_times_minutes,
+                y=up[i],
+                mode='lines',
+                name='UP' if i == 0 else None,  # Only show legend for first segment
+                legendgroup='UP',
+                showlegend=(i == 0),
+                line=dict(color='#3498DB', width=1.5),
+                hovertemplate=f'Epoch {i}<br>Time: %{{x:.2f}} min before birth<br>UP: %{{y:.1f}}<extra></extra>'
+            ),
+            row=2, col=1
+        )
+
+    # Update layout for wide, zoomable plot
+    fig.update_layout(
+        title=dict(
+            text=f'{title} - {sample_id}',
+            font=dict(size=20)
+        ),
+        width=2000,  # Wide plot for detailed inspection
+        height=600,
+        showlegend=True,
+        hovermode='x unified',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+
+    # Update x-axes
+    fig.update_xaxes(
+        title_text='Time (minutes before birth)',
+        gridcolor='lightgray',
+        showgrid=True,
+        showline=True,
+        linewidth=2,
+        linecolor='black',
+        mirror=True,
+        row=2, col=1
+    )
+
+    fig.update_xaxes(
+        showline=True,
+        linewidth=2,
+        linecolor='black',
+        mirror=True,
+        showgrid=True,
+        gridcolor='lightgray',
+        row=1, col=1
+    )
+
+    # Update y-axis for FHR
+    fig.update_yaxes(
+        title_text='FHR (bpm)',
+        gridcolor='lightgray',
+        showgrid=True,
+        showline=True,
+        linewidth=2,
+        linecolor='black',
+        mirror=True,
+        row=1, col=1
+    )
+
+    # Update y-axis for UP
+    fig.update_yaxes(
+        title_text='UP (mmHg)',
+        gridcolor='lightgray',
+        showgrid=True,
+        showline=True,
+        linewidth=2,
+        linecolor='black',
+        mirror=True,
+        row=2, col=1
+    )
+
+    # Save the plot
+    output_path = f'{save_path}/timeline_{sample_id}.html'
+    fig.write_html(output_path)
+    logger.info(f"Timeline plot saved to: {output_path}")
+
+
 def plot_latent_trajectory(
     latent_trajectory,
     save_path,
@@ -1140,6 +1318,7 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 fhr_ph = batch.fhr_ph.to(self.device)
                 fhr_up_ph = batch.fhr_up_ph.to(self.device)
                 fhr = batch.fhr.to(self.device)
+                up = batch.up.to(self.device)
                 epoch = batch.epoch  # Shape (Batch_size,)
                 guid_in_batch = batch['guid'][0]
 
@@ -1148,9 +1327,20 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 fhr_st = fhr_st[sort_indices]
                 fhr_ph = fhr_ph[sort_indices]
                 fhr_up_ph = fhr_up_ph[sort_indices]
-                fhr = fhr[sort_indices]
+                fhr = fhr[sort_indices]  # shape: (Batch, time_step)
+                up = up[sort_indices]  # shape: (Batch, time_step)
                 epoch = epoch[sort_indices]
 
+                fhr_up_plot_path = os.path.join(save_dir, "fhr-up-signals")
+                plot_complete_fhr_up_timeline(
+                    fhr=fhr,
+                    up=up,
+                    epoch=epoch,
+                    save_path=fhr_up_plot_path,
+                    sample_id=f"{guid_in_batch}",
+                    title='Complete FHR and UP Timeline',
+                    sampling_rate_hz=4  # Adjust based on your actual sampling rate
+                )
                 self.pytorch_model.to(self.device)
                 model_output = self.pytorch_model(
                     y_st=fhr_st,
@@ -1308,21 +1498,21 @@ def main():
     
     
 if __name__ == '__main__':
-    # main()
-    compare_trajectory_classes(
-        [
-            [
-                r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/hie_cs/all_epochs_trajectory_complete/trajectory__EDB32D23E6D148908E7B84588F0E04CA_data.npy",
-            ],
-            [
-                r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/healthy_no_bg_no_cs/all_epochs_trajectory_complete/trajectory__2203847F514E487884D410B8605BFA2F_data.npy",
-            ]
-        ],
-        save_path=r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/train_results",
-        class_labels=["HIE", "Healthy"],
-        title='Trajectory Comparison',
-        colormaps=None,
-        plot_animation=False,
-        point_size=20,
-        alpha=0.6
-    )
+    main()
+    # compare_trajectory_classes(
+    #     [
+    #         [
+    #             r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/hie_cs/all_epochs_trajectory_complete/trajectory__EDB32D23E6D148908E7B84588F0E04CA_data.npy",
+    #         ],
+    #         [
+    #             r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/healthy_no_bg_no_cs/all_epochs_trajectory_complete/trajectory__2203847F514E487884D410B8605BFA2F_data.npy",
+    #         ]
+    #     ],
+    #     save_path=r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/train_results",
+    #     class_labels=["HIE", "Healthy"],
+    #     title='Trajectory Comparison',
+    #     colormaps=None,
+    #     plot_animation=False,
+    #     point_size=20,
+    #     alpha=0.6
+    # )
