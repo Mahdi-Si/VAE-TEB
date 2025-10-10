@@ -434,7 +434,9 @@ def plot_complete_fhr_up_timeline(
     sample_id='sample_0',
     title='Complete FHR and UP Timeline',
     segment_duration_minutes=20,
-    sampling_rate_hz=4
+    sampling_rate_hz=4,
+    detect_changepoints=False,
+    n_changepoints=5
 ):
     """
     Plot complete FHR and UP signals along timeline with missing segments as gaps.
@@ -451,6 +453,8 @@ def plot_complete_fhr_up_timeline(
         title: str, plot title
         segment_duration_minutes: int, duration of each segment in minutes (default: 20)
         sampling_rate_hz: float, sampling rate in Hz (default: 4 Hz)
+        detect_changepoints: bool, whether to detect and visualize changepoints in FHR (default: False)
+        n_changepoints: int, number of changepoints to detect per segment (default: 5)
 
     Saves:
         - Interactive HTML plot: {save_path}/timeline_{sample_id}.html
@@ -459,6 +463,8 @@ def plot_complete_fhr_up_timeline(
         - Missing segments will appear as gaps in the timeline
         - The plot is wide and zoomable for detailed inspection
         - X-axis shows time in minutes before birth (negative values)
+        - Changepoint detection uses ruptures library (install with: pip install ruptures)
+        - Changepoints are detected independently for each 20-minute segment
     """
     try:
         import plotly.graph_objects as go
@@ -530,6 +536,67 @@ def plot_complete_fhr_up_timeline(
             ),
             row=2, col=1
         )
+
+        # Detect and visualize changepoints if requested
+        if detect_changepoints:
+            try:
+                import ruptures as rpt
+            except ImportError:
+                if i == 0:  # Only warn once
+                    logger.warning(
+                        "ruptures library required for changepoint detection. "
+                        "Install with: pip install ruptures"
+                    )
+                continue
+
+            # Apply changepoint detection to FHR signal for this segment
+            fhr_signal = fhr[i].reshape(-1, 1)  # Shape (time_steps, 1)
+
+            # Use Dynp (dynamic programming) algorithm
+            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(fhr_signal)
+
+            # Find n_changepoints segments (n_changepoints-1 breakpoints)
+            # Handle case where segment is too short for requested changepoints
+            max_possible_changepoints = max(1, time_steps // 10)  # At least 10 points per segment
+            actual_n_changepoints = min(n_changepoints, max_possible_changepoints)
+
+            try:
+                changepoint_indices = algo.predict(n_bkps=actual_n_changepoints - 1)
+            except Exception as e:
+                logger.warning(f"Changepoint detection failed for epoch {i}: {e}")
+                continue
+
+            # Convert changepoint indices to time in minutes
+            changepoint_times = segment_start_minutes + np.array(changepoint_indices) * time_per_step / 60.0
+
+            # Add vertical lines at changepoints on FHR plot
+            for cp_idx, cp_time in enumerate(changepoint_times[:-1]):  # Exclude last point (end of segment)
+                fig.add_vline(
+                    x=cp_time,
+                    line=dict(color='green', width=2, dash='dash'),
+                    opacity=0.6,
+                    row=1, col=1,
+                    annotation=dict(
+                        text=f'CP',
+                        showarrow=False,
+                        font=dict(size=10, color='green'),
+                        yshift=10
+                    ) if cp_idx == 0 and i == 0 else None  # Only annotate first changepoint of first segment
+                )
+
+            # Add legend entry for changepoints (only once)
+            if i == 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[None],
+                        y=[None],
+                        mode='lines',
+                        name='Changepoints',
+                        line=dict(color='green', width=2, dash='dash'),
+                        showlegend=True
+                    ),
+                    row=1, col=1
+                )
 
     # Update layout for wide, zoomable plot
     fig.update_layout(
