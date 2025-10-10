@@ -1159,8 +1159,9 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 )
                 latent_mean = model_output['mu_post']  # Shape (Batch_size, time_steps, latent_dim)
                 latent_var = torch.exp(model_output['logvar_post'])  # (Batch_size, time_steps, latent_dim)
-                proccessed_latent_mean = preprocess_latent(latent=latent_mean, denoise=False)  # Shape (Batch_size, time_steps, latent_dim)
-                proccessed_latent_var = preprocess_latent(latent=latent_var, denoise=False)  # (Batch_size, time_steps, latent_dim)
+                proccessed_latent_mean = latent_mean
+                # proccessed_latent_mean = preprocess_latent(latent=latent_mean, denoise=False)  # Shape (Batch_size, time_steps, latent_dim)
+                # proccessed_latent_var = preprocess_latent(latent=latent_var, denoise=False)  # (Batch_size, time_steps, latent_dim)
                 
                 reduced_latent_mean = reduce_latent_dimensionality(
                     proccessed_latent_mean,
@@ -1207,7 +1208,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                     color_by_time=True,
                     point_size=100,
                     arrow_scale=0.3,
-                    plot_animation=False
+                    plot_animation=False,
+                    save_data=True
                 )                
                 
                 reduced_latent_mean_summary = summarize_trajectory(
@@ -1254,7 +1256,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                     title='Latent Trajectory',
                     color_by_time=True,
                     point_size=100,
-                    arrow_scale=0.3
+                    arrow_scale=0.3,
+                    save_data=True
                 )
 
                 print('done')
@@ -1300,7 +1303,7 @@ def main():
         latent_time_reduction_methods = ['changepoint', 'rdp', 'quantile', 'medoid', 'frechet']
         graph_model.latent_trajectory_tests(test_dataloader=test_dataloader,
                                             save_path=file_name,
-                                            laten_dim_reduction_type='pca', time_dim_reduction_type='changepoint')
+                                            laten_dim_reduction_type='isomap', time_dim_reduction_type='changepoint')
 
     
     
