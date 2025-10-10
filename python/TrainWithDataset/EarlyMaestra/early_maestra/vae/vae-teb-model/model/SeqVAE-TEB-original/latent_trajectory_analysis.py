@@ -434,7 +434,8 @@ def plot_latent_trajectory(
     color_by_time=True,
     point_size=20,
     arrow_scale=0.3,
-    plot_animation=True
+    plot_animation=True,
+    save_data=False
 ):
     """
     Plot and save latent trajectory with arrows showing temporal evolution.
@@ -449,11 +450,13 @@ def plot_latent_trajectory(
         point_size: int, size of trajectory points
         arrow_scale: float, scale factor for arrow size
         plot_animation: bool, whether to generate animated GIF (default: True)
+        save_data: bool, whether to save trajectory data as .npy file (default: False)
 
     Saves:
         - Static plot: {save_path}/trajectory_{sample_id}.png
         - Animated GIF (if plot_animation=True): {save_path}/trajectory_{sample_id}_animated.gif
         - 3D HTML (if 3D): {save_path}/trajectory_{sample_id}_3d.html
+        - Data file (if save_data=True): {save_path}/trajectory_{sample_id}_data.npy
     """
     # Convert sample_id to string
     sample_id = str(sample_id)
@@ -478,6 +481,11 @@ def plot_latent_trajectory(
 
     time_steps, n_dims = latent_trajectory.shape
     os.makedirs(save_path, exist_ok=True)
+
+    # Save trajectory data if requested
+    if save_data:
+        data_file_path = f'{save_path}/trajectory_{sample_id}_data.npy'
+        np.save(data_file_path, latent_trajectory)
 
     if color_by_time:
         colors = plt.cm.viridis(np.linspace(0, 1, time_steps))
@@ -698,6 +706,396 @@ def plot_latent_trajectory(
             )
 
             fig.write_html(f'{save_path}/trajectory_{sample_id}_3d.html')
+        except ImportError:
+            logger.warning("plotly not installed, skipping interactive 3D HTML plot")
+
+
+def compare_trajectory_classes(
+    trajectory_file_lists,
+    save_path,
+    class_labels=None,
+    title='Trajectory Comparison',
+    colormaps=None,
+    plot_animation=True,
+    point_size=20,
+    alpha=0.6
+):
+    """
+    Compare latent trajectories from different classes by plotting them together.
+
+    Args:
+        trajectory_file_lists: List[List[str]], 2-3 lists of file paths to .npy trajectory data
+                              Each list represents a different class
+        save_path: str, directory path to save comparison plots
+        class_labels: Optional[List[str]], labels for each class (default: Class 0, Class 1, ...)
+        title: str, plot title
+        colormaps: Optional[List[str]], matplotlib colormaps for each class
+                   (default: ['Reds', 'Blues', 'Greens'])
+        plot_animation: bool, whether to generate animated GIF (default: True)
+        point_size: int, size of trajectory points
+        alpha: float, transparency of trajectories (0-1)
+
+    Saves:
+        - Static plot: {save_path}/trajectory_comparison.png
+        - Animated GIF (if plot_animation=True): {save_path}/trajectory_comparison_animated.gif
+        - 3D HTML (if 3D): {save_path}/trajectory_comparison_3d.html
+    """
+    import matplotlib.animation as animation
+    from matplotlib.patches import FancyArrowPatch
+    from mpl_toolkits.mplot3d import proj3d
+
+    # Custom 3D arrow class
+    class Arrow3D(FancyArrowPatch):
+        def __init__(self, xs, ys, zs, *args, **kwargs):
+            super().__init__((0, 0), (0, 0), *args, **kwargs)
+            self._verts3d = xs, ys, zs
+
+        def do_3d_projection(self, renderer=None):
+            xs3d, ys3d, zs3d = self._verts3d
+            xs, ys, zs = proj3d.proj_transform(xs3d, ys3d, zs3d, self.axes.M)
+            self.set_positions((xs[0], ys[0]), (xs[1], ys[1]))
+            return np.min(zs)
+
+    # Validate input
+    n_classes = len(trajectory_file_lists)
+    if n_classes < 2 or n_classes > 3:
+        raise ValueError(f"Expected 2-3 trajectory lists, got {n_classes}")
+
+    # Set default labels
+    if class_labels is None:
+        class_labels = [f'Class {i}' for i in range(n_classes)]
+    elif len(class_labels) != n_classes:
+        raise ValueError(f"Number of labels ({len(class_labels)}) must match number of classes ({n_classes})")
+
+    # Set default colormaps
+    if colormaps is None:
+        colormaps = ['Reds', 'Blues', 'Greens'][:n_classes]
+    elif len(colormaps) != n_classes:
+        raise ValueError(f"Number of colormaps ({len(colormaps)}) must match number of classes ({n_classes})")
+
+    os.makedirs(save_path, exist_ok=True)
+
+    # Load all trajectories
+    all_trajectories = []
+    all_class_ids = []
+
+    for class_idx, file_list in enumerate(trajectory_file_lists):
+        for file_path in file_list:
+            trajectory = np.load(file_path)
+            if trajectory.ndim == 3:
+                trajectory = trajectory.squeeze(0)
+            all_trajectories.append(trajectory)
+            all_class_ids.append(class_idx)
+
+    if len(all_trajectories) == 0:
+        logger.error("No trajectories loaded")
+        return
+
+    # Determine dimensionality (assume all have same dimensionality)
+    n_dims = all_trajectories[0].shape[1]
+    if n_dims not in [2, 3]:
+        raise ValueError(f"Trajectories must be 2D or 3D, got {n_dims}D")
+
+    # Verify all trajectories have same dimensionality
+    for traj in all_trajectories:
+        if traj.shape[1] != n_dims:
+            raise ValueError(f"All trajectories must have same dimensionality. Expected {n_dims}, got {traj.shape[1]}")
+
+    # Plot trajectories
+    if n_dims == 2:
+        # 2D Static Plot
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        for traj_idx, (trajectory, class_idx) in enumerate(zip(all_trajectories, all_class_ids)):
+            time_steps = trajectory.shape[0]
+            cmap = plt.get_cmap(colormaps[class_idx])
+            colors = cmap(np.linspace(0.3, 0.9, time_steps))
+
+            # Plot trajectory points
+            scatter = ax.scatter(
+                trajectory[:, 0], trajectory[:, 1],
+                c=np.arange(time_steps), cmap=colormaps[class_idx],
+                s=point_size, alpha=alpha,
+                label=class_labels[class_idx] if traj_idx == 0 or all_class_ids[traj_idx-1] != class_idx else None
+            )
+
+            # Draw arrows
+            for i in range(time_steps - 1):
+                ax.annotate(
+                    '',
+                    xy=trajectory[i+1],
+                    xytext=trajectory[i],
+                    arrowprops=dict(
+                        arrowstyle='->',
+                        lw=1.0,
+                        color=colors[i],
+                        alpha=alpha * 0.8
+                    )
+                )
+
+            # Mark start and end points
+            ax.scatter(
+                trajectory[0, 0], trajectory[0, 1],
+                c=[cmap(0.3)], s=80, marker='o',
+                edgecolors='black', linewidths=1.5, alpha=alpha, zorder=4
+            )
+            ax.scatter(
+                trajectory[-1, 0], trajectory[-1, 1],
+                c=[cmap(0.9)], s=80, marker='X',
+                edgecolors='black', linewidths=1.5, alpha=alpha, zorder=4
+            )
+
+        ax.set_xlabel('Latent Dim 1', fontsize=12)
+        ax.set_ylabel('Latent Dim 2', fontsize=12)
+        ax.set_title(f'{title}', fontsize=14)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{save_path}/trajectory_comparison.png', dpi=150)
+        plt.close()
+
+        # 2D Animation
+        if plot_animation:
+            fig, ax = plt.subplots(figsize=(12, 10))
+
+            # Get overall bounds
+            all_x = np.concatenate([traj[:, 0] for traj in all_trajectories])
+            all_y = np.concatenate([traj[:, 1] for traj in all_trajectories])
+            ax.set_xlim(all_x.min() - 0.5, all_x.max() + 0.5)
+            ax.set_ylim(all_y.min() - 0.5, all_y.max() + 0.5)
+            ax.set_xlabel('Latent Dim 1', fontsize=12)
+            ax.set_ylabel('Latent Dim 2', fontsize=12)
+            ax.set_title(f'{title} (Animated)', fontsize=14)
+            ax.grid(True, alpha=0.3)
+
+            # Create legend
+            for class_idx, label in enumerate(class_labels):
+                ax.plot([], [], color=plt.get_cmap(colormaps[class_idx])(0.6),
+                       label=label, linewidth=2)
+            ax.legend(loc='best', fontsize=10)
+
+            max_time_steps = max(traj.shape[0] for traj in all_trajectories)
+
+            lines = []
+            points = []
+            for class_idx in range(n_classes):
+                cmap = plt.get_cmap(colormaps[class_idx])
+                line, = ax.plot([], [], alpha=alpha, lw=2, color=cmap(0.6))
+                point, = ax.plot([], [], 'o', markersize=8, color=cmap(0.8))
+                lines.append(line)
+                points.append(point)
+
+            def init():
+                for line, point in zip(lines, points):
+                    line.set_data([], [])
+                    point.set_data([], [])
+                return lines + points
+
+            def animate(i):
+                for traj_idx, (trajectory, class_idx) in enumerate(zip(all_trajectories, all_class_ids)):
+                    time_steps = trajectory.shape[0]
+                    frame_idx = min(i, time_steps - 1)
+
+                    lines[class_idx].set_data(
+                        trajectory[:frame_idx+1, 0],
+                        trajectory[:frame_idx+1, 1]
+                    )
+                    points[class_idx].set_data(
+                        [trajectory[frame_idx, 0]],
+                        [trajectory[frame_idx, 1]]
+                    )
+                return lines + points
+
+            anim = animation.FuncAnimation(
+                fig, animate, init_func=init,
+                frames=max_time_steps, interval=50, blit=True
+            )
+            anim.save(
+                f'{save_path}/trajectory_comparison_animated.gif',
+                writer='pillow', fps=20
+            )
+            plt.close()
+
+    elif n_dims == 3:
+        # 3D Static Plot
+        fig = plt.figure(figsize=(14, 12))
+        ax = fig.add_subplot(111, projection='3d')
+
+        for traj_idx, (trajectory, class_idx) in enumerate(zip(all_trajectories, all_class_ids)):
+            time_steps = trajectory.shape[0]
+            cmap = plt.get_cmap(colormaps[class_idx])
+            colors = cmap(np.linspace(0.3, 0.9, time_steps))
+
+            # Plot trajectory points
+            scatter = ax.scatter(
+                trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+                c=np.arange(time_steps), cmap=colormaps[class_idx],
+                s=point_size, alpha=alpha,
+                label=class_labels[class_idx] if traj_idx == 0 or all_class_ids[traj_idx-1] != class_idx else None
+            )
+
+            # Draw arrows in 3D
+            for i in range(time_steps - 1):
+                arrow = Arrow3D(
+                    [trajectory[i, 0], trajectory[i+1, 0]],
+                    [trajectory[i, 1], trajectory[i+1, 1]],
+                    [trajectory[i, 2], trajectory[i+1, 2]],
+                    mutation_scale=15,
+                    arrowstyle='-|>',
+                    color=colors[i],
+                    alpha=alpha * 0.8,
+                    shrinkA=0,
+                    shrinkB=0
+                )
+                arrow.set_edgecolor(colors[i])
+                arrow.set_linewidth(1.0)
+                ax.add_artist(arrow)
+
+            # Mark start and end points
+            ax.scatter(
+                trajectory[0, 0], trajectory[0, 1], trajectory[0, 2],
+                c=[cmap(0.3)], s=100, marker='o',
+                edgecolors='black', linewidths=1.5, alpha=alpha
+            )
+            ax.scatter(
+                trajectory[-1, 0], trajectory[-1, 1], trajectory[-1, 2],
+                c=[cmap(0.9)], s=100, marker='X',
+                edgecolors='black', linewidths=1.5, alpha=alpha
+            )
+
+        ax.set_xlabel('Latent Dim 1', fontsize=12)
+        ax.set_ylabel('Latent Dim 2', fontsize=12)
+        ax.set_zlabel('Latent Dim 3', fontsize=12)
+        ax.set_title(f'{title}', fontsize=14)
+        ax.legend(loc='best', fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f'{save_path}/trajectory_comparison.png', dpi=150)
+        plt.close()
+
+        # 3D Animation
+        if plot_animation:
+            fig = plt.figure(figsize=(14, 12))
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Get overall bounds
+            all_x = np.concatenate([traj[:, 0] for traj in all_trajectories])
+            all_y = np.concatenate([traj[:, 1] for traj in all_trajectories])
+            all_z = np.concatenate([traj[:, 2] for traj in all_trajectories])
+            ax.set_xlim(all_x.min() - 0.5, all_x.max() + 0.5)
+            ax.set_ylim(all_y.min() - 0.5, all_y.max() + 0.5)
+            ax.set_zlim(all_z.min() - 0.5, all_z.max() + 0.5)
+            ax.set_xlabel('Latent Dim 1', fontsize=12)
+            ax.set_ylabel('Latent Dim 2', fontsize=12)
+            ax.set_zlabel('Latent Dim 3', fontsize=12)
+            ax.set_title(f'{title} (Animated)', fontsize=14)
+
+            # Create legend
+            for class_idx, label in enumerate(class_labels):
+                ax.plot([], [], [], color=plt.get_cmap(colormaps[class_idx])(0.6),
+                       label=label, linewidth=2)
+            ax.legend(loc='best', fontsize=10)
+
+            max_time_steps = max(traj.shape[0] for traj in all_trajectories)
+
+            lines = []
+            points = []
+            for class_idx in range(n_classes):
+                cmap = plt.get_cmap(colormaps[class_idx])
+                line, = ax.plot([], [], [], alpha=alpha, lw=2, color=cmap(0.6))
+                point, = ax.plot([], [], [], 'o', markersize=8, color=cmap(0.8))
+                lines.append(line)
+                points.append(point)
+
+            def init():
+                for line, point in zip(lines, points):
+                    line.set_data([], [])
+                    line.set_3d_properties([])
+                    point.set_data([], [])
+                    point.set_3d_properties([])
+                return lines + points
+
+            def animate(i):
+                for traj_idx, (trajectory, class_idx) in enumerate(zip(all_trajectories, all_class_ids)):
+                    time_steps = trajectory.shape[0]
+                    frame_idx = min(i, time_steps - 1)
+
+                    lines[class_idx].set_data(
+                        trajectory[:frame_idx+1, 0],
+                        trajectory[:frame_idx+1, 1]
+                    )
+                    lines[class_idx].set_3d_properties(trajectory[:frame_idx+1, 2])
+
+                    points[class_idx].set_data(
+                        [trajectory[frame_idx, 0]],
+                        [trajectory[frame_idx, 1]]
+                    )
+                    points[class_idx].set_3d_properties([trajectory[frame_idx, 2]])
+                return lines + points
+
+            anim = animation.FuncAnimation(
+                fig, animate, init_func=init,
+                frames=max_time_steps, interval=50, blit=True
+            )
+            anim.save(
+                f'{save_path}/trajectory_comparison_animated.gif',
+                writer='pillow', fps=20
+            )
+            plt.close()
+
+        # 3D Interactive HTML using plotly
+        try:
+            import plotly.graph_objects as go
+
+            fig = go.Figure()
+
+            for traj_idx, (trajectory, class_idx) in enumerate(zip(all_trajectories, all_class_ids)):
+                time_steps = trajectory.shape[0]
+                cmap = plt.get_cmap(colormaps[class_idx])
+
+                # Convert matplotlib colormap to RGB values
+                color_values = [f'rgb({int(r*255)},{int(g*255)},{int(b*255)})'
+                               for r, g, b, _ in cmap(np.linspace(0.3, 0.9, time_steps))]
+
+                fig.add_trace(go.Scatter3d(
+                    x=trajectory[:, 0],
+                    y=trajectory[:, 1],
+                    z=trajectory[:, 2],
+                    mode='markers+lines',
+                    marker=dict(
+                        size=5,
+                        color=np.arange(time_steps),
+                        colorscale=[[i/(time_steps-1), color_values[i]] for i in range(time_steps)],
+                        showscale=False
+                    ),
+                    line=dict(color=color_values[time_steps//2], width=2),
+                    text=[f'{class_labels[class_idx]} - Time: {i}' for i in range(time_steps)],
+                    hoverinfo='text',
+                    name=class_labels[class_idx] if traj_idx == 0 or all_class_ids[traj_idx-1] != class_idx else None,
+                    showlegend=traj_idx == 0 or all_class_ids[traj_idx-1] != class_idx,
+                    legendgroup=f'class_{class_idx}',
+                    opacity=alpha
+                ))
+
+            fig.update_layout(
+                title=f'{title} (Interactive 3D)',
+                scene=dict(
+                    xaxis_title='Latent Dim 1',
+                    yaxis_title='Latent Dim 2',
+                    zaxis_title='Latent Dim 3'
+                ),
+                width=1400, height=1000,
+                legend=dict(
+                    x=0.02,
+                    y=0.98,
+                    xanchor='left',
+                    yanchor='top',
+                    bgcolor='rgba(255, 255, 255, 0.8)',
+                    bordercolor='black',
+                    borderwidth=1
+                )
+            )
+
+            fig.write_html(f'{save_path}/trajectory_comparison_3d.html')
         except ImportError:
             logger.warning("plotly not installed, skipping interactive 3D HTML plot")
 
