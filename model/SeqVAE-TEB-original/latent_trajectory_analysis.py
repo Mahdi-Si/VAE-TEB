@@ -1308,5 +1308,21 @@ def main():
     
     
 if __name__ == '__main__':
-    main()
-
+    # main()
+    compare_trajectory_classes(
+        [
+            [
+                r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/hie_cs/all_epochs_trajectory_complete/trajectory__EDB32D23E6D148908E7B84588F0E04CA_data.npy",
+            ],
+            [
+                r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/test_results/healthy_no_bg_no_cs/all_epochs_trajectory_complete/trajectory__2203847F514E487884D410B8605BFA2F_data.npy",
+            ]
+        ],
+        save_path=r"/data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-10-09--[18-38]--latent_test_trajectory_no_normalization_isomap_changepoint/train_results",
+        class_labels=["HIE", "Healthy"],
+        title='Trajectory Comparison',
+        colormaps=None,
+        plot_animation=False,
+        point_size=20,
+        alpha=0.6
+    )
