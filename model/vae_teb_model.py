@@ -1639,7 +1639,11 @@ class SeqVaeNoForecast(SeqVaeTeb):
             )
 
         log.info(
-            f"Loaded {len(filtered_sd)} legacy parameters into SeqVaeTeb from {ckpt_path}"
+            "Loaded %d/%d legacy parameters into %s from %s",
+            len(filtered_sd),
+            len(current_sd),
+            cls.__name__,
+            ckpt_path,
         )
 
         if compile_model:
