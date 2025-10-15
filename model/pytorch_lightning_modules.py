@@ -87,71 +87,70 @@ class PlottingCallBack(Callback):
                     epoch=pl_trainer.current_epoch,
                 )
 
-                # Forecast across all valid anchors using posterior mean latents for stability
-                forecast_out = pl_module.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
-                anchors = forecast_out["anchors"]
-                mu_future = forecast_out["mu_future"]          # (B,N,480)
-                logvar_future = forecast_out["logvar_future"]  # (B,N,480)
-                z_future = forecast_out.get("z_future")
-                enc = forecast_out["enc"]
+                if pl_module.model.has_forecaster():
+                    forecast_out = pl_module.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
+                    anchors = forecast_out["anchors"]
+                    mu_future = forecast_out["mu_future"]          # (B,N,480)
+                    logvar_future = forecast_out["logvar_future"]  # (B,N,480)
+                    z_future = forecast_out.get("z_future")
+                    enc = forecast_out["enc"]
 
-                # Aggregate forecasts to full raw timeline
-                canvas_mu, mean_mu = pl_module.model.aggregate_forecasts_to_canvas(
-                    mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+                    canvas_mu, mean_mu = pl_module.model.aggregate_forecasts_to_canvas(
+                        mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
 
-                # Uncertainty: aggregate variances then sqrt to get std
-                var_future = logvar_future.exp()
-                _, mean_var = pl_module.model.aggregate_forecasts_to_canvas(
-                    var_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
-                std_mu = mean_var.clamp_min(1e-8).sqrt()
+                    var_future = logvar_future.exp()
+                    _, mean_var = pl_module.model.aggregate_forecasts_to_canvas(
+                        var_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+                    std_mu = mean_var.clamp_min(1e-8).sqrt()
 
-                self._plot_latent_forecast_samples(
-                    mu_post_sequence=enc.get("mu_post"),
-                    z_future=z_future,
-                    anchors=anchors,
-                    epoch=pl_trainer.current_epoch,
-                )
-                self._plot_channel_forecasts(
-                    mu_post_sequence=enc.get("mu_post"),
-                    z_future=z_future,
-                    anchors=anchors,
-                    epoch=pl_trainer.current_epoch,
-                )
-                self._plot_latent_trajectory_analysis(
-                    mu_post_sequence=enc.get("mu_post"),
-                    mu_prior_sequence=enc.get("mu_prior"),
-                    epoch=pl_trainer.current_epoch,
-                )
-
-                self._plot_latent_statistics(
-                    mu_prior=mu_prior_full if mu_prior_full is not None else enc.get("mu_prior"),
-                    mu_post=mu_post_full if mu_post_full is not None else enc.get("mu_post"),
-                    epoch=pl_trainer.current_epoch,
-                )
-
-                # Plot forecast results
-                self._plot_forecast_results(
-                    y_raw_normalized,
-                    mean_mu,
-                    std_mu,
-                    canvas_mu,
-                    anchors,
-                    enc.get('mu_post'),
-                    pl_trainer.current_epoch)
-
-                # Additionally, plot batch-aggregated forecast across samples
-                try:
-                    self._plot_batch_aggregated_forecast(
-                        y_raw_batch=y_raw_normalized,
-                        mean_mu_batch=mean_mu,
-                        std_mu_batch=std_mu,
+                    self._plot_latent_forecast_samples(
+                        mu_post_sequence=enc.get("mu_post"),
+                        z_future=z_future,
+                        anchors=anchors,
                         epoch=pl_trainer.current_epoch,
                     )
-                except Exception as e:
-                    logger.warning(f"Batch-aggregated forecast plotting failed: {e}")
-                
+                    self._plot_channel_forecasts(
+                        mu_post_sequence=enc.get("mu_post"),
+                        z_future=z_future,
+                        anchors=anchors,
+                        epoch=pl_trainer.current_epoch,
+                    )
+                    self._plot_latent_trajectory_analysis(
+                        mu_post_sequence=enc.get("mu_post"),
+                        mu_prior_sequence=enc.get("mu_prior"),
+                        epoch=pl_trainer.current_epoch,
+                    )
 
+                    self._plot_latent_statistics(
+                        mu_prior=mu_prior_full if mu_prior_full is not None else enc.get("mu_prior"),
+                        mu_post=mu_post_full if mu_post_full is not None else enc.get("mu_post"),
+                        epoch=pl_trainer.current_epoch,
+                    )
 
+                    self._plot_forecast_results(
+                        y_raw_normalized,
+                        mean_mu,
+                        std_mu,
+                        canvas_mu,
+                        anchors,
+                        enc.get('mu_post'),
+                        pl_trainer.current_epoch)
+
+                    try:
+                        self._plot_batch_aggregated_forecast(
+                            y_raw_batch=y_raw_normalized,
+                            mean_mu_batch=mean_mu,
+                            std_mu_batch=std_mu,
+                            epoch=pl_trainer.current_epoch,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to plot batch aggregated forecast: {e}")
+                else:
+                    self._plot_latent_statistics(
+                        mu_prior=mu_prior_full,
+                        mu_post=mu_post_full,
+                        epoch=pl_trainer.current_epoch,
+                    )
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
             import traceback
@@ -1353,6 +1352,12 @@ class LightSeqVaeTeb(L.LightningModule):
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
         self.model = seqvae_teb_model
+        self._forecaster_enabled = getattr(self.model, "has_forecaster", lambda: True)()
+        self.hparams.enable_forecaster = self._forecaster_enabled
+        if not self._forecaster_enabled:
+            self.hparams.predictive_weight = 0.0
+            self.hparams.latent_consistency_weight = 0.0
+            self.hparams.log_forecast_metrics = False
 
         # Only compile if not already compiled to avoid double compilation
         if not is_compiled_module(self.model):
@@ -1367,6 +1372,9 @@ class LightSeqVaeTeb(L.LightningModule):
     def forward(self, y_st, y_ph, x_ph):
         """Forward pass through the SeqVaeTeb model."""
         return self.model(y_st, y_ph, x_ph)
+
+    def _has_forecaster(self) -> bool:
+        return getattr(self.model, "has_forecaster", lambda: True)()
 
     def _calculate_beta(self):
         """Calculates the KLD weight (beta) based on the current epoch and schedule."""
@@ -1486,7 +1494,16 @@ class LightSeqVaeTeb(L.LightningModule):
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
         y_raw = batch.fhr
-
+        use_forecaster = self._has_forecaster()
+        predictive_weight = self.hparams.predictive_weight if use_forecaster else 0.0
+        latent_consistency_weight = self.hparams.latent_consistency_weight if use_forecaster else 0.0
+        predictive_horizon = max(1, int(self.hparams.predictive_horizon))
+        predictive_context = max(1, int(self.hparams.predictive_context_len))
+        predictive_max = None
+        if use_forecaster and getattr(self.hparams, 'predictive_max_anchors', None) is not None:
+            predictive_max = int(self.hparams.predictive_max_anchors)
+            if predictive_max <= 0:
+                predictive_max = None
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
@@ -1496,15 +1513,15 @@ class LightSeqVaeTeb(L.LightningModule):
             y_raw=y_raw,
             compute_kld_loss=True,
             beta=self.hparams.beta,
-            predictive_weight=self.hparams.predictive_weight,
-            predictive_horizon=max(1, int(self.hparams.predictive_horizon)),
-            latent_consistency_weight=self.hparams.latent_consistency_weight,
-            predictive_context_len=max(1, int(self.hparams.predictive_context_len)),
-            predictive_max_anchors=int(self.hparams.predictive_max_anchors) if getattr(self.hparams, 'predictive_max_anchors', None) is not None else None,
+            predictive_weight=predictive_weight,
+            predictive_horizon=predictive_horizon,
+            latent_consistency_weight=latent_consistency_weight,
+            predictive_context_len=predictive_context,
+            predictive_max_anchors=predictive_max,
         )
 
         aux_metrics: Dict[str, torch.Tensor] = {}
-        if self.hparams.log_forecast_metrics and stage != "train":
+        if use_forecaster and self.hparams.log_forecast_metrics and stage != "train":
             with torch.no_grad():
                 aux_metrics = self._compute_forecast_metrics(
                     mu_post=forward_outputs["mu_post"].detach(),
