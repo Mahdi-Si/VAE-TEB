@@ -1004,10 +1004,19 @@ class Decoder(nn.Module):
         if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
             target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
 
-        diff = target_raw_signal - raw_mu_predicted  # (B, 4800)
-        var = raw_logvar_predicted.exp()  # (B, 4800)
-        nll_loss = 0.5 * (raw_logvar_predicted + diff.pow(2) / var)  # (B, 4800)
-        nll_loss = nll_loss.mean()
+        steps = max(0, linear_output.size(1) - 1)
+        if steps > 0:
+            stride = max(1, raw_mu_predicted.size(1) // linear_output.size(1))
+            idx = stride * (torch.arange(steps, device=device, dtype=torch.long) + 1)
+            gather_idx = idx.unsqueeze(0).expand(raw_mu_predicted.size(0), -1)
+            mu_next = torch.gather(raw_mu_predicted, 1, gather_idx)
+            logvar_next = torch.gather(raw_logvar_predicted, 1, gather_idx)
+            target_next = torch.gather(target_raw_signal, 1, gather_idx)
+            var_next = logvar_next.exp()
+            nll_loss = 0.5 * (logvar_next + (target_next - mu_next) ** 2 / var_next)
+            nll_loss = nll_loss.mean()
+        else:
+            nll_loss = torch.tensor(0.0, device=device)
 
         return {
             'mse_loss': mse_loss,
@@ -1086,8 +1095,10 @@ class LatentForecaster(nn.Module):
         return z_future
 
 
-
-class SeqVaeTeb(nn.Module):
+class SeqVaeCore(nn.Module):
+    """
+    Core sequential VAE module (encoders + decoder) with reconstruction losses.
+    """
 
     def __init__(
         self,
@@ -1099,23 +1110,16 @@ class SeqVaeTeb(nn.Module):
         warmup_period: int = 30,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
-        # Forecasting params
-        context_len: int = 75,
-        horizon_len: int = 30,
-        forecaster_hidden_dim: int = 128,
-        forecaster_layers: int = 1,
-        forecaster_dropout: float = 0.0,
-    ):
+        *,
+        init_weights: bool = True,
+    ) -> None:
         super().__init__()
-
+        self.sequence_length = sequence_length
         self.latent_dim_source = latent_dim_source
         self.latent_dim_target = latent_dim_target
         self.latent_dim_z = latent_dim_z
         self.decimation_factor = decimation_factor
         self.warmup_period = warmup_period
-        self.sequence_length = sequence_length
-        self.context_len = context_len
-        self.horizon_len = horizon_len
 
         self.source_encoder = SourceEncoder(
             sequence_length=sequence_length,
@@ -1134,18 +1138,382 @@ class SeqVaeTeb(nn.Module):
             dim_hy=latent_dim_target,
             dim_z=latent_dim_z,
         )
-        
-        self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)  # Original decoder for backward compatibility
+        self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)
 
-        # Latent forecaster for prediction mode
-        self.latent_forecaster = LatentForecaster(
-            latent_dim=latent_dim_z,
-            hidden_dim=forecaster_hidden_dim,
-            num_layers=forecaster_layers,
-            dropout=forecaster_dropout,
+        if init_weights:
+            initialization(self)
+
+    def forward(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        mu_x = self.source_encoder(x_ph)
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
+
+        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
+        z = self.reparameterize(mu_post, logvar_post)
+
+        linear_output, mu_pr, logvar_pr = self.decoder(z)
+
+        if self.sequence_length > 1:
+            next_idx = self._next_step_indices(mu_pr.device)
+            gather_idx = next_idx.unsqueeze(0).expand(mu_pr.size(0), -1)
+            mu_next = torch.gather(mu_pr, 1, gather_idx)
+            logvar_next = torch.gather(logvar_pr, 1, gather_idx)
+        else:
+            next_idx = torch.zeros(0, device=mu_pr.device, dtype=torch.long)
+            mu_next = mu_pr.new_zeros(mu_pr.size(0), 0)
+            logvar_next = logvar_pr.new_zeros(logvar_pr.size(0), 0)
+
+        return {
+            "z": z,
+            "linear_output": linear_output,
+            "mu_pr": mu_pr,
+            "logvar_pr": logvar_pr,
+            "mu_next": mu_next,
+            "logvar_next": logvar_next,
+            "next_step_indices": next_idx,
+            "mu_prior": mu_y,
+            "logvar_prior": logvar_y_prior,
+            "mu_post": mu_post,
+            "logvar_post": logvar_post,
+        }
+
+    def encode_only(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        sample_z: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        mu_x = self.source_encoder(x_ph)
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
+        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
+        z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
+        return {
+            "mu_prior": mu_y,
+            "logvar_prior": logvar_y_prior,
+            "mu_post": mu_post,
+            "logvar_post": logvar_post,
+            "z": z,
+        }
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def _kld_loss(
+        mu_prior: torch.Tensor,
+        logvar_prior: torch.Tensor,
+        mu_post: torch.Tensor,
+        logvar_post: torch.Tensor,
+        *,
+        reduce_mean: bool = True,
+    ) -> torch.Tensor:
+        kld = (
+            logvar_prior
+            - logvar_post
+            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+            - 1.0
+        )
+        kld = 0.5 * kld
+        return kld.mean() if reduce_mean else kld.sum()
+
+    @staticmethod
+    def gaussian_nll(
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        var = logvar.exp()
+        nll = 0.5 * (logvar + (target - mu) ** 2 / var)
+        if mask is not None:
+            nll = nll * mask
+            denom = mask.sum().clamp_min(1.0)
+            return nll.sum() / denom
+        return nll.mean()
+
+    def _next_step_indices(self, device: torch.device) -> torch.Tensor:
+        steps = max(0, self.sequence_length - 1)
+        if steps == 0:
+            return torch.zeros(0, device=device, dtype=torch.long)
+        base = torch.arange(steps, device=device, dtype=torch.long) + 1
+        return self.decimation_factor * base
+
+    def compute_reconstruction_loss(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        y_raw: torch.Tensor,
+        *,
+        compute_kld_loss: bool = True,
+        beta: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        if y_raw.dim() == 3 and y_raw.size(-1) == 1:
+            y_raw = y_raw.squeeze(-1)
+
+        device = y_raw.device
+
+        mse_loss = torch.tensor(0.0, device=device)
+        linear_output = forward_outputs.get("linear_output")
+        if (
+            linear_output is not None
+            and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
+        ):
+            stacked_target = torch.cat([y_st, y_ph], dim=-1)
+            mse_loss = F.mse_loss(linear_output, stacked_target)
+
+        mu_next = forward_outputs.get("mu_next")
+        logvar_next = forward_outputs.get("logvar_next")
+        indices = forward_outputs.get("next_step_indices")
+
+        if indices is None:
+            indices = self._next_step_indices(device)
+        if indices.device != device:
+            indices = indices.to(device)
+        if mu_next is not None and mu_next.numel() > 0:
+            gather_idx = indices.unsqueeze(0).expand(y_raw.size(0), -1)
+            target_next = torch.gather(y_raw, 1, gather_idx)
+            var_next = logvar_next.exp()
+            next_step_nll = 0.5 * (logvar_next + (target_next - mu_next) ** 2 / var_next)
+            nll_loss = next_step_nll.mean()
+        else:
+            nll_loss = torch.tensor(0.0, device=device)
+
+        kld_loss = torch.tensor(0.0, device=y_raw.device)
+        if compute_kld_loss:
+            kld_loss = self._kld_loss(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"],
+                reduce_mean=True,
+            )
+
+        total_decoder = mse_loss + nll_loss
+        total_loss = total_decoder + beta * kld_loss
+        return {
+            "reconstruction_loss": total_decoder,
+            "mse_loss": mse_loss,
+            "nll_loss": nll_loss,
+            "kld_loss": kld_loss,
+            "total_loss": total_loss,
+            "total_decoder_loss": total_decoder,
+        }
+
+
+class SeqVaeTeb(nn.Module):
+    """
+    Complete SeqVAE model with an optional latent forecaster head.
+
+    The reconstruction path lives in `SeqVaeCore`, which can be saved on its own via
+    `vae_state_dict()`, while `state_dict(include_forecaster=False)` omits forecasting
+    weights for backwards compatibility with older checkpoints.
+    """
+    def __init__(
+        self,
+        sequence_length: int = 300,
+        latent_dim_source: int = 16,
+        latent_dim_target: int = 16,
+        latent_dim_z: int = 16,
+        decimation_factor: int = 16,
+        warmup_period: int = 30,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 5,
+        # Forecasting params
+        context_len: int = 75,
+        horizon_len: int = 30,
+        forecaster_hidden_dim: int = 128,
+        forecaster_layers: int = 1,
+        forecaster_dropout: float = 0.0,
+        *,
+        use_latent_forecaster: bool = True,
+        latent_forecaster: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+
+        self.sequence_length = sequence_length
+        self.latent_dim_source = latent_dim_source
+        self.latent_dim_target = latent_dim_target
+        self.latent_dim_z = latent_dim_z
+        self.decimation_factor = decimation_factor
+        self.warmup_period = warmup_period
+        self.context_len = context_len
+        self.horizon_len = horizon_len
+
+        self.core = SeqVaeCore(
+            sequence_length=sequence_length,
+            latent_dim_source=latent_dim_source,
+            latent_dim_target=latent_dim_target,
+            latent_dim_z=latent_dim_z,
+            decimation_factor=decimation_factor,
+            warmup_period=warmup_period,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
+            init_weights=False,
+        )
+        initialization(self.core)
+
+        if latent_forecaster is not None:
+            self.latent_forecaster = latent_forecaster
+        elif use_latent_forecaster:
+            self.latent_forecaster = LatentForecaster(
+                latent_dim=latent_dim_z,
+                hidden_dim=forecaster_hidden_dim,
+                num_layers=forecaster_layers,
+                dropout=forecaster_dropout,
+            )
+            initialization(self.latent_forecaster)
+        else:
+            self.latent_forecaster = None
+
+        self.use_latent_forecaster = self.latent_forecaster is not None
+
+    @property
+    def source_encoder(self) -> SourceEncoder:
+        return self.core.source_encoder
+
+    @property
+    def target_encoder(self) -> TargetEncoder:
+        return self.core.target_encoder
+
+    @property
+    def conditional_encoder(self) -> ConditionalEncoder:
+        return self.core.conditional_encoder
+
+    @property
+    def decoder(self) -> Decoder:
+        return self.core.decoder
+
+    def has_forecaster(self) -> bool:
+        return self.latent_forecaster is not None
+
+    def _require_forecaster(self) -> None:
+        if self.latent_forecaster is None:
+            raise RuntimeError("Latent forecaster is disabled for this SeqVaeTeb instance.")
+
+    @staticmethod
+    def _is_latent_forecaster_key(name: str) -> bool:
+        return "latent_forecaster" in name.split(".")
+
+    def state_dict(
+        self,
+        destination: Optional[Dict[str, torch.Tensor]] = None,
+        prefix: str = "",
+        keep_vars: bool = False,
+        *,
+        include_forecaster: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Return model weights, optionally skipping the latent forecaster block."""
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        if include_forecaster or self.latent_forecaster is None:
+            return state
+
+        keys_to_drop = [k for k in list(state.keys()) if self._is_latent_forecaster_key(k)]
+        for key in keys_to_drop:
+            state.pop(key)
+        return state
+
+    def vae_state_dict(
+        self,
+        destination: Optional[Dict[str, torch.Tensor]] = None,
+        prefix: str = "",
+        keep_vars: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Convenience helper that exposes only the VAE core parameters."""
+        return self.core.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        strict: bool = True,
+        *,
+        load_forecaster: Optional[bool] = None,
+    ):
+        """
+        Load weights with explicit control over whether latent forecaster parameters are expected.
+        """
+        has_module_forecaster = self.latent_forecaster is not None
+        has_forecaster_weights = any(self._is_latent_forecaster_key(k) for k in state_dict.keys())
+
+        if load_forecaster is None:
+            load_forecaster = has_module_forecaster and has_forecaster_weights
+
+        if load_forecaster and not has_module_forecaster:
+            raise RuntimeError("Cannot load latent forecaster weights: forecaster disabled on this model.")
+        if load_forecaster and not has_forecaster_weights:
+            raise RuntimeError("Requested latent forecaster weights but none found in the provided state_dict.")
+
+        filtered_state = (
+            {k: v for k, v in state_dict.items() if not self._is_latent_forecaster_key(k)}
+            if not load_forecaster
+            else state_dict
         )
 
-        initialization(self)
+        incompatible = super().load_state_dict(filtered_state, strict=False)
+        missing_keys = getattr(incompatible, "missing_keys", []) if hasattr(incompatible, "missing_keys") else incompatible[0]
+        unexpected_keys = getattr(incompatible, "unexpected_keys", []) if hasattr(incompatible, "unexpected_keys") else incompatible[1]
+
+        missing_keys = [k for k in missing_keys if not self._is_latent_forecaster_key(k)]
+        unexpected_keys = [k for k in unexpected_keys if not self._is_latent_forecaster_key(k)]
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Error loading state_dict: missing keys {missing_keys}, unexpected keys {unexpected_keys}"
+            )
+
+        incompatible_type = type(incompatible)
+        return incompatible_type(missing_keys, unexpected_keys)
+
+
+class SeqVaeNoForecast(SeqVaeTeb):
+    """
+    Thin wrapper around SeqVaeTeb that guarantees the latent forecaster is disabled.
+    Useful for lightweight training checkpoints while retaining interface compatibility.
+    """
+
+    def __init__(
+        self,
+        sequence_length: int = 300,
+        latent_dim_source: int = 16,
+        latent_dim_target: int = 16,
+        latent_dim_z: int = 16,
+        decimation_factor: int = 16,
+        warmup_period: int = 30,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 5,
+        context_len: int = 75,
+        horizon_len: int = 30,
+        forecaster_hidden_dim: int = 128,
+        forecaster_layers: int = 1,
+        forecaster_dropout: float = 0.0,
+    ):
+        super().__init__(
+            sequence_length=sequence_length,
+            latent_dim_source=latent_dim_source,
+            latent_dim_target=latent_dim_target,
+            latent_dim_z=latent_dim_z,
+            decimation_factor=decimation_factor,
+            warmup_period=warmup_period,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
+            context_len=context_len,
+            horizon_len=horizon_len,
+            forecaster_hidden_dim=forecaster_hidden_dim,
+            forecaster_layers=forecaster_layers,
+            forecaster_dropout=forecaster_dropout,
+            use_latent_forecaster=False,
+            latent_forecaster=None,
+        )
 
     @classmethod
     def from_legacy_checkpoint(
@@ -1194,13 +1562,21 @@ class SeqVaeTeb(nn.Module):
             "conditional_encoder.",
             "decoder.",
         )
+        core_prefixes = tuple(f"core.{p}" for p in legacy_prefixes)
 
         current_sd = model.state_dict()
         filtered_sd: Dict[str, torch.Tensor] = {}
         for key, value in sd.items():
             norm_key = _normalize_key(key)
-            if norm_key in current_sd and norm_key.startswith(legacy_prefixes):
-                filtered_sd[norm_key] = value
+            candidate_keys = []
+            if norm_key.startswith(core_prefixes):
+                candidate_keys.append(norm_key)
+            if norm_key.startswith(legacy_prefixes):
+                candidate_keys.append(f"core.{norm_key}")
+            for target_key in candidate_keys:
+                if target_key in current_sd:
+                    filtered_sd[target_key] = value
+                    break
 
         if not filtered_sd:
             raise ValueError(
@@ -1230,8 +1606,9 @@ class SeqVaeTeb(nn.Module):
             except Exception:
                 missing_keys, unexpected_keys = [], []
 
-        legacy_missing = [k for k in missing_keys if k.startswith(legacy_prefixes)]
-        new_module_missing = [k for k in missing_keys if not k.startswith(legacy_prefixes)]
+        legacy_key_prefixes = legacy_prefixes + core_prefixes
+        legacy_missing = [k for k in missing_keys if k.startswith(legacy_key_prefixes)]
+        new_module_missing = [k for k in missing_keys if not k.startswith(legacy_key_prefixes)]
 
         if legacy_missing:
             log.warning(
@@ -1281,51 +1658,8 @@ class SeqVaeTeb(nn.Module):
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Full forward pass (reconstruction mode; decodes full length T to raw 4800).
-
-        Args:
-            y_st: (B, T, 43)
-            y_ph: (B, T, 44)
-            x_ph: (B, T, 130)
-
-        Returns:
-            dict with:
-                z:            (B, T, D)
-                linear_output:(B, T, 87)
-                mu_pr:        (B, 4800)
-                logvar_pr:    (B, 4800)
-                mu_prior:     (B, T, D)
-                logvar_prior: (B, T, D)
-                mu_post:      (B, T, D)
-                logvar_post:  (B, T, D)
-        """
-
-        # Source encoder for q(h_x|x)
-        mu_x = self.source_encoder(x_ph)
-
-        # Target encoder for p(z|y) - now returns separate outputs for TEB compliance
-        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
-
-        # Conditional encoder for q(z|x, y)
-        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
-        mu_post = mu_post + mu_y
-
-        z = self.reparameterize(mu_post, logvar_post)
-
-        # Decode raw signal predictions from z (no encoder features to preserve information bottleneck)
-        linear_output, mu_pr, logvar_pr = self.decoder(z)
-
-        return {
-            "z": z,  # (batch, length, channel)
-            "linear_output": linear_output,  # (batch, length, 87)
-            "mu_pr": mu_pr, # (batch, 4800) - raw signal reconstruction
-            "logvar_pr": logvar_pr,  # (batch, 4800) - raw signal reconstruction
-            "mu_prior": mu_y,
-            "logvar_prior": logvar_y_prior,
-            "mu_post": mu_post,
-            "logvar_post": logvar_post,
-        }
+        """Full VAE forward pass via the core module."""
+        return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
 
     # ------------------------
     # Encoding utilities
@@ -1337,23 +1671,8 @@ class SeqVaeTeb(nn.Module):
         x_ph: torch.Tensor,
         sample_z: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Run only encoders and posterior sampling (no decoding).
-
-        Returns keys: mu_prior, logvar_prior, mu_post, logvar_post, z
-        """
-        mu_x = self.source_encoder(x_ph)
-        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
-        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
-        mu_post = mu_post + mu_y
-        z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
-        return {
-            "mu_prior": mu_y,
-            "logvar_prior": logvar_y_prior,
-            "mu_post": mu_post,
-            "logvar_post": logvar_post,
-            "z": z,
-        }
+        """Encoder-only pass delegated to the core module."""
+        return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
 
     # ------------------------
     # Forecasting helpers
@@ -1412,6 +1731,8 @@ class SeqVaeTeb(nn.Module):
             mu_future/logvar_future: (B, N, W) with W = 16*H
             enc: dict with full-sequence priors/posteriors
         """
+        self._require_forecaster()
+
         B, T, _ = y_st.shape
         H = self.horizon_len
         Lc = self.context_len
@@ -1454,13 +1775,8 @@ class SeqVaeTeb(nn.Module):
         }
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        Reparameterization trick.
-        Shapes: mu/logvar (B, L, D) -> z (B, L, D)
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std  # Remove in-place operation
+        """Reparameterization trick delegated to the core module."""
+        return self.core.reparameterize(mu, logvar)
 
     def _kld_loss(
         self,
@@ -1470,42 +1786,19 @@ class SeqVaeTeb(nn.Module):
         logvar_post: torch.Tensor,
         reduce_mean: bool = True,
     ) -> torch.Tensor:
-        """
-        KL divergence between diagonal Gaussians.
-
-        Shapes
-            mu_prior/logvar_prior: (B, L, D)
-            mu_post/logvar_post:   (B, L, D)
-            returns: scalar if reduce_mean=True else (B, L, D)
-        """
-        kld = (
-                logvar_prior
-                - logvar_post
-                - 1
-                + (logvar_post.exp() + (mu_post - mu_prior).pow(2))
-                / logvar_prior.exp()
+        """Wrapper over the core KL helper."""
+        return self.core._kld_loss(
+            mu_prior=mu_prior,
+            logvar_prior=logvar_prior,
+            mu_post=mu_post,
+            logvar_post=logvar_post,
+            reduce_mean=reduce_mean,
         )
-        kld = 0.5 * kld
-
-        if reduce_mean:
-            return kld.sum(dim=-1).mean()
-        return kld
 
     @staticmethod
     def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Elementwise Gaussian NLL averaged over batch and time.
-
-        Shapes: mu/logvar/target (B, R) or (B, W) must match; optional mask same shape.
-        If mask provided, returns weighted mean over valid points.
-        """
-        var = logvar.exp()
-        nll = 0.5 * (logvar + (target - mu) ** 2 / var)
-        if mask is not None:
-            nll = nll * mask
-            denom = mask.sum().clamp_min(1.0)
-            return nll.sum() / denom
-        return nll.mean()
+        """Static redirect to the core Gaussian NLL helper."""
+        return SeqVaeCore.gaussian_nll(mu, logvar, target, mask)
 
     def compute_forecast_loss(
         self,
@@ -1526,6 +1819,8 @@ class SeqVaeTeb(nn.Module):
             y_raw: (B, R=4800)
             anchors: (N,)
         """
+        self._require_forecaster()
+
         mu_future = forecast_outputs["mu_future"]  # (B,N,480)
         logvar_future = forecast_outputs["logvar_future"]  # (B,N,480)
         enc = forecast_outputs["enc"]
@@ -1790,91 +2085,77 @@ class SeqVaeTeb(nn.Module):
         Returns:
             A dictionary of computed losses.
         """
-        device = y_raw.device
-        kld_loss = torch.tensor(0.0, device=device)
-        predictive_loss = torch.tensor(0.0, device=device)
-        latent_consistency_loss = torch.tensor(0.0, device=device)
-
-        if y_raw.dim() == 3 and y_raw.size(-1) == 1:
-            y_raw = y_raw.squeeze(-1)  # Remove channel dimension if present
-
-        # Decoder losses (MSE + NLL)
-        decoder_losses = self.decoder.compute_loss(
-            linear_output=forward_outputs['linear_output'],
-            raw_mu_predicted=forward_outputs['mu_pr'], 
-            raw_logvar_predicted=forward_outputs['logvar_pr'],
-            target_fhr_st=y_st,
-            target_fhr_ph=y_ph,
-            target_raw_signal=y_raw
-        )
-
-        # KLD loss
-        if compute_kld_loss:
-            kld_loss = self._kld_loss(
-                mu_prior=forward_outputs["mu_prior"],
-                logvar_prior=forward_outputs["logvar_prior"],
-                mu_post=forward_outputs["mu_post"],
-                logvar_post=forward_outputs["logvar_post"],
-                reduce_mean=True,  # Ensure scalar loss for training
-            )
-
-        # Auxiliary predictive objectives to encourage temporally informative latents
         needs_predictive = (predictive_weight > 0.0 or latent_consistency_weight > 0.0)
         if needs_predictive:
             if predictive_horizon < 1:
                 raise ValueError("predictive_horizon must be >= 1 when predictive losses are enabled")
+            self._require_forecaster()
 
-            mu_post = forward_outputs["mu_post"]  # (B, T, D)
-            B, T, D = mu_post.shape
+        base_losses = self.core.compute_reconstruction_loss(
+            forward_outputs=forward_outputs,
+            y_st=y_st,
+            y_ph=y_ph,
+            y_raw=y_raw,
+            compute_kld_loss=compute_kld_loss,
+            beta=beta,
+        )
+        base_total = base_losses["total_loss"]
+
+        device = forward_outputs["mu_pr"].device
+        predictive_loss = torch.tensor(0.0, device=device)
+        latent_consistency_loss = torch.tensor(0.0, device=device)
+
+        y_raw_eval = y_raw
+        if y_raw_eval.dim() == 3 and y_raw_eval.size(-1) == 1:
+            y_raw_eval = y_raw_eval.squeeze(-1)
+
+        if needs_predictive:
+            mu_post = forward_outputs["mu_post"]
+            _, T, D = mu_post.shape
             stride = self.decimation_factor
             context_len = predictive_context_len or self.context_len
 
             anchors = self.anchor_range(T, context_len, predictive_horizon)
             if anchors.numel() > 0:
                 anchors = anchors.to(mu_post.device)
-
                 if predictive_max_anchors is not None and predictive_max_anchors > 0:
                     max_anchors = min(int(predictive_max_anchors), anchors.numel())
                     if max_anchors < anchors.numel():
                         perm = torch.randperm(anchors.numel(), device=anchors.device)
                         anchors = anchors[perm[:max_anchors]]
 
-                # Gather contexts for latent forecaster
-                contexts = self._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
+                contexts = self._gather_context(mu_post, anchors, context_len)
                 B_ctx, N, Lc, _ = contexts.shape
                 contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
 
-                # Predict future latents z_{t+1:t+H}
                 z_future_pred = self.latent_forecaster(contexts_flat, horizon=predictive_horizon)
                 z_future_pred = z_future_pred.reshape(B_ctx, N, predictive_horizon, D)
 
-                # Collect ground-truth future latent means (stop gradient)
                 future_offsets = torch.arange(1, predictive_horizon + 1, device=mu_post.device, dtype=torch.long)
-                step_indices = anchors.to(mu_post.device).long().unsqueeze(1) + future_offsets.unsqueeze(0)  # (N, H)
+                step_indices = anchors.long().unsqueeze(1) + future_offsets.unsqueeze(0)
                 gather_idx = step_indices.unsqueeze(0).unsqueeze(-1).expand(B_ctx, -1, -1, D)
                 expanded_mu_post = mu_post.unsqueeze(1).expand(-1, N, -1, -1)
-                future_targets = torch.gather(expanded_mu_post, 2, gather_idx).detach()  # (B, N, H, D)
+                future_targets = torch.gather(expanded_mu_post, 2, gather_idx).detach()
 
                 if latent_consistency_weight > 0.0:
                     latent_consistency_loss = F.mse_loss(z_future_pred, future_targets)
 
                 if predictive_weight > 0.0:
-                    # Decode forecasted latents to raw space and score against ground truth
                     z_future_flat = z_future_pred.reshape(B_ctx * N, predictive_horizon, D)
                     _, mu_flat, logvar_flat = self.decoder(z_future_flat)
                     mu_future = mu_flat.reshape(B_ctx, N, -1)
                     logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
 
                     window_len = mu_future.size(-1)
-                    start_positions = stride * (anchors.to(device=device).long() + 1)
+                    start_positions = stride * (anchors.long() + 1)
                     raw_offsets = torch.arange(window_len, device=device, dtype=torch.long)
-                    raw_indices = start_positions[:, None] + raw_offsets[None, :]  # (N, window_len)
+                    raw_indices = start_positions[:, None] + raw_offsets[None, :]
                     raw_indices = raw_indices.unsqueeze(0).expand(B_ctx, -1, -1)
 
                     target_windows = torch.gather(
-                        y_raw.unsqueeze(1).expand(-1, N, -1),
+                        y_raw_eval.unsqueeze(1).expand(-1, N, -1),
                         2,
-                        raw_indices
+                        raw_indices.to(y_raw_eval.device),
                     )
 
                     predictive_loss = self.gaussian_nll(
@@ -1883,24 +2164,18 @@ class SeqVaeTeb(nn.Module):
                         target_windows.reshape(B_ctx * N, window_len),
                     )
 
-        # Total loss with beta-weighted KLD
         total_loss = (
-            decoder_losses['total_decoder_loss']
-            + beta * kld_loss
+            base_total
             + predictive_weight * predictive_loss
             + latent_consistency_weight * latent_consistency_loss
         )
 
-        return {
-            "reconstruction_loss": decoder_losses['total_decoder_loss'],  # For backward compatibility
-            "mse_loss": decoder_losses['mse_loss'],
-            "nll_loss": decoder_losses['nll_loss'], 
-            "kld_loss": kld_loss,
-            "predictive_loss": predictive_loss,
-            "latent_consistency_loss": latent_consistency_loss,
-            "total_loss": total_loss,
-            "classification_loss": None,  # Required by interface
-        }
+        base_losses["base_total_loss"] = base_total
+        base_losses["predictive_loss"] = predictive_loss
+        base_losses["latent_consistency_loss"] = latent_consistency_loss
+        base_losses["total_loss"] = total_loss
+        base_losses["classification_loss"] = None  # Required by interface
+        return base_losses
 
     def measure_transfer_entropy(
         self,

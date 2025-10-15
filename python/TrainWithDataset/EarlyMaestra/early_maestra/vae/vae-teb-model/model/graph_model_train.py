@@ -33,6 +33,7 @@ from pytorch_lightning_modules import *
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
     SeqVaeTeb,
+    SeqVaeNoForecast,
     DEFAULT_COMPILE_ATTEMPTS,
     ensure_compiled_module,
 )
@@ -238,6 +239,18 @@ class SeqVAEGraphModel:
         self.monitor_metric = vae_cfg.get('monitor_metric', 'val/predictive_loss')
         self.monitor_mode = vae_cfg.get('monitor_mode', 'min')
 
+        default_forecaster_flag = (
+            self.predictive_weight > 0.0
+            or self.latent_consistency_weight > 0.0
+        )
+        self.enable_forecaster = bool(vae_cfg.get('enable_forecaster', default_forecaster_flag))
+        if not self.enable_forecaster:
+            self.predictive_weight = 0.0
+            self.latent_consistency_weight = 0.0
+            self.log_forecast_metrics = False
+            if 'predictive' in self.monitor_metric:
+                self.monitor_metric = 'val/total_loss'
+
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
@@ -330,17 +343,26 @@ class SeqVAEGraphModel:
             load_success = False
             last_error: Optional[Exception] = None
 
+            model_cls = SeqVaeTeb if self.enable_forecaster else SeqVaeNoForecast
+
             for compile_options in compile_attempts:
-                base_model_for_loading = SeqVaeTeb(
-                    context_len=self.model_context_len,
-                    horizon_len=self.model_horizon_len,
-                )
+                if self.enable_forecaster:
+                    base_model_for_loading = model_cls(
+                        context_len=self.model_context_len,
+                        horizon_len=self.model_horizon_len,
+                        use_latent_forecaster=True,
+                    )
+                else:
+                    base_model_for_loading = model_cls(
+                        context_len=self.model_context_len,
+                        horizon_len=self.model_horizon_len,
+                    )
                 self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
 
                 if compile_options is not None:
                     compiled_module, compiled_ok = ensure_compiled_module(
                         base_model_for_loading,
-                        module_name="SeqVaeTeb preload",
+                        module_name=f"{model_cls.__name__} preload",
                         attempts=[compile_options],
                     )
                     if not compiled_ok:
@@ -382,7 +404,7 @@ class SeqVAEGraphModel:
                 self.base_model = self.lightning_base_model.model
                 self.base_model, compiled_flag = ensure_compiled_module(
                     self.base_model,
-                    module_name="SeqVaeTeb post-checkpoint",
+                    module_name=f"{model_cls.__name__} post-checkpoint",
                 )
                 self.lightning_base_model.model = self.base_model
                 self._skip_compilation = compiled_flag
@@ -404,6 +426,10 @@ class SeqVAEGraphModel:
 
     def _resolve_predictive_anchor_cap(self, sequence_length: int) -> None:
         """Set predictive_max_anchors to the maximum feasible value if unset or oversized."""
+        if not self.enable_forecaster:
+            self.predictive_max_anchors = 0
+            logger.info("Latent forecaster disabled; predictive_max_anchors set to 0")
+            return
         seq_len = max(1, int(sequence_length))
         context = max(1, int(self.predictive_context_len))
         horizon = max(1, int(self.predictive_horizon))
@@ -437,25 +463,28 @@ class SeqVAEGraphModel:
             'context_len': self.model_context_len,
             'horizon_len': self.model_horizon_len,
         }
+        model_cls = SeqVaeTeb if self.enable_forecaster else SeqVaeNoForecast
+        if self.enable_forecaster:
+            init_kwargs['use_latent_forecaster'] = True
         base_model = None
         legacy_ckpt = getattr(self, 'legacy_seqvae_checkpoint', None)
         if legacy_ckpt:
             if os.path.exists(legacy_ckpt):
                 try:
-                    logger.info(f"Initializing SeqVaeTeb from legacy checkpoint: {legacy_ckpt}")
-                    base_model = SeqVaeTeb.from_legacy_checkpoint(
+                    logger.info(f"Initializing {model_cls.__name__} from legacy checkpoint: {legacy_ckpt}")
+                    base_model = model_cls.from_legacy_checkpoint(
                         legacy_ckpt,
                         strict=False,
                         init_kwargs=init_kwargs,
                     )
                 except Exception as exc:
-                    logger.warning(f"Failed to load legacy SeqVaeTeb checkpoint {legacy_ckpt}: {exc}")
+                    logger.warning(f"Failed to load legacy SeqVAE checkpoint {legacy_ckpt}: {exc}")
                     logger.warning("Falling back to random initialization.")
             else:
-                logger.warning(f"Legacy SeqVaeTeb checkpoint not found at {legacy_ckpt}. Proceeding with random initialization.")
+                logger.warning(f"Legacy SeqVAE checkpoint not found at {legacy_ckpt}. Proceeding with random initialization.")
 
         if base_model is None:
-            base_model = SeqVaeTeb(**init_kwargs)
+            base_model = model_cls(**init_kwargs)
 
         self.base_model = base_model
         self._resolve_predictive_anchor_cap(getattr(self.base_model, 'sequence_length', 300))
@@ -538,6 +567,7 @@ class SeqVAEGraphModel:
             'predictive_context_len': self.predictive_context_len,
             'predictive_max_anchors': self.predictive_max_anchors,
             'log_forecast_metrics': self.log_forecast_metrics,
+            'enable_forecaster': self.enable_forecaster,
         }
 
         for key, value in enforce_map.items():
@@ -634,6 +664,7 @@ class SeqVAEGraphModel:
             self.predictive_max_anchors,
             self.log_forecast_metrics,
         )
+        logger.info("Latent forecaster enabled: %s", self.enable_forecaster)
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
             plot_every_epoch=self.plot_every_epoch,
@@ -649,6 +680,8 @@ class SeqVAEGraphModel:
 
         monitor_metric = ckpt_cfg.get('monitor', self.monitor_metric)
         monitor_mode = ckpt_cfg.get('mode', self.monitor_mode)
+        if (not self.enable_forecaster) and monitor_metric and 'predictive' in monitor_metric:
+            monitor_metric = 'val/total_loss'
         self.monitor_metric = monitor_metric
         self.monitor_mode = monitor_mode
 
@@ -667,10 +700,14 @@ class SeqVAEGraphModel:
         logger.info(f"Checkpoint callback monitoring '{monitor_metric}' (mode={monitor_mode})")
 
         early_enabled = bool(early_cfg.get('enabled', False))
+        early_monitor = early_cfg.get('monitor', monitor_metric)
+        if (not self.enable_forecaster) and early_monitor and 'predictive' in early_monitor:
+            early_monitor = 'val/total_loss'
+
         self.early_stop_callback = None
         if early_enabled:
             self.early_stop_callback = EarlyStopping(
-                monitor=early_cfg.get('monitor', monitor_metric),
+                monitor=early_monitor,
                 min_delta=float(early_cfg.get('min_delta', 1e-4)),
                 patience=int(early_cfg.get('patience', 100)),
                 verbose=True,
