@@ -420,6 +420,8 @@ class SeqVAEGraphModel:
         else:
             if self.base_model_checkpoint:
                 logger.warning(f"Checkpoint file not found at {self.base_model_checkpoint}. Initializing models from scratch.")
+            elif self.legacy_seqvae_checkpoint and os.path.exists(self.legacy_seqvae_checkpoint):
+                logger.info("No full checkpoint provided. Falling back to legacy SeqVAE checkpoint.")
             else:
                 logger.info("No checkpoint provided. Initializing models from scratch.")
             self._create_fresh_model()
