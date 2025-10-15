@@ -1405,6 +1405,38 @@ class SeqVaeTeb(nn.Module):
     def _is_latent_forecaster_key(name: str) -> bool:
         return "latent_forecaster" in name.split(".")
 
+    @staticmethod
+    def _normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Strip wrapper prefixes and ensure core.* names for legacy checkpoints."""
+        strip_prefixes = (
+            "model.",
+            "module.",
+            "_orig_mod.",
+            "seqvae_model.",
+            "vae_model.",
+        )
+        core_modules = (
+            "source_encoder.",
+            "target_encoder.",
+            "conditional_encoder.",
+            "decoder.",
+        )
+
+        normalized: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = key
+            changed = True
+            while changed:
+                changed = False
+                for prefix in strip_prefixes:
+                    if new_key.startswith(prefix):
+                        new_key = new_key[len(prefix):]
+                        changed = True
+            if not new_key.startswith("core.") and new_key.startswith(core_modules):
+                new_key = f"core.{new_key}"
+            normalized[new_key] = value
+        return normalized
+
     def state_dict(
         self,
         destination: Optional[Dict[str, torch.Tensor]] = None,
@@ -1442,8 +1474,10 @@ class SeqVaeTeb(nn.Module):
         """
         Load weights with explicit control over whether latent forecaster parameters are expected.
         """
+        normalized_state = self._normalize_state_dict_keys(state_dict)
+
         has_module_forecaster = self.latent_forecaster is not None
-        has_forecaster_weights = any(self._is_latent_forecaster_key(k) for k in state_dict.keys())
+        has_forecaster_weights = any(self._is_latent_forecaster_key(k) for k in normalized_state.keys())
 
         if load_forecaster is None:
             load_forecaster = has_module_forecaster and has_forecaster_weights
@@ -1454,9 +1488,9 @@ class SeqVaeTeb(nn.Module):
             raise RuntimeError("Requested latent forecaster weights but none found in the provided state_dict.")
 
         filtered_state = (
-            {k: v for k, v in state_dict.items() if not self._is_latent_forecaster_key(k)}
+            {k: v for k, v in normalized_state.items() if not self._is_latent_forecaster_key(k)}
             if not load_forecaster
-            else state_dict
+            else normalized_state
         )
 
         incompatible = super().load_state_dict(filtered_state, strict=False)
@@ -1538,45 +1572,20 @@ class SeqVaeNoForecast(SeqVaeTeb):
 
         ckpt = torch.load(ckpt_path, map_location=map_location)
         sd = ckpt.get("state_dict", ckpt)
-
-        def _normalize_key(k: str) -> str:
-            prefixes = (
-                "model.",
-                "module.",
-                "_orig_mod.",
-                "seqvae_model.",
-                "vae_model.",
-            )
-            changed = True
-            while changed:
-                changed = False
-                for p in prefixes:
-                    if k.startswith(p):
-                        k = k[len(p):]
-                        changed = True
-            return k
+        sd = cls._normalize_state_dict_keys(sd)
 
         legacy_prefixes = (
-            "source_encoder.",
-            "target_encoder.",
-            "conditional_encoder.",
-            "decoder.",
+            "core.source_encoder.",
+            "core.target_encoder.",
+            "core.conditional_encoder.",
+            "core.decoder.",
         )
-        core_prefixes = tuple(f"core.{p}" for p in legacy_prefixes)
 
         current_sd = model.state_dict()
         filtered_sd: Dict[str, torch.Tensor] = {}
         for key, value in sd.items():
-            norm_key = _normalize_key(key)
-            candidate_keys = []
-            if norm_key.startswith(core_prefixes):
-                candidate_keys.append(norm_key)
-            if norm_key.startswith(legacy_prefixes):
-                candidate_keys.append(f"core.{norm_key}")
-            for target_key in candidate_keys:
-                if target_key in current_sd:
-                    filtered_sd[target_key] = value
-                    break
+            if key in current_sd and key.startswith(legacy_prefixes):
+                filtered_sd[key] = value
 
         if not filtered_sd:
             raise ValueError(
@@ -1606,9 +1615,8 @@ class SeqVaeNoForecast(SeqVaeTeb):
             except Exception:
                 missing_keys, unexpected_keys = [], []
 
-        legacy_key_prefixes = legacy_prefixes + core_prefixes
-        legacy_missing = [k for k in missing_keys if k.startswith(legacy_key_prefixes)]
-        new_module_missing = [k for k in missing_keys if not k.startswith(legacy_key_prefixes)]
+        legacy_missing = [k for k in missing_keys if k.startswith(legacy_prefixes)]
+        new_module_missing = [k for k in missing_keys if not k.startswith(legacy_prefixes)]
 
         if legacy_missing:
             log.warning(
