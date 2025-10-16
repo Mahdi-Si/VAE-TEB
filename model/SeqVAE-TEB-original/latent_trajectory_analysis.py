@@ -435,7 +435,9 @@ def plot_latent_changepoints_with_raw(
     n_changepoints=5,
     decimation_factor=16,
     cmap='viridis',
-    figsize=(14, 8)
+    figsize=(14, 4),
+    max_samples=5,
+    random_state=None
 ):
     """
     Visualize latent trajectories alongside raw signals with shared changepoints.
@@ -452,10 +454,12 @@ def plot_latent_changepoints_with_raw(
         n_changepoints: int, number of changepoints to detect in the latent space (>=0).
         decimation_factor: int, ratio between raw signal length and latent length (default: 16).
         cmap: str, matplotlib colormap name for the latent heatmap.
-        figsize: tuple, figure size passed to matplotlib.
+        figsize: tuple, base figure size per sample pair (latent + raw axes).
+        max_samples: int, maximum number of samples to visualize (randomly selected, default: 5).
+        random_state: Optional int for reproducible sample selection.
 
     Returns:
-        List[Dict[str, Any]] containing per-sample changepoint metadata with keys:
+        List[Dict[str, Any]] containing per-sample changepoint metadata for plotted samples with keys:
             - 'sample_id'
             - 'latent_changepoints' (np.ndarray of latent indices)
             - 'raw_changepoints' (np.ndarray of raw indices)
@@ -502,12 +506,43 @@ def plot_latent_changepoints_with_raw(
     if len(sample_ids) != batch_size:
         raise ValueError("sample_ids length must match batch size.")
 
+    if max_samples is not None:
+        if max_samples <= 0:
+            logger.warning("max_samples <= 0; no plots generated.")
+            return []
+        max_samples = min(batch_size, int(max_samples))
+    else:
+        max_samples = batch_size
+
+    rng = np.random.default_rng(random_state)
+    if max_samples < batch_size:
+        selected_indices = rng.choice(batch_size, size=max_samples, replace=False)
+    else:
+        selected_indices = np.arange(batch_size)
+    selected_indices = np.sort(selected_indices)
+
+    if selected_indices.size == 0:
+        logger.warning("No samples selected for plotting.")
+        return []
+
     os.makedirs(save_path, exist_ok=True)
 
     results: List[Dict[str, Any]] = []
 
     max_bkps = max(0, int(n_changepoints))
-    for batch_idx in range(batch_size):
+
+    total_rows = selected_indices.size * 2
+    fig_height = figsize[1] * selected_indices.size
+    fig, axes = plt.subplots(
+        total_rows,
+        1,
+        figsize=(figsize[0], fig_height),
+        sharex=False,
+        squeeze=False
+    )
+    axes = axes.reshape(-1)
+
+    for idx_counter, batch_idx in enumerate(selected_indices):
         sample_id = str(sample_ids[batch_idx])
         latent_sample = latent_np[batch_idx]
         fhr_sample = fhr_np[batch_idx]
@@ -539,24 +574,23 @@ def plot_latent_changepoints_with_raw(
             dtype=int
         )
 
-        fig, axes = plt.subplots(
-            2, 1, figsize=figsize, sharex=False, gridspec_kw={'height_ratios': [2, 1]}
-        )
+        latent_ax = axes[2 * idx_counter]
+        raw_ax = axes[2 * idx_counter + 1]
 
-        im = axes[0].imshow(
+        im = latent_ax.imshow(
             latent_sample,
             aspect='auto',
             origin='lower',
             cmap=cmap,
             interpolation='nearest'
         )
-        axes[0].set_ylabel('Latent Time Index')
-        axes[0].set_title('Latent Representation (mean)')
-        cbar = plt.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+        latent_ax.set_ylabel('Latent Time Index')
+        latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
+        cbar = plt.colorbar(im, ax=latent_ax, fraction=0.046, pad=0.04)
         cbar.ax.set_ylabel('Activation', rotation=270, labelpad=15)
 
         for cp_idx in latent_cps:
-            axes[0].axhline(
+            latent_ax.axhline(
                 cp_idx - 0.5,
                 color='white',
                 linestyle='--',
@@ -565,32 +599,22 @@ def plot_latent_changepoints_with_raw(
             )
 
         time_axis = np.arange(raw_len)
-        axes[1].plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
-        axes[1].plot(time_axis, up_sample, label='UP', color='#2E86C1', linewidth=1.0)
-        axes[1].set_xlabel('Raw Time Index')
-        axes[1].set_ylabel('Normalized Amplitude')
-        axes[1].set_title('Raw Signals (FHR & UP)')
-        axes[1].grid(True, alpha=0.3)
-        axes[1].legend(loc='upper right')
+        raw_ax.plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
+        raw_ax.plot(time_axis, up_sample, label='UP', color='#2E86C1', linewidth=1.0)
+        raw_ax.set_xlabel('Raw Time Index')
+        raw_ax.set_ylabel('Normalized Amplitude')
+        raw_ax.set_title(f'Raw Signals (FHR & UP) - {sample_id}')
+        raw_ax.grid(True, alpha=0.3)
+        raw_ax.legend(loc='upper right')
 
         for raw_cp in raw_cps:
-            axes[1].axvline(
+            raw_ax.axvline(
                 raw_cp,
                 color='black',
                 linestyle='--',
                 linewidth=1.0,
                 alpha=0.6
             )
-
-        fig.suptitle(f'Latent Trajectory Changepoints - {sample_id}', fontsize=14)
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-        figure_path = os.path.join(
-            save_path,
-            f'latent_raw_changepoints_{sample_id}.png'
-        )
-        fig.savefig(figure_path, dpi=150)
-        plt.close(fig)
 
         results.append(
             {
@@ -599,6 +623,21 @@ def plot_latent_changepoints_with_raw(
                 'raw_changepoints': raw_cps
             }
         )
+
+    fig.suptitle('Latent Trajectory Changepoints (sampled)', fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+
+    selected_labels = "_".join([str(sample_ids[idx]) for idx in selected_indices])
+    selected_labels = selected_labels.replace(os.sep, "-")
+    if len(selected_labels) > 80:
+        selected_labels = selected_labels[:77] + "..."
+
+    figure_path = os.path.join(
+        save_path,
+        f'latent_raw_changepoints_samples_{selected_labels}.png'
+    )
+    fig.savefig(figure_path, dpi=150)
+    plt.close(fig)
 
     return results
 
@@ -1601,13 +1640,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 plot_latent_changepoints_with_raw(
                     fhr=fhr,
                     up=up,
-                    epoch=epoch,
-                    latent_trajectory=latent_mean,
+                    latent_mean=latent_mean,
                     save_path=fhr_up_plot_path,
-                    sample_id=f"{guid_in_batch}",
-                    title='FHR, UP and Latent Changepoints',
-                    sampling_rate_hz=4,
-                    point_size=50
                 )
                 
                 # reduced_latent_mean = reduce_latent_dimensionality(
