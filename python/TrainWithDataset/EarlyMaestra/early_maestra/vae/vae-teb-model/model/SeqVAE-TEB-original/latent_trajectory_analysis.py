@@ -17,7 +17,7 @@ import torch
 from loguru import logger
 from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.gridspec import GridSpec
 from sklearn.cluster import KMeans
 from sklearn.decomposition import IncrementalPCA, PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -536,14 +536,18 @@ def plot_latent_changepoints_with_raw(
 
     total_rows = selected_indices.size * 2
     fig_height = figsize[1] * selected_indices.size
-    fig, raw_axes = plt.subplots(
+    n_cols = 2 if show_colorbar else 1
+    width_ratios = [20, 1] if show_colorbar else None
+    fig = plt.figure(figsize=(figsize[0], fig_height))
+    gs = GridSpec(
         total_rows,
-        1,
-        figsize=(figsize[0], fig_height),
-        sharex=False,
-        squeeze=False
+        n_cols,
+        figure=fig,
+        height_ratios=[1.0] * total_rows,
+        width_ratios=width_ratios,
+        hspace=0.6,
+        wspace=0.2 if show_colorbar else 0.1
     )
-    axes = raw_axes.reshape(-1)
 
     for idx_counter, batch_idx in enumerate(selected_indices):
         sample_id = str(sample_ids[batch_idx])
@@ -577,11 +581,22 @@ def plot_latent_changepoints_with_raw(
             dtype=int
         )
 
-        latent_ax = axes[2 * idx_counter]
-        raw_ax = axes[2 * idx_counter + 1]
+        row_latent = 2 * idx_counter
+        row_raw = row_latent + 1
+
+        if show_colorbar:
+            latent_ax = fig.add_subplot(gs[row_latent, 0])
+            cax = fig.add_subplot(gs[row_latent, 1])
+            raw_ax = fig.add_subplot(gs[row_raw, 0], sharex=latent_ax)
+            fig.add_subplot(gs[row_raw, 1]).axis('off')
+        else:
+            latent_ax = fig.add_subplot(gs[row_latent, 0])
+            cax = None
+            raw_ax = fig.add_subplot(gs[row_raw, 0], sharex=latent_ax)
 
         latent_dims = latent_sample.shape[1]
-        extent = (0, max(raw_len - 1, 0), 0, latent_dims)
+        x_max = max(raw_len - 1, 0)
+        extent = (0, x_max, 0, latent_dims)
         im = latent_ax.imshow(
             latent_sample.T,
             aspect='auto',
@@ -591,13 +606,16 @@ def plot_latent_changepoints_with_raw(
             extent=extent
         )
         latent_ax.set_xlim(extent[0], extent[1])
+        latent_ax.set_ylim(0, latent_dims)
         latent_ax.set_ylabel('Latent Dimension')
-        latent_ax.set_xlabel('Raw Time Index')
         latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
+        latent_ax.grid(False)
+        if idx_counter != selected_indices.size - 1:
+            latent_ax.tick_params(labelbottom=False)
+        else:
+            latent_ax.set_xlabel('Raw Time Index')
 
-        if show_colorbar:
-            divider = make_axes_locatable(latent_ax)
-            cax = divider.append_axes('right', size='3%', pad=0.05)
+        if show_colorbar and cax is not None:
             cbar = fig.colorbar(im, cax=cax)
             cbar.ax.set_ylabel('Activation', rotation=270, labelpad=12)
 
@@ -619,6 +637,8 @@ def plot_latent_changepoints_with_raw(
         raw_ax.grid(True, alpha=0.3)
         raw_ax.legend(loc='upper right')
         raw_ax.set_xlim(extent[0], extent[1])
+        if idx_counter != selected_indices.size - 1:
+            raw_ax.tick_params(labelbottom=False)
 
         for raw_cp in raw_cps:
             raw_ax.axvline(
@@ -638,7 +658,7 @@ def plot_latent_changepoints_with_raw(
         )
 
     fig.suptitle('Latent Trajectory Changepoints (sampled)', fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
 
     selected_labels = "_".join([str(sample_ids[idx]) for idx in selected_indices])
     selected_labels = selected_labels.replace(os.sep, "-")
