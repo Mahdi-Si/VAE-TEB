@@ -4,9 +4,11 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, Union, Dict, Any, Sequence
 
 import math
+import copy
 from typing import List
 
 from utils.custom_logger import setup_logging
+from model.model_utils import *
 
 setup_logging(
     log_to_file=True,
@@ -17,12 +19,11 @@ setup_logging(
     rotation="100 MB",
     retention="14 days",
     compression="zip",
-    serialize=False,   # True → JSON output
-    backtrace=True,    # include full stack backtraces
-    diagnose=False,    # include local vars in tracebacks
+    serialize=False,
+    backtrace=True,
+    diagnose=False,
 )
 
-# Now all logging goes through Loguru
 from loguru import logger as log
 import logging as std_logging
 
@@ -31,61 +32,7 @@ try:
 except Exception:
     _TorchOptimizedModule = tuple()
 
-DEFAULT_COMPILE_ATTEMPTS: Tuple[Dict[str, Any], ...] = (
-    {
-        "mode": "max-autotune-no-cudagraphs",
-        "fullgraph": False,
-        "dynamic": True,
-    },
-    {
-        "mode": "reduce-overhead",
-        "fullgraph": False,
-        "dynamic": True,
-        "options": {"triton.cudagraphs": False},
-    },
-)
 
-def is_compiled_module(module: nn.Module) -> bool:
-    """Return True if `module` is already wrapped by torch.compile."""
-    if module is None:
-        return False
-    if hasattr(module, "_orig_mod"):
-        return True
-    try:
-        return isinstance(module, _TorchOptimizedModule) if _TorchOptimizedModule else False
-    except TypeError:
-        return False
-
-def ensure_compiled_module(
-    module: nn.Module,
-    *,
-    compile_flag: bool = True,
-    module_name: str = "module",
-    attempts: Optional[Sequence[Dict[str, Any]]] = None,
-) -> Tuple[nn.Module, bool]:
-    """Wrap `module` with torch.compile using the provided attempts."""
-    if module is None:
-        return module, False
-    if not compile_flag:
-        return module, is_compiled_module(module)
-    if not hasattr(torch, "compile"):
-        log.warning(f"[{module_name}] torch.compile unavailable in this PyTorch build; running in eager mode")
-        return module, False
-    if is_compiled_module(module):
-        return module, True
-
-    compile_attempts = tuple(attempts) if attempts is not None else DEFAULT_COMPILE_ATTEMPTS
-    for opts in compile_attempts:
-        try:
-            compiled = torch.compile(module, **opts)
-            setattr(compiled, "_compile_options", opts)
-            log.info(f"[{module_name}] Compiled with torch.compile options={opts}")
-            return compiled, True
-        except Exception as exc:  # noqa: BLE001
-            log.warning(f"[{module_name}] torch.compile failed with options={opts}: {exc}")
-
-    log.warning(f"[{module_name}] Falling back to eager mode after all torch.compile attempts failed")
-    return module, False
 
 # -----------------------------------------------------------------------------
 # Shape conventions used throughout this module
@@ -304,7 +251,7 @@ class MultiChannelConvBlock(nn.Module):
         x = self.pre_norm(x)
         
         # Apply activation before convolution (PreAct)
-        x = torch.tanh(x) if self.tanh else F.relu(x)
+        x = torch.tanh(x) if self.tanh else F.gelu(x)
 
         p = self.padding
         if p > 0:
@@ -333,33 +280,30 @@ class ResidualMLP(nn.Module):
     - Output: y  (B, L, Cout) where Cout = hidden_dims[-1]
     """
     def __init__(
-        self, input_dim, hidden_dims=(72, 68, 64), final_activation=True, activation=nn.GELU, use_skip_connection=True
+        self,
+        input_dim,
+        hidden_dims=(72, 68, 64),
+        final_activation=True,
+        activation=nn.GELU,
+        use_skip_connection=True,
+        use_input_layer_norm=True,
     ):
         super().__init__()
-        self.input_norm = nn.LayerNorm(input_dim)
         self.final_activation = final_activation
-        self.activation = activation
         self.use_skip_connection = use_skip_connection
-        # Sequence of (Linear → LayerNorm → activation → Dropout)
+        self.input_norm = nn.LayerNorm(input_dim) if use_input_layer_norm else nn.Identity()
+        self.activation_factory = self._build_activation_factory(activation)
+
+        # Sequence of (Linear → LayerNorm → activation) for intermediate layers
         layers = []
         dims = [input_dim, *hidden_dims]
         for i in range(len(hidden_dims)):
-            is_final_layer = (i == len(hidden_dims) - 1)
-            if is_final_layer and not final_activation:
-                layers += [
-                    nn.Linear(dims[i], dims[i + 1]),
-                ]
-            elif is_final_layer and final_activation:
-                layers += [
-                    nn.Linear(dims[i], dims[i + 1]),
-                    nn.LayerNorm(dims[i + 1]),
-                ]
-            else:
-                layers += [
-                    nn.Linear(dims[i], dims[i + 1]),
-                    nn.LayerNorm(dims[i + 1]),
-                    self.activation(),
-                ]
+            is_final_layer = i == len(hidden_dims) - 1
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if not is_final_layer or final_activation:
+                layers.append(nn.LayerNorm(dims[i + 1]))
+            if not is_final_layer:
+                layers.append(self.activation_factory())
         self.body = nn.Sequential(*layers)
 
         final_dim = hidden_dims[-1]
@@ -371,24 +315,29 @@ class ResidualMLP(nn.Module):
         else:
             self.skip_proj = None
 
-        self.final_act = self.activation() if final_activation else None
+        self.final_act = self.activation_factory() if final_activation else None
 
     def forward(self, x):
-        # x: (B, L, Cin)
-        x0 = self.input_norm(x)          # (B, L, Cin)
-
-        y = self.body(x0)                # (B, L, Cout)
-
-        if self.final_activation:
-            y = self.final_act(y)       # (B, L, Cout)
-
+        x_norm = self.input_norm(x)
+        y = self.body(x_norm)  # (B, L, Cout)
         if self.use_skip_connection:
-            skip = self.skip_proj(x0)   # (B, L, Cout)
-            z = y + skip               # (B, L, Cout)
-        else:
-            z = y
+            skip = self.skip_proj(x_norm)  # (B, L, Cout)
+            y = y + skip
+        if self.final_activation and self.final_act is not None:
+            y = self.final_act(y)  # (B, L, Cout)
+        return y  # (B, L, Cout)
 
-        return z                         # (B, L, Cout)
+    @staticmethod
+    def _build_activation_factory(activation):
+        if isinstance(activation, nn.Module):
+            return lambda: copy.deepcopy(activation)
+        if isinstance(activation, type) and issubclass(activation, nn.Module):
+            return activation
+        if callable(activation):
+            return activation
+        raise TypeError(
+            "activation must be an nn.Module instance, nn.Module subclass, or callable returning an nn.Module."
+        )
 
 
 
@@ -415,7 +364,8 @@ class TargetEncoder(nn.Module):
     """
     def __init__(
         self,
-        sequence_length: int = 300,
+        input_dim_st = 43,
+        input_dim_ph = 44,
         latent_dim: int = 16,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
@@ -424,7 +374,6 @@ class TargetEncoder(nn.Module):
     ):
         super(TargetEncoder, self).__init__()
 
-        self.sequence_length = sequence_length
         self.latent_dim = latent_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.lstm_num_layers = lstm_num_layers
@@ -433,16 +382,16 @@ class TargetEncoder(nn.Module):
         self.activation = activation
         
         self.mlp_scattering = ResidualMLP(
-                input_dim=43,
-                hidden_dims=geometric_schedule(43, 16, 4),
+                input_dim=input_dim_st,
+                hidden_dims=geometric_schedule(input_dim_st, latent_dim, 4),
                 final_activation=False,
                 use_skip_connection=True,
                 activation=nn.GELU
                 )
 
         self.mlp_phase = ResidualMLP(
-            input_dim=44,
-            hidden_dims=geometric_schedule(44, 16, 4),
+            input_dim=input_dim_ph,
+            hidden_dims=geometric_schedule(input_dim_ph, latent_dim, 4),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.GELU
@@ -450,14 +399,14 @@ class TargetEncoder(nn.Module):
 
         self.conv_scattering_1 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1)
         self.conv_scattering_2 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1)
-        self.conv_scattering_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1)
+        self.conv_scattering_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=9, dilation=1)
         
         self.scatter_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
         self.scatter_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
 
         self.conv_phase_1 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=3, dilation=1)
         self.conv_phase_2 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=5, dilation=1)
-        self.conv_phase_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=7, dilation=1)
+        self.conv_phase_3 = CausalMultiChannelConvBlock(in_channels=16, out_channels=16, filter_size=9, dilation=1)
         
         self.phase_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
         self.phase_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
@@ -637,7 +586,6 @@ class SourceEncoder(nn.Module):
     def __init__(
         self,
         input_channels: int = 130,
-        sequence_length: int = 300,
         latent_dim: int = 16,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 4,
@@ -645,7 +593,6 @@ class SourceEncoder(nn.Module):
         super(SourceEncoder, self).__init__()
 
         self.input_channels = input_channels
-        self.sequence_length = sequence_length
         self.latent_dim = latent_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.lstm_num_layers = lstm_num_layers
@@ -919,7 +866,10 @@ class Decoder(nn.Module):
         self.signal_mu = nn.Conv1d(1, 1, kernel_size=1)
         self.signal_logvar = nn.Conv1d(1, 1, kernel_size=1)
 
-    def forward(self, latent_z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        latent_z: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Progressive upsampling forward pass with strict information bottleneck preservation.
         
@@ -938,8 +888,10 @@ class Decoder(nn.Module):
         L = latent_z.size(1)
         z_expanded = self.feature_expansion_1(latent_z)
         z_expanded = self.feature_expansion_2(z_expanded)
-        z_expanded = self.feature_expansion_layer_norm(z_expanded + self.skip_con_exp(latent_z)) # (B, L, 87)
-        z_expanded_pre = self.pre_linear(z_expanded)  # (B, L, 128)
+        z_expanded = self.feature_expansion_layer_norm(z_expanded + self.skip_con_exp(latent_z))  # (B, L, 87)
+        linear_output = z_expanded
+
+        z_expanded_pre = self.pre_linear(linear_output)  # (B, L, 128)
         z_conv = z_expanded_pre.transpose(1, 2)       # (B, 128, L) for conv operations
         del z_expanded_pre
 
@@ -966,7 +918,7 @@ class Decoder(nn.Module):
 
         logvar = torch.clamp(logvar, min=-10, max=10)
 
-        return z_expanded, mu, logvar
+        return linear_output, mu, logvar
 
     @staticmethod
     def compute_loss(
@@ -978,9 +930,7 @@ class Decoder(nn.Module):
         target_raw_signal: torch.Tensor,
         compute_st_mse: bool = True):
         """
-        Compute two-part loss: MSE loss for linear output and NLL loss for raw signal reconstruction.
-        
-        Identical to original Decoder.compute_loss() for compatibility.
+        Compute auxiliary reconstruction MSE and raw-signal NLL losses.
         
         Args:
             linear_output: Output from linear layers (B, S, 87)
@@ -995,28 +945,25 @@ class Decoder(nn.Module):
         """
         device = raw_mu_predicted.device
 
-        if compute_st_mse and linear_output.shape[-1] == 87 and target_fhr_st.shape[-1] == 43 and target_fhr_ph.shape[-1] == 44:
-            stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)  # (B, S, 87)
+        if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
+            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
+
+        if (
+            compute_st_mse
+            and target_fhr_st.dim() == 3
+            and target_fhr_ph.dim() == 3
+            and target_fhr_st.shape[:2] == linear_output.shape[:2]
+            and target_fhr_ph.shape[:2] == linear_output.shape[:2]
+            and linear_output.shape[-1] == (target_fhr_st.shape[-1] + target_fhr_ph.shape[-1])
+        ):
+            stacked_target = torch.cat([target_fhr_st, target_fhr_ph], dim=-1)
             mse_loss = F.mse_loss(linear_output, stacked_target)
         else:
             mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
-            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
-
-        steps = max(0, linear_output.size(1) - 1)
-        if steps > 0:
-            stride = max(1, raw_mu_predicted.size(1) // linear_output.size(1))
-            idx = stride * (torch.arange(steps, device=device, dtype=torch.long) + 1)
-            gather_idx = idx.unsqueeze(0).expand(raw_mu_predicted.size(0), -1)
-            mu_next = torch.gather(raw_mu_predicted, 1, gather_idx)
-            logvar_next = torch.gather(raw_logvar_predicted, 1, gather_idx)
-            target_next = torch.gather(target_raw_signal, 1, gather_idx)
-            var_next = logvar_next.exp()
-            nll_loss = 0.5 * (logvar_next + (target_next - mu_next) ** 2 / var_next)
-            nll_loss = nll_loss.mean()
-        else:
-            nll_loss = torch.tensor(0.0, device=device)
+        var = raw_logvar_predicted.exp()
+        nll_loss = 0.5 * (raw_logvar_predicted + (target_raw_signal - raw_mu_predicted) ** 2 / var)
+        nll_loss = nll_loss.mean()
 
         return {
             'mse_loss': mse_loss,
@@ -1158,24 +1105,14 @@ class SeqVaeCore(nn.Module):
 
         linear_output, mu_pr, logvar_pr = self.decoder(z)
 
-        if self.sequence_length > 1:
-            next_idx = self._next_step_indices(mu_pr.device)
-            gather_idx = next_idx.unsqueeze(0).expand(mu_pr.size(0), -1)
-            mu_next = torch.gather(mu_pr, 1, gather_idx)
-            logvar_next = torch.gather(logvar_pr, 1, gather_idx)
-        else:
-            next_idx = torch.zeros(0, device=mu_pr.device, dtype=torch.long)
-            mu_next = mu_pr.new_zeros(mu_pr.size(0), 0)
-            logvar_next = logvar_pr.new_zeros(logvar_pr.size(0), 0)
-
         return {
             "z": z,
             "linear_output": linear_output,
             "mu_pr": mu_pr,
             "logvar_pr": logvar_pr,
-            "mu_next": mu_next,
-            "logvar_next": logvar_next,
-            "next_step_indices": next_idx,
+            "mu_next": None,
+            "logvar_next": None,
+            "next_step_indices": None,
             "mu_prior": mu_y,
             "logvar_prior": logvar_y_prior,
             "mu_post": mu_post,
@@ -1267,25 +1204,20 @@ class SeqVaeCore(nn.Module):
         linear_output = forward_outputs.get("linear_output")
         if (
             linear_output is not None
+            and linear_output.dim() == 3
+            and y_st.shape[:2] == linear_output.shape[:2]
+            and y_ph.shape[:2] == linear_output.shape[:2]
             and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
         ):
             stacked_target = torch.cat([y_st, y_ph], dim=-1)
             mse_loss = F.mse_loss(linear_output, stacked_target)
 
-        mu_next = forward_outputs.get("mu_next")
-        logvar_next = forward_outputs.get("logvar_next")
-        indices = forward_outputs.get("next_step_indices")
-
-        if indices is None:
-            indices = self._next_step_indices(device)
-        if indices.device != device:
-            indices = indices.to(device)
-        if mu_next is not None and mu_next.numel() > 0:
-            gather_idx = indices.unsqueeze(0).expand(y_raw.size(0), -1)
-            target_next = torch.gather(y_raw, 1, gather_idx)
-            var_next = logvar_next.exp()
-            next_step_nll = 0.5 * (logvar_next + (target_next - mu_next) ** 2 / var_next)
-            nll_loss = next_step_nll.mean()
+        mu_pr = forward_outputs.get("mu_pr")
+        logvar_pr = forward_outputs.get("logvar_pr")
+        if mu_pr is not None and logvar_pr is not None:
+            var = logvar_pr.exp()
+            nll_loss = 0.5 * (logvar_pr + (y_raw - mu_pr) ** 2 / var)
+            nll_loss = nll_loss.mean()
         else:
             nll_loss = torch.tensor(0.0, device=device)
 
@@ -2732,41 +2664,3 @@ if __name__ == "__main__":
     # prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
     # loss = model.compute_loss(forward_outputs, y_raw_input)
     # print('done')
-    #
-    # except Exception as e:
-    #     import traceback
-    #     traceback.print_exc()
-    #     exit(1)
-    #
-    # # --- Test Loss Computation ---
-    # try:
-    #     loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
-    #
-    # except Exception as e:
-    #     import traceback
-    #     traceback.print_exc()
-    #     exit(1)
-    #
-    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    # num_epochs = 3
-    #
-    # for epoch in range(num_epochs):
-    #     model.train()  # Set the model to training mode
-    #
-    #     # 1. Zero the gradients
-    #     optimizer.zero_grad()
-    #
-    #     # 2. Forward pass
-    #     forward_outputs = model(
-    #         y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input
-    #     )
-    #
-    #     # 3. Compute loss
-    #     loss_dict = model.compute_loss(forward_outputs, y_raw=y_raw_input)
-    #     total_loss = loss_dict["total_loss"]
-    #
-    #     # 4. Backward pass
-    #     total_loss.backward()
-    #
-    #     # 5. Update weights
-    #     optimizer.step()

@@ -4,8 +4,9 @@ from lightning.pytorch.callbacks import Callback
 import numpy as np
 import torch.nn as nn
 import torch
-import matplotlib.pyplot as plt
 import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import os
 import plotly.graph_objects as go
 from typing import Dict, Optional, Tuple
@@ -16,7 +17,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYDEVD_USE_CYTHON'] = "NO"
 
-matplotlib.use('Agg')
 torch.backends.cudnn.enabled = False
 
 from loguru import logger
@@ -52,7 +52,7 @@ class PlottingCallBack(Callback):
             logger.warning(f"Could not get a batch from validation dataloader for plotting: {e}")
             return
 
-        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, pl_module.local_rank)
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
 
         pl_module.eval()
         try:
@@ -877,7 +877,14 @@ class PlottingCallBack(Callback):
         ax[0, 1].set_axis_off()
         ax[0, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9)
         ax[0, 0].plot(t_in, pred_mean, linewidth=1.2, color='#BB3E00', label='Forecast (mean)', alpha=0.9)
-        ax[0, 0].fill_between(t_in, pred_mean - pred_std, pred_mean + pred_std, alpha=0.3, color=colors['uncertainty'], label='Ã‚Â±1ÃÆ’')
+        ax[0, 0].fill_between(
+            t_in,
+            pred_mean - pred_std,
+            pred_mean + pred_std,
+            alpha=0.3,
+            color=colors['uncertainty'],
+            label='Uncertainty band',
+        )
         ax[0, 0].set_ylabel('FHR (bpm)')
         ax[0, 0].set_title('Raw FHR vs Aggregated Forecast')
         ax[0, 0].legend(loc='upper right', framealpha=0.95)
@@ -909,7 +916,7 @@ class PlottingCallBack(Callback):
             cbar.outline.set_linewidth(0.7)
             ax[2, 0].set_ylabel('Latent Dimensions')
             ax[2, 0].set_xlabel('Decimated steps')
-            ax[2, 0].set_title('Latent ÃŽÂ¼_post (TÃƒâ€”D)')
+            ax[2, 0].set_title('Latent mu_post (T x D)')
         else:
             ax[2, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center')
         
@@ -919,7 +926,7 @@ class PlottingCallBack(Callback):
             f"MSE={sample_mse:.4f} | MAE={sample_mae:.4f} | Corr={sample_corr:.4f} | Cov={coverage_display}"
         )
         fig.suptitle(
-            f'Forecasting Results Ã¢â‚¬â€œ Epoch {epoch}\n{diag_str}',
+            f'Forecasting Results - Epoch {epoch}\n{diag_str}',
             fontsize=14,
             fontweight='normal',
             y=0.98,
@@ -979,7 +986,14 @@ class PlottingCallBack(Callback):
         fig, ax = plt.subplots(1, 1, figsize=(16, 4.5), constrained_layout=True)
         ax.plot(t, gm, color='#2E86AB', label='GT (batch mean)', linewidth=1.5)
         ax.plot(t, pm, color='#BB3E00', label='Forecast (batch mean)', linewidth=1.2)
-        ax.fill_between(t, pm - ps, pm + ps, color='#F5B7B1', alpha=0.4, label='Ã‚Â±1ÃÆ’ (total)')
+        ax.fill_between(
+            t,
+            pm - ps,
+            pm + ps,
+            color='#F5B7B1',
+            alpha=0.4,
+            label='Total uncertainty band',
+        )
         ax.set_title('Batch-Aggregated Forecast vs Ground Truth')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('FHR (bpm)')
@@ -1212,7 +1226,7 @@ class HyperparameterLoggingCallback(Callback):
             
             # LightningModule handles logging; callback only tracks history
             
-            logger.info(f"Epoch {epoch}: ÃŽÂ²={beta:.4f}, lr={lr:.6f}")
+            logger.info(f"Epoch {epoch}: beta={beta:.4f}, lr={lr:.6f}")
 
     def plot_hyperparameters(self, output_dir):
         """Create a plot of hyperparameter evolution"""
@@ -1294,7 +1308,7 @@ class LightSeqVaeTeb(L.LightningModule):
 
     This module handles the training, validation, and optimization loops,
     including learning rate scheduling and KLD beta annealing.
-    Supports both standard TEB and ÃŽÂ²-TCVAE training modes.
+    Supports both standard TEB and beta-TCVAE training modes.
     """
 
     def __init__(
@@ -1418,14 +1432,14 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def _validate_hyperparameters(self):
         """Validate that hyperparameters are correctly set from config."""
-        logger.info("Ã°Å¸â€Â Validating hyperparameters...")
+        logger.info(" Validating hyperparameters...")
         logger.info(f"  Current beta_schedule: {self.hparams.beta_schedule}")
         logger.info(f"  Current beta_const_val: {self.hparams.beta_const_val}")
         logger.info(f"  Current beta_start: {self.hparams.beta_start}")
         logger.info(f"  Current beta_end: {self.hparams.beta_end}")
         logger.info(f"  Current lr: {self.hparams.lr}")
         logger.info(f"  Current lr_milestones: {self.hparams.lr_milestones}")
-        logger.info("Ã¢Å“â€¦ Hyperparameter validation complete")
+        logger.info(" Hyperparameter validation complete")
 
     def _compute_forecast_metrics(
         self,
@@ -1597,7 +1611,7 @@ class LightSeqVaeTeb(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=1e-4,     # L2 regularization
             eps=1e-8,              # Numerical stability
-            betas=(0.9, 0.95),     # SOTA: Slightly higher ÃŽÂ²2 for better convergence
+            betas=(0.9, 0.95),     # SOTA: Slightly higher beta2 for better convergence
             amsgrad=False,         # Standard AdamW
             # foreach=True,          # SOTA: Vectorized optimizer updates (faster)
             maximize=False,
@@ -1697,3 +1711,5 @@ class MemoryMonitorCallback(Callback):
         # Only clear cache at epoch end, not during training for better multi-GPU performance
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
