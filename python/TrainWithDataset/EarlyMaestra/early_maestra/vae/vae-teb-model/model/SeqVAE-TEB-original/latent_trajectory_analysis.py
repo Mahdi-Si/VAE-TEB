@@ -17,6 +17,7 @@ import torch
 from loguru import logger
 from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from sklearn.cluster import KMeans
 from sklearn.decomposition import IncrementalPCA, PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -437,7 +438,8 @@ def plot_latent_changepoints_with_raw(
     cmap='viridis',
     figsize=(14, 4),
     max_samples=5,
-    random_state=None
+    random_state=None,
+    show_colorbar=True
 ):
     """
     Visualize latent trajectories alongside raw signals with shared changepoints.
@@ -457,6 +459,7 @@ def plot_latent_changepoints_with_raw(
         figsize: tuple, base figure size per sample pair (latent + raw axes).
         max_samples: int, maximum number of samples to visualize (randomly selected, default: 5).
         random_state: Optional int for reproducible sample selection.
+        show_colorbar: bool, whether to attach a colorbar next to each latent plot.
 
     Returns:
         List[Dict[str, Any]] containing per-sample changepoint metadata for plotted samples with keys:
@@ -587,8 +590,11 @@ def plot_latent_changepoints_with_raw(
         latent_ax.set_ylabel('Latent Dimension')
         latent_ax.set_xlabel('Latent Time Index')
         latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
-        cbar = plt.colorbar(im, ax=latent_ax, fraction=0.046, pad=0.04)
-        cbar.ax.set_ylabel('Activation', rotation=270, labelpad=15)
+        if show_colorbar:
+            divider = make_axes_locatable(latent_ax)
+            cax = divider.append_axes('right', size='3%', pad=0.05)
+            cbar = fig.colorbar(im, cax=cax)
+            cbar.ax.set_ylabel('Activation', rotation=270, labelpad=12)
 
         for cp_idx in latent_cps:
             latent_ax.axvline(
@@ -1615,16 +1621,16 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 epoch = epoch[sort_indices]
 
                 fhr_up_plot_path = os.path.join(save_dir, "fhr-up-signals")
-                plot_complete_fhr_up_timeline(
-                    fhr=fhr,
-                    up=up,
-                    epoch=epoch,
-                    save_path=fhr_up_plot_path,
-                    sample_id=f"{guid_in_batch}",
-                    title='Complete FHR and UP Timeline',
-                    sampling_rate_hz=4,
-                    detect_changepoints=True
-                )
+                # plot_complete_fhr_up_timeline(
+                #     fhr=fhr,
+                #     up=up,
+                #     epoch=epoch,
+                #     save_path=fhr_up_plot_path,
+                #     sample_id=f"{guid_in_batch}",
+                #     title='Complete FHR and UP Timeline',
+                #     sampling_rate_hz=4,
+                #     detect_changepoints=True
+                # )
                 self.pytorch_model.to(self.device)
                 model_output = self.pytorch_model(
                     y_st=fhr_st,
