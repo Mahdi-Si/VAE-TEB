@@ -426,6 +426,182 @@ def summarize_trajectory(
 # plotting methods
 # ------------------------------------------------------
 
+def plot_latent_changepoints_with_raw(
+    latent_mean,
+    fhr,
+    up,
+    save_path,
+    sample_ids=None,
+    n_changepoints=5,
+    decimation_factor=16,
+    cmap='viridis',
+    figsize=(14, 8)
+):
+    """
+    Visualize latent trajectories alongside raw signals with shared changepoints.
+
+    Args:
+        latent_mean: torch.Tensor or np.ndarray of shape (batch, time_steps, latent_dim)
+            Latent representation mean per batch.
+        fhr: torch.Tensor or np.ndarray of shape (batch, time_steps * decimation_factor)
+            Fetal heart rate signals corresponding to each latent trajectory.
+        up: torch.Tensor or np.ndarray of shape (batch, time_steps * decimation_factor)
+            Uterine pressure signals corresponding to each latent trajectory.
+        save_path: str, directory path where figures will be written.
+        sample_ids: Optional sequence of identifiers (len == batch). Defaults to sequential indices.
+        n_changepoints: int, number of changepoints to detect in the latent space (>=0).
+        decimation_factor: int, ratio between raw signal length and latent length (default: 16).
+        cmap: str, matplotlib colormap name for the latent heatmap.
+        figsize: tuple, figure size passed to matplotlib.
+
+    Returns:
+        List[Dict[str, Any]] containing per-sample changepoint metadata with keys:
+            - 'sample_id'
+            - 'latent_changepoints' (np.ndarray of latent indices)
+            - 'raw_changepoints' (np.ndarray of raw indices)
+
+    Notes:
+        - Changepoints are detected in latent space using ruptures Dynp segmentation.
+        - Raw changepoints are derived by multiplying latent indices by decimation_factor.
+    """
+    try:
+        import ruptures as rpt
+    except ImportError as exc:
+        raise ImportError(
+            "plot_latent_changepoints_with_raw requires the 'ruptures' package. "
+            "Install with: pip install ruptures"
+        ) from exc
+
+    def _to_numpy(data):
+        if torch.is_tensor(data):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
+
+    latent_np = _to_numpy(latent_mean)
+    fhr_np = _to_numpy(fhr)
+    up_np = _to_numpy(up)
+
+    if latent_np.ndim != 3:
+        raise ValueError(
+            f"latent_mean must have shape (batch, time_steps, latent_dim); got {latent_np.shape}"
+        )
+    if fhr_np.ndim != 2 or up_np.ndim != 2:
+        raise ValueError(
+            f"fhr and up must have shape (batch, raw_time_steps); got {fhr_np.shape}, {up_np.shape}"
+        )
+    if latent_np.shape[0] != fhr_np.shape[0] or latent_np.shape[0] != up_np.shape[0]:
+        raise ValueError(
+            "latent_mean, fhr, and up must share the same batch dimension."
+        )
+    if fhr_np.shape != up_np.shape:
+        raise ValueError("fhr and up must have identical shapes.")
+
+    batch_size, latent_time_steps, _ = latent_np.shape
+    if sample_ids is None:
+        sample_ids = [f"sample_{idx}" for idx in range(batch_size)]
+    if len(sample_ids) != batch_size:
+        raise ValueError("sample_ids length must match batch size.")
+
+    os.makedirs(save_path, exist_ok=True)
+
+    results: List[Dict[str, Any]] = []
+
+    max_bkps = max(0, int(n_changepoints))
+    for batch_idx in range(batch_size):
+        sample_id = str(sample_ids[batch_idx])
+        latent_sample = latent_np[batch_idx]
+        fhr_sample = fhr_np[batch_idx]
+        up_sample = up_np[batch_idx]
+
+        per_sample_max_bkps = min(max_bkps, max(0, latent_time_steps - 1))
+        if per_sample_max_bkps > 0:
+            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(latent_sample)
+            bkps = algo.predict(n_bkps=per_sample_max_bkps)
+            latent_cps = [int(idx) for idx in bkps if idx < latent_time_steps]
+        else:
+            latent_cps = []
+
+        latent_cps = np.asarray(sorted({cp for cp in latent_cps if cp > 0}), dtype=int)
+        raw_expected_len = latent_time_steps * decimation_factor
+        raw_len = fhr_sample.shape[0]
+        if raw_len != raw_expected_len:
+            logger.warning(
+                f"[{sample_id}] Raw signal length ({raw_len}) does not match "
+                f"latent_time_steps * decimation_factor ({raw_expected_len})."
+            )
+
+        raw_cps = np.asarray(
+            [
+                min(raw_len - 1, cp_idx * decimation_factor)
+                for cp_idx in latent_cps
+                if raw_len > 0
+            ],
+            dtype=int
+        )
+
+        fig, axes = plt.subplots(
+            2, 1, figsize=figsize, sharex=False, gridspec_kw={'height_ratios': [2, 1]}
+        )
+
+        im = axes[0].imshow(
+            latent_sample,
+            aspect='auto',
+            origin='lower',
+            cmap=cmap,
+            interpolation='nearest'
+        )
+        axes[0].set_ylabel('Latent Time Index')
+        axes[0].set_title('Latent Representation (mean)')
+        cbar = plt.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+        cbar.ax.set_ylabel('Activation', rotation=270, labelpad=15)
+
+        for cp_idx in latent_cps:
+            axes[0].axhline(
+                cp_idx - 0.5,
+                color='white',
+                linestyle='--',
+                linewidth=1.5,
+                alpha=0.8
+            )
+
+        time_axis = np.arange(raw_len)
+        axes[1].plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
+        axes[1].plot(time_axis, up_sample, label='UP', color='#2E86C1', linewidth=1.0)
+        axes[1].set_xlabel('Raw Time Index')
+        axes[1].set_ylabel('Normalized Amplitude')
+        axes[1].set_title('Raw Signals (FHR & UP)')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend(loc='upper right')
+
+        for raw_cp in raw_cps:
+            axes[1].axvline(
+                raw_cp,
+                color='black',
+                linestyle='--',
+                linewidth=1.0,
+                alpha=0.6
+            )
+
+        fig.suptitle(f'Latent Trajectory Changepoints - {sample_id}', fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        figure_path = os.path.join(
+            save_path,
+            f'latent_raw_changepoints_{sample_id}.png'
+        )
+        fig.savefig(figure_path, dpi=150)
+        plt.close(fig)
+
+        results.append(
+            {
+                'sample_id': sample_id,
+                'latent_changepoints': latent_cps,
+                'raw_changepoints': raw_cps
+            }
+        )
+
+    return results
+
 def plot_complete_fhr_up_timeline(
     fhr,
     up,
@@ -1394,8 +1570,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 fhr_st = fhr_st[sort_indices]
                 fhr_ph = fhr_ph[sort_indices]
                 fhr_up_ph = fhr_up_ph[sort_indices]
-                fhr = fhr[sort_indices]  # shape: (Batch, time_step)
-                up = up[sort_indices]  # shape: (Batch, time_step)
+                fhr = fhr[sort_indices]  # shape: (Batch, time_step*16)
+                up = up[sort_indices]  # shape: (Batch, time_step*16)
                 epoch = epoch[sort_indices]
 
                 fhr_up_plot_path = os.path.join(save_dir, "fhr-up-signals")
@@ -1406,7 +1582,8 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                     save_path=fhr_up_plot_path,
                     sample_id=f"{guid_in_batch}",
                     title='Complete FHR and UP Timeline',
-                    sampling_rate_hz=4  # Adjust based on your actual sampling rate
+                    sampling_rate_hz=4,
+                    detect_changepoints=True
                 )
                 self.pytorch_model.to(self.device)
                 model_output = self.pytorch_model(
@@ -1420,104 +1597,117 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 # proccessed_latent_mean = preprocess_latent(latent=latent_mean, denoise=False)  # Shape (Batch_size, time_steps, latent_dim)
                 # proccessed_latent_var = preprocess_latent(latent=latent_var, denoise=False)  # (Batch_size, time_steps, latent_dim)
                 
-                reduced_latent_mean = reduce_latent_dimensionality(
-                    proccessed_latent_mean,
-                    method=laten_dim_reduction_type,
-                    n_components=3,
-                    n_neighbors=15,
-                    min_dist=0.1,
-                    return_reducer=False
-                )
-
-                epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory")
-                plot_latent_trajectory(
-                    reduced_latent_mean[0],
-                    epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3
+                
+                plot_latent_changepoints_with_raw(
+                    fhr=fhr,
+                    up=up,
+                    epoch=epoch,
+                    latent_trajectory=latent_mean,
+                    save_path=fhr_up_plot_path,
+                    sample_id=f"{guid_in_batch}",
+                    title='FHR, UP and Latent Changepoints',
+                    sampling_rate_hz=4,
+                    point_size=50
                 )
                 
-                plot_latent_trajectory(
-                    reduced_latent_mean[-1],
-                    epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[1]}-end",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3
-                )
+                # reduced_latent_mean = reduce_latent_dimensionality(
+                #     proccessed_latent_mean,
+                #     method=laten_dim_reduction_type,
+                #     n_components=3,
+                #     n_neighbors=15,
+                #     min_dist=0.1,
+                #     return_reducer=False
+                # )
+
+                # epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory")
+                # plot_latent_trajectory(
+                #     reduced_latent_mean[0],
+                #     epoch_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3
+                # )
+                
+                # plot_latent_trajectory(
+                #     reduced_latent_mean[-1],
+                #     epoch_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}-{epoch[1]}-end",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3
+                # )
 
                 
                 
-                batch_size, reduced_time_steps, reduced_latent_dim = reduced_latent_mean.shape
-                all_reduced_latent_mean = reduced_latent_mean.reshape(
-                    batch_size * reduced_time_steps, reduced_latent_dim
-                )
-                all_laten_trajectory_path = os.path.join(save_dir, "all_epochs_trajectory_complete")
-                plot_latent_trajectory(
-                    all_reduced_latent_mean,
-                    all_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3,
-                    plot_animation=False,
-                    save_data=True
-                )                
+                # batch_size, reduced_time_steps, reduced_latent_dim = reduced_latent_mean.shape
+                # all_reduced_latent_mean = reduced_latent_mean.reshape(
+                #     batch_size * reduced_time_steps, reduced_latent_dim
+                # )
+                # all_laten_trajectory_path = os.path.join(save_dir, "all_epochs_trajectory_complete")
+                # plot_latent_trajectory(
+                #     all_reduced_latent_mean,
+                #     all_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3,
+                #     plot_animation=False,
+                #     save_data=True
+                # )                
                 
-                reduced_latent_mean_summary = summarize_trajectory(
-                    reduced_latent_mean,
-                    k=10,
-                    method=time_dim_reduction_type,
-                    epsilon=None,
-                    return_indices=False
-                )   # shape (Bathc_size, reduces_time_steps, reduced_latent_dim)
+                # reduced_latent_mean_summary = summarize_trajectory(
+                #     reduced_latent_mean,
+                #     k=10,
+                #     method=time_dim_reduction_type,
+                #     epsilon=None,
+                #     return_indices=False
+                # )   # shape (Bathc_size, reduces_time_steps, reduced_latent_dim)
 
 
-                epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory_summary")
-                plot_latent_trajectory(
-                    reduced_latent_mean_summary[0],
-                    epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3
-                )
+                # epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory_summary")
+                # plot_latent_trajectory(
+                #     reduced_latent_mean_summary[0],
+                #     epoch_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}-{epoch[0]}-start",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3
+                # )
                 
-                plot_latent_trajectory(
-                    reduced_latent_mean_summary[-1],
-                    epoch_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}-{epoch[-1]}-end",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3
-                )
+                # plot_latent_trajectory(
+                #     reduced_latent_mean_summary[-1],
+                #     epoch_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}-{epoch[-1]}-end",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3
+                # )
 
-                # Reshape to (Batch_size * reduced_time_steps, reduced_latent_dim)
-                # keep epoch-sorted order from the earlier sorting
-                batch_size, reduced_time_steps, reduced_latent_dim = reduced_latent_mean_summary.shape
-                all_reduced_latent_mean_summary = reduced_latent_mean_summary.reshape(
-                    batch_size * reduced_time_steps, reduced_latent_dim
-                )
-                all_laten_trajectory_path = os.path.join(save_dir, "all_epochs_trajectory_summary")
-                plot_latent_trajectory(
-                    all_reduced_latent_mean_summary,
-                    all_laten_trajectory_path,
-                    sample_id=f"_{guid_in_batch}",
-                    title='Latent Trajectory',
-                    color_by_time=True,
-                    point_size=100,
-                    arrow_scale=0.3,
-                    save_data=True
-                )
+                # # Reshape to (Batch_size * reduced_time_steps, reduced_latent_dim)
+                # # keep epoch-sorted order from the earlier sorting
+                # batch_size, reduced_time_steps, reduced_latent_dim = reduced_latent_mean_summary.shape
+                # all_reduced_latent_mean_summary = reduced_latent_mean_summary.reshape(
+                #     batch_size * reduced_time_steps, reduced_latent_dim
+                # )
+                # all_laten_trajectory_path = os.path.join(save_dir, "all_epochs_trajectory_summary")
+                # plot_latent_trajectory(
+                #     all_reduced_latent_mean_summary,
+                #     all_laten_trajectory_path,
+                #     sample_id=f"_{guid_in_batch}",
+                #     title='Latent Trajectory',
+                #     color_by_time=True,
+                #     point_size=100,
+                #     arrow_scale=0.3,
+                #     save_data=True
+                # )
+                
 
-                print('done')
 
 
 def main():
