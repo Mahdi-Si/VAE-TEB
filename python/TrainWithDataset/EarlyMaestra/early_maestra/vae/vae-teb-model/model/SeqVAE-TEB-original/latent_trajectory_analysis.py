@@ -536,14 +536,14 @@ def plot_latent_changepoints_with_raw(
 
     total_rows = selected_indices.size * 2
     fig_height = figsize[1] * selected_indices.size
-    fig, axes = plt.subplots(
+    fig, raw_axes = plt.subplots(
         total_rows,
         1,
         figsize=(figsize[0], fig_height),
         sharex=False,
         squeeze=False
     )
-    axes = axes.reshape(-1)
+    axes = raw_axes.reshape(-1)
 
     for idx_counter, batch_idx in enumerate(selected_indices):
         sample_id = str(sample_ids[batch_idx])
@@ -580,25 +580,30 @@ def plot_latent_changepoints_with_raw(
         latent_ax = axes[2 * idx_counter]
         raw_ax = axes[2 * idx_counter + 1]
 
+        latent_dims = latent_sample.shape[1]
+        extent = (0, max(raw_len - 1, 0), 0, latent_dims)
         im = latent_ax.imshow(
             latent_sample.T,
             aspect='auto',
             origin='lower',
             cmap=cmap,
-            interpolation='nearest'
+            interpolation='nearest',
+            extent=extent
         )
+        latent_ax.set_xlim(extent[0], extent[1])
         latent_ax.set_ylabel('Latent Dimension')
-        latent_ax.set_xlabel('Latent Time Index')
+        latent_ax.set_xlabel('Raw Time Index')
         latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
+
         if show_colorbar:
             divider = make_axes_locatable(latent_ax)
             cax = divider.append_axes('right', size='3%', pad=0.05)
             cbar = fig.colorbar(im, cax=cax)
             cbar.ax.set_ylabel('Activation', rotation=270, labelpad=12)
 
-        for cp_idx in latent_cps:
+        for raw_cp in raw_cps:
             latent_ax.axvline(
-                cp_idx - 0.5,
+                raw_cp,
                 color='white',
                 linestyle='--',
                 linewidth=1.5,
@@ -613,6 +618,7 @@ def plot_latent_changepoints_with_raw(
         raw_ax.set_title(f'Raw Signals (FHR & UP) - {sample_id}')
         raw_ax.grid(True, alpha=0.3)
         raw_ax.legend(loc='upper right')
+        raw_ax.set_xlim(extent[0], extent[1])
 
         for raw_cp in raw_cps:
             raw_ax.axvline(
