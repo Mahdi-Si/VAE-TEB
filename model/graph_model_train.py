@@ -89,86 +89,6 @@ def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, norm
     return denormalized_data
 
 
-def log_gpu_memory_usage(prefix=""):
-    """Log current GPU memory usage for debugging memory issues."""
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved(device) / 1024**3   # GB
-        max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3  # GB
-        logger.info(f"{prefix} GPU {device}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB")
-    else:
-        logger.info(f"{prefix} CUDA not available")
-
-def clear_gpu_memory():
-    """Clear GPU memory cache and run garbage collection."""
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-
-def find_optimal_batch_size(model, sample_batch, device, max_batch_size=64, min_batch_size=1):
-    """
-    Find the optimal batch size that fits in GPU memory.
-    
-    Args:
-        model: The model to test
-        sample_batch: A sample batch to use for testing
-        device: The device to test on
-        max_batch_size: Maximum batch size to try
-        min_batch_size: Minimum batch size to try
-    
-    Returns:
-        int: Optimal batch size
-    """
-    model.eval()
-    optimal_batch_size = min_batch_size
-    
-    for batch_size in range(min_batch_size, max_batch_size + 1, 2):
-        try:
-            clear_gpu_memory()
-            
-            test_y_st = sample_batch.fhr_st[:batch_size].to(device)
-            test_y_ph = sample_batch.fhr_ph[:batch_size].to(device)
-            test_x_ph = sample_batch.fhr_up_ph[:batch_size].to(device)
-            test_y_raw = sample_batch.fhr[:batch_size].to(device)
-            
-            with torch.no_grad():
-                forward_outputs = model(test_y_st, test_y_ph, test_x_ph)
-                loss_dict = model.compute_loss(forward_outputs, test_y_st, test_y_ph, test_y_raw, compute_kld_loss=True, beta=1.0)
-                loss = loss_dict['total_loss']
-                
-            loss.backward()
-            
-            optimal_batch_size = batch_size
-            logger.info(f"Batch size {batch_size} successful")
-            
-            del test_y_st, test_y_ph, test_x_ph, test_y_raw
-            del forward_outputs, loss_dict, loss
-            clear_gpu_memory()
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                logger.warning(f"Batch size {batch_size} failed: OOM")
-                break
-            else:
-                logger.error(f"Batch size {batch_size} failed with error: {e}")
-                break
-        except Exception as e:
-            logger.error(f"Batch size {batch_size} failed with unexpected error: {e}")
-            break
-    
-    # Use 80% of the maximum working batch size for safety margin
-    safe_batch_size = max(1, int(optimal_batch_size * 0.8))
-    logger.info(f"Optimal batch size found: {safe_batch_size} (80% of max working size {optimal_batch_size})")
-    
-    model.train()
-    clear_gpu_memory()
-    
-    return safe_batch_size
-
 class SeqVAEGraphModel:
     def __init__(self, config_file_path=None):
         super(SeqVAEGraphModel, self).__init__()
@@ -317,8 +237,8 @@ class SeqVAEGraphModel:
             retention="14 days",
             compression="zip",
             enqueue=True,
-            backtrace=True,
-            diagnose=True,
+            backtrace=False,
+            diagnose=False,
             serialize=False,
         )
         logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
@@ -789,8 +709,6 @@ class SeqVAEGraphModel:
             barebones=False,            # Use full trainer features
         )
 
-        log_gpu_memory_usage("After trainer setup")
-
         logger.info("Finding optimal batch size using PyTorch Lightning's tuner...")
         tuner = Tuner(trainer)
         
@@ -845,9 +763,7 @@ class SeqVAEGraphModel:
         #     del lr_finder, fig
         # else:
         #     logger.warning("Could not find a new learning rate. Using the one from config.")
-        #
-        # # Log memory before training starts - COMMENTED OUT FOR MULTI-GPU PERFORMANCE
-        # log_gpu_memory_usage("Before training starts")
+
 
         logger.info(f"Starting training of the base model for {self.epochs_num} epochs.")
         trainer.fit(
