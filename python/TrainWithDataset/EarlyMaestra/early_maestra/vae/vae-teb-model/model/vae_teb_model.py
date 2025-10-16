@@ -1069,13 +1069,11 @@ class SeqVaeCore(nn.Module):
         self.warmup_period = warmup_period
 
         self.source_encoder = SourceEncoder(
-            sequence_length=sequence_length,
             latent_dim=latent_dim_source,
             lstm_hidden_dim=lstm_hidden_dim,
             lstm_num_layers=lstm_num_layers,
         )
         self.target_encoder = TargetEncoder(
-            sequence_length=sequence_length,
             latent_dim=latent_dim_target,
             lstm_hidden_dim=lstm_hidden_dim,
             lstm_num_layers=lstm_num_layers,

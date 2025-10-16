@@ -17,7 +17,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYDEVD_USE_CYTHON'] = "NO"
 
-torch.backends.cudnn.enabled = False
+torch.backends.cudnn.enabled = True
 
 from loguru import logger
 
