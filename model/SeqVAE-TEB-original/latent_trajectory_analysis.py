@@ -578,19 +578,20 @@ def plot_latent_changepoints_with_raw(
         raw_ax = axes[2 * idx_counter + 1]
 
         im = latent_ax.imshow(
-            latent_sample,
+            latent_sample.T,
             aspect='auto',
             origin='lower',
             cmap=cmap,
             interpolation='nearest'
         )
-        latent_ax.set_ylabel('Latent Time Index')
+        latent_ax.set_ylabel('Latent Dimension')
+        latent_ax.set_xlabel('Latent Time Index')
         latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
         cbar = plt.colorbar(im, ax=latent_ax, fraction=0.046, pad=0.04)
         cbar.ax.set_ylabel('Activation', rotation=270, labelpad=15)
 
         for cp_idx in latent_cps:
-            latent_ax.axhline(
+            latent_ax.axvline(
                 cp_idx - 0.5,
                 color='white',
                 linestyle='--',
@@ -1636,23 +1637,22 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 # proccessed_latent_mean = preprocess_latent(latent=latent_mean, denoise=False)  # Shape (Batch_size, time_steps, latent_dim)
                 # proccessed_latent_var = preprocess_latent(latent=latent_var, denoise=False)  # (Batch_size, time_steps, latent_dim)
                 
-                
+                reduced_latent_mean = reduce_latent_dimensionality(
+                    proccessed_latent_mean,
+                    method=laten_dim_reduction_type,
+                    n_components=3,
+                    n_neighbors=15,
+                    min_dist=0.1,
+                    return_reducer=False
+                )
+
                 plot_latent_changepoints_with_raw(
                     fhr=fhr,
                     up=up,
-                    latent_mean=latent_mean,
+                    latent_mean=reduced_latent_mean,
                     save_path=fhr_up_plot_path,
                 )
                 
-                # reduced_latent_mean = reduce_latent_dimensionality(
-                #     proccessed_latent_mean,
-                #     method=laten_dim_reduction_type,
-                #     n_components=3,
-                #     n_neighbors=15,
-                #     min_dist=0.1,
-                #     return_reducer=False
-                # )
-
                 # epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory")
                 # plot_latent_trajectory(
                 #     reduced_latent_mean[0],
