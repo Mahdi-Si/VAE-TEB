@@ -72,6 +72,20 @@ def ensure_compiled_module(
         try:
             compiled = torch.compile(module, **opts)
             setattr(compiled, "_compile_options", opts)
+            # Expose non-forward helpers (torch.compile only guarantees forward).
+            passthrough_attrs = (
+                "compute_loss",
+                "encode_only",
+                "forecast",
+                "forecast_full",
+                "aggregate_forecasts_to_canvas",
+                "compute_forecast_loss",
+                "evaluate_forecast_batch",
+                "measure_transfer_entropy",
+            )
+            for attr in passthrough_attrs:
+                if hasattr(module, attr):
+                    setattr(compiled, attr, getattr(module, attr))
             log.info(f"[{module_name}] Compiled with torch.compile options={opts}")
             return compiled, True
         except Exception as exc:  # noqa: BLE001
