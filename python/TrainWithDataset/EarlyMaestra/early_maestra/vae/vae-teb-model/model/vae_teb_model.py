@@ -1457,6 +1457,105 @@ class SeqVaeTeb(nn.Module):
         """Full VAE forward pass via the core module."""
         return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
 
+    @classmethod
+    def from_legacy_checkpoint(
+        cls,
+        ckpt_path: str,
+        *,
+        map_location: Union[str, torch.device] = "cpu",
+        strict: bool = False,
+        compile_model: bool = False,
+        compile_mode: str = "max-autotune-no-cudagraphs",
+        init_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "SeqVaeTeb":
+        """Instantiate SeqVaeTeb and load weights from a pre-forecaster checkpoint.
+
+        Legacy checkpoints only contain the VAE components. This helper loads those weights
+        while leaving the latent forecaster randomly initialised so it can be trained afresh.
+        """
+        init_kwargs = init_kwargs or {}
+        model = cls(**init_kwargs)
+
+        ckpt = torch.load(ckpt_path, map_location=map_location)
+        sd = ckpt.get("state_dict", ckpt)
+        sd = cls._normalize_state_dict_keys(sd)
+
+        legacy_prefixes = (
+            "core.source_encoder.",
+            "core.target_encoder.",
+            "core.conditional_encoder.",
+            "core.decoder.",
+        )
+
+        current_sd = model.state_dict()
+        filtered_sd: Dict[str, torch.Tensor] = {}
+        for key, value in sd.items():
+            if key in current_sd and key.startswith(legacy_prefixes):
+                filtered_sd[key] = value
+
+        if not filtered_sd:
+            raise ValueError(
+                f"No legacy SeqVaeTeb parameters found in checkpoint {ckpt_path}"
+            )
+
+        shape_mismatches = []
+        for key, value in filtered_sd.items():
+            current_shape = current_sd[key].shape
+            if current_shape != value.shape:
+                shape_mismatches.append(
+                    f"{key}: current {tuple(current_shape)} vs checkpoint {tuple(value.shape)}"
+                )
+        if shape_mismatches:
+            raise ValueError(
+                "SeqVaeTeb architecture mismatch when loading legacy checkpoint:\n"
+                + "\n".join(shape_mismatches)
+            )
+
+        incompatible = model.load_state_dict(filtered_sd, strict=False)
+        try:
+            missing_keys = getattr(incompatible, "missing_keys", [])
+            unexpected_keys = getattr(incompatible, "unexpected_keys", [])
+        except Exception:
+            try:
+                missing_keys, unexpected_keys = incompatible
+            except Exception:
+                missing_keys, unexpected_keys = [], []
+
+        legacy_missing = [k for k in missing_keys if k.startswith(legacy_prefixes)]
+        new_module_missing = [k for k in missing_keys if not k.startswith(legacy_prefixes)]
+
+        if legacy_missing:
+            log.warning(
+                f"[SeqVaeTeb] Missing legacy keys when loading checkpoint: {legacy_missing}"
+            )
+        if unexpected_keys:
+            log.warning(
+                f"[SeqVaeTeb] Unexpected keys ignored from checkpoint: {unexpected_keys}"
+            )
+        if new_module_missing:
+            preview = new_module_missing[:5]
+            suffix = " ..." if len(new_module_missing) > 5 else ""
+            log.info(
+                f"[SeqVaeTeb] Leaving newly introduced parameters uninitialised: {preview}{suffix}"
+            )
+
+        if strict and (legacy_missing or unexpected_keys):
+            raise RuntimeError(
+                "Strict legacy load failed due to missing or unexpected parameters"
+            )
+
+        if compile_model:
+            model, _ = ensure_compiled_module(
+                model,
+                module_name="SeqVaeTeb legacy load",
+                attempts=[{"mode": compile_mode, "fullgraph": False, "dynamic": True}],
+            )
+
+        log.info(
+            f"Loaded {len(filtered_sd)}/{len(current_sd)} legacy parameters into {cls.__name__} from {ckpt_path}"
+        )
+        return model
+
     def state_dict(
         self,
         destination: Optional[Dict[str, torch.Tensor]] = None,
