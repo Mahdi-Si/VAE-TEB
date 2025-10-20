@@ -1035,11 +1035,25 @@ class LGSSMLatentForecaster(nn.Module):
         Construct a stable transition matrix A from raw parameters.
         Returns (A, |eig(A)|).
         """
+        # Store original dtype for mixed precision compatibility
+        original_dtype = M.dtype
+
+        # Cast to FP32 if needed - QR decomposition not supported in FP16 on CUDA
+        if M.dtype == torch.float16:
+            M = M.float()
+            rho = rho.float()
+
         # QR decomposition provides an orthogonal basis
         Q_orth, _ = torch.linalg.qr(M)
         eigenvalues = self.alpha * torch.tanh(rho)  # clamp spectral radius
         A = Q_orth @ torch.diag_embed(eigenvalues) @ Q_orth.transpose(1, 2)
         eig_abs = eigenvalues.abs()
+
+        # Cast back to original dtype
+        if original_dtype == torch.float16:
+            A = A.half()
+            eig_abs = eig_abs.half()
+
         return A, eig_abs
 
     def _build_noise(self, diag_params: torch.Tensor, U: Optional[torch.Tensor]) -> torch.Tensor:
