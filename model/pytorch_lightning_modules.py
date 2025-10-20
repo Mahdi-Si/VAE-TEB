@@ -88,12 +88,23 @@ class PlottingCallBack(Callback):
                 )
 
                 if pl_module.model.has_forecaster():
-                    forecast_out = pl_module.model.forecast(y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True)
+                    forecast_out = pl_module.model.forecast(
+                        y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True
+                    )
                     anchors = forecast_out["anchors"]
                     mu_future = forecast_out["mu_future"]          # (B,N,480)
                     logvar_future = forecast_out["logvar_future"]  # (B,N,480)
                     z_future = forecast_out.get("z_future")
+                    latent_logvar_future = forecast_out.get("latent_logvar_future")
                     enc = forecast_out["enc"]
+
+                    stability_penalty = forecast_out.get("stability_penalty")
+                    if stability_penalty is not None:
+                        logger.info(
+                            "LGSSM stability penalty at epoch %s: %.4e",
+                            pl_trainer.current_epoch,
+                            float(stability_penalty),
+                        )
 
                     canvas_mu, mean_mu = pl_module.model.aggregate_forecasts_to_canvas(
                         mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
@@ -106,12 +117,14 @@ class PlottingCallBack(Callback):
                     self._plot_latent_forecast_samples(
                         mu_post_sequence=enc.get("mu_post"),
                         z_future=z_future,
+                        latent_logvar_future=latent_logvar_future,
                         anchors=anchors,
                         epoch=pl_trainer.current_epoch,
                     )
                     self._plot_channel_forecasts(
                         mu_post_sequence=enc.get("mu_post"),
                         z_future=z_future,
+                        latent_logvar_future=latent_logvar_future,
                         anchors=anchors,
                         epoch=pl_trainer.current_epoch,
                     )
@@ -349,6 +362,7 @@ class PlottingCallBack(Callback):
         self,
         mu_post_sequence: Optional[torch.Tensor],
         z_future: Optional[torch.Tensor],
+        latent_logvar_future: Optional[torch.Tensor],
         anchors: Optional[torch.Tensor],
         epoch: int,
     ):
@@ -366,6 +380,11 @@ class PlottingCallBack(Callback):
             mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
             z_future_np = z_future[batch_idx].detach().cpu().numpy()
             anchors_np = anchors.detach().cpu().numpy().astype(int)
+            latent_std_np = None
+            if latent_logvar_future is not None:
+                latent_std_np = np.sqrt(
+                    np.exp(latent_logvar_future[batch_idx].detach().cpu().numpy())
+                )
         except Exception:
             return
 
@@ -401,7 +420,8 @@ class PlottingCallBack(Callback):
                 continue
             pred = z_future_np[idx]
             global_max = max(global_max, np.abs(gt).max(), np.abs(pred).max())
-            valid_segments.append((idx, anchor, gt, pred))
+            std_seg = latent_std_np[idx] if latent_std_np is not None else None
+            valid_segments.append((idx, anchor, gt, pred, std_seg))
 
         if not valid_segments:
             return
@@ -415,7 +435,7 @@ class PlottingCallBack(Callback):
         if n_rows == 1:
             axes = np.expand_dims(axes, axis=0)
 
-        for row, (idx, anchor, gt, pred) in enumerate(valid_segments):
+        for row, (idx, anchor, gt, pred, std_segment) in enumerate(valid_segments):
             err = pred - gt
 
             im0 = axes[row, 0].imshow(gt.T, aspect='auto', origin='lower', cmap='RdBu_r', vmin=-global_max, vmax=global_max)
@@ -443,6 +463,18 @@ class PlottingCallBack(Callback):
             time_axis = np.arange(horizon)
             axes[row, 3].plot(time_axis, gt[:, best_channel], color='#2E86AB', linewidth=1.4, label='GT')
             axes[row, 3].plot(time_axis, pred[:, best_channel], color='#BB3E00', linewidth=1.2, linestyle='--', label='Forecast')
+            if std_segment is not None and best_channel < std_segment.shape[1]:
+                std_vec = std_segment[:, best_channel]
+                upper = pred[:, best_channel] + 1.96 * std_vec
+                lower = pred[:, best_channel] - 1.96 * std_vec
+                axes[row, 3].fill_between(
+                    time_axis,
+                    lower,
+                    upper,
+                    color='#BB3E00',
+                    alpha=0.18,
+                    label='Forecast +/- 1.96 std' if row == 0 else None,
+                )
             axes[row, 3].fill_between(
                 time_axis,
                 gt[:, best_channel],
@@ -471,6 +503,7 @@ class PlottingCallBack(Callback):
         self,
         mu_post_sequence: Optional[torch.Tensor],
         z_future: Optional[torch.Tensor],
+        latent_logvar_future: Optional[torch.Tensor],
         anchors: Optional[torch.Tensor],
         epoch: int,
     ) -> None:
@@ -488,6 +521,11 @@ class PlottingCallBack(Callback):
             mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
             z_future_np = z_future[batch_idx].detach().cpu().numpy()
             anchors_np = anchors.detach().cpu().numpy().astype(int)
+            std_future_np = None
+            if latent_logvar_future is not None:
+                std_future_np = np.sqrt(
+                    np.exp(latent_logvar_future[batch_idx].detach().cpu().numpy())
+                )
         except Exception:
             return
 
@@ -504,7 +542,8 @@ class PlottingCallBack(Callback):
                 start = anchor_val + 1
                 end = start + horizon
                 if end <= mu_post_np.shape[0]:
-                    anchor_pairs.append((anchor_val, mu_post_np[start:end], z_future_np[idx_anchor]))
+                    std_slice = std_future_np[idx_anchor] if std_future_np is not None else None
+                    anchor_pairs.append((anchor_val, mu_post_np[start:end], z_future_np[idx_anchor], std_slice))
 
         if len(anchor_pairs) != len(desired_anchors):
             return
@@ -525,11 +564,23 @@ class PlottingCallBack(Callback):
             'pred': '#BB3E00',
         }
 
-        for col, (anchor_val, gt, pred) in enumerate(anchor_pairs):
+        for col, (anchor_val, gt, pred, std_block) in enumerate(anchor_pairs):
             for row in range(latent_dim):
                 ax = axes[row, col]
                 ax.plot(time_axis, gt[:, row], color=colors['gt'], linewidth=1.2, label='GT')
                 ax.plot(time_axis, pred[:, row], color=colors['pred'], linewidth=1.0, linestyle='--', label='Forecast')
+                if std_block is not None:
+                    std_vec = std_block[:, row]
+                    upper = pred[:, row] + 1.96 * std_vec
+                    lower = pred[:, row] - 1.96 * std_vec
+                    ax.fill_between(
+                        time_axis,
+                        lower,
+                        upper,
+                        color=colors['pred'],
+                    alpha=0.18,
+                    label='Forecast +/- 1.96 std' if (row == 0 and col == 0) else None,
+                    )
                 ax.grid(True, alpha=0.3)
                 if row == 0:
                     ax.set_title(f'Anchor {anchor_val}')
@@ -1025,8 +1076,11 @@ class LossPlotCallback(Callback):
             "train/mse_loss": [],
             "train/nll_loss": [],
             "train/predictive_loss": [],
+            "train/latent_nll_loss": [],
             "train/latent_consistency_loss": [],
             "train/forecast_nll": [],
+            "train/predictive_kl_loss": [],
+            "train/stability_penalty": [],
             "train/kld_loss": [],
             "train/agg_mse": [],
             "val/total_loss": [],
@@ -1034,8 +1088,11 @@ class LossPlotCallback(Callback):
             "val/mse_loss": [],
             "val/nll_loss": [],
             "val/predictive_loss": [],
+            "val/latent_nll_loss": [],
             "val/latent_consistency_loss": [],
             "val/forecast_nll": [],
+            "val/predictive_kl_loss": [],
+            "val/stability_penalty": [],
             "val/kld_loss": [],
             "val/agg_mse": [],
             "val/agg_mae": [],
@@ -1293,12 +1350,12 @@ class MetricsLoggingCallback(Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         logs = trainer.callback_metrics
-        train_loss = logs.get("train_loss")
+        train_loss = logs.get("train/total_loss")
         self.train_loss_history.append(train_loss)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         logs = trainer.callback_metrics
-        val_loss = logs.get("validation_loss")
+        val_loss = logs.get("val/total_loss")
         self.val_loss_history.append(val_loss)
 
 
@@ -1328,6 +1385,11 @@ class LightSeqVaeTeb(L.LightningModule):
         predictive_context_len: Optional[int] = None,
         log_forecast_metrics: bool = True,
         predictive_max_anchors: Optional[int] = None,
+        *,
+        forecast_weight: Optional[float] = None,
+        latent_nll_weight: Optional[float] = None,
+        predictive_kl_weight: float = 0.0,
+        stability_weight: float = 0.0,
         ):
         """
         Args:
@@ -1340,12 +1402,16 @@ class LightSeqVaeTeb(L.LightningModule):
             beta_anneal_epochs: Number of epochs for linear annealing.
             beta_cycle_len: Length of a cycle for cyclic annealing.
             beta_const_val: Constant value for beta if schedule is 'constant'.
-            predictive_weight: Weight for auxiliary raw forecasting NLL during training.
-            latent_consistency_weight: Weight for latent forecast consistency (MSE) term.
+            predictive_weight: (legacy) raw forecasting loss weight.
+            latent_consistency_weight: (legacy) latent consistency weight.
             predictive_horizon: Forecast horizon (decimated steps) used for auxiliary objectives.
             predictive_context_len: Context length supplied to the latent forecaster (decimated steps).
             log_forecast_metrics: Whether to compute/log aggregated forecast metrics during validation.
             predictive_max_anchors: Optional cap on anchors sampled for auxiliary loss to control memory.
+            forecast_weight: Weight for raw forecast NLL (defaults to predictive_weight).
+            latent_nll_weight: Weight for latent Gaussian NLL (defaults to latent_consistency_weight).
+            predictive_kl_weight: Weight for KL between LGSSM predictions and posterior latents.
+            stability_weight: Weight for the LGSSM stability regulariser.
         """
         super().__init__()
 
@@ -1363,6 +1429,11 @@ class LightSeqVaeTeb(L.LightningModule):
         if predictive_max_anchors is None:
             predictive_max_anchors = 0
 
+        if forecast_weight is None:
+            forecast_weight = predictive_weight
+        if latent_nll_weight is None:
+            latent_nll_weight = latent_consistency_weight
+
         # Using save_hyperparameters to automatically save arguments to self.hparams
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
         self.model = seqvae_teb_model
@@ -1371,6 +1442,10 @@ class LightSeqVaeTeb(L.LightningModule):
         if not self._forecaster_enabled:
             self.hparams.predictive_weight = 0.0
             self.hparams.latent_consistency_weight = 0.0
+            self.hparams.forecast_weight = 0.0
+            self.hparams.latent_nll_weight = 0.0
+            self.hparams.predictive_kl_weight = 0.0
+            self.hparams.stability_weight = 0.0
             self.hparams.log_forecast_metrics = False
 
         # Only compile if not already compiled to avoid double compilation
@@ -1471,8 +1546,8 @@ class LightSeqVaeTeb(L.LightningModule):
         B, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B * N, Lc, D)
 
-        z_future_flat = self.model.latent_forecaster(contexts_flat, horizon=horizon)
-        _, mu_flat, logvar_flat = self.model.decoder(z_future_flat)
+        mu_latent_flat, _, _ = self.model.latent_forecaster(contexts_flat, horizon=horizon)
+        _, mu_flat, logvar_flat = self.model.decoder(mu_latent_flat)
         mu_future = mu_flat.reshape(B, N, -1)
         logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
 
@@ -1509,8 +1584,23 @@ class LightSeqVaeTeb(L.LightningModule):
         x_ph = batch.fhr_up_ph
         y_raw = batch.fhr
         use_forecaster = self._has_forecaster()
-        predictive_weight = self.hparams.predictive_weight if use_forecaster else 0.0
-        latent_consistency_weight = self.hparams.latent_consistency_weight if use_forecaster else 0.0
+
+        def _get_weight(primary: str, legacy: str = "", default: float = 0.0) -> float:
+            if not use_forecaster:
+                return 0.0
+            if hasattr(self.hparams, primary):
+                return getattr(self.hparams, primary)
+            if legacy and hasattr(self.hparams, legacy):
+                return getattr(self.hparams, legacy)
+            return default
+
+        forecast_weight = _get_weight("forecast_weight", "predictive_weight")
+        latent_nll_weight = _get_weight("latent_nll_weight", "latent_consistency_weight")
+        predictive_kl_weight = _get_weight("predictive_kl_weight")
+        stability_weight = _get_weight("stability_weight")
+        predictive_weight = _get_weight("predictive_weight")
+        latent_consistency_weight = _get_weight("latent_consistency_weight")
+
         predictive_horizon = max(1, int(self.hparams.predictive_horizon))
         predictive_context = max(1, int(self.hparams.predictive_context_len))
         predictive_max = None
@@ -1532,6 +1622,10 @@ class LightSeqVaeTeb(L.LightningModule):
             latent_consistency_weight=latent_consistency_weight,
             predictive_context_len=predictive_context,
             predictive_max_anchors=predictive_max,
+            latent_nll_weight=latent_nll_weight,
+            forecast_weight=forecast_weight,
+            predictive_kl_weight=predictive_kl_weight,
+            stability_weight=stability_weight,
         )
 
         aux_metrics: Dict[str, torch.Tensor] = {}
@@ -1559,10 +1653,15 @@ class LightSeqVaeTeb(L.LightningModule):
         # Forecast-specific losses
         if 'predictive_loss' in loss_dict:
             self.log('train/predictive_loss', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            # Backward-compat alias for prior dashboards
-            self.log('train/forecast_nll', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        if 'latent_consistency_loss' in loss_dict:
-            self.log('train/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'forecast_nll' in loss_dict:
+            self.log('train/forecast_nll', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        if 'latent_nll_loss' in loss_dict:
+            self.log('train/latent_nll_loss', loss_dict['latent_nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+            self.log('train/latent_consistency_loss', loss_dict['latent_nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'predictive_kl_loss' in loss_dict:
+            self.log('train/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'stability_penalty' in loss_dict:
+            self.log('train/stability_penalty', loss_dict['stability_penalty'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # Auxiliary metrics (if any were computed)
         for name, value in aux_metrics.items():
@@ -1584,9 +1683,15 @@ class LightSeqVaeTeb(L.LightningModule):
 
         if 'predictive_loss' in loss_dict:
             self.log('val/predictive_loss', loss_dict['predictive_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log('val/forecast_nll', loss_dict['predictive_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        if 'latent_consistency_loss' in loss_dict:
-            self.log('val/latent_consistency_loss', loss_dict['latent_consistency_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'forecast_nll' in loss_dict:
+            self.log('val/forecast_nll', loss_dict['forecast_nll'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        if 'latent_nll_loss' in loss_dict:
+            self.log('val/latent_nll_loss', loss_dict['latent_nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+            self.log('val/latent_consistency_loss', loss_dict['latent_nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'predictive_kl_loss' in loss_dict:
+            self.log('val/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        if 'stability_penalty' in loss_dict:
+            self.log('val/stability_penalty', loss_dict['stability_penalty'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         for name, value in aux_metrics.items():
             self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
