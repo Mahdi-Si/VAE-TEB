@@ -1448,6 +1448,15 @@ class SeqVaeTeb(nn.Module):
             normalized[new_key] = value
         return normalized
 
+    def forward(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Full VAE forward pass via the core module."""
+        return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+
     def state_dict(
         self,
         destination: Optional[Dict[str, torch.Tensor]] = None,
