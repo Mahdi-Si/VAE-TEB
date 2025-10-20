@@ -972,74 +972,146 @@ class Decoder(nn.Module):
         }
 
 
-class LatentForecaster(nn.Module):
+class LGSSMLatentForecaster(nn.Module):
     """
-    Simple autoregressive forecaster on latent space.
+    Context-conditioned linear Gaussian state-space forecaster.
 
-    - Encodes the past context z_{t-Lc+1:t} with a GRU encoder
-    - Decodes future H steps autoregressively with a GRU decoder
-    - Each step predicts a D-dimensional latent vector
+    The transition is
+        z_{t+1} = A z_t + b + w_t,   w_t ~ N(0, Q),
+    where (A, b, Q) are functions of the context summary.
 
-    Shapes:
-        context: (B, Lc, D)
-        returns: (B, H, D)
+    Args:
+        latent_dim: Dimensionality of latent space D.
+        hidden_dim: Hidden dimension for the context summarizer MLP.
+        lowrank_q: Rank of the low-rank component for Q (0 -> diagonal).
+        alpha: Maximum spectral radius factor for A (0 < alpha < 1).
+        eig_penalty_fraction: Threshold fraction of alpha after which a stability
+            penalty is applied (e.g., 0.95 penalizes eigenvalues close to alpha).
+        min_logvar: Clamp for minimum log-variance of predicted latents.
+        max_logvar: Clamp for maximum log-variance of predicted latents.
     """
 
     def __init__(
         self,
         latent_dim: int = 16,
         hidden_dim: int = 128,
-        num_layers: int = 1,
-        dropout: float = 0.0,
+        lowrank_q: int = 0,
+        alpha: float = 0.98,
+        eig_penalty_fraction: float = 0.95,
+        min_logvar: float = -7.0,
+        max_logvar: float = 4.0,
     ):
         super().__init__()
+        if not (0.0 < alpha < 1.0):
+            raise ValueError("alpha must be in (0, 1) for stable LGSSM dynamics.")
+        if not (0.0 < eig_penalty_fraction <= 1.0):
+            raise ValueError("eig_penalty_fraction must be in (0, 1].")
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.lowrank_q = lowrank_q
+        self.alpha = alpha
+        self.eig_penalty_fraction = eig_penalty_fraction
+        self.min_logvar = min_logvar
+        self.max_logvar = max_logvar
 
-        self.encoder = nn.GRU(
-            input_size=latent_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
+        self.summarizer = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
         )
+        self.M_head = nn.Linear(hidden_dim, latent_dim * latent_dim)
+        self.rho_head = nn.Linear(hidden_dim, latent_dim)
+        self.b_head = nn.Linear(hidden_dim, latent_dim)
+        self.qdiag_head = nn.Linear(hidden_dim, latent_dim)
+        if lowrank_q > 0:
+            self.U_head = nn.Linear(hidden_dim, latent_dim * lowrank_q)
+        else:
+            self.U_head = None
 
-        self.decoder = nn.GRU(
-            input_size=latent_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.proj = ResidualMLP(hidden_dim, geometric_schedule(hidden_dim, latent_dim, 4), final_activation=False)
+    def _build_transition(self, M: torch.Tensor, rho: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Construct a stable transition matrix A from raw parameters.
+        Returns (A, |eig(A)|).
+        """
+        # QR decomposition provides an orthogonal basis
+        Q_orth, _ = torch.linalg.qr(M)
+        eigenvalues = self.alpha * torch.tanh(rho)  # clamp spectral radius
+        A = Q_orth @ torch.diag_embed(eigenvalues) @ Q_orth.transpose(1, 2)
+        eig_abs = eigenvalues.abs()
+        return A, eig_abs
 
-    def forward(self, z_context: torch.Tensor, horizon: int) -> torch.Tensor:
+    def _build_noise(self, diag_params: torch.Tensor, U: Optional[torch.Tensor]) -> torch.Tensor:
+        diag_cov = torch.diag_embed(F.softplus(diag_params) + 1e-5)
+        if U is None:
+            return diag_cov
+        return diag_cov + U @ U.transpose(1, 2)
+
+    def forward(
+        self,
+        z_context: torch.Tensor,
+        horizon: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
-            z_context: (B, Lc, D)
-            horizon: number of future steps to predict (H)
+            z_context: (B, Lc, D) context window.
+            horizon:  Number of future decimated steps to predict.
+
         Returns:
-            z_future: (B, H, D)
+            mu_steps:    (B, H, D) future latent means.
+            logvar_steps:(B, H, D) future latent log-variances (diagonal).
+            info:        Dictionary with auxiliary tensors (e.g., stability penalty).
         """
+        if horizon < 1:
+            raise ValueError("horizon must be >= 1")
         B, Lc, D = z_context.shape
+        assert D == self.latent_dim, "Context latent dimension mismatch."
 
-        # Encode context
-        _, h_n = self.encoder(z_context)  # h_n: (num_layers, B, hidden_dim)
+        ctx_summary = z_context.mean(dim=1)  # (B, D)
+        hidden = self.summarizer(ctx_summary)  # (B, hidden_dim)
 
-        # Initialize decoder with last context latent as first input
-        dec_input = z_context[:, -1:, :]  # (B, 1, D)
-        h = h_n
+        M = self.M_head(hidden).view(B, D, D)
+        rho = self.rho_head(hidden)
+        b = self.b_head(hidden)
+        q_diag = self.qdiag_head(hidden)
+        U = None
+        if self.lowrank_q > 0:
+            U = self.U_head(hidden).view(B, D, self.lowrank_q)
 
-        outputs = []
+        A, eig_abs = self._build_transition(M, rho)
+        Q = self._build_noise(q_diag, U)
+
+        threshold = self.alpha * self.eig_penalty_fraction
+        stability_penalty = torch.clamp(eig_abs - threshold, min=0.0).mean()
+
+        device = z_context.device
+        dtype = z_context.dtype
+        mu_t = z_context[:, -1, :]  # (B, D)
+        cov_t = torch.zeros(B, D, D, device=device, dtype=dtype)
+
+        mu_steps: List[torch.Tensor] = []
+        logvar_steps: List[torch.Tensor] = []
+        min_var = torch.exp(torch.tensor(self.min_logvar, device=device, dtype=dtype))
+
         for _ in range(horizon):
-            out, h = self.decoder(dec_input, h)   # out: (B, 1, hidden_dim)
-            z_hat = self.proj(out)                # (B, 1, D)
-            outputs.append(z_hat)
-            # Autoregressive: feed back the predicted latent
-            dec_input = z_hat
+            mu_t = (A @ mu_t.unsqueeze(-1)).squeeze(-1) + b
+            cov_t = A @ cov_t @ A.transpose(1, 2) + Q
+            diag = torch.diagonal(cov_t, dim1=1, dim2=2).clamp_min(min_var)
+            logvar = torch.log(diag)
+            logvar = torch.clamp(logvar, min=self.min_logvar, max=self.max_logvar)
 
-        z_future = torch.cat(outputs, dim=1)  # (B, H, D)
-        return z_future
+            mu_steps.append(mu_t)
+            logvar_steps.append(logvar)
+
+        mu_steps_tensor = torch.stack(mu_steps, dim=1)
+        logvar_steps_tensor = torch.stack(logvar_steps, dim=1)
+
+        aux = {
+            "stability_penalty": stability_penalty,
+            "eig_abs": eig_abs.detach(),
+        }
+        return mu_steps_tensor, logvar_steps_tensor, aux
 
 
 class SeqVaeCore(nn.Module):
@@ -1263,6 +1335,12 @@ class SeqVaeTeb(nn.Module):
         context_len: int = 75,
         horizon_len: int = 30,
         forecaster_hidden_dim: int = 128,
+        forecaster_lowrank: int = 0,
+        forecaster_alpha: float = 0.98,
+        forecaster_eig_fraction: float = 0.95,
+        forecaster_min_logvar: float = -7.0,
+        forecaster_max_logvar: float = 4.0,
+        # Legacy arguments (ignored)
         forecaster_layers: int = 1,
         forecaster_dropout: float = 0.0,
         *,
@@ -1296,11 +1374,14 @@ class SeqVaeTeb(nn.Module):
         if latent_forecaster is not None:
             self.latent_forecaster = latent_forecaster
         elif use_latent_forecaster:
-            self.latent_forecaster = LatentForecaster(
+            self.latent_forecaster = LGSSMLatentForecaster(
                 latent_dim=latent_dim_z,
                 hidden_dim=forecaster_hidden_dim,
-                num_layers=forecaster_layers,
-                dropout=forecaster_dropout,
+                lowrank_q=forecaster_lowrank,
+                alpha=forecaster_alpha,
+                eig_penalty_fraction=forecaster_eig_fraction,
+                min_logvar=forecaster_min_logvar,
+                max_logvar=forecaster_max_logvar,
             )
             initialization(self.latent_forecaster)
         else:
@@ -1458,6 +1539,11 @@ class SeqVaeNoForecast(SeqVaeTeb):
         context_len: int = 75,
         horizon_len: int = 30,
         forecaster_hidden_dim: int = 128,
+        forecaster_lowrank: int = 0,
+        forecaster_alpha: float = 0.98,
+        forecaster_eig_fraction: float = 0.95,
+        forecaster_min_logvar: float = -7.0,
+        forecaster_max_logvar: float = 4.0,
         forecaster_layers: int = 1,
         forecaster_dropout: float = 0.0,
     ):
@@ -1473,6 +1559,11 @@ class SeqVaeNoForecast(SeqVaeTeb):
             context_len=context_len,
             horizon_len=horizon_len,
             forecaster_hidden_dim=forecaster_hidden_dim,
+            forecaster_lowrank=forecaster_lowrank,
+            forecaster_alpha=forecaster_alpha,
+            forecaster_eig_fraction=forecaster_eig_fraction,
+            forecaster_min_logvar=forecaster_min_logvar,
+            forecaster_max_logvar=forecaster_max_logvar,
             forecaster_layers=forecaster_layers,
             forecaster_dropout=forecaster_dropout,
             use_latent_forecaster=False,
@@ -1694,13 +1785,13 @@ class SeqVaeNoForecast(SeqVaeTeb):
         B, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B * N, Lc, D)
 
-        # Predict future latents per anchor
-        z_future_flat = self.latent_forecaster(contexts_flat, horizon=H)  # (B*N, H, D)
-        z_future = z_future_flat.reshape(B, N, H, D)
+        # Predict future latents per anchor via LGSSM forecaster
+        mu_latent_flat, logvar_latent_flat, aux = self.latent_forecaster(contexts_flat, horizon=H)
+        z_future = mu_latent_flat.reshape(B, N, H, D)
+        latent_logvar = logvar_latent_flat.reshape(B, N, H, D)
 
-        # Decode per-anchor future latents into raw windows
-        z_future_flat_for_dec = z_future_flat  # (B*N, H, D)
-        _, mu_flat, logvar_flat = self.decoder(z_future_flat_for_dec)  # mu/logvar: (B*N, 16*H)
+        # Decode per-anchor latent means into raw windows
+        _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
         mu_future = mu_flat.reshape(B, N, -1)
         logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
 
@@ -1709,6 +1800,9 @@ class SeqVaeNoForecast(SeqVaeTeb):
             "z_future": z_future,
             "mu_future": mu_future,
             "logvar_future": logvar_future,
+            "latent_mu_future": z_future,
+            "latent_logvar_future": latent_logvar,
+            "stability_penalty": aux.get("stability_penalty", torch.tensor(0.0, device=z_future.device)),
             "enc": enc,
         }
 
@@ -1994,7 +2088,7 @@ class SeqVaeNoForecast(SeqVaeTeb):
         self,
         forward_outputs: Dict[str, torch.Tensor],
         y_st: torch.Tensor,
-        y_ph: torch.Tensor, 
+        y_ph: torch.Tensor,
         y_raw: torch.Tensor,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
@@ -2003,30 +2097,48 @@ class SeqVaeNoForecast(SeqVaeTeb):
         latent_consistency_weight: float = 0.0,
         predictive_context_len: Optional[int] = None,
         predictive_max_anchors: Optional[int] = None,
+        *,
+        latent_nll_weight: Optional[float] = None,
+        forecast_weight: Optional[float] = None,
+        predictive_kl_weight: float = 0.0,
+        stability_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """
-        Computes the total training loss with MSE and NLL components.
+        Compute the full training loss, including LGSSM forecasting terms.
 
         Args:
-            forward_outputs: The dictionary returned by the forward pass.
-            y_st: Target scattering coefficients from optimized dataloader (B, S=300, channels=43)
-            y_ph: Target phase coefficients from optimized dataloader (B, S=300, channels=44)
-            y_raw: Ground truth raw signal data from optimized dataloader (B, 4800)
-            compute_kld_loss (bool): Whether to compute KLD loss.
-            beta (float): Beta weight for KLD loss in VAE training.
-            predictive_weight (float): Weight for auxiliary raw-forecast NLL (0 disables).
-            predictive_horizon (int): Number of decimated steps to forecast (H >= 1).
-            latent_consistency_weight (float): Weight for latent forecast MSE (0 disables).
-            predictive_context_len (Optional[int]): Context length for latent forecaster; defaults to
-                ``self.context_len`` when ``None``.
-
-        Returns:
-            A dictionary of computed losses.
+            forward_outputs: Dictionary produced by the forward pass.
+            y_st, y_ph, y_raw: Target tensors.
+            compute_kld_loss: Whether to include the VAE KL term.
+            beta: Weight for the VAE KL term.
+            predictive_weight: (legacy) raw forecast NLL weight.
+            predictive_horizon: Forecast horizon in decimated steps.
+            latent_consistency_weight: (legacy) latent forecasting auxiliary weight.
+            predictive_context_len: Context length supplied to the forecaster.
+            predictive_max_anchors: Optional cap on the number of anchors sampled per batch.
+            latent_nll_weight: Weight for latent Gaussian NLL (defaults to legacy value).
+            forecast_weight: Weight for raw forecast NLL (defaults to legacy value).
+            predictive_kl_weight: Weight for teacher-forced KL between LGSSM and posterior latents.
+            stability_weight: Weight on the eigenvalue stability penalty.
         """
-        needs_predictive = (predictive_weight > 0.0 or latent_consistency_weight > 0.0)
-        if needs_predictive:
+        # Backwards compatibility with previous arguments
+        if latent_nll_weight is None:
+            latent_nll_weight = latent_consistency_weight
+        if forecast_weight is None:
+            forecast_weight = predictive_weight
+
+        needs_forecaster = any(
+            weight > 0.0
+            for weight in (
+                latent_nll_weight,
+                forecast_weight,
+                predictive_kl_weight,
+                stability_weight,
+            )
+        )
+        if needs_forecaster:
             if predictive_horizon < 1:
-                raise ValueError("predictive_horizon must be >= 1 when predictive losses are enabled")
+                raise ValueError("predictive_horizon must be >= 1 when forecasting losses are enabled.")
             self._require_forecaster()
 
         base_losses = self.core.compute_reconstruction_loss(
@@ -2040,16 +2152,19 @@ class SeqVaeNoForecast(SeqVaeTeb):
         base_total = base_losses["total_loss"]
 
         device = forward_outputs["mu_pr"].device
-        predictive_loss = torch.tensor(0.0, device=device)
-        latent_consistency_loss = torch.tensor(0.0, device=device)
+        latent_nll = torch.tensor(0.0, device=device)
+        forecast_nll = torch.tensor(0.0, device=device)
+        predictive_kl = torch.tensor(0.0, device=device)
+        stability_penalty = torch.tensor(0.0, device=device)
 
         y_raw_eval = y_raw
         if y_raw_eval.dim() == 3 and y_raw_eval.size(-1) == 1:
             y_raw_eval = y_raw_eval.squeeze(-1)
 
-        if needs_predictive:
+        if needs_forecaster:
             mu_post = forward_outputs["mu_post"]
-            _, T, D = mu_post.shape
+            logvar_post = forward_outputs["logvar_post"]
+            B, T, D = mu_post.shape
             stride = self.decimation_factor
             context_len = predictive_context_len or self.context_len
 
@@ -2066,20 +2181,44 @@ class SeqVaeNoForecast(SeqVaeTeb):
                 B_ctx, N, Lc, _ = contexts.shape
                 contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
 
-                z_future_pred = self.latent_forecaster(contexts_flat, horizon=predictive_horizon)
-                z_future_pred = z_future_pred.reshape(B_ctx, N, predictive_horizon, D)
+                mu_pred_flat, logvar_pred_flat, aux = self.latent_forecaster(
+                    contexts_flat, horizon=predictive_horizon
+                )
+                stability_penalty = aux.get("stability_penalty", stability_penalty)
 
-                future_offsets = torch.arange(1, predictive_horizon + 1, device=mu_post.device, dtype=torch.long)
+                mu_pred = mu_pred_flat.reshape(B_ctx, N, predictive_horizon, D)
+                logvar_pred = logvar_pred_flat.reshape(B_ctx, N, predictive_horizon, D)
+
+                future_offsets = torch.arange(
+                    1, predictive_horizon + 1, device=mu_post.device, dtype=torch.long
+                )
                 step_indices = anchors.long().unsqueeze(1) + future_offsets.unsqueeze(0)
                 gather_idx = step_indices.unsqueeze(0).unsqueeze(-1).expand(B_ctx, -1, -1, D)
+
                 expanded_mu_post = mu_post.unsqueeze(1).expand(-1, N, -1, -1)
-                future_targets = torch.gather(expanded_mu_post, 2, gather_idx).detach()
+                expanded_logvar_post = logvar_post.unsqueeze(1).expand(-1, N, -1, -1)
+                teacher_mu = torch.gather(expanded_mu_post, 2, gather_idx).detach()
+                teacher_logvar = torch.gather(expanded_logvar_post, 2, gather_idx).detach()
 
-                if latent_consistency_weight > 0.0:
-                    latent_consistency_loss = F.mse_loss(z_future_pred, future_targets)
+                if latent_nll_weight > 0.0:
+                    latent_nll = 0.5 * (
+                        logvar_pred + (teacher_mu - mu_pred) ** 2 / logvar_pred.exp()
+                    )
+                    latent_nll = latent_nll.mean()
 
-                if predictive_weight > 0.0:
-                    z_future_flat = z_future_pred.reshape(B_ctx * N, predictive_horizon, D)
+                if predictive_kl_weight > 0.0:
+                    teacher_var = teacher_logvar.exp()
+                    pred_var = logvar_pred.exp()
+                    predictive_kl = 0.5 * (
+                        teacher_logvar
+                        - logvar_pred
+                        + (pred_var + (mu_pred - teacher_mu) ** 2) / teacher_var
+                        - 1.0
+                    )
+                    predictive_kl = predictive_kl.mean()
+
+                if forecast_weight > 0.0:
+                    z_future_flat = mu_pred_flat  # (B*N, H, D)
                     _, mu_flat, logvar_flat = self.decoder(z_future_flat)
                     mu_future = mu_flat.reshape(B_ctx, N, -1)
                     logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
@@ -2096,7 +2235,7 @@ class SeqVaeNoForecast(SeqVaeTeb):
                         raw_indices.to(y_raw_eval.device),
                     )
 
-                    predictive_loss = self.gaussian_nll(
+                    forecast_nll = self.gaussian_nll(
                         mu_future.reshape(B_ctx * N, window_len),
                         logvar_future.reshape(B_ctx * N, window_len),
                         target_windows.reshape(B_ctx * N, window_len),
@@ -2104,13 +2243,18 @@ class SeqVaeNoForecast(SeqVaeTeb):
 
         total_loss = (
             base_total
-            + predictive_weight * predictive_loss
-            + latent_consistency_weight * latent_consistency_loss
+            + latent_nll_weight * latent_nll
+            + forecast_weight * forecast_nll
+            + predictive_kl_weight * predictive_kl
+            + stability_weight * stability_penalty
         )
 
         base_losses["base_total_loss"] = base_total
-        base_losses["predictive_loss"] = predictive_loss
-        base_losses["latent_consistency_loss"] = latent_consistency_loss
+        base_losses["latent_nll_loss"] = latent_nll
+        base_losses["predictive_kl_loss"] = predictive_kl
+        base_losses["forecast_nll"] = forecast_nll
+        base_losses["predictive_loss"] = forecast_nll  # Backwards compatibility (logged elsewhere)
+        base_losses["stability_penalty"] = stability_penalty
         base_losses["total_loss"] = total_loss
         base_losses["classification_loss"] = None  # Required by interface
         return base_losses

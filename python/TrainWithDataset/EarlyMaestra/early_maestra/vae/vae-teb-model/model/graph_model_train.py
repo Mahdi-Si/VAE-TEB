@@ -135,8 +135,13 @@ class SeqVAEGraphModel:
         # SeqVAE forecasting parameters
         self.model_context_len = int(vae_cfg.get('context_len', 75))
         self.model_horizon_len = int(vae_cfg.get('horizon_len', 30))
-        self.predictive_weight = float(vae_cfg.get('predictive_weight', 0.0))
-        self.latent_consistency_weight = float(vae_cfg.get('latent_consistency_weight', 0.0))
+        self.forecast_weight = float(vae_cfg.get('forecast_weight', vae_cfg.get('predictive_weight', 0.0)))
+        self.latent_nll_weight = float(vae_cfg.get('latent_nll_weight', vae_cfg.get('latent_consistency_weight', 0.0)))
+        self.predictive_kl_weight = float(vae_cfg.get('predictive_kl_weight', 0.0))
+        self.stability_weight = float(vae_cfg.get('stability_weight', 0.0))
+        # Legacy aliases (for backwards compatibility in downstream utilities)
+        self.predictive_weight = self.forecast_weight
+        self.latent_consistency_weight = self.latent_nll_weight
 
         predictive_horizon_cfg = vae_cfg.get('predictive_horizon')
         if predictive_horizon_cfg is None:
@@ -160,13 +165,19 @@ class SeqVAEGraphModel:
         self.monitor_mode = vae_cfg.get('monitor_mode', 'min')
 
         default_forecaster_flag = (
-            self.predictive_weight > 0.0
-            or self.latent_consistency_weight > 0.0
+            self.forecast_weight > 0.0
+            or self.latent_nll_weight > 0.0
+            or self.predictive_kl_weight > 0.0
+            or self.stability_weight > 0.0
         )
         self.enable_forecaster = bool(vae_cfg.get('enable_forecaster', default_forecaster_flag))
         if not self.enable_forecaster:
             self.predictive_weight = 0.0
             self.latent_consistency_weight = 0.0
+            self.forecast_weight = 0.0
+            self.latent_nll_weight = 0.0
+            self.predictive_kl_weight = 0.0
+            self.stability_weight = 0.0
             self.log_forecast_metrics = False
             if 'predictive' in self.monitor_metric:
                 self.monitor_metric = 'val/total_loss'
@@ -310,6 +321,10 @@ class SeqVAEGraphModel:
                         predictive_context_len=self.predictive_context_len,
                         predictive_max_anchors=self.predictive_max_anchors,
                         log_forecast_metrics=self.log_forecast_metrics,
+                        forecast_weight=self.forecast_weight,
+                        latent_nll_weight=self.latent_nll_weight,
+                        predictive_kl_weight=self.predictive_kl_weight,
+                        stability_weight=self.stability_weight,
                     )
                     load_success = True
                     break
@@ -465,6 +480,10 @@ class SeqVAEGraphModel:
             predictive_context_len=self.predictive_context_len,
             predictive_max_anchors=self.predictive_max_anchors,
             log_forecast_metrics=self.log_forecast_metrics,
+            forecast_weight=self.forecast_weight,
+            latent_nll_weight=self.latent_nll_weight,
+            predictive_kl_weight=self.predictive_kl_weight,
+            stability_weight=self.stability_weight,
         )
         self._enforce_lightning_hparams(self.lightning_base_model)
         self.pytorch_model = self.base_model  # Set pytorch_model reference
@@ -485,6 +504,10 @@ class SeqVAEGraphModel:
             'beta_const_val': self.beta_const_val,
             'predictive_weight': self.predictive_weight,
             'latent_consistency_weight': self.latent_consistency_weight,
+            'forecast_weight': self.forecast_weight,
+            'latent_nll_weight': self.latent_nll_weight,
+            'predictive_kl_weight': self.predictive_kl_weight,
+            'stability_weight': self.stability_weight,
             'predictive_horizon': self.predictive_horizon,
             'predictive_context_len': self.predictive_context_len,
             'predictive_max_anchors': self.predictive_max_anchors,
@@ -578,9 +601,11 @@ class SeqVAEGraphModel:
         """
         logger.info("Setting up trainer for the base model...")
         logger.info(
-            "Forecasting configuration | predictive_weight=%.4f | latent_consistency_weight=%.4f | horizon=%s | context=%s | max_anchors=%s | log_metrics=%s",
-            self.predictive_weight,
-            self.latent_consistency_weight,
+            "Forecasting configuration | forecast_weight=%.4f | latent_nll_weight=%.4f | predictive_kl_weight=%.4f | stability_weight=%.4f | horizon=%s | context=%s | max_anchors=%s | log_metrics=%s",
+            self.forecast_weight,
+            self.latent_nll_weight,
+            self.predictive_kl_weight,
+            self.stability_weight,
             self.predictive_horizon,
             self.predictive_context_len,
             self.predictive_max_anchors,

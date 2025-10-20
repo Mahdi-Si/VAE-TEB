@@ -42,8 +42,11 @@ model_config:
     # Direct transfer entropy measurement
 
     # Forecasting auxiliary objectives
-    predictive_weight: 0.8              # Weight on raw forecast NLL auxiliary loss
-    latent_consistency_weight: 0.1      # Weight on latent-space consistency loss
+    enable_forecaster: false
+    forecast_weight: 0.8                # Weight on raw forecast NLL auxiliary loss
+    latent_nll_weight: 0.1              # Weight on latent latent-space Gaussian NLL
+    predictive_kl_weight: 0.0           # Weight on teacher KL between LGSSM and posterior
+    stability_weight: 0.001             # Weight on LGSSM stability regularizer
     predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
     predictive_context_len: null        # Override context length (defaults to context_len)
     predictive_max_anchors: 0           # Max anchors (0 = use all) for auxiliary losses
@@ -52,7 +55,7 @@ model_config:
     monitor_metric: "val/total_loss"  # Metric to monitor for checkpoints / early stopping
     monitor_mode: "min"                 # Direction for monitored metric
 
-  base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-08-28--[13-19]--seqvae_teb_experiment_latent_16_B1e-4/model_checkpoints/base-model-best-epoch=997.ckpt
+  base_model_checkpoint: null
   legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
 
 folders_config:
