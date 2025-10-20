@@ -1627,6 +1627,54 @@ class SeqVaeTeb(nn.Module):
         incompatible_type = type(incompatible)
         return incompatible_type(missing_keys, unexpected_keys)
 
+    # ------------------------
+    # Encoding utilities
+    # ------------------------
+    def encode_only(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        sample_z: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Encoder-only pass delegated to the core module."""
+        return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
+
+    # ------------------------
+    # Forecasting helpers
+    # ------------------------
+    @staticmethod
+    def anchor_range(T: int, Lc: int, H: int) -> torch.Tensor:
+        """Return valid anchor indices t in [Lc-1, T-1-H] as (N,)."""
+        start = max(0, Lc - 1)
+        end = max(start - 1, T - 1 - H)  # inclusive
+        if end < start:
+            return torch.zeros(0, dtype=torch.long)
+        return torch.arange(start, end + 1, dtype=torch.long)
+
+    def _gather_context(self, z_seq: torch.Tensor, anchors: torch.Tensor, Lc: int) -> torch.Tensor:
+        """
+        Gather contexts for anchors from z sequence.
+
+        Args:
+            z_seq: (B, T, D)
+            anchors: (N,)
+        Returns:
+            contexts: (B, N, Lc, D)
+        """
+        B, T, D = z_seq.shape
+        N = anchors.numel()
+        contexts = []
+        for t in anchors.tolist():
+            ctx = z_seq[:, t - Lc + 1 : t + 1, :]
+            contexts.append(ctx.unsqueeze(1))  # (B,1,Lc,D)
+        return torch.cat(contexts, dim=1) if contexts else z_seq.new_zeros(B, 0, Lc, D)
+
+    @staticmethod
+    def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Static redirect to the core Gaussian NLL helper."""
+        return SeqVaeCore.gaussian_nll(mu, logvar, target, mask)
+
     def compute_loss(
         self,
         forward_outputs: Dict[str, torch.Tensor],
