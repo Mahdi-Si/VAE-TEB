@@ -96,8 +96,15 @@ class PlottingCallBack(Callback):
                     epoch=pl_trainer.current_epoch,
                 )
 
+                # Get uncompiled model for utility methods
+                model = pl_module.model
+                if hasattr(model, '_orig_mod'):
+                    orig_model = model._orig_mod
+                else:
+                    orig_model = model
+
                 if pl_module.model.has_forecaster():
-                    forecast_out = pl_module.model.forecast(
+                    forecast_out = orig_model.forecast(
                         y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True
                     )
                     anchors = forecast_out["anchors"]
@@ -115,12 +122,12 @@ class PlottingCallBack(Callback):
                             float(stability_penalty),
                         )
 
-                    canvas_mu, mean_mu = pl_module.model.aggregate_forecasts_to_canvas(
-                        mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+                    canvas_mu, mean_mu = orig_model.aggregate_forecasts_to_canvas(
+                        mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=orig_model.decimation_factor)
 
                     var_future = logvar_future.exp()
-                    _, mean_var = pl_module.model.aggregate_forecasts_to_canvas(
-                        var_future, anchors, total_len=y_raw_normalized.shape[1], stride=pl_module.model.decimation_factor)
+                    _, mean_var = orig_model.aggregate_forecasts_to_canvas(
+                        var_future, anchors, total_len=y_raw_normalized.shape[1], stride=orig_model.decimation_factor)
                     std_mu = mean_var.clamp_min(1e-8).sqrt()
 
                     self._plot_latent_forecast_samples(
@@ -1552,9 +1559,23 @@ class LightSeqVaeTeb(L.LightningModule):
         # Import SeqVaeTeb class for static method access
         from vae_teb_model import SeqVaeTeb
 
-        # Use the original uncompiled model for helper methods
-        # self._orig_model is set in __init__ to always point to the SeqVaeTeb instance
-        orig_model = self._orig_model
+        # Get the uncompiled model instance by unwrapping if necessary
+        model = self.model
+        if hasattr(model, '_orig_mod'):
+            # torch.compile wraps the module with _orig_mod
+            orig_model = model._orig_mod
+        else:
+            orig_model = model
+
+        # Verify we have the right type
+        if not isinstance(orig_model, SeqVaeTeb):
+            # Fallback to self._orig_model if set
+            if hasattr(self, '_orig_model') and isinstance(self._orig_model, SeqVaeTeb):
+                orig_model = self._orig_model
+            else:
+                logger.warning("Could not access uncompiled SeqVaeTeb model for forecast metrics")
+                return metrics
+
         stride = orig_model.decimation_factor
 
         # Ensure requested horizons fit within available sequence length
