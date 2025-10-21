@@ -1,3 +1,10 @@
+import os
+# Set matplotlib backend BEFORE any other imports
+os.environ["MPLBACKEND"] = "Agg"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['PYDEVD_USE_CYTHON'] = "NO"
+
 import lightning as L
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
@@ -5,17 +12,16 @@ import numpy as np
 import torch.nn as nn
 import torch
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg', force=True)
+# Disable interactive mode and set thread-safe parameters
 import matplotlib.pyplot as plt
-import os
+plt.ioff()  # Turn off interactive mode
+matplotlib.rcParams['figure.max_open_warning'] = 0
+
 import plotly.graph_objects as go
 from typing import Dict, Optional, Tuple
 
 from vae_teb_model import SeqVaeTeb, ensure_compiled_module, is_compiled_module
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['PYDEVD_USE_CYTHON'] = "NO"
 
 torch.backends.cudnn.enabled = True
 
@@ -37,6 +43,9 @@ class PlottingCallBack(Callback):
             return
 
         logger.info(f"Starting plotting callback for epoch {pl_trainer.current_epoch}")
+
+        # Close all existing matplotlib figures before starting
+        plt.close('all')
 
         try:
             if hasattr(pl_trainer, 'datamodule') and pl_trainer.datamodule is not None:
@@ -169,6 +178,10 @@ class PlottingCallBack(Callback):
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
         finally:
+            # Ensure all figures are closed to prevent threading issues
+            plt.close('all')
+            import gc
+            gc.collect()
             pl_module.train()
 
     def _plot_reconstruction_overview(
@@ -1526,13 +1539,31 @@ class LightSeqVaeTeb(L.LightningModule):
 
         horizon = max(int(self.hparams.predictive_horizon), 1)
         context_len = max(int(self.hparams.predictive_context_len), 1)
-        stride = self.model.decimation_factor
+
+        # Get the original model (unwrap from compiled/DDP wrapper)
+        from vae_teb_model import SeqVaeTeb
+        if isinstance(self.model, SeqVaeTeb):
+            orig_model = self.model
+        elif hasattr(self.model, '_orig_mod'):
+            # torch.compile wrapper
+            orig_model = self.model._orig_mod
+        elif hasattr(self.model, 'module'):
+            # DDP wrapper
+            orig_model = self.model.module
+            # Check if DDP module is also compiled
+            if hasattr(orig_model, '_orig_mod'):
+                orig_model = orig_model._orig_mod
+        else:
+            # Fallback: try to use the model directly
+            orig_model = self.model
+
+        stride = orig_model.decimation_factor
 
         # Ensure requested horizons fit within available sequence length
         horizon = min(horizon, mu_post.size(1))
         context_len = min(context_len, mu_post.size(1))
 
-        anchors = self.model.anchor_range(mu_post.size(1), context_len, horizon)
+        anchors = orig_model.anchor_range(mu_post.size(1), context_len, horizon)
         if anchors.numel() == 0:
             return metrics
 
@@ -1542,20 +1573,20 @@ class LightSeqVaeTeb(L.LightningModule):
         if max_anchors > 0 and anchors.numel() > max_anchors:
             perm = torch.randperm(anchors.numel(), device=anchors.device)
             anchors = anchors[perm[:max_anchors]]
-        contexts = self.model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
+        contexts = orig_model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
         B, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B * N, Lc, D)
 
-        mu_latent_flat, _, _ = self.model.latent_forecaster(contexts_flat, horizon=horizon)
-        _, mu_flat, logvar_flat = self.model.decoder(mu_latent_flat)
+        mu_latent_flat, _, _ = orig_model.latent_forecaster(contexts_flat, horizon=horizon)
+        _, mu_flat, logvar_flat = orig_model.decoder(mu_latent_flat)
         mu_future = mu_flat.reshape(B, N, -1)
         logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
 
-        canvas_mu, mean_mu = self.model.aggregate_forecasts_to_canvas(
+        canvas_mu, mean_mu = orig_model.aggregate_forecasts_to_canvas(
             mu_future, anchors, total_len=y_raw.shape[1], stride=stride
         )
         var_future = logvar_future.exp()
-        _, mean_var = self.model.aggregate_forecasts_to_canvas(
+        _, mean_var = orig_model.aggregate_forecasts_to_canvas(
             var_future, anchors, total_len=y_raw.shape[1], stride=stride
         )
 
@@ -1566,7 +1597,7 @@ class LightSeqVaeTeb(L.LightningModule):
             denom = mask.sum(dim=1).clamp_min(1)
             mse = (pred - gt).pow(2).sum(dim=1) / denom
             mae = (pred - gt).abs().sum(dim=1) / denom
-            corr = self.model._masked_corrcoef(pred, gt, mask)
+            corr = orig_model._masked_corrcoef(pred, gt, mask)
             coverage = mask.float().mean(dim=1)
 
             metrics['agg_mse'] = torch.nanmean(mse)
