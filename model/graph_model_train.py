@@ -723,7 +723,7 @@ class SeqVAEGraphModel:
             limit_val_batches=1.0,
             val_check_interval=1.0,
             check_val_every_n_epoch=1,
-            sync_batchnorm=True if len(self.cuda_devices) > 1 else False,
+            sync_batchnorm=False if len(self.cuda_devices) > 1 else False,
             detect_anomaly=False,
             deterministic=False,
             benchmark=True,

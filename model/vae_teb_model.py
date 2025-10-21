@@ -1035,24 +1035,22 @@ class LGSSMLatentForecaster(nn.Module):
         Construct a stable transition matrix A from raw parameters.
         Returns (A, |eig(A)|).
         """
-        # Store original dtype for mixed precision compatibility
-        original_dtype = M.dtype
+        # Use autocast context to handle mixed precision efficiently
+        # QR decomposition requires FP32, but autocast handles the conversions
+        with torch.autocast(device_type='cuda', enabled=False):
+            # Convert to FP32 for QR decomposition
+            M_fp32 = M.float()
+            rho_fp32 = rho.float()
 
-        # Cast to FP32 if needed - QR decomposition not supported in FP16 on CUDA
-        if M.dtype == torch.float16:
-            M = M.float()
-            rho = rho.float()
+            # QR decomposition provides an orthogonal basis
+            Q_orth, _ = torch.linalg.qr(M_fp32)
+            eigenvalues = self.alpha * torch.tanh(rho_fp32)  # clamp spectral radius
+            A = Q_orth @ torch.diag_embed(eigenvalues) @ Q_orth.transpose(1, 2)
+            eig_abs = eigenvalues.abs()
 
-        # QR decomposition provides an orthogonal basis
-        Q_orth, _ = torch.linalg.qr(M)
-        eigenvalues = self.alpha * torch.tanh(rho)  # clamp spectral radius
-        A = Q_orth @ torch.diag_embed(eigenvalues) @ Q_orth.transpose(1, 2)
-        eig_abs = eigenvalues.abs()
-
-        # Cast back to original dtype
-        if original_dtype == torch.float16:
-            A = A.half()
-            eig_abs = eig_abs.half()
+        # Convert back to original dtype (autocast will handle this efficiently)
+        A = A.to(M.dtype)
+        eig_abs = eig_abs.to(M.dtype)
 
         return A, eig_abs
 
@@ -1668,21 +1666,39 @@ class SeqVaeTeb(nn.Module):
 
     def _gather_context(self, z_seq: torch.Tensor, anchors: torch.Tensor, Lc: int) -> torch.Tensor:
         """
-        Gather contexts for anchors from z sequence.
+        Gather contexts for anchors from z sequence using vectorized operations.
 
         Args:
             z_seq: (B, T, D)
-            anchors: (N,)
+            anchors: (N,) anchor time indices
         Returns:
             contexts: (B, N, Lc, D)
         """
         B, T, D = z_seq.shape
         N = anchors.numel()
-        contexts = []
-        for t in anchors.tolist():
-            ctx = z_seq[:, t - Lc + 1 : t + 1, :]
-            contexts.append(ctx.unsqueeze(1))  # (B,1,Lc,D)
-        return torch.cat(contexts, dim=1) if contexts else z_seq.new_zeros(B, 0, Lc, D)
+
+        if N == 0:
+            return z_seq.new_zeros(B, 0, Lc, D)
+
+        # Vectorized context gathering using advanced indexing
+        # Create index tensor: (N, Lc) where each row contains indices [t-Lc+1, ..., t]
+        # anchors: (N,) -> (N, 1)
+        # offsets: (Lc,) representing [-Lc+1, -Lc+2, ..., 0]
+        offsets = torch.arange(-Lc + 1, 1, device=anchors.device, dtype=anchors.dtype)  # (Lc,)
+        indices = anchors.unsqueeze(1) + offsets.unsqueeze(0)  # (N, Lc)
+
+        # Gather all contexts at once: z_seq[:, indices, :] -> (B, N, Lc, D)
+        # Use expand to broadcast batch dimension, then gather
+        indices_expanded = indices.unsqueeze(0).expand(B, -1, -1)  # (B, N, Lc)
+
+        # Gather operation: for each batch, gather specified time slices
+        contexts = torch.gather(
+            z_seq.unsqueeze(1).expand(-1, N, -1, -1),  # (B, N, T, D)
+            dim=2,  # gather along time dimension
+            index=indices_expanded.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, N, Lc, D)
+        )
+
+        return contexts
 
     @staticmethod
     def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -2077,21 +2093,39 @@ class SeqVaeNoForecast(SeqVaeTeb):
 
     def _gather_context(self, z_seq: torch.Tensor, anchors: torch.Tensor, Lc: int) -> torch.Tensor:
         """
-        Gather contexts for anchors from z sequence.
+        Gather contexts for anchors from z sequence using vectorized operations.
 
         Args:
             z_seq: (B, T, D)
-            anchors: (N,)
+            anchors: (N,) anchor time indices
         Returns:
             contexts: (B, N, Lc, D)
         """
         B, T, D = z_seq.shape
         N = anchors.numel()
-        contexts = []
-        for t in anchors.tolist():
-            ctx = z_seq[:, t - Lc + 1 : t + 1, :]
-            contexts.append(ctx.unsqueeze(1))  # (B,1,Lc,D)
-        return torch.cat(contexts, dim=1) if contexts else z_seq.new_zeros(B, 0, Lc, D)
+
+        if N == 0:
+            return z_seq.new_zeros(B, 0, Lc, D)
+
+        # Vectorized context gathering using advanced indexing
+        # Create index tensor: (N, Lc) where each row contains indices [t-Lc+1, ..., t]
+        # anchors: (N,) -> (N, 1)
+        # offsets: (Lc,) representing [-Lc+1, -Lc+2, ..., 0]
+        offsets = torch.arange(-Lc + 1, 1, device=anchors.device, dtype=anchors.dtype)  # (Lc,)
+        indices = anchors.unsqueeze(1) + offsets.unsqueeze(0)  # (N, Lc)
+
+        # Gather all contexts at once: z_seq[:, indices, :] -> (B, N, Lc, D)
+        # Use expand to broadcast batch dimension, then gather
+        indices_expanded = indices.unsqueeze(0).expand(B, -1, -1)  # (B, N, Lc)
+
+        # Gather operation: for each batch, gather specified time slices
+        contexts = torch.gather(
+            z_seq.unsqueeze(1).expand(-1, N, -1, -1),  # (B, N, T, D)
+            dim=2,  # gather along time dimension
+            index=indices_expanded.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, N, Lc, D)
+        )
+
+        return contexts
 
     def forecast(
         self,
