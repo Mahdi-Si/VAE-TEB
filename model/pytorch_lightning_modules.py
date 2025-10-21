@@ -1461,14 +1461,23 @@ class LightSeqVaeTeb(L.LightningModule):
             self.hparams.stability_weight = 0.0
             self.hparams.log_forecast_metrics = False
 
+        # Store reference to original model before compilation
+        self._orig_model = self.model
+
         # Only compile if not already compiled to avoid double compilation
         if not is_compiled_module(self.model):
             self.model, self._model_compiled = ensure_compiled_module(
                 self.model,
                 module_name="SeqVaeTeb Lightning wrapper",
             )
+            # After compilation, update the reference to the original uncompiled model
+            if self._model_compiled and hasattr(self.model, '_orig_mod'):
+                self._orig_model = self.model._orig_mod
         else:
             self._model_compiled = True
+            # If already compiled, extract the original model
+            if hasattr(self.model, '_orig_mod'):
+                self._orig_model = self.model._orig_mod
             logger.info("[LightSeqVaeTeb] Model already compiled, skipping compilation")
 
     def forward(self, y_st, y_ph, x_ph):
@@ -1540,30 +1549,20 @@ class LightSeqVaeTeb(L.LightningModule):
         horizon = max(int(self.hparams.predictive_horizon), 1)
         context_len = max(int(self.hparams.predictive_context_len), 1)
 
-        # Get the original model (unwrap from compiled/DDP wrapper)
+        # Import SeqVaeTeb class for static method access
         from vae_teb_model import SeqVaeTeb
-        if isinstance(self.model, SeqVaeTeb):
-            orig_model = self.model
-        elif hasattr(self.model, '_orig_mod'):
-            # torch.compile wrapper
-            orig_model = self.model._orig_mod
-        elif hasattr(self.model, 'module'):
-            # DDP wrapper
-            orig_model = self.model.module
-            # Check if DDP module is also compiled
-            if hasattr(orig_model, '_orig_mod'):
-                orig_model = orig_model._orig_mod
-        else:
-            # Fallback: try to use the model directly
-            orig_model = self.model
 
+        # Use the original uncompiled model for helper methods
+        # self._orig_model is set in __init__ to always point to the SeqVaeTeb instance
+        orig_model = self._orig_model
         stride = orig_model.decimation_factor
 
         # Ensure requested horizons fit within available sequence length
         horizon = min(horizon, mu_post.size(1))
         context_len = min(context_len, mu_post.size(1))
 
-        anchors = orig_model.anchor_range(mu_post.size(1), context_len, horizon)
+        # Use static method directly from class
+        anchors = SeqVaeTeb.anchor_range(mu_post.size(1), context_len, horizon)
         if anchors.numel() == 0:
             return metrics
 
@@ -1573,6 +1572,8 @@ class LightSeqVaeTeb(L.LightningModule):
         if max_anchors > 0 and anchors.numel() > max_anchors:
             perm = torch.randperm(anchors.numel(), device=anchors.device)
             anchors = anchors[perm[:max_anchors]]
+
+        # Use original uncompiled model for helper methods that aren't in the compiled interface
         contexts = orig_model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
         B, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B * N, Lc, D)
@@ -1597,7 +1598,8 @@ class LightSeqVaeTeb(L.LightningModule):
             denom = mask.sum(dim=1).clamp_min(1)
             mse = (pred - gt).pow(2).sum(dim=1) / denom
             mae = (pred - gt).abs().sum(dim=1) / denom
-            corr = orig_model._masked_corrcoef(pred, gt, mask)
+            # Use static method directly from class for _masked_corrcoef
+            corr = SeqVaeTeb._masked_corrcoef(pred, gt, mask)
             coverage = mask.float().mean(dim=1)
 
             metrics['agg_mse'] = torch.nanmean(mse)
