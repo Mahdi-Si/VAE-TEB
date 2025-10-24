@@ -1764,9 +1764,24 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers with SOTA optimizations."""
+        # Only optimize parameters that require gradients (respects frozen core)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+
+        # Log parameter counts
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_count = sum(p.numel() for p in trainable_params)
+        frozen_count = total_params - trainable_count
+
+        logger.info("=" * 80)
+        logger.info(f"Optimizer configuration:")
+        logger.info(f"  Total parameters: {total_params:,}")
+        logger.info(f"  Trainable parameters: {trainable_count:,} ({100.0 * trainable_count / total_params:.2f}%)")
+        logger.info(f"  Frozen parameters: {frozen_count:,} ({100.0 * frozen_count / total_params:.2f}%)")
+        logger.info("=" * 80)
+
         # OPTIMIZATION: Use AdamW with gradient clipping compatibility
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            trainable_params,  # Only optimize trainable parameters
             lr=self.hparams.lr,
             weight_decay=1e-4,     # L2 regularization
             eps=1e-8,              # Numerical stability
