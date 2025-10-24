@@ -1424,6 +1424,50 @@ class SeqVaeTeb(nn.Module):
         if self.latent_forecaster is None:
             raise RuntimeError("Latent forecaster is disabled for this SeqVaeTeb instance.")
 
+    def freeze_core(self) -> None:
+        """Freeze all core VAE parameters (encoders + decoder), leaving only latent forecaster trainable."""
+        if self.latent_forecaster is None:
+            log.warning("Cannot freeze core: latent forecaster is not available")
+            return
+
+        for param in self.core.parameters():
+            param.requires_grad = False
+
+        log.info("Froze core VAE (source encoder, target encoder, conditional encoder, decoder)")
+
+        # Ensure forecaster remains trainable
+        for param in self.latent_forecaster.parameters():
+            param.requires_grad = True
+
+        log.info("Latent forecaster parameters remain trainable")
+
+    def unfreeze_core(self) -> None:
+        """Unfreeze all core VAE parameters."""
+        for param in self.core.parameters():
+            param.requires_grad = True
+
+        log.info("Unfroze core VAE (all parameters now trainable)")
+
+    def get_trainable_params_info(self) -> Dict[str, int]:
+        """Get information about trainable vs frozen parameters."""
+        core_trainable = sum(p.numel() for p in self.core.parameters() if p.requires_grad)
+        core_frozen = sum(p.numel() for p in self.core.parameters() if not p.requires_grad)
+        forecaster_trainable = 0
+        forecaster_frozen = 0
+
+        if self.latent_forecaster is not None:
+            forecaster_trainable = sum(p.numel() for p in self.latent_forecaster.parameters() if p.requires_grad)
+            forecaster_frozen = sum(p.numel() for p in self.latent_forecaster.parameters() if not p.requires_grad)
+
+        return {
+            "core_trainable": core_trainable,
+            "core_frozen": core_frozen,
+            "forecaster_trainable": forecaster_trainable,
+            "forecaster_frozen": forecaster_frozen,
+            "total_trainable": core_trainable + forecaster_trainable,
+            "total_frozen": core_frozen + forecaster_frozen,
+        }
+
     @staticmethod
     def _is_latent_forecaster_key(name: str) -> bool:
         return "latent_forecaster" in name.split(".")

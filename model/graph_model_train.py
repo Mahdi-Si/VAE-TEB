@@ -183,6 +183,7 @@ class SeqVAEGraphModel:
                 self.monitor_metric = 'val/total_loss'
 
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
+        self.freeze_core_model = self.config['model_config']['VAE_model'].get('freeze_core_model', False)
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']
         self.accumulate_grad_batches = self.config['general_config'].get('accumulate_grad_batches', 1)
@@ -531,6 +532,48 @@ class SeqVAEGraphModel:
             {k: getattr(lightning_model.hparams, k, None) for k in enforce_map.keys()},
         )
 
+    def _apply_freeze_core(self) -> None:
+        """Apply freeze_core to the model if latent forecaster is available."""
+        if self.pytorch_model is None:
+            logger.error("Cannot apply freeze_core: pytorch_model is None")
+            return
+
+        # Get the actual model (unwrap if compiled)
+        model = self.pytorch_model
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+
+        # Check if model has latent forecaster
+        if not hasattr(model, 'has_forecaster') or not model.has_forecaster():
+            logger.error(
+                "Cannot freeze core: latent forecaster is not available. "
+                "Set enable_forecaster=true in config to use freeze_core_model."
+            )
+            self.freeze_core_model = False
+            return
+
+        # Apply freeze
+        model.freeze_core()
+
+        # Get and log parameter info
+        param_info = model.get_trainable_params_info()
+        logger.info("=" * 80)
+        logger.info("FREEZE CORE MODEL APPLIED:")
+        logger.info(f"  Core VAE - Trainable: {param_info['core_trainable']:,} | Frozen: {param_info['core_frozen']:,}")
+        logger.info(f"  Latent Forecaster - Trainable: {param_info['forecaster_trainable']:,} | Frozen: {param_info['forecaster_frozen']:,}")
+        logger.info(f"  TOTAL - Trainable: {param_info['total_trainable']:,} | Frozen: {param_info['total_frozen']:,}")
+        logger.info(f"  Training only {param_info['forecaster_trainable']:,} / {param_info['total_trainable'] + param_info['total_frozen']:,} parameters ({100.0 * param_info['forecaster_trainable'] / (param_info['total_trainable'] + param_info['total_frozen']):.2f}%)")
+        logger.info("=" * 80)
+
+        # Also apply to lightning model if it exists
+        if hasattr(self, 'lightning_base_model') and self.lightning_base_model is not None:
+            lightning_model = self.lightning_base_model.model
+            if hasattr(lightning_model, '_orig_mod'):
+                lightning_model = lightning_model._orig_mod
+            if hasattr(lightning_model, 'freeze_core'):
+                lightning_model.freeze_core()
+                logger.info("Freeze core also applied to Lightning module")
+
     def _validate_compilation_state(self) -> None:
         """Validate that the model compilation state is correct and log status."""
         if self.pytorch_model is None:
@@ -570,6 +613,11 @@ class SeqVAEGraphModel:
         self.load_checkpoint()
         if self.pytorch_model is not None:
             logger.info("Model created successfully with enforced config parameters")
+
+            # Apply freeze_core_model if configured
+            if self.freeze_core_model:
+                logger.info("Applying freeze_core_model configuration...")
+                self._apply_freeze_core()
 
             # Validate compilation state
             self._validate_compilation_state()
