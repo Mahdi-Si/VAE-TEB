@@ -22,6 +22,7 @@ general_config:
 model_config:
   VAE_model:
     freeze_seqvae: False        # Whether to freeze VAE during classifier training
+    freeze_core_model: False    # Whether to freeze core VAE (encoders+decoder) and only train latent forecaster
     zero_source: False           # Whether to zero source during certain experiments
     context_len: 75            # Latent forecaster context length (decimated steps)
     horizon_len: 30            # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
