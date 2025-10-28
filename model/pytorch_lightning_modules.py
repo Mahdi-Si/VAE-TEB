@@ -1088,32 +1088,34 @@ class LossPlotCallback(Callback):
         self.output_dir = output_dir
         self.plot_frequency = plot_frequency
         self.max_history_size = max_history_size
-        # Standard TEB metrics
+        # Standard TEB metrics (cleaned up - removed legacy aliases)
         self.history = {
             "epoch": [],
+            # Core VAE losses
             "train/total_loss": [],
             "train/recon_loss": [],
             "train/mse_loss": [],
             "train/nll_loss": [],
-            "train/predictive_loss": [],
-            "train/latent_nll_loss": [],
-            "train/latent_consistency_loss": [],
+            "train/kld_loss": [],
+            # TCN forecaster losses
             "train/forecast_nll": [],
+            "train/latent_nll_loss": [],
             "train/predictive_kl_loss": [],
             "train/stability_penalty": [],
-            "train/kld_loss": [],
+            # Auxiliary metrics
             "train/agg_mse": [],
+            # Validation core losses
             "val/total_loss": [],
             "val/recon_loss": [],
             "val/mse_loss": [],
             "val/nll_loss": [],
-            "val/predictive_loss": [],
-            "val/latent_nll_loss": [],
-            "val/latent_consistency_loss": [],
+            "val/kld_loss": [],
+            # Validation forecaster losses
             "val/forecast_nll": [],
+            "val/latent_nll_loss": [],
             "val/predictive_kl_loss": [],
             "val/stability_penalty": [],
-            "val/kld_loss": [],
+            # Validation aggregate metrics
             "val/agg_mse": [],
             "val/agg_mae": [],
             "val/agg_corr": [],
@@ -1711,7 +1713,6 @@ class LightSeqVaeTeb(L.LightningModule):
             self.log('train/forecast_nll', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_nll_loss' in loss_dict:
             self.log('train/latent_nll_loss', loss_dict['latent_nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log('train/latent_consistency_loss', loss_dict['latent_nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         if 'predictive_kl_loss' in loss_dict:
             self.log('train/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         if 'stability_penalty' in loss_dict:
@@ -1741,7 +1742,6 @@ class LightSeqVaeTeb(L.LightningModule):
             self.log('val/forecast_nll', loss_dict['forecast_nll'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_nll_loss' in loss_dict:
             self.log('val/latent_nll_loss', loss_dict['latent_nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log('val/latent_consistency_loss', loss_dict['latent_nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         if 'predictive_kl_loss' in loss_dict:
             self.log('val/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         if 'stability_penalty' in loss_dict:
