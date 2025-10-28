@@ -124,7 +124,7 @@ advanced_config:
   callbacks:
     early_stopping:
       enabled: false                   # Enable early stopping
-      monitor: "val/predictive_loss"  # Metric to monitor
+      monitor: "val/forecast_nll"     # Metric to monitor (use val/forecast_nll or val/total_loss)
       patience: 20                     # Epochs to wait for improvement
       min_delta: 0.0001               # Minimum change to qualify as improvement
     
