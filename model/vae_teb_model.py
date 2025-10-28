@@ -2021,6 +2021,12 @@ class SeqVaeTeb(nn.Module):
     def has_forecaster(self) -> bool:
         return self.latent_forecaster is not None
 
+    def is_core_frozen(self) -> bool:
+        """Check if the core VAE is frozen (all parameters have requires_grad=False)."""
+        if not list(self.core.parameters()):
+            return False
+        return all(not param.requires_grad for param in self.core.parameters())
+
     def _require_forecaster(self) -> None:
         if self.latent_forecaster is None:
             raise RuntimeError("Latent forecaster is disabled for this SeqVaeTeb instance.")
@@ -2034,7 +2040,11 @@ class SeqVaeTeb(nn.Module):
         for param in self.core.parameters():
             param.requires_grad = False
 
+        # Set core to eval mode for efficiency (no dropout/batchnorm updates)
+        self.core.eval()
+
         log.info("Froze core VAE (source encoder, target encoder, conditional encoder, decoder)")
+        log.info("Core VAE set to eval mode (dropout/batchnorm disabled)")
 
         # Ensure forecaster remains trainable
         for param in self.latent_forecaster.parameters():
@@ -2043,11 +2053,15 @@ class SeqVaeTeb(nn.Module):
         log.info("Latent forecaster parameters remain trainable")
 
     def unfreeze_core(self) -> None:
-        """Unfreeze all core VAE parameters."""
+        """Unfreeze all core VAE parameters and restore training mode."""
         for param in self.core.parameters():
             param.requires_grad = True
 
+        # Restore core to training mode (will be controlled by parent module's train()/eval() calls)
+        self.core.train()
+
         log.info("Unfroze core VAE (all parameters now trainable)")
+        log.info("Core VAE restored to training mode")
 
     def get_trainable_params_info(self) -> Dict[str, int]:
         """Get information about trainable vs frozen parameters."""
@@ -2112,7 +2126,12 @@ class SeqVaeTeb(nn.Module):
         x_ph: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Full VAE forward pass via the core module."""
-        return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        if self.is_core_frozen():
+            # Run frozen core in inference mode for efficiency
+            with torch.no_grad():
+                return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        else:
+            return self.core.forward(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
 
     @classmethod
     def from_legacy_checkpoint(
@@ -2295,7 +2314,12 @@ class SeqVaeTeb(nn.Module):
         sample_z: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Encoder-only pass delegated to the core module."""
-        return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
+        if self.is_core_frozen():
+            # Run frozen core in inference mode for efficiency
+            with torch.no_grad():
+                return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
+        else:
+            return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
 
     # ------------------------
     # Forecasting helpers
@@ -2404,11 +2428,18 @@ class SeqVaeTeb(nn.Module):
         B_ctx, N, Lc, D = contexts.shape
         contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
 
+        # Latent forecaster forward pass (always with gradients when training)
         mu_latent_flat, logvar_latent_flat, aux = self.latent_forecaster(contexts_flat, horizon=H)
         z_future = mu_latent_flat.reshape(B_ctx, N, H, D)
         latent_logvar = logvar_latent_flat.reshape(B_ctx, N, H, D)
 
-        _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
+        # Decoder forward pass (no gradients if core is frozen)
+        if self.is_core_frozen():
+            with torch.no_grad():
+                _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
+        else:
+            _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
+
         mu_future = mu_flat.reshape(B_ctx, N, -1)
         logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
 
