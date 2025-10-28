@@ -189,7 +189,18 @@ class PlottingCallBack(Callback):
             plt.close('all')
             import gc
             gc.collect()
+
+            # Restore training mode
             pl_module.train()
+
+            # Preserve frozen core's eval mode if applicable
+            if hasattr(pl_module.model, 'is_core_frozen'):
+                model = pl_module.model
+                # Handle compiled models
+                orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                if orig_model.is_core_frozen():
+                    orig_model.core.eval()
+                    logger.debug("Preserved frozen core eval mode after plotting callback")
 
     def _plot_reconstruction_overview(
         self,
@@ -1519,10 +1530,18 @@ class LightSeqVaeTeb(L.LightningModule):
 
     def on_train_epoch_start(self):
         """Called at the beginning of each training epoch."""
+        # Preserve frozen core's eval mode after Lightning's automatic train() call
+        if hasattr(self.model, 'is_core_frozen'):
+            model = self.model
+            # Handle compiled models
+            orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+            if orig_model.is_core_frozen():
+                orig_model.core.eval()
+
         self.hparams.beta = self._calculate_beta()
         self.log('kld_beta', self.hparams.beta, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('hyperparams/beta', self.hparams.beta, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        
+
         # Log learning rate at the start of each epoch
         try:
             lr = self.optimizers().param_groups[0]['lr']
@@ -1531,7 +1550,7 @@ class LightSeqVaeTeb(L.LightningModule):
         except IndexError:
             # This can happen if the optimizer is not yet configured
             pass
-        
+
         # Validate hyperparameters are correctly set (first epoch only)
         if self.current_epoch == 0:
             self._validate_hyperparameters()
