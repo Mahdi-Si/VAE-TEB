@@ -179,7 +179,8 @@ def summarize_trajectory(
     k=5,
     method='changepoint',
     epsilon=None,
-    return_indices=False
+    return_indices=False,
+    precomputed_indices=None
 ):
     """
     Summarize latent trajectory in time by selecting k representative points.
@@ -196,6 +197,7 @@ def summarize_trajectory(
         epsilon: float, RDP tolerance parameter (only for method='rdp')
             If None, automatically tuned to get approximately k vertices
         return_indices: bool, if True return time indices of selected points
+        precomputed_indices: Optional iterable of changepoint indices to reuse when method='changepoint'.
 
     Returns:
         summarized_trajectory: np.ndarray of shape (k, n_dims) or (batch_size, k, n_dims)
@@ -211,13 +213,30 @@ def summarize_trajectory(
         batch_size = latent_trajectory.shape[0]
         results = []
         indices_list = []
+        precomputed_seq = None
+        precomputed_map = None
+        if precomputed_indices is not None:
+            if isinstance(precomputed_indices, dict):
+                precomputed_map = precomputed_indices
+            elif isinstance(precomputed_indices, (list, tuple)):
+                precomputed_seq = list(precomputed_indices)
+            else:
+                raise TypeError(
+                    "precomputed_indices must be a dict or list/tuple when latent_trajectory has a batch dimension."
+                )
         for b in range(batch_size):
+            sample_precomputed = None
+            if precomputed_map is not None:
+                sample_precomputed = precomputed_map.get(b)
+            elif precomputed_seq is not None and b < len(precomputed_seq):
+                sample_precomputed = precomputed_seq[b]
             result = summarize_trajectory(
                 latent_trajectory[b],
                 k=k,
                 method=method,
                 epsilon=epsilon,
-                return_indices=return_indices
+                return_indices=return_indices,
+                precomputed_indices=sample_precomputed
             )
             if return_indices:
                 results.append(result[0])
@@ -263,22 +282,38 @@ def summarize_trajectory(
 
     # K>1 methods: multiple keyframes
     if method == 'changepoint':
-        try:
-            import ruptures as rpt
-        except ImportError:
-            raise ImportError(
-                "ruptures library required for changepoint method. "
-                "Install with: pip install ruptures"
-            )
+        changepoint_indices = None
 
-        # Use Dynp (dynamic programming) algorithm which supports n_bkps parameter
-        # Pelt requires penalty parameter, so we use Dynp for exact k segments
-        algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(latent_trajectory)
-        # Find k segments (k-1 breakpoints)
-        result = algo.predict(n_bkps=k-1)
+        if precomputed_indices is not None:
+            changepoint_indices = np.asarray(precomputed_indices, dtype=int)
+        else:
+            try:
+                import ruptures as rpt
+            except ImportError:
+                raise ImportError(
+                    "ruptures library required for changepoint method. "
+                    "Install with: pip install ruptures"
+                )
 
-        # Extract segment boundaries (add start point)
-        segment_bounds = [0] + result
+            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(latent_trajectory)
+            result = algo.predict(n_bkps=k-1)
+            changepoint_indices = np.asarray(result, dtype=int)
+
+        if changepoint_indices is None:
+            changepoint_indices = np.asarray([], dtype=int)
+
+        changepoint_indices = np.asarray(
+            sorted(
+                {
+                    int(idx)
+                    for idx in np.asarray(changepoint_indices).tolist()
+                    if 0 < int(idx) < time_steps
+                }
+            ),
+            dtype=int
+        )
+
+        segment_bounds = [0] + changepoint_indices.tolist() + [time_steps]
 
         # For each segment, find the medoid
         keyframe_indices = []
@@ -427,6 +462,149 @@ def summarize_trajectory(
 # plotting methods
 # ------------------------------------------------------
 
+def _create_changepoint_detector(
+    changepoint_algo: str = 'dynp',
+    changepoint_model: Optional[str] = 'rbf',
+    changepoint_kwargs: Optional[Dict[str, Any]] = None
+):
+    """
+    Build a callable that detects changepoints using a ruptures algorithm.
+
+    Returns:
+        Callable[[np.ndarray, int], np.ndarray]: function mapping (data, max_bkps) to changepoint indices.
+    """
+    try:
+        import ruptures as rpt
+    except ImportError as exc:
+        raise ImportError(
+            "Changepoint detection requires the 'ruptures' package. Install with: pip install ruptures"
+        ) from exc
+
+    algo_name = (changepoint_algo or '').lower()
+    base_kwargs = dict(changepoint_kwargs or {})
+
+    algo_map = {
+        'dynp': rpt.Dynp,
+        'pelt': rpt.Pelt,
+        'binseg': rpt.Binseg,
+        'bottomup': rpt.BottomUp,
+        'window': rpt.Window,
+    }
+
+    if algo_name not in algo_map:
+        valid = ", ".join(sorted(algo_map))
+        raise ValueError(f"Unsupported changepoint_algo '{changepoint_algo}'. Valid options: {valid}")
+
+    if changepoint_model is not None and 'model' not in base_kwargs:
+        base_kwargs['model'] = changepoint_model
+    if algo_name == 'dynp':
+        base_kwargs.setdefault('min_size', 2)
+        base_kwargs.setdefault('jump', 1)
+
+    AlgoCls = algo_map[algo_name]
+
+    def _detect(sample_array: np.ndarray, max_bkps: int) -> np.ndarray:
+        if max_bkps <= 0:
+            return np.asarray([], dtype=int)
+
+        kwargs = dict(base_kwargs)
+        algo = AlgoCls(**kwargs)
+        algo = algo.fit(sample_array)
+        bkps = algo.predict(n_bkps=max_bkps)
+        return np.asarray(
+            sorted({int(idx) for idx in bkps if 0 < idx < sample_array.shape[0]}),
+            dtype=int
+        )
+
+    return _detect
+
+
+def detect_changepoints(
+    latent_sample,
+    n_changepoints: int = 5,
+    decimation_factor: int = 16,
+    raw_signal=None,
+    detect_raw: bool = True,
+    detector=None,
+    changepoint_algo: str = 'dynp',
+    changepoint_model: Optional[str] = 'rbf',
+    changepoint_kwargs: Optional[Dict[str, Any]] = None
+) -> Dict[str, np.ndarray]:
+    """
+    Detect changepoints for a single latent trajectory and optional raw signal.
+
+    Args:
+        latent_sample: (time_steps, latent_dim) array-like.
+        n_changepoints: Maximum number of changepoints to detect (>=0).
+        decimation_factor: Ratio between raw length and latent length for mapping indices.
+        raw_signal: Optional 1D array-like of the raw FHR signal corresponding to latent_sample.
+        detect_raw: Whether to detect changepoints directly on raw_signal (requires raw_signal).
+        detector: Optional callable returned by `_create_changepoint_detector`. If None, one will be created.
+        changepoint_algo / changepoint_model / changepoint_kwargs: Parameters for detector construction
+            when `detector` is None.
+
+    Returns:
+        Dict with keys:
+            - 'latent_changepoints': np.ndarray of changepoint indices in latent steps.
+            - 'raw_changepoints': np.ndarray of mapped indices in raw space (if raw_signal provided).
+            - 'raw_detected_changepoints': np.ndarray of indices detected directly in raw_signal
+              (empty if raw detection disabled or raw_signal not provided).
+    """
+
+    def _to_numpy(data):
+        if data is None:
+            return None
+        if torch.is_tensor(data):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
+
+    latent_np = _to_numpy(latent_sample)
+    if latent_np.ndim != 2:
+        raise ValueError(
+            f"latent_sample must have shape (time_steps, latent_dim); got {latent_np.shape}"
+        )
+
+    latent_time_steps = latent_np.shape[0]
+    max_bkps = min(max(0, int(n_changepoints)), max(0, latent_time_steps - 1))
+
+    detector_fn = detector
+    if detector_fn is None:
+        detector_fn = _create_changepoint_detector(
+            changepoint_algo=changepoint_algo,
+            changepoint_model=changepoint_model,
+            changepoint_kwargs=changepoint_kwargs
+        )
+
+    latent_cps = detector_fn(latent_np, max_bkps)
+
+    raw_cps_from_latent = np.asarray([], dtype=int)
+    raw_detected_cps = np.asarray([], dtype=int)
+
+    raw_np = _to_numpy(raw_signal)
+    if raw_np is not None:
+        raw_np = raw_np.reshape(-1)
+        raw_len = raw_np.shape[0]
+        if raw_len > 0:
+            raw_cps_from_latent = np.asarray(
+                [
+                    min(raw_len - 1, int(cp_idx * decimation_factor))
+                    for cp_idx in latent_cps
+                ],
+                dtype=int
+            )
+
+            if detect_raw:
+                per_sample_raw_bkps = min(max_bkps, max(0, raw_len - 1))
+                if per_sample_raw_bkps > 0:
+                    raw_detected_cps = detector_fn(raw_np.reshape(-1, 1), per_sample_raw_bkps)
+
+    return {
+        'latent_changepoints': np.asarray(latent_cps, dtype=int),
+        'raw_changepoints': raw_cps_from_latent,
+        'raw_detected_changepoints': raw_detected_cps,
+    }
+
+
 def plot_latent_changepoints_with_raw(
     latent_mean,
     fhr,
@@ -439,7 +617,11 @@ def plot_latent_changepoints_with_raw(
     figsize=(14, 4),
     max_samples=5,
     random_state=None,
-    show_colorbar=True
+    show_colorbar=True,
+    changepoint_algo='dynp',
+    changepoint_model='rbf',
+    changepoint_kwargs=None,
+    precomputed_changepoints=None
 ):
     """
     Visualize latent trajectories alongside raw signals with shared changepoints.
@@ -449,8 +631,7 @@ def plot_latent_changepoints_with_raw(
             Latent representation mean per batch.
         fhr: torch.Tensor or np.ndarray of shape (batch, time_steps * decimation_factor)
             Fetal heart rate signals corresponding to each latent trajectory.
-        up: torch.Tensor or np.ndarray of shape (batch, time_steps * decimation_factor)
-            Uterine pressure signals corresponding to each latent trajectory.
+        up: Ignored (kept for backward compatibility). Raw changepoint comparisons use FHR only.
         save_path: str, directory path where figures will be written.
         sample_ids: Optional sequence of identifiers (len == batch). Defaults to sequential indices.
         n_changepoints: int, number of changepoints to detect in the latent space (>=0).
@@ -460,25 +641,23 @@ def plot_latent_changepoints_with_raw(
         max_samples: int, maximum number of samples to visualize (randomly selected, default: 5).
         random_state: Optional int for reproducible sample selection.
         show_colorbar: bool, whether to attach a colorbar next to each latent plot.
+        changepoint_algo: str, ruptures algorithm name applied to latent & raw (e.g., 'dynp', 'pelt').
+        changepoint_model: str or None, model argument forwarded to ruptures (e.g., 'rbf', 'l2').
+        changepoint_kwargs: Optional dict, extra keyword arguments for the ruptures algorithm.
+        precomputed_changepoints: Optional dict or list/tuple containing per-sample changepoint
+            results (as returned by `detect_changepoints`). If provided, detections are reused.
 
     Returns:
         List[Dict[str, Any]] containing per-sample changepoint metadata for plotted samples with keys:
             - 'sample_id'
             - 'latent_changepoints' (np.ndarray of latent indices)
-            - 'raw_changepoints' (np.ndarray of raw indices)
+            - 'raw_changepoints' (np.ndarray of raw indices mapped from latent)
+            - 'raw_detected_changepoints' (np.ndarray of raw indices detected from raw signals)
 
     Notes:
-        - Changepoints are detected in latent space using ruptures Dynp segmentation.
-        - Raw changepoints are derived by multiplying latent indices by decimation_factor.
+        - Changepoints are detected in latent space and FHR space using the same ruptures settings.
+        - Raw changepoints mapped from latent are derived by multiplying latent indices by decimation_factor.
     """
-    try:
-        import ruptures as rpt
-    except ImportError as exc:
-        raise ImportError(
-            "plot_latent_changepoints_with_raw requires the 'ruptures' package. "
-            "Install with: pip install ruptures"
-        ) from exc
-
     def _to_numpy(data):
         if torch.is_tensor(data):
             return data.detach().cpu().numpy()
@@ -486,24 +665,39 @@ def plot_latent_changepoints_with_raw(
 
     latent_np = _to_numpy(latent_mean)
     fhr_np = _to_numpy(fhr)
-    up_np = _to_numpy(up)
+
+    detector_fn = _create_changepoint_detector(
+        changepoint_algo=changepoint_algo,
+        changepoint_model=changepoint_model,
+        changepoint_kwargs=changepoint_kwargs
+    )
 
     if latent_np.ndim != 3:
         raise ValueError(
             f"latent_mean must have shape (batch, time_steps, latent_dim); got {latent_np.shape}"
         )
-    if fhr_np.ndim != 2 or up_np.ndim != 2:
+    if fhr_np.ndim != 2:
         raise ValueError(
-            f"fhr and up must have shape (batch, raw_time_steps); got {fhr_np.shape}, {up_np.shape}"
+            f"fhr must have shape (batch, raw_time_steps); got {fhr_np.shape}"
         )
-    if latent_np.shape[0] != fhr_np.shape[0] or latent_np.shape[0] != up_np.shape[0]:
+    if latent_np.shape[0] != fhr_np.shape[0]:
         raise ValueError(
-            "latent_mean, fhr, and up must share the same batch dimension."
+            "latent_mean and fhr must share the same batch dimension."
         )
-    if fhr_np.shape != up_np.shape:
-        raise ValueError("fhr and up must have identical shapes.")
 
     batch_size, latent_time_steps, _ = latent_np.shape
+
+    precomputed_list: Optional[List[Dict[str, Any]]] = None
+    precomputed_dict: Optional[Dict[Any, Dict[str, Any]]] = None
+    if precomputed_changepoints is not None:
+        if isinstance(precomputed_changepoints, dict):
+            precomputed_dict = precomputed_changepoints
+        elif isinstance(precomputed_changepoints, (list, tuple)):
+            precomputed_list = list(precomputed_changepoints)
+        else:
+            raise TypeError(
+                "precomputed_changepoints must be a dict or list/tuple of per-sample results."
+            )
     if sample_ids is None:
         sample_ids = [f"sample_{idx}" for idx in range(batch_size)]
     if len(sample_ids) != batch_size:
@@ -534,10 +728,20 @@ def plot_latent_changepoints_with_raw(
 
     max_bkps = max(0, int(n_changepoints))
 
-    total_rows = selected_indices.size * 2
-    fig_height = figsize[1] * selected_indices.size
+    def _fetch_precomputed(idx: int, sample_label: str) -> Optional[Dict[str, Any]]:
+        entry = None
+        if precomputed_dict is not None:
+            entry = precomputed_dict.get(sample_label)
+            if entry is None:
+                entry = precomputed_dict.get(idx)
+        if entry is None and precomputed_list is not None and idx < len(precomputed_list):
+            entry = precomputed_list[idx]
+        return entry
+
+    total_rows = selected_indices.size * 3
+    fig_height = max(figsize[1] * selected_indices.size * 1.5, 3.5)
     n_cols = 2 if show_colorbar else 1
-    width_ratios = [20, 1] if show_colorbar else None
+    width_ratios = [25, 1] if show_colorbar else None
     fig = plt.figure(figsize=(figsize[0], fig_height))
     gs = GridSpec(
         total_rows,
@@ -545,25 +749,26 @@ def plot_latent_changepoints_with_raw(
         figure=fig,
         height_ratios=[1.0] * total_rows,
         width_ratios=width_ratios,
-        hspace=0.6,
-        wspace=0.2 if show_colorbar else 0.1
     )
 
     for idx_counter, batch_idx in enumerate(selected_indices):
         sample_id = str(sample_ids[batch_idx])
         latent_sample = latent_np[batch_idx]
         fhr_sample = fhr_np[batch_idx]
-        up_sample = up_np[batch_idx]
 
-        per_sample_max_bkps = min(max_bkps, max(0, latent_time_steps - 1))
-        if per_sample_max_bkps > 0:
-            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(latent_sample)
-            bkps = algo.predict(n_bkps=per_sample_max_bkps)
-            latent_cps = [int(idx) for idx in bkps if idx < latent_time_steps]
-        else:
-            latent_cps = []
+        cp_entry = _fetch_precomputed(batch_idx, sample_id)
+        if cp_entry is None:
+            cp_entry = detect_changepoints(
+                latent_sample=latent_sample,
+                n_changepoints=max_bkps,
+                decimation_factor=decimation_factor,
+                raw_signal=fhr_sample,
+                detect_raw=True,
+                detector=detector_fn
+            )
 
-        latent_cps = np.asarray(sorted({cp for cp in latent_cps if cp > 0}), dtype=int)
+        latent_cps = np.asarray(cp_entry.get('latent_changepoints', []), dtype=int)
+
         raw_expected_len = latent_time_steps * decimation_factor
         raw_len = fhr_sample.shape[0]
         if raw_len != raw_expected_len:
@@ -572,31 +777,42 @@ def plot_latent_changepoints_with_raw(
                 f"latent_time_steps * decimation_factor ({raw_expected_len})."
             )
 
-        raw_cps = np.asarray(
-            [
-                min(raw_len - 1, cp_idx * decimation_factor)
-                for cp_idx in latent_cps
-                if raw_len > 0
-            ],
+        raw_cps_from_latent = np.asarray(
+            cp_entry.get('raw_changepoints', []),
+            dtype=int
+        )
+        raw_detected_cps = np.asarray(
+            cp_entry.get('raw_detected_changepoints', []),
             dtype=int
         )
 
-        row_latent = 2 * idx_counter
-        row_raw = row_latent + 1
+        if raw_cps_from_latent.size == 0 and raw_len > 0 and latent_cps.size > 0:
+            raw_cps_from_latent = np.asarray(
+                [
+                    min(raw_len - 1, int(cp_idx * decimation_factor))
+                    for cp_idx in latent_cps
+                ],
+                dtype=int
+            )
+
+        row_latent = 3 * idx_counter
+        row_raw_latent = row_latent + 1
+        row_raw_detected = row_latent + 2
 
         if show_colorbar:
             latent_ax = fig.add_subplot(gs[row_latent, 0])
-            cax = fig.add_subplot(gs[row_latent, 1])
-            raw_ax = fig.add_subplot(gs[row_raw, 0], sharex=latent_ax)
-            fig.add_subplot(gs[row_raw, 1]).axis('off')
+            raw_latent_ax = fig.add_subplot(gs[row_raw_latent, 0], sharex=latent_ax)
+            raw_detected_ax = fig.add_subplot(gs[row_raw_detected, 0], sharex=latent_ax)
+            cax = fig.add_subplot(gs[row_latent:row_raw_detected+1, 1])
         else:
             latent_ax = fig.add_subplot(gs[row_latent, 0])
             cax = None
-            raw_ax = fig.add_subplot(gs[row_raw, 0], sharex=latent_ax)
+            raw_latent_ax = fig.add_subplot(gs[row_raw_latent, 0], sharex=latent_ax)
+            raw_detected_ax = fig.add_subplot(gs[row_raw_detected, 0], sharex=latent_ax)
 
         latent_dims = latent_sample.shape[1]
         x_max = max(raw_len - 1, 0)
-        extent = (0, x_max, 0, latent_dims)
+        extent = (0, x_max, -0.5, latent_dims - 0.5)
         im = latent_ax.imshow(
             latent_sample.T,
             aspect='auto',
@@ -606,7 +822,7 @@ def plot_latent_changepoints_with_raw(
             extent=extent
         )
         latent_ax.set_xlim(extent[0], extent[1])
-        latent_ax.set_ylim(0, latent_dims)
+        latent_ax.set_ylim(extent[2], extent[3])
         latent_ax.set_ylabel('Latent Dimension')
         latent_ax.set_title(f'Latent Representation (mean) - {sample_id}')
         latent_ax.grid(False)
@@ -619,7 +835,7 @@ def plot_latent_changepoints_with_raw(
             cbar = fig.colorbar(im, cax=cax)
             cbar.ax.set_ylabel('Activation', rotation=270, labelpad=12)
 
-        for raw_cp in raw_cps:
+        for raw_cp in raw_cps_from_latent:
             latent_ax.axvline(
                 raw_cp,
                 color='white',
@@ -629,19 +845,16 @@ def plot_latent_changepoints_with_raw(
             )
 
         time_axis = np.arange(raw_len)
-        raw_ax.plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
-        raw_ax.plot(time_axis, up_sample, label='UP', color='#2E86C1', linewidth=1.0)
-        raw_ax.set_xlabel('Raw Time Index')
-        raw_ax.set_ylabel('Normalized Amplitude')
-        raw_ax.set_title(f'Raw Signals (FHR & UP) - {sample_id}')
-        raw_ax.grid(True, alpha=0.3)
-        raw_ax.legend(loc='upper right')
-        raw_ax.set_xlim(extent[0], extent[1])
-        if idx_counter != selected_indices.size - 1:
-            raw_ax.tick_params(labelbottom=False)
+        raw_latent_ax.plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
+        raw_latent_ax.set_ylabel('Normalized Amplitude')
+        raw_latent_ax.set_title(f'FHR w/ Latent CPs - {sample_id}')
+        raw_latent_ax.grid(True, alpha=0.3)
+        raw_latent_ax.legend(loc='upper right')
+        raw_latent_ax.set_xlim(extent[0], extent[1])
+        raw_latent_ax.tick_params(labelbottom=False)
 
-        for raw_cp in raw_cps:
-            raw_ax.axvline(
+        for raw_cp in raw_cps_from_latent:
+            raw_latent_ax.axvline(
                 raw_cp,
                 color='black',
                 linestyle='--',
@@ -649,16 +862,60 @@ def plot_latent_changepoints_with_raw(
                 alpha=0.6
             )
 
+        raw_detected_ax.plot(time_axis, fhr_sample, label='FHR', color='#E74C3C', linewidth=1.2)
+        raw_detected_ax.set_ylabel('Normalized Amplitude')
+        raw_detected_ax.set_title(f'FHR w/ Raw CPs - {sample_id}')
+        raw_detected_ax.grid(True, alpha=0.3)
+        raw_detected_ax.set_xlim(extent[0], extent[1])
+        if idx_counter != selected_indices.size - 1:
+            raw_detected_ax.tick_params(labelbottom=False)
+        else:
+            raw_detected_ax.set_xlabel('Raw Time Index')
+
+        latent_line_added = False
+        raw_line_added = False
+        for raw_cp in raw_cps_from_latent:
+            raw_detected_ax.axvline(
+                raw_cp,
+                color='#7F8C8D',
+                linestyle='--',
+                linewidth=1.0,
+                alpha=0.6,
+                label='Latent CPs' if not latent_line_added else None
+            )
+            latent_line_added = True
+        for raw_cp in raw_detected_cps:
+            raw_detected_ax.axvline(
+                raw_cp,
+                color='#27AE60',
+                linestyle='-',
+                linewidth=1.2,
+                alpha=0.75,
+                label='Raw CPs' if not raw_line_added else None
+            )
+            raw_line_added = True
+
+        if latent_line_added or raw_line_added:
+            raw_detected_ax.legend(loc='upper right')
+
         results.append(
             {
                 'sample_id': sample_id,
                 'latent_changepoints': latent_cps,
-                'raw_changepoints': raw_cps
+                'raw_changepoints': raw_cps_from_latent,
+                'raw_detected_changepoints': raw_detected_cps
             }
         )
 
-    fig.suptitle('Latent Trajectory Changepoints (sampled)', fontsize=16)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.suptitle('Latent vs Raw Changepoints (sampled)', fontsize=14, y=0.995)
+    fig.subplots_adjust(
+        top=0.92,
+        bottom=0.07,
+        left=0.08,
+        right=0.98,
+        hspace=0.3,
+        wspace=0.12 if show_colorbar else 0.05
+    )
 
     selected_labels = "_".join([str(sample_ids[idx]) for idx in selected_indices])
     selected_labels = selected_labels.replace(os.sep, "-")
@@ -669,10 +926,335 @@ def plot_latent_changepoints_with_raw(
         save_path,
         f'latent_raw_changepoints_samples_{selected_labels}.png'
     )
-    fig.savefig(figure_path, dpi=150)
+    fig.savefig(figure_path, dpi=180, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
     return results
+
+
+def summarize_latent_segments(
+    latent_mean,
+    epoch=None,
+    sample_ids: Optional[Sequence[Any]] = None,
+    n_changepoints: int = 5,
+    decimation_factor: int = 16,
+    raw_sample_rate_hz: float = 4.0,
+    changepoint_algo: str = 'dynp',
+    changepoint_model: Optional[str] = 'rbf',
+    changepoint_kwargs: Optional[Dict[str, Any]] = None,
+    precomputed_changepoints: Optional[Any] = None
+) -> List[Dict[str, Any]]:
+    """
+    Compute per-segment latent statistics after changepoint detection.
+
+    Args:
+        latent_mean: torch.Tensor or np.ndarray of shape (batch, time_steps, latent_dim).
+        epoch: Optional torch.Tensor or np.ndarray of shape (batch,) giving raw-sample start
+            indices relative to delivery (see dataset docs). Used to express segment timing.
+        sample_ids: Optional identifiers per sample (len == batch). Defaults to sequential indices.
+        n_changepoints: Maximum number of changepoints to detect per sample (>=0).
+        decimation_factor: Ratio between raw signal length and latent length (default: 16).
+        raw_sample_rate_hz: Raw sampling rate in Hz (default: 4.0).
+        changepoint_algo: ruptures algorithm name (e.g., 'dynp', 'pelt').
+        changepoint_model: Model argument passed to ruptures (e.g., 'rbf', 'l2'); set None to skip.
+        changepoint_kwargs: Extra kwargs forwarded to the ruptures algorithm constructor.
+        precomputed_changepoints: Optional dict/list containing per-sample changepoint dictionaries
+            (as returned by `detect_changepoints`). When supplied, latent changepoints are reused.
+
+    Returns:
+        List of dictionaries, one per sample, each containing:
+            - 'sample_id'
+            - 'epoch_raw_index'
+            - 'latent_changepoints'
+            - 'segments': list of segment-level statistics dictionaries with keys:
+                * 'segment_index'
+                * 'start_step', 'end_step', 'length_steps'
+                * 'duration_seconds'
+                * 'start_minutes_rel_delivery', 'end_minutes_rel_delivery' (if epoch provided)
+                * 'mean_vector', 'variance_vector'
+                * 'dominant_latent_dim'
+                * 'mean_velocity', 'mean_speed', 'direction_unit_vector'
+                * 'mean_activation_norm'
+    """
+
+    def _to_numpy(data):
+        if data is None:
+            return None
+        if torch.is_tensor(data):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
+
+    latent_np = _to_numpy(latent_mean)
+    epoch_np = _to_numpy(epoch)
+
+    if latent_np.ndim != 3:
+        raise ValueError(
+            f"latent_mean must have shape (batch, time_steps, latent_dim); got {latent_np.shape}"
+        )
+
+    batch_size, latent_time_steps, latent_dim = latent_np.shape
+
+    if sample_ids is None:
+        sample_ids = [f"sample_{idx}" for idx in range(batch_size)]
+    if len(sample_ids) != batch_size:
+        raise ValueError("sample_ids length must match batch size.")
+
+    if epoch_np is not None:
+        epoch_np = epoch_np.astype(np.float64)
+        if epoch_np.ndim != 1 or epoch_np.shape[0] != batch_size:
+            raise ValueError("epoch must be 1D with length equal to batch size.")
+
+    precomputed_list: Optional[List[Dict[str, Any]]] = None
+    precomputed_dict: Optional[Dict[Any, Dict[str, Any]]] = None
+    if precomputed_changepoints is not None:
+        if isinstance(precomputed_changepoints, dict):
+            precomputed_dict = precomputed_changepoints
+        elif isinstance(precomputed_changepoints, (list, tuple)):
+            precomputed_list = list(precomputed_changepoints)
+        else:
+            raise TypeError(
+                "precomputed_changepoints must be a dict or list/tuple of per-sample results."
+            )
+
+    detector_fn = None
+
+    seconds_per_step = None
+    minutes_scale = None
+    if raw_sample_rate_hz and decimation_factor:
+        seconds_per_step = decimation_factor / float(raw_sample_rate_hz)
+        minutes_scale = raw_sample_rate_hz * 60.0
+
+    max_bkps = max(0, int(n_changepoints))
+    results: List[Dict[str, Any]] = []
+
+    def _fetch_precomputed(idx: int, sample_label: str) -> Optional[Dict[str, Any]]:
+        entry = None
+        if precomputed_dict is not None:
+            entry = precomputed_dict.get(sample_label)
+            if entry is None:
+                entry = precomputed_dict.get(idx)
+        if entry is None and precomputed_list is not None and idx < len(precomputed_list):
+            entry = precomputed_list[idx]
+        return entry
+
+    for batch_idx in range(batch_size):
+        sample_id = str(sample_ids[batch_idx])
+        latent_sample = latent_np[batch_idx]
+        cp_entry = _fetch_precomputed(batch_idx, sample_id)
+        if cp_entry is None:
+            if detector_fn is None:
+                detector_fn = _create_changepoint_detector(
+                    changepoint_algo=changepoint_algo,
+                    changepoint_model=changepoint_model,
+                    changepoint_kwargs=changepoint_kwargs
+                )
+            cp_entry = detect_changepoints(
+                latent_sample=latent_sample,
+                n_changepoints=max_bkps,
+                decimation_factor=decimation_factor,
+                raw_signal=None,
+                detect_raw=False,
+                detector=detector_fn
+            )
+
+        latent_cps = np.asarray(cp_entry.get('latent_changepoints', []), dtype=int)
+
+        segment_boundaries = np.concatenate(([0], latent_cps, [latent_time_steps]))
+        epoch_value = None if epoch_np is None else float(epoch_np[batch_idx])
+        segments: List[Dict[str, Any]] = []
+
+        for seg_idx in range(len(segment_boundaries) - 1):
+            start_step = int(segment_boundaries[seg_idx])
+            end_step = int(segment_boundaries[seg_idx + 1])
+            length_steps = end_step - start_step
+            if length_steps <= 0:
+                continue
+
+            segment_values = latent_sample[start_step:end_step]
+            segment_mean = segment_values.mean(axis=0)
+            if length_steps > 1:
+                segment_var = segment_values.var(axis=0, ddof=1)
+                velocity = np.diff(segment_values, axis=0)
+                mean_velocity = velocity.mean(axis=0)
+            else:
+                segment_var = np.zeros(latent_dim, dtype=np.float64)
+                mean_velocity = np.zeros(latent_dim, dtype=np.float64)
+
+            mean_speed = float(np.linalg.norm(mean_velocity))
+            if mean_speed > 0:
+                direction_unit_vector = mean_velocity / mean_speed
+            else:
+                direction_unit_vector = np.zeros_like(mean_velocity)
+
+            dominant_dim = int(np.argmax(segment_var)) if segment_var.size else None
+            mean_activation_norm = float(np.mean(np.linalg.norm(segment_values, axis=1)))
+
+            duration_seconds = None
+            if seconds_per_step is not None:
+                duration_seconds = float(length_steps * seconds_per_step)
+
+            start_minutes = end_minutes = None
+            if epoch_value is not None and minutes_scale:
+                raw_start = epoch_value + start_step * decimation_factor
+                raw_end = epoch_value + end_step * decimation_factor
+                start_minutes = float(raw_start / minutes_scale)
+                end_minutes = float(raw_end / minutes_scale)
+
+            segments.append(
+                {
+                    'segment_index': seg_idx,
+                    'start_step': start_step,
+                    'end_step': end_step,
+                    'length_steps': length_steps,
+                    'duration_seconds': duration_seconds,
+                    'start_minutes_rel_delivery': start_minutes,
+                    'end_minutes_rel_delivery': end_minutes,
+                    'mean_vector': segment_mean,
+                    'variance_vector': segment_var,
+                    'dominant_latent_dim': dominant_dim,
+                    'mean_velocity': mean_velocity,
+                    'mean_speed': mean_speed,
+                    'direction_unit_vector': direction_unit_vector,
+                    'mean_activation_norm': mean_activation_norm,
+                }
+            )
+
+        results.append(
+            {
+                'sample_id': sample_id,
+                'epoch_raw_index': epoch_value,
+                'latent_changepoints': latent_cps,
+                'segments': segments,
+            }
+        )
+
+    return results
+
+
+def plot_segment_statistics(
+    segment_stats: Sequence[Dict[str, Any]],
+    save_path: str,
+    csv_filename: str = "segment_stats.csv"
+) -> Optional[pd.DataFrame]:
+    """
+    Visualize aggregated latent segment statistics.
+
+    Args:
+        segment_stats: Iterable of per-sample dictionaries produced by summarize_latent_segments.
+        save_path: Directory where figures (and optional CSV) will be written.
+        csv_filename: Name of the CSV file to export flattened segment statistics.
+
+    Returns:
+        pandas.DataFrame containing flattened segment statistics (or None if no data).
+    """
+    if not segment_stats:
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for entry in segment_stats:
+        sample_id = entry.get('sample_id')
+        epoch_raw_index = entry.get('epoch_raw_index')
+        for seg in entry.get('segments', []):
+            row = {
+                'sample_id': sample_id,
+                'epoch_raw_index': epoch_raw_index,
+                'segment_index': seg.get('segment_index'),
+                'start_step': seg.get('start_step'),
+                'end_step': seg.get('end_step'),
+                'length_steps': seg.get('length_steps'),
+                'duration_seconds': seg.get('duration_seconds'),
+                'start_minutes_rel_delivery': seg.get('start_minutes_rel_delivery'),
+                'end_minutes_rel_delivery': seg.get('end_minutes_rel_delivery'),
+                'dominant_latent_dim': seg.get('dominant_latent_dim'),
+                'mean_speed': seg.get('mean_speed'),
+                'mean_activation_norm': seg.get('mean_activation_norm'),
+            }
+            rows.append(row)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+
+    os.makedirs(save_path, exist_ok=True)
+    csv_path = os.path.join(save_path, csv_filename)
+    df.to_csv(csv_path, index=False)
+
+    # Histogram of segment durations (minutes)
+    durations = df['duration_seconds'].dropna()
+    if not durations.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        durations_minutes = durations / 60.0
+        ax.hist(durations_minutes, bins=20, color='#2E86C1', alpha=0.75, edgecolor='black')
+        ax.set_title('Segment Duration Distribution')
+        ax.set_xlabel('Duration (minutes)')
+        ax.set_ylabel('Count')
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, 'segment_duration_hist.png'), dpi=160)
+        plt.close(fig)
+
+    # Scatter: start time relative to delivery vs mean speed
+    start_speed = df[['start_minutes_rel_delivery', 'mean_speed']].dropna()
+    if not start_speed.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.scatter(
+            start_speed['start_minutes_rel_delivery'],
+            start_speed['mean_speed'],
+            s=25,
+            c='#E74C3C',
+            alpha=0.7,
+            edgecolors='black',
+            linewidths=0.4
+        )
+        ax.set_title('Mean Latent Speed vs Start Time')
+        ax.set_xlabel('Start Minutes Relative to Delivery')
+        ax.set_ylabel('Mean Latent Speed (L2 norm)')
+        ax.axvline(0.0, color='gray', linestyle='--', linewidth=1, alpha=0.6)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, 'mean_speed_vs_start.png'), dpi=160)
+        plt.close(fig)
+
+    # Bar chart: dominant latent dimension counts
+    dominant_dims = df['dominant_latent_dim'].dropna()
+    if not dominant_dims.empty:
+        dominant_counts = (
+            dominant_dims.astype(int)
+            .value_counts()
+            .sort_index()
+        )
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(dominant_counts.index.astype(str), dominant_counts.values, color='#27AE60', alpha=0.8)
+        ax.set_title('Dominant Latent Dimension Frequency')
+        ax.set_xlabel('Latent Dimension Index')
+        ax.set_ylabel('Segment Count')
+        ax.grid(True, axis='y', alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, 'dominant_latent_dim_counts.png'), dpi=160)
+        plt.close(fig)
+
+    # Bar chart: segments per sample
+    segments_per_sample = df.groupby('sample_id')['segment_index'].count()
+    if not segments_per_sample.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        segments_per_sample.sort_values(ascending=False).plot(
+            kind='bar',
+            ax=ax,
+            color='#9B59B6',
+            alpha=0.8
+        )
+        ax.set_title('Segments per Sample')
+        ax.set_xlabel('Sample ID')
+        ax.set_ylabel('Number of Segments')
+        ax.tick_params(axis='x', rotation=45, ha='right')
+        ax.grid(True, axis='y', alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, 'segments_per_sample.png'), dpi=160)
+        plt.close(fig)
+
+    return df
+
 
 def plot_complete_fhr_up_timeline(
     fhr,
@@ -1627,6 +2209,25 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
         all_batches = list(test_dataloader)
         selected_batches = random.sample(all_batches, min(10, len(all_batches)))
 
+        changepoint_cfg = config_latent or {}
+        n_changepoints = int(changepoint_cfg.get('n_changepoints', 5))
+        default_decimation = int(changepoint_cfg.get('decimation_factor', 16))
+        raw_sample_rate_hz = float(changepoint_cfg.get('raw_sample_rate_hz', 4.0))
+        changepoint_algo = changepoint_cfg.get('changepoint_algo', 'dynp')
+        changepoint_model = changepoint_cfg.get('changepoint_model', 'rbf')
+        changepoint_kwargs = changepoint_cfg.get('changepoint_kwargs', {}) or {}
+        if not isinstance(changepoint_kwargs, dict):
+            changepoint_kwargs = {}
+
+        changepoint_detector = _create_changepoint_detector(
+            changepoint_algo=changepoint_algo,
+            changepoint_model=changepoint_model,
+            changepoint_kwargs=copy.deepcopy(changepoint_kwargs)
+        )
+
+        all_changepoint_results: List[Dict[str, Any]] = []
+        all_segment_stats: List[Dict[str, Any]] = []
+
         with torch.inference_mode():
             for batch in selected_batches:
                 fhr_st = batch.fhr_st.to(self.device)
@@ -1635,7 +2236,7 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 fhr = batch.fhr.to(self.device)
                 up = batch.up.to(self.device)
                 epoch = batch.epoch  # Shape (Batch_size,)
-                guid_in_batch = batch['guid'][0]
+                guid_in_batch = str(batch['guid'][0])
 
                 # Sort all batch data by epoch values
                 sort_indices = torch.argsort(epoch)
@@ -1645,6 +2246,9 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 fhr = fhr[sort_indices]  # shape: (Batch, time_step*16)
                 up = up[sort_indices]  # shape: (Batch, time_step*16)
                 epoch = epoch[sort_indices]
+                epoch_cpu = epoch.detach().cpu()
+
+                sample_ids = [f"{guid_in_batch}_{idx:02d}" for idx in range(len(epoch))]
 
                 fhr_up_plot_path = os.path.join(save_dir, "fhr-up-signals")
                 # plot_complete_fhr_up_timeline(
@@ -1678,12 +2282,54 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                     return_reducer=False
                 )
 
+                effective_decimation = max(
+                    1,
+                    int(fhr.shape[1] // max(1, reduced_latent_mean.shape[1]))
+                )
+                if effective_decimation <= 0:
+                    effective_decimation = default_decimation
+
+                changepoint_results: List[Dict[str, Any]] = []
+                for sample_idx in range(reduced_latent_mean.shape[0]):
+                    cp_info = detect_changepoints(
+                        latent_sample=reduced_latent_mean[sample_idx],
+                        n_changepoints=n_changepoints,
+                        decimation_factor=effective_decimation,
+                        raw_signal=fhr[sample_idx],
+                        detect_raw=True,
+                        detector=changepoint_detector
+                    )
+                    cp_info['sample_id'] = sample_ids[sample_idx]
+                    changepoint_results.append(cp_info)
+                all_changepoint_results.extend(changepoint_results)
+
                 plot_latent_changepoints_with_raw(
                     fhr=fhr,
                     up=up,
                     latent_mean=reduced_latent_mean,
                     save_path=fhr_up_plot_path,
+                    sample_ids=sample_ids,
+                    n_changepoints=n_changepoints,
+                    decimation_factor=effective_decimation,
+                    changepoint_algo=changepoint_algo,
+                    changepoint_model=changepoint_model,
+                    changepoint_kwargs=changepoint_kwargs,
+                    precomputed_changepoints=changepoint_results
                 )
+
+                segment_stats = summarize_latent_segments(
+                    latent_mean=reduced_latent_mean,
+                    epoch=epoch_cpu,
+                    sample_ids=sample_ids,
+                    n_changepoints=n_changepoints,
+                    decimation_factor=effective_decimation,
+                    raw_sample_rate_hz=raw_sample_rate_hz,
+                    changepoint_algo=changepoint_algo,
+                    changepoint_model=changepoint_model,
+                    changepoint_kwargs=changepoint_kwargs,
+                    precomputed_changepoints=changepoint_results
+                )
+                all_segment_stats.extend(segment_stats)
                 
                 # epoch_laten_trajectory_path = os.path.join(save_dir, "per_epoch_trajectory")
                 # plot_latent_trajectory(
@@ -1772,9 +2418,16 @@ class LatentTrajectoryGraph(SeqVAEGraphModelTest):
                 #     arrow_scale=0.3,
                 #     save_data=True
                 # )
-                
 
+        segment_stats_dir = os.path.join(save_dir, "segment_statistics")
+        segment_stats_table = plot_segment_statistics(all_segment_stats, segment_stats_dir)
 
+        return {
+            'changepoints': all_changepoint_results,
+            'segment_stats': all_segment_stats,
+            'segment_stats_table': segment_stats_table,
+            'segment_stats_path': segment_stats_dir,
+        }
 
 def main():
     np.random.seed(42)
