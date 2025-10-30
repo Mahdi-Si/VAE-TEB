@@ -1474,10 +1474,10 @@ class LatentForecaster(nn.Module):
     def __init__(
         self,
         latent_dim: int = 16,
-        hidden_dim: int = 256,
+        hidden_dim: int = 128,
         min_logvar: float = -7.0,
         max_logvar: float = 4.0,
-        tcn_depth: int = 8,
+        tcn_depth: int = 6,
         kernel_size: int = 3,
         max_horizon: int = 30,
         dropout: float = 0.1,
@@ -1497,7 +1497,7 @@ class LatentForecaster(nn.Module):
 
         self.input_projection = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 6),
+            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 3),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
@@ -1510,7 +1510,7 @@ class LatentForecaster(nn.Module):
             block = CausalMultiChannelConvBlock(
                 in_channels=hidden_dim,
                 out_channels=hidden_dim,
-                groups=1,
+                groups=min(4, hidden_dim),
                 filter_size=kernel_size,
                 dilation=dilation,
                 activation=nn.GELU,
@@ -1522,7 +1522,7 @@ class LatentForecaster(nn.Module):
 
         self.feature_refinement = ResidualMLP(
             input_dim=hidden_dim,
-            hidden_dims=geometric_schedule(hidden_dim, hidden_dim, 4),
+            hidden_dims=geometric_schedule(hidden_dim, hidden_dim, 2),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
@@ -1532,13 +1532,18 @@ class LatentForecaster(nn.Module):
         self.summary_projection = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.GELU(),
+            nn.LayerNorm(hidden_dim),
         )
-        self.horizon_attention = nn.Linear(hidden_dim, max_horizon)
+        self.horizon_attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, max_horizon),
+        )
         self.horizon_embedding = nn.Parameter(torch.randn(max_horizon, hidden_dim) * 0.02)
 
         self.step_mlp = ResidualMLP(
             input_dim=2 * hidden_dim,
-            hidden_dims=(hidden_dim, hidden_dim),
+            hidden_dims=(hidden_dim,),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
@@ -1683,7 +1688,7 @@ class SeqVaeTeb(nn.Module):
         lstm_num_layers: int = 5,
         # Forecasting params
         horizon_len: int = 30,
-        forecaster_hidden_dim: int = 256,
+        forecaster_hidden_dim: int = 128,
         forecaster_min_logvar: float = -7.0,
         forecaster_max_logvar: float = 4.0,
         forecaster_dropout: float = 0.1,
