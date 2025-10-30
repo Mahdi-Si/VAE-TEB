@@ -1,6 +1,6 @@
 general_config:
   tag: latent_test
-  cuda_devices: [7]
+  cuda_devices:
   train_classifier: False
   lr: 0.000001
   lr_milestone: [100, 200]
@@ -25,7 +25,32 @@ model_config:
     num_RNN_layers: 5
     kld_beta: 0.006
     freeze_seqvae: False
+    freeze_core_model: False    # Whether to freeze core VAE (encoders+decoder) and only train latent forecaster
     zero_source: True
+    context_len: 75             # Latent forecaster context length (decimated steps)
+    horizon_len: 30             # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
+
+    # Beta Scheduling Configuration
+    beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0            # Starting beta value for annealing schedules
+    beta_end: 1.0              # Final beta value for TEB
+    beta_anneal_epochs: 50     # Number of epochs for linear annealing
+    beta_cycle_len: 1000       # Cycle length for cyclic annealing
+    beta_const_val: 0.006      # Constant beta value when schedule='constant' (matches kld_beta)
+
+    # TCN Latent Forecaster Configuration
+    enable_forecaster: false           # Set to true to enable latent forecasting
+    forecast_weight: 0.8               # Weight on raw forecast NLL auxiliary loss
+    latent_nll_weight: 0.1             # Weight on latent-space Gaussian NLL
+    predictive_kl_weight: 0.0          # Weight on predictive KL between forecaster and encoder posterior
+    stability_weight: 0.001            # Weight on LGSSM stability regularizer (legacy compatibility)
+    predictive_horizon: null           # Override horizon for auxiliary loss (defaults to horizon_len)
+    predictive_context_len: null       # Override context length (defaults to context_len)
+    predictive_max_anchors: 0          # Max anchors (0 = use all) for auxiliary losses
+    max_predictive_contexts_per_batch: 4096  # Safety cap on total contexts processed per batch
+    log_forecast_metrics: true         # Log aggregated forecast metrics during validation
+    monitor_metric: "val/total_loss"   # Metric to monitor for checkpoints / early stopping
+    monitor_mode: "min"                # Direction for monitored metric
 
   seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
   base_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
@@ -37,12 +62,13 @@ inv_scattering_model:
   train_inv_st: False
 
 folders_config:
-  out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
+  out_dir_base: C:\Users\mahdi\Desktop\McGill\data\latent_analysis\outputs
 
 dataset_config:
     vae_train_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/complete_segments/pre_training_dataset/acidosis_cs.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\latent_analysis\hie_cs.hdf5
+      # - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_no_cs.hdf5
+      # - /data1/fetal-heart-tracing/HDF5_Datasets/complete_segments/pre_training_dataset/acidosis_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/train_dataset_no_cs.hdf5
@@ -51,8 +77,9 @@ dataset_config:
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/pre_training_dataset/test_dataset_no_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/acidosis_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdfs5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/complete_segments/pre_training_dataset/acidosis_cs.hdf5
-    stat_path: /data/deid/isilon/MS_model/Q4_stats/stats.hdf5
+      # - /data1/fetal-heart-tracing/HDF5_Datasets/complete_segments/pre_training_dataset/acidosis_cs.hdf5
+      - C:\Users\mahdi\Desktop\McGill\data\latent_analysis\hie_cs.hdf5
+    stat_path: C:\Users\mahdi\Desktop\McGill\data\latent_analysis\stats.hdf5
     dataloader_config:
       num_workers: 64
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
@@ -72,7 +99,7 @@ seqvae_testing:
   test_data_dir:
   test_data_selected_dir:
   HIE_test_data_dir:
-  test_checkpoint_path: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
+  test_checkpoint_path: C:\Users\mahdi\Desktop\McGill\data\latent_analysis\base-model-best-epoch=357.ckpt
 latent_analysis:
   device: null
   which: mu_post
