@@ -1591,7 +1591,10 @@ class LatentForecaster(nn.Module):
         summary = self.summary_projection(torch.cat([last_feat, mean_feat], dim=-1))
 
         attn_logits = self.horizon_attention(x)[:, :, :horizon]
-        attn_logits = attn_logits.masked_fill(~context_mask.unsqueeze(-1), -1e9)
+        mask = ~context_mask.unsqueeze(-1)
+        if mask.any():
+            fill_value = torch.finfo(attn_logits.dtype).min
+            attn_logits = attn_logits.masked_fill(mask, fill_value)
         attn_weights = torch.softmax(attn_logits, dim=1)
         aggregated = torch.einsum('blc,blh->bhc', x, attn_weights)
         aggregated = aggregated + self.horizon_embedding[:horizon].unsqueeze(0)
