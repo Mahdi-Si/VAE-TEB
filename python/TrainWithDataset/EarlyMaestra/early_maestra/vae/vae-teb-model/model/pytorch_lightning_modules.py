@@ -1412,93 +1412,50 @@ class LightSeqVaeTeb(L.LightningModule):
         beta_anneal_epochs: int = 100,
         beta_cycle_len: int = 1000,
         beta_const_val: float = 1.0,
-        predictive_weight: float = 0.0,
-        latent_consistency_weight: float = 0.0,
         predictive_horizon: Optional[int] = None,
-        predictive_context_len: Optional[int] = None,
-        log_forecast_metrics: bool = True,
         predictive_max_anchors: Optional[int] = None,
-        *,
-        forecast_weight: Optional[float] = None,
         latent_nll_weight: Optional[float] = None,
-        predictive_kl_weight: float = 0.0,
-        stability_weight: float = 0.0,
-        ):
-        """
-        Args:
-            seqvae_teb_model: An instance of the SeqVaeTeb model.
-            lr: Learning rate.
-            lr_milestones: Epochs at which to decay the learning rate.
-            beta_schedule: Type of beta annealing schedule. Options: 'constant', 'linear', 'cyclic'.
-            beta_start: Starting value for beta in annealing schedules.
-            beta_end: Final value for beta in annealing schedules.
-            beta_anneal_epochs: Number of epochs for linear annealing.
-            beta_cycle_len: Length of a cycle for cyclic annealing.
-            beta_const_val: Constant value for beta if schedule is 'constant'.
-            predictive_weight: (legacy) raw forecasting loss weight.
-            latent_consistency_weight: (legacy) latent consistency weight.
-            predictive_horizon: Forecast horizon (decimated steps) used for auxiliary objectives.
-            predictive_context_len: Context length supplied to the latent forecaster (decimated steps).
-            log_forecast_metrics: Whether to compute/log aggregated forecast metrics during validation.
-            predictive_max_anchors: Optional cap on anchors sampled for auxiliary loss to control memory.
-            forecast_weight: Weight for raw forecast NLL (defaults to predictive_weight).
-            latent_nll_weight: Weight for latent Gaussian NLL (defaults to latent_consistency_weight).
-            predictive_kl_weight: Weight for KL between LGSSM predictions and posterior latents.
-            stability_weight: Weight for the LGSSM stability regulariser.
-        """
+        latent_discount_gamma: float = 1.0,
+        log_forecast_metrics: bool = True,
+        enable_forecaster: Optional[bool] = None,
+    ):
+        """Lightning wrapper for SeqVaeTeb with optional latent forecasting losses."""
         super().__init__()
 
-        # Default predictive settings to model attributes when not provided
-        model_horizon = getattr(seqvae_teb_model, "horizon_len", None)
-        model_context = getattr(seqvae_teb_model, "context_len", None)
-
+        model_horizon = getattr(seqvae_teb_model, 'horizon_len', None)
         if predictive_horizon is None:
             predictive_horizon = model_horizon if model_horizon is not None else 1
-        if predictive_context_len is None:
-            if model_context is not None:
-                predictive_context_len = model_context
-            else:
-                predictive_context_len = max(predictive_horizon, 1)
         if predictive_max_anchors is None:
             predictive_max_anchors = 0
-
-        if forecast_weight is None:
-            forecast_weight = predictive_weight
         if latent_nll_weight is None:
-            latent_nll_weight = latent_consistency_weight
+            latent_nll_weight = 0.0
 
-        # Using save_hyperparameters to automatically save arguments to self.hparams
+        forecaster_available = getattr(seqvae_teb_model, 'has_forecaster', lambda: False)()
+        if enable_forecaster is None:
+            enable_forecaster = forecaster_available
+
         self.save_hyperparameters(ignore=['seqvae_teb_model'])
         self.model = seqvae_teb_model
-        self._forecaster_enabled = getattr(self.model, "has_forecaster", lambda: True)()
+        self._forecaster_enabled = bool(enable_forecaster and forecaster_available)
         self.hparams.enable_forecaster = self._forecaster_enabled
         if not self._forecaster_enabled:
-            self.hparams.predictive_weight = 0.0
-            self.hparams.latent_consistency_weight = 0.0
-            self.hparams.forecast_weight = 0.0
             self.hparams.latent_nll_weight = 0.0
-            self.hparams.predictive_kl_weight = 0.0
-            self.hparams.stability_weight = 0.0
             self.hparams.log_forecast_metrics = False
 
-        # Store reference to original model before compilation
         self._orig_model = self.model
 
-        # Only compile if not already compiled to avoid double compilation
         if not is_compiled_module(self.model):
             self.model, self._model_compiled = ensure_compiled_module(
                 self.model,
-                module_name="SeqVaeTeb Lightning wrapper",
+                module_name='SeqVaeTeb Lightning wrapper',
             )
-            # After compilation, update the reference to the original uncompiled model
             if self._model_compiled and hasattr(self.model, '_orig_mod'):
                 self._orig_model = self.model._orig_mod
         else:
             self._model_compiled = True
-            # If already compiled, extract the original model
             if hasattr(self.model, '_orig_mod'):
                 self._orig_model = self.model._orig_mod
-            logger.info("[LightSeqVaeTeb] Model already compiled, skipping compilation")
+            logger.info('[LightSeqVaeTeb] Model already compiled, skipping compilation')
 
     def forward(self, y_st, y_ph, x_ph):
         """Forward pass through the SeqVaeTeb model."""
@@ -1575,52 +1532,38 @@ class LightSeqVaeTeb(L.LightningModule):
         metrics: Dict[str, torch.Tensor] = {}
 
         horizon = max(int(self.hparams.predictive_horizon), 1)
-        context_len = max(int(self.hparams.predictive_context_len), 1)
 
-        # Import SeqVaeTeb class for static method access
         from vae_teb_model import SeqVaeTeb
 
-        # Get the uncompiled model instance by unwrapping if necessary
         model = self.model
         if hasattr(model, '_orig_mod'):
-            # torch.compile wraps the module with _orig_mod
             orig_model = model._orig_mod
         else:
             orig_model = model
 
-        # Verify we have the right type
-        if not isinstance(orig_model, SeqVaeTeb):
-            # Fallback to self._orig_model if set
-            if hasattr(self, '_orig_model') and isinstance(self._orig_model, SeqVaeTeb):
-                orig_model = self._orig_model
-            else:
-                logger.warning("Could not access uncompiled SeqVaeTeb model for forecast metrics")
-                return metrics
+        if not isinstance(orig_model, SeqVaeTeb) or not orig_model.has_forecaster():
+            return metrics
 
         stride = orig_model.decimation_factor
-
-        # Ensure requested horizons fit within available sequence length
         horizon = min(horizon, mu_post.size(1))
-        context_len = min(context_len, mu_post.size(1))
-
-        # Use static method directly from class
-        anchors = SeqVaeTeb.anchor_range(mu_post.size(1), context_len, horizon)
+        anchors = SeqVaeTeb.anchor_range(mu_post.size(1), horizon)
         if anchors.numel() == 0:
             return metrics
 
         anchors = anchors.to(mu_post.device)
-
         max_anchors = int(getattr(self.hparams, 'predictive_max_anchors', 0) or 0)
         if max_anchors > 0 and anchors.numel() > max_anchors:
             perm = torch.randperm(anchors.numel(), device=anchors.device)
             anchors = anchors[perm[:max_anchors]]
 
-        # Use original uncompiled model for helper methods that aren't in the compiled interface
-        contexts = orig_model._gather_context(mu_post, anchors, context_len)  # (B, N, Lc, D)
-        B, N, Lc, D = contexts.shape
-        contexts_flat = contexts.reshape(B * N, Lc, D)
+        contexts, mask = orig_model._build_forecast_contexts(mu_post, anchors)
+        B, N, L_max, D = contexts.shape
+        contexts_flat = contexts.reshape(B * N, L_max, D)
+        mask_flat = mask.reshape(B * N, L_max)
 
-        mu_latent_flat, _, _ = orig_model.latent_forecaster(contexts_flat, horizon=horizon)
+        mu_latent_flat, _, _ = orig_model.latent_forecaster(
+            contexts_flat, horizon=horizon, context_mask=mask_flat
+        )
         _, mu_flat, logvar_flat = orig_model.decoder(mu_latent_flat)
         mu_future = mu_flat.reshape(B, N, -1)
         logvar_future = torch.clamp(logvar_flat.reshape(B, N, -1), min=-10, max=10)
@@ -1640,7 +1583,6 @@ class LightSeqVaeTeb(L.LightningModule):
             denom = mask.sum(dim=1).clamp_min(1)
             mse = (pred - gt).pow(2).sum(dim=1) / denom
             mae = (pred - gt).abs().sum(dim=1) / denom
-            # Use static method directly from class for _masked_corrcoef
             corr = SeqVaeTeb._masked_corrcoef(pred, gt, mask)
             coverage = mask.float().mean(dim=1)
 
@@ -1652,37 +1594,25 @@ class LightSeqVaeTeb(L.LightningModule):
         metrics['agg_std'] = torch.nanmean(mean_var.clamp_min(1e-8).sqrt())
         return metrics
 
+        return metrics
+
     def _compute_losses_and_metrics(self, batch, stage: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Run forward pass, compute losses, and (optionally) auxiliary forecast metrics."""
+        """Run forward pass, compute losses, and optional forecast metrics."""
         y_st = batch.fhr_st
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
         y_raw = batch.fhr
-        use_forecaster = self._has_forecaster()
+        use_forecaster = self._has_forecaster() and bool(self.hparams.enable_forecaster)
 
-        def _get_weight(primary: str, legacy: str = "", default: float = 0.0) -> float:
-            if not use_forecaster:
-                return 0.0
-            if hasattr(self.hparams, primary):
-                return getattr(self.hparams, primary)
-            if legacy and hasattr(self.hparams, legacy):
-                return getattr(self.hparams, legacy)
-            return default
-
-        forecast_weight = _get_weight("forecast_weight", "predictive_weight")
-        latent_nll_weight = _get_weight("latent_nll_weight", "latent_consistency_weight")
-        predictive_kl_weight = _get_weight("predictive_kl_weight")
-        stability_weight = _get_weight("stability_weight")
-        predictive_weight = _get_weight("predictive_weight")
-        latent_consistency_weight = _get_weight("latent_consistency_weight")
-
+        latent_nll_weight = float(self.hparams.latent_nll_weight) if use_forecaster else 0.0
         predictive_horizon = max(1, int(self.hparams.predictive_horizon))
-        predictive_context = max(1, int(self.hparams.predictive_context_len))
         predictive_max = None
         if use_forecaster and getattr(self.hparams, 'predictive_max_anchors', None) is not None:
             predictive_max = int(self.hparams.predictive_max_anchors)
             if predictive_max <= 0:
                 predictive_max = None
+        latent_discount_gamma = float(getattr(self.hparams, 'latent_discount_gamma', 1.0))
+
         forward_outputs = self.model(y_st, y_ph, x_ph)
 
         loss_dict = self.model.compute_loss(
@@ -1692,22 +1622,17 @@ class LightSeqVaeTeb(L.LightningModule):
             y_raw=y_raw,
             compute_kld_loss=True,
             beta=self.hparams.beta,
-            predictive_weight=predictive_weight,
             predictive_horizon=predictive_horizon,
-            latent_consistency_weight=latent_consistency_weight,
-            predictive_context_len=predictive_context,
-            predictive_max_anchors=predictive_max,
             latent_nll_weight=latent_nll_weight,
-            forecast_weight=forecast_weight,
-            predictive_kl_weight=predictive_kl_weight,
-            stability_weight=stability_weight,
+            latent_discount_gamma=latent_discount_gamma,
+            predictive_max_anchors=predictive_max,
         )
 
         aux_metrics: Dict[str, torch.Tensor] = {}
-        if use_forecaster and self.hparams.log_forecast_metrics and stage != "train":
+        if use_forecaster and self.hparams.log_forecast_metrics and latent_nll_weight > 0.0 and stage != 'train':
             with torch.no_grad():
                 aux_metrics = self._compute_forecast_metrics(
-                    mu_post=forward_outputs["mu_post"].detach(),
+                    mu_post=forward_outputs['mu_post'].detach(),
                     y_raw=y_raw,
                 )
 
@@ -1725,17 +1650,8 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        # Forecast-specific losses
-        if 'predictive_loss' in loss_dict:
-            self.log('train/predictive_loss', loss_dict['predictive_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'forecast_nll' in loss_dict:
-            self.log('train/forecast_nll', loss_dict['forecast_nll'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_nll_loss' in loss_dict:
             self.log('train/latent_nll_loss', loss_dict['latent_nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'predictive_kl_loss' in loss_dict:
-            self.log('train/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'stability_penalty' in loss_dict:
-            self.log('train/stability_penalty', loss_dict['stability_penalty'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # Auxiliary metrics (if any were computed)
         for name, value in aux_metrics.items():
@@ -1755,16 +1671,8 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        if 'predictive_loss' in loss_dict:
-            self.log('val/predictive_loss', loss_dict['predictive_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'forecast_nll' in loss_dict:
-            self.log('val/forecast_nll', loss_dict['forecast_nll'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         if 'latent_nll_loss' in loss_dict:
             self.log('val/latent_nll_loss', loss_dict['latent_nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'predictive_kl_loss' in loss_dict:
-            self.log('val/predictive_kl_loss', loss_dict['predictive_kl_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        if 'stability_penalty' in loss_dict:
-            self.log('val/stability_penalty', loss_dict['stability_penalty'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         for name, value in aux_metrics.items():
             self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)

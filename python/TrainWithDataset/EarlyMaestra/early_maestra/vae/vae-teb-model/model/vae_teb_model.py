@@ -1201,53 +1201,14 @@ class Decoder(nn.Module):
 
 class LatentForecaster(nn.Module):
     """
-    Causal Dilated TCN Forecaster with Parallel Horizon Prediction and Gaussian Uncertainty.
-
-    A state-of-the-art, fully parallel, non-autoregressive forecaster that predicts future
-    latent trajectories with calibrated uncertainty. Uses causal dilated convolutions to
-    achieve full receptive field coverage while maintaining strict causality.
-
-    **Architecture Philosophy**:
-    1. **Causal Dilated TCN Backbone**: Exponentially growing dilations [1,2,4,8,16,32,64,128]
-       provide receptive field RF=511 > 300, ensuring each time step sees entire history
-    2. **Multi-Scale Feature Extraction**: Parallel processing at multiple temporal scales
-       captures both local dynamics and long-range dependencies
-    3. **Parallel Horizon Heads**: All $H$ future steps predicted simultaneously (non-AR)
-       with per-step uncertainty quantification
-    4. **Skip Connections**: U-Net style skip connections preserve gradient flow and
-       low-level temporal features
-    5. **Uncertainty Calibration**: Diagonal Gaussian outputs with proper variance bounds
-
-    **Mathematical Framework**:
-    Given context latents $z_{1:t} \in \mathbb{R}^{t \\times D}$, predict future distribution:
-    $$p(z_{t+1:t+H} | z_{1:t}) = \\prod_{h=1}^{H} \\mathcal{N}(z_{t+h}; \\mu_{t,h}, \\mathrm{diag}(\\sigma^2_{t,h}))$$
-
-    **Key Advantages over LGSSM**:
-    - Fully parallel (no sequential rollout)
-    - Learns data-driven temporal patterns (no hand-designed state transitions)
-    - Richer feature hierarchies through multi-scale dilations
-    - Better gradient flow through residual connections
-    - Flexible horizon (no covariance explosion issues)
-
-    Args:
-        latent_dim (int): Dimensionality of latent space $D$ (default: 16)
-        hidden_dim (int): Number of channels in TCN backbone (default: 128)
-        tcn_depth (int): Number of dilated TCN blocks, determines receptive field
-            RF = 1 + 2(2^depth - 1) for kernel_size=3. Depth=8 → RF=511 (default: 8)
-        kernel_size (int): Convolutional kernel size (default: 3)
-        max_horizon (int): Maximum forecast horizon to support (default: 30)
-        dropout (float): Dropout rate for regularization (default: 0.1)
-        min_logvar (float): Lower bound for log-variance (default: -7.0)
-        max_logvar (float): Upper bound for log-variance (default: 4.0)
-        lowrank_q (int): Legacy LGSSM parameter, kept for backward compatibility (ignored)
-        alpha (float): Legacy LGSSM parameter, kept for backward compatibility (ignored)
-        eig_penalty_fraction (float): Legacy LGSSM parameter (ignored)
+    Causal latent forecaster that consumes the full history and produces parallel
+    horizon predictions with calibrated uncertainty.
     """
 
     def __init__(
         self,
         latent_dim: int = 16,
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
         min_logvar: float = -7.0,
         max_logvar: float = 4.0,
         tcn_depth: int = 8,
@@ -1266,31 +1227,24 @@ class LatentForecaster(nn.Module):
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
 
-        # Compute receptive field: RF = 1 + sum((k-1)*dilation) = 1 + (k-1)*sum(2^l)
-        # For k=3, depth=8: RF = 1 + 2*(2^8 - 1) = 511
         self.receptive_field = 1 + (kernel_size - 1) * (2**tcn_depth - 1)
 
-        # === STAGE 1: INPUT PROJECTION ===
-        # Project latent dimension to hidden dimension for richer representations
         self.input_projection = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 3),
+            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 6),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
             dropout=dropout,
         )
 
-        # === STAGE 2: CAUSAL DILATED TCN BACKBONE ===
-        # Stack of dilated conv blocks with exponentially growing dilations
-        # Each block has residual connection and maintains causality
         self.tcn_blocks = nn.ModuleList()
         for depth_idx in range(tcn_depth):
-            dilation = 2 ** depth_idx  # Dilations: 1, 2, 4, 8, 16, 32, 64, 128
+            dilation = 2 ** depth_idx
             block = CausalMultiChannelConvBlock(
                 in_channels=hidden_dim,
                 out_channels=hidden_dim,
-                groups=min(8, hidden_dim),  # Group convolutions for efficiency
+                groups=1,
                 filter_size=kernel_size,
                 dilation=dilation,
                 activation=nn.GELU,
@@ -1298,139 +1252,92 @@ class LatentForecaster(nn.Module):
             )
             self.tcn_blocks.append(block)
 
-        # === STAGE 3: MULTI-SCALE SKIP CONNECTIONS ===
-        # Skip from input projection to later stages (U-Net style)
         self.skip_connection_mid = nn.Linear(hidden_dim, hidden_dim)
 
-        # === STAGE 4: TEMPORAL FEATURE REFINEMENT ===
-        # Additional refinement after TCN stack for final feature polishing
         self.feature_refinement = ResidualMLP(
             input_dim=hidden_dim,
-            hidden_dims=geometric_schedule(hidden_dim, hidden_dim, 3),
+            hidden_dims=geometric_schedule(hidden_dim, hidden_dim, 4),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
             dropout=dropout,
         )
 
-        # === STAGE 5: PARALLEL HORIZON PREDICTION HEADS ===
-        # Each horizon step gets its own prediction head for maximum flexibility
-        # This allows learning step-specific dynamics (near-term vs far-term predictions)
-        self.horizon_heads = nn.ModuleList()
-        for h in range(max_horizon):
-            # Each head: hidden_dim → 2*latent_dim (mu and logvar)
-            head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, 2 * latent_dim),  # mu + logvar
-            )
-            self.horizon_heads.append(head)
-
-        # === STAGE 6: POSITIONAL ENCODING FOR HORIZON ===
-        # Optional: helps heads distinguish between different future time steps
-        self.horizon_embedding = nn.Parameter(
-            torch.randn(max_horizon, hidden_dim) * 0.02
+        self.summary_projection = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
         )
+        self.horizon_attention = nn.Linear(hidden_dim, max_horizon)
+        self.horizon_embedding = nn.Parameter(torch.randn(max_horizon, hidden_dim) * 0.02)
+
+        self.step_mlp = ResidualMLP(
+            input_dim=2 * hidden_dim,
+            hidden_dims=(hidden_dim, hidden_dim),
+            final_activation=True,
+            use_skip_connection=True,
+            activation=nn.GELU,
+            dropout=dropout,
+        )
+        self.output_layer = nn.Linear(hidden_dim, 2 * latent_dim)
 
     def forward(
         self,
         z_context: torch.Tensor,
         horizon: int,
+        context_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Forward pass: predict future latent trajectory with uncertainty.
+        if horizon < 1 or horizon > self.max_horizon:
+            raise ValueError(f"Invalid horizon={horizon}, expected 1..{self.max_horizon}")
 
-        Args:
-            z_context: Context latent sequence, shape $(B, L_c, D)$
-                where $L_c$ is context length (variable, typically ≤ 300)
-            horizon: Number of future steps to predict $H \in [1, \mathrm{max\\_horizon}]$
-
-        Returns:
-            Tuple containing:
-            - mu_steps: Predicted latent means, shape $(B, H, D)$
-            - logvar_steps: Predicted latent log-variances (diagonal), shape $(B, H, D)$
-            - aux: Dictionary with:
-                - receptive_field_coverage: Fraction of context covered by RF
-                - context_length: Actual context length used
-
-        Raises:
-            ValueError: If horizon < 1 or horizon > max_horizon
-            AssertionError: If z_context has wrong latent dimension
-
-        Mathematical Operation:
-        $$\\mu_{t,h}, \\log\\sigma^2_{t,h} = \\mathrm{Head}_h(\\mathrm{TCN}(z_{1:t}))$$
-        for each horizon step $h \\in \\{1, \\ldots, H\\}$
-        """
-        if horizon < 1:
-            raise ValueError(f"horizon must be >= 1, got {horizon}")
-        if horizon > self.max_horizon:
-            raise ValueError(f"horizon {horizon} exceeds max_horizon {self.max_horizon}")
-
-        B, Lc, D = z_context.shape
+        B, L, D = z_context.shape
         assert D == self.latent_dim, f"Context latent dimension {D} != {self.latent_dim}"
 
-        # === STAGE 1: INPUT PROJECTION ===
-        # Transform latent features to hidden dimension
-        x = self.input_projection(z_context)  # (B, Lc, hidden_dim)
+        if context_mask is None:
+            context_mask = z_context.new_ones(B, L, dtype=torch.bool)
+        else:
+            context_mask = context_mask.to(torch.bool)
 
-        # Save for skip connection
+        mask = context_mask.unsqueeze(-1).float()
+
+        x = self.input_projection(z_context) * mask
         skip_input = x
 
-        # Transpose for 1D convolution: (B, Lc, C) → (B, C, Lc)
-        x = x.transpose(1, 2)  # (B, hidden_dim, Lc)
-
-        # === STAGE 2: CAUSAL DILATED TCN BACKBONE ===
-        # Process through dilated conv stack with exponentially growing receptive field
-        for depth_idx, tcn_block in enumerate(self.tcn_blocks):
-            x = tcn_block(x)  # (B, hidden_dim, Lc)
-
-            # Add skip connection at mid-depth for better gradient flow
+        x = x.transpose(1, 2)
+        for depth_idx, block in enumerate(self.tcn_blocks):
+            x = block(x)
             if depth_idx == self.tcn_depth // 2:
                 skip_mid = self.skip_connection_mid(skip_input).transpose(1, 2)
                 x = x + skip_mid
 
-        # Transpose back: (B, C, Lc) → (B, Lc, C)
-        x = x.transpose(1, 2)  # (B, Lc, hidden_dim)
+        x = x.transpose(1, 2)
+        x = self.feature_refinement(x) * mask
 
-        # === STAGE 3: TEMPORAL FEATURE REFINEMENT ===
-        x = self.feature_refinement(x)  # (B, Lc, hidden_dim)
+        lengths = context_mask.sum(dim=1).clamp_min(1)
+        last_indices = (lengths - 1).long()
+        batch_idx = torch.arange(B, device=z_context.device)
+        last_feat = x[batch_idx, last_indices]
+        mean_feat = (x * mask).sum(dim=1) / lengths.unsqueeze(-1)
+        summary = self.summary_projection(torch.cat([last_feat, mean_feat], dim=-1))
 
-        # === STAGE 4: EXTRACT FINAL CONTEXT SUMMARY ===
-        # Use last time step (most recent context with full RF coverage)
-        context_summary = x[:, -1, :]  # (B, hidden_dim)
+        attn_logits = self.horizon_attention(x)[:, :, :horizon]
+        attn_logits = attn_logits.masked_fill(~context_mask.unsqueeze(-1), -1e9)
+        attn_weights = torch.softmax(attn_logits, dim=1)
+        aggregated = torch.einsum('blc,blh->bhc', x, attn_weights)
+        aggregated = aggregated + self.horizon_embedding[:horizon].unsqueeze(0)
 
-        # === STAGE 5: PARALLEL HORIZON PREDICTION ===
-        # Predict all H steps simultaneously (non-autoregressive)
-        mu_steps_list = []
-        logvar_steps_list = []
+        summary_expanded = summary.unsqueeze(1).expand(-1, horizon, -1)
+        step_inputs = torch.cat([aggregated, summary_expanded], dim=-1)
+        step_hidden = self.step_mlp(step_inputs)
 
-        for h in range(horizon):
-            # Add horizon-specific positional information
-            h_input = context_summary + self.horizon_embedding[h].unsqueeze(0)  # (B, hidden_dim)
+        stats = self.output_layer(step_hidden)
+        mu_steps = stats[..., : self.latent_dim]
+        logvar_steps = stats[..., self.latent_dim :]
+        logvar_steps = torch.clamp(logvar_steps, min=self.min_logvar, max=self.max_logvar)
 
-            # Predict (mu, logvar) for this horizon step
-            stats = self.horizon_heads[h](h_input)  # (B, 2*D)
-            mu_h = stats[:, :self.latent_dim]  # (B, D)
-            logvar_h = stats[:, self.latent_dim:]  # (B, D)
-
-            # Clamp log-variance for numerical stability and calibration
-            logvar_h = torch.clamp(logvar_h, min=self.min_logvar, max=self.max_logvar)
-
-            mu_steps_list.append(mu_h)
-            logvar_steps_list.append(logvar_h)
-
-        # Stack into tensors
-        mu_steps = torch.stack(mu_steps_list, dim=1)  # (B, H, D)
-        logvar_steps = torch.stack(logvar_steps_list, dim=1)  # (B, H, D)
-
-        # === AUXILIARY OUTPUT ===
         aux = {
-            "receptive_field_coverage": min(1.0, self.receptive_field / Lc),
-            "context_length": Lc,
-            "receptive_field": self.receptive_field,
+            'context_lengths': lengths,
+            'receptive_field': self.receptive_field,
         }
-
         return mu_steps, logvar_steps, aux
 
     @staticmethod
@@ -1440,110 +1347,16 @@ class LatentForecaster(nn.Module):
         z_target: torch.Tensor,
         horizon_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Compute Gaussian negative log-likelihood loss for predicted latent distributions.
+        var_pred = torch.exp(logvar_pred)
+        squared_error = (z_target - mu_pred) ** 2
+        nll = 0.5 * (logvar_pred + squared_error / var_pred)
 
-        This is the primary forecasting loss that trains the model to predict future latent
-        means and variances. It directly optimizes the predictive distribution to match
-        the target latent values (either samples or means from the encoder posterior).
-
-        **Mathematical Formulation**:
-        $$\\mathcal{L}_{\\text{latent-NLL}} = \\frac{1}{BHD} \\sum_{b,h,d} \\frac{1}{2} \\left[ \\log \\sigma^2_{b,h,d} + \\frac{(z^{\\text{target}}_{b,h,d} - \\mu_{b,h,d})^2}{\\sigma^2_{b,h,d}} \\right]$$
-
-        where:
-        - $\\mu_{b,h,d}$ is predicted mean for batch $b$, horizon $h$, dimension $d$
-        - $\\sigma^2_{b,h,d} = \\exp(\\text{logvar}_{b,h,d})$ is predicted variance
-        - $z^{\\text{target}}$ is either sampled latent or encoder posterior mean
-
-        Args:
-            mu_pred: Predicted latent means, shape $(B, H, D)$
-            logvar_pred: Predicted latent log-variances, shape $(B, H, D)$
-            z_target: Target latent values (samples or means), shape $(B, H, D)$
-            horizon_weights: Optional per-horizon weights, shape $(H,)$ or $(B, H, 1)$
-                Use this for horizon discounting: $\\gamma^{h-1}$ where $\\gamma \\in [0.9, 1.0]$
-
-        Returns:
-            Scalar loss value (mean over all dimensions)
-
-        Example:
-            >>> mu_pred = torch.randn(4, 30, 16)
-            >>> logvar_pred = torch.randn(4, 30, 16).clamp(-7, 4)
-            >>> z_target = torch.randn(4, 30, 16)
-            >>> loss = LatentForecaster.compute_latent_nll_loss(mu_pred, logvar_pred, z_target)
-        """
-        # Compute variance from log-variance
-        var_pred = torch.exp(logvar_pred)  # (B, H, D)
-
-        # Gaussian NLL: 0.5 * (log(var) + (target - mu)^2 / var)
-        squared_error = (z_target - mu_pred) ** 2  # (B, H, D)
-        nll = 0.5 * (logvar_pred + squared_error / var_pred)  # (B, H, D)
-
-        # Apply optional horizon weights (e.g., discount farther horizons)
         if horizon_weights is not None:
-            if horizon_weights.dim() == 1:  # (H,)
-                horizon_weights = horizon_weights.view(1, -1, 1)  # (1, H, 1)
-            nll = nll * horizon_weights  # (B, H, D)
+            if horizon_weights.dim() == 1:
+                horizon_weights = horizon_weights.view(1, -1, 1)
+            nll = nll * horizon_weights
 
-        # Return mean loss
         return nll.mean()
-
-    @staticmethod
-    def compute_predictive_kl_loss(
-        mu_pred: torch.Tensor,
-        logvar_pred: torch.Tensor,
-        mu_target: torch.Tensor,
-        logvar_target: torch.Tensor,
-        horizon_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute KL divergence between predicted and target latent distributions.
-
-        This loss is used when you have access to the full encoder posterior distribution
-        (both mean and variance) for the target future latents. It aligns the predicted
-        distribution with the teacher distribution, providing stronger supervision than
-        NLL alone.
-
-        **Mathematical Formulation**:
-        $$\\mathcal{L}_{\\text{pred-KL}} = \\frac{1}{BHD} \\sum_{b,h,d} \\frac{1}{2} \\left[ \\log\\frac{\\sigma^2_{\\text{pred}}}{\\sigma^2_{\\text{target}}} + \\frac{\\sigma^2_{\\text{target}} + (\\mu_{\\text{target}} - \\mu_{\\text{pred}})^2}{\\sigma^2_{\\text{pred}}} - 1 \\right]$$
-
-        This is the closed-form KL divergence for diagonal Gaussians:
-        $$\\text{KL}(\\mathcal{N}(\\mu_q, \\sigma^2_q) \\| \\mathcal{N}(\\mu_p, \\sigma^2_p))$$
-
-        Args:
-            mu_pred: Predicted latent means, shape $(B, H, D)$
-            logvar_pred: Predicted latent log-variances, shape $(B, H, D)$
-            mu_target: Target latent means (from encoder), shape $(B, H, D)$
-            logvar_target: Target latent log-variances (from encoder), shape $(B, H, D)$
-            horizon_weights: Optional per-horizon weights, shape $(H,)$ or $(B, H, 1)$
-
-        Returns:
-            Scalar KL divergence (mean over all dimensions)
-
-        Example:
-            >>> # Predicted distribution from forecaster
-            >>> mu_pred, logvar_pred = torch.randn(4, 30, 16), torch.randn(4, 30, 16).clamp(-7, 4)
-            >>> # Target distribution from encoder posterior
-            >>> mu_target, logvar_target = torch.randn(4, 30, 16), torch.randn(4, 30, 16).clamp(-7, 4)
-            >>> kl_loss = LatentForecaster.compute_predictive_kl_loss(mu_pred, logvar_pred, mu_target, logvar_target)
-        """
-        var_pred = torch.exp(logvar_pred)  # (B, H, D)
-        var_target = torch.exp(logvar_target)  # (B, H, D)
-
-        # Closed-form KL for diagonal Gaussians
-        # KL(q || p) = 0.5 * [log(var_p/var_q) + (var_q + (mu_q - mu_p)^2) / var_p - 1]
-        log_var_ratio = logvar_pred - logvar_target  # log(var_pred / var_target)
-        squared_mean_diff = (mu_target - mu_pred) ** 2  # (B, H, D)
-
-        kl = 0.5 * (log_var_ratio + (var_target + squared_mean_diff) / var_pred - 1.0)
-
-        # Apply optional horizon weights
-        if horizon_weights is not None:
-            if horizon_weights.dim() == 1:  # (H,)
-                horizon_weights = horizon_weights.view(1, -1, 1)  # (1, H, 1)
-            kl = kl * horizon_weights  # (B, H, D)
-
-        # Return mean KL
-        return kl.mean()
 
     @staticmethod
     def create_horizon_discount_weights(
@@ -1551,35 +1364,8 @@ class LatentForecaster(nn.Module):
         gamma: float = 0.95,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        """
-        Create exponentially decaying weights for horizon discounting.
-
-        Farther predictions are harder and less critical, so we can optionally
-        down-weight them in the loss function. This creates weights:
-        $$w_h = \\gamma^{h-1}$$
-        for horizon steps $h \\in \\{1, 2, \\ldots, H\\}$.
-
-        Args:
-            horizon: Number of future steps $H$
-            gamma: Discount factor $\\gamma \\in [0, 1]$. Common values:
-                - 1.0: No discounting (all steps equally weighted)
-                - 0.95: Mild discounting
-                - 0.9: Moderate discounting
-            device: Target device for the tensor
-
-        Returns:
-            Discount weights, shape $(H,)$
-
-        Example:
-            >>> weights = LatentForecaster.create_horizon_discount_weights(30, gamma=0.95)
-            >>> weights.shape
-            torch.Size([30])
-            >>> weights[:5]  # First 5 weights
-            tensor([1.0000, 0.9500, 0.9025, 0.8574, 0.8145])
-        """
-        # Create discount weights: [gamma^0, gamma^1, gamma^2, ..., gamma^(H-1)]
         exponents = torch.arange(horizon, dtype=torch.float32, device=device)
-        weights = gamma ** exponents  # (H,)
+        weights = gamma ** exponents
         return weights
 
     def compute_forecasting_loss(
@@ -1587,345 +1373,30 @@ class LatentForecaster(nn.Module):
         z_context: torch.Tensor,
         z_target: torch.Tensor,
         horizon: int,
-        target_logvar: Optional[torch.Tensor] = None,
-        use_predictive_kl: bool = False,
-        lambda_latent_nll: float = 1.0,
-        lambda_pred_kl: float = 0.1,
+        context_mask: Optional[torch.Tensor] = None,
         gamma: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute complete forecasting loss including NLL and optional predictive KL.
+        mu_pred, logvar_pred, aux = self.forward(
+            z_context, horizon, context_mask=context_mask
+        )
 
-        This is a convenience method that combines the forward pass and loss computation
-        in one call, useful during training.
-
-        Args:
-            z_context: Context latent sequence, shape $(B, L_c, D)$
-            z_target: Target future latents (ground truth), shape $(B, H, D)$
-                Can be either samples from encoder or posterior means
-            horizon: Number of future steps to predict $H$
-            target_logvar: Optional target log-variances, shape $(B, H, D)$
-                If provided and use_predictive_kl=True, predictive KL will be computed
-            use_predictive_kl: Whether to compute predictive KL loss (requires target_logvar)
-            lambda_latent_nll: Weight for latent NLL loss (default: 1.0)
-            lambda_pred_kl: Weight for predictive KL loss (default: 0.5)
-            gamma: Horizon discount factor (default: 1.0 = no discounting)
-
-        Returns:
-            Dictionary containing:
-            - 'total_loss': Combined weighted loss
-            - 'latent_nll': Latent NLL component
-            - 'pred_kl': Predictive KL component (0 if not used)
-            - 'mu_pred': Predicted means $(B, H, D)$
-            - 'logvar_pred': Predicted log-variances $(B, H, D)$
-
-        Example:
-            >>> forecaster = LatentForecaster(latent_dim=16)
-            >>> z_context = torch.randn(4, 100, 16)
-            >>> z_target = torch.randn(4, 30, 16)
-            >>> losses = forecaster.compute_forecasting_loss(z_context, z_target, horizon=30)
-            >>> losses['total_loss'].backward()
-        """
-        # Forward pass
-        mu_pred, logvar_pred, aux = self.forward(z_context, horizon)
-
-        # Create horizon weights if discounting is enabled
         horizon_weights = None
         if gamma < 1.0:
             horizon_weights = self.create_horizon_discount_weights(
                 horizon, gamma=gamma, device=z_context.device
             )
 
-        # Compute latent NLL loss
         latent_nll = self.compute_latent_nll_loss(
             mu_pred, logvar_pred, z_target, horizon_weights=horizon_weights
         )
 
-        # Compute predictive KL loss if requested and target variances available
-        pred_kl = torch.tensor(0.0, device=z_context.device)
-        if use_predictive_kl and target_logvar is not None:
-            mu_target = z_target  # z_target is actually mu_target when logvar is provided
-            pred_kl = self.compute_predictive_kl_loss(
-                mu_pred, logvar_pred, mu_target, target_logvar, horizon_weights=horizon_weights
-            )
-
-        # Combine losses
-        total_loss = lambda_latent_nll * latent_nll + lambda_pred_kl * pred_kl
-
         return {
-            'total_loss': total_loss,
+            'total_loss': latent_nll,
             'latent_nll': latent_nll,
-            'pred_kl': pred_kl,
             'mu_pred': mu_pred,
             'logvar_pred': logvar_pred,
-            **aux,  # Include auxiliary outputs (RF coverage, etc.)
+            'aux': aux,
         }
-
-
-class SeqVaeCore(nn.Module):
-    """
-    Core sequential VAE module (encoders + decoder) with reconstruction losses.
-    """
-
-    def __init__(
-        self,
-        sequence_length: int = 300,
-        latent_dim_source: int = 16,
-        latent_dim_target: int = 16,
-        latent_dim_z: int = 16,
-        decimation_factor: int = 16,
-        warmup_period: int = 30,
-        lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 5,
-        *,
-        init_weights: bool = True,
-    ) -> None:
-        super().__init__()
-        self.sequence_length = sequence_length
-        self.latent_dim_source = latent_dim_source
-        self.latent_dim_target = latent_dim_target
-        self.latent_dim_z = latent_dim_z
-        self.decimation_factor = decimation_factor
-        self.warmup_period = warmup_period
-
-        self.source_encoder = SourceEncoder(
-            latent_dim=latent_dim_source,
-            lstm_hidden_dim=lstm_hidden_dim,
-            lstm_num_layers=lstm_num_layers,
-        )
-        self.target_encoder = TargetEncoder(
-            latent_dim=latent_dim_target,
-            lstm_hidden_dim=lstm_hidden_dim,
-            lstm_num_layers=lstm_num_layers,
-        )
-        self.conditional_encoder = ConditionalEncoder(
-            dim_hx=latent_dim_source,
-            dim_hy=latent_dim_target,
-            dim_z=latent_dim_z,
-        )
-        self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)
-
-        if init_weights:
-            initialization(self)
-
-    def forward(
-        self,
-        y_st: torch.Tensor,  # (B, T, 43)
-        y_ph: torch.Tensor,  # (B, T, 44)
-        x_ph: torch.Tensor,  # (B, T, 130)
-    ) -> Dict[str, torch.Tensor]:
-        """Forward pass through the complete VAE (encode + decode).
-
-        Performs the full TEB encoding and reconstruction:
-            1. Encode source: $h_x = f_{source}(x_{ph})$
-            2. Encode target prior: $\mu_y, \log\sigma^2_y = f_{target}(y_{st}, y_{ph})$
-            3. Encode posterior: $\mu_{post}, \log\sigma^2_{post} = f_{cond}(h_x, c_{logvar})$
-            4. Add residual: $\mu_{post} += \mu_y$ (TEB residual connection)
-            5. Sample latent: $z \sim q(z|x,y)$
-            6. Decode: $p(y|z)$ with Gaussian likelihood
-
-        Args:
-            y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$ where
-                $B$ is batch size, $T$ is sequence_length (300), and 43 is the number
-                of scattering transform channels.
-            y_ph (torch.Tensor): Target phase harmonic features, shape $(B, T, 44)$.
-            x_ph (torch.Tensor): Source cross-phase harmonic features, shape $(B, T, 130)$.
-
-        Returns:
-            Dict[str, torch.Tensor]: Dictionary containing:
-                - z: Sampled posterior latent, shape $(B, T, D_z)$.
-                - linear_output: Intermediate decoder features, shape $(B, T, 87)$.
-                - mu_pr: Predicted raw signal mean, shape $(B, 4800)$.
-                - logvar_pr: Predicted raw signal log-variance, shape $(B, 4800)$.
-                - mu_prior: Target prior mean, shape $(B, T, D_{target})$.
-                - logvar_prior: Target prior log-variance, shape $(B, T, D_{target})$.
-                - mu_post: Posterior mean after residual, shape $(B, T, D_z)$.
-                - logvar_post: Posterior log-variance, shape $(B, T, D_z)$.
-                - mu_next: None (legacy placeholder).
-                - logvar_next: None (legacy placeholder).
-                - next_step_indices: None (legacy placeholder).
-        """
-        mu_x = self.source_encoder(x_ph)
-        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
-
-        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
-        mu_post = mu_post + mu_y
-        z = self.reparameterize(mu_post, logvar_post)
-
-        linear_output, mu_pr, logvar_pr = self.decoder(z)
-
-        return {
-            "z": z,  # (B, T, latent_dim_z)
-            "linear_output": linear_output,  # (B, T, 87)
-            "mu_pr": mu_pr,  # (B, 4800)
-            "logvar_pr": logvar_pr,  # (B, 4800)
-            "mu_next": None,  # Legacy placeholder
-            "logvar_next": None,  # Legacy placeholder
-            "next_step_indices": None,  # Legacy placeholder
-            "mu_prior": mu_y,  # (B, T, latent_dim_target)
-            "logvar_prior": logvar_y_prior,  # (B, T, latent_dim_target)
-            "mu_post": mu_post,  # (B, T, latent_dim_z)
-            "logvar_post": logvar_post,  # (B, T, latent_dim_z)
-        }
-
-    def encode_only(
-        self,
-        y_st: torch.Tensor,
-        y_ph: torch.Tensor,
-        x_ph: torch.Tensor,
-        sample_z: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        mu_x = self.source_encoder(x_ph)
-        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
-        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
-        mu_post = mu_post + mu_y
-        z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
-        return {
-            "mu_prior": mu_y,
-            "logvar_prior": logvar_y_prior,
-            "mu_post": mu_post,
-            "logvar_post": logvar_post,
-            "z": z,
-        }
-
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    @staticmethod
-    def _kld_loss(
-        mu_prior: torch.Tensor,
-        logvar_prior: torch.Tensor,
-        mu_post: torch.Tensor,
-        logvar_post: torch.Tensor,
-        *,
-        reduce_mean: bool = True,
-    ) -> torch.Tensor:
-        kld = (
-            logvar_prior
-            - logvar_post
-            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
-            - 1.0
-        )
-        kld = 0.5 * kld
-        return kld.mean() if reduce_mean else kld.sum()
-
-    @staticmethod
-    def gaussian_nll(
-        mu: torch.Tensor,
-        logvar: torch.Tensor,
-        target: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        var = logvar.exp()
-        nll = 0.5 * (logvar + (target - mu) ** 2 / var)
-        if mask is not None:
-            nll = nll * mask
-            denom = mask.sum().clamp_min(1.0)
-            return nll.sum() / denom
-        return nll.mean()
-
-    def _next_step_indices(self, device: torch.device) -> torch.Tensor:
-        steps = max(0, self.sequence_length - 1)
-        if steps == 0:
-            return torch.zeros(0, device=device, dtype=torch.long)
-        base = torch.arange(steps, device=device, dtype=torch.long) + 1
-        return self.decimation_factor * base
-
-    def compute_reconstruction_loss(
-        self,
-        forward_outputs: Dict[str, torch.Tensor],  # Dict from forward()
-        y_st: torch.Tensor,  # (B, T, 43)
-        y_ph: torch.Tensor,  # (B, T, 44)
-        y_raw: torch.Tensor,  # (B, 4800) or (B, 4800, 1)
-        *,
-        compute_kld_loss: bool = True,
-        beta: float = 1.0,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute reconstruction and regularization losses for VAE training.
-
-        Computes the complete VAE objective with three loss components:
-            1. MSE loss: Mean squared error between intermediate decoder features and
-               concatenated scattering + phase harmonic inputs (auxiliary supervision).
-            2. NLL loss: Gaussian negative log-likelihood for raw signal reconstruction
-               $p(y_{raw} | z)$, allowing heteroscedastic noise modeling.
-            3. KLD loss: Transfer entropy $\text{KL}(q(z|x,y) \| p(z|y))$ measuring
-               information flow from source to latent representation.
-
-        Total loss: $\mathcal{L} = \text{MSE} + \text{NLL} + \beta \cdot \text{KLD}$
-
-        Args:
-            forward_outputs (Dict[str, torch.Tensor]): Dictionary from forward() containing
-                mu_pr, logvar_pr, mu_prior, logvar_prior, mu_post, logvar_post, and
-                optionally linear_output.
-            y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$.
-            y_ph (torch.Tensor): Target phase harmonic features, shape $(B, T, 44)$.
-            y_raw (torch.Tensor): Raw target signal for reconstruction, shape $(B, 4800)$
-                or $(B, 4800, 1)$. If 3D with last dim=1, it will be squeezed to $(B, 4800)$.
-            compute_kld_loss (bool, optional): Whether to compute and include KL divergence
-                term. Set to False for deterministic autoencoders or ablation studies.
-                Defaults to True.
-            beta (float, optional): Weight for KL divergence term ($\beta$-VAE framework).
-
-        Returns:
-            Dict[str, torch.Tensor]: Dictionary containing all loss components (all scalars):
-                - reconstruction_loss: MSE + NLL.
-                - mse_loss: Auxiliary MSE loss on intermediate features.
-                - nll_loss: Gaussian NLL for raw signal reconstruction.
-                - kld_loss: Transfer entropy $\text{KL}(q(z|x,y) \| p(z|y))$.
-                - total_loss: reconstruction_loss + $\beta$ * kld_loss.
-                - total_decoder_loss: Alias for reconstruction_loss (backward compatibility).
-        """
-        if y_raw.dim() == 3 and y_raw.size(-1) == 1:
-            y_raw = y_raw.squeeze(-1)
-
-        device = y_raw.device
-
-        mse_loss = torch.tensor(0.0, device=device)
-        linear_output = forward_outputs.get("linear_output")
-        if (
-            linear_output is not None
-            and linear_output.dim() == 3
-            and y_st.shape[:2] == linear_output.shape[:2]
-            and y_ph.shape[:2] == linear_output.shape[:2]
-            and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
-        ):
-            stacked_target = torch.cat([y_st, y_ph], dim=-1)
-            mse_loss = F.mse_loss(linear_output, stacked_target)
-
-        mu_pr = forward_outputs.get("mu_pr")
-        logvar_pr = forward_outputs.get("logvar_pr")
-        if mu_pr is not None and logvar_pr is not None:
-            var = logvar_pr.exp()
-            nll_loss = 0.5 * (logvar_pr + (y_raw - mu_pr) ** 2 / var)
-            nll_loss = nll_loss.mean()
-        else:
-            nll_loss = torch.tensor(0.0, device=device)
-
-        kld_loss = torch.tensor(0.0, device=y_raw.device)
-        if compute_kld_loss:
-            kld_loss = self._kld_loss(
-                mu_prior=forward_outputs["mu_prior"],
-                logvar_prior=forward_outputs["logvar_prior"],
-                mu_post=forward_outputs["mu_post"],
-                logvar_post=forward_outputs["logvar_post"],
-                reduce_mean=True,
-            )
-
-        total_decoder = mse_loss + nll_loss
-        total_loss = total_decoder + beta * kld_loss
-        return {
-            "reconstruction_loss": total_decoder,  # scalar: MSE + NLL
-            "mse_loss": mse_loss,  # scalar: intermediate features MSE
-            "nll_loss": nll_loss,  # scalar: Gaussian NLL for raw signal
-            "kld_loss": kld_loss,  # scalar: KL(q(z|x,y) || p(z|y))
-            "total_loss": total_loss,  # scalar: reconstruction_loss + β * kld_loss
-            "total_decoder_loss": total_decoder,  # scalar: alias for reconstruction_loss
-        }
-
-
 class SeqVaeTeb(nn.Module):
     """
     Complete SeqVAE model with an optional latent forecaster head.
@@ -1945,17 +1416,11 @@ class SeqVaeTeb(nn.Module):
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
         # Forecasting params
-        context_len: int = 75,
         horizon_len: int = 30,
-        forecaster_hidden_dim: int = 128,
-        forecaster_lowrank: int = 0,
-        forecaster_alpha: float = 0.98,
-        forecaster_eig_fraction: float = 0.95,
+        forecaster_hidden_dim: int = 256,
         forecaster_min_logvar: float = -7.0,
         forecaster_max_logvar: float = 4.0,
-        # Legacy arguments (ignored)
-        forecaster_layers: int = 1,
-        forecaster_dropout: float = 0.0,
+        forecaster_dropout: float = 0.1,
         *,
         use_latent_forecaster: bool = True,
         latent_forecaster: Optional[nn.Module] = None,
@@ -1968,7 +1433,6 @@ class SeqVaeTeb(nn.Module):
         self.latent_dim_z = latent_dim_z
         self.decimation_factor = decimation_factor
         self.warmup_period = warmup_period
-        self.context_len = context_len
         self.horizon_len = horizon_len
 
         self.core = SeqVaeCore(
@@ -1990,11 +1454,9 @@ class SeqVaeTeb(nn.Module):
             self.latent_forecaster = LatentForecaster(
                 latent_dim=latent_dim_z,
                 hidden_dim=forecaster_hidden_dim,
-                lowrank_q=forecaster_lowrank,
-                alpha=forecaster_alpha,
-                eig_penalty_fraction=forecaster_eig_fraction,
                 min_logvar=forecaster_min_logvar,
                 max_logvar=forecaster_max_logvar,
+                dropout=forecaster_dropout,
             )
             initialization(self.latent_forecaster)
         else:
@@ -2325,49 +1787,46 @@ class SeqVaeTeb(nn.Module):
     # Forecasting helpers
     # ------------------------
     @staticmethod
-    def anchor_range(T: int, Lc: int, H: int) -> torch.Tensor:
-        """Return valid anchor indices t in [Lc-1, T-1-H] as (N,)."""
-        start = max(0, Lc - 1)
-        end = max(start - 1, T - 1 - H)  # inclusive
-        if end < start:
+    def anchor_range(T: int, H: int) -> torch.Tensor:
+        """Return valid anchor indices t in [0, T-1-H] as (N,)."""
+        end = T - 1 - H
+        if end < 0:
             return torch.zeros(0, dtype=torch.long)
-        return torch.arange(start, end + 1, dtype=torch.long)
+        return torch.arange(0, end + 1, dtype=torch.long)
 
-    def _gather_context(self, z_seq: torch.Tensor, anchors: torch.Tensor, Lc: int) -> torch.Tensor:
+    def _build_forecast_contexts(
+        self,
+        z_seq: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Gather contexts for anchors from z sequence using vectorized operations.
+        Assemble per-anchor histories padded to the longest history length.
 
-        Args:
-            z_seq: (B, T, D)
-            anchors: (N,) anchor time indices
         Returns:
-            contexts: (B, N, Lc, D)
+            contexts: (B, N, L_max, D)
+            mask: (B, N, L_max) with True on valid timesteps
         """
         B, T, D = z_seq.shape
         N = anchors.numel()
-
         if N == 0:
-            return z_seq.new_zeros(B, 0, Lc, D)
+            empty_ctx = z_seq.new_zeros(B, 0, 1, D)
+            empty_mask = torch.zeros(B, 0, 1, dtype=torch.bool, device=z_seq.device)
+            return empty_ctx, empty_mask
 
-        # Vectorized context gathering using advanced indexing
-        # Create index tensor: (N, Lc) where each row contains indices [t-Lc+1, ..., t]
-        # anchors: (N,) -> (N, 1)
-        # offsets: (Lc,) representing [-Lc+1, -Lc+2, ..., 0]
-        offsets = torch.arange(-Lc + 1, 1, device=anchors.device, dtype=anchors.dtype)  # (Lc,)
-        indices = anchors.unsqueeze(1) + offsets.unsqueeze(0)  # (N, Lc)
+        max_len = int(anchors.max().item()) + 1
+        base = torch.arange(max_len, device=z_seq.device)
+        anchor_matrix = torch.minimum(base.unsqueeze(0).expand(N, -1), anchors.unsqueeze(1))
 
-        # Gather all contexts at once: z_seq[:, indices, :] -> (B, N, Lc, D)
-        # Use expand to broadcast batch dimension, then gather
-        indices_expanded = indices.unsqueeze(0).expand(B, -1, -1)  # (B, N, Lc)
-
-        # Gather operation: for each batch, gather specified time slices
+        gather_idx = anchor_matrix.unsqueeze(0).expand(B, -1, -1)
         contexts = torch.gather(
-            z_seq.unsqueeze(1).expand(-1, N, -1, -1),  # (B, N, T, D)
-            dim=2,  # gather along time dimension
-            index=indices_expanded.unsqueeze(-1).expand(-1, -1, -1, D)  # (B, N, Lc, D)
+            z_seq.unsqueeze(1).expand(-1, N, -1, -1),
+            2,
+            gather_idx.unsqueeze(-1).expand(-1, -1, -1, D),
         )
 
-        return contexts
+        mask = base.unsqueeze(0) <= anchors.unsqueeze(1)
+        mask = mask.unsqueeze(0).expand(B, -1, -1)
+        return contexts, mask
 
     @staticmethod
     def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -2405,13 +1864,12 @@ class SeqVaeTeb(nn.Module):
 
         B, T, _ = y_st.shape
         H = self.horizon_len
-        Lc = self.context_len
 
         enc = self.encode_only(y_st, y_ph, x_ph, sample_z=not use_posterior_mean)
         z_seq = enc["z"] if not use_posterior_mean else enc["mu_post"]  # (B,T,D)
 
         if anchors is None:
-            anchors = self.anchor_range(T, Lc, H).to(z_seq.device)
+            anchors = self.anchor_range(T, H).to(z_seq.device)
         if anchors.numel() == 0:
             return {
                 "anchors": anchors,
@@ -2420,16 +1878,18 @@ class SeqVaeTeb(nn.Module):
                 "logvar_future": z_seq.new_zeros(B, 0, H * self.decimation_factor),
                 "latent_mu_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
                 "latent_logvar_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
-                "stability_penalty": torch.tensor(0.0, device=z_seq.device),
                 "enc": enc,
             }
 
-        contexts = self._gather_context(z_seq, anchors, Lc)  # (B,N,Lc,D)
-        B_ctx, N, Lc, D = contexts.shape
-        contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
+        contexts, mask = self._build_forecast_contexts(z_seq, anchors)
+        B_ctx, N, L_max, D = contexts.shape
+        contexts_flat = contexts.reshape(B_ctx * N, L_max, D)
+        mask_flat = mask.reshape(B_ctx * N, L_max)
 
         # Latent forecaster forward pass (always with gradients when training)
-        mu_latent_flat, logvar_latent_flat, aux = self.latent_forecaster(contexts_flat, horizon=H)
+        mu_latent_flat, logvar_latent_flat, aux = self.latent_forecaster(
+            contexts_flat, horizon=H, context_mask=mask_flat
+        )
         z_future = mu_latent_flat.reshape(B_ctx, N, H, D)
         latent_logvar = logvar_latent_flat.reshape(B_ctx, N, H, D)
 
@@ -2450,7 +1910,6 @@ class SeqVaeTeb(nn.Module):
             "logvar_future": logvar_future,
             "latent_mu_future": z_future,
             "latent_logvar_future": latent_logvar,
-            "stability_penalty": aux.get("stability_penalty", torch.tensor(0.0, device=z_future.device)),
             "enc": enc,
         }
 
@@ -2719,61 +2178,15 @@ class SeqVaeTeb(nn.Module):
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
         y_raw: torch.Tensor,
+        *,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
-        predictive_weight: float = 0.0,
         predictive_horizon: int = 1,
-        latent_consistency_weight: float = 0.0,
-        predictive_context_len: Optional[int] = None,
+        latent_nll_weight: float = 0.0,
+        latent_discount_gamma: float = 1.0,
         predictive_max_anchors: Optional[int] = None,
-        *,
-        latent_nll_weight: Optional[float] = None,
-        forecast_weight: Optional[float] = None,
-        predictive_kl_weight: float = 0.0,
-        stability_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute the full training loss, including LGSSM forecasting terms.
-
-        This implements the loss formulation from LGSSM.md:
-        L_total = L_base + λ_latent * L_latent-NLL + λ_pred * L_pred-KL
-                  + λ_raw * L_forecast + λ_stab * R_stab
-
-        Args:
-            forward_outputs: Dictionary produced by the forward pass.
-            y_st, y_ph, y_raw: Target tensors.
-            compute_kld_loss: Whether to include the VAE KL term.
-            beta: Weight for the VAE KL term.
-            predictive_weight: (legacy) raw forecast NLL weight.
-            predictive_horizon: Forecast horizon in decimated steps.
-            latent_consistency_weight: (legacy) latent forecasting auxiliary weight.
-            predictive_context_len: Context length supplied to the forecaster.
-            predictive_max_anchors: Optional cap on the number of anchors sampled per batch.
-            latent_nll_weight: Weight for latent Gaussian NLL (defaults to legacy value).
-            forecast_weight: Weight for raw forecast NLL (defaults to legacy value).
-            predictive_kl_weight: Weight for teacher-forced KL between LGSSM and posterior latents.
-            stability_weight: Weight on the eigenvalue stability penalty.
-        """
-        # Backwards compatibility with previous arguments
-        if latent_nll_weight is None:
-            latent_nll_weight = latent_consistency_weight
-        if forecast_weight is None:
-            forecast_weight = predictive_weight
-
-        needs_forecaster = any(
-            weight > 0.0
-            for weight in (
-                latent_nll_weight,
-                forecast_weight,
-                predictive_kl_weight,
-                stability_weight,
-            )
-        )
-        if needs_forecaster:
-            if predictive_horizon < 1:
-                raise ValueError("predictive_horizon must be >= 1 when forecasting losses are enabled.")
-            self._require_forecaster()
-
+        """Compute reconstruction loss and optional latent forecasting NLL."""
         base_losses = self.core.compute_reconstruction_loss(
             forward_outputs=forward_outputs,
             y_st=y_st,
@@ -2782,133 +2195,53 @@ class SeqVaeTeb(nn.Module):
             compute_kld_loss=compute_kld_loss,
             beta=beta,
         )
-        base_total = base_losses["total_loss"]
+        base_total = base_losses['total_loss']
+        device = base_total.device
 
-        device = forward_outputs["mu_pr"].device
         latent_nll = torch.tensor(0.0, device=device)
-        forecast_nll = torch.tensor(0.0, device=device)
-        predictive_kl = torch.tensor(0.0, device=device)
-        stability_penalty = torch.tensor(0.0, device=device)
+        if latent_nll_weight > 0.0:
+            if predictive_horizon < 1:
+                raise ValueError('predictive_horizon must be >= 1 when latent forecasting is enabled.')
+            self._require_forecaster()
 
-        y_raw_eval = y_raw
-        if y_raw_eval.dim() == 3 and y_raw_eval.size(-1) == 1:
-            y_raw_eval = y_raw_eval.squeeze(-1)
-
-        if needs_forecaster:
-            mu_post = forward_outputs["mu_post"]
-            logvar_post = forward_outputs["logvar_post"]
+            mu_post = forward_outputs['mu_post']
             _B, T, D = mu_post.shape
-            stride = self.decimation_factor
-            context_len = predictive_context_len or self.context_len
 
-            anchors = self.anchor_range(T, context_len, predictive_horizon)
+            anchors = self.anchor_range(T, predictive_horizon)
             if anchors.numel() > 0:
                 anchors = anchors.to(mu_post.device)
-                if predictive_max_anchors is not None and predictive_max_anchors > 0:
-                    max_anchors = min(int(predictive_max_anchors), anchors.numel())
-                    if max_anchors < anchors.numel():
-                        perm = torch.randperm(anchors.numel(), device=anchors.device)
-                        anchors = anchors[perm[:max_anchors]]
+                if predictive_max_anchors is not None and predictive_max_anchors > 0 and anchors.numel() > predictive_max_anchors:
+                    perm = torch.randperm(anchors.numel(), device=anchors.device)
+                    anchors = anchors[perm[:predictive_max_anchors]]
 
-                contexts = self._gather_context(mu_post, anchors, context_len)
-                B_ctx, N, Lc, _ = contexts.shape
-                contexts_flat = contexts.reshape(B_ctx * N, Lc, D)
+                contexts, mask = self._build_forecast_contexts(mu_post, anchors)
+                B_ctx, N, L_max, _ = contexts.shape
+                contexts_flat = contexts.reshape(B_ctx * N, L_max, D)
+                mask_flat = mask.reshape(B_ctx * N, L_max)
 
-                # Get target future latents for teacher forcing
-                future_offsets = torch.arange(
-                    1, predictive_horizon + 1, device=mu_post.device, dtype=torch.long
-                )
-                step_indices = anchors.long().unsqueeze(1) + future_offsets.unsqueeze(0)
+                future_offsets = torch.arange(1, predictive_horizon + 1, device=mu_post.device)
+                step_indices = anchors.unsqueeze(1) + future_offsets.unsqueeze(0)
                 gather_idx = step_indices.unsqueeze(0).unsqueeze(-1).expand(B_ctx, -1, -1, D)
 
                 expanded_mu_post = mu_post.unsqueeze(1).expand(-1, N, -1, -1)
-                expanded_logvar_post = logvar_post.unsqueeze(1).expand(-1, N, -1, -1)
-                teacher_mu = torch.gather(expanded_mu_post, 2, gather_idx).detach()  # (B, N, H, D)
-                teacher_logvar = torch.gather(expanded_logvar_post, 2, gather_idx).detach()  # (B, N, H, D)
-
-                # Reshape for batch processing: (B, N, H, D) → (B*N, H, D)
+                teacher_mu = torch.gather(expanded_mu_post, 2, gather_idx).detach()
                 teacher_mu_flat = teacher_mu.reshape(B_ctx * N, predictive_horizon, D)
-                teacher_logvar_flat = teacher_logvar.reshape(B_ctx * N, predictive_horizon, D)
 
-                # === USE TCN FORECASTER'S BUILT-IN LOSS METHODS ===
-                # Compute latent NLL using forecaster's static method
-                if latent_nll_weight > 0.0 or predictive_kl_weight > 0.0:
-                    mu_pred_flat, logvar_pred_flat, aux = self.latent_forecaster(
-                        contexts_flat, horizon=predictive_horizon
-                    )
-                    # Update stability penalty from TCN forecaster aux output
-                    stability_penalty = aux.get("stability_penalty", stability_penalty)
+                loss_dict = self.latent_forecaster.compute_forecasting_loss(
+                    contexts_flat,
+                    teacher_mu_flat,
+                    horizon=predictive_horizon,
+                    context_mask=mask_flat,
+                    gamma=latent_discount_gamma,
+                )
+                latent_nll = loss_dict['latent_nll']
 
-                    # Latent Gaussian NLL (primary latent forecasting loss)
-                    if latent_nll_weight > 0.0:
-                        from model.vae_teb_model import LatentForecaster
-                        latent_nll = LatentForecaster.compute_latent_nll_loss(
-                            mu_pred=mu_pred_flat,
-                            logvar_pred=logvar_pred_flat,
-                            z_target=teacher_mu_flat,
-                            horizon_weights=None,  # Optional: could add gamma discounting
-                        )
+        total_loss = base_total + latent_nll_weight * latent_nll
 
-                    # Predictive KL (distribution matching between forecaster and encoder posterior)
-                    if predictive_kl_weight > 0.0:
-                        from model.vae_teb_model import LatentForecaster
-                        predictive_kl = LatentForecaster.compute_predictive_kl_loss(
-                            mu_pred=mu_pred_flat,
-                            logvar_pred=logvar_pred_flat,
-                            mu_target=teacher_mu_flat,
-                            logvar_target=teacher_logvar_flat,
-                            horizon_weights=None,  # Optional: could add gamma discounting
-                        )
-
-                # Raw forecast NLL (decode predicted latents to raw space)
-                if forecast_weight > 0.0:
-                    # Forward pass through forecaster if not already done
-                    if latent_nll_weight == 0.0 and predictive_kl_weight == 0.0:
-                        mu_pred_flat, logvar_pred_flat, aux = self.latent_forecaster(
-                            contexts_flat, horizon=predictive_horizon
-                        )
-                        stability_penalty = aux.get("stability_penalty", stability_penalty)
-
-                    # Decode predicted latents to raw signal space
-                    _, mu_flat, logvar_flat = self.decoder(mu_pred_flat)
-                    mu_future = mu_flat.reshape(B_ctx, N, -1)
-                    logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
-
-                    window_len = mu_future.size(-1)
-                    start_positions = stride * (anchors.long() + 1)
-                    raw_offsets = torch.arange(window_len, device=device, dtype=torch.long)
-                    raw_indices = start_positions[:, None] + raw_offsets[None, :]
-                    raw_indices = raw_indices.unsqueeze(0).expand(B_ctx, -1, -1)
-
-                    target_windows = torch.gather(
-                        y_raw_eval.unsqueeze(1).expand(-1, N, -1),
-                        2,
-                        raw_indices.to(y_raw_eval.device),
-                    )
-
-                    forecast_nll = self.gaussian_nll(
-                        mu_future.reshape(B_ctx * N, window_len),
-                        logvar_future.reshape(B_ctx * N, window_len),
-                        target_windows.reshape(B_ctx * N, window_len),
-                    )
-
-        # Combined loss (LGSSM.md eq. lines 140-146)
-        total_loss = (
-            base_total
-            + latent_nll_weight * latent_nll
-            + forecast_weight * forecast_nll
-            + predictive_kl_weight * predictive_kl
-            + stability_weight * stability_penalty
-        )
-
-        base_losses["base_total_loss"] = base_total
-        base_losses["latent_nll_loss"] = latent_nll
-        base_losses["predictive_kl_loss"] = predictive_kl
-        base_losses["forecast_nll"] = forecast_nll
-        base_losses["predictive_loss"] = forecast_nll  # Backwards compatibility (logged elsewhere)
-        base_losses["stability_penalty"] = stability_penalty
-        base_losses["total_loss"] = total_loss
-        base_losses["classification_loss"] = None  # Required by interface
+        base_losses['base_total_loss'] = base_total
+        base_losses['latent_nll_loss'] = latent_nll
+        base_losses['total_loss'] = total_loss
+        base_losses['classification_loss'] = None
         return base_losses
 
     def measure_transfer_entropy(
@@ -2967,16 +2300,7 @@ class SeqVaeNoForecast(SeqVaeTeb):
         warmup_period: int = 30,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
-        context_len: int = 75,
         horizon_len: int = 30,
-        forecaster_hidden_dim: int = 128,
-        forecaster_lowrank: int = 0,
-        forecaster_alpha: float = 0.98,
-        forecaster_eig_fraction: float = 0.95,
-        forecaster_min_logvar: float = -7.0,
-        forecaster_max_logvar: float = 4.0,
-        forecaster_layers: int = 1,
-        forecaster_dropout: float = 0.0,
     ):
         super().__init__(
             sequence_length=sequence_length,
@@ -2987,16 +2311,7 @@ class SeqVaeNoForecast(SeqVaeTeb):
             warmup_period=warmup_period,
             lstm_hidden_dim=lstm_hidden_dim,
             lstm_num_layers=lstm_num_layers,
-            context_len=context_len,
             horizon_len=horizon_len,
-            forecaster_hidden_dim=forecaster_hidden_dim,
-            forecaster_lowrank=forecaster_lowrank,
-            forecaster_alpha=forecaster_alpha,
-            forecaster_eig_fraction=forecaster_eig_fraction,
-            forecaster_min_logvar=forecaster_min_logvar,
-            forecaster_max_logvar=forecaster_max_logvar,
-            forecaster_layers=forecaster_layers,
-            forecaster_dropout=forecaster_dropout,
             use_latent_forecaster=False,
             latent_forecaster=None,
         )
