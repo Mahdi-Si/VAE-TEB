@@ -1199,6 +1199,272 @@ class Decoder(nn.Module):
         }
 
 
+class SeqVaeCore(nn.Module):
+    """
+    Core sequential VAE module (encoders + decoder) with reconstruction losses.
+    """
+
+    def __init__(
+        self,
+        sequence_length: int = 300,
+        latent_dim_source: int = 16,
+        latent_dim_target: int = 16,
+        latent_dim_z: int = 16,
+        decimation_factor: int = 16,
+        warmup_period: int = 30,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 5,
+        *,
+        init_weights: bool = True,
+    ) -> None:
+        super().__init__()
+        self.sequence_length = sequence_length
+        self.latent_dim_source = latent_dim_source
+        self.latent_dim_target = latent_dim_target
+        self.latent_dim_z = latent_dim_z
+        self.decimation_factor = decimation_factor
+        self.warmup_period = warmup_period
+
+        self.source_encoder = SourceEncoder(
+            latent_dim=latent_dim_source,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
+        )
+        self.target_encoder = TargetEncoder(
+            latent_dim=latent_dim_target,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_num_layers=lstm_num_layers,
+        )
+        self.conditional_encoder = ConditionalEncoder(
+            dim_hx=latent_dim_source,
+            dim_hy=latent_dim_target,
+            dim_z=latent_dim_z,
+        )
+        self.decoder = Decoder(latent_dim=latent_dim_z, sequence_length=sequence_length)
+
+        if init_weights:
+            initialization(self)
+
+    def forward(
+        self,
+        y_st: torch.Tensor,  # (B, T, 43)
+        y_ph: torch.Tensor,  # (B, T, 44)
+        x_ph: torch.Tensor,  # (B, T, 130)
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass through the complete VAE (encode + decode).
+
+        Performs the full TEB encoding and reconstruction:
+            1. Encode source: $h_x = f_{source}(x_{ph})$
+            2. Encode target prior: $\mu_y, \log\sigma^2_y = f_{target}(y_{st}, y_{ph})$
+            3. Encode posterior: $\mu_{post}, \log\sigma^2_{post} = f_{cond}(h_x, c_{logvar})$
+            4. Add residual: $\mu_{post} += \mu_y$ (TEB residual connection)
+            5. Sample latent: $z \sim q(z|x,y)$
+            6. Decode: $p(y|z)$ with Gaussian likelihood
+
+        Args:
+            y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$ where
+                $B$ is batch size, $T$ is sequence_length (300), and 43 is the number
+                of scattering transform channels.
+            y_ph (torch.Tensor): Target phase harmonic features, shape $(B, T, 44)$.
+            x_ph (torch.Tensor): Source cross-phase harmonic features, shape $(B, T, 130)$.
+
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary containing:
+                - z: Sampled posterior latent, shape $(B, T, D_z)$.
+                - linear_output: Intermediate decoder features, shape $(B, T, 87)$.
+                - mu_pr: Predicted raw signal mean, shape $(B, 4800)$.
+                - logvar_pr: Predicted raw signal log-variance, shape $(B, 4800)$.
+                - mu_prior: Target prior mean, shape $(B, T, D_{target})$.
+                - logvar_prior: Target prior log-variance, shape $(B, T, D_{target})$.
+                - mu_post: Posterior mean after residual, shape $(B, T, D_z)$.
+                - logvar_post: Posterior log-variance, shape $(B, T, D_z)$.
+                - mu_next: None (legacy placeholder).
+                - logvar_next: None (legacy placeholder).
+                - next_step_indices: None (legacy placeholder).
+        """
+        mu_x = self.source_encoder(x_ph)
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
+
+        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
+        z = self.reparameterize(mu_post, logvar_post)
+
+        linear_output, mu_pr, logvar_pr = self.decoder(z)
+
+        return {
+            "z": z,  # (B, T, latent_dim_z)
+            "linear_output": linear_output,  # (B, T, 87)
+            "mu_pr": mu_pr,  # (B, 4800)
+            "logvar_pr": logvar_pr,  # (B, 4800)
+            "mu_next": None,  # Legacy placeholder
+            "logvar_next": None,  # Legacy placeholder
+            "next_step_indices": None,  # Legacy placeholder
+            "mu_prior": mu_y,  # (B, T, latent_dim_target)
+            "logvar_prior": logvar_y_prior,  # (B, T, latent_dim_target)
+            "mu_post": mu_post,  # (B, T, latent_dim_z)
+            "logvar_post": logvar_post,  # (B, T, latent_dim_z)
+        }
+
+    def encode_only(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        sample_z: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        mu_x = self.source_encoder(x_ph)
+        mu_y, logvar_y_prior, c_logvar = self.target_encoder(y_st, y_ph)
+        mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
+        mu_post = mu_post + mu_y
+        z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
+        return {
+            "mu_prior": mu_y,
+            "logvar_prior": logvar_y_prior,
+            "mu_post": mu_post,
+            "logvar_post": logvar_post,
+            "z": z,
+        }
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def _kld_loss(
+        mu_prior: torch.Tensor,
+        logvar_prior: torch.Tensor,
+        mu_post: torch.Tensor,
+        logvar_post: torch.Tensor,
+        *,
+        reduce_mean: bool = True,
+    ) -> torch.Tensor:
+        kld = (
+            logvar_prior
+            - logvar_post
+            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+            - 1.0
+        )
+        kld = 0.5 * kld
+        return kld.mean() if reduce_mean else kld.sum()
+
+    @staticmethod
+    def gaussian_nll(
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        var = logvar.exp()
+        nll = 0.5 * (logvar + (target - mu) ** 2 / var)
+        if mask is not None:
+            nll = nll * mask
+            denom = mask.sum().clamp_min(1.0)
+            return nll.sum() / denom
+        return nll.mean()
+
+    def _next_step_indices(self, device: torch.device) -> torch.Tensor:
+        steps = max(0, self.sequence_length - 1)
+        if steps == 0:
+            return torch.zeros(0, device=device, dtype=torch.long)
+        base = torch.arange(steps, device=device, dtype=torch.long) + 1
+        return self.decimation_factor * base
+
+    def compute_reconstruction_loss(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],  # Dict from forward()
+        y_st: torch.Tensor,  # (B, T, 43)
+        y_ph: torch.Tensor,  # (B, T, 44)
+        y_raw: torch.Tensor,  # (B, 4800) or (B, 4800, 1)
+        *,
+        compute_kld_loss: bool = True,
+        beta: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute reconstruction and regularization losses for VAE training.
+
+        Computes the complete VAE objective with three loss components:
+            1. MSE loss: Mean squared error between intermediate decoder features and
+               concatenated scattering + phase harmonic inputs (auxiliary supervision).
+            2. NLL loss: Gaussian negative log-likelihood for raw signal reconstruction
+               $p(y_{raw} | z)$, allowing heteroscedastic noise modeling.
+            3. KLD loss: Transfer entropy $\text{KL}(q(z|x,y) \| p(z|y))$ measuring
+               information flow from source to latent representation.
+
+        Total loss: $\mathcal{L} = \text{MSE} + \text{NLL} + \beta \cdot \text{KLD}$
+
+        Args:
+            forward_outputs (Dict[str, torch.Tensor]): Dictionary from forward() containing
+                mu_pr, logvar_pr, mu_prior, logvar_prior, mu_post, logvar_post, and
+                optionally linear_output.
+            y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$.
+            y_ph (torch.Tensor): Target phase harmonic features, shape $(B, T, 44)$.
+            y_raw (torch.Tensor): Raw target signal for reconstruction, shape $(B, 4800)$
+                or $(B, 4800, 1)$. If 3D with last dim=1, it will be squeezed to $(B, 4800)$.
+            compute_kld_loss (bool, optional): Whether to compute and include KL divergence
+                term. Set to False for deterministic autoencoders or ablation studies.
+                Defaults to True.
+            beta (float, optional): Weight for KL divergence term ($\beta$-VAE framework).
+
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary containing all loss components (all scalars):
+                - reconstruction_loss: MSE + NLL.
+                - mse_loss: Auxiliary MSE loss on intermediate features.
+                - nll_loss: Gaussian NLL for raw signal reconstruction.
+                - kld_loss: Transfer entropy $\text{KL}(q(z|x,y) \| p(z|y))$.
+                - total_loss: reconstruction_loss + $\beta$ * kld_loss.
+                - total_decoder_loss: Alias for reconstruction_loss (backward compatibility).
+        """
+        if y_raw.dim() == 3 and y_raw.size(-1) == 1:
+            y_raw = y_raw.squeeze(-1)
+
+        device = y_raw.device
+
+        mse_loss = torch.tensor(0.0, device=device)
+        linear_output = forward_outputs.get("linear_output")
+        if (
+            linear_output is not None
+            and linear_output.dim() == 3
+            and y_st.shape[:2] == linear_output.shape[:2]
+            and y_ph.shape[:2] == linear_output.shape[:2]
+            and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
+        ):
+            stacked_target = torch.cat([y_st, y_ph], dim=-1)
+            mse_loss = F.mse_loss(linear_output, stacked_target)
+
+        mu_pr = forward_outputs.get("mu_pr")
+        logvar_pr = forward_outputs.get("logvar_pr")
+        if mu_pr is not None and logvar_pr is not None:
+            var = logvar_pr.exp()
+            nll_loss = 0.5 * (logvar_pr + (y_raw - mu_pr) ** 2 / var)
+            nll_loss = nll_loss.mean()
+        else:
+            nll_loss = torch.tensor(0.0, device=device)
+
+        kld_loss = torch.tensor(0.0, device=y_raw.device)
+        if compute_kld_loss:
+            kld_loss = self._kld_loss(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"],
+                reduce_mean=True,
+            )
+
+        total_decoder = mse_loss + nll_loss
+        total_loss = total_decoder + beta * kld_loss
+        return {
+            "reconstruction_loss": total_decoder,  # scalar: MSE + NLL
+            "mse_loss": mse_loss,  # scalar: intermediate features MSE
+            "nll_loss": nll_loss,  # scalar: Gaussian NLL for raw signal
+            "kld_loss": kld_loss,  # scalar: KL(q(z|x,y) || p(z|y))
+            "total_loss": total_loss,  # scalar: reconstruction_loss + β * kld_loss
+            "total_decoder_loss": total_decoder,  # scalar: alias for reconstruction_loss
+        }
+
+
+
+
 class LatentForecaster(nn.Module):
     """
     Causal latent forecaster that consumes the full history and produces parallel
@@ -2807,3 +3073,4 @@ if __name__ == "__main__":
     # prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
     # loss = model.compute_loss(forward_outputs, y_raw_input)
     # print('done')
+
