@@ -134,7 +134,7 @@ class SeqVAEGraphModel:
 
                 # SeqVAE forecasting parameters
         self.model_horizon_len = int(vae_cfg.get('horizon_len', 30))
-        self.forecaster_hidden_dim = int(vae_cfg.get('forecaster_hidden_dim', 256))
+        self.forecaster_hidden_dim = int(vae_cfg.get('forecaster_hidden_dim', 128))
         self.forecaster_dropout = float(vae_cfg.get('forecaster_dropout', 0.1))
         self.forecaster_min_logvar = float(vae_cfg.get('forecaster_min_logvar', -7.0))
         self.forecaster_max_logvar = float(vae_cfg.get('forecaster_max_logvar', 4.0))
