@@ -189,7 +189,7 @@ def summarize_trajectory(
         latent_trajectory: np.ndarray of shape (time_steps, n_dims) or (batch_size, time_steps, n_dims)
         k: int, number of keyframes to extract (e.g., 1 for single summary, 5 for segments)
         method: str, summarization strategy
-            - 'changepoint': Change-point segmentation using ruptures library (preserves regimes)
+            - 'changepoint': Fast gradient-based segmentation tailored for high-dimensional regimes
             - 'rdp': Ramer-Douglas-Peucker polyline simplification (preserves shape)
             - 'quantile': Quantile samples along arclength (even coverage)
             - 'medoid': Single medoid (most representative point) - only for k=1
@@ -206,7 +206,7 @@ def summarize_trajectory(
     Notes:
         - For nonlinear embeddings (UMAP/Isomap), use 'medoid', 'changepoint', 'rdp', or 'quantile'
         - Avoid 'frechet' (average) for nonlinear embeddings as it may produce unrealizable points
-        - 'changepoint' requires ruptures package: pip install ruptures
+        - 'changepoint' leverages a fast gradient-based detector optimized for high-dimensional data
     """
     # Handle batch dimension
     if latent_trajectory.ndim == 3:
@@ -287,17 +287,9 @@ def summarize_trajectory(
         if precomputed_indices is not None:
             changepoint_indices = np.asarray(precomputed_indices, dtype=int)
         else:
-            try:
-                import ruptures as rpt
-            except ImportError:
-                raise ImportError(
-                    "ruptures library required for changepoint method. "
-                    "Install with: pip install ruptures"
-                )
-
-            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(latent_trajectory)
-            result = algo.predict(n_bkps=k-1)
-            changepoint_indices = np.asarray(result, dtype=int)
+            detector_fn = _create_changepoint_detector()
+            max_breakpoints = max(0, int(k) - 1)
+            changepoint_indices = detector_fn(latent_trajectory, max_breakpoints)
 
         if changepoint_indices is None:
             changepoint_indices = np.asarray([], dtype=int)
@@ -463,58 +455,118 @@ def summarize_trajectory(
 # ------------------------------------------------------
 
 def _create_changepoint_detector(
-    changepoint_algo: str = 'dynp',
-    changepoint_model: Optional[str] = 'rbf',
+    changepoint_algo: str = 'gradient',
+    changepoint_model: Optional[str] = None,
     changepoint_kwargs: Optional[Dict[str, Any]] = None
 ):
     """
-    Build a callable that detects changepoints using a ruptures algorithm.
+    Build a callable that detects changepoints using a fast gradient-based scoring strategy.
+
+    Args:
+        changepoint_algo: Alias for the detector type. Legacy values are accepted for backwards
+            compatibility but currently map to the same fast detector.
+        changepoint_model: Unused, kept for backwards compatibility with previous interfaces.
+        changepoint_kwargs: Optional parameters for the detector. Supported keys include:
+            - 'smoothing_window' (int >=1): moving-average window applied to the score (default: 5).
+            - 'min_distance' (int >=1): minimum separation between changepoints.
+            - 'min_distance_ratio' (float): ratio of the series length used when 'min_distance' is not set.
+            - 'candidate_pool_multiplier' (int >=1): multiplier for the candidate pool size (default: 5).
+            - 'normalize_differences' (bool): scale feature differences before scoring (default: True).
+            - 'robust_scale' (bool): use median/MAD scaling instead of standard deviation (default: False).
 
     Returns:
         Callable[[np.ndarray, int], np.ndarray]: function mapping (data, max_bkps) to changepoint indices.
     """
-    try:
-        import ruptures as rpt
-    except ImportError as exc:
-        raise ImportError(
-            "Changepoint detection requires the 'ruptures' package. Install with: pip install ruptures"
-        ) from exc
+    _ = changepoint_model  # Maintained for API compatibility.
+    algo_name = (changepoint_algo or 'gradient').lower()
+    if algo_name not in {'gradient', 'fast', 'auto'}:
+        # Map legacy ruptures identifiers to the fast detector without raising.
+        algo_name = 'gradient'
 
-    algo_name = (changepoint_algo or '').lower()
     base_kwargs = dict(changepoint_kwargs or {})
-
-    algo_map = {
-        'dynp': rpt.Dynp,
-        'pelt': rpt.Pelt,
-        'binseg': rpt.Binseg,
-        'bottomup': rpt.BottomUp,
-        'window': rpt.Window,
-    }
-
-    if algo_name not in algo_map:
-        valid = ", ".join(sorted(algo_map))
-        raise ValueError(f"Unsupported changepoint_algo '{changepoint_algo}'. Valid options: {valid}")
-
-    if changepoint_model is not None and 'model' not in base_kwargs:
-        base_kwargs['model'] = changepoint_model
-    if algo_name == 'dynp':
-        base_kwargs.setdefault('min_size', 2)
-        base_kwargs.setdefault('jump', 1)
-
-    AlgoCls = algo_map[algo_name]
+    smoothing_window = int(max(1, base_kwargs.pop('smoothing_window', 5)))
+    min_distance = base_kwargs.pop('min_distance', None)
+    min_distance_ratio = float(base_kwargs.pop('min_distance_ratio', 0.05))
+    candidate_pool_multiplier = max(1, int(base_kwargs.pop('candidate_pool_multiplier', 5)))
+    normalize_differences = bool(base_kwargs.pop('normalize_differences', True))
+    robust_scale = bool(base_kwargs.pop('robust_scale', False))
 
     def _detect(sample_array: np.ndarray, max_bkps: int) -> np.ndarray:
         if max_bkps <= 0:
             return np.asarray([], dtype=int)
 
-        kwargs = dict(base_kwargs)
-        algo = AlgoCls(**kwargs)
-        algo = algo.fit(sample_array)
-        bkps = algo.predict(n_bkps=max_bkps)
-        return np.asarray(
-            sorted({int(idx) for idx in bkps if 0 < idx < sample_array.shape[0]}),
-            dtype=int
-        )
+        data = np.asarray(sample_array, dtype=np.float64)
+        if data.ndim == 1:
+            data = data[:, None]
+        if data.ndim != 2:
+            raise ValueError(
+                f"sample_array must be 1D or 2D; received shape {data.shape}"
+            )
+
+        n_samples = data.shape[0]
+        if n_samples <= 1:
+            return np.asarray([], dtype=int)
+
+        diffs = np.diff(data, axis=0)
+        if diffs.size == 0:
+            return np.asarray([], dtype=int)
+
+        if np.isnan(diffs).any() or np.isinf(diffs).any():
+            diffs = np.nan_to_num(diffs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if normalize_differences:
+            if robust_scale:
+                median = np.median(diffs, axis=0)
+                mad = np.median(np.abs(diffs - median), axis=0)
+                mad[mad < 1e-12] = 1.0
+                diffs = (diffs - median) / mad
+            else:
+                std = diffs.std(axis=0, ddof=1)
+                std[std < 1e-12] = 1.0
+                diffs = diffs / std
+
+        scores = np.linalg.norm(diffs, axis=1)
+
+        if smoothing_window > 1 and scores.size >= smoothing_window:
+            kernel = np.ones(smoothing_window, dtype=np.float64) / float(smoothing_window)
+            scores = np.convolve(scores, kernel, mode='same')
+
+        candidate_pool = max(max_bkps, candidate_pool_multiplier * max_bkps)
+        candidate_pool = min(candidate_pool, scores.size)
+        if candidate_pool <= 0:
+            return np.asarray([], dtype=int)
+
+        # Select top candidates based on score magnitude.
+        candidate_indices = np.argpartition(-scores, candidate_pool - 1)[:candidate_pool]
+        ranked_indices = sorted(candidate_indices, key=lambda idx: scores[idx], reverse=True)
+
+        if min_distance is not None:
+            min_sep = max(1, int(min_distance))
+        else:
+            min_sep = max(1, int(round(min_distance_ratio * n_samples)))
+
+        selected: List[int] = []
+        for idx in ranked_indices:
+            cp = idx + 1  # Convert diff index to changepoint position.
+            if cp <= 0 or cp >= n_samples:
+                continue
+            if all(abs(cp - prev) >= min_sep for prev in selected):
+                selected.append(cp)
+            if len(selected) >= max_bkps:
+                break
+
+        if len(selected) < max_bkps:
+            # Relax spacing constraints if we still need more changepoints.
+            for idx in ranked_indices:
+                cp = idx + 1
+                if cp <= 0 or cp >= n_samples or cp in selected:
+                    continue
+                selected.append(cp)
+                if len(selected) >= max_bkps:
+                    break
+
+        selected = sorted(set(selected))
+        return np.asarray(selected[:max_bkps], dtype=int)
 
     return _detect
 
@@ -526,8 +578,8 @@ def detect_changepoints(
     raw_signal=None,
     detect_raw: bool = True,
     detector=None,
-    changepoint_algo: str = 'dynp',
-    changepoint_model: Optional[str] = 'rbf',
+    changepoint_algo: str = 'gradient',
+    changepoint_model: Optional[str] = None,
     changepoint_kwargs: Optional[Dict[str, Any]] = None
 ) -> Dict[str, np.ndarray]:
     """
@@ -618,8 +670,8 @@ def plot_latent_changepoints_with_raw(
     max_samples=5,
     random_state=None,
     show_colorbar=True,
-    changepoint_algo='dynp',
-    changepoint_model='rbf',
+    changepoint_algo='gradient',
+    changepoint_model=None,
     changepoint_kwargs=None,
     precomputed_changepoints=None
 ):
@@ -641,9 +693,9 @@ def plot_latent_changepoints_with_raw(
         max_samples: int, maximum number of samples to visualize (randomly selected, default: 5).
         random_state: Optional int for reproducible sample selection.
         show_colorbar: bool, whether to attach a colorbar next to each latent plot.
-        changepoint_algo: str, ruptures algorithm name applied to latent & raw (e.g., 'dynp', 'pelt').
-        changepoint_model: str or None, model argument forwarded to ruptures (e.g., 'rbf', 'l2').
-        changepoint_kwargs: Optional dict, extra keyword arguments for the ruptures algorithm.
+        changepoint_algo: str, detector alias applied to latent & raw (legacy names are accepted).
+        changepoint_model: str or None, currently unused (retained for backwards compatibility).
+        changepoint_kwargs: Optional dict, extra keyword arguments for the fast detector (e.g., smoothing_window).
         precomputed_changepoints: Optional dict or list/tuple containing per-sample changepoint
             results (as returned by `detect_changepoints`). If provided, detections are reused.
 
@@ -655,7 +707,7 @@ def plot_latent_changepoints_with_raw(
             - 'raw_detected_changepoints' (np.ndarray of raw indices detected from raw signals)
 
     Notes:
-        - Changepoints are detected in latent space and FHR space using the same ruptures settings.
+        - Changepoints are detected in latent space and FHR space using the same gradient-based settings.
         - Raw changepoints mapped from latent are derived by multiplying latent indices by decimation_factor.
     """
     def _to_numpy(data):
@@ -939,8 +991,8 @@ def summarize_latent_segments(
     n_changepoints: int = 5,
     decimation_factor: int = 16,
     raw_sample_rate_hz: float = 4.0,
-    changepoint_algo: str = 'dynp',
-    changepoint_model: Optional[str] = 'rbf',
+    changepoint_algo: str = 'gradient',
+    changepoint_model: Optional[str] = None,
     changepoint_kwargs: Optional[Dict[str, Any]] = None,
     precomputed_changepoints: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
@@ -955,9 +1007,9 @@ def summarize_latent_segments(
         n_changepoints: Maximum number of changepoints to detect per sample (>=0).
         decimation_factor: Ratio between raw signal length and latent length (default: 16).
         raw_sample_rate_hz: Raw sampling rate in Hz (default: 4.0).
-        changepoint_algo: ruptures algorithm name (e.g., 'dynp', 'pelt').
-        changepoint_model: Model argument passed to ruptures (e.g., 'rbf', 'l2'); set None to skip.
-        changepoint_kwargs: Extra kwargs forwarded to the ruptures algorithm constructor.
+        changepoint_algo: Detector alias (legacy ruptures names are mapped automatically).
+        changepoint_model: Optional legacy argument retained for compatibility; ignored by the fast detector.
+        changepoint_kwargs: Extra kwargs forwarded to the gradient-based detector.
         precomputed_changepoints: Optional dict/list containing per-sample changepoint dictionaries
             (as returned by `detect_changepoints`). When supplied, latent changepoints are reused.
 
@@ -1293,7 +1345,7 @@ def plot_complete_fhr_up_timeline(
         - Missing segments will appear as gaps in the timeline
         - The plot is wide and zoomable for detailed inspection
         - X-axis shows time in minutes before birth (negative values)
-        - Changepoint detection uses ruptures library (install with: pip install ruptures)
+        - Changepoint detection uses the same fast gradient-based detector as latent analysis
         - Changepoints are detected independently for each 20-minute segment
     """
     try:
@@ -1327,6 +1379,8 @@ def plot_complete_fhr_up_timeline(
         subplot_titles=('Fetal Heart Rate (FHR)', 'Uterine Pressure (UP)'),
         row_heights=[0.5, 0.5]
     )
+
+    detector_fn = _create_changepoint_detector() if detect_changepoints else None
 
     # Plot each segment individually so they don't connect
     for i in range(batch_size):
@@ -1368,46 +1422,41 @@ def plot_complete_fhr_up_timeline(
         )
 
         # Detect and visualize changepoints if requested
-        if detect_changepoints:
-            try:
-                import ruptures as rpt
-            except ImportError:
-                if i == 0:  # Only warn once
-                    logger.warning(
-                        "ruptures library required for changepoint detection. "
-                        "Install with: pip install ruptures"
-                    )
-                continue
-
-            # Apply changepoint detection to FHR signal for this segment
+        if detect_changepoints and detector_fn is not None:
             fhr_signal = fhr[i].reshape(-1, 1)  # Shape (time_steps, 1)
 
-            # Use Dynp (dynamic programming) algorithm
-            algo = rpt.Dynp(model="rbf", min_size=2, jump=1).fit(fhr_signal)
+            # Determine a reasonable number of breakpoints while guarding short segments.
+            max_possible_segments = max(1, time_steps // 10)  # At least 10 points per segment
+            requested_segments = max(1, int(n_changepoints))
+            actual_segments = min(requested_segments, max_possible_segments)
+            per_segment_bkps = max(0, actual_segments - 1)
 
-            # Find n_changepoints segments (n_changepoints-1 breakpoints)
-            # Handle case where segment is too short for requested changepoints
-            max_possible_changepoints = max(1, time_steps // 10)  # At least 10 points per segment
-            actual_n_changepoints = min(n_changepoints, max_possible_changepoints)
+            if per_segment_bkps <= 0:
+                continue
 
             try:
-                changepoint_indices = algo.predict(n_bkps=actual_n_changepoints - 1)
-            except Exception as e:
-                logger.warning(f"Changepoint detection failed for epoch {i}: {e}")
+                changepoint_indices = detector_fn(fhr_signal, per_segment_bkps)
+            except Exception as exc:
+                if i == 0:
+                    logger.warning(f"Changepoint detection failed for epoch {i}: {exc}")
+                continue
+
+            changepoint_indices = np.asarray(changepoint_indices, dtype=int)
+            if changepoint_indices.size == 0:
                 continue
 
             # Convert changepoint indices to time in minutes
-            changepoint_times = segment_start_minutes + np.array(changepoint_indices) * time_per_step / 60.0
+            changepoint_times = segment_start_minutes + changepoint_indices * time_per_step / 60.0
 
             # Add vertical lines at changepoints on FHR plot
-            for cp_idx, cp_time in enumerate(changepoint_times[:-1]):  # Exclude last point (end of segment)
+            for cp_idx, cp_time in enumerate(changepoint_times):
                 fig.add_vline(
                     x=cp_time,
                     line=dict(color='green', width=2, dash='dash'),
                     opacity=0.6,
                     row=1, col=1,
                     annotation=dict(
-                        text=f'CP',
+                        text='CP',
                         showarrow=False,
                         font=dict(size=10, color='green'),
                         yshift=10
