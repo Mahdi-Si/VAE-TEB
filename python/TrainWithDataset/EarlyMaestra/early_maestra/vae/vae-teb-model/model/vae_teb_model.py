@@ -110,8 +110,7 @@ class CausalConv1d(nn.Module):
         bias: bool = True,
         groups: int = 1,
     ):
-        super(CausalConv1d, self).__init__()
-        # left padding for causal convolution
+        super().__init__()
         self.left_padding = (kernel_size - 1) * dilation
         self.conv = nn.Conv1d(
             in_channels,
@@ -134,23 +133,133 @@ class CausalConv1d(nn.Module):
         if self.left_padding > 0:
             x = F.pad(x, (self.left_padding, 0))
         return self.conv(x)
+class DropPath(nn.Module):
+    """Stochastic depth per-sample dropping of entire residual paths."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * random_tensor / keep_prob
 
 
 class TCNBlock(nn.Module):
-    def __init__(self, ch, kernel_size=3, dilation=1, dropout=0.1):
+    def __init__(self, ch, kernel_size=3, dilation=1, dropout=0.1, *, channel_dropout=0.0, drop_path=0.0):
         super().__init__()
-        self.c1 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.c1 = CausalConv1d(ch, ch, kernel_size, dilation=dilation)
         self.n1 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
-        self.c2 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.c2 = CausalConv1d(ch, ch, kernel_size, dilation=dilation)
         self.n2 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
-        self.drop = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.channel_dropout = nn.Dropout1d(channel_dropout) if channel_dropout > 0.0 else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
     def forward(self, x):  # (B,C,T)
-        y = self.c1(x); y = F.gelu(self.n1(y))
-        y = self.c2(y); y = self.n2(y)
-        y = self.drop(y)
-        return F.gelu(x + y)
+        residual = x
+        y = self.c1(x)
+        y = F.gelu(self.n1(y))
+        y = self.c2(y)
+        y = self.n2(y)
+        y = self.channel_dropout(y)
+        y = self.dropout(y)
+        y = self.drop_path(y)
+        return F.gelu(residual + y)
 
 
+
+class CausalTemporalConvNet(nn.Module):
+    """Causal multi-layer temporal convolutional network used in place of recurrent branches."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        *,
+        num_layers: int = 4,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        dilation_growth: int = 2,
+        output_dim: Optional[int] = None,
+        channel_dropout: float = 0.0,
+        drop_path_rate: float = 0.0,
+    ):
+        super().__init__()
+        output_dim = output_dim or hidden_dim
+
+        self.input_projection = (
+            nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        )
+        self.pre_norm = nn.LayerNorm(hidden_dim)
+        self.tcn_blocks = nn.ModuleList()
+        dilation = 1
+        if num_layers <= 0:
+            raise ValueError("num_layers must be >= 1 for CausalTemporalConvNet")
+        drop_rates = torch.linspace(0.0, drop_path_rate, steps=num_layers).tolist()
+        for idx in range(num_layers):
+            self.tcn_blocks.append(
+                TCNBlock(
+                    hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                    channel_dropout=channel_dropout,
+                    drop_path=drop_rates[idx],
+                )
+            )
+            dilation = max(1, dilation * dilation_growth)
+
+        self.post_norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = (
+            nn.Linear(hidden_dim, output_dim) if output_dim != hidden_dim else nn.Identity()
+        )
+        self.final_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (B, T, input_dim)
+        Returns:
+            Tensor of shape (B, T, output_dim)
+        """
+        x_proj = self.input_projection(x)
+        x_proj = self.pre_norm(x_proj)
+        y = x_proj.transpose(1, 2).contiguous()
+        for block in self.tcn_blocks:
+            y = block(y)
+        y = y.transpose(1, 2).contiguous()
+        y = y + x_proj
+        y = self.post_norm(y)
+        y = self.final_dropout(y)
+        y = self.output_projection(y)
+        return y
+
+
+
+
+
+class TemporalFusionGate(nn.Module):
+    """Learned gating between convolutional and temporal features."""
+
+    def __init__(self, conv_dim: int, temporal_dim: int, fused_dim: int, *, dropout: float = 0.0):
+        super().__init__()
+        self.conv_proj = nn.Linear(conv_dim, fused_dim)
+        self.temporal_proj = nn.Linear(temporal_dim, fused_dim)
+        self.gate_proj = nn.Linear(fused_dim * 2, fused_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, conv_feat: torch.Tensor, temporal_feat: torch.Tensor) -> torch.Tensor:
+        conv_z = self.conv_proj(conv_feat)
+        temporal_z = self.temporal_proj(temporal_feat)
+        gate_input = torch.cat([conv_z, temporal_z], dim=-1)
+        gate = torch.sigmoid(self.gate_proj(gate_input))
+        fused = gate * conv_z + (1.0 - gate) * temporal_z
+        return self.dropout(fused)
 class CausalMultiChannelConvBlock(nn.Module):
     """
     Causal version of MultiChannelConvBlock that ensures no future information leaks.
@@ -376,11 +485,12 @@ class ResidualMLP(nn.Module):
 
 
 
+
 class TargetEncoder(nn.Module):
     """
     Encodes the target signal (y) to produce the parameters of the prior distribution p(z|y).
 
-    Architecture: Parallel Conv-LSTM design for complementary temporal modeling
+    Architecture: Parallel Conv-TCN design for complementary temporal modeling
 
     The target signal is composed of two parts: scattering transform features (y_st) and
     phase harmonic features (y_ph). These are processed through:
@@ -389,12 +499,13 @@ class TargetEncoder(nn.Module):
     2. Modality-specific convs: Multi-scale local feature extraction (dilations: 1, 2, 4)
     3. PARALLEL temporal branches:
         - Conv branch: Additional dilated convs (dilations: 8, 16) for ~35s receptive field
-        - LSTM branch: Bidirectional LSTM for global sequential dependencies (~75s)
-    4. Fusion: Concatenate parallel outputs and project to final latent dimension
+        - TCN branch: Deep causal TCN with exponentially grown dilation for global dependencies (~75s)
+    4. Fusion: Concatenate gated parallel outputs and project to final latent dimension
 
     This design provides complementary temporal modeling:
         - Conv: Local patterns (accelerations, sharp changes) with exponential receptive field
-        - LSTM: Global context (baseline drift, long UC contractions, state transitions)
+        - TCN: Global context (baseline drift, long UC contractions, state transitions)
+        - Gate: Adaptive weighting that balances modalities and regularizes long-context usage
 
     Shapes:
     - Inputs:
@@ -419,10 +530,17 @@ class TargetEncoder(nn.Module):
     ):
         super(TargetEncoder, self).__init__()
 
+        if use_bidirectional_lstm:
+            log.warning(
+                "Bidirectional LSTM setting is deprecated; using causal TCN branch instead."
+            )
+
         self.latent_dim = latent_dim
-        self.lstm_hidden_dim = lstm_hidden_dim
-        self.lstm_num_layers = lstm_num_layers
-        self.use_bidirectional = use_bidirectional_lstm
+        self.lstm_hidden_dim = lstm_hidden_dim  # Backwards compatible attribute name
+        self.lstm_num_layers = lstm_num_layers  # Backwards compatible attribute name
+        self.temporal_hidden_dim = lstm_hidden_dim
+        self.temporal_num_layers = lstm_num_layers
+        self.use_bidirectional = False
         self.activation = activation
 
         combined_in = input_dim_st + input_dim_ph
@@ -433,7 +551,7 @@ class TargetEncoder(nn.Module):
             use_skip_connection=True,
             activation=nn.GELU
         )
-        
+
         self.mlp_combined_2 = ResidualMLP(
             input_dim=87,
             hidden_dims=geometric_schedule(87, 32, 6),
@@ -441,7 +559,7 @@ class TargetEncoder(nn.Module):
             use_skip_connection=True,
             activation=nn.GELU
         )
-        
+
         self.mlp_combined_skip_proj_1 = nn.Linear(combined_in, 32)
         self.mlp_combined_skip_proj_2 = nn.Linear(combined_in, 32)
 
@@ -458,21 +576,30 @@ class TargetEncoder(nn.Module):
         self.stack_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
         self.fused_norm = nn.LayerNorm(32)
 
+        temporal_channel_dropout = min(0.2, conv_dropout * 1.5)
+        temporal_drop_path = 0.1 if self.temporal_num_layers > 1 else 0.0
+        temporal_gate_dropout = min(0.2, lstm_dropout + conv_dropout)
 
-        self.lstm_temporal = nn.LSTM(
-            input_size=32,
-            hidden_size=lstm_hidden_dim,
-            num_layers=lstm_num_layers,
-            batch_first=True,
-            bidirectional=use_bidirectional_lstm,
-            dropout=lstm_dropout if lstm_num_layers > 1 else 0.0,
+        self.temporal_tcn = CausalTemporalConvNet(
+            input_dim=32,
+            hidden_dim=self.temporal_hidden_dim,
+            num_layers=self.temporal_num_layers,
+            kernel_size=5,
+            dropout=lstm_dropout,
+            dilation_growth=2,
+            output_dim=self.temporal_hidden_dim,
+            channel_dropout=temporal_channel_dropout,
+            drop_path_rate=temporal_drop_path,
+        )
+        self.temporal_out_norm = nn.LayerNorm(self.temporal_hidden_dim)
+        self.temporal_gate = TemporalFusionGate(
+            conv_dim=32,
+            temporal_dim=self.temporal_hidden_dim,
+            fused_dim=32,
+            dropout=temporal_gate_dropout,
         )
 
-        lstm_output_dim = lstm_hidden_dim * (2 if use_bidirectional_lstm else 1)
-        self.lstm_temporal_norm = nn.LayerNorm(lstm_output_dim)
-
-        parallel_concat_dim =  lstm_output_dim + 32
-
+        parallel_concat_dim = 32 + self.temporal_hidden_dim + 32
         self.fusion = ResidualMLP(
             input_dim=parallel_concat_dim,
             hidden_dims=geometric_schedule(parallel_concat_dim, 32, 5),
@@ -511,42 +638,21 @@ class TargetEncoder(nn.Module):
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]],
     ]:
-        """Forward pass through the parallel Conv-LSTM encoder.
-
-        Processing stages:
-            1. Modality-specific MLPs project inputs to latent dimension
-            2. Modality-specific dilated conv stacks (RF ≈ 10.75s)
-            3. Concatenate scattering and phase features
-            4. PARALLEL temporal branches:
-                - Conv branch: Extended dilated convs (RF ≈ 35s)
-                - LSTM branch: Bidirectional LSTM (RF = full 75s)
-            5. Fusion: Concatenate and project parallel outputs
-            6. Output heads: Generate mu, logvar, and conditioning features
-
-        Args:
-            scattering_input (torch.Tensor): Scattering transform features, shape $(B, T, 43)$.
-            phase_harmonic_input (torch.Tensor): Phase harmonic features, shape $(B, T, 44)$.
-            return_hidden (bool, optional): Whether to return intermediate hidden states for
-                debugging/analysis. Defaults to False.
-
-        Returns:
-            Tuple containing:
-                - mu (torch.Tensor): Mean of prior distribution $p(z|y)$, shape $(B, T, D)$.
-                - prior_logvar (torch.Tensor): Log-variance of prior, shape $(B, T, D)$.
-                - cond_features (torch.Tensor): Conditioning features for ConditionalEncoder, shape $(B, T, D)$.
-                - hidden_states (Dict[str, torch.Tensor], optional): Intermediate activations if return_hidden=True.
-        """
+        """Forward pass through the parallel Conv-TCN encoder."""
         hidden_states = {} if return_hidden else None
 
         combined = torch.cat([scattering_input, phase_harmonic_input], dim=-1)  # (B, T, 87)
         x_linear = self.mlp_combined_1(combined)
         x_linear_ = self.mlp_combined_2(x_linear + combined)  # (B, T, 32)
-        x_linear = x_linear_ + self.mlp_combined_skip_proj_1(combined) + self.mlp_combined_skip_proj_2(x_linear)  # (B, T, 32)
-        
+        x_linear = (
+            x_linear_
+            + self.mlp_combined_skip_proj_1(combined)
+            + self.mlp_combined_skip_proj_2(x_linear)
+        )  # (B, T, 32)
+
         if return_hidden:
             hidden_states["combined_mlp"] = x_linear
 
-        # === STAGE 2 (new): Single causal conv stack ===
         x_conv = x_linear.transpose(1, 2)  # (B, 32, T)
         conv_1 = self.conv_1(x_conv)
         conv_2 = self.conv_2(conv_1)
@@ -557,17 +663,15 @@ class TargetEncoder(nn.Module):
         if return_hidden:
             hidden_states["conv_stack_output"] = conv_output
 
-        lstm_temporal, (hidden, cell) = self.lstm_temporal(x_linear)
-        lstm_temporal = self.lstm_temporal_norm(lstm_temporal)
+        temporal_features = self.temporal_out_norm(self.temporal_tcn(x_linear))
+        gated_temporal = self.temporal_gate(conv_output, temporal_features)
 
         if return_hidden:
-            hidden_states["lstm_temporal"] = lstm_temporal
-            hidden_states["lstm_hidden"] = hidden
-            hidden_states["lstm_cell"] = cell
+            hidden_states["temporal_tcn"] = temporal_features
+            hidden_states["temporal_gate"] = gated_temporal
 
-
-        parallel_concat = torch.cat([conv_output, lstm_temporal], dim=-1)
-        fused = self.fusion(parallel_concat)  # (B, T, 32)
+        parallel_concat = torch.cat([conv_output, temporal_features, gated_temporal], dim=-1)
+        fused = self.fusion(parallel_concat)
 
         if return_hidden:
             hidden_states["parallel_concat"] = parallel_concat
@@ -590,10 +694,7 @@ class TargetEncoder(nn.Module):
     def get_encoder_features(
         self, scattering_input: torch.Tensor, phase_harmonic_input: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Extract encoder features without variational sampling.
-        Useful for analysis and visualization.
-        """
+        """Extract encoder features without variational sampling."""
         with torch.no_grad():
             mu, _, _ = self.forward(scattering_input, phase_harmonic_input)
             return mu
@@ -604,7 +705,7 @@ class SourceEncoder(nn.Module):
     """
     Encodes the source signal (x) to produce a deterministic latent representation h_x.
 
-    Architecture: Parallel Conv-LSTM design for complementary temporal modeling
+    Architecture: Parallel Conv-TCN design for complementary temporal modeling
 
     This encoder processes the source signal features (cross-phase UP+FHR) through:
 
@@ -612,8 +713,8 @@ class SourceEncoder(nn.Module):
     2. Dilated conv stack: Multi-scale local feature extraction (dilations: 1, 2, 4)
     3. PARALLEL temporal branches:
         - Conv branch: Additional dilated convs (dilations: 8, 16) for ~35s receptive field
-        - LSTM branch: Unidirectional LSTM for global sequential dependencies (~75s)
-    4. Fusion: Concatenate parallel outputs and project to final latent dimension
+        - TCN branch: Deep causal TCN with exponentially grown dilation for global dependencies (~75s)
+    4. Fusion: Concatenate gated parallel outputs and project to final latent dimension
     5. Output: Deterministic latent vector h_x (used to condition posterior)
 
     Note: Unlike TargetEncoder, this outputs only a deterministic representation (no logvar).
@@ -621,7 +722,7 @@ class SourceEncoder(nn.Module):
 
     This design provides complementary temporal modeling:
         - Conv: Local UC patterns (contractions, intensity changes) with exponential receptive field
-        - LSTM: Global context (UC history, state transitions, long-term coupling)
+        - TCN: Global context (UC history, state transitions, long-term coupling)
 
     Shapes:
     - Input:  x_ph (B, T, 130) - Cross-phase harmonic features (UP + FHR)
@@ -632,8 +733,8 @@ class SourceEncoder(nn.Module):
         self,
         input_channels: int = 130,
         latent_dim: int = 16,
-        lstm_hidden_dim: int = 64,  # Reduced from 128 (parallel design needs less)
-        lstm_num_layers: int = 4,   # Reduced from 4 (parallel design needs less)
+        lstm_hidden_dim: int = 64,
+        lstm_num_layers: int = 4,
         conv_dropout: float = 0.1,
         lstm_dropout: float = 0.1,
     ):
@@ -641,10 +742,11 @@ class SourceEncoder(nn.Module):
 
         self.input_channels = input_channels
         self.latent_dim = latent_dim
-        self.lstm_hidden_dim = lstm_hidden_dim
-        self.lstm_num_layers = lstm_num_layers
+        self.lstm_hidden_dim = lstm_hidden_dim  # Backwards compatible attribute name
+        self.lstm_num_layers = lstm_num_layers  # Backwards compatible attribute name
+        self.temporal_hidden_dim = lstm_hidden_dim
+        self.temporal_num_layers = lstm_num_layers
 
-        # === STAGE 1: Input MLP ===
         self.mlp = ResidualMLP(
             input_dim=130,
             hidden_dims=geometric_schedule(130, 32, 6),
@@ -667,17 +769,30 @@ class SourceEncoder(nn.Module):
         self.source_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
 
         self.fused_norm = nn.LayerNorm(32)
-        self.lstm_temporal = nn.LSTM(
-            input_size=32,
-            hidden_size=lstm_hidden_dim,
-            num_layers=lstm_num_layers,
-            batch_first=True,
-            bidirectional=False,  # Keep unidirectional for source
-            dropout=lstm_dropout if lstm_num_layers > 1 else 0.0,
-        )
-        self.lstm_temporal_norm = nn.LayerNorm(lstm_hidden_dim)
+        temporal_channel_dropout = min(0.2, conv_dropout * 1.5)
+        temporal_drop_path = 0.1 if self.temporal_num_layers > 1 else 0.0
+        temporal_gate_dropout = min(0.2, lstm_dropout + conv_dropout)
 
-        parallel_concat_dim = 32 + lstm_hidden_dim
+        self.temporal_tcn = CausalTemporalConvNet(
+            input_dim=32,
+            hidden_dim=self.temporal_hidden_dim,
+            num_layers=self.temporal_num_layers,
+            kernel_size=5,
+            dropout=lstm_dropout,
+            dilation_growth=2,
+            output_dim=self.temporal_hidden_dim,
+            channel_dropout=temporal_channel_dropout,
+            drop_path_rate=temporal_drop_path,
+        )
+        self.temporal_out_norm = nn.LayerNorm(self.temporal_hidden_dim)
+        self.temporal_gate = TemporalFusionGate(
+            conv_dim=32,
+            temporal_dim=self.temporal_hidden_dim,
+            fused_dim=32,
+            dropout=temporal_gate_dropout,
+        )
+
+        parallel_concat_dim = 32 + self.temporal_hidden_dim + 32
 
         self.fusion = ResidualMLP(
             input_dim=parallel_concat_dim,
@@ -697,28 +812,7 @@ class SourceEncoder(nn.Module):
     def forward(
         self, x: torch.Tensor, return_intermediate: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """Forward pass through the parallel Conv-LSTM encoder.
-
-        Processing stages:
-            1. Initial MLP projects 130-channel input to 32D
-            2. Dilated conv stack (RF ≈ 10.75s) with dilations [1, 2, 4]
-            3. PARALLEL temporal branches:
-                - Conv branch: Extended dilated convs (RF ≈ 35s) with dilations [8, 16]
-                - LSTM branch: Unidirectional LSTM (RF = full 75s)
-            4. Fusion: Concatenate and project parallel outputs
-            5. Output head: Generate deterministic mu_x
-
-        Args:
-            x (torch.Tensor): Cross-phase harmonic features (UP+FHR), shape $(B, T, 130)$.
-            return_intermediate (bool, optional): Whether to return intermediate activations
-                for debugging/analysis. Defaults to False.
-
-        Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-                - mu_x (torch.Tensor): Deterministic source encoding, shape $(B, T, D)$.
-                - intermediates (Dict[str, torch.Tensor], optional): Intermediate activations
-                    if return_intermediate=True.
-        """
+        """Forward pass through the parallel Conv-TCN encoder."""
         intermediates = {} if return_intermediate else None
         x_linear = self.mlp(x)  # (B, T, 32)
 
@@ -741,16 +835,14 @@ class SourceEncoder(nn.Module):
         if return_intermediate:
             intermediates["conv_stack_output"] = conv_out
 
-        lstm_temporal, (hidden, cell) = self.lstm_temporal(x_linear)  # (B, T, 64)
-        lstm_temporal = self.lstm_temporal_norm(lstm_temporal)
+        temporal_features = self.temporal_out_norm(self.temporal_tcn(x_linear))
+        gated_temporal = self.temporal_gate(conv_out, temporal_features)
 
         if return_intermediate:
-            intermediates["lstm_temporal"] = lstm_temporal
-            intermediates["lstm_hidden"] = hidden
-            intermediates["lstm_cell"] = cell
+            intermediates["temporal_tcn"] = temporal_features
+            intermediates["temporal_gate"] = gated_temporal
 
-
-        parallel_concat = torch.cat([conv_out, lstm_temporal], dim=-1)  # (B, T, 96)
+        parallel_concat = torch.cat([conv_out, temporal_features, gated_temporal], dim=-1)  # (B, T, 32 + H + 32)
         fused = self.fusion(parallel_concat)  # (B, T, 32)
 
         if return_intermediate:
@@ -768,7 +860,6 @@ class SourceEncoder(nn.Module):
     def get_sequence_encoding(self, x: torch.Tensor, timestep: int) -> torch.Tensor:
         """
         Get encoding up to a specific timestep (causal encoding).
-        Useful for incremental inference.
 
         Args:
             x: Input tensor from optimized dataloader (batch_size, seq_len=300, channels=130) - fhr_up_ph cross-phase features
@@ -854,6 +945,7 @@ class ConditionalEncoder(nn.Module):
         return mu, logvar
 
 
+
 class Decoder(nn.Module):
     def __init__(
         self,
@@ -874,28 +966,38 @@ class Decoder(nn.Module):
         self.target_length = target_length
 
         self.feature_expansion = ResidualMLP(
-                input_dim=latent_dim,
-                hidden_dims=geometric_schedule(latent_dim, 32, 5),
-                final_activation=True,
-                use_skip_connection=True, 
-                activation=nn.GELU,
-                )
-
-        self.lstm_temporal = nn.LSTM(
-            input_size=latent_dim,
-            hidden_size=32,
-            num_layers=4,
-            batch_first=True,
-            bidirectional=False,
-            dropout=0.1,
+            input_dim=latent_dim,
+            hidden_dims=geometric_schedule(latent_dim, 32, 5),
+            final_activation=True,
+            use_skip_connection=True,
+            activation=nn.GELU,
         )
-        
+
+        self.temporal_tcn = CausalTemporalConvNet(
+            input_dim=latent_dim,
+            hidden_dim=32,
+            num_layers=4,
+            kernel_size=5,
+            dropout=0.1,
+            dilation_growth=2,
+            output_dim=32,
+            channel_dropout=0.05,
+            drop_path_rate=0.1,
+        )
+        self.temporal_out_norm = nn.LayerNorm(32)
+        self.latent_temporal_gate = TemporalFusionGate(
+            conv_dim=32,
+            temporal_dim=32,
+            fused_dim=32,
+            dropout=0.05,
+        )
+
         self.skip_z_expanded = nn.Linear(latent_dim, 64)
         self.temporal_fusion_layer_norm = nn.LayerNorm(64)
-        
+
         self.pre_linear = ResidualMLP(
             input_dim=64,
-            hidden_dims=geometric_schedule(64, 87, 5), 
+            hidden_dims=geometric_schedule(64, 87, 5),
             final_activation=False,
             activation=nn.GELU,
             use_skip_connection=True
@@ -917,11 +1019,9 @@ class Decoder(nn.Module):
         self.norm_4 = nn.GroupNorm(num_groups=2, num_channels=8)
         self.temporal_refine_4 = nn.Conv1d(8, 8, kernel_size=7, dilation=2, padding=6)
 
-
         self.skip_to_x1 = nn.Linear(latent_dim, 64)  # Will be upsampled to 600
         self.skip_to_x2 = nn.Linear(latent_dim, 32)  # Will be upsampled to 1200
         self.skip_to_x3 = nn.Linear(latent_dim, 16)  # Will be upsampled to 2400
-
 
         self.refine_stack = nn.Sequential(
             nn.Conv1d(8, 8, kernel_size=3, dilation=1, padding=1),
@@ -946,93 +1046,89 @@ class Decoder(nn.Module):
 
         Architecture improvements for high-fidelity FHR reconstruction:
         1. **Temporal refinement convolutions**: Dilated convs after each upsampling stage
-           smooth transitions and maintain temporal coherence (RF ≈ 7s at each stage)
-        2. **Multi-scale skip connections**: Direct paths from latent $z$ to intermediate
+           smooth transitions and maintain temporal coherence (RF ~ 7s at each stage)
+        2. **Multi-scale skip connections**: Direct paths from latent z to intermediate
            resolutions for better gradient flow and information preservation
         3. **Dilated refinement stack**: Final refinement with dilations [1,2,4] provides
-           larger receptive field (RF ≈ 6.5s) for capturing local FHR patterns
+           larger receptive field (RF ~ 6.5s) for capturing local FHR patterns
+        4. **Causal TCN expansion**: The temporal TCN branch replaces the recurrent path
+           to gather long-range context without sacrificing causality
+        5. **Gated latent fusion**: Learnable gating blends static and temporal expansions before upsampling
 
-        Upsampling path: 300 → 600 → 1200 → 2400 → 4800 (16× total upsampling)
+        Upsampling path: 300 -> 600 -> 1200 -> 2400 -> 4800 (x16 total upsampling)
 
         Args:
-            latent_z: Latent variables, shape $(B, L, D)$ where $L=300$, $D=16$
+            latent_z: Latent variables, shape (B, L, D) where L=300, D=16
 
         Returns:
             Tuple containing:
-            - linear_output: Auxiliary features, shape $(B, L, 87)$
-            - raw_signal_mu: Raw signal reconstruction mean, shape $(B, 16L)$ = $(B, 4800)$
-            - raw_signal_logvar: Raw signal reconstruction log-variance, shape $(B, 16L)$ = $(B, 4800)$
+            - linear_output: Auxiliary features, shape (B, L, 87)
+            - raw_signal_mu: Raw signal reconstruction mean, shape (B, 16L)
+            - raw_signal_logvar: Raw signal reconstruction log-variance, shape (B, 16L)
         """
         L = latent_z.size(1)
         z_expanded_linear = self.feature_expansion(latent_z)
-        z_expanded_lstm, (_, _) = self.lstm_temporal(latent_z)
-        z_expanded = self.skip_z_expanded(latent_z) + torch.cat([z_expanded_linear, z_expanded_lstm], dim=-1)  # (B, L, 87)
+        z_expanded_temporal = self.temporal_out_norm(self.temporal_tcn(latent_z))
+        temporal_mix = self.latent_temporal_gate(z_expanded_linear, z_expanded_temporal)
+        z_expanded = self.skip_z_expanded(latent_z) + torch.cat(
+            [temporal_mix, z_expanded_temporal], dim=-1
+        )  # (B, L, 64)
         z_expanded = self.temporal_fusion_layer_norm(z_expanded)  # (B, L, 64)
-        z_linear = self.pre_linear(z_expanded)
+        z_linear = self.pre_linear(z_expanded)  # (B, L, 87)
 
         if first_st_ph_sample is not None:
-            z_linear = torch.cat([first_st_ph_sample.unsqueeze(1), z_linear], dim=1)   # Force first frame to match input sample
-            z_linear = z_linear[:, :-1, :]  # Remove last frame to maintain length L
-        
-        z_linear = z_linear.transpose(1, 2)       # (B, 128, L) for conv operations
-        x1 = F.gelu(self.norm_1(self.upsample_1(z_linear)))      # (B, 64, 2L)
-        x1 = F.gelu(self.temporal_refine_1(x1))                # (B, 64, 2L)
-        skip1 = self.skip_to_x1(latent_z).transpose(1, 2)      # (B, 64, L)
-        skip1 = F.interpolate(skip1, size=x1.size(2), mode='linear', align_corners=False)  # (B, 64, 2L)
+            z_linear = torch.cat([first_st_ph_sample.unsqueeze(1), z_linear], dim=1)
+            z_linear = z_linear[:, :-1, :]
+
+        linear_features = z_linear  # Preserve (B, L, 87) representation for auxiliary losses
+
+        z_linear_t = z_linear.transpose(1, 2)  # (B, 87, L) for conv operations
+        x1 = F.gelu(self.norm_1(self.upsample_1(z_linear_t)))  # (B, 64, 2L)
+        x1 = F.gelu(self.temporal_refine_1(x1))  # (B, 64, 2L)
+        skip1 = self.skip_to_x1(latent_z).transpose(1, 2)  # (B, 64, L)
+        skip1 = F.interpolate(skip1, size=x1.size(2), mode='linear', align_corners=False)
         x1 = x1 + skip1
 
-        x2 = F.gelu(self.norm_2(self.upsample_2(x1)))          # (B, 32, 4L)
-        x2 = F.gelu(self.temporal_refine_2(x2))                # (B, 32, 4L)
-        skip2 = self.skip_to_x2(latent_z).transpose(1, 2)      # (B, 32, L)
-        skip2 = F.interpolate(skip2, size=x2.size(2), mode='linear', align_corners=False)  # (B, 32, 4L)
+        x2 = F.gelu(self.norm_2(self.upsample_2(x1)))  # (B, 32, 4L)
+        x2 = F.gelu(self.temporal_refine_2(x2))  # (B, 32, 4L)
+        skip2 = self.skip_to_x2(latent_z).transpose(1, 2)  # (B, 32, L)
+        skip2 = F.interpolate(skip2, size=x2.size(2), mode='linear', align_corners=False)
         x2 = x2 + skip2
 
-        x3 = F.gelu(self.norm_3(self.upsample_3(x2)))          # (B, 16, 8L)
-        x3 = F.gelu(self.temporal_refine_3(x3))                # (B, 16, 8L)
-        skip3 = self.skip_to_x3(latent_z).transpose(1, 2)      # (B, 16, L)
-        skip3 = F.interpolate(skip3, size=x3.size(2), mode='linear', align_corners=False)  # (B, 16, 8L)
+        x3 = F.gelu(self.norm_3(self.upsample_3(x2)))  # (B, 16, 8L)
+        x3 = F.gelu(self.temporal_refine_3(x3))  # (B, 16, 8L)
+        skip3 = self.skip_to_x3(latent_z).transpose(1, 2)  # (B, 16, L)
+        skip3 = F.interpolate(skip3, size=x3.size(2), mode='linear', align_corners=False)
         x3 = x3 + skip3
 
-        x4 = F.gelu(self.norm_4(self.upsample_4(x3)))          # (B, 8, 16L)
-        x4 = F.gelu(self.temporal_refine_4(x4))                # (B, 8, 16L)
+        x4 = F.gelu(self.norm_4(self.upsample_4(x3)))  # (B, 8, 16L)
+        x4 = F.gelu(self.temporal_refine_4(x4))  # (B, 8, 16L)
 
-        refined = self.refine_stack(x4)                         # (B, 4, 16L)
-        features = self.final_conv(refined)                     # (B, 1, 16L)
+        refined = self.refine_stack(x4)  # (B, 4, 16L)
+        features = self.final_conv(refined)  # (B, 1, 16L)
 
-        mu = self.signal_mu(features).squeeze(1)                # (B, 16L)
-        logvar = self.signal_logvar(features).squeeze(1)        # (B, 16L)
+        raw_signal_mu = self.signal_mu(features).squeeze(1)  # (B, 16L)
+        raw_signal_logvar = self.signal_logvar(features).squeeze(1)  # (B, 16L)
+        raw_signal_logvar = torch.clamp(raw_signal_logvar, min=-10, max=10)
 
-        logvar = torch.clamp(logvar, min=-10, max=10)
+        return linear_features, raw_signal_mu, raw_signal_logvar
 
-        return z_linear.transpose(1, 2), mu, logvar
 
     @staticmethod
     def compute_loss(
         linear_output: torch.Tensor,
-        raw_mu_predicted: torch.Tensor, 
+        raw_mu_predicted: torch.Tensor,
         raw_logvar_predicted: torch.Tensor,
         target_fhr_st: torch.Tensor,
         target_fhr_ph: torch.Tensor,
         target_raw_signal: torch.Tensor,
-        compute_st_mse: bool = True):
-        """
-        Compute auxiliary reconstruction MSE and raw-signal NLL losses.
-        
-        Args:
-            linear_output: Output from linear layers (B, S, 87)
-            raw_mu_predicted: Predicted raw signal mean (B, 4800)
-            raw_logvar_predicted: Predicted raw signal log variance (B, 4800)
-            target_fhr_st: Target scattering coefficients (B, S, 43)
-            target_fhr_ph: Target phase coefficients (B, S, 44)
-            target_raw_signal: Target raw signal (B, 4800)
-            
-        Returns:
-            Dictionary containing individual loss components
-        """
+        compute_st_mse: bool = True,
+    ):
+        """Compute auxiliary reconstruction MSE and raw-signal NLL losses."""
         device = raw_mu_predicted.device
 
         if target_raw_signal.dim() == 3 and target_raw_signal.size(-1) == 1:
-            target_raw_signal = target_raw_signal.squeeze(-1)  # Remove channel dimension if present
+            target_raw_signal = target_raw_signal.squeeze(-1)
 
         if (
             compute_st_mse
@@ -1054,7 +1150,7 @@ class Decoder(nn.Module):
         return {
             'mse_loss': mse_loss,
             'nll_loss': nll_loss,
-            'total_decoder_loss': mse_loss + nll_loss
+            'total_decoder_loss': mse_loss + nll_loss,
         }
 
 
@@ -2958,4 +3054,3 @@ if __name__ == "__main__":
     # prd_x_logvar = model.get_average_predictions(forward_outputs['logvar_pr'])
     # loss = model.compute_loss(forward_outputs, y_raw_input)
     # print('done')
-
