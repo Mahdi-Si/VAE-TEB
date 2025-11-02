@@ -879,16 +879,25 @@ class Decoder(nn.Module):
                 final_activation=True,
                 use_skip_connection=True, 
                 activation=nn.GELU,
-                )
-
-        self.lstm_temporal = nn.LSTM(
-            input_size=latent_dim,
-            hidden_size=32,
-            num_layers=4,
-            batch_first=True,
-            bidirectional=False,
-            dropout=0.1,
         )
+
+        # self.lstm_temporal = nn.LSTM(
+        #     input_size=latent_dim,
+        #     hidden_size=32,
+        #     num_layers=4,
+        #     batch_first=True,
+        #     bidirectional=False,
+        #     dropout=0.1,
+        # )
+        
+        self.lstm_temporal = ResidualMLP(
+            input_dim=latent_dim,
+            hidden_dims=geometric_schedule(latent_dim, 32, 5),
+            final_activation=True,
+            use_skip_connection=True, 
+            activation=nn.GELU,
+        )
+        
         
         self.skip_z_expanded = nn.Linear(latent_dim, 64)
         self.temporal_fusion_layer_norm = nn.LayerNorm(64)
@@ -965,7 +974,8 @@ class Decoder(nn.Module):
         """
         L = latent_z.size(1)
         z_expanded_linear = self.feature_expansion(latent_z)
-        z_expanded_lstm, (_, _) = self.lstm_temporal(latent_z)
+        # z_expanded_lstm, (_, _) = self.lstm_temporal(latent_z)
+        z_expanded_lstm = self.lstm_temporal(latent_z)
         z_expanded = self.skip_z_expanded(latent_z) + torch.cat([z_expanded_linear, z_expanded_lstm], dim=-1)  # (B, L, 87)
         z_expanded = self.temporal_fusion_layer_norm(z_expanded)  # (B, L, 64)
         z_linear = self.pre_linear(z_expanded)
