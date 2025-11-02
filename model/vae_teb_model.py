@@ -410,9 +410,9 @@ class TargetEncoder(nn.Module):
         input_dim_st: int = 43,
         input_dim_ph: int = 44,
         latent_dim: int = 16,
-        lstm_hidden_dim: int = 64,  # Reduced from 128 (parallel design needs less)
-        lstm_num_layers: int = 3,   # Reduced from 5 (parallel design needs less)
-        use_bidirectional_lstm: bool = False,  # Changed default to True
+        lstm_hidden_dim: int = 64,
+        lstm_num_layers: int = 4,
+        use_bidirectional_lstm: bool = False,
         activation: nn.Module = nn.GELU,
         conv_dropout: float = 0.1,
         lstm_dropout: float = 0.1,
@@ -425,75 +425,42 @@ class TargetEncoder(nn.Module):
         self.use_bidirectional = use_bidirectional_lstm
         self.activation = activation
 
-        # === STAGE 1: Modality-specific MLPs ===
-        self.mlp_scattering = ResidualMLP(
-            input_dim=input_dim_st,
-            hidden_dims=geometric_schedule(input_dim_st, latent_dim, 5),
+        combined_in = input_dim_st + input_dim_ph
+        self.mlp_combined_1 = ResidualMLP(
+            input_dim=combined_in,
+            hidden_dims=geometric_schedule(combined_in, combined_in, 4),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.GELU
         )
-
-        self.mlp_phase = ResidualMLP(
-            input_dim=input_dim_ph,
-            hidden_dims=geometric_schedule(input_dim_ph, latent_dim, 4),
+        
+        self.mlp_combined_2 = ResidualMLP(
+            input_dim=87,
+            hidden_dims=geometric_schedule(87, 32, 6),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.GELU
         )
+        
+        self.mlp_combined_skip_proj_1 = nn.Linear(combined_in, 32)
+        self.mlp_combined_skip_proj_2 = nn.Linear(combined_in, 32)
 
-        # === STAGE 2: Modality-specific conv stacks (multi-scale with dilations) ===
-        # Scattering convs with exponential dilation: [1, 2, 4] → RF ≈ 10.75s
-        self.conv_scattering_1 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=3, dilation=1, dropout=conv_dropout
+        self.conv_1 = CausalMultiChannelConvBlock(
+            in_channels=32, out_channels=32, filter_size=3, dilation=1, dropout=conv_dropout
         )
-        self.conv_scattering_2 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=5, dilation=2, dropout=conv_dropout
+        self.conv_2 = CausalMultiChannelConvBlock(
+            in_channels=32, out_channels=32, filter_size=7, dilation=1, dropout=conv_dropout
         )
-        self.conv_scattering_3 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=7, dilation=4, dropout=conv_dropout
+        self.conv_3 = CausalMultiChannelConvBlock(
+            in_channels=32, out_channels=32, filter_size=11, dilation=1, dropout=conv_dropout
         )
+        self.stack_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
+        self.stack_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
+        self.fused_norm = nn.LayerNorm(32)
 
-        self.scatter_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
-        self.scatter_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
 
-        # Phase convs with exponential dilation: [1, 2, 4] → RF ≈ 10.75s
-        self.conv_phase_1 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=3, dilation=1, dropout=conv_dropout
-        )
-        self.conv_phase_2 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=5, dilation=2, dropout=conv_dropout
-        )
-        self.conv_phase_3 = CausalMultiChannelConvBlock(
-            in_channels=16, out_channels=16, filter_size=7, dilation=4, dropout=conv_dropout
-        )
-
-        self.phase_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
-        self.phase_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 16), num_channels=16)
-
-        self.scatter_fused_norm = nn.LayerNorm(16)
-        self.phase_fused_norm = nn.LayerNorm(16)
-
-        # Concatenated modality dimension: 16 + 16 = 32
-        modality_concat_dim = 32
-
-        # === STAGE 3: PARALLEL TEMPORAL BRANCHES ===
-
-        # Branch A: Additional dilated convs for extended receptive field
-        # Dilations [8, 16] extend RF from 10.75s → ~35s
-        self.conv_temporal_1 = CausalMultiChannelConvBlock(
-            in_channels=modality_concat_dim, out_channels=modality_concat_dim,
-            filter_size=3, dilation=8, dropout=conv_dropout
-        )
-        self.conv_temporal_2 = CausalMultiChannelConvBlock(
-            in_channels=modality_concat_dim, out_channels=modality_concat_dim,
-            filter_size=5, dilation=16, dropout=conv_dropout
-        )
-        self.conv_temporal_norm = nn.LayerNorm(modality_concat_dim)
-
-        # Branch B: LSTM for global sequential dependencies
         self.lstm_temporal = nn.LSTM(
-            input_size=modality_concat_dim,
+            input_size=32,
             hidden_size=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             batch_first=True,
@@ -504,19 +471,16 @@ class TargetEncoder(nn.Module):
         lstm_output_dim = lstm_hidden_dim * (2 if use_bidirectional_lstm else 1)
         self.lstm_temporal_norm = nn.LayerNorm(lstm_output_dim)
 
-        # === STAGE 4: FUSION ===
-        # Concatenate parallel branches: 32 (conv) + 64 (lstm with bidirectional) = 160
-        parallel_concat_dim = modality_concat_dim + lstm_output_dim
+        parallel_concat_dim =  lstm_output_dim + 32
 
         self.fusion = ResidualMLP(
             input_dim=parallel_concat_dim,
-            hidden_dims=geometric_schedule(parallel_concat_dim, 32, 4),
+            hidden_dims=geometric_schedule(parallel_concat_dim, 32, 5),
             final_activation=True,
             activation=nn.GELU,
             use_skip_connection=True
         )
 
-        # === OUTPUT HEADS ===
         self.mu_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, latent_dim, 4),
@@ -574,80 +538,41 @@ class TargetEncoder(nn.Module):
         """
         hidden_states = {} if return_hidden else None
 
-        # === STAGE 1: Modality-specific MLPs ===
-        scatter_linear = self.mlp_scattering(scattering_input)   # (B, T, 16)
-        phase_linear = self.mlp_phase(phase_harmonic_input)      # (B, T, 16)
-
+        combined = torch.cat([scattering_input, phase_harmonic_input], dim=-1)  # (B, T, 87)
+        x_linear = self.mlp_combined_1(combined)
+        x_linear_ = self.mlp_combined_2(x_linear + combined)  # (B, T, 32)
+        x_linear = x_linear_ + self.mlp_combined_skip_proj_1(combined) + self.mlp_combined_skip_proj_2(x_linear)  # (B, T, 32)
+        
         if return_hidden:
-            hidden_states["scattering_mlp"] = scatter_linear
-            hidden_states["phase_mlp"] = phase_linear
+            hidden_states["combined_mlp"] = x_linear
 
-        # === STAGE 2: Modality-specific conv stacks ===
-        # Scattering path with dilations [1, 2, 4]
-        x_scatter = scatter_linear.transpose(1, 2)  # (B, 16, T)
-
-        scatter_conv_1 = self.conv_scattering_1(x_scatter)
-        scatter_conv_2 = self.conv_scattering_2(scatter_conv_1)
-        skip_1_norm = self.scatter_skip_norm_1(scatter_conv_1)
-        scatter_conv_2 = scatter_conv_2 + skip_1_norm
-
-        scatter_conv_3 = self.conv_scattering_3(scatter_conv_2)
-        skip_2_norm = self.scatter_skip_norm_2(scatter_conv_2)
-        scatter_conv_3 = scatter_conv_3 + skip_2_norm
-
-        scatter_conv = scatter_conv_3.transpose(1, 2).contiguous()  # (B, T, 16)
-        scatter_conv = self.scatter_fused_norm(scatter_conv)
-
-        # Phase path with dilations [1, 2, 4]
-        x_phase = phase_linear.transpose(1, 2)  # (B, 16, T)
-
-        phase_conv_1 = self.conv_phase_1(x_phase)
-        phase_conv_2 = self.conv_phase_2(phase_conv_1)
-        skip_1_norm = self.phase_skip_norm_1(phase_conv_1)
-        phase_conv_2 = phase_conv_2 + skip_1_norm
-
-        phase_conv_3 = self.conv_phase_3(phase_conv_2)
-        skip_2_norm = self.phase_skip_norm_2(phase_conv_2)
-        phase_conv_3 = phase_conv_3 + skip_2_norm
-
-        phase_conv = phase_conv_3.transpose(1, 2).contiguous()  # (B, T, 16)
-        phase_conv = self.phase_fused_norm(phase_conv)
-
-        # Concatenate modalities
-        modality_concat = torch.cat([scatter_conv, phase_conv], dim=-1)  # (B, T, 32)
-
+        # === STAGE 2 (new): Single causal conv stack ===
+        x_conv = x_linear.transpose(1, 2)  # (B, 32, T)
+        conv_1 = self.conv_1(x_conv)
+        conv_2 = self.conv_2(conv_1)
+        conv_2 = conv_2 + self.stack_skip_norm_1(conv_1)
+        conv_3 = self.conv_3(conv_2)
+        conv_3 = conv_3 + self.stack_skip_norm_2(conv_2)
+        conv_output = self.fused_norm(conv_3.transpose(1, 2).contiguous() + x_linear)  # (B, T, 32)
         if return_hidden:
-            hidden_states["modality_concat"] = modality_concat
+            hidden_states["conv_stack_output"] = conv_output
 
-        # === STAGE 3: PARALLEL TEMPORAL BRANCHES ===
-
-        # Branch A: Conv temporal path (dilations [8, 16] for extended RF)
-        conv_temporal = modality_concat.transpose(1, 2)  # (B, 32, T)
-        conv_temporal = self.conv_temporal_1(conv_temporal)
-        conv_temporal = self.conv_temporal_2(conv_temporal)
-        conv_temporal = conv_temporal.transpose(1, 2)  # (B, T, 32)
-        conv_temporal = self.conv_temporal_norm(conv_temporal)
-
-        # Branch B: LSTM temporal path (global context)
-        lstm_temporal, (hidden, cell) = self.lstm_temporal(modality_concat)  # (B, T, 128 if bidirectional)
+        lstm_temporal, (hidden, cell) = self.lstm_temporal(x_linear)
         lstm_temporal = self.lstm_temporal_norm(lstm_temporal)
 
         if return_hidden:
-            hidden_states["conv_temporal"] = conv_temporal
             hidden_states["lstm_temporal"] = lstm_temporal
             hidden_states["lstm_hidden"] = hidden
             hidden_states["lstm_cell"] = cell
 
-        # === STAGE 4: FUSION ===
-        # Concatenate parallel branches
-        parallel_concat = torch.cat([conv_temporal, lstm_temporal], dim=-1)  # (B, T, 160)
+
+        parallel_concat = torch.cat([conv_output, lstm_temporal], dim=-1)
         fused = self.fusion(parallel_concat)  # (B, T, 32)
 
         if return_hidden:
             hidden_states["parallel_concat"] = parallel_concat
             hidden_states["fused"] = fused
 
-        # === OUTPUT HEADS ===
         mu = self.mu_layer(fused)  # (B, T, D)
         prior_logvar = self.prior_logvar_layer(fused)  # (B, T, D)
         conditioning_features = self.conditioning_layer(fused)  # (B, T, D)
@@ -708,7 +633,7 @@ class SourceEncoder(nn.Module):
         input_channels: int = 130,
         latent_dim: int = 16,
         lstm_hidden_dim: int = 64,  # Reduced from 128 (parallel design needs less)
-        lstm_num_layers: int = 3,   # Reduced from 4 (parallel design needs less)
+        lstm_num_layers: int = 4,   # Reduced from 4 (parallel design needs less)
         conv_dropout: float = 0.1,
         lstm_dropout: float = 0.1,
     ):
@@ -722,43 +647,26 @@ class SourceEncoder(nn.Module):
         # === STAGE 1: Input MLP ===
         self.mlp = ResidualMLP(
             input_dim=130,
-            hidden_dims=geometric_schedule(130, 32, 5),
+            hidden_dims=geometric_schedule(130, 32, 6),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.GELU
         )
 
-        # === STAGE 2: Dilated conv stack with exponential dilations ===
-        # Dilations [1, 2, 4] → RF ≈ 10.75s
         self.conv_1 = CausalMultiChannelConvBlock(
             in_channels=32, out_channels=32, filter_size=3, dilation=1, dropout=conv_dropout
         )
         self.conv_2 = CausalMultiChannelConvBlock(
-            in_channels=32, out_channels=32, filter_size=5, dilation=2, dropout=conv_dropout
+            in_channels=32, out_channels=32, filter_size=5, dilation=1, dropout=conv_dropout
         )
         self.conv_3 = CausalMultiChannelConvBlock(
-            in_channels=32, out_channels=32, filter_size=7, dilation=4, dropout=conv_dropout
+            in_channels=32, out_channels=32, filter_size=11, dilation=1, dropout=conv_dropout
         )
 
         self.source_skip_norm_1 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
         self.source_skip_norm_2 = nn.GroupNorm(num_groups=min(8, 32), num_channels=32)
 
         self.fused_norm = nn.LayerNorm(32)
-
-        # === STAGE 3: PARALLEL TEMPORAL BRANCHES ===
-
-        # Branch A: Additional dilated convs for extended receptive field
-        # Dilations [8, 16] extend RF from 10.75s → ~35s
-        self.conv_temporal_1 = CausalMultiChannelConvBlock(
-            in_channels=32, out_channels=32, filter_size=3, dilation=8, dropout=conv_dropout
-        )
-        self.conv_temporal_2 = CausalMultiChannelConvBlock(
-            in_channels=32, out_channels=32, filter_size=5, dilation=16, dropout=conv_dropout
-        )
-        self.conv_temporal_norm = nn.LayerNorm(32)
-
-        # Branch B: LSTM for global sequential dependencies
-        # Unidirectional (causal) since source is used for prediction
         self.lstm_temporal = nn.LSTM(
             input_size=32,
             hidden_size=lstm_hidden_dim,
@@ -769,19 +677,16 @@ class SourceEncoder(nn.Module):
         )
         self.lstm_temporal_norm = nn.LayerNorm(lstm_hidden_dim)
 
-        # === STAGE 4: FUSION ===
-        # Concatenate parallel branches: 32 (conv) + 64 (lstm) = 96
         parallel_concat_dim = 32 + lstm_hidden_dim
 
         self.fusion = ResidualMLP(
             input_dim=parallel_concat_dim,
-            hidden_dims=geometric_schedule(parallel_concat_dim, 32, 4),
+            hidden_dims=geometric_schedule(parallel_concat_dim, 32, 5),
             final_activation=True,
             activation=nn.GELU,
             use_skip_connection=True
         )
 
-        # === OUTPUT HEAD ===
         self.mu_layer = ResidualMLP(
             input_dim=32,
             hidden_dims=geometric_schedule(32, latent_dim, 4),
@@ -815,15 +720,10 @@ class SourceEncoder(nn.Module):
                     if return_intermediate=True.
         """
         intermediates = {} if return_intermediate else None
-
-        # === STAGE 1: Input MLP ===
         x_linear = self.mlp(x)  # (B, T, 32)
 
         if return_intermediate:
             intermediates["mlp_output"] = x_linear
-
-        # === STAGE 2: Dilated conv stack ===
-        # Dilations [1, 2, 4]
         x_conv = x_linear.transpose(1, 2)  # (B, 32, T)
 
         conv_1 = self.conv_1(x_conv)
@@ -841,35 +741,22 @@ class SourceEncoder(nn.Module):
         if return_intermediate:
             intermediates["conv_stack_output"] = conv_out
 
-        # === STAGE 3: PARALLEL TEMPORAL BRANCHES ===
-
-        # Branch A: Conv temporal path (dilations [8, 16])
-        conv_temporal = conv_out.transpose(1, 2)  # (B, 32, T)
-        conv_temporal = self.conv_temporal_1(conv_temporal)
-        conv_temporal = self.conv_temporal_2(conv_temporal)
-        conv_temporal = conv_temporal.transpose(1, 2)  # (B, T, 32)
-        conv_temporal = self.conv_temporal_norm(conv_temporal)
-
-        # Branch B: LSTM temporal path (global context)
-        lstm_temporal, (hidden, cell) = self.lstm_temporal(conv_out)  # (B, T, 64)
+        lstm_temporal, (hidden, cell) = self.lstm_temporal(x_linear)  # (B, T, 64)
         lstm_temporal = self.lstm_temporal_norm(lstm_temporal)
 
         if return_intermediate:
-            intermediates["conv_temporal"] = conv_temporal
             intermediates["lstm_temporal"] = lstm_temporal
             intermediates["lstm_hidden"] = hidden
             intermediates["lstm_cell"] = cell
 
-        # === STAGE 4: FUSION ===
-        # Concatenate parallel branches
-        parallel_concat = torch.cat([conv_temporal, lstm_temporal], dim=-1)  # (B, T, 96)
+
+        parallel_concat = torch.cat([conv_out, lstm_temporal], dim=-1)  # (B, T, 96)
         fused = self.fusion(parallel_concat)  # (B, T, 32)
 
         if return_intermediate:
             intermediates["parallel_concat"] = parallel_concat
             intermediates["fused"] = fused
 
-        # === OUTPUT HEAD ===
         mu_x = self.mu_layer(fused)  # (B, T, D)
 
         if return_intermediate:
@@ -920,22 +807,22 @@ class ConditionalEncoder(nn.Module):
         super().__init__()
         self.mlp = ResidualMLP(
             input_dim=dim_hx + dim_hy,
-            hidden_dims=geometric_schedule(dim_hx + dim_hy, 20, 4),
+            hidden_dims=geometric_schedule(dim_hx + dim_hy, 16, 4),
             final_activation=True,
             use_skip_connection=True, 
             activation=nn.GELU,
         )
 
         self.fc_mu = ResidualMLP(
-            input_dim=20,
-            hidden_dims=geometric_schedule(20, 16, 4),
+            input_dim=16,
+            hidden_dims=geometric_schedule(16, 16, 4),
             final_activation=False,
             use_skip_connection=False, 
             activation=nn.GELU,
         )
         self.fc_logvar = ResidualMLP(
-            input_dim=20,
-            hidden_dims=geometric_schedule(20, 16, 4),
+            input_dim=16,
+            hidden_dims=geometric_schedule(16, 16, 4),
             final_activation=False,
             use_skip_connection=False, 
             activation=nn.GELU,
@@ -962,10 +849,8 @@ class ConditionalEncoder(nn.Module):
         """
         h_combined = torch.cat([h_x, h_y], dim=-1)
         h_merged = self.mlp(h_combined)
-        del h_combined
         mu = self.fc_mu(h_merged)
         logvar = self.fc_logvar(h_merged)
-        del h_merged
         return mu, logvar
 
 
@@ -988,65 +873,56 @@ class Decoder(nn.Module):
         self.sequence_length = sequence_length
         self.target_length = target_length
 
-        self.feature_expansion_1 = ResidualMLP(
+        self.feature_expansion = ResidualMLP(
                 input_dim=latent_dim,
-                hidden_dims=geometric_schedule(latent_dim, 50, 5),
+                hidden_dims=geometric_schedule(latent_dim, 32, 5),
                 final_activation=True,
                 use_skip_connection=True, 
                 activation=nn.GELU,
                 )
 
-        self.feature_expansion_2 = ResidualMLP(
-                input_dim=50,
-                hidden_dims=geometric_schedule(50, 87, 5),
-                final_activation=True,
-                activation=nn.GELU,
-                use_skip_connection=True
-                )
-
-        self.skip_con_exp = nn.Linear(latent_dim, 87, bias=False)
-        self.feature_expansion_layer_norm = nn.LayerNorm(87)
+        self.lstm_temporal = nn.LSTM(
+            input_size=latent_dim,
+            hidden_size=32,
+            num_layers=4,
+            batch_first=True,
+            bidirectional=False,
+            dropout=0.1,
+        )
+        
+        self.skip_z_expanded = nn.Linear(latent_dim, 64)
+        self.temporal_fusion_layer_norm = nn.LayerNorm(64)
         
         self.pre_linear = ResidualMLP(
-            input_dim=87,
-            hidden_dims=geometric_schedule(87, 128, 3), 
+            input_dim=64,
+            hidden_dims=geometric_schedule(64, 87, 5), 
             final_activation=False,
             activation=nn.GELU,
             use_skip_connection=True
         )
 
-        # === UPSAMPLING STAGE 1: 300 → 600 ===
-        self.upsample_1 = nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1)
+        self.upsample_1 = nn.ConvTranspose1d(87, 64, kernel_size=4, stride=2, padding=1)
         self.norm_1 = nn.GroupNorm(num_groups=8, num_channels=64)
-        # Temporal refinement after upsampling (dilation=2 for ~28 samples RF ≈ 7s)
         self.temporal_refine_1 = nn.Conv1d(64, 64, kernel_size=7, dilation=2, padding=6)
 
-        # === UPSAMPLING STAGE 2: 600 → 1200 ===
         self.upsample_2 = nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1)
         self.norm_2 = nn.GroupNorm(num_groups=8, num_channels=32)
-        # Temporal refinement (dilation=2 for smooth transitions)
         self.temporal_refine_2 = nn.Conv1d(32, 32, kernel_size=7, dilation=2, padding=6)
 
-        # === UPSAMPLING STAGE 3: 1200 → 2400 ===
         self.upsample_3 = nn.ConvTranspose1d(32, 16, kernel_size=4, stride=2, padding=1)
         self.norm_3 = nn.GroupNorm(num_groups=4, num_channels=16)
-        # Temporal refinement (dilation=2)
         self.temporal_refine_3 = nn.Conv1d(16, 16, kernel_size=7, dilation=2, padding=6)
 
-        # === UPSAMPLING STAGE 4: 2400 → 4800 ===
         self.upsample_4 = nn.ConvTranspose1d(16, 8, kernel_size=4, stride=2, padding=1)
         self.norm_4 = nn.GroupNorm(num_groups=2, num_channels=8)
-        # Temporal refinement (dilation=2)
         self.temporal_refine_4 = nn.Conv1d(8, 8, kernel_size=7, dilation=2, padding=6)
 
-        # === MULTI-SCALE SKIP CONNECTIONS ===
-        # Skip from latent (16D) to intermediate resolutions for gradient flow
+
         self.skip_to_x1 = nn.Linear(latent_dim, 64)  # Will be upsampled to 600
         self.skip_to_x2 = nn.Linear(latent_dim, 32)  # Will be upsampled to 1200
         self.skip_to_x3 = nn.Linear(latent_dim, 16)  # Will be upsampled to 2400
 
-        # === DILATED REFINEMENT STACK ===
-        # Replace simple refine_conv with dilated stack for larger receptive field
+
         self.refine_stack = nn.Sequential(
             nn.Conv1d(8, 8, kernel_size=3, dilation=1, padding=1),
             nn.GELU(),
@@ -1063,6 +939,7 @@ class Decoder(nn.Module):
     def forward(
         self,
         latent_z: torch.Tensor,
+        first_st_ph_sample: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Progressive upsampling decoder with temporal refinement and multi-scale skip connections.
@@ -1087,65 +964,47 @@ class Decoder(nn.Module):
             - raw_signal_logvar: Raw signal reconstruction log-variance, shape $(B, 16L)$ = $(B, 4800)$
         """
         L = latent_z.size(1)
-        z_expanded = self.feature_expansion_1(latent_z)
-        z_expanded = self.feature_expansion_2(z_expanded)
-        z_expanded = self.feature_expansion_layer_norm(z_expanded + self.skip_con_exp(latent_z))  # (B, L, 87)
-        linear_output = z_expanded
+        z_expanded_linear = self.feature_expansion(latent_z)
+        z_expanded_lstm, (_, _) = self.lstm_temporal(latent_z)
+        z_expanded = self.skip_z_expanded(latent_z) + torch.cat([z_expanded_linear, z_expanded_lstm], dim=-1)  # (B, L, 87)
+        z_expanded = self.temporal_fusion_layer_norm(z_expanded)  # (B, L, 64)
+        z_linear = self.pre_linear(z_expanded)
 
-        z_expanded_pre = self.pre_linear(linear_output)  # (B, L, 128)
-        z_conv = z_expanded_pre.transpose(1, 2)       # (B, 128, L) for conv operations
-        del z_expanded_pre
-
-        # === UPSAMPLING STAGE 1: L → 2L (300 → 600) ===
-        x1 = F.gelu(self.norm_1(self.upsample_1(z_conv)))      # (B, 64, 2L)
-        # Temporal refinement for smooth transitions
+        if first_st_ph_sample is not None:
+            z_linear = torch.cat([first_st_ph_sample.unsqueeze(1), z_linear], dim=1)   # Force first frame to match input sample
+            z_linear = z_linear[:, :-1, :]  # Remove last frame to maintain length L
+        
+        z_linear = z_linear.transpose(1, 2)       # (B, 128, L) for conv operations
+        x1 = F.gelu(self.norm_1(self.upsample_1(z_linear)))      # (B, 64, 2L)
         x1 = F.gelu(self.temporal_refine_1(x1))                # (B, 64, 2L)
-        # Multi-scale skip connection from latent
         skip1 = self.skip_to_x1(latent_z).transpose(1, 2)      # (B, 64, L)
         skip1 = F.interpolate(skip1, size=x1.size(2), mode='linear', align_corners=False)  # (B, 64, 2L)
         x1 = x1 + skip1
-        del z_conv, skip1
 
-        # === UPSAMPLING STAGE 2: 2L → 4L (600 → 1200) ===
         x2 = F.gelu(self.norm_2(self.upsample_2(x1)))          # (B, 32, 4L)
-        # Temporal refinement
         x2 = F.gelu(self.temporal_refine_2(x2))                # (B, 32, 4L)
-        # Multi-scale skip connection from latent
         skip2 = self.skip_to_x2(latent_z).transpose(1, 2)      # (B, 32, L)
         skip2 = F.interpolate(skip2, size=x2.size(2), mode='linear', align_corners=False)  # (B, 32, 4L)
         x2 = x2 + skip2
-        del x1, skip2
 
-        # === UPSAMPLING STAGE 3: 4L → 8L (1200 → 2400) ===
         x3 = F.gelu(self.norm_3(self.upsample_3(x2)))          # (B, 16, 8L)
-        # Temporal refinement
         x3 = F.gelu(self.temporal_refine_3(x3))                # (B, 16, 8L)
-        # Multi-scale skip connection from latent
         skip3 = self.skip_to_x3(latent_z).transpose(1, 2)      # (B, 16, L)
         skip3 = F.interpolate(skip3, size=x3.size(2), mode='linear', align_corners=False)  # (B, 16, 8L)
         x3 = x3 + skip3
-        del x2, skip3
 
-        # === UPSAMPLING STAGE 4: 8L → 16L (2400 → 4800) ===
         x4 = F.gelu(self.norm_4(self.upsample_4(x3)))          # (B, 8, 16L)
-        # Temporal refinement
         x4 = F.gelu(self.temporal_refine_4(x4))                # (B, 8, 16L)
-        del x3
 
-        # === DILATED REFINEMENT STACK ===
-        # Multi-scale refinement with dilations [1, 2, 4] for larger receptive field
         refined = self.refine_stack(x4)                         # (B, 4, 16L)
-        del x4
         features = self.final_conv(refined)                     # (B, 1, 16L)
-        del refined
 
         mu = self.signal_mu(features).squeeze(1)                # (B, 16L)
         logvar = self.signal_logvar(features).squeeze(1)        # (B, 16L)
-        del features
 
         logvar = torch.clamp(logvar, min=-10, max=10)
 
-        return linear_output, mu, logvar
+        return z_linear.transpose(1, 2), mu, logvar
 
     @staticmethod
     def compute_loss(
@@ -1213,7 +1072,7 @@ class SeqVaeCore(nn.Module):
         decimation_factor: int = 16,
         warmup_period: int = 30,
         lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 5,
+        lstm_num_layers: int = 4,
         *,
         init_weights: bool = True,
     ) -> None:
@@ -1250,6 +1109,7 @@ class SeqVaeCore(nn.Module):
         y_st: torch.Tensor,  # (B, T, 43)
         y_ph: torch.Tensor,  # (B, T, 44)
         x_ph: torch.Tensor,  # (B, T, 130)
+        prediction_mode: bool = True
     ) -> Dict[str, torch.Tensor]:
         """Forward pass through the complete VAE (encode + decode).
 
@@ -1262,6 +1122,7 @@ class SeqVaeCore(nn.Module):
             6. Decode: $p(y|z)$ with Gaussian likelihood
 
         Args:
+            prediction_mode:
             y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$ where
                 $B$ is batch size, $T$ is sequence_length (300), and 43 is the number
                 of scattering transform channels.
@@ -1288,8 +1149,11 @@ class SeqVaeCore(nn.Module):
         mu_post, logvar_post = self.conditional_encoder(mu_x, c_logvar)
         mu_post = mu_post + mu_y
         z = self.reparameterize(mu_post, logvar_post)
-
-        linear_output, mu_pr, logvar_pr = self.decoder(z)
+        if prediction_mode:
+            first_coef = torch.cat([y_st, y_ph], -1)[:, 0, :]
+            linear_output, mu_pr, logvar_pr = self.decoder(z, first_coef)
+        else:
+            linear_output, mu_pr, logvar_pr = self.decoder(z)
 
         return {
             "z": z,  # (B, T, latent_dim_z)
@@ -3017,8 +2881,8 @@ if __name__ == "__main__":
     #                                phase_harmonic_input=y_ph_input)
 
     # source encoder test: -------------------------------------------------------
-    model = SourceEncoder()
-    mu = model(x_ph_input)
+    # model = SourceEncoder()
+    # mu = model(x_ph_input)
 
     # conditional encoder test: --------------------------------------------------
     # model = ConditionalEncoder(32, 32, 32)
@@ -3041,6 +2905,19 @@ if __name__ == "__main__":
     #     torch.randn(batch_size, 4800)  # target_raw_signal
     # )
     
+    # Core model test: --------------------------------------------------------------
+    model = SeqVaeCore()
+    outputs = model(
+        y_st_input,
+        y_ph_input,
+        x_ph_input, 
+    )
+    loss_dict = model.compute_reconstruction_loss(
+        forward_outputs=outputs,
+        y_st=torch.randn(batch_size, seq_len, 43),
+        y_ph=torch.randn(batch_size, seq_len, 44),
+        y_raw=torch.randn(batch_size, 4800),
+    )
     # ImprovedDecoder test: ------------------------------------------------------
     # model = ImprovedDecoder(latent_dim=32, sequence_length=seq_len, target_length=4800)
     # linear_output, mu, logvar = model(
