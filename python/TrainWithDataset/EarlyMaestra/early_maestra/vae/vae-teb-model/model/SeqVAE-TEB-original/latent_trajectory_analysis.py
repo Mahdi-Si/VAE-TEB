@@ -189,7 +189,8 @@ def summarize_trajectory(
         latent_trajectory: np.ndarray of shape (time_steps, n_dims) or (batch_size, time_steps, n_dims)
         k: int, number of keyframes to extract (e.g., 1 for single summary, 5 for segments)
         method: str, summarization strategy
-            - 'changepoint': Fast gradient-based segmentation tailored for high-dimensional regimes
+            - 'changepoint': Low-complexity PELT segmentation via ruptures (pass changepoint_algo='gradient'
+              to reuse the built-in fast detector)
             - 'rdp': Ramer-Douglas-Peucker polyline simplification (preserves shape)
             - 'quantile': Quantile samples along arclength (even coverage)
             - 'medoid': Single medoid (most representative point) - only for k=1
@@ -206,7 +207,8 @@ def summarize_trajectory(
     Notes:
         - For nonlinear embeddings (UMAP/Isomap), use 'medoid', 'changepoint', 'rdp', or 'quantile'
         - Avoid 'frechet' (average) for nonlinear embeddings as it may produce unrealizable points
-        - 'changepoint' leverages a fast gradient-based detector optimized for high-dimensional data
+        - 'changepoint' defaults to a low-complexity ruptures implementation (requires `pip install ruptures`);
+          set changepoint_algo='gradient' to activate the built-in detector when ruptures is unavailable
     """
     # Handle batch dimension
     if latent_trajectory.ndim == 3:
@@ -455,41 +457,110 @@ def summarize_trajectory(
 # ------------------------------------------------------
 
 def _create_changepoint_detector(
-    changepoint_algo: str = 'gradient',
-    changepoint_model: Optional[str] = None,
+    changepoint_algo: str = 'pelt',
+    changepoint_model: Optional[str] = 'rbf',
     changepoint_kwargs: Optional[Dict[str, Any]] = None
 ):
     """
-    Build a callable that detects changepoints using a fast gradient-based scoring strategy.
-
-    Args:
-        changepoint_algo: Alias for the detector type. Legacy values are accepted for backwards
-            compatibility but currently map to the same fast detector.
-        changepoint_model: Unused, kept for backwards compatibility with previous interfaces.
-        changepoint_kwargs: Optional parameters for the detector. Supported keys include:
-            - 'smoothing_window' (int >=1): moving-average window applied to the score (default: 5).
-            - 'min_distance' (int >=1): minimum separation between changepoints.
-            - 'min_distance_ratio' (float): ratio of the series length used when 'min_distance' is not set.
-            - 'candidate_pool_multiplier' (int >=1): multiplier for the candidate pool size (default: 5).
-            - 'normalize_differences' (bool): scale feature differences before scoring (default: True).
-            - 'robust_scale' (bool): use median/MAD scaling instead of standard deviation (default: False).
-
-    Returns:
-        Callable[[np.ndarray, int], np.ndarray]: function mapping (data, max_bkps) to changepoint indices.
+    Build a simple callable that detects changepoints using either ruptures (default PELT)
+    or a lightweight gradient-based scorer.
     """
-    _ = changepoint_model  # Maintained for API compatibility.
-    algo_name = (changepoint_algo or 'gradient').lower()
-    if algo_name not in {'gradient', 'fast', 'auto'}:
-        # Map legacy ruptures identifiers to the fast detector without raising.
-        algo_name = 'gradient'
-
+    algo_name = (changepoint_algo or 'pelt').lower()
     base_kwargs = dict(changepoint_kwargs or {})
-    smoothing_window = int(max(1, base_kwargs.pop('smoothing_window', 5)))
-    min_distance = base_kwargs.pop('min_distance', None)
-    min_distance_ratio = float(base_kwargs.pop('min_distance_ratio', 0.05))
-    candidate_pool_multiplier = max(1, int(base_kwargs.pop('candidate_pool_multiplier', 5)))
-    normalize_differences = bool(base_kwargs.pop('normalize_differences', True))
-    robust_scale = bool(base_kwargs.pop('robust_scale', False))
+
+    if algo_name in {'gradient', 'fast'}:
+        smoothing_window = int(max(1, base_kwargs.pop('smoothing_window', 5)))
+        min_distance = base_kwargs.pop('min_distance', None)
+        min_distance_ratio = float(base_kwargs.pop('min_distance_ratio', 0.05))
+        candidate_pool_multiplier = max(1, int(base_kwargs.pop('candidate_pool_multiplier', 5)))
+        normalize_differences = bool(base_kwargs.pop('normalize_differences', True))
+        robust_scale = bool(base_kwargs.pop('robust_scale', False))
+
+        def _detect(sample_array: np.ndarray, max_bkps: int) -> np.ndarray:
+            if max_bkps <= 0:
+                return np.asarray([], dtype=int)
+
+            data = np.asarray(sample_array, dtype=np.float64)
+            if data.ndim == 1:
+                data = data[:, None]
+
+            diffs = np.diff(data, axis=0)
+            if diffs.size == 0:
+                return np.asarray([], dtype=int)
+
+            if normalize_differences:
+                if robust_scale:
+                    median = np.median(diffs, axis=0)
+                    mad = np.median(np.abs(diffs - median), axis=0)
+                    mad[mad < 1e-12] = 1.0
+                    diffs = (diffs - median) / mad
+                else:
+                    std = diffs.std(axis=0, ddof=1)
+                    std[std < 1e-12] = 1.0
+                    diffs = diffs / std
+
+            scores = np.linalg.norm(diffs, axis=1)
+
+            if smoothing_window > 1 and scores.size >= smoothing_window:
+                kernel = np.ones(smoothing_window, dtype=np.float64) / float(smoothing_window)
+                scores = np.convolve(scores, kernel, mode='same')
+
+            candidate_pool = max(max_bkps, candidate_pool_multiplier * max_bkps)
+            candidate_pool = min(candidate_pool, scores.size)
+            if candidate_pool <= 0:
+                return np.asarray([], dtype=int)
+
+            candidate_indices = np.argpartition(-scores, candidate_pool - 1)[:candidate_pool]
+            ranked_indices = sorted(candidate_indices, key=lambda idx: scores[idx], reverse=True)
+
+            if min_distance is not None:
+                min_sep = max(1, int(min_distance))
+            else:
+                min_sep = max(1, int(round(min_distance_ratio * data.shape[0])))
+
+            selected: List[int] = []
+            for idx in ranked_indices:
+                cp = idx + 1
+                if cp <= 0 or cp >= data.shape[0]:
+                    continue
+                if all(abs(cp - prev) >= min_sep for prev in selected):
+                    selected.append(cp)
+                if len(selected) >= max_bkps:
+                    break
+
+            if len(selected) < max_bkps:
+                for idx in ranked_indices:
+                    cp = idx + 1
+                    if cp <= 0 or cp >= data.shape[0] or cp in selected:
+                        continue
+                    selected.append(cp)
+                    if len(selected) >= max_bkps:
+                        break
+
+            return np.asarray(sorted(set(selected))[:max_bkps], dtype=int)
+
+        return _detect
+
+    import ruptures as rpt
+
+    algo_map = {
+        'pelt': rpt.Pelt,
+        'binseg': rpt.Binseg,
+        'bottomup': rpt.BottomUp,
+        'window': rpt.Window,
+        'dynp': rpt.Dynp,
+    }
+
+    if algo_name not in algo_map:
+        return _create_changepoint_detector('gradient', changepoint_model, changepoint_kwargs)
+
+    if changepoint_model is not None and 'model' not in base_kwargs:
+        base_kwargs['model'] = changepoint_model
+    if algo_name == 'dynp':
+        base_kwargs.setdefault('min_size', 2)
+        base_kwargs.setdefault('jump', 1)
+
+    AlgoCls = algo_map[algo_name]
 
     def _detect(sample_array: np.ndarray, max_bkps: int) -> np.ndarray:
         if max_bkps <= 0:
@@ -498,75 +569,19 @@ def _create_changepoint_detector(
         data = np.asarray(sample_array, dtype=np.float64)
         if data.ndim == 1:
             data = data[:, None]
-        if data.ndim != 2:
-            raise ValueError(
-                f"sample_array must be 1D or 2D; received shape {data.shape}"
-            )
 
-        n_samples = data.shape[0]
-        if n_samples <= 1:
-            return np.asarray([], dtype=int)
+        kwargs = dict(base_kwargs)
+        if algo_name == 'window':
+            kwargs.setdefault('width', max(2, data.shape[0] // 20))
 
-        diffs = np.diff(data, axis=0)
-        if diffs.size == 0:
-            return np.asarray([], dtype=int)
+        algo = AlgoCls(**kwargs).fit(data)
+        try:
+            bkps = algo.predict(n_bkps=max_bkps)
+        except TypeError:
+            bkps = algo.predict(max_bkps)
 
-        if np.isnan(diffs).any() or np.isinf(diffs).any():
-            diffs = np.nan_to_num(diffs, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if normalize_differences:
-            if robust_scale:
-                median = np.median(diffs, axis=0)
-                mad = np.median(np.abs(diffs - median), axis=0)
-                mad[mad < 1e-12] = 1.0
-                diffs = (diffs - median) / mad
-            else:
-                std = diffs.std(axis=0, ddof=1)
-                std[std < 1e-12] = 1.0
-                diffs = diffs / std
-
-        scores = np.linalg.norm(diffs, axis=1)
-
-        if smoothing_window > 1 and scores.size >= smoothing_window:
-            kernel = np.ones(smoothing_window, dtype=np.float64) / float(smoothing_window)
-            scores = np.convolve(scores, kernel, mode='same')
-
-        candidate_pool = max(max_bkps, candidate_pool_multiplier * max_bkps)
-        candidate_pool = min(candidate_pool, scores.size)
-        if candidate_pool <= 0:
-            return np.asarray([], dtype=int)
-
-        # Select top candidates based on score magnitude.
-        candidate_indices = np.argpartition(-scores, candidate_pool - 1)[:candidate_pool]
-        ranked_indices = sorted(candidate_indices, key=lambda idx: scores[idx], reverse=True)
-
-        if min_distance is not None:
-            min_sep = max(1, int(min_distance))
-        else:
-            min_sep = max(1, int(round(min_distance_ratio * n_samples)))
-
-        selected: List[int] = []
-        for idx in ranked_indices:
-            cp = idx + 1  # Convert diff index to changepoint position.
-            if cp <= 0 or cp >= n_samples:
-                continue
-            if all(abs(cp - prev) >= min_sep for prev in selected):
-                selected.append(cp)
-            if len(selected) >= max_bkps:
-                break
-
-        if len(selected) < max_bkps:
-            # Relax spacing constraints if we still need more changepoints.
-            for idx in ranked_indices:
-                cp = idx + 1
-                if cp <= 0 or cp >= n_samples or cp in selected:
-                    continue
-                selected.append(cp)
-                if len(selected) >= max_bkps:
-                    break
-
-        selected = sorted(set(selected))
-        return np.asarray(selected[:max_bkps], dtype=int)
+        filtered = [int(idx) for idx in bkps if 0 < int(idx) < data.shape[0]]
+        return np.asarray(sorted(set(filtered)), dtype=int)
 
     return _detect
 
@@ -578,8 +593,8 @@ def detect_changepoints(
     raw_signal=None,
     detect_raw: bool = True,
     detector=None,
-    changepoint_algo: str = 'gradient',
-    changepoint_model: Optional[str] = None,
+    changepoint_algo: str = 'pelt',
+    changepoint_model: Optional[str] = 'rbf',
     changepoint_kwargs: Optional[Dict[str, Any]] = None
 ) -> Dict[str, np.ndarray]:
     """
@@ -593,7 +608,8 @@ def detect_changepoints(
         detect_raw: Whether to detect changepoints directly on raw_signal (requires raw_signal).
         detector: Optional callable returned by `_create_changepoint_detector`. If None, one will be created.
         changepoint_algo / changepoint_model / changepoint_kwargs: Parameters for detector construction
-            when `detector` is None.
+            when `detector` is None. Defaults use the PELT algorithm via ruptures; pass
+            changepoint_algo='gradient' to activate the built-in fast detector.
 
     Returns:
         Dict with keys:
@@ -611,10 +627,13 @@ def detect_changepoints(
         return np.asarray(data)
 
     latent_np = _to_numpy(latent_sample)
-    if latent_np.ndim != 2:
-        raise ValueError(
-            f"latent_sample must have shape (time_steps, latent_dim); got {latent_np.shape}"
-        )
+    if latent_np is None:
+        latent_np = np.zeros((0, 1), dtype=np.float64)
+    latent_np = np.asarray(latent_np, dtype=np.float64)
+    if latent_np.ndim == 1:
+        latent_np = latent_np[:, None]
+    elif latent_np.ndim > 2:
+        latent_np = latent_np.reshape(latent_np.shape[0], -1)
 
     latent_time_steps = latent_np.shape[0]
     max_bkps = min(max(0, int(n_changepoints)), max(0, latent_time_steps - 1))
@@ -670,8 +689,8 @@ def plot_latent_changepoints_with_raw(
     max_samples=5,
     random_state=None,
     show_colorbar=True,
-    changepoint_algo='gradient',
-    changepoint_model=None,
+    changepoint_algo='pelt',
+    changepoint_model='rbf',
     changepoint_kwargs=None,
     precomputed_changepoints=None
 ):
@@ -693,9 +712,10 @@ def plot_latent_changepoints_with_raw(
         max_samples: int, maximum number of samples to visualize (randomly selected, default: 5).
         random_state: Optional int for reproducible sample selection.
         show_colorbar: bool, whether to attach a colorbar next to each latent plot.
-        changepoint_algo: str, detector alias applied to latent & raw (legacy names are accepted).
-        changepoint_model: str or None, currently unused (retained for backwards compatibility).
-        changepoint_kwargs: Optional dict, extra keyword arguments for the fast detector (e.g., smoothing_window).
+        changepoint_algo: str, detector alias applied to latent & raw (default 'pelt' from ruptures;
+            pass 'gradient' to reuse the built-in detector).
+        changepoint_model: str or None, model parameter forwarded to ruptures algorithms.
+        changepoint_kwargs: Optional dict, extra keyword arguments for the selected detector.
         precomputed_changepoints: Optional dict or list/tuple containing per-sample changepoint
             results (as returned by `detect_changepoints`). If provided, detections are reused.
 
@@ -707,7 +727,7 @@ def plot_latent_changepoints_with_raw(
             - 'raw_detected_changepoints' (np.ndarray of raw indices detected from raw signals)
 
     Notes:
-        - Changepoints are detected in latent space and FHR space using the same gradient-based settings.
+        - Changepoints are detected in latent space and FHR space using the same detector settings.
         - Raw changepoints mapped from latent are derived by multiplying latent indices by decimation_factor.
     """
     def _to_numpy(data):
@@ -724,18 +744,17 @@ def plot_latent_changepoints_with_raw(
         changepoint_kwargs=changepoint_kwargs
     )
 
-    if latent_np.ndim != 3:
-        raise ValueError(
-            f"latent_mean must have shape (batch, time_steps, latent_dim); got {latent_np.shape}"
-        )
-    if fhr_np.ndim != 2:
-        raise ValueError(
-            f"fhr must have shape (batch, raw_time_steps); got {fhr_np.shape}"
-        )
-    if latent_np.shape[0] != fhr_np.shape[0]:
-        raise ValueError(
-            "latent_mean and fhr must share the same batch dimension."
-        )
+    if latent_np.ndim == 2:
+        latent_np = latent_np[None, ...]
+    elif latent_np.ndim > 3:
+        latent_np = latent_np.reshape(latent_np.shape[0], latent_np.shape[1], -1)
+
+    if fhr_np.ndim == 1:
+        fhr_np = fhr_np[None, ...]
+
+    batch_size = min(latent_np.shape[0], fhr_np.shape[0])
+    latent_np = latent_np[:batch_size]
+    fhr_np = fhr_np[:batch_size]
 
     batch_size, latent_time_steps, _ = latent_np.shape
 
@@ -991,8 +1010,8 @@ def summarize_latent_segments(
     n_changepoints: int = 5,
     decimation_factor: int = 16,
     raw_sample_rate_hz: float = 4.0,
-    changepoint_algo: str = 'gradient',
-    changepoint_model: Optional[str] = None,
+    changepoint_algo: str = 'pelt',
+    changepoint_model: Optional[str] = 'rbf',
     changepoint_kwargs: Optional[Dict[str, Any]] = None,
     precomputed_changepoints: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
@@ -1007,9 +1026,9 @@ def summarize_latent_segments(
         n_changepoints: Maximum number of changepoints to detect per sample (>=0).
         decimation_factor: Ratio between raw signal length and latent length (default: 16).
         raw_sample_rate_hz: Raw sampling rate in Hz (default: 4.0).
-        changepoint_algo: Detector alias (legacy ruptures names are mapped automatically).
-        changepoint_model: Optional legacy argument retained for compatibility; ignored by the fast detector.
-        changepoint_kwargs: Extra kwargs forwarded to the gradient-based detector.
+        changepoint_algo: Detector alias (default 'pelt' via ruptures; pass 'gradient' for the fast builtin).
+        changepoint_model: Optional model argument for ruptures detectors (ignored for 'gradient').
+        changepoint_kwargs: Extra kwargs forwarded to the selected detector.
         precomputed_changepoints: Optional dict/list containing per-sample changepoint dictionaries
             (as returned by `detect_changepoints`). When supplied, latent changepoints are reused.
 
@@ -1345,7 +1364,7 @@ def plot_complete_fhr_up_timeline(
         - Missing segments will appear as gaps in the timeline
         - The plot is wide and zoomable for detailed inspection
         - X-axis shows time in minutes before birth (negative values)
-        - Changepoint detection uses the same fast gradient-based detector as latent analysis
+        - Changepoint detection uses the configured detector (default PELT via ruptures)
         - Changepoints are detected independently for each 20-minute segment
     """
     try:
@@ -2541,3 +2560,10 @@ if __name__ == '__main__':
     #     point_size=20,
     #     alpha=0.6
     # )
+
+
+"""
+For vs_ProPlan and vs_ProPlan_% we should compare with respect to Calculated ProPlan so 
+it should be the in period minus proplan and (in period  / proplan - 1)*100
+Revise 
+"""
