@@ -33,7 +33,6 @@ from pytorch_lightning_modules import *
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
     SeqVaeTeb,
-    SeqVaeNoForecast,
     DEFAULT_COMPILE_ATTEMPTS,
     ensure_compiled_module,
 )
@@ -253,28 +252,21 @@ class SeqVAEGraphModel:
             load_success = False
             last_error: Optional[Exception] = None
 
-            model_cls = SeqVaeTeb if self.enable_forecaster else SeqVaeNoForecast
-
             for compile_options in compile_attempts:
-                if self.enable_forecaster:
-                    base_model_for_loading = model_cls(
-                        horizon_len=self.model_horizon_len,
-                        forecaster_hidden_dim=self.forecaster_hidden_dim,
-                        forecaster_min_logvar=self.forecaster_min_logvar,
-                        forecaster_max_logvar=self.forecaster_max_logvar,
-                        forecaster_dropout=self.forecaster_dropout,
-                        use_latent_forecaster=True,
-                    )
-                else:
-                    base_model_for_loading = model_cls(
-                        horizon_len=self.model_horizon_len,
-                    )
+                base_model_for_loading = SeqVaeTeb(
+                    horizon_len=self.model_horizon_len,
+                    forecaster_hidden_dim=self.forecaster_hidden_dim,
+                    forecaster_min_logvar=self.forecaster_min_logvar,
+                    forecaster_max_logvar=self.forecaster_max_logvar,
+                    forecaster_dropout=self.forecaster_dropout,
+                    use_latent_forecaster=self.enable_forecaster,
+                )
                 self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
 
                 if compile_options is not None:
                     compiled_module, compiled_ok = ensure_compiled_module(
                         base_model_for_loading,
-                        module_name=f"{model_cls.__name__} preload",
+                        module_name="SeqVaeTeb preload",
                         attempts=[compile_options],
                     )
                     if not compiled_ok:
@@ -317,7 +309,7 @@ class SeqVAEGraphModel:
                 self.base_model = self.lightning_base_model.model
                 self.base_model, compiled_flag = ensure_compiled_module(
                     self.base_model,
-                    module_name=f"{model_cls.__name__} post-checkpoint",
+                    module_name="SeqVaeTeb post-checkpoint",
                 )
                 self.lightning_base_model.model = self.base_model
                 self._skip_compilation = compiled_flag
@@ -374,30 +366,20 @@ class SeqVAEGraphModel:
             'forecaster_max_logvar': self.forecaster_max_logvar,
             'forecaster_dropout': self.forecaster_dropout,
             'use_latent_forecaster': self.enable_forecaster,
-            'latent_forecaster': None,
         }
-        model_cls = SeqVaeTeb if self.enable_forecaster else SeqVaeNoForecast
-        if self.enable_forecaster:
-            init_kwargs['use_latent_forecaster'] = True
+
         base_model = None
         legacy_ckpt = getattr(self, 'legacy_seqvae_checkpoint', None)
-        if legacy_ckpt:
-            if os.path.exists(legacy_ckpt):
-                try:
-                    logger.info(f"Initializing {model_cls.__name__} from legacy checkpoint: {legacy_ckpt}")
-                    base_model = model_cls.from_legacy_checkpoint(
-                        legacy_ckpt,
-                        strict=False,
-                        init_kwargs=init_kwargs,
-                    )
-                except Exception as exc:
-                    logger.warning(f"Failed to load legacy SeqVAE checkpoint {legacy_ckpt}: {exc}")
-                    logger.warning("Falling back to random initialization.")
-            else:
-                logger.warning(f"Legacy SeqVAE checkpoint not found at {legacy_ckpt}. Proceeding with random initialization.")
+        if legacy_ckpt and os.path.exists(legacy_ckpt):
+            logger.info(f"Initializing SeqVaeTeb from legacy checkpoint: {legacy_ckpt}")
+            base_model = SeqVaeTeb.from_legacy_checkpoint(
+                legacy_ckpt,
+                strict=False,
+                init_kwargs=init_kwargs,
+            )
 
         if base_model is None:
-            base_model = model_cls(**init_kwargs)
+            base_model = SeqVaeTeb(**init_kwargs)
 
         self.base_model = base_model
         self._resolve_predictive_anchor_cap(getattr(self.base_model, 'sequence_length', 300))
