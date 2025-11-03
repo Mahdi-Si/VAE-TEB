@@ -575,101 +575,127 @@ class PlottingCallBack(Callback):
         enc: Optional[Dict[str, torch.Tensor]],
         epoch: int,
     ):
-        """Visualize a latent forecast window against the ground-truth latent trajectory for one sample."""
+        """Visualize latent predictions against ground truth for selected anchors."""
         if latent_mu_future is None or anchors is None or anchors.numel() == 0:
             logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent predictions available")
             return
 
         batch_idx = 0
         anchors_np = anchors.detach().cpu().numpy()
-        num_anchors = anchors_np.size
-        if num_anchors == 0:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: empty anchor set")
+        target_steps = [60, 150, 169]
+        selected = []
+        for t in target_steps:
+            matches = np.where(anchors_np == t)[0]
+            if matches.size > 0:
+                selected.append((t, int(matches[0])))
+
+        if not selected:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: none of the requested anchors were found")
             return
-
-        anchor_idx = int(min(num_anchors // 2, num_anchors - 1))
-        anchor_idx = max(anchor_idx, 0)
-        anchor_t = int(anchors_np[anchor_idx])
-
-        pred_window = latent_mu_future[batch_idx, anchor_idx].detach().cpu().numpy()  # (H, D)
-        horizon, latent_dim = pred_window.shape
 
         gt_source = None
         if isinstance(enc, dict):
             mu_post = enc.get('mu_post')
             if isinstance(mu_post, torch.Tensor):
                 gt_source = mu_post.detach().cpu().numpy()
-
         if gt_source is None and latent_sequence is not None:
             gt_source = latent_sequence.detach().cpu().numpy()
-
         if gt_source is None:
             logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent targets available")
             return
 
         if gt_source.ndim == 2:
             gt_source = gt_source[None, ...]
-
         if batch_idx >= gt_source.shape[0]:
             logger.warning("[PlottingCallback] Skipping latent forecast plot: batch index out of range")
             return
 
         gt_full = gt_source[batch_idx]
-        start = anchor_t + 1
-        end = start + horizon
-        if start >= gt_full.shape[0]:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: anchor beyond latent sequence")
+        pred_full = latent_mu_future[batch_idx].detach().cpu().numpy()
+        horizon = pred_full.shape[1] if pred_full.ndim == 3 else pred_full.shape[0]
+        latent_dim = pred_full.shape[-1]
+
+        columns = []
+        for anchor_t, anchor_idx in selected:
+            if anchor_idx >= pred_full.shape[0]:
+                continue
+            pred_window = pred_full[anchor_idx]
+            if pred_window.ndim == 1:
+                pred_window = pred_window[:, None]
+            window_len = pred_window.shape[0]
+            start = anchor_t + 1
+            end = start + window_len
+            if start >= gt_full.shape[0]:
+                continue
+            end = min(end, gt_full.shape[0])
+            gt_window = gt_full[start:end]
+            if gt_window.shape[0] != pred_window.shape[0]:
+                window_len = min(gt_window.shape[0], pred_window.shape[0])
+                pred_window = pred_window[:window_len]
+                gt_window = gt_window[:window_len]
+            if window_len == 0:
+                continue
+            columns.append((anchor_t, pred_window, gt_window))
+
+        if not columns:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: no usable windows after alignment")
             return
 
-        end = min(end, gt_full.shape[0])
-        gt_window = gt_full[start:end]
+        n_cols = len(columns)
+        horizon = columns[0][1].shape[0]
+        latent_dim = columns[0][1].shape[1]
+        time_axis = np.arange(horizon)
 
-        if gt_window.shape[0] != pred_window.shape[0]:
-            horizon = min(gt_window.shape[0], pred_window.shape[0])
-            pred_window = pred_window[:horizon]
-            gt_window = gt_window[:horizon]
+        fig_height = max(latent_dim * 1.1, 6.0)
+        fig_width = max(n_cols * 4.0, 8.0)
+        fig, axes = plt.subplots(
+            nrows=latent_dim,
+            ncols=n_cols,
+            figsize=(fig_width, fig_height),
+            sharex=True,
+            constrained_layout=True,
+        )
 
-        if horizon == 0:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: zero-length window")
-            return
+        import gc
+        if latent_dim == 1:
+            axes = np.expand_dims(axes, axis=0)
+        if n_cols == 1:
+            axes = np.expand_dims(axes, axis=1)
 
-        diff_window = pred_window - gt_window
-        latent_mse = float(np.mean(diff_window ** 2))
-        latent_mae = float(np.mean(np.abs(diff_window)))
+        mse_summary = []
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+        for col_idx, (anchor_t, pred_window, gt_window) in enumerate(columns):
+            mse_val = float(np.mean((pred_window - gt_window) ** 2))
+            mse_summary.append((anchor_t, mse_val))
+            for dim_idx in range(latent_dim):
+                ax = axes[dim_idx, col_idx]
+                ax.plot(time_axis, gt_window[:, dim_idx], label='GT' if col_idx == 0 and dim_idx == 0 else None, color='#055C9A', linewidth=1.2)
+                ax.plot(time_axis, pred_window[:, dim_idx], label='Pred' if col_idx == 0 and dim_idx == 0 else None, color='#BB3E00', linewidth=1.0, linestyle='--')
+                ax.grid(alpha=0.3, linewidth=0.4)
+                if col_idx == 0:
+                    ax.set_ylabel(f'z{dim_idx}', fontsize=8)
+                else:
+                    ax.set_yticklabels([])
+                if dim_idx == latent_dim - 1:
+                    ax.set_xlabel('Forecast step', fontsize=8)
+                if dim_idx == 0:
+                    ax.set_title(f't = {anchor_t}', fontsize=10)
 
-        im0 = axes[0].imshow(gt_window.T, aspect='auto', origin='lower', cmap='viridis')
-        axes[0].set_title('Ground Truth Latent')
-        axes[0].set_xlabel('Forecast step')
-        axes[0].set_ylabel('Latent dim')
-        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        if latent_dim > 0 and n_cols > 0:
+            axes[0, 0].legend(loc='upper right', fontsize=8)
 
-        im1 = axes[1].imshow(pred_window.T, aspect='auto', origin='lower', cmap='viridis')
-        axes[1].set_title('Predicted Latent Mean')
-        axes[1].set_xlabel('Forecast step')
-        axes[1].set_ylabel('Latent dim')
-        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-        vmax = float(np.max(np.abs(diff_window))) if np.any(diff_window) else 1.0
-        im2 = axes[2].imshow(diff_window.T, aspect='auto', origin='lower', cmap='coolwarm', vmin=-vmax, vmax=vmax)
-        axes[2].set_title('Prediction Error')
-        axes[2].set_xlabel('Forecast step')
-        axes[2].set_ylabel('Latent dim')
-        fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-
+        summary_str = ' | '.join([f't={t}: MSE={mse:.4f}' for t, mse in mse_summary])
         fig.suptitle(
-            f'Latent Forecast vs Ground Truth | Epoch {epoch} | Anchor t={anchor_t} | MSE={latent_mse:.4f} | MAE={latent_mae:.4f}',
-            fontsize=13,
-            color='#456882'
+            f'Latent Forecast vs Ground Truth | Epoch {epoch}\n{summary_str}',
+            fontsize=14,
+            color='#456882',
         )
 
         save_path = os.path.join(self.output_dir, f'latent_forecast_epoch_{epoch}.pdf')
         fig.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
         plt.close(fig)
         logger.info(f'Latent forecast comparison plot saved to {save_path}')
-
-        del pred_window, gt_window, diff_window
+        gc.collect()
 
     def _plot_batch_aggregated_forecast(
         self,
