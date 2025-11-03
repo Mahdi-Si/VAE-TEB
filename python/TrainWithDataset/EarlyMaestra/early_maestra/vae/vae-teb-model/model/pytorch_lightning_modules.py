@@ -114,77 +114,49 @@ class PlottingCallBack(Callback):
 
                 if pl_module.model.has_forecaster():
                     # Use new forecast API (no anchors)
-                    forecast_dict = orig_model.forecast(
-                        y_st=y_st,
-                        y_ph=y_ph,
-                        x_ph=x_ph,
-                        timesteps=None,  # All valid timesteps
-                        use_posterior_mean=True,
-                        decode_predictions=True,  # Need decoded predictions for plotting
+                    forecast_dict = orig_model.forecast_full(
+                    y_st=y_st,
+                    y_ph=y_ph,
+                    x_ph=x_ph,
+                    anchors=None,
+                    use_posterior_mean=True,
+                )
+
+                mu_future = forecast_dict.get('mu_future')
+                logvar_future = forecast_dict.get('logvar_future')
+                anchors = forecast_dict.get('anchors')
+                canvas_mu = forecast_dict.get('canvas_mu')
+                mean_mu = forecast_dict.get('mean_mu')
+                std_mu = forecast_dict.get('std_mu')
+
+                if (
+                    mu_future is not None
+                    and anchors is not None
+                    and anchors.numel() > 0
+                    and mean_mu is not None
+                    and std_mu is not None
+                ):
+                    self._plot_forecast_results(
+                        y_raw_normalized,
+                        mean_mu,
+                        std_mu,
+                        canvas_mu,
+                        anchors,
+                        latent_z_full,
+                        pl_trainer.current_epoch
                     )
 
-                    # Extract predictions
-                    mu_future = forecast_dict.get('mu_future')  # (B, N, 480)
-                    logvar_future = forecast_dict.get('logvar_future')  # (B, N, 480)
-                    timesteps = forecast_dict.get('timesteps')  # (N,)
-
-                    # Check if we have valid forecasts
-                    if mu_future is not None and timesteps is not None and timesteps.numel() > 0:
-                        # Aggregate forecasts to canvas for plotting
-                        # Create a simple canvas by averaging predictions (simplified approach)
-                        B = mu_future.size(0)
-                        signal_len = y_raw_normalized.shape[1]
-                        mean_mu = torch.full((B, signal_len), float('nan'), device=mu_future.device)
-                        std_mu = torch.full((B, signal_len), float('nan'), device=mu_future.device)
-
-                        # For each timestep, place the prediction in the corresponding window
-                        H = 30  # horizon
-                        stride = 16  # decimation factor
-                        for i, t in enumerate(timesteps):
-                            t_val = int(t.item())
-                            start_idx = stride * (t_val + 1)
-                            end_idx = start_idx + stride * H
-                            if end_idx <= signal_len:
-                                # Average predictions for overlapping windows
-                                for b in range(B):
-                                    pred = mu_future[b, i, :]  # (480,)
-                                    var = logvar_future[b, i, :].exp()  # (480,)
-                                    # Simple averaging (could use weighted averaging)
-                                    window_mean = mean_mu[b, start_idx:end_idx]
-                                    window_std = std_mu[b, start_idx:end_idx]
-                                    # Replace NaN with new values or average
-                                    mask = torch.isnan(window_mean)
-                                    window_mean = torch.where(mask, pred, (window_mean + pred) / 2)
-                                    window_std = torch.where(mask, var.sqrt(), (window_std + var.sqrt()) / 2)
-                                    mean_mu[b, start_idx:end_idx] = window_mean
-                                    std_mu[b, start_idx:end_idx] = window_std
-
-                        # Create dummy canvas_mu and anchors for backward compatibility with plotting
-                        canvas_mu = mean_mu.unsqueeze(1)  # (B, 1, signal_len)
-                        anchors = timesteps  # Use timesteps as anchors
-
-                        # Plot forecast results (keep only this plot)
-                        self._plot_forecast_results(
-                            y_raw_normalized,
-                            mean_mu,
-                            std_mu,
-                            canvas_mu,
-                            anchors,
-                            latent_z_full,
-                            pl_trainer.current_epoch
+                    try:
+                        self._plot_batch_aggregated_forecast(
+                            y_raw_batch=y_raw_normalized,
+                            mean_mu_batch=mean_mu,
+                            std_mu_batch=std_mu,
+                            epoch=pl_trainer.current_epoch,
                         )
-
-                        try:
-                            self._plot_batch_aggregated_forecast(
-                                y_raw_batch=y_raw_normalized,
-                                mean_mu_batch=mean_mu,
-                                std_mu_batch=std_mu,
-                                epoch=pl_trainer.current_epoch,
-                            )
-                        except Exception as e:
-                            logger.warning(f"Failed to plot batch aggregated forecast: {e}")
-                    else:
-                        logger.warning("No valid forecasts available for plotting")
+                    except Exception as e:
+                        logger.warning(f"Failed to plot batch aggregated forecast: {e}")
+                else:
+                    logger.warning("No valid forecasts available for plotting")
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
             import traceback
