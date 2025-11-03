@@ -532,10 +532,18 @@ class PlottingCallBack(Callback):
         ax[1, 0].plot(t_in, y_raw, color=colors['gt'], alpha=0.4, linewidth=1.0)
         if anchors.numel() > 0:
             anc = anchors.detach().cpu().numpy()
-            cmu = canvas_mu[batch_idx].detach().cpu().numpy()  # (N,4800)
+            cmu = canvas_mu[batch_idx].detach().cpu().numpy()
+            if cmu.ndim == 1:
+                cmu = cmu[np.newaxis, ...]
             picks = [anc[0], anc[len(anc)//2], anc[-1]] if len(anc) >= 3 else list(anc)
             for a in picks:
-                idx = int(np.where(anc == a)[0][0])
+                idx_matches = np.where(anc == a)[0]
+                if idx_matches.size == 0:
+                    continue
+                idx = int(idx_matches[0])
+                if idx >= cmu.shape[0]:
+                    logger.warning("[PlottingCallback] Anchor index %s exceeds canvas windows %s, skipping", idx, cmu.shape[0])
+                    continue
                 w = cmu[idx]
                 ax[1, 0].plot(t_in, w, color='#D7263D', linewidth=1.0, alpha=0.8)
         ax[1, 0].set_ylabel('FHR (bpm)')
