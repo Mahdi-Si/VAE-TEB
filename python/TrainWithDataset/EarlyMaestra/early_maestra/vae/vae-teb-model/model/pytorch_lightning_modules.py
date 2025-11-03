@@ -616,15 +616,15 @@ class PlottingCallBack(Callback):
         latent_dim = pred_full.shape[-1]
 
         columns = []
+        latent_logvar_future = enc.get('latent_logvar_future') if isinstance(enc, dict) else None
         for anchor_t, anchor_idx in selected:
             if anchor_idx >= pred_full.shape[0]:
                 continue
             pred_window = pred_full[anchor_idx]
             if pred_window.ndim == 1:
                 pred_window = pred_window[:, None]
-            var_full = forecast_dict.get('latent_logvar_future')
-            if isinstance(var_full, torch.Tensor):
-                var_window = var_full[batch_idx, anchor_idx].detach().cpu().numpy()
+            if isinstance(latent_logvar_future, torch.Tensor) and anchor_idx < latent_logvar_future.shape[1]:
+                var_window = latent_logvar_future[batch_idx, anchor_idx].detach().cpu().numpy()
                 if var_window.ndim == 1:
                     var_window = var_window[:, None]
             else:
