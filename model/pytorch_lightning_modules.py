@@ -622,6 +622,13 @@ class PlottingCallBack(Callback):
             pred_window = pred_full[anchor_idx]
             if pred_window.ndim == 1:
                 pred_window = pred_window[:, None]
+            var_full = forecast_dict.get('latent_logvar_future')
+            if isinstance(var_full, torch.Tensor):
+                var_window = var_full[batch_idx, anchor_idx].detach().cpu().numpy()
+                if var_window.ndim == 1:
+                    var_window = var_window[:, None]
+            else:
+                var_window = None
             window_len = pred_window.shape[0]
             start = anchor_t + 1
             end = start + window_len
@@ -633,9 +640,11 @@ class PlottingCallBack(Callback):
                 window_len = min(gt_window.shape[0], pred_window.shape[0])
                 pred_window = pred_window[:window_len]
                 gt_window = gt_window[:window_len]
+                if var_window is not None:
+                    var_window = var_window[:window_len]
             if window_len == 0:
                 continue
-            columns.append((anchor_t, pred_window, gt_window))
+            columns.append((anchor_t, pred_window, gt_window, var_window))
 
         if not columns:
             logger.warning("[PlottingCallback] Skipping latent forecast plot: no usable windows after alignment")
@@ -664,13 +673,18 @@ class PlottingCallBack(Callback):
 
         mse_summary = []
 
-        for col_idx, (anchor_t, pred_window, gt_window) in enumerate(columns):
+        for col_idx, (anchor_t, pred_window, gt_window, var_window) in enumerate(columns):
             mse_val = float(np.mean((pred_window - gt_window) ** 2))
             mse_summary.append((anchor_t, mse_val))
             for dim_idx in range(latent_dim):
                 ax = axes[dim_idx, col_idx]
                 ax.plot(time_axis, gt_window[:, dim_idx], label='GT' if col_idx == 0 and dim_idx == 0 else None, color='#055C9A', linewidth=1.2)
                 ax.plot(time_axis, pred_window[:, dim_idx], label='Pred' if col_idx == 0 and dim_idx == 0 else None, color='#BB3E00', linewidth=1.0, linestyle='--')
+                if var_window is not None:
+                    std_vals = np.sqrt(np.maximum(var_window[:, dim_idx], 1e-8))
+                    upper = pred_window[:, dim_idx] + std_vals
+                    lower = pred_window[:, dim_idx] - std_vals
+                    ax.fill_between(time_axis, lower, upper, color='#BB3E00', alpha=0.15, linewidth=0)
                 ax.grid(alpha=0.3, linewidth=0.4)
                 if col_idx == 0:
                     ax.set_ylabel(f'z{dim_idx}', fontsize=8)
