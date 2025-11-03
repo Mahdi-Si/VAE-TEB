@@ -1490,9 +1490,11 @@ class LatentForecaster(nn.Module):
         # Forward pass to get predictions at all timesteps
         mu_pred, logvar_pred = self.forward(z_sequence)  # (B, T, H, D)
 
-        # Determine valid prediction range: [warmup_period, T - horizon]
+        # Determine valid prediction range: [warmup_period, T - horizon - 1]
+        # We need t+1+h < T for all h in [0, horizon-1]
+        # This gives: t < T - horizon, so max valid t = T - horizon - 1
         start_t = self.warmup_period
-        end_t = T - self.horizon
+        end_t = T - self.horizon - 1
 
         if end_t < start_t:
             # Not enough timesteps for any valid predictions
@@ -2158,7 +2160,7 @@ class SeqVaeTeb(nn.Module):
         Forecast future latent sequences using the new LatentForecaster.
 
         The new forecaster predicts the next H=30 latent steps at each timestep.
-        Valid predictions are in the range [warmup_period, T-horizon].
+        Valid predictions are in the range [warmup_period, T-horizon-1].
 
         Args:
             y_st: Target scattering features, shape (B, T, 43)
@@ -2190,9 +2192,10 @@ class SeqVaeTeb(nn.Module):
         # Get forecasting predictions for all timesteps
         mu_pred, logvar_pred = self.latent_forecaster.forward(z_seq)  # (B, T, H, D)
 
-        # Determine valid timesteps
+        # Determine valid timesteps: [warmup_period, T - H - 1]
+        # We need t+1+h < T for all h in [0, H-1], which gives t < T - H
         start_t = self.warmup_period
-        end_t = T - H
+        end_t = T - H - 1
         if end_t < start_t:
             # No valid predictions
             return {
