@@ -115,48 +115,56 @@ class PlottingCallBack(Callback):
                 if pl_module.model.has_forecaster():
                     # Use new forecast API (no anchors)
                     forecast_dict = orig_model.forecast_full(
-                    y_st=y_st,
-                    y_ph=y_ph,
-                    x_ph=x_ph,
-                    anchors=None,
-                    use_posterior_mean=True,
-                )
-
-                mu_future = forecast_dict.get('mu_future')
-                logvar_future = forecast_dict.get('logvar_future')
-                anchors = forecast_dict.get('anchors')
-                canvas_mu = forecast_dict.get('canvas_mu')
-                mean_mu = forecast_dict.get('mean_mu')
-                std_mu = forecast_dict.get('std_mu')
-
-                if (
-                    mu_future is not None
-                    and anchors is not None
-                    and anchors.numel() > 0
-                    and mean_mu is not None
-                    and std_mu is not None
-                ):
-                    self._plot_forecast_results(
-                        y_raw_normalized,
-                        mean_mu,
-                        std_mu,
-                        canvas_mu,
-                        anchors,
-                        latent_z_full,
-                        pl_trainer.current_epoch
+                        y_st=y_st,
+                        y_ph=y_ph,
+                        x_ph=x_ph,
+                        anchors=None,
+                        use_posterior_mean=True,
                     )
 
-                    try:
-                        self._plot_batch_aggregated_forecast(
-                            y_raw_batch=y_raw_normalized,
-                            mean_mu_batch=mean_mu,
-                            std_mu_batch=std_mu,
+                    mu_future = forecast_dict.get('mu_future')
+                    logvar_future = forecast_dict.get('logvar_future')
+                    anchors = forecast_dict.get('anchors')
+                    canvas_mu = forecast_dict.get('canvas_mu')
+                    mean_mu = forecast_dict.get('mean_mu')
+                    std_mu = forecast_dict.get('std_mu')
+
+                    if (
+                        mu_future is not None
+                        and anchors is not None
+                        and anchors.numel() > 0
+                        and mean_mu is not None
+                        and std_mu is not None
+                    ):
+                        self._plot_forecast_results(
+                            y_raw_normalized,
+                            mean_mu,
+                            std_mu,
+                            canvas_mu,
+                            anchors,
+                            latent_z_full,
+                            pl_trainer.current_epoch
+                        )
+
+                        self._plot_latent_forecast(
+                            latent_sequence=latent_z_full,
+                            latent_mu_future=forecast_dict.get('latent_mu_future'),
+                            anchors=anchors,
+                            enc=forecast_dict.get('enc'),
                             epoch=pl_trainer.current_epoch,
                         )
-                    except Exception as e:
-                        logger.warning(f"Failed to plot batch aggregated forecast: {e}")
-                else:
-                    logger.warning("No valid forecasts available for plotting")
+
+                        try:
+                            self._plot_batch_aggregated_forecast(
+                                y_raw_batch=y_raw_normalized,
+                                mean_mu_batch=mean_mu,
+                                std_mu_batch=std_mu,
+                                epoch=pl_trainer.current_epoch,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to plot batch aggregated forecast: {e}")
+                    else:
+                        logger.warning("No valid forecasts available for plotting")
         except Exception as e:
             logger.error(f"Error during plotting: {e}")
             import traceback
@@ -502,20 +510,18 @@ class PlottingCallBack(Callback):
         # Subplot 2: show some example windows overlayed
         ax[1, 1].set_axis_off()
         ax[1, 0].plot(t_in, y_raw, color=colors['gt'], alpha=0.4, linewidth=1.0)
-        if anchors.numel() > 0:
+        if anchors is not None and anchors.numel() > 0 and canvas_mu is not None:
             anc = anchors.detach().cpu().numpy()
             cmu = canvas_mu[batch_idx].detach().cpu().numpy()
             if cmu.ndim == 1:
                 cmu = cmu[np.newaxis, ...]
-            picks = [anc[0], anc[len(anc)//2], anc[-1]] if len(anc) >= 3 else list(anc)
-            for a in picks:
-                idx_matches = np.where(anc == a)[0]
-                if idx_matches.size == 0:
+            pick_indices = [0, len(anc) // 2, len(anc) - 1] if len(anc) >= 3 else list(range(len(anc)))
+            seen = set()
+            for idx in pick_indices:
+                idx = int(idx)
+                if idx < 0 or idx >= cmu.shape[0] or idx in seen:
                     continue
-                idx = int(idx_matches[0])
-                if idx >= cmu.shape[0]:
-                    logger.warning("[PlottingCallback] Anchor index %s exceeds canvas windows %s, skipping", idx, cmu.shape[0])
-                    continue
+                seen.add(idx)
                 w = cmu[idx]
                 ax[1, 0].plot(t_in, w, color='#D7263D', linewidth=1.0, alpha=0.8)
         ax[1, 0].set_ylabel('FHR (bpm)')
@@ -560,6 +566,110 @@ class PlottingCallBack(Callback):
             del z_latent
         gc.collect()
         logger.info(f"Forecast results plot saved to {save_path}")
+
+    def _plot_latent_forecast(
+        self,
+        latent_sequence: Optional[torch.Tensor],
+        latent_mu_future: Optional[torch.Tensor],
+        anchors: Optional[torch.Tensor],
+        enc: Optional[Dict[str, torch.Tensor]],
+        epoch: int,
+    ):
+        """Visualize a latent forecast window against the ground-truth latent trajectory for one sample."""
+        if latent_mu_future is None or anchors is None or anchors.numel() == 0:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent predictions available")
+            return
+
+        batch_idx = 0
+        anchors_np = anchors.detach().cpu().numpy()
+        num_anchors = anchors_np.size
+        if num_anchors == 0:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: empty anchor set")
+            return
+
+        anchor_idx = int(min(num_anchors // 2, num_anchors - 1))
+        anchor_idx = max(anchor_idx, 0)
+        anchor_t = int(anchors_np[anchor_idx])
+
+        pred_window = latent_mu_future[batch_idx, anchor_idx].detach().cpu().numpy()  # (H, D)
+        horizon, latent_dim = pred_window.shape
+
+        gt_source = None
+        if isinstance(enc, dict):
+            mu_post = enc.get('mu_post')
+            if isinstance(mu_post, torch.Tensor):
+                gt_source = mu_post.detach().cpu().numpy()
+
+        if gt_source is None and latent_sequence is not None:
+            gt_source = latent_sequence.detach().cpu().numpy()
+
+        if gt_source is None:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent targets available")
+            return
+
+        if gt_source.ndim == 2:
+            gt_source = gt_source[None, ...]
+
+        if batch_idx >= gt_source.shape[0]:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: batch index out of range")
+            return
+
+        gt_full = gt_source[batch_idx]
+        start = anchor_t + 1
+        end = start + horizon
+        if start >= gt_full.shape[0]:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: anchor beyond latent sequence")
+            return
+
+        end = min(end, gt_full.shape[0])
+        gt_window = gt_full[start:end]
+
+        if gt_window.shape[0] != pred_window.shape[0]:
+            horizon = min(gt_window.shape[0], pred_window.shape[0])
+            pred_window = pred_window[:horizon]
+            gt_window = gt_window[:horizon]
+
+        if horizon == 0:
+            logger.warning("[PlottingCallback] Skipping latent forecast plot: zero-length window")
+            return
+
+        diff_window = pred_window - gt_window
+        latent_mse = float(np.mean(diff_window ** 2))
+        latent_mae = float(np.mean(np.abs(diff_window)))
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+
+        im0 = axes[0].imshow(gt_window.T, aspect='auto', origin='lower', cmap='viridis')
+        axes[0].set_title('Ground Truth Latent')
+        axes[0].set_xlabel('Forecast step')
+        axes[0].set_ylabel('Latent dim')
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+        im1 = axes[1].imshow(pred_window.T, aspect='auto', origin='lower', cmap='viridis')
+        axes[1].set_title('Predicted Latent Mean')
+        axes[1].set_xlabel('Forecast step')
+        axes[1].set_ylabel('Latent dim')
+        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        vmax = float(np.max(np.abs(diff_window))) if np.any(diff_window) else 1.0
+        im2 = axes[2].imshow(diff_window.T, aspect='auto', origin='lower', cmap='coolwarm', vmin=-vmax, vmax=vmax)
+        axes[2].set_title('Prediction Error')
+        axes[2].set_xlabel('Forecast step')
+        axes[2].set_ylabel('Latent dim')
+        fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+        fig.suptitle(
+            f'Latent Forecast vs Ground Truth | Epoch {epoch} | Anchor t={anchor_t} | MSE={latent_mse:.4f} | MAE={latent_mae:.4f}',
+            fontsize=13,
+            color='#456882'
+        )
+
+        save_path = os.path.join(self.output_dir, f'latent_forecast_epoch_{epoch}.pdf')
+        fig.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
+        plt.close(fig)
+        logger.info(f'Latent forecast comparison plot saved to {save_path}')
+
+        del pred_window, gt_window, diff_window
 
     def _plot_batch_aggregated_forecast(
         self,
