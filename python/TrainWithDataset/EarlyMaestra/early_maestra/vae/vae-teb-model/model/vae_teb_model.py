@@ -1341,170 +1341,209 @@ class SeqVaeCore(nn.Module):
 
 class LatentForecaster(nn.Module):
     """
-    Causal latent forecaster that consumes the full history and produces parallel
-    horizon predictions with calibrated uncertainty.
+    Causal latent forecaster that predicts the next 30 latent steps at each timestep.
+
+    Architecture:
+        Input: (B, T, 16) where T=300
+        1. ResidualMLP: 16 → 64
+        2. LSTM: hidden_dim=128
+        3. Two ResidualMLPs: 128 → 480 (30 steps × 16 latent_dim)
+        Output: (B, T, 30, 16) - 30 future latent predictions at each timestep
+
+    Loss computation:
+        - Valid prediction range: t ∈ [warmup_period, T - horizon]
+        - For warmup_period=30, horizon=30: t ∈ [30, 270]
+        - Each timestep t predicts z[t+1:t+31] and computes NLL loss
     """
 
     def __init__(
         self,
         latent_dim: int = 16,
-        hidden_dim: int = 128,
+        lstm_hidden_dim: int = 128,
+        lstm_num_layers: int = 4,
         min_logvar: float = -7.0,
         max_logvar: float = 4.0,
-        tcn_depth: int = 6,
-        kernel_size: int = 3,
-        max_horizon: int = 30,
+        warmup_period: int = 30,
+        horizon: int = 30,
         dropout: float = 0.1,
     ):
         super().__init__()
 
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.tcn_depth = tcn_depth
-        self.kernel_size = kernel_size
-        self.max_horizon = max_horizon
-        self.dropout = dropout
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.lstm_num_layers = lstm_num_layers
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
+        self.warmup_period = warmup_period
+        self.horizon = horizon
+        self.dropout = dropout
 
-        self.receptive_field = 1 + (kernel_size - 1) * (2**tcn_depth - 1)
+        # Output dimension: horizon * latent_dim * 2 (mu and logvar)
+        self.output_dim = horizon * latent_dim * 2
 
+        # 1. Input projection: 16 → 64
         self.input_projection = ResidualMLP(
             input_dim=latent_dim,
-            hidden_dims=geometric_schedule(latent_dim, hidden_dim, 3),
+            hidden_dims=geometric_schedule(latent_dim, 64, 3),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
             dropout=dropout,
         )
 
-        self.tcn_blocks = nn.ModuleList()
-        for depth_idx in range(tcn_depth):
-            dilation = 2 ** depth_idx
-            block = CausalMultiChannelConvBlock(
-                in_channels=hidden_dim,
-                out_channels=hidden_dim,
-                groups=min(4, hidden_dim),
-                filter_size=kernel_size,
-                dilation=dilation,
-                activation=nn.GELU,
-                dropout=dropout,
-            )
-            self.tcn_blocks.append(block)
+        # 2. LSTM: hidden_dim=128
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_num_layers,
+            batch_first=True,
+            bidirectional=False,
+            dropout=dropout if lstm_num_layers > 1 else 0.0,
+        )
+        self.lstm_norm = nn.LayerNorm(lstm_hidden_dim)
 
-        self.skip_connection_mid = nn.Linear(hidden_dim, hidden_dim)
-
-        self.feature_refinement = ResidualMLP(
-            input_dim=hidden_dim,
-            hidden_dims=geometric_schedule(hidden_dim, hidden_dim, 2),
+        # 3. Two ResidualMLPs: 128 → 480
+        intermediate_dim = (lstm_hidden_dim + self.output_dim) // 2
+        self.output_mlp_1 = ResidualMLP(
+            input_dim=lstm_hidden_dim,
+            hidden_dims=(intermediate_dim,),
             final_activation=True,
             use_skip_connection=True,
             activation=nn.GELU,
             dropout=dropout,
         )
 
-        self.summary_projection = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.horizon_attention = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, max_horizon),
-        )
-        self.horizon_embedding = nn.Parameter(torch.randn(max_horizon, hidden_dim) * 0.02)
-
-        self.step_mlp = ResidualMLP(
-            input_dim=2 * hidden_dim,
-            hidden_dims=(hidden_dim,),
-            final_activation=True,
-            use_skip_connection=True,
+        self.output_mlp_2 = ResidualMLP(
+            input_dim=intermediate_dim,
+            hidden_dims=(self.output_dim,),
+            final_activation=False,
+            use_skip_connection=False,
             activation=nn.GELU,
             dropout=dropout,
         )
-        self.output_layer = nn.Linear(hidden_dim, 2 * latent_dim)
 
     def forward(
         self,
-        z_context: torch.Tensor,
-        horizon: int,
-        context_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        if horizon < 1 or horizon > self.max_horizon:
-            raise ValueError(f"Invalid horizon={horizon}, expected 1..{self.max_horizon}")
+        z_sequence: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the forecaster.
 
-        B, L, D = z_context.shape
-        assert D == self.latent_dim, f"Context latent dimension {D} != {self.latent_dim}"
+        Args:
+            z_sequence: Latent sequence, shape (B, T, D) where D=latent_dim
 
-        if context_mask is None:
-            context_mask = z_context.new_ones(B, L, dtype=torch.bool)
-        else:
-            context_mask = context_mask.to(torch.bool)
+        Returns:
+            mu_pred: Predicted means, shape (B, T, H, D) where H=horizon
+            logvar_pred: Predicted log-variances, shape (B, T, H, D)
+        """
+        B, T, D = z_sequence.shape
+        assert D == self.latent_dim, f"Input latent dimension {D} != {self.latent_dim}"
 
-        mask = context_mask.unsqueeze(-1).float()
+        # 1. Input projection: (B, T, 16) → (B, T, 64)
+        x = self.input_projection(z_sequence)
 
-        x = self.input_projection(z_context) * mask
-        skip_input = x
+        # 2. LSTM: (B, T, 64) → (B, T, 128)
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.lstm_norm(lstm_out)
 
-        x = x.transpose(1, 2)
-        for depth_idx, block in enumerate(self.tcn_blocks):
-            x = block(x)
-            if depth_idx == self.tcn_depth // 2:
-                skip_mid = self.skip_connection_mid(skip_input).transpose(1, 2)
-                x = x + skip_mid
+        # 3. Output MLPs: (B, T, 128) → (B, T, 480)
+        hidden = self.output_mlp_1(lstm_out)
+        output = self.output_mlp_2(hidden)  # (B, T, 480)
 
-        x = x.transpose(1, 2)
-        x = self.feature_refinement(x) * mask
+        # Reshape to separate mu and logvar for each horizon step
+        # (B, T, 480) → (B, T, 30, 32) where 32 = 2 * latent_dim
+        output = output.view(B, T, self.horizon, 2 * self.latent_dim)
 
-        lengths = context_mask.sum(dim=1).clamp_min(1)
-        last_indices = (lengths - 1).long()
-        batch_idx = torch.arange(B, device=z_context.device)
-        last_feat = x[batch_idx, last_indices]
-        mean_feat = (x * mask).sum(dim=1) / lengths.unsqueeze(-1)
-        summary = self.summary_projection(torch.cat([last_feat, mean_feat], dim=-1))
+        # Split into mu and logvar
+        mu_pred = output[..., :self.latent_dim]  # (B, T, 30, 16)
+        logvar_pred = output[..., self.latent_dim:]  # (B, T, 30, 16)
 
-        attn_logits = self.horizon_attention(x)[:, :, :horizon]
-        mask = ~context_mask.unsqueeze(-1)
-        if mask.any():
-            fill_value = torch.finfo(attn_logits.dtype).min
-            attn_logits = attn_logits.masked_fill(mask, fill_value)
-        attn_weights = torch.softmax(attn_logits, dim=1)
-        aggregated = torch.einsum('blc,blh->bhc', x, attn_weights)
-        aggregated = aggregated + self.horizon_embedding[:horizon].unsqueeze(0)
+        # Clamp logvar
+        logvar_pred = torch.clamp(logvar_pred, min=self.min_logvar, max=self.max_logvar)
 
-        summary_expanded = summary.unsqueeze(1).expand(-1, horizon, -1)
-        step_inputs = torch.cat([aggregated, summary_expanded], dim=-1)
-        step_hidden = self.step_mlp(step_inputs)
+        return mu_pred, logvar_pred
 
-        stats = self.output_layer(step_hidden)
-        mu_steps = stats[..., : self.latent_dim]
-        logvar_steps = stats[..., self.latent_dim :]
-        logvar_steps = torch.clamp(logvar_steps, min=self.min_logvar, max=self.max_logvar)
+    def compute_forecasting_loss(
+        self,
+        z_sequence: torch.Tensor,
+        gamma: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute forecasting loss for the latent predictions.
 
-        aux = {
-            'context_lengths': lengths,
-            'receptive_field': self.receptive_field,
-        }
-        return mu_steps, logvar_steps, aux
+        Valid prediction range: t ∈ [warmup_period, T - horizon]
+        For each timestep t in this range, predict z[t+1:t+1+horizon] and compute NLL.
 
-    @staticmethod
-    def compute_latent_nll_loss(
-        mu_pred: torch.Tensor,
-        logvar_pred: torch.Tensor,
-        z_target: torch.Tensor,
-        horizon_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        var_pred = torch.exp(logvar_pred)
-        squared_error = (z_target - mu_pred) ** 2
-        nll = 0.5 * (logvar_pred + squared_error / var_pred)
+        Args:
+            z_sequence: Full latent sequence, shape (B, T, D)
+            gamma: Discount factor for horizon weighting (1.0 = no discount)
 
-        if horizon_weights is not None:
-            if horizon_weights.dim() == 1:
-                horizon_weights = horizon_weights.view(1, -1, 1)
+        Returns:
+            Dictionary containing:
+                - total_loss: Total forecasting loss
+                - latent_nll: NLL loss for latent predictions
+                - mu_pred: Predicted means (B, T, H, D)
+                - logvar_pred: Predicted log-variances (B, T, H, D)
+        """
+        B, T, D = z_sequence.shape
+
+        # Forward pass to get predictions at all timesteps
+        mu_pred, logvar_pred = self.forward(z_sequence)  # (B, T, H, D)
+
+        # Determine valid prediction range: [warmup_period, T - horizon]
+        start_t = self.warmup_period
+        end_t = T - self.horizon
+
+        if end_t < start_t:
+            # Not enough timesteps for any valid predictions
+            device = z_sequence.device
+            return {
+                'total_loss': torch.tensor(0.0, device=device, requires_grad=True),
+                'latent_nll': torch.tensor(0.0, device=device, requires_grad=True),
+                'mu_pred': mu_pred,
+                'logvar_pred': logvar_pred,
+                'valid_predictions': 0,
+            }
+
+        # Collect targets: for each t in [start_t, end_t], target is z[t+1:t+1+horizon]
+        # Shape: (B, num_valid_t, H, D)
+        num_valid_t = end_t - start_t + 1
+        targets = []
+        for offset in range(self.horizon):
+            # For horizon step h, target at time t is z[t+1+h]
+            target_slice = z_sequence[:, start_t+1+offset:end_t+2+offset, :]  # (B, num_valid_t, D)
+            targets.append(target_slice)
+
+        z_target = torch.stack(targets, dim=2)  # (B, num_valid_t, H, D)
+
+        # Extract predictions for valid timesteps
+        mu_pred_valid = mu_pred[:, start_t:end_t+1, :, :]  # (B, num_valid_t, H, D)
+        logvar_pred_valid = logvar_pred[:, start_t:end_t+1, :, :]  # (B, num_valid_t, H, D)
+
+        # Compute NLL loss
+        var_pred = torch.exp(logvar_pred_valid)
+        squared_error = (z_target - mu_pred_valid) ** 2
+        nll = 0.5 * (logvar_pred_valid + squared_error / var_pred)  # (B, num_valid_t, H, D)
+
+        # Apply horizon discount weights if gamma < 1.0
+        if gamma < 1.0:
+            horizon_weights = self.create_horizon_discount_weights(
+                self.horizon, gamma=gamma, device=z_sequence.device
+            )
+            # Reshape weights: (H,) → (1, 1, H, 1)
+            horizon_weights = horizon_weights.view(1, 1, -1, 1)
             nll = nll * horizon_weights
 
-        return nll.mean()
+        # Average over all dimensions
+        latent_nll = nll.mean()
+
+        return {
+            'total_loss': latent_nll,
+            'latent_nll': latent_nll,
+            'mu_pred': mu_pred,
+            'logvar_pred': logvar_pred,
+            'valid_predictions': num_valid_t,
+        }
 
     @staticmethod
     def create_horizon_discount_weights(
@@ -1512,39 +1551,10 @@ class LatentForecaster(nn.Module):
         gamma: float = 0.95,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
+        """Create exponentially decaying weights for horizon steps."""
         exponents = torch.arange(horizon, dtype=torch.float32, device=device)
         weights = gamma ** exponents
         return weights
-
-    def compute_forecasting_loss(
-        self,
-        z_context: torch.Tensor,
-        z_target: torch.Tensor,
-        horizon: int,
-        context_mask: Optional[torch.Tensor] = None,
-        gamma: float = 1.0,
-    ) -> Dict[str, torch.Tensor]:
-        mu_pred, logvar_pred, aux = self.forward(
-            z_context, horizon, context_mask=context_mask
-        )
-
-        horizon_weights = None
-        if gamma < 1.0:
-            horizon_weights = self.create_horizon_discount_weights(
-                horizon, gamma=gamma, device=z_context.device
-            )
-
-        latent_nll = self.compute_latent_nll_loss(
-            mu_pred, logvar_pred, z_target, horizon_weights=horizon_weights
-        )
-
-        return {
-            'total_loss': latent_nll,
-            'latent_nll': latent_nll,
-            'mu_pred': mu_pred,
-            'logvar_pred': logvar_pred,
-            'aux': aux,
-        }
 class SeqVaeTeb(nn.Module):
     """
     Complete SeqVAE model with an optional latent forecaster head.
@@ -1601,9 +1611,12 @@ class SeqVaeTeb(nn.Module):
         elif use_latent_forecaster:
             self.latent_forecaster = LatentForecaster(
                 latent_dim=latent_dim_z,
-                hidden_dim=forecaster_hidden_dim,
+                lstm_hidden_dim=forecaster_hidden_dim,
+                lstm_num_layers=4,
                 min_logvar=forecaster_min_logvar,
                 max_logvar=forecaster_max_logvar,
+                warmup_period=warmup_period,
+                horizon=horizon_len,
                 dropout=forecaster_dropout,
             )
             initialization(self.latent_forecaster)
@@ -1932,6 +1945,150 @@ class SeqVaeTeb(nn.Module):
             return self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=sample_z)
 
     # ------------------------
+    # Combined Training Loss
+    # ------------------------
+    def compute_combined_loss(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        y_raw: torch.Tensor,
+        decoder_weight: float = 1.0,
+        forecaster_weight: float = 1.0,
+        kld_weight: float = 1.0,
+        gamma: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute combined loss for VAE reconstruction and latent forecasting.
+
+        This method handles:
+        1. VAE encoding to get latent sequence z
+        2. Conditional decoder reconstruction (only if decoder_weight > 0)
+        3. Latent forecasting loss (only if forecaster is enabled and forecaster_weight > 0)
+
+        Args:
+            y_st: Target scattering features, shape (B, T, 43)
+            y_ph: Target phase harmonic features, shape (B, T, 44)
+            x_ph: Source cross-phase harmonic features, shape (B, T, 130)
+            y_raw: Raw target signal for reconstruction, shape (B, 4800) or (B, 4800, 1)
+            decoder_weight: Weight for decoder reconstruction losses (set to 0 to skip decoder)
+            forecaster_weight: Weight for forecasting loss
+            kld_weight: Weight for KL divergence (beta-VAE)
+            gamma: Horizon discount factor for forecasting loss
+
+        Returns:
+            Dictionary containing:
+                - total_loss: Combined weighted loss
+                - reconstruction_loss: VAE reconstruction loss (MSE + NLL)
+                - kld_loss: KL divergence loss
+                - forecasting_loss: Latent forecasting NLL
+                - mse_loss: Auxiliary MSE loss on intermediate features
+                - nll_loss: Gaussian NLL for raw signal reconstruction
+                - latent_nll: NLL loss for latent forecasting
+                - z: Latent sequence (B, T, D)
+                - mu_pred: Forecasting predictions (B, T, H, D) if forecaster enabled
+                - logvar_pred: Forecasting log-variances (B, T, H, D) if forecaster enabled
+        """
+        device = y_st.device
+
+        # Step 1: Encode to get latent sequence
+        if self.is_core_frozen():
+            with torch.no_grad():
+                enc_out = self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=True)
+        else:
+            enc_out = self.core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=True)
+
+        z = enc_out["z"]  # (B, T, D)
+        mu_prior = enc_out["mu_prior"]
+        logvar_prior = enc_out["logvar_prior"]
+        mu_post = enc_out["mu_post"]
+        logvar_post = enc_out["logvar_post"]
+
+        # Step 2: Compute KLD loss (always computed, even if decoder is skipped)
+        kld_loss = self.core._kld_loss(
+            mu_prior=mu_prior,
+            logvar_prior=logvar_prior,
+            mu_post=mu_post,
+            logvar_post=logvar_post,
+            reduce_mean=True,
+        )
+
+        # Step 3: Conditional decoder reconstruction
+        reconstruction_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        mse_loss = torch.tensor(0.0, device=device)
+        nll_loss = torch.tensor(0.0, device=device)
+
+        if decoder_weight > 0:
+            # Run decoder
+            linear_output, mu_pr, logvar_pr = self.core.decoder(z)
+
+            # Compute reconstruction losses
+            if y_raw.dim() == 3 and y_raw.size(-1) == 1:
+                y_raw = y_raw.squeeze(-1)
+
+            # MSE loss on intermediate features
+            if (
+                linear_output is not None
+                and linear_output.dim() == 3
+                and y_st.shape[:2] == linear_output.shape[:2]
+                and y_ph.shape[:2] == linear_output.shape[:2]
+                and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
+            ):
+                stacked_target = torch.cat([y_st, y_ph], dim=-1)
+                mse_loss = F.mse_loss(linear_output, stacked_target)
+
+            # NLL loss for raw signal
+            if mu_pr is not None and logvar_pr is not None:
+                var = logvar_pr.exp()
+                nll_loss = 0.5 * (logvar_pr + (y_raw - mu_pr) ** 2 / var)
+                nll_loss = nll_loss.mean()
+
+            reconstruction_loss = mse_loss + nll_loss
+
+        # Step 4: Latent forecasting loss
+        forecasting_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        latent_nll = torch.tensor(0.0, device=device)
+        mu_pred = None
+        logvar_pred = None
+        valid_predictions = 0
+
+        if self.latent_forecaster is not None and forecaster_weight > 0:
+            forecasting_outputs = self.latent_forecaster.compute_forecasting_loss(
+                z_sequence=z,
+                gamma=gamma,
+            )
+            forecasting_loss = forecasting_outputs['total_loss']
+            latent_nll = forecasting_outputs['latent_nll']
+            mu_pred = forecasting_outputs.get('mu_pred')
+            logvar_pred = forecasting_outputs.get('logvar_pred')
+            valid_predictions = forecasting_outputs.get('valid_predictions', 0)
+
+        # Step 5: Combine losses
+        total_loss = (
+            decoder_weight * reconstruction_loss +
+            kld_weight * kld_loss +
+            forecaster_weight * forecasting_loss
+        )
+
+        return {
+            'total_loss': total_loss,
+            'reconstruction_loss': reconstruction_loss,
+            'kld_loss': kld_loss,
+            'forecasting_loss': forecasting_loss,
+            'mse_loss': mse_loss,
+            'nll_loss': nll_loss,
+            'latent_nll': latent_nll,
+            'z': z,
+            'mu_pred': mu_pred,
+            'logvar_pred': logvar_pred,
+            'valid_predictions': valid_predictions,
+            'mu_prior': mu_prior,
+            'logvar_prior': logvar_prior,
+            'mu_post': mu_post,
+            'logvar_post': logvar_post,
+        }
+
+    # ------------------------
     # Forecasting helpers
     # ------------------------
     @staticmethod
@@ -1993,73 +2150,119 @@ class SeqVaeTeb(nn.Module):
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
-        anchors: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
         use_posterior_mean: bool = False,
+        decode_predictions: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forecast future raw FHR windows at the given anchors.
+        Forecast future latent sequences using the new LatentForecaster.
 
-        Shapes
-            y_*: (B, T, ...)
-            anchors: (N,) — if None, computed from (T, Lc, H)
+        The new forecaster predicts the next H=30 latent steps at each timestep.
+        Valid predictions are in the range [warmup_period, T-horizon].
+
+        Args:
+            y_st: Target scattering features, shape (B, T, 43)
+            y_ph: Target phase harmonic features, shape (B, T, 44)
+            x_ph: Source cross-phase features, shape (B, T, 130)
+            timesteps: Specific timesteps to extract predictions for, shape (N,).
+                      If None, returns predictions for all valid timesteps [warmup_period, T-horizon]
+            use_posterior_mean: If True, use posterior mean instead of sampling
+            decode_predictions: If True, decode latent predictions to raw signal space
+
         Returns:
-            anchors: (N,)
-            z_future: (B, N, H, D)
-            mu_future/logvar_future: (B, N, W) with W = 16*H
-            enc: dict with priors/posteriors
+            Dictionary containing:
+                - latent_mu_future: Predicted latent means, shape (B, N, H, D) where N is number of timesteps
+                - latent_logvar_future: Predicted latent log-variances, shape (B, N, H, D)
+                - timesteps: Timesteps for which predictions were made, shape (N,)
+                - mu_future: Decoded raw signal means, shape (B, N, H*16) if decode_predictions=True
+                - logvar_future: Decoded raw signal log-variances, shape (B, N, H*16) if decode_predictions=True
+                - enc: Encoder outputs (priors/posteriors)
         """
         self._require_forecaster()
 
         B, T, _ = y_st.shape
         H = self.horizon_len
 
+        # Encode to get latent sequence
         enc = self.encode_only(y_st, y_ph, x_ph, sample_z=not use_posterior_mean)
-        z_seq = enc["z"] if not use_posterior_mean else enc["mu_post"]  # (B,T,D)
+        z_seq = enc["z"] if not use_posterior_mean else enc["mu_post"]  # (B, T, D)
 
-        if anchors is None:
-            anchors = self.anchor_range(T, H).to(z_seq.device)
-        if anchors.numel() == 0:
+        # Get forecasting predictions for all timesteps
+        mu_pred, logvar_pred = self.latent_forecaster.forward(z_seq)  # (B, T, H, D)
+
+        # Determine valid timesteps
+        start_t = self.warmup_period
+        end_t = T - H
+        if end_t < start_t:
+            # No valid predictions
             return {
-                "anchors": anchors,
-                "z_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
-                "mu_future": z_seq.new_zeros(B, 0, H * self.decimation_factor),
-                "logvar_future": z_seq.new_zeros(B, 0, H * self.decimation_factor),
                 "latent_mu_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
                 "latent_logvar_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
+                "timesteps": torch.zeros(0, dtype=torch.long, device=z_seq.device),
+                "mu_future": z_seq.new_zeros(B, 0, H * self.decimation_factor) if decode_predictions else None,
+                "logvar_future": z_seq.new_zeros(B, 0, H * self.decimation_factor) if decode_predictions else None,
                 "enc": enc,
             }
 
-        contexts, mask = self._build_forecast_contexts(z_seq, anchors)
-        B_ctx, N, L_max, D = contexts.shape
-        contexts_flat = contexts.reshape(B_ctx * N, L_max, D)
-        mask_flat = mask.reshape(B_ctx * N, L_max)
-
-        # Latent forecaster forward pass (always with gradients when training)
-        mu_latent_flat, logvar_latent_flat, aux = self.latent_forecaster(
-            contexts_flat, horizon=H, context_mask=mask_flat
-        )
-        z_future = mu_latent_flat.reshape(B_ctx, N, H, D)
-        latent_logvar = logvar_latent_flat.reshape(B_ctx, N, H, D)
-
-        # Decoder forward pass (no gradients if core is frozen)
-        if self.is_core_frozen():
-            with torch.no_grad():
-                _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
+        # Select timesteps
+        if timesteps is None:
+            # Use all valid timesteps
+            timesteps = torch.arange(start_t, end_t + 1, device=z_seq.device)
         else:
-            _, mu_flat, logvar_flat = self.decoder(mu_latent_flat)  # mu/logvar: (B*N, 16*H)
+            # Filter to valid range
+            timesteps = timesteps[(timesteps >= start_t) & (timesteps <= end_t)]
 
-        mu_future = mu_flat.reshape(B_ctx, N, -1)
-        logvar_future = torch.clamp(logvar_flat.reshape(B_ctx, N, -1), min=-10, max=10)
+        N = timesteps.numel()
+        if N == 0:
+            return {
+                "latent_mu_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
+                "latent_logvar_future": z_seq.new_zeros(B, 0, H, self.latent_dim_z),
+                "timesteps": timesteps,
+                "mu_future": z_seq.new_zeros(B, 0, H * self.decimation_factor) if decode_predictions else None,
+                "logvar_future": z_seq.new_zeros(B, 0, H * self.decimation_factor) if decode_predictions else None,
+                "enc": enc,
+            }
 
-        return {
-            "anchors": anchors,
-            "z_future": z_future,
-            "mu_future": mu_future,
-            "logvar_future": logvar_future,
-            "latent_mu_future": z_future,
-            "latent_logvar_future": latent_logvar,
+        # Extract predictions for selected timesteps
+        # mu_pred: (B, T, H, D) → (B, N, H, D)
+        latent_mu_future = mu_pred[:, timesteps, :, :]
+        latent_logvar_future = logvar_pred[:, timesteps, :, :]
+
+        result = {
+            "latent_mu_future": latent_mu_future,
+            "latent_logvar_future": latent_logvar_future,
+            "timesteps": timesteps,
             "enc": enc,
         }
+
+        # Optionally decode predictions to raw signal space
+        if decode_predictions:
+            # Reshape for decoder: (B, N, H, D) → (B*N*H, 1, D)
+            # Actually, decoder expects (B, L, D), so we need to reshape appropriately
+            # For each prediction window, we need to decode H latent steps
+            B_orig, N, H_dim, D = latent_mu_future.shape
+
+            # Flatten to (B*N, H, D) - treat each prediction window as a separate batch
+            latent_flat = latent_mu_future.reshape(B_orig * N, H_dim, D)
+
+            # Decode
+            if self.is_core_frozen():
+                with torch.no_grad():
+                    _, mu_raw, logvar_raw = self.decoder(latent_flat)  # (B*N, H*16)
+            else:
+                _, mu_raw, logvar_raw = self.decoder(latent_flat)  # (B*N, H*16)
+
+            # Reshape back: (B*N, H*16) → (B, N, H*16)
+            mu_future = mu_raw.reshape(B_orig, N, -1)
+            logvar_future = torch.clamp(logvar_raw.reshape(B_orig, N, -1), min=-10, max=10)
+
+            result["mu_future"] = mu_future
+            result["logvar_future"] = logvar_future
+        else:
+            result["mu_future"] = None
+            result["logvar_future"] = None
+
+        return result
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick delegated to the core module."""

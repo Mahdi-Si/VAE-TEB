@@ -16,15 +16,15 @@ general_config:
   optimization:
     compile_model: true              # Enable torch.compile
     compile_mode: "max-autotune"     # Most aggressive optimization
-    fused_optimizer: true            # Enable fused AdamW
-    channels_last: false             # Memory format optimization (not beneficial for 1D data)
+#     fused_optimizer: true            # Enable fused AdamW
+#     channels_last: false             # Memory format optimization (not beneficial for 1D data)
 
 model_config:
   VAE_model:
-    freeze_seqvae: False        # Whether to freeze VAE during classifier training
+#     freeze_seqvae: False        # Whether to freeze VAE during classifier training
     freeze_core_model: False    # Whether to freeze core VAE (encoders+decoder) and only train latent forecaster
-    zero_source: False           # Whether to zero source during certain experiments
-    context_len: 75            # Latent forecaster context length (decimated steps)
+#     zero_source: False           # Whether to zero source during certain experiments
+#     context_len: 75            # Latent forecaster context length (decimated steps)
     horizon_len: 30            # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
 
     # Beta Scheduling Configuration
@@ -44,17 +44,17 @@ model_config:
 
     # Forecasting auxiliary objectives
     enable_forecaster: false
-    forecast_weight: 0.8                # Weight on raw forecast NLL auxiliary loss
+#     forecast_weight: 0.8                # Weight on raw forecast NLL auxiliary loss
     latent_nll_weight: 0.1              # Weight on latent latent-space Gaussian NLL
-    predictive_kl_weight: 0.0           # Weight on teacher KL between LGSSM and posterior
-    stability_weight: 0.001             # Weight on LGSSM stability regularizer
+#     predictive_kl_weight: 0.0           # Weight on teacher KL between LGSSM and posterior
+#     stability_weight: 0.001             # Weight on LGSSM stability regularizer
     predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
-    predictive_context_len: null        # Override context length (defaults to context_len)
+#     predictive_context_len: null        # Override context length (defaults to context_len)
     predictive_max_anchors: 0           # Max anchors (0 = use all) for auxiliary losses
-    max_predictive_contexts_per_batch: 4096  # Safety cap on total contexts processed per batch
+#     max_predictive_contexts_per_batch: 4096  # Safety cap on total contexts processed per batch
     log_forecast_metrics: true          # Log aggregated forecast metrics during validation
-    monitor_metric: "val/total_loss"  # Metric to monitor for checkpoints / early stopping
-    monitor_mode: "min"                 # Direction for monitored metric
+#     monitor_metric: "val/total_loss"  # Metric to monitor for checkpoints / early stopping
+#     monitor_mode: "min"                 # Direction for monitored metric
 
   base_model_checkpoint: null
   legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
@@ -120,6 +120,17 @@ advanced_config:
     memory_threshold_gb: 60.0          # Memory threshold for cache clearing
     memory_log_frequency: 500          # Frequency of memory logging
   
+  tracking:
+    mlflow:
+      enabled: false
+      tracking_uri: null
+      experiment_name: seqvae-teb
+      run_name: null
+      artifact_location: null
+      log_model: false
+      log_config_artifact: false
+      tags: {}
+
   # Callbacks Configuration
   callbacks:
     early_stopping:
