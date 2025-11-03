@@ -942,6 +942,24 @@ class LightSeqVaeTeb(L.LightningModule):
     """
     PyTorch Lightning module for the SeqVaeTeb model.
 
+    _FORECAST_METRIC_KEYS = (
+        'agg_mse',
+        'agg_mae',
+        'agg_corr',
+        'agg_std',
+        'agg_coverage',
+    )
+
+    @staticmethod
+    def _to_log_tensor(value: Optional[torch.Tensor], reference: torch.Tensor, default: float = 0.0) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif value is None:
+            tensor = reference.new_tensor(default)
+        else:
+            tensor = reference.new_tensor(float(value))
+        return tensor.detach()
+
     This module handles the training, validation, and optimization loops,
     including learning rate scheduling and KLD beta annealing.
     Supports both standard TEB and beta-TCVAE training modes.
@@ -1182,18 +1200,18 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/nll_loss', loss_dict['nll_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.log('train/kld_loss', loss_dict['kld_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        # NEW: Log forecasting losses
-        if 'forecasting_loss' in loss_dict and loss_dict['forecasting_loss'] > 0:
-            self.log('train/forecast_nll', loss_dict['forecasting_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log('train/latent_nll_loss', loss_dict['forecasting_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)  # Backward compat
+        forecast_loss = self._to_log_tensor(loss_dict.get('forecasting_loss'), reference=total_loss, default=0.0)
+        latent_nll = self._to_log_tensor(loss_dict.get('latent_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
+        valid_predictions = self._to_log_tensor(loss_dict.get('valid_predictions', 0.0), reference=total_loss, default=0.0)
 
-            # NEW: Log valid prediction count
-            if 'valid_predictions' in loss_dict:
-                self.log('train/valid_predictions', loss_dict['valid_predictions'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/forecast_nll', forecast_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/latent_nll_loss', latent_nll, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train/valid_predictions', valid_predictions, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # Auxiliary metrics (if any were computed)
-        for name, value in aux_metrics.items():
-            self.log(f'train/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        for name, value in sorted(aux_metrics.items()):
+            metric_value = self._to_log_tensor(value, reference=total_loss, default=0.0)
+            self.log(f'train/{name}', metric_value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         return total_loss
 
@@ -1209,17 +1227,17 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/nll_loss', loss_dict['nll_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        # NEW: Log forecasting losses
-        if 'forecasting_loss' in loss_dict and loss_dict['forecasting_loss'] > 0:
-            self.log('val/forecast_nll', loss_dict['forecasting_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log('val/latent_nll_loss', loss_dict['forecasting_loss'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)  # Backward compat
+        forecast_loss = self._to_log_tensor(loss_dict.get('forecasting_loss'), reference=total_loss, default=0.0)
+        latent_nll = self._to_log_tensor(loss_dict.get('latent_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
+        valid_predictions = self._to_log_tensor(loss_dict.get('valid_predictions', 0.0), reference=total_loss, default=0.0)
 
-            # NEW: Log valid prediction count
-            if 'valid_predictions' in loss_dict:
-                self.log('val/valid_predictions', loss_dict['valid_predictions'], on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/forecast_nll', forecast_loss, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/latent_nll_loss', latent_nll, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/valid_predictions', valid_predictions, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
-        for name, value in aux_metrics.items():
-            self.log(f'val/{name}', value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        for name in self._FORECAST_METRIC_KEYS:
+            metric_value = self._to_log_tensor(aux_metrics.get(name), reference=total_loss, default=0.0)
+            self.log(f'val/{name}', metric_value, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         return total_loss
 
