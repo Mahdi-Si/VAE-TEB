@@ -2420,35 +2420,51 @@ class SeqVaeTeb(nn.Module):
         anchors: Optional[torch.Tensor] = None,
         use_posterior_mean: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Runs forecast and returns aggregated mean/std on the raw timeline.
-
-        Returns keys
-            anchors:      (N,)
-            mu_future:    (B, N, 16*H)
-            logvar_future:(B, N, 16*H)
-            canvas_mu:    (B, N, 4800)
-            mean_mu:      (B, 4800)
-            canvas_var:   (B, N, 4800)
-            std_mu:       (B, 4800)
-            enc:          dict with priors/posteriors
-        """
-        out = self.forecast(y_st, y_ph, x_ph, anchors=anchors, use_posterior_mean=use_posterior_mean)
-        anchors = out["anchors"]
-        mu_future = out["mu_future"]
-        logvar_future = out["logvar_future"]
-        enc = out["enc"]
-
-        canvas_mu, mean_mu = self.aggregate_forecasts_to_canvas(
-            mu_future, anchors, total_len=4800, stride=self.decimation_factor
+        """Runs forecast and returns aggregated mean/std on the raw timeline."""
+        out = self.forecast(
+            y_st=y_st,
+            y_ph=y_ph,
+            x_ph=x_ph,
+            timesteps=anchors,
+            use_posterior_mean=use_posterior_mean,
+            decode_predictions=True,
         )
-        var_future = logvar_future.exp()
-        canvas_var, mean_var = self.aggregate_forecasts_to_canvas(
-            var_future, anchors, total_len=4800, stride=self.decimation_factor
-        )
-        std_mu = mean_var.clamp_min(1e-8).sqrt()
+
+        anchors_tensor = out.get("timesteps")
+        mu_future = out.get("mu_future")
+        logvar_future = out.get("logvar_future")
+        latent_mu_future = out.get("latent_mu_future")
+        latent_logvar_future = out.get("latent_logvar_future")
+        enc = out.get("enc", {})
+
+        B = y_st.size(0)
+        total_len = self.sequence_length * self.decimation_factor
+        device = y_st.device
+
+        if anchors_tensor is None:
+            anchors_tensor = torch.zeros(0, dtype=torch.long, device=device)
+
+        if mu_future is None or anchors_tensor.numel() == 0:
+            canvas_mu = y_st.new_full((B, 0, total_len), float('nan'))
+            mean_mu = y_st.new_full((B, total_len), float('nan'))
+            canvas_var = y_st.new_full((B, 0, total_len), float('nan'))
+            std_mu = y_st.new_full((B, total_len), float('nan'))
+        else:
+            canvas_mu, mean_mu = self.aggregate_forecasts_to_canvas(
+                mu_future, anchors_tensor, total_len=total_len, stride=self.decimation_factor
+            )
+            if logvar_future is not None:
+                var_future = logvar_future.exp()
+                canvas_var, mean_var = self.aggregate_forecasts_to_canvas(
+                    var_future, anchors_tensor, total_len=total_len, stride=self.decimation_factor
+                )
+                std_mu = mean_var.clamp_min(1e-8).sqrt()
+            else:
+                canvas_var = torch.full_like(canvas_mu, float('nan'))
+                std_mu = y_st.new_full((B, total_len), float('nan'))
+
         return {
-            "anchors": anchors,
+            "anchors": anchors_tensor,
             "mu_future": mu_future,
             "logvar_future": logvar_future,
             "canvas_mu": canvas_mu,
@@ -2456,6 +2472,8 @@ class SeqVaeTeb(nn.Module):
             "canvas_var": canvas_var,
             "std_mu": std_mu,
             "enc": enc,
+            "latent_mu_future": latent_mu_future,
+            "latent_logvar_future": latent_logvar_future,
         }
 
     @staticmethod
