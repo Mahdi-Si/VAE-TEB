@@ -149,6 +149,7 @@ class PlottingCallBack(Callback):
                         self._plot_latent_forecast(
                             latent_sequence=latent_z_full,
                             latent_mu_future=forecast_dict.get('latent_mu_future'),
+                            latent_logvar_future=forecast_dict.get('latent_logvar_future'),
                             anchors=anchors,
                             enc=forecast_dict.get('enc'),
                             epoch=pl_trainer.current_epoch,
@@ -571,6 +572,7 @@ class PlottingCallBack(Callback):
         self,
         latent_sequence: Optional[torch.Tensor],
         latent_mu_future: Optional[torch.Tensor],
+        latent_logvar_future: Optional[torch.Tensor],
         anchors: Optional[torch.Tensor],
         enc: Optional[Dict[str, torch.Tensor]],
         epoch: int,
@@ -616,15 +618,17 @@ class PlottingCallBack(Callback):
         latent_dim = pred_full.shape[-1]
 
         columns = []
-        latent_logvar_future = enc.get('latent_logvar_future') if isinstance(enc, dict) else None
+        var_source = latent_logvar_future
+        if var_source is None and isinstance(enc, dict):
+            var_source = enc.get('latent_logvar_future')
         for anchor_t, anchor_idx in selected:
             if anchor_idx >= pred_full.shape[0]:
                 continue
             pred_window = pred_full[anchor_idx]
             if pred_window.ndim == 1:
                 pred_window = pred_window[:, None]
-            if isinstance(latent_logvar_future, torch.Tensor) and anchor_idx < latent_logvar_future.shape[1]:
-                var_window = latent_logvar_future[batch_idx, anchor_idx].detach().cpu().numpy()
+            if isinstance(var_source, torch.Tensor) and anchor_idx < var_source.shape[1]:
+                var_window = var_source[batch_idx, anchor_idx].detach().cpu().numpy()
                 if var_window.ndim == 1:
                     var_window = var_window[:, None]
             else:
