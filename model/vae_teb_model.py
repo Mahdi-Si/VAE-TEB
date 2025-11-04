@@ -1529,7 +1529,6 @@ class SeqVaeTeb(nn.Module):
         warmup_period: int = 30,
         lstm_hidden_dim: int = 128,
         lstm_num_layers: int = 5,
-        # Forecasting params
         horizon_len: int = 30,
         forecaster_hidden_dim: int = 128,
         forecaster_min_logvar: float = -7.0,
