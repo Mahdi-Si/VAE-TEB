@@ -139,9 +139,9 @@ class CausalConv1d(nn.Module):
 class TCNBlock(nn.Module):
     def __init__(self, ch, kernel_size=3, dilation=1, dropout=0.1):
         super().__init__()
-        self.c1 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.c1 = CausalConv1d(ch, ch, kernel_size, dilation=dilation)
         self.n1 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
-        self.c2 = CausalConv1d(ch, ch, kernel_size, dilation)
+        self.c2 = CausalConv1d(ch, ch, kernel_size, dilation=dilation)
         self.n2 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
         self.drop = nn.Dropout(dropout)
     def forward(self, x):  # (B,C,T)
