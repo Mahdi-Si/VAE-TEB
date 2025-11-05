@@ -28,8 +28,14 @@ from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequenci
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 
-from pytorch_lightning_modules import *
-from model.callbacks import LossPlotCallback
+from pytorch_lightning_modules import LightSeqVaeTeb
+from model.callbacks import (
+    LossPlotCallback,
+    ScatteringForecastMetricsCallback,
+    MetricsLoggingCallback,
+    MemoryMonitorCallback,
+    ReconstructionPlotCallback,
+)
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
@@ -760,8 +766,29 @@ class SeqVAEGraphModel:
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
             plot_frequency=self.plot_every_epoch,
-            max_history_size=19900 
+            max_history_size=19900
         )
+
+        # Optional: Reconstruction plotting callback
+        reconstruction_cfg = callbacks_cfg.get('reconstruction_plotting', {})
+        self.reconstruction_callback = None
+        if reconstruction_cfg.get('enabled', False):
+            self.reconstruction_callback = ReconstructionPlotCallback(
+                output_dir=self.train_results_dir,
+                plot_frequency=reconstruction_cfg.get('plot_frequency', self.plot_every_epoch),
+                num_examples=reconstruction_cfg.get('num_examples', 3),
+            )
+            logger.info(f"Reconstruction plotting enabled: {reconstruction_cfg.get('num_examples', 3)} examples every {reconstruction_cfg.get('plot_frequency', self.plot_every_epoch)} epochs")
+
+        # Optional: Memory monitoring callback
+        memory_cfg = self.config.get('advanced_config', {}).get('memory', {})
+        self.memory_callback = None
+        if memory_cfg.get('enable_memory_monitoring', False):
+            self.memory_callback = MemoryMonitorCallback(
+                threshold_gb=memory_cfg.get('memory_threshold_gb', 60.0),
+                log_frequency=memory_cfg.get('memory_log_frequency', 500),
+            )
+            logger.info(f"Memory monitoring enabled: threshold={memory_cfg.get('memory_threshold_gb', 60.0)}GB, log_freq={memory_cfg.get('memory_log_frequency', 500)}")
 
         profiler = SimpleProfiler(dirpath=self.train_results_dir, filename="profiler_base_model.txt")
 
@@ -789,6 +816,8 @@ class SeqVAEGraphModel:
                 self.loss_plot_callback,
                 self.metrics_callback,
                 self.early_stop_callback,
+                self.reconstruction_callback,  # Optional: reconstruction plots
+                self.memory_callback,          # Optional: memory monitoring
             )
             if cb is not None
         ]

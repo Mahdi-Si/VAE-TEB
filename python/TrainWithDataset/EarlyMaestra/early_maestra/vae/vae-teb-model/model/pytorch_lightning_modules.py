@@ -28,85 +28,13 @@ from loguru import logger
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
-# Callbacks
+# Lightning Module
 # ------------------------------------------------------------------------------------------------------------------------------------------
-class ScatteringForecastMetricsCallback(Callback):
-    """Logs scattering forecast and reconstruction metrics on validation epochs."""
-
-    def __init__(self, log_every_n_epochs: int = 1) -> None:
-        super().__init__()
-        self.log_every_n_epochs = max(1, log_every_n_epochs)
-
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        epoch = trainer.current_epoch
-        if (epoch % self.log_every_n_epochs) != 0 or not trainer.is_global_zero:
-            return
-
-        if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
-            dataloader = trainer.datamodule.val_dataloader()
-            if isinstance(dataloader, list):
-                dataloader = dataloader[0]
-        else:
-            dataloader = trainer.val_dataloaders
-            if isinstance(dataloader, list):
-                dataloader = dataloader[0]
-
-        try:
-            batch = next(iter(dataloader))
-        except Exception as exc:
-            logger.warning(f"ScatteringForecastMetricsCallback: unable to fetch validation batch ({exc})")
-            return
-
-        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
-        model = pl_module.model
-        orig_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-
-        with torch.no_grad():
-            recon = orig_model(y_st=batch.fhr_st, y_ph=batch.fhr_ph, x_ph=batch.fhr_up_ph)
-            mu_pr = recon.get("mu_pr")
-            if mu_pr is not None:
-                raw = batch.fhr
-                if raw.dim() == 3 and raw.size(-1) == 1:
-                    raw = raw.squeeze(-1)
-                recon_rmse = torch.sqrt(F.mse_loss(mu_pr, raw))
-                pl_module.log("val/sample_recon_rmse", recon_rmse, prog_bar=False, logger=True, sync_dist=False)
-
-            if orig_model.has_forecaster():
-                forecast = orig_model.forecast_scattering(
-                    y_st=batch.fhr_st,
-                    y_ph=batch.fhr_ph,
-                    x_ph=batch.fhr_up_ph,
-                    timesteps=None,
-                    use_posterior_mean=True,
-                )
-                mu_future = forecast.get("mu_future")
-                logvar_future = forecast.get("logvar_future")
-                timesteps = forecast.get("timesteps")
-                if mu_future is not None and timesteps is not None:
-                    target_stph = torch.cat([batch.fhr_st, batch.fhr_ph], dim=-1)
-                    metrics = orig_model.scattering_forecast_metrics(mu_future, logvar_future, target_stph, timesteps)
-                    for key, value in metrics.items():
-                        pl_module.log(f"val/sample_{key}", value, prog_bar=False, logger=True, sync_dist=False)
-
-        if hasattr(model, "is_core_frozen") and model.is_core_frozen():
-            orig_model.core.eval()
-
-class MetricsLoggingCallback(Callback):
-    def __init__(self):
-        super().__init__()
-        self.train_loss_history = []
-        self.val_loss_history = []
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        logs = trainer.callback_metrics
-        train_loss = logs.get("train/total_loss")
-        self.train_loss_history.append(train_loss)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        logs = trainer.callback_metrics
-        val_loss = logs.get("val/total_loss")
-        self.val_loss_history.append(val_loss)
-
+# Note: Callbacks have been moved to model/callbacks.py for better organization
+# Import them from: from model.callbacks import (
+#     LossPlotCallback, ScatteringForecastMetricsCallback, MetricsLoggingCallback,
+#     MemoryMonitorCallback, ReconstructionPlotCallback
+# )
 
 class LightSeqVaeTeb(L.LightningModule):
     """
@@ -408,79 +336,3 @@ class LightSeqVaeTeb(L.LightningModule):
                 },
             }
         return optimizer
-
-
-class MemoryMonitorCallback(Callback):
-    """
-    Callback to monitor GPU memory usage and automatically clear cache when needed.
-    Optimized for multi-GPU training with reduced monitoring frequency.
-    """
-
-    def __init__(self, threshold_gb=12.0, log_frequency=200):
-        """
-        Args:
-            threshold_gb (float): GPU memory threshold in GB above which cache is cleared.
-            log_frequency (int): Frequency (in batches) to log memory usage.
-        """
-        super().__init__()
-        self.threshold_gb = threshold_gb
-        self.log_frequency = log_frequency
-        self.batch_count = 0
-
-    def _log_memory_usage(self, prefix=""):
-        """Log current GPU memory usage for all devices."""
-        if torch.cuda.is_available():
-            total_allocated = 0.0
-            device_count = torch.cuda.device_count()
-            for device_id in range(device_count):
-                allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3  # GB
-                reserved = torch.cuda.memory_reserved(device_id) / 1024 ** 3  # GB
-                logger.info(f"{prefix} GPU {device_id}: Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-                total_allocated += allocated
-            return total_allocated
-        return 0.0
-
-    def _clear_memory_if_needed(self):
-        """Clear GPU memory on all devices if usage exceeds threshold."""
-        if torch.cuda.is_available():
-            device_count = torch.cuda.device_count()
-            cleared_any = False
-            for device_id in range(device_count):
-                allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3  # GB
-                if allocated > self.threshold_gb:
-                    logger.warning(
-                        f"GPU {device_id} memory usage ({allocated:.2f}GB) exceeds threshold ({self.threshold_gb}GB). Clearing cache...")
-                    with torch.cuda.device(device_id):
-                        torch.cuda.empty_cache()
-                    cleared_any = True
-            return cleared_any
-        return False
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Monitor memory after each training batch."""
-        self.batch_count += 1
-
-        # Log memory usage periodically
-        if self.batch_count % self.log_frequency == 0:
-            self._log_memory_usage(f"Train batch {batch_idx}")
-
-        # Clear memory if needed
-        self._clear_memory_if_needed()
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Monitor memory after each validation batch."""
-        # Clear memory if needed during validation
-        self._clear_memory_if_needed()
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        """Log memory at the start of each epoch."""
-        self._log_memory_usage(f"Epoch {trainer.current_epoch} start")
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        """Log usage at the end of each epoch - reduced cache clearing for multi-GPU."""
-        self._log_memory_usage(f"Epoch {trainer.current_epoch} end")
-        # Only clear cache at epoch end, not during training for better multi-GPU performance
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
