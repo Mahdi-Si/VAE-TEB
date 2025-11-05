@@ -1,11 +1,11 @@
 general_config:
-  tag: latent_forecast_with_checkpoint
+  tag: scattering_forecast_autoreg
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   lr: 0.0001  # Learning rate (reduced for stability)
   lr_milestone: [1000]  # Epochs at which to decay learning rate
   weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
   checkpoint_frequency: 1
-  plot_frequency: 1  # Plot every 5 epochs to reduce I/O
+  plot_frequency: 1  # Callback log frequency in epochs
   epochs: 10000  # Increased for better convergence
   accumulate_grad_batches: 20  # Gradient accumulation for effective larger batch size
   batch_size:
@@ -44,8 +44,13 @@ model_config:
 
     # Forecasting auxiliary objectives
     enable_forecaster: false
+    forecaster_hidden_dim: 128        # Hidden size used inside scattering forecaster
+    forecaster_layers: 2             # Number of LSTM layers in scattering forecaster
+    forecaster_dropout: 0.1          # Dropout applied in scattering forecaster
+    forecaster_min_logvar: -7.0      # Minimum log-variance clamp
+    forecaster_max_logvar: 4.0       # Maximum log-variance clamp
 #     forecast_weight: 0.8                # Weight on raw forecast NLL auxiliary loss
-    latent_nll_weight: 0.1              # Weight on latent latent-space Gaussian NLL
+    scattering_forecast_weight: 0.1              # Weight on scattering-forecast Gaussian NLL
 #     predictive_kl_weight: 0.0           # Weight on teacher KL between LGSSM and posterior
 #     stability_weight: 0.001             # Weight on LGSSM stability regularizer
     predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
@@ -135,7 +140,7 @@ advanced_config:
   callbacks:
     early_stopping:
       enabled: false                   # Enable early stopping
-      monitor: "val/forecast_nll"     # Metric to monitor (use val/forecast_nll or val/total_loss)
+      monitor: "val/forecast_loss"     # Metric to monitor (use val/forecast_loss or val/total_loss)
       patience: 20                     # Epochs to wait for improvement
       min_delta: 0.0001               # Minimum change to qualify as improvement
     

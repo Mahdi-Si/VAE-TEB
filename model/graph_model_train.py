@@ -134,11 +134,12 @@ class SeqVAEGraphModel:
                 # SeqVAE forecasting parameters
         self.model_horizon_len = int(vae_cfg.get('horizon_len', 30))
         self.forecaster_hidden_dim = int(vae_cfg.get('forecaster_hidden_dim', 128))
+        self.forecaster_layers = int(vae_cfg.get('forecaster_layers', 2))
         self.forecaster_dropout = float(vae_cfg.get('forecaster_dropout', 0.1))
         self.forecaster_min_logvar = float(vae_cfg.get('forecaster_min_logvar', -7.0))
         self.forecaster_max_logvar = float(vae_cfg.get('forecaster_max_logvar', 4.0))
-        self.latent_nll_weight = float(vae_cfg.get('latent_nll_weight', 0.0))
-        self.latent_discount_gamma = float(vae_cfg.get('latent_discount_gamma', 1.0))
+        self.scattering_forecast_weight = float(vae_cfg.get('scattering_forecast_weight', vae_cfg.get('latent_nll_weight', 0.0)))
+        self.scattering_discount_gamma = float(vae_cfg.get('scattering_discount_gamma', vae_cfg.get('latent_discount_gamma', 1.0)))
         predictive_horizon_cfg = vae_cfg.get('predictive_horizon')
         if predictive_horizon_cfg is None:
             self.predictive_horizon = self.model_horizon_len
@@ -150,14 +151,14 @@ class SeqVAEGraphModel:
         else:
             self.predictive_max_anchors = max(0, int(predictive_max_cfg))
         self.log_forecast_metrics = bool(vae_cfg.get('log_forecast_metrics', True))
-        self.monitor_metric = vae_cfg.get('monitor_metric', 'val/latent_nll_loss')
+        self.monitor_metric = vae_cfg.get('monitor_metric', 'val/scattering_nll')
         self.monitor_mode = vae_cfg.get('monitor_mode', 'min')
-        default_forecaster_flag = self.latent_nll_weight > 0.0
+        default_forecaster_flag = self.scattering_forecast_weight > 0.0
         self.enable_forecaster = bool(vae_cfg.get('enable_forecaster', default_forecaster_flag))
         if not self.enable_forecaster:
-            self.latent_nll_weight = 0.0
+            self.scattering_forecast_weight = 0.0
             self.log_forecast_metrics = False
-            if 'latent' in self.monitor_metric:
+            if 'latent' in self.monitor_metric or 'scattering' in self.monitor_metric:
                 self.monitor_metric = 'val/total_loss'
         self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.freeze_core_model = self.config['model_config']['VAE_model'].get('freeze_core_model', False)
@@ -256,10 +257,11 @@ class SeqVAEGraphModel:
                 base_model_for_loading = SeqVaeTeb(
                     horizon_len=self.model_horizon_len,
                     forecaster_hidden_dim=self.forecaster_hidden_dim,
+                    forecaster_layers=self.forecaster_layers,
                     forecaster_min_logvar=self.forecaster_min_logvar,
                     forecaster_max_logvar=self.forecaster_max_logvar,
                     forecaster_dropout=self.forecaster_dropout,
-                    use_latent_forecaster=self.enable_forecaster,
+                    enable_forecaster=self.enable_forecaster,
                 )
                 self._resolve_predictive_anchor_cap(getattr(base_model_for_loading, 'sequence_length', 300))
 
@@ -289,8 +291,8 @@ class SeqVAEGraphModel:
                         beta_cycle_len=self.beta_cycle_len,
                         beta_const_val=self.beta_const_val,
                         predictive_horizon=self.predictive_horizon,
-                        latent_nll_weight=self.latent_nll_weight,
-                        latent_discount_gamma=self.latent_discount_gamma,
+                        scattering_forecast_weight=self.scattering_forecast_weight,
+                        scattering_discount_gamma=self.scattering_discount_gamma,
                         predictive_max_anchors=self.predictive_max_anchors,
                         log_forecast_metrics=self.log_forecast_metrics,
                         enable_forecaster=self.enable_forecaster,
@@ -335,7 +337,7 @@ class SeqVAEGraphModel:
         """Set predictive_max_anchors to the maximum feasible value if unset or oversized."""
         if not self.enable_forecaster:
             self.predictive_max_anchors = 0
-            logger.info("Latent forecaster disabled; predictive_max_anchors set to 0")
+            logger.info("Scattering forecaster disabled; predictive_max_anchors set to 0")
             return
         seq_len = max(1, int(sequence_length))
         horizon = max(1, int(self.predictive_horizon))
@@ -362,10 +364,11 @@ class SeqVAEGraphModel:
         init_kwargs = {
             'horizon_len': self.model_horizon_len,
             'forecaster_hidden_dim': self.forecaster_hidden_dim,
+            'forecaster_layers': self.forecaster_layers,
             'forecaster_min_logvar': self.forecaster_min_logvar,
             'forecaster_max_logvar': self.forecaster_max_logvar,
             'forecaster_dropout': self.forecaster_dropout,
-            'use_latent_forecaster': self.enable_forecaster,
+            'enable_forecaster': self.enable_forecaster,
         }
 
         base_model = None
@@ -433,8 +436,8 @@ class SeqVAEGraphModel:
             beta_cycle_len=self.beta_cycle_len,
             beta_const_val=self.beta_const_val,
             predictive_horizon=self.predictive_horizon,
-            latent_nll_weight=self.latent_nll_weight,
-            latent_discount_gamma=self.latent_discount_gamma,
+            scattering_forecast_weight=self.scattering_forecast_weight,
+            scattering_discount_gamma=self.scattering_discount_gamma,
             predictive_max_anchors=self.predictive_max_anchors,
             log_forecast_metrics=self.log_forecast_metrics,
             enable_forecaster=self.enable_forecaster,
@@ -459,8 +462,8 @@ class SeqVAEGraphModel:
             'beta_anneal_epochs': self.beta_anneal_epochs,
             'beta_cycle_len': self.beta_cycle_len,
             'beta_const_val': self.beta_const_val,
-            'latent_nll_weight': self.latent_nll_weight,
-            'latent_discount_gamma': self.latent_discount_gamma,
+            'scattering_forecast_weight': self.scattering_forecast_weight,
+            'scattering_discount_gamma': self.scattering_discount_gamma,
             'predictive_horizon': self.predictive_horizon,
             'predictive_max_anchors': self.predictive_max_anchors,
             'log_forecast_metrics': self.log_forecast_metrics,
@@ -477,7 +480,7 @@ class SeqVAEGraphModel:
         )
 
     def _apply_freeze_core(self) -> None:
-        """Apply freeze_core to the model if latent forecaster is available."""
+        """Apply freeze_core to the model if scattering forecaster is available."""
         if self.pytorch_model is None:
             logger.error("Cannot apply freeze_core: pytorch_model is None")
             return
@@ -487,10 +490,10 @@ class SeqVAEGraphModel:
         if hasattr(model, '_orig_mod'):
             model = model._orig_mod
 
-        # Check if model has latent forecaster
+        # Check if model has scattering forecaster
         if not hasattr(model, 'has_forecaster') or not model.has_forecaster():
             logger.error(
-                "Cannot freeze core: latent forecaster is not available. "
+                "Cannot freeze core: scattering forecaster is not available. "
                 "Set enable_forecaster=true in config to use freeze_core_model."
             )
             self.freeze_core_model = False
@@ -504,7 +507,7 @@ class SeqVAEGraphModel:
         logger.info("=" * 80)
         logger.info("FREEZE CORE MODEL APPLIED:")
         logger.info(f"  Core VAE - Trainable: {param_info['core_trainable']:,} | Frozen: {param_info['core_frozen']:,}")
-        logger.info(f"  Latent Forecaster - Trainable: {param_info['forecaster_trainable']:,} | Frozen: {param_info['forecaster_frozen']:,}")
+        logger.info(f"  Scattering Forecaster - Trainable: {param_info['forecaster_trainable']:,} | Frozen: {param_info['forecaster_frozen']:,}")
         logger.info(f"  TOTAL - Trainable: {param_info['total_trainable']:,} | Frozen: {param_info['total_frozen']:,}")
         logger.info(f"  Training only {param_info['forecaster_trainable']:,} / {param_info['total_trainable'] + param_info['total_frozen']:,} parameters ({100.0 * param_info['forecaster_trainable'] / (param_info['total_trainable'] + param_info['total_frozen']):.2f}%)")
         logger.info("=" * 80)
@@ -582,7 +585,7 @@ class SeqVAEGraphModel:
 
         This function configures and runs the training process, leveraging multi-GPU
         support, callbacks for early stopping, model checkpointing, and real-time
-        loss plotting with Plotly.
+        scattering forecast diagnostics callback.
 
         Args:
             train_loader (DataLoader): DataLoader for the training dataset.
@@ -593,18 +596,16 @@ class SeqVAEGraphModel:
         """
         logger.info("Setting up trainer for the base model...")
         logger.info(
-            "Latent forecasting config | latent_nll_weight=%.4f | gamma=%.3f | horizon=%s | max_anchors=%s | log_metrics=%s",
-            self.latent_nll_weight,
-            self.latent_discount_gamma,
+            "Scattering forecasting config | scattering_forecast_weight=%.4f | gamma=%.3f | horizon=%s | max_anchors=%s | log_metrics=%s",
+            self.scattering_forecast_weight,
+            self.scattering_discount_gamma,
             self.predictive_horizon,
             self.predictive_max_anchors,
             self.log_forecast_metrics,
         )
-        logger.info("Latent forecaster enabled: %s", self.enable_forecaster)
-        self.plotting_callback = PlottingCallBack(
-            output_dir=self.train_results_dir,
-            plot_every_epoch=self.plot_every_epoch,
-            predictive_horizon=self.predictive_horizon,
+        logger.info("Scattering forecaster enabled: %s", self.enable_forecaster)
+        self.plotting_callback = ScatteringForecastMetricsCallback(
+            log_every_n_epochs=self.plot_every_epoch,
         )
 
         self.metrics_callback = MetricsLoggingCallback()

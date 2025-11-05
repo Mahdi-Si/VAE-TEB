@@ -1,6 +1,4 @@
 import os
-# Set matplotlib backend BEFORE any other imports
-os.environ["MPLBACKEND"] = "Agg"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYDEVD_USE_CYTHON'] = "NO"
@@ -8,17 +6,9 @@ os.environ['PYDEVD_USE_CYTHON'] = "NO"
 import lightning as L
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
-import numpy as np
-import torch.nn as nn
 import torch
-import matplotlib
-matplotlib.use('Agg', force=True)
 # Disable interactive mode and set thread-safe parameters
-import matplotlib.pyplot as plt
-plt.ioff()  # Turn off interactive mode
-matplotlib.rcParams['figure.max_open_warning'] = 0
 
-import plotly.graph_objects as go
 from typing import Dict, Optional, Tuple
 
 from vae_teb_model import SeqVaeTeb, ensure_compiled_module, is_compiled_module
@@ -40,1029 +30,66 @@ from loguru import logger
 # ------------------------------------------------------------------------------------------------------------------------------------------
 # Callbacks
 # ------------------------------------------------------------------------------------------------------------------------------------------
-class PlottingCallBack(Callback):
-    def __init__(self, output_dir, plot_every_epoch, predictive_horizon: Optional[int] = None):
-        super().__init__()
-        self.output_dir = output_dir    
-        self.plot_every_epoch = plot_every_epoch
-        self.predictive_horizon = predictive_horizon
+class ScatteringForecastMetricsCallback(Callback):
+    """Logs scattering forecast and reconstruction metrics on validation epochs."""
 
-    def on_validation_epoch_end(self, pl_trainer, pl_module):
-        if pl_trainer.current_epoch % self.plot_every_epoch != 0 or not pl_trainer.is_global_zero:
+    def __init__(self, log_every_n_epochs: int = 1) -> None:
+        super().__init__()
+        self.log_every_n_epochs = max(1, log_every_n_epochs)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        epoch = trainer.current_epoch
+        if (epoch % self.log_every_n_epochs) != 0 or not trainer.is_global_zero:
             return
 
-        logger.info(f"Starting plotting callback for epoch {pl_trainer.current_epoch}")
-
-        # Close all existing matplotlib figures before starting
-        plt.close('all')
+        if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
+            dataloader = trainer.datamodule.val_dataloader()
+            if isinstance(dataloader, list):
+                dataloader = dataloader[0]
+        else:
+            dataloader = trainer.val_dataloaders
+            if isinstance(dataloader, list):
+                dataloader = dataloader[0]
 
         try:
-            if hasattr(pl_trainer, 'datamodule') and pl_trainer.datamodule is not None:
-                val_dataloader = pl_trainer.datamodule.val_dataloader()
-            else:
-                val_dataloader = pl_trainer.val_dataloaders
-                if isinstance(val_dataloader, list):
-                    val_dataloader = val_dataloader[0]
-
-            batch = next(iter(val_dataloader))
-            logger.info("Successfully fetched batch from validation dataloader")
-        except (StopIteration, AttributeError, IndexError) as e:
-            logger.warning(f"Could not get a batch from validation dataloader for plotting: {e}")
+            batch = next(iter(dataloader))
+        except Exception as exc:
+            logger.warning(f"ScatteringForecastMetricsCallback: unable to fetch validation batch ({exc})")
             return
 
         batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
+        model = pl_module.model
+        orig_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
-        pl_module.eval()
-        try:
-            with torch.no_grad():
-                # Check if this is the correct Lightning module type
-                if not isinstance(pl_module, LightSeqVaeTeb):
-                    logger.warning(f"PlottingCallback received unexpected module type: {type(pl_module)}. Expected LightSeqVaeTeb.")
-                    return
+        with torch.no_grad():
+            recon = orig_model(y_st=batch.fhr_st, y_ph=batch.fhr_ph, x_ph=batch.fhr_up_ph)
+            mu_pr = recon.get("mu_pr")
+            if mu_pr is not None:
+                raw = batch.fhr
+                if raw.dim() == 3 and raw.size(-1) == 1:
+                    raw = raw.squeeze(-1)
+                recon_rmse = torch.sqrt(F.mse_loss(mu_pr, raw))
+                pl_module.log("val/sample_recon_rmse", recon_rmse, prog_bar=False, logger=True, sync_dist=False)
 
-                logger.info("Accessing batch data...")
-                # SPEED OPTIMIZATION: Data now comes pre-permuted from dataset - no permute needed
-                # Optimized dataloader provides tensors in (batch, sequence, channels) format:
-                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph  # All (B, seq, channels)
-                y_raw_normalized = batch.fhr  # (B, 4800)
-                up_raw_normalized = batch.up  # (B, 4800)
-
-                model_outputs = pl_module.model(y_st, y_ph, x_ph)
-                mu_pr = model_outputs.get("mu_pr")
-                logvar_pr = model_outputs.get("logvar_pr")
-                latent_z_full = model_outputs.get("z")
-                mu_post_full = model_outputs.get("mu_post")
-                mu_prior_full = model_outputs.get("mu_prior")
-
-                self._plot_reconstruction_overview(
-                    y_raw_normalized=y_raw_normalized,
-                    up_raw_normalized=up_raw_normalized,
-                    mu_pr=mu_pr,
-                    logvar_pr=logvar_pr,
-                    latent_z=latent_z_full,
-                    mu_post=mu_post_full,
-                    mu_prior=mu_prior_full,
-                    epoch=pl_trainer.current_epoch,
+            if orig_model.has_forecaster():
+                forecast = orig_model.forecast_scattering(
+                    y_st=batch.fhr_st,
+                    y_ph=batch.fhr_ph,
+                    x_ph=batch.fhr_up_ph,
+                    timesteps=None,
+                    use_posterior_mean=True,
                 )
-
-                # Get uncompiled model for utility methods
-                model = pl_module.model
-                if hasattr(model, '_orig_mod'):
-                    orig_model = model._orig_mod
-                else:
-                    orig_model = model
-
-                if pl_module.model.has_forecaster():
-                    # Use new forecast API (no anchors)
-                    forecast_dict = orig_model.forecast_full(
-                        y_st=y_st,
-                        y_ph=y_ph,
-                        x_ph=x_ph,
-                        anchors=None,
-                        use_posterior_mean=True,
-                    )
-
-                    mu_future = forecast_dict.get('mu_future')
-                    logvar_future = forecast_dict.get('logvar_future')
-                    anchors = forecast_dict.get('anchors')
-                    canvas_mu = forecast_dict.get('canvas_mu')
-                    mean_mu = forecast_dict.get('mean_mu')
-                    std_mu = forecast_dict.get('std_mu')
-
-                    if (
-                        mu_future is not None
-                        and anchors is not None
-                        and anchors.numel() > 0
-                        and mean_mu is not None
-                        and std_mu is not None
-                    ):
-                        self._plot_forecast_results(
-                            y_raw_normalized,
-                            mean_mu,
-                            std_mu,
-                            canvas_mu,
-                            anchors,
-                            latent_z_full,
-                            pl_trainer.current_epoch
-                        )
-
-                        self._plot_latent_forecast(
-                            latent_sequence=latent_z_full,
-                            latent_mu_future=forecast_dict.get('latent_mu_future'),
-                            latent_logvar_future=forecast_dict.get('latent_logvar_future'),
-                            anchors=anchors,
-                            enc=forecast_dict.get('enc'),
-                            epoch=pl_trainer.current_epoch,
-                        )
-
-                        try:
-                            self._plot_batch_aggregated_forecast(
-                                y_raw_batch=y_raw_normalized,
-                                mean_mu_batch=mean_mu,
-                                std_mu_batch=std_mu,
-                                epoch=pl_trainer.current_epoch,
-                            )
-                        except Exception as e:
-                            logger.warning(f"Failed to plot batch aggregated forecast: {e}")
-                    else:
-                        logger.warning("No valid forecasts available for plotting")
-        except Exception as e:
-            logger.error(f"Error during plotting: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-        finally:
-            # Ensure all figures are closed to prevent threading issues
-            plt.close('all')
-            import gc
-            gc.collect()
-
-            # Restore training mode
-            pl_module.train()
-
-            # Preserve frozen core's eval mode if applicable
-            if hasattr(pl_module.model, 'is_core_frozen'):
-                model = pl_module.model
-                # Handle compiled models
-                orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-                if orig_model.is_core_frozen():
-                    orig_model.core.eval()
-                    logger.debug("Preserved frozen core eval mode after plotting callback")
-
-    def _plot_reconstruction_overview(
-        self,
-        y_raw_normalized: torch.Tensor,
-        up_raw_normalized: Optional[torch.Tensor],
-        mu_pr: Optional[torch.Tensor],
-        logvar_pr: Optional[torch.Tensor],
-        latent_z: Optional[torch.Tensor],
-        mu_post: Optional[torch.Tensor],
-        mu_prior: Optional[torch.Tensor],
-        epoch: int,
-    ):
-        """Plot ground-truth vs reconstruction along with latent diagnostics."""
-        import os
-        import gc
-        import numpy as np
-        import matplotlib.pyplot as plt
-
-        if y_raw_normalized is None or mu_pr is None or logvar_pr is None:
-            return
-
-        batch_idx = 0
-        try:
-            y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
-            recon = mu_pr[batch_idx].detach().cpu().numpy()
-            logvar = logvar_pr[batch_idx].detach().cpu().numpy()
-        except Exception:
-            return
-
-        std = np.exp(0.5 * logvar)
-        diff = y_raw - recon
-
-        up_raw = None
-        if up_raw_normalized is not None:
-            try:
-                up_raw = up_raw_normalized[batch_idx].detach().cpu().numpy()
-            except Exception:
-                up_raw = None
-
-        latent_matrix = None
-        if latent_z is not None:
-            try:
-                latent_matrix = latent_z[batch_idx].detach().cpu().numpy()
-            except Exception:
-                latent_matrix = None
-        if latent_matrix is None and mu_post is not None:
-            try:
-                latent_matrix = mu_post[batch_idx].detach().cpu().numpy()
-            except Exception:
-                latent_matrix = None
-
-        prior_matrix = None
-        if mu_prior is not None:
-            try:
-                prior_matrix = mu_prior[batch_idx].detach().cpu().numpy()
-            except Exception:
-                prior_matrix = None
-
-        Fs = 4.0
-        t = np.arange(y_raw.shape[0]) / Fs
-
-        corr = float('nan')
-        if np.std(y_raw) > 1e-8 and np.std(recon) > 1e-8:
-            try:
-                corr = float(np.corrcoef(y_raw, recon)[0, 1])
-            except Exception:
-                corr = float('nan')
-
-        rmse = float(np.sqrt(np.mean(diff ** 2)))
-        mae = float(np.mean(np.abs(diff)))
-
-        colors = {
-            'fhr': "#055C9A",
-            'up': "#0DD8A2",
-            'gt': '#456882',
-            'recon': '#BB3E00',
-            'uncertainty': '#F7AD45',
-            'background': '#F9F3EF'
-        }
-
-        plt.style.use('default')
-        plt.rcParams.update({
-            'font.family': 'sans-serif',
-            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-            'font.size': 11,
-            'axes.titlesize': 12,
-            'axes.labelsize': 11,
-            'axes.linewidth': 0.7,
-            'axes.edgecolor': "#9E9D9D",
-            'axes.facecolor': colors['background'],
-            'grid.color': "#838383",
-            'grid.linewidth': 0.4,
-            'grid.alpha': 0.6,
-            'legend.frameon': True,
-            'legend.fancybox': False,
-            'legend.shadow': False,
-            'legend.framealpha': 0.95,
-            'legend.edgecolor': '#A2B9A7',
-            'legend.facecolor': colors['background'],
-            'figure.facecolor': 'white',
-            'savefig.facecolor': 'white',
-            'savefig.dpi': 300
-        })
-
-        n_rows = 4
-        fig, ax = plt.subplots(
-            nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.2),
-            gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
-
-        for i in range(n_rows):
-            ax[i, 0].grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#D2C1B6')
-            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
-            ax[i, 0].minorticks_on()
-            ax[i, 0].set_axisbelow(True)
-            ax[i, 0].spines['top'].set_visible(False)
-            ax[i, 0].spines['right'].set_visible(False)
-            ax[i, 0].spines['left'].set_color('#A2B9A7')
-            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
-            ax[i, 0].spines['left'].set_linewidth(0.7)
-            ax[i, 0].spines['bottom'].set_linewidth(0.7)
-
-        ax[0, 1].set_axis_off()
-        ax[0, 0].plot(t, y_raw, linewidth=1.2, color=colors['fhr'], label='FHR', alpha=0.9)
-        if up_raw is not None:
-            ax[0, 0].plot(t, up_raw, linewidth=1.0, color=colors['up'], label='UP', alpha=0.75)
-        ax[0, 0].set_ylabel('Amplitude')
-        ax[0, 0].set_title('Raw FHR/UP Signals')
-        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
-        ax[0, 0].legend(loc='upper right', framealpha=0.95)
-
-        ax[1, 1].set_axis_off()
-        ax[1, 0].plot(t, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=3)
-        ax[1, 0].plot(t, recon, linewidth=1.3, color=colors['recon'], label='Reconstruction', alpha=0.85, zorder=2)
-        ax[1, 0].fill_between(t, recon - std, recon + std, color=colors['uncertainty'], alpha=0.25, label='+/- 1 sigma')
-        ax[1, 0].set_ylabel('FHR (bpm)')
-        ax[1, 0].set_title('Ground Truth vs Reconstruction')
-        ax[1, 0].legend(loc='upper right', framealpha=0.95)
-        ax[1, 0].autoscale(enable=True, axis='x', tight=True)
-        ax[1, 0].text(
-            0.01,
-            0.92,
-            f"RMSE: {rmse:.3f}\nMAE: {mae:.3f}\nCorr: {corr:.3f}",
-            transform=ax[1, 0].transAxes,
-            fontsize=10,
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-        )
-
-        ax[2, 0].set_axis_off()
-        ax[2, 1].set_axis_off()
-
-        if prior_matrix is not None and latent_matrix is not None and ax.shape[1] > 1:
-            ax[2, 1].set_axis_on()
-            step_idx = np.arange(latent_matrix.shape[0])
-            prior_norm = np.linalg.norm(prior_matrix, axis=1)
-            post_norm = np.linalg.norm(latent_matrix, axis=1)
-            delta_norm = np.linalg.norm(latent_matrix - prior_matrix, axis=1)
-            ax[2, 1].plot(step_idx, prior_norm, color='#7F8C8D', linewidth=1.0, label='||mu_prior||')
-            ax[2, 1].plot(step_idx, post_norm, color='#BB3E00', linewidth=1.2, label='||mu_post||')
-            ax[2, 1].plot(step_idx, delta_norm, color='#2E86AB', linewidth=1.2, linestyle='--', label='||delta||')
-            ax[2, 1].set_title('Latent Norm Dynamics')
-            ax[2, 1].set_xlabel('Decimated step')
-            ax[2, 1].grid(True, alpha=0.3)
-            ax[2, 1].legend(loc='upper right', fontsize=9, framealpha=0.9)
-
-        ax[3, 1].set_axis_off()
-        if latent_matrix is not None:
-            img = ax[3, 0].imshow(latent_matrix.T, aspect='auto', cmap='RdBu_r', origin='lower')
-            ax[3, 0].set_ylabel('Latent dim')
-            ax[3, 0].set_xlabel('Decimated step')
-            title_suffix = ''
-            if prior_matrix is not None:
-                mean_delta = float(np.mean(np.abs(latent_matrix - prior_matrix)))
-                title_suffix = f' | mean |delta| = {mean_delta:.3f}'
-            ax[3, 0].set_title(f'Posterior Latent Trajectory{title_suffix}')
-            cbar = fig.colorbar(img, cax=ax[3, 1])
-            cbar.ax.tick_params(labelsize=9, colors='#666666')
-            cbar.set_label('Activation', fontsize=10, color='#666666')
-        else:
-            ax[3, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center', fontsize=12)
-            ax[3, 0].set_axis_off()
-
-        fig.suptitle(f'Reconstruction Overview - Epoch {epoch}', fontsize=14, color='#456882')
-        save_path = os.path.join(self.output_dir, f'reconstruction_overview_epoch_{epoch}.pdf')
-        plt.savefig(save_path, bbox_inches='tight', dpi=300)
-        plt.close(fig)
-        gc.collect()
-        logger.info(f"Reconstruction plot saved to {save_path}")
-
-
-    def _plot_forecast_results(
-        self,
-        y_raw_normalized: torch.Tensor,
-        mean_mu: torch.Tensor,
-        std_mu: torch.Tensor,
-        canvas_mu: torch.Tensor,
-        anchors: torch.Tensor,
-        latent_z: torch.Tensor,
-        epoch: int,
-    ):
-        """Plot forecast results: ground truth vs aggregated forecast with uncertainty; sample windows; latent heatmap."""
-        import os
-        import gc
-        
-        # Select one sample from the batch (first sample)
-        batch_idx = 0
-        
-        # Convert tensors to numpy and move to CPU
-        y_raw = y_raw_normalized[batch_idx].cpu().numpy()  # (4800,)
-        pred_mean = mean_mu[batch_idx].cpu().numpy()       # (4800,)
-        pred_std = std_mu[batch_idx].cpu().numpy()         # (4800,)
-        z_latent = None
-        if latent_z is not None:
-            z_latent = latent_z[batch_idx].detach().cpu().numpy()  # (T,D)
-
-        mask = ~np.isnan(pred_mean)
-        coverage = float(np.mean(mask)) if mask.size > 0 else float('nan')
-        coverage_display = f"{coverage:.2%}" if not np.isnan(coverage) else "nan"
-        if np.any(mask):
-            gt_masked = y_raw.copy()
-            pred_masked = pred_mean.copy()
-            gt_masked[~mask] = np.nan
-            pred_masked[~mask] = np.nan
-            sample_mse = float(np.nanmean((pred_masked - gt_masked) ** 2))
-            sample_mae = float(np.nanmean(np.abs(pred_masked - gt_masked)))
-            if np.sum(mask) > 2:
-                sample_corr = float(np.corrcoef(gt_masked[mask], pred_masked[mask])[0, 1])
-            else:
-                sample_corr = float('nan')
-        else:
-            sample_mse = float('nan')
-            sample_mae = float('nan')
-            sample_corr = float('nan')
-
-        logger.info(
-            "[PlottingCallback] Epoch {} sample forecast diagnostics | horizon={} | MSE={:.4f} | MAE={:.4f} | Corr={:.4f} | Coverage={:.2%}".format(
-                epoch,
-                self.predictive_horizon if self.predictive_horizon is not None else 'model',
-                sample_mse,
-                sample_mae,
-                sample_corr,
-                coverage if not np.isnan(coverage) else float('nan'),
-            )
-        )
-
-        # Setup plotting parameters following the style from data_utils
-        Fs = 4
-        N = len(y_raw)
-        t_in = np.arange(0, N) / Fs
-        
-        # Professional scientific paper color palette
-        colors = {
-            'fhr': "#055C9A",           # Deep blue-gray
-            'up': "#0DD8A2",            # Sage green
-            'gt': '#456882',            # Medium blue-gray
-            'recon': '#BB3E00',         # Deep orange-red
-            'uncertainty': '#F7AD45',    # Golden yellow
-            'samples': "#4BD605",       # Muted green-gray
-            'background': '#F9F3EF'     # Warm off-white
-        }
-        
-        # Set professional scientific paper styling
-        plt.style.use('default')  # Reset to default first
-        plt.rcParams.update({
-            'font.family': 'sans-serif',
-            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-            'font.size': 11,
-            'axes.titlesize': 12,
-            'axes.labelsize': 11,
-            'axes.linewidth': 0.7,
-            'axes.edgecolor': "#9E9D9D",
-            'axes.facecolor': colors['background'],
-            'grid.color': "#838383",
-            'grid.linewidth': 0.4,
-            'grid.alpha': 0.6,
-            'legend.frameon': True,
-            'legend.fancybox': False,
-            'legend.shadow': False,
-            'legend.framealpha': 0.95,
-            'legend.edgecolor': '#A2B9A7',
-            'legend.facecolor': colors['background'],
-            'figure.facecolor': 'white',
-            'savefig.facecolor': 'white',
-            'savefig.dpi': 300
-        })
-        
-        # Create figure with 3 rows, 2 columns (main plot + colorbar)
-        n_rows = 3
-        fig, ax = plt.subplots(
-            nrows=n_rows, ncols=2, figsize=(20, n_rows * 3.5),
-            gridspec_kw={"width_ratios": [80, 1]}, constrained_layout=True)
-        
-        # Configure scientific paper grid style for all subplots
-        for i in range(n_rows):
-            ax[i, 0].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
-            ax[i, 0].minorticks_on()
-            ax[i, 0].set_axisbelow(True)
-            ax[i, 0].spines['top'].set_visible(False)
-            ax[i, 0].spines['right'].set_visible(False)
-            ax[i, 0].spines['left'].set_color('#A2B9A7')
-            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
-            ax[i, 0].spines['left'].set_linewidth(0.7)
-            ax[i, 0].spines['bottom'].set_linewidth(0.7)
-        
-        # Subplot 1: GT vs aggregated forecast with uncertainty band
-        ax[0, 1].set_axis_off()
-        ax[0, 0].plot(t_in, y_raw, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9)
-        ax[0, 0].plot(t_in, pred_mean, linewidth=1.2, color='#BB3E00', label='Forecast (mean)', alpha=0.9)
-        ax[0, 0].fill_between(
-            t_in,
-            pred_mean - pred_std,
-            pred_mean + pred_std,
-            alpha=0.3,
-            color=colors['uncertainty'],
-            label='Uncertainty band',
-        )
-        ax[0, 0].set_ylabel('FHR (bpm)')
-        ax[0, 0].set_title('Raw FHR vs Aggregated Forecast')
-        ax[0, 0].legend(loc='upper right', framealpha=0.95)
-        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
-
-        # Subplot 2: show some example windows overlayed
-        ax[1, 1].set_axis_off()
-        ax[1, 0].plot(t_in, y_raw, color=colors['gt'], alpha=0.4, linewidth=1.0)
-        if anchors is not None and anchors.numel() > 0 and canvas_mu is not None:
-            anc = anchors.detach().cpu().numpy()
-            cmu = canvas_mu[batch_idx].detach().cpu().numpy()
-            if cmu.ndim == 1:
-                cmu = cmu[np.newaxis, ...]
-            pick_indices = [0, len(anc) // 2, len(anc) - 1] if len(anc) >= 3 else list(range(len(anc)))
-            seen = set()
-            for idx in pick_indices:
-                idx = int(idx)
-                if idx < 0 or idx >= cmu.shape[0] or idx in seen:
-                    continue
-                seen.add(idx)
-                w = cmu[idx]
-                ax[1, 0].plot(t_in, w, color='#D7263D', linewidth=1.0, alpha=0.8)
-        ax[1, 0].set_ylabel('FHR (bpm)')
-        ax[1, 0].set_title('Sample Forecast Windows')
-        ax[1, 0].autoscale(enable=True, axis='x', tight=True)
-
-        # Subplot 3: latent heatmap (posterior mean)
-        if z_latent is not None:
-            imgplot = ax[2, 0].imshow(z_latent.T, aspect='auto', cmap='bwr', origin='lower')
-            ax[2, 1].set_axis_on()
-            cbar = fig.colorbar(imgplot, cax=ax[2, 1])
-            cbar.ax.tick_params(labelsize=10, colors='#666666')
-            cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
-            cbar.outline.set_color('#A2B9A7')
-            cbar.outline.set_linewidth(0.7)
-            ax[2, 0].set_ylabel('Latent Dimensions')
-            ax[2, 0].set_xlabel('Decimated steps')
-            ax[2, 0].set_title('Latent mu_post (T x D)')
-        else:
-            ax[2, 0].text(0.5, 0.5, 'Latents not available', ha='center', va='center')
-        
-        # Set overall title with scientific paper styling
-        diag_str = (
-            f"H={self.predictive_horizon if self.predictive_horizon is not None else 'model'} | "
-            f"MSE={sample_mse:.4f} | MAE={sample_mae:.4f} | Corr={sample_corr:.4f} | Cov={coverage_display}"
-        )
-        fig.suptitle(
-            f'Forecasting Results - Epoch {epoch}\n{diag_str}',
-            fontsize=14,
-            fontweight='normal',
-            y=0.98,
-            color='#456882'
-        )
-        # Save plot as PDF with high quality
-        save_path = os.path.join(self.output_dir, f'forecast_results_epoch_{epoch}.pdf')
-        plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
-        plt.close(fig)
-        
-        # Clean up memory  
-        del y_raw, pred_mean, pred_std
-        if z_latent is not None:
-            del z_latent
-        gc.collect()
-        logger.info(f"Forecast results plot saved to {save_path}")
-
-    def _plot_latent_forecast(
-        self,
-        latent_sequence: Optional[torch.Tensor],
-        latent_mu_future: Optional[torch.Tensor],
-        latent_logvar_future: Optional[torch.Tensor],
-        anchors: Optional[torch.Tensor],
-        enc: Optional[Dict[str, torch.Tensor]],
-        epoch: int,
-    ):
-        """Visualize latent predictions against ground truth for selected anchors."""
-        if latent_mu_future is None or anchors is None or anchors.numel() == 0:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent predictions available")
-            return
-
-        batch_idx = 0
-        anchors_np = anchors.detach().cpu().numpy()
-        target_steps = [60, 150, 169]
-        selected = []
-        for t in target_steps:
-            matches = np.where(anchors_np == t)[0]
-            if matches.size > 0:
-                selected.append((t, int(matches[0])))
-
-        if not selected:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: none of the requested anchors were found")
-            return
-
-        gt_source = None
-        if isinstance(enc, dict):
-            mu_post = enc.get('mu_post')
-            if isinstance(mu_post, torch.Tensor):
-                gt_source = mu_post.detach().cpu().numpy()
-        if gt_source is None and latent_sequence is not None:
-            gt_source = latent_sequence.detach().cpu().numpy()
-        if gt_source is None:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: no latent targets available")
-            return
-
-        if gt_source.ndim == 2:
-            gt_source = gt_source[None, ...]
-        if batch_idx >= gt_source.shape[0]:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: batch index out of range")
-            return
-
-        gt_full = gt_source[batch_idx]
-        pred_full = latent_mu_future[batch_idx].detach().cpu().numpy()
-        horizon = pred_full.shape[1] if pred_full.ndim == 3 else pred_full.shape[0]
-        latent_dim = pred_full.shape[-1]
-
-        columns = []
-        var_source = latent_logvar_future
-        if var_source is None and isinstance(enc, dict):
-            var_source = enc.get('latent_logvar_future')
-        for anchor_t, anchor_idx in selected:
-            if anchor_idx >= pred_full.shape[0]:
-                continue
-            pred_window = pred_full[anchor_idx]
-            if pred_window.ndim == 1:
-                pred_window = pred_window[:, None]
-            if isinstance(var_source, torch.Tensor) and anchor_idx < var_source.shape[1]:
-                var_window = var_source[batch_idx, anchor_idx].detach().cpu().numpy()
-                if var_window.ndim == 1:
-                    var_window = var_window[:, None]
-            else:
-                var_window = None
-            window_len = pred_window.shape[0]
-            start = anchor_t + 1
-            end = start + window_len
-            if start >= gt_full.shape[0]:
-                continue
-            end = min(end, gt_full.shape[0])
-            gt_window = gt_full[start:end]
-            if gt_window.shape[0] != pred_window.shape[0]:
-                window_len = min(gt_window.shape[0], pred_window.shape[0])
-                pred_window = pred_window[:window_len]
-                gt_window = gt_window[:window_len]
-                if var_window is not None:
-                    var_window = var_window[:window_len]
-            if window_len == 0:
-                continue
-            columns.append((anchor_t, pred_window, gt_window, var_window))
-
-        if not columns:
-            logger.warning("[PlottingCallback] Skipping latent forecast plot: no usable windows after alignment")
-            return
-
-        n_cols = len(columns)
-        horizon = columns[0][1].shape[0]
-        latent_dim = columns[0][1].shape[1]
-        time_axis = np.arange(horizon)
-
-        fig_height = max(latent_dim * 1.1, 6.0)
-        fig_width = max(n_cols * 4.0, 8.0)
-        fig, axes = plt.subplots(
-            nrows=latent_dim,
-            ncols=n_cols,
-            figsize=(fig_width, fig_height),
-            sharex=True,
-            constrained_layout=True,
-        )
-
-        import gc
-        if latent_dim == 1:
-            axes = np.expand_dims(axes, axis=0)
-        if n_cols == 1:
-            axes = np.expand_dims(axes, axis=1)
-
-        mse_summary = []
-
-        for col_idx, (anchor_t, pred_window, gt_window, var_window) in enumerate(columns):
-            mse_val = float(np.mean((pred_window - gt_window) ** 2))
-            mse_summary.append((anchor_t, mse_val))
-            for dim_idx in range(latent_dim):
-                ax = axes[dim_idx, col_idx]
-                ax.plot(time_axis, gt_window[:, dim_idx], label='GT' if col_idx == 0 and dim_idx == 0 else None, color='#055C9A', linewidth=1.2)
-                ax.plot(time_axis, pred_window[:, dim_idx], label='Pred' if col_idx == 0 and dim_idx == 0 else None, color='#BB3E00', linewidth=1.0, linestyle='--')
-                if var_window is not None:
-                    std_vals = np.sqrt(np.maximum(var_window[:, dim_idx], 1e-8))
-                    upper = pred_window[:, dim_idx] + std_vals
-                    lower = pred_window[:, dim_idx] - std_vals
-                    ax.fill_between(time_axis, lower, upper, color='#BB3E00', alpha=0.15, linewidth=0)
-                ax.grid(alpha=0.3, linewidth=0.4)
-                if col_idx == 0:
-                    ax.set_ylabel(f'z{dim_idx}', fontsize=8)
-                else:
-                    ax.set_yticklabels([])
-                if dim_idx == latent_dim - 1:
-                    ax.set_xlabel('Forecast step', fontsize=8)
-                if dim_idx == 0:
-                    ax.set_title(f't = {anchor_t}', fontsize=10)
-
-        if latent_dim > 0 and n_cols > 0:
-            axes[0, 0].legend(loc='upper right', fontsize=8)
-
-        summary_str = ' | '.join([f't={t}: MSE={mse:.4f}' for t, mse in mse_summary])
-        fig.suptitle(
-            f'Latent Forecast vs Ground Truth | Epoch {epoch}\n{summary_str}',
-            fontsize=14,
-            color='#456882',
-        )
-
-        save_path = os.path.join(self.output_dir, f'latent_forecast_epoch_{epoch}.pdf')
-        fig.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
-        plt.close(fig)
-        logger.info(f'Latent forecast comparison plot saved to {save_path}')
-        gc.collect()
-
-    def _plot_batch_aggregated_forecast(
-        self,
-        y_raw_batch: torch.Tensor,
-        mean_mu_batch: torch.Tensor,
-        std_mu_batch: torch.Tensor,
-        epoch: int,
-    ):
-        """Plot average aggregated forecast across validation batch with uncertainty band.
-
-        Uses per-sample coverage masks from mean_mu_batch (NaNs denote uncovered points).
-        Uncertainty combines within-sample variance and across-sample variability (law of total variance).
-        """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import os
-
-        # Compute per-time coverage mask and masked batch means
-        mask = ~torch.isnan(mean_mu_batch)  # (B,4800)
-        # Predicted mean across samples (nanmean)
-        pred_mean = torch.nanmean(mean_mu_batch, dim=0)  # (4800,)
-        # Ground-truth mean across samples restricted to covered points
-        gt_masked = y_raw_batch.masked_fill(~mask, float('nan'))
-        gt_mean = torch.nanmean(gt_masked, dim=0)  # (4800,)
-
-        # Uncertainty via total variance: E[var] + var(E)
-        # E[var] term
-        e_var = torch.nanmean(std_mu_batch.pow(2), dim=0)
-        # var(E) term: variability of per-sample predicted means
-        mean_centered = mean_mu_batch - pred_mean.unsqueeze(0)
-        mean_centered = mean_centered.masked_fill(~mask, float('nan'))
-        var_e = torch.nanmean(mean_centered.pow(2), dim=0)
-        total_var = (e_var + var_e).clamp_min(0.0)
-        pred_std = total_var.sqrt()
-
-        t = np.arange(pred_mean.shape[0]) / 4.0
-        pm = pred_mean.detach().cpu().numpy()
-        ps = pred_std.detach().cpu().numpy()
-        gm = gt_mean.detach().cpu().numpy()
-
-        fig, ax = plt.subplots(1, 1, figsize=(16, 4.5), constrained_layout=True)
-        ax.plot(t, gm, color='#2E86AB', label='GT (batch mean)', linewidth=1.5)
-        ax.plot(t, pm, color='#BB3E00', label='Forecast (batch mean)', linewidth=1.2)
-        ax.fill_between(
-            t,
-            pm - ps,
-            pm + ps,
-            color='#F5B7B1',
-            alpha=0.4,
-            label='Total uncertainty band',
-        )
-        ax.set_title('Batch-Aggregated Forecast vs Ground Truth')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('FHR (bpm)')
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-        save_path = os.path.join(self.output_dir, f'forecast_results_epoch_{epoch}_avg.pdf')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close(fig)
-        logger.info(f"Batch-aggregated forecast plot saved to {save_path}")
-
-
-class LossPlotCallback(Callback):
-    def __init__(self, output_dir, plot_frequency=10, max_history_size=1000):
-        """
-        Args:
-            output_dir (str): Directory where the loss plot HTML files will be saved.
-            plot_frequency (int): Frequency (in epochs) to generate the loss plot.
-            max_history_size (int): Maximum number of epochs to keep in history to prevent memory issues.
-        """
-        super().__init__()
-        self.output_dir = output_dir
-        self.plot_frequency = plot_frequency
-        self.max_history_size = max_history_size
-        # Standard TEB metrics (cleaned up - removed legacy aliases)
-        self.history = {
-            "epoch": [],
-            # Core VAE losses
-            "train/total_loss": [],
-            "train/recon_loss": [],
-            "train/mse_loss": [],
-            "train/nll_loss": [],
-            "train/kld_loss": [],
-            # TCN forecaster losses
-            "train/forecast_nll": [],
-            "train/latent_nll_loss": [],
-            "train/predictive_kl_loss": [],
-            "train/stability_penalty": [],
-            # Auxiliary metrics
-            "train/agg_mse": [],
-            # Validation core losses
-            "val/total_loss": [],
-            "val/recon_loss": [],
-            "val/mse_loss": [],
-            "val/nll_loss": [],
-            "val/kld_loss": [],
-            # Validation forecaster losses
-            "val/forecast_nll": [],
-            "val/latent_nll_loss": [],
-            "val/predictive_kl_loss": [],
-            "val/stability_penalty": [],
-            # Validation aggregate metrics
-            "val/agg_mse": [],
-            "val/agg_mae": [],
-            "val/agg_corr": [],
-            "val/agg_std": [],
-            "val/agg_coverage": [],
-            # Hyperparameters
-            "hyperparams/beta": [],
-            "hyperparams/lr": []
-        }
-
-    def _trim_history(self):
-        """Trim history to prevent unlimited memory growth."""
-        if len(self.history["epoch"]) > self.max_history_size:
-            # Keep only the last max_history_size entries
-            trim_size = len(self.history["epoch"]) - self.max_history_size
-            for key in self.history:
-                self.history[key] = self.history[key][trim_size:]
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        # Extract the current epoch number
-        epoch = trainer.current_epoch
-
-        # Retrieve logged metrics from the trainer
-        metrics = trainer.callback_metrics
-
-        def to_float(x):
-            return x.item() if x is not None and hasattr(x, 'item') else float('nan')
-
-        # Store losses in history
-        self.history["epoch"].append(epoch)
-        for key in self.history:
-            if key != "epoch":
-                self.history[key].append(to_float(metrics.get(key)))
-
-        # Trim history to prevent memory issues
-        self._trim_history()
-
-        # Check if it's time to plot the losses and only do so on the main process
-        if (epoch + 1) % self.plot_frequency == 0 and trainer.is_global_zero:
-            self.plot_losses()
-            self.plot_hyperparameters()
-
-    def plot_losses(self):
-        import os
-        import plotly.graph_objects as go
-        import gc
-
-        # Create a Plotly figure and add a trace for each metric.
-        fig = go.Figure()
-
-        for key, values in self.history.items():
-            if key == "epoch" or not any(v is not None and not np.isnan(v) for v in values):
-                continue
-
-            fig.add_trace(go.Scatter(
-                x=self.history["epoch"],
-                y=values,
-                mode='lines+markers',
-                name=key.replace('/', ' ').title()
-            ))
-
-        # Customize layout
-        fig.update_layout(
-            title="Training and Validation Losses",
-            xaxis_title="Epoch",
-            yaxis_title="Loss",
-            legend_title="Metrics",
-            template="plotly_white",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
-            )
-        )
-
-        # Save the figure as an HTML file
-        plot_path = os.path.join(self.output_dir, f"loss_plot_epoch.html")
-        fig.write_html(plot_path)
-        logger.info(f"Loss plot saved to {plot_path}")
-
-        # Clean up figure to free memory
-        del fig
-        gc.collect()
-
-    def plot_hyperparameters(self):
-        """Create a plot of hyperparameter evolution"""
-        import os
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        import gc
-
-        if len(self.history["epoch"]) == 0:
-            return
-
-        # Check if we have hyperparameter data
-        has_beta = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/beta", []))
-        has_lr = any(v is not None and not np.isnan(v) for v in self.history.get("hyperparams/lr", []))
-
-        if not (has_beta or has_lr):
-            logger.info("No hyperparameter data available for plotting")
-            return
-
-        # Create subplots for different hyperparameters
-        fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=('Beta (KLD Weight)', 'Learning Rate'),
-            vertical_spacing=0.12,
-            horizontal_spacing=0.10
-        )
-
-        # Plot Beta if available
-        if has_beta:
-            fig.add_trace(
-                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/beta"],
-                          mode='lines+markers', name='Beta', line=dict(color='red', width=2)),
-                row=1, col=1
-            )
-
-        # Plot Learning Rate if available
-        if has_lr:
-            fig.add_trace(
-                go.Scatter(x=self.history["epoch"], y=self.history["hyperparams/lr"],
-                          mode='lines+markers', name='Learning Rate', line=dict(color='blue', width=2)),
-                row=1, col=2
-            )
-
-        # Update layout
-        fig.update_layout(
-            title="Training Hyperparameters Evolution",
-            showlegend=False,
-            template="plotly_white",
-            height=400
-        )
-
-        # Update axes labels
-        fig.update_xaxes(title_text="Epoch", row=1, col=1)
-        fig.update_xaxes(title_text="Epoch", row=1, col=2)
-
-        fig.update_yaxes(title_text="Beta Value", row=1, col=1)
-        fig.update_yaxes(title_text="Learning Rate", row=1, col=2, type="log")
-
-        # Save the figure
-        plot_path = os.path.join(self.output_dir, "hyperparameters_evolution.html")
-        fig.write_html(plot_path)
-        logger.info(f"Hyperparameters plot saved to {plot_path}")
-
-        # Clean up
-        del fig
-        gc.collect()
-
-
-class HyperparameterLoggingCallback(Callback):
-    """
-    Callback to track and log hyperparameters like beta, learning rate, alpha, gamma, etc.
-    """
-    def __init__(self):
-        super().__init__()
-        self.history = {
-            "epoch": [],
-            "beta": [],
-            "lr": []
-        }
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        """Log hyperparameters at the start of each epoch"""
-        if trainer.is_global_zero:  # Only log on main process for multi-GPU
-            epoch = trainer.current_epoch
-            
-            # Get current beta value (always calculate fresh to reflect any config changes)
-            beta = pl_module._calculate_beta()
-            
-            # Get current learning rate
-            lr = 0.0
-            try:
-                if hasattr(trainer, 'optimizers') and trainer.optimizers:
-                    optimizer = trainer.optimizers[0] if isinstance(trainer.optimizers, list) else trainer.optimizers
-                    lr = optimizer.param_groups[0]['lr']
-            except (IndexError, AttributeError):
-                pass
-            
-            # Store in history
-            self.history["epoch"].append(epoch)
-            self.history["beta"].append(beta)
-            self.history["lr"].append(lr)
-            
-            # LightningModule handles logging; callback only tracks history
-            
-            logger.info(f"Epoch {epoch}: beta={beta:.4f}, lr={lr:.6f}")
-
-    def plot_hyperparameters(self, output_dir):
-        """Create a plot of hyperparameter evolution"""
-        import os
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        import gc
-
-        if len(self.history["epoch"]) == 0:
-            return
-
-        # Create subplots for different hyperparameters
-        fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=('Beta (KLD Weight)', 'Learning Rate'),
-            vertical_spacing=0.12,
-            horizontal_spacing=0.10
-        )
-
-        # Plot Beta
-        fig.add_trace(
-            go.Scatter(x=self.history["epoch"], y=self.history["beta"],
-                      mode='lines+markers', name='Beta', line=dict(color='red', width=2)),
-            row=1, col=1
-        )
-
-        # Plot Learning Rate
-        fig.add_trace(
-            go.Scatter(x=self.history["epoch"], y=self.history["lr"],
-                      mode='lines+markers', name='Learning Rate', line=dict(color='blue', width=2)),
-            row=1, col=2
-        )
-
-        # Update layout
-        fig.update_layout(
-            title="Training Hyperparameters Evolution",
-            showlegend=False,
-            template="plotly_white",
-            height=400
-        )
-
-        # Update axes labels
-        fig.update_xaxes(title_text="Epoch", row=1, col=1)
-        fig.update_xaxes(title_text="Epoch", row=1, col=2)
-
-        fig.update_yaxes(title_text="Beta Value", row=1, col=1)
-        fig.update_yaxes(title_text="Learning Rate", row=1, col=2, type="log")
-
-        # Save the figure
-        plot_path = os.path.join(output_dir, "hyperparameters_evolution.html")
-        fig.write_html(plot_path)
-        logger.info(f"Hyperparameters plot saved to {plot_path}")
-
-        # Clean up
-        del fig
-        gc.collect()
-
+                mu_future = forecast.get("mu_future")
+                logvar_future = forecast.get("logvar_future")
+                timesteps = forecast.get("timesteps")
+                if mu_future is not None and timesteps is not None:
+                    target_stph = torch.cat([batch.fhr_st, batch.fhr_ph], dim=-1)
+                    metrics = orig_model.scattering_forecast_metrics(mu_future, logvar_future, target_stph, timesteps)
+                    for key, value in metrics.items():
+                        pl_module.log(f"val/sample_{key}", value, prog_bar=False, logger=True, sync_dist=False)
+
+        if hasattr(model, "is_core_frozen") and model.is_core_frozen():
+            orig_model.core.eval()
 
 class MetricsLoggingCallback(Callback):
     def __init__(self):
@@ -1091,11 +118,9 @@ class LightSeqVaeTeb(L.LightningModule):
     """
 
     _FORECAST_METRIC_KEYS = (
-        'agg_mse',
-        'agg_mae',
-        'agg_corr',
-        'agg_std',
-        'agg_coverage',
+        'forecast_mse',
+        'forecast_rmse',
+        'forecast_nll',
     )
 
     def __init__(
@@ -1111,12 +136,12 @@ class LightSeqVaeTeb(L.LightningModule):
         beta_const_val: float = 1.0,
         predictive_horizon: Optional[int] = None,
         predictive_max_anchors: Optional[int] = None,
-        latent_nll_weight: Optional[float] = None,
-        latent_discount_gamma: float = 1.0,
+        scattering_forecast_weight: Optional[float] = None,
+        scattering_discount_gamma: float = 1.0,
         log_forecast_metrics: bool = True,
         enable_forecaster: Optional[bool] = None,
     ):
-        """Lightning wrapper for SeqVaeTeb with optional latent forecasting losses."""
+        """Lightning wrapper for SeqVaeTeb with optional scattering forecasting losses."""
         super().__init__()
 
         model_horizon = getattr(seqvae_teb_model, 'horizon_len', None)
@@ -1124,8 +149,8 @@ class LightSeqVaeTeb(L.LightningModule):
             predictive_horizon = model_horizon if model_horizon is not None else 1
         if predictive_max_anchors is None:
             predictive_max_anchors = 0
-        if latent_nll_weight is None:
-            latent_nll_weight = 0.0
+        if scattering_forecast_weight is None:
+            scattering_forecast_weight = 0.0
 
         forecaster_available = getattr(seqvae_teb_model, 'has_forecaster', lambda: False)()
         if enable_forecaster is None:
@@ -1136,7 +161,7 @@ class LightSeqVaeTeb(L.LightningModule):
         self._forecaster_enabled = bool(enable_forecaster and forecaster_available)
         self.hparams.enable_forecaster = self._forecaster_enabled
         if not self._forecaster_enabled:
-            self.hparams.latent_nll_weight = 0.0
+            self.hparams.scattering_forecast_weight = 0.0
             self.hparams.log_forecast_metrics = False
 
         self._orig_model = self.model
@@ -1220,72 +245,6 @@ class LightSeqVaeTeb(L.LightningModule):
         logger.info(f"  Current lr_milestones: {self.hparams.lr_milestones}")
         logger.info(" Hyperparameter validation complete")
 
-    def _compute_forecast_metrics_v2(self, batch) -> Dict[str, torch.Tensor]:
-        """Compute forecast metrics using new forecast API."""
-        metrics: Dict[str, torch.Tensor] = {}
-
-        model = self.model
-        if hasattr(model, '_orig_mod'):
-            orig_model = model._orig_mod
-        else:
-            orig_model = model
-
-        if not orig_model.has_forecaster():
-            return metrics
-
-        try:
-            # Get forecasts at all valid timesteps using new API
-            forecast_dict = orig_model.forecast(
-                y_st=batch.fhr_st,
-                y_ph=batch.fhr_ph,
-                x_ph=batch.fhr_up_ph,
-                timesteps=None,  # All valid timesteps
-                use_posterior_mean=True,
-                decode_predictions=True,  # Need decoded predictions for metrics
-            )
-
-            mu_future = forecast_dict.get('mu_future')  # (B, N, 480)
-            timesteps = forecast_dict.get('timesteps')  # (N,)
-
-            if mu_future is None or timesteps is None or timesteps.numel() == 0:
-                return metrics
-
-            # Compute metrics on forecast windows
-            y_raw = batch.fhr  # (B, 4800)
-            B = y_raw.size(0)
-
-            # For each valid timestep, compare prediction window to ground truth
-            H = 30  # horizon
-            stride = 16  # decimation factor
-
-            mse_list = []
-            mae_list = []
-
-            for i, t in enumerate(timesteps):
-                t_val = int(t.item())
-                # Ground truth window: raw samples [stride*(t+1), stride*(t+1+H))
-                gt_start = stride * (t_val + 1)
-                gt_end = gt_start + stride * H
-
-                if gt_end <= y_raw.size(1):
-                    gt_window = y_raw[:, gt_start:gt_end]  # (B, 480)
-                    pred_window = mu_future[:, i, :]  # (B, 480)
-
-                    mse = (pred_window - gt_window).pow(2).mean()
-                    mae = (pred_window - gt_window).abs().mean()
-
-                    mse_list.append(mse)
-                    mae_list.append(mae)
-
-            if mse_list:
-                metrics['agg_mse'] = torch.stack(mse_list).mean()
-                metrics['agg_mae'] = torch.stack(mae_list).mean()
-
-        except Exception as e:
-            logger.warning(f"Failed to compute forecast metrics: {e}")
-
-        return metrics
-
     def _compute_losses_and_metrics(self, batch, stage: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Run forward pass, compute losses, and optional forecast metrics using new API."""
         y_st = batch.fhr_st
@@ -1297,9 +256,9 @@ class LightSeqVaeTeb(L.LightningModule):
 
         # Determine loss weights based on configuration
         decoder_weight = 1.0  # Always compute reconstruction during training
-        forecaster_weight = float(self.hparams.latent_nll_weight) if use_forecaster else 0.0
+        forecaster_weight = float(self.hparams.scattering_forecast_weight) if use_forecaster else 0.0
         kld_weight = self.hparams.beta  # Use current beta value
-        gamma = float(getattr(self.hparams, 'latent_discount_gamma', 1.0))
+        gamma = float(getattr(self.hparams, 'scattering_discount_gamma', 1.0))
 
         # Compute combined loss using new API
         loss_dict = self.model.compute_combined_loss(
@@ -1317,7 +276,21 @@ class LightSeqVaeTeb(L.LightningModule):
         aux_metrics: Dict[str, torch.Tensor] = {}
         if use_forecaster and self.hparams.log_forecast_metrics and forecaster_weight > 0.0 and stage != 'train':
             with torch.no_grad():
-                aux_metrics = self._compute_forecast_metrics_v2(batch)
+                mu_future_full = loss_dict.get('mu_future')
+                logvar_future_full = loss_dict.get('logvar_future')
+                timesteps = loss_dict.get('forecast_timesteps')
+                if (
+                    isinstance(mu_future_full, torch.Tensor)
+                    and isinstance(logvar_future_full, torch.Tensor)
+                    and isinstance(timesteps, torch.Tensor)
+                    and timesteps.numel() > 0
+                ):
+                    idx = timesteps.long()
+                    target_stph = torch.cat([y_st, y_ph], dim=-1)
+                    mu_slice = mu_future_full[:, idx, :, :]
+                    logvar_slice = logvar_future_full[:, idx, :, :]
+                    metrics = self.model.scattering_forecast_metrics(mu_slice, logvar_slice, target_stph, idx)
+                    aux_metrics = {f'forecast_{k}': v for k, v in metrics.items()}
 
         return loss_dict, aux_metrics
 
@@ -1334,12 +307,14 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('train/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
 
         forecast_loss = _log_metric_tensor(loss_dict.get('forecasting_loss'), reference=total_loss, default=0.0)
-        latent_nll = _log_metric_tensor(loss_dict.get('latent_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
-        valid_predictions = _log_metric_tensor(loss_dict.get('valid_predictions', 0.0), reference=total_loss, default=0.0)
+        scattering_nll = _log_metric_tensor(loss_dict.get('scattering_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
+        scattering_mse = _log_metric_tensor(loss_dict.get('scattering_mse', 0.0), reference=total_loss, default=0.0)
+        valid_steps = _log_metric_tensor(loss_dict.get('valid_steps', 0.0), reference=total_loss, default=0.0)
 
-        self.log('train/forecast_nll', forecast_loss, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('train/latent_nll_loss', latent_nll, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-        self.log('train/valid_predictions', valid_predictions, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('train/forecast_loss', forecast_loss, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('train/scattering_nll', scattering_nll, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('train/scattering_mse', scattering_mse, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        self.log('train/valid_steps', valid_steps, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
 
         # Auxiliary metrics (if any were computed)
         for name, value in sorted(aux_metrics.items()):
@@ -1361,12 +336,12 @@ class LightSeqVaeTeb(L.LightningModule):
         self.log('val/kld_loss', loss_dict['kld_loss'], on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
         forecast_loss = _log_metric_tensor(loss_dict.get('forecasting_loss'), reference=total_loss, default=0.0)
-        latent_nll = _log_metric_tensor(loss_dict.get('latent_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
-        valid_predictions = _log_metric_tensor(loss_dict.get('valid_predictions', 0.0), reference=total_loss, default=0.0)
+        scattering_nll = _log_metric_tensor(loss_dict.get('scattering_nll', loss_dict.get('forecasting_loss')), reference=total_loss, default=0.0)
+        valid_steps = _log_metric_tensor(loss_dict.get('valid_steps', 0.0), reference=total_loss, default=0.0)
 
-        self.log('val/forecast_nll', forecast_loss, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('val/latent_nll_loss', latent_nll, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log('val/valid_predictions', valid_predictions, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/forecast_loss', forecast_loss, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/scattering_nll', scattering_nll, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('val/valid_steps', valid_steps, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         for name in self._FORECAST_METRIC_KEYS:
             metric_value = _log_metric_tensor(aux_metrics.get(name), reference=total_loss, default=0.0)
