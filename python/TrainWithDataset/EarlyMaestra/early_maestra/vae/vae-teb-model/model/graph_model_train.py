@@ -167,7 +167,7 @@ class SeqVAEGraphModel:
             self.log_forecast_metrics = False
             if 'latent' in self.monitor_metric or 'scattering' in self.monitor_metric:
                 self.monitor_metric = 'val/total_loss'
-        self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
+        # self.freeze_seqvae = self.config['model_config']['VAE_model']['freeze_seqvae']
         self.freeze_core_model = self.config['model_config']['VAE_model'].get('freeze_core_model', False)
         self.batch_size_train = self.config['general_config']['batch_size']['train']
         self.batch_size_test = self.config['general_config']['batch_size']['test']

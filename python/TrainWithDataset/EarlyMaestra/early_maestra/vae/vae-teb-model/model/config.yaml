@@ -47,7 +47,7 @@ general_config:
   # - Stage 2 (freeze): epochs: 200 (forecaster trains faster)
   # - Stage 2 (joint): epochs: 300-500 (joint training needs more epochs)
   # ========================================================================
-  epochs: 500
+  epochs: 5000
 
   accumulate_grad_batches: 20  # Gradient accumulation for effective larger batch size
   batch_size:
@@ -83,9 +83,9 @@ model_config:
     # --------------------------------------------------------------------
 
     # CURRENT SETTINGS (STAGE 1):
-    enable_forecaster: false         # ← CHANGE TO true FOR STAGE 2
+    enable_forecaster: true         # ← CHANGE TO true FOR STAGE 2
     freeze_core_model: false         # ← CHANGE TO true FOR STAGE 2 FREEZE MODE
-    scattering_forecast_weight: 0.0  # ← CHANGE TO 1.0 FOR STAGE 2
+    scattering_forecast_weight: 1  # ← CHANGE TO 1.0 FOR STAGE 2
 
     # Forecasting horizon (used in Stage 2)
     horizon_len: 30  # 30 decimated steps = ~2 minutes at 4Hz with decimation 16
@@ -110,7 +110,7 @@ model_config:
     # Forecasting Loss Configuration (used in Stage 2)
     predictive_horizon: 30            # Forecast horizon (same as horizon_len)
     predictive_max_anchors: 0         # 0 = use all valid timesteps as anchors
-    log_forecast_metrics: false       # ← CHANGE TO true FOR STAGE 2
+    log_forecast_metrics: true       # ← CHANGE TO true FOR STAGE 2
     scattering_discount_gamma: 1.0    # Discount factor for multi-step forecasting
 
   # ######################################################################
@@ -134,7 +134,7 @@ model_config:
   # --------------------------------------------------------------------
 
   base_model_checkpoint: null
-  legacy_seqvae_checkpoint: null  # ← CHANGE TO STAGE 1 CHECKPOINT PATH FOR STAGE 2
+  legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-11-02--[14-52]--No_LSTM_B-200_lr-e-3_predictive/model_checkpoints/base-model-best-epoch=34.ckpt
 
 folders_config:
   # ========================================================================
@@ -149,11 +149,15 @@ dataset_config:
     # UPDATE THESE PATHS TO YOUR DATASET LOCATIONS
     # ========================================================================
     vae_train_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
     vae_test_datasets:
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
 
     dataloader_config:
