@@ -1120,7 +1120,7 @@ class SeqVaeCore(nn.Module):
         y_st: torch.Tensor,  # (B, T, 43)
         y_ph: torch.Tensor,  # (B, T, 44)
         x_ph: torch.Tensor,  # (B, T, 130)
-        prediction_mode: bool = True
+        prediction_mode: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Forward pass through the complete VAE (encode + decode).
 
