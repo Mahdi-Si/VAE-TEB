@@ -1,89 +1,164 @@
+# ############################################################################
+# UNIFIED CONFIG: SeqVAE-TEB Two-Stage Training
+# ############################################################################
+#
+# This config supports both training stages:
+#   STAGE 1: Core VAE Training (encoders + decoder)
+#   STAGE 2: Scattering Forecaster Training (autoregressive prediction)
+#
+# QUICK START:
+# ------------
+# 1. STAGE 1 - Train Core VAE:
+#    - Set: enable_forecaster: false
+#    - Set: freeze_core_model: false
+#    - Set: scattering_forecast_weight: 0.0
+#    - Set: legacy_seqvae_checkpoint: null
+#    - Run: python model/graph_model_train.py
+#    - Save checkpoint path after training
+#
+# 2. STAGE 2 - Train Forecaster:
+#    - Set: enable_forecaster: true
+#    - Set: freeze_core_model: true (freeze) or false (joint training)
+#    - Set: scattering_forecast_weight: 1.0
+#    - Set: legacy_seqvae_checkpoint: /path/to/stage1/checkpoint.ckpt
+#    - Update: tag, out_dir_base (optional)
+#    - Run: python model/graph_model_train.py
+#
+# ############################################################################
+
 general_config:
-  tag: scattering_forecast_autoreg
+  # ========================================================================
+  # CHANGE FOR EACH STAGE:
+  # - Stage 1: tag: "stage1_core_vae_training"
+  # - Stage 2: tag: "stage2_forecaster_training" or "stage2_joint_training"
+  # ========================================================================
+  tag: stage1_core_vae_training
+
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
-  lr: 0.0001  # Learning rate (reduced for stability)
+  lr: 0.0001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
   lr_milestone: [1000]  # Epochs at which to decay learning rate
-  weight_decay: 0.0001  # L2 regularization weight (now handled by AdamW)
+  weight_decay: 0.0001  # L2 regularization weight
   checkpoint_frequency: 1
   plot_frequency: 1  # Callback log frequency in epochs
-  epochs: 10000  # Increased for better convergence
+
+  # ========================================================================
+  # CHANGE FOR EACH STAGE:
+  # - Stage 1: epochs: 500 (core VAE needs more epochs)
+  # - Stage 2 (freeze): epochs: 200 (forecaster trains faster)
+  # - Stage 2 (joint): epochs: 300-500 (joint training needs more epochs)
+  # ========================================================================
+  epochs: 500
+
   accumulate_grad_batches: 20  # Gradient accumulation for effective larger batch size
   batch_size:
-    train: 210  # Increased from 2 for better training stability
-    test: 210   # Can be larger for testing since no gradients
-  
-  # SOTA Training Optimizations
-  optimization:
-    compile_model: true              # Enable torch.compile
-    compile_mode: "max-autotune"     # Most aggressive optimization
-#     fused_optimizer: true            # Enable fused AdamW
-#     channels_last: false             # Memory format optimization (not beneficial for 1D data)
+    train: 210
+    test: 210
 
 model_config:
   VAE_model:
-#     freeze_seqvae: False        # Whether to freeze VAE during classifier training
-    freeze_core_model: False    # Whether to freeze core VAE (encoders+decoder) and only train latent forecaster
-#     zero_source: False           # Whether to zero source during certain experiments
-#     context_len: 75            # Latent forecaster context length (decimated steps)
-    horizon_len: 30            # Forecast horizon (decimated steps -> 2 minutes at 4 Hz)
+    # ######################################################################
+    # CRITICAL SETTINGS - CHANGE THESE WHEN SWITCHING STAGES
+    # ######################################################################
+
+    # --------------------------------------------------------------------
+    # STAGE 1 (Core VAE Training):
+    # --------------------------------------------------------------------
+    #   enable_forecaster: false
+    #   freeze_core_model: false
+    #   scattering_forecast_weight: 0.0
+    #
+    # --------------------------------------------------------------------
+    # STAGE 2 (Forecaster Training - Freeze Core Mode - RECOMMENDED):
+    # --------------------------------------------------------------------
+    #   enable_forecaster: true
+    #   freeze_core_model: true          # ← Freeze core, train forecaster only
+    #   scattering_forecast_weight: 1.0
+    #
+    # --------------------------------------------------------------------
+    # STAGE 2 (Forecaster Training - Joint Mode - ADVANCED):
+    # --------------------------------------------------------------------
+    #   enable_forecaster: true
+    #   freeze_core_model: false         # ← Train everything together
+    #   scattering_forecast_weight: 1.0
+    # --------------------------------------------------------------------
+
+    # CURRENT SETTINGS (STAGE 1):
+    enable_forecaster: false         # ← CHANGE TO true FOR STAGE 2
+    freeze_core_model: false         # ← CHANGE TO true FOR STAGE 2 FREEZE MODE
+    scattering_forecast_weight: 0.0  # ← CHANGE TO 1.0 FOR STAGE 2
+
+    # Forecasting horizon (used in Stage 2)
+    horizon_len: 30  # 30 decimated steps = ~2 minutes at 4Hz with decimation 16
 
     # Beta Scheduling Configuration
-    # Controls the strength of regularization terms across training
-    beta_schedule: constant     # Options: 'constant', 'linear', 'cyclic'
-    beta_start: 0.0            # Starting beta value for annealing schedules
-    beta_end: 1.0              # Final beta value for TEB
-    beta_anneal_epochs: 50     # Number of epochs for linear annealing
-    beta_cycle_len: 1000       # Cycle length for cyclic annealing
-    beta_const_val: 0.005        # Constant beta value when schedule='constant'
-    kld_beta: 0.005              # Fallback beta value (legacy parameter)
+    # Controls KL divergence weight (transfer entropy regularization)
+    beta_schedule: constant      # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0             # Starting beta for annealing schedules
+    beta_end: 1.0               # Final beta for annealing schedules
+    beta_anneal_epochs: 50      # Number of epochs for linear annealing
+    beta_cycle_len: 1000        # Cycle length for cyclic annealing
+    beta_const_val: 0.005       # Constant beta value (ACTIVE when schedule='constant')
+    kld_beta: 0.005             # Fallback beta value
 
-    # Standard TEB Configuration
-    # Original TEB formulation with conditional prior p(z|y)
-    # Single KL divergence: KL(q(z|x,y) || p(z|y))
-    # Direct transfer entropy measurement
+    # Forecasting Model Architecture (used in Stage 2)
+    forecaster_hidden_dim: 128        # Hidden size for forecaster LSTM
+    forecaster_layers: 2              # Number of LSTM layers in forecaster
+    forecaster_dropout: 0.1           # Dropout in forecaster
+    forecaster_min_logvar: -7.0       # Minimum log-variance clamp
+    forecaster_max_logvar: 4.0        # Maximum log-variance clamp
 
-    # Forecasting auxiliary objectives
-    enable_forecaster: false
-    forecaster_hidden_dim: 128        # Hidden size used inside scattering forecaster
-    forecaster_layers: 2             # Number of LSTM layers in scattering forecaster
-    forecaster_dropout: 0.1          # Dropout applied in scattering forecaster
-    forecaster_min_logvar: -7.0      # Minimum log-variance clamp
-    forecaster_max_logvar: 4.0       # Maximum log-variance clamp
-#     forecast_weight: 0.8                # Weight on raw forecast NLL auxiliary loss
-    scattering_forecast_weight: 0.1              # Weight on scattering-forecast Gaussian NLL
-#     predictive_kl_weight: 0.0           # Weight on teacher KL between LGSSM and posterior
-#     stability_weight: 0.001             # Weight on LGSSM stability regularizer
-    predictive_horizon: null            # Override horizon for auxiliary loss (defaults to horizon_len)
-#     predictive_context_len: null        # Override context length (defaults to context_len)
-    predictive_max_anchors: 0           # Max anchors (0 = use all) for auxiliary losses
-#     max_predictive_contexts_per_batch: 4096  # Safety cap on total contexts processed per batch
-    log_forecast_metrics: true          # Log aggregated forecast metrics during validation
-#     monitor_metric: "val/total_loss"  # Metric to monitor for checkpoints / early stopping
-#     monitor_mode: "min"                 # Direction for monitored metric
+    # Forecasting Loss Configuration (used in Stage 2)
+    predictive_horizon: 30            # Forecast horizon (same as horizon_len)
+    predictive_max_anchors: 0         # 0 = use all valid timesteps as anchors
+    log_forecast_metrics: false       # ← CHANGE TO true FOR STAGE 2
+    scattering_discount_gamma: 1.0    # Discount factor for multi-step forecasting
+
+  # ######################################################################
+  # CHECKPOINT SETTINGS - CHANGE THESE WHEN SWITCHING TO STAGE 2
+  # ######################################################################
+
+  # --------------------------------------------------------------------
+  # STAGE 1 (Training from scratch):
+  # --------------------------------------------------------------------
+  #   base_model_checkpoint: null
+  #   legacy_seqvae_checkpoint: null
+  #
+  # --------------------------------------------------------------------
+  # STAGE 2 (Load Stage 1 checkpoint):
+  # --------------------------------------------------------------------
+  #   base_model_checkpoint: null
+  #   legacy_seqvae_checkpoint: /path/to/stage1/checkpoint.ckpt
+  #
+  # EXAMPLE:
+  # legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training/2025-01-15--[14-30]--stage1_core_vae_training/model_checkpoints/base-model-best-epoch=357.ckpt
+  # --------------------------------------------------------------------
 
   base_model_checkpoint: null
-  legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-09-01--[13-43]--seqvae_teb_experiment_latent_16_B1e-3_from_checkpoint__fixed/model_checkpoints/base-model-best-epoch=357.ckpt  # Optional legacy SeqVaeTeb checkpoint (no latent forecaster)
+  legacy_seqvae_checkpoint: null  # ← CHANGE TO STAGE 1 CHECKPOINT PATH FOR STAGE 2
 
 folders_config:
-  out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training
+  # ========================================================================
+  # OPTIONAL - CHANGE FOR EACH STAGE:
+  # - Stage 1: out_dir_base: .../stage1_core_training
+  # - Stage 2: out_dir_base: .../stage2_forecaster_training
+  # ========================================================================
+  out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training
 
 dataset_config:
+    # ========================================================================
+    # UPDATE THESE PATHS TO YOUR DATASET LOCATIONS
+    # ========================================================================
     vae_train_datasets:
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
     vae_test_datasets:
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
     dataloader_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
-      # These are for CombinedHDF5Dataset
       dataset_kwargs:
         load_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'epoch', 'guid']
         allowed_guids: null
@@ -93,61 +168,162 @@ dataset_config:
         epoch_max: null
         label: null
         cache_size: 20000
-        trim_minutes: 2.0  # how much to trim from start and end of the signal
+        trim_minutes: 2.0
 
-seqvae_testing:
-  test_checkpoint_path: null
-  
-  # Test Analysis Configuration
-  analysis_config:
-    num_analysis_samples: 50             # Number of samples for detailed analysis
-    num_shift_samples: 10                # Number of samples for TE shift analysis
-    max_left_shift_seconds: 60           # Maximum left shift for TE analysis
-    shift_step_seconds: 2                # Step size for TE shift analysis
-    te_ablation_samples: 200             # Samples for UP ablation analysis
-    gain_sweep_samples: 100              # Samples for gain sweep analysis
-    gain_sweep_values: [0.0, 0.5, 1.0, 1.5, 2.0]  # Gain values to test
-  
-# Optional: Advanced Training Configuration
+# Advanced Training Configuration
 advanced_config:
-  # PyTorch Lightning Trainer Settings
   trainer:
-    precision: "16-mixed"               # Mixed precision training for speed
-    gradient_clip_val: 0.5             # Gradient clipping for stability
-    gradient_clip_algorithm: "norm"    # Gradient clipping algorithm
-    sync_batchnorm: true               # Sync batch norm for multi-GPU
-    deterministic: false               # Allow non-deterministic for speed
-    benchmark: true                    # Enable cuDNN benchmarking
-  
-  # Memory Optimization
-  memory:
-    enable_memory_monitoring: false    # Enable memory monitoring callback
-    memory_threshold_gb: 60.0          # Memory threshold for cache clearing
-    memory_log_frequency: 500          # Frequency of memory logging
-  
-  tracking:
-    mlflow:
-      enabled: false
-      tracking_uri: null
-      experiment_name: seqvae-teb
-      run_name: null
-      artifact_location: null
-      log_model: false
-      log_config_artifact: false
-      tags: {}
+    precision: "16-mixed"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: true
+    deterministic: false
+    benchmark: true
 
-  # Callbacks Configuration
+  memory:
+    enable_memory_monitoring: false    # Set to true if OOM errors occur
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
   callbacks:
     early_stopping:
-      enabled: false                   # Enable early stopping
-      monitor: "val/forecast_loss"     # Metric to monitor (use val/forecast_loss or val/total_loss)
-      patience: 20                     # Epochs to wait for improvement
-      min_delta: 0.0001               # Minimum change to qualify as improvement
-    
+      # ====================================================================
+      # CHANGE FOR EACH STAGE:
+      # - Stage 1: enabled: false (let it train fully)
+      # - Stage 2: enabled: true (prevent overfitting)
+      # ====================================================================
+      enabled: false
+
+      # ====================================================================
+      # CHANGE MONITOR METRIC FOR STAGE 2:
+      # - Stage 1: monitor: "val/total_loss"
+      # - Stage 2: monitor: "val/scattering_nll"
+      # ====================================================================
+      monitor: "val/total_loss"
+      patience: 30
+      min_delta: 0.0001
+
     model_checkpoint:
-      monitor: "val/total_loss"  # Metric to monitor for best model
-      save_top_k: 3                   # Number of best models to keep
-      mode: "min"                     # Minimize the monitored metric
-    
+      # ====================================================================
+      # CHANGE MONITOR METRIC FOR STAGE 2:
+      # - Stage 1: monitor: "val/total_loss"
+      # - Stage 2: monitor: "val/scattering_nll"
+      # ====================================================================
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
     loss_plotting:
-      max_history_size: 1000          # Maximum epochs to keep in plotting history
+      max_history_size: 1000
+
+    reconstruction_plotting:
+      # ====================================================================
+      # OPTIONAL - Adjust for each stage:
+      # - Stage 1: enabled: true (recommended - visualize reconstructions)
+      # - Stage 2: enabled: false (optional - core is frozen anyway)
+      # ====================================================================
+      enabled: true
+      plot_frequency: 10
+      num_examples: 3
+
+# ############################################################################
+# STEP-BY-STEP TRAINING INSTRUCTIONS
+# ############################################################################
+#
+# ============================================================================
+# STAGE 1: Train Core VAE
+# ============================================================================
+#
+# 1. Verify these settings above:
+#    ✓ enable_forecaster: false
+#    ✓ freeze_core_model: false
+#    ✓ scattering_forecast_weight: 0.0
+#    ✓ legacy_seqvae_checkpoint: null
+#    ✓ tag: "stage1_core_vae_training"
+#    ✓ epochs: 500
+#    ✓ out_dir_base: .../stage1_core_training
+#    ✓ monitor: "val/total_loss" (in both early_stopping and model_checkpoint)
+#
+# 2. Run training:
+#    python model/graph_model_train.py
+#
+# 3. Monitor these metrics during training:
+#    - val/total_loss (should decrease)
+#    - val/recon_loss (reconstruction quality)
+#    - val/kld_loss (transfer entropy)
+#    - val/sample_recon_rmse (RMSE on validation samples)
+#
+# 4. After training completes (~500 epochs):
+#    - Find output directory: out_dir_base/[date-time]-stage1_core_vae_training/
+#    - Locate best checkpoint: model_checkpoints/base-model-best-epoch=XXX.ckpt
+#    - Copy the FULL PATH to this checkpoint
+#
+#    Example checkpoint path:
+#    /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training/2025-01-15--[14-30]--stage1_core_vae_training/model_checkpoints/base-model-best-epoch=357.ckpt
+#
+# ============================================================================
+# STAGE 2: Train Scattering Forecaster
+# ============================================================================
+#
+# 5. Update these settings in this config file:
+#
+#    REQUIRED CHANGES:
+#    ✓ enable_forecaster: false → true
+#    ✓ scattering_forecast_weight: 0.0 → 1.0
+#    ✓ legacy_seqvae_checkpoint: null → /path/to/stage1/checkpoint.ckpt
+#    ✓ log_forecast_metrics: false → true
+#    ✓ monitor: "val/total_loss" → "val/scattering_nll" (in both callbacks)
+#
+#    CHOOSE TRAINING MODE:
+#    Option A (Recommended - Freeze Core):
+#      ✓ freeze_core_model: false → true
+#      ✓ epochs: 500 → 200
+#      ✓ tag: "stage1_core_vae_training" → "stage2_forecaster_freeze_core"
+#      ✓ out_dir_base: .../stage1_core_training → .../stage2_forecaster_training
+#
+#    Option B (Advanced - Joint Training):
+#      ✓ freeze_core_model: false (keep as false)
+#      ✓ epochs: 500 → 300-500
+#      ✓ tag: "stage1_core_vae_training" → "stage2_forecaster_joint"
+#      ✓ out_dir_base: .../stage1_core_training → .../stage2_forecaster_training
+#
+#    OPTIONAL CHANGES:
+#    ✓ early_stopping.enabled: false → true
+#    ✓ reconstruction_plotting.enabled: true → false
+#
+# 6. Run training:
+#    python model/graph_model_train.py
+#
+# 7. Monitor these metrics during training:
+#    - val/scattering_nll (main metric - should decrease)
+#    - val/forecast_mse (forecast mean squared error)
+#    - val/forecast_rmse (forecast RMSE)
+#    - val/total_loss (combined loss)
+#
+# 8. After training completes:
+#    - Find best checkpoint: model_checkpoints/base-model-best-epoch=YYY.ckpt
+#    - This checkpoint contains the COMPLETE MODEL (core + forecaster)
+#    - Use this for inference and evaluation
+#
+# ============================================================================
+# VERIFICATION
+# ============================================================================
+#
+# When you start training, check the console output:
+#
+# STAGE 1 should show:
+#   Training Stage: STAGE 1 - Core VAE Only
+#   - Forecaster: DISABLED
+#   - Training: Source Encoder + Target Encoder + Conditional Encoder + Decoder
+#
+# STAGE 2 (Freeze Core) should show:
+#   Training Stage: STAGE 2 - Complete Model with Forecaster
+#   - Forecaster: ENABLED
+#   - Mode: FREEZE CORE - Training forecaster only
+#   - Frozen: Source Encoder + Target Encoder + Conditional Encoder + Decoder
+#   - Training: Scattering Forecaster
+#   Successfully loaded core VAE from legacy checkpoint
+#   Core VAE - Trainable: 0 | Frozen: 2,019,473
+#   Scattering Forecaster - Trainable: 512,387 | Frozen: 0
+#
+# ############################################################################
