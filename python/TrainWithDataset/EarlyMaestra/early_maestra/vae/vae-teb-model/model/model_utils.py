@@ -76,11 +76,8 @@ def ensure_compiled_module(
             passthrough_attrs = (
                 "compute_loss",
                 "encode_only",
-                "forecast",
-                "forecast_full",
-                "aggregate_forecasts_to_canvas",
-                "compute_forecast_loss",
-                "evaluate_forecast_batch",
+                "forecast_scattering",
+                "scattering_forecast_metrics",
                 "measure_transfer_entropy",
             )
             for attr in passthrough_attrs:
