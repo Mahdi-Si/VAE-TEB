@@ -29,6 +29,7 @@ from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 
 from pytorch_lightning_modules import *
+from model.callbacks import LossPlotCallback
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
