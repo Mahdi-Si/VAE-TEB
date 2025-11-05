@@ -609,7 +609,6 @@ class SeqVAEGraphModel:
         )
 
         self.metrics_callback = MetricsLoggingCallback()
-        self.hyperparameter_callback = HyperparameterLoggingCallback()
 
         callbacks_cfg = self.config.get('advanced_config', {}).get('callbacks', {})
         early_cfg = callbacks_cfg.get('early_stopping', {})
@@ -682,16 +681,17 @@ class SeqVAEGraphModel:
             loging_steps = 1
 
         callbacks_list = [
-            ModelSummary(max_depth=-1),
-            self.plotting_callback,
-            self.checkpoint_callback,
-            self.loss_plot_callback,
-            self.hyperparameter_callback,
+            cb
+            for cb in (
+                ModelSummary(max_depth=-1),
+                self.plotting_callback,
+                self.checkpoint_callback,
+                self.loss_plot_callback,
+                self.metrics_callback,
+                self.early_stop_callback,
+            )
+            if cb is not None
         ]
-        if self.metrics_callback is not None:
-            callbacks_list.append(self.metrics_callback)
-        if self.early_stop_callback is not None:
-            callbacks_list.append(self.early_stop_callback)
 
         trainer = L.Trainer(
             devices=devices,
@@ -795,15 +795,6 @@ class SeqVAEGraphModel:
         
         logger.info(f"Training history saved to {path_save_hist}")
         
-        hyperparameter_hist = self.hyperparameter_callback.history
-        path_save_hyperparams = os.path.join(self.train_results_dir, 'hyperparameter_history.pkl')
-        with open(path_save_hyperparams, 'wb') as f:
-            pickle.dump(hyperparameter_hist, f)
-        
-        logger.info(f"Hyperparameter history saved to {path_save_hyperparams}")
-        
-        if trainer.is_global_zero:
-            self.hyperparameter_callback.plot_hyperparameters(self.train_results_dir)
 
         # Final cleanup
         if torch.cuda.is_available():
