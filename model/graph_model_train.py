@@ -206,6 +206,72 @@ class SeqVAEGraphModel:
         self.lightning_base_model = None
         self._skip_compilation = False
 
+    def _validate_config(self) -> None:
+        """Validate configuration for consistency and detect training stage."""
+        vae_cfg = self.config['model_config']['VAE_model']
+
+        # Detect training stage
+        has_legacy_checkpoint = bool(self.legacy_seqvae_checkpoint and os.path.exists(self.legacy_seqvae_checkpoint))
+        has_full_checkpoint = bool(self.base_model_checkpoint and os.path.exists(self.base_model_checkpoint))
+
+        # Stage 1: Training core VAE only
+        stage1_training = not self.enable_forecaster
+        # Stage 2: Training with forecaster
+        stage2_training = self.enable_forecaster
+
+        logger.info("=" * 80)
+        logger.info("CONFIGURATION VALIDATION")
+        logger.info("=" * 80)
+
+        if stage1_training:
+            logger.info("Training Stage: STAGE 1 - Core VAE Only")
+            logger.info("  - Forecaster: DISABLED")
+            logger.info("  - Training: Source Encoder + Target Encoder + Conditional Encoder + Decoder")
+
+            if self.scattering_forecast_weight > 0:
+                logger.warning(f"  - WARNING: scattering_forecast_weight={self.scattering_forecast_weight} but forecaster disabled")
+                logger.warning(f"  - Setting scattering_forecast_weight=0.0")
+                self.scattering_forecast_weight = 0.0
+
+            if self.freeze_core_model:
+                logger.warning("  - WARNING: freeze_core_model=True but no forecaster to train")
+                logger.warning("  - Setting freeze_core_model=False")
+                self.freeze_core_model = False
+
+        elif stage2_training:
+            logger.info("Training Stage: STAGE 2 - Complete Model with Forecaster")
+            logger.info("  - Forecaster: ENABLED")
+
+            if self.freeze_core_model:
+                logger.info("  - Mode: FREEZE CORE - Training forecaster only")
+                logger.info("  - Frozen: Source Encoder + Target Encoder + Conditional Encoder + Decoder")
+                logger.info("  - Training: Scattering Forecaster")
+
+                if not has_legacy_checkpoint and not has_full_checkpoint:
+                    logger.error("ERROR: freeze_core_model=True requires a checkpoint!")
+                    logger.error("  - Set base_model_checkpoint or legacy_seqvae_checkpoint in config")
+                    raise ValueError("Cannot freeze core without a pretrained checkpoint")
+
+            else:
+                logger.info("  - Mode: JOINT TRAINING - Training everything together")
+                logger.info("  - Training: Core VAE + Scattering Forecaster")
+
+            if self.scattering_forecast_weight <= 0:
+                logger.warning(f"  - WARNING: scattering_forecast_weight={self.scattering_forecast_weight}")
+                logger.warning("  - Forecaster enabled but weight is 0! No forecasting loss will be computed.")
+
+        logger.info(f"Checkpoints:")
+        logger.info(f"  - Full checkpoint: {self.base_model_checkpoint if has_full_checkpoint else 'None'}")
+        logger.info(f"  - Legacy checkpoint: {self.legacy_seqvae_checkpoint if has_legacy_checkpoint else 'None'}")
+
+        logger.info(f"Hyperparameters:")
+        logger.info(f"  - enable_forecaster: {self.enable_forecaster}")
+        logger.info(f"  - freeze_core_model: {self.freeze_core_model}")
+        logger.info(f"  - scattering_forecast_weight: {self.scattering_forecast_weight}")
+        logger.info(f"  - horizon_len: {self.model_horizon_len}")
+        logger.info(f"  - beta_schedule: {self.beta_schedule}")
+        logger.info(f"  - beta (const_val): {self.beta_const_val}")
+        logger.info("=" * 80)
 
     def setup_config(self):
         folders_list = [
@@ -359,7 +425,13 @@ class SeqVAEGraphModel:
         )
 
     def _create_fresh_model(self):
-        """Create fresh model instance with config parameters."""
+        """Create fresh model instance with config parameters.
+
+        This method handles three scenarios:
+        1. Stage 1 training from scratch: No checkpoint, forecaster disabled
+        2. Stage 2 training from legacy checkpoint: Load core from Stage 1, initialize forecaster
+        3. Training from scratch with forecaster: No checkpoint, forecaster enabled
+        """
         logger.info("Creating fresh model with config parameters...")
 
         init_kwargs = {
@@ -374,15 +446,41 @@ class SeqVAEGraphModel:
 
         base_model = None
         legacy_ckpt = getattr(self, 'legacy_seqvae_checkpoint', None)
+
+        # STAGE 2 TRAINING: Load core VAE from Stage 1 checkpoint, initialize forecaster
         if legacy_ckpt and os.path.exists(legacy_ckpt):
-            logger.info(f"Initializing SeqVaeTeb from legacy checkpoint: {legacy_ckpt}")
+            logger.info("=" * 80)
+            logger.info("STAGE 2 TRAINING: Loading core VAE from Stage 1 checkpoint")
+            logger.info(f"Legacy checkpoint: {legacy_ckpt}")
+            logger.info(f"Forecaster enabled: {self.enable_forecaster}")
+
+            if self.enable_forecaster:
+                logger.info("Initializing NEW forecaster (will be trained from scratch)")
+            else:
+                logger.warning("WARNING: Loading legacy checkpoint but forecaster is disabled!")
+                logger.warning("This is unusual - typically Stage 2 should have enable_forecaster=true")
+
             base_model = SeqVaeTeb.from_legacy_checkpoint(
                 legacy_ckpt,
                 strict=False,
                 init_kwargs=init_kwargs,
             )
+            logger.info("Successfully loaded core VAE from legacy checkpoint")
+            logger.info("=" * 80)
 
+        # STAGE 1 TRAINING or STAGE 2 from scratch
         if base_model is None:
+            if self.enable_forecaster:
+                logger.info("=" * 80)
+                logger.info("TRAINING FROM SCRATCH: Core VAE + Forecaster")
+                logger.info("Both core and forecaster will be initialized randomly")
+                logger.info("=" * 80)
+            else:
+                logger.info("=" * 80)
+                logger.info("STAGE 1 TRAINING FROM SCRATCH: Core VAE only")
+                logger.info("Training core VAE without forecaster")
+                logger.info("=" * 80)
+
             base_model = SeqVaeTeb(**init_kwargs)
 
         self.base_model = base_model
@@ -558,6 +656,7 @@ class SeqVAEGraphModel:
     def create_model(self):
         """Create model ensuring config parameters take precedence over any checkpoint values."""
         self.setup_config()
+        self._validate_config()  # Validate configuration before loading checkpoint
         self.load_checkpoint()
         if self.pytorch_model is not None:
             logger.info("Model created successfully with enforced config parameters")
