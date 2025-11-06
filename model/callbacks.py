@@ -566,13 +566,17 @@ class ScatteringForecastVisualizationCallback(Callback):
 class ReconstructionPlotCallback(Callback):
     """Plots reconstructions from the validation set every few epochs."""
 
-    def __init__(self, output_dir: Path | str, plot_frequency: int = 5, num_examples: int = 3, *, mlflow_logger: "MLFlowLogger" | None = None) -> None:
+    def __init__(self, output_dir: Path | str, plot_frequency: int = 5, num_examples: int = 3, *, file_format: str = 'pdf', mlflow_logger: "MLFlowLogger" | None = None) -> None:
         super().__init__()
         self._mlflow_logger = mlflow_logger
-        self.output_dir = Path(output_dir) / "reconstructions"
+        self.output_dir = Path(output_dir) / 'reconstructions'
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plot_frequency = max(1, int(plot_frequency))
         self.num_examples = max(1, int(num_examples))
+        self.file_format = file_format.lower()
+        if self.file_format not in {'png', 'pdf'}:
+            logger.warning(f"Unsupported file_format '{file_format}', defaulting to 'pdf'")
+            self.file_format = 'pdf'
 
     def _log_artifact(self, path: Path) -> None:
         if getattr(self, "_mlflow_logger", None) is None:
@@ -641,7 +645,7 @@ class ReconstructionPlotCallback(Callback):
         axes[-1].set_xlabel("Time index")
         axes[0].legend(loc="upper right", frameon=False)
         fig.tight_layout()
-        save_path = self.output_dir / f"reconstruction_epoch_{epoch:04d}.png"
+        save_path = self.output_dir / f"reconstruction_epoch_{epoch:04d}.{self.file_format}"
         fig.savefig(save_path, dpi=150)
         logger.info(f"Saved reconstruction plot to {save_path}")
         plt.close(fig)
