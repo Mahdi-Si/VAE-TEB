@@ -32,6 +32,7 @@ from model.callbacks import (
     LossPlotCallback,
     ScatteringForecastMetricsCallback,
     ScatteringForecastVisualizationCallback,
+    ReconstructionPlotCallback,
     MetricsLoggingCallback,
 )
 from pytorch_lightning_modules import LightSeqVaeTeb
@@ -717,11 +718,21 @@ class SeqVAEGraphModel:
                 plot_every_epoch=self.plot_every_epoch,
             )
 
-        self.metrics_callback = MetricsLoggingCallback()
-
         callbacks_cfg = self.config.get('advanced_config', {}).get('callbacks', {})
         early_cfg = callbacks_cfg.get('early_stopping', {})
         ckpt_cfg = callbacks_cfg.get('model_checkpoint', {})
+        recon_cfg = callbacks_cfg.get('reconstruction', {})
+
+        self.metrics_callback = MetricsLoggingCallback()
+        self.reconstruction_callback = None
+        if recon_cfg.get('enabled', self.enable_forecaster):
+            self.reconstruction_callback = ReconstructionPlotCallback(
+                output_dir=self.train_results_dir,
+                plot_frequency=recon_cfg.get('plot_frequency', self.plot_every_epoch),
+                num_examples=recon_cfg.get('num_examples', 3),
+                file_format=recon_cfg.get('file_format', 'pdf'),
+            )
+
 
         monitor_metric = ckpt_cfg.get('monitor', self.monitor_metric)
         monitor_mode = ckpt_cfg.get('mode', self.monitor_mode)
@@ -797,6 +808,7 @@ class SeqVAEGraphModel:
                 self.forecast_viz_callback,
                 self.checkpoint_callback,
                 self.loss_plot_callback,
+                self.reconstruction_callback,
                 self.metrics_callback,
                 self.early_stop_callback,
             )
