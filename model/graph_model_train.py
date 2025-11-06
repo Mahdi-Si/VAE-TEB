@@ -31,7 +31,7 @@ from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 from model.callbacks import (
     LossPlotCallback,
     ScatteringForecastMetricsCallback,
-    ScatteringForecastVisualizationCallback,
+    ComprehensiveForecastPlotCallback,
     ReconstructionPlotCallback,
     MetricsLoggingCallback,
 )
@@ -711,17 +711,22 @@ class SeqVAEGraphModel:
         self.forecast_metrics_callback = ScatteringForecastMetricsCallback(
             log_every_n_epochs=self.plot_every_epoch,
         )
-        self.forecast_viz_callback = None
-        if self.enable_forecaster:
-            self.forecast_viz_callback = ScatteringForecastVisualizationCallback(
-                output_dir=self.train_results_dir,
-                plot_every_epoch=self.plot_every_epoch,
-            )
 
         callbacks_cfg = self.config.get('advanced_config', {}).get('callbacks', {})
         early_cfg = callbacks_cfg.get('early_stopping', {})
         ckpt_cfg = callbacks_cfg.get('model_checkpoint', {})
         recon_cfg = callbacks_cfg.get('reconstruction', {})
+        viz_cfg = callbacks_cfg.get('forecast_visualization', {})
+
+        self.comprehensive_plot_callback = None
+        if viz_cfg.get('enabled', self.enable_forecaster):
+            self.comprehensive_plot_callback = ComprehensiveForecastPlotCallback(
+                output_dir=self.train_results_dir,
+                plot_every_epoch=viz_cfg.get('plot_frequency', self.plot_every_epoch),
+                predictive_horizon=self.predictive_horizon,
+                num_examples=viz_cfg.get('num_examples', 1),
+                max_anchors=viz_cfg.get('max_anchors', 3),
+            )
 
         self.metrics_callback = MetricsLoggingCallback()
         self.reconstruction_callback = None
@@ -732,7 +737,6 @@ class SeqVAEGraphModel:
                 num_examples=recon_cfg.get('num_examples', 3),
                 file_format=recon_cfg.get('file_format', 'pdf'),
             )
-
 
         monitor_metric = ckpt_cfg.get('monitor', self.monitor_metric)
         monitor_mode = ckpt_cfg.get('mode', self.monitor_mode)
@@ -805,10 +809,10 @@ class SeqVAEGraphModel:
             for cb in (
                 ModelSummary(max_depth=-1),
                 self.forecast_metrics_callback,
-                self.forecast_viz_callback,
+                self.comprehensive_plot_callback,
+                self.reconstruction_callback,
                 self.checkpoint_callback,
                 self.loss_plot_callback,
-                self.reconstruction_callback,
                 self.metrics_callback,
                 self.early_stop_callback,
             )
