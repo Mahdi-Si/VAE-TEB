@@ -1221,6 +1221,7 @@ class SeqVaeCore(nn.Module):
             )
         return kld
 
+    @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
