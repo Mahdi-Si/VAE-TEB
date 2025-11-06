@@ -596,55 +596,76 @@ class PlottingCallBack(Callback):
                     has_forecaster = orig_model.has_forecaster()
 
                 if has_forecaster:
-                    # Generate forecasts
-                    if hasattr(orig_model, 'forecast_scattering'):
-                        forecast_out = orig_model.forecast_scattering(
-                            y_st=y_st, y_ph=y_ph, x_ph=x_ph, timesteps=None, use_posterior_mean=True
+                    # Generate forecasts using the forecast() method (returns latent predictions)
+                    try:
+                        forecast_out = orig_model.forecast(
+                            y_st, y_ph, x_ph, anchors=None, use_posterior_mean=True
                         )
-                    else:
-                        logger.warning("Model has forecaster but no forecast_scattering method")
-                        forecast_out = None
 
-                    if forecast_out is not None:
-                        mu_future = forecast_out.get("mu_future")
-                        logvar_future = forecast_out.get("logvar_future")
-                        timesteps = forecast_out.get("timesteps")
+                        anchors = forecast_out.get("anchors")
+                        mu_future = forecast_out.get("mu_future")          # Predicted scattering coefficients (B,N,480)
+                        logvar_future = forecast_out.get("logvar_future")  # Uncertainty in scattering predictions
+                        z_future = forecast_out.get("z_future")            # Predicted latent trajectories
+                        latent_logvar_future = forecast_out.get("latent_logvar_future")
+                        enc = forecast_out.get("enc")
 
-                        # Plot forecast visualizations
-                        if mu_future is not None and timesteps is not None:
-                            # Aggregate forecasts to canvas for visualization
-                            if hasattr(orig_model, 'aggregate_scattering_forecasts'):
-                                canvas_mu, mean_mu = orig_model.aggregate_scattering_forecasts(
-                                    mu_future, timesteps, total_len=y_raw_normalized.shape[1]
-                                )
-                                var_future = logvar_future.exp() if logvar_future is not None else None
-                                if var_future is not None:
-                                    _, mean_var = orig_model.aggregate_scattering_forecasts(
-                                        var_future, timesteps, total_len=y_raw_normalized.shape[1]
-                                    )
-                                    std_mu = mean_var.clamp_min(1e-8).sqrt()
-                                else:
-                                    std_mu = torch.zeros_like(mean_mu)
+                        # Aggregate forecasts to raw signal canvas
+                        canvas_mu, mean_mu = orig_model.aggregate_forecasts_to_canvas(
+                            mu_future, anchors, total_len=y_raw_normalized.shape[1], stride=orig_model.decimation_factor
+                        )
 
-                                self._plot_forecast_results_scattering(
-                                    y_raw_normalized,
-                                    mean_mu,
-                                    std_mu,
-                                    canvas_mu,
-                                    timesteps,
-                                    mu_post_full,
-                                    trainer.current_epoch
-                                )
+                        var_future = logvar_future.exp()
+                        _, mean_var = orig_model.aggregate_forecasts_to_canvas(
+                            var_future, anchors, total_len=y_raw_normalized.shape[1], stride=orig_model.decimation_factor
+                        )
+                        std_mu = mean_var.clamp_min(1e-8).sqrt()
 
-                                try:
-                                    self._plot_batch_aggregated_forecast(
-                                        y_raw_batch=y_raw_normalized,
-                                        mean_mu_batch=mean_mu,
-                                        std_mu_batch=std_mu,
-                                        epoch=trainer.current_epoch,
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"Failed to plot batch aggregated forecast: {e}")
+                        # Plot latent forecast diagnostics (prediction accuracy in scattering domain)
+                        self._plot_latent_forecast_samples(
+                            mu_post_sequence=enc.get("mu_post"),
+                            z_future=z_future,
+                            latent_logvar_future=latent_logvar_future,
+                            anchors=anchors,
+                            epoch=trainer.current_epoch,
+                        )
+
+                        self._plot_channel_forecasts(
+                            mu_post_sequence=enc.get("mu_post"),
+                            z_future=z_future,
+                            latent_logvar_future=latent_logvar_future,
+                            anchors=anchors,
+                            epoch=trainer.current_epoch,
+                        )
+
+                        self._plot_latent_trajectory_analysis(
+                            mu_post_sequence=enc.get("mu_post"),
+                            mu_prior_sequence=enc.get("mu_prior"),
+                            epoch=trainer.current_epoch,
+                        )
+
+                        # Plot reconstructed raw signal from predictions
+                        self._plot_forecast_results_scattering(
+                            y_raw_normalized,
+                            mean_mu,
+                            std_mu,
+                            canvas_mu,
+                            anchors,
+                            enc.get('mu_post'),
+                            trainer.current_epoch
+                        )
+
+                        try:
+                            self._plot_batch_aggregated_forecast(
+                                y_raw_batch=y_raw_normalized,
+                                mean_mu_batch=mean_mu,
+                                std_mu_batch=std_mu,
+                                epoch=trainer.current_epoch,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to plot batch aggregated forecast: {e}")
+
+                    except Exception as e:
+                        logger.warning(f"Failed to generate forecasts for plotting: {e}")
 
                 # Always plot latent statistics
                 self._plot_latent_statistics(
@@ -1097,3 +1118,364 @@ class PlottingCallBack(Callback):
         plt.close(fig)
         gc.collect()
         logger.info(f"Batch-aggregated forecast plot saved to {save_path}")
+    def _plot_latent_forecast_samples(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        z_future: Optional[torch.Tensor],
+        latent_logvar_future: Optional[torch.Tensor],
+        anchors: Optional[torch.Tensor],
+        epoch: int,
+    ):
+        """Visualize forecasted latent trajectories against ground truth for spaced anchors."""
+        import gc
+
+        if mu_post_sequence is None or z_future is None or anchors is None or anchors.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+            z_future_np = z_future[batch_idx].detach().cpu().numpy()
+            anchors_np = anchors.detach().cpu().numpy().astype(int)
+            latent_std_np = None
+            if latent_logvar_future is not None:
+                latent_std_np = np.sqrt(
+                    np.exp(latent_logvar_future[batch_idx].detach().cpu().numpy())
+                )
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2 or z_future_np.ndim != 3:
+            return
+
+        horizon = z_future_np.shape[1]
+        step = 30
+        selected = []
+        last_anchor = -step
+        for idx, anchor in enumerate(anchors_np):
+            if anchor - last_anchor >= step and anchor + 1 + horizon <= mu_post_np.shape[0]:
+                selected.append((idx, anchor))
+                last_anchor = anchor
+            if len(selected) >= 4:
+                break
+
+        if not selected:
+            for idx, anchor in enumerate(anchors_np[:4]):
+                if anchor + 1 + horizon <= mu_post_np.shape[0]:
+                    selected.append((idx, anchor))
+
+        if not selected:
+            return
+
+        global_max = 1e-6
+        valid_segments = []
+        for idx, anchor in selected:
+            start = anchor + 1
+            end = start + horizon
+            gt = mu_post_np[start:end]
+            if gt.shape[0] != horizon:
+                continue
+            pred = z_future_np[idx]
+            global_max = max(global_max, np.abs(gt).max(), np.abs(pred).max())
+            std_seg = latent_std_np[idx] if latent_std_np is not None else None
+            valid_segments.append((idx, anchor, gt, pred, std_seg))
+
+        if not valid_segments:
+            return
+
+        n_rows = len(valid_segments)
+        fig, axes = plt.subplots(
+            n_rows, 4, figsize=(22, n_rows * 3.2),
+            gridspec_kw={'width_ratios': [1, 1, 1, 1.3]},
+            constrained_layout=True,
+        )
+        if n_rows == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for row, (idx, anchor, gt, pred, std_segment) in enumerate(valid_segments):
+            err = pred - gt
+
+            im0 = axes[row, 0].imshow(gt.T, aspect='auto', origin='lower', cmap='RdBu_r', vmin=-global_max, vmax=global_max)
+            axes[row, 0].set_title(f'Ground truth mu_post | anchor={anchor}')
+            axes[row, 0].set_ylabel('Latent dim')
+            axes[row, 0].set_xlabel('Forecast step')
+
+            im1 = axes[row, 1].imshow(pred.T, aspect='auto', origin='lower', cmap='RdBu_r', vmin=-global_max, vmax=global_max)
+            axes[row, 1].set_title('Forecast mu_future')
+            axes[row, 1].set_xlabel('Forecast step')
+
+            abs_err = np.abs(err)
+            im2 = axes[row, 2].imshow(abs_err.T, aspect='auto', origin='lower', cmap='magma')
+            axes[row, 2].set_title('Absolute error')
+            axes[row, 2].set_xlabel('Forecast step')
+
+            for c in range(3):
+                axes[row, c].grid(False)
+
+            if abs_err.size > 0:
+                per_channel_energy = abs_err.sum(axis=0)
+                best_channel = int(np.argmax(per_channel_energy))
+            else:
+                best_channel = 0
+            time_axis = np.arange(horizon)
+            axes[row, 3].plot(time_axis, gt[:, best_channel], color='#2E86AB', linewidth=1.4, label='GT')
+            axes[row, 3].plot(time_axis, pred[:, best_channel], color='#BB3E00', linewidth=1.2, linestyle='--', label='Forecast')
+            if std_segment is not None and best_channel < std_segment.shape[1]:
+                std_vec = std_segment[:, best_channel]
+                upper = pred[:, best_channel] + 1.96 * std_vec
+                lower = pred[:, best_channel] - 1.96 * std_vec
+                axes[row, 3].fill_between(
+                    time_axis,
+                    lower,
+                    upper,
+                    color='#BB3E00',
+                    alpha=0.18,
+                    label='Forecast +/- 1.96 std' if row == 0 else None,
+                )
+            axes[row, 3].fill_between(
+                time_axis,
+                gt[:, best_channel],
+                pred[:, best_channel],
+                color='#F5B7B1',
+                alpha=0.3,
+            )
+            axes[row, 3].set_title(f'Latent dim {best_channel} trajectory')
+            axes[row, 3].set_xlabel('Forecast step')
+            axes[row, 3].set_ylabel('Activation')
+            axes[row, 3].grid(True, alpha=0.3)
+            axes[row, 3].legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+            if row == 0:
+                fig.colorbar(im0, ax=axes[row, 0], fraction=0.046, pad=0.04)
+                fig.colorbar(im2, ax=axes[row, 2], fraction=0.046, pad=0.04)
+
+        save_path = self.output_dir / f'latent_forecast_samples_epoch_{epoch}.pdf'
+        fig.suptitle(f'Latent Forecast Diagnostics - Epoch {epoch}', fontsize=14, color='#456882')
+        plt.savefig(str(save_path), bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Latent forecast comparison saved to {save_path}")
+
+    def _plot_channel_forecasts(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        z_future: Optional[torch.Tensor],
+        latent_logvar_future: Optional[torch.Tensor],
+        anchors: Optional[torch.Tensor],
+        epoch: int,
+    ) -> None:
+        """Plot per-dimension latent trajectories for specific anchors (75 and 224)."""
+        import gc
+
+        if mu_post_sequence is None or z_future is None or anchors is None or anchors.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+            z_future_np = z_future[batch_idx].detach().cpu().numpy()
+            anchors_np = anchors.detach().cpu().numpy().astype(int)
+            std_future_np = None
+            if latent_logvar_future is not None:
+                std_future_np = np.sqrt(
+                    np.exp(latent_logvar_future[batch_idx].detach().cpu().numpy())
+                )
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2 or z_future_np.ndim != 3:
+            return
+
+        horizon = z_future_np.shape[1]
+        latent_dim = z_future_np.shape[2]
+        desired_anchors = [75, 224]
+        anchor_pairs = []
+        for anchor_val in desired_anchors:
+            if anchor_val in anchors_np:
+                idx_anchor = int(np.where(anchors_np == anchor_val)[0][0])
+                start = anchor_val + 1
+                end = start + horizon
+                if end <= mu_post_np.shape[0]:
+                    std_slice = std_future_np[idx_anchor] if std_future_np is not None else None
+                    anchor_pairs.append((anchor_val, mu_post_np[start:end], z_future_np[idx_anchor], std_slice))
+
+        if len(anchor_pairs) != len(desired_anchors):
+            return
+
+        fig, axes = plt.subplots(
+            latent_dim,
+            len(anchor_pairs),
+            figsize=(len(anchor_pairs) * 5.5, latent_dim * 1.6),
+            sharex=True,
+            constrained_layout=True,
+        )
+        if latent_dim == 1:
+            axes = axes.reshape(1, -1)
+
+        time_axis = np.arange(horizon)
+        colors = {
+            'gt': '#2E86AB',
+            'pred': '#BB3E00',
+        }
+
+        for col, (anchor_val, gt, pred, std_block) in enumerate(anchor_pairs):
+            for row in range(latent_dim):
+                ax = axes[row, col]
+                ax.plot(time_axis, gt[:, row], color=colors['gt'], linewidth=1.2, label='GT')
+                ax.plot(time_axis, pred[:, row], color=colors['pred'], linewidth=1.0, linestyle='--', label='Forecast')
+                if std_block is not None:
+                    std_vec = std_block[:, row]
+                    upper = pred[:, row] + 1.96 * std_vec
+                    lower = pred[:, row] - 1.96 * std_vec
+                    ax.fill_between(
+                        time_axis,
+                        lower,
+                        upper,
+                        color=colors['pred'],
+                        alpha=0.18,
+                        label='Forecast +/- 1.96 std' if (row == 0 and col == 0) else None,
+                    )
+                ax.grid(True, alpha=0.3)
+                if row == 0:
+                    ax.set_title(f'Anchor {anchor_val}')
+                if col == 0:
+                    ax.set_ylabel(f'Latent {row}')
+                if row == latent_dim - 1:
+                    ax.set_xlabel('Forecast step')
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc='upper center', ncol=2)
+
+        save_path = self.output_dir / f'latent_forecast_channels_epoch_{epoch}.pdf'
+        fig.suptitle(f'Per-channel Latent Forecasts - Epoch {epoch}', fontsize=14, color='#456882')
+        plt.savefig(str(save_path), bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f"Latent forecast per-channel plot saved to {save_path}")
+
+    def _plot_latent_trajectory_analysis(
+        self,
+        mu_post_sequence: Optional[torch.Tensor],
+        mu_prior_sequence: Optional[torch.Tensor],
+        epoch: int,
+    ) -> None:
+        """Comprehensive latent trajectory diagnostics for a single validation sample."""
+        import gc
+
+        if mu_post_sequence is None or mu_post_sequence.numel() == 0:
+            return
+
+        batch_idx = 0
+        try:
+            mu_post_np = mu_post_sequence[batch_idx].detach().cpu().numpy()
+        except Exception:
+            return
+
+        if mu_post_np.ndim != 2:
+            return
+
+        prior_np = None
+        if mu_prior_sequence is not None:
+            try:
+                prior_np = mu_prior_sequence[batch_idx].detach().cpu().numpy()
+                if prior_np.ndim != 2 or prior_np.shape != mu_post_np.shape:
+                    prior_np = None
+            except Exception:
+                prior_np = None
+
+        time_axis = np.arange(mu_post_np.shape[0])
+        latent_dim = mu_post_np.shape[1]
+        if latent_dim == 0:
+            return
+
+        if prior_np is not None:
+            delta_np = mu_post_np - prior_np
+            ranking_signal = delta_np.var(axis=0)
+        else:
+            delta_np = None
+            ranking_signal = mu_post_np.var(axis=0)
+        order = np.argsort(ranking_signal)[::-1]
+        top_k = int(min(latent_dim, 8))
+        total_rows = top_k + 1
+
+        fig, axes = plt.subplots(
+            total_rows,
+            2,
+            figsize=(12, 2.2 * total_rows),
+            constrained_layout=True,
+        )
+        axes = np.asarray(axes)
+
+        colors = {'posterior': '#1f77b4', 'prior': '#ff7f0e', 'delta': '#2ca02c'}
+        legend_handles = []
+        legend_labels = []
+
+        for row, dim in enumerate(order[:top_k]):
+            ax_left = axes[row, 0]
+            line_post, = ax_left.plot(time_axis, mu_post_np[:, dim], color=colors['posterior'], linewidth=1.2, label='mu_post')
+            if 'mu_post' not in legend_labels:
+                legend_handles.append(line_post)
+                legend_labels.append('mu_post')
+            if prior_np is not None:
+                line_prior, = ax_left.plot(time_axis, prior_np[:, dim], color=colors['prior'], linewidth=1.0, linestyle='--', label='mu_prior')
+                if 'mu_prior' not in legend_labels:
+                    legend_handles.append(line_prior)
+                    legend_labels.append('mu_prior')
+            ax_left.grid(True, alpha=0.3)
+            if row == 0:
+                ax_left.set_title('Latent trajectory')
+            if row == top_k - 1:
+                ax_left.set_xlabel('Decimated step')
+            ax_left.set_ylabel(f'z[{dim}]')
+
+            ax_right = axes[row, 1]
+            if delta_np is not None:
+                line_delta, = ax_right.plot(time_axis, delta_np[:, dim], color=colors['delta'], linewidth=1.2, label='delta')
+                if row == 0:
+                    ax_right.set_title('Delta (mu_post - mu_prior)')
+            else:
+                centered = mu_post_np[:, dim] - mu_post_np[:, dim].mean()
+                line_delta, = ax_right.plot(time_axis, centered, color=colors['delta'], linewidth=1.2, label='delta')
+                if row == 0:
+                    ax_right.set_title('Centered trajectory')
+            if 'delta' not in legend_labels:
+                legend_handles.append(line_delta)
+                legend_labels.append('delta')
+            ax_right.grid(True, alpha=0.3)
+            if row == top_k - 1:
+                ax_right.set_xlabel('Decimated step')
+
+        energy = np.sum(mu_post_np ** 2, axis=0)
+        summary_ax = axes[top_k, 0]
+        summary_ax.bar(np.arange(latent_dim), energy, color='#345995')
+        summary_ax.set_title('Posterior energy per latent')
+        summary_ax.set_xlabel('Latent dim')
+        summary_ax.set_ylabel('Energy')
+        summary_ax.grid(True, axis='y', alpha=0.3)
+
+        heat_ax = axes[top_k, 1]
+        heat_data = mu_post_np[:, order[:top_k]].T
+        im = heat_ax.imshow(heat_data, aspect='auto', origin='lower', cmap='RdBu_r')
+        heat_ax.set_title('Posterior heatmap (top dims)')
+        heat_ax.set_xlabel('Decimated step')
+        heat_ax.set_yticks(range(top_k))
+        heat_ax.set_yticklabels([f'z[{dim}]' for dim in order[:top_k]])
+        fig.colorbar(im, ax=heat_ax, fraction=0.046, pad=0.04, label='Activation')
+
+        if legend_handles:
+            fig.legend(legend_handles, legend_labels, loc='upper center', ncol=len(legend_handles))
+
+        overall_energy = float(np.linalg.norm(mu_post_np))
+        if delta_np is not None:
+            delta_energy = float(np.linalg.norm(delta_np))
+            stats_text = f'||mu_post||_2={overall_energy:.2f}  |  ||delta||_2={delta_energy:.2f}'
+        else:
+            stats_text = f'||mu_post||_2={overall_energy:.2f}'
+
+        save_path = self.output_dir / f'latent_trajectory_analysis_epoch_{epoch}.pdf'
+        fig.suptitle(f'Latent Trajectory Analysis - Epoch {epoch}\n{stats_text}', fontsize=14, color='#456882')
+        plt.savefig(str(save_path), bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        gc.collect()
+        logger.info(f'Latent trajectory analysis plot saved to {save_path}')
