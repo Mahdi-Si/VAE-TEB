@@ -430,6 +430,139 @@ class MemoryMonitorCallback(Callback):
             torch.cuda.empty_cache()
 
 
+
+
+class ScatteringForecastVisualizationCallback(Callback):
+    """Log qualitative plots for scattering forecasts and raw reconstructions."""
+
+    def __init__(self, output_dir: Path | str, plot_every_epoch: int = 5, *, num_examples: int = 2, max_anchors: int = 2) -> None:
+        super().__init__()
+        self.output_dir = Path(output_dir) / 'forecast_visualizations'
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.plot_every_epoch = max(1, int(plot_every_epoch))
+        self.num_examples = max(1, int(num_examples))
+        self.max_anchors = max(1, int(max_anchors))
+
+    @staticmethod
+    def _first_batch(trainer):
+        if hasattr(trainer, 'datamodule') and trainer.datamodule is not None:
+            dataloader = trainer.datamodule.val_dataloader()
+            if isinstance(dataloader, list):
+                dataloader = dataloader[0]
+        else:
+            dataloader = trainer.val_dataloaders
+            if isinstance(dataloader, list):
+                dataloader = dataloader[0]
+        try:
+            return next(iter(dataloader))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Forecast viz callback could not fetch batch: {exc}")
+            return None
+
+    @staticmethod
+    def _select_indices(total: int, count: int) -> list[int]:
+        if total <= count:
+            return list(range(total))
+        step = max(1, total // count)
+        return [idx for idx in range(0, total, step)][:count]
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
+        epoch = trainer.current_epoch
+        if not trainer.is_global_zero or (epoch + 1) % self.plot_every_epoch != 0:
+            return
+        batch = self._first_batch(trainer)
+        if batch is None:
+            return
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
+        model = pl_module.model
+        orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        with torch.no_grad():
+            forward_out = orig_model(batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph)
+        mu_pr = forward_out.get('mu_pr')
+        if mu_pr is not None:
+            self._plot_raw_recon(epoch, batch.fhr, mu_pr)
+        if not getattr(orig_model, 'has_forecaster', lambda: False)():
+            return
+        with torch.no_grad():
+            forecast = orig_model.forecast_scattering(
+                y_st=batch.fhr_st,
+                y_ph=batch.fhr_ph,
+                x_ph=batch.fhr_up_ph,
+                timesteps=None,
+                use_posterior_mean=True,
+            )
+        mu_future = forecast.get('mu_future')
+        timesteps = forecast.get('timesteps')
+        if mu_future is None or timesteps is None or timesteps.numel() == 0:
+            logger.warning('Forecast viz callback found no valid scattering predictions.')
+            return
+        target_stph = torch.cat([batch.fhr_st, batch.fhr_ph], dim=-1)
+        self._plot_scattering(epoch, mu_future, timesteps, target_stph)
+
+    def _plot_raw_recon(self, epoch: int, y_raw: torch.Tensor, mu_pr: torch.Tensor) -> None:
+        import matplotlib.pyplot as plt
+        gt = y_raw.detach().cpu()
+        pred = mu_pr.detach().cpu()
+        if gt.dim() == 3 and gt.size(-1) == 1:
+            gt = gt[..., 0]
+        if pred.dim() == 3 and pred.size(-1) == 1:
+            pred = pred[..., 0]
+        sample_indices = self._select_indices(gt.size(0), self.num_examples)
+        fig, axes = plt.subplots(len(sample_indices), 1, figsize=(12, 3 * len(sample_indices)), sharex=True)
+        if len(sample_indices) == 1:
+            axes = [axes]
+        time_axis = torch.arange(gt.size(-1), dtype=torch.float32) / 4.0
+        for axis, s_idx in zip(axes, sample_indices):
+            axis.plot(time_axis, gt[s_idx].numpy(), label='raw', linewidth=1.2)
+            axis.plot(time_axis, pred[s_idx].numpy(), label='recon', linewidth=1.0)
+            axis.set_title(f'Raw reconstruction | sample {s_idx}')
+            axis.set_ylabel('FHR (bpm)')
+            axis.legend(loc='upper right', frameon=False)
+            axis.grid(alpha=0.3)
+        axes[-1].set_xlabel('Time (s)')
+        fig.tight_layout()
+        save_path = self.output_dir / f'reconstruction_epoch_{epoch:04d}.png'
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        logger.info(f'Saved raw reconstruction plot to {save_path}')
+
+    def _plot_scattering(self, epoch: int, mu_future: torch.Tensor, timesteps: torch.Tensor, target_stph: torch.Tensor) -> None:
+        import matplotlib.pyplot as plt
+        B, _, horizon, _ = mu_future.shape
+        sample_indices = self._select_indices(B, self.num_examples)
+        anchor_indices = self._select_indices(timesteps.numel(), self.max_anchors)
+        for sample_idx in sample_indices:
+            fig, axes = plt.subplots(len(anchor_indices), 2, figsize=(12, 4 * len(anchor_indices)))
+            if len(anchor_indices) == 1:
+                axes = [axes]
+            for row_axes, anchor_pos in zip(axes, anchor_indices):
+                anchor = int(timesteps[anchor_pos].item())
+                pred_slice = mu_future[sample_idx, anchor_pos].detach().cpu()
+                slices = []
+                for offset in range(pred_slice.size(0)):
+                    step_idx = anchor + 1 + offset
+                    if step_idx >= target_stph.size(1):
+                        break
+                    slices.append(target_stph[sample_idx, step_idx].detach().cpu())
+                if not slices:
+                    continue
+                target_slice = torch.stack(slices, dim=0)
+                self._imshow(row_axes[0], target_slice, f'Target | anchor {anchor}')
+                self._imshow(row_axes[1], pred_slice, f'Predicted | anchor {anchor}')
+            fig.suptitle(f'Scattering forecast | sample {sample_idx}')
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            save_path = self.output_dir / f'scattering_epoch_{epoch:04d}_sample_{sample_idx}.png'
+            fig.savefig(save_path, dpi=150)
+            plt.close(fig)
+            logger.info(f'Saved scattering forecast plot to {save_path}')
+
+    @staticmethod
+    def _imshow(axis, data: torch.Tensor, title: str) -> None:
+        axis.imshow(data.numpy().T, aspect='auto', origin='lower', cmap='viridis')
+        axis.set_title(title)
+        axis.set_ylabel('Channel')
+        axis.set_xlabel('Horizon step')
+
 class ReconstructionPlotCallback(Callback):
     """Plots reconstructions from the validation set every few epochs."""
 
