@@ -226,9 +226,25 @@ advanced_config:
       # - Stage 1: enabled: true (recommended - visualize reconstructions)
       # - Stage 2: enabled: false (optional - core is frozen anyway)
       # ====================================================================
-      enabled: true
+      enabled: false
       plot_frequency: 10
       num_examples: 3
+
+    comprehensive_plotting:
+      # ====================================================================
+      # COMPREHENSIVE VISUALIZATIONS (same style as your previous callbacks):
+      # Generates detailed PDF plots including:
+      # - Reconstruction overview (FHR/UP signals, ground truth vs recon, latents)
+      # - Latent statistics (norms, correlations, energy)
+      # - Forecast results (when forecaster is enabled)
+      # - Batch-aggregated forecasts
+      #
+      # Recommended settings:
+      # - Stage 1: enabled: true, plot_frequency: 10
+      # - Stage 2: enabled: true, plot_frequency: 5
+      # ====================================================================
+      enabled: true
+      plot_frequency: 10
 
 # ############################################################################
 # STEP-BY-STEP TRAINING INSTRUCTIONS

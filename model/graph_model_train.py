@@ -35,6 +35,7 @@ from model.callbacks import (
     MetricsLoggingCallback,
     MemoryMonitorCallback,
     ReconstructionPlotCallback,
+    PlottingCallBack,
 )
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
@@ -769,7 +770,7 @@ class SeqVAEGraphModel:
             max_history_size=19900
         )
 
-        # Optional: Reconstruction plotting callback
+        # Optional: Reconstruction plotting callback (simple version)
         reconstruction_cfg = callbacks_cfg.get('reconstruction_plotting', {})
         self.reconstruction_callback = None
         if reconstruction_cfg.get('enabled', False):
@@ -779,6 +780,17 @@ class SeqVAEGraphModel:
                 num_examples=reconstruction_cfg.get('num_examples', 3),
             )
             logger.info(f"Reconstruction plotting enabled: {reconstruction_cfg.get('num_examples', 3)} examples every {reconstruction_cfg.get('plot_frequency', self.plot_every_epoch)} epochs")
+
+        # Optional: Comprehensive plotting callback (detailed visualizations)
+        comprehensive_plotting_cfg = callbacks_cfg.get('comprehensive_plotting', {})
+        self.comprehensive_plotting_callback = None
+        if comprehensive_plotting_cfg.get('enabled', True):  # Enabled by default
+            self.comprehensive_plotting_callback = PlottingCallBack(
+                output_dir=self.train_results_dir,
+                plot_every_epoch=comprehensive_plotting_cfg.get('plot_frequency', self.plot_every_epoch),
+                predictive_horizon=self.predictive_horizon,
+            )
+            logger.info(f"Comprehensive plotting enabled: detailed visualizations every {comprehensive_plotting_cfg.get('plot_frequency', self.plot_every_epoch)} epochs")
 
         # Optional: Memory monitoring callback
         memory_cfg = self.config.get('advanced_config', {}).get('memory', {})
@@ -816,8 +828,9 @@ class SeqVAEGraphModel:
                 self.loss_plot_callback,
                 self.metrics_callback,
                 self.early_stop_callback,
-                self.reconstruction_callback,  # Optional: reconstruction plots
-                self.memory_callback,          # Optional: memory monitoring
+                self.reconstruction_callback,             # Optional: simple reconstruction plots
+                self.comprehensive_plotting_callback,     # Optional: comprehensive visualizations
+                self.memory_callback,                     # Optional: memory monitoring
             )
             if cb is not None
         ]
