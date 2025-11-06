@@ -28,14 +28,14 @@ from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequenci
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 
-from pytorch_lightning_modules import LightSeqVaeTeb
 from model.callbacks import (
     LossPlotCallback,
+    ScatteringForecastVisualizationCallback,
+)
+from pytorch_lightning_modules import (
+    LightSeqVaeTeb,
     ScatteringForecastMetricsCallback,
     MetricsLoggingCallback,
-    MemoryMonitorCallback,
-    ReconstructionPlotCallback,
-    PlottingCallBack,
 )
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
@@ -44,7 +44,6 @@ from vae_teb_model import (
     DEFAULT_COMPILE_ATTEMPTS,
     ensure_compiled_module,
 )
-from pytorch_lightning_modules import LightSeqVaeTeb
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -201,7 +200,8 @@ class SeqVAEGraphModel:
         self.classifier = None
         self.inv_scattering_model = None
         self.csv_logger = None
-        self.plotting_callback = None
+        self.forecast_metrics_callback = None
+        self.forecast_viz_callback = None
         self.classification_performance_callback = None
         self.base_model = None
         self.pytorch_model = None
@@ -364,7 +364,6 @@ class SeqVAEGraphModel:
                         beta_anneal_epochs=self.beta_anneal_epochs,
                         beta_cycle_len=self.beta_cycle_len,
                         beta_const_val=self.beta_const_val,
-                        predictive_horizon=self.predictive_horizon,
                         scattering_forecast_weight=self.scattering_forecast_weight,
                         scattering_discount_gamma=self.scattering_discount_gamma,
                         predictive_max_anchors=self.predictive_max_anchors,
@@ -541,7 +540,6 @@ class SeqVAEGraphModel:
             beta_anneal_epochs=self.beta_anneal_epochs,
             beta_cycle_len=self.beta_cycle_len,
             beta_const_val=self.beta_const_val,
-            predictive_horizon=self.predictive_horizon,
             scattering_forecast_weight=self.scattering_forecast_weight,
             scattering_discount_gamma=self.scattering_discount_gamma,
             predictive_max_anchors=self.predictive_max_anchors,
@@ -711,9 +709,15 @@ class SeqVAEGraphModel:
             self.log_forecast_metrics,
         )
         logger.info("Scattering forecaster enabled: %s", self.enable_forecaster)
-        self.plotting_callback = ScatteringForecastMetricsCallback(
+        self.forecast_metrics_callback = ScatteringForecastMetricsCallback(
             log_every_n_epochs=self.plot_every_epoch,
         )
+        self.forecast_viz_callback = None
+        if self.enable_forecaster:
+            self.forecast_viz_callback = ScatteringForecastVisualizationCallback(
+                output_dir=self.train_results_dir,
+                plot_every_epoch=self.plot_every_epoch,
+            )
 
         self.metrics_callback = MetricsLoggingCallback()
 
@@ -770,38 +774,6 @@ class SeqVAEGraphModel:
             max_history_size=19900
         )
 
-        # Optional: Reconstruction plotting callback (simple version)
-        reconstruction_cfg = callbacks_cfg.get('reconstruction_plotting', {})
-        self.reconstruction_callback = None
-        if reconstruction_cfg.get('enabled', False):
-            self.reconstruction_callback = ReconstructionPlotCallback(
-                output_dir=self.train_results_dir,
-                plot_frequency=reconstruction_cfg.get('plot_frequency', self.plot_every_epoch),
-                num_examples=reconstruction_cfg.get('num_examples', 3),
-            )
-            logger.info(f"Reconstruction plotting enabled: {reconstruction_cfg.get('num_examples', 3)} examples every {reconstruction_cfg.get('plot_frequency', self.plot_every_epoch)} epochs")
-
-        # Optional: Comprehensive plotting callback (detailed visualizations)
-        comprehensive_plotting_cfg = callbacks_cfg.get('comprehensive_plotting', {})
-        self.comprehensive_plotting_callback = None
-        if comprehensive_plotting_cfg.get('enabled', True):  # Enabled by default
-            self.comprehensive_plotting_callback = PlottingCallBack(
-                output_dir=self.train_results_dir,
-                plot_every_epoch=comprehensive_plotting_cfg.get('plot_frequency', self.plot_every_epoch),
-                predictive_horizon=self.predictive_horizon,
-            )
-            logger.info(f"Comprehensive plotting enabled: detailed visualizations every {comprehensive_plotting_cfg.get('plot_frequency', self.plot_every_epoch)} epochs")
-
-        # Optional: Memory monitoring callback
-        memory_cfg = self.config.get('advanced_config', {}).get('memory', {})
-        self.memory_callback = None
-        if memory_cfg.get('enable_memory_monitoring', False):
-            self.memory_callback = MemoryMonitorCallback(
-                threshold_gb=memory_cfg.get('memory_threshold_gb', 60.0),
-                log_frequency=memory_cfg.get('memory_log_frequency', 500),
-            )
-            logger.info(f"Memory monitoring enabled: threshold={memory_cfg.get('memory_threshold_gb', 60.0)}GB, log_freq={memory_cfg.get('memory_log_frequency', 500)}")
-
         profiler = SimpleProfiler(dirpath=self.train_results_dir, filename="profiler_base_model.txt")
 
         if self.cuda_devices and len(self.cuda_devices) > 0:
@@ -823,14 +795,12 @@ class SeqVAEGraphModel:
             cb
             for cb in (
                 ModelSummary(max_depth=-1),
-                self.plotting_callback,
+                self.forecast_metrics_callback,
+                self.forecast_viz_callback,
                 self.checkpoint_callback,
                 self.loss_plot_callback,
                 self.metrics_callback,
                 self.early_stop_callback,
-                self.reconstruction_callback,             # Optional: simple reconstruction plots
-                self.comprehensive_plotting_callback,     # Optional: comprehensive visualizations
-                self.memory_callback,                     # Optional: memory monitoring
             )
             if cb is not None
         ]
