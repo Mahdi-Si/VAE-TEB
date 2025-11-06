@@ -30,13 +30,11 @@ from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 
 from model.callbacks import (
     LossPlotCallback,
-    ScatteringForecastVisualizationCallback,
-)
-from pytorch_lightning_modules import (
-    LightSeqVaeTeb,
     ScatteringForecastMetricsCallback,
+    ScatteringForecastVisualizationCallback,
     MetricsLoggingCallback,
 )
+from pytorch_lightning_modules import LightSeqVaeTeb
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
