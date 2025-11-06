@@ -530,62 +530,227 @@ class ComprehensiveForecastPlotCallback(Callback):
             self._plot_scattering_forecast(epoch, mu_future, logvar_future, timesteps, target_stph)
             self._plot_latent_summary(epoch, mu_post, mu_prior)
 
-    def _plot_reconstruction_overview(self, y_raw: torch.Tensor, up_raw: Optional[torch.Tensor], mu_pr: Optional[torch.Tensor], logvar_pr: Optional[torch.Tensor], latent_z: Optional[torch.Tensor], mu_post: Optional[torch.Tensor], mu_prior: Optional[torch.Tensor], epoch: int) -> None:
+    def _plot_reconstruction_overview(
+        self,
+        y_raw: torch.Tensor,
+        up_raw: Optional[torch.Tensor],
+        mu_pr: Optional[torch.Tensor],
+        logvar_pr: Optional[torch.Tensor],
+        latent_z: Optional[torch.Tensor],
+        mu_post: Optional[torch.Tensor],
+        mu_prior: Optional[torch.Tensor],
+        epoch: int,
+    ) -> None:
+        import gc
         import matplotlib.pyplot as plt
         import numpy as np
-        if mu_pr is None or logvar_pr is None or y_raw is None:
+
+        if y_raw is None or mu_pr is None or logvar_pr is None:
             return
+
         sample_idx = 0
         try:
-            gt = y_raw[sample_idx].detach().cpu().numpy()
-            recon = mu_pr[sample_idx].detach().cpu().numpy()
-            logvar = logvar_pr[sample_idx].detach().cpu().numpy()
+            y_tensor = y_raw[sample_idx].detach().cpu()
+            recon_tensor = mu_pr[sample_idx].detach().cpu()
+            logvar_tensor = logvar_pr[sample_idx].detach().cpu()
         except Exception:
             return
-        std = np.sqrt(np.maximum(np.exp(logvar), 1e-8))
-        diff = gt - recon
-        up = None
+
+        y_np = np.reshape(y_tensor.numpy(), -1)
+        recon_np = np.reshape(recon_tensor.numpy(), -1)
+        logvar_np = np.reshape(logvar_tensor.numpy(), -1)
+
+        length = min(len(y_np), len(recon_np), len(logvar_np))
+        if length == 0:
+            return
+        y_np = y_np[:length]
+        recon_np = recon_np[:length]
+        logvar_np = logvar_np[:length]
+        std_np = np.sqrt(np.maximum(np.exp(logvar_np), 1e-8))
+        diff_np = y_np - recon_np
+
+        up_np = None
         if up_raw is not None:
             try:
-                up = up_raw[sample_idx].detach().cpu().numpy()
+                up_np = np.reshape(up_raw[sample_idx].detach().cpu().numpy(), -1)[:length]
             except Exception:
-                up = None
-        mse = float(np.mean(diff ** 2)) if diff.size else float('nan')
-        mae = float(np.mean(np.abs(diff))) if diff.size else float('nan')
-        corr = float(np.corrcoef(gt, recon)[0, 1]) if gt.size and recon.size else float('nan')
-        fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-        time_axis = np.arange(gt.shape[-1])
-        axes[0].plot(time_axis, gt, label='Target', color='tab:blue', linewidth=1.2)
-        axes[0].plot(time_axis, recon, label='Reconstruction', color='tab:orange', linewidth=1.0)
-        axes[0].fill_between(time_axis, recon - 2 * std, recon + 2 * std, color='tab:orange', alpha=0.2)
-        if up is not None:
-            axes[0].plot(time_axis, up, label='UP signal', color='tab:green', linewidth=0.8)
-        axes[0].set_ylabel('Signal')
-        axes[0].legend(loc='upper right')
-        axes[0].grid(alpha=0.3)
-        axes[1].plot(time_axis, diff, label=f'Error | MSE={mse:.3f} | MAE={mae:.3f}', color='tab:red', linewidth=1.0)
-        axes[1].set_ylabel('Error')
-        axes[1].legend(loc='upper right')
-        axes[1].grid(alpha=0.3)
-        if latent_z is not None and isinstance(latent_z, torch.Tensor):
-            latent = latent_z[sample_idx].detach().cpu().numpy()
+                up_np = None
+
+        latent_matrix = None
+        if isinstance(latent_z, torch.Tensor):
+            try:
+                latent_matrix = latent_z[sample_idx].detach().cpu().numpy()
+            except Exception:
+                latent_matrix = None
+        if latent_matrix is not None and latent_matrix.ndim == 1:
+            latent_matrix = latent_matrix[:, None]
+
+        posterior_matrix = None
+        if isinstance(mu_post, torch.Tensor):
+            try:
+                posterior_matrix = mu_post[sample_idx].detach().cpu().numpy()
+            except Exception:
+                posterior_matrix = None
+        if posterior_matrix is not None and posterior_matrix.ndim == 1:
+            posterior_matrix = posterior_matrix[:, None]
+
+        prior_matrix = None
+        if isinstance(mu_prior, torch.Tensor):
+            try:
+                prior_matrix = mu_prior[sample_idx].detach().cpu().numpy()
+            except Exception:
+                prior_matrix = None
+        if prior_matrix is not None and prior_matrix.ndim == 1:
+            prior_matrix = prior_matrix[:, None]
+
+        Fs = 4.0
+        time_axis = np.arange(length) / Fs
+
+        corr = float('nan')
+        if np.std(y_np) > 1e-8 and np.std(recon_np) > 1e-8:
+            try:
+                corr = float(np.corrcoef(y_np, recon_np)[0, 1])
+            except Exception:
+                corr = float('nan')
+        rmse = float(np.sqrt(np.mean(diff_np ** 2))) if diff_np.size else float('nan')
+        mae = float(np.mean(np.abs(diff_np))) if diff_np.size else float('nan')
+
+        colors = {
+            'fhr': '#055C9A',
+            'up': '#0DD8A2',
+            'gt': '#456882',
+            'recon': '#BB3E00',
+            'uncertainty': '#F7AD45',
+            'samples': '#4BD605',
+            'background': '#F9F3EF',
+        }
+
+        plt.style.use('default')
+        plt.rcParams.update({
+            'font.family': 'sans-serif',
+            'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+            'font.size': 11,
+            'axes.titlesize': 12,
+            'axes.labelsize': 11,
+            'axes.linewidth': 0.7,
+            'axes.edgecolor': '#9E9D9D',
+            'axes.facecolor': colors['background'],
+            'grid.color': '#838383',
+            'grid.linewidth': 0.4,
+            'grid.alpha': 0.6,
+            'legend.frameon': True,
+            'legend.fancybox': False,
+            'legend.shadow': False,
+            'legend.framealpha': 0.95,
+            'legend.edgecolor': '#A2B9A7',
+            'legend.facecolor': colors['background'],
+            'figure.facecolor': 'white',
+            'savefig.facecolor': 'white',
+            'savefig.dpi': 300,
+        })
+
+        n_rows = 4
+        fig, ax = plt.subplots(
+            nrows=n_rows,
+            ncols=2,
+            figsize=(20, n_rows * 3.2),
+            gridspec_kw={'width_ratios': [80, 1]},
+            constrained_layout=True,
+        )
+
+        for row in range(n_rows):
+            ax[row, 0].grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#D2C1B6')
+            ax[row, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[row, 0].minorticks_on()
+            ax[row, 0].set_axisbelow(True)
+            ax[row, 0].spines['top'].set_visible(False)
+            ax[row, 0].spines['right'].set_visible(False)
+            ax[row, 0].spines['left'].set_color('#A2B9A7')
+            ax[row, 0].spines['bottom'].set_color('#A2B9A7')
+            ax[row, 0].spines['left'].set_linewidth(0.7)
+            ax[row, 0].spines['bottom'].set_linewidth(0.7)
+            ax[row, 1].set_axis_off()
+
+        ax[0, 0].plot(time_axis, y_np, linewidth=1.2, color=colors['fhr'], label='FHR', alpha=0.9)
+        if up_np is not None:
+            ax[0, 0].plot(time_axis, up_np, linewidth=1.0, color=colors['up'], label='UP', alpha=0.75)
+        ax[0, 0].set_ylabel('Amplitude')
+        ax[0, 0].set_title('Raw FHR and UP Signals')
+        ax[0, 0].legend(loc='upper right', framealpha=0.95)
+        ax[0, 0].autoscale(enable=True, axis='x', tight=True)
+
+        ax[1, 0].plot(time_axis, y_np, linewidth=1.5, color=colors['gt'], label='Ground Truth', alpha=0.9, zorder=3)
+        ax[1, 0].plot(time_axis, recon_np, linewidth=1.3, color=colors['recon'], label='Reconstruction', alpha=0.85, zorder=2)
+        ax[1, 0].fill_between(time_axis, recon_np - std_np, recon_np + std_np, color=colors['uncertainty'], alpha=0.25, label='plusminus 1 std', zorder=1)
+        ax[1, 0].set_ylabel('FHR (bpm)')
+        ax[1, 0].set_title('Ground Truth vs Reconstruction')
+        ax[1, 0].legend(loc='upper right', framealpha=0.95)
+        ax[1, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[1, 0].text(
+            0.01,
+            0.92,
+            f"RMSE: {rmse:.3f}\nMAE: {mae:.3f}\nCorr: {corr:.3f}",
+            transform=ax[1, 0].transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85),
+        )
+
+        mu_samples_np = recon_tensor.numpy()
+        if mu_samples_np.ndim <= 1:
+            sample_series = [np.reshape(mu_samples_np, -1)[:length]]
         else:
-            latent = None
-        if latent is not None:
-            im = axes[2].imshow(latent.T, aspect='auto', origin='lower', cmap='RdBu_r')
-            axes[2].set_title('Latent representation (posterior)')
-            axes[2].set_ylabel('Latent dim')
-            axes[2].set_xlabel('Decimated step')
-            plt.colorbar(im, ax=axes[2], orientation='vertical', pad=0.01)
+            flat = mu_samples_np.reshape(mu_samples_np.shape[0], -1)
+            sample_series = [flat[idx, :length] for idx in range(min(6, flat.shape[0]))]
+
+        ax[2, 0].plot(time_axis, y_np, linewidth=1.2, color=colors['gt'], label='Ground Truth', alpha=0.9)
+        for idx, series in enumerate(sample_series):
+            alpha_val = 0.45 + 0.1 * idx
+            ax[2, 0].plot(time_axis, series, linewidth=1.0, color=colors['samples'], alpha=min(alpha_val, 0.9), label='Model sample' if idx == 0 else None)
+        ax[2, 0].set_ylabel('FHR (bpm)')
+        ax[2, 0].set_title('Sample Reconstructions')
+        ax[2, 0].autoscale(enable=True, axis='x', tight=True)
+        ax[2, 0].legend(loc='upper right', framealpha=0.95)
+
+        if prior_matrix is not None and posterior_matrix is not None:
+            ax[2, 1].set_axis_on()
+            prior_arr = np.asarray(prior_matrix)
+            post_arr = np.asarray(posterior_matrix)
+            if prior_arr.ndim == 1:
+                prior_arr = prior_arr[:, None]
+            if post_arr.ndim == 1:
+                post_arr = post_arr[:, None]
+            steps = np.arange(post_arr.shape[0])
+            ax[2, 1].plot(steps, np.linalg.norm(prior_arr, axis=1), color='#7F8C8D', linewidth=1.0, label='||mu_prior||')
+            ax[2, 1].plot(steps, np.linalg.norm(post_arr, axis=1), color='#BB3E00', linewidth=1.2, label='||mu_post||')
+            delta = post_arr - prior_arr
+            ax[2, 1].plot(steps, np.linalg.norm(delta, axis=1), color='#2E86AB', linewidth=1.0, linestyle='--', label='||delta||')
+            ax[2, 1].set_title('Latent Norm Dynamics')
+            ax[2, 1].set_xlabel('Decimated step')
+            ax[2, 1].set_ylabel('Norm')
+            ax[2, 1].grid(True, alpha=0.3)
+            ax[2, 1].legend(loc='upper right', fontsize=9, framealpha=0.9)
+
+        if latent_matrix is not None and latent_matrix.size > 0:
+            if latent_matrix.ndim == 1:
+                latent_matrix = latent_matrix[:, None]
+            img = ax[3, 0].imshow(latent_matrix.T, aspect='auto', cmap='RdBu_r', origin='lower')
+            ax[3, 0].set_ylabel('Latent dim')
+            ax[3, 0].set_xlabel('Decimated step')
+            ax[3, 0].set_title('Posterior Latent Trajectory')
+            ax[3, 1].set_axis_on()
+            cbar = fig.colorbar(img, cax=ax[3, 1])
+            cbar.ax.tick_params(labelsize=9, colors='#666666')
+            cbar.set_label('Activation', fontsize=10, color='#666666')
         else:
-            axes[2].text(0.5, 0.5, 'Latent trajectory unavailable', ha='center', va='center')
-            axes[2].set_axis_off()
-        axes[0].set_title(f'Reconstruction overview | MSE={mse:.3f} | Corr={corr:.3f}')
-        fig.tight_layout()
+            ax[3, 0].text(0.5, 0.5, 'Latent trajectory unavailable', ha='center', va='center', fontsize=12)
+            ax[3, 0].set_axis_off()
+
+        fig.suptitle(f'Reconstruction Overview - Epoch {epoch}', fontsize=14, color='#456882')
         save_path = self.output_dir / f'reconstruction_overview_epoch_{epoch:04d}.pdf'
-        fig.savefig(save_path, dpi=200)
+        fig.savefig(save_path, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"Saved reconstruction overview to {save_path}")
+        gc.collect()
+        logger.info(f'Reconstruction plot saved to {save_path}')
 
     def _plot_scattering_forecast(self, epoch: int, mu_future: Optional[torch.Tensor], logvar_future: Optional[torch.Tensor], timesteps: Optional[torch.Tensor], target_stph: torch.Tensor) -> None:
         import matplotlib.pyplot as plt
