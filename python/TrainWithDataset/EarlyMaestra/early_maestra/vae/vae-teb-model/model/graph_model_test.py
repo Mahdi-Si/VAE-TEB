@@ -269,6 +269,35 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
 
         self.pytorch_model = core_model
 
+    def _measure_transfer_entropy(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        *,
+        reduce_mean: bool = False,
+    ) -> torch.Tensor:
+        """Call measure_transfer_entropy regardless of staticmethod vs bound method signature."""
+        model = self.pytorch_model
+        if model is None:
+            raise RuntimeError("SeqVAE core model not initialized.")
+
+        te_fn = getattr(model, 'measure_transfer_entropy', None)
+        target_model = model
+        if te_fn is None:
+            core = self._get_core_module()
+            target_model = core
+            te_fn = getattr(core, 'measure_transfer_entropy', None)
+
+        if not callable(te_fn):
+            raise AttributeError("Current model does not expose measure_transfer_entropy.")
+
+        try:
+            return te_fn(y_st, y_ph, x_ph, reduce_mean=reduce_mean)
+        except TypeError:
+            # Handle legacy staticmethod signature that expects the model instance explicitly
+            return te_fn(target_model, y_st, y_ph, x_ph, reduce_mean=reduce_mean)
+
     def run_tests(self, test_loader, cuda_device=None):
         """Run SeqVAE test analyses and plots with optional CUDA device selection.
 
@@ -532,7 +561,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     loss_dict = self._prepare_loss_dict(raw_loss_dict)
                     
                     # Also get KLD tensor for detailed analysis (original method)
-                    kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
+                    kld_tensor = self._measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
                     kld_mean_over_channels = kld_tensor.mean(dim=-1)
 
                     # Always keep normalized versions for reconstruction comparison
@@ -793,7 +822,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                         x_ph_input = cross_phase_trimmed.to(device)
 
                         # TE (KLD)
-                        kld_tensor = self.pytorch_model.measure_transfer_entropy(
+                        kld_tensor = self._measure_transfer_entropy(
                             y_st=y_st_input, y_ph=y_ph_input, x_ph=x_ph_input, reduce_mean=False
                         )
                         kld_value = kld_tensor.mean().item()
@@ -1173,7 +1202,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     reconstructed_fhr_mu = forward_outputs['mu_pr']  # (1, 4800)
                     
                     # Compute KLD using the model's method
-                    kld_tensor = self.pytorch_model.measure_transfer_entropy(
+                    kld_tensor = self._measure_transfer_entropy(
                         y_st, y_ph, x_ph, reduce_mean=False
                     )
                     # Average KLD over sequence length and latent dimensions
@@ -1319,14 +1348,14 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                 # With UP
                 out_up = model(y_st, y_ph, x_ph)
                 mu_pr_up = out_up['mu_pr']  # (B, 4800)
-                kld_tensor_up = model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
+                kld_tensor_up = self._measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
                 kld_up = kld_tensor_up.mean(dim=(1, 2))  # per-sample
 
                 # Without UP (zeroed source)
                 x_zero = torch.zeros_like(x_ph)
                 out_no = model(y_st, y_ph, x_zero)
                 mu_pr_no = out_no['mu_pr']
-                kld_tensor_no = model.measure_transfer_entropy(y_st, y_ph, x_zero, reduce_mean=False)
+                kld_tensor_no = self._measure_transfer_entropy(y_st, y_ph, x_zero, reduce_mean=False)
                 kld_no = kld_tensor_no.mean(dim=(1, 2))
 
                 # VAF per-sample (normalized space)
@@ -1427,7 +1456,7 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     x_scaled = x_ph_base * float(g)
                     out = model(y_st, y_ph, x_scaled)
                     mu_pr = out['mu_pr']
-                    kld_tensor = model.measure_transfer_entropy(y_st, y_ph, x_scaled, reduce_mean=False)
+                    kld_tensor = self._measure_transfer_entropy(y_st, y_ph, x_scaled, reduce_mean=False)
 
                     # Per-sample KLD mean
                     kld_ps = kld_tensor.mean(dim=(1, 2))  # (B,)
