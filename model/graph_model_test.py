@@ -27,6 +27,7 @@ from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequenci
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data, create_optimized_dataloader
 from model.graph_model_train import SeqVAEGraphModel, denormalize_signal_data
+from model.vae_teb_model import SeqVaeCore, SeqVaeTeb
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -155,6 +156,118 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                 )
 
         return _manual_loss()
+
+    def _prepare_loss_dict(self, loss_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """Convert scalar tensors to floats for logging/plotting."""
+        safe: Dict[str, float] = {}
+        for key, value in (loss_dict or {}).items():
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach()
+                if tensor.numel() == 1:
+                    safe[key] = float(tensor.item())
+                else:
+                    # Preserve shapeful tensors (e.g., for debugging) as CPU numpy arrays
+                    safe[key] = tensor.cpu().numpy()
+            else:
+                try:
+                    safe[key] = float(value)
+                except (TypeError, ValueError):
+                    safe[key] = value
+        return safe
+
+    def _core_init_kwargs(self) -> Dict[str, int]:
+        vae_cfg = self.config.get('model_config', {}).get('VAE_model', {})
+        return {
+            'sequence_length': int(vae_cfg.get('sequence_length', 300)),
+            'latent_dim_source': int(vae_cfg.get('latent_dim_source', 16)),
+            'latent_dim_target': int(vae_cfg.get('latent_dim_target', 16)),
+            'latent_dim_z': int(vae_cfg.get('latent_dim_z', 16)),
+            'decimation_factor': int(vae_cfg.get('decimation_factor', 16)),
+            'warmup_period': int(vae_cfg.get('warmup_period', 30)),
+            'lstm_hidden_dim': int(vae_cfg.get('lstm_hidden_dim', 128)),
+            'lstm_num_layers': int(vae_cfg.get('lstm_num_layers', 4)),
+            'init_weights': True,
+        }
+
+    def _core_checkpoint_path(self):
+        candidates = [
+            ('legacy_seqvae_checkpoint', getattr(self, 'legacy_seqvae_checkpoint', None)),
+            ('base_model_checkpoint', getattr(self, 'base_model_checkpoint', None)),
+        ]
+        for label, path in candidates:
+            if path and os.path.exists(path):
+                return path, label
+        return None, None
+
+    def _load_core_state_dict(self, checkpoint_path: str) -> Dict[str, torch.Tensor]:
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        except Exception as exc:
+            logger.error(f"Failed to load SeqVaeCore checkpoint ({checkpoint_path}): {exc}")
+            return {}
+
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        try:
+            state_dict = SeqVaeTeb._normalize_state_dict_keys(state_dict)
+        except Exception:
+            pass
+
+        module_prefixes = (
+            "source_encoder.",
+            "target_encoder.",
+            "conditional_encoder.",
+            "decoder.",
+        )
+
+        trimmed_state = {}
+        for key, value in state_dict.items():
+            if key.startswith("core."):
+                trimmed_state[key[len("core."):]] = value
+                continue
+            for prefix in module_prefixes:
+                if key.startswith(prefix):
+                    trimmed_state[key] = value
+                    break
+
+        if not trimmed_state:
+            logger.warning(
+                f"Checkpoint {checkpoint_path} did not contain SeqVaeCore parameters. "
+                "Ensure you are pointing to a Stage-1/core checkpoint."
+            )
+        return trimmed_state
+
+    def create_model(self):
+        """Instantiate SeqVaeCore and load the Stage-1 checkpoint for evaluation."""
+        self.setup_config()
+        self._validate_config()
+
+        init_kwargs = self._core_init_kwargs()
+        logger.info(f"Initializing SeqVaeCore with kwargs: {init_kwargs}")
+        core_model = SeqVaeCore(**init_kwargs)
+
+        ckpt_path, ckpt_label = self._core_checkpoint_path()
+        if ckpt_path is None:
+            logger.warning(
+                "No SeqVaeCore checkpoint path found in config "
+                "(legacy_seqvae_checkpoint/base_model_checkpoint). "
+                "Proceeding with randomly initialized weights."
+            )
+        else:
+            logger.info(f"Loading SeqVaeCore weights from {ckpt_label}: {ckpt_path}")
+            core_state = self._load_core_state_dict(ckpt_path)
+            if core_state:
+                incompatible = core_model.load_state_dict(core_state, strict=False)
+                missing_keys = getattr(incompatible, 'missing_keys', [])
+                unexpected_keys = getattr(incompatible, 'unexpected_keys', [])
+                if missing_keys:
+                    logger.warning(f"Missing core parameters during load: {missing_keys}")
+                if unexpected_keys:
+                    logger.warning(f"Ignoring unexpected parameters: {unexpected_keys}")
+                logger.info("SeqVaeCore checkpoint loaded successfully.")
+            else:
+                logger.warning("SeqVaeCore checkpoint load skipped due to empty state dict.")
+
+        self.pytorch_model = core_model
 
     def run_tests(self, test_loader, cuda_device=None):
         """Run SeqVAE test analyses and plots with optional CUDA device selection.
@@ -409,13 +522,14 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     # Compute loss the same way as training to get consistent KLD values
                     # CRITICAL FIX: Use the same beta as training (beta_const_val from config)
                     effective_beta = getattr(self, 'beta_const_val', self.kld_beta_)
-                    loss_dict = self._compute_reconstruction_losses(
+                    raw_loss_dict = self._compute_reconstruction_losses(
                         forward_outputs=forward_outputs,
                         y_st=y_st,
                         y_ph=y_ph,
                         y_raw=y_raw,
                         beta=effective_beta,
                     )
+                    loss_dict = self._prepare_loss_dict(raw_loss_dict)
                     
                     # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
