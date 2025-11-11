@@ -24,6 +24,7 @@ import numpy as np
 from typing import Optional
 
 from loguru import logger
+from utils.custom_logger import setup_logging
 from hdf5_dataset.kymatio_frequency_analysis import analyze_scattering_frequencies
 from hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
 from hdf5_dataset.hdf5_dataset import normalize_tensor_data
@@ -36,6 +37,8 @@ from model.callbacks import (
     MetricsLoggingCallback,
 )
 from pytorch_lightning_modules import LightSeqVaeTeb
+
+from graph_models_utils import denormalize_signal_data
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from vae_teb_model import (
@@ -60,39 +63,6 @@ matplotlib.use('Agg')
 # os.environ['MASTER_PORT'] = '29500'
 
 
-def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, normalization_stats: dict) -> torch.Tensor:
-    """
-    Denormalize FHR or UP signal data using normalization statistics.
-    
-    Args:
-        normalized_data: Normalized tensor data (shape: any)
-        field_name: Name of the field ('fhr' or 'up')
-        normalization_stats: Dictionary containing normalization statistics
-        
-    Returns:
-        Denormalized tensor data
-    """
-    if field_name not in normalization_stats:
-        logger.warning(f"No normalization stats found for field '{field_name}'. Returning data as-is.")
-        return normalized_data
-    
-    if field_name not in ['fhr', 'up']:
-        logger.warning(f"Denormalization only supported for 'fhr' and 'up' fields, got '{field_name}'. Returning data as-is.")
-        return normalized_data
-    
-    stats = normalization_stats[field_name]
-    
-    if 'mean_tensor' in stats and 'std_tensor' in stats:
-        mean_tensor = stats['mean_tensor']
-        std_tensor = stats['std_tensor']
-    else:
-        mean_tensor = torch.tensor(stats['mean'], dtype=normalized_data.dtype, device=normalized_data.device)
-        std_tensor = torch.tensor(stats['std'], dtype=normalized_data.dtype, device=normalized_data.device)    
-    epsilon = 1e-8
-    denormalized_data = normalized_data * (std_tensor + epsilon) + mean_tensor
-    
-    return denormalized_data
-
 
 class SeqVAEGraphModel:
     def __init__(self, config_file_path=None):
@@ -104,6 +74,7 @@ class SeqVAEGraphModel:
 
         with open(self.config_file_path) as yaml_file:
             self.config = yaml.safe_load(yaml_file)
+        self._config_dump = yaml.dump(self.config, sort_keys=False, default_flow_style=False)
         now = datetime.now()
         run_date = now.strftime("%Y-%m-%d--[%H-%M]-")
         self.experiment_tag = self.config['general_config']['tag']
@@ -114,13 +85,10 @@ class SeqVAEGraphModel:
         self.train_results_dir = os.path.join(self.output_base_dir, self.base_folder, 'train_results')
         self.test_results_dir = os.path.join(self.output_base_dir, self.base_folder, 'test_results')
         self.model_checkpoint_dir = os.path.join(self.output_base_dir, self.base_folder, 'model_checkpoints')
-        self.aux_dir = os.path.join(self.output_base_dir, self.base_folder, 'aux_test_HIE')
+        self.aux_dir = os.path.join(self.output_base_dir, self.base_folder, 'aux_tests')
         self.tensorboard_dir = os.path.join(self.output_base_dir, self.base_folder, 'tensorboard_log')
         self.log_file = None
         self.logger = None
-
-        logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
-        logger.info('==' * 50)
         self.stat_path = os.path.normpath(self.config['dataset_config']['stat_path'])
 
         self.plot_every_epoch = self.config['general_config']['plot_frequency']
@@ -132,12 +100,12 @@ class SeqVAEGraphModel:
         vae_cfg = self.config['model_config']['VAE_model']
         self.beta_schedule = vae_cfg.get('beta_schedule', 'linear')
         self.beta_start = float(vae_cfg.get('beta_start', 0.0))
-        self.beta_end = float(vae_cfg.get('beta_end', 6.0))  # Default β-TCVAE value
+        self.beta_end = float(vae_cfg.get('beta_end', 6.0))
         self.beta_anneal_epochs = int(vae_cfg.get('beta_anneal_epochs', 50))
         self.beta_cycle_len = int(vae_cfg.get('beta_cycle_len', 1000))
         self.beta_const_val = float(vae_cfg.get('beta_const_val', self.kld_beta_))
 
-                # SeqVAE forecasting parameters
+        # SeqVAE forecasting parameters
         self.model_horizon_len = int(vae_cfg.get('horizon_len', 30))
         self.forecaster_hidden_dim = int(vae_cfg.get('forecaster_hidden_dim', 128))
         self.forecaster_layers = int(vae_cfg.get('forecaster_layers', 2))
@@ -290,23 +258,23 @@ class SeqVAEGraphModel:
             os.makedirs(folder, exist_ok=True)
 
         self.log_file = os.path.join(self.train_results_dir, 'full.log')
-        
-        logger.remove()
-        logger.add(sys.stderr, level="INFO")
-        logger.add(
-            self.log_file,
-            level="INFO",
+
+        setup_logging(
+            log_to_file=True,
+            log_to_console=True,
+            file_path=self.log_file,
+            file_level="INFO",
+            console_level="INFO",
             rotation="100 MB",
             retention="14 days",
             compression="zip",
-            enqueue=True,
+            serialize=False,
             backtrace=False,
             diagnose=False,
-            serialize=False,
         )
-        logger.info(yaml.dump(self.config, sort_keys=False, default_flow_style=False))
+        logger.info(self._config_dump)
         logger.info('==' * 50)
-        
+
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()

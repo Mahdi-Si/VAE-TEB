@@ -1,6 +1,6 @@
-# ############################################################################
+# ======================================================================
 # UNIFIED CONFIG: SeqVAE-TEB Two-Stage Training
-# ############################################################################
+# ======================================================================
 #
 # This config supports both training stages:
 #   STAGE 1: Core VAE Training (encoders + decoder)
@@ -24,7 +24,7 @@
 #    - Update: tag, out_dir_base (optional)
 #    - Run: python model/graph_model_train.py
 #
-# ############################################################################
+# ======================================================================
 
 general_config:
   # ========================================================================
@@ -37,7 +37,6 @@ general_config:
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   lr: 0.0001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
   lr_milestone: [1000]  # Epochs at which to decay learning rate
-  weight_decay: 0.0001  # L2 regularization weight
   checkpoint_frequency: 1
   plot_frequency: 1  # Callback log frequency in epochs
 
@@ -49,16 +48,16 @@ general_config:
   # ========================================================================
   epochs: 5000
 
-  accumulate_grad_batches: 20  # Gradient accumulation for effective larger batch size
+  accumulate_grad_batches: 1
   batch_size:
     train: 210
     test: 210
 
 model_config:
   VAE_model:
-    # ######################################################################
+    # ======================================================================
     # CRITICAL SETTINGS - CHANGE THESE WHEN SWITCHING STAGES
-    # ######################################################################
+    # ======================================================================
 
     # --------------------------------------------------------------------
     # STAGE 1 (Core VAE Training):
@@ -113,9 +112,9 @@ model_config:
     log_forecast_metrics: true       # ← CHANGE TO true FOR STAGE 2
     scattering_discount_gamma: 1.0    # Discount factor for multi-step forecasting
 
-  # ######################################################################
+  # ======================================================================
   # CHECKPOINT SETTINGS - CHANGE THESE WHEN SWITCHING TO STAGE 2
-  # ######################################################################
+  # ======================================================================
 
   # --------------------------------------------------------------------
   # STAGE 1 (Training from scratch):
@@ -128,20 +127,12 @@ model_config:
   # --------------------------------------------------------------------
   #   base_model_checkpoint: null
   #   legacy_seqvae_checkpoint: /path/to/stage1/checkpoint.ckpt
-  #
-  # EXAMPLE:
-  # legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training/2025-01-15--[14-30]--stage1_core_vae_training/model_checkpoints/base-model-best-epoch=357.ckpt
   # --------------------------------------------------------------------
 
   base_model_checkpoint: null
   legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-11-02--[14-52]--No_LSTM_B-200_lr-e-3_predictive/model_checkpoints/base-model-best-epoch=34.ckpt
 
 folders_config:
-  # ========================================================================
-  # OPTIONAL - CHANGE FOR EACH STAGE:
-  # - Stage 1: out_dir_base: .../stage1_core_training
-  # - Stage 2: out_dir_base: .../stage2_forecaster_training
-  # ========================================================================
   out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training
 
 dataset_config:
