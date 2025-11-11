@@ -191,7 +191,7 @@ class CausalMultiChannelConvBlock(nn.Module):
             kernel_size=filter_size,
             groups=groups,
             bias=bias,
-            padding=0,  # We handle padding manually
+            padding=0,
             dilation=dilation,
             stride=stride
         )
@@ -243,6 +243,7 @@ class CausalMultiChannelConvBlock(nn.Module):
             residual = self.residual_proj(residual)
 
         return output + residual
+
 
 class MultiChannelConvBlock(nn.Module):
     """
@@ -298,7 +299,6 @@ class MultiChannelConvBlock(nn.Module):
 
         x = self.conv(x)
         return x
-
 
 
 class ResidualMLP(nn.Module):
@@ -599,7 +599,6 @@ class TargetEncoder(nn.Module):
             return mu
 
 
-
 class SourceEncoder(nn.Module):
     """
     Encodes the source signal (x) to produce a deterministic latent representation h_x.
@@ -880,15 +879,6 @@ class Decoder(nn.Module):
                 use_skip_connection=True, 
                 activation=nn.GELU,
         )
-
-        # self.lstm_temporal = nn.LSTM(
-        #     input_size=latent_dim,
-        #     hidden_size=32,
-        #     num_layers=4,
-        #     batch_first=True,
-        #     bidirectional=False,
-        #     dropout=0.1,
-        # )
         
         self.lstm_temporal = ResidualMLP(
             input_dim=latent_dim,
@@ -1066,7 +1056,6 @@ class Decoder(nn.Module):
             'nll_loss': nll_loss,
             'total_decoder_loss': mse_loss + nll_loss
         }
-
 
 
 class SeqVaeCore(nn.Module):
@@ -1359,18 +1348,7 @@ class SeqVaeCore(nn.Module):
         }
 
 
-
-
 class ScatteringForecaster(nn.Module):
-    """Autoregressive forecaster for scattering+phase coefficients (st+ph).
-
-    The module consumes the latent trajectory and observed scattering coefficients
-    and predicts the next ``horizon`` frames (mu/logvar pairs) for each timestep.
-    We combine lightweight residual MLPs, causal LSTM context encoding, and an
-    autoregressive LSTMCell rollout. Only LSTM and linear blocks are used as
-    requested.
-    """
-
     def __init__(
         self,
         latent_dim: int,
@@ -1383,8 +1361,6 @@ class ScatteringForecaster(nn.Module):
         max_logvar: float = 4.0,
     ) -> None:
         super().__init__()
-        if context_layers < 1:
-            raise ValueError("context_layers must be at least 1")
         self.latent_dim = latent_dim
         self.stph_dim = stph_dim
         self.hidden_dim = hidden_dim
@@ -1488,11 +1464,6 @@ class ScatteringForecaster(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Gaussian NLL + MSE over the valid forecast anchors."""
         B, T, H, C = mu_pred.shape
-        if logvar_pred.shape != mu_pred.shape:
-            raise ValueError("mu_pred and logvar_pred must share the same shape")
-        if target_stph.shape != (B, T, C):
-            raise ValueError("target_stph must match (B, T, C)")
-
         end_t = T - H - 1
         start_t = warmup
         device = mu_pred.device
@@ -1638,7 +1609,6 @@ class SeqVaeTeb(nn.Module):
             raise RuntimeError("Scattering forecaster is disabled for this SeqVaeTeb instance.")
 
     def freeze_core(self) -> None:
-        """Freeze all core VAE parameters, leaving only the forecaster trainable."""
         if self.scattering_forecaster is None:
             log.warning("Cannot freeze core: scattering forecaster is not available")
             return
@@ -1647,21 +1617,13 @@ class SeqVaeTeb(nn.Module):
             param.requires_grad = False
 
         self.core.eval()
-        log.info("Froze core VAE (source encoder, target encoder, conditional encoder, decoder)")
-        log.info("Core VAE set to eval mode (dropout/batchnorm disabled)")
-
         for param in self.scattering_forecaster.parameters():
             param.requires_grad = True
 
-        log.info("Scattering forecaster parameters remain trainable")
-
     def unfreeze_core(self) -> None:
-        """Unfreeze all core VAE parameters and restore training mode."""
         for param in self.core.parameters():
             param.requires_grad = True
         self.core.train()
-        log.info("Unfroze core VAE (all parameters now trainable)")
-        log.info("Core VAE restored to training mode")
 
     def get_trainable_params_info(self) -> Dict[str, int]:
         """Get information about trainable vs frozen parameters."""
@@ -2154,39 +2116,6 @@ class SeqVaeTeb(nn.Module):
             logvar_post=logvar_post,
             reduce_mean=reduce_mean,
         )
-
-class SeqVaeNoForecast(SeqVaeTeb):
-    """
-    Thin wrapper around SeqVaeTeb that guarantees the scattering forecaster is disabled.
-    Useful for lightweight training checkpoints while retaining interface compatibility.
-    """
-
-    def __init__(
-        self,
-        sequence_length: int = 300,
-        latent_dim_source: int = 16,
-        latent_dim_target: int = 16,
-        latent_dim_z: int = 16,
-        decimation_factor: int = 16,
-        warmup_period: int = 30,
-        lstm_hidden_dim: int = 128,
-        lstm_num_layers: int = 5,
-        horizon_len: int = 30,
-    ):
-        super().__init__(
-            sequence_length=sequence_length,
-            latent_dim_source=latent_dim_source,
-            latent_dim_target=latent_dim_target,
-            latent_dim_z=latent_dim_z,
-            decimation_factor=decimation_factor,
-            warmup_period=warmup_period,
-            lstm_hidden_dim=lstm_hidden_dim,
-            lstm_num_layers=lstm_num_layers,
-            horizon_len=horizon_len,
-            enable_forecaster=False,
-            scattering_forecaster=None,
-        )
-
 
 
 class SeqVaeTebClassifier(nn.Module):

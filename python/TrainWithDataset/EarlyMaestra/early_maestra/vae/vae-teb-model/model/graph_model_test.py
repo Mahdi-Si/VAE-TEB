@@ -6,6 +6,7 @@ import time
 import sys
 import os
 import yaml
+from typing import Dict
 from tqdm import tqdm
 import pickle
 import matplotlib
@@ -33,6 +34,125 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "0"   # set to 1 only in debugging
 class SeqVAEGraphModelTest(SeqVAEGraphModel):
     def __init__(self, config_file_path=None):
         super().__init__(config_file_path)
+
+    def _get_core_module(self):
+        model = self.pytorch_model
+        if model is None:
+            return None
+        if hasattr(model, 'core') and model.core is not None:
+            return model.core
+        return model
+
+    def _supports_forecast_eval(self) -> bool:
+        model = self.pytorch_model
+        if model is None:
+            return False
+        eval_fn = getattr(model, 'evaluate_forecast_batch', None)
+        agg_fn = getattr(model, 'aggregate_forecasts_to_canvas', None)
+        forecast_fn = getattr(model, 'forecast', None)
+        return callable(eval_fn) and callable(agg_fn) and callable(forecast_fn)
+
+    def _compute_reconstruction_losses(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        y_raw: torch.Tensor,
+        beta: float,
+    ) -> Dict[str, torch.Tensor]:
+        model = self.pytorch_model
+        core = self._get_core_module()
+        beta_value = float(beta)
+
+        def _manual_loss() -> Dict[str, torch.Tensor]:
+            target_raw = y_raw
+            if target_raw.dim() == 3 and target_raw.size(-1) == 1:
+                target_raw = target_raw.squeeze(-1)
+
+            device = target_raw.device
+            zeros = torch.tensor(0.0, device=device)
+
+            linear_output = forward_outputs.get('linear_output')
+            mse_loss = zeros
+            if (
+                linear_output is not None
+                and linear_output.dim() == 3
+                and y_st.shape[:2] == linear_output.shape[:2]
+                and y_ph.shape[:2] == linear_output.shape[:2]
+                and linear_output.shape[-1] == (y_st.shape[-1] + y_ph.shape[-1])
+            ):
+                stacked_target = torch.cat([y_st, y_ph], dim=-1)
+                mse_loss = torch.nn.functional.mse_loss(linear_output, stacked_target)
+
+            mu_pr = forward_outputs.get('mu_pr')
+            logvar_pr = forward_outputs.get('logvar_pr')
+            if mu_pr is not None and logvar_pr is not None:
+                var = logvar_pr.exp()
+                nll = 0.5 * (logvar_pr + (target_raw - mu_pr) ** 2 / var)
+                nll_loss = nll.mean()
+            else:
+                nll_loss = zeros
+
+            kld_fn = getattr(model, '_kld_loss', None)
+            if kld_fn is None and core is not None:
+                kld_fn = getattr(core, '_kld_loss', None)
+
+            if callable(kld_fn):
+                kld_loss = kld_fn(
+                    mu_prior=forward_outputs['mu_prior'],
+                    logvar_prior=forward_outputs['logvar_prior'],
+                    mu_post=forward_outputs['mu_post'],
+                    logvar_post=forward_outputs['logvar_post'],
+                    reduce_mean=True,
+                )
+            else:
+                logvar_prior = forward_outputs['logvar_prior']
+                logvar_post = forward_outputs['logvar_post']
+                mu_prior = forward_outputs['mu_prior']
+                mu_post = forward_outputs['mu_post']
+                kld_raw = (
+                    logvar_prior
+                    - logvar_post
+                    + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+                    - 1.0
+                )
+                kld_loss = 0.5 * kld_raw.mean()
+
+            total_decoder = mse_loss + nll_loss
+            total_loss = total_decoder + beta_value * kld_loss
+            return {
+                'reconstruction_loss': total_decoder,
+                'mse_loss': mse_loss,
+                'nll_loss': nll_loss,
+                'kld_loss': kld_loss,
+                'total_loss': total_loss,
+                'total_decoder_loss': total_decoder,
+            }
+
+        loss_fn = getattr(model, 'compute_reconstruction_loss', None)
+        if callable(loss_fn):
+            return loss_fn(
+                forward_outputs=forward_outputs,
+                y_st=y_st,
+                y_ph=y_ph,
+                y_raw=y_raw,
+                compute_kld_loss=True,
+                beta=beta_value,
+            )
+
+        if core is not None:
+            core_loss_fn = getattr(core, 'compute_reconstruction_loss', None)
+            if callable(core_loss_fn):
+                return core_loss_fn(
+                    forward_outputs=forward_outputs,
+                    y_st=y_st,
+                    y_ph=y_ph,
+                    y_raw=y_raw,
+                    compute_kld_loss=True,
+                    beta=beta_value,
+                )
+
+        return _manual_loss()
 
     def run_tests(self, test_loader, cuda_device=None):
         """Run SeqVAE test analyses and plots with optional CUDA device selection.
@@ -148,9 +268,18 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir, model_created=True)
 
         # New: forecasting evaluation and plots (keeps legacy tests intact)
-        forecast_dir = os.path.join(self.test_results_dir, 'forecast_eval')
-        os.makedirs(forecast_dir, exist_ok=True)
-        self.run_forecast_evaluation_and_plot(test_loader, num_samples=100, output_dir=forecast_dir, selected_guids=selected_guids, model_created=True)
+        if self._supports_forecast_eval():
+            forecast_dir = os.path.join(self.test_results_dir, 'forecast_eval')
+            os.makedirs(forecast_dir, exist_ok=True)
+            self.run_forecast_evaluation_and_plot(
+                test_loader,
+                num_samples=100,
+                output_dir=forecast_dir,
+                selected_guids=selected_guids,
+                model_created=True,
+            )
+        else:
+            logger.info("Skipping forecast evaluation: model does not expose forecasting helpers.")
 
 
     def run_analysis_and_plot(self, test_loader, num_samples=200, output_dir=None, selected_guids=None, model_created=False):
@@ -278,10 +407,13 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
                     # Compute loss the same way as training to get consistent KLD values
                     # CRITICAL FIX: Use the same beta as training (beta_const_val from config)
                     effective_beta = getattr(self, 'beta_const_val', self.kld_beta_)
-                    loss_dict = self.pytorch_model.compute_loss(
-                        forward_outputs, y_st, y_ph, y_raw, 
-                        compute_kld_loss=True, 
-                        beta=effective_beta)
+                    loss_dict = self._compute_reconstruction_losses(
+                        forward_outputs=forward_outputs,
+                        y_st=y_st,
+                        y_ph=y_ph,
+                        y_raw=y_raw,
+                        beta=effective_beta,
+                    )
                     
                     # Also get KLD tensor for detailed analysis (original method)
                     kld_tensor = self.pytorch_model.measure_transfer_entropy(y_st, y_ph, x_ph, reduce_mean=False)
@@ -694,6 +826,10 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         out_dir = output_dir or os.path.join(self.test_results_dir, 'forecast_eval')
         os.makedirs(out_dir, exist_ok=True)
         logger.info(f"Starting forecasting evaluation on up to {num_samples} samples...")
+
+        if not self._supports_forecast_eval():
+            logger.info("Forecast evaluation skipped: forecasting helpers unavailable on the loaded model.")
+            return
 
         if not model_created:
             self.create_model()
