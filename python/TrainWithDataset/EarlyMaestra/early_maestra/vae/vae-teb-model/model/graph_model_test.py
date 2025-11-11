@@ -277,26 +277,28 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
         *,
         reduce_mean: bool = False,
     ) -> torch.Tensor:
-        """Call measure_transfer_entropy regardless of staticmethod vs bound method signature."""
-        model = self.pytorch_model
-        if model is None:
+        """Return per-timestep KL tensor (B, T, latent_dim) for plotting."""
+        core = self._get_core_module()
+        if core is None:
             raise RuntimeError("SeqVAE core model not initialized.")
 
-        te_fn = getattr(model, 'measure_transfer_entropy', None)
-        target_model = model
-        if te_fn is None:
-            core = self._get_core_module()
-            target_model = core
-            te_fn = getattr(core, 'measure_transfer_entropy', None)
+        with torch.no_grad():
+            enc = core.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=True)
+            mu_prior = enc["mu_prior"]
+            logvar_prior = enc["logvar_prior"]
+            mu_post = enc["mu_post"]
+            logvar_post = enc["logvar_post"]
 
-        if not callable(te_fn):
-            raise AttributeError("Current model does not expose measure_transfer_entropy.")
-
-        try:
-            return te_fn(y_st, y_ph, x_ph, reduce_mean=reduce_mean)
-        except TypeError:
-            # Handle legacy staticmethod signature that expects the model instance explicitly
-            return te_fn(target_model, y_st, y_ph, x_ph, reduce_mean=reduce_mean)
+            kld = (
+                logvar_prior
+                - logvar_post
+                + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+                - 1.0
+            )
+            kld = 0.5 * kld
+            if reduce_mean:
+                return kld.mean()
+            return kld
 
     def run_tests(self, test_loader, cuda_device=None):
         """Run SeqVAE test analyses and plots with optional CUDA device selection.
