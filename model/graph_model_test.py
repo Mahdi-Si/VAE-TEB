@@ -12,6 +12,8 @@ import pickle
 import matplotlib
 matplotlib.use('Agg')
 
+import matplotlib.pyplot as plt
+
 from utils.plot_utils import (
     plot_model_analysis,
     plot_vae_reconstruction,
@@ -262,10 +264,10 @@ class SeqVAEGraphModelTest(SeqVAEGraphModel):
 
         # Pass the created model to avoid re-creation in each analysis function
         self.run_analysis_and_plot(test_loader, 50, output_dir=analysis_dir, selected_guids=selected_guids, model_created=True)
-        self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids, model_created=True)
+        # self.run_transfer_entropy_shift_analysis(test_loader, output_dir=te_shift_dir, selected_guids=selected_guids, model_created=True)
         self.run_metrics_histogram_analysis(test_loader, output_dir=metrics_dir, model_created=True)
-        self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir, model_created=True)
-        self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir, model_created=True)
+        # self.run_up_ablation_analysis(test_loader, output_dir=ablation_dir, model_created=True)
+        # self.run_up_gain_sweep_analysis(test_loader, output_dir=gain_sweep_dir, model_created=True)
 
         # New: forecasting evaluation and plots (keeps legacy tests intact)
         if self._supports_forecast_eval():
