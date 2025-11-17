@@ -70,7 +70,7 @@ class LightningModelBase(L.LightningModule, ABC):
         self.save_hyperparameters(ignore=['base_model'])
         self._orig_model = base_model  # Reference to the original module before compilation/wrapping
         self._wrapper_name = module_name or self.__class__.__name__  # Used in logs to identify this wrapper
-        self.model = torch.compile(base_model)
+        self.model = torch.compile(base_model) # you can consider mode="max-autotune" for long trainings
 
     @property
     def orig_model(self) -> nn.Module:
