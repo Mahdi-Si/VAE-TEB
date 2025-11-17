@@ -496,8 +496,8 @@ class TargetEncoder(nn.Module):
         )
 
         self.conditioning_layer = ResidualMLP(
-            input_dim=32,
-            hidden_dims=geometric_schedule(32, latent_dim, 4),
+            input_dim=16,
+            hidden_dims=geometric_schedule(16, latent_dim, 4),
             final_activation=False,
             activation=nn.GELU
         )
