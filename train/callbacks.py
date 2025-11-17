@@ -243,7 +243,13 @@ class LossPlotCallback(Callback):
 class HyperparameterLoggingCallback(Callback):
     """Track arbitrary hyper-parameters (learning rates, annealing weights, etc.)."""
 
-    def __init__(self, tracked_keys: Optional[Iterable[str]] = None) -> None:
+    def __init__(
+        self,
+        tracked_keys: Optional[Iterable[str]] = None,
+        *,
+        output_dir: Path | str,
+        plot_frequency: int = 10,
+    ) -> None:
         super().__init__()
         self.tracked_keys: Tuple[str, ...] = tuple(
             tracked_keys or ("hyperparams/beta", "kld_beta", "hyperparams/lr", "lr", "learning_rate")
@@ -251,6 +257,10 @@ class HyperparameterLoggingCallback(Callback):
         self.history: Dict[str, List[float]] = {"epoch": []}
         for key in self.tracked_keys:
             self.history[key] = []
+        self.output_dir = Path(output_dir) / "hyperparameter_plots"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.plot_frequency = max(1, int(plot_frequency))
+        self._plotly_available = True
 
     def on_train_epoch_end(self, trainer, pl_module):  # type: ignore[override]
         if not trainer.is_global_zero:
@@ -260,15 +270,18 @@ class HyperparameterLoggingCallback(Callback):
         self.history["epoch"].append(int(epoch))
         for key in self.tracked_keys:
             self.history[key].append(_metric_to_float(metrics.get(key)))
+        if (epoch + 1) % self.plot_frequency == 0:
+            self.plot_hyperparameters()
 
-    def plot_hyperparameters(self, output_dir: Path | str) -> None:
+    def plot_hyperparameters(self) -> None:
+        if not self._plotly_available:
+            return
         if not self.history["epoch"]:
             return
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
         try:
             import plotly.graph_objects as go
         except ImportError:
+            self._plotly_available = False
             logger.warning("Plotly is not installed; skipping hyperparameter logging plot.")
             return
         epochs = np.array(self.history["epoch"], dtype=float)
@@ -297,7 +310,7 @@ class HyperparameterLoggingCallback(Callback):
             yaxis_title="Value",
             template="plotly_white",
         )
-        path = output_path / "hyperparameters_evolution.html"
+        path = self.output_dir / f"hyperparameters_epoch_{int(epochs[-1]):04d}.html"
         fig.write_html(str(path))
         logger.info(f"Hyperparameters plot saved to {path}")
 
@@ -446,12 +459,33 @@ class PlottingCallBack(Callback):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plot_every_epoch = max(1, int(plot_every_epoch))
         self.input_channel_num = input_channel_num
+        self._plotly_available = True
 
     @staticmethod
     def _get(batch, name):
         if isinstance(batch, dict):
             return batch.get(name)
         return getattr(batch, name, None)
+
+    @staticmethod
+    def _guid(batch, index: int = 0) -> str:
+        guid_field = None
+        if isinstance(batch, dict):
+            guid_field = batch.get("guid")
+        elif hasattr(batch, "guid"):
+            guid_field = getattr(batch, "guid")
+        if guid_field is None:
+            return "unknown"
+        if isinstance(guid_field, (list, tuple)):
+            if not guid_field:
+                return "unknown"
+            return str(guid_field[index % len(guid_field)])
+        if isinstance(guid_field, torch.Tensor):
+            try:
+                return str(guid_field[index].item())
+            except Exception:  # noqa: BLE001
+                return "unknown"
+        return str(guid_field)
 
     def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
         if not trainer.is_global_zero:
@@ -478,14 +512,16 @@ class PlottingCallBack(Callback):
                 latent_z = outputs["z"]
                 mu_pr = outputs["mu_pr"]
                 logvar_pr = outputs["logvar_pr"]
-                self._plot_results(
-                    y_raw,
-                    up_raw,
-                    mu_pr,
-                    logvar_pr,
-                    latent_z,
-                    epoch,
-                )
+            guid = self._guid(batch)
+            self._plot_results(
+                y_raw,
+                up_raw,
+                mu_pr,
+                logvar_pr,
+                latent_z,
+                epoch,
+                guid,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"PlottingCallBack failed: {exc}")
         finally:
@@ -499,6 +535,7 @@ class PlottingCallBack(Callback):
         logvar_pr,
         latent_z,
         epoch: int,
+        guid: str,
     ) -> None:
         batch_idx = 0
         y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
@@ -595,7 +632,7 @@ class PlottingCallBack(Callback):
         cbar.ax.tick_params(labelsize=10, colors="#666666")
         cbar.set_label("Activation", fontweight="normal", fontsize=11, color="#666666")
 
-        fig.suptitle(f"Model Performance Analysis — Epoch {epoch}", fontsize=14, y=0.97, color="#456882")
+        fig.suptitle(f"Model Performance Analysis — Epoch {epoch} | guid: {guid}", fontsize=14, y=0.97, color="#456882")
         save_path = self.output_dir / f"model_results_epoch_{epoch:04d}.pdf"
         fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
         plt.close(fig)
