@@ -1,0 +1,113 @@
+
+general_config:
+  tag: stage1_core_vae_training
+
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
+  lr: 0.0001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
+  lr_milestone: [1000]  # Epochs at which to decay learning rate
+  checkpoint_frequency: 1
+  plot_frequency: 1  # Callback log frequency in epochs
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 210
+    test: 210
+  
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training
+
+model_config:
+  VAE_model:
+    enable_forecaster: true         # ← CHANGE TO true FOR STAGE 2
+    freeze_core_model: false         # ← CHANGE TO true FOR STAGE 2 FREEZE MODE
+    scattering_forecast_weight: 1  # ← CHANGE TO 1.0 FOR STAGE 2
+    horizon_len: 30  # 30 decimated steps = ~2 minutes at 4Hz with decimation 16
+
+    beta_schedule: constant      # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0             # Starting beta for annealing schedules
+    beta_end: 1.0               # Final beta for annealing schedules
+    beta_anneal_epochs: 50      # Number of epochs for linear annealing
+    beta_cycle_len: 1000        # Cycle length for cyclic annealing
+    beta_const_val: 0.005       # Constant beta value (ACTIVE when schedule='constant')
+    kld_beta: 0.005             # Fallback beta value
+
+    forecaster_hidden_dim: 128        # Hidden size for forecaster LSTM
+    forecaster_layers: 2              # Number of LSTM layers in forecaster
+    forecaster_dropout: 0.1           # Dropout in forecaster
+    forecaster_min_logvar: -7.0       # Minimum log-variance clamp
+    forecaster_max_logvar: 4.0        # Maximum log-variance clamp
+
+    predictive_horizon: 30            # Forecast horizon (same as horizon_len)
+    predictive_max_anchors: 0         # 0 = use all valid timesteps as anchors
+    log_forecast_metrics: true       # ← CHANGE TO true FOR STAGE 2
+    scattering_discount_gamma: 1.0    # Discount factor for multi-step forecasting
+
+  base_model_checkpoint: null
+  legacy_seqvae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/pre_training/2025-11-02--[14-52]--No_LSTM_B-200_lr-e-3_predictive/model_checkpoints/base-model-best-epoch=34.ckpt
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    vae_test_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+    dataloader_config:
+      num_workers: 0
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+      dataset_kwargs:
+        load_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'epoch', 'guid']
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: null
+        label: null
+        cache_size: 20000
+        trim_minutes: 2.0
+
+# Advanced Training Configuration
+advanced_config:
+  trainer:
+    precision: "16-mixed"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: true
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false    # Set to true if OOM errors occur
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 30
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 1000
+
+    reconstruction_plotting:
+      enabled: false
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: true
+      plot_frequency: 10
+
