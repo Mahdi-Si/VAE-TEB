@@ -40,6 +40,8 @@ def _clean_state_dict(sd):
     cleaned = OrderedDict()
     prefixes = (
         "model._orig_mod.",
+        "model._orig_model.",
+        "_orig_model.",
         "_orig_mod.",
         "model.model.",
         "model.module.",
@@ -80,6 +82,8 @@ def _normalize_checkpoint_state_dict(state_dict):
         new_key = key
         for old_prefix, new_prefix in (
             ('model._orig_mod.', 'model.'),
+            ('model._orig_model.', 'model.'),
+            ('_orig_model.', ''),
             ('_orig_mod.', ''),
             ('model.model.', 'model.'),
         ):
