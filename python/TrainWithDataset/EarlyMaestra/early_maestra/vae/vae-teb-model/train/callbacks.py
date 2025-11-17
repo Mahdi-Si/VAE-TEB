@@ -71,7 +71,7 @@ class LossPlotCallback(Callback):
         mlflow_logger: "MLFlowLogger" | None = None,
     ) -> None:
         super().__init__()
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir) / "loss_plots"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plot_frequency = max(1, int(plot_frequency))
         self.max_history_size = max(1, int(max_history_size))
@@ -87,7 +87,7 @@ class LossPlotCallback(Callback):
         self._tracked_metrics: List[str] = []
 
     def _should_track_metric(self, name: str) -> bool:
-        if name in self.hyperparam_keys or name == "epoch":
+        if name.endswith("_step") or name in self.hyperparam_keys or name == "epoch":
             return False
         if not self.metric_filters:
             return True
