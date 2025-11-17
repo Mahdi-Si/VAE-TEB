@@ -55,12 +55,13 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
 
     def create_model(self):
         self.pytorch_model = SeqVaeCore()
-        self.checkpoint = self.config.get('core_model_checkpoint', None)
+        self.checkpoint = self.config.get('model_config').get('core_model_checkpoint')
         if self.checkpoint is not None:
             load_checkpoint_strict(
                 model=self.pytorch_model,
                 checkpoint=self.checkpoint,
             )
+            logger.info(f"Model loaded from checkpoint: {self.checkpoint}")
         trainer_hparams = {
             "lr": self.lr,
             "lr_milestones": self.lr_milestones,

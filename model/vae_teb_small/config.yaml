@@ -1,6 +1,6 @@
 
 general_config:
-  tag: small_core_model_L8
+  tag: small_core_model_L8_continue
 
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   lr: 0.001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
@@ -24,9 +24,9 @@ model_config:
     beta_anneal_epochs: 50      # Number of epochs for linear annealing
     beta_cycle_len: 1000        # Cycle length for cyclic annealing
     beta_const_val: 0.005       # Constant beta value (ACTIVE when schedule='constant')
-    kld_beta: 0.005             # Fallback beta value
+    kld_beta: 0.05             # Fallback beta value
 
-  core_model_checkpoint: null
+  core_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-11-16--[22-10]--small_core_model_L8/model_checkpoints/core-model-epoch=epoch=125.ckpt
 
 
 dataset_config:
