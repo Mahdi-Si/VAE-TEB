@@ -1,9 +1,9 @@
 
 general_config:
-  tag: stage1_core_vae_training
+  tag: core_model_with_l8
 
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
-  lr: 0.0001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
+  lr: 0.001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
   lr_milestone: [1000]  # Epochs at which to decay learning rate
   checkpoint_frequency: 1
   plot_frequency: 1  # Callback log frequency in epochs
@@ -14,15 +14,10 @@ general_config:
     test: 210
   
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure
 
 model_config:
   VAE_model:
-    enable_forecaster: true         # ← CHANGE TO true FOR STAGE 2
-    freeze_core_model: false         # ← CHANGE TO true FOR STAGE 2 FREEZE MODE
-    scattering_forecast_weight: 1  # ← CHANGE TO 1.0 FOR STAGE 2
-    horizon_len: 30  # 30 decimated steps = ~2 minutes at 4Hz with decimation 16
-
     beta_schedule: constant      # Options: 'constant', 'linear', 'cyclic'
     beta_start: 0.0             # Starting beta for annealing schedules
     beta_end: 1.0               # Final beta for annealing schedules
@@ -30,17 +25,6 @@ model_config:
     beta_cycle_len: 1000        # Cycle length for cyclic annealing
     beta_const_val: 0.005       # Constant beta value (ACTIVE when schedule='constant')
     kld_beta: 0.005             # Fallback beta value
-
-    forecaster_hidden_dim: 128        # Hidden size for forecaster LSTM
-    forecaster_layers: 2              # Number of LSTM layers in forecaster
-    forecaster_dropout: 0.1           # Dropout in forecaster
-    forecaster_min_logvar: -7.0       # Minimum log-variance clamp
-    forecaster_max_logvar: 4.0        # Maximum log-variance clamp
-
-    predictive_horizon: 30            # Forecast horizon (same as horizon_len)
-    predictive_max_anchors: 0         # 0 = use all valid timesteps as anchors
-    log_forecast_metrics: true       # ← CHANGE TO true FOR STAGE 2
-    scattering_discount_gamma: 1.0    # Discount factor for multi-step forecasting
 
   core_model_checkpoint: null
 

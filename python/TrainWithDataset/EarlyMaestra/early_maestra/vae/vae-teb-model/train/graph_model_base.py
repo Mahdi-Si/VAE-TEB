@@ -2,7 +2,7 @@
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch
 
-from graph_models_utils import load_checkpoint_torch
+from train.graph_models_utils import load_checkpoint_torch
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -132,20 +132,20 @@ class GraphModelBase(ABC):
         """
         raise NotImplementedError("Subclasses must implement create_model()")
 
-    @abstractmethod
-    def configure_trainable_params(self, model: torch.nn.Module) -> None:
-        """Set ``requires_grad`` flags before the optimizer sees the parameters.
-
-        Example:
-            >>> def configure_trainable_params(self, model):
-            ...     # Freeze the pretrained encoder
-            ...     for param in model.encoder.parameters():
-            ...         param.requires_grad = False
-            ...     # Train only the decoder head
-            ...     for param in model.decoder.parameters():
-            ...         param.requires_grad = True
-        """
-        raise NotImplementedError("Subclasses must implement configure_trainable_params()")
+    # @abstractmethod
+    # def configure_trainable_params(self, model: torch.nn.Module) -> None:
+    #     """Set ``requires_grad`` flags before the optimizer sees the parameters.
+    #
+    #     Example:
+    #         >>> def configure_trainable_params(self, model):
+    #         ...     # Freeze the pretrained encoder
+    #         ...     for param in model.encoder.parameters():
+    #         ...         param.requires_grad = False
+    #         ...     # Train only the decoder head
+    #         ...     for param in model.decoder.parameters():
+    #         ...         param.requires_grad = True
+    #     """
+    #     raise NotImplementedError("Subclasses must implement configure_trainable_params()")
 
     def set_cuda_devices(self, device_list=None):
         """Override CUDA device IDs used by the training run."""

@@ -1,10 +1,10 @@
 
 general_config:
-  tag: stage1_core_vae_training
+  tag: core_model_with_l8
 
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
-  lr: 0.0001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
-  lr_milestone: [1000]  # Epochs at which to decay learning rate
+  lr: 0.001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
+  lr_milestone: [500]  # Epochs at which to decay learning rate
   checkpoint_frequency: 1
   plot_frequency: 1  # Callback log frequency in epochs
   epochs: 5000
@@ -14,7 +14,7 @@ general_config:
     test: 210
   
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/stage1_core_training
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure
 
 model_config:
   VAE_model:
