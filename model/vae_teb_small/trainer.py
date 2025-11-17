@@ -49,7 +49,7 @@ class SeqVaeCorePl(LightningModelBase):
         return total_loss, metrics
 
 
-class GraphModelVaeTebSmallTrainer(GraphModelTrainer):
+class GraphModelVaeTebSmallTrainer(GraphModelBase):
     def __init__(self, config_file_path=None):
         super(GraphModelVaeTebSmallTrainer, self).__init__(config_file_path)
 
@@ -59,7 +59,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelTrainer):
         if self.checkpoint is not None:
             load_checkpoint_strict(
                 model=self.pytorch_model,
-                checkpoint_path=self.checkpoint,
+                checkpoint=self.checkpoint,
             )
         trainer_hparams = {
             "lr": self.lr,
@@ -152,7 +152,7 @@ def main():
     normalized_fields = dataloader_config.get('normalized_fields', [])
     stat_path = dataloader_config.get('stat_path', None)
     train_dataloader = create_optimized_dataloader(
-        hdf5_files=dataset_config.get('train_datasets', []),
+        hdf5_files=dataset_config.get('vae_train_datasets', []),
         batch_size=config['general_config']['batch_size']['train'],
         num_workers=dataloader_config.get('num_workers', 4),
         shuffle=True,
@@ -165,7 +165,7 @@ def main():
     )
     
     validation_dataloader = create_optimized_dataloader(
-        hdf5_files=dataset_config.get('validation_datasets', []),
+        hdf5_files=dataset_config.get('vae_test_datasets', []),
         batch_size=config['general_config']['batch_size']['test'],
         num_workers=dataloader_config.get('num_workers', 4),
         shuffle=False,
