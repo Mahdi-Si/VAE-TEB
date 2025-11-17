@@ -1,4 +1,4 @@
-from train.graph_model_base import GraphModelTrainer
+from train.graph_model_base import GraphModelBase
 from train.pl_model_base import LightningModelBase
 from train.callbacks import (
     LossPlotCallback,
@@ -14,7 +14,7 @@ from vae_teb_model_small import SeqVaeCore
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
-import lightning as L
+import lightning as pl
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 
@@ -132,7 +132,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelTrainer):
             )
         else:
             trainer_kwargs.update({"accelerator": "cpu", "devices": 1})
-        trainer = L.Trainer(**trainer_kwargs)
+        trainer = pl.Trainer(**trainer_kwargs)
         trainer.fit(self.pl_model, train_dataloader, validation_dataloader)
         return trainer
         
