@@ -120,7 +120,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             "use_distributed_sampler": True,
             "sync_batchnorm": len(self.cuda_devices) > 1,
             "enable_progress_bar": True,
-            "profiler": SimpleProfiler,
+            "profiler": SimpleProfiler(dirpath=self.train_results_dir),
         }
         if torch.cuda.is_available():
             trainer_kwargs.update(
