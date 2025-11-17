@@ -75,7 +75,6 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
     
     def train_model(self, train_dataloader, validation_dataloader):
         callbacks_cfg = self.config.get("advanced_config", {}).get("callbacks", {})
-        plot_frequency = callbacks_cfg.get("comprehensive_plotting", {}).get("plot_frequency", 5)
         self.metrics_callback = MetricsLoggingCallback()
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
@@ -84,7 +83,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
         self.hyperparam_callback = HyperparameterLoggingCallback()
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
-            plot_frequency=plot_frequency,
+            plot_frequency=self.plot_every_epoch,
         )
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
@@ -97,8 +96,8 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             self.metrics_callback,
             self.loss_plot_callback,
             self.hyperparam_callback,
-            self.plotting_callback,
             self.checkpoint_callback,
+            self.plotting_callback,
         ]
         trainer_cfg = self.config.get("advanced_config", {}).get("trainer", {})
         precision = trainer_cfg.get("precision", "32-true")
