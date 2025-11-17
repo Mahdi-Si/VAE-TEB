@@ -80,8 +80,10 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             output_dir=self.train_results_dir,
             plot_frequency=self.config["general_config"].get("plot_frequency", 1),
         )
-        self.hyperparam_callback = HyperparameterLoggingCallback()
-        plot_frequency = callbacks_cfg.get("comprehensive_plotting", {}).get("plot_frequency", 5)
+        self.hyperparam_callback = HyperparameterLoggingCallback(
+            output_dir=self.train_results_dir,
+            plot_frequency=10,
+        )
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
             plot_every_epoch=self.plot_every_epoch,
