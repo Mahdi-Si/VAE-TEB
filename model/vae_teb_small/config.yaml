@@ -1,6 +1,6 @@
 
 general_config:
-  tag: core_model_with_l8
+  tag: small_core_model_L8
 
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   lr: 0.001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
@@ -36,10 +36,11 @@ dataset_config:
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
     vae_test_datasets:
       - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
 
     dataloader_config:

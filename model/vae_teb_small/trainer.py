@@ -84,7 +84,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
         plot_frequency = callbacks_cfg.get("comprehensive_plotting", {}).get("plot_frequency", 5)
         self.plotting_callback = PlottingCallBack(
             output_dir=self.train_results_dir,
-            plot_every_epoch=plot_frequency,
+            plot_every_epoch=self.plot_every_epoch,
             input_channel_num=0,
         )
         self.checkpoint_callback = ModelCheckpoint(
@@ -147,11 +147,14 @@ def main():
     with open(r'config.yaml') as f:
         config = yaml.safe_load(f)
     
-    dataset_config = config.get('dataset_config', {})
-    dataloader_config = dataset_config.get('dataloader_config', {})
-    dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-    normalized_fields = dataloader_config.get('normalized_fields', [])
-    stat_path = dataloader_config.get('stat_path', None)
+    dataset_config = config.get('dataset_config')
+    dataloader_config = dataset_config.get('dataloader_config')
+    dataset_kwargs = dataloader_config.get('dataset_kwargs')
+    normalized_fields = dataloader_config.get('normalize_fields')
+    stat_path = dataset_config.get('stat_path')
+    if stat_path is None:
+        raise ValueError("stat_path must be provided")
+    logger.info(f"normalized fields: {normalized_fields}")
     train_dataloader = create_optimized_dataloader(
         hdf5_files=dataset_config.get('vae_train_datasets', []),
         batch_size=config['general_config']['batch_size']['train'],
