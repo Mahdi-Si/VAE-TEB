@@ -666,16 +666,6 @@ class SeqVAEGraphModel:
         Returns:
             dict: A dictionary containing the training history.
         """
-        logger.info("Setting up trainer for the base model...")
-        logger.info(
-            "Scattering forecasting config | scattering_forecast_weight=%.4f | gamma=%.3f | horizon=%s | max_anchors=%s | log_metrics=%s",
-            self.scattering_forecast_weight,
-            self.scattering_discount_gamma,
-            self.predictive_horizon,
-            self.predictive_max_anchors,
-            self.log_forecast_metrics,
-        )
-        logger.info("Scattering forecaster enabled: %s", self.enable_forecaster)
         self.forecast_metrics_callback = ScatteringForecastMetricsCallback(
             log_every_n_epochs=self.plot_every_epoch,
         )

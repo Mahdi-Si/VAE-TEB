@@ -17,7 +17,6 @@ class InterceptHandler(_logging.Handler):
 
     def emit(self, record: _logging.LogRecord):
         level = record.levelname
-        # Find the call frame so Loguru reports the correct origin
         frame, depth = _logging.currentframe(), 2
         while frame and frame.f_code.co_filename == _logging.__file__:
             frame = frame.f_back
@@ -37,8 +36,8 @@ def setup_logging(
     retention: str = "7 days",
     compression: Optional[str] = "zip",
     serialize: bool = False,
-    backtrace: bool = False,
-    diagnose: bool = False,
+    backtrace: bool = True,
+    diagnose: bool = True,
 ):
     """
     Configure Loguru-based logging for the entire application.
