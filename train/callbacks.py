@@ -438,13 +438,14 @@ class ReconstructionPlotCallback(Callback):
 
 
 class PlottingCallBack(Callback):
-    """Simple qualitative figure for the first validation batch."""
+    """Reproduce the original SeqVAE qualitative plotting callback."""
 
-    def __init__(self, output_dir: Path | str, plot_frequency: int = 5):
+    def __init__(self, output_dir: Path | str, plot_every_epoch: int = 5, input_channel_num: int = 0):
         super().__init__()
         self.output_dir = Path(output_dir) / "analysis_plots"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.plot_frequency = max(1, int(plot_frequency))
+        self.plot_every_epoch = max(1, int(plot_every_epoch))
+        self.input_channel_num = input_channel_num
 
     @staticmethod
     def _get(batch, name):
@@ -452,59 +453,60 @@ class PlottingCallBack(Callback):
             return batch.get(name)
         return getattr(batch, name, None)
 
-    @staticmethod
-    def _guid_from_batch(guid_field, index: int = 0) -> str:
-        if guid_field is None:
-            return "unknown"
-        if isinstance(guid_field, (list, tuple)):
-            if not guid_field:
-                return "unknown"
-            return str(guid_field[index % len(guid_field)])
-        if isinstance(guid_field, torch.Tensor):
-            try:
-                return str(guid_field[index].item())
-            except Exception:  # noqa: BLE001
-                return "unknown"
-        return str(guid_field)
-
     def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
         if not trainer.is_global_zero:
             return
         epoch = trainer.current_epoch
-        if (epoch + 1) % self.plot_frequency != 0:
+        if (epoch + 1) % self.plot_every_epoch != 0:
             return
+
         batch = _first_validation_batch(trainer)
         if batch is None:
+            logger.warning("PlottingCallBack: could not fetch validation batch")
             return
-        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
-        y_st = self._get(batch, "fhr_st")
-        y_ph = self._get(batch, "fhr_ph")
-        x_ph = self._get(batch, "fhr_up_ph")
-        y_raw = self._get(batch, "fhr")
-        up_raw = self._get(batch, "up")
-        guid_field = self._get(batch, "guid")
-        if not all(isinstance(t, torch.Tensor) for t in (y_st, y_ph, x_ph, y_raw, up_raw)):
-            return
-        model = getattr(pl_module, "model", pl_module)
-        with torch.no_grad():
-            outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
-        mu_pr = outputs.get("mu_pr")
-        logvar_pr = outputs.get("logvar_pr")
-        latent_z = outputs.get("z")
-        if not all(isinstance(t, torch.Tensor) for t in (mu_pr, logvar_pr, latent_z)):
-            return
-        guid = self._guid_from_batch(guid_field)
-        self._plot_sample(y_raw, up_raw, mu_pr, logvar_pr, latent_z, epoch, guid)
 
-    def _plot_sample(self, y_raw, up_raw, mu_pr, logvar_pr, latent_z, epoch: int, guid: str) -> None:
-        idx = 0
-        y = y_raw[idx].detach().cpu().numpy()
-        up = up_raw[idx].detach().cpu().numpy()
-        recon = mu_pr[idx].detach().cpu().numpy()
-        logvar = logvar_pr[idx].detach().cpu().numpy()
-        latent = latent_z[idx].detach().cpu().numpy()
-        std = np.sqrt(np.exp(logvar))
-        time_axis = np.arange(y.shape[-1]) / 4.0
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
+        module = getattr(pl_module, "model", pl_module)
+
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+                y_raw = batch.fhr
+                up_raw = batch.up
+                outputs = module(y_st, y_ph, x_ph)
+                latent_z = outputs["z"]
+                mu_pr = outputs["mu_pr"]
+                logvar_pr = outputs["logvar_pr"]
+                self._plot_results(
+                    y_raw,
+                    up_raw,
+                    mu_pr,
+                    logvar_pr,
+                    latent_z,
+                    epoch,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"PlottingCallBack failed: {exc}")
+        finally:
+            pl_module.train()
+
+    def _plot_results(
+        self,
+        y_raw_normalized,
+        up_raw_normalized,
+        mu_pr,
+        logvar_pr,
+        latent_z,
+        epoch: int,
+    ) -> None:
+        batch_idx = 0
+        y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
+        up_raw = up_raw_normalized[batch_idx].detach().cpu().numpy()
+        mu_samples = mu_pr[batch_idx].detach().cpu().numpy()
+        logvar_samples = logvar_pr[batch_idx].detach().cpu().numpy()
+        z_latent = latent_z[batch_idx].detach().cpu().numpy()
+        time_axis = np.arange(0, len(y_raw)) / 4.0
 
         colors = {
             "fhr": "#055C9A",
@@ -512,6 +514,7 @@ class PlottingCallBack(Callback):
             "gt": "#456882",
             "recon": "#BB3E00",
             "uncertainty": "#F7AD45",
+            "samples": "#4BD605",
             "background": "#F9F3EF",
         }
 
@@ -522,61 +525,79 @@ class PlottingCallBack(Callback):
                 "font.size": 11,
                 "axes.titlesize": 12,
                 "axes.labelsize": 11,
-                "axes.edgecolor": "#A2B9A7",
-                "axes.linewidth": 1.0,
-                "figure.facecolor": "#F7F7F7",
+                "axes.linewidth": 0.7,
+                "axes.edgecolor": "#9E9D9D",
+                "axes.facecolor": colors["background"],
+                "grid.color": "#838383",
+                "grid.linewidth": 0.4,
+                "grid.alpha": 0.6,
+                "figure.facecolor": "white",
+                "savefig.facecolor": "white",
+                "savefig.dpi": 300,
             }
         )
-        fig, ax = plt.subplots(4, 2, figsize=(16, 12), gridspec_kw={"height_ratios": [1.3, 1.3, 1.3, 1.6]})
-        fig.subplots_adjust(hspace=0.35, wspace=0.25)
-        fig.patch.set_facecolor("#F7F7F7")
-        for axis_row in ax:
-            for axis in axis_row:
-                axis.set_facecolor(colors["background"])
-                axis.grid(color="#C6D8D3", linestyle="--", linewidth=0.5, alpha=0.4)
-                axis.tick_params(axis="x", colors="#666666")
-                axis.tick_params(axis="y", colors="#666666")
 
-        Fs = 4
-        zoom = Fs * 120
+        n_rows = 4
+        fig, ax = plt.subplots(
+            nrows=n_rows,
+            ncols=2,
+            figsize=(20, n_rows * 3.5),
+            gridspec_kw={"width_ratios": [80, 1]},
+            constrained_layout=True,
+        )
+        for i in range(n_rows):
+            ax[i, 0].grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
+            ax[i, 0].grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color="#D2C1B6")
+            ax[i, 0].minorticks_on()
+            ax[i, 0].set_axisbelow(True)
+            ax[i, 0].spines["top"].set_visible(False)
+            ax[i, 0].spines["right"].set_visible(False)
+            ax[i, 0].spines["left"].set_color("#A2B9A7")
+            ax[i, 0].spines["bottom"].set_color("#A2B9A7")
+            ax[i, 0].spines["left"].set_linewidth(0.7)
+            ax[i, 0].spines["bottom"].set_linewidth(0.7)
+            ax[i, 1].set_axis_off()
 
-        ax[0, 0].plot(time_axis, y, label="FHR signal (target)", color=colors["fhr"], linewidth=1.2)
-        ax[0, 0].plot(time_axis, up, label="UP signal", color=colors["up"], linewidth=1.0, alpha=0.8)
-        ax[0, 0].set_ylabel("Normalized amplitude")
-        ax[0, 0].set_title("Input FHR and UP signals", pad=12)
-        ax[0, 0].legend(loc="upper right", framealpha=0.9)
+        ax[0, 0].plot(time_axis, y_raw, linewidth=1.2, color=colors["fhr"], label="FHR", alpha=0.85)
+        ax[0, 0].plot(time_axis, up_raw, linewidth=1.2, color=colors["up"], label="UP", alpha=0.85)
+        ax[0, 0].set_ylabel("Amplitude")
+        ax[0, 0].set_title("Raw FHR and UP Signals", pad=12)
+        ax[0, 0].legend(loc="upper right", framealpha=0.95)
 
-        ax[0, 1].plot(time_axis[:zoom], y[:zoom], color=colors["gt"], linewidth=1.2)
-        ax[0, 1].set_title("FHR signal (first 2 minutes)", pad=12)
-        ax[0, 1].set_ylabel("Amplitude")
+        ax[1, 0].plot(time_axis, y_raw, linewidth=1.5, color=colors["gt"], label="Ground Truth", alpha=0.85, zorder=3)
+        ax[1, 0].plot(time_axis, mu_samples, linewidth=1.5, color=colors["recon"], label="Reconstruction", alpha=0.85, zorder=2)
+        std_dev = np.exp(0.5 * logvar_samples)
+        ax[1, 0].fill_between(
+            time_axis,
+            mu_samples - std_dev,
+            mu_samples + std_dev,
+            alpha=0.3,
+            color=colors["uncertainty"],
+            label="Uncertainty (±1σ)",
+            zorder=1,
+        )
+        ax[1, 0].set_ylabel("FHR (bpm)")
+        ax[1, 0].set_title("FHR Reconstruction with Uncertainty", pad=12)
+        ax[1, 0].legend(loc="upper right", framealpha=0.95)
 
-        ax[1, 0].plot(time_axis, recon, color=colors["recon"], linewidth=1.2, label="Model mean reconstruction")
-        ax[1, 0].fill_between(time_axis, recon - 2 * std, recon + 2 * std, color=colors["uncertainty"], alpha=0.35, label="±2σ")
-        ax[1, 0].set_ylabel("Amplitude")
-        ax[1, 0].set_title("Model mean reconstruction with uncertainty", pad=12)
-        ax[1, 0].legend(loc="upper right", framealpha=0.9)
+        ax[2, 0].plot(time_axis, y_raw, linewidth=1.5, color=colors["gt"], label="Ground Truth", alpha=0.85, zorder=2)
+        ax[2, 0].plot(time_axis, mu_samples, linewidth=1.5, color=colors["samples"], label="Model Prediction", alpha=0.85, zorder=1)
+        ax[2, 0].set_ylabel("FHR (bpm)")
+        ax[2, 0].set_title("FHR vs Model Reconstructions", pad=12)
+        ax[2, 0].legend(loc="upper right", framealpha=0.95)
 
-        ax[1, 1].plot(time_axis[:zoom], recon[:zoom], color=colors["recon"], linewidth=1.2)
-        ax[1, 1].fill_between(time_axis[:zoom], (recon - 2 * std)[:zoom], (recon + 2 * std)[:zoom], color=colors["uncertainty"], alpha=0.35)
-        ax[1, 1].set_title("Reconstruction detail (first 2 minutes)", pad=12)
-        ax[1, 1].set_ylabel("Amplitude")
+        imgplot = ax[3, 0].imshow(z_latent.T, aspect="auto", cmap="bwr", origin="lower")
+        ax[3, 0].set_ylabel("Latent Dimensions")
+        ax[3, 0].set_xlabel("Time Steps")
+        ax[3, 0].set_title("Latent Space Representation", pad=12)
+        ax[3, 1].set_axis_on()
+        cbar = fig.colorbar(imgplot, cax=ax[3, 1])
+        cbar.ax.tick_params(labelsize=10, colors="#666666")
+        cbar.set_label("Activation", fontweight="normal", fontsize=11, color="#666666")
 
-        ax[2, 0].plot(time_axis, y, label="Ground truth", color=colors["gt"], linewidth=1.2)
-        ax[2, 0].plot(time_axis, recon, label="Model mean", color=colors["recon"], linewidth=1.2, alpha=0.9)
-        ax[2, 0].set_ylabel("Normalized amplitude")
-        ax[2, 0].set_title("FHR vs model reconstructions", pad=12)
-        ax[2, 0].legend(loc="upper right", framealpha=0.9)
-        ax[2, 1].axis("off")
-
-        imgplot = ax[3, 0].imshow(latent.T, aspect="auto", cmap="bwr", origin="lower")
-        ax[3, 0].set_ylabel("Latent dimensions")
-        ax[3, 0].set_xlabel("Time steps")
-        ax[3, 0].set_title("Latent space representation", pad=12)
-        fig.colorbar(imgplot, ax=ax[3, 1], fraction=0.046, pad=0.04).set_label("Activation", fontsize=11, color="#666666")
-
-        fig.suptitle(f"Model performance analysis – Epoch {epoch} | guid: {guid}", fontsize=14, y=0.98, color=colors["gt"])
-        path = self.output_dir / f"analysis_epoch_{epoch:04d}.pdf"
-        fig.savefig(path, bbox_inches="tight", dpi=250)
+        fig.suptitle(f"Model Performance Analysis — Epoch {epoch}", fontsize=14, y=0.97, color="#456882")
+        save_path = self.output_dir / f"model_results_epoch_{epoch:04d}.pdf"
+        fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
         plt.close(fig)
 
 
