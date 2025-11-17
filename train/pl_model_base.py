@@ -308,26 +308,3 @@ class LightningModelBase(L.LightningModule, ABC):
 
     def _on_train_epoch_start_hook(self) -> None:
         """Optional hook for subclasses that need to refresh schedulers or state."""
-
-    def on_save_checkpoint(self) -> None:
-        """Persist the underlying PyTorch module alongside Lightning checkpoints."""
-        if not hasattr(self, "trainer") or self.trainer is None:
-            return
-        callback = getattr(self.trainer, "checkpoint_callback", None)
-        if callback is None or not getattr(callback, "dirpath", None):
-            return
-        orig_model = self.orig_model
-        if not isinstance(orig_model, nn.Module):
-            return
-        dir_path = Path(callback.dirpath)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        epoch = getattr(self.trainer, "current_epoch", None)
-        global_step = getattr(self.trainer, "global_step", None)
-        if epoch is not None:
-            suffix = f"epoch={int(epoch):04d}"
-        elif global_step is not None:
-            suffix = f"step={int(global_step):06d}"
-        else:
-            suffix = "raw"
-        file_name = f"{self._wrapper_name}_{suffix}_orig_state_dict.pt"
-        torch.save(orig_model.state_dict(), dir_path / file_name)
