@@ -87,6 +87,19 @@ advanced_config:
     memory_threshold_gb: 60.0
     memory_log_frequency: 500
 
+  tracking:
+    mlflow:
+      enabled: false
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb
+      run_name: null
+      artifact_location: null
+      log_model: false
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+
   callbacks:
     early_stopping:
       enabled: false

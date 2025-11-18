@@ -80,6 +80,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
         self.loss_plot_callback = LossPlotCallback(
             output_dir=self.train_results_dir,
             plot_frequency=self.config["general_config"].get("plot_frequency", 1),
+            mlflow_logger=self.mlflow_logger,
         )
         self.hyperparam_callback = HyperparameterLoggingCallback(
             output_dir=self.train_results_dir,
@@ -108,6 +109,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
         precision = trainer_cfg.get("precision", "32-true")
         gradient_clip_val = trainer_cfg.get("gradient_clip_val")
         gradient_clip_algorithm = trainer_cfg.get("gradient_clip_algorithm", "norm")
+        logger_reference = self.lightning_loggers if self.lightning_loggers else True
         trainer_kwargs = {
             "max_epochs": self.epochs_num,
             "callbacks": callback_list,
@@ -125,6 +127,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             "sync_batchnorm": len(self.cuda_devices) > 1,
             "enable_progress_bar": True,
             "profiler": SimpleProfiler(dirpath=self.train_results_dir),
+            "logger": logger_reference,
         }
         if torch.cuda.is_available():
             trainer_kwargs.update(

@@ -71,8 +71,7 @@ class LossPlotCallback(Callback):
         mlflow_logger: "MLFlowLogger" | None = None,
     ) -> None:
         super().__init__()
-        self.output_dir = Path(output_dir) / "loss_plots"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(output_dir)
         self.plot_frequency = max(1, int(plot_frequency))
         self.max_history_size = max(1, int(max_history_size))
         self._mlflow_logger = mlflow_logger
@@ -257,10 +256,19 @@ class HyperparameterLoggingCallback(Callback):
         self.history: Dict[str, List[float]] = {"epoch": []}
         for key in self.tracked_keys:
             self.history[key] = []
-        self.output_dir = Path(output_dir) / "hyperparameter_plots"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(output_dir)
         self.plot_frequency = max(1, int(plot_frequency))
         self._plotly_available = True
+
+    @staticmethod
+    def _current_lr(trainer) -> Optional[float]:
+        optimizers = getattr(trainer, "optimizers", None)
+        if not optimizers:
+            return None
+        optimizer = optimizers[0]
+        if not optimizer.param_groups:
+            return None
+        return float(optimizer.param_groups[0].get("lr", 0.0))
 
     def on_train_epoch_end(self, trainer, pl_module):  # type: ignore[override]
         if not trainer.is_global_zero:
@@ -268,8 +276,12 @@ class HyperparameterLoggingCallback(Callback):
         metrics = trainer.callback_metrics
         epoch = trainer.current_epoch
         self.history["epoch"].append(int(epoch))
+        lr_value = self._current_lr(trainer)
         for key in self.tracked_keys:
-            self.history[key].append(_metric_to_float(metrics.get(key)))
+            value = metrics.get(key)
+            if value is None and lr_value is not None and "lr" in key:
+                value = lr_value
+            self.history[key].append(_metric_to_float(value))
         if (epoch + 1) % self.plot_frequency == 0:
             self.plot_hyperparameters()
 
@@ -310,7 +322,7 @@ class HyperparameterLoggingCallback(Callback):
             yaxis_title="Value",
             template="plotly_white",
         )
-        path = self.output_dir / f"hyperparameters_epoch_{int(epochs[-1]):04d}.html"
+        path = self.output_dir / f"hyperparameters.html"
         fig.write_html(str(path))
         logger.info(f"Hyperparameters plot saved to {path}")
 
