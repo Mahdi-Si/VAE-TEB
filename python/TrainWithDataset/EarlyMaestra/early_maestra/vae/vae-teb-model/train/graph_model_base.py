@@ -9,10 +9,12 @@ import matplotlib
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 import yaml
 import os
 
+from lightning.pytorch.loggers import Logger as LightningLogger
+from lightning.pytorch.loggers import MLFlowLogger
 from utils.custom_logger import setup_logging
 from loguru import logger
 
@@ -59,6 +61,12 @@ class GraphModelBase(ABC):
         self.experiment_tag = self.config['general_config']['tag']
         self.cuda_devices = self.config['general_config']['cuda_devices']
 
+        advanced_cfg = self.config.get('advanced_config', {})
+        tracking_cfg = advanced_cfg.get('tracking', {}).get('mlflow', {}) or {}
+        self._mlflow_settings = tracking_cfg
+        self.mlflow_logger: Optional[MLFlowLogger] = None
+        self.lightning_loggers: List[LightningLogger] = []
+
         self.output_base_dir = os.path.normpath(self.config['general_config']['folders_config']['out_dir_base'])
         self.base_folder = f'{run_date}-{self.experiment_tag}'
         self.train_results_dir = os.path.join(self.output_base_dir, self.base_folder, 'train_results')
@@ -81,7 +89,6 @@ class GraphModelBase(ABC):
 
         self.clip = 10
         plt.ion()
-
 
     def setup_config(self):
         """Initialize logging sinks and ensure output directories exist."""
@@ -116,6 +123,7 @@ class GraphModelBase(ABC):
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_accumulated_memory_stats()
 
+        self._init_mlflow_logger()
 
     @abstractmethod
     def create_model(self):
@@ -180,13 +188,8 @@ class GraphModelBase(ABC):
         optionally loading weights into) the Lightning module to ensure the
         experiment always uses the values declared in the current config file.
         """
-        hparams = getattr(lightning_module, "hparams", None)
-        if hparams is None:
-            logger.warning("apply_config_hyperparameters: module exposes no hparams attribute; skipping override")
-            return
-
+        hparams = getattr(lightning_module, "hparams")
         overrides = hparams_dict
-
         updated = []
         for key, value in overrides.items():
             if value is None:
@@ -203,6 +206,43 @@ class GraphModelBase(ABC):
     def train_model(self, train_loader, validation_loader):
         """Run the full training loop using Lightning's Trainer."""
         raise NotImplementedError("Subclasses must implement train_base_model()")
+
+    def _init_mlflow_logger(self) -> None:
+        """Create an MLflow logger when enabled in the experiment config."""
+        settings = self._mlflow_settings
+        enabled = bool(settings.get('enabled', False))
+        if not enabled:
+            self.mlflow_logger = None
+            self.lightning_loggers = []
+            return
+        experiment_name = settings.get('experiment_name') or self.experiment_tag
+        run_name = settings.get('run_name') or self.base_folder
+        tracking_uri = settings.get('tracking_uri')
+        artifact_location = settings.get('artifact_location')
+        log_model = bool(settings.get('log_model', False))
+        tags = settings.get('tags') or None
+        self.mlflow_logger = MLFlowLogger(
+            experiment_name=experiment_name,
+            run_name=run_name,
+            tracking_uri=tracking_uri,
+            artifact_location=artifact_location,
+            log_model=log_model,
+            tags=tags,
+            save_dir=self.train_results_dir,
+        )
+        basic_params = {
+            "tag": self.experiment_tag,
+            "lr": self.lr,
+            "epochs": self.epochs_num,
+            "batch_size_train": self.batch_size_train,
+            "batch_size_test": self.batch_size_test,
+            "run_directory": self.train_results_dir,
+        }
+        try:
+            self.mlflow_logger.log_hyperparams(basic_params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MLflow hyperparameter logging failed: {exc}")
+        self.lightning_loggers = [self.mlflow_logger]
 
 
 if __name__ == '__main__':
