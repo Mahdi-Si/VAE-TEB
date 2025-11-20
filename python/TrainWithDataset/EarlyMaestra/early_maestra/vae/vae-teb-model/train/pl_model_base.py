@@ -243,7 +243,7 @@ class LightningModelBase(L.LightningModule, ABC):
         ``compute_loss_and_metrics``.
         """
         loss, metrics = self.compute_loss_and_metrics(batch, batch_idx, stage)
-        self._log_metrics(metrics, stage=stage, on_step=(stage == "train"))
+        self._log_metrics(metrics, stage=stage, on_step=False)
         return loss
 
     def _log_learning_rate(self) -> None:

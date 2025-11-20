@@ -1,24 +1,22 @@
-"""Project-specific Lightning callbacks for plotting and metric logging."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
-
-import fnmatch
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
 from lightning.pytorch.callbacks import Callback
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from loguru import logger
+from pathlib import Path
+import numpy as np
+import matplotlib
+import fnmatch
+import torch
+
 
 if TYPE_CHECKING:
     from lightning.pytorch.loggers import MLFlowLogger
 
+matplotlib.use("Agg")
 
 def _resolve_validation_dataloader(trainer):
     """Return the first validation dataloader regardless of trainer setup."""
@@ -79,7 +77,7 @@ class LossPlotCallback(Callback):
         self.history: Dict[str, List[float]] = {"epoch": []}
         self.metric_filters: Tuple[str, ...] = tuple(metric_filters or ("train/*", "val/*"))
         self.hyperparam_keys: Tuple[str, ...] = tuple(
-            hyperparam_keys or ("hyperparams/beta", "hyperparams/lr", "kld_beta", "lr", "learning_rate")
+            hyperparam_keys or ("hyperparams/beta", "hyperparams/lr", "hyperparams/kld_beta", "lr", "learning_rate", "kld_beta", "beta")
         )
         for key in self.hyperparam_keys:
             self.history.setdefault(key, [])
@@ -108,7 +106,7 @@ class LossPlotCallback(Callback):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Failed to log artifact {path} to MLflow: {exc}")
 
-    def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+    def on_validation_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch
         metrics = trainer.callback_metrics
         self.history["epoch"].append(int(epoch))
@@ -138,14 +136,6 @@ class LossPlotCallback(Callback):
         self.plot_hyperparameters()
 
     def plot_losses(self) -> None:
-        if not self._plotly_available:
-            return
-        try:
-            import plotly.graph_objects as go
-        except ImportError:
-            self._plotly_available = False
-            logger.warning("Plotly is not installed; skipping loss plotting.")
-            return
         epochs = self.history["epoch"]
         if not epochs:
             return

@@ -34,7 +34,6 @@ matplotlib.use('Agg')
 # os.environ['MASTER_PORT'] = '29500'
 
 
-
 class GraphModelBase(ABC):
     """Shared scaffolding for SeqVAE experiment pipelines.
 
@@ -238,10 +237,7 @@ class GraphModelBase(ABC):
             "batch_size_test": self.batch_size_test,
             "run_directory": self.train_results_dir,
         }
-        try:
-            self.mlflow_logger.log_hyperparams(basic_params)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"MLflow hyperparameter logging failed: {exc}")
+        self.mlflow_logger.log_hyperparams(basic_params)
         self.lightning_loggers = [self.mlflow_logger]
 
 
