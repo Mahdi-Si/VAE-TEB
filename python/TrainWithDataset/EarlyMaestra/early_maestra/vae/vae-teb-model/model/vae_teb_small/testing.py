@@ -11,7 +11,8 @@ import numpy as np
 import torch
 import yaml
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, CustomJS, Slider
+from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider
+from bokeh.palettes import Viridis256
 from bokeh.plotting import figure, output_file, save
 from loguru import logger
 
@@ -196,6 +197,49 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         fig.savefig(out_dir / "latent_histograms.png", dpi=200)
         plt.close(fig)
         logger.info("Latent distribution plot saved to %s", out_dir)
+
+    @staticmethod
+    def _extract_guid_epoch(batch, index: int) -> tuple[Optional[str], Optional[float]]:
+        guid_attr = getattr(batch, "guid", None)
+        epoch_attr = getattr(batch, "epoch", None)
+        guid_val: Optional[str] = None
+        epoch_val: Optional[float] = None
+        if guid_attr is not None:
+            try:
+                raw_guid = guid_attr[index]
+                if isinstance(raw_guid, torch.Tensor):
+                    if raw_guid.dtype == torch.int64:
+                        raw_guid = int(raw_guid.item())
+                    else:
+                        raw_guid = raw_guid.item()
+                if isinstance(raw_guid, bytes):
+                    raw_guid = raw_guid.decode("utf-8")
+                guid_val = str(raw_guid)
+            except Exception:
+                guid_val = None
+        if epoch_attr is not None:
+            try:
+                raw_epoch = epoch_attr[index]
+                if isinstance(raw_epoch, torch.Tensor):
+                    epoch_val = float(raw_epoch.item())
+                else:
+                    epoch_val = float(raw_epoch)
+            except Exception:
+                epoch_val = None
+        return guid_val, epoch_val
+
+    @staticmethod
+    def _build_consecutive_pairs(grouped: Dict[str, List[Dict[str, Any]]], target: int) -> List[tuple[Dict[str, Any], Dict[str, Any]]]:
+        pairs: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for entries in grouped.values():
+            if not entries:
+                continue
+            entries.sort(key=lambda item: item.get("epoch", 0.0))
+            for idx in range(len(entries) - 1):
+                pairs.append((entries[idx], entries[idx + 1]))
+                if len(pairs) >= target:
+                    return pairs
+        return pairs
 
     @staticmethod
     def _kld_tensor_from_forward(outputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
@@ -761,19 +805,27 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         required_samples = pair_count * 2
-        samples: List[Dict[str, torch.Tensor]] = []
+        samples: List[Dict[str, Any]] = []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        metadata_available = True
         with torch.inference_mode():
             for batch in test_loader:
                 batch_size = batch.fhr_st.size(0)
                 for idx in range(batch_size):
-                    samples.append(
-                        {
-                            "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
-                            "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
-                            "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
-                            "fhr": batch.fhr[idx : idx + 1].to(device),
-                        }
-                    )
+                    guid_val, epoch_val = self._extract_guid_epoch(batch, idx)
+                    entry = {
+                        "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
+                        "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
+                        "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
+                        "fhr": batch.fhr[idx : idx + 1].to(device),
+                        "guid": guid_val,
+                        "epoch": epoch_val,
+                    }
+                    samples.append(entry)
+                    if guid_val is not None and epoch_val is not None:
+                        grouped.setdefault(guid_val, []).append(entry)
+                    else:
+                        metadata_available = False
                     if len(samples) >= required_samples:
                         break
                 if len(samples) >= required_samples:
@@ -782,11 +834,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             logger.error("Insufficient samples for interpolation.")
             return
 
-        actual_pairs = min(pair_count, len(samples) // 2)
+        if metadata_available and grouped:
+            sample_pairs = self._build_consecutive_pairs(grouped, pair_count)
+        else:
+            sample_pairs = []
+        if not sample_pairs:
+            logger.warning("Falling back to sequential pairing for interpolation.")
+            for idx in range(0, min(len(samples) - 1, pair_count * 2), 2):
+                sample_pairs.append((samples[idx], samples[idx + 1]))
+        if not sample_pairs:
+            logger.error("Unable to construct interpolation pairs.")
+            return
+
+        actual_pairs = min(pair_count, len(sample_pairs))
         weights = np.linspace(0.0, 1.0, steps)
         for pair_idx in range(actual_pairs):
-            sample_a = samples[2 * pair_idx]
-            sample_b = samples[2 * pair_idx + 1]
+            sample_a, sample_b = sample_pairs[pair_idx]
             with torch.inference_mode():
                 outputs_a = model(y_st=sample_a["fhr_st"], y_ph=sample_a["fhr_ph"], x_ph=sample_a["fhr_up_ph"])
                 outputs_b = model(y_st=sample_b["fhr_st"], y_ph=sample_b["fhr_ph"], x_ph=sample_b["fhr_up_ph"])
@@ -800,8 +863,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             recon_store: List[np.ndarray] = []
             target_store: List[np.ndarray] = []
             latent_store: List[np.ndarray] = []
+            heatmaps: List[List[List[float]]] = []
             time_axis = np.arange(y_a.shape[-1])
             latent_dim = latent_a.size(-1)
+            sequence_len = latent_a.size(1)
             for alpha in weights:
                 latent_interp = latent_a * (1.0 - alpha) + latent_b * alpha
                 decoded = decoder(latent_interp)
@@ -811,6 +876,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 target_store.append(target_interp[0].detach().cpu().numpy())
                 latent_mean = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
                 latent_store.append(latent_mean)
+                heatmaps.append(latent_interp[0].detach().cpu().numpy().tolist())
 
             signal_source = ColumnDataSource(
                 data=dict(
@@ -843,14 +909,39 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             )
             latent_fig.vbar(x="dim", top="value", width=0.8, source=latent_source, color="#7570b3")
 
+            heat_min = min(float(np.min(np.array(arr))) for arr in heatmaps)
+            heat_max = max(float(np.max(np.array(arr))) for arr in heatmaps)
+            color_mapper = LinearColorMapper(palette=Viridis256, low=heat_min, high=heat_max)
+            heat_source = ColumnDataSource(data=dict(image=[heatmaps[0]]))
+            heat_fig = figure(
+                title=f"Pair {pair_idx} - Latent Heatmap",
+                width=900,
+                height=300,
+                x_axis_label="Latent Dimension",
+                y_axis_label="Time Step",
+                y_range=(sequence_len, 0),
+            )
+            heat_fig.image(
+                source=heat_source,
+                image="image",
+                x=0,
+                y=0,
+                dw=latent_dim,
+                dh=sequence_len,
+                color_mapper=color_mapper,
+            )
+            heat_fig.add_layout(ColorBar(color_mapper=color_mapper, width=10, label_standoff=8), "right")
+
             slider = Slider(start=0, end=len(weights) - 1, value=0, step=1, title="Interpolation Step")
             callback = CustomJS(
                 args=dict(
                     source_signal=signal_source,
                     source_latent=latent_source,
+                    source_heat=heat_source,
                     recon_data=recon_store,
                     target_data=target_store,
                     latent_data=latent_store,
+                    heat_data=heatmaps,
                 ),
                 code="""
                     const idx = Math.round(cb_obj.value);
@@ -859,11 +950,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     source_signal.change.emit();
                     source_latent.data['value'] = latent_data[idx];
                     source_latent.change.emit();
+                    source_heat.data['image'] = [heat_data[idx]];
+                    source_heat.change.emit();
                 """,
             )
             slider.js_on_change("value", callback)
 
-            layout = column(signal_fig, latent_fig, slider)
+            layout = column(signal_fig, latent_fig, heat_fig, slider)
             output_file(out_dir / f"latent_interp_pair_{pair_idx:02d}.html", title=f"Latent Interpolation Pair {pair_idx}")
             save(layout)
         logger.info("Latent interpolation animations saved to %s", out_dir)
