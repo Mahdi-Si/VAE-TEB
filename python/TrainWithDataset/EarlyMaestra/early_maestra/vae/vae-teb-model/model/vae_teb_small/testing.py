@@ -866,6 +866,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             latent_means: List[np.ndarray] = []
             heatmaps: List[np.ndarray] = []
             latent_hists: List[np.ndarray] = []
+            latent_dim_hists: List[np.ndarray] = []
+            latent_hist_bins: Optional[np.ndarray] = None
+            latent_hist_values: List[np.ndarray] = []
             latent_hist_bins: Optional[np.ndarray] = None
             latent_hist_values: List[np.ndarray] = []
             latent_hist_bins: Optional[np.ndarray] = None
@@ -921,6 +924,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             for arr in latent_hists[:common_len]:
                 hist, _ = np.histogram(arr, bins=latent_hist_bins, density=True)
                 latent_hist_values.append(hist)
+            # Per-dimension distributions over temporal values: shape (steps, latent_dim, bins)
+            latent_dim_hist_values: List[np.ndarray] = []
+            for step_idx, img in enumerate(heatmaps):
+                # img shape: (latent_dim, seq_len)
+                dim_hists = []
+                for d in range(latent_dim):
+                    h, _ = np.histogram(img[d], bins=latent_hist_bins, density=True)
+                    dim_hists.append(h)
+                latent_dim_hist_values.append(np.stack(dim_hists, axis=0))  # (latent_dim, bins)
 
             heat_min = float(min(float(np.min(img)) for img in heatmaps))
             heat_max = float(max(float(np.max(img)) for img in heatmaps))
@@ -933,12 +945,12 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             x_values = np.arange(min_series_len)
 
             fig, axes = plt.subplots(
-                4,
+                5,
                 1,
-                figsize=(10, 11),
-                gridspec_kw={"height_ratios": [3.0, 2.0, 3.5, 2.0], "hspace": 0.4},
+                figsize=(10, 13),
+                gridspec_kw={"height_ratios": [3.0, 2.0, 3.5, 2.0, 2.0], "hspace": 0.45},
             )
-            ax_sig, ax_bar, ax_heat, ax_hist = axes
+            ax_sig, ax_bar, ax_heat, ax_hist, ax_dimhist = axes
 
             line_target, = ax_sig.plot(x_values, target_sequences[0], color="#268bd2", label="Target", linewidth=1.8)
             line_recon, = ax_sig.plot(x_values, recon_sequences[0], color="#d33682", label="Reconstruction", linewidth=1.2)
@@ -974,6 +986,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             ax_hist.set_ylabel("Density")
             ax_hist.grid(True, alpha=0.3)
 
+            # Per-dimension distributions: show a few dims stacked
+            dim_hist_lines = []
+            for d in range(min(latent_dim, 4)):
+                ln, = ax_dimhist.plot(
+                    hist_centers,
+                    latent_dim_hist_values[0][d],
+                    label=f"z[{d}]",
+                    linewidth=1.2,
+                )
+                dim_hist_lines.append(ln)
+            ax_dimhist.set_title("Latent Distribution per Dimension")
+            ax_dimhist.set_xlabel("Latent Value")
+            ax_dimhist.set_ylabel("Density")
+            ax_dimhist.legend(loc="upper right", fontsize=8, ncol=2)
+            ax_dimhist.grid(True, alpha=0.3)
+
             def _update(frame_idx: int):
                 line_target.set_ydata(target_sequences[frame_idx])
                 line_recon.set_ydata(recon_sequences[frame_idx])
@@ -982,7 +1010,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     bar.set_height(val)
                 heat_img.set_data(heatmaps[frame_idx])
                 line_hist.set_ydata(latent_hist_values[frame_idx])
-                return [line_target, line_recon, heat_img, line_hist, *bars]
+                frame_dim_hists = latent_dim_hist_values[frame_idx]
+                for ln, arr in zip(dim_hist_lines, frame_dim_hists[: len(dim_hist_lines)]):
+                    ln.set_ydata(arr)
+                return [line_target, line_recon, heat_img, line_hist, *dim_hist_lines, *bars]
 
             anim = animation.FuncAnimation(
                 fig,
@@ -1163,6 +1194,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             latent_means: List[List[float]] = []
             heatmaps: List[List[List[float]]] = []
             latent_hists: List[np.ndarray] = []
+            latent_dim_hist_values: List[List[List[float]]] = []
             latent_hist_bins: Optional[np.ndarray] = None
             latent_hist_values: List[np.ndarray] = []
 
@@ -1183,6 +1215,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 latent_means.append(self._sanitize_finite_array(latent_mean_np).tolist())
                 heat_np = latent_interp[0].detach().cpu().numpy().T  # (latent_dim, seq_len)
                 heatmaps.append(self._sanitize_finite_array(heat_np).tolist())
+                latent_flat = latent_interp[0].detach().cpu().numpy().ravel()
+                latent_hists.append(self._sanitize_finite_array(latent_flat))
 
             if not recon_sequences or not target_sequences:
                 logger.warning("Interpolation pair %d produced no valid decoded signals.", pair_idx)
@@ -1206,13 +1240,14 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_sequences = target_sequences[:common_len]
             latent_means = latent_means[:common_len]
             heatmaps = heatmaps[:common_len]
+            latent_hists = latent_hists[:common_len]
 
             x_values = np.arange(min_series_len).tolist()
             recon_sequences = [seq[:min_series_len] for seq in recon_sequences]
             target_sequences = [seq[:min_series_len] for seq in target_sequences]
             latent_means = [seq for seq in latent_means if len(seq) == latent_dim]
             heatmaps = [np.asarray(h, dtype=float).tolist() for h in heatmaps if np.asarray(h).shape == (latent_dim, seq_len)]
-            if not latent_means or not heatmaps:
+            if not latent_means or not heatmaps or not latent_hists:
                 logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
 
@@ -1222,9 +1257,18 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             if hist_max <= hist_min:
                 hist_max = hist_min + 1e-6
             latent_hist_bins = np.linspace(hist_min, hist_max, 41)
+            latent_hist_values = []
             for arr in latent_hists[: len(heatmaps)]:
                 hist, _ = np.histogram(arr, bins=latent_hist_bins, density=True)
                 latent_hist_values.append(hist.tolist())
+            # per-dimension histograms (first up to 4 dims)
+            for img in heatmaps:
+                arr = np.asarray(img)
+                dim_hists = []
+                for d in range(min(latent_dim, 4)):
+                    h, _ = np.histogram(arr[d], bins=latent_hist_bins, density=True)
+                    dim_hists.append(h.tolist())
+                latent_dim_hist_values.append(dim_hists)
 
             heat_min = min(float(np.min(np.array(h))) for h in heatmaps)
             heat_max = max(float(np.max(np.array(h))) for h in heatmaps)
@@ -1232,12 +1276,12 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 heat_max = heat_min + 1e-6
 
             fig = make_subplots(
-                rows=4,
+                rows=5,
                 cols=1,
                 shared_xaxes=False,
                 vertical_spacing=0.05,
-                row_heights=[0.30, 0.20, 0.35, 0.15],
-                specs=[[{"type": "xy"}], [{"type": "bar"}], [{"type": "heatmap"}], [{"type": "xy"}]],
+                row_heights=[0.28, 0.18, 0.32, 0.12, 0.18],
+                specs=[[{"type": "xy"}], [{"type": "bar"}], [{"type": "heatmap"}], [{"type": "xy"}], [{"type": "xy"}]],
             )
             fig.add_trace(
                 go.Scatter(x=x_values, y=target_sequences[0], name="Target", line=dict(color="#268bd2")),
@@ -1270,6 +1314,18 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 row=4,
                 col=1,
             )
+            dim_traces = []
+            dims_shown = min(latent_dim, 4)
+            for d in range(dims_shown):
+                tr = go.Scatter(
+                    x=hist_centers.tolist(),
+                    y=latent_dim_hist_values[0][d],
+                    mode="lines",
+                    name=f"z[{d}]",
+                    line=dict(width=1.2),
+                )
+                fig.add_trace(tr, row=5, col=1)
+                dim_traces.append(tr)
 
             frames = []
             for step_idx in range(len(recon_sequences)):
@@ -1281,6 +1337,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                             go.Bar(y=latent_means[step_idx]),
                             go.Heatmap(z=heatmaps[step_idx]),
                             go.Scatter(y=latent_hist_values[step_idx]),
+                            *[
+                                go.Scatter(y=latent_dim_hist_values[step_idx][d])
+                                for d in range(dims_shown)
+                            ],
                         ],
                         name=f"step{step_idx}",
                     )
@@ -1310,10 +1370,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     "colorscale": "Viridis",
                     "cmin": heat_min,
                     "cmax": heat_max,
-                    "colorbar": {"len": 0.2, "thickness": 10, "y": 0.23},
+                    "colorbar": {"len": 0.2, "thickness": 10, "y": 0.21},
                 },
                 sliders=sliders,
-                height=1000,
+                height=1100,
                 showlegend=True,
             )
             fig.frames = frames
