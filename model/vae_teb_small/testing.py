@@ -12,7 +12,7 @@ import torch
 import yaml
 from bokeh.embed import file_html
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider
+from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider, Div
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 from bokeh.resources import INLINE
