@@ -12,7 +12,7 @@ import torch
 import yaml
 from bokeh.embed import file_html
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, CustomJS, Slider, Div
+from bokeh.models import ColumnDataSource, CustomJS, Slider, Div, ColorBar, LinearColorMapper
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 from bokeh.resources import INLINE
@@ -959,27 +959,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             latent_means = latent_means[:common_len_filtered]
             heatmaps_clean = heatmaps_clean[:common_len_filtered]
 
-            # Build RGBA heatmaps (image_rgba) to avoid runtime colormapper issues
+            # Normalize heatmaps for color mapper
             heat_all = np.stack(heatmaps_clean, axis=0)  # (steps, latent_dim, seq_len)
-            global_min = float(np.min(heat_all))
-            global_max = float(np.max(heat_all))
-            if global_max <= global_min:
-                global_max = global_min + 1e-6
-            palette = np.array([[int(c[i:i+2], 16) for i in (1, 3, 5)] for c in Viridis256], dtype=np.uint8)
-            heat_rgba: List[List[List[int]]] = []
-            for img in heatmaps_clean:
-                norm = np.clip((img - global_min) / (global_max - global_min), 0.0, 1.0)
-                idx = np.floor(norm * 255).astype(np.int64)
-                rgb = palette[idx]  # (latent_dim, seq_len, 3)
-                alpha = np.full((*rgb.shape[:2], 1), 255, dtype=np.uint8)
-                rgba = np.concatenate([rgb, alpha], axis=-1)
-                rgba_uint32 = (
-                    (rgba[..., 0].astype(np.uint32) << 24)
-                    | (rgba[..., 1].astype(np.uint32) << 16)
-                    | (rgba[..., 2].astype(np.uint32) << 8)
-                    | rgba[..., 3].astype(np.uint32)
-                )
-                heat_rgba.append(rgba_uint32.tolist())
+            heat_min = float(np.min(heat_all))
+            heat_max = float(np.max(heat_all))
+            if heat_max <= heat_min:
+                heat_max = heat_min + 1e-6
+            heat_images = [img.tolist() for img in heatmaps_clean]
 
             recon_min = min(min(seq) for seq in recon_sequences)
             recon_max = max(max(seq) for seq in recon_sequences)
@@ -995,8 +981,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     "target_max": float(target_max),
                     "latent_min": float(latent_min),
                     "latent_max": float(latent_max),
-                    "heat_min": float(min(float(np.min(arr)) for arr in heatmaps_clean)),
-                    "heat_max": float(max(float(np.max(arr)) for arr in heatmaps_clean)),
+                    "heat_min": float(heat_min),
+                    "heat_max": float(heat_max),
                     "heat_shape": [latent_dim, seq_len],
                     "steps_available": len(recon_sequences),
                 }
@@ -1005,7 +991,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             # ------------------------------------------------------------------
             # 3) Build Bokeh figures with slider-controlled data updates
             # ------------------------------------------------------------------
-            heat0 = np.asarray(heat_rgba[0], dtype=np.uint32)
+            heat0 = np.asarray(heat_images[0], dtype=float)
             if heat0.ndim != 2:
                 logger.warning("Skipping pair %d due to non-2D heatmap shape %s", pair_idx, heat0.shape)
                 continue
@@ -1049,6 +1035,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 x_range=(0, seq_len),
                 y_range=(0, latent_dim),
             )
+            heat_mapper = LinearColorMapper(palette=Viridis256, low=heat_min, high=heat_max)
             heat_fig.image(
                 source=heat_source,
                 image="image",
@@ -1056,7 +1043,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 y=0,
                 dw=seq_len,
                 dh=latent_dim,
+                color_mapper=heat_mapper,
             )
+            heat_fig.add_layout(ColorBar(color_mapper=heat_mapper, width=10, label_standoff=8), "right")
             meta_div = Div(
                 text=(
                     f"<b>Pair {pair_idx}</b> | steps={len(recon_sequences)} | "
@@ -1073,7 +1062,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     recon_data=recon_sequences,
                     target_data=target_sequences,
                     latent_data=latent_means,
-                    heat_data=heat_rgba,
+                    heat_data=heat_images,
                     x_values=x_values,
                     dim_values=dim_template,
                     latent_dim_val=latent_dim,
