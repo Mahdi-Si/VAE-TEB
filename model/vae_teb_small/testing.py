@@ -939,7 +939,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 arr = np.asarray(heat, dtype=float)
                 if arr.shape != (latent_dim, seq_len):
                     continue
-                heatmaps_clean.append(arr.tolist())
+                heatmaps_clean.append(self._sanitize_finite_array(arr).tolist())
             if not latent_means or not heatmaps_clean:
                 logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
@@ -1422,19 +1422,19 @@ def _parse_float_list(value: Optional[Any]) -> Optional[List[float]]:
 def main(
     *,
     config: Path | str = Path("config.yaml"),
-    max_samples: Optional[int] = None,
+    max_samples: Optional[int] = 100,
     metrics_max_samples: Optional[int] = None,
     analysis_samples: int = 10,
     latent_ablation_samples: int = 0,
     latent_ablation_dims: Optional[Any] = None,
     latent_ablation_visuals: int = 1,
-    latent_dist_samples: int = 1000,
+    latent_dist_samples: int = 100,
     latent_sweep_samples: int = 0,
     latent_sweep_dims: Optional[Any] = None,
     latent_sweep_scales: Optional[Any] = None,
     latent_sweep_visuals: int = 1,
     latent_interp_pairs: int = 10,
-    latent_interp_steps: int = 20,
+    latent_interp_steps: int = 10,
     latent_attr_samples: int = 8,
 ) -> None:
     config_path = Path(config)
@@ -1482,4 +1482,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main(**vars(parse_args()))
+    main()
