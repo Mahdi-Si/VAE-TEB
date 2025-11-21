@@ -7,15 +7,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import math
 
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import numpy as np
 import torch
 import yaml
-from bokeh.embed import file_html
-from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, CustomJS, Slider, Div, ColorBar, LinearColorMapper
-from bokeh.palettes import Viridis256
-from bokeh.plotting import figure
-from bokeh.resources import INLINE
 from loguru import logger
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
@@ -788,7 +783,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             logger.info("Latent sweep plotted for dimension %d -> %s", dim, dim_dir)
 
     def run_latent_interpolation(self, test_loader, *, pair_count: int = 10, steps: int = 11) -> None:
-        """Decode linear latent blends and export interactive Bokeh dashboards."""
+        """Decode linear latent blends and export animated Matplotlib HTML dashboards."""
         if pair_count <= 0 or steps < 2:
             logger.info("Latent interpolation skipped (invalid pair_count/steps)")
             return
@@ -803,12 +798,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         )
         model = self.pytorch_model.to(device)
         model.eval()
-        out_dir = Path(self.test_results_dir) / "latent_interpolation_bokeh"
+        out_dir = Path(self.test_results_dir) / "latent_interpolation_matplotlib"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ------------------------------------------------------------------
-        # 1) Gather candidate samples (guid + epoch allow deterministic pairs)
-        # ------------------------------------------------------------------
         required_samples = pair_count * 2
         samples: List[Dict[str, Any]] = []
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -851,12 +843,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             logger.error("Unable to construct interpolation pairs.")
             return
 
-        # ------------------------------------------------------------------
-        # 2) For each pair, decode blended latents and prepare plot-ready data
-        # ------------------------------------------------------------------
         weights = np.linspace(0.0, 1.0, steps)
-        dim_template = None
-        sequence_template = None
         rendered = 0
         for pair_idx, (sample_a, sample_b) in enumerate(sample_pairs[:pair_count]):
             with torch.inference_mode():
@@ -873,17 +860,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             latent_dim = latent_a.size(-1)
             seq_len = latent_a.size(1)
             dim_template = list(range(latent_dim))
-            sequence_template = seq_len
 
-            recon_sequences: List[List[float]] = []
-            target_sequences: List[List[float]] = []
-            latent_means: List[List[float]] = []
-            latent_heatmaps: List[List[List[float]]] = []
-            diagnostics: Dict[str, Any] = {
-                "pair_idx": pair_idx,
-                "alphas": [],
-                "series_len": [],
-            }
+            recon_sequences: List[np.ndarray] = []
+            target_sequences: List[np.ndarray] = []
+            latent_means: List[np.ndarray] = []
+            heatmaps: List[np.ndarray] = []
+            latent_hists: List[np.ndarray] = []
+            latent_hist_bins: Optional[np.ndarray] = None
+            latent_hist_values: List[np.ndarray] = []
+            latent_hist_bins: Optional[np.ndarray] = None
 
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
@@ -895,228 +880,127 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 series_len = min(len(recon_flat), len(target_flat))
                 if series_len <= 1:
                     continue
-                diagnostics["alphas"].append(float(alpha))
-                diagnostics["series_len"].append(series_len)
 
-                recon_sequences.append(recon_flat[:series_len].astype(float).tolist())
-                target_sequences.append(target_flat[:series_len].astype(float).tolist())
+                recon_sequences.append(recon_flat[:series_len])
+                target_sequences.append(target_flat[:series_len])
                 latent_mean_np = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
-                latent_heat_np = latent_interp[0].detach().cpu().numpy().T  # (latent_dim, seq_len) to match analysis plots
-                latent_means.append(self._sanitize_finite_array(latent_mean_np).tolist())
-                latent_heatmaps.append(self._sanitize_finite_array(latent_heat_np).tolist())
+                latent_means.append(self._sanitize_finite_array(latent_mean_np))
+                heat_np = latent_interp[0].detach().cpu().numpy().T  # (latent_dim, seq_len)
+                heatmaps.append(self._sanitize_finite_array(heat_np))
+                latent_flat = latent_interp[0].detach().cpu().numpy().ravel()
+                latent_hists.append(self._sanitize_finite_array(latent_flat))
 
             if not recon_sequences or not target_sequences:
                 logger.warning("Interpolation pair %d produced no valid decoded signals.", pair_idx)
                 continue
 
-            min_series_len = min(len(seq) for seq in (recon_sequences + target_sequences))
+            min_series_len = min(arr.shape[0] for arr in (recon_sequences + target_sequences))
             if min_series_len <= 1:
                 logger.warning("Skipping pair %d (series length %d).", pair_idx, min_series_len)
                 continue
 
-            # Align sequence counts across all collections to avoid undefined JS data
-            common_len = min(
-                len(recon_sequences),
-                len(target_sequences),
-                len(latent_means),
-                len(latent_heatmaps),
-            )
+            common_len = min(len(recon_sequences), len(target_sequences), len(latent_means), len(heatmaps))
             if common_len == 0:
                 logger.warning("Skipping pair %d due to empty synchronized sequences.", pair_idx)
                 continue
-            recon_sequences = recon_sequences[:common_len]
-            target_sequences = target_sequences[:common_len]
-            latent_means = latent_means[:common_len]
-            latent_heatmaps = latent_heatmaps[:common_len]
-            diagnostics["common_len"] = common_len
 
-            x_values = np.arange(min_series_len).tolist()
-            recon_sequences = [seq[:min_series_len] for seq in recon_sequences]
-            target_sequences = [seq[:min_series_len] for seq in target_sequences]
-            latent_means = [seq for seq in latent_means if len(seq) == latent_dim]
-            heatmaps_clean = []
-            for heat in latent_heatmaps:
-                arr = np.asarray(heat, dtype=float)
-                if arr.shape != (latent_dim, seq_len):
-                    continue
-                heatmaps_clean.append(self._sanitize_finite_array(arr))
-            if not latent_means or not heatmaps_clean:
+            recon_sequences = [seq[:min_series_len] for seq in recon_sequences[:common_len]]
+            target_sequences = [seq[:min_series_len] for seq in target_sequences[:common_len]]
+            latent_means = [seq for seq in latent_means[:common_len] if seq.shape[0] == latent_dim]
+            heatmaps = [img for img in heatmaps[:common_len] if img.shape == (latent_dim, seq_len)]
+            if not latent_means or not heatmaps:
                 logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
-
-            # Re-align after filtering shapes
-            common_len_filtered = min(
-                len(recon_sequences),
-                len(target_sequences),
-                len(latent_means),
-                len(heatmaps_clean),
+            # Build common histogram bins for latent distributions
+            latent_hist_bins = np.linspace(
+                float(np.min(np.concatenate(latent_hists, axis=0))),
+                float(np.max(np.concatenate(latent_hists, axis=0))) + 1e-6,
+                41,
             )
-            if common_len_filtered == 0:
-                logger.warning("Skipping pair %d after filtering due to zero common length.", pair_idx)
-                continue
-            recon_sequences = recon_sequences[:common_len_filtered]
-            target_sequences = target_sequences[:common_len_filtered]
-            latent_means = latent_means[:common_len_filtered]
-            heatmaps_clean = heatmaps_clean[:common_len_filtered]
+            latent_hist_values = []
+            for arr in latent_hists[:common_len]:
+                hist, _ = np.histogram(arr, bins=latent_hist_bins, density=True)
+                latent_hist_values.append(hist)
 
-            # Normalize heatmaps for color mapper
-            heat_all = np.stack(heatmaps_clean, axis=0)  # (steps, latent_dim, seq_len)
-            heat_min = float(np.min(heat_all))
-            heat_max = float(np.max(heat_all))
+            heat_min = float(min(float(np.min(img)) for img in heatmaps))
+            heat_max = float(max(float(np.max(img)) for img in heatmaps))
             if heat_max <= heat_min:
                 heat_max = heat_min + 1e-6
-            heat_images = [img.tolist() for img in heatmaps_clean]
-
-            recon_min = min(min(seq) for seq in recon_sequences)
-            recon_max = max(max(seq) for seq in recon_sequences)
-            target_min = min(min(seq) for seq in target_sequences)
-            target_max = max(max(seq) for seq in target_sequences)
-            latent_min = min(min(seq) for seq in latent_means)
-            latent_max = max(max(seq) for seq in latent_means)
-            diagnostics.update(
-                {
-                    "recon_min": float(recon_min),
-                    "recon_max": float(recon_max),
-                    "target_min": float(target_min),
-                    "target_max": float(target_max),
-                    "latent_min": float(latent_min),
-                    "latent_max": float(latent_max),
-                    "heat_min": float(heat_min),
-                    "heat_max": float(heat_max),
-                    "heat_shape": [latent_dim, seq_len],
-                    "steps_available": len(recon_sequences),
-                }
-            )
-
-            # ------------------------------------------------------------------
-            # 3) Build Bokeh figures with slider-controlled data updates
-            # ------------------------------------------------------------------
-            heat0 = np.asarray(heat_images[0], dtype=float)
-            if heat0.ndim != 2:
-                logger.warning("Skipping pair %d due to non-2D heatmap shape %s", pair_idx, heat0.shape)
+            if latent_hist_bins is None:
+                logger.warning("Skipping pair %d due to missing histogram bins.", pair_idx)
                 continue
-            signal_source = ColumnDataSource(
-                data=dict(
-                    x=x_values,
-                    recon=recon_sequences[0],
-                    target=target_sequences[0],
-                )
-            )
-            latent_source = ColumnDataSource(data=dict(dim=dim_template, value=latent_means[0]))
-            heat_source = ColumnDataSource(data=dict(image=[heat0.tolist()]))
 
-            signal_fig = figure(
-                title=f"Pair {pair_idx} – Raw vs Reconstruction",
-                width=900,
-                height=320,
-                x_axis_label="Sample Index",
-                y_axis_label="Amplitude",
-            )
-            signal_fig.line("x", "target", source=signal_source, color="#268bd2", line_width=2, legend_label="Target")
-            signal_fig.line("x", "recon", source=signal_source, color="#d33682", line_width=2, legend_label="Reconstruction")
-            signal_fig.legend.location = "top_right"
-            signal_fig.legend.click_policy = "hide"
+            x_values = np.arange(min_series_len)
 
-            latent_fig = figure(
-                title=f"Pair {pair_idx} – Latent Mean by Dimension",
-                width=900,
-                height=260,
-                x_axis_label="Latent Dimension",
-                y_axis_label="Mean Value",
+            fig, axes = plt.subplots(
+                4,
+                1,
+                figsize=(10, 11),
+                gridspec_kw={"height_ratios": [3.0, 2.0, 3.5, 2.0], "hspace": 0.4},
             )
-            latent_fig.vbar(x="dim", top="value", width=0.8, source=latent_source, color="#6c71c4")
+            ax_sig, ax_bar, ax_heat, ax_hist = axes
 
-            heat_fig = figure(
-                title=f"Pair {pair_idx} – Latent Heatmap",
-                width=900,
-                height=320,
-                x_axis_label="Time Step",
-                y_axis_label="Latent Dimension",
-                x_range=(0, seq_len),
-                y_range=(0, latent_dim),
-            )
-            heat_mapper = LinearColorMapper(palette=Viridis256, low=heat_min, high=heat_max)
-            heat_fig.image(
-                source=heat_source,
-                image="image",
-                x=0,
-                y=0,
-                dw=seq_len,
-                dh=latent_dim,
-                color_mapper=heat_mapper,
-            )
-            heat_fig.add_layout(ColorBar(color_mapper=heat_mapper, width=10, label_standoff=8), "right")
-            meta_div = Div(
-                text=(
-                    f"<b>Pair {pair_idx}</b> | steps={len(recon_sequences)} | "
-                    f"signal_len={len(x_values)} | latent_dim={latent_dim} | seq_len={seq_len}"
-                ),
-            )
+            line_target, = ax_sig.plot(x_values, target_sequences[0], color="#268bd2", label="Target", linewidth=1.8)
+            line_recon, = ax_sig.plot(x_values, recon_sequences[0], color="#d33682", label="Reconstruction", linewidth=1.2)
+            ax_sig.set_title(f"Pair {pair_idx} – Signal")
+            ax_sig.set_xlabel("Sample Index")
+            ax_sig.set_ylabel("Amplitude")
+            ax_sig.legend(loc="upper right")
 
-            slider = Slider(start=0, end=len(recon_sequences) - 1, value=0, step=1, title="Interpolation Step")
-            slider_callback = CustomJS(
-                args=dict(
-                    src_signal=signal_source,
-                    src_latent=latent_source,
-                    src_heat=heat_source,
-                    recon_data=recon_sequences,
-                    target_data=target_sequences,
-                    latent_data=latent_means,
-                    heat_data=heat_images,
-                    x_values=x_values,
-                    dim_values=dim_template,
-                    latent_dim_val=latent_dim,
-                    seq_len_val=seq_len,
-                ),
-                code="""
-                    const idx = Math.max(0, Math.min(recon_data.length - 1, Math.round(cb_obj.value)));
-                    if (!recon_data[idx] || !target_data[idx]) {
-                        console.warn("Interpolation step missing recon/target data at idx", idx);
-                        return;
-                    }
-                    if (!Array.isArray(recon_data[idx]) || !Array.isArray(target_data[idx])) {
-                        console.warn("Interpolation step recon/target not arrays at idx", idx, recon_data[idx], target_data[idx]);
-                        return;
-                    }
-                    src_signal.data['x'] = x_values;
-                    src_signal.data['recon'] = recon_data[idx];
-                    src_signal.data['target'] = target_data[idx];
-                    src_signal.change.emit();
-                    const latentVals = latent_data[idx] && Array.isArray(latent_data[idx]) && latent_data[idx].length === dim_values.length
-                        ? latent_data[idx]
-                        : Array(dim_values.length).fill(0);
-                    src_latent.data['dim'] = dim_values;
-                    src_latent.data['value'] = latentVals;
-                    src_latent.change.emit();
+            bars = ax_bar.bar(dim_template, latent_means[0], color="#6c71c4")
+            ax_bar.set_title("Latent Mean by Dimension")
+            ax_bar.set_xlabel("Latent Dimension")
+            ax_bar.set_ylabel("Mean Value")
 
-                    const heatVals = heat_data[idx];
-                    if (heatVals && Array.isArray(heatVals) && heatVals.length === latent_dim_val && Array.isArray(heatVals[0]) && heatVals[0].length === seq_len_val) {
-                        src_heat.data['image'] = [heatVals];
-                    } else {
-                        console.warn("Heatmap data missing/invalid at idx", idx);
-                        const zeros = Array.from({length: latent_dim_val}, () => Array(seq_len_val).fill(0));
-                        src_heat.data['image'] = [zeros];
-                    }
-                    src_heat.change.emit();
-                """,
+            heat_img = ax_heat.imshow(
+                heatmaps[0],
+                aspect="auto",
+                origin="lower",
+                cmap="viridis",
+                vmin=heat_min,
+                vmax=heat_max,
+                extent=[0, seq_len, 0, latent_dim],
             )
-            slider.js_on_change("value", slider_callback)
+            cbar = fig.colorbar(heat_img, ax=ax_heat, fraction=0.046, pad=0.04)
+            cbar.set_label("Latent Activation")
+            ax_heat.set_title("Latent Heatmap")
+            ax_heat.set_xlabel("Time Step")
+            ax_heat.set_ylabel("Latent Dimension")
 
-            layout = column(meta_div, signal_fig, latent_fig, heat_fig, slider)
+            hist_centers = 0.5 * (latent_hist_bins[:-1] + latent_hist_bins[1:])
+            line_hist, = ax_hist.plot(hist_centers, latent_hist_values[0], color="#2c3e50", linewidth=1.5)
+            ax_hist.set_title("Latent Distribution (flattened)")
+            ax_hist.set_xlabel("Latent Value")
+            ax_hist.set_ylabel("Density")
+            ax_hist.grid(True, alpha=0.3)
+
+            def _update(frame_idx: int):
+                line_target.set_ydata(target_sequences[frame_idx])
+                line_recon.set_ydata(recon_sequences[frame_idx])
+                frame_latent = latent_means[frame_idx]
+                for bar, val in zip(bars, frame_latent):
+                    bar.set_height(val)
+                heat_img.set_data(heatmaps[frame_idx])
+                line_hist.set_ydata(latent_hist_values[frame_idx])
+                return [line_target, line_recon, heat_img, line_hist, *bars]
+
+            anim = animation.FuncAnimation(
+                fig,
+                _update,
+                frames=len(recon_sequences),
+                interval=400,
+                blit=False,
+            )
+            html_str = anim.to_jshtml()
             output_path = out_dir / f"latent_interp_pair_{pair_idx:02d}.html"
-            output_path.write_text(file_html(layout, INLINE, title=f"Latent Interpolation Pair {pair_idx}"), encoding="utf-8")
-            diag_path = out_dir / f"latent_interp_pair_{pair_idx:02d}_diag.yaml"
-            try:
-                import yaml as _yaml  # Local import to avoid global dependency at runtime
-                diag_path.write_text(_yaml.safe_dump(diagnostics, sort_keys=False), encoding="utf-8")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to write diag yaml for pair %d: %s", pair_idx, exc)
+            output_path.write_text(html_str, encoding="utf-8")
+            plt.close(fig)
             logger.info(
-                "Saved latent interpolation pair %d -> %s (steps=%d, series_len=%d, latent_dim=%d, seq_len=%d)",
+                "Saved matplotlib interpolation pair %d -> %s (steps=%d, series_len=%d, latent_dim=%d, seq_len=%d)",
                 pair_idx,
                 output_path,
                 len(recon_sequences),
-                len(x_values),
+                min_series_len,
                 latent_dim,
                 seq_len,
             )
@@ -1278,6 +1162,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_sequences: List[List[float]] = []
             latent_means: List[List[float]] = []
             heatmaps: List[List[List[float]]] = []
+            latent_hists: List[np.ndarray] = []
+            latent_hist_bins: Optional[np.ndarray] = None
+            latent_hist_values: List[np.ndarray] = []
 
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
@@ -1329,18 +1216,28 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
 
+            all_latent_flat = np.concatenate(latent_hists, axis=0)
+            hist_min = float(np.min(all_latent_flat))
+            hist_max = float(np.max(all_latent_flat))
+            if hist_max <= hist_min:
+                hist_max = hist_min + 1e-6
+            latent_hist_bins = np.linspace(hist_min, hist_max, 41)
+            for arr in latent_hists[: len(heatmaps)]:
+                hist, _ = np.histogram(arr, bins=latent_hist_bins, density=True)
+                latent_hist_values.append(hist.tolist())
+
             heat_min = min(float(np.min(np.array(h))) for h in heatmaps)
             heat_max = max(float(np.max(np.array(h))) for h in heatmaps)
             if heat_max <= heat_min:
                 heat_max = heat_min + 1e-6
 
             fig = make_subplots(
-                rows=3,
+                rows=4,
                 cols=1,
                 shared_xaxes=False,
-                vertical_spacing=0.08,
-                row_heights=[0.35, 0.25, 0.4],
-                specs=[[{"type": "xy"}], [{"type": "bar"}], [{"type": "heatmap"}]],
+                vertical_spacing=0.05,
+                row_heights=[0.30, 0.20, 0.35, 0.15],
+                specs=[[{"type": "xy"}], [{"type": "bar"}], [{"type": "heatmap"}], [{"type": "xy"}]],
             )
             fig.add_trace(
                 go.Scatter(x=x_values, y=target_sequences[0], name="Target", line=dict(color="#268bd2")),
@@ -1363,9 +1260,14 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     coloraxis="coloraxis",
                     zmin=heat_min,
                     zmax=heat_max,
-                    showscale=False,
                 ),
                 row=3,
+                col=1,
+            )
+            hist_centers = 0.5 * (latent_hist_bins[:-1] + latent_hist_bins[1:])
+            fig.add_trace(
+                go.Scatter(x=hist_centers.tolist(), y=latent_hist_values[0], mode="lines", name="Latent PDF", line=dict(color="#2c3e50")),
+                row=4,
                 col=1,
             )
 
@@ -1378,6 +1280,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                             go.Scatter(y=recon_sequences[step_idx]),
                             go.Bar(y=latent_means[step_idx]),
                             go.Heatmap(z=heatmaps[step_idx]),
+                            go.Scatter(y=latent_hist_values[step_idx]),
                         ],
                         name=f"step{step_idx}",
                     )
@@ -1403,9 +1306,14 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
             fig.update_layout(
                 title=f"Latent Interpolation Pair {pair_idx}",
-                coloraxis={"colorscale": "Viridis", "cmin": heat_min, "cmax": heat_max},
+                coloraxis={
+                    "colorscale": "Viridis",
+                    "cmin": heat_min,
+                    "cmax": heat_max,
+                    "colorbar": {"len": 0.2, "thickness": 10, "y": 0.23},
+                },
                 sliders=sliders,
-                height=900,
+                height=1000,
                 showlegend=True,
             )
             fig.frames = frames
@@ -1672,7 +1580,7 @@ def main(
     latent_sweep_visuals: int = 1,
     latent_interp_pairs: int = 10,
     latent_interp_steps: int = 10,
-    latent_interp_plotly: bool = True,
+    latent_interp_plotly: bool = False,
     latent_attr_samples: int = 8,
 ) -> None:
     config_path = Path(config)
