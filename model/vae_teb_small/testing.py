@@ -874,16 +874,55 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 decoded = decoder(latent_interp)
                 recon_interp = decoded[1]
                 target_interp = y_a * (1.0 - alpha) + y_b * alpha
-                recon_store.append(recon_interp[0].detach().cpu().numpy())
-                target_store.append(target_interp[0].detach().cpu().numpy())
+                recon_flat = self._flatten_signal_for_plot(recon_interp[0])
+                target_flat = self._flatten_signal_for_plot(target_interp[0])
+                min_len = min(len(time_axis), recon_flat.shape[0], target_flat.shape[0])
+                if min_len <= 0:
+                    continue
+                if (
+                    recon_flat.shape[0] != time_axis.size
+                    or target_flat.shape[0] != time_axis.size
+                ):
+                    logger.debug(
+                        "Trimming interpolation series from (%d, %d) to %d samples.",
+                        recon_flat.shape[0],
+                        target_flat.shape[0],
+                        min_len,
+                    )
+                recon_store.append(recon_flat[:min_len])
+                target_store.append(target_flat[:min_len])
                 latent_mean = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
                 latent_store.append(latent_mean)
                 heatmaps.append(latent_interp[0].detach().cpu().numpy().tolist())
 
-            x_values = time_axis.tolist()
-            recon_series = [arr.tolist() for arr in recon_store]
-            target_series = [arr.tolist() for arr in target_store]
+            if not recon_store or not target_store:
+                logger.warning("Interpolation pair %d produced empty signal series.", pair_idx)
+                continue
+
+            series_candidates = [time_axis.size]
+            series_candidates.extend(arr.shape[0] for arr in recon_store)
+            series_candidates.extend(arr.shape[0] for arr in target_store)
+            series_len = min(series_candidates)
+            if series_len <= 1:
+                logger.warning("Skipping pair %d due to insufficient series length (%d).", pair_idx, series_len)
+                continue
+
+            x_values = time_axis[:series_len].tolist()
+            recon_series = [arr[:series_len].tolist() for arr in recon_store]
+            target_series = [arr[:series_len].tolist() for arr in target_store]
             latent_series = [arr.tolist() for arr in latent_store]
+            if not recon_series or not target_series:
+                logger.warning("Interpolation pair %d produced empty signal series.", pair_idx)
+                continue
+            if len(recon_series[0]) != series_len or len(target_series[0]) != series_len:
+                logger.warning(
+                    "Skipping pair %d due to mismatched signal lengths (x=%d, recon=%d, target=%d).",
+                    pair_idx,
+                    series_len,
+                    len(recon_series[0]),
+                    len(target_series[0]),
+                )
+                continue
 
             signal_source = ColumnDataSource(
                 data=dict(
@@ -1074,6 +1113,19 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         recon_st = linear_np[:, :st_channels].T
         recon_ph = linear_np[:, st_channels : st_channels + ph_channels].T
         return recon_st, recon_ph
+
+    @staticmethod
+    def _flatten_signal_for_plot(tensor: torch.Tensor) -> np.ndarray:
+        """Return a 1D numpy series suitable for plotting."""
+        array = tensor.detach().cpu().numpy()
+        squeezed = np.squeeze(array)
+        if squeezed.ndim == 0:
+            return np.asarray([float(squeezed)])
+        if squeezed.ndim == 1:
+            return squeezed
+        if squeezed.ndim == 2:
+            return squeezed[0]
+        return squeezed.reshape(-1)
 
     @staticmethod
     def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
