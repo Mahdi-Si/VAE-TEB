@@ -879,6 +879,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_sequences: List[List[float]] = []
             latent_means: List[List[float]] = []
             latent_heatmaps: List[List[List[float]]] = []
+            diagnostics: Dict[str, Any] = {"pair_idx": pair_idx, "alphas": [], "series_len": []}
 
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
@@ -890,6 +891,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 series_len = min(len(recon_flat), len(target_flat))
                 if series_len <= 1:
                     continue
+                diagnostics["alphas"].append(float(alpha))
+                diagnostics["series_len"].append(series_len)
 
                 recon_sequences.append(recon_flat[:series_len].astype(float).tolist())
                 target_sequences.append(target_flat[:series_len].astype(float).tolist())
@@ -1000,6 +1003,21 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             layout = column(signal_fig, latent_fig, heat_fig, slider)
             output_path = out_dir / f"latent_interp_pair_{pair_idx:02d}.html"
             output_path.write_text(file_html(layout, INLINE, title=f"Latent Interpolation Pair {pair_idx}"), encoding="utf-8")
+            diag_path = out_dir / f"latent_interp_pair_{pair_idx:02d}_diag.yaml"
+            try:
+                import yaml as _yaml  # Local import to avoid global dependency at runtime
+                diag_path.write_text(_yaml.safe_dump(diagnostics), encoding="utf-8")
+            except Exception:
+                pass
+            logger.info(
+                "Saved latent interpolation pair %d -> %s (steps=%d, series_len=%d, latent_dim=%d, seq_len=%d)",
+                pair_idx,
+                output_path,
+                len(recon_sequences),
+                len(x_values),
+                latent_dim,
+                seq_len,
+            )
             rendered += 1
 
         if rendered == 0:
@@ -1118,14 +1136,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         array = tensor.detach().cpu().numpy()
         squeezed = np.squeeze(array)
         if squeezed.ndim == 0:
-            flat = np.asarray([float(squeezed)])
+            flat = np.asarray([float(squeezed)], dtype=float)
         elif squeezed.ndim == 1:
-            flat = squeezed
+            flat = np.asarray(squeezed, dtype=float)
         elif squeezed.ndim == 2:
-            flat = squeezed[0]
+            flat = np.asarray(squeezed[0], dtype=float)
         else:
-            flat = squeezed.reshape(-1)
-        np.nan_to_num(flat, copy=False)
+            flat = np.asarray(squeezed.reshape(-1), dtype=float)
+        np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        flat = np.clip(flat, -1e6, 1e6)
         return flat
 
     @staticmethod
