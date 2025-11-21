@@ -924,6 +924,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 height=300,
                 x_axis_label="Latent Dimension",
                 y_axis_label="Time Step",
+                x_range=(0, latent_dim),
                 y_range=(sequence_len, 0),
             )
             heat_fig.image(
@@ -962,7 +963,11 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             slider.js_on_change("value", callback)
 
             layout = column(signal_fig, latent_fig, heat_fig, slider)
-            output_file(str(out_dir / f"latent_interp_pair_{pair_idx:02d}.html"), title=f"Latent Interpolation Pair {pair_idx}")
+            output_file(
+                filename=str(out_dir / f"latent_interp_pair_{pair_idx:02d}.html"),
+                title=f"Latent Interpolation Pair {pair_idx}",
+                mode="inline",
+            )
             save(layout)
         logger.info("Latent interpolation animations saved to %s", out_dir)
 
