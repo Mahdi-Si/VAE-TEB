@@ -983,6 +983,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             # ------------------------------------------------------------------
             # 3) Build Bokeh figures with slider-controlled data updates
             # ------------------------------------------------------------------
+            heat0 = np.asarray(heatmaps_clean[0], dtype=float)
+            if heat0.ndim != 2:
+                logger.warning("Skipping pair %d due to non-2D heatmap shape %s", pair_idx, heat0.shape)
+                continue
             signal_source = ColumnDataSource(
                 data=dict(
                     x=x_values,
@@ -991,7 +995,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 )
             )
             latent_source = ColumnDataSource(data=dict(dim=dim_template, value=latent_means[0]))
-            heat_source = ColumnDataSource(data=dict(image=[heatmaps_clean[0]]))
+            heat_source = ColumnDataSource(data=dict(image=[heat0]))
 
             signal_fig = figure(
                 title=f"Pair {pair_idx} – Raw vs Reconstruction",
@@ -1037,6 +1041,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             )
             heat_fig.add_layout(ColorBar(color_mapper=color_mapper, width=10, label_standoff=8), "right")
 
+            # Diagnostics rendered in-page for quick inspection
+            meta_div = Div(
+                text=(
+                    f"<b>Pair {pair_idx}</b> | steps={len(recon_sequences)} | "
+                    f"signal_len={len(x_values)} | latent_dim={latent_dim} | seq_len={seq_len}"
+                ),
+                style={"font-size": "12px", "margin-bottom": "6px"},
+            )
+
             slider = Slider(start=0, end=len(recon_sequences) - 1, value=0, step=1, title="Interpolation Step")
             slider_callback = CustomJS(
                 args=dict(
@@ -1049,11 +1062,17 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     heat_data=heatmaps_clean,
                     x_values=x_values,
                     dim_values=dim_template,
+                    latent_dim_val=latent_dim,
+                    seq_len_val=seq_len,
                 ),
                 code="""
                     const idx = Math.max(0, Math.min(recon_data.length - 1, Math.round(cb_obj.value)));
                     if (!recon_data[idx] || !target_data[idx]) {
                         console.warn("Interpolation step missing recon/target data at idx", idx);
+                        return;
+                    }
+                    if (!Array.isArray(recon_data[idx]) || !Array.isArray(target_data[idx])) {
+                        console.warn("Interpolation step recon/target not arrays at idx", idx, recon_data[idx], target_data[idx]);
                         return;
                     }
                     src_signal.data = {x: x_values, recon: recon_data[idx], target: target_data[idx]};
@@ -1067,12 +1086,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         src_heat.change.emit();
                     } else {
                         console.warn("Heatmap data missing at idx", idx);
+                        const zeros = Array.from({length: latent_dim_val}, () => Array(seq_len_val).fill(0));
+                        src_heat.data = {image: [zeros]};
+                        src_heat.change.emit();
                     }
                 """,
             )
             slider.js_on_change("value", slider_callback)
 
-            layout = column(signal_fig, latent_fig, heat_fig, slider)
+            layout = column(meta_div, signal_fig, latent_fig, heat_fig, slider)
             output_path = out_dir / f"latent_interp_pair_{pair_idx:02d}.html"
             output_path.write_text(file_html(layout, INLINE, title=f"Latent Interpolation Pair {pair_idx}"), encoding="utf-8")
             diag_path = out_dir / f"latent_interp_pair_{pair_idx:02d}_diag.yaml"
