@@ -896,8 +896,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
                 recon_sequences.append(recon_flat[:series_len].astype(float).tolist())
                 target_sequences.append(target_flat[:series_len].astype(float).tolist())
-                latent_means.append(latent_interp.mean(dim=1)[0].detach().cpu().numpy().astype(float).tolist())
-                latent_heatmaps.append(latent_interp[0].detach().cpu().numpy().astype(float).tolist())
+                latent_mean_np = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
+                latent_heat_np = latent_interp[0].detach().cpu().numpy().T  # (latent_dim, seq_len) to match analysis plots
+                latent_means.append(self._sanitize_finite_array(latent_mean_np).tolist())
+                latent_heatmaps.append(self._sanitize_finite_array(latent_heat_np).tolist())
 
             if not recon_sequences or not target_sequences:
                 logger.warning("Interpolation pair %d produced no valid decoded signals.", pair_idx)
@@ -919,12 +921,31 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             heatmaps_clean = []
             for heat in latent_heatmaps:
                 arr = np.asarray(heat, dtype=float)
-                if arr.shape != (seq_len, latent_dim):
+                if arr.shape != (latent_dim, seq_len):
                     continue
                 heatmaps_clean.append(arr.tolist())
             if not heatmaps_clean:
                 logger.warning("Skipping pair %d due to invalid latent heatmaps.", pair_idx)
                 continue
+
+            recon_min = min(min(seq) for seq in recon_sequences)
+            recon_max = max(max(seq) for seq in recon_sequences)
+            target_min = min(min(seq) for seq in target_sequences)
+            target_max = max(max(seq) for seq in target_sequences)
+            latent_min = min(min(seq) for seq in latent_means)
+            latent_max = max(max(seq) for seq in latent_means)
+            diagnostics.update(
+                {
+                    "recon_min": float(recon_min),
+                    "recon_max": float(recon_max),
+                    "target_min": float(target_min),
+                    "target_max": float(target_max),
+                    "latent_min": float(latent_min),
+                    "latent_max": float(latent_max),
+                    "heat_min": float(min(float(np.min(arr)) for arr in heatmaps_clean)),
+                    "heat_max": float(max(float(np.max(arr)) for arr in heatmaps_clean)),
+                }
+            )
 
             # ------------------------------------------------------------------
             # 3) Build Bokeh figures with slider-controlled data updates
@@ -967,12 +988,12 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 title=f"Pair {pair_idx} – Latent Heatmap",
                 width=900,
                 height=320,
-                x_axis_label="Latent Dimension",
-                y_axis_label="Time Step",
-                x_range=(0, latent_dim),
-                y_range=(seq_len, 0),
+                x_axis_label="Time Step",
+                y_axis_label="Latent Dimension",
+                x_range=(0, seq_len),
+                y_range=(0, latent_dim),
             )
-            heat_fig.image(source=heat_source, image="image", x=0, y=0, dw=latent_dim, dh=seq_len, color_mapper=color_mapper)
+            heat_fig.image(source=heat_source, image="image", x=0, y=0, dw=seq_len, dh=latent_dim, color_mapper=color_mapper)
             heat_fig.add_layout(ColorBar(color_mapper=color_mapper, width=10, label_standoff=8), "right")
 
             slider = Slider(start=0, end=len(recon_sequences) - 1, value=0, step=1, title="Interpolation Step")
@@ -1006,9 +1027,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             diag_path = out_dir / f"latent_interp_pair_{pair_idx:02d}_diag.yaml"
             try:
                 import yaml as _yaml  # Local import to avoid global dependency at runtime
-                diag_path.write_text(_yaml.safe_dump(diagnostics), encoding="utf-8")
-            except Exception:
-                pass
+                diag_path.write_text(_yaml.safe_dump(diagnostics, sort_keys=False), encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to write diag yaml for pair %d: %s", pair_idx, exc)
             logger.info(
                 "Saved latent interpolation pair %d -> %s (steps=%d, series_len=%d, latent_dim=%d, seq_len=%d)",
                 pair_idx,
@@ -1146,6 +1167,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         flat = np.clip(flat, -1e6, 1e6)
         return flat
+
+    @staticmethod
+    def _sanitize_finite_array(arr: np.ndarray, clip_val: float = 1e6) -> np.ndarray:
+        """Ensure array is finite and reasonably bounded for JSON serialization."""
+        arr = np.asarray(arr, dtype=float)
+        np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        return np.clip(arr, -clip_val, clip_val)
 
     @staticmethod
     def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
