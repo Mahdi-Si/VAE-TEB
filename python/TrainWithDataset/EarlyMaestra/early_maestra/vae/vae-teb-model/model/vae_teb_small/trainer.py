@@ -31,7 +31,7 @@ class SeqVaeCorePl(LightningModelBase):
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
         y_raw  = batch.fhr
-        forward_outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        forward_outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, prediction_mode=True)
         loss_dict = self.orig_model.compute_loss(
             forward_outputs=forward_outputs,
             y_st=y_st,
