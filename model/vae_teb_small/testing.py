@@ -866,7 +866,6 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_store: List[np.ndarray] = []
             latent_store: List[np.ndarray] = []
             heatmaps: List[List[List[float]]] = []
-            time_axis = np.arange(y_a.shape[-1])
             latent_dim = latent_a.size(-1)
             sequence_len = latent_a.size(1)
             for alpha in weights:
@@ -876,19 +875,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 target_interp = y_a * (1.0 - alpha) + y_b * alpha
                 recon_flat = self._flatten_signal_for_plot(recon_interp[0])
                 target_flat = self._flatten_signal_for_plot(target_interp[0])
-                min_len = min(len(time_axis), recon_flat.shape[0], target_flat.shape[0])
-                if min_len <= 0:
+                min_len = min(recon_flat.shape[0], target_flat.shape[0])
+                if min_len <= 1:
                     continue
-                if (
-                    recon_flat.shape[0] != time_axis.size
-                    or target_flat.shape[0] != time_axis.size
-                ):
-                    logger.debug(
-                        "Trimming interpolation series from (%d, %d) to %d samples.",
-                        recon_flat.shape[0],
-                        target_flat.shape[0],
-                        min_len,
-                    )
                 recon_store.append(recon_flat[:min_len])
                 target_store.append(target_flat[:min_len])
                 latent_mean = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
@@ -899,15 +888,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 logger.warning("Interpolation pair %d produced empty signal series.", pair_idx)
                 continue
 
-            series_candidates = [time_axis.size]
-            series_candidates.extend(arr.shape[0] for arr in recon_store)
-            series_candidates.extend(arr.shape[0] for arr in target_store)
-            series_len = min(series_candidates)
+            series_len = min(
+                min(arr.shape[0] for arr in recon_store),
+                min(arr.shape[0] for arr in target_store),
+            )
             if series_len <= 1:
                 logger.warning("Skipping pair %d due to insufficient series length (%d).", pair_idx, series_len)
                 continue
 
-            x_values = time_axis[:series_len].tolist()
+            x_values = np.arange(series_len).tolist()
             recon_series = [arr[:series_len].tolist() for arr in recon_store]
             target_series = [arr[:series_len].tolist() for arr in target_store]
             latent_series = [arr.tolist() for arr in latent_store]
@@ -1120,12 +1109,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         array = tensor.detach().cpu().numpy()
         squeezed = np.squeeze(array)
         if squeezed.ndim == 0:
-            return np.asarray([float(squeezed)])
-        if squeezed.ndim == 1:
-            return squeezed
-        if squeezed.ndim == 2:
-            return squeezed[0]
-        return squeezed.reshape(-1)
+            flat = np.asarray([float(squeezed)])
+        elif squeezed.ndim == 1:
+            flat = squeezed
+        elif squeezed.ndim == 2:
+            flat = squeezed[0]
+        else:
+            flat = squeezed.reshape(-1)
+        np.nan_to_num(flat, copy=False)
+        return flat
 
     @staticmethod
     def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
@@ -1321,6 +1313,12 @@ def main(
     tester.setup_config()
     tester.create_model()
     test_loader = build_test_dataloader(config_data)
+    if latent_interp_pairs and latent_interp_steps and latent_interp_steps >= 2:
+        tester.run_latent_interpolation(
+            test_loader,
+            pair_count=latent_interp_pairs,
+            steps=latent_interp_steps,
+        )
     if latent_dist_samples and latent_dist_samples > 0:
         tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
     if analysis_samples and analysis_samples > 0:
@@ -1342,12 +1340,6 @@ def main(
             dims=sweep_dims_list,
             scales=sweep_scale_list,
             visuals_per_dim=latent_sweep_visuals,
-        )
-    if latent_interp_pairs and latent_interp_steps and latent_interp_steps >= 2:
-        tester.run_latent_interpolation(
-            test_loader,
-            pair_count=latent_interp_pairs,
-            steps=latent_interp_steps,
         )
     if latent_attr_samples and latent_attr_samples > 0:
         tester.run_latent_feature_attribution(test_loader, num_samples=latent_attr_samples)
