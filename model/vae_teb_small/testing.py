@@ -995,7 +995,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 )
             )
             latent_source = ColumnDataSource(data=dict(dim=dim_template, value=latent_means[0]))
-            heat_source = ColumnDataSource(data=dict(image=[heat0]))
+            heat_source = ColumnDataSource(data=dict(image=[heat0.tolist()]))
 
             signal_fig = figure(
                 title=f"Pair {pair_idx} – Raw vs Reconstruction",
@@ -1076,19 +1076,21 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     }
                     src_signal.data = {x: x_values, recon: recon_data[idx], target: target_data[idx]};
                     src_signal.change.emit();
-                    if (latent_data[idx]) {
-                        src_latent.data = {dim: dim_values, value: latent_data[idx]};
-                        src_latent.change.emit();
-                    }
-                    if (heat_data[idx]) {
-                        src_heat.data = {image: [heat_data[idx]]};
-                        src_heat.change.emit();
+                    const latentVals = latent_data[idx] && Array.isArray(latent_data[idx]) && latent_data[idx].length === dim_values.length
+                        ? latent_data[idx]
+                        : Array(dim_values.length).fill(0);
+                    src_latent.data = {dim: dim_values, value: latentVals};
+                    src_latent.change.emit();
+
+                    const heatVals = heat_data[idx];
+                    if (heatVals && Array.isArray(heatVals) && heatVals.length === latent_dim_val && Array.isArray(heatVals[0]) && heatVals[0].length === seq_len_val) {
+                        src_heat.data = {image: [heatVals]};
                     } else {
-                        console.warn("Heatmap data missing at idx", idx);
+                        console.warn("Heatmap data missing/invalid at idx", idx);
                         const zeros = Array.from({length: latent_dim_val}, () => Array(seq_len_val).fill(0));
                         src_heat.data = {image: [zeros]};
-                        src_heat.change.emit();
                     }
+                    src_heat.change.emit();
                 """,
             )
             slider.js_on_change("value", slider_callback)
