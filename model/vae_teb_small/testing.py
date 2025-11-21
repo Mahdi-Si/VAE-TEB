@@ -10,10 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
+from bokeh.embed import file_html
 from bokeh.layouts import column
 from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider
 from bokeh.palettes import Viridis256
-from bokeh.plotting import figure, save
+from bokeh.plotting import figure
 from bokeh.resources import INLINE
 from loguru import logger
 
@@ -964,12 +965,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             slider.js_on_change("value", callback)
 
             layout = column(signal_fig, latent_fig, heat_fig, slider)
-            save(
-                layout,
-                filename=str(out_dir / f"latent_interp_pair_{pair_idx:02d}.html"),
-                title=f"Latent Interpolation Pair {pair_idx}",
-                resources=INLINE,
-            )
+            html = file_html(layout, INLINE, title=f"Latent Interpolation Pair {pair_idx}")
+            output_path = out_dir / f"latent_interp_pair_{pair_idx:02d}.html"
+            output_path.write_text(html, encoding="utf-8")
         logger.info("Latent interpolation animations saved to %s", out_dir)
 
     def run_latent_feature_attribution(
