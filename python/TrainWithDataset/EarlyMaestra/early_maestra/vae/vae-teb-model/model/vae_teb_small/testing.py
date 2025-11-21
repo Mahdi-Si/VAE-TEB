@@ -4,16 +4,21 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+import math
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
+from bokeh.layouts import column
+from bokeh.models import ColumnDataSource, CustomJS, Slider
+from bokeh.plotting import figure, output_file, save
 from loguru import logger
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from trainer import GraphModelVaeTebSmallTrainer
 from train.graph_models_utils import denormalize_signal_data
 from utils.plot_utils import plot_metrics_histograms, plot_model_analysis, plot_vae_reconstruction
-import matplotlib.pyplot as plt
 
 
 def load_config(path: Path) -> Dict:
@@ -52,7 +57,7 @@ def build_test_dataloader(config: Dict):
 class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
     """Lightweight test harness focused on basic reconstruction diagnostics."""
 
-    def run_histogram_test(self, test_loader, *, num_samples: Optional[int] = None) -> None:
+    def run_histogram_test(self, test_loader, *, num_samples: Optional[int] = None, max_samples: Optional[int] = None) -> None:
         """Evaluate VAF, MSE, SNR, and KLD histograms on the provided loader."""
         if self.pytorch_model is None:
             self.create_model()
@@ -69,11 +74,16 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         snr_values: List[float] = []
         kld_values: List[float] = []
 
-        max_samples = None if num_samples is None else max(0, int(num_samples))
+        limit_primary = None if num_samples is None else max(0, int(num_samples))
+        limit_secondary = None if max_samples is None else max(0, int(max_samples))
+        if limit_primary is not None and limit_secondary is not None:
+            total_limit = min(limit_primary, limit_secondary)
+        else:
+            total_limit = limit_primary if limit_primary is not None else limit_secondary
         processed = 0
         with torch.inference_mode():
             for batch in test_loader:
-                if max_samples is not None and processed >= max_samples:
+                if total_limit is not None and processed >= total_limit:
                     break
 
                 y_st = batch.fhr_st.to(device)
@@ -98,8 +108,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 batch_snr = metrics["snr"].detach().cpu().tolist()
                 batch_kld = kld_batch.detach().cpu().tolist()
 
-                if max_samples is not None:
-                    remaining = max_samples - processed
+                if total_limit is not None:
+                    remaining = total_limit - processed
                     if remaining <= 0:
                         break
                     batch_vaf = batch_vaf[:remaining]
@@ -130,6 +140,62 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         )
 
         plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, output_dir)
+
+    def run_latent_distribution(self, test_loader, *, num_samples: int = 500) -> None:
+        """Plot latent-dimension distributions aggregated across samples."""
+        if num_samples <= 0:
+            logger.info("Latent distribution skipped (num_samples <= 0)")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model unavailable; cannot compute latent distributions.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        latent_chunks: List[np.ndarray] = []
+        collected = 0
+        with torch.inference_mode():
+            for batch in test_loader:
+                outputs = model(y_st=batch.fhr_st.to(device), y_ph=batch.fhr_ph.to(device), x_ph=batch.fhr_up_ph.to(device))
+                latent = outputs.get("z")
+                if latent is None:
+                    continue
+                latent_np = latent.detach().cpu().numpy()  # (B, T, D)
+                batch_size = latent_np.shape[0]
+                for i in range(batch_size):
+                    if collected >= num_samples:
+                        break
+                    latent_chunks.append(latent_np[i].reshape(-1, latent_np.shape[-1]))
+                    collected += 1
+                if collected >= num_samples:
+                    break
+        if not latent_chunks:
+            logger.warning("No latent samples collected for distribution plot.")
+            return
+        combined = np.concatenate(latent_chunks, axis=0)
+        latent_dim = combined.shape[1]
+        cols = 4
+        rows = math.ceil(latent_dim / cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows))
+        axes = np.atleast_2d(axes)
+        for idx in range(rows * cols):
+            row, col = divmod(idx, cols)
+            ax = axes[row, col]
+            if idx < latent_dim:
+                ax.hist(combined[:, idx], bins=50, color="#4C72B0", alpha=0.8)
+                ax.set_title(f"z[{idx}]")
+            else:
+                ax.axis("off")
+        fig.tight_layout()
+        out_dir = Path(self.test_results_dir) / "latent_distribution"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_dir / "latent_histograms.png", dpi=200)
+        plt.close(fig)
+        logger.info("Latent distribution plot saved to %s", out_dir)
 
     @staticmethod
     def _kld_tensor_from_forward(outputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
@@ -675,10 +741,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             self._plot_latent_metric_curves(metric_map, sweep_scales, dim_dir / "metric_curves.png")
             logger.info("Latent sweep plotted for dimension %d -> %s", dim, dim_dir)
 
-    def run_latent_interpolation(self, test_loader, *, steps: int = 5) -> None:
-        """Interpolate between two latent vectors and visualize reconstructions."""
-        if steps < 2:
-            logger.warning("Interpolation steps must be >=2")
+    def run_latent_interpolation(self, test_loader, *, pair_count: int = 10, steps: int = 11) -> None:
+        """Create Bokeh animations showing interpolation between sample pairs."""
+        if pair_count <= 0 or steps < 2:
+            logger.info("Latent interpolation skipped (invalid pair_count/steps)")
             return
         if self.pytorch_model is None:
             self.create_model()
@@ -691,64 +757,116 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         )
         model = self.pytorch_model.to(device)
         model.eval()
-        out_dir = Path(self.test_results_dir) / "latent_interpolation"
+        out_dir = Path(self.test_results_dir) / "latent_interpolation_bokeh"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        samples = []
+        required_samples = pair_count * 2
+        samples: List[Dict[str, torch.Tensor]] = []
         with torch.inference_mode():
             for batch in test_loader:
                 batch_size = batch.fhr_st.size(0)
                 for idx in range(batch_size):
-                    sample = {
-                        "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
-                        "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
-                        "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
-                        "fhr": batch.fhr[idx : idx + 1].to(device),
-                    }
-                    samples.append(sample)
-                    if len(samples) >= 2:
+                    samples.append(
+                        {
+                            "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
+                            "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
+                            "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
+                            "fhr": batch.fhr[idx : idx + 1].to(device),
+                        }
+                    )
+                    if len(samples) >= required_samples:
                         break
-                if len(samples) >= 2:
+                if len(samples) >= required_samples:
                     break
         if len(samples) < 2:
-            logger.error("Need at least two samples for interpolation.")
+            logger.error("Insufficient samples for interpolation.")
             return
 
-        with torch.inference_mode():
-            outputs_a = model(y_st=samples[0]["fhr_st"], y_ph=samples[0]["fhr_ph"], x_ph=samples[0]["fhr_up_ph"])
-            outputs_b = model(y_st=samples[1]["fhr_st"], y_ph=samples[1]["fhr_ph"], x_ph=samples[1]["fhr_up_ph"])
-
-        latent_a = outputs_a.get("z")
-        latent_b = outputs_b.get("z")
-        y_a = samples[0]["fhr"]
-        y_b = samples[1]["fhr"]
-        if latent_a is None or latent_b is None:
-            logger.error("Unable to obtain latents for interpolation.")
-            return
-
+        actual_pairs = min(pair_count, len(samples) // 2)
         weights = np.linspace(0.0, 1.0, steps)
-        metric_curves = {"mse": [], "vaf": [], "snr": []}
-        recon_examples = []
-        for alpha in weights:
-            latent_interp = latent_a * (1.0 - alpha) + latent_b * alpha
-            recon_interp = decoder(latent_interp)[1]
-            target_interp = y_a * (1.0 - alpha) + y_b * alpha
-            metrics = self._compute_basic_metrics(target_interp, recon_interp)
-            if metrics is None:
+        for pair_idx in range(actual_pairs):
+            sample_a = samples[2 * pair_idx]
+            sample_b = samples[2 * pair_idx + 1]
+            with torch.inference_mode():
+                outputs_a = model(y_st=sample_a["fhr_st"], y_ph=sample_a["fhr_ph"], x_ph=sample_a["fhr_up_ph"])
+                outputs_b = model(y_st=sample_b["fhr_st"], y_ph=sample_b["fhr_ph"], x_ph=sample_b["fhr_up_ph"])
+            latent_a = outputs_a.get("z")
+            latent_b = outputs_b.get("z")
+            if latent_a is None or latent_b is None:
+                logger.warning("Skipping pair %d due to missing latents.", pair_idx)
                 continue
-            metric_curves["mse"].append(float(torch.mean(metrics["mse"]).detach().cpu().item()))
-            metric_curves["vaf"].append(float(torch.mean(metrics["vaf"]).detach().cpu().item()))
-            metric_curves["snr"].append(float(torch.mean(metrics["snr"]).detach().cpu().item()))
-            recon_examples.append(
-                {
-                    "alpha": alpha,
-                    "target": target_interp[0].detach().cpu().numpy(),
-                    "recon": recon_interp[0].detach().cpu().numpy(),
-                }
-            )
+            y_a = sample_a["fhr"]
+            y_b = sample_b["fhr"]
+            recon_store: List[np.ndarray] = []
+            target_store: List[np.ndarray] = []
+            latent_store: List[np.ndarray] = []
+            time_axis = np.arange(y_a.shape[-1])
+            latent_dim = latent_a.size(-1)
+            for alpha in weights:
+                latent_interp = latent_a * (1.0 - alpha) + latent_b * alpha
+                decoded = decoder(latent_interp)
+                recon_interp = decoded[1]
+                target_interp = y_a * (1.0 - alpha) + y_b * alpha
+                recon_store.append(recon_interp[0].detach().cpu().numpy())
+                target_store.append(target_interp[0].detach().cpu().numpy())
+                latent_mean = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
+                latent_store.append(latent_mean)
 
-        self._plot_interpolation_metrics(weights, metric_curves, out_dir / "metric_curves.png")
-        self._plot_interpolation_examples(recon_examples, out_dir / "recon_examples.png")
+            signal_source = ColumnDataSource(
+                data=dict(
+                    x=time_axis,
+                    recon=recon_store[0],
+                    target=target_store[0],
+                )
+            )
+            latent_source = ColumnDataSource(
+                data=dict(dim=np.arange(latent_dim), value=latent_store[0])
+            )
+            signal_fig = figure(
+                title=f"Pair {pair_idx} - Raw vs Reconstruction",
+                width=900,
+                height=300,
+                x_axis_label="Time Index",
+                y_axis_label="Amplitude",
+            )
+            signal_fig.line("x", "target", source=signal_source, color="#1b9e77", legend_label="Target", line_width=2)
+            signal_fig.line("x", "recon", source=signal_source, color="#d95f02", legend_label="Reconstruction", line_width=2)
+            signal_fig.legend.location = "top_right"
+            signal_fig.legend.click_policy = "hide"
+
+            latent_fig = figure(
+                title=f"Pair {pair_idx} - Latent Mean by Dimension",
+                width=900,
+                height=250,
+                x_axis_label="Latent Dimension",
+                y_axis_label="Mean Value",
+            )
+            latent_fig.vbar(x="dim", top="value", width=0.8, source=latent_source, color="#7570b3")
+
+            slider = Slider(start=0, end=len(weights) - 1, value=0, step=1, title="Interpolation Step")
+            callback = CustomJS(
+                args=dict(
+                    source_signal=signal_source,
+                    source_latent=latent_source,
+                    recon_data=recon_store,
+                    target_data=target_store,
+                    latent_data=latent_store,
+                ),
+                code="""
+                    const idx = Math.round(cb_obj.value);
+                    source_signal.data['recon'] = recon_data[idx];
+                    source_signal.data['target'] = target_data[idx];
+                    source_signal.change.emit();
+                    source_latent.data['value'] = latent_data[idx];
+                    source_latent.change.emit();
+                """,
+            )
+            slider.js_on_change("value", callback)
+
+            layout = column(signal_fig, latent_fig, slider)
+            output_file(out_dir / f"latent_interp_pair_{pair_idx:02d}.html", title=f"Latent Interpolation Pair {pair_idx}")
+            save(layout)
+        logger.info("Latent interpolation animations saved to %s", out_dir)
 
     def run_latent_feature_attribution(
         self,
@@ -874,41 +992,6 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         plt.close(fig)
 
     @staticmethod
-    def _plot_interpolation_metrics(weights: np.ndarray, metric_curves: Dict[str, List[float]], path: Path) -> None:
-        fig, axes = plt.subplots(1, len(metric_curves), figsize=(5 * len(metric_curves), 4), squeeze=False)
-        for idx, (metric, values) in enumerate(metric_curves.items()):
-            axis = axes[0][idx]
-            axis.plot(weights, values, marker="o")
-            axis.set_title(metric.upper())
-            axis.set_xlabel("Interpolation weight")
-            axis.set_ylabel(metric.upper())
-            axis.grid(True, alpha=0.4)
-        fig.suptitle("Latent Interpolation Metrics", fontsize=14)
-        fig.tight_layout()
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
-
-    @staticmethod
-    def _plot_interpolation_examples(examples: List[Dict[str, Any]], path: Path) -> None:
-        if not examples:
-            return
-        fig, ax = plt.subplots(figsize=(12, 4))
-        t = np.arange(len(examples[0]["target"]))
-        for record in examples:
-            label = f"alpha={record['alpha']:.2f}"
-            ax.plot(t, record["recon"], label=f"Recon {label}", alpha=0.8)
-        ax.plot(t, examples[0]["target"], label="Target alpha=0", linestyle="--", color="black", alpha=0.6)
-        ax.plot(t, examples[-1]["target"], label="Target alpha=1", linestyle="--", color="gray", alpha=0.6)
-        ax.set_title("Reconstruction trajectories along interpolation")
-        ax.set_xlabel("Time index")
-        ax.set_ylabel("Normalized amplitude")
-        ax.legend(loc="upper right", ncol=2)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
-
-    @staticmethod
     def _plot_feature_importance(values: np.ndarray, path: Path) -> None:
         fig, ax = plt.subplots(figsize=(10, 4))
         dim_ids = np.arange(len(values))
@@ -932,6 +1015,12 @@ def parse_args() -> argparse.Namespace:
         help="Limit number of samples for histogram plots (None = all, 0 = skip).",
     )
     parser.add_argument(
+        "--metrics-max-samples",
+        type=int,
+        default=None,
+        help="Additional limit for histogram metric samples (None = unrestricted).",
+    )
+    parser.add_argument(
         "--analysis-samples",
         type=int,
         default=10,
@@ -940,7 +1029,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latent-ablation-samples",
         type=int,
-        default=16,
+        default=0,
         help="Number of samples to run latent ablation on (0 = skip).",
     )
     parser.add_argument(
@@ -956,9 +1045,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of reconstruction plots to save per ablated dimension.",
     )
     parser.add_argument(
+        "--latent-dist-samples",
+        type=int,
+        default=500,
+        help="Samples to use when plotting latent distributions (0 = skip).",
+    )
+    parser.add_argument(
         "--latent-sweep-samples",
         type=int,
-        default=16,
+        default=0,
         help="Number of samples for latent magnitude sweep (0 = skip).",
     )
     parser.add_argument(
@@ -980,10 +1075,16 @@ def parse_args() -> argparse.Namespace:
         help="Visuals per-dimension during latent sweep.",
     )
     parser.add_argument(
+        "--latent-interp-pairs",
+        type=int,
+        default=10,
+        help="Number of sample pairs for interpolation animations.",
+    )
+    parser.add_argument(
         "--latent-interp-steps",
         type=int,
-        default=6,
-        help="Number of interpolation steps (>=2 runs the test).",
+        default=11,
+        help="Number of discrete interpolation steps (>=2).",
     )
     parser.add_argument(
         "--latent-attr-samples",
@@ -1046,15 +1147,18 @@ def main(
     *,
     config: Path | str = Path("config.yaml"),
     max_samples: Optional[int] = None,
+    metrics_max_samples: Optional[int] = None,
     analysis_samples: int = 10,
-    latent_ablation_samples: int = 16,
+    latent_ablation_samples: int = 0,
     latent_ablation_dims: Optional[Any] = None,
     latent_ablation_visuals: int = 1,
-    latent_sweep_samples: int = 16,
+    latent_dist_samples: int = 1000,
+    latent_sweep_samples: int = 0,
     latent_sweep_dims: Optional[Any] = None,
     latent_sweep_scales: Optional[Any] = None,
     latent_sweep_visuals: int = 1,
-    latent_interp_steps: int = 6,
+    latent_interp_pairs: int = 10,
+    latent_interp_steps: int = 20,
     latent_attr_samples: int = 8,
 ) -> None:
     config_path = Path(config)
@@ -1063,6 +1167,8 @@ def main(
     tester.setup_config()
     tester.create_model()
     test_loader = build_test_dataloader(config_data)
+    if latent_dist_samples and latent_dist_samples > 0:
+        tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
     if analysis_samples and analysis_samples > 0:
         tester.run_analysis_and_plot(test_loader, num_samples=analysis_samples)
     ablation_dims_list = _parse_int_list(latent_ablation_dims)
@@ -1083,12 +1189,20 @@ def main(
             scales=sweep_scale_list,
             visuals_per_dim=latent_sweep_visuals,
         )
-    if latent_interp_steps and latent_interp_steps >= 2:
-        tester.run_latent_interpolation(test_loader, steps=latent_interp_steps)
+    if latent_interp_pairs and latent_interp_steps and latent_interp_steps >= 2:
+        tester.run_latent_interpolation(
+            test_loader,
+            pair_count=latent_interp_pairs,
+            steps=latent_interp_steps,
+        )
     if latent_attr_samples and latent_attr_samples > 0:
         tester.run_latent_feature_attribution(test_loader, num_samples=latent_attr_samples)
-    if max_samples is None or max_samples > 0:
-        tester.run_histogram_test(test_loader, num_samples=max_samples)
+    if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
+        tester.run_histogram_test(
+            test_loader,
+            num_samples=max_samples,
+            max_samples=metrics_max_samples,
+        )
 
 
 if __name__ == "__main__":
