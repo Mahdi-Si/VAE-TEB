@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -994,67 +994,102 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    config = load_config(args.config)
-    tester = GraphModelVaeTebSmallTester(str(args.config))
+def _parse_int_list(value: Optional[Any]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            return [int(item.strip()) for item in value.split(",") if item.strip()]
+        except ValueError:
+            logger.warning("Failed to parse int list from %s; ignoring.", value)
+            return None
+    if isinstance(value, Iterable):
+        try:
+            return [int(item) for item in value]
+        except (TypeError, ValueError):
+            logger.warning("Failed to coerce iterable %s into int list; ignoring.", value)
+            return None
+    try:
+        return [int(value)]
+    except (TypeError, ValueError):
+        logger.warning("Failed to parse value %s as int list; ignoring.", value)
+        return None
+
+
+def _parse_float_list(value: Optional[Any]) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            return [float(item.strip()) for item in value.split(",") if item.strip()]
+        except ValueError:
+            logger.warning("Failed to parse float list from %s; ignoring.", value)
+            return None
+    if isinstance(value, Iterable):
+        try:
+            return [float(item) for item in value]
+        except (TypeError, ValueError):
+            logger.warning("Failed to coerce iterable %s into float list; ignoring.", value)
+            return None
+    try:
+        return [float(value)]
+    except (TypeError, ValueError):
+        logger.warning("Failed to parse value %s as float list; ignoring.", value)
+        return None
+
+
+def main(
+    *,
+    config: Path | str = Path("config.yaml"),
+    max_samples: Optional[int] = None,
+    analysis_samples: int = 10,
+    latent_ablation_samples: int = 10,
+    latent_ablation_dims: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
+    latent_ablation_visuals: int = 10,
+    latent_sweep_samples: int = 10,
+    latent_sweep_dims: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
+    latent_sweep_scales: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
+    latent_sweep_visuals: int = 10,
+    latent_interp_steps: int = 10,
+    latent_attr_samples: int = 10,
+) -> None:
+    config_path = Path(config)
+    config_data = load_config(config_path)
+    tester = GraphModelVaeTebSmallTester(str(config_path))
     tester.setup_config()
     tester.create_model()
-    test_loader = build_test_dataloader(config)
-    if args.analysis_samples and args.analysis_samples > 0:
-        tester.run_analysis_and_plot(test_loader, num_samples=args.analysis_samples)
-    ablation_dims = None
-    if args.latent_ablation_dims:
-        try:
-            ablation_dims = [
-                int(item.strip()) for item in args.latent_ablation_dims.split(",") if item.strip()
-            ]
-        except ValueError:
-            logger.warning("Could not parse --latent-ablation-dims=%s; defaulting to all dims.", args.latent_ablation_dims)
-            ablation_dims = None
-    if args.latent_ablation_samples and args.latent_ablation_samples > 0:
+    test_loader = build_test_dataloader(config_data)
+    if analysis_samples and analysis_samples > 0:
+        tester.run_analysis_and_plot(test_loader, num_samples=analysis_samples)
+    ablation_dims_list = _parse_int_list(latent_ablation_dims)
+    if latent_ablation_samples and latent_ablation_samples > 0:
         tester.run_latent_ablation_test(
             test_loader,
-            num_samples=args.latent_ablation_samples,
-            dims=ablation_dims,
-            visuals_per_dim=args.latent_ablation_visuals,
+            num_samples=latent_ablation_samples,
+            dims=ablation_dims_list,
+            visuals_per_dim=latent_ablation_visuals,
         )
-    sweep_dims = None
-    if args.latent_sweep_dims:
-        try:
-            sweep_dims = [
-                int(item.strip()) for item in args.latent_sweep_dims.split(",") if item.strip()
-            ]
-        except ValueError:
-            logger.warning("Could not parse --latent-sweep-dims=%s; defaulting to all dims.", args.latent_sweep_dims)
-            sweep_dims = None
-    sweep_scales = None
-    if args.latent_sweep_scales:
-        try:
-            sweep_scales = [
-                float(item.strip()) for item in args.latent_sweep_scales.split(",") if item.strip()
-            ]
-        except ValueError:
-            logger.warning(
-                "Could not parse --latent-sweep-scales=%s; using defaults.",
-                args.latent_sweep_scales,
-            )
-            sweep_scales = None
-    if args.latent_sweep_samples and args.latent_sweep_samples > 0:
+    sweep_dims_list = _parse_int_list(latent_sweep_dims)
+    sweep_scale_list = _parse_float_list(latent_sweep_scales)
+    if latent_sweep_samples and latent_sweep_samples > 0:
         tester.run_latent_magnitude_sweep(
             test_loader,
-            num_samples=args.latent_sweep_samples,
-            dims=sweep_dims,
-            scales=sweep_scales,
-            visuals_per_dim=args.latent_sweep_visuals,
+            num_samples=latent_sweep_samples,
+            dims=sweep_dims_list,
+            scales=sweep_scale_list,
+            visuals_per_dim=latent_sweep_visuals,
         )
-    if args.latent_interp_steps and args.latent_interp_steps >= 2:
-        tester.run_latent_interpolation(test_loader, steps=args.latent_interp_steps)
-    if args.latent_attr_samples and args.latent_attr_samples > 0:
-        tester.run_latent_feature_attribution(test_loader, num_samples=args.latent_attr_samples)
-    if args.max_samples is None or args.max_samples > 0:
-        tester.run_histogram_test(test_loader, num_samples=args.max_samples)
+    if latent_interp_steps and latent_interp_steps >= 2:
+        tester.run_latent_interpolation(test_loader, steps=latent_interp_steps)
+    if latent_attr_samples and latent_attr_samples > 0:
+        tester.run_latent_feature_attribution(test_loader, num_samples=latent_attr_samples)
+    if max_samples is None or max_samples > 0:
+        tester.run_histogram_test(test_loader, num_samples=max_samples)
 
 
 if __name__ == "__main__":
-    main()
+    main(**vars(parse_args()))
