@@ -879,7 +879,11 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_sequences: List[List[float]] = []
             latent_means: List[List[float]] = []
             latent_heatmaps: List[List[List[float]]] = []
-            diagnostics: Dict[str, Any] = {"pair_idx": pair_idx, "alphas": [], "series_len": []}
+            diagnostics: Dict[str, Any] = {
+                "pair_idx": pair_idx,
+                "alphas": [],
+                "series_len": [],
+            }
 
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
@@ -910,23 +914,50 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 logger.warning("Skipping pair %d (series length %d).", pair_idx, min_series_len)
                 continue
 
+            # Align sequence counts across all collections to avoid undefined JS data
+            common_len = min(
+                len(recon_sequences),
+                len(target_sequences),
+                len(latent_means),
+                len(latent_heatmaps),
+            )
+            if common_len == 0:
+                logger.warning("Skipping pair %d due to empty synchronized sequences.", pair_idx)
+                continue
+            recon_sequences = recon_sequences[:common_len]
+            target_sequences = target_sequences[:common_len]
+            latent_means = latent_means[:common_len]
+            latent_heatmaps = latent_heatmaps[:common_len]
+            diagnostics["common_len"] = common_len
+
             x_values = np.arange(min_series_len).tolist()
             recon_sequences = [seq[:min_series_len] for seq in recon_sequences]
             target_sequences = [seq[:min_series_len] for seq in target_sequences]
             latent_means = [seq for seq in latent_means if len(seq) == latent_dim]
-            if not latent_means:
-                logger.warning("Skipping pair %d due to invalid latent summaries.", pair_idx)
-                continue
-
             heatmaps_clean = []
             for heat in latent_heatmaps:
                 arr = np.asarray(heat, dtype=float)
                 if arr.shape != (latent_dim, seq_len):
                     continue
                 heatmaps_clean.append(arr.tolist())
-            if not heatmaps_clean:
-                logger.warning("Skipping pair %d due to invalid latent heatmaps.", pair_idx)
+            if not latent_means or not heatmaps_clean:
+                logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
+
+            # Re-align after filtering shapes
+            common_len_filtered = min(
+                len(recon_sequences),
+                len(target_sequences),
+                len(latent_means),
+                len(heatmaps_clean),
+            )
+            if common_len_filtered == 0:
+                logger.warning("Skipping pair %d after filtering due to zero common length.", pair_idx)
+                continue
+            recon_sequences = recon_sequences[:common_len_filtered]
+            target_sequences = target_sequences[:common_len_filtered]
+            latent_means = latent_means[:common_len_filtered]
+            heatmaps_clean = heatmaps_clean[:common_len_filtered]
 
             recon_min = min(min(seq) for seq in recon_sequences)
             recon_max = max(max(seq) for seq in recon_sequences)
@@ -944,6 +975,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     "latent_max": float(latent_max),
                     "heat_min": float(min(float(np.min(arr)) for arr in heatmaps_clean)),
                     "heat_max": float(max(float(np.max(arr)) for arr in heatmaps_clean)),
+                    "heat_shape": [latent_dim, seq_len],
+                    "steps_available": len(recon_sequences),
                 }
             )
 
@@ -993,7 +1026,15 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 x_range=(0, seq_len),
                 y_range=(0, latent_dim),
             )
-            heat_fig.image(source=heat_source, image="image", x=0, y=0, dw=seq_len, dh=latent_dim, color_mapper=color_mapper)
+            heat_fig.image(
+                source=heat_source,
+                image="image",
+                x=0,
+                y=0,
+                dw=seq_len,
+                dh=latent_dim,
+                color_mapper=color_mapper,
+            )
             heat_fig.add_layout(ColorBar(color_mapper=color_mapper, width=10, label_standoff=8), "right")
 
             slider = Slider(start=0, end=len(recon_sequences) - 1, value=0, step=1, title="Interpolation Step")
@@ -1011,12 +1052,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 ),
                 code="""
                     const idx = Math.max(0, Math.min(recon_data.length - 1, Math.round(cb_obj.value)));
+                    if (!recon_data[idx] || !target_data[idx]) {
+                        console.warn("Interpolation step missing recon/target data at idx", idx);
+                        return;
+                    }
                     src_signal.data = {x: x_values, recon: recon_data[idx], target: target_data[idx]};
                     src_signal.change.emit();
-                    src_latent.data = {dim: dim_values, value: latent_data[idx]};
-                    src_latent.change.emit();
-                    src_heat.data = {image: [heat_data[idx]]};
-                    src_heat.change.emit();
+                    if (latent_data[idx]) {
+                        src_latent.data = {dim: dim_values, value: latent_data[idx]};
+                        src_latent.change.emit();
+                    }
+                    if (heat_data[idx]) {
+                        src_heat.data = {image: [heat_data[idx]]};
+                        src_heat.change.emit();
+                    } else {
+                        console.warn("Heatmap data missing at idx", idx);
+                    }
                 """,
             )
             slider.js_on_change("value", slider_callback)
