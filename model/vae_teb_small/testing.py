@@ -1,0 +1,1060 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+import yaml
+from loguru import logger
+
+from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
+from trainer import GraphModelVaeTebSmallTrainer
+from train.graph_models_utils import denormalize_signal_data
+from utils.plot_utils import plot_metrics_histograms, plot_model_analysis, plot_vae_reconstruction
+import matplotlib.pyplot as plt
+
+
+def load_config(path: Path) -> Dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def build_test_dataloader(config: Dict):
+    dataset_cfg = config.get("dataset_config", {})
+    dataloader_cfg = dataset_cfg.get("dataloader_config", {})
+    dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
+    test_files = dataset_cfg.get("vae_test_datasets", [])
+    if not test_files:
+        raise ValueError("dataset_config.vae_test_datasets is empty.")
+    stats_path = dataset_cfg.get("stat_path")
+    if stats_path is None:
+        raise ValueError("dataset_config.stat_path must be provided.")
+    normalize_fields = dataloader_cfg.get("normalize_fields")
+    batch_size = config.get("general_config", {}).get("batch_size", {}).get("test", 1)
+    return create_optimized_dataloader(
+        hdf5_files=test_files,
+        batch_size=batch_size,
+        num_workers=dataloader_cfg.get("num_workers", 0),
+        shuffle=False,
+        stats_path=stats_path,
+        normalize_fields=normalize_fields,
+        pin_memory=torch.cuda.is_available(),
+        rank=0,
+        world_size=1,
+        **dataset_kwargs,
+    )
+
+
+class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
+    """Lightweight test harness focused on basic reconstruction diagnostics."""
+
+    def run_histogram_test(self, test_loader, *, num_samples: Optional[int] = None) -> None:
+        """Evaluate VAF, MSE, SNR, and KLD histograms on the provided loader."""
+        if self.pytorch_model is None:
+            self.create_model()
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        output_dir = Path(self.test_results_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        vaf_values: List[float] = []
+        mse_values: List[float] = []
+        snr_values: List[float] = []
+        kld_values: List[float] = []
+
+        max_samples = None if num_samples is None else max(0, int(num_samples))
+        processed = 0
+        with torch.inference_mode():
+            for batch in test_loader:
+                if max_samples is not None and processed >= max_samples:
+                    break
+
+                y_st = batch.fhr_st.to(device)
+                y_ph = batch.fhr_ph.to(device)
+                x_ph = batch.fhr_up_ph.to(device)
+                y_raw = batch.fhr.to(device)
+
+                forward_outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                recon = forward_outputs.get("mu_pr")
+                if recon is None:
+                    logger.warning("Forward pass did not return 'mu_pr'; skipping batch.")
+                    continue
+
+                metrics = self._compute_basic_metrics(y_raw, recon)
+                if metrics is None:
+                    logger.warning("Metric computation failed for batch; skipping.")
+                    continue
+                kld_batch = self._kld_from_forward(forward_outputs, device).to(recon.device)
+
+                batch_vaf = metrics["vaf"].detach().cpu().tolist()
+                batch_mse = metrics["mse"].detach().cpu().tolist()
+                batch_snr = metrics["snr"].detach().cpu().tolist()
+                batch_kld = kld_batch.detach().cpu().tolist()
+
+                if max_samples is not None:
+                    remaining = max_samples - processed
+                    if remaining <= 0:
+                        break
+                    batch_vaf = batch_vaf[:remaining]
+                    batch_mse = batch_mse[:remaining]
+                    batch_snr = batch_snr[:remaining]
+                    batch_kld = batch_kld[:remaining]
+
+                if not batch_vaf:
+                    continue
+
+                vaf_values.extend(batch_vaf)
+                mse_values.extend(batch_mse)
+                snr_values.extend(batch_snr)
+                kld_values.extend(batch_kld)
+                processed += len(batch_vaf)
+
+        if not vaf_values:
+            logger.error("No metrics were collected; check the dataloader and model outputs.")
+            return
+
+        logger.info(
+            "Histogram metrics collected for %d samples (VAF mean=%.4f, MSE mean=%.6f, SNR mean=%.2f dB, KLD mean=%.6f)",
+            len(vaf_values),
+            float(np.mean(vaf_values)),
+            float(np.mean(mse_values)),
+            float(np.mean(snr_values)),
+            float(np.mean(kld_values)),
+        )
+
+        plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, output_dir)
+
+    @staticmethod
+    def _kld_tensor_from_forward(outputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Return the unreduced KLD tensor for downstream analysis."""
+        mu_prior = outputs.get("mu_prior")
+        logvar_prior = outputs.get("logvar_prior")
+        mu_post = outputs.get("mu_post")
+        logvar_post = outputs.get("logvar_post")
+        if any(t is None for t in (mu_prior, logvar_prior, mu_post, logvar_post)):
+            return None
+        kld = (
+            logvar_prior
+            - logvar_post
+            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+            - 1.0
+        )
+        kld = 0.5 * kld
+        return kld
+
+    @staticmethod
+    def _kld_from_forward(outputs: Dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
+        """Compute per-sample KLD scalars from forward outputs."""
+        tensor = GraphModelVaeTebSmallTester._kld_tensor_from_forward(outputs)
+        if tensor is None:
+            fallback_shape = outputs.get("mu_pr")
+            batch = 1 if fallback_shape is None else fallback_shape.shape[0]
+            return torch.zeros(batch, device=device)
+        dims = tuple(range(1, tensor.ndim))
+        if not dims:
+            return tensor
+        return tensor.mean(dim=dims)
+
+    @staticmethod
+    def _compute_basic_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+        """Return per-sample tensors for MSE, SNR (dB), and VAF."""
+        if y_true.shape != y_pred.shape:
+            return None
+        residual = y_true - y_pred
+        dims = tuple(range(1, residual.ndim))
+        if not dims:
+            return None
+        mse = (residual ** 2).mean(dim=dims)
+        signal_power = (y_true ** 2).mean(dim=dims)
+        noise_power = (residual ** 2).mean(dim=dims)
+        snr = torch.where(
+            noise_power > 1e-12,
+            10.0 * torch.log10(signal_power.clamp_min(1e-12) / noise_power.clamp_min(1e-12)),
+            torch.full_like(signal_power, 100.0),
+        )
+        var_res = residual.var(dim=dims, unbiased=False)
+        var_orig = y_true.var(dim=dims, unbiased=False).clamp_min(1e-12)
+        vaf = (1.0 - (var_res / var_orig)).clamp(0.0, 1.0)
+        return {"mse": mse, "snr": snr, "vaf": vaf}
+
+    def run_analysis_and_plot(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 10,
+        output_dir: Optional[Path] = None,
+    ) -> None:
+        """Generate qualitative plots for a subset of samples."""
+        if num_samples <= 0:
+            logger.info("run_analysis_and_plot: num_samples<=0, skipping analysis.")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model is unavailable; cannot run analysis.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        stats = self._get_normalization_stats(test_loader)
+        vae_cfg = self.config.get("model_config", {}).get("VAE_model", {}) or {}
+        beta_value = float(vae_cfg.get("kld_beta", 1.0))
+        out_dir = Path(output_dir or self.test_results_dir) / "analysis"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        processed = 0
+        with torch.inference_mode():
+            for batch in test_loader:
+                batch_size = batch.fhr_st.size(0)
+                for idx in range(batch_size):
+                    if processed >= num_samples:
+                        break
+                    y_st = batch.fhr_st[idx : idx + 1].to(device)
+                    y_ph = batch.fhr_ph[idx : idx + 1].to(device)
+                    x_ph = batch.fhr_up_ph[idx : idx + 1].to(device)
+                    y_raw = batch.fhr[idx : idx + 1].to(device)
+                    up_raw_tensor = getattr(batch, "up", None)
+                    if up_raw_tensor is None:
+                        up_raw = torch.zeros_like(y_raw)
+                    else:
+                        up_raw = up_raw_tensor[idx : idx + 1].to(device)
+
+                    forward_outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                    recon = forward_outputs.get("mu_pr")
+                    logvar = forward_outputs.get("logvar_pr")
+                    latent = forward_outputs.get("z")
+                    linear_output = forward_outputs.get("linear_output")
+                    if recon is None or logvar is None or latent is None:
+                        logger.warning("Forward outputs missing required tensors; skipping sample.")
+                        continue
+
+                    loss_dict = model.compute_loss(
+                        forward_outputs=forward_outputs,
+                        y_st=y_st,
+                        y_ph=y_ph,
+                        y_raw=y_raw,
+                        beta=beta_value,
+                    )
+                    loss_floats = {
+                        key: float(val.detach().cpu().item()) if isinstance(val, torch.Tensor) else float(val)
+                        for key, val in loss_dict.items()
+                    }
+
+                    kld_tensor = self._kld_tensor_from_forward(forward_outputs)
+                    if kld_tensor is None:
+                        kld_tensor_np = np.zeros((latent.shape[-1], y_st.shape[1]))
+                        kld_mean_np = np.zeros(y_st.shape[1])
+                    else:
+                        kld_sample = kld_tensor[0]
+                        kld_tensor_np = kld_sample.detach().cpu().numpy().T
+                        kld_mean_np = kld_sample.mean(dim=-1).detach().cpu().numpy()
+
+                    fhr_norm = y_raw[0]
+                    up_norm = up_raw[0]
+                    fhr_denorm = self._maybe_denormalize(fhr_norm, "fhr", stats)
+                    up_denorm = self._maybe_denormalize(up_norm, "up", stats)
+
+                    raw_fhr_norm_np = fhr_norm.detach().cpu().numpy()
+                    raw_up_norm_np = up_norm.detach().cpu().numpy()
+                    raw_fhr_denorm_np = fhr_denorm.detach().cpu().numpy()
+                    raw_up_denorm_np = up_denorm.detach().cpu().numpy()
+
+                    fhr_st_np = y_st[0].detach().cpu().numpy().T
+                    fhr_ph_np = y_ph[0].detach().cpu().numpy().T
+                    fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
+                    latent_np = latent[0].detach().cpu().numpy().T
+                    recon_np = recon[0].detach().cpu().numpy()
+                    logvar_np = logvar[0].detach().cpu().numpy()
+
+                    recon_st_np, recon_ph_np = self._extract_reconstruction_features(
+                        linear_output,
+                        st_channels=fhr_st_np.shape[0],
+                        ph_channels=fhr_ph_np.shape[0],
+                        seq_len=fhr_st_np.shape[1],
+                    )
+
+                    plot_model_analysis(
+                        output_dir=str(out_dir),
+                        raw_fhr=raw_fhr_denorm_np,
+                        raw_up=raw_up_denorm_np,
+                        fhr_st=fhr_st_np,
+                        fhr_ph=fhr_ph_np,
+                        fhr_up_ph=fhr_up_ph_np,
+                        latent_z=latent_np,
+                        reconstructed_fhr_mu=recon_np,
+                        reconstructed_fhr_logvar=logvar_np,
+                        kld_tensor=kld_tensor_np,
+                        kld_mean_over_channels=kld_mean_np,
+                        batch_idx=processed,
+                        loss_dict=loss_floats,
+                        raw_fhr_normalized=raw_fhr_norm_np,
+                        raw_up_normalized=raw_up_norm_np,
+                    )
+
+                    plot_vae_reconstruction(
+                        output_dir=str(out_dir),
+                        raw_fhr_unnormalized=raw_fhr_denorm_np,
+                        raw_up_unnormalized=raw_up_denorm_np,
+                        raw_fhr_normalized=raw_fhr_norm_np,
+                        raw_up_normalized=raw_up_norm_np,
+                        reconstructed_fhr=recon_np,
+                        original_scattering_transform=fhr_st_np,
+                        reconstructed_scattering_transform=recon_st_np,
+                        original_phase_harmonic=fhr_ph_np,
+                        reconstructed_phase_harmonic=recon_ph_np,
+                        scattering_channel_data=None,
+                        batch_idx=processed,
+                        loss_dict=loss_floats,
+                    )
+
+                    processed += 1
+                if processed >= num_samples:
+                    break
+
+        logger.info("Analysis plots saved to %s (samples=%d)", out_dir, processed)
+
+    def run_latent_ablation_test(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 16,
+        dims: Optional[List[int]] = None,
+        visuals_per_dim: int = 1,
+    ) -> None:
+        """Zero-out selected latent dimensions and evaluate reconstruction impact."""
+        if num_samples <= 0:
+            logger.info("latent ablation skipped (num_samples <= 0)")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model unavailable; cannot run latent ablation.")
+            return
+        decoder = getattr(self.pytorch_model, "decoder", None)
+        if decoder is None:
+            logger.error("SeqVAE core does not expose a decoder attribute; cannot ablate latents.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        stats = self._get_normalization_stats(test_loader)
+        vae_cfg = self.config.get("model_config", {}).get("VAE_model", {}) or {}
+        beta_value = float(vae_cfg.get("kld_beta", 1.0))
+
+        out_root = Path(self.test_results_dir) / "latent_ablation"
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        dims_to_eval: Optional[List[int]] = None
+        dim_metrics: Dict[int, Dict[str, List[float]]] = {}
+        visual_counts: Dict[int, int] = {}
+        processed = 0
+
+        with torch.inference_mode():
+            for batch in test_loader:
+                batch_size = batch.fhr_st.size(0)
+                for idx in range(batch_size):
+                    if processed >= num_samples:
+                        break
+                    y_st = batch.fhr_st[idx : idx + 1].to(device)
+                    y_ph = batch.fhr_ph[idx : idx + 1].to(device)
+                    x_ph = batch.fhr_up_ph[idx : idx + 1].to(device)
+                    y_raw = batch.fhr[idx : idx + 1].to(device)
+                    up_raw_tensor = getattr(batch, "up", None)
+                    up_raw = up_raw_tensor[idx : idx + 1].to(device) if up_raw_tensor is not None else torch.zeros_like(y_raw)
+
+                    outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                    latent = outputs.get("z")
+                    recon = outputs.get("mu_pr")
+                    logvar = outputs.get("logvar_pr")
+                    linear_output = outputs.get("linear_output")
+                    if latent is None or recon is None or logvar is None or linear_output is None:
+                        logger.warning("Forward outputs missing latent/decoder tensors; skipping sample.")
+                        continue
+
+                    dims_source = latent.size(-1)
+                    if dims_to_eval is None:
+                        dims_to_eval = dims if dims else list(range(dims_source))
+                        for dim in dims_to_eval:
+                            dim_metrics[dim] = {"vaf": [], "mse": [], "snr": [], "delta_loss": []}
+                            visual_counts[dim] = 0
+
+                    metrics_base = self._compute_basic_metrics(y_raw, recon)
+                    if metrics_base is None:
+                        continue
+                    loss_base = model.compute_loss(
+                        forward_outputs=outputs,
+                        y_st=y_st,
+                        y_ph=y_ph,
+                        y_raw=y_raw,
+                        beta=beta_value,
+                    )
+                    base_recon_loss = float(loss_base["reconstruction_loss"].detach().cpu().item())
+
+                    for dim in dims_to_eval:
+                        latent_mod = latent.clone()
+                        latent_mod[:, :, dim] = 0.0
+                        linear_mod, recon_mod, logvar_mod = decoder(latent_mod)
+                        metrics_mod = self._compute_basic_metrics(y_raw, recon_mod)
+                        if metrics_mod is None:
+                            continue
+
+                        mutated_outputs = dict(outputs)
+                        mutated_outputs["linear_output"] = linear_mod
+                        mutated_outputs["mu_pr"] = recon_mod
+                        mutated_outputs["logvar_pr"] = logvar_mod
+                        loss_mod = model.compute_loss(
+                            forward_outputs=mutated_outputs,
+                            y_st=y_st,
+                            y_ph=y_ph,
+                            y_raw=y_raw,
+                            beta=beta_value,
+                        )
+                        delta_loss = float(
+                            loss_mod["reconstruction_loss"].detach().cpu().item() - base_recon_loss
+                        )
+
+                        dim_metrics[dim]["vaf"].extend(metrics_mod["vaf"].detach().cpu().tolist())
+                        dim_metrics[dim]["mse"].extend(metrics_mod["mse"].detach().cpu().tolist())
+                        dim_metrics[dim]["snr"].extend(metrics_mod["snr"].detach().cpu().tolist())
+                        dim_metrics[dim]["delta_loss"].append(delta_loss)
+
+                        # Save qualitative plots if requested
+                        if visual_counts[dim] < max(0, int(visuals_per_dim)):
+                            visual_counts[dim] += 1
+                            self._save_ablation_visual(
+                                out_root / f"dim_{dim:02d}",
+                                sample_idx=processed,
+                                dim_index=dim,
+                                y_st=y_st,
+                                y_ph=y_ph,
+                                x_ph=x_ph,
+                                y_raw=y_raw,
+                                up_raw=up_raw,
+                                recon=recon_mod,
+                                logvar=logvar_mod,
+                                linear_output=linear_mod,
+                                latent=latent_mod,
+                                stats=stats,
+                                loss_dict=loss_mod,
+                                label_suffix="ablate",
+                            )
+
+                    processed += 1
+                if processed >= num_samples:
+                    break
+
+        if not dim_metrics:
+            logger.warning("No latent ablation metrics were collected.")
+            return
+
+        for dim, metrics in dim_metrics.items():
+            if not metrics["vaf"]:
+                continue
+            dim_dir = out_root / f"dim_{dim:02d}"
+            dim_dir.mkdir(parents=True, exist_ok=True)
+            plot_metrics_histograms(
+                metrics["vaf"],
+                metrics["mse"],
+                metrics["snr"],
+                metrics["delta_loss"],
+                dim_dir,
+            )
+            logger.info(
+                "Latent dim %d -> mean VAF=%.3f, MSE=%.5f, Δrecon=%.5f",
+                dim,
+                float(np.mean(metrics["vaf"])),
+                float(np.mean(metrics["mse"])),
+                float(np.mean(metrics["delta_loss"])),
+            )
+
+    def _save_ablation_visual(
+        self,
+        output_dir: Path,
+        *,
+        sample_idx: int,
+        dim_index: int,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        y_raw: torch.Tensor,
+        up_raw: torch.Tensor,
+        recon: torch.Tensor,
+        logvar: torch.Tensor,
+        linear_output: torch.Tensor,
+        latent: torch.Tensor,
+        stats: Optional[Dict],
+        loss_dict: Dict[str, torch.Tensor],
+        label_suffix: str = "",
+    ) -> None:
+        """Store qualitative reconstruction plot for a latent-ablation sample."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fhr_norm = y_raw[0]
+        up_norm = up_raw[0]
+        fhr_denorm = self._maybe_denormalize(fhr_norm, "fhr", stats)
+        up_denorm = self._maybe_denormalize(up_norm, "up", stats)
+
+        fhr_norm_np = fhr_norm.detach().cpu().numpy()
+        up_norm_np = up_norm.detach().cpu().numpy()
+        fhr_denorm_np = fhr_denorm.detach().cpu().numpy()
+        up_denorm_np = up_denorm.detach().cpu().numpy()
+
+        fhr_st_np = y_st[0].detach().cpu().numpy().T
+        fhr_ph_np = y_ph[0].detach().cpu().numpy().T
+        fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
+        latent_np = latent[0].detach().cpu().numpy().T
+        recon_np = recon[0].detach().cpu().numpy()
+        logvar_np = logvar[0].detach().cpu().numpy()
+
+        recon_st_np, recon_ph_np = self._extract_reconstruction_features(
+            linear_output,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+            seq_len=fhr_st_np.shape[1],
+        )
+
+        loss_floats = {
+            key: float(val.detach().cpu().item()) if isinstance(val, torch.Tensor) else float(val)
+            for key, val in loss_dict.items()
+        }
+
+        extra = f"_{label_suffix}" if label_suffix else ""
+        tag = f"sample{sample_idx:03d}_dim{dim_index:02d}{extra}"
+        plot_model_analysis(
+            output_dir=str(output_dir),
+            raw_fhr=fhr_denorm_np,
+            raw_up=up_denorm_np,
+            fhr_st=fhr_st_np,
+            fhr_ph=fhr_ph_np,
+            fhr_up_ph=fhr_up_ph_np,
+            latent_z=latent_np,
+            reconstructed_fhr_mu=recon_np,
+            reconstructed_fhr_logvar=logvar_np,
+            kld_tensor=np.zeros_like(latent_np),
+            kld_mean_over_channels=np.zeros(latent_np.shape[1]),
+            batch_idx=f"{tag}_analysis",
+            loss_dict=loss_floats,
+            raw_fhr_normalized=fhr_norm_np,
+            raw_up_normalized=up_norm_np,
+        )
+
+        plot_vae_reconstruction(
+            output_dir=str(output_dir),
+            raw_fhr_unnormalized=fhr_denorm_np,
+            raw_up_unnormalized=up_denorm_np,
+            raw_fhr_normalized=fhr_norm_np,
+            raw_up_normalized=up_norm_np,
+            reconstructed_fhr=recon_np,
+            original_scattering_transform=fhr_st_np,
+            reconstructed_scattering_transform=recon_st_np,
+            original_phase_harmonic=fhr_ph_np,
+            reconstructed_phase_harmonic=recon_ph_np,
+            scattering_channel_data=None,
+            batch_idx=f"{tag}_recon",
+            loss_dict=loss_floats,
+        )
+
+    def run_latent_magnitude_sweep(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 16,
+        dims: Optional[List[int]] = None,
+        scales: Optional[List[float]] = None,
+        visuals_per_dim: int = 1,
+    ) -> None:
+        """Scale latent dimensions and track reconstruction metrics."""
+        if num_samples <= 0:
+            logger.info("latent magnitude sweep skipped (num_samples <= 0)")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        decoder = getattr(self.pytorch_model, "decoder", None)
+        if decoder is None:
+            logger.error("SeqVAE core does not expose a decoder attribute; cannot run sweep.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        stats = self._get_normalization_stats(test_loader)
+        beta_value = float(self.config.get("model_config", {}).get("VAE_model", {}).get("kld_beta", 1.0))
+        sweep_scales = scales if scales else [0.0, 0.5, 1.0, 1.5, 2.0]
+        out_root = Path(self.test_results_dir) / "latent_sweep"
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        dim_metrics: Dict[int, Dict[str, Dict[float, List[float]]]] = {}
+        visual_counts: Dict[int, int] = {}
+        processed = 0
+
+        with torch.inference_mode():
+            for batch in test_loader:
+                batch_size = batch.fhr_st.size(0)
+                for idx in range(batch_size):
+                    if processed >= num_samples:
+                        break
+                    y_st = batch.fhr_st[idx : idx + 1].to(device)
+                    y_ph = batch.fhr_ph[idx : idx + 1].to(device)
+                    x_ph = batch.fhr_up_ph[idx : idx + 1].to(device)
+                    y_raw = batch.fhr[idx : idx + 1].to(device)
+                    up_raw_tensor = getattr(batch, "up", None)
+                    up_raw = up_raw_tensor[idx : idx + 1].to(device) if up_raw_tensor is not None else torch.zeros_like(y_raw)
+
+                    outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                    latent = outputs.get("z")
+                    if latent is None:
+                        continue
+                    dims_to_eval = dims if dims else list(range(latent.size(-1)))
+                    for dim in dims_to_eval:
+                        dim_metrics.setdefault(dim, {})
+                        for metric_name in ("vaf", "mse", "snr"):
+                            dim_metrics[dim].setdefault(metric_name, {})
+                        visual_counts.setdefault(dim, 0)
+                        for scale in sweep_scales:
+                            latent_mod = latent.clone()
+                            latent_mod[:, :, dim] = latent[:, :, dim] * scale
+                            linear_mod, recon_mod, logvar_mod = decoder(latent_mod)
+                            metrics_mod = self._compute_basic_metrics(y_raw, recon_mod)
+                            if metrics_mod is None:
+                                continue
+                            for metric_name in ("vaf", "mse", "snr"):
+                                dim_metrics[dim][metric_name].setdefault(scale, []).extend(
+                                    metrics_mod[metric_name].detach().cpu().tolist()
+                                )
+                            if visual_counts[dim] < max(0, int(visuals_per_dim)) and scale != 1.0:
+                                visual_counts[dim] += 1
+                                mutated_outputs = dict(outputs)
+                                mutated_outputs["linear_output"] = linear_mod
+                                mutated_outputs["mu_pr"] = recon_mod
+                                mutated_outputs["logvar_pr"] = logvar_mod
+                                loss_mod = model.compute_loss(
+                                    forward_outputs=mutated_outputs,
+                                    y_st=y_st,
+                                    y_ph=y_ph,
+                                    y_raw=y_raw,
+                                    beta=beta_value,
+                                )
+                                self._save_ablation_visual(
+                                    out_root / f"dim_{dim:02d}",
+                                    sample_idx=processed,
+                                    dim_index=dim,
+                                    y_st=y_st,
+                                    y_ph=y_ph,
+                                    x_ph=x_ph,
+                                    y_raw=y_raw,
+                                    up_raw=up_raw,
+                                    recon=recon_mod,
+                                    logvar=logvar_mod,
+                                    linear_output=linear_mod,
+                                    latent=latent_mod,
+                                    stats=stats,
+                                    loss_dict=loss_mod,
+                                    label_suffix=f"scale{scale}",
+                                )
+                    processed += 1
+                if processed >= num_samples:
+                    break
+
+        if not dim_metrics:
+            logger.warning("No latent sweep metrics were collected.")
+            return
+        for dim, metric_map in dim_metrics.items():
+            dim_dir = out_root / f"dim_{dim:02d}"
+            dim_dir.mkdir(parents=True, exist_ok=True)
+            self._plot_latent_metric_curves(metric_map, sweep_scales, dim_dir / "metric_curves.png")
+            logger.info("Latent sweep plotted for dimension %d -> %s", dim, dim_dir)
+
+    def run_latent_interpolation(self, test_loader, *, steps: int = 5) -> None:
+        """Interpolate between two latent vectors and visualize reconstructions."""
+        if steps < 2:
+            logger.warning("Interpolation steps must be >=2")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        decoder = getattr(self.pytorch_model, "decoder", None)
+        if decoder is None:
+            logger.error("SeqVAE core does not expose a decoder attribute; cannot run interpolation.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        out_dir = Path(self.test_results_dir) / "latent_interpolation"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        samples = []
+        with torch.inference_mode():
+            for batch in test_loader:
+                batch_size = batch.fhr_st.size(0)
+                for idx in range(batch_size):
+                    sample = {
+                        "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
+                        "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
+                        "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
+                        "fhr": batch.fhr[idx : idx + 1].to(device),
+                    }
+                    samples.append(sample)
+                    if len(samples) >= 2:
+                        break
+                if len(samples) >= 2:
+                    break
+        if len(samples) < 2:
+            logger.error("Need at least two samples for interpolation.")
+            return
+
+        with torch.inference_mode():
+            outputs_a = model(y_st=samples[0]["fhr_st"], y_ph=samples[0]["fhr_ph"], x_ph=samples[0]["fhr_up_ph"])
+            outputs_b = model(y_st=samples[1]["fhr_st"], y_ph=samples[1]["fhr_ph"], x_ph=samples[1]["fhr_up_ph"])
+
+        latent_a = outputs_a.get("z")
+        latent_b = outputs_b.get("z")
+        y_a = samples[0]["fhr"]
+        y_b = samples[1]["fhr"]
+        if latent_a is None or latent_b is None:
+            logger.error("Unable to obtain latents for interpolation.")
+            return
+
+        weights = np.linspace(0.0, 1.0, steps)
+        metric_curves = {"mse": [], "vaf": [], "snr": []}
+        recon_examples = []
+        for alpha in weights:
+            latent_interp = latent_a * (1.0 - alpha) + latent_b * alpha
+            recon_interp = decoder(latent_interp)[1]
+            target_interp = y_a * (1.0 - alpha) + y_b * alpha
+            metrics = self._compute_basic_metrics(target_interp, recon_interp)
+            if metrics is None:
+                continue
+            metric_curves["mse"].append(float(torch.mean(metrics["mse"]).detach().cpu().item()))
+            metric_curves["vaf"].append(float(torch.mean(metrics["vaf"]).detach().cpu().item()))
+            metric_curves["snr"].append(float(torch.mean(metrics["snr"]).detach().cpu().item()))
+            recon_examples.append(
+                {
+                    "alpha": alpha,
+                    "target": target_interp[0].detach().cpu().numpy(),
+                    "recon": recon_interp[0].detach().cpu().numpy(),
+                }
+            )
+
+        self._plot_interpolation_metrics(weights, metric_curves, out_dir / "metric_curves.png")
+        self._plot_interpolation_examples(recon_examples, out_dir / "recon_examples.png")
+
+    def run_latent_feature_attribution(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 8,
+    ) -> None:
+        """Approximate latent importance via gradients of reconstruction loss."""
+        if num_samples <= 0:
+            logger.info("Feature attribution skipped (num_samples <= 0)")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        decoder = getattr(self.pytorch_model, "decoder", None)
+        if decoder is None:
+            logger.error("SeqVAE core does not expose a decoder attribute; cannot run attribution.")
+            return
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        out_dir = Path(self.test_results_dir) / "latent_feature_attribution"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        grad_accum: Optional[torch.Tensor] = None
+        processed = 0
+        for batch in test_loader:
+            batch_size = batch.fhr_st.size(0)
+            for idx in range(batch_size):
+                if processed >= num_samples:
+                    break
+                y_st = batch.fhr_st[idx : idx + 1].to(device)
+                y_ph = batch.fhr_ph[idx : idx + 1].to(device)
+                x_ph = batch.fhr_up_ph[idx : idx + 1].to(device)
+                y_raw = batch.fhr[idx : idx + 1].to(device)
+
+                with torch.no_grad():
+                    outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                    latent = outputs.get("z")
+                if latent is None:
+                    continue
+                latent = latent.detach().clone().requires_grad_(True)
+                decoder.zero_grad(set_to_none=True)
+                reconstruction = decoder(latent)[1]
+                loss = torch.mean((reconstruction - y_raw) ** 2)
+                loss.backward()
+                if latent.grad is None:
+                    decoder.zero_grad(set_to_none=True)
+                    continue
+                grad_importance = latent.grad.detach().abs().mean(dim=(0, 1))
+                if grad_accum is None:
+                    grad_accum = grad_importance
+                else:
+                    grad_accum = grad_accum + grad_importance
+                decoder.zero_grad(set_to_none=True)
+                processed += 1
+            if processed >= num_samples:
+                break
+
+        if grad_accum is None:
+            logger.warning("No gradients collected for feature attribution.")
+            return
+        grad_mean = (grad_accum / processed).cpu().numpy()
+        self._plot_feature_importance(grad_mean, out_dir / "latent_feature_importance.png")
+        logger.info("Feature attribution plot saved to %s", out_dir)
+
+    @staticmethod
+    def _maybe_denormalize(tensor: torch.Tensor, field: str, stats: Optional[Dict]) -> torch.Tensor:
+        if not stats:
+            return tensor
+        try:
+            return denormalize_signal_data(tensor, field, stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to denormalize %s: %s. Returning tensor as-is.", field, exc)
+            return tensor
+
+    @staticmethod
+    def _get_normalization_stats(loader) -> Optional[Dict]:
+        dataset = getattr(loader, "dataset", None)
+        if dataset is None or not hasattr(dataset, "get_normalization_stats"):
+            return None
+        try:
+            return dataset.get_normalization_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch normalization stats: %s", exc)
+            return None
+
+    @staticmethod
+    def _extract_reconstruction_features(
+        linear_output: Optional[torch.Tensor],
+        st_channels: int,
+        ph_channels: int,
+        seq_len: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if (
+            linear_output is None
+            or linear_output.dim() != 3
+            or linear_output.size(-1) < st_channels + ph_channels
+        ):
+            return np.zeros((st_channels, seq_len)), np.zeros((ph_channels, seq_len))
+        linear_np = linear_output[0].detach().cpu().numpy()  # (T, channels_total)
+        recon_st = linear_np[:, :st_channels].T
+        recon_ph = linear_np[:, st_channels : st_channels + ph_channels].T
+        return recon_st, recon_ph
+
+    @staticmethod
+    def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
+        metrics = ["vaf", "mse", "snr"]
+        fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4), squeeze=False)
+        for idx, metric in enumerate(metrics):
+            axis = axes[0][idx]
+            values = metric_map.get(metric, {})
+            means = [np.mean(values.get(scale, [np.nan])) for scale in scales]
+            axis.plot(scales, means, marker="o")
+            axis.set_title(metric.upper())
+            axis.set_xlabel("Scale factor")
+            axis.set_ylabel(metric.upper())
+            axis.grid(True, alpha=0.4)
+        fig.suptitle("Latent Magnitude Sweep", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _plot_interpolation_metrics(weights: np.ndarray, metric_curves: Dict[str, List[float]], path: Path) -> None:
+        fig, axes = plt.subplots(1, len(metric_curves), figsize=(5 * len(metric_curves), 4), squeeze=False)
+        for idx, (metric, values) in enumerate(metric_curves.items()):
+            axis = axes[0][idx]
+            axis.plot(weights, values, marker="o")
+            axis.set_title(metric.upper())
+            axis.set_xlabel("Interpolation weight")
+            axis.set_ylabel(metric.upper())
+            axis.grid(True, alpha=0.4)
+        fig.suptitle("Latent Interpolation Metrics", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _plot_interpolation_examples(examples: List[Dict[str, Any]], path: Path) -> None:
+        if not examples:
+            return
+        fig, ax = plt.subplots(figsize=(12, 4))
+        t = np.arange(len(examples[0]["target"]))
+        for record in examples:
+            label = f"alpha={record['alpha']:.2f}"
+            ax.plot(t, record["recon"], label=f"Recon {label}", alpha=0.8)
+        ax.plot(t, examples[0]["target"], label="Target alpha=0", linestyle="--", color="black", alpha=0.6)
+        ax.plot(t, examples[-1]["target"], label="Target alpha=1", linestyle="--", color="gray", alpha=0.6)
+        ax.set_title("Reconstruction trajectories along interpolation")
+        ax.set_xlabel("Time index")
+        ax.set_ylabel("Normalized amplitude")
+        ax.legend(loc="upper right", ncol=2)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _plot_feature_importance(values: np.ndarray, path: Path) -> None:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        dim_ids = np.arange(len(values))
+        ax.bar(dim_ids, values)
+        ax.set_xlabel("Latent dimension")
+        ax.set_ylabel("Mean |∂Loss/∂z|")
+        ax.set_title("Latent Feature Attribution")
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SeqVAE-TEB small tester")
+    parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Path to config file.")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Limit number of samples for histogram plots (None = all, 0 = skip).",
+    )
+    parser.add_argument(
+        "--analysis-samples",
+        type=int,
+        default=0,
+        help="Number of samples to visualize with analysis plots (0 = skip).",
+    )
+    parser.add_argument(
+        "--latent-ablation-samples",
+        type=int,
+        default=0,
+        help="Number of samples to run latent ablation on (0 = skip).",
+    )
+    parser.add_argument(
+        "--latent-ablation-dims",
+        type=str,
+        default=None,
+        help="Comma-separated latent dimension indices to zero (default: all).",
+    )
+    parser.add_argument(
+        "--latent-ablation-visuals",
+        type=int,
+        default=1,
+        help="Number of reconstruction plots to save per ablated dimension.",
+    )
+    parser.add_argument(
+        "--latent-sweep-samples",
+        type=int,
+        default=0,
+        help="Number of samples for latent magnitude sweep (0 = skip).",
+    )
+    parser.add_argument(
+        "--latent-sweep-dims",
+        type=str,
+        default=None,
+        help="Comma-separated latent dims for magnitude sweep (default: all).",
+    )
+    parser.add_argument(
+        "--latent-sweep-scales",
+        type=str,
+        default=None,
+        help="Comma-separated scale factors for sweep (default: 0.0,0.5,1.0,1.5,2.0).",
+    )
+    parser.add_argument(
+        "--latent-sweep-visuals",
+        type=int,
+        default=1,
+        help="Visuals per-dimension during latent sweep.",
+    )
+    parser.add_argument(
+        "--latent-interp-steps",
+        type=int,
+        default=0,
+        help="Number of interpolation steps (>=2 runs the test).",
+    )
+    parser.add_argument(
+        "--latent-attr-samples",
+        type=int,
+        default=0,
+        help="Samples for latent feature attribution (0 = skip).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    tester = GraphModelVaeTebSmallTester(str(args.config))
+    tester.setup_config()
+    tester.create_model()
+    test_loader = build_test_dataloader(config)
+    if args.analysis_samples and args.analysis_samples > 0:
+        tester.run_analysis_and_plot(test_loader, num_samples=args.analysis_samples)
+    ablation_dims = None
+    if args.latent_ablation_dims:
+        try:
+            ablation_dims = [
+                int(item.strip()) for item in args.latent_ablation_dims.split(",") if item.strip()
+            ]
+        except ValueError:
+            logger.warning("Could not parse --latent-ablation-dims=%s; defaulting to all dims.", args.latent_ablation_dims)
+            ablation_dims = None
+    if args.latent_ablation_samples and args.latent_ablation_samples > 0:
+        tester.run_latent_ablation_test(
+            test_loader,
+            num_samples=args.latent_ablation_samples,
+            dims=ablation_dims,
+            visuals_per_dim=args.latent_ablation_visuals,
+        )
+    sweep_dims = None
+    if args.latent_sweep_dims:
+        try:
+            sweep_dims = [
+                int(item.strip()) for item in args.latent_sweep_dims.split(",") if item.strip()
+            ]
+        except ValueError:
+            logger.warning("Could not parse --latent-sweep-dims=%s; defaulting to all dims.", args.latent_sweep_dims)
+            sweep_dims = None
+    sweep_scales = None
+    if args.latent_sweep_scales:
+        try:
+            sweep_scales = [
+                float(item.strip()) for item in args.latent_sweep_scales.split(",") if item.strip()
+            ]
+        except ValueError:
+            logger.warning(
+                "Could not parse --latent-sweep-scales=%s; using defaults.",
+                args.latent_sweep_scales,
+            )
+            sweep_scales = None
+    if args.latent_sweep_samples and args.latent_sweep_samples > 0:
+        tester.run_latent_magnitude_sweep(
+            test_loader,
+            num_samples=args.latent_sweep_samples,
+            dims=sweep_dims,
+            scales=sweep_scales,
+            visuals_per_dim=args.latent_sweep_visuals,
+        )
+    if args.latent_interp_steps and args.latent_interp_steps >= 2:
+        tester.run_latent_interpolation(test_loader, steps=args.latent_interp_steps)
+    if args.latent_attr_samples and args.latent_attr_samples > 0:
+        tester.run_latent_feature_attribution(test_loader, num_samples=args.latent_attr_samples)
+    if args.max_samples is None or args.max_samples > 0:
+        tester.run_histogram_test(test_loader, num_samples=args.max_samples)
+
+
+if __name__ == "__main__":
+    main()
