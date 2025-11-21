@@ -934,13 +934,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--analysis-samples",
         type=int,
-        default=0,
+        default=10,
         help="Number of samples to visualize with analysis plots (0 = skip).",
     )
     parser.add_argument(
         "--latent-ablation-samples",
         type=int,
-        default=0,
+        default=16,
         help="Number of samples to run latent ablation on (0 = skip).",
     )
     parser.add_argument(
@@ -958,7 +958,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latent-sweep-samples",
         type=int,
-        default=0,
+        default=16,
         help="Number of samples for latent magnitude sweep (0 = skip).",
     )
     parser.add_argument(
@@ -982,13 +982,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latent-interp-steps",
         type=int,
-        default=0,
+        default=6,
         help="Number of interpolation steps (>=2 runs the test).",
     )
     parser.add_argument(
         "--latent-attr-samples",
         type=int,
-        default=0,
+        default=8,
         help="Samples for latent feature attribution (0 = skip).",
     )
     return parser.parse_args()
@@ -1047,15 +1047,15 @@ def main(
     config: Path | str = Path("config.yaml"),
     max_samples: Optional[int] = None,
     analysis_samples: int = 10,
-    latent_ablation_samples: int = 10,
-    latent_ablation_dims: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
-    latent_ablation_visuals: int = 10,
-    latent_sweep_samples: int = 10,
-    latent_sweep_dims: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
-    latent_sweep_scales: Optional[Any] = [0, 1, 2, 3, 4, 5, 6, 7],
-    latent_sweep_visuals: int = 10,
-    latent_interp_steps: int = 10,
-    latent_attr_samples: int = 10,
+    latent_ablation_samples: int = 16,
+    latent_ablation_dims: Optional[Any] = None,
+    latent_ablation_visuals: int = 1,
+    latent_sweep_samples: int = 16,
+    latent_sweep_dims: Optional[Any] = None,
+    latent_sweep_scales: Optional[Any] = None,
+    latent_sweep_visuals: int = 1,
+    latent_interp_steps: int = 6,
+    latent_attr_samples: int = 8,
 ) -> None:
     config_path = Path(config)
     config_data = load_config(config_path)
