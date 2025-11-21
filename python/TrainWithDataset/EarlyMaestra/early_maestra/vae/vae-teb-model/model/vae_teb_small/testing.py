@@ -12,7 +12,7 @@ import torch
 import yaml
 from bokeh.embed import file_html
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider, Div
+from bokeh.models import ColumnDataSource, CustomJS, Slider, Div
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 from bokeh.resources import INLINE
@@ -939,7 +939,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 arr = np.asarray(heat, dtype=float)
                 if arr.shape != (latent_dim, seq_len):
                     continue
-                heatmaps_clean.append(self._sanitize_finite_array(arr).tolist())
+                heatmaps_clean.append(self._sanitize_finite_array(arr))
             if not latent_means or not heatmaps_clean:
                 logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
                 continue
@@ -958,6 +958,28 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             target_sequences = target_sequences[:common_len_filtered]
             latent_means = latent_means[:common_len_filtered]
             heatmaps_clean = heatmaps_clean[:common_len_filtered]
+
+            # Build RGBA heatmaps (image_rgba) to avoid runtime colormapper issues
+            heat_all = np.stack(heatmaps_clean, axis=0)  # (steps, latent_dim, seq_len)
+            global_min = float(np.min(heat_all))
+            global_max = float(np.max(heat_all))
+            if global_max <= global_min:
+                global_max = global_min + 1e-6
+            palette = np.array([[int(c[i:i+2], 16) for i in (1, 3, 5)] for c in Viridis256], dtype=np.uint8)
+            heat_rgba: List[List[List[int]]] = []
+            for img in heatmaps_clean:
+                norm = np.clip((img - global_min) / (global_max - global_min), 0.0, 1.0)
+                idx = np.floor(norm * 255).astype(np.int64)
+                rgb = palette[idx]  # (latent_dim, seq_len, 3)
+                alpha = np.full((*rgb.shape[:2], 1), 255, dtype=np.uint8)
+                rgba = np.concatenate([rgb, alpha], axis=-1)
+                rgba_uint32 = (
+                    (rgba[..., 0].astype(np.uint32) << 24)
+                    | (rgba[..., 1].astype(np.uint32) << 16)
+                    | (rgba[..., 2].astype(np.uint32) << 8)
+                    | rgba[..., 3].astype(np.uint32)
+                )
+                heat_rgba.append(rgba_uint32.tolist())
 
             recon_min = min(min(seq) for seq in recon_sequences)
             recon_max = max(max(seq) for seq in recon_sequences)
@@ -983,7 +1005,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             # ------------------------------------------------------------------
             # 3) Build Bokeh figures with slider-controlled data updates
             # ------------------------------------------------------------------
-            heat0 = np.asarray(heatmaps_clean[0], dtype=float)
+            heat0 = np.asarray(heat_rgba[0], dtype=np.uint32)
             if heat0.ndim != 2:
                 logger.warning("Skipping pair %d due to non-2D heatmap shape %s", pair_idx, heat0.shape)
                 continue
@@ -1018,9 +1040,6 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             )
             latent_fig.vbar(x="dim", top="value", width=0.8, source=latent_source, color="#6c71c4")
 
-            heat_min = min(float(np.min(arr)) for arr in heatmaps_clean)
-            heat_max = max(float(np.max(arr)) for arr in heatmaps_clean)
-            color_mapper = LinearColorMapper(palette=Viridis256, low=heat_min, high=heat_max)
             heat_fig = figure(
                 title=f"Pair {pair_idx} – Latent Heatmap",
                 width=900,
@@ -1037,11 +1056,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 y=0,
                 dw=seq_len,
                 dh=latent_dim,
-                color_mapper=color_mapper,
             )
-            heat_fig.add_layout(ColorBar(color_mapper=color_mapper, width=10, label_standoff=8), "right")
-
-            # Diagnostics rendered in-page for quick inspection
             meta_div = Div(
                 text=(
                     f"<b>Pair {pair_idx}</b> | steps={len(recon_sequences)} | "
@@ -1058,7 +1073,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     recon_data=recon_sequences,
                     target_data=target_sequences,
                     latent_data=latent_means,
-                    heat_data=heatmaps_clean,
+                    heat_data=heat_rgba,
                     x_values=x_values,
                     dim_values=dim_template,
                     latent_dim_val=latent_dim,
@@ -1074,21 +1089,24 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         console.warn("Interpolation step recon/target not arrays at idx", idx, recon_data[idx], target_data[idx]);
                         return;
                     }
-                    src_signal.data = {x: x_values, recon: recon_data[idx], target: target_data[idx]};
+                    src_signal.data['x'] = x_values;
+                    src_signal.data['recon'] = recon_data[idx];
+                    src_signal.data['target'] = target_data[idx];
                     src_signal.change.emit();
                     const latentVals = latent_data[idx] && Array.isArray(latent_data[idx]) && latent_data[idx].length === dim_values.length
                         ? latent_data[idx]
                         : Array(dim_values.length).fill(0);
-                    src_latent.data = {dim: dim_values, value: latentVals};
+                    src_latent.data['dim'] = dim_values;
+                    src_latent.data['value'] = latentVals;
                     src_latent.change.emit();
 
                     const heatVals = heat_data[idx];
                     if (heatVals && Array.isArray(heatVals) && heatVals.length === latent_dim_val && Array.isArray(heatVals[0]) && heatVals[0].length === seq_len_val) {
-                        src_heat.data = {image: [heatVals]};
+                        src_heat.data['image'] = [heatVals];
                     } else {
                         console.warn("Heatmap data missing/invalid at idx", idx);
                         const zeros = Array.from({length: latent_dim_val}, () => Array(seq_len_val).fill(0));
-                        src_heat.data = {image: [zeros]};
+                        src_heat.data['image'] = [zeros];
                     }
                     src_heat.change.emit();
                 """,
