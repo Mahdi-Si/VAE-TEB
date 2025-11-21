@@ -12,6 +12,8 @@ import matplotlib
 import fnmatch
 import torch
 
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 if TYPE_CHECKING:
     from lightning.pytorch.loggers import MLFlowLogger
@@ -73,7 +75,6 @@ class LossPlotCallback(Callback):
         self.plot_frequency = max(1, int(plot_frequency))
         self.max_history_size = max(1, int(max_history_size))
         self._mlflow_logger = mlflow_logger
-        self._plotly_available = True
         self.history: Dict[str, List[float]] = {"epoch": []}
         self.metric_filters: Tuple[str, ...] = tuple(metric_filters or ("train/*", "val/*"))
         self.hyperparam_keys: Tuple[str, ...] = tuple(
@@ -167,15 +168,6 @@ class LossPlotCallback(Callback):
         self._log_artifact(path)
 
     def plot_hyperparameters(self) -> None:
-        if not self._plotly_available:
-            return
-        try:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-        except ImportError:
-            self._plotly_available = False
-            logger.warning("Plotly is not installed; skipping hyperparameter plotting.")
-            return
         epochs = np.array(self.history["epoch"], dtype=float)
         if epochs.size == 0:
             return

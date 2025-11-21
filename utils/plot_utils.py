@@ -913,11 +913,11 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
     """
     # Professional scientific paper color palette
     colors = {
-        'vaf': '#055C9A',      # Deep blue
-        'mse': '#BB3E00',      # Deep orange-red
+        'vaf': "#00A2FF",      # Deep blue
+        'mse': "#FC7937",      # Deep orange-red
         'snr': '#0DD8A2',      # Sage green
-        'kld': '#F7AD45',      # Golden yellow
-        'background': '#F9F3EF'
+        'kld': "#EF9A22",      # Golden yellow
+        'background': "#FFFFFFFF"
     }
     
     plt.style.use('default')
@@ -930,7 +930,7 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
         'axes.linewidth': 0.7,
         'axes.edgecolor': "#9E9D9D",
         'axes.facecolor': colors['background'],
-        'grid.color': "#838383",
+        'grid.color': "#686868",
         'grid.linewidth': 0.4,
         'grid.alpha': 0.6,
         'legend.frameon': True,

@@ -1160,9 +1160,6 @@ class SeqVaeCore(nn.Module):
             "linear_output": linear_output,  # (B, T, 87)
             "mu_pr": mu_pr,  # (B, 4800)
             "logvar_pr": logvar_pr,  # (B, 4800)
-            "mu_next": None,  # Legacy placeholder
-            "logvar_next": None,  # Legacy placeholder
-            "next_step_indices": None,  # Legacy placeholder
             "mu_prior": mu_y,  # (B, T, latent_dim_target)
             "logvar_prior": logvar_y_prior,  # (B, T, latent_dim_target)
             "mu_post": mu_post,  # (B, T, latent_dim_z)
