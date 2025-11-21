@@ -13,7 +13,8 @@ import yaml
 from bokeh.layouts import column
 from bokeh.models import ColumnDataSource, ColorBar, CustomJS, LinearColorMapper, Slider
 from bokeh.palettes import Viridis256
-from bokeh.plotting import figure, output_file, save
+from bokeh.plotting import figure, save
+from bokeh.resources import INLINE
 from loguru import logger
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
@@ -963,12 +964,12 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             slider.js_on_change("value", callback)
 
             layout = column(signal_fig, latent_fig, heat_fig, slider)
-            output_file(
+            save(
+                layout,
                 filename=str(out_dir / f"latent_interp_pair_{pair_idx:02d}.html"),
                 title=f"Latent Interpolation Pair {pair_idx}",
-                mode="inline",
+                resources=INLINE,
             )
-            save(layout)
         logger.info("Latent interpolation animations saved to %s", out_dir)
 
     def run_latent_feature_attribution(
