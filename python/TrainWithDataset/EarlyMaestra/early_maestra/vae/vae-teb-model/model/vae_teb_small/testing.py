@@ -878,15 +878,20 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 latent_store.append(latent_mean)
                 heatmaps.append(latent_interp[0].detach().cpu().numpy().tolist())
 
+            x_values = time_axis.tolist()
+            recon_series = [arr.tolist() for arr in recon_store]
+            target_series = [arr.tolist() for arr in target_store]
+            latent_series = [arr.tolist() for arr in latent_store]
+
             signal_source = ColumnDataSource(
                 data=dict(
-                    x=time_axis,
-                    recon=recon_store[0],
-                    target=target_store[0],
+                    x=x_values,
+                    recon=recon_series[0],
+                    target=target_series[0],
                 )
             )
             latent_source = ColumnDataSource(
-                data=dict(dim=np.arange(latent_dim), value=latent_store[0])
+                data=dict(dim=np.arange(latent_dim).tolist(), value=latent_series[0])
             )
             signal_fig = figure(
                 title=f"Pair {pair_idx} - Raw vs Reconstruction",
@@ -938,9 +943,9 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     source_signal=signal_source,
                     source_latent=latent_source,
                     source_heat=heat_source,
-                    recon_data=recon_store,
-                    target_data=target_store,
-                    latent_data=latent_store,
+                    recon_data=recon_series,
+                    target_data=target_series,
+                    latent_data=latent_series,
                     heat_data=heatmaps,
                 ),
                 code="""
@@ -957,7 +962,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             slider.js_on_change("value", callback)
 
             layout = column(signal_fig, latent_fig, heat_fig, slider)
-            output_file(out_dir / f"latent_interp_pair_{pair_idx:02d}.html", title=f"Latent Interpolation Pair {pair_idx}")
+            output_file(str(out_dir / f"latent_interp_pair_{pair_idx:02d}.html"), title=f"Latent Interpolation Pair {pair_idx}")
             save(layout)
         logger.info("Latent interpolation animations saved to %s", out_dir)
 
