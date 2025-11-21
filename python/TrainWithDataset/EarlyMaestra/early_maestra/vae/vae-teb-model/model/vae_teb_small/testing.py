@@ -1047,7 +1047,6 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     f"<b>Pair {pair_idx}</b> | steps={len(recon_sequences)} | "
                     f"signal_len={len(x_values)} | latent_dim={latent_dim} | seq_len={seq_len}"
                 ),
-                style={"font-size": "12px", "margin-bottom": "6px"},
             )
 
             slider = Slider(start=0, end=len(recon_sequences) - 1, value=0, step=1, title="Interpolation Step")
