@@ -1193,6 +1193,231 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         self._plot_feature_importance(grad_mean, out_dir / "latent_feature_importance.png")
         logger.info("Feature attribution plot saved to %s", out_dir)
 
+    def run_latent_interpolation_plotly(self, test_loader, *, pair_count: int = 10, steps: int = 11) -> None:
+        """Export latent interpolation as interactive Plotly HTML (signals, latent bars, latent heatmap)."""
+        if pair_count <= 0 or steps < 2:
+            logger.info("Latent interpolation (plotly) skipped (invalid pair_count/steps)")
+            return
+        if self.pytorch_model is None:
+            self.create_model()
+        decoder = getattr(self.pytorch_model, "decoder", None)
+        if decoder is None:
+            logger.error("SeqVAE core does not expose a decoder attribute; cannot run interpolation.")
+            return
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+        out_dir = Path(self.test_results_dir) / "latent_interpolation_plotly"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        required_samples = pair_count * 2
+        samples: List[Dict[str, Any]] = []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        metadata_complete = True
+        with torch.inference_mode():
+            for batch in test_loader:
+                batch_size = batch.fhr_st.size(0)
+                for idx in range(batch_size):
+                    guid_val, epoch_val = self._extract_guid_epoch(batch, idx)
+                    entry = {
+                        "fhr_st": batch.fhr_st[idx : idx + 1].to(device),
+                        "fhr_ph": batch.fhr_ph[idx : idx + 1].to(device),
+                        "fhr_up_ph": batch.fhr_up_ph[idx : idx + 1].to(device),
+                        "fhr": batch.fhr[idx : idx + 1].to(device),
+                        "guid": guid_val,
+                        "epoch": epoch_val,
+                    }
+                    samples.append(entry)
+                    if guid_val is not None and epoch_val is not None:
+                        grouped.setdefault(guid_val, []).append(entry)
+                    else:
+                        metadata_complete = False
+                    if len(samples) >= required_samples:
+                        break
+                if len(samples) >= required_samples:
+                    break
+        if len(samples) < 2:
+            logger.error("Insufficient samples for interpolation.")
+            return
+
+        if metadata_complete and grouped:
+            sample_pairs = self._build_consecutive_pairs(grouped, pair_count)
+        else:
+            sample_pairs = []
+        if not sample_pairs:
+            for idx in range(0, min(len(samples) - 1, pair_count * 2), 2):
+                sample_pairs.append((samples[idx], samples[idx + 1]))
+        if not sample_pairs:
+            logger.error("Unable to construct interpolation pairs.")
+            return
+
+        weights = np.linspace(0.0, 1.0, steps)
+        rendered = 0
+        for pair_idx, (sample_a, sample_b) in enumerate(sample_pairs[:pair_count]):
+            with torch.inference_mode():
+                outputs_a = model(y_st=sample_a["fhr_st"], y_ph=sample_a["fhr_ph"], x_ph=sample_a["fhr_up_ph"])
+                outputs_b = model(y_st=sample_b["fhr_st"], y_ph=sample_b["fhr_ph"], x_ph=sample_b["fhr_up_ph"])
+            latent_a = outputs_a.get("z")
+            latent_b = outputs_b.get("z")
+            if latent_a is None or latent_b is None:
+                logger.warning("Skipping pair %d because latents are missing.", pair_idx)
+                continue
+
+            y_a = sample_a["fhr"]
+            y_b = sample_b["fhr"]
+            latent_dim = latent_a.size(-1)
+            seq_len = latent_a.size(1)
+            dim_template = list(range(latent_dim))
+
+            recon_sequences: List[List[float]] = []
+            target_sequences: List[List[float]] = []
+            latent_means: List[List[float]] = []
+            heatmaps: List[List[List[float]]] = []
+
+            for alpha in weights:
+                latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
+                decoded_linear, decoded_mu, _ = decoder(latent_interp)
+                target_interp = torch.lerp(y_a, y_b, float(alpha))
+
+                recon_flat = self._flatten_signal_for_plot(decoded_mu[0])
+                target_flat = self._flatten_signal_for_plot(target_interp[0])
+                series_len = min(len(recon_flat), len(target_flat))
+                if series_len <= 1:
+                    continue
+
+                recon_sequences.append(recon_flat[:series_len].tolist())
+                target_sequences.append(target_flat[:series_len].tolist())
+                latent_mean_np = latent_interp.mean(dim=1)[0].detach().cpu().numpy()
+                latent_means.append(self._sanitize_finite_array(latent_mean_np).tolist())
+                heat_np = latent_interp[0].detach().cpu().numpy().T  # (latent_dim, seq_len)
+                heatmaps.append(self._sanitize_finite_array(heat_np).tolist())
+
+            if not recon_sequences or not target_sequences:
+                logger.warning("Interpolation pair %d produced no valid decoded signals.", pair_idx)
+                continue
+
+            min_series_len = min(len(seq) for seq in (recon_sequences + target_sequences))
+            if min_series_len <= 1:
+                logger.warning("Skipping pair %d (series length %d).", pair_idx, min_series_len)
+                continue
+
+            common_len = min(
+                len(recon_sequences),
+                len(target_sequences),
+                len(latent_means),
+                len(heatmaps),
+            )
+            if common_len == 0:
+                logger.warning("Skipping pair %d due to empty synchronized sequences.", pair_idx)
+                continue
+            recon_sequences = recon_sequences[:common_len]
+            target_sequences = target_sequences[:common_len]
+            latent_means = latent_means[:common_len]
+            heatmaps = heatmaps[:common_len]
+
+            x_values = np.arange(min_series_len).tolist()
+            recon_sequences = [seq[:min_series_len] for seq in recon_sequences]
+            target_sequences = [seq[:min_series_len] for seq in target_sequences]
+            latent_means = [seq for seq in latent_means if len(seq) == latent_dim]
+            heatmaps = [np.asarray(h, dtype=float).tolist() for h in heatmaps if np.asarray(h).shape == (latent_dim, seq_len)]
+            if not latent_means or not heatmaps:
+                logger.warning("Skipping pair %d due to invalid latent summaries/heatmaps.", pair_idx)
+                continue
+
+            heat_min = min(float(np.min(np.array(h))) for h in heatmaps)
+            heat_max = max(float(np.max(np.array(h))) for h in heatmaps)
+            if heat_max <= heat_min:
+                heat_max = heat_min + 1e-6
+
+            fig = make_subplots(
+                rows=3,
+                cols=1,
+                shared_xaxes=False,
+                vertical_spacing=0.08,
+                row_heights=[0.35, 0.25, 0.4],
+                specs=[[{"type": "xy"}], [{"type": "bar"}], [{"type": "heatmap"}]],
+            )
+            fig.add_trace(
+                go.Scatter(x=x_values, y=target_sequences[0], name="Target", line=dict(color="#268bd2")),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(x=x_values, y=recon_sequences[0], name="Reconstruction", line=dict(color="#d33682")),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Bar(x=dim_template, y=latent_means[0], name="Latent Mean", marker_color="#6c71c4"),
+                row=2,
+                col=1,
+            )
+            fig.add_trace(
+                go.Heatmap(
+                    z=heatmaps[0],
+                    coloraxis="coloraxis",
+                    zmin=heat_min,
+                    zmax=heat_max,
+                    showscale=False,
+                ),
+                row=3,
+                col=1,
+            )
+
+            frames = []
+            for step_idx in range(len(recon_sequences)):
+                frames.append(
+                    go.Frame(
+                        data=[
+                            go.Scatter(y=target_sequences[step_idx]),
+                            go.Scatter(y=recon_sequences[step_idx]),
+                            go.Bar(y=latent_means[step_idx]),
+                            go.Heatmap(z=heatmaps[step_idx]),
+                        ],
+                        name=f"step{step_idx}",
+                    )
+                )
+
+            sliders = [
+                {
+                    "active": 0,
+                    "yanchor": "top",
+                    "xanchor": "left",
+                    "currentvalue": {"font": {"size": 12}, "prefix": "Step: ", "visible": True},
+                    "pad": {"t": 5, "b": 5},
+                    "steps": [
+                        {
+                            "args": [[f"step{idx}"], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+                            "label": f"{idx}",
+                            "method": "animate",
+                        }
+                        for idx in range(len(frames))
+                    ],
+                }
+            ]
+
+            fig.update_layout(
+                title=f"Latent Interpolation Pair {pair_idx}",
+                coloraxis={"colorscale": "Viridis", "cmin": heat_min, "cmax": heat_max},
+                sliders=sliders,
+                height=900,
+                showlegend=True,
+            )
+            fig.frames = frames
+
+            output_path = out_dir / f"latent_interp_pair_{pair_idx:02d}_plotly.html"
+            fig.write_html(str(output_path), include_plotlyjs="cdn", full_html=True)
+            logger.info("Saved plotly interpolation for pair %d -> %s", pair_idx, output_path)
+            rendered += 1
+
+        if rendered == 0:
+            logger.error("No plotly latent interpolation plots were generated.")
+
     @staticmethod
     def _maybe_denormalize(tensor: torch.Tensor, field: str, stats: Optional[Dict]) -> torch.Tensor:
         if not stats:
@@ -1370,6 +1595,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of discrete interpolation steps (>=2).",
     )
     parser.add_argument(
+        "--latent-interp-plotly",
+        action="store_true",
+        help="Also export latent interpolation animations using Plotly.",
+    )
+    parser.add_argument(
         "--latent-attr-samples",
         type=int,
         default=8,
@@ -1442,6 +1672,7 @@ def main(
     latent_sweep_visuals: int = 1,
     latent_interp_pairs: int = 10,
     latent_interp_steps: int = 10,
+    latent_interp_plotly: bool = True,
     latent_attr_samples: int = 8,
 ) -> None:
     config_path = Path(config)
@@ -1456,6 +1687,12 @@ def main(
             pair_count=latent_interp_pairs,
             steps=latent_interp_steps,
         )
+        if latent_interp_plotly:
+            tester.run_latent_interpolation_plotly(
+                test_loader,
+                pair_count=latent_interp_pairs,
+                steps=latent_interp_steps,
+            )
     if latent_dist_samples and latent_dist_samples > 0:
         tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
     if analysis_samples and analysis_samples > 0:
