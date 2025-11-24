@@ -1246,7 +1246,6 @@ class SeqVae(nn.Module):
 
         linear_output, mu_pr, logvar_pr = self.decoder(z)
         linear_output = linear_output.view(linear_output.shape[0], 300, 40, 30).mean(dim=-1)
-        print('done')
         return {
             "z": z,  # (B, T, latent_dim_z)
             "linear_output": linear_output,

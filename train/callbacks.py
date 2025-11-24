@@ -703,6 +703,9 @@ class PlottingAvgPredCallBack(Callback):
                     )
                 linear_output = outputs.get("linear_output")
                 latent_z = outputs.get("z")
+                st_feats = y_st
+                ph_feats = y_ph
+                cross_feats = x_ph
             guid = self._guid(batch)
             self._plot_results(
                 y_raw,
@@ -711,6 +714,9 @@ class PlottingAvgPredCallBack(Callback):
                 avg_std,
                 linear_output,
                 latent_z,
+                st_feats,
+                ph_feats,
+                cross_feats,
                 epoch,
                 guid,
             )
@@ -764,6 +770,9 @@ class PlottingAvgPredCallBack(Callback):
         avg_std,
         linear_output,
         latent_z,
+        st_feats,
+        ph_feats,
+        cross_feats,
         epoch: int,
         guid: str,
     ) -> None:
@@ -782,6 +791,15 @@ class PlottingAvgPredCallBack(Callback):
         latent_np = None
         if isinstance(latent_z, torch.Tensor):
             latent_np = latent_z[batch_idx].detach().cpu().numpy()
+        st_np = None
+        if isinstance(st_feats, torch.Tensor):
+            st_np = st_feats[batch_idx].detach().cpu().numpy()
+        ph_np = None
+        if isinstance(ph_feats, torch.Tensor):
+            ph_np = ph_feats[batch_idx].detach().cpu().numpy()
+        cross_np = None
+        if isinstance(cross_feats, torch.Tensor):
+            cross_np = cross_feats[batch_idx].detach().cpu().numpy()
         time_axis = np.arange(0, len(y_raw)) / 4.0
 
         colors = {
@@ -811,7 +829,9 @@ class PlottingAvgPredCallBack(Callback):
             }
         )
 
-        fig, axes = plt.subplots(4, 1, figsize=(16, 13), sharex=False)
+        extra_rows = int(st_np is not None) + int(ph_np is not None) + int(cross_np is not None)
+        n_rows = 4 + extra_rows
+        fig, axes = plt.subplots(n_rows, 1, figsize=(16, 3.5 * n_rows), sharex=False)
 
         ax0 = axes[0]
         ax0.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
@@ -863,6 +883,31 @@ class PlottingAvgPredCallBack(Callback):
             fig.colorbar(im2, ax=ax3, fraction=0.015, pad=0.02)
         else:
             ax3.set_visible(False)
+
+        idx = 4
+        if st_np is not None and idx < len(axes):
+            ax_st = axes[idx]
+            im_st = ax_st.imshow(st_np.T, aspect="auto", cmap="bwr", origin="lower")
+            ax_st.set_ylabel("ST ch")
+            ax_st.set_xlabel("Time steps (decimated)")
+            ax_st.set_title("FHR Scattering Transform")
+            fig.colorbar(im_st, ax=ax_st, fraction=0.015, pad=0.02)
+            idx += 1
+        if ph_np is not None and idx < len(axes):
+            ax_ph = axes[idx]
+            im_ph = ax_ph.imshow(ph_np.T, aspect="auto", cmap="bwr", origin="lower")
+            ax_ph.set_ylabel("Phase ch")
+            ax_ph.set_xlabel("Time steps (decimated)")
+            ax_ph.set_title("FHR Phase Harmonics")
+            fig.colorbar(im_ph, ax=ax_ph, fraction=0.015, pad=0.02)
+            idx += 1
+        if cross_np is not None and idx < len(axes):
+            ax_cross = axes[idx]
+            im_cross = ax_cross.imshow(cross_np.T, aspect="auto", cmap="bwr", origin="lower")
+            ax_cross.set_ylabel("Cross ch")
+            ax_cross.set_xlabel("Time steps (decimated)")
+            ax_cross.set_title("UP+FHR Cross Phase")
+            fig.colorbar(im_cross, ax=ax_cross, fraction=0.015, pad=0.02)
 
         fig.suptitle(f"Avg Prediction — Epoch {epoch} | guid: {guid}", fontsize=12, y=0.98, color="#456882")
         fig.tight_layout(rect=(0, 0, 1, 0.96))
