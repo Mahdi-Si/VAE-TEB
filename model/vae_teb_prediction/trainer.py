@@ -46,7 +46,6 @@ class SeqVaePl(LightningModelBase):
             "kld_loss": loss_dict["kld_loss"],
             "kld_beta": self.hparams.get('kld_beta', 0.001),
         }
-        self.log(f"{stage}/kld_beta", self.hparams.get('kld_beta', 0.001), prog_bar=False, on_step=False, on_epoch=True)
         return total_loss, metrics
 
 
