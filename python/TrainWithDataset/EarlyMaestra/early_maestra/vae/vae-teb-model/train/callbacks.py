@@ -102,10 +102,7 @@ class LossPlotCallback(Callback):
     def _log_artifact(self, path: Path) -> None:
         if self._mlflow_logger is None:
             return
-        try:
-            self._mlflow_logger.experiment.log_artifact(self._mlflow_logger.run_id, str(path))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Failed to log artifact {path} to MLflow: {exc}")
+        self._mlflow_logger.experiment.log_artifact(self._mlflow_logger.run_id, str(path))
 
     def on_validation_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch
@@ -632,10 +629,145 @@ class PlottingCallBack(Callback):
         plt.close(fig)
 
 
+
+class PlottingAvgPredCallBack(Callback):
+    """Plot averaged raw prediction (post-warmup) versus ground truth."""
+
+    def __init__(self, output_dir: Path | str, plot_every_epoch: int = 5, input_channel_num: int = 0):
+        super().__init__()
+        self.output_dir = Path(output_dir) / "analysis_plots"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.plot_every_epoch = max(1, int(plot_every_epoch))
+        self.input_channel_num = input_channel_num
+        self._plotly_available = True
+
+    @staticmethod
+    def _get(batch, name):
+        if isinstance(batch, dict):
+            return batch.get(name)
+        return getattr(batch, name, None)
+
+    @staticmethod
+    def _guid(batch, index: int = 0) -> str:
+        guid_field = None
+        if isinstance(batch, dict):
+            guid_field = batch.get("guid")
+        elif hasattr(batch, "guid"):
+            guid_field = getattr(batch, "guid")
+        if guid_field is None:
+            return "unknown"
+        if isinstance(guid_field, (list, tuple)):
+            if not guid_field:
+                return "unknown"
+            return str(guid_field[index % len(guid_field)])
+        if isinstance(guid_field, torch.Tensor):
+            try:
+                return str(guid_field[index].item())
+            except Exception:  # noqa: BLE001
+                return "unknown"
+        return str(guid_field)
+
+    def on_validation_epoch_end(self, trainer, pl_module):  # type: ignore[override]
+        if not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.plot_every_epoch != 0:
+            return
+
+        batch = _first_validation_batch(trainer)
+        if batch is None:
+            logger.warning("PlottingCallBack: could not fetch validation batch")
+            return
+
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
+        module = getattr(pl_module, "model", pl_module)
+
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
+                y_raw = batch.fhr
+                outputs = module(y_st, y_ph, x_ph)
+                mu_pr = outputs["mu_pr"]
+                avg_pred = module.average_raw_prediction(mu_pr)
+            guid = self._guid(batch)
+            self._plot_results(
+                y_raw,
+                avg_pred,
+                epoch,
+                guid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"PlottingCallBack failed: {exc}")
+        finally:
+            pl_module.train()
+
+    def _plot_results(
+        self,
+        y_raw_normalized,
+        avg_pred,
+        epoch: int,
+        guid: str,
+    ) -> None:
+        batch_idx = 0
+        y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
+        avg_pred_np = avg_pred[batch_idx].detach().cpu().numpy()
+        time_axis = np.arange(0, len(y_raw)) / 4.0
+
+        colors = {
+            "fhr": "#055C9A",
+            "avg": "#BB3E00",
+            "background": "#F9F3EF",
+        }
+
+        plt.style.use("default")
+        plt.rcParams.update(
+            {
+                "font.family": "sans-serif",
+                "font.size": 11,
+                "axes.titlesize": 12,
+                "axes.labelsize": 11,
+                "axes.linewidth": 0.7,
+                "axes.edgecolor": "#9E9D9D",
+                "axes.facecolor": colors["background"],
+                "grid.color": "#838383",
+                "grid.linewidth": 0.4,
+                "grid.alpha": 0.6,
+                "figure.facecolor": "white",
+                "savefig.facecolor": "white",
+                "savefig.dpi": 300,
+            }
+        )
+
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
+        ax.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color="#D2C1B6")
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#A2B9A7")
+        ax.spines["bottom"].set_color("#A2B9A7")
+        ax.spines["left"].set_linewidth(0.7)
+        ax.spines["bottom"].set_linewidth(0.7)
+
+        ax.plot(time_axis, y_raw, linewidth=1.2, color=colors["fhr"], label="Ground Truth", alpha=0.85)
+        ax.plot(time_axis, avg_pred_np, linewidth=1.0, color=colors["avg"], label="Avg Prediction", alpha=0.9)
+        ax.set_ylabel("Amplitude")
+        ax.set_xlabel("Time (s)")
+        ax.set_title("Average Raw Prediction (post-warmup)")
+        ax.legend(loc="upper right", framealpha=0.95)
+
+        fig.suptitle(f"Avg Prediction — Epoch {epoch} | guid: {guid}", fontsize=12, y=0.98, color="#456882")
+        save_path = self.output_dir / f"avg_prediction_epoch_{epoch:04d}.pdf"
+        fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
+        plt.close(fig)
+
 __all__ = [
     "LossPlotCallback",
     "HyperparameterLoggingCallback",
     "MetricsLoggingCallback",
     "ReconstructionPlotCallback",
     "PlottingCallBack",
+    "PlottingAvgPredCallBack",
 ]
