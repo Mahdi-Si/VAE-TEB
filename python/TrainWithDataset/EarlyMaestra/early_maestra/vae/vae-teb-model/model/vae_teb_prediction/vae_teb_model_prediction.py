@@ -1245,10 +1245,11 @@ class SeqVae(nn.Module):
         z = self.reparameterize(mu_post, logvar_post)  # (B, T, latent_dim)
 
         linear_output, mu_pr, logvar_pr = self.decoder(z)
-
+        linear_output = linear_output.view(linear_output.shape[0], 300, 40, 30).mean(dim=-1)
+        print('done')
         return {
             "z": z,  # (B, T, latent_dim_z)
-            "linear_output": linear_output,  # (B, T, 87)
+            "linear_output": linear_output,
             "mu_pr": mu_pr,  # (B, 4800, 480)
             "logvar_pr": logvar_pr,  # (B, 4800, 480)
             "mu_prior": mu_y,  # (B, T, latent_dim_target)
