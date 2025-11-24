@@ -1467,7 +1467,10 @@ class SeqVae(nn.Module):
                 mask = (idx < raw_len).float()                  # (T_valid, H)
                 idx_clamped = idx.clamp(max=raw_len - 1)
 
-                target = y_raw[:, None, :].gather(
+                # Expand raw to match the (B, T_valid, *) shape for gathering.
+                # Use repeat to avoid any view/stride edge cases across devices.
+                raw_expanded = y_raw.unsqueeze(1).repeat(1, idx_clamped.size(0), 1)
+                target = raw_expanded.gather(
                     2, idx_clamped.unsqueeze(0).expand(B, -1, -1)
                 )  # (B, T_valid, H)
 
