@@ -776,9 +776,9 @@ class PlottingAvgPredCallBack(Callback):
         avg_std_np = None
         if isinstance(avg_std, torch.Tensor):
             avg_std_np = avg_std[batch_idx].detach().cpu().numpy()
-        linear_mean_np = None
+        linear_np = None
         if isinstance(linear_output, torch.Tensor):
-            linear_mean_np = linear_output[batch_idx].mean(dim=0).detach().cpu().numpy()
+            linear_np = linear_output[batch_idx].detach().cpu().numpy()
         latent_np = None
         if isinstance(latent_z, torch.Tensor):
             latent_np = latent_z[batch_idx].detach().cpu().numpy()
@@ -811,7 +811,7 @@ class PlottingAvgPredCallBack(Callback):
             }
         )
 
-        fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=False)
+        fig, axes = plt.subplots(4, 1, figsize=(16, 13), sharex=False)
 
         ax0 = axes[0]
         ax0.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
@@ -851,11 +851,18 @@ class PlottingAvgPredCallBack(Callback):
             ax2.set_xlabel("Time steps (decimated)")
             ax2.set_title("Latent Representation")
             fig.colorbar(im, ax=ax2, fraction=0.015, pad=0.02)
-        elif linear_mean_np is not None:
-            ax2.bar(np.arange(linear_mean_np.shape[0]), linear_mean_np, color="#6A5ACD")
-            ax2.set_ylabel("Value")
-            ax2.set_xlabel("Channel")
-            ax2.set_title("Linear Output (time-avg)")
+        else:
+            ax2.set_visible(False)
+
+        ax3 = axes[3]
+        if linear_np is not None:
+            im2 = ax3.imshow(linear_np.T, aspect="auto", cmap="viridis", origin="lower")
+            ax3.set_ylabel("Linear Output Ch")
+            ax3.set_xlabel("Time steps (decimated)")
+            ax3.set_title("Linear Output (B,T,40)")
+            fig.colorbar(im2, ax=ax3, fraction=0.015, pad=0.02)
+        else:
+            ax3.set_visible(False)
 
         fig.suptitle(f"Avg Prediction — Epoch {epoch} | guid: {guid}", fontsize=12, y=0.98, color="#456882")
         fig.tight_layout(rect=(0, 0, 1, 0.96))
