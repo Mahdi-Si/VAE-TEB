@@ -631,7 +631,7 @@ class PlottingCallBack(Callback):
 
 
 class PlottingAvgPredCallBack(Callback):
-    """Plot averaged raw prediction (post-warmup) versus ground truth."""
+    """Plot averaged raw prediction (post-warmup) versus ground truth with uncertainty, latent, and UP."""
 
     def __init__(self, output_dir: Path | str, plot_every_epoch: int = 5, input_channel_num: int = 0):
         super().__init__()
@@ -687,13 +687,30 @@ class PlottingAvgPredCallBack(Callback):
             with torch.no_grad():
                 y_st, y_ph, x_ph = batch.fhr_st, batch.fhr_ph, batch.fhr_up_ph
                 y_raw = batch.fhr
+                up_raw = getattr(batch, "up", None)
                 outputs = module(y_st, y_ph, x_ph)
                 mu_pr = outputs["mu_pr"]
+                logvar_pr = outputs.get("logvar_pr")
                 avg_pred = module.average_raw_prediction(mu_pr)
+                avg_std = None
+                if isinstance(logvar_pr, torch.Tensor):
+                    std_pr = torch.exp(0.5 * logvar_pr)
+                    avg_std = self._average_segments(
+                        std_pr,
+                        decimation_factor=getattr(module, "decimation_factor", 16),
+                        warmup=getattr(module, "warmup_period", 0),
+                        raw_len=y_raw.shape[-1],
+                    )
+                linear_output = outputs.get("linear_output")
+                latent_z = outputs.get("z")
             guid = self._guid(batch)
             self._plot_results(
                 y_raw,
+                up_raw,
                 avg_pred,
+                avg_std,
+                linear_output,
+                latent_z,
                 epoch,
                 guid,
             )
@@ -702,21 +719,76 @@ class PlottingAvgPredCallBack(Callback):
         finally:
             pl_module.train()
 
+    @staticmethod
+    def _average_segments(segments: torch.Tensor, decimation_factor: int, warmup: int, raw_len: int) -> torch.Tensor:
+        """Average per-step horizon segments onto the raw axis (mirrors average_raw_prediction)."""
+        if segments.dim() != 3:
+            return torch.full((segments.size(0), raw_len), float("nan"), device=segments.device, dtype=segments.dtype)
+        B, T, H = segments.shape
+        s = int(decimation_factor)
+        warmup = int(warmup)
+        device = segments.device
+        dtype = segments.dtype
+
+        avg = torch.full((B, raw_len), float("nan"), device=device, dtype=dtype)
+        max_valid_t = max(0, min(T, (raw_len - H) // s + 1))
+        start_t = min(warmup, max_valid_t)
+        if start_t >= max_valid_t:
+            return avg
+        valid_steps = torch.arange(start_t, max_valid_t, device=device)
+        start_idx = valid_steps[:, None] * s
+        h_idx = torch.arange(H, device=device)[None, :]
+        idx = start_idx + h_idx  # (T_valid, H)
+        mask = (idx < raw_len).to(dtype)
+        idx_clamped = idx.clamp(max=raw_len - 1)
+
+        pred_sum = torch.zeros((B, raw_len), device=device, dtype=dtype)
+        count = torch.zeros((B, raw_len), device=device, dtype=dtype)
+
+        flat_idx = idx_clamped.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)
+        flat_seg = segments[:, valid_steps, :].reshape(B, -1)
+        flat_mask = mask.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)
+
+        pred_sum.scatter_add_(1, flat_idx, flat_seg * flat_mask)
+        count.scatter_add_(1, flat_idx, flat_mask)
+
+        avg = pred_sum / count.clamp_min(1.0)
+        avg = avg.masked_fill(count == 0, float("nan"))
+        return avg
+
     def _plot_results(
         self,
         y_raw_normalized,
+        up_raw_normalized,
         avg_pred,
+        avg_std,
+        linear_output,
+        latent_z,
         epoch: int,
         guid: str,
     ) -> None:
         batch_idx = 0
         y_raw = y_raw_normalized[batch_idx].detach().cpu().numpy()
+        up_raw = None
+        if isinstance(up_raw_normalized, torch.Tensor):
+            up_raw = up_raw_normalized[batch_idx].detach().cpu().numpy()
         avg_pred_np = avg_pred[batch_idx].detach().cpu().numpy()
+        avg_std_np = None
+        if isinstance(avg_std, torch.Tensor):
+            avg_std_np = avg_std[batch_idx].detach().cpu().numpy()
+        linear_mean_np = None
+        if isinstance(linear_output, torch.Tensor):
+            linear_mean_np = linear_output[batch_idx].mean(dim=0).detach().cpu().numpy()
+        latent_np = None
+        if isinstance(latent_z, torch.Tensor):
+            latent_np = latent_z[batch_idx].detach().cpu().numpy()
         time_axis = np.arange(0, len(y_raw)) / 4.0
 
         colors = {
             "fhr": "#055C9A",
             "avg": "#BB3E00",
+            "up": "#0DD8A2",
+            "uncertainty": "#F7AD45",
             "background": "#F9F3EF",
         }
 
@@ -739,26 +811,54 @@ class PlottingAvgPredCallBack(Callback):
             }
         )
 
-        fig, ax = plt.subplots(figsize=(14, 4))
-        ax.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
-        ax.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color="#D2C1B6")
-        ax.minorticks_on()
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color("#A2B9A7")
-        ax.spines["bottom"].set_color("#A2B9A7")
-        ax.spines["left"].set_linewidth(0.7)
-        ax.spines["bottom"].set_linewidth(0.7)
+        fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=False)
 
-        ax.plot(time_axis, y_raw, linewidth=1.2, color=colors["fhr"], label="Ground Truth", alpha=0.85)
-        ax.plot(time_axis, avg_pred_np, linewidth=1.0, color=colors["avg"], label="Avg Prediction", alpha=0.9)
-        ax.set_ylabel("Amplitude")
-        ax.set_xlabel("Time (s)")
-        ax.set_title("Average Raw Prediction (post-warmup)")
-        ax.legend(loc="upper right", framealpha=0.95)
+        ax0 = axes[0]
+        ax0.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
+        ax0.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color="#D2C1B6")
+        ax0.minorticks_on()
+        ax0.plot(time_axis, y_raw, linewidth=1.2, color=colors["fhr"], label="FHR", alpha=0.85)
+        if up_raw is not None:
+            ax0.plot(time_axis, up_raw, linewidth=1.0, color=colors["up"], label="UP", alpha=0.8)
+        ax0.set_ylabel("Amplitude")
+        ax0.set_title("Raw FHR/UP")
+        ax0.legend(loc="upper right", framealpha=0.95)
+
+        ax1 = axes[1]
+        ax1.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color="#D2C1B6")
+        ax1.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color="#D2C1B6")
+        ax1.minorticks_on()
+        ax1.plot(time_axis, y_raw, linewidth=1.2, color=colors["fhr"], label="Ground Truth", alpha=0.85)
+        ax1.plot(time_axis, avg_pred_np, linewidth=1.0, color=colors["avg"], label="Avg Prediction", alpha=0.9)
+        if avg_std_np is not None:
+            ax1.fill_between(
+                time_axis,
+                avg_pred_np - 2 * avg_std_np,
+                avg_pred_np + 2 * avg_std_np,
+                color=colors["uncertainty"],
+                alpha=0.25,
+                label="Uncertainty (±2σ)",
+            )
+        ax1.set_ylabel("Amplitude")
+        ax1.set_xlabel("Time (s)")
+        ax1.set_title("Average Raw Prediction (post-warmup)")
+        ax1.legend(loc="upper right", framealpha=0.95)
+
+        ax2 = axes[2]
+        if latent_np is not None:
+            im = ax2.imshow(latent_np.T, aspect="auto", cmap="bwr", origin="lower")
+            ax2.set_ylabel("Latent dims")
+            ax2.set_xlabel("Time steps (decimated)")
+            ax2.set_title("Latent Representation")
+            fig.colorbar(im, ax=ax2, fraction=0.015, pad=0.02)
+        elif linear_mean_np is not None:
+            ax2.bar(np.arange(linear_mean_np.shape[0]), linear_mean_np, color="#6A5ACD")
+            ax2.set_ylabel("Value")
+            ax2.set_xlabel("Channel")
+            ax2.set_title("Linear Output (time-avg)")
 
         fig.suptitle(f"Avg Prediction — Epoch {epoch} | guid: {guid}", fontsize=12, y=0.98, color="#456882")
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
         save_path = self.output_dir / f"avg_prediction_epoch_{epoch:04d}.pdf"
         fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
         plt.close(fig)
