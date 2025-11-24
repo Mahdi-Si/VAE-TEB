@@ -4,13 +4,13 @@ from train.callbacks import (
     LossPlotCallback,
     HyperparameterLoggingCallback,
     MetricsLoggingCallback,
-    PlottingCallBack
+    PlottingAvgPredCallBack
 )
 
 from loguru import logger
 
 from train.graph_models_utils import load_checkpoint_strict
-from vae_teb_model_small import SeqVaeCore
+from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
@@ -24,14 +24,14 @@ import time
 import yaml
 
 
-class SeqVaeCorePl(LightningModelBase):
+class SeqVaePl(LightningModelBase):
 
     def compute_loss_and_metrics(self, batch, batch_idx, stage: str):
         y_st = batch.fhr_st
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
         y_raw  = batch.fhr
-        forward_outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, prediction_mode=True)
+        forward_outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
         loss_dict = self.orig_model.compute_loss(
             forward_outputs=forward_outputs,
             y_st=y_st,
@@ -42,7 +42,6 @@ class SeqVaeCorePl(LightningModelBase):
         total_loss = loss_dict['total_loss']
         metrics = {
             "total_loss": total_loss,
-            "mse_loss": loss_dict["mse_loss"],
             "nll_loss": loss_dict["nll_loss"],
             "kld_loss": loss_dict["kld_loss"],
             "kld_beta": self.hparams.get('kld_beta', 0.001),
@@ -56,7 +55,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
         super(GraphModelVaeTebSmallTrainer, self).__init__(config_file_path)
 
     def create_model(self):
-        self.pytorch_model = SeqVaeCore()
+        self.pytorch_model = SeqVae()
         self.checkpoint = self.config.get('model_config').get('core_model_checkpoint')
         if self.checkpoint is not None:
             load_checkpoint_strict(
@@ -69,7 +68,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             "lr_milestones": self.lr_milestones,
             "kld_beta": self.config["model_config"]["VAE_model"].get("kld_beta"),
         }
-        self.pl_model = SeqVaeCorePl(
+        self.pl_model = SeqVaePl(
             self.pytorch_model,
             lr=self.lr,
             lr_milestones=self.lr_milestones,
@@ -88,7 +87,7 @@ class GraphModelVaeTebSmallTrainer(GraphModelBase):
             output_dir=self.train_results_dir,
             plot_frequency=10,
         )
-        self.plotting_callback = PlottingCallBack(
+        self.plotting_callback = PlottingAvgPredCallBack(
             output_dir=self.train_results_dir,
             plot_every_epoch=self.plot_every_epoch,
             input_channel_num=0,
