@@ -470,8 +470,11 @@ def plot_model_analysis(
 def plot_single_prediction_windows(
     output_dir: str,
     raw_fhr_unnormalized: np.ndarray,
+    raw_fhr_normalized: np.ndarray,
     windows: List[Dict[str, Any]],
     *,
+    aggregated_pred_norm: Optional[np.ndarray] = None,
+    aggregated_uncertainty_norm: Optional[np.ndarray] = None,
     sample_idx: int,
     sample_guid: Optional[str] = None,
     epoch: Optional[float] = None,
@@ -483,7 +486,10 @@ def plot_single_prediction_windows(
     Args:
         output_dir (str): Directory to save results.
         raw_fhr_unnormalized (np.ndarray): Full raw FHR signal for context (unnormalized).
+        raw_fhr_normalized (np.ndarray): Normalized FHR signal for aggregate comparison.
         windows (List[Dict]): Each window contains prediction/target arrays and metadata.
+        aggregated_pred_norm (np.ndarray, optional): Concatenated normalized predictions.
+        aggregated_uncertainty_norm (np.ndarray, optional): Concatenated normalized std dev.
         sample_idx (int): Sequential index for file naming.
         sample_guid (str, optional): Record identifier for subplot titles.
         epoch (float, optional): Epoch metadata in raw domain.
@@ -508,7 +514,7 @@ def plot_single_prediction_windows(
         'axes.facecolor': colors['background'],
     })
 
-    n_rows = 1 + len(windows)
+    n_rows = 2 + len(windows)
     fig, axes = plt.subplots(n_rows, 1, figsize=(16, max(6, 3 + 2.3 * len(windows))), constrained_layout=True)
     if n_rows == 1:
         axes = np.asarray([axes])
@@ -580,8 +586,6 @@ def plot_single_prediction_windows(
                 label=label,
             )
         ax.set_ylabel("Amplitude")
-        if idx == len(windows) - 1:
-            ax.set_xlabel("Time (s)")
         metrics = window.get("metrics", {})
         mse = metrics.get("mse")
         vaf = metrics.get("vaf")
@@ -599,6 +603,37 @@ def plot_single_prediction_windows(
             header += f" | {metric_text}"
         ax.set_title(header, fontweight='normal', pad=10)
         ax.legend(loc="upper right", framealpha=0.95)
+
+    agg_ax = axes[-1]
+    agg_ax.set_title("Concatenated Predictions vs Normalized FHR", fontweight='normal', pad=12)
+    agg_ax.set_ylabel("Normalized Amplitude")
+    agg_ax.set_xlabel("Time (s)")
+    agg_ax.plot(t_raw, raw_fhr_normalized, color=colors['gt'], linewidth=1.2, label="Normalized FHR")
+    for window in windows:
+        start_sec = window["raw_start"] / sampling_rate
+        end_sec = window["raw_end"] / sampling_rate
+        agg_ax.axvspan(start_sec, end_sec, color=colors['recon'], alpha=0.08)
+        agg_ax.axvline(start_sec, color=colors['recon'], linestyle="--", linewidth=0.8)
+        agg_ax.axvline(end_sec, color=colors['recon'], linestyle="--", linewidth=0.8)
+    if aggregated_pred_norm is not None and np.isfinite(aggregated_pred_norm).any():
+        agg_ax.plot(t_raw, aggregated_pred_norm, color=colors['recon'], linewidth=1.2, label="Concatenated Prediction")
+        if (
+            aggregated_uncertainty_norm is not None
+            and np.isfinite(aggregated_uncertainty_norm).any()
+        ):
+            lower = aggregated_pred_norm - aggregated_uncertainty_norm
+            upper = aggregated_pred_norm + aggregated_uncertainty_norm
+            valid = np.isfinite(lower) & np.isfinite(upper)
+            agg_ax.fill_between(
+                t_raw,
+                lower,
+                upper,
+                where=valid,
+                color=colors['uncertainty'],
+                alpha=0.2,
+                label="±1σ (norm)",
+            )
+    agg_ax.legend(loc="upper right", framealpha=0.95)
 
     output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.png")
     fig.savefig(output_path, dpi=300, facecolor='white')
