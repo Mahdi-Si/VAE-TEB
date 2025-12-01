@@ -496,6 +496,7 @@ def plot_single_prediction_windows(
         'fhr': "#055C9A",
         'gt': '#456882',
         'recon': '#BB3E00',
+        'uncertainty': '#F7AD45',
         'background': '#F9F3EF',
     }
 
@@ -540,7 +541,9 @@ def plot_single_prediction_windows(
     for window in windows:
         start_sec = window["raw_start"] / sampling_rate
         end_sec = window["raw_end"] / sampling_rate
-        axes[0].axvspan(start_sec, end_sec, color=colors['recon'], alpha=0.15)
+        axes[0].axvspan(start_sec, end_sec, color=colors['recon'], alpha=0.12)
+        axes[0].axvline(start_sec, color=colors['recon'], linestyle="--", linewidth=1.0)
+        axes[0].axvline(end_sec, color=colors['recon'], linestyle="--", linewidth=1.0)
         axes[0].text(
             (start_sec + end_sec) / 2.0,
             y_min + 0.05 * (y_max - y_min),
@@ -558,8 +561,24 @@ def plot_single_prediction_windows(
         start_sec = window["raw_start"] / sampling_rate
         end_sec = window["raw_end"] / sampling_rate
         t_segment = np.arange(len(prediction)) / sampling_rate + start_sec
+        ax.axvline(start_sec, color=colors['recon'], linestyle="--", linewidth=0.9)
+        ax.axvline(end_sec, color=colors['recon'], linestyle="--", linewidth=0.9)
         ax.plot(t_segment, target, color=colors['gt'], linewidth=1.5, label="Target")
         ax.plot(t_segment, prediction, color=colors['recon'], linewidth=1.3, label="Prediction")
+        uncertainty = window.get("uncertainty")
+        if uncertainty is not None:
+            uncertainty = np.asarray(uncertainty).astype(float)
+            lower = prediction - uncertainty
+            upper = prediction + uncertainty
+            label = "±1σ" if idx == 0 else None
+            ax.fill_between(
+                t_segment,
+                lower,
+                upper,
+                color=colors['uncertainty'],
+                alpha=0.25,
+                label=label,
+            )
         ax.set_ylabel("Amplitude")
         if idx == len(windows) - 1:
             ax.set_xlabel("Time (s)")

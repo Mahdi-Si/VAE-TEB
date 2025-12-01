@@ -557,6 +557,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
                 forward_outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
                 mu_segments = forward_outputs.get("mu_pr")
+                logvar_segments = forward_outputs.get("logvar_pr")
                 if mu_segments is None:
                     logger.warning("Model outputs missing 'mu_pr'; skipping batch.")
                     continue
@@ -570,6 +571,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     fhr_denorm = self._maybe_denormalize(fhr_norm, "fhr", stats)
                     windows = self._prepare_single_prediction_windows(
                         predictions=mu_segments[idx],
+                        logvar_predictions=logvar_segments[idx] if logvar_segments is not None else None,
                         raw_norm=fhr_norm,
                         raw_denorm=fhr_denorm,
                         start_index=start_index,
@@ -1153,6 +1155,37 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             return tensor
 
     @staticmethod
+    def _denormalize_std(
+        std_tensor: torch.Tensor,
+        field: str,
+        stats: Optional[Dict],
+        *,
+        raw_start: Optional[int] = None,
+        length: Optional[int] = None,
+    ) -> torch.Tensor:
+        if not stats or field not in stats:
+            return std_tensor
+        try:
+            field_stats = stats[field] or {}
+            scale = field_stats.get("std_tensor")
+            if scale is None:
+                scale = field_stats.get("std", 1.0)
+            scale_tensor = torch.as_tensor(scale, dtype=std_tensor.dtype, device=std_tensor.device)
+            if (
+                scale_tensor.dim() > 0
+                and raw_start is not None
+                and length is not None
+                and scale_tensor.size(-1) >= raw_start + length
+            ):
+                scale_tensor = scale_tensor.narrow(-1, raw_start, length)
+            while scale_tensor.dim() < std_tensor.dim():
+                scale_tensor = scale_tensor.unsqueeze(0)
+            return std_tensor * (scale_tensor + 1e-8)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to denormalize std for %s: %s. Returning std as-is.", field, exc)
+            return std_tensor
+
+    @staticmethod
     def _get_normalization_stats(loader) -> Optional[Dict]:
         dataset = getattr(loader, "dataset", None)
         if dataset is None or not hasattr(dataset, "get_normalization_stats"):
@@ -1185,6 +1218,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         self,
         *,
         predictions: torch.Tensor,
+        logvar_predictions: Optional[torch.Tensor],
         raw_norm: torch.Tensor,
         raw_denorm: torch.Tensor,
         start_index: int,
@@ -1217,8 +1251,20 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             if raw_end > raw_len:
                 break
             pred_segment = predictions[t_idx]
+            logvar_segment = logvar_predictions[t_idx] if logvar_predictions is not None else None
             target_denorm = raw_denorm[raw_start:raw_end]
             pred_denorm = self._maybe_denormalize(pred_segment.unsqueeze(0), "fhr", stats)[0]
+            std_denorm_np = None
+            if logvar_segment is not None:
+                std_norm = torch.exp(0.5 * logvar_segment)
+                std_denorm = self._denormalize_std(
+                    std_norm.unsqueeze(0),
+                    "fhr",
+                    stats,
+                    raw_start=raw_start,
+                    length=horizon,
+                )[0]
+                std_denorm_np = std_denorm.detach().cpu().numpy()
             metrics = self._compute_basic_metrics(
                 target_denorm.unsqueeze(0),
                 pred_denorm.unsqueeze(0),
@@ -1235,6 +1281,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     "raw_end": int(raw_end),
                     "prediction": pred_denorm.detach().cpu().numpy(),
                     "target": target_denorm.detach().cpu().numpy(),
+                    "uncertainty": std_denorm_np,
                     "metrics": metrics_map,
                 }
             )
@@ -1476,7 +1523,7 @@ def main(
     latent_interp_pairs: int = 10,
     latent_interp_steps: int = 10,
     latent_interp_plotly: bool = False,
-    single_pred_samples: int = 0,
+    single_pred_samples: int = 20,
     single_pred_start: int = 20,
     single_pred_step: Optional[int] = None,
     single_pred_windows: int = 4,
