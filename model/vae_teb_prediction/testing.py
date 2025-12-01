@@ -582,11 +582,27 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     if not windows:
                         continue
 
+                    raw_fhr_norm_np = fhr_norm.detach().cpu().numpy()
+                    agg_pred_norm = np.full_like(raw_fhr_norm_np, np.nan)
+                    agg_uncert_norm = np.full_like(raw_fhr_norm_np, np.nan)
+                    for window in windows:
+                        start = window["raw_start"]
+                        end = window["raw_end"]
+                        pred_norm = window.get("prediction_norm")
+                        if pred_norm is not None:
+                            agg_pred_norm[start:end] = pred_norm
+                        uncert_norm = window.get("uncertainty_norm")
+                        if uncert_norm is not None:
+                            agg_uncert_norm[start:end] = uncert_norm
+
                     raw_fhr_denorm_np = fhr_denorm.detach().cpu().numpy()
                     plot_single_prediction_windows(
                         output_dir=str(out_dir),
                         raw_fhr_unnormalized=raw_fhr_denorm_np,
+                        raw_fhr_normalized=raw_fhr_norm_np,
                         windows=windows,
+                        aggregated_pred_norm=agg_pred_norm,
+                        aggregated_uncertainty_norm=agg_uncert_norm,
                         sample_idx=processed,
                         sample_guid=guid_val,
                         epoch=epoch_val,
@@ -1252,11 +1268,14 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 break
             pred_segment = predictions[t_idx]
             logvar_segment = logvar_predictions[t_idx] if logvar_predictions is not None else None
+            target_norm = raw_norm[raw_start:raw_end]
             target_denorm = raw_denorm[raw_start:raw_end]
             pred_denorm = self._maybe_denormalize(pred_segment.unsqueeze(0), "fhr", stats)[0]
             std_denorm_np = None
+            std_norm_np = None
             if logvar_segment is not None:
                 std_norm = torch.exp(0.5 * logvar_segment)
+                std_norm_np = std_norm.detach().cpu().numpy()
                 std_denorm = self._denormalize_std(
                     std_norm.unsqueeze(0),
                     "fhr",
@@ -1281,7 +1300,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     "raw_end": int(raw_end),
                     "prediction": pred_denorm.detach().cpu().numpy(),
                     "target": target_denorm.detach().cpu().numpy(),
+                    "prediction_norm": pred_segment.detach().cpu().numpy(),
+                    "target_norm": target_norm.detach().cpu().numpy(),
                     "uncertainty": std_denorm_np,
+                    "uncertainty_norm": std_norm_np,
                     "metrics": metrics_map,
                 }
             )
