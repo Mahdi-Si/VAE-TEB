@@ -1367,52 +1367,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of samples to visualize with analysis plots (0 = skip).",
     )
     parser.add_argument(
-        "--latent-ablation-samples",
-        type=int,
-        default=0,
-        help="Number of samples to run latent ablation on (0 = skip).",
-    )
-    parser.add_argument(
-        "--latent-ablation-dims",
-        type=str,
-        default=None,
-        help="Comma-separated latent dimension indices to zero (default: all).",
-    )
-    parser.add_argument(
-        "--latent-ablation-visuals",
-        type=int,
-        default=1,
-        help="Number of reconstruction plots to save per ablated dimension.",
-    )
-    parser.add_argument(
         "--latent-dist-samples",
         type=int,
         default=500,
         help="Samples to use when plotting latent distributions (0 = skip).",
-    )
-    parser.add_argument(
-        "--latent-sweep-samples",
-        type=int,
-        default=0,
-        help="Number of samples for latent magnitude sweep (0 = skip).",
-    )
-    parser.add_argument(
-        "--latent-sweep-dims",
-        type=str,
-        default=None,
-        help="Comma-separated latent dims for magnitude sweep (default: all).",
-    )
-    parser.add_argument(
-        "--latent-sweep-scales",
-        type=str,
-        default=None,
-        help="Comma-separated scale factors for sweep (default: 0.0,0.5,1.0,1.5,2.0).",
-    )
-    parser.add_argument(
-        "--latent-sweep-visuals",
-        type=int,
-        default=1,
-        help="Visuals per-dimension during latent sweep.",
     )
     parser.add_argument(
         "--latent-interp-pairs",
@@ -1430,12 +1388,6 @@ def parse_args() -> argparse.Namespace:
         "--latent-interp-plotly",
         action="store_true",
         help="Also export latent interpolation animations using Plotly.",
-    )
-    parser.add_argument(
-        "--latent-attr-samples",
-        type=int,
-        default=8,
-        help="Samples for latent feature attribution (0 = skip).",
     )
     parser.add_argument(
         "--single-pred-samples",
@@ -1518,14 +1470,13 @@ def main(
     max_samples: Optional[int] = 100,
     metrics_max_samples: Optional[int] = None,
     analysis_samples: int = 10,
-    latent_ablation_dims: Optional[Any] = None,
     latent_dist_samples: int = 100,
     latent_interp_pairs: int = 10,
     latent_interp_steps: int = 10,
     latent_interp_plotly: bool = False,
     single_pred_samples: int = 20,
     single_pred_start: int = 20,
-    single_pred_step: Optional[int] = None,
+    single_pred_step: Optional[int] = 30,
     single_pred_windows: int = 4,
 ) -> None:
     config_path = Path(config)
@@ -1534,22 +1485,22 @@ def main(
     tester.setup_config()
     tester.create_model()
     test_loader = build_test_dataloader(config_data)
-    if latent_interp_pairs and latent_interp_steps and latent_interp_steps >= 2:
-        tester.run_latent_interpolation(
-            test_loader,
-            pair_count=latent_interp_pairs,
-            steps=latent_interp_steps,
-        )
-        if latent_interp_plotly:
-            tester.run_latent_interpolation_plotly(
-                test_loader,
-                pair_count=latent_interp_pairs,
-                steps=latent_interp_steps,
-            )
-    if latent_dist_samples and latent_dist_samples > 0:
-        tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
-    if analysis_samples and analysis_samples > 0:
-        tester.run_analysis_and_plot(test_loader, num_samples=analysis_samples)
+    # if latent_interp_pairs and latent_interp_steps and latent_interp_steps >= 2:
+    #     tester.run_latent_interpolation(
+    #         test_loader,
+    #         pair_count=latent_interp_pairs,
+    #         steps=latent_interp_steps,
+    #     )
+    #     if latent_interp_plotly:
+    #         tester.run_latent_interpolation_plotly(
+    #             test_loader,
+    #             pair_count=latent_interp_pairs,
+    #             steps=latent_interp_steps,
+    #         )
+    # if latent_dist_samples and latent_dist_samples > 0:
+    #     tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
+    # if analysis_samples and analysis_samples > 0:
+    #     tester.run_analysis_and_plot(test_loader, num_samples=analysis_samples)
     if single_pred_samples and single_pred_samples > 0:
         tester.run_single_prediction_probe(
             test_loader,
@@ -1558,14 +1509,14 @@ def main(
             step_size=single_pred_step,
             windows_per_sample=single_pred_windows,
         )
-    if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
-        tester.run_histogram_test(
-            test_loader,
-            num_samples=max_samples,
-            max_samples=metrics_max_samples,
-        )
+    # if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
+    #     tester.run_histogram_test(
+    #         test_loader,
+    #         num_samples=max_samples,
+    #         max_samples=metrics_max_samples,
+    #     )
 
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    main(**vars(cli_args))
+    main()
