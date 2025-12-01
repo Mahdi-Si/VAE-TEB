@@ -1471,18 +1471,11 @@ def main(
     max_samples: Optional[int] = 100,
     metrics_max_samples: Optional[int] = None,
     analysis_samples: int = 10,
-    latent_ablation_samples: int = 0,
     latent_ablation_dims: Optional[Any] = None,
-    latent_ablation_visuals: int = 1,
     latent_dist_samples: int = 100,
-    latent_sweep_samples: int = 0,
-    latent_sweep_dims: Optional[Any] = None,
-    latent_sweep_scales: Optional[Any] = None,
-    latent_sweep_visuals: int = 1,
     latent_interp_pairs: int = 10,
     latent_interp_steps: int = 10,
     latent_interp_plotly: bool = False,
-    latent_attr_samples: int = 8,
     single_pred_samples: int = 0,
     single_pred_start: int = 20,
     single_pred_step: Optional[int] = None,
@@ -1518,26 +1511,6 @@ def main(
             step_size=single_pred_step,
             windows_per_sample=single_pred_windows,
         )
-    ablation_dims_list = _parse_int_list(latent_ablation_dims)
-    if latent_ablation_samples and latent_ablation_samples > 0:
-        tester.run_latent_ablation_test(
-            test_loader,
-            num_samples=latent_ablation_samples,
-            dims=ablation_dims_list,
-            visuals_per_dim=latent_ablation_visuals,
-        )
-    sweep_dims_list = _parse_int_list(latent_sweep_dims)
-    sweep_scale_list = _parse_float_list(latent_sweep_scales)
-    if latent_sweep_samples and latent_sweep_samples > 0:
-        tester.run_latent_magnitude_sweep(
-            test_loader,
-            num_samples=latent_sweep_samples,
-            dims=sweep_dims_list,
-            scales=sweep_scale_list,
-            visuals_per_dim=latent_sweep_visuals,
-        )
-    if latent_attr_samples and latent_attr_samples > 0:
-        tester.run_latent_feature_attribution(test_loader, num_samples=latent_attr_samples)
     if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
         tester.run_histogram_test(
             test_loader,
