@@ -2,6 +2,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+from typing import Any, Dict, List, Optional
 
 def plot_model_analysis(
     output_dir: str,
@@ -465,6 +466,124 @@ def plot_model_analysis(
 
     print(f"Analysis plot saved to {save_path}")
 
+
+def plot_single_prediction_windows(
+    output_dir: str,
+    raw_fhr_unnormalized: np.ndarray,
+    windows: List[Dict[str, Any]],
+    *,
+    sample_idx: int,
+    sample_guid: Optional[str] = None,
+    epoch: Optional[float] = None,
+    sampling_rate: float = 4.0,
+) -> None:
+    """
+    Plot non-overlapping prediction windows (no averaging) for a single sample.
+
+    Args:
+        output_dir (str): Directory to save results.
+        raw_fhr_unnormalized (np.ndarray): Full raw FHR signal for context (unnormalized).
+        windows (List[Dict]): Each window contains prediction/target arrays and metadata.
+        sample_idx (int): Sequential index for file naming.
+        sample_guid (str, optional): Record identifier for subplot titles.
+        epoch (float, optional): Epoch metadata in raw domain.
+        sampling_rate (float): Sampling rate (Hz) for axis conversion.
+    """
+    if not windows:
+        return
+
+    colors = {
+        'fhr': "#055C9A",
+        'gt': '#456882',
+        'recon': '#BB3E00',
+        'background': '#F9F3EF',
+    }
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
+        'axes.edgecolor': "#9E9D9D",
+        'axes.facecolor': colors['background'],
+    })
+
+    n_rows = 1 + len(windows)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(16, max(6, 3 + 2.3 * len(windows))), constrained_layout=True)
+    if n_rows == 1:
+        axes = np.asarray([axes])
+
+    for ax in axes:
+        ax.grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#D2C1B6')
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#A2B9A7')
+        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_linewidth(0.7)
+        ax.spines['bottom'].set_linewidth(0.7)
+
+    t_raw = np.arange(len(raw_fhr_unnormalized)) / sampling_rate
+    axes[0].plot(t_raw, raw_fhr_unnormalized, color=colors['fhr'], linewidth=1.4, label="Raw FHR")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].legend(loc="upper right", framealpha=0.95)
+
+    title = f"Single Prediction Windows – Sample {sample_idx:03d}"
+    if sample_guid:
+        title += f" | GUID {sample_guid}"
+    if epoch is not None:
+        title += f" | epoch {epoch:.2f}"
+    axes[0].set_title(title, fontweight='normal', pad=12)
+
+    y_min, y_max = axes[0].get_ylim()
+    for window in windows:
+        start_sec = window["raw_start"] / sampling_rate
+        end_sec = window["raw_end"] / sampling_rate
+        axes[0].axvspan(start_sec, end_sec, color=colors['recon'], alpha=0.15)
+        axes[0].text(
+            (start_sec + end_sec) / 2.0,
+            y_min + 0.05 * (y_max - y_min),
+            f"T={window['t_index']}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color=colors['recon'],
+        )
+
+    for idx, window in enumerate(windows):
+        ax = axes[idx + 1]
+        prediction = np.asarray(window["prediction"]).astype(float)
+        target = np.asarray(window["target"]).astype(float)
+        start_sec = window["raw_start"] / sampling_rate
+        end_sec = window["raw_end"] / sampling_rate
+        t_segment = np.arange(len(prediction)) / sampling_rate + start_sec
+        ax.plot(t_segment, target, color=colors['gt'], linewidth=1.5, label="Target")
+        ax.plot(t_segment, prediction, color=colors['recon'], linewidth=1.3, label="Prediction")
+        ax.set_ylabel("Amplitude")
+        if idx == len(windows) - 1:
+            ax.set_xlabel("Time (s)")
+        metrics = window.get("metrics", {})
+        mse = metrics.get("mse")
+        vaf = metrics.get("vaf")
+        snr = metrics.get("snr")
+        metric_parts = []
+        if mse is not None:
+            metric_parts.append(f"MSE={mse:.4f}")
+        if vaf is not None:
+            metric_parts.append(f"VAF={vaf:.2f}")
+        if snr is not None:
+            metric_parts.append(f"SNR={snr:.2f} dB")
+        metric_text = " | ".join(metric_parts)
+        header = f"Window {idx + 1} — T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
+        if metric_text:
+            header += f" | {metric_text}"
+        ax.set_title(header, fontweight='normal', pad=10)
+        ax.legend(loc="upper right", framealpha=0.95)
+
+    output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.png")
+    fig.savefig(output_path, dpi=300, facecolor='white')
+    plt.close(fig)
 
 def plot_vae_reconstruction(
     output_dir: str,
