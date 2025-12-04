@@ -280,6 +280,21 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             - 1.0
         )
         kld = 0.5 * kld
+        mask = outputs.get("warmup_mask")
+        if mask is not None:
+            valid = mask
+            if valid.dim() == 0:
+                valid = valid.view(1, 1, 1)
+            if valid.dim() == 1:
+                valid = valid.unsqueeze(0).unsqueeze(-1)
+            elif valid.dim() == 2:
+                valid = valid.unsqueeze(-1)
+            valid = valid.to(device=kld.device, dtype=torch.bool)
+            if valid.size(0) == 1 and kld.size(0) > 1:
+                valid = valid.expand(kld.size(0), -1, -1)
+            if valid.size(-1) == 1 and kld.size(-1) > 1:
+                valid = valid.expand(-1, -1, kld.size(-1))
+            kld = kld.masked_fill(~valid, float("nan"))
         return kld
 
     @staticmethod
