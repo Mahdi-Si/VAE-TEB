@@ -1313,6 +1313,7 @@ class SeqVae(nn.Module):
         return mu + eps * std
 
     def _kld_loss(
+        self,
         mu_prior: torch.Tensor,
         logvar_prior: torch.Tensor,
         mu_post: torch.Tensor,
