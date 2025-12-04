@@ -1246,6 +1246,7 @@ class SeqVae(nn.Module):
 
         linear_output, mu_pr, logvar_pr = self.decoder(z)
         linear_output = linear_output.view(linear_output.shape[0], 300, 40, 30).mean(dim=-1)
+        warmup_mask = self._build_warmup_valid_mask(z.size(1), device=z.device)
         return {
             "z": z,  # (B, T, latent_dim_z)
             "linear_output": linear_output,
@@ -1255,6 +1256,7 @@ class SeqVae(nn.Module):
             "logvar_prior": logvar_y_prior,  # (B, T, latent_dim_target)
             "mu_post": mu_post,  # (B, T, latent_dim_z)
             "logvar_post": logvar_post,  # (B, T, latent_dim_z)
+            "warmup_mask": warmup_mask,  # (T,)
         }
 
     def encode_only(
@@ -1277,7 +1279,6 @@ class SeqVae(nn.Module):
             "z": z,
         }
 
-    @staticmethod
     def measure_transfer_entropy(
         self,
         y_st: torch.Tensor,
@@ -1289,14 +1290,21 @@ class SeqVae(nn.Module):
         self.eval()
         with torch.no_grad():
             enc = self.encode_only(y_st=y_st, y_ph=y_ph, x_ph=x_ph, sample_z=True)
-            kld = self._kld_loss(
+            if reduce_mean:
+                return self._kld_loss(
+                    mu_prior=enc["mu_prior"],
+                    logvar_prior=enc["logvar_prior"],
+                    mu_post=enc["mu_post"],
+                    logvar_post=enc["logvar_post"],
+                    reduce_mean=True,
+                )
+            return self.kld_tensor(
                 mu_prior=enc["mu_prior"],
                 logvar_prior=enc["logvar_prior"],
                 mu_post=enc["mu_post"],
                 logvar_post=enc["logvar_post"],
-                reduce_mean=reduce_mean,
+                mask_warmup=True,
             )
-        return kld
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -1304,7 +1312,6 @@ class SeqVae(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    @staticmethod
     def _kld_loss(
         mu_prior: torch.Tensor,
         logvar_prior: torch.Tensor,
@@ -1313,13 +1320,18 @@ class SeqVae(nn.Module):
         *,
         reduce_mean: bool = True,
     ) -> torch.Tensor:
-        kld = (
-            logvar_prior
-            - logvar_post
-            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
-            - 1.0
+        kld = self.kld_tensor(
+            mu_prior=mu_prior,
+            logvar_prior=logvar_prior,
+            mu_post=mu_post,
+            logvar_post=logvar_post,
+            mask_warmup=False,
         )
-        kld = 0.5 * kld
+        warmup = self._warmup_steps(kld.size(1))
+        if warmup > 0:
+            if warmup >= kld.size(1):
+                return torch.zeros((), device=kld.device, dtype=kld.dtype)
+            kld = kld[:, warmup:, :]
         return kld.mean() if reduce_mean else kld.sum()
 
     @staticmethod
@@ -1390,6 +1402,47 @@ class SeqVae(nn.Module):
         avg = pred_sum / count.clamp_min(1.0)
         avg = avg.masked_fill(count == 0, float("nan"))
         return avg
+
+    def _warmup_steps(self, seq_len: int) -> int:
+        warmup = int(getattr(self, "warmup_period", 0) or 0)
+        if warmup <= 0:
+            return 0
+        return min(seq_len, warmup)
+
+    def _build_warmup_valid_mask(self, seq_len: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+        warmup = self._warmup_steps(seq_len)
+        if warmup > 0:
+            mask[:warmup] = False
+        return mask
+
+    def kld_tensor(
+        self,
+        mu_prior: torch.Tensor,
+        logvar_prior: torch.Tensor,
+        mu_post: torch.Tensor,
+        logvar_post: torch.Tensor,
+        *,
+        mask_warmup: bool = False,
+        fill_value: float = float("nan"),
+    ) -> torch.Tensor:
+        """Return per-timestep KLD with optional warmup masking."""
+        kld = (
+            logvar_prior
+            - logvar_post
+            + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+            - 1.0
+        )
+        kld = 0.5 * kld
+        if mask_warmup:
+            warmup = self._warmup_steps(kld.size(1))
+            if warmup > 0:
+                kld = kld.clone()
+                if math.isnan(fill_value):
+                    kld[:, :warmup, :] = float("nan")
+                else:
+                    kld[:, :warmup, :].fill_(fill_value)
+        return kld
 
 
     def compute_loss(
@@ -1485,30 +1538,11 @@ class SeqVae(nn.Module):
 
         kld_loss = torch.tensor(0.0, device=y_raw.device)
         if compute_kld_loss:
-            # Apply the same warmup/valid window to KL if possible
-            start_t = int(self.warmup_period)
-            if "mu_prior" in forward_outputs and "logvar_prior" in forward_outputs:
-                mu_prior = forward_outputs["mu_prior"]
-                logvar_prior = forward_outputs["logvar_prior"]
-                mu_post = forward_outputs["mu_post"]
-                logvar_post = forward_outputs["logvar_post"]
-
-                if mu_prior.dim() == 3 and mu_prior.size(1) > start_t:
-                    mu_prior = mu_prior[:, start_t:, :]
-                    logvar_prior = logvar_prior[:, start_t:, :]
-                    mu_post = mu_post[:, start_t:, :]
-                    logvar_post = logvar_post[:, start_t:, :]
-            else:
-                mu_prior = forward_outputs["mu_prior"]
-                logvar_prior = forward_outputs["logvar_prior"]
-                mu_post = forward_outputs["mu_post"]
-                logvar_post = forward_outputs["logvar_post"]
-
             kld_loss = self._kld_loss(
-                mu_prior=mu_prior,
-                logvar_prior=logvar_prior,
-                mu_post=mu_post,
-                logvar_post=logvar_post,
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"],
                 reduce_mean=True,
             )
 
