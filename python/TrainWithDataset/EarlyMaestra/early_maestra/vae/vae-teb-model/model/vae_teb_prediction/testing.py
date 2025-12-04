@@ -327,7 +327,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         dims = tuple(range(1, tensor.ndim))
         if not dims:
             return tensor
-        return tensor.mean(dim=dims)
+        return torch.nanmean(tensor, dim=dims)
 
     @staticmethod
     def _average_raw_prediction_segments(
@@ -477,7 +477,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     else:
                         kld_sample = kld_tensor[0]
                         kld_tensor_np = kld_sample.detach().cpu().numpy().T
-                        kld_mean_np = kld_sample.mean(dim=-1).detach().cpu().numpy()
+                        kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
 
                     fhr_norm = y_raw[0]
                     up_norm = up_raw[0]
