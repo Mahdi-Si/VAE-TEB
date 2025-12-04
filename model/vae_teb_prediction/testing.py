@@ -154,13 +154,32 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             logger.error("No metrics were collected; check the dataloader and model outputs.")
             return
 
+        def _finite_only(values: List[float]) -> List[float]:
+            if not values:
+                return []
+            arr = np.asarray(values, dtype=float)
+            mask = np.isfinite(arr)
+            return arr[mask].tolist()
+
+        vaf_values = _finite_only(vaf_values)
+        mse_values = _finite_only(mse_values)
+        snr_values = _finite_only(snr_values)
+        kld_values = _finite_only(kld_values)
+
+        if not any((vaf_values, mse_values, snr_values, kld_values)):
+            logger.error("All histogram metrics are NaN/invalid; cannot plot.")
+            return
+
+        def _safe_mean(values: List[float]) -> float:
+            return float(np.mean(values)) if values else float("nan")
+
         logger.info(
             "Histogram metrics collected for %d samples (VAF mean=%.4f, MSE mean=%.6f, SNR mean=%.2f dB, KLD mean=%.6f)",
             len(vaf_values),
-            float(np.mean(vaf_values)),
-            float(np.mean(mse_values)),
-            float(np.mean(snr_values)),
-            float(np.mean(kld_values)),
+            _safe_mean(vaf_values),
+            _safe_mean(mse_values),
+            _safe_mean(snr_values),
+            _safe_mean(kld_values),
         )
 
         plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, output_dir)
