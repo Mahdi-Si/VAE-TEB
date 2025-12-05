@@ -285,7 +285,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
     @staticmethod
     def _kld_tensor_from_forward(outputs: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
-        """Return the unreduced KLD tensor for downstream analysis."""
+        """Return the unreduced KLD tensor for downstream analysis with warmup masking applied."""
         mu_prior = outputs.get("mu_prior")
         logvar_prior = outputs.get("logvar_prior")
         mu_post = outputs.get("mu_post")
@@ -315,6 +315,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 valid = valid.expand(-1, -1, kld.size(-1))
             kld = kld.masked_fill(~valid, float("nan"))
         return kld
+
+    @staticmethod
+    def _compute_aligned_kld_mean(kld_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Compute mean KLD over latent dimensions while preserving warmup NaN alignment.
+
+        Args:
+            kld_tensor: KLD tensor of shape (B, T, D) where warmup timesteps are NaN
+
+        Returns:
+            Mean KLD of shape (B, T) with NaN preserved for warmup timesteps
+        """
+        # Take mean over latent dimension (dim=-1)
+        # nanmean will return NaN if all values in a timestep are NaN (warmup period)
+        kld_mean = torch.nanmean(kld_tensor, dim=-1)
+        return kld_mean
 
     @staticmethod
     def _kld_from_forward(outputs: Dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
@@ -478,9 +494,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         kld_tensor_np = np.zeros((latent.shape[-1], y_st.shape[1]))
                         kld_mean_np = np.zeros(y_st.shape[1])
                     else:
-                        kld_sample = kld_tensor[0]
-                        kld_tensor_np = kld_sample.detach().cpu().numpy().T
-                        kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
+                        kld_sample = kld_tensor[0]  # (T, D)
+                        kld_tensor_np = kld_sample.detach().cpu().numpy().T  # (D, T)
+                        # Compute aligned mean - preserves NaN for warmup timesteps
+                        kld_mean_np = self._compute_aligned_kld_mean(kld_sample.unsqueeze(0))[0].detach().cpu().numpy()  # (T,)
 
                     fhr_norm = y_raw[0]
                     up_norm = up_raw[0]

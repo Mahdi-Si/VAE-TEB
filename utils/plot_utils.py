@@ -14,8 +14,8 @@ def plot_model_analysis(
     latent_z: np.ndarray = None,
     reconstructed_fhr_mu: np.ndarray = None,
     reconstructed_fhr_logvar: np.ndarray = None,
-    kld_tensor: np.ndarray = None,
-    kld_mean_over_channels: np.ndarray = None,
+    kld_tensor: np.ndarray = None,  # Shape: (D, T) - latent dims × time, with warmup masked as NaN
+    kld_mean_over_channels: np.ndarray = None,  # Shape: (T,) - mean over latent dims, warmup preserved as NaN
     batch_idx: int = 0,
     # New parameters for training callback
     y_raw_normalized: np.ndarray = None,
@@ -52,8 +52,10 @@ def plot_model_analysis(
         latent_z (np.ndarray): Latent space representation z. Shape: (D, L).
         reconstructed_fhr_mu (np.ndarray): Mean of the reconstructed FHR. Shape: (N,).
         reconstructed_fhr_logvar (np.ndarray): Log variance of the reconstructed FHR. Shape: (N,).
-        kld_tensor (np.ndarray): KLD tensor. Shape: (D, L).
-        kld_mean_over_channels (np.ndarray): KLD mean over channels. Shape: (L,).
+        kld_tensor (np.ndarray): KLD tensor. Shape: (D, T) where D=latent dimensions, T=time steps.
+            Warmup period should be masked as NaN: kld_tensor[:, 0:warmup] = NaN.
+        kld_mean_over_channels (np.ndarray): KLD mean over latent dimensions. Shape: (T,).
+            Must be aligned with kld_tensor time axis, preserving NaN for warmup period.
         batch_idx (int): Index of the sample in the batch for file naming.
         # Training callback mode parameters
         y_raw_normalized (np.ndarray): Normalized raw FHR signal. Shape: (4800,).
@@ -268,13 +270,27 @@ def plot_model_analysis(
                 ax[2, 0].text(0.5, -0.15, loss_text, transform=ax[2, 0].transAxes, ha='center',
                            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
-        # 4. Latent Space z
+        # 4. Latent Space z with warmup alignment
         if latent_z is not None:
             imgplot = ax[3, 0].imshow(latent_z.T, aspect='auto', cmap='bwr', origin='lower')
-            
+
             # Remove grid lines from imshow plot
             ax[3, 0].grid(False)
-            
+
+            # Mark warmup boundary if applicable (check for leading NaN columns)
+            # latent_z shape is (D, T) so we check columns
+            if np.any(np.isnan(latent_z)):
+                leading_nan_cols = 0
+                while (
+                    leading_nan_cols < latent_z.shape[1]
+                    and np.all(np.isnan(latent_z[:, leading_nan_cols]))
+                ):
+                    leading_nan_cols += 1
+                if leading_nan_cols > 0:
+                    ax[3, 0].axvline(x=leading_nan_cols - 0.5, color='white', linestyle='--',
+                                   linewidth=2, alpha=0.8, label='Warmup end')
+                    ax[3, 0].legend(loc='upper right', framealpha=0.95, fontsize=9)
+
             ax[3, 1].set_axis_on()
             cbar = fig.colorbar(imgplot, cax=ax[3, 1])
             cbar.ax.tick_params(labelsize=10, colors='#666666')
@@ -284,7 +300,7 @@ def plot_model_analysis(
             ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
             ax[3, 0].set_xlabel('Time Steps', fontweight='normal')
             ax[3, 0].set_title('Latent Space Representation', fontweight='normal', pad=12)
-            
+
             # Add KLD mean to latent space plot
             if loss_dict:
                 loss_text = f"KLD Mean: {kld_mean_value:.4f} | Epoch: {epoch}"
@@ -309,32 +325,51 @@ def plot_model_analysis(
         ax[0].legend()
         ax[0].autoscale(enable=True, axis='x', tight=True)
 
-        # Calculate KLD mean for display in original mode (ignore NaN warmup gaps)
+        # ===== KLD Alignment Strategy =====
+        # The KLD tensor has shape (D, T) where D=latent_dim, T=time_steps
+        # During warmup period, all elements are masked to NaN: kld_tensor[:, 0:warmup] = NaN
+        # The mean trace should:
+        # 1. Have the same length T as the tensor
+        # 2. Preserve NaN values for warmup timesteps (where all latent dims are NaN)
+        # 3. Have finite values after warmup (mean of KLD across latent dimensions)
+        # This ensures x-axis alignment between the heatmap and line plot
+        # ===================================
         kld_trace = None
         if kld_mean_over_channels is not None:
             kld_trace = np.asarray(kld_mean_over_channels, dtype=float)
             if kld_tensor is not None:
-                tensor_len = kld_tensor.shape[1]
+                # Align trace length with tensor time dimension (columns in tensor)
+                tensor_len = kld_tensor.shape[1]  # Time steps
                 trace_len = kld_trace.shape[0]
+
+                # Ensure lengths match
                 if trace_len < tensor_len:
+                    # Pad at the beginning with NaN
                     pad = np.full(tensor_len - trace_len, np.nan, dtype=float)
                     kld_trace = np.concatenate([pad, kld_trace], axis=0)
                 elif trace_len > tensor_len:
+                    # Take the last tensor_len elements
                     kld_trace = kld_trace[-tensor_len:]
+
+                # Count warmup period: leading timesteps where ALL latent dims are NaN
                 leading_nan_cols = 0
                 while (
                     leading_nan_cols < tensor_len
                     and np.all(np.isnan(kld_tensor[:, leading_nan_cols]))
                 ):
                     leading_nan_cols += 1
+
+                # Ensure warmup period in trace also has NaN
                 if leading_nan_cols > 0:
                     kld_trace = kld_trace.copy()
                     kld_trace[:leading_nan_cols] = np.nan
+
             finite_mask = np.isfinite(kld_trace)
             kld_overall_mean = float(np.nanmean(kld_trace)) if np.any(finite_mask) else 0.0
         else:
             kld_overall_mean = 0.0
             if kld_tensor is not None:
+                # Create NaN-filled trace matching tensor length
                 kld_trace = np.full(kld_tensor.shape[1], np.nan, dtype=float)
         
         # 2. FHR Reconstruction with Uncertainty
@@ -360,24 +395,46 @@ def plot_model_analysis(
         ax[2].set_ylabel('Latent Dimensions')
         fig.colorbar(im_z, ax=ax[2])
 
-        # 4. KLD Tensor
+        # 4. KLD Tensor with warmup boundary
         im_kld = ax[3].imshow(kld_tensor, aspect='auto', cmap='bwr', origin='lower')
         ax[3].grid(False)  # Remove grid lines
         ax[3].set_title(f'KLD Tensor (Mean: {kld_overall_mean:.4f})')
         ax[3].set_xlabel('Time Steps')
         ax[3].set_ylabel('Latent Dimensions')
+        # Mark warmup period boundary
+        leading_nan_cols = 0
+        while (
+            leading_nan_cols < kld_tensor.shape[1]
+            and np.all(np.isnan(kld_tensor[:, leading_nan_cols]))
+        ):
+            leading_nan_cols += 1
+        if leading_nan_cols > 0:
+            ax[3].axvline(x=leading_nan_cols - 0.5, color='white', linestyle='--', linewidth=2, alpha=0.8, label='Warmup end')
+            ax[3].legend(loc='upper right', framealpha=0.95, fontsize=9)
         fig.colorbar(im_kld, ax=ax[3])
 
-        # 5. Mean KLD over time
+        # 5. Mean KLD over time (aligned with tensor x-axis)
         trace_for_plot = None
         if kld_trace is not None:
             trace_for_plot = kld_trace
         elif kld_mean_over_channels is not None:
             trace_for_plot = np.asarray(kld_mean_over_channels, dtype=float)
         if trace_for_plot is not None:
+            # Use same x-axis as tensor for proper alignment
             t_latent = np.arange(trace_for_plot.shape[0])
             ax[4].plot(t_latent, trace_for_plot, color=colors['kld'], linewidth=1.5)
-        ax[4].set_title(f'Mean KLD Across Channels (Overall Mean: {kld_overall_mean:.4f})')
+            # Highlight warmup period with shading if present
+            if kld_tensor is not None:
+                leading_nan_cols = 0
+                while (
+                    leading_nan_cols < kld_tensor.shape[1]
+                    and np.all(np.isnan(kld_tensor[:, leading_nan_cols]))
+                ):
+                    leading_nan_cols += 1
+                if leading_nan_cols > 0:
+                    ax[4].axvspan(0, leading_nan_cols, alpha=0.15, color='gray', label='Warmup')
+                    ax[4].legend(loc='upper right', framealpha=0.95, fontsize=9)
+        ax[4].set_title(f'Mean KLD Across Latent Dimensions (Overall Mean: {kld_overall_mean:.4f})')
         ax[4].set_xlabel('Time Steps')
         ax[4].set_ylabel('KLD')
         ax[4].autoscale(enable=True, axis='x', tight=True)
