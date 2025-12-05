@@ -310,14 +310,32 @@ def plot_model_analysis(
         ax[0].autoscale(enable=True, axis='x', tight=True)
 
         # Calculate KLD mean for display in original mode (ignore NaN warmup gaps)
+        kld_trace = None
         if kld_mean_over_channels is not None:
-            finite_mask = np.isfinite(kld_mean_over_channels)
-            if np.any(finite_mask):
-                kld_overall_mean = float(np.nanmean(kld_mean_over_channels))
-            else:
-                kld_overall_mean = 0.0
+            kld_trace = np.asarray(kld_mean_over_channels, dtype=float)
+            if kld_tensor is not None:
+                tensor_len = kld_tensor.shape[1]
+                trace_len = kld_trace.shape[0]
+                if trace_len < tensor_len:
+                    pad = np.full(tensor_len - trace_len, np.nan, dtype=float)
+                    kld_trace = np.concatenate([pad, kld_trace], axis=0)
+                elif trace_len > tensor_len:
+                    kld_trace = kld_trace[-tensor_len:]
+                leading_nan_cols = 0
+                while (
+                    leading_nan_cols < tensor_len
+                    and np.all(np.isnan(kld_tensor[:, leading_nan_cols]))
+                ):
+                    leading_nan_cols += 1
+                if leading_nan_cols > 0:
+                    kld_trace = kld_trace.copy()
+                    kld_trace[:leading_nan_cols] = np.nan
+            finite_mask = np.isfinite(kld_trace)
+            kld_overall_mean = float(np.nanmean(kld_trace)) if np.any(finite_mask) else 0.0
         else:
             kld_overall_mean = 0.0
+            if kld_tensor is not None:
+                kld_trace = np.full(kld_tensor.shape[1], np.nan, dtype=float)
         
         # 2. FHR Reconstruction with Uncertainty
         # Use normalized FHR for reconstruction comparison if available, otherwise use raw_fhr
@@ -351,8 +369,14 @@ def plot_model_analysis(
         fig.colorbar(im_kld, ax=ax[3])
 
         # 5. Mean KLD over time
-        t_latent = np.arange(kld_mean_over_channels.shape[0])
-        ax[4].plot(t_latent, kld_mean_over_channels, color=colors['kld'], linewidth=1.5)
+        trace_for_plot = None
+        if kld_trace is not None:
+            trace_for_plot = kld_trace
+        elif kld_mean_over_channels is not None:
+            trace_for_plot = np.asarray(kld_mean_over_channels, dtype=float)
+        if trace_for_plot is not None:
+            t_latent = np.arange(trace_for_plot.shape[0])
+            ax[4].plot(t_latent, trace_for_plot, color=colors['kld'], linewidth=1.5)
         ax[4].set_title(f'Mean KLD Across Channels (Overall Mean: {kld_overall_mean:.4f})')
         ax[4].set_xlabel('Time Steps')
         ax[4].set_ylabel('KLD')
