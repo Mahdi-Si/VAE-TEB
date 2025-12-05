@@ -1333,7 +1333,12 @@ class SeqVae(nn.Module):
             if warmup >= kld.size(1):
                 return torch.zeros((), device=kld.device, dtype=kld.dtype)
             kld = kld[:, warmup:, :]
-        return kld.mean() if reduce_mean else kld.sum()
+        if reduce_mean:
+            mean_val = torch.nanmean(kld)
+            if torch.isnan(mean_val):
+                return torch.zeros((), device=kld.device, dtype=kld.dtype)
+            return mean_val
+        return torch.nan_to_num(kld).sum()
 
     @staticmethod
     def gaussian_nll(
