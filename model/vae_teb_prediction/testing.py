@@ -465,10 +465,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         y_raw=y_raw,
                         beta=beta_value,
                     )
-                    loss_floats = {
-                        key: float(val.detach().cpu().item()) if isinstance(val, torch.Tensor) else float(val)
-                        for key, val in loss_dict.items()
-                    }
+                    loss_floats = {}
+                    for key, val in loss_dict.items():
+                        if isinstance(val, torch.Tensor):
+                            scalar = torch.nan_to_num(val.detach()).cpu().item()
+                        else:
+                            scalar = float(val)
+                        loss_floats[key] = scalar
 
                     kld_tensor = self._kld_tensor_from_forward(forward_outputs)
                     if kld_tensor is None:
