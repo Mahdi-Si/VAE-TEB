@@ -309,8 +309,15 @@ def plot_model_analysis(
         ax[0].legend()
         ax[0].autoscale(enable=True, axis='x', tight=True)
 
-        # Calculate KLD mean for display in original mode
-        kld_overall_mean = np.mean(kld_mean_over_channels) if kld_mean_over_channels is not None else 0
+        # Calculate KLD mean for display in original mode (ignore NaN warmup gaps)
+        if kld_mean_over_channels is not None:
+            finite_mask = np.isfinite(kld_mean_over_channels)
+            if np.any(finite_mask):
+                kld_overall_mean = float(np.nanmean(kld_mean_over_channels))
+            else:
+                kld_overall_mean = 0.0
+        else:
+            kld_overall_mean = 0.0
         
         # 2. FHR Reconstruction with Uncertainty
         # Use normalized FHR for reconstruction comparison if available, otherwise use raw_fhr
