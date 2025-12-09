@@ -299,7 +299,7 @@ class CombinedHDF5Dataset(Dataset):
     """
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
     
-    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+    With Scattering transform (J=11, Q=4, T=16):
     - FHR scattering: 43 coefficients (first order)
     - FHR phase: 44 selected coefficients (95.1% reduction)
     - FHR-UP cross-phase: 130 selected coefficients (UP→FHR coupling)

@@ -668,6 +668,156 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         else:
             logger.info("Single prediction probe saved %d samples to %s", processed, out_dir)
 
+    def run_temporal_accuracy_analysis(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 50,
+        start_index: int = 30,
+        max_timesteps: Optional[int] = None,
+    ) -> None:
+        """Analyze prediction accuracy as a function of position and timestep.
+
+        Generates two analyses:
+        1. Within-window: VAF/SNR vs position (0-480) within each prediction window
+        2. Across-timesteps: VAF/SNR vs timestep index across the recording
+
+        Args:
+            test_loader: DataLoader for test samples
+            num_samples: Number of samples to aggregate statistics over
+            start_index: Starting timestep (default: warmup_period)
+            max_timesteps: Maximum number of timesteps to analyze (None = all)
+        """
+        if num_samples <= 0:
+            logger.info("Temporal accuracy analysis skipped (num_samples<=0).")
+            return
+
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model unavailable; cannot run temporal accuracy analysis.")
+            return
+
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+
+        stride = int(getattr(model, "decimation_factor", 16))
+        warmup = int(getattr(model, "warmup_period", 30))
+        start_t = max(start_index, warmup)
+
+        out_dir = Path(self.test_results_dir) / "temporal_accuracy"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_predictions: List[torch.Tensor] = []
+        all_targets: List[torch.Tensor] = []
+        processed = 0
+
+        with torch.inference_mode():
+            for batch in test_loader:
+                if processed >= num_samples:
+                    break
+
+                y_st = batch.fhr_st.to(device)
+                y_ph = batch.fhr_ph.to(device)
+                x_ph = batch.fhr_up_ph.to(device)
+                y_raw = batch.fhr.to(device)
+
+                forward_outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                mu_pr = forward_outputs.get("mu_pr")
+
+                if mu_pr is None:
+                    logger.warning("Model outputs missing 'mu_pr'; skipping batch.")
+                    continue
+
+                batch_size = mu_pr.size(0)
+                T = mu_pr.size(1)
+                H = mu_pr.size(2)
+                end_t = T if max_timesteps is None else min(T, start_t + max_timesteps)
+
+                for idx in range(batch_size):
+                    if processed >= num_samples:
+                        break
+
+                    sample_preds: List[torch.Tensor] = []
+                    sample_targets: List[torch.Tensor] = []
+
+                    for t in range(start_t, end_t):
+                        raw_start = t * stride
+                        raw_end = raw_start + H
+
+                        if raw_end > y_raw.size(1):
+                            break
+
+                        pred = mu_pr[idx, t, :]
+                        target = y_raw[idx, raw_start:raw_end]
+
+                        sample_preds.append(pred)
+                        sample_targets.append(target)
+
+                    if sample_preds:
+                        all_predictions.append(torch.stack(sample_preds))
+                        all_targets.append(torch.stack(sample_targets))
+                        processed += 1
+
+        if not all_predictions:
+            logger.warning("No valid predictions collected for temporal accuracy analysis.")
+            return
+
+        all_predictions_tensor = torch.stack(all_predictions)
+        all_targets_tensor = torch.stack(all_targets)
+
+        N, T_prime, H = all_predictions_tensor.shape
+        logger.info(
+            "Collected %d samples with %d timesteps each (horizon=%d)",
+            N, T_prime, H
+        )
+
+        preds_flat = all_predictions_tensor.view(N * T_prime, H)
+        targets_flat = all_targets_tensor.view(N * T_prime, H)
+
+        position_vaf: List[float] = []
+        position_snr: List[float] = []
+
+        logger.info("Computing within-window metrics (position 0-%d)...", H)
+        for pos in range(H):
+            metrics = self._compute_basic_metrics(
+                targets_flat[:, pos:pos+1],
+                preds_flat[:, pos:pos+1],
+            )
+            if metrics is not None:
+                position_vaf.append(metrics['vaf'].mean().item())
+                position_snr.append(metrics['snr'].mean().item())
+            else:
+                position_vaf.append(float('nan'))
+                position_snr.append(float('nan'))
+
+        timestep_vaf: List[float] = []
+        timestep_snr: List[float] = []
+
+        logger.info("Computing across-timesteps metrics (timesteps %d-%d)...", start_t, start_t + T_prime)
+        for t_idx in range(T_prime):
+            metrics = self._compute_basic_metrics(
+                all_targets_tensor[:, t_idx, :],
+                all_predictions_tensor[:, t_idx, :],
+            )
+            if metrics is not None:
+                timestep_vaf.append(metrics['vaf'].mean().item())
+                timestep_snr.append(metrics['snr'].mean().item())
+            else:
+                timestep_vaf.append(float('nan'))
+                timestep_snr.append(float('nan'))
+
+        self._plot_within_window_analysis(position_vaf, position_snr, out_dir)
+        self._plot_across_timesteps_analysis(timestep_vaf, timestep_snr, start_t, out_dir)
+
+        logger.info(
+            "Temporal accuracy analysis complete: %d samples, saved to %s",
+            processed, out_dir
+        )
+
     def run_latent_interpolation(self, test_loader, *, pair_count: int = 10, steps: int = 11) -> None:
         """Decode linear latent blends and export animated Matplotlib HTML dashboards."""
         if pair_count <= 0 or steps < 2:
@@ -1390,6 +1540,65 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         return np.clip(arr, -clip_val, clip_val)
 
     @staticmethod
+    def _plot_within_window_analysis(
+        vaf_values: List[float],
+        snr_values: List[float],
+        output_dir: Path,
+    ) -> None:
+        """Plot VAF and SNR vs position within 480-sample prediction window."""
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+        ax1.plot(range(len(vaf_values)), vaf_values, linewidth=1.5, color='#2E86AB')
+        ax1.set_xlabel('Position in Window (samples)', fontsize=11)
+        ax1.set_ylabel('VAF', fontsize=11)
+        ax1.set_title('Prediction Quality vs Position Within Prediction Window', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim([0, 1])
+
+        ax2.plot(range(len(snr_values)), snr_values, linewidth=1.5, color='#A23B72')
+        ax2.set_xlabel('Position in Window (samples)', fontsize=11)
+        ax2.set_ylabel('SNR (dB)', fontsize=11)
+        ax2.set_title('SNR vs Position Within Prediction Window', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        output_path = output_dir / 'temporal_accuracy_within_window.png'
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+        logger.info("Saved within-window analysis plot to %s", output_path)
+
+    @staticmethod
+    def _plot_across_timesteps_analysis(
+        vaf_values: List[float],
+        snr_values: List[float],
+        start_timestep: int,
+        output_dir: Path,
+    ) -> None:
+        """Plot VAF and SNR vs timestep index across recording."""
+        timestep_indices = list(range(start_timestep, start_timestep + len(vaf_values)))
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+        ax1.plot(timestep_indices, vaf_values, linewidth=1.5, color='#2E86AB')
+        ax1.set_xlabel('Timestep Index', fontsize=11)
+        ax1.set_ylabel('VAF', fontsize=11)
+        ax1.set_title('Prediction Quality vs Timestep in Recording', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim([0, 1])
+
+        ax2.plot(timestep_indices, snr_values, linewidth=1.5, color='#A23B72')
+        ax2.set_xlabel('Timestep Index', fontsize=11)
+        ax2.set_ylabel('SNR (dB)', fontsize=11)
+        ax2.set_title('SNR vs Timestep in Recording', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        output_path = output_dir / 'temporal_accuracy_across_timesteps.png'
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+        logger.info("Saved across-timesteps analysis plot to %s", output_path)
+
+    @staticmethod
     def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
         metrics = ["vaf", "mse", "snr"]
         fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4), squeeze=False)
@@ -1489,6 +1698,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of non-overlapping windows to visualize per sample.",
     )
+    parser.add_argument(
+        "--temporal-accuracy-samples",
+        type=int,
+        default=480,
+        help="Samples for temporal accuracy analysis (0 = skip).",
+    )
     return parser.parse_args()
 
 
@@ -1554,6 +1769,7 @@ def main(
     single_pred_start: int = 20,
     single_pred_step: Optional[int] = 30,
     single_pred_windows: int = 4,
+    temporal_accuracy_samples: int = 480,
 ) -> None:
     config_path = Path(config)
     config_data = load_config(config_path)
@@ -1584,6 +1800,11 @@ def main(
             start_index=single_pred_start,
             step_size=single_pred_step,
             windows_per_sample=single_pred_windows,
+        )
+    if temporal_accuracy_samples and temporal_accuracy_samples > 0:
+        tester.run_temporal_accuracy_analysis(
+            test_loader,
+            num_samples=temporal_accuracy_samples,
         )
     # if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
     #     tester.run_histogram_test(

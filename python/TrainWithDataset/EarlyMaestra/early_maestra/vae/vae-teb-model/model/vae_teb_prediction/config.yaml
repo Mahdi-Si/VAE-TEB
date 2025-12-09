@@ -28,6 +28,40 @@ model_config:
 
   core_model_checkpoint: null
 
+  classifier:
+    vae_checkpoint: /path/to/your/trained/vae/checkpoint.ckpt
+    type: lstm
+    latent_dim: 16
+    num_classes: 2
+    freeze_vae: true
+    use_posterior: true
+    sample_latent: false
+
+    # Classifier architecture parameters
+    hidden_dim: 128         # Hidden dimension for LSTM/BiLSTM
+    num_layers: 2           # Number of layers
+    bidirectional: false    # For LSTM classifier
+    attn_dim: 64           # For BiLSTMAttention classifier
+    dropout: 0.1           # Dropout rate
+
+    # CNN-specific parameters
+    num_filters: 64        # For CNN classifier
+    kernel_sizes: [3, 5, 7]  # For CNN classifier
+
+    # Transformer-specific parameters
+    d_model: 128           # For Transformer classifier
+    n_heads: 4             # For Transformer classifier
+    dim_feedforward: 256   # For Transformer classifier
+    pooling: mean          # For Transformer classifier: 'mean' or 'cls'
+
+    # Evaluation settings
+    evaluation:
+      target_fpr: 0.05              # Target false positive rate for threshold determination (5%)
+      compute_both_thresholds: true  # Compute both epoch-level and GUID-level thresholds
+      generate_plots: true           # Generate comprehensive visualizations
+      max_gap_multiplier: 2.0        # For missing epoch filling: only fill gaps <= 2 * typical_interval
+      # Note: Time bins and windows are computed dynamically from actual epoch data
+
 
 dataset_config:
     vae_train_datasets:
@@ -42,6 +76,15 @@ dataset_config:
 #      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
 
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+    # K-Fold Cross-Validation Configuration (for classifier training)
+    # Label mapping: healthy → target 1 → class 0, acidosis/HIE → target 2/3 → class 1
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    # These will be populated dynamically by kfold_classifier_trainer.py for each fold
+    classifier_train_datasets: []  # Populated per fold (train/*.hdf5)
+    classifier_val_datasets: []    # Populated per fold (val/*.hdf5)
+    classifier_test_datasets: []   # Populated per fold (test/*.hdf5)
 
     dataloader_config:
       num_workers: 0
