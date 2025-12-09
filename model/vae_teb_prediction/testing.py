@@ -783,16 +783,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
         logger.info("Computing within-window metrics (position 0-%d)...", H)
         for pos in range(H):
-            metrics = self._compute_basic_metrics(
-                targets_flat[:, pos:pos+1],
-                preds_flat[:, pos:pos+1],
-            )
-            if metrics is not None:
-                position_vaf.append(metrics['vaf'].mean().item())
-                position_snr.append(metrics['snr'].mean().item())
-            else:
-                position_vaf.append(float('nan'))
-                position_snr.append(float('nan'))
+            pred_at_pos = preds_flat[:, pos]
+            target_at_pos = targets_flat[:, pos]
+
+            residual = target_at_pos - pred_at_pos
+            mse = (residual ** 2).mean()
+            signal_power = (target_at_pos ** 2).mean()
+            noise_power = mse
+
+            var_res = residual.var(unbiased=False)
+            var_orig = target_at_pos.var(unbiased=False).clamp_min(1e-12)
+
+            snr = 10.0 * torch.log10(signal_power.clamp_min(1e-12) / noise_power.clamp_min(1e-12))
+            vaf = (1.0 - (var_res / var_orig)).clamp(0.0, 1.0)
+
+            position_vaf.append(vaf.item())
+            position_snr.append(snr.item())
 
         timestep_vaf: List[float] = []
         timestep_snr: List[float] = []
