@@ -17,7 +17,8 @@ import torch
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
+from lightning.pytorch.loggers import MLFlowLogger
 from loguru import logger
 import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -52,6 +53,48 @@ def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
             logger.warning(f"Split directory not found: {split_dir}")
 
     return datasets
+
+
+def create_mlflow_logger_from_config(
+    config_data: Optional[Dict],
+    run_name: str,
+    extra_tags: Optional[Dict[str, str]] = None,
+) -> Optional[MLFlowLogger]:
+    """
+    Build an MLflow logger (outside Lightning) using the base configuration.
+    """
+    if not config_data:
+        return None
+
+    mlflow_cfg = (
+        config_data.get('advanced_config', {})
+        .get('tracking', {})
+        .get('mlflow', {})
+        or {}
+    )
+    if not mlflow_cfg.get('enabled'):
+        return None
+
+    general_cfg = config_data.get('general_config', {})
+    tags = dict(mlflow_cfg.get('tags') or {})
+    if extra_tags:
+        tags.update({k: str(v) for k, v in extra_tags.items()})
+
+    save_dir = (
+        general_cfg.get('folders_config', {}).get('out_dir_base')
+        or os.getcwd()
+    )
+
+    return MLFlowLogger(
+        experiment_name=mlflow_cfg.get('experiment_name')
+        or general_cfg.get('tag', 'kfold'),
+        run_name=run_name,
+        tracking_uri=mlflow_cfg.get('tracking_uri'),
+        artifact_location=mlflow_cfg.get('artifact_location'),
+        log_model=bool(mlflow_cfg.get('log_model', False)),
+        tags=tags or None,
+        save_dir=save_dir,
+    )
 
 
 def train_single_fold(
@@ -89,7 +132,24 @@ def train_single_fold(
     config['dataset_config']['classifier_val_datasets'] = fold_datasets['val']
     config['dataset_config']['classifier_test_datasets'] = fold_datasets['test']
 
-    config['general_config']['cuda_devices'] = [gpu_id]
+    config['general_config']['cuda_devices'] = [0]
+
+    advanced_cfg = config.setdefault('advanced_config', {})
+    tracking_cfg = advanced_cfg.setdefault('tracking', {})
+    mlflow_cfg = tracking_cfg.setdefault('mlflow', {})
+    mlflow_tags = mlflow_cfg.get('tags') or {}
+    mlflow_tags.update({
+        'kfold.fold_id': str(fold_id),
+        'kfold.gpu_id': str(gpu_id),
+        'kfold.train_files': str(len(fold_datasets['train'])),
+        'kfold.val_files': str(len(fold_datasets['val'])),
+        'kfold.test_files': str(len(fold_datasets['test'])),
+        'kfold.base_path': str(kfold_base_path),
+    })
+    mlflow_cfg['tags'] = mlflow_tags
+    if not mlflow_cfg.get('run_name'):
+        experiment_tag = config['general_config'].get('tag', 'classifier')
+        mlflow_cfg['run_name'] = f"{experiment_tag}-fold{fold_id:02d}"
 
     fold_output_dir = Path(output_base_dir) / f"fold_{fold_id}"
     fold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -126,7 +186,7 @@ def train_single_fold(
     np.random.seed(42 + fold_id)
     torch.manual_seed(42 + fold_id)
 
-    # os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
     try:
         dataset_config = config.get('dataset_config')
@@ -181,6 +241,35 @@ def train_single_fold(
         best_ckpt_path = graph_model.checkpoint_callback.best_model_path
         logger.info(f"Fold {fold_id}: Best checkpoint path: {best_ckpt_path}")
 
+        mlflow_logger = getattr(graph_model, "mlflow_logger", None)
+
+        def _log_mlflow_metrics(metrics: Dict[str, float], step: Optional[int] = None):
+            if mlflow_logger is None or not metrics:
+                return
+            cleaned = {}
+            for key, value in metrics.items():
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                try:
+                    cleaned[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            if cleaned:
+                mlflow_logger.log_metrics(cleaned, step=step)
+
+        def _log_mlflow_artifact(path: Path | str, *, is_dir: bool = False):
+            if mlflow_logger is None or not path:
+                return
+            path_obj = Path(path)
+            if not path_obj.exists():
+                return
+            if is_dir:
+                mlflow_logger.experiment.log_artifacts(mlflow_logger.run_id, str(path_obj))
+            else:
+                mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(path_obj))
+
         # --------------------------------------------------------------------
         # POST-TRAINING EVALUATION
         # --------------------------------------------------------------------
@@ -188,7 +277,7 @@ def train_single_fold(
 
         from model.vae_teb_prediction.evaluate_classifier import evaluate_fold
 
-        device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
         
         eval_results = evaluate_fold(
             model=graph_model.pytorch_model,
@@ -227,6 +316,36 @@ def train_single_fold(
         logger.info(f"  Threshold: {results['threshold']:.4f}")
         logger.info(f"  Test accuracy: {results['test_accuracy']:.4f}")
         logger.info(f"  Test sensitivity: {results['test_sensitivity']:.4f}, specificity: {results['test_specificity']:.4f}")
+
+        _log_mlflow_metrics(
+            {
+                "train/training_time_minutes": training_time,
+                "val/best_accuracy": best_val_acc,
+                "val/best_loss": best_val_loss,
+            },
+            step=getattr(trainer, "global_step", None),
+        )
+        _log_mlflow_metrics(
+            {
+                "eval/threshold": results['threshold'],
+                "eval/val_accuracy": results['validation_accuracy'],
+                "eval/val_sensitivity": results['validation_sensitivity'],
+                "eval/val_specificity": results['validation_specificity'],
+                "eval/test_accuracy": results['test_accuracy'],
+                "eval/test_sensitivity": results['test_sensitivity'],
+                "eval/test_specificity": results['test_specificity'],
+                "eval/test_fpr": results['test_fpr'],
+            },
+            step=getattr(trainer, "global_step", None),
+        )
+
+        _log_mlflow_artifact(fold_config_path)
+        _log_mlflow_artifact(results_path)
+        if best_ckpt_path:
+            _log_mlflow_artifact(best_ckpt_path)
+        evaluation_dir = fold_output_dir / "evaluation"
+        if evaluation_dir.exists():
+            _log_mlflow_artifact(evaluation_dir, is_dir=True)
 
         return results
 
@@ -268,6 +387,11 @@ def run_kfold_parallel(
     """
     if max_parallel is None:
         max_parallel = len(gpu_ids)
+
+    base_cfg_data = None
+    if base_config_path and os.path.exists(base_config_path):
+        with open(base_config_path, 'r') as cfg_file:
+            base_cfg_data = yaml.safe_load(cfg_file)
 
     logger.info(f"Starting {num_folds}-fold cross-validation")
     logger.info(f"Using GPUs: {gpu_ids}")
@@ -359,6 +483,44 @@ def run_kfold_parallel(
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
 
+        experiment_tag = (
+            (base_cfg_data or {}).get('general_config', {}).get('tag', 'classifier')
+        )
+        summary_run_name = f"{experiment_tag}-kfold-summary-{time.strftime('%Y%m%d-%H%M%S')}"
+        summary_logger = create_mlflow_logger_from_config(
+            base_cfg_data,
+            run_name=summary_run_name,
+            extra_tags={
+                'kfold.summary': True,
+                'kfold.num_folds': num_folds,
+                'kfold.successful_folds': len(successful_folds),
+            },
+        )
+
+        if summary_logger:
+            summary_logger.log_metrics(
+                {
+                    "summary/successful_folds": len(successful_folds),
+                    "summary/failed_folds": num_folds - len(successful_folds),
+                    "summary/mean_val_accuracy": avg_val_acc_train,
+                    "summary/std_val_accuracy": std_val_acc_train,
+                    "summary/mean_test_accuracy": avg_test_acc,
+                    "summary/std_test_accuracy": std_test_acc,
+                    "summary/mean_test_sensitivity": avg_test_sens,
+                    "summary/std_test_sensitivity": std_test_sens,
+                    "summary/mean_test_specificity": avg_test_spec,
+                    "summary/std_test_specificity": std_test_spec,
+                    "summary/mean_test_fpr": avg_test_fpr,
+                    "summary/std_test_fpr": std_test_fpr,
+                }
+            )
+            summary_logger.experiment.log_artifact(
+                summary_logger.run_id, str(aggregated_results_path)
+            )
+            summary_logger.experiment.log_artifact(
+                summary_logger.run_id, str(summary_path)
+            )
+
         logger.info("=" * 80)
         logger.info("K-FOLD CROSS-VALIDATION SUMMARY")
         logger.info("=" * 80)
@@ -396,6 +558,18 @@ def run_kfold_parallel(
             logger.warning("K-fold results are still valid, but aggregated subgroup analysis is missing")
 
         logger.info("=" * 80)
+
+        if summary_logger:
+            aggregated_dir = Path(output_base_dir) / "aggregated"
+            if aggregated_dir.exists():
+                summary_logger.experiment.log_artifacts(
+                    summary_logger.run_id, str(aggregated_dir)
+                )
+            subgroup_dir = Path(output_base_dir) / "aggregated_analysis"
+            if subgroup_dir.exists():
+                summary_logger.experiment.log_artifacts(
+                    summary_logger.run_id, str(subgroup_dir)
+                )
 
     return all_results
 
