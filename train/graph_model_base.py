@@ -206,6 +206,22 @@ class GraphModelBase(ABC):
         """Run the full training loop using Lightning's Trainer."""
         raise NotImplementedError("Subclasses must implement train_base_model()")
 
+    def _validate_tracking_uri(self, uri: str) -> bool:
+        """Validate MLflow tracking URI."""
+        if not uri:
+            return False
+        # Basic validation
+        if uri.startswith(('http://', 'https://', 'file://', 'databricks://')):
+            return True
+        # Local file path
+        from pathlib import Path
+        try:
+            if Path(uri).parent.exists():
+                return True
+        except Exception:
+            pass
+        return False
+
     def _init_mlflow_logger(self) -> None:
         """Create an MLflow logger when enabled in the experiment config."""
         settings = self._mlflow_settings
@@ -214,31 +230,49 @@ class GraphModelBase(ABC):
             self.mlflow_logger = None
             self.lightning_loggers = []
             return
-        experiment_name = settings.get('experiment_name') or self.experiment_tag
-        run_name = settings.get('run_name') or self.base_folder
-        tracking_uri = settings.get('tracking_uri')
-        artifact_location = settings.get('artifact_location')
-        log_model = bool(settings.get('log_model', False))
-        tags = settings.get('tags') or None
-        self.mlflow_logger = MLFlowLogger(
-            experiment_name=experiment_name,
-            run_name=run_name,
-            tracking_uri=tracking_uri,
-            artifact_location=artifact_location,
-            log_model=log_model,
-            tags=tags,
-            save_dir=self.train_results_dir,
-        )
-        basic_params = {
-            "tag": self.experiment_tag,
-            "lr": self.lr,
-            "epochs": self.epochs_num,
-            "batch_size_train": self.batch_size_train,
-            "batch_size_test": self.batch_size_test,
-            "run_directory": self.train_results_dir,
-        }
-        self.mlflow_logger.log_hyperparams(basic_params)
-        self.lightning_loggers = [self.mlflow_logger]
+
+        try:
+            experiment_name = settings.get('experiment_name') or self.experiment_tag
+            run_name = settings.get('run_name') or self.base_folder
+            tracking_uri = settings.get('tracking_uri')
+
+            # Validate tracking URI if provided
+            if tracking_uri and not self._validate_tracking_uri(tracking_uri):
+                logger.warning(f"Invalid tracking URI: {tracking_uri}, using default")
+                tracking_uri = None
+
+            self.mlflow_logger = MLFlowLogger(
+                experiment_name=experiment_name,
+                run_name=run_name,
+                tracking_uri=tracking_uri,
+                artifact_location=settings.get('artifact_location'),
+                log_model=bool(settings.get('log_model', False)),
+                tags=settings.get('tags') or None,
+                save_dir=self.train_results_dir,
+            )
+
+            basic_params = {
+                "tag": self.experiment_tag,
+                "lr": self.lr,
+                "epochs": self.epochs_num,
+                "batch_size_train": self.batch_size_train,
+                "batch_size_test": self.batch_size_test,
+                "run_directory": self.train_results_dir,
+            }
+
+            try:
+                self.mlflow_logger.log_hyperparams(basic_params)
+            except Exception as e_params:
+                logger.warning(f"Failed to log hyperparameters: {e_params}")
+
+            self.lightning_loggers = [self.mlflow_logger]
+            logger.info(f"MLflow logger initialized successfully: {experiment_name}/{run_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize MLflow logger: {e}")
+            logger.warning("Continuing without MLflow logging")
+            self.mlflow_logger = None
+            self.lightning_loggers = []
 
 
 if __name__ == '__main__':

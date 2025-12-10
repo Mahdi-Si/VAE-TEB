@@ -11,10 +11,8 @@ Label mapping:
 """
 
 import os
-import sys
 import yaml
 import torch
-import subprocess
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -393,6 +391,8 @@ def run_kfold_parallel(
     output_base_dir: str,
     vae_checkpoint: str,
     max_parallel: int = None,
+    fold_ids: Optional[List[int]] = None,
+    sequential: bool = False,
     **kwargs
 ) -> List[Dict]:
     """
@@ -406,34 +406,53 @@ def run_kfold_parallel(
         output_base_dir: Base directory for saving results
         vae_checkpoint: Path to pre-trained VAE checkpoint
         max_parallel: Maximum number of parallel processes (defaults to len(gpu_ids))
+        fold_ids: Optional subset of folds to run (default: all 1..num_folds)
+        sequential: If True, run folds sequentially on GPUs instead of spawning processes
         **kwargs: Additional config overrides
 
     Returns:
         List of result dictionaries, one per fold
     """
+    if fold_ids is None:
+        selected_folds = list(range(1, num_folds + 1))
+    else:
+        selected_folds = sorted({int(fid) for fid in fold_ids})
+        invalid = [fid for fid in selected_folds if fid < 1 or fid > num_folds]
+        if invalid:
+            raise ValueError(f"Invalid fold IDs requested: {invalid} (valid range 1..{num_folds})")
+    if not selected_folds:
+        raise ValueError("No folds requested for execution.")
+
+    requested_fold_count = len(selected_folds)
+
     if max_parallel is None:
-        max_parallel = len(gpu_ids)
+        max_parallel = min(len(gpu_ids), requested_fold_count)
+    else:
+        max_parallel = max(1, min(max_parallel, requested_fold_count))
 
     base_cfg_data = None
     if base_config_path and os.path.exists(base_config_path):
         with open(base_config_path, 'r') as cfg_file:
             base_cfg_data = yaml.safe_load(cfg_file)
 
-    logger.info(f"Starting {num_folds}-fold cross-validation")
+    execution_mode = "parallel" if (not sequential and max_parallel > 1) else "sequential"
+
+    logger.info(f"Starting k-fold cross-validation (configured folds={num_folds})")
+    logger.info(f"Requested folds: {selected_folds}")
+    logger.info(f"Execution mode: {execution_mode}")
     logger.info(f"Using GPUs: {gpu_ids}")
-    logger.info(f"Max parallel folds: {max_parallel}")
+    if execution_mode == "parallel":
+        logger.info(f"Max parallel folds: {max_parallel}")
 
     Path(output_base_dir).mkdir(parents=True, exist_ok=True)
 
     all_results = []
 
-    with ProcessPoolExecutor(max_workers=max_parallel) as executor:
-        futures = {}
-        for fold_id in range(1, num_folds + 1):
-            gpu_id = gpu_ids[(fold_id - 1) % len(gpu_ids)]
-
-            future = executor.submit(
-                train_single_fold,
+    if sequential or max_parallel == 1:
+        logger.info("Running folds sequentially...")
+        for job_idx, fold_id in enumerate(selected_folds):
+            gpu_id = gpu_ids[job_idx % len(gpu_ids)]
+            result = train_single_fold(
                 fold_id=fold_id,
                 gpu_id=gpu_id,
                 base_config_path=base_config_path,
@@ -442,23 +461,42 @@ def run_kfold_parallel(
                 vae_checkpoint=vae_checkpoint,
                 **kwargs
             )
-            futures[future] = fold_id
+            all_results.append(result)
+            logger.info(f"Fold {fold_id} completed: {result}")
+    else:
+        logger.info("Running folds in parallel...")
+        with ProcessPoolExecutor(max_workers=max_parallel) as executor:
+            futures = {}
+            for job_idx, fold_id in enumerate(selected_folds):
+                gpu_id = gpu_ids[job_idx % len(gpu_ids)]
 
-        for future in as_completed(futures):
-            fold_id = futures[future]
-            try:
-                result = future.result()
-                all_results.append(result)
-                logger.info(f"Fold {fold_id} completed: {result}")
-            except Exception as e:
-                import traceback
-                logger.exception(f"Fold {fold_id} raised exception:")
-                all_results.append({
-                    'fold_id': fold_id,
-                    'status': 'failed',
-                    'error': str(e),
-                    'traceback': traceback.format_exc()
-                })
+                future = executor.submit(
+                    train_single_fold,
+                    fold_id=fold_id,
+                    gpu_id=gpu_id,
+                    base_config_path=base_config_path,
+                    kfold_base_path=kfold_base_path,
+                    output_base_dir=output_base_dir,
+                    vae_checkpoint=vae_checkpoint,
+                    **kwargs
+                )
+                futures[future] = fold_id
+
+            for future in as_completed(futures):
+                fold_id = futures[future]
+                try:
+                    result = future.result()
+                    all_results.append(result)
+                    logger.info(f"Fold {fold_id} completed: {result}")
+                except Exception as e:
+                    import traceback
+                    logger.exception(f"Fold {fold_id} raised exception:")
+                    all_results.append({
+                        'fold_id': fold_id,
+                        'status': 'failed',
+                        'error': str(e),
+                        'traceback': traceback.format_exc()
+                    })
 
     all_results.sort(key=lambda x: x['fold_id'])
 
@@ -489,9 +527,10 @@ def run_kfold_parallel(
         std_test_fpr = (sum((r['test_fpr'] - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
         summary = {
-            'num_folds': num_folds,
+            'configured_num_folds': num_folds,
+            'requested_folds': selected_folds,
             'successful_folds': len(successful_folds),
-            'failed_folds': num_folds - len(successful_folds),
+            'failed_folds': requested_fold_count - len(successful_folds),
             'training_metrics': {
                 'mean_val_accuracy': avg_val_acc_train,
                 'std_val_accuracy': std_val_acc_train,
@@ -522,7 +561,8 @@ def run_kfold_parallel(
             run_name=summary_run_name,
             extra_tags={
                 'kfold.summary': True,
-                'kfold.num_folds': num_folds,
+                'kfold.configured_num_folds': num_folds,
+                'kfold.requested_folds': selected_folds,
                 'kfold.successful_folds': len(successful_folds),
             },
         )
@@ -531,7 +571,7 @@ def run_kfold_parallel(
             summary_logger.log_metrics(
                 {
                     "summary/successful_folds": len(successful_folds),
-                    "summary/failed_folds": num_folds - len(successful_folds),
+                    "summary/failed_folds": requested_fold_count - len(successful_folds),
                     "summary/mean_val_accuracy": avg_val_acc_train,
                     "summary/std_val_accuracy": std_val_acc_train,
                     "summary/mean_test_accuracy": avg_test_acc,
@@ -554,9 +594,9 @@ def run_kfold_parallel(
         logger.info("=" * 80)
         logger.info("K-FOLD CROSS-VALIDATION SUMMARY")
         logger.info("=" * 80)
-        logger.info(f"Total folds: {num_folds}")
+        logger.info(f"Total requested folds: {requested_fold_count}")
         logger.info(f"Successful: {len(successful_folds)}")
-        logger.info(f"Failed: {num_folds - len(successful_folds)}")
+        logger.info(f"Failed: {requested_fold_count - len(successful_folds)}")
         logger.info("")
         logger.info("Training Metrics:")
         logger.info(f"  Mean validation accuracy: {avg_val_acc_train:.4f} ± {std_val_acc_train:.4f}")
@@ -568,39 +608,42 @@ def run_kfold_parallel(
         logger.info(f"  Mean FPR: {avg_test_fpr:.4f} ± {std_test_fpr:.4f}")
         logger.info("=" * 80)
 
-        # Run subgroup aggregation across all folds
-        logger.info("")
-        logger.info("=" * 80)
-        logger.info("RUNNING SUBGROUP AGGREGATION ACROSS FOLDS")
-        logger.info("=" * 80)
+        need_full_aggregation = (fold_ids is None)
+        if need_full_aggregation:
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("RUNNING SUBGROUP AGGREGATION ACROSS FOLDS")
+            logger.info("=" * 80)
 
-        try:
-            from model.vae_teb_prediction.evaluate_classifier import run_subgroup_aggregation
+            try:
+                from model.vae_teb_prediction.evaluate_classifier import run_subgroup_aggregation
 
-            run_subgroup_aggregation(
-                kfold_results_dir=output_base_dir,
-                num_folds=num_folds
-            )
-
-            logger.info("Subgroup aggregation completed successfully!")
-        except Exception as e:
-            import traceback
-            logger.exception("Subgroup aggregation failed:")
-            logger.warning("K-fold results are still valid, but aggregated subgroup analysis is missing")
-
-        logger.info("=" * 80)
-
-        if summary_logger:
-            aggregated_dir = Path(output_base_dir) / "aggregated"
-            if aggregated_dir.exists():
-                summary_logger.experiment.log_artifacts(
-                    summary_logger.run_id, str(aggregated_dir)
+                run_subgroup_aggregation(
+                    kfold_results_dir=output_base_dir,
+                    num_folds=num_folds
                 )
-            subgroup_dir = Path(output_base_dir) / "aggregated_analysis"
-            if subgroup_dir.exists():
-                summary_logger.experiment.log_artifacts(
-                    summary_logger.run_id, str(subgroup_dir)
-                )
+
+                logger.info("Subgroup aggregation completed successfully!")
+            except Exception as e:
+                import traceback
+                logger.exception("Subgroup aggregation failed:")
+                logger.warning("K-fold results are still valid, but aggregated subgroup analysis is missing")
+
+            logger.info("=" * 80)
+
+            if summary_logger:
+                aggregated_dir = Path(output_base_dir) / "aggregated"
+                if aggregated_dir.exists():
+                    summary_logger.experiment.log_artifacts(
+                        summary_logger.run_id, str(aggregated_dir)
+                    )
+                subgroup_dir = Path(output_base_dir) / "aggregated_analysis"
+                if subgroup_dir.exists():
+                    summary_logger.experiment.log_artifacts(
+                        summary_logger.run_id, str(subgroup_dir)
+                    )
+        else:
+            logger.info("Skipping aggregated subgroup analysis (disabled when running a subset of folds).")
 
     return all_results
 
@@ -619,7 +662,9 @@ def main():
 
     GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
     NUM_FOLDS = 10
-    MAX_PARALLEL = 8 
+    MAX_PARALLEL = 8
+    RUN_IN_PARALLEL = True  # Set to False to run folds sequentially
+    FOLDS_TO_RUN = None     # Example: [1, 3, 5] to run only specific folds
 
     if os.path.exists(BASE_CONFIG_PATH):
         with open(BASE_CONFIG_PATH, 'r') as f:
@@ -646,6 +691,8 @@ def main():
         output_base_dir=OUTPUT_BASE_DIR,
         vae_checkpoint=VAE_CHECKPOINT,
         max_parallel=MAX_PARALLEL,
+        fold_ids=FOLDS_TO_RUN,
+        sequential=not RUN_IN_PARALLEL,
     )
 
     logger.info("K-Fold Cross-Validation completed!")
