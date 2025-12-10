@@ -348,20 +348,36 @@ def train_single_fold(
 
         logger.info(f"Fold {fold_id}: Evaluation completed")
 
+        threshold_info = eval_results.get('threshold_info', {})
+        epoch_threshold_info = threshold_info.get('epoch_level', {})
+        guid_threshold_info = threshold_info.get('guid_level', {})
+
+        test_results = eval_results.get('test_results', {})
+        test_epoch_metrics = test_results.get('epoch_level', {}).get('epoch_metrics', {})
+        test_guid_metrics = test_results.get('guid_level', {}).get('guid_metrics', {})
+
         results = {
             'fold_id': fold_id,
             'gpu_id': gpu_id,
             'training_time_minutes': training_time,
             'best_val_accuracy_training': float(best_val_acc),
             'best_val_loss_training': float(best_val_loss),
-            'threshold': eval_results['validation_metrics']['threshold'],
-            'validation_accuracy': eval_results['validation_metrics']['accuracy'],
-            'validation_sensitivity': eval_results['validation_metrics']['sensitivity'],
-            'validation_specificity': eval_results['validation_metrics']['specificity'],
-            'test_accuracy': eval_results['test_metrics']['accuracy'],
-            'test_sensitivity': eval_results['test_metrics']['sensitivity'],
-            'test_specificity': eval_results['test_metrics']['specificity'],
-            'test_fpr': eval_results['test_metrics']['fpr'],
+            'epoch_threshold': epoch_threshold_info.get('threshold'),
+            'guid_threshold': guid_threshold_info.get('threshold'),
+            'validation_accuracy_epoch': epoch_threshold_info.get('accuracy'),
+            'validation_sensitivity_epoch': epoch_threshold_info.get('sensitivity'),
+            'validation_specificity_epoch': epoch_threshold_info.get('specificity'),
+            'validation_accuracy_guid': guid_threshold_info.get('accuracy'),
+            'validation_sensitivity_guid': guid_threshold_info.get('sensitivity'),
+            'validation_specificity_guid': guid_threshold_info.get('specificity'),
+            'test_accuracy_epoch': test_epoch_metrics.get('accuracy'),
+            'test_sensitivity_epoch': test_epoch_metrics.get('sensitivity'),
+            'test_specificity_epoch': test_epoch_metrics.get('specificity'),
+            'test_fpr_epoch': test_epoch_metrics.get('fpr'),
+            'test_accuracy_guid': test_guid_metrics.get('accuracy'),
+            'test_sensitivity_guid': test_guid_metrics.get('sensitivity'),
+            'test_specificity_guid': test_guid_metrics.get('specificity'),
+            'test_fpr_guid': test_guid_metrics.get('fpr'),
             'status': 'success'
         }
 
@@ -369,11 +385,26 @@ def train_single_fold(
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
 
+        fmt = lambda v: f"{float(v):.4f}" if v is not None else "nan"
+
         logger.info(f"Fold {fold_id} summary:")
         logger.info(f"  Training val_acc: {best_val_acc:.4f}, val_loss: {best_val_loss:.4f}")
-        logger.info(f"  Threshold: {results['threshold']:.4f}")
-        logger.info(f"  Test accuracy: {results['test_accuracy']:.4f}")
-        logger.info(f"  Test sensitivity: {results['test_sensitivity']:.4f}, specificity: {results['test_specificity']:.4f}")
+        logger.info(
+            f"  Epoch threshold: {results['epoch_threshold']}, "
+            f"Guid threshold: {results['guid_threshold']}"
+        )
+        logger.info(
+            "  Test accuracy (epoch/guid): "
+            f"{fmt(results['test_accuracy_epoch'])} / {fmt(results['test_accuracy_guid'])}"
+        )
+        logger.info(
+            "  Test sensitivity (epoch/guid): "
+            f"{fmt(results['test_sensitivity_epoch'])} / {fmt(results['test_sensitivity_guid'])}"
+        )
+        logger.info(
+            "  Test specificity (epoch/guid): "
+            f"{fmt(results['test_specificity_epoch'])} / {fmt(results['test_specificity_guid'])}"
+        )
 
         _log_mlflow_metrics(
             {
@@ -385,14 +416,22 @@ def train_single_fold(
         )
         _log_mlflow_metrics(
             {
-                "eval/threshold": results['threshold'],
-                "eval/val_accuracy": results['validation_accuracy'],
-                "eval/val_sensitivity": results['validation_sensitivity'],
-                "eval/val_specificity": results['validation_specificity'],
-                "eval/test_accuracy": results['test_accuracy'],
-                "eval/test_sensitivity": results['test_sensitivity'],
-                "eval/test_specificity": results['test_specificity'],
-                "eval/test_fpr": results['test_fpr'],
+                "eval/epoch_threshold": results['epoch_threshold'],
+                "eval/guid_threshold": results['guid_threshold'],
+                "eval/val_accuracy_epoch": results['validation_accuracy_epoch'],
+                "eval/val_sensitivity_epoch": results['validation_sensitivity_epoch'],
+                "eval/val_specificity_epoch": results['validation_specificity_epoch'],
+                "eval/val_accuracy_guid": results['validation_accuracy_guid'],
+                "eval/val_sensitivity_guid": results['validation_sensitivity_guid'],
+                "eval/val_specificity_guid": results['validation_specificity_guid'],
+                "eval/test_accuracy_epoch": results['test_accuracy_epoch'],
+                "eval/test_sensitivity_epoch": results['test_sensitivity_epoch'],
+                "eval/test_specificity_epoch": results['test_specificity_epoch'],
+                "eval/test_fpr_epoch": results['test_fpr_epoch'],
+                "eval/test_accuracy_guid": results['test_accuracy_guid'],
+                "eval/test_sensitivity_guid": results['test_sensitivity_guid'],
+                "eval/test_specificity_guid": results['test_specificity_guid'],
+                "eval/test_fpr_guid": results['test_fpr_guid'],
             },
             step=getattr(trainer, "global_step", None),
         )
@@ -562,17 +601,29 @@ def run_kfold_parallel(
         std_val_acc_train = (sum((r['best_val_accuracy_training'] - avg_val_acc_train) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
         # Test metrics
-        avg_test_acc = sum(r['test_accuracy'] for r in successful_folds) / n
-        std_test_acc = (sum((r['test_accuracy'] - avg_test_acc) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        avg_test_acc = sum(r.get('test_accuracy_epoch', 0.0) for r in successful_folds) / n
+        std_test_acc = (
+            (sum((r.get('test_accuracy_epoch', 0.0) - avg_test_acc) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
+            if n > 1 else 0.0
+        )
 
-        avg_test_sens = sum(r['test_sensitivity'] for r in successful_folds) / n
-        std_test_sens = (sum((r['test_sensitivity'] - avg_test_sens) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        avg_test_sens = sum(r.get('test_sensitivity_epoch', 0.0) for r in successful_folds) / n
+        std_test_sens = (
+            (sum((r.get('test_sensitivity_epoch', 0.0) - avg_test_sens) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
+            if n > 1 else 0.0
+        )
 
-        avg_test_spec = sum(r['test_specificity'] for r in successful_folds) / n
-        std_test_spec = (sum((r['test_specificity'] - avg_test_spec) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        avg_test_spec = sum(r.get('test_specificity_epoch', 0.0) for r in successful_folds) / n
+        std_test_spec = (
+            (sum((r.get('test_specificity_epoch', 0.0) - avg_test_spec) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
+            if n > 1 else 0.0
+        )
 
-        avg_test_fpr = sum(r['test_fpr'] for r in successful_folds) / n
-        std_test_fpr = (sum((r['test_fpr'] - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        avg_test_fpr = sum(r.get('test_fpr_epoch', 0.0) for r in successful_folds) / n
+        std_test_fpr = (
+            (sum((r.get('test_fpr_epoch', 0.0) - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
+            if n > 1 else 0.0
+        )
 
         summary = {
             'configured_num_folds': num_folds,
