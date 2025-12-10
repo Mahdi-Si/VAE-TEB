@@ -362,7 +362,7 @@ def fill_missing_epochs(
                         'model_pred': 0,
                         'clinical_pred': 0,
                         'first_detection_epoch': np.nan,
-                        'is_fil2led': True
+                        'is_filled': True
                     }
                     filled_rows.append(filled_row)
                 else:

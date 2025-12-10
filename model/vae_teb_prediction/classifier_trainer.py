@@ -147,7 +147,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             input_dim=latent_dim,
             num_classes=num_classes,
             hidden_dim=classifier_config.get('hidden_dim', 128),
-            num_layers=classifier_config.get('num_layers', 4),
+            num_layers=classifier_config.get('num_layers', 2),
             bidirectional=classifier_config.get('bidirectional', False),
             dropout=classifier_config.get('dropout', 0.1),
         )

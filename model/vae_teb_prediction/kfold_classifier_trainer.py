@@ -52,6 +52,11 @@ def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
         else:
             logger.warning(f"Split directory not found: {split_dir}")
 
+    # Validate we have data for all splits
+    for split in ['train', 'val', 'test']:
+        if not datasets[split]:
+            raise ValueError(f"Fold {fold_id} has no {split} files! Check dataset structure at {fold_dir}")
+
     return datasets
 
 
@@ -181,10 +186,17 @@ def train_single_fold(
     from model.vae_teb_prediction.classifier_trainer import GraphModelClassifierTrainer
     from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
     import numpy as np
+    import random
 
-    # Set random seeds
+    # Set random seeds for reproducibility
+    random.seed(42 + fold_id)
     np.random.seed(42 + fold_id)
     torch.manual_seed(42 + fold_id)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42 + fold_id)
+    # Keep benchmark mode for performance
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
@@ -347,15 +359,29 @@ def train_single_fold(
         if evaluation_dir.exists():
             _log_mlflow_artifact(evaluation_dir, is_dir=True)
 
+        # Explicit cleanup to prevent memory accumulation
+        try:
+            del train_dataloader, val_dataloader
+            del graph_model, trainer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            logger.info(f"Fold {fold_id}: Memory cleanup completed")
+        except Exception as e_cleanup:
+            logger.warning(f"Fold {fold_id}: Cleanup warning: {e_cleanup}")
+
         return results
 
     except Exception as e:
-        logger.error(f"Fold {fold_id} failed with error: {str(e)}")
+        import traceback
+        logger.exception(f"Fold {fold_id} failed:")
         return {
             'fold_id': fold_id,
             'gpu_id': gpu_id,
             'status': 'failed',
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }
 
 
@@ -425,11 +451,13 @@ def run_kfold_parallel(
                 all_results.append(result)
                 logger.info(f"Fold {fold_id} completed: {result}")
             except Exception as e:
-                logger.error(f"Fold {fold_id} raised exception: {e}")
+                import traceback
+                logger.exception(f"Fold {fold_id} raised exception:")
                 all_results.append({
                     'fold_id': fold_id,
                     'status': 'failed',
-                    'error': str(e)
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
                 })
 
     all_results.sort(key=lambda x: x['fold_id'])
@@ -441,22 +469,24 @@ def run_kfold_parallel(
     successful_folds = [r for r in all_results if r['status'] == 'success']
 
     if successful_folds:
+        n = len(successful_folds)
+
         # Training metrics
-        avg_val_acc_train = sum(r['best_val_accuracy_training'] for r in successful_folds) / len(successful_folds)
-        std_val_acc_train = (sum((r['best_val_accuracy_training'] - avg_val_acc_train) ** 2 for r in successful_folds) / len(successful_folds)) ** 0.5
+        avg_val_acc_train = sum(r['best_val_accuracy_training'] for r in successful_folds) / n
+        std_val_acc_train = (sum((r['best_val_accuracy_training'] - avg_val_acc_train) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
         # Test metrics
-        avg_test_acc = sum(r['test_accuracy'] for r in successful_folds) / len(successful_folds)
-        std_test_acc = (sum((r['test_accuracy'] - avg_test_acc) ** 2 for r in successful_folds) / len(successful_folds)) ** 0.5
+        avg_test_acc = sum(r['test_accuracy'] for r in successful_folds) / n
+        std_test_acc = (sum((r['test_accuracy'] - avg_test_acc) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        avg_test_sens = sum(r['test_sensitivity'] for r in successful_folds) / len(successful_folds)
-        std_test_sens = (sum((r['test_sensitivity'] - avg_test_sens) ** 2 for r in successful_folds) / len(successful_folds)) ** 0.5
+        avg_test_sens = sum(r['test_sensitivity'] for r in successful_folds) / n
+        std_test_sens = (sum((r['test_sensitivity'] - avg_test_sens) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        avg_test_spec = sum(r['test_specificity'] for r in successful_folds) / len(successful_folds)
-        std_test_spec = (sum((r['test_specificity'] - avg_test_spec) ** 2 for r in successful_folds) / len(successful_folds)) ** 0.5
+        avg_test_spec = sum(r['test_specificity'] for r in successful_folds) / n
+        std_test_spec = (sum((r['test_specificity'] - avg_test_spec) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        avg_test_fpr = sum(r['test_fpr'] for r in successful_folds) / len(successful_folds)
-        std_test_fpr = (sum((r['test_fpr'] - avg_test_fpr) ** 2 for r in successful_folds) / len(successful_folds)) ** 0.5
+        avg_test_fpr = sum(r['test_fpr'] for r in successful_folds) / n
+        std_test_fpr = (sum((r['test_fpr'] - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
         summary = {
             'num_folds': num_folds,
@@ -554,7 +584,8 @@ def run_kfold_parallel(
 
             logger.info("Subgroup aggregation completed successfully!")
         except Exception as e:
-            logger.error(f"Subgroup aggregation failed: {e}")
+            import traceback
+            logger.exception("Subgroup aggregation failed:")
             logger.warning("K-fold results are still valid, but aggregated subgroup analysis is missing")
 
         logger.info("=" * 80)
@@ -596,6 +627,14 @@ def main():
             vae_ckpt = base_config.get('model_config', {}).get('classifier', {}).get('vae_checkpoint')
             if vae_ckpt:
                 VAE_CHECKPOINT = vae_ckpt
+
+    # Validate VAE checkpoint exists before starting folds
+    if VAE_CHECKPOINT:
+        if not os.path.exists(VAE_CHECKPOINT):
+            raise FileNotFoundError(f"VAE checkpoint not found: {VAE_CHECKPOINT}")
+        logger.info(f"VAE checkpoint validated: {VAE_CHECKPOINT}")
+    else:
+        logger.warning("No VAE checkpoint specified - will attempt to train from scratch")
 
     logger.info("Starting K-Fold Cross-Validation for Classifier")
 
