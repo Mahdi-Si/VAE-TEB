@@ -1837,9 +1837,39 @@ def evaluate_fold(
     logger.info("EVALUATION COMPLETE")
     logger.info("=" * 80)
 
+    # ------------------------------------------------------------------
+    # Compatibility helpers for older callers that expect a flat schema
+    # ------------------------------------------------------------------
+    preferred_threshold_type = 'guid_level'
+    compat_threshold_type = preferred_threshold_type if threshold_results.get(preferred_threshold_type) else None
+    if compat_threshold_type is None and threshold_results.get('epoch_level'):
+        compat_threshold_type = 'epoch_level'
+
+    validation_metrics_compat = {}
+    if compat_threshold_type is not None:
+        validation_metrics_compat = dict(threshold_results.get(compat_threshold_type, {}))
+        if validation_metrics_compat:
+            validation_metrics_compat.setdefault('threshold_type', compat_threshold_type)
+            target_fpr_value = threshold_results.get('target_fpr')
+            if target_fpr_value is not None and 'target_fpr' not in validation_metrics_compat:
+                validation_metrics_compat['target_fpr'] = target_fpr_value
+
+    test_metrics_compat = {}
+    if compat_threshold_type is not None:
+        test_result = test_results.get(compat_threshold_type, {})
+        metrics_key = 'guid_metrics' if compat_threshold_type == 'guid_level' else 'epoch_metrics'
+        test_metrics_compat = dict(test_result.get(metrics_key, {}))
+        if test_metrics_compat:
+            test_metrics_compat.setdefault('threshold_type', compat_threshold_type)
+            threshold_value = test_result.get('threshold')
+            if threshold_value is not None and 'threshold' not in test_metrics_compat:
+                test_metrics_compat['threshold'] = threshold_value
+
     return {
         'threshold_info': threshold_results,
         'test_results': test_results,
+        'validation_metrics': validation_metrics_compat,
+        'test_metrics': test_metrics_compat,
     }
 
 
