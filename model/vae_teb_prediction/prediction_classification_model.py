@@ -62,11 +62,16 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
         num_layers: int = 1,
         bidirectional: bool = False,
         dropout: float = 0.1,
+        pooling: str = "last",  # 'last', 'mean', 'max', 'mean_max', 'concat'
+        mlp_multiplier: float = 2.0,
+        use_layer_norm: bool = True,
     ):
         super().__init__(input_dim, num_classes)
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.bidirectional = bidirectional
+        self.pooling = pooling.lower()
+        self.use_layer_norm = use_layer_norm
 
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -79,19 +84,46 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
 
         lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_out_dim, lstm_out_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(lstm_out_dim, num_classes),
+        if self.pooling == "mean_max":
+            feature_dim = lstm_out_dim * 2
+        elif self.pooling == "concat":
+            feature_dim = lstm_out_dim * 2
+        else:
+            feature_dim = lstm_out_dim
+
+        hidden_fc = max(int(feature_dim * mlp_multiplier), feature_dim)
+        layers = []
+        if self.use_layer_norm:
+            layers.append(nn.LayerNorm(feature_dim))
+        layers.extend(
+            [
+                nn.Linear(feature_dim, hidden_fc),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_fc, num_classes),
+            ]
         )
+        self.classifier = nn.Sequential(*layers)
 
     def forward(self, x):
         # x: (B, T, D)
         lstm_out, (h_n, c_n) = self.lstm(x)  # lstm_out: (B, T, H*)
 
-        # Use the last time step's output as sequence representation
-        features = lstm_out[:, -1, :]  # (B, H*)
+        if self.pooling == "mean":
+            features = lstm_out.mean(dim=1)
+        elif self.pooling == "max":
+            features, _ = torch.max(lstm_out, dim=1)
+        elif self.pooling == "mean_max":
+            mean_val = lstm_out.mean(dim=1)
+            max_val, _ = torch.max(lstm_out, dim=1)
+            features = torch.cat([mean_val, max_val], dim=1)
+        elif self.pooling == "concat":
+            last_state = lstm_out[:, -1, :]
+            mean_state = lstm_out.mean(dim=1)
+            features = torch.cat([last_state, mean_state], dim=1)
+        else:
+            # Default to last time step
+            features = lstm_out[:, -1, :]
 
         logits = self.classifier(features)  # (B, C)
         probs = F.softmax(logits, dim=-1)

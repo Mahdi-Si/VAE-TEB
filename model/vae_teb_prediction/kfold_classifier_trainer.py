@@ -20,6 +20,8 @@ from lightning.pytorch.loggers import MLFlowLogger
 from loguru import logger
 import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import numpy as np
+import h5py
 
 
 def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
@@ -100,6 +102,47 @@ def create_mlflow_logger_from_config(
     )
 
 
+def estimate_class_weights(hdf5_files: List[str], chunk_size: int = 512) -> Optional[List[float]]:
+    """
+    Estimate class weights (binary) by scanning the HDF5 target datasets.
+    """
+    if not hdf5_files:
+        return None
+
+    counts = np.zeros(2, dtype=np.int64)
+
+    for path in hdf5_files:
+        h5_path = Path(path)
+        if not h5_path.exists():
+            logger.warning(f"Training dataset missing for class weight estimation: {path}")
+            continue
+        with h5py.File(h5_path, "r") as h5f:
+            if "target" not in h5f:
+                logger.warning(f"'target' dataset missing in {path}")
+                continue
+            target_ds = h5f["target"]
+            total_samples = target_ds.shape[0]
+            for start in range(0, total_samples, chunk_size):
+                end = min(start + chunk_size, total_samples)
+                targets = target_ds[start:end]
+                labels = targets.max(axis=1)
+                counts[0] += np.sum(labels <= 1)
+                counts[1] += np.sum(labels > 1)
+
+    total = counts.sum()
+    if total == 0:
+        return None
+    weights = []
+    num_classes = len(counts)
+    for class_count in counts:
+        if class_count == 0:
+            weights.append(1.0)
+        else:
+            weights.append(float(total / (num_classes * class_count)))
+    logger.info(f"Estimated class counts (healthy, unhealthy): {counts.tolist()}, weights: {weights}")
+    return weights
+
+
 def train_single_fold(
     fold_id: int,
     gpu_id: int,
@@ -163,6 +206,11 @@ def train_single_fold(
     if 'classifier' not in config['model_config']:
         config['model_config']['classifier'] = {}
     config['model_config']['classifier']['vae_checkpoint'] = vae_checkpoint
+    class_weights = estimate_class_weights(fold_datasets['train'])
+    if class_weights is not None:
+        config['model_config']['classifier']['class_weights'] = class_weights
+    else:
+        config['model_config']['classifier'].pop('class_weights', None)
 
     for key, value in kwargs.items():
         if '.' in key:
