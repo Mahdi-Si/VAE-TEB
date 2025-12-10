@@ -126,7 +126,7 @@ def train_single_fold(
     np.random.seed(42 + fold_id)
     torch.manual_seed(42 + fold_id)
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
     try:
         dataset_config = config.get('dataset_config')
