@@ -90,7 +90,20 @@ dataset_config:
       num_workers: 0
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
       dataset_kwargs:
-        load_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'epoch', 'guid']
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'fhr_st',
+            'fhr_ph',
+            'fhr_up_ph',
+            'target',
+            'weight',
+            'epoch',
+            'cs_label',
+            'bg_label',
+            'guid',
+          ]
         allowed_guids: null
         cs_label: null
         bg_label: null
