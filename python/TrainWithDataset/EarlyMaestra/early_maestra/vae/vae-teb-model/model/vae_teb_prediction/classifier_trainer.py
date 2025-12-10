@@ -27,6 +27,8 @@ import lightning as pl
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 
+from typing import List, Optional
+
 import numpy as np
 import torch
 import time
@@ -40,6 +42,15 @@ class PlSeqVaeClassifier(LightningModelBase):
     This class handles the training/validation logic for the combined VAE+Classifier model,
     following the same pattern as SeqVaePl from the VAE trainer.
     """
+
+    def __init__(self, *args, class_weights: Optional[List[float]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if class_weights is not None:
+            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
+            self.register_buffer("class_weights", weight_tensor)
+            logger.info(f"PlSeqVaeClassifier: using class weights {class_weights}")
+        else:
+            self.class_weights = None
 
     def compute_loss_and_metrics(self, batch, batch_idx, stage: str):
         """
@@ -75,8 +86,13 @@ class PlSeqVaeClassifier(LightningModelBase):
         logits = outputs["logits"]  # (B, 2)
         preds = outputs["preds"]    # (B,)
 
-        # Compute loss
-        loss = torch.nn.functional.cross_entropy(logits, binary_labels)
+        # Compute loss with optional class weights
+        weight = getattr(self, "class_weights", None)
+        loss = torch.nn.functional.cross_entropy(
+            logits,
+            binary_labels,
+            weight=weight,
+        )
 
         # Compute accuracy
         accuracy = (preds == binary_labels).float().mean()
@@ -154,6 +170,17 @@ class GraphModelClassifierTrainer(GraphModelBase):
 
         logger.info(f"Created classifier: {classifier_type}")
 
+        class_weights = classifier_config.get('class_weights')
+        if class_weights is not None:
+            if not isinstance(class_weights, (list, tuple)):
+                raise ValueError("class_weights must be a list or tuple when provided")
+            if len(class_weights) != num_classes:
+                raise ValueError(
+                    f"class_weights length ({len(class_weights)}) must match num_classes ({num_classes})"
+                )
+            class_weights = [float(w) for w in class_weights]
+            logger.info(f"Using class weights: {class_weights}")
+
         # Combine VAE + Classifier
         self.pytorch_model = VaeTebTimeSeriesClassifier(
             vae_model=vae_model,
@@ -180,6 +207,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             self.pytorch_model,
             lr=self.lr,
             lr_milestones=self.lr_milestones,
+            class_weights=class_weights,
         )
 
         self.apply_config_hyperparameters(trainer_hparams, self.pl_model)

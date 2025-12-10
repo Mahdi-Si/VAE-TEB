@@ -76,6 +76,21 @@ def load_best_checkpoint(checkpoint_dir: str, device: str = 'cuda:0') -> torch.n
     return model_state_dict, best_ckpt
 
 
+def find_latest_checkpoint_in_fold(fold_dir: Path) -> Path:
+    """
+    Locate the most recent checkpoint within a fold directory.
+    Searches recursively to accommodate timestamped run folders.
+    """
+    ckpt_files = sorted(
+        fold_dir.rglob("*.ckpt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found under {fold_dir}")
+    return ckpt_files[0]
+
+
 def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTimeSeriesClassifier:
     """
     Create model from configuration.
@@ -2302,33 +2317,86 @@ def run_subgroup_aggregation(
 
 def main():
     """
-    Example usage: Evaluate a trained fold standalone.
-
-    Note: In the k-fold pipeline, the model is passed directly from the trainer.
-    For standalone evaluation, you need to create the model from config first.
+    Run evaluation for every fold (plus aggregated metrics) from a k-fold results root.
+    Set ROOT_RESULTS_DIR to the directory containing fold_1, fold_2, ..., fold_N.
     """
-    FOLD_DIR = "/data/deid/isilon/MS_model/classifier_kfold_results/fold_1"
-    CONFIG_PATH = f"{FOLD_DIR}/config.yaml"
-    CHECKPOINT_PATH = f"{FOLD_DIR}/checkpoints/classifier-model-epoch=XX-acc=0.XXXX.ckpt"  # Update with actual path
-    TARGET_FPR = 0.05  # 5% false positive rate
+    ROOT_RESULTS_DIR = "/data/deid/isilon/MS_model/classifier_kfold_results"
+    TARGET_FPR = 0.05
     DEVICE = "cuda:0"
+    FOLDS_TO_EVALUATE = None  # e.g., [1, 3, 5] to evaluate specific folds
+    RUN_AGGREGATIONS = True
 
-    # For standalone evaluation, create model from config
-    with open(CONFIG_PATH, 'r') as f:
-        config = yaml.safe_load(f)
+    root_dir = Path(ROOT_RESULTS_DIR)
+    if not root_dir.exists():
+        raise FileNotFoundError(f"Root results directory not found: {root_dir}")
 
-    model = create_model_from_config(config, DEVICE)
+    fold_dirs: List[Tuple[int, Path]] = []
+    for path in sorted(root_dir.iterdir()):
+        if not path.is_dir():
+            continue
+        if not path.name.startswith("fold_"):
+            continue
+        try:
+            fold_id = int(path.name.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        fold_dirs.append((fold_id, path))
 
-    results = evaluate_fold(
-        model=model,
-        fold_dir=FOLD_DIR,
-        config_path=CONFIG_PATH,
-        checkpoint_path=CHECKPOINT_PATH,
-        target_fpr=TARGET_FPR,
-        device=DEVICE
-    )
+    if not fold_dirs:
+        logger.error(f"No fold directories found in {root_dir}")
+        return
 
-    logger.info("Evaluation complete!")
+    if FOLDS_TO_EVALUATE is not None:
+        requested = set(FOLDS_TO_EVALUATE)
+        fold_dirs = [(fid, fdir) for fid, fdir in fold_dirs if fid in requested]
+        if not fold_dirs:
+            logger.error(f"No matching folds found for requested IDs: {FOLDS_TO_EVALUATE}")
+            return
+
+    logger.info(f"Evaluating folds: {[fid for fid, _ in fold_dirs]}")
+
+    for fold_id, fold_dir in fold_dirs:
+        config_path = fold_dir / "config.yaml"
+        if not config_path.exists():
+            logger.warning(f"Config not found for fold {fold_id}: {config_path}")
+            continue
+        try:
+            checkpoint_path = find_latest_checkpoint_in_fold(fold_dir)
+        except FileNotFoundError as e:
+            logger.warning(str(e))
+            continue
+
+        logger.info("=" * 80)
+        logger.info(f"Evaluating Fold {fold_id}")
+        logger.info("=" * 80)
+
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        model = create_model_from_config(config, DEVICE)
+        evaluate_fold(
+            model=model,
+            fold_dir=str(fold_dir),
+            config_path=str(config_path),
+            checkpoint_path=str(checkpoint_path),
+            target_fpr=TARGET_FPR,
+            device=DEVICE
+        )
+
+    if RUN_AGGREGATIONS:
+        max_fold_id = max(fid for fid, _ in fold_dirs)
+        logger.info("Running cross-fold aggregation...")
+        aggregate_kfold_metrics(
+            kfold_results_dir=ROOT_RESULTS_DIR,
+            threshold_type='both',
+            num_folds=max_fold_id
+        )
+        run_subgroup_aggregation(
+            kfold_results_dir=ROOT_RESULTS_DIR,
+            num_folds=max_fold_id
+        )
+
+    logger.info("Complete evaluation pipeline finished.")
 
 
 if __name__ == '__main__':
