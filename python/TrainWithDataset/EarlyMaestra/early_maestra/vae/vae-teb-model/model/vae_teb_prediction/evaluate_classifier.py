@@ -134,6 +134,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
         freeze_vae=classifier_config.get('freeze_vae', True),
         use_posterior=classifier_config.get('use_posterior', True),
         sample_latent=classifier_config.get('sample_latent', False),
+        class_weights=classifier_config.get('class_weights'),
     )
 
     return model

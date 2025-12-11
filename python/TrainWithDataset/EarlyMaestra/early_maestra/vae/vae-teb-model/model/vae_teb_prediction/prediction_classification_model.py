@@ -3,6 +3,7 @@ from vae_teb_model_prediction import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Sequence
 
 
 class BaseTimeSeriesClassifier(nn.Module):
@@ -417,6 +418,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         freeze_vae: bool = True,
         use_posterior: bool = True,
         sample_latent: bool = False,
+        class_weights: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.vae_model = vae_model
@@ -424,6 +426,11 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         self.freeze_vae = freeze_vae
         self.use_posterior = use_posterior
         self.sample_latent = sample_latent
+        self.class_weights = None
+        if class_weights is not None:
+            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
+            self.register_buffer("class_weights", weight_tensor)
+            self.class_weights = weight_tensor
 
         if self.freeze_vae:
             for param in self.vae_model.parameters():
@@ -531,7 +538,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         logits = outputs["logits"]
 
         # Compute cross-entropy loss
-        loss = F.cross_entropy(logits, labels)
+        loss = F.cross_entropy(logits, labels, weight=self.class_weights)
 
         # Compute accuracy
         preds = outputs["preds"]

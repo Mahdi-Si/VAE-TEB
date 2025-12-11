@@ -188,6 +188,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             freeze_vae=freeze_vae,
             use_posterior=use_posterior,
             sample_latent=sample_latent,
+            class_weights=class_weights,
         )
 
         # Log parameter counts
