@@ -677,12 +677,14 @@ def compute_time_bins(df: pd.DataFrame) -> np.ndarray:
     then coarser bins beyond that.
 
     Args:
-        df: DataFrame with 'epoch' column (seconds before birth)
+        df: DataFrame with 'epoch' column (negative seconds before birth)
 
     Returns:
-        Array of time bin edges in hours
+        Array of time bin edges in hours (positive values: 0 = birth, 6 = 6h before birth)
     """
-    max_epoch_hours = df['epoch'].max() / 3600
+    # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
+    # Example: epochs from -43200 to -3600 → min=-43200 → abs=-43200 → 12 hours before birth
+    max_epoch_hours = abs(df['epoch'].min()) / 3600
 
     if max_epoch_hours <= 6:
         # All data within 6 hours - use 30-min bins
@@ -703,12 +705,13 @@ def compute_time_windows(df: pd.DataFrame) -> List[Tuple[float, float]]:
     Compute time windows for ROC/confusion matrix analysis.
 
     Args:
-        df: DataFrame with 'epoch' column (seconds before birth)
+        df: DataFrame with 'epoch' column (negative seconds before birth)
 
     Returns:
-        List of (start_hour, end_hour) tuples
+        List of (start_hour, end_hour) tuples (positive values: 0 = birth)
     """
-    max_epoch_hours = df['epoch'].max() / 3600
+    # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
+    max_epoch_hours = abs(df['epoch'].min()) / 3600
 
     # Fixed critical windows
     windows = [(0, 1), (1, 2), (2, 4), (4, 6), (0, 6)]
@@ -1309,14 +1312,20 @@ def plot_subgroup_metrics_vs_time(
 
     # Compute metrics for each subgroup
     subgroup_results = {}
+    empty_subgroups = []
     for subgroup_name, subgroup_filter in subgroups.items():
         metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins)
         if len(metrics_df) > 0:
             subgroup_results[subgroup_name] = metrics_df
+        else:
+            empty_subgroups.append(subgroup_name)
 
     if len(subgroup_results) == 0:
-        logger.warning("No subgroup data available for plotting")
+        logger.warning(f"No subgroup data available for plotting {prefix}. All subgroups empty: {', '.join(empty_subgroups)}")
         return
+
+    if empty_subgroups:
+        logger.info(f"Plotting {len(subgroup_results)} subgroups (skipped {len(empty_subgroups)}: {', '.join(empty_subgroups)})")
 
     # Create figure with 2 subplots: sensitivity and specificity
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -1330,15 +1339,21 @@ def plot_subgroup_metrics_vs_time(
 
         x = metrics_df['bin_center'].values
 
-        # Sensitivity subplot
-        axes[0].plot(x, metrics_df['sensitivity'],
-                    marker=marker, label=subgroup_name.replace('_', ' ').title(),
-                    linewidth=2, markersize=6, color=color)
+        # Filter out NaN values for plotting (but keep x-axis aligned)
+        sens_values = metrics_df['sensitivity'].values
+        spec_values = metrics_df['specificity'].values
 
-        # Specificity subplot
-        axes[1].plot(x, metrics_df['specificity'],
-                    marker=marker, label=subgroup_name.replace('_', ' ').title(),
-                    linewidth=2, markersize=6, color=color)
+        # Sensitivity subplot (skip if all NaN)
+        if not np.all(np.isnan(sens_values)):
+            axes[0].plot(x, sens_values,
+                        marker=marker, label=subgroup_name.replace('_', ' ').title(),
+                        linewidth=2, markersize=6, color=color)
+
+        # Specificity subplot (skip if all NaN)
+        if not np.all(np.isnan(spec_values)):
+            axes[1].plot(x, spec_values,
+                        marker=marker, label=subgroup_name.replace('_', ' ').title(),
+                        linewidth=2, markersize=6, color=color)
 
     # Format sensitivity subplot
     axes[0].set_xlabel('Time Before Birth (hours)', fontsize=12)
@@ -1529,23 +1544,34 @@ def save_subgroup_metrics(
     # FIX #5: Ensure epoch_hours column exists
     df = ensure_epoch_hours(df.copy())
 
+    # Get all subgroup filters including overall comparison
     subgroup_filters = create_subgroup_filters()
+    subgroup_filters['unhealthy'] = lambda df: df['binary_target'] == 1
+
     time_bins = compute_time_bins(df)
 
     all_subgroup_metrics = []
+    saved_subgroups = []
+    skipped_subgroups = []
 
     for subgroup_name, subgroup_filter in subgroup_filters.items():
         metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins)
         if len(metrics_df) > 0:
             all_subgroup_metrics.append(metrics_df)
+            saved_subgroups.append(subgroup_name)
+        else:
+            skipped_subgroups.append(subgroup_name)
 
     if all_subgroup_metrics:
         combined_df = pd.concat(all_subgroup_metrics, ignore_index=True)
         csv_path = output_dir / f"{prefix}subgroup_metrics.csv"
         combined_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved: {csv_path}")
+        logger.info(f"Saved subgroup metrics: {csv_path}")
+        logger.info(f"  Saved subgroups ({len(saved_subgroups)}): {', '.join(saved_subgroups)}")
+        if skipped_subgroups:
+            logger.info(f"  Skipped subgroups ({len(skipped_subgroups)}): {', '.join(skipped_subgroups)}")
     else:
-        logger.warning("No subgroup metrics to save")
+        logger.warning(f"No subgroup metrics to save. All subgroups were empty: {', '.join(skipped_subgroups)}")
 
 
 def evaluate_fold(
@@ -1760,6 +1786,21 @@ def evaluate_fold(
         test_df = apply_clinical_decision_rule(test_df_raw.copy(), threshold_value)
         test_df = fill_missing_epochs(test_df, max_gap_multiplier=2.0)
 
+        # Diagnostic: Log target distribution
+        if 'target' in test_df.columns:
+            target_counts = test_df['target'].value_counts().sort_index()
+            logger.info(f"{threshold_type} - Target distribution in test set:")
+            for target_val, count in target_counts.items():
+                target_name = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}.get(target_val, f'Unknown({target_val})')
+                logger.info(f"  {target_name} (target={target_val}): {count} epochs")
+
+            # Log GUID-level distribution
+            guid_targets = test_df.groupby('guid')['target'].first().value_counts().sort_index()
+            logger.info(f"{threshold_type} - Target distribution (GUID-level):")
+            for target_val, count in guid_targets.items():
+                target_name = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}.get(target_val, f'Unknown({target_val})')
+                logger.info(f"  {target_name} (target={target_val}): {count} GUIDs")
+
         # Create output directory for this threshold
         plots_dir = val_output_dir / "plots" / threshold_type
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1777,93 +1818,115 @@ def evaluate_fold(
             logger.warning(f"Error generating plots for {threshold_type}: {e}")
 
         # Generate subgroup analysis
+        logger.info(f"Generating subgroup analysis for {threshold_type}...")
+
+        # Create subgroup filters
+        subgroup_filters = create_subgroup_filters()
+
+        # Create subgroup output directory
+        subgroup_dir = plots_dir / "subgroup_analysis"
+        subgroup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Compute time bins for subgroup analysis
+        time_bins = compute_time_bins(test_df)
+
+        # Plot diagnosis comparison (Acidosis vs HIE)
         try:
-            logger.info(f"Generating subgroup analysis for {threshold_type}...")
-
-            # Create subgroup filters
-            subgroup_filters = create_subgroup_filters()
-
-            # Diagnosis-based subgroups (Acidosis vs HIE)
             diagnosis_subgroups = {
                 'acidosis': subgroup_filters['acidosis'],
                 'hie': subgroup_filters['hie']
             }
+            plot_subgroup_metrics_vs_time(
+                test_df, diagnosis_subgroups,
+                time_bins,
+                subgroup_dir, prefix="diagnosis_"
+            )
+            plot_subgroup_roc_curves(
+                test_df, diagnosis_subgroups,
+                subgroup_dir, prefix="diagnosis_"
+            )
+        except Exception as e:
+            logger.warning(f"Error generating diagnosis subgroup plots: {e}")
 
-            # CS status subgroups
+        # Plot CS status comparison
+        try:
             cs_subgroups = {
                 'cs_positive': subgroup_filters['cs_positive'],
                 'cs_negative': subgroup_filters['cs_negative']
             }
+            plot_subgroup_metrics_vs_time(
+                test_df, cs_subgroups,
+                time_bins,
+                subgroup_dir, prefix="cs_status_"
+            )
+            plot_subgroup_roc_curves(
+                test_df, cs_subgroups,
+                subgroup_dir, prefix="cs_status_"
+            )
+        except Exception as e:
+            logger.warning(f"Error generating CS status subgroup plots: {e}")
 
-            # Combined subgroups
+        # Plot BG label comparison
+        try:
+            bg_subgroups = {
+                'bg_positive': subgroup_filters['bg_positive'],
+                'bg_negative': subgroup_filters['bg_negative']
+            }
+            plot_subgroup_metrics_vs_time(
+                test_df, bg_subgroups,
+                time_bins,
+                subgroup_dir, prefix="bg_label_"
+            )
+            plot_subgroup_roc_curves(
+                test_df, bg_subgroups,
+                subgroup_dir, prefix="bg_label_"
+            )
+        except Exception as e:
+            logger.warning(f"Error generating BG label subgroup plots: {e}")
+
+        # Plot combined subgroups
+        try:
             combined_subgroups = {
                 'acidosis_cs_pos': subgroup_filters['acidosis_cs_pos'],
                 'acidosis_cs_neg': subgroup_filters['acidosis_cs_neg'],
                 'hie_cs_pos': subgroup_filters['hie_cs_pos'],
                 'hie_cs_neg': subgroup_filters['hie_cs_neg']
             }
-
-            # Create subgroup output directory
-            subgroup_dir = plots_dir / "subgroup_analysis"
-
-            # Compute time bins for subgroup analysis
-            time_bins = compute_time_bins(test_df)
-
-            # Plot diagnosis comparison (Acidosis vs HIE)
-            plot_subgroup_metrics_vs_time(
-                test_df, diagnosis_subgroups,
-                time_bins,
-                subgroup_dir, prefix="diagnosis_"
-            )
-            plot_subgroup_roc_curves(
-                test_df, diagnosis_subgroups,
-                subgroup_dir, prefix="diagnosis_"
-            )
-
-            # Plot CS status comparison
-            plot_subgroup_metrics_vs_time(
-                test_df, cs_subgroups,
-                time_bins,
-                subgroup_dir, prefix="cs_status_"
-            )
-            plot_subgroup_roc_curves(
-                test_df, cs_subgroups,
-                subgroup_dir, prefix="cs_status_"
-            )
-
-            # Plot BG label comparison
-            bg_subgroups = {
-                'bg_positive': subgroup_filters['bg_positive'],
-                'bg_negative': subgroup_filters['bg_negative']
-            }
-
-            plot_subgroup_metrics_vs_time(
-                test_df, bg_subgroups,
-                time_bins,
-                subgroup_dir, prefix="bg_label_"
-            )
-            plot_subgroup_roc_curves(
-                test_df, bg_subgroups,
-                subgroup_dir, prefix="bg_label_"
-            )
-
-            # Plot combined subgroups
             plot_subgroup_metrics_vs_time(
                 test_df, combined_subgroups,
                 time_bins,
                 subgroup_dir, prefix="combined_"
             )
-
-            # Plot sample distribution
-            plot_subgroup_distribution(test_df, subgroup_dir, prefix="")
-
-            # Save subgroup metrics to CSV
-            save_subgroup_metrics(test_df, subgroup_dir, prefix="")
-
-            logger.info(f"Subgroup analysis complete for {threshold_type}")
-
         except Exception as e:
-            logger.warning(f"Error generating subgroup analysis for {threshold_type}: {e}")
+            logger.warning(f"Error generating combined subgroup plots: {e}")
+
+        # Plot overall comparison (Healthy vs Unhealthy)
+        try:
+            overall_subgroups = {
+                'healthy': subgroup_filters['healthy'],
+                'unhealthy': lambda df: df['binary_target'] == 1
+            }
+            plot_subgroup_metrics_vs_time(
+                test_df, overall_subgroups,
+                time_bins,
+                subgroup_dir, prefix="overall_"
+            )
+        except Exception as e:
+            logger.warning(f"Error generating overall subgroup plots: {e}")
+
+        # Plot sample distribution
+        try:
+            plot_subgroup_distribution(test_df, subgroup_dir, prefix="")
+        except Exception as e:
+            logger.warning(f"Error generating subgroup distribution plot: {e}")
+
+        # Save subgroup metrics to CSV
+        try:
+            save_subgroup_metrics(test_df, subgroup_dir, prefix="")
+        except Exception as e:
+            logger.warning(f"Error saving subgroup metrics CSV: {e}")
+
+        logger.info(f"Subgroup analysis complete for {threshold_type}")
 
     # Generate comparison plots
     try:
@@ -2363,19 +2426,37 @@ def plot_aggregated_subgroup_metrics(
             sens_mean = subgroup_data['sensitivity_mean'].values
             sens_std = subgroup_data['sensitivity_std'].values
 
-            axes[0].plot(x, sens_mean, marker='o', label=subgroup_name.replace('_', ' ').title(),
-                        linewidth=2, color=colors[idx])
-            axes[0].fill_between(x, sens_mean - sens_std, sens_mean + sens_std,
-                                 alpha=0.2, color=colors[idx])
+            # Filter out NaN values
+            valid_sens = ~np.isnan(sens_mean)
+            if valid_sens.any():
+                axes[0].plot(x[valid_sens], sens_mean[valid_sens], marker='o',
+                           label=subgroup_name.replace('_', ' ').title(),
+                           linewidth=2, color=colors[idx])
+                # Only fill_between where std is also valid
+                valid_std = valid_sens & ~np.isnan(sens_std)
+                if valid_std.any():
+                    axes[0].fill_between(x[valid_std],
+                                        sens_mean[valid_std] - sens_std[valid_std],
+                                        sens_mean[valid_std] + sens_std[valid_std],
+                                        alpha=0.2, color=colors[idx])
 
             # Specificity plot with error bands
             spec_mean = subgroup_data['specificity_mean'].values
             spec_std = subgroup_data['specificity_std'].values
 
-            axes[1].plot(x, spec_mean, marker='o', label=subgroup_name.replace('_', ' ').title(),
-                        linewidth=2, color=colors[idx])
-            axes[1].fill_between(x, spec_mean - spec_std, spec_mean + spec_std,
-                                 alpha=0.2, color=colors[idx])
+            # Filter out NaN values
+            valid_spec = ~np.isnan(spec_mean)
+            if valid_spec.any():
+                axes[1].plot(x[valid_spec], spec_mean[valid_spec], marker='o',
+                           label=subgroup_name.replace('_', ' ').title(),
+                           linewidth=2, color=colors[idx])
+                # Only fill_between where std is also valid
+                valid_std = valid_spec & ~np.isnan(spec_std)
+                if valid_std.any():
+                    axes[1].fill_between(x[valid_std],
+                                        spec_mean[valid_std] - spec_std[valid_std],
+                                        spec_mean[valid_std] + spec_std[valid_std],
+                                        alpha=0.2, color=colors[idx])
 
         # Format plots
         axes[0].set_xlabel('Time Before Birth (hours)', fontsize=12)

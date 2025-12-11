@@ -18,11 +18,15 @@ def ensure_epoch_hours(df: pd.DataFrame) -> pd.DataFrame:
     This function checks if the DataFrame has an epoch_hours column. If not,
     it creates one by converting the epoch column (seconds) to hours.
 
+    IMPORTANT: Epochs are negative (seconds before birth), but epoch_hours is converted
+    to positive values for easier interpretation and binning.
+    Example: epoch=-43200s → epoch_hours=12.0h (12 hours before birth)
+
     Args:
-        df: Input DataFrame with 'epoch' column (seconds before birth)
+        df: Input DataFrame with 'epoch' column (negative seconds before birth)
 
     Returns:
-        DataFrame with epoch_hours column added if missing
+        DataFrame with epoch_hours column added if missing (positive hours before birth)
 
     Raises:
         ValueError: If 'epoch' column is missing
@@ -34,8 +38,10 @@ def ensure_epoch_hours(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("DataFrame missing required 'epoch' column for time conversion")
 
     df = df.copy()
-    df['epoch_hours'] = df['epoch'] / 3600
-    logger.debug(f"Added epoch_hours column (converted from epoch): {len(df)} rows")
+    # CRITICAL FIX: Convert negative epochs to positive hours before birth
+    # epoch=-43200s → epoch_hours=12.0h (12 hours before birth)
+    df['epoch_hours'] = abs(df['epoch']) / 3600
+    logger.debug(f"Added epoch_hours column (converted from epoch to absolute hours): {len(df)} rows")
 
     return df
 
