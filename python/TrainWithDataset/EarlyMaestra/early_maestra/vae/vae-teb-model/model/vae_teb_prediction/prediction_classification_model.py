@@ -426,11 +426,12 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         self.freeze_vae = freeze_vae
         self.use_posterior = use_posterior
         self.sample_latent = sample_latent
-        self.class_weights = None
         if class_weights is not None:
             weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
             self.register_buffer("class_weights", weight_tensor)
-            self.class_weights = weight_tensor
+        else:
+            # Keep an attribute for convenience when no weights are provided
+            self.class_weights = None
 
         if self.freeze_vae:
             for param in self.vae_model.parameters():
@@ -538,7 +539,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         logits = outputs["logits"]
 
         # Compute cross-entropy loss
-        loss = F.cross_entropy(logits, labels, weight=self.class_weights)
+        loss = F.cross_entropy(logits, labels, weight=getattr(self, "class_weights", None))
 
         # Compute accuracy
         preds = outputs["preds"]
