@@ -19,6 +19,7 @@ from typing import List, Dict, Optional
 from lightning.pytorch.loggers import MLFlowLogger
 from loguru import logger
 import json
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import h5py
@@ -707,19 +708,23 @@ def run_kfold_parallel(
         logger.info(f"  Mean FPR: {avg_test_fpr:.4f} ± {std_test_fpr:.4f}")
         logger.info("=" * 80)
 
-        need_full_aggregation = (fold_ids is None)
-        if need_full_aggregation:
+        # CRITICAL FIX: Always aggregate completed folds (not just when all folds requested)
+        completed_fold_ids = [r['fold_id'] for r in all_results if r['status'] == 'success']
+
+        if len(completed_fold_ids) > 0:
             logger.info("")
             logger.info("=" * 80)
             logger.info("RUNNING SUBGROUP AGGREGATION ACROSS FOLDS")
             logger.info("=" * 80)
+            logger.info(f"Aggregating {len(completed_fold_ids)} completed folds: {completed_fold_ids}")
 
             try:
                 from model.vae_teb_prediction.evaluate_classifier import run_subgroup_aggregation
 
                 run_subgroup_aggregation(
                     kfold_results_dir=output_base_dir,
-                    num_folds=num_folds
+                    num_folds=num_folds,
+                    completed_fold_ids=completed_fold_ids  # NEW: Pass actual completed folds
                 )
 
                 logger.info("Subgroup aggregation completed successfully!")
@@ -742,7 +747,24 @@ def run_kfold_parallel(
                         summary_logger.run_id, str(subgroup_dir)
                     )
         else:
-            logger.info("Skipping aggregated subgroup analysis (disabled when running a subset of folds).")
+            logger.warning("No successful folds to aggregate")
+
+    # Save execution metadata for reproducibility and debugging
+    execution_metadata = {
+        'num_folds_configured': num_folds,
+        'requested_folds': selected_folds,
+        'successful_folds': [r['fold_id'] for r in all_results if r['status'] == 'success'],
+        'failed_folds': [r['fold_id'] for r in all_results if r['status'] == 'failed'],
+        'execution_mode': 'sequential' if sequential else 'parallel',
+        'max_parallel': max_parallel if not sequential else 1,
+        'gpu_ids': gpu_ids,
+        'execution_timestamp': datetime.now().isoformat()
+    }
+
+    metadata_path = Path(output_base_dir) / "execution_metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(execution_metadata, f, indent=2)
+    logger.info(f"Saved execution metadata: {metadata_path}")
 
     return all_results
 
