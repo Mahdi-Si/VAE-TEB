@@ -85,13 +85,8 @@ def validate_predictions_df(df: pd.DataFrame, data_type: str = "predictions") ->
             f"Range found: [{min_val:.4f}, {max_val:.4f}]"
         )
 
-    # Validate epoch values
-    if (df['epoch'] < 0).any():
-        negative_count = (df['epoch'] < 0).sum()
-        raise ValueError(
-            f"{data_type} has {negative_count} samples with negative epoch values. "
-            f"Epoch should represent time before birth (non-negative)."
-        )
+    # Note: Epoch values are NEGATIVE (time before birth in seconds)
+    # No validation needed - negative values are correct per dataset schema
 
     # Check for duplicates (warning, not error)
     duplicates = df.duplicated(subset=['guid', 'epoch'])
@@ -172,9 +167,12 @@ def log_dataframe_stats(df: pd.DataFrame, label: str) -> None:
         )
 
     if 'epoch' in df.columns:
+        # Epochs are negative (time before birth). More negative = further from birth
+        min_hours = abs(df['epoch'].min() / 3600)
+        max_hours = abs(df['epoch'].max() / 3600)
         logger.info(
             f"  Epoch range: [{df['epoch'].min():.1f}, {df['epoch'].max():.1f}] seconds "
-            f"({df['epoch'].min()/3600:.1f}h - {df['epoch'].max()/3600:.1f}h before birth)"
+            f"({max_hours:.1f}h to {min_hours:.1f}h before birth)"
         )
 
     if 'is_filled' in df.columns:
