@@ -32,6 +32,12 @@ from model.vae_teb_prediction.prediction_classification_model import (
 )
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from train.graph_models_utils import load_checkpoint_strict
+from model.vae_teb_prediction.validation_utils import (
+    ensure_epoch_hours,
+    validate_predictions_df,
+    validate_guid_consistency,
+    log_dataframe_stats
+)
 
 
 def load_best_checkpoint(checkpoint_dir: str, device: str = 'cuda:0') -> torch.nn.Module:
@@ -289,8 +295,10 @@ def apply_clinical_decision_rule(
         guid_data['first_detection_epoch'] = first_detection if detected else np.nan
 
         # Update original dataframe
-        df.loc[guid_mask, 'clinical_pred'] = guid_data['clinical_pred'].values
-        df.loc[guid_mask, 'first_detection_epoch'] = guid_data['first_detection_epoch'].values
+        # CRITICAL FIX: Use index-aware assignment (without .values) to preserve alignment
+        # guid_data is sorted, but pandas will match rows by index
+        df.loc[guid_mask, 'clinical_pred'] = guid_data['clinical_pred']
+        df.loc[guid_mask, 'first_detection_epoch'] = guid_data['first_detection_epoch']
 
     logger.info(f"Clinical decision rule applied. "
                 f"Model positives: {df['model_pred'].sum()}, "
@@ -318,6 +326,7 @@ def fill_missing_epochs(
     df['is_filled'] = False
 
     all_rows = []
+    total_skipped = 0  # FIX #6: Track skipped epochs across all GUIDs
 
     # Process each GUID separately
     for guid in df['guid'].unique():
@@ -342,9 +351,9 @@ def fill_missing_epochs(
         min_epoch = epochs.min()
         max_epoch = epochs.max()
 
-        # Generate expected epochs
-        num_expected = int((max_epoch - min_epoch) / typical_interval) + 1
-        expected_epochs = np.linspace(min_epoch, max_epoch, num_expected)
+        # FIX #7: Use np.arange with explicit step instead of linspace
+        # This ensures spacing equals typical_interval exactly
+        expected_epochs = np.arange(min_epoch, max_epoch + typical_interval/2, typical_interval)
 
         # Round to avoid floating point issues
         expected_epochs = np.round(expected_epochs, 1)
@@ -353,6 +362,7 @@ def fill_missing_epochs(
         # Find missing epochs (only fill gaps <= max_gap)
         filled_rows = []
         guid_data_dict = guid_data.set_index('epoch').to_dict('index')
+        skipped_epochs = []  # FIX #6: Track per-GUID skipped epochs
 
         for i, exp_epoch in enumerate(expected_epochs):
             if exp_epoch in existing_epochs_set:
@@ -406,6 +416,22 @@ def fill_missing_epochs(
                                 'is_filled': True
                             }
                             filled_rows.append(filled_row)
+                        else:
+                            # FIX #6: Log skipped epoch (gap too large)
+                            skipped_epochs.append({
+                                'epoch': exp_epoch,
+                                'gap_seconds': gap,
+                                'max_gap_seconds': max_gap
+                            })
+
+        # FIX #6: Log skipped epochs for this GUID
+        if skipped_epochs:
+            total_skipped += len(skipped_epochs)
+            logger.debug(
+                f"GUID {guid}: Skipped {len(skipped_epochs)} epochs due to large gaps. "
+                f"Example: epoch {skipped_epochs[0]['epoch']:.1f}s, "
+                f"gap {skipped_epochs[0]['gap_seconds']:.1f}s > max {max_gap:.1f}s"
+            )
 
         # Convert filled rows to dataframe
         if filled_rows:
@@ -420,12 +446,14 @@ def fill_missing_epochs(
     # Sort by GUID and epoch
     result_df = result_df.sort_values(['guid', 'epoch'], ascending=[True, False])
 
+    # FIX #6: Enhanced logging with skipped epoch count
     n_filled = result_df['is_filled'].sum()
     n_total = len(result_df)
-    logger.info(f"Missing epoch filling complete. "
-                f"Original epochs: {n_total - n_filled}, "
-                f"Filled epochs: {n_filled}, "
-                f"Total: {n_total}")
+    logger.info(f"Missing epoch filling complete:")
+    logger.info(f"  Original epochs: {n_total - n_filled}")
+    logger.info(f"  Filled epochs: {n_filled}")
+    logger.info(f"  Skipped epochs (gap too large): {total_skipped}")
+    logger.info(f"  Total epochs: {n_total}")
 
     return result_df
 
@@ -817,9 +845,8 @@ def plot_metrics_vs_time(
     # Compute dynamic time bins
     time_bins = compute_time_bins(df)
 
-    # Convert epoch to hours
-    df = df.copy()
-    df['epoch_hours'] = df['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
 
     # Compute metrics for each time bin
     sensitivities = []
@@ -890,9 +917,8 @@ def plot_roc_curves_by_time(
     # Compute dynamic time windows
     time_windows = compute_time_windows(df)
 
-    # Convert epoch to hours
-    df = df.copy()
-    df['epoch_hours'] = df['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
 
     # Plot all ROC curves on one figure
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -1005,9 +1031,8 @@ def plot_confusion_matrices_by_time(
     # Compute dynamic time windows
     time_windows = compute_time_windows(df)
 
-    # Convert epoch to hours
-    df = df.copy()
-    df['epoch_hours'] = df['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
 
     # Create grid of confusion matrices
     n_windows = len(time_windows)
@@ -1015,7 +1040,8 @@ def plot_confusion_matrices_by_time(
     n_rows = (n_windows + n_cols - 1) // n_cols
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-    axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
+    # FIX #8: Simplified axes flattening - handles single plot, 1D array, and 2D array
+    axes = np.atleast_1d(axes).flatten()
 
     for idx, (start_h, end_h) in enumerate(time_windows):
         window_mask = (df['epoch_hours'] >= start_h) & (df['epoch_hours'] < end_h)
@@ -1026,7 +1052,8 @@ def plot_confusion_matrices_by_time(
             continue
 
         # Compute confusion matrix
-        cm = confusion_matrix(window_data['binary_target'], window_data['clinical_pred'])
+        # Force 2x2 matrix even if only one class present in window
+        cm = confusion_matrix(window_data['binary_target'], window_data['clinical_pred'], labels=[0, 1])
 
         # Plot heatmap
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[idx],
@@ -1075,7 +1102,8 @@ def plot_guid_level_analysis(
     # Plot 1: GUID-level confusion matrix
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
 
-    cm = confusion_matrix(guid_data['binary_target'], guid_data['clinical_pred'])
+    # Force 2x2 matrix even if only one class present
+    cm = confusion_matrix(guid_data['binary_target'], guid_data['clinical_pred'], labels=[0, 1])
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0, 0],
                 xticklabels=['Healthy', 'Unhealthy'],
                 yticklabels=['Healthy', 'Unhealthy'])
@@ -1177,8 +1205,9 @@ def plot_threshold_comparison(
 
     # Plot 2: FPR comparison over time
     time_bins = compute_time_bins(df_epoch)
-    df_epoch['epoch_hours'] = df_epoch['epoch'] / 3600
-    df_guid['epoch_hours'] = df_guid['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df_epoch = ensure_epoch_hours(df_epoch)
+    df_guid = ensure_epoch_hours(df_guid)
 
     epoch_fprs, guid_fprs, bin_centers = [], [], []
 
@@ -1225,12 +1254,19 @@ def plot_threshold_comparison(
     axes[1, 0].grid(True, alpha=0.3)
 
     # Plot 4: Agreement analysis
-    agreement_df = pd.DataFrame({
-        'epoch_pred': df_epoch['clinical_pred'],
-        'guid_pred': df_guid['clinical_pred']
-    })
+    # CRITICAL FIX: Use explicit merge to ensure alignment (don't assume row order matches)
+    agreement_df = pd.merge(
+        df_epoch[['guid', 'epoch', 'clinical_pred']].rename(columns={'clinical_pred': 'epoch_pred'}),
+        df_guid[['guid', 'epoch', 'clinical_pred']].rename(columns={'clinical_pred': 'guid_pred'}),
+        on=['guid', 'epoch'],
+        how='inner',
+        validate='1:1'
+    )
 
-    cm = confusion_matrix(agreement_df['epoch_pred'], agreement_df['guid_pred'])
+    logger.debug(f"Threshold comparison: {len(agreement_df)} matched samples")
+
+    # Force 2x2 matrix even if only one class present
+    cm = confusion_matrix(agreement_df['epoch_pred'], agreement_df['guid_pred'], labels=[0, 1])
     sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', ax=axes[1, 1],
                 xticklabels=['GUID: Neg', 'GUID: Pos'],
                 yticklabels=['Epoch: Neg', 'Epoch: Pos'])
@@ -1268,10 +1304,8 @@ def plot_subgroup_metrics_vs_time(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure epoch_hours exists
-    df = df.copy()
-    if 'epoch_hours' not in df.columns:
-        df['epoch_hours'] = df['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
 
     # Compute metrics for each subgroup
     subgroup_results = {}
@@ -1440,9 +1474,8 @@ def plot_subgroup_distribution(
     axes[1, 0].grid(True, alpha=0.3, axis='x')
 
     # Plot 4: Prevalence by time (using epoch_hours bins)
-    df_copy = df.copy()
-    if 'epoch_hours' not in df_copy.columns:
-        df_copy['epoch_hours'] = df_copy['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df_copy = ensure_epoch_hours(df.copy())
 
     time_bins = compute_time_bins(df_copy)
     bin_centers = []
@@ -1493,10 +1526,8 @@ def save_subgroup_metrics(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure epoch_hours exists
-    df = df.copy()
-    if 'epoch_hours' not in df.columns:
-        df['epoch_hours'] = df['epoch'] / 3600
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
 
     subgroup_filters = create_subgroup_filters()
     time_bins = compute_time_bins(df)
@@ -1582,6 +1613,11 @@ def evaluate_fold(
     # Run validation inference
     val_df_raw = run_inference(model, val_dataloader, device)
 
+    # FIX #9: Validate predictions DataFrame
+    validate_predictions_df(val_df_raw, "Validation")
+    validate_guid_consistency(val_df_raw)
+    log_dataframe_stats(val_df_raw, "Validation Raw")
+
     # Save raw validation predictions
     val_output_dir = fold_dir / "evaluation"
     val_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1628,6 +1664,11 @@ def evaluate_fold(
     # Run test inference
     test_df_raw = run_inference(model, test_dataloader, device)
 
+    # FIX #9: Validate predictions DataFrame
+    validate_predictions_df(test_df_raw, "Test")
+    validate_guid_consistency(test_df_raw)
+    log_dataframe_stats(test_df_raw, "Test Raw")
+
     # Save raw test predictions
     test_df_raw.to_csv(val_output_dir / "test_predictions_raw.csv", index=False)
     logger.info("Test raw predictions saved")
@@ -1642,9 +1683,13 @@ def evaluate_fold(
 
         # Apply clinical decision rule
         test_df = apply_clinical_decision_rule(test_df_raw.copy(), threshold_value)
+        # FIX #9: Log statistics after clinical decision rule
+        log_dataframe_stats(test_df, f"Test Clinical ({threshold_type})")
 
         # Fill missing epochs
         test_df = fill_missing_epochs(test_df, max_gap_multiplier=2.0)
+        # FIX #9: Log statistics after filling
+        log_dataframe_stats(test_df, f"Test Filled ({threshold_type})")
 
         # Save predictions
         test_df.to_csv(val_output_dir / f"test_predictions_clinical_{threshold_type}.csv", index=False)
@@ -1838,6 +1883,26 @@ def evaluate_fold(
     logger.info("EVALUATION COMPLETE")
     logger.info("=" * 80)
 
+    # Save processing metadata for reproducibility and debugging
+    processing_metadata = {
+        'fold_dir': str(fold_dir),
+        'checkpoint_path': str(checkpoint_path),
+        'device': device,
+        'target_fpr': target_fpr,
+        'validation_samples': len(val_df_raw),
+        'test_samples': len(test_df_raw),
+        'thresholds_used': {
+            'epoch_level': threshold_results['epoch_level']['threshold'],
+            'guid_level': threshold_results['guid_level']['threshold']
+        },
+        'evaluation_timestamp': datetime.now().isoformat()
+    }
+
+    metadata_path = val_output_dir / "processing_metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(processing_metadata, f, indent=2)
+    logger.info(f"Saved processing metadata: {metadata_path}")
+
     # ------------------------------------------------------------------
     # Compatibility helpers for older callers that expect a flat schema
     # ------------------------------------------------------------------
@@ -1939,6 +2004,9 @@ def compute_fold_metrics_by_time(df: pd.DataFrame, time_bins: np.ndarray) -> pd.
         DataFrame with columns: bin_start, bin_end, bin_center, sensitivity,
                                 specificity, n_class_0, n_class_1
     """
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df)
+
     results = []
 
     for i in range(len(time_bins) - 1):
@@ -2187,35 +2255,57 @@ def aggregate_kfold_metrics(
 def aggregate_subgroup_metrics(
     kfold_results_dir: str,
     threshold_type: str = 'epoch_level',
-    num_folds: int = 10
-) -> pd.DataFrame:
+    num_folds: int = 10,
+    completed_fold_ids: List[int] = None
+) -> Tuple[pd.DataFrame, Dict]:
     """
     Aggregate subgroup metrics across all folds.
 
     Args:
         kfold_results_dir: Base directory containing fold_1, fold_2, ..., fold_N
         threshold_type: 'epoch_level' or 'guid_level'
-        num_folds: Number of folds to aggregate
+        num_folds: Number of folds configured (for reference)
+        completed_fold_ids: List of fold IDs to aggregate. If None, tries to load 1..num_folds.
 
     Returns:
-        DataFrame with aggregated metrics (mean ± std) per subgroup and time bin
+        Tuple of (aggregated_df, metadata_dict)
     """
+    # Determine which folds to load
+    if completed_fold_ids is None:
+        fold_ids_to_load = list(range(1, num_folds + 1))
+    else:
+        fold_ids_to_load = sorted(completed_fold_ids)
+
     all_fold_data = []
+    loaded_fold_ids = []
 
     # Load subgroup metrics from each fold
-    for fold_id in range(1, num_folds + 1):
+    for fold_id in fold_ids_to_load:
         csv_path = Path(kfold_results_dir) / f"fold_{fold_id}" / "evaluation" / "plots" / threshold_type / "subgroup_analysis" / "subgroup_metrics.csv"
 
         if csv_path.exists():
             fold_df = pd.read_csv(csv_path)
             fold_df['fold_id'] = fold_id
             all_fold_data.append(fold_df)
+            loaded_fold_ids.append(fold_id)
         else:
             logger.warning(f"Missing subgroup metrics for fold {fold_id}: {csv_path}")
 
+    # Build metadata
+    missing_fold_ids = sorted(set(fold_ids_to_load) - set(loaded_fold_ids))
+    metadata = {
+        'requested_folds': fold_ids_to_load,
+        'loaded_folds': loaded_fold_ids,
+        'missing_folds': missing_fold_ids,
+        'n_requested': len(fold_ids_to_load),
+        'n_loaded': len(loaded_fold_ids),
+        'n_missing': len(missing_fold_ids),
+        'aggregation_timestamp': datetime.now().isoformat()
+    }
+
     if not all_fold_data:
-        logger.error("No subgroup metrics found across folds")
-        return pd.DataFrame()
+        logger.error(f"No subgroup metrics found for {threshold_type}. Requested: {fold_ids_to_load}")
+        return pd.DataFrame(), metadata
 
     # Concatenate all folds
     combined_df = pd.concat(all_fold_data, ignore_index=True)
@@ -2231,7 +2321,7 @@ def aggregate_subgroup_metrics(
     # Flatten column names
     agg_metrics.columns = ['_'.join(col).strip('_') if col[1] else col[0] for col in agg_metrics.columns.values]
 
-    return agg_metrics
+    return agg_metrics, metadata
 
 
 def plot_aggregated_subgroup_metrics(
@@ -2313,22 +2403,34 @@ def plot_aggregated_subgroup_metrics(
 
 def run_subgroup_aggregation(
     kfold_results_dir: str,
-    num_folds: int = 10
+    num_folds: int = 10,
+    completed_fold_ids: List[int] = None
 ):
     """
     Run complete subgroup aggregation across folds.
 
+    Args:
+        kfold_results_dir: Base directory containing fold_1, fold_2, ..., fold_N
+        num_folds: Total number of folds configured
+        completed_fold_ids: List of fold IDs to aggregate. If None, tries all folds 1..num_folds.
+
     Usage:
-        run_subgroup_aggregation("/path/to/kfold_results", num_folds=10)
+        run_subgroup_aggregation("/path/to/kfold_results", num_folds=10, completed_fold_ids=[1,2,3])
     """
     output_dir = Path(kfold_results_dir) / "aggregated_analysis" / "subgroups"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    all_metadata = {}
+
     for threshold_type in ['epoch_level', 'guid_level']:
         logger.info(f"Aggregating subgroup metrics for {threshold_type}...")
 
-        # Aggregate metrics
-        agg_df = aggregate_subgroup_metrics(kfold_results_dir, threshold_type, num_folds)
+        # Aggregate metrics (now returns tuple)
+        agg_df, metadata = aggregate_subgroup_metrics(
+            kfold_results_dir, threshold_type, num_folds, completed_fold_ids
+        )
+
+        all_metadata[threshold_type] = metadata
 
         if agg_df.empty:
             logger.warning(f"No data for {threshold_type}, skipping...")
@@ -2337,11 +2439,28 @@ def run_subgroup_aggregation(
         # Save aggregated CSV
         csv_path = output_dir / f"aggregated_subgroup_metrics_{threshold_type}.csv"
         agg_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved: {csv_path}")
+        logger.info(f"Saved aggregated metrics: {csv_path}")
 
         # Plot aggregated metrics
         plot_dir = output_dir / threshold_type
         plot_aggregated_subgroup_metrics(agg_df, plot_dir, title_suffix=f"({threshold_type})")
+
+    # Save aggregation metadata
+    metadata_path = output_dir / "aggregation_metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(all_metadata, f, indent=2)
+    logger.info(f"Saved aggregation metadata: {metadata_path}")
+
+    # Log summary
+    logger.info("=" * 80)
+    logger.info("AGGREGATION SUMMARY")
+    logger.info("=" * 80)
+    for thr_type, meta in all_metadata.items():
+        logger.info(f"{thr_type}:")
+        logger.info(f"  Loaded folds: {meta['loaded_folds']}")
+        logger.info(f"  Missing folds: {meta['missing_folds']}")
+        logger.info(f"  Coverage: {meta['n_loaded']}/{meta['n_requested']} folds")
+    logger.info("=" * 80)
 
     logger.info("Subgroup aggregation complete!")
 
