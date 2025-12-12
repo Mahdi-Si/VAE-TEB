@@ -1,4 +1,9 @@
-from vae_teb_model_prediction import *
+try:
+    # Preferred (package) import
+    from .vae_teb_model_prediction import *  # noqa: F403
+except ImportError:
+    # Backward-compatible fallback when running from this directory
+    from vae_teb_model_prediction import *  # noqa: F403
 
 import torch
 import torch.nn as nn

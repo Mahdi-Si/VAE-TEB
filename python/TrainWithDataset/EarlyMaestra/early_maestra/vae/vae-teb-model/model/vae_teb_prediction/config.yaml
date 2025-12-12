@@ -59,7 +59,9 @@ model_config:
       target_fpr: 0.05              # Target false positive rate for threshold determination (5%)
       compute_both_thresholds: true  # Compute both epoch-level and GUID-level thresholds
       generate_plots: true           # Generate comprehensive visualizations
-      max_gap_multiplier: 2.0        # For missing epoch filling: only fill gaps <= 2 * typical_interval
+      decision_time_hours: 1.0       # Optimize threshold for GUID-level FPR at this time before delivery
+      exclude_last_minutes: 30       # Exclude last N minutes before delivery in time-binned plots
+      max_gap_multiplier: null       # If set, only fill gaps <= multiplier * typical_interval; null fills all missing epochs
       # Note: Time bins and windows are computed dynamically from actual epoch data
 
 
@@ -171,4 +173,3 @@ advanced_config:
     comprehensive_plotting:
       enabled: true
       plot_frequency: 10
-
