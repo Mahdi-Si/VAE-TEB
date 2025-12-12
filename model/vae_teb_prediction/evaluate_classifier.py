@@ -304,6 +304,10 @@ def apply_clinical_decision_rule(
                 f"Model positives: {df['model_pred'].sum()}, "
                 f"Clinical positives: {df['clinical_pred'].sum()}")
 
+    # Verify clinical decision rule applied correctly
+    from model.vae_teb_prediction.validation_utils import verify_clinical_decision_rule
+    verify_clinical_decision_rule(df, "Clinical Decision Rule")
+
     return df
 
 
@@ -627,27 +631,156 @@ def find_threshold_for_fpr_guid(
     return best_threshold, best_metrics
 
 
+def find_threshold_for_fpr_at_time_window(
+    val_df: pd.DataFrame,
+    target_fpr: float = 0.05,
+    time_window_hours: float = 1.0,
+    max_gap_multiplier: float = 2.0
+) -> Tuple[float, Dict]:
+    """
+    Find threshold to achieve target FPR specifically at a time window before delivery.
+
+    This function optimizes the threshold to achieve the desired FPR at a specific
+    time window (e.g., 1 hour before delivery), which is more clinically relevant
+    than global optimization across all time points.
+
+    Args:
+        val_df: Validation dataframe with columns: guid, epoch, binary_target, prob_class_1
+        target_fpr: Desired false positive rate (default 0.05)
+        time_window_hours: Time window in hours before delivery (default 1.0 = last 1h)
+        max_gap_multiplier: For epoch filling (default 2.0)
+
+    Returns:
+        threshold: Optimal threshold value
+        metrics_dict: Performance metrics at this threshold
+    """
+    logger.info("=" * 80)
+    logger.info(f"Finding threshold for FPR={target_fpr} at time window [0-{time_window_hours}h] before delivery")
+    logger.info("=" * 80)
+
+    # Add epoch_hours column for filtering
+    val_df = val_df.copy()
+    val_df['epoch_hours'] = abs(val_df['epoch']) / 3600  # Convert to positive hours before birth
+
+    # Filter to time window of interest
+    window_mask = val_df['epoch_hours'] <= time_window_hours
+    val_window = val_df[window_mask].copy()
+
+    logger.info(f"Filtered to {len(val_window)} epochs within {time_window_hours}h window")
+    logger.info(f"Unique GUIDs in window: {val_window['guid'].nunique()}")
+
+    if len(val_window) == 0:
+        logger.error(f"No data found in time window [0-{time_window_hours}h]")
+        return 0.5, {}
+
+    # Test threshold candidates (same as find_threshold_for_fpr_guid)
+    threshold_candidates = np.arange(0.0, 1.01, 0.01)
+    results = []
+
+    for thresh in threshold_candidates:
+        # Apply clinical decision rule to FULL dataset (not just window)
+        # This ensures forward-fill logic works correctly across all epochs
+        df_clinical = apply_clinical_decision_rule(val_df.copy(), thresh)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier)
+
+        # Filter to time window AFTER clinical rule applied
+        df_clinical['epoch_hours'] = abs(df_clinical['epoch']) / 3600
+        window_clinical = df_clinical[df_clinical['epoch_hours'] <= time_window_hours].copy()
+
+        if len(window_clinical) == 0:
+            continue
+
+        # Compute GUID-level FPR in this time window
+        # A GUID is "detected" if ANY epoch in the window is predicted positive
+        guid_stats = window_clinical.groupby('guid').agg({
+            'binary_target': 'max',  # GUID outcome (should be consistent)
+            'clinical_pred': 'max'   # GUID detected if ANY epoch positive
+        }).reset_index()
+
+        # Separate healthy and unhealthy GUIDs
+        healthy_guids = guid_stats[guid_stats['binary_target'] == 0]
+        unhealthy_guids = guid_stats[guid_stats['binary_target'] == 1]
+
+        if len(healthy_guids) == 0:
+            continue  # Skip if no healthy GUIDs in window
+
+        # Compute FPR and sensitivity at GUID level in this time window
+        guid_fpr = (healthy_guids['clinical_pred'] == 1).sum() / len(healthy_guids)
+        guid_sensitivity = (unhealthy_guids['clinical_pred'] == 1).mean() if len(unhealthy_guids) > 0 else 0.0
+
+        results.append({
+            'threshold': thresh,
+            'guid_fpr': guid_fpr,
+            'guid_sensitivity': guid_sensitivity,
+            'n_healthy_guids': len(healthy_guids),
+            'n_unhealthy_guids': len(unhealthy_guids)
+        })
+
+    if len(results) == 0:
+        logger.error("No valid thresholds found")
+        return 0.5, {}
+
+    # Select threshold closest to target FPR
+    results_df = pd.DataFrame(results)
+    results_df['fpr_diff'] = abs(results_df['guid_fpr'] - target_fpr)
+    best_row = results_df.loc[results_df['fpr_diff'].idxmin()]
+
+    selected_threshold = best_row['threshold']
+
+    logger.info(f"Selected threshold: {selected_threshold:.3f}")
+    logger.info(f"Achieved GUID-level FPR at {time_window_hours}h: {best_row['guid_fpr']:.4f} (target: {target_fpr})")
+    logger.info(f"GUID-level sensitivity at {time_window_hours}h: {best_row['guid_sensitivity']:.4f}")
+    logger.info(f"Healthy GUIDs in window: {int(best_row['n_healthy_guids'])}")
+    logger.info(f"Unhealthy GUIDs in window: {int(best_row['n_unhealthy_guids'])}")
+    logger.info("=" * 80)
+
+    metrics_dict = {
+        'threshold': selected_threshold,
+        'guid_fpr_at_window': best_row['guid_fpr'],
+        'guid_sensitivity_at_window': best_row['guid_sensitivity'],
+        'time_window_hours': time_window_hours,
+        'n_healthy_guids': int(best_row['n_healthy_guids']),
+        'n_unhealthy_guids': int(best_row['n_unhealthy_guids']),
+        'fpr': best_row['guid_fpr'],
+        'sensitivity': best_row['guid_sensitivity']
+    }
+
+    return selected_threshold, metrics_dict
+
+
 def find_optimal_thresholds(
     val_df: pd.DataFrame,
-    target_fpr: float = 0.05
+    target_fpr: float = 0.05,
+    time_window_hours: float = 1.0,
+    max_gap_multiplier: float = 2.0
 ) -> Dict:
     """
-    Compute both epoch-level and GUID-level thresholds for comparison.
+    Compute epoch-level, GUID-level, and time-specific thresholds for comparison.
 
     Args:
         val_df: Validation predictions DataFrame
         target_fpr: Target false positive rate for threshold determination
+        time_window_hours: Time window for time-specific optimization (default 1.0h before delivery)
+        max_gap_multiplier: For missing epoch filling in time-specific optimization
 
     Returns:
-        Dictionary with both epoch-level and GUID-level threshold information
+        Dictionary with epoch-level, GUID-level, and time-specific threshold information
     """
-    logger.info("Computing optimal thresholds using both approaches...")
+    logger.info("Computing optimal thresholds using three approaches...")
 
-    # Epoch-level threshold
+    # Epoch-level threshold (global optimization at epoch level)
     epoch_threshold, epoch_metrics = find_threshold_for_fpr_epoch(val_df, target_fpr)
 
-    # GUID-level threshold
+    # GUID-level threshold (global optimization at GUID level)
     guid_threshold, guid_metrics = find_threshold_for_fpr_guid(val_df, target_fpr)
+
+    # Time-specific threshold (optimized for specific time window before delivery)
+    time_threshold, time_metrics = find_threshold_for_fpr_at_time_window(
+        val_df,
+        target_fpr=target_fpr,
+        time_window_hours=time_window_hours,
+        max_gap_multiplier=max_gap_multiplier
+    )
 
     results = {
         'epoch_level': {
@@ -658,28 +791,37 @@ def find_optimal_thresholds(
             'threshold': guid_threshold,
             **guid_metrics
         },
-        'target_fpr': target_fpr
+        'time_specific': {
+            'threshold': time_threshold,
+            **time_metrics
+        },
+        'target_fpr': target_fpr,
+        'time_window_hours': time_window_hours
     }
 
     logger.info("=" * 80)
     logger.info("THRESHOLD COMPARISON")
     logger.info("=" * 80)
-    logger.info(f"Epoch-level threshold: {epoch_threshold:.4f} (FPR: {epoch_metrics['actual_fpr']:.4f})")
-    logger.info(f"GUID-level threshold: {guid_threshold:.4f} (FPR: {guid_metrics['actual_fpr']:.4f})")
+    logger.info(f"Epoch-level threshold:     {epoch_threshold:.4f} (FPR: {epoch_metrics['actual_fpr']:.4f})")
+    logger.info(f"GUID-level threshold:      {guid_threshold:.4f} (FPR: {guid_metrics.get('actual_fpr', guid_metrics.get('fpr', 0)):.4f})")
+    logger.info(f"Time-specific threshold:   {time_threshold:.4f} (FPR at {time_window_hours}h: {time_metrics['guid_fpr_at_window']:.4f})")
+    logger.info(f"")
+    logger.info(f"RECOMMENDATION: Use time-specific threshold ({time_threshold:.4f}) for clinically relevant evaluation")
     logger.info("=" * 80)
 
     return results
 
 
-def compute_time_bins(df: pd.DataFrame) -> np.ndarray:
+def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> np.ndarray:
     """
     Compute dynamic time bins from actual epoch data with uniform 20-minute bins.
 
     Args:
         df: DataFrame with 'epoch' column (negative seconds before birth)
+        exclude_last_minutes: Exclude last N minutes before birth from bins (default: 30 min = 0.5h)
 
     Returns:
-        Array of time bin edges in hours (positive values: 0 = birth, 6 = 6h before birth)
+        Array of time bin edges in hours (positive values: 0.5 = 30min before birth, 6 = 6h before birth)
     """
     # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
     # Example: epochs from -43200 to -3600 → min=-43200 → abs=-43200 → 12 hours before birth
@@ -688,31 +830,39 @@ def compute_time_bins(df: pd.DataFrame) -> np.ndarray:
     # Uniform 20-minute bins: 20 min = 1/3 hour
     bin_size_hours = 1.0 / 3.0  # 20 minutes = 0.333... hours
 
-    # Create uniform bins from 0 (birth) to max_epoch_hours
-    bins = np.arange(0, max_epoch_hours + bin_size_hours, bin_size_hours)
+    # Convert exclusion from minutes to hours
+    exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
+
+    # Create uniform bins starting from exclude_hours (e.g., 0.5h) to max_epoch_hours
+    # This excludes the last N minutes before birth from analysis
+    bins = np.arange(exclude_hours, max_epoch_hours + bin_size_hours, bin_size_hours)
 
     return bins
 
 
-def compute_time_windows(df: pd.DataFrame) -> List[Tuple[float, float]]:
+def compute_time_windows(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> List[Tuple[float, float]]:
     """
     Compute time windows for ROC/confusion matrix analysis.
 
     Args:
         df: DataFrame with 'epoch' column (negative seconds before birth)
+        exclude_last_minutes: Exclude last N minutes before birth from windows (default: 30 min = 0.5h)
 
     Returns:
-        List of (start_hour, end_hour) tuples (positive values: 0 = birth)
+        List of (start_hour, end_hour) tuples (positive values: 0.5 = 30min before birth)
     """
     # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
     max_epoch_hours = abs(df['epoch'].min()) / 3600
 
-    # Fixed critical windows
-    windows = [(0, 1), (1, 2), (2, 4), (4, 6), (0, 6)]
+    # Convert exclusion from minutes to hours
+    exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
+
+    # Fixed critical windows (adjusted to start at exclude_hours)
+    windows = [(exclude_hours, 1), (1, 2), (2, 4), (4, 6), (exclude_hours, 6)]
 
     # Add additional windows if data extends beyond 6 hours
     if max_epoch_hours > 6:
-        windows.extend([(6, 12), (0, 12)])
+        windows.extend([(6, 12), (exclude_hours, 12)])
 
     return windows
 
@@ -865,13 +1015,47 @@ def compute_subgroup_metrics_by_time(
 
     df_result = pd.DataFrame(results)
     df_result['subgroup'] = subgroup_name
+
+    # MONOTONICITY VALIDATION: For GUID-level metrics, sensitivity should be non-decreasing
+    # as we approach delivery (moving from larger time bins to smaller ones)
+    if guid_level and 'guid_sensitivity' in df_result.columns:
+        # Remove rows with NaN sensitivity for validation
+        valid_rows = df_result[df_result['guid_sensitivity'].notna()]
+
+        if len(valid_rows) > 1:
+            sensitivities = valid_rows['guid_sensitivity'].values
+            violations = []
+
+            for i in range(1, len(sensitivities)):
+                # As we move to later bins (closer to birth), sensitivity should not decrease
+                if sensitivities[i] < sensitivities[i-1] - 1e-6:  # Allow small numerical error
+                    violations.append({
+                        'bin_index': i,
+                        'bin_center': valid_rows.iloc[i]['bin_center'],
+                        'prev_sensitivity': sensitivities[i-1],
+                        'curr_sensitivity': sensitivities[i],
+                        'decrease': sensitivities[i-1] - sensitivities[i]
+                    })
+
+            if violations:
+                logger.warning(f"GUID-level monotonicity violations detected in {subgroup_name}:")
+                for v in violations:
+                    logger.warning(
+                        f"  Bin {v['bin_index']} ({v['bin_center']:.1f}h): "
+                        f"Sensitivity decreased from {v['prev_sensitivity']:.4f} to {v['curr_sensitivity']:.4f} "
+                        f"(Δ = {v['decrease']:.4f})"
+                    )
+            else:
+                logger.debug(f"  ✓ GUID-level sensitivity is monotonically non-decreasing for {subgroup_name}")
+
     return df_result
 
 
 def plot_metrics_vs_time(
     df: pd.DataFrame,
     output_dir: Path,
-    prefix: str = ""
+    prefix: str = "",
+    exclude_last_minutes: float = 30.0
 ) -> None:
     """
     Plot sensitivity and specificity as function of time before birth.
@@ -880,11 +1064,12 @@ def plot_metrics_vs_time(
         df: Predictions dataframe with clinical_pred
         output_dir: Directory to save plots
         prefix: Prefix for plot filenames (e.g., "epoch_threshold_" or "guid_threshold_")
+        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute dynamic time bins
-    time_bins = compute_time_bins(df)
+    time_bins = compute_time_bins(df, exclude_last_minutes=exclude_last_minutes)
 
     # FIX #5: Ensure epoch_hours column exists
     df = ensure_epoch_hours(df.copy())
@@ -945,7 +1130,8 @@ def plot_metrics_vs_time(
 def plot_roc_curves_by_time(
     df: pd.DataFrame,
     output_dir: Path,
-    prefix: str = ""
+    prefix: str = "",
+    exclude_last_minutes: float = 30.0
 ) -> None:
     """
     Plot ROC curves for different time windows before birth.
@@ -954,11 +1140,12 @@ def plot_roc_curves_by_time(
         df: Predictions dataframe
         output_dir: Directory to save plots
         prefix: Prefix for plot filenames
+        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute dynamic time windows
-    time_windows = compute_time_windows(df)
+    time_windows = compute_time_windows(df, exclude_last_minutes=exclude_last_minutes)
 
     # FIX #5: Ensure epoch_hours column exists
     df = ensure_epoch_hours(df.copy())
@@ -1056,10 +1243,346 @@ def plot_detection_timing(
     logger.info(f"Saved: {prefix}detection_timing.png")
 
 
+def analyze_detection_timing_statistics(
+    df: pd.DataFrame,
+    subgroups: Dict[str, callable] = None,
+    output_dir: Path = None,
+    prefix: str = ""
+) -> Dict:
+    """
+    Comprehensive detection timing analysis with lead time metrics.
+
+    Computes:
+    - First detection time statistics (mean, median, std, percentiles)
+    - Lead time before delivery (advance warning)
+    - Detection rates at time windows (0.5-1h, 1-2h, 2-4h, 4-6h, 6+h)
+    - Subgroup-specific timing comparison
+
+    Args:
+        df: Predictions dataframe with first_detection_epoch column
+        subgroups: Optional dictionary of subgroup filters for comparison
+        output_dir: Directory to save results (JSON and CSV)
+        prefix: Prefix for output filenames
+
+    Returns:
+        Dictionary with detection timing statistics
+    """
+    # Get unique GUIDs with their first detection epochs
+    guid_data = df.groupby('guid').agg({
+        'first_detection_epoch': 'first',
+        'binary_target': 'max'  # GUID is unhealthy if any epoch unhealthy
+    }).reset_index()
+
+    # Filter to unhealthy GUIDs
+    unhealthy_guids = guid_data[guid_data['binary_target'] == 1]
+    detected = unhealthy_guids[unhealthy_guids['first_detection_epoch'].notna()]
+
+    # Overall statistics
+    n_unhealthy = len(unhealthy_guids)
+    n_detected = len(detected)
+    detection_rate = (n_detected / n_unhealthy * 100) if n_unhealthy > 0 else 0.0
+
+    overall_stats = {
+        'n_total_guids': len(guid_data),
+        'n_unhealthy_guids': n_unhealthy,
+        'n_detected': n_detected,
+        'n_missed': n_unhealthy - n_detected,
+        'detection_rate': detection_rate
+    }
+
+    if n_detected > 0:
+        # Convert to positive hours before birth
+        detection_hours = abs(detected['first_detection_epoch'].values) / 3600
+
+        overall_stats.update({
+            'mean_detection_time_hours': float(np.mean(detection_hours)),
+            'median_detection_time_hours': float(np.median(detection_hours)),
+            'std_detection_time_hours': float(np.std(detection_hours)),
+            'min_detection_time_hours': float(np.min(detection_hours)),
+            'max_detection_time_hours': float(np.max(detection_hours)),
+            'percentiles': {
+                '25th': float(np.percentile(detection_hours, 25)),
+                '50th': float(np.percentile(detection_hours, 50)),
+                '75th': float(np.percentile(detection_hours, 75)),
+                '90th': float(np.percentile(detection_hours, 90)),
+                '95th': float(np.percentile(detection_hours, 95))
+            }
+        })
+
+        # Detection counts by time window
+        windows = {
+            '0.5-1h': (0.5, 1),
+            '1-2h': (1, 2),
+            '2-4h': (2, 4),
+            '4-6h': (4, 6),
+            '6h+': (6, float('inf'))
+        }
+
+        detection_windows = {}
+        for window_name, (start, end) in windows.items():
+            count = ((detection_hours >= start) & (detection_hours < end)).sum()
+            pct = (count / n_detected * 100) if n_detected > 0 else 0.0
+            detection_windows[window_name] = {
+                'count': int(count),
+                'percentage': float(pct)
+            }
+
+        overall_stats['detection_windows'] = detection_windows
+    else:
+        overall_stats.update({
+            'mean_detection_time_hours': None,
+            'median_detection_time_hours': None,
+            'std_detection_time_hours': None,
+            'min_detection_time_hours': None,
+            'max_detection_time_hours': None,
+            'percentiles': {},
+            'detection_windows': {}
+        })
+
+    results = {'overall': overall_stats}
+
+    # Subgroup-specific statistics
+    if subgroups:
+        subgroup_stats = {}
+        for subgroup_name, subgroup_filter in subgroups.items():
+            try:
+                subgroup_df = df[subgroup_filter(df)]
+                subgroup_guid_data = subgroup_df.groupby('guid').agg({
+                    'first_detection_epoch': 'first',
+                    'binary_target': 'max'
+                }).reset_index()
+
+                subgroup_unhealthy = subgroup_guid_data[subgroup_guid_data['binary_target'] == 1]
+                subgroup_detected = subgroup_unhealthy[subgroup_unhealthy['first_detection_epoch'].notna()]
+
+                n_subgroup_unhealthy = len(subgroup_unhealthy)
+                n_subgroup_detected = len(subgroup_detected)
+                subgroup_detection_rate = (n_subgroup_detected / n_subgroup_unhealthy * 100) if n_subgroup_unhealthy > 0 else 0.0
+
+                subgroup_stat = {
+                    'n_unhealthy_guids': n_subgroup_unhealthy,
+                    'n_detected': n_subgroup_detected,
+                    'n_missed': n_subgroup_unhealthy - n_subgroup_detected,
+                    'detection_rate': subgroup_detection_rate
+                }
+
+                if n_subgroup_detected > 0:
+                    subgroup_hours = abs(subgroup_detected['first_detection_epoch'].values) / 3600
+                    subgroup_stat.update({
+                        'mean_detection_time_hours': float(np.mean(subgroup_hours)),
+                        'median_detection_time_hours': float(np.median(subgroup_hours)),
+                        'std_detection_time_hours': float(np.std(subgroup_hours)),
+                        'min_detection_time_hours': float(np.min(subgroup_hours)),
+                        'max_detection_time_hours': float(np.max(subgroup_hours))
+                    })
+                else:
+                    subgroup_stat.update({
+                        'mean_detection_time_hours': None,
+                        'median_detection_time_hours': None,
+                        'std_detection_time_hours': None,
+                        'min_detection_time_hours': None,
+                        'max_detection_time_hours': None
+                    })
+
+                subgroup_stats[subgroup_name] = subgroup_stat
+
+            except Exception as e:
+                logger.warning(f"Error computing detection stats for subgroup {subgroup_name}: {e}")
+                subgroup_stats[subgroup_name] = {'error': str(e)}
+
+        results['subgroups'] = subgroup_stats
+
+    # Log summary
+    logger.info(f"Detection Timing Statistics:")
+    logger.info(f"  Overall: {n_detected}/{n_unhealthy} detected ({detection_rate:.1f}%)")
+    if n_detected > 0:
+        logger.info(f"  Mean detection time: {overall_stats['mean_detection_time_hours']:.2f}h before birth")
+        logger.info(f"  Median detection time: {overall_stats['median_detection_time_hours']:.2f}h before birth")
+
+    return results
+
+
+def plot_detection_timing_enhanced(
+    df: pd.DataFrame,
+    subgroups: Dict[str, callable],
+    output_dir: Path,
+    prefix: str = ""
+) -> None:
+    """
+    Enhanced detection timing plots with subgroup comparison.
+
+    Creates 2x2 grid:
+    - Top-left: Overlaid histograms by subgroup
+    - Top-right: Cumulative detection curves
+    - Bottom-left: Box plots (detection time distribution)
+    - Bottom-right: Violin plots (lead time distribution)
+
+    Args:
+        df: Predictions dataframe
+        subgroups: Dictionary of subgroup filters
+        output_dir: Directory to save plots
+        prefix: Prefix for filenames
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    colors = ['#e74c3c', '#3498db', '#2ecc71']  # Red, Blue, Green
+
+    # Collect detection times for each subgroup
+    subgroup_detections = {}
+    for idx, (subgroup_name, subgroup_filter) in enumerate(subgroups.items()):
+        subgroup_df = df[subgroup_filter(df)]
+        guid_data = subgroup_df.groupby('guid').agg({
+            'first_detection_epoch': 'first',
+            'binary_target': 'max'
+        }).reset_index()
+
+        unhealthy = guid_data[guid_data['binary_target'] == 1]
+        detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
+
+        if len(detected) > 0:
+            # Convert to positive hours before birth
+            detection_hours = abs(detected['first_detection_epoch'].values) / 3600
+            subgroup_detections[subgroup_name] = detection_hours
+
+    if len(subgroup_detections) == 0:
+        logger.warning("No detections found for enhanced timing analysis")
+        return
+
+    # Plot 1: Overlaid histograms
+    for idx, (name, hours) in enumerate(subgroup_detections.items()):
+        axes[0, 0].hist(hours, bins=20, alpha=0.6, label=name.title(),
+                       edgecolor='black', color=colors[idx % len(colors)])
+    axes[0, 0].set_xlabel('Time Before Birth (hours)', fontsize=11)
+    axes[0, 0].set_ylabel('Number of Detections', fontsize=11)
+    axes[0, 0].set_title('Detection Time Distribution by Subgroup', fontsize=13)
+    axes[0, 0].legend(fontsize=10)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Plot 2: Cumulative detection curves
+    for idx, (name, hours) in enumerate(subgroup_detections.items()):
+        sorted_hours = np.sort(hours)
+        cumulative_pct = np.arange(1, len(sorted_hours) + 1) / len(sorted_hours) * 100
+        axes[0, 1].plot(sorted_hours, cumulative_pct, linewidth=2.5,
+                       label=name.title(), color=colors[idx % len(colors)])
+    axes[0, 1].set_xlabel('Time Before Birth (hours)', fontsize=11)
+    axes[0, 1].set_ylabel('Cumulative % Detected', fontsize=11)
+    axes[0, 1].set_title('Cumulative Detection Curves', fontsize=13)
+    axes[0, 1].legend(fontsize=10)
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_ylim([0, 105])
+
+    # Plot 3: Box plots
+    box_data = [hours for hours in subgroup_detections.values()]
+    box_labels = [name.title() for name in subgroup_detections.keys()]
+    bp = axes[1, 0].boxplot(box_data, labels=box_labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    axes[1, 0].set_ylabel('Time Before Birth (hours)', fontsize=11)
+    axes[1, 0].set_title('Detection Time Distribution (Box Plots)', fontsize=13)
+    axes[1, 0].grid(True, alpha=0.3, axis='y')
+
+    # Plot 4: Violin plots
+    positions = np.arange(1, len(subgroup_detections) + 1)
+    for idx, (name, hours) in enumerate(subgroup_detections.items()):
+        parts = axes[1, 1].violinplot([hours], positions=[positions[idx]],
+                                     showmeans=True, showmedians=True)
+        for pc in parts['bodies']:
+            pc.set_facecolor(colors[idx % len(colors)])
+            pc.set_alpha(0.6)
+    axes[1, 1].set_xticks(positions)
+    axes[1, 1].set_xticklabels([name.title() for name in subgroup_detections.keys()])
+    axes[1, 1].set_ylabel('Time Before Birth (hours)', fontsize=11)
+    axes[1, 1].set_title('Lead Time Distribution (Violin Plots)', fontsize=13)
+    axes[1, 1].grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{prefix}enhanced_detection_timing.png", dpi=150)
+    plt.close()
+
+    logger.info(f"Saved: {prefix}enhanced_detection_timing.png")
+
+
+def create_lead_time_table(
+    df: pd.DataFrame,
+    subgroups: Dict[str, callable]
+) -> pd.DataFrame:
+    """
+    Create summary table of lead time metrics by subgroup.
+
+    Returns DataFrame with:
+    - subgroup, n_unhealthy_guids, n_detected, detection_rate (%)
+    - mean/median/std lead_time_hours
+    - pct_detected_gt_1h, pct_detected_gt_2h, pct_detected_gt_6h
+    - min/max lead_time
+
+    Args:
+        df: Predictions dataframe
+        subgroups: Dictionary of subgroup filters
+
+    Returns:
+        DataFrame with lead time metrics
+    """
+    results = []
+
+    for subgroup_name, subgroup_filter in subgroups.items():
+        subgroup_df = df[subgroup_filter(df)]
+        guid_data = subgroup_df.groupby('guid').agg({
+            'first_detection_epoch': 'first',
+            'binary_target': 'max'
+        }).reset_index()
+
+        unhealthy = guid_data[guid_data['binary_target'] == 1]
+        detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
+
+        n_unhealthy = len(unhealthy)
+        n_detected = len(detected)
+        detection_rate = (n_detected / n_unhealthy * 100) if n_unhealthy > 0 else 0.0
+
+        row = {
+            'subgroup': subgroup_name,
+            'n_unhealthy_guids': n_unhealthy,
+            'n_detected': n_detected,
+            'detection_rate_pct': detection_rate
+        }
+
+        if n_detected > 0:
+            # Lead time = time before birth when first detected
+            lead_time_hours = abs(detected['first_detection_epoch'].values) / 3600
+
+            row.update({
+                'mean_lead_time_hours': np.mean(lead_time_hours),
+                'median_lead_time_hours': np.median(lead_time_hours),
+                'std_lead_time_hours': np.std(lead_time_hours),
+                'min_lead_time_hours': np.min(lead_time_hours),
+                'max_lead_time_hours': np.max(lead_time_hours),
+                'pct_detected_gt_1h': (lead_time_hours > 1).sum() / n_detected * 100,
+                'pct_detected_gt_2h': (lead_time_hours > 2).sum() / n_detected * 100,
+                'pct_detected_gt_6h': (lead_time_hours > 6).sum() / n_detected * 100
+            })
+        else:
+            row.update({
+                'mean_lead_time_hours': np.nan,
+                'median_lead_time_hours': np.nan,
+                'std_lead_time_hours': np.nan,
+                'min_lead_time_hours': np.nan,
+                'max_lead_time_hours': np.nan,
+                'pct_detected_gt_1h': 0.0,
+                'pct_detected_gt_2h': 0.0,
+                'pct_detected_gt_6h': 0.0
+            })
+
+        results.append(row)
+
+    return pd.DataFrame(results)
+
+
 def plot_confusion_matrices_by_time(
     df: pd.DataFrame,
     output_dir: Path,
-    prefix: str = ""
+    prefix: str = "",
+    exclude_last_minutes: float = 30.0
 ) -> None:
     """
     Plot confusion matrices for different time windows.
@@ -1068,11 +1591,12 @@ def plot_confusion_matrices_by_time(
         df: Predictions dataframe
         output_dir: Directory to save plots
         prefix: Prefix for plot filenames
+        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute dynamic time windows
-    time_windows = compute_time_windows(df)
+    time_windows = compute_time_windows(df, exclude_last_minutes=exclude_last_minutes)
 
     # FIX #5: Ensure epoch_hours column exists
     df = ensure_epoch_hours(df.copy())
@@ -1480,6 +2004,191 @@ def plot_subgroup_roc_curves(
     logger.info(f"Saved: {prefix}subgroup_roc_curves.png")
 
 
+def plot_enhanced_subgroup_comparison(
+    df: pd.DataFrame,
+    subgroups: Dict[str, callable],
+    time_bins: np.ndarray,
+    output_dir: Path,
+    prefix: str = "",
+    metric: str = "both"
+) -> None:
+    """
+    Enhanced subgroup comparison with side-by-side epoch and GUID-level views.
+
+    Creates 2x2 grid comparing epoch-level vs GUID-level metrics for subgroups.
+
+    Args:
+        df: Predictions dataframe
+        subgroups: Dictionary mapping subgroup_name -> filter_function
+        time_bins: Time bin edges in hours
+        output_dir: Directory to save plots
+        prefix: Prefix for plot filenames
+        metric: "sensitivity", "specificity", or "both"
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
+
+    # Create 2x2 subplot grid
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    colors = ['#e74c3c', '#3498db', '#2ecc71']  # Red, Blue, Green
+    markers = ['o', 's', '^']
+
+    # Compute metrics for each subgroup (both epoch and GUID level)
+    for idx, (subgroup_name, subgroup_filter) in enumerate(subgroups.items()):
+        # Epoch-level metrics
+        epoch_metrics = compute_subgroup_metrics_by_time(
+            df, subgroup_name, subgroup_filter, time_bins, guid_level=False
+        )
+
+        # GUID-level metrics
+        guid_metrics = compute_subgroup_metrics_by_time(
+            df, subgroup_name, subgroup_filter, time_bins, guid_level=True
+        )
+
+        if len(epoch_metrics) == 0:
+            continue
+
+        color = colors[idx % len(colors)]
+        marker = markers[idx % len(markers)]
+        label = subgroup_name.replace('_', ' ').title()
+
+        # Negate bin_center to show negative hours before birth
+        x_epoch = -epoch_metrics['bin_center'].values
+        x_guid = -guid_metrics['bin_center'].values if len(guid_metrics) > 0 else []
+
+        # Top-left: Epoch-level Sensitivity
+        if 'sensitivity' in epoch_metrics.columns and not np.all(np.isnan(epoch_metrics['sensitivity'])):
+            axes[0, 0].plot(x_epoch, epoch_metrics['sensitivity'].values,
+                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
+
+        # Top-right: GUID-level Cumulative Sensitivity
+        if len(guid_metrics) > 0 and 'guid_sensitivity' in guid_metrics.columns:
+            axes[0, 1].plot(x_guid, guid_metrics['guid_sensitivity'].values,
+                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
+
+        # Bottom-left: Epoch-level Specificity
+        if 'specificity' in epoch_metrics.columns and not np.all(np.isnan(epoch_metrics['specificity'])):
+            axes[1, 0].plot(x_epoch, epoch_metrics['specificity'].values,
+                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
+
+        # Bottom-right: GUID-level Cumulative Specificity
+        if len(guid_metrics) > 0 and 'guid_specificity' in guid_metrics.columns:
+            axes[1, 1].plot(x_guid, guid_metrics['guid_specificity'].values,
+                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
+
+    # Format subplots
+    for ax, title in zip(axes.flat, [
+        'Epoch-Level Sensitivity',
+        'GUID-Level Cumulative Sensitivity (Monotonic)',
+        'Epoch-Level Specificity',
+        'GUID-Level Cumulative Specificity'
+    ]):
+        ax.set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=11)
+        ax.set_ylabel('Metric Value', fontsize=11)
+        ax.set_title(title, fontsize=12)
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{prefix}enhanced_sensitivity_specificity.png", dpi=150)
+    plt.close()
+
+    logger.info(f"Saved: {prefix}enhanced_sensitivity_specificity.png")
+
+
+def compute_subgroup_statistics_summary(
+    df: pd.DataFrame,
+    subgroups: Dict[str, callable],
+    time_bins: np.ndarray
+) -> pd.DataFrame:
+    """
+    Compute comprehensive statistics for each subgroup.
+
+    Returns DataFrame with overall sensitivity/specificity and detection rates
+    at different time windows.
+
+    Args:
+        df: Predictions dataframe
+        subgroups: Dictionary mapping subgroup_name -> filter_function
+        time_bins: Time bin edges in hours
+
+    Returns:
+        DataFrame with subgroup statistics
+    """
+    # FIX #5: Ensure epoch_hours column exists
+    df = ensure_epoch_hours(df.copy())
+
+    results = []
+
+    for subgroup_name, subgroup_filter in subgroups.items():
+        subgroup_df = df[subgroup_filter(df)]
+
+        if len(subgroup_df) == 0:
+            continue
+
+        # GUID-level statistics
+        guid_data = subgroup_df.groupby('guid').agg({
+            'binary_target': 'max',
+            'clinical_pred': 'max',
+            'first_detection_epoch': 'first'
+        }).reset_index()
+
+        n_total_guids = len(guid_data)
+        unhealthy_guids = guid_data[guid_data['binary_target'] == 1]
+        healthy_guids = guid_data[guid_data['binary_target'] == 0]
+
+        n_unhealthy = len(unhealthy_guids)
+        n_healthy = len(healthy_guids)
+
+        # Overall GUID-level metrics
+        if n_unhealthy > 0:
+            overall_sensitivity = (unhealthy_guids['clinical_pred'] == 1).sum() / n_unhealthy
+        else:
+            overall_sensitivity = np.nan
+
+        if n_healthy > 0:
+            overall_specificity = 1 - (healthy_guids['clinical_pred'] == 1).sum() / n_healthy
+        else:
+            overall_specificity = np.nan
+
+        # Detection rates at key time windows
+        detected = unhealthy_guids[unhealthy_guids['first_detection_epoch'].notna()]
+        if len(detected) > 0:
+            detection_hours = abs(detected['first_detection_epoch'].values) / 3600
+            detection_rate_1h = (detection_hours <= 1).sum() / len(unhealthy_guids) * 100
+            detection_rate_2h = (detection_hours <= 2).sum() / len(unhealthy_guids) * 100
+            detection_rate_6h = (detection_hours <= 6).sum() / len(unhealthy_guids) * 100
+            mean_detection_time = np.mean(detection_hours)
+            median_detection_time = np.median(detection_hours)
+        else:
+            detection_rate_1h = 0.0
+            detection_rate_2h = 0.0
+            detection_rate_6h = 0.0
+            mean_detection_time = np.nan
+            median_detection_time = np.nan
+
+        row = {
+            'subgroup_name': subgroup_name,
+            'n_total_guids': n_total_guids,
+            'n_unhealthy_guids': n_unhealthy,
+            'n_healthy_guids': n_healthy,
+            'overall_sensitivity': overall_sensitivity,
+            'overall_specificity': overall_specificity,
+            'detection_rate_1h': detection_rate_1h,
+            'detection_rate_2h': detection_rate_2h,
+            'detection_rate_6h': detection_rate_6h,
+            'mean_detection_time': mean_detection_time,
+            'median_detection_time': median_detection_time
+        }
+
+        results.append(row)
+
+    return pd.DataFrame(results)
+
+
 def plot_subgroup_distribution(
     df: pd.DataFrame,
     output_dir: Path,
@@ -1703,21 +2412,31 @@ def evaluate_fold(
     val_df_raw.to_csv(val_output_dir / "validation_predictions_raw.csv", index=False)
     logger.info("Validation raw predictions saved")
 
-    # Find optimal thresholds using both approaches
+    # Find optimal thresholds using three approaches (epoch-level, GUID-level, time-specific)
     logger.info("=" * 80)
     logger.info("THRESHOLD DETERMINATION")
     logger.info("=" * 80)
-    threshold_results = find_optimal_thresholds(val_df_raw, target_fpr)
+    threshold_results = find_optimal_thresholds(
+        val_df_raw,
+        target_fpr=target_fpr,
+        time_window_hours=1.0,  # Optimize for 1 hour before delivery
+        max_gap_multiplier=2.0
+    )
 
     # Save threshold information
     with open(val_output_dir / "validation_threshold_info.json", 'w') as f:
         json.dump(threshold_results, f, indent=2)
 
     # Apply clinical decision rule and fill missing epochs for validation
-    # (using epoch-level threshold for validation data processing)
-    epoch_threshold = threshold_results['epoch_level']['threshold']
-    val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), epoch_threshold)
+    # Using TIME-SPECIFIC threshold (optimized for 1h before delivery)
+    time_threshold = threshold_results['time_specific']['threshold']
+    logger.info(f"Using time-specific threshold: {time_threshold:.4f} (optimized for 1h before delivery)")
+    val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), time_threshold)
     val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=2.0)
+
+    # Verify forward-filling after epoch filling
+    from model.vae_teb_prediction.validation_utils import verify_clinical_decision_rule
+    verify_clinical_decision_rule(val_df_clinical, "Validation (post-filling)")
 
     # Save clinical validation predictions
     val_df_clinical.to_csv(val_output_dir / "validation_predictions_clinical.csv", index=False)
@@ -1752,11 +2471,13 @@ def evaluate_fold(
     test_df_raw.to_csv(val_output_dir / "test_predictions_raw.csv", index=False)
     logger.info("Test raw predictions saved")
 
-    # Process test set with both thresholds
+    # Process test set with all three thresholds (time_specific is primary/recommended)
     test_results = {}
 
-    for threshold_type in ['epoch_level', 'guid_level']:
-        logger.info(f"\nProcessing test set with {threshold_type} threshold...")
+    for threshold_type in ['time_specific', 'guid_level', 'epoch_level']:
+        is_primary = (threshold_type == 'time_specific')
+        marker = " [PRIMARY - Clinically Optimized]" if is_primary else ""
+        logger.info(f"\nProcessing test set with {threshold_type} threshold...{marker}")
 
         threshold_value = threshold_results[threshold_type]['threshold']
 
@@ -1769,6 +2490,9 @@ def evaluate_fold(
         test_df = fill_missing_epochs(test_df, max_gap_multiplier=2.0)
         # FIX #9: Log statistics after filling
         log_dataframe_stats(test_df, f"Test Filled ({threshold_type})")
+
+        # Verify forward-filling after epoch filling
+        verify_clinical_decision_rule(test_df, f"Test {threshold_type} (post-filling)")
 
         # Save predictions
         test_df.to_csv(val_output_dir / f"test_predictions_clinical_{threshold_type}.csv", index=False)
@@ -1827,12 +2551,12 @@ def evaluate_fold(
     with open(val_output_dir / "test_metrics_comparison.json", 'w') as f:
         json.dump(test_results, f, indent=2)
 
-    # Generate visualizations for both thresholds
+    # Generate visualizations for all three thresholds
     logger.info("=" * 80)
     logger.info("GENERATING VISUALIZATIONS")
     logger.info("=" * 80)
 
-    for threshold_type in ['epoch_level', 'guid_level']:
+    for threshold_type in ['time_specific', 'guid_level', 'epoch_level']:
         threshold_value = threshold_results[threshold_type]['threshold']
 
         # Apply clinical rule for visualization
@@ -1862,11 +2586,13 @@ def evaluate_fold(
 
         # Generate all plots
         try:
-            plot_metrics_vs_time(test_df, plots_dir, prefix)
-            plot_roc_curves_by_time(test_df, plots_dir, prefix)
-            plot_detection_timing(test_df, plots_dir, prefix)
-            plot_confusion_matrices_by_time(test_df, plots_dir, prefix)
+            plot_metrics_vs_time(test_df, plots_dir, prefix, exclude_last_minutes=30.0)
+            plot_roc_curves_by_time(test_df, plots_dir, prefix, exclude_last_minutes=30.0)
+            plot_confusion_matrices_by_time(test_df, plots_dir, prefix, exclude_last_minutes=30.0)
             plot_guid_level_analysis(test_df, plots_dir, prefix)
+
+            # Original detection timing plot (keep for compatibility)
+            plot_detection_timing(test_df, plots_dir, prefix)
         except Exception as e:
             logger.warning(f"Error generating plots for {threshold_type}: {e}")
 
@@ -1876,12 +2602,49 @@ def evaluate_fold(
         # Create subgroup filters
         subgroup_filters = create_subgroup_filters()
 
+        # Enhanced detection timing analysis
+        try:
+            logger.info("Generating enhanced detection timing analysis...")
+
+            # Comprehensive detection timing statistics
+            detection_stats = analyze_detection_timing_statistics(
+                test_df,
+                subgroups=subgroup_filters,
+                output_dir=plots_dir,
+                prefix=prefix
+            )
+
+            # Save detection statistics as JSON
+            with open(plots_dir / f"{prefix}detection_timing_statistics.json", 'w') as f:
+                json.dump(detection_stats, f, indent=2)
+
+            # Enhanced plots with subgroup comparison (Acidosis vs HIE)
+            timing_subgroups = {
+                'acidosis': subgroup_filters['acidosis'],
+                'hie': subgroup_filters['hie']
+            }
+            plot_detection_timing_enhanced(test_df, timing_subgroups, plots_dir, prefix)
+
+            # Lead time metrics table
+            lead_time_subgroups = {
+                'acidosis': subgroup_filters['acidosis'],
+                'hie': subgroup_filters['hie'],
+                'healthy': subgroup_filters['healthy']
+            }
+            lead_time_table = create_lead_time_table(test_df, lead_time_subgroups)
+            lead_time_table.to_csv(plots_dir / f"{prefix}lead_time_metrics.csv", index=False)
+
+            logger.info(f"Detection timing analysis complete")
+        except Exception as e:
+            logger.warning(f"Error in enhanced detection timing analysis: {e}")
+
         # Create subgroup output directory
         subgroup_dir = plots_dir / "subgroup_analysis"
         subgroup_dir.mkdir(parents=True, exist_ok=True)
 
-        # Compute time bins for subgroup analysis
-        time_bins = compute_time_bins(test_df)
+        # Compute time bins for subgroup analysis (excluding last 30 minutes before birth)
+        time_bins = compute_time_bins(test_df, exclude_last_minutes=30.0)
+        logger.info(f"Time bins computed (excluding last 30min): {len(time_bins)-1} bins from {time_bins[0]:.2f}h to {time_bins[-1]:.2f}h")
 
         # Plot diagnosis comparison (Acidosis vs HIE) - Both epoch and GUID level
         try:
@@ -1905,6 +2668,19 @@ def evaluate_fold(
                 test_df, diagnosis_subgroups,
                 subgroup_dir, prefix="diagnosis_"
             )
+
+            # Enhanced subgroup comparison (Epoch vs GUID level side-by-side)
+            plot_enhanced_subgroup_comparison(
+                test_df, diagnosis_subgroups, time_bins,
+                subgroup_dir, prefix="diagnosis_", metric="both"
+            )
+
+            # Compute and save subgroup statistics summary
+            stats_df = compute_subgroup_statistics_summary(
+                test_df, diagnosis_subgroups, time_bins
+            )
+            stats_df.to_csv(subgroup_dir / "diagnosis_statistics.csv", index=False)
+            logger.info(f"Saved diagnosis subgroup statistics: {len(stats_df)} subgroups")
         except Exception as e:
             logger.warning(f"Error generating diagnosis subgroup plots: {e}")
 

@@ -192,6 +192,144 @@ def log_dataframe_stats(df: pd.DataFrame, label: str) -> None:
         logger.info(f"  Positive predictions: {n_positive} ({pct_positive:.1f}%)")
 
 
+def verify_clinical_decision_rule(df: pd.DataFrame, label: str = "Clinical") -> None:
+    """
+    Verify that GUID-level forward-filling is working correctly.
+
+    This function validates that the clinical decision rule (once a baby is detected
+    as unhealthy, all subsequent epochs until birth are also labeled as unhealthy)
+    has been applied correctly.
+
+    Validates:
+    1. All epochs after first_detection_epoch are marked as unhealthy (clinical_pred=1)
+    2. All epochs before first_detection_epoch are marked as healthy (clinical_pred=0)
+    3. first_detection_epoch is consistent across all rows for each GUID
+
+    Note: Epochs are negative seconds before birth, so "after" means >= (less negative, closer to birth)
+
+    Args:
+        df: DataFrame with clinical_pred and first_detection_epoch columns
+        label: Label for error messages (e.g., "Validation", "Test")
+
+    Raises:
+        ValueError: If verification fails (forward-filling not applied correctly)
+    """
+    required_cols = ['guid', 'epoch', 'clinical_pred', 'first_detection_epoch']
+    missing_cols = set(required_cols) - set(df.columns)
+
+    if missing_cols:
+        logger.warning(
+            f"{label}: Cannot verify clinical decision rule - missing columns: {missing_cols}"
+        )
+        return
+
+    if len(df) == 0:
+        logger.warning(f"{label}: Cannot verify clinical decision rule - empty DataFrame")
+        return
+
+    # Track verification results
+    total_guids = df['guid'].nunique()
+    guids_checked = 0
+    violations_found = 0
+    violation_details = []
+
+    # Process each GUID separately
+    for guid in df['guid'].unique():
+        guid_mask = df['guid'] == guid
+        guid_data = df.loc[guid_mask].copy()
+        guid_data = guid_data.sort_values('epoch', ascending=False)  # Furthest to closest
+
+        # Skip GUIDs with single epoch (nothing to verify)
+        if len(guid_data) <= 1:
+            continue
+
+        guids_checked += 1
+
+        # Get first detection epoch (should be consistent across all rows)
+        first_detections = guid_data['first_detection_epoch'].dropna().unique()
+
+        # No detection for this GUID - all epochs should be predicted as healthy
+        if len(first_detections) == 0 or guid_data['first_detection_epoch'].isna().all():
+            # All clinical_pred should be 0
+            if not (guid_data['clinical_pred'] == 0).all():
+                violations_found += 1
+                n_positive = (guid_data['clinical_pred'] == 1).sum()
+                violation_details.append({
+                    'guid': guid,
+                    'issue': 'no_detection_but_positive_preds',
+                    'details': f"{n_positive}/{len(guid_data)} epochs marked positive despite no detection"
+                })
+            continue
+
+        # Detection exists - verify forward-filling
+        if len(first_detections) > 1:
+            # Inconsistent first_detection_epoch within GUID
+            violations_found += 1
+            violation_details.append({
+                'guid': guid,
+                'issue': 'inconsistent_first_detection',
+                'details': f"Multiple first_detection_epoch values: {first_detections}"
+            })
+            continue
+
+        first_detection_epoch = first_detections[0]
+
+        # Epochs >= first_detection_epoch (closer to birth, less negative) should all be positive
+        epochs_after = guid_data[guid_data['epoch'] >= first_detection_epoch]
+        if not (epochs_after['clinical_pred'] == 1).all():
+            violations_found += 1
+            n_wrong = (epochs_after['clinical_pred'] == 0).sum()
+            violation_details.append({
+                'guid': guid,
+                'issue': 'missing_forward_fill_after_detection',
+                'details': (
+                    f"{n_wrong}/{len(epochs_after)} epochs after first detection "
+                    f"(epoch>={first_detection_epoch:.1f}) marked as healthy (should be unhealthy)"
+                )
+            })
+
+        # Epochs < first_detection_epoch (further from birth, more negative) should all be negative
+        epochs_before = guid_data[guid_data['epoch'] < first_detection_epoch]
+        if len(epochs_before) > 0 and not (epochs_before['clinical_pred'] == 0).all():
+            violations_found += 1
+            n_wrong = (epochs_before['clinical_pred'] == 1).sum()
+            violation_details.append({
+                'guid': guid,
+                'issue': 'incorrect_positive_before_detection',
+                'details': (
+                    f"{n_wrong}/{len(epochs_before)} epochs before first detection "
+                    f"(epoch<{first_detection_epoch:.1f}) marked as unhealthy (should be healthy)"
+                )
+            })
+
+    # Log verification results
+    if violations_found == 0:
+        logger.info(
+            f"{label}: Clinical decision rule verification PASSED ✓ "
+            f"({guids_checked}/{total_guids} GUIDs checked, 0 violations)"
+        )
+    else:
+        logger.error(
+            f"{label}: Clinical decision rule verification FAILED ✗ "
+            f"({violations_found}/{guids_checked} GUIDs with violations)"
+        )
+
+        # Log first 5 violations for debugging
+        for i, violation in enumerate(violation_details[:5]):
+            logger.error(
+                f"  Violation {i+1}: GUID={violation['guid']}, "
+                f"Issue={violation['issue']}, Details={violation['details']}"
+            )
+
+        if len(violation_details) > 5:
+            logger.error(f"  ... and {len(violation_details) - 5} more violations")
+
+        raise ValueError(
+            f"{label}: Clinical decision rule verification failed with {violations_found} violations. "
+            f"Forward-filling may not be applied correctly."
+        )
+
+
 def validate_fold_config(config: dict) -> None:
     """
     Validate fold configuration before training/evaluation.
