@@ -255,10 +255,32 @@ def infer_epoch_interval_seconds(df: pd.DataFrame) -> float:
     if df is None or len(df) < 2 or 'epoch' not in df.columns:
         return 0.0
 
+    # Use only original (non-filled) epochs to infer the dataset grid.
+    if 'is_filled' in df.columns:
+        df = df[df['is_filled'] == False]  # noqa: E712
+        if len(df) < 2:
+            return 0.0
+
     if 'guid' not in df.columns:
         epochs = np.sort(np.unique(df['epoch'].values.astype(float)))
         return float(np.median(np.diff(epochs))) if len(epochs) >= 2 else 0.0
 
+    # Robust grid step: take the MODE of per-GUID consecutive deltas (rounded to 1s).
+    deltas: List[float] = []
+    for _, g in df.groupby('guid', sort=False):
+        epochs_sorted = np.sort(np.unique(g['epoch'].values.astype(float)))
+        if len(epochs_sorted) < 2:
+            continue
+        d = np.diff(epochs_sorted)
+        d = d[d > 0]
+        if len(d):
+            deltas.extend(np.round(d, 0).tolist())
+
+    if len(deltas) >= 10:
+        vc = pd.Series(deltas).value_counts()
+        return float(vc.index[0])
+
+    # Fallback: median of per-GUID medians.
     medians: List[float] = []
     for _, g in df.groupby('guid', sort=False):
         interval = compute_epoch_intervals(g['epoch'].values)
@@ -909,20 +931,40 @@ def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> n
     Returns:
         Array of time bin edges in hours (positive values: 0.5 = 30min before birth, 6 = 6h before birth)
     """
-    # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
-    # Example: epochs from -43200 to -3600 → min=-43200 → abs=-43200 → 12 hours before birth
-    max_epoch_hours = abs(df['epoch'].min()) / 3600
+    df_bins = df.copy()
+    if 'is_filled' in df_bins.columns:
+        df_bins = df_bins[df_bins['is_filled'] == False]  # noqa: E712
+
+    # Ensure epoch_hours exists (positive hours before birth)
+    df_bins = ensure_epoch_hours(df_bins)
 
     # Infer bin size from typical epoch interval (fallback to 20 minutes if inference fails)
-    inferred_seconds = infer_epoch_interval_seconds(df)
+    inferred_seconds = infer_epoch_interval_seconds(df_bins)
     bin_size_hours = (inferred_seconds / 3600.0) if inferred_seconds > 0 else (1.0 / 3.0)
 
     # Convert exclusion from minutes to hours
     exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
 
-    # Create uniform bins starting from exclude_hours (e.g., 0.5h) to max_epoch_hours
-    # This excludes the last N minutes before birth from analysis
-    bins = np.arange(exclude_hours, max_epoch_hours + bin_size_hours, bin_size_hours)
+    if len(df_bins) == 0:
+        return np.array([exclude_hours, exclude_hours + bin_size_hours])
+
+    df_included = df_bins[df_bins['epoch_hours'] >= exclude_hours]
+    if len(df_included) == 0:
+        return np.array([exclude_hours, exclude_hours + bin_size_hours])
+
+    # Anchor bins to the actual epoch grid (bin centers at epoch start times).
+    first_center = float(df_included['epoch_hours'].min())
+    last_center = float(df_included['epoch_hours'].max())
+
+    start_edge = first_center - bin_size_hours / 2.0
+    end_edge = last_center + bin_size_hours / 2.0 + 1e-9
+
+    # Clamp to exclude window so we don't show bins that overlap excluded region.
+    start_edge = max(start_edge, exclude_hours)
+    if start_edge >= end_edge:
+        end_edge = start_edge + bin_size_hours
+
+    bins = np.arange(start_edge, end_edge, bin_size_hours)
 
     return bins
 
