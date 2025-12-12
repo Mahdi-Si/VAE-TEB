@@ -392,27 +392,28 @@ def fill_missing_epochs(
                     }
                     filled_rows.append(filled_row)
                 else:
-                    # Find preceding epoch (next larger epoch value)
-                    preceding_epochs = epochs[epochs > exp_epoch]
-                    if len(preceding_epochs) > 0:
-                        preceding_epoch = preceding_epochs.min()
-                        gap = preceding_epoch - exp_epoch
+                    # Find previous epoch (next smaller epoch value, further from birth)
+                    # For negative epochs: more negative = earlier in time
+                    previous_epochs = epochs[epochs < exp_epoch]
+                    if len(previous_epochs) > 0:
+                        previous_epoch = previous_epochs.max()
+                        gap = exp_epoch - previous_epoch
 
                         if gap <= max_gap:
-                            # Fill from preceding epoch
-                            preceding_data = guid_data_dict[preceding_epoch]
+                            # Fill from previous epoch (further from birth)
+                            previous_data = guid_data_dict[previous_epoch]
                             filled_row = {
                                 'guid': guid,
                                 'epoch': exp_epoch,
-                                'cs_label': preceding_data.get('cs_label'),
-                                'bg_label': preceding_data.get('bg_label'),
-                                'binary_target': preceding_data['binary_target'],
-                                'target': preceding_data['target'],
+                                'cs_label': previous_data.get('cs_label'),
+                                'bg_label': previous_data.get('bg_label'),
+                                'binary_target': previous_data['binary_target'],
+                                'target': previous_data['target'],
                                 'prob_class_0': np.nan,
                                 'prob_class_1': np.nan,
-                                'model_pred': preceding_data['model_pred'],
-                                'clinical_pred': preceding_data['clinical_pred'],
-                                'first_detection_epoch': preceding_data.get('first_detection_epoch', np.nan),
+                                'model_pred': previous_data['model_pred'],
+                                'clinical_pred': previous_data['clinical_pred'],
+                                'first_detection_epoch': previous_data.get('first_detection_epoch', np.nan),
                                 'is_filled': True
                             }
                             filled_rows.append(filled_row)
@@ -430,7 +431,8 @@ def fill_missing_epochs(
             logger.debug(
                 f"GUID {guid}: Skipped {len(skipped_epochs)} epochs due to large gaps. "
                 f"Example: epoch {skipped_epochs[0]['epoch']:.1f}s, "
-                f"gap {skipped_epochs[0]['gap_seconds']:.1f}s > max {max_gap:.1f}s"
+                f"gap {skipped_epochs[0]['gap_seconds']:.1f}s > max {max_gap:.1f}s "
+                f"(no suitable previous epoch within acceptable range)"
             )
 
         # Convert filled rows to dataframe
@@ -671,10 +673,7 @@ def find_optimal_thresholds(
 
 def compute_time_bins(df: pd.DataFrame) -> np.ndarray:
     """
-    Compute dynamic time bins from actual epoch data.
-
-    Focuses on last 6 hours with finer granularity (30-min bins),
-    then coarser bins beyond that.
+    Compute dynamic time bins from actual epoch data with uniform 20-minute bins.
 
     Args:
         df: DataFrame with 'epoch' column (negative seconds before birth)
@@ -686,16 +685,11 @@ def compute_time_bins(df: pd.DataFrame) -> np.ndarray:
     # Example: epochs from -43200 to -3600 → min=-43200 → abs=-43200 → 12 hours before birth
     max_epoch_hours = abs(df['epoch'].min()) / 3600
 
-    if max_epoch_hours <= 6:
-        # All data within 6 hours - use 30-min bins
-        bins = np.arange(0, max_epoch_hours + 0.5, 0.5)
-    else:
-        # Fine bins for 0-6h, coarser beyond
-        bins = np.concatenate([
-            np.arange(0, 6, 0.5),                          # 0-6h: 30-min bins
-            np.arange(6, min(12, max_epoch_hours), 1),    # 6-12h: 1-hour bins
-            np.arange(12, max_epoch_hours + 2, 2)          # >12h: 2-hour bins
-        ])
+    # Uniform 20-minute bins: 20 min = 1/3 hour
+    bin_size_hours = 1.0 / 3.0  # 20 minutes = 0.333... hours
+
+    # Create uniform bins from 0 (birth) to max_epoch_hours
+    bins = np.arange(0, max_epoch_hours + bin_size_hours, bin_size_hours)
 
     return bins
 
@@ -760,7 +754,8 @@ def compute_subgroup_metrics_by_time(
     df: pd.DataFrame,
     subgroup_name: str,
     subgroup_filter: callable,
-    time_bins: np.ndarray
+    time_bins: np.ndarray,
+    guid_level: bool = False
 ) -> pd.DataFrame:
     """
     Compute sensitivity/specificity for a specific subgroup across time bins.
@@ -770,10 +765,12 @@ def compute_subgroup_metrics_by_time(
         subgroup_name: Name of subgroup (for labeling)
         subgroup_filter: Function returning boolean mask for subgroup
         time_bins: Time bin edges in hours
+        guid_level: If True, compute GUID-level cumulative sensitivity (monotonically increasing)
+                   If False, compute epoch-level sensitivity within each bin
 
     Returns:
         DataFrame with: bin_center, sensitivity, specificity, n_samples,
-                       n_detected, prevalence
+                       n_detected, prevalence, guid_sensitivity (if guid_level=True)
     """
     # Apply subgroup filter
     subgroup_df = df[subgroup_filter(df)].copy()
@@ -784,9 +781,14 @@ def compute_subgroup_metrics_by_time(
 
     # Ensure epoch_hours exists
     if 'epoch_hours' not in subgroup_df.columns:
-        subgroup_df['epoch_hours'] = subgroup_df['epoch'] / 3600
+        subgroup_df['epoch_hours'] = abs(subgroup_df['epoch']) / 3600
 
     results = []
+
+    # For GUID-level cumulative metrics, pre-compute total unhealthy GUIDs
+    if guid_level:
+        unhealthy_guids = subgroup_df[subgroup_df['binary_target'] == 1]['guid'].unique()
+        total_unhealthy_guids = len(unhealthy_guids)
 
     for i in range(len(time_bins) - 1):
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
@@ -797,33 +799,69 @@ def compute_subgroup_metrics_by_time(
         bin_data = subgroup_df[bin_mask]
 
         if len(bin_data) == 0:
-            results.append({
+            result = {
                 'bin_center': bin_center,
                 'n_samples': 0,
                 'sensitivity': np.nan,
                 'specificity': np.nan,
                 'n_detected': 0,
                 'prevalence': 0.0
-            })
+            }
+            if guid_level:
+                result['guid_sensitivity'] = np.nan
+                result['guid_specificity'] = np.nan
+            results.append(result)
             continue
 
-        # Compute metrics (same pattern as existing code)
+        # Compute epoch-level metrics within this bin
         class_0 = bin_data[bin_data['binary_target'] == 0]
         class_1 = bin_data[bin_data['binary_target'] == 1]
 
-        sensitivity = (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else np.nan
-        specificity = 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else np.nan
+        epoch_sensitivity = (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else np.nan
+        epoch_specificity = 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else np.nan
         n_detected = (bin_data['clinical_pred'] == 1).sum()
         prevalence = len(class_1) / len(bin_data) if len(bin_data) > 0 else 0.0
 
-        results.append({
+        result = {
             'bin_center': bin_center,
             'n_samples': len(bin_data),
-            'sensitivity': sensitivity,
-            'specificity': specificity,
+            'sensitivity': epoch_sensitivity,
+            'specificity': epoch_specificity,
             'n_detected': n_detected,
             'prevalence': prevalence
-        })
+        }
+
+        # Compute GUID-level cumulative sensitivity if requested
+        if guid_level:
+            # Find all data up to and including this time bin (cumulative)
+            cumulative_mask = subgroup_df['epoch_hours'] <= bin_end
+            cumulative_data = subgroup_df[cumulative_mask]
+
+            # GUID-level sensitivity: A GUID is detected if it has ANY positive prediction up to this time
+            guid_predictions = cumulative_data.groupby('guid').agg({
+                'binary_target': 'max',  # True label (should be consistent per GUID)
+                'clinical_pred': 'max'   # Detected if ANY epoch is positive
+            })
+
+            unhealthy_guid_preds = guid_predictions[guid_predictions['binary_target'] == 1]
+            healthy_guid_preds = guid_predictions[guid_predictions['binary_target'] == 0]
+
+            if len(unhealthy_guid_preds) > 0:
+                guid_sensitivity = (unhealthy_guid_preds['clinical_pred'] == 1).mean()
+            else:
+                guid_sensitivity = np.nan
+
+            if len(healthy_guid_preds) > 0:
+                guid_specificity = 1 - (healthy_guid_preds['clinical_pred'] == 1).mean()
+            else:
+                guid_specificity = np.nan
+
+            result['guid_sensitivity'] = guid_sensitivity
+            result['guid_specificity'] = guid_specificity
+            result['n_unhealthy_guids'] = len(unhealthy_guid_preds)
+            result['n_detected_guids'] = (unhealthy_guid_preds['clinical_pred'] == 1).sum() if len(unhealthy_guid_preds) > 0 else 0
+
+        results.append(result)
 
     df_result = pd.DataFrame(results)
     df_result['subgroup'] = subgroup_name
@@ -885,10 +923,12 @@ def plot_metrics_vs_time(
     # Plot combined figure
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    ax.plot(bin_centers, sensitivities, marker='o', label='Sensitivity (TPR)', linewidth=2, markersize=6)
-    ax.plot(bin_centers, specificities, marker='s', label='Specificity (TNR)', linewidth=2, markersize=6)
+    # Negate bin_centers to show negative hours (before delivery) on left → 0 (delivery) on right
+    x = [-bc for bc in bin_centers]
+    ax.plot(x, sensitivities, marker='o', label='Sensitivity (TPR)', linewidth=2, markersize=6)
+    ax.plot(x, specificities, marker='s', label='Specificity (TNR)', linewidth=2, markersize=6)
 
-    ax.set_xlabel('Time Before Birth (hours)', fontsize=12)
+    ax.set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
     ax.set_ylabel('Metric Value', fontsize=12)
     ax.set_title('Sensitivity and Specificity vs. Time Before Birth', fontsize=14)
     ax.legend(fontsize=11)
@@ -937,8 +977,8 @@ def plot_roc_curves_by_time(
         fpr, tpr, _ = roc_curve(window_data['binary_target'], window_data['prob_class_1'])
         roc_auc = auc(fpr, tpr)
 
-        # Plot
-        label = f"{start_h}-{end_h}h (AUC={roc_auc:.3f})"
+        # Plot (show negative time range: -end to -start hours before birth)
+        label = f"{-end_h:.1f} to {-start_h:.1f}h (AUC={roc_auc:.3f})"
         ax.plot(fpr, tpr, label=label, linewidth=2)
 
     # Plot diagonal
@@ -986,14 +1026,14 @@ def plot_detection_timing(
         logger.warning("No detections found for timing analysis")
         return
 
-    # Convert to hours
-    detection_hours = detected['first_detection_epoch'].values / 3600
+    # Convert to hours (negate to show negative hours before birth)
+    detection_hours = -(detected['first_detection_epoch'].values / 3600)
 
     # Plot 1: Histogram of detection times
     fig, axes = plt.subplots(2, 1, figsize=(12, 10))
 
     axes[0].hist(detection_hours, bins=30, edgecolor='black', alpha=0.7)
-    axes[0].set_xlabel('Time Before Birth (hours)', fontsize=12)
+    axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
     axes[0].set_ylabel('Number of Detections', fontsize=12)
     axes[0].set_title('Distribution of First Detection Times', fontsize=14)
     axes[0].grid(True, alpha=0.3)
@@ -1003,7 +1043,7 @@ def plot_detection_timing(
     cumulative_pct = np.arange(1, len(sorted_hours) + 1) / len(sorted_hours) * 100
 
     axes[1].plot(sorted_hours, cumulative_pct, linewidth=2)
-    axes[1].set_xlabel('Time Before Birth (hours)', fontsize=12)
+    axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
     axes[1].set_ylabel('Cumulative % of Unhealthy GUIDs Detected', fontsize=12)
     axes[1].set_title('Cumulative Detection Curve', fontsize=14)
     axes[1].grid(True, alpha=0.3)
@@ -1062,7 +1102,8 @@ def plot_confusion_matrices_by_time(
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[idx],
                     xticklabels=['Healthy', 'Unhealthy'],
                     yticklabels=['Healthy', 'Unhealthy'])
-        axes[idx].set_title(f'{start_h}-{end_h}h before birth')
+        # Show negative time range: -end to -start hours before birth
+        axes[idx].set_title(f'{-end_h:.1f} to {-start_h:.1f}h before birth')
         axes[idx].set_ylabel('True Label')
         axes[idx].set_xlabel('Predicted Label')
 
@@ -1119,11 +1160,12 @@ def plot_guid_level_analysis(
     detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
     missed = unhealthy[unhealthy['first_detection_epoch'].isna()]
 
-    detection_hours = detected['first_detection_epoch'].values / 3600 if len(detected) > 0 else []
+    # Negate to show negative hours before birth
+    detection_hours = -(detected['first_detection_epoch'].values / 3600) if len(detected) > 0 else []
 
     if len(detection_hours) > 0:
         axes[0, 1].hist(detection_hours, bins=20, edgecolor='black', alpha=0.7)
-        axes[0, 1].set_xlabel('Time Before Birth (hours)')
+        axes[0, 1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=10)
         axes[0, 1].set_ylabel('Count')
         axes[0, 1].set_title(f'Detection Time Distribution (n={len(detected)})')
         axes[0, 1].grid(True, alpha=0.3)
@@ -1289,7 +1331,8 @@ def plot_subgroup_metrics_vs_time(
     subgroups: Dict[str, callable],
     time_bins: np.ndarray,
     output_dir: Path,
-    prefix: str = ""
+    prefix: str = "",
+    guid_level: bool = False
 ) -> None:
     """
     Plot sensitivity/specificity for multiple subgroups on same figure.
@@ -1304,6 +1347,7 @@ def plot_subgroup_metrics_vs_time(
         time_bins: Time bin edges in hours
         output_dir: Directory to save plots
         prefix: Prefix for plot filenames
+        guid_level: If True, plot GUID-level cumulative sensitivity (monotonically increasing)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1314,7 +1358,7 @@ def plot_subgroup_metrics_vs_time(
     subgroup_results = {}
     empty_subgroups = []
     for subgroup_name, subgroup_filter in subgroups.items():
-        metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins)
+        metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins, guid_level=guid_level)
         if len(metrics_df) > 0:
             subgroup_results[subgroup_name] = metrics_df
         else:
@@ -1337,11 +1381,16 @@ def plot_subgroup_metrics_vs_time(
         color = colors[idx]
         marker = markers[idx % len(markers)]
 
-        x = metrics_df['bin_center'].values
+        # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
+        x = -metrics_df['bin_center'].values
 
-        # Filter out NaN values for plotting (but keep x-axis aligned)
-        sens_values = metrics_df['sensitivity'].values
-        spec_values = metrics_df['specificity'].values
+        # Use GUID-level or epoch-level metrics depending on mode
+        if guid_level and 'guid_sensitivity' in metrics_df.columns:
+            sens_values = metrics_df['guid_sensitivity'].values
+            spec_values = metrics_df['guid_specificity'].values
+        else:
+            sens_values = metrics_df['sensitivity'].values
+            spec_values = metrics_df['specificity'].values
 
         # Sensitivity subplot (skip if all NaN)
         if not np.all(np.isnan(sens_values)):
@@ -1356,26 +1405,28 @@ def plot_subgroup_metrics_vs_time(
                         linewidth=2, markersize=6, color=color)
 
     # Format sensitivity subplot
-    axes[0].set_xlabel('Time Before Birth (hours)', fontsize=12)
-    axes[0].set_ylabel('Sensitivity (TPR)', fontsize=12)
-    axes[0].set_title('Sensitivity by Subgroup', fontsize=14)
+    metric_type = "GUID-Level Cumulative" if guid_level else "Epoch-Level"
+    axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
+    axes[0].set_ylabel(f'Sensitivity (TPR) - {metric_type}', fontsize=12)
+    axes[0].set_title(f'Sensitivity by Subgroup ({metric_type})', fontsize=14)
     axes[0].legend(fontsize=10, loc='best')
     axes[0].grid(True, alpha=0.3)
     axes[0].set_ylim([0, 1.05])
 
     # Format specificity subplot
-    axes[1].set_xlabel('Time Before Birth (hours)', fontsize=12)
-    axes[1].set_ylabel('Specificity (TNR)', fontsize=12)
-    axes[1].set_title('Specificity by Subgroup', fontsize=14)
+    axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
+    axes[1].set_ylabel(f'Specificity (TNR) - {metric_type}', fontsize=12)
+    axes[1].set_title(f'Specificity by Subgroup ({metric_type})', fontsize=14)
     axes[1].legend(fontsize=10, loc='best')
     axes[1].grid(True, alpha=0.3)
     axes[1].set_ylim([0, 1.05])
 
     plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}subgroup_metrics_vs_time.png", dpi=150)
+    filename_suffix = "guid_level" if guid_level else "epoch_level"
+    plt.savefig(output_dir / f"{prefix}subgroup_metrics_vs_time_{filename_suffix}.png", dpi=150)
     plt.close()
 
-    logger.info(f"Saved: {prefix}subgroup_metrics_vs_time.png")
+    logger.info(f"Saved: {prefix}subgroup_metrics_vs_time_{filename_suffix}.png")
 
 
 def plot_subgroup_roc_curves(
@@ -1508,9 +1559,11 @@ def plot_subgroup_distribution(
             hie_prev.append((bin_data['target'] == 3).mean() * 100)
 
     if len(bin_centers) > 0:
-        axes[1, 1].plot(bin_centers, acidosis_prev, marker='o', label='Acidosis', linewidth=2)
-        axes[1, 1].plot(bin_centers, hie_prev, marker='s', label='HIE', linewidth=2)
-        axes[1, 1].set_xlabel('Time Before Birth (hours)', fontsize=12)
+        # Negate bin_centers to show negative hours (before delivery) on left → 0 (delivery) on right
+        x = [-bc for bc in bin_centers]
+        axes[1, 1].plot(x, acidosis_prev, marker='o', label='Acidosis', linewidth=2)
+        axes[1, 1].plot(x, hie_prev, marker='s', label='HIE', linewidth=2)
+        axes[1, 1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
         axes[1, 1].set_ylabel('Prevalence (%)', fontsize=12)
         axes[1, 1].set_title('Diagnosis Prevalence Over Time', fontsize=14)
         axes[1, 1].legend(fontsize=11)
@@ -1830,16 +1883,23 @@ def evaluate_fold(
         # Compute time bins for subgroup analysis
         time_bins = compute_time_bins(test_df)
 
-        # Plot diagnosis comparison (Acidosis vs HIE)
+        # Plot diagnosis comparison (Acidosis vs HIE) - Both epoch and GUID level
         try:
             diagnosis_subgroups = {
                 'acidosis': subgroup_filters['acidosis'],
                 'hie': subgroup_filters['hie']
             }
+            # Epoch-level metrics
             plot_subgroup_metrics_vs_time(
                 test_df, diagnosis_subgroups,
                 time_bins,
-                subgroup_dir, prefix="diagnosis_"
+                subgroup_dir, prefix="diagnosis_", guid_level=False
+            )
+            # GUID-level cumulative metrics (monotonically increasing)
+            plot_subgroup_metrics_vs_time(
+                test_df, diagnosis_subgroups,
+                time_bins,
+                subgroup_dir, prefix="diagnosis_", guid_level=True
             )
             plot_subgroup_roc_curves(
                 test_df, diagnosis_subgroups,
@@ -1848,16 +1908,23 @@ def evaluate_fold(
         except Exception as e:
             logger.warning(f"Error generating diagnosis subgroup plots: {e}")
 
-        # Plot CS status comparison
+        # Plot CS status comparison - Both epoch and GUID level
         try:
             cs_subgroups = {
                 'cs_positive': subgroup_filters['cs_positive'],
                 'cs_negative': subgroup_filters['cs_negative']
             }
+            # Epoch-level metrics
             plot_subgroup_metrics_vs_time(
                 test_df, cs_subgroups,
                 time_bins,
-                subgroup_dir, prefix="cs_status_"
+                subgroup_dir, prefix="cs_status_", guid_level=False
+            )
+            # GUID-level cumulative metrics
+            plot_subgroup_metrics_vs_time(
+                test_df, cs_subgroups,
+                time_bins,
+                subgroup_dir, prefix="cs_status_", guid_level=True
             )
             plot_subgroup_roc_curves(
                 test_df, cs_subgroups,
@@ -1866,7 +1933,7 @@ def evaluate_fold(
         except Exception as e:
             logger.warning(f"Error generating CS status subgroup plots: {e}")
 
-        # Plot BG label comparison
+        # Plot BG label comparison - Both epoch and GUID level
         try:
             bg_subgroups = {
                 'bg_positive': subgroup_filters['bg_positive'],
@@ -1875,7 +1942,12 @@ def evaluate_fold(
             plot_subgroup_metrics_vs_time(
                 test_df, bg_subgroups,
                 time_bins,
-                subgroup_dir, prefix="bg_label_"
+                subgroup_dir, prefix="bg_label_", guid_level=False
+            )
+            plot_subgroup_metrics_vs_time(
+                test_df, bg_subgroups,
+                time_bins,
+                subgroup_dir, prefix="bg_label_", guid_level=True
             )
             plot_subgroup_roc_curves(
                 test_df, bg_subgroups,
@@ -1884,7 +1956,7 @@ def evaluate_fold(
         except Exception as e:
             logger.warning(f"Error generating BG label subgroup plots: {e}")
 
-        # Plot combined subgroups
+        # Plot combined subgroups - Both epoch and GUID level
         try:
             combined_subgroups = {
                 'acidosis_cs_pos': subgroup_filters['acidosis_cs_pos'],
@@ -1895,21 +1967,33 @@ def evaluate_fold(
             plot_subgroup_metrics_vs_time(
                 test_df, combined_subgroups,
                 time_bins,
-                subgroup_dir, prefix="combined_"
+                subgroup_dir, prefix="combined_", guid_level=False
+            )
+            plot_subgroup_metrics_vs_time(
+                test_df, combined_subgroups,
+                time_bins,
+                subgroup_dir, prefix="combined_", guid_level=True
             )
         except Exception as e:
             logger.warning(f"Error generating combined subgroup plots: {e}")
 
-        # Plot overall comparison (Healthy vs Unhealthy)
+        # Plot overall comparison (Healthy vs Unhealthy) - Both epoch and GUID level
         try:
             overall_subgroups = {
                 'healthy': subgroup_filters['healthy'],
                 'unhealthy': lambda df: df['binary_target'] == 1
             }
+            # Epoch-level
             plot_subgroup_metrics_vs_time(
                 test_df, overall_subgroups,
                 time_bins,
-                subgroup_dir, prefix="overall_"
+                subgroup_dir, prefix="overall_", guid_level=False
+            )
+            # GUID-level (THIS IS THE KEY ONE - monotonically increasing)
+            plot_subgroup_metrics_vs_time(
+                test_df, overall_subgroups,
+                time_bins,
+                subgroup_dir, prefix="overall_", guid_level=True
             )
         except Exception as e:
             logger.warning(f"Error generating overall subgroup plots: {e}")
@@ -2163,7 +2247,8 @@ def plot_aggregated_metrics(
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    x = aggregated_df['bin_center'].values
+    # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
+    x = -aggregated_df['bin_center'].values
 
     # Plot sensitivity
     ax.plot(x, aggregated_df['sensitivity_mean'],
@@ -2184,7 +2269,7 @@ def plot_aggregated_metrics(
                      alpha=0.2, color='#A23B72', label='Specificity (min-max)')
 
     # Formatting (follows existing conventions)
-    ax.set_xlabel('Time Before Birth (hours)', fontsize=12)
+    ax.set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
     ax.set_ylabel('Metric Value', fontsize=12)
     ax.set_title(
         f'10-Fold CV: Sensitivity and Specificity vs. Time ({threshold_type.replace("_", " ").title()})',
@@ -2420,7 +2505,8 @@ def plot_aggregated_subgroup_metrics(
             if len(subgroup_data) == 0:
                 continue
 
-            x = subgroup_data['bin_center'].values
+            # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
+            x = -subgroup_data['bin_center'].values
 
             # Sensitivity plot with error bands
             sens_mean = subgroup_data['sensitivity_mean'].values
@@ -2459,14 +2545,14 @@ def plot_aggregated_subgroup_metrics(
                                         alpha=0.2, color=colors[idx])
 
         # Format plots
-        axes[0].set_xlabel('Time Before Birth (hours)', fontsize=12)
+        axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
         axes[0].set_ylabel('Sensitivity (mean ± std)', fontsize=12)
         axes[0].set_title(f'Sensitivity by {group_name.replace("_", " ").title()}', fontsize=14)
         axes[0].legend(fontsize=11)
         axes[0].grid(True, alpha=0.3)
         axes[0].set_ylim([0, 1.05])
 
-        axes[1].set_xlabel('Time Before Birth (hours)', fontsize=12)
+        axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
         axes[1].set_ylabel('Specificity (mean ± std)', fontsize=12)
         axes[1].set_title(f'Specificity by {group_name.replace("_", " ").title()}', fontsize=14)
         axes[1].legend(fontsize=11)

@@ -108,7 +108,7 @@ dataset_config:
         cs_label: null
         bg_label: null
         epoch_min: null
-        epoch_max: null
+        epoch_max: -23000
         label: null
         cache_size: 1000
         trim_minutes: 2.0
