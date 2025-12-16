@@ -1078,16 +1078,22 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                 'scales': (S,) - wavelet scales used
             }
         """
-        from scipy.signal import cwt, morlet2
+        import pywt
 
         if scales is None:
             # Generate scales covering 0.003 Hz to Nyquist (2 Hz)
-            # f = omega0 / (2π * scale * dt), omega0 = 6
+            # For Morlet wavelet: f ≈ f_c / (scale * dt), where f_c is center frequency
+            # Morlet center frequency f_c ≈ 1.0 Hz for pywt
             scales = np.logspace(np.log10(2), np.log10(240), 50)
 
         dt = 1.0 / fs
-        omega0 = 6.0  # Morlet parameter
-        frequencies = omega0 / (2 * np.pi * scales * dt)
+
+        # Use Morlet wavelet (complex Morlet for phase information)
+        wavelet = 'morl'  # Morlet wavelet
+
+        # Get center frequency of the Morlet wavelet
+        center_freq = pywt.central_frequency(wavelet)
+        frequencies = center_freq / (scales * dt)
 
         # Flatten across samples and timesteps
         preds_flat = predictions.reshape(-1, predictions.shape[-1])
@@ -1096,9 +1102,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         coherence_maps = []
 
         for i in range(len(preds_flat)):
-            # CWT of prediction and target
-            cwt_pred = cwt(preds_flat[i], morlet2, scales, w=omega0)
-            cwt_targ = cwt(targets_flat[i], morlet2, scales, w=omega0)
+            # CWT of prediction and target using PyWavelets
+            # Returns (scales, time) array of complex coefficients
+            cwt_pred, _ = pywt.cwt(preds_flat[i], scales, wavelet, sampling_period=dt)
+            cwt_targ, _ = pywt.cwt(targets_flat[i], scales, wavelet, sampling_period=dt)
 
             # Cross-wavelet spectrum
             cross_spectrum = cwt_pred * np.conj(cwt_targ)
@@ -2492,19 +2499,19 @@ def main(
     #     tester.run_latent_distribution(test_loader, num_samples=latent_dist_samples)
     # if analysis_samples and analysis_samples > 0:
     #     tester.run_analysis_and_plot(test_loader, num_samples=analysis_samples)
-    if single_pred_samples and single_pred_samples > 0:
-        tester.run_single_prediction_probe(
-            test_loader,
-            num_samples=single_pred_samples,
-            start_index=single_pred_start,
-            step_size=single_pred_step,
-            windows_per_sample=single_pred_windows,
-        )
-    if temporal_accuracy_samples and temporal_accuracy_samples > 0:
-        tester.run_temporal_accuracy_analysis(
-            test_loader,
-            num_samples=temporal_accuracy_samples,
-        )
+    # if single_pred_samples and single_pred_samples > 0:
+    #     tester.run_single_prediction_probe(
+    #         test_loader,
+    #         num_samples=single_pred_samples,
+    #         start_index=single_pred_start,
+    #         step_size=single_pred_step,
+    #         windows_per_sample=single_pred_windows,
+    #     )
+    # if temporal_accuracy_samples and temporal_accuracy_samples > 0:
+    #     tester.run_temporal_accuracy_analysis(
+    #         test_loader,
+    #         num_samples=temporal_accuracy_samples,
+    #     )
     if coherence_analysis_samples and coherence_analysis_samples > 0:
         tester.run_time_frequency_coherence_analysis(
             test_loader,
@@ -2519,20 +2526,21 @@ def main(
 
 
 if __name__ == "__main__":
-    cli_args = parse_args()
-    main(
-        config=cli_args.config,
-        max_samples=cli_args.max_samples,
-        metrics_max_samples=cli_args.metrics_max_samples,
-        analysis_samples=cli_args.analysis_samples,
-        latent_dist_samples=cli_args.latent_dist_samples,
-        latent_interp_pairs=cli_args.latent_interp_pairs,
-        latent_interp_steps=cli_args.latent_interp_steps,
-        latent_interp_plotly=cli_args.latent_interp_plotly,
-        single_pred_samples=cli_args.single_pred_samples,
-        single_pred_start=cli_args.single_pred_start,
-        single_pred_step=cli_args.single_pred_step,
-        single_pred_windows=cli_args.single_pred_windows,
-        temporal_accuracy_samples=cli_args.temporal_accuracy_samples,
-        coherence_analysis_samples=cli_args.coherence_analysis_samples,
-    )
+    # cli_args = parse_args()
+    # main(
+    #     config=cli_args.config,
+    #     max_samples=cli_args.max_samples,
+    #     metrics_max_samples=cli_args.metrics_max_samples,
+    #     analysis_samples=cli_args.analysis_samples,
+    #     latent_dist_samples=cli_args.latent_dist_samples,
+    #     latent_interp_pairs=cli_args.latent_interp_pairs,
+    #     latent_interp_steps=cli_args.latent_interp_steps,
+    #     latent_interp_plotly=cli_args.latent_interp_plotly,
+    #     single_pred_samples=cli_args.single_pred_samples,
+    #     single_pred_start=cli_args.single_pred_start,
+    #     single_pred_step=cli_args.single_pred_step,
+    #     single_pred_windows=cli_args.single_pred_windows,
+    #     temporal_accuracy_samples=cli_args.temporal_accuracy_samples,
+    #     coherence_analysis_samples=cli_args.coherence_analysis_samples,
+    # )
+    main()
