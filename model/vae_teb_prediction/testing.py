@@ -1174,57 +1174,103 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         output_dir: Path,
     ) -> None:
         """
-        Generate STFT coherence visualization plots.
+        Generate comprehensive STFT coherence visualization.
 
-        Creates:
+        Creates single-column, multi-row figure with:
         1. Frequency vs coherence curve with band shading
         2. Band-aggregated coherence bar chart
+        3. Coherence distribution across samples
         """
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        fig, axes = plt.subplots(3, 1, figsize=(14, 16))
 
-        # Plot 1: Coherence vs frequency
         f = stft_results['frequencies']
         coh_mean = stft_results['coherence_mean']
         coh_std = stft_results['coherence_std']
+        coh_matrix = stft_results['coherence_matrix']
 
-        ax1.plot(f, coh_mean, linewidth=2, color='#2E86AB', label='Mean Coherence')
-        ax1.fill_between(f, coh_mean - coh_std, coh_mean + coh_std,
-                         alpha=0.3, color='#2E86AB', label='±1 STD')
-
-        # Shade frequency bands
+        # Define frequency bands
         bands = {
             'VLF': (0.003, 0.04, '#FFE5B4'),
             'LF': (0.04, 0.15, '#E0F7FA'),
             'MF': (0.15, 0.5, '#C8E6C9'),
             'HF': (0.5, 2.0, '#FFCCBC'),
         }
+
+        # Plot 1: Coherence vs frequency with band shading
+        axes[0].plot(f, coh_mean, linewidth=2.5, color='#2E86AB', label='Mean Coherence', zorder=3)
+        axes[0].fill_between(f, coh_mean - coh_std, coh_mean + coh_std,
+                            alpha=0.3, color='#2E86AB', label='±1 STD', zorder=2)
+
         for band_name, (f_min, f_max, color) in bands.items():
-            ax1.axvspan(f_min, f_max, alpha=0.2, color=color, label=band_name)
+            axes[0].axvspan(f_min, f_max, alpha=0.2, color=color, label=band_name, zorder=1)
 
-        ax1.set_xlabel('Frequency (Hz)', fontsize=12)
-        ax1.set_ylabel('Coherence', fontsize=12)
-        ax1.set_title('STFT Coherence: Prediction vs Target', fontsize=14)
-        ax1.legend(loc='best', fontsize=9)
-        ax1.grid(True, alpha=0.3)
-        ax1.set_ylim([0, 1])
-        ax1.set_xlim([0, 2])
+        axes[0].set_xlabel('Frequency (Hz)', fontsize=13, fontweight='bold')
+        axes[0].set_ylabel('Coherence', fontsize=13, fontweight='bold')
+        axes[0].set_title('STFT Coherence Spectrum: Prediction vs Target', fontsize=15, fontweight='bold')
+        axes[0].legend(loc='best', fontsize=10, ncol=2)
+        axes[0].grid(True, alpha=0.3, linestyle='--')
+        axes[0].set_ylim([0, 1.05])
+        axes[0].set_xlim([0, 2])
 
-        # Plot 2: Band-aggregated coherence
+        # Plot 2: Band-aggregated coherence with error bars
         band_coherence = GraphModelVaeTebSmallTester._aggregate_frequency_bands(f, coh_mean)
         band_names = list(band_coherence.keys())
         band_values = [band_coherence[k] for k in band_names]
 
+        # Compute std for each band
+        band_stds = []
+        for band_name in band_names:
+            f_min, f_max, _ = bands[band_name]
+            mask = (f >= f_min) & (f <= f_max)
+            if np.any(mask):
+                band_coh_samples = coh_matrix[:, mask]
+                band_stds.append(np.std(np.mean(band_coh_samples, axis=1)))
+            else:
+                band_stds.append(0)
+
         colors = ['#FFE5B4', '#E0F7FA', '#C8E6C9', '#FFCCBC']
-        ax2.bar(band_names, band_values, color=colors, edgecolor='black', linewidth=1.5)
-        ax2.axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, label='Clinical Threshold (0.7)')
-        ax2.set_ylabel('Mean Coherence', fontsize=12)
-        ax2.set_title('Band-Aggregated Coherence', fontsize=14)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3, axis='y')
-        ax2.set_ylim([0, 1])
+        bars = axes[1].bar(band_names, band_values, color=colors, edgecolor='black',
+                          linewidth=2, alpha=0.8, yerr=band_stds, capsize=10)
+        axes[1].axhline(y=0.7, color='red', linestyle='--', linewidth=2, label='Clinical Threshold (0.7)')
+        axes[1].axhline(y=0.8, color='orange', linestyle='--', linewidth=2, label='Excellent (0.8)')
+        axes[1].set_ylabel('Mean Coherence', fontsize=13, fontweight='bold')
+        axes[1].set_xlabel('Frequency Band', fontsize=13, fontweight='bold')
+        axes[1].set_title('Band-Aggregated Coherence with Variability', fontsize=15, fontweight='bold')
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3, axis='y', linestyle='--')
+        axes[1].set_ylim([0, 1.05])
+
+        # Add value labels on bars
+        for bar, val in zip(bars, band_values):
+            height = bar.get_height()
+            axes[1].text(bar.get_x() + bar.get_width()/2., height,
+                        f'{val:.3f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        # Plot 3: Coherence distribution across frequency (violin plot)
+        band_data = []
+        band_labels = []
+        for band_name in band_names:
+            f_min, f_max, _ = bands[band_name]
+            mask = (f >= f_min) & (f <= f_max)
+            if np.any(mask):
+                # Get coherence values for this band across all samples
+                band_coh = coh_matrix[:, mask].flatten()
+                band_data.append(band_coh)
+                band_labels.append(band_name)
+
+        parts = axes[2].violinplot(band_data, positions=range(len(band_labels)),
+                                   widths=0.7, showmeans=True, showmedians=True)
+        axes[2].set_xticks(range(len(band_labels)))
+        axes[2].set_xticklabels(band_labels)
+        axes[2].set_ylabel('Coherence Distribution', fontsize=13, fontweight='bold')
+        axes[2].set_xlabel('Frequency Band', fontsize=13, fontweight='bold')
+        axes[2].set_title('Coherence Distribution Across Samples and Frequencies', fontsize=15, fontweight='bold')
+        axes[2].grid(True, alpha=0.3, axis='y', linestyle='--')
+        axes[2].set_ylim([0, 1.05])
+        axes[2].axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
 
         plt.tight_layout()
-        fig.savefig(output_dir / 'stft_coherence_analysis.png', dpi=200)
+        fig.savefig(output_dir / 'stft_coherence_analysis.png', dpi=250, bbox_inches='tight')
         plt.close(fig)
 
     @staticmethod
@@ -1233,44 +1279,117 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         output_dir: Path,
     ) -> None:
         """
-        Generate wavelet coherence time-frequency heatmap.
+        Generate comprehensive wavelet coherence time-frequency analysis.
+
+        Creates single-column, multi-row figure with:
+        1. Time-frequency heatmap showing coherence evolution
+        2. Temporal evolution of band-averaged coherence
+        3. Frequency-averaged coherence over time
         """
-        fig, ax = plt.subplots(figsize=(14, 8))
+        fig, axes = plt.subplots(3, 1, figsize=(16, 18))
 
         times = wavelet_results['times']
         freqs = wavelet_results['frequencies']
-        coherence = wavelet_results['coherence_mean']
+        coherence_mean = wavelet_results['coherence_mean']
+        coherence_std = wavelet_results['coherence_std']
 
-        # Create heatmap
-        im = ax.pcolormesh(
-            times, freqs, coherence,
-            cmap='viridis', shading='auto',
+        # Define frequency bands
+        bands = {
+            'VLF': (0.003, 0.04, '#FFE5B4'),
+            'LF': (0.04, 0.15, '#E0F7FA'),
+            'MF': (0.15, 0.5, '#C8E6C9'),
+            'HF': (0.5, 2.0, '#FFCCBC'),
+        }
+
+        # Plot 1: Time-Frequency Coherence Heatmap
+        im = axes[0].pcolormesh(
+            times, freqs, coherence_mean,
+            cmap='RdYlGn', shading='auto',
             vmin=0, vmax=1
         )
 
-        # Add frequency band dividers
+        # Add frequency band dividers and labels
         band_edges = [0.003, 0.04, 0.15, 0.5, 2.0]
         for edge in band_edges:
-            ax.axhline(y=edge, color='white', linestyle='--', linewidth=1.5, alpha=0.7)
+            axes[0].axhline(y=edge, color='white', linestyle='--', linewidth=2, alpha=0.8)
 
-        # Add band labels
         band_labels = ['VLF', 'LF', 'MF', 'HF']
         band_centers = [0.02, 0.095, 0.325, 1.25]
         for label, center in zip(band_labels, band_centers):
-            ax.text(times[-1] * 1.02, center, label,
-                    fontsize=11, fontweight='bold', color='white',
-                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+            axes[0].text(times[-1] * 1.01, center, label,
+                        fontsize=12, fontweight='bold', color='black',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black', linewidth=2))
 
-        ax.set_xlabel('Time (seconds)', fontsize=12)
-        ax.set_ylabel('Frequency (Hz)', fontsize=12)
-        ax.set_title('Wavelet Coherence: Time-Frequency Analysis', fontsize=14)
-        ax.set_yscale('log')
+        axes[0].set_xlabel('Time from Prediction Start (seconds)', fontsize=13, fontweight='bold')
+        axes[0].set_ylabel('Frequency (Hz)', fontsize=13, fontweight='bold')
+        axes[0].set_title('Wavelet Coherence: Time-Frequency Evolution Over 2-Minute Prediction Window',
+                         fontsize=15, fontweight='bold')
+        axes[0].set_yscale('log')
+        axes[0].set_ylim([0.003, 2.0])
 
-        cbar = fig.colorbar(im, ax=ax, label='Coherence')
-        cbar.set_label('Coherence', fontsize=12)
+        cbar = fig.colorbar(im, ax=axes[0], label='Coherence', pad=0.02)
+        cbar.set_label('Coherence', fontsize=12, fontweight='bold')
+        cbar.ax.tick_params(labelsize=11)
+
+        # Plot 2: Temporal Evolution by Frequency Band
+        for band_name, (f_min, f_max, color) in bands.items():
+            # Extract coherence for this frequency band
+            freq_mask = (freqs >= f_min) & (freqs <= f_max)
+            if np.any(freq_mask):
+                band_coherence = np.mean(coherence_mean[freq_mask, :], axis=0)
+                band_std = np.mean(coherence_std[freq_mask, :], axis=0)
+
+                axes[1].plot(times, band_coherence, linewidth=2.5, label=band_name,
+                           color=color.replace('#', '#').replace('B4', '80').replace('FA', '90').replace('C9', '80').replace('BC', '90'))
+                axes[1].fill_between(times, band_coherence - band_std, band_coherence + band_std,
+                                    alpha=0.2, color=color)
+
+        axes[1].axhline(y=0.7, color='red', linestyle='--', linewidth=2, label='Clinical Threshold', alpha=0.7)
+        axes[1].axhline(y=0.8, color='orange', linestyle='--', linewidth=2, label='Excellent', alpha=0.7)
+        axes[1].set_xlabel('Time from Prediction Start (seconds)', fontsize=13, fontweight='bold')
+        axes[1].set_ylabel('Mean Coherence', fontsize=13, fontweight='bold')
+        axes[1].set_title('Temporal Evolution of Coherence by Frequency Band', fontsize=15, fontweight='bold')
+        axes[1].legend(fontsize=11, loc='best', ncol=2)
+        axes[1].grid(True, alpha=0.3, linestyle='--')
+        axes[1].set_ylim([0, 1.05])
+        axes[1].set_xlim([times[0], times[-1]])
+
+        # Plot 3: Overall Coherence Over Time (frequency-averaged)
+        overall_coherence = np.mean(coherence_mean, axis=0)
+        overall_std = np.mean(coherence_std, axis=0)
+
+        axes[2].plot(times, overall_coherence, linewidth=3, color='#2E86AB', label='Mean Coherence')
+        axes[2].fill_between(times, overall_coherence - overall_std, overall_coherence + overall_std,
+                            alpha=0.3, color='#2E86AB', label='±1 STD')
+
+        # Add trend line
+        z = np.polyfit(times, overall_coherence, 2)
+        p = np.poly1d(z)
+        axes[2].plot(times, p(times), linewidth=2, linestyle='--', color='red',
+                    label='Quadratic Trend', alpha=0.7)
+
+        axes[2].axhline(y=0.7, color='gray', linestyle='--', linewidth=1.5, alpha=0.5)
+        axes[2].set_xlabel('Time from Prediction Start (seconds)', fontsize=13, fontweight='bold')
+        axes[2].set_ylabel('Overall Coherence', fontsize=13, fontweight='bold')
+        axes[2].set_title('Frequency-Averaged Coherence Evolution Over Prediction Horizon',
+                         fontsize=15, fontweight='bold')
+        axes[2].legend(fontsize=11, loc='best')
+        axes[2].grid(True, alpha=0.3, linestyle='--')
+        axes[2].set_ylim([0, 1.05])
+        axes[2].set_xlim([times[0], times[-1]])
+
+        # Add annotation for trend
+        final_coherence = overall_coherence[-1]
+        initial_coherence = overall_coherence[0]
+        coherence_change = final_coherence - initial_coherence
+        axes[2].text(0.02, 0.95,
+                    f'Initial: {initial_coherence:.3f}\nFinal: {final_coherence:.3f}\nChange: {coherence_change:+.3f}',
+                    transform=axes[2].transAxes, fontsize=11,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
         plt.tight_layout()
-        fig.savefig(output_dir / 'wavelet_coherence_heatmap.png', dpi=200)
+        fig.savefig(output_dir / 'wavelet_coherence_heatmap.png', dpi=250, bbox_inches='tight')
         plt.close(fig)
 
     @staticmethod
@@ -1281,8 +1400,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
     ) -> None:
         """
         Compare STFT and wavelet coherence methods.
+
+        Creates single-column, multi-row figure comparing both methods.
         """
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(4, 1, figsize=(16, 20))
 
         # STFT band coherence
         stft_bands = GraphModelVaeTebSmallTester._aggregate_frequency_bands(
@@ -1299,63 +1420,136 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         # Plot 1: Side-by-side bar comparison
         x = np.arange(len(stft_bands))
         width = 0.35
-        axes[0, 0].bar(x - width/2, [stft_bands[k] for k in stft_bands.keys()], width,
-                       label='STFT', color='#2E86AB')
-        axes[0, 0].bar(x + width/2, [wavelet_bands[k] for k in wavelet_bands.keys()], width,
-                       label='Wavelet', color='#A23B72')
-        axes[0, 0].set_xticks(x)
-        axes[0, 0].set_xticklabels(stft_bands.keys())
-        axes[0, 0].set_ylabel('Mean Coherence')
-        axes[0, 0].set_title('Method Comparison: Band-Aggregated Coherence')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3, axis='y')
-        axes[0, 0].set_ylim([0, 1])
+        bars1 = axes[0].bar(x - width/2, [stft_bands[k] for k in stft_bands.keys()], width,
+                           label='STFT (Welch Method)', color='#2E86AB', alpha=0.8, edgecolor='black', linewidth=1.5)
+        bars2 = axes[0].bar(x + width/2, [wavelet_bands[k] for k in wavelet_bands.keys()], width,
+                           label='Wavelet (CWT)', color='#A23B72', alpha=0.8, edgecolor='black', linewidth=1.5)
 
-        # Plot 2: Frequency-domain overlay
-        axes[0, 1].plot(stft_results['frequencies'],
-                       stft_results['coherence_mean'],
-                       linewidth=2, label='STFT', color='#2E86AB')
+        # Add value labels on bars
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                axes[0].text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(stft_bands.keys(), fontsize=12, fontweight='bold')
+        axes[0].set_ylabel('Mean Coherence', fontsize=13, fontweight='bold')
+        axes[0].set_xlabel('Frequency Band', fontsize=13, fontweight='bold')
+        axes[0].set_title('Method Comparison: Band-Aggregated Coherence (STFT vs Wavelet)',
+                         fontsize=15, fontweight='bold')
+        axes[0].legend(fontsize=11, loc='best')
+        axes[0].grid(True, alpha=0.3, axis='y', linestyle='--')
+        axes[0].set_ylim([0, 1.05])
+        axes[0].axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, alpha=0.5)
+
+        # Plot 2: Frequency-domain overlay with detailed comparison
+        axes[1].plot(stft_results['frequencies'],
+                    stft_results['coherence_mean'],
+                    linewidth=3, label='STFT (Welch)', color='#2E86AB', alpha=0.8)
+
         # Interpolate wavelet to STFT frequencies for comparison
         wavelet_interp = np.interp(
             stft_results['frequencies'],
             wavelet_results['frequencies'],
             np.mean(wavelet_results['coherence_mean'], axis=1)
         )
-        axes[0, 1].plot(stft_results['frequencies'], wavelet_interp,
-                       linewidth=2, label='Wavelet (time-avg)', color='#A23B72')
-        axes[0, 1].set_xlabel('Frequency (Hz)')
-        axes[0, 1].set_ylabel('Coherence')
-        axes[0, 1].set_title('Frequency Domain Comparison')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].set_ylim([0, 1])
+        axes[1].plot(stft_results['frequencies'], wavelet_interp,
+                    linewidth=3, label='Wavelet (time-averaged)', color='#A23B72', alpha=0.8, linestyle='--')
 
-        # Plot 3: Difference map
-        diff = [stft_bands[k] - wavelet_bands[k] for k in stft_bands.keys()]
-        axes[1, 0].bar(range(len(diff)), diff, color='gray', edgecolor='black')
-        axes[1, 0].axhline(y=0, color='black', linestyle='-', linewidth=1)
-        axes[1, 0].set_xticks(range(len(stft_bands)))
-        axes[1, 0].set_xticklabels(stft_bands.keys())
-        axes[1, 0].set_ylabel('STFT - Wavelet')
-        axes[1, 0].set_title('Method Difference (Positive = STFT Higher)')
-        axes[1, 0].grid(True, alpha=0.3, axis='y')
+        # Shade frequency bands
+        bands = {
+            'VLF': (0.003, 0.04, '#FFE5B4'),
+            'LF': (0.04, 0.15, '#E0F7FA'),
+            'MF': (0.15, 0.5, '#C8E6C9'),
+            'HF': (0.5, 2.0, '#FFCCBC'),
+        }
+        for band_name, (f_min, f_max, color) in bands.items():
+            axes[1].axvspan(f_min, f_max, alpha=0.1, color=color)
 
-        # Plot 4: Summary statistics table
-        axes[1, 1].axis('off')
+        axes[1].set_xlabel('Frequency (Hz)', fontsize=13, fontweight='bold')
+        axes[1].set_ylabel('Coherence', fontsize=13, fontweight='bold')
+        axes[1].set_title('Frequency Domain Comparison: STFT vs Wavelet Coherence Spectra',
+                         fontsize=15, fontweight='bold')
+        axes[1].legend(fontsize=11, loc='best')
+        axes[1].grid(True, alpha=0.3, linestyle='--')
+        axes[1].set_ylim([0, 1.05])
+        axes[1].set_xlim([0, 2])
+
+        # Plot 3: Difference analysis (STFT - Wavelet)
+        diff_values = [stft_bands[k] - wavelet_bands[k] for k in stft_bands.keys()]
+        colors_diff = ['green' if d > 0 else 'red' for d in diff_values]
+        bars = axes[2].bar(range(len(diff_values)), diff_values, color=colors_diff,
+                          edgecolor='black', linewidth=2, alpha=0.7)
+        axes[2].axhline(y=0, color='black', linestyle='-', linewidth=2)
+        axes[2].set_xticks(range(len(stft_bands)))
+        axes[2].set_xticklabels(stft_bands.keys(), fontsize=12, fontweight='bold')
+        axes[2].set_ylabel('Coherence Difference (STFT - Wavelet)', fontsize=13, fontweight='bold')
+        axes[2].set_xlabel('Frequency Band', fontsize=13, fontweight='bold')
+        axes[2].set_title('Method Difference Analysis (Positive = STFT Higher, Negative = Wavelet Higher)',
+                         fontsize=15, fontweight='bold')
+        axes[2].grid(True, alpha=0.3, axis='y', linestyle='--')
+
+        # Add value labels
+        for bar, val in zip(bars, diff_values):
+            height = bar.get_height()
+            axes[2].text(bar.get_x() + bar.get_width()/2., height,
+                        f'{val:+.3f}', ha='center', va='bottom' if val > 0 else 'top',
+                        fontsize=11, fontweight='bold')
+
+        # Plot 4: Correlation and agreement analysis
+        axes[3].axis('off')
+
+        # Create comprehensive statistics table
         table_data = [
-            ['Band', 'STFT', 'Wavelet', 'Difference'],
-            *[[k, f'{stft_bands[k]:.3f}', f'{wavelet_bands[k]:.3f}',
-               f'{stft_bands[k]-wavelet_bands[k]:+.3f}']
-              for k in stft_bands.keys()]
+            ['Metric', 'VLF', 'LF', 'MF', 'HF', 'Overall'],
+            ['STFT Coherence',
+             f'{stft_bands["VLF"]:.3f}',
+             f'{stft_bands["LF"]:.3f}',
+             f'{stft_bands["MF"]:.3f}',
+             f'{stft_bands["HF"]:.3f}',
+             f'{np.mean(list(stft_bands.values())):.3f}'],
+            ['Wavelet Coherence',
+             f'{wavelet_bands["VLF"]:.3f}',
+             f'{wavelet_bands["LF"]:.3f}',
+             f'{wavelet_bands["MF"]:.3f}',
+             f'{wavelet_bands["HF"]:.3f}',
+             f'{np.mean(list(wavelet_bands.values())):.3f}'],
+            ['Difference (STFT-Wav)',
+             f'{stft_bands["VLF"]-wavelet_bands["VLF"]:+.3f}',
+             f'{stft_bands["LF"]-wavelet_bands["LF"]:+.3f}',
+             f'{stft_bands["MF"]-wavelet_bands["MF"]:+.3f}',
+             f'{stft_bands["HF"]-wavelet_bands["HF"]:+.3f}',
+             f'{np.mean(list(stft_bands.values()))-np.mean(list(wavelet_bands.values())):+.3f}'],
+            ['Relative Diff (%)',
+             f'{100*(stft_bands["VLF"]-wavelet_bands["VLF"])/wavelet_bands["VLF"]:+.1f}%',
+             f'{100*(stft_bands["LF"]-wavelet_bands["LF"])/wavelet_bands["LF"]:+.1f}%',
+             f'{100*(stft_bands["MF"]-wavelet_bands["MF"])/wavelet_bands["MF"]:+.1f}%',
+             f'{100*(stft_bands["HF"]-wavelet_bands["HF"])/wavelet_bands["HF"]:+.1f}%',
+             '']
         ]
-        table = axes[1, 1].table(cellText=table_data, loc='center',
-                                 cellLoc='center', colWidths=[0.2]*4)
+
+        table = axes[3].table(cellText=table_data, loc='center',
+                             cellLoc='center', colWidths=[0.25, 0.12, 0.12, 0.12, 0.12, 0.15])
         table.auto_set_font_size(False)
-        table.set_fontsize(11)
-        table.scale(1, 2)
+        table.set_fontsize(12)
+        table.scale(1, 3)
+
+        # Style header row
+        for i in range(len(table_data[0])):
+            table[(0, i)].set_facecolor('#4472C4')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+
+        # Style metric column
+        for i in range(1, len(table_data)):
+            table[(i, 0)].set_facecolor('#D9E1F2')
+            table[(i, 0)].set_text_props(weight='bold')
+
+        axes[3].set_title('Comprehensive Method Comparison Statistics',
+                         fontsize=15, fontweight='bold', pad=20)
 
         plt.tight_layout()
-        fig.savefig(output_dir / 'method_comparison.png', dpi=200)
+        fig.savefig(output_dir / 'method_comparison.png', dpi=250, bbox_inches='tight')
         plt.close(fig)
 
     @staticmethod
