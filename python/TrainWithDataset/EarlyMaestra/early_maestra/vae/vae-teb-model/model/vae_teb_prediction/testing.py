@@ -824,6 +824,692 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             processed, out_dir
         )
 
+    def run_time_frequency_coherence_analysis(
+        self,
+        test_loader,
+        *,
+        num_samples: int = 50,
+        start_index: int = 30,
+        max_timesteps: Optional[int] = None,
+        nperseg: int = 64,
+        noverlap: int = 48,
+        wavelet_scales: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Analyze time-frequency coherence between predictions and targets.
+
+        Computes both STFT-based and wavelet-based coherence across clinical
+        frequency bands (VLF, LF, MF, HF) to assess spectral fidelity.
+
+        Args:
+            test_loader: DataLoader for test samples
+            num_samples: Number of samples to aggregate statistics over
+            start_index: Starting timestep (default: warmup_period)
+            max_timesteps: Maximum timesteps to analyze (None = all)
+            nperseg: STFT window length in samples (default: 64 = 16s @ 4Hz)
+            noverlap: STFT overlap in samples (default: 48 = 75% overlap)
+            wavelet_scales: CWT scale array (None = auto-generate 50 scales)
+
+        Outputs to test_results/time_frequency_coherence/:
+            - stft_coherence_analysis.png
+            - wavelet_coherence_heatmap.png
+            - method_comparison.png
+            - coherence_statistics.txt
+        """
+        if num_samples <= 0:
+            logger.info("Time-frequency coherence analysis skipped (num_samples<=0).")
+            return
+
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("PyTorch model unavailable; cannot run coherence analysis.")
+            return
+
+        device = torch.device(
+            f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
+        )
+        model = self.pytorch_model.to(device)
+        model.eval()
+
+        stride = int(getattr(model, "decimation_factor", 16))
+        warmup = int(getattr(model, "warmup_period", 30))
+        start_t = max(start_index, warmup)
+
+        out_dir = Path(self.test_results_dir) / "time_frequency_coherence"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_predictions: List[torch.Tensor] = []
+        all_targets: List[torch.Tensor] = []
+        processed = 0
+
+        logger.info("Collecting predictions and targets for coherence analysis...")
+
+        with torch.inference_mode():
+            for batch in test_loader:
+                if processed >= num_samples:
+                    break
+
+                y_st = batch.fhr_st.to(device)
+                y_ph = batch.fhr_ph.to(device)
+                x_ph = batch.fhr_up_ph.to(device)
+                y_raw = batch.fhr.to(device)
+
+                forward_outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+                mu_pr = forward_outputs.get("mu_pr")
+
+                if mu_pr is None:
+                    logger.warning("Model outputs missing 'mu_pr'; skipping batch.")
+                    continue
+
+                batch_size = mu_pr.size(0)
+                T = mu_pr.size(1)
+                H = mu_pr.size(2)
+                end_t = T if max_timesteps is None else min(T, start_t + max_timesteps)
+
+                for idx in range(batch_size):
+                    if processed >= num_samples:
+                        break
+
+                    sample_preds: List[torch.Tensor] = []
+                    sample_targets: List[torch.Tensor] = []
+
+                    for t in range(start_t, end_t):
+                        raw_start = t * stride
+                        raw_end = raw_start + H
+
+                        if raw_end > y_raw.size(1):
+                            break
+
+                        pred = mu_pr[idx, t, :]
+                        target = y_raw[idx, raw_start:raw_end]
+
+                        sample_preds.append(pred)
+                        sample_targets.append(target)
+
+                    if sample_preds:
+                        all_predictions.append(torch.stack(sample_preds))
+                        all_targets.append(torch.stack(sample_targets))
+                        processed += 1
+
+        if not all_predictions:
+            logger.warning("No valid predictions collected for coherence analysis.")
+            return
+
+        all_predictions_tensor = torch.stack(all_predictions)
+        all_targets_tensor = torch.stack(all_targets)
+
+        N, T_prime, H = all_predictions_tensor.shape
+        logger.info(
+            "Collected %d samples with %d timesteps each (horizon=%d)",
+            N, T_prime, H
+        )
+
+        # Convert to numpy for scipy signal processing
+        preds_np = all_predictions_tensor.detach().cpu().numpy()
+        targets_np = all_targets_tensor.detach().cpu().numpy()
+
+        # Compute STFT coherence
+        logger.info("Computing STFT coherence...")
+        stft_results = self._compute_stft_coherence(
+            preds_np, targets_np,
+            fs=4.0,
+            nperseg=nperseg,
+            noverlap=noverlap
+        )
+
+        # Compute wavelet coherence
+        logger.info("Computing wavelet coherence...")
+        wavelet_results = self._compute_wavelet_coherence(
+            preds_np, targets_np,
+            fs=4.0,
+            scales=wavelet_scales
+        )
+
+        # Aggregate into frequency bands
+        logger.info("Aggregating into clinical frequency bands...")
+        stft_bands = self._aggregate_frequency_bands(
+            stft_results['frequencies'],
+            stft_results['coherence_mean']
+        )
+        wavelet_bands = self._aggregate_frequency_bands(
+            wavelet_results['frequencies'],
+            np.mean(wavelet_results['coherence_mean'], axis=1)
+        )
+
+        # Generate visualizations
+        logger.info("Generating visualizations...")
+        self._plot_stft_coherence_analysis(stft_results, out_dir)
+        self._plot_wavelet_coherence_heatmap(wavelet_results, out_dir)
+        self._plot_method_comparison(stft_results, wavelet_results, out_dir)
+
+        # Generate statistics file
+        logger.info("Writing statistics...")
+        self._write_coherence_statistics(
+            stft_results, wavelet_results,
+            stft_bands, wavelet_bands,
+            N, T_prime, H,
+            nperseg, noverlap,
+            out_dir
+        )
+
+        logger.info(
+            "Time-frequency coherence analysis complete: %d samples, saved to %s",
+            processed, out_dir
+        )
+
+    @staticmethod
+    def _compute_stft_coherence(
+        predictions: np.ndarray,
+        targets: np.ndarray,
+        fs: float = 4.0,
+        nperseg: int = 64,
+        noverlap: int = 48,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute STFT coherence aggregated across samples and timesteps.
+
+        Args:
+            predictions: Shape (N_samples, T_timesteps, H_horizon=480)
+            targets: Shape (N_samples, T_timesteps, H_horizon=480)
+            fs: Sampling frequency in Hz
+            nperseg: Window length for STFT
+            noverlap: Overlap between windows
+
+        Returns:
+            {
+                'frequencies': (F,) - frequency bins in Hz
+                'coherence_mean': (F,) - mean coherence across all windows
+                'coherence_std': (F,) - std deviation of coherence
+                'coherence_matrix': (N*T', F) - coherence per time window
+            }
+        """
+        from scipy.signal import coherence
+
+        # Flatten across samples and timesteps: (N*T', H)
+        preds_flat = predictions.reshape(-1, predictions.shape[-1])
+        targets_flat = targets.reshape(-1, targets.shape[-1])
+
+        # Accumulate coherence across all prediction windows
+        coherence_list = []
+        for i in range(len(preds_flat)):
+            f, coh = coherence(
+                targets_flat[i],
+                preds_flat[i],
+                fs=fs,
+                nperseg=nperseg,
+                noverlap=noverlap,
+                window='hann',
+                detrend='constant'
+            )
+            coherence_list.append(coh)
+
+        coherence_array = np.array(coherence_list)  # (N*T', F)
+
+        return {
+            'frequencies': f,
+            'coherence_mean': np.mean(coherence_array, axis=0),
+            'coherence_std': np.std(coherence_array, axis=0),
+            'coherence_matrix': coherence_array,
+        }
+
+    @staticmethod
+    def _compute_wavelet_coherence(
+        predictions: np.ndarray,
+        targets: np.ndarray,
+        fs: float = 4.0,
+        scales: Optional[np.ndarray] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute wavelet-based coherence using continuous wavelet transform.
+
+        Args:
+            predictions: Shape (N_samples, T_timesteps, H_horizon=480)
+            targets: Shape (N_samples, T_timesteps, H_horizon=480)
+            fs: Sampling frequency in Hz
+            scales: CWT scales (None = auto-generate)
+
+        Returns:
+            {
+                'frequencies': (S,) - center frequencies for each scale
+                'times': (H,) - time points
+                'coherence_mean': (S, H) - mean coherence time-freq map
+                'coherence_std': (S, H) - std deviation
+                'scales': (S,) - wavelet scales used
+            }
+        """
+        from scipy.signal import cwt, morlet2
+
+        if scales is None:
+            # Generate scales covering 0.003 Hz to Nyquist (2 Hz)
+            # f = omega0 / (2π * scale * dt), omega0 = 6
+            scales = np.logspace(np.log10(2), np.log10(240), 50)
+
+        dt = 1.0 / fs
+        omega0 = 6.0  # Morlet parameter
+        frequencies = omega0 / (2 * np.pi * scales * dt)
+
+        # Flatten across samples and timesteps
+        preds_flat = predictions.reshape(-1, predictions.shape[-1])
+        targets_flat = targets.reshape(-1, targets.shape[-1])
+
+        coherence_maps = []
+
+        for i in range(len(preds_flat)):
+            # CWT of prediction and target
+            cwt_pred = cwt(preds_flat[i], morlet2, scales, w=omega0)
+            cwt_targ = cwt(targets_flat[i], morlet2, scales, w=omega0)
+
+            # Cross-wavelet spectrum
+            cross_spectrum = cwt_pred * np.conj(cwt_targ)
+
+            # Auto-spectra
+            auto_pred = np.abs(cwt_pred) ** 2
+            auto_targ = np.abs(cwt_targ) ** 2
+
+            # Coherence (with small epsilon for numerical stability)
+            coherence_map = np.abs(cross_spectrum) ** 2 / (auto_pred * auto_targ + 1e-12)
+            coherence_maps.append(coherence_map)
+
+        coherence_array = np.array(coherence_maps)  # (N*T', S, H)
+
+        return {
+            'frequencies': frequencies,
+            'times': np.arange(predictions.shape[-1]) / fs,
+            'coherence_mean': np.mean(coherence_array, axis=0),
+            'coherence_std': np.std(coherence_array, axis=0),
+            'scales': scales,
+        }
+
+    @staticmethod
+    def _aggregate_frequency_bands(
+        frequencies: np.ndarray,
+        coherence: np.ndarray,
+        axis: int = 0,
+    ) -> Dict[str, float]:
+        """
+        Aggregate coherence values into clinical frequency bands.
+
+        Args:
+            frequencies: Frequency bins in Hz
+            coherence: Coherence values (can be 1D or 2D)
+            axis: Frequency axis (default: 0)
+
+        Returns:
+            {
+                'VLF': mean coherence in VLF band (0.003-0.04 Hz)
+                'LF': mean coherence in LF band (0.04-0.15 Hz)
+                'MF': mean coherence in MF band (0.15-0.5 Hz)
+                'HF': mean coherence in HF band (0.5-2.0 Hz)
+            }
+        """
+        bands = {
+            'VLF': (0.003, 0.04),
+            'LF': (0.04, 0.15),
+            'MF': (0.15, 0.5),
+            'HF': (0.5, 2.0),
+        }
+
+        result = {}
+        for band_name, (f_min, f_max) in bands.items():
+            mask = (frequencies >= f_min) & (frequencies <= f_max)
+            if np.any(mask):
+                band_coherence = np.take(coherence, np.where(mask)[0], axis=axis)
+                result[band_name] = float(np.nanmean(band_coherence))
+            else:
+                result[band_name] = float('nan')
+
+        return result
+
+    @staticmethod
+    def _plot_stft_coherence_analysis(
+        stft_results: Dict[str, np.ndarray],
+        output_dir: Path,
+    ) -> None:
+        """
+        Generate STFT coherence visualization plots.
+
+        Creates:
+        1. Frequency vs coherence curve with band shading
+        2. Band-aggregated coherence bar chart
+        """
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+
+        # Plot 1: Coherence vs frequency
+        f = stft_results['frequencies']
+        coh_mean = stft_results['coherence_mean']
+        coh_std = stft_results['coherence_std']
+
+        ax1.plot(f, coh_mean, linewidth=2, color='#2E86AB', label='Mean Coherence')
+        ax1.fill_between(f, coh_mean - coh_std, coh_mean + coh_std,
+                         alpha=0.3, color='#2E86AB', label='±1 STD')
+
+        # Shade frequency bands
+        bands = {
+            'VLF': (0.003, 0.04, '#FFE5B4'),
+            'LF': (0.04, 0.15, '#E0F7FA'),
+            'MF': (0.15, 0.5, '#C8E6C9'),
+            'HF': (0.5, 2.0, '#FFCCBC'),
+        }
+        for band_name, (f_min, f_max, color) in bands.items():
+            ax1.axvspan(f_min, f_max, alpha=0.2, color=color, label=band_name)
+
+        ax1.set_xlabel('Frequency (Hz)', fontsize=12)
+        ax1.set_ylabel('Coherence', fontsize=12)
+        ax1.set_title('STFT Coherence: Prediction vs Target', fontsize=14)
+        ax1.legend(loc='best', fontsize=9)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim([0, 1])
+        ax1.set_xlim([0, 2])
+
+        # Plot 2: Band-aggregated coherence
+        band_coherence = GraphModelVaeTebSmallTester._aggregate_frequency_bands(f, coh_mean)
+        band_names = list(band_coherence.keys())
+        band_values = [band_coherence[k] for k in band_names]
+
+        colors = ['#FFE5B4', '#E0F7FA', '#C8E6C9', '#FFCCBC']
+        ax2.bar(band_names, band_values, color=colors, edgecolor='black', linewidth=1.5)
+        ax2.axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, label='Clinical Threshold (0.7)')
+        ax2.set_ylabel('Mean Coherence', fontsize=12)
+        ax2.set_title('Band-Aggregated Coherence', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3, axis='y')
+        ax2.set_ylim([0, 1])
+
+        plt.tight_layout()
+        fig.savefig(output_dir / 'stft_coherence_analysis.png', dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _plot_wavelet_coherence_heatmap(
+        wavelet_results: Dict[str, np.ndarray],
+        output_dir: Path,
+    ) -> None:
+        """
+        Generate wavelet coherence time-frequency heatmap.
+        """
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        times = wavelet_results['times']
+        freqs = wavelet_results['frequencies']
+        coherence = wavelet_results['coherence_mean']
+
+        # Create heatmap
+        im = ax.pcolormesh(
+            times, freqs, coherence,
+            cmap='viridis', shading='auto',
+            vmin=0, vmax=1
+        )
+
+        # Add frequency band dividers
+        band_edges = [0.003, 0.04, 0.15, 0.5, 2.0]
+        for edge in band_edges:
+            ax.axhline(y=edge, color='white', linestyle='--', linewidth=1.5, alpha=0.7)
+
+        # Add band labels
+        band_labels = ['VLF', 'LF', 'MF', 'HF']
+        band_centers = [0.02, 0.095, 0.325, 1.25]
+        for label, center in zip(band_labels, band_centers):
+            ax.text(times[-1] * 1.02, center, label,
+                    fontsize=11, fontweight='bold', color='white',
+                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+
+        ax.set_xlabel('Time (seconds)', fontsize=12)
+        ax.set_ylabel('Frequency (Hz)', fontsize=12)
+        ax.set_title('Wavelet Coherence: Time-Frequency Analysis', fontsize=14)
+        ax.set_yscale('log')
+
+        cbar = fig.colorbar(im, ax=ax, label='Coherence')
+        cbar.set_label('Coherence', fontsize=12)
+
+        plt.tight_layout()
+        fig.savefig(output_dir / 'wavelet_coherence_heatmap.png', dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _plot_method_comparison(
+        stft_results: Dict[str, np.ndarray],
+        wavelet_results: Dict[str, np.ndarray],
+        output_dir: Path,
+    ) -> None:
+        """
+        Compare STFT and wavelet coherence methods.
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        # STFT band coherence
+        stft_bands = GraphModelVaeTebSmallTester._aggregate_frequency_bands(
+            stft_results['frequencies'],
+            stft_results['coherence_mean']
+        )
+
+        # Wavelet band coherence (average over time)
+        wavelet_bands = GraphModelVaeTebSmallTester._aggregate_frequency_bands(
+            wavelet_results['frequencies'],
+            np.mean(wavelet_results['coherence_mean'], axis=1)
+        )
+
+        # Plot 1: Side-by-side bar comparison
+        x = np.arange(len(stft_bands))
+        width = 0.35
+        axes[0, 0].bar(x - width/2, [stft_bands[k] for k in stft_bands.keys()], width,
+                       label='STFT', color='#2E86AB')
+        axes[0, 0].bar(x + width/2, [wavelet_bands[k] for k in wavelet_bands.keys()], width,
+                       label='Wavelet', color='#A23B72')
+        axes[0, 0].set_xticks(x)
+        axes[0, 0].set_xticklabels(stft_bands.keys())
+        axes[0, 0].set_ylabel('Mean Coherence')
+        axes[0, 0].set_title('Method Comparison: Band-Aggregated Coherence')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3, axis='y')
+        axes[0, 0].set_ylim([0, 1])
+
+        # Plot 2: Frequency-domain overlay
+        axes[0, 1].plot(stft_results['frequencies'],
+                       stft_results['coherence_mean'],
+                       linewidth=2, label='STFT', color='#2E86AB')
+        # Interpolate wavelet to STFT frequencies for comparison
+        wavelet_interp = np.interp(
+            stft_results['frequencies'],
+            wavelet_results['frequencies'],
+            np.mean(wavelet_results['coherence_mean'], axis=1)
+        )
+        axes[0, 1].plot(stft_results['frequencies'], wavelet_interp,
+                       linewidth=2, label='Wavelet (time-avg)', color='#A23B72')
+        axes[0, 1].set_xlabel('Frequency (Hz)')
+        axes[0, 1].set_ylabel('Coherence')
+        axes[0, 1].set_title('Frequency Domain Comparison')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].set_ylim([0, 1])
+
+        # Plot 3: Difference map
+        diff = [stft_bands[k] - wavelet_bands[k] for k in stft_bands.keys()]
+        axes[1, 0].bar(range(len(diff)), diff, color='gray', edgecolor='black')
+        axes[1, 0].axhline(y=0, color='black', linestyle='-', linewidth=1)
+        axes[1, 0].set_xticks(range(len(stft_bands)))
+        axes[1, 0].set_xticklabels(stft_bands.keys())
+        axes[1, 0].set_ylabel('STFT - Wavelet')
+        axes[1, 0].set_title('Method Difference (Positive = STFT Higher)')
+        axes[1, 0].grid(True, alpha=0.3, axis='y')
+
+        # Plot 4: Summary statistics table
+        axes[1, 1].axis('off')
+        table_data = [
+            ['Band', 'STFT', 'Wavelet', 'Difference'],
+            *[[k, f'{stft_bands[k]:.3f}', f'{wavelet_bands[k]:.3f}',
+               f'{stft_bands[k]-wavelet_bands[k]:+.3f}']
+              for k in stft_bands.keys()]
+        ]
+        table = axes[1, 1].table(cellText=table_data, loc='center',
+                                 cellLoc='center', colWidths=[0.2]*4)
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1, 2)
+
+        plt.tight_layout()
+        fig.savefig(output_dir / 'method_comparison.png', dpi=200)
+        plt.close(fig)
+
+    @staticmethod
+    def _write_coherence_statistics(
+        stft_results: Dict[str, np.ndarray],
+        wavelet_results: Dict[str, np.ndarray],
+        stft_bands: Dict[str, float],
+        wavelet_bands: Dict[str, float],
+        n_samples: int,
+        n_timesteps: int,
+        horizon: int,
+        nperseg: int,
+        noverlap: int,
+        output_dir: Path,
+    ) -> None:
+        """Write comprehensive statistics file."""
+        output_file = output_dir / 'coherence_statistics.txt'
+
+        # Compute standard deviations for each band
+        stft_coh_matrix = stft_results['coherence_matrix']
+        stft_band_stds = {}
+        for band_name, (f_min, f_max) in [('VLF', (0.003, 0.04)), ('LF', (0.04, 0.15)),
+                                           ('MF', (0.15, 0.5)), ('HF', (0.5, 2.0))]:
+            mask = (stft_results['frequencies'] >= f_min) & (stft_results['frequencies'] <= f_max)
+            if np.any(mask):
+                band_data = stft_coh_matrix[:, mask]
+                stft_band_stds[band_name] = float(np.nanstd(np.nanmean(band_data, axis=1)))
+            else:
+                stft_band_stds[band_name] = 0.0
+
+        # Similar for wavelet
+        wavelet_coh_matrix = wavelet_results['coherence_mean']
+        wavelet_band_stds = {}
+        for band_name, (f_min, f_max) in [('VLF', (0.003, 0.04)), ('LF', (0.04, 0.15)),
+                                            ('MF', (0.15, 0.5)), ('HF', (0.5, 2.0))]:
+            mask = (wavelet_results['frequencies'] >= f_min) & (wavelet_results['frequencies'] <= f_max)
+            if np.any(mask):
+                band_data = wavelet_coh_matrix[mask, :]
+                wavelet_band_stds[band_name] = float(np.nanstd(np.nanmean(band_data, axis=0)))
+            else:
+                wavelet_band_stds[band_name] = 0.0
+
+        # Compute MAD
+        mad = np.mean([abs(stft_bands[k] - wavelet_bands[k]) for k in stft_bands.keys()])
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("Time-Frequency Coherence Analysis Results\n")
+            f.write("=" * 70 + "\n")
+            f.write(f"Samples analyzed: {n_samples}\n")
+            f.write(f"Timesteps per sample: {n_timesteps} (after warmup)\n")
+            f.write(f"Prediction horizon: {horizon} samples ({horizon/4:.1f} seconds @ 4 Hz)\n")
+            f.write("\n")
+
+            f.write("STFT Coherence (Welch's Method)\n")
+            f.write("-" * 70 + "\n")
+            f.write("Parameters:\n")
+            f.write(f"  - Window length (nperseg): {nperseg} samples ({nperseg/4:.1f} seconds)\n")
+            f.write(f"  - Overlap: {noverlap} samples ({noverlap/4:.1f} seconds, {100*noverlap/nperseg:.0f}%)\n")
+            f.write(f"  - Number of windows per horizon: {(horizon-nperseg)//(nperseg-noverlap)+1}\n")
+            f.write(f"  - Frequency resolution: {4.0/nperseg:.4f} Hz\n")
+            f.write(f"  - Window function: Hann\n")
+            f.write("\n")
+
+            f.write("Band-Aggregated Coherence (Mean ± Std):\n")
+            for band_name in ['VLF', 'LF', 'MF', 'HF']:
+                mean_val = stft_bands[band_name]
+                std_val = stft_band_stds.get(band_name, 0.0)
+                freq_range = {'VLF': '0.003-0.04', 'LF': '0.04-0.15',
+                              'MF': '0.15-0.5', 'HF': '0.5-2.0'}[band_name]
+                check = '✓' if (band_name == 'MF' and mean_val > 0.8) or \
+                              (band_name == 'LF' and mean_val > 0.7) else ''
+                f.write(f"  {band_name} ({freq_range} Hz): {mean_val:.3f} ± {std_val:.3f} {check}\n")
+            f.write("\n")
+
+            f.write("Wavelet Coherence (Continuous Wavelet Transform)\n")
+            f.write("-" * 70 + "\n")
+            f.write("Parameters:\n")
+            f.write("  - Wavelet: Morlet (omega0=6)\n")
+            f.write(f"  - Number of scales: {len(wavelet_results['scales'])}\n")
+            f.write(f"  - Frequency range: {wavelet_results['frequencies'].min():.3f}-{wavelet_results['frequencies'].max():.1f} Hz\n")
+            f.write("  - Time resolution: Variable (better at HF)\n")
+            f.write("  - Frequency resolution: Variable (better at LF)\n")
+            f.write("\n")
+
+            f.write("Band-Aggregated Coherence (time-averaged, Mean ± Std):\n")
+            for band_name in ['VLF', 'LF', 'MF', 'HF']:
+                mean_val = wavelet_bands[band_name]
+                std_val = wavelet_band_stds.get(band_name, 0.0)
+                freq_range = {'VLF': '0.003-0.04', 'LF': '0.04-0.15',
+                              'MF': '0.15-0.5', 'HF': '0.5-2.0'}[band_name]
+                check = '✓' if (band_name == 'MF' and mean_val > 0.8) or \
+                              (band_name == 'LF' and mean_val > 0.7) else ''
+                f.write(f"  {band_name} ({freq_range} Hz): {mean_val:.3f} ± {std_val:.3f} {check}\n")
+            f.write("\n")
+
+            f.write("Method Comparison\n")
+            f.write("-" * 70 + "\n")
+            f.write("Absolute Difference (STFT - Wavelet):\n")
+            for band_name in ['VLF', 'LF', 'MF', 'HF']:
+                diff = stft_bands[band_name] - wavelet_bands[band_name]
+                f.write(f"  {band_name}: {diff:+.3f}\n")
+            f.write("\n")
+            f.write(f"Mean Absolute Difference (MAD): {mad:.3f}\n")
+            if mad < 0.05:
+                f.write("Recommendation: Methods agree well (MAD < 0.05)\n")
+            elif mad < 0.1:
+                f.write("Recommendation: Methods show good agreement (MAD < 0.1)\n")
+            else:
+                f.write("Recommendation: Investigate method discrepancies (MAD >= 0.1)\n")
+            f.write("\n")
+
+            f.write("Clinical Interpretation\n")
+            f.write("-" * 70 + "\n")
+            mf_coh = stft_bands['MF']
+            lf_coh = stft_bands['LF']
+            vlf_coh = stft_bands['VLF']
+            hf_coh = stft_bands['HF']
+
+            if mf_coh > 0.8:
+                f.write("✓ MF band coherence > 0.8: Excellent preservation of primary HRV\n")
+            elif mf_coh > 0.7:
+                f.write("~ MF band coherence 0.7-0.8: Good preservation of primary HRV\n")
+            else:
+                f.write("⚠ MF band coherence < 0.7: Weak primary HRV preservation\n")
+
+            if lf_coh > 0.7:
+                f.write("✓ LF band coherence > 0.7: Good capture of autonomic balance\n")
+            elif lf_coh > 0.6:
+                f.write("~ LF band coherence 0.6-0.7: Moderate autonomic balance capture\n")
+            else:
+                f.write("⚠ LF band coherence < 0.6: Weak autonomic balance capture\n")
+
+            if vlf_coh >= 0.6:
+                f.write("~ VLF band coherence >= 0.6: Acceptable long-term trends\n")
+            else:
+                f.write("⚠ VLF band coherence < 0.6: Limited long-term trend preservation\n")
+                f.write("  (Note: VLF coherence has high uncertainty due to limited cycles)\n")
+
+            if hf_coh >= 0.5:
+                f.write("~ HF band coherence >= 0.5: Acceptable high-frequency fidelity\n")
+            else:
+                f.write("⚠ HF band coherence < 0.5: Limited high-frequency preservation\n")
+            f.write("  (Note: HF coherence limited by 4 Hz Nyquist sampling)\n")
+            f.write("\n")
+
+            # Overall assessment
+            if mf_coh > 0.8 and lf_coh > 0.7:
+                f.write("Overall Assessment: EXCELLENT\n")
+                f.write("Model preserves clinically relevant spectral content across bands.\n")
+            elif mf_coh > 0.7 and lf_coh > 0.6:
+                f.write("Overall Assessment: GOOD\n")
+                f.write("Model preserves primary HRV and autonomic balance adequately.\n")
+            elif mf_coh > 0.6:
+                f.write("Overall Assessment: ACCEPTABLE\n")
+                f.write("Model captures primary HRV but may miss some spectral details.\n")
+            else:
+                f.write("Overall Assessment: POOR\n")
+                f.write("Model shows weak spectral preservation. Review model architecture.\n")
+
+        logger.info(f"Coherence statistics written to {output_file}")
+
     def run_latent_interpolation(self, test_loader, *, pair_count: int = 10, steps: int = 11) -> None:
         """Decode linear latent blends and export animated Matplotlib HTML dashboards."""
         if pair_count <= 0 or steps < 2:
@@ -1710,6 +2396,12 @@ def parse_args() -> argparse.Namespace:
         default=480,
         help="Samples for temporal accuracy analysis (0 = skip).",
     )
+    parser.add_argument(
+        "--coherence-analysis-samples",
+        type=int,
+        default=50,
+        help="Samples for time-frequency coherence analysis (0 = skip).",
+    )
     return parser.parse_args()
 
 
@@ -1776,6 +2468,7 @@ def main(
     single_pred_step: Optional[int] = 30,
     single_pred_windows: int = 4,
     temporal_accuracy_samples: int = 480,
+    coherence_analysis_samples: int = 50,
 ) -> None:
     config_path = Path(config)
     config_data = load_config(config_path)
@@ -1812,6 +2505,11 @@ def main(
             test_loader,
             num_samples=temporal_accuracy_samples,
         )
+    if coherence_analysis_samples and coherence_analysis_samples > 0:
+        tester.run_time_frequency_coherence_analysis(
+            test_loader,
+            num_samples=coherence_analysis_samples,
+        )
     # if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
     #     tester.run_histogram_test(
     #         test_loader,
@@ -1822,4 +2520,19 @@ def main(
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    main()
+    main(
+        config=cli_args.config,
+        max_samples=cli_args.max_samples,
+        metrics_max_samples=cli_args.metrics_max_samples,
+        analysis_samples=cli_args.analysis_samples,
+        latent_dist_samples=cli_args.latent_dist_samples,
+        latent_interp_pairs=cli_args.latent_interp_pairs,
+        latent_interp_steps=cli_args.latent_interp_steps,
+        latent_interp_plotly=cli_args.latent_interp_plotly,
+        single_pred_samples=cli_args.single_pred_samples,
+        single_pred_start=cli_args.single_pred_start,
+        single_pred_step=cli_args.single_pred_step,
+        single_pred_windows=cli_args.single_pred_windows,
+        temporal_accuracy_samples=cli_args.temporal_accuracy_samples,
+        coherence_analysis_samples=cli_args.coherence_analysis_samples,
+    )
