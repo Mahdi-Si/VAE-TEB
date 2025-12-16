@@ -298,7 +298,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         else:
             trainer_kwargs.update({"accelerator": "cpu", "devices": 1})
-
         # Create and run trainer
         trainer = pl.Trainer(**trainer_kwargs)
         trainer.fit(self.pl_model, train_dataloader, validation_dataloader)
