@@ -1,0 +1,175 @@
+
+general_config:
+  tag: vae_classification_run_7
+
+  cuda_devices: [0]  # List of GPU device IDs to use
+  lr: 0.00001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
+  lr_milestone: [100]  # Epochs at which to decay learning rate
+  checkpoint_frequency: 1
+  plot_frequency: 1  # Callback log frequency in epochs
+  epochs: 1000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 200
+    test: 200
+  
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure
+
+model_config:
+  VAE_model:
+    beta_schedule: constant      # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0             # Starting beta for annealing schedules
+    beta_end: 1.0               # Final beta for annealing schedules
+    beta_anneal_epochs: 50      # Number of epochs for linear annealing
+    beta_cycle_len: 1000        # Cycle length for cyclic annealing
+    beta_const_val: 0.005       # Constant beta value (ACTIVE when schedule='constant')
+    kld_beta: 0.1             # Fallback beta value
+
+  core_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
+
+  classifier:
+    vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
+    type: lstm
+    latent_dim: 16
+    num_classes: 2
+    freeze_vae: true
+    use_posterior: true
+    sample_latent: false
+
+    # Classifier architecture parameters
+    hidden_dim: 128         # Hidden dimension for LSTM/BiLSTM
+    num_layers: 3           # Number of layers
+    bidirectional: false    # For LSTM classifier
+    attn_dim: 64           # For BiLSTMAttention classifier
+    dropout: 0.1           # Dropout rate
+
+    # CNN-specific parameters
+    num_filters: 64        # For CNN classifier
+    kernel_sizes: [3, 5, 7]  # For CNN classifier
+
+    # Transformer-specific parameters
+    d_model: 128           # For Transformer classifier
+    n_heads: 4             # For Transformer classifier
+    dim_feedforward: 256   # For Transformer classifier
+    pooling: mean          # For Transformer classifier: 'mean' or 'cls'
+
+    # Evaluation settings
+    evaluation:
+      target_fpr: 0.2              # Target false positive rate for threshold determination (5%)
+      compute_both_thresholds: true  # Compute both epoch-level and GUID-level thresholds
+      generate_plots: true           # Generate comprehensive visualizations
+      decision_time_hours: 1.0       # Optimize threshold for GUID-level FPR at this time before delivery
+      exclude_last_minutes: 30       # Exclude last N minutes before delivery in time-binned plots
+      max_gap_multiplier: null       # If set, only fill gaps <= multiplier * typical_interval; null fills all missing epochs
+      # Note: Time bins and windows are computed dynamically from actual epoch data
+
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+    vae_test_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_Q4/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+    # K-Fold Cross-Validation Configuration (for classifier training)
+    # Label mapping: healthy → target 1 → class 0, acidosis/HIE → target 2/3 → class 1
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    # These will be populated dynamically by kfold_classifier_trainer.py for each fold
+    classifier_train_datasets: []  # Populated per fold (train/*.hdf5)
+    classifier_val_datasets: []    # Populated per fold (val/*.hdf5)
+    classifier_test_datasets: []   # Populated per fold (test/*.hdf5)
+
+    dataloader_config:
+      num_workers: 0
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+      dataset_kwargs:
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'fhr_st',
+            'fhr_ph',
+            'fhr_up_ph',
+            'target',
+            'weight',
+            'epoch',
+            'cs_label',
+            'bg_label',
+            'guid',
+          ]
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: -23000
+        epoch_max: null
+        label: null
+        cache_size: 1000
+        trim_minutes: 2.0
+
+
+# Advanced configs ========================================================
+# precision: set to "16-mixed" for faster training on modern GPUs with enough VRAM; fall back to "32-true" if you see numerical issues or your GPU lacks Tensor Cores.
+# gradient_clip_val and gradient_clip_algorithm: clip when you’re stacking long sequences or large batch sizes and gradients spike; start with 0.5 + "norm" and relax only if training stays stable without it.
+# sync_batchnorm: enable (true) only when you train across multiple GPUs so BatchNorm stats stay consistent; leave false for single-GPU runs to avoid the extra synchronization cost.
+# deterministic / benchmark: set deterministic=true when you need reproducibility (at the cost of speed); keep benchmark=true when input sizes are consistent to let cuDNN autotune, but disable it for highly variable sequence lengths.
+# memory.enable_memory_monitoring / memory_threshold_gb / memory_log_frequency: turn these on when debugging OOMs; set the threshold just under your GPU’s usable memory (e.g., 60 GB on A100-80) and log frequently enough (every ~500 steps) to catch leaks without overwhelming stdout.
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false    # Set to true if OOM errors occur
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-k-fold-run-7
+      run_name: null
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae_classifier_run_7
+        stage: dev
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 30
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 1000
+
+    reconstruction_plotting:
+      enabled: false
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: true
+      plot_frequency: 10
