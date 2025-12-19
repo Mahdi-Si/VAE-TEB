@@ -551,225 +551,44 @@ def fill_missing_epochs(
     return result_df
 
 
-def find_threshold_for_fpr_epoch(
-    val_df: pd.DataFrame,
-    target_fpr: float = 0.05
-) -> Tuple[float, Dict]:
-    """
-    Find classification threshold that achieves target false positive rate at epoch level.
-
-    This is the original per-epoch FPR approach.
-
-    Args:
-        val_df: Validation predictions DataFrame
-        target_fpr: Target false positive rate (e.g., 0.05 for 5%)
-
-    Returns:
-        Tuple of (threshold, metrics_dict)
-    """
-    # Get true negatives (class 0 samples)
-    class_0_mask = val_df['binary_target'] == 0
-    class_0_probs = val_df.loc[class_0_mask, 'prob_class_1'].values
-
-    if len(class_0_probs) == 0:
-        logger.warning("No class 0 samples in validation set!")
-        return 0.5, {}
-
-    # Sort probabilities
-    sorted_probs = np.sort(class_0_probs)
-
-    # Find threshold at target FPR percentile
-    threshold_idx = int(len(sorted_probs) * (1 - target_fpr))
-    threshold = sorted_probs[threshold_idx] if threshold_idx < len(sorted_probs) else sorted_probs[-1]
-
-    # Apply threshold to get predictions
-    val_df['threshold_pred'] = (val_df['prob_class_1'] >= threshold).astype(int)
-
-    # Compute metrics
-    accuracy = (val_df['threshold_pred'] == val_df['binary_target']).mean()
-
-    # Class-specific metrics
-    class_0_samples = val_df[val_df['binary_target'] == 0]
-    class_1_samples = val_df[val_df['binary_target'] == 1]
-
-    if len(class_0_samples) > 0:
-        fpr = (class_0_samples['threshold_pred'] == 1).mean()  # False positives / negatives
-        specificity = 1 - fpr
-    else:
-        fpr = 0.0
-        specificity = 1.0
-
-    if len(class_1_samples) > 0:
-        sensitivity = (class_1_samples['threshold_pred'] == 1).mean()  # True positives / positives
-    else:
-        sensitivity = 1.0
-
-    metrics = {
-        'threshold': float(threshold),
-        'target_fpr': target_fpr,
-        'actual_fpr': float(fpr),
-        'specificity': float(specificity),
-        'sensitivity': float(sensitivity),
-        'accuracy': float(accuracy),
-        'n_class_0': len(class_0_samples),
-        'n_class_1': len(class_1_samples),
-    }
-
-    logger.info("=" * 80)
-    logger.info("THRESHOLD DETERMINATION (Validation Set)")
-    logger.info("=" * 80)
-    logger.info(f"Target FPR: {target_fpr:.4f}")
-    logger.info(f"Selected threshold: {threshold:.4f}")
-    logger.info(f"Actual FPR: {fpr:.4f}")
-    logger.info(f"Specificity: {specificity:.4f}")
-    logger.info(f"Sensitivity: {sensitivity:.4f}")
-    logger.info(f"Accuracy: {accuracy:.4f}")
-    logger.info("=" * 80)
-
-    return threshold, metrics
-
-
-def find_threshold_for_fpr_guid(
-    val_df: pd.DataFrame,
-    target_fpr: float = 0.05,
-    threshold_candidates: np.ndarray = None
-) -> Tuple[float, Dict]:
-    """
-    Find classification threshold that achieves target false positive rate at GUID level.
-
-    This approach is more clinically relevant as it considers per-patient (GUID) outcomes
-    after applying the clinical decision rule.
-
-    Args:
-        val_df: Validation predictions DataFrame
-        target_fpr: Target false positive rate at GUID level (e.g., 0.05 for 5%)
-        threshold_candidates: Array of thresholds to test (default: 0.0 to 1.0 in steps of 0.01)
-
-    Returns:
-        Tuple of (threshold, metrics_dict)
-    """
-    if threshold_candidates is None:
-        probs = val_df['prob_class_1'].dropna().values.astype(float)
-        if len(probs) == 0:
-            logger.warning("No probabilities found in validation set!")
-            return 0.5, {}
-        threshold_candidates = np.unique(np.clip(probs, 0.0, 1.0))
-        threshold_candidates = np.unique(np.concatenate(([0.0], threshold_candidates, [1.0])))
-
-    threshold_candidates = np.asarray(threshold_candidates, dtype=float)
-    threshold_candidates.sort()
-
-    best_threshold = float(threshold_candidates[len(threshold_candidates) // 2]) if len(threshold_candidates) else 0.5
-    best_fpr_diff = float('inf')
-    best_metrics = {}
-
-    # FPR is monotonic non-increasing with threshold; use binary search over candidates.
-    lo, hi = 0, len(threshold_candidates) - 1
-    max_iter = min(25, len(threshold_candidates))  # guard for pathological candidate lists
-    it = 0
-
-    while lo <= hi and it < max_iter:
-        mid = (lo + hi) // 2
-        thresh = float(threshold_candidates[mid])
-
-        # Apply clinical decision rule at this threshold
-        df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
-
-        # Determine GUID-level labels
-        guid_stats = df_clinical.groupby('guid').agg({
-            'binary_target': 'max',  # GUID is unhealthy if any epoch is unhealthy
-            'clinical_pred': 'max'   # GUID is predicted unhealthy if any epoch predicted unhealthy
-        }).reset_index()
-
-        # Compute GUID-level metrics
-        healthy_guids = guid_stats[guid_stats['binary_target'] == 0]
-        unhealthy_guids = guid_stats[guid_stats['binary_target'] == 1]
-
-        if len(healthy_guids) == 0:
-            continue
-
-        # GUID-level FPR
-        guid_fpr = (healthy_guids['clinical_pred'] == 1).sum() / len(healthy_guids)
-
-        # Check if this is closest to target FPR
-        fpr_diff = abs(guid_fpr - target_fpr)
-        if fpr_diff < best_fpr_diff:
-            best_fpr_diff = fpr_diff
-            best_threshold = thresh
-
-            # Compute additional metrics at this threshold
-            guid_specificity = 1 - guid_fpr
-
-            if len(unhealthy_guids) > 0:
-                guid_sensitivity = (unhealthy_guids['clinical_pred'] == 1).sum() / len(unhealthy_guids)
-            else:
-                guid_sensitivity = 1.0
-
-            guid_accuracy = (guid_stats['binary_target'] == guid_stats['clinical_pred']).mean()
-
-            best_metrics = {
-                'threshold': float(best_threshold),
-                'target_fpr': target_fpr,
-                'actual_fpr': float(guid_fpr),
-                'specificity': float(guid_specificity),
-                'sensitivity': float(guid_sensitivity),
-                'accuracy': float(guid_accuracy),
-                'n_healthy_guids': len(healthy_guids),
-                'n_unhealthy_guids': len(unhealthy_guids),
-            }
-
-        # Adjust search bounds
-        if guid_fpr > target_fpr:
-            lo = mid + 1  # increase threshold to reduce FPR
-        else:
-            hi = mid - 1  # decrease threshold to increase FPR
-
-        it += 1
-
-    logger.info("=" * 80)
-    logger.info("GUID-LEVEL THRESHOLD DETERMINATION (Validation Set)")
-    logger.info("=" * 80)
-    logger.info(f"Target GUID-level FPR: {target_fpr:.4f}")
-    logger.info(f"Selected threshold: {best_threshold:.4f}")
-    logger.info(f"Actual GUID-level FPR: {best_metrics.get('actual_fpr', 0):.4f}")
-    logger.info(f"GUID-level Specificity: {best_metrics.get('specificity', 0):.4f}")
-    logger.info(f"GUID-level Sensitivity: {best_metrics.get('sensitivity', 0):.4f}")
-    logger.info(f"GUID-level Accuracy: {best_metrics.get('accuracy', 0):.4f}")
-    logger.info(f"Healthy GUIDs: {best_metrics.get('n_healthy_guids', 0)}")
-    logger.info(f"Unhealthy GUIDs: {best_metrics.get('n_unhealthy_guids', 0)}")
-    logger.info("=" * 80)
-
-    return best_threshold, best_metrics
-
-
-def find_threshold_for_fpr_at_time_window(
+def find_threshold_for_instantaneous_fpr_at_1h(
     val_df: pd.DataFrame,
     target_fpr: float = 0.05,
     time_window_hours: float = 1.0,
-    max_gap_multiplier: Optional[float] = None
+    max_gap_multiplier: Optional[float] = None,
+    fallback_tolerance_hours: float = 0.5
 ) -> Tuple[float, Dict]:
     """
-    Find threshold to achieve target FPR specifically at a time window before delivery.
+    Find threshold for instantaneous decision metric at 1h before birth.
 
-    This function optimizes the threshold to achieve the desired FPR at a specific
-    time window (e.g., 1 hour before delivery), which is more clinically relevant
-    than global optimization across all time points.
+    Optimizes threshold to achieve target FPR for the INSTANTANEOUS metric:
+    - FPR(1h) = FP(t=1h) / N(t=1h)
+    - Only counts epochs within the 1h time bin
 
     Args:
-        val_df: Validation dataframe with columns: guid, epoch, binary_target, prob_class_1
-        target_fpr: Desired false positive rate (default 0.05)
-        time_window_hours: Decision time in hours before delivery (default 1.0 = 1h before delivery)
-        max_gap_multiplier: For epoch filling. If None, fill all missing epochs.
+        val_df: Validation DataFrame with columns: guid, epoch, binary_target, prob_class_1
+        target_fpr: Target false positive rate (default 0.05)
+        time_window_hours: Decision time in hours before delivery (default 1.0)
+        max_gap_multiplier: For epoch filling. If None, fill all missing epochs
+        fallback_tolerance_hours: If no data at exact time_window_hours, use nearest within tolerance
 
     Returns:
         threshold: Optimal threshold value
-        metrics_dict: Performance metrics at this threshold
+        metrics_dict: Performance metrics including actual time used
     """
     logger.info("=" * 80)
-    logger.info(f"Finding threshold for target FPR={target_fpr} at decision time {time_window_hours}h before delivery")
+    logger.info(f"Finding threshold for INSTANTANEOUS FPR={target_fpr} at {time_window_hours}h before delivery")
     logger.info("=" * 80)
 
     val_df = ensure_epoch_hours(val_df.copy())
+
+    # Create time bins around target time
+    bin_width = 0.5  # 30 minutes
+    time_bins = np.array([
+        time_window_hours + bin_width,
+        time_window_hours,
+        max(0, time_window_hours - bin_width)
+    ])
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -780,11 +599,11 @@ def find_threshold_for_fpr_at_time_window(
     threshold_candidates = np.unique(np.concatenate(([0.0], threshold_candidates, [1.0])))
     threshold_candidates.sort()
 
-    best_threshold = float(threshold_candidates[len(threshold_candidates) // 2]) if len(threshold_candidates) else 0.5
+    best_threshold = 0.5
     best_fpr_diff = float('inf')
-    best_row = None
+    best_metrics = None
 
-    # FPR is monotonic non-increasing with threshold; use binary search over candidates.
+    # Binary search over threshold candidates
     lo, hi = 0, len(threshold_candidates) - 1
     max_iter = min(25, len(threshold_candidates))
     it = 0
@@ -793,130 +612,323 @@ def find_threshold_for_fpr_at_time_window(
         mid = (lo + hi) // 2
         thresh = float(threshold_candidates[mid])
 
+        # Apply threshold and clinical decision rule
         df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
         df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
 
-        guid_stats = guid_snapshot_at_or_before_time(df_clinical, time_window_hours)
-        if len(guid_stats) == 0:
+        # Compute instantaneous metrics at 1h bin
+        instantaneous_df = compute_instantaneous_metrics(df_clinical, time_bins, subgroup_filter=None)
+
+        # Find bin closest to target time
+        if len(instantaneous_df) == 0:
             it += 1
             break
 
-        healthy_guids = guid_stats[guid_stats['binary_target'] == 0]
-        unhealthy_guids = guid_stats[guid_stats['binary_target'] == 1]
+        target_bin = instantaneous_df.iloc[(instantaneous_df['bin_center'] - time_window_hours).abs().argmin()]
 
-        if len(healthy_guids) == 0:
+        # Check if bin is within tolerance
+        actual_time = target_bin['bin_center']
+        if abs(actual_time - time_window_hours) > fallback_tolerance_hours:
+            logger.warning(f"No data within {fallback_tolerance_hours}h of target time {time_window_hours}h")
             it += 1
             break
 
-        guid_fpr = (healthy_guids['pred_at_time'] == 1).mean()
-        guid_sensitivity = (unhealthy_guids['pred_at_time'] == 1).mean() if len(unhealthy_guids) > 0 else 0.0
+        fpr = target_bin['fpr']
+        sensitivity = target_bin['sensitivity']
 
-        fpr_diff = abs(guid_fpr - target_fpr)
+        if pd.isna(fpr) or pd.isna(sensitivity):
+            it += 1
+            break
+
+        fpr_diff = abs(fpr - target_fpr)
         if fpr_diff < best_fpr_diff:
             best_fpr_diff = fpr_diff
             best_threshold = thresh
-            best_row = {
+            best_metrics = {
                 'threshold': thresh,
-                'guid_fpr': float(guid_fpr),
-                'guid_sensitivity': float(guid_sensitivity),
-                'n_healthy_guids': int(len(healthy_guids)),
-                'n_unhealthy_guids': int(len(unhealthy_guids)),
+                'fpr': float(fpr),
+                'sensitivity': float(sensitivity),
+                'specificity': float(1 - fpr),
+                'actual_time_hours': float(actual_time),
+                'target_time_hours': time_window_hours,
+                'n_positive': int(target_bin['n_positive']),
+                'n_negative': int(target_bin['n_negative']),
+                'metric_type': 'instantaneous'
             }
 
-        if guid_fpr > target_fpr:
-            lo = mid + 1  # increase threshold to reduce FPR
+        if fpr > target_fpr:
+            lo = mid + 1
         else:
-            hi = mid - 1  # decrease threshold to increase FPR
+            hi = mid - 1
 
         it += 1
 
-    if best_row is None:
-        logger.error("No valid thresholds found")
+    if best_metrics is None:
+        logger.error("No valid thresholds found for instantaneous metric")
         return 0.5, {}
 
     logger.info(f"Selected threshold: {best_threshold:.3f}")
-    logger.info(f"Achieved GUID-level FPR at {time_window_hours}h: {best_row['guid_fpr']:.4f} (target: {target_fpr})")
-    logger.info(f"GUID-level sensitivity at {time_window_hours}h: {best_row['guid_sensitivity']:.4f}")
-    logger.info(f"Healthy GUIDs in window: {int(best_row['n_healthy_guids'])}")
-    logger.info(f"Unhealthy GUIDs in window: {int(best_row['n_unhealthy_guids'])}")
+    logger.info(f"Achieved instantaneous FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
+    logger.info(f"Instantaneous sensitivity: {best_metrics['sensitivity']:.4f}")
     logger.info("=" * 80)
 
-    metrics_dict = {
-        'threshold': best_threshold,
-        'guid_fpr_at_window': best_row['guid_fpr'],
-        'guid_sensitivity_at_window': best_row['guid_sensitivity'],
-        'time_window_hours': time_window_hours,
-        'n_healthy_guids': int(best_row['n_healthy_guids']),
-        'n_unhealthy_guids': int(best_row['n_unhealthy_guids']),
-        'fpr': best_row['guid_fpr'],
-        'sensitivity': best_row['guid_sensitivity']
-    }
-
-    return best_threshold, metrics_dict
+    return best_threshold, best_metrics
 
 
-def find_optimal_thresholds(
+def find_threshold_for_committed_cumulative_fpr_at_1h(
     val_df: pd.DataFrame,
     target_fpr: float = 0.05,
     time_window_hours: float = 1.0,
-    max_gap_multiplier: Optional[float] = None
-) -> Dict:
+    max_gap_multiplier: Optional[float] = None,
+    fallback_tolerance_hours: float = 0.5
+) -> Tuple[float, Dict]:
     """
-    Compute epoch-level, GUID-level, and time-specific thresholds for comparison.
+    Find threshold for committed_cumulative decision metric at 1h before birth.
+
+    Optimizes threshold to achieve target FPR for the COMMITTED CUMULATIVE metric:
+    - FPR(1h) = FP(t≤1h) / N(t≤1h)
+    - Cumulative detections from 1h to birth
+    - Denominator = GUIDs available at 1h (CHANGING)
 
     Args:
-        val_df: Validation predictions DataFrame
-        target_fpr: Target false positive rate for threshold determination
-        time_window_hours: Decision time for time-specific optimization (default 1.0h before delivery)
-        max_gap_multiplier: For missing epoch filling in time-specific optimization (None fills all)
+        val_df: Validation DataFrame with columns: guid, epoch, binary_target, prob_class_1
+        target_fpr: Target false positive rate (default 0.05)
+        time_window_hours: Decision time in hours before delivery (default 1.0)
+        max_gap_multiplier: For epoch filling. If None, fill all missing epochs
+        fallback_tolerance_hours: If no data at exact time_window_hours, use nearest within tolerance
 
     Returns:
-        Dictionary with epoch-level, GUID-level, and time-specific threshold information
+        threshold: Optimal threshold value
+        metrics_dict: Performance metrics including actual time used
     """
-    logger.info("Computing optimal thresholds using three approaches...")
-
-    # Epoch-level threshold (global optimization at epoch level)
-    epoch_threshold, epoch_metrics = find_threshold_for_fpr_epoch(val_df, target_fpr)
-
-    # GUID-level threshold (global optimization at GUID level)
-    guid_threshold, guid_metrics = find_threshold_for_fpr_guid(val_df, target_fpr)
-
-    # Time-specific threshold (optimized for specific time window before delivery)
-    time_threshold, time_metrics = find_threshold_for_fpr_at_time_window(
-        val_df,
-        target_fpr=target_fpr,
-        time_window_hours=time_window_hours,
-        max_gap_multiplier=max_gap_multiplier
-    )
-
-    results = {
-        'epoch_level': {
-            'threshold': epoch_threshold,
-            **epoch_metrics
-        },
-        'guid_level': {
-            'threshold': guid_threshold,
-            **guid_metrics
-        },
-        'time_specific': {
-            'threshold': time_threshold,
-            **time_metrics
-        },
-        'target_fpr': target_fpr,
-        'time_window_hours': time_window_hours
-    }
-
     logger.info("=" * 80)
-    logger.info("THRESHOLD COMPARISON")
-    logger.info("=" * 80)
-    logger.info(f"Epoch-level threshold:     {epoch_threshold:.4f} (FPR: {epoch_metrics['actual_fpr']:.4f})")
-    logger.info(f"GUID-level threshold:      {guid_threshold:.4f} (FPR: {guid_metrics.get('actual_fpr', guid_metrics.get('fpr', 0)):.4f})")
-    logger.info(f"Time-specific threshold:   {time_threshold:.4f} (FPR at {time_window_hours}h: {time_metrics['guid_fpr_at_window']:.4f})")
-    logger.info(f"")
-    logger.info(f"RECOMMENDATION: Use time-specific threshold ({time_threshold:.4f}) for clinically relevant evaluation")
+    logger.info(f"Finding threshold for COMMITTED CUMULATIVE FPR={target_fpr} at {time_window_hours}h before delivery")
     logger.info("=" * 80)
 
-    return results
+    val_df = ensure_epoch_hours(val_df.copy())
+
+    # Create time bins around target time
+    bin_width = 0.5
+    time_bins = np.array([
+        time_window_hours + bin_width,
+        time_window_hours,
+        max(0, time_window_hours - bin_width)
+    ])
+
+    probs = val_df['prob_class_1'].dropna().values.astype(float)
+    if len(probs) == 0:
+        logger.error("No probabilities found - cannot determine threshold")
+        return 0.5, {}
+
+    threshold_candidates = np.unique(np.clip(probs, 0.0, 1.0))
+    threshold_candidates = np.unique(np.concatenate(([0.0], threshold_candidates, [1.0])))
+    threshold_candidates.sort()
+
+    best_threshold = 0.5
+    best_fpr_diff = float('inf')
+    best_metrics = None
+
+    # Binary search over threshold candidates
+    lo, hi = 0, len(threshold_candidates) - 1
+    max_iter = min(25, len(threshold_candidates))
+    it = 0
+
+    while lo <= hi and it < max_iter:
+        mid = (lo + hi) // 2
+        thresh = float(threshold_candidates[mid])
+
+        # Apply threshold and clinical decision rule
+        df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+
+        # Compute committed cumulative metrics
+        cumulative_df = compute_committed_cumulative_metrics(df_clinical, time_bins, subgroup_filter=None)
+
+        # Find bin closest to target time
+        if len(cumulative_df) == 0:
+            it += 1
+            break
+
+        target_bin = cumulative_df.iloc[(cumulative_df['bin_center'] - time_window_hours).abs().argmin()]
+
+        # Check if bin is within tolerance
+        actual_time = target_bin['bin_center']
+        if abs(actual_time - time_window_hours) > fallback_tolerance_hours:
+            logger.warning(f"No data within {fallback_tolerance_hours}h of target time {time_window_hours}h")
+            it += 1
+            break
+
+        fpr = target_bin['fpr']
+        sensitivity = target_bin['sensitivity']
+
+        if pd.isna(fpr) or pd.isna(sensitivity):
+            it += 1
+            break
+
+        fpr_diff = abs(fpr - target_fpr)
+        if fpr_diff < best_fpr_diff:
+            best_fpr_diff = fpr_diff
+            best_threshold = thresh
+            best_metrics = {
+                'threshold': thresh,
+                'fpr': float(fpr),
+                'sensitivity': float(sensitivity),
+                'specificity': float(1 - fpr),
+                'actual_time_hours': float(actual_time),
+                'target_time_hours': time_window_hours,
+                'n_positive_available': int(target_bin['n_positive_available']),
+                'n_negative_available': int(target_bin['n_negative_available']),
+                'metric_type': 'committed_cumulative'
+            }
+
+        if fpr > target_fpr:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+        it += 1
+
+    if best_metrics is None:
+        logger.error("No valid thresholds found for committed_cumulative metric")
+        return 0.5, {}
+
+    logger.info(f"Selected threshold: {best_threshold:.3f}")
+    logger.info(f"Achieved committed_cumulative FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
+    logger.info(f"Committed_cumulative sensitivity: {best_metrics['sensitivity']:.4f}")
+    logger.info("=" * 80)
+
+    return best_threshold, best_metrics
+
+
+def find_threshold_for_committed_overall_fpr_at_1h(
+    val_df: pd.DataFrame,
+    target_fpr: float = 0.05,
+    time_window_hours: float = 1.0,
+    max_gap_multiplier: Optional[float] = None,
+    fallback_tolerance_hours: float = 0.5
+) -> Tuple[float, Dict]:
+    """
+    Find threshold for committed_overall decision metric at 1h before birth (PRIMARY).
+
+    Optimizes threshold to achieve target FPR for the COMMITTED OVERALL metric:
+    - FPR(1h) = FP(t≤1h) / N(t≤0)
+    - Cumulative detections from 1h to birth
+    - Denominator = ALL GUIDs in dataset (FIXED)
+
+    This is the PRIMARY METRIC for clinical reporting.
+
+    Args:
+        val_df: Validation DataFrame with columns: guid, epoch, binary_target, prob_class_1
+        target_fpr: Target false positive rate (default 0.05)
+        time_window_hours: Decision time in hours before delivery (default 1.0)
+        max_gap_multiplier: For epoch filling. If None, fill all missing epochs
+        fallback_tolerance_hours: If no data at exact time_window_hours, use nearest within tolerance
+
+    Returns:
+        threshold: Optimal threshold value
+        metrics_dict: Performance metrics including actual time used
+    """
+    logger.info("=" * 80)
+    logger.info(f"Finding threshold for COMMITTED OVERALL (PRIMARY) FPR={target_fpr} at {time_window_hours}h before delivery")
+    logger.info("=" * 80)
+
+    val_df = ensure_epoch_hours(val_df.copy())
+
+    # Create time bins around target time
+    bin_width = 0.5
+    time_bins = np.array([
+        time_window_hours + bin_width,
+        time_window_hours,
+        max(0, time_window_hours - bin_width)
+    ])
+
+    probs = val_df['prob_class_1'].dropna().values.astype(float)
+    if len(probs) == 0:
+        logger.error("No probabilities found - cannot determine threshold")
+        return 0.5, {}
+
+    threshold_candidates = np.unique(np.clip(probs, 0.0, 1.0))
+    threshold_candidates = np.unique(np.concatenate(([0.0], threshold_candidates, [1.0])))
+    threshold_candidates.sort()
+
+    best_threshold = 0.5
+    best_fpr_diff = float('inf')
+    best_metrics = None
+
+    # Binary search over threshold candidates
+    lo, hi = 0, len(threshold_candidates) - 1
+    max_iter = min(25, len(threshold_candidates))
+    it = 0
+
+    while lo <= hi and it < max_iter:
+        mid = (lo + hi) // 2
+        thresh = float(threshold_candidates[mid])
+
+        # Apply threshold and clinical decision rule
+        df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+
+        # Compute committed overall metrics (PRIMARY)
+        overall_df = compute_committed_overall_metrics(df_clinical, time_bins, subgroup_filter=None)
+
+        # Find bin closest to target time
+        if len(overall_df) == 0:
+            it += 1
+            break
+
+        target_bin = overall_df.iloc[(overall_df['bin_center'] - time_window_hours).abs().argmin()]
+
+        # Check if bin is within tolerance
+        actual_time = target_bin['bin_center']
+        if abs(actual_time - time_window_hours) > fallback_tolerance_hours:
+            logger.warning(f"No data within {fallback_tolerance_hours}h of target time {time_window_hours}h")
+            it += 1
+            break
+
+        fpr = target_bin['fpr']
+        sensitivity = target_bin['sensitivity']
+
+        if pd.isna(fpr) or pd.isna(sensitivity):
+            it += 1
+            break
+
+        fpr_diff = abs(fpr - target_fpr)
+        if fpr_diff < best_fpr_diff:
+            best_fpr_diff = fpr_diff
+            best_threshold = thresh
+            best_metrics = {
+                'threshold': thresh,
+                'fpr': float(fpr),
+                'sensitivity': float(sensitivity),
+                'specificity': float(1 - fpr),
+                'actual_time_hours': float(actual_time),
+                'target_time_hours': time_window_hours,
+                'n_positive_total': int(target_bin['n_positive_total']),
+                'n_negative_total': int(target_bin['n_negative_total']),
+                'n_available_positive': int(target_bin['n_available_positive']),
+                'n_available_negative': int(target_bin['n_available_negative']),
+                'metric_type': 'committed_overall',
+                'is_primary_metric': True
+            }
+
+        if fpr > target_fpr:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+        it += 1
+
+    if best_metrics is None:
+        logger.error("No valid thresholds found for committed_overall (PRIMARY) metric")
+        return 0.5, {}
+
+    logger.info(f"Selected threshold (PRIMARY): {best_threshold:.3f}")
+    logger.info(f"Achieved committed_overall FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
+    logger.info(f"Committed_overall sensitivity: {best_metrics['sensitivity']:.4f}")
+    logger.info(f"FIXED denominators - P(t≤0)={best_metrics['n_positive_total']}, N(t≤0)={best_metrics['n_negative_total']}")
+    logger.info("=" * 80)
+
+    return best_threshold, best_metrics
 
 
 def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> np.ndarray:
@@ -1000,32 +1012,86 @@ def compute_time_windows(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -
 # SUBGROUP ANALYSIS FUNCTIONS
 # ==================================================================================
 
-def create_subgroup_filters() -> Dict[str, callable]:
+def create_enhanced_subgroup_filters() -> Dict[str, callable]:
     """
-    Create filter functions for all subgroups.
+    Create enhanced filter functions for all subgroups.
+
+    Includes comprehensive subgroups for both unhealthy and healthy cases,
+    stratified by CS status, BG status, and their combinations.
+
+    UNHEALTHY SUBGROUPS:
+    - Basic: acidosis, hie, unhealthy (combined)
+    - CS stratified: unhealthy_cs_pos/neg, hie_cs_pos/neg, acidosis_cs_pos/neg
+    - BG stratified (Acidosis only): acidosis_bg_pos/neg
+      Note: All HIE cases are bg_positive, so no HIE BG stratification
+
+    HEALTHY SUBGROUPS:
+    - Basic: healthy
+    - CS stratified: healthy_cs_pos/neg
+    - BG stratified: healthy_bg_pos/neg
+    - BG×CS combinations (4-way): healthy_bg_pos_cs_pos/neg, healthy_bg_neg_cs_pos/neg
 
     Returns:
         Dictionary mapping subgroup_name -> filter_function
     """
     return {
-        # Diagnosis-based subgroups
+        # =====================================================================
+        # UNHEALTHY SUBGROUPS
+        # =====================================================================
+
+        # Basic diagnosis subgroups
         'acidosis': lambda df: df['target'] == 2,
         'hie': lambda df: df['target'] == 3,
+        'unhealthy': lambda df: (df['target'] == 2) | (df['target'] == 3),
+
+        # Unhealthy stratified by CS status
+        'unhealthy_cs_pos': lambda df: ((df['target'] == 2) | (df['target'] == 3)) & (df['cs_label'] == True),
+        'unhealthy_cs_neg': lambda df: ((df['target'] == 2) | (df['target'] == 3)) & (df['cs_label'] == False),
+
+        # HIE stratified by CS status
+        'hie_cs_pos': lambda df: (df['target'] == 3) & (df['cs_label'] == True),
+        'hie_cs_neg': lambda df: (df['target'] == 3) & (df['cs_label'] == False),
+
+        # Acidosis stratified by CS status
+        'acidosis_cs_pos': lambda df: (df['target'] == 2) & (df['cs_label'] == True),
+        'acidosis_cs_neg': lambda df: (df['target'] == 2) & (df['cs_label'] == False),
+
+        # Acidosis stratified by BG status (ONLY acidosis; all HIE are bg_positive)
+        'acidosis_bg_pos': lambda df: (df['target'] == 2) & (df['bg_label'] == True),
+        'acidosis_bg_neg': lambda df: (df['target'] == 2) & (df['bg_label'] == False),
+
+        # =====================================================================
+        # HEALTHY SUBGROUPS
+        # =====================================================================
+
+        # Basic healthy
         'healthy': lambda df: df['target'] == 1,
 
-        # CS status subgroups
+        # Healthy stratified by CS status
+        'healthy_cs_pos': lambda df: (df['target'] == 1) & (df['cs_label'] == True),
+        'healthy_cs_neg': lambda df: (df['target'] == 1) & (df['cs_label'] == False),
+
+        # Healthy stratified by BG status
+        'healthy_bg_pos': lambda df: (df['target'] == 1) & (df['bg_label'] == True),
+        'healthy_bg_neg': lambda df: (df['target'] == 1) & (df['bg_label'] == False),
+
+        # Healthy BG×CS combinations (4-way)
+        'healthy_bg_pos_cs_pos': lambda df: (df['target'] == 1) & (df['bg_label'] == True) & (df['cs_label'] == True),
+        'healthy_bg_pos_cs_neg': lambda df: (df['target'] == 1) & (df['bg_label'] == True) & (df['cs_label'] == False),
+        'healthy_bg_neg_cs_pos': lambda df: (df['target'] == 1) & (df['bg_label'] == False) & (df['cs_label'] == True),
+        'healthy_bg_neg_cs_neg': lambda df: (df['target'] == 1) & (df['bg_label'] == False) & (df['cs_label'] == False),
+
+        # =====================================================================
+        # LEGACY SUBGROUPS (for backward compatibility)
+        # =====================================================================
+
+        # CS status (global)
         'cs_positive': lambda df: df['cs_label'] == True,
         'cs_negative': lambda df: df['cs_label'] == False,
 
-        # BG label subgroups
+        # BG label (global)
         'bg_positive': lambda df: df['bg_label'] == True,
         'bg_negative': lambda df: df['bg_label'] == False,
-
-        # Combined subgroups
-        'acidosis_cs_pos': lambda df: (df['target'] == 2) & (df['cs_label'] == True),
-        'acidosis_cs_neg': lambda df: (df['target'] == 2) & (df['cs_label'] == False),
-        'hie_cs_pos': lambda df: (df['target'] == 3) & (df['cs_label'] == True),
-        'hie_cs_neg': lambda df: (df['target'] == 3) & (df['cs_label'] == False),
     }
 
 
@@ -1179,2016 +1245,55 @@ def compute_subgroup_metrics_by_time(
     return df_result
 
 
-def plot_metrics_vs_time(
+# =============================================================================
+# New Metric Computation Functions (Instantaneous + Committed Decisions)
+# =============================================================================
+
+def compute_instantaneous_metrics(
     df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = "",
-    exclude_last_minutes: float = 30.0
-) -> None:
-    """
-    Plot sensitivity and specificity as function of time before birth.
-
-    Args:
-        df: Predictions dataframe with clinical_pred
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames (e.g., "epoch_threshold_" or "guid_threshold_")
-        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Compute dynamic time bins
-    time_bins = compute_time_bins(df, exclude_last_minutes=exclude_last_minutes)
-
-    # Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    if len(time_bins) < 2:
-        logger.warning("Not enough time bins to plot sensitivity/specificity vs time")
-        return
-
-    # ------------------------------
-    # Epoch-level metrics per bin
-    # ------------------------------
-    epoch_rows = []
-    for i in range(len(time_bins) - 1):
-        bin_start, bin_end = time_bins[i], time_bins[i + 1]
-        bin_center = (bin_start + bin_end) / 2
-        bin_mask = (df['epoch_hours'] >= bin_start) & (df['epoch_hours'] < bin_end)
-        bin_data = df[bin_mask]
-
-        if len(bin_data) == 0:
-            continue
-
-        class_0 = bin_data[bin_data['binary_target'] == 0]
-        class_1 = bin_data[bin_data['binary_target'] == 1]
-
-        epoch_rows.append({
-            'bin_center': float(bin_center),
-            'sensitivity': (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else np.nan,
-            'specificity': 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else np.nan,
-            'n_class_0': int(len(class_0)),
-            'n_class_1': int(len(class_1)),
-        })
-
-    epoch_df = pd.DataFrame(epoch_rows).sort_values('bin_center', ascending=False)
-
-    if len(epoch_df) > 0:
-        x = epoch_df['bin_center'].values
-        bin_width = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 0.25
-        bar_width = 0.85 * bin_width
-
-        fig, (ax, ax_counts) = plt.subplots(
-            2, 1,
-            figsize=(12, 7),
-            gridspec_kw={'height_ratios': [3, 1]},
-            sharex=True
-        )
-
-        ax.plot(x, epoch_df['sensitivity'], marker='o', label='Sensitivity (epoch-level)', linewidth=2, markersize=5)
-        ax.plot(x, epoch_df['specificity'], marker='s', label='Specificity (epoch-level)', linewidth=2, markersize=5)
-        ax.set_ylabel('Metric Value', fontsize=12)
-        ax.set_title('Sensitivity/Specificity vs Time Before Birth (Epoch-Level)', fontsize=13)
-        ax.legend(fontsize=10, loc='lower left')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim([0, 1.05])
-
-        ax_counts.bar(x, epoch_df['n_class_0'], width=bar_width, label='Healthy epochs', alpha=0.7)
-        ax_counts.bar(x, epoch_df['n_class_1'], bottom=epoch_df['n_class_0'], width=bar_width,
-                      label='Unhealthy epochs', alpha=0.7)
-        ax_counts.set_ylabel('Epochs', fontsize=10)
-        ax_counts.set_xlabel('Hours Before Birth (segment start)', fontsize=12)
-        ax_counts.grid(True, alpha=0.2, axis='y')
-        ax_counts.legend(fontsize=9, loc='upper left')
-
-        # Earlier times on the left, closer to birth on the right
-        ax.invert_xaxis()
-
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{prefix}sensitivity_specificity_vs_time.png", dpi=150)
-        plt.close()
-        logger.info(f"Saved: {prefix}sensitivity_specificity_vs_time.png")
-    else:
-        logger.warning("No epoch-level bins contained data; skipping epoch-level time plot")
-
-    # ------------------------------
-    # GUID-level decision-time curve
-    # ------------------------------
-    times = epoch_df['bin_center'].values if len(epoch_df) > 0 else np.array([(time_bins[i] + time_bins[i + 1]) / 2 for i in range(len(time_bins) - 1)])
-    guid_rows = []
-    for t in times:
-        snap = guid_snapshot_at_or_before_time(df, float(t), pred_col='clinical_pred')
-        if len(snap) == 0:
-            continue
-
-        healthy = snap[snap['binary_target'] == 0]
-        unhealthy = snap[snap['binary_target'] == 1]
-
-        guid_rows.append({
-            'bin_center': float(t),
-            'guid_sensitivity': (unhealthy['pred_at_time'] == 1).mean() if len(unhealthy) > 0 else np.nan,
-            'guid_specificity': 1 - (healthy['pred_at_time'] == 1).mean() if len(healthy) > 0 else np.nan,
-            'n_healthy_guids': int(len(healthy)),
-            'n_unhealthy_guids': int(len(unhealthy)),
-        })
-
-    guid_df = pd.DataFrame(guid_rows).sort_values('bin_center', ascending=False)
-    if len(guid_df) == 0:
-        logger.warning("No GUID snapshots available for decision-time plot; skipping")
-        return
-
-    x = guid_df['bin_center'].values
-    bin_width = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 0.25
-    bar_width = 0.85 * bin_width
-
-    fig, (ax, ax_counts) = plt.subplots(
-        2, 1,
-        figsize=(12, 7),
-        gridspec_kw={'height_ratios': [3, 1]},
-        sharex=True
-    )
-
-    ax.plot(x, guid_df['guid_sensitivity'], marker='o', label='Sensitivity (GUID @ time)', linewidth=2, markersize=5)
-    ax.plot(x, guid_df['guid_specificity'], marker='s', label='Specificity (GUID @ time)', linewidth=2, markersize=5)
-    ax.set_ylabel('Metric Value', fontsize=12)
-    ax.set_title('Sensitivity/Specificity vs Time Before Birth (GUID State at Time)', fontsize=13)
-    ax.legend(fontsize=10, loc='lower left')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([0, 1.05])
-
-    ax_counts.bar(x, guid_df['n_healthy_guids'], width=bar_width, label='Healthy GUIDs', alpha=0.7)
-    ax_counts.bar(x, guid_df['n_unhealthy_guids'], bottom=guid_df['n_healthy_guids'], width=bar_width,
-                  label='Unhealthy GUIDs', alpha=0.7)
-    ax_counts.set_ylabel('GUIDs', fontsize=10)
-    ax_counts.set_xlabel('Hours Before Birth (decision time)', fontsize=12)
-    ax_counts.grid(True, alpha=0.2, axis='y')
-    ax_counts.legend(fontsize=9, loc='upper left')
-
-    ax.invert_xaxis()
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}guid_sensitivity_specificity_vs_time.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}guid_sensitivity_specificity_vs_time.png")
-
-
-def plot_roc_curves_by_time(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = "",
-    exclude_last_minutes: float = 30.0
-) -> None:
-    """
-    Plot ROC curves for different time windows before birth.
-
-    Args:
-        df: Predictions dataframe
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Compute dynamic time windows
-    time_windows = compute_time_windows(df, exclude_last_minutes=exclude_last_minutes)
-
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    # Plot all ROC curves on one figure
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    for start_h, end_h in time_windows:
-        window_mask = (df['epoch_hours'] >= start_h) & (df['epoch_hours'] < end_h)
-        window_data = df[window_mask]
-
-        if len(window_data) < 10 or window_data['binary_target'].nunique() < 2:
-            continue
-
-        # Compute ROC curve
-        fpr, tpr, _ = roc_curve(window_data['binary_target'], window_data['prob_class_1'])
-        roc_auc = auc(fpr, tpr)
-
-        # Plot (show negative time range: -end to -start hours before birth)
-        label = f"{-end_h:.1f} to {-start_h:.1f}h (AUC={roc_auc:.3f})"
-        ax.plot(fpr, tpr, label=label, linewidth=2)
-
-    # Plot diagonal
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random (AUC=0.500)')
-
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ROC Curves by Time Window Before Birth', fontsize=14)
-    ax.legend(fontsize=10, loc='lower right')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}roc_curves_by_time.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}roc_curves_by_time.png")
-
-
-def plot_detection_timing(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    Analyze when unhealthy babies are first detected.
-
-    Args:
-        df: Predictions dataframe with first_detection_epoch column
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Get unique GUIDs with their first detection epochs
-    guid_data = df.groupby('guid').agg({
-        'first_detection_epoch': 'first',
-        'binary_target': 'max'  # GUID is unhealthy if any epoch unhealthy
-    }).reset_index()
-
-    # Filter to unhealthy GUIDs only
-    unhealthy_guids = guid_data[guid_data['binary_target'] == 1]
-    detected = unhealthy_guids[unhealthy_guids['first_detection_epoch'].notna()]
-
-    if len(detected) == 0:
-        logger.warning("No detections found for timing analysis")
-        return
-
-    # Convert to hours (negate to show negative hours before birth)
-    detection_hours = -(detected['first_detection_epoch'].values / 3600)
-
-    # Plot 1: Histogram of detection times
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
-
-    axes[0].hist(detection_hours, bins=30, edgecolor='black', alpha=0.7)
-    axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-    axes[0].set_ylabel('Number of Detections', fontsize=12)
-    axes[0].set_title('Distribution of First Detection Times', fontsize=14)
-    axes[0].grid(True, alpha=0.3)
-
-    # Plot 2: Cumulative detection curve
-    sorted_hours = np.sort(detection_hours)
-    cumulative_pct = np.arange(1, len(sorted_hours) + 1) / len(sorted_hours) * 100
-
-    axes[1].plot(sorted_hours, cumulative_pct, linewidth=2)
-    axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-    axes[1].set_ylabel('Cumulative % of Unhealthy GUIDs Detected', fontsize=12)
-    axes[1].set_title('Cumulative Detection Curve', fontsize=14)
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_ylim([0, 105])
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}detection_timing.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}detection_timing.png")
-
-
-def analyze_detection_timing_statistics(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable] = None,
-    output_dir: Path = None,
-    prefix: str = ""
-) -> Dict:
-    """
-    Comprehensive detection timing analysis with lead time metrics.
-
-    Computes:
-    - First detection time statistics (mean, median, std, percentiles)
-    - Lead time before delivery (advance warning)
-    - Detection rates at time windows (0.5-1h, 1-2h, 2-4h, 4-6h, 6+h)
-    - Subgroup-specific timing comparison
-
-    Args:
-        df: Predictions dataframe with first_detection_epoch column
-        subgroups: Optional dictionary of subgroup filters for comparison
-        output_dir: Directory to save results (JSON and CSV)
-        prefix: Prefix for output filenames
-
-    Returns:
-        Dictionary with detection timing statistics
-    """
-    # Get unique GUIDs with their first detection epochs
-    guid_data = df.groupby('guid').agg({
-        'first_detection_epoch': 'first',
-        'binary_target': 'max'  # GUID is unhealthy if any epoch unhealthy
-    }).reset_index()
-
-    # Filter to unhealthy GUIDs
-    unhealthy_guids = guid_data[guid_data['binary_target'] == 1]
-    detected = unhealthy_guids[unhealthy_guids['first_detection_epoch'].notna()]
-
-    # Overall statistics
-    n_unhealthy = len(unhealthy_guids)
-    n_detected = len(detected)
-    detection_rate = (n_detected / n_unhealthy * 100) if n_unhealthy > 0 else 0.0
-
-    overall_stats = {
-        'n_total_guids': len(guid_data),
-        'n_unhealthy_guids': n_unhealthy,
-        'n_detected': n_detected,
-        'n_missed': n_unhealthy - n_detected,
-        'detection_rate': detection_rate
-    }
-
-    if n_detected > 0:
-        # Convert to positive hours before birth
-        detection_hours = abs(detected['first_detection_epoch'].values) / 3600
-
-        overall_stats.update({
-            'mean_detection_time_hours': float(np.mean(detection_hours)),
-            'median_detection_time_hours': float(np.median(detection_hours)),
-            'std_detection_time_hours': float(np.std(detection_hours)),
-            'min_detection_time_hours': float(np.min(detection_hours)),
-            'max_detection_time_hours': float(np.max(detection_hours)),
-            'percentiles': {
-                '25th': float(np.percentile(detection_hours, 25)),
-                '50th': float(np.percentile(detection_hours, 50)),
-                '75th': float(np.percentile(detection_hours, 75)),
-                '90th': float(np.percentile(detection_hours, 90)),
-                '95th': float(np.percentile(detection_hours, 95))
-            }
-        })
-
-        # Detection counts by time window
-        windows = {
-            '0.5-1h': (0.5, 1),
-            '1-2h': (1, 2),
-            '2-4h': (2, 4),
-            '4-6h': (4, 6),
-            '6h+': (6, float('inf'))
-        }
-
-        detection_windows = {}
-        for window_name, (start, end) in windows.items():
-            count = ((detection_hours >= start) & (detection_hours < end)).sum()
-            pct = (count / n_detected * 100) if n_detected > 0 else 0.0
-            detection_windows[window_name] = {
-                'count': int(count),
-                'percentage': float(pct)
-            }
-
-        overall_stats['detection_windows'] = detection_windows
-    else:
-        overall_stats.update({
-            'mean_detection_time_hours': None,
-            'median_detection_time_hours': None,
-            'std_detection_time_hours': None,
-            'min_detection_time_hours': None,
-            'max_detection_time_hours': None,
-            'percentiles': {},
-            'detection_windows': {}
-        })
-
-    results = {'overall': overall_stats}
-
-    # Subgroup-specific statistics
-    if subgroups:
-        subgroup_stats = {}
-        for subgroup_name, subgroup_filter in subgroups.items():
-            try:
-                subgroup_df = df[subgroup_filter(df)]
-                subgroup_guid_data = subgroup_df.groupby('guid').agg({
-                    'first_detection_epoch': 'first',
-                    'binary_target': 'max'
-                }).reset_index()
-
-                subgroup_unhealthy = subgroup_guid_data[subgroup_guid_data['binary_target'] == 1]
-                subgroup_detected = subgroup_unhealthy[subgroup_unhealthy['first_detection_epoch'].notna()]
-
-                n_subgroup_unhealthy = len(subgroup_unhealthy)
-                n_subgroup_detected = len(subgroup_detected)
-                subgroup_detection_rate = (n_subgroup_detected / n_subgroup_unhealthy * 100) if n_subgroup_unhealthy > 0 else 0.0
-
-                subgroup_stat = {
-                    'n_unhealthy_guids': n_subgroup_unhealthy,
-                    'n_detected': n_subgroup_detected,
-                    'n_missed': n_subgroup_unhealthy - n_subgroup_detected,
-                    'detection_rate': subgroup_detection_rate
-                }
-
-                if n_subgroup_detected > 0:
-                    subgroup_hours = abs(subgroup_detected['first_detection_epoch'].values) / 3600
-                    subgroup_stat.update({
-                        'mean_detection_time_hours': float(np.mean(subgroup_hours)),
-                        'median_detection_time_hours': float(np.median(subgroup_hours)),
-                        'std_detection_time_hours': float(np.std(subgroup_hours)),
-                        'min_detection_time_hours': float(np.min(subgroup_hours)),
-                        'max_detection_time_hours': float(np.max(subgroup_hours))
-                    })
-                else:
-                    subgroup_stat.update({
-                        'mean_detection_time_hours': None,
-                        'median_detection_time_hours': None,
-                        'std_detection_time_hours': None,
-                        'min_detection_time_hours': None,
-                        'max_detection_time_hours': None
-                    })
-
-                subgroup_stats[subgroup_name] = subgroup_stat
-
-            except Exception as e:
-                logger.warning(f"Error computing detection stats for subgroup {subgroup_name}: {e}")
-                subgroup_stats[subgroup_name] = {'error': str(e)}
-
-        results['subgroups'] = subgroup_stats
-
-    # Log summary
-    logger.info(f"Detection Timing Statistics:")
-    logger.info(f"  Overall: {n_detected}/{n_unhealthy} detected ({detection_rate:.1f}%)")
-    if n_detected > 0:
-        logger.info(f"  Mean detection time: {overall_stats['mean_detection_time_hours']:.2f}h before birth")
-        logger.info(f"  Median detection time: {overall_stats['median_detection_time_hours']:.2f}h before birth")
-
-    return results
-
-
-def plot_detection_timing_enhanced(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable],
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    Enhanced detection timing plots with subgroup comparison.
-
-    Creates 2x2 grid:
-    - Top-left: Overlaid histograms by subgroup
-    - Top-right: Cumulative detection curves
-    - Bottom-left: Box plots (detection time distribution)
-    - Bottom-right: Violin plots (lead time distribution)
-
-    Args:
-        df: Predictions dataframe
-        subgroups: Dictionary of subgroup filters
-        output_dir: Directory to save plots
-        prefix: Prefix for filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    colors = ['#e74c3c', '#3498db', '#2ecc71']  # Red, Blue, Green
-
-    # Collect detection times for each subgroup
-    subgroup_detections = {}
-    for idx, (subgroup_name, subgroup_filter) in enumerate(subgroups.items()):
-        subgroup_df = df[subgroup_filter(df)]
-        guid_data = subgroup_df.groupby('guid').agg({
-            'first_detection_epoch': 'first',
-            'binary_target': 'max'
-        }).reset_index()
-
-        unhealthy = guid_data[guid_data['binary_target'] == 1]
-        detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
-
-        if len(detected) > 0:
-            # Convert to positive hours before birth
-            detection_hours = abs(detected['first_detection_epoch'].values) / 3600
-            subgroup_detections[subgroup_name] = detection_hours
-
-    if len(subgroup_detections) == 0:
-        logger.warning("No detections found for enhanced timing analysis")
-        return
-
-    # Plot 1: Overlaid histograms
-    for idx, (name, hours) in enumerate(subgroup_detections.items()):
-        axes[0, 0].hist(hours, bins=20, alpha=0.6, label=name.title(),
-                       edgecolor='black', color=colors[idx % len(colors)])
-    axes[0, 0].set_xlabel('Time Before Birth (hours)', fontsize=11)
-    axes[0, 0].set_ylabel('Number of Detections', fontsize=11)
-    axes[0, 0].set_title('Detection Time Distribution by Subgroup', fontsize=13)
-    axes[0, 0].legend(fontsize=10)
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Plot 2: Cumulative detection curves
-    for idx, (name, hours) in enumerate(subgroup_detections.items()):
-        sorted_hours = np.sort(hours)
-        cumulative_pct = np.arange(1, len(sorted_hours) + 1) / len(sorted_hours) * 100
-        axes[0, 1].plot(sorted_hours, cumulative_pct, linewidth=2.5,
-                       label=name.title(), color=colors[idx % len(colors)])
-    axes[0, 1].set_xlabel('Time Before Birth (hours)', fontsize=11)
-    axes[0, 1].set_ylabel('Cumulative % Detected', fontsize=11)
-    axes[0, 1].set_title('Cumulative Detection Curves', fontsize=13)
-    axes[0, 1].legend(fontsize=10)
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_ylim([0, 105])
-
-    # Plot 3: Box plots
-    box_data = [hours for hours in subgroup_detections.values()]
-    box_labels = [name.title() for name in subgroup_detections.keys()]
-    bp = axes[1, 0].boxplot(box_data, labels=box_labels, patch_artist=True)
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.6)
-    axes[1, 0].set_ylabel('Time Before Birth (hours)', fontsize=11)
-    axes[1, 0].set_title('Detection Time Distribution (Box Plots)', fontsize=13)
-    axes[1, 0].grid(True, alpha=0.3, axis='y')
-
-    # Plot 4: Violin plots
-    positions = np.arange(1, len(subgroup_detections) + 1)
-    for idx, (name, hours) in enumerate(subgroup_detections.items()):
-        parts = axes[1, 1].violinplot([hours], positions=[positions[idx]],
-                                     showmeans=True, showmedians=True)
-        for pc in parts['bodies']:
-            pc.set_facecolor(colors[idx % len(colors)])
-            pc.set_alpha(0.6)
-    axes[1, 1].set_xticks(positions)
-    axes[1, 1].set_xticklabels([name.title() for name in subgroup_detections.keys()])
-    axes[1, 1].set_ylabel('Time Before Birth (hours)', fontsize=11)
-    axes[1, 1].set_title('Lead Time Distribution (Violin Plots)', fontsize=13)
-    axes[1, 1].grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}enhanced_detection_timing.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}enhanced_detection_timing.png")
-
-
-def create_lead_time_table(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable]
+    time_bins: np.ndarray,
+    subgroup_filter: Optional[callable] = None
 ) -> pd.DataFrame:
     """
-    Create summary table of lead time metrics by subgroup.
+    Compute instantaneous decision metrics at specific time bins.
 
-    Returns DataFrame with:
-    - subgroup, n_unhealthy_guids, n_detected, detection_rate (%)
-    - mean/median/std lead_time_hours
-    - pct_detected_gt_1h, pct_detected_gt_2h, pct_detected_gt_6h
-    - min/max lead_time
+    For each time bin τ:
+    - Filter epochs in bin: epoch_hours in [bin_start, bin_end)
+    - Sensitivity(τ) = TP(t=τ) / P(t=τ)
+    - FPR(τ) = FP(t=τ) / N(t=τ)
+    - Specificity(τ) = TN(t=τ) / N(t=τ) = 1 - FPR(τ)
+
+    This metric shows performance at a specific time window only.
+    NOT monotonic - can fluctuate based on which epochs fall in each bin.
 
     Args:
-        df: Predictions dataframe
-        subgroups: Dictionary of subgroup filters
+        df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
+        time_bins: Array of time bin edges (hours before birth)
+        subgroup_filter: Optional filter function to apply to df before computation
 
     Returns:
-        DataFrame with lead time metrics
+        DataFrame with columns:
+            - bin_center: Center of time bin (hours before birth)
+            - sensitivity: TP / P in this bin
+            - specificity: TN / N in this bin
+            - fpr: FP / N in this bin
+            - n_positive: Number of positive cases in bin
+            - n_negative: Number of negative cases in bin
+            - n_tp: True positives in bin
+            - n_fp: False positives in bin
+            - n_tn: True negatives in bin
+            - n_fn: False negatives in bin
     """
-    results = []
+    # Apply subgroup filter if provided
+    if subgroup_filter is not None:
+        df = df[subgroup_filter(df)].copy()
 
-    for subgroup_name, subgroup_filter in subgroups.items():
-        subgroup_df = df[subgroup_filter(df)]
-        guid_data = subgroup_df.groupby('guid').agg({
-            'first_detection_epoch': 'first',
-            'binary_target': 'max'
-        }).reset_index()
+    if len(df) == 0:
+        logger.warning("compute_instantaneous_metrics: Empty dataframe after subgroup filter")
+        return pd.DataFrame()
 
-        unhealthy = guid_data[guid_data['binary_target'] == 1]
-        detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
-
-        n_unhealthy = len(unhealthy)
-        n_detected = len(detected)
-        detection_rate = (n_detected / n_unhealthy * 100) if n_unhealthy > 0 else 0.0
-
-        row = {
-            'subgroup': subgroup_name,
-            'n_unhealthy_guids': n_unhealthy,
-            'n_detected': n_detected,
-            'detection_rate_pct': detection_rate
-        }
-
-        if n_detected > 0:
-            # Lead time = time before birth when first detected
-            lead_time_hours = abs(detected['first_detection_epoch'].values) / 3600
-
-            row.update({
-                'mean_lead_time_hours': np.mean(lead_time_hours),
-                'median_lead_time_hours': np.median(lead_time_hours),
-                'std_lead_time_hours': np.std(lead_time_hours),
-                'min_lead_time_hours': np.min(lead_time_hours),
-                'max_lead_time_hours': np.max(lead_time_hours),
-                'pct_detected_gt_1h': (lead_time_hours > 1).sum() / n_detected * 100,
-                'pct_detected_gt_2h': (lead_time_hours > 2).sum() / n_detected * 100,
-                'pct_detected_gt_6h': (lead_time_hours > 6).sum() / n_detected * 100
-            })
-        else:
-            row.update({
-                'mean_lead_time_hours': np.nan,
-                'median_lead_time_hours': np.nan,
-                'std_lead_time_hours': np.nan,
-                'min_lead_time_hours': np.nan,
-                'max_lead_time_hours': np.nan,
-                'pct_detected_gt_1h': 0.0,
-                'pct_detected_gt_2h': 0.0,
-                'pct_detected_gt_6h': 0.0
-            })
-
-        results.append(row)
-
-    return pd.DataFrame(results)
-
-
-def plot_confusion_matrix_heatmap(
-    ax: plt.Axes,
-    cm: np.ndarray,
-    cmap: str,
-    xticklabels: List[str],
-    yticklabels: List[str],
-) -> None:
-    """
-    Plot a 2x2 confusion matrix, using seaborn if available.
-    """
-    if sns is not None:
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt='d',
-            cmap=cmap,
-            ax=ax,
-            cbar=False,
-            xticklabels=xticklabels,
-            yticklabels=yticklabels,
-        )
-        return
-
-    im = ax.imshow(cm, cmap=plt.get_cmap(cmap))
-    for (i, j), v in np.ndenumerate(cm):
-        ax.text(j, i, str(int(v)), ha='center', va='center', color='black', fontsize=10)
-    ax.set_xticks(range(len(xticklabels)))
-    ax.set_xticklabels(xticklabels)
-    ax.set_yticks(range(len(yticklabels)))
-    ax.set_yticklabels(yticklabels)
-    # Keep layout similar to seaborn
-    ax.set_xlim(-0.5, len(xticklabels) - 0.5)
-    ax.set_ylim(len(yticklabels) - 0.5, -0.5)
-
-
-def plot_confusion_matrices_by_time(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = "",
-    exclude_last_minutes: float = 30.0
-) -> None:
-    """
-    Plot confusion matrices for different time windows.
-
-    Args:
-        df: Predictions dataframe
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-        exclude_last_minutes: Exclude last N minutes before birth from plots (default: 30 min)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Compute dynamic time windows
-    time_windows = compute_time_windows(df, exclude_last_minutes=exclude_last_minutes)
-
-    # FIX #5: Ensure epoch_hours column exists
+    # Ensure required columns
     df = ensure_epoch_hours(df.copy())
-
-    # Create grid of confusion matrices
-    n_windows = len(time_windows)
-    n_cols = 3
-    n_rows = (n_windows + n_cols - 1) // n_cols
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-    # FIX #8: Simplified axes flattening - handles single plot, 1D array, and 2D array
-    axes = np.atleast_1d(axes).flatten()
-
-    for idx, (start_h, end_h) in enumerate(time_windows):
-        window_mask = (df['epoch_hours'] >= start_h) & (df['epoch_hours'] < end_h)
-        window_data = df[window_mask]
-
-        if len(window_data) < 10:
-            axes[idx].axis('off')
-            continue
-
-        # Compute confusion matrix
-        # Force 2x2 matrix even if only one class present in window
-        cm = confusion_matrix(window_data['binary_target'], window_data['clinical_pred'], labels=[0, 1])
-
-        plot_confusion_matrix_heatmap(
-            axes[idx],
-            cm,
-            cmap='Blues',
-            xticklabels=['Healthy', 'Unhealthy'],
-            yticklabels=['Healthy', 'Unhealthy'],
-        )
-        # Show negative time range: -end to -start hours before birth
-        axes[idx].set_title(f'{-end_h:.1f} to {-start_h:.1f}h before birth')
-        axes[idx].set_ylabel('True Label')
-        axes[idx].set_xlabel('Predicted Label')
-
-    # Hide unused subplots
-    for idx in range(len(time_windows), len(axes)):
-        axes[idx].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}confusion_matrices_by_time.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}confusion_matrices_by_time.png")
-
-
-def plot_guid_level_analysis(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    GUID-level performance analysis.
-
-    Args:
-        df: Predictions dataframe
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Aggregate to GUID level
-    guid_data = df.groupby('guid').agg({
-        'binary_target': 'max',      # GUID unhealthy if any epoch unhealthy
-        'clinical_pred': 'max',       # GUID predicted unhealthy if any epoch predicted unhealthy
-        'first_detection_epoch': 'first',
-        'is_filled': 'sum'            # Count filled epochs
-    }).reset_index()
-
-    guid_data['n_epochs'] = df.groupby('guid').size().values
-
-    # Plot 1: GUID-level confusion matrix
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-
-    # Force 2x2 matrix even if only one class present
-    cm = confusion_matrix(guid_data['binary_target'], guid_data['clinical_pred'], labels=[0, 1])
-    plot_confusion_matrix_heatmap(
-        axes[0, 0],
-        cm,
-        cmap='Blues',
-        xticklabels=['Healthy', 'Unhealthy'],
-        yticklabels=['Healthy', 'Unhealthy'],
-    )
-    axes[0, 0].set_title('GUID-Level Classification Matrix')
-    axes[0, 0].set_ylabel('True Label')
-    axes[0, 0].set_xlabel('Predicted Label')
-
-    # Plot 2: Time to detection for unhealthy GUIDs
-    unhealthy = guid_data[guid_data['binary_target'] == 1].copy()
-    detected = unhealthy[unhealthy['first_detection_epoch'].notna()]
-    missed = unhealthy[unhealthy['first_detection_epoch'].isna()]
-
-    # Negate to show negative hours before birth
-    detection_hours = -(detected['first_detection_epoch'].values / 3600) if len(detected) > 0 else []
-
-    if len(detection_hours) > 0:
-        axes[0, 1].hist(detection_hours, bins=20, edgecolor='black', alpha=0.7)
-        axes[0, 1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=10)
-        axes[0, 1].set_ylabel('Count')
-        axes[0, 1].set_title(f'Detection Time Distribution (n={len(detected)})')
-        axes[0, 1].grid(True, alpha=0.3)
-    else:
-        axes[0, 1].text(0.5, 0.5, 'No detections', ha='center', va='center')
-        axes[0, 1].axis('off')
-
-    # Plot 3: Epoch coverage distribution
-    axes[1, 0].hist(guid_data['n_epochs'], bins=30, edgecolor='black', alpha=0.7)
-    axes[1, 0].set_xlabel('Number of Epochs per GUID')
-    axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title('Epoch Coverage Distribution')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Plot 4: Filled vs. original epochs
-    if 'is_filled' in guid_data.columns:
-        guid_data['pct_filled'] = guid_data['is_filled'] / guid_data['n_epochs'] * 100
-        axes[1, 1].hist(guid_data['pct_filled'], bins=20, edgecolor='black', alpha=0.7)
-        axes[1, 1].set_xlabel('% Filled Epochs')
-        axes[1, 1].set_ylabel('Count')
-        axes[1, 1].set_title('Proportion of Filled Epochs per GUID')
-        axes[1, 1].grid(True, alpha=0.3)
-    else:
-        axes[1, 1].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}guid_level_analysis.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}guid_level_analysis.png")
-
-
-def plot_threshold_comparison(
-    df_epoch: pd.DataFrame,
-    df_guid: pd.DataFrame,
-    output_dir: Path
-) -> None:
-    """
-    Compare performance of epoch-level vs. GUID-level thresholds.
-
-    Args:
-        df_epoch: Predictions using epoch-level threshold
-        df_guid: Predictions using GUID-level threshold
-        output_dir: Directory to save plots
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-
-    # Plot 1: Metrics comparison
-    metrics_names = ['Sensitivity', 'Specificity', 'Accuracy']
-
-    # Compute metrics for both
-    epoch_metrics = []
-    guid_metrics = []
-
-    for df_data in [df_epoch, df_guid]:
-        class_0 = df_data[df_data['binary_target'] == 0]
-        class_1 = df_data[df_data['binary_target'] == 1]
-
-        sens = (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else 0
-        spec = 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else 0
-        acc = (df_data['binary_target'] == df_data['clinical_pred']).mean()
-
-        if df_data is df_epoch:
-            epoch_metrics = [sens, spec, acc]
-        else:
-            guid_metrics = [sens, spec, acc]
-
-    x = np.arange(len(metrics_names))
-    width = 0.35
-
-    axes[0, 0].bar(x - width/2, epoch_metrics, width, label='Epoch Threshold', alpha=0.8)
-    axes[0, 0].bar(x + width/2, guid_metrics, width, label='GUID Threshold', alpha=0.8)
-    axes[0, 0].set_ylabel('Metric Value')
-    axes[0, 0].set_title('Metrics Comparison: Epoch vs. GUID Threshold')
-    axes[0, 0].set_xticks(x)
-    axes[0, 0].set_xticklabels(metrics_names)
-    axes[0, 0].legend()
-    axes[0, 0].set_ylim([0, 1.05])
-    axes[0, 0].grid(True, alpha=0.3, axis='y')
-
-    # Plot 2: FPR comparison over time
-    time_bins = compute_time_bins(df_epoch)
-    # FIX #5: Ensure epoch_hours column exists
-    df_epoch = ensure_epoch_hours(df_epoch)
-    df_guid = ensure_epoch_hours(df_guid)
-
-    epoch_fprs, guid_fprs, bin_centers = [], [], []
-
-    for i in range(len(time_bins) - 1):
-        bin_start, bin_end = time_bins[i], time_bins[i + 1]
-
-        for df_data, fpr_list in [(df_epoch, epoch_fprs), (df_guid, guid_fprs)]:
-            bin_mask = (df_data['epoch_hours'] >= bin_start) & (df_data['epoch_hours'] < bin_end)
-            class_0 = df_data[bin_mask & (df_data['binary_target'] == 0)]
-
-            if len(class_0) > 0:
-                fpr = (class_0['clinical_pred'] == 1).mean()
-                fpr_list.append(fpr)
-            else:
-                fpr_list.append(np.nan)
-
-        bin_centers.append((bin_start + bin_end) / 2)
-
-    axes[0, 1].plot(bin_centers, epoch_fprs, marker='o', label='Epoch Threshold', linewidth=2)
-    axes[0, 1].plot(bin_centers, guid_fprs, marker='s', label='GUID Threshold', linewidth=2)
-    axes[0, 1].set_xlabel('Time Before Birth (hours)')
-    axes[0, 1].set_ylabel('False Positive Rate')
-    axes[0, 1].set_title('FPR Comparison Over Time')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Plot 3: Detection count comparison
-    epoch_counts, guid_counts = [], []
-
-    for i in range(len(time_bins) - 1):
-        bin_start, bin_end = time_bins[i], time_bins[i + 1]
-
-        for df_data, count_list in [(df_epoch, epoch_counts), (df_guid, guid_counts)]:
-            bin_mask = (df_data['epoch_hours'] >= bin_start) & (df_data['epoch_hours'] < bin_end)
-            count = (df_data[bin_mask]['clinical_pred'] == 1).sum()
-            count_list.append(count)
-
-    axes[1, 0].plot(bin_centers, epoch_counts, marker='o', label='Epoch Threshold', linewidth=2)
-    axes[1, 0].plot(bin_centers, guid_counts, marker='s', label='GUID Threshold', linewidth=2)
-    axes[1, 0].set_xlabel('Time Before Birth (hours)')
-    axes[1, 0].set_ylabel('Number of Positive Predictions')
-    axes[1, 0].set_title('Detection Count Over Time')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Plot 4: Agreement analysis
-    # CRITICAL FIX: Use explicit merge to ensure alignment (don't assume row order matches)
-    agreement_df = pd.merge(
-        df_epoch[['guid', 'epoch', 'clinical_pred']].rename(columns={'clinical_pred': 'epoch_pred'}),
-        df_guid[['guid', 'epoch', 'clinical_pred']].rename(columns={'clinical_pred': 'guid_pred'}),
-        on=['guid', 'epoch'],
-        how='inner',
-        validate='1:1'
-    )
-
-    logger.debug(f"Threshold comparison: {len(agreement_df)} matched samples")
-
-    # Force 2x2 matrix even if only one class present
-    cm = confusion_matrix(agreement_df['epoch_pred'], agreement_df['guid_pred'], labels=[0, 1])
-    plot_confusion_matrix_heatmap(
-        axes[1, 1],
-        cm,
-        cmap='Greens',
-        xticklabels=['GUID: Neg', 'GUID: Pos'],
-        yticklabels=['Epoch: Neg', 'Epoch: Pos'],
-    )
-    axes[1, 1].set_title('Agreement Between Thresholds')
-    axes[1, 1].set_ylabel('Epoch Threshold')
-    axes[1, 1].set_xlabel('GUID Threshold')
-
-    plt.tight_layout()
-    plt.savefig(output_dir / "threshold_comparison.png", dpi=150)
-    plt.close()
-
-    logger.info("Saved: threshold_comparison.png")
-
-
-def plot_subgroup_metrics_vs_time(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable],
-    time_bins: np.ndarray,
-    output_dir: Path,
-    prefix: str = "",
-    guid_level: bool = False
-) -> None:
-    """
-    Plot sensitivity/specificity for multiple subgroups on same figure.
-
-    Creates two separate plots:
-    - Sensitivity comparison across subgroups
-    - Specificity comparison across subgroups
-
-    Args:
-        df: Predictions dataframe
-        subgroups: Dictionary mapping subgroup_name -> filter_function
-        time_bins: Time bin edges in hours
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-        guid_level: If True, plot GUID-level cumulative sensitivity (monotonically increasing)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    # Compute metrics for each subgroup
-    subgroup_results = {}
-    empty_subgroups = []
-    for subgroup_name, subgroup_filter in subgroups.items():
-        metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins, guid_level=guid_level)
-        if len(metrics_df) > 0:
-            subgroup_results[subgroup_name] = metrics_df
-        else:
-            empty_subgroups.append(subgroup_name)
-
-    if len(subgroup_results) == 0:
-        logger.warning(f"No subgroup data available for plotting {prefix}. All subgroups empty: {', '.join(empty_subgroups)}")
-        return
-
-    if empty_subgroups:
-        logger.info(f"Plotting {len(subgroup_results)} subgroups (skipped {len(empty_subgroups)}: {', '.join(empty_subgroups)})")
-
-    # Create figure with 2 subplots: sensitivity and specificity
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    colors = plt.cm.tab10(np.linspace(0, 1, len(subgroup_results)))
-    markers = ['o', 's', '^', 'v', 'D', 'P', '*', 'X']
-
-    for idx, (subgroup_name, metrics_df) in enumerate(subgroup_results.items()):
-        color = colors[idx]
-        marker = markers[idx % len(markers)]
-
-        # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
-        x = -metrics_df['bin_center'].values
-
-        # Use GUID-level or epoch-level metrics depending on mode
-        if guid_level and 'guid_sensitivity' in metrics_df.columns:
-            sens_values = metrics_df['guid_sensitivity'].values
-            spec_values = metrics_df['guid_specificity'].values
-        else:
-            sens_values = metrics_df['sensitivity'].values
-            spec_values = metrics_df['specificity'].values
-
-        # Sensitivity subplot (skip if all NaN)
-        if not np.all(np.isnan(sens_values)):
-            axes[0].plot(x, sens_values,
-                        marker=marker, label=subgroup_name.replace('_', ' ').title(),
-                        linewidth=2, markersize=6, color=color)
-
-        # Specificity subplot (skip if all NaN)
-        if not np.all(np.isnan(spec_values)):
-            axes[1].plot(x, spec_values,
-                        marker=marker, label=subgroup_name.replace('_', ' ').title(),
-                        linewidth=2, markersize=6, color=color)
-
-    # Format sensitivity subplot
-    metric_type = "GUID-Level Cumulative" if guid_level else "Epoch-Level"
-    axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-    axes[0].set_ylabel(f'Sensitivity (TPR) - {metric_type}', fontsize=12)
-    axes[0].set_title(f'Sensitivity by Subgroup ({metric_type})', fontsize=14)
-    axes[0].legend(fontsize=10, loc='best')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].set_ylim([0, 1.05])
-
-    # Format specificity subplot
-    axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-    axes[1].set_ylabel(f'Specificity (TNR) - {metric_type}', fontsize=12)
-    axes[1].set_title(f'Specificity by Subgroup ({metric_type})', fontsize=14)
-    axes[1].legend(fontsize=10, loc='best')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_ylim([0, 1.05])
-
-    plt.tight_layout()
-    filename_suffix = "guid_level" if guid_level else "epoch_level"
-    plt.savefig(output_dir / f"{prefix}subgroup_metrics_vs_time_{filename_suffix}.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}subgroup_metrics_vs_time_{filename_suffix}.png")
-
-
-def plot_subgroup_roc_curves(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable],
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    Plot ROC curves comparing different subgroups.
-
-    Args:
-        df: Predictions dataframe
-        subgroups: Dictionary mapping subgroup_name -> filter_function
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    colors = plt.cm.tab10(np.linspace(0, 1, len(subgroups)))
-
-    for idx, (subgroup_name, subgroup_filter) in enumerate(subgroups.items()):
-        subgroup_df = df[subgroup_filter(df)]
-
-        if len(subgroup_df) < 10 or subgroup_df['binary_target'].nunique() < 2:
-            logger.warning(f"Insufficient data for ROC curve in subgroup: {subgroup_name}")
-            continue
-
-        # Compute ROC
-        fpr, tpr, _ = roc_curve(subgroup_df['binary_target'], subgroup_df['prob_class_1'])
-        roc_auc = auc(fpr, tpr)
-
-        label = f"{subgroup_name.replace('_', ' ').title()} (AUC={roc_auc:.3f})"
-        ax.plot(fpr, tpr, label=label, linewidth=2, color=colors[idx])
-
-    # Plot diagonal
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random (AUC=0.500)')
-
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ROC Curves by Subgroup', fontsize=14)
-    ax.legend(fontsize=11, loc='lower right')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}subgroup_roc_curves.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}subgroup_roc_curves.png")
-
-
-def plot_enhanced_subgroup_comparison(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable],
-    time_bins: np.ndarray,
-    output_dir: Path,
-    prefix: str = "",
-    metric: str = "both"
-) -> None:
-    """
-    Enhanced subgroup comparison with side-by-side epoch and GUID-level views.
-
-    Creates 2x2 grid comparing epoch-level vs GUID-level metrics for subgroups.
-
-    Args:
-        df: Predictions dataframe
-        subgroups: Dictionary mapping subgroup_name -> filter_function
-        time_bins: Time bin edges in hours
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-        metric: "sensitivity", "specificity", or "both"
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    # Create 2x2 subplot grid
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-    colors = ['#e74c3c', '#3498db', '#2ecc71']  # Red, Blue, Green
-    markers = ['o', 's', '^']
-
-    # Compute metrics for each subgroup (both epoch and GUID level)
-    for idx, (subgroup_name, subgroup_filter) in enumerate(subgroups.items()):
-        # Epoch-level metrics
-        epoch_metrics = compute_subgroup_metrics_by_time(
-            df, subgroup_name, subgroup_filter, time_bins, guid_level=False
-        )
-
-        # GUID-level metrics
-        guid_metrics = compute_subgroup_metrics_by_time(
-            df, subgroup_name, subgroup_filter, time_bins, guid_level=True
-        )
-
-        if len(epoch_metrics) == 0:
-            continue
-
-        color = colors[idx % len(colors)]
-        marker = markers[idx % len(markers)]
-        label = subgroup_name.replace('_', ' ').title()
-
-        # Negate bin_center to show negative hours before birth
-        x_epoch = -epoch_metrics['bin_center'].values
-        x_guid = -guid_metrics['bin_center'].values if len(guid_metrics) > 0 else []
-
-        # Top-left: Epoch-level Sensitivity
-        if 'sensitivity' in epoch_metrics.columns and not np.all(np.isnan(epoch_metrics['sensitivity'])):
-            axes[0, 0].plot(x_epoch, epoch_metrics['sensitivity'].values,
-                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
-
-        # Top-right: GUID-level Cumulative Sensitivity
-        if len(guid_metrics) > 0 and 'guid_sensitivity' in guid_metrics.columns:
-            axes[0, 1].plot(x_guid, guid_metrics['guid_sensitivity'].values,
-                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
-
-        # Bottom-left: Epoch-level Specificity
-        if 'specificity' in epoch_metrics.columns and not np.all(np.isnan(epoch_metrics['specificity'])):
-            axes[1, 0].plot(x_epoch, epoch_metrics['specificity'].values,
-                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
-
-        # Bottom-right: GUID-level Cumulative Specificity
-        if len(guid_metrics) > 0 and 'guid_specificity' in guid_metrics.columns:
-            axes[1, 1].plot(x_guid, guid_metrics['guid_specificity'].values,
-                           marker=marker, label=label, linewidth=2, markersize=6, color=color)
-
-    # Format subplots
-    for ax, title in zip(axes.flat, [
-        'Epoch-Level Sensitivity',
-        'GUID-Level Cumulative Sensitivity (Monotonic)',
-        'Epoch-Level Specificity',
-        'GUID-Level Cumulative Specificity'
-    ]):
-        ax.set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=11)
-        ax.set_ylabel('Metric Value', fontsize=11)
-        ax.set_title(title, fontsize=12)
-        ax.legend(fontsize=10, loc='best')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim([0, 1.05])
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}enhanced_sensitivity_specificity.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}enhanced_sensitivity_specificity.png")
-
-
-def compute_subgroup_statistics_summary(
-    df: pd.DataFrame,
-    subgroups: Dict[str, callable],
-    time_bins: np.ndarray
-) -> pd.DataFrame:
-    """
-    Compute comprehensive statistics for each subgroup.
-
-    Returns DataFrame with overall sensitivity/specificity and detection rates
-    at different time windows.
-
-    Args:
-        df: Predictions dataframe
-        subgroups: Dictionary mapping subgroup_name -> filter_function
-        time_bins: Time bin edges in hours
-
-    Returns:
-        DataFrame with subgroup statistics
-    """
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    results = []
-
-    for subgroup_name, subgroup_filter in subgroups.items():
-        subgroup_df = df[subgroup_filter(df)]
-
-        if len(subgroup_df) == 0:
-            continue
-
-        # GUID-level statistics
-        guid_data = subgroup_df.groupby('guid').agg({
-            'binary_target': 'max',
-            'clinical_pred': 'max',
-            'first_detection_epoch': 'first'
-        }).reset_index()
-
-        n_total_guids = len(guid_data)
-        unhealthy_guids = guid_data[guid_data['binary_target'] == 1]
-        healthy_guids = guid_data[guid_data['binary_target'] == 0]
-
-        n_unhealthy = len(unhealthy_guids)
-        n_healthy = len(healthy_guids)
-
-        # Overall GUID-level metrics
-        if n_unhealthy > 0:
-            overall_sensitivity = (unhealthy_guids['clinical_pred'] == 1).sum() / n_unhealthy
-        else:
-            overall_sensitivity = np.nan
-
-        if n_healthy > 0:
-            overall_specificity = 1 - (healthy_guids['clinical_pred'] == 1).sum() / n_healthy
-        else:
-            overall_specificity = np.nan
-
-        # Detection rates at key time windows
-        detected = unhealthy_guids[unhealthy_guids['first_detection_epoch'].notna()]
-        if len(detected) > 0:
-            detection_hours = abs(detected['first_detection_epoch'].values) / 3600
-            detection_rate_1h = (detection_hours <= 1).sum() / len(unhealthy_guids) * 100
-            detection_rate_2h = (detection_hours <= 2).sum() / len(unhealthy_guids) * 100
-            detection_rate_6h = (detection_hours <= 6).sum() / len(unhealthy_guids) * 100
-            mean_detection_time = np.mean(detection_hours)
-            median_detection_time = np.median(detection_hours)
-        else:
-            detection_rate_1h = 0.0
-            detection_rate_2h = 0.0
-            detection_rate_6h = 0.0
-            mean_detection_time = np.nan
-            median_detection_time = np.nan
-
-        row = {
-            'subgroup_name': subgroup_name,
-            'n_total_guids': n_total_guids,
-            'n_unhealthy_guids': n_unhealthy,
-            'n_healthy_guids': n_healthy,
-            'overall_sensitivity': overall_sensitivity,
-            'overall_specificity': overall_specificity,
-            'detection_rate_1h': detection_rate_1h,
-            'detection_rate_2h': detection_rate_2h,
-            'detection_rate_6h': detection_rate_6h,
-            'mean_detection_time': mean_detection_time,
-            'median_detection_time': median_detection_time
-        }
-
-        results.append(row)
-
-    return pd.DataFrame(results)
-
-
-def plot_subgroup_distribution(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    Visualize sample distribution across subgroups.
-
-    Shows:
-    - Target distribution (Healthy, Acidosis, HIE)
-    - CS status distribution
-    - Combined subgroup counts
-    - Prevalence over time
-
-    Args:
-        df: Predictions dataframe
-        output_dir: Directory to save plots
-        prefix: Prefix for plot filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Count unique GUIDs per subgroup
-    guid_stats = df.groupby('guid').agg({
-        'target': 'max',
-        'cs_label': 'first',
-        'binary_target': 'max'
-    }).reset_index()
-
-    # Plot 1: Target distribution
-    target_counts = guid_stats['target'].value_counts().sort_index()
-    target_labels = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}
-    axes[0, 0].bar([target_labels.get(k, str(k)) for k in target_counts.index],
-                   target_counts.values, alpha=0.7, edgecolor='black')
-    axes[0, 0].set_ylabel('Number of GUIDs', fontsize=12)
-    axes[0, 0].set_title('Distribution by Diagnosis', fontsize=14)
-    axes[0, 0].grid(True, alpha=0.3, axis='y')
-
-    # Plot 2: CS status distribution
-    cs_counts = guid_stats['cs_label'].value_counts()
-    cs_labels = {True: 'CS+', False: 'CS-'}
-    axes[0, 1].bar([cs_labels.get(k, 'Unknown') for k in cs_counts.index],
-                   cs_counts.values, alpha=0.7, edgecolor='black')
-    axes[0, 1].set_ylabel('Number of GUIDs', fontsize=12)
-    axes[0, 1].set_title('Distribution by CS Status', fontsize=14)
-    axes[0, 1].grid(True, alpha=0.3, axis='y')
-
-    # Plot 3: Combined subgroup distribution (Diagnosis × CS)
-    combined = guid_stats.groupby(['target', 'cs_label']).size().reset_index(name='count')
-    combined['label'] = combined.apply(
-        lambda row: f"{target_labels.get(row['target'], str(row['target']))} - {cs_labels.get(row['cs_label'], 'Unknown')}",
-        axis=1
-    )
-    axes[1, 0].barh(combined['label'], combined['count'], alpha=0.7, edgecolor='black')
-    axes[1, 0].set_xlabel('Number of GUIDs', fontsize=12)
-    axes[1, 0].set_title('Combined Subgroup Distribution', fontsize=14)
-    axes[1, 0].grid(True, alpha=0.3, axis='x')
-
-    # Plot 4: Prevalence by time (using epoch_hours bins)
-    # FIX #5: Ensure epoch_hours column exists
-    df_copy = ensure_epoch_hours(df.copy())
-
-    time_bins = compute_time_bins(df_copy)
-    bin_centers = []
-    acidosis_prev = []
-    hie_prev = []
-
-    for i in range(len(time_bins) - 1):
-        bin_start, bin_end = time_bins[i], time_bins[i + 1]
-        bin_mask = (df_copy['epoch_hours'] >= bin_start) & (df_copy['epoch_hours'] < bin_end)
-        bin_data = df_copy[bin_mask]
-
-        if len(bin_data) > 0:
-            bin_centers.append((bin_start + bin_end) / 2)
-            acidosis_prev.append((bin_data['target'] == 2).mean() * 100)
-            hie_prev.append((bin_data['target'] == 3).mean() * 100)
-
-    if len(bin_centers) > 0:
-        # Negate bin_centers to show negative hours (before delivery) on left → 0 (delivery) on right
-        x = [-bc for bc in bin_centers]
-        axes[1, 1].plot(x, acidosis_prev, marker='o', label='Acidosis', linewidth=2)
-        axes[1, 1].plot(x, hie_prev, marker='s', label='HIE', linewidth=2)
-        axes[1, 1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-        axes[1, 1].set_ylabel('Prevalence (%)', fontsize=12)
-        axes[1, 1].set_title('Diagnosis Prevalence Over Time', fontsize=14)
-        axes[1, 1].legend(fontsize=11)
-        axes[1, 1].grid(True, alpha=0.3)
-    else:
-        axes[1, 1].text(0.5, 0.5, 'No time data available', ha='center', va='center')
-        axes[1, 1].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{prefix}subgroup_distribution.png", dpi=150)
-    plt.close()
-
-    logger.info(f"Saved: {prefix}subgroup_distribution.png")
-
-
-def save_subgroup_metrics(
-    df: pd.DataFrame,
-    output_dir: Path,
-    prefix: str = ""
-) -> None:
-    """
-    Compute and save subgroup metrics to CSV files.
-
-    Args:
-        df: Predictions dataframe
-        output_dir: Directory to save metrics
-        prefix: Prefix for output filenames
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df.copy())
-
-    # Get all subgroup filters including overall comparison
-    subgroup_filters = create_subgroup_filters()
-    subgroup_filters['unhealthy'] = lambda df: df['binary_target'] == 1
-
-    time_bins = compute_time_bins(df)
-
-    all_subgroup_metrics = []
-    saved_subgroups = []
-    skipped_subgroups = []
-
-    for subgroup_name, subgroup_filter in subgroup_filters.items():
-        metrics_df = compute_subgroup_metrics_by_time(df, subgroup_name, subgroup_filter, time_bins)
-        if len(metrics_df) > 0:
-            all_subgroup_metrics.append(metrics_df)
-            saved_subgroups.append(subgroup_name)
-        else:
-            skipped_subgroups.append(subgroup_name)
-
-    if all_subgroup_metrics:
-        combined_df = pd.concat(all_subgroup_metrics, ignore_index=True)
-        csv_path = output_dir / f"{prefix}subgroup_metrics.csv"
-        combined_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved subgroup metrics: {csv_path}")
-        logger.info(f"  Saved subgroups ({len(saved_subgroups)}): {', '.join(saved_subgroups)}")
-        if skipped_subgroups:
-            logger.info(f"  Skipped subgroups ({len(skipped_subgroups)}): {', '.join(skipped_subgroups)}")
-    else:
-        logger.warning(f"No subgroup metrics to save. All subgroups were empty: {', '.join(skipped_subgroups)}")
-
-
-def evaluate_fold(
-    model: torch.nn.Module,
-    fold_dir: str,
-    config_path: str,
-    checkpoint_path: str,
-    target_fpr: float = 0.05,
-    device: str = 'cuda:0'
-) -> Dict:
-    """
-    Evaluate a single fold after training.
-
-    Args:
-        model: PyTorch model to evaluate
-        fold_dir: Fold output directory
-        config_path: Path to fold config
-        checkpoint_path: Path to best model checkpoint
-        target_fpr: Target false positive rate for threshold selection
-        device: Device to run on
-
-    Returns:
-        Dictionary with evaluation results
-    """
-    fold_dir = Path(fold_dir)
-
-    logger.info(f"Evaluating fold: {fold_dir}")
-    logger.info(f"Using checkpoint: {checkpoint_path}")
-
-    # Load config for dataset settings
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-
-    eval_cfg = (
-        config.get('model_config', {})
-        .get('classifier', {})
-        .get('evaluation', {})
-    ) or {}
-    decision_time_hours = float(eval_cfg.get('decision_time_hours', 1.0))
-    exclude_last_minutes = float(eval_cfg.get('exclude_last_minutes', 30.0))
-    max_gap_multiplier = eval_cfg.get('max_gap_multiplier', None)
-
-    # Load checkpoint using utility function
-    model = load_checkpoint_strict(model, checkpoint_path, map_location=device)
-    if model is None:
-        raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}")
-
-    model.eval()
-    logger.info(f"Model loaded successfully from: {checkpoint_path}")
-
-    # Get dataset config
-    dataset_config = config['dataset_config']
-    dataloader_config = dataset_config['dataloader_config']
-    dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
-    normalized_fields = dataloader_config.get('normalize_fields')
-    stat_path = dataset_config.get('stat_path')
-    batch_size = config['general_config']['batch_size']['test']
-
-    # Create validation dataloader
-    logger.info("Running validation inference...")
-    val_dataloader = create_optimized_dataloader(
-        hdf5_files=dataset_config['classifier_val_datasets'],
-        batch_size=batch_size,
-        num_workers=0,
-        shuffle=False,
-        stats_path=stat_path,
-        normalize_fields=normalized_fields,
-        pin_memory=False,
-        rank=0,
-        world_size=1,
-        **dataset_kwargs
-    )
-
-    # Run validation inference
-    val_df_raw = run_inference(model, val_dataloader, device)
-
-    # FIX #9: Validate predictions DataFrame
-    validate_predictions_df(val_df_raw, "Validation")
-    validate_guid_consistency(val_df_raw)
-    log_dataframe_stats(val_df_raw, "Validation Raw")
-
-    # Save raw validation predictions
-    val_output_dir = fold_dir / "evaluation"
-    val_output_dir.mkdir(parents=True, exist_ok=True)
-    val_df_raw.to_csv(val_output_dir / "validation_predictions_raw.csv", index=False)
-    logger.info("Validation raw predictions saved")
-
-    # Find optimal thresholds using three approaches (epoch-level, GUID-level, time-specific)
-    logger.info("=" * 80)
-    logger.info("THRESHOLD DETERMINATION")
-    logger.info("=" * 80)
-    threshold_results = find_optimal_thresholds(
-        val_df_raw,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier
-    )
-
-    # Save threshold information
-    with open(val_output_dir / "validation_threshold_info.json", 'w') as f:
-        json.dump(threshold_results, f, indent=2)
-
-    # Apply clinical decision rule and fill missing epochs for validation
-    # Using TIME-SPECIFIC threshold (optimized for 1h before delivery)
-    time_threshold = threshold_results['time_specific']['threshold']
-    logger.info(f"Using time-specific threshold: {time_threshold:.4f} (optimized for {decision_time_hours}h before delivery)")
-    val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), time_threshold)
-    val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
-
-    # Verify forward-filling after epoch filling
-    from model.vae_teb_prediction.validation_utils import verify_clinical_decision_rule
-    verify_clinical_decision_rule(val_df_clinical, "Validation (post-filling)")
-
-    # Save clinical validation predictions
-    val_df_clinical.to_csv(val_output_dir / "validation_predictions_clinical.csv", index=False)
-    logger.info("Validation clinical predictions saved")
-
-    # Create test dataloader
-    logger.info("=" * 80)
-    logger.info("TEST SET EVALUATION")
-    logger.info("=" * 80)
-    test_dataloader = create_optimized_dataloader(
-        hdf5_files=dataset_config['classifier_test_datasets'],
-        batch_size=batch_size,
-        num_workers=0,
-        shuffle=False,
-        stats_path=stat_path,
-        normalize_fields=normalized_fields,
-        pin_memory=False,
-        rank=0,
-        world_size=1,
-        **dataset_kwargs
-    )
-
-    # Run test inference
-    test_df_raw = run_inference(model, test_dataloader, device)
-
-    # FIX #9: Validate predictions DataFrame
-    validate_predictions_df(test_df_raw, "Test")
-    validate_guid_consistency(test_df_raw)
-    log_dataframe_stats(test_df_raw, "Test Raw")
-
-    # Save raw test predictions
-    test_df_raw.to_csv(val_output_dir / "test_predictions_raw.csv", index=False)
-    logger.info("Test raw predictions saved")
-
-    # Process test set with all three thresholds (time_specific is primary/recommended)
-    test_results = {}
-
-    for threshold_type in ['time_specific', 'guid_level', 'epoch_level']:
-        is_primary = (threshold_type == 'time_specific')
-        marker = " [PRIMARY - Clinically Optimized]" if is_primary else ""
-        logger.info(f"\nProcessing test set with {threshold_type} threshold...{marker}")
-
-        threshold_value = threshold_results[threshold_type]['threshold']
-
-        # Apply clinical decision rule
-        test_df = apply_clinical_decision_rule(test_df_raw.copy(), threshold_value)
-        # FIX #9: Log statistics after clinical decision rule
-        log_dataframe_stats(test_df, f"Test Clinical ({threshold_type})")
-
-        # Fill missing epochs
-        test_df = fill_missing_epochs(test_df, max_gap_multiplier=max_gap_multiplier)
-        # FIX #9: Log statistics after filling
-        log_dataframe_stats(test_df, f"Test Filled ({threshold_type})")
-
-        # Verify forward-filling after epoch filling
-        verify_clinical_decision_rule(test_df, f"Test {threshold_type} (post-filling)")
-
-        # Save predictions
-        test_df.to_csv(val_output_dir / f"test_predictions_clinical_{threshold_type}.csv", index=False)
-
-        # Compute test metrics
-        test_metrics = {}
-
-        # Epoch-level metrics
-        class_0 = test_df[test_df['binary_target'] == 0]
-        class_1 = test_df[test_df['binary_target'] == 1]
-
-        test_metrics['epoch_metrics'] = {
-            'accuracy': (test_df['binary_target'] == test_df['clinical_pred']).mean(),
-            'sensitivity': (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else 1.0,
-            'specificity': 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else 1.0,
-            'fpr': (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else 0.0,
-            'n_class_0': len(class_0),
-            'n_class_1': len(class_1),
-        }
-
-        # GUID-level metrics
-        guid_stats = test_df.groupby('guid').agg({
-            'binary_target': 'max',
-            'clinical_pred': 'max'
-        }).reset_index()
-
-        healthy_guids = guid_stats[guid_stats['binary_target'] == 0]
-        unhealthy_guids = guid_stats[guid_stats['binary_target'] == 1]
-
-        test_metrics['guid_metrics'] = {
-            'accuracy': (guid_stats['binary_target'] == guid_stats['clinical_pred']).mean(),
-            'sensitivity': (unhealthy_guids['clinical_pred'] == 1).sum() / len(unhealthy_guids) if len(unhealthy_guids) > 0 else 1.0,
-            'specificity': 1 - (healthy_guids['clinical_pred'] == 1).sum() / len(healthy_guids) if len(healthy_guids) > 0 else 1.0,
-            'fpr': (healthy_guids['clinical_pred'] == 1).sum() / len(healthy_guids) if len(healthy_guids) > 0 else 0.0,
-            'n_healthy_guids': len(healthy_guids),
-            'n_unhealthy_guids': len(unhealthy_guids),
-        }
-
-        test_metrics['threshold'] = threshold_value
-        test_results[threshold_type] = test_metrics
-
-        # Save metrics
-        with open(val_output_dir / f"test_metrics_{threshold_type}.json", 'w') as f:
-            json.dump(test_metrics, f, indent=2)
-
-        logger.info(f"{threshold_type.upper()} THRESHOLD RESULTS:")
-        logger.info(f"  Threshold: {threshold_value:.4f}")
-        logger.info(f"  Epoch-level - Acc: {test_metrics['epoch_metrics']['accuracy']:.4f}, "
-                   f"Sens: {test_metrics['epoch_metrics']['sensitivity']:.4f}, "
-                   f"Spec: {test_metrics['epoch_metrics']['specificity']:.4f}")
-        logger.info(f"  GUID-level  - Acc: {test_metrics['guid_metrics']['accuracy']:.4f}, "
-                   f"Sens: {test_metrics['guid_metrics']['sensitivity']:.4f}, "
-                   f"Spec: {test_metrics['guid_metrics']['specificity']:.4f}")
-
-    # Save comparison metrics
-    with open(val_output_dir / "test_metrics_comparison.json", 'w') as f:
-        json.dump(test_results, f, indent=2)
-
-    # Generate visualizations for all three thresholds
-    logger.info("=" * 80)
-    logger.info("GENERATING VISUALIZATIONS")
-    logger.info("=" * 80)
-
-    for threshold_type in ['time_specific', 'guid_level', 'epoch_level']:
-        threshold_value = threshold_results[threshold_type]['threshold']
-
-        # Apply clinical rule for visualization
-        test_df = apply_clinical_decision_rule(test_df_raw.copy(), threshold_value)
-        test_df = fill_missing_epochs(test_df, max_gap_multiplier=max_gap_multiplier)
-
-        # Diagnostic: Log target distribution
-        if 'target' in test_df.columns:
-            target_counts = test_df['target'].value_counts().sort_index()
-            logger.info(f"{threshold_type} - Target distribution in test set:")
-            for target_val, count in target_counts.items():
-                target_name = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}.get(target_val, f'Unknown({target_val})')
-                logger.info(f"  {target_name} (target={target_val}): {count} epochs")
-
-            # Log GUID-level distribution
-            guid_targets = test_df.groupby('guid')['target'].first().value_counts().sort_index()
-            logger.info(f"{threshold_type} - Target distribution (GUID-level):")
-            for target_val, count in guid_targets.items():
-                target_name = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}.get(target_val, f'Unknown({target_val})')
-                logger.info(f"  {target_name} (target={target_val}): {count} GUIDs")
-
-        # Create output directory for this threshold
-        plots_dir = val_output_dir / "plots" / threshold_type
-        plots_dir.mkdir(parents=True, exist_ok=True)
-
-        prefix = ""
-
-        # Generate all plots
-        try:
-            plot_metrics_vs_time(test_df, plots_dir, prefix, exclude_last_minutes=exclude_last_minutes)
-            plot_roc_curves_by_time(test_df, plots_dir, prefix, exclude_last_minutes=exclude_last_minutes)
-            plot_confusion_matrices_by_time(test_df, plots_dir, prefix, exclude_last_minutes=exclude_last_minutes)
-            plot_guid_level_analysis(test_df, plots_dir, prefix)
-
-            # Original detection timing plot (keep for compatibility)
-            plot_detection_timing(test_df, plots_dir, prefix)
-        except Exception as e:
-            logger.warning(f"Error generating plots for {threshold_type}: {e}")
-
-        # Generate subgroup analysis
-        logger.info(f"Generating subgroup analysis for {threshold_type}...")
-
-        # Create subgroup filters
-        subgroup_filters = create_subgroup_filters()
-
-        # Enhanced detection timing analysis
-        try:
-            logger.info("Generating enhanced detection timing analysis...")
-
-            # Comprehensive detection timing statistics
-            detection_stats = analyze_detection_timing_statistics(
-                test_df,
-                subgroups=subgroup_filters,
-                output_dir=plots_dir,
-                prefix=prefix
-            )
-
-            # Save detection statistics as JSON
-            with open(plots_dir / f"{prefix}detection_timing_statistics.json", 'w') as f:
-                json.dump(detection_stats, f, indent=2)
-
-            # Enhanced plots with subgroup comparison (Acidosis vs HIE)
-            timing_subgroups = {
-                'acidosis': subgroup_filters['acidosis'],
-                'hie': subgroup_filters['hie']
-            }
-            plot_detection_timing_enhanced(test_df, timing_subgroups, plots_dir, prefix)
-
-            # Lead time metrics table
-            lead_time_subgroups = {
-                'acidosis': subgroup_filters['acidosis'],
-                'hie': subgroup_filters['hie'],
-                'healthy': subgroup_filters['healthy']
-            }
-            lead_time_table = create_lead_time_table(test_df, lead_time_subgroups)
-            lead_time_table.to_csv(plots_dir / f"{prefix}lead_time_metrics.csv", index=False)
-
-            logger.info(f"Detection timing analysis complete")
-        except Exception as e:
-            logger.warning(f"Error in enhanced detection timing analysis: {e}")
-
-        # Create subgroup output directory
-        subgroup_dir = plots_dir / "subgroup_analysis"
-        subgroup_dir.mkdir(parents=True, exist_ok=True)
-
-        # Compute time bins for subgroup analysis (excluding last 30 minutes before birth)
-        time_bins = compute_time_bins(test_df, exclude_last_minutes=exclude_last_minutes)
-        logger.info(f"Time bins computed (excluding last {exclude_last_minutes:.0f}min): {len(time_bins)-1} bins from {time_bins[0]:.2f}h to {time_bins[-1]:.2f}h")
-
-        # Plot diagnosis comparison (Acidosis vs HIE) - Both epoch and GUID level
-        try:
-            diagnosis_subgroups = {
-                'acidosis': subgroup_filters['acidosis'],
-                'hie': subgroup_filters['hie']
-            }
-            # Epoch-level metrics
-            plot_subgroup_metrics_vs_time(
-                test_df, diagnosis_subgroups,
-                time_bins,
-                subgroup_dir, prefix="diagnosis_", guid_level=False
-            )
-            # GUID-level cumulative metrics (monotonically increasing)
-            plot_subgroup_metrics_vs_time(
-                test_df, diagnosis_subgroups,
-                time_bins,
-                subgroup_dir, prefix="diagnosis_", guid_level=True
-            )
-            plot_subgroup_roc_curves(
-                test_df, diagnosis_subgroups,
-                subgroup_dir, prefix="diagnosis_"
-            )
-
-            # Enhanced subgroup comparison (Epoch vs GUID level side-by-side)
-            plot_enhanced_subgroup_comparison(
-                test_df, diagnosis_subgroups, time_bins,
-                subgroup_dir, prefix="diagnosis_", metric="both"
-            )
-
-            # Compute and save subgroup statistics summary
-            stats_df = compute_subgroup_statistics_summary(
-                test_df, diagnosis_subgroups, time_bins
-            )
-            stats_df.to_csv(subgroup_dir / "diagnosis_statistics.csv", index=False)
-            logger.info(f"Saved diagnosis subgroup statistics: {len(stats_df)} subgroups")
-        except Exception as e:
-            logger.warning(f"Error generating diagnosis subgroup plots: {e}")
-
-        # Plot CS status comparison - Both epoch and GUID level
-        try:
-            cs_subgroups = {
-                'cs_positive': subgroup_filters['cs_positive'],
-                'cs_negative': subgroup_filters['cs_negative']
-            }
-            # Epoch-level metrics
-            plot_subgroup_metrics_vs_time(
-                test_df, cs_subgroups,
-                time_bins,
-                subgroup_dir, prefix="cs_status_", guid_level=False
-            )
-            # GUID-level cumulative metrics
-            plot_subgroup_metrics_vs_time(
-                test_df, cs_subgroups,
-                time_bins,
-                subgroup_dir, prefix="cs_status_", guid_level=True
-            )
-            plot_subgroup_roc_curves(
-                test_df, cs_subgroups,
-                subgroup_dir, prefix="cs_status_"
-            )
-        except Exception as e:
-            logger.warning(f"Error generating CS status subgroup plots: {e}")
-
-        # Plot BG label comparison - Both epoch and GUID level
-        try:
-            bg_subgroups = {
-                'bg_positive': subgroup_filters['bg_positive'],
-                'bg_negative': subgroup_filters['bg_negative']
-            }
-            plot_subgroup_metrics_vs_time(
-                test_df, bg_subgroups,
-                time_bins,
-                subgroup_dir, prefix="bg_label_", guid_level=False
-            )
-            plot_subgroup_metrics_vs_time(
-                test_df, bg_subgroups,
-                time_bins,
-                subgroup_dir, prefix="bg_label_", guid_level=True
-            )
-            plot_subgroup_roc_curves(
-                test_df, bg_subgroups,
-                subgroup_dir, prefix="bg_label_"
-            )
-        except Exception as e:
-            logger.warning(f"Error generating BG label subgroup plots: {e}")
-
-        # Plot combined subgroups - Both epoch and GUID level
-        try:
-            combined_subgroups = {
-                'acidosis_cs_pos': subgroup_filters['acidosis_cs_pos'],
-                'acidosis_cs_neg': subgroup_filters['acidosis_cs_neg'],
-                'hie_cs_pos': subgroup_filters['hie_cs_pos'],
-                'hie_cs_neg': subgroup_filters['hie_cs_neg']
-            }
-            plot_subgroup_metrics_vs_time(
-                test_df, combined_subgroups,
-                time_bins,
-                subgroup_dir, prefix="combined_", guid_level=False
-            )
-            plot_subgroup_metrics_vs_time(
-                test_df, combined_subgroups,
-                time_bins,
-                subgroup_dir, prefix="combined_", guid_level=True
-            )
-        except Exception as e:
-            logger.warning(f"Error generating combined subgroup plots: {e}")
-
-        # Plot overall comparison (Healthy vs Unhealthy) - Both epoch and GUID level
-        try:
-            overall_subgroups = {
-                'healthy': subgroup_filters['healthy'],
-                'unhealthy': lambda df: df['binary_target'] == 1
-            }
-            # Epoch-level
-            plot_subgroup_metrics_vs_time(
-                test_df, overall_subgroups,
-                time_bins,
-                subgroup_dir, prefix="overall_", guid_level=False
-            )
-            # GUID-level (THIS IS THE KEY ONE - monotonically increasing)
-            plot_subgroup_metrics_vs_time(
-                test_df, overall_subgroups,
-                time_bins,
-                subgroup_dir, prefix="overall_", guid_level=True
-            )
-        except Exception as e:
-            logger.warning(f"Error generating overall subgroup plots: {e}")
-
-        # Plot sample distribution
-        try:
-            plot_subgroup_distribution(test_df, subgroup_dir, prefix="")
-        except Exception as e:
-            logger.warning(f"Error generating subgroup distribution plot: {e}")
-
-        # Save subgroup metrics to CSV
-        try:
-            save_subgroup_metrics(test_df, subgroup_dir, prefix="")
-        except Exception as e:
-            logger.warning(f"Error saving subgroup metrics CSV: {e}")
-
-        logger.info(f"Subgroup analysis complete for {threshold_type}")
-
-    # Generate comparison plots
-    try:
-        # Load both processed test sets
-        df_epoch = apply_clinical_decision_rule(test_df_raw.copy(), threshold_results['epoch_level']['threshold'])
-        df_epoch = fill_missing_epochs(df_epoch)
-
-        df_guid = apply_clinical_decision_rule(test_df_raw.copy(), threshold_results['guid_level']['threshold'])
-        df_guid = fill_missing_epochs(df_guid)
-
-        comparison_dir = val_output_dir / "plots" / "comparison"
-        plot_threshold_comparison(df_epoch, df_guid, comparison_dir)
-    except Exception as e:
-        logger.warning(f"Error generating comparison plots: {e}")
-
-    logger.info("=" * 80)
-    logger.info("EVALUATION COMPLETE")
-    logger.info("=" * 80)
-
-    # Save processing metadata for reproducibility and debugging
-    processing_metadata = {
-        'fold_dir': str(fold_dir),
-        'checkpoint_path': str(checkpoint_path),
-        'device': device,
-        'target_fpr': target_fpr,
-        'validation_samples': len(val_df_raw),
-        'test_samples': len(test_df_raw),
-        'thresholds_used': {
-            'epoch_level': threshold_results['epoch_level']['threshold'],
-            'guid_level': threshold_results['guid_level']['threshold']
-        },
-        'evaluation_timestamp': datetime.now().isoformat()
-    }
-
-    metadata_path = val_output_dir / "processing_metadata.json"
-    with open(metadata_path, 'w') as f:
-        json.dump(processing_metadata, f, indent=2)
-    logger.info(f"Saved processing metadata: {metadata_path}")
-
-    # ------------------------------------------------------------------
-    # Compatibility helpers for older callers that expect a flat schema
-    # ------------------------------------------------------------------
-    preferred_threshold_type = 'guid_level'
-    compat_threshold_type = preferred_threshold_type if threshold_results.get(preferred_threshold_type) else None
-    if compat_threshold_type is None and threshold_results.get('epoch_level'):
-        compat_threshold_type = 'epoch_level'
-
-    validation_metrics_compat = {}
-    if compat_threshold_type is not None:
-        validation_metrics_compat = dict(threshold_results.get(compat_threshold_type, {}))
-        if validation_metrics_compat:
-            validation_metrics_compat.setdefault('threshold_type', compat_threshold_type)
-            target_fpr_value = threshold_results.get('target_fpr')
-            if target_fpr_value is not None and 'target_fpr' not in validation_metrics_compat:
-                validation_metrics_compat['target_fpr'] = target_fpr_value
-
-    test_metrics_compat = {}
-    if compat_threshold_type is not None:
-        test_result = test_results.get(compat_threshold_type, {})
-        metrics_key = 'guid_metrics' if compat_threshold_type == 'guid_level' else 'epoch_metrics'
-        test_metrics_compat = dict(test_result.get(metrics_key, {}))
-        if test_metrics_compat:
-            test_metrics_compat.setdefault('threshold_type', compat_threshold_type)
-            threshold_value = test_result.get('threshold')
-            if threshold_value is not None and 'threshold' not in test_metrics_compat:
-                test_metrics_compat['threshold'] = threshold_value
-
-    return {
-        'threshold_info': threshold_results,
-        'test_results': test_results,
-        'validation_metrics': validation_metrics_compat,
-        'test_metrics': test_metrics_compat,
-    }
-
-
-# ==================================================================================
-# K-FOLD CROSS-VALIDATION RESULT AGGREGATION
-# ==================================================================================
-
-def load_fold_predictions(fold_dir: Path, threshold_type: str) -> pd.DataFrame:
-    """
-    Load predictions CSV for a single fold.
-
-    Args:
-        fold_dir: Path to fold directory (e.g., fold_1)
-        threshold_type: 'epoch_level' or 'guid_level'
-
-    Returns:
-        DataFrame with predictions, or None if file not found
-    """
-    csv_path = fold_dir / "evaluation" / f"test_predictions_clinical_{threshold_type}.csv"
-
-    if not csv_path.exists():
-        logger.warning(f"CSV not found: {csv_path}")
-        return None
-
-    df = pd.read_csv(csv_path)
-    df['epoch_hours'] = df['epoch'] / 3600  # Convert seconds to hours
-    return df
-
-
-def load_all_folds(base_dir: Path, threshold_type: str, num_folds: int) -> List[pd.DataFrame]:
-    """
-    Load predictions from all folds.
-
-    Args:
-        base_dir: Base directory containing fold_1, fold_2, ..., fold_N
-        threshold_type: 'epoch_level' or 'guid_level'
-        num_folds: Number of folds to load
-
-    Returns:
-        List of DataFrames, one per successfully loaded fold
-    """
-    fold_data = []
-
-    for fold_id in range(1, num_folds + 1):
-        fold_dir = base_dir / f"fold_{fold_id}"
-        df = load_fold_predictions(fold_dir, threshold_type)
-
-        if df is not None:
-            df['fold_id'] = fold_id  # Track which fold this came from
-            fold_data.append(df)
-            logger.info(f"Loaded fold {fold_id}: {len(df)} samples")
-
-    logger.info(f"Successfully loaded {len(fold_data)}/{num_folds} folds")
-    return fold_data
-
-
-def compute_fold_metrics_by_time(df: pd.DataFrame, time_bins: np.ndarray) -> pd.DataFrame:
-    """
-    Compute sensitivity and specificity for each time bin in a single fold.
-
-    Args:
-        df: Predictions dataframe for one fold
-        time_bins: Time bin edges in hours (from compute_time_bins)
-
-    Returns:
-        DataFrame with columns: bin_start, bin_end, bin_center, sensitivity,
-                                specificity, n_class_0, n_class_1
-    """
-    # FIX #5: Ensure epoch_hours column exists
-    df = ensure_epoch_hours(df)
 
     results = []
 
@@ -3196,561 +1301,1600 @@ def compute_fold_metrics_by_time(df: pd.DataFrame, time_bins: np.ndarray) -> pd.
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # Filter to this time bin
+        # Filter epochs in this time bin only
         bin_mask = (df['epoch_hours'] >= bin_start) & (df['epoch_hours'] < bin_end)
         bin_data = df[bin_mask]
 
         if len(bin_data) == 0:
-            # No data in this bin - use NaN
+            # No data in this bin - record NaN
             results.append({
-                'bin_start': bin_start,
-                'bin_end': bin_end,
                 'bin_center': bin_center,
                 'sensitivity': np.nan,
                 'specificity': np.nan,
-                'n_class_0': 0,
-                'n_class_1': 0
+                'fpr': np.nan,
+                'n_positive': 0,
+                'n_negative': 0,
+                'n_tp': 0,
+                'n_fp': 0,
+                'n_tn': 0,
+                'n_fn': 0
             })
             continue
 
-        # Compute metrics (same logic as plot_metrics_vs_time)
-        class_0 = bin_data[bin_data['binary_target'] == 0]
-        class_1 = bin_data[bin_data['binary_target'] == 1]
+        # Count positives and negatives in this bin
+        positives = bin_data[bin_data['binary_target'] == 1]
+        negatives = bin_data[bin_data['binary_target'] == 0]
 
-        specificity = 1 - (class_0['clinical_pred'] == 1).mean() if len(class_0) > 0 else np.nan
-        sensitivity = (class_1['clinical_pred'] == 1).mean() if len(class_1) > 0 else np.nan
+        n_positive = len(positives)
+        n_negative = len(negatives)
+
+        # Count TP, FP, TN, FN in this bin
+        n_tp = ((bin_data['binary_target'] == 1) & (bin_data['clinical_pred'] == 1)).sum()
+        n_fp = ((bin_data['binary_target'] == 0) & (bin_data['clinical_pred'] == 1)).sum()
+        n_tn = ((bin_data['binary_target'] == 0) & (bin_data['clinical_pred'] == 0)).sum()
+        n_fn = ((bin_data['binary_target'] == 1) & (bin_data['clinical_pred'] == 0)).sum()
+
+        # Compute metrics
+        sensitivity = n_tp / n_positive if n_positive > 0 else np.nan
+        fpr = n_fp / n_negative if n_negative > 0 else np.nan
+        specificity = n_tn / n_negative if n_negative > 0 else np.nan
 
         results.append({
-            'bin_start': bin_start,
-            'bin_end': bin_end,
             'bin_center': bin_center,
             'sensitivity': sensitivity,
             'specificity': specificity,
-            'n_class_0': len(class_0),
-            'n_class_1': len(class_1)
+            'fpr': fpr,
+            'n_positive': n_positive,
+            'n_negative': n_negative,
+            'n_tp': n_tp,
+            'n_fp': n_fp,
+            'n_tn': n_tn,
+            'n_fn': n_fn
         })
 
-    return pd.DataFrame(results)
+    result_df = pd.DataFrame(results)
 
-
-def aggregate_metrics_across_folds(fold_metrics_list: List[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Aggregate metrics from all folds.
-
-    Args:
-        fold_metrics_list: List of DataFrames, one per fold (from compute_fold_metrics_by_time)
-
-    Returns:
-        DataFrame with columns: bin_center, sensitivity_mean, sensitivity_min, sensitivity_max,
-                                specificity_mean, specificity_min, specificity_max, n_folds
-    """
-    # Concatenate all folds
-    all_metrics = pd.concat(fold_metrics_list, ignore_index=True)
-
-    # Group by time bin and aggregate
-    aggregated = all_metrics.groupby('bin_center').agg({
-        'sensitivity': ['mean', 'min', 'max', 'count'],
-        'specificity': ['mean', 'min', 'max', 'count'],
-        'n_class_0': 'sum',
-        'n_class_1': 'sum'
-    }).reset_index()
-
-    # Flatten column names
-    aggregated.columns = [
-        'bin_center',
-        'sensitivity_mean', 'sensitivity_min', 'sensitivity_max', 'n_folds_sens',
-        'specificity_mean', 'specificity_min', 'specificity_max', 'n_folds_spec',
-        'total_class_0', 'total_class_1'
-    ]
-
-    return aggregated
-
-
-def plot_aggregated_metrics(
-    aggregated_df: pd.DataFrame,
-    output_dir: Path,
-    threshold_type: str
-) -> None:
-    """
-    Plot sensitivity and specificity with confidence bounds across all folds.
-
-    Args:
-        aggregated_df: Aggregated metrics from aggregate_metrics_across_folds
-        output_dir: Directory to save plot
-        threshold_type: 'epoch_level' or 'guid_level' (for title)
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
-    x = -aggregated_df['bin_center'].values
-
-    # Plot sensitivity
-    ax.plot(x, aggregated_df['sensitivity_mean'],
-            marker='o', label='Sensitivity (mean)',
-            linewidth=2, markersize=6, color='#2E86AB')
-    ax.fill_between(x,
-                     aggregated_df['sensitivity_min'],
-                     aggregated_df['sensitivity_max'],
-                     alpha=0.2, color='#2E86AB', label='Sensitivity (min-max)')
-
-    # Plot specificity
-    ax.plot(x, aggregated_df['specificity_mean'],
-            marker='s', label='Specificity (mean)',
-            linewidth=2, markersize=6, color='#A23B72')
-    ax.fill_between(x,
-                     aggregated_df['specificity_min'],
-                     aggregated_df['specificity_max'],
-                     alpha=0.2, color='#A23B72', label='Specificity (min-max)')
-
-    # Formatting (follows existing conventions)
-    ax.set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-    ax.set_ylabel('Metric Value', fontsize=12)
-    ax.set_title(
-        f'10-Fold CV: Sensitivity and Specificity vs. Time ({threshold_type.replace("_", " ").title()})',
-        fontsize=14
+    logger.info(
+        f"compute_instantaneous_metrics: Computed metrics for {len(result_df)} time bins "
+        f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
-    ax.legend(fontsize=11, loc='best')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([0, 1.05])
 
-    plt.tight_layout()
-    output_path = output_dir / f"kfold_aggregated_metrics_{threshold_type}.png"
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-
-    logger.info(f"Saved aggregated plot: {output_path}")
+    return result_df
 
 
-def aggregate_kfold_metrics(
-    kfold_results_dir: str,
-    threshold_type: str = 'both',
-    num_folds: int = 10,
-    output_dir: str = None
-) -> Dict:
+def compute_committed_cumulative_metrics(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    subgroup_filter: Optional[callable] = None
+) -> pd.DataFrame:
     """
-    Aggregate sensitivity/specificity metrics across all K-fold cross-validation folds.
+    Compute committed decision metrics with CHANGING denominator.
 
-    This function loads test predictions from all folds, computes metrics per time bin
-    for each fold, and aggregates across folds with mean and confidence bounds (min/max).
+    For each time bin center τ:
+    - Get GUIDs with data available at time τ: epoch_hours >= τ
+    - For each GUID, check if detected (any epoch with clinical_pred=1 from τ to birth)
+    - Sensitivity(τ) = TP(t≤τ) / P(t≤τ)
+    - FPR(τ) = FP(t≤τ) / N(t≤τ)
+
+    where:
+    - TP(t≤τ) = detected unhealthy GUIDs (with data at τ)
+    - P(t≤τ) = total unhealthy GUIDs available at time τ
+    - FP(t≤τ) = detected healthy GUIDs (with data at τ)
+    - N(t≤τ) = total healthy GUIDs available at time τ
+
+    The denominator CHANGES as we approach birth (more GUIDs have data).
+    This metric is monotonically non-decreasing.
 
     Args:
-        kfold_results_dir: Base directory containing fold_1, fold_2, ..., fold_N
-        threshold_type: 'epoch_level', 'guid_level', or 'both'
-        num_folds: Number of folds (default: 10)
-        output_dir: Where to save aggregated results (default: kfold_results_dir/aggregated)
+        df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
+        time_bins: Array of time bin edges (hours before birth)
+        subgroup_filter: Optional filter function to apply to df before computation
 
     Returns:
-        Dictionary with aggregated metrics and metadata
+        DataFrame with columns:
+            - bin_center: Center of time bin (hours before birth)
+            - sensitivity: Cumulative detection rate for positives available at τ
+            - specificity: Cumulative true negative rate for negatives available at τ
+            - fpr: Cumulative false positive rate for negatives available at τ
+            - n_positive_available: Number of positive GUIDs available at τ
+            - n_negative_available: Number of negative GUIDs available at τ
+            - n_detected_positive: Number of detected positive GUIDs
+            - n_detected_negative: Number of detected negative GUIDs
     """
-    base_dir = Path(kfold_results_dir)
+    # Apply subgroup filter if provided
+    if subgroup_filter is not None:
+        df = df[subgroup_filter(df)].copy()
 
-    if output_dir is None:
-        output_dir = base_dir / "aggregated"
-    else:
-        output_dir = Path(output_dir)
+    if len(df) == 0:
+        logger.warning("compute_committed_cumulative_metrics: Empty dataframe after subgroup filter")
+        return pd.DataFrame()
 
-    threshold_types = ['epoch_level', 'guid_level'] if threshold_type == 'both' else [threshold_type]
+    # Ensure required columns
+    df = ensure_epoch_hours(df.copy())
 
-    all_results = {}
+    # Get GUID-level target labels (binary_target should be consistent per GUID)
+    guid_targets = df.groupby('guid')['binary_target'].first()
 
-    for thr_type in threshold_types:
-        logger.info("=" * 80)
-        logger.info(f"AGGREGATING RESULTS FOR: {thr_type}")
-        logger.info("=" * 80)
+    results = []
 
-        # 1. Load all folds
-        fold_data = load_all_folds(base_dir, thr_type, num_folds)
+    for i in range(len(time_bins) - 1):
+        bin_start, bin_end = time_bins[i], time_bins[i + 1]
+        bin_center = (bin_start + bin_end) / 2
 
-        if len(fold_data) == 0:
-            logger.error(f"No folds loaded for {thr_type}. Skipping.")
+        # Get GUIDs with data available at time τ (bin_center)
+        # Available means they have at least one epoch with epoch_hours >= bin_center
+        available_mask = df['epoch_hours'] >= bin_center
+        available_guids = df[available_mask]['guid'].unique()
+
+        if len(available_guids) == 0:
+            results.append({
+                'bin_center': bin_center,
+                'sensitivity': np.nan,
+                'specificity': np.nan,
+                'fpr': np.nan,
+                'n_positive_available': 0,
+                'n_negative_available': 0,
+                'n_detected_positive': 0,
+                'n_detected_negative': 0
+            })
             continue
 
-        # 2. Compute unified time bins from first fold (all use same bins)
-        logger.info("Computing time bins from first fold...")
-        time_bins = compute_time_bins(fold_data[0])
-        logger.info(f"Time bins: {time_bins}")
+        # Split by target
+        available_positive_guids = [g for g in available_guids if guid_targets.get(g, -1) == 1]
+        available_negative_guids = [g for g in available_guids if guid_targets.get(g, -1) == 0]
 
-        # 3. Compute metrics for each fold
-        logger.info("Computing metrics per fold...")
-        fold_metrics_list = []
-        for i, df in enumerate(fold_data, 1):
-            fold_metrics = compute_fold_metrics_by_time(df, time_bins)
-            fold_metrics['fold_id'] = df['fold_id'].iloc[0]  # Add fold ID
-            fold_metrics_list.append(fold_metrics)
-            logger.info(f"  Fold {i}: computed metrics for {len(fold_metrics)} time bins")
+        n_positive_available = len(available_positive_guids)
+        n_negative_available = len(available_negative_guids)
 
-        # 4. Aggregate across folds
-        logger.info("Aggregating across folds...")
-        aggregated_df = aggregate_metrics_across_folds(fold_metrics_list)
+        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
+        # "From τ to birth" means epoch_hours >= bin_center
+        detected_positive = 0
+        for guid in available_positive_guids:
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            if (guid_data['clinical_pred'] == 1).any():
+                detected_positive += 1
 
-        # 5. Save outputs
-        thr_output_dir = output_dir / thr_type
-        thr_output_dir.mkdir(parents=True, exist_ok=True)
+        detected_negative = 0
+        for guid in available_negative_guids:
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            if (guid_data['clinical_pred'] == 1).any():
+                detected_negative += 1
 
-        # Save aggregated metrics
-        agg_csv_path = thr_output_dir / "aggregated_metrics.csv"
-        aggregated_df.to_csv(agg_csv_path, index=False)
-        logger.info(f"Saved: {agg_csv_path}")
+        # Compute metrics
+        sensitivity = detected_positive / n_positive_available if n_positive_available > 0 else np.nan
+        fpr = detected_negative / n_negative_available if n_negative_available > 0 else np.nan
+        specificity = (n_negative_available - detected_negative) / n_negative_available if n_negative_available > 0 else np.nan
 
-        # Save raw fold metrics (for debugging)
-        raw_csv_path = thr_output_dir / "fold_metrics_raw.csv"
-        all_fold_metrics = pd.concat(fold_metrics_list, ignore_index=True)
-        all_fold_metrics.to_csv(raw_csv_path, index=False)
-        logger.info(f"Saved: {raw_csv_path}")
+        results.append({
+            'bin_center': bin_center,
+            'sensitivity': sensitivity,
+            'specificity': specificity,
+            'fpr': fpr,
+            'n_positive_available': n_positive_available,
+            'n_negative_available': n_negative_available,
+            'n_detected_positive': detected_positive,
+            'n_detected_negative': detected_negative
+        })
 
-        # Save summary metadata
-        summary = {
-            'threshold_type': thr_type,
-            'num_folds_requested': num_folds,
-            'num_folds_loaded': len(fold_data),
-            'missing_folds': [i for i in range(1, num_folds + 1) if i not in [df['fold_id'].iloc[0] for df in fold_data]],
-            'time_bins_used': time_bins.tolist(),
-            'aggregation_date': datetime.now().isoformat()
-        }
-        summary_path = thr_output_dir / "aggregation_summary.json"
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
-        logger.info(f"Saved: {summary_path}")
+    result_df = pd.DataFrame(results)
 
-        # 6. Generate plot
-        logger.info("Generating aggregated plot...")
-        plot_aggregated_metrics(aggregated_df, thr_output_dir, thr_type)
+    logger.info(
+        f"compute_committed_cumulative_metrics: Computed metrics for {len(result_df)} time bins "
+        f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
+    )
 
-        # Store results
-        all_results[thr_type] = {
-            'aggregated_metrics': aggregated_df,
-            'fold_metrics': all_fold_metrics,
-            'summary': summary
-        }
+    # Verify monotonicity
+    valid_sens = result_df['sensitivity'].dropna()
+    if len(valid_sens) > 1:
+        violations = (valid_sens.diff() < -1e-6).sum()
+        if violations > 0:
+            logger.warning(f"⚠️  Committed cumulative sensitivity has {violations} monotonicity violations!")
+        else:
+            logger.info("✓ Committed cumulative sensitivity is monotonically non-decreasing")
 
-        logger.info(f"Aggregation complete for {thr_type}")
-        logger.info("=" * 80)
-
-    logger.info("ALL AGGREGATIONS COMPLETE!")
-    return all_results
+    return result_df
 
 
-# ==================================================================================
-# SUBGROUP AGGREGATION FUNCTIONS
-# ==================================================================================
-
-def aggregate_subgroup_metrics(
-    kfold_results_dir: str,
-    threshold_type: str = 'epoch_level',
-    num_folds: int = 10,
-    completed_fold_ids: List[int] = None
-) -> Tuple[pd.DataFrame, Dict]:
+def compute_committed_overall_metrics(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    subgroup_filter: Optional[callable] = None
+) -> pd.DataFrame:
     """
-    Aggregate subgroup metrics across all folds.
+    Compute committed decision metrics with FIXED denominator (PRIMARY METRIC).
+
+    For each time bin center τ:
+    - Get ALL GUIDs in dataset: P(t≤0) and N(t≤0) are FIXED
+    - For GUIDs with data at time τ, check if detected (any clinical_pred=1 from τ to birth)
+    - Sensitivity(τ) = TP(t≤τ) / P(t≤0)
+    - FPR(τ) = FP(t≤τ) / N(t≤0)
+
+    where:
+    - TP(t≤τ) = detected unhealthy GUIDs (with data at τ)
+    - P(t≤0) = ALL unhealthy GUIDs in dataset (FIXED)
+    - FP(t≤τ) = detected healthy GUIDs (with data at τ)
+    - N(t≤0) = ALL healthy GUIDs in dataset (FIXED)
+
+    GUIDs not yet available at time τ contribute 0 to numerator (not detected yet).
+
+    The denominator is FIXED across all time bins.
+    This is the PRIMARY METRIC for clinical reporting.
+    MUST be monotonically non-decreasing.
 
     Args:
-        kfold_results_dir: Base directory containing fold_1, fold_2, ..., fold_N
-        threshold_type: 'epoch_level' or 'guid_level'
-        num_folds: Number of folds configured (for reference)
-        completed_fold_ids: List of fold IDs to aggregate. If None, tries to load 1..num_folds.
+        df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
+        time_bins: Array of time bin edges (hours before birth)
+        subgroup_filter: Optional filter function to apply to df before computation
 
     Returns:
-        Tuple of (aggregated_df, metadata_dict)
+        DataFrame with columns:
+            - bin_center: Center of time bin (hours before birth)
+            - sensitivity: Cumulative detection rate (detected / ALL positives)
+            - specificity: Cumulative true negative rate (not detected / ALL negatives)
+            - fpr: Cumulative false positive rate (detected / ALL negatives)
+            - n_positive_total: Total positive GUIDs in dataset (FIXED)
+            - n_negative_total: Total negative GUIDs in dataset (FIXED)
+            - n_detected_positive: Number of detected positive GUIDs at τ
+            - n_detected_negative: Number of detected negative GUIDs at τ
+            - n_available_positive: Number of positive GUIDs with data at τ
+            - n_available_negative: Number of negative GUIDs with data at τ
     """
-    # Determine which folds to load
-    if completed_fold_ids is None:
-        fold_ids_to_load = list(range(1, num_folds + 1))
-    else:
-        fold_ids_to_load = sorted(completed_fold_ids)
+    # Apply subgroup filter if provided
+    if subgroup_filter is not None:
+        df = df[subgroup_filter(df)].copy()
 
-    all_fold_data = []
-    loaded_fold_ids = []
+    if len(df) == 0:
+        logger.warning("compute_committed_overall_metrics: Empty dataframe after subgroup filter")
+        return pd.DataFrame()
 
-    # Load subgroup metrics from each fold
-    for fold_id in fold_ids_to_load:
-        csv_path = Path(kfold_results_dir) / f"fold_{fold_id}" / "evaluation" / "plots" / threshold_type / "subgroup_analysis" / "subgroup_metrics.csv"
+    # Ensure required columns
+    df = ensure_epoch_hours(df.copy())
 
-        if csv_path.exists():
-            fold_df = pd.read_csv(csv_path)
-            fold_df['fold_id'] = fold_id
-            all_fold_data.append(fold_df)
-            loaded_fold_ids.append(fold_id)
+    # Get ALL GUIDs and their targets (FIXED denominator)
+    guid_targets = df.groupby('guid')['binary_target'].first()
+    all_positive_guids = guid_targets[guid_targets == 1].index.tolist()
+    all_negative_guids = guid_targets[guid_targets == 0].index.tolist()
+
+    n_positive_total = len(all_positive_guids)  # FIXED
+    n_negative_total = len(all_negative_guids)  # FIXED
+
+    logger.info(
+        f"compute_committed_overall_metrics: FIXED denominators - "
+        f"P(t≤0)={n_positive_total}, N(t≤0)={n_negative_total}"
+    )
+
+    results = []
+
+    for i in range(len(time_bins) - 1):
+        bin_start, bin_end = time_bins[i], time_bins[i + 1]
+        bin_center = (bin_start + bin_end) / 2
+
+        # Get GUIDs with data available at time τ (bin_center)
+        available_mask = df['epoch_hours'] >= bin_center
+        available_guids = df[available_mask]['guid'].unique()
+
+        # Split available GUIDs by target
+        available_positive_guids = [g for g in available_guids if g in all_positive_guids]
+        available_negative_guids = [g for g in available_guids if g in all_negative_guids]
+
+        n_available_positive = len(available_positive_guids)
+        n_available_negative = len(available_negative_guids)
+
+        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
+        detected_positive = 0
+        for guid in available_positive_guids:
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            if (guid_data['clinical_pred'] == 1).any():
+                detected_positive += 1
+
+        detected_negative = 0
+        for guid in available_negative_guids:
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            if (guid_data['clinical_pred'] == 1).any():
+                detected_negative += 1
+
+        # Compute metrics with FIXED denominator
+        sensitivity = detected_positive / n_positive_total if n_positive_total > 0 else np.nan
+        fpr = detected_negative / n_negative_total if n_negative_total > 0 else np.nan
+        specificity = (n_negative_total - detected_negative) / n_negative_total if n_negative_total > 0 else np.nan
+
+        results.append({
+            'bin_center': bin_center,
+            'sensitivity': sensitivity,
+            'specificity': specificity,
+            'fpr': fpr,
+            'n_positive_total': n_positive_total,
+            'n_negative_total': n_negative_total,
+            'n_detected_positive': detected_positive,
+            'n_detected_negative': detected_negative,
+            'n_available_positive': n_available_positive,
+            'n_available_negative': n_available_negative
+        })
+
+    result_df = pd.DataFrame(results)
+
+    logger.info(
+        f"compute_committed_overall_metrics: Computed PRIMARY METRIC for {len(result_df)} time bins "
+        f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
+    )
+
+    # Verify monotonicity (CRITICAL for primary metric)
+    valid_sens = result_df['sensitivity'].dropna()
+    if len(valid_sens) > 1:
+        violations = (valid_sens.diff() < -1e-6).sum()
+        if violations > 0:
+            logger.error(f"❌ PRIMARY METRIC violation: Committed overall sensitivity has {violations} monotonicity violations!")
+            # Log details
+            for idx in range(1, len(result_df)):
+                prev_sens = result_df.iloc[idx - 1]['sensitivity']
+                curr_sens = result_df.iloc[idx]['sensitivity']
+                if pd.notna(prev_sens) and pd.notna(curr_sens) and curr_sens < prev_sens - 1e-6:
+                    logger.error(
+                        f"  Bin {idx} ({result_df.iloc[idx]['bin_center']:.1f}h): "
+                        f"Sensitivity decreased from {prev_sens:.4f} to {curr_sens:.4f}"
+                    )
         else:
-            logger.warning(f"Missing subgroup metrics for fold {fold_id}: {csv_path}")
+            logger.info("✓ PRIMARY METRIC: Committed overall sensitivity is monotonically non-decreasing")
 
-    # Build metadata
-    missing_fold_ids = sorted(set(fold_ids_to_load) - set(loaded_fold_ids))
-    metadata = {
-        'requested_folds': fold_ids_to_load,
-        'loaded_folds': loaded_fold_ids,
-        'missing_folds': missing_fold_ids,
-        'n_requested': len(fold_ids_to_load),
-        'n_loaded': len(loaded_fold_ids),
-        'n_missing': len(missing_fold_ids),
-        'aggregation_timestamp': datetime.now().isoformat()
+    return result_df
+
+
+def compute_all_metric_types(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    subgroup_filter: Optional[callable] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Wrapper to compute all three metric types efficiently.
+
+    Args:
+        df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
+        time_bins: Array of time bin edges (hours before birth)
+        subgroup_filter: Optional filter function to apply before computing metrics
+
+    Returns:
+        Dictionary with keys:
+            - 'instantaneous': DataFrame from compute_instantaneous_metrics()
+            - 'committed_cumulative': DataFrame from compute_committed_cumulative_metrics()
+            - 'committed_overall': DataFrame from compute_committed_overall_metrics() [PRIMARY]
+    """
+    logger.info("=" * 80)
+    logger.info("Computing all three metric types...")
+    logger.info("=" * 80)
+
+    # Compute each metric type
+    instantaneous_df = compute_instantaneous_metrics(df, time_bins, subgroup_filter)
+    committed_cumulative_df = compute_committed_cumulative_metrics(df, time_bins, subgroup_filter)
+    committed_overall_df = compute_committed_overall_metrics(df, time_bins, subgroup_filter)
+
+    logger.info("All metric types computed successfully")
+
+    return {
+        'instantaneous': instantaneous_df,
+        'committed_cumulative': committed_cumulative_df,
+        'committed_overall': committed_overall_df  # PRIMARY METRIC
     }
 
-    if not all_fold_data:
-        logger.error(f"No subgroup metrics found for {threshold_type}. Requested: {fold_ids_to_load}")
-        return pd.DataFrame(), metadata
 
-    # Concatenate all folds
-    combined_df = pd.concat(all_fold_data, ignore_index=True)
+# =============================================================================
+# New Plotting Functions (Three Metric Types)
+# =============================================================================
 
-    # Group by subgroup and bin_center, compute mean ± std
-    agg_metrics = combined_df.groupby(['subgroup', 'bin_center']).agg({
-        'sensitivity': ['mean', 'std', 'min', 'max'],
-        'specificity': ['mean', 'std', 'min', 'max'],
-        'n_samples': 'sum',
-        'prevalence': 'mean'
-    }).reset_index()
-
-    # Flatten column names
-    agg_metrics.columns = ['_'.join(col).strip('_') if col[1] else col[0] for col in agg_metrics.columns.values]
-
-    return agg_metrics, metadata
-
-
-def plot_aggregated_subgroup_metrics(
-    agg_df: pd.DataFrame,
+def plot_single_metric_type(
+    metrics_df: pd.DataFrame,
+    metric_type: str,
     output_dir: Path,
     title_suffix: str = ""
 ) -> None:
     """
-    Plot aggregated subgroup metrics with mean ± std error bands.
+    Create comprehensive plots for a single metric type.
 
-    Creates plots for key subgroup comparisons:
-    - Diagnosis: Acidosis vs HIE
-    - Delivery: CS+ vs CS-
-    - Background: BG+ vs BG-
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Define subgroup sets to plot
-    plot_groups = {
-        'diagnosis': ['acidosis', 'hie'],
-        'cs_status': ['cs_positive', 'cs_negative'],
-        'bg_label': ['bg_positive', 'bg_negative']
-    }
-
-    for group_name, subgroup_list in plot_groups.items():
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-        colors = plt.cm.Set2(np.linspace(0, 1, len(subgroup_list)))
-
-        for idx, subgroup_name in enumerate(subgroup_list):
-            subgroup_data = agg_df[agg_df['subgroup'] == subgroup_name]
-
-            if len(subgroup_data) == 0:
-                continue
-
-            # Negate bin_center to show negative hours (before delivery) on left → 0 (delivery) on right
-            x = -subgroup_data['bin_center'].values
-
-            # Sensitivity plot with error bands
-            sens_mean = subgroup_data['sensitivity_mean'].values
-            sens_std = subgroup_data['sensitivity_std'].values
-
-            # Filter out NaN values
-            valid_sens = ~np.isnan(sens_mean)
-            if valid_sens.any():
-                axes[0].plot(x[valid_sens], sens_mean[valid_sens], marker='o',
-                           label=subgroup_name.replace('_', ' ').title(),
-                           linewidth=2, color=colors[idx])
-                # Only fill_between where std is also valid
-                valid_std = valid_sens & ~np.isnan(sens_std)
-                if valid_std.any():
-                    axes[0].fill_between(x[valid_std],
-                                        sens_mean[valid_std] - sens_std[valid_std],
-                                        sens_mean[valid_std] + sens_std[valid_std],
-                                        alpha=0.2, color=colors[idx])
-
-            # Specificity plot with error bands
-            spec_mean = subgroup_data['specificity_mean'].values
-            spec_std = subgroup_data['specificity_std'].values
-
-            # Filter out NaN values
-            valid_spec = ~np.isnan(spec_mean)
-            if valid_spec.any():
-                axes[1].plot(x[valid_spec], spec_mean[valid_spec], marker='o',
-                           label=subgroup_name.replace('_', ' ').title(),
-                           linewidth=2, color=colors[idx])
-                # Only fill_between where std is also valid
-                valid_std = valid_spec & ~np.isnan(spec_std)
-                if valid_std.any():
-                    axes[1].fill_between(x[valid_std],
-                                        spec_mean[valid_std] - spec_std[valid_std],
-                                        spec_mean[valid_std] + spec_std[valid_std],
-                                        alpha=0.2, color=colors[idx])
-
-        # Format plots
-        axes[0].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-        axes[0].set_ylabel('Sensitivity (mean ± std)', fontsize=12)
-        axes[0].set_title(f'Sensitivity by {group_name.replace("_", " ").title()}', fontsize=14)
-        axes[0].legend(fontsize=11)
-        axes[0].grid(True, alpha=0.3)
-        axes[0].set_ylim([0, 1.05])
-
-        axes[1].set_xlabel('Time Before Birth (hours, 0 = delivery)', fontsize=12)
-        axes[1].set_ylabel('Specificity (mean ± std)', fontsize=12)
-        axes[1].set_title(f'Specificity by {group_name.replace("_", " ").title()}', fontsize=14)
-        axes[1].legend(fontsize=11)
-        axes[1].grid(True, alpha=0.3)
-        axes[1].set_ylim([0, 1.05])
-
-        plt.suptitle(f'Cross-Fold Aggregated Metrics: {group_name.replace("_", " ").title()} {title_suffix}',
-                     fontsize=16, y=1.02)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"aggregated_{group_name}_metrics.png", dpi=150)
-        plt.close()
-
-        logger.info(f"Saved: aggregated_{group_name}_metrics.png")
-
-
-def run_subgroup_aggregation(
-    kfold_results_dir: str,
-    num_folds: int = 10,
-    completed_fold_ids: List[int] = None
-):
-    """
-    Run complete subgroup aggregation across folds.
+    Generates multiple plot variations:
+    1. sensitivity_vs_time.png - Sensitivity only
+    2. sensitivity_specificity_vs_time.png - Sensitivity + Specificity
+    3. sensitivity_fpr_vs_time.png - Sensitivity + FPR
+    4. all_metrics_vs_time.png - All three metrics together
 
     Args:
-        kfold_results_dir: Base directory containing fold_1, fold_2, ..., fold_N
-        num_folds: Total number of folds configured
-        completed_fold_ids: List of fold IDs to aggregate. If None, tries all folds 1..num_folds.
-
-    Usage:
-        run_subgroup_aggregation("/path/to/kfold_results", num_folds=10, completed_fold_ids=[1,2,3])
+        metrics_df: DataFrame with columns ['bin_center', 'sensitivity', 'specificity', 'fpr']
+        metric_type: One of 'instantaneous', 'committed_cumulative', 'committed_overall'
+        output_dir: Directory to save plots
+        title_suffix: Additional suffix for plot titles (e.g., "Test Set", "Fold 1")
     """
-    output_dir = Path(kfold_results_dir) / "aggregated_analysis" / "subgroups"
+    import matplotlib.pyplot as plt
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_metadata = {}
-
-    for threshold_type in ['epoch_level', 'guid_level']:
-        logger.info(f"Aggregating subgroup metrics for {threshold_type}...")
-
-        # Aggregate metrics (now returns tuple)
-        agg_df, metadata = aggregate_subgroup_metrics(
-            kfold_results_dir, threshold_type, num_folds, completed_fold_ids
-        )
-
-        all_metadata[threshold_type] = metadata
-
-        if agg_df.empty:
-            logger.warning(f"No data for {threshold_type}, skipping...")
-            continue
-
-        # Save aggregated CSV
-        csv_path = output_dir / f"aggregated_subgroup_metrics_{threshold_type}.csv"
-        agg_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved aggregated metrics: {csv_path}")
-
-        # Plot aggregated metrics
-        plot_dir = output_dir / threshold_type
-        plot_aggregated_subgroup_metrics(agg_df, plot_dir, title_suffix=f"({threshold_type})")
-
-    # Save aggregation metadata
-    metadata_path = output_dir / "aggregation_metadata.json"
-    with open(metadata_path, 'w') as f:
-        json.dump(all_metadata, f, indent=2)
-    logger.info(f"Saved aggregation metadata: {metadata_path}")
-
-    # Log summary
-    logger.info("=" * 80)
-    logger.info("AGGREGATION SUMMARY")
-    logger.info("=" * 80)
-    for thr_type, meta in all_metadata.items():
-        logger.info(f"{thr_type}:")
-        logger.info(f"  Loaded folds: {meta['loaded_folds']}")
-        logger.info(f"  Missing folds: {meta['missing_folds']}")
-        logger.info(f"  Coverage: {meta['n_loaded']}/{meta['n_requested']} folds")
-    logger.info("=" * 80)
-
-    logger.info("Subgroup aggregation complete!")
-
-
-def main():
-    """
-    Run evaluation for every fold (plus aggregated metrics) from a k-fold results root.
-    Set ROOT_RESULTS_DIR to the directory containing fold_1, fold_2, ..., fold_N.
-    """
-    ROOT_RESULTS_DIR = "/data/deid/isilon/MS_model/classifier_kfold_results"
-    TARGET_FPR = 0.05
-    DEVICE = "cuda:0"
-    FOLDS_TO_EVALUATE = None  # e.g., [1, 3, 5] to evaluate specific folds
-    RUN_AGGREGATIONS = True
-
-    root_dir = Path(ROOT_RESULTS_DIR)
-    if not root_dir.exists():
-        raise FileNotFoundError(f"Root results directory not found: {root_dir}")
-
-    fold_dirs: List[Tuple[int, Path]] = []
-    for path in sorted(root_dir.iterdir()):
-        if not path.is_dir():
-            continue
-        if not path.name.startswith("fold_"):
-            continue
-        try:
-            fold_id = int(path.name.split("_")[1])
-        except (IndexError, ValueError):
-            continue
-        fold_dirs.append((fold_id, path))
-
-    if not fold_dirs:
-        logger.error(f"No fold directories found in {root_dir}")
+    if metrics_df is None or len(metrics_df) == 0:
+        logger.warning(f"No data to plot for {metric_type}")
         return
 
-    if FOLDS_TO_EVALUATE is not None:
-        requested = set(FOLDS_TO_EVALUATE)
-        fold_dirs = [(fid, fdir) for fid, fdir in fold_dirs if fid in requested]
-        if not fold_dirs:
-            logger.error(f"No matching folds found for requested IDs: {FOLDS_TO_EVALUATE}")
-            return
+    # Filter out NaN values
+    valid_df = metrics_df[metrics_df['sensitivity'].notna()].copy()
+    if len(valid_df) == 0:
+        logger.warning(f"No valid (non-NaN) data to plot for {metric_type}")
+        return
 
-    logger.info(f"Evaluating folds: {[fid for fid, _ in fold_dirs]}")
+    valid_df = valid_df.sort_values('bin_center', ascending=False)
+    x = valid_df['bin_center'].values
 
-    for fold_id, fold_dir in fold_dirs:
-        config_path = fold_dir / "config.yaml"
-        if not config_path.exists():
-            logger.warning(f"Config not found for fold {fold_id}: {config_path}")
+    # Metric type labels
+    metric_labels = {
+        'instantaneous': 'Instantaneous Decisions',
+        'committed_cumulative': 'Committed Decisions (Cumulative)',
+        'committed_overall': 'Committed Decisions (Overall) - PRIMARY'
+    }
+    metric_label = metric_labels.get(metric_type, metric_type)
+
+    # Color scheme
+    colors = {
+        'sensitivity': '#2ecc71',  # Green
+        'specificity': '#3498db',  # Blue
+        'fpr': '#e74c3c'  # Red
+    }
+
+    # --- Plot 1: Sensitivity Only ---
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(x, valid_df['sensitivity'], marker='o', label='Sensitivity',
+            color=colors['sensitivity'], linewidth=2.5, markersize=6)
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('Sensitivity', fontsize=13)
+    title = f'Sensitivity vs Time - {metric_label}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "sensitivity_vs_time.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/sensitivity_vs_time.png")
+
+    # --- Plot 2: Sensitivity + Specificity ---
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(x, valid_df['sensitivity'], marker='o', label='Sensitivity',
+            color=colors['sensitivity'], linewidth=2.5, markersize=6)
+    ax.plot(x, valid_df['specificity'], marker='s', label='Specificity',
+            color=colors['specificity'], linewidth=2.5, markersize=6)
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('Metric Value', fontsize=13)
+    title = f'Sensitivity & Specificity vs Time - {metric_label}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "sensitivity_specificity_vs_time.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/sensitivity_specificity_vs_time.png")
+
+    # --- Plot 3: Sensitivity + FPR ---
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(x, valid_df['sensitivity'], marker='o', label='Sensitivity',
+            color=colors['sensitivity'], linewidth=2.5, markersize=6)
+    ax.plot(x, valid_df['fpr'], marker='^', label='FPR',
+            color=colors['fpr'], linewidth=2.5, markersize=6)
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('Metric Value', fontsize=13)
+    title = f'Sensitivity & FPR vs Time - {metric_label}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "sensitivity_fpr_vs_time.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/sensitivity_fpr_vs_time.png")
+
+    # --- Plot 4: All Three Metrics ---
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(x, valid_df['sensitivity'], marker='o', label='Sensitivity',
+            color=colors['sensitivity'], linewidth=2.5, markersize=7, linestyle='-')
+    ax.plot(x, valid_df['specificity'], marker='s', label='Specificity',
+            color=colors['specificity'], linewidth=2.5, markersize=7, linestyle='--')
+    ax.plot(x, valid_df['fpr'], marker='^', label='FPR',
+            color=colors['fpr'], linewidth=2.5, markersize=7, linestyle=':')
+    ax.set_xlabel('Hours Before Birth', fontsize=14)
+    ax.set_ylabel('Metric Value', fontsize=14)
+    title = f'All Metrics vs Time - {metric_label}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=15, fontweight='bold')
+    ax.legend(fontsize=12, loc='best', framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "all_metrics_vs_time.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/all_metrics_vs_time.png")
+
+
+def plot_all_metric_types_for_fold(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    output_base_dir: Path,
+    title_suffix: str = ""
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generate complete plot sets for all three metric types.
+
+    Creates directory structure:
+    output_base_dir/
+        instantaneous/
+            sensitivity_vs_time.png
+            sensitivity_specificity_vs_time.png
+            sensitivity_fpr_vs_time.png
+            all_metrics_vs_time.png
+        committed_cumulative/
+            [same plots]
+        committed_overall/  # PRIMARY
+            [same plots]
+
+    Args:
+        df: DataFrame with clinical predictions
+        time_bins: Time bin edges
+        output_base_dir: Base directory for all plots
+        title_suffix: Suffix for plot titles
+
+    Returns:
+        Dictionary with all three metric DataFrames
+    """
+    logger.info("=" * 80)
+    logger.info("Generating plots for all three metric types...")
+    logger.info("=" * 80)
+
+    # Compute all three metric types
+    metrics_dict = compute_all_metric_types(df, time_bins, subgroup_filter=None)
+
+    # Plot each metric type
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        metric_output_dir = output_base_dir / metric_type
+        logger.info(f"Plotting {metric_type}...")
+
+        plot_single_metric_type(
+            metrics_dict[metric_type],
+            metric_type,
+            metric_output_dir,
+            title_suffix
+        )
+
+    logger.info("All metric type plots generated successfully")
+    return metrics_dict
+
+
+def plot_metric_type_comparison(
+    metrics_dict: Dict[str, pd.DataFrame],
+    output_dir: Path,
+    title_suffix: str = ""
+) -> None:
+    """
+    Side-by-side comparison of all three metric types.
+
+    Creates a 3-column layout showing:
+    - Instantaneous | Committed Cumulative | Committed Overall (PRIMARY)
+
+    Helps visualize differences between metric types.
+
+    Args:
+        metrics_dict: Dictionary with 'instantaneous', 'committed_cumulative', 'committed_overall' DataFrames
+        output_dir: Directory to save comparison plot
+        title_suffix: Additional suffix for title
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+
+    metric_types = ['instantaneous', 'committed_cumulative', 'committed_overall']
+    titles = ['Instantaneous', 'Committed Cumulative', 'Committed Overall\n(PRIMARY)']
+    colors = {'sensitivity': '#2ecc71', 'fpr': '#e74c3c'}
+
+    for ax, metric_type, title in zip(axes, metric_types, titles):
+        df = metrics_dict.get(metric_type)
+        if df is None or len(df) == 0:
+            ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
+            ax.set_title(title, fontsize=13, fontweight='bold')
             continue
+
+        valid_df = df[df['sensitivity'].notna()].copy()
+        if len(valid_df) == 0:
+            ax.text(0.5, 0.5, 'No Valid Data', ha='center', va='center', fontsize=14)
+            ax.set_title(title, fontsize=13, fontweight='bold')
+            continue
+
+        valid_df = valid_df.sort_values('bin_center', ascending=False)
+        x = valid_df['bin_center'].values
+
+        ax.plot(x, valid_df['sensitivity'], marker='o', label='Sensitivity',
+                color=colors['sensitivity'], linewidth=2, markersize=5)
+        ax.plot(x, valid_df['fpr'], marker='^', label='FPR',
+                color=colors['fpr'], linewidth=2, markersize=5)
+
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.set_xlabel('Hours Before Birth', fontsize=11)
+        if ax == axes[0]:
+            ax.set_ylabel('Metric Value', fontsize=11)
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+
+    main_title = 'Metric Type Comparison: Sensitivity & FPR'
+    if title_suffix:
+        main_title += f' ({title_suffix})'
+    fig.suptitle(main_title, fontsize=15, fontweight='bold', y=1.02)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "metric_type_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: comparison/metric_type_comparison.png")
+
+
+def plot_subgroup_analysis(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    metric_type: str,
+    subgroup_filters: Dict[str, callable],
+    output_dir: Path,
+    title_suffix: str = ""
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generate plots comparing metrics across subgroups for a specific metric type.
+
+    Args:
+        df: DataFrame with clinical predictions
+        time_bins: Time bin edges
+        metric_type: 'instantaneous', 'committed_cumulative', or 'committed_overall'
+        subgroup_filters: Dictionary of subgroup_name -> filter_function
+        output_dir: Directory to save subgroup plots
+        title_suffix: Additional suffix for titles
+
+    Returns:
+        Dictionary mapping subgroup_name -> metrics DataFrame
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Computing {metric_type} metrics for {len(subgroup_filters)} subgroups...")
+
+    # Compute metrics for each subgroup
+    subgroup_metrics = {}
+    compute_func = {
+        'instantaneous': compute_instantaneous_metrics,
+        'committed_cumulative': compute_committed_cumulative_metrics,
+        'committed_overall': compute_committed_overall_metrics
+    }[metric_type]
+
+    for subgroup_name, subgroup_filter in subgroup_filters.items():
         try:
-            checkpoint_path = find_latest_checkpoint_in_fold(fold_dir)
-        except FileNotFoundError as e:
-            logger.warning(str(e))
+            metrics_df = compute_func(df, time_bins, subgroup_filter)
+            if metrics_df is not None and len(metrics_df) > 0:
+                subgroup_metrics[subgroup_name] = metrics_df
+        except Exception as e:
+            logger.warning(f"Failed to compute {metric_type} for subgroup {subgroup_name}: {e}")
+
+    if len(subgroup_metrics) == 0:
+        logger.warning(f"No valid subgroup metrics computed for {metric_type}")
+        return {}
+
+    # Create comparison plots by category
+    _plot_diagnosis_comparison(subgroup_metrics, metric_type, output_dir, title_suffix)
+    _plot_cs_stratification(subgroup_metrics, metric_type, output_dir, title_suffix)
+    _plot_bg_stratification(subgroup_metrics, metric_type, output_dir, title_suffix)
+    _plot_healthy_subgroups(subgroup_metrics, metric_type, output_dir, title_suffix)
+
+    logger.info(f"Subgroup analysis plots generated for {metric_type}")
+    return subgroup_metrics
+
+
+def _plot_diagnosis_comparison(
+    subgroup_metrics: Dict[str, pd.DataFrame],
+    metric_type: str,
+    output_dir: Path,
+    title_suffix: str
+) -> None:
+    """Plot comparison of basic diagnosis subgroups (healthy, acidosis, hie, unhealthy)."""
+    import matplotlib.pyplot as plt
+
+    diagnosis_groups = ['healthy', 'acidosis', 'hie', 'unhealthy']
+    available_groups = [g for g in diagnosis_groups if g in subgroup_metrics]
+
+    if len(available_groups) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = {'healthy': '#2ecc71', 'acidosis': '#e74c3c', 'hie': '#e67e22', 'unhealthy': '#95a5a6'}
+
+    for group in available_groups:
+        df = subgroup_metrics[group]
+        valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+        if len(valid_df) > 0:
+            ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                   marker='o', label=group.capitalize(), linewidth=2.5,
+                   color=colors.get(group, None), markersize=6)
+
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('Sensitivity', fontsize=13)
+    title = f'Diagnosis Comparison - {metric_type.replace("_", " ").title()}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "diagnosis_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/diagnosis_comparison.png")
+
+
+def _plot_cs_stratification(
+    subgroup_metrics: Dict[str, pd.DataFrame],
+    metric_type: str,
+    output_dir: Path,
+    title_suffix: str
+) -> None:
+    """Plot CS stratification for unhealthy, HIE, and Acidosis separately."""
+    import matplotlib.pyplot as plt
+
+    stratifications = [
+        (['unhealthy_cs_pos', 'unhealthy_cs_neg'], 'Unhealthy by CS Status'),
+        (['hie_cs_pos', 'hie_cs_neg'], 'HIE by CS Status'),
+        (['acidosis_cs_pos', 'acidosis_cs_neg'], 'Acidosis by CS Status')
+    ]
+
+    for groups, title_text in stratifications:
+        available_groups = [g for g in groups if g in subgroup_metrics]
+        if len(available_groups) == 0:
             continue
 
-        logger.info("=" * 80)
-        logger.info(f"Evaluating Fold {fold_id}")
-        logger.info("=" * 80)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        colors = {'pos': '#3498db', 'neg': '#9b59b6'}
 
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+        for group in available_groups:
+            df = subgroup_metrics[group]
+            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            if len(valid_df) > 0:
+                label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                color = colors['pos'] if 'pos' in group else colors['neg']
+                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                       marker='o', label=label, linewidth=2.5,
+                       color=color, markersize=6)
 
-        model = create_model_from_config(config, DEVICE)
-        evaluate_fold(
-            model=model,
-            fold_dir=str(fold_dir),
-            config_path=str(config_path),
-            checkpoint_path=str(checkpoint_path),
-            target_fpr=TARGET_FPR,
-            device=DEVICE
+        ax.set_xlabel('Hours Before Birth', fontsize=13)
+        ax.set_ylabel('Sensitivity', fontsize=13)
+        title = f'{title_text} - {metric_type.replace("_", " ").title()}'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        plt.tight_layout()
+        filename = f"{groups[0].rsplit('_', 2)[0]}_cs_stratification.png"
+        plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"  Saved: {output_dir.name}/{filename}")
+
+
+def _plot_bg_stratification(
+    subgroup_metrics: Dict[str, pd.DataFrame],
+    metric_type: str,
+    output_dir: Path,
+    title_suffix: str
+) -> None:
+    """Plot BG stratification for Acidosis only (all HIE are bg_positive)."""
+    import matplotlib.pyplot as plt
+
+    bg_groups = ['acidosis_bg_pos', 'acidosis_bg_neg']
+    available_groups = [g for g in bg_groups if g in subgroup_metrics]
+
+    if len(available_groups) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = {'pos': '#f39c12', 'neg': '#16a085'}
+
+    for group in available_groups:
+        df = subgroup_metrics[group]
+        valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+        if len(valid_df) > 0:
+            label = 'BG Positive' if 'pos' in group else 'BG Negative'
+            color = colors['pos'] if 'pos' in group else colors['neg']
+            ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                   marker='o', label=label, linewidth=2.5,
+                   color=color, markersize=6)
+
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('Sensitivity', fontsize=13)
+    title = f'Acidosis by BG Status - {metric_type.replace("_", " ").title()}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "acidosis_bg_stratification.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/acidosis_bg_stratification.png")
+
+
+def _plot_healthy_subgroups(
+    subgroup_metrics: Dict[str, pd.DataFrame],
+    metric_type: str,
+    output_dir: Path,
+    title_suffix: str
+) -> None:
+    """Plot healthy subgroup stratifications (CS, BG, and combinations)."""
+    import matplotlib.pyplot as plt
+
+    # Healthy by CS
+    cs_groups = ['healthy_cs_pos', 'healthy_cs_neg']
+    available_cs = [g for g in cs_groups if g in subgroup_metrics]
+
+    if len(available_cs) > 0:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        colors = {'pos': '#3498db', 'neg': '#9b59b6'}
+
+        for group in available_cs:
+            df = subgroup_metrics[group]
+            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            if len(valid_df) > 0:
+                label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                color = colors['pos'] if 'pos' in group else colors['neg']
+                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                       marker='o', label=label, linewidth=2.5,
+                       color=color, markersize=6)
+
+        ax.set_xlabel('Hours Before Birth', fontsize=13)
+        ax.set_ylabel('Sensitivity', fontsize=13)
+        title = f'Healthy by CS Status - {metric_type.replace("_", " ").title()}'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        plt.tight_layout()
+        plt.savefig(output_dir / "healthy_cs_stratification.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"  Saved: {output_dir.name}/healthy_cs_stratification.png")
+
+    # Healthy by BG
+    bg_groups = ['healthy_bg_pos', 'healthy_bg_neg']
+    available_bg = [g for g in bg_groups if g in subgroup_metrics]
+
+    if len(available_bg) > 0:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        colors = {'pos': '#f39c12', 'neg': '#16a085'}
+
+        for group in available_bg:
+            df = subgroup_metrics[group]
+            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            if len(valid_df) > 0:
+                label = 'BG Positive' if 'pos' in group else 'BG Negative'
+                color = colors['pos'] if 'pos' in group else colors['neg']
+                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                       marker='o', label=label, linewidth=2.5,
+                       color=color, markersize=6)
+
+        ax.set_xlabel('Hours Before Birth', fontsize=13)
+        ax.set_ylabel('Sensitivity', fontsize=13)
+        title = f'Healthy by BG Status - {metric_type.replace("_", " ").title()}'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        plt.tight_layout()
+        plt.savefig(output_dir / "healthy_bg_stratification.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"  Saved: {output_dir.name}/healthy_bg_stratification.png")
+
+    # Healthy BG×CS 4-way combination
+    combo_groups = ['healthy_bg_pos_cs_pos', 'healthy_bg_pos_cs_neg',
+                    'healthy_bg_neg_cs_pos', 'healthy_bg_neg_cs_neg']
+    available_combo = [g for g in combo_groups if g in subgroup_metrics]
+
+    if len(available_combo) > 0:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        colors = ['#e74c3c', '#3498db', '#f39c12', '#9b59b6']
+
+        for i, group in enumerate(available_combo):
+            df = subgroup_metrics[group]
+            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            if len(valid_df) > 0:
+                label = group.replace('healthy_', '').replace('_', ' ').upper()
+                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                       marker='o', label=label, linewidth=2.5,
+                       color=colors[i % len(colors)], markersize=6)
+
+        ax.set_xlabel('Hours Before Birth', fontsize=13)
+        ax.set_ylabel('Sensitivity', fontsize=13)
+        title = f'Healthy BG×CS Combinations - {metric_type.replace("_", " ").title()}'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(fontsize=10, loc='best', ncol=2)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        plt.tight_layout()
+        plt.savefig(output_dir / "healthy_bg_cs_combinations.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"  Saved: {output_dir.name}/healthy_bg_cs_combinations.png")
+
+
+# =============================================================================
+# Complete Evaluation Pipeline Integration
+# =============================================================================
+
+def generate_three_metric_type_analysis(
+    df: pd.DataFrame,
+    output_base_dir: Path,
+    exclude_last_minutes: float = 30.0,
+    title_suffix: str = "Test Set"
+) -> Dict:
+    """
+    Complete evaluation pipeline using three metric types.
+
+    Generates:
+    1. Three separate thresholds (instantaneous, committed_cumulative, committed_overall)
+    2. Plots for each metric type
+    3. Metric type comparison plots
+    4. Subgroup analysis for committed_overall (PRIMARY)
+    5. Saves all metrics as JSON
+
+    Directory structure:
+    output_base_dir/
+        three_metric_types/
+            instantaneous/
+                sensitivity_vs_time.png
+                ...
+            committed_cumulative/
+                ...
+            committed_overall/  # PRIMARY
+                ...
+                subgroups/
+                    diagnosis_comparison.png
+                    ...
+            comparison/
+                metric_type_comparison.png
+            thresholds.json
+            metrics_summary.json
+
+    Args:
+        df: DataFrame with predictions and clinical_pred column
+        output_base_dir: Base directory for all outputs
+        exclude_last_minutes: Exclude last N minutes from analysis
+        title_suffix: Suffix for plot titles
+
+    Returns:
+        Dictionary with thresholds and metrics for all three types
+    """
+    logger.info("=" * 80)
+    logger.info("THREE METRIC TYPE ANALYSIS - NEW PIPELINE")
+    logger.info("=" * 80)
+
+    analysis_dir = output_base_dir / "three_metric_types"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compute time bins
+    time_bins = compute_time_bins(df, exclude_last_minutes=exclude_last_minutes)
+    logger.info(f"Time bins: {len(time_bins)-1} bins from {time_bins[0]:.1f}h to {time_bins[-1]:.1f}h")
+
+    # Step 1: Generate plots for all three metric types
+    metrics_dict = plot_all_metric_types_for_fold(
+        df, time_bins, analysis_dir, title_suffix
+    )
+
+    # Step 2: Generate metric type comparison
+    comparison_dir = analysis_dir / "comparison"
+    plot_metric_type_comparison(metrics_dict, comparison_dir, title_suffix)
+
+    # Step 3: Generate subgroup analysis for PRIMARY metric (committed_overall)
+    logger.info("Generating subgroup analysis for committed_overall (PRIMARY)...")
+    subgroup_filters = create_enhanced_subgroup_filters()
+    subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
+
+    subgroup_metrics = plot_subgroup_analysis(
+        df, time_bins, 'committed_overall',
+        subgroup_filters, subgroup_dir, title_suffix
+    )
+
+    # Step 4: Save metrics summary
+    summary = {
+        'metric_types': {
+            'instantaneous': _summarize_metrics_df(metrics_dict.get('instantaneous')),
+            'committed_cumulative': _summarize_metrics_df(metrics_dict.get('committed_cumulative')),
+            'committed_overall': _summarize_metrics_df(metrics_dict.get('committed_overall'))
+        },
+        'subgroups': {
+            name: _summarize_metrics_df(df)
+            for name, df in subgroup_metrics.items()
+        }
+    }
+
+    with open(analysis_dir / "metrics_summary.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info("Three metric type analysis complete")
+    logger.info(f"Results saved to: {analysis_dir}")
+
+    return {
+        'metrics_dict': metrics_dict,
+        'subgroup_metrics': subgroup_metrics,
+        'summary': summary
+    }
+
+
+def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
+    """Helper to summarize a metrics DataFrame for JSON export."""
+    if df is None or len(df) == 0:
+        return {}
+
+    valid_df = df[df['sensitivity'].notna()]
+    if len(valid_df) == 0:
+        return {}
+
+    return {
+        'n_bins': len(df),
+        'n_valid_bins': len(valid_df),
+        'sensitivity_mean': float(valid_df['sensitivity'].mean()),
+        'sensitivity_std': float(valid_df['sensitivity'].std()),
+        'sensitivity_min': float(valid_df['sensitivity'].min()),
+        'sensitivity_max': float(valid_df['sensitivity'].max()),
+        'fpr_mean': float(valid_df['fpr'].mean()) if 'fpr' in valid_df else None,
+        'fpr_std': float(valid_df['fpr'].std()) if 'fpr' in valid_df else None,
+    }
+
+
+# ============================================================================
+# MAIN FUNCTION - Post-Training Evaluation Pipeline
+# ============================================================================
+
+def main(
+    output_base_dir: str,
+    target_fpr: float = 0.15,
+    device: str = 'cuda:0',
+    exclude_last_minutes: float = 30.0,
+    max_gap_multiplier: Optional[float] = None,
+    regenerate_predictions: bool = False
+):
+    """
+    Run evaluation pipeline on all completed folds.
+
+    This function is designed for post-training evaluation where training
+    has already completed and you want to (re)run the evaluation pipeline
+    across all folds.
+
+    Args:
+        output_base_dir: Base directory containing fold_1, fold_2, ..., fold_N
+                        subdirectories with trained models and configs
+        target_fpr: Target false positive rate for threshold optimization
+                   (default: 0.15 = 15% FPR)
+        device: Device to run inference on (default: 'cuda:0')
+        exclude_last_minutes: Exclude last N minutes before birth from time-based
+                            analysis (default: 30.0 minutes)
+        max_gap_multiplier: Maximum gap multiplier for epoch filling
+                          (default: None = use config or auto-detect)
+        regenerate_predictions: If True, regenerate predictions even if cached
+                               predictions exist (default: False)
+
+    Returns:
+        Dictionary with aggregated results across all folds
+
+    Directory Structure Expected:
+        output_base_dir/
+            fold_1/
+                config.yaml
+                checkpoints/
+                    epoch=X-val_accuracy=Y.ckpt
+                evaluation/  (will be created/updated)
+            fold_2/
+                ...
+            ...
+            aggregated_results.json  (will be created)
+
+    Outputs Generated Per Fold:
+        evaluation/
+            validation_predictions_raw.csv
+            validation_predictions_clinical.csv
+            test_predictions_raw.csv
+            test_predictions_clinical.csv
+            threshold_info.json
+            three_metric_types/
+                instantaneous/
+                    [4 plots per metric type]
+                committed_cumulative/
+                    [4 plots per metric type]
+                committed_overall/  (PRIMARY METRIC)
+                    [4 plots per metric type]
+                    subgroups/
+                        [8 subgroup comparison plots]
+                comparison/
+                    metric_type_comparison.png
+                metrics_summary.json
+            fold_results.json
+
+    Outputs Generated Across Folds:
+        aggregated_results.json - Summary statistics across all folds
+    """
+    output_base_dir = Path(output_base_dir)
+
+    if not output_base_dir.exists():
+        raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
+
+    logger.info("="*80)
+    logger.info("POST-TRAINING EVALUATION PIPELINE")
+    logger.info("="*80)
+    logger.info(f"Output base directory: {output_base_dir}")
+    logger.info(f"Target FPR: {target_fpr}")
+    logger.info(f"Device: {device}")
+    logger.info(f"Exclude last minutes: {exclude_last_minutes}")
+    logger.info(f"Regenerate predictions: {regenerate_predictions}")
+    logger.info("="*80)
+
+    # Find all fold directories (fold_1, fold_2, ..., fold_N)
+    fold_dirs = sorted(
+        [d for d in output_base_dir.iterdir() if d.is_dir() and d.name.startswith('fold_')],
+        key=lambda x: int(x.name.split('_')[1])
+    )
+
+    if not fold_dirs:
+        raise FileNotFoundError(f"No fold directories found in {output_base_dir}")
+
+    logger.info(f"Found {len(fold_dirs)} fold directories: {[d.name for d in fold_dirs]}")
+
+    # Process each fold
+    all_fold_results = []
+    successful_folds = []
+    failed_folds = []
+
+    for fold_dir in fold_dirs:
+        fold_id = int(fold_dir.name.split('_')[1])
+        logger.info("")
+        logger.info("="*80)
+        logger.info(f"Processing Fold {fold_id}")
+        logger.info("="*80)
+
+        try:
+            # Evaluate single fold
+            fold_results = _evaluate_single_fold(
+                fold_dir=fold_dir,
+                fold_id=fold_id,
+                target_fpr=target_fpr,
+                device=device,
+                exclude_last_minutes=exclude_last_minutes,
+                max_gap_multiplier=max_gap_multiplier,
+                regenerate_predictions=regenerate_predictions
+            )
+
+            all_fold_results.append(fold_results)
+            successful_folds.append(fold_id)
+            logger.info(f"Fold {fold_id}: COMPLETED SUCCESSFULLY")
+
+        except Exception as e:
+            logger.error(f"Fold {fold_id}: FAILED with error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            failed_folds.append(fold_id)
+
+    # Aggregate results across all successful folds
+    logger.info("")
+    logger.info("="*80)
+    logger.info("AGGREGATING RESULTS ACROSS FOLDS")
+    logger.info("="*80)
+
+    if not all_fold_results:
+        logger.error("No folds completed successfully. Cannot aggregate results.")
+        return {
+            'status': 'failed',
+            'successful_folds': successful_folds,
+            'failed_folds': failed_folds,
+            'n_successful': 0,
+            'n_failed': len(failed_folds)
+        }
+
+    aggregated = _aggregate_fold_results(all_fold_results)
+    aggregated['successful_folds'] = successful_folds
+    aggregated['failed_folds'] = failed_folds
+    aggregated['n_successful'] = len(successful_folds)
+    aggregated['n_failed'] = len(failed_folds)
+
+    # Save aggregated results
+    aggregated_path = output_base_dir / "aggregated_results.json"
+    with open(aggregated_path, 'w') as f:
+        json.dump(aggregated, f, indent=2)
+
+    logger.info(f"Aggregated results saved to: {aggregated_path}")
+
+    # Print summary
+    logger.info("")
+    logger.info("="*80)
+    logger.info("FINAL SUMMARY")
+    logger.info("="*80)
+    logger.info(f"Total folds: {len(fold_dirs)}")
+    logger.info(f"Successful: {len(successful_folds)} {successful_folds}")
+    logger.info(f"Failed: {len(failed_folds)} {failed_folds}")
+    logger.info("")
+    logger.info("PRIMARY METRICS (committed_overall) - Aggregated Across Folds:")
+    logger.info(f"  Validation Sensitivity: {aggregated['validation_sensitivity_mean']:.3f} +/- {aggregated['validation_sensitivity_std']:.3f}")
+    logger.info(f"  Validation Specificity: {aggregated['validation_specificity_mean']:.3f} +/- {aggregated['validation_specificity_std']:.3f}")
+    logger.info(f"  Validation FPR: {aggregated['validation_fpr_mean']:.3f} +/- {aggregated['validation_fpr_std']:.3f}")
+    logger.info(f"  Test Sensitivity: {aggregated['test_sensitivity_mean']:.3f} +/- {aggregated['test_sensitivity_std']:.3f}")
+    logger.info(f"  Test Specificity: {aggregated['test_specificity_mean']:.3f} +/- {aggregated['test_specificity_std']:.3f}")
+    logger.info(f"  Test FPR: {aggregated['test_fpr_mean']:.3f} +/- {aggregated['test_fpr_std']:.3f}")
+    logger.info("="*80)
+
+    return aggregated
+
+
+def _evaluate_single_fold(
+    fold_dir: Path,
+    fold_id: int,
+    target_fpr: float,
+    device: str,
+    exclude_last_minutes: float,
+    max_gap_multiplier: Optional[float],
+    regenerate_predictions: bool
+) -> Dict:
+    """
+    Evaluate a single fold.
+
+    Args:
+        fold_dir: Path to fold directory
+        fold_id: Fold ID number
+        target_fpr: Target false positive rate
+        device: Device to run inference on
+        exclude_last_minutes: Minutes to exclude from analysis
+        max_gap_multiplier: Maximum gap multiplier for epoch filling
+        regenerate_predictions: Whether to regenerate predictions
+
+    Returns:
+        Dictionary with fold results
+    """
+    # Load config
+    config_path = fold_dir / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    logger.info(f"Fold {fold_id}: Loaded config from {config_path}")
+
+    # Create evaluation directory
+    evaluation_dir = fold_dir / "evaluation"
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for cached predictions
+    val_raw_path = evaluation_dir / "validation_predictions_raw.csv"
+    test_raw_path = evaluation_dir / "test_predictions_raw.csv"
+
+    use_cached_val = val_raw_path.exists() and not regenerate_predictions
+    use_cached_test = test_raw_path.exists() and not regenerate_predictions
+
+    # Load or generate validation predictions
+    if use_cached_val:
+        logger.info(f"Fold {fold_id}: Loading cached validation predictions from {val_raw_path}")
+        val_df_raw = pd.read_csv(val_raw_path)
+    else:
+        logger.info(f"Fold {fold_id}: Generating validation predictions...")
+        val_df_raw = _run_inference_for_fold(
+            fold_dir=fold_dir,
+            config=config,
+            device=device,
+            split='val'
         )
+        val_df_raw.to_csv(val_raw_path, index=False)
+        logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
-    if RUN_AGGREGATIONS:
-        max_fold_id = max(fid for fid, _ in fold_dirs)
-        logger.info("Running cross-fold aggregation...")
-        aggregate_kfold_metrics(
-            kfold_results_dir=ROOT_RESULTS_DIR,
-            threshold_type='both',
-            num_folds=max_fold_id
-        )
-        run_subgroup_aggregation(
-            kfold_results_dir=ROOT_RESULTS_DIR,
-            num_folds=max_fold_id
-        )
+    # Find PRIMARY threshold on validation set
+    logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr})...")
+    primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
+        val_df_raw,
+        target_fpr=target_fpr,
+        time_window_hours=1.0,
+        fallback_tolerance_hours=0.5
+    )
 
-    logger.info("Complete evaluation pipeline finished.")
+    logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
+    logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
+    logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
+    logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
+
+    # Apply clinical decision rule to validation set
+    val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
+    val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
+    val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
+
+    # Load or generate test predictions
+    if use_cached_test:
+        logger.info(f"Fold {fold_id}: Loading cached test predictions from {test_raw_path}")
+        test_df_raw = pd.read_csv(test_raw_path)
+    else:
+        logger.info(f"Fold {fold_id}: Generating test predictions...")
+        test_df_raw = _run_inference_for_fold(
+            fold_dir=fold_dir,
+            config=config,
+            device=device,
+            split='test'
+        )
+        test_df_raw.to_csv(test_raw_path, index=False)
+        logger.info(f"Fold {fold_id}: Test predictions saved ({len(test_df_raw)} rows)")
+
+    # Apply clinical decision rule to test set
+    test_df_clinical = apply_clinical_decision_rule(test_df_raw.copy(), primary_threshold)
+    test_df_clinical = fill_missing_epochs(test_df_clinical, max_gap_multiplier=max_gap_multiplier)
+    test_df_clinical.to_csv(evaluation_dir / "test_predictions_clinical.csv", index=False)
+
+    # Generate three metric type analysis
+    logger.info(f"Fold {fold_id}: Generating three metric type analysis...")
+    try:
+        three_metric_results = generate_three_metric_type_analysis(
+            test_df_clinical,
+            output_base_dir=evaluation_dir,
+            exclude_last_minutes=exclude_last_minutes,
+            title_suffix=f"Fold {fold_id}"
+        )
+        logger.info(f"Fold {fold_id}: Three metric type analysis complete")
+    except Exception as e:
+        logger.warning(f"Fold {fold_id}: Three metric type analysis failed: {e}")
+        three_metric_results = {}
+
+    # Extract PRIMARY metrics from three metric type results
+    primary_metrics = {}
+    if three_metric_results and 'summary' in three_metric_results:
+        primary_summary = three_metric_results['summary'].get('metric_types', {}).get('committed_overall', {})
+        primary_metrics = {
+            'test_sensitivity_mean': primary_summary.get('sensitivity_mean', 0.0),
+            'test_sensitivity_std': primary_summary.get('sensitivity_std', 0.0),
+            'test_specificity_mean': primary_summary.get('specificity_mean', 0.0),
+            'test_specificity_std': primary_summary.get('specificity_std', 0.0),
+            'test_fpr_mean': primary_summary.get('fpr_mean', 0.0),
+            'test_fpr_std': primary_summary.get('fpr_std', 0.0),
+        }
+
+    # Save threshold and metrics info
+    threshold_info = {
+        'primary_threshold': float(primary_threshold),
+        'target_fpr': float(target_fpr),
+        'validation_metrics': {
+            'sensitivity': float(threshold_metrics.get('sensitivity', 0)),
+            'specificity': float(threshold_metrics.get('specificity', 0)),
+            'fpr': float(threshold_metrics.get('fpr', 0)),
+            'accuracy': float(threshold_metrics.get('accuracy', 0)),
+            'time_window_hours': float(threshold_metrics.get('time_window_hours', 1.0)),
+        },
+        'test_metrics_primary': primary_metrics,
+    }
+
+    with open(evaluation_dir / "threshold_info.json", 'w') as f:
+        json.dump(threshold_info, f, indent=2)
+
+    # Create fold results
+    fold_results = {
+        'fold_id': fold_id,
+        'primary_threshold': float(primary_threshold),
+        'validation_sensitivity': float(threshold_metrics.get('sensitivity', 0)),
+        'validation_specificity': float(threshold_metrics.get('specificity', 0)),
+        'validation_fpr': float(threshold_metrics.get('fpr', 0)),
+        'validation_accuracy': float(threshold_metrics.get('accuracy', 0)),
+        'test_sensitivity_mean': primary_metrics.get('test_sensitivity_mean', 0.0),
+        'test_sensitivity_std': primary_metrics.get('test_sensitivity_std', 0.0),
+        'test_specificity_mean': primary_metrics.get('test_specificity_mean', 0.0),
+        'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
+        'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
+        'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
+        'status': 'success'
+    }
+
+    # Save fold results
+    results_path = fold_dir / "fold_results.json"
+    with open(results_path, 'w') as f:
+        json.dump(fold_results, f, indent=2)
+
+    logger.info(f"Fold {fold_id}: Results saved to {results_path}")
+
+    return fold_results
+
+
+def _run_inference_for_fold(
+    fold_dir: Path,
+    config: Dict,
+    device: str,
+    split: str
+) -> pd.DataFrame:
+    """
+    Run inference for a specific split (val/test) of a fold.
+
+    Args:
+        fold_dir: Path to fold directory
+        config: Configuration dictionary
+        device: Device to run inference on
+        split: Data split ('val' or 'test')
+
+    Returns:
+        DataFrame with predictions
+    """
+    # Find checkpoint
+    checkpoint_path = find_latest_checkpoint_in_fold(fold_dir)
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
+
+    # Create model
+    model = create_model_from_config(config, device=device)
+
+    # Load checkpoint state
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint['state_dict']
+
+    # Remove 'model.' prefix from keys (LightningModule wraps the model)
+    model_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('model.'):
+            new_key = key[6:]
+            model_state_dict[new_key] = value
+
+    model.load_state_dict(model_state_dict, strict=True)
+    model.eval()
+
+    # Get dataset configuration
+    fold_datasets = config.get('fold_datasets', {})
+    if split not in fold_datasets:
+        raise ValueError(f"Split '{split}' not found in fold_datasets config")
+
+    hdf5_files = fold_datasets[split]
+
+    # Get dataloader configuration
+    dataloader_config = config.get('general_config', {}).get('dataloader', {})
+    batch_size = config.get('general_config', {}).get('batch_size', {}).get(split, 32)
+
+    # Get normalization configuration
+    stats_path = config.get('general_config', {}).get('stats_path')
+    normalized_fields = config.get('general_config', {}).get('normalized_fields', [])
+
+    # Additional dataset kwargs
+    dataset_config = config.get('model_config', {}).get('dataset', {})
+    dataset_kwargs = {
+        'target_label_name': dataset_config.get('target_label_name', 'target'),
+        'epoch_hour_field': dataset_config.get('epoch_hour_field', 'epoch_hours'),
+        'guid_field': dataset_config.get('guid_field', 'guid'),
+        'max_epochs': dataset_config.get('max_epochs', None),
+        'sequence_fields': dataset_config.get('sequence_fields', []),
+        'pad_sequences': dataset_config.get('pad_sequences', True),
+    }
+
+    # Create dataloader
+    dataloader = create_optimized_dataloader(
+        hdf5_files=hdf5_files,
+        batch_size=batch_size,
+        num_workers=dataloader_config.get('num_workers', 4),
+        shuffle=False,
+        stats_path=stats_path,
+        normalize_fields=normalized_fields,
+        pin_memory=True,
+        rank=0,
+        world_size=1,
+        **dataset_kwargs
+    )
+
+    # Run inference
+    predictions_df = run_inference(model, dataloader, device=device)
+
+    return predictions_df
+
+
+def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
+    """
+    Aggregate results across all folds.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+
+    Returns:
+        Aggregated results dictionary
+    """
+    n = len(all_fold_results)
+
+    if n == 0:
+        return {}
+
+    # Aggregate PRIMARY threshold
+    thresholds = [r['primary_threshold'] for r in all_fold_results]
+    threshold_mean = float(np.mean(thresholds))
+    threshold_std = float(np.std(thresholds))
+
+    # Aggregate validation metrics
+    val_sens = [r['validation_sensitivity'] for r in all_fold_results]
+    val_spec = [r['validation_specificity'] for r in all_fold_results]
+    val_fpr = [r['validation_fpr'] for r in all_fold_results]
+    val_acc = [r['validation_accuracy'] for r in all_fold_results]
+
+    # Aggregate test metrics (PRIMARY - committed_overall)
+    test_sens = [r['test_sensitivity_mean'] for r in all_fold_results]
+    test_spec = [r['test_specificity_mean'] for r in all_fold_results]
+    test_fpr = [r['test_fpr_mean'] for r in all_fold_results]
+
+    aggregated = {
+        'timestamp': datetime.now().isoformat(),
+        'n_folds': n,
+
+        # PRIMARY threshold statistics
+        'primary_threshold_mean': threshold_mean,
+        'primary_threshold_std': threshold_std,
+        'primary_threshold_min': float(np.min(thresholds)),
+        'primary_threshold_max': float(np.max(thresholds)),
+
+        # Validation metrics (aggregated across folds)
+        'validation_sensitivity_mean': float(np.mean(val_sens)),
+        'validation_sensitivity_std': float(np.std(val_sens)),
+        'validation_specificity_mean': float(np.mean(val_spec)),
+        'validation_specificity_std': float(np.std(val_spec)),
+        'validation_fpr_mean': float(np.mean(val_fpr)),
+        'validation_fpr_std': float(np.std(val_fpr)),
+        'validation_accuracy_mean': float(np.mean(val_acc)),
+        'validation_accuracy_std': float(np.std(val_acc)),
+
+        # Test metrics (PRIMARY - committed_overall aggregated across folds)
+        'test_sensitivity_mean': float(np.mean(test_sens)),
+        'test_sensitivity_std': float(np.std(test_sens)),
+        'test_sensitivity_min': float(np.min(test_sens)),
+        'test_sensitivity_max': float(np.max(test_sens)),
+        'test_specificity_mean': float(np.mean(test_spec)),
+        'test_specificity_std': float(np.std(test_spec)),
+        'test_specificity_min': float(np.min(test_spec)),
+        'test_specificity_max': float(np.max(test_spec)),
+        'test_fpr_mean': float(np.mean(test_fpr)),
+        'test_fpr_std': float(np.std(test_fpr)),
+        'test_fpr_min': float(np.min(test_fpr)),
+        'test_fpr_max': float(np.max(test_fpr)),
+
+        # Individual fold results
+        'fold_results': all_fold_results,
+    }
+
+    return aggregated
 
 
 if __name__ == '__main__':
-    main()
+    # Example usage for post-training evaluation
+    # Modify these parameters as needed for your setup
+
+    OUTPUT_BASE_DIR = r"C:\Users\mahdi\Desktop\teb_vae_model\outputs\kfold_results"
+    TARGET_FPR = 0.15  # 15% FPR target
+    DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    EXCLUDE_LAST_MINUTES = 30.0  # Exclude last 30 minutes before birth
+    REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
+
+    # Run evaluation pipeline
+    results = main(
+        output_base_dir=OUTPUT_BASE_DIR,
+        target_fpr=TARGET_FPR,
+        device=DEVICE,
+        exclude_last_minutes=EXCLUDE_LAST_MINUTES,
+        regenerate_predictions=REGENERATE_PREDICTIONS
+    )
+
+    print("\nEvaluation pipeline completed!")
+    print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+
+
