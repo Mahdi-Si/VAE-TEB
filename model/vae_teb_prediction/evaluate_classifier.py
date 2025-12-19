@@ -1581,42 +1581,35 @@ def compute_committed_overall_metrics(
         # DEBUG: Log bin info
         logger.info(f"  [BIN {i}] bin_center={bin_center:.2f}h, range=[{bin_start:.2f}, {bin_end:.2f})")
 
-        # Get GUIDs with data available at time τ (bin_center)
-        # "Available at τ" means: baby was under monitoring at time τ
-        # This requires having data that extends TO τ or BEYOND (further from birth)
-        # So we need: epoch_hours >= bin_center
-        available_mask = df['epoch_hours'] >= bin_center
-        available_guids = df[available_mask]['guid'].unique()
+        # For COMMITTED OVERALL with FIXED denominator:
+        # We check ALL positive/negative GUIDs to see if they were detected in window [0, τ]
+        # We DON'T restrict to "available" GUIDs because once detected, they should stay detected
+        # at all larger τ values (monotonicity requirement)
 
-        # DEBUG: Check what "available" means
-        logger.info(f"  [BIN {i}] Available GUIDs (epoch_hours >= {bin_center:.2f}): {len(available_guids)} total")
-
-        # Split available GUIDs by target
-        available_positive_guids = [g for g in available_guids if g in all_positive_guids]
-        available_negative_guids = [g for g in available_guids if g in all_negative_guids]
-
-        n_available_positive = len(available_positive_guids)
-        n_available_negative = len(available_negative_guids)
-
-        logger.info(f"  [BIN {i}] Available by class: {n_available_positive} positive, {n_available_negative} negative")
-
-        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means the time window [0, τ] hours before birth
-        # This requires checking epochs with: epoch_hours <= bin_center (at τ or closer to birth)
+        # Count detections for ALL positive GUIDs (not just those with data at τ)
         detected_positive = 0
-        for guid in available_positive_guids:
+        for guid in all_positive_guids:
+            # Check if this GUID has ANY epoch with clinical_pred=1 in window [0, τ]
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
-        for guid in available_negative_guids:
+        for guid in all_negative_guids:
+            # Check if this GUID has ANY epoch with clinical_pred=1 in window [0, τ]
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
-        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 in window [0, {bin_center:.2f}]): {detected_positive}/{n_available_positive} positive")
-        logger.info(f"  [BIN {i}] Sensitivity = {detected_positive} detected / {n_positive_total} total_positive = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
+        # For reporting: also track how many GUIDs have data extending to τ
+        available_mask = df['epoch_hours'] >= bin_center
+        available_guids = df[available_mask]['guid'].unique()
+        n_available_positive = len([g for g in available_guids if g in all_positive_guids])
+        n_available_negative = len([g for g in available_guids if g in all_negative_guids])
+
+        logger.info(f"  [BIN {i}] GUIDs with data at τ (epoch_hours >= {bin_center:.2f}): {n_available_positive} positive, {n_available_negative} negative")
+        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 in window [0, {bin_center:.2f}]): {detected_positive}/{n_positive_total} positive")
+        logger.info(f"  [BIN {i}] Sensitivity = {detected_positive} / {n_positive_total} = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
 
         # Compute metrics with FIXED denominator
         sensitivity = detected_positive / n_positive_total if n_positive_total > 0 else np.nan
