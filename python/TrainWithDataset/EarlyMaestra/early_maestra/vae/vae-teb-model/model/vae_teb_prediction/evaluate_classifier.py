@@ -1422,8 +1422,9 @@ def compute_committed_cumulative_metrics(
         bin_center = (bin_start + bin_end) / 2
 
         # Get GUIDs with data available at time τ (bin_center)
-        # Available means they have at least one epoch with epoch_hours >= bin_center
-        available_mask = df['epoch_hours'] >= bin_center
+        # Available means they have at least one epoch with epoch_hours <= bin_center
+        # (epoch_hours is hours before birth, so <= means closer to birth)
+        available_mask = df['epoch_hours'] <= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
         if len(available_guids) == 0:
@@ -1447,16 +1448,16 @@ def compute_committed_cumulative_metrics(
         n_negative_available = len(available_negative_guids)
 
         # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means epoch_hours >= bin_center
+        # "From τ to birth" means epoch_hours <= bin_center (closer to birth)
         detected_positive = 0
         for guid in available_positive_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
             if (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in available_negative_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
             if (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
@@ -1570,7 +1571,8 @@ def compute_committed_overall_metrics(
         bin_center = (bin_start + bin_end) / 2
 
         # Get GUIDs with data available at time τ (bin_center)
-        available_mask = df['epoch_hours'] >= bin_center
+        # (epoch_hours is hours before birth, so <= means closer to birth)
+        available_mask = df['epoch_hours'] <= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
         # Split available GUIDs by target
@@ -1581,15 +1583,16 @@ def compute_committed_overall_metrics(
         n_available_negative = len(available_negative_guids)
 
         # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
+        # "From τ to birth" means epoch_hours <= bin_center (closer to birth)
         detected_positive = 0
         for guid in available_positive_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
             if (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in available_negative_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
             if (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
@@ -2140,7 +2143,13 @@ def _plot_healthy_subgroups(
     output_dir: Path,
     title_suffix: str
 ) -> None:
-    """Plot healthy subgroup stratifications (CS, BG, and combinations)."""
+    """
+    Plot healthy subgroup stratifications (CS, BG, and combinations).
+
+    NOTE: For healthy subgroups (all negative cases), we plot SPECIFICITY instead of
+    sensitivity, since sensitivity is undefined (no positive cases to detect).
+    Specificity shows how well we correctly identify healthy patients as healthy.
+    """
     import matplotlib.pyplot as plt
 
     # Healthy by CS
@@ -2153,16 +2162,17 @@ def _plot_healthy_subgroups(
 
         for group in available_cs:
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = 'CS Positive' if 'pos' in group else 'CS Negative'
                 color = colors['pos'] if 'pos' in group else colors['neg']
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=color, markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy by CS Status - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
@@ -2186,16 +2196,17 @@ def _plot_healthy_subgroups(
 
         for group in available_bg:
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = 'BG Positive' if 'pos' in group else 'BG Negative'
                 color = colors['pos'] if 'pos' in group else colors['neg']
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=color, markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy by BG Status - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
@@ -2220,15 +2231,16 @@ def _plot_healthy_subgroups(
 
         for i, group in enumerate(available_combo):
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = group.replace('healthy_', '').replace('_', ' ').upper()
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=colors[i % len(colors)], markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy BG×CS Combinations - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
