@@ -2751,11 +2751,27 @@ def _run_inference_for_fold(
     model.eval()
 
     # Get dataset configuration
-    fold_datasets = config.get('fold_datasets', {})
-    if split not in fold_datasets:
-        raise ValueError(f"Split '{split}' not found in fold_datasets config")
+    # Note: kfold_classifier_trainer.py saves datasets under dataset_config with specific keys
+    dataset_config = config.get('dataset_config', {})
 
-    hdf5_files = fold_datasets[split]
+    # Map split names to config keys
+    split_key_map = {
+        'val': 'classifier_val_datasets',
+        'test': 'classifier_test_datasets',
+        'train': 'classifier_train_datasets'
+    }
+
+    if split not in split_key_map:
+        raise ValueError(f"Invalid split '{split}'. Must be one of: {list(split_key_map.keys())}")
+
+    config_key = split_key_map[split]
+    if config_key not in dataset_config:
+        raise ValueError(
+            f"Config key '{config_key}' not found in dataset_config. "
+            f"Available keys: {list(dataset_config.keys())}"
+        )
+
+    hdf5_files = dataset_config[config_key]
 
     # Get dataloader configuration
     dataloader_config = config.get('general_config', {}).get('dataloader', {})
