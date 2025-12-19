@@ -1123,6 +1123,103 @@ def create_enhanced_subgroup_filters() -> Dict[str, callable]:
     }
 
 
+def compute_subgroup_statistics(
+    df: pd.DataFrame,
+    subgroup_filters: Dict[str, callable]
+) -> Dict[str, Dict[str, int]]:
+    """
+    Compute dataset statistics for all subgroups.
+
+    For each subgroup, computes:
+    - n_guids: Number of unique patients (GUIDs) in subgroup
+    - n_epochs: Total number of epochs in subgroup
+    - n_positive: Number of unhealthy GUIDs (binary_target==1)
+    - n_negative: Number of healthy GUIDs (binary_target==0)
+
+    Args:
+        df: Full predictions dataframe with columns: guid, target, binary_target,
+            cs_label, bg_label, epoch
+        subgroup_filters: Dictionary mapping subgroup_name -> filter_function
+
+    Returns:
+        Dictionary mapping subgroup_name -> statistics dict with:
+            - n_guids: Unique patient count
+            - n_epochs: Total epoch count
+            - n_positive: Unhealthy patient count
+            - n_negative: Healthy patient count
+            - diagnosis_breakdown: Count by target (1=Healthy, 2=Acidosis, 3=HIE)
+    """
+    statistics = {}
+
+    for subgroup_name, filter_func in subgroup_filters.items():
+        try:
+            # Apply subgroup filter
+            subgroup_df = df[filter_func(df)].copy()
+
+            if len(subgroup_df) == 0:
+                statistics[subgroup_name] = {
+                    'n_guids': 0,
+                    'n_epochs': 0,
+                    'n_positive': 0,
+                    'n_negative': 0,
+                    'diagnosis_breakdown': {
+                        'healthy': 0,
+                        'acidosis': 0,
+                        'hie': 0
+                    }
+                }
+                continue
+
+            # Basic counts
+            n_guids = subgroup_df['guid'].nunique()
+            n_epochs = len(subgroup_df)
+
+            # Get unique GUIDs and their targets
+            guid_targets = subgroup_df.groupby('guid').agg({
+                'binary_target': 'first',
+                'target': 'first'
+            })
+
+            n_positive = (guid_targets['binary_target'] == 1).sum()
+            n_negative = (guid_targets['binary_target'] == 0).sum()
+
+            # Diagnosis breakdown (by unique GUIDs)
+            diagnosis_breakdown = {
+                'healthy': (guid_targets['target'] == 1).sum(),
+                'acidosis': (guid_targets['target'] == 2).sum(),
+                'hie': (guid_targets['target'] == 3).sum()
+            }
+
+            statistics[subgroup_name] = {
+                'n_guids': int(n_guids),
+                'n_epochs': int(n_epochs),
+                'n_positive': int(n_positive),
+                'n_negative': int(n_negative),
+                'diagnosis_breakdown': {
+                    'healthy': int(diagnosis_breakdown['healthy']),
+                    'acidosis': int(diagnosis_breakdown['acidosis']),
+                    'hie': int(diagnosis_breakdown['hie'])
+                }
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to compute statistics for {subgroup_name}: {e}")
+            statistics[subgroup_name] = {
+                'n_guids': 0,
+                'n_epochs': 0,
+                'n_positive': 0,
+                'n_negative': 0,
+                'diagnosis_breakdown': {
+                    'healthy': 0,
+                    'acidosis': 0,
+                    'hie': 0
+                },
+                'error': str(e)
+            }
+
+    return statistics
+
+
 def compute_subgroup_metrics_by_time(
     df: pd.DataFrame,
     subgroup_name: str,
@@ -2421,7 +2518,30 @@ def generate_three_metric_type_analysis(
     )
     all_subgroup_metrics['committed_overall'] = overall_subgroups
 
-    # Step 4: Save metrics summary
+    # Step 4: Compute subgroup dataset statistics
+    logger.info("Computing dataset statistics for all subgroups...")
+    subgroup_statistics = compute_subgroup_statistics(df, subgroup_filters)
+
+    # Overall dataset statistics
+    overall_statistics = {
+        'total_guids': df['guid'].nunique(),
+        'total_epochs': len(df),
+        'diagnosis_counts': {
+            'healthy': df.groupby('guid')['target'].first().eq(1).sum(),
+            'acidosis': df.groupby('guid')['target'].first().eq(2).sum(),
+            'hie': df.groupby('guid')['target'].first().eq(3).sum()
+        },
+        'cs_counts': {
+            'cs_positive': df.groupby('guid')['cs_label'].first().eq(True).sum(),
+            'cs_negative': df.groupby('guid')['cs_label'].first().eq(False).sum()
+        },
+        'bg_counts': {
+            'bg_positive': df.groupby('guid')['bg_label'].first().eq(True).sum(),
+            'bg_negative': df.groupby('guid')['bg_label'].first().eq(False).sum()
+        }
+    }
+
+    # Step 5: Save metrics summary with statistics
     summary = {
         'metric_types': {
             'instantaneous': _summarize_metrics_df(metrics_dict.get('instantaneous')),
@@ -2441,19 +2561,35 @@ def generate_three_metric_type_analysis(
                 name: _summarize_metrics_df(df)
                 for name, df in overall_subgroups.items()
             }
+        },
+        'dataset_statistics': {
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
         }
     }
 
     with open(analysis_dir / "metrics_summary.json", 'w') as f:
         json.dump(summary, f, indent=2)
 
+    # Save dataset statistics separately for easy access
+    with open(analysis_dir / "dataset_statistics.json", 'w') as f:
+        json.dump({
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
+        }, f, indent=2)
+
+    logger.info(f"Dataset statistics computed for {len(subgroup_statistics)} subgroups")
     logger.info("Three metric type analysis complete")
     logger.info(f"Results saved to: {analysis_dir}")
 
     return {
         'metrics_dict': metrics_dict,
         'subgroup_metrics': all_subgroup_metrics,
-        'summary': summary
+        'summary': summary,
+        'dataset_statistics': {
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
+        }
     }
 
 
@@ -3159,6 +3295,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
     # Aggregate three metric type analysis across folds
     three_metric_aggregated = _aggregate_three_metric_analysis(all_fold_results)
 
+    # Aggregate dataset statistics across folds
+    dataset_stats_aggregated = _aggregate_dataset_statistics(all_fold_results)
+
     aggregated = {
         'timestamp': datetime.now().isoformat(),
         'n_folds': n,
@@ -3195,6 +3334,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
 
         # Three metric type analysis (all metrics and subgroups aggregated)
         'three_metric_analysis_aggregated': three_metric_aggregated,
+
+        # Dataset statistics (aggregated across folds)
+        'dataset_statistics_aggregated': dataset_stats_aggregated,
 
         # Individual fold results (includes per-fold three metric analysis)
         'fold_results': all_fold_results,
@@ -3282,6 +3424,97 @@ def _aggregate_three_metric_analysis(all_fold_results: List[Dict]) -> Dict:
                 })
 
     return aggregated
+
+
+def _aggregate_dataset_statistics(all_fold_results: List[Dict]) -> Dict:
+    """
+    Aggregate dataset statistics across folds.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+
+    Returns:
+        Dictionary with aggregated statistics (mean, std, min, max) for:
+        - Overall statistics (total GUIDs, diagnosis counts, CS counts, BG counts)
+        - Subgroup statistics (counts for each subgroup)
+    """
+    # Extract dataset statistics from each fold
+    fold_stats = []
+    for r in all_fold_results:
+        three_metric_full = r.get('three_metric_results_full', {})
+        if three_metric_full and 'dataset_statistics' in three_metric_full:
+            fold_stats.append(three_metric_full['dataset_statistics'])
+
+    if not fold_stats:
+        return {}
+
+    # Aggregate overall statistics
+    overall_stats = {
+        'total_guids': _aggregate_stat([s['overall']['total_guids'] for s in fold_stats]),
+        'total_epochs': _aggregate_stat([s['overall']['total_epochs'] for s in fold_stats]),
+        'diagnosis_counts': {
+            'healthy': _aggregate_stat([s['overall']['diagnosis_counts']['healthy'] for s in fold_stats]),
+            'acidosis': _aggregate_stat([s['overall']['diagnosis_counts']['acidosis'] for s in fold_stats]),
+            'hie': _aggregate_stat([s['overall']['diagnosis_counts']['hie'] for s in fold_stats])
+        },
+        'cs_counts': {
+            'cs_positive': _aggregate_stat([s['overall']['cs_counts']['cs_positive'] for s in fold_stats]),
+            'cs_negative': _aggregate_stat([s['overall']['cs_counts']['cs_negative'] for s in fold_stats])
+        },
+        'bg_counts': {
+            'bg_positive': _aggregate_stat([s['overall']['bg_counts']['bg_positive'] for s in fold_stats]),
+            'bg_negative': _aggregate_stat([s['overall']['bg_counts']['bg_negative'] for s in fold_stats])
+        }
+    }
+
+    # Aggregate subgroup statistics
+    all_subgroup_names = set()
+    for s in fold_stats:
+        all_subgroup_names.update(s['subgroups'].keys())
+
+    subgroup_stats = {}
+    for subgroup_name in all_subgroup_names:
+        try:
+            n_guids_list = [s['subgroups'][subgroup_name]['n_guids'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_epochs_list = [s['subgroups'][subgroup_name]['n_epochs'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_positive_list = [s['subgroups'][subgroup_name]['n_positive'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_negative_list = [s['subgroups'][subgroup_name]['n_negative'] for s in fold_stats if subgroup_name in s['subgroups']]
+
+            healthy_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['healthy'] for s in fold_stats if subgroup_name in s['subgroups']]
+            acidosis_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['acidosis'] for s in fold_stats if subgroup_name in s['subgroups']]
+            hie_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['hie'] for s in fold_stats if subgroup_name in s['subgroups']]
+
+            subgroup_stats[subgroup_name] = {
+                'n_guids': _aggregate_stat(n_guids_list),
+                'n_epochs': _aggregate_stat(n_epochs_list),
+                'n_positive': _aggregate_stat(n_positive_list),
+                'n_negative': _aggregate_stat(n_negative_list),
+                'diagnosis_breakdown': {
+                    'healthy': _aggregate_stat(healthy_list),
+                    'acidosis': _aggregate_stat(acidosis_list),
+                    'hie': _aggregate_stat(hie_list)
+                }
+            }
+        except Exception as e:
+            logger.warning(f"Failed to aggregate statistics for {subgroup_name}: {e}")
+            continue
+
+    return {
+        'overall': overall_stats,
+        'subgroups': subgroup_stats
+    }
+
+
+def _aggregate_stat(values: List[float]) -> Dict[str, float]:
+    """Helper to compute mean, std, min, max for a list of values."""
+    if not values:
+        return {'mean': 0, 'std': 0, 'min': 0, 'max': 0}
+    return {
+        'mean': float(np.mean(values)),
+        'std': float(np.std(values)),
+        'min': float(np.min(values)),
+        'max': float(np.max(values))
+    }
 
 
 def _aggregate_dataframes_across_folds(
@@ -3398,7 +3631,7 @@ def plot_aggregated_metric_type(
     # Plot 1: Sensitivity vs Time
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
-            'b-', linewidth=2.5, label='Mean Sensitivity')
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
     ax.fill_between(valid_df['bin_center'],
                      valid_df['sensitivity_min'],
                      valid_df['sensitivity_max'],
@@ -3417,7 +3650,7 @@ def plot_aggregated_metric_type(
     # Plot 2: Sensitivity + Specificity
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
-            'b-', linewidth=2.5, label='Mean Sensitivity')
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
     ax.fill_between(valid_df['bin_center'],
                      valid_df['sensitivity_min'],
                      valid_df['sensitivity_max'],
@@ -3425,7 +3658,7 @@ def plot_aggregated_metric_type(
 
     if 'specificity_mean' in valid_df.columns:
         ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
-                'g-', linewidth=2.5, label='Mean Specificity')
+                'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
         ax.fill_between(valid_df['bin_center'],
                          valid_df['specificity_min'],
                          valid_df['specificity_max'],
@@ -3445,7 +3678,7 @@ def plot_aggregated_metric_type(
     # Plot 3: Sensitivity + FPR
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
-            'b-', linewidth=2.5, label='Mean Sensitivity')
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
     ax.fill_between(valid_df['bin_center'],
                      valid_df['sensitivity_min'],
                      valid_df['sensitivity_max'],
@@ -3453,7 +3686,7 @@ def plot_aggregated_metric_type(
 
     if 'fpr_mean' in valid_df.columns:
         ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
-                'r-', linewidth=2.5, label='Mean FPR')
+                'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
         ax.fill_between(valid_df['bin_center'],
                          valid_df['fpr_min'],
                          valid_df['fpr_max'],
@@ -3473,7 +3706,7 @@ def plot_aggregated_metric_type(
     # Plot 4: All metrics
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
-            'b-', linewidth=2.5, label='Mean Sensitivity')
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
     ax.fill_between(valid_df['bin_center'],
                      valid_df['sensitivity_min'],
                      valid_df['sensitivity_max'],
@@ -3481,7 +3714,7 @@ def plot_aggregated_metric_type(
 
     if 'specificity_mean' in valid_df.columns:
         ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
-                'g-', linewidth=2.5, label='Mean Specificity')
+                'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
         ax.fill_between(valid_df['bin_center'],
                          valid_df['specificity_min'],
                          valid_df['specificity_max'],
@@ -3489,7 +3722,7 @@ def plot_aggregated_metric_type(
 
     if 'fpr_mean' in valid_df.columns:
         ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
-                'r-', linewidth=2.5, label='Mean FPR')
+                'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
         ax.fill_between(valid_df['bin_center'],
                          valid_df['fpr_min'],
                          valid_df['fpr_max'],
@@ -3531,6 +3764,7 @@ def plot_aggregated_subgroup_comparison(
     fig, ax = plt.subplots(figsize=(14, 8))
 
     colors = plt.cm.tab10(np.linspace(0, 1, len(subgroup_names)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']  # Different markers for variety
 
     for i, name in enumerate(subgroup_names):
         df = subgroup_dfs.get(name)
@@ -3548,8 +3782,10 @@ def plot_aggregated_subgroup_comparison(
         if len(valid_df) == 0:
             continue
 
+        marker = markers[i % len(markers)]
         ax.plot(valid_df['bin_center'], valid_df[mean_col],
-                linewidth=2.5, label=name, color=colors[i])
+                marker=marker, linewidth=2.5, markersize=6, label=name, color=colors[i],
+                markerfacecolor=colors[i], markeredgecolor='black', markeredgewidth=0.5)
         ax.fill_between(valid_df['bin_center'],
                          valid_df[min_col],
                          valid_df[max_col],
@@ -3813,8 +4049,7 @@ if __name__ == '__main__':
         results = main(
             output_base_dir=OUTPUT_BASE_DIR,
             aggregate_only=True,
-            exclude_last_minutes=EXCLUDE_LAST_MINUTES,
-            aggregate_only=True
+            exclude_last_minutes=EXCLUDE_LAST_MINUTES
         )
 
         # Option B: Use aggregate_existing_results() directly
