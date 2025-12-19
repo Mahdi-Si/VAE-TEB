@@ -582,12 +582,12 @@ def find_threshold_for_instantaneous_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
+    # Create time bins around target time (ascending)
     bin_width = 0.5  # 30 minutes
     time_bins = np.array([
-        time_window_hours + bin_width,
+        max(0, time_window_hours - bin_width),
         time_window_hours,
-        max(0, time_window_hours - bin_width)
+        time_window_hours + bin_width
     ])
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
@@ -707,12 +707,12 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
+    # Create time bins around target time (ascending)
     bin_width = 0.5
     time_bins = np.array([
-        time_window_hours + bin_width,
+        max(0, time_window_hours - bin_width),
         time_window_hours,
-        max(0, time_window_hours - bin_width)
+        time_window_hours + bin_width
     ])
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
@@ -834,12 +834,12 @@ def find_threshold_for_committed_overall_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
+    # Create time bins around target time (ascending)
     bin_width = 0.5
     time_bins = np.array([
-        time_window_hours + bin_width,
+        max(0, time_window_hours - bin_width),
         time_window_hours,
-        max(0, time_window_hours - bin_width)
+        time_window_hours + bin_width
     ])
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
@@ -1372,7 +1372,7 @@ def compute_committed_cumulative_metrics(
 
     For each time bin center τ:
     - Get GUIDs with data available at time τ: epoch_hours >= τ
-    - For each GUID, check if detected (any epoch with clinical_pred=1 from τ to birth)
+    - For each GUID, check if detected using epochs at/earlier than τ (epoch_hours >= τ)
     - Sensitivity(τ) = TP(t≤τ) / P(t≤τ)
     - FPR(τ) = FP(t≤τ) / N(t≤τ)
 
@@ -1383,7 +1383,7 @@ def compute_committed_cumulative_metrics(
     - N(t≤τ) = total healthy GUIDs available at time τ
 
     The denominator CHANGES as we approach birth (more GUIDs have data).
-    This metric is monotonically non-decreasing.
+    Sensitivity can move up or down depending on who becomes available.
 
     Args:
         df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
@@ -1421,15 +1421,14 @@ def compute_committed_cumulative_metrics(
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # COMMITTED CUMULATIVE: Denominator is "cases available/monitored at time τ"
-        # This means: babies that have data extending to τ or beyond (further from birth)
-        # Clinically: "Which babies were under active monitoring at time τ?"
+        # COMMITTED CUMULATIVE: Denominator is "cases available/monitored at time tau"
+        # This means: babies that have data extending to tau or beyond (further from birth).
         # Implementation: epoch_hours >= bin_center
         #
-        # As τ increases (further from birth):
-        #   - Fewer babies were monitored that far back → denominator DECREASES
-        #   - Detection window [0, τ] expands → numerator may increase or decrease
-        #   - Sensitivity trend depends on the interplay of these factors
+        # As tau decreases (closer to birth):
+        #   - More babies have data -> denominator increases
+        #   - Detection window [tau, max] expands -> numerator can increase
+        #   - Sensitivity can move in either direction as new GUIDs appear
         #
         # This is fundamentally different from committed_overall which has a FIXED denominator.
         available_mask = df['epoch_hours'] >= bin_center
@@ -1455,16 +1454,16 @@ def compute_committed_cumulative_metrics(
         n_positive_available = len(available_positive_guids)
         n_negative_available = len(available_negative_guids)
 
-        # For each GUID being monitored at τ, check if detected in window [0, τ]
+        # For each GUID being monitored at tau, check if detected using epochs at/earlier than tau.
         detected_positive = 0
         for guid in available_positive_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
             if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in available_negative_guids:
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
             if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
@@ -1486,25 +1485,22 @@ def compute_committed_cumulative_metrics(
 
     result_df = pd.DataFrame(results)
 
-    # CRITICAL: Sort by bin_center in ASCENDING order (near birth → far from birth)
-    # This ensures monotonicity check works correctly (sensitivity should increase with τ)
-    result_df = result_df.sort_values('bin_center').reset_index(drop=True)
+    # Sort by bin_center in DESCENDING order (far from birth -> near birth)
+    result_df = result_df.sort_values('bin_center', ascending=False).reset_index(drop=True)
 
     logger.info(
         f"compute_committed_cumulative_metrics: Computed metrics for {len(result_df)} time bins "
         f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
 
-    # Verify monotonicity
-    # After sorting, bins go from small τ to large τ (near→far from birth)
-    # Sensitivity should be non-decreasing (can only increase or stay same)
+    # Sensitivity is not guaranteed to be monotonic with a changing denominator.
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
         if violations > 0:
-            logger.warning(f"⚠️  Committed cumulative sensitivity has {violations} monotonicity violations!")
+            logger.debug(f"Committed cumulative sensitivity decreases in {violations} bins (expected with changing denominator)")
         else:
-            logger.info("✓ Committed cumulative sensitivity is monotonically non-decreasing")
+            logger.debug("Committed cumulative sensitivity is non-decreasing across bins")
 
     return result_df
 
@@ -1519,7 +1515,7 @@ def compute_committed_overall_metrics(
 
     For each time bin center τ:
     - Get ALL GUIDs in dataset: P(t≤0) and N(t≤0) are FIXED
-    - For GUIDs with data at time τ, check if detected (any clinical_pred=1 from τ to birth)
+    - For GUIDs with data at time tau, check if detected using epochs at/earlier than tau (epoch_hours >= tau)
     - Sensitivity(τ) = TP(t≤τ) / P(t≤0)
     - FPR(τ) = FP(t≤τ) / N(t≤0)
 
@@ -1587,22 +1583,22 @@ def compute_committed_overall_metrics(
         logger.info(f"  [BIN {i}] bin_center={bin_center:.2f}h, range=[{bin_start:.2f}, {bin_end:.2f})")
 
         # For COMMITTED OVERALL with FIXED denominator:
-        # We check ALL positive/negative GUIDs to see if they were detected in window [0, τ]
+        # We check ALL positive/negative GUIDs to see if they were detected using epochs at/earlier than tau.
         # We DON'T restrict to "available" GUIDs because once detected, they should stay detected
-        # at all larger τ values (monotonicity requirement)
+        # at all smaller tau values (closer to birth) (monotonicity requirement)
 
         # Count detections for ALL positive GUIDs (not just those with data at τ)
         detected_positive = 0
         for guid in all_positive_guids:
-            # Check if this GUID has ANY epoch with clinical_pred=1 in window [0, τ]
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
+            # Check if this GUID has ANY epoch with clinical_pred=1 with epoch_hours >= tau
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
             if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in all_negative_guids:
-            # Check if this GUID has ANY epoch with clinical_pred=1 in window [0, τ]
-            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
+            # Check if this GUID has ANY epoch with clinical_pred=1 with epoch_hours >= tau
+            guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
             if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
@@ -1613,7 +1609,7 @@ def compute_committed_overall_metrics(
         n_available_negative = len([g for g in available_guids if g in all_negative_guids])
 
         logger.info(f"  [BIN {i}] GUIDs with data at τ (epoch_hours >= {bin_center:.2f}): {n_available_positive} positive, {n_available_negative} negative")
-        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 in window [0, {bin_center:.2f}]): {detected_positive}/{n_positive_total} positive")
+        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 where epoch_hours >= {bin_center:.2f}): {detected_positive}/{n_positive_total} positive")
         logger.info(f"  [BIN {i}] Sensitivity = {detected_positive} / {n_positive_total} = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
 
         # Compute metrics with FIXED denominator
@@ -1636,9 +1632,9 @@ def compute_committed_overall_metrics(
 
     result_df = pd.DataFrame(results)
 
-    # CRITICAL: Sort by bin_center in ASCENDING order (near birth → far from birth)
-    # This ensures monotonicity check works correctly (sensitivity should increase with τ)
-    result_df = result_df.sort_values('bin_center').reset_index(drop=True)
+    # Sort by bin_center in DESCENDING order (far from birth -> near birth)
+    # This aligns monotonicity checks with approaching birth (tau decreasing)
+    result_df = result_df.sort_values('bin_center', ascending=False).reset_index(drop=True)
 
     logger.info(
         f"compute_committed_overall_metrics: Computed PRIMARY METRIC for {len(result_df)} time bins "
@@ -1646,8 +1642,8 @@ def compute_committed_overall_metrics(
     )
 
     # Verify monotonicity (CRITICAL for primary metric)
-    # After sorting, bins go from small τ to large τ (near→far from birth)
-    # Sensitivity should be non-decreasing (can only increase or stay same)
+    # After sorting, bins go from large tau to small tau (far->near from birth)
+    # Sensitivity should be non-decreasing as we approach birth
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
@@ -3084,5 +3080,3 @@ if __name__ == '__main__':
 
     print("\nEvaluation pipeline completed!")
     print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
-
-
