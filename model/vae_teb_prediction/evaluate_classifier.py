@@ -1481,12 +1481,18 @@ def compute_committed_cumulative_metrics(
 
     result_df = pd.DataFrame(results)
 
+    # CRITICAL: Sort by bin_center in ASCENDING order (near birth → far from birth)
+    # This ensures monotonicity check works correctly (sensitivity should increase with τ)
+    result_df = result_df.sort_values('bin_center').reset_index(drop=True)
+
     logger.info(
         f"compute_committed_cumulative_metrics: Computed metrics for {len(result_df)} time bins "
         f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
 
     # Verify monotonicity
+    # After sorting, bins go from small τ to large τ (near→far from birth)
+    # Sensitivity should be non-decreasing (can only increase or stay same)
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
@@ -1632,12 +1638,18 @@ def compute_committed_overall_metrics(
 
     result_df = pd.DataFrame(results)
 
+    # CRITICAL: Sort by bin_center in ASCENDING order (near birth → far from birth)
+    # This ensures monotonicity check works correctly (sensitivity should increase with τ)
+    result_df = result_df.sort_values('bin_center').reset_index(drop=True)
+
     logger.info(
         f"compute_committed_overall_metrics: Computed PRIMARY METRIC for {len(result_df)} time bins "
         f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
 
     # Verify monotonicity (CRITICAL for primary metric)
+    # After sorting, bins go from small τ to large τ (near→far from birth)
+    # Sensitivity should be non-decreasing (can only increase or stay same)
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
@@ -1647,10 +1659,12 @@ def compute_committed_overall_metrics(
             for idx in range(1, len(result_df)):
                 prev_sens = result_df.iloc[idx - 1]['sensitivity']
                 curr_sens = result_df.iloc[idx]['sensitivity']
+                prev_time = result_df.iloc[idx - 1]['bin_center']
+                curr_time = result_df.iloc[idx]['bin_center']
                 if pd.notna(prev_sens) and pd.notna(curr_sens) and curr_sens < prev_sens - 1e-6:
                     logger.error(
-                        f"  Bin {idx} ({result_df.iloc[idx]['bin_center']:.1f}h): "
-                        f"Sensitivity decreased from {prev_sens:.4f} to {curr_sens:.4f}"
+                        f"  Bin {idx} (τ={curr_time:.1f}h): "
+                        f"Sensitivity decreased from {prev_sens:.4f} (at τ={prev_time:.1f}h) to {curr_sens:.4f}"
                     )
         else:
             logger.info("✓ PRIMARY METRIC: Committed overall sensitivity is monotonically non-decreasing")
@@ -2288,7 +2302,7 @@ def generate_three_metric_type_analysis(
     1. Three separate thresholds (instantaneous, committed_cumulative, committed_overall)
     2. Plots for each metric type
     3. Metric type comparison plots
-    4. Subgroup analysis for committed_overall (PRIMARY)
+    4. Subgroup analysis for ALL THREE metric types
     5. Saves all metrics as JSON
 
     Directory structure:
@@ -2297,9 +2311,17 @@ def generate_three_metric_type_analysis(
             instantaneous/
                 sensitivity_vs_time.png
                 ...
+                subgroups/
+                    diagnosis_comparison.png
+                    ...
             committed_cumulative/
+                sensitivity_vs_time.png
                 ...
+                subgroups/
+                    diagnosis_comparison.png
+                    ...
             committed_overall/  # PRIMARY
+                sensitivity_vs_time.png
                 ...
                 subgroups/
                     diagnosis_comparison.png
@@ -2316,7 +2338,8 @@ def generate_three_metric_type_analysis(
         title_suffix: Suffix for plot titles
 
     Returns:
-        Dictionary with thresholds and metrics for all three types
+        Dictionary with thresholds and metrics for all three types, including
+        subgroup analysis for each metric type
     """
     logger.info("=" * 80)
     logger.info("THREE METRIC TYPE ANALYSIS - NEW PIPELINE")
@@ -2338,15 +2361,38 @@ def generate_three_metric_type_analysis(
     comparison_dir = analysis_dir / "comparison"
     plot_metric_type_comparison(metrics_dict, comparison_dir, title_suffix)
 
-    # Step 3: Generate subgroup analysis for PRIMARY metric (committed_overall)
-    logger.info("Generating subgroup analysis for committed_overall (PRIMARY)...")
+    # Step 3: Generate subgroup analysis for ALL THREE metric types
+    logger.info("Generating subgroup analysis for all three metric types...")
     subgroup_filters = create_enhanced_subgroup_filters()
-    subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
 
-    subgroup_metrics = plot_subgroup_analysis(
-        df, time_bins, 'committed_overall',
-        subgroup_filters, subgroup_dir, title_suffix
+    all_subgroup_metrics = {}
+
+    # Subgroup analysis for instantaneous
+    logger.info("  - Instantaneous metric subgroups...")
+    instantaneous_subgroup_dir = analysis_dir / "instantaneous" / "subgroups"
+    instantaneous_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'instantaneous',
+        subgroup_filters, instantaneous_subgroup_dir, title_suffix
     )
+    all_subgroup_metrics['instantaneous'] = instantaneous_subgroups
+
+    # Subgroup analysis for committed_cumulative
+    logger.info("  - Committed cumulative metric subgroups...")
+    cumulative_subgroup_dir = analysis_dir / "committed_cumulative" / "subgroups"
+    cumulative_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'committed_cumulative',
+        subgroup_filters, cumulative_subgroup_dir, title_suffix
+    )
+    all_subgroup_metrics['committed_cumulative'] = cumulative_subgroups
+
+    # Subgroup analysis for committed_overall (PRIMARY)
+    logger.info("  - Committed overall metric (PRIMARY) subgroups...")
+    overall_subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
+    overall_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'committed_overall',
+        subgroup_filters, overall_subgroup_dir, title_suffix
+    )
+    all_subgroup_metrics['committed_overall'] = overall_subgroups
 
     # Step 4: Save metrics summary
     summary = {
@@ -2356,8 +2402,18 @@ def generate_three_metric_type_analysis(
             'committed_overall': _summarize_metrics_df(metrics_dict.get('committed_overall'))
         },
         'subgroups': {
-            name: _summarize_metrics_df(df)
-            for name, df in subgroup_metrics.items()
+            'instantaneous': {
+                name: _summarize_metrics_df(df)
+                for name, df in instantaneous_subgroups.items()
+            },
+            'committed_cumulative': {
+                name: _summarize_metrics_df(df)
+                for name, df in cumulative_subgroups.items()
+            },
+            'committed_overall': {
+                name: _summarize_metrics_df(df)
+                for name, df in overall_subgroups.items()
+            }
         }
     }
 
@@ -2369,7 +2425,7 @@ def generate_three_metric_type_analysis(
 
     return {
         'metrics_dict': metrics_dict,
-        'subgroup_metrics': subgroup_metrics,
+        'subgroup_metrics': all_subgroup_metrics,
         'summary': summary
     }
 
@@ -2745,7 +2801,9 @@ def _evaluate_single_fold(
         'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
         'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
         'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
-        'status': 'success'
+        'status': 'success',
+        # Include full three metric type analysis (including all subgroups)
+        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {}
     }
 
     # Save fold results
@@ -2879,6 +2937,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
     test_spec = [r['test_specificity_mean'] for r in all_fold_results]
     test_fpr = [r['test_fpr_mean'] for r in all_fold_results]
 
+    # Aggregate three metric type analysis across folds
+    three_metric_aggregated = _aggregate_three_metric_analysis(all_fold_results)
+
     aggregated = {
         'timestamp': datetime.now().isoformat(),
         'n_folds': n,
@@ -2913,9 +2974,93 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
         'test_fpr_min': float(np.min(test_fpr)),
         'test_fpr_max': float(np.max(test_fpr)),
 
-        # Individual fold results
+        # Three metric type analysis (all metrics and subgroups aggregated)
+        'three_metric_analysis_aggregated': three_metric_aggregated,
+
+        # Individual fold results (includes per-fold three metric analysis)
         'fold_results': all_fold_results,
     }
+
+    return aggregated
+
+
+def _aggregate_three_metric_analysis(all_fold_results: List[Dict]) -> Dict:
+    """
+    Aggregate three metric type analysis (including subgroups) across folds.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+
+    Returns:
+        Aggregated three metric analysis with mean/std for all metric types and subgroups
+    """
+    aggregated = {
+        'metric_types': {},
+        'subgroups': {}
+    }
+
+    # Extract three_metric_analysis from each fold
+    fold_analyses = [
+        r.get('three_metric_analysis', {})
+        for r in all_fold_results
+        if r.get('three_metric_analysis')
+    ]
+
+    if not fold_analyses:
+        return aggregated
+
+    # Aggregate main metric types (instantaneous, committed_cumulative, committed_overall)
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        metric_values = {}
+        for fold in fold_analyses:
+            fold_metrics = fold.get('metric_types', {}).get(metric_type, {})
+            for key, value in fold_metrics.items():
+                if isinstance(value, (int, float)):
+                    if key not in metric_values:
+                        metric_values[key] = []
+                    metric_values[key].append(value)
+
+        # Compute mean/std for each metric
+        aggregated['metric_types'][metric_type] = {
+            f'{key}_mean': float(np.mean(values))
+            for key, values in metric_values.items()
+        }
+        aggregated['metric_types'][metric_type].update({
+            f'{key}_std': float(np.std(values))
+            for key, values in metric_values.items()
+        })
+
+    # Aggregate subgroups for each metric type
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        aggregated['subgroups'][metric_type] = {}
+
+        # Get all subgroup names across folds
+        all_subgroup_names = set()
+        for fold in fold_analyses:
+            subgroups = fold.get('subgroups', {}).get(metric_type, {})
+            all_subgroup_names.update(subgroups.keys())
+
+        # Aggregate each subgroup
+        for subgroup_name in all_subgroup_names:
+            subgroup_values = {}
+            for fold in fold_analyses:
+                fold_subgroup = fold.get('subgroups', {}).get(metric_type, {}).get(subgroup_name, {})
+                for key, value in fold_subgroup.items():
+                    if isinstance(value, (int, float)):
+                        if key not in subgroup_values:
+                            subgroup_values[key] = []
+                        subgroup_values[key].append(value)
+
+            # Compute mean/std
+            if subgroup_values:
+                aggregated['subgroups'][metric_type][subgroup_name] = {
+                    f'{key}_mean': float(np.mean(values))
+                    for key, values in subgroup_values.items()
+                }
+                aggregated['subgroups'][metric_type][subgroup_name].update({
+                    f'{key}_std': float(np.std(values))
+                    for key, values in subgroup_values.items()
+                })
 
     return aggregated
 
