@@ -2614,13 +2614,25 @@ def _evaluate_single_fold(
         val_df_raw,
         target_fpr=target_fpr,
         time_window_hours=1.0,
+        max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=0.5
     )
+
+    # Calculate accuracy from sensitivity and specificity (weighted by class prevalence)
+    # Accuracy = (TP + TN) / (TP + FP + TN + FN)
+    # With P = n_positive, N = n_negative:
+    # Accuracy = (sensitivity * P + specificity * N) / (P + N)
+    n_pos = threshold_metrics.get('n_positive_total', threshold_metrics.get('n_available_positive', 1))
+    n_neg = threshold_metrics.get('n_negative_total', threshold_metrics.get('n_available_negative', 1))
+    sens = threshold_metrics.get('sensitivity', 0)
+    spec = threshold_metrics.get('specificity', 0)
+    threshold_metrics['accuracy'] = float((sens * n_pos + spec * n_neg) / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else 0.0
 
     logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
     logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
     logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
     logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
+    logger.info(f"  Validation accuracy: {threshold_metrics.get('accuracy', 0):.3f}")
 
     # Apply clinical decision rule to validation set
     val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
@@ -2773,26 +2785,22 @@ def _run_inference_for_fold(
 
     hdf5_files = dataset_config[config_key]
 
-    # Get dataloader configuration
-    dataloader_config = config.get('general_config', {}).get('dataloader', {})
-    batch_size = config.get('general_config', {}).get('batch_size', {}).get(split, 32)
+    # Get dataloader configuration (match kfold_classifier_trainer.py structure)
+    dataloader_config = dataset_config.get('dataloader_config', {})
+
+    # Get batch size from general_config
+    # Note: config only has 'train' and 'test' batch sizes, so map 'val' -> 'test'
+    batch_size_key = 'test' if split in ['val', 'test'] else split
+    batch_size = config.get('general_config', {}).get('batch_size', {}).get(batch_size_key, 32)
 
     # Get normalization configuration
-    stats_path = config.get('general_config', {}).get('stats_path')
-    normalized_fields = config.get('general_config', {}).get('normalized_fields', [])
+    stats_path = dataset_config.get('stat_path')
+    normalized_fields = dataloader_config.get('normalize_fields', [])
 
-    # Additional dataset kwargs
-    dataset_config = config.get('model_config', {}).get('dataset', {})
-    dataset_kwargs = {
-        'target_label_name': dataset_config.get('target_label_name', 'target'),
-        'epoch_hour_field': dataset_config.get('epoch_hour_field', 'epoch_hours'),
-        'guid_field': dataset_config.get('guid_field', 'guid'),
-        'max_epochs': dataset_config.get('max_epochs', None),
-        'sequence_fields': dataset_config.get('sequence_fields', []),
-        'pad_sequences': dataset_config.get('pad_sequences', True),
-    }
+    # Get dataset kwargs from dataloader_config
+    dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
 
-    # Create dataloader
+    # Create dataloader (match kfold_classifier_trainer.py parameters)
     dataloader = create_optimized_dataloader(
         hdf5_files=hdf5_files,
         batch_size=batch_size,
