@@ -1422,9 +1422,10 @@ def compute_committed_cumulative_metrics(
         bin_center = (bin_start + bin_end) / 2
 
         # Get GUIDs with data available at time τ (bin_center)
-        # Available means they have at least one epoch with epoch_hours <= bin_center
-        # (epoch_hours is hours before birth, so <= means closer to birth)
-        available_mask = df['epoch_hours'] <= bin_center
+        # "Available at τ" means: baby was under monitoring at time τ
+        # This requires having data that extends TO τ or BEYOND (further from birth)
+        # So we need: epoch_hours >= bin_center
+        available_mask = df['epoch_hours'] >= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
         if len(available_guids) == 0:
@@ -1448,7 +1449,8 @@ def compute_committed_cumulative_metrics(
         n_negative_available = len(available_negative_guids)
 
         # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means epoch_hours <= bin_center (closer to birth)
+        # "From τ to birth" means the time window [0, τ] hours before birth
+        # This requires checking epochs with: epoch_hours <= bin_center (at τ or closer to birth)
         detected_positive = 0
         for guid in available_positive_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
@@ -1571,8 +1573,10 @@ def compute_committed_overall_metrics(
         bin_center = (bin_start + bin_end) / 2
 
         # Get GUIDs with data available at time τ (bin_center)
-        # (epoch_hours is hours before birth, so <= means closer to birth)
-        available_mask = df['epoch_hours'] <= bin_center
+        # "Available at τ" means: baby was under monitoring at time τ
+        # This requires having data that extends TO τ or BEYOND (further from birth)
+        # So we need: epoch_hours >= bin_center
+        available_mask = df['epoch_hours'] >= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
         # Split available GUIDs by target
@@ -1583,7 +1587,8 @@ def compute_committed_overall_metrics(
         n_available_negative = len(available_negative_guids)
 
         # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means epoch_hours <= bin_center (closer to birth)
+        # "From τ to birth" means the time window [0, τ] hours before birth
+        # This requires checking epochs with: epoch_hours <= bin_center (at τ or closer to birth)
         detected_positive = 0
         for guid in available_positive_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
