@@ -305,12 +305,12 @@ def verify_clinical_decision_rule(df: pd.DataFrame, label: str = "Clinical") -> 
     # Log verification results
     if violations_found == 0:
         logger.info(
-            f"{label}: Clinical decision rule verification PASSED ✓ "
+            f"{label}: Clinical decision rule verification PASSED "
             f"({guids_checked}/{total_guids} GUIDs checked, 0 violations)"
         )
     else:
         logger.error(
-            f"{label}: Clinical decision rule verification FAILED ✗ "
+            f"{label}: Clinical decision rule verification FAILED "
             f"({violations_found}/{guids_checked} GUIDs with violations)"
         )
 
@@ -328,38 +328,3 @@ def verify_clinical_decision_rule(df: pd.DataFrame, label: str = "Clinical") -> 
             f"{label}: Clinical decision rule verification failed with {violations_found} violations. "
             f"Forward-filling may not be applied correctly."
         )
-
-
-def validate_fold_config(config: dict) -> None:
-    """
-    Validate fold configuration before training/evaluation.
-
-    Checks for required configuration keys and validates dataset paths exist.
-
-    Args:
-        config: Configuration dictionary
-
-    Raises:
-        ValueError: If required configuration is missing or invalid
-    """
-    required_keys = [
-        ('dataset_config', 'classifier_train_datasets'),
-        ('dataset_config', 'classifier_val_datasets'),
-        ('dataset_config', 'classifier_test_datasets'),
-        ('model_config', 'classifier', 'vae_checkpoint'),
-    ]
-
-    for key_path in required_keys:
-        value = config
-        for k in key_path:
-            if k not in value:
-                raise ValueError(f"Missing config key: {'.'.join(key_path)}")
-            value = value[k]
-
-        # Validate dataset paths are non-empty lists
-        if 'datasets' in key_path[-1]:
-            if not isinstance(value, list) or len(value) == 0:
-                raise ValueError(
-                    f"Config key {'.'.join(key_path)} must be non-empty list, "
-                    f"got {type(value).__name__}"
-                )
