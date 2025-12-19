@@ -2743,18 +2743,11 @@ def _run_inference_for_fold(
     # Create model
     model = create_model_from_config(config, device=device)
 
-    # Load checkpoint state
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint['state_dict']
+    # Load checkpoint using proper utility (handles Lightning, compiled, wrapped models)
+    model = load_checkpoint_strict(model, checkpoint_path, map_location=device)
+    if model is None:
+        raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}")
 
-    # Remove 'model.' prefix from keys (LightningModule wraps the model)
-    model_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith('model.'):
-            new_key = key[6:]
-            model_state_dict[new_key] = value
-
-    model.load_state_dict(model_state_dict, strict=True)
     model.eval()
 
     # Get dataset configuration
