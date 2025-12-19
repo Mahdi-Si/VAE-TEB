@@ -2638,6 +2638,10 @@ def main(
 
     logger.info(f"Aggregated results saved to: {aggregated_path}")
 
+    # Generate aggregated plots across folds
+    logger.info("")
+    generate_aggregated_plots(all_fold_results, output_base_dir, len(successful_folds))
+
     # Print summary
     logger.info("")
     logger.info("="*80)
@@ -3090,6 +3094,476 @@ def _aggregate_three_metric_analysis(all_fold_results: List[Dict]) -> Dict:
                 })
 
     return aggregated
+
+
+def _aggregate_dataframes_across_folds(
+    fold_dfs: List[pd.DataFrame],
+    metrics: List[str] = ['sensitivity', 'specificity', 'fpr']
+) -> pd.DataFrame:
+    """
+    Aggregate DataFrames across folds to compute mean, min, max for each time bin.
+
+    Args:
+        fold_dfs: List of DataFrames from different folds (same structure)
+        metrics: List of metric column names to aggregate
+
+    Returns:
+        Aggregated DataFrame with columns:
+            - bin_center
+            - {metric}_mean, {metric}_min, {metric}_max for each metric
+            - n_folds (number of folds contributing to each bin)
+    """
+    if not fold_dfs:
+        return pd.DataFrame()
+
+    # Filter out None and empty DataFrames
+    valid_dfs = [df for df in fold_dfs if df is not None and len(df) > 0]
+    if not valid_dfs:
+        return pd.DataFrame()
+
+    # Get all unique bin_centers across folds
+    all_bins = set()
+    for df in valid_dfs:
+        if 'bin_center' in df.columns:
+            all_bins.update(df['bin_center'].unique())
+
+    if not all_bins:
+        return pd.DataFrame()
+
+    all_bins = sorted(all_bins)
+
+    # Aggregate metrics for each bin
+    aggregated_data = []
+    for bin_center in all_bins:
+        bin_data = {'bin_center': bin_center}
+
+        for metric in metrics:
+            values = []
+            for df in valid_dfs:
+                if metric in df.columns:
+                    bin_rows = df[df['bin_center'] == bin_center]
+                    if len(bin_rows) > 0:
+                        value = bin_rows[metric].iloc[0]
+                        if pd.notna(value):
+                            values.append(value)
+
+            if values:
+                bin_data[f'{metric}_mean'] = np.mean(values)
+                bin_data[f'{metric}_min'] = np.min(values)
+                bin_data[f'{metric}_max'] = np.max(values)
+                bin_data[f'{metric}_std'] = np.std(values)
+                bin_data[f'{metric}_n_folds'] = len(values)
+            else:
+                bin_data[f'{metric}_mean'] = np.nan
+                bin_data[f'{metric}_min'] = np.nan
+                bin_data[f'{metric}_max'] = np.nan
+                bin_data[f'{metric}_std'] = np.nan
+                bin_data[f'{metric}_n_folds'] = 0
+
+        aggregated_data.append(bin_data)
+
+    return pd.DataFrame(aggregated_data)
+
+
+def plot_aggregated_metric_type(
+    aggregated_df: pd.DataFrame,
+    metric_type: str,
+    output_dir: Path,
+    n_folds: int
+):
+    """
+    Plot aggregated metrics for a single metric type with min/max error bands.
+
+    Generates 4 plots:
+    1. Sensitivity vs time with min/max band
+    2. Sensitivity + Specificity vs time with bands
+    3. Sensitivity + FPR vs time with bands
+    4. All metrics vs time with bands
+
+    Args:
+        aggregated_df: Aggregated DataFrame with mean, min, max columns
+        metric_type: 'instantaneous', 'committed_cumulative', or 'committed_overall'
+        output_dir: Directory to save plots
+        n_folds: Number of folds used in aggregation
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(aggregated_df) == 0:
+        logger.warning(f"No data to plot for aggregated {metric_type}")
+        return
+
+    # Filter to non-NaN bins
+    valid_df = aggregated_df[aggregated_df['sensitivity_mean'].notna()].copy()
+    if len(valid_df) == 0:
+        logger.warning(f"No valid data to plot for aggregated {metric_type}")
+        return
+
+    # Sort by bin_center (descending for plotting - far from birth to birth)
+    valid_df = valid_df.sort_values('bin_center', ascending=False)
+
+    metric_type_title = {
+        'instantaneous': 'Instantaneous',
+        'committed_cumulative': 'Committed (Cumulative)',
+        'committed_overall': 'Committed (Overall - PRIMARY)'
+    }.get(metric_type, metric_type)
+
+    # Plot 1: Sensitivity vs Time
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-', linewidth=2.5, label='Mean Sensitivity')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue', label='Min-Max Range')
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Sensitivity', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity vs Time\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 2: Sensitivity + Specificity
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-', linewidth=2.5, label='Mean Sensitivity')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue')
+
+    if 'specificity_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+                'g-', linewidth=2.5, label='Mean Specificity')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['specificity_min'],
+                         valid_df['specificity_max'],
+                         alpha=0.3, color='green')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity & Specificity\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_specificity_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 3: Sensitivity + FPR
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-', linewidth=2.5, label='Mean Sensitivity')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue')
+
+    if 'fpr_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+                'r-', linewidth=2.5, label='Mean FPR')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['fpr_min'],
+                         valid_df['fpr_max'],
+                         alpha=0.3, color='red')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity & FPR\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_fpr_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 4: All metrics
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-', linewidth=2.5, label='Mean Sensitivity')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.2, color='blue')
+
+    if 'specificity_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+                'g-', linewidth=2.5, label='Mean Specificity')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['specificity_min'],
+                         valid_df['specificity_max'],
+                         alpha=0.2, color='green')
+
+    if 'fpr_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+                'r-', linewidth=2.5, label='Mean FPR')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['fpr_min'],
+                         valid_df['fpr_max'],
+                         alpha=0.2, color='red')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - All Metrics\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'all_metrics_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"  Saved 4 aggregated plots for {metric_type} to {output_dir}")
+
+
+def plot_aggregated_subgroup_comparison(
+    subgroup_dfs: Dict[str, pd.DataFrame],
+    subgroup_names: List[str],
+    output_path: Path,
+    title: str,
+    n_folds: int,
+    metric: str = 'sensitivity'
+):
+    """
+    Plot aggregated subgroup comparison with min/max bands.
+
+    Args:
+        subgroup_dfs: Dict mapping subgroup name to aggregated DataFrame
+        subgroup_names: List of subgroup names to plot
+        output_path: Path to save plot
+        title: Plot title
+        n_folds: Number of folds
+        metric: Metric to plot ('sensitivity' or 'specificity')
+    """
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(subgroup_names)))
+
+    for i, name in enumerate(subgroup_names):
+        df = subgroup_dfs.get(name)
+        if df is None or len(df) == 0:
+            continue
+
+        mean_col = f'{metric}_mean'
+        min_col = f'{metric}_min'
+        max_col = f'{metric}_max'
+
+        if mean_col not in df.columns:
+            continue
+
+        valid_df = df[df[mean_col].notna()].sort_values('bin_center', ascending=False)
+        if len(valid_df) == 0:
+            continue
+
+        ax.plot(valid_df['bin_center'], valid_df[mean_col],
+                linewidth=2.5, label=name, color=colors[i])
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df[min_col],
+                         valid_df[max_col],
+                         alpha=0.2, color=colors[i])
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    metric_label = metric.capitalize()
+    ax.set_ylabel(metric_label, fontsize=14, fontweight='bold')
+    ax.set_title(f'{title}\n(Aggregated across {n_folds} folds)', fontsize=16, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"  Saved aggregated subgroup plot: {output_path.name}")
+
+
+def generate_aggregated_plots(
+    all_fold_results: List[Dict],
+    output_base_dir: Path,
+    n_folds: int
+):
+    """
+    Generate aggregated plots across all folds for all three metric types and subgroups.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+        output_base_dir: Base output directory
+        n_folds: Total number of folds
+    """
+    logger.info("="*80)
+    logger.info("GENERATING AGGREGATED PLOTS ACROSS FOLDS")
+    logger.info("="*80)
+
+    aggregated_dir = output_base_dir / "aggregated_plots"
+    aggregated_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract three_metric_analysis from each fold
+    fold_analyses = [
+        r.get('three_metric_analysis', {})
+        for r in all_fold_results
+        if r.get('three_metric_analysis')
+    ]
+
+    if not fold_analyses:
+        logger.warning("No three_metric_analysis data found in fold results")
+        return
+
+    # Aggregate and plot each metric type
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        logger.info(f"Aggregating and plotting {metric_type}...")
+
+        # Extract DataFrames for this metric type across folds
+        fold_dfs = []
+        for fold_analysis in fold_analyses:
+            metrics_dict = fold_analysis.get('metrics_dict', {})
+            df = metrics_dict.get(metric_type)
+            if df is not None:
+                fold_dfs.append(df)
+
+        if fold_dfs:
+            # Aggregate DataFrames
+            aggregated_df = _aggregate_dataframes_across_folds(fold_dfs)
+
+            # Plot aggregated metrics
+            metric_output_dir = aggregated_dir / metric_type
+            plot_aggregated_metric_type(aggregated_df, metric_type, metric_output_dir, n_folds)
+        else:
+            logger.warning(f"  No data found for {metric_type}")
+
+    # Aggregate and plot subgroups for each metric type
+    logger.info("Aggregating and plotting subgroups...")
+
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        logger.info(f"  Processing {metric_type} subgroups...")
+
+        # Get all subgroup names across folds
+        all_subgroup_names = set()
+        for fold_analysis in fold_analyses:
+            subgroup_metrics = fold_analysis.get('subgroup_metrics', {})
+            metric_subgroups = subgroup_metrics.get(metric_type, {})
+            all_subgroup_names.update(metric_subgroups.keys())
+
+        if not all_subgroup_names:
+            logger.warning(f"    No subgroups found for {metric_type}")
+            continue
+
+        # Aggregate each subgroup
+        aggregated_subgroups = {}
+        for subgroup_name in all_subgroup_names:
+            fold_subgroup_dfs = []
+            for fold_analysis in fold_analyses:
+                subgroup_metrics = fold_analysis.get('subgroup_metrics', {})
+                metric_subgroups = subgroup_metrics.get(metric_type, {})
+                subgroup_df = metric_subgroups.get(subgroup_name)
+                if subgroup_df is not None:
+                    fold_subgroup_dfs.append(subgroup_df)
+
+            if fold_subgroup_dfs:
+                aggregated_df = _aggregate_dataframes_across_folds(fold_subgroup_dfs)
+                aggregated_subgroups[subgroup_name] = aggregated_df
+
+        # Create subgroup comparison plots
+        subgroup_output_dir = aggregated_dir / metric_type / "subgroups"
+        subgroup_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Diagnosis comparison
+        diagnosis_subgroups = ['healthy', 'acidosis', 'hie', 'unhealthy']
+        available_diagnosis = [s for s in diagnosis_subgroups if s in aggregated_subgroups]
+        if available_diagnosis:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_diagnosis,
+                subgroup_output_dir / 'diagnosis_comparison_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Diagnosis Comparison',
+                n_folds
+            )
+
+        # Unhealthy CS stratification
+        unhealthy_cs = ['unhealthy_cs_pos', 'unhealthy_cs_neg']
+        available_unhealthy_cs = [s for s in unhealthy_cs if s in aggregated_subgroups]
+        if available_unhealthy_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_unhealthy_cs,
+                subgroup_output_dir / 'unhealthy_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Unhealthy: CS Stratification',
+                n_folds
+            )
+
+        # HIE CS stratification
+        hie_cs = ['hie_cs_pos', 'hie_cs_neg']
+        available_hie_cs = [s for s in hie_cs if s in aggregated_subgroups]
+        if available_hie_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_hie_cs,
+                subgroup_output_dir / 'hie_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - HIE: CS Stratification',
+                n_folds
+            )
+
+        # Acidosis CS stratification
+        acidosis_cs = ['acidosis_cs_pos', 'acidosis_cs_neg']
+        available_acidosis_cs = [s for s in acidosis_cs if s in aggregated_subgroups]
+        if available_acidosis_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_cs,
+                subgroup_output_dir / 'acidosis_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: CS Stratification',
+                n_folds
+            )
+
+        # Acidosis BG stratification
+        acidosis_bg = ['acidosis_bg_pos', 'acidosis_bg_neg']
+        available_acidosis_bg = [s for s in acidosis_bg if s in aggregated_subgroups]
+        if available_acidosis_bg:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_bg,
+                subgroup_output_dir / 'acidosis_bg_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: BG Stratification',
+                n_folds
+            )
+
+        # Healthy CS stratification (use specificity instead of sensitivity)
+        healthy_cs = ['healthy_cs_pos', 'healthy_cs_neg']
+        available_healthy_cs = [s for s in healthy_cs if s in aggregated_subgroups]
+        if available_healthy_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_cs,
+                subgroup_output_dir / 'healthy_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: CS Stratification',
+                n_folds,
+                metric='specificity'
+            )
+
+        # Healthy BG stratification (use specificity)
+        healthy_bg = ['healthy_bg_pos', 'healthy_bg_neg']
+        available_healthy_bg = [s for s in healthy_bg if s in aggregated_subgroups]
+        if available_healthy_bg:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg,
+                subgroup_output_dir / 'healthy_bg_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG Stratification',
+                n_folds,
+                metric='specificity'
+            )
+
+        # Healthy BG×CS combinations (use specificity)
+        healthy_bg_cs = ['healthy_bg_pos_cs_pos', 'healthy_bg_pos_cs_neg',
+                         'healthy_bg_neg_cs_pos', 'healthy_bg_neg_cs_neg']
+        available_healthy_bg_cs = [s for s in healthy_bg_cs if s in aggregated_subgroups]
+        if available_healthy_bg_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg_cs,
+                subgroup_output_dir / 'healthy_bg_cs_combinations_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG×CS Combinations',
+                n_folds,
+                metric='specificity'
+            )
+
+    logger.info(f"Aggregated plots saved to: {aggregated_dir}")
+    logger.info("="*80)
 
 
 if __name__ == '__main__':
