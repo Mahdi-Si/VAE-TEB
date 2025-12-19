@@ -1421,10 +1421,17 @@ def compute_committed_cumulative_metrics(
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # Get GUIDs with data available at time τ (bin_center)
-        # "Available at τ" means: baby was under monitoring at time τ
-        # This requires having data that extends TO τ or BEYOND (further from birth)
-        # So we need: epoch_hours >= bin_center
+        # COMMITTED CUMULATIVE: Denominator is "cases available/monitored at time τ"
+        # This means: babies that have data extending to τ or beyond (further from birth)
+        # Clinically: "Which babies were under active monitoring at time τ?"
+        # Implementation: epoch_hours >= bin_center
+        #
+        # As τ increases (further from birth):
+        #   - Fewer babies were monitored that far back → denominator DECREASES
+        #   - Detection window [0, τ] expands → numerator may increase or decrease
+        #   - Sensitivity trend depends on the interplay of these factors
+        #
+        # This is fundamentally different from committed_overall which has a FIXED denominator.
         available_mask = df['epoch_hours'] >= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
@@ -1448,19 +1455,17 @@ def compute_committed_cumulative_metrics(
         n_positive_available = len(available_positive_guids)
         n_negative_available = len(available_negative_guids)
 
-        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means the time window [0, τ] hours before birth
-        # This requires checking epochs with: epoch_hours <= bin_center (at τ or closer to birth)
+        # For each GUID being monitored at τ, check if detected in window [0, τ]
         detected_positive = 0
         for guid in available_positive_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in available_negative_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] <= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
         # Compute metrics
