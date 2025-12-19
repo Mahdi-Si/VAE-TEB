@@ -2482,13 +2482,163 @@ def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
 # MAIN FUNCTION - Post-Training Evaluation Pipeline
 # ============================================================================
 
+def aggregate_existing_results(
+    output_base_dir: str,
+    regenerate_from_predictions: bool = False,
+    exclude_last_minutes: float = 30.0
+):
+    """
+    Generate aggregated plots from existing fold results without re-running evaluation.
+
+    This function loads existing fold_results.json files and generates aggregated plots.
+    If the fold results don't contain three_metric_results_full, it can optionally
+    regenerate them from the saved prediction CSV files.
+
+    Args:
+        output_base_dir: Base directory containing fold_1, fold_2, ..., fold_N
+        regenerate_from_predictions: If True, regenerate metrics from prediction CSVs
+                                    when three_metric_results_full is missing
+        exclude_last_minutes: Exclude last N minutes before birth (default: 30.0)
+
+    Returns:
+        Dictionary with aggregation status
+
+    Example:
+        # Simple aggregation from existing results
+        aggregate_existing_results(
+            "/path/to/kfold_results"
+        )
+
+        # Regenerate metrics from predictions if needed
+        aggregate_existing_results(
+            "/path/to/kfold_results",
+            regenerate_from_predictions=True
+        )
+    """
+    output_base_dir = Path(output_base_dir)
+
+    if not output_base_dir.exists():
+        raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
+
+    logger.info("="*80)
+    logger.info("AGGREGATING EXISTING FOLD RESULTS")
+    logger.info("="*80)
+    logger.info(f"Output base directory: {output_base_dir}")
+    logger.info(f"Regenerate from predictions: {regenerate_from_predictions}")
+    logger.info("="*80)
+
+    # Find all fold directories
+    fold_dirs = sorted(
+        [d for d in output_base_dir.iterdir() if d.is_dir() and d.name.startswith('fold_')],
+        key=lambda x: int(x.name.split('_')[1])
+    )
+
+    if not fold_dirs:
+        raise FileNotFoundError(f"No fold directories found in {output_base_dir}")
+
+    logger.info(f"Found {len(fold_dirs)} fold directories")
+
+    # Load existing fold results
+    all_fold_results = []
+    loaded_folds = []
+    missing_data_folds = []
+
+    for fold_dir in fold_dirs:
+        fold_id = int(fold_dir.name.split('_')[1])
+        results_path = fold_dir / "fold_results.json"
+
+        if not results_path.exists():
+            logger.warning(f"Fold {fold_id}: No fold_results.json found, skipping")
+            continue
+
+        with open(results_path, 'r') as f:
+            fold_results = json.load(f)
+
+        # Check if three_metric_results_full exists
+        if 'three_metric_results_full' in fold_results and fold_results['three_metric_results_full']:
+            all_fold_results.append(fold_results)
+            loaded_folds.append(fold_id)
+            logger.info(f"Fold {fold_id}: Loaded three_metric_results_full")
+
+        elif regenerate_from_predictions:
+            # Regenerate from prediction CSVs
+            logger.info(f"Fold {fold_id}: Regenerating metrics from predictions...")
+
+            evaluation_dir = fold_dir / "evaluation"
+            test_clinical_path = evaluation_dir / "test_predictions_clinical.csv"
+
+            if not test_clinical_path.exists():
+                logger.warning(f"Fold {fold_id}: No test_predictions_clinical.csv found, skipping")
+                missing_data_folds.append(fold_id)
+                continue
+
+            # Load predictions
+            test_df = pd.read_csv(test_clinical_path)
+
+            # Regenerate three metric type analysis
+            three_metric_results = generate_three_metric_type_analysis(
+                test_df,
+                output_base_dir=evaluation_dir,
+                exclude_last_minutes=exclude_last_minutes,
+                title_suffix=f"Fold {fold_id}"
+            )
+
+            # Add to fold results
+            fold_results['three_metric_results_full'] = three_metric_results
+            all_fold_results.append(fold_results)
+            loaded_folds.append(fold_id)
+            logger.info(f"Fold {fold_id}: Regenerated and loaded")
+
+        else:
+            logger.warning(f"Fold {fold_id}: No three_metric_results_full found. " +
+                          "Use regenerate_from_predictions=True to regenerate.")
+            missing_data_folds.append(fold_id)
+
+    if not all_fold_results:
+        logger.error("No fold results with three_metric_results_full found!")
+        return {
+            'status': 'failed',
+            'loaded_folds': loaded_folds,
+            'missing_data_folds': missing_data_folds,
+            'n_loaded': 0,
+            'n_missing': len(missing_data_folds)
+        }
+
+    logger.info("")
+    logger.info(f"Successfully loaded {len(all_fold_results)} folds: {loaded_folds}")
+    if missing_data_folds:
+        logger.warning(f"Missing data for {len(missing_data_folds)} folds: {missing_data_folds}")
+
+    # Generate aggregated plots
+    logger.info("")
+    generate_aggregated_plots(all_fold_results, output_base_dir, len(all_fold_results))
+
+    logger.info("")
+    logger.info("="*80)
+    logger.info("AGGREGATION COMPLETE")
+    logger.info("="*80)
+    logger.info(f"Loaded folds: {len(loaded_folds)} {loaded_folds}")
+    logger.info(f"Missing data: {len(missing_data_folds)} {missing_data_folds}")
+    logger.info(f"Aggregated plots saved to: {output_base_dir / 'aggregated_plots'}")
+    logger.info("="*80)
+
+    return {
+        'status': 'success',
+        'loaded_folds': loaded_folds,
+        'missing_data_folds': missing_data_folds,
+        'n_loaded': len(loaded_folds),
+        'n_missing': len(missing_data_folds)
+    }
+
+
 def main(
     output_base_dir: str,
     target_fpr: float = 0.15,
     device: str = 'cuda:0',
     exclude_last_minutes: float = 30.0,
     max_gap_multiplier: Optional[float] = None,
-    regenerate_predictions: bool = False
+    regenerate_predictions: bool = False,
+    aggregate_only: bool = False
 ):
     """
     Run evaluation pipeline on all completed folds.
@@ -2509,6 +2659,8 @@ def main(
                           (default: None = use config or auto-detect)
         regenerate_predictions: If True, regenerate predictions even if cached
                                predictions exist (default: False)
+        aggregate_only: If True, skip evaluation and only generate aggregated plots
+                       from existing fold results (default: False)
 
     Returns:
         Dictionary with aggregated results across all folds
@@ -2554,6 +2706,14 @@ def main(
     if not output_base_dir.exists():
         raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
 
+    # If aggregate_only mode, delegate to aggregate_existing_results
+    if aggregate_only:
+        return aggregate_existing_results(
+            output_base_dir=str(output_base_dir),
+            regenerate_from_predictions=True,
+            exclude_last_minutes=exclude_last_minutes
+        )
+
     logger.info("="*80)
     logger.info("POST-TRAINING EVALUATION PIPELINE")
     logger.info("="*80)
@@ -2562,6 +2722,7 @@ def main(
     logger.info(f"Device: {device}")
     logger.info(f"Exclude last minutes: {exclude_last_minutes}")
     logger.info(f"Regenerate predictions: {regenerate_predictions}")
+    logger.info(f"Aggregate only: {aggregate_only}")
     logger.info("="*80)
 
     # Find all fold directories (fold_1, fold_2, ..., fold_N)
@@ -2833,14 +2994,41 @@ def _evaluate_single_fold(
         'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
         'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
         'status': 'success',
-        # Include full three metric type analysis (including all subgroups)
-        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {}
+        # Include full three metric type analysis (summary only - DataFrames saved separately)
+        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {},
+        # Store full results including DataFrames for aggregated plotting
+        'three_metric_results_full': three_metric_results if three_metric_results else {}
     }
 
     # Save fold results
     results_path = fold_dir / "fold_results.json"
+
+    # Convert DataFrames to dict for JSON serialization
+    fold_results_json = fold_results.copy()
+    if 'three_metric_results_full' in fold_results_json and fold_results_json['three_metric_results_full']:
+        three_metric_full = fold_results_json['three_metric_results_full'].copy()
+
+        # Convert metrics_dict DataFrames to dicts
+        if 'metrics_dict' in three_metric_full:
+            three_metric_full['metrics_dict'] = {
+                k: v.to_dict('records') if v is not None else None
+                for k, v in three_metric_full['metrics_dict'].items()
+            }
+
+        # Convert subgroup_metrics DataFrames to dicts
+        if 'subgroup_metrics' in three_metric_full:
+            three_metric_full['subgroup_metrics'] = {
+                metric_type: {
+                    subgroup: df.to_dict('records') if df is not None else None
+                    for subgroup, df in subgroups.items()
+                }
+                for metric_type, subgroups in three_metric_full['subgroup_metrics'].items()
+            }
+
+        fold_results_json['three_metric_results_full'] = three_metric_full
+
     with open(results_path, 'w') as f:
-        json.dump(fold_results, f, indent=2)
+        json.dump(fold_results_json, f, indent=2)
 
     logger.info(f"Fold {fold_id}: Results saved to {results_path}")
 
@@ -3401,15 +3589,39 @@ def generate_aggregated_plots(
     aggregated_dir = output_base_dir / "aggregated_plots"
     aggregated_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract three_metric_analysis from each fold
-    fold_analyses = [
-        r.get('three_metric_analysis', {})
-        for r in all_fold_results
-        if r.get('three_metric_analysis')
-    ]
+    # Extract three_metric_results_full from each fold and reconstruct DataFrames
+    fold_analyses = []
+    for r in all_fold_results:
+        three_metric_full = r.get('three_metric_results_full', {})
+        if not three_metric_full:
+            continue
+
+        # Reconstruct DataFrames from dicts
+        reconstructed = {}
+
+        # Reconstruct metrics_dict
+        if 'metrics_dict' in three_metric_full:
+            reconstructed['metrics_dict'] = {
+                k: pd.DataFrame(v) if v is not None else None
+                for k, v in three_metric_full['metrics_dict'].items()
+            }
+
+        # Reconstruct subgroup_metrics
+        if 'subgroup_metrics' in three_metric_full:
+            reconstructed['subgroup_metrics'] = {
+                metric_type: {
+                    subgroup: pd.DataFrame(df_dict) if df_dict is not None else None
+                    for subgroup, df_dict in subgroups.items()
+                }
+                for metric_type, subgroups in three_metric_full['subgroup_metrics'].items()
+            }
+
+        if reconstructed:
+            fold_analyses.append(reconstructed)
 
     if not fold_analyses:
-        logger.warning("No three_metric_analysis data found in fold results")
+        logger.warning("No three_metric_results_full data found in fold results. " +
+                      "Please re-run evaluation to generate plots, or use aggregate_existing_results().")
         return
 
     # Aggregate and plot each metric type
@@ -3575,15 +3787,42 @@ if __name__ == '__main__':
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     EXCLUDE_LAST_MINUTES = 30.0  # Exclude last 30 minutes before birth
     REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
+    AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots from existing results
 
-    # Run evaluation pipeline
-    results = main(
-        output_base_dir=OUTPUT_BASE_DIR,
-        target_fpr=TARGET_FPR,
-        device=DEVICE,
-        exclude_last_minutes=EXCLUDE_LAST_MINUTES,
-        regenerate_predictions=REGENERATE_PREDICTIONS
-    )
+    # ============================================================================
+    # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
+    # ============================================================================
+    if not AGGREGATE_ONLY:
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            target_fpr=TARGET_FPR,
+            device=DEVICE,
+            exclude_last_minutes=EXCLUDE_LAST_MINUTES,
+            regenerate_predictions=REGENERATE_PREDICTIONS,
+            aggregate_only=False
+        )
+        print("\nEvaluation pipeline completed!")
+        print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
 
-    print("\nEvaluation pipeline completed!")
-    print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+    # ============================================================================
+    # MODE 2: Aggregate Only (generate aggregated plots from existing results)
+    # ============================================================================
+    else:
+        # Option A: Use main() with aggregate_only=True
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            aggregate_only=True,
+            exclude_last_minutes=EXCLUDE_LAST_MINUTES,
+            aggregate_only=True
+        )
+
+        # Option B: Use aggregate_existing_results() directly
+        # results = aggregate_existing_results(
+        #     output_base_dir=OUTPUT_BASE_DIR,
+        #     regenerate_from_predictions=True,
+        #     exclude_last_minutes=EXCLUDE_LAST_MINUTES
+        # )
+
+        print("\nAggregation completed!")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
