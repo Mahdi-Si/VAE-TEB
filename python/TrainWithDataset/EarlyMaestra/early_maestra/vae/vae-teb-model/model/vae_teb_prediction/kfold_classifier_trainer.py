@@ -329,56 +329,173 @@ def train_single_fold(
             else:
                 mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(path_obj))
 
+# NEW Clean Evaluation Implementation for kfold_classifier_trainer.py
+# Replace lines 332-493 with this code
+
         # --------------------------------------------------------------------
-        # POST-TRAINING EVALUATION
+        # POST-TRAINING EVALUATION - NEW Implementation
         # --------------------------------------------------------------------
         logger.info(f"Fold {fold_id}: Starting post-training evaluation...")
 
-        from model.vae_teb_prediction.evaluate_classifier import evaluate_fold
+        from model.vae_teb_prediction.evaluate_classifier import (
+            run_inference,
+            find_threshold_for_committed_overall_fpr_at_1h,
+            apply_clinical_decision_rule,
+            fill_missing_epochs,
+            generate_three_metric_type_analysis,
+        )
+        import pandas as pd
+        from pathlib import Path
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        
-        eval_results = evaluate_fold(
-            model=graph_model.pytorch_model,
-            fold_dir=str(fold_output_dir),
-            config_path=str(fold_config_path),
-            checkpoint_path=best_ckpt_path,
-            target_fpr=kwargs.get('target_fpr', 0.15),  # Default 15% FPR
-            device=device
+        evaluation_dir = fold_output_dir / "evaluation"
+        evaluation_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get evaluation config
+        eval_cfg = config.get('model_config', {}).get('classifier', {}).get('evaluation', {}) or {}
+        target_fpr = float(kwargs.get('target_fpr', 0.15))  # Default 15% FPR
+        exclude_last_minutes = float(eval_cfg.get('exclude_last_minutes', 30.0))
+        max_gap_multiplier = eval_cfg.get('max_gap_multiplier', None)
+
+        # --------------------------------------------------------------------
+        # VALIDATION SET INFERENCE
+        # --------------------------------------------------------------------
+        logger.info(f"Fold {fold_id}: Running validation inference...")
+        val_df_raw = run_inference(graph_model.pytorch_model, val_dataloader, device)
+        val_df_raw.to_csv(evaluation_dir / "validation_predictions_raw.csv", index=False)
+        logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
+
+        # --------------------------------------------------------------------
+        # FIND PRIMARY THRESHOLD (committed_overall @ 1h)
+        # --------------------------------------------------------------------
+        logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr})...")
+        primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
+            val_df_raw,
+            target_fpr=target_fpr,
+            time_window_hours=1.0,
+            fallback_tolerance_hours=0.5
         )
+        logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
+        logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
+        logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
+        logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
+
+        # Apply clinical decision rule to validation set
+        val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
+        val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
+        val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
+
+        # --------------------------------------------------------------------
+        # TEST SET INFERENCE
+        # --------------------------------------------------------------------
+        logger.info(f"Fold {fold_id}: Running test inference...")
+
+        # Create test dataloader
+        test_dataloader = create_optimized_dataloader(
+            hdf5_files=fold_datasets['test'],
+            batch_size=config['general_config']['batch_size']['test'],
+            num_workers=dataloader_config.get('num_workers', 4),
+            shuffle=False,
+            stats_path=stat_path,
+            normalize_fields=normalized_fields,
+            pin_memory=True,
+            rank=0,
+            world_size=1,
+            **dataset_kwargs
+        )
+
+        test_df_raw = run_inference(graph_model.pytorch_model, test_dataloader, device)
+        test_df_raw.to_csv(evaluation_dir / "test_predictions_raw.csv", index=False)
+        logger.info(f"Fold {fold_id}: Test predictions saved ({len(test_df_raw)} rows)")
+
+        # Apply clinical decision rule to test set
+        test_df_clinical = apply_clinical_decision_rule(test_df_raw.copy(), primary_threshold)
+        test_df_clinical = fill_missing_epochs(test_df_clinical, max_gap_multiplier=max_gap_multiplier)
+        test_df_clinical.to_csv(evaluation_dir / "test_predictions_clinical.csv", index=False)
+
+        # --------------------------------------------------------------------
+        # GENERATE THREE METRIC TYPE ANALYSIS
+        # --------------------------------------------------------------------
+        logger.info(f"Fold {fold_id}: Generating three metric type analysis...")
+        try:
+            three_metric_results = generate_three_metric_type_analysis(
+                test_df_clinical,
+                output_base_dir=evaluation_dir,
+                exclude_last_minutes=exclude_last_minutes,
+                title_suffix=f"Fold {fold_id}"
+            )
+            logger.info(f"Fold {fold_id}: Three metric type analysis complete")
+
+            # Log the three metric type directory to MLflow
+            three_metric_dir = evaluation_dir / "three_metric_types"
+            if three_metric_dir.exists():
+                _log_mlflow_artifact(three_metric_dir, is_dir=True)
+
+        except Exception as e:
+            logger.warning(f"Fold {fold_id}: Three metric type analysis failed: {e}")
+            three_metric_results = {}
+
+        # --------------------------------------------------------------------
+        # COMPUTE TEST METRICS (Simple binary classification metrics)
+        # --------------------------------------------------------------------
+        # Extract PRIMARY metric (committed_overall) from three metric type results
+        primary_metrics = {}
+        if three_metric_results and 'summary' in three_metric_results:
+            primary_summary = three_metric_results['summary'].get('metric_types', {}).get('committed_overall', {})
+            primary_metrics = {
+                'test_sensitivity_mean': primary_summary.get('sensitivity_mean', 0.0),
+                'test_sensitivity_std': primary_summary.get('sensitivity_std', 0.0),
+                'test_specificity_mean': primary_summary.get('specificity_mean', 0.0),
+                'test_specificity_std': primary_summary.get('specificity_std', 0.0),
+                'test_fpr_mean': primary_summary.get('fpr_mean', 0.0),
+                'test_fpr_std': primary_summary.get('fpr_std', 0.0),
+            }
+
+        # Save threshold and metrics info
+        threshold_info = {
+            'primary_threshold': float(primary_threshold),
+            'target_fpr': float(target_fpr),
+            'validation_metrics': {
+                'sensitivity': float(threshold_metrics.get('sensitivity', 0)),
+                'specificity': float(threshold_metrics.get('specificity', 0)),
+                'fpr': float(threshold_metrics.get('fpr', 0)),
+                'accuracy': float(threshold_metrics.get('accuracy', 0)),
+                'time_window_hours': float(threshold_metrics.get('time_window_hours', 1.0)),
+            },
+            'test_metrics_primary': primary_metrics,
+        }
+
+        # Save threshold info
+        with open(evaluation_dir / "threshold_info.json", 'w') as f:
+            json.dump(threshold_info, f, indent=2)
 
         logger.info(f"Fold {fold_id}: Evaluation completed")
 
-        threshold_info = eval_results.get('threshold_info', {})
-        epoch_threshold_info = threshold_info.get('epoch_level', {})
-        guid_threshold_info = threshold_info.get('guid_level', {})
-
-        test_results = eval_results.get('test_results', {})
-        test_epoch_metrics = test_results.get('epoch_level', {}).get('epoch_metrics', {})
-        test_guid_metrics = test_results.get('guid_level', {}).get('guid_metrics', {})
-
+        # --------------------------------------------------------------------
+        # RESULTS DICTIONARY (NEW metrics only)
+        # --------------------------------------------------------------------
         results = {
             'fold_id': fold_id,
             'gpu_id': gpu_id,
             'training_time_minutes': training_time,
             'best_val_accuracy_training': float(best_val_acc),
             'best_val_loss_training': float(best_val_loss),
-            'epoch_threshold': epoch_threshold_info.get('threshold'),
-            'guid_threshold': guid_threshold_info.get('threshold'),
-            'validation_accuracy_epoch': epoch_threshold_info.get('accuracy'),
-            'validation_sensitivity_epoch': epoch_threshold_info.get('sensitivity'),
-            'validation_specificity_epoch': epoch_threshold_info.get('specificity'),
-            'validation_accuracy_guid': guid_threshold_info.get('accuracy'),
-            'validation_sensitivity_guid': guid_threshold_info.get('sensitivity'),
-            'validation_specificity_guid': guid_threshold_info.get('specificity'),
-            'test_accuracy_epoch': test_epoch_metrics.get('accuracy'),
-            'test_sensitivity_epoch': test_epoch_metrics.get('sensitivity'),
-            'test_specificity_epoch': test_epoch_metrics.get('specificity'),
-            'test_fpr_epoch': test_epoch_metrics.get('fpr'),
-            'test_accuracy_guid': test_guid_metrics.get('accuracy'),
-            'test_sensitivity_guid': test_guid_metrics.get('sensitivity'),
-            'test_specificity_guid': test_guid_metrics.get('specificity'),
-            'test_fpr_guid': test_guid_metrics.get('fpr'),
+
+            # PRIMARY threshold and validation metrics
+            'primary_threshold': float(primary_threshold),
+            'validation_sensitivity': float(threshold_metrics.get('sensitivity', 0)),
+            'validation_specificity': float(threshold_metrics.get('specificity', 0)),
+            'validation_fpr': float(threshold_metrics.get('fpr', 0)),
+            'validation_accuracy': float(threshold_metrics.get('accuracy', 0)),
+
+            # Test metrics (PRIMARY - committed_overall)
+            'test_sensitivity_mean': primary_metrics.get('test_sensitivity_mean', 0.0),
+            'test_sensitivity_std': primary_metrics.get('test_sensitivity_std', 0.0),
+            'test_specificity_mean': primary_metrics.get('test_specificity_mean', 0.0),
+            'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
+            'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
+            'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
+
             'status': 'success'
         }
 
@@ -386,64 +503,51 @@ def train_single_fold(
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
 
-        fmt = lambda v: f"{float(v):.4f}" if v is not None else "nan"
-
+        # Log summary
         logger.info(f"Fold {fold_id} summary:")
         logger.info(f"  Training val_acc: {best_val_acc:.4f}, val_loss: {best_val_loss:.4f}")
-        logger.info(
-            f"  Epoch threshold: {results['epoch_threshold']}, "
-            f"Guid threshold: {results['guid_threshold']}"
-        )
-        logger.info(
-            "  Test accuracy (epoch/guid): "
-            f"{fmt(results['test_accuracy_epoch'])} / {fmt(results['test_accuracy_guid'])}"
-        )
-        logger.info(
-            "  Test sensitivity (epoch/guid): "
-            f"{fmt(results['test_sensitivity_epoch'])} / {fmt(results['test_sensitivity_guid'])}"
-        )
-        logger.info(
-            "  Test specificity (epoch/guid): "
-            f"{fmt(results['test_specificity_epoch'])} / {fmt(results['test_specificity_guid'])}"
-        )
+        logger.info(f"  PRIMARY threshold: {results['primary_threshold']:.4f}")
+        logger.info(f"  Validation sensitivity: {results['validation_sensitivity']:.3f}, specificity: {results['validation_specificity']:.3f}")
+        logger.info(f"  Test sensitivity: {results['test_sensitivity_mean']:.3f} ± {results['test_sensitivity_std']:.3f}")
+        logger.info(f"  Test specificity: {results['test_specificity_mean']:.3f} ± {results['test_specificity_std']:.3f}")
+        logger.info(f"  Test FPR: {results['test_fpr_mean']:.3f} ± {results['test_fpr_std']:.3f}")
 
+        # Log metrics to MLflow
         _log_mlflow_metrics(
             {
                 "train/training_time_minutes": training_time,
                 "val/best_accuracy": best_val_acc,
                 "val/best_loss": best_val_loss,
-            },
-            step=getattr(trainer, "global_step", None),
-        )
-        _log_mlflow_metrics(
-            {
-                "eval/epoch_threshold": results['epoch_threshold'],
-                "eval/guid_threshold": results['guid_threshold'],
-                "eval/val_accuracy_epoch": results['validation_accuracy_epoch'],
-                "eval/val_sensitivity_epoch": results['validation_sensitivity_epoch'],
-                "eval/val_specificity_epoch": results['validation_specificity_epoch'],
-                "eval/val_accuracy_guid": results['validation_accuracy_guid'],
-                "eval/val_sensitivity_guid": results['validation_sensitivity_guid'],
-                "eval/val_specificity_guid": results['validation_specificity_guid'],
-                "eval/test_accuracy_epoch": results['test_accuracy_epoch'],
-                "eval/test_sensitivity_epoch": results['test_sensitivity_epoch'],
-                "eval/test_specificity_epoch": results['test_specificity_epoch'],
-                "eval/test_fpr_epoch": results['test_fpr_epoch'],
-                "eval/test_accuracy_guid": results['test_accuracy_guid'],
-                "eval/test_sensitivity_guid": results['test_sensitivity_guid'],
-                "eval/test_specificity_guid": results['test_specificity_guid'],
-                "eval/test_fpr_guid": results['test_fpr_guid'],
+                "eval/primary_threshold": results['primary_threshold'],
+                "eval/validation_sensitivity": results['validation_sensitivity'],
+                "eval/validation_specificity": results['validation_specificity'],
+                "eval/validation_fpr": results['validation_fpr'],
+                "eval/test_sensitivity_mean": results['test_sensitivity_mean'],
+                "eval/test_specificity_mean": results['test_specificity_mean'],
+                "eval/test_fpr_mean": results['test_fpr_mean'],
             },
             step=getattr(trainer, "global_step", None),
         )
 
+        # Log artifacts to MLflow
         _log_mlflow_artifact(fold_config_path)
         _log_mlflow_artifact(results_path)
         if best_ckpt_path:
             _log_mlflow_artifact(best_ckpt_path)
-        evaluation_dir = fold_output_dir / "evaluation"
         if evaluation_dir.exists():
             _log_mlflow_artifact(evaluation_dir, is_dir=True)
+
+        # Explicit cleanup to prevent memory accumulation
+        try:
+            del train_dataloader, val_dataloader, test_dataloader
+            del graph_model, trainer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            logger.info(f"Fold {fold_id}: Memory cleanup completed")
+        except Exception as e_cleanup:
+            logger.warning(f"Fold {fold_id}: Cleanup warning: {e_cleanup}")
 
         # Explicit cleanup to prevent memory accumulation
         try:
@@ -601,30 +705,15 @@ def run_kfold_parallel(
         avg_val_acc_train = sum(r['best_val_accuracy_training'] for r in successful_folds) / n
         std_val_acc_train = (sum((r['best_val_accuracy_training'] - avg_val_acc_train) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        # Test metrics
-        avg_test_acc = sum(r.get('test_accuracy_epoch', 0.0) for r in successful_folds) / n
-        std_test_acc = (
-            (sum((r.get('test_accuracy_epoch', 0.0) - avg_test_acc) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
-            if n > 1 else 0.0
-        )
+        # Test metrics (PRIMARY - committed_overall averaged across folds)
+        avg_test_sens = sum(r.get('test_sensitivity_mean', 0.0) for r in successful_folds) / n
+        std_test_sens = (sum((r.get('test_sensitivity_mean', 0.0) - avg_test_sens) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        avg_test_sens = sum(r.get('test_sensitivity_epoch', 0.0) for r in successful_folds) / n
-        std_test_sens = (
-            (sum((r.get('test_sensitivity_epoch', 0.0) - avg_test_sens) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
-            if n > 1 else 0.0
-        )
+        avg_test_spec = sum(r.get('test_specificity_mean', 0.0) for r in successful_folds) / n
+        std_test_spec = (sum((r.get('test_specificity_mean', 0.0) - avg_test_spec) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
-        avg_test_spec = sum(r.get('test_specificity_epoch', 0.0) for r in successful_folds) / n
-        std_test_spec = (
-            (sum((r.get('test_specificity_epoch', 0.0) - avg_test_spec) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
-            if n > 1 else 0.0
-        )
-
-        avg_test_fpr = sum(r.get('test_fpr_epoch', 0.0) for r in successful_folds) / n
-        std_test_fpr = (
-            (sum((r.get('test_fpr_epoch', 0.0) - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5
-            if n > 1 else 0.0
-        )
+        avg_test_fpr = sum(r.get('test_fpr_mean', 0.0) for r in successful_folds) / n
+        std_test_fpr = (sum((r.get('test_fpr_mean', 0.0) - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
         summary = {
             'configured_num_folds': num_folds,
@@ -635,9 +724,7 @@ def run_kfold_parallel(
                 'mean_val_accuracy': avg_val_acc_train,
                 'std_val_accuracy': std_val_acc_train,
             },
-            'test_metrics': {
-                'mean_accuracy': avg_test_acc,
-                'std_accuracy': std_test_acc,
+            'test_metrics_primary': {
                 'mean_sensitivity': avg_test_sens,
                 'std_sensitivity': std_test_sens,
                 'mean_specificity': avg_test_spec,
@@ -674,8 +761,6 @@ def run_kfold_parallel(
                     "summary/failed_folds": requested_fold_count - len(successful_folds),
                     "summary/mean_val_accuracy": avg_val_acc_train,
                     "summary/std_val_accuracy": std_val_acc_train,
-                    "summary/mean_test_accuracy": avg_test_acc,
-                    "summary/std_test_accuracy": std_test_acc,
                     "summary/mean_test_sensitivity": avg_test_sens,
                     "summary/std_test_sensitivity": std_test_sens,
                     "summary/mean_test_specificity": avg_test_spec,
@@ -701,10 +786,9 @@ def run_kfold_parallel(
         logger.info("Training Metrics:")
         logger.info(f"  Mean validation accuracy: {avg_val_acc_train:.4f} ± {std_val_acc_train:.4f}")
         logger.info("")
-        logger.info("Test Metrics (with threshold):")
-        logger.info(f"  Mean accuracy: {avg_test_acc:.4f} ± {std_test_acc:.4f}")
-        logger.info(f"  Mean sensitivity (TPR): {avg_test_sens:.4f} ± {std_test_sens:.4f}")
-        logger.info(f"  Mean specificity (TNR): {avg_test_spec:.4f} ± {std_test_spec:.4f}")
+        logger.info("Test Metrics (PRIMARY - committed_overall):")
+        logger.info(f"  Mean sensitivity: {avg_test_sens:.4f} ± {std_test_sens:.4f}")
+        logger.info(f"  Mean specificity: {avg_test_spec:.4f} ± {std_test_spec:.4f}")
         logger.info(f"  Mean FPR: {avg_test_fpr:.4f} ± {std_test_fpr:.4f}")
         logger.info("=" * 80)
 
@@ -714,38 +798,12 @@ def run_kfold_parallel(
         if len(completed_fold_ids) > 0:
             logger.info("")
             logger.info("=" * 80)
-            logger.info("RUNNING SUBGROUP AGGREGATION ACROSS FOLDS")
+            logger.info("CROSS-FOLD AGGREGATION")
             logger.info("=" * 80)
-            logger.info(f"Aggregating {len(completed_fold_ids)} completed folds: {completed_fold_ids}")
-
-            try:
-                from model.vae_teb_prediction.evaluate_classifier import run_subgroup_aggregation
-
-                run_subgroup_aggregation(
-                    kfold_results_dir=output_base_dir,
-                    num_folds=num_folds,
-                    completed_fold_ids=completed_fold_ids  # NEW: Pass actual completed folds
-                )
-
-                logger.info("Subgroup aggregation completed successfully!")
-            except Exception as e:
-                import traceback
-                logger.exception("Subgroup aggregation failed:")
-                logger.warning("K-fold results are still valid, but aggregated subgroup analysis is missing")
-
+            logger.info(f"Completed folds: {completed_fold_ids}")
+            logger.info("Note: Cross-fold aggregation for three metric types will be implemented in future update")
+            logger.info("Individual fold results are available in each fold's 'three_metric_types' directory")
             logger.info("=" * 80)
-
-            if summary_logger:
-                aggregated_dir = Path(output_base_dir) / "aggregated"
-                if aggregated_dir.exists():
-                    summary_logger.experiment.log_artifacts(
-                        summary_logger.run_id, str(aggregated_dir)
-                    )
-                subgroup_dir = Path(output_base_dir) / "aggregated_analysis"
-                if subgroup_dir.exists():
-                    summary_logger.experiment.log_artifacts(
-                        summary_logger.run_id, str(subgroup_dir)
-                    )
         else:
             logger.warning("No successful folds to aggregate")
 
