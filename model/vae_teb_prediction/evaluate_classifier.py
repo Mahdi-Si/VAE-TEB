@@ -398,7 +398,9 @@ def apply_clinical_decision_rule(
 def fill_missing_epochs(
     df: pd.DataFrame,
     max_gap_multiplier: Optional[float] = None,
-    log_summary: bool = True
+    log_summary: bool = True,
+    fill_until_birth: bool = False,
+    birth_epoch_seconds: float = 0.0
 ) -> pd.DataFrame:
     """
     Fill missing epochs for each GUID using forward-filling strategy.
@@ -407,6 +409,8 @@ def fill_missing_epochs(
         df: Predictions dataframe with clinical decision rule applied
         max_gap_multiplier: If provided, only fill gaps <= multiplier * typical_interval.
                            If None, fill all missing epochs within each GUID range.
+        fill_until_birth: If True, extend each GUID to birth_epoch_seconds using forward-fill.
+        birth_epoch_seconds: Epoch value (seconds before birth) treated as birth (default 0.0).
 
     Returns:
         Complete dataframe with all epochs (filled + original)
@@ -440,13 +444,19 @@ def fill_missing_epochs(
         # Identify missing epochs
         min_epoch = epochs.min()
         max_epoch = epochs.max()
+        fill_end_epoch = max_epoch
+        if fill_until_birth:
+            fill_end_epoch = max(fill_end_epoch, birth_epoch_seconds)
 
         # FIX #7: Use np.arange with explicit step instead of linspace
         # This ensures spacing equals typical_interval exactly
-        expected_epochs = np.arange(min_epoch, max_epoch + typical_interval/2, typical_interval)
+        expected_epochs = np.arange(min_epoch, fill_end_epoch + typical_interval/2, typical_interval)
 
         # Round to avoid floating point issues
         expected_epochs = np.round(expected_epochs, 1)
+        if fill_until_birth:
+            birth_epoch = float(np.round(birth_epoch_seconds, 1))
+            expected_epochs = np.unique(np.append(expected_epochs, birth_epoch))
         existing_epochs_set = set(np.round(epochs, 1))
 
         # Find missing epochs (only fill gaps <= max_gap)
@@ -551,6 +561,36 @@ def fill_missing_epochs(
     return result_df
 
 
+def ensure_committed_epochs_filled(
+    df: pd.DataFrame,
+    birth_epoch_seconds: float = 0.0
+) -> pd.DataFrame:
+    """
+    Ensure committed-metric inputs include forward-filled epochs up to birth.
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    if 'guid' not in df.columns or 'epoch' not in df.columns:
+        return df
+
+    needs_fill = 'is_filled' not in df.columns
+    max_by_guid = df.groupby('guid')['epoch'].max()
+    if len(max_by_guid) > 0 and max_by_guid.min() < birth_epoch_seconds - 1e-6:
+        needs_fill = True
+
+    if not needs_fill:
+        return df
+
+    return fill_missing_epochs(
+        df,
+        max_gap_multiplier=None,
+        log_summary=False,
+        fill_until_birth=True,
+        birth_epoch_seconds=birth_epoch_seconds
+    )
+
+
 def find_threshold_for_instantaneous_fpr_at_1h(
     val_df: pd.DataFrame,
     target_fpr: float = 0.05,
@@ -582,13 +622,8 @@ def find_threshold_for_instantaneous_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time (ascending)
-    bin_width = 0.5  # 30 minutes
-    time_bins = np.array([
-        max(0, time_window_hours - bin_width),
-        time_window_hours,
-        time_window_hours + bin_width
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -707,13 +742,8 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time (ascending)
-    bin_width = 0.5
-    time_bins = np.array([
-        max(0, time_window_hours - bin_width),
-        time_window_hours,
-        time_window_hours + bin_width
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -739,7 +769,7 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
 
         # Apply threshold and clinical decision rule
         df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
-        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier=None, log_summary=False, fill_until_birth=True)
 
         # Compute committed cumulative metrics
         cumulative_df = compute_committed_cumulative_metrics(df_clinical, time_bins, subgroup_filter=None)
@@ -834,13 +864,8 @@ def find_threshold_for_committed_overall_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time (ascending)
-    bin_width = 0.5
-    time_bins = np.array([
-        max(0, time_window_hours - bin_width),
-        time_window_hours,
-        time_window_hours + bin_width
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -866,7 +891,7 @@ def find_threshold_for_committed_overall_fpr_at_1h(
 
         # Apply threshold and clinical decision rule
         df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
-        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier=None, log_summary=False, fill_until_birth=True)
 
         # Compute committed overall metrics (PRIMARY)
         overall_df = compute_committed_overall_metrics(df_clinical, time_bins, subgroup_filter=None)
@@ -944,15 +969,18 @@ def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> n
         Array of time bin edges in hours (positive values: 0.5 = 30min before birth, 6 = 6h before birth)
     """
     df_bins = df.copy()
+    df_interval = df_bins
     if 'is_filled' in df_bins.columns:
-        df_bins = df_bins[df_bins['is_filled'] == False]  # noqa: E712
+        df_interval = df_bins[df_bins['is_filled'] == False]  # noqa: E712
 
     # Ensure epoch_hours exists (positive hours before birth)
+    df_interval = ensure_epoch_hours(df_interval)
     df_bins = ensure_epoch_hours(df_bins)
 
     # Infer bin size from typical epoch interval (fallback to 20 minutes if inference fails)
-    inferred_seconds = infer_epoch_interval_seconds(df_bins)
+    inferred_seconds = infer_epoch_interval_seconds(df_interval)
     bin_size_hours = (inferred_seconds / 3600.0) if inferred_seconds > 0 else (1.0 / 3.0)
+    bin_size_hours = round(bin_size_hours * 60) / 60.0
 
     # Convert exclusion from minutes to hours
     exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
@@ -1409,6 +1437,8 @@ def compute_committed_cumulative_metrics(
         logger.warning("compute_committed_cumulative_metrics: Empty dataframe after subgroup filter")
         return pd.DataFrame()
 
+    df = ensure_committed_epochs_filled(df)
+
     # Ensure required columns
     df = ensure_epoch_hours(df.copy())
 
@@ -1556,6 +1586,8 @@ def compute_committed_overall_metrics(
     if len(df) == 0:
         logger.warning("compute_committed_overall_metrics: Empty dataframe after subgroup filter")
         return pd.DataFrame()
+
+    df = ensure_committed_epochs_filled(df)
 
     # Ensure required columns
     df = ensure_epoch_hours(df.copy())
@@ -2343,7 +2375,8 @@ def generate_three_metric_type_analysis(
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute time bins
-    time_bins = compute_time_bins(df, exclude_last_minutes=exclude_last_minutes)
+    df_bins = ensure_committed_epochs_filled(df)
+    time_bins = compute_time_bins(df_bins, exclude_last_minutes=exclude_last_minutes)
     logger.info(f"Time bins: {len(time_bins)-1} bins from {time_bins[0]:.1f}h to {time_bins[-1]:.1f}h")
 
     # Step 1: Generate plots for all three metric types
