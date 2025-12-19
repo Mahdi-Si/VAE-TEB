@@ -398,7 +398,9 @@ def apply_clinical_decision_rule(
 def fill_missing_epochs(
     df: pd.DataFrame,
     max_gap_multiplier: Optional[float] = None,
-    log_summary: bool = True
+    log_summary: bool = True,
+    fill_until_birth: bool = False,
+    birth_epoch_seconds: float = 0.0
 ) -> pd.DataFrame:
     """
     Fill missing epochs for each GUID using forward-filling strategy.
@@ -407,6 +409,8 @@ def fill_missing_epochs(
         df: Predictions dataframe with clinical decision rule applied
         max_gap_multiplier: If provided, only fill gaps <= multiplier * typical_interval.
                            If None, fill all missing epochs within each GUID range.
+        fill_until_birth: If True, extend each GUID to birth_epoch_seconds using forward-fill.
+        birth_epoch_seconds: Epoch value (seconds before birth) treated as birth (default 0.0).
 
     Returns:
         Complete dataframe with all epochs (filled + original)
@@ -440,13 +444,19 @@ def fill_missing_epochs(
         # Identify missing epochs
         min_epoch = epochs.min()
         max_epoch = epochs.max()
+        fill_end_epoch = max_epoch
+        if fill_until_birth:
+            fill_end_epoch = max(fill_end_epoch, birth_epoch_seconds)
 
         # FIX #7: Use np.arange with explicit step instead of linspace
         # This ensures spacing equals typical_interval exactly
-        expected_epochs = np.arange(min_epoch, max_epoch + typical_interval/2, typical_interval)
+        expected_epochs = np.arange(min_epoch, fill_end_epoch + typical_interval/2, typical_interval)
 
         # Round to avoid floating point issues
         expected_epochs = np.round(expected_epochs, 1)
+        if fill_until_birth:
+            birth_epoch = float(np.round(birth_epoch_seconds, 1))
+            expected_epochs = np.unique(np.append(expected_epochs, birth_epoch))
         existing_epochs_set = set(np.round(epochs, 1))
 
         # Find missing epochs (only fill gaps <= max_gap)
@@ -551,6 +561,36 @@ def fill_missing_epochs(
     return result_df
 
 
+def ensure_committed_epochs_filled(
+    df: pd.DataFrame,
+    birth_epoch_seconds: float = 0.0
+) -> pd.DataFrame:
+    """
+    Ensure committed-metric inputs include forward-filled epochs up to birth.
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    if 'guid' not in df.columns or 'epoch' not in df.columns:
+        return df
+
+    needs_fill = 'is_filled' not in df.columns
+    max_by_guid = df.groupby('guid')['epoch'].max()
+    if len(max_by_guid) > 0 and max_by_guid.min() < birth_epoch_seconds - 1e-6:
+        needs_fill = True
+
+    if not needs_fill:
+        return df
+
+    return fill_missing_epochs(
+        df,
+        max_gap_multiplier=None,
+        log_summary=False,
+        fill_until_birth=True,
+        birth_epoch_seconds=birth_epoch_seconds
+    )
+
+
 def find_threshold_for_instantaneous_fpr_at_1h(
     val_df: pd.DataFrame,
     target_fpr: float = 0.05,
@@ -582,13 +622,8 @@ def find_threshold_for_instantaneous_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
-    bin_width = 0.5  # 30 minutes
-    time_bins = np.array([
-        time_window_hours + bin_width,
-        time_window_hours,
-        max(0, time_window_hours - bin_width)
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -707,13 +742,8 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
-    bin_width = 0.5
-    time_bins = np.array([
-        time_window_hours + bin_width,
-        time_window_hours,
-        max(0, time_window_hours - bin_width)
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -739,7 +769,7 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
 
         # Apply threshold and clinical decision rule
         df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
-        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier=None, log_summary=False, fill_until_birth=True)
 
         # Compute committed cumulative metrics
         cumulative_df = compute_committed_cumulative_metrics(df_clinical, time_bins, subgroup_filter=None)
@@ -834,13 +864,8 @@ def find_threshold_for_committed_overall_fpr_at_1h(
 
     val_df = ensure_epoch_hours(val_df.copy())
 
-    # Create time bins around target time
-    bin_width = 0.5
-    time_bins = np.array([
-        time_window_hours + bin_width,
-        time_window_hours,
-        max(0, time_window_hours - bin_width)
-    ])
+    # Create time bins aligned to the actual epoch grid
+    time_bins = compute_time_bins(val_df, exclude_last_minutes=0.0)
 
     probs = val_df['prob_class_1'].dropna().values.astype(float)
     if len(probs) == 0:
@@ -866,7 +891,7 @@ def find_threshold_for_committed_overall_fpr_at_1h(
 
         # Apply threshold and clinical decision rule
         df_clinical = apply_clinical_decision_rule(val_df, thresh, verify=False)
-        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier, log_summary=False)
+        df_clinical = fill_missing_epochs(df_clinical, max_gap_multiplier=None, log_summary=False, fill_until_birth=True)
 
         # Compute committed overall metrics (PRIMARY)
         overall_df = compute_committed_overall_metrics(df_clinical, time_bins, subgroup_filter=None)
@@ -944,15 +969,18 @@ def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> n
         Array of time bin edges in hours (positive values: 0.5 = 30min before birth, 6 = 6h before birth)
     """
     df_bins = df.copy()
+    df_interval = df_bins
     if 'is_filled' in df_bins.columns:
-        df_bins = df_bins[df_bins['is_filled'] == False]  # noqa: E712
+        df_interval = df_bins[df_bins['is_filled'] == False]  # noqa: E712
 
     # Ensure epoch_hours exists (positive hours before birth)
+    df_interval = ensure_epoch_hours(df_interval)
     df_bins = ensure_epoch_hours(df_bins)
 
     # Infer bin size from typical epoch interval (fallback to 20 minutes if inference fails)
-    inferred_seconds = infer_epoch_interval_seconds(df_bins)
+    inferred_seconds = infer_epoch_interval_seconds(df_interval)
     bin_size_hours = (inferred_seconds / 3600.0) if inferred_seconds > 0 else (1.0 / 3.0)
+    bin_size_hours = round(bin_size_hours * 60) / 60.0
 
     # Convert exclusion from minutes to hours
     exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
@@ -1372,7 +1400,7 @@ def compute_committed_cumulative_metrics(
 
     For each time bin center τ:
     - Get GUIDs with data available at time τ: epoch_hours >= τ
-    - For each GUID, check if detected (any epoch with clinical_pred=1 from τ to birth)
+    - For each GUID, check if detected using epochs at/earlier than τ (epoch_hours >= τ)
     - Sensitivity(τ) = TP(t≤τ) / P(t≤τ)
     - FPR(τ) = FP(t≤τ) / N(t≤τ)
 
@@ -1383,7 +1411,7 @@ def compute_committed_cumulative_metrics(
     - N(t≤τ) = total healthy GUIDs available at time τ
 
     The denominator CHANGES as we approach birth (more GUIDs have data).
-    This metric is monotonically non-decreasing.
+    Sensitivity can move up or down depending on who becomes available.
 
     Args:
         df: DataFrame with columns ['guid', 'epoch_hours', 'binary_target', 'clinical_pred']
@@ -1409,6 +1437,8 @@ def compute_committed_cumulative_metrics(
         logger.warning("compute_committed_cumulative_metrics: Empty dataframe after subgroup filter")
         return pd.DataFrame()
 
+    df = ensure_committed_epochs_filled(df)
+
     # Ensure required columns
     df = ensure_epoch_hours(df.copy())
 
@@ -1421,8 +1451,16 @@ def compute_committed_cumulative_metrics(
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # Get GUIDs with data available at time τ (bin_center)
-        # Available means they have at least one epoch with epoch_hours >= bin_center
+        # COMMITTED CUMULATIVE: Denominator is "cases available/monitored at time tau"
+        # This means: babies that have data extending to tau or beyond (further from birth).
+        # Implementation: epoch_hours >= bin_center
+        #
+        # As tau decreases (closer to birth):
+        #   - More babies have data -> denominator increases
+        #   - Detection window [tau, max] expands -> numerator can increase
+        #   - Sensitivity can move in either direction as new GUIDs appear
+        #
+        # This is fundamentally different from committed_overall which has a FIXED denominator.
         available_mask = df['epoch_hours'] >= bin_center
         available_guids = df[available_mask]['guid'].unique()
 
@@ -1446,18 +1484,17 @@ def compute_committed_cumulative_metrics(
         n_positive_available = len(available_positive_guids)
         n_negative_available = len(available_negative_guids)
 
-        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
-        # "From τ to birth" means epoch_hours >= bin_center
+        # For each GUID being monitored at tau, check if detected using epochs at/earlier than tau.
         detected_positive = 0
         for guid in available_positive_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
         for guid in available_negative_guids:
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
 
         # Compute metrics
@@ -1478,19 +1515,22 @@ def compute_committed_cumulative_metrics(
 
     result_df = pd.DataFrame(results)
 
+    # Sort by bin_center in DESCENDING order (far from birth -> near birth)
+    result_df = result_df.sort_values('bin_center', ascending=False).reset_index(drop=True)
+
     logger.info(
         f"compute_committed_cumulative_metrics: Computed metrics for {len(result_df)} time bins "
         f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
 
-    # Verify monotonicity
+    # Sensitivity is not guaranteed to be monotonic with a changing denominator.
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
         if violations > 0:
-            logger.warning(f"⚠️  Committed cumulative sensitivity has {violations} monotonicity violations!")
+            logger.debug(f"Committed cumulative sensitivity decreases in {violations} bins (expected with changing denominator)")
         else:
-            logger.info("✓ Committed cumulative sensitivity is monotonically non-decreasing")
+            logger.debug("Committed cumulative sensitivity is non-decreasing across bins")
 
     return result_df
 
@@ -1505,7 +1545,7 @@ def compute_committed_overall_metrics(
 
     For each time bin center τ:
     - Get ALL GUIDs in dataset: P(t≤0) and N(t≤0) are FIXED
-    - For GUIDs with data at time τ, check if detected (any clinical_pred=1 from τ to birth)
+    - For GUIDs with data at time tau, check if detected using epochs at/earlier than tau (epoch_hours >= tau)
     - Sensitivity(τ) = TP(t≤τ) / P(t≤0)
     - FPR(τ) = FP(t≤τ) / N(t≤0)
 
@@ -1547,6 +1587,8 @@ def compute_committed_overall_metrics(
         logger.warning("compute_committed_overall_metrics: Empty dataframe after subgroup filter")
         return pd.DataFrame()
 
+    df = ensure_committed_epochs_filled(df)
+
     # Ensure required columns
     df = ensure_epoch_hours(df.copy())
 
@@ -1569,29 +1611,38 @@ def compute_committed_overall_metrics(
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # Get GUIDs with data available at time τ (bin_center)
-        available_mask = df['epoch_hours'] >= bin_center
-        available_guids = df[available_mask]['guid'].unique()
+        # DEBUG: Log bin info
+        logger.info(f"  [BIN {i}] bin_center={bin_center:.2f}h, range=[{bin_start:.2f}, {bin_end:.2f})")
 
-        # Split available GUIDs by target
-        available_positive_guids = [g for g in available_guids if g in all_positive_guids]
-        available_negative_guids = [g for g in available_guids if g in all_negative_guids]
+        # For COMMITTED OVERALL with FIXED denominator:
+        # We check ALL positive/negative GUIDs to see if they were detected using epochs at/earlier than tau.
+        # We DON'T restrict to "available" GUIDs because once detected, they should stay detected
+        # at all smaller tau values (closer to birth) (monotonicity requirement)
 
-        n_available_positive = len(available_positive_guids)
-        n_available_negative = len(available_negative_guids)
-
-        # For each available GUID, check if detected (any clinical_pred=1 from τ to birth)
+        # Count detections for ALL positive GUIDs (not just those with data at τ)
         detected_positive = 0
-        for guid in available_positive_guids:
+        for guid in all_positive_guids:
+            # Check if this GUID has ANY epoch with clinical_pred=1 with epoch_hours >= tau
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_positive += 1
 
         detected_negative = 0
-        for guid in available_negative_guids:
+        for guid in all_negative_guids:
+            # Check if this GUID has ANY epoch with clinical_pred=1 with epoch_hours >= tau
             guid_data = df[(df['guid'] == guid) & (df['epoch_hours'] >= bin_center)]
-            if (guid_data['clinical_pred'] == 1).any():
+            if len(guid_data) > 0 and (guid_data['clinical_pred'] == 1).any():
                 detected_negative += 1
+
+        # For reporting: also track how many GUIDs have data extending to τ
+        available_mask = df['epoch_hours'] >= bin_center
+        available_guids = df[available_mask]['guid'].unique()
+        n_available_positive = len([g for g in available_guids if g in all_positive_guids])
+        n_available_negative = len([g for g in available_guids if g in all_negative_guids])
+
+        logger.info(f"  [BIN {i}] GUIDs with data at τ (epoch_hours >= {bin_center:.2f}): {n_available_positive} positive, {n_available_negative} negative")
+        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 where epoch_hours >= {bin_center:.2f}): {detected_positive}/{n_positive_total} positive")
+        logger.info(f"  [BIN {i}] Sensitivity = {detected_positive} / {n_positive_total} = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
 
         # Compute metrics with FIXED denominator
         sensitivity = detected_positive / n_positive_total if n_positive_total > 0 else np.nan
@@ -1613,12 +1664,18 @@ def compute_committed_overall_metrics(
 
     result_df = pd.DataFrame(results)
 
+    # Sort by bin_center in DESCENDING order (far from birth -> near birth)
+    # This aligns monotonicity checks with approaching birth (tau decreasing)
+    result_df = result_df.sort_values('bin_center', ascending=False).reset_index(drop=True)
+
     logger.info(
         f"compute_committed_overall_metrics: Computed PRIMARY METRIC for {len(result_df)} time bins "
         f"({result_df['sensitivity'].notna().sum()} non-NaN bins)"
     )
 
     # Verify monotonicity (CRITICAL for primary metric)
+    # After sorting, bins go from large tau to small tau (far->near from birth)
+    # Sensitivity should be non-decreasing as we approach birth
     valid_sens = result_df['sensitivity'].dropna()
     if len(valid_sens) > 1:
         violations = (valid_sens.diff() < -1e-6).sum()
@@ -1628,10 +1685,12 @@ def compute_committed_overall_metrics(
             for idx in range(1, len(result_df)):
                 prev_sens = result_df.iloc[idx - 1]['sensitivity']
                 curr_sens = result_df.iloc[idx]['sensitivity']
+                prev_time = result_df.iloc[idx - 1]['bin_center']
+                curr_time = result_df.iloc[idx]['bin_center']
                 if pd.notna(prev_sens) and pd.notna(curr_sens) and curr_sens < prev_sens - 1e-6:
                     logger.error(
-                        f"  Bin {idx} ({result_df.iloc[idx]['bin_center']:.1f}h): "
-                        f"Sensitivity decreased from {prev_sens:.4f} to {curr_sens:.4f}"
+                        f"  Bin {idx} (τ={curr_time:.1f}h): "
+                        f"Sensitivity decreased from {prev_sens:.4f} (at τ={prev_time:.1f}h) to {curr_sens:.4f}"
                     )
         else:
             logger.info("✓ PRIMARY METRIC: Committed overall sensitivity is monotonically non-decreasing")
@@ -2140,7 +2199,13 @@ def _plot_healthy_subgroups(
     output_dir: Path,
     title_suffix: str
 ) -> None:
-    """Plot healthy subgroup stratifications (CS, BG, and combinations)."""
+    """
+    Plot healthy subgroup stratifications (CS, BG, and combinations).
+
+    NOTE: For healthy subgroups (all negative cases), we plot SPECIFICITY instead of
+    sensitivity, since sensitivity is undefined (no positive cases to detect).
+    Specificity shows how well we correctly identify healthy patients as healthy.
+    """
     import matplotlib.pyplot as plt
 
     # Healthy by CS
@@ -2153,16 +2218,17 @@ def _plot_healthy_subgroups(
 
         for group in available_cs:
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = 'CS Positive' if 'pos' in group else 'CS Negative'
                 color = colors['pos'] if 'pos' in group else colors['neg']
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=color, markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy by CS Status - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
@@ -2186,16 +2252,17 @@ def _plot_healthy_subgroups(
 
         for group in available_bg:
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = 'BG Positive' if 'pos' in group else 'BG Negative'
                 color = colors['pos'] if 'pos' in group else colors['neg']
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=color, markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy by BG Status - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
@@ -2220,15 +2287,16 @@ def _plot_healthy_subgroups(
 
         for i, group in enumerate(available_combo):
             df = subgroup_metrics[group]
-            valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
+            # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
+            valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
                 label = group.replace('healthy_', '').replace('_', ' ').upper()
-                ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
+                ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=colors[i % len(colors)], markersize=6)
 
         ax.set_xlabel('Hours Before Birth', fontsize=13)
-        ax.set_ylabel('Sensitivity', fontsize=13)
+        ax.set_ylabel('Specificity (Correctly Identified as Healthy)', fontsize=13)
         title = f'Healthy BG×CS Combinations - {metric_type.replace("_", " ").title()}'
         if title_suffix:
             title += f' ({title_suffix})'
@@ -2260,7 +2328,7 @@ def generate_three_metric_type_analysis(
     1. Three separate thresholds (instantaneous, committed_cumulative, committed_overall)
     2. Plots for each metric type
     3. Metric type comparison plots
-    4. Subgroup analysis for committed_overall (PRIMARY)
+    4. Subgroup analysis for ALL THREE metric types
     5. Saves all metrics as JSON
 
     Directory structure:
@@ -2269,9 +2337,17 @@ def generate_three_metric_type_analysis(
             instantaneous/
                 sensitivity_vs_time.png
                 ...
+                subgroups/
+                    diagnosis_comparison.png
+                    ...
             committed_cumulative/
+                sensitivity_vs_time.png
                 ...
+                subgroups/
+                    diagnosis_comparison.png
+                    ...
             committed_overall/  # PRIMARY
+                sensitivity_vs_time.png
                 ...
                 subgroups/
                     diagnosis_comparison.png
@@ -2288,7 +2364,8 @@ def generate_three_metric_type_analysis(
         title_suffix: Suffix for plot titles
 
     Returns:
-        Dictionary with thresholds and metrics for all three types
+        Dictionary with thresholds and metrics for all three types, including
+        subgroup analysis for each metric type
     """
     logger.info("=" * 80)
     logger.info("THREE METRIC TYPE ANALYSIS - NEW PIPELINE")
@@ -2298,7 +2375,8 @@ def generate_three_metric_type_analysis(
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
     # Compute time bins
-    time_bins = compute_time_bins(df, exclude_last_minutes=exclude_last_minutes)
+    df_bins = ensure_committed_epochs_filled(df)
+    time_bins = compute_time_bins(df_bins, exclude_last_minutes=exclude_last_minutes)
     logger.info(f"Time bins: {len(time_bins)-1} bins from {time_bins[0]:.1f}h to {time_bins[-1]:.1f}h")
 
     # Step 1: Generate plots for all three metric types
@@ -2310,15 +2388,38 @@ def generate_three_metric_type_analysis(
     comparison_dir = analysis_dir / "comparison"
     plot_metric_type_comparison(metrics_dict, comparison_dir, title_suffix)
 
-    # Step 3: Generate subgroup analysis for PRIMARY metric (committed_overall)
-    logger.info("Generating subgroup analysis for committed_overall (PRIMARY)...")
+    # Step 3: Generate subgroup analysis for ALL THREE metric types
+    logger.info("Generating subgroup analysis for all three metric types...")
     subgroup_filters = create_enhanced_subgroup_filters()
-    subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
 
-    subgroup_metrics = plot_subgroup_analysis(
-        df, time_bins, 'committed_overall',
-        subgroup_filters, subgroup_dir, title_suffix
+    all_subgroup_metrics = {}
+
+    # Subgroup analysis for instantaneous
+    logger.info("  - Instantaneous metric subgroups...")
+    instantaneous_subgroup_dir = analysis_dir / "instantaneous" / "subgroups"
+    instantaneous_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'instantaneous',
+        subgroup_filters, instantaneous_subgroup_dir, title_suffix
     )
+    all_subgroup_metrics['instantaneous'] = instantaneous_subgroups
+
+    # Subgroup analysis for committed_cumulative
+    logger.info("  - Committed cumulative metric subgroups...")
+    cumulative_subgroup_dir = analysis_dir / "committed_cumulative" / "subgroups"
+    cumulative_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'committed_cumulative',
+        subgroup_filters, cumulative_subgroup_dir, title_suffix
+    )
+    all_subgroup_metrics['committed_cumulative'] = cumulative_subgroups
+
+    # Subgroup analysis for committed_overall (PRIMARY)
+    logger.info("  - Committed overall metric (PRIMARY) subgroups...")
+    overall_subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
+    overall_subgroups = plot_subgroup_analysis(
+        df, time_bins, 'committed_overall',
+        subgroup_filters, overall_subgroup_dir, title_suffix
+    )
+    all_subgroup_metrics['committed_overall'] = overall_subgroups
 
     # Step 4: Save metrics summary
     summary = {
@@ -2328,8 +2429,18 @@ def generate_three_metric_type_analysis(
             'committed_overall': _summarize_metrics_df(metrics_dict.get('committed_overall'))
         },
         'subgroups': {
-            name: _summarize_metrics_df(df)
-            for name, df in subgroup_metrics.items()
+            'instantaneous': {
+                name: _summarize_metrics_df(df)
+                for name, df in instantaneous_subgroups.items()
+            },
+            'committed_cumulative': {
+                name: _summarize_metrics_df(df)
+                for name, df in cumulative_subgroups.items()
+            },
+            'committed_overall': {
+                name: _summarize_metrics_df(df)
+                for name, df in overall_subgroups.items()
+            }
         }
     }
 
@@ -2341,7 +2452,7 @@ def generate_three_metric_type_analysis(
 
     return {
         'metrics_dict': metrics_dict,
-        'subgroup_metrics': subgroup_metrics,
+        'subgroup_metrics': all_subgroup_metrics,
         'summary': summary
     }
 
@@ -2614,13 +2725,25 @@ def _evaluate_single_fold(
         val_df_raw,
         target_fpr=target_fpr,
         time_window_hours=1.0,
+        max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=0.5
     )
+
+    # Calculate accuracy from sensitivity and specificity (weighted by class prevalence)
+    # Accuracy = (TP + TN) / (TP + FP + TN + FN)
+    # With P = n_positive, N = n_negative:
+    # Accuracy = (sensitivity * P + specificity * N) / (P + N)
+    n_pos = threshold_metrics.get('n_positive_total', threshold_metrics.get('n_available_positive', 1))
+    n_neg = threshold_metrics.get('n_negative_total', threshold_metrics.get('n_available_negative', 1))
+    sens = threshold_metrics.get('sensitivity', 0)
+    spec = threshold_metrics.get('specificity', 0)
+    threshold_metrics['accuracy'] = float((sens * n_pos + spec * n_neg) / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else 0.0
 
     logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
     logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
     logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
     logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
+    logger.info(f"  Validation accuracy: {threshold_metrics.get('accuracy', 0):.3f}")
 
     # Apply clinical decision rule to validation set
     val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
@@ -2705,7 +2828,9 @@ def _evaluate_single_fold(
         'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
         'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
         'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
-        'status': 'success'
+        'status': 'success',
+        # Include full three metric type analysis (including all subgroups)
+        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {}
     }
 
     # Save fold results
@@ -2743,47 +2868,52 @@ def _run_inference_for_fold(
     # Create model
     model = create_model_from_config(config, device=device)
 
-    # Load checkpoint state
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint['state_dict']
+    # Load checkpoint using proper utility (handles Lightning, compiled, wrapped models)
+    model = load_checkpoint_strict(model, checkpoint_path, map_location=device)
+    if model is None:
+        raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}")
 
-    # Remove 'model.' prefix from keys (LightningModule wraps the model)
-    model_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith('model.'):
-            new_key = key[6:]
-            model_state_dict[new_key] = value
-
-    model.load_state_dict(model_state_dict, strict=True)
     model.eval()
 
     # Get dataset configuration
-    fold_datasets = config.get('fold_datasets', {})
-    if split not in fold_datasets:
-        raise ValueError(f"Split '{split}' not found in fold_datasets config")
+    # Note: kfold_classifier_trainer.py saves datasets under dataset_config with specific keys
+    dataset_config = config.get('dataset_config', {})
 
-    hdf5_files = fold_datasets[split]
-
-    # Get dataloader configuration
-    dataloader_config = config.get('general_config', {}).get('dataloader', {})
-    batch_size = config.get('general_config', {}).get('batch_size', {}).get(split, 32)
-
-    # Get normalization configuration
-    stats_path = config.get('general_config', {}).get('stats_path')
-    normalized_fields = config.get('general_config', {}).get('normalized_fields', [])
-
-    # Additional dataset kwargs
-    dataset_config = config.get('model_config', {}).get('dataset', {})
-    dataset_kwargs = {
-        'target_label_name': dataset_config.get('target_label_name', 'target'),
-        'epoch_hour_field': dataset_config.get('epoch_hour_field', 'epoch_hours'),
-        'guid_field': dataset_config.get('guid_field', 'guid'),
-        'max_epochs': dataset_config.get('max_epochs', None),
-        'sequence_fields': dataset_config.get('sequence_fields', []),
-        'pad_sequences': dataset_config.get('pad_sequences', True),
+    # Map split names to config keys
+    split_key_map = {
+        'val': 'classifier_val_datasets',
+        'test': 'classifier_test_datasets',
+        'train': 'classifier_train_datasets'
     }
 
-    # Create dataloader
+    if split not in split_key_map:
+        raise ValueError(f"Invalid split '{split}'. Must be one of: {list(split_key_map.keys())}")
+
+    config_key = split_key_map[split]
+    if config_key not in dataset_config:
+        raise ValueError(
+            f"Config key '{config_key}' not found in dataset_config. "
+            f"Available keys: {list(dataset_config.keys())}"
+        )
+
+    hdf5_files = dataset_config[config_key]
+
+    # Get dataloader configuration (match kfold_classifier_trainer.py structure)
+    dataloader_config = dataset_config.get('dataloader_config', {})
+
+    # Get batch size from general_config
+    # Note: config only has 'train' and 'test' batch sizes, so map 'val' -> 'test'
+    batch_size_key = 'test' if split in ['val', 'test'] else split
+    batch_size = config.get('general_config', {}).get('batch_size', {}).get(batch_size_key, 32)
+
+    # Get normalization configuration
+    stats_path = dataset_config.get('stat_path')
+    normalized_fields = dataloader_config.get('normalize_fields', [])
+
+    # Get dataset kwargs from dataloader_config
+    dataset_kwargs = dataloader_config.get('dataset_kwargs', {})
+
+    # Create dataloader (match kfold_classifier_trainer.py parameters)
     dataloader = create_optimized_dataloader(
         hdf5_files=hdf5_files,
         batch_size=batch_size,
@@ -2834,6 +2964,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
     test_spec = [r['test_specificity_mean'] for r in all_fold_results]
     test_fpr = [r['test_fpr_mean'] for r in all_fold_results]
 
+    # Aggregate three metric type analysis across folds
+    three_metric_aggregated = _aggregate_three_metric_analysis(all_fold_results)
+
     aggregated = {
         'timestamp': datetime.now().isoformat(),
         'n_folds': n,
@@ -2868,9 +3001,93 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
         'test_fpr_min': float(np.min(test_fpr)),
         'test_fpr_max': float(np.max(test_fpr)),
 
-        # Individual fold results
+        # Three metric type analysis (all metrics and subgroups aggregated)
+        'three_metric_analysis_aggregated': three_metric_aggregated,
+
+        # Individual fold results (includes per-fold three metric analysis)
         'fold_results': all_fold_results,
     }
+
+    return aggregated
+
+
+def _aggregate_three_metric_analysis(all_fold_results: List[Dict]) -> Dict:
+    """
+    Aggregate three metric type analysis (including subgroups) across folds.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+
+    Returns:
+        Aggregated three metric analysis with mean/std for all metric types and subgroups
+    """
+    aggregated = {
+        'metric_types': {},
+        'subgroups': {}
+    }
+
+    # Extract three_metric_analysis from each fold
+    fold_analyses = [
+        r.get('three_metric_analysis', {})
+        for r in all_fold_results
+        if r.get('three_metric_analysis')
+    ]
+
+    if not fold_analyses:
+        return aggregated
+
+    # Aggregate main metric types (instantaneous, committed_cumulative, committed_overall)
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        metric_values = {}
+        for fold in fold_analyses:
+            fold_metrics = fold.get('metric_types', {}).get(metric_type, {})
+            for key, value in fold_metrics.items():
+                if isinstance(value, (int, float)):
+                    if key not in metric_values:
+                        metric_values[key] = []
+                    metric_values[key].append(value)
+
+        # Compute mean/std for each metric
+        aggregated['metric_types'][metric_type] = {
+            f'{key}_mean': float(np.mean(values))
+            for key, values in metric_values.items()
+        }
+        aggregated['metric_types'][metric_type].update({
+            f'{key}_std': float(np.std(values))
+            for key, values in metric_values.items()
+        })
+
+    # Aggregate subgroups for each metric type
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        aggregated['subgroups'][metric_type] = {}
+
+        # Get all subgroup names across folds
+        all_subgroup_names = set()
+        for fold in fold_analyses:
+            subgroups = fold.get('subgroups', {}).get(metric_type, {})
+            all_subgroup_names.update(subgroups.keys())
+
+        # Aggregate each subgroup
+        for subgroup_name in all_subgroup_names:
+            subgroup_values = {}
+            for fold in fold_analyses:
+                fold_subgroup = fold.get('subgroups', {}).get(metric_type, {}).get(subgroup_name, {})
+                for key, value in fold_subgroup.items():
+                    if isinstance(value, (int, float)):
+                        if key not in subgroup_values:
+                            subgroup_values[key] = []
+                        subgroup_values[key].append(value)
+
+            # Compute mean/std
+            if subgroup_values:
+                aggregated['subgroups'][metric_type][subgroup_name] = {
+                    f'{key}_mean': float(np.mean(values))
+                    for key, values in subgroup_values.items()
+                }
+                aggregated['subgroups'][metric_type][subgroup_name].update({
+                    f'{key}_std': float(np.std(values))
+                    for key, values in subgroup_values.items()
+                })
 
     return aggregated
 
@@ -2896,5 +3113,3 @@ if __name__ == '__main__':
 
     print("\nEvaluation pipeline completed!")
     print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
-
-
