@@ -43,6 +43,50 @@ from model.vae_teb_prediction.validation_utils import (
 )
 
 
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+
+    Args:
+        obj: Any object (dict, list, numpy type, or primitive)
+
+    Returns:
+        Object with all numpy types converted to Python natives
+    """
+    # Handle None first
+    if obj is None:
+        return None
+    # Handle dicts and lists (recurse into nested structures)
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    # Handle numpy arrays (convert to list, which will recurse)
+    elif isinstance(obj, np.ndarray):
+        return [convert_numpy_types(item) for item in obj.tolist()]
+    # Handle scalar numpy types
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        val = float(obj)
+        # Handle NaN and inf/-inf
+        if np.isnan(val) or np.isinf(val):
+            return None  # Convert to null for JSON compatibility
+        return val
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    # Handle pandas NaT and other pd.NA types
+    elif pd.isna(obj):
+        return None
+    # Handle Python float NaN/inf
+    elif isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+
 def load_best_checkpoint(checkpoint_dir: str, device: str = 'cuda:0') -> torch.nn.Module:
     """
     Load the best model checkpoint.
@@ -2523,21 +2567,22 @@ def generate_three_metric_type_analysis(
     subgroup_statistics = compute_subgroup_statistics(df, subgroup_filters)
 
     # Overall dataset statistics
+    # NOTE: Convert all values to native Python types for JSON serialization
     overall_statistics = {
-        'total_guids': df['guid'].nunique(),
-        'total_epochs': len(df),
+        'total_guids': int(df['guid'].nunique()),
+        'total_epochs': int(len(df)),
         'diagnosis_counts': {
-            'healthy': df.groupby('guid')['target'].first().eq(1).sum(),
-            'acidosis': df.groupby('guid')['target'].first().eq(2).sum(),
-            'hie': df.groupby('guid')['target'].first().eq(3).sum()
+            'healthy': int(df.groupby('guid')['target'].first().eq(1).sum()),
+            'acidosis': int(df.groupby('guid')['target'].first().eq(2).sum()),
+            'hie': int(df.groupby('guid')['target'].first().eq(3).sum())
         },
         'cs_counts': {
-            'cs_positive': df.groupby('guid')['cs_label'].first().eq(True).sum(),
-            'cs_negative': df.groupby('guid')['cs_label'].first().eq(False).sum()
+            'cs_positive': int(df.groupby('guid')['cs_label'].first().eq(True).sum()),
+            'cs_negative': int(df.groupby('guid')['cs_label'].first().eq(False).sum())
         },
         'bg_counts': {
-            'bg_positive': df.groupby('guid')['bg_label'].first().eq(True).sum(),
-            'bg_negative': df.groupby('guid')['bg_label'].first().eq(False).sum()
+            'bg_positive': int(df.groupby('guid')['bg_label'].first().eq(True).sum()),
+            'bg_negative': int(df.groupby('guid')['bg_label'].first().eq(False).sum())
         }
     }
 
@@ -2569,14 +2614,14 @@ def generate_three_metric_type_analysis(
     }
 
     with open(analysis_dir / "metrics_summary.json", 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(convert_numpy_types(summary), f, indent=2)
 
     # Save dataset statistics separately for easy access
     with open(analysis_dir / "dataset_statistics.json", 'w') as f:
-        json.dump({
+        json.dump(convert_numpy_types({
             'overall': overall_statistics,
             'subgroups': subgroup_statistics
-        }, f, indent=2)
+        }), f, indent=2)
 
     logger.info(f"Dataset statistics computed for {len(subgroup_statistics)} subgroups")
     logger.info("Three metric type analysis complete")
@@ -2603,8 +2648,8 @@ def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
         return {}
 
     return {
-        'n_bins': len(df),
-        'n_valid_bins': len(valid_df),
+        'n_bins': int(len(df)),
+        'n_valid_bins': int(len(valid_df)),
         'sensitivity_mean': float(valid_df['sensitivity'].mean()),
         'sensitivity_std': float(valid_df['sensitivity'].std()),
         'sensitivity_min': float(valid_df['sensitivity'].min()),
@@ -2931,7 +2976,7 @@ def main(
     # Save aggregated results
     aggregated_path = output_base_dir / "aggregated_results.json"
     with open(aggregated_path, 'w') as f:
-        json.dump(aggregated, f, indent=2)
+        json.dump(convert_numpy_types(aggregated), f, indent=2)
 
     logger.info(f"Aggregated results saved to: {aggregated_path}")
 
@@ -3113,7 +3158,7 @@ def _evaluate_single_fold(
     }
 
     with open(evaluation_dir / "threshold_info.json", 'w') as f:
-        json.dump(threshold_info, f, indent=2)
+        json.dump(convert_numpy_types(threshold_info), f, indent=2)
 
     # Create fold results
     fold_results = {
@@ -3164,7 +3209,7 @@ def _evaluate_single_fold(
         fold_results_json['three_metric_results_full'] = three_metric_full
 
     with open(results_path, 'w') as f:
-        json.dump(fold_results_json, f, indent=2)
+        json.dump(convert_numpy_types(fold_results_json), f, indent=2)
 
     logger.info(f"Fold {fold_id}: Results saved to {results_path}")
 
