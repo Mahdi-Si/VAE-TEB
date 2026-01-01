@@ -440,3 +440,117 @@ def plot_coherence_analysis(
     fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_coherence_signals(
+    up_signal: np.ndarray,
+    fhr_original: np.ndarray,
+    fhr_reconstructed: np.ndarray,
+    output_path: Path,
+    *,
+    fs: float = 4.0,
+    title: Optional[str] = None,
+) -> None:
+    """
+    Plot UP and FHR signals for a single sample.
+
+    Args:
+        up_signal: UP signal array.
+        fhr_original: Original FHR array.
+        fhr_reconstructed: Reconstructed FHR array.
+        output_path: Output path for the figure.
+        fs: Sampling frequency in Hz (default 4.0).
+        title: Optional title for the figure.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    min_len = min(len(up_signal), len(fhr_original), len(fhr_reconstructed))
+    up_signal = up_signal[:min_len]
+    fhr_original = fhr_original[:min_len]
+    fhr_reconstructed = fhr_reconstructed[:min_len]
+
+    time_min = np.arange(min_len) / fs / 60.0
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+
+    axes[0].plot(time_min, up_signal, color="#8172B2", linewidth=0.8)
+    axes[0].set_ylabel("UP (normalized)")
+    axes[0].set_title(title or "UP and FHR Signals")
+
+    axes[1].plot(time_min, fhr_original, color="#4C72B0", linewidth=0.8, label="Original FHR")
+    axes[1].plot(time_min, fhr_reconstructed, color="#C44E52", linewidth=0.8, linestyle="--", label="Reconstructed FHR")
+    axes[1].set_ylabel("FHR (normalized)")
+    axes[1].legend(loc="upper right")
+
+    residual = fhr_original - fhr_reconstructed
+    axes[2].plot(time_min, residual, color="#55A868", linewidth=0.6)
+    axes[2].axhline(0.0, color="black", linestyle="--", alpha=0.4)
+    axes[2].set_xlabel("Time (minutes)")
+    axes[2].set_ylabel("Residual")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_time_frequency_coherence(
+    frequencies: np.ndarray,
+    times: np.ndarray,
+    coherence_original: np.ndarray,
+    coherence_reconstructed: np.ndarray,
+    output_path: Path,
+    *,
+    max_freq: Optional[float] = None,
+    title: Optional[str] = None,
+) -> None:
+    """
+    Plot time-frequency coherence maps for original and reconstructed signals.
+
+    Args:
+        frequencies: Frequency array in Hz.
+        times: Time array in seconds.
+        coherence_original: Coherence matrix (freq x time) for original FHR.
+        coherence_reconstructed: Coherence matrix (freq x time) for reconstructed FHR.
+        output_path: Output path for the figure.
+        max_freq: Optional max frequency to display.
+        title: Optional title for the figure.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    freq_mask = slice(None)
+    if max_freq is not None:
+        freq_mask = frequencies <= max_freq
+
+    freqs = frequencies[freq_mask]
+    coh_orig = coherence_original[freq_mask, :]
+    coh_recon = coherence_reconstructed[freq_mask, :]
+    coh_diff = coh_recon - coh_orig
+
+    time_min = times / 60.0
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    axes[0].set_ylabel("Frequency (Hz)")
+    axes[0].set_title("UP-FHR Coherence (Original)")
+    fig.colorbar(im0, ax=axes[0], label="Coherence")
+
+    im1 = axes[1].pcolormesh(time_min, freqs, coh_recon, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    axes[1].set_ylabel("Frequency (Hz)")
+    axes[1].set_title("UP-FHR Coherence (Reconstructed)")
+    fig.colorbar(im1, ax=axes[1], label="Coherence")
+
+    im2 = axes[2].pcolormesh(time_min, freqs, coh_diff, shading="auto", cmap="coolwarm", vmin=-1.0, vmax=1.0)
+    axes[2].set_xlabel("Time (minutes)")
+    axes[2].set_ylabel("Frequency (Hz)")
+    axes[2].set_title("Coherence Difference (Reconstructed - Original)")
+    fig.colorbar(im2, ax=axes[2], label="Delta")
+
+    if title:
+        fig.suptitle(title, fontsize=12, y=0.98)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)

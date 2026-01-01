@@ -98,7 +98,7 @@ class TestRunner:
         # Create model with architecture parameters
         # Note: model_kwargs should match the checkpoint's architecture
         # (e.g., latent_dim, hidden_dim, etc.)
-        model = SeqVae(**model_kwargs)
+        model = SeqVae()
 
         # Load checkpoint using the robust loader that handles:
         # - PyTorch Lightning checkpoints
