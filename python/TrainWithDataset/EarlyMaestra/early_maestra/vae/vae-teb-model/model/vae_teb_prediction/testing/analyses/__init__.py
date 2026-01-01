@@ -33,18 +33,18 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from ..base import TestRunner
+from model.vae_teb_prediction.testing.base import TestRunner
 
 # Import individual analyses
-from .histogram import run_histogram_analysis
-from .latent import (
+from model.vae_teb_prediction.testing.analyses.histogram import run_histogram_analysis
+from model.vae_teb_prediction.testing.analyses.latent import (
     run_latent_distribution_analysis,
     run_latent_interpolation,
     run_latent_space_visualization,
 )
-from .temporal import run_temporal_accuracy_analysis, run_within_window_analysis
-from .coherence import run_coherence_analysis
-from .trajectory import run_trajectory_analysis, TrajectoryAnalyzer
+from model.vae_teb_prediction.testing.analyses.temporal import run_temporal_accuracy_analysis, run_within_window_analysis
+from model.vae_teb_prediction.testing.analyses.coherence import run_coherence_analysis
+from model.vae_teb_prediction.testing.analyses.trajectory import run_trajectory_analysis, TrajectoryAnalyzer
 
 
 def run_all_analyses(

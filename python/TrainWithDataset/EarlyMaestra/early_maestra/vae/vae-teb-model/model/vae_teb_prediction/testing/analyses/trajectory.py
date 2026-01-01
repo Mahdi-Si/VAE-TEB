@@ -35,10 +35,10 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..base import TestRunner
-from ..collectors import _extract_epoch, _extract_guid, _extract_label
-from ..metrics import compute_kld
-from ..visualizers import plot_kld_trajectory
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.collectors import _extract_epoch, _extract_guid, _extract_label
+from model.vae_teb_prediction.testing.metrics import compute_kld
+from model.vae_teb_prediction.testing.visualizers import plot_kld_trajectory
 
 try:
     from sklearn.decomposition import PCA

@@ -19,10 +19,10 @@ import numpy as np
 import torch
 from loguru import logger
 
-from ..base import TestRunner
-from ..collectors import collect_latents, collect_predictions
-from ..visualizers import plot_latent_distributions
-from ..visualizers_interactive import plot_latent_space_3d, plot_latent_interpolation_interactive
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.collectors import collect_latents, collect_predictions
+from model.vae_teb_prediction.testing.visualizers import plot_latent_distributions
+from model.vae_teb_prediction.testing.visualizers_interactive import plot_latent_space_3d, plot_latent_interpolation_interactive
 
 
 def run_latent_distribution_analysis(
