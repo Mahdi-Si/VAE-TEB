@@ -74,17 +74,17 @@ def run_full_test_pipeline(
         >>> print(f"Mean VAF: {results['histogram']['vaf'].mean():.4f}")
     """
     # Import here to avoid circular imports
-    from .base import TestRunner
-    from .analyses import (
+    from model.vae_teb_prediction.testing.base import TestRunner
+    from model.vae_teb_prediction.testing.analyses import (
         run_histogram_analysis,
         run_latent_distribution_analysis,
         run_temporal_accuracy_analysis,
         run_coherence_analysis,
         run_trajectory_analysis,
     )
-    from .collectors import collect_predictions
-    from .visualizers import plot_reconstruction_sample
-    from .visualizers_interactive import (
+    from model.vae_teb_prediction.testing.collectors import collect_predictions
+    from model.vae_teb_prediction.testing.visualizers import plot_reconstruction_sample
+    from model.vae_teb_prediction.testing.visualizers_interactive import (
         plot_reconstruction_interactive,
         plot_metrics_comparison_interactive,
     )

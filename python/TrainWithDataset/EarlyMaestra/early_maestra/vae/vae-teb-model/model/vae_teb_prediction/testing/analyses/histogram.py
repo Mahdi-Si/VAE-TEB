@@ -16,9 +16,9 @@ from typing import Any, Optional
 import pandas as pd
 from loguru import logger
 
-from ..base import TestRunner
-from ..collectors import collect_metrics
-from ..visualizers import plot_metric_histograms
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.collectors import collect_metrics
+from model.vae_teb_prediction.testing.visualizers import plot_metric_histograms
 
 
 def run_histogram_analysis(
