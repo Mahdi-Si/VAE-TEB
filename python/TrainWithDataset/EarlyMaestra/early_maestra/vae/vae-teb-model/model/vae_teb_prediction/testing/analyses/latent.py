@@ -21,6 +21,7 @@ from loguru import logger
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import collect_latents, collect_predictions
+from model.vae_teb_prediction.testing.metrics import aggregate_predictions
 from model.vae_teb_prediction.testing.visualizers import plot_latent_distributions
 from model.vae_teb_prediction.testing.visualizers_interactive import plot_latent_space_3d, plot_latent_interpolation_interactive
 
@@ -186,15 +187,20 @@ def run_latent_interpolation(
                 z_interp = (1 - alpha) * z1 + alpha * z2
 
                 # Expand to sequence: (D,) -> (1, T, D)
-                T = 300  # Default sequence length
+                if s1["latent"] is not None:
+                    T = int(s1["latent"].shape[0])
+                else:
+                    T = int(getattr(runner.model, "sequence_length", 300))
                 z_seq = z_interp.unsqueeze(0).unsqueeze(0).expand(1, T, -1)
 
                 # Decode
                 _, mu_pr, _ = runner.model.decoder(z_seq)
 
                 # Average to get raw signal
-                from ..metrics import aggregate_predictions
-                avg_pred, _ = aggregate_predictions(runner.model, mu_pr)
+                raw_len = None
+                if s1.get("y_true") is not None:
+                    raw_len = int(len(s1["y_true"]))
+                avg_pred, _ = aggregate_predictions(runner.model, mu_pr, raw_len=raw_len)
 
                 if avg_pred is not None:
                     interpolated_signals.append(avg_pred[0].cpu().numpy())

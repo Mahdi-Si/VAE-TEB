@@ -44,11 +44,13 @@ from model.vae_teb_prediction.testing.collectors import (
 # Static visualizers (Matplotlib)
 from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_analysis,
+    plot_coherence_signals,
     plot_kld_trajectory,
     plot_latent_distributions,
     plot_metric_histograms,
     plot_reconstruction_sample,
     plot_temporal_accuracy,
+    plot_time_frequency_coherence,
 )
 
 # Interactive visualizers (Plotly)
@@ -96,6 +98,8 @@ __all__ = [
     "plot_temporal_accuracy",
     "plot_kld_trajectory",
     "plot_coherence_analysis",
+    "plot_coherence_signals",
+    "plot_time_frequency_coherence",
     # Interactive visualizers
     "plot_reconstruction_interactive",
     "plot_kld_trajectory_interactive",
