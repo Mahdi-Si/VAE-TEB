@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .base import TestRunner
-from .metrics import (
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.metrics import (
     aggregate_predictions,
     compute_kld_per_sample,
     compute_kld_per_timestep,
