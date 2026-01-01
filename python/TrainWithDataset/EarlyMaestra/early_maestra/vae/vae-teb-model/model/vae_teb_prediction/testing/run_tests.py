@@ -5,9 +5,10 @@ Usage:
     from testing.run_tests import run_full_test_pipeline
 
     results = run_full_test_pipeline(
-        checkpoint_path="path/to/model.ckpt",
-        data_path="path/to/test_data.h5",
-        output_dir="results/",
+        checkpoint_path=None,
+        data_path=None,
+        output_dir=None,
+        config_path="model/vae_teb_prediction/config.yaml",
     )
 """
 
@@ -50,9 +51,9 @@ import json
 
 
 def run_full_test_pipeline(
-    checkpoint_path: str,
+    checkpoint_path: Optional[str],
     data_path: Optional[Union[str, List[str]]],
-    output_dir: str = "test_results",
+    output_dir: Optional[str] = None,
     stats_path: Optional[str] = None,
     device: Optional[str] = None,
     max_samples: Optional[int] = None,
@@ -76,11 +77,13 @@ def run_full_test_pipeline(
     - GUID-based loader for trajectory analysis (each batch = one patient)
 
     Args:
-        checkpoint_path: Path to model checkpoint (.ckpt or .pt).
+        checkpoint_path: Path to model checkpoint (.ckpt or .pt). If None, uses
+            model_config.core_model_checkpoint from config_path.
         data_path: Path(s) to test dataset(s). Can be a single HDF5 file path
             or a list of paths for multiple files. If None, config_path must be
             provided and include dataset_config.vae_test_datasets.
-        output_dir: Directory for saving results.
+        output_dir: Directory for saving results. If None and config_path is provided,
+            uses general_config.folders_config.out_dir_base/test_results.
         stats_path: Path to normalization statistics HDF5 file (optional).
         device: Device string ("cuda:0", "cpu"). Auto-detects if None.
         max_samples: Maximum samples to process for standard analyses. None for all.
@@ -114,8 +117,11 @@ def run_full_test_pipeline(
         >>> print(f"Mean VAF: {results['histogram']['vaf'].mean():.4f}")
     """
     # Resolve paths
-    checkpoint_path = Path(checkpoint_path)
-    output_dir = Path(output_dir)
+    checkpoint_path, output_dir = _resolve_runner_settings(
+        checkpoint_path=checkpoint_path,
+        output_dir=output_dir,
+        config_path=config_path,
+    )
 
     # Normalize data_path to list of strings
     data_paths: List[str] = []
@@ -350,6 +356,39 @@ def _load_config(path: Union[str, Path]) -> Dict[str, Any]:
     return config or {}
 
 
+def _resolve_runner_settings(
+    *,
+    checkpoint_path: Optional[str],
+    output_dir: Optional[str],
+    config_path: Optional[Union[str, Path]],
+) -> tuple[Path, Path]:
+    resolved_checkpoint = checkpoint_path
+    resolved_output = output_dir
+
+    if config_path is not None:
+        config = _load_config(config_path)
+        model_cfg = config.get("model_config", {}) or {}
+        folders_cfg = config.get("general_config", {}).get("folders_config", {}) or {}
+
+        if not resolved_checkpoint:
+            resolved_checkpoint = model_cfg.get("core_model_checkpoint")
+
+        if resolved_output is None:
+            base_dir = folders_cfg.get("out_dir_base")
+            if base_dir:
+                resolved_output = str(Path(base_dir) / "test_results")
+
+    if not resolved_checkpoint:
+        raise ValueError(
+            "checkpoint_path is required unless config_path provides model_config.core_model_checkpoint."
+        )
+
+    if not resolved_output:
+        resolved_output = "test_results"
+
+    return Path(resolved_checkpoint), Path(resolved_output)
+
+
 def _resolve_dataloader_settings(
     *,
     data_paths: List[str],
@@ -439,7 +478,7 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
 
 # ----- Convenience function for quick testing -----
 def quick_test(
-    checkpoint_path: str,
+    checkpoint_path: Optional[str],
     data_path: Optional[str],
     output_dir: str = "quick_test_results",
     stats_path: Optional[str] = None,
@@ -454,7 +493,7 @@ def quick_test(
     Run a quick test with limited samples (for debugging).
 
     Args:
-        checkpoint_path: Path to checkpoint.
+        checkpoint_path: Path to checkpoint (optional if config_path provides core_model_checkpoint).
         data_path: Path to test data (optional if config_path is provided).
         output_dir: Output directory.
         stats_path: Path to normalization statistics (optional).
@@ -488,11 +527,11 @@ def quick_test(
 # ----- Example usage -----
 if __name__ == "__main__":
     # Example: Edit these paths for your setup
-    CHECKPOINT = "path/to/your/model.ckpt"
+    CHECKPOINT = None  # Use config_path to pull core_model_checkpoint
     DATA = None  # Use config_path to pull dataset settings
     STATS = None  # Optional normalization stats if not using config_path
     CONFIG = "path/to/your/config.yaml"
-    OUTPUT = "test_results"
+    OUTPUT = None  # Use config_path to pull out_dir_base/test_results
 
     # Run full pipeline
     results = run_full_test_pipeline(
