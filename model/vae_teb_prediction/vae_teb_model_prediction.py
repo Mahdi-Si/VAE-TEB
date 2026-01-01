@@ -1250,8 +1250,8 @@ class SeqVae(nn.Module):
         return {
             "z": z,  # (B, T, latent_dim_z)
             "linear_output": linear_output,
-            "mu_pr": mu_pr,  # (B, 4800, 480)
-            "logvar_pr": logvar_pr,  # (B, 4800, 480)
+            "mu_pr": mu_pr,  # (B, T, H)
+            "logvar_pr": logvar_pr,  # (B, T, H)
             "mu_prior": mu_y,  # (B, T, latent_dim_target)
             "logvar_prior": logvar_y_prior,  # (B, T, latent_dim_target)
             "mu_post": mu_post,  # (B, T, latent_dim_z)
@@ -1355,12 +1355,18 @@ class SeqVae(nn.Module):
             return nll.sum() / denom
         return nll.mean()
 
-    def average_raw_prediction(self, mu_pr: torch.Tensor) -> torch.Tensor:
+    def average_raw_prediction(
+        self,
+        mu_pr: torch.Tensor,
+        *,
+        raw_len: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Aggregate per-timestep raw predictions into a single raw-length series.
 
         Args:
             mu_pr: Predicted raw segments, shape (B, T, H) where H is the horizon (e.g., 480).
+            raw_len: Optional raw length override (e.g., when data is trimmed).
 
         Returns:
             Tensor of shape (B, raw_len) with averaged predictions; positions with no coverage
@@ -1375,7 +1381,7 @@ class SeqVae(nn.Module):
         device = mu_pr.device
         dtype = mu_pr.dtype
 
-        raw_len = self.sequence_length * s
+        raw_len = int(raw_len) if raw_len is not None else self.sequence_length * s
         avg = torch.full((B, raw_len), float("nan"), device=device, dtype=dtype)
 
         if T <= warmup:
@@ -1539,7 +1545,7 @@ class SeqVae(nn.Module):
 
                 nll = 0.5 * (lv + (pred - target) ** 2 / var)
                 nll = nll * mask.unsqueeze(0)  # broadcast mask to batch
-                denom = mask.sum().clamp_min(1.0)
+                denom = mask.sum().clamp_min(1.0) * B
                 nll_loss = nll.sum() / denom
 
         kld_loss = torch.tensor(0.0, device=y_raw.device)

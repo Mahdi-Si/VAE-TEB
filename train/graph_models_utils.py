@@ -303,8 +303,8 @@ def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, norm
     stats = normalization_stats[field_name]
     
     if 'mean_tensor' in stats and 'std_tensor' in stats:
-        mean_tensor = stats['mean_tensor']
-        std_tensor = stats['std_tensor']
+        mean_tensor = stats['mean_tensor'].to(device=normalized_data.device, dtype=normalized_data.dtype)
+        std_tensor = stats['std_tensor'].to(device=normalized_data.device, dtype=normalized_data.dtype)
     else:
         mean_tensor = torch.tensor(stats['mean'], dtype=normalized_data.dtype, device=normalized_data.device)
         std_tensor = torch.tensor(stats['std'], dtype=normalized_data.dtype, device=normalized_data.device)    

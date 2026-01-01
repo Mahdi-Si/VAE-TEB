@@ -22,6 +22,7 @@ from utils.plot_utils import (
     plot_single_prediction_windows,
     plot_vae_reconstruction,
 )
+from model.vae_teb_prediction.trajectory_analysis import TrajectoryAnalyzer, run_trajectory_analysis
 
 
 def load_config(path: Path) -> Dict:
@@ -101,6 +102,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     model,
                     recon_segments,
                     logvar_segments=logvar_segments,
+                    raw_len=y_raw.size(1),
                 )
                 if recon is None:
                     logger.warning("Forward pass did not return usable raw predictions; skipping batch.")
@@ -351,6 +353,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         segments: Optional[torch.Tensor],
         *,
         logvar_segments: Optional[torch.Tensor] = None,
+        raw_len: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Collapse per-timestep prediction windows into a single raw-length sequence.
@@ -363,13 +366,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         if not hasattr(model, "average_raw_prediction"):
             return segments, logvar_segments, None
 
-        avg_mu = model.average_raw_prediction(segments)
+        avg_mu = model.average_raw_prediction(segments, raw_len=raw_len)
         valid_mask = torch.isfinite(avg_mu)
         avg_mu = torch.nan_to_num(avg_mu, nan=0.0)
 
         avg_logvar = None
         if logvar_segments is not None:
-            avg_var = model.average_raw_prediction(logvar_segments.exp())
+            avg_var = model.average_raw_prediction(logvar_segments.exp(), raw_len=raw_len)
             valid_mask = valid_mask & torch.isfinite(avg_var)
             avg_var = torch.nan_to_num(avg_var, nan=1.0)
             avg_logvar = avg_var.clamp_min(1e-12).log()
@@ -469,6 +472,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         model,
                         recon_segments,
                         logvar_segments=logvar_segments,
+                        raw_len=y_raw.size(1),
                     )
                     if recon is None or latent is None:
                         logger.warning("Forward outputs missing required tensors; skipping sample.")
@@ -529,6 +533,10 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         ph_channels=fhr_ph_np.shape[0],
                         seq_len=fhr_st_np.shape[1],
                     )
+                    if recon_st_np is None or recon_ph_np is None:
+                        logger.warning(
+                            "Reconstruction features do not align with input channels; skipping feature recon plots."
+                        )
 
                     plot_model_analysis(
                         output_dir=str(out_dir),
@@ -951,20 +959,30 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
 
         # Compute STFT coherence
         logger.info("Computing STFT coherence...")
-        stft_results = self._compute_stft_coherence(
-            preds_np, targets_np,
-            fs=4.0,
-            nperseg=nperseg,
-            noverlap=noverlap
-        )
+        try:
+            stft_results = self._compute_stft_coherence(
+                preds_np,
+                targets_np,
+                fs=4.0,
+                nperseg=nperseg,
+                noverlap=noverlap,
+            )
+        except ImportError as exc:
+            logger.error("SciPy not available; skipping coherence analysis: %s", exc)
+            return
 
         # Compute wavelet coherence
         logger.info("Computing wavelet coherence...")
-        wavelet_results = self._compute_wavelet_coherence(
-            preds_np, targets_np,
-            fs=4.0,
-            scales=wavelet_scales
-        )
+        try:
+            wavelet_results = self._compute_wavelet_coherence(
+                preds_np,
+                targets_np,
+                fs=4.0,
+                scales=wavelet_scales,
+            )
+        except ImportError as exc:
+            logger.error("PyWavelets not available; skipping coherence analysis: %s", exc)
+            return
 
         # Aggregate into frequency bands
         logger.info("Aggregating into clinical frequency bands...")
@@ -1805,7 +1823,11 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
                 decoded_linear, decoded_mu, _ = decoder(latent_interp)
-                averaged_mu, _, _ = self._average_raw_prediction_segments(model, decoded_mu)
+                averaged_mu, _, _ = self._average_raw_prediction_segments(
+                    model,
+                    decoded_mu,
+                    raw_len=y_a.size(1),
+                )
                 if averaged_mu is None:
                     logger.warning("Decoder did not return usable raw predictions; skipping alpha %.3f.", alpha)
                     continue
@@ -1986,8 +2008,12 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         if decoder is None:
             logger.error("SeqVAE core does not expose a decoder attribute; cannot run interpolation.")
             return
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except ImportError as exc:
+            logger.error("Plotly not available; skipping plotly interpolation: %s", exc)
+            return
 
         device = torch.device(
             f"cuda:{self.cuda_devices[0]}" if torch.cuda.is_available() and self.cuda_devices else "cpu"
@@ -2068,7 +2094,11 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
             for alpha in weights:
                 latent_interp = torch.lerp(latent_a, latent_b, float(alpha))
                 decoded_linear, decoded_mu, _ = decoder(latent_interp)
-                averaged_mu, _, _ = self._average_raw_prediction_segments(model, decoded_mu)
+                averaged_mu, _, _ = self._average_raw_prediction_segments(
+                    model,
+                    decoded_mu,
+                    raw_len=y_a.size(1),
+                )
                 if averaged_mu is None:
                     logger.warning("Decoder did not return usable raw predictions; skipping alpha %.3f.", alpha)
                     continue
@@ -2315,13 +2345,13 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         st_channels: int,
         ph_channels: int,
         seq_len: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if (
             linear_output is None
             or linear_output.dim() != 3
             or linear_output.size(-1) < st_channels + ph_channels
         ):
-            return np.zeros((st_channels, seq_len)), np.zeros((ph_channels, seq_len))
+            return None, None
         linear_np = linear_output[0].detach().cpu().numpy()  # (T, channels_total)
         recon_st = linear_np[:, :st_channels].T
         recon_ph = linear_np[:, st_channels : st_channels + ph_channels].T
@@ -2490,6 +2520,56 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
         fig.savefig(output_path, dpi=200)
         plt.close(fig)
         logger.info("Saved across-timesteps analysis plot to %s", output_path)
+
+    def run_trajectory_analysis(
+        self,
+        test_loader,
+        output_dir: Optional[Path] = None,
+        time_range_hours: Optional[float] = 12.0,
+        min_epochs_per_guid: int = 3,
+        n_dashboards: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Run trajectory and KLD analysis over time before birth.
+
+        Analyzes how latent representations and KL divergence evolve as
+        pregnancy approaches delivery. Generates KLD curves, latent space
+        visualizations, and per-GUID dashboards.
+
+        Args:
+            test_loader: DataLoader with guid, epoch, and feature tensors.
+            output_dir: Where to save outputs (default: test_results_dir/trajectory_analysis).
+            time_range_hours: Hours before birth to analyze (None = all available).
+            min_epochs_per_guid: Minimum epochs per GUID for inclusion.
+            n_dashboards: Number of per-GUID dashboards to generate.
+
+        Returns:
+            Summary dict with analysis results.
+        """
+        if self.pytorch_model is None:
+            self.create_model()
+        if self.pytorch_model is None:
+            logger.error("Model unavailable for trajectory analysis")
+            return {"status": "error", "message": "Model unavailable"}
+
+        out_dir = Path(output_dir or self.test_results_dir) / "trajectory_analysis"
+
+        logger.info("Starting trajectory analysis (time_range=%s hours, min_epochs=%d)",
+                   time_range_hours, min_epochs_per_guid)
+
+        result = run_trajectory_analysis(
+            model=self.pytorch_model,
+            dataloader=test_loader,
+            output_dir=out_dir,
+            time_range_hours=time_range_hours,
+            min_epochs_per_guid=min_epochs_per_guid,
+            n_dashboards=n_dashboards,
+        )
+
+        logger.info("Trajectory analysis complete: %d GUIDs, %d epochs",
+                   result.get("n_guids", 0), result.get("n_epochs", 0))
+
+        return result
 
     @staticmethod
     def _plot_latent_metric_curves(metric_map: Dict[str, Dict[float, List[float]]], scales: List[float], path: Path) -> None:
@@ -2670,6 +2750,10 @@ def main(
     single_pred_windows: int = 4,
     temporal_accuracy_samples: int = 480,
     coherence_analysis_samples: int = 50,
+    trajectory_analysis: bool = False,
+    trajectory_time_range: Optional[float] = 12.0,
+    trajectory_min_epochs: int = 5,
+    trajectory_dashboards: int = 12,
 ) -> None:
     config_path = Path(config)
     config_data = load_config(config_path)
@@ -2710,6 +2794,15 @@ def main(
         tester.run_time_frequency_coherence_analysis(
             test_loader,
             num_samples=coherence_analysis_samples,
+        )
+    # Trajectory and KLD analysis over time before birth
+    if trajectory_analysis:
+        time_range = trajectory_time_range if trajectory_time_range and trajectory_time_range > 0 else None
+        tester.run_trajectory_analysis(
+            test_loader,
+            time_range_hours=time_range,
+            min_epochs_per_guid=trajectory_min_epochs,
+            n_dashboards=trajectory_dashboards,
         )
     # if max_samples is None or max_samples > 0 or (metrics_max_samples and metrics_max_samples > 0):
     #     tester.run_histogram_test(
