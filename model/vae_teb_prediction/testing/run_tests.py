@@ -14,7 +14,7 @@ Usage:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 from loguru import logger
@@ -22,7 +22,7 @@ from loguru import logger
 
 def run_full_test_pipeline(
     checkpoint_path: str,
-    data_path: str,
+    data_path: Union[str, List[str]],
     output_dir: str = "test_results",
     stats_path: Optional[str] = None,
     device: Optional[str] = None,
@@ -44,7 +44,8 @@ def run_full_test_pipeline(
 
     Args:
         checkpoint_path: Path to model checkpoint (.ckpt or .pt).
-        data_path: Path to test dataset (HDF5 file).
+        data_path: Path(s) to test dataset(s). Can be a single HDF5 file path
+            or a list of paths for multiple files.
         output_dir: Directory for saving results.
         stats_path: Path to normalization statistics HDF5 file (optional).
         device: Device string ("cuda:0", "cpu"). Auto-detects if None.
@@ -90,8 +91,13 @@ def run_full_test_pipeline(
 
     # Resolve paths
     checkpoint_path = Path(checkpoint_path)
-    data_path = Path(data_path)
     output_dir = Path(output_dir)
+
+    # Normalize data_path to list of strings for CombinedHDF5Dataset
+    if isinstance(data_path, str):
+        data_paths = [data_path]
+    else:
+        data_paths = list(data_path)
 
     # Auto-detect device
     if device is None:
@@ -115,14 +121,14 @@ def run_full_test_pipeline(
     # ----- Step 2: Create DataLoaders -----
     # Standard loader for most analyses
     logger.info("Creating standard test dataloader...")
-    standard_loader = _create_dataloader(data_path, batch_size, stats_path)
+    standard_loader = _create_dataloader(data_paths, batch_size, stats_path)
 
     # GUID-based loader for trajectory analysis (each batch = one patient)
     guid_loader = None
     if not skip_trajectory:
         logger.info("Creating GUID-based dataloader for trajectory analysis...")
         _, guid_loader = _create_guid_dataloader(
-            data_path,
+            data_paths,
             stats_path=stats_path,
             min_epochs_per_guid=min_epochs_per_guid,
             max_guids=max_guids,
@@ -187,7 +193,7 @@ def run_full_test_pipeline(
 
 
 def _create_dataloader(
-    data_path: Path,
+    data_path: Union[str, Path, Sequence[Union[str, Path]]],
     batch_size: int = 32,
     stats_path: Optional[str] = None,
 ) -> Any:
@@ -195,7 +201,7 @@ def _create_dataloader(
     Create a standard DataLoader for the test dataset.
 
     Args:
-        data_path: Path to HDF5 test data file.
+        data_path: Path or list of paths to HDF5 test data file(s).
         batch_size: Batch size for loading.
         stats_path: Optional path to normalization statistics HDF5 file.
 
@@ -205,8 +211,9 @@ def _create_dataloader(
     from torch.utils.data import DataLoader
     from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
 
+    paths = list(data_path) if isinstance(data_path, (list, tuple)) else [data_path]
     dataset = CombinedHDF5Dataset(
-        paths=str(data_path),
+        paths=[str(p) for p in paths],
         stats_path=stats_path,
         cache_size=500,
         pin_memory=torch.cuda.is_available(),
@@ -225,7 +232,7 @@ def _create_dataloader(
 
 
 def _create_guid_dataloader(
-    data_path: Path,
+    data_path: Union[str, Path, Sequence[Union[str, Path]]],
     stats_path: Optional[str] = None,
     min_epochs_per_guid: int = 3,
     max_guids: Optional[int] = None,
@@ -237,7 +244,7 @@ def _create_guid_dataloader(
     temporal evolution of each patient.
 
     Args:
-        data_path: Path to HDF5 test data file.
+        data_path: Path or list of paths to HDF5 test data file(s).
         stats_path: Optional path to normalization statistics HDF5 file.
         min_epochs_per_guid: Minimum epochs required per GUID to be included.
         max_guids: Maximum number of GUIDs to include (None for all).
@@ -247,8 +254,9 @@ def _create_guid_dataloader(
     """
     from hdf5_dataset.hdf5_dataset import build_guid_filtered_dataloader
 
+    paths = list(data_path) if isinstance(data_path, (list, tuple)) else [data_path]
     eligible_guids, loader = build_guid_filtered_dataloader(
-        dataset_paths=[str(data_path)],
+        dataset_paths=[str(p) for p in paths],
         min_samples=min_epochs_per_guid,
         max_guids=max_guids,
         sampler_shuffle=False,
@@ -333,7 +341,7 @@ def quick_test(
 if __name__ == "__main__":
     # Example: Edit these paths for your setup
     CHECKPOINT = "path/to/your/model.ckpt"
-    DATA = "path/to/your/test_data.h5"
+    DATA = ["path/to/your/test_data.h5"]  # Can be a single path or list of paths
     STATS = "path/to/your/stats.h5"  # Optional normalization stats
     OUTPUT = "test_results"
 
