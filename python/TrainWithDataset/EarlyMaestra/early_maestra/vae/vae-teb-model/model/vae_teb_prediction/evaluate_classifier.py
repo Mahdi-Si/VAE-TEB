@@ -43,6 +43,50 @@ from model.vae_teb_prediction.validation_utils import (
 )
 
 
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+
+    Args:
+        obj: Any object (dict, list, numpy type, or primitive)
+
+    Returns:
+        Object with all numpy types converted to Python natives
+    """
+    # Handle None first
+    if obj is None:
+        return None
+    # Handle dicts and lists (recurse into nested structures)
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    # Handle numpy arrays (convert to list, which will recurse)
+    elif isinstance(obj, np.ndarray):
+        return [convert_numpy_types(item) for item in obj.tolist()]
+    # Handle scalar numpy types
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        val = float(obj)
+        # Handle NaN and inf/-inf
+        if np.isnan(val) or np.isinf(val):
+            return None  # Convert to null for JSON compatibility
+        return val
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    # Handle pandas NaT and other pd.NA types
+    elif pd.isna(obj):
+        return None
+    # Handle Python float NaN/inf
+    elif isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+
 def load_best_checkpoint(checkpoint_dir: str, device: str = 'cuda:0') -> torch.nn.Module:
     """
     Load the best model checkpoint.
@@ -1121,6 +1165,103 @@ def create_enhanced_subgroup_filters() -> Dict[str, callable]:
         'bg_positive': lambda df: df['bg_label'] == True,
         'bg_negative': lambda df: df['bg_label'] == False,
     }
+
+
+def compute_subgroup_statistics(
+    df: pd.DataFrame,
+    subgroup_filters: Dict[str, callable]
+) -> Dict[str, Dict[str, int]]:
+    """
+    Compute dataset statistics for all subgroups.
+
+    For each subgroup, computes:
+    - n_guids: Number of unique patients (GUIDs) in subgroup
+    - n_epochs: Total number of epochs in subgroup
+    - n_positive: Number of unhealthy GUIDs (binary_target==1)
+    - n_negative: Number of healthy GUIDs (binary_target==0)
+
+    Args:
+        df: Full predictions dataframe with columns: guid, target, binary_target,
+            cs_label, bg_label, epoch
+        subgroup_filters: Dictionary mapping subgroup_name -> filter_function
+
+    Returns:
+        Dictionary mapping subgroup_name -> statistics dict with:
+            - n_guids: Unique patient count
+            - n_epochs: Total epoch count
+            - n_positive: Unhealthy patient count
+            - n_negative: Healthy patient count
+            - diagnosis_breakdown: Count by target (1=Healthy, 2=Acidosis, 3=HIE)
+    """
+    statistics = {}
+
+    for subgroup_name, filter_func in subgroup_filters.items():
+        try:
+            # Apply subgroup filter
+            subgroup_df = df[filter_func(df)].copy()
+
+            if len(subgroup_df) == 0:
+                statistics[subgroup_name] = {
+                    'n_guids': 0,
+                    'n_epochs': 0,
+                    'n_positive': 0,
+                    'n_negative': 0,
+                    'diagnosis_breakdown': {
+                        'healthy': 0,
+                        'acidosis': 0,
+                        'hie': 0
+                    }
+                }
+                continue
+
+            # Basic counts
+            n_guids = subgroup_df['guid'].nunique()
+            n_epochs = len(subgroup_df)
+
+            # Get unique GUIDs and their targets
+            guid_targets = subgroup_df.groupby('guid').agg({
+                'binary_target': 'first',
+                'target': 'first'
+            })
+
+            n_positive = (guid_targets['binary_target'] == 1).sum()
+            n_negative = (guid_targets['binary_target'] == 0).sum()
+
+            # Diagnosis breakdown (by unique GUIDs)
+            diagnosis_breakdown = {
+                'healthy': (guid_targets['target'] == 1).sum(),
+                'acidosis': (guid_targets['target'] == 2).sum(),
+                'hie': (guid_targets['target'] == 3).sum()
+            }
+
+            statistics[subgroup_name] = {
+                'n_guids': int(n_guids),
+                'n_epochs': int(n_epochs),
+                'n_positive': int(n_positive),
+                'n_negative': int(n_negative),
+                'diagnosis_breakdown': {
+                    'healthy': int(diagnosis_breakdown['healthy']),
+                    'acidosis': int(diagnosis_breakdown['acidosis']),
+                    'hie': int(diagnosis_breakdown['hie'])
+                }
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to compute statistics for {subgroup_name}: {e}")
+            statistics[subgroup_name] = {
+                'n_guids': 0,
+                'n_epochs': 0,
+                'n_positive': 0,
+                'n_negative': 0,
+                'diagnosis_breakdown': {
+                    'healthy': 0,
+                    'acidosis': 0,
+                    'hie': 0
+                },
+                'error': str(e)
+            }
+
+    return statistics
 
 
 def compute_subgroup_metrics_by_time(
@@ -2421,7 +2562,31 @@ def generate_three_metric_type_analysis(
     )
     all_subgroup_metrics['committed_overall'] = overall_subgroups
 
-    # Step 4: Save metrics summary
+    # Step 4: Compute subgroup dataset statistics
+    logger.info("Computing dataset statistics for all subgroups...")
+    subgroup_statistics = compute_subgroup_statistics(df, subgroup_filters)
+
+    # Overall dataset statistics
+    # NOTE: Convert all values to native Python types for JSON serialization
+    overall_statistics = {
+        'total_guids': int(df['guid'].nunique()),
+        'total_epochs': int(len(df)),
+        'diagnosis_counts': {
+            'healthy': int(df.groupby('guid')['target'].first().eq(1).sum()),
+            'acidosis': int(df.groupby('guid')['target'].first().eq(2).sum()),
+            'hie': int(df.groupby('guid')['target'].first().eq(3).sum())
+        },
+        'cs_counts': {
+            'cs_positive': int(df.groupby('guid')['cs_label'].first().eq(True).sum()),
+            'cs_negative': int(df.groupby('guid')['cs_label'].first().eq(False).sum())
+        },
+        'bg_counts': {
+            'bg_positive': int(df.groupby('guid')['bg_label'].first().eq(True).sum()),
+            'bg_negative': int(df.groupby('guid')['bg_label'].first().eq(False).sum())
+        }
+    }
+
+    # Step 5: Save metrics summary with statistics
     summary = {
         'metric_types': {
             'instantaneous': _summarize_metrics_df(metrics_dict.get('instantaneous')),
@@ -2441,19 +2606,35 @@ def generate_three_metric_type_analysis(
                 name: _summarize_metrics_df(df)
                 for name, df in overall_subgroups.items()
             }
+        },
+        'dataset_statistics': {
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
         }
     }
 
     with open(analysis_dir / "metrics_summary.json", 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(convert_numpy_types(summary), f, indent=2)
 
+    # Save dataset statistics separately for easy access
+    with open(analysis_dir / "dataset_statistics.json", 'w') as f:
+        json.dump(convert_numpy_types({
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
+        }), f, indent=2)
+
+    logger.info(f"Dataset statistics computed for {len(subgroup_statistics)} subgroups")
     logger.info("Three metric type analysis complete")
     logger.info(f"Results saved to: {analysis_dir}")
 
     return {
         'metrics_dict': metrics_dict,
         'subgroup_metrics': all_subgroup_metrics,
-        'summary': summary
+        'summary': summary,
+        'dataset_statistics': {
+            'overall': overall_statistics,
+            'subgroups': subgroup_statistics
+        }
     }
 
 
@@ -2467,8 +2648,8 @@ def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
         return {}
 
     return {
-        'n_bins': len(df),
-        'n_valid_bins': len(valid_df),
+        'n_bins': int(len(df)),
+        'n_valid_bins': int(len(valid_df)),
         'sensitivity_mean': float(valid_df['sensitivity'].mean()),
         'sensitivity_std': float(valid_df['sensitivity'].std()),
         'sensitivity_min': float(valid_df['sensitivity'].min()),
@@ -2482,13 +2663,163 @@ def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
 # MAIN FUNCTION - Post-Training Evaluation Pipeline
 # ============================================================================
 
+def aggregate_existing_results(
+    output_base_dir: str,
+    regenerate_from_predictions: bool = False,
+    exclude_last_minutes: float = 30.0
+):
+    """
+    Generate aggregated plots from existing fold results without re-running evaluation.
+
+    This function loads existing fold_results.json files and generates aggregated plots.
+    If the fold results don't contain three_metric_results_full, it can optionally
+    regenerate them from the saved prediction CSV files.
+
+    Args:
+        output_base_dir: Base directory containing fold_1, fold_2, ..., fold_N
+        regenerate_from_predictions: If True, regenerate metrics from prediction CSVs
+                                    when three_metric_results_full is missing
+        exclude_last_minutes: Exclude last N minutes before birth (default: 30.0)
+
+    Returns:
+        Dictionary with aggregation status
+
+    Example:
+        # Simple aggregation from existing results
+        aggregate_existing_results(
+            "/path/to/kfold_results"
+        )
+
+        # Regenerate metrics from predictions if needed
+        aggregate_existing_results(
+            "/path/to/kfold_results",
+            regenerate_from_predictions=True
+        )
+    """
+    output_base_dir = Path(output_base_dir)
+
+    if not output_base_dir.exists():
+        raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
+
+    logger.info("="*80)
+    logger.info("AGGREGATING EXISTING FOLD RESULTS")
+    logger.info("="*80)
+    logger.info(f"Output base directory: {output_base_dir}")
+    logger.info(f"Regenerate from predictions: {regenerate_from_predictions}")
+    logger.info("="*80)
+
+    # Find all fold directories
+    fold_dirs = sorted(
+        [d for d in output_base_dir.iterdir() if d.is_dir() and d.name.startswith('fold_')],
+        key=lambda x: int(x.name.split('_')[1])
+    )
+
+    if not fold_dirs:
+        raise FileNotFoundError(f"No fold directories found in {output_base_dir}")
+
+    logger.info(f"Found {len(fold_dirs)} fold directories")
+
+    # Load existing fold results
+    all_fold_results = []
+    loaded_folds = []
+    missing_data_folds = []
+
+    for fold_dir in fold_dirs:
+        fold_id = int(fold_dir.name.split('_')[1])
+        results_path = fold_dir / "fold_results.json"
+
+        if not results_path.exists():
+            logger.warning(f"Fold {fold_id}: No fold_results.json found, skipping")
+            continue
+
+        with open(results_path, 'r') as f:
+            fold_results = json.load(f)
+
+        # Check if three_metric_results_full exists
+        if 'three_metric_results_full' in fold_results and fold_results['three_metric_results_full']:
+            all_fold_results.append(fold_results)
+            loaded_folds.append(fold_id)
+            logger.info(f"Fold {fold_id}: Loaded three_metric_results_full")
+
+        elif regenerate_from_predictions:
+            # Regenerate from prediction CSVs
+            logger.info(f"Fold {fold_id}: Regenerating metrics from predictions...")
+
+            evaluation_dir = fold_dir / "evaluation"
+            test_clinical_path = evaluation_dir / "test_predictions_clinical.csv"
+
+            if not test_clinical_path.exists():
+                logger.warning(f"Fold {fold_id}: No test_predictions_clinical.csv found, skipping")
+                missing_data_folds.append(fold_id)
+                continue
+
+            # Load predictions
+            test_df = pd.read_csv(test_clinical_path)
+
+            # Regenerate three metric type analysis
+            three_metric_results = generate_three_metric_type_analysis(
+                test_df,
+                output_base_dir=evaluation_dir,
+                exclude_last_minutes=exclude_last_minutes,
+                title_suffix=f"Fold {fold_id}"
+            )
+
+            # Add to fold results
+            fold_results['three_metric_results_full'] = three_metric_results
+            all_fold_results.append(fold_results)
+            loaded_folds.append(fold_id)
+            logger.info(f"Fold {fold_id}: Regenerated and loaded")
+
+        else:
+            logger.warning(f"Fold {fold_id}: No three_metric_results_full found. " +
+                          "Use regenerate_from_predictions=True to regenerate.")
+            missing_data_folds.append(fold_id)
+
+    if not all_fold_results:
+        logger.error("No fold results with three_metric_results_full found!")
+        return {
+            'status': 'failed',
+            'loaded_folds': loaded_folds,
+            'missing_data_folds': missing_data_folds,
+            'n_loaded': 0,
+            'n_missing': len(missing_data_folds)
+        }
+
+    logger.info("")
+    logger.info(f"Successfully loaded {len(all_fold_results)} folds: {loaded_folds}")
+    if missing_data_folds:
+        logger.warning(f"Missing data for {len(missing_data_folds)} folds: {missing_data_folds}")
+
+    # Generate aggregated plots
+    logger.info("")
+    generate_aggregated_plots(all_fold_results, output_base_dir, len(all_fold_results))
+
+    logger.info("")
+    logger.info("="*80)
+    logger.info("AGGREGATION COMPLETE")
+    logger.info("="*80)
+    logger.info(f"Loaded folds: {len(loaded_folds)} {loaded_folds}")
+    logger.info(f"Missing data: {len(missing_data_folds)} {missing_data_folds}")
+    logger.info(f"Aggregated plots saved to: {output_base_dir / 'aggregated_plots'}")
+    logger.info("="*80)
+
+    return {
+        'status': 'success',
+        'loaded_folds': loaded_folds,
+        'missing_data_folds': missing_data_folds,
+        'n_loaded': len(loaded_folds),
+        'n_missing': len(missing_data_folds)
+    }
+
+
 def main(
     output_base_dir: str,
     target_fpr: float = 0.15,
     device: str = 'cuda:0',
     exclude_last_minutes: float = 30.0,
     max_gap_multiplier: Optional[float] = None,
-    regenerate_predictions: bool = False
+    regenerate_predictions: bool = False,
+    aggregate_only: bool = False
 ):
     """
     Run evaluation pipeline on all completed folds.
@@ -2509,6 +2840,8 @@ def main(
                           (default: None = use config or auto-detect)
         regenerate_predictions: If True, regenerate predictions even if cached
                                predictions exist (default: False)
+        aggregate_only: If True, skip evaluation and only generate aggregated plots
+                       from existing fold results (default: False)
 
     Returns:
         Dictionary with aggregated results across all folds
@@ -2554,6 +2887,14 @@ def main(
     if not output_base_dir.exists():
         raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
 
+    # If aggregate_only mode, delegate to aggregate_existing_results
+    if aggregate_only:
+        return aggregate_existing_results(
+            output_base_dir=str(output_base_dir),
+            regenerate_from_predictions=True,
+            exclude_last_minutes=exclude_last_minutes
+        )
+
     logger.info("="*80)
     logger.info("POST-TRAINING EVALUATION PIPELINE")
     logger.info("="*80)
@@ -2562,6 +2903,7 @@ def main(
     logger.info(f"Device: {device}")
     logger.info(f"Exclude last minutes: {exclude_last_minutes}")
     logger.info(f"Regenerate predictions: {regenerate_predictions}")
+    logger.info(f"Aggregate only: {aggregate_only}")
     logger.info("="*80)
 
     # Find all fold directories (fold_1, fold_2, ..., fold_N)
@@ -2634,9 +2976,13 @@ def main(
     # Save aggregated results
     aggregated_path = output_base_dir / "aggregated_results.json"
     with open(aggregated_path, 'w') as f:
-        json.dump(aggregated, f, indent=2)
+        json.dump(convert_numpy_types(aggregated), f, indent=2)
 
     logger.info(f"Aggregated results saved to: {aggregated_path}")
+
+    # Generate aggregated plots across folds
+    logger.info("")
+    generate_aggregated_plots(all_fold_results, output_base_dir, len(successful_folds))
 
     # Print summary
     logger.info("")
@@ -2812,7 +3158,7 @@ def _evaluate_single_fold(
     }
 
     with open(evaluation_dir / "threshold_info.json", 'w') as f:
-        json.dump(threshold_info, f, indent=2)
+        json.dump(convert_numpy_types(threshold_info), f, indent=2)
 
     # Create fold results
     fold_results = {
@@ -2829,14 +3175,41 @@ def _evaluate_single_fold(
         'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
         'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
         'status': 'success',
-        # Include full three metric type analysis (including all subgroups)
-        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {}
+        # Include full three metric type analysis (summary only - DataFrames saved separately)
+        'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {},
+        # Store full results including DataFrames for aggregated plotting
+        'three_metric_results_full': three_metric_results if three_metric_results else {}
     }
 
     # Save fold results
     results_path = fold_dir / "fold_results.json"
+
+    # Convert DataFrames to dict for JSON serialization
+    fold_results_json = fold_results.copy()
+    if 'three_metric_results_full' in fold_results_json and fold_results_json['three_metric_results_full']:
+        three_metric_full = fold_results_json['three_metric_results_full'].copy()
+
+        # Convert metrics_dict DataFrames to dicts
+        if 'metrics_dict' in three_metric_full:
+            three_metric_full['metrics_dict'] = {
+                k: v.to_dict('records') if v is not None else None
+                for k, v in three_metric_full['metrics_dict'].items()
+            }
+
+        # Convert subgroup_metrics DataFrames to dicts
+        if 'subgroup_metrics' in three_metric_full:
+            three_metric_full['subgroup_metrics'] = {
+                metric_type: {
+                    subgroup: df.to_dict('records') if df is not None else None
+                    for subgroup, df in subgroups.items()
+                }
+                for metric_type, subgroups in three_metric_full['subgroup_metrics'].items()
+            }
+
+        fold_results_json['three_metric_results_full'] = three_metric_full
+
     with open(results_path, 'w') as f:
-        json.dump(fold_results, f, indent=2)
+        json.dump(convert_numpy_types(fold_results_json), f, indent=2)
 
     logger.info(f"Fold {fold_id}: Results saved to {results_path}")
 
@@ -2967,6 +3340,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
     # Aggregate three metric type analysis across folds
     three_metric_aggregated = _aggregate_three_metric_analysis(all_fold_results)
 
+    # Aggregate dataset statistics across folds
+    dataset_stats_aggregated = _aggregate_dataset_statistics(all_fold_results)
+
     aggregated = {
         'timestamp': datetime.now().isoformat(),
         'n_folds': n,
@@ -3003,6 +3379,9 @@ def _aggregate_fold_results(all_fold_results: List[Dict]) -> Dict:
 
         # Three metric type analysis (all metrics and subgroups aggregated)
         'three_metric_analysis_aggregated': three_metric_aggregated,
+
+        # Dataset statistics (aggregated across folds)
+        'dataset_statistics_aggregated': dataset_stats_aggregated,
 
         # Individual fold results (includes per-fold three metric analysis)
         'fold_results': all_fold_results,
@@ -3092,6 +3471,594 @@ def _aggregate_three_metric_analysis(all_fold_results: List[Dict]) -> Dict:
     return aggregated
 
 
+def _aggregate_dataset_statistics(all_fold_results: List[Dict]) -> Dict:
+    """
+    Aggregate dataset statistics across folds.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+
+    Returns:
+        Dictionary with aggregated statistics (mean, std, min, max) for:
+        - Overall statistics (total GUIDs, diagnosis counts, CS counts, BG counts)
+        - Subgroup statistics (counts for each subgroup)
+    """
+    # Extract dataset statistics from each fold
+    fold_stats = []
+    for r in all_fold_results:
+        three_metric_full = r.get('three_metric_results_full', {})
+        if three_metric_full and 'dataset_statistics' in three_metric_full:
+            fold_stats.append(three_metric_full['dataset_statistics'])
+
+    if not fold_stats:
+        return {}
+
+    # Aggregate overall statistics
+    overall_stats = {
+        'total_guids': _aggregate_stat([s['overall']['total_guids'] for s in fold_stats]),
+        'total_epochs': _aggregate_stat([s['overall']['total_epochs'] for s in fold_stats]),
+        'diagnosis_counts': {
+            'healthy': _aggregate_stat([s['overall']['diagnosis_counts']['healthy'] for s in fold_stats]),
+            'acidosis': _aggregate_stat([s['overall']['diagnosis_counts']['acidosis'] for s in fold_stats]),
+            'hie': _aggregate_stat([s['overall']['diagnosis_counts']['hie'] for s in fold_stats])
+        },
+        'cs_counts': {
+            'cs_positive': _aggregate_stat([s['overall']['cs_counts']['cs_positive'] for s in fold_stats]),
+            'cs_negative': _aggregate_stat([s['overall']['cs_counts']['cs_negative'] for s in fold_stats])
+        },
+        'bg_counts': {
+            'bg_positive': _aggregate_stat([s['overall']['bg_counts']['bg_positive'] for s in fold_stats]),
+            'bg_negative': _aggregate_stat([s['overall']['bg_counts']['bg_negative'] for s in fold_stats])
+        }
+    }
+
+    # Aggregate subgroup statistics
+    all_subgroup_names = set()
+    for s in fold_stats:
+        all_subgroup_names.update(s['subgroups'].keys())
+
+    subgroup_stats = {}
+    for subgroup_name in all_subgroup_names:
+        try:
+            n_guids_list = [s['subgroups'][subgroup_name]['n_guids'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_epochs_list = [s['subgroups'][subgroup_name]['n_epochs'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_positive_list = [s['subgroups'][subgroup_name]['n_positive'] for s in fold_stats if subgroup_name in s['subgroups']]
+            n_negative_list = [s['subgroups'][subgroup_name]['n_negative'] for s in fold_stats if subgroup_name in s['subgroups']]
+
+            healthy_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['healthy'] for s in fold_stats if subgroup_name in s['subgroups']]
+            acidosis_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['acidosis'] for s in fold_stats if subgroup_name in s['subgroups']]
+            hie_list = [s['subgroups'][subgroup_name]['diagnosis_breakdown']['hie'] for s in fold_stats if subgroup_name in s['subgroups']]
+
+            subgroup_stats[subgroup_name] = {
+                'n_guids': _aggregate_stat(n_guids_list),
+                'n_epochs': _aggregate_stat(n_epochs_list),
+                'n_positive': _aggregate_stat(n_positive_list),
+                'n_negative': _aggregate_stat(n_negative_list),
+                'diagnosis_breakdown': {
+                    'healthy': _aggregate_stat(healthy_list),
+                    'acidosis': _aggregate_stat(acidosis_list),
+                    'hie': _aggregate_stat(hie_list)
+                }
+            }
+        except Exception as e:
+            logger.warning(f"Failed to aggregate statistics for {subgroup_name}: {e}")
+            continue
+
+    return {
+        'overall': overall_stats,
+        'subgroups': subgroup_stats
+    }
+
+
+def _aggregate_stat(values: List[float]) -> Dict[str, float]:
+    """Helper to compute mean, std, min, max for a list of values."""
+    if not values:
+        return {'mean': 0, 'std': 0, 'min': 0, 'max': 0}
+    return {
+        'mean': float(np.mean(values)),
+        'std': float(np.std(values)),
+        'min': float(np.min(values)),
+        'max': float(np.max(values))
+    }
+
+
+def _aggregate_dataframes_across_folds(
+    fold_dfs: List[pd.DataFrame],
+    metrics: List[str] = ['sensitivity', 'specificity', 'fpr']
+) -> pd.DataFrame:
+    """
+    Aggregate DataFrames across folds to compute mean, min, max for each time bin.
+
+    Args:
+        fold_dfs: List of DataFrames from different folds (same structure)
+        metrics: List of metric column names to aggregate
+
+    Returns:
+        Aggregated DataFrame with columns:
+            - bin_center
+            - {metric}_mean, {metric}_min, {metric}_max for each metric
+            - n_folds (number of folds contributing to each bin)
+    """
+    if not fold_dfs:
+        return pd.DataFrame()
+
+    # Filter out None and empty DataFrames
+    valid_dfs = [df for df in fold_dfs if df is not None and len(df) > 0]
+    if not valid_dfs:
+        return pd.DataFrame()
+
+    # Get all unique bin_centers across folds
+    all_bins = set()
+    for df in valid_dfs:
+        if 'bin_center' in df.columns:
+            all_bins.update(df['bin_center'].unique())
+
+    if not all_bins:
+        return pd.DataFrame()
+
+    all_bins = sorted(all_bins)
+
+    # Aggregate metrics for each bin
+    aggregated_data = []
+    for bin_center in all_bins:
+        bin_data = {'bin_center': bin_center}
+
+        for metric in metrics:
+            values = []
+            for df in valid_dfs:
+                if metric in df.columns:
+                    bin_rows = df[df['bin_center'] == bin_center]
+                    if len(bin_rows) > 0:
+                        value = bin_rows[metric].iloc[0]
+                        if pd.notna(value):
+                            values.append(value)
+
+            if values:
+                bin_data[f'{metric}_mean'] = np.mean(values)
+                bin_data[f'{metric}_min'] = np.min(values)
+                bin_data[f'{metric}_max'] = np.max(values)
+                bin_data[f'{metric}_std'] = np.std(values)
+                bin_data[f'{metric}_n_folds'] = len(values)
+            else:
+                bin_data[f'{metric}_mean'] = np.nan
+                bin_data[f'{metric}_min'] = np.nan
+                bin_data[f'{metric}_max'] = np.nan
+                bin_data[f'{metric}_std'] = np.nan
+                bin_data[f'{metric}_n_folds'] = 0
+
+        aggregated_data.append(bin_data)
+
+    return pd.DataFrame(aggregated_data)
+
+
+def plot_aggregated_metric_type(
+    aggregated_df: pd.DataFrame,
+    metric_type: str,
+    output_dir: Path,
+    n_folds: int
+):
+    """
+    Plot aggregated metrics for a single metric type with min/max error bands.
+
+    Generates 4 plots:
+    1. Sensitivity vs time with min/max band
+    2. Sensitivity + Specificity vs time with bands
+    3. Sensitivity + FPR vs time with bands
+    4. All metrics vs time with bands
+
+    Args:
+        aggregated_df: Aggregated DataFrame with mean, min, max columns
+        metric_type: 'instantaneous', 'committed_cumulative', or 'committed_overall'
+        output_dir: Directory to save plots
+        n_folds: Number of folds used in aggregation
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(aggregated_df) == 0:
+        logger.warning(f"No data to plot for aggregated {metric_type}")
+        return
+
+    # Filter to non-NaN bins
+    valid_df = aggregated_df[aggregated_df['sensitivity_mean'].notna()].copy()
+    if len(valid_df) == 0:
+        logger.warning(f"No valid data to plot for aggregated {metric_type}")
+        return
+
+    # Sort by bin_center (descending for plotting - far from birth to birth)
+    valid_df = valid_df.sort_values('bin_center', ascending=False)
+
+    metric_type_title = {
+        'instantaneous': 'Instantaneous',
+        'committed_cumulative': 'Committed (Cumulative)',
+        'committed_overall': 'Committed (Overall - PRIMARY)'
+    }.get(metric_type, metric_type)
+
+    # Plot 1: Sensitivity vs Time
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue', label='Min-Max Range')
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Sensitivity', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity vs Time\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 2: Sensitivity + Specificity
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue')
+
+    if 'specificity_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+                'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['specificity_min'],
+                         valid_df['specificity_max'],
+                         alpha=0.3, color='green')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity & Specificity\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_specificity_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 3: Sensitivity + FPR
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.3, color='blue')
+
+    if 'fpr_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+                'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['fpr_min'],
+                         valid_df['fpr_max'],
+                         alpha=0.3, color='red')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - Sensitivity & FPR\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'sensitivity_fpr_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plot 4: All metrics
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+            'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
+    ax.fill_between(valid_df['bin_center'],
+                     valid_df['sensitivity_min'],
+                     valid_df['sensitivity_max'],
+                     alpha=0.2, color='blue')
+
+    if 'specificity_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+                'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['specificity_min'],
+                         valid_df['specificity_max'],
+                         alpha=0.2, color='green')
+
+    if 'fpr_mean' in valid_df.columns:
+        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+                'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df['fpr_min'],
+                         valid_df['fpr_max'],
+                         alpha=0.2, color='red')
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=14, fontweight='bold')
+    ax.set_title(f'{metric_type_title} - All Metrics\n(Aggregated across {n_folds} folds)',
+                 fontsize=16, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_dir / 'all_metrics_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"  Saved 4 aggregated plots for {metric_type} to {output_dir}")
+
+
+def plot_aggregated_subgroup_comparison(
+    subgroup_dfs: Dict[str, pd.DataFrame],
+    subgroup_names: List[str],
+    output_path: Path,
+    title: str,
+    n_folds: int,
+    metric: str = 'sensitivity'
+):
+    """
+    Plot aggregated subgroup comparison with min/max bands.
+
+    Args:
+        subgroup_dfs: Dict mapping subgroup name to aggregated DataFrame
+        subgroup_names: List of subgroup names to plot
+        output_path: Path to save plot
+        title: Plot title
+        n_folds: Number of folds
+        metric: Metric to plot ('sensitivity' or 'specificity')
+    """
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(subgroup_names)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']  # Different markers for variety
+
+    for i, name in enumerate(subgroup_names):
+        df = subgroup_dfs.get(name)
+        if df is None or len(df) == 0:
+            continue
+
+        mean_col = f'{metric}_mean'
+        min_col = f'{metric}_min'
+        max_col = f'{metric}_max'
+
+        if mean_col not in df.columns:
+            continue
+
+        valid_df = df[df[mean_col].notna()].sort_values('bin_center', ascending=False)
+        if len(valid_df) == 0:
+            continue
+
+        marker = markers[i % len(markers)]
+        ax.plot(valid_df['bin_center'], valid_df[mean_col],
+                marker=marker, linewidth=2.5, markersize=6, label=name, color=colors[i],
+                markerfacecolor=colors[i], markeredgecolor='black', markeredgewidth=0.5)
+        ax.fill_between(valid_df['bin_center'],
+                         valid_df[min_col],
+                         valid_df[max_col],
+                         alpha=0.2, color=colors[i])
+
+    ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+    metric_label = metric.capitalize()
+    ax.set_ylabel(metric_label, fontsize=14, fontweight='bold')
+    ax.set_title(f'{title}\n(Aggregated across {n_folds} folds)', fontsize=16, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"  Saved aggregated subgroup plot: {output_path.name}")
+
+
+def generate_aggregated_plots(
+    all_fold_results: List[Dict],
+    output_base_dir: Path,
+    n_folds: int
+):
+    """
+    Generate aggregated plots across all folds for all three metric types and subgroups.
+
+    Args:
+        all_fold_results: List of fold result dictionaries
+        output_base_dir: Base output directory
+        n_folds: Total number of folds
+    """
+    logger.info("="*80)
+    logger.info("GENERATING AGGREGATED PLOTS ACROSS FOLDS")
+    logger.info("="*80)
+
+    aggregated_dir = output_base_dir / "aggregated_plots"
+    aggregated_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract three_metric_results_full from each fold and reconstruct DataFrames
+    fold_analyses = []
+    for r in all_fold_results:
+        three_metric_full = r.get('three_metric_results_full', {})
+        if not three_metric_full:
+            continue
+
+        # Reconstruct DataFrames from dicts
+        reconstructed = {}
+
+        # Reconstruct metrics_dict
+        if 'metrics_dict' in three_metric_full:
+            reconstructed['metrics_dict'] = {
+                k: pd.DataFrame(v) if v is not None else None
+                for k, v in three_metric_full['metrics_dict'].items()
+            }
+
+        # Reconstruct subgroup_metrics
+        if 'subgroup_metrics' in three_metric_full:
+            reconstructed['subgroup_metrics'] = {
+                metric_type: {
+                    subgroup: pd.DataFrame(df_dict) if df_dict is not None else None
+                    for subgroup, df_dict in subgroups.items()
+                }
+                for metric_type, subgroups in three_metric_full['subgroup_metrics'].items()
+            }
+
+        if reconstructed:
+            fold_analyses.append(reconstructed)
+
+    if not fold_analyses:
+        logger.warning("No three_metric_results_full data found in fold results. " +
+                      "Please re-run evaluation to generate plots, or use aggregate_existing_results().")
+        return
+
+    # Aggregate and plot each metric type
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        logger.info(f"Aggregating and plotting {metric_type}...")
+
+        # Extract DataFrames for this metric type across folds
+        fold_dfs = []
+        for fold_analysis in fold_analyses:
+            metrics_dict = fold_analysis.get('metrics_dict', {})
+            df = metrics_dict.get(metric_type)
+            if df is not None:
+                fold_dfs.append(df)
+
+        if fold_dfs:
+            # Aggregate DataFrames
+            aggregated_df = _aggregate_dataframes_across_folds(fold_dfs)
+
+            # Plot aggregated metrics
+            metric_output_dir = aggregated_dir / metric_type
+            plot_aggregated_metric_type(aggregated_df, metric_type, metric_output_dir, n_folds)
+        else:
+            logger.warning(f"  No data found for {metric_type}")
+
+    # Aggregate and plot subgroups for each metric type
+    logger.info("Aggregating and plotting subgroups...")
+
+    for metric_type in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+        logger.info(f"  Processing {metric_type} subgroups...")
+
+        # Get all subgroup names across folds
+        all_subgroup_names = set()
+        for fold_analysis in fold_analyses:
+            subgroup_metrics = fold_analysis.get('subgroup_metrics', {})
+            metric_subgroups = subgroup_metrics.get(metric_type, {})
+            all_subgroup_names.update(metric_subgroups.keys())
+
+        if not all_subgroup_names:
+            logger.warning(f"    No subgroups found for {metric_type}")
+            continue
+
+        # Aggregate each subgroup
+        aggregated_subgroups = {}
+        for subgroup_name in all_subgroup_names:
+            fold_subgroup_dfs = []
+            for fold_analysis in fold_analyses:
+                subgroup_metrics = fold_analysis.get('subgroup_metrics', {})
+                metric_subgroups = subgroup_metrics.get(metric_type, {})
+                subgroup_df = metric_subgroups.get(subgroup_name)
+                if subgroup_df is not None:
+                    fold_subgroup_dfs.append(subgroup_df)
+
+            if fold_subgroup_dfs:
+                aggregated_df = _aggregate_dataframes_across_folds(fold_subgroup_dfs)
+                aggregated_subgroups[subgroup_name] = aggregated_df
+
+        # Create subgroup comparison plots
+        subgroup_output_dir = aggregated_dir / metric_type / "subgroups"
+        subgroup_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Diagnosis comparison
+        diagnosis_subgroups = ['healthy', 'acidosis', 'hie', 'unhealthy']
+        available_diagnosis = [s for s in diagnosis_subgroups if s in aggregated_subgroups]
+        if available_diagnosis:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_diagnosis,
+                subgroup_output_dir / 'diagnosis_comparison_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Diagnosis Comparison',
+                n_folds
+            )
+
+        # Unhealthy CS stratification
+        unhealthy_cs = ['unhealthy_cs_pos', 'unhealthy_cs_neg']
+        available_unhealthy_cs = [s for s in unhealthy_cs if s in aggregated_subgroups]
+        if available_unhealthy_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_unhealthy_cs,
+                subgroup_output_dir / 'unhealthy_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Unhealthy: CS Stratification',
+                n_folds
+            )
+
+        # HIE CS stratification
+        hie_cs = ['hie_cs_pos', 'hie_cs_neg']
+        available_hie_cs = [s for s in hie_cs if s in aggregated_subgroups]
+        if available_hie_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_hie_cs,
+                subgroup_output_dir / 'hie_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - HIE: CS Stratification',
+                n_folds
+            )
+
+        # Acidosis CS stratification
+        acidosis_cs = ['acidosis_cs_pos', 'acidosis_cs_neg']
+        available_acidosis_cs = [s for s in acidosis_cs if s in aggregated_subgroups]
+        if available_acidosis_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_cs,
+                subgroup_output_dir / 'acidosis_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: CS Stratification',
+                n_folds
+            )
+
+        # Acidosis BG stratification
+        acidosis_bg = ['acidosis_bg_pos', 'acidosis_bg_neg']
+        available_acidosis_bg = [s for s in acidosis_bg if s in aggregated_subgroups]
+        if available_acidosis_bg:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_bg,
+                subgroup_output_dir / 'acidosis_bg_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: BG Stratification',
+                n_folds
+            )
+
+        # Healthy CS stratification (use specificity instead of sensitivity)
+        healthy_cs = ['healthy_cs_pos', 'healthy_cs_neg']
+        available_healthy_cs = [s for s in healthy_cs if s in aggregated_subgroups]
+        if available_healthy_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_cs,
+                subgroup_output_dir / 'healthy_cs_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: CS Stratification',
+                n_folds,
+                metric='specificity'
+            )
+
+        # Healthy BG stratification (use specificity)
+        healthy_bg = ['healthy_bg_pos', 'healthy_bg_neg']
+        available_healthy_bg = [s for s in healthy_bg if s in aggregated_subgroups]
+        if available_healthy_bg:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg,
+                subgroup_output_dir / 'healthy_bg_stratification_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG Stratification',
+                n_folds,
+                metric='specificity'
+            )
+
+        # Healthy BG×CS combinations (use specificity)
+        healthy_bg_cs = ['healthy_bg_pos_cs_pos', 'healthy_bg_pos_cs_neg',
+                         'healthy_bg_neg_cs_pos', 'healthy_bg_neg_cs_neg']
+        available_healthy_bg_cs = [s for s in healthy_bg_cs if s in aggregated_subgroups]
+        if available_healthy_bg_cs:
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg_cs,
+                subgroup_output_dir / 'healthy_bg_cs_combinations_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG×CS Combinations',
+                n_folds,
+                metric='specificity'
+            )
+
+    logger.info(f"Aggregated plots saved to: {aggregated_dir}")
+    logger.info("="*80)
+
+
 if __name__ == '__main__':
     # Example usage for post-training evaluation
     # Modify these parameters as needed for your setup
@@ -3101,15 +4068,41 @@ if __name__ == '__main__':
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     EXCLUDE_LAST_MINUTES = 30.0  # Exclude last 30 minutes before birth
     REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
+    AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots from existing results
 
-    # Run evaluation pipeline
-    results = main(
-        output_base_dir=OUTPUT_BASE_DIR,
-        target_fpr=TARGET_FPR,
-        device=DEVICE,
-        exclude_last_minutes=EXCLUDE_LAST_MINUTES,
-        regenerate_predictions=REGENERATE_PREDICTIONS
-    )
+    # ============================================================================
+    # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
+    # ============================================================================
+    if not AGGREGATE_ONLY:
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            target_fpr=TARGET_FPR,
+            device=DEVICE,
+            exclude_last_minutes=EXCLUDE_LAST_MINUTES,
+            regenerate_predictions=REGENERATE_PREDICTIONS,
+            aggregate_only=False
+        )
+        print("\nEvaluation pipeline completed!")
+        print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
 
-    print("\nEvaluation pipeline completed!")
-    print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+    # ============================================================================
+    # MODE 2: Aggregate Only (generate aggregated plots from existing results)
+    # ============================================================================
+    else:
+        # Option A: Use main() with aggregate_only=True
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            aggregate_only=True,
+            exclude_last_minutes=EXCLUDE_LAST_MINUTES
+        )
+
+        # Option B: Use aggregate_existing_results() directly
+        # results = aggregate_existing_results(
+        #     output_base_dir=OUTPUT_BASE_DIR,
+        #     regenerate_from_predictions=True,
+        #     exclude_last_minutes=EXCLUDE_LAST_MINUTES
+        # )
+
+        print("\nAggregation completed!")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
