@@ -18,9 +18,9 @@ import pandas as pd
 import torch
 from loguru import logger
 
-from ..base import TestRunner
-from ..metrics import aggregate_predictions, compute_kld_per_timestep, compute_reconstruction_metrics
-from ..visualizers import plot_temporal_accuracy
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.metrics import aggregate_predictions, compute_kld_per_timestep, compute_reconstruction_metrics
+from model.vae_teb_prediction.testing.visualizers import plot_temporal_accuracy
 
 
 def run_temporal_accuracy_analysis(

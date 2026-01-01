@@ -22,9 +22,9 @@ from loguru import logger
 
 from scipy import signal
 
-from ..base import TestRunner
-from ..metrics import aggregate_predictions
-from ..visualizers import plot_coherence_analysis
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.metrics import aggregate_predictions
+from model.vae_teb_prediction.testing.visualizers import plot_coherence_analysis
 
 
 def compute_stft_coherence(

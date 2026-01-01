@@ -22,10 +22,10 @@ For individual analyses:
 from __future__ import annotations
 
 # Core components
-from .base import TestRunner
+from model.vae_teb_prediction.testing.base import TestRunner
 
 # Metric functions
-from .metrics import (
+from model.vae_teb_prediction.testing.metrics import (
     aggregate_predictions,
     compute_kld,
     compute_kld_per_sample,
@@ -34,7 +34,7 @@ from .metrics import (
 )
 
 # Data collectors
-from .collectors import (
+from model.vae_teb_prediction.testing.collectors import (
     collect_kld_trajectory,
     collect_latents,
     collect_metrics,
@@ -42,7 +42,7 @@ from .collectors import (
 )
 
 # Static visualizers (Matplotlib)
-from .visualizers import (
+from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_analysis,
     plot_kld_trajectory,
     plot_latent_distributions,
@@ -52,7 +52,7 @@ from .visualizers import (
 )
 
 # Interactive visualizers (Plotly)
-from .visualizers_interactive import (
+from model.vae_teb_prediction.testing.visualizers_interactive import (
     plot_kld_trajectory_interactive,
     plot_latent_interpolation_interactive,
     plot_latent_space_3d,
@@ -61,7 +61,7 @@ from .visualizers_interactive import (
 )
 
 # Analysis modules
-from .analyses import (
+from model.vae_teb_prediction.testing.analyses import (
     TrajectoryAnalyzer,
     run_all_analyses,
     run_coherence_analysis,
