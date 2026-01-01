@@ -13,26 +13,59 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 from loguru import logger
+import yaml
+
+# Add project root to sys.path for imports
+project_root = Path(__file__).resolve().parents[4]  # Go up 4 levels to reach project root
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# Import testing components
+from model.vae_teb_prediction.testing.base import TestRunner
+from model.vae_teb_prediction.testing.analyses import (
+    run_histogram_analysis,
+    run_latent_distribution_analysis,
+    run_temporal_accuracy_analysis,
+    run_coherence_analysis,
+    run_trajectory_analysis,
+)
+from model.vae_teb_prediction.testing.collectors import collect_predictions
+from model.vae_teb_prediction.testing.visualizers import plot_reconstruction_sample
+from model.vae_teb_prediction.testing.visualizers_interactive import (
+    plot_reconstruction_interactive,
+    plot_metrics_comparison_interactive,
+)
+
+# Import data loading utilities
+from hdf5_dataset.hdf5_dataset import create_optimized_dataloader, build_guid_filtered_dataloader
+
+# Import standard library
+import json
 
 
 def run_full_test_pipeline(
     checkpoint_path: str,
-    data_path: Union[str, List[str]],
+    data_path: Optional[Union[str, List[str]]],
     output_dir: str = "test_results",
     stats_path: Optional[str] = None,
     device: Optional[str] = None,
     max_samples: Optional[int] = None,
-    batch_size: int = 32,
+    batch_size: Optional[int] = None,
     skip_trajectory: bool = False,
     skip_coherence: bool = False,
     skip_interactive: bool = False,
     min_epochs_per_guid: int = 10,
     max_guids: Optional[int] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    num_workers: Optional[int] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    dataset_kwargs: Optional[Dict[str, Any]] = None,
     **model_kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -45,17 +78,24 @@ def run_full_test_pipeline(
     Args:
         checkpoint_path: Path to model checkpoint (.ckpt or .pt).
         data_path: Path(s) to test dataset(s). Can be a single HDF5 file path
-            or a list of paths for multiple files.
+            or a list of paths for multiple files. If None, config_path must be
+            provided and include dataset_config.vae_test_datasets.
         output_dir: Directory for saving results.
         stats_path: Path to normalization statistics HDF5 file (optional).
         device: Device string ("cuda:0", "cpu"). Auto-detects if None.
         max_samples: Maximum samples to process for standard analyses. None for all.
-        batch_size: Batch size for standard data loading.
+        batch_size: Batch size for standard data loading. If None and config_path
+            is provided, uses general_config.batch_size.test.
         skip_trajectory: Skip trajectory analysis (faster).
         skip_coherence: Skip coherence analysis (faster).
         skip_interactive: Skip Plotly interactive plots.
         min_epochs_per_guid: Minimum epochs per patient for trajectory analysis.
         max_guids: Maximum patients for trajectory analysis (None for all).
+        config_path: Optional path to a YAML config matching trainer.py.
+        num_workers: DataLoader worker count. If None and config_path is provided,
+            uses dataset_config.dataloader_config.num_workers.
+        normalize_fields: Fields to normalize (None uses config or stats defaults).
+        dataset_kwargs: Additional CombinedHDF5Dataset kwargs. Merged over config.
         **model_kwargs: Additional model architecture parameters
             (e.g., latent_dim=16, hidden_dim=64).
 
@@ -73,31 +113,32 @@ def run_full_test_pipeline(
         ... )
         >>> print(f"Mean VAF: {results['histogram']['vaf'].mean():.4f}")
     """
-    # Import here to avoid circular imports
-    from model.vae_teb_prediction.testing.base import TestRunner
-    from model.vae_teb_prediction.testing.analyses import (
-        run_histogram_analysis,
-        run_latent_distribution_analysis,
-        run_temporal_accuracy_analysis,
-        run_coherence_analysis,
-        run_trajectory_analysis,
-    )
-    from model.vae_teb_prediction.testing.collectors import collect_predictions
-    from model.vae_teb_prediction.testing.visualizers import plot_reconstruction_sample
-    from model.vae_teb_prediction.testing.visualizers_interactive import (
-        plot_reconstruction_interactive,
-        plot_metrics_comparison_interactive,
-    )
-
     # Resolve paths
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
 
-    # Normalize data_path to list of strings for CombinedHDF5Dataset
+    # Normalize data_path to list of strings
+    data_paths: List[str] = []
     if isinstance(data_path, str):
         data_paths = [data_path]
-    else:
+    elif data_path is not None:
         data_paths = list(data_path)
+
+    data_paths, stats_path, batch_size, num_workers, normalize_fields, dataset_kwargs = _resolve_dataloader_settings(
+        data_paths=data_paths,
+        stats_path=stats_path,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        normalize_fields=normalize_fields,
+        dataset_kwargs=dataset_kwargs,
+        config_path=config_path,
+    )
+
+    if not data_paths:
+        raise ValueError(
+            "No test data provided. Pass data_path or supply config_path with "
+            "dataset_config.vae_test_datasets."
+        )
 
     # Auto-detect device
     if device is None:
@@ -105,9 +146,13 @@ def run_full_test_pipeline(
     device = torch.device(device)
 
     logger.info(f"Checkpoint: {checkpoint_path}")
-    logger.info(f"Data: {data_path}")
+    logger.info(f"Data: {data_paths}")
     logger.info(f"Output: {output_dir}")
+    logger.info(f"Stats: {stats_path}")
+    if config_path is not None:
+        logger.info(f"Config: {config_path}")
     logger.info(f"Device: {device}")
+    logger.info(f"Batch size: {batch_size}")
 
     # ----- Step 1: Create TestRunner -----
     logger.info("Loading model from checkpoint...")
@@ -121,7 +166,14 @@ def run_full_test_pipeline(
     # ----- Step 2: Create DataLoaders -----
     # Standard loader for most analyses
     logger.info("Creating standard test dataloader...")
-    standard_loader = _create_dataloader(data_paths, batch_size, stats_path)
+    standard_loader = _create_dataloader(
+        data_paths,
+        batch_size,
+        stats_path,
+        normalize_fields=normalize_fields,
+        num_workers=num_workers,
+        dataset_kwargs=dataset_kwargs,
+    )
 
     # GUID-based loader for trajectory analysis (each batch = one patient)
     guid_loader = None
@@ -132,7 +184,17 @@ def run_full_test_pipeline(
             stats_path=stats_path,
             min_epochs_per_guid=min_epochs_per_guid,
             max_guids=max_guids,
+            normalize_fields=normalize_fields,
+            num_workers=num_workers,
+            dataset_kwargs=dataset_kwargs,
         )
+
+    if not skip_coherence:
+        dataset = getattr(standard_loader, "dataset", None)
+        load_fields = getattr(dataset, "load_fields", None)
+        if load_fields is not None and "up" not in load_fields:
+            logger.warning("Coherence analysis skipped because 'up' is not in dataset load_fields.")
+            skip_coherence = True
 
     # ----- Step 3: Run analyses -----
     results: Dict[str, Any] = {}
@@ -194,8 +256,11 @@ def run_full_test_pipeline(
 
 def _create_dataloader(
     data_path: Union[str, Path, Sequence[Union[str, Path]]],
-    batch_size: int = 32,
+    batch_size: int,
     stats_path: Optional[str] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    num_workers: int = 0,
+    dataset_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
     Create a standard DataLoader for the test dataset.
@@ -208,26 +273,24 @@ def _create_dataloader(
     Returns:
         DataLoader for the test dataset.
     """
-    from torch.utils.data import DataLoader
-    from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
-
     paths = list(data_path) if isinstance(data_path, (list, tuple)) else [data_path]
-    dataset = CombinedHDF5Dataset(
-        paths=[str(p) for p in paths],
-        stats_path=stats_path,
-        cache_size=500,
-        pin_memory=torch.cuda.is_available(),
-    )
+    resolved_kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
+    if "pin_memory" not in resolved_kwargs:
+        resolved_kwargs["pin_memory"] = True
 
-    loader = DataLoader(
-        dataset,
+    loader = create_optimized_dataloader(
+        hdf5_files=[str(p) for p in paths],
         batch_size=batch_size,
+        num_workers=num_workers,
         shuffle=False,
-        num_workers=0,  # Set to 0 for Windows compatibility
-        pin_memory=torch.cuda.is_available(),
+        stats_path=stats_path,
+        normalize_fields=normalize_fields,
+        rank=0,
+        world_size=1,
+        **resolved_kwargs,
     )
 
-    logger.info(f"Loaded {len(dataset)} test samples")
+    logger.info(f"Loaded {len(loader.dataset)} test samples")
     return loader
 
 
@@ -236,6 +299,9 @@ def _create_guid_dataloader(
     stats_path: Optional[str] = None,
     min_epochs_per_guid: int = 3,
     max_guids: Optional[int] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    num_workers: Optional[int] = None,
+    dataset_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
     Create a GUID-based DataLoader where each batch contains all samples from one GUID.
@@ -252,27 +318,97 @@ def _create_guid_dataloader(
     Returns:
         Tuple of (eligible_guids, DataLoader).
     """
-    from hdf5_dataset.hdf5_dataset import build_guid_filtered_dataloader
-
     paths = list(data_path) if isinstance(data_path, (list, tuple)) else [data_path]
+    resolved_kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
+    if "pin_memory" not in resolved_kwargs:
+        resolved_kwargs["pin_memory"] = True
+
+    loader_overrides = {}
+    if num_workers is not None:
+        loader_overrides["num_workers"] = num_workers
     eligible_guids, loader = build_guid_filtered_dataloader(
         dataset_paths=[str(p) for p in paths],
         min_samples=min_epochs_per_guid,
         max_guids=max_guids,
         sampler_shuffle=False,
         stats_path=stats_path,
-        cache_size=500,
-        pin_memory=torch.cuda.is_available(),
+        normalize_fields=normalize_fields,
+        dataloader_overrides=loader_overrides if loader_overrides else None,
+        **resolved_kwargs,
     )
 
     logger.info(f"GUID-based loader: {len(eligible_guids)} patients with >= {min_epochs_per_guid} epochs")
     return eligible_guids, loader
 
 
+def _load_config(path: Union[str, Path]) -> Dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    return config or {}
+
+
+def _resolve_dataloader_settings(
+    *,
+    data_paths: List[str],
+    stats_path: Optional[str],
+    batch_size: Optional[int],
+    num_workers: Optional[int],
+    normalize_fields: Optional[Sequence[str]],
+    dataset_kwargs: Optional[Dict[str, Any]],
+    config_path: Optional[Union[str, Path]],
+) -> tuple[List[str], Optional[str], int, int, Optional[Sequence[str]], Dict[str, Any]]:
+    resolved_paths = list(data_paths) if data_paths else []
+    resolved_stats = stats_path
+    resolved_batch_size = batch_size
+    resolved_workers = num_workers
+    resolved_normalize_fields = normalize_fields
+    resolved_kwargs = {} if dataset_kwargs is None else dict(dataset_kwargs)
+
+    if config_path is not None:
+        config = _load_config(config_path)
+        dataset_cfg = config.get("dataset_config", {}) or {}
+        dataloader_cfg = dataset_cfg.get("dataloader_config", {}) or {}
+
+        if not resolved_paths:
+            resolved_paths = list(dataset_cfg.get("vae_test_datasets", []) or [])
+        if resolved_stats is None:
+            resolved_stats = dataset_cfg.get("stat_path")
+        if resolved_batch_size is None:
+            resolved_batch_size = (
+                config.get("general_config", {})
+                .get("batch_size", {})
+                .get("test")
+            )
+        if resolved_workers is None:
+            resolved_workers = dataloader_cfg.get("num_workers", 0)
+        if resolved_normalize_fields is None:
+            resolved_normalize_fields = dataloader_cfg.get("normalize_fields")
+
+        config_dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
+        merged_kwargs = dict(config_dataset_kwargs)
+        merged_kwargs.update(resolved_kwargs)
+        resolved_kwargs = merged_kwargs
+
+    if resolved_batch_size is None:
+        resolved_batch_size = 32
+    if resolved_workers is None:
+        resolved_workers = 0
+
+    return (
+        resolved_paths,
+        resolved_stats,
+        resolved_batch_size,
+        resolved_workers,
+        resolved_normalize_fields,
+        resolved_kwargs,
+    )
+
+
 def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
     """Save a text summary of results."""
-    import json
-
     summary_path = output_dir / "test_summary.json"
 
     # Extract serializable metrics
@@ -304,10 +440,14 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
 # ----- Convenience function for quick testing -----
 def quick_test(
     checkpoint_path: str,
-    data_path: str,
+    data_path: Optional[str],
     output_dir: str = "quick_test_results",
     stats_path: Optional[str] = None,
     n_samples: int = 100,
+    config_path: Optional[Union[str, Path]] = None,
+    num_workers: Optional[int] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    dataset_kwargs: Optional[Dict[str, Any]] = None,
     **model_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -315,10 +455,14 @@ def quick_test(
 
     Args:
         checkpoint_path: Path to checkpoint.
-        data_path: Path to test data.
+        data_path: Path to test data (optional if config_path is provided).
         output_dir: Output directory.
         stats_path: Path to normalization statistics (optional).
         n_samples: Number of samples to process (default 100).
+        config_path: Optional path to a YAML config matching trainer.py.
+        num_workers: DataLoader worker count.
+        normalize_fields: Fields to normalize.
+        dataset_kwargs: Additional CombinedHDF5Dataset kwargs.
         **model_kwargs: Model architecture parameters.
 
     Returns:
@@ -333,6 +477,10 @@ def quick_test(
         skip_trajectory=True,
         skip_coherence=True,
         skip_interactive=True,
+        config_path=config_path,
+        num_workers=num_workers,
+        normalize_fields=normalize_fields,
+        dataset_kwargs=dataset_kwargs,
         **model_kwargs,
     )
 
@@ -341,8 +489,9 @@ def quick_test(
 if __name__ == "__main__":
     # Example: Edit these paths for your setup
     CHECKPOINT = "path/to/your/model.ckpt"
-    DATA = ["path/to/your/test_data.h5"]  # Can be a single path or list of paths
-    STATS = "path/to/your/stats.h5"  # Optional normalization stats
+    DATA = None  # Use config_path to pull dataset settings
+    STATS = None  # Optional normalization stats if not using config_path
+    CONFIG = "path/to/your/config.yaml"
     OUTPUT = "test_results"
 
     # Run full pipeline
@@ -351,6 +500,7 @@ if __name__ == "__main__":
         data_path=DATA,
         output_dir=OUTPUT,
         stats_path=STATS,  # Optional
+        config_path=CONFIG,
         max_samples=None,  # Process all samples
     )
 
