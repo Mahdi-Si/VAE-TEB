@@ -24,40 +24,31 @@ from scipy import stats as scipy_stats
 # Set publication-quality style - optimized for high-impact journals
 plt.style.use("default")  # Start from clean slate
 
-# Publication-quality rcParams
-# Optimized for: Nature, Science, Cell, PNAS, and similar high-impact journals
 plt.rcParams.update({
-    # Figure and saving settings
     "figure.dpi": 150,
-    "savefig.dpi": 600,  # 600 DPI for publication quality
+    "savefig.dpi": 600,
     "savefig.format": "png",
     "savefig.bbox": "tight",
     "savefig.pad_inches": 0.05,
-
-    # Font settings - professional and publication-ready
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial", "DejaVu Sans", "Helvetica", "Liberation Sans"],
-    "font.size": 6,
-    "axes.titlesize": 7,
-    "axes.labelsize": 5,
-    "xtick.labelsize": 5,
-    "ytick.labelsize": 5,
-    "legend.fontsize": 5,
-    "legend.title_fontsize": 5,
-
-    # Axes styling - clean and professional
-    "axes.linewidth": 0.5,
+    "font.size": 8,
+    "axes.titlesize": 9,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
+    "legend.fontsize": 7,
+    "legend.title_fontsize": 7,
+    "axes.linewidth": 0.6,
     "axes.edgecolor": "#000000",
     "axes.labelcolor": "#000000",
     "axes.spines.top": True,
     "axes.spines.right": True,
     "axes.spines.left": True,
     "axes.spines.bottom": True,
-    # "axes.titleweight": "bold",
+    "axes.titleweight": "bold",
     "axes.labelweight": "normal",
     "axes.axisbelow": True,
-
-    # Tick settings - publication standard
     "xtick.direction": "in",
     "ytick.direction": "in",
     "xtick.major.size": 3.0,
@@ -70,34 +61,22 @@ plt.rcParams.update({
     "ytick.minor.width": 0.3,
     "xtick.color": "#000000",
     "ytick.color": "#000000",
-
-    # Grid - subtle and professional
     "grid.alpha": 0.25,
     "grid.linewidth": 0.3,
     "grid.color": "#E0E0E0",
     "grid.linestyle": "-",
-
-    # Legend - clean and unobtrusive
     "legend.frameon": True,
     "legend.framealpha": 0.95,
     "legend.fancybox": False,
     "legend.edgecolor": "#000000",
     "legend.shadow": False,
-
-    # Lines - thin and clean
-    "lines.linewidth": 0.6,
-    "lines.markersize": 2,
+    "lines.linewidth": 1.0,
+    "lines.markersize": 3,
     "lines.markeredgewidth": 0.0,
-
-    # Background colors
     "figure.facecolor": "white",
     "axes.facecolor": "white",
     "savefig.facecolor": "white",
-
-    # Error bars
     "errorbar.capsize": 3,
-
-    # Math text
     "mathtext.default": "regular",
 })
 
@@ -118,6 +97,10 @@ PALETTE_PRIMARY = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_PURPLE]
 PALETTE_EXTENDED = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_PURPLE,
                     COLOR_SKY, COLOR_VERMILLION, COLOR_GRAY]
 SAVE_DPI = 600
+FONT_LABEL = plt.rcParams["axes.labelsize"]
+FONT_TITLE = plt.rcParams["axes.titlesize"]
+FONT_TICK = plt.rcParams["xtick.labelsize"]
+FONT_LEGEND = plt.rcParams["legend.fontsize"]
 
 
 def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) -> None:
@@ -146,7 +129,24 @@ def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) 
         if spine in ax.spines:
             ax.spines[spine].set_visible(True)
             ax.spines[spine].set_color("#000000")
-            ax.spines[spine].set_linewidth(0.5)
+            ax.spines[spine].set_linewidth(0.6)
+
+
+def _add_colorbar(
+    fig: plt.Figure,
+    mappable: Any,
+    ax: plt.Axes,
+    *,
+    label: Optional[str] = None,
+    shrink: float = 0.8,
+    pad: float = 0.02,
+) -> plt.Axes:
+    """Attach a single-column aligned colorbar matching plot_utils.py."""
+    cbar = fig.colorbar(mappable, ax=ax, shrink=shrink, pad=pad)
+    if label:
+        cbar.set_label(label, fontsize=plt.rcParams["axes.labelsize"])
+    cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+    return cbar
 
 
 def _format_stats_box(n: int, mean: float, std: float, median: float, **kwargs) -> str:
@@ -210,8 +210,8 @@ def plot_metric_histograms(
 
     for ax, (col, title, color, unit) in zip(axes, metrics_config):
         if col not in df.columns:
-            ax.text(0.5, 0.5, f"No {col} data", ha="center", va="center", fontsize=5)
-            ax.set_title(title, fontsize=6, fontweight="bold")
+            ax.text(0.5, 0.5, f"No {col} data", ha="center", va="center", fontsize=FONT_LABEL)
+            ax.set_title(title, fontsize=FONT_TITLE, fontweight="bold")
             continue
 
         # Get finite values only
@@ -219,8 +219,8 @@ def plot_metric_histograms(
         values = values[np.isfinite(values)]
 
         if len(values) == 0:
-            ax.text(0.5, 0.5, "No valid data", ha="center", va="center", fontsize=5)
-            ax.set_title(title, fontsize=6, fontweight="bold")
+            ax.text(0.5, 0.5, "No valid data", ha="center", va="center", fontsize=FONT_LABEL)
+            ax.set_title(title, fontsize=FONT_TITLE, fontweight="bold")
             continue
 
         # Compute statistics
@@ -249,7 +249,7 @@ def plot_metric_histograms(
         stats_text = _format_stats_box(len(values), mean_val, std_val, median_val, **kwargs)
         ax.text(
             0.97, 0.97, stats_text,
-            transform=ax.transAxes, fontsize=7,
+            transform=ax.transAxes, fontsize=FONT_LEGEND,
             verticalalignment="top", horizontalalignment="right",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                      edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
@@ -257,14 +257,14 @@ def plot_metric_histograms(
 
         # Labels and styling
         xlabel = f"{col.upper()}" + (f" ({unit})" if unit else "")
-        ax.set_xlabel(xlabel, fontsize=5)
-        ax.set_ylabel("Density", fontsize=5)
-        ax.set_title(title, fontsize=6, fontweight="bold", pad=8)
+        ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
+        ax.set_ylabel("Density", fontsize=FONT_LABEL)
+        ax.set_title(title, fontsize=FONT_TITLE, fontweight="bold", pad=8)
         _style_axes(ax, grid="major", minor_ticks=False)
 
         # Add subtle legend only to first panel
         if ax == axes[0]:
-            ax.legend(loc="upper left", fontsize=6, framealpha=0.9)
+            ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.9)
 
     fig.tight_layout(pad=1.5)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
@@ -330,16 +330,16 @@ def plot_latent_distributions(
                           alpha=0.6)
 
                 # Styling
-                ax.set_title(f"$z_{{{idx}}}$", fontsize=5, fontweight="bold")
+                ax.set_title(f"$z_{{{idx}}}$", fontsize=FONT_LABEL, fontweight="bold")
                 ax.set_xlabel("")
-                ax.set_ylabel("Density" if idx % cols == 0 else "", fontsize=7)
-                ax.tick_params(axis='both', which='major', labelsize=6)
+                ax.set_ylabel("Density" if idx % cols == 0 else "", fontsize=FONT_LEGEND)
+                ax.tick_params(axis='both', which='major', labelsize=FONT_TICK)
 
                 _style_axes(ax, grid="major", minor_ticks=False)
         else:
             ax.axis("off")
 
-    fig.suptitle("Latent Space Distributions", fontsize=10, fontweight="bold", y=0.99)
+    fig.suptitle("Latent Space Distributions", fontsize=FONT_TITLE, fontweight="bold", y=0.99)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -413,19 +413,19 @@ def plot_reconstruction_sample(
     )
     ax1.text(
         0.02, 0.98, metrics_text,
-        transform=ax1.transAxes, fontsize=7,
+        transform=ax1.transAxes, fontsize=FONT_LEGEND,
         verticalalignment="top",
         bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                  edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
     )
 
     ax1.set_xlabel("")
-    ax1.set_ylabel("FHR (normalized)", fontsize=5)
+    ax1.set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
     ax1.set_title(
         f"Reconstruction Quality: GUID={sample.get('guid', 'N/A')}, Epoch={sample.get('epoch', 'N/A')}",
-        fontsize=6, fontweight="bold", pad=8
+        fontsize=FONT_TITLE, fontweight="bold", pad=8
     )
-    ax1.legend(loc="upper right", fontsize=7, framealpha=0.95)
+    ax1.legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
     ax1.set_xlim(0, time[-1])
     _style_axes(ax1, grid="both", minor_ticks=True)
 
@@ -441,14 +441,14 @@ def plot_reconstruction_sample(
     # Add RMSE annotation
     ax2.text(
         0.98, 0.95, f"RMSE = {rmse:.4f}",
-        transform=ax2.transAxes, fontsize=7,
+        transform=ax2.transAxes, fontsize=FONT_LEGEND,
         verticalalignment="top", horizontalalignment="right",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                  edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
     )
 
     ax2.set_xlabel("")
-    ax2.set_ylabel("Residual", fontsize=5)
+    ax2.set_ylabel("Residual", fontsize=FONT_LABEL)
     ax2.set_xlim(0, time[-1])
     _style_axes(ax2, grid="major", minor_ticks=False)
 
@@ -464,17 +464,15 @@ def plot_reconstruction_sample(
             interpolation="nearest",
             vmin=-vmax, vmax=vmax,
         )
-        ax3.set_xlabel("Time (min)", fontsize=5)
-        ax3.set_ylabel("Latent dimension", fontsize=5)
-        ax3.set_title("Latent Representation $\\mathbf{z}(t)$", fontsize=6, fontweight="bold")
+        ax3.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+        ax3.set_ylabel("Latent dimension", fontsize=FONT_LABEL)
+        ax3.set_title("Latent Representation $\\mathbf{z}(t)$", fontsize=FONT_TITLE, fontweight="bold")
 
-        # Add colorbar with better formatting
-        cbar = plt.colorbar(im, ax=ax3, label="Value", pad=0.02, aspect=20)
-        cbar.ax.tick_params(labelsize=7)
+        _add_colorbar(fig, im, ax3, label="Value", shrink=0.8, pad=0.02)
         _style_axes(ax3, grid="major", minor_ticks=False)
     else:
         ax3.text(0.5, 0.5, "No latent data available",
-                ha="center", va="center", fontsize=5)
+                ha="center", va="center", fontsize=FONT_LABEL)
         ax3.axis("off")
 
     fig.tight_layout(pad=1.0)
@@ -541,10 +539,10 @@ def plot_temporal_accuracy(
     ax1.axvline(warmup_steps, color=COLOR_GRAY,
                linewidth=0.6, alpha=0.6, zorder=1)
 
-    ax1.set_ylabel("Variance Accounted For", fontsize=5)
+    ax1.set_ylabel("Variance Accounted For", fontsize=FONT_LABEL)
     ax1.set_title("Reconstruction Quality vs. Timestep",
-                 fontsize=6, fontweight="bold", pad=8)
-    ax1.legend(loc="lower right", fontsize=7, framealpha=0.95)
+                 fontsize=FONT_TITLE, fontweight="bold", pad=8)
+    ax1.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
     ax1.set_ylim(0, 1.05)
     _style_axes(ax1, grid="both", minor_ticks=True)
 
@@ -566,9 +564,9 @@ def plot_temporal_accuracy(
     ax2.axvline(warmup_steps, color=COLOR_GRAY,
                linewidth=0.6, alpha=0.6, zorder=1)
 
-    ax2.set_xlabel("Timestep (prediction index)", fontsize=5)
-    ax2.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=5)
-    ax2.legend(loc="lower right", fontsize=7, framealpha=0.95)
+    ax2.set_xlabel("Timestep (prediction index)", fontsize=FONT_LABEL)
+    ax2.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=FONT_LABEL)
+    ax2.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax2, grid="both", minor_ticks=True)
 
     fig.tight_layout(pad=1.0)
@@ -644,15 +642,15 @@ def plot_within_window_accuracy(
         alpha=0.2,
     )
 
-    axes[0].set_ylabel("Absolute error", fontsize=5)
-    axes[0].set_title("Within-Window Accuracy", fontsize=6, fontweight="bold", pad=6)
+    axes[0].set_ylabel("Absolute error", fontsize=FONT_LABEL)
+    axes[0].set_title("Within-Window Accuracy", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     axes[0].set_ylim(bottom=0.0)
-    axes[0].legend(loc="upper right", fontsize=7, framealpha=0.95)
+    axes[0].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(axes[0], grid="both", minor_ticks=True)
 
     secax = axes[0].secondary_xaxis("top", functions=(lambda v: v / fs, lambda s: s * fs))
-    secax.set_xlabel("Time from window start (seconds)", fontsize=5)
-    secax.tick_params(labelsize=8)
+    secax.set_xlabel("Time from window start (seconds)", fontsize=FONT_LABEL)
+    secax.tick_params(labelsize=FONT_TICK)
 
     panel_idx = 1
     if has_vaf:
@@ -666,9 +664,9 @@ def plot_within_window_accuracy(
             markevery=max(1, len(x) // 30),
             label="VAF",
         )
-        axes[panel_idx].set_ylabel("VAF", fontsize=5)
+        axes[panel_idx].set_ylabel("VAF", fontsize=FONT_LABEL)
         axes[panel_idx].set_ylim(0.0, 1.0)
-        axes[panel_idx].legend(loc="lower right", fontsize=7, framealpha=0.95)
+        axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
         panel_idx += 1
 
@@ -683,11 +681,11 @@ def plot_within_window_accuracy(
             markevery=max(1, len(x) // 30),
             label="SNR",
         )
-        axes[panel_idx].set_ylabel("SNR (dB)", fontsize=5)
-        axes[panel_idx].legend(loc="lower right", fontsize=7, framealpha=0.95)
+        axes[panel_idx].set_ylabel("SNR (dB)", fontsize=FONT_LABEL)
+        axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
 
-    axes[-1].set_xlabel("Index from window start (samples)", fontsize=5)
+    axes[-1].set_xlabel("Index from window start (samples)", fontsize=FONT_LABEL)
     axes[-1].set_xlim(0, np.max(x) if len(x) else 1)
 
     fig.tight_layout()
@@ -777,12 +775,12 @@ def plot_kld_trajectory(
             alpha=0.25, color=COLOR_BLUE,
         )
 
-    ax.set_xlabel("Hours Before Birth", fontsize=5)
-    ax.set_ylabel("KLD (Transfer Entropy)", fontsize=5)
-    ax.set_title("Transfer Entropy Evolution Before Delivery", fontsize=6, fontweight="bold", pad=6)
+    ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
+    ax.set_ylabel("KLD (Transfer Entropy)", fontsize=FONT_LABEL)
+    ax.set_title("Transfer Entropy Evolution Before Delivery", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     ax.invert_xaxis()  # Time flows right-to-left toward birth
     if has_labels:
-        ax.legend(loc="upper left", fontsize=7, framealpha=0.95)
+        ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
@@ -824,13 +822,13 @@ def plot_coherence_analysis(
         label="UP vs Reconstructed FHR",
     )
 
-    ax.set_xlabel("Frequency (Hz)", fontsize=5)
-    ax.set_ylabel("Coherence", fontsize=5)
-    ax.set_title("UP-FHR Spectral Coherence Comparison", fontsize=5, fontweight="bold", pad=6)
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
+    ax.set_title("UP-FHR Spectral Coherence Comparison", fontsize=FONT_LABEL, fontweight="bold", pad=6)
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     ax.set_xlim(0, max_freq)
     ax.set_ylim(0, 1)
-    ax.legend(fontsize=7, framealpha=0.95)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
@@ -868,13 +866,13 @@ def plot_reconstruction_coherence(
         alpha=0.2,
     )
 
-    ax.set_xlabel("Frequency (Hz)", fontsize=5)
-    ax.set_ylabel("Coherence", fontsize=5)
-    ax.set_title("FHR Reconstruction Coherence", fontsize=6, fontweight="bold", pad=6)
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
+    ax.set_title("FHR Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     ax.set_xlim(0, max_freq)
     ax.set_ylim(0, 1)
-    ax.legend(fontsize=7, framealpha=0.95)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
@@ -958,12 +956,12 @@ def plot_psd_comparison(
                 zorder=1,
             )
 
-    ax.set_xlabel("Frequency (Hz)", fontsize=5)
-    ax.set_ylabel("PSD (dB/Hz)", fontsize=5)
-    ax.set_title("Power Spectral Density Comparison (Welch)", fontsize=6, fontweight="bold", pad=6)
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("PSD (dB/Hz)", fontsize=FONT_LABEL)
+    ax.set_title("Power Spectral Density Comparison (Welch)", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     ax.set_xlim(0, max_freq)
-    ax.legend(fontsize=7, framealpha=0.95)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
@@ -1025,10 +1023,10 @@ def plot_cross_correlation(
     ax.axhline(0.0, color=COLOR_LIGHT_GRAY,
               linewidth=0.6, alpha=0.5, zorder=0)
 
-    ax.set_xlabel("Lag (seconds)", fontsize=5)
-    ax.set_ylabel("Normalized correlation", fontsize=5)
-    ax.set_title("Cross-Correlation Analysis", fontsize=6, fontweight="bold", pad=6)
-    ax.legend(fontsize=6, framealpha=0.95, loc="best")
+    ax.set_xlabel("Lag (seconds)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Normalized correlation", fontsize=FONT_LABEL)
+    ax.set_title("Cross-Correlation Analysis", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95, loc="best")
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
@@ -1078,22 +1076,22 @@ def plot_coherence_signals(
             linewidth=0.9,
             label="Reconstructed FHR",
         )
-        axes[0].set_ylabel("FHR (normalized)", fontsize=5)
-        axes[0].set_title(title or "FHR Reconstruction", fontsize=6, fontweight="bold", pad=6)
-        axes[0].legend(loc="upper right", fontsize=7, framealpha=0.95)
+        axes[0].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
+        axes[0].set_title(title or "FHR Reconstruction", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+        axes[0].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
 
         residual = fhr_original - fhr_reconstructed
         axes[1].plot(time_min, residual, color=COLOR_GREEN, linewidth=0.6)
         axes[1].axhline(0.0, color=COLOR_BLACK, alpha=0.5, linewidth=0.7)
-        axes[1].set_xlabel("Time (minutes)", fontsize=5)
-        axes[1].set_ylabel("Residual", fontsize=5)
+        axes[1].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
+        axes[1].set_ylabel("Residual", fontsize=FONT_LABEL)
         _style_axes(axes[0], grid="both", minor_ticks=True)
         _style_axes(axes[1], grid="major", minor_ticks=False)
     else:
         fig, axes = plt.subplots(3, 1, figsize=(7.0, 5.5), sharex=True)
         axes[0].plot(time_min, up_signal, color=COLOR_PURPLE, linewidth=0.5)
-        axes[0].set_ylabel("UP (normalized)", fontsize=5)
-        axes[0].set_title(title or "UP and FHR Signals", fontsize=6, fontweight="bold", pad=6)
+        axes[0].set_ylabel("UP (normalized)", fontsize=FONT_LABEL)
+        axes[0].set_title(title or "UP and FHR Signals", fontsize=FONT_TITLE, fontweight="bold", pad=6)
 
         axes[1].plot(time_min, fhr_original, color=COLOR_BLUE, linewidth=0.7, label="Original FHR")
         axes[1].plot(
@@ -1103,14 +1101,14 @@ def plot_coherence_signals(
             linewidth=0.9,
             label="Reconstructed FHR",
         )
-        axes[1].set_ylabel("FHR (normalized)", fontsize=5)
-        axes[1].legend(loc="upper right", fontsize=7, framealpha=0.95)
+        axes[1].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
+        axes[1].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
 
         residual = fhr_original - fhr_reconstructed
         axes[2].plot(time_min, residual, color=COLOR_GREEN, linewidth=0.5)
         axes[2].axhline(0.0, color=COLOR_BLACK, alpha=0.5, linewidth=0.6)
-        axes[2].set_xlabel("Time (minutes)", fontsize=5)
-        axes[2].set_ylabel("Residual", fontsize=5)
+        axes[2].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
+        axes[2].set_ylabel("Residual", fontsize=FONT_LABEL)
         _style_axes(axes[0], grid="both", minor_ticks=True)
         _style_axes(axes[1], grid="both", minor_ticks=True)
         _style_axes(axes[2], grid="major", minor_ticks=False)
@@ -1156,14 +1154,14 @@ def plot_time_frequency_coherence(
     if coherence_reconstructed is None:
         fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.0))
         im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
-        ax.set_xlabel("Time (minutes)", fontsize=5)
-        ax.set_ylabel("Frequency (Hz)", fontsize=5)
-        ax.set_title("FHR Reconstruction Coherence", fontsize=6, fontweight="bold", pad=6)
-        fig.colorbar(im, ax=ax, label="Coherence", pad=0.02)
+        ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
+        ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
+        ax.set_title("FHR Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+        _add_colorbar(fig, im, ax, label="Coherence", shrink=0.8, pad=0.02)
         _style_axes(ax, grid="major")
 
         if title:
-            fig.suptitle(title, fontsize=12, y=0.98)
+            fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
 
         fig.tight_layout()
         fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
@@ -1176,26 +1174,26 @@ def plot_time_frequency_coherence(
     fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.0), sharex=True)
 
     im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
-    axes[0].set_ylabel("Frequency (Hz)", fontsize=5)
-    axes[0].set_title("Reference Coherence", fontsize=6, fontweight="bold", pad=6)
-    fig.colorbar(im0, ax=axes[0], label="Coherence", pad=0.02)
+    axes[0].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    axes[0].set_title("Reference Coherence", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    _add_colorbar(fig, im0, axes[0], label="Coherence", shrink=0.8, pad=0.02)
 
     im1 = axes[1].pcolormesh(time_min, freqs, coh_recon, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
-    axes[1].set_ylabel("Frequency (Hz)", fontsize=5)
-    axes[1].set_title("Reconstruction Coherence", fontsize=6, fontweight="bold", pad=6)
-    fig.colorbar(im1, ax=axes[1], label="Coherence", pad=0.02)
+    axes[1].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    axes[1].set_title("Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    _add_colorbar(fig, im1, axes[1], label="Coherence", shrink=0.8, pad=0.02)
 
     im2 = axes[2].pcolormesh(time_min, freqs, coh_diff, shading="auto", cmap="coolwarm", vmin=-1.0, vmax=1.0)
-    axes[2].set_xlabel("Time (minutes)", fontsize=5)
-    axes[2].set_ylabel("Frequency (Hz)", fontsize=5)
-    axes[2].set_title("Coherence Difference (Reconstruction - Reference)", fontsize=6, fontweight="bold", pad=6)
-    fig.colorbar(im2, ax=axes[2], label="Delta", pad=0.02)
+    axes[2].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
+    axes[2].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    axes[2].set_title("Coherence Difference (Reconstruction - Reference)", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    _add_colorbar(fig, im2, axes[2], label="Delta", shrink=0.8, pad=0.02)
 
     for ax in axes:
         _style_axes(ax, grid="major")
 
     if title:
-        fig.suptitle(title, fontsize=6, y=0.98)
+        fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
@@ -1283,13 +1281,12 @@ def plot_latent_trajectory_2d(
     )
 
     if color_by_time:
-        cbar = plt.colorbar(scatter, ax=ax, label="Time Step", pad=0.02)
-        cbar.ax.tick_params(labelsize=7)
+        _add_colorbar(fig, scatter, ax, label="Time Step", shrink=0.8, pad=0.02)
 
-    ax.set_xlabel("Latent Dim 1", fontsize=5)
-    ax.set_ylabel("Latent Dim 2", fontsize=5)
-    ax.set_title(f"Latent Trajectory - {sample_id}", fontsize=6, fontweight="bold", pad=6)
-    ax.legend(loc="best", fontsize=7, framealpha=0.95)
+    ax.set_xlabel("Latent Dim 1", fontsize=FONT_LABEL)
+    ax.set_ylabel("Latent Dim 2", fontsize=FONT_LABEL)
+    ax.set_title(f"Latent Trajectory - {sample_id}", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="major", minor_ticks=False)
 
     fig.tight_layout()
@@ -1361,14 +1358,13 @@ def plot_latent_trajectory_3d(
     )
 
     if color_by_time:
-        cbar = plt.colorbar(scatter, ax=ax, label="Time Step", shrink=0.6, pad=0.1)
-        cbar.ax.tick_params(labelsize=7)
+        _add_colorbar(fig, scatter, ax, label="Time Step", shrink=0.8, pad=0.02)
 
-    ax.set_xlabel("Latent Dim 1", fontsize=5, labelpad=10)
-    ax.set_ylabel("Latent Dim 2", fontsize=5, labelpad=10)
-    ax.set_zlabel("Latent Dim 3", fontsize=5, labelpad=10)
-    ax.set_title(f"Latent Trajectory 3D - {sample_id}", fontsize=6, fontweight="bold", pad=10)
-    ax.legend(loc="best", fontsize=7)
+    ax.set_xlabel("Latent Dim 1", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_ylabel("Latent Dim 2", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_zlabel("Latent Dim 3", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_title(f"Latent Trajectory 3D - {sample_id}", fontsize=FONT_TITLE, fontweight="bold", pad=10)
+    ax.legend(loc="best", fontsize=FONT_LEGEND)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
@@ -1436,33 +1432,32 @@ def plot_latent_changepoints_with_raw(
     )
     axes[0].set_xlim(extent[0], extent[1])
     axes[0].set_ylim(extent[2], extent[3])
-    axes[0].set_ylabel("Latent Dimension", fontsize=5)
-    axes[0].set_title(f"Latent Representation - {sample_id}", fontsize=6, fontweight="bold", pad=6)
+    axes[0].set_ylabel("Latent Dimension", fontsize=FONT_LABEL)
+    axes[0].set_title(f"Latent Representation - {sample_id}", fontsize=FONT_TITLE, fontweight="bold", pad=6)
 
     for raw_cp in raw_cps_from_latent:
         axes[0].axvline(raw_cp, color="white", linewidth=0.7, alpha=0.8)
 
-    cbar = fig.colorbar(im, ax=axes[0], pad=0.02)
-    cbar.ax.set_ylabel("Activation", rotation=270, labelpad=12, fontsize=5)
-    cbar.ax.tick_params(labelsize=7)
+    cbar = _add_colorbar(fig, im, axes[0], label="Activation", shrink=0.8, pad=0.02)
+    cbar.ax.set_ylabel("Activation", rotation=270, labelpad=12, fontsize=plt.rcParams["axes.labelsize"])
 
     # Panel 2: FHR with latent-derived changepoints
     time_axis = np.arange(raw_len)
     axes[1].plot(time_axis, fhr, color=COLOR_VERMILLION, linewidth=0.5, label="FHR")
-    axes[1].set_ylabel("FHR (normalized)", fontsize=5)
-    axes[1].set_title("FHR with Latent Changepoints", fontsize=6, fontweight="bold", pad=6)
+    axes[1].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
+    axes[1].set_title("FHR with Latent Changepoints", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     axes[1].set_xlim(0, x_max)
     _style_axes(axes[1], grid="major", minor_ticks=False)
-    axes[1].legend(loc="upper right", fontsize=7)
+    axes[1].legend(loc="upper right", fontsize=FONT_LEGEND)
 
     for raw_cp in raw_cps_from_latent:
         axes[1].axvline(raw_cp, color=COLOR_BLACK, linewidth=0.5, alpha=0.6)
 
     # Panel 3: FHR with both latent and raw changepoints
     axes[2].plot(time_axis, fhr, color=COLOR_VERMILLION, linewidth=0.5, label="FHR")
-    axes[2].set_xlabel("Raw Time Index", fontsize=5)
-    axes[2].set_ylabel("FHR (normalized)", fontsize=5)
-    axes[2].set_title("FHR with Latent (gray) and Raw (green) Changepoints", fontsize=6, fontweight="bold", pad=6)
+    axes[2].set_xlabel("Raw Time Index", fontsize=FONT_LABEL)
+    axes[2].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
+    axes[2].set_title("FHR with Latent (gray) and Raw (green) Changepoints", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     axes[2].set_xlim(0, x_max)
     _style_axes(axes[2], grid="major", minor_ticks=False)
 
@@ -1482,7 +1477,7 @@ def plot_latent_changepoints_with_raw(
         raw_line_added = True
 
     if latent_line_added or raw_line_added:
-        axes[2].legend(loc="upper right", fontsize=7)
+        axes[2].legend(loc="upper right", fontsize=FONT_LEGEND)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
@@ -1560,9 +1555,9 @@ def plot_segment_statistics(
         fig, ax = plt.subplots(figsize=(3.5, 3.0))
         durations_minutes = durations / 60.0
         ax.hist(durations_minutes, bins=20, color=COLOR_BLUE, alpha=0.75, edgecolor=COLOR_BLACK, linewidth=0.5)
-        ax.set_xlabel("Duration (minutes)", fontsize=5)
-        ax.set_ylabel("Count", fontsize=5)
-        ax.set_title("Segment Duration Distribution", fontsize=6, fontweight="bold", pad=6)
+        ax.set_xlabel("Duration (minutes)", fontsize=FONT_LABEL)
+        ax.set_ylabel("Count", fontsize=FONT_LABEL)
+        ax.set_title("Segment Duration Distribution", fontsize=FONT_TITLE, fontweight="bold", pad=6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
         fig.savefig(output_dir / f"{filename_prefix}_duration_hist.png", dpi=SAVE_DPI, bbox_inches="tight")
@@ -1577,9 +1572,9 @@ def plot_segment_statistics(
             start_speed["mean_speed"],
             s=12, c=COLOR_ORANGE, alpha=0.7, edgecolors=COLOR_BLACK, linewidths=0.2
         )
-        ax.set_xlabel("Start Minutes Rel. Delivery", fontsize=5)
-        ax.set_ylabel("Mean Latent Speed", fontsize=5)
-        ax.set_title("Latent Speed vs Start Time", fontsize=6, fontweight="bold", pad=6)
+        ax.set_xlabel("Start Minutes Rel. Delivery", fontsize=FONT_LABEL)
+        ax.set_ylabel("Mean Latent Speed", fontsize=FONT_LABEL)
+        ax.set_title("Latent Speed vs Start Time", fontsize=FONT_TITLE, fontweight="bold", pad=6)
         ax.axvline(0.0, color=COLOR_GRAY, linewidth=0.6, alpha=0.6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
@@ -1592,9 +1587,9 @@ def plot_segment_statistics(
         dominant_counts = dominant_dims.astype(int).value_counts().sort_index()
         fig, ax = plt.subplots(figsize=(3.5, 3.0))
         ax.bar(dominant_counts.index.astype(str), dominant_counts.values, color=COLOR_GREEN, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5)
-        ax.set_xlabel("Latent Dimension Index", fontsize=5)
-        ax.set_ylabel("Segment Count", fontsize=5)
-        ax.set_title("Dominant Latent Dimension", fontsize=6, fontweight="bold", pad=6)
+        ax.set_xlabel("Latent Dimension Index", fontsize=FONT_LABEL)
+        ax.set_ylabel("Segment Count", fontsize=FONT_LABEL)
+        ax.set_title("Dominant Latent Dimension", fontsize=FONT_TITLE, fontweight="bold", pad=6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
         fig.savefig(output_dir / f"{filename_prefix}_dominant_dim.png", dpi=SAVE_DPI, bbox_inches="tight")
@@ -1607,10 +1602,10 @@ def plot_segment_statistics(
         segments_per_sample.sort_values(ascending=False).plot(
             kind="bar", ax=ax, color=COLOR_PURPLE, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5
         )
-        ax.set_xlabel("Sample ID", fontsize=5)
-        ax.set_ylabel("Number of Segments", fontsize=5)
-        ax.set_title("Segments per Sample", fontsize=6, fontweight="bold", pad=6)
-        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        ax.set_xlabel("Sample ID", fontsize=FONT_LABEL)
+        ax.set_ylabel("Number of Segments", fontsize=FONT_LABEL)
+        ax.set_title("Segments per Sample", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+        ax.tick_params(axis="x", rotation=45, labelsize=FONT_TICK)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
         fig.savefig(output_dir / f"{filename_prefix}_per_sample.png", dpi=SAVE_DPI, bbox_inches="tight")
@@ -1696,16 +1691,16 @@ def plot_trajectory_comparison(
                 )
 
     if n_components == 3:
-        ax.set_xlabel("PC1", fontsize=5, labelpad=10)
-        ax.set_ylabel("PC2", fontsize=5, labelpad=10)
-        ax.set_zlabel("PC3", fontsize=5, labelpad=10)
+        ax.set_xlabel("PC1", fontsize=FONT_LABEL, labelpad=10)
+        ax.set_ylabel("PC2", fontsize=FONT_LABEL, labelpad=10)
+        ax.set_zlabel("PC3", fontsize=FONT_LABEL, labelpad=10)
     else:
-        ax.set_xlabel("PC1", fontsize=5)
-        ax.set_ylabel("PC2", fontsize=5)
+        ax.set_xlabel("PC1", fontsize=FONT_LABEL)
+        ax.set_ylabel("PC2", fontsize=FONT_LABEL)
         _style_axes(ax, grid="major", minor_ticks=False)
 
-    ax.set_title("Trajectory Comparison by Class", fontsize=6, fontweight="bold", pad=6)
-    ax.legend(loc="best", fontsize=7, framealpha=0.95)
+    ax.set_title("Trajectory Comparison by Class", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
 
     fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
