@@ -1410,7 +1410,7 @@ def plot_time_frequency_coherence(
 
     if coherence_reconstructed is None:
         fig, ax = plt.subplots(1, 1, figsize=(7.6, 2.6))
-        im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="cividis", vmin=0.0, vmax=1.0)
+        im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
         ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
         ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
         ax.set_title("FHR Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
@@ -1434,21 +1434,21 @@ def plot_time_frequency_coherence(
 
     fig, axes = plt.subplots(3, 1, figsize=(7.6, 4.8), sharex=True)
 
-    im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="cividis", vmin=0.0, vmax=1.0)
+    im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
     axes[0].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
     axes[0].set_title("Reference Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
     if freqs.size:
         axes[0].set_ylim(float(np.min(freqs)), float(np.max(freqs)))
     _add_colorbar(fig, im0, axes[0], label="Coherence", shrink=0.8, pad=0.02)
 
-    im1 = axes[1].pcolormesh(time_min, freqs, coh_recon, shading="auto", cmap="cividis", vmin=0.0, vmax=1.0)
+    im1 = axes[1].pcolormesh(time_min, freqs, coh_recon, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
     axes[1].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
     axes[1].set_title("Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
     if freqs.size:
         axes[1].set_ylim(float(np.min(freqs)), float(np.max(freqs)))
     _add_colorbar(fig, im1, axes[1], label="Coherence", shrink=0.8, pad=0.02)
 
-    im2 = axes[2].pcolormesh(time_min, freqs, coh_diff, shading="auto", cmap="BrBG", vmin=-1.0, vmax=1.0)
+    im2 = axes[2].pcolormesh(time_min, freqs, coh_diff, shading="auto", cmap="bwr", vmin=-1.0, vmax=1.0)
     axes[2].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
     axes[2].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
     axes[2].set_title("Coherence Difference (Reconstruction - Reference)", fontsize=FONT_TITLE, fontweight="normal", pad=6)
