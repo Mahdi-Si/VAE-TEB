@@ -1,11 +1,9 @@
 """
 Time-frequency coherence analysis for VAE-TEB models.
 
-This module analyzes the spectral coherence between UP (uterine pressure)
-and FHR (fetal heart rate) signals, comparing original vs reconstructed.
-
-Coherence preservation indicates that the model maintains the physiological
-coupling between contractions and heart rate variability.
+This module analyzes reconstruction coherence between the original FHR
+signal and the model's predicted FHR signal. Optional UP-FHR coherence
+can be computed to assess physiological coupling preservation.
 
 Example:
     >>> from testing.analyses.coherence import run_coherence_analysis
@@ -30,6 +28,9 @@ from model.vae_teb_prediction.testing.metrics import aggregate_predictions
 from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_analysis,
     plot_coherence_signals,
+    plot_cross_correlation,
+    plot_psd_comparison,
+    plot_reconstruction_coherence,
     plot_time_frequency_coherence,
 )
 
@@ -59,6 +60,12 @@ def _plot_band_trends(
     fig, axes = plt.subplots(rows, cols, figsize=(12, 4 * rows), sharex=False)
     axes = np.atleast_2d(axes)
 
+    has_pair = "orig_mean" in df.columns and "recon_mean" in df.columns
+    has_single = "coherence_mean" in df.columns
+
+    if not has_pair and not has_single:
+        return
+
     for idx, band in enumerate(bands):
         row, col = divmod(idx, cols)
         ax = axes[row, col]
@@ -68,25 +75,36 @@ def _plot_band_trends(
             continue
 
         x_vals = subset[x_col].values
-        ax.plot(x_vals, subset["orig_mean"], color="#4C72B0", linewidth=1.5, label="Original")
-        ax.plot(x_vals, subset["recon_mean"], color="#C44E52", linewidth=1.5, linestyle="--", label="Reconstructed")
+        if has_pair:
+            ax.plot(x_vals, subset["orig_mean"], color="#4C72B0", linewidth=1.5, label="Reference")
+            ax.plot(x_vals, subset["recon_mean"], color="#C44E52", linewidth=1.5, linestyle="--", label="Reconstruction")
 
-        if "orig_std" in subset.columns:
-            ax.fill_between(
-                x_vals,
-                subset["orig_mean"] - subset["orig_std"],
-                subset["orig_mean"] + subset["orig_std"],
-                color="#4C72B0",
-                alpha=0.2,
-            )
-        if "recon_std" in subset.columns:
-            ax.fill_between(
-                x_vals,
-                subset["recon_mean"] - subset["recon_std"],
-                subset["recon_mean"] + subset["recon_std"],
-                color="#C44E52",
-                alpha=0.2,
-            )
+            if "orig_std" in subset.columns:
+                ax.fill_between(
+                    x_vals,
+                    subset["orig_mean"] - subset["orig_std"],
+                    subset["orig_mean"] + subset["orig_std"],
+                    color="#4C72B0",
+                    alpha=0.2,
+                )
+            if "recon_std" in subset.columns:
+                ax.fill_between(
+                    x_vals,
+                    subset["recon_mean"] - subset["recon_std"],
+                    subset["recon_mean"] + subset["recon_std"],
+                    color="#C44E52",
+                    alpha=0.2,
+                )
+        else:
+            ax.plot(x_vals, subset["coherence_mean"], color="#4C72B0", linewidth=1.5, label="Coherence")
+            if "coherence_std" in subset.columns:
+                ax.fill_between(
+                    x_vals,
+                    subset["coherence_mean"] - subset["coherence_std"],
+                    subset["coherence_mean"] + subset["coherence_std"],
+                    color="#4C72B0",
+                    alpha=0.2,
+                )
 
         ax.set_title(f"{band} Band")
         ax.set_xlabel(x_label)
@@ -130,7 +148,7 @@ def compute_stft_coherence(
             - coherence: Coherence values in [0, 1]
 
     Example:
-        >>> freqs, coh = compute_stft_coherence(up_signal, fhr_signal)
+        >>> freqs, coh = compute_stft_coherence(fhr_signal, fhr_pred)
         >>> plt.plot(freqs, coh)
     """
 
@@ -144,6 +162,80 @@ def compute_stft_coherence(
     )
 
     return frequencies, coherence
+
+
+def compute_welch_psd(
+    x: np.ndarray,
+    *,
+    fs: float = 4.0,
+    nperseg: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Welch PSD for a signal.
+
+    Args:
+        x: Signal array.
+        fs: Sampling frequency in Hz.
+        nperseg: Segment length for Welch's method.
+
+    Returns:
+        Tuple of (frequencies, PSD).
+    """
+    if x.size < 2:
+        return np.array([]), np.array([])
+
+    nperseg_used = min(nperseg, x.size)
+    if nperseg_used < 2:
+        return np.array([]), np.array([])
+
+    freqs, psd = signal.welch(x, fs=fs, nperseg=nperseg_used, noverlap=nperseg_used // 2)
+    return freqs, psd
+
+
+def compute_cross_correlation(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    fs: float = 4.0,
+    max_lag_sec: float = 120.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute normalized cross-correlation between two signals.
+
+    Args:
+        x: First signal array.
+        y: Second signal array.
+        fs: Sampling frequency in Hz.
+        max_lag_sec: Max lag to keep (seconds).
+
+    Returns:
+        Tuple of (lags_sec, correlation).
+    """
+    min_len = min(len(x), len(y))
+    if min_len < 2:
+        return np.array([]), np.array([])
+
+    x = x[:min_len] - np.mean(x[:min_len])
+    y = y[:min_len] - np.mean(y[:min_len])
+
+    corr = signal.correlate(y, x, mode="full")
+    lags = signal.correlation_lags(len(y), len(x), mode="full")
+
+    denom = np.std(x) * np.std(y) * max(min_len, 1)
+    if denom > 0:
+        corr = corr / denom
+    else:
+        corr = corr * 0.0
+
+    max_lag = int(max_lag_sec * fs)
+    if max_lag <= 0:
+        return np.array([]), np.array([])
+
+    center = len(corr) // 2
+    start = max(center - max_lag, 0)
+    end = min(center + max_lag + 1, len(corr))
+
+    return lags[start:end] / fs, corr[start:end]
 
 
 def _band_means(
@@ -169,9 +261,8 @@ def _band_means(
 
 
 def compute_windowed_coherence_map(
-    up: np.ndarray,
-    fhr_original: np.ndarray,
-    fhr_recon_windows: np.ndarray,
+    reference_full: np.ndarray,
+    pred_windows: np.ndarray,
     *,
     fs: float,
     stride: int,
@@ -182,9 +273,8 @@ def compute_windowed_coherence_map(
     Compute per-window coherence maps aligned to the model's 2-minute predictions.
 
     Args:
-        up: UP signal array (raw).
-        fhr_original: Ground-truth FHR signal array (raw).
-        fhr_recon_windows: Predicted windows, shape (T, H).
+        reference_full: Reference signal array (raw FHR).
+        pred_windows: Predicted windows, shape (T, H).
         fs: Sampling frequency in Hz.
         stride: Step size in raw samples between windows (decimation factor).
         warmup: Number of initial timesteps to skip.
@@ -194,25 +284,22 @@ def compute_windowed_coherence_map(
         Dict with:
             - 'frequencies': Frequency array
             - 'times': Time array (window centers, seconds)
-            - 'coherence_original': Coherence map (freq x time)
-            - 'coherence_reconstructed': Coherence map (freq x time)
+            - 'coherence': Coherence map (freq x time) between reference and predicted window
     """
-    min_len = min(len(up), len(fhr_original))
+    min_len = len(reference_full)
     if min_len < 2:
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
         }
 
-    T, H = fhr_recon_windows.shape
+    T, H = pred_windows.shape
     if H < 2:
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
         }
 
     nperseg_used = min(nperseg, H)
@@ -220,12 +307,10 @@ def compute_windowed_coherence_map(
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
         }
 
-    coh_orig_list: List[np.ndarray] = []
-    coh_recon_list: List[np.ndarray] = []
+    coh_list: List[np.ndarray] = []
     times: List[float] = []
     window_indices: List[int] = []
     frequencies = None
@@ -236,38 +321,32 @@ def compute_windowed_coherence_map(
         if end > min_len:
             break
 
-        up_win = up[start:end]
-        fhr_win = fhr_original[start:end]
-        recon_win = fhr_recon_windows[t]
+        ref_win = reference_full[start:end]
+        pred_win = pred_windows[t]
 
-        freq, coh_orig = compute_stft_coherence(up_win, fhr_win, fs=fs, nperseg=nperseg_used)
-        _, coh_recon = compute_stft_coherence(up_win, recon_win, fs=fs, nperseg=nperseg_used)
+        freq, coh = compute_stft_coherence(ref_win, pred_win, fs=fs, nperseg=nperseg_used)
 
         if frequencies is None:
             frequencies = freq
 
-        coh_orig_list.append(coh_orig)
-        coh_recon_list.append(coh_recon)
+        coh_list.append(coh)
         times.append((start + H / 2) / fs)
         window_indices.append(t)
 
-    if not coh_orig_list:
+    if not coh_list:
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
         }
 
-    coherence_original = np.stack(coh_orig_list, axis=1)
-    coherence_reconstructed = np.stack(coh_recon_list, axis=1)
+    coherence = np.stack(coh_list, axis=1)
 
     return {
         "frequencies": frequencies,
         "times": np.array(times),
         "window_indices": np.array(window_indices),
-        "coherence_original": coherence_original,
-        "coherence_reconstructed": coherence_reconstructed,
+        "coherence": coherence,
     }
 
 
@@ -296,7 +375,7 @@ def compute_wavelet_coherence(
             - 'phase': Phase difference matrix
 
     Example:
-        >>> result = compute_wavelet_coherence(up, fhr)
+        >>> result = compute_wavelet_coherence(fhr_orig, fhr_pred)
         >>> plt.pcolormesh(result['times'], result['frequencies'], result['coherence'])
     """
     try:
@@ -401,9 +480,8 @@ def compute_stft_coherence_map(
 
 
 def compute_window_relative_time_frequency(
-    up: np.ndarray,
-    fhr_original: np.ndarray,
-    fhr_recon_windows: np.ndarray,
+    reference_full: np.ndarray,
+    pred_windows: np.ndarray,
     *,
     fs: float,
     stride: int,
@@ -417,14 +495,13 @@ def compute_window_relative_time_frequency(
     Aligns STFT coherence maps to the start of each prediction window and
     averages across windows to show coherence vs time-from-window-start.
     """
-    min_len = min(len(up), len(fhr_original))
-    T, H = fhr_recon_windows.shape
+    min_len = len(reference_full)
+    T, H = pred_windows.shape
     if min_len < 2 or H < 2:
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
             "n_windows": 0,
         }
 
@@ -433,13 +510,11 @@ def compute_window_relative_time_frequency(
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
             "n_windows": 0,
         }
 
-    acc_orig = None
-    acc_recon = None
+    acc = None
     freqs = None
     times = None
     count = 0
@@ -453,43 +528,37 @@ def compute_window_relative_time_frequency(
         if end > min_len:
             break
 
-        up_win = up[start:end]
-        fhr_win = fhr_original[start:end]
-        recon_win = fhr_recon_windows[t]
+        ref_win = reference_full[start:end]
+        pred_win = pred_windows[t]
 
-        orig_tf = compute_stft_coherence_map(up_win, fhr_win, fs=fs, nperseg=nperseg_used)
-        recon_tf = compute_stft_coherence_map(up_win, recon_win, fs=fs, nperseg=nperseg_used)
+        tf_map = compute_stft_coherence_map(ref_win, pred_win, fs=fs, nperseg=nperseg_used)
 
-        if orig_tf["coherence"].size == 0 or recon_tf["coherence"].size == 0:
+        if tf_map["coherence"].size == 0:
             continue
 
-        if acc_orig is None:
-            acc_orig = orig_tf["coherence"].copy()
-            acc_recon = recon_tf["coherence"].copy()
-            freqs = orig_tf["frequencies"]
-            times = orig_tf["times"]
+        if acc is None:
+            acc = tf_map["coherence"].copy()
+            freqs = tf_map["frequencies"]
+            times = tf_map["times"]
         else:
-            if orig_tf["coherence"].shape != acc_orig.shape:
+            if tf_map["coherence"].shape != acc.shape:
                 continue
-            acc_orig += orig_tf["coherence"]
-            acc_recon += recon_tf["coherence"]
+            acc += tf_map["coherence"]
 
         count += 1
 
-    if acc_orig is None:
+    if acc is None:
         return {
             "frequencies": np.array([]),
             "times": np.array([]),
-            "coherence_original": np.empty((0, 0)),
-            "coherence_reconstructed": np.empty((0, 0)),
+            "coherence": np.empty((0, 0)),
             "n_windows": 0,
         }
 
     return {
         "frequencies": freqs,
         "times": times,
-        "coherence_original": acc_orig / max(count, 1),
-        "coherence_reconstructed": acc_recon / max(count, 1),
+        "coherence": acc / max(count, 1),
         "n_windows": count,
     }
 
@@ -502,6 +571,7 @@ def run_coherence_analysis(
     *,
     fs: float = 4.0,
     max_detailed_samples: int = 5,
+    include_up_coherence: bool = False,
     time_frequency_method: str = "stft",
     time_frequency_nperseg: int = 128,
     time_frequency_num_scales: int = 50,
@@ -509,16 +579,16 @@ def run_coherence_analysis(
     window_nperseg: int = 128,
     window_relative_nperseg: int = 128,
     max_window_timefreq_windows: Optional[int] = None,
+    psd_nperseg: int = 256,
+    max_corr_lag_sec: float = 120.0,
 ) -> Dict[str, Any]:
     """
-    Run complete UP-FHR coherence analysis.
+    Run complete FHR reconstruction coherence analysis.
 
-    Compares spectral coherence between:
-    1. UP and original FHR (ground truth coupling)
-    2. UP and reconstructed FHR (preserved coupling)
-
-    This helps assess whether the model maintains physiologically
-    meaningful relationships between contractions and heart rate.
+    Computes coherence between original FHR and reconstructed FHR, along with
+    per-window and within-window time-frequency diagnostics. Optionally computes
+    UP-FHR coherence to assess physiological coupling preservation. Also records
+    PSD and cross-correlation summaries for reconstruction quality.
 
     Args:
         runner: TestRunner with model and device configured.
@@ -527,6 +597,7 @@ def run_coherence_analysis(
         nperseg: Segment length for STFT coherence (default 64).
         fs: Sampling frequency in Hz (default 4.0).
         max_detailed_samples: Number of per-sample plots to generate.
+        include_up_coherence: If True and UP is available, compute UP-FHR coherence.
         time_frequency_method: "stft" or "wavelet" for time-frequency plots.
         time_frequency_nperseg: STFT segment length for time-frequency plots.
         time_frequency_num_scales: Number of scales for wavelet coherence.
@@ -534,26 +605,35 @@ def run_coherence_analysis(
         window_nperseg: Welch segment length for per-window (2-minute) coherence.
         window_relative_nperseg: STFT segment length for within-window coherence.
         max_window_timefreq_windows: Optional limit on windows for relative maps.
+        psd_nperseg: Welch segment length for PSD comparison.
+        max_corr_lag_sec: Max lag for cross-correlation plot (seconds).
 
     Returns:
         Dict with:
             - 'frequencies': Frequency array
-            - 'coherence_original': Mean coherence UP-FHR original
-            - 'coherence_reconstructed': Mean coherence UP-FHR reconstructed
-            - 'coherence_std_original': Std across samples
-            - 'coherence_std_reconstructed': Std across samples
+            - 'recon_coherence_mean': Mean FHR reconstruction coherence
+            - 'recon_coherence_std': Std FHR reconstruction coherence
             - 'n_samples': Number of samples analyzed
+            - optional UP-FHR coherence arrays if include_up_coherence is True
 
     Example:
         >>> results = run_coherence_analysis(runner, test_loader)
-        >>> print(f"Mean coherence preserved: {results['coherence_reconstructed'].mean():.3f}")
+        >>> print(f"Mean coherence preserved: {results['recon_coherence_mean'].mean():.3f}")
     """
 
-    logger.info(f"Running UP-FHR coherence analysis (max {max_samples} samples)...")
+    logger.info(f"Running FHR reconstruction coherence analysis (max {max_samples} samples)...")
 
-    coherence_original_list: List[np.ndarray] = []
-    coherence_recon_list: List[np.ndarray] = []
+    recon_coherence_list: List[np.ndarray] = []
+    up_coherence_original_list: List[np.ndarray] = []
+    up_coherence_recon_list: List[np.ndarray] = []
+    psd_orig_list: List[np.ndarray] = []
+    psd_recon_list: List[np.ndarray] = []
+    psd_resid_list: List[np.ndarray] = []
+    corr_list: List[np.ndarray] = []
     frequencies = None
+    up_frequencies = None
+    psd_frequencies = None
+    corr_lags_sec = None
     processed = 0
     detailed_saved = 0
     epoch_records: List[Dict[str, Any]] = []
@@ -564,10 +644,9 @@ def run_coherence_analysis(
         for batch in runner.iter_batches(loader, max_samples):
             batch_size = batch.fhr_st.size(0)
 
-            # Check if UP signal is available
-            if not hasattr(batch, "up") or batch.up is None:
-                logger.warning("UP signal not available in batch - skipping coherence analysis")
-                continue
+            has_up = hasattr(batch, "up") and batch.up is not None
+            if include_up_coherence and not has_up:
+                logger.warning("UP signal not available in batch - skipping UP-FHR coherence.")
 
             # Forward pass
             outputs = runner.forward(batch)
@@ -593,55 +672,58 @@ def run_coherence_analysis(
                 epoch = _extract_epoch(batch, idx)
                 label = _extract_label(batch, idx)
 
-                up_full = batch.up[idx].cpu().numpy()
                 fhr_orig_full = batch.fhr[idx].cpu().numpy()
                 fhr_recon_full = avg_pred[idx].cpu().numpy()
-                up = up_full
+                up_full = batch.up[idx].cpu().numpy() if has_up else None
+
                 fhr_orig = fhr_orig_full
                 fhr_recon = fhr_recon_full
+                up = up_full if include_up_coherence and up_full is not None else None
                 mask = valid_mask[idx].cpu().numpy() if valid_mask is not None else None
 
                 if mask is not None and mask.any():
                     start = int(np.argmax(mask))
                     end = int(len(mask) - np.argmax(mask[::-1]))
-                    up = up[start:end]
                     fhr_orig = fhr_orig[start:end]
                     fhr_recon = fhr_recon[start:end]
+                    if up is not None:
+                        up = up[start:end]
 
-                min_len = min(len(up), len(fhr_orig), len(fhr_recon))
+                min_len = min(len(fhr_orig), len(fhr_recon))
+                if up is not None:
+                    min_len = min(min_len, len(up))
                 if min_len < nperseg:
                     logger.warning(
                         f"Sample {idx} too short for coherence (len={min_len}, nperseg={nperseg}); skipping."
                     )
                     continue
 
+                fhr_orig = fhr_orig[:min_len]
+                fhr_recon = fhr_recon[:min_len]
+                if up is not None:
+                    up = up[:min_len]
+
                 window_tf = {
                     "frequencies": np.array([]),
                     "times": np.array([]),
                     "window_indices": np.array([]),
-                    "coherence_original": np.empty((0, 0)),
-                    "coherence_reconstructed": np.empty((0, 0)),
+                    "coherence": np.empty((0, 0)),
                 }
                 relative_tf = {
                     "frequencies": np.array([]),
                     "times": np.array([]),
-                    "coherence_original": np.empty((0, 0)),
-                    "coherence_reconstructed": np.empty((0, 0)),
+                    "coherence": np.empty((0, 0)),
                     "n_windows": 0,
                 }
 
                 # Compute coherence
                 try:
-                    freq, coh_orig = compute_stft_coherence(up, fhr_orig, fs=fs, nperseg=nperseg)
-                    _, coh_recon = compute_stft_coherence(up, fhr_recon, fs=fs, nperseg=nperseg)
-
-                    coherence_original_list.append(coh_orig)
-                    coherence_recon_list.append(coh_recon)
+                    freq, coh_recon = compute_stft_coherence(fhr_orig, fhr_recon, fs=fs, nperseg=nperseg)
+                    recon_coherence_list.append(coh_recon)
 
                     if frequencies is None:
                         frequencies = freq
 
-                    band_orig = _band_means(freq, coh_orig)
                     band_recon = _band_means(freq, coh_recon)
                     epoch_record = {
                         "guid": guid,
@@ -651,14 +733,32 @@ def run_coherence_analysis(
                     }
                     for band in COHERENCE_BANDS:
                         name = band[0]
-                        epoch_record[f"{name}_orig"] = float(band_orig.get(name, np.nan))
-                        epoch_record[f"{name}_recon"] = float(band_recon.get(name, np.nan))
-                        epoch_record[f"{name}_delta"] = float(band_recon.get(name, np.nan) - band_orig.get(name, np.nan))
+                        epoch_record[f"{name}_coherence"] = float(band_recon.get(name, np.nan))
+
+                    if include_up_coherence and up is not None:
+                        up_freq, coh_up_orig = compute_stft_coherence(up, fhr_orig, fs=fs, nperseg=nperseg)
+                        _, coh_up_recon = compute_stft_coherence(up, fhr_recon, fs=fs, nperseg=nperseg)
+
+                        if up_frequencies is None:
+                            up_frequencies = up_freq
+                        elif up_freq.shape != up_frequencies.shape or not np.allclose(up_freq, up_frequencies):
+                            logger.warning("UP coherence frequency mismatch; skipping UP-FHR coherence for this sample.")
+                        else:
+                            up_coherence_original_list.append(coh_up_orig)
+                            up_coherence_recon_list.append(coh_up_recon)
+                            up_band_orig = _band_means(up_freq, coh_up_orig)
+                            up_band_recon = _band_means(up_freq, coh_up_recon)
+                            for band in COHERENCE_BANDS:
+                                name = band[0]
+                                epoch_record[f"{name}_up_orig"] = float(up_band_orig.get(name, np.nan))
+                                epoch_record[f"{name}_up_recon"] = float(up_band_recon.get(name, np.nan))
+                                epoch_record[f"{name}_up_delta"] = float(
+                                    up_band_recon.get(name, np.nan) - up_band_orig.get(name, np.nan)
+                                )
                     epoch_records.append(epoch_record)
 
                     mu_pr_window = mu_pr[idx].detach().cpu().numpy()
                     window_tf = compute_windowed_coherence_map(
-                        up_full,
                         fhr_orig_full,
                         mu_pr_window,
                         fs=fs,
@@ -666,17 +766,19 @@ def run_coherence_analysis(
                         warmup=runner.warmup_steps,
                         nperseg=window_nperseg,
                     )
-                    if window_tf["coherence_original"].size > 0:
-                        window_band_orig = _band_means(window_tf["frequencies"], window_tf["coherence_original"])
-                        window_band_recon = _band_means(window_tf["frequencies"], window_tf["coherence_reconstructed"])
-                        window_indices = window_tf.get("window_indices", np.arange(window_tf["coherence_original"].shape[1]))
-                        for band_name in window_band_orig.keys():
-                            orig_vals = window_band_orig[band_name]
-                            recon_vals = window_band_recon.get(band_name)
-                            if recon_vals is None:
-                                continue
+                    if window_tf["coherence"].size > 0:
+                        window_band = _band_means(window_tf["frequencies"], window_tf["coherence"])
+                        window_indices = window_tf.get("window_indices", np.arange(window_tf["coherence"].shape[1]))
+                        for band_name, vals in window_band.items():
+                            baseline = float(band_recon.get(band_name, np.nan))
                             for w_idx, window_index in enumerate(window_indices):
                                 window_start_sample = int(window_index) * int(runner.decimation_factor)
+                                coherence_val = float(vals[w_idx]) if w_idx < len(vals) else np.nan
+                                delta = (
+                                    coherence_val - baseline
+                                    if np.isfinite(coherence_val) and np.isfinite(baseline)
+                                    else np.nan
+                                )
                                 window_records.append({
                                     "guid": guid,
                                     "epoch": epoch,
@@ -687,13 +789,12 @@ def run_coherence_analysis(
                                     "window_start_sample": window_start_sample,
                                     "window_start_sec": window_start_sample / fs,
                                     "window_center_sec": float(window_tf["times"][w_idx]) if w_idx < len(window_tf["times"]) else np.nan,
-                                    "coherence_original": float(orig_vals[w_idx]) if w_idx < len(orig_vals) else np.nan,
-                                    "coherence_reconstructed": float(recon_vals[w_idx]) if w_idx < len(recon_vals) else np.nan,
-                                    "coherence_delta": float(recon_vals[w_idx] - orig_vals[w_idx]) if w_idx < len(orig_vals) else np.nan,
+                                    "coherence": coherence_val,
+                                    "coherence_baseline": baseline,
+                                    "coherence_delta": delta,
                                 })
 
                         relative_tf = compute_window_relative_time_frequency(
-                            up_full,
                             fhr_orig_full,
                             mu_pr_window,
                             fs=fs,
@@ -702,15 +803,17 @@ def run_coherence_analysis(
                             nperseg=window_relative_nperseg,
                             max_windows=max_window_timefreq_windows,
                         )
-                        if relative_tf["coherence_original"].size > 0:
-                            relative_band_orig = _band_means(relative_tf["frequencies"], relative_tf["coherence_original"])
-                            relative_band_recon = _band_means(relative_tf["frequencies"], relative_tf["coherence_reconstructed"])
-                            for band_name in relative_band_orig.keys():
-                                orig_vals = relative_band_orig[band_name]
-                                recon_vals = relative_band_recon.get(band_name)
-                                if recon_vals is None:
-                                    continue
+                        if relative_tf["coherence"].size > 0:
+                            relative_band = _band_means(relative_tf["frequencies"], relative_tf["coherence"])
+                            for band_name, vals in relative_band.items():
+                                baseline = float(band_recon.get(band_name, np.nan))
                                 for t_idx, rel_time in enumerate(relative_tf["times"]):
+                                    coherence_val = float(vals[t_idx]) if t_idx < len(vals) else np.nan
+                                    delta = (
+                                        coherence_val - baseline
+                                        if np.isfinite(coherence_val) and np.isfinite(baseline)
+                                        else np.nan
+                                    )
                                     relative_records.append({
                                         "guid": guid,
                                         "epoch": epoch,
@@ -718,10 +821,34 @@ def run_coherence_analysis(
                                         "sample_idx": processed,
                                         "band": band_name,
                                         "relative_time_sec": float(rel_time),
-                                        "coherence_original": float(orig_vals[t_idx]) if t_idx < len(orig_vals) else np.nan,
-                                        "coherence_reconstructed": float(recon_vals[t_idx]) if t_idx < len(recon_vals) else np.nan,
-                                        "coherence_delta": float(recon_vals[t_idx] - orig_vals[t_idx]) if t_idx < len(orig_vals) else np.nan,
+                                        "coherence": coherence_val,
+                                        "coherence_baseline": baseline,
+                                        "coherence_delta": delta,
                                     })
+
+                    psd_freq, psd_orig = compute_welch_psd(fhr_orig, fs=fs, nperseg=psd_nperseg)
+                    _, psd_recon = compute_welch_psd(fhr_recon, fs=fs, nperseg=psd_nperseg)
+                    _, psd_resid = compute_welch_psd(fhr_orig - fhr_recon, fs=fs, nperseg=psd_nperseg)
+                    if psd_freq.size > 0:
+                        if psd_frequencies is None:
+                            psd_frequencies = psd_freq
+                            psd_orig_list.append(psd_orig)
+                            psd_recon_list.append(psd_recon)
+                            psd_resid_list.append(psd_resid)
+                        elif psd_freq.shape == psd_frequencies.shape and np.allclose(psd_freq, psd_frequencies):
+                            psd_orig_list.append(psd_orig)
+                            psd_recon_list.append(psd_recon)
+                            psd_resid_list.append(psd_resid)
+
+                    lags_sec, corr = compute_cross_correlation(
+                        fhr_orig, fhr_recon, fs=fs, max_lag_sec=max_corr_lag_sec
+                    )
+                    if lags_sec.size > 0:
+                        if corr_lags_sec is None:
+                            corr_lags_sec = lags_sec
+                            corr_list.append(corr)
+                        elif lags_sec.shape == corr_lags_sec.shape and np.allclose(lags_sec, corr_lags_sec):
+                            corr_list.append(corr)
 
                     processed += 1
                 except Exception as e:
@@ -760,29 +887,22 @@ def run_coherence_analysis(
 
                     try:
                         if method == "wavelet":
-                            orig_tf = compute_wavelet_coherence(
-                                up, fhr_orig, fs=fs, num_scales=time_frequency_num_scales
-                            )
-                            recon_tf = compute_wavelet_coherence(
-                                up, fhr_recon, fs=fs, num_scales=time_frequency_num_scales
+                            tf_map = compute_wavelet_coherence(
+                                fhr_orig, fhr_recon, fs=fs, num_scales=time_frequency_num_scales
                             )
                         else:
-                            orig_tf = compute_stft_coherence_map(
-                                up, fhr_orig, fs=fs, nperseg=time_frequency_nperseg
-                            )
-                            recon_tf = compute_stft_coherence_map(
-                                up, fhr_recon, fs=fs, nperseg=time_frequency_nperseg
+                            tf_map = compute_stft_coherence_map(
+                                fhr_orig, fhr_recon, fs=fs, nperseg=time_frequency_nperseg
                             )
 
-                        if orig_tf["coherence"].size == 0 or recon_tf["coherence"].size == 0:
+                        if tf_map["coherence"].size == 0:
                             logger.warning(f"Time-frequency coherence empty for {sample_name}; skipping plot.")
                         else:
                             plot_time_frequency_coherence(
-                                orig_tf["frequencies"],
-                                orig_tf["times"],
-                                orig_tf["coherence"],
-                                recon_tf["coherence"],
-                                sample_dir / f"{sample_name}_time_frequency.png",
+                                tf_map["frequencies"],
+                                tf_map["times"],
+                                tf_map["coherence"],
+                                output_path=sample_dir / f"{sample_name}_time_frequency.png",
                                 max_freq=time_frequency_max_freq,
                                 title=signal_title,
                             )
@@ -792,15 +912,14 @@ def run_coherence_analysis(
                         logger.warning(f"Time-frequency coherence failed for {sample_name}: {e}")
 
                     try:
-                        if window_tf["coherence_original"].size == 0:
+                        if window_tf["coherence"].size == 0:
                             logger.warning(f"Windowed coherence empty for {sample_name}; skipping plot.")
                         else:
                             plot_time_frequency_coherence(
                                 window_tf["frequencies"],
                                 window_tf["times"],
-                                window_tf["coherence_original"],
-                                window_tf["coherence_reconstructed"],
-                                sample_dir / f"{sample_name}_windowed_coherence.png",
+                                window_tf["coherence"],
+                                output_path=sample_dir / f"{sample_name}_windowed_coherence.png",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (2-min window coherence)",
                             )
@@ -808,51 +927,139 @@ def run_coherence_analysis(
                         logger.warning(f"Windowed coherence failed for {sample_name}: {e}")
 
                     try:
-                        if relative_tf["coherence_original"].size == 0:
+                        if relative_tf["coherence"].size == 0:
                             logger.warning(f"Relative window coherence empty for {sample_name}; skipping plot.")
                         else:
                             plot_time_frequency_coherence(
                                 relative_tf["frequencies"],
                                 relative_tf["times"],
-                                relative_tf["coherence_original"],
-                                relative_tf["coherence_reconstructed"],
-                                sample_dir / f"{sample_name}_relative_window_time_frequency.png",
+                                relative_tf["coherence"],
+                                output_path=sample_dir / f"{sample_name}_relative_window_time_frequency.png",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (window-relative coherence)",
                             )
                     except Exception as e:
                         logger.warning(f"Relative window coherence failed for {sample_name}: {e}")
 
+                    try:
+                        psd_freq, psd_orig = compute_welch_psd(fhr_orig, fs=fs, nperseg=psd_nperseg)
+                        _, psd_recon = compute_welch_psd(fhr_recon, fs=fs, nperseg=psd_nperseg)
+                        _, psd_resid = compute_welch_psd(fhr_orig - fhr_recon, fs=fs, nperseg=psd_nperseg)
+                        if psd_freq.size > 0:
+                            plot_psd_comparison(
+                                psd_freq,
+                                psd_orig,
+                                np.zeros_like(psd_orig),
+                                psd_recon,
+                                np.zeros_like(psd_recon),
+                                sample_dir,
+                                psd_residual_mean=psd_resid,
+                                psd_residual_std=np.zeros_like(psd_resid),
+                                filename=f"{sample_name}_psd.png",
+                            )
+                    except Exception as e:
+                        logger.warning(f"PSD comparison failed for {sample_name}: {e}")
+
+                    try:
+                        lags_sec, corr = compute_cross_correlation(
+                            fhr_orig, fhr_recon, fs=fs, max_lag_sec=max_corr_lag_sec
+                        )
+                        if lags_sec.size > 0:
+                            plot_cross_correlation(
+                                lags_sec,
+                                corr,
+                                np.zeros_like(corr),
+                                sample_dir,
+                                filename=f"{sample_name}_cross_correlation.png",
+                            )
+                    except Exception as e:
+                        logger.warning(f"Cross-correlation failed for {sample_name}: {e}")
+
                     detailed_saved += 1
 
             if max_samples and processed >= max_samples:
                 break
 
-    if not coherence_original_list:
+    if not recon_coherence_list:
         logger.warning("No coherence data collected.")
         return {}
 
     # Stack and compute statistics
-    coh_orig_arr = np.array(coherence_original_list)
-    coh_recon_arr = np.array(coherence_recon_list)
+    coh_recon_arr = np.array(recon_coherence_list)
 
     results = {
         "frequencies": frequencies,
-        "coherence_original": np.mean(coh_orig_arr, axis=0),
-        "coherence_reconstructed": np.mean(coh_recon_arr, axis=0),
-        "coherence_std_original": np.std(coh_orig_arr, axis=0),
-        "coherence_std_reconstructed": np.std(coh_recon_arr, axis=0),
+        "recon_coherence_mean": np.mean(coh_recon_arr, axis=0),
+        "recon_coherence_std": np.std(coh_recon_arr, axis=0),
         "n_samples": processed,
     }
+    results["coherence_reconstructed"] = results["recon_coherence_mean"]
+    results["coherence_std_reconstructed"] = results["recon_coherence_std"]
 
     # Create visualization
     output_dir = runner.ensure_dir("coherence")
-    plot_coherence_analysis(
+    plot_reconstruction_coherence(
         results["frequencies"],
-        results["coherence_original"],
-        results["coherence_reconstructed"],
+        results["recon_coherence_mean"],
+        results["recon_coherence_std"],
         output_dir,
     )
+
+    if include_up_coherence and up_coherence_original_list and up_frequencies is not None:
+        up_orig_arr = np.array(up_coherence_original_list)
+        up_recon_arr = np.array(up_coherence_recon_list)
+        results.update({
+            "up_frequencies": up_frequencies,
+            "up_coherence_original_mean": np.mean(up_orig_arr, axis=0),
+            "up_coherence_reconstructed_mean": np.mean(up_recon_arr, axis=0),
+            "up_coherence_original_std": np.std(up_orig_arr, axis=0),
+            "up_coherence_reconstructed_std": np.std(up_recon_arr, axis=0),
+        })
+        plot_coherence_analysis(
+            results["up_frequencies"],
+            results["up_coherence_original_mean"],
+            results["up_coherence_reconstructed_mean"],
+            output_dir,
+            filename="up_fhr_coherence.png",
+        )
+
+    if psd_orig_list and psd_frequencies is not None:
+        psd_orig_arr = np.stack(psd_orig_list, axis=0)
+        psd_recon_arr = np.stack(psd_recon_list, axis=0)
+        psd_resid_arr = np.stack(psd_resid_list, axis=0)
+        results.update({
+            "psd_frequencies": psd_frequencies,
+            "psd_orig_mean": np.mean(psd_orig_arr, axis=0),
+            "psd_orig_std": np.std(psd_orig_arr, axis=0),
+            "psd_recon_mean": np.mean(psd_recon_arr, axis=0),
+            "psd_recon_std": np.std(psd_recon_arr, axis=0),
+            "psd_resid_mean": np.mean(psd_resid_arr, axis=0),
+            "psd_resid_std": np.std(psd_resid_arr, axis=0),
+        })
+        plot_psd_comparison(
+            results["psd_frequencies"],
+            results["psd_orig_mean"],
+            results["psd_orig_std"],
+            results["psd_recon_mean"],
+            results["psd_recon_std"],
+            output_dir,
+            psd_residual_mean=results["psd_resid_mean"],
+            psd_residual_std=results["psd_resid_std"],
+        )
+
+    if corr_list and corr_lags_sec is not None:
+        corr_arr = np.stack(corr_list, axis=0)
+        results.update({
+            "corr_lags_sec": corr_lags_sec,
+            "corr_mean": np.mean(corr_arr, axis=0),
+            "corr_std": np.std(corr_arr, axis=0),
+        })
+        plot_cross_correlation(
+            results["corr_lags_sec"],
+            results["corr_mean"],
+            results["corr_std"],
+            output_dir,
+        )
 
     # Save detailed data
     if epoch_records:
@@ -865,10 +1072,8 @@ def run_coherence_analysis(
 
         window_agg = df_windows.groupby(["band", "window_index"]).agg(
             window_start_sec=("window_start_sec", "mean"),
-            orig_mean=("coherence_original", "mean"),
-            orig_std=("coherence_original", "std"),
-            recon_mean=("coherence_reconstructed", "mean"),
-            recon_std=("coherence_reconstructed", "std"),
+            coherence_mean=("coherence", "mean"),
+            coherence_std=("coherence", "std"),
         ).reset_index()
         window_agg.to_csv(output_dir / "window_coherence_aggregate.csv", index=False)
 
@@ -885,10 +1090,8 @@ def run_coherence_analysis(
         df_relative.to_csv(output_dir / "relative_window_coherence_summary.csv", index=False)
 
         relative_agg = df_relative.groupby(["band", "relative_time_sec"]).agg(
-            orig_mean=("coherence_original", "mean"),
-            orig_std=("coherence_original", "std"),
-            recon_mean=("coherence_reconstructed", "mean"),
-            recon_std=("coherence_reconstructed", "std"),
+            coherence_mean=("coherence", "mean"),
+            coherence_std=("coherence", "std"),
         ).reset_index()
         relative_agg.to_csv(output_dir / "relative_window_coherence_aggregate.csv", index=False)
 
@@ -903,11 +1106,11 @@ def run_coherence_analysis(
     # Save summary statistics
     summary_path = output_dir / "coherence_summary.txt"
     with open(summary_path, "w") as f:
-        f.write("UP-FHR Coherence Analysis Summary\n")
+        f.write("FHR Reconstruction Coherence Summary\n")
         f.write("=" * 40 + "\n\n")
         f.write(f"Samples analyzed: {processed}\n")
-        f.write(f"Segment length: {nperseg} samples ({nperseg / 4.0:.1f} seconds)\n\n")
-        f.write("Mean coherence by frequency band:\n")
+        f.write(f"Segment length: {nperseg} samples ({nperseg / fs:.1f} seconds)\n\n")
+        f.write("Mean coherence by frequency band (FHR vs reconstructed):\n")
 
         # Compute band averages
         bands = [
@@ -920,14 +1123,26 @@ def run_coherence_analysis(
         for band_name, f_low, f_high in bands:
             mask = (frequencies >= f_low) & (frequencies < f_high)
             if mask.any():
-                orig_mean = results["coherence_original"][mask].mean()
-                recon_mean = results["coherence_reconstructed"][mask].mean()
-                f.write(f"  {band_name}:\n")
-                f.write(f"    Original:     {orig_mean:.4f}\n")
-                f.write(f"    Reconstructed: {recon_mean:.4f}\n")
-                f.write(f"    Preservation:  {recon_mean / max(orig_mean, 1e-6) * 100:.1f}%\n")
+                recon_mean = results["recon_coherence_mean"][mask].mean()
+                f.write(f"  {band_name}: {recon_mean:.4f}\n")
+
+        if include_up_coherence and "up_coherence_original_mean" in results:
+            f.write("\nUP-FHR coherence by frequency band (optional):\n")
+            for band_name, f_low, f_high in bands:
+                mask = (results["up_frequencies"] >= f_low) & (results["up_frequencies"] < f_high)
+                if mask.any():
+                    orig_mean = results["up_coherence_original_mean"][mask].mean()
+                    recon_mean = results["up_coherence_reconstructed_mean"][mask].mean()
+                    f.write(f"  {band_name}:\n")
+                    f.write(f"    UP vs FHR:     {orig_mean:.4f}\n")
+                    f.write(f"    UP vs recon:   {recon_mean:.4f}\n")
 
         f.write("\nAdditional outputs:\n")
+        f.write("  reconstruction_coherence.png\n")
+        f.write("  psd_comparison.png\n")
+        f.write("  cross_correlation.png\n")
+        if include_up_coherence and "up_coherence_original_mean" in results:
+            f.write("  up_fhr_coherence.png\n")
         f.write("  epoch_coherence_summary.csv\n")
         f.write("  window_coherence_summary.csv\n")
         f.write("  window_coherence_aggregate.csv\n")
@@ -935,8 +1150,12 @@ def run_coherence_analysis(
         f.write("  relative_window_coherence_summary.csv\n")
         f.write("  relative_window_coherence_aggregate.csv\n")
         f.write("  relative_window_coherence_trends.png\n")
+        f.write("  samples/<sample>_signals.png\n")
+        f.write("  samples/<sample>_time_frequency.png\n")
         f.write("  samples/<sample>_windowed_coherence.png\n")
         f.write("  samples/<sample>_relative_window_time_frequency.png\n")
+        f.write("  samples/<sample>_psd.png\n")
+        f.write("  samples/<sample>_cross_correlation.png\n")
 
     logger.info(f"Coherence analysis complete. Results saved to {output_dir}")
 

@@ -10,7 +10,7 @@ Available analyses:
     - run_latent_space_visualization: 3D PCA latent space plot
     - run_latent_interpolation: Interpolate between latent codes
     - run_temporal_accuracy_analysis: Accuracy vs timestep position
-    - run_coherence_analysis: UP-FHR spectral coherence
+    - run_coherence_analysis: FHR reconstruction coherence (optional UP coupling)
     - run_trajectory_analysis: KLD evolution over time before birth
     - run_all_analyses: Run all analyses with sensible defaults
 
@@ -66,7 +66,7 @@ def run_all_analyses(
         loader: PyTorch DataLoader for test data (standard batching).
         max_samples: Maximum samples for per-sample analyses. None for all.
         skip_trajectory: If True, skip trajectory analysis (can be slow).
-        skip_coherence: If True, skip coherence analysis (requires UP signal).
+        skip_coherence: If True, skip coherence analysis.
         trajectory_loader: Optional GUID-based DataLoader for trajectory analysis.
             If None, uses the standard loader. For best results, pass a loader
             created with build_guid_filtered_dataloader where each batch contains
@@ -129,7 +129,7 @@ def run_all_analyses(
         logger.error(f"Temporal accuracy analysis failed: {e}")
         results["temporal"] = {"error": str(e)}
 
-    # Coherence analysis (optional - requires UP signal)
+    # Coherence analysis (optional)
     if not skip_coherence:
         try:
             logger.info("=" * 50)
