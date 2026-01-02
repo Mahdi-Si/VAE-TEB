@@ -78,6 +78,8 @@ from model.vae_teb_prediction.testing.analyses import (
     run_temporal_accuracy_analysis,
     run_trajectory_analysis,
     run_within_window_analysis,
+    run_reconstruction_analysis,
+    run_single_prediction_windows,
 )
 
 
@@ -121,6 +123,8 @@ __all__ = [
     "run_latent_interpolation",
     "run_temporal_accuracy_analysis",
     "run_within_window_analysis",
+    "run_reconstruction_analysis",
+    "run_single_prediction_windows",
     "run_coherence_analysis",
     "run_trajectory_analysis",
     "TrajectoryAnalyzer",

@@ -157,7 +157,11 @@ def run_within_window_analysis(
         max_samples: Maximum samples to process.
 
     Returns:
-        DataFrame with columns: [window_position, vaf, snr, mse]
+        DataFrame with columns:
+            - window_position
+            - mae_mean, mae_std
+            - vaf_mean, snr_mean
+            - count
 
     Example:
         >>> df = run_within_window_analysis(runner, test_loader)
@@ -165,11 +169,18 @@ def run_within_window_analysis(
     """
     logger.info(f"Running within-window accuracy analysis...")
 
-    records: List[Dict[str, Any]] = []
     processed = 0
 
     warmup = runner.warmup_steps
     stride = runner.decimation_factor
+
+    sum_abs_error = None
+    sum_abs_error_sq = None
+    sum_true = None
+    sum_true_sq = None
+    sum_res = None
+    sum_res_sq = None
+    counts = None
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -184,6 +195,15 @@ def run_within_window_analysis(
             T = mu_pr.size(1)
             H = mu_pr.size(2)
             raw_len = batch.fhr.size(1)
+
+            if sum_abs_error is None:
+                sum_abs_error = np.zeros(H, dtype=np.float64)
+                sum_abs_error_sq = np.zeros(H, dtype=np.float64)
+                sum_true = np.zeros(H, dtype=np.float64)
+                sum_true_sq = np.zeros(H, dtype=np.float64)
+                sum_res = np.zeros(H, dtype=np.float64)
+                sum_res_sq = np.zeros(H, dtype=np.float64)
+                counts = np.zeros(H, dtype=np.int64)
 
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
@@ -202,33 +222,62 @@ def run_within_window_analysis(
                     pred = mu_pr[idx, t, :]
                     true = y_raw[start_raw:end_raw]
 
-                    # Analyze each position within the window
-                    for pos in range(min(H, len(true))):
-                        err = (true[pos] - pred[pos]).item()
-                        records.append({
-                            "sample_idx": processed,
-                            "window_position": pos,
-                            "error": err,
-                            "abs_error": abs(err),
-                        })
+                    pred_np = pred.detach().cpu().numpy()
+                    true_np = true.detach().cpu().numpy()
+                    length = min(len(pred_np), len(true_np), H)
+                    if length <= 0:
+                        continue
+
+                    pred_np = pred_np[:length]
+                    true_np = true_np[:length]
+                    residual = true_np - pred_np
+
+                    sum_abs_error[:length] += np.abs(residual)
+                    sum_abs_error_sq[:length] += residual ** 2
+                    sum_true[:length] += true_np
+                    sum_true_sq[:length] += true_np ** 2
+                    sum_res[:length] += residual
+                    sum_res_sq[:length] += residual ** 2
+                    counts[:length] += 1
 
                 processed += 1
 
             if max_samples and processed >= max_samples:
                 break
 
-    df = pd.DataFrame(records)
+    if counts is None or not np.any(counts):
+        logger.warning("No within-window accuracy data collected.")
+        return pd.DataFrame()
 
-    if not df.empty:
-        # Aggregate by window position
-        agg = df.groupby("window_position").agg({
-            "abs_error": ["mean", "std"],
-        }).reset_index()
-        agg.columns = ["window_position", "mae_mean", "mae_std"]
+    count_safe = np.maximum(counts, 1)
+    mae_mean = sum_abs_error / count_safe
+    mae_var = sum_abs_error_sq / count_safe - mae_mean ** 2
+    mae_std = np.sqrt(np.maximum(mae_var, 0.0))
 
-        logger.info(f"Within-window analysis: collected {len(df)} position measurements")
+    mean_true = sum_true / count_safe
+    var_true = sum_true_sq / count_safe - mean_true ** 2
+    mean_res = sum_res / count_safe
+    var_res = sum_res_sq / count_safe - mean_res ** 2
+    var_true = np.maximum(var_true, 1e-12)
+    var_res = np.maximum(var_res, 0.0)
 
-        output_dir = runner.ensure_dir("temporal_accuracy")
-        plot_within_window_accuracy(agg, output_dir)
+    vaf_mean = np.clip(1.0 - var_res / var_true, 0.0, 1.0)
+    signal_power = sum_true_sq / count_safe
+    noise_power = sum_res_sq / count_safe
+    snr_mean = 10.0 * np.log10(np.maximum(signal_power, 1e-12) / np.maximum(noise_power, 1e-12))
 
-    return df
+    agg = pd.DataFrame({
+        "window_position": np.arange(len(count_safe)),
+        "mae_mean": mae_mean,
+        "mae_std": mae_std,
+        "vaf_mean": vaf_mean,
+        "snr_mean": snr_mean,
+        "count": counts,
+    })
+
+    logger.info("Within-window analysis: aggregated %d samples", int(np.max(counts)))
+
+    output_dir = runner.ensure_dir("temporal_accuracy")
+    plot_within_window_accuracy(agg, output_dir)
+
+    return agg
