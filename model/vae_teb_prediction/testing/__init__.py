@@ -45,9 +45,13 @@ from model.vae_teb_prediction.testing.collectors import (
 from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_analysis,
     plot_coherence_signals,
+    plot_coherence_spectrum,
     plot_cross_correlation,
+    plot_kld_guid_trajectory,
+    plot_kld_trajectory_3d,
     plot_kld_trajectory,
     plot_latent_distributions,
+    plot_latent_trajectory_3d,
     plot_metric_histograms,
     plot_psd_comparison,
     plot_reconstruction_coherence,
@@ -60,8 +64,10 @@ from model.vae_teb_prediction.testing.visualizers import (
 # Interactive visualizers (Plotly)
 from model.vae_teb_prediction.testing.visualizers_interactive import (
     plot_kld_trajectory_interactive,
+    plot_kld_trajectory_3d_interactive,
     plot_latent_interpolation_interactive,
     plot_latent_space_3d,
+    plot_latent_trajectory_3d_interactive,
     plot_metrics_comparison_interactive,
     plot_reconstruction_interactive,
 )
@@ -103,8 +109,11 @@ __all__ = [
     "plot_reconstruction_sample",
     "plot_temporal_accuracy",
     "plot_kld_trajectory",
+    "plot_kld_guid_trajectory",
+    "plot_kld_trajectory_3d",
     "plot_coherence_analysis",
     "plot_coherence_signals",
+    "plot_coherence_spectrum",
     "plot_reconstruction_coherence",
     "plot_psd_comparison",
     "plot_cross_correlation",
@@ -113,8 +122,10 @@ __all__ = [
     # Interactive visualizers
     "plot_reconstruction_interactive",
     "plot_kld_trajectory_interactive",
+    "plot_kld_trajectory_3d_interactive",
     "plot_latent_space_3d",
     "plot_latent_interpolation_interactive",
+    "plot_latent_trajectory_3d_interactive",
     "plot_metrics_comparison_interactive",
     # Analyses
     "run_histogram_analysis",

@@ -44,6 +44,8 @@ from model.vae_teb_prediction.testing.metrics import (
 )
 from model.vae_teb_prediction.testing.visualizers import (
     plot_kld_trajectory,
+    plot_kld_guid_trajectory,
+    plot_kld_trajectory_3d,
     plot_latent_trajectory_2d,
     plot_latent_trajectory_3d,
     plot_latent_changepoints_with_raw,
@@ -72,6 +74,7 @@ except ImportError:
 try:
     from model.vae_teb_prediction.testing.visualizers_interactive import (
         plot_latent_trajectory_3d_interactive,
+        plot_kld_trajectory_3d_interactive,
         plot_fhr_timeline,
         plot_trajectory_animation,
         plot_trajectory_comparison_interactive,
@@ -187,6 +190,8 @@ class TrajectoryAnalyzer:
         n_dashboards: int = 12,
         class_analysis: bool = False,
         n_trajectory_samples: int = 5,
+        n_kld_guid_plots: int = 12,
+        kld_guid_list: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run complete trajectory analysis pipeline.
@@ -208,6 +213,8 @@ class TrajectoryAnalyzer:
             n_dashboards: Maximum number of patient dashboards to generate.
             class_analysis: If True, include class-based plots/analysis.
             n_trajectory_samples: Number of samples for 3D trajectory plots.
+            n_kld_guid_plots: Number of GUIDs to plot for per-epoch KLD trends.
+            kld_guid_list: Optional list of GUIDs to plot (overrides top-N selection).
 
         Returns:
             Dict with summary statistics and output paths.
@@ -241,11 +248,13 @@ class TrajectoryAnalyzer:
         self._plot_kld_vs_time()
         if class_analysis:
             self._plot_kld_by_class()
+        self._plot_kld_guid_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
         self._plot_latent_space(color_by_label=class_analysis)
 
         # Generate 3D trajectory plots
         if self.plot_3d:
             self._plot_3d_trajectories(n_samples=n_trajectory_samples)
+            self._plot_kld_3d_trajectories(n_samples=n_trajectory_samples)
 
         # Plot changepoint analysis
         if HAS_CHANGEPOINT and self.changepoint_results:
@@ -400,25 +409,34 @@ class TrajectoryAnalyzer:
         return "unknown"
 
     def _add_dynamics(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add velocity and acceleration in latent space."""
+        """Add velocity/acceleration in latent space and KLD dynamics."""
         if df.empty:
             return df
 
         z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in df.columns]
-        if not z_cols:
+        has_kld = "kld" in df.columns
+        if not z_cols and not has_kld:
             return df
 
         def compute_dynamics(group: pd.DataFrame) -> pd.DataFrame:
             group = group.sort_values("t")
-            Z = group[z_cols].values
+            if z_cols:
+                Z = group[z_cols].values
 
-            # Velocity (first derivative)
-            dZ = np.diff(Z, axis=0, prepend=Z[[0]])
-            group["speed"] = np.linalg.norm(dZ, axis=1)
+                # Velocity (first derivative)
+                dZ = np.diff(Z, axis=0, prepend=Z[[0]])
+                group["speed"] = np.linalg.norm(dZ, axis=1)
 
-            # Acceleration (second derivative)
-            d2Z = np.diff(dZ, axis=0, prepend=dZ[[0]])
-            group["accel"] = np.linalg.norm(d2Z, axis=1)
+                # Acceleration (second derivative)
+                d2Z = np.diff(dZ, axis=0, prepend=dZ[[0]])
+                group["accel"] = np.linalg.norm(d2Z, axis=1)
+
+            if has_kld:
+                kld_series = pd.Series(group["kld"].astype(float).values)
+                kld_velocity = kld_series.diff().to_numpy()
+                kld_accel = pd.Series(kld_velocity).diff().to_numpy()
+                group["kld_velocity"] = kld_velocity
+                group["kld_accel"] = kld_accel
 
             return group
 
@@ -491,6 +509,32 @@ class TrajectoryAnalyzer:
         fig.tight_layout()
         fig.savefig(self.output_dir / "plots" / "kld_by_class.png", dpi=200)
         plt.close(fig)
+
+    def _plot_kld_guid_trajectories(
+        self,
+        *,
+        n_samples: int = 12,
+        guid_list: Optional[List[str]] = None,
+    ) -> None:
+        """Plot per-epoch KLD mean trajectories for selected GUIDs."""
+        if self.epoch_df.empty:
+            return
+
+        if guid_list:
+            selected_guids = [guid for guid in guid_list if guid in self.epoch_df["guid"].unique()]
+        else:
+            guid_counts = self.epoch_df["guid"].value_counts()
+            selected_guids = guid_counts.head(n_samples).index.tolist()
+
+        for guid in selected_guids:
+            subset = self.epoch_df[self.epoch_df["guid"] == guid]
+            if subset.empty:
+                continue
+            plot_kld_guid_trajectory(
+                subset,
+                self.output_dir / "plots",
+                guid=guid,
+            )
 
     def _plot_latent_space(self, *, color_by_label: bool = True) -> None:
         """Plot 2D PCA of latent space (optionally colored by class)."""
@@ -828,6 +872,51 @@ class TrajectoryAnalyzer:
 
         logger.info(f"Generated 3D trajectory plots for {min(n_samples, len(top_samples))} samples")
 
+    def _plot_kld_3d_trajectories(self, n_samples: int = 5) -> None:
+        """Generate 3D KLD trajectory plots for selected samples."""
+        if self.latent_df.empty or "kld_velocity" not in self.latent_df.columns:
+            return
+
+        sample_counts = self.latent_df.groupby(["guid", "epoch_sec"]).size()
+        top_samples = sample_counts.nlargest(n_samples).index.tolist()
+
+        plots_dir = self.output_dir / "plots"
+
+        for guid, epoch in top_samples:
+            mask = (self.latent_df["guid"] == guid) & (self.latent_df["epoch_sec"] == epoch)
+            subset = self.latent_df[mask].sort_values("t")
+
+            if len(subset) < 5:
+                continue
+
+            traj_df = subset[["kld", "kld_velocity", "kld_accel"]].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(traj_df) < 5:
+                continue
+
+            traj = traj_df.values
+            sample_id = f"{guid}_{int(epoch)}"
+
+            try:
+                plot_kld_trajectory_3d(
+                    traj,
+                    plots_dir / f"kld_trajectory_3d_{sample_id}.png",
+                    sample_id=sample_id,
+                )
+            except Exception as e:
+                logger.debug(f"KLD 3D trajectory plot failed: {e}")
+
+            if HAS_INTERACTIVE:
+                try:
+                    plot_kld_trajectory_3d_interactive(
+                        traj,
+                        plots_dir / f"kld_trajectory_3d_{sample_id}.html",
+                        sample_id=sample_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"Interactive KLD 3D trajectory plot failed: {e}")
+
+        logger.info(f"Generated KLD 3D trajectory plots for {min(n_samples, len(top_samples))} samples")
+
     def _plot_changepoints_with_raw(self, n_samples: int = 5) -> None:
         """Plot changepoints overlaid on raw FHR signals."""
         if not self.changepoint_results or not self.raw_data:
@@ -1007,6 +1096,8 @@ def run_trajectory_analysis(
     plot_3d: bool = True,
     plot_animations: bool = False,
     n_trajectory_samples: int = 5,
+    n_kld_guid_plots: int = 12,
+    kld_guid_list: Optional[List[str]] = None,
     decimation_factor: int = 16,
 ) -> Dict[str, Any]:
     """
@@ -1028,6 +1119,8 @@ def run_trajectory_analysis(
         plot_3d: Whether to generate 3D trajectory plots.
         plot_animations: Whether to generate animated trajectory GIFs.
         n_trajectory_samples: Number of samples for trajectory plots.
+        n_kld_guid_plots: Number of GUIDs to plot for per-epoch KLD trends.
+        kld_guid_list: Optional list of GUIDs to plot (overrides top-N selection).
         decimation_factor: Ratio between raw signal and latent lengths.
 
     Returns:
@@ -1065,4 +1158,6 @@ def run_trajectory_analysis(
         n_dashboards=n_dashboards,
         class_analysis=class_analysis,
         n_trajectory_samples=n_trajectory_samples,
+        n_kld_guid_plots=n_kld_guid_plots,
+        kld_guid_list=kld_guid_list,
     )
