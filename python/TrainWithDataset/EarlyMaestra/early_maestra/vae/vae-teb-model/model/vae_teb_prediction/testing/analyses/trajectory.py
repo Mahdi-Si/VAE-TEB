@@ -122,6 +122,7 @@ class TrajectoryAnalyzer:
         self,
         skip_dashboards: bool = False,
         n_dashboards: int = 12,
+        class_analysis: bool = False,
     ) -> Dict[str, Any]:
         """
         Run complete trajectory analysis pipeline.
@@ -143,6 +144,7 @@ class TrajectoryAnalyzer:
             Dict with summary statistics and output paths.
         """
         logger.info("Starting trajectory analysis...")
+        self.class_analysis = class_analysis
 
         # Step 1: Collect data
         self.latent_df, self.epoch_df = self._collect_data()
@@ -163,8 +165,9 @@ class TrajectoryAnalyzer:
 
         # Step 5: Generate plots
         self._plot_kld_vs_time()
-        self._plot_kld_by_class()
-        self._plot_latent_space()
+        if class_analysis:
+            self._plot_kld_by_class()
+        self._plot_latent_space(color_by_label=class_analysis)
 
         # Step 6: Dashboards
         if not skip_dashboards:
@@ -343,8 +346,9 @@ class TrajectoryAnalyzer:
         if self.epoch_df.empty:
             return
 
-        # Use the standard visualizer
-        plot_kld_trajectory(self.epoch_df, self.output_dir / "plots")
+        # Use the standard visualizer without class split
+        epoch_df = self.epoch_df.drop(columns=["label"], errors="ignore")
+        plot_kld_trajectory(epoch_df, self.output_dir / "plots")
 
     def _plot_kld_by_class(self) -> None:
         """Plot KLD trajectories separated by class."""
@@ -379,22 +383,26 @@ class TrajectoryAnalyzer:
         fig.savefig(self.output_dir / "plots" / "kld_by_class.png", dpi=200)
         plt.close(fig)
 
-    def _plot_latent_space(self) -> None:
-        """Plot 2D PCA of latent space colored by class."""
+    def _plot_latent_space(self, *, color_by_label: bool = True) -> None:
+        """Plot 2D PCA of latent space (optionally colored by class)."""
         if self.latent_df.empty or "pc1" not in self.latent_df.columns:
             return
 
         fig, ax = plt.subplots(figsize=(10, 8))
 
-        for label in self.latent_df["label"].unique():
-            subset = self.latent_df[self.latent_df["label"] == label]
-            color = self.colors.get(label, "#666666")
-            ax.scatter(subset["pc1"], subset["pc2"], c=color, alpha=0.3, s=1, label=label)
+        if color_by_label and "label" in self.latent_df.columns:
+            for label in self.latent_df["label"].unique():
+                subset = self.latent_df[self.latent_df["label"] == label]
+                color = self.colors.get(label, "#666666")
+                ax.scatter(subset["pc1"], subset["pc2"], c=color, alpha=0.3, s=1, label=label)
+        else:
+            ax.scatter(self.latent_df["pc1"], self.latent_df["pc2"], c="#4C72B0", alpha=0.25, s=1)
 
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_title("Latent Space (PCA Projection)")
-        ax.legend(markerscale=5)
+        if color_by_label and "label" in self.latent_df.columns:
+            ax.legend(markerscale=5)
 
         fig.tight_layout()
         fig.savefig(self.output_dir / "plots" / "latent_space.png", dpi=200)
@@ -483,7 +491,7 @@ class TrajectoryAnalyzer:
             metrics["kld_std"] = float(self.epoch_df["kld_mean"].std())
 
         # Silhouette score for class separation (if sklearn available)
-        if HAS_SKLEARN and not self.latent_df.empty and "label" in self.latent_df.columns:
+        if self.class_analysis and HAS_SKLEARN and not self.latent_df.empty and "label" in self.latent_df.columns:
             try:
                 z_cols = [c for c in self.latent_df.columns if c.startswith("z") and c[1:].isdigit()]
                 if z_cols:
@@ -508,6 +516,7 @@ def run_trajectory_analysis(
     min_epochs_per_guid: int = 3,
     skip_dashboards: bool = False,
     n_dashboards: int = 12,
+    class_analysis: bool = False,
 ) -> Dict[str, Any]:
     """
     Run complete trajectory analysis.
@@ -521,6 +530,7 @@ def run_trajectory_analysis(
         min_epochs_per_guid: Minimum epochs per patient.
         skip_dashboards: If True, skip dashboard generation.
         n_dashboards: Maximum dashboards to generate.
+        class_analysis: If True, include class-based plots/analysis.
 
     Returns:
         Summary dict with statistics and output paths.
@@ -539,4 +549,8 @@ def run_trajectory_analysis(
         min_epochs_per_guid=min_epochs_per_guid,
     )
 
-    return analyzer.run(skip_dashboards=skip_dashboards, n_dashboards=n_dashboards)
+    return analyzer.run(
+        skip_dashboards=skip_dashboards,
+        n_dashboards=n_dashboards,
+        class_analysis=class_analysis,
+    )

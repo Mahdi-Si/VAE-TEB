@@ -33,6 +33,7 @@ from model.vae_teb_prediction.testing.analyses import (
     run_histogram_analysis,
     run_latent_distribution_analysis,
     run_temporal_accuracy_analysis,
+    run_within_window_analysis,
     run_coherence_analysis,
     run_trajectory_analysis,
 )
@@ -195,13 +196,6 @@ def run_full_test_pipeline(
             dataset_kwargs=dataset_kwargs,
         )
 
-    if not skip_coherence:
-        dataset = getattr(standard_loader, "dataset", None)
-        load_fields = getattr(dataset, "load_fields", None)
-        if load_fields is not None and "up" not in load_fields:
-            logger.warning("Coherence analysis skipped because 'up' is not in dataset load_fields.")
-            skip_coherence = True
-
     # ----- Step 3: Run analyses -----
     results: Dict[str, Any] = {}
 
@@ -216,6 +210,14 @@ def run_full_test_pipeline(
     # Temporal accuracy analysis (standard loader)
     logger.info("Running temporal accuracy analysis...")
     results["temporal"] = run_temporal_accuracy_analysis(runner, standard_loader, max_samples=min(200, max_samples or 200))
+
+    # Within-window temporal accuracy (standard loader)
+    logger.info("Running within-window accuracy analysis...")
+    results["within_window"] = run_within_window_analysis(
+        runner,
+        standard_loader,
+        max_samples=min(100, max_samples or 100),
+    )
 
     # Coherence analysis (standard loader)
     if not skip_coherence:
