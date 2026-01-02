@@ -37,8 +37,19 @@ from loguru import logger
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import _extract_epoch, _extract_guid, _extract_label
-from model.vae_teb_prediction.testing.metrics import compute_kld
-from model.vae_teb_prediction.testing.visualizers import plot_kld_trajectory
+from model.vae_teb_prediction.testing.metrics import (
+    compute_kld,
+    preprocess_latent,
+    reduce_latent_dimensionality,
+)
+from model.vae_teb_prediction.testing.visualizers import (
+    plot_kld_trajectory,
+    plot_latent_trajectory_2d,
+    plot_latent_trajectory_3d,
+    plot_latent_changepoints_with_raw,
+    plot_segment_statistics,
+    plot_trajectory_comparison,
+)
 
 try:
     from sklearn.decomposition import PCA
@@ -46,6 +57,34 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+# Optional imports for advanced features
+try:
+    from model.vae_teb_prediction.testing.analyses.changepoint import (
+        detect_changepoints,
+        summarize_latent_segments,
+        create_changepoint_detector,
+    )
+    HAS_CHANGEPOINT = True
+except ImportError:
+    HAS_CHANGEPOINT = False
+
+try:
+    from model.vae_teb_prediction.testing.visualizers_interactive import (
+        plot_latent_trajectory_3d_interactive,
+        plot_fhr_timeline,
+        plot_trajectory_animation,
+        plot_trajectory_comparison_interactive,
+    )
+    HAS_INTERACTIVE = True
+except ImportError:
+    HAS_INTERACTIVE = False
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 # Constants
 TIMESTEP_SECONDS = 4.0  # Each latent step = 4 seconds
@@ -78,6 +117,11 @@ class TrajectoryAnalyzer:
         time_range_hours: Optional[float] = 12.0,
         min_epochs_per_guid: int = 3,
         class_names: Optional[List[str]] = None,
+        dim_reduction_method: str = "pca",
+        n_changepoints: int = 5,
+        plot_3d: bool = True,
+        plot_animations: bool = False,
+        decimation_factor: int = 16,
     ):
         """
         Initialize the trajectory analyzer.
@@ -89,6 +133,12 @@ class TrajectoryAnalyzer:
             time_range_hours: Analyze this many hours before birth (None = all).
             min_epochs_per_guid: Minimum epochs per patient to include.
             class_names: Names for outcome classes.
+            dim_reduction_method: Dimensionality reduction method
+                ('pca', 'umap', 'tsne', 'isomap', 'diffusion').
+            n_changepoints: Number of changepoints to detect per sample.
+            plot_3d: Whether to generate 3D trajectory plots.
+            plot_animations: Whether to generate trajectory animations (slower).
+            decimation_factor: Ratio between raw signal and latent lengths.
         """
         self.runner = runner
         self.loader = loader
@@ -99,6 +149,13 @@ class TrajectoryAnalyzer:
         # Get latent dimension from model
         self.latent_dim = int(getattr(runner.model, "latent_dim_z", 16))
         self.warmup_steps = runner.warmup_steps
+
+        # Advanced analysis settings
+        self.dim_reduction_method = dim_reduction_method
+        self.n_changepoints = n_changepoints
+        self.plot_3d = plot_3d
+        self.plot_animations = plot_animations
+        self.decimation_factor = decimation_factor
 
         # Class configuration
         self.class_names = class_names or ["healthy", "acidosis", "HIE"]
@@ -113,16 +170,23 @@ class TrajectoryAnalyzer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "plots").mkdir(exist_ok=True)
         (self.output_dir / "dashboards").mkdir(exist_ok=True)
+        (self.output_dir / "changepoint_analysis").mkdir(exist_ok=True)
+        if plot_animations:
+            (self.output_dir / "animations").mkdir(exist_ok=True)
 
         # Results storage
         self.latent_df: Optional[pd.DataFrame] = None
         self.epoch_df: Optional[pd.DataFrame] = None
+        self.raw_data: Dict[str, Dict[str, Any]] = {}  # Store raw signals per GUID
+        self.changepoint_results: Dict[str, Any] = {}
+        self.segment_stats: List[Dict[str, Any]] = []
 
     def run(
         self,
         skip_dashboards: bool = False,
         n_dashboards: int = 12,
         class_analysis: bool = False,
+        n_trajectory_samples: int = 5,
     ) -> Dict[str, Any]:
         """
         Run complete trajectory analysis pipeline.
@@ -130,15 +194,20 @@ class TrajectoryAnalyzer:
         Steps:
             1. Collect latent codes and KLD from model
             2. Add dynamics (velocity, acceleration)
-            3. Fit PCA for visualization
-            4. Save data to parquet
-            5. Generate plots
-            6. Generate per-patient dashboards
-            7. Compute summary metrics
+            3. Apply dimensionality reduction (PCA, UMAP, t-SNE, etc.)
+            4. Detect changepoints and compute segment statistics
+            5. Save data to parquet
+            6. Generate plots (including 3D trajectories)
+            7. Generate per-patient dashboards
+            8. Generate animations (if enabled)
+            9. Compare class trajectories (if class_analysis enabled)
+            10. Compute summary metrics
 
         Args:
             skip_dashboards: If True, skip per-patient dashboard generation.
             n_dashboards: Maximum number of patient dashboards to generate.
+            class_analysis: If True, include class-based plots/analysis.
+            n_trajectory_samples: Number of samples for 3D trajectory plots.
 
         Returns:
             Dict with summary statistics and output paths.
@@ -156,24 +225,47 @@ class TrajectoryAnalyzer:
         # Step 2: Add dynamics
         self.latent_df = self._add_dynamics(self.latent_df)
 
-        # Step 3: Fit PCA
-        self.latent_df = self._fit_pca(self.latent_df)
+        # Step 3: Apply dimensionality reduction
+        self._reduce_dimensionality()
 
-        # Step 4: Save data
+        # Step 4: Detect changepoints and compute segment statistics
+        if HAS_CHANGEPOINT and self.n_changepoints > 0:
+            self._detect_changepoints_all()
+            self._compute_segment_statistics()
+
+        # Step 5: Save data
         self.latent_df.to_parquet(self.output_dir / "latent_trajectories.parquet")
         self.epoch_df.to_parquet(self.output_dir / "epoch_summary.parquet")
 
-        # Step 5: Generate plots
+        # Step 6: Generate plots
         self._plot_kld_vs_time()
         if class_analysis:
             self._plot_kld_by_class()
         self._plot_latent_space(color_by_label=class_analysis)
 
-        # Step 6: Dashboards
+        # Generate 3D trajectory plots
+        if self.plot_3d:
+            self._plot_3d_trajectories(n_samples=n_trajectory_samples)
+
+        # Plot changepoint analysis
+        if HAS_CHANGEPOINT and self.changepoint_results:
+            self._plot_changepoints_with_raw(n_samples=n_trajectory_samples)
+            if self.segment_stats:
+                self._plot_segment_stats()
+
+        # Step 7: Dashboards
         if not skip_dashboards:
             self._generate_dashboards(n_dashboards)
 
-        # Step 7: Compute metrics
+        # Step 8: Generate animations (if enabled)
+        if self.plot_animations and HAS_INTERACTIVE:
+            self._generate_trajectory_animations(n_samples=min(3, n_trajectory_samples))
+
+        # Step 9: Compare class trajectories
+        if class_analysis and HAS_INTERACTIVE:
+            self._compare_class_trajectories()
+
+        # Step 10: Compute metrics
         metrics = self._compute_metrics()
 
         # Save summary
@@ -182,6 +274,8 @@ class TrajectoryAnalyzer:
             "n_guids": self.epoch_df["guid"].nunique() if not self.epoch_df.empty else 0,
             "n_epochs": len(self.epoch_df),
             "time_range_hours": self.time_range_hours,
+            "dim_reduction_method": self.dim_reduction_method,
+            "n_changepoints": self.n_changepoints,
             "metrics": metrics,
         }
 
@@ -265,6 +359,21 @@ class TrajectoryAnalyzer:
                         "kld_mean": float(np.nanmean(valid_kld)) if valid_kld is not None else np.nan,
                         "kld_std": float(np.nanstd(valid_kld)) if valid_kld is not None else np.nan,
                     })
+
+                    # Store raw data for changepoint detection (first epoch per guid)
+                    if guid not in self.raw_data:
+                        fhr_signal = None
+                        if hasattr(batch, "fhr") and batch.fhr is not None:
+                            fhr_signal = batch.fhr[idx].cpu().numpy() if hasattr(batch.fhr, 'cpu') else np.asarray(batch.fhr[idx])
+                        elif hasattr(batch, "fhr_st") and batch.fhr_st is not None:
+                            fhr_signal = batch.fhr_st[idx].cpu().numpy().flatten() if hasattr(batch.fhr_st, 'cpu') else np.asarray(batch.fhr_st[idx]).flatten()
+
+                        self.raw_data[guid] = {
+                            "latent_mean": latent_np[idx],  # (T, D)
+                            "fhr": fhr_signal,
+                            "epoch": epoch_sec,
+                            "label": label,
+                        }
 
         # Create DataFrames
         latent_df = pd.DataFrame(latent_rows)
@@ -508,6 +617,382 @@ class TrajectoryAnalyzer:
 
         return metrics
 
+    # -------------------------------------------------------------------------
+    # New methods for advanced trajectory analysis
+    # -------------------------------------------------------------------------
+
+    def _reduce_dimensionality(self) -> None:
+        """Apply dimensionality reduction to latent trajectories."""
+        if self.latent_df.empty:
+            return
+
+        z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
+        if not z_cols:
+            return
+
+        # Get unique (guid, epoch) combinations
+        unique_keys = self.latent_df[["guid", "epoch_sec"]].drop_duplicates()
+
+        reduced_trajectories = []
+        for _, row in unique_keys.iterrows():
+            guid, epoch = row["guid"], row["epoch_sec"]
+            mask = (self.latent_df["guid"] == guid) & (self.latent_df["epoch_sec"] == epoch)
+            subset = self.latent_df[mask].sort_values("t")
+
+            if len(subset) < 3:
+                continue
+
+            Z = subset[z_cols].values
+            if not np.all(np.isfinite(Z)):
+                continue
+
+            # Reshape to (1, T, D) for reduce_latent_dimensionality
+            Z_3d = Z[np.newaxis, :, :]
+
+            try:
+                if HAS_TORCH:
+                    Z_tensor = torch.from_numpy(Z_3d).float()
+                    reduced = reduce_latent_dimensionality(
+                        Z_tensor,
+                        method=self.dim_reduction_method,
+                        n_components=3,
+                    )
+                else:
+                    # Fallback to simple PCA if torch not available
+                    self.latent_df = self._fit_pca(self.latent_df)
+                    return
+
+                # Store reduced coordinates
+                reduced_2d = reduced[0]  # (T, 3)
+                for i, t in enumerate(subset["t"].values):
+                    reduced_trajectories.append({
+                        "guid": guid,
+                        "epoch_sec": epoch,
+                        "t": t,
+                        "rd1": reduced_2d[i, 0],
+                        "rd2": reduced_2d[i, 1],
+                        "rd3": reduced_2d[i, 2] if reduced_2d.shape[1] > 2 else 0.0,
+                    })
+            except Exception as e:
+                logger.debug(f"Dimensionality reduction failed for {guid}: {e}")
+                continue
+
+        # Merge reduced coordinates into latent_df
+        if reduced_trajectories:
+            reduced_df = pd.DataFrame(reduced_trajectories)
+            self.latent_df = self.latent_df.merge(
+                reduced_df, on=["guid", "epoch_sec", "t"], how="left"
+            )
+            # Use rd1, rd2, rd3 as pc1, pc2, pc3 for compatibility
+            if "rd1" in self.latent_df.columns:
+                self.latent_df["pc1"] = self.latent_df["rd1"]
+                self.latent_df["pc2"] = self.latent_df["rd2"]
+                self.latent_df["pc3"] = self.latent_df.get("rd3", 0.0)
+
+            logger.info(f"Applied {self.dim_reduction_method.upper()} dimensionality reduction")
+        else:
+            # Fallback to standard PCA
+            self.latent_df = self._fit_pca(self.latent_df)
+
+    def _detect_changepoints_all(self) -> None:
+        """Detect changepoints for all samples with stored raw data."""
+        if not HAS_CHANGEPOINT:
+            logger.warning("Changepoint detection not available (ruptures not installed)")
+            return
+
+        if not self.raw_data:
+            logger.debug("No raw data stored for changepoint detection")
+            return
+
+        detector = create_changepoint_detector(algo="pelt", model="rbf")
+
+        for guid, data in self.raw_data.items():
+            latent_mean = data.get("latent_mean")
+            fhr = data.get("fhr")
+
+            if latent_mean is None:
+                continue
+
+            try:
+                cp_result = detect_changepoints(
+                    latent_sample=latent_mean,
+                    n_changepoints=self.n_changepoints,
+                    decimation_factor=self.decimation_factor,
+                    raw_signal=fhr,
+                    detect_raw=(fhr is not None),
+                    detector=detector,
+                )
+                self.changepoint_results[guid] = cp_result
+            except Exception as e:
+                logger.debug(f"Changepoint detection failed for {guid}: {e}")
+                continue
+
+        if self.changepoint_results:
+            logger.info(f"Detected changepoints for {len(self.changepoint_results)} samples")
+
+    def _compute_segment_statistics(self) -> None:
+        """Compute per-segment statistics after changepoint detection."""
+        if not HAS_CHANGEPOINT or not self.raw_data:
+            return
+
+        all_segment_stats = []
+
+        for guid, data in self.raw_data.items():
+            latent_mean = data.get("latent_mean")
+            epoch = data.get("epoch")
+
+            if latent_mean is None:
+                continue
+
+            try:
+                stats = summarize_latent_segments(
+                    latent_mean=latent_mean[np.newaxis, :, :] if latent_mean.ndim == 2 else latent_mean,
+                    epoch=np.array([epoch]) if epoch is not None else None,
+                    sample_ids=[guid],
+                    n_changepoints=self.n_changepoints,
+                    decimation_factor=self.decimation_factor,
+                    precomputed_changepoints=self.changepoint_results.get(guid),
+                )
+                all_segment_stats.extend(stats)
+            except Exception as e:
+                logger.debug(f"Segment statistics failed for {guid}: {e}")
+                continue
+
+        self.segment_stats = all_segment_stats
+        if self.segment_stats:
+            logger.info(f"Computed segment statistics for {len(self.segment_stats)} samples")
+
+    def _plot_3d_trajectories(self, n_samples: int = 5) -> None:
+        """Generate 3D trajectory plots for selected samples."""
+        if self.latent_df.empty:
+            return
+
+        # Get samples with most time points
+        sample_counts = self.latent_df.groupby(["guid", "epoch_sec"]).size()
+        top_samples = sample_counts.nlargest(n_samples).index.tolist()
+
+        plots_dir = self.output_dir / "plots"
+
+        for guid, epoch in top_samples:
+            mask = (self.latent_df["guid"] == guid) & (self.latent_df["epoch_sec"] == epoch)
+            subset = self.latent_df[mask].sort_values("t")
+
+            if len(subset) < 5:
+                continue
+
+            # Try reduced dimensions first, fallback to z0, z1, z2
+            if "rd1" in subset.columns:
+                traj = subset[["rd1", "rd2", "rd3"]].values
+            elif "pc1" in subset.columns:
+                traj = subset[["pc1", "pc2", "pc3"]].values if "pc3" in subset.columns else subset[["pc1", "pc2"]].values
+            else:
+                z_cols = [f"z{d}" for d in range(3) if f"z{d}" in subset.columns]
+                if len(z_cols) < 2:
+                    continue
+                traj = subset[z_cols].values
+
+            sample_id = f"{guid}_{int(epoch)}"
+
+            # Static 2D plot
+            if traj.shape[1] >= 2:
+                try:
+                    plot_latent_trajectory_2d(
+                        traj[:, :2],
+                        plots_dir / f"trajectory_2d_{sample_id}.png",
+                        sample_id=sample_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"2D trajectory plot failed: {e}")
+
+            # Static 3D plot
+            if traj.shape[1] >= 3:
+                try:
+                    plot_latent_trajectory_3d(
+                        traj[:, :3],
+                        plots_dir / f"trajectory_3d_{sample_id}.png",
+                        sample_id=sample_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"3D trajectory plot failed: {e}")
+
+            # Interactive 3D plot
+            if HAS_INTERACTIVE and traj.shape[1] >= 3:
+                try:
+                    plot_latent_trajectory_3d_interactive(
+                        traj[:, :3],
+                        plots_dir / f"trajectory_3d_{sample_id}.html",
+                        sample_id=sample_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"Interactive 3D trajectory plot failed: {e}")
+
+        logger.info(f"Generated 3D trajectory plots for {min(n_samples, len(top_samples))} samples")
+
+    def _plot_changepoints_with_raw(self, n_samples: int = 5) -> None:
+        """Plot changepoints overlaid on raw FHR signals."""
+        if not self.changepoint_results or not self.raw_data:
+            return
+
+        cp_dir = self.output_dir / "changepoint_analysis"
+        samples_plotted = 0
+
+        for guid, cp_result in list(self.changepoint_results.items())[:n_samples]:
+            data = self.raw_data.get(guid)
+            if data is None:
+                continue
+
+            latent_mean = data.get("latent_mean")
+            fhr = data.get("fhr")
+
+            if latent_mean is None or fhr is None:
+                continue
+
+            try:
+                plot_latent_changepoints_with_raw(
+                    latent_mean=latent_mean,
+                    fhr=fhr,
+                    changepoint_results=cp_result,
+                    output_path=cp_dir / f"changepoints_{guid}.png",
+                    sample_id=guid,
+                    decimation_factor=self.decimation_factor,
+                )
+                samples_plotted += 1
+            except Exception as e:
+                logger.debug(f"Changepoint plot failed for {guid}: {e}")
+
+        if samples_plotted > 0:
+            logger.info(f"Generated changepoint plots for {samples_plotted} samples")
+
+    def _plot_segment_stats(self) -> None:
+        """Plot aggregated segment statistics."""
+        if not self.segment_stats:
+            return
+
+        try:
+            df = plot_segment_statistics(
+                self.segment_stats,
+                self.output_dir / "changepoint_analysis",
+                filename_prefix="segment",
+            )
+            if df is not None:
+                df.to_csv(self.output_dir / "segment_stats.csv", index=False)
+                logger.info("Generated segment statistics plots")
+        except Exception as e:
+            logger.warning(f"Segment statistics plotting failed: {e}")
+
+    def _generate_trajectory_animations(self, n_samples: int = 3) -> None:
+        """Generate animated trajectory GIFs."""
+        if not HAS_INTERACTIVE:
+            return
+
+        if self.latent_df.empty:
+            return
+
+        animations_dir = self.output_dir / "animations"
+
+        sample_counts = self.latent_df.groupby(["guid", "epoch_sec"]).size()
+        top_samples = sample_counts.nlargest(n_samples).index.tolist()
+
+        for guid, epoch in top_samples:
+            mask = (self.latent_df["guid"] == guid) & (self.latent_df["epoch_sec"] == epoch)
+            subset = self.latent_df[mask].sort_values("t")
+
+            if len(subset) < 10:
+                continue
+
+            # Get trajectory coordinates
+            if "rd1" in subset.columns:
+                traj = subset[["rd1", "rd2", "rd3"]].values
+            elif "pc1" in subset.columns and "pc3" in subset.columns:
+                traj = subset[["pc1", "pc2", "pc3"]].values
+            elif "pc1" in subset.columns:
+                traj = subset[["pc1", "pc2"]].values
+            else:
+                z_cols = [f"z{d}" for d in range(3) if f"z{d}" in subset.columns]
+                if len(z_cols) < 2:
+                    continue
+                traj = subset[z_cols].values
+
+            sample_id = f"{guid}_{int(epoch)}"
+
+            try:
+                success = plot_trajectory_animation(
+                    traj,
+                    animations_dir / f"trajectory_{sample_id}.gif",
+                    sample_id=sample_id,
+                    fps=15,
+                    duration_seconds=5.0,
+                )
+                if success:
+                    logger.debug(f"Generated animation for {sample_id}")
+            except Exception as e:
+                logger.debug(f"Animation generation failed for {sample_id}: {e}")
+
+        logger.info(f"Generated trajectory animations")
+
+    def _compare_class_trajectories(self) -> None:
+        """Compare trajectories across outcome classes."""
+        if not HAS_INTERACTIVE or self.latent_df.empty or "label" not in self.latent_df.columns:
+            return
+
+        # Group trajectories by class
+        trajectories_by_class: Dict[str, List[np.ndarray]] = defaultdict(list)
+
+        for label in self.latent_df["label"].unique():
+            if label == "unknown":
+                continue
+
+            subset = self.latent_df[self.latent_df["label"] == label]
+            unique_samples = subset[["guid", "epoch_sec"]].drop_duplicates()
+
+            for _, row in unique_samples.head(5).iterrows():  # Max 5 per class
+                guid, epoch = row["guid"], row["epoch_sec"]
+                mask = (subset["guid"] == guid) & (subset["epoch_sec"] == epoch)
+                sample = subset[mask].sort_values("t")
+
+                if len(sample) < 5:
+                    continue
+
+                # Get coordinates
+                if "rd1" in sample.columns:
+                    traj = sample[["rd1", "rd2", "rd3"]].values
+                elif "pc1" in sample.columns and "pc3" in sample.columns:
+                    traj = sample[["pc1", "pc2", "pc3"]].values
+                else:
+                    continue
+
+                trajectories_by_class[label].append(traj)
+
+        if not trajectories_by_class:
+            return
+
+        # Convert lists to arrays for plotting
+        trajectories_dict = {}
+        for label, traj_list in trajectories_by_class.items():
+            if traj_list:
+                # Stack first trajectory for each class (for simple comparison)
+                trajectories_dict[label] = traj_list[0]
+
+        try:
+            # Static comparison
+            plot_trajectory_comparison(
+                trajectories_dict,
+                self.output_dir / "plots",
+                n_components=3,
+                filename="trajectory_class_comparison.png",
+            )
+
+            # Interactive comparison
+            plot_trajectory_comparison_interactive(
+                trajectories_dict,
+                self.output_dir / "plots" / "trajectory_class_comparison.html",
+                title="Trajectory Comparison by Outcome Class",
+                n_components=3,
+            )
+            logger.info("Generated class trajectory comparison plots")
+        except Exception as e:
+            logger.warning(f"Class trajectory comparison failed: {e}")
+
 
 def run_trajectory_analysis(
     runner: TestRunner,
@@ -517,6 +1002,12 @@ def run_trajectory_analysis(
     skip_dashboards: bool = False,
     n_dashboards: int = 12,
     class_analysis: bool = False,
+    dim_reduction_method: str = "pca",
+    n_changepoints: int = 5,
+    plot_3d: bool = True,
+    plot_animations: bool = False,
+    n_trajectory_samples: int = 5,
+    decimation_factor: int = 16,
 ) -> Dict[str, Any]:
     """
     Run complete trajectory analysis.
@@ -531,6 +1022,13 @@ def run_trajectory_analysis(
         skip_dashboards: If True, skip dashboard generation.
         n_dashboards: Maximum dashboards to generate.
         class_analysis: If True, include class-based plots/analysis.
+        dim_reduction_method: Dimensionality reduction method
+            ('pca', 'umap', 'tsne', 'isomap', 'diffusion').
+        n_changepoints: Number of changepoints to detect per sample.
+        plot_3d: Whether to generate 3D trajectory plots.
+        plot_animations: Whether to generate animated trajectory GIFs.
+        n_trajectory_samples: Number of samples for trajectory plots.
+        decimation_factor: Ratio between raw signal and latent lengths.
 
     Returns:
         Summary dict with statistics and output paths.
@@ -538,6 +1036,14 @@ def run_trajectory_analysis(
     Example:
         >>> results = run_trajectory_analysis(runner, test_loader)
         >>> print(f"Analyzed {results['n_guids']} patients")
+
+        >>> # With advanced options
+        >>> results = run_trajectory_analysis(
+        ...     runner, test_loader,
+        ...     dim_reduction_method='umap',
+        ...     n_changepoints=5,
+        ...     plot_animations=True,
+        ... )
     """
     output_dir = runner.ensure_dir("trajectory")
 
@@ -547,10 +1053,16 @@ def run_trajectory_analysis(
         output_dir=output_dir,
         time_range_hours=time_range_hours,
         min_epochs_per_guid=min_epochs_per_guid,
+        dim_reduction_method=dim_reduction_method,
+        n_changepoints=n_changepoints,
+        plot_3d=plot_3d,
+        plot_animations=plot_animations,
+        decimation_factor=decimation_factor,
     )
 
     return analyzer.run(
         skip_dashboards=skip_dashboards,
         n_dashboards=n_dashboards,
         class_analysis=class_analysis,
+        n_trajectory_samples=n_trajectory_samples,
     )
