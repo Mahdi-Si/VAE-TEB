@@ -5,13 +5,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 # Publication-style defaults aligned with testing/visualizers.py
-COLOR_BLUE = "#0173B2"
-COLOR_ORANGE = "#DE8F05"
-COLOR_GREEN = "#029E73"
-COLOR_SKY = "#56B4E9"
-COLOR_PURPLE = "#CC78BC"
-COLOR_GRAY = "#555555"
-COLOR_BLACK = "#000000"
+COLOR_BLUE = "#5A6673"
+COLOR_ORANGE = "#7A6D63"
+COLOR_GREEN = "#5F6B64"
+COLOR_SKY = "#8C98A4"
+COLOR_PURPLE = "#6C6474"
+COLOR_GRAY = "#666666"
+COLOR_BLACK = "#222222"
 SAVE_DPI = 600
 
 
@@ -23,8 +23,9 @@ def _apply_publication_style() -> None:
         "savefig.format": "png",
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.05,
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "DejaVu Sans", "Helvetica", "Liberation Sans"],
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
+        
         "font.size": 8,
         "axes.titlesize": 9,
         "axes.labelsize": 8,
@@ -39,6 +40,8 @@ def _apply_publication_style() -> None:
         "axes.spines.right": True,
         "axes.spines.left": True,
         "axes.spines.bottom": True,
+        "axes.titleweight": "normal",
+        "axes.labelweight": "normal",
         "axes.axisbelow": True,
         "xtick.direction": "in",
         "ytick.direction": "in",
@@ -54,7 +57,7 @@ def _apply_publication_style() -> None:
         "ytick.color": COLOR_BLACK,
         "grid.alpha": 0.25,
         "grid.linewidth": 0.3,
-        "grid.color": "#E0E0E0",
+        "grid.color": "#DDDDDD",
         "grid.linestyle": "-",
         "legend.frameon": True,
         "legend.framealpha": 0.95,
@@ -175,27 +178,27 @@ def plot_model_analysis(
     if training_mode:
         # Configure scientific paper grid style for main plots only (left column)
         for i in range(n_rows):
-            ax[i, 0].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[i, 0].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+            ax[i, 0].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
             ax[i, 0].minorticks_on()
             ax[i, 0].set_axisbelow(True)
             ax[i, 0].spines['top'].set_visible(False)
             ax[i, 0].spines['right'].set_visible(False)
-            ax[i, 0].spines['left'].set_color('#A2B9A7')
-            ax[i, 0].spines['bottom'].set_color('#A2B9A7')
+            ax[i, 0].spines['left'].set_color('#999999')
+            ax[i, 0].spines['bottom'].set_color('#999999')
             ax[i, 0].spines['left'].set_linewidth(0.7)
             ax[i, 0].spines['bottom'].set_linewidth(0.7)
     else:
         # Original mode: apply to all subplots (now single column)
         for i in range(n_rows):
-            ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-            ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+            ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+            ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
             ax[i].minorticks_on()
             ax[i].set_axisbelow(True)
             ax[i].spines['top'].set_visible(False)
             ax[i].spines['right'].set_visible(False)
-            ax[i].spines['left'].set_color('#A2B9A7')
-            ax[i].spines['bottom'].set_color('#A2B9A7')
+            ax[i].spines['left'].set_color('#999999')
+            ax[i].spines['bottom'].set_color('#999999')
             ax[i].spines['left'].set_linewidth(0.7)
             ax[i].spines['bottom'].set_linewidth(0.7)
 
@@ -338,7 +341,7 @@ def plot_model_analysis(
             cbar = fig.colorbar(imgplot, cax=ax[3, 1])
             cbar.ax.tick_params(labelsize=10, colors='#666666')
             cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#666666')
-            cbar.outline.set_color('#A2B9A7')
+            cbar.outline.set_color('#999999')
             cbar.outline.set_linewidth(0.7)
             ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
             ax[3, 0].set_xlabel('Time Steps', fontweight='normal')
@@ -352,7 +355,7 @@ def plot_model_analysis(
 
         # Set overall title with scientific paper styling
         fig.suptitle(f'Model Performance Analysis - Epoch {epoch}', 
-                    fontsize=14, fontweight='normal', y=0.97, color='#456882')
+                    fontsize=14, fontweight='normal', y=0.97, color=COLOR_BLUE)
         save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.pdf')
         
     else:
@@ -563,7 +566,7 @@ def plot_model_analysis(
             fig.colorbar(im_up_ph, ax=ax[next_idx])
             next_idx += 1
 
-        fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='normal')
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
     
     # Save and close (common for both modes)
@@ -639,18 +642,18 @@ def plot_single_prediction_windows(
     }
 
     n_rows = 2 + len(windows)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(16, max(6, 3 + 2.3 * len(windows))), constrained_layout=True)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(6.5, max(6, 2.4 * n_rows)), constrained_layout=True)
     if n_rows == 1:
         axes = np.asarray([axes])
 
     for ax in axes:
-        ax.grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#D2C1B6')
+        ax.grid(True, linestyle='-', alpha=0.35, linewidth=0.4, color='#DDDDDD')
         ax.minorticks_on()
         ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#A2B9A7')
-        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_color('#999999')
+        ax.spines['bottom'].set_color('#999999')
         ax.spines['left'].set_linewidth(0.7)
         ax.spines['bottom'].set_linewidth(0.7)
 
@@ -658,7 +661,10 @@ def plot_single_prediction_windows(
     axes[0].plot(t_raw, raw_fhr_unnormalized, color=colors['fhr'], linewidth=1.4, label="Raw FHR")
     axes[0].set_ylabel("Amplitude")
     axes[0].set_xlabel("Time (s)")
-    axes[0].legend(loc="upper right", framealpha=0.95)
+    from matplotlib.patches import Patch
+    window_patch = Patch(facecolor=colors["recon"], alpha=0.12, label="Prediction window")
+    handles, labels = axes[0].get_legend_handles_labels()
+    axes[0].legend(handles + [window_patch], labels + [window_patch.get_label()], loc="upper right", framealpha=0.95)
 
     title = f"Single Prediction Windows - Sample {sample_idx:03d}"
     if sample_guid:
@@ -727,6 +733,7 @@ def plot_single_prediction_windows(
             header += f" | {metric_text}"
         ax.set_title(header, fontweight='normal', pad=10)
         ax.legend(loc="upper right", framealpha=0.95)
+        ax.set_xlim(start_sec, end_sec)
 
     agg_ax = axes[-1]
     agg_ax.set_title("Concatenated Predictions vs Normalized FHR", fontweight='normal', pad=12)
@@ -757,7 +764,8 @@ def plot_single_prediction_windows(
                 alpha=0.2,
                 label="+/-1SD (norm)",
             )
-    agg_ax.legend(loc="upper right", framealpha=0.95)
+    agg_handles, agg_labels = agg_ax.get_legend_handles_labels()
+    agg_ax.legend(agg_handles + [window_patch], agg_labels + [window_patch.get_label()], loc="upper right", framealpha=0.95)
 
     output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.png")
     fig.savefig(output_path, dpi=SAVE_DPI, facecolor='white')
@@ -840,14 +848,14 @@ def plot_vae_reconstruction(
         ax = np.asarray([ax])
 
     for i in range(n_rows):
-        ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax[i].grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+        ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
         ax[i].minorticks_on()
         ax[i].set_axisbelow(True)
         ax[i].spines['top'].set_visible(False)
         ax[i].spines['right'].set_visible(False)
-        ax[i].spines['left'].set_color('#A2B9A7')
-        ax[i].spines['bottom'].set_color('#A2B9A7')
+        ax[i].spines['left'].set_color('#999999')
+        ax[i].spines['bottom'].set_color('#999999')
         ax[i].spines['left'].set_linewidth(0.7)
         ax[i].spines['bottom'].set_linewidth(0.7)
 
@@ -982,7 +990,7 @@ def plot_vae_reconstruction(
             original_scattering_transform.shape[0]/2,
             'ST',
             color='white',
-            fontweight='bold',
+            fontweight='normal',
             fontsize=10,
             va='center',
         )
@@ -991,7 +999,7 @@ def plot_vae_reconstruction(
             original_scattering_transform.shape[0] + original_phase_harmonic.shape[0]/2,
             'PH',
             color='white',
-            fontweight='bold',
+            fontweight='normal',
             fontsize=10,
             va='center',
         )
@@ -1047,7 +1055,7 @@ def plot_vae_reconstruction(
             va='top',
             fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'],
-                      alpha=0.8, edgecolor='#A2B9A7'),
+                      alpha=0.8, edgecolor='#999999'),
         )
         plot_idx += 1
 
@@ -1064,7 +1072,7 @@ def plot_vae_reconstruction(
     if loss_text:
         title_text += f" - {loss_text}"
     
-    fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color='#456882')
+    fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color=COLOR_BLUE)
     
     # Save plot
     save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.pdf')
@@ -1093,9 +1101,9 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     """
     # Professional scientific paper color palette
     colors = {
-        'main_line': "#055C9A",
-        'minimum_point': "#BB3E00",
-        'background': '#F9F3EF'
+        'main_line': "#5A6673",
+        'minimum_point': "#7A6D63",
+        'background': 'white'
     }
 
     plt.style.use('default')
@@ -1106,16 +1114,16 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
         'axes.titlesize': 12,
         'axes.labelsize': 11,
         'axes.linewidth': 0.7,
-        'axes.edgecolor': "#9E9D9D",
+        'axes.edgecolor': "#999999",
         'axes.facecolor': colors['background'],
-        'grid.color': "#838383",
+        'grid.color': "#DDDDDD",
         'grid.linewidth': 0.4,
         'grid.alpha': 0.6,
         'legend.frameon': True,
         'legend.fancybox': False,
         'legend.shadow': False,
         'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
+        'legend.edgecolor': '#999999',
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
@@ -1126,14 +1134,14 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     
     # Configure scientific paper grid style for both plots
     for ax in [ax1, ax2]:
-        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
         ax.minorticks_on()
         ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#A2B9A7')
-        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_color('#999999')
+        ax.spines['bottom'].set_color('#999999')
         ax.spines['left'].set_linewidth(0.7)
         ax.spines['bottom'].set_linewidth(0.7)
     
@@ -1182,11 +1190,11 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
         ax2.text(min_shift, min_kld, f'  Optimal: {min_shift}s\n  KLD: {min_kld:.6f}', 
                  verticalalignment='bottom', horizontalalignment='left',
                  bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], 
-                          alpha=0.9, edgecolor='#A2B9A7'), fontsize=10)
+                          alpha=0.9, edgecolor='#999999'), fontsize=10)
     
     # Add overall title with physiological context
     fig.suptitle('Fetal-Maternal Coupling: Transfer Entropy Analysis', 
-                fontsize=14, fontweight='normal', y=0.97, color='#456882')
+                fontsize=14, fontweight='normal', y=0.97, color=COLOR_BLUE)
     
     # Add interpretation text
     interpretation_text = (
@@ -1197,7 +1205,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     
     fig.text(0.02, 0.02, interpretation_text, fontsize=9, 
              bbox=dict(boxstyle="round,pad=0.5", facecolor=colors['background'], 
-                      alpha=0.9, edgecolor='#A2B9A7'),
+                      alpha=0.9, edgecolor='#999999'),
              verticalalignment='bottom', horizontalalignment='left')
     
     # Save plot
@@ -1226,10 +1234,10 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
     """
     # Professional scientific paper color palette
     colors = {
-        'vaf': "#00A2FF",      # Deep blue
-        'mse': "#FC7937",      # Deep orange-red
-        'snr': '#0DD8A2',      # Sage green
-        'kld': "#EF9A22",      # Golden yellow
+        'vaf': "#5A6673",      # Deep blue
+        'mse': "#7A6D63",      # Deep orange-red
+        'snr': '#5F6B64',      # Sage green
+        'kld': "#8C98A4",      # Golden yellow
         'background': "#FFFFFFFF"
     }
     
@@ -1241,16 +1249,16 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
         'axes.titlesize': 12,
         'axes.labelsize': 11,
         'axes.linewidth': 0.7,
-        'axes.edgecolor': "#9E9D9D",
+        'axes.edgecolor': "#999999",
         'axes.facecolor': colors['background'],
-        'grid.color': "#686868",
+        'grid.color': "#DDDDDD",
         'grid.linewidth': 0.4,
         'grid.alpha': 0.6,
         'legend.frameon': True,
         'legend.fancybox': False,
         'legend.shadow': False,
         'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
+        'legend.edgecolor': '#999999',
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
@@ -1270,14 +1278,14 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
     
     # Configure scientific paper grid style for all subplots
     for ax in axes:
-        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
         ax.minorticks_on()
         ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#A2B9A7')
-        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_color('#999999')
+        ax.spines['bottom'].set_color('#999999')
         ax.spines['left'].set_linewidth(0.7)
         ax.spines['bottom'].set_linewidth(0.7)
     
@@ -1315,7 +1323,7 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
     # Overall title
-    fig.suptitle('Reconstruction Quality Metrics Distribution', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+    fig.suptitle('Reconstruction Quality Metrics Distribution', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
     
     # Save plot
     save_path = os.path.join(output_dir, 'metrics_histograms.png')
@@ -1350,11 +1358,11 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
 
     # Professional scientific paper color palette (consistent styling)
     colors = {
-        'kld_up': '#F7AD45',    # Golden yellow
-        'kld_no': '#D95319',    # Darker orange/red
-        'vaf_up': '#055C9A',    # Deep blue
-        'vaf_no': '#0DD8A2',    # Sage green
-        'background': '#F9F3EF'
+        'kld_up': '#8C98A4',    # Golden yellow
+        'kld_no': '#7B5D5D',    # Darker orange/red
+        'vaf_up': '#5A6673',    # Deep blue
+        'vaf_no': '#5F6B64',    # Sage green
+        'background': 'white'
     }
 
     plt.style.use('default')
@@ -1365,16 +1373,16 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
         'axes.titlesize': 12,
         'axes.labelsize': 11,
         'axes.linewidth': 0.7,
-        'axes.edgecolor': '#9E9D9D',
+        'axes.edgecolor': '#999999',
         'axes.facecolor': colors['background'],
-        'grid.color': '#838383',
+        'grid.color': '#DDDDDD',
         'grid.linewidth': 0.4,
         'grid.alpha': 0.6,
         'legend.frameon': True,
         'legend.fancybox': False,
         'legend.shadow': False,
         'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
+        'legend.edgecolor': '#999999',
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
@@ -1386,14 +1394,14 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
 
     # Grid/spine style
     for ax in axes:
-        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
         ax.minorticks_on()
         ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#A2B9A7')
-        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_color('#999999')
+        ax.spines['bottom'].set_color('#999999')
         ax.spines['left'].set_linewidth(0.7)
         ax.spines['bottom'].set_linewidth(0.7)
 
@@ -1445,7 +1453,7 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
         axes[3].set_title('VAF: Mean +/- 1SD')
         axes[3].set_ylabel('VAF')
 
-    fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+    fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_ablation_results.png')
@@ -1475,9 +1483,9 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
     import numpy as np
 
     colors = {
-        'kld': '#F7AD45',
-        'vaf': '#055C9A',
-        'background': '#F9F3EF'
+        'kld': '#8C98A4',
+        'vaf': '#5A6673',
+        'background': 'white'
     }
 
     plt.style.use('default')
@@ -1488,16 +1496,16 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
         'axes.titlesize': 12,
         'axes.labelsize': 11,
         'axes.linewidth': 0.7,
-        'axes.edgecolor': '#9E9D9D',
+        'axes.edgecolor': '#999999',
         'axes.facecolor': colors['background'],
-        'grid.color': '#838383',
+        'grid.color': '#DDDDDD',
         'grid.linewidth': 0.4,
         'grid.alpha': 0.6,
         'legend.frameon': True,
         'legend.fancybox': False,
         'legend.shadow': False,
         'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
+        'legend.edgecolor': '#999999',
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
@@ -1507,14 +1515,14 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
 
     for ax in (ax1, ax2):
-        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
-        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#D2C1B6')
+        ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#DDDDDD')
+        ax.grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#DDDDDD')
         ax.minorticks_on()
         ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#A2B9A7')
-        ax.spines['bottom'].set_color('#A2B9A7')
+        ax.spines['left'].set_color('#999999')
+        ax.spines['bottom'].set_color('#999999')
         ax.spines['left'].set_linewidth(0.7)
         ax.spines['bottom'].set_linewidth(0.7)
 
@@ -1534,7 +1542,7 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
     ax2.set_title('Reconstruction Quality vs UP Gain')
     ax2.legend(loc='lower right', framealpha=0.95)
 
-    fig.suptitle('UP Gain Sweep: Information Flow and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color='#456882')
+    fig.suptitle('UP Gain Sweep: Information Flow and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_gain_sweep.png')
