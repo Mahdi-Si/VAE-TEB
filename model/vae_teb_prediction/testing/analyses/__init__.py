@@ -52,6 +52,22 @@ from model.vae_teb_prediction.testing.analyses.qualitative import (
     run_single_prediction_windows,
 )
 
+# Import changepoint analysis functions
+try:
+    from model.vae_teb_prediction.testing.analyses.changepoint import (
+        create_changepoint_detector,
+        detect_changepoints,
+        summarize_trajectory,
+        summarize_latent_segments,
+    )
+    HAS_CHANGEPOINT = True
+except ImportError:
+    HAS_CHANGEPOINT = False
+    create_changepoint_detector = None
+    detect_changepoints = None
+    summarize_trajectory = None
+    summarize_latent_segments = None
+
 
 def run_all_analyses(
     runner: TestRunner,
@@ -60,6 +76,10 @@ def run_all_analyses(
     skip_trajectory: bool = False,
     skip_coherence: bool = False,
     trajectory_loader: Optional[Any] = None,
+    trajectory_dim_reduction: str = "pca",
+    trajectory_n_changepoints: int = 5,
+    trajectory_plot_3d: bool = True,
+    trajectory_plot_animations: bool = False,
 ) -> Dict[str, Any]:
     """
     Run all available analyses with sensible defaults.
@@ -77,6 +97,11 @@ def run_all_analyses(
             If None, uses the standard loader. For best results, pass a loader
             created with build_guid_filtered_dataloader where each batch contains
             all epochs from a single patient.
+        trajectory_dim_reduction: Dimensionality reduction method for trajectory
+            analysis ('pca', 'umap', 'tsne', 'isomap', 'diffusion').
+        trajectory_n_changepoints: Number of changepoints to detect per sample.
+        trajectory_plot_3d: Whether to generate 3D trajectory plots.
+        trajectory_plot_animations: Whether to generate animated trajectory GIFs.
 
     Returns:
         Dict mapping analysis names to their results or error messages.
@@ -88,6 +113,14 @@ def run_all_analyses(
 
     Example with single loader:
         >>> results = run_all_analyses(runner, test_loader, max_samples=500)
+
+    Example with advanced trajectory options:
+        >>> results = run_all_analyses(
+        ...     runner, test_loader,
+        ...     trajectory_dim_reduction='umap',
+        ...     trajectory_n_changepoints=5,
+        ...     trajectory_plot_animations=True,
+        ... )
     """
     results: Dict[str, Any] = {}
 
@@ -162,6 +195,10 @@ def run_all_analyses(
                 time_range_hours=12.0,
                 min_epochs_per_guid=3,
                 skip_dashboards=True,  # Skip for speed
+                dim_reduction_method=trajectory_dim_reduction,
+                n_changepoints=trajectory_n_changepoints,
+                plot_3d=trajectory_plot_3d,
+                plot_animations=trajectory_plot_animations,
             )
         except Exception as e:
             logger.error(f"Trajectory analysis failed: {e}")
@@ -190,6 +227,12 @@ __all__ = [
     "TrajectoryAnalyzer",
     "run_reconstruction_analysis",
     "run_single_prediction_windows",
+    # Changepoint analysis
+    "create_changepoint_detector",
+    "detect_changepoints",
+    "summarize_trajectory",
+    "summarize_latent_segments",
+    "HAS_CHANGEPOINT",
     # Combined
     "run_all_analyses",
 ]
