@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.collections import LineCollection
 
 # Set publication-quality style - optimized for high-impact journals
 plt.style.use("default")  # Start from clean slate
@@ -1473,6 +1474,96 @@ def plot_time_frequency_coherence(
 # Trajectory Visualization Functions
 # -----------------------------------------------------------------------------
 
+def plot_guid_absolute_trajectory(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    guid: str,
+    x_col: str,
+    y_col: str,
+    color_by: str = "t_abs_sec",
+    show_epoch_boundaries: bool = True,
+) -> None:
+    """
+    Plot concatenated latent trajectory for a GUID, ordered by absolute time.
+
+    Args:
+        df: DataFrame containing a single GUID's latent rows with time fields.
+        output_path: Output path for the figure.
+        guid: GUID identifier for the title.
+        x_col: Column name for x-axis coordinates.
+        y_col: Column name for y-axis coordinates.
+        color_by: Column name for color progression (default: 't_abs_sec').
+        show_epoch_boundaries: Mark transitions between epochs if available.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return
+
+    sort_col = color_by if color_by in df.columns else "t_abs_sec"
+    if sort_col not in df.columns:
+        sort_col = "t_sec" if "t_sec" in df.columns else None
+    if sort_col is None:
+        return
+
+    sub = df.sort_values(sort_col)
+    X = sub[[x_col, y_col]].to_numpy()
+    if len(X) < 2:
+        return
+
+    color_vals = sub[sort_col].to_numpy()
+    points = X.reshape(-1, 1, 2)
+    segs = np.concatenate([points[:-1], points[1:]], axis=1)
+    lc = LineCollection(segs, cmap="bwr", linewidths=1.6)
+    lc.set_array(color_vals[:-1])
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    ax.add_collection(lc)
+    ax.scatter(X[0, 0], X[0, 1], s=50, marker="o", color=COLOR_GREEN, edgecolors=COLOR_BLACK, linewidth=0.4, label="Start")
+    ax.scatter(X[-1, 0], X[-1, 1], s=60, marker="X", color=COLOR_VERMILLION, edgecolors=COLOR_BLACK, linewidth=0.4, label="End")
+
+    if show_epoch_boundaries and "epoch_sec" in sub.columns:
+        epochs = sub["epoch_sec"].to_numpy()
+        for idx in range(1, len(epochs)):
+            if epochs[idx] != epochs[idx - 1]:
+                ax.scatter(
+                    X[idx, 0],
+                    X[idx, 1],
+                    s=28,
+                    marker="s",
+                    color=COLOR_LIGHT_GRAY,
+                    edgecolors=COLOR_GRAY,
+                    linewidth=0.4,
+                )
+
+    if "t_abs_sec" in sub.columns:
+        abs_times = sub["t_abs_sec"].to_numpy()
+        if abs_times.size:
+            zero_idx = int(np.argmin(np.abs(abs_times)))
+            ax.scatter(
+                X[zero_idx, 0],
+                X[zero_idx, 1],
+                s=50,
+                marker="^",
+                color=COLOR_ORANGE,
+                edgecolors=COLOR_BLACK,
+                linewidth=0.4,
+                label="t~0",
+            )
+
+    ax.set_xlabel(x_col.upper(), fontsize=FONT_LABEL)
+    ax.set_ylabel(y_col.upper(), fontsize=FONT_LABEL)
+    ax.set_title(f"Absolute Trajectory - {guid}", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
+
+    _add_colorbar(fig, lc, ax, label=color_by, shrink=0.8, pad=0.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
 def plot_latent_trajectory_2d(
     trajectory: np.ndarray,
     output_path: Path,
@@ -1508,10 +1599,10 @@ def plot_latent_trajectory_2d(
 
     # Color by time
     if color_by_time:
-        colors = plt.cm.cividis(np.linspace(0, 1, time_steps))
+        colors = plt.cm.bwr(np.linspace(0, 1, time_steps))
         scatter = ax.scatter(
             trajectory[:, 0], trajectory[:, 1],
-            c=np.arange(time_steps), cmap="cividis",
+            c=np.arange(time_steps), cmap="bwr",
             s=point_size, zorder=3, edgecolor="white", linewidth=0.3
         )
     else:
@@ -1601,7 +1692,7 @@ def plot_latent_trajectory_3d(
     if color_by_time:
         scatter = ax.scatter(
             trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
-            c=np.arange(time_steps), cmap="cividis",
+            c=np.arange(time_steps), cmap="bwr",
             s=point_size, depthshade=True
         )
     else:

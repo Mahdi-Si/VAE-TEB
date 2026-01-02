@@ -46,6 +46,7 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_kld_trajectory,
     plot_kld_guid_trajectory,
     plot_kld_trajectory_3d,
+    plot_guid_absolute_trajectory,
     plot_latent_trajectory_2d,
     plot_latent_trajectory_3d,
     plot_latent_changepoints_with_raw,
@@ -250,6 +251,7 @@ class TrajectoryAnalyzer:
             self._plot_kld_by_class()
         self._plot_kld_guid_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
         self._plot_latent_space(color_by_label=class_analysis)
+        self._plot_guid_absolute_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
 
         # Generate 3D trajectory plots
         if self.plot_3d:
@@ -346,6 +348,7 @@ class TrajectoryAnalyzer:
                             "label": label,
                             "t": t,
                             "t_sec": t * TIMESTEP_SECONDS,
+                            "t_abs_sec": float(epoch_sec) + t * TIMESTEP_SECONDS,
                             "kld": float(kld[idx, t]) if kld is not None and np.isfinite(kld[idx, t]) else np.nan,
                         }
 
@@ -534,6 +537,50 @@ class TrajectoryAnalyzer:
                 subset,
                 self.output_dir / "plots",
                 guid=guid,
+            )
+
+    def _plot_guid_absolute_trajectories(
+        self,
+        *,
+        n_samples: int = 12,
+        guid_list: Optional[List[str]] = None,
+    ) -> None:
+        """Plot concatenated trajectories per GUID using absolute time ordering."""
+        if self.latent_df.empty:
+            return
+
+        if guid_list:
+            selected_guids = [guid for guid in guid_list if guid in self.latent_df["guid"].unique()]
+        else:
+            guid_counts = self.latent_df["guid"].value_counts()
+            selected_guids = guid_counts.head(n_samples).index.tolist()
+
+        if "gpc1" in self.latent_df.columns and "gpc2" in self.latent_df.columns:
+            x_col, y_col = "gpc1", "gpc2"
+        elif "pc1" in self.latent_df.columns and "pc2" in self.latent_df.columns:
+            x_col, y_col = "pc1", "pc2"
+        elif "rd1" in self.latent_df.columns and "rd2" in self.latent_df.columns:
+            x_col, y_col = "rd1", "rd2"
+        else:
+            z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
+            if len(z_cols) < 2:
+                return
+            x_col, y_col = z_cols[:2]
+
+        plots_dir = self.output_dir / "plots"
+
+        for guid in selected_guids:
+            subset = self.latent_df[self.latent_df["guid"] == guid]
+            if subset.empty:
+                continue
+            plot_guid_absolute_trajectory(
+                subset,
+                plots_dir / f"guid_absolute_trajectory_{guid}.png",
+                guid=guid,
+                x_col=x_col,
+                y_col=y_col,
+                color_by="t_abs_sec",
+                show_epoch_boundaries=True,
             )
 
     def _plot_latent_space(self, *, color_by_label: bool = True) -> None:
@@ -737,6 +784,33 @@ class TrajectoryAnalyzer:
         else:
             # Fallback to standard PCA
             self.latent_df = self._fit_pca(self.latent_df)
+
+        # Add global PCA coordinates for cross-epoch trajectory stitching
+        self._add_global_pca()
+
+    def _add_global_pca(self, n_components: int = 3) -> None:
+        """Compute global PCA coordinates over all latent points."""
+        if self.latent_df.empty or not HAS_SKLEARN:
+            return
+
+        z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
+        if not z_cols:
+            return
+
+        Z = self.latent_df[z_cols].values
+        valid_mask = np.all(np.isfinite(Z), axis=1)
+        if valid_mask.sum() < 10:
+            return
+
+        n_components = min(n_components, len(z_cols))
+        pca = PCA(n_components=n_components)
+        X = np.full((len(Z), n_components), np.nan)
+        X[valid_mask] = pca.fit_transform(Z[valid_mask])
+
+        for i in range(n_components):
+            self.latent_df[f"gpc{i + 1}"] = X[:, i]
+
+        logger.info(f"Global PCA variance explained: {pca.explained_variance_ratio_.round(3)}")
 
     def _detect_changepoints_all(self) -> None:
         """Detect changepoints for all samples with stored raw data."""

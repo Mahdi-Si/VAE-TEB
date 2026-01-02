@@ -672,7 +672,7 @@ def plot_kld_trajectory_3d_interactive(
             marker=dict(
                 size=point_size,
                 color=np.arange(time_steps),
-                colorscale="Cividis",
+                colorscale="RdBu",
                 showscale=True,
                 colorbar=dict(
                     title="Time Step",
