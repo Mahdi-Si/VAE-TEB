@@ -26,6 +26,10 @@ from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import _extract_epoch, _extract_guid, _extract_label
 from model.vae_teb_prediction.testing.metrics import aggregate_predictions
 from model.vae_teb_prediction.testing.visualizers import (
+    COLOR_BLUE,
+    COLOR_GRAY,
+    COLOR_ORANGE,
+    _style_axes,
     plot_coherence_analysis,
     plot_coherence_signals,
     plot_cross_correlation,
@@ -49,6 +53,7 @@ def _plot_band_trends(
     x_col: str,
     x_label: str,
     title: str,
+    y_label: str = "Coherence",
 ) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,7 +62,7 @@ def _plot_band_trends(
     n_bands = len(bands)
     cols = 2
     rows = int(np.ceil(n_bands / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 4 * rows), sharex=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(7.0, 3.0 * rows), sharex=False)
     axes = np.atleast_2d(axes)
 
     has_pair = "orig_mean" in df.columns and "recon_mean" in df.columns
@@ -76,15 +81,15 @@ def _plot_band_trends(
 
         x_vals = subset[x_col].values
         if has_pair:
-            ax.plot(x_vals, subset["orig_mean"], color="#4C72B0", linewidth=1.5, label="Reference")
-            ax.plot(x_vals, subset["recon_mean"], color="#C44E52", linewidth=1.5, linestyle="--", label="Reconstruction")
+            ax.plot(x_vals, subset["orig_mean"], color=COLOR_BLUE, linewidth=1.4, label="Reference")
+            ax.plot(x_vals, subset["recon_mean"], color=COLOR_ORANGE, linewidth=1.4, linestyle="--", label="Reconstruction")
 
             if "orig_std" in subset.columns:
                 ax.fill_between(
                     x_vals,
                     subset["orig_mean"] - subset["orig_std"],
                     subset["orig_mean"] + subset["orig_std"],
-                    color="#4C72B0",
+                    color=COLOR_BLUE,
                     alpha=0.2,
                 )
             if "recon_std" in subset.columns:
@@ -92,35 +97,36 @@ def _plot_band_trends(
                     x_vals,
                     subset["recon_mean"] - subset["recon_std"],
                     subset["recon_mean"] + subset["recon_std"],
-                    color="#C44E52",
+                    color=COLOR_ORANGE,
                     alpha=0.2,
                 )
         else:
-            ax.plot(x_vals, subset["coherence_mean"], color="#4C72B0", linewidth=1.5, label="Coherence")
+            ax.plot(x_vals, subset["coherence_mean"], color=COLOR_BLUE, linewidth=1.4, label="Coherence")
             if "coherence_std" in subset.columns:
                 ax.fill_between(
                     x_vals,
                     subset["coherence_mean"] - subset["coherence_std"],
                     subset["coherence_mean"] + subset["coherence_std"],
-                    color="#4C72B0",
+                    color=COLOR_BLUE,
                     alpha=0.2,
                 )
 
         ax.set_title(f"{band} Band")
         ax.set_xlabel(x_label)
-        ax.set_ylabel("Coherence")
-        ax.set_ylim(0, 1)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best")
+        ax.set_ylabel(y_label)
+        if y_label.lower().startswith("coherence"):
+            ax.set_ylim(0, 1)
+        ax.legend(loc="best", fontsize=7, framealpha=0.95)
+        _style_axes(ax, grid="both", minor_ticks=True)
 
     # Hide unused subplots
     for idx in range(n_bands, rows * cols):
         row, col = divmod(idx, cols)
         axes[row, col].axis("off")
 
-    fig.suptitle(title, fontsize=14, y=1.02)
+    fig.suptitle(title, fontsize=9, y=1.02, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -190,6 +196,40 @@ def compute_welch_psd(
 
     freqs, psd = signal.welch(x, fs=fs, nperseg=nperseg_used, noverlap=nperseg_used // 2)
     return freqs, psd
+
+
+def compute_bandpower(
+    x: np.ndarray,
+    *,
+    fs: float,
+    bands: List[Tuple[str, float, float]],
+    nperseg: int = 128,
+) -> Dict[str, float]:
+    """
+    Compute band power for defined frequency bands using Welch PSD.
+
+    Args:
+        x: Signal array.
+        fs: Sampling frequency in Hz.
+        bands: List of (name, f_low, f_high).
+        nperseg: Welch segment length.
+
+    Returns:
+        Dict mapping band name to band power.
+    """
+    freqs, psd = compute_welch_psd(x, fs=fs, nperseg=nperseg)
+    if freqs.size == 0 or psd.size == 0:
+        return {name: np.nan for name, _, _ in bands}
+
+    band_powers: Dict[str, float] = {}
+    for name, f_low, f_high in bands:
+        mask = (freqs >= f_low) & (freqs < f_high)
+        if not mask.any():
+            band_powers[name] = np.nan
+            continue
+        band_powers[name] = float(np.trapz(psd[mask], freqs[mask]))
+
+    return band_powers
 
 
 def compute_cross_correlation(
@@ -579,6 +619,7 @@ def run_coherence_analysis(
     window_nperseg: int = 128,
     window_relative_nperseg: int = 128,
     max_window_timefreq_windows: Optional[int] = None,
+    bandpower_nperseg: int = 128,
     psd_nperseg: int = 256,
     max_corr_lag_sec: float = 120.0,
 ) -> Dict[str, Any]:
@@ -605,6 +646,7 @@ def run_coherence_analysis(
         window_nperseg: Welch segment length for per-window (2-minute) coherence.
         window_relative_nperseg: STFT segment length for within-window coherence.
         max_window_timefreq_windows: Optional limit on windows for relative maps.
+        bandpower_nperseg: Welch segment length for bandpower per window.
         psd_nperseg: Welch segment length for PSD comparison.
         max_corr_lag_sec: Max lag for cross-correlation plot (seconds).
 
@@ -639,6 +681,7 @@ def run_coherence_analysis(
     epoch_records: List[Dict[str, Any]] = []
     window_records: List[Dict[str, Any]] = []
     relative_records: List[Dict[str, Any]] = []
+    bandpower_records: List[Dict[str, Any]] = []
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -715,6 +758,9 @@ def run_coherence_analysis(
                     "coherence": np.empty((0, 0)),
                     "n_windows": 0,
                 }
+                sample_window_band = None
+                sample_relative_band = None
+                sample_bandpower = None
 
                 # Compute coherence
                 try:
@@ -768,6 +814,7 @@ def run_coherence_analysis(
                     )
                     if window_tf["coherence"].size > 0:
                         window_band = _band_means(window_tf["frequencies"], window_tf["coherence"])
+                        sample_window_band = window_band
                         window_indices = window_tf.get("window_indices", np.arange(window_tf["coherence"].shape[1]))
                         for band_name, vals in window_band.items():
                             baseline = float(band_recon.get(band_name, np.nan))
@@ -805,6 +852,7 @@ def run_coherence_analysis(
                         )
                         if relative_tf["coherence"].size > 0:
                             relative_band = _band_means(relative_tf["frequencies"], relative_tf["coherence"])
+                            sample_relative_band = relative_band
                             for band_name, vals in relative_band.items():
                                 baseline = float(band_recon.get(band_name, np.nan))
                                 for t_idx, rel_time in enumerate(relative_tf["times"]):
@@ -820,11 +868,52 @@ def run_coherence_analysis(
                                         "label": label,
                                         "sample_idx": processed,
                                         "band": band_name,
+                                        "relative_frame_index": int(t_idx),
                                         "relative_time_sec": float(rel_time),
                                         "coherence": coherence_val,
                                         "coherence_baseline": baseline,
                                         "coherence_delta": delta,
                                     })
+
+                    # Per-window bandpower analysis
+                    sample_bandpower_rows: List[Dict[str, Any]] = []
+                    T_win, H_win = mu_pr_window.shape
+                    for t in range(runner.warmup_steps, T_win):
+                        start = t * int(runner.decimation_factor)
+                        end = start + H_win
+                        if end > len(fhr_orig_full):
+                            break
+
+                        ref_win = fhr_orig_full[start:end]
+                        pred_win = mu_pr_window[t]
+                        bandpower_orig = compute_bandpower(
+                            ref_win, fs=fs, bands=COHERENCE_BANDS, nperseg=bandpower_nperseg
+                        )
+                        bandpower_recon = compute_bandpower(
+                            pred_win, fs=fs, bands=COHERENCE_BANDS, nperseg=bandpower_nperseg
+                        )
+
+                        for band_name in bandpower_orig.keys():
+                            bp_orig = bandpower_orig.get(band_name, np.nan)
+                            bp_recon = bandpower_recon.get(band_name, np.nan)
+                            record = {
+                                "guid": guid,
+                                "epoch": epoch,
+                                "label": label,
+                                "sample_idx": processed,
+                                "band": band_name,
+                                "window_index": int(t),
+                                "window_start_sample": int(start),
+                                "window_start_sec": start / fs,
+                                "bandpower_original": bp_orig,
+                                "bandpower_reconstructed": bp_recon,
+                                "bandpower_delta": bp_recon - bp_orig if np.isfinite(bp_orig) and np.isfinite(bp_recon) else np.nan,
+                            }
+                            bandpower_records.append(record)
+                            sample_bandpower_rows.append(record)
+
+                    if sample_bandpower_rows:
+                        sample_bandpower = pd.DataFrame(sample_bandpower_rows)
 
                     psd_freq, psd_orig = compute_welch_psd(fhr_orig, fs=fs, nperseg=psd_nperseg)
                     _, psd_recon = compute_welch_psd(fhr_recon, fs=fs, nperseg=psd_nperseg)
@@ -923,6 +1012,31 @@ def run_coherence_analysis(
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (2-min window coherence)",
                             )
+                            if sample_window_band is not None:
+                                window_band_df = pd.DataFrame([
+                                    {
+                                        "band": band_name,
+                                        "window_index": int(window_idx),
+                                        "coherence_mean": float(val) if w_idx < len(vals) else np.nan,
+                                    }
+                                    for band_name, vals in sample_window_band.items()
+                                    for w_idx, window_idx in enumerate(
+                                        window_tf.get(
+                                            "window_indices",
+                                            np.arange(window_tf["coherence"].shape[1]),
+                                        )
+                                    )
+                                    for val in [vals[w_idx]] if w_idx < len(vals)
+                                ])
+                                if not window_band_df.empty:
+                                    _plot_band_trends(
+                                        window_band_df,
+                                        sample_dir / f"{sample_name}_window_band_coherence.png",
+                                        x_col="window_index",
+                                        x_label="Window index",
+                                        title=f"{signal_title} (band coherence vs window index)",
+                                        y_label="Coherence",
+                                    )
                     except Exception as e:
                         logger.warning(f"Windowed coherence failed for {sample_name}: {e}")
 
@@ -938,8 +1052,45 @@ def run_coherence_analysis(
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (window-relative coherence)",
                             )
+                            if sample_relative_band is not None:
+                                relative_band_df = pd.DataFrame([
+                                    {
+                                        "band": band_name,
+                                        "relative_frame_index": int(t_idx),
+                                        "coherence_mean": float(val) if t_idx < len(vals) else np.nan,
+                                    }
+                                    for band_name, vals in sample_relative_band.items()
+                                    for t_idx, val in enumerate(vals)
+                                ])
+                                if not relative_band_df.empty:
+                                    _plot_band_trends(
+                                        relative_band_df,
+                                        sample_dir / f"{sample_name}_relative_band_coherence.png",
+                                        x_col="relative_frame_index",
+                                        x_label="STFT frame index",
+                                        title=f"{signal_title} (band coherence vs frame index)",
+                                        y_label="Coherence",
+                                    )
                     except Exception as e:
                         logger.warning(f"Relative window coherence failed for {sample_name}: {e}")
+
+                    try:
+                        if sample_bandpower is not None and not sample_bandpower.empty:
+                            sample_bandpower = sample_bandpower.copy()
+                            sample_bandpower.rename(columns={
+                                "bandpower_original": "orig_mean",
+                                "bandpower_reconstructed": "recon_mean",
+                            }, inplace=True)
+                            _plot_band_trends(
+                                sample_bandpower,
+                                sample_dir / f"{sample_name}_window_bandpower.png",
+                                x_col="window_index",
+                                x_label="Window index",
+                                title=f"{signal_title} (band power vs window index)",
+                                y_label="Band power (a.u.)",
+                            )
+                    except Exception as e:
+                        logger.warning(f"Bandpower plot failed for {sample_name}: {e}")
 
                     try:
                         psd_freq, psd_orig = compute_welch_psd(fhr_orig, fs=fs, nperseg=psd_nperseg)
@@ -1083,6 +1234,16 @@ def run_coherence_analysis(
             x_col="window_start_sec",
             x_label="Window Start (seconds)",
             title="Coherence vs Window Start",
+            y_label="Coherence",
+        )
+
+        _plot_band_trends(
+            window_agg,
+            output_dir / "window_coherence_trends_index.png",
+            x_col="window_index",
+            x_label="Window index",
+            title="Coherence vs Window Index",
+            y_label="Coherence",
         )
 
     if relative_records:
@@ -1101,6 +1262,53 @@ def run_coherence_analysis(
             x_col="relative_time_sec",
             x_label="Time From Window Start (seconds)",
             title="Coherence vs Time From Window Start",
+            y_label="Coherence",
+        )
+
+        relative_index_agg = df_relative.groupby(["band", "relative_frame_index"]).agg(
+            coherence_mean=("coherence", "mean"),
+            coherence_std=("coherence", "std"),
+        ).reset_index()
+        relative_index_agg.to_csv(output_dir / "relative_window_coherence_index_aggregate.csv", index=False)
+
+        _plot_band_trends(
+            relative_index_agg,
+            output_dir / "relative_window_coherence_trends_index.png",
+            x_col="relative_frame_index",
+            x_label="STFT frame index",
+            title="Coherence vs Frame Index",
+            y_label="Coherence",
+        )
+
+    if bandpower_records:
+        df_bandpower = pd.DataFrame(bandpower_records)
+        df_bandpower.to_csv(output_dir / "window_bandpower_summary.csv", index=False)
+
+        bandpower_agg = df_bandpower.groupby(["band", "window_index"]).agg(
+            window_start_sec=("window_start_sec", "mean"),
+            orig_mean=("bandpower_original", "mean"),
+            orig_std=("bandpower_original", "std"),
+            recon_mean=("bandpower_reconstructed", "mean"),
+            recon_std=("bandpower_reconstructed", "std"),
+        ).reset_index()
+        bandpower_agg.to_csv(output_dir / "window_bandpower_aggregate.csv", index=False)
+
+        _plot_band_trends(
+            bandpower_agg,
+            output_dir / "window_bandpower_trends.png",
+            x_col="window_start_sec",
+            x_label="Window Start (seconds)",
+            title="Band Power vs Window Start",
+            y_label="Band power (a.u.)",
+        )
+
+        _plot_band_trends(
+            bandpower_agg,
+            output_dir / "window_bandpower_trends_index.png",
+            x_col="window_index",
+            x_label="Window index",
+            title="Band Power vs Window Index",
+            y_label="Band power (a.u.)",
         )
 
     # Save summary statistics
@@ -1147,13 +1355,23 @@ def run_coherence_analysis(
         f.write("  window_coherence_summary.csv\n")
         f.write("  window_coherence_aggregate.csv\n")
         f.write("  window_coherence_trends.png\n")
+        f.write("  window_coherence_trends_index.png\n")
         f.write("  relative_window_coherence_summary.csv\n")
         f.write("  relative_window_coherence_aggregate.csv\n")
         f.write("  relative_window_coherence_trends.png\n")
+        f.write("  relative_window_coherence_index_aggregate.csv\n")
+        f.write("  relative_window_coherence_trends_index.png\n")
+        f.write("  window_bandpower_summary.csv\n")
+        f.write("  window_bandpower_aggregate.csv\n")
+        f.write("  window_bandpower_trends.png\n")
+        f.write("  window_bandpower_trends_index.png\n")
         f.write("  samples/<sample>_signals.png\n")
         f.write("  samples/<sample>_time_frequency.png\n")
         f.write("  samples/<sample>_windowed_coherence.png\n")
         f.write("  samples/<sample>_relative_window_time_frequency.png\n")
+        f.write("  samples/<sample>_window_band_coherence.png\n")
+        f.write("  samples/<sample>_relative_band_coherence.png\n")
+        f.write("  samples/<sample>_window_bandpower.png\n")
         f.write("  samples/<sample>_psd.png\n")
         f.write("  samples/<sample>_cross_correlation.png\n")
 

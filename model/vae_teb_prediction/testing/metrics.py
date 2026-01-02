@@ -284,3 +284,222 @@ def compute_kld_per_timestep(
 
     # Average over latent dimensions only (keep time)
     return torch.nanmean(kld, dim=-1)  # Shape: (B, T)
+
+
+# -----------------------------------------------------------------------------
+# Latent Space Preprocessing and Dimensionality Reduction
+# -----------------------------------------------------------------------------
+
+def preprocess_latent(
+    latent: Tensor,
+    window_length: int = 9,
+    polyorder: int = 2,
+    denoise: bool = True,
+) -> Tensor:
+    """
+    Preprocess latent trajectories with robust z-score normalization and denoising.
+
+    Uses median and MAD (Median Absolute Deviation) for robust normalization,
+    and optional Savitzky-Golay filtering for denoising.
+
+    Args:
+        latent: Latent tensor of shape (B, T, D) where B is batch size,
+            T is time steps, and D is latent dimension.
+        window_length: Savitzky-Golay filter window length (must be odd, default 9).
+        polyorder: Savitzky-Golay polynomial order (default 2).
+        denoise: Whether to apply Savitzky-Golay filter (default True).
+
+    Returns:
+        Preprocessed latent tensor of same shape (B, T, D).
+
+    Example:
+        >>> latent = outputs['mu_post']  # Shape: (32, 300, 16)
+        >>> preprocessed = preprocess_latent(latent)
+    """
+    import numpy as np
+
+    if not denoise:
+        # Simple robust normalization without denoising
+        median = torch.median(latent, dim=1, keepdim=True).values
+        deviations = torch.abs(latent - median)
+        mad = torch.median(deviations, dim=1, keepdim=True).values
+        # Avoid division by zero
+        mad = torch.where(mad == 0, torch.ones_like(mad), mad)
+        return (latent - median) / mad
+
+    # Denoise with Savitzky-Golay filter
+    try:
+        from scipy.signal import savgol_filter
+    except ImportError:
+        # Fallback to no denoising if scipy not available
+        return preprocess_latent(latent, denoise=False)
+
+    device = latent.device
+    latent_np = latent.cpu().numpy()
+
+    # Robust normalization (median and MAD)
+    median = np.median(latent_np, axis=1, keepdims=True)
+    mad = np.median(np.abs(latent_np - median), axis=1, keepdims=True)
+    mad = np.where(mad == 0, 1.0, mad)
+    latent_normalized = (latent_np - median) / mad
+
+    batch_size, time_steps, latent_dim = latent_normalized.shape
+
+    # Apply Savitzky-Golay filter to each trajectory
+    for b in range(batch_size):
+        for d in range(latent_dim):
+            if time_steps >= window_length:
+                latent_normalized[b, :, d] = savgol_filter(
+                    latent_normalized[b, :, d],
+                    window_length=window_length,
+                    polyorder=polyorder,
+                )
+
+    return torch.from_numpy(latent_normalized).to(device)
+
+
+def reduce_latent_dimensionality(
+    latent_data: Tensor,
+    method: str = "pca",
+    n_components: int = 3,
+    n_neighbors: int = 15,
+    min_dist: float = 0.1,
+    random_state: int = 42,
+    return_reducer: bool = False,
+):
+    """
+    Reduce latent trajectory dimensionality for visualization and analysis.
+
+    Supports multiple dimensionality reduction methods including linear (PCA)
+    and nonlinear manifold methods (UMAP, t-SNE, Isomap, diffusion maps).
+
+    Args:
+        latent_data: Latent tensor of shape (B, T, D) or numpy array.
+        method: Reduction method - one of:
+            - 'pca': Principal Component Analysis (fast, linear)
+            - 'umap': Uniform Manifold Approximation (preserves global + local)
+            - 'tsne': t-Distributed Stochastic Neighbor Embedding (local structure)
+            - 'isomap': Isometric Mapping (geodesic distances)
+            - 'diffusion': Diffusion Maps (spectral embedding)
+        n_components: Target dimensions (2 or 3, default 3).
+        n_neighbors: Neighbors for manifold methods (default 15).
+        min_dist: UMAP minimum distance parameter (default 0.1).
+        random_state: Random seed for reproducibility (default 42).
+        return_reducer: Whether to return fitted reducer object (default False).
+
+    Returns:
+        If return_reducer is False:
+            reduced_data: np.ndarray of shape (B, T, n_components)
+        If return_reducer is True:
+            Tuple of (reduced_data, reducer) where reducer is the fitted object.
+
+    Raises:
+        ValueError: If method is not recognized.
+        ImportError: If required libraries are not installed.
+
+    Example:
+        >>> latent = outputs['mu_post']  # Shape: (32, 300, 16)
+        >>> reduced = reduce_latent_dimensionality(latent, method='umap', n_components=3)
+        >>> print(reduced.shape)  # (32, 300, 3)
+    """
+    import numpy as np
+
+    # Convert to numpy if needed
+    if torch.is_tensor(latent_data):
+        latent_np = latent_data.cpu().numpy()
+    else:
+        latent_np = np.asarray(latent_data)
+
+    batch_size, time_steps, latent_dim = latent_np.shape
+
+    # Flatten for dimensionality reduction: (B*T, D)
+    latent_flat = latent_np.reshape(-1, latent_dim)
+
+    method = method.lower()
+
+    if method == "pca":
+        from sklearn.decomposition import PCA
+
+        reducer = PCA(n_components=n_components, random_state=random_state)
+        reduced_flat = reducer.fit_transform(latent_flat)
+
+    elif method == "umap":
+        try:
+            from umap import UMAP
+        except ImportError:
+            raise ImportError(
+                "UMAP is required for 'umap' method. Install with: pip install umap-learn"
+            )
+
+        reducer = UMAP(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric="euclidean",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        reduced_flat = reducer.fit_transform(latent_flat)
+
+    elif method == "tsne":
+        from sklearn.manifold import TSNE
+
+        # Perplexity must be less than n_samples
+        perplexity = min(30, latent_flat.shape[0] // 4)
+        perplexity = max(5, perplexity)  # At least 5
+
+        reducer = TSNE(
+            n_components=n_components,
+            perplexity=perplexity,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        reduced_flat = reducer.fit_transform(latent_flat)
+
+    elif method == "isomap":
+        from sklearn.manifold import Isomap
+
+        # n_neighbors must be less than n_samples
+        effective_neighbors = min(n_neighbors, latent_flat.shape[0] - 1)
+
+        reducer = Isomap(
+            n_neighbors=effective_neighbors,
+            n_components=n_components,
+            n_jobs=-1,
+        )
+        reduced_flat = reducer.fit_transform(latent_flat)
+
+    elif method == "diffusion":
+        # Diffusion maps using spectral decomposition of the diffusion operator
+        from sklearn.metrics.pairwise import rbf_kernel
+
+        gamma = 1.0 / latent_dim
+        K = rbf_kernel(latent_flat, gamma=gamma)
+
+        # Normalize the kernel to create a Markov transition matrix
+        D = np.diag(K.sum(axis=1))
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+        L = D_inv_sqrt @ K @ D_inv_sqrt
+
+        # Eigendecomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(L)
+        # Sort by eigenvalue in descending order
+        idx = eigenvalues.argsort()[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        # Use top eigenvectors (skip first constant eigenvector)
+        reduced_flat = eigenvectors[:, 1 : n_components + 1] * eigenvalues[1 : n_components + 1]
+        reducer = None
+
+    else:
+        raise ValueError(
+            f"Unknown method: '{method}'. Choose from: 'pca', 'umap', 'tsne', 'isomap', 'diffusion'"
+        )
+
+    # Reshape back to (B, T, n_components)
+    reduced_data = reduced_flat.reshape(batch_size, time_steps, n_components)
+
+    if return_reducer:
+        return reduced_data, reducer
+    return reduced_data
