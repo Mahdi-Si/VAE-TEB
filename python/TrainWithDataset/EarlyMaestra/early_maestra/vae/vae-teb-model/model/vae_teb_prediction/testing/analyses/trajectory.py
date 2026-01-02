@@ -38,7 +38,7 @@ from loguru import logger
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import _extract_epoch, _extract_guid, _extract_label
 from model.vae_teb_prediction.testing.metrics import (
-    compute_kld,
+    compute_kld_per_timestep,
     preprocess_latent,
     reduce_latent_dimensionality,
 )
@@ -315,9 +315,9 @@ class TrajectoryAnalyzer:
                     continue
                 latent_np = latent.cpu().numpy()  # (B, T, D)
 
-                # Compute per-timestep KLD
-                kld_tensor = compute_kld(outputs, self.warmup_steps)
-                kld = kld_tensor.sum(dim=-1).cpu().numpy() if kld_tensor is not None else None  # (B, T)
+                # Compute per-timestep KLD mean over latent dims
+                kld_t = compute_kld_per_timestep(outputs, self.warmup_steps)
+                kld = kld_t.cpu().numpy() if kld_t is not None else None  # (B, T)
 
                 # Get uncertainty if available
                 uncertainty = None
