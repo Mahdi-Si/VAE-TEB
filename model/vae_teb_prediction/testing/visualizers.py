@@ -46,11 +46,11 @@ plt.rcParams.update({
     "legend.title_fontsize": 9,
 
     # Axes styling - clean and professional
-    "axes.linewidth": 0.8,
-    "axes.edgecolor": "#2F2F2F",
+    "axes.linewidth": 0.5,
+    "axes.edgecolor": "#000000",
     "axes.labelcolor": "#000000",
-    "axes.spines.top": False,
-    "axes.spines.right": False,
+    "axes.spines.top": True,
+    "axes.spines.right": True,
     "axes.spines.left": True,
     "axes.spines.bottom": True,
     "axes.titleweight": "bold",
@@ -60,33 +60,33 @@ plt.rcParams.update({
     # Tick settings - publication standard
     "xtick.direction": "in",
     "ytick.direction": "in",
-    "xtick.major.size": 4.0,
-    "ytick.major.size": 4.0,
-    "xtick.minor.size": 2.5,
-    "ytick.minor.size": 2.5,
-    "xtick.major.width": 0.8,
-    "ytick.major.width": 0.8,
-    "xtick.minor.width": 0.6,
-    "ytick.minor.width": 0.6,
-    "xtick.color": "#2F2F2F",
-    "ytick.color": "#2F2F2F",
+    "xtick.major.size": 3.0,
+    "ytick.major.size": 3.0,
+    "xtick.minor.size": 1.5,
+    "ytick.minor.size": 1.5,
+    "xtick.major.width": 0.5,
+    "ytick.major.width": 0.5,
+    "xtick.minor.width": 0.3,
+    "ytick.minor.width": 0.3,
+    "xtick.color": "#000000",
+    "ytick.color": "#000000",
 
     # Grid - subtle and professional
-    "grid.alpha": 0.3,
-    "grid.linewidth": 0.5,
-    "grid.color": "#CCCCCC",
+    "grid.alpha": 0.2,
+    "grid.linewidth": 0.3,
+    "grid.color": "#E0E0E0",
     "grid.linestyle": "-",
 
     # Legend - clean and unobtrusive
     "legend.frameon": True,
     "legend.framealpha": 0.95,
     "legend.fancybox": False,
-    "legend.edgecolor": "#CCCCCC",
+    "legend.edgecolor": "#000000",
     "legend.shadow": False,
 
-    # Lines - appropriate weights for clarity
-    "lines.linewidth": 1.5,
-    "lines.markersize": 4,
+    # Lines - thin and clean
+    "lines.linewidth": 1.0,
+    "lines.markersize": 3,
     "lines.markeredgewidth": 0.0,
 
     # Background colors
@@ -122,7 +122,7 @@ SAVE_DPI = 600
 
 def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) -> None:
     """
-    Apply publication-quality styling to axes.
+    Apply clean styling to axes with thin black borders.
 
     Args:
         ax: Matplotlib axes object.
@@ -131,21 +131,22 @@ def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) 
     """
     ax.set_axisbelow(True)
 
-    # Configure grid
+    # Configure grid - subtle
     if grid in ("both", "major"):
-        ax.grid(True, which="major", alpha=0.35, linewidth=0.6, color="#CCCCCC")
+        ax.grid(True, which="major", alpha=0.2, linewidth=0.3, color="#E0E0E0")
     if grid == "both":
-        ax.grid(True, which="minor", alpha=0.15, linewidth=0.4, color="#DDDDDD")
+        ax.grid(True, which="minor", alpha=0.1, linewidth=0.2, color="#F0F0F0")
 
     # Configure ticks
     if minor_ticks and grid == "both":
         ax.minorticks_on()
 
-    # Ensure spines are styled consistently
-    for spine in ["left", "bottom"]:
+    # Ensure all spines are thin and black
+    for spine in ["left", "bottom", "top", "right"]:
         if spine in ax.spines:
-            ax.spines[spine].set_color("#2F2F2F")
-            ax.spines[spine].set_linewidth(0.8)
+            ax.spines[spine].set_visible(True)
+            ax.spines[spine].set_color("#000000")
+            ax.spines[spine].set_linewidth(0.5)
 
 
 def _format_stats_box(n: int, mean: float, std: float, median: float, **kwargs) -> str:
@@ -176,17 +177,17 @@ def plot_metric_histograms(
     output_dir: Path,
     filename: str = "metrics_histograms.png",
     *,
-    add_kde: bool = True,
+    add_kde: bool = False,
     add_ci: bool = True,
 ) -> None:
     """
-    Create a 2x2 grid of histograms for VAF, MSE, SNR, and KLD with KDE overlays.
+    Create a 2x2 grid of histograms for VAF, MSE, SNR, and KLD.
 
     Args:
         df: DataFrame with columns 'vaf', 'mse', 'snr', 'kld'.
         output_dir: Directory to save the plot.
         filename: Output filename (default: metrics_histograms.png).
-        add_kde: Whether to add kernel density estimate overlay (default: True).
+        add_kde: Whether to add kernel density estimate overlay (default: False).
         add_ci: Whether to include 95% confidence intervals in stats box (default: True).
 
     Example:
@@ -233,25 +234,15 @@ def plot_metric_histograms(
         n_bins = min(50, max(20, int(np.sqrt(len(values)))))
         counts, bins, patches = ax.hist(
             values, bins=n_bins, density=True,
-            color=color, alpha=0.65, edgecolor=color,
-            linewidth=0.8, label="Histogram"
+            color=color, alpha=0.7, edgecolor="#000000",
+            linewidth=0.5
         )
 
-        # Add KDE overlay if requested
-        if add_kde and len(values) > 10:
-            try:
-                kde = scipy_stats.gaussian_kde(values, bw_method="scott")
-                x_range = np.linspace(values.min(), values.max(), 200)
-                ax.plot(x_range, kde(x_range), color=COLOR_BLACK,
-                       linewidth=2.0, linestyle="-", alpha=0.9, label="KDE")
-            except (np.linalg.LinAlgError, ValueError):
-                pass  # Skip KDE if singular matrix
-
-        # Add reference lines
-        ax.axvline(mean_val, color=COLOR_BLACK, linewidth=1.5,
-                  linestyle="--", alpha=0.8, label="Mean")
-        ax.axvline(median_val, color=COLOR_GRAY, linewidth=1.5,
-                  linestyle=":", alpha=0.8, label="Median")
+        # Add reference lines - thin and clean
+        ax.axvline(mean_val, color=COLOR_BLACK, linewidth=1.0,
+                  linestyle="--", alpha=0.7, label="Mean")
+        ax.axvline(median_val, color=COLOR_GRAY, linewidth=1.0,
+                  linestyle=":", alpha=0.7, label="Median")
 
         # Add statistics box with proper formatting
         kwargs = {"ci95": ci95} if add_ci else {}
@@ -285,16 +276,16 @@ def plot_latent_distributions(
     output_dir: Path,
     filename: str = "latent_distributions.png",
     *,
-    add_gaussian: bool = True,
+    add_gaussian: bool = False,
 ) -> None:
     """
-    Create a grid of histograms for each latent dimension with publication quality.
+    Create a grid of histograms for each latent dimension.
 
     Args:
         latents: Array of shape (N, D) where N is samples and D is latent dim.
         output_dir: Directory to save the plot.
         filename: Output filename.
-        add_gaussian: Whether to overlay N(0,1) reference (default: True).
+        add_gaussian: Whether to overlay N(0,1) reference (default: False).
 
     Example:
         >>> plot_latent_distributions(latents, Path("results/latent/"))
@@ -326,35 +317,23 @@ def plot_latent_distributions(
                 mean_val = float(np.mean(values))
                 std_val = float(np.std(values, ddof=1))
 
-                # Normalized histogram
+                # Normalized histogram - clean and simple
                 n_bins = min(40, max(15, int(np.sqrt(len(values)))))
                 ax.hist(values, bins=n_bins, density=True,
-                       color=COLOR_BLUE, alpha=0.6, edgecolor=COLOR_BLUE,
-                       linewidth=0.5, label="Empirical")
+                       color=COLOR_BLUE, alpha=0.7, edgecolor="#000000",
+                       linewidth=0.3)
 
-                # Add standard normal reference if requested
-                if add_gaussian:
-                    x_range = np.linspace(values.min(), values.max(), 200)
-                    gaussian = scipy_stats.norm.pdf(x_range, 0, 1)
-                    ax.plot(x_range, gaussian, color=COLOR_GRAY,
-                           linewidth=1.2, linestyle="--", alpha=0.8,
-                           label="$\\mathcal{N}(0,1)$")
-
-                # Reference lines
-                ax.axvline(mean_val, color=COLOR_BLACK, linewidth=1.0,
-                          linestyle="-", alpha=0.7, label=f"$\\mu={mean_val:.2f}$")
-                ax.axvline(0.0, color=COLOR_LIGHT_GRAY, linewidth=0.8,
-                          linestyle=":", alpha=0.6)
+                # Reference lines - thin and minimal
+                ax.axvline(mean_val, color=COLOR_BLACK, linewidth=0.8,
+                          linestyle="--", alpha=0.6)
+                ax.axvline(0.0, color=COLOR_LIGHT_GRAY, linewidth=0.6,
+                          linestyle=":", alpha=0.5)
 
                 # Styling
                 ax.set_title(f"$z_{{{idx}}}$", fontsize=8, fontweight="bold")
                 ax.set_xlabel("")
                 ax.set_ylabel("Density" if idx % cols == 0 else "", fontsize=7)
                 ax.tick_params(axis='both', which='major', labelsize=6)
-
-                # Add mini legend only to first panel
-                if idx == 0:
-                    ax.legend(fontsize=5, loc="upper right", framealpha=0.9)
 
                 _style_axes(ax, grid="major", minor_ticks=False)
         else:
@@ -409,9 +388,9 @@ def plot_reconstruction_sample(
     # ----- Panel 1: Signal with prediction -----
     ax1 = axes[0]
     ax1.plot(time, y_true, label="Ground truth",
-            color=COLOR_BLUE, alpha=0.95, linewidth=1.2, zorder=2)
+            color=COLOR_BLUE, alpha=0.9, linewidth=0.8, zorder=2)
     ax1.plot(time, y_pred, label="Reconstruction",
-            color=COLOR_ORANGE, alpha=0.95, linewidth=1.2, zorder=3)
+            color=COLOR_ORANGE, alpha=0.9, linewidth=0.8, zorder=3)
 
     # Add uncertainty band if available
     if y_pred_std is not None:
@@ -455,9 +434,9 @@ def plot_reconstruction_sample(
     residual = y_true - y_pred
     rmse = np.sqrt(np.mean(residual**2))
 
-    ax2.plot(time, residual, color=COLOR_GREEN, alpha=0.9, linewidth=1.0)
-    ax2.axhline(y=0, color=COLOR_BLACK, linestyle="--", linewidth=1.2, alpha=0.6, zorder=3)
-    ax2.fill_between(time, residual, 0, alpha=0.25, color=COLOR_GREEN, linewidth=0)
+    ax2.plot(time, residual, color=COLOR_GREEN, alpha=0.8, linewidth=0.7)
+    ax2.axhline(y=0, color=COLOR_BLACK, linestyle="--", linewidth=0.8, alpha=0.5, zorder=3)
+    ax2.fill_between(time, residual, 0, alpha=0.15, color=COLOR_GREEN, linewidth=0)
 
     # Add RMSE annotation
     ax2.text(
@@ -538,29 +517,29 @@ def plot_temporal_accuracy(
     agg.columns = ["timestep", "vaf_mean", "vaf_std", "vaf_sem",
                   "snr_mean", "snr_std", "snr_sem"]
 
-    # Use single-column width for journal
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(3.5, 5.0), sharex=True)
+    # Use wider figure for better visibility
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.0, 4.5), sharex=True)
 
     # ----- VAF plot -----
-    marker_every = max(1, len(agg) // 15)
+    marker_every = max(1, len(agg) // 20)
     ax1.plot(
         agg["timestep"], agg["vaf_mean"],
-        color=COLOR_BLUE, linewidth=1.5, label="VAF",
-        marker="o", markersize=3, markevery=marker_every,
+        color=COLOR_BLUE, linewidth=1.0, label="VAF",
+        marker="o", markersize=2.5, markevery=marker_every,
         markerfacecolor=COLOR_BLUE, markeredgewidth=0,
     )
     ax1.fill_between(
         agg["timestep"],
         agg["vaf_mean"] - agg["vaf_std"],
         agg["vaf_mean"] + agg["vaf_std"],
-        alpha=0.25, color=COLOR_BLUE, linewidth=0,
+        alpha=0.15, color=COLOR_BLUE, linewidth=0,
     )
 
     # Mark warmup region with subtle styling
-    ax1.axvspan(0, warmup_steps, alpha=0.12, color=COLOR_GRAY,
+    ax1.axvspan(0, warmup_steps, alpha=0.08, color=COLOR_GRAY,
                label="Warmup", zorder=0, linewidth=0)
     ax1.axvline(warmup_steps, color=COLOR_GRAY, linestyle="--",
-               linewidth=1.0, alpha=0.6, zorder=1)
+               linewidth=0.7, alpha=0.5, zorder=1)
 
     ax1.set_ylabel("Variance Accounted For", fontsize=8)
     ax1.set_title("Reconstruction Quality vs. Timestep",
@@ -572,20 +551,20 @@ def plot_temporal_accuracy(
     # ----- SNR plot -----
     ax2.plot(
         agg["timestep"], agg["snr_mean"],
-        color=COLOR_ORANGE, linewidth=1.5, label="SNR",
-        marker="s", markersize=3, markevery=marker_every,
+        color=COLOR_ORANGE, linewidth=1.0, label="SNR",
+        marker="s", markersize=2.5, markevery=marker_every,
         markerfacecolor=COLOR_ORANGE, markeredgewidth=0,
     )
     ax2.fill_between(
         agg["timestep"],
         agg["snr_mean"] - agg["snr_std"],
         agg["snr_mean"] + agg["snr_std"],
-        alpha=0.25, color=COLOR_ORANGE, linewidth=0,
+        alpha=0.15, color=COLOR_ORANGE, linewidth=0,
     )
 
-    ax2.axvspan(0, warmup_steps, alpha=0.12, color=COLOR_GRAY, zorder=0, linewidth=0)
+    ax2.axvspan(0, warmup_steps, alpha=0.08, color=COLOR_GRAY, zorder=0, linewidth=0)
     ax2.axvline(warmup_steps, color=COLOR_GRAY, linestyle="--",
-               linewidth=1.0, alpha=0.6, zorder=1)
+               linewidth=0.7, alpha=0.5, zorder=1)
 
     ax2.set_xlabel("Timestep (prediction index)", fontsize=8)
     ax2.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=8)
@@ -895,14 +874,14 @@ def plot_psd_comparison(
     orig_db = _to_db(psd_orig_mean)
     recon_db = _to_db(psd_recon_mean)
 
-    # Plot with enhanced styling
-    ax.plot(frequencies, orig_db, color=COLOR_BLUE, linewidth=1.8,
+    # Plot with clean styling
+    ax.plot(frequencies, orig_db, color=COLOR_BLUE, linewidth=1.0,
            label="Original FHR", zorder=3)
     ax.plot(
         frequencies,
         recon_db,
         color=COLOR_ORANGE,
-        linewidth=1.8,
+        linewidth=1.0,
         linestyle="--",
         label="Reconstructed FHR",
         zorder=3,
@@ -918,7 +897,7 @@ def plot_psd_comparison(
 
     if psd_residual_mean is not None:
         resid_db = _to_db(psd_residual_mean)
-        ax.plot(frequencies, resid_db, color=COLOR_GREEN, linewidth=1.6,
+        ax.plot(frequencies, resid_db, color=COLOR_GREEN, linewidth=1.0,
                label="Residual", zorder=3)
         if psd_residual_std is not None:
             resid_low, resid_high = _band_db(psd_residual_mean, psd_residual_std)
@@ -968,8 +947,8 @@ def plot_cross_correlation(
 
     fig, ax = plt.subplots(figsize=(3.5, 3.0))
 
-    # Plot main curve with enhanced styling
-    ax.plot(lags_sec, corr_mean, color=COLOR_PURPLE, linewidth=1.8,
+    # Plot main curve with clean styling
+    ax.plot(lags_sec, corr_mean, color=COLOR_PURPLE, linewidth=1.0,
            label="Cross-correlation", zorder=3)
     ax.fill_between(
         lags_sec,
@@ -991,11 +970,11 @@ def plot_cross_correlation(
                markersize=6, markeredgecolor='white', markeredgewidth=0.5,
                zorder=4, label=f"Peak: $r$={peak_corr:.3f} at {peak_lag:.2f}s")
 
-    # Reference lines
-    ax.axvline(0.0, color=COLOR_BLACK, linestyle="--", linewidth=1.2,
-              alpha=0.6, zorder=2, label="Zero lag")
+    # Reference lines - thin and clean
+    ax.axvline(0.0, color=COLOR_BLACK, linestyle="--", linewidth=0.8,
+              alpha=0.5, zorder=2, label="Zero lag")
     ax.axhline(0.0, color=COLOR_LIGHT_GRAY, linestyle=":",
-              linewidth=1.0, alpha=0.6, zorder=0)
+              linewidth=0.7, alpha=0.5, zorder=0)
 
     ax.set_xlabel("Lag (seconds)", fontsize=8)
     ax.set_ylabel("Normalized correlation", fontsize=8)
@@ -1173,4 +1152,514 @@ def plot_time_frequency_coherence(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Trajectory Visualization Functions
+# -----------------------------------------------------------------------------
+
+def plot_latent_trajectory_2d(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    color_by_time: bool = True,
+    point_size: int = 20,
+    show_arrows: bool = True,
+) -> None:
+    """
+    Plot 2D latent trajectory with temporal coloring and directional arrows.
+
+    Args:
+        trajectory: Trajectory array of shape (T, 2) where T is time steps.
+        output_path: Path to save the figure.
+        sample_id: Sample identifier for the title.
+        color_by_time: Whether to color points by time progression.
+        point_size: Size of trajectory points.
+        show_arrows: Whether to show directional arrows.
+
+    Example:
+        >>> plot_latent_trajectory_2d(trajectory_2d, Path("results/traj_2d.png"))
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+
+    time_steps = trajectory.shape[0]
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.0))
+
+    # Color by time
+    if color_by_time:
+        colors = plt.cm.viridis(np.linspace(0, 1, time_steps))
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1],
+            c=np.arange(time_steps), cmap="viridis",
+            s=point_size, zorder=3, edgecolor="white", linewidth=0.3
+        )
+    else:
+        colors = [COLOR_BLUE] * time_steps
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1],
+            c=COLOR_BLUE, s=point_size, zorder=3,
+            edgecolor="white", linewidth=0.3
+        )
+
+    # Draw arrows
+    if show_arrows:
+        for i in range(time_steps - 1):
+            ax.annotate(
+                "",
+                xy=trajectory[i + 1],
+                xytext=trajectory[i],
+                arrowprops=dict(
+                    arrowstyle="->",
+                    lw=0.8,
+                    color=colors[i] if color_by_time else COLOR_BLUE,
+                    alpha=0.6,
+                ),
+            )
+
+    # Mark start and end
+    ax.scatter(
+        trajectory[0, 0], trajectory[0, 1],
+        c=COLOR_GREEN, s=100, marker="o", label="Start",
+        zorder=4, edgecolor=COLOR_BLACK, linewidth=1.0
+    )
+    ax.scatter(
+        trajectory[-1, 0], trajectory[-1, 1],
+        c=COLOR_VERMILLION, s=100, marker="X", label="End",
+        zorder=4, edgecolor=COLOR_BLACK, linewidth=1.0
+    )
+
+    if color_by_time:
+        cbar = plt.colorbar(scatter, ax=ax, label="Time Step", pad=0.02)
+        cbar.ax.tick_params(labelsize=7)
+
+    ax.set_xlabel("Latent Dim 1", fontsize=8)
+    ax.set_ylabel("Latent Dim 2", fontsize=8)
+    ax.set_title(f"Latent Trajectory - {sample_id}", fontsize=9, fontweight="bold", pad=6)
+    ax.legend(loc="best", fontsize=7, framealpha=0.95)
+    _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_latent_trajectory_3d(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    color_by_time: bool = True,
+    point_size: int = 20,
+) -> None:
+    """
+    Plot 3D latent trajectory with temporal coloring.
+
+    Args:
+        trajectory: Trajectory array of shape (T, 3) where T is time steps.
+        output_path: Path to save the figure.
+        sample_id: Sample identifier for the title.
+        color_by_time: Whether to color points by time progression.
+        point_size: Size of trajectory points.
+
+    Example:
+        >>> plot_latent_trajectory_3d(trajectory_3d, Path("results/traj_3d.png"))
+    """
+    from mpl_toolkits.mplot3d import Axes3D
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+
+    time_steps = trajectory.shape[0]
+
+    fig = plt.figure(figsize=(8.0, 7.0))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Color by time
+    if color_by_time:
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+            c=np.arange(time_steps), cmap="viridis",
+            s=point_size, depthshade=True
+        )
+    else:
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+            c=COLOR_BLUE, s=point_size, depthshade=True
+        )
+
+    # Draw trajectory line
+    ax.plot(
+        trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+        color=COLOR_BLUE, alpha=0.4, linewidth=1.0
+    )
+
+    # Mark start and end
+    ax.scatter(
+        [trajectory[0, 0]], [trajectory[0, 1]], [trajectory[0, 2]],
+        c=COLOR_GREEN, s=100, marker="o", label="Start", depthshade=False
+    )
+    ax.scatter(
+        [trajectory[-1, 0]], [trajectory[-1, 1]], [trajectory[-1, 2]],
+        c=COLOR_VERMILLION, s=100, marker="X", label="End", depthshade=False
+    )
+
+    if color_by_time:
+        cbar = plt.colorbar(scatter, ax=ax, label="Time Step", shrink=0.6, pad=0.1)
+        cbar.ax.tick_params(labelsize=7)
+
+    ax.set_xlabel("Latent Dim 1", fontsize=8, labelpad=10)
+    ax.set_ylabel("Latent Dim 2", fontsize=8, labelpad=10)
+    ax.set_zlabel("Latent Dim 3", fontsize=8, labelpad=10)
+    ax.set_title(f"Latent Trajectory 3D - {sample_id}", fontsize=9, fontweight="bold", pad=10)
+    ax.legend(loc="best", fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_latent_changepoints_with_raw(
+    latent_mean: np.ndarray,
+    fhr: np.ndarray,
+    changepoint_results: Dict[str, Any],
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    cmap: str = "viridis",
+    decimation_factor: int = 16,
+) -> None:
+    """
+    Visualize latent trajectory alongside raw FHR signal with changepoints marked.
+
+    Creates a 3-panel figure:
+        1. Latent representation heatmap with changepoints
+        2. FHR signal with latent-derived changepoints
+        3. FHR signal with raw-detected changepoints (if available)
+
+    Args:
+        latent_mean: Latent trajectory of shape (T, D).
+        fhr: Raw FHR signal of shape (L,).
+        changepoint_results: Dict from detect_changepoints with keys:
+            - 'latent_changepoints': Changepoint indices in latent space
+            - 'raw_changepoints': Mapped indices in raw space
+            - 'raw_detected_changepoints': Directly detected in raw (optional)
+        output_path: Path to save the figure.
+        sample_id: Sample identifier for the title.
+        cmap: Colormap for latent heatmap.
+        decimation_factor: Ratio between raw and latent lengths.
+
+    Example:
+        >>> plot_latent_changepoints_with_raw(latent, fhr, cp_results, Path("results/cp.png"))
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    latent_cps = changepoint_results.get("latent_changepoints", np.array([]))
+    raw_cps_from_latent = changepoint_results.get("raw_changepoints", np.array([]))
+    raw_detected_cps = changepoint_results.get("raw_detected_changepoints", np.array([]))
+
+    latent_time_steps, latent_dims = latent_mean.shape
+    raw_len = len(fhr)
+
+    # Map latent changepoints to raw indices if not provided
+    if len(raw_cps_from_latent) == 0 and len(latent_cps) > 0:
+        raw_cps_from_latent = np.array([
+            min(raw_len - 1, int(cp * decimation_factor)) for cp in latent_cps
+        ])
+
+    fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.5), sharex=True,
+                             gridspec_kw={"height_ratios": [1.5, 1, 1]})
+
+    # Panel 1: Latent heatmap
+    x_max = max(raw_len - 1, 0)
+    extent = (0, x_max, -0.5, latent_dims - 0.5)
+    im = axes[0].imshow(
+        latent_mean.T, aspect="auto", origin="lower", cmap=cmap,
+        interpolation="nearest", extent=extent
+    )
+    axes[0].set_xlim(extent[0], extent[1])
+    axes[0].set_ylim(extent[2], extent[3])
+    axes[0].set_ylabel("Latent Dimension", fontsize=8)
+    axes[0].set_title(f"Latent Representation - {sample_id}", fontsize=9, fontweight="bold", pad=6)
+
+    for raw_cp in raw_cps_from_latent:
+        axes[0].axvline(raw_cp, color="white", linestyle="--", linewidth=1.2, alpha=0.8)
+
+    cbar = fig.colorbar(im, ax=axes[0], pad=0.02)
+    cbar.ax.set_ylabel("Activation", rotation=270, labelpad=12, fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    # Panel 2: FHR with latent-derived changepoints
+    time_axis = np.arange(raw_len)
+    axes[1].plot(time_axis, fhr, color=COLOR_VERMILLION, linewidth=0.8, label="FHR")
+    axes[1].set_ylabel("FHR (normalized)", fontsize=8)
+    axes[1].set_title("FHR with Latent Changepoints", fontsize=9, fontweight="bold", pad=6)
+    axes[1].set_xlim(0, x_max)
+    _style_axes(axes[1], grid="major", minor_ticks=False)
+    axes[1].legend(loc="upper right", fontsize=7)
+
+    for raw_cp in raw_cps_from_latent:
+        axes[1].axvline(raw_cp, color=COLOR_BLACK, linestyle="--", linewidth=0.8, alpha=0.6)
+
+    # Panel 3: FHR with both latent and raw changepoints
+    axes[2].plot(time_axis, fhr, color=COLOR_VERMILLION, linewidth=0.8, label="FHR")
+    axes[2].set_xlabel("Raw Time Index", fontsize=8)
+    axes[2].set_ylabel("FHR (normalized)", fontsize=8)
+    axes[2].set_title("FHR with Latent (gray) and Raw (green) Changepoints", fontsize=9, fontweight="bold", pad=6)
+    axes[2].set_xlim(0, x_max)
+    _style_axes(axes[2], grid="major", minor_ticks=False)
+
+    latent_line_added = False
+    raw_line_added = False
+    for raw_cp in raw_cps_from_latent:
+        axes[2].axvline(
+            raw_cp, color=COLOR_GRAY, linestyle="--", linewidth=0.8, alpha=0.6,
+            label="Latent CPs" if not latent_line_added else None
+        )
+        latent_line_added = True
+    for raw_cp in raw_detected_cps:
+        axes[2].axvline(
+            raw_cp, color=COLOR_GREEN, linestyle="-", linewidth=1.0, alpha=0.75,
+            label="Raw CPs" if not raw_line_added else None
+        )
+        raw_line_added = True
+
+    if latent_line_added or raw_line_added:
+        axes[2].legend(loc="upper right", fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_segment_statistics(
+    segment_stats: List[Dict[str, Any]],
+    output_dir: Path,
+    *,
+    filename_prefix: str = "segment",
+) -> Optional[pd.DataFrame]:
+    """
+    Visualize aggregated latent segment statistics from changepoint analysis.
+
+    Creates multiple plots:
+        1. Segment duration histogram
+        2. Mean speed vs start time scatter
+        3. Dominant latent dimension bar chart
+        4. Segments per sample bar chart
+
+    Also exports segment data to CSV.
+
+    Args:
+        segment_stats: List of per-sample dicts from summarize_latent_segments.
+        output_dir: Directory to save plots.
+        filename_prefix: Prefix for output files.
+
+    Returns:
+        DataFrame with flattened segment statistics, or None if no data.
+
+    Example:
+        >>> df = plot_segment_statistics(segment_stats, Path("results/segments/"))
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not segment_stats:
+        return None
+
+    # Flatten to DataFrame
+    rows: List[Dict[str, Any]] = []
+    for entry in segment_stats:
+        sample_id = entry.get("sample_id")
+        epoch_raw_index = entry.get("epoch_raw_index")
+        for seg in entry.get("segments", []):
+            row = {
+                "sample_id": sample_id,
+                "epoch_raw_index": epoch_raw_index,
+                "segment_index": seg.get("segment_index"),
+                "start_step": seg.get("start_step"),
+                "end_step": seg.get("end_step"),
+                "length_steps": seg.get("length_steps"),
+                "duration_seconds": seg.get("duration_seconds"),
+                "start_minutes_rel_delivery": seg.get("start_minutes_rel_delivery"),
+                "end_minutes_rel_delivery": seg.get("end_minutes_rel_delivery"),
+                "dominant_latent_dim": seg.get("dominant_latent_dim"),
+                "mean_speed": seg.get("mean_speed"),
+                "mean_activation_norm": seg.get("mean_activation_norm"),
+            }
+            rows.append(row)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+
+    # Save CSV
+    csv_path = output_dir / f"{filename_prefix}_stats.csv"
+    df.to_csv(csv_path, index=False)
+
+    # Plot 1: Duration histogram
+    durations = df["duration_seconds"].dropna()
+    if not durations.empty:
+        fig, ax = plt.subplots(figsize=(3.5, 3.0))
+        durations_minutes = durations / 60.0
+        ax.hist(durations_minutes, bins=20, color=COLOR_BLUE, alpha=0.75, edgecolor=COLOR_BLACK, linewidth=0.5)
+        ax.set_xlabel("Duration (minutes)", fontsize=8)
+        ax.set_ylabel("Count", fontsize=8)
+        ax.set_title("Segment Duration Distribution", fontsize=9, fontweight="bold", pad=6)
+        _style_axes(ax, grid="major", minor_ticks=False)
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{filename_prefix}_duration_hist.png", dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    # Plot 2: Mean speed vs start time
+    start_speed = df[["start_minutes_rel_delivery", "mean_speed"]].dropna()
+    if not start_speed.empty:
+        fig, ax = plt.subplots(figsize=(3.5, 3.0))
+        ax.scatter(
+            start_speed["start_minutes_rel_delivery"],
+            start_speed["mean_speed"],
+            s=20, c=COLOR_ORANGE, alpha=0.7, edgecolors=COLOR_BLACK, linewidths=0.3
+        )
+        ax.set_xlabel("Start Minutes Rel. Delivery", fontsize=8)
+        ax.set_ylabel("Mean Latent Speed", fontsize=8)
+        ax.set_title("Latent Speed vs Start Time", fontsize=9, fontweight="bold", pad=6)
+        ax.axvline(0.0, color=COLOR_GRAY, linestyle="--", linewidth=0.8, alpha=0.6)
+        _style_axes(ax, grid="major", minor_ticks=False)
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{filename_prefix}_speed_vs_start.png", dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    # Plot 3: Dominant latent dimension counts
+    dominant_dims = df["dominant_latent_dim"].dropna()
+    if not dominant_dims.empty:
+        dominant_counts = dominant_dims.astype(int).value_counts().sort_index()
+        fig, ax = plt.subplots(figsize=(3.5, 3.0))
+        ax.bar(dominant_counts.index.astype(str), dominant_counts.values, color=COLOR_GREEN, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5)
+        ax.set_xlabel("Latent Dimension Index", fontsize=8)
+        ax.set_ylabel("Segment Count", fontsize=8)
+        ax.set_title("Dominant Latent Dimension", fontsize=9, fontweight="bold", pad=6)
+        _style_axes(ax, grid="major", minor_ticks=False)
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{filename_prefix}_dominant_dim.png", dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    # Plot 4: Segments per sample
+    segments_per_sample = df.groupby("sample_id")["segment_index"].count()
+    if not segments_per_sample.empty and len(segments_per_sample) <= 30:
+        fig, ax = plt.subplots(figsize=(5.0, 3.0))
+        segments_per_sample.sort_values(ascending=False).plot(
+            kind="bar", ax=ax, color=COLOR_PURPLE, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5
+        )
+        ax.set_xlabel("Sample ID", fontsize=8)
+        ax.set_ylabel("Number of Segments", fontsize=8)
+        ax.set_title("Segments per Sample", fontsize=9, fontweight="bold", pad=6)
+        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        _style_axes(ax, grid="major", minor_ticks=False)
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{filename_prefix}_per_sample.png", dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    return df
+
+
+def plot_trajectory_comparison(
+    trajectories: Dict[str, np.ndarray],
+    output_dir: Path,
+    *,
+    n_components: int = 2,
+    filename: str = "trajectory_comparison.png",
+) -> None:
+    """
+    Compare latent trajectories across multiple classes in a single plot.
+
+    Args:
+        trajectories: Dict mapping class names to trajectory arrays.
+            Each array has shape (N, T, D) where N is samples, T is time, D is dims.
+        output_dir: Directory to save the plot.
+        n_components: Number of dimensions to plot (2 or 3).
+        filename: Output filename.
+
+    Example:
+        >>> trajectories = {"healthy": healthy_trajs, "acidosis": acidosis_trajs}
+        >>> plot_trajectory_comparison(trajectories, Path("results/"))
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Color map for classes
+    class_colors = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+        "unknown": COLOR_GRAY,
+    }
+
+    if n_components == 3:
+        fig = plt.figure(figsize=(8.0, 7.0))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig, ax = plt.subplots(figsize=(7.0, 6.0))
+
+    for class_name, class_trajectories in trajectories.items():
+        color = class_colors.get(class_name.lower(), COLOR_BLUE)
+
+        if class_trajectories.ndim == 2:
+            class_trajectories = class_trajectories[None, ...]
+
+        for i, traj in enumerate(class_trajectories):
+            alpha = 0.3 + 0.5 * (i == 0)  # Highlight first trajectory
+
+            if n_components == 3 and traj.shape[1] >= 3:
+                ax.plot(
+                    traj[:, 0], traj[:, 1], traj[:, 2],
+                    color=color, alpha=alpha, linewidth=0.8,
+                    label=class_name if i == 0 else None
+                )
+                ax.scatter(
+                    [traj[0, 0]], [traj[0, 1]], [traj[0, 2]],
+                    c=color, s=30, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.3
+                )
+                ax.scatter(
+                    [traj[-1, 0]], [traj[-1, 1]], [traj[-1, 2]],
+                    c=color, s=30, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.3
+                )
+            else:
+                ax.plot(
+                    traj[:, 0], traj[:, 1],
+                    color=color, alpha=alpha, linewidth=0.8,
+                    label=class_name if i == 0 else None
+                )
+                ax.scatter(
+                    traj[0, 0], traj[0, 1],
+                    c=color, s=30, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.3
+                )
+                ax.scatter(
+                    traj[-1, 0], traj[-1, 1],
+                    c=color, s=30, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.3
+                )
+
+    if n_components == 3:
+        ax.set_xlabel("PC1", fontsize=8, labelpad=10)
+        ax.set_ylabel("PC2", fontsize=8, labelpad=10)
+        ax.set_zlabel("PC3", fontsize=8, labelpad=10)
+    else:
+        ax.set_xlabel("PC1", fontsize=8)
+        ax.set_ylabel("PC2", fontsize=8)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    ax.set_title("Trajectory Comparison by Class", fontsize=9, fontweight="bold", pad=6)
+    ax.legend(loc="best", fontsize=7, framealpha=0.95)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
