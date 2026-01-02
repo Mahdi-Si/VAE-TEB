@@ -41,8 +41,8 @@ plt.rcParams.update({
     "legend.fontsize": 7,
     "legend.title_fontsize": 7,
     "axes.linewidth": 0.6,
-    "axes.edgecolor": "#222222",
-    "axes.labelcolor": "#222222",
+    "axes.edgecolor": "#222831",
+    "axes.labelcolor": "#222831",
     "axes.spines.top": True,
     "axes.spines.right": True,
     "axes.spines.left": True,
@@ -60,16 +60,16 @@ plt.rcParams.update({
     "ytick.major.width": 0.5,
     "xtick.minor.width": 0.3,
     "ytick.minor.width": 0.3,
-    "xtick.color": "#222222",
-    "ytick.color": "#222222",
+    "xtick.color": "#222831",
+    "ytick.color": "#222831",
     "grid.alpha": 0.2,
     "grid.linewidth": 0.3,
-    "grid.color": "#DDDDDD",
+    "grid.color": "#EEEEEE",
     "grid.linestyle": "-",
     "legend.frameon": True,
     "legend.framealpha": 0.95,
     "legend.fancybox": False,
-    "legend.edgecolor": "#222222",
+    "legend.edgecolor": "#393E46",
     "legend.shadow": False,
     "lines.linewidth": 1.0,
     "lines.markersize": 3,
@@ -81,22 +81,31 @@ plt.rcParams.update({
     "mathtext.default": "regular",
 })
 
-# Colorblind-friendly palette (Okabe-Ito, optimized for accessibility and print)
-# Validated for deuteranopia, protanopia, and tritanopia
-COLOR_BLUE = "#5A6673"        # Muted slate
-COLOR_ORANGE = "#7A6D63"      # Muted taupe
-COLOR_GREEN = "#5F6B64"       # Muted green-gray
-COLOR_SKY = "#8C98A4"         # Light blue-gray
-COLOR_PURPLE = "#6C6474"      # Muted violet
-COLOR_VERMILLION = "#7B5D5D"  # Muted rose
-COLOR_GRAY = "#666666"        # Dark gray
-COLOR_BLACK = "#222222"       # Soft black
-COLOR_LIGHT_GRAY = "#B3B3B3"  # Light gray for auxiliary elements
+# Testing palette (user-provided)
+COLOR_BLUE = "#3F72AF"
+COLOR_ORANGE = "#FFB200"
+COLOR_GREEN = "#609966"
+COLOR_SKY = "#00ADB5"
+COLOR_PURPLE = "#112D4E"
+COLOR_VERMILLION = "#EB5B00"
+COLOR_GRAY = "#393E46"
+COLOR_BLACK = "#222831"
+COLOR_LIGHT_GRAY = "#EEEEEE"
+COLOR_SAGE = "#9DC08B"
+COLOR_TEAL_DARK = "#0D7377"
 
 # Multi-line palettes for complex figures
-PALETTE_PRIMARY = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_PURPLE]
-PALETTE_EXTENDED = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_PURPLE,
-                    COLOR_SKY, COLOR_VERMILLION, COLOR_GRAY]
+PALETTE_PRIMARY = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_SKY]
+PALETTE_EXTENDED = [
+    COLOR_BLUE,
+    COLOR_ORANGE,
+    COLOR_GREEN,
+    COLOR_SKY,
+    COLOR_PURPLE,
+    COLOR_VERMILLION,
+    COLOR_SAGE,
+    COLOR_TEAL_DARK,
+]
 SAVE_DPI = 600
 FONT_LABEL = plt.rcParams["axes.labelsize"]
 FONT_TITLE = plt.rcParams["axes.titlesize"]
@@ -117,9 +126,9 @@ def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) 
 
     # Configure grid - subtle
     if grid in ("both", "major"):
-        ax.grid(True, which="major", alpha=0.2, linewidth=0.3, color="#E0E0E0")
+        ax.grid(True, which="major", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
     if grid == "both":
-        ax.grid(True, which="minor", alpha=0.1, linewidth=0.2, color="#F0F0F0")
+        ax.grid(True, which="minor", alpha=0.12, linewidth=0.2, color=COLOR_LIGHT_GRAY)
 
     # Configure ticks
     if minor_ticks and grid == "both":
@@ -129,7 +138,7 @@ def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) 
     for spine in ["left", "bottom", "top", "right"]:
         if spine in ax.spines:
             ax.spines[spine].set_visible(True)
-            ax.spines[spine].set_color("#000000")
+            ax.spines[spine].set_color(COLOR_BLACK)
             ax.spines[spine].set_linewidth(0.6)
 
 
@@ -277,7 +286,7 @@ def plot_metric_histograms(
         n_bins = min(120, max(40, int(np.sqrt(len(values)) * 2)))
         counts, bins, patches = ax.hist(
             values, bins=n_bins, density=True,
-            color=color, alpha=0.7, edgecolor="#000000",
+            color=color, alpha=0.7, edgecolor=COLOR_BLACK,
             linewidth=0.5
         )
 
@@ -295,7 +304,7 @@ def plot_metric_histograms(
             transform=ax.transAxes, fontsize=FONT_LEGEND,
             verticalalignment="top", horizontalalignment="left",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
-                     edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
+                     edgecolor=COLOR_LIGHT_GRAY, alpha=0.95, linewidth=0.8),
             clip_on=False,
         )
 
@@ -365,7 +374,7 @@ def plot_latent_distributions(
                 # Normalized histogram with finer binning
                 n_bins = min(100, max(30, int(np.sqrt(len(values)) * 2)))
                 ax.hist(values, bins=n_bins, density=True,
-                       color=COLOR_BLUE, alpha=0.7, edgecolor="#000000",
+                       color=COLOR_BLUE, alpha=0.7, edgecolor=COLOR_BLACK,
                        linewidth=0.3)
 
                 # Reference lines with distinct colors and dashed styles
@@ -463,7 +472,7 @@ def plot_reconstruction_sample(
         transform=ax1.transAxes, fontsize=FONT_LEGEND,
         verticalalignment="top",
         bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
-                 edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
+                 edgecolor=COLOR_LIGHT_GRAY, alpha=0.95, linewidth=0.8),
     )
 
     ax1.set_xlabel("")
@@ -499,7 +508,7 @@ def plot_reconstruction_sample(
         transform=ax2.transAxes, fontsize=FONT_LEGEND,
         verticalalignment="top", horizontalalignment="right",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                 edgecolor="#CCCCCC", alpha=0.95, linewidth=0.8),
+                 edgecolor=COLOR_LIGHT_GRAY, alpha=0.95, linewidth=0.8),
     )
 
     ax2.set_xlabel("")
@@ -834,7 +843,7 @@ def plot_kld_trajectory(
             subset["hour_bin"] = (subset["hours_before"] * 2).round() / 2  # 30-min bins
             agg = subset.groupby("hour_bin")["kld_mean"].agg(["mean", "std"]).reset_index()
 
-            color = label_colors.get(label, "#666666")
+            color = label_colors.get(label, COLOR_GRAY)
             name = label_names.get(label, f"Class {label}")
 
             ax.plot(
