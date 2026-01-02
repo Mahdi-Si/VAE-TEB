@@ -72,7 +72,12 @@ def _plot_band_trends(
     cols = 1
     rows = n_bands
     fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.9 * rows), sharex=False)
-    axes = np.atleast_2d(axes)
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = np.array(axes)[np.newaxis, :]
+    elif cols == 1:
+        axes = np.array(axes)[:, np.newaxis]
 
     has_pair = "orig_mean" in df.columns and "recon_mean" in df.columns
     has_single = "coherence_mean" in df.columns
