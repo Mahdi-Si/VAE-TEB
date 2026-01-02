@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+from datetime import datetime
 
 import torch
 from loguru import logger
@@ -378,7 +379,15 @@ def _resolve_runner_settings(
         if resolved_output is None:
             base_dir = folders_cfg.get("out_dir_base")
             if base_dir:
-                resolved_output = str(Path(base_dir) / "test_results")
+                # Create timestamped folder structure similar to training pipeline
+                now = datetime.now()
+                run_date = now.strftime("%Y-%m-%d--[%H-%M-%S]") + f"--{now.microsecond:06d}-"
+                experiment_tag = config.get("general_config", {}).get("tag", "test")
+
+                # Structure: out_dir_base / {tag} / {timestamp} / test_results
+                tag_dir = Path(base_dir) / experiment_tag
+                timestamped_dir = tag_dir / run_date
+                resolved_output = str(timestamped_dir / "test_results")
 
     if not resolved_checkpoint:
         raise ValueError(
