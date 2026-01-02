@@ -317,10 +317,15 @@ def plot_metric_histograms(
         _tighten_xaxis(ax, values)
         ax.set_ylim(bottom=0.0)
 
-        # Add legend to each panel for clarity
-        ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.9)
+        # Add legend outside, below the stats box
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 0.62),
+            fontsize=FONT_LEGEND,
+            framealpha=0.9,
+        )
 
-    fig.tight_layout(rect=[0.0, 0.0, 0.85, 1.0], pad=0.8)
+    fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0], pad=0.8)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -893,6 +898,73 @@ def plot_kld_trajectory(
     plt.close(fig)
 
 
+def plot_kld_guid_trajectory(
+    df: pd.DataFrame,
+    output_dir: Path,
+    *,
+    guid: str,
+    filename: Optional[str] = None,
+    show_std: bool = True,
+) -> None:
+    """
+    Plot per-epoch KLD mean trajectory for a single GUID.
+
+    Args:
+        df: DataFrame filtered to a single GUID with 'hours_before', 'kld_mean',
+            and optionally 'kld_std'.
+        output_dir: Directory to save the plot.
+        guid: GUID identifier for title/filename.
+        filename: Output filename override (optional).
+        show_std: Whether to plot +/- std if available.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if df.empty or "hours_before" not in df.columns or "kld_mean" not in df.columns:
+        return
+
+    fig, ax = plt.subplots(figsize=(7.6, 2.8))
+
+    plot_df = df.copy().sort_values("hours_before", ascending=False)
+    x = plot_df["hours_before"].values
+    y = plot_df["kld_mean"].values
+
+    ax.plot(
+        x,
+        y,
+        color=COLOR_BLUE,
+        linewidth=0.8,
+        marker="o",
+        markersize=2.2,
+        label="KLD mean",
+    )
+
+    if show_std and "kld_std" in plot_df.columns:
+        std = plot_df["kld_std"].values
+        ax.fill_between(
+            x,
+            y - std,
+            y + std,
+            color=COLOR_BLUE,
+            alpha=0.18,
+            label="KLD +/- 1 SD",
+        )
+
+    ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
+    ax.set_ylabel("KLD (Transfer Entropy)", fontsize=FONT_LABEL)
+    ax.set_title(f"KLD Trajectory - {guid}", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    _tighten_xaxis(ax, x)
+    _set_ylim_from_data(ax, y, pad_frac=0.08)
+    ax.invert_xaxis()
+    ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.95)
+    _style_axes(ax, grid="both", minor_ticks=True)
+
+    fig.tight_layout()
+    out_name = filename or f"kld_guid_{guid}.png"
+    fig.savefig(output_dir / out_name, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_coherence_analysis(
     frequencies: np.ndarray,
     coherence_original: np.ndarray,
@@ -916,7 +988,7 @@ def plot_coherence_analysis(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6.5, 3.2))
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
 
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     freq_mask = frequencies <= max_freq
@@ -973,7 +1045,7 @@ def plot_reconstruction_coherence(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6.5, 3.2))
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     freq_mask = frequencies <= max_freq
     freqs = frequencies[freq_mask]
@@ -1001,6 +1073,52 @@ def plot_reconstruction_coherence(
 
     fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_coherence_spectrum(
+    frequencies: np.ndarray,
+    coherence: np.ndarray,
+    output_path: Path,
+    *,
+    title: Optional[str] = None,
+    max_freq: Optional[float] = 0.5,
+) -> None:
+    """
+    Plot a single coherence spectrum (one line, no aggregation).
+
+    Args:
+        frequencies: Frequency array in Hz.
+        coherence: Coherence values in [0, 1].
+        output_path: Output path for the figure.
+        title: Optional title override.
+        max_freq: Optional max frequency to display.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if frequencies.size == 0 or coherence.size == 0:
+        return
+
+    if max_freq is None:
+        max_freq = float(np.nanmax(frequencies))
+    freq_mask = frequencies <= max_freq
+    freqs = frequencies[freq_mask]
+    coh = coherence[freq_mask]
+
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
+    ax.plot(freqs, coh, color=COLOR_BLUE, linewidth=0.8, label="Coherence")
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
+    ax.set_title(title or "Coherence Spectrum", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.set_xlim(0, float(max_freq))
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
+    _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, freqs)
+
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1033,7 +1151,7 @@ def plot_psd_comparison(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6.5, 3.2))
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
     max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
     freq_mask = frequencies <= max_freq
     freqs = frequencies[freq_mask]
@@ -1124,7 +1242,7 @@ def plot_cross_correlation(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    fig, ax = plt.subplots(figsize=(7.6, 2.4))
 
     # Plot main curve with clean styling
     ax.plot(lags_sec, corr_mean, color=COLOR_PURPLE, linewidth=0.5,
@@ -1201,7 +1319,7 @@ def plot_coherence_signals(
     time_min = np.arange(min_len) / fs / 60.0
 
     if up_signal is None:
-        fig, axes = plt.subplots(2, 1, figsize=(6.5, 4.0), sharex=True)
+        fig, axes = plt.subplots(2, 1, figsize=(7.6, 3.2), sharex=True)
         axes[0].plot(time_min, fhr_original, color=COLOR_BLUE, linewidth=0.6, label="Original FHR")
         axes[0].plot(
             time_min,
@@ -1224,7 +1342,7 @@ def plot_coherence_signals(
         _tighten_xaxis(axes[0], time_min)
         _tighten_xaxis(axes[1], time_min)
     else:
-        fig, axes = plt.subplots(3, 1, figsize=(6.5, 5.2), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(7.6, 4.2), sharex=True)
         axes[0].plot(time_min, up_signal, color=COLOR_PURPLE, linewidth=0.5)
         axes[0].set_ylabel("UP (normalized)", fontsize=FONT_LABEL)
         axes[0].set_title(title or "UP and FHR Signals", fontsize=FONT_TITLE, fontweight="normal", pad=6)
@@ -1291,7 +1409,7 @@ def plot_time_frequency_coherence(
     time_min = times / 60.0
 
     if coherence_reconstructed is None:
-        fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.2))
+        fig, ax = plt.subplots(1, 1, figsize=(7.6, 2.6))
         im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="cividis", vmin=0.0, vmax=1.0)
         ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
         ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
@@ -1314,7 +1432,7 @@ def plot_time_frequency_coherence(
     coh_recon = coherence_reconstructed[freq_mask, :]
     coh_diff = coh_recon - coh_orig
 
-    fig, axes = plt.subplots(3, 1, figsize=(6.5, 6.0), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(7.6, 4.8), sharex=True)
 
     im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="cividis", vmin=0.0, vmax=1.0)
     axes[0].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
@@ -1521,6 +1639,79 @@ def plot_latent_trajectory_3d(
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
+
+def plot_kld_trajectory_3d(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    color_by_time: bool = True,
+    point_size: int = 12,
+) -> None:
+    """
+    Plot 3D KLD trajectory (KLD, KLD velocity, KLD acceleration).
+
+    Args:
+        trajectory: Array of shape (T, 3) with columns [kld, kld_velocity, kld_accel].
+        output_path: Path to save the figure.
+        sample_id: Sample identifier for the title.
+        color_by_time: Whether to color points by time progression.
+        point_size: Size of trajectory points.
+    """
+    from mpl_toolkits.mplot3d import Axes3D
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+
+    if trajectory.shape[1] < 3:
+        return
+
+    time_steps = trajectory.shape[0]
+
+    fig = plt.figure(figsize=(8.0, 7.0))
+    ax = fig.add_subplot(111, projection="3d")
+
+    if color_by_time:
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+            c=np.arange(time_steps), cmap="cividis",
+            s=point_size, depthshade=True
+        )
+    else:
+        scatter = ax.scatter(
+            trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+            c=COLOR_BLUE, s=point_size, depthshade=True
+        )
+
+    ax.plot(
+        trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+        color=COLOR_BLUE, alpha=0.4, linewidth=0.5
+    )
+
+    ax.scatter(
+        [trajectory[0, 0]], [trajectory[0, 1]], [trajectory[0, 2]],
+        c=COLOR_GREEN, s=50, marker="o", label="Start", depthshade=False
+    )
+    ax.scatter(
+        [trajectory[-1, 0]], [trajectory[-1, 1]], [trajectory[-1, 2]],
+        c=COLOR_VERMILLION, s=50, marker="X", label="End", depthshade=False
+    )
+
+    if color_by_time:
+        _add_colorbar(fig, scatter, ax, label="Time Step", shrink=0.8, pad=0.02)
+
+    ax.set_xlabel("KLD", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_ylabel("KLD Velocity", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_zlabel("KLD Acceleration", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_title(f"KLD Trajectory 3D - {sample_id}", fontsize=FONT_TITLE, fontweight="normal", pad=10)
+    ax.legend(loc="best", fontsize=FONT_LEGEND)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 def plot_latent_changepoints_with_raw(
     latent_mean: np.ndarray,

@@ -630,6 +630,122 @@ def plot_latent_trajectory_3d_interactive(
     return fig
 
 
+def plot_kld_trajectory_3d_interactive(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    color_by_time: bool = True,
+    point_size: int = 5,
+    line_width: int = 2,
+) -> Optional[go.Figure]:
+    """
+    Create an interactive 3D KLD trajectory plot using Plotly.
+
+    Args:
+        trajectory: Array of shape (T, 3) with columns [kld, kld_velocity, kld_accel].
+        output_path: Path to save HTML file.
+        sample_id: Sample identifier for the title.
+        color_by_time: Whether to color points by time progression.
+        point_size: Size of trajectory points.
+        line_width: Width of trajectory line.
+    """
+    _check_plotly()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+
+    if trajectory.shape[1] < 3:
+        return None
+
+    time_steps = trajectory.shape[0]
+
+    if color_by_time:
+        main_trace = go.Scatter3d(
+            x=trajectory[:, 0],
+            y=trajectory[:, 1],
+            z=trajectory[:, 2],
+            mode="markers+lines",
+            marker=dict(
+                size=point_size,
+                color=np.arange(time_steps),
+                colorscale="Cividis",
+                showscale=True,
+                colorbar=dict(
+                    title="Time Step",
+                    x=1.05,
+                    xanchor="left",
+                    thickness=15,
+                    len=0.7,
+                ),
+            ),
+            line=dict(color="rgba(100, 100, 100, 0.5)", width=line_width),
+            text=[f"Time: {i}" for i in range(time_steps)],
+            hovertemplate="Time: %{text}<br>KLD: %{x:.4f}<br>dKLD: %{y:.4f}<br>ddKLD: %{z:.4f}<extra></extra>",
+            name="KLD Trajectory",
+            showlegend=True,
+        )
+    else:
+        main_trace = go.Scatter3d(
+            x=trajectory[:, 0],
+            y=trajectory[:, 1],
+            z=trajectory[:, 2],
+            mode="markers+lines",
+            marker=dict(size=point_size, color="#3F72AF"),
+            line=dict(color="#3F72AF", width=line_width),
+            text=[f"Time: {i}" for i in range(time_steps)],
+            hovertemplate="Time: %{text}<br>KLD: %{x:.4f}<br>dKLD: %{y:.4f}<br>ddKLD: %{z:.4f}<extra></extra>",
+            name="KLD Trajectory",
+            showlegend=True,
+        )
+
+    start_trace = go.Scatter3d(
+        x=[trajectory[0, 0]],
+        y=[trajectory[0, 1]],
+        z=[trajectory[0, 2]],
+        mode="markers",
+        marker=dict(size=10, color="#609966", symbol="circle"),
+        name="Start",
+        hovertemplate="START<br>KLD: %{x:.4f}<br>dKLD: %{y:.4f}<br>ddKLD: %{z:.4f}<extra></extra>",
+    )
+
+    end_trace = go.Scatter3d(
+        x=[trajectory[-1, 0]],
+        y=[trajectory[-1, 1]],
+        z=[trajectory[-1, 2]],
+        mode="markers",
+        marker=dict(size=10, color="#EB5B00", symbol="x"),
+        name="End",
+        hovertemplate="END<br>KLD: %{x:.4f}<br>dKLD: %{y:.4f}<br>ddKLD: %{z:.4f}<extra></extra>",
+    )
+
+    fig = go.Figure(data=[main_trace, start_trace, end_trace])
+
+    fig.update_layout(
+        title=dict(
+            text=f"KLD Trajectory 3D - {sample_id}",
+            x=0.5,
+        ),
+        scene=dict(
+            xaxis_title="KLD",
+            yaxis_title="KLD Velocity",
+            zaxis_title="KLD Acceleration",
+            aspectmode="data",
+        ),
+        width=1000,
+        height=800,
+        legend=dict(
+            x=0.02,
+            y=0.98,
+        ),
+    )
+
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    return fig
+
 def plot_fhr_timeline(
     fhr: np.ndarray,
     epoch: np.ndarray,
