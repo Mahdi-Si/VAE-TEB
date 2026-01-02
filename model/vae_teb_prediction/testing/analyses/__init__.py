@@ -12,6 +12,8 @@ Available analyses:
     - run_temporal_accuracy_analysis: Accuracy vs timestep position
     - run_coherence_analysis: FHR reconstruction coherence (optional UP coupling)
     - run_trajectory_analysis: KLD evolution over time before birth
+    - run_reconstruction_analysis: Detailed per-sample diagnostics plots
+    - run_single_prediction_windows: Non-averaged prediction window plots
     - run_all_analyses: Run all analyses with sensible defaults
 
 IMPORTANT: Trajectory analysis works best with a GUID-based DataLoader where
@@ -45,6 +47,10 @@ from model.vae_teb_prediction.testing.analyses.latent import (
 from model.vae_teb_prediction.testing.analyses.temporal import run_temporal_accuracy_analysis, run_within_window_analysis
 from model.vae_teb_prediction.testing.analyses.coherence import run_coherence_analysis
 from model.vae_teb_prediction.testing.analyses.trajectory import run_trajectory_analysis, TrajectoryAnalyzer
+from model.vae_teb_prediction.testing.analyses.qualitative import (
+    run_reconstruction_analysis,
+    run_single_prediction_windows,
+)
 
 
 def run_all_analyses(
@@ -182,6 +188,8 @@ __all__ = [
     "run_coherence_analysis",
     "run_trajectory_analysis",
     "TrajectoryAnalyzer",
+    "run_reconstruction_analysis",
+    "run_single_prediction_windows",
     # Combined
     "run_all_analyses",
 ]

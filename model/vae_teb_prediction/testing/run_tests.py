@@ -37,6 +37,8 @@ from model.vae_teb_prediction.testing.analyses import (
     run_within_window_analysis,
     run_coherence_analysis,
     run_trajectory_analysis,
+    run_reconstruction_analysis,
+    run_single_prediction_windows,
 )
 from model.vae_teb_prediction.testing.collectors import collect_predictions
 from model.vae_teb_prediction.testing.visualizers import plot_reconstruction_sample
@@ -63,6 +65,12 @@ def run_full_test_pipeline(
     skip_trajectory: bool = False,
     skip_coherence: bool = False,
     skip_interactive: bool = False,
+    analysis_samples: int = 5,
+    analysis_beta: float = 1.0,
+    single_prediction_samples: int = 5,
+    single_prediction_start_index: int = 20,
+    single_prediction_step_size: Optional[int] = None,
+    single_prediction_windows_per_sample: int = 4,
     min_epochs_per_guid: int = 10,
     max_guids: Optional[int] = None,
     config_path: Optional[Union[str, Path]] = None,
@@ -94,6 +102,12 @@ def run_full_test_pipeline(
         skip_trajectory: Skip trajectory analysis (faster).
         skip_coherence: Skip coherence analysis (faster).
         skip_interactive: Skip Plotly interactive plots.
+        analysis_samples: Number of samples for detailed reconstruction plots.
+        analysis_beta: Beta value for loss annotation in reconstruction plots.
+        single_prediction_samples: Number of samples for single-window plots.
+        single_prediction_start_index: First prediction index for window plots.
+        single_prediction_step_size: Optional step size between windows.
+        single_prediction_windows_per_sample: Windows per sample for window plots.
         min_epochs_per_guid: Minimum epochs per patient for trajectory analysis.
         max_guids: Maximum patients for trajectory analysis (None for all).
         config_path: Optional path to a YAML config matching trainer.py.
@@ -248,7 +262,28 @@ def run_full_test_pipeline(
         if not skip_interactive:
             plot_reconstruction_interactive(sample, samples_dir / f"sample_{i}.html")
 
-    # ----- Step 5: Interactive metrics comparison -----
+    # ----- Step 5: Detailed reconstruction + single-window plots -----
+    if analysis_samples > 0:
+        logger.info("Generating detailed reconstruction analysis plots...")
+        results["analysis"] = run_reconstruction_analysis(
+            runner,
+            standard_loader,
+            max_samples=min(analysis_samples, max_samples or analysis_samples),
+            beta=analysis_beta,
+        )
+
+    if single_prediction_samples > 0:
+        logger.info("Generating single prediction window plots...")
+        results["single_prediction_windows"] = run_single_prediction_windows(
+            runner,
+            standard_loader,
+            max_samples=min(single_prediction_samples, max_samples or single_prediction_samples),
+            start_index=single_prediction_start_index,
+            step_size=single_prediction_step_size,
+            windows_per_sample=single_prediction_windows_per_sample,
+        )
+
+    # ----- Step 6: Interactive metrics comparison -----
     if not skip_interactive and "histogram" in results:
         logger.info("Generating interactive metrics comparison...")
         plot_metrics_comparison_interactive(
@@ -256,7 +291,7 @@ def run_full_test_pipeline(
             output_dir / "metrics_comparison.html",
         )
 
-    # ----- Step 6: Save summary -----
+    # ----- Step 7: Save summary -----
     _save_summary(results, output_dir)
 
     logger.info(f"Testing complete! Results saved to {output_dir}")
@@ -527,6 +562,8 @@ def quick_test(
         skip_trajectory=True,
         skip_coherence=True,
         skip_interactive=True,
+        analysis_samples=0,
+        single_prediction_samples=0,
         config_path=config_path,
         num_workers=num_workers,
         normalize_fields=normalize_fields,
@@ -559,7 +596,7 @@ if __name__ == "__main__":
         df = results["histogram"]
         print(f"\n=== Test Results ===")
         print(f"Samples: {len(df)}")
-        print(f"VAF: {df['vaf'].mean():.4f} ± {df['vaf'].std():.4f}")
+        print(f"VAF: {df['vaf'].mean():.4f} +/- {df['vaf'].std():.4f}")
         print(f"MSE: {df['mse'].mean():.6f}")
         print(f"SNR: {df['snr'].mean():.2f} dB")
         print(f"KLD: {df['kld'].mean():.6f}")
