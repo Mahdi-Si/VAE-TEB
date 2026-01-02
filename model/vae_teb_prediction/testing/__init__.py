@@ -45,11 +45,15 @@ from model.vae_teb_prediction.testing.collectors import (
 from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_analysis,
     plot_coherence_signals,
+    plot_cross_correlation,
     plot_kld_trajectory,
     plot_latent_distributions,
     plot_metric_histograms,
+    plot_psd_comparison,
+    plot_reconstruction_coherence,
     plot_reconstruction_sample,
     plot_temporal_accuracy,
+    plot_within_window_accuracy,
     plot_time_frequency_coherence,
 )
 
@@ -99,7 +103,11 @@ __all__ = [
     "plot_kld_trajectory",
     "plot_coherence_analysis",
     "plot_coherence_signals",
+    "plot_reconstruction_coherence",
+    "plot_psd_comparison",
+    "plot_cross_correlation",
     "plot_time_frequency_coherence",
+    "plot_within_window_accuracy",
     # Interactive visualizers
     "plot_reconstruction_interactive",
     "plot_kld_trajectory_interactive",

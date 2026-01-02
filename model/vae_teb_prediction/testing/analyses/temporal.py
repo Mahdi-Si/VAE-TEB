@@ -20,7 +20,7 @@ from loguru import logger
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.metrics import aggregate_predictions, compute_kld_per_timestep, compute_reconstruction_metrics
-from model.vae_teb_prediction.testing.visualizers import plot_temporal_accuracy
+from model.vae_teb_prediction.testing.visualizers import plot_temporal_accuracy, plot_within_window_accuracy
 
 
 def run_temporal_accuracy_analysis(
@@ -227,5 +227,8 @@ def run_within_window_analysis(
         agg.columns = ["window_position", "mae_mean", "mae_std"]
 
         logger.info(f"Within-window analysis: collected {len(df)} position measurements")
+
+        output_dir = runner.ensure_dir("temporal_accuracy")
+        plot_within_window_accuracy(agg, output_dir)
 
     return df
