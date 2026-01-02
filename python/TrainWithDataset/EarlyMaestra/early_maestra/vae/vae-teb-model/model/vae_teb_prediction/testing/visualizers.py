@@ -149,6 +149,44 @@ def _add_colorbar(
     return cbar
 
 
+def _tighten_xaxis(ax: plt.Axes, x_vals: np.ndarray) -> None:
+    """Remove extra horizontal padding so traces align to axis edges."""
+    if x_vals is None or len(x_vals) == 0:
+        return
+    finite = np.asarray(x_vals)[np.isfinite(x_vals)]
+    if finite.size == 0:
+        return
+    ax.set_xlim(float(np.min(finite)), float(np.max(finite)))
+    ax.margins(x=0.0)
+
+
+def _set_ylim_from_data(
+    ax: plt.Axes,
+    y_vals: np.ndarray,
+    *,
+    pad_frac: float = 0.05,
+    min_zero: bool = False,
+    clamp: Optional[Tuple[float, float]] = None,
+) -> None:
+    """Set y-limits based on data with minimal padding."""
+    if y_vals is None:
+        return
+    finite = np.asarray(y_vals)[np.isfinite(y_vals)]
+    if finite.size == 0:
+        return
+    y_min = float(np.min(finite))
+    y_max = float(np.max(finite))
+    if min_zero:
+        y_min = 0.0
+    span = max(y_max - y_min, 1e-12)
+    y_min -= span * pad_frac
+    y_max += span * pad_frac
+    if clamp is not None:
+        y_min = max(clamp[0], y_min)
+        y_max = min(clamp[1], y_max)
+    ax.set_ylim(y_min, y_max)
+
+
 def _format_stats_box(n: int, mean: float, std: float, median: float, **kwargs) -> str:
     """
     Create a formatted statistics text box string.
@@ -196,9 +234,9 @@ def plot_metric_histograms(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use appropriate figure size for journal (double-column width)
-    fig, axes = plt.subplots(2, 2, figsize=(7.0, 6.0))
-    axes = axes.flatten()
+    # Single-column layout with wider panels
+    fig, axes = plt.subplots(4, 1, figsize=(6.5, 8.5))
+    axes = np.atleast_1d(axes)
 
     # Define metrics and their properties
     metrics_config = [
@@ -230,19 +268,19 @@ def plot_metric_histograms(
         sem = scipy_stats.sem(values)
         ci95 = scipy_stats.t.interval(0.95, len(values) - 1, loc=mean_val, scale=sem)
 
-        # Plot histogram with better binning
-        n_bins = min(50, max(20, int(np.sqrt(len(values)))))
+        # Plot histogram with finer binning
+        n_bins = min(120, max(40, int(np.sqrt(len(values)) * 2)))
         counts, bins, patches = ax.hist(
             values, bins=n_bins, density=True,
             color=color, alpha=0.7, edgecolor="#000000",
             linewidth=0.5
         )
 
-        # Add reference lines - thin and clean
-        ax.axvline(mean_val, color=COLOR_BLACK, linewidth=0.9,
-                  alpha=0.8, label="Mean")
-        ax.axvline(median_val, color=COLOR_GRAY, linewidth=0.7,
-                  alpha=0.8, label="Median")
+        # Add reference lines with distinct colors and dashed styles
+        ax.axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9,
+                   linestyle="--", alpha=0.9, label="Mean")
+        ax.axvline(median_val, color=COLOR_PURPLE, linewidth=0.8,
+                   linestyle="-.", alpha=0.9, label="Median")
 
         # Add statistics box with proper formatting
         kwargs = {"ci95": ci95} if add_ci else {}
@@ -261,12 +299,12 @@ def plot_metric_histograms(
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.set_title(title, fontsize=FONT_TITLE, fontweight="bold", pad=8)
         _style_axes(ax, grid="major", minor_ticks=False)
+        _tighten_xaxis(ax, values)
 
-        # Add subtle legend only to first panel
-        if ax == axes[0]:
-            ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.9)
+        # Add legend to each panel for clarity
+        ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.9)
 
-    fig.tight_layout(pad=1.5)
+    fig.tight_layout(pad=0.8)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -300,8 +338,8 @@ def plot_latent_distributions(
     cols = 4
     rows = math.ceil(latent_dim / cols)
 
-    fig_width = 7.0 if cols >= 3 else 3.5
-    fig_height = 2.0 * rows
+    fig_width = 6.5 if cols >= 3 else 4.5
+    fig_height = 2.2 * rows
     fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
     axes = np.atleast_2d(axes).reshape(-1)  # Flatten for easier indexing
 
@@ -317,17 +355,18 @@ def plot_latent_distributions(
                 mean_val = float(np.mean(values))
                 std_val = float(np.std(values, ddof=1))
 
-                # Normalized histogram - clean and simple
-                n_bins = min(40, max(15, int(np.sqrt(len(values)))))
+                # Normalized histogram with finer binning
+                n_bins = min(100, max(30, int(np.sqrt(len(values)) * 2)))
                 ax.hist(values, bins=n_bins, density=True,
                        color=COLOR_BLUE, alpha=0.7, edgecolor="#000000",
                        linewidth=0.3)
 
-                # Reference lines - thin and minimal
-                ax.axvline(mean_val, color=COLOR_BLACK, linewidth=0.7,
-                          alpha=0.7)
-                ax.axvline(0.0, color=COLOR_LIGHT_GRAY, linewidth=0.5,
-                          alpha=0.6)
+                # Reference lines with distinct colors and dashed styles
+                median_val = float(np.median(values))
+                ax.axvline(mean_val, color=COLOR_ORANGE, linewidth=0.7,
+                           linestyle="--", alpha=0.8)
+                ax.axvline(median_val, color=COLOR_PURPLE, linewidth=0.7,
+                           linestyle="-.", alpha=0.8)
 
                 # Styling
                 ax.set_title(f"$z_{{{idx}}}$", fontsize=FONT_LABEL, fontweight="bold")
@@ -336,6 +375,7 @@ def plot_latent_distributions(
                 ax.tick_params(axis='both', which='major', labelsize=FONT_TICK)
 
                 _style_axes(ax, grid="major", minor_ticks=False)
+                _tighten_xaxis(ax, values)
         else:
             ax.axis("off")
 
@@ -382,7 +422,7 @@ def plot_reconstruction_sample(
     # Compute correlation coefficient
     corr_coef, p_value = scipy_stats.pearsonr(y_true, y_pred)
 
-    fig, axes = plt.subplots(3, 1, figsize=(7.0, 7.0),
+    fig, axes = plt.subplots(3, 1, figsize=(6.5, 6.5),
                             gridspec_kw={"height_ratios": [2.5, 1, 1.5]})
 
     # ----- Panel 1: Signal with prediction -----
@@ -426,7 +466,7 @@ def plot_reconstruction_sample(
         fontsize=FONT_TITLE, fontweight="bold", pad=8
     )
     ax1.legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
-    ax1.set_xlim(0, time[-1])
+    _tighten_xaxis(ax1, time)
     _style_axes(ax1, grid="both", minor_ticks=True)
 
     # ----- Panel 2: Residual -----
@@ -449,7 +489,7 @@ def plot_reconstruction_sample(
 
     ax2.set_xlabel("")
     ax2.set_ylabel("Residual", fontsize=FONT_LABEL)
-    ax2.set_xlim(0, time[-1])
+    _tighten_xaxis(ax2, time)
     _style_axes(ax2, grid="major", minor_ticks=False)
 
     # ----- Panel 3: Latent heatmap -----
@@ -470,12 +510,13 @@ def plot_reconstruction_sample(
 
         _add_colorbar(fig, im, ax3, label="Value", shrink=0.8, pad=0.02)
         _style_axes(ax3, grid="major", minor_ticks=False)
+        _tighten_xaxis(ax3, time)
     else:
         ax3.text(0.5, 0.5, "No latent data available",
                 ha="center", va="center", fontsize=FONT_LABEL)
         ax3.axis("off")
 
-    fig.tight_layout(pad=1.0)
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -516,7 +557,7 @@ def plot_temporal_accuracy(
                   "snr_mean", "snr_std", "snr_sem"]
 
     # Use wider figure for better visibility
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.0, 4.5), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.5, 4.6), sharex=True)
 
     # ----- VAF plot -----
     marker_every = max(1, len(agg) // 20)
@@ -543,8 +584,14 @@ def plot_temporal_accuracy(
     ax1.set_title("Reconstruction Quality vs. Timestep",
                  fontsize=FONT_TITLE, fontweight="bold", pad=8)
     ax1.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
-    ax1.set_ylim(0, 1.05)
+    _set_ylim_from_data(
+        ax1,
+        np.concatenate([agg["vaf_mean"].values, (agg["vaf_mean"] + agg["vaf_std"]).values]),
+        min_zero=True,
+        clamp=(0.0, 1.0),
+    )
     _style_axes(ax1, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax1, agg["timestep"].values)
 
     # ----- SNR plot -----
     ax2.plot(
@@ -568,8 +615,14 @@ def plot_temporal_accuracy(
     ax2.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=FONT_LABEL)
     ax2.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax2, grid="both", minor_ticks=True)
+    _set_ylim_from_data(
+        ax2,
+        np.concatenate([agg["snr_mean"].values, (agg["snr_mean"] + agg["snr_std"]).values]),
+        pad_frac=0.05,
+    )
+    _tighten_xaxis(ax2, agg["timestep"].values)
 
-    fig.tight_layout(pad=1.0)
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -617,7 +670,7 @@ def plot_within_window_accuracy(
     fig, axes = plt.subplots(
         n_panels,
         1,
-        figsize=(3.5, 2.4 * n_panels),
+        figsize=(6.5, 2.4 * n_panels),
         sharex=True,
     )
     if n_panels == 1:
@@ -644,7 +697,12 @@ def plot_within_window_accuracy(
 
     axes[0].set_ylabel("Absolute error", fontsize=FONT_LABEL)
     axes[0].set_title("Within-Window Accuracy", fontsize=FONT_TITLE, fontweight="bold", pad=6)
-    axes[0].set_ylim(bottom=0.0)
+    _set_ylim_from_data(
+        axes[0],
+        np.concatenate([agg["mae_mean"].values, (agg["mae_mean"] + agg["mae_std"]).values]),
+        min_zero=True,
+        pad_frac=0.05,
+    )
     axes[0].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(axes[0], grid="both", minor_ticks=True)
 
@@ -665,7 +723,12 @@ def plot_within_window_accuracy(
             label="VAF",
         )
         axes[panel_idx].set_ylabel("VAF", fontsize=FONT_LABEL)
-        axes[panel_idx].set_ylim(0.0, 1.0)
+        _set_ylim_from_data(
+            axes[panel_idx],
+            agg["vaf_mean"].values,
+            min_zero=True,
+            clamp=(0.0, 1.0),
+        )
         axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
         panel_idx += 1
@@ -684,11 +747,17 @@ def plot_within_window_accuracy(
         axes[panel_idx].set_ylabel("SNR (dB)", fontsize=FONT_LABEL)
         axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
+        _set_ylim_from_data(
+            axes[panel_idx],
+            agg["snr_mean"].values,
+            pad_frac=0.05,
+        )
 
     axes[-1].set_xlabel("Index from window start (samples)", fontsize=FONT_LABEL)
     axes[-1].set_xlim(0, np.max(x) if len(x) else 1)
+    _tighten_xaxis(axes[-1], x)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -717,7 +786,7 @@ def plot_kld_trajectory(
     if df.empty or "hours_before" not in df.columns:
         return
 
-    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+    fig, ax = plt.subplots(figsize=(6.5, 3.2))
 
     # Check if we have class labels
     has_labels = "label" in df.columns and df["label"].notna().any()
@@ -778,6 +847,7 @@ def plot_kld_trajectory(
     ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
     ax.set_ylabel("KLD (Transfer Entropy)", fontsize=FONT_LABEL)
     ax.set_title("Transfer Entropy Evolution Before Delivery", fontsize=FONT_TITLE, fontweight="bold", pad=6)
+    _tighten_xaxis(ax, agg["hour_bin"].values)
     ax.invert_xaxis()  # Time flows right-to-left toward birth
     if has_labels:
         ax.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.95)
@@ -830,8 +900,9 @@ def plot_coherence_analysis(
     ax.set_ylim(0, 1)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, frequencies)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -856,7 +927,7 @@ def plot_reconstruction_coherence(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+    fig, ax = plt.subplots(figsize=(6.5, 3.2))
     ax.plot(frequencies, coherence_mean, color=COLOR_BLUE, linewidth=0.5, label="FHR vs Reconstructed FHR")
     ax.fill_between(
         frequencies,
@@ -874,8 +945,9 @@ def plot_reconstruction_coherence(
     ax.set_ylim(0, 1)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, frequencies)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -909,7 +981,7 @@ def plot_psd_comparison(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+    fig, ax = plt.subplots(figsize=(6.5, 3.2))
 
     def _to_db(x: np.ndarray) -> np.ndarray:
         return 10.0 * np.log10(np.maximum(x, 1e-12))
@@ -963,8 +1035,9 @@ def plot_psd_comparison(
     ax.set_xlim(0, max_freq)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
     _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, frequencies)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -992,7 +1065,7 @@ def plot_cross_correlation(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+    fig, ax = plt.subplots(figsize=(6.5, 3.0))
 
     # Plot main curve with clean styling
     ax.plot(lags_sec, corr_mean, color=COLOR_PURPLE, linewidth=0.5,
@@ -1028,8 +1101,9 @@ def plot_cross_correlation(
     ax.set_title("Cross-Correlation Analysis", fontsize=FONT_TITLE, fontweight="bold", pad=6)
     ax.legend(fontsize=FONT_LEGEND, framealpha=0.95, loc="best")
     _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, lags_sec)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1067,7 +1141,7 @@ def plot_coherence_signals(
     time_min = np.arange(min_len) / fs / 60.0
 
     if up_signal is None:
-        fig, axes = plt.subplots(2, 1, figsize=(7.0, 4.2), sharex=True)
+        fig, axes = plt.subplots(2, 1, figsize=(6.5, 4.0), sharex=True)
         axes[0].plot(time_min, fhr_original, color=COLOR_BLUE, linewidth=0.6, label="Original FHR")
         axes[0].plot(
             time_min,
@@ -1087,8 +1161,10 @@ def plot_coherence_signals(
         axes[1].set_ylabel("Residual", fontsize=FONT_LABEL)
         _style_axes(axes[0], grid="both", minor_ticks=True)
         _style_axes(axes[1], grid="major", minor_ticks=False)
+        _tighten_xaxis(axes[0], time_min)
+        _tighten_xaxis(axes[1], time_min)
     else:
-        fig, axes = plt.subplots(3, 1, figsize=(7.0, 5.5), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(6.5, 5.2), sharex=True)
         axes[0].plot(time_min, up_signal, color=COLOR_PURPLE, linewidth=0.5)
         axes[0].set_ylabel("UP (normalized)", fontsize=FONT_LABEL)
         axes[0].set_title(title or "UP and FHR Signals", fontsize=FONT_TITLE, fontweight="bold", pad=6)
@@ -1112,8 +1188,11 @@ def plot_coherence_signals(
         _style_axes(axes[0], grid="both", minor_ticks=True)
         _style_axes(axes[1], grid="both", minor_ticks=True)
         _style_axes(axes[2], grid="major", minor_ticks=False)
+        _tighten_xaxis(axes[0], time_min)
+        _tighten_xaxis(axes[1], time_min)
+        _tighten_xaxis(axes[2], time_min)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1152,7 +1231,7 @@ def plot_time_frequency_coherence(
     time_min = times / 60.0
 
     if coherence_reconstructed is None:
-        fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.0))
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.2))
         im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
         ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
         ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
@@ -1163,7 +1242,8 @@ def plot_time_frequency_coherence(
         if title:
             fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
 
-        fig.tight_layout()
+        _tighten_xaxis(ax, time_min)
+        fig.tight_layout(pad=0.6)
         fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
         return
@@ -1171,7 +1251,7 @@ def plot_time_frequency_coherence(
     coh_recon = coherence_reconstructed[freq_mask, :]
     coh_diff = coh_recon - coh_orig
 
-    fig, axes = plt.subplots(3, 1, figsize=(7.0, 6.0), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(6.5, 6.0), sharex=True)
 
     im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
     axes[0].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
@@ -1191,11 +1271,12 @@ def plot_time_frequency_coherence(
 
     for ax in axes:
         _style_axes(ax, grid="major")
+        _tighten_xaxis(ax, time_min)
 
     if title:
         fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
