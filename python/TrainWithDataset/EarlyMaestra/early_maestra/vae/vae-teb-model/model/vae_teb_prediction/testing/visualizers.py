@@ -529,7 +529,7 @@ def plot_reconstruction_sample(
         # Use symmetric colormap centered at zero
         vmax = np.abs(latent).max()
         im = ax3.imshow(
-            latent.T, aspect="auto", cmap="Greys",
+            latent.T, aspect="auto", cmap="bwr",
             extent=[0, time[-1] * 60 * fs, latent.shape[1] - 0.5, -0.5],
             interpolation="nearest",
             vmin=-vmax, vmax=vmax,
@@ -1720,7 +1720,7 @@ def plot_latent_changepoints_with_raw(
     output_path: Path,
     *,
     sample_id: str = "sample",
-    cmap: str = "Greys",
+    cmap: str = "bwr",
     decimation_factor: int = 16,
 ) -> None:
     """
