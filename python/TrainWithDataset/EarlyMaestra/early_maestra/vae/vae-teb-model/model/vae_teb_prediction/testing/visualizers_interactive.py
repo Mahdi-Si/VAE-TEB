@@ -162,6 +162,8 @@ def plot_reconstruction_interactive(
 def plot_kld_trajectory_interactive(
     df: pd.DataFrame,
     output_path: Path,
+    *,
+    by_class: bool = False,
 ) -> None:
     """
     Create an interactive KLD trajectory plot with hover and filtering.
@@ -174,6 +176,7 @@ def plot_kld_trajectory_interactive(
     Args:
         df: DataFrame with 'hours_before', 'kld_mean', 'guid', and optionally 'label'.
         output_path: Path to save the HTML file.
+        by_class: Whether to color/group by class labels (default False).
 
     Example:
         >>> plot_kld_trajectory_interactive(trajectory_df, Path("results/kld.html"))
@@ -187,7 +190,7 @@ def plot_kld_trajectory_interactive(
         return
 
     # Prepare data
-    has_labels = "label" in df.columns and df["label"].notna().any()
+    has_labels = by_class and "label" in df.columns and df["label"].notna().any()
 
     if has_labels:
         # Map labels to names

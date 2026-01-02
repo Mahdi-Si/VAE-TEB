@@ -400,13 +400,15 @@ def collect_kld_trajectory(
                 latent_vals = latent[idx].cpu().numpy() if latent is not None else None
 
                 for t in range(T):
+                    if not np.isfinite(kld_vals[t]):
+                        continue
                     record = {
                         "guid": guid,
                         "epoch": epoch,
                         "hours_before": hours_before,
                         "label": label,
                         "timestep": t,
-                        "kld_mean": float(kld_vals[t]) if np.isfinite(kld_vals[t]) else np.nan,
+                        "kld_mean": float(kld_vals[t]),
                     }
 
                     # Add individual latent dimensions
