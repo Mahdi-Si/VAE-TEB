@@ -4,6 +4,73 @@ import numpy as np
 import os
 from typing import Any, Dict, List, Optional
 
+# Publication-style defaults aligned with testing/visualizers.py
+COLOR_BLUE = "#0173B2"
+COLOR_ORANGE = "#DE8F05"
+COLOR_GREEN = "#029E73"
+COLOR_SKY = "#56B4E9"
+COLOR_PURPLE = "#CC78BC"
+COLOR_GRAY = "#555555"
+COLOR_BLACK = "#000000"
+SAVE_DPI = 600
+
+
+def _apply_publication_style() -> None:
+    plt.style.use("default")
+    plt.rcParams.update({
+        "figure.dpi": 150,
+        "savefig.dpi": SAVE_DPI,
+        "savefig.format": "png",
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.05,
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "DejaVu Sans", "Helvetica", "Liberation Sans"],
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+        "legend.title_fontsize": 7,
+        "axes.linewidth": 0.6,
+        "axes.edgecolor": COLOR_BLACK,
+        "axes.labelcolor": COLOR_BLACK,
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+        "axes.spines.left": True,
+        "axes.spines.bottom": True,
+        "axes.axisbelow": True,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 3.0,
+        "ytick.major.size": 3.0,
+        "xtick.minor.size": 1.5,
+        "ytick.minor.size": 1.5,
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
+        "xtick.minor.width": 0.3,
+        "ytick.minor.width": 0.3,
+        "xtick.color": COLOR_BLACK,
+        "ytick.color": COLOR_BLACK,
+        "grid.alpha": 0.25,
+        "grid.linewidth": 0.3,
+        "grid.color": "#E0E0E0",
+        "grid.linestyle": "-",
+        "legend.frameon": True,
+        "legend.framealpha": 0.95,
+        "legend.fancybox": False,
+        "legend.edgecolor": COLOR_BLACK,
+        "legend.shadow": False,
+        "lines.linewidth": 1.0,
+        "lines.markersize": 3,
+        "lines.markeredgewidth": 0.0,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "errorbar.capsize": 3,
+        "mathtext.default": "regular",
+    })
+
 def plot_model_analysis(
     output_dir: str,
     raw_fhr: np.ndarray = None,
@@ -14,7 +81,7 @@ def plot_model_analysis(
     latent_z: np.ndarray = None,
     reconstructed_fhr_mu: np.ndarray = None,
     reconstructed_fhr_logvar: np.ndarray = None,
-    kld_tensor: np.ndarray = None,  # Shape: (D, T) - latent dims × time, with warmup masked as NaN
+    kld_tensor: np.ndarray = None,  # Shape: (D, T) - latent dims x time, with warmup masked as NaN
     kld_mean_over_channels: np.ndarray = None,  # Shape: (T,) - mean over latent dims, warmup preserved as NaN
     batch_idx: int = 0,
     # New parameters for training callback
@@ -74,40 +141,16 @@ def plot_model_analysis(
         raw_up_normalized (np.ndarray): Normalized UP signal (if needed). Shape: (N,).
     """
     
-    # Professional scientific paper color palette
+    _apply_publication_style()
     colors = {
-        'fhr': "#055C9A",
-        'up': "#0DD8A2",
-        'gt': '#456882',
-        'recon': '#BB3E00',
-        'uncertainty': '#F7AD45',
-        'kld': '#D95319',
-        'background': '#F9F3EF'
+        "fhr": COLOR_BLUE,
+        "up": COLOR_GREEN,
+        "gt": COLOR_BLUE,
+        "recon": COLOR_ORANGE,
+        "uncertainty": COLOR_SKY,
+        "kld": COLOR_PURPLE,
+        "background": "white",
     }
-
-    plt.style.use('default')
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-        'font.size': 11,
-        'axes.titlesize': 12,
-        'axes.labelsize': 11,
-        'axes.linewidth': 0.7,
-        'axes.edgecolor': "#9E9D9D",
-        'axes.facecolor': colors['background'],
-        'grid.color': "#838383",
-        'grid.linewidth': 0.4,
-        'grid.alpha': 0.6,
-        'legend.frameon': True,
-        'legend.fancybox': False,
-        'legend.shadow': False,
-        'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
-        'legend.facecolor': colors['background'],
-        'figure.facecolor': 'white',
-        'savefig.facecolor': 'white',
-        'savefig.dpi': 300
-    })
 
     if training_mode:
         # Training callback mode: 4 rows, 2 columns (main plot + colorbar) like PlottingCallBack
@@ -203,7 +246,7 @@ def plot_model_analysis(
             # Add uncertainty visualization using log_var_means
             std_dev = np.exp(0.5 * log_var_means)  # Convert log variance to standard deviation
             ax[1, 0].fill_between(t_raw_norm, mu_pr_means - std_dev, mu_pr_means + std_dev, 
-                                alpha=0.3, color=colors['uncertainty'], label='Uncertainty (±1σ)', zorder=1)
+                                alpha=0.3, color=colors['uncertainty'], label='Uncertainty (+/-1SD)', zorder=1)
             
             ax[1, 0].set_title('FHR Reconstruction with Uncertainty', fontweight='normal', pad=12)
             ax[1, 0].set_ylabel('FHR (bpm)', fontweight='normal')
@@ -308,7 +351,7 @@ def plot_model_analysis(
                            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # Set overall title with scientific paper styling
-        fig.suptitle(f'Model Performance Analysis — Epoch {epoch}', 
+        fig.suptitle(f'Model Performance Analysis - Epoch {epoch}', 
                     fontsize=14, fontweight='normal', y=0.97, color='#456882')
         save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.pdf')
         
@@ -380,7 +423,7 @@ def plot_model_analysis(
         std_dev = np.exp(0.5 * reconstructed_fhr_logvar)
         ax[1].fill_between(
             t_raw, reconstructed_fhr_mu - std_dev, reconstructed_fhr_mu + std_dev,
-            color=colors['uncertainty'], alpha=0.4, label='Uncertainty (±1σ)')
+            color=colors['uncertainty'], alpha=0.4, label='Uncertainty (+/-1SD)')
         ax[1].set_title('FHR Reconstruction (Normalized Space)')
         ax[1].set_xlabel('Time (s)')
         ax[1].set_ylabel('Normalized Amplitude')
@@ -456,24 +499,24 @@ def plot_model_analysis(
             if ph_auto is not None and ph_auto.size > 0:
                 im_ph_auto = ax[next_idx].imshow(ph_auto, aspect='auto', cmap='bwr', origin='upper')
                 ax[next_idx].grid(False)
-                ax[next_idx].set_title('FHR Phase Harmonics — Autocorr (same freq)')
+                ax[next_idx].set_title('FHR Phase Harmonics - Autocorr (same freq)')
                 ax[next_idx].set_xlabel('Time Steps')
                 ax[next_idx].set_ylabel('Channels')
                 fig.colorbar(im_ph_auto, ax=ax[next_idx])
             else:
-                ax[next_idx].set_title('FHR Phase Harmonics — Autocorr (none)')
+                ax[next_idx].set_title('FHR Phase Harmonics - Autocorr (none)')
                 ax[next_idx].set_axis_off()
             next_idx += 1
             # Cross
             if ph_cross is not None and ph_cross.size > 0:
                 im_ph_cross = ax[next_idx].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper')
                 ax[next_idx].grid(False)
-                ax[next_idx].set_title('FHR Phase Harmonics — Cross (different freq)')
+                ax[next_idx].set_title('FHR Phase Harmonics - Cross (different freq)')
                 ax[next_idx].set_xlabel('Time Steps')
                 ax[next_idx].set_ylabel('Channels')
                 fig.colorbar(im_ph_cross, ax=ax[next_idx])
             else:
-                ax[next_idx].set_title('FHR Phase Harmonics — Cross (none)')
+                ax[next_idx].set_title('FHR Phase Harmonics - Cross (none)')
                 ax[next_idx].set_axis_off()
             next_idx += 1
         else:
@@ -492,29 +535,29 @@ def plot_model_analysis(
             if cp_auto is not None and cp_auto.size > 0:
                 im_cp_auto = ax[next_idx].imshow(cp_auto, aspect='auto', cmap='bwr', origin='upper')
                 ax[next_idx].grid(False)
-                ax[next_idx].set_title('UP→FHR Cross-Phase — Autocorr (same filter)')
+                ax[next_idx].set_title('UP->FHR Cross-Phase - Autocorr (same filter)')
                 ax[next_idx].set_xlabel('Time Steps')
                 ax[next_idx].set_ylabel('Channels')
                 fig.colorbar(im_cp_auto, ax=ax[next_idx])
             else:
-                ax[next_idx].set_title('UP→FHR Cross-Phase — Autocorr (none)')
+                ax[next_idx].set_title('UP->FHR Cross-Phase - Autocorr (none)')
                 ax[next_idx].set_axis_off()
             next_idx += 1
             if cp_cross is not None and cp_cross.size > 0:
                 im_cp_cross = ax[next_idx].imshow(cp_cross, aspect='auto', cmap='bwr', origin='upper')
                 ax[next_idx].grid(False)
-                ax[next_idx].set_title('UP→FHR Cross-Phase — Cross (different filters)')
+                ax[next_idx].set_title('UP->FHR Cross-Phase - Cross (different filters)')
                 ax[next_idx].set_xlabel('Time Steps')
                 ax[next_idx].set_ylabel('Channels')
                 fig.colorbar(im_cp_cross, ax=ax[next_idx])
             else:
-                ax[next_idx].set_title('UP→FHR Cross-Phase — Cross (none)')
+                ax[next_idx].set_title('UP->FHR Cross-Phase - Cross (none)')
                 ax[next_idx].set_axis_off()
             next_idx += 1
         else:
             im_up_ph = ax[next_idx].imshow(fhr_up_ph, aspect='auto', cmap='bwr', origin='upper')
             ax[next_idx].grid(False)
-            ax[next_idx].set_title('UP→FHR Cross-Phase Harmonics (fhr_up_ph)')
+            ax[next_idx].set_title('UP->FHR Cross-Phase Harmonics (fhr_up_ph)')
             ax[next_idx].set_xlabel('Time Steps')
             ax[next_idx].set_ylabel('Channels')
             fig.colorbar(im_up_ph, ax=ax[next_idx])
@@ -526,7 +569,7 @@ def plot_model_analysis(
     # Save and close (common for both modes)
     if training_mode:
         # Save plot as PDF with high quality - matching PlottingCallBack
-        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=300, facecolor='white', edgecolor='none')
+        plt.savefig(save_path, bbox_inches='tight', orientation='landscape', dpi=SAVE_DPI, facecolor='white', edgecolor='none')
         plt.close(fig)
         
         # Clean up memory like PlottingCallBack
@@ -549,7 +592,7 @@ def plot_model_analysis(
             del latent_z
         gc.collect()
     else:
-        plt.savefig(save_path, bbox_inches='tight')
+        plt.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI)
         plt.close(fig)
 
     print(f"Analysis plot saved to {save_path}")
@@ -586,21 +629,14 @@ def plot_single_prediction_windows(
     if not windows:
         return
 
+    _apply_publication_style()
     colors = {
-        'fhr': "#055C9A",
-        'gt': '#456882',
-        'recon': '#BB3E00',
-        'uncertainty': '#F7AD45',
-        'background': '#F9F3EF',
+        "fhr": COLOR_BLUE,
+        "gt": COLOR_BLUE,
+        "recon": COLOR_ORANGE,
+        "uncertainty": COLOR_SKY,
+        "background": "white",
     }
-
-    plt.style.use('default')
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-        'axes.edgecolor': "#9E9D9D",
-        'axes.facecolor': colors['background'],
-    })
 
     n_rows = 2 + len(windows)
     fig, axes = plt.subplots(n_rows, 1, figsize=(16, max(6, 3 + 2.3 * len(windows))), constrained_layout=True)
@@ -624,7 +660,7 @@ def plot_single_prediction_windows(
     axes[0].set_xlabel("Time (s)")
     axes[0].legend(loc="upper right", framealpha=0.95)
 
-    title = f"Single Prediction Windows – Sample {sample_idx:03d}"
+    title = f"Single Prediction Windows - Sample {sample_idx:03d}"
     if sample_guid:
         title += f" | GUID {sample_guid}"
     if epoch is not None:
@@ -664,7 +700,7 @@ def plot_single_prediction_windows(
             uncertainty = np.asarray(uncertainty).astype(float)
             lower = prediction - uncertainty
             upper = prediction + uncertainty
-            label = "±1σ" if idx == 0 else None
+            label = "+/-1SD" if idx == 0 else None
             ax.fill_between(
                 t_segment,
                 lower,
@@ -686,7 +722,7 @@ def plot_single_prediction_windows(
         if snr is not None:
             metric_parts.append(f"SNR={snr:.2f} dB")
         metric_text = " | ".join(metric_parts)
-        header = f"Window {idx + 1} — T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
+        header = f"Window {idx + 1} - T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
         if metric_text:
             header += f" | {metric_text}"
         ax.set_title(header, fontweight='normal', pad=10)
@@ -719,12 +755,12 @@ def plot_single_prediction_windows(
                 where=valid,
                 color=colors['uncertainty'],
                 alpha=0.2,
-                label="±1σ (norm)",
+                label="+/-1SD (norm)",
             )
     agg_ax.legend(loc="upper right", framealpha=0.95)
 
     output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.png")
-    fig.savefig(output_path, dpi=300, facecolor='white')
+    fig.savefig(output_path, dpi=SAVE_DPI, facecolor='white')
     plt.close(fig)
 
 def plot_vae_reconstruction(
@@ -764,40 +800,16 @@ def plot_vae_reconstruction(
         loss_dict (dict): Dictionary containing loss values.
     """
     
-    # Professional scientific paper color palette
+    _apply_publication_style()
     colors = {
-        'fhr': "#055C9A",
-        'up': "#0DD8A2",
-        'gt': '#456882',
-        'recon': '#BB3E00',
-        'uncertainty': '#F7AD45',
-        'kld': '#D95319',
-        'background': '#F9F3EF'
+        "fhr": COLOR_BLUE,
+        "up": COLOR_GREEN,
+        "gt": COLOR_BLUE,
+        "recon": COLOR_ORANGE,
+        "uncertainty": COLOR_SKY,
+        "kld": COLOR_PURPLE,
+        "background": "white",
     }
-
-    plt.style.use('default')
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-        'font.size': 11,
-        'axes.titlesize': 12,
-        'axes.labelsize': 11,
-        'axes.linewidth': 0.7,
-        'axes.edgecolor': "#9E9D9D",
-        'axes.facecolor': colors['background'],
-        'grid.color': "#838383",
-        'grid.linewidth': 0.4,
-        'grid.alpha': 0.6,
-        'legend.frameon': True,
-        'legend.fancybox': False,
-        'legend.shadow': False,
-        'legend.framealpha': 0.95,
-        'legend.edgecolor': '#A2B9A7',
-        'legend.facecolor': colors['background'],
-        'figure.facecolor': 'white',
-        'savefig.facecolor': 'white',
-        'savefig.dpi': 300
-    })
 
     split_phase = (phase_auto_indices is not None and phase_cross_indices is not None)
     has_recon_st = (
@@ -1048,15 +1060,15 @@ def plot_vae_reconstruction(
             loss_text = f"Total Loss: {loss_dict['total_loss']:.4f}"
 
     # Set overall title with scientific paper styling
-    title_text = f'VAE Reconstruction Analysis — Sample {batch_idx}'
+    title_text = f'VAE Reconstruction Analysis - Sample {batch_idx}'
     if loss_text:
-        title_text += f" — {loss_text}"
+        title_text += f" - {loss_text}"
     
     fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color='#456882')
     
     # Save plot
     save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.pdf')
-    plt.savefig(save_path, bbox_inches='tight', dpi=300, facecolor='white', edgecolor='none')
+    plt.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI, facecolor='white', edgecolor='none')
     plt.close(fig)
     
     # Clean up memory
@@ -1107,7 +1119,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
-        'savefig.dpi': 300
+        'savefig.dpi': SAVE_DPI
     })
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), constrained_layout=True)
@@ -1147,7 +1159,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     ax1.axvspan(10, 30, alpha=0.1, color='orange', label='Delayed response')
     
     # Zoomed plot around minimum
-    zoom_range = 15  # ±15 seconds around minimum
+    zoom_range = 15  # +/-15 seconds around minimum
     zoom_mask = np.abs(np.array(shifts_seconds) - min_shift) <= zoom_range
     zoom_shifts = np.array(shifts_seconds)[zoom_mask]
     zoom_klds = np.array(kld_values)[zoom_mask]
@@ -1159,7 +1171,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
                  markersize=8, zorder=5)
         ax2.set_xlabel('UP Signal Shift (seconds)', fontweight='normal')
         ax2.set_ylabel('Average Transfer Entropy (KLD)', fontweight='normal')
-        ax2.set_title(f'Zoomed View: ±{zoom_range}s around minimum', fontweight='normal', pad=12)
+        ax2.set_title(f'Zoomed View: +/-{zoom_range}s around minimum', fontweight='normal', pad=12)
         ax2.autoscale(enable=True, axis='x', tight=True)
         
         # Add vertical line at minimum
@@ -1190,7 +1202,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     
     # Save plot
     plot_path = os.path.join(output_dir, 'transfer_entropy_vs_shift.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(plot_path, dpi=SAVE_DPI, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
     
     # Clean up memory
@@ -1242,7 +1254,7 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
-        'savefig.dpi': 300
+        'savefig.dpi': SAVE_DPI
     })
     
     # Create figure with subplots
@@ -1283,11 +1295,11 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
         n, bins, patches = ax.hist(values, bins=50, alpha=0.7, color=color, 
                                  edgecolor='white', linewidth=0.5, density=True)
         
-        # Add vertical lines for mean and ±1std
+        # Add vertical lines for mean and +/-1std
         ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, 
                   label=f'Mean: {mean_val:.4f}')
         ax.axvline(mean_val + std_val, color='red', linestyle=':', linewidth=1.5,
-                  alpha=0.7, label=f'±1σ: {std_val:.4f}')
+                  alpha=0.7, label=f'+/-1SD: {std_val:.4f}')
         ax.axvline(mean_val - std_val, color='red', linestyle=':', linewidth=1.5,
                   alpha=0.7)
         
@@ -1307,7 +1319,7 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
     
     # Save plot
     save_path = os.path.join(output_dir, 'metrics_histograms.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(save_path, dpi=SAVE_DPI, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
     
     # Clean up memory
@@ -1366,7 +1378,7 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
-        'savefig.dpi': 300
+        'savefig.dpi': SAVE_DPI
     })
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
@@ -1407,7 +1419,7 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
         axes[1].set_ylabel('Density')
         axes[1].legend(loc='upper right', framealpha=0.95)
 
-    # 3) KLD mean ± std bars
+    # 3) KLD mean +/- std bars
     if len(kld_with_up) > 0 or len(kld_without_up) > 0:
         means = [np.mean(kld_with_up) if len(kld_with_up) else 0.0,
                  np.mean(kld_without_up) if len(kld_without_up) else 0.0]
@@ -1417,10 +1429,10 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
                     alpha=0.8, edgecolor='white', linewidth=0.5)
         axes[2].set_xticks([0, 1])
         axes[2].set_xticklabels(['with UP', 'ablated'])
-        axes[2].set_title('KLD: Mean ± 1σ')
+        axes[2].set_title('KLD: Mean +/- 1SD')
         axes[2].set_ylabel('KLD')
 
-    # 4) VAF mean ± std bars
+    # 4) VAF mean +/- std bars
     if len(vaf_with_up) > 0 or len(vaf_without_up) > 0:
         means = [np.mean(vaf_with_up) if len(vaf_with_up) else 0.0,
                  np.mean(vaf_without_up) if len(vaf_without_up) else 0.0]
@@ -1430,14 +1442,14 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
                     alpha=0.8, edgecolor='white', linewidth=0.5)
         axes[3].set_xticks([0, 1])
         axes[3].set_xticklabels(['with UP', 'ablated'])
-        axes[3].set_title('VAF: Mean ± 1σ')
+        axes[3].set_title('VAF: Mean +/- 1SD')
         axes[3].set_ylabel('VAF')
 
     fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color='#456882')
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_ablation_results.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(save_path, dpi=SAVE_DPI, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
     # Clean up
     import gc
@@ -1489,7 +1501,7 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
         'legend.facecolor': colors['background'],
         'figure.facecolor': 'white',
         'savefig.facecolor': 'white',
-        'savefig.dpi': 300
+        'savefig.dpi': SAVE_DPI
     })
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
@@ -1526,7 +1538,7 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_gain_sweep.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(save_path, dpi=SAVE_DPI, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
 
     # Clean up
