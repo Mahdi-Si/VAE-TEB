@@ -646,7 +646,7 @@ def plot_single_prediction_windows(
     }
 
     n_rows = 2 + len(windows)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(6.5, max(6, 2.4 * n_rows)), constrained_layout=True)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(13.0, max(6, 2.4 * n_rows)), constrained_layout=True)
     if n_rows == 1:
         axes = np.asarray([axes])
 
