@@ -29,7 +29,11 @@ from model.vae_teb_prediction.testing.visualizers import (
     COLOR_BLUE,
     COLOR_GRAY,
     COLOR_ORANGE,
+    FONT_LABEL,
+    FONT_LEGEND,
+    FONT_TITLE,
     _style_axes,
+    _tighten_xaxis,
     plot_coherence_analysis,
     plot_coherence_signals,
     plot_cross_correlation,
@@ -54,6 +58,8 @@ def _plot_band_trends(
     x_label: str,
     title: str,
     y_label: str = "Coherence",
+    label_pair: Tuple[str, str] = ("Reference", "Reconstruction"),
+    single_label: str = "Coherence",
 ) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +68,7 @@ def _plot_band_trends(
     n_bands = len(bands)
     cols = 2
     rows = int(np.ceil(n_bands / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(7.0, 3.0 * rows), sharex=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(6.5, 3.0 * rows), sharex=False)
     axes = np.atleast_2d(axes)
 
     has_pair = "orig_mean" in df.columns and "recon_mean" in df.columns
@@ -81,8 +87,21 @@ def _plot_band_trends(
 
         x_vals = subset[x_col].values
         if has_pair:
-            ax.plot(x_vals, subset["orig_mean"], color=COLOR_BLUE, linewidth=1.4, label="Reference")
-            ax.plot(x_vals, subset["recon_mean"], color=COLOR_ORANGE, linewidth=1.4, linestyle="--", label="Reconstruction")
+            ax.plot(
+                x_vals,
+                subset["orig_mean"],
+                color=COLOR_BLUE,
+                linewidth=1.2,
+                label=label_pair[0],
+            )
+            ax.plot(
+                x_vals,
+                subset["recon_mean"],
+                color=COLOR_ORANGE,
+                linewidth=1.2,
+                linestyle="--",
+                label=label_pair[1],
+            )
 
             if "orig_std" in subset.columns:
                 ax.fill_between(
@@ -91,6 +110,7 @@ def _plot_band_trends(
                     subset["orig_mean"] + subset["orig_std"],
                     color=COLOR_BLUE,
                     alpha=0.2,
+                    label="Reference +/- 1 SD",
                 )
             if "recon_std" in subset.columns:
                 ax.fill_between(
@@ -99,9 +119,16 @@ def _plot_band_trends(
                     subset["recon_mean"] + subset["recon_std"],
                     color=COLOR_ORANGE,
                     alpha=0.2,
+                    label="Reconstruction +/- 1 SD",
                 )
         else:
-            ax.plot(x_vals, subset["coherence_mean"], color=COLOR_BLUE, linewidth=1.4, label="Coherence")
+            ax.plot(
+                x_vals,
+                subset["coherence_mean"],
+                color=COLOR_BLUE,
+                linewidth=1.2,
+                label=single_label,
+            )
             if "coherence_std" in subset.columns:
                 ax.fill_between(
                     x_vals,
@@ -109,23 +136,45 @@ def _plot_band_trends(
                     subset["coherence_mean"] + subset["coherence_std"],
                     color=COLOR_BLUE,
                     alpha=0.2,
+                    label=f"{single_label} +/- 1 SD",
                 )
 
-        ax.set_title(f"{band} Band")
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
+        ax.set_title(f"{band} Band", fontsize=FONT_TITLE, fontweight="normal")
+        ax.set_xlabel(x_label, fontsize=FONT_LABEL)
+        ax.set_ylabel(y_label, fontsize=FONT_LABEL)
         if y_label.lower().startswith("coherence"):
-            ax.set_ylim(0, 1)
-        ax.legend(loc="best", fontsize=7, framealpha=0.95)
+            y_vals = []
+            if has_pair:
+                y_vals.extend(subset["orig_mean"].values.tolist())
+                y_vals.extend(subset["recon_mean"].values.tolist())
+            else:
+                y_vals.extend(subset["coherence_mean"].values.tolist())
+            y_arr = np.asarray(y_vals, dtype=float)
+            y_arr = y_arr[np.isfinite(y_arr)]
+            if y_arr.size > 0:
+                y_min = float(np.min(y_arr))
+                y_max = float(np.max(y_arr))
+                pad = max(0.02, 0.05 * (y_max - y_min))
+                y_min -= pad
+                y_max += pad
+                if y_min < 0.0:
+                    y_min = 0.0
+                if y_max > 1.0:
+                    y_max = 1.0
+                if y_max <= y_min:
+                    y_max = min(1.0, y_min + 0.1)
+                ax.set_ylim(y_min, y_max)
+        ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(ax, grid="both", minor_ticks=True)
+        _tighten_xaxis(ax, x_vals)
 
     # Hide unused subplots
     for idx in range(n_bands, rows * cols):
         row, col = divmod(idx, cols)
         axes[row, col].axis("off")
 
-    fig.suptitle(title, fontsize=9, y=1.02, fontweight="bold")
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=FONT_TITLE, y=1.02, fontweight="normal")
+    fig.tight_layout(pad=0.6)
     fig.savefig(output_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
 
@@ -1037,6 +1086,37 @@ def run_coherence_analysis(
                                         title=f"{signal_title} (band coherence vs window index)",
                                         y_label="Coherence",
                                     )
+                                    if band_recon:
+                                        delta_rows = []
+                                        for band_name, vals in sample_window_band.items():
+                                            baseline = float(band_recon.get(band_name, np.nan))
+                                            for w_idx, window_idx in enumerate(
+                                                window_tf.get(
+                                                    "window_indices",
+                                                    np.arange(window_tf["coherence"].shape[1]),
+                                                )
+                                            ):
+                                                if w_idx >= len(vals):
+                                                    continue
+                                                val = float(vals[w_idx])
+                                                if not np.isfinite(val) or not np.isfinite(baseline):
+                                                    continue
+                                                delta_rows.append({
+                                                    "band": band_name,
+                                                    "window_index": int(window_idx),
+                                                    "coherence_mean": val - baseline,
+                                                })
+                                        if delta_rows:
+                                            window_delta_df = pd.DataFrame(delta_rows)
+                                            _plot_band_trends(
+                                                window_delta_df,
+                                                sample_dir / f"{sample_name}_window_band_coherence_delta.png",
+                                                x_col="window_index",
+                                                x_label="Window index",
+                                                title=f"{signal_title} (delta coherence vs window index)",
+                                                y_label="Delta coherence",
+                                                single_label="Delta coherence",
+                                            )
                     except Exception as e:
                         logger.warning(f"Windowed coherence failed for {sample_name}: {e}")
 
@@ -1071,6 +1151,30 @@ def run_coherence_analysis(
                                         title=f"{signal_title} (band coherence vs frame index)",
                                         y_label="Coherence",
                                     )
+                                    if band_recon:
+                                        delta_rows = []
+                                        for band_name, vals in sample_relative_band.items():
+                                            baseline = float(band_recon.get(band_name, np.nan))
+                                            for t_idx, val in enumerate(vals):
+                                                val_f = float(val)
+                                                if not np.isfinite(val_f) or not np.isfinite(baseline):
+                                                    continue
+                                                delta_rows.append({
+                                                    "band": band_name,
+                                                    "relative_frame_index": int(t_idx),
+                                                    "coherence_mean": val_f - baseline,
+                                                })
+                                        if delta_rows:
+                                            relative_delta_df = pd.DataFrame(delta_rows)
+                                            _plot_band_trends(
+                                                relative_delta_df,
+                                                sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
+                                                x_col="relative_frame_index",
+                                                x_label="STFT frame index",
+                                                title=f"{signal_title} (delta coherence vs frame index)",
+                                                y_label="Delta coherence",
+                                                single_label="Delta coherence",
+                                            )
                     except Exception as e:
                         logger.warning(f"Relative window coherence failed for {sample_name}: {e}")
 
@@ -1088,6 +1192,7 @@ def run_coherence_analysis(
                                 x_label="Window index",
                                 title=f"{signal_title} (band power vs window index)",
                                 y_label="Band power (a.u.)",
+                                label_pair=("Original", "Reconstruction"),
                             )
                     except Exception as e:
                         logger.warning(f"Bandpower plot failed for {sample_name}: {e}")
@@ -1216,6 +1321,40 @@ def run_coherence_analysis(
     if epoch_records:
         df_epochs = pd.DataFrame(epoch_records)
         df_epochs.to_csv(output_dir / "epoch_coherence_summary.csv", index=False)
+        if "epoch" in df_epochs.columns:
+            epoch_band_rows: List[Dict[str, Any]] = []
+            df_epochs = df_epochs.copy()
+            df_epochs["hours_before"] = df_epochs["epoch"].apply(
+                lambda val: (-val / 3600.0) if pd.notna(val) else np.nan
+            )
+            for band_name, _, _ in COHERENCE_BANDS:
+                col = f"{band_name}_coherence"
+                if col not in df_epochs.columns:
+                    continue
+                subset = df_epochs[["hours_before", col]].dropna()
+                for _, row in subset.iterrows():
+                    epoch_band_rows.append({
+                        "band": band_name,
+                        "hours_before": float(row["hours_before"]),
+                        "coherence": float(row[col]),
+                    })
+
+            if epoch_band_rows:
+                df_epoch_band = pd.DataFrame(epoch_band_rows)
+                df_epoch_band["hour_bin"] = (df_epoch_band["hours_before"] * 2).round() / 2
+                epoch_agg = df_epoch_band.groupby(["band", "hour_bin"]).agg(
+                    coherence_mean=("coherence", "mean"),
+                    coherence_std=("coherence", "std"),
+                ).reset_index()
+                epoch_agg.to_csv(output_dir / "epoch_coherence_aggregate.csv", index=False)
+                _plot_band_trends(
+                    epoch_agg,
+                    output_dir / "epoch_coherence_trends.png",
+                    x_col="hour_bin",
+                    x_label="Hours Before Birth",
+                    title="Coherence vs Hours Before Birth",
+                    y_label="Coherence",
+                )
 
     if window_records:
         df_windows = pd.DataFrame(window_records)
@@ -1245,6 +1384,34 @@ def run_coherence_analysis(
             title="Coherence vs Window Index",
             y_label="Coherence",
         )
+
+        if "coherence_delta" in df_windows.columns:
+            window_delta = df_windows.groupby(["band", "window_index"]).agg(
+                window_start_sec=("window_start_sec", "mean"),
+                coherence_mean=("coherence_delta", "mean"),
+                coherence_std=("coherence_delta", "std"),
+            ).reset_index()
+            window_delta.to_csv(output_dir / "window_coherence_delta_aggregate.csv", index=False)
+
+            _plot_band_trends(
+                window_delta,
+                output_dir / "window_coherence_delta_trends.png",
+                x_col="window_start_sec",
+                x_label="Window Start (seconds)",
+                title="Delta Coherence vs Window Start",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
+
+            _plot_band_trends(
+                window_delta,
+                output_dir / "window_coherence_delta_trends_index.png",
+                x_col="window_index",
+                x_label="Window index",
+                title="Delta Coherence vs Window Index",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
 
     if relative_records:
         df_relative = pd.DataFrame(relative_records)
@@ -1280,6 +1447,42 @@ def run_coherence_analysis(
             y_label="Coherence",
         )
 
+        if "coherence_delta" in df_relative.columns:
+            relative_delta = df_relative.groupby(["band", "relative_time_sec"]).agg(
+                coherence_mean=("coherence_delta", "mean"),
+                coherence_std=("coherence_delta", "std"),
+            ).reset_index()
+            relative_delta.to_csv(output_dir / "relative_window_coherence_delta_aggregate.csv", index=False)
+
+            _plot_band_trends(
+                relative_delta,
+                output_dir / "relative_window_coherence_delta_trends.png",
+                x_col="relative_time_sec",
+                x_label="Time From Window Start (seconds)",
+                title="Delta Coherence vs Time From Window Start",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
+
+            relative_delta_index = df_relative.groupby(["band", "relative_frame_index"]).agg(
+                coherence_mean=("coherence_delta", "mean"),
+                coherence_std=("coherence_delta", "std"),
+            ).reset_index()
+            relative_delta_index.to_csv(
+                output_dir / "relative_window_coherence_delta_index_aggregate.csv",
+                index=False,
+            )
+
+            _plot_band_trends(
+                relative_delta_index,
+                output_dir / "relative_window_coherence_delta_trends_index.png",
+                x_col="relative_frame_index",
+                x_label="STFT frame index",
+                title="Delta Coherence vs Frame Index",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
+
     if bandpower_records:
         df_bandpower = pd.DataFrame(bandpower_records)
         df_bandpower.to_csv(output_dir / "window_bandpower_summary.csv", index=False)
@@ -1300,6 +1503,7 @@ def run_coherence_analysis(
             x_label="Window Start (seconds)",
             title="Band Power vs Window Start",
             y_label="Band power (a.u.)",
+            label_pair=("Original", "Reconstruction"),
         )
 
         _plot_band_trends(
@@ -1309,7 +1513,36 @@ def run_coherence_analysis(
             x_label="Window index",
             title="Band Power vs Window Index",
             y_label="Band power (a.u.)",
+            label_pair=("Original", "Reconstruction"),
         )
+
+        if "bandpower_delta" in df_bandpower.columns:
+            bandpower_delta = df_bandpower.groupby(["band", "window_index"]).agg(
+                window_start_sec=("window_start_sec", "mean"),
+                coherence_mean=("bandpower_delta", "mean"),
+                coherence_std=("bandpower_delta", "std"),
+            ).reset_index()
+            bandpower_delta.to_csv(output_dir / "window_bandpower_delta_aggregate.csv", index=False)
+
+            _plot_band_trends(
+                bandpower_delta,
+                output_dir / "window_bandpower_delta_trends.png",
+                x_col="window_start_sec",
+                x_label="Window Start (seconds)",
+                title="Band Power Delta vs Window Start",
+                y_label="Band power delta (a.u.)",
+                single_label="Delta",
+            )
+
+            _plot_band_trends(
+                bandpower_delta,
+                output_dir / "window_bandpower_delta_trends_index.png",
+                x_col="window_index",
+                x_label="Window index",
+                title="Band Power Delta vs Window Index",
+                y_label="Band power delta (a.u.)",
+                single_label="Delta",
+            )
 
     # Save summary statistics
     summary_path = output_dir / "coherence_summary.txt"
@@ -1352,25 +1585,39 @@ def run_coherence_analysis(
         if include_up_coherence and "up_coherence_original_mean" in results:
             f.write("  up_fhr_coherence.png\n")
         f.write("  epoch_coherence_summary.csv\n")
+        f.write("  epoch_coherence_aggregate.csv\n")
+        f.write("  epoch_coherence_trends.png\n")
         f.write("  window_coherence_summary.csv\n")
         f.write("  window_coherence_aggregate.csv\n")
         f.write("  window_coherence_trends.png\n")
         f.write("  window_coherence_trends_index.png\n")
+        f.write("  window_coherence_delta_aggregate.csv\n")
+        f.write("  window_coherence_delta_trends.png\n")
+        f.write("  window_coherence_delta_trends_index.png\n")
         f.write("  relative_window_coherence_summary.csv\n")
         f.write("  relative_window_coherence_aggregate.csv\n")
         f.write("  relative_window_coherence_trends.png\n")
         f.write("  relative_window_coherence_index_aggregate.csv\n")
         f.write("  relative_window_coherence_trends_index.png\n")
+        f.write("  relative_window_coherence_delta_aggregate.csv\n")
+        f.write("  relative_window_coherence_delta_trends.png\n")
+        f.write("  relative_window_coherence_delta_index_aggregate.csv\n")
+        f.write("  relative_window_coherence_delta_trends_index.png\n")
         f.write("  window_bandpower_summary.csv\n")
         f.write("  window_bandpower_aggregate.csv\n")
         f.write("  window_bandpower_trends.png\n")
         f.write("  window_bandpower_trends_index.png\n")
+        f.write("  window_bandpower_delta_aggregate.csv\n")
+        f.write("  window_bandpower_delta_trends.png\n")
+        f.write("  window_bandpower_delta_trends_index.png\n")
         f.write("  samples/<sample>_signals.png\n")
         f.write("  samples/<sample>_time_frequency.png\n")
         f.write("  samples/<sample>_windowed_coherence.png\n")
         f.write("  samples/<sample>_relative_window_time_frequency.png\n")
         f.write("  samples/<sample>_window_band_coherence.png\n")
+        f.write("  samples/<sample>_window_band_coherence_delta.png\n")
         f.write("  samples/<sample>_relative_band_coherence.png\n")
+        f.write("  samples/<sample>_relative_band_coherence_delta.png\n")
         f.write("  samples/<sample>_window_bandpower.png\n")
         f.write("  samples/<sample>_psd.png\n")
         f.write("  samples/<sample>_cross_correlation.png\n")
