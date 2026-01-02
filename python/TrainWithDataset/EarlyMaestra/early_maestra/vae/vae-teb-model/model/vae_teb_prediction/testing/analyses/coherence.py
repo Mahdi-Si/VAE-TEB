@@ -36,6 +36,7 @@ from model.vae_teb_prediction.testing.visualizers import (
     _tighten_xaxis,
     plot_coherence_analysis,
     plot_coherence_signals,
+    plot_coherence_spectrum,
     plot_cross_correlation,
     plot_psd_comparison,
     plot_reconstruction_coherence,
@@ -60,15 +61,17 @@ def _plot_band_trends(
     y_label: str = "Coherence",
     label_pair: Tuple[str, str] = ("Reference", "Reconstruction"),
     single_label: str = "Coherence",
+    xlim: Optional[Tuple[float, float]] = None,
+    invert_x: bool = False,
 ) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     bands = [b[0] for b in COHERENCE_BANDS]
     n_bands = len(bands)
-    cols = 2
-    rows = int(np.ceil(n_bands / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(6.5, 3.0 * rows), sharex=False)
+    cols = 1
+    rows = n_bands
+    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.9 * rows), sharex=False)
     axes = np.atleast_2d(axes)
 
     has_pair = "orig_mean" in df.columns and "recon_mean" in df.columns
@@ -166,9 +169,14 @@ def _plot_band_trends(
                 ax.set_ylim(y_min, y_max)
         ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
         _style_axes(ax, grid="both", minor_ticks=True)
-        _tighten_xaxis(ax, x_vals)
+        if xlim is None:
+            _tighten_xaxis(ax, x_vals)
+        else:
+            ax.set_xlim(xlim[0], xlim[1])
+        if invert_x:
+            ax.invert_xaxis()
 
-    # Hide unused subplots
+    # Hide unused subplots (defensive; should not trigger with single column)
     for idx in range(n_bands, rows * cols):
         row, col = divmod(idx, cols)
         axes[row, col].axis("off")
@@ -661,7 +669,7 @@ def run_coherence_analysis(
     fs: float = 4.0,
     max_detailed_samples: int = 5,
     include_up_coherence: bool = False,
-    time_frequency_method: str = "stft",
+    time_frequency_method: str = "wavelet",
     time_frequency_nperseg: int = 128,
     time_frequency_num_scales: int = 50,
     time_frequency_max_freq: float = 0.5,
@@ -688,7 +696,7 @@ def run_coherence_analysis(
         fs: Sampling frequency in Hz (default 4.0).
         max_detailed_samples: Number of per-sample plots to generate.
         include_up_coherence: If True and UP is available, compute UP-FHR coherence.
-        time_frequency_method: "stft" or "wavelet" for time-frequency plots.
+        time_frequency_method: "wavelet" or "stft" for time-frequency plots.
         time_frequency_nperseg: STFT segment length for time-frequency plots.
         time_frequency_num_scales: Number of scales for wavelet coherence.
         time_frequency_max_freq: Max frequency to display in time-frequency plots.
@@ -1167,16 +1175,103 @@ def run_coherence_analysis(
                                         if delta_rows:
                                             relative_delta_df = pd.DataFrame(delta_rows)
                                             _plot_band_trends(
-                                                relative_delta_df,
-                                                sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
-                                                x_col="relative_frame_index",
-                                                x_label="STFT frame index",
-                                                title=f"{signal_title} (delta coherence vs frame index)",
-                                                y_label="Delta coherence",
-                                                single_label="Delta coherence",
-                                            )
+                                            relative_delta_df,
+                                            sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
+                                            x_col="relative_frame_index",
+                                            x_label="STFT frame index",
+                                            title=f"{signal_title} (delta coherence vs frame index)",
+                                            y_label="Delta coherence",
+                                            single_label="Delta coherence",
+                                        )
                     except Exception as e:
                         logger.warning(f"Relative window coherence failed for {sample_name}: {e}")
+
+                    try:
+                        if mu_pr_window is not None and mu_pr_window.size > 0:
+                            T_win, H_win = mu_pr_window.shape
+                            single_index = runner.warmup_steps if runner.warmup_steps < T_win else 0
+                            start = int(single_index) * int(runner.decimation_factor)
+                            end = start + H_win
+                            if end <= len(fhr_orig_full):
+                                ref_win = fhr_orig_full[start:end]
+                                pred_win = mu_pr_window[single_index][: len(ref_win)]
+
+                                window_prefix = f"{sample_name}_single_window_{single_index}"
+                                window_title = f"{signal_title} (window {single_index}, {H_win} samples)"
+
+                                plot_coherence_signals(
+                                    None,
+                                    ref_win,
+                                    pred_win,
+                                    sample_dir / f"{window_prefix}_signals.png",
+                                    fs=fs,
+                                    title=window_title,
+                                )
+
+                                nperseg_used = min(window_nperseg, len(ref_win))
+                                if nperseg_used >= 2:
+                                    freq_win, coh_win = compute_stft_coherence(
+                                        ref_win,
+                                        pred_win,
+                                        fs=fs,
+                                        nperseg=nperseg_used,
+                                    )
+                                    if freq_win.size > 0:
+                                        plot_coherence_spectrum(
+                                            freq_win,
+                                            coh_win,
+                                            sample_dir / f"{window_prefix}_coherence_spectrum.png",
+                                            title=f"{window_title} (coherence spectrum)",
+                                            max_freq=time_frequency_max_freq,
+                                        )
+
+                                method = str(time_frequency_method).lower() if time_frequency_method else "stft"
+                                if method not in ("stft", "wavelet"):
+                                    method = "stft"
+                                if method == "wavelet":
+                                    tf_map = compute_wavelet_coherence(
+                                        ref_win, pred_win, fs=fs, num_scales=time_frequency_num_scales
+                                    )
+                                else:
+                                    tf_map = compute_stft_coherence_map(
+                                        ref_win, pred_win, fs=fs, nperseg=time_frequency_nperseg
+                                    )
+                                if tf_map["coherence"].size > 0:
+                                    plot_time_frequency_coherence(
+                                        tf_map["frequencies"],
+                                        tf_map["times"],
+                                        tf_map["coherence"],
+                                        output_path=sample_dir / f"{window_prefix}_time_frequency.png",
+                                        max_freq=time_frequency_max_freq,
+                                        title=f"{window_title} (time-frequency coherence)",
+                                    )
+
+                                psd_freq, psd_orig = compute_welch_psd(ref_win, fs=fs, nperseg=psd_nperseg)
+                                _, psd_recon = compute_welch_psd(pred_win, fs=fs, nperseg=psd_nperseg)
+                                if psd_freq.size > 0:
+                                    plot_psd_comparison(
+                                        psd_freq,
+                                        psd_orig,
+                                        np.zeros_like(psd_orig),
+                                        psd_recon,
+                                        np.zeros_like(psd_recon),
+                                        sample_dir,
+                                        filename=f"{window_prefix}_psd.png",
+                                    )
+
+                                lags_sec, corr = compute_cross_correlation(
+                                    ref_win, pred_win, fs=fs, max_lag_sec=max_corr_lag_sec
+                                )
+                                if lags_sec.size > 0:
+                                    plot_cross_correlation(
+                                        lags_sec,
+                                        corr,
+                                        np.zeros_like(corr),
+                                        sample_dir,
+                                        filename=f"{window_prefix}_cross_correlation.png",
+                                    )
+                    except Exception as e:
+                        logger.warning(f"Single-window coherence analysis failed for {sample_name}: {e}")
 
                     try:
                         if sample_bandpower is not None and not sample_bandpower.empty:
@@ -1341,6 +1436,9 @@ def run_coherence_analysis(
 
             if epoch_band_rows:
                 df_epoch_band = pd.DataFrame(epoch_band_rows)
+                df_epoch_band = df_epoch_band[
+                    (df_epoch_band["hours_before"] >= 0.0) & (df_epoch_band["hours_before"] <= 6.0)
+                ]
                 df_epoch_band["hour_bin"] = (df_epoch_band["hours_before"] * 2).round() / 2
                 epoch_agg = df_epoch_band.groupby(["band", "hour_bin"]).agg(
                     coherence_mean=("coherence", "mean"),
@@ -1354,6 +1452,8 @@ def run_coherence_analysis(
                     x_label="Hours Before Birth",
                     title="Coherence vs Hours Before Birth",
                     y_label="Coherence",
+                    xlim=(0.0, 6.0),
+                    invert_x=True,
                 )
 
     if window_records:
@@ -1618,6 +1718,11 @@ def run_coherence_analysis(
         f.write("  samples/<sample>_window_band_coherence_delta.png\n")
         f.write("  samples/<sample>_relative_band_coherence.png\n")
         f.write("  samples/<sample>_relative_band_coherence_delta.png\n")
+        f.write("  samples/<sample>_single_window_*_signals.png\n")
+        f.write("  samples/<sample>_single_window_*_coherence_spectrum.png\n")
+        f.write("  samples/<sample>_single_window_*_time_frequency.png\n")
+        f.write("  samples/<sample>_single_window_*_psd.png\n")
+        f.write("  samples/<sample>_single_window_*_cross_correlation.png\n")
         f.write("  samples/<sample>_window_bandpower.png\n")
         f.write("  samples/<sample>_psd.png\n")
         f.write("  samples/<sample>_cross_correlation.png\n")
