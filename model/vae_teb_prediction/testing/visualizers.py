@@ -1032,6 +1032,7 @@ def plot_reconstruction_coherence(
     coherence_std: np.ndarray,
     output_dir: Path,
     filename: str = "reconstruction_coherence.png",
+    significance_threshold: Optional[float] = None,
 ) -> None:
     """
     Plot coherence between original and reconstructed FHR signals.
@@ -1062,6 +1063,14 @@ def plot_reconstruction_coherence(
         alpha=0.2,
         label="Coherence +/- 1 SD",
     )
+    if significance_threshold is not None and np.isfinite(significance_threshold):
+        ax.axhline(
+            float(significance_threshold),
+            color=COLOR_ORANGE,
+            linestyle="--",
+            linewidth=0.9,
+            label="Significance threshold",
+        )
 
     ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
     ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
@@ -1118,6 +1127,176 @@ def plot_coherence_spectrum(
     _style_axes(ax, grid="both", minor_ticks=True)
     _tighten_xaxis(ax, freqs)
 
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_horizon_spectra(
+    frequencies: np.ndarray,
+    early_mean: np.ndarray,
+    early_std: np.ndarray,
+    late_mean: np.ndarray,
+    late_std: np.ndarray,
+    output_path: Path,
+    *,
+    title: Optional[str] = None,
+    max_freq: Optional[float] = 0.5,
+    early_label: str = "Early horizon",
+    late_label: str = "Late horizon",
+) -> None:
+    """
+    Plot early vs late horizon coherence spectra with uncertainty bands.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if frequencies.size == 0:
+        return
+
+    if max_freq is None:
+        max_freq = float(np.nanmax(frequencies))
+    freq_mask = frequencies <= max_freq
+    freqs = frequencies[freq_mask]
+    early_m = early_mean[freq_mask]
+    late_m = late_mean[freq_mask]
+    early_s = early_std[freq_mask] if early_std.size else np.zeros_like(early_m)
+    late_s = late_std[freq_mask] if late_std.size else np.zeros_like(late_m)
+
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
+    ax.plot(freqs, early_m, color=COLOR_BLUE, linewidth=0.8, label=early_label)
+    ax.fill_between(
+        freqs,
+        early_m - early_s,
+        early_m + early_s,
+        color=COLOR_BLUE,
+        alpha=0.2,
+        label=f"{early_label} +/- 1 SD",
+    )
+    ax.plot(freqs, late_m, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=late_label)
+    ax.fill_between(
+        freqs,
+        late_m - late_s,
+        late_m + late_s,
+        color=COLOR_ORANGE,
+        alpha=0.15,
+        label=f"{late_label} +/- 1 SD",
+    )
+
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
+    ax.set_title(title or "Early vs Late Horizon Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.set_xlim(0, float(max_freq))
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
+    _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, freqs)
+
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_spectrum_delta(
+    frequencies: np.ndarray,
+    delta_mean: np.ndarray,
+    delta_std: np.ndarray,
+    output_path: Path,
+    *,
+    title: Optional[str] = None,
+    max_freq: Optional[float] = 0.5,
+    label: str = "Late - Early",
+) -> None:
+    """
+    Plot delta spectrum (late minus early) with uncertainty.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if frequencies.size == 0:
+        return
+
+    if max_freq is None:
+        max_freq = float(np.nanmax(frequencies))
+    freq_mask = frequencies <= max_freq
+    freqs = frequencies[freq_mask]
+    delta_m = delta_mean[freq_mask]
+    delta_s = delta_std[freq_mask] if delta_std.size else np.zeros_like(delta_m)
+
+    fig, ax = plt.subplots(figsize=(7.6, 2.6))
+    ax.plot(freqs, delta_m, color=COLOR_BLUE, linewidth=0.8, label=label)
+    ax.fill_between(
+        freqs,
+        delta_m - delta_s,
+        delta_m + delta_s,
+        color=COLOR_BLUE,
+        alpha=0.2,
+        label=f"{label} +/- 1 SD",
+    )
+    ax.axhline(0.0, color=COLOR_BLACK, linewidth=0.8, alpha=0.7)
+    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Delta Coherence", fontsize=FONT_LABEL)
+    ax.set_title(title or "Horizon Delta Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.set_xlim(0, float(max_freq))
+    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
+    _style_axes(ax, grid="both", minor_ticks=True)
+    _tighten_xaxis(ax, freqs)
+
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_time_frequency_map(
+    frequencies: np.ndarray,
+    times: np.ndarray,
+    values: np.ndarray,
+    output_path: Path,
+    *,
+    max_freq: Optional[float] = None,
+    title: Optional[str] = None,
+    cmap: str = "viridis",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    colorbar_label: str = "Value",
+) -> None:
+    """
+    Plot a generic time-frequency map (not constrained to coherence [0,1]).
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if frequencies.size == 0 or times.size == 0 or values.size == 0:
+        return
+
+    freq_mask = slice(None)
+    if max_freq is not None:
+        freq_mask = frequencies <= max_freq
+
+    freqs = frequencies[freq_mask]
+    vals = values[freq_mask, :]
+    time_min = times / 60.0
+
+    fig, ax = plt.subplots(1, 1, figsize=(7.6, 2.6))
+    im = ax.pcolormesh(
+        time_min,
+        freqs,
+        vals,
+        shading="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
+    ax.set_title(title or "Time-Frequency Map", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    if freqs.size:
+        ax.set_ylim(float(np.min(freqs)), float(np.max(freqs)))
+    _add_colorbar(fig, im, ax, label=colorbar_label, shrink=0.8, pad=0.02)
+    _style_axes(ax, grid="major")
+    ax.margins(x=0.0, y=0.0)
+
+    _tighten_xaxis(ax, time_min)
     fig.tight_layout(pad=0.6)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)

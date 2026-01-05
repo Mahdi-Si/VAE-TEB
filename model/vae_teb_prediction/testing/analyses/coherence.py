@@ -38,9 +38,12 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_coherence_signals,
     plot_coherence_spectrum,
     plot_cross_correlation,
+    plot_horizon_spectra,
     plot_psd_comparison,
     plot_reconstruction_coherence,
+    plot_spectrum_delta,
     plot_time_frequency_coherence,
+    plot_time_frequency_map,
 )
 
 COHERENCE_BANDS = [
@@ -49,6 +52,150 @@ COHERENCE_BANDS = [
     ("HF", 0.15, 0.5),
     ("Total", 0.0, 0.5),
 ]
+
+
+def _resolve_time_frequency_methods(method: Optional[str]) -> List[str]:
+    if not method:
+        return ["stft"]
+    key = str(method).strip().lower()
+    if key in {"both", "all", "stft+wavelet", "wavelet+stft"}:
+        return ["stft", "wavelet"]
+    if key in {"stft", "wavelet"}:
+        return [key]
+    logger.warning("Unknown time-frequency method '%s', using STFT only.", method)
+    return ["stft"]
+
+
+def _welch_segment_count(n_samples: int, nperseg: int, noverlap: int) -> int:
+    if n_samples < nperseg or nperseg <= 0:
+        return 0
+    step = max(1, nperseg - noverlap)
+    return 1 + max(0, (n_samples - nperseg) // step)
+
+
+def _coherence_significance_threshold(k_segments: int, alpha: float) -> float:
+    if k_segments <= 1 or alpha <= 0.0 or alpha >= 1.0:
+        return np.nan
+    return float(1.0 - alpha ** (1.0 / (k_segments - 1)))
+
+
+def _compute_horizon_spectra(
+    frequencies: np.ndarray,
+    times: np.ndarray,
+    coherence: np.ndarray,
+    *,
+    early_seconds: float,
+    late_seconds: float,
+) -> Dict[str, np.ndarray]:
+    if frequencies.size == 0 or times.size == 0 or coherence.size == 0:
+        return {"early": np.array([]), "late": np.array([]), "delta": np.array([])}
+
+    total_duration = float(times[-1]) if times.size > 0 else 0.0
+    early_seconds = max(0.0, float(early_seconds))
+    late_seconds = max(0.0, float(late_seconds))
+
+    early_mask = times <= early_seconds if early_seconds > 0 else np.zeros_like(times, dtype=bool)
+    late_mask = times >= (total_duration - late_seconds) if late_seconds > 0 else np.zeros_like(times, dtype=bool)
+
+    if not early_mask.any():
+        early_mask = np.zeros_like(times, dtype=bool)
+        early_mask[0] = True
+    if not late_mask.any():
+        late_mask = np.zeros_like(times, dtype=bool)
+        late_mask[-1] = True
+
+    early = np.nanmean(coherence[:, early_mask], axis=1)
+    late = np.nanmean(coherence[:, late_mask], axis=1)
+    delta = late - early
+    return {"early": early, "late": late, "delta": delta}
+
+
+def _collect_prediction_windows(
+    reference_full: np.ndarray,
+    pred_windows: np.ndarray,
+    *,
+    stride: int,
+    warmup: int,
+    max_windows: Optional[int] = None,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    windows: List[Tuple[np.ndarray, np.ndarray]] = []
+    min_len = len(reference_full)
+    if min_len < 2:
+        return windows
+    T, H = pred_windows.shape
+    for t in range(warmup, T):
+        if max_windows is not None and len(windows) >= max_windows:
+            break
+        start = t * stride
+        end = start + H
+        if end > min_len:
+            break
+        windows.append((reference_full[start:end], pred_windows[t]))
+    return windows
+
+
+def _compute_permutation_ci(
+    windows: List[Tuple[np.ndarray, np.ndarray]],
+    *,
+    map_fn,
+    num_permutations: int,
+    alpha: float,
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    if num_permutations <= 0 or len(windows) < 2:
+        return {"lower": np.array([]), "upper": np.array([]), "frequencies": np.array([]), "times": np.array([])}
+
+    refs = [w[0] for w in windows]
+    preds = [w[1] for w in windows]
+
+    perm_maps: List[np.ndarray] = []
+    freqs = None
+    times = None
+    n_windows = len(preds)
+    for _ in range(num_permutations):
+        perm = rng.permutation(n_windows)
+        acc = None
+        count = 0
+        for i, j in enumerate(perm):
+            tf_map = map_fn(refs[i], preds[j])
+            if tf_map["coherence"].size == 0:
+                continue
+            if acc is None:
+                acc = tf_map["coherence"].copy()
+                freqs = tf_map["frequencies"]
+                times = tf_map["times"]
+            else:
+                if tf_map["coherence"].shape != acc.shape:
+                    continue
+                acc += tf_map["coherence"]
+            count += 1
+        if acc is None or count == 0:
+            continue
+        perm_maps.append(acc / count)
+
+    if not perm_maps:
+        return {"lower": np.array([]), "upper": np.array([]), "frequencies": np.array([]), "times": np.array([])}
+
+    perm_stack = np.stack(perm_maps, axis=0)
+    lower = np.nanpercentile(perm_stack, alpha * 100.0, axis=0)
+    upper = np.nanpercentile(perm_stack, (1.0 - alpha) * 100.0, axis=0)
+
+    return {
+        "lower": lower,
+        "upper": upper,
+        "frequencies": freqs if freqs is not None else np.array([]),
+        "times": times if times is not None else np.array([]),
+    }
+
+
+def _stack_consistent(maps: List[np.ndarray]) -> np.ndarray:
+    if not maps:
+        return np.empty((0, 0))
+    shape = maps[0].shape
+    filtered = [m for m in maps if m.shape == shape]
+    if not filtered:
+        return np.empty((0, 0))
+    return np.stack(filtered, axis=0)
 
 
 def _plot_band_trends(
@@ -457,6 +604,14 @@ def compute_wavelet_coherence(
     y: np.ndarray,
     fs: float = 4.0,
     num_scales: int = 50,
+    *,
+    min_freq: Optional[float] = None,
+    max_freq: Optional[float] = None,
+    pad_mode: Optional[str] = "reflect",
+    pad_max_fraction: float = 0.25,
+    coi_scale: float = 1.65,
+    apply_coi_mask: bool = True,
+    smooth_kernel: int = 5,
 ) -> Dict[str, np.ndarray]:
     """
     Compute wavelet coherence between two signals.
@@ -485,46 +640,120 @@ def compute_wavelet_coherence(
     except ImportError:
         raise ImportError("PyWavelets is required for wavelet coherence. Install with: pip install pywavelets")
 
-    # Ensure same length
     min_len = min(len(x), len(y))
-    x, y = x[:min_len], y[:min_len]
+    if min_len < 2:
+        return {
+            "frequencies": np.array([]),
+            "times": np.array([]),
+            "coherence": np.empty((0, 0)),
+            "phase": np.empty((0, 0)),
+            "scales": np.array([]),
+        }
 
-    # Define scales (logarithmically spaced)
-    scales = np.logspace(np.log10(2), np.log10(min_len // 4), num_scales)
+    x = x[:min_len]
+    y = y[:min_len]
 
-    # Compute CWT for both signals
-    wavelet = "morl"  # Morlet wavelet
-    coefs_x, frequencies = pywt.cwt(x, scales, wavelet, sampling_period=1.0 / fs)
-    coefs_y, _ = pywt.cwt(y, scales, wavelet, sampling_period=1.0 / fs)
+    wavelet = "morl"
+    dt = 1.0 / fs
+    center_freq = pywt.central_frequency(wavelet)
 
-    # Compute cross-spectrum and power spectra
+    min_resolvable = 1.0 / max(min_len / fs, 1e-6)
+    if min_freq is None:
+        min_freq = 0.003
+    min_freq = max(min_freq, min_resolvable)
+
+    if max_freq is None:
+        max_freq = fs / 2.0
+    max_freq = min(max_freq, fs / 2.0)
+
+    if min_freq >= max_freq or min_freq <= 0.0:
+        return {
+            "frequencies": np.array([]),
+            "times": np.array([]),
+            "coherence": np.empty((0, 0)),
+            "phase": np.empty((0, 0)),
+            "scales": np.array([]),
+        }
+
+    scale_min = center_freq / (max_freq * dt)
+    scale_max = center_freq / (min_freq * dt)
+    scale_min = max(scale_min, 1.0)
+    scale_max = min(scale_max, max(min_len / 2.0, scale_min + 1e-6))
+    if scale_max <= scale_min:
+        return {
+            "frequencies": np.array([]),
+            "times": np.array([]),
+            "coherence": np.empty((0, 0)),
+            "phase": np.empty((0, 0)),
+            "scales": np.array([]),
+        }
+
+    scales = np.logspace(np.log10(scale_min), np.log10(scale_max), num_scales)
+
+    pad_samples = 0
+    if pad_mode:
+        max_scale = float(np.max(scales))
+        coi_samples = int(np.ceil(coi_scale * max_scale))
+        max_pad = int(np.floor(min_len * pad_max_fraction))
+        pad_samples = max(0, min(coi_samples, max_pad))
+
+    if pad_samples > 0:
+        x = np.pad(x, (pad_samples, pad_samples), mode=pad_mode)
+        y = np.pad(y, (pad_samples, pad_samples), mode=pad_mode)
+
+    coefs_x, frequencies = pywt.cwt(x, scales, wavelet, sampling_period=dt)
+    coefs_y, _ = pywt.cwt(y, scales, wavelet, sampling_period=dt)
+
     cross_spectrum = coefs_x * np.conj(coefs_y)
     power_x = np.abs(coefs_x) ** 2
     power_y = np.abs(coefs_y) ** 2
 
-    # Coherence = |Sxy|^2 / (Sxx * Syy)
-    # Apply smoothing for stable coherence estimate
-    kernel_size = 5
+    kernel_size = max(1, int(smooth_kernel))
     kernel = np.ones(kernel_size) / kernel_size
 
     coherence = np.zeros_like(power_x)
     for i in range(len(scales)):
-        smoothed_cross = np.convolve(np.abs(cross_spectrum[i]), kernel, mode="same")
+        smoothed_cross = np.convolve(cross_spectrum[i], kernel, mode="same")
         smoothed_x = np.convolve(power_x[i], kernel, mode="same")
         smoothed_y = np.convolve(power_y[i], kernel, mode="same")
-        coherence[i] = smoothed_cross ** 2 / (smoothed_x * smoothed_y + 1e-12)
+        coherence[i] = np.abs(smoothed_cross) ** 2 / (smoothed_x * smoothed_y + 1e-12)
 
-    # Time array
+    phase = np.angle(cross_spectrum)
+
+    if pad_samples > 0:
+        coherence = coherence[:, pad_samples:pad_samples + min_len]
+        phase = phase[:, pad_samples:pad_samples + min_len]
+
+    if apply_coi_mask:
+        for i, scale in enumerate(scales):
+            edge = int(np.ceil(coi_scale * scale))
+            if edge <= 0:
+                continue
+            if edge * 2 >= min_len:
+                coherence[i, :] = np.nan
+                phase[i, :] = np.nan
+                continue
+            coherence[i, :edge] = np.nan
+            coherence[i, -edge:] = np.nan
+            phase[i, :edge] = np.nan
+            phase[i, -edge:] = np.nan
+
     times = np.arange(min_len) / fs
 
-    # Phase difference
-    phase = np.angle(cross_spectrum)
+    if frequencies.ndim == 1 and frequencies.size > 1:
+        if np.any(np.diff(frequencies) < 0):
+            order = np.argsort(frequencies)
+            frequencies = frequencies[order]
+            coherence = coherence[order, :]
+            phase = phase[order, :]
+            scales = scales[order]
 
     return {
         "frequencies": frequencies,
         "times": times,
         "coherence": coherence,
         "phase": phase,
+        "scales": scales,
     }
 
 
@@ -569,8 +798,24 @@ def compute_stft_coherence_map(
     elif noverlap >= nperseg:
         noverlap = max(0, nperseg // 2)
 
-    freqs, times, stft_x = signal.stft(x, fs=fs, nperseg=nperseg, noverlap=noverlap, boundary=None)
-    _, _, stft_y = signal.stft(y, fs=fs, nperseg=nperseg, noverlap=noverlap, boundary=None)
+    freqs, times, stft_x = signal.stft(
+        x,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        boundary=None,
+        padded=False,
+        window="hann",
+    )
+    _, _, stft_y = signal.stft(
+        y,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        boundary=None,
+        padded=False,
+        window="hann",
+    )
 
     sxy = stft_x * np.conj(stft_y)
     sxx = np.abs(stft_x) ** 2
@@ -596,6 +841,15 @@ def compute_window_relative_time_frequency(
 
     Aligns STFT coherence maps to the start of each prediction window and
     averages across windows to show coherence vs time-from-window-start.
+
+    Returns:
+        Dict with:
+            - 'frequencies': Frequency array
+            - 'times': Time array
+            - 'coherence': Mean coherence (freq x time)
+            - 'coherence_std': Std across windows (freq x time)
+            - 'coherence_cv': Coefficient of variation across windows
+            - 'n_windows': Number of windows aggregated
     """
     min_len = len(reference_full)
     T, H = pred_windows.shape
@@ -617,6 +871,7 @@ def compute_window_relative_time_frequency(
         }
 
     acc = None
+    acc_sq = None
     freqs = None
     times = None
     count = 0
@@ -640,12 +895,14 @@ def compute_window_relative_time_frequency(
 
         if acc is None:
             acc = tf_map["coherence"].copy()
+            acc_sq = np.square(tf_map["coherence"].astype(float))
             freqs = tf_map["frequencies"]
             times = tf_map["times"]
         else:
             if tf_map["coherence"].shape != acc.shape:
                 continue
             acc += tf_map["coherence"]
+            acc_sq += np.square(tf_map["coherence"].astype(float))
 
         count += 1
 
@@ -657,10 +914,162 @@ def compute_window_relative_time_frequency(
             "n_windows": 0,
         }
 
+    mean = acc / max(count, 1)
+    variance = acc_sq / max(count, 1) - np.square(mean)
+    variance = np.clip(variance, 0.0, None)
+    std = np.sqrt(variance)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cv = std / mean
+        cv[~np.isfinite(cv)] = np.nan
+
     return {
         "frequencies": freqs,
         "times": times,
-        "coherence": acc / max(count, 1),
+        "coherence": mean,
+        "coherence_std": std,
+        "coherence_cv": cv,
+        "n_windows": count,
+    }
+
+
+def compute_window_relative_time_frequency_wavelet(
+    reference_full: np.ndarray,
+    pred_windows: np.ndarray,
+    *,
+    fs: float,
+    stride: int,
+    warmup: int,
+    num_scales: int,
+    min_freq: Optional[float] = None,
+    max_freq: Optional[float] = None,
+    pad_mode: Optional[str] = "reflect",
+    pad_max_fraction: float = 0.25,
+    coi_scale: float = 1.65,
+    apply_coi_mask: bool = True,
+    max_windows: Optional[int] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute average wavelet coherence within 2-minute windows.
+
+    Aligns wavelet coherence maps to the start of each prediction window and
+    averages across windows to show coherence vs time-from-window-start.
+
+    Returns:
+        Dict with:
+            - 'frequencies': Frequency array
+            - 'times': Time array
+            - 'coherence': Mean coherence (freq x time)
+            - 'coherence_std': Std across windows (freq x time)
+            - 'coherence_cv': Coefficient of variation across windows
+            - 'plv': Phase-locking value map
+            - 'phase_mean': Circular mean phase map
+            - 'n_windows': Number of windows aggregated
+    """
+    min_len = len(reference_full)
+    T, H = pred_windows.shape
+    if min_len < 2 or H < 2:
+        return {
+            "frequencies": np.array([]),
+            "times": np.array([]),
+            "coherence": np.empty((0, 0)),
+            "n_windows": 0,
+        }
+
+    acc = None
+    acc_sq = None
+    acc_count = None
+    phase_sum = None
+    phase_count = None
+    freqs = None
+    times = None
+    count = 0
+
+    for t in range(warmup, T):
+        if max_windows is not None and count >= max_windows:
+            break
+
+        start = t * stride
+        end = start + H
+        if end > min_len:
+            break
+
+        ref_win = reference_full[start:end]
+        pred_win = pred_windows[t]
+
+        tf_map = compute_wavelet_coherence(
+            ref_win,
+            pred_win,
+            fs=fs,
+            num_scales=num_scales,
+            min_freq=min_freq,
+            max_freq=max_freq,
+            pad_mode=pad_mode,
+            pad_max_fraction=pad_max_fraction,
+            coi_scale=coi_scale,
+            apply_coi_mask=apply_coi_mask,
+        )
+
+        if tf_map["coherence"].size == 0:
+            continue
+
+        coh = tf_map["coherence"]
+        phase = tf_map["phase"]
+        if acc is None:
+            acc = np.zeros_like(coh, dtype=float)
+            acc_sq = np.zeros_like(coh, dtype=float)
+            acc_count = np.zeros_like(coh, dtype=float)
+            phase_sum = np.zeros_like(coh, dtype=complex)
+            phase_count = np.zeros_like(coh, dtype=float)
+            freqs = tf_map["frequencies"]
+            times = tf_map["times"]
+        else:
+            if coh.shape != acc.shape:
+                continue
+
+        mask = np.isfinite(coh)
+        phase_mask = np.isfinite(phase)
+        acc += np.where(mask, coh, 0.0)
+        acc_sq += np.where(mask, coh * coh, 0.0)
+        acc_count += mask.astype(float)
+        if phase_sum is not None:
+            phase_sum += np.where(phase_mask, np.exp(1j * phase), 0.0)
+            phase_count += phase_mask.astype(float)
+        count += 1
+
+    if acc is None:
+        return {
+            "frequencies": np.array([]),
+            "times": np.array([]),
+            "coherence": np.empty((0, 0)),
+            "n_windows": 0,
+        }
+
+    coherence = acc / np.maximum(acc_count, 1.0)
+    coherence[acc_count == 0] = np.nan
+    variance = acc_sq / np.maximum(acc_count, 1.0) - np.square(coherence)
+    variance = np.clip(variance, 0.0, None)
+    coherence_std = np.sqrt(variance)
+    coherence_std[acc_count == 0] = np.nan
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coherence_cv = coherence_std / coherence
+        coherence_cv[~np.isfinite(coherence_cv)] = np.nan
+
+    plv = None
+    phase_mean = None
+    if phase_sum is not None and phase_count is not None:
+        plv = np.abs(phase_sum / np.maximum(phase_count, 1.0))
+        plv[phase_count == 0] = np.nan
+        phase_mean = np.angle(phase_sum)
+        phase_mean[phase_count == 0] = np.nan
+
+    return {
+        "frequencies": freqs,
+        "times": times,
+        "coherence": coherence,
+        "coherence_std": coherence_std,
+        "coherence_cv": coherence_cv,
+        "plv": plv if plv is not None else np.empty((0, 0)),
+        "phase_mean": phase_mean if phase_mean is not None else np.empty((0, 0)),
         "n_windows": count,
     }
 
@@ -674,10 +1083,21 @@ def run_coherence_analysis(
     fs: float = 4.0,
     max_detailed_samples: int = 5,
     include_up_coherence: bool = False,
-    time_frequency_method: str = "wavelet",
+    time_frequency_method: str = "both",
     time_frequency_nperseg: int = 128,
     time_frequency_num_scales: int = 50,
+    time_frequency_min_freq: Optional[float] = None,
     time_frequency_max_freq: float = 0.5,
+    time_frequency_early_seconds: float = 30.0,
+    time_frequency_late_seconds: float = 30.0,
+    time_frequency_permutations: int = 0,
+    time_frequency_permutation_alpha: float = 0.05,
+    time_frequency_permutation_seed: Optional[int] = None,
+    time_frequency_permutation_max_samples: Optional[int] = None,
+    wavelet_pad_mode: Optional[str] = "reflect",
+    wavelet_pad_max_fraction: float = 0.25,
+    wavelet_coi_scale: float = 1.65,
+    wavelet_apply_coi_mask: bool = True,
     window_nperseg: int = 128,
     window_relative_nperseg: int = 128,
     max_window_timefreq_windows: Optional[int] = None,
@@ -701,10 +1121,21 @@ def run_coherence_analysis(
         fs: Sampling frequency in Hz (default 4.0).
         max_detailed_samples: Number of per-sample plots to generate.
         include_up_coherence: If True and UP is available, compute UP-FHR coherence.
-        time_frequency_method: "wavelet" or "stft" for time-frequency plots.
+        time_frequency_method: "stft", "wavelet", or "both" for time-frequency plots.
         time_frequency_nperseg: STFT segment length for time-frequency plots.
         time_frequency_num_scales: Number of scales for wavelet coherence.
+        time_frequency_min_freq: Minimum frequency for wavelet scale selection.
         time_frequency_max_freq: Max frequency to display in time-frequency plots.
+        time_frequency_early_seconds: Early-horizon window length for spectra comparisons.
+        time_frequency_late_seconds: Late-horizon window length for spectra comparisons.
+        time_frequency_permutations: Number of permutation samples for TF CIs (0 disables).
+        time_frequency_permutation_alpha: Significance level for permutation CIs.
+        time_frequency_permutation_seed: RNG seed for permutation sampling.
+        time_frequency_permutation_max_samples: Max samples to run permutations for.
+        wavelet_pad_mode: Padding mode for wavelet coherence (e.g. "reflect").
+        wavelet_pad_max_fraction: Max padding as fraction of window length.
+        wavelet_coi_scale: COI multiplier for edge masking in wavelet maps.
+        wavelet_apply_coi_mask: Whether to mask COI regions with NaN.
         window_nperseg: Welch segment length for per-window (2-minute) coherence.
         window_relative_nperseg: STFT segment length for within-window coherence.
         max_window_timefreq_windows: Optional limit on windows for relative maps.
@@ -734,6 +1165,7 @@ def run_coherence_analysis(
     psd_recon_list: List[np.ndarray] = []
     psd_resid_list: List[np.ndarray] = []
     corr_list: List[np.ndarray] = []
+    coherence_thresholds: List[float] = []
     frequencies = None
     up_frequencies = None
     psd_frequencies = None
@@ -743,7 +1175,35 @@ def run_coherence_analysis(
     epoch_records: List[Dict[str, Any]] = []
     window_records: List[Dict[str, Any]] = []
     relative_records: List[Dict[str, Any]] = []
+    relative_records_wavelet: List[Dict[str, Any]] = []
+    relative_tf_mean_list: List[np.ndarray] = []
+    relative_tf_std_list: List[np.ndarray] = []
+    relative_tf_cv_list: List[np.ndarray] = []
+    relative_tf_wavelet_mean_list: List[np.ndarray] = []
+    relative_tf_wavelet_std_list: List[np.ndarray] = []
+    relative_tf_wavelet_cv_list: List[np.ndarray] = []
+    relative_tf_wavelet_plv_list: List[np.ndarray] = []
+    relative_tf_wavelet_phase_list: List[np.ndarray] = []
+    horizon_early_list: List[np.ndarray] = []
+    horizon_late_list: List[np.ndarray] = []
+    horizon_delta_list: List[np.ndarray] = []
+    horizon_early_wavelet_list: List[np.ndarray] = []
+    horizon_late_wavelet_list: List[np.ndarray] = []
+    horizon_delta_wavelet_list: List[np.ndarray] = []
+    permutation_lower_list: List[np.ndarray] = []
+    permutation_upper_list: List[np.ndarray] = []
+    permutation_lower_wavelet_list: List[np.ndarray] = []
+    permutation_upper_wavelet_list: List[np.ndarray] = []
     bandpower_records: List[Dict[str, Any]] = []
+    tf_methods = _resolve_time_frequency_methods(time_frequency_method)
+    rng = np.random.default_rng(time_frequency_permutation_seed)
+    relative_tf_template = None
+    relative_tf_wavelet_template = None
+    perm_sample_limit = (
+        max_detailed_samples
+        if time_frequency_permutation_max_samples is None
+        else int(time_frequency_permutation_max_samples)
+    )
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -803,6 +1263,11 @@ def run_coherence_analysis(
                     )
                     continue
 
+                k_segments = _welch_segment_count(min_len, nperseg, nperseg // 2)
+                threshold = _coherence_significance_threshold(k_segments, time_frequency_permutation_alpha)
+                if np.isfinite(threshold):
+                    coherence_thresholds.append(threshold)
+
                 fhr_orig = fhr_orig[:min_len]
                 fhr_recon = fhr_recon[:min_len]
                 if up is not None:
@@ -820,8 +1285,17 @@ def run_coherence_analysis(
                     "coherence": np.empty((0, 0)),
                     "n_windows": 0,
                 }
+                relative_tf_wavelet = {
+                    "frequencies": np.array([]),
+                    "times": np.array([]),
+                    "coherence": np.empty((0, 0)),
+                    "n_windows": 0,
+                }
                 sample_window_band = None
                 sample_relative_band = None
+                sample_relative_band_wavelet = None
+                sample_relative_perm_stft = None
+                sample_relative_perm_wavelet = None
                 sample_bandpower = None
 
                 # Compute coherence
@@ -915,6 +1389,27 @@ def run_coherence_analysis(
                         if relative_tf["coherence"].size > 0:
                             relative_band = _band_means(relative_tf["frequencies"], relative_tf["coherence"])
                             sample_relative_band = relative_band
+                            if relative_tf_template is None:
+                                relative_tf_template = {
+                                    "frequencies": relative_tf["frequencies"],
+                                    "times": relative_tf["times"],
+                                }
+                            relative_tf_mean_list.append(relative_tf["coherence"])
+                            if "coherence_std" in relative_tf:
+                                relative_tf_std_list.append(relative_tf["coherence_std"])
+                            if "coherence_cv" in relative_tf:
+                                relative_tf_cv_list.append(relative_tf["coherence_cv"])
+                            horizon = _compute_horizon_spectra(
+                                relative_tf["frequencies"],
+                                relative_tf["times"],
+                                relative_tf["coherence"],
+                                early_seconds=time_frequency_early_seconds,
+                                late_seconds=time_frequency_late_seconds,
+                            )
+                            if horizon["early"].size:
+                                horizon_early_list.append(horizon["early"])
+                                horizon_late_list.append(horizon["late"])
+                                horizon_delta_list.append(horizon["delta"])
                             for band_name, vals in relative_band.items():
                                 baseline = float(band_recon.get(band_name, np.nan))
                                 for t_idx, rel_time in enumerate(relative_tf["times"]):
@@ -936,6 +1431,133 @@ def run_coherence_analysis(
                                         "coherence_baseline": baseline,
                                         "coherence_delta": delta,
                                     })
+                        if "wavelet" in tf_methods:
+                            try:
+                                relative_tf_wavelet = compute_window_relative_time_frequency_wavelet(
+                                    fhr_orig_full,
+                                    mu_pr_window,
+                                    fs=fs,
+                                    stride=runner.decimation_factor,
+                                    warmup=runner.warmup_steps,
+                                    num_scales=time_frequency_num_scales,
+                                    min_freq=time_frequency_min_freq,
+                                    max_freq=time_frequency_max_freq,
+                                    pad_mode=wavelet_pad_mode,
+                                    pad_max_fraction=wavelet_pad_max_fraction,
+                                    coi_scale=wavelet_coi_scale,
+                                    apply_coi_mask=wavelet_apply_coi_mask,
+                                    max_windows=max_window_timefreq_windows,
+                                )
+                            except ImportError as e:
+                                logger.warning(f"Wavelet coherence skipped: {e}")
+                            except Exception as e:
+                                logger.warning(f"Wavelet coherence failed for {guid}: {e}")
+                            else:
+                                if relative_tf_wavelet["coherence"].size > 0:
+                                    relative_band_wavelet = _band_means(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["coherence"],
+                                    )
+                                    sample_relative_band_wavelet = relative_band_wavelet
+                                    if relative_tf_wavelet_template is None:
+                                        relative_tf_wavelet_template = {
+                                            "frequencies": relative_tf_wavelet["frequencies"],
+                                            "times": relative_tf_wavelet["times"],
+                                        }
+                                    relative_tf_wavelet_mean_list.append(relative_tf_wavelet["coherence"])
+                                    if "coherence_std" in relative_tf_wavelet:
+                                        relative_tf_wavelet_std_list.append(relative_tf_wavelet["coherence_std"])
+                                    if "coherence_cv" in relative_tf_wavelet:
+                                        relative_tf_wavelet_cv_list.append(relative_tf_wavelet["coherence_cv"])
+                                    plv_map = relative_tf_wavelet.get("plv")
+                                    if plv_map is not None and plv_map.size:
+                                        relative_tf_wavelet_plv_list.append(plv_map)
+                                    phase_mean_map = relative_tf_wavelet.get("phase_mean")
+                                    if phase_mean_map is not None and phase_mean_map.size:
+                                        relative_tf_wavelet_phase_list.append(phase_mean_map)
+                                    horizon_wavelet = _compute_horizon_spectra(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["times"],
+                                        relative_tf_wavelet["coherence"],
+                                        early_seconds=time_frequency_early_seconds,
+                                        late_seconds=time_frequency_late_seconds,
+                                    )
+                                    if horizon_wavelet["early"].size:
+                                        horizon_early_wavelet_list.append(horizon_wavelet["early"])
+                                        horizon_late_wavelet_list.append(horizon_wavelet["late"])
+                                        horizon_delta_wavelet_list.append(horizon_wavelet["delta"])
+                                    for band_name, vals in relative_band_wavelet.items():
+                                        baseline = float(band_recon.get(band_name, np.nan))
+                                        for t_idx, rel_time in enumerate(relative_tf_wavelet["times"]):
+                                            coherence_val = float(vals[t_idx]) if t_idx < len(vals) else np.nan
+                                            delta = (
+                                                coherence_val - baseline
+                                                if np.isfinite(coherence_val) and np.isfinite(baseline)
+                                                else np.nan
+                                            )
+                                            relative_records_wavelet.append({
+                                                "guid": guid,
+                                                "epoch": epoch,
+                                                "label": label,
+                                                "sample_idx": processed,
+                                                "band": band_name,
+                                                "relative_frame_index": int(t_idx),
+                                                "relative_time_sec": float(rel_time),
+                                                "coherence": coherence_val,
+                                                "coherence_baseline": baseline,
+                                                "coherence_delta": delta,
+                                            })
+
+                        if time_frequency_permutations > 0 and processed < perm_sample_limit:
+                            windows = _collect_prediction_windows(
+                                fhr_orig_full,
+                                mu_pr_window,
+                                stride=runner.decimation_factor,
+                                warmup=runner.warmup_steps,
+                                max_windows=max_window_timefreq_windows,
+                            )
+                            if windows:
+                                if "stft" in tf_methods:
+                                    perm_ci = _compute_permutation_ci(
+                                        windows,
+                                        map_fn=lambda a, b: compute_stft_coherence_map(
+                                            a, b, fs=fs, nperseg=window_relative_nperseg
+                                        ),
+                                        num_permutations=time_frequency_permutations,
+                                        alpha=time_frequency_permutation_alpha,
+                                        rng=rng,
+                                    )
+                                    if perm_ci["upper"].size:
+                                        permutation_lower_list.append(perm_ci["lower"])
+                                        permutation_upper_list.append(perm_ci["upper"])
+                                        sample_relative_perm_stft = perm_ci
+                                if "wavelet" in tf_methods:
+                                    try:
+                                        perm_ci_wavelet = _compute_permutation_ci(
+                                            windows,
+                                            map_fn=lambda a, b: compute_wavelet_coherence(
+                                                a,
+                                                b,
+                                                fs=fs,
+                                                num_scales=time_frequency_num_scales,
+                                                min_freq=time_frequency_min_freq,
+                                                max_freq=time_frequency_max_freq,
+                                                pad_mode=wavelet_pad_mode,
+                                                pad_max_fraction=wavelet_pad_max_fraction,
+                                                coi_scale=wavelet_coi_scale,
+                                                apply_coi_mask=wavelet_apply_coi_mask,
+                                            ),
+                                            num_permutations=time_frequency_permutations,
+                                            alpha=time_frequency_permutation_alpha,
+                                            rng=rng,
+                                        )
+                                    except ImportError as e:
+                                        logger.warning(f"Wavelet permutation CIs skipped: {e}")
+                                    else:
+                                        if perm_ci_wavelet["upper"].size:
+                                            permutation_lower_wavelet_list.append(perm_ci_wavelet["lower"])
+                                            permutation_upper_wavelet_list.append(perm_ci_wavelet["upper"])
+                                            sample_relative_perm_wavelet = perm_ci_wavelet
 
                     # Per-window bandpower analysis
                     sample_bandpower_rows: List[Dict[str, Any]] = []
@@ -1031,36 +1653,50 @@ def run_coherence_analysis(
                         title=signal_title,
                     )
 
-                    method = str(time_frequency_method).lower() if time_frequency_method else "stft"
-                    if method not in ("stft", "wavelet"):
-                        logger.warning(f"Unknown time-frequency method '{time_frequency_method}', using STFT.")
-                        method = "stft"
+                    for method in tf_methods:
+                        try:
+                            if method == "wavelet":
+                                tf_map = compute_wavelet_coherence(
+                                    fhr_orig,
+                                    fhr_recon,
+                                    fs=fs,
+                                    num_scales=time_frequency_num_scales,
+                                    min_freq=time_frequency_min_freq,
+                                    max_freq=time_frequency_max_freq,
+                                    pad_mode=wavelet_pad_mode,
+                                    pad_max_fraction=wavelet_pad_max_fraction,
+                                    coi_scale=wavelet_coi_scale,
+                                    apply_coi_mask=wavelet_apply_coi_mask,
+                                )
+                            else:
+                                tf_map = compute_stft_coherence_map(
+                                    fhr_orig,
+                                    fhr_recon,
+                                    fs=fs,
+                                    nperseg=time_frequency_nperseg,
+                                )
 
-                    try:
-                        if method == "wavelet":
-                            tf_map = compute_wavelet_coherence(
-                                fhr_orig, fhr_recon, fs=fs, num_scales=time_frequency_num_scales
-                            )
-                        else:
-                            tf_map = compute_stft_coherence_map(
-                                fhr_orig, fhr_recon, fs=fs, nperseg=time_frequency_nperseg
-                            )
+                            if tf_map["coherence"].size == 0:
+                                logger.warning(
+                                    "Time-frequency coherence empty for %s (%s); skipping plot.",
+                                    sample_name,
+                                    method,
+                                )
+                                continue
 
-                        if tf_map["coherence"].size == 0:
-                            logger.warning(f"Time-frequency coherence empty for {sample_name}; skipping plot.")
-                        else:
+                            suffix = "wavelet" if method == "wavelet" else "stft"
                             plot_time_frequency_coherence(
                                 tf_map["frequencies"],
                                 tf_map["times"],
                                 tf_map["coherence"],
-                                output_path=sample_dir / f"{sample_name}_time_frequency.png",
+                                output_path=sample_dir / f"{sample_name}_time_frequency_{suffix}.png",
                                 max_freq=time_frequency_max_freq,
-                                title=signal_title,
+                                title=f"{signal_title} ({suffix.upper()})",
                             )
-                    except ImportError as e:
-                        logger.warning(f"Time-frequency coherence skipped: {e}")
-                    except Exception as e:
-                        logger.warning(f"Time-frequency coherence failed for {sample_name}: {e}")
+                        except ImportError as e:
+                            logger.warning(f"Time-frequency coherence skipped ({method}): {e}")
+                        except Exception as e:
+                            logger.warning(f"Time-frequency coherence failed for {sample_name} ({method}): {e}")
 
                     try:
                         if window_tf["coherence"].size == 0:
@@ -1135,16 +1771,38 @@ def run_coherence_analysis(
 
                     try:
                         if relative_tf["coherence"].size == 0:
-                            logger.warning(f"Relative window coherence empty for {sample_name}; skipping plot.")
+                            logger.warning(f"Relative window coherence empty for {sample_name}; skipping STFT plot.")
                         else:
                             plot_time_frequency_coherence(
                                 relative_tf["frequencies"],
                                 relative_tf["times"],
                                 relative_tf["coherence"],
-                                output_path=sample_dir / f"{sample_name}_relative_window_time_frequency.png",
+                                output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft.png",
                                 max_freq=time_frequency_max_freq,
-                                title=f"{signal_title} (window-relative coherence)",
+                                title=f"{signal_title} (window-relative coherence, STFT)",
                             )
+                            if relative_tf.get("coherence_std") is not None:
+                                plot_time_frequency_map(
+                                    relative_tf["frequencies"],
+                                    relative_tf["times"],
+                                    relative_tf["coherence_std"],
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_std.png",
+                                    max_freq=time_frequency_max_freq,
+                                    title=f"{signal_title} (window-relative coherence std, STFT)",
+                                    cmap="viridis",
+                                    colorbar_label="Std",
+                                )
+                            if relative_tf.get("coherence_cv") is not None:
+                                plot_time_frequency_map(
+                                    relative_tf["frequencies"],
+                                    relative_tf["times"],
+                                    relative_tf["coherence_cv"],
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_cv.png",
+                                    max_freq=time_frequency_max_freq,
+                                    title=f"{signal_title} (window-relative coherence CV, STFT)",
+                                    cmap="magma",
+                                    colorbar_label="CV",
+                                )
                             if sample_relative_band is not None:
                                 relative_band_df = pd.DataFrame([
                                     {
@@ -1180,16 +1838,161 @@ def run_coherence_analysis(
                                         if delta_rows:
                                             relative_delta_df = pd.DataFrame(delta_rows)
                                             _plot_band_trends(
-                                            relative_delta_df,
-                                            sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
-                                            x_col="relative_frame_index",
-                                            x_label="STFT frame index",
-                                            title=f"{signal_title} (delta coherence vs frame index)",
-                                            y_label="Delta coherence",
-                                            single_label="Delta coherence",
-                                        )
+                                                relative_delta_df,
+                                                sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
+                                                x_col="relative_frame_index",
+                                                x_label="STFT frame index",
+                                                title=f"{signal_title} (delta coherence vs frame index)",
+                                                y_label="Delta coherence",
+                                                single_label="Delta coherence",
+                                            )
                     except Exception as e:
                         logger.warning(f"Relative window coherence failed for {sample_name}: {e}")
+
+                    try:
+                        if "wavelet" in tf_methods:
+                            if relative_tf_wavelet["coherence"].size == 0:
+                                logger.warning(
+                                    f"Relative window coherence empty for {sample_name}; skipping wavelet plot."
+                                )
+                            else:
+                                plot_time_frequency_coherence(
+                                    relative_tf_wavelet["frequencies"],
+                                    relative_tf_wavelet["times"],
+                                    relative_tf_wavelet["coherence"],
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet.png",
+                                    max_freq=time_frequency_max_freq,
+                                    title=f"{signal_title} (window-relative coherence, WAVELET)",
+                                )
+                                if relative_tf_wavelet.get("coherence_std") is not None:
+                                    plot_time_frequency_map(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["times"],
+                                        relative_tf_wavelet["coherence_std"],
+                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_std.png",
+                                        max_freq=time_frequency_max_freq,
+                                        title=f"{signal_title} (window-relative coherence std, WAVELET)",
+                                        cmap="viridis",
+                                        colorbar_label="Std",
+                                    )
+                                if relative_tf_wavelet.get("coherence_cv") is not None:
+                                    plot_time_frequency_map(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["times"],
+                                        relative_tf_wavelet["coherence_cv"],
+                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_cv.png",
+                                        max_freq=time_frequency_max_freq,
+                                        title=f"{signal_title} (window-relative coherence CV, WAVELET)",
+                                        cmap="magma",
+                                        colorbar_label="CV",
+                                    )
+                                if relative_tf_wavelet.get("plv") is not None:
+                                    plot_time_frequency_map(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["times"],
+                                        relative_tf_wavelet["plv"],
+                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_plv.png",
+                                        max_freq=time_frequency_max_freq,
+                                        title=f"{signal_title} (wavelet PLV)",
+                                        cmap="viridis",
+                                        vmin=0.0,
+                                        vmax=1.0,
+                                        colorbar_label="PLV",
+                                    )
+                                if relative_tf_wavelet.get("phase_mean") is not None:
+                                    plot_time_frequency_map(
+                                        relative_tf_wavelet["frequencies"],
+                                        relative_tf_wavelet["times"],
+                                        relative_tf_wavelet["phase_mean"],
+                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_phase.png",
+                                        max_freq=time_frequency_max_freq,
+                                        title=f"{signal_title} (wavelet phase mean)",
+                                        cmap="twilight",
+                                        vmin=-np.pi,
+                                        vmax=np.pi,
+                                        colorbar_label="Phase (rad)",
+                                    )
+                                if sample_relative_band_wavelet is not None:
+                                    relative_band_df = pd.DataFrame([
+                                        {
+                                            "band": band_name,
+                                            "relative_time_sec": float(rel_time),
+                                            "coherence_mean": float(val) if t_idx < len(vals) else np.nan,
+                                        }
+                                        for band_name, vals in sample_relative_band_wavelet.items()
+                                        for t_idx, (rel_time, val) in enumerate(
+                                            zip(relative_tf_wavelet["times"], vals)
+                                        )
+                                    ])
+                                    if not relative_band_df.empty:
+                                        _plot_band_trends(
+                                            relative_band_df,
+                                            sample_dir / f"{sample_name}_relative_band_coherence_wavelet.png",
+                                            x_col="relative_time_sec",
+                                            x_label="Time From Window Start (seconds)",
+                                            title=f"{signal_title} (band coherence vs time, WAVELET)",
+                                            y_label="Coherence",
+                                        )
+                                        if band_recon:
+                                            delta_rows = []
+                                            for band_name, vals in sample_relative_band_wavelet.items():
+                                                baseline = float(band_recon.get(band_name, np.nan))
+                                                for rel_time, val in zip(relative_tf_wavelet["times"], vals):
+                                                    val_f = float(val)
+                                                    if not np.isfinite(val_f) or not np.isfinite(baseline):
+                                                        continue
+                                                    delta_rows.append({
+                                                        "band": band_name,
+                                                        "relative_time_sec": float(rel_time),
+                                                        "coherence_mean": val_f - baseline,
+                                                    })
+                                            if delta_rows:
+                                                relative_delta_df = pd.DataFrame(delta_rows)
+                                            _plot_band_trends(
+                                                relative_delta_df,
+                                                sample_dir / f"{sample_name}_relative_band_coherence_delta_wavelet.png",
+                                                x_col="relative_time_sec",
+                                                x_label="Time From Window Start (seconds)",
+                                                title=f"{signal_title} (delta coherence vs time, WAVELET)",
+                                                y_label="Delta coherence",
+                                                single_label="Delta coherence",
+                                            )
+                    except Exception as e:
+                        logger.warning(f"Relative window wavelet coherence failed for {sample_name}: {e}")
+
+                    try:
+                        if sample_relative_perm_stft is not None:
+                            plot_time_frequency_map(
+                                sample_relative_perm_stft["frequencies"],
+                                sample_relative_perm_stft["times"],
+                                sample_relative_perm_stft["upper"],
+                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_stft.png",
+                                max_freq=time_frequency_max_freq,
+                                title=f"{signal_title} (perm upper CI, STFT)",
+                                cmap="viridis",
+                                vmin=0.0,
+                                vmax=1.0,
+                                colorbar_label="Coherence",
+                            )
+                    except Exception as e:
+                        logger.warning(f"Permutation CI plot failed for {sample_name} (STFT): {e}")
+
+                    try:
+                        if sample_relative_perm_wavelet is not None:
+                            plot_time_frequency_map(
+                                sample_relative_perm_wavelet["frequencies"],
+                                sample_relative_perm_wavelet["times"],
+                                sample_relative_perm_wavelet["upper"],
+                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_wavelet.png",
+                                max_freq=time_frequency_max_freq,
+                                title=f"{signal_title} (perm upper CI, WAVELET)",
+                                cmap="viridis",
+                                vmin=0.0,
+                                vmax=1.0,
+                                colorbar_label="Coherence",
+                            )
+                    except Exception as e:
+                        logger.warning(f"Permutation CI plot failed for {sample_name} (WAVELET): {e}")
 
                     try:
                         if mu_pr_window is not None and mu_pr_window.size > 0:
@@ -1230,25 +2033,47 @@ def run_coherence_analysis(
                                             max_freq=time_frequency_max_freq,
                                         )
 
-                                method = str(time_frequency_method).lower() if time_frequency_method else "stft"
-                                if method not in ("stft", "wavelet"):
-                                    method = "stft"
-                                if method == "wavelet":
-                                    tf_map = compute_wavelet_coherence(
-                                        ref_win, pred_win, fs=fs, num_scales=time_frequency_num_scales
-                                    )
-                                else:
-                                    tf_map = compute_stft_coherence_map(
-                                        ref_win, pred_win, fs=fs, nperseg=time_frequency_nperseg
-                                    )
-                                if tf_map["coherence"].size > 0:
+                                for method in tf_methods:
+                                    try:
+                                        if method == "wavelet":
+                                            tf_map = compute_wavelet_coherence(
+                                                ref_win,
+                                                pred_win,
+                                                fs=fs,
+                                                num_scales=time_frequency_num_scales,
+                                                min_freq=time_frequency_min_freq,
+                                                max_freq=time_frequency_max_freq,
+                                                pad_mode=wavelet_pad_mode,
+                                                pad_max_fraction=wavelet_pad_max_fraction,
+                                                coi_scale=wavelet_coi_scale,
+                                                apply_coi_mask=wavelet_apply_coi_mask,
+                                            )
+                                        else:
+                                            tf_map = compute_stft_coherence_map(
+                                                ref_win,
+                                                pred_win,
+                                                fs=fs,
+                                                nperseg=time_frequency_nperseg,
+                                            )
+                                    except ImportError as e:
+                                        logger.warning(f"Single-window wavelet coherence skipped: {e}")
+                                        continue
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Single-window time-frequency coherence failed for {sample_name}: {e}"
+                                        )
+                                        continue
+
+                                    if tf_map["coherence"].size == 0:
+                                        continue
+                                    suffix = "wavelet" if method == "wavelet" else "stft"
                                     plot_time_frequency_coherence(
                                         tf_map["frequencies"],
                                         tf_map["times"],
                                         tf_map["coherence"],
-                                        output_path=sample_dir / f"{window_prefix}_time_frequency.png",
+                                        output_path=sample_dir / f"{window_prefix}_time_frequency_{suffix}.png",
                                         max_freq=time_frequency_max_freq,
-                                        title=f"{window_title} (time-frequency coherence)",
+                                        title=f"{window_title} (time-frequency coherence, {suffix.upper()})",
                                     )
 
                                 psd_freq, psd_orig = compute_welch_psd(ref_win, fs=fs, nperseg=psd_nperseg)
@@ -1351,6 +2176,8 @@ def run_coherence_analysis(
     }
     results["coherence_reconstructed"] = results["recon_coherence_mean"]
     results["coherence_std_reconstructed"] = results["recon_coherence_std"]
+    if coherence_thresholds:
+        results["coherence_significance_threshold_mean"] = float(np.nanmean(coherence_thresholds))
 
     # Create visualization
     output_dir = runner.ensure_dir("coherence")
@@ -1359,6 +2186,7 @@ def run_coherence_analysis(
         results["recon_coherence_mean"],
         results["recon_coherence_std"],
         output_dir,
+        significance_threshold=results.get("coherence_significance_threshold_mean"),
     )
 
     if include_up_coherence and up_coherence_original_list and up_frequencies is not None:
@@ -1588,6 +2416,375 @@ def run_coherence_analysis(
                 single_label="Delta coherence",
             )
 
+    if relative_tf_mean_list and relative_tf_template is not None:
+        tf_stack = _stack_consistent(relative_tf_mean_list)
+        tf_std_stack = _stack_consistent(relative_tf_std_list)
+        tf_cv_stack = _stack_consistent(relative_tf_cv_list)
+        if tf_stack.size:
+            tf_mean = np.nanmean(tf_stack, axis=0)
+            tf_std = np.nanstd(tf_stack, axis=0)
+            plot_time_frequency_coherence(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                tf_mean,
+                output_path=output_dir / "relative_window_time_frequency_mean_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-Relative Coherence Mean (STFT)",
+            )
+            plot_time_frequency_map(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                tf_std,
+                output_path=output_dir / "relative_window_time_frequency_std_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-Relative Coherence Std Across Samples (STFT)",
+                cmap="viridis",
+                colorbar_label="Std",
+            )
+        if tf_std_stack.size:
+            tf_std_mean = np.nanmean(tf_std_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                tf_std_mean,
+                output_path=output_dir / "relative_window_time_frequency_window_std_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-to-Window Std (STFT)",
+                cmap="viridis",
+                colorbar_label="Std",
+            )
+        if tf_cv_stack.size:
+            tf_cv_mean = np.nanmean(tf_cv_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                tf_cv_mean,
+                output_path=output_dir / "relative_window_time_frequency_window_cv_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-to-Window CV (STFT)",
+                cmap="magma",
+                colorbar_label="CV",
+            )
+
+    if relative_tf_wavelet_mean_list and relative_tf_wavelet_template is not None:
+        tfw_stack = _stack_consistent(relative_tf_wavelet_mean_list)
+        tfw_std_stack = _stack_consistent(relative_tf_wavelet_std_list)
+        tfw_cv_stack = _stack_consistent(relative_tf_wavelet_cv_list)
+        if tfw_stack.size:
+            tfw_mean = np.nanmean(tfw_stack, axis=0)
+            tfw_std = np.nanstd(tfw_stack, axis=0)
+            plot_time_frequency_coherence(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                tfw_mean,
+                output_path=output_dir / "relative_window_time_frequency_mean_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-Relative Coherence Mean (WAVELET)",
+            )
+            plot_time_frequency_map(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                tfw_std,
+                output_path=output_dir / "relative_window_time_frequency_std_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-Relative Coherence Std Across Samples (WAVELET)",
+                cmap="viridis",
+                colorbar_label="Std",
+            )
+        if tfw_std_stack.size:
+            tfw_std_mean = np.nanmean(tfw_std_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                tfw_std_mean,
+                output_path=output_dir / "relative_window_time_frequency_window_std_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-to-Window Std (WAVELET)",
+                cmap="viridis",
+                colorbar_label="Std",
+            )
+        if tfw_cv_stack.size:
+            tfw_cv_mean = np.nanmean(tfw_cv_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                tfw_cv_mean,
+                output_path=output_dir / "relative_window_time_frequency_window_cv_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Window-to-Window CV (WAVELET)",
+                cmap="magma",
+                colorbar_label="CV",
+            )
+
+        if relative_tf_wavelet_plv_list:
+            plv_stack = _stack_consistent(relative_tf_wavelet_plv_list)
+            if plv_stack.size:
+                plv_mean = np.nanmean(plv_stack, axis=0)
+                plot_time_frequency_map(
+                    relative_tf_wavelet_template["frequencies"],
+                    relative_tf_wavelet_template["times"],
+                    plv_mean,
+                    output_path=output_dir / "relative_window_wavelet_plv.png",
+                    max_freq=time_frequency_max_freq,
+                    title="Wavelet PLV (Mean Across Samples)",
+                    cmap="viridis",
+                    vmin=0.0,
+                    vmax=1.0,
+                    colorbar_label="PLV",
+                )
+
+        if relative_tf_wavelet_phase_list:
+            phase_stack = _stack_consistent(relative_tf_wavelet_phase_list)
+            if phase_stack.size:
+                exp_phase = np.exp(1j * phase_stack)
+                exp_phase[~np.isfinite(phase_stack)] = np.nan + 1j * np.nan
+                phase_sum = np.nansum(exp_phase, axis=0)
+                phase_count = np.sum(np.isfinite(phase_stack), axis=0)
+                phase_mean = np.angle(phase_sum)
+                phase_mean[phase_count == 0] = np.nan
+                plot_time_frequency_map(
+                    relative_tf_wavelet_template["frequencies"],
+                    relative_tf_wavelet_template["times"],
+                    phase_mean,
+                    output_path=output_dir / "relative_window_wavelet_phase_mean.png",
+                    max_freq=time_frequency_max_freq,
+                    title="Wavelet Phase Mean (Across Samples)",
+                    cmap="twilight",
+                    vmin=-np.pi,
+                    vmax=np.pi,
+                    colorbar_label="Phase (rad)",
+                )
+
+    if horizon_early_list and relative_tf_template is not None:
+        early_stack = _stack_consistent(horizon_early_list)
+        late_stack = _stack_consistent(horizon_late_list)
+        delta_stack = _stack_consistent(horizon_delta_list)
+        if early_stack.size and late_stack.size:
+            early_mean = np.nanmean(early_stack, axis=0)
+            late_mean = np.nanmean(late_stack, axis=0)
+            early_std = np.nanstd(early_stack, axis=0)
+            late_std = np.nanstd(late_stack, axis=0)
+            horizon_df = pd.DataFrame({
+                "frequency": relative_tf_template["frequencies"],
+                "early_mean": early_mean,
+                "early_std": early_std,
+                "late_mean": late_mean,
+                "late_std": late_std,
+            })
+            horizon_df["delta_mean"] = horizon_df["late_mean"] - horizon_df["early_mean"]
+            horizon_df["delta_std"] = np.nanstd(delta_stack, axis=0) if delta_stack.size else np.nan
+            horizon_df.to_csv(output_dir / "relative_window_horizon_spectra_stft.csv", index=False)
+            plot_horizon_spectra(
+                relative_tf_template["frequencies"],
+                early_mean,
+                early_std,
+                late_mean,
+                late_std,
+                output_path=output_dir / "relative_window_horizon_spectra_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Early vs Late Horizon Coherence (STFT)",
+            )
+        if delta_stack.size:
+            delta_mean = np.nanmean(delta_stack, axis=0)
+            delta_std = np.nanstd(delta_stack, axis=0)
+            plot_spectrum_delta(
+                relative_tf_template["frequencies"],
+                delta_mean,
+                delta_std,
+                output_path=output_dir / "relative_window_horizon_delta_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Horizon Delta Coherence (STFT)",
+            )
+
+    if horizon_early_wavelet_list and relative_tf_wavelet_template is not None:
+        early_stack = _stack_consistent(horizon_early_wavelet_list)
+        late_stack = _stack_consistent(horizon_late_wavelet_list)
+        delta_stack = _stack_consistent(horizon_delta_wavelet_list)
+        if early_stack.size and late_stack.size:
+            early_mean = np.nanmean(early_stack, axis=0)
+            late_mean = np.nanmean(late_stack, axis=0)
+            early_std = np.nanstd(early_stack, axis=0)
+            late_std = np.nanstd(late_stack, axis=0)
+            horizon_df = pd.DataFrame({
+                "frequency": relative_tf_wavelet_template["frequencies"],
+                "early_mean": early_mean,
+                "early_std": early_std,
+                "late_mean": late_mean,
+                "late_std": late_std,
+            })
+            horizon_df["delta_mean"] = horizon_df["late_mean"] - horizon_df["early_mean"]
+            horizon_df["delta_std"] = np.nanstd(delta_stack, axis=0) if delta_stack.size else np.nan
+            horizon_df.to_csv(output_dir / "relative_window_horizon_spectra_wavelet.csv", index=False)
+            plot_horizon_spectra(
+                relative_tf_wavelet_template["frequencies"],
+                early_mean,
+                early_std,
+                late_mean,
+                late_std,
+                output_path=output_dir / "relative_window_horizon_spectra_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Early vs Late Horizon Coherence (WAVELET)",
+            )
+        if delta_stack.size:
+            delta_mean = np.nanmean(delta_stack, axis=0)
+            delta_std = np.nanstd(delta_stack, axis=0)
+            plot_spectrum_delta(
+                relative_tf_wavelet_template["frequencies"],
+                delta_mean,
+                delta_std,
+                output_path=output_dir / "relative_window_horizon_delta_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Horizon Delta Coherence (WAVELET)",
+            )
+
+    if permutation_upper_list and relative_tf_template is not None:
+        perm_upper_stack = _stack_consistent(permutation_upper_list)
+        perm_lower_stack = _stack_consistent(permutation_lower_list)
+        if perm_upper_stack.size:
+            perm_upper_mean = np.nanmean(perm_upper_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                perm_upper_mean,
+                output_path=output_dir / "relative_window_perm_upper_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Permutation Upper CI (STFT)",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                colorbar_label="Coherence",
+            )
+        if perm_lower_stack.size:
+            perm_lower_mean = np.nanmean(perm_lower_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_template["frequencies"],
+                relative_tf_template["times"],
+                perm_lower_mean,
+                output_path=output_dir / "relative_window_perm_lower_stft.png",
+                max_freq=time_frequency_max_freq,
+                title="Permutation Lower CI (STFT)",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                colorbar_label="Coherence",
+            )
+
+    if permutation_upper_wavelet_list and relative_tf_wavelet_template is not None:
+        perm_upper_stack = _stack_consistent(permutation_upper_wavelet_list)
+        perm_lower_stack = _stack_consistent(permutation_lower_wavelet_list)
+        if perm_upper_stack.size:
+            perm_upper_mean = np.nanmean(perm_upper_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                perm_upper_mean,
+                output_path=output_dir / "relative_window_perm_upper_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Permutation Upper CI (WAVELET)",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                colorbar_label="Coherence",
+            )
+        if perm_lower_stack.size:
+            perm_lower_mean = np.nanmean(perm_lower_stack, axis=0)
+            plot_time_frequency_map(
+                relative_tf_wavelet_template["frequencies"],
+                relative_tf_wavelet_template["times"],
+                perm_lower_mean,
+                output_path=output_dir / "relative_window_perm_lower_wavelet.png",
+                max_freq=time_frequency_max_freq,
+                title="Permutation Lower CI (WAVELET)",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                colorbar_label="Coherence",
+            )
+
+    if relative_records_wavelet:
+        df_relative_wavelet = pd.DataFrame(relative_records_wavelet)
+        df_relative_wavelet.to_csv(
+            output_dir / "relative_window_coherence_summary_wavelet.csv",
+            index=False,
+        )
+
+        relative_wavelet_agg = df_relative_wavelet.groupby(["band", "relative_time_sec"]).agg(
+            coherence_mean=("coherence", "mean"),
+            coherence_std=("coherence", "std"),
+        ).reset_index()
+        relative_wavelet_agg.to_csv(
+            output_dir / "relative_window_coherence_aggregate_wavelet.csv",
+            index=False,
+        )
+
+        _plot_band_trends(
+            relative_wavelet_agg,
+            output_dir / "relative_window_coherence_trends_wavelet.png",
+            x_col="relative_time_sec",
+            x_label="Time From Window Start (seconds)",
+            title="Wavelet Coherence vs Time From Window Start",
+            y_label="Coherence",
+        )
+
+        relative_wavelet_index = df_relative_wavelet.groupby(["band", "relative_frame_index"]).agg(
+            coherence_mean=("coherence", "mean"),
+            coherence_std=("coherence", "std"),
+        ).reset_index()
+        relative_wavelet_index.to_csv(
+            output_dir / "relative_window_coherence_index_aggregate_wavelet.csv",
+            index=False,
+        )
+
+        _plot_band_trends(
+            relative_wavelet_index,
+            output_dir / "relative_window_coherence_trends_index_wavelet.png",
+            x_col="relative_frame_index",
+            x_label="Wavelet time index",
+            title="Wavelet Coherence vs Time Index",
+            y_label="Coherence",
+        )
+
+        if "coherence_delta" in df_relative_wavelet.columns:
+            relative_wavelet_delta = df_relative_wavelet.groupby(["band", "relative_time_sec"]).agg(
+                coherence_mean=("coherence_delta", "mean"),
+                coherence_std=("coherence_delta", "std"),
+            ).reset_index()
+            relative_wavelet_delta.to_csv(
+                output_dir / "relative_window_coherence_delta_aggregate_wavelet.csv",
+                index=False,
+            )
+
+            _plot_band_trends(
+                relative_wavelet_delta,
+                output_dir / "relative_window_coherence_delta_trends_wavelet.png",
+                x_col="relative_time_sec",
+                x_label="Time From Window Start (seconds)",
+                title="Wavelet Delta Coherence vs Time From Window Start",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
+
+            relative_wavelet_delta_index = df_relative_wavelet.groupby(
+                ["band", "relative_frame_index"]
+            ).agg(
+                coherence_mean=("coherence_delta", "mean"),
+                coherence_std=("coherence_delta", "std"),
+            ).reset_index()
+            relative_wavelet_delta_index.to_csv(
+                output_dir / "relative_window_coherence_delta_index_aggregate_wavelet.csv",
+                index=False,
+            )
+
+            _plot_band_trends(
+                relative_wavelet_delta_index,
+                output_dir / "relative_window_coherence_delta_trends_index_wavelet.png",
+                x_col="relative_frame_index",
+                x_label="Wavelet time index",
+                title="Wavelet Delta Coherence vs Time Index",
+                y_label="Delta coherence",
+                single_label="Delta coherence",
+            )
+
     if bandpower_records:
         df_bandpower = pd.DataFrame(bandpower_records)
         df_bandpower.to_csv(output_dir / "window_bandpower_summary.csv", index=False)
@@ -1656,6 +2853,9 @@ def run_coherence_analysis(
         f.write("=" * 40 + "\n\n")
         f.write(f"Samples analyzed: {processed}\n")
         f.write(f"Segment length: {nperseg} samples ({nperseg / fs:.1f} seconds)\n\n")
+        if coherence_thresholds:
+            threshold_mean = float(np.nanmean(coherence_thresholds))
+            f.write(f"Mean significance threshold (alpha={time_frequency_permutation_alpha:.3f}): {threshold_mean:.4f}\n\n")
         f.write("Mean coherence by frequency band (FHR vs reconstructed):\n")
 
         # Compute band averages
@@ -1708,6 +2908,36 @@ def run_coherence_analysis(
         f.write("  relative_window_coherence_delta_trends.png\n")
         f.write("  relative_window_coherence_delta_index_aggregate.csv\n")
         f.write("  relative_window_coherence_delta_trends_index.png\n")
+        f.write("  relative_window_time_frequency_mean_stft.png\n")
+        f.write("  relative_window_time_frequency_std_stft.png\n")
+        f.write("  relative_window_time_frequency_window_std_stft.png\n")
+        f.write("  relative_window_time_frequency_window_cv_stft.png\n")
+        f.write("  relative_window_horizon_spectra_stft.png\n")
+        f.write("  relative_window_horizon_delta_stft.png\n")
+        f.write("  relative_window_horizon_spectra_stft.csv\n")
+        f.write("  relative_window_perm_upper_stft.png\n")
+        f.write("  relative_window_perm_lower_stft.png\n")
+        if relative_records_wavelet:
+            f.write("  relative_window_coherence_summary_wavelet.csv\n")
+            f.write("  relative_window_coherence_aggregate_wavelet.csv\n")
+            f.write("  relative_window_coherence_trends_wavelet.png\n")
+            f.write("  relative_window_coherence_index_aggregate_wavelet.csv\n")
+            f.write("  relative_window_coherence_trends_index_wavelet.png\n")
+            f.write("  relative_window_coherence_delta_aggregate_wavelet.csv\n")
+            f.write("  relative_window_coherence_delta_trends_wavelet.png\n")
+            f.write("  relative_window_coherence_delta_index_aggregate_wavelet.csv\n")
+            f.write("  relative_window_coherence_delta_trends_index_wavelet.png\n")
+            f.write("  relative_window_time_frequency_mean_wavelet.png\n")
+            f.write("  relative_window_time_frequency_std_wavelet.png\n")
+            f.write("  relative_window_time_frequency_window_std_wavelet.png\n")
+            f.write("  relative_window_time_frequency_window_cv_wavelet.png\n")
+            f.write("  relative_window_wavelet_plv.png\n")
+            f.write("  relative_window_wavelet_phase_mean.png\n")
+            f.write("  relative_window_horizon_spectra_wavelet.png\n")
+            f.write("  relative_window_horizon_delta_wavelet.png\n")
+            f.write("  relative_window_horizon_spectra_wavelet.csv\n")
+            f.write("  relative_window_perm_upper_wavelet.png\n")
+            f.write("  relative_window_perm_lower_wavelet.png\n")
         f.write("  window_bandpower_summary.csv\n")
         f.write("  window_bandpower_aggregate.csv\n")
         f.write("  window_bandpower_trends.png\n")
@@ -1716,16 +2946,29 @@ def run_coherence_analysis(
         f.write("  window_bandpower_delta_trends.png\n")
         f.write("  window_bandpower_delta_trends_index.png\n")
         f.write("  samples/<sample>_signals.png\n")
-        f.write("  samples/<sample>_time_frequency.png\n")
+        f.write("  samples/<sample>_time_frequency_stft.png\n")
+        f.write("  samples/<sample>_time_frequency_wavelet.png\n")
         f.write("  samples/<sample>_windowed_coherence.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft_std.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft_cv.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_std.png\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_cv.png\n")
         f.write("  samples/<sample>_window_band_coherence.png\n")
         f.write("  samples/<sample>_window_band_coherence_delta.png\n")
         f.write("  samples/<sample>_relative_band_coherence.png\n")
         f.write("  samples/<sample>_relative_band_coherence_delta.png\n")
+        f.write("  samples/<sample>_relative_band_coherence_wavelet.png\n")
+        f.write("  samples/<sample>_relative_band_coherence_delta_wavelet.png\n")
+        f.write("  samples/<sample>_relative_window_wavelet_plv.png\n")
+        f.write("  samples/<sample>_relative_window_wavelet_phase.png\n")
+        f.write("  samples/<sample>_relative_window_perm_upper_stft.png\n")
+        f.write("  samples/<sample>_relative_window_perm_upper_wavelet.png\n")
         f.write("  samples/<sample>_single_window_*_signals.png\n")
         f.write("  samples/<sample>_single_window_*_coherence_spectrum.png\n")
-        f.write("  samples/<sample>_single_window_*_time_frequency.png\n")
+        f.write("  samples/<sample>_single_window_*_time_frequency_stft.png\n")
+        f.write("  samples/<sample>_single_window_*_time_frequency_wavelet.png\n")
         f.write("  samples/<sample>_single_window_*_psd.png\n")
         f.write("  samples/<sample>_single_window_*_cross_correlation.png\n")
         f.write("  samples/<sample>_window_bandpower.png\n")
