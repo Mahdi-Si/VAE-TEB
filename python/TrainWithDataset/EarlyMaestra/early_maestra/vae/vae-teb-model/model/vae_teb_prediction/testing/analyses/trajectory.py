@@ -472,7 +472,7 @@ class TrajectoryAnalyzer:
         return df
 
     def _plot_kld_vs_time(self) -> None:
-        """Plot mean KLD vs hours before birth."""
+        """Plot mean KLD vs hours before birth and save data to CSV."""
         if self.epoch_df.empty:
             return
 
@@ -480,12 +480,29 @@ class TrajectoryAnalyzer:
         epoch_df = self.epoch_df.drop(columns=["label"], errors="ignore")
         plot_kld_trajectory(epoch_df, self.output_dir / "plots")
 
+        # Save raw epoch data as CSV for reproducibility
+        csv_path = self.output_dir / "kld_trajectory_raw.csv"
+        self.epoch_df.to_csv(csv_path, index=False)
+        logger.info(f"Saved raw KLD trajectory data to {csv_path}")
+
+        # Compute and save the aggregated data that's actually plotted (30-min bins)
+        df_for_agg = self.epoch_df.copy()
+        df_for_agg["hour_bin"] = (df_for_agg["hours_before"] * 2).round() / 2
+        agg_df = df_for_agg.groupby("hour_bin")["kld_mean"].agg(["mean", "std", "count"]).reset_index()
+        agg_df.columns = ["hour_bin", "kld_mean", "kld_std", "n_samples"]
+        agg_csv_path = self.output_dir / "kld_trajectory_aggregated.csv"
+        agg_df.to_csv(agg_csv_path, index=False)
+        logger.info(f"Saved aggregated KLD trajectory data to {agg_csv_path}")
+
     def _plot_kld_by_class(self) -> None:
-        """Plot KLD trajectories separated by class."""
+        """Plot KLD trajectories separated by class and save data to CSV."""
         if self.epoch_df.empty or "label" not in self.epoch_df.columns:
             return
 
         fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Collect aggregated data for all classes to save to CSV
+        all_class_agg: List[pd.DataFrame] = []
 
         for label in self.epoch_df["label"].unique():
             if label == "unknown":
@@ -495,12 +512,15 @@ class TrajectoryAnalyzer:
             subset = subset.copy()
             subset["hour_bin"] = (subset["hours_before"] * 2).round() / 2  # 30-min bins
 
-            agg = subset.groupby("hour_bin")["kld_mean"].agg(["mean", "std"]).reset_index()
+            agg = subset.groupby("hour_bin")["kld_mean"].agg(["mean", "std", "count"]).reset_index()
             agg = agg[agg["hour_bin"].notna()]
+            agg["label"] = label
+            agg.columns = ["hour_bin", "kld_mean", "kld_std", "n_samples", "label"]
+            all_class_agg.append(agg)
 
             color = self.colors.get(label, "#666666")
-            ax.plot(agg["hour_bin"], agg["mean"], color=color, linewidth=2, label=label, marker="o", markersize=4)
-            ax.fill_between(agg["hour_bin"], agg["mean"] - agg["std"], agg["mean"] + agg["std"], alpha=0.2, color=color)
+            ax.plot(agg["hour_bin"], agg["kld_mean"], color=color, linewidth=2, label=label, marker="o", markersize=4)
+            ax.fill_between(agg["hour_bin"], agg["kld_mean"] - agg["kld_std"], agg["kld_mean"] + agg["kld_std"], alpha=0.2, color=color)
 
         ax.set_xlabel("Hours Before Birth")
         ax.set_ylabel("KLD (Transfer Entropy)")
@@ -512,6 +532,13 @@ class TrajectoryAnalyzer:
         fig.tight_layout()
         fig.savefig(self.output_dir / "plots" / "kld_by_class.svg", dpi=200)
         plt.close(fig)
+
+        # Save class-aggregated data to CSV
+        if all_class_agg:
+            class_agg_df = pd.concat(all_class_agg, ignore_index=True)
+            csv_path = self.output_dir / "kld_trajectory_by_class.csv"
+            class_agg_df.to_csv(csv_path, index=False)
+            logger.info(f"Saved class-aggregated KLD trajectory data to {csv_path}")
 
     def _plot_kld_guid_trajectories(
         self,
