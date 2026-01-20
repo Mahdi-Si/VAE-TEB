@@ -472,7 +472,7 @@ class TrajectoryAnalyzer:
         return df
 
     def _plot_kld_vs_time(self) -> None:
-        """Plot mean KLD vs hours before birth."""
+        """Plot mean KLD vs hours before birth and save data to CSV."""
         if self.epoch_df.empty:
             return
 
@@ -480,12 +480,29 @@ class TrajectoryAnalyzer:
         epoch_df = self.epoch_df.drop(columns=["label"], errors="ignore")
         plot_kld_trajectory(epoch_df, self.output_dir / "plots")
 
+        # Save raw epoch data as CSV for reproducibility
+        csv_path = self.output_dir / "kld_trajectory_raw.csv"
+        self.epoch_df.to_csv(csv_path, index=False)
+        logger.info(f"Saved raw KLD trajectory data to {csv_path}")
+
+        # Compute and save the aggregated data that's actually plotted (30-min bins)
+        df_for_agg = self.epoch_df.copy()
+        df_for_agg["hour_bin"] = (df_for_agg["hours_before"] * 2).round() / 2
+        agg_df = df_for_agg.groupby("hour_bin")["kld_mean"].agg(["mean", "std", "count"]).reset_index()
+        agg_df.columns = ["hour_bin", "kld_mean", "kld_std", "n_samples"]
+        agg_csv_path = self.output_dir / "kld_trajectory_aggregated.csv"
+        agg_df.to_csv(agg_csv_path, index=False)
+        logger.info(f"Saved aggregated KLD trajectory data to {agg_csv_path}")
+
     def _plot_kld_by_class(self) -> None:
-        """Plot KLD trajectories separated by class."""
+        """Plot KLD trajectories separated by class and save data to CSV."""
         if self.epoch_df.empty or "label" not in self.epoch_df.columns:
             return
 
         fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Collect aggregated data for all classes to save to CSV
+        all_class_agg: List[pd.DataFrame] = []
 
         for label in self.epoch_df["label"].unique():
             if label == "unknown":
@@ -495,12 +512,15 @@ class TrajectoryAnalyzer:
             subset = subset.copy()
             subset["hour_bin"] = (subset["hours_before"] * 2).round() / 2  # 30-min bins
 
-            agg = subset.groupby("hour_bin")["kld_mean"].agg(["mean", "std"]).reset_index()
+            agg = subset.groupby("hour_bin")["kld_mean"].agg(["mean", "std", "count"]).reset_index()
             agg = agg[agg["hour_bin"].notna()]
+            agg["label"] = label
+            agg.columns = ["hour_bin", "kld_mean", "kld_std", "n_samples", "label"]
+            all_class_agg.append(agg)
 
             color = self.colors.get(label, "#666666")
-            ax.plot(agg["hour_bin"], agg["mean"], color=color, linewidth=2, label=label, marker="o", markersize=4)
-            ax.fill_between(agg["hour_bin"], agg["mean"] - agg["std"], agg["mean"] + agg["std"], alpha=0.2, color=color)
+            ax.plot(agg["hour_bin"], agg["kld_mean"], color=color, linewidth=2, label=label, marker="o", markersize=4)
+            ax.fill_between(agg["hour_bin"], agg["kld_mean"] - agg["kld_std"], agg["kld_mean"] + agg["kld_std"], alpha=0.2, color=color)
 
         ax.set_xlabel("Hours Before Birth")
         ax.set_ylabel("KLD (Transfer Entropy)")
@@ -510,8 +530,15 @@ class TrajectoryAnalyzer:
         ax.grid(True, alpha=0.3)
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "plots" / "kld_by_class.png", dpi=200)
+        fig.savefig(self.output_dir / "plots" / "kld_by_class.svg", dpi=200)
         plt.close(fig)
+
+        # Save class-aggregated data to CSV
+        if all_class_agg:
+            class_agg_df = pd.concat(all_class_agg, ignore_index=True)
+            csv_path = self.output_dir / "kld_trajectory_by_class.csv"
+            class_agg_df.to_csv(csv_path, index=False)
+            logger.info(f"Saved class-aggregated KLD trajectory data to {csv_path}")
 
     def _plot_kld_guid_trajectories(
         self,
@@ -575,7 +602,7 @@ class TrajectoryAnalyzer:
                 continue
             plot_guid_absolute_trajectory(
                 subset,
-                plots_dir / f"guid_absolute_trajectory_{guid}.png",
+                plots_dir / f"guid_absolute_trajectory_{guid}.svg",
                 guid=guid,
                 x_col=x_col,
                 y_col=y_col,
@@ -605,7 +632,7 @@ class TrajectoryAnalyzer:
             ax.legend(markerscale=5)
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "plots" / "latent_space.png", dpi=200)
+        fig.savefig(self.output_dir / "plots" / "latent_space.svg", dpi=200)
         plt.close(fig)
 
     def _generate_dashboards(self, n_dashboards: int = 12) -> None:
@@ -679,7 +706,7 @@ class TrajectoryAnalyzer:
         ax4.set_title("Latent Dimensions (First Epoch)")
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "dashboards" / f"{guid}.png", dpi=150)
+        fig.savefig(self.output_dir / "dashboards" / f"{guid}.svg", dpi=150)
         plt.close(fig)
 
     def _compute_metrics(self) -> Dict[str, float]:
@@ -916,7 +943,7 @@ class TrajectoryAnalyzer:
                 try:
                     plot_latent_trajectory_2d(
                         traj[:, :2],
-                        plots_dir / f"trajectory_2d_{sample_id}.png",
+                        plots_dir / f"trajectory_2d_{sample_id}.svg",
                         sample_id=sample_id,
                     )
                 except Exception as e:
@@ -927,7 +954,7 @@ class TrajectoryAnalyzer:
                 try:
                     plot_latent_trajectory_3d(
                         traj[:, :3],
-                        plots_dir / f"trajectory_3d_{sample_id}.png",
+                        plots_dir / f"trajectory_3d_{sample_id}.svg",
                         sample_id=sample_id,
                     )
                 except Exception as e:
@@ -973,7 +1000,7 @@ class TrajectoryAnalyzer:
             try:
                 plot_kld_trajectory_3d(
                     traj,
-                    plots_dir / f"kld_trajectory_3d_{sample_id}.png",
+                    plots_dir / f"kld_trajectory_3d_{sample_id}.svg",
                     sample_id=sample_id,
                 )
             except Exception as e:
@@ -1015,7 +1042,7 @@ class TrajectoryAnalyzer:
                     latent_mean=latent_mean,
                     fhr=fhr,
                     changepoint_results=cp_result,
-                    output_path=cp_dir / f"changepoints_{guid}.png",
+                    output_path=cp_dir / f"changepoints_{guid}.svg",
                     sample_id=guid,
                     decimation_factor=self.decimation_factor,
                 )
@@ -1142,7 +1169,7 @@ class TrajectoryAnalyzer:
                 trajectories_dict,
                 self.output_dir / "plots",
                 n_components=3,
-                filename="trajectory_class_comparison.png",
+                filename="trajectory_class_comparison.svg",
             )
 
             # Interactive comparison

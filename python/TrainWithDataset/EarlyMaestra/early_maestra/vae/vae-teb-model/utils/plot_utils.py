@@ -360,7 +360,7 @@ def plot_model_analysis(
         # Set overall title with scientific paper styling
         fig.suptitle(f'Model Performance Analysis - Epoch {epoch}', 
                     fontsize=14, fontweight='normal', y=0.97, color=COLOR_BLUE)
-        save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.pdf')
+        save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.svg')
         
     else:
         # Original analysis mode: 8 subplots
@@ -571,7 +571,7 @@ def plot_model_analysis(
             next_idx += 1
 
         fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='normal')
-        save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.pdf')
+        save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.svg')
     
     # Save and close (common for both modes)
     if training_mode:
@@ -1079,7 +1079,7 @@ def plot_vae_reconstruction(
     fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color=COLOR_BLUE)
     
     # Save plot
-    save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.pdf')
+    save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.svg')
     plt.savefig(save_path, bbox_inches='tight', dpi=SAVE_DPI, facecolor='white', edgecolor='none')
     plt.close(fig)
     

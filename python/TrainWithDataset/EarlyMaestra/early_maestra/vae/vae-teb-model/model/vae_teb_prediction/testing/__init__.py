@@ -89,6 +89,9 @@ from model.vae_teb_prediction.testing.analyses import (
     run_single_prediction_windows,
 )
 
+# Single sample plotting utility
+from model.vae_teb_prediction.testing.plot_single_samples import plot_single_samples
+
 
 __all__ = [
     # Core
@@ -142,4 +145,6 @@ __all__ = [
     "run_trajectory_analysis",
     "TrajectoryAnalyzer",
     "run_all_analyses",
+    # Single sample plotting
+    "plot_single_samples",
 ]
