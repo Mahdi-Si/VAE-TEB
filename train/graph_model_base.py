@@ -56,7 +56,7 @@ class GraphModelBase(ABC):
             self.config = yaml.safe_load(yaml_file)
         self._config_dump = yaml.dump(self.config, sort_keys=False, default_flow_style=False)
         now = datetime.now()
-        run_date = now.strftime("%Y-%m-%d--[%H-%M-%S]") + f"--{now.microsecond:06d}-"
+        run_date = now.strftime("%Y-%m-%d--[%H-%M]") # -%S]") + f"--{now.microsecond:06d}-"
         self.experiment_tag = self.config['general_config']['tag']
         self.cuda_devices = self.config['general_config']['cuda_devices']
 

@@ -39,6 +39,7 @@ from model.vae_teb_prediction.testing.analyses import (
     run_trajectory_analysis,
     run_reconstruction_analysis,
     run_single_prediction_windows,
+    run_dataset_stats_analysis,
 )
 from model.vae_teb_prediction.testing.collectors import collect_predictions
 from model.vae_teb_prediction.testing.visualizers import plot_reconstruction_sample
@@ -213,6 +214,11 @@ def run_full_test_pipeline(
 
     # ----- Step 3: Run analyses -----
     results: Dict[str, Any] = {}
+
+    # Dataset statistics (does not require model, only dataloader)
+    logger.info("Running dataset statistics analysis...")
+    dataset_stats_dir = Path(output_dir) / "dataset_stats"
+    results["dataset_stats"] = run_dataset_stats_analysis(standard_loader, dataset_stats_dir)
 
     # Histogram analysis (standard loader)
     logger.info("Running histogram analysis...")
@@ -514,6 +520,15 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
         summary["trajectory"] = {
             k: v for k, v in results["trajectory"].items()
             if isinstance(v, (int, float, str))
+        }
+
+    if "dataset_stats" in results and isinstance(results["dataset_stats"], dict):
+        ds = results["dataset_stats"]
+        summary["dataset_stats"] = {
+            "n_samples": ds.get("n_samples"),
+            "n_guids": ds.get("n_guids"),
+            "epochs_per_guid": ds.get("epochs_per_guid"),
+            "epoch_time": ds.get("epoch_time"),
         }
 
     with open(summary_path, "w") as f:
