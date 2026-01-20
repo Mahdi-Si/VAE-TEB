@@ -267,7 +267,7 @@ class TestRunner:
 
         Example:
             >>> histograms_dir = runner.ensure_dir("histograms")
-            >>> fig.savefig(histograms_dir / "vaf_histogram.png")
+            >>> fig.savefig(histograms_dir / "vaf_histogram.svg")
         """
         path = self.output_dir / subdir
         path.mkdir(parents=True, exist_ok=True)

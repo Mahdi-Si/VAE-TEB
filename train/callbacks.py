@@ -624,7 +624,7 @@ class PlottingCallBack(Callback):
         cbar.set_label("Activation", fontweight="normal", fontsize=11, color="#666666")
 
         fig.suptitle(f"Model Performance Analysis — Epoch {epoch} | guid: {guid}", fontsize=14, y=0.97, color="#456882")
-        save_path = self.output_dir / f"model_results_epoch_{epoch:04d}.pdf"
+        save_path = self.output_dir / f"model_results_epoch_{epoch:04d}.svg"
         fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
         plt.close(fig)
 
@@ -911,7 +911,7 @@ class PlottingAvgPredCallBack(Callback):
 
         fig.suptitle(f"Avg Prediction — Epoch {epoch} | guid: {guid}", fontsize=12, y=0.98, color="#456882")
         fig.tight_layout(rect=(0, 0, 1, 0.96))
-        save_path = self.output_dir / f"avg_prediction_epoch_{epoch:04d}.pdf"
+        save_path = self.output_dir / f"avg_prediction_epoch_{epoch:04d}.svg"
         fig.savefig(save_path, bbox_inches="tight", orientation="landscape", dpi=300, facecolor="white", edgecolor="none")
         plt.close(fig)
 
