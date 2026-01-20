@@ -1648,7 +1648,7 @@ def run_coherence_analysis(
                         up,
                         fhr_orig,
                         fhr_recon,
-                        sample_dir / f"{sample_name}_signals.png",
+                        sample_dir / f"{sample_name}_signals.svg",
                         fs=fs,
                         title=signal_title,
                     )
@@ -1689,7 +1689,7 @@ def run_coherence_analysis(
                                 tf_map["frequencies"],
                                 tf_map["times"],
                                 tf_map["coherence"],
-                                output_path=sample_dir / f"{sample_name}_time_frequency_{suffix}.png",
+                                output_path=sample_dir / f"{sample_name}_time_frequency_{suffix}.svg",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} ({suffix.upper()})",
                             )
@@ -1706,7 +1706,7 @@ def run_coherence_analysis(
                                 window_tf["frequencies"],
                                 window_tf["times"],
                                 window_tf["coherence"],
-                                output_path=sample_dir / f"{sample_name}_windowed_coherence.png",
+                                output_path=sample_dir / f"{sample_name}_windowed_coherence.svg",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (2-min window coherence)",
                             )
@@ -1729,7 +1729,7 @@ def run_coherence_analysis(
                                 if not window_band_df.empty:
                                     _plot_band_trends(
                                         window_band_df,
-                                        sample_dir / f"{sample_name}_window_band_coherence.png",
+                                        sample_dir / f"{sample_name}_window_band_coherence.svg",
                                         x_col="window_index",
                                         x_label="Window index",
                                         title=f"{signal_title} (band coherence vs window index)",
@@ -1759,7 +1759,7 @@ def run_coherence_analysis(
                                             window_delta_df = pd.DataFrame(delta_rows)
                                             _plot_band_trends(
                                                 window_delta_df,
-                                                sample_dir / f"{sample_name}_window_band_coherence_delta.png",
+                                                sample_dir / f"{sample_name}_window_band_coherence_delta.svg",
                                                 x_col="window_index",
                                                 x_label="Window index",
                                                 title=f"{signal_title} (delta coherence vs window index)",
@@ -1777,7 +1777,7 @@ def run_coherence_analysis(
                                 relative_tf["frequencies"],
                                 relative_tf["times"],
                                 relative_tf["coherence"],
-                                output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft.png",
+                                output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft.svg",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (window-relative coherence, STFT)",
                             )
@@ -1786,7 +1786,7 @@ def run_coherence_analysis(
                                     relative_tf["frequencies"],
                                     relative_tf["times"],
                                     relative_tf["coherence_std"],
-                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_std.png",
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_std.svg",
                                     max_freq=time_frequency_max_freq,
                                     title=f"{signal_title} (window-relative coherence std, STFT)",
                                     cmap="viridis",
@@ -1797,7 +1797,7 @@ def run_coherence_analysis(
                                     relative_tf["frequencies"],
                                     relative_tf["times"],
                                     relative_tf["coherence_cv"],
-                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_cv.png",
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_stft_cv.svg",
                                     max_freq=time_frequency_max_freq,
                                     title=f"{signal_title} (window-relative coherence CV, STFT)",
                                     cmap="magma",
@@ -1816,7 +1816,7 @@ def run_coherence_analysis(
                                 if not relative_band_df.empty:
                                     _plot_band_trends(
                                         relative_band_df,
-                                        sample_dir / f"{sample_name}_relative_band_coherence.png",
+                                        sample_dir / f"{sample_name}_relative_band_coherence.svg",
                                         x_col="relative_frame_index",
                                         x_label="STFT frame index",
                                         title=f"{signal_title} (band coherence vs frame index)",
@@ -1839,7 +1839,7 @@ def run_coherence_analysis(
                                             relative_delta_df = pd.DataFrame(delta_rows)
                                             _plot_band_trends(
                                                 relative_delta_df,
-                                                sample_dir / f"{sample_name}_relative_band_coherence_delta.png",
+                                                sample_dir / f"{sample_name}_relative_band_coherence_delta.svg",
                                                 x_col="relative_frame_index",
                                                 x_label="STFT frame index",
                                                 title=f"{signal_title} (delta coherence vs frame index)",
@@ -1860,7 +1860,7 @@ def run_coherence_analysis(
                                     relative_tf_wavelet["frequencies"],
                                     relative_tf_wavelet["times"],
                                     relative_tf_wavelet["coherence"],
-                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet.png",
+                                    output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet.svg",
                                     max_freq=time_frequency_max_freq,
                                     title=f"{signal_title} (window-relative coherence, WAVELET)",
                                 )
@@ -1869,7 +1869,7 @@ def run_coherence_analysis(
                                         relative_tf_wavelet["frequencies"],
                                         relative_tf_wavelet["times"],
                                         relative_tf_wavelet["coherence_std"],
-                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_std.png",
+                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_std.svg",
                                         max_freq=time_frequency_max_freq,
                                         title=f"{signal_title} (window-relative coherence std, WAVELET)",
                                         cmap="viridis",
@@ -1880,7 +1880,7 @@ def run_coherence_analysis(
                                         relative_tf_wavelet["frequencies"],
                                         relative_tf_wavelet["times"],
                                         relative_tf_wavelet["coherence_cv"],
-                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_cv.png",
+                                        output_path=sample_dir / f"{sample_name}_relative_window_time_frequency_wavelet_cv.svg",
                                         max_freq=time_frequency_max_freq,
                                         title=f"{signal_title} (window-relative coherence CV, WAVELET)",
                                         cmap="magma",
@@ -1891,7 +1891,7 @@ def run_coherence_analysis(
                                         relative_tf_wavelet["frequencies"],
                                         relative_tf_wavelet["times"],
                                         relative_tf_wavelet["plv"],
-                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_plv.png",
+                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_plv.svg",
                                         max_freq=time_frequency_max_freq,
                                         title=f"{signal_title} (wavelet PLV)",
                                         cmap="viridis",
@@ -1904,7 +1904,7 @@ def run_coherence_analysis(
                                         relative_tf_wavelet["frequencies"],
                                         relative_tf_wavelet["times"],
                                         relative_tf_wavelet["phase_mean"],
-                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_phase.png",
+                                        output_path=sample_dir / f"{sample_name}_relative_window_wavelet_phase.svg",
                                         max_freq=time_frequency_max_freq,
                                         title=f"{signal_title} (wavelet phase mean)",
                                         cmap="twilight",
@@ -1927,7 +1927,7 @@ def run_coherence_analysis(
                                     if not relative_band_df.empty:
                                         _plot_band_trends(
                                             relative_band_df,
-                                            sample_dir / f"{sample_name}_relative_band_coherence_wavelet.png",
+                                            sample_dir / f"{sample_name}_relative_band_coherence_wavelet.svg",
                                             x_col="relative_time_sec",
                                             x_label="Time From Window Start (seconds)",
                                             title=f"{signal_title} (band coherence vs time, WAVELET)",
@@ -1950,7 +1950,7 @@ def run_coherence_analysis(
                                                 relative_delta_df = pd.DataFrame(delta_rows)
                                             _plot_band_trends(
                                                 relative_delta_df,
-                                                sample_dir / f"{sample_name}_relative_band_coherence_delta_wavelet.png",
+                                                sample_dir / f"{sample_name}_relative_band_coherence_delta_wavelet.svg",
                                                 x_col="relative_time_sec",
                                                 x_label="Time From Window Start (seconds)",
                                                 title=f"{signal_title} (delta coherence vs time, WAVELET)",
@@ -1966,7 +1966,7 @@ def run_coherence_analysis(
                                 sample_relative_perm_stft["frequencies"],
                                 sample_relative_perm_stft["times"],
                                 sample_relative_perm_stft["upper"],
-                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_stft.png",
+                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_stft.svg",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (perm upper CI, STFT)",
                                 cmap="viridis",
@@ -1983,7 +1983,7 @@ def run_coherence_analysis(
                                 sample_relative_perm_wavelet["frequencies"],
                                 sample_relative_perm_wavelet["times"],
                                 sample_relative_perm_wavelet["upper"],
-                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_wavelet.png",
+                                output_path=sample_dir / f"{sample_name}_relative_window_perm_upper_wavelet.svg",
                                 max_freq=time_frequency_max_freq,
                                 title=f"{signal_title} (perm upper CI, WAVELET)",
                                 cmap="viridis",
@@ -2011,7 +2011,7 @@ def run_coherence_analysis(
                                     None,
                                     ref_win,
                                     pred_win,
-                                    sample_dir / f"{window_prefix}_signals.png",
+                                    sample_dir / f"{window_prefix}_signals.svg",
                                     fs=fs,
                                     title=window_title,
                                 )
@@ -2028,7 +2028,7 @@ def run_coherence_analysis(
                                         plot_coherence_spectrum(
                                             freq_win,
                                             coh_win,
-                                            sample_dir / f"{window_prefix}_coherence_spectrum.png",
+                                            sample_dir / f"{window_prefix}_coherence_spectrum.svg",
                                             title=f"{window_title} (coherence spectrum)",
                                             max_freq=time_frequency_max_freq,
                                         )
@@ -2071,7 +2071,7 @@ def run_coherence_analysis(
                                         tf_map["frequencies"],
                                         tf_map["times"],
                                         tf_map["coherence"],
-                                        output_path=sample_dir / f"{window_prefix}_time_frequency_{suffix}.png",
+                                        output_path=sample_dir / f"{window_prefix}_time_frequency_{suffix}.svg",
                                         max_freq=time_frequency_max_freq,
                                         title=f"{window_title} (time-frequency coherence, {suffix.upper()})",
                                     )
@@ -2086,7 +2086,7 @@ def run_coherence_analysis(
                                         psd_recon,
                                         np.zeros_like(psd_recon),
                                         sample_dir,
-                                        filename=f"{window_prefix}_psd.png",
+                                        filename=f"{window_prefix}_psd.svg",
                                     )
 
                                 lags_sec, corr = compute_cross_correlation(
@@ -2098,7 +2098,7 @@ def run_coherence_analysis(
                                         corr,
                                         np.zeros_like(corr),
                                         sample_dir,
-                                        filename=f"{window_prefix}_cross_correlation.png",
+                                        filename=f"{window_prefix}_cross_correlation.svg",
                                     )
                     except Exception as e:
                         logger.warning(f"Single-window coherence analysis failed for {sample_name}: {e}")
@@ -2112,7 +2112,7 @@ def run_coherence_analysis(
                             }, inplace=True)
                             _plot_band_trends(
                                 sample_bandpower,
-                                sample_dir / f"{sample_name}_window_bandpower.png",
+                                sample_dir / f"{sample_name}_window_bandpower.svg",
                                 x_col="window_index",
                                 x_label="Window index",
                                 title=f"{signal_title} (band power vs window index)",
@@ -2136,7 +2136,7 @@ def run_coherence_analysis(
                                 sample_dir,
                                 psd_residual_mean=psd_resid,
                                 psd_residual_std=np.zeros_like(psd_resid),
-                                filename=f"{sample_name}_psd.png",
+                                filename=f"{sample_name}_psd.svg",
                             )
                     except Exception as e:
                         logger.warning(f"PSD comparison failed for {sample_name}: {e}")
@@ -2151,7 +2151,7 @@ def run_coherence_analysis(
                                 corr,
                                 np.zeros_like(corr),
                                 sample_dir,
-                                filename=f"{sample_name}_cross_correlation.png",
+                                filename=f"{sample_name}_cross_correlation.svg",
                             )
                     except Exception as e:
                         logger.warning(f"Cross-correlation failed for {sample_name}: {e}")
@@ -2204,7 +2204,7 @@ def run_coherence_analysis(
             results["up_coherence_original_mean"],
             results["up_coherence_reconstructed_mean"],
             output_dir,
-            filename="up_fhr_coherence.png",
+            filename="up_fhr_coherence.svg",
         )
 
     if psd_orig_list and psd_frequencies is not None:
@@ -2280,7 +2280,7 @@ def run_coherence_analysis(
                 epoch_agg.to_csv(output_dir / "epoch_coherence_aggregate.csv", index=False)
                 _plot_band_trends(
                     epoch_agg,
-                    output_dir / "epoch_coherence_trends.png",
+                    output_dir / "epoch_coherence_trends.svg",
                     x_col="hour_bin",
                     x_label="Hours Before Birth",
                     title="Coherence vs Hours Before Birth",
@@ -2302,7 +2302,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             window_agg,
-            output_dir / "window_coherence_trends.png",
+            output_dir / "window_coherence_trends.svg",
             x_col="window_start_sec",
             x_label="Window Start (seconds)",
             title="Coherence vs Window Start",
@@ -2311,7 +2311,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             window_agg,
-            output_dir / "window_coherence_trends_index.png",
+            output_dir / "window_coherence_trends_index.svg",
             x_col="window_index",
             x_label="Window index",
             title="Coherence vs Window Index",
@@ -2328,7 +2328,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 window_delta,
-                output_dir / "window_coherence_delta_trends.png",
+                output_dir / "window_coherence_delta_trends.svg",
                 x_col="window_start_sec",
                 x_label="Window Start (seconds)",
                 title="Delta Coherence vs Window Start",
@@ -2338,7 +2338,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 window_delta,
-                output_dir / "window_coherence_delta_trends_index.png",
+                output_dir / "window_coherence_delta_trends_index.svg",
                 x_col="window_index",
                 x_label="Window index",
                 title="Delta Coherence vs Window Index",
@@ -2358,7 +2358,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             relative_agg,
-            output_dir / "relative_window_coherence_trends.png",
+            output_dir / "relative_window_coherence_trends.svg",
             x_col="relative_time_sec",
             x_label="Time From Window Start (seconds)",
             title="Coherence vs Time From Window Start",
@@ -2373,7 +2373,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             relative_index_agg,
-            output_dir / "relative_window_coherence_trends_index.png",
+            output_dir / "relative_window_coherence_trends_index.svg",
             x_col="relative_frame_index",
             x_label="STFT frame index",
             title="Coherence vs Frame Index",
@@ -2389,7 +2389,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 relative_delta,
-                output_dir / "relative_window_coherence_delta_trends.png",
+                output_dir / "relative_window_coherence_delta_trends.svg",
                 x_col="relative_time_sec",
                 x_label="Time From Window Start (seconds)",
                 title="Delta Coherence vs Time From Window Start",
@@ -2408,7 +2408,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 relative_delta_index,
-                output_dir / "relative_window_coherence_delta_trends_index.png",
+                output_dir / "relative_window_coherence_delta_trends_index.svg",
                 x_col="relative_frame_index",
                 x_label="STFT frame index",
                 title="Delta Coherence vs Frame Index",
@@ -2427,7 +2427,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 tf_mean,
-                output_path=output_dir / "relative_window_time_frequency_mean_stft.png",
+                output_path=output_dir / "relative_window_time_frequency_mean_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-Relative Coherence Mean (STFT)",
             )
@@ -2435,7 +2435,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 tf_std,
-                output_path=output_dir / "relative_window_time_frequency_std_stft.png",
+                output_path=output_dir / "relative_window_time_frequency_std_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-Relative Coherence Std Across Samples (STFT)",
                 cmap="viridis",
@@ -2447,7 +2447,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 tf_std_mean,
-                output_path=output_dir / "relative_window_time_frequency_window_std_stft.png",
+                output_path=output_dir / "relative_window_time_frequency_window_std_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-to-Window Std (STFT)",
                 cmap="viridis",
@@ -2459,7 +2459,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 tf_cv_mean,
-                output_path=output_dir / "relative_window_time_frequency_window_cv_stft.png",
+                output_path=output_dir / "relative_window_time_frequency_window_cv_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-to-Window CV (STFT)",
                 cmap="magma",
@@ -2477,7 +2477,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 tfw_mean,
-                output_path=output_dir / "relative_window_time_frequency_mean_wavelet.png",
+                output_path=output_dir / "relative_window_time_frequency_mean_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-Relative Coherence Mean (WAVELET)",
             )
@@ -2485,7 +2485,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 tfw_std,
-                output_path=output_dir / "relative_window_time_frequency_std_wavelet.png",
+                output_path=output_dir / "relative_window_time_frequency_std_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-Relative Coherence Std Across Samples (WAVELET)",
                 cmap="viridis",
@@ -2497,7 +2497,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 tfw_std_mean,
-                output_path=output_dir / "relative_window_time_frequency_window_std_wavelet.png",
+                output_path=output_dir / "relative_window_time_frequency_window_std_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-to-Window Std (WAVELET)",
                 cmap="viridis",
@@ -2509,7 +2509,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 tfw_cv_mean,
-                output_path=output_dir / "relative_window_time_frequency_window_cv_wavelet.png",
+                output_path=output_dir / "relative_window_time_frequency_window_cv_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Window-to-Window CV (WAVELET)",
                 cmap="magma",
@@ -2524,7 +2524,7 @@ def run_coherence_analysis(
                     relative_tf_wavelet_template["frequencies"],
                     relative_tf_wavelet_template["times"],
                     plv_mean,
-                    output_path=output_dir / "relative_window_wavelet_plv.png",
+                    output_path=output_dir / "relative_window_wavelet_plv.svg",
                     max_freq=time_frequency_max_freq,
                     title="Wavelet PLV (Mean Across Samples)",
                     cmap="viridis",
@@ -2546,7 +2546,7 @@ def run_coherence_analysis(
                     relative_tf_wavelet_template["frequencies"],
                     relative_tf_wavelet_template["times"],
                     phase_mean,
-                    output_path=output_dir / "relative_window_wavelet_phase_mean.png",
+                    output_path=output_dir / "relative_window_wavelet_phase_mean.svg",
                     max_freq=time_frequency_max_freq,
                     title="Wavelet Phase Mean (Across Samples)",
                     cmap="twilight",
@@ -2580,7 +2580,7 @@ def run_coherence_analysis(
                 early_std,
                 late_mean,
                 late_std,
-                output_path=output_dir / "relative_window_horizon_spectra_stft.png",
+                output_path=output_dir / "relative_window_horizon_spectra_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Early vs Late Horizon Coherence (STFT)",
             )
@@ -2591,7 +2591,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 delta_mean,
                 delta_std,
-                output_path=output_dir / "relative_window_horizon_delta_stft.png",
+                output_path=output_dir / "relative_window_horizon_delta_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Horizon Delta Coherence (STFT)",
             )
@@ -2621,7 +2621,7 @@ def run_coherence_analysis(
                 early_std,
                 late_mean,
                 late_std,
-                output_path=output_dir / "relative_window_horizon_spectra_wavelet.png",
+                output_path=output_dir / "relative_window_horizon_spectra_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Early vs Late Horizon Coherence (WAVELET)",
             )
@@ -2632,7 +2632,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 delta_mean,
                 delta_std,
-                output_path=output_dir / "relative_window_horizon_delta_wavelet.png",
+                output_path=output_dir / "relative_window_horizon_delta_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Horizon Delta Coherence (WAVELET)",
             )
@@ -2646,7 +2646,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 perm_upper_mean,
-                output_path=output_dir / "relative_window_perm_upper_stft.png",
+                output_path=output_dir / "relative_window_perm_upper_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Permutation Upper CI (STFT)",
                 cmap="viridis",
@@ -2660,7 +2660,7 @@ def run_coherence_analysis(
                 relative_tf_template["frequencies"],
                 relative_tf_template["times"],
                 perm_lower_mean,
-                output_path=output_dir / "relative_window_perm_lower_stft.png",
+                output_path=output_dir / "relative_window_perm_lower_stft.svg",
                 max_freq=time_frequency_max_freq,
                 title="Permutation Lower CI (STFT)",
                 cmap="viridis",
@@ -2678,7 +2678,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 perm_upper_mean,
-                output_path=output_dir / "relative_window_perm_upper_wavelet.png",
+                output_path=output_dir / "relative_window_perm_upper_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Permutation Upper CI (WAVELET)",
                 cmap="viridis",
@@ -2692,7 +2692,7 @@ def run_coherence_analysis(
                 relative_tf_wavelet_template["frequencies"],
                 relative_tf_wavelet_template["times"],
                 perm_lower_mean,
-                output_path=output_dir / "relative_window_perm_lower_wavelet.png",
+                output_path=output_dir / "relative_window_perm_lower_wavelet.svg",
                 max_freq=time_frequency_max_freq,
                 title="Permutation Lower CI (WAVELET)",
                 cmap="viridis",
@@ -2719,7 +2719,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             relative_wavelet_agg,
-            output_dir / "relative_window_coherence_trends_wavelet.png",
+            output_dir / "relative_window_coherence_trends_wavelet.svg",
             x_col="relative_time_sec",
             x_label="Time From Window Start (seconds)",
             title="Wavelet Coherence vs Time From Window Start",
@@ -2737,7 +2737,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             relative_wavelet_index,
-            output_dir / "relative_window_coherence_trends_index_wavelet.png",
+            output_dir / "relative_window_coherence_trends_index_wavelet.svg",
             x_col="relative_frame_index",
             x_label="Wavelet time index",
             title="Wavelet Coherence vs Time Index",
@@ -2756,7 +2756,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 relative_wavelet_delta,
-                output_dir / "relative_window_coherence_delta_trends_wavelet.png",
+                output_dir / "relative_window_coherence_delta_trends_wavelet.svg",
                 x_col="relative_time_sec",
                 x_label="Time From Window Start (seconds)",
                 title="Wavelet Delta Coherence vs Time From Window Start",
@@ -2777,7 +2777,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 relative_wavelet_delta_index,
-                output_dir / "relative_window_coherence_delta_trends_index_wavelet.png",
+                output_dir / "relative_window_coherence_delta_trends_index_wavelet.svg",
                 x_col="relative_frame_index",
                 x_label="Wavelet time index",
                 title="Wavelet Delta Coherence vs Time Index",
@@ -2800,7 +2800,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             bandpower_agg,
-            output_dir / "window_bandpower_trends.png",
+            output_dir / "window_bandpower_trends.svg",
             x_col="window_start_sec",
             x_label="Window Start (seconds)",
             title="Band Power vs Window Start",
@@ -2810,7 +2810,7 @@ def run_coherence_analysis(
 
         _plot_band_trends(
             bandpower_agg,
-            output_dir / "window_bandpower_trends_index.png",
+            output_dir / "window_bandpower_trends_index.svg",
             x_col="window_index",
             x_label="Window index",
             title="Band Power vs Window Index",
@@ -2828,7 +2828,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 bandpower_delta,
-                output_dir / "window_bandpower_delta_trends.png",
+                output_dir / "window_bandpower_delta_trends.svg",
                 x_col="window_start_sec",
                 x_label="Window Start (seconds)",
                 title="Band Power Delta vs Window Start",
@@ -2838,7 +2838,7 @@ def run_coherence_analysis(
 
             _plot_band_trends(
                 bandpower_delta,
-                output_dir / "window_bandpower_delta_trends_index.png",
+                output_dir / "window_bandpower_delta_trends_index.svg",
                 x_col="window_index",
                 x_label="Window index",
                 title="Band Power Delta vs Window Index",
@@ -2884,96 +2884,96 @@ def run_coherence_analysis(
                     f.write(f"    UP vs recon:   {recon_mean:.4f}\n")
 
         f.write("\nAdditional outputs:\n")
-        f.write("  reconstruction_coherence.png\n")
-        f.write("  psd_comparison.png\n")
-        f.write("  cross_correlation.png\n")
+        f.write("  reconstruction_coherence.svg\n")
+        f.write("  psd_comparison.svg\n")
+        f.write("  cross_correlation.svg\n")
         if include_up_coherence and "up_coherence_original_mean" in results:
-            f.write("  up_fhr_coherence.png\n")
+            f.write("  up_fhr_coherence.svg\n")
         f.write("  epoch_coherence_summary.csv\n")
         f.write("  epoch_coherence_aggregate.csv\n")
-        f.write("  epoch_coherence_trends.png\n")
+        f.write("  epoch_coherence_trends.svg\n")
         f.write("  window_coherence_summary.csv\n")
         f.write("  window_coherence_aggregate.csv\n")
-        f.write("  window_coherence_trends.png\n")
-        f.write("  window_coherence_trends_index.png\n")
+        f.write("  window_coherence_trends.svg\n")
+        f.write("  window_coherence_trends_index.svg\n")
         f.write("  window_coherence_delta_aggregate.csv\n")
-        f.write("  window_coherence_delta_trends.png\n")
-        f.write("  window_coherence_delta_trends_index.png\n")
+        f.write("  window_coherence_delta_trends.svg\n")
+        f.write("  window_coherence_delta_trends_index.svg\n")
         f.write("  relative_window_coherence_summary.csv\n")
         f.write("  relative_window_coherence_aggregate.csv\n")
-        f.write("  relative_window_coherence_trends.png\n")
+        f.write("  relative_window_coherence_trends.svg\n")
         f.write("  relative_window_coherence_index_aggregate.csv\n")
-        f.write("  relative_window_coherence_trends_index.png\n")
+        f.write("  relative_window_coherence_trends_index.svg\n")
         f.write("  relative_window_coherence_delta_aggregate.csv\n")
-        f.write("  relative_window_coherence_delta_trends.png\n")
+        f.write("  relative_window_coherence_delta_trends.svg\n")
         f.write("  relative_window_coherence_delta_index_aggregate.csv\n")
-        f.write("  relative_window_coherence_delta_trends_index.png\n")
-        f.write("  relative_window_time_frequency_mean_stft.png\n")
-        f.write("  relative_window_time_frequency_std_stft.png\n")
-        f.write("  relative_window_time_frequency_window_std_stft.png\n")
-        f.write("  relative_window_time_frequency_window_cv_stft.png\n")
-        f.write("  relative_window_horizon_spectra_stft.png\n")
-        f.write("  relative_window_horizon_delta_stft.png\n")
+        f.write("  relative_window_coherence_delta_trends_index.svg\n")
+        f.write("  relative_window_time_frequency_mean_stft.svg\n")
+        f.write("  relative_window_time_frequency_std_stft.svg\n")
+        f.write("  relative_window_time_frequency_window_std_stft.svg\n")
+        f.write("  relative_window_time_frequency_window_cv_stft.svg\n")
+        f.write("  relative_window_horizon_spectra_stft.svg\n")
+        f.write("  relative_window_horizon_delta_stft.svg\n")
         f.write("  relative_window_horizon_spectra_stft.csv\n")
-        f.write("  relative_window_perm_upper_stft.png\n")
-        f.write("  relative_window_perm_lower_stft.png\n")
+        f.write("  relative_window_perm_upper_stft.svg\n")
+        f.write("  relative_window_perm_lower_stft.svg\n")
         if relative_records_wavelet:
             f.write("  relative_window_coherence_summary_wavelet.csv\n")
             f.write("  relative_window_coherence_aggregate_wavelet.csv\n")
-            f.write("  relative_window_coherence_trends_wavelet.png\n")
+            f.write("  relative_window_coherence_trends_wavelet.svg\n")
             f.write("  relative_window_coherence_index_aggregate_wavelet.csv\n")
-            f.write("  relative_window_coherence_trends_index_wavelet.png\n")
+            f.write("  relative_window_coherence_trends_index_wavelet.svg\n")
             f.write("  relative_window_coherence_delta_aggregate_wavelet.csv\n")
-            f.write("  relative_window_coherence_delta_trends_wavelet.png\n")
+            f.write("  relative_window_coherence_delta_trends_wavelet.svg\n")
             f.write("  relative_window_coherence_delta_index_aggregate_wavelet.csv\n")
-            f.write("  relative_window_coherence_delta_trends_index_wavelet.png\n")
-            f.write("  relative_window_time_frequency_mean_wavelet.png\n")
-            f.write("  relative_window_time_frequency_std_wavelet.png\n")
-            f.write("  relative_window_time_frequency_window_std_wavelet.png\n")
-            f.write("  relative_window_time_frequency_window_cv_wavelet.png\n")
-            f.write("  relative_window_wavelet_plv.png\n")
-            f.write("  relative_window_wavelet_phase_mean.png\n")
-            f.write("  relative_window_horizon_spectra_wavelet.png\n")
-            f.write("  relative_window_horizon_delta_wavelet.png\n")
+            f.write("  relative_window_coherence_delta_trends_index_wavelet.svg\n")
+            f.write("  relative_window_time_frequency_mean_wavelet.svg\n")
+            f.write("  relative_window_time_frequency_std_wavelet.svg\n")
+            f.write("  relative_window_time_frequency_window_std_wavelet.svg\n")
+            f.write("  relative_window_time_frequency_window_cv_wavelet.svg\n")
+            f.write("  relative_window_wavelet_plv.svg\n")
+            f.write("  relative_window_wavelet_phase_mean.svg\n")
+            f.write("  relative_window_horizon_spectra_wavelet.svg\n")
+            f.write("  relative_window_horizon_delta_wavelet.svg\n")
             f.write("  relative_window_horizon_spectra_wavelet.csv\n")
-            f.write("  relative_window_perm_upper_wavelet.png\n")
-            f.write("  relative_window_perm_lower_wavelet.png\n")
+            f.write("  relative_window_perm_upper_wavelet.svg\n")
+            f.write("  relative_window_perm_lower_wavelet.svg\n")
         f.write("  window_bandpower_summary.csv\n")
         f.write("  window_bandpower_aggregate.csv\n")
-        f.write("  window_bandpower_trends.png\n")
-        f.write("  window_bandpower_trends_index.png\n")
+        f.write("  window_bandpower_trends.svg\n")
+        f.write("  window_bandpower_trends_index.svg\n")
         f.write("  window_bandpower_delta_aggregate.csv\n")
-        f.write("  window_bandpower_delta_trends.png\n")
-        f.write("  window_bandpower_delta_trends_index.png\n")
-        f.write("  samples/<sample>_signals.png\n")
-        f.write("  samples/<sample>_time_frequency_stft.png\n")
-        f.write("  samples/<sample>_time_frequency_wavelet.png\n")
-        f.write("  samples/<sample>_windowed_coherence.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_stft.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_stft_std.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_stft_cv.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_wavelet.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_std.png\n")
-        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_cv.png\n")
-        f.write("  samples/<sample>_window_band_coherence.png\n")
-        f.write("  samples/<sample>_window_band_coherence_delta.png\n")
-        f.write("  samples/<sample>_relative_band_coherence.png\n")
-        f.write("  samples/<sample>_relative_band_coherence_delta.png\n")
-        f.write("  samples/<sample>_relative_band_coherence_wavelet.png\n")
-        f.write("  samples/<sample>_relative_band_coherence_delta_wavelet.png\n")
-        f.write("  samples/<sample>_relative_window_wavelet_plv.png\n")
-        f.write("  samples/<sample>_relative_window_wavelet_phase.png\n")
-        f.write("  samples/<sample>_relative_window_perm_upper_stft.png\n")
-        f.write("  samples/<sample>_relative_window_perm_upper_wavelet.png\n")
-        f.write("  samples/<sample>_single_window_*_signals.png\n")
-        f.write("  samples/<sample>_single_window_*_coherence_spectrum.png\n")
-        f.write("  samples/<sample>_single_window_*_time_frequency_stft.png\n")
-        f.write("  samples/<sample>_single_window_*_time_frequency_wavelet.png\n")
-        f.write("  samples/<sample>_single_window_*_psd.png\n")
-        f.write("  samples/<sample>_single_window_*_cross_correlation.png\n")
-        f.write("  samples/<sample>_window_bandpower.png\n")
-        f.write("  samples/<sample>_psd.png\n")
-        f.write("  samples/<sample>_cross_correlation.png\n")
+        f.write("  window_bandpower_delta_trends.svg\n")
+        f.write("  window_bandpower_delta_trends_index.svg\n")
+        f.write("  samples/<sample>_signals.svg\n")
+        f.write("  samples/<sample>_time_frequency_stft.svg\n")
+        f.write("  samples/<sample>_time_frequency_wavelet.svg\n")
+        f.write("  samples/<sample>_windowed_coherence.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft_std.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_stft_cv.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_std.svg\n")
+        f.write("  samples/<sample>_relative_window_time_frequency_wavelet_cv.svg\n")
+        f.write("  samples/<sample>_window_band_coherence.svg\n")
+        f.write("  samples/<sample>_window_band_coherence_delta.svg\n")
+        f.write("  samples/<sample>_relative_band_coherence.svg\n")
+        f.write("  samples/<sample>_relative_band_coherence_delta.svg\n")
+        f.write("  samples/<sample>_relative_band_coherence_wavelet.svg\n")
+        f.write("  samples/<sample>_relative_band_coherence_delta_wavelet.svg\n")
+        f.write("  samples/<sample>_relative_window_wavelet_plv.svg\n")
+        f.write("  samples/<sample>_relative_window_wavelet_phase.svg\n")
+        f.write("  samples/<sample>_relative_window_perm_upper_stft.svg\n")
+        f.write("  samples/<sample>_relative_window_perm_upper_wavelet.svg\n")
+        f.write("  samples/<sample>_single_window_*_signals.svg\n")
+        f.write("  samples/<sample>_single_window_*_coherence_spectrum.svg\n")
+        f.write("  samples/<sample>_single_window_*_time_frequency_stft.svg\n")
+        f.write("  samples/<sample>_single_window_*_time_frequency_wavelet.svg\n")
+        f.write("  samples/<sample>_single_window_*_psd.svg\n")
+        f.write("  samples/<sample>_single_window_*_cross_correlation.svg\n")
+        f.write("  samples/<sample>_window_bandpower.svg\n")
+        f.write("  samples/<sample>_psd.svg\n")
+        f.write("  samples/<sample>_cross_correlation.svg\n")
 
     logger.info(f"Coherence analysis complete. Results saved to {output_dir}")
 
