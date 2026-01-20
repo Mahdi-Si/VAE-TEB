@@ -391,7 +391,7 @@ def plot_dataset_statistics(
             bbox=dict(boxstyle="round,pad=0.4", facecolor=COLOR_LIGHT_GRAY, alpha=0.3))
 
     plt.tight_layout()
-    plt.savefig(output_dir / "dataset_statistics.png", dpi=SAVE_DPI, bbox_inches="tight")
+    plt.savefig(output_dir / "dataset_statistics.svg", dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # --- Detailed plot: Distribution at each unique epoch time point ---
@@ -452,7 +452,7 @@ def _plot_epoch_time_distribution(
         _style_axes(ax)
 
     plt.tight_layout()
-    plt.savefig(output_dir / "time_distribution_detailed.png", dpi=SAVE_DPI, bbox_inches="tight")
+    plt.savefig(output_dir / "time_distribution_detailed.svg", dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # --- Also create a table/list of unique epoch times ---
@@ -593,7 +593,7 @@ def _plot_label_statistics(
     fig.colorbar(im, ax=ax, shrink=0.6)
 
     plt.tight_layout()
-    plt.savefig(output_dir / "label_statistics.png", dpi=SAVE_DPI, bbox_inches="tight")
+    plt.savefig(output_dir / "label_statistics.svg", dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
     # --- Save detailed label statistics to CSV ---
@@ -674,7 +674,7 @@ def _plot_epochs_per_guid_ranked(
         _style_axes(ax)
 
     plt.tight_layout()
-    plt.savefig(output_dir / "epochs_per_guid_ranked.png", dpi=SAVE_DPI, bbox_inches="tight")
+    plt.savefig(output_dir / "epochs_per_guid_ranked.svg", dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -767,10 +767,10 @@ def run_dataset_stats_analysis(
         **stats,
         "output_dir": str(output_dir),
         "plots": [
-            str(output_dir / "dataset_statistics.png"),
-            str(output_dir / "time_distribution_detailed.png"),
-            str(output_dir / "epochs_per_guid_ranked.png"),
-            str(output_dir / "label_statistics.png"),
+            str(output_dir / "dataset_statistics.svg"),
+            str(output_dir / "time_distribution_detailed.svg"),
+            str(output_dir / "epochs_per_guid_ranked.svg"),
+            str(output_dir / "label_statistics.svg"),
         ],
         "data_csv": str(output_dir / "dataset_metadata.csv"),
         "time_table_csv": str(output_dir / "epoch_time_distribution.csv"),
