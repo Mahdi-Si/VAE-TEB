@@ -762,11 +762,15 @@ def _plot_all_single_sample_plots(
 
     # Aggregate predictions
     avg_mu, valid_mask = aggregate_predictions(
-        runner.model, mu_pr[idx], raw_len=y_raw.size(1)
+        runner.model, mu_pr[idx : idx + 1], raw_len=y_raw.size(1)
     )
     if avg_mu is None:
         logger.warning("Aggregated predictions missing; skipping sample.")
         return plot_paths
+    if avg_mu.dim() == 2:
+        avg_mu = avg_mu[0]
+    if valid_mask is not None and valid_mask.dim() == 2:
+        valid_mask = valid_mask[0]
 
     # Aggregate variance if available
     avg_std = None
