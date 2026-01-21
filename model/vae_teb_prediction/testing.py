@@ -517,14 +517,16 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                     fhr_ph_np = y_ph[0].detach().cpu().numpy().T
                     fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
                     latent_np = latent[0].detach().cpu().numpy().T
-                    recon_np = recon[0].detach().cpu().numpy()
+                    recon_norm_np = recon[0].detach().cpu().numpy()
+                    recon_denorm_np = self._maybe_denormalize(recon[0], "fhr", stats).detach().cpu().numpy()
                     if logvar is not None:
                         logvar_np = logvar[0].detach().cpu().numpy()
                     else:
-                        logvar_np = np.zeros_like(recon_np)
+                        logvar_np = np.zeros_like(recon_norm_np)
                     if valid_mask is not None:
                         mask_np = valid_mask[0].detach().cpu().numpy().astype(bool)
-                        recon_np = np.where(mask_np, recon_np, np.nan)
+                        recon_norm_np = np.where(mask_np, recon_norm_np, np.nan)
+                        recon_denorm_np = np.where(mask_np, recon_denorm_np, np.nan)
                         logvar_np = np.where(mask_np, logvar_np, np.nan)
 
                     recon_st_np, recon_ph_np = self._extract_reconstruction_features(
@@ -546,7 +548,7 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         fhr_ph=fhr_ph_np,
                         fhr_up_ph=fhr_up_ph_np,
                         latent_z=latent_np,
-                        reconstructed_fhr_mu=recon_np,
+                        reconstructed_fhr_mu=recon_norm_np,
                         reconstructed_fhr_logvar=logvar_np,
                         kld_tensor=kld_tensor_np,
                         kld_mean_over_channels=kld_mean_np,
@@ -562,7 +564,8 @@ class GraphModelVaeTebSmallTester(GraphModelVaeTebSmallTrainer):
                         raw_up_unnormalized=raw_up_denorm_np,
                         raw_fhr_normalized=raw_fhr_norm_np,
                         raw_up_normalized=raw_up_norm_np,
-                        reconstructed_fhr=recon_np,
+                        reconstructed_fhr=recon_norm_np,
+                        reconstructed_fhr_unnormalized=recon_denorm_np,
                         original_scattering_transform=fhr_st_np,
                         reconstructed_scattering_transform=recon_st_np,
                         original_phase_harmonic=fhr_ph_np,
