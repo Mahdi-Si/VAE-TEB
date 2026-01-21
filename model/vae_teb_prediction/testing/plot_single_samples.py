@@ -96,6 +96,12 @@ from utils.plot_utils import (
     plot_single_prediction_windows,
 )
 
+FONT_SCALE = 2.0
+
+
+def _fs(value: float) -> float:
+    return value * FONT_SCALE
+
 
 def _load_config(path: Union[str, Path]) -> Dict[str, Any]:
     """Load YAML config file."""
@@ -277,12 +283,12 @@ def _apply_publication_style() -> None:
         "savefig.pad_inches": 0.05,
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
-        "font.size": 8,
-        "axes.titlesize": 9,
-        "axes.labelsize": 8,
-        "xtick.labelsize": 7,
-        "ytick.labelsize": 7,
-        "legend.fontsize": 7,
+        "font.size": _fs(8),
+        "axes.titlesize": _fs(9),
+        "axes.labelsize": _fs(8),
+        "xtick.labelsize": _fs(7),
+        "ytick.labelsize": _fs(7),
+        "legend.fontsize": _fs(7),
         "axes.linewidth": 0.6,
         "axes.edgecolor": COLOR_BLACK,
         "axes.labelcolor": COLOR_BLACK,
@@ -323,8 +329,8 @@ def _add_colorbar(
     cax = divider.append_axes("right", size="3.5%", pad=0.02)
     cbar = fig.colorbar(mappable, cax=cax)
     if label:
-        cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
-    cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
+        cbar.set_label(label, fontsize=_fs(8), color=COLOR_BLACK)
+    cbar.ax.tick_params(labelsize=_fs(7), colors=COLOR_BLACK)
     cbar.outline.set_linewidth(0.6)
     cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
     return cbar
@@ -362,9 +368,9 @@ def _plot_coefficient_heatmap(
         vmax=vmax,
     )
 
-    ax.set_xlabel(xlabel, fontsize=8)
-    ax.set_ylabel(ylabel, fontsize=8)
-    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
+    ax.set_xlabel(xlabel, fontsize=_fs(8))
+    ax.set_ylabel(ylabel, fontsize=_fs(8))
+    ax.set_title(title, fontsize=_fs(9), fontweight="normal", pad=8)
     ax.grid(False)
 
     _add_colorbar(fig, im, ax, label="Value")
@@ -392,27 +398,27 @@ def _plot_coefficient_error_heatmap(
     # Original
     vabs = np.nanmax(np.abs(original))
     im0 = axes[0].imshow(original, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[0].set_title("Original Coefficients", fontsize=9)
-    axes[0].set_ylabel(ylabel, fontsize=8)
+    axes[0].set_title("Original Coefficients", fontsize=_fs(9))
+    axes[0].set_ylabel(ylabel, fontsize=_fs(8))
     axes[0].grid(False)
     _add_colorbar(fig, im0, axes[0], label="Value")
 
     # Reconstructed
     im1 = axes[1].imshow(reconstructed, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[1].set_title("Reconstructed Coefficients", fontsize=9)
-    axes[1].set_ylabel(ylabel, fontsize=8)
+    axes[1].set_title("Reconstructed Coefficients", fontsize=_fs(9))
+    axes[1].set_ylabel(ylabel, fontsize=_fs(8))
     axes[1].grid(False)
     _add_colorbar(fig, im1, axes[1], label="Value")
 
     # Error
     im2 = axes[2].imshow(error, aspect="auto", cmap="Reds", origin="upper")
-    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=9)
-    axes[2].set_xlabel("Time Steps", fontsize=8)
-    axes[2].set_ylabel(ylabel, fontsize=8)
+    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=_fs(9))
+    axes[2].set_xlabel("Time Steps", fontsize=_fs(8))
+    axes[2].set_ylabel(ylabel, fontsize=_fs(8))
     axes[2].grid(False)
     _add_colorbar(fig, im2, axes[2], label="|Error|")
 
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -438,11 +444,11 @@ def _plot_latent_heatmap(
     # Mark warmup boundary
     if warmup_steps > 0:
         ax.axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=7, va="top")
+        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=_fs(7), va="top")
 
-    ax.set_xlabel("Time Steps", fontsize=8)
-    ax.set_ylabel("Latent Dimension", fontsize=8)
-    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
+    ax.set_xlabel("Time Steps", fontsize=_fs(8))
+    ax.set_ylabel("Latent Dimension", fontsize=_fs(8))
+    ax.set_title(title, fontsize=_fs(9), fontweight="normal", pad=8)
     ax.grid(False)
 
     _add_colorbar(fig, im, ax, label="Activation")
@@ -475,8 +481,8 @@ def _plot_kld_per_dimension(
     im = axes[0].imshow(kld_T, aspect="auto", cmap="viridis", origin="lower")
     if warmup_steps > 0:
         axes[0].axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-    axes[0].set_ylabel("Latent Dimension", fontsize=8)
-    axes[0].set_title("KLD per Dimension over Time", fontsize=9)
+    axes[0].set_ylabel("Latent Dimension", fontsize=_fs(8))
+    axes[0].set_title("KLD per Dimension over Time", fontsize=_fs(9))
     axes[0].grid(False)
     _add_colorbar(fig, im, axes[0], label="KLD (bits)")
 
@@ -497,13 +503,13 @@ def _plot_kld_per_dimension(
     if warmup_steps > 0:
         axes[1].axvspan(0, warmup_steps, alpha=0.1, color=COLOR_GRAY)
         axes[1].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
-    axes[1].set_xlabel("Time Steps", fontsize=8)
-    axes[1].set_ylabel("Mean KLD", fontsize=8)
-    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=9)
+    axes[1].set_xlabel("Time Steps", fontsize=_fs(8))
+    axes[1].set_ylabel("Mean KLD", fontsize=_fs(8))
+    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=_fs(9))
     _style_axes(axes[1], grid="both")
     axes[1].set_xlim(0, len(kld_mean))
 
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -541,15 +547,15 @@ def _plot_residual_histogram(
     axes[0].axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=f"Mean: {mean_val:.4f}")
     axes[0].axvline(0, color=COLOR_BLACK, linewidth=0.6, alpha=0.5)
 
-    axes[0].set_xlabel("Residual (True - Pred)", fontsize=8)
-    axes[0].set_ylabel("Density", fontsize=8)
-    axes[0].set_title("Residual Histogram", fontsize=9)
-    axes[0].legend(fontsize=7, framealpha=0.95)
+    axes[0].set_xlabel("Residual (True - Pred)", fontsize=_fs(8))
+    axes[0].set_ylabel("Density", fontsize=_fs(8))
+    axes[0].set_title("Residual Histogram", fontsize=_fs(9))
+    axes[0].legend(fontsize=_fs(7), framealpha=0.95)
     _style_axes(axes[0], grid="major")
 
     # Q-Q plot
     scipy_stats.probplot(residual, dist="norm", plot=axes[1])
-    axes[1].set_title("Q-Q Plot (Normal)", fontsize=9)
+    axes[1].set_title("Q-Q Plot (Normal)", fontsize=_fs(9))
     axes[1].get_lines()[0].set_markersize(2)
     axes[1].get_lines()[0].set_color(COLOR_BLUE)
     axes[1].get_lines()[1].set_color(COLOR_VERMILLION)
@@ -561,12 +567,12 @@ def _plot_residual_histogram(
     stats_text = f"Skewness: {skewness:.3f}\nKurtosis: {kurtosis:.3f}\nRMSE: {np.sqrt(np.mean(residual**2)):.4f}"
     axes[0].text(
         0.98, 0.98, stats_text,
-        transform=axes[0].transAxes, fontsize=7,
+        transform=axes[0].transAxes, fontsize=_fs(7),
         verticalalignment="top", horizontalalignment="right",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=COLOR_LIGHT_GRAY, alpha=0.95)
     )
 
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -598,23 +604,23 @@ def _plot_channel_timeseries(
         if reconstructed is not None and i < reconstructed.shape[0]:
             ax.plot(t, reconstructed[i], color=COLOR_ORANGE, linewidth=0.8, alpha=0.8, label="Reconstructed")
             mae = np.mean(np.abs(coefficients[i] - reconstructed[i]))
-            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=8)
+            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=_fs(8))
         else:
-            ax.set_title(f"Channel {i}", fontsize=8)
-        ax.set_ylabel("Value", fontsize=7)
+            ax.set_title(f"Channel {i}", fontsize=_fs(8))
+        ax.set_ylabel("Value", fontsize=_fs(7))
         _style_axes(ax, grid="major")
         if i == 0:
-            ax.legend(fontsize=6, loc="upper right", framealpha=0.9)
+            ax.legend(fontsize=_fs(6), loc="upper right", framealpha=0.9)
 
     # Hide unused axes
     for i in range(n_ch, len(axes)):
         axes[i].set_visible(False)
 
-    axes[-2].set_xlabel("Time Steps", fontsize=8)
+    axes[-2].set_xlabel("Time Steps", fontsize=_fs(8))
     if len(axes) > 1:
-        axes[-1].set_xlabel("Time Steps", fontsize=8)
+        axes[-1].set_xlabel("Time Steps", fontsize=_fs(8))
 
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -654,10 +660,10 @@ def _plot_error_summary(
         for bar, val in zip(bars, metric_values):
             if np.isfinite(val):
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                        f"{val:.4f}", ha="center", va="bottom", fontsize=7)
+                        f"{val:.4f}", ha="center", va="bottom", fontsize=_fs(7))
 
-        ax.set_ylabel("Value", fontsize=8)
-        ax.set_title("FHR Reconstruction Metrics", fontsize=9)
+        ax.set_ylabel("Value", fontsize=_fs(8))
+        ax.set_title("FHR Reconstruction Metrics", fontsize=_fs(9))
         _style_axes(ax, grid="major")
 
     # 2. Per-channel ST MAE distribution
@@ -668,14 +674,14 @@ def _plot_error_summary(
                edgecolor=COLOR_BLACK, linewidth=0.3)
         ax.axhline(np.mean(st_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
                    linewidth=1.0, label=f"Mean: {np.mean(st_mae_per_channel):.4f}")
-        ax.set_xlabel("ST Channel", fontsize=8)
-        ax.set_ylabel("MAE", fontsize=8)
-        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
-        ax.legend(fontsize=7, framealpha=0.9)
+        ax.set_xlabel("ST Channel", fontsize=_fs(8))
+        ax.set_ylabel("MAE", fontsize=_fs(8))
+        ax.set_title("Scattering Transform Error by Channel", fontsize=_fs(9))
+        ax.legend(fontsize=_fs(7), framealpha=0.9)
         _style_axes(ax, grid="major")
     else:
-        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=8)
-        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
+        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=_fs(8))
+        ax.set_title("Scattering Transform Error by Channel", fontsize=_fs(9))
 
     # 3. Per-channel PH MAE distribution
     ax = axes[1, 0]
@@ -685,14 +691,14 @@ def _plot_error_summary(
                edgecolor=COLOR_BLACK, linewidth=0.3)
         ax.axhline(np.mean(ph_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
                    linewidth=1.0, label=f"Mean: {np.mean(ph_mae_per_channel):.4f}")
-        ax.set_xlabel("PH Channel", fontsize=8)
-        ax.set_ylabel("MAE", fontsize=8)
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
-        ax.legend(fontsize=7, framealpha=0.9)
+        ax.set_xlabel("PH Channel", fontsize=_fs(8))
+        ax.set_ylabel("MAE", fontsize=_fs(8))
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=_fs(9))
+        ax.legend(fontsize=_fs(7), framealpha=0.9)
         _style_axes(ax, grid="major")
     else:
-        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=8)
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
+        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=_fs(8))
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=_fs(9))
 
     # 4. FHR error over time
     ax = axes[1, 1]
@@ -707,14 +713,14 @@ def _plot_error_summary(
     ax.plot(t, rolling_mae, color=COLOR_PURPLE, linewidth=0.6, label="Rolling MAE")
     ax.axhline(np.mean(np.abs(residual)), color=COLOR_ORANGE, linestyle="--",
                linewidth=0.9, label=f"Mean MAE: {np.mean(np.abs(residual)):.4f}")
-    ax.set_xlabel("Sample Index", fontsize=8)
-    ax.set_ylabel("MAE", fontsize=8)
-    ax.set_title("FHR Reconstruction Error Over Time", fontsize=9)
-    ax.legend(fontsize=7, framealpha=0.9)
+    ax.set_xlabel("Sample Index", fontsize=_fs(8))
+    ax.set_ylabel("MAE", fontsize=_fs(8))
+    ax.set_title("FHR Reconstruction Error Over Time", fontsize=_fs(9))
+    ax.legend(fontsize=_fs(7), framealpha=0.9)
     ax.set_xlim(0, len(residual))
     _style_axes(ax, grid="major")
 
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=0.99)
+    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=0.99)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -878,8 +884,19 @@ def _plot_all_single_sample_plots(
     # 4. Time-frequency coherence (STFT)
     # -------------------------------------------------------------------
     try:
+        tf_true = y_true_np
+        tf_pred = y_pred_np
+        if valid_mask is not None:
+            mask_np = valid_mask.detach().cpu().numpy().astype(bool)
+            if mask_np.any():
+                start = int(np.argmax(mask_np))
+                end = int(len(mask_np) - np.argmax(mask_np[::-1]))
+                if end > start:
+                    tf_true = tf_true[start:end]
+                    tf_pred = tf_pred[start:end]
+
         stft_result = compute_stft_coherence_map(
-            y_true_np, y_pred_np, fs=fs, nperseg=64
+            tf_true, tf_pred, fs=fs, nperseg=128
         )
         if stft_result["coherence"].size > 0:
             plot_path = sample_dir / "time_frequency_coherence_stft.svg"
@@ -901,7 +918,16 @@ def _plot_all_single_sample_plots(
     # -------------------------------------------------------------------
     try:
         wavelet_result = compute_wavelet_coherence(
-            y_true_np, y_pred_np, fs=fs, num_scales=40
+            tf_true,
+            tf_pred,
+            fs=fs,
+            num_scales=50,
+            min_freq=None,
+            max_freq=0.5,
+            pad_mode="reflect",
+            pad_max_fraction=0.25,
+            coi_scale=1.65,
+            apply_coi_mask=True,
         )
         if wavelet_result["coherence"].size > 0:
             plot_path = sample_dir / "time_frequency_coherence_wavelet.svg"
