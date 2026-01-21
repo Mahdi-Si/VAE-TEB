@@ -1071,7 +1071,8 @@ def _plot_all_single_sample_plots(
 
     # Denormalize prediction for detailed plots
     pred_denorm_full = _denormalize_tensor(avg_mu.unsqueeze(0), "fhr", stats)
-    recon_np = pred_denorm_full[0].detach().cpu().numpy()
+    recon_denorm_np = pred_denorm_full[0].detach().cpu().numpy()
+    recon_norm_np = avg_mu.detach().cpu().numpy()
 
     # Logvar for detailed plots
     logvar_np = None
@@ -1098,7 +1099,7 @@ def _plot_all_single_sample_plots(
             fhr_ph=fhr_ph_np,
             fhr_up_ph=fhr_up_ph_np,
             latent_z=latent_np.T,
-            reconstructed_fhr_mu=recon_np,
+            reconstructed_fhr_mu=recon_norm_np,
             reconstructed_fhr_logvar=logvar_np,
             kld_tensor=kld_tensor_np,
             kld_mean_over_channels=kld_mean_np,
@@ -1128,7 +1129,8 @@ def _plot_all_single_sample_plots(
             raw_up_unnormalized=raw_up_denorm_np,
             raw_fhr_normalized=raw_fhr_norm_np,
             raw_up_normalized=raw_up_norm_np,
-            reconstructed_fhr=recon_np,
+            reconstructed_fhr=recon_norm_np,
+            reconstructed_fhr_unnormalized=recon_denorm_np,
             original_scattering_transform=fhr_st_np,
             reconstructed_scattering_transform=recon_st_np,
             original_phase_harmonic=fhr_ph_np,
@@ -1252,7 +1254,7 @@ def _plot_all_single_sample_plots(
                 sample_guid=guid,
                 epoch=epoch,
             )
-            plot_paths["single_prediction_windows"] = str(sample_dir / "single_pred_windows_0.svg")
+            plot_paths["single_prediction_windows"] = str(sample_dir / "single_prediction_sample_000.svg")
             logger.debug("Saved single_prediction_windows.svg")
     except Exception as e:
         logger.warning(f"Failed to plot single_prediction_windows: {e}")

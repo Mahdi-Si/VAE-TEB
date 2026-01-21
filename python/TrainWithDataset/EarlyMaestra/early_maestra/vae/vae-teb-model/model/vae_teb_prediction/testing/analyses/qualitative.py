@@ -362,7 +362,8 @@ def run_reconstruction_analysis(
                 fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
                 latent_np = latent[idx].detach().cpu().numpy().T
 
-                recon_np = avg_mu.detach().cpu().numpy()
+                recon_norm_np = avg_mu.detach().cpu().numpy()
+                recon_denorm_np = _denormalize_tensor(avg_mu.unsqueeze(0), "fhr", stats)[0].detach().cpu().numpy()
                 logvar_np = avg_logvar.detach().cpu().numpy() if avg_logvar is not None else None
                 if valid_mask is not None and logvar_np is not None:
                     mask_np = valid_mask.detach().cpu().numpy()
@@ -382,7 +383,7 @@ def run_reconstruction_analysis(
                     fhr_ph=fhr_ph_np,
                     fhr_up_ph=fhr_up_ph_np,
                     latent_z=latent_np,
-                    reconstructed_fhr_mu=recon_np,
+                    reconstructed_fhr_mu=recon_norm_np,
                     reconstructed_fhr_logvar=logvar_np,
                     kld_tensor=kld_tensor_np,
                     kld_mean_over_channels=kld_mean_np,
@@ -398,7 +399,8 @@ def run_reconstruction_analysis(
                     raw_up_unnormalized=raw_up_denorm_np,
                     raw_fhr_normalized=raw_fhr_norm_np,
                     raw_up_normalized=raw_up_norm_np,
-                    reconstructed_fhr=recon_np,
+                    reconstructed_fhr=recon_norm_np,
+                    reconstructed_fhr_unnormalized=recon_denorm_np,
                     original_scattering_transform=fhr_st_np,
                     reconstructed_scattering_transform=recon_st_np,
                     original_phase_harmonic=fhr_ph_np,
