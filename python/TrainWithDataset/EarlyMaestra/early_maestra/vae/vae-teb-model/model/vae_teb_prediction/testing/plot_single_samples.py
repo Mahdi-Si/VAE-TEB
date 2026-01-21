@@ -481,7 +481,17 @@ def _plot_kld_per_dimension(
     _add_colorbar(fig, im, axes[0], label="KLD (bits)")
 
     # Mean trace
-    kld_mean = np.nanmean(kld_T, axis=0)
+    if kld_T.size == 0:
+        return
+
+    finite_mask = np.isfinite(kld_T)
+    if np.any(finite_mask):
+        kld_mean = np.nanmean(kld_T, axis=0)
+        overall_mean = float(np.nanmean(kld_mean))
+    else:
+        kld_mean = np.full(kld_T.shape[1], np.nan, dtype=float)
+        overall_mean = 0.0
+
     t = np.arange(len(kld_mean))
     axes[1].plot(t, kld_mean, color=COLOR_PURPLE, linewidth=0.8)
     if warmup_steps > 0:
@@ -489,7 +499,7 @@ def _plot_kld_per_dimension(
         axes[1].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
     axes[1].set_xlabel("Time Steps", fontsize=8)
     axes[1].set_ylabel("Mean KLD", fontsize=8)
-    axes[1].set_title(f"Mean KLD over Time (Overall: {np.nanmean(kld_mean):.4f})", fontsize=9)
+    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=9)
     _style_axes(axes[1], grid="both")
     axes[1].set_xlim(0, len(kld_mean))
 
@@ -921,8 +931,10 @@ def _plot_all_single_sample_plots(
             plot_path = sample_dir / "psd_comparison.svg"
             plot_psd_comparison(
                 freqs_orig,
-                psd_orig.reshape(1, -1),  # shape (1, F) for mean/std calc
-                psd_pred.reshape(1, -1),
+                psd_orig,
+                np.zeros_like(psd_orig),
+                psd_pred,
+                np.zeros_like(psd_pred),
                 sample_dir,
                 filename="psd_comparison.svg",
             )
@@ -957,7 +969,7 @@ def _plot_all_single_sample_plots(
         if latent_np.shape[0] > 2 and latent_np.shape[1] >= 2:
             # Reduce to 2D
             latent_2d = reduce_latent_dimensionality(
-                latent_np, method=dim_reduction_method, n_components=2
+                latent_np[None, ...], method=dim_reduction_method, n_components=2
             )
             plot_path = sample_dir / "latent_trajectory_2d.svg"
             plot_latent_trajectory_2d(
@@ -978,7 +990,7 @@ def _plot_all_single_sample_plots(
         if latent_np.shape[0] > 2 and latent_np.shape[1] >= 3:
             # Reduce to 3D
             latent_3d = reduce_latent_dimensionality(
-                latent_np, method=dim_reduction_method, n_components=3
+                latent_np[None, ...], method=dim_reduction_method, n_components=3
             )
             plot_path = sample_dir / "latent_trajectory_3d.svg"
             plot_latent_trajectory_3d(
@@ -1071,6 +1083,8 @@ def _plot_all_single_sample_plots(
             avg_logvar, _ = aggregate_predictions(runner.model, avg_logvar_seg, raw_len=y_raw.size(1))
             if avg_logvar is not None:
                 logvar_np = avg_logvar.detach().cpu().numpy()
+                if logvar_np.ndim == 2 and logvar_np.shape[0] == 1:
+                    logvar_np = logvar_np[0]
 
     # -------------------------------------------------------------------
     # 10. Model analysis (detailed panel)
@@ -1119,6 +1133,11 @@ def _plot_all_single_sample_plots(
             reconstructed_scattering_transform=recon_st_np,
             original_phase_harmonic=fhr_ph_np,
             reconstructed_phase_harmonic=recon_ph_np,
+            original_cross_phase_harmonic=fhr_up_ph_np,
+            latent_z=latent_np,
+            kld_tensor=kld_tensor_np,
+            kld_mean_over_channels=kld_mean_np,
+            warmup_steps=runner.warmup_steps,
             scattering_channel_data=None,
             batch_idx=0,
             loss_dict=loss_floats,
