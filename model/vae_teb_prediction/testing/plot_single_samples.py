@@ -295,19 +295,18 @@ def _apply_publication_style() -> None:
 
 
 def _style_axes(ax: plt.Axes, *, grid: str = "major") -> None:
-    """Apply clean styling to axes."""
+    """Apply clean styling to axes with all four spines visible."""
     ax.set_axisbelow(True)
     if grid in ("both", "major"):
         ax.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color=COLOR_LIGHT_GRAY)
     if grid == "both":
         ax.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
         ax.minorticks_on()
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color(COLOR_GRAY)
-    ax.spines["bottom"].set_color(COLOR_GRAY)
-    ax.spines["left"].set_linewidth(0.7)
-    ax.spines["bottom"].set_linewidth(0.7)
+    # Show all four spines
+    for spine in ["top", "bottom", "left", "right"]:
+        ax.spines[spine].set_visible(True)
+        ax.spines[spine].set_color(COLOR_BLACK)
+        ax.spines[spine].set_linewidth(0.6)
 
 
 def _add_colorbar(
@@ -808,6 +807,9 @@ def _plot_all_single_sample_plots(
     if logvar_predictions is not None:
         std_concat = np.full_like(raw_norm_np, np.nan, dtype=float)
 
+    # Track prediction window boundaries for visualization
+    prediction_boundaries = []
+
     t_idx = warmup
     while t_idx < total_steps:
         raw_start = t_idx * stride
@@ -823,6 +825,7 @@ def _plot_all_single_sample_plots(
             pred_segment = pred_segment[:seg_len]
 
         pred_concat[raw_start:raw_end] = pred_segment
+        prediction_boundaries.append(raw_start)
 
         if std_concat is not None:
             logvar_segment = logvar_predictions[t_idx]
@@ -918,11 +921,15 @@ def _plot_all_single_sample_plots(
     ax = axes[7]
     ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
     ax.plot(t_raw, pred_concat, color=COLOR_ORANGE, linewidth=1.2, label="Single Predictions")
+    # Add fill_between for uncertainty with more visible color
     if std_concat is not None:
         upper = pred_concat + std_concat
         lower = pred_concat - std_concat
-        ax.plot(t_raw, upper, color=COLOR_LIGHT_GRAY, linewidth=0.9, linestyle="--", label="+/-1SD")
-        ax.plot(t_raw, lower, color=COLOR_LIGHT_GRAY, linewidth=0.9, linestyle="--")
+        ax.fill_between(t_raw, lower, upper, color=COLOR_SKY, alpha=0.35, label="+/-1SD")
+    # Add vertical lines at prediction window boundaries
+    for i, boundary in enumerate(prediction_boundaries):
+        boundary_sec = boundary / fs
+        ax.axvline(x=boundary_sec, color=COLOR_GRAY, linestyle=":", linewidth=0.6, alpha=0.7)
     ax.set_title("Single-Window Predictions (Normalized)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized Amplitude")
