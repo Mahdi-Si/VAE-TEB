@@ -26,6 +26,8 @@ from matplotlib.collections import LineCollection
 # Set publication-quality style - optimized for high-impact journals
 plt.style.use("default")  # Start from clean slate
 
+FONT_SCALE = 2.0
+
 plt.rcParams.update({
     "figure.dpi": 150,
     "savefig.dpi": 600,
@@ -34,13 +36,13 @@ plt.rcParams.update({
     "savefig.pad_inches": 0.05,
     "font.family": "serif",
     "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
-    "font.size": 8,
-    "axes.titlesize": 9,
-    "axes.labelsize": 8,
-    "xtick.labelsize": 7,
-    "ytick.labelsize": 7,
-    "legend.fontsize": 7,
-    "legend.title_fontsize": 7,
+    "font.size": 8 * FONT_SCALE,
+    "axes.titlesize": 9 * FONT_SCALE,
+    "axes.labelsize": 8 * FONT_SCALE,
+    "xtick.labelsize": 7 * FONT_SCALE,
+    "ytick.labelsize": 7 * FONT_SCALE,
+    "legend.fontsize": 7 * FONT_SCALE,
+    "legend.title_fontsize": 7 * FONT_SCALE,
     "axes.linewidth": 0.6,
     "axes.edgecolor": "#222831",
     "axes.labelcolor": "#222831",

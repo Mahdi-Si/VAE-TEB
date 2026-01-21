@@ -17,6 +17,12 @@ COLOR_LIGHT_GRAY = "#EEEEEE"
 COLOR_SAGE = "#9DC08B"
 COLOR_TEAL_DARK = "#0D7377"
 SAVE_DPI = 600
+FONT_SCALE = 2.0
+COLORBAR_PAD = 0.01
+
+
+def _fs(value: float) -> float:
+    return value * FONT_SCALE
 
 
 def _apply_publication_style() -> None:
@@ -30,13 +36,13 @@ def _apply_publication_style() -> None:
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
         
-        "font.size": 8,
-        "axes.titlesize": 9,
-        "axes.labelsize": 8,
-        "xtick.labelsize": 7,
-        "ytick.labelsize": 7,
-        "legend.fontsize": 7,
-        "legend.title_fontsize": 7,
+        "font.size": _fs(8),
+        "axes.titlesize": _fs(9),
+        "axes.labelsize": _fs(8),
+        "xtick.labelsize": _fs(7),
+        "ytick.labelsize": _fs(7),
+        "legend.fontsize": _fs(7),
+        "legend.title_fontsize": _fs(7),
         "axes.linewidth": 0.6,
         "axes.edgecolor": COLOR_BLACK,
         "axes.labelcolor": COLOR_BLACK,
@@ -238,8 +244,8 @@ def plot_model_analysis(
         # Add loss info at bottom
         if loss_dict:
             loss_text = f"KLD: {kld_mean_value:.4f} | MSE: {loss_dict.get('mse_loss', 0):.4f}"
-            ax[0, 0].text(0.5, -0.15, loss_text, transform=ax[0, 0].transAxes, ha='center', 
-                       fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
+            ax[0, 0].text(0.5, -0.15, loss_text, transform=ax[0, 0].transAxes, ha='center',
+                       fontsize=_fs(10), bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 2. FHR Reconstruction with Uncertainty
         if mu_pr_means is not None and log_var_means is not None:
@@ -264,7 +270,7 @@ def plot_model_analysis(
             if loss_dict:
                 loss_text = f"NLL: {loss_dict.get('nll_loss', 0):.4f} | Total Rec: {loss_dict.get('total_rec', loss_dict.get('reconstruction_loss', 0)):.4f}"
                 ax[1, 0].text(0.5, -0.15, loss_text, transform=ax[1, 0].transAxes, ha='center',
-                           fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
+                           fontsize=_fs(10), bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 3. Selected timesteps aggregation (handling NaN values)
         if mu_pr is not None:
@@ -318,7 +324,7 @@ def plot_model_analysis(
             if loss_dict:
                 loss_text = f"Total Loss: {loss_dict.get('total_loss', 0):.4f}"
                 ax[2, 0].text(0.5, -0.15, loss_text, transform=ax[2, 0].transAxes, ha='center',
-                           fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
+                           fontsize=_fs(10), bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # 4. Latent Space z with warmup alignment
         if latent_z is not None:
@@ -339,12 +345,12 @@ def plot_model_analysis(
                 if leading_nan_cols > 0:
                     ax[3, 0].axvline(x=leading_nan_cols - 0.5, color='white', linestyle='--',
                                    linewidth=2, alpha=0.8, label='Warmup end')
-                    ax[3, 0].legend(loc='upper right', framealpha=0.95, fontsize=9)
+                    ax[3, 0].legend(loc='upper right', framealpha=0.95, fontsize=_fs(9))
 
             ax[3, 1].set_axis_on()
             cbar = fig.colorbar(imgplot, cax=ax[3, 1])
-            cbar.ax.tick_params(labelsize=10, colors='#393E46')
-            cbar.set_label('Activation', fontweight='normal', fontsize=11, color='#393E46')
+            cbar.ax.tick_params(labelsize=_fs(10), colors='#393E46')
+            cbar.set_label('Activation', fontweight='normal', fontsize=_fs(11), color='#393E46')
             cbar.outline.set_color('#393E46')
             cbar.outline.set_linewidth(0.7)
             ax[3, 0].set_ylabel('Latent Dimensions', fontweight='normal')
@@ -355,11 +361,11 @@ def plot_model_analysis(
             if loss_dict:
                 loss_text = f"KLD Mean: {kld_mean_value:.4f} | Epoch: {epoch}"
                 ax[3, 0].text(0.5, -0.15, loss_text, transform=ax[3, 0].transAxes, ha='center',
-                           fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
+                           fontsize=_fs(10), bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], alpha=0.8))
 
         # Set overall title with scientific paper styling
-        fig.suptitle(f'Model Performance Analysis - Epoch {epoch}', 
-                    fontsize=14, fontweight='normal', y=0.97, color=COLOR_BLUE)
+        fig.suptitle(f'Model Performance Analysis - Epoch {epoch}',
+                    fontsize=_fs(14), fontweight='normal', y=0.97, color=COLOR_BLUE)
         save_path = os.path.join(output_dir, f'model_results_epoch_{epoch}.svg')
         
     else:
@@ -460,7 +466,7 @@ def plot_model_analysis(
             leading_nan_cols += 1
         if leading_nan_cols > 0:
             ax[3].axvline(x=leading_nan_cols - 0.5, color='white', linestyle='--', linewidth=2, alpha=0.8, label='Warmup end')
-            ax[3].legend(loc='upper right', framealpha=0.95, fontsize=9)
+            ax[3].legend(loc='upper right', framealpha=0.95, fontsize=_fs(9))
         fig.colorbar(im_kld, ax=ax[3])
 
         # 5. Mean KLD over time (aligned with tensor x-axis)
@@ -483,7 +489,7 @@ def plot_model_analysis(
                     leading_nan_cols += 1
                 if leading_nan_cols > 0:
                     ax[4].axvspan(0, leading_nan_cols, alpha=0.15, color='gray', label='Warmup')
-                    ax[4].legend(loc='upper right', framealpha=0.95, fontsize=9)
+                    ax[4].legend(loc='upper right', framealpha=0.95, fontsize=_fs(9))
         ax[4].set_title(f'Mean KLD Across Latent Dimensions (Overall Mean: {kld_overall_mean:.4f})')
         ax[4].set_xlabel('Time Steps')
         ax[4].set_ylabel('KLD')
@@ -570,7 +576,7 @@ def plot_model_analysis(
             fig.colorbar(im_up_ph, ax=ax[next_idx])
             next_idx += 1
 
-        fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=16, fontweight='normal')
+        fig.suptitle(f'Model Analysis - Best Checkpoint - Sample {batch_idx}', fontsize=_fs(16), fontweight='normal')
         save_path = os.path.join(output_dir, f'analysis_plot_best_checkpoint_sample_{batch_idx}.svg')
     
     # Save and close (common for both modes)
@@ -690,7 +696,7 @@ def plot_single_prediction_windows(
             f"T={window['t_index']}",
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=_fs(9),
             color=colors['recon'],
         )
 
@@ -939,7 +945,7 @@ def plot_vae_reconstruction(
     n_channel_plots = min(10, original_scattering_transform.shape[0]) if show_channel_plots else 0
     n_rows = n_main_plots + n_channel_plots
 
-    fig, ax = plt.subplots(n_rows, 1, figsize=(16, n_rows * 2.5), constrained_layout=True)
+    fig, ax = plt.subplots(n_rows, 1, figsize=(16, n_rows * 2.5), constrained_layout=False)
     if n_rows == 1:
         ax = np.asarray([ax])
 
@@ -961,7 +967,7 @@ def plot_vae_reconstruction(
             "No data",
             ha="center",
             va="center",
-            fontsize=9,
+            fontsize=_fs(9),
             color=COLOR_GRAY,
             transform=axis.transAxes,
         )
@@ -1030,7 +1036,7 @@ def plot_vae_reconstruction(
         ax[plot_idx].set_ylabel('Latent Dimensions', fontweight='normal')
         if warmup_steps > 0:
             ax[plot_idx].axvline(x=warmup_steps - 0.5, color=COLOR_GRAY, linestyle='--', linewidth=1.0, alpha=0.8)
-        fig.colorbar(im_latent, ax=ax[plot_idx], shrink=0.8)
+        fig.colorbar(im_latent, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         plot_idx += 1
 
     if has_kld_heatmap:
@@ -1055,7 +1061,7 @@ def plot_vae_reconstruction(
         ax[plot_idx].set_ylabel('Latent Dimensions', fontweight='normal')
         if warmup_steps > 0:
             ax[plot_idx].axvline(x=warmup_steps - 0.5, color=COLOR_GRAY, linestyle='--', linewidth=1.0, alpha=0.8)
-        fig.colorbar(im_kld, ax=ax[plot_idx], shrink=0.8)
+        fig.colorbar(im_kld, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         plot_idx += 1
 
     if has_kld_mean:
@@ -1099,7 +1105,7 @@ def plot_vae_reconstruction(
     ax[plot_idx].set_title('Original Scattering Transform Coefficients', fontweight='normal', pad=12)
     ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
     ax[plot_idx].set_ylabel('Scattering Channels', fontweight='normal')
-    fig.colorbar(im_st_orig, ax=ax[plot_idx], shrink=0.8)
+    fig.colorbar(im_st_orig, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
     plot_idx += 1
 
     if has_recon_st:
@@ -1108,7 +1114,7 @@ def plot_vae_reconstruction(
         ax[plot_idx].set_title('Reconstructed Scattering Transform Coefficients', fontweight='normal', pad=12)
         ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
         ax[plot_idx].set_ylabel('Scattering Channels', fontweight='normal')
-        fig.colorbar(im_st_recon, ax=ax[plot_idx], shrink=0.8)
+        fig.colorbar(im_st_recon, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         plot_idx += 1
 
     if split_phase:
@@ -1120,7 +1126,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_title('Original Phase Harmonics - Autocorr (same freq)')
             ax[plot_idx].set_xlabel('Time Steps')
             ax[plot_idx].set_ylabel('Channels')
-            fig.colorbar(im_ph_auto, ax=ax[plot_idx], shrink=0.8)
+            fig.colorbar(im_ph_auto, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         else:
             _annotate_empty(ax[plot_idx], 'Original Phase Harmonics - Autocorr (none)')
         plot_idx += 1
@@ -1130,7 +1136,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_title('Original Phase Harmonics - Cross (different freq)')
             ax[plot_idx].set_xlabel('Time Steps')
             ax[plot_idx].set_ylabel('Channels')
-            fig.colorbar(im_ph_cross, ax=ax[plot_idx], shrink=0.8)
+            fig.colorbar(im_ph_cross, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         else:
             _annotate_empty(ax[plot_idx], 'Original Phase Harmonics - Cross (none)')
         plot_idx += 1
@@ -1140,7 +1146,7 @@ def plot_vae_reconstruction(
         ax[plot_idx].set_title('Original Phase Harmonic Coefficients', fontweight='normal', pad=12)
         ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
         ax[plot_idx].set_ylabel('Phase Harmonic Channels', fontweight='normal')
-        fig.colorbar(im_ph_orig, ax=ax[plot_idx], shrink=0.8)
+        fig.colorbar(im_ph_orig, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         plot_idx += 1
 
     if has_recon_ph:
@@ -1153,7 +1159,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_title('Reconstructed Phase Harmonics - Autocorr (same freq)')
                 ax[plot_idx].set_xlabel('Time Steps')
                 ax[plot_idx].set_ylabel('Channels')
-                fig.colorbar(im_ph_auto_r, ax=ax[plot_idx], shrink=0.8)
+                fig.colorbar(im_ph_auto_r, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             else:
                 _annotate_empty(ax[plot_idx], 'Reconstructed Phase Harmonics - Autocorr (none)')
             plot_idx += 1
@@ -1163,7 +1169,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_title('Reconstructed Phase Harmonics - Cross (different freq)')
                 ax[plot_idx].set_xlabel('Time Steps')
                 ax[plot_idx].set_ylabel('Channels')
-                fig.colorbar(im_ph_cross_r, ax=ax[plot_idx], shrink=0.8)
+                fig.colorbar(im_ph_cross_r, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             else:
                 _annotate_empty(ax[plot_idx], 'Reconstructed Phase Harmonics - Cross (none)')
             plot_idx += 1
@@ -1173,7 +1179,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_title('Reconstructed Phase Harmonic Coefficients', fontweight='normal', pad=12)
             ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
             ax[plot_idx].set_ylabel('Phase Harmonic Channels', fontweight='normal')
-            fig.colorbar(im_ph_recon, ax=ax[plot_idx], shrink=0.8)
+            fig.colorbar(im_ph_recon, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             plot_idx += 1
 
     if has_cross:
@@ -1194,7 +1200,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_title('UP->FHR Cross-Phase - Autocorr (same filter)')
                 ax[plot_idx].set_xlabel('Time Steps')
                 ax[plot_idx].set_ylabel('Channels')
-                fig.colorbar(im_cp_auto, ax=ax[plot_idx], shrink=0.8)
+                fig.colorbar(im_cp_auto, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             else:
                 _annotate_empty(ax[plot_idx], 'UP->FHR Cross-Phase - Autocorr (none)')
             plot_idx += 1
@@ -1204,7 +1210,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_title('UP->FHR Cross-Phase - Cross (different filters)')
                 ax[plot_idx].set_xlabel('Time Steps')
                 ax[plot_idx].set_ylabel('Channels')
-                fig.colorbar(im_cp_cross, ax=ax[plot_idx], shrink=0.8)
+                fig.colorbar(im_cp_cross, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             else:
                 _annotate_empty(ax[plot_idx], 'UP->FHR Cross-Phase - Cross (none)')
             plot_idx += 1
@@ -1214,7 +1220,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_title('UP->FHR Cross-Phase Harmonics', fontweight='normal', pad=12)
             ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
             ax[plot_idx].set_ylabel('Channels', fontweight='normal')
-            fig.colorbar(im_up_ph, ax=ax[plot_idx], shrink=0.8)
+            fig.colorbar(im_up_ph, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
             plot_idx += 1
 
     if show_error_heatmap:
@@ -1233,7 +1239,7 @@ def plot_vae_reconstruction(
             'ST',
             color='white',
             fontweight='normal',
-            fontsize=10,
+            fontsize=_fs(10),
             va='center',
         )
         ax[plot_idx].text(
@@ -1242,10 +1248,10 @@ def plot_vae_reconstruction(
             'PH',
             color='white',
             fontweight='normal',
-            fontsize=10,
+            fontsize=_fs(10),
             va='center',
         )
-        fig.colorbar(im_error, ax=ax[plot_idx], shrink=0.8)
+        fig.colorbar(im_error, ax=ax[plot_idx], shrink=0.8, pad=COLORBAR_PAD)
         plot_idx += 1
 
     for i in range(n_channel_plots):
@@ -1280,7 +1286,7 @@ def plot_vae_reconstruction(
         ax[plot_idx].set_ylabel('Coefficient Value', fontweight='normal')
         if i == n_channel_plots - 1:
             ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
-        ax[plot_idx].legend(loc='upper right', framealpha=0.95, fontsize=9)
+        ax[plot_idx].legend(loc='upper right', framealpha=0.95, fontsize=_fs(9))
         ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
 
         mse_channel = np.mean((original_scattering_transform[channel, :] -
@@ -1295,7 +1301,7 @@ def plot_vae_reconstruction(
             transform=ax[plot_idx].transAxes,
             ha='right',
             va='top',
-            fontsize=8,
+            fontsize=_fs(8),
             bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'],
                       alpha=0.8, edgecolor='#393E46'),
         )
@@ -1314,7 +1320,8 @@ def plot_vae_reconstruction(
     if loss_text:
         title_text += f" - {loss_text}"
     
-    fig.suptitle(title_text, fontsize=14, fontweight='normal', y=0.99, color=COLOR_BLUE)
+    fig.suptitle(title_text, fontsize=_fs(14), fontweight='normal', y=1.02, color=COLOR_BLUE)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
     
     # Save plot
     save_path = os.path.join(output_dir, f'vae_reconstruction_analysis_sample_{batch_idx}.svg')
@@ -1352,9 +1359,9 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
     plt.rcParams.update({
         'font.family': 'sans-serif',
         'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-        'font.size': 11,
-        'axes.titlesize': 12,
-        'axes.labelsize': 11,
+        'font.size': _fs(11),
+        'axes.titlesize': _fs(12),
+        'axes.labelsize': _fs(11),
         'axes.linewidth': 0.7,
         'axes.edgecolor': COLOR_GRAY,
         'axes.facecolor': colors['background'],
@@ -1429,14 +1436,14 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
                    alpha=0.7, linewidth=1.5)
         
         # Add text annotation for the optimal shift
-        ax2.text(min_shift, min_kld, f'  Optimal: {min_shift}s\n  KLD: {min_kld:.6f}', 
+        ax2.text(min_shift, min_kld, f'  Optimal: {min_shift}s\n  KLD: {min_kld:.6f}',
                  verticalalignment='bottom', horizontalalignment='left',
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'], 
-                          alpha=0.9, edgecolor='#393E46'), fontsize=10)
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor=colors['background'],
+                          alpha=0.9, edgecolor='#393E46'), fontsize=_fs(10))
     
     # Add overall title with physiological context
-    fig.suptitle('Fetal-Maternal Coupling: Transfer Entropy Analysis', 
-                fontsize=14, fontweight='normal', y=0.97, color=COLOR_BLUE)
+    fig.suptitle('Fetal-Maternal Coupling: Transfer Entropy Analysis',
+                fontsize=_fs(14), fontweight='normal', y=0.97, color=COLOR_BLUE)
     
     # Add interpretation text
     interpretation_text = (
@@ -1445,7 +1452,7 @@ def plot_transfer_entropy_vs_shift(shifts_seconds, kld_values, output_dir):
         "Minimum KLD indicates optimal temporal coupling for information transfer"
     )
     
-    fig.text(0.02, 0.02, interpretation_text, fontsize=9, 
+    fig.text(0.02, 0.02, interpretation_text, fontsize=_fs(9),
              bbox=dict(boxstyle="round,pad=0.5", facecolor=colors['background'], 
                       alpha=0.9, edgecolor='#393E46'),
              verticalalignment='bottom', horizontalalignment='left')
@@ -1554,18 +1561,18 @@ def plot_metrics_histograms(vaf_values, mse_values, snr_values, kld_values, outp
                   alpha=0.7)
         
         # Styling
-        ax.set_title(title, fontweight='normal', fontsize=12, pad=12)
+        ax.set_title(title, fontweight='normal', fontsize=_fs(12), pad=12)
         ax.set_xlabel(xlabel, fontweight='normal')
         ax.set_ylabel('Density', fontweight='normal')
         ax.legend(framealpha=0.95, loc='upper right')
         
         # Add text box with statistics
         stats_text = f'Min: {min_val:.4f}\nMax: {max_val:.4f}\nStd: {std_val:.4f}\nSamples: {len(values)}'
-        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=_fs(9),
                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
     # Overall title
-    fig.suptitle('Reconstruction Quality Metrics Distribution', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
+    fig.suptitle('Reconstruction Quality Metrics Distribution', fontsize=_fs(14), fontweight='normal', y=0.98, color=COLOR_BLUE)
     
     # Save plot
     save_path = os.path.join(output_dir, 'metrics_histograms.png')
@@ -1695,7 +1702,7 @@ def plot_te_ablation_results(kld_with_up, kld_without_up, vaf_with_up, vaf_witho
         axes[3].set_title('VAF: Mean +/- 1SD')
         axes[3].set_ylabel('VAF')
 
-    fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
+    fig.suptitle('UP Ablation: Transfer Entropy and Reconstruction', fontsize=_fs(14), fontweight='normal', y=0.98, color=COLOR_BLUE)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_ablation_results.png')
@@ -1734,9 +1741,9 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
     plt.rcParams.update({
         'font.family': 'sans-serif',
         'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif'],
-        'font.size': 11,
-        'axes.titlesize': 12,
-        'axes.labelsize': 11,
+        'font.size': _fs(11),
+        'axes.titlesize': _fs(12),
+        'axes.labelsize': _fs(11),
         'axes.linewidth': 0.7,
         'axes.edgecolor': COLOR_GRAY,
         'axes.facecolor': colors['background'],
@@ -1784,7 +1791,7 @@ def plot_te_gain_sweep(gains, kld_means, vaf_means, output_dir):
     ax2.set_title('Reconstruction Quality vs UP Gain')
     ax2.legend(loc='lower right', framealpha=0.95)
 
-    fig.suptitle('UP Gain Sweep: Information Flow and Reconstruction', fontsize=14, fontweight='normal', y=0.98, color=COLOR_BLUE)
+    fig.suptitle('UP Gain Sweep: Information Flow and Reconstruction', fontsize=_fs(14), fontweight='normal', y=0.98, color=COLOR_BLUE)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, 'te_gain_sweep.png')
