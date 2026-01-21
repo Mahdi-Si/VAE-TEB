@@ -791,7 +791,14 @@ def plot_vae_reconstruction(
     loss_dict: dict = None,
     # Optional phase split indices
     phase_auto_indices: np.ndarray = None,
-    phase_cross_indices: np.ndarray = None
+    phase_cross_indices: np.ndarray = None,
+    original_cross_phase_harmonic: Optional[np.ndarray] = None,  # Shape: (130, 300)
+    latent_z: Optional[np.ndarray] = None,  # Shape: (T, D) or (D, T)
+    kld_tensor: Optional[np.ndarray] = None,  # Shape: (D, T) or (T, D)
+    kld_mean_over_channels: Optional[np.ndarray] = None,  # Shape: (T,)
+    warmup_steps: int = 0,
+    cross_auto_indices: np.ndarray = None,
+    cross_cross_indices: np.ndarray = None,
 ):
     """
     Generates and saves comprehensive VAE reconstruction analysis plots.
@@ -807,9 +814,16 @@ def plot_vae_reconstruction(
         reconstructed_scattering_transform (np.ndarray): Reconstructed scattering coeffs, optional. Shape: (43, 300).
         original_phase_harmonic (np.ndarray): Original phase harmonic coeffs. Shape: (44, 300).
         reconstructed_phase_harmonic (np.ndarray): Reconstructed phase harmonic coeffs, optional. Shape: (44, 300).
+        original_cross_phase_harmonic (np.ndarray): Original cross-phase harmonic coeffs, optional. Shape: (130, 300).
+        latent_z (np.ndarray): Latent representation, optional. Shape: (T, D) or (D, T).
+        kld_tensor (np.ndarray): KLD tensor, optional. Shape: (D, T) or (T, D).
+        kld_mean_over_channels (np.ndarray): Mean KLD over latent dims, optional. Shape: (T,).
+        warmup_steps (int): Warmup steps for annotation.
         scattering_channel_data (dict): Frequency analysis data for channel annotations.
         batch_idx (int): Index of the sample for file naming.
         loss_dict (dict): Dictionary containing loss values.
+        cross_auto_indices (np.ndarray): Optional cross-phase autocorr indices.
+        cross_cross_indices (np.ndarray): Optional cross-phase cross indices.
     """
     
     _apply_publication_style()
@@ -824,6 +838,7 @@ def plot_vae_reconstruction(
     }
 
     split_phase = (phase_auto_indices is not None and phase_cross_indices is not None)
+    split_cross = (cross_auto_indices is not None and cross_cross_indices is not None)
     has_recon_st = (
         reconstructed_scattering_transform is not None
         and reconstructed_scattering_transform.shape == original_scattering_transform.shape
@@ -832,15 +847,49 @@ def plot_vae_reconstruction(
         reconstructed_phase_harmonic is not None
         and reconstructed_phase_harmonic.shape == original_phase_harmonic.shape
     )
+    has_cross = (
+        original_cross_phase_harmonic is not None
+        and original_cross_phase_harmonic.size > 0
+    )
+
+    def _to_channel_time(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        arr_np = np.asarray(arr)
+        if arr_np.ndim != 2:
+            return None
+        # Expect (channels, time); transpose if (time, channels)
+        if arr_np.shape[0] > arr_np.shape[1]:
+            return arr_np.T
+        return arr_np
+
+    latent_plot = _to_channel_time(latent_z)
+    kld_plot = _to_channel_time(kld_tensor)
+    has_latent = latent_plot is not None and latent_plot.size > 0
+    has_kld_heatmap = kld_plot is not None and kld_plot.size > 0
+    has_kld_mean = (
+        kld_mean_over_channels is not None
+        or has_kld_heatmap
+    )
+
     show_error_heatmap = has_recon_st and has_recon_ph
     show_channel_plots = has_recon_st
 
-    n_main_plots = 4  # raw signals, normalized vs recon, recon only, original scattering
+    n_main_plots = 3  # raw signals, normalized vs recon, recon only
+    if has_latent:
+        n_main_plots += 1
+    if has_kld_heatmap:
+        n_main_plots += 1
+    if has_kld_mean:
+        n_main_plots += 1
+    n_main_plots += 1  # original scattering
     if has_recon_st:
         n_main_plots += 1
     n_main_plots += 2 if split_phase else 1
     if has_recon_ph:
         n_main_plots += 2 if split_phase else 1
+    if has_cross:
+        n_main_plots += 2 if split_cross else 1
     if show_error_heatmap:
         n_main_plots += 1
 
@@ -856,12 +905,25 @@ def plot_vae_reconstruction(
         ax[i].grid(True, which='minor', linestyle=':', alpha=0.25, linewidth=0.3, color='#EEEEEE')
         ax[i].minorticks_on()
         ax[i].set_axisbelow(True)
-        ax[i].spines['top'].set_visible(False)
-        ax[i].spines['right'].set_visible(False)
-        ax[i].spines['left'].set_color('#393E46')
-        ax[i].spines['bottom'].set_color('#393E46')
-        ax[i].spines['left'].set_linewidth(0.7)
-        ax[i].spines['bottom'].set_linewidth(0.7)
+        for side in ("top", "right", "left", "bottom"):
+            ax[i].spines[side].set_visible(True)
+            ax[i].spines[side].set_color('#393E46')
+            ax[i].spines[side].set_linewidth(0.7)
+
+    def _annotate_empty(axis, title: str) -> None:
+        axis.set_title(title, fontweight='normal', pad=12)
+        axis.text(
+            0.5,
+            0.5,
+            "No data",
+            ha="center",
+            va="center",
+            fontsize=9,
+            color=COLOR_GRAY,
+            transform=axis.transAxes,
+        )
+        axis.set_xticks([])
+        axis.set_yticks([])
 
     t_raw = np.arange(len(raw_fhr_unnormalized)) / 4.0
     t_coeffs = np.arange(original_scattering_transform.shape[1])
@@ -893,6 +955,92 @@ def plot_vae_reconstruction(
     ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
     plot_idx += 1
 
+    if has_latent:
+        latent_finite = np.isfinite(latent_plot)
+        if np.any(latent_finite):
+            latent_vabs = np.nanmax(np.abs(latent_plot))
+        else:
+            latent_vabs = 1.0
+        if not np.isfinite(latent_vabs) or latent_vabs == 0:
+            latent_vabs = 1.0
+        im_latent = ax[plot_idx].imshow(
+            latent_plot,
+            aspect='auto',
+            cmap='bwr',
+            origin='lower',
+            vmin=-latent_vabs,
+            vmax=latent_vabs,
+        )
+        ax[plot_idx].grid(False)
+        ax[plot_idx].set_title('Latent Representation (z)', fontweight='normal', pad=12)
+        ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
+        ax[plot_idx].set_ylabel('Latent Dimensions', fontweight='normal')
+        if warmup_steps > 0:
+            ax[plot_idx].axvline(x=warmup_steps - 0.5, color=COLOR_GRAY, linestyle='--', linewidth=1.0, alpha=0.8)
+        fig.colorbar(im_latent, ax=ax[plot_idx], shrink=0.8)
+        plot_idx += 1
+
+    if has_kld_heatmap:
+        kld_finite = np.isfinite(kld_plot)
+        if np.any(kld_finite):
+            kld_vmax = np.nanmax(kld_plot)
+        else:
+            kld_vmax = 1.0
+        if kld_vmax == 0:
+            kld_vmax = 1.0
+        im_kld = ax[plot_idx].imshow(
+            kld_plot,
+            aspect='auto',
+            cmap='viridis',
+            origin='lower',
+            vmin=0.0,
+            vmax=kld_vmax,
+        )
+        ax[plot_idx].grid(False)
+        ax[plot_idx].set_title('KLD Tensor', fontweight='normal', pad=12)
+        ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
+        ax[plot_idx].set_ylabel('Latent Dimensions', fontweight='normal')
+        if warmup_steps > 0:
+            ax[plot_idx].axvline(x=warmup_steps - 0.5, color=COLOR_GRAY, linestyle='--', linewidth=1.0, alpha=0.8)
+        fig.colorbar(im_kld, ax=ax[plot_idx], shrink=0.8)
+        plot_idx += 1
+
+    if has_kld_mean:
+        if kld_mean_over_channels is not None:
+            kld_mean = np.asarray(kld_mean_over_channels, dtype=float)
+        elif has_kld_heatmap:
+            if np.any(np.isfinite(kld_plot)):
+                kld_mean = np.nanmean(kld_plot, axis=0)
+            else:
+                kld_mean = np.full(kld_plot.shape[1], np.nan, dtype=float)
+        else:
+            kld_mean = np.array([])
+        if has_kld_heatmap and kld_mean.size != kld_plot.shape[1]:
+            if kld_mean.size > kld_plot.shape[1]:
+                kld_mean = kld_mean[-kld_plot.shape[1]:]
+            else:
+                pad = np.full(kld_plot.shape[1] - kld_mean.size, np.nan, dtype=float)
+                kld_mean = np.concatenate([pad, kld_mean], axis=0)
+        finite_mask = np.isfinite(kld_mean)
+        overall_mean = float(np.nanmean(kld_mean)) if np.any(finite_mask) else 0.0
+        if kld_mean.size == 0:
+            _annotate_empty(ax[plot_idx], 'Mean KLD over Time')
+        else:
+            t_latent = np.arange(kld_mean.shape[0])
+            ax[plot_idx].plot(t_latent, kld_mean, color=colors['kld'], linewidth=1.2)
+            if warmup_steps > 0:
+                ax[plot_idx].axvspan(0, warmup_steps, alpha=0.1, color=COLOR_GRAY)
+                ax[plot_idx].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle='--', linewidth=0.8)
+            ax[plot_idx].set_title(
+                f'Mean KLD over Time (Overall Mean: {overall_mean:.4f})',
+                fontweight='normal',
+                pad=12,
+            )
+            ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
+            ax[plot_idx].set_ylabel('KLD', fontweight='normal')
+            ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
+        plot_idx += 1
+
     im_st_orig = ax[plot_idx].imshow(original_scattering_transform, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
     ax[plot_idx].grid(False)
     ax[plot_idx].set_title('Original Scattering Transform Coefficients', fontweight='normal', pad=12)
@@ -921,8 +1069,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_ylabel('Channels')
             fig.colorbar(im_ph_auto, ax=ax[plot_idx], shrink=0.8)
         else:
-            ax[plot_idx].set_title('Original Phase Harmonics - Autocorr (none)')
-            ax[plot_idx].set_axis_off()
+            _annotate_empty(ax[plot_idx], 'Original Phase Harmonics - Autocorr (none)')
         plot_idx += 1
         if ph_cross is not None and ph_cross.size > 0:
             im_ph_cross = ax[plot_idx].imshow(ph_cross, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
@@ -932,8 +1079,7 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_ylabel('Channels')
             fig.colorbar(im_ph_cross, ax=ax[plot_idx], shrink=0.8)
         else:
-            ax[plot_idx].set_title('Original Phase Harmonics - Cross (none)')
-            ax[plot_idx].set_axis_off()
+            _annotate_empty(ax[plot_idx], 'Original Phase Harmonics - Cross (none)')
         plot_idx += 1
     else:
         im_ph_orig = ax[plot_idx].imshow(original_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
@@ -956,8 +1102,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_ylabel('Channels')
                 fig.colorbar(im_ph_auto_r, ax=ax[plot_idx], shrink=0.8)
             else:
-                ax[plot_idx].set_title('Reconstructed Phase Harmonics - Autocorr (none)')
-                ax[plot_idx].set_axis_off()
+                _annotate_empty(ax[plot_idx], 'Reconstructed Phase Harmonics - Autocorr (none)')
             plot_idx += 1
             if ph_cross_r is not None and ph_cross_r.size > 0:
                 im_ph_cross_r = ax[plot_idx].imshow(ph_cross_r, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
@@ -967,8 +1112,7 @@ def plot_vae_reconstruction(
                 ax[plot_idx].set_ylabel('Channels')
                 fig.colorbar(im_ph_cross_r, ax=ax[plot_idx], shrink=0.8)
             else:
-                ax[plot_idx].set_title('Reconstructed Phase Harmonics - Cross (none)')
-                ax[plot_idx].set_axis_off()
+                _annotate_empty(ax[plot_idx], 'Reconstructed Phase Harmonics - Cross (none)')
             plot_idx += 1
         else:
             im_ph_recon = ax[plot_idx].imshow(reconstructed_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
@@ -977,6 +1121,47 @@ def plot_vae_reconstruction(
             ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
             ax[plot_idx].set_ylabel('Phase Harmonic Channels', fontweight='normal')
             fig.colorbar(im_ph_recon, ax=ax[plot_idx], shrink=0.8)
+            plot_idx += 1
+
+    if has_cross:
+        if split_cross:
+            cp_auto = (
+                original_cross_phase_harmonic[cross_auto_indices, :]
+                if len(cross_auto_indices) > 0
+                else None
+            )
+            cp_cross = (
+                original_cross_phase_harmonic[cross_cross_indices, :]
+                if len(cross_cross_indices) > 0
+                else None
+            )
+            if cp_auto is not None and cp_auto.size > 0:
+                im_cp_auto = ax[plot_idx].imshow(cp_auto, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+                ax[plot_idx].grid(False)
+                ax[plot_idx].set_title('UP->FHR Cross-Phase - Autocorr (same filter)')
+                ax[plot_idx].set_xlabel('Time Steps')
+                ax[plot_idx].set_ylabel('Channels')
+                fig.colorbar(im_cp_auto, ax=ax[plot_idx], shrink=0.8)
+            else:
+                _annotate_empty(ax[plot_idx], 'UP->FHR Cross-Phase - Autocorr (none)')
+            plot_idx += 1
+            if cp_cross is not None and cp_cross.size > 0:
+                im_cp_cross = ax[plot_idx].imshow(cp_cross, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+                ax[plot_idx].grid(False)
+                ax[plot_idx].set_title('UP->FHR Cross-Phase - Cross (different filters)')
+                ax[plot_idx].set_xlabel('Time Steps')
+                ax[plot_idx].set_ylabel('Channels')
+                fig.colorbar(im_cp_cross, ax=ax[plot_idx], shrink=0.8)
+            else:
+                _annotate_empty(ax[plot_idx], 'UP->FHR Cross-Phase - Cross (none)')
+            plot_idx += 1
+        else:
+            im_up_ph = ax[plot_idx].imshow(original_cross_phase_harmonic, aspect='auto', cmap='bwr', origin='upper', vmin=-3, vmax=3)
+            ax[plot_idx].grid(False)
+            ax[plot_idx].set_title('UP->FHR Cross-Phase Harmonics', fontweight='normal', pad=12)
+            ax[plot_idx].set_xlabel('Time Steps', fontweight='normal')
+            ax[plot_idx].set_ylabel('Channels', fontweight='normal')
+            fig.colorbar(im_up_ph, ax=ax[plot_idx], shrink=0.8)
             plot_idx += 1
 
     if show_error_heatmap:
