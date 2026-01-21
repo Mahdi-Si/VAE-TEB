@@ -723,6 +723,7 @@ def _plot_all_single_sample_plots(
     idx: int,
     outputs: Dict[str, Any],
     sample_dir: Path,
+    sample_name: str,
     stats: Optional[Dict[str, Any]],
     fs: float = 4.0,
     beta: float = 1.0,
@@ -731,6 +732,10 @@ def _plot_all_single_sample_plots(
 ) -> Dict[str, Any]:
     """
     Plot a single consolidated summary figure for a sample.
+
+    Args:
+        sample_dir: Output directory (root folder).
+        sample_name: Unique identifier for the sample (used in filename).
 
     Returns:
         Dict with paths to generated plots.
@@ -929,7 +934,7 @@ def _plot_all_single_sample_plots(
     title = f"Sample Summary | GUID={guid} | Epoch={epoch}"
     fig.suptitle(title, fontsize=14, fontweight="normal", y=0.98, color=COLOR_BLUE)
 
-    plot_path = sample_dir / "vae_reconstruction_analysis_sample_0.svg"
+    plot_path = sample_dir / f"vae_reconstruction_analysis_{sample_name}.svg"
     fig.savefig(plot_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1088,20 +1093,19 @@ def plot_single_samples(
                     epoch = _extract_epoch(batch, idx_in_batch)
                     label = _extract_label(batch, idx_in_batch)
 
-                    # Create folder for this sample
-                    folder_name = _sanitize_folder_name(guid or f"sample_{processed}", epoch or 0.0)
-                    sample_dir = output_path / folder_name
-                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    # Create unique sample name for filename
+                    sample_name = _sanitize_folder_name(guid or f"sample_{processed}", epoch or 0.0)
 
                     logger.info(f"Processing sample {processed + 1}/{n_samples}: GUID={guid}, Epoch={epoch}")
 
-                    # Plot all single-sample plots
+                    # Plot all single-sample plots (save directly to output_path)
                     plot_paths = _plot_all_single_sample_plots(
                         runner=runner,
                         batch=batch,
                         idx=idx_in_batch,
                         outputs=outputs,
-                        sample_dir=sample_dir,
+                        sample_dir=output_path,
+                        sample_name=sample_name,
                         stats=stats,
                         fs=fs,
                         beta=beta,
@@ -1113,7 +1117,7 @@ def plot_single_samples(
                         "guid": guid,
                         "epoch": epoch,
                         "label": label,
-                        "folder": str(sample_dir),
+                        "output_dir": str(output_path),
                         "plots": plot_paths,
                     })
 
