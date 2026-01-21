@@ -40,26 +40,10 @@ from model.vae_teb_prediction.testing.collectors import (
 from model.vae_teb_prediction.testing.metrics import (
     aggregate_predictions,
     compute_kld,
-    compute_kld_per_sample,
-    compute_kld_per_timestep,
-    compute_reconstruction_metrics,
-    reduce_latent_dimensionality,
 )
 import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy import stats as scipy_stats
 from model.vae_teb_prediction.testing.visualizers import (
-    plot_reconstruction_sample,
-    plot_coherence_signals,
-    plot_time_frequency_coherence,
-    plot_latent_trajectory_2d,
-    plot_latent_trajectory_3d,
-    plot_psd_comparison,
-    plot_cross_correlation,
-    plot_coherence_analysis,
-    plot_reconstruction_coherence,
-    plot_coherence_spectrum,
-    plot_kld_trajectory_3d,
     # Colors for consistent styling
     COLOR_BLUE,
     COLOR_ORANGE,
@@ -73,34 +57,12 @@ from model.vae_teb_prediction.testing.visualizers import (
     COLOR_SAGE,
     SAVE_DPI,
 )
-from model.vae_teb_prediction.testing.visualizers_interactive import (
-    plot_reconstruction_interactive,
-    plot_latent_trajectory_3d_interactive,
-    HAS_PLOTLY,
-)
-from model.vae_teb_prediction.testing.analyses.coherence import (
-    compute_stft_coherence_map,
-    compute_wavelet_coherence,
-    compute_welch_psd,
-    compute_cross_correlation,
-    compute_stft_coherence,
-)
 
 # Import data loading utilities
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 
 # Import legacy plot utils for detailed analysis plots
-from utils.plot_utils import (
-    plot_model_analysis,
-    plot_vae_reconstruction,
-    plot_single_prediction_windows,
-)
 
-FONT_SCALE = 2.0
-
-
-def _fs(value: float) -> float:
-    return value * FONT_SCALE
 
 
 def _load_config(path: Union[str, Path]) -> Dict[str, Any]:
@@ -278,28 +240,57 @@ def _apply_publication_style() -> None:
     plt.rcParams.update({
         "figure.dpi": 150,
         "savefig.dpi": SAVE_DPI,
-        "savefig.format": "svg",
+        "savefig.format": "png",
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.05,
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
-        "font.size": _fs(8),
-        "axes.titlesize": _fs(9),
-        "axes.labelsize": _fs(8),
-        "xtick.labelsize": _fs(7),
-        "ytick.labelsize": _fs(7),
-        "legend.fontsize": _fs(7),
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+        "legend.title_fontsize": 7,
         "axes.linewidth": 0.6,
         "axes.edgecolor": COLOR_BLACK,
         "axes.labelcolor": COLOR_BLACK,
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+        "axes.spines.left": True,
+        "axes.spines.bottom": True,
+        "axes.titleweight": "normal",
+        "axes.labelweight": "normal",
+        "axes.axisbelow": True,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 3.0,
+        "ytick.major.size": 3.0,
+        "xtick.minor.size": 1.5,
+        "ytick.minor.size": 1.5,
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
+        "xtick.minor.width": 0.3,
+        "ytick.minor.width": 0.3,
+        "xtick.color": COLOR_BLACK,
+        "ytick.color": COLOR_BLACK,
         "grid.alpha": 0.2,
         "grid.linewidth": 0.3,
         "grid.color": COLOR_LIGHT_GRAY,
+        "grid.linestyle": "-",
+        "legend.frameon": True,
+        "legend.framealpha": 0.95,
+        "legend.fancybox": False,
+        "legend.edgecolor": COLOR_GRAY,
+        "legend.shadow": False,
         "lines.linewidth": 1.0,
         "lines.markersize": 3,
+        "lines.markeredgewidth": 0.0,
         "figure.facecolor": "white",
         "axes.facecolor": "white",
         "savefig.facecolor": "white",
+        "errorbar.capsize": 3,
+        "mathtext.default": "regular",
     })
 
 
@@ -307,14 +298,16 @@ def _style_axes(ax: plt.Axes, *, grid: str = "major") -> None:
     """Apply clean styling to axes."""
     ax.set_axisbelow(True)
     if grid in ("both", "major"):
-        ax.grid(True, which="major", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
+        ax.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color=COLOR_LIGHT_GRAY)
     if grid == "both":
-        ax.grid(True, which="minor", alpha=0.12, linewidth=0.2, color=COLOR_LIGHT_GRAY)
+        ax.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
         ax.minorticks_on()
-    for spine in ["left", "bottom", "top", "right"]:
-        ax.spines[spine].set_visible(True)
-        ax.spines[spine].set_color(COLOR_BLACK)
-        ax.spines[spine].set_linewidth(0.6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(COLOR_GRAY)
+    ax.spines["bottom"].set_color(COLOR_GRAY)
+    ax.spines["left"].set_linewidth(0.7)
+    ax.spines["bottom"].set_linewidth(0.7)
 
 
 def _add_colorbar(
@@ -325,12 +318,10 @@ def _add_colorbar(
     label: Optional[str] = None,
 ) -> plt.Axes:
     """Attach aligned colorbar."""
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes("right", size="3.5%", pad=0.02)
-    cbar = fig.colorbar(mappable, cax=cax)
+    cbar = fig.colorbar(mappable, ax=ax, shrink=0.8, pad=0.02)
     if label:
-        cbar.set_label(label, fontsize=_fs(8), color=COLOR_BLACK)
-    cbar.ax.tick_params(labelsize=_fs(7), colors=COLOR_BLACK)
+        cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
+    cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
     cbar.outline.set_linewidth(0.6)
     cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
     return cbar
@@ -368,9 +359,9 @@ def _plot_coefficient_heatmap(
         vmax=vmax,
     )
 
-    ax.set_xlabel(xlabel, fontsize=_fs(8))
-    ax.set_ylabel(ylabel, fontsize=_fs(8))
-    ax.set_title(title, fontsize=_fs(9), fontweight="normal", pad=8)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
     ax.grid(False)
 
     _add_colorbar(fig, im, ax, label="Value")
@@ -398,27 +389,27 @@ def _plot_coefficient_error_heatmap(
     # Original
     vabs = np.nanmax(np.abs(original))
     im0 = axes[0].imshow(original, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[0].set_title("Original Coefficients", fontsize=_fs(9))
-    axes[0].set_ylabel(ylabel, fontsize=_fs(8))
+    axes[0].set_title("Original Coefficients", fontsize=9)
+    axes[0].set_ylabel(ylabel, fontsize=8)
     axes[0].grid(False)
     _add_colorbar(fig, im0, axes[0], label="Value")
 
     # Reconstructed
     im1 = axes[1].imshow(reconstructed, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[1].set_title("Reconstructed Coefficients", fontsize=_fs(9))
-    axes[1].set_ylabel(ylabel, fontsize=_fs(8))
+    axes[1].set_title("Reconstructed Coefficients", fontsize=9)
+    axes[1].set_ylabel(ylabel, fontsize=8)
     axes[1].grid(False)
     _add_colorbar(fig, im1, axes[1], label="Value")
 
     # Error
     im2 = axes[2].imshow(error, aspect="auto", cmap="Reds", origin="upper")
-    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=_fs(9))
-    axes[2].set_xlabel("Time Steps", fontsize=_fs(8))
-    axes[2].set_ylabel(ylabel, fontsize=_fs(8))
+    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=9)
+    axes[2].set_xlabel("Time Steps", fontsize=8)
+    axes[2].set_ylabel(ylabel, fontsize=8)
     axes[2].grid(False)
     _add_colorbar(fig, im2, axes[2], label="|Error|")
 
-    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -444,11 +435,11 @@ def _plot_latent_heatmap(
     # Mark warmup boundary
     if warmup_steps > 0:
         ax.axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=_fs(7), va="top")
+        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=7, va="top")
 
-    ax.set_xlabel("Time Steps", fontsize=_fs(8))
-    ax.set_ylabel("Latent Dimension", fontsize=_fs(8))
-    ax.set_title(title, fontsize=_fs(9), fontweight="normal", pad=8)
+    ax.set_xlabel("Time Steps", fontsize=8)
+    ax.set_ylabel("Latent Dimension", fontsize=8)
+    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
     ax.grid(False)
 
     _add_colorbar(fig, im, ax, label="Activation")
@@ -481,8 +472,8 @@ def _plot_kld_per_dimension(
     im = axes[0].imshow(kld_T, aspect="auto", cmap="viridis", origin="lower")
     if warmup_steps > 0:
         axes[0].axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-    axes[0].set_ylabel("Latent Dimension", fontsize=_fs(8))
-    axes[0].set_title("KLD per Dimension over Time", fontsize=_fs(9))
+    axes[0].set_ylabel("Latent Dimension", fontsize=8)
+    axes[0].set_title("KLD per Dimension over Time", fontsize=9)
     axes[0].grid(False)
     _add_colorbar(fig, im, axes[0], label="KLD (bits)")
 
@@ -503,13 +494,13 @@ def _plot_kld_per_dimension(
     if warmup_steps > 0:
         axes[1].axvspan(0, warmup_steps, alpha=0.1, color=COLOR_GRAY)
         axes[1].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
-    axes[1].set_xlabel("Time Steps", fontsize=_fs(8))
-    axes[1].set_ylabel("Mean KLD", fontsize=_fs(8))
-    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=_fs(9))
+    axes[1].set_xlabel("Time Steps", fontsize=8)
+    axes[1].set_ylabel("Mean KLD", fontsize=8)
+    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=9)
     _style_axes(axes[1], grid="both")
     axes[1].set_xlim(0, len(kld_mean))
 
-    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -547,15 +538,15 @@ def _plot_residual_histogram(
     axes[0].axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=f"Mean: {mean_val:.4f}")
     axes[0].axvline(0, color=COLOR_BLACK, linewidth=0.6, alpha=0.5)
 
-    axes[0].set_xlabel("Residual (True - Pred)", fontsize=_fs(8))
-    axes[0].set_ylabel("Density", fontsize=_fs(8))
-    axes[0].set_title("Residual Histogram", fontsize=_fs(9))
-    axes[0].legend(fontsize=_fs(7), framealpha=0.95)
+    axes[0].set_xlabel("Residual (True - Pred)", fontsize=8)
+    axes[0].set_ylabel("Density", fontsize=8)
+    axes[0].set_title("Residual Histogram", fontsize=9)
+    axes[0].legend(fontsize=7, framealpha=0.95)
     _style_axes(axes[0], grid="major")
 
     # Q-Q plot
     scipy_stats.probplot(residual, dist="norm", plot=axes[1])
-    axes[1].set_title("Q-Q Plot (Normal)", fontsize=_fs(9))
+    axes[1].set_title("Q-Q Plot (Normal)", fontsize=9)
     axes[1].get_lines()[0].set_markersize(2)
     axes[1].get_lines()[0].set_color(COLOR_BLUE)
     axes[1].get_lines()[1].set_color(COLOR_VERMILLION)
@@ -567,12 +558,12 @@ def _plot_residual_histogram(
     stats_text = f"Skewness: {skewness:.3f}\nKurtosis: {kurtosis:.3f}\nRMSE: {np.sqrt(np.mean(residual**2)):.4f}"
     axes[0].text(
         0.98, 0.98, stats_text,
-        transform=axes[0].transAxes, fontsize=_fs(7),
+        transform=axes[0].transAxes, fontsize=7,
         verticalalignment="top", horizontalalignment="right",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=COLOR_LIGHT_GRAY, alpha=0.95)
     )
 
-    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -604,23 +595,23 @@ def _plot_channel_timeseries(
         if reconstructed is not None and i < reconstructed.shape[0]:
             ax.plot(t, reconstructed[i], color=COLOR_ORANGE, linewidth=0.8, alpha=0.8, label="Reconstructed")
             mae = np.mean(np.abs(coefficients[i] - reconstructed[i]))
-            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=_fs(8))
+            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=8)
         else:
-            ax.set_title(f"Channel {i}", fontsize=_fs(8))
-        ax.set_ylabel("Value", fontsize=_fs(7))
+            ax.set_title(f"Channel {i}", fontsize=8)
+        ax.set_ylabel("Value", fontsize=7)
         _style_axes(ax, grid="major")
         if i == 0:
-            ax.legend(fontsize=_fs(6), loc="upper right", framealpha=0.9)
+            ax.legend(fontsize=6, loc="upper right", framealpha=0.9)
 
     # Hide unused axes
     for i in range(n_ch, len(axes)):
         axes[i].set_visible(False)
 
-    axes[-2].set_xlabel("Time Steps", fontsize=_fs(8))
+    axes[-2].set_xlabel("Time Steps", fontsize=8)
     if len(axes) > 1:
-        axes[-1].set_xlabel("Time Steps", fontsize=_fs(8))
+        axes[-1].set_xlabel("Time Steps", fontsize=8)
 
-    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=1.01)
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -660,10 +651,10 @@ def _plot_error_summary(
         for bar, val in zip(bars, metric_values):
             if np.isfinite(val):
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                        f"{val:.4f}", ha="center", va="bottom", fontsize=_fs(7))
+                        f"{val:.4f}", ha="center", va="bottom", fontsize=7)
 
-        ax.set_ylabel("Value", fontsize=_fs(8))
-        ax.set_title("FHR Reconstruction Metrics", fontsize=_fs(9))
+        ax.set_ylabel("Value", fontsize=8)
+        ax.set_title("FHR Reconstruction Metrics", fontsize=9)
         _style_axes(ax, grid="major")
 
     # 2. Per-channel ST MAE distribution
@@ -674,14 +665,14 @@ def _plot_error_summary(
                edgecolor=COLOR_BLACK, linewidth=0.3)
         ax.axhline(np.mean(st_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
                    linewidth=1.0, label=f"Mean: {np.mean(st_mae_per_channel):.4f}")
-        ax.set_xlabel("ST Channel", fontsize=_fs(8))
-        ax.set_ylabel("MAE", fontsize=_fs(8))
-        ax.set_title("Scattering Transform Error by Channel", fontsize=_fs(9))
-        ax.legend(fontsize=_fs(7), framealpha=0.9)
+        ax.set_xlabel("ST Channel", fontsize=8)
+        ax.set_ylabel("MAE", fontsize=8)
+        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
+        ax.legend(fontsize=7, framealpha=0.9)
         _style_axes(ax, grid="major")
     else:
-        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=_fs(8))
-        ax.set_title("Scattering Transform Error by Channel", fontsize=_fs(9))
+        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=8)
+        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
 
     # 3. Per-channel PH MAE distribution
     ax = axes[1, 0]
@@ -691,14 +682,14 @@ def _plot_error_summary(
                edgecolor=COLOR_BLACK, linewidth=0.3)
         ax.axhline(np.mean(ph_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
                    linewidth=1.0, label=f"Mean: {np.mean(ph_mae_per_channel):.4f}")
-        ax.set_xlabel("PH Channel", fontsize=_fs(8))
-        ax.set_ylabel("MAE", fontsize=_fs(8))
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=_fs(9))
-        ax.legend(fontsize=_fs(7), framealpha=0.9)
+        ax.set_xlabel("PH Channel", fontsize=8)
+        ax.set_ylabel("MAE", fontsize=8)
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
+        ax.legend(fontsize=7, framealpha=0.9)
         _style_axes(ax, grid="major")
     else:
-        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=_fs(8))
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=_fs(9))
+        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=8)
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
 
     # 4. FHR error over time
     ax = axes[1, 1]
@@ -713,14 +704,14 @@ def _plot_error_summary(
     ax.plot(t, rolling_mae, color=COLOR_PURPLE, linewidth=0.6, label="Rolling MAE")
     ax.axhline(np.mean(np.abs(residual)), color=COLOR_ORANGE, linestyle="--",
                linewidth=0.9, label=f"Mean MAE: {np.mean(np.abs(residual)):.4f}")
-    ax.set_xlabel("Sample Index", fontsize=_fs(8))
-    ax.set_ylabel("MAE", fontsize=_fs(8))
-    ax.set_title("FHR Reconstruction Error Over Time", fontsize=_fs(9))
-    ax.legend(fontsize=_fs(7), framealpha=0.9)
+    ax.set_xlabel("Sample Index", fontsize=8)
+    ax.set_ylabel("MAE", fontsize=8)
+    ax.set_title("FHR Reconstruction Error Over Time", fontsize=9)
+    ax.legend(fontsize=7, framealpha=0.9)
     ax.set_xlim(0, len(residual))
     _style_axes(ax, grid="major")
 
-    fig.suptitle(title, fontsize=_fs(10), fontweight="normal", y=0.99)
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=0.99)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -739,19 +730,7 @@ def _plot_all_single_sample_plots(
     dim_reduction_method: str = "pca",
 ) -> Dict[str, Any]:
     """
-    Plot all available single-sample plots for a given sample.
-
-    Args:
-        runner: TestRunner instance.
-        batch: Current batch from dataloader.
-        idx: Index within the batch.
-        outputs: Model outputs dict.
-        sample_dir: Directory to save plots.
-        stats: Normalization statistics.
-        fs: Sampling frequency in Hz.
-        beta: Beta value for loss computation.
-        skip_interactive: Whether to skip Plotly interactive plots.
-        dim_reduction_method: Method for latent dimensionality reduction.
+    Plot a single consolidated summary figure for a sample.
 
     Returns:
         Dict with paths to generated plots.
@@ -759,7 +738,6 @@ def _plot_all_single_sample_plots(
     sample_dir.mkdir(parents=True, exist_ok=True)
     plot_paths: Dict[str, Any] = {}
 
-    # Extract sample data
     y_st = batch.fhr_st[idx : idx + 1]
     y_ph = batch.fhr_ph[idx : idx + 1]
     x_ph = batch.fhr_up_ph[idx : idx + 1]
@@ -770,784 +748,192 @@ def _plot_all_single_sample_plots(
     mu_pr = outputs.get("mu_pr")
     logvar_pr = outputs.get("logvar_pr")
     latent = outputs.get("z")
-    linear_output = outputs.get("linear_output")
 
     if mu_pr is None or latent is None:
         logger.warning("Missing prediction outputs; skipping sample.")
         return plot_paths
 
-    # Aggregate predictions
     avg_mu, valid_mask = aggregate_predictions(
         runner.model, mu_pr[idx : idx + 1], raw_len=y_raw.size(1)
     )
     if avg_mu is None:
         logger.warning("Aggregated predictions missing; skipping sample.")
         return plot_paths
-    if avg_mu.dim() == 2:
-        avg_mu = avg_mu[0]
-    if valid_mask is not None and valid_mask.dim() == 2:
-        valid_mask = valid_mask[0]
 
-    # Aggregate variance if available
-    avg_std = None
-    if logvar_pr is not None:
-        logvar_seg = logvar_pr[idx]
-        if logvar_seg.dim() == 2:
-            logvar_seg = logvar_seg.unsqueeze(0)
-        if logvar_seg.dim() == 3:
-            avg_var, _ = aggregate_predictions(runner.model, logvar_seg.exp(), raw_len=y_raw.size(1))
-            if avg_var is not None:
-                avg_std = torch.sqrt(avg_var.clamp_min(1e-12))
+    avg_mu = avg_mu[0]
+    valid_mask_np = None
+    if valid_mask is not None:
+        valid_mask_np = valid_mask[0].detach().cpu().numpy().astype(bool)
 
-    # Compute metrics
-    metrics = compute_reconstruction_metrics(y_raw, avg_mu.unsqueeze(0), valid_mask.unsqueeze(0) if valid_mask is not None else None)
-    kld = compute_kld_per_sample(outputs, runner.warmup_steps)
-
-    # Prepare numpy arrays
-    y_true_np = y_raw[0].detach().cpu().numpy()
-    y_pred_np = avg_mu.detach().cpu().numpy() if avg_mu.dim() == 1 else avg_mu[0].detach().cpu().numpy()
-    y_pred_std_np = avg_std[0].detach().cpu().numpy() if avg_std is not None else None
-    latent_np = latent[idx].detach().cpu().numpy()
-
-    guid = _extract_guid(batch, idx)
-    epoch = _extract_epoch(batch, idx)
-    label = _extract_label(batch, idx)
-
-    # Sample dict for reconstruction plots
-    sample_dict = {
-        "y_true": y_true_np,
-        "y_pred": y_pred_np,
-        "y_pred_std": y_pred_std_np,
-        "latent": latent_np,
-        "guid": guid,
-        "epoch": epoch,
-        "label": label,
-        "metrics": {
-            "vaf": float(metrics["vaf"][0].cpu().item()) if metrics else np.nan,
-            "mse": float(metrics["mse"][0].cpu().item()) if metrics else np.nan,
-            "snr": float(metrics["snr"][0].cpu().item()) if metrics else np.nan,
-            "kld": float(kld[idx].cpu().item()) if kld is not None else np.nan,
-        },
-    }
-
-    # -------------------------------------------------------------------
-    # 1. Basic reconstruction sample plot
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "reconstruction_sample.svg"
-        plot_reconstruction_sample(sample_dict, plot_path, fs=fs)
-        plot_paths["reconstruction_sample"] = str(plot_path)
-        logger.debug("Saved reconstruction_sample.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot reconstruction_sample: {e}")
-
-    # -------------------------------------------------------------------
-    # 2. Interactive reconstruction plot (Plotly)
-    # -------------------------------------------------------------------
-    if not skip_interactive and HAS_PLOTLY:
-        try:
-            plot_path = sample_dir / "reconstruction_interactive.html"
-            plot_reconstruction_interactive(sample_dict, plot_path)
-            plot_paths["reconstruction_interactive"] = str(plot_path)
-            logger.debug("Saved reconstruction_interactive.html")
-        except Exception as e:
-            logger.warning(f"Failed to plot reconstruction_interactive: {e}")
-
-    # -------------------------------------------------------------------
-    # 3. Coherence signals plot
-    # -------------------------------------------------------------------
-    try:
-        fhr_denorm = _denormalize_tensor(y_raw, "fhr", stats)
-        up_denorm = _denormalize_tensor(up_raw, "up", stats)
-        fhr_orig_np = fhr_denorm[0].detach().cpu().numpy()
-        up_np = up_denorm[0].detach().cpu().numpy()
-
-        # Denormalize prediction
-        pred_denorm = _denormalize_tensor(avg_mu.unsqueeze(0), "fhr", stats)
-        fhr_pred_np = pred_denorm[0].detach().cpu().numpy()
-
-        plot_path = sample_dir / "coherence_signals.svg"
-        plot_coherence_signals(
-            up_signal=up_np if np.any(up_np != 0) else None,
-            fhr_original=fhr_orig_np,
-            fhr_reconstructed=fhr_pred_np,
-            output_path=plot_path,
-            fs=fs,
-            title=f"Signals - GUID: {guid}",
-        )
-        plot_paths["coherence_signals"] = str(plot_path)
-        logger.debug("Saved coherence_signals.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot coherence_signals: {e}")
-
-    # -------------------------------------------------------------------
-    # 4. Time-frequency coherence (STFT)
-    # -------------------------------------------------------------------
-    try:
-        tf_true = y_true_np
-        tf_pred = y_pred_np
-        if valid_mask is not None:
-            mask_np = valid_mask.detach().cpu().numpy().astype(bool)
-            if mask_np.any():
-                start = int(np.argmax(mask_np))
-                end = int(len(mask_np) - np.argmax(mask_np[::-1]))
-                if end > start:
-                    tf_true = tf_true[start:end]
-                    tf_pred = tf_pred[start:end]
-
-        stft_result = compute_stft_coherence_map(
-            tf_true, tf_pred, fs=fs, nperseg=128
-        )
-        if stft_result["coherence"].size > 0:
-            plot_path = sample_dir / "time_frequency_coherence_stft.svg"
-            plot_time_frequency_coherence(
-                stft_result["frequencies"],
-                stft_result["times"],
-                stft_result["coherence"],
-                plot_path,
-                max_freq=0.5,
-                title=f"STFT Coherence - GUID: {guid}",
-            )
-            plot_paths["time_frequency_coherence_stft"] = str(plot_path)
-            logger.debug("Saved time_frequency_coherence_stft.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot time_frequency_coherence_stft: {e}")
-
-    # -------------------------------------------------------------------
-    # 5. Time-frequency coherence (Wavelet) - optional
-    # -------------------------------------------------------------------
-    try:
-        wavelet_result = compute_wavelet_coherence(
-            tf_true,
-            tf_pred,
-            fs=fs,
-            num_scales=50,
-            min_freq=None,
-            max_freq=0.5,
-            pad_mode="reflect",
-            pad_max_fraction=0.25,
-            coi_scale=1.65,
-            apply_coi_mask=True,
-        )
-        if wavelet_result["coherence"].size > 0:
-            plot_path = sample_dir / "time_frequency_coherence_wavelet.svg"
-            plot_time_frequency_coherence(
-                wavelet_result["frequencies"],
-                wavelet_result["times"],
-                wavelet_result["coherence"],
-                plot_path,
-                max_freq=0.5,
-                title=f"Wavelet Coherence - GUID: {guid}",
-            )
-            plot_paths["time_frequency_coherence_wavelet"] = str(plot_path)
-            logger.debug("Saved time_frequency_coherence_wavelet.svg")
-    except ImportError:
-        logger.debug("PyWavelets not available, skipping wavelet coherence plot.")
-    except Exception as e:
-        logger.warning(f"Failed to plot time_frequency_coherence_wavelet: {e}")
-
-    # -------------------------------------------------------------------
-    # 6. PSD comparison
-    # -------------------------------------------------------------------
-    try:
-        freqs_orig, psd_orig = compute_welch_psd(y_true_np, fs=fs, nperseg=256)
-        _, psd_pred = compute_welch_psd(y_pred_np, fs=fs, nperseg=256)
-
-        if freqs_orig.size > 0 and psd_orig.size > 0:
-            plot_path = sample_dir / "psd_comparison.svg"
-            plot_psd_comparison(
-                freqs_orig,
-                psd_orig,
-                np.zeros_like(psd_orig),
-                psd_pred,
-                np.zeros_like(psd_pred),
-                sample_dir,
-                filename="psd_comparison.svg",
-            )
-            plot_paths["psd_comparison"] = str(plot_path)
-            logger.debug("Saved psd_comparison.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot psd_comparison: {e}")
-
-    # -------------------------------------------------------------------
-    # 7. Cross-correlation
-    # -------------------------------------------------------------------
-    try:
-        lags, corr = compute_cross_correlation(y_true_np, y_pred_np, fs=fs, max_lag_sec=60.0)
-        if lags.size > 0:
-            plot_path = sample_dir / "cross_correlation.svg"
-            plot_cross_correlation(
-                lags,
-                corr,
-                np.zeros_like(corr),  # no std for single sample
-                sample_dir,
-                filename="cross_correlation.svg",
-            )
-            plot_paths["cross_correlation"] = str(plot_path)
-            logger.debug("Saved cross_correlation.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot cross_correlation: {e}")
-
-    # -------------------------------------------------------------------
-    # 8. Latent trajectory 2D
-    # -------------------------------------------------------------------
-    try:
-        if latent_np.shape[0] > 2 and latent_np.shape[1] >= 2:
-            # Reduce to 2D
-            latent_2d = reduce_latent_dimensionality(
-                latent_np[None, ...], method=dim_reduction_method, n_components=2
-            )
-            plot_path = sample_dir / "latent_trajectory_2d.svg"
-            plot_latent_trajectory_2d(
-                latent_2d,
-                plot_path,
-                sample_id=str(guid),
-                color_by_time=True,
-            )
-            plot_paths["latent_trajectory_2d"] = str(plot_path)
-            logger.debug("Saved latent_trajectory_2d.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot latent_trajectory_2d: {e}")
-
-    # -------------------------------------------------------------------
-    # 9. Latent trajectory 3D
-    # -------------------------------------------------------------------
-    try:
-        if latent_np.shape[0] > 2 and latent_np.shape[1] >= 3:
-            # Reduce to 3D
-            latent_3d = reduce_latent_dimensionality(
-                latent_np[None, ...], method=dim_reduction_method, n_components=3
-            )
-            plot_path = sample_dir / "latent_trajectory_3d.svg"
-            plot_latent_trajectory_3d(
-                latent_3d,
-                plot_path,
-                sample_id=str(guid),
-                color_by_time=True,
-            )
-            plot_paths["latent_trajectory_3d"] = str(plot_path)
-            logger.debug("Saved latent_trajectory_3d.svg")
-
-            # Interactive 3D
-            if not skip_interactive and HAS_PLOTLY:
-                plot_path = sample_dir / "latent_trajectory_3d_interactive.html"
-                plot_latent_trajectory_3d_interactive(
-                    latent_3d,
-                    plot_path,
-                    sample_id=str(guid),
-                    color_by_time=True,
-                )
-                plot_paths["latent_trajectory_3d_interactive"] = str(plot_path)
-                logger.debug("Saved latent_trajectory_3d_interactive.html")
-    except Exception as e:
-        logger.warning(f"Failed to plot latent_trajectory_3d: {e}")
-
-    # -------------------------------------------------------------------
-    # Prepare common data for detailed plots (model_analysis, vae_reconstruction)
-    # -------------------------------------------------------------------
-    # Denormalize signals
-    fhr_denorm_full = _denormalize_tensor(y_raw, "fhr", stats)
-    up_denorm_full = _denormalize_tensor(up_raw, "up", stats)
-
-    raw_fhr_norm_np = y_raw[0].detach().cpu().numpy()
-    raw_up_norm_np = up_raw[0].detach().cpu().numpy()
-    raw_fhr_denorm_np = fhr_denorm_full[0].detach().cpu().numpy()
-    raw_up_denorm_np = up_denorm_full[0].detach().cpu().numpy()
+    kld_tensor = compute_kld(outputs, runner.warmup_steps)
+    kld_mean_np = None
+    if kld_tensor is not None:
+        kld_sample = kld_tensor[idx]
+        kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
 
     fhr_st_np = y_st[0].detach().cpu().numpy().T
     fhr_ph_np = y_ph[0].detach().cpu().numpy().T
     fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
+    latent_np = latent[idx].detach().cpu().numpy().T
 
-    # Compute KLD tensor
-    kld_tensor = compute_kld(outputs, runner.warmup_steps)
-    kld_tensor_np = None
-    kld_mean_np = None
-    if kld_tensor is not None:
-        kld_sample = kld_tensor[idx]
-        kld_tensor_np = kld_sample.detach().cpu().numpy().T
-        kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
+    raw_norm_np = y_raw[0].detach().cpu().numpy().reshape(-1)
+    raw_denorm_np = _denormalize_tensor(y_raw, "fhr", stats)[0].detach().cpu().numpy().reshape(-1)
+    up_denorm_np = _denormalize_tensor(up_raw, "up", stats)[0].detach().cpu().numpy().reshape(-1)
 
-    # Compute loss for annotations
-    sample_outputs: Dict[str, Any] = {}
-    for key, val in outputs.items():
-        if torch.is_tensor(val):
-            sample_outputs[key] = val[idx : idx + 1]
-        else:
-            sample_outputs[key] = val
+    avg_pred_np = avg_mu.detach().cpu().numpy().reshape(-1)
+    if valid_mask_np is not None:
+        avg_pred_np = np.where(valid_mask_np, avg_pred_np, np.nan)
 
-    loss_dict = None
-    try:
-        loss_dict = runner.model.compute_loss(
-            forward_outputs=sample_outputs,
-            y_st=y_st,
-            y_ph=y_ph,
-            y_raw=y_raw,
-            beta=beta,
-        )
-    except Exception as exc:
-        logger.warning("Loss computation failed: %s", exc)
+    pred_concat = np.full_like(raw_norm_np, np.nan, dtype=float)
+    std_concat = None
+    predictions = mu_pr[idx]
+    logvar_predictions = logvar_pr[idx] if logvar_pr is not None else None
+    if predictions.dim() == 3:
+        predictions = predictions.squeeze(0)
+    if logvar_predictions is not None and logvar_predictions.dim() == 3:
+        logvar_predictions = logvar_predictions.squeeze(0)
 
-    loss_floats: Dict[str, float] = {}
-    if loss_dict:
-        for key, val in loss_dict.items():
-            if torch.is_tensor(val):
-                loss_floats[key] = float(torch.nan_to_num(val.detach()).cpu().item())
-            else:
-                loss_floats[key] = float(val)
+    horizon = predictions.size(-1)
+    stride = runner.decimation_factor
+    warmup = runner.warmup_steps
+    raw_len = raw_norm_np.shape[0]
+    total_steps = predictions.size(0)
+    step_size = max(1, horizon // max(1, stride))
 
-    # Denormalize prediction for detailed plots
-    pred_denorm_full = _denormalize_tensor(avg_mu.unsqueeze(0), "fhr", stats)
-    recon_denorm_np = pred_denorm_full[0].detach().cpu().numpy()
-    recon_norm_np = avg_mu.detach().cpu().numpy()
+    if logvar_predictions is not None:
+        std_concat = np.full_like(raw_norm_np, np.nan, dtype=float)
 
-    # Logvar for detailed plots
-    logvar_np = None
-    if logvar_pr is not None:
-        avg_logvar_seg = logvar_pr[idx]
-        if avg_logvar_seg.dim() == 2:
-            avg_logvar_seg = avg_logvar_seg.unsqueeze(0)
-        if avg_logvar_seg.dim() == 3:
-            avg_logvar, _ = aggregate_predictions(runner.model, avg_logvar_seg, raw_len=y_raw.size(1))
-            if avg_logvar is not None:
-                logvar_np = avg_logvar.detach().cpu().numpy()
-                if logvar_np.ndim == 2 and logvar_np.shape[0] == 1:
-                    logvar_np = logvar_np[0]
+    t_idx = warmup
+    while t_idx < total_steps:
+        raw_start = t_idx * stride
+        if raw_start >= raw_len:
+            break
+        raw_end = raw_start + horizon
 
-    # -------------------------------------------------------------------
-    # 10. Model analysis (detailed panel)
-    # -------------------------------------------------------------------
-    try:
-        plot_model_analysis(
-            output_dir=str(sample_dir),
-            raw_fhr=raw_fhr_denorm_np,
-            raw_up=raw_up_denorm_np,
-            fhr_st=fhr_st_np,
-            fhr_ph=fhr_ph_np,
-            fhr_up_ph=fhr_up_ph_np,
-            latent_z=latent_np.T,
-            reconstructed_fhr_mu=recon_norm_np,
-            reconstructed_fhr_logvar=logvar_np,
-            kld_tensor=kld_tensor_np,
-            kld_mean_over_channels=kld_mean_np,
-            batch_idx=0,
-            loss_dict=loss_floats,
-            raw_fhr_normalized=raw_fhr_norm_np,
-            raw_up_normalized=raw_up_norm_np,
-        )
-        plot_paths["model_analysis"] = str(sample_dir / "model_analysis_0.svg")
-        logger.debug("Saved model_analysis.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot model_analysis: {e}")
+        pred_segment = predictions[t_idx].detach().cpu().numpy()
+        seg_len = raw_end - raw_start
+        if raw_end > raw_len:
+            seg_len = raw_len - raw_start
+            raw_end = raw_len
+            pred_segment = pred_segment[:seg_len]
 
-    # -------------------------------------------------------------------
-    # 11. VAE reconstruction diagnostic
-    # -------------------------------------------------------------------
-    try:
-        recon_st_np, recon_ph_np = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
+        pred_concat[raw_start:raw_end] = pred_segment
 
-        plot_vae_reconstruction(
-            output_dir=str(sample_dir),
-            raw_fhr_unnormalized=raw_fhr_denorm_np,
-            raw_up_unnormalized=raw_up_denorm_np,
-            raw_fhr_normalized=raw_fhr_norm_np,
-            raw_up_normalized=raw_up_norm_np,
-            reconstructed_fhr=recon_norm_np,
-            reconstructed_fhr_unnormalized=recon_denorm_np,
-            original_scattering_transform=fhr_st_np,
-            reconstructed_scattering_transform=recon_st_np,
-            original_phase_harmonic=fhr_ph_np,
-            reconstructed_phase_harmonic=recon_ph_np,
-            original_cross_phase_harmonic=fhr_up_ph_np,
-            latent_z=latent_np,
-            kld_tensor=kld_tensor_np,
-            kld_mean_over_channels=kld_mean_np,
-            warmup_steps=runner.warmup_steps,
-            scattering_channel_data=None,
-            batch_idx=0,
-            loss_dict=loss_floats,
-        )
-        plot_paths["vae_reconstruction"] = str(sample_dir / "vae_reconstruction_0.svg")
-        logger.debug("Saved vae_reconstruction.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot vae_reconstruction: {e}")
+        if std_concat is not None:
+            logvar_segment = logvar_predictions[t_idx]
+            std_segment = torch.exp(0.5 * logvar_segment).detach().cpu().numpy()
+            if std_segment.shape[0] > seg_len:
+                std_segment = std_segment[:seg_len]
+            std_concat[raw_start:raw_end] = std_segment
 
-    # -------------------------------------------------------------------
-    # 12. Single prediction windows
-    # -------------------------------------------------------------------
-    try:
-        mu_pr_sample = mu_pr[idx]
-        logvar_pr_sample = logvar_pr[idx] if logvar_pr is not None else None
+        t_idx += step_size
 
-        if mu_pr_sample.dim() == 2:
-            mu_pr_sample = mu_pr_sample.unsqueeze(0)
-        if mu_pr_sample.dim() != 3:
-            raise ValueError("mu_pr must be 3D for window extraction")
+    _apply_publication_style()
+    fig, axes = plt.subplots(8, 1, figsize=(16, 24), constrained_layout=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
 
-        # Prepare windows
-        predictions = mu_pr_sample.squeeze(0)
-        logvar_predictions = logvar_pr_sample.squeeze(0) if logvar_pr_sample is not None else None
+    def _style_heatmap(ax: plt.Axes) -> None:
+        _style_axes(ax, grid="none")
+        ax.grid(False)
 
-        horizon = predictions.size(-1)
-        stride = runner.decimation_factor
-        warmup = runner.warmup_steps
+    t_raw = np.arange(raw_norm_np.shape[0]) / fs
 
-        raw_norm = y_raw[0]
-        raw_denorm = _denormalize_tensor(raw_norm.unsqueeze(0), "fhr", stats)[0]
-        raw_len = raw_norm.size(0)
+    ax = axes[0]
+    ax.plot(t_raw, raw_denorm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR")
+    ax.plot(t_raw, up_denorm_np, color=COLOR_GREEN, linewidth=1.2, label="UP")
+    ax.set_title("Original FHR and UP")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.legend(loc="upper right", framealpha=0.95)
+    _style_axes(ax, grid="both")
 
-        # Extract several windows
-        windows: List[Dict[str, Any]] = []
-        total_steps = predictions.size(0)
-        step_size = max(1, horizon // stride)
-        t_idx = warmup
-        max_windows = 4
+    ax = axes[1]
+    im = ax.imshow(fhr_st_np, aspect="auto", cmap="bwr", origin="upper")
+    ax.set_title("FHR Scattering Transform")
+    ax.set_xlabel("Time Steps")
+    ax.set_ylabel("ST Channel")
+    _style_heatmap(ax)
+    _add_colorbar(fig, im, ax, label="Coeff")
 
-        while t_idx < total_steps and len(windows) < max_windows:
-            raw_start = t_idx * stride
-            raw_end = raw_start + horizon
-            if raw_end > raw_len:
-                break
+    ax = axes[2]
+    im = ax.imshow(fhr_ph_np, aspect="auto", cmap="bwr", origin="upper")
+    ax.set_title("FHR Phase Harmonics")
+    ax.set_xlabel("Time Steps")
+    ax.set_ylabel("PH Channel")
+    _style_heatmap(ax)
+    _add_colorbar(fig, im, ax, label="Coeff")
 
-            pred_segment = predictions[t_idx]
-            logvar_segment = logvar_predictions[t_idx] if logvar_predictions is not None else None
+    ax = axes[3]
+    im = ax.imshow(fhr_up_ph_np, aspect="auto", cmap="bwr", origin="upper")
+    ax.set_title("FHR-UP Cross-Channel Phase Harmonics")
+    ax.set_xlabel("Time Steps")
+    ax.set_ylabel("Cross-PH Channel")
+    _style_heatmap(ax)
+    _add_colorbar(fig, im, ax, label="Coeff")
 
-            target_norm = raw_norm[raw_start:raw_end]
-            target_denorm = raw_denorm[raw_start:raw_end]
+    ax = axes[4]
+    im = ax.imshow(latent_np, aspect="auto", cmap="bwr", origin="lower")
+    # Add warmup boundary
+    if warmup > 0:
+        ax.axvline(x=warmup - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
+    ax.set_title("Latent Representation")
+    ax.set_xlabel("Time Steps")
+    ax.set_ylabel("Latent Dim")
+    _style_heatmap(ax)
+    _add_colorbar(fig, im, ax, label="Activation")
 
-            pred_denorm_win = _denormalize_tensor(
-                pred_segment.unsqueeze(0), "fhr", stats, raw_start=raw_start, length=horizon
-            )[0]
+    ax = axes[5]
+    if kld_mean_np is None:
+        ax.text(0.5, 0.5, "KLD unavailable", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        t_kld = np.arange(len(kld_mean_np))
+        ax.plot(t_kld, kld_mean_np, color=COLOR_PURPLE, linewidth=1.1)
+        # Add warmup shading
+        if warmup > 0:
+            ax.axvspan(0, warmup, alpha=0.15, color=COLOR_GRAY, label="Warmup")
+            ax.axvline(x=warmup, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
+        overall_mean = float(np.nanmean(kld_mean_np[warmup:]))
+        ax.set_title(f"Mean KLD over Dimensions (Overall: {overall_mean:.4f})")
+        ax.set_xlabel("Time Steps")
+        ax.set_ylabel("KLD")
+        ax.set_xlim(0, len(kld_mean_np))
+        _style_axes(ax, grid="both")
 
-            std_denorm_np = None
-            std_norm_np = None
-            if logvar_segment is not None:
-                std_norm = torch.exp(0.5 * logvar_segment)
-                std_norm_np = std_norm.detach().cpu().numpy()
-                std_denorm = _denormalize_tensor(
-                    std_norm.unsqueeze(0), "fhr", stats, raw_start=raw_start, length=horizon
-                )[0]
-                std_denorm_np = std_denorm.detach().cpu().numpy()
+    ax = axes[6]
+    ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
+    ax.plot(t_raw, avg_pred_np, color=COLOR_ORANGE, linewidth=1.2, label="Avg Prediction")
+    ax.set_title("Normalized FHR vs Average Prediction")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Normalized Amplitude")
+    ax.legend(loc="upper right", framealpha=0.95)
+    _style_axes(ax, grid="both")
 
-            win_metrics = compute_reconstruction_metrics(
-                target_denorm.unsqueeze(0), pred_denorm_win.unsqueeze(0)
-            )
-            win_metrics_map = (
-                {key: float(val.detach().cpu().item()) for key, val in win_metrics.items()}
-                if win_metrics else {}
-            )
+    ax = axes[7]
+    ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
+    ax.plot(t_raw, pred_concat, color=COLOR_ORANGE, linewidth=1.2, label="Single Predictions")
+    if std_concat is not None:
+        upper = pred_concat + std_concat
+        lower = pred_concat - std_concat
+        ax.plot(t_raw, upper, color=COLOR_LIGHT_GRAY, linewidth=0.9, linestyle="--", label="+/-1SD")
+        ax.plot(t_raw, lower, color=COLOR_LIGHT_GRAY, linewidth=0.9, linestyle="--")
+    ax.set_title("Single-Window Predictions (Normalized)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Normalized Amplitude")
+    ax.legend(loc="upper right", framealpha=0.95)
+    _style_axes(ax, grid="both")
 
-            windows.append({
-                "t_index": int(t_idx),
-                "raw_start": int(raw_start),
-                "raw_end": int(raw_end),
-                "prediction": pred_denorm_win.detach().cpu().numpy(),
-                "target": target_denorm.detach().cpu().numpy(),
-                "prediction_norm": pred_segment.detach().cpu().numpy(),
-                "target_norm": target_norm.detach().cpu().numpy(),
-                "uncertainty": std_denorm_np,
-                "uncertainty_norm": std_norm_np,
-                "metrics": win_metrics_map,
-            })
-            t_idx += step_size
+    guid = _extract_guid(batch, idx)
+    epoch = _extract_epoch(batch, idx)
+    title = f"Sample Summary | GUID={guid} | Epoch={epoch}"
+    fig.suptitle(title, fontsize=14, fontweight="normal", y=0.98, color=COLOR_BLUE)
 
-        if windows:
-            raw_fhr_norm_np = raw_norm.detach().cpu().numpy()
-            agg_pred_norm = np.full_like(raw_fhr_norm_np, np.nan)
-            agg_uncert_norm = np.full_like(raw_fhr_norm_np, np.nan)
-            for window in windows:
-                start = window["raw_start"]
-                end = window["raw_end"]
-                pred_norm = window.get("prediction_norm")
-                if pred_norm is not None:
-                    agg_pred_norm[start:end] = pred_norm
-                uncert_norm = window.get("uncertainty_norm")
-                if uncert_norm is not None:
-                    agg_uncert_norm[start:end] = uncert_norm
+    plot_path = sample_dir / "vae_reconstruction_analysis_sample_0.svg"
+    fig.savefig(plot_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
 
-            raw_fhr_denorm_np = raw_denorm.detach().cpu().numpy()
-            plot_single_prediction_windows(
-                output_dir=str(sample_dir),
-                raw_fhr_unnormalized=raw_fhr_denorm_np,
-                raw_fhr_normalized=raw_fhr_norm_np,
-                windows=windows,
-                aggregated_pred_norm=agg_pred_norm,
-                aggregated_uncertainty_norm=agg_uncert_norm,
-                sample_idx=0,
-                sample_guid=guid,
-                epoch=epoch,
-            )
-            plot_paths["single_prediction_windows"] = str(sample_dir / "single_prediction_sample_000.svg")
-            logger.debug("Saved single_prediction_windows.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot single_prediction_windows: {e}")
-
-    # -------------------------------------------------------------------
-    # 13. Scattering Transform Heatmap (Original)
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "scattering_transform_original.svg"
-        _plot_coefficient_heatmap(
-            fhr_st_np,
-            plot_path,
-            title=f"Scattering Transform Coefficients - GUID: {guid}",
-            ylabel="ST Channel",
-        )
-        plot_paths["scattering_transform_original"] = str(plot_path)
-        logger.debug("Saved scattering_transform_original.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot scattering_transform_original: {e}")
-
-    # -------------------------------------------------------------------
-    # 14. Phase Harmonic Heatmap (Original)
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "phase_harmonic_original.svg"
-        _plot_coefficient_heatmap(
-            fhr_ph_np,
-            plot_path,
-            title=f"Phase Harmonic Coefficients - GUID: {guid}",
-            ylabel="PH Channel",
-        )
-        plot_paths["phase_harmonic_original"] = str(plot_path)
-        logger.debug("Saved phase_harmonic_original.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot phase_harmonic_original: {e}")
-
-    # -------------------------------------------------------------------
-    # 15. Cross-Phase Harmonic Heatmap (UP->FHR)
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "cross_phase_harmonic.svg"
-        _plot_coefficient_heatmap(
-            fhr_up_ph_np,
-            plot_path,
-            title=f"Cross-Phase Harmonics (UP→FHR) - GUID: {guid}",
-            ylabel="Cross-PH Channel",
-        )
-        plot_paths["cross_phase_harmonic"] = str(plot_path)
-        logger.debug("Saved cross_phase_harmonic.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot cross_phase_harmonic: {e}")
-
-    # -------------------------------------------------------------------
-    # 16. Latent Space z Heatmap
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "latent_z_heatmap.svg"
-        _plot_latent_heatmap(
-            latent_np,
-            plot_path,
-            title=f"Latent Space z(t) - GUID: {guid}",
-            warmup_steps=runner.warmup_steps,
-        )
-        plot_paths["latent_z_heatmap"] = str(plot_path)
-        logger.debug("Saved latent_z_heatmap.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot latent_z_heatmap: {e}")
-
-    # -------------------------------------------------------------------
-    # 17. KLD per Latent Dimension
-    # -------------------------------------------------------------------
-    try:
-        if kld_tensor_np is not None:
-            plot_path = sample_dir / "kld_per_dimension.svg"
-            _plot_kld_per_dimension(
-                kld_tensor_np,
-                plot_path,
-                title=f"KLD per Latent Dimension - GUID: {guid}",
-                warmup_steps=runner.warmup_steps,
-            )
-            plot_paths["kld_per_dimension"] = str(plot_path)
-            logger.debug("Saved kld_per_dimension.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot kld_per_dimension: {e}")
-
-    # -------------------------------------------------------------------
-    # 18. Residual Distribution Histogram
-    # -------------------------------------------------------------------
-    try:
-        plot_path = sample_dir / "residual_histogram.svg"
-        _plot_residual_histogram(
-            y_true_np,
-            y_pred_np,
-            plot_path,
-            title=f"Residual Distribution - GUID: {guid}",
-        )
-        plot_paths["residual_histogram"] = str(plot_path)
-        logger.debug("Saved residual_histogram.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot residual_histogram: {e}")
-
-    # -------------------------------------------------------------------
-    # 19. Scattering Transform Channel Time Series
-    # -------------------------------------------------------------------
-    try:
-        recon_st_np, _ = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
-        plot_path = sample_dir / "st_channel_timeseries.svg"
-        _plot_channel_timeseries(
-            fhr_st_np,
-            plot_path,
-            title=f"Scattering Transform Channels - GUID: {guid}",
-            n_channels=8,
-            reconstructed=recon_st_np,
-            fs=fs,
-        )
-        plot_paths["st_channel_timeseries"] = str(plot_path)
-        logger.debug("Saved st_channel_timeseries.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot st_channel_timeseries: {e}")
-
-    # -------------------------------------------------------------------
-    # 20. Phase Harmonic Channel Time Series
-    # -------------------------------------------------------------------
-    try:
-        _, recon_ph_np_ts = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
-        plot_path = sample_dir / "ph_channel_timeseries.svg"
-        _plot_channel_timeseries(
-            fhr_ph_np,
-            plot_path,
-            title=f"Phase Harmonic Channels - GUID: {guid}",
-            n_channels=8,
-            reconstructed=recon_ph_np_ts,
-            fs=fs,
-        )
-        plot_paths["ph_channel_timeseries"] = str(plot_path)
-        logger.debug("Saved ph_channel_timeseries.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot ph_channel_timeseries: {e}")
-
-    # -------------------------------------------------------------------
-    # 21. ST Reconstruction Error Heatmap
-    # -------------------------------------------------------------------
-    try:
-        recon_st_np_err, _ = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
-        if recon_st_np_err is not None:
-            plot_path = sample_dir / "st_reconstruction_error.svg"
-            _plot_coefficient_error_heatmap(
-                fhr_st_np,
-                recon_st_np_err,
-                plot_path,
-                title=f"ST Reconstruction Error - GUID: {guid}",
-                ylabel="ST Channel",
-            )
-            plot_paths["st_reconstruction_error"] = str(plot_path)
-            logger.debug("Saved st_reconstruction_error.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot st_reconstruction_error: {e}")
-
-    # -------------------------------------------------------------------
-    # 22. PH Reconstruction Error Heatmap
-    # -------------------------------------------------------------------
-    try:
-        _, recon_ph_np_err = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
-        if recon_ph_np_err is not None:
-            plot_path = sample_dir / "ph_reconstruction_error.svg"
-            _plot_coefficient_error_heatmap(
-                fhr_ph_np,
-                recon_ph_np_err,
-                plot_path,
-                title=f"PH Reconstruction Error - GUID: {guid}",
-                ylabel="PH Channel",
-            )
-            plot_paths["ph_reconstruction_error"] = str(plot_path)
-            logger.debug("Saved ph_reconstruction_error.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot ph_reconstruction_error: {e}")
-
-    # -------------------------------------------------------------------
-    # 23. Coherence Spectrum (FHR Original vs Reconstructed)
-    # -------------------------------------------------------------------
-    try:
-        freqs_coh, coh_vals = compute_stft_coherence(y_true_np, y_pred_np, fs=fs, nperseg=256)
-        if freqs_coh.size > 0 and coh_vals.size > 0:
-            plot_path = sample_dir / "coherence_spectrum.svg"
-            plot_coherence_spectrum(
-                freqs_coh,
-                coh_vals,
-                plot_path,
-                title=f"Coherence Spectrum (FHR Orig vs Recon) - GUID: {guid}",
-                max_freq=0.5,
-            )
-            plot_paths["coherence_spectrum"] = str(plot_path)
-            logger.debug("Saved coherence_spectrum.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot coherence_spectrum: {e}")
-
-    # -------------------------------------------------------------------
-    # 24. UP-FHR Coherence Analysis (if UP available)
-    # -------------------------------------------------------------------
-    try:
-        up_np_check = up_raw[0].detach().cpu().numpy()
-        if np.any(up_np_check != 0):
-            # Compute coherence between UP and original FHR
-            freqs_up_fhr_orig, coh_up_fhr_orig = compute_stft_coherence(
-                up_np_check, y_true_np, fs=fs, nperseg=256
-            )
-            # Compute coherence between UP and reconstructed FHR
-            freqs_up_fhr_recon, coh_up_fhr_recon = compute_stft_coherence(
-                up_np_check, y_pred_np, fs=fs, nperseg=256
-            )
-            if freqs_up_fhr_orig.size > 0:
-                plot_path = sample_dir / "up_fhr_coherence.svg"
-                plot_coherence_analysis(
-                    freqs_up_fhr_orig,
-                    coh_up_fhr_orig,
-                    coh_up_fhr_recon,
-                    sample_dir,
-                    filename="up_fhr_coherence.svg",
-                )
-                plot_paths["up_fhr_coherence"] = str(plot_path)
-                logger.debug("Saved up_fhr_coherence.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot up_fhr_coherence: {e}")
-
-    # -------------------------------------------------------------------
-    # 25. Combined Error Statistics Summary
-    # -------------------------------------------------------------------
-    try:
-        # Get ST and PH reconstructions for error summary
-        recon_st_for_summary, recon_ph_for_summary = _extract_reconstruction_features(
-            linear_output[idx : idx + 1] if linear_output is not None else None,
-            st_channels=fhr_st_np.shape[0],
-            ph_channels=fhr_ph_np.shape[0],
-        )
-        plot_path = sample_dir / "error_summary.svg"
-        _plot_error_summary(
-            y_true_np=y_true_np,
-            y_pred_np=y_pred_np,
-            fhr_st_orig=fhr_st_np,
-            fhr_st_recon=recon_st_for_summary,
-            fhr_ph_orig=fhr_ph_np,
-            fhr_ph_recon=recon_ph_for_summary,
-            output_path=plot_path,
-            title=f"Error Summary - GUID: {guid}",
-            metrics=sample_dict["metrics"],
-        )
-        plot_paths["error_summary"] = str(plot_path)
-        logger.debug("Saved error_summary.svg")
-    except Exception as e:
-        logger.warning(f"Failed to plot error_summary: {e}")
-
+    plot_paths["vae_reconstruction"] = str(plot_path)
     return plot_paths
 
 
