@@ -232,6 +232,7 @@ def plot_metric_histograms(
     *,
     add_kde: bool = False,
     add_ci: bool = True,
+    kld_log_scale: bool = True,
 ) -> None:
     """
     Create a 2x2 grid of histograms for VAF, MSE, SNR, and KLD.
@@ -242,6 +243,7 @@ def plot_metric_histograms(
         filename: Output filename (default: metrics_histograms.svg).
         add_kde: Whether to add kernel density estimate overlay (default: False).
         add_ci: Whether to include 95% confidence intervals in stats box (default: True).
+        kld_log_scale: Whether to use log scale for KLD x-axis (default: True).
 
     Example:
         >>> plot_metric_histograms(metrics_df, Path("results/"))
@@ -253,15 +255,15 @@ def plot_metric_histograms(
     fig, axes = plt.subplots(4, 1, figsize=(6.5, 8.5))
     axes = np.atleast_1d(axes)
 
-    # Define metrics and their properties
+    # Define metrics and their properties: (col, title, color, unit, use_log_scale)
     metrics_config = [
-        ("vaf", "Variance Accounted For (VAF)", COLOR_BLUE, ""),
-        ("mse", "Mean Squared Error (MSE)", COLOR_GREEN, ""),
-        ("snr", "Signal-to-Noise Ratio (SNR)", COLOR_ORANGE, "dB"),
-        ("kld", "Transfer Entropy (KLD)", COLOR_PURPLE, "bits"),
+        ("vaf", "Variance Accounted For (VAF)", COLOR_BLUE, "", False),
+        ("mse", "Mean Squared Error (MSE)", COLOR_GREEN, "", False),
+        ("snr", "Signal-to-Noise Ratio (SNR)", COLOR_ORANGE, "dB", False),
+        ("kld", "Transfer Entropy (KLD)", COLOR_PURPLE, "bits", kld_log_scale),
     ]
 
-    for ax, (col, title, color, unit) in zip(axes, metrics_config):
+    for ax, (col, title, color, unit, use_log) in zip(axes, metrics_config):
         if col not in df.columns:
             ax.text(0.5, 0.5, f"No {col} data", ha="center", va="center", fontsize=FONT_LABEL)
             ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
@@ -276,7 +278,7 @@ def plot_metric_histograms(
             ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
             continue
 
-        # Compute statistics
+        # Compute statistics (on original scale)
         mean_val = np.mean(values)
         std_val = np.std(values, ddof=1)
         median_val = np.median(values)
@@ -285,11 +287,32 @@ def plot_metric_histograms(
 
         # Plot histogram with finer binning
         n_bins = min(120, max(40, int(np.sqrt(len(values)) * 2)))
-        counts, bins, patches = ax.hist(
-            values, bins=n_bins, density=True,
-            color=color, alpha=0.7, edgecolor=COLOR_BLACK,
-            linewidth=0.5
-        )
+
+        # Use log-spaced bins for log scale
+        if use_log:
+            # Filter out non-positive values for log scale
+            positive_values = values[values > 0]
+            if len(positive_values) < 10:
+                # Fall back to linear scale if not enough positive values
+                use_log = False
+            else:
+                values = positive_values
+                log_min = np.log10(np.min(values))
+                log_max = np.log10(np.max(values))
+                bins = np.logspace(log_min, log_max, n_bins + 1)
+                counts, bins, patches = ax.hist(
+                    values, bins=bins, density=True,
+                    color=color, alpha=0.7, edgecolor=COLOR_BLACK,
+                    linewidth=0.5
+                )
+                ax.set_xscale("log")
+
+        if not use_log:
+            counts, bins, patches = ax.hist(
+                values, bins=n_bins, density=True,
+                color=color, alpha=0.7, edgecolor=COLOR_BLACK,
+                linewidth=0.5
+            )
 
         # Add reference lines with distinct colors and dashed styles
         ax.axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9,
@@ -311,11 +334,14 @@ def plot_metric_histograms(
 
         # Labels and styling
         xlabel = f"{col.upper()}" + (f" ({unit})" if unit else "")
+        if use_log:
+            xlabel += " [log scale]"
         ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal", pad=8)
         _style_axes(ax, grid="major", minor_ticks=False)
-        _tighten_xaxis(ax, values)
+        if not use_log:
+            _tighten_xaxis(ax, values)
         ax.set_ylim(bottom=0.0)
 
         # Add legend outside, below the stats box
