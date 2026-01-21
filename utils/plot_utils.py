@@ -645,7 +645,7 @@ def plot_single_prediction_windows(
         "background": "white",
     }
 
-    n_rows = 2 + len(windows)
+    n_rows = 2 + 2 * len(windows)
     fig, axes = plt.subplots(n_rows, 1, figsize=(13.0, max(6, 2.4 * n_rows)), constrained_layout=True)
     if n_rows == 1:
         axes = np.asarray([axes])
@@ -694,8 +694,11 @@ def plot_single_prediction_windows(
             color=colors['recon'],
         )
 
+    row_idx = 1
+    std_color = COLOR_LIGHT_GRAY
+    std_alpha = 0.18
     for idx, window in enumerate(windows):
-        ax = axes[idx + 1]
+        ax = axes[row_idx]
         prediction = np.asarray(window["prediction"]).astype(float)
         target = np.asarray(window["target"]).astype(float)
         start_sec = window["raw_start"] / sampling_rate
@@ -715,8 +718,8 @@ def plot_single_prediction_windows(
                 t_segment,
                 lower,
                 upper,
-                color=colors['uncertainty'],
-                alpha=0.25,
+                color=std_color,
+                alpha=std_alpha,
                 label=label,
             )
         ax.set_ylabel("Amplitude")
@@ -732,14 +735,49 @@ def plot_single_prediction_windows(
         if snr is not None:
             metric_parts.append(f"SNR={snr:.2f} dB")
         metric_text = " | ".join(metric_parts)
-        header = f"Window {idx + 1} - T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
+        header = f"Window {idx + 1} (denormalized) - T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
         if metric_text:
             header += f" | {metric_text}"
         ax.set_title(header, fontweight='normal', pad=10)
         ax.legend(loc="upper right", framealpha=0.95)
         ax.set_xlim(start_sec, end_sec)
 
-    agg_ax = axes[-1]
+        norm_ax = axes[row_idx + 1]
+        pred_norm = np.asarray(window.get("prediction_norm")) if window.get("prediction_norm") is not None else None
+        target_norm = np.asarray(window.get("target_norm")) if window.get("target_norm") is not None else None
+        if pred_norm is not None and target_norm is not None:
+            pred_norm = pred_norm.astype(float)
+            target_norm = target_norm.astype(float)
+            norm_ax.axvline(start_sec, color=colors['recon'], linestyle="--", linewidth=0.9)
+            norm_ax.axvline(end_sec, color=colors['recon'], linestyle="--", linewidth=0.9)
+            norm_ax.plot(t_segment, target_norm, color=colors['gt'], linewidth=1.5, label="Target (norm)")
+            norm_ax.plot(t_segment, pred_norm, color=colors['recon'], linewidth=1.3, label="Prediction (norm)")
+            uncertainty_norm = window.get("uncertainty_norm")
+            if uncertainty_norm is not None:
+                uncertainty_norm = np.asarray(uncertainty_norm).astype(float)
+                lower = pred_norm - uncertainty_norm
+                upper = pred_norm + uncertainty_norm
+                label = "+/-1SD (norm)" if idx == 0 else None
+                norm_ax.fill_between(
+                    t_segment,
+                    lower,
+                    upper,
+                    color=std_color,
+                    alpha=std_alpha,
+                    label=label,
+                )
+            norm_ax.set_ylabel("Normalized Amplitude")
+            norm_header = f"Window {idx + 1} (normalized) - T={window['t_index']} ({start_sec:.1f}-{end_sec:.1f}s)"
+            norm_ax.set_title(norm_header, fontweight='normal', pad=10)
+            norm_ax.legend(loc="upper right", framealpha=0.95)
+            norm_ax.set_xlim(start_sec, end_sec)
+        else:
+            norm_ax.set_title(f"Window {idx + 1} (normalized) - missing data", fontweight='normal', pad=10)
+            norm_ax.set_axis_off()
+
+        row_idx += 2
+
+    agg_ax = axes[row_idx]
     agg_ax.set_title("Concatenated Predictions vs Normalized FHR", fontweight='normal', pad=12)
     agg_ax.set_ylabel("Normalized Amplitude")
     agg_ax.set_xlabel("Time (s)")
@@ -764,14 +802,14 @@ def plot_single_prediction_windows(
                 lower,
                 upper,
                 where=valid,
-                color=colors['uncertainty'],
-                alpha=0.2,
+                color=std_color,
+                alpha=std_alpha,
                 label="+/-1SD (norm)",
             )
     agg_handles, agg_labels = agg_ax.get_legend_handles_labels()
     agg_ax.legend(agg_handles + [window_patch], agg_labels + [window_patch.get_label()], loc="upper right", framealpha=0.95)
 
-    output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.png")
+    output_path = os.path.join(output_dir, f"single_prediction_sample_{sample_idx:03d}.svg")
     fig.savefig(output_path, dpi=SAVE_DPI, facecolor='white')
     plt.close(fig)
 
@@ -799,6 +837,7 @@ def plot_vae_reconstruction(
     warmup_steps: int = 0,
     cross_auto_indices: np.ndarray = None,
     cross_cross_indices: np.ndarray = None,
+    reconstructed_fhr_unnormalized: Optional[np.ndarray] = None,  # Shape: (4800,)
 ):
     """
     Generates and saves comprehensive VAE reconstruction analysis plots.
@@ -809,7 +848,8 @@ def plot_vae_reconstruction(
         raw_up_unnormalized (np.ndarray): Raw unnormalized UP signal. Shape: (4800,).
         raw_fhr_normalized (np.ndarray): Raw normalized FHR signal. Shape: (4800,).
         raw_up_normalized (np.ndarray): Raw normalized UP signal. Shape: (4800,).
-        reconstructed_fhr (np.ndarray): Reconstructed FHR signal. Shape: (4800,).
+        reconstructed_fhr (np.ndarray): Reconstructed FHR signal (normalized). Shape: (4800,).
+        reconstructed_fhr_unnormalized (np.ndarray): Reconstructed FHR signal (unnormalized), optional.
         original_scattering_transform (np.ndarray): Original scattering coeffs. Shape: (43, 300).
         reconstructed_scattering_transform (np.ndarray): Reconstructed scattering coeffs, optional. Shape: (43, 300).
         original_phase_harmonic (np.ndarray): Original phase harmonic coeffs. Shape: (44, 300).
@@ -851,6 +891,7 @@ def plot_vae_reconstruction(
         original_cross_phase_harmonic is not None
         and original_cross_phase_harmonic.size > 0
     )
+    has_recon_denorm = reconstructed_fhr_unnormalized is not None
 
     def _to_channel_time(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if arr is None:
@@ -876,6 +917,8 @@ def plot_vae_reconstruction(
     show_channel_plots = has_recon_st
 
     n_main_plots = 3  # raw signals, normalized vs recon, recon only
+    if has_recon_denorm:
+        n_main_plots += 1
     if has_latent:
         n_main_plots += 1
     if has_kld_heatmap:
@@ -939,16 +982,26 @@ def plot_vae_reconstruction(
     plot_idx += 1
 
     ax[plot_idx].plot(t_raw, raw_fhr_normalized, color=colors['gt'], label='Normalized FHR', linewidth=1.5, alpha=0.85)
-    ax[plot_idx].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5, alpha=0.85)
-    ax[plot_idx].set_title('Normalized FHR vs Reconstructed FHR', fontweight='normal', pad=12)
+    ax[plot_idx].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR (norm)', linewidth=1.5, alpha=0.85)
+    ax[plot_idx].set_title('Normalized FHR vs Reconstructed FHR (norm)', fontweight='normal', pad=12)
     ax[plot_idx].set_ylabel('Normalized Amplitude', fontweight='normal')
     ax[plot_idx].set_xlabel('Time (s)', fontweight='normal')
     ax[plot_idx].legend(loc='upper right', framealpha=0.95)
     ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
     plot_idx += 1
 
-    ax[plot_idx].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR', linewidth=1.5, alpha=0.85)
-    ax[plot_idx].set_title('Reconstructed FHR Signal', fontweight='normal', pad=12)
+    if has_recon_denorm:
+        ax[plot_idx].plot(t_raw, raw_fhr_unnormalized, color=colors['gt'], label='Raw FHR', linewidth=1.5, alpha=0.85)
+        ax[plot_idx].plot(t_raw, reconstructed_fhr_unnormalized, color=colors['recon'], label='Reconstructed FHR (raw)', linewidth=1.5, alpha=0.85)
+        ax[plot_idx].set_title('Raw FHR vs Reconstructed FHR (unnormalized)', fontweight='normal', pad=12)
+        ax[plot_idx].set_ylabel('Amplitude', fontweight='normal')
+        ax[plot_idx].set_xlabel('Time (s)', fontweight='normal')
+        ax[plot_idx].legend(loc='upper right', framealpha=0.95)
+        ax[plot_idx].autoscale(enable=True, axis='x', tight=True)
+        plot_idx += 1
+
+    ax[plot_idx].plot(t_raw, reconstructed_fhr, color=colors['recon'], label='Reconstructed FHR (norm)', linewidth=1.5, alpha=0.85)
+    ax[plot_idx].set_title('Reconstructed FHR Signal (normalized)', fontweight='normal', pad=12)
     ax[plot_idx].set_ylabel('Normalized Amplitude', fontweight='normal')
     ax[plot_idx].set_xlabel('Time (s)', fontweight='normal')
     ax[plot_idx].legend(loc='upper right', framealpha=0.95)
