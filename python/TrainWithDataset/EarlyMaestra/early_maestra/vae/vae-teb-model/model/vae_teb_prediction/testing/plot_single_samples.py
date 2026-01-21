@@ -41,9 +41,13 @@ from model.vae_teb_prediction.testing.metrics import (
     aggregate_predictions,
     compute_kld,
     compute_kld_per_sample,
+    compute_kld_per_timestep,
     compute_reconstruction_metrics,
     reduce_latent_dimensionality,
 )
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy import stats as scipy_stats
 from model.vae_teb_prediction.testing.visualizers import (
     plot_reconstruction_sample,
     plot_coherence_signals,
@@ -52,6 +56,22 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_latent_trajectory_3d,
     plot_psd_comparison,
     plot_cross_correlation,
+    plot_coherence_analysis,
+    plot_reconstruction_coherence,
+    plot_coherence_spectrum,
+    plot_kld_trajectory_3d,
+    # Colors for consistent styling
+    COLOR_BLUE,
+    COLOR_ORANGE,
+    COLOR_GREEN,
+    COLOR_SKY,
+    COLOR_PURPLE,
+    COLOR_VERMILLION,
+    COLOR_GRAY,
+    COLOR_BLACK,
+    COLOR_LIGHT_GRAY,
+    COLOR_SAGE,
+    SAVE_DPI,
 )
 from model.vae_teb_prediction.testing.visualizers_interactive import (
     plot_reconstruction_interactive,
@@ -63,6 +83,7 @@ from model.vae_teb_prediction.testing.analyses.coherence import (
     compute_wavelet_coherence,
     compute_welch_psd,
     compute_cross_correlation,
+    compute_stft_coherence,
 )
 
 # Import data loading utilities
@@ -243,6 +264,450 @@ def _extract_reconstruction_features(
     recon_st = linear_np[:, :st_channels].T
     recon_ph = linear_np[:, st_channels : st_channels + ph_channels].T
     return recon_st, recon_ph
+
+
+def _apply_publication_style() -> None:
+    """Apply publication-quality matplotlib style."""
+    plt.style.use("default")
+    plt.rcParams.update({
+        "figure.dpi": 150,
+        "savefig.dpi": SAVE_DPI,
+        "savefig.format": "svg",
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.05,
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+        "axes.linewidth": 0.6,
+        "axes.edgecolor": COLOR_BLACK,
+        "axes.labelcolor": COLOR_BLACK,
+        "grid.alpha": 0.2,
+        "grid.linewidth": 0.3,
+        "grid.color": COLOR_LIGHT_GRAY,
+        "lines.linewidth": 1.0,
+        "lines.markersize": 3,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    })
+
+
+def _style_axes(ax: plt.Axes, *, grid: str = "major") -> None:
+    """Apply clean styling to axes."""
+    ax.set_axisbelow(True)
+    if grid in ("both", "major"):
+        ax.grid(True, which="major", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
+    if grid == "both":
+        ax.grid(True, which="minor", alpha=0.12, linewidth=0.2, color=COLOR_LIGHT_GRAY)
+        ax.minorticks_on()
+    for spine in ["left", "bottom", "top", "right"]:
+        ax.spines[spine].set_visible(True)
+        ax.spines[spine].set_color(COLOR_BLACK)
+        ax.spines[spine].set_linewidth(0.6)
+
+
+def _add_colorbar(
+    fig: plt.Figure,
+    mappable: Any,
+    ax: plt.Axes,
+    *,
+    label: Optional[str] = None,
+) -> plt.Axes:
+    """Attach aligned colorbar."""
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="3.5%", pad=0.02)
+    cbar = fig.colorbar(mappable, cax=cax)
+    if label:
+        cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
+    cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+    return cbar
+
+
+def _plot_coefficient_heatmap(
+    coefficients: np.ndarray,
+    output_path: Path,
+    *,
+    title: str,
+    ylabel: str = "Channel",
+    xlabel: str = "Time Steps",
+    cmap: str = "bwr",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    fs: float = 4.0,
+) -> None:
+    """Plot a heatmap of coefficient values (ST, PH, etc.)."""
+    _apply_publication_style()
+
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+
+    # Auto-scale if not provided
+    if vmin is None or vmax is None:
+        vabs = np.nanmax(np.abs(coefficients))
+        vmin = -vabs
+        vmax = vabs
+
+    im = ax.imshow(
+        coefficients,
+        aspect="auto",
+        cmap=cmap,
+        origin="upper",
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
+    ax.grid(False)
+
+    _add_colorbar(fig, im, ax, label="Value")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_coefficient_error_heatmap(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    output_path: Path,
+    *,
+    title: str,
+    ylabel: str = "Channel",
+) -> None:
+    """Plot reconstruction error heatmap."""
+    _apply_publication_style()
+
+    error = np.abs(original - reconstructed)
+
+    fig, axes = plt.subplots(3, 1, figsize=(8, 7), constrained_layout=True)
+
+    # Original
+    vabs = np.nanmax(np.abs(original))
+    im0 = axes[0].imshow(original, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
+    axes[0].set_title("Original Coefficients", fontsize=9)
+    axes[0].set_ylabel(ylabel, fontsize=8)
+    axes[0].grid(False)
+    _add_colorbar(fig, im0, axes[0], label="Value")
+
+    # Reconstructed
+    im1 = axes[1].imshow(reconstructed, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
+    axes[1].set_title("Reconstructed Coefficients", fontsize=9)
+    axes[1].set_ylabel(ylabel, fontsize=8)
+    axes[1].grid(False)
+    _add_colorbar(fig, im1, axes[1], label="Value")
+
+    # Error
+    im2 = axes[2].imshow(error, aspect="auto", cmap="Reds", origin="upper")
+    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=9)
+    axes[2].set_xlabel("Time Steps", fontsize=8)
+    axes[2].set_ylabel(ylabel, fontsize=8)
+    axes[2].grid(False)
+    _add_colorbar(fig, im2, axes[2], label="|Error|")
+
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_latent_heatmap(
+    latent: np.ndarray,
+    output_path: Path,
+    *,
+    title: str = "Latent Space z(t)",
+    warmup_steps: int = 0,
+) -> None:
+    """Plot latent space heatmap with optional warmup marking."""
+    _apply_publication_style()
+
+    fig, ax = plt.subplots(figsize=(8, 3))
+
+    # latent shape: (T, D) - transpose to (D, T) for display
+    latent_T = latent.T if latent.ndim == 2 else latent
+
+    vabs = np.nanmax(np.abs(latent_T))
+    im = ax.imshow(latent_T, aspect="auto", cmap="bwr", origin="lower", vmin=-vabs, vmax=vabs)
+
+    # Mark warmup boundary
+    if warmup_steps > 0:
+        ax.axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
+        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=7, va="top")
+
+    ax.set_xlabel("Time Steps", fontsize=8)
+    ax.set_ylabel("Latent Dimension", fontsize=8)
+    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
+    ax.grid(False)
+
+    _add_colorbar(fig, im, ax, label="Activation")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_kld_per_dimension(
+    kld_tensor: np.ndarray,
+    output_path: Path,
+    *,
+    title: str = "KLD per Latent Dimension",
+    warmup_steps: int = 0,
+) -> None:
+    """Plot KLD heatmap and mean trace per latent dimension."""
+    _apply_publication_style()
+
+    # kld_tensor shape: (T, D) or (D, T) - ensure (D, T)
+    if kld_tensor.ndim != 2:
+        return
+
+    # Assume (D, T) format based on typical usage
+    kld_T = kld_tensor if kld_tensor.shape[0] < kld_tensor.shape[1] else kld_tensor.T
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 4.5), gridspec_kw={"height_ratios": [2, 1]})
+
+    # Heatmap
+    im = axes[0].imshow(kld_T, aspect="auto", cmap="viridis", origin="lower")
+    if warmup_steps > 0:
+        axes[0].axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
+    axes[0].set_ylabel("Latent Dimension", fontsize=8)
+    axes[0].set_title("KLD per Dimension over Time", fontsize=9)
+    axes[0].grid(False)
+    _add_colorbar(fig, im, axes[0], label="KLD (bits)")
+
+    # Mean trace
+    kld_mean = np.nanmean(kld_T, axis=0)
+    t = np.arange(len(kld_mean))
+    axes[1].plot(t, kld_mean, color=COLOR_PURPLE, linewidth=0.8)
+    if warmup_steps > 0:
+        axes[1].axvspan(0, warmup_steps, alpha=0.1, color=COLOR_GRAY)
+        axes[1].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
+    axes[1].set_xlabel("Time Steps", fontsize=8)
+    axes[1].set_ylabel("Mean KLD", fontsize=8)
+    axes[1].set_title(f"Mean KLD over Time (Overall: {np.nanmean(kld_mean):.4f})", fontsize=9)
+    _style_axes(axes[1], grid="both")
+    axes[1].set_xlim(0, len(kld_mean))
+
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_residual_histogram(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    output_path: Path,
+    *,
+    title: str = "Residual Distribution",
+) -> None:
+    """Plot histogram of reconstruction residuals."""
+    _apply_publication_style()
+
+    residual = y_true - y_pred
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+
+    # Histogram
+    n_bins = min(100, max(30, int(np.sqrt(len(residual)) * 2)))
+    counts, bins, patches = axes[0].hist(
+        residual, bins=n_bins, density=True,
+        color=COLOR_GREEN, alpha=0.7, edgecolor=COLOR_BLACK, linewidth=0.3
+    )
+
+    # Fit normal distribution
+    mean_val = np.mean(residual)
+    std_val = np.std(residual)
+    x_fit = np.linspace(bins[0], bins[-1], 200)
+    y_fit = scipy_stats.norm.pdf(x_fit, mean_val, std_val)
+    axes[0].plot(x_fit, y_fit, color=COLOR_VERMILLION, linewidth=1.2, label=f"N({mean_val:.3f}, {std_val:.3f})")
+
+    # Reference lines
+    axes[0].axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=f"Mean: {mean_val:.4f}")
+    axes[0].axvline(0, color=COLOR_BLACK, linewidth=0.6, alpha=0.5)
+
+    axes[0].set_xlabel("Residual (True - Pred)", fontsize=8)
+    axes[0].set_ylabel("Density", fontsize=8)
+    axes[0].set_title("Residual Histogram", fontsize=9)
+    axes[0].legend(fontsize=7, framealpha=0.95)
+    _style_axes(axes[0], grid="major")
+
+    # Q-Q plot
+    scipy_stats.probplot(residual, dist="norm", plot=axes[1])
+    axes[1].set_title("Q-Q Plot (Normal)", fontsize=9)
+    axes[1].get_lines()[0].set_markersize(2)
+    axes[1].get_lines()[0].set_color(COLOR_BLUE)
+    axes[1].get_lines()[1].set_color(COLOR_VERMILLION)
+    _style_axes(axes[1], grid="major")
+
+    # Stats box
+    skewness = scipy_stats.skew(residual)
+    kurtosis = scipy_stats.kurtosis(residual)
+    stats_text = f"Skewness: {skewness:.3f}\nKurtosis: {kurtosis:.3f}\nRMSE: {np.sqrt(np.mean(residual**2)):.4f}"
+    axes[0].text(
+        0.98, 0.98, stats_text,
+        transform=axes[0].transAxes, fontsize=7,
+        verticalalignment="top", horizontalalignment="right",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=COLOR_LIGHT_GRAY, alpha=0.95)
+    )
+
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_channel_timeseries(
+    coefficients: np.ndarray,
+    output_path: Path,
+    *,
+    title: str,
+    n_channels: int = 8,
+    reconstructed: Optional[np.ndarray] = None,
+    fs: float = 4.0,
+) -> None:
+    """Plot individual channel time series (first n_channels)."""
+    _apply_publication_style()
+
+    n_ch = min(n_channels, coefficients.shape[0])
+    n_rows = (n_ch + 1) // 2
+
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 2 * n_rows), sharex=True)
+    axes = axes.flatten() if n_rows > 1 else [axes] if n_rows == 1 else axes
+
+    t = np.arange(coefficients.shape[1])
+
+    for i in range(n_ch):
+        ax = axes[i]
+        ax.plot(t, coefficients[i], color=COLOR_BLUE, linewidth=0.6, label="Original")
+        if reconstructed is not None and i < reconstructed.shape[0]:
+            ax.plot(t, reconstructed[i], color=COLOR_ORANGE, linewidth=0.8, alpha=0.8, label="Reconstructed")
+            mae = np.mean(np.abs(coefficients[i] - reconstructed[i]))
+            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=8)
+        else:
+            ax.set_title(f"Channel {i}", fontsize=8)
+        ax.set_ylabel("Value", fontsize=7)
+        _style_axes(ax, grid="major")
+        if i == 0:
+            ax.legend(fontsize=6, loc="upper right", framealpha=0.9)
+
+    # Hide unused axes
+    for i in range(n_ch, len(axes)):
+        axes[i].set_visible(False)
+
+    axes[-2].set_xlabel("Time Steps", fontsize=8)
+    if len(axes) > 1:
+        axes[-1].set_xlabel("Time Steps", fontsize=8)
+
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_error_summary(
+    y_true_np: np.ndarray,
+    y_pred_np: np.ndarray,
+    fhr_st_orig: np.ndarray,
+    fhr_st_recon: Optional[np.ndarray],
+    fhr_ph_orig: np.ndarray,
+    fhr_ph_recon: Optional[np.ndarray],
+    output_path: Path,
+    *,
+    title: str = "Reconstruction Error Summary",
+    metrics: Optional[Dict[str, float]] = None,
+) -> None:
+    """Plot comprehensive error summary with bar charts and statistics."""
+    _apply_publication_style()
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+
+    # 1. FHR reconstruction metrics bar chart
+    ax = axes[0, 0]
+    if metrics:
+        metric_names = ["VAF", "MSE", "SNR", "KLD"]
+        metric_values = [
+            metrics.get("vaf", np.nan),
+            metrics.get("mse", np.nan),
+            metrics.get("snr", np.nan),
+            metrics.get("kld", np.nan),
+        ]
+        colors = [COLOR_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE]
+        bars = ax.bar(metric_names, metric_values, color=colors, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5)
+
+        # Add value labels on bars
+        for bar, val in zip(bars, metric_values):
+            if np.isfinite(val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                        f"{val:.4f}", ha="center", va="bottom", fontsize=7)
+
+        ax.set_ylabel("Value", fontsize=8)
+        ax.set_title("FHR Reconstruction Metrics", fontsize=9)
+        _style_axes(ax, grid="major")
+
+    # 2. Per-channel ST MAE distribution
+    ax = axes[0, 1]
+    if fhr_st_recon is not None:
+        st_mae_per_channel = np.mean(np.abs(fhr_st_orig - fhr_st_recon), axis=1)
+        ax.bar(range(len(st_mae_per_channel)), st_mae_per_channel, color=COLOR_SKY, alpha=0.8,
+               edgecolor=COLOR_BLACK, linewidth=0.3)
+        ax.axhline(np.mean(st_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
+                   linewidth=1.0, label=f"Mean: {np.mean(st_mae_per_channel):.4f}")
+        ax.set_xlabel("ST Channel", fontsize=8)
+        ax.set_ylabel("MAE", fontsize=8)
+        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
+        ax.legend(fontsize=7, framealpha=0.9)
+        _style_axes(ax, grid="major")
+    else:
+        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=8)
+        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
+
+    # 3. Per-channel PH MAE distribution
+    ax = axes[1, 0]
+    if fhr_ph_recon is not None:
+        ph_mae_per_channel = np.mean(np.abs(fhr_ph_orig - fhr_ph_recon), axis=1)
+        ax.bar(range(len(ph_mae_per_channel)), ph_mae_per_channel, color=COLOR_SAGE, alpha=0.8,
+               edgecolor=COLOR_BLACK, linewidth=0.3)
+        ax.axhline(np.mean(ph_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
+                   linewidth=1.0, label=f"Mean: {np.mean(ph_mae_per_channel):.4f}")
+        ax.set_xlabel("PH Channel", fontsize=8)
+        ax.set_ylabel("MAE", fontsize=8)
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
+        ax.legend(fontsize=7, framealpha=0.9)
+        _style_axes(ax, grid="major")
+    else:
+        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=8)
+        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
+
+    # 4. FHR error over time
+    ax = axes[1, 1]
+    residual = y_true_np - y_pred_np
+    window_size = max(1, len(residual) // 50)
+    # Compute rolling MAE
+    rolling_mae = np.array([
+        np.mean(np.abs(residual[max(0, i - window_size):i + window_size + 1]))
+        for i in range(len(residual))
+    ])
+    t = np.arange(len(residual))
+    ax.plot(t, rolling_mae, color=COLOR_PURPLE, linewidth=0.6, label="Rolling MAE")
+    ax.axhline(np.mean(np.abs(residual)), color=COLOR_ORANGE, linestyle="--",
+               linewidth=0.9, label=f"Mean MAE: {np.mean(np.abs(residual)):.4f}")
+    ax.set_xlabel("Sample Index", fontsize=8)
+    ax.set_ylabel("MAE", fontsize=8)
+    ax.set_title("FHR Reconstruction Error Over Time", fontsize=9)
+    ax.legend(fontsize=7, framealpha=0.9)
+    ax.set_xlim(0, len(residual))
+    _style_axes(ax, grid="major")
+
+    fig.suptitle(title, fontsize=10, fontweight="normal", y=0.99)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_all_single_sample_plots(
@@ -768,6 +1233,269 @@ def _plot_all_single_sample_plots(
             logger.debug("Saved single_prediction_windows.svg")
     except Exception as e:
         logger.warning(f"Failed to plot single_prediction_windows: {e}")
+
+    # -------------------------------------------------------------------
+    # 13. Scattering Transform Heatmap (Original)
+    # -------------------------------------------------------------------
+    try:
+        plot_path = sample_dir / "scattering_transform_original.svg"
+        _plot_coefficient_heatmap(
+            fhr_st_np,
+            plot_path,
+            title=f"Scattering Transform Coefficients - GUID: {guid}",
+            ylabel="ST Channel",
+        )
+        plot_paths["scattering_transform_original"] = str(plot_path)
+        logger.debug("Saved scattering_transform_original.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot scattering_transform_original: {e}")
+
+    # -------------------------------------------------------------------
+    # 14. Phase Harmonic Heatmap (Original)
+    # -------------------------------------------------------------------
+    try:
+        plot_path = sample_dir / "phase_harmonic_original.svg"
+        _plot_coefficient_heatmap(
+            fhr_ph_np,
+            plot_path,
+            title=f"Phase Harmonic Coefficients - GUID: {guid}",
+            ylabel="PH Channel",
+        )
+        plot_paths["phase_harmonic_original"] = str(plot_path)
+        logger.debug("Saved phase_harmonic_original.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot phase_harmonic_original: {e}")
+
+    # -------------------------------------------------------------------
+    # 15. Cross-Phase Harmonic Heatmap (UP->FHR)
+    # -------------------------------------------------------------------
+    try:
+        plot_path = sample_dir / "cross_phase_harmonic.svg"
+        _plot_coefficient_heatmap(
+            fhr_up_ph_np,
+            plot_path,
+            title=f"Cross-Phase Harmonics (UP→FHR) - GUID: {guid}",
+            ylabel="Cross-PH Channel",
+        )
+        plot_paths["cross_phase_harmonic"] = str(plot_path)
+        logger.debug("Saved cross_phase_harmonic.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot cross_phase_harmonic: {e}")
+
+    # -------------------------------------------------------------------
+    # 16. Latent Space z Heatmap
+    # -------------------------------------------------------------------
+    try:
+        plot_path = sample_dir / "latent_z_heatmap.svg"
+        _plot_latent_heatmap(
+            latent_np,
+            plot_path,
+            title=f"Latent Space z(t) - GUID: {guid}",
+            warmup_steps=runner.warmup_steps,
+        )
+        plot_paths["latent_z_heatmap"] = str(plot_path)
+        logger.debug("Saved latent_z_heatmap.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot latent_z_heatmap: {e}")
+
+    # -------------------------------------------------------------------
+    # 17. KLD per Latent Dimension
+    # -------------------------------------------------------------------
+    try:
+        if kld_tensor_np is not None:
+            plot_path = sample_dir / "kld_per_dimension.svg"
+            _plot_kld_per_dimension(
+                kld_tensor_np,
+                plot_path,
+                title=f"KLD per Latent Dimension - GUID: {guid}",
+                warmup_steps=runner.warmup_steps,
+            )
+            plot_paths["kld_per_dimension"] = str(plot_path)
+            logger.debug("Saved kld_per_dimension.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot kld_per_dimension: {e}")
+
+    # -------------------------------------------------------------------
+    # 18. Residual Distribution Histogram
+    # -------------------------------------------------------------------
+    try:
+        plot_path = sample_dir / "residual_histogram.svg"
+        _plot_residual_histogram(
+            y_true_np,
+            y_pred_np,
+            plot_path,
+            title=f"Residual Distribution - GUID: {guid}",
+        )
+        plot_paths["residual_histogram"] = str(plot_path)
+        logger.debug("Saved residual_histogram.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot residual_histogram: {e}")
+
+    # -------------------------------------------------------------------
+    # 19. Scattering Transform Channel Time Series
+    # -------------------------------------------------------------------
+    try:
+        recon_st_np, _ = _extract_reconstruction_features(
+            linear_output[idx : idx + 1] if linear_output is not None else None,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+        )
+        plot_path = sample_dir / "st_channel_timeseries.svg"
+        _plot_channel_timeseries(
+            fhr_st_np,
+            plot_path,
+            title=f"Scattering Transform Channels - GUID: {guid}",
+            n_channels=8,
+            reconstructed=recon_st_np,
+            fs=fs,
+        )
+        plot_paths["st_channel_timeseries"] = str(plot_path)
+        logger.debug("Saved st_channel_timeseries.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot st_channel_timeseries: {e}")
+
+    # -------------------------------------------------------------------
+    # 20. Phase Harmonic Channel Time Series
+    # -------------------------------------------------------------------
+    try:
+        _, recon_ph_np_ts = _extract_reconstruction_features(
+            linear_output[idx : idx + 1] if linear_output is not None else None,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+        )
+        plot_path = sample_dir / "ph_channel_timeseries.svg"
+        _plot_channel_timeseries(
+            fhr_ph_np,
+            plot_path,
+            title=f"Phase Harmonic Channels - GUID: {guid}",
+            n_channels=8,
+            reconstructed=recon_ph_np_ts,
+            fs=fs,
+        )
+        plot_paths["ph_channel_timeseries"] = str(plot_path)
+        logger.debug("Saved ph_channel_timeseries.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot ph_channel_timeseries: {e}")
+
+    # -------------------------------------------------------------------
+    # 21. ST Reconstruction Error Heatmap
+    # -------------------------------------------------------------------
+    try:
+        recon_st_np_err, _ = _extract_reconstruction_features(
+            linear_output[idx : idx + 1] if linear_output is not None else None,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+        )
+        if recon_st_np_err is not None:
+            plot_path = sample_dir / "st_reconstruction_error.svg"
+            _plot_coefficient_error_heatmap(
+                fhr_st_np,
+                recon_st_np_err,
+                plot_path,
+                title=f"ST Reconstruction Error - GUID: {guid}",
+                ylabel="ST Channel",
+            )
+            plot_paths["st_reconstruction_error"] = str(plot_path)
+            logger.debug("Saved st_reconstruction_error.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot st_reconstruction_error: {e}")
+
+    # -------------------------------------------------------------------
+    # 22. PH Reconstruction Error Heatmap
+    # -------------------------------------------------------------------
+    try:
+        _, recon_ph_np_err = _extract_reconstruction_features(
+            linear_output[idx : idx + 1] if linear_output is not None else None,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+        )
+        if recon_ph_np_err is not None:
+            plot_path = sample_dir / "ph_reconstruction_error.svg"
+            _plot_coefficient_error_heatmap(
+                fhr_ph_np,
+                recon_ph_np_err,
+                plot_path,
+                title=f"PH Reconstruction Error - GUID: {guid}",
+                ylabel="PH Channel",
+            )
+            plot_paths["ph_reconstruction_error"] = str(plot_path)
+            logger.debug("Saved ph_reconstruction_error.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot ph_reconstruction_error: {e}")
+
+    # -------------------------------------------------------------------
+    # 23. Coherence Spectrum (FHR Original vs Reconstructed)
+    # -------------------------------------------------------------------
+    try:
+        freqs_coh, coh_vals = compute_stft_coherence(y_true_np, y_pred_np, fs=fs, nperseg=256)
+        if freqs_coh.size > 0 and coh_vals.size > 0:
+            plot_path = sample_dir / "coherence_spectrum.svg"
+            plot_coherence_spectrum(
+                freqs_coh,
+                coh_vals,
+                plot_path,
+                title=f"Coherence Spectrum (FHR Orig vs Recon) - GUID: {guid}",
+                max_freq=0.5,
+            )
+            plot_paths["coherence_spectrum"] = str(plot_path)
+            logger.debug("Saved coherence_spectrum.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot coherence_spectrum: {e}")
+
+    # -------------------------------------------------------------------
+    # 24. UP-FHR Coherence Analysis (if UP available)
+    # -------------------------------------------------------------------
+    try:
+        up_np_check = up_raw[0].detach().cpu().numpy()
+        if np.any(up_np_check != 0):
+            # Compute coherence between UP and original FHR
+            freqs_up_fhr_orig, coh_up_fhr_orig = compute_stft_coherence(
+                up_np_check, y_true_np, fs=fs, nperseg=256
+            )
+            # Compute coherence between UP and reconstructed FHR
+            freqs_up_fhr_recon, coh_up_fhr_recon = compute_stft_coherence(
+                up_np_check, y_pred_np, fs=fs, nperseg=256
+            )
+            if freqs_up_fhr_orig.size > 0:
+                plot_path = sample_dir / "up_fhr_coherence.svg"
+                plot_coherence_analysis(
+                    freqs_up_fhr_orig,
+                    coh_up_fhr_orig,
+                    coh_up_fhr_recon,
+                    sample_dir,
+                    filename="up_fhr_coherence.svg",
+                )
+                plot_paths["up_fhr_coherence"] = str(plot_path)
+                logger.debug("Saved up_fhr_coherence.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot up_fhr_coherence: {e}")
+
+    # -------------------------------------------------------------------
+    # 25. Combined Error Statistics Summary
+    # -------------------------------------------------------------------
+    try:
+        # Get ST and PH reconstructions for error summary
+        recon_st_for_summary, recon_ph_for_summary = _extract_reconstruction_features(
+            linear_output[idx : idx + 1] if linear_output is not None else None,
+            st_channels=fhr_st_np.shape[0],
+            ph_channels=fhr_ph_np.shape[0],
+        )
+        plot_path = sample_dir / "error_summary.svg"
+        _plot_error_summary(
+            y_true_np=y_true_np,
+            y_pred_np=y_pred_np,
+            fhr_st_orig=fhr_st_np,
+            fhr_st_recon=recon_st_for_summary,
+            fhr_ph_orig=fhr_ph_np,
+            fhr_ph_recon=recon_ph_for_summary,
+            output_path=plot_path,
+            title=f"Error Summary - GUID: {guid}",
+            metrics=sample_dict["metrics"],
+        )
+        plot_paths["error_summary"] = str(plot_path)
+        logger.debug("Saved error_summary.svg")
+    except Exception as e:
+        logger.warning(f"Failed to plot error_summary: {e}")
 
     return plot_paths
 
