@@ -456,16 +456,37 @@ def _plot_summary_comparison(
 # OUTPUT SAVING
 # ============================================================================
 
+def _convert_to_json_serializable(obj: Any) -> Any:
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {key: _convert_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_to_json_serializable(item) for item in obj]
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
+
+
 def _save_results(
     results: Dict[str, Any],
     labels: List[str],
     output_dir: Path,
 ) -> None:
     """Save statistical results in JSON, CSV, and text formats."""
+    # Convert numpy types to native Python types for JSON serialization
+    results_serializable = _convert_to_json_serializable(results)
+
     # JSON (full results)
     json_path = output_dir / "statistical_results.json"
     with open(json_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results_serializable, f, indent=2)
     logger.info(f"\nSaved full results: {json_path}")
 
     # CSV (summary table)
