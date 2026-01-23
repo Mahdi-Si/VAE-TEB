@@ -854,6 +854,8 @@ def _plot_all_single_sample_plots(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Amplitude")
     ax.legend(loc="upper right", framealpha=0.95)
+    ax.set_xlim(t_raw[0], t_raw[-1])
+    ax.margins(x=0.0)
     _style_axes(ax, grid="both")
 
     ax = axes[1]
@@ -916,6 +918,8 @@ def _plot_all_single_sample_plots(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized Amplitude")
     ax.legend(loc="upper right", framealpha=0.95)
+    ax.set_xlim(t_raw[0], t_raw[-1])
+    ax.margins(x=0.0)
     _style_axes(ax, grid="both")
 
     ax = axes[7]
@@ -934,6 +938,8 @@ def _plot_all_single_sample_plots(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized Amplitude")
     ax.legend(loc="upper right", framealpha=0.95)
+    ax.set_xlim(t_raw[0], t_raw[-1])
+    ax.margins(x=0.0)
     _style_axes(ax, grid="both")
 
     guid = _extract_guid(batch, idx)
