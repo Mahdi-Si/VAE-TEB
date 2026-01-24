@@ -314,6 +314,11 @@ def plot_metric_histograms(
         ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal", pad=8)
+
+        # Use log scale for KLD x-axis by default
+        if col == "kld":
+            ax.set_xscale('log')
+
         _style_axes(ax, grid="major", minor_ticks=False)
         _tighten_xaxis(ax, values)
         ax.set_ylim(bottom=0.0)
