@@ -168,12 +168,13 @@ def main():
         shuffle=True,
         stats_path=stat_path,
         normalize_fields=normalized_fields,
+        prefetch_factor=dataloader_config.get('prefetch_factor', 2),
         pin_memory=True,
         rank=0,
         world_size=1,
         **dataset_kwargs
     )
-    
+
     validation_dataloader = create_optimized_dataloader(
         hdf5_files=dataset_config.get('vae_test_datasets', []),
         batch_size=config['general_config']['batch_size']['test'],
@@ -181,6 +182,7 @@ def main():
         shuffle=False,
         stats_path=stat_path,
         normalize_fields=normalized_fields,
+        prefetch_factor=dataloader_config.get('prefetch_factor', 2),
         rank=0,
         world_size=1,
         **dataset_kwargs
