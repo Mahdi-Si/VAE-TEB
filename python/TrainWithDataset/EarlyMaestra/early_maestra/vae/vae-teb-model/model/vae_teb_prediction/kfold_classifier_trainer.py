@@ -265,6 +265,7 @@ def train_single_fold(
             shuffle=True,
             stats_path=stat_path,
             normalize_fields=normalized_fields,
+            prefetch_factor=dataloader_config.get('prefetch_factor', 2),
             pin_memory=True,
             rank=0,
             world_size=1,
@@ -278,6 +279,7 @@ def train_single_fold(
             shuffle=False,
             stats_path=stat_path,
             normalize_fields=normalized_fields,
+            prefetch_factor=dataloader_config.get('prefetch_factor', 2),
             pin_memory=True,
             rank=0,
             world_size=1,
@@ -346,8 +348,6 @@ def train_single_fold(
             fill_missing_epochs,
             generate_three_metric_type_analysis,
         )
-        from pathlib import Path
-
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         evaluation_dir = fold_output_dir / "evaluation"
         evaluation_dir.mkdir(parents=True, exist_ok=True)
@@ -400,6 +400,7 @@ def train_single_fold(
             shuffle=False,
             stats_path=stat_path,
             normalize_fields=normalized_fields,
+            prefetch_factor=dataloader_config.get('prefetch_factor', 2),
             pin_memory=True,
             rank=0,
             world_size=1,

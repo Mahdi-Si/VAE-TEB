@@ -127,7 +127,8 @@ dataset_config:
   # DataLoader Configuration
   # -------------------------------------------------------------------------
   dataloader_config:
-    num_workers: 0                        # Number of data loading workers (0 for main process)
+    num_workers: 4                        # Number of data loading workers (0 for main process)
+    prefetch_factor: 4                    # Batches to prefetch per worker (default 2, higher reduces GPU starvation)
     normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
 
     dataset_kwargs:
@@ -149,7 +150,7 @@ dataset_config:
       epoch_min: -23000                   # Minimum epoch to include
       epoch_max: null                     # Maximum epoch to include (null = no limit)
       label: null                         # Filter by label (null = all)
-      cache_size: 1000                    # Number of samples to cache in memory
+      cache_size: 10000                   # Number of samples to cache in memory
       trim_minutes: 2.0                   # Trim N minutes from start/end of recordings
 
 
