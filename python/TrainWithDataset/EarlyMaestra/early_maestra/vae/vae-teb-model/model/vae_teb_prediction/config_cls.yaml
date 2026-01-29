@@ -9,7 +9,8 @@
 general_config:
   tag: vae_classification_run_8           # Experiment identifier for logging/output dirs
 
-  cuda_devices: [0]                       # GPU device IDs to use
+  cuda_devices: [0, 1, 2, 3, 4]           # GPU device IDs to use (one per parallel fold)
+  max_parallel_folds: 5                    # Max folds to run in parallel (set 1 for sequential)
   lr: 0.00001                             # Learning rate (reduce to 0.00005 for frozen VAE)
   lr_milestone: [100]                     # Epochs at which to decay learning rate
   checkpoint_frequency: 1                 # Save checkpoint every N epochs

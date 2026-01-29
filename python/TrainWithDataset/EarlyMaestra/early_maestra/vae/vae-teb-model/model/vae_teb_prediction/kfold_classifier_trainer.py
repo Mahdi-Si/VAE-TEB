@@ -21,6 +21,7 @@ from loguru import logger
 import json
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import numpy as np
 import h5py
 
@@ -660,7 +661,8 @@ def run_kfold_parallel(
             logger.info(f"Fold {fold_id} completed: {result}")
     else:
         logger.info("Running folds in parallel...")
-        with ProcessPoolExecutor(max_workers=max_parallel) as executor:
+        spawn_ctx = multiprocessing.get_context('spawn')
+        with ProcessPoolExecutor(max_workers=max_parallel, mp_context=spawn_ctx) as executor:
             futures = {}
             for job_idx, fold_id in enumerate(selected_folds):
                 gpu_id = gpu_ids[job_idx % len(gpu_ids)]
@@ -871,19 +873,20 @@ def main():
     dataset_cfg = base_config.get('dataset_config', {})
 
     GPU_IDS = general_cfg.get('cuda_devices', [0])
+    MAX_PARALLEL = general_cfg.get('max_parallel_folds', 1)
     OUTPUT_BASE_DIR = general_cfg.get('folders_config', {}).get('out_dir_base', os.getcwd())
     VAE_CHECKPOINT = model_cfg.get('classifier', {}).get('vae_checkpoint')
     KFOLD_BASE_PATH = dataset_cfg.get('kfold_base_path', '')
     NUM_FOLDS = dataset_cfg.get('num_folds', 10)
     FOLDS_TO_RUN = dataset_cfg.get('fold_ids', None)  # null = all folds
 
-    # Sequential mode (set to True for parallel execution)
-    RUN_IN_PARALLEL = False
+    RUN_IN_PARALLEL = MAX_PARALLEL > 1
 
     logger.info(f"Config file: {BASE_CONFIG_PATH}")
     logger.info(f"Output base dir: {OUTPUT_BASE_DIR}")
     logger.info(f"K-fold base path: {KFOLD_BASE_PATH}")
     logger.info(f"GPU IDs: {GPU_IDS}")
+    logger.info(f"Max parallel folds: {MAX_PARALLEL}")
     logger.info(f"Num folds: {NUM_FOLDS}")
     logger.info(f"Fold IDs: {FOLDS_TO_RUN if FOLDS_TO_RUN else 'all'}")
 
@@ -904,7 +907,7 @@ def main():
         kfold_base_path=KFOLD_BASE_PATH,
         output_base_dir=OUTPUT_BASE_DIR,
         vae_checkpoint=VAE_CHECKPOINT,
-        max_parallel=1,  # Sequential mode
+        max_parallel=MAX_PARALLEL,
         fold_ids=FOLDS_TO_RUN,
         sequential=not RUN_IN_PARALLEL,
     )
