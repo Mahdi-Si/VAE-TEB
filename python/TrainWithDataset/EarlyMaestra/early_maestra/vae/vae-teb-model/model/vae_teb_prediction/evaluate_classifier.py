@@ -9,6 +9,7 @@ After training completes:
 Saves: guid, epoch, target, binary_target, predicted_class, prob_class_0, prob_class_1
 """
 
+import os
 import torch
 import pandas as pd
 import numpy as np
@@ -4148,15 +4149,17 @@ if __name__ == '__main__':
     # ==========================================================================
     # Post-Training Evaluation Pipeline
     # ==========================================================================
-    # Evaluation settings (target_fpr, exclude_last_minutes, decision_time_hours,
-    # max_gap_multiplier) are read from CONFIG_PATH. You can override them by
-    # passing explicit values to main().
+    # All settings (target_fpr, exclude_last_minutes, decision_time_hours,
+    # max_gap_multiplier, fold_ids) are read from config_cls.yaml.
+    # You can override them by passing explicit values to main().
 
-    # Path to config file (contains evaluation settings)
-    CONFIG_PATH = r"C:\Users\mahdi\Desktop\teb_vae_model\model\vae_teb_prediction\config_cls.yaml"
+    # Path to config file (same directory as this script)
+    CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_cls.yaml")
 
-    # Output directory containing fold_1, fold_2, ..., fold_N
-    OUTPUT_BASE_DIR = r"C:\Users\mahdi\Desktop\teb_vae_model\outputs\kfold_results"
+    # Read output_base_dir from config
+    with open(CONFIG_PATH, 'r') as _f:
+        _cfg = yaml.safe_load(_f)
+    OUTPUT_BASE_DIR = _cfg.get('general_config', {}).get('folders_config', {}).get('out_dir_base', os.getcwd())
 
     # Runtime options (not in config)
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'

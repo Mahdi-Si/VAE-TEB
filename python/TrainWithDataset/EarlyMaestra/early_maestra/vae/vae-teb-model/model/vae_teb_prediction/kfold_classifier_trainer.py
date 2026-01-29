@@ -848,39 +848,45 @@ def main():
     """
     Main entry point for k-fold cross-validation.
 
+    All settings are read from config_cls.yaml. Override here only if needed.
+
     Usage:
         python kfold_classifier_trainer.py
     """
-    BASE_CONFIG_PATH = "config.yaml"
-    KFOLD_BASE_PATH = "/data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset"
-    OUTPUT_BASE_DIR = "/data/deid/isilon/MS_model/classifier_kfold_results"
-    VAE_CHECKPOINT = None
+    # Path to the classifier config file
+    BASE_CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "config_cls.yaml"
+    )
 
-    GPU_IDS = [0]           # Single GPU for sequential mode
-    NUM_FOLDS = 10
-    # MAX_PARALLEL = 8      # Not used in sequential mode
-    RUN_IN_PARALLEL = False  # Sequential mode (set to True for parallel)
-    FOLDS_TO_RUN = None     # Read from config, or override here e.g. [1, 3, 5]
+    if not os.path.exists(BASE_CONFIG_PATH):
+        raise FileNotFoundError(f"Config file not found: {BASE_CONFIG_PATH}")
 
-    if os.path.exists(BASE_CONFIG_PATH):
-        with open(BASE_CONFIG_PATH, 'r') as f:
-            base_config = yaml.safe_load(f)
-            # Read VAE checkpoint
-            vae_ckpt = base_config.get('model_config', {}).get('classifier', {}).get('vae_checkpoint')
-            if vae_ckpt:
-                VAE_CHECKPOINT = vae_ckpt
-            # Read dataset config
-            dataset_cfg = base_config.get('dataset_config', {})
-            if dataset_cfg.get('kfold_base_path'):
-                KFOLD_BASE_PATH = dataset_cfg['kfold_base_path']
-            if dataset_cfg.get('num_folds'):
-                NUM_FOLDS = dataset_cfg['num_folds']
-            # Read fold_ids from config (which folds to run)
-            if dataset_cfg.get('fold_ids') is not None:
-                FOLDS_TO_RUN = dataset_cfg['fold_ids']
-                logger.info(f"Using fold_ids from config: {FOLDS_TO_RUN}")
+    with open(BASE_CONFIG_PATH, 'r') as f:
+        base_config = yaml.safe_load(f)
 
-    # Validate VAE checkpoint exists before starting folds
+    # Read settings from config
+    general_cfg = base_config.get('general_config', {})
+    model_cfg = base_config.get('model_config', {})
+    dataset_cfg = base_config.get('dataset_config', {})
+
+    GPU_IDS = general_cfg.get('cuda_devices', [0])
+    OUTPUT_BASE_DIR = general_cfg.get('folders_config', {}).get('out_dir_base', os.getcwd())
+    VAE_CHECKPOINT = model_cfg.get('classifier', {}).get('vae_checkpoint')
+    KFOLD_BASE_PATH = dataset_cfg.get('kfold_base_path', '')
+    NUM_FOLDS = dataset_cfg.get('num_folds', 10)
+    FOLDS_TO_RUN = dataset_cfg.get('fold_ids', None)  # null = all folds
+
+    # Sequential mode (set to True for parallel execution)
+    RUN_IN_PARALLEL = False
+
+    logger.info(f"Config file: {BASE_CONFIG_PATH}")
+    logger.info(f"Output base dir: {OUTPUT_BASE_DIR}")
+    logger.info(f"K-fold base path: {KFOLD_BASE_PATH}")
+    logger.info(f"GPU IDs: {GPU_IDS}")
+    logger.info(f"Num folds: {NUM_FOLDS}")
+    logger.info(f"Fold IDs: {FOLDS_TO_RUN if FOLDS_TO_RUN else 'all'}")
+
+    # Validate VAE checkpoint
     if VAE_CHECKPOINT:
         if not os.path.exists(VAE_CHECKPOINT):
             raise FileNotFoundError(f"VAE checkpoint not found: {VAE_CHECKPOINT}")
@@ -889,10 +895,6 @@ def main():
         logger.warning("No VAE checkpoint specified - will attempt to train from scratch")
 
     logger.info("Starting K-Fold Cross-Validation for Classifier")
-    if FOLDS_TO_RUN:
-        logger.info(f"Running specific folds: {FOLDS_TO_RUN}")
-    else:
-        logger.info(f"Running all {NUM_FOLDS} folds")
 
     results = run_kfold_parallel(
         num_folds=NUM_FOLDS,
