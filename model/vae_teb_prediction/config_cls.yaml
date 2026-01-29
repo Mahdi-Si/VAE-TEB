@@ -116,6 +116,7 @@ dataset_config:
   # Label mapping: healthy -> target 1 -> class 0, acidosis/HIE -> target 2/3 -> class 1
   kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
   num_folds: 10
+  fold_ids: null                          # Which folds to run/evaluate: null = all, or list e.g. [1, 3, 9]
 
   # These are populated dynamically by kfold_classifier_trainer.py for each fold
   classifier_train_datasets: []

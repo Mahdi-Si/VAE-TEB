@@ -856,18 +856,29 @@ def main():
     OUTPUT_BASE_DIR = "/data/deid/isilon/MS_model/classifier_kfold_results"
     VAE_CHECKPOINT = None
 
-    GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
+    GPU_IDS = [0]           # Single GPU for sequential mode
     NUM_FOLDS = 10
-    MAX_PARALLEL = 8
-    RUN_IN_PARALLEL = True  # Set to False to run folds sequentially
-    FOLDS_TO_RUN = None     # Example: [1, 3, 5] to run only specific folds
+    # MAX_PARALLEL = 8      # Not used in sequential mode
+    RUN_IN_PARALLEL = False  # Sequential mode (set to True for parallel)
+    FOLDS_TO_RUN = None     # Read from config, or override here e.g. [1, 3, 5]
 
     if os.path.exists(BASE_CONFIG_PATH):
         with open(BASE_CONFIG_PATH, 'r') as f:
             base_config = yaml.safe_load(f)
+            # Read VAE checkpoint
             vae_ckpt = base_config.get('model_config', {}).get('classifier', {}).get('vae_checkpoint')
             if vae_ckpt:
                 VAE_CHECKPOINT = vae_ckpt
+            # Read dataset config
+            dataset_cfg = base_config.get('dataset_config', {})
+            if dataset_cfg.get('kfold_base_path'):
+                KFOLD_BASE_PATH = dataset_cfg['kfold_base_path']
+            if dataset_cfg.get('num_folds'):
+                NUM_FOLDS = dataset_cfg['num_folds']
+            # Read fold_ids from config (which folds to run)
+            if dataset_cfg.get('fold_ids') is not None:
+                FOLDS_TO_RUN = dataset_cfg['fold_ids']
+                logger.info(f"Using fold_ids from config: {FOLDS_TO_RUN}")
 
     # Validate VAE checkpoint exists before starting folds
     if VAE_CHECKPOINT:
@@ -878,6 +889,10 @@ def main():
         logger.warning("No VAE checkpoint specified - will attempt to train from scratch")
 
     logger.info("Starting K-Fold Cross-Validation for Classifier")
+    if FOLDS_TO_RUN:
+        logger.info(f"Running specific folds: {FOLDS_TO_RUN}")
+    else:
+        logger.info(f"Running all {NUM_FOLDS} folds")
 
     results = run_kfold_parallel(
         num_folds=NUM_FOLDS,
@@ -886,7 +901,7 @@ def main():
         kfold_base_path=KFOLD_BASE_PATH,
         output_base_dir=OUTPUT_BASE_DIR,
         vae_checkpoint=VAE_CHECKPOINT,
-        max_parallel=MAX_PARALLEL,
+        max_parallel=1,  # Sequential mode
         fold_ids=FOLDS_TO_RUN,
         sequential=not RUN_IN_PARALLEL,
     )
