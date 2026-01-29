@@ -89,7 +89,8 @@ dataset_config:
     classifier_test_datasets: []   # Populated per fold (test/*.hdf5)
 
     dataloader_config:
-      num_workers: 0
+      num_workers: 4
+      prefetch_factor: 4
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
       dataset_kwargs:
         load_fields:
@@ -112,7 +113,7 @@ dataset_config:
         epoch_min: null
         epoch_max: -23000
         label: null
-        cache_size: 1000
+        cache_size: 10000
         trim_minutes: 2.0
 
 
