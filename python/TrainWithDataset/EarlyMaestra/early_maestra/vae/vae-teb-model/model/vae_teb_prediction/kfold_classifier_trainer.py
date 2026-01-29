@@ -346,8 +346,6 @@ def train_single_fold(
             fill_missing_epochs,
             generate_three_metric_type_analysis,
         )
-        from pathlib import Path
-
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         evaluation_dir = fold_output_dir / "evaluation"
         evaluation_dir.mkdir(parents=True, exist_ok=True)
