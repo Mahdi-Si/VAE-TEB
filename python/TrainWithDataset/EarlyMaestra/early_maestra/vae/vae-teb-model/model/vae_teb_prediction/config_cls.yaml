@@ -1,0 +1,218 @@
+# =============================================================================
+# Classifier Training and Evaluation Configuration
+# =============================================================================
+# This config is used by:
+#   - kfold_classifier_trainer.py (k-fold cross-validation training)
+#   - evaluate_classifier.py (post-training evaluation pipeline)
+# =============================================================================
+
+general_config:
+  tag: vae_classification_run_8           # Experiment identifier for logging/output dirs
+
+  cuda_devices: [0]                       # GPU device IDs to use
+  lr: 0.00001                             # Learning rate (reduce to 0.00005 for frozen VAE)
+  lr_milestone: [100]                     # Epochs at which to decay learning rate
+  checkpoint_frequency: 1                 # Save checkpoint every N epochs
+  plot_frequency: 1                       # Generate plots every N epochs
+  epochs: 1000                            # Maximum training epochs
+  accumulate_grad_batches: 1              # Gradient accumulation steps
+  batch_size:
+    train: 200
+    test: 200
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure
+
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model_config:
+  # VAE model settings (for reconstruction loss if not frozen)
+  VAE_model:
+    beta_schedule: constant               # Options: 'constant', 'linear', 'cyclic'
+    beta_start: 0.0                       # Starting beta for annealing schedules
+    beta_end: 1.0                         # Final beta for annealing schedules
+    beta_anneal_epochs: 50                # Epochs for linear annealing
+    beta_cycle_len: 1000                  # Cycle length for cyclic annealing
+    beta_const_val: 0.005                 # Constant beta value (when schedule='constant')
+    kld_beta: 0.1                         # Fallback beta value
+
+  # Pre-trained VAE checkpoint for latent space extraction
+  core_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
+
+  # -------------------------------------------------------------------------
+  # Classifier Configuration
+  # -------------------------------------------------------------------------
+  classifier:
+    vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
+    type: lstm                            # Options: 'lstm', 'bilstm', 'bilstm_attention', 'cnn', 'transformer'
+    latent_dim: 16                        # VAE latent dimension (must match checkpoint)
+    num_classes: 2                        # Binary classification (healthy vs unhealthy)
+    freeze_vae: true                      # Freeze VAE weights during classifier training
+    use_posterior: true                   # Use posterior mean (true) or prior samples (false)
+    sample_latent: false                  # Sample from posterior distribution
+
+    # Architecture parameters (shared)
+    hidden_dim: 128                       # Hidden dimension for LSTM/BiLSTM
+    num_layers: 3                         # Number of recurrent layers
+    dropout: 0.1                          # Dropout rate
+
+    # LSTM-specific
+    bidirectional: false                  # Use bidirectional LSTM
+
+    # Attention-specific
+    attn_dim: 64                          # Attention dimension for BiLSTMAttention
+
+    # CNN-specific
+    num_filters: 64                       # Number of CNN filters
+    kernel_sizes: [3, 5, 7]               # CNN kernel sizes
+
+    # Transformer-specific
+    d_model: 128                          # Transformer model dimension
+    n_heads: 4                            # Number of attention heads
+    dim_feedforward: 256                  # Feedforward network dimension
+    pooling: mean                         # Pooling strategy: 'mean' or 'cls'
+
+    # -----------------------------------------------------------------------
+    # Evaluation Settings
+    # -----------------------------------------------------------------------
+    evaluation:
+      # Threshold optimization
+      target_fpr: 0.2                     # Target false positive rate (0.2 = 20%)
+      decision_time_hours: 1.0            # Time window for threshold optimization (hours before birth)
+
+      # Time-based analysis
+      exclude_last_minutes: 30            # Exclude last N minutes from time-binned plots
+
+      # Epoch gap handling
+      max_gap_multiplier: null            # Max gap = multiplier * typical_interval; null fills all gaps
+
+      # Plot generation
+      generate_plots: true                # Generate visualization plots
+
+      # Threshold computation options
+      compute_both_thresholds: true       # Compute both epoch-level and GUID-level thresholds
+
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+dataset_config:
+  # Pre-training datasets (for VAE training, not classifier)
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+
+  # Normalization statistics file
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+  # -------------------------------------------------------------------------
+  # K-Fold Cross-Validation Configuration
+  # -------------------------------------------------------------------------
+  # Label mapping: healthy -> target 1 -> class 0, acidosis/HIE -> target 2/3 -> class 1
+  kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+  num_folds: 10
+
+  # These are populated dynamically by kfold_classifier_trainer.py for each fold
+  classifier_train_datasets: []
+  classifier_val_datasets: []
+  classifier_test_datasets: []
+
+  # -------------------------------------------------------------------------
+  # DataLoader Configuration
+  # -------------------------------------------------------------------------
+  dataloader_config:
+    num_workers: 0                        # Number of data loading workers (0 for main process)
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+
+    dataset_kwargs:
+      load_fields:
+        - fhr                             # Fetal heart rate
+        - up                              # Uterine pressure
+        - fhr_st                          # FHR short-term variability
+        - fhr_ph                          # FHR phase
+        - fhr_up_ph                       # FHR-UP phase relationship
+        - target                          # Label (1=healthy, 2=acidosis, 3=HIE)
+        - weight                          # Sample weight
+        - epoch                           # Time epoch index
+        - cs_label                        # C-section label
+        - bg_label                        # Blood gas label
+        - guid                            # Patient identifier
+      allowed_guids: null                 # Filter to specific GUIDs (null = all)
+      cs_label: null                      # Filter by C-section label (null = all)
+      bg_label: null                      # Filter by blood gas label (null = all)
+      epoch_min: -23000                   # Minimum epoch to include
+      epoch_max: null                     # Maximum epoch to include (null = no limit)
+      label: null                         # Filter by label (null = all)
+      cache_size: 1000                    # Number of samples to cache in memory
+      trim_minutes: 2.0                   # Trim N minutes from start/end of recordings
+
+
+# =============================================================================
+# Advanced Configuration
+# =============================================================================
+# precision: "16-mixed" for faster training on modern GPUs; "32-true" for stability
+# gradient_clip_val/algorithm: Clip gradients to prevent exploding gradients
+# sync_batchnorm: Enable for multi-GPU training only
+# deterministic/benchmark: Trade reproducibility for speed
+
+advanced_config:
+  trainer:
+    precision: "32-true"                  # "32-true" or "16-mixed"
+    gradient_clip_val: 0.5                # Max gradient norm (0 to disable)
+    gradient_clip_algorithm: "norm"       # "norm" or "value"
+    sync_batchnorm: false                 # Sync BatchNorm across GPUs (multi-GPU only)
+    deterministic: false                  # Deterministic mode (slower but reproducible)
+    benchmark: true                       # cuDNN autotuning (faster for fixed input sizes)
+
+  memory:
+    enable_memory_monitoring: false       # Enable GPU memory monitoring
+    memory_threshold_gb: 60.0             # Warning threshold in GB
+    memory_log_frequency: 500             # Log memory every N steps
+
+  # -------------------------------------------------------------------------
+  # MLflow Tracking
+  # -------------------------------------------------------------------------
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-k-fold-run-8
+      run_name: null                      # Auto-generated if null
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae_classifier_run_8
+        stage: dev
+
+  # -------------------------------------------------------------------------
+  # Callbacks
+  # -------------------------------------------------------------------------
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 30
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 1000
+
+    reconstruction_plotting:
+      enabled: false
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: true
+      plot_frequency: 10
