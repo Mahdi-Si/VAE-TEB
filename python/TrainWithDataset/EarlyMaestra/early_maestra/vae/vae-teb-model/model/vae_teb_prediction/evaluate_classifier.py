@@ -2840,6 +2840,7 @@ def main(
     exclude_last_minutes: Optional[float] = None,
     max_gap_multiplier: Optional[float] = None,
     decision_time_hours: Optional[float] = None,
+    fold_ids: Optional[List[int]] = None,
     regenerate_predictions: bool = False,
     aggregate_only: bool = False
 ):
@@ -2865,6 +2866,8 @@ def main(
                           If None, reads from config.
         decision_time_hours: Time window for threshold optimization (hours before birth).
                            If None, reads from config or defaults to 1.0.
+        fold_ids: List of fold IDs to evaluate (e.g., [1, 3, 9]).
+                 If None, reads from config or evaluates all available folds.
         regenerate_predictions: If True, regenerate predictions even if cached
                                predictions exist (default: False)
         aggregate_only: If True, skip evaluation and only generate aggregated plots
@@ -2916,11 +2919,13 @@ def main(
 
     # Load evaluation settings from config file if provided
     eval_cfg = {}
+    dataset_cfg = {}
     if config_path and Path(config_path).exists():
         logger.info(f"Loading evaluation config from: {config_path}")
         with open(config_path, 'r') as f:
             config_data = yaml.safe_load(f)
         eval_cfg = config_data.get('model_config', {}).get('classifier', {}).get('evaluation', {}) or {}
+        dataset_cfg = config_data.get('dataset_config', {}) or {}
         logger.info(f"Loaded evaluation settings: {eval_cfg}")
 
     # Apply config values with parameter overrides (explicit params take priority)
@@ -2928,6 +2933,7 @@ def main(
     exclude_last_minutes = exclude_last_minutes if exclude_last_minutes is not None else float(eval_cfg.get('exclude_last_minutes', 30.0))
     max_gap_multiplier = max_gap_multiplier if max_gap_multiplier is not None else eval_cfg.get('max_gap_multiplier', None)
     decision_time_hours = decision_time_hours if decision_time_hours is not None else float(eval_cfg.get('decision_time_hours', 1.0))
+    fold_ids = fold_ids if fold_ids is not None else dataset_cfg.get('fold_ids', None)
 
     # If aggregate_only mode, delegate to aggregate_existing_results
     if aggregate_only:
@@ -2948,19 +2954,28 @@ def main(
     logger.info(f"Device: {device}")
     logger.info(f"Exclude last minutes: {exclude_last_minutes}")
     logger.info(f"Max gap multiplier: {max_gap_multiplier}")
+    logger.info(f"Fold IDs: {fold_ids if fold_ids else 'all'}")
     logger.info(f"Regenerate predictions: {regenerate_predictions}")
     logger.info("="*80)
 
     # Find all fold directories (fold_1, fold_2, ..., fold_N)
-    fold_dirs = sorted(
+    all_fold_dirs = sorted(
         [d for d in output_base_dir.iterdir() if d.is_dir() and d.name.startswith('fold_')],
         key=lambda x: int(x.name.split('_')[1])
     )
 
-    if not fold_dirs:
+    if not all_fold_dirs:
         raise FileNotFoundError(f"No fold directories found in {output_base_dir}")
 
-    logger.info(f"Found {len(fold_dirs)} fold directories: {[d.name for d in fold_dirs]}")
+    # Filter to specific fold_ids if provided
+    if fold_ids:
+        fold_dirs = [d for d in all_fold_dirs if int(d.name.split('_')[1]) in fold_ids]
+        if not fold_dirs:
+            raise ValueError(f"None of the requested fold_ids {fold_ids} found in {output_base_dir}")
+        logger.info(f"Found {len(all_fold_dirs)} fold directories, evaluating {len(fold_dirs)}: {[d.name for d in fold_dirs]}")
+    else:
+        fold_dirs = all_fold_dirs
+        logger.info(f"Found {len(fold_dirs)} fold directories: {[d.name for d in fold_dirs]}")
 
     # Process each fold
     all_fold_results = []
@@ -4157,12 +4172,13 @@ if __name__ == '__main__':
             config_path=CONFIG_PATH,
             device=DEVICE,
             regenerate_predictions=REGENERATE_PREDICTIONS,
-            aggregate_only=False
+            aggregate_only=False,
             # Optional overrides (uncomment to override config values):
             # target_fpr=0.15,
             # exclude_last_minutes=30.0,
             # decision_time_hours=1.0,
             # max_gap_multiplier=None,
+            # fold_ids=[1, 3, 9],  # Only evaluate specific folds
         )
         print("\nEvaluation pipeline completed!")
         print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
