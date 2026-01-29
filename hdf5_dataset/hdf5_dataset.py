@@ -415,10 +415,30 @@ class CombinedHDF5Dataset(Dataset):
             normalized_fields = list(self.normalization_stats.keys())
             print(f"Normalization enabled for fields: {normalized_fields}")
 
+    def __getstate__(self):
+        """Exclude unpicklable threading locks and open file handles for multiprocessing."""
+        state = self.__dict__.copy()
+        # Remove threading locks (cannot be pickled)
+        state['_handle_locks'] = None
+        state['_cache_lock'] = None
+        # Remove open HDF5 file handles (cannot be shared across processes)
+        state['file_handles'] = [None] * len(self.paths)
+        # Clear cache (each worker builds its own)
+        state['_cache'] = {}
+        return state
+
+    def __setstate__(self, state):
+        """Recreate threading locks and file handles after unpickling in worker process."""
+        self.__dict__.update(state)
+        # Recreate locks
+        self._handle_locks = [threading.Lock() for _ in self.paths]
+        self._cache_lock = threading.Lock()
+        # File handles remain None — will be lazily opened on first access
+
     def _load_normalization_stats(self):
         """
         Load normalization statistics from HDF5 file.
-        
+
         The stats file should be created by DatasetStatsCalculator.save_stats().
         """
         if not os.path.exists(self.stats_path):
