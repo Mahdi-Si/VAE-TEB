@@ -872,6 +872,7 @@ def create_optimized_dataloader(
     world_size: int = 1,
     stats_path: Optional[str] = None,
     normalize_fields: Optional[Sequence[str]] = None,
+    prefetch_factor: int = 2,
     **dataset_kwargs
 ) -> torch.utils.data.DataLoader:
     """
@@ -926,7 +927,7 @@ def create_optimized_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         drop_last=False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         multiprocessing_context='spawn' if num_workers > 0 else None,
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=attribute_dict_collate
