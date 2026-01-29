@@ -24,6 +24,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import h5py
 
+from model.vae_teb_prediction.evaluate_classifier import generate_aggregated_plots
+
 
 def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
     """
@@ -344,18 +346,18 @@ def train_single_fold(
             fill_missing_epochs,
             generate_three_metric_type_analysis,
         )
-        import pandas as pd
         from pathlib import Path
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         evaluation_dir = fold_output_dir / "evaluation"
         evaluation_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get evaluation config
+        # Get evaluation config (from config file, with kwargs override)
         eval_cfg = config.get('model_config', {}).get('classifier', {}).get('evaluation', {}) or {}
-        target_fpr = float(kwargs.get('target_fpr', 0.15))  # Default 15% FPR
+        target_fpr = float(kwargs.get('target_fpr', eval_cfg.get('target_fpr', 0.15)))
         exclude_last_minutes = float(eval_cfg.get('exclude_last_minutes', 30.0))
         max_gap_multiplier = eval_cfg.get('max_gap_multiplier', None)
+        decision_time_hours = float(eval_cfg.get('decision_time_hours', 1.0))
 
         # --------------------------------------------------------------------
         # VALIDATION SET INFERENCE
@@ -366,13 +368,13 @@ def train_single_fold(
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
         # --------------------------------------------------------------------
-        # FIND PRIMARY THRESHOLD (committed_overall @ 1h)
+        # FIND PRIMARY THRESHOLD (committed_overall @ decision_time_hours)
         # --------------------------------------------------------------------
-        logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr})...")
+        logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
         primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
             val_df_raw,
             target_fpr=target_fpr,
-            time_window_hours=1.0,
+            time_window_hours=decision_time_hours,
             fallback_tolerance_hours=0.5
         )
         logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
@@ -801,8 +803,23 @@ def run_kfold_parallel(
             logger.info("CROSS-FOLD AGGREGATION")
             logger.info("=" * 80)
             logger.info(f"Completed folds: {completed_fold_ids}")
-            logger.info("Note: Cross-fold aggregation for three metric types will be implemented in future update")
-            logger.info("Individual fold results are available in each fold's 'three_metric_types' directory")
+
+            successful_results = [r for r in all_results if r['status'] == 'success']
+
+            try:
+                generate_aggregated_plots(
+                    all_fold_results=successful_results,
+                    output_base_dir=Path(output_base_dir),
+                    n_folds=len(successful_results)
+                )
+                logger.info("Cross-fold aggregation completed successfully")
+                logger.info(f"Aggregated plots saved to: {Path(output_base_dir) / 'aggregated_plots'}")
+            except Exception as e:
+                logger.error(f"Cross-fold aggregation failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                logger.warning("Individual fold results still available in each fold's 'three_metric_types' directory")
+
             logger.info("=" * 80)
         else:
             logger.warning("No successful folds to aggregate")

@@ -258,7 +258,7 @@ def plot_metric_histograms(
         ("vaf", "Variance Accounted For (VAF)", COLOR_BLUE, ""),
         ("mse", "Mean Squared Error (MSE)", COLOR_GREEN, ""),
         ("snr", "Signal-to-Noise Ratio (SNR)", COLOR_ORANGE, "dB"),
-        ("kld", "Transfer Entropy (KLD)", COLOR_PURPLE, "bits"),
+        ("kld", "Transfer Entropy (KLD)", COLOR_PURPLE, "nats"),
     ]
 
     for ax, (col, title, color, unit) in zip(axes, metrics_config):

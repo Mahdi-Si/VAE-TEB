@@ -1894,6 +1894,7 @@ def plot_single_metric_type(
     2. sensitivity_specificity_vs_time.png - Sensitivity + Specificity
     3. sensitivity_fpr_vs_time.png - Sensitivity + FPR
     4. all_metrics_vs_time.png - All three metrics together
+    5. fpr_vs_time.png - FPR only (emphasized metric)
 
     Args:
         metrics_df: DataFrame with columns ['bin_center', 'sensitivity', 'specificity', 'fpr']
@@ -2016,6 +2017,25 @@ def plot_single_metric_type(
     plt.savefig(output_dir / "all_metrics_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"  Saved: {output_dir.name}/all_metrics_vs_time.png")
+
+    # --- Plot 5: FPR Only (emphasized metric) ---
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(x, valid_df['fpr'], marker='^', label='FPR',
+            color=colors['fpr'], linewidth=2.5, markersize=6)
+    ax.set_xlabel('Hours Before Birth', fontsize=13)
+    ax.set_ylabel('FPR', fontsize=13)
+    title = f'FPR vs Time - {metric_label}'
+    if title_suffix:
+        title += f' ({title_suffix})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig(output_dir / "fpr_vs_time.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  Saved: {output_dir.name}/fpr_vs_time.png")
 
 
 def plot_all_metric_types_for_fold(
@@ -2814,10 +2834,12 @@ def aggregate_existing_results(
 
 def main(
     output_base_dir: str,
-    target_fpr: float = 0.15,
+    config_path: Optional[str] = None,
+    target_fpr: Optional[float] = None,
     device: str = 'cuda:0',
-    exclude_last_minutes: float = 30.0,
+    exclude_last_minutes: Optional[float] = None,
     max_gap_multiplier: Optional[float] = None,
+    decision_time_hours: Optional[float] = None,
     regenerate_predictions: bool = False,
     aggregate_only: bool = False
 ):
@@ -2831,13 +2853,18 @@ def main(
     Args:
         output_base_dir: Base directory containing fold_1, fold_2, ..., fold_N
                         subdirectories with trained models and configs
-        target_fpr: Target false positive rate for threshold optimization
-                   (default: 0.15 = 15% FPR)
+        config_path: Optional path to config file (e.g., config_cls.yaml).
+                    If provided, evaluation settings are read from config.
+                    Explicit parameters override config values.
+        target_fpr: Target false positive rate for threshold optimization.
+                   If None, reads from config or defaults to 0.15.
         device: Device to run inference on (default: 'cuda:0')
         exclude_last_minutes: Exclude last N minutes before birth from time-based
-                            analysis (default: 30.0 minutes)
-        max_gap_multiplier: Maximum gap multiplier for epoch filling
-                          (default: None = use config or auto-detect)
+                            analysis. If None, reads from config or defaults to 30.0.
+        max_gap_multiplier: Maximum gap multiplier for epoch filling.
+                          If None, reads from config.
+        decision_time_hours: Time window for threshold optimization (hours before birth).
+                           If None, reads from config or defaults to 1.0.
         regenerate_predictions: If True, regenerate predictions even if cached
                                predictions exist (default: False)
         aggregate_only: If True, skip evaluation and only generate aggregated plots
@@ -2867,13 +2894,13 @@ def main(
             threshold_info.json
             three_metric_types/
                 instantaneous/
-                    [4 plots per metric type]
+                    [5 plots per metric type]
                 committed_cumulative/
-                    [4 plots per metric type]
+                    [5 plots per metric type]
                 committed_overall/  (PRIMARY METRIC)
-                    [4 plots per metric type]
+                    [5 plots per metric type]
                     subgroups/
-                        [8 subgroup comparison plots]
+                        [subgroup comparison plots]
                 comparison/
                     metric_type_comparison.png
                 metrics_summary.json
@@ -2887,6 +2914,21 @@ def main(
     if not output_base_dir.exists():
         raise FileNotFoundError(f"Output base directory not found: {output_base_dir}")
 
+    # Load evaluation settings from config file if provided
+    eval_cfg = {}
+    if config_path and Path(config_path).exists():
+        logger.info(f"Loading evaluation config from: {config_path}")
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        eval_cfg = config_data.get('model_config', {}).get('classifier', {}).get('evaluation', {}) or {}
+        logger.info(f"Loaded evaluation settings: {eval_cfg}")
+
+    # Apply config values with parameter overrides (explicit params take priority)
+    target_fpr = target_fpr if target_fpr is not None else float(eval_cfg.get('target_fpr', 0.15))
+    exclude_last_minutes = exclude_last_minutes if exclude_last_minutes is not None else float(eval_cfg.get('exclude_last_minutes', 30.0))
+    max_gap_multiplier = max_gap_multiplier if max_gap_multiplier is not None else eval_cfg.get('max_gap_multiplier', None)
+    decision_time_hours = decision_time_hours if decision_time_hours is not None else float(eval_cfg.get('decision_time_hours', 1.0))
+
     # If aggregate_only mode, delegate to aggregate_existing_results
     if aggregate_only:
         return aggregate_existing_results(
@@ -2899,11 +2941,14 @@ def main(
     logger.info("POST-TRAINING EVALUATION PIPELINE")
     logger.info("="*80)
     logger.info(f"Output base directory: {output_base_dir}")
+    if config_path:
+        logger.info(f"Config file: {config_path}")
     logger.info(f"Target FPR: {target_fpr}")
+    logger.info(f"Decision time (hours): {decision_time_hours}")
     logger.info(f"Device: {device}")
     logger.info(f"Exclude last minutes: {exclude_last_minutes}")
+    logger.info(f"Max gap multiplier: {max_gap_multiplier}")
     logger.info(f"Regenerate predictions: {regenerate_predictions}")
-    logger.info(f"Aggregate only: {aggregate_only}")
     logger.info("="*80)
 
     # Find all fold directories (fold_1, fold_2, ..., fold_N)
@@ -2938,6 +2983,7 @@ def main(
                 device=device,
                 exclude_last_minutes=exclude_last_minutes,
                 max_gap_multiplier=max_gap_multiplier,
+                decision_time_hours=decision_time_hours,
                 regenerate_predictions=regenerate_predictions
             )
 
@@ -3012,6 +3058,7 @@ def _evaluate_single_fold(
     device: str,
     exclude_last_minutes: float,
     max_gap_multiplier: Optional[float],
+    decision_time_hours: float,
     regenerate_predictions: bool
 ) -> Dict:
     """
@@ -3024,6 +3071,7 @@ def _evaluate_single_fold(
         device: Device to run inference on
         exclude_last_minutes: Minutes to exclude from analysis
         max_gap_multiplier: Maximum gap multiplier for epoch filling
+        decision_time_hours: Time window for threshold optimization (hours before birth)
         regenerate_predictions: Whether to regenerate predictions
 
     Returns:
@@ -3066,11 +3114,11 @@ def _evaluate_single_fold(
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
     # Find PRIMARY threshold on validation set
-    logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr})...")
+    logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
     primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
         val_df_raw,
         target_fpr=target_fpr,
-        time_window_hours=1.0,
+        time_window_hours=decision_time_hours,
         max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=0.5
     )
@@ -3640,11 +3688,12 @@ def plot_aggregated_metric_type(
     """
     Plot aggregated metrics for a single metric type with min/max error bands.
 
-    Generates 4 plots:
+    Generates 5 plots:
     1. Sensitivity vs time with min/max band
     2. Sensitivity + Specificity vs time with bands
     3. Sensitivity + FPR vs time with bands
     4. All metrics vs time with bands
+    5. FPR only vs time with band (emphasized metric)
 
     Args:
         aggregated_df: Aggregated DataFrame with mean, min, max columns
@@ -3784,7 +3833,28 @@ def plot_aggregated_metric_type(
     plt.savefig(output_dir / 'all_metrics_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    logger.info(f"  Saved 4 aggregated plots for {metric_type} to {output_dir}")
+    # Plot 5: FPR Only (emphasized metric)
+    if 'fpr_mean' in valid_df.columns:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+                'r-^', linewidth=2.5, markersize=6, label='Mean FPR',
+                markerfacecolor='red', markeredgecolor='darkred')
+        ax.fill_between(valid_df['bin_center'],
+                        valid_df['fpr_min'],
+                        valid_df['fpr_max'],
+                        alpha=0.3, color='red', label='Min-Max Range')
+        ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
+        ax.set_ylabel('FPR', fontsize=14, fontweight='bold')
+        ax.set_title(f'{metric_type_title} - FPR vs Time\n(Aggregated across {n_folds} folds)',
+                     fontsize=16, fontweight='bold')
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+        plt.tight_layout()
+        plt.savefig(output_dir / 'fpr_vs_time_aggregated.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    logger.info(f"  Saved 5 aggregated plots for {metric_type} to {output_dir}")
 
 
 def plot_aggregated_subgroup_comparison(
@@ -4060,15 +4130,23 @@ def generate_aggregated_plots(
 
 
 if __name__ == '__main__':
-    # Example usage for post-training evaluation
-    # Modify these parameters as needed for your setup
+    # ==========================================================================
+    # Post-Training Evaluation Pipeline
+    # ==========================================================================
+    # Evaluation settings (target_fpr, exclude_last_minutes, decision_time_hours,
+    # max_gap_multiplier) are read from CONFIG_PATH. You can override them by
+    # passing explicit values to main().
 
+    # Path to config file (contains evaluation settings)
+    CONFIG_PATH = r"C:\Users\mahdi\Desktop\teb_vae_model\model\vae_teb_prediction\config_cls.yaml"
+
+    # Output directory containing fold_1, fold_2, ..., fold_N
     OUTPUT_BASE_DIR = r"C:\Users\mahdi\Desktop\teb_vae_model\outputs\kfold_results"
-    TARGET_FPR = 0.15  # 15% FPR target
+
+    # Runtime options (not in config)
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    EXCLUDE_LAST_MINUTES = 30.0  # Exclude last 30 minutes before birth
     REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
-    AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots from existing results
+    AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots
 
     # ============================================================================
     # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
@@ -4076,11 +4154,15 @@ if __name__ == '__main__':
     if not AGGREGATE_ONLY:
         results = main(
             output_base_dir=OUTPUT_BASE_DIR,
-            target_fpr=TARGET_FPR,
+            config_path=CONFIG_PATH,
             device=DEVICE,
-            exclude_last_minutes=EXCLUDE_LAST_MINUTES,
             regenerate_predictions=REGENERATE_PREDICTIONS,
             aggregate_only=False
+            # Optional overrides (uncomment to override config values):
+            # target_fpr=0.15,
+            # exclude_last_minutes=30.0,
+            # decision_time_hours=1.0,
+            # max_gap_multiplier=None,
         )
         print("\nEvaluation pipeline completed!")
         print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
@@ -4090,18 +4172,17 @@ if __name__ == '__main__':
     # MODE 2: Aggregate Only (generate aggregated plots from existing results)
     # ============================================================================
     else:
-        # Option A: Use main() with aggregate_only=True
         results = main(
             output_base_dir=OUTPUT_BASE_DIR,
-            aggregate_only=True,
-            exclude_last_minutes=EXCLUDE_LAST_MINUTES
+            config_path=CONFIG_PATH,
+            aggregate_only=True
         )
 
-        # Option B: Use aggregate_existing_results() directly
+        # Alternative: Use aggregate_existing_results() directly
         # results = aggregate_existing_results(
         #     output_base_dir=OUTPUT_BASE_DIR,
         #     regenerate_from_predictions=True,
-        #     exclude_last_minutes=EXCLUDE_LAST_MINUTES
+        #     exclude_last_minutes=30.0
         # )
 
         print("\nAggregation completed!")
