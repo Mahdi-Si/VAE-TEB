@@ -31,6 +31,7 @@ from model.vae_teb_prediction.prediction_classification_model import (
     VaeTebTimeSeriesClassifier,
     BiLSTMAttentionClassifier,
     LSTMClassifier,
+    CNNLSTMClassifier,
     CNN1DClassifier,
     TransformerClassifier,
 )
@@ -173,14 +174,58 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
     classifier_type = classifier_config.get('type', 'lstm')
     latent_dim = classifier_config.get('latent_dim', 16)
     num_classes = classifier_config.get('num_classes', 2)
-    classifier = LSTMClassifier(
-        input_dim=latent_dim,
-        num_classes=num_classes,
-        hidden_dim=classifier_config.get('hidden_dim', 128),
-        num_layers=classifier_config.get('num_layers', 2),
-        bidirectional=classifier_config.get('bidirectional', False),
-        dropout=classifier_config.get('dropout', 0.1),
-    )
+
+    if classifier_type == 'lstm':
+        classifier = LSTMClassifier(
+            input_dim=latent_dim,
+            num_classes=num_classes,
+            hidden_dim=classifier_config.get('hidden_dim', 128),
+            num_layers=classifier_config.get('num_layers', 2),
+            bidirectional=classifier_config.get('bidirectional', False),
+            dropout=classifier_config.get('dropout', 0.1),
+        )
+    elif classifier_type == 'cnn_lstm':
+        classifier = CNNLSTMClassifier(
+            input_dim=latent_dim,
+            num_classes=num_classes,
+            num_filters=classifier_config.get('num_filters', 32),
+            kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
+            cnn_out_dim=classifier_config.get('cnn_out_dim', 64),
+            lstm_hidden=classifier_config.get('lstm_hidden', 128),
+            lstm_layers=classifier_config.get('lstm_layers', 2),
+            dropout=classifier_config.get('dropout', 0.1),
+            pooling=classifier_config.get('pooling', 'mean_max'),
+        )
+    elif classifier_type == 'cnn':
+        classifier = CNN1DClassifier(
+            input_dim=latent_dim,
+            num_classes=num_classes,
+            num_filters=classifier_config.get('num_filters', 64),
+            kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
+            dropout=classifier_config.get('dropout', 0.1),
+        )
+    elif classifier_type == 'bilstm_attention':
+        classifier = BiLSTMAttentionClassifier(
+            input_dim=latent_dim,
+            num_classes=num_classes,
+            hidden_dim=classifier_config.get('hidden_dim', 128),
+            num_layers=classifier_config.get('num_layers', 1),
+            attn_dim=classifier_config.get('attn_dim', 64),
+            dropout=classifier_config.get('dropout', 0.1),
+        )
+    elif classifier_type == 'transformer':
+        classifier = TransformerClassifier(
+            input_dim=latent_dim,
+            num_classes=num_classes,
+            d_model=classifier_config.get('d_model', 128),
+            n_heads=classifier_config.get('n_heads', 4),
+            num_layers=classifier_config.get('num_layers', 2),
+            dim_feedforward=classifier_config.get('dim_feedforward', 256),
+            dropout=classifier_config.get('dropout', 0.1),
+            pooling=classifier_config.get('pooling', 'mean'),
+        )
+    else:
+        raise ValueError(f"Unknown classifier type: {classifier_type}")
 
     model = VaeTebTimeSeriesClassifier(
         vae_model=vae_model,
@@ -4067,6 +4112,13 @@ def generate_aggregated_plots(
                 f'{metric_type.replace("_", " ").title()} - Diagnosis Comparison',
                 n_folds
             )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_diagnosis,
+                subgroup_output_dir / 'diagnosis_comparison_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Diagnosis Comparison (FPR)',
+                n_folds,
+                metric='fpr'
+            )
 
         # Unhealthy CS stratification
         unhealthy_cs = ['unhealthy_cs_pos', 'unhealthy_cs_neg']
@@ -4077,6 +4129,13 @@ def generate_aggregated_plots(
                 subgroup_output_dir / 'unhealthy_cs_stratification_aggregated.png',
                 f'{metric_type.replace("_", " ").title()} - Unhealthy: CS Stratification',
                 n_folds
+            )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_unhealthy_cs,
+                subgroup_output_dir / 'unhealthy_cs_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Unhealthy: CS Stratification (FPR)',
+                n_folds,
+                metric='fpr'
             )
 
         # HIE CS stratification
@@ -4089,6 +4148,13 @@ def generate_aggregated_plots(
                 f'{metric_type.replace("_", " ").title()} - HIE: CS Stratification',
                 n_folds
             )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_hie_cs,
+                subgroup_output_dir / 'hie_cs_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - HIE: CS Stratification (FPR)',
+                n_folds,
+                metric='fpr'
+            )
 
         # Acidosis CS stratification
         acidosis_cs = ['acidosis_cs_pos', 'acidosis_cs_neg']
@@ -4100,6 +4166,13 @@ def generate_aggregated_plots(
                 f'{metric_type.replace("_", " ").title()} - Acidosis: CS Stratification',
                 n_folds
             )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_cs,
+                subgroup_output_dir / 'acidosis_cs_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: CS Stratification (FPR)',
+                n_folds,
+                metric='fpr'
+            )
 
         # Acidosis BG stratification
         acidosis_bg = ['acidosis_bg_pos', 'acidosis_bg_neg']
@@ -4110,6 +4183,13 @@ def generate_aggregated_plots(
                 subgroup_output_dir / 'acidosis_bg_stratification_aggregated.png',
                 f'{metric_type.replace("_", " ").title()} - Acidosis: BG Stratification',
                 n_folds
+            )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_acidosis_bg,
+                subgroup_output_dir / 'acidosis_bg_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Acidosis: BG Stratification (FPR)',
+                n_folds,
+                metric='fpr'
             )
 
         # Healthy CS stratification (use specificity instead of sensitivity)
@@ -4123,6 +4203,13 @@ def generate_aggregated_plots(
                 n_folds,
                 metric='specificity'
             )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_cs,
+                subgroup_output_dir / 'healthy_cs_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: CS Stratification (FPR)',
+                n_folds,
+                metric='fpr'
+            )
 
         # Healthy BG stratification (use specificity)
         healthy_bg = ['healthy_bg_pos', 'healthy_bg_neg']
@@ -4134,6 +4221,13 @@ def generate_aggregated_plots(
                 f'{metric_type.replace("_", " ").title()} - Healthy: BG Stratification',
                 n_folds,
                 metric='specificity'
+            )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg,
+                subgroup_output_dir / 'healthy_bg_stratification_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG Stratification (FPR)',
+                n_folds,
+                metric='fpr'
             )
 
         # Healthy BG×CS combinations (use specificity)
@@ -4147,6 +4241,13 @@ def generate_aggregated_plots(
                 f'{metric_type.replace("_", " ").title()} - Healthy: BG×CS Combinations',
                 n_folds,
                 metric='specificity'
+            )
+            plot_aggregated_subgroup_comparison(
+                aggregated_subgroups, available_healthy_bg_cs,
+                subgroup_output_dir / 'healthy_bg_cs_combinations_fpr_aggregated.png',
+                f'{metric_type.replace("_", " ").title()} - Healthy: BG×CS Combinations (FPR)',
+                n_folds,
+                metric='fpr'
             )
 
     logger.info(f"Aggregated plots saved to: {aggregated_dir}")
