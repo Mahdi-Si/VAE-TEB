@@ -202,7 +202,133 @@ class CNN1DClassifier(BaseTimeSeriesClassifier):
 
 
 # ---------------------------------------------------------------------
-# 3. BiLSTM + self-attention classifier
+# 3. CNN-LSTM hybrid classifier
+# ---------------------------------------------------------------------
+class CNNLSTMClassifier(BaseTimeSeriesClassifier):
+    """
+    CNN-LSTM hybrid classifier for time series classification.
+
+    Architecture:
+        1. Multi-kernel CNN extracts local multi-scale patterns from VAE latent trajectories
+        2. BiLSTM captures bidirectional temporal context
+        3. Configurable pooling aggregates over time
+        4. MLP classification head
+
+    Input: (B, T, D) — T timesteps of D-dim VAE latent features
+    Output: dict with "logits", "probs", "preds"
+    """
+    def __init__(
+        self,
+        input_dim: int = 16,
+        num_classes: int = 2,
+        num_filters: int = 32,
+        kernel_sizes: Sequence[int] = (3, 5, 7),
+        cnn_out_dim: int = 64,
+        lstm_hidden: int = 128,
+        lstm_layers: int = 2,
+        dropout: float = 0.1,
+        pooling: str = "mean_max",
+        mlp_multiplier: float = 2.0,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__(input_dim, num_classes)
+        self.pooling = pooling.lower()
+
+        # --- CNN feature extraction (parallel multi-kernel) ---
+        self.conv_branches = nn.ModuleList()
+        for k in kernel_sizes:
+            self.conv_branches.append(nn.Sequential(
+                nn.Conv1d(input_dim, num_filters, kernel_size=k, padding=k // 2),
+                nn.BatchNorm1d(num_filters),
+                nn.GELU(),
+            ))
+
+        concat_filters = num_filters * len(kernel_sizes)
+        self.cnn_projection = nn.Sequential(
+            nn.Conv1d(concat_filters, cnn_out_dim, kernel_size=1),
+            nn.BatchNorm1d(cnn_out_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # --- BiLSTM temporal modeling ---
+        self.lstm = nn.LSTM(
+            input_size=cnn_out_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+        lstm_out_dim = lstm_hidden * 2  # bidirectional
+        self.lstm_norm = nn.LayerNorm(lstm_out_dim) if use_layer_norm else nn.Identity()
+
+        # --- Pooling ---
+        if self.pooling == "mean_max":
+            pooled_dim = lstm_out_dim * 2
+        elif self.pooling == "concat":
+            pooled_dim = lstm_out_dim * 2
+        else:
+            pooled_dim = lstm_out_dim
+
+        # --- FC classification head ---
+        hidden_fc = max(int(pooled_dim * mlp_multiplier), pooled_dim)
+        head_layers = []
+        if use_layer_norm:
+            head_layers.append(nn.LayerNorm(pooled_dim))
+        head_layers.extend([
+            nn.Linear(pooled_dim, hidden_fc),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_fc, num_classes),
+        ])
+        self.classifier = nn.Sequential(*head_layers)
+
+    def forward(self, x):
+        # x: (B, T, D)
+        h = x.transpose(1, 2)  # (B, D, T)
+
+        # Parallel multi-kernel CNN
+        branch_outs = [branch(h) for branch in self.conv_branches]
+        h = torch.cat(branch_outs, dim=1)  # (B, concat_filters, T)
+
+        # Project to cnn_out_dim
+        h = self.cnn_projection(h)  # (B, cnn_out_dim, T)
+        h = h.transpose(1, 2)  # (B, T, cnn_out_dim)
+
+        # BiLSTM
+        lstm_out, _ = self.lstm(h)  # (B, T, lstm_out_dim)
+        lstm_out = self.lstm_norm(lstm_out)
+
+        # Pooling
+        if self.pooling == "mean":
+            features = lstm_out.mean(dim=1)
+        elif self.pooling == "max":
+            features, _ = torch.max(lstm_out, dim=1)
+        elif self.pooling == "mean_max":
+            mean_val = lstm_out.mean(dim=1)
+            max_val, _ = torch.max(lstm_out, dim=1)
+            features = torch.cat([mean_val, max_val], dim=1)
+        elif self.pooling == "concat":
+            last_state = lstm_out[:, -1, :]
+            mean_state = lstm_out.mean(dim=1)
+            features = torch.cat([last_state, mean_state], dim=1)
+        else:
+            features = lstm_out[:, -1, :]
+
+        logits = self.classifier(features)
+        probs = F.softmax(logits, dim=-1)
+        preds = probs.argmax(dim=-1)
+
+        return {
+            "logits": logits,
+            "probs": probs,
+            "preds": preds,
+        }
+
+
+# ---------------------------------------------------------------------
+# 4. BiLSTM + self-attention classifier
 # ---------------------------------------------------------------------
 class BiLSTMAttentionClassifier(BaseTimeSeriesClassifier):
     """
