@@ -16,6 +16,7 @@ from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
 from model.vae_teb_prediction.prediction_classification_model import (
     VaeTebTimeSeriesClassifier,
     LSTMClassifier,
+    CNNLSTMClassifier,
     CNN1DClassifier,
     BiLSTMAttentionClassifier,
     TransformerClassifier,
@@ -159,14 +160,57 @@ class GraphModelClassifierTrainer(GraphModelBase):
         use_posterior = classifier_config.get('use_posterior', True)
         sample_latent = classifier_config.get('sample_latent', False)
 
-        classifier = LSTMClassifier(
-            input_dim=latent_dim,
-            num_classes=num_classes,
-            hidden_dim=classifier_config.get('hidden_dim', 128),
-            num_layers=classifier_config.get('num_layers', 2),
-            bidirectional=classifier_config.get('bidirectional', False),
-            dropout=classifier_config.get('dropout', 0.1),
-        )
+        if classifier_type == 'lstm':
+            classifier = LSTMClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                hidden_dim=classifier_config.get('hidden_dim', 128),
+                num_layers=classifier_config.get('num_layers', 2),
+                bidirectional=classifier_config.get('bidirectional', False),
+                dropout=classifier_config.get('dropout', 0.1),
+            )
+        elif classifier_type == 'cnn_lstm':
+            classifier = CNNLSTMClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                num_filters=classifier_config.get('num_filters', 32),
+                kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
+                cnn_out_dim=classifier_config.get('cnn_out_dim', 64),
+                lstm_hidden=classifier_config.get('lstm_hidden', 128),
+                lstm_layers=classifier_config.get('lstm_layers', 2),
+                dropout=classifier_config.get('dropout', 0.1),
+                pooling=classifier_config.get('pooling', 'mean_max'),
+            )
+        elif classifier_type == 'cnn':
+            classifier = CNN1DClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                num_filters=classifier_config.get('num_filters', 64),
+                kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
+                dropout=classifier_config.get('dropout', 0.1),
+            )
+        elif classifier_type == 'bilstm_attention':
+            classifier = BiLSTMAttentionClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                hidden_dim=classifier_config.get('hidden_dim', 128),
+                num_layers=classifier_config.get('num_layers', 1),
+                attn_dim=classifier_config.get('attn_dim', 64),
+                dropout=classifier_config.get('dropout', 0.1),
+            )
+        elif classifier_type == 'transformer':
+            classifier = TransformerClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                d_model=classifier_config.get('d_model', 128),
+                n_heads=classifier_config.get('n_heads', 4),
+                num_layers=classifier_config.get('num_layers', 2),
+                dim_feedforward=classifier_config.get('dim_feedforward', 256),
+                dropout=classifier_config.get('dropout', 0.1),
+                pooling=classifier_config.get('pooling', 'mean'),
+            )
+        else:
+            raise ValueError(f"Unknown classifier type: {classifier_type}")
 
         logger.info(f"Created classifier: {classifier_type}")
 

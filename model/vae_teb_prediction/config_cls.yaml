@@ -47,7 +47,7 @@ model_config:
   # -------------------------------------------------------------------------
   classifier:
     vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
-    type: lstm                            # Options: 'lstm', 'bilstm', 'bilstm_attention', 'cnn', 'transformer'
+    type: cnn_lstm                        # Options: 'lstm', 'cnn_lstm', 'bilstm', 'bilstm_attention', 'cnn', 'transformer'
     latent_dim: 16                        # VAE latent dimension (must match checkpoint)
     num_classes: 2                        # Binary classification (healthy vs unhealthy)
     freeze_vae: true                      # Freeze VAE weights during classifier training
@@ -65,15 +65,22 @@ model_config:
     # Attention-specific
     attn_dim: 64                          # Attention dimension for BiLSTMAttention
 
-    # CNN-specific
-    num_filters: 64                       # Number of CNN filters
+    # CNN-specific (also used by CNN-LSTM as per-branch filter count)
+    num_filters: 32                       # Number of CNN filters (32 per-branch for cnn_lstm, 64 for standalone cnn)
     kernel_sizes: [3, 5, 7]               # CNN kernel sizes
+
+    # CNN-LSTM specific
+    cnn_out_dim: 64                       # Projected CNN output dimension
+    lstm_hidden: 128                      # LSTM hidden dim per direction (BiLSTM)
+    lstm_layers: 2                        # Number of stacked LSTM layers
+
+    # Pooling (used by cnn_lstm and transformer)
+    pooling: mean_max                     # Pooling strategy: 'mean_max'/'mean'/'max'/'last' (cnn_lstm), 'mean'/'cls' (transformer)
 
     # Transformer-specific
     d_model: 128                          # Transformer model dimension
     n_heads: 4                            # Number of attention heads
     dim_feedforward: 256                  # Feedforward network dimension
-    pooling: mean                         # Pooling strategy: 'mean' or 'cls'
 
     # -----------------------------------------------------------------------
     # Evaluation Settings
