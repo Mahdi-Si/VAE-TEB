@@ -3729,8 +3729,9 @@ def plot_aggregated_metric_type(
         logger.warning(f"No valid data to plot for aggregated {metric_type}")
         return
 
-    # Sort by bin_center (descending for plotting - far from birth to birth)
-    valid_df = valid_df.sort_values('bin_center', ascending=False)
+    # Sort by bin_center descending and extract x as NumPy array (matches per-fold plots)
+    valid_df = valid_df.sort_values('bin_center', ascending=False).reset_index(drop=True)
+    x = valid_df['bin_center'].values
 
     metric_type_title = {
         'instantaneous': 'Instantaneous',
@@ -3740,11 +3741,11 @@ def plot_aggregated_metric_type(
 
     # Plot 1: Sensitivity vs Time
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+    ax.plot(x, valid_df['sensitivity_mean'].values,
             'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
-    ax.fill_between(valid_df['bin_center'],
-                     valid_df['sensitivity_min'],
-                     valid_df['sensitivity_max'],
+    ax.fill_between(x,
+                     valid_df['sensitivity_min'].values,
+                     valid_df['sensitivity_max'].values,
                      alpha=0.3, color='blue', label='Min-Max Range')
     ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
     ax.set_ylabel('Sensitivity', fontsize=14, fontweight='bold')
@@ -3760,19 +3761,19 @@ def plot_aggregated_metric_type(
 
     # Plot 2: Sensitivity + Specificity
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+    ax.plot(x, valid_df['sensitivity_mean'].values,
             'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
-    ax.fill_between(valid_df['bin_center'],
-                     valid_df['sensitivity_min'],
-                     valid_df['sensitivity_max'],
+    ax.fill_between(x,
+                     valid_df['sensitivity_min'].values,
+                     valid_df['sensitivity_max'].values,
                      alpha=0.3, color='blue')
 
     if 'specificity_mean' in valid_df.columns:
-        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+        ax.plot(x, valid_df['specificity_mean'].values,
                 'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
-        ax.fill_between(valid_df['bin_center'],
-                         valid_df['specificity_min'],
-                         valid_df['specificity_max'],
+        ax.fill_between(x,
+                         valid_df['specificity_min'].values,
+                         valid_df['specificity_max'].values,
                          alpha=0.3, color='green')
 
     ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
@@ -3789,19 +3790,19 @@ def plot_aggregated_metric_type(
 
     # Plot 3: Sensitivity + FPR
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+    ax.plot(x, valid_df['sensitivity_mean'].values,
             'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
-    ax.fill_between(valid_df['bin_center'],
-                     valid_df['sensitivity_min'],
-                     valid_df['sensitivity_max'],
+    ax.fill_between(x,
+                     valid_df['sensitivity_min'].values,
+                     valid_df['sensitivity_max'].values,
                      alpha=0.3, color='blue')
 
     if 'fpr_mean' in valid_df.columns:
-        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+        ax.plot(x, valid_df['fpr_mean'].values,
                 'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
-        ax.fill_between(valid_df['bin_center'],
-                         valid_df['fpr_min'],
-                         valid_df['fpr_max'],
+        ax.fill_between(x,
+                         valid_df['fpr_min'].values,
+                         valid_df['fpr_max'].values,
                          alpha=0.3, color='red')
 
     ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
@@ -3818,27 +3819,27 @@ def plot_aggregated_metric_type(
 
     # Plot 4: All metrics
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(valid_df['bin_center'], valid_df['sensitivity_mean'],
+    ax.plot(x, valid_df['sensitivity_mean'].values,
             'b-o', linewidth=2.5, markersize=6, label='Mean Sensitivity', markerfacecolor='blue', markeredgecolor='darkblue')
-    ax.fill_between(valid_df['bin_center'],
-                     valid_df['sensitivity_min'],
-                     valid_df['sensitivity_max'],
+    ax.fill_between(x,
+                     valid_df['sensitivity_min'].values,
+                     valid_df['sensitivity_max'].values,
                      alpha=0.2, color='blue')
 
     if 'specificity_mean' in valid_df.columns:
-        ax.plot(valid_df['bin_center'], valid_df['specificity_mean'],
+        ax.plot(x, valid_df['specificity_mean'].values,
                 'g-s', linewidth=2.5, markersize=6, label='Mean Specificity', markerfacecolor='green', markeredgecolor='darkgreen')
-        ax.fill_between(valid_df['bin_center'],
-                         valid_df['specificity_min'],
-                         valid_df['specificity_max'],
+        ax.fill_between(x,
+                         valid_df['specificity_min'].values,
+                         valid_df['specificity_max'].values,
                          alpha=0.2, color='green')
 
     if 'fpr_mean' in valid_df.columns:
-        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+        ax.plot(x, valid_df['fpr_mean'].values,
                 'r-^', linewidth=2.5, markersize=6, label='Mean FPR', markerfacecolor='red', markeredgecolor='darkred')
-        ax.fill_between(valid_df['bin_center'],
-                         valid_df['fpr_min'],
-                         valid_df['fpr_max'],
+        ax.fill_between(x,
+                         valid_df['fpr_min'].values,
+                         valid_df['fpr_max'].values,
                          alpha=0.2, color='red')
 
     ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
@@ -3856,12 +3857,12 @@ def plot_aggregated_metric_type(
     # Plot 5: FPR Only (emphasized metric)
     if 'fpr_mean' in valid_df.columns:
         fig, ax = plt.subplots(figsize=(12, 8))
-        ax.plot(valid_df['bin_center'], valid_df['fpr_mean'],
+        ax.plot(x, valid_df['fpr_mean'].values,
                 'r-^', linewidth=2.5, markersize=6, label='Mean FPR',
                 markerfacecolor='red', markeredgecolor='darkred')
-        ax.fill_between(valid_df['bin_center'],
-                        valid_df['fpr_min'],
-                        valid_df['fpr_max'],
+        ax.fill_between(x,
+                        valid_df['fpr_min'].values,
+                        valid_df['fpr_max'].values,
                         alpha=0.3, color='red', label='Min-Max Range')
         ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
         ax.set_ylabel('FPR', fontsize=14, fontweight='bold')
@@ -3914,17 +3915,18 @@ def plot_aggregated_subgroup_comparison(
         if mean_col not in df.columns:
             continue
 
-        valid_df = df[df[mean_col].notna()].sort_values('bin_center', ascending=False)
+        valid_df = df[df[mean_col].notna()].sort_values('bin_center', ascending=False).reset_index(drop=True)
         if len(valid_df) == 0:
             continue
 
+        sg_x = valid_df['bin_center'].values
         marker = markers[i % len(markers)]
-        ax.plot(valid_df['bin_center'], valid_df[mean_col],
+        ax.plot(sg_x, valid_df[mean_col].values,
                 marker=marker, linewidth=2.5, markersize=6, label=name, color=colors[i],
                 markerfacecolor=colors[i], markeredgecolor='black', markeredgewidth=0.5)
-        ax.fill_between(valid_df['bin_center'],
-                         valid_df[min_col],
-                         valid_df[max_col],
+        ax.fill_between(sg_x,
+                         valid_df[min_col].values,
+                         valid_df[max_col].values,
                          alpha=0.2, color=colors[i])
 
     ax.set_xlabel('Hours Before Birth', fontsize=14, fontweight='bold')
@@ -3934,6 +3936,7 @@ def plot_aggregated_subgroup_comparison(
     ax.legend(fontsize=11, loc='best')
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
+    ax.invert_xaxis()
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
