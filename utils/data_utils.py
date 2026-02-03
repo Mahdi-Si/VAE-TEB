@@ -155,9 +155,9 @@ def plot_scattering(signal=None, plot_order=None, Sx=None, meta=None,
     plt.set_cmap(cmstr)
     fig.delaxes(ax[1][1])
     ax[0, 1].set_axis_off()
-    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.svg', bbox_inches='tight',
+    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.pdf', bbox_inches='tight',
     #             orientation='landscape')
-    plt.savefig(plot_dir + '/' + tag + '_' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/' + tag + '_' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 
@@ -187,7 +187,7 @@ def plot_original_reconstructed(original_x, reconstructed_x, plot_dir=None, tag=
     ax[0].grid(True)
     ax[1].grid(True)
     ax[2].grid(True)
-    plt.savefig(plot_dir + '/' + tag + '_' + '_st.svg', bbox_inches='tight', orientation='landscape')
+    plt.savefig(plot_dir + '/' + tag + '_' + '_st.pdf', bbox_inches='tight', orientation='landscape')
     plt.close(fig)
 
 def plot_original_reconstructed_vae(raw_signal, original_x, reconstructed_x, plot_dir=None, tag=''):
@@ -221,7 +221,7 @@ def plot_original_reconstructed_vae(raw_signal, original_x, reconstructed_x, plo
     ax[0].grid(True)
     ax[1].grid(True)
     ax[2].grid(True)
-    plt.savefig(plot_dir + '/' + tag + '.svg', bbox_inches='tight', orientation='landscape')
+    plt.savefig(plot_dir + '/' + tag + '.pdf', bbox_inches='tight', orientation='landscape')
     plt.close(fig)
 
 def plot_prediction_st(signal=None, plot_title='', sx=None, plot_second_channel=False, tag='', sx_pmean=None,
@@ -287,7 +287,7 @@ def plot_prediction_st(signal=None, plot_title='', sx=None, plot_second_channel=
     ax[0, 1].set_axis_off()
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.suptitle(plot_title, fontsize=22)
-    plt.savefig(plot_dir + '/st-plots' + tag + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/st-plots' + tag + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 def plot_forward_pass(raw_fhr=None, raw_up=None, fhr_st=None, fhr_ph=None,
@@ -409,7 +409,7 @@ def plot_forward_pass(raw_fhr=None, raw_up=None, fhr_st=None, fhr_ph=None,
     fig.suptitle(plot_title, fontsize=24)
     
     # Save the plot
-    save_path = os.path.join(plot_dir, f'forward_pass_{tag}.svg')
+    save_path = os.path.join(plot_dir, f'forward_pass_{tag}.pdf')
     plt.savefig(save_path, bbox_inches='tight', orientation='landscape')
     plt.close(fig)
 
@@ -505,11 +505,11 @@ def plot_forward_pass_raw_signal(signal=None, plot_title='', Sx=None, plot_secon
     plt.set_cmap(cmstr)
     fig.delaxes(ax[1][1])
     ax[0, 1].set_axis_off()
-    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.svg', bbox_inches='tight',
+    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.pdf', bbox_inches='tight',
     #             orientation='landscape')
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.suptitle(plot_title, fontsize=22)
-    plt.savefig(plot_dir + '/st-plots' + tag + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/st-plots' + tag + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 def plot_loss_dict(loss_dict, epoch_num, plot_dir):
@@ -537,7 +537,7 @@ def plot_loss_dict(loss_dict, epoch_num, plot_dir):
     # Save the figure as an HTML file
     fig_path = os.path.join(plot_dir, 'loss_plot.html')
     fig.write_html(fig_path)
-    # plt.savefig(f'{plot_dir}/Loss_st.svg', bbox_inches='tight', dpi=50)
+    # plt.savefig(f'{plot_dir}/Loss_st.pdf', bbox_inches='tight', dpi=50)
 
 
 def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_latent_mean=None, h_hidden_mean=None,
@@ -652,9 +652,9 @@ def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_l
     plt.set_cmap(cmstr)
     fig.delaxes(ax[1][1])
     ax[0, 1].set_axis_off()
-    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.svg', bbox_inches='tight',
+    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.pdf', bbox_inches='tight',
     #             orientation='landscape')
-    plt.savefig(plot_dir + '/' + 'st-true-reconstructed' + tag + '.svg',
+    plt.savefig(plot_dir + '/' + 'st-true-reconstructed' + tag + '.pdf',
                 bbox_inches='tight',
                 orientation='landscape',
                 dpi=300)
@@ -709,7 +709,7 @@ def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_l
         #     # ax[i_row, 0].set_xticklabels([])
         #     ax[i_row, 0].set_ylabel(f'Latent Dim Histogram {i}')
 
-        plt.savefig(plot_dir + '/' + 'latent-representation' + tag + '.svg',
+        plt.savefig(plot_dir + '/' + 'latent-representation' + tag + '.pdf',
                     bbox_inches='tight',
                     orientation='landscape',
                     dpi=50)
@@ -777,7 +777,7 @@ def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_l
             # ax[i_row, 0].set_xticklabels([])
             ax[i_row, 0].set_ylabel(f'Hidden Dim Histogram {i}')
 
-        plt.savefig(plot_dir + '/' + tag + '_hidden' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+        plt.savefig(plot_dir + '/' + tag + '_hidden' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
         plt.close(fig)
     # ------------------------------------------------------------------------------------------------------------------
 
@@ -808,7 +808,7 @@ def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_l
         ax3 = ax[i_row, 0].twinx()
         ax3.plot(t_2, signal_1, linewidth=1.5)
 
-        plt.savefig(plot_dir + '/' + 'kld' + tag + '.svg',
+        plt.savefig(plot_dir + '/' + 'kld' + tag + '.pdf',
                     bbox_inches='tight',
                     orientation='landscape',
                     dpi=50)
@@ -836,7 +836,7 @@ def plot_averaged_results(signal=None, Sx=None, Sxr_mean=None, Sxr_std=None, z_l
     #     ax[i_row, 0].autoscale(enable=True, axis='x', tight=True)
     #     ax[i_row, 0].set_xticklabels([])
     #     ax[i_row, 0].set_ylabel('New Sample')
-    # plt.savefig(plot_dir + '/' + tag + '_new-sample' + '.svg', bbox_inches='tight', orientation='landscape', dpi=100)
+    # plt.savefig(plot_dir + '/' + tag + '_new-sample' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=100)
     # plt.close(fig)
     #
     # N_ROWS = 2 * Sx.shape[0]
@@ -863,7 +863,7 @@ def plot_latent_interpolation(len_signal, z_latent, decoder_output, plot_dir, ta
         ax[i_row, 0].autoscale(enable=True, axis='x', tight=True)
         ax[i_row, 0].set_xticklabels([])
         ax[i_row, 0].set_ylabel('z')
-    plt.savefig(plot_dir + '/' + tag + '_z_latent' + '.svg', bbox_inches='tight', orientation='landscape', dpi=100)
+    plt.savefig(plot_dir + '/' + tag + '_z_latent' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=100)
     plt.close(fig)
 
     fig, ax = plt.subplots(nrows=n_rows, ncols=2, figsize=(25, n_rows * 5 + 10), gridspec_kw={"width_ratios": [80, 1]})
@@ -879,7 +879,7 @@ def plot_latent_interpolation(len_signal, z_latent, decoder_output, plot_dir, ta
         ax[i_row, 0].set_xticklabels([])
         ax[i_row, 0].set_ylabel('y')
 
-    plt.savefig(plot_dir + '/' + tag + '_decoder' + '.svg', bbox_inches='tight', orientation='landscape', dpi=100)
+    plt.savefig(plot_dir + '/' + tag + '_decoder' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=100)
     plt.close(fig)
 
 
@@ -944,7 +944,7 @@ def plot_general_mse(signal=None, plot_order=None, Sx=None, meta=None,
         ax[i_row, 0].set_ylabel(f'mse coefficient {i}')
         avg_mse = np.mean(all_mse[i, :])
         ax[i_row, 0].set_title(f'Average MSE: {avg_mse:.5f}')
-    plt.savefig(plot_dir + '/' + tag + '_mses' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/' + tag + '_mses' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 
@@ -1002,9 +1002,9 @@ def plot_generated_samples(sx, sx_mean, sx_std, input_len, tag='_', plot_dir=Non
     plt.set_cmap(cmstr)
     fig.delaxes(ax[1][1])
     ax[0, 1].set_axis_off()
-    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.svg', bbox_inches='tight',
+    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.pdf', bbox_inches='tight',
     #             orientation='landscape')
-    plt.savefig(plot_dir + '/' + tag + '_' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/' + tag + '_' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 
@@ -1047,7 +1047,7 @@ def plot_distributions(sx_mean=None, sx_std=None, plot_second_channel=False, plo
             ax[i_row, 0].legend()
             ax[i_row, 1].set_axis_off()
             ax[i_row, 0].set_ylabel(f'St-Coefficient-{i}')
-        plt.savefig(plot_dir + '/' + tag + '_dataset' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+        plt.savefig(plot_dir + '/' + tag + '_dataset' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
         plt.close(fig)
 
     if plot_sample:
@@ -1067,7 +1067,7 @@ def plot_distributions(sx_mean=None, sx_std=None, plot_second_channel=False, plo
             ax[i_row, 1].set_axis_off()
             ax[i_row, 0].set_ylabel(f'St-Coefficient-{i}')
 
-        plt.savefig(plot_dir + '/' + tag + '_sample' + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+        plt.savefig(plot_dir + '/' + tag + '_sample' + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
         plt.close(fig)
 #
 # def plot_histogram(data=None, single_channel=True, bins=100, save_dir=None, tag=''):
@@ -1085,7 +1085,7 @@ def plot_distributions(sx_mean=None, sx_std=None, plot_second_channel=False, plo
 #         ax.axvline(mean, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mean:.4f}')
 #         ax.axvline(median, color='green', linestyle='dashed', linewidth=1, label=f'Median: {median:.4f}')
 #         ax.legend()
-#         plt.savefig(save_dir + '/' + tag + '.svg', bbox_inches='tight',
+#         plt.savefig(save_dir + '/' + tag + '.pdf', bbox_inches='tight',
 #                     orientation='landscape', dpi=50)
 #         plt.close(fig)
 #     else:
@@ -1106,7 +1106,7 @@ def plot_distributions(sx_mean=None, sx_std=None, plot_second_channel=False, plo
 #             ax[i_row].axvline(mean, color='red', linestyle='dashed', linewidth=1, label=f'Mean: {mean:.6f}')
 #             ax[i_row].axvline(median, color='green', linestyle='dashed', linewidth=1, label=f'Median: {median:.6f}')
 #             ax[i_row].legend()
-#         plt.savefig(save_dir + '/' + tag + '.svg', bbox_inches='tight',
+#         plt.savefig(save_dir + '/' + tag + '.pdf', bbox_inches='tight',
 #                     orientation='landscape', dpi=50)
 #         plt.close(fig)
 #
@@ -1478,11 +1478,11 @@ def plot_forward_pass_kld(signal=None, plot_title='', Sx=None, meta=None, plot_s
     plt.set_cmap(cmstr)
     fig.delaxes(ax[1][1])
     ax[0, 1].set_axis_off()
-    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.svg', bbox_inches='tight',
+    # plt.savefig(plot_dir + '/' + record_name + '_' + str(domain_start[i_segment]) + '_st.pdf', bbox_inches='tight',
     #             orientation='landscape')
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.suptitle(plot_title, fontsize=22)
-    plt.savefig(plot_dir + '/st-plots' + tag + '.svg', bbox_inches='tight', orientation='landscape', dpi=50)
+    plt.savefig(plot_dir + '/st-plots' + tag + '.pdf', bbox_inches='tight', orientation='landscape', dpi=50)
     plt.close(fig)
 
 

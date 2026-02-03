@@ -276,7 +276,7 @@ def plot_seqvae_tests(dataloader_pst, model, input_dim_t, device, base_dir=None)
                 # ax[1].scatter(latent_tsne_results[:, 0], latent_tsne_results[:, 1],
                 #               c=np.linspace(0, 1, signal_len), cmap='Reds', s=100, edgecolors='black')
                 # ax[1].set_ylabel('latent representation')
-                # plt.savefig(save_dir_signal + '/' + 't-SNE' + '.svg', bbox_inches='tight',
+                # plt.savefig(save_dir_signal + '/' + 't-SNE' + '.pdf', bbox_inches='tight',
                 #             orientation='landscape',
                 #             dpi=50)
                 # plt.close(fig)
