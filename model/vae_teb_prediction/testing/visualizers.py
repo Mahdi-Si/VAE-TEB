@@ -228,7 +228,7 @@ def _format_stats_box(n: int, mean: float, std: float, median: float, **kwargs) 
 def plot_metric_histograms(
     df: pd.DataFrame,
     output_dir: Path,
-    filename: str = "metrics_histograms.svg",
+    filename: str = "metrics_histograms.pdf",
     *,
     add_kde: bool = False,
     add_ci: bool = True,
@@ -239,7 +239,7 @@ def plot_metric_histograms(
     Args:
         df: DataFrame with columns 'vaf', 'mse', 'snr', 'kld'.
         output_dir: Directory to save the plot.
-        filename: Output filename (default: metrics_histograms.svg).
+        filename: Output filename (default: metrics_histograms.pdf).
         add_kde: Whether to add kernel density estimate overlay (default: False).
         add_ci: Whether to include 95% confidence intervals in stats box (default: True).
 
@@ -339,7 +339,7 @@ def plot_metric_histograms(
 def plot_latent_distributions(
     latents: np.ndarray,
     output_dir: Path,
-    filename: str = "latent_distributions.svg",
+    filename: str = "latent_distributions.pdf",
     *,
     add_gaussian: bool = False,
 ) -> None:
@@ -432,7 +432,7 @@ def plot_reconstruction_sample(
         fs: Sampling frequency in Hz (default: 4.0).
 
     Example:
-        >>> plot_reconstruction_sample(samples[0], Path("results/sample_0.svg"))
+        >>> plot_reconstruction_sample(samples[0], Path("results/sample_0.pdf"))
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -561,7 +561,7 @@ def plot_temporal_accuracy(
     df: pd.DataFrame,
     output_dir: Path,
     warmup_steps: int = 30,
-    filename: str = "temporal_accuracy.svg",
+    filename: str = "temporal_accuracy.pdf",
 ) -> None:
     """
     Plot VAF and SNR as a function of timestep position with publication quality.
@@ -670,7 +670,7 @@ def plot_within_window_accuracy(
     output_dir: Path,
     *,
     fs: float = 4.0,
-    filename: str = "within_window_accuracy.svg",
+    filename: str = "within_window_accuracy.pdf",
 ) -> None:
     """
     Plot reconstruction accuracy as a function of index within the prediction window.
@@ -804,7 +804,7 @@ def plot_within_window_accuracy(
 def plot_kld_trajectory(
     df: pd.DataFrame,
     output_dir: Path,
-    filename: str = "kld_trajectory.svg",
+    filename: str = "kld_trajectory.pdf",
     *,
     by_class: bool = False,
 ) -> None:
@@ -966,7 +966,7 @@ def plot_kld_guid_trajectory(
     _style_axes(ax, grid="both", minor_ticks=True)
 
     fig.tight_layout()
-    out_name = filename or f"kld_guid_{guid}.svg"
+    out_name = filename or f"kld_guid_{guid}.pdf"
     fig.savefig(output_dir / out_name, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -976,7 +976,7 @@ def plot_coherence_analysis(
     coherence_original: np.ndarray,
     coherence_reconstructed: np.ndarray,
     output_dir: Path,
-    filename: str = "coherence_analysis.svg",
+    filename: str = "coherence_analysis.pdf",
 ) -> None:
     """
     Plot optional UP-FHR coherence comparison between original and reconstructed signals.
@@ -1036,7 +1036,7 @@ def plot_reconstruction_coherence(
     coherence_mean: np.ndarray,
     coherence_std: np.ndarray,
     output_dir: Path,
-    filename: str = "reconstruction_coherence.svg",
+    filename: str = "reconstruction_coherence.pdf",
     significance_threshold: Optional[float] = None,
 ) -> None:
     """
@@ -1317,7 +1317,7 @@ def plot_psd_comparison(
     *,
     psd_residual_mean: Optional[np.ndarray] = None,
     psd_residual_std: Optional[np.ndarray] = None,
-    filename: str = "psd_comparison.svg",
+    filename: str = "psd_comparison.pdf",
 ) -> None:
     """
     Plot Welch PSD comparison between original and reconstructed signals.
@@ -1409,7 +1409,7 @@ def plot_cross_correlation(
     corr_mean: np.ndarray,
     corr_std: np.ndarray,
     output_dir: Path,
-    filename: str = "cross_correlation.svg",
+    filename: str = "cross_correlation.pdf",
     *,
     annotate_peak: bool = True,
 ) -> None:
@@ -1769,7 +1769,7 @@ def plot_latent_trajectory_2d(
         show_arrows: Whether to show directional arrows.
 
     Example:
-        >>> plot_latent_trajectory_2d(trajectory_2d, Path("results/traj_2d.svg"))
+        >>> plot_latent_trajectory_2d(trajectory_2d, Path("results/traj_2d.pdf"))
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1857,7 +1857,7 @@ def plot_latent_trajectory_3d(
         point_size: Size of trajectory points.
 
     Example:
-        >>> plot_latent_trajectory_3d(trajectory_3d, Path("results/traj_3d.svg"))
+        >>> plot_latent_trajectory_3d(trajectory_3d, Path("results/traj_3d.pdf"))
     """
     from mpl_toolkits.mplot3d import Axes3D
 
@@ -2019,7 +2019,7 @@ def plot_latent_changepoints_with_raw(
         decimation_factor: Ratio between raw and latent lengths.
 
     Example:
-        >>> plot_latent_changepoints_with_raw(latent, fhr, cp_results, Path("results/cp.svg"))
+        >>> plot_latent_changepoints_with_raw(latent, fhr, cp_results, Path("results/cp.pdf"))
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2177,7 +2177,7 @@ def plot_segment_statistics(
         ax.set_title("Segment Duration Distribution", fontsize=FONT_TITLE, fontweight="normal", pad=6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
-        fig.savefig(output_dir / f"{filename_prefix}_duration_hist.svg", dpi=SAVE_DPI, bbox_inches="tight")
+        fig.savefig(output_dir / f"{filename_prefix}_duration_hist.pdf", dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
 
     # Plot 2: Mean speed vs start time
@@ -2195,7 +2195,7 @@ def plot_segment_statistics(
         ax.axvline(0.0, color=COLOR_GRAY, linewidth=0.6, alpha=0.6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
-        fig.savefig(output_dir / f"{filename_prefix}_speed_vs_start.svg", dpi=SAVE_DPI, bbox_inches="tight")
+        fig.savefig(output_dir / f"{filename_prefix}_speed_vs_start.pdf", dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
 
     # Plot 3: Dominant latent dimension counts
@@ -2209,7 +2209,7 @@ def plot_segment_statistics(
         ax.set_title("Dominant Latent Dimension", fontsize=FONT_TITLE, fontweight="normal", pad=6)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
-        fig.savefig(output_dir / f"{filename_prefix}_dominant_dim.svg", dpi=SAVE_DPI, bbox_inches="tight")
+        fig.savefig(output_dir / f"{filename_prefix}_dominant_dim.pdf", dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
 
     # Plot 4: Segments per sample
@@ -2225,7 +2225,7 @@ def plot_segment_statistics(
         ax.tick_params(axis="x", rotation=45, labelsize=FONT_TICK)
         _style_axes(ax, grid="major", minor_ticks=False)
         fig.tight_layout()
-        fig.savefig(output_dir / f"{filename_prefix}_per_sample.svg", dpi=SAVE_DPI, bbox_inches="tight")
+        fig.savefig(output_dir / f"{filename_prefix}_per_sample.pdf", dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
 
     return df
@@ -2236,7 +2236,7 @@ def plot_trajectory_comparison(
     output_dir: Path,
     *,
     n_components: int = 2,
-    filename: str = "trajectory_comparison.svg",
+    filename: str = "trajectory_comparison.pdf",
 ) -> None:
     """
     Compare latent trajectories across multiple classes in a single plot.

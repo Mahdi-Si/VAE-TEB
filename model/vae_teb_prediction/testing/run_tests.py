@@ -262,7 +262,7 @@ def run_full_test_pipeline(
     samples_dir = runner.ensure_dir("samples")
     for i, sample in enumerate(samples[:5]):
         # Static plot
-        plot_reconstruction_sample(sample, samples_dir / f"sample_{i}.svg")
+        plot_reconstruction_sample(sample, samples_dir / f"sample_{i}.pdf")
 
         # Interactive plot
         if not skip_interactive:
