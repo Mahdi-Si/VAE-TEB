@@ -947,7 +947,7 @@ def _plot_all_single_sample_plots(
     title = f"Sample Summary | GUID={guid} | Epoch={epoch}"
     fig.suptitle(title, fontsize=14, fontweight="normal", y=0.98, color=COLOR_BLUE)
 
-    plot_path = sample_dir / f"vae_reconstruction_analysis_{sample_name}.svg"
+    plot_path = sample_dir / f"vae_reconstruction_analysis_{sample_name}.pdf"
     fig.savefig(plot_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 

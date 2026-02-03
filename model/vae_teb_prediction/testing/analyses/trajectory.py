@@ -530,7 +530,7 @@ class TrajectoryAnalyzer:
         ax.grid(True, alpha=0.3)
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "plots" / "kld_by_class.svg", dpi=200)
+        fig.savefig(self.output_dir / "plots" / "kld_by_class.pdf", dpi=200)
         plt.close(fig)
 
         # Save class-aggregated data to CSV
@@ -602,7 +602,7 @@ class TrajectoryAnalyzer:
                 continue
             plot_guid_absolute_trajectory(
                 subset,
-                plots_dir / f"guid_absolute_trajectory_{guid}.svg",
+                plots_dir / f"guid_absolute_trajectory_{guid}.pdf",
                 guid=guid,
                 x_col=x_col,
                 y_col=y_col,
@@ -632,7 +632,7 @@ class TrajectoryAnalyzer:
             ax.legend(markerscale=5)
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "plots" / "latent_space.svg", dpi=200)
+        fig.savefig(self.output_dir / "plots" / "latent_space.pdf", dpi=200)
         plt.close(fig)
 
     def _generate_dashboards(self, n_dashboards: int = 12) -> None:
@@ -706,7 +706,7 @@ class TrajectoryAnalyzer:
         ax4.set_title("Latent Dimensions (First Epoch)")
 
         fig.tight_layout()
-        fig.savefig(self.output_dir / "dashboards" / f"{guid}.svg", dpi=150)
+        fig.savefig(self.output_dir / "dashboards" / f"{guid}.pdf", dpi=150)
         plt.close(fig)
 
     def _compute_metrics(self) -> Dict[str, float]:
@@ -943,7 +943,7 @@ class TrajectoryAnalyzer:
                 try:
                     plot_latent_trajectory_2d(
                         traj[:, :2],
-                        plots_dir / f"trajectory_2d_{sample_id}.svg",
+                        plots_dir / f"trajectory_2d_{sample_id}.pdf",
                         sample_id=sample_id,
                     )
                 except Exception as e:
@@ -954,7 +954,7 @@ class TrajectoryAnalyzer:
                 try:
                     plot_latent_trajectory_3d(
                         traj[:, :3],
-                        plots_dir / f"trajectory_3d_{sample_id}.svg",
+                        plots_dir / f"trajectory_3d_{sample_id}.pdf",
                         sample_id=sample_id,
                     )
                 except Exception as e:
@@ -1000,7 +1000,7 @@ class TrajectoryAnalyzer:
             try:
                 plot_kld_trajectory_3d(
                     traj,
-                    plots_dir / f"kld_trajectory_3d_{sample_id}.svg",
+                    plots_dir / f"kld_trajectory_3d_{sample_id}.pdf",
                     sample_id=sample_id,
                 )
             except Exception as e:
@@ -1042,7 +1042,7 @@ class TrajectoryAnalyzer:
                     latent_mean=latent_mean,
                     fhr=fhr,
                     changepoint_results=cp_result,
-                    output_path=cp_dir / f"changepoints_{guid}.svg",
+                    output_path=cp_dir / f"changepoints_{guid}.pdf",
                     sample_id=guid,
                     decimation_factor=self.decimation_factor,
                 )
@@ -1169,7 +1169,7 @@ class TrajectoryAnalyzer:
                 trajectories_dict,
                 self.output_dir / "plots",
                 n_components=3,
-                filename="trajectory_class_comparison.svg",
+                filename="trajectory_class_comparison.pdf",
             )
 
             # Interactive comparison
