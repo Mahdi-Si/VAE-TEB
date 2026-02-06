@@ -20,6 +20,8 @@ from model.vae_teb_prediction.prediction_classification_model import (
     CNN1DClassifier,
     BiLSTMAttentionClassifier,
     TransformerClassifier,
+    MambaClassifier,
+    MultiScaleConvAttentionClassifier,
 )
 
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -208,6 +210,32 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 dim_feedforward=classifier_config.get('dim_feedforward', 256),
                 dropout=classifier_config.get('dropout', 0.1),
                 pooling=classifier_config.get('pooling', 'mean'),
+            )
+        elif classifier_type == 'mamba':
+            classifier = MambaClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                d_model=classifier_config.get('d_model', 64),
+                d_state=classifier_config.get('d_state', 16),
+                expand=classifier_config.get('expand', 2),
+                conv_kernel=classifier_config.get('conv_kernel', 4),
+                n_layers=classifier_config.get('n_layers', 3),
+                dropout=classifier_config.get('dropout', 0.1),
+                pooling=classifier_config.get('pooling', 'mean_max'),
+                mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
+            )
+        elif classifier_type == 'multiscale_conv_attention':
+            classifier = MultiScaleConvAttentionClassifier(
+                input_dim=latent_dim,
+                num_classes=num_classes,
+                num_filters=classifier_config.get('num_filters', 32),
+                kernel_sizes=tuple(classifier_config.get('kernel_sizes', [5, 19, 39])),
+                n_inception_blocks=classifier_config.get('n_inception_blocks', 2),
+                se_reduction=classifier_config.get('se_reduction', 8),
+                n_attn_heads=classifier_config.get('n_attn_heads', 4),
+                attn_dropout=classifier_config.get('attn_dropout', 0.1),
+                dropout=classifier_config.get('dropout', 0.1),
+                mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
             )
         else:
             raise ValueError(f"Unknown classifier type: {classifier_type}")
