@@ -1338,6 +1338,354 @@ def compute_subgroup_statistics(
     return statistics
 
 
+# ---------------------------------------------------------------------------
+# Per-fold dataset statistics with visualizations
+# ---------------------------------------------------------------------------
+
+def _seconds_to_hhmm(seconds: float) -> str:
+    """Convert seconds before birth to HH:MM format (absolute value)."""
+    abs_seconds = abs(seconds)
+    hours = int(abs_seconds // 3600)
+    minutes = int((abs_seconds % 3600) // 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def generate_fold_dataset_stats(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    output_dir: Path,
+    title_suffix: str = "Test Set",
+) -> None:
+    """
+    Generate per-fold dataset statistics folder with JSON summary, plots, and CSV.
+
+    Creates a ``dataset_stats/`` directory containing:
+    - dataset_summary.json  — computed statistics
+    - dataset_overview.pdf  — 2x2 overview figure
+    - epochs_per_time_bin.pdf — epochs per metric time bin (stacked by label)
+    - epochs_per_guid_ranked.pdf — ranked bar chart coloured by label
+    - label_cross_table.csv — target x cs_label x bg_label cross-tabulation
+
+    Args:
+        df: Predictions DataFrame with columns: guid, epoch, target,
+            binary_target, cs_label, bg_label.
+        time_bins: Array of time-bin edges in hours (from ``compute_time_bins``).
+        output_dir: Directory to create (will be created if absent).
+        title_suffix: Text appended to plot titles (e.g. "Fold 1 Test Set").
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure epoch_hours column exists
+    df_stats = ensure_epoch_hours(df.copy())
+
+    # --- A. Compute summary statistics ----------------------------------
+    n_guids = int(df_stats['guid'].nunique())
+    n_epochs = len(df_stats)
+
+    epochs_per_guid = df_stats.groupby('guid').size()
+    epg_stats = {
+        'min': int(epochs_per_guid.min()),
+        'max': int(epochs_per_guid.max()),
+        'mean': float(epochs_per_guid.mean()),
+        'median': float(epochs_per_guid.median()),
+        'std': float(epochs_per_guid.std()) if len(epochs_per_guid) > 1 else 0.0,
+    }
+
+    min_sec = float(df_stats['epoch'].min())
+    max_sec = float(df_stats['epoch'].max())
+    n_unique_time_points = int(df_stats['epoch'].nunique())
+
+    # GUID-level label info
+    guid_info = df_stats.groupby('guid').agg({
+        'target': 'first',
+        'binary_target': 'first',
+        'cs_label': 'first',
+        'bg_label': 'first',
+    })
+
+    target_map = {1: 'healthy', 2: 'acidosis', 3: 'hie'}
+    guid_target_counts = {v: int((guid_info['target'] == k).sum()) for k, v in target_map.items()}
+    guid_cs_counts = {
+        'cs_positive': int(guid_info['cs_label'].eq(True).sum()),
+        'cs_negative': int(guid_info['cs_label'].eq(False).sum()),
+    }
+    guid_bg_counts = {
+        'bg_positive': int(guid_info['bg_label'].eq(True).sum()),
+        'bg_negative': int(guid_info['bg_label'].eq(False).sum()),
+    }
+
+    # Epoch-level label counts
+    epoch_target_counts = {v: int((df_stats['target'] == k).sum()) for k, v in target_map.items()}
+    epoch_cs_counts = {
+        'cs_positive': int(df_stats['cs_label'].eq(True).sum()),
+        'cs_negative': int(df_stats['cs_label'].eq(False).sum()),
+    }
+    epoch_bg_counts = {
+        'bg_positive': int(df_stats['bg_label'].eq(True).sum()),
+        'bg_negative': int(df_stats['bg_label'].eq(False).sum()),
+    }
+
+    # Epochs per time bin
+    bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
+    bin_epoch_counts = []
+    for i in range(len(time_bins) - 1):
+        lo, hi = time_bins[i], time_bins[i + 1]
+        mask = (df_stats['epoch_hours'] >= lo) & (df_stats['epoch_hours'] < hi)
+        bin_epoch_counts.append({
+            'bin_center_hours': float(bin_centers[i]),
+            'n_epochs': int(mask.sum()),
+        })
+
+    summary = {
+        'total_guids': n_guids,
+        'total_epochs': n_epochs,
+        'epochs_per_guid': epg_stats,
+        'time_range': {
+            'min_seconds': min_sec,
+            'max_seconds': max_sec,
+            'min_hours': float(min_sec / 3600.0),
+            'max_hours': float(max_sec / 3600.0),
+            'min_hhmm': _seconds_to_hhmm(min_sec),
+            'max_hhmm': _seconds_to_hhmm(max_sec),
+        },
+        'n_unique_time_points': n_unique_time_points,
+        'label_distributions': {
+            'guid_level': {
+                'target': guid_target_counts,
+                'cs_label': guid_cs_counts,
+                'bg_label': guid_bg_counts,
+            },
+            'epoch_level': {
+                'target': epoch_target_counts,
+                'cs_label': epoch_cs_counts,
+                'bg_label': epoch_bg_counts,
+            },
+        },
+        'epochs_per_time_bin': bin_epoch_counts,
+    }
+
+    with open(output_dir / "dataset_summary.json", 'w') as f:
+        json.dump(convert_numpy_types(summary), f, indent=2)
+    logger.info(f"Dataset summary saved to {output_dir / 'dataset_summary.json'}")
+
+    # --- B. Dataset overview (2x2) --------------------------------------
+    _plot_dataset_overview(df_stats, summary, output_dir, title_suffix)
+
+    # --- C. Epochs per time bin -----------------------------------------
+    _plot_epochs_per_time_bin(df_stats, time_bins, output_dir, title_suffix)
+
+    # --- D. Epochs per GUID ranked --------------------------------------
+    _plot_epochs_per_guid_ranked(df_stats, output_dir, title_suffix)
+
+    # --- E. Label cross-table -------------------------------------------
+    _save_label_cross_table(df_stats, output_dir)
+
+    logger.info(f"Fold dataset stats saved to {output_dir}")
+
+
+def _plot_dataset_overview(
+    df: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    """Create 2x2 overview figure: histogram, time dist, label bars, summary text."""
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    fig.suptitle(f"Dataset Overview — {title_suffix}", fontsize=12, fontweight='bold', y=0.98)
+
+    # Colours consistent with evaluate_classifier palette
+    c_green = '#2ecc71'
+    c_blue = '#3498db'
+    c_red = '#e74c3c'
+    c_orange = '#e67e22'
+    c_gray = '#95a5a6'
+
+    # [0,0] Epochs per GUID histogram
+    ax = axes[0, 0]
+    epochs_per_guid = df.groupby('guid').size()
+    ax.hist(epochs_per_guid, bins=min(30, len(epochs_per_guid.unique())),
+            color=c_blue, edgecolor='white', alpha=0.8)
+    mean_val = float(epochs_per_guid.mean())
+    median_val = float(epochs_per_guid.median())
+    ax.axvline(mean_val, color=c_red, linestyle='--', linewidth=1.5,
+               label=f"Mean: {mean_val:.1f}")
+    ax.axvline(median_val, color=c_green, linestyle=':', linewidth=1.5,
+               label=f"Median: {median_val:.1f}")
+    ax.set_xlabel("Epochs per GUID")
+    ax.set_ylabel("Number of GUIDs")
+    ax.set_title(f"Epochs per Baby (n={summary['total_guids']})")
+    ax.legend(fontsize=7)
+
+    # [0,1] Time distribution (epoch count vs hours before birth)
+    ax = axes[0, 1]
+    epoch_hours = df['epoch_hours']
+    ax.hist(epoch_hours, bins=min(50, len(epoch_hours.unique())),
+            color=c_blue, edgecolor='white', alpha=0.8)
+    ax.set_xlabel("Hours before birth")
+    ax.set_ylabel("Number of epochs")
+    ax.set_title(f"Time Distribution ({summary['n_unique_time_points']} unique pts)")
+    ax.invert_xaxis()
+
+    # [1,0] Label distribution bars
+    ax = axes[1, 0]
+    guid_level = summary['label_distributions']['guid_level']
+    tgt = guid_level['target']
+    cs = summary['label_distributions']['epoch_level']['cs_label']
+    bg = summary['label_distributions']['epoch_level']['bg_label']
+    labels = ['Healthy', 'Acidosis', 'HIE', 'CS+', 'BG+']
+    counts = [
+        tgt.get('healthy', 0), tgt.get('acidosis', 0), tgt.get('hie', 0),
+        cs.get('cs_positive', 0), bg.get('bg_positive', 0),
+    ]
+    colors_bar = [c_green, c_red, c_orange, c_blue, c_gray]
+    bars = ax.bar(labels, counts, color=colors_bar, edgecolor='white', alpha=0.8)
+    ax.set_ylabel("Count")
+    ax.set_title("Label Distribution (GUIDs / epoch counts)")
+    for bar, cnt in zip(bars, counts):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{cnt}", ha='center', va='bottom', fontsize=8)
+
+    # [1,1] Text summary box
+    ax = axes[1, 1]
+    ax.axis('off')
+    epg = summary['epochs_per_guid']
+    tr = summary['time_range']
+    text = (
+        f"Dataset Summary\n"
+        f"{'─' * 28}\n"
+        f"Total Epochs:  {summary['total_epochs']:,}\n"
+        f"Unique GUIDs:  {summary['total_guids']:,}\n"
+        f"Unique Times:  {summary['n_unique_time_points']}\n\n"
+        f"Epochs per GUID:\n"
+        f"  Min: {epg['min']}  Max: {epg['max']}\n"
+        f"  Mean: {epg['mean']:.1f}  Median: {epg['median']:.1f}\n\n"
+        f"Time Before Birth:\n"
+        f"  Range: {tr['max_hhmm']} → {tr['min_hhmm']} (HH:MM)\n"
+        f"  ({abs(tr['max_hours']):.1f}h → {abs(tr['min_hours']):.1f}h)\n\n"
+        f"Labels (GUID-level):\n"
+        f"  Healthy: {tgt.get('healthy', 0)}  "
+        f"Acidosis: {tgt.get('acidosis', 0)}  "
+        f"HIE: {tgt.get('hie', 0)}"
+    )
+    ax.text(0.05, 0.95, text, transform=ax.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#ecf0f1', alpha=0.3))
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "dataset_overview.pdf", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _plot_epochs_per_time_bin(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    """Bar chart of epochs per metric time bin, stacked by healthy vs unhealthy."""
+    bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
+    n_bins = len(bin_centers)
+
+    counts_healthy = np.zeros(n_bins)
+    counts_unhealthy = np.zeros(n_bins)
+
+    for i in range(n_bins):
+        lo, hi = time_bins[i], time_bins[i + 1]
+        mask = (df['epoch_hours'] >= lo) & (df['epoch_hours'] < hi)
+        bin_df = df[mask]
+        counts_healthy[i] = (bin_df['binary_target'] == 0).sum()
+        counts_unhealthy[i] = (bin_df['binary_target'] == 1).sum()
+
+    bar_width = np.median(np.diff(time_bins)) * 0.8 if n_bins > 1 else 0.3
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.bar(bin_centers, counts_healthy, width=bar_width, label='Healthy (target=0)',
+           color='#2ecc71', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, counts_unhealthy, width=bar_width, bottom=counts_healthy,
+           label='Unhealthy (target=1)', color='#e74c3c', edgecolor='white', alpha=0.85)
+
+    ax.set_xlabel("Hours before birth")
+    ax.set_ylabel("Number of epochs")
+    ax.set_title(f"Epochs per Time Bin — {title_suffix}\n"
+                 f"({n_bins} bins, {int(counts_healthy.sum() + counts_unhealthy.sum())} total epochs)")
+    ax.legend(fontsize=9)
+    ax.invert_xaxis()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "epochs_per_time_bin.pdf", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _plot_epochs_per_guid_ranked(
+    df: pd.DataFrame,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    """Ranked bar chart of epochs per GUID, coloured by target label."""
+    guid_info = df.groupby('guid').agg(
+        n_epochs=('epoch', 'size'),
+        binary_target=('binary_target', 'first'),
+    ).sort_values('n_epochs', ascending=False).reset_index()
+
+    x = np.arange(len(guid_info))
+    colors = ['#e74c3c' if bt == 1 else '#2ecc71' for bt in guid_info['binary_target']]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(x, guid_info['n_epochs'].values, color=colors, alpha=0.85, width=1.0)
+    ax.set_xlabel("GUID rank (sorted by epoch count)")
+    ax.set_ylabel("Number of epochs")
+    ax.set_title(f"Epochs per GUID (ranked) — {title_suffix}")
+
+    mean_val = float(guid_info['n_epochs'].mean())
+    ax.axhline(mean_val, color='#3498db', linestyle='--', linewidth=1.5,
+               label=f"Mean: {mean_val:.1f}")
+
+    # Legend for colours
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#2ecc71', alpha=0.85, label='Healthy'),
+        Patch(facecolor='#e74c3c', alpha=0.85, label='Unhealthy'),
+        ax.get_lines()[0],
+    ]
+    ax.legend(handles=legend_elements, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "epochs_per_guid_ranked.pdf", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _save_label_cross_table(df: pd.DataFrame, output_dir: Path) -> None:
+    """Save target x cs_label x bg_label cross-tabulation at GUID level."""
+    guid_info = df.groupby('guid').agg({
+        'target': 'first',
+        'cs_label': 'first',
+        'bg_label': 'first',
+    }).reset_index()
+
+    target_map = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}
+    guid_info['target_name'] = guid_info['target'].map(target_map).fillna('Unknown')
+
+    rows = []
+    for tgt_val, tgt_name in target_map.items():
+        for cs_val in [False, True]:
+            for bg_val in [False, True]:
+                mask = (
+                    (guid_info['target'] == tgt_val) &
+                    (guid_info['cs_label'] == cs_val) &
+                    (guid_info['bg_label'] == bg_val)
+                )
+                rows.append({
+                    'target': tgt_name,
+                    'cs_label': int(cs_val),
+                    'bg_label': int(bg_val),
+                    'n_guids': int(mask.sum()),
+                })
+
+    cross_df = pd.DataFrame(rows)
+    cross_df.to_csv(output_dir / "label_cross_table.csv", index=False)
+
+
 def compute_subgroup_metrics_by_time(
     df: pd.DataFrame,
     subgroup_name: str,
@@ -2622,6 +2970,10 @@ def generate_three_metric_type_analysis(
     # Step 2: Generate metric type comparison
     comparison_dir = analysis_dir / "comparison"
     plot_metric_type_comparison(metrics_dict, comparison_dir, title_suffix)
+
+    # Step 2b: Generate dataset stats folder
+    dataset_stats_dir = analysis_dir / "dataset_stats"
+    generate_fold_dataset_stats(df, time_bins, dataset_stats_dir, title_suffix)
 
     # Step 3: Generate subgroup analysis for ALL THREE metric types
     logger.info("Generating subgroup analysis for all three metric types...")
