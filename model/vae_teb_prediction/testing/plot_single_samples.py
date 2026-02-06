@@ -771,9 +771,14 @@ def _plot_all_single_sample_plots(
 
     kld_tensor = compute_kld(outputs, runner.warmup_steps)
     kld_mean_np = None
+    kld_std_np = None
+    kld_sample_np = None
     if kld_tensor is not None:
         kld_sample = kld_tensor[idx]
         kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
+        kld_std_np = kld_sample.detach().cpu().numpy()
+        kld_std_np = np.nanstd(kld_std_np, axis=-1)  # (T,)
+        kld_sample_np = kld_sample.detach().cpu().numpy()  # (T, D)
 
     fhr_st_np = y_st[0].detach().cpu().numpy().T
     fhr_ph_np = y_ph[0].detach().cpu().numpy().T
@@ -837,7 +842,7 @@ def _plot_all_single_sample_plots(
         t_idx += step_size
 
     _apply_publication_style()
-    fig, axes = plt.subplots(8, 1, figsize=(16, 24), constrained_layout=True)
+    fig, axes = plt.subplots(9, 1, figsize=(16, 27), constrained_layout=True)
     if not isinstance(axes, np.ndarray):
         axes = np.asarray([axes])
 
@@ -899,19 +904,53 @@ def _plot_all_single_sample_plots(
         ax.set_axis_off()
     else:
         t_kld = np.arange(len(kld_mean_np))
-        ax.plot(t_kld, kld_mean_np, color=COLOR_PURPLE, linewidth=1.1)
+        ax.plot(t_kld, kld_mean_np, color=COLOR_PURPLE, linewidth=1.1, label="Mean KLD")
         # Add warmup shading
         if warmup > 0:
             ax.axvspan(0, warmup, alpha=0.15, color=COLOR_GRAY, label="Warmup")
             ax.axvline(x=warmup, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
         overall_mean = float(np.nanmean(kld_mean_np[warmup:]))
-        ax.set_title(f"Mean KLD over Dimensions (Overall: {overall_mean:.4f})")
         ax.set_xlabel("Time Steps")
-        ax.set_ylabel("KLD")
+        ax.set_ylabel("Mean KLD", color=COLOR_PURPLE)
+        ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
         ax.set_xlim(0, len(kld_mean_np))
         _style_axes(ax, grid="both")
 
+        # Second y-axis for KLD std across dimensions
+        if kld_std_np is not None:
+            ax2 = ax.twinx()
+            ax2.plot(t_kld, kld_std_np, color=COLOR_ORANGE, linewidth=0.9, alpha=0.85, label="Std KLD")
+            ax2.set_ylabel("Std KLD", color=COLOR_ORANGE, fontsize=8)
+            ax2.tick_params(axis="y", labelcolor=COLOR_ORANGE)
+            overall_std = float(np.nanmean(kld_std_np[warmup:]))
+            ax.set_title(
+                f"KLD over Dimensions (Mean: {overall_mean:.4f}, Std: {overall_std:.4f})"
+            )
+            # Combined legend from both axes
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7, framealpha=0.95)
+        else:
+            ax.set_title(f"Mean KLD over Dimensions (Overall: {overall_mean:.4f})")
+
+    # KLD heatmap across all latent dimensions
     ax = axes[6]
+    if kld_sample_np is None:
+        ax.text(0.5, 0.5, "KLD unavailable", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        # kld_sample_np shape: (T, D) — transpose to (D, T) for display
+        kld_heatmap = kld_sample_np.T
+        im = ax.imshow(kld_heatmap, aspect="auto", cmap="viridis", origin="lower")
+        if warmup > 0:
+            ax.axvline(x=warmup - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
+        ax.set_title("KLD per Latent Dimension")
+        ax.set_xlabel("Time Steps")
+        ax.set_ylabel("Latent Dimension")
+        ax.grid(False)
+        _add_colorbar(fig, im, ax, label="KLD (nats)")
+
+    ax = axes[7]
     ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
     ax.plot(t_raw, avg_pred_np, color=COLOR_ORANGE, linewidth=1.2, label="Avg Prediction")
     ax.set_title("Normalized FHR vs Average Prediction")
@@ -922,7 +961,7 @@ def _plot_all_single_sample_plots(
     ax.margins(x=0.0)
     _style_axes(ax, grid="both")
 
-    ax = axes[7]
+    ax = axes[8]
     ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
     ax.plot(t_raw, pred_concat, color=COLOR_ORANGE, linewidth=1.2, label="Single Predictions")
     # Add fill_between for uncertainty with more visible color
@@ -945,7 +984,7 @@ def _plot_all_single_sample_plots(
     guid = _extract_guid(batch, idx)
     epoch = _extract_epoch(batch, idx)
     title = f"Sample Summary | GUID={guid} | Epoch={epoch}"
-    fig.suptitle(title, fontsize=14, fontweight="normal", y=0.98, color=COLOR_BLUE)
+    fig.suptitle(title, fontsize=14, fontweight="normal", y=1.01, color=COLOR_BLUE)
 
     plot_path = sample_dir / f"vae_reconstruction_analysis_{sample_name}.pdf"
     fig.savefig(plot_path, dpi=SAVE_DPI, bbox_inches="tight")
