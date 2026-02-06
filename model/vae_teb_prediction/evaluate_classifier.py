@@ -65,6 +65,11 @@ def convert_numpy_types(obj):
         return {k: convert_numpy_types(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [convert_numpy_types(item) for item in obj]
+    # Handle pandas DataFrame and Series (convert to serializable form before pd.isna check)
+    elif isinstance(obj, pd.DataFrame):
+        return convert_numpy_types(obj.to_dict('records'))
+    elif isinstance(obj, pd.Series):
+        return convert_numpy_types(obj.to_list())
     # Handle numpy arrays (convert to list, which will recurse)
     elif isinstance(obj, np.ndarray):
         return [convert_numpy_types(item) for item in obj.tolist()]
@@ -79,15 +84,18 @@ def convert_numpy_types(obj):
         return val
     elif isinstance(obj, np.bool_):
         return bool(obj)
-    # Handle pandas NaT and other pd.NA types
-    elif pd.isna(obj):
-        return None
     # Handle Python float NaN/inf
     elif isinstance(obj, float):
         if np.isnan(obj) or np.isinf(obj):
             return None
         return obj
     else:
+        # Handle pandas NaT and other pd.NA types (scalar only)
+        try:
+            if pd.isna(obj):
+                return None
+        except (ValueError, TypeError):
+            pass
         return obj
 
 
@@ -1350,6 +1358,83 @@ def _seconds_to_hhmm(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}"
 
 
+def _get_clinical_subgroups():
+    """
+    Return the clinical subgroup definitions used across all dataset-stats plots.
+
+    Each entry: (key, label, filter_function, colour).
+
+    Subgroups are **mutually exclusive within each diagnosis** when stratified
+    by CS, and within healthy when stratified by BG.
+    """
+    return {
+        # -- Healthy, stratified by BG -----------------------------------
+        'healthy_bg_pos': ('Healthy BG+',
+                           lambda d: (d['target'] == 1) & (d['bg_label'] == True),   # noqa: E712
+                           '#2ecc71'),
+        'healthy_bg_neg': ('Healthy BG\u2212',
+                           lambda d: (d['target'] == 1) & (d['bg_label'] == False),  # noqa: E712
+                           '#27ae60'),
+        # -- Healthy, stratified by CS -----------------------------------
+        'healthy_cs_pos': ('Healthy CS+',
+                           lambda d: (d['target'] == 1) & (d['cs_label'] == True),   # noqa: E712
+                           '#a8e6cf'),
+        'healthy_cs_neg': ('Healthy CS\u2212',
+                           lambda d: (d['target'] == 1) & (d['cs_label'] == False),  # noqa: E712
+                           '#6ab04c'),
+        # -- Acidosis, stratified by CS ----------------------------------
+        'acidosis_cs_pos': ('Acidosis CS+',
+                            lambda d: (d['target'] == 2) & (d['cs_label'] == True),  # noqa: E712
+                            '#e74c3c'),
+        'acidosis_cs_neg': ('Acidosis CS\u2212',
+                            lambda d: (d['target'] == 2) & (d['cs_label'] == False), # noqa: E712
+                            '#c0392b'),
+        # -- HIE, stratified by CS ---------------------------------------
+        'hie_cs_pos': ('HIE CS+',
+                       lambda d: (d['target'] == 3) & (d['cs_label'] == True),       # noqa: E712
+                       '#e67e22'),
+        'hie_cs_neg': ('HIE CS\u2212',
+                       lambda d: (d['target'] == 3) & (d['cs_label'] == False),      # noqa: E712
+                       '#d35400'),
+    }
+
+
+def _compute_subgroup_stats(df: pd.DataFrame, subgroups: dict) -> dict:
+    """
+    Compute per-subgroup statistics (n_guids, n_epochs, epochs_per_guid).
+
+    Args:
+        df: Predictions DataFrame (must have epoch_hours already).
+        subgroups: Dict from ``_get_clinical_subgroups()``.
+
+    Returns:
+        Dict mapping subgroup key -> stats dict.
+    """
+    results = {}
+    for key, (label, filt, _color) in subgroups.items():
+        sub = df[filt(df)]
+        n_guids = int(sub['guid'].nunique())
+        n_epochs = len(sub)
+        if n_guids > 0:
+            epg = sub.groupby('guid').size()
+            epg_stats = {
+                'min': int(epg.min()),
+                'max': int(epg.max()),
+                'mean': float(epg.mean()),
+                'median': float(epg.median()),
+                'std': float(epg.std()) if len(epg) > 1 else 0.0,
+            }
+        else:
+            epg_stats = {'min': 0, 'max': 0, 'mean': 0.0, 'median': 0.0, 'std': 0.0}
+        results[key] = {
+            'label': label,
+            'n_guids': n_guids,
+            'n_epochs': n_epochs,
+            'epochs_per_guid': epg_stats,
+        }
+    return results
+
+
 def generate_fold_dataset_stats(
     df: pd.DataFrame,
     time_bins: np.ndarray,
@@ -1359,12 +1444,19 @@ def generate_fold_dataset_stats(
     """
     Generate per-fold dataset statistics folder with JSON summary, plots, and CSV.
 
+    All outputs are stratified by clinical subgroup:
+      Healthy  — BG+/BG\u2212  and CS+/CS\u2212
+      Acidosis — CS+/CS\u2212
+      HIE      — CS+/CS\u2212
+
     Creates a ``dataset_stats/`` directory containing:
-    - dataset_summary.json  — computed statistics
-    - dataset_overview.pdf  — 2x2 overview figure
-    - epochs_per_time_bin.pdf — epochs per metric time bin (stacked by label)
-    - epochs_per_guid_ranked.pdf — ranked bar chart coloured by label
-    - label_cross_table.csv — target x cs_label x bg_label cross-tabulation
+    - dataset_summary.json       — overall + per-subgroup statistics
+    - dataset_overview.pdf       — 2\u00d72 overview figure with subgroup bars
+    - subgroup_overview.pdf      — grouped bar chart (GUIDs & epochs per subgroup)
+    - epochs_per_time_bin.pdf    — stacked by Healthy / Acidosis / HIE
+    - epochs_per_time_bin_subgroups.pdf — per-diagnosis panels with CS/BG stratification
+    - epochs_per_guid_ranked.pdf — ranked bar chart coloured by diagnosis
+    - label_cross_table.csv      — target \u00d7 cs_label \u00d7 bg_label (GUID + epoch counts)
 
     Args:
         df: Predictions DataFrame with columns: guid, epoch, target,
@@ -1379,7 +1471,10 @@ def generate_fold_dataset_stats(
     # Ensure epoch_hours column exists
     df_stats = ensure_epoch_hours(df.copy())
 
-    # --- A. Compute summary statistics ----------------------------------
+    subgroups = _get_clinical_subgroups()
+    subgroup_stats = _compute_subgroup_stats(df_stats, subgroups)
+
+    # --- A. Compute overall summary statistics --------------------------
     n_guids = int(df_stats['guid'].nunique())
     n_epochs = len(df_stats)
 
@@ -1426,7 +1521,7 @@ def generate_fold_dataset_stats(
         'bg_negative': int(df_stats['bg_label'].eq(False).sum()),
     }
 
-    # Epochs per time bin
+    # Epochs per time bin (overall)
     bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
     bin_epoch_counts = []
     for i in range(len(time_bins) - 1):
@@ -1463,6 +1558,7 @@ def generate_fold_dataset_stats(
             },
         },
         'epochs_per_time_bin': bin_epoch_counts,
+        'subgroups': subgroup_stats,
     }
 
     with open(output_dir / "dataset_summary.json", 'w') as f:
@@ -1470,15 +1566,21 @@ def generate_fold_dataset_stats(
     logger.info(f"Dataset summary saved to {output_dir / 'dataset_summary.json'}")
 
     # --- B. Dataset overview (2x2) --------------------------------------
-    _plot_dataset_overview(df_stats, summary, output_dir, title_suffix)
+    _plot_dataset_overview(df_stats, summary, subgroup_stats, output_dir, title_suffix)
 
-    # --- C. Epochs per time bin -----------------------------------------
+    # --- C. Subgroup overview bar chart ---------------------------------
+    _plot_subgroup_overview(subgroup_stats, subgroups, output_dir, title_suffix)
+
+    # --- D. Epochs per time bin (diagnosis-level stacked) ---------------
     _plot_epochs_per_time_bin(df_stats, time_bins, output_dir, title_suffix)
 
-    # --- D. Epochs per GUID ranked --------------------------------------
+    # --- E. Epochs per time bin (per-diagnosis CS/BG panels) ------------
+    _plot_epochs_per_time_bin_subgroups(df_stats, time_bins, subgroups, output_dir, title_suffix)
+
+    # --- F. Epochs per GUID ranked --------------------------------------
     _plot_epochs_per_guid_ranked(df_stats, output_dir, title_suffix)
 
-    # --- E. Label cross-table -------------------------------------------
+    # --- G. Label cross-table -------------------------------------------
     _save_label_cross_table(df_stats, output_dir)
 
     logger.info(f"Fold dataset stats saved to {output_dir}")
@@ -1487,19 +1589,20 @@ def generate_fold_dataset_stats(
 def _plot_dataset_overview(
     df: pd.DataFrame,
     summary: dict,
+    subgroup_stats: dict,
     output_dir: Path,
     title_suffix: str,
 ) -> None:
-    """Create 2x2 overview figure: histogram, time dist, label bars, summary text."""
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    """Create 2x2 overview figure: histogram, time dist, subgroup bars, summary text."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(f"Dataset Overview — {title_suffix}", fontsize=12, fontweight='bold', y=0.98)
 
-    # Colours consistent with evaluate_classifier palette
+    subgroups = _get_clinical_subgroups()
+
+    # Colours
     c_green = '#2ecc71'
     c_blue = '#3498db'
     c_red = '#e74c3c'
-    c_orange = '#e67e22'
-    c_gray = '#95a5a6'
 
     # [0,0] Epochs per GUID histogram
     ax = axes[0, 0]
@@ -1527,53 +1630,111 @@ def _plot_dataset_overview(
     ax.set_title(f"Time Distribution ({summary['n_unique_time_points']} unique pts)")
     ax.invert_xaxis()
 
-    # [1,0] Label distribution bars
+    # [1,0] Subgroup GUID counts (grouped bar chart)
     ax = axes[1, 0]
-    guid_level = summary['label_distributions']['guid_level']
-    tgt = guid_level['target']
-    cs = summary['label_distributions']['epoch_level']['cs_label']
-    bg = summary['label_distributions']['epoch_level']['bg_label']
-    labels = ['Healthy', 'Acidosis', 'HIE', 'CS+', 'BG+']
-    counts = [
-        tgt.get('healthy', 0), tgt.get('acidosis', 0), tgt.get('hie', 0),
-        cs.get('cs_positive', 0), bg.get('bg_positive', 0),
-    ]
-    colors_bar = [c_green, c_red, c_orange, c_blue, c_gray]
-    bars = ax.bar(labels, counts, color=colors_bar, edgecolor='white', alpha=0.8)
-    ax.set_ylabel("Count")
-    ax.set_title("Label Distribution (GUIDs / epoch counts)")
-    for bar, cnt in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                f"{cnt}", ha='center', va='bottom', fontsize=8)
+    # Show the 8 clinical subgroups
+    sg_keys = list(subgroups.keys())
+    sg_labels = [subgroups[k][0] for k in sg_keys]
+    sg_colors = [subgroups[k][2] for k in sg_keys]
+    sg_guids = [subgroup_stats.get(k, {}).get('n_guids', 0) for k in sg_keys]
 
-    # [1,1] Text summary box
+    x_pos = np.arange(len(sg_keys))
+    bars = ax.bar(x_pos, sg_guids, color=sg_colors, edgecolor='white', alpha=0.85)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(sg_labels, rotation=40, ha='right', fontsize=7)
+    ax.set_ylabel("Number of GUIDs")
+    ax.set_title("Subgroup GUID Counts")
+    for bar, cnt in zip(bars, sg_guids):
+        if cnt > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{cnt}", ha='center', va='bottom', fontsize=7)
+
+    # [1,1] Text summary box with subgroup breakdown
     ax = axes[1, 1]
     ax.axis('off')
     epg = summary['epochs_per_guid']
     tr = summary['time_range']
+    tgt = summary['label_distributions']['guid_level']['target']
+
+    # Build subgroup lines
+    sg_lines = []
+    for k in sg_keys:
+        s = subgroup_stats.get(k, {})
+        sg_lines.append(f"  {subgroups[k][0]:16s}  {s.get('n_guids',0):3d} GUIDs  {s.get('n_epochs',0):5d} epochs")
+
     text = (
         f"Dataset Summary\n"
-        f"{'─' * 28}\n"
+        f"{'─' * 42}\n"
         f"Total Epochs:  {summary['total_epochs']:,}\n"
         f"Unique GUIDs:  {summary['total_guids']:,}\n"
-        f"Unique Times:  {summary['n_unique_time_points']}\n\n"
-        f"Epochs per GUID:\n"
-        f"  Min: {epg['min']}  Max: {epg['max']}\n"
-        f"  Mean: {epg['mean']:.1f}  Median: {epg['median']:.1f}\n\n"
-        f"Time Before Birth:\n"
-        f"  Range: {tr['max_hhmm']} → {tr['min_hhmm']} (HH:MM)\n"
-        f"  ({abs(tr['max_hours']):.1f}h → {abs(tr['min_hours']):.1f}h)\n\n"
-        f"Labels (GUID-level):\n"
         f"  Healthy: {tgt.get('healthy', 0)}  "
         f"Acidosis: {tgt.get('acidosis', 0)}  "
-        f"HIE: {tgt.get('hie', 0)}"
+        f"HIE: {tgt.get('hie', 0)}\n\n"
+        f"Epochs/GUID: {epg['mean']:.1f} mean, {epg['median']:.1f} med\n"
+        f"Time: {tr['max_hhmm']} \u2192 {tr['min_hhmm']} (HH:MM)\n\n"
+        f"Subgroups:\n" + "\n".join(sg_lines)
     )
-    ax.text(0.05, 0.95, text, transform=ax.transAxes,
-            fontsize=9, verticalalignment='top', fontfamily='monospace',
+    ax.text(0.02, 0.98, text, transform=ax.transAxes,
+            fontsize=7.5, verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#ecf0f1', alpha=0.3))
 
     plt.tight_layout()
     plt.savefig(output_dir / "dataset_overview.pdf", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _plot_subgroup_overview(
+    subgroup_stats: dict,
+    subgroups: dict,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    """Grouped bar chart showing n_guids and n_epochs for every clinical subgroup."""
+    sg_keys = list(subgroups.keys())
+    sg_labels = [subgroups[k][0] for k in sg_keys]
+    sg_colors = [subgroups[k][2] for k in sg_keys]
+    sg_guids = [subgroup_stats.get(k, {}).get('n_guids', 0) for k in sg_keys]
+    sg_epochs = [subgroup_stats.get(k, {}).get('n_epochs', 0) for k in sg_keys]
+
+    x = np.arange(len(sg_keys))
+    width = 0.38
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+
+    # GUIDs bars (left)
+    bars_g = ax1.bar(x - width / 2, sg_guids, width, color=sg_colors,
+                     edgecolor='white', alpha=0.85, label='GUIDs')
+    ax1.set_ylabel("Number of GUIDs")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(sg_labels, rotation=35, ha='right', fontsize=8)
+
+    # Epochs bars (right, secondary axis)
+    ax2 = ax1.twinx()
+    bars_e = ax2.bar(x + width / 2, sg_epochs, width, color=sg_colors,
+                     edgecolor='white', alpha=0.45, hatch='//', label='Epochs')
+    ax2.set_ylabel("Number of Epochs")
+
+    # Count labels
+    for bar, cnt in zip(bars_g, sg_guids):
+        if cnt > 0:
+            ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{cnt}", ha='center', va='bottom', fontsize=7)
+    for bar, cnt in zip(bars_e, sg_epochs):
+        if cnt > 0:
+            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{cnt}", ha='center', va='bottom', fontsize=7)
+
+    # Combined legend
+    from matplotlib.patches import Patch
+    ax1.legend(handles=[
+        Patch(facecolor='gray', alpha=0.85, label='GUIDs (solid)'),
+        Patch(facecolor='gray', alpha=0.45, hatch='//', label='Epochs (hatched)'),
+    ], fontsize=8, loc='upper right')
+
+    ax1.set_title(f"Subgroup Overview — {title_suffix}", fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "subgroup_overview.pdf", dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -1583,32 +1744,38 @@ def _plot_epochs_per_time_bin(
     output_dir: Path,
     title_suffix: str,
 ) -> None:
-    """Bar chart of epochs per metric time bin, stacked by healthy vs unhealthy."""
+    """Stacked bar chart of epochs per metric time bin (Healthy / Acidosis / HIE)."""
     bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
     n_bins = len(bin_centers)
 
     counts_healthy = np.zeros(n_bins)
-    counts_unhealthy = np.zeros(n_bins)
+    counts_acidosis = np.zeros(n_bins)
+    counts_hie = np.zeros(n_bins)
 
     for i in range(n_bins):
         lo, hi = time_bins[i], time_bins[i + 1]
         mask = (df['epoch_hours'] >= lo) & (df['epoch_hours'] < hi)
         bin_df = df[mask]
-        counts_healthy[i] = (bin_df['binary_target'] == 0).sum()
-        counts_unhealthy[i] = (bin_df['binary_target'] == 1).sum()
+        counts_healthy[i] = (bin_df['target'] == 1).sum()
+        counts_acidosis[i] = (bin_df['target'] == 2).sum()
+        counts_hie[i] = (bin_df['target'] == 3).sum()
 
-    bar_width = np.median(np.diff(time_bins)) * 0.8 if n_bins > 1 else 0.3
+    bar_width = float(np.median(np.diff(time_bins)) * 0.8) if n_bins > 1 else 0.3
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.bar(bin_centers, counts_healthy, width=bar_width, label='Healthy (target=0)',
-           color='#2ecc71', edgecolor='white', alpha=0.85)
-    ax.bar(bin_centers, counts_unhealthy, width=bar_width, bottom=counts_healthy,
-           label='Unhealthy (target=1)', color='#e74c3c', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, counts_healthy, width=bar_width,
+           label='Healthy', color='#2ecc71', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, counts_acidosis, width=bar_width, bottom=counts_healthy,
+           label='Acidosis', color='#e74c3c', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, counts_hie, width=bar_width,
+           bottom=counts_healthy + counts_acidosis,
+           label='HIE', color='#e67e22', edgecolor='white', alpha=0.85)
 
+    total = int(counts_healthy.sum() + counts_acidosis.sum() + counts_hie.sum())
     ax.set_xlabel("Hours before birth")
     ax.set_ylabel("Number of epochs")
     ax.set_title(f"Epochs per Time Bin — {title_suffix}\n"
-                 f"({n_bins} bins, {int(counts_healthy.sum() + counts_unhealthy.sum())} total epochs)")
+                 f"({n_bins} bins, {total} total epochs)")
     ax.legend(fontsize=9)
     ax.invert_xaxis()
 
@@ -1617,19 +1784,143 @@ def _plot_epochs_per_time_bin(
     plt.close(fig)
 
 
+def _plot_epochs_per_time_bin_subgroups(
+    df: pd.DataFrame,
+    time_bins: np.ndarray,
+    subgroups: dict,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    """
+    Multi-panel figure: per-diagnosis time-bin breakdown with CS/BG stratification.
+
+    Layout (3 rows):
+      Row 0 — Healthy: BG+ vs BG\u2212  |  Healthy: CS+ vs CS\u2212
+      Row 1 — Acidosis: CS+ vs CS\u2212  |  (empty / summary text)
+      Row 2 — HIE: CS+ vs CS\u2212       |  (empty / summary text)
+    """
+    bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
+    n_bins = len(bin_centers)
+    bar_width = float(np.median(np.diff(time_bins)) * 0.8) if n_bins > 1 else 0.3
+
+    def _bin_counts(filt):
+        counts = np.zeros(n_bins)
+        for i in range(n_bins):
+            lo, hi = time_bins[i], time_bins[i + 1]
+            mask_time = (df['epoch_hours'] >= lo) & (df['epoch_hours'] < hi)
+            counts[i] = filt(df[mask_time]).sum()
+        return counts
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    fig.suptitle(f"Epochs per Time Bin by Subgroup — {title_suffix}",
+                 fontsize=13, fontweight='bold', y=0.98)
+
+    # --- Row 0, Col 0: Healthy by BG ---
+    ax = axes[0, 0]
+    c_bg_pos = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == True))   # noqa: E712
+    c_bg_neg = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == False))  # noqa: E712
+    ax.bar(bin_centers, c_bg_neg, width=bar_width,
+           label=f"Healthy BG\u2212 ({int(c_bg_neg.sum())})",
+           color='#27ae60', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, c_bg_pos, width=bar_width, bottom=c_bg_neg,
+           label=f"Healthy BG+ ({int(c_bg_pos.sum())})",
+           color='#2ecc71', edgecolor='white', alpha=0.85)
+    ax.set_title("Healthy — BG stratification")
+    ax.set_ylabel("Epochs")
+    ax.legend(fontsize=8)
+    ax.invert_xaxis()
+
+    # --- Row 0, Col 1: Healthy by CS ---
+    ax = axes[0, 1]
+    c_cs_pos = _bin_counts(lambda d: (d['target'] == 1) & (d['cs_label'] == True))   # noqa: E712
+    c_cs_neg = _bin_counts(lambda d: (d['target'] == 1) & (d['cs_label'] == False))  # noqa: E712
+    ax.bar(bin_centers, c_cs_neg, width=bar_width,
+           label=f"Healthy CS\u2212 ({int(c_cs_neg.sum())})",
+           color='#6ab04c', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, c_cs_pos, width=bar_width, bottom=c_cs_neg,
+           label=f"Healthy CS+ ({int(c_cs_pos.sum())})",
+           color='#a8e6cf', edgecolor='white', alpha=0.85)
+    ax.set_title("Healthy — CS stratification")
+    ax.set_ylabel("Epochs")
+    ax.legend(fontsize=8)
+    ax.invert_xaxis()
+
+    # --- Row 1, Col 0: Acidosis by CS ---
+    ax = axes[1, 0]
+    c_acid_cs_pos = _bin_counts(lambda d: (d['target'] == 2) & (d['cs_label'] == True))   # noqa: E712
+    c_acid_cs_neg = _bin_counts(lambda d: (d['target'] == 2) & (d['cs_label'] == False))  # noqa: E712
+    ax.bar(bin_centers, c_acid_cs_neg, width=bar_width,
+           label=f"Acidosis CS\u2212 ({int(c_acid_cs_neg.sum())})",
+           color='#c0392b', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, c_acid_cs_pos, width=bar_width, bottom=c_acid_cs_neg,
+           label=f"Acidosis CS+ ({int(c_acid_cs_pos.sum())})",
+           color='#e74c3c', edgecolor='white', alpha=0.85)
+    ax.set_title("Acidosis — CS stratification")
+    ax.set_ylabel("Epochs")
+    ax.set_xlabel("Hours before birth")
+    ax.legend(fontsize=8)
+    ax.invert_xaxis()
+
+    # --- Row 1, Col 1: Acidosis summary text ---
+    ax = axes[1, 1]
+    ax.axis('off')
+    n_acid = int((df['target'] == 2).sum())
+    n_acid_guids = int(df[df['target'] == 2]['guid'].nunique())
+    ax.text(0.1, 0.7,
+            f"Acidosis: {n_acid_guids} GUIDs, {n_acid} epochs\n"
+            f"  CS+: {int(c_acid_cs_pos.sum())} epochs\n"
+            f"  CS\u2212: {int(c_acid_cs_neg.sum())} epochs",
+            transform=ax.transAxes, fontsize=10, fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#fadbd8', alpha=0.4))
+
+    # --- Row 2, Col 0: HIE by CS ---
+    ax = axes[2, 0]
+    c_hie_cs_pos = _bin_counts(lambda d: (d['target'] == 3) & (d['cs_label'] == True))   # noqa: E712
+    c_hie_cs_neg = _bin_counts(lambda d: (d['target'] == 3) & (d['cs_label'] == False))  # noqa: E712
+    ax.bar(bin_centers, c_hie_cs_neg, width=bar_width,
+           label=f"HIE CS\u2212 ({int(c_hie_cs_neg.sum())})",
+           color='#d35400', edgecolor='white', alpha=0.85)
+    ax.bar(bin_centers, c_hie_cs_pos, width=bar_width, bottom=c_hie_cs_neg,
+           label=f"HIE CS+ ({int(c_hie_cs_pos.sum())})",
+           color='#e67e22', edgecolor='white', alpha=0.85)
+    ax.set_title("HIE — CS stratification")
+    ax.set_ylabel("Epochs")
+    ax.set_xlabel("Hours before birth")
+    ax.legend(fontsize=8)
+    ax.invert_xaxis()
+
+    # --- Row 2, Col 1: HIE summary text ---
+    ax = axes[2, 1]
+    ax.axis('off')
+    n_hie = int((df['target'] == 3).sum())
+    n_hie_guids = int(df[df['target'] == 3]['guid'].nunique())
+    ax.text(0.1, 0.7,
+            f"HIE: {n_hie_guids} GUIDs, {n_hie} epochs\n"
+            f"  CS+: {int(c_hie_cs_pos.sum())} epochs\n"
+            f"  CS\u2212: {int(c_hie_cs_neg.sum())} epochs",
+            transform=ax.transAxes, fontsize=10, fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#fdebd0', alpha=0.4))
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "epochs_per_time_bin_subgroups.pdf", dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def _plot_epochs_per_guid_ranked(
     df: pd.DataFrame,
     output_dir: Path,
     title_suffix: str,
 ) -> None:
-    """Ranked bar chart of epochs per GUID, coloured by target label."""
+    """Ranked bar chart of epochs per GUID, coloured by diagnosis (Healthy/Acidosis/HIE)."""
     guid_info = df.groupby('guid').agg(
         n_epochs=('epoch', 'size'),
-        binary_target=('binary_target', 'first'),
+        target=('target', 'first'),
     ).sort_values('n_epochs', ascending=False).reset_index()
 
+    diag_colors = {1: '#2ecc71', 2: '#e74c3c', 3: '#e67e22'}
+    colors = [diag_colors.get(t, '#95a5a6') for t in guid_info['target']]
+
     x = np.arange(len(guid_info))
-    colors = ['#e74c3c' if bt == 1 else '#2ecc71' for bt in guid_info['binary_target']]
 
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.bar(x, guid_info['n_epochs'].values, color=colors, alpha=0.85, width=1.0)
@@ -1641,11 +1932,11 @@ def _plot_epochs_per_guid_ranked(
     ax.axhline(mean_val, color='#3498db', linestyle='--', linewidth=1.5,
                label=f"Mean: {mean_val:.1f}")
 
-    # Legend for colours
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='#2ecc71', alpha=0.85, label='Healthy'),
-        Patch(facecolor='#e74c3c', alpha=0.85, label='Unhealthy'),
+        Patch(facecolor='#e74c3c', alpha=0.85, label='Acidosis'),
+        Patch(facecolor='#e67e22', alpha=0.85, label='HIE'),
         ax.get_lines()[0],
     ]
     ax.legend(handles=legend_elements, fontsize=8)
@@ -1656,7 +1947,7 @@ def _plot_epochs_per_guid_ranked(
 
 
 def _save_label_cross_table(df: pd.DataFrame, output_dir: Path) -> None:
-    """Save target x cs_label x bg_label cross-tabulation at GUID level."""
+    """Save target x cs_label x bg_label cross-tabulation (GUID + epoch counts)."""
     guid_info = df.groupby('guid').agg({
         'target': 'first',
         'cs_label': 'first',
@@ -1664,22 +1955,27 @@ def _save_label_cross_table(df: pd.DataFrame, output_dir: Path) -> None:
     }).reset_index()
 
     target_map = {1: 'Healthy', 2: 'Acidosis', 3: 'HIE'}
-    guid_info['target_name'] = guid_info['target'].map(target_map).fillna('Unknown')
 
     rows = []
     for tgt_val, tgt_name in target_map.items():
         for cs_val in [False, True]:
             for bg_val in [False, True]:
-                mask = (
+                guid_mask = (
                     (guid_info['target'] == tgt_val) &
                     (guid_info['cs_label'] == cs_val) &
                     (guid_info['bg_label'] == bg_val)
+                )
+                epoch_mask = (
+                    (df['target'] == tgt_val) &
+                    (df['cs_label'] == cs_val) &
+                    (df['bg_label'] == bg_val)
                 )
                 rows.append({
                     'target': tgt_name,
                     'cs_label': int(cs_val),
                     'bg_label': int(bg_val),
-                    'n_guids': int(mask.sum()),
+                    'n_guids': int(guid_mask.sum()),
+                    'n_epochs': int(epoch_mask.sum()),
                 })
 
     cross_df = pd.DataFrame(rows)
