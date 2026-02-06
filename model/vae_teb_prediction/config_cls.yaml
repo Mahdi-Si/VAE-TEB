@@ -7,11 +7,11 @@
 # =============================================================================
 
 general_config:
-  tag: vae_classification_run_8           # Experiment identifier for logging/output dirs
+  tag: vae_classification_run_9           # Experiment identifier for logging/output dirs
 
   cuda_devices: [0, 1, 2, 3, 4]           # GPU device IDs to use (one per parallel fold)
   max_parallel_folds: 5                    # Max folds to run in parallel (set 1 for sequential)
-  lr: 0.00001                             # Learning rate (reduce to 0.00005 for frozen VAE)
+  lr: 0.001                               # Learning rate (1e-3 for frozen VAE + trainable head)
   lr_milestone: [100]                     # Epochs at which to decay learning rate
   checkpoint_frequency: 1                 # Save checkpoint every N epochs
   plot_frequency: 1                       # Generate plots every N epochs
@@ -47,7 +47,7 @@ model_config:
   # -------------------------------------------------------------------------
   classifier:
     vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
-    type: cnn_lstm                        # Options: 'lstm', 'cnn_lstm', 'bilstm', 'bilstm_attention', 'cnn', 'transformer'
+    type: mamba                           # Options: 'mamba', 'multiscale_conv_attention', 'lstm', 'cnn_lstm', 'bilstm_attention', 'cnn', 'transformer'
     latent_dim: 16                        # VAE latent dimension (must match checkpoint)
     num_classes: 2                        # Binary classification (healthy vs unhealthy)
     freeze_vae: true                      # Freeze VAE weights during classifier training
@@ -58,6 +58,7 @@ model_config:
     hidden_dim: 128                       # Hidden dimension for LSTM/BiLSTM
     num_layers: 3                         # Number of recurrent layers
     dropout: 0.1                          # Dropout rate
+    mlp_multiplier: 2.0                   # MLP head hidden dim = pooled_dim * multiplier
 
     # LSTM-specific
     bidirectional: false                  # Use bidirectional LSTM
@@ -66,19 +67,32 @@ model_config:
     attn_dim: 64                          # Attention dimension for BiLSTMAttention
 
     # CNN-specific (also used by CNN-LSTM as per-branch filter count)
-    num_filters: 32                       # Number of CNN filters (32 per-branch for cnn_lstm, 64 for standalone cnn)
-    kernel_sizes: [3, 5, 7]               # CNN kernel sizes
+    num_filters: 32                       # Number of CNN filters (32 per-branch for cnn_lstm/multiscale, 64 for standalone cnn)
+    kernel_sizes: [5, 19, 39]             # Multi-scale kernel sizes (beat-to-beat / decelerations / baseline shifts)
 
     # CNN-LSTM specific
     cnn_out_dim: 64                       # Projected CNN output dimension
     lstm_hidden: 128                      # LSTM hidden dim per direction (BiLSTM)
     lstm_layers: 2                        # Number of stacked LSTM layers
 
-    # Pooling (used by cnn_lstm and transformer)
-    pooling: mean_max                     # Pooling strategy: 'mean_max'/'mean'/'max'/'last' (cnn_lstm), 'mean'/'cls' (transformer)
+    # Pooling (used by mamba, cnn_lstm, multiscale_conv_attention, transformer)
+    pooling: mean_max                     # Pooling strategy: 'mean_max'/'mean'/'max'/'last'/'concat'
+
+    # Mamba-specific (selective state space model)
+    d_model: 64                           # Mamba model dimension after input projection
+    d_state: 16                           # SSM state dimension (matches latent dim)
+    expand: 2                             # Inner dimension expansion factor
+    conv_kernel: 4                        # Local depthwise conv kernel in Mamba block
+    n_layers: 3                           # Number of stacked Mamba blocks
+
+    # MultiScale Conv Attention specific
+    n_inception_blocks: 2                 # Number of InceptionTime blocks
+    se_reduction: 8                       # Squeeze-and-Excitation reduction ratio
+    n_attn_heads: 4                       # Self-attention heads
+    attn_dropout: 0.1                     # Attention dropout
 
     # Transformer-specific
-    d_model: 128                          # Transformer model dimension
+    # d_model: 128                        # (shared with Mamba — set d_model above)
     n_heads: 4                            # Number of attention heads
     dim_feedforward: 256                  # Feedforward network dimension
 
@@ -191,13 +205,13 @@ advanced_config:
     mlflow:
       enabled: true
       tracking_uri: "http://localhost:5000"
-      experiment_name: seqvae-teb-k-fold-run-8
+      experiment_name: seqvae-teb-k-fold-run-9
       run_name: null                      # Auto-generated if null
       artifact_location: null
       log_model: true
       log_config_artifact: true
       tags:
-        project: teb_vae_classifier_run_8
+        project: teb_vae_classifier_run_9
         stage: dev
 
   # -------------------------------------------------------------------------
