@@ -410,9 +410,18 @@ def create_hdf5_dataset_from_records_list(
                 )
 
             epoch_samples = mimo_prepared.block_input.shape[1]
-            fhr = mimo_prepared.block_input[:, :, 1]
+            fhr = mimo_prepared.block_input[:, :, 1].copy()
+            up = mimo_prepared.block_input[:, :, 0].copy()
 
-            up = mimo_prepared.block_input[:, :, 0]
+            # Clean NaN/Inf in raw signals (zero = "no signal", handled by sample_weights)
+            fhr_bad = ~np.isfinite(fhr)
+            up_bad = ~np.isfinite(up)
+            if fhr_bad.any() or up_bad.any():
+                n_bad = int(fhr_bad.sum() + up_bad.sum())
+                logger.warning(f"{os.path.splitext(os.path.split(record)[1])[0]}: "
+                               f"replaced {n_bad} NaN/Inf values with 0 in raw signals")
+                fhr[fhr_bad] = 0.0
+                up[up_bad] = 0.0
             domain_starts = mimo_prepared.domain_start
             guid_key = os.path.splitext(os.path.split(record)[1])[0]
             if guid_tracking is not None:
@@ -428,7 +437,7 @@ def create_hdf5_dataset_from_records_list(
             sample_weights = mimo_prepared.sample_weights
 
             st_input = torch.from_numpy(np.stack([fhr, up], axis=1)).float().to(device)
-            
+
             # Compute scattering and phase coefficients (FHR channel only)
             st_results_phase = st_model(x=st_input,
                                         compute_phase=True,
