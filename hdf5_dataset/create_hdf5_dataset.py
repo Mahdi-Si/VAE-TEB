@@ -45,6 +45,31 @@ torch.cuda.manual_seed(42)
 # Utility functions
 #-----------------------------------------------------------------------------------------------------------------------
 
+def interpolate_bad_values(signal_2d):
+    """Replace NaN/Inf values with linear interpolation, per row.
+
+    For each row (segment), valid samples are used as knots and bad samples
+    are filled by linear interpolation.  Edge NaNs are extrapolated flat
+    (np.interp default).  Rows that are entirely bad are filled with 0.
+    Operates in-place and returns the array.
+    """
+    bad = ~np.isfinite(signal_2d)
+    if not bad.any():
+        return signal_2d
+    indices = np.arange(signal_2d.shape[1])
+    for row_idx in range(signal_2d.shape[0]):
+        row_bad = bad[row_idx]
+        if not row_bad.any():
+            continue
+        row_good = ~row_bad
+        if not row_good.any():
+            signal_2d[row_idx] = 0.0
+            continue
+        signal_2d[row_idx, row_bad] = np.interp(
+            indices[row_bad], indices[row_good], signal_2d[row_idx, row_good])
+    return signal_2d
+
+
 def find_flat_regions(signal, tolerance=1e-3, min_length=20):
     """
     Finds flat regions in the signal that are at least `min_length` samples long.
@@ -413,15 +438,23 @@ def create_hdf5_dataset_from_records_list(
             fhr = mimo_prepared.block_input[:, :, 1].copy()
             up = mimo_prepared.block_input[:, :, 0].copy()
 
-            # Clean NaN/Inf in raw signals (zero = "no signal", handled by sample_weights)
-            fhr_bad = ~np.isfinite(fhr)
-            up_bad = ~np.isfinite(up)
-            if fhr_bad.any() or up_bad.any():
-                n_bad = int(fhr_bad.sum() + up_bad.sum())
+            # Sanitize raw signals: linear-interpolate NaN/Inf, clamp range,
+            # flush denormalized floats.
+            n_bad_fhr = int((~np.isfinite(fhr)).sum())
+            n_bad_up = int((~np.isfinite(up)).sum())
+            if n_bad_fhr or n_bad_up:
                 logger.warning(f"{os.path.splitext(os.path.split(record)[1])[0]}: "
-                               f"replaced {n_bad} NaN/Inf values with 0 in raw signals")
-                fhr[fhr_bad] = 0.0
-                up[up_bad] = 0.0
+                               f"interpolating {n_bad_fhr + n_bad_up} NaN/Inf values "
+                               f"(FHR={n_bad_fhr}, UP={n_bad_up})")
+                interpolate_bad_values(fhr)
+                interpolate_bad_values(up)
+            # Clamp to generous physiological range (avoids MKL FFT overflow)
+            fhr = np.clip(fhr, 0, 500).astype(np.float32)
+            up = np.clip(up, -50, 500).astype(np.float32)
+            # Flush denormalized floats to zero (MKL can choke on subnormals)
+            tiny = np.finfo(np.float32).tiny  # ~1.18e-38
+            fhr[(fhr != 0) & (np.abs(fhr) < tiny)] = 0.0
+            up[(up != 0) & (np.abs(up) < tiny)] = 0.0
             domain_starts = mimo_prepared.domain_start
             guid_key = os.path.splitext(os.path.split(record)[1])[0]
             if guid_tracking is not None:
@@ -436,59 +469,22 @@ def create_hdf5_dataset_from_records_list(
             # sample_weights = np.repeat(mimo_prepared.sample_weights, repeats=16, axis=1)
             sample_weights = mimo_prepared.sample_weights
 
-            st_input = torch.from_numpy(np.stack([fhr, up], axis=1)).float().to(device)
+            record_file = os.path.split(record)
+            record_name = os.path.splitext(record_file[1])
 
-            # Compute scattering and phase coefficients (FHR channel only)
-            st_results_phase = st_model(x=st_input,
-                                        compute_phase=True,
-                                        compute_cross_phase=False,
-                                        scattering_channel=0,
-                                        phase_channels=[0])
-            
-            # Compute cross-channel phase coefficients (FHR-UP)
-            st_results_cross = st_model(x=st_input,
-                                        compute_phase=False,
-                                        compute_cross_phase=True,
-                                        scattering_channel=0,
-                                        phase_channels=[0, 1])
-            
-            # Extract coefficients
-            fhr_st = st_results_phase.get('scattering')  # Use all scattering coefficients (first order)
-            fhr_st_phase_full = st_results_phase.get('phase_corr')
-            fhr_up_cc_phase_full = st_results_cross.get('cross_phase_corr')
-            
-            # Apply optimal selection masks to reduce coefficients
-            fhr_ph = fhr_st_phase_full[:, phase_mask, :] if fhr_st_phase_full is not None else None
-            fhr_up_ph = fhr_up_cc_phase_full[:, cross_mask, :] if fhr_up_cc_phase_full is not None else None
-            # ===========================================
-            # Testing the overlap plot:
-
-            # if fhr.shape[0] >= 4:  # Only plot if we have at least 4 segments
-            #     try:
-            #         plot_fhr_signals(fhr, domain_starts, start_idx=0,
-            #                          save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_{os.path.splitext(os.path.split(record)[1])}.png")
-            #         logger.info(f"FHR plot saved for record {counter_rec}")
-            #     except Exception as plot_error:
-            #         logger.warning(f"Could not create FHR plot: {plot_error}")
-            # =============================================
-
+            # ---- Step 1: Filter segments BEFORE scattering ----
+            valid_indices = []
             for i in range(fhr.shape[0]):
-                record_file = os.path.split(record)
-                record_name = os.path.splitext(record_file[1])
-
                 if np.mean(sample_weights[i, :]) < 0.90:
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_low_weight.append(float(domain_starts[i]))
                     continue
 
-                # --- Corrected flat region detection ---
+                # Flat region detection
                 fhr_flat_regions = find_flat_regions(fhr[i, :], tolerance=1e-9)
                 up_flat_regions = find_flat_regions(up[i, :], tolerance=1e-9)
-
-                # Calculate lengths of flat regions
                 fhr_flat_lengths = [end - start + 1 for start, end in fhr_flat_regions]
                 up_flat_lengths = [end - start + 1 for start, end in up_flat_regions]
-
                 max_flat_fhr_len = max(fhr_flat_lengths, default=0)
                 max_flat_up_len = max(up_flat_lengths, default=0)
                 total_flat_fhr_len = sum(fhr_flat_lengths)
@@ -502,32 +498,75 @@ def create_hdf5_dataset_from_records_list(
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_flat_region.append(float(domain_starts[i]))
                 else:
-                    # plotting for test =============================================================================================================================================
-                    # plot_channel_range(fhr_st[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_st_{os.path.splitext(os.path.split(record)[1])}.png")
-                    # plot_stacked_channels(fhr_st[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_st_chs_{os.path.splitext(os.path.split(record)[1])}.png")
-                    #
-                    # plot_channel_range(fhr_st_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_ph_{os.path.splitext(os.path.split(record)[1])}.png")
-                    # plot_stacked_channels(fhr_st_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_ph_chs_{os.path.splitext(os.path.split(record)[1])}.png")
-                    #
-                    # plot_channel_range(fhr_up_cc_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_up_ph_{os.path.splitext(os.path.split(record)[1])}.png")
-                    # plot_stacked_channels(fhr_up_cc_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_up_ph_chs_{os.path.splitext(os.path.split(record)[1])}.png")
-                    # # plotting for test =============================================================================================================================================
+                    valid_indices.append(i)
 
-                    if guid_tracking is not None:
-                        guid_tracking[guid_key].included_domain_starts.append(float(domain_starts[i]))
-                    append_sample(
-                        path=hdf5_path,
-                        fhr=fhr[i, :],
-                        up=up[i, :],
-                        fhr_st=fhr_st[i, :, :].detach().cpu().numpy(),
-                        fhr_ph=fhr_ph[i, :, :].detach().cpu().numpy(),
-                        fhr_up_ph=fhr_up_ph[i, :, :].detach().cpu().numpy(),
-                        target=pre_defined_target * sample_weights[i, :],
-                        weight=sample_weights[i, :],
-                        guid=record_name[0],
-                        epoch=domain_starts[i],
-                        bg_label=bg_label,
-                        cs_label=cs_label)
+            if not valid_indices:
+                logger.info(f'{guid_key}: all {fhr.shape[0]} segments filtered out, skipping record')
+                continue
+
+            # ---- Step 2: Scattering on valid segments only ----
+            valid_fhr = fhr[valid_indices]
+            valid_up = up[valid_indices]
+            st_input = torch.from_numpy(
+                np.stack([valid_fhr, valid_up], axis=1)).float().to(device)
+
+            # Per-segment scattering (one 24-min segment at a time)
+            st_phase_list = []
+            st_cross_list = []
+            scatter_failed = []
+            for seg_j in range(st_input.shape[0]):
+                seg = st_input[seg_j:seg_j+1]
+                try:
+                    seg_phase = st_model(x=seg,
+                                         compute_phase=True,
+                                         compute_cross_phase=False,
+                                         scattering_channel=0,
+                                         phase_channels=[0])
+                    seg_cross = st_model(x=seg,
+                                         compute_phase=False,
+                                         compute_cross_phase=True,
+                                         scattering_channel=0,
+                                         phase_channels=[0, 1])
+                    st_phase_list.append(seg_phase)
+                    st_cross_list.append(seg_cross)
+                except RuntimeError as seg_err:
+                    orig_idx = valid_indices[seg_j]
+                    logger.error(f"{guid_key} segment {orig_idx} "
+                                 f"(epoch={domain_starts[orig_idx]}): "
+                                 f"scattering failed: {seg_err}")
+                    scatter_failed.append(seg_j)
+                    st_phase_list.append(None)
+                    st_cross_list.append(None)
+
+            # ---- Step 3: Save valid, successfully scattered segments ----
+            for seg_j in range(len(valid_indices)):
+                if seg_j in scatter_failed:
+                    continue
+                orig_idx = valid_indices[seg_j]
+
+                fhr_st = st_phase_list[seg_j]['scattering'][0]
+                fhr_st_phase_full = st_phase_list[seg_j]['phase_corr'][0]
+                fhr_up_cc_phase_full = st_cross_list[seg_j]['cross_phase_corr'][0]
+
+                fhr_ph = fhr_st_phase_full[phase_mask, :]
+                fhr_up_ph = fhr_up_cc_phase_full[cross_mask, :]
+
+                if guid_tracking is not None:
+                    guid_tracking[guid_key].included_domain_starts.append(
+                        float(domain_starts[orig_idx]))
+                append_sample(
+                    path=hdf5_path,
+                    fhr=fhr[orig_idx, :],
+                    up=up[orig_idx, :],
+                    fhr_st=fhr_st.detach().cpu().numpy(),
+                    fhr_ph=fhr_ph.detach().cpu().numpy(),
+                    fhr_up_ph=fhr_up_ph.detach().cpu().numpy(),
+                    target=pre_defined_target * sample_weights[orig_idx, :],
+                    weight=sample_weights[orig_idx, :],
+                    guid=record_name[0],
+                    epoch=domain_starts[orig_idx],
+                    bg_label=bg_label,
+                    cs_label=cs_label)
 
         except Exception as e:
             errors_list.append(record)
