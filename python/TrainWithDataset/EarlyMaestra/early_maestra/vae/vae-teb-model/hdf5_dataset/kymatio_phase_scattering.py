@@ -29,9 +29,9 @@ class KymatioPhaseScattering1D(nn.Module):
     
     For J=11, Q=4, T=16 configuration:
     - Reduces phase coefficients by ~95% (from 903 to ~44 relevant pairs)
-    - Selects ~130 cross-channel coefficients for UP→FHR coupling
-    - Focuses on contraction frequencies (<0.02 Hz) and FHR variability (0.04-0.5 Hz)
-    - Total feature reduction from ~232 to ~219 coefficients with better clinical relevance
+    - v2 two-band selection: ~62 cross-channel coefficients for UP→FHR coupling
+      (Band A: deceleration 0.008-0.04 Hz, Band B: variability 0.04-0.25 Hz)
+    - Total feature reduction from ~232 to ~151 coefficients with better clinical relevance
     
     Usage for FHR Analysis:
     ----------------------
@@ -632,6 +632,193 @@ class KymatioPhaseScattering1D(nn.Module):
             'fhr_freqs_selected': self.center_freqs[self.j_idx[cross_mask]]
         }
     
+    def select_fhr_up_cross_coefficients_v2(self, fs=4.0,
+                                               band_a_up_max_hz=0.02,
+                                               band_a_fhr_min_hz=0.008,
+                                               band_a_fhr_max_hz=0.04,
+                                               band_a_k_steps=(0, 1, 2, 3, 4),
+                                               band_b_up_max_hz=0.02,
+                                               band_b_fhr_min_hz=0.04,
+                                               band_b_fhr_max_hz=0.25,
+                                               band_b_k_steps=(8, 12, 16),
+                                               power_tol=0.05):
+        """
+        Two-band cross-channel coefficient selection for FHR-UP analysis (v2).
+
+        Adds deceleration-band coverage (Band A) while tightening the variability
+        band (Band B), reducing total cross-channel coefficients from ~130 to ~62.
+
+        Band A — Contraction ↔ Deceleration:
+            UP < 0.02 Hz, FHR ∈ [0.008, 0.04) Hz, k-steps 0–4
+            Captures early vs late deceleration phase delays.
+
+        Band B — Contraction ↔ Variability (tightened):
+            UP < 0.02 Hz, FHR ∈ [0.04, 0.25] Hz, k-steps 8, 12, 16
+            Captures double/triple/quadruple-octave coupling.
+
+        All frequency thresholds are specified in **true Hz** and converted
+        internally to normalised ξ via ``threshold_hz / fs``.
+
+        Args:
+            fs: Sampling frequency in Hz (default 4.0).
+            band_a_up_max_hz: UP upper freq for Band A (Hz).
+            band_a_fhr_min_hz: FHR lower freq for Band A (Hz).
+            band_a_fhr_max_hz: FHR upper freq for Band A (Hz, exclusive).
+            band_a_k_steps: Tuple of Q-step offsets for Band A.
+            band_b_up_max_hz: UP upper freq for Band B (Hz).
+            band_b_fhr_min_hz: FHR lower freq for Band B (Hz).
+            band_b_fhr_max_hz: FHR upper freq for Band B (Hz, inclusive).
+            band_b_k_steps: Tuple of Q-step offsets for Band B.
+            power_tol: Relative tolerance for power matching (default 5%).
+
+        Returns:
+            dict with keys:
+                cross_mask: Combined boolean mask over all coupling pairs.
+                band_a_mask: Mask for Band A (deceleration) pairs only.
+                band_b_mask: Mask for Band B (variability) pairs only.
+                metadata: Selection statistics and frequency info.
+                i_idx_selected, j_idx_selected, powers_selected,
+                up_freqs_selected, fhr_freqs_selected: Selected pair details.
+        """
+        Q = self.Q
+
+        # Convert Hz thresholds to normalised ξ
+        band_a_up_max_xi = band_a_up_max_hz / fs
+        band_a_fhr_min_xi = band_a_fhr_min_hz / fs
+        band_a_fhr_max_xi = band_a_fhr_max_hz / fs
+        band_b_up_max_xi = band_b_up_max_hz / fs
+        band_b_fhr_min_xi = band_b_fhr_min_hz / fs
+        band_b_fhr_max_xi = band_b_fhr_max_hz / fs
+
+        n_pairs = len(self.i_idx)
+
+        # --- Band A: Contraction ↔ Deceleration ---
+        up_mask_a = self.center_freqs < band_a_up_max_xi
+        fhr_mask_a = (self.center_freqs >= band_a_fhr_min_xi) & (self.center_freqs < band_a_fhr_max_xi)
+
+        band_a_mask = torch.zeros(n_pairs, dtype=torch.bool, device=self.device)
+        for k in band_a_k_steps:
+            target_power = 2.0 ** (k / Q)
+            power_match = torch.abs(self.powers - target_power) < (power_tol * target_power)
+            k_mask = up_mask_a[self.i_idx] & fhr_mask_a[self.j_idx] & power_match
+            band_a_mask |= k_mask
+
+        # --- Band B: Contraction ↔ Variability (tightened) ---
+        up_mask_b = self.center_freqs < band_b_up_max_xi
+        fhr_mask_b = (self.center_freqs >= band_b_fhr_min_xi) & (self.center_freqs <= band_b_fhr_max_xi)
+
+        band_b_mask = torch.zeros(n_pairs, dtype=torch.bool, device=self.device)
+        for k in band_b_k_steps:
+            target_power = 2.0 ** (k / Q)
+            power_match = torch.abs(self.powers - target_power) < (power_tol * target_power)
+            k_mask = up_mask_b[self.i_idx] & fhr_mask_b[self.j_idx] & power_match
+            band_b_mask |= k_mask
+
+        # --- Combine ---
+        cross_mask = band_a_mask | band_b_mask
+
+        metadata = {
+            'total_pairs': n_pairs,
+            'band_a_pairs': band_a_mask.sum().item(),
+            'band_b_pairs': band_b_mask.sum().item(),
+            'cross_selected_pairs': cross_mask.sum().item(),
+            'band_a_freq_range_hz': {
+                'up': (0.0, band_a_up_max_hz),
+                'fhr': (band_a_fhr_min_hz, band_a_fhr_max_hz),
+            },
+            'band_b_freq_range_hz': {
+                'up': (0.0, band_b_up_max_hz),
+                'fhr': (band_b_fhr_min_hz, band_b_fhr_max_hz),
+            },
+            'band_a_k_steps': list(band_a_k_steps),
+            'band_b_k_steps': list(band_b_k_steps),
+            'up_filters_band_a': up_mask_a.sum().item(),
+            'fhr_filters_band_a': fhr_mask_a.sum().item(),
+            'up_filters_band_b': up_mask_b.sum().item(),
+            'fhr_filters_band_b': fhr_mask_b.sum().item(),
+            'power_range': (
+                self.powers[cross_mask].min().item() if cross_mask.any() else 0,
+                self.powers[cross_mask].max().item() if cross_mask.any() else 0,
+            ),
+        }
+
+        return {
+            'cross_mask': cross_mask,
+            'band_a_mask': band_a_mask,
+            'band_b_mask': band_b_mask,
+            'metadata': metadata,
+            'i_idx_selected': self.i_idx[cross_mask],
+            'j_idx_selected': self.j_idx[cross_mask],
+            'powers_selected': self.powers[cross_mask],
+            'up_freqs_selected': self.center_freqs[self.i_idx[cross_mask]],
+            'fhr_freqs_selected': self.center_freqs[self.j_idx[cross_mask]],
+        }
+
+    def get_optimal_coefficients_for_fhr_v2(self, j_config=11, q_config=4, t_config=16):
+        """
+        Get optimal coefficient selection for FHR analysis using two-band
+        cross-channel selection (v2).
+
+        Uses the same phase coefficient selection as v1 (44 coefficients) but
+        replaces the cross-channel selection with the two-band method that adds
+        deceleration-band coverage while reducing total cross-channel coefficients
+        from ~130 to ~62.
+
+        For J=11, Q=4, T=16 configuration:
+        - Selected phase coefficients: ~44
+        - Selected cross-channel coefficients: ~62 (Band A: ~40, Band B: ~22)
+        - Total selected features: ~151 (45 scattering + 44 phase + 62 cross-phase)
+
+        Args:
+            j_config: Current J parameter
+            q_config: Current Q parameter
+            t_config: Current T parameter
+
+        Returns:
+            dict: Complete coefficient selection strategy with masks and metadata
+        """
+        if j_config >= 11:
+            min_freq = 0.006
+        else:
+            min_freq = 0.003
+
+        phase_selection = self.select_fhr_phase_coefficients(
+            min_freq=min_freq,
+            max_harmonic_power=8,
+            include_autocorr=True,
+            harmonic_ratios=[2, 3]
+        )
+
+        cross_selection = self.select_fhr_up_cross_coefficients_v2()
+
+        config_analysis = {
+            'current_config': {'J': j_config, 'Q': q_config, 'T': t_config},
+            'total_scattering_coeffs': j_config * q_config + 1,
+            'selected_phase_coeffs': phase_selection['optimal_mask'].sum().item(),
+            'selected_cross_coeffs': cross_selection['cross_mask'].sum().item(),
+            'band_a_cross_coeffs': cross_selection['band_a_mask'].sum().item(),
+            'band_b_cross_coeffs': cross_selection['band_b_mask'].sum().item(),
+            'efficiency_gain': {
+                'phase_reduction': f"{100 * (1 - phase_selection['optimal_mask'].sum().item() / len(self.i_idx)):.1f}%",
+                'focus_improvement': f"Focused on {phase_selection['metadata']['selected_pairs']} most relevant pairs"
+            }
+        }
+
+        return {
+            'phase_selection': phase_selection,
+            'cross_selection': cross_selection,
+            'config_analysis': config_analysis,
+            'recommendations': {
+                'use_phase_mask': phase_selection['optimal_mask'],
+                'use_cross_mask': cross_selection['cross_mask'],
+                'total_selected_features': (
+                    config_analysis['total_scattering_coeffs'] +
+                    config_analysis['selected_phase_coeffs'] +
+                    config_analysis['selected_cross_coeffs']
+                )
+            }
+        }
+
     def get_optimal_coefficients_for_fhr(self, j_config=11, q_config=4, t_config=16):
         """
         Get optimal coefficient selection for FHR analysis based on current configuration.
