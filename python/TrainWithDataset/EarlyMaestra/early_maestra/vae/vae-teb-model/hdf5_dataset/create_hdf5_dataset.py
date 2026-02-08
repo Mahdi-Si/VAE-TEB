@@ -408,6 +408,10 @@ def create_hdf5_dataset_from_records_list(
         counter_rec += 1
         logger.info(f'The count is  --------->  {counter_rec}')
         try:
+            # target_map: Healthy=0, Acidosis=1, HIE=2
+            # pre_defined_target: HEALTHY=1, ACIDOSIS=2, HIE=3
+            # So default_target_index = pre_defined_target - 1
+            default_ti = (pre_defined_target - 1) if pre_defined_target is not None else None
             mimo_adaptor = EarlyMaestraMimoAdaptor(
                 do_transpose=True,
                 process_targets=True,
@@ -415,8 +419,8 @@ def create_hdf5_dataset_from_records_list(
                 signal_indices=range(0, 2),
                 n_input_chan=2,
                 labels=["HIE", "ACIDOSIS", "HEALTHY"],
-                up_shift_secs=-20
-                # labels=["HIE", "ACIDOSIS"],
+                up_shift_secs=-20,
+                default_target_index=default_ti,
                 )
             mimo_adaptor.read_single_input(
                 record, out_dec_factor=16, out_dec_factor_offset=0, target_is_onehot=True,
