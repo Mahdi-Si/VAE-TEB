@@ -20,6 +20,7 @@ from typing import Dict, List
 from sklearn.model_selection import KFold
 
 from hdf5_dataset import create_initial_hdf5, append_sample
+from guid_analysis import GuidTrackingEntry
 
 
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
@@ -352,24 +353,28 @@ def create_cv_splits(
 def create_hdf5_dataset_from_records_list(
     hdf5_path=None, records_list=None, file_limit=-1,
     base_block_size=3840, save_name=None, min_domain_start=None,
-    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=0.5):
+    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=0.5,
+    run_guid_analysis=False):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Initialize scattering transform with optimal configuration for FHR analysis
     st_model = KymatioPhaseScattering1D(J=11, Q=4, T=16, shape=5760, device=device, tukey_alpha=None, max_order=1)
     
-    # Get optimal coefficient selection for FHR analysis
-    optimal_selection = st_model.get_optimal_coefficients_for_fhr(11, 4, 16)
+    # Get optimal coefficient selection for FHR analysis (v2: two-band cross-channel)
+    optimal_selection = st_model.get_optimal_coefficients_for_fhr_v2(11, 4, 16)
     phase_mask = optimal_selection['recommendations']['use_phase_mask']
     cross_mask = optimal_selection['recommendations']['use_cross_mask']
-    
-    logger.info(f"Using optimal coefficient selection:")
+
+    logger.info(f"Using two-band cross-channel coefficient selection (v2):")
     logger.info(f"  - FHR scattering: 45 coefficients (first order)")
     logger.info(f"  - FHR phase: {phase_mask.sum().item()} coefficients (95.1% reduction)")
-    logger.info(f"  - FHR-UP cross-phase: {cross_mask.sum().item()} coefficients")
+    logger.info(f"  - FHR-UP cross-phase: {cross_mask.sum().item()} coefficients "
+                f"(Band A: {optimal_selection['config_analysis']['band_a_cross_coeffs']}, "
+                f"Band B: {optimal_selection['config_analysis']['band_b_cross_coeffs']})")
     logger.info(f"  - Total features: {optimal_selection['recommendations']['total_selected_features']}")
     errors_list = []
+    guid_tracking = {} if run_guid_analysis else None
     counter_rec = 0
     if file_limit > 0:
         records_list = records_list[:file_limit]
@@ -384,6 +389,7 @@ def create_hdf5_dataset_from_records_list(
                 signal_indices=range(0, 2),
                 n_input_chan=2,
                 labels=["HIE", "ACIDOSIS", "HEALTHY"],
+                up_shift_secs=-20
                 # labels=["HIE", "ACIDOSIS"],
                 )
             mimo_adaptor.read_single_input(
@@ -407,6 +413,11 @@ def create_hdf5_dataset_from_records_list(
 
             up = mimo_prepared.block_input[:, :, 0]
             domain_starts = mimo_prepared.domain_start
+            guid_key = os.path.splitext(os.path.split(record)[1])[0]
+            if guid_tracking is not None:
+                guid_tracking[guid_key] = GuidTrackingEntry(
+                    all_domain_starts=[float(ds) for ds in domain_starts],
+                    included_domain_starts=[], skipped_low_weight=[], skipped_flat_region=[])
             block_targets = mimo_prepared.block_target
             if isinstance(block_targets, np.ndarray) and block_targets.ndim < 3:
                 block_targets = []
@@ -456,6 +467,8 @@ def create_hdf5_dataset_from_records_list(
                 record_name = os.path.splitext(record_file[1])
 
                 if np.mean(sample_weights[i, :]) < 0.90:
+                    if guid_tracking is not None:
+                        guid_tracking[guid_key].skipped_low_weight.append(float(domain_starts[i]))
                     continue
 
                 # --- Corrected flat region detection ---
@@ -474,8 +487,10 @@ def create_hdf5_dataset_from_records_list(
                 if (max_flat_fhr_len > 480 or
                         max_flat_up_len > 1200 or
                         total_flat_fhr_len > 1200 or
-                        total_flat_up_len > 1200):
+                        total_flat_up_len > 2400):
                     logger.info(f'Flat region detected for {record_name} in {domain_starts[i]}')
+                    if guid_tracking is not None:
+                        guid_tracking[guid_key].skipped_flat_region.append(float(domain_starts[i]))
                 else:
                     # plotting for test =============================================================================================================================================
                     # plot_channel_range(fhr_st[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_st_{os.path.splitext(os.path.split(record)[1])}.png")
@@ -488,6 +503,8 @@ def create_hdf5_dataset_from_records_list(
                     # plot_stacked_channels(fhr_up_cc_phase[i, :, :], 2, 23, save_path=f"/data/deid/isilon/MS_model/testing_code_plots/fhr_up_ph_chs_{os.path.splitext(os.path.split(record)[1])}.png")
                     # # plotting for test =============================================================================================================================================
 
+                    if guid_tracking is not None:
+                        guid_tracking[guid_key].included_domain_starts.append(float(domain_starts[i]))
                     append_sample(
                         path=hdf5_path,
                         fhr=fhr[i, :],
@@ -505,10 +522,23 @@ def create_hdf5_dataset_from_records_list(
         except Exception as e:
             errors_list.append(record)
             logger.error(e)
+            if guid_tracking is not None:
+                err_guid = os.path.splitext(os.path.split(record)[1])[0]
+                guid_tracking[err_guid] = GuidTrackingEntry(
+                    error=True, error_msg=str(e))
+
+    if run_guid_analysis and hdf5_path and guid_tracking is not None:
+        from guid_analysis import run_guid_analysis as _run_analysis
+        segment_dur = 5760 / 4  # 1440 sec
+        try:
+            _run_analysis(hdf5_path, guid_tracking, segment_duration_sec=segment_dur)
+        except Exception as e:
+            logger.error(f"GUID analysis failed: {e}")
+
     return errors_list
 
 
-def create_records(records_base_path_ = None, output_base_path_ = None):
+def create_records(records_base_path_ = None, output_base_path_ = None, run_guid_analysis=False):
 
     list_of_folders_dict = {
         1: "ACIDOSIS_NO_HIE_CS",
@@ -617,50 +647,55 @@ def create_records(records_base_path_ = None, output_base_path_ = None):
     os.makedirs(pre_train_path, exist_ok=True)
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
     # Calculate optimal number of channels based on coefficient selection
-    total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
     create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
     create_hdf5_dataset_from_records_list(
         records_list=healthy_bg_cs_files_vae_train,
         hdf5_path=pre_training_dataset,
         cs_label=True,
         bg_label=True,
-        pre_defined_target=1)
+        pre_defined_target=1,
+        run_guid_analysis=run_guid_analysis)
 
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
     # Calculate optimal number of channels based on coefficient selection
-    total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
     create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_train,
                                           hdf5_path=pre_training_dataset,
                                           cs_label=False,
                                           bg_label=True,
-                                          pre_defined_target=1)
+                                          pre_defined_target=1,
+                                          run_guid_analysis=run_guid_analysis)
 
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
     # Calculate optimal number of channels based on coefficient selection
-    total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
     create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_test,
                                           hdf5_path=pre_training_dataset,
                                           cs_label=True,
                                           bg_label=True,
-                                          pre_defined_target=1)
+                                          pre_defined_target=1,
+                                          run_guid_analysis=run_guid_analysis)
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
     # Calculate optimal number of channels based on coefficient selection
-    total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
     create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_test,
                                           hdf5_path=pre_training_dataset,
                                           cs_label=False,
                                           bg_label=True,
-                                          pre_defined_target=1)
+                                          pre_defined_target=1,
+                                          run_guid_analysis=run_guid_analysis)
     # ---------------------------
     # Classifications
     # ---------------------------
     k_fold_cross_validation_path = os.path.join(output_base_path_, "k_fold_cross_validation_dataset")
     os.makedirs(k_fold_cross_validation_path, exist_ok=True)
+    run_guid_analysis = True
     for fold in classification_folds:
         print('done')
         fold_path = os.path.join(k_fold_cross_validation_path, str(fold))
@@ -675,218 +710,227 @@ def create_records(records_base_path_ = None, output_base_path_ = None):
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=False,
                                                   bg_label=False,
-                                                  pre_defined_target=1)
+                                                  pre_defined_target=1,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "healthy_no_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=True,
                                                   bg_label=False,
-                                                  pre_defined_target=1)
+                                                  pre_defined_target=1,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "healthy_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=True,
                                                   bg_label=True,
-                                                  pre_defined_target=1)
+                                                  pre_defined_target=1,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "healthy_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=False,
                                                   bg_label=True,
-                                                  pre_defined_target=1)
+                                                  pre_defined_target=1,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "acidosis_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=True,
                                                   bg_label=True,
-                                                  pre_defined_target=2)
+                                                  pre_defined_target=2,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "acidosis_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=False,
                                                   bg_label=True,
-                                                  pre_defined_target=2)
+                                                  pre_defined_target=2,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "hie_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=True,
                                                   bg_label=True,
-                                                  pre_defined_target=3)
+                                                  pre_defined_target=3,
+                                                  run_guid_analysis=run_guid_analysis)
 
             selected_sub_group = "hie_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
             # Use optimal number of channels for all dataset creation
-            total_channels = 174  # 44 phase + 130 cross-phase coefficients from optimal selection
+            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
             create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   cs_label=False,
                                                   bg_label=True,
-                                                  pre_defined_target=3)
+                                                  pre_defined_target=3,
+                                                  run_guid_analysis=run_guid_analysis)
+        run_guid_analysis = False
 
 
 if __name__ == "__main__":
-    # base_folder = r'/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/'
-    # base_output_folder = r'/data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours'
-    # create_records(records_base_path_=base_folder, output_base_path_=base_output_folder)
+    base_folder = r'/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/'
+    base_output_folder = r'/data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours'
+    create_records(records_base_path_=base_folder, output_base_path_=base_output_folder)
 
-    hdf_file = "test_dataset_no_cs.hdf5"
+    # hdf_file = "test_dataset_no_cs.hdf5"
     
-    try:
-        print("Opening HDF5 dataset...")
-        with h5py.File(hdf_file, "r") as dataset:
+    # try:
+    #     print("Opening HDF5 dataset...")
+    #     with h5py.File(hdf_file, "r") as dataset:
             
-            # Print dataset structure
-            print("\n" + "="*60)
-            print("DATASET STRUCTURE")
-            print("="*60)
-            print("Available fields in dataset:")
-            for key in dataset.keys():
-                shape = dataset[key].shape
-                dtype = dataset[key].dtype
-                print(f"  {key}: shape={shape}, dtype={dtype}")
+    #         # Print dataset structure
+    #         print("\n" + "="*60)
+    #         print("DATASET STRUCTURE")
+    #         print("="*60)
+    #         print("Available fields in dataset:")
+    #         for key in dataset.keys():
+    #             shape = dataset[key].shape
+    #             dtype = dataset[key].dtype
+    #             print(f"  {key}: shape={shape}, dtype={dtype}")
             
-            # Check if dataset has samples
-            if len(dataset.keys()) == 0:
-                print("Dataset is empty!")
-            else:
-                # Get the number of samples (assuming all fields have same first dimension)
-                first_key = list(dataset.keys())[0]
-                n_samples = dataset[first_key].shape[0]
-                print(f"\nTotal number of samples: {n_samples}")
+    #         # Check if dataset has samples
+    #         if len(dataset.keys()) == 0:
+    #             print("Dataset is empty!")
+    #         else:
+    #             # Get the number of samples (assuming all fields have same first dimension)
+    #             first_key = list(dataset.keys())[0]
+    #             n_samples = dataset[first_key].shape[0]
+    #             print(f"\nTotal number of samples: {n_samples}")
                 
-                if n_samples > 0:
-                    # Example: Get the first sample (index 0)
-                    sample_idx = 100
-                    print(f"\n" + "="*60)
-                    print(f"SAMPLE {sample_idx} DETAILS")
-                    print("="*60)
+    #             if n_samples > 0:
+    #                 # Example: Get the first sample (index 0)
+    #                 sample_idx = 100
+    #                 print(f"\n" + "="*60)
+    #                 print(f"SAMPLE {sample_idx} DETAILS")
+    #                 print("="*60)
                     
-                    sample_data = {}
-                    for field in dataset.keys():
-                        sample_data[field] = dataset[field][sample_idx]
+    #                 sample_data = {}
+    #                 for field in dataset.keys():
+    #                     sample_data[field] = dataset[field][sample_idx]
                     
-                    # Display sample information
-                    for field, data in sample_data.items():
-                        if isinstance(data, np.ndarray):
-                            print(f"{field}:")
-                            print(f"  Shape: {data.shape}")
-                            print(f"  Dtype: {data.dtype}")
-                            if data.size > 0:
-                                if data.ndim == 1:
-                                    # 1D array - show basic stats
-                                    print(f"  Min: {np.min(data):.4f}, Max: {np.max(data):.4f}")
-                                    print(f"  Mean: {np.mean(data):.4f}, Std: {np.std(data):.4f}")
-                                    print(f"  First 5 values: {data[:5]}")
-                                elif data.ndim == 2:
-                                    # 2D array - show shape and channel stats
-                                    print(f"  Channels: {data.shape[0]}, Sequence length: {data.shape[1]}")
-                                    print(f"  Min: {np.min(data):.4f}, Max: {np.max(data):.4f}")
-                                    print(f"  Mean: {np.mean(data):.4f}, Std: {np.std(data):.4f}")
-                                    # Show stats for first few channels
-                                    for i in range(min(3, data.shape[0])):
-                                        ch_data = data[i, :]
-                                        print(f"    Ch {i}: mean={np.mean(ch_data):.4f}, std={np.std(ch_data):.4f}")
-                                    if data.shape[0] > 3:
-                                        print(f"    ... ({data.shape[0] - 3} more channels)")
-                        else:
-                            # Scalar values
-                            print(f"{field}: {data}")
-                        print()
+    #                 # Display sample information
+    #                 for field, data in sample_data.items():
+    #                     if isinstance(data, np.ndarray):
+    #                         print(f"{field}:")
+    #                         print(f"  Shape: {data.shape}")
+    #                         print(f"  Dtype: {data.dtype}")
+    #                         if data.size > 0:
+    #                             if data.ndim == 1:
+    #                                 # 1D array - show basic stats
+    #                                 print(f"  Min: {np.min(data):.4f}, Max: {np.max(data):.4f}")
+    #                                 print(f"  Mean: {np.mean(data):.4f}, Std: {np.std(data):.4f}")
+    #                                 print(f"  First 5 values: {data[:5]}")
+    #                             elif data.ndim == 2:
+    #                                 # 2D array - show shape and channel stats
+    #                                 print(f"  Channels: {data.shape[0]}, Sequence length: {data.shape[1]}")
+    #                                 print(f"  Min: {np.min(data):.4f}, Max: {np.max(data):.4f}")
+    #                                 print(f"  Mean: {np.mean(data):.4f}, Std: {np.std(data):.4f}")
+    #                                 # Show stats for first few channels
+    #                                 for i in range(min(3, data.shape[0])):
+    #                                     ch_data = data[i, :]
+    #                                     print(f"    Ch {i}: mean={np.mean(ch_data):.4f}, std={np.std(ch_data):.4f}")
+    #                                 if data.shape[0] > 3:
+    #                                     print(f"    ... ({data.shape[0] - 3} more channels)")
+    #                     else:
+    #                         # Scalar values
+    #                         print(f"{field}: {data}")
+    #                     print()
                     
-                    # Example: How to use the sample data
-                    print("="*60)
-                    print("EXAMPLE USAGE")  
-                    print("="*60)
-                    print("\n# Example code for using the loaded sample:")
-                    print("# Access specific fields:")
-                    if 'fhr' in sample_data:
-                        print(f"# fhr_signal = sample_data['fhr']  # Shape: {sample_data['fhr'].shape}")
-                    if 'up' in sample_data:
-                        print(f"# up_signal = sample_data['up']    # Shape: {sample_data['up'].shape}")
-                    if 'fhr_st' in sample_data:
-                        print(f"# fhr_st = sample_data['fhr_st']   # Shape: {sample_data['fhr_st'].shape}")
-                    if 'fhr_ph' in sample_data:
-                        print(f"# fhr_ph = sample_data['fhr_ph']   # Shape: {sample_data['fhr_ph'].shape}")
-                    if 'fhr_up_ph' in sample_data:
-                        print(f"# fhr_up_ph = sample_data['fhr_up_ph'] # Shape: {sample_data['fhr_up_ph'].shape}")
+    #                 # Example: How to use the sample data
+    #                 print("="*60)
+    #                 print("EXAMPLE USAGE")  
+    #                 print("="*60)
+    #                 print("\n# Example code for using the loaded sample:")
+    #                 print("# Access specific fields:")
+    #                 if 'fhr' in sample_data:
+    #                     print(f"# fhr_signal = sample_data['fhr']  # Shape: {sample_data['fhr'].shape}")
+    #                 if 'up' in sample_data:
+    #                     print(f"# up_signal = sample_data['up']    # Shape: {sample_data['up'].shape}")
+    #                 if 'fhr_st' in sample_data:
+    #                     print(f"# fhr_st = sample_data['fhr_st']   # Shape: {sample_data['fhr_st'].shape}")
+    #                 if 'fhr_ph' in sample_data:
+    #                     print(f"# fhr_ph = sample_data['fhr_ph']   # Shape: {sample_data['fhr_ph'].shape}")
+    #                 if 'fhr_up_ph' in sample_data:
+    #                     print(f"# fhr_up_ph = sample_data['fhr_up_ph'] # Shape: {sample_data['fhr_up_ph'].shape}")
                     
-                    print("\n# Convert to torch tensors for deep learning:")
-                    print("# import torch")
-                    if 'fhr' in sample_data and 'up' in sample_data:
-                        print("# fhr_tensor = torch.from_numpy(sample_data['fhr']).float()")
-                        print("# up_tensor = torch.from_numpy(sample_data['up']).float()")
-                    if 'fhr_st' in sample_data:
-                        print("# fhr_st_tensor = torch.from_numpy(sample_data['fhr_st']).float()")
+    #                 print("\n# Convert to torch tensors for deep learning:")
+    #                 print("# import torch")
+    #                 if 'fhr' in sample_data and 'up' in sample_data:
+    #                     print("# fhr_tensor = torch.from_numpy(sample_data['fhr']).float()")
+    #                     print("# up_tensor = torch.from_numpy(sample_data['up']).float()")
+    #                 if 'fhr_st' in sample_data:
+    #                     print("# fhr_st_tensor = torch.from_numpy(sample_data['fhr_st']).float()")
                     
-                    print("\n# Example batch processing (multiple samples):")
-                    batch_size = min(4, n_samples)
-                    print(f"# batch_fhr = dataset['fhr'][:{batch_size}]  # Shape: {dataset['fhr'][:batch_size].shape}")
-                    if 'fhr_st' in dataset:
-                        print(f"# batch_fhr_st = dataset['fhr_st'][:{batch_size}]  # Shape: {dataset['fhr_st'][:batch_size].shape}")
+    #                 print("\n# Example batch processing (multiple samples):")
+    #                 batch_size = min(4, n_samples)
+    #                 print(f"# batch_fhr = dataset['fhr'][:{batch_size}]  # Shape: {dataset['fhr'][:batch_size].shape}")
+    #                 if 'fhr_st' in dataset:
+    #                     print(f"# batch_fhr_st = dataset['fhr_st'][:{batch_size}]  # Shape: {dataset['fhr_st'][:batch_size].shape}")
                     
-                    # Show another sample if available
-                    if n_samples > 1:
-                        sample_idx = min(1, n_samples - 1)
-                        print(f"\n" + "="*60)
-                        print(f"QUICK VIEW: SAMPLE {sample_idx}")
-                        print("="*60)
-                        for field in ['guid', 'epoch', 'target', 'cs_label', 'bg_label']:
-                            if field in dataset:
-                                value = dataset[field][sample_idx]
-                                print(f"{field}: {value}")
-                else:
-                    print("\nDataset contains no samples!")
+    #                 # Show another sample if available
+    #                 if n_samples > 1:
+    #                     sample_idx = min(1, n_samples - 1)
+    #                     print(f"\n" + "="*60)
+    #                     print(f"QUICK VIEW: SAMPLE {sample_idx}")
+    #                     print("="*60)
+    #                     for field in ['guid', 'epoch', 'target', 'cs_label', 'bg_label']:
+    #                         if field in dataset:
+    #                             value = dataset[field][sample_idx]
+    #                             print(f"{field}: {value}")
+    #             else:
+    #                 print("\nDataset contains no samples!")
                     
-        print(f"\nSuccessfully examined HDF5 dataset: {hdf_file}")
+    #     print(f"\nSuccessfully examined HDF5 dataset: {hdf_file}")
         
-    except FileNotFoundError:
-        print(f"HDF5 file not found: {hdf_file}")
-        print("Please make sure the file exists or create it first using the dataset creation functions.")
-    except Exception as e:
-        print(f"Error reading HDF5 dataset: {e}")
+    # except FileNotFoundError:
+    #     print(f"HDF5 file not found: {hdf_file}")
+    #     print("Please make sure the file exists or create it first using the dataset creation functions.")
+    # except Exception as e:
+    #     print(f"Error reading HDF5 dataset: {e}")
     
-    print('\nDone!')
+    # print('\nDone!')
