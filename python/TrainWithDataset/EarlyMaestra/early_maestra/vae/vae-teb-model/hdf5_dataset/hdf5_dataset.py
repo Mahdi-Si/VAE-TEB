@@ -144,23 +144,24 @@ def create_initial_hdf5(
     path: str,
     len_signal: int,
     n_channels: int,
-    len_sequence: int = 300
+    len_sequence: int = 300,
+    n_cross_phase_channels: int = 62
 ) -> None:
     """
     Create a new HDF5 file with empty, resizable datasets for signal storage.
-    
-    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+
+    Updated for two-band cross-channel selection v2 (J=11, Q=4, T=16):
         - FHR scattering: 43 coefficients (first order only)
         - FHR phase: 44 coefficients (95.1% reduction from optimal selection)
-        - FHR-UP cross-phase: 130 coefficients (UP→FHR coupling)
-        - Total phase/cross-phase channels: 174
+        - FHR-UP cross-phase: 62 coefficients (Band A deceleration + Band B variability)
+        - Total phase/cross-phase channels: 106
 
     Datasets created (first dim unlimited):
         - "fhr"       : float32, shape (N, len_signal)
         - "up"        : float32, shape (N, len_signal)
         - "fhr_st"    : float32, shape (N, 43, len_sequence) - Scattering coefficients
         - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
-        - "fhr_up_ph" : float32, shape (N, 130, len_sequence) - Selected cross-phase coefficients
+        - "fhr_up_ph" : float32, shape (N, n_cross_phase_channels, len_sequence) - Selected cross-phase coefficients
         - "target"    : float32, shape (N, len_sequence)
         - "weight"    : float32, shape (N, len_sequence)
         - "epoch"     : float32, shape (N,)
@@ -171,10 +172,11 @@ def create_initial_hdf5(
     All datasets use per-sample chunking and LZF compression.
 
     Args:
-        path:         Path to output HDF5 file (overwrites if exists).
-        len_signal:   Length of raw signal arrays (e.g. 4800).
-        n_channels:   Number of channels in combined phase/cross-phase arrays (174).
-        len_sequence: Length of sequence dimension (default: 300).
+        path:                    Path to output HDF5 file (overwrites if exists).
+        len_signal:              Length of raw signal arrays (e.g. 4800).
+        n_channels:              Number of channels in combined phase/cross-phase arrays (106).
+        len_sequence:            Length of sequence dimension (default: 300).
+        n_cross_phase_channels:  Number of cross-phase channels for fhr_up_ph (default: 62).
     """
     try:
         os.remove(path)
@@ -202,10 +204,11 @@ def create_initial_hdf5(
             "fhr_ph", shape=(0, 44, len_sequence), maxshape=(None, 44, len_sequence),
             dtype="f4", chunks=(1, 44, len_sequence), compression="lzf"
         )
-        # fhr_up_ph: 130 selected cross-phase coefficients
+        # fhr_up_ph: selected cross-phase coefficients (62 with v2 two-band selection)
         h5f.create_dataset(
-            "fhr_up_ph", shape=(0, 130, len_sequence), maxshape=(None, 130, len_sequence),
-            dtype="f4", chunks=(1, 130, len_sequence), compression="lzf"
+            "fhr_up_ph", shape=(0, n_cross_phase_channels, len_sequence),
+            maxshape=(None, n_cross_phase_channels, len_sequence),
+            dtype="f4", chunks=(1, n_cross_phase_channels, len_sequence), compression="lzf"
         )
         h5f.create_dataset(
             "target", shape=(0, len_sequence), maxshape=(None, len_sequence),
@@ -299,10 +302,10 @@ class CombinedHDF5Dataset(Dataset):
     """
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
     
-    With Scattering transform (J=11, Q=4, T=16):
+    With Scattering transform (J=11, Q=4, T=16) and v2 two-band selection:
     - FHR scattering: 43 coefficients (first order)
     - FHR phase: 44 selected coefficients (95.1% reduction)
-    - FHR-UP cross-phase: 130 selected coefficients (UP→FHR coupling)
+    - FHR-UP cross-phase: 62 selected coefficients (Band A deceleration + Band B variability)
     
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
@@ -381,13 +384,13 @@ class CombinedHDF5Dataset(Dataset):
         self.normalization_enabled = False
         
         # Define which channels should use LOG normalization for optimal coefficients.
-        # Updated for optimal coefficient selection (44 phase + 130 cross-phase channels).
+        # Updated for v2 two-band selection (44 phase + 62 cross-phase channels).
         self.log_norm_channels_config = {
             'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude order 0)
         }
         self.asinh_norm_channels_config = {
             'fhr_ph': 'all',     # All 44 selected phase coefficients
-            'fhr_up_ph': 'all'   # All 130 selected cross-phase coefficients
+            'fhr_up_ph': 'all'   # All 62 selected cross-phase coefficients (v2 two-band)
         }
         
         # This will be populated from the stats file, but the config above provides a fallback.

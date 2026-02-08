@@ -14,19 +14,20 @@ import argparse
 class DatasetStatsCalculator:
     """
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
-    
-    Updated for optimal coefficient selection (J=11, Q=4, T=16):
+
+    Updated for two-band cross-channel selection v2 (J=11, Q=4, T=16):
     - FHR scattering: 43 coefficients (first order, channel 0 regular, others log-transformed)
     - FHR phase: 44 selected coefficients (all asinh-transformed)
-    - FHR-UP cross-phase: 130 selected coefficients (all asinh-transformed)
-    
+    - FHR-UP cross-phase: 62 selected coefficients (all asinh-transformed)
+      Band A (deceleration): ~40 pairs, Band B (variability): ~22 pairs
+
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
-    
+
     Transformation strategy:
-    - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed  
+    - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed
     - fhr_ph (44 channels): all asinh-transformed for phase stability
-    - fhr_up_ph (130 channels): all asinh-transformed for cross-phase correlation
+    - fhr_up_ph (62 channels): all asinh-transformed for cross-phase correlation
     """
     
     def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
@@ -56,7 +57,7 @@ class DatasetStatsCalculator:
         # ASINH normalization for phase coefficients (better for phase data)
         self.asinh_norm_channels_config = {
             'fhr_ph': 'all',    # All 44 selected phase coefficients
-            'fhr_up_ph': 'all'  # All 130 selected cross-phase coefficients
+            'fhr_up_ph': 'all'  # All 62 selected cross-phase coefficients (v2 two-band)
         }
         
     def _initialize_stats(self, field_shapes: Dict[str, Tuple[int, ...]]) -> Dict[str, Dict[str, Any]]:
@@ -395,7 +396,7 @@ class DatasetStatsCalculator:
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
-            f.attrs['description'] = 'Statistics for optimal coefficient selection: 43 scattering (log), 44 phase (asinh), 130 cross-phase (asinh)'
+            f.attrs['description'] = 'Statistics for v2 two-band selection: 43 scattering (log), 44 phase (asinh), 62 cross-phase (asinh)'
             
             # Save statistics for each field
             for field, field_stats in stats.items():
@@ -522,10 +523,10 @@ class DatasetStatsCalculator:
         print("\n" + "="*60)
         print("DATASET STATISTICS SUMMARY")
         print("="*60)
-        print("Note: Optimal coefficient selection with specialized transformations:")
+        print("Note: Two-band v2 coefficient selection with specialized transformations:")
         print("- FHR scattering (43 ch): channel 0 regular, others log(x + 1e-6)")
         print("- FHR phase (44 ch): all asinh(x) transformed")
-        print("- FHR-UP cross-phase (130 ch): all asinh(x) transformed")
+        print("- FHR-UP cross-phase (62 ch): all asinh(x) transformed")
         
         for field, field_stats in stats.items():
             print(f"\n{field.upper()}:")
@@ -959,7 +960,7 @@ if __name__ == "__main__":
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            'description': 'Statistics for optimal coefficient selection (J=11, Q=4, T=16): 217 total features'
+            'description': 'Statistics for v2 two-band selection (J=11, Q=4, T=16): 149 total features'
         },
         trim_minutes=2,
         device=device,
