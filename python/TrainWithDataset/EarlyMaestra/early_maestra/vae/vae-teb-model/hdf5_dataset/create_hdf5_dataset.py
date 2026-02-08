@@ -13,6 +13,7 @@ import random
 from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
 import shutil
 import logging
+import traceback
 import math
 import random
 import h5py
@@ -521,7 +522,7 @@ def create_hdf5_dataset_from_records_list(
 
         except Exception as e:
             errors_list.append(record)
-            logger.error(e)
+            logger.error(f"Failed processing {record}:\n{traceback.format_exc()}")
             if guid_tracking is not None:
                 err_guid = os.path.splitext(os.path.split(record)[1])[0]
                 guid_tracking[err_guid] = GuidTrackingEntry(
