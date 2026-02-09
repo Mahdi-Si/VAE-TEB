@@ -139,6 +139,50 @@ def detect_flat_region(signal, threshold=0.5, window=5):
     return flat_regions
 
 
+def deduplicate_segments(domain_starts, sample_weights):
+    """Remove duplicate segments that share the same domain_start value.
+
+    When multiple short raw segments align to the same grid point in
+    ``split_long(do_equalize=True)``, they produce identical ``domain_start``
+    values.  This function keeps only the segment with the highest mean
+    sample weight for each unique ``domain_start``.
+
+    Args:
+        domain_starts: Array-like of domain_start values (one per segment).
+        sample_weights: 2-D array of shape ``(n_segments, n_samples)``.
+
+    Returns:
+        ``(keep_indices, removed_indices, duplicate_groups)`` where
+        *duplicate_groups* maps each duplicated ``domain_start`` value to
+        the list of original indices that shared it.
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for idx, ds in enumerate(domain_starts):
+        groups[ds].append(idx)
+
+    keep_indices = []
+    removed_indices = []
+    duplicate_groups = {}
+
+    for ds, indices in groups.items():
+        if len(indices) == 1:
+            keep_indices.append(indices[0])
+        else:
+            duplicate_groups[ds] = indices
+            # Keep the segment with the highest mean sample weight
+            best_idx = max(indices, key=lambda i: float(np.mean(sample_weights[i, :])))
+            keep_indices.append(best_idx)
+            for i in indices:
+                if i != best_idx:
+                    removed_indices.append(i)
+
+    keep_indices.sort()
+    removed_indices.sort()
+    return keep_indices, removed_indices, duplicate_groups
+
+
 def plot_fhr_signals(fhr_data, domain_starts, start_idx=0, sampling_rate=4, save_path=None):
     """
     Plot 4 consecutive FHR signals in vertically stacked subplots.
@@ -481,6 +525,22 @@ def create_hdf5_dataset_from_records_list(
                 block_targets = []
             # sample_weights = np.repeat(mimo_prepared.sample_weights, repeats=16, axis=1)
             sample_weights = mimo_prepared.sample_weights
+
+            # ---- Deduplicate segments with identical domain_start ----
+            keep_idx, removed_idx, dup_groups = deduplicate_segments(domain_starts, sample_weights)
+            if removed_idx:
+                logger.info(f"{guid_key}: deduplicating {len(removed_idx)} segments "
+                            f"across {len(dup_groups)} duplicate domain_start groups")
+                for ds_val, idx_list in dup_groups.items():
+                    logger.debug(f"  domain_start={ds_val:.1f}: {len(idx_list)} segments, "
+                                 f"keeping best weight")
+                if guid_tracking is not None:
+                    guid_tracking[guid_key].skipped_duplicate.extend(
+                        float(domain_starts[i]) for i in removed_idx)
+                fhr = fhr[keep_idx]
+                up = up[keep_idx]
+                sample_weights = sample_weights[keep_idx]
+                domain_starts = [domain_starts[i] for i in keep_idx]
 
             record_file = os.path.split(record)
             record_name = os.path.splitext(record_file[1])
