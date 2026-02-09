@@ -29,6 +29,35 @@ from matplotlib.patches import Patch
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Journal-quality matplotlib defaults
+# ---------------------------------------------------------------------------
+_JOURNAL_RC = {
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'font.size': 8,
+    'axes.titlesize': 9,
+    'axes.labelsize': 8,
+    'xtick.labelsize': 7,
+    'ytick.labelsize': 7,
+    'legend.fontsize': 7,
+    'axes.linewidth': 0.5,
+    'xtick.major.width': 0.4,
+    'ytick.major.width': 0.4,
+    'xtick.minor.width': 0.3,
+    'ytick.minor.width': 0.3,
+    'xtick.major.size': 3,
+    'ytick.major.size': 3,
+    'grid.linewidth': 0.3,
+    'grid.alpha': 0.4,
+    'lines.linewidth': 0.8,
+    'patch.linewidth': 0.4,
+    'figure.dpi': 300,
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'savefig.pad_inches': 0.03,
+}
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -561,7 +590,7 @@ def _plot_coverage_timeline(
     coverage_results: List[GuidCoverageResult],
     output_dir: str,
     max_guids: int = 100,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Optional[str]:
     """Horizontal broken-bar chart: blue=covered, red=gap per GUID."""
     non_error = [r for r in coverage_results if not r.error and r.total_extent_sec > 0]
@@ -572,49 +601,44 @@ def _plot_coverage_timeline(
     plotted = non_error[:max_guids]
     n = len(plotted)
 
-    fig_height = max(4, n * 0.3 + 1)
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    fig_height = max(3, n * 0.22 + 0.8)
+    with plt.rc_context(_JOURNAL_RC):
+        fig, ax = plt.subplots(figsize=(7, fig_height))
 
-    for idx, r in enumerate(reversed(plotted)):  # reverse so largest at top
-        y = idx
-        # Draw total extent as red background
-        if r.total_extent_sec > 0:
-            # Use full recording extent (from all_starts, not just included)
-            extent_start = r.extent_start_sec
+        for idx, r in enumerate(reversed(plotted)):  # reverse so largest at top
+            y = idx
+            if r.total_extent_sec > 0:
+                extent_start = r.extent_start_sec
+                ax.barh(y, r.total_extent_sec / 60.0, left=extent_start / 60.0,
+                        height=0.7, color='#f4cccc', edgecolor='#e06666', linewidth=0.3)
+                for start, end in r.merged_intervals:
+                    ax.barh(y, (end - start) / 60.0, left=start / 60.0,
+                            height=0.7, color='#6fa8dc', edgecolor='#3d85c6', linewidth=0.3)
 
-            # Red background for total extent
-            ax.barh(y, r.total_extent_sec / 60.0, left=extent_start / 60.0,
-                    height=0.7, color='#ffcccc', edgecolor='#ff6666', linewidth=0.5)
+        labels = [r.guid[:20] for r in reversed(plotted)]
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(labels, fontsize=max(4.5, min(6.5, 120 / n)))
+        ax.set_xlabel('Time (min, relative to delivery)')
+        ax.set_title(f'Coverage Timeline ({n} GUIDs)')
+        ax.axvline(0, color='#333333', linestyle='--', linewidth=0.6, alpha=0.7)
+        ax.legend(handles=[
+            Patch(facecolor='#6fa8dc', edgecolor='#3d85c6', label='Covered', linewidth=0.3),
+            Patch(facecolor='#f4cccc', edgecolor='#e06666', label='Gap / Missing', linewidth=0.3),
+        ], loc='lower right', frameon=True, edgecolor='#cccccc', framealpha=0.9)
+        ax.grid(axis='x', linewidth=0.3, alpha=0.4)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
 
-            # Blue bars for covered intervals
-            for start, end in r.merged_intervals:
-                ax.barh(y, (end - start) / 60.0, left=start / 60.0,
-                        height=0.7, color='#4488cc', edgecolor='#2266aa', linewidth=0.5)
-
-    labels = [r.guid[:20] for r in reversed(plotted)]
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(labels, fontsize=max(5, min(8, 200 // n)))
-    ax.set_xlabel('Time (minutes, relative to delivery)')
-    ax.set_title(f'Coverage Timeline ({n} GUIDs)')
-    # Mark delivery (time=0) with a vertical line
-    ax.axvline(0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, label='Delivery (t=0)')
-    ax.legend(handles=[
-        Patch(facecolor='#4488cc', edgecolor='#2266aa', label='Covered'),
-        Patch(facecolor='#ffcccc', edgecolor='#ff6666', label='Gap / Missing'),
-    ], loc='lower right', fontsize=8)
-    ax.grid(axis='x', alpha=0.3)
-    plt.tight_layout()
-
-    path = os.path.join(output_dir, 'coverage_timeline.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+        path = os.path.join(output_dir, 'coverage_timeline.png')
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
     return path
 
 
 def _plot_gap_distribution(
     coverage_results: List[GuidCoverageResult],
     output_dir: str,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Optional[str]:
     """Histogram of gap durations in minutes."""
     all_gaps = []
@@ -627,32 +651,40 @@ def _plot_gap_distribution(
 
     gaps_min = np.array(all_gaps) / 60.0
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    n_bins = min(50, max(10, len(gaps_min) // 5))
-    ax.hist(gaps_min, bins=n_bins, color='#4488cc', edgecolor='#2266aa', alpha=0.8)
+    with plt.rc_context(_JOURNAL_RC):
+        fig, ax = plt.subplots(figsize=(3.5, 2.4))
+        n_bins = min(50, max(10, len(gaps_min) // 5))
+        ax.hist(gaps_min, bins=n_bins, color='#6fa8dc', edgecolor='#3d85c6',
+                linewidth=0.3, alpha=0.85)
 
-    mean_val = float(np.mean(gaps_min))
-    median_val = float(np.median(gaps_min))
-    max_val = float(np.max(gaps_min))
+        mean_val = float(np.mean(gaps_min))
+        median_val = float(np.median(gaps_min))
+        max_val = float(np.max(gaps_min))
 
-    ax.axvline(mean_val, color='red', linestyle='--', linewidth=1.5, label=f'Mean: {mean_val:.1f} min')
-    ax.axvline(median_val, color='orange', linestyle='--', linewidth=1.5, label=f'Median: {median_val:.1f} min')
+        ax.axvline(mean_val, color='#c0392b', linestyle='--', linewidth=0.7,
+                   label=f'Mean: {mean_val:.1f} min')
+        ax.axvline(median_val, color='#e67e22', linestyle='--', linewidth=0.7,
+                   label=f'Median: {median_val:.1f} min')
 
-    ax.text(0.98, 0.95,
-            f'Count: {len(gaps_min)}\nMean: {mean_val:.1f} min\nMedian: {median_val:.1f} min\nMax: {max_val:.1f} min',
-            transform=ax.transAxes, fontsize=9, verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+        ax.text(0.97, 0.95,
+                f'n = {len(gaps_min)}\nMean = {mean_val:.1f} min\n'
+                f'Median = {median_val:.1f} min\nMax = {max_val:.1f} min',
+                transform=ax.transAxes, fontsize=6, verticalalignment='top',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='#fafafa',
+                          edgecolor='#cccccc', linewidth=0.4, alpha=0.9))
 
-    ax.set_xlabel('Gap Duration (minutes)')
-    ax.set_ylabel('Count')
-    ax.set_title('Distribution of Gap Durations')
-    ax.legend(fontsize=9)
-    ax.grid(axis='y', alpha=0.3)
-    plt.tight_layout()
+        ax.set_xlabel('Gap Duration (min)')
+        ax.set_ylabel('Count')
+        ax.set_title('Distribution of Gap Durations')
+        ax.legend(frameon=True, edgecolor='#cccccc', framealpha=0.9)
+        ax.grid(axis='y', linewidth=0.3, alpha=0.4)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
 
-    path = os.path.join(output_dir, 'gap_distribution.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+        path = os.path.join(output_dir, 'gap_distribution.png')
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
     return path
 
 
@@ -660,51 +692,52 @@ def _plot_missing_data_percentage(
     coverage_results: List[GuidCoverageResult],
     output_dir: str,
     max_guids: int = 50,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Optional[str]:
     """Sorted horizontal bar chart of missing data % per GUID."""
     non_error = [r for r in coverage_results if not r.error and r.total_extent_sec > 0]
     if not non_error:
         return None
 
-    # Sort by missing_pct descending
     sorted_results = sorted(non_error, key=lambda r: r.missing_pct, reverse=True)
     plotted = sorted_results[:max_guids]
     n = len(plotted)
 
-    fig_height = max(4, n * 0.35 + 1)
-    fig, ax = plt.subplots(figsize=(10, fig_height))
+    fig_height = max(3, n * 0.22 + 0.8)
+    with plt.rc_context(_JOURNAL_RC):
+        fig, ax = plt.subplots(figsize=(4.5, fig_height))
 
-    guids = [r.guid[:20] for r in plotted]
-    pcts = [r.missing_pct for r in plotted]
+        guids = [r.guid[:20] for r in plotted]
+        pcts = [r.missing_pct for r in plotted]
 
-    # Color gradient green->red
-    colors = []
-    for p in pcts:
-        t = p / 100.0
-        r = min(1.0, 2 * t)
-        g = min(1.0, 2 * (1 - t))
-        colors.append((r, g, 0.2, 0.8))
+        # Color gradient green->red (muted tones)
+        colors = []
+        for p in pcts:
+            t = p / 100.0
+            r_ch = min(1.0, 0.3 + 0.7 * t)
+            g_ch = min(1.0, 0.3 + 0.7 * (1 - t))
+            colors.append((r_ch, g_ch, 0.25, 0.75))
 
-    y_pos = range(n)
-    ax.barh(y_pos, pcts, color=colors, edgecolor='gray', linewidth=0.5)
+        y_pos = range(n)
+        ax.barh(y_pos, pcts, color=colors, edgecolor='#888888', linewidth=0.3)
 
-    mean_pct = float(np.mean([r.missing_pct for r in non_error]))
-    ax.axvline(mean_pct, color='blue', linestyle='--', linewidth=1.5,
-               label=f'Mean: {mean_pct:.1f}%')
+        mean_pct = float(np.mean([r.missing_pct for r in non_error]))
+        ax.axvline(mean_pct, color='#2c3e50', linestyle='--', linewidth=0.7,
+                   label=f'Mean: {mean_pct:.1f}%')
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(guids, fontsize=max(5, min(8, 200 // n)))
-    ax.set_xlabel('Missing Data (%)')
-    ax.set_title(f'Missing Data Percentage by GUID (top {n})')
-    ax.set_xlim(0, 105)
-    ax.legend(fontsize=9)
-    ax.grid(axis='x', alpha=0.3)
-    plt.tight_layout()
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(guids, fontsize=max(4.5, min(6.5, 120 / n)))
+        ax.set_xlabel('Missing Data (%)')
+        ax.set_title(f'Missing Data Percentage by GUID (top {n})')
+        ax.set_xlim(0, 105)
+        ax.legend(frameon=True, edgecolor='#cccccc', framealpha=0.9)
+        ax.grid(axis='x', linewidth=0.3, alpha=0.4)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
 
-    path = os.path.join(output_dir, 'missing_data_percentage.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+        path = os.path.join(output_dir, 'missing_data_percentage.png')
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
     return path
 
 
@@ -713,76 +746,89 @@ def _plot_segment_counts(
     output_dir: str,
     has_tracking: bool = False,
     max_guids: int = 50,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Optional[str]:
     """Stacked bar chart of segment counts per GUID."""
     non_error = [r for r in coverage_results if not r.error]
     if not non_error:
         return None
 
-    # Sort by total segments descending
     sorted_results = sorted(non_error, key=lambda r: r.total_segments, reverse=True)
     plotted = sorted_results[:max_guids]
     n = len(plotted)
 
-    fig_height = max(4, n * 0.35 + 1)
-    fig, ax = plt.subplots(figsize=(10, fig_height))
+    # Muted palette for stacked categories
+    _PAL = {
+        'included': ('#6fa8dc', '#3d85c6'),
+        'low_weight': ('#f6b26b', '#e69138'),
+        'flat_region': ('#e06666', '#cc0000'),
+        'scatter': ('#b4a7d6', '#8e7cc3'),
+        'duplicate': ('#76d7c4', '#45b39d'),
+        'unaccounted': ('#b7b7b7', '#888888'),
+    }
 
-    guids = [r.guid[:20] for r in plotted]
-    y_pos = np.arange(n)
+    fig_height = max(3, n * 0.22 + 0.8)
+    with plt.rc_context(_JOURNAL_RC):
+        fig, ax = plt.subplots(figsize=(4.5, fig_height))
 
-    if has_tracking:
-        included = [r.included_segments for r in plotted]
-        skipped_lw = [r.skipped_low_weight for r in plotted]
-        skipped_flat = [r.skipped_flat_region for r in plotted]
-        skipped_scatter = [r.skipped_scatter_failed for r in plotted]
-        skipped_dup = [r.skipped_duplicate for r in plotted]
-        # Unaccounted = total - (included + lw + flat + scatter + dup)
-        unaccounted = [max(0, r.total_segments - r.included_segments
-                          - r.skipped_low_weight - r.skipped_flat_region
-                          - r.skipped_scatter_failed - r.skipped_duplicate) for r in plotted]
+        guids = [r.guid[:20] for r in plotted]
+        y_pos = np.arange(n)
+        edge_lw = 0.3
 
-        ax.barh(y_pos, included, color='#4488cc', edgecolor='#2266aa',
-                linewidth=0.5, label='Included')
-        left1 = list(included)
-        ax.barh(y_pos, skipped_lw, left=left1, color='#ff9933',
-                edgecolor='#cc7722', linewidth=0.5, label='Skipped (Low Weight)')
-        left2 = [a + b for a, b in zip(left1, skipped_lw)]
-        ax.barh(y_pos, skipped_flat, left=left2, color='#cc3333',
-                edgecolor='#aa2222', linewidth=0.5, label='Skipped (Flat Region)')
-        left3 = [a + b for a, b in zip(left2, skipped_flat)]
-        ax.barh(y_pos, skipped_scatter, left=left3, color='#9966cc',
-                edgecolor='#774499', linewidth=0.5, label='Skipped (Scatter Failed)')
-        left4 = [a + b for a, b in zip(left3, skipped_scatter)]
-        ax.barh(y_pos, skipped_dup, left=left4, color='#66cccc',
-                edgecolor='#449999', linewidth=0.5, label='Skipped (Duplicate)')
-        if any(u > 0 for u in unaccounted):
-            left5 = [a + b for a, b in zip(left4, skipped_dup)]
-            ax.barh(y_pos, unaccounted, left=left5, color='#999999',
-                    edgecolor='#666666', linewidth=0.5, label='Unaccounted')
-    else:
-        included = [r.included_segments for r in plotted]
-        ax.barh(y_pos, included, color='#4488cc', edgecolor='#2266aa',
-                linewidth=0.5, label='Included')
+        if has_tracking:
+            included = [r.included_segments for r in plotted]
+            skipped_lw = [r.skipped_low_weight for r in plotted]
+            skipped_flat = [r.skipped_flat_region for r in plotted]
+            skipped_scatter = [r.skipped_scatter_failed for r in plotted]
+            skipped_dup = [r.skipped_duplicate for r in plotted]
+            unaccounted = [max(0, r.total_segments - r.included_segments
+                              - r.skipped_low_weight - r.skipped_flat_region
+                              - r.skipped_scatter_failed - r.skipped_duplicate)
+                          for r in plotted]
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(guids, fontsize=max(5, min(8, 200 // n)))
-    ax.set_xlabel('Segment Count')
-    ax.set_title(f'Segment Counts by GUID (top {n})')
-    ax.legend(fontsize=9, loc='lower right')
-    ax.grid(axis='x', alpha=0.3)
-    plt.tight_layout()
+            ax.barh(y_pos, included, color=_PAL['included'][0],
+                    edgecolor=_PAL['included'][1], linewidth=edge_lw, label='Included')
+            left1 = list(included)
+            ax.barh(y_pos, skipped_lw, left=left1, color=_PAL['low_weight'][0],
+                    edgecolor=_PAL['low_weight'][1], linewidth=edge_lw, label='Low Weight')
+            left2 = [a + b for a, b in zip(left1, skipped_lw)]
+            ax.barh(y_pos, skipped_flat, left=left2, color=_PAL['flat_region'][0],
+                    edgecolor=_PAL['flat_region'][1], linewidth=edge_lw, label='Flat Region')
+            left3 = [a + b for a, b in zip(left2, skipped_flat)]
+            ax.barh(y_pos, skipped_scatter, left=left3, color=_PAL['scatter'][0],
+                    edgecolor=_PAL['scatter'][1], linewidth=edge_lw, label='Scatter Failed')
+            left4 = [a + b for a, b in zip(left3, skipped_scatter)]
+            ax.barh(y_pos, skipped_dup, left=left4, color=_PAL['duplicate'][0],
+                    edgecolor=_PAL['duplicate'][1], linewidth=edge_lw, label='Duplicate')
+            if any(u > 0 for u in unaccounted):
+                left5 = [a + b for a, b in zip(left4, skipped_dup)]
+                ax.barh(y_pos, unaccounted, left=left5, color=_PAL['unaccounted'][0],
+                        edgecolor=_PAL['unaccounted'][1], linewidth=edge_lw,
+                        label='Unaccounted')
+        else:
+            included = [r.included_segments for r in plotted]
+            ax.barh(y_pos, included, color=_PAL['included'][0],
+                    edgecolor=_PAL['included'][1], linewidth=edge_lw, label='Included')
 
-    path = os.path.join(output_dir, 'segment_counts.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(guids, fontsize=max(4.5, min(6.5, 120 / n)))
+        ax.set_xlabel('Segment Count')
+        ax.set_title(f'Segment Counts by GUID (top {n})')
+        ax.legend(loc='lower right', frameon=True, edgecolor='#cccccc', framealpha=0.9)
+        ax.grid(axis='x', linewidth=0.3, alpha=0.4)
+        for spine in ('top', 'right'):
+            ax.spines[spine].set_visible(False)
+
+        path = os.path.join(output_dir, 'segment_counts.png')
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
     return path
 
 
 def _plot_rejection_reasons(
     summary: Dict[str, Any],
     output_dir: str,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Optional[str]:
     """Pie chart of rejection reasons. Only generated with tracking data."""
     if not summary.get('has_tracking_data'):
@@ -799,48 +845,250 @@ def _plot_rejection_reasons(
     sizes = []
     colors = []
 
+    # Muted palette matching the segment counts chart
     if included > 0:
         labels.append(f'Included ({included})')
         sizes.append(included)
-        colors.append('#4488cc')
+        colors.append('#6fa8dc')
     if lw > 0:
         labels.append(f'Low Weight ({lw})')
         sizes.append(lw)
-        colors.append('#ff9933')
+        colors.append('#f6b26b')
     if flat > 0:
         labels.append(f'Flat Region ({flat})')
         sizes.append(flat)
-        colors.append('#cc3333')
+        colors.append('#e06666')
     if scatter > 0:
         labels.append(f'Scatter Failed ({scatter})')
         sizes.append(scatter)
-        colors.append('#9966cc')
+        colors.append('#b4a7d6')
     if dup > 0:
         labels.append(f'Duplicate ({dup})')
         sizes.append(dup)
-        colors.append('#66cccc')
+        colors.append('#76d7c4')
     if errored > 0:
         labels.append(f'Errored GUIDs ({errored})')
         sizes.append(errored)
-        colors.append('#999999')
+        colors.append('#b7b7b7')
 
     if not sizes:
         return None
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    _, _, autotexts = ax.pie(
-        sizes, labels=labels, colors=colors, autopct='%1.1f%%',
-        startangle=90, pctdistance=0.85,
-        wedgeprops=dict(edgecolor='white', linewidth=1.5))
-    for t in autotexts:
-        t.set_fontsize(9)
-    ax.set_title('Segment Rejection Reasons')
-    plt.tight_layout()
+    with plt.rc_context(_JOURNAL_RC):
+        fig, ax = plt.subplots(figsize=(3.8, 3))
+        _, texts, autotexts = ax.pie(
+            sizes, labels=labels, colors=colors, autopct='%1.1f%%',
+            startangle=90, pctdistance=0.82,
+            wedgeprops=dict(edgecolor='white', linewidth=0.8))
+        for t in texts:
+            t.set_fontsize(6.5)
+        for t in autotexts:
+            t.set_fontsize(6)
+        ax.set_title('Segment Rejection Reasons')
 
-    path = os.path.join(output_dir, 'rejection_reasons.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
+        path = os.path.join(output_dir, 'rejection_reasons.png')
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Interactive signal strip plot (plotly)
+# ---------------------------------------------------------------------------
+
+# Color scheme for segment status
+_STRIP_COLORS = {
+    'included':       {'line': 'rgb(30,30,30)',    'band': None},
+    'low_weight':     {'line': 'rgb(200,0,0)',     'band': 'rgba(255,180,180,0.35)'},
+    'flat_region':    {'line': 'rgb(200,100,0)',   'band': 'rgba(255,200,150,0.35)'},
+    'scatter_failed': {'line': 'rgb(140,0,140)',   'band': 'rgba(220,180,255,0.35)'},
+    'pending':        {'line': 'rgb(150,150,150)', 'band': 'rgba(200,200,200,0.2)'},
+}
+
+_STATUS_LABELS = {
+    'included':       'Included',
+    'low_weight':     'Rejected: Low Weight',
+    'flat_region':    'Rejected: Flat Region',
+    'scatter_failed': 'Rejected: Scatter Failed',
+    'pending':        'Pending (unprocessed)',
+}
+
+
+def plot_guid_signal_strip(
+    guid: str,
+    fhr: np.ndarray,
+    up: np.ndarray,
+    domain_starts: List[float],
+    segment_status: List[str],
+    output_dir: str,
+    sampling_rate: float = 4.0,
+) -> Optional[str]:
+    """Generate an interactive plotly signal strip for a single GUID.
+
+    Creates a clinical-strip-style HTML plot with FHR (top) and UP (bottom),
+    where rejected segments are highlighted with colored background bands and
+    signal lines.
+
+    Args:
+        guid: GUID identifier string.
+        fhr: Signal array of shape ``(n_segments, 5760)``.
+        up: Signal array of shape ``(n_segments, 5760)``.
+        domain_starts: Domain start (seconds relative to delivery) per segment.
+        segment_status: Status string per segment — one of
+            ``'included'``, ``'low_weight'``, ``'flat_region'``,
+            ``'scatter_failed'``, ``'pending'``.
+        output_dir: Directory where the HTML file will be saved.
+        sampling_rate: Sampling rate in Hz (default 4.0).
+
+    Returns:
+        Path to the saved HTML file, or ``None`` on failure.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        logger.warning("plotly not installed — skipping signal strip plot for %s", guid)
+        return None
+
+    n_segments = fhr.shape[0]
+    if n_segments == 0:
+        return None
+
+    segment_duration_sec = fhr.shape[1] / sampling_rate  # 1440 sec
+    downsample = 4  # 5760 → 1440 points per segment
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.6, 0.4],
+        subplot_titles=('FHR (bpm)', 'UP (mmHg)'),
+    )
+
+    legend_shown = set()
+
+    # Plot rejected segments first, then accepted on top
+    order = [i for i in range(n_segments) if segment_status[i] != 'included']
+    order += [i for i in range(n_segments) if segment_status[i] == 'included']
+
+    for seg_i in order:
+        status = segment_status[seg_i]
+        colors = _STRIP_COLORS.get(status, _STRIP_COLORS['pending'])
+        ds = domain_starts[seg_i]
+
+        # Time axis in minutes relative to delivery
+        t_start_min = ds / 60.0
+        seg_samples = fhr.shape[1]
+        t = np.linspace(t_start_min, t_start_min + segment_duration_sec / 60.0,
+                        seg_samples // downsample, endpoint=False)
+
+        fhr_ds = fhr[seg_i, ::downsample]
+        up_ds = up[seg_i, ::downsample]
+
+        show_legend = status not in legend_shown
+        legend_shown.add(status)
+
+        hover_text = (f"Status: {_STATUS_LABELS.get(status, status)}<br>"
+                      f"Epoch: {ds:.0f}s ({ds/60:.1f} min)")
+
+        # Background band for rejected segments
+        if colors['band'] is not None:
+            t_end_min = t_start_min + segment_duration_sec / 60.0
+            for row in (1, 2):
+                fig.add_vrect(
+                    x0=t_start_min, x1=t_end_min,
+                    fillcolor=colors['band'],
+                    line_width=0,
+                    layer='below',
+                    row=row, col=1,
+                )
+
+        # FHR trace
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=fhr_ds,
+                mode='lines',
+                line=dict(color=colors['line'], width=1),
+                name=_STATUS_LABELS.get(status, status),
+                legendgroup=status,
+                showlegend=show_legend,
+                hovertemplate=hover_text + '<br>FHR: %{y:.0f} bpm<extra></extra>',
+            ),
+            row=1, col=1,
+        )
+
+        # UP trace
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=up_ds,
+                mode='lines',
+                line=dict(color=colors['line'], width=1),
+                name=_STATUS_LABELS.get(status, status),
+                legendgroup=status,
+                showlegend=False,
+                hovertemplate=hover_text + '<br>UP: %{y:.0f} mmHg<extra></extra>',
+            ),
+            row=2, col=1,
+        )
+
+    # Delivery marker (t=0)
+    for row in (1, 2):
+        fig.add_vline(
+            x=0, line_dash='dash', line_color='red', line_width=1.5,
+            annotation_text='Delivery' if row == 1 else None,
+            annotation_position='top right' if row == 1 else None,
+            row=row, col=1,
+        )
+
+    # Count summary
+    n_included = sum(1 for s in segment_status if s == 'included')
+    n_rejected = n_segments - n_included
+
+    fig.update_layout(
+        title=dict(
+            text=(f'{guid} — {n_segments} segments '
+                  f'({n_included} included, {n_rejected} rejected)'),
+            font_size=13,
+        ),
+        width=2400,
+        height=250,
+        margin=dict(l=60, r=30, t=50, b=40),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5,
+            font_size=10,
+        ),
+        hovermode='x unified',
+    )
+
+    # Axis styling
+    fig.update_yaxes(
+        range=[50, 210], title_text='FHR (bpm)',
+        gridcolor='lightgray', gridwidth=0.5,
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        range=[0, 100], title_text='UP (mmHg)',
+        gridcolor='lightgray', gridwidth=0.5,
+        row=2, col=1,
+    )
+    fig.update_xaxes(
+        title_text='Time (min, relative to delivery)',
+        gridcolor='lightgray', gridwidth=0.5,
+        row=2, col=1,
+    )
+    fig.update_xaxes(gridcolor='lightgray', gridwidth=0.5, row=1, col=1)
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f'{guid}_signal_strip.html')
+    fig.write_html(out_path, include_plotlyjs=True)
+    logger.info(f"Signal strip plot saved: {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +1101,7 @@ def run_guid_analysis(
     segment_duration_sec: float = 1440.0,
     output_dir: Optional[str] = None,
     max_guids_in_timeline_plot: int = 100,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Dict[str, Any]:
     """Run full GUID-level analysis and generate reports + plots.
 
@@ -865,7 +1113,7 @@ def run_guid_analysis(
         output_dir: Directory for output files. Defaults to ``<hdf5_stem>_guid_analysis/``
             alongside the HDF5 file.
         max_guids_in_timeline_plot: Cap on GUIDs shown in the timeline plot.
-        dpi: Resolution for saved plots.
+        dpi: Resolution for saved plots (default 300).
 
     Returns:
         Summary statistics dictionary.
