@@ -461,10 +461,19 @@ def create_hdf5_dataset_from_records_list(
             up[(up != 0) & (np.abs(up) < tiny)] = 0.0
             domain_starts = mimo_prepared.domain_start
             guid_key = os.path.splitext(os.path.split(record)[1])[0]
+            # Surface post-delivery segments from prepare_data
+            n_post_delivery = sum(1 for ds in domain_starts if ds >= 0)
+            if n_post_delivery > 0:
+                logger.warning(
+                    f"{guid_key}: {n_post_delivery}/{len(domain_starts)} segments have "
+                    f"domain_start >= 0 (post-delivery). Max domain_start="
+                    f"{max(domain_starts):.1f}s. Source: split_long() equalization "
+                    f"padding or recording extends past delivery.")
             if guid_tracking is not None:
                 guid_tracking[guid_key] = GuidTrackingEntry(
                     all_domain_starts=[float(ds) for ds in domain_starts],
-                    included_domain_starts=[], skipped_low_weight=[], skipped_flat_region=[])
+                    included_domain_starts=[], skipped_low_weight=[],
+                    skipped_flat_region=[], skipped_scatter_failed=[])
             block_targets = mimo_prepared.block_target
             if isinstance(block_targets, np.ndarray) and block_targets.ndim < 3:
                 block_targets = []
@@ -541,6 +550,9 @@ def create_hdf5_dataset_from_records_list(
                     scatter_failed.append(seg_j)
                     st_phase_list.append(None)
                     st_cross_list.append(None)
+                    if guid_tracking is not None:
+                        guid_tracking[guid_key].skipped_scatter_failed.append(
+                            float(domain_starts[orig_idx]))
 
             # ---- Step 3: Save valid, successfully scattered segments ----
             for seg_j in range(len(valid_indices)):
@@ -555,9 +567,13 @@ def create_hdf5_dataset_from_records_list(
                 fhr_ph = fhr_st_phase_full[phase_mask, :]
                 fhr_up_ph = fhr_up_cc_phase_full[cross_mask, :]
 
+                ds_val = float(domain_starts[orig_idx])
+                if ds_val >= 0:
+                    logger.warning(
+                        f"{guid_key} segment {orig_idx}: post-delivery domain_start="
+                        f"{ds_val:.1f}s (equalization padding or recording extends past delivery)")
                 if guid_tracking is not None:
-                    guid_tracking[guid_key].included_domain_starts.append(
-                        float(domain_starts[orig_idx]))
+                    guid_tracking[guid_key].included_domain_starts.append(ds_val)
                 append_sample(
                     path=hdf5_path,
                     fhr=fhr[orig_idx, :],
