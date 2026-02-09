@@ -926,8 +926,8 @@ def plot_guid_signal_strip(
     """Generate an interactive plotly signal strip for a single GUID.
 
     Creates a clinical-strip-style HTML plot with FHR (top) and UP (bottom),
-    where rejected segments are highlighted with colored background bands and
-    signal lines.
+    where rejected segments are colored by their filtering status.
+    Overlapping segments are trimmed so each time point shows only once.
 
     Args:
         guid: GUID identifier string.
@@ -954,15 +954,36 @@ def plot_guid_signal_strip(
     if n_segments == 0:
         return None
 
-    segment_duration_sec = fhr.shape[1] / sampling_rate  # 1440 sec
+    seg_samples = fhr.shape[1]
+    segment_duration_sec = seg_samples / sampling_rate  # 1440 sec
     downsample = 4  # 5760 → 1440 points per segment
+
+    # --- Compute per-segment display boundaries to eliminate overlap ---
+    # Sort indices by domain_start so we can trim at midpoints
+    sorted_idx = sorted(range(n_segments), key=lambda i: domain_starts[i])
+    # For each segment: display from its start to the midpoint with its
+    # right neighbour (or its full end if it's the last / no overlap).
+    seg_display_end_sample = {}  # seg index -> how many samples to show
+    for pos, si in enumerate(sorted_idx):
+        if pos + 1 < len(sorted_idx):
+            next_si = sorted_idx[pos + 1]
+            gap_sec = domain_starts[next_si] - domain_starts[si]
+            if gap_sec < segment_duration_sec:
+                # Overlap exists — trim at midpoint
+                mid_sec = gap_sec / 2.0
+                end_sample = int(mid_sec * sampling_rate)
+                end_sample = max(1, min(end_sample, seg_samples))
+            else:
+                end_sample = seg_samples
+        else:
+            end_sample = seg_samples
+        seg_display_end_sample[si] = end_sample
 
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,
+        vertical_spacing=0.06,
         row_heights=[0.6, 0.4],
-        subplot_titles=('FHR (bpm)', 'UP (mmHg)'),
     )
 
     legend_shown = set()
@@ -976,14 +997,16 @@ def plot_guid_signal_strip(
         colors = _STRIP_COLORS.get(status, _STRIP_COLORS['pending'])
         ds = domain_starts[seg_i]
 
-        # Time axis in minutes relative to delivery
-        t_start_min = ds / 60.0
-        seg_samples = fhr.shape[1]
-        t = np.linspace(t_start_min, t_start_min + segment_duration_sec / 60.0,
-                        seg_samples // downsample, endpoint=False)
+        # Trim to display boundary then downsample
+        end_samp = seg_display_end_sample[seg_i]
+        fhr_trimmed = fhr[seg_i, :end_samp:downsample]
+        up_trimmed = up[seg_i, :end_samp:downsample]
+        n_pts = len(fhr_trimmed)
 
-        fhr_ds = fhr[seg_i, ::downsample]
-        up_ds = up[seg_i, ::downsample]
+        t_start_min = ds / 60.0
+        t = np.linspace(t_start_min,
+                        t_start_min + end_samp / sampling_rate / 60.0,
+                        n_pts, endpoint=False)
 
         show_legend = status not in legend_shown
         legend_shown.add(status)
@@ -991,22 +1014,10 @@ def plot_guid_signal_strip(
         hover_text = (f"Status: {_STATUS_LABELS.get(status, status)}<br>"
                       f"Epoch: {ds:.0f}s ({ds/60:.1f} min)")
 
-        # Background band for rejected segments
-        if colors['band'] is not None:
-            t_end_min = t_start_min + segment_duration_sec / 60.0
-            for row in (1, 2):
-                fig.add_vrect(
-                    x0=t_start_min, x1=t_end_min,
-                    fillcolor=colors['band'],
-                    line_width=0,
-                    layer='below',
-                    row=row, col=1,
-                )
-
         # FHR trace
         fig.add_trace(
             go.Scattergl(
-                x=t, y=fhr_ds,
+                x=t, y=fhr_trimmed,
                 mode='lines',
                 line=dict(color=colors['line'], width=1),
                 name=_STATUS_LABELS.get(status, status),
@@ -1020,7 +1031,7 @@ def plot_guid_signal_strip(
         # UP trace
         fig.add_trace(
             go.Scattergl(
-                x=t, y=up_ds,
+                x=t, y=up_trimmed,
                 mode='lines',
                 line=dict(color=colors['line'], width=1),
                 name=_STATUS_LABELS.get(status, status),
@@ -1049,18 +1060,22 @@ def plot_guid_signal_strip(
             text=(f'{guid} — {n_segments} segments '
                   f'({n_included} included, {n_rejected} rejected)'),
             font_size=13,
+            x=0.5,
+            xanchor='center',
+            y=0.98,
+            yanchor='top',
         ),
-        width=2400,
-        height=250,
-        margin=dict(l=60, r=30, t=50, b=40),
+        width=3600,
+        height=350,
+        margin=dict(l=60, r=30, t=80, b=40),
         plot_bgcolor='white',
         paper_bgcolor='white',
         legend=dict(
             orientation='h',
-            yanchor='bottom',
-            y=1.02,
-            xanchor='center',
-            x=0.5,
+            yanchor='top',
+            y=1.15,
+            xanchor='right',
+            x=1.0,
             font_size=10,
         ),
         hovermode='x unified',
