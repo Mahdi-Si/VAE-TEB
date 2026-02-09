@@ -41,6 +41,7 @@ class GuidTrackingEntry:
     included_domain_starts: List[float] = field(default_factory=list)
     skipped_low_weight: List[float] = field(default_factory=list)
     skipped_flat_region: List[float] = field(default_factory=list)
+    skipped_scatter_failed: List[float] = field(default_factory=list)
     error: bool = False
     error_msg: Optional[str] = None
 
@@ -53,6 +54,7 @@ class GuidCoverageResult:
     included_segments: int
     skipped_low_weight: int
     skipped_flat_region: int
+    skipped_scatter_failed: int
     total_extent_sec: float
     covered_sec: float
     missing_pct: float
@@ -60,6 +62,10 @@ class GuidCoverageResult:
     gap_durations_sec: List[float]
     longest_gap_sec: float
     merged_intervals: List[Tuple[float, float]]
+    extent_start_sec: float = 0.0
+    extent_end_sec: float = 0.0
+    n_post_delivery_all: int = 0
+    n_post_delivery_included: int = 0
     error: bool = False
     error_msg: Optional[str] = None
 
@@ -119,12 +125,18 @@ def _compute_coverage_for_guid(
     segment_duration_sec: float,
     skipped_low_weight: Optional[List[float]] = None,
     skipped_flat_region: Optional[List[float]] = None,
+    skipped_scatter_failed: Optional[List[float]] = None,
     error: bool = False,
     error_msg: Optional[str] = None,
 ) -> GuidCoverageResult:
     """Compute coverage statistics for a single GUID."""
     n_skipped_lw = len(skipped_low_weight) if skipped_low_weight else 0
     n_skipped_flat = len(skipped_flat_region) if skipped_flat_region else 0
+    n_skipped_scatter = len(skipped_scatter_failed) if skipped_scatter_failed else 0
+
+    # Count post-delivery segments (domain_start >= 0 means segment starts at or after birth)
+    n_post_all = sum(1 for s in all_starts if s >= 0) if all_starts else 0
+    n_post_included = sum(1 for s in included_starts if s >= 0)
 
     if error:
         return GuidCoverageResult(
@@ -133,6 +145,7 @@ def _compute_coverage_for_guid(
             included_segments=0,
             skipped_low_weight=n_skipped_lw,
             skipped_flat_region=n_skipped_flat,
+            skipped_scatter_failed=n_skipped_scatter,
             total_extent_sec=0.0,
             covered_sec=0.0,
             missing_pct=100.0,
@@ -140,6 +153,8 @@ def _compute_coverage_for_guid(
             gap_durations_sec=[],
             longest_gap_sec=0.0,
             merged_intervals=[],
+            n_post_delivery_all=n_post_all,
+            n_post_delivery_included=n_post_included,
             error=True,
             error_msg=error_msg,
         )
@@ -153,6 +168,7 @@ def _compute_coverage_for_guid(
             included_segments=len(included_starts),
             skipped_low_weight=n_skipped_lw,
             skipped_flat_region=n_skipped_flat,
+            skipped_scatter_failed=n_skipped_scatter,
             total_extent_sec=0.0,
             covered_sec=0.0,
             missing_pct=100.0,
@@ -169,6 +185,9 @@ def _compute_coverage_for_guid(
     if total_extent <= 0:
         total_extent = segment_duration_sec  # single segment
 
+    extent_start = min_start
+    extent_end = max_start + segment_duration_sec
+
     # Build and merge included intervals
     if not included_starts:
         return GuidCoverageResult(
@@ -177,6 +196,7 @@ def _compute_coverage_for_guid(
             included_segments=0,
             skipped_low_weight=n_skipped_lw,
             skipped_flat_region=n_skipped_flat,
+            skipped_scatter_failed=n_skipped_scatter,
             total_extent_sec=total_extent,
             covered_sec=0.0,
             missing_pct=100.0,
@@ -184,15 +204,17 @@ def _compute_coverage_for_guid(
             gap_durations_sec=[],
             longest_gap_sec=0.0,
             merged_intervals=[],
+            extent_start_sec=extent_start,
+            extent_end_sec=extent_end,
+            n_post_delivery_all=n_post_all,
+            n_post_delivery_included=n_post_included,
         )
 
     intervals = [(s, s + segment_duration_sec) for s in included_starts]
     merged = _merge_intervals(intervals)
     covered = sum(end - start for start, end in merged)
 
-    # Compute gaps within total extent
-    extent_start = min_start
-    extent_end = max_start + segment_duration_sec
+    # Compute gaps within total extent (extent_start/extent_end already set above)
     gaps: List[float] = []
 
     # Gap before first merged interval
@@ -216,6 +238,7 @@ def _compute_coverage_for_guid(
         included_segments=len(included_starts),
         skipped_low_weight=n_skipped_lw,
         skipped_flat_region=n_skipped_flat,
+        skipped_scatter_failed=n_skipped_scatter,
         total_extent_sec=total_extent,
         covered_sec=covered,
         missing_pct=missing_pct,
@@ -223,6 +246,10 @@ def _compute_coverage_for_guid(
         gap_durations_sec=gaps,
         longest_gap_sec=max(gaps, default=0.0),
         merged_intervals=merged,
+        extent_start_sec=extent_start,
+        extent_end_sec=extent_end,
+        n_post_delivery_all=n_post_all,
+        n_post_delivery_included=n_post_included,
     )
 
 
@@ -250,6 +277,7 @@ def _compute_all_coverage(
                 segment_duration_sec=segment_duration_sec,
                 skipped_low_weight=entry.skipped_low_weight,
                 skipped_flat_region=entry.skipped_flat_region,
+                skipped_scatter_failed=entry.skipped_scatter_failed,
                 error=entry.error,
                 error_msg=entry.error_msg,
             )
@@ -284,6 +312,10 @@ def _generate_summary_stats(
     total_all_segments = sum(r.total_segments for r in non_error)
     total_skipped_lw = sum(r.skipped_low_weight for r in non_error)
     total_skipped_flat = sum(r.skipped_flat_region for r in non_error)
+    total_skipped_scatter = sum(r.skipped_scatter_failed for r in non_error)
+    total_post_delivery_all = sum(r.n_post_delivery_all for r in non_error)
+    total_post_delivery_included = sum(r.n_post_delivery_included for r in non_error)
+    guids_with_post_delivery = [r.guid for r in non_error if r.n_post_delivery_included > 0]
 
     missing_pcts = [r.missing_pct for r in non_error if r.total_extent_sec > 0]
     all_gaps = []
@@ -320,6 +352,10 @@ def _generate_summary_stats(
             'p95': float(np.percentile(mp, 95)),
         }
 
+    # Segment accounting: total = included + skipped_lw + skipped_flat + skipped_scatter + unaccounted
+    total_accounted = total_included + total_skipped_lw + total_skipped_flat + total_skipped_scatter
+    unaccounted = max(0, total_all_segments - total_accounted)
+
     return {
         'total_guids': len(coverage_results),
         'guids_with_data': len(non_error) - len(fully_rejected),
@@ -329,7 +365,12 @@ def _generate_summary_stats(
         'total_included_segments': total_included,
         'total_skipped_low_weight': total_skipped_lw,
         'total_skipped_flat_region': total_skipped_flat,
+        'total_skipped_scatter_failed': total_skipped_scatter,
+        'total_unaccounted_segments': unaccounted,
         'has_tracking_data': guid_tracking is not None,
+        'total_post_delivery_all': total_post_delivery_all,
+        'total_post_delivery_included': total_post_delivery_included,
+        'guids_with_post_delivery': guids_with_post_delivery,
         'gap_stats': gap_stats,
         'missing_pct_stats': missing_stats,
     }
@@ -358,6 +399,11 @@ def _write_json_report(
             'missing_pct': round(r.missing_pct, 2),
             'n_gaps': r.n_gaps,
             'longest_gap_sec': round(r.longest_gap_sec, 2),
+            'skipped_scatter_failed': r.skipped_scatter_failed,
+            'extent_start_sec': round(r.extent_start_sec, 2),
+            'extent_end_sec': round(r.extent_end_sec, 2),
+            'n_post_delivery_all': r.n_post_delivery_all,
+            'n_post_delivery_included': r.n_post_delivery_included,
             'error': r.error,
         }
         if r.error_msg:
@@ -398,6 +444,31 @@ def _write_markdown_report(
     if summary['has_tracking_data']:
         lines.append(f'| Skipped (low weight) | {summary["total_skipped_low_weight"]} |')
         lines.append(f'| Skipped (flat region) | {summary["total_skipped_flat_region"]} |')
+        lines.append(f'| Skipped (scatter failed) | {summary["total_skipped_scatter_failed"]} |')
+        if summary['total_unaccounted_segments'] > 0:
+            lines.append(f'| **Unaccounted segments** | **{summary["total_unaccounted_segments"]}** |')
+
+    # Post-delivery diagnostics (domain_start >= 0)
+    n_post_all = summary.get('total_post_delivery_all', 0)
+    n_post_inc = summary.get('total_post_delivery_included', 0)
+    guids_post = summary.get('guids_with_post_delivery', [])
+    if n_post_all > 0 or n_post_inc > 0:
+        lines.append('\n## WARNING: Post-Delivery Segments Detected')
+        lines.append('')
+        lines.append('Segments with `domain_start >= 0` start at or after delivery.')
+        lines.append('These come from equalization padding in `split_long()` pushing')
+        lines.append('the last segment past t=0, or from recordings that extend past delivery.')
+        lines.append('')
+        lines.append('| Metric | Value |')
+        lines.append('|--------|-------|')
+        lines.append(f'| Post-delivery segments (from prepare_data) | {n_post_all} |')
+        lines.append(f'| Post-delivery segments (included in HDF5) | {n_post_inc} |')
+        lines.append(f'| GUIDs affected | {len(guids_post)} |')
+        if guids_post:
+            lines.append('')
+            lines.append('Affected GUIDs:')
+            for g in guids_post:
+                lines.append(f'- `{g}`')
 
     # Coverage statistics
     if summary['missing_pct_stats']:
@@ -435,7 +506,7 @@ def _write_markdown_report(
         lines.append(f'\n## Fully Rejected GUIDs ({len(rejected)})')
         lines.append('')
         for r in rejected:
-            lines.append(f'- `{r.guid}` — {r.total_segments} total segments, '
+            lines.append(f'- `{r.guid}` -- {r.total_segments} total segments, '
                          f'{r.skipped_low_weight} low weight, {r.skipped_flat_region} flat region')
 
     # Errored GUIDs
@@ -444,20 +515,22 @@ def _write_markdown_report(
         lines.append(f'\n## Errored GUIDs ({len(errored)})')
         lines.append('')
         for r in errored:
-            lines.append(f'- `{r.guid}` — {r.error_msg or "unknown error"}')
+            lines.append(f'- `{r.guid}` -- {r.error_msg or "unknown error"}')
 
     # Per-GUID table
     non_error = [r for r in coverage_results if not r.error]
     if non_error:
         lines.append('\n## Per-GUID Detail')
         lines.append('')
-        lines.append('| GUID | Total | Included | Skipped LW | Skipped Flat | Missing % | Longest Gap (min) |')
-        lines.append('|------|-------|----------|------------|--------------|-----------|-------------------|')
+        lines.append('| GUID | Total | Included | Skip LW | Skip Flat | Skip Scatter | Post-Deliv | Missing % | Longest Gap (min) |')
+        lines.append('|------|-------|----------|---------|-----------|--------------|------------|-----------|-------------------|')
         for r in non_error:
             longest_gap_min = r.longest_gap_sec / 60.0
+            post_flag = f'**{r.n_post_delivery_included}**' if r.n_post_delivery_included > 0 else '0'
             lines.append(
                 f'| `{r.guid}` | {r.total_segments} | {r.included_segments} '
                 f'| {r.skipped_low_weight} | {r.skipped_flat_region} '
+                f'| {r.skipped_scatter_failed} | {post_flag} '
                 f'| {r.missing_pct:.1f}% | {longest_gap_min:.1f} |'
             )
 
@@ -492,11 +565,8 @@ def _plot_coverage_timeline(
         y = idx
         # Draw total extent as red background
         if r.total_extent_sec > 0:
-            # Use domain_start values (seconds before delivery, often negative)
-            if r.merged_intervals:
-                extent_start = min(iv[0] for iv in r.merged_intervals)
-            else:
-                extent_start = 0
+            # Use full recording extent (from all_starts, not just included)
+            extent_start = r.extent_start_sec
 
             # Red background for total extent
             ax.barh(y, r.total_extent_sec / 60.0, left=extent_start / 60.0,
@@ -512,6 +582,8 @@ def _plot_coverage_timeline(
     ax.set_yticklabels(labels, fontsize=max(5, min(8, 200 // n)))
     ax.set_xlabel('Time (minutes, relative to delivery)')
     ax.set_title(f'Coverage Timeline ({n} GUIDs)')
+    # Mark delivery (time=0) with a vertical line
+    ax.axvline(0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, label='Delivery (t=0)')
     ax.legend(handles=[
         Patch(facecolor='#4488cc', edgecolor='#2266aa', label='Covered'),
         Patch(facecolor='#ffcccc', edgecolor='#ff6666', label='Gap / Missing'),
@@ -649,14 +721,27 @@ def _plot_segment_counts(
         included = [r.included_segments for r in plotted]
         skipped_lw = [r.skipped_low_weight for r in plotted]
         skipped_flat = [r.skipped_flat_region for r in plotted]
+        skipped_scatter = [r.skipped_scatter_failed for r in plotted]
+        # Unaccounted = total - (included + lw + flat + scatter)
+        unaccounted = [max(0, r.total_segments - r.included_segments
+                          - r.skipped_low_weight - r.skipped_flat_region
+                          - r.skipped_scatter_failed) for r in plotted]
 
         ax.barh(y_pos, included, color='#4488cc', edgecolor='#2266aa',
                 linewidth=0.5, label='Included')
-        ax.barh(y_pos, skipped_lw, left=included, color='#ff9933',
+        left1 = list(included)
+        ax.barh(y_pos, skipped_lw, left=left1, color='#ff9933',
                 edgecolor='#cc7722', linewidth=0.5, label='Skipped (Low Weight)')
-        left2 = [a + b for a, b in zip(included, skipped_lw)]
+        left2 = [a + b for a, b in zip(left1, skipped_lw)]
         ax.barh(y_pos, skipped_flat, left=left2, color='#cc3333',
                 edgecolor='#aa2222', linewidth=0.5, label='Skipped (Flat Region)')
+        left3 = [a + b for a, b in zip(left2, skipped_flat)]
+        ax.barh(y_pos, skipped_scatter, left=left3, color='#9966cc',
+                edgecolor='#774499', linewidth=0.5, label='Skipped (Scatter Failed)')
+        if any(u > 0 for u in unaccounted):
+            left4 = [a + b for a, b in zip(left3, skipped_scatter)]
+            ax.barh(y_pos, unaccounted, left=left4, color='#999999',
+                    edgecolor='#666666', linewidth=0.5, label='Unaccounted')
     else:
         included = [r.included_segments for r in plotted]
         ax.barh(y_pos, included, color='#4488cc', edgecolor='#2266aa',
@@ -688,6 +773,7 @@ def _plot_rejection_reasons(
     included = summary['total_included_segments']
     lw = summary['total_skipped_low_weight']
     flat = summary['total_skipped_flat_region']
+    scatter = summary.get('total_skipped_scatter_failed', 0)
     errored = summary['errored_guids']
 
     labels = []
@@ -706,6 +792,10 @@ def _plot_rejection_reasons(
         labels.append(f'Flat Region ({flat})')
         sizes.append(flat)
         colors.append('#cc3333')
+    if scatter > 0:
+        labels.append(f'Scatter Failed ({scatter})')
+        sizes.append(scatter)
+        colors.append('#9966cc')
     if errored > 0:
         labels.append(f'Errored GUIDs ({errored})')
         sizes.append(errored)
