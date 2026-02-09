@@ -542,6 +542,11 @@ def create_hdf5_dataset_from_records_list(
                 sample_weights = sample_weights[keep_idx]
                 domain_starts = [domain_starts[i] for i in keep_idx]
 
+            # Initialize per-segment status tracking for signal strip plots
+            plot_segment_status = None
+            if guid_tracking is not None:
+                plot_segment_status = ['pending'] * fhr.shape[0]
+
             record_file = os.path.split(record)
             record_name = os.path.splitext(record_file[1])
 
@@ -551,6 +556,8 @@ def create_hdf5_dataset_from_records_list(
                 if np.mean(sample_weights[i, :]) < 0.90:
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_low_weight.append(float(domain_starts[i]))
+                        if plot_segment_status is not None:
+                            plot_segment_status[i] = 'low_weight'
                     continue
 
                 # Flat region detection
@@ -570,11 +577,25 @@ def create_hdf5_dataset_from_records_list(
                     logger.info(f'Flat region detected for {record_name} in {domain_starts[i]}')
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_flat_region.append(float(domain_starts[i]))
+                        if plot_segment_status is not None:
+                            plot_segment_status[i] = 'flat_region'
                 else:
                     valid_indices.append(i)
 
             if not valid_indices:
                 logger.info(f'{guid_key}: all {fhr.shape[0]} segments filtered out, skipping record')
+                # Generate strip plot for fully-rejected GUIDs
+                if plot_segment_status is not None and hdf5_path:
+                    from guid_analysis import plot_guid_signal_strip
+                    hdf5_stem = os.path.splitext(os.path.basename(hdf5_path))[0]
+                    strip_dir = os.path.join(
+                        os.path.dirname(os.path.abspath(hdf5_path)),
+                        f'{hdf5_stem}_guid_analysis', 'signal_strips')
+                    plot_guid_signal_strip(
+                        guid=guid_key, fhr=fhr, up=up,
+                        domain_starts=domain_starts,
+                        segment_status=plot_segment_status,
+                        output_dir=strip_dir)
                 continue
 
             # ---- Step 2: Scattering on valid segments only ----
@@ -647,6 +668,26 @@ def create_hdf5_dataset_from_records_list(
                     epoch=domain_starts[orig_idx],
                     bg_label=bg_label,
                     cs_label=cs_label)
+
+            # ---- Generate signal strip plot ----
+            if plot_segment_status is not None and hdf5_path:
+                # Mark scatter_failed segments
+                for seg_j in scatter_failed:
+                    plot_segment_status[valid_indices[seg_j]] = 'scatter_failed'
+                # Mark remaining valid (successfully saved) segments as included
+                for seg_j in range(len(valid_indices)):
+                    if seg_j not in scatter_failed:
+                        plot_segment_status[valid_indices[seg_j]] = 'included'
+                from guid_analysis import plot_guid_signal_strip
+                hdf5_stem = os.path.splitext(os.path.basename(hdf5_path))[0]
+                strip_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(hdf5_path)),
+                    f'{hdf5_stem}_guid_analysis', 'signal_strips')
+                plot_guid_signal_strip(
+                    guid=guid_key, fhr=fhr, up=up,
+                    domain_starts=domain_starts,
+                    segment_status=plot_segment_status,
+                    output_dir=strip_dir)
 
         except Exception as e:
             errors_list.append(record)
