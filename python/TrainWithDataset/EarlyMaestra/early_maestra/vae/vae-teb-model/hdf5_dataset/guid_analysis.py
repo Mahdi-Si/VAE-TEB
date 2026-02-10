@@ -959,25 +959,55 @@ def plot_guid_signal_strip(
     downsample = 4  # 5760 → 1440 points per segment
 
     # --- Compute per-segment display boundaries to eliminate overlap ---
-    # Sort indices by domain_start so we can trim at midpoints
+    # Sort indices by domain_start; for each consecutive pair that overlaps,
+    # place a boundary at the midpoint of the overlap region.  Each segment
+    # then displays only the samples between its left and right boundaries.
+    #
+    # Example (50% overlap, dur=1440s):
+    #   Seg A ds=-7200  covers [-7200, -5760]
+    #   Seg B ds=-6480  covers [-6480, -5040]
+    #   Overlap = [-6480, -5760] (720s).  Midpoint = -6120.
+    #   Seg A shows [-7200, -6120] → samples 0..4320   (75%)
+    #   Seg B shows [-6120, -5040] → samples 1440..5760 (75%)
     sorted_idx = sorted(range(n_segments), key=lambda i: domain_starts[i])
-    # For each segment: display from its start to the midpoint with its
-    # right neighbour (or its full end if it's the last / no overlap).
-    seg_display_end_sample = {}  # seg index -> how many samples to show
-    for pos, si in enumerate(sorted_idx):
-        if pos + 1 < len(sorted_idx):
-            next_si = sorted_idx[pos + 1]
-            gap_sec = domain_starts[next_si] - domain_starts[si]
-            if gap_sec < segment_duration_sec:
-                # Overlap exists — trim at midpoint
-                mid_sec = gap_sec / 2.0
-                end_sample = int(mid_sec * sampling_rate)
-                end_sample = max(1, min(end_sample, seg_samples))
-            else:
-                end_sample = seg_samples
+
+    # Boundary between each consecutive pair (None = no overlap, show fully)
+    boundaries_sec = []  # length = n_segments - 1
+    for pos in range(len(sorted_idx) - 1):
+        si_cur = sorted_idx[pos]
+        si_nxt = sorted_idx[pos + 1]
+        ds_cur = domain_starts[si_cur]
+        ds_nxt = domain_starts[si_nxt]
+        overlap_sec = (ds_cur + segment_duration_sec) - ds_nxt
+        if overlap_sec > 0:
+            # Midpoint of the overlap region in absolute time
+            boundary = ds_nxt + overlap_sec / 2.0
         else:
-            end_sample = seg_samples
-        seg_display_end_sample[si] = end_sample
+            boundary = None
+        boundaries_sec.append(boundary)
+
+    # Convert to per-segment (start_sample, end_sample)
+    seg_display = {}  # seg index -> (start_sample, end_sample)
+    for pos, si in enumerate(sorted_idx):
+        ds = domain_starts[si]
+        start_sample = 0
+        end_sample = seg_samples
+
+        # Left boundary: trim start if previous segment overlaps us
+        if pos > 0 and boundaries_sec[pos - 1] is not None:
+            left_sec = boundaries_sec[pos - 1] - ds
+            start_sample = max(0, int(round(left_sec * sampling_rate)))
+
+        # Right boundary: trim end if we overlap the next segment
+        if pos < len(boundaries_sec) and boundaries_sec[pos] is not None:
+            right_sec = boundaries_sec[pos] - ds
+            end_sample = min(seg_samples, int(round(right_sec * sampling_rate)))
+
+        # Safety: ensure at least 1 sample
+        if end_sample <= start_sample:
+            end_sample = min(start_sample + downsample, seg_samples)
+
+        seg_display[si] = (start_sample, end_sample)
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -998,15 +1028,17 @@ def plot_guid_signal_strip(
         ds = domain_starts[seg_i]
 
         # Trim to display boundary then downsample
-        end_samp = seg_display_end_sample[seg_i]
-        fhr_trimmed = fhr[seg_i, :end_samp:downsample]
-        up_trimmed = up[seg_i, :end_samp:downsample]
+        start_samp, end_samp = seg_display[seg_i]
+        fhr_trimmed = fhr[seg_i, start_samp:end_samp:downsample]
+        up_trimmed = up[seg_i, start_samp:end_samp:downsample]
         n_pts = len(fhr_trimmed)
+        if n_pts == 0:
+            continue
 
-        t_start_min = ds / 60.0
-        t = np.linspace(t_start_min,
-                        t_start_min + end_samp / sampling_rate / 60.0,
-                        n_pts, endpoint=False)
+        # Time axis: offset by start_samp into the segment
+        t_start_min = (ds + start_samp / sampling_rate) / 60.0
+        t_end_min = (ds + end_samp / sampling_rate) / 60.0
+        t = np.linspace(t_start_min, t_end_min, n_pts, endpoint=False)
 
         show_legend = status not in legend_shown
         legend_shown.add(status)
