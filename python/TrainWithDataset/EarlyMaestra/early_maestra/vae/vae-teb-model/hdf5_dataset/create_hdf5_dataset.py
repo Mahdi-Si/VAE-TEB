@@ -567,13 +567,14 @@ def create_hdf5_dataset_from_records_list(
                 up_flat_lengths = [end - start + 1 for start, end in up_flat_regions]
                 max_flat_fhr_len = max(fhr_flat_lengths, default=0)
                 max_flat_up_len = max(up_flat_lengths, default=0)
-                total_flat_fhr_len = sum(fhr_flat_lengths)
-                total_flat_up_len = sum(up_flat_lengths)
+                # For FHR cumulative: only count flat regions >= 40 samples (10 sec at 4 Hz)
+                total_flat_fhr_len = sum(l for l in fhr_flat_lengths if l >= 40)
+                # total_flat_up_len = sum(up_flat_lengths)  # UP cumulative removed
 
                 if (max_flat_fhr_len > 480 or
                         max_flat_up_len > 1200 or
-                        total_flat_fhr_len > 1200 or
-                        total_flat_up_len > 2400):
+                        total_flat_fhr_len > 1200):
+                        # total_flat_up_len > 2400  # UP cumulative condition removed
                     logger.info(f'Flat region detected for {record_name} in {domain_starts[i]}')
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_flat_region.append(float(domain_starts[i]))
