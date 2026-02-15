@@ -417,32 +417,94 @@ def create_cv_splits(
 
     return folds
 
+def compute_scattering_masks(signal_length, scattering_T=16, device=None):
+    """Compute all coefficient selection masks once.
+
+    v3 changes vs v2:
+    - Cross-phase: UP cap raised from 0.02 to 0.05 Hz in both bands
+    - UP self-phase: new, using select_fhr_phase_coefficients(min_freq=0.002)
+
+    Returns dict with masks and channel counts.
+    """
+    tmp_model = KymatioPhaseScattering1D(
+        J=11, Q=4, T=scattering_T, shape=signal_length, device=device,
+        tukey_alpha=None, max_order=1)
+
+    # FHR self-phase (unchanged from v2)
+    phase_sel = tmp_model.select_fhr_phase_coefficients(min_freq=0.006)
+    phase_mask = phase_sel['optimal_mask']
+
+    # FHR-UP cross-phase (v3: raised UP cap to 0.05 Hz)
+    cross_sel = tmp_model.select_fhr_up_cross_coefficients_v2(
+        band_a_up_max_hz=0.05,
+        band_b_up_max_hz=0.05)
+    cross_mask = cross_sel['cross_mask']
+
+    # UP self-phase (v3: new — lower min_freq captures contraction frequencies)
+    up_phase_sel = tmp_model.select_fhr_phase_coefficients(min_freq=0.002)
+    up_phase_mask = up_phase_sel['optimal_mask']
+
+    n_phase = int(phase_mask.sum().item())
+    n_cross = int(cross_mask.sum().item())
+    n_up_phase = int(up_phase_mask.sum().item())
+    n_combined_cross = n_cross + n_up_phase
+
+    cross_metadata = cross_sel.get('metadata', {})
+
+    return {
+        'phase_mask': phase_mask,
+        'cross_mask': cross_mask,
+        'up_phase_mask': up_phase_mask,
+        'n_phase': n_phase,
+        'n_cross': n_cross,
+        'n_up_phase': n_up_phase,
+        'n_combined_cross': n_combined_cross,
+        'cross_metadata': cross_metadata,
+    }
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Dataset creation method
 #-----------------------------------------------------------------------------------------------------------------------
 def create_hdf5_dataset_from_records_list(
     hdf5_path=None, records_list=None, file_limit=-1,
-    base_block_size=3840, save_name=None, min_domain_start=None,
-    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=0.5,
-    run_guid_analysis=False):
+    base_block_size=3520, save_name=None, min_domain_start=None,
+    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=1/22,
+    run_guid_analysis=False, precomputed_masks=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Initialize scattering transform with optimal configuration for FHR analysis
-    st_model = KymatioPhaseScattering1D(J=11, Q=4, T=16, shape=5760, device=device, tukey_alpha=None, max_order=1)
-    
-    # Get optimal coefficient selection for FHR analysis (v2: two-band cross-channel)
-    optimal_selection = st_model.get_optimal_coefficients_for_fhr_v2(11, 4, 16)
-    phase_mask = optimal_selection['recommendations']['use_phase_mask']
-    cross_mask = optimal_selection['recommendations']['use_cross_mask']
 
-    logger.info(f"Using two-band cross-channel coefficient selection (v2):")
-    logger.info(f"  - FHR scattering: 45 coefficients (first order)")
-    logger.info(f"  - FHR phase: {phase_mask.sum().item()} coefficients (95.1% reduction)")
-    logger.info(f"  - FHR-UP cross-phase: {cross_mask.sum().item()} coefficients "
-                f"(Band A: {optimal_selection['config_analysis']['band_a_cross_coeffs']}, "
-                f"Band B: {optimal_selection['config_analysis']['band_b_cross_coeffs']})")
-    logger.info(f"  - Total features: {optimal_selection['recommendations']['total_selected_features']}")
+    scattering_T = 16
+    signal_length = int(base_block_size * 1.5)
+    sequence_length = signal_length // scattering_T
+
+    # Initialize scattering transform with optimal configuration for FHR analysis
+    st_model = KymatioPhaseScattering1D(J=11, Q=4, T=scattering_T, shape=signal_length, device=device, tukey_alpha=None, max_order=1)
+
+    # Get coefficient selection masks (v3: raised UP cap + UP self-phase)
+    if precomputed_masks is not None:
+        phase_mask = precomputed_masks['phase_mask']
+        cross_mask = precomputed_masks['cross_mask']
+        up_phase_mask = precomputed_masks['up_phase_mask']
+        n_phase = precomputed_masks['n_phase']
+        n_cross = precomputed_masks['n_cross']
+        n_up_phase = precomputed_masks['n_up_phase']
+        n_combined_cross = precomputed_masks['n_combined_cross']
+    else:
+        masks = compute_scattering_masks(signal_length, scattering_T, device)
+        phase_mask = masks['phase_mask']
+        cross_mask = masks['cross_mask']
+        up_phase_mask = masks['up_phase_mask']
+        n_phase = masks['n_phase']
+        n_cross = masks['n_cross']
+        n_up_phase = masks['n_up_phase']
+        n_combined_cross = masks['n_combined_cross']
+
+    logger.info(f"Using coefficient selection (v3: raised UP cap + UP self-phase):")
+    logger.info(f"  - FHR phase: {n_phase} coefficients")
+    logger.info(f"  - FHR-UP cross-phase: {n_cross} coefficients")
+    logger.info(f"  - UP self-phase: {n_up_phase} coefficients")
+    logger.info(f"  - Combined fhr_up_ph: {n_combined_cross} (cross + UP self-phase)")
     errors_list = []
     guid_tracking = {} if run_guid_analysis else None
     counter_rec = 0
@@ -568,7 +630,7 @@ def create_hdf5_dataset_from_records_list(
                 max_flat_fhr_len = max(fhr_flat_lengths, default=0)
                 max_flat_up_len = max(up_flat_lengths, default=0)
                 # For FHR cumulative: only count flat regions >= 40 samples (10 sec at 4 Hz)
-                total_flat_fhr_len = sum(l for l in fhr_flat_lengths if l >= 40)
+                total_flat_fhr_len = sum(l for l in fhr_flat_lengths if l >= 240)
                 # total_flat_up_len = sum(up_flat_lengths)  # UP cumulative removed
 
                 if (max_flat_fhr_len > 480 or
@@ -608,6 +670,7 @@ def create_hdf5_dataset_from_records_list(
             # Per-segment scattering (one 24-min segment at a time)
             st_phase_list = []
             st_cross_list = []
+            st_up_phase_list = []
             scatter_failed = []
             for seg_j in range(st_input.shape[0]):
                 seg = st_input[seg_j:seg_j+1]
@@ -622,8 +685,15 @@ def create_hdf5_dataset_from_records_list(
                                          compute_cross_phase=True,
                                          scattering_channel=0,
                                          phase_channels=[0, 1])
+                    # v3: UP self-phase (channel 1 = UP)
+                    seg_up_phase = st_model(x=seg,
+                                            compute_phase=True,
+                                            compute_cross_phase=False,
+                                            scattering_channel=0,
+                                            phase_channels=[1])
                     st_phase_list.append(seg_phase)
                     st_cross_list.append(seg_cross)
+                    st_up_phase_list.append(seg_up_phase)
                 except RuntimeError as seg_err:
                     orig_idx = valid_indices[seg_j]
                     logger.error(f"{guid_key} segment {orig_idx} "
@@ -632,6 +702,7 @@ def create_hdf5_dataset_from_records_list(
                     scatter_failed.append(seg_j)
                     st_phase_list.append(None)
                     st_cross_list.append(None)
+                    st_up_phase_list.append(None)
                     if guid_tracking is not None:
                         guid_tracking[guid_key].skipped_scatter_failed.append(
                             float(domain_starts[orig_idx]))
@@ -647,7 +718,14 @@ def create_hdf5_dataset_from_records_list(
                 fhr_up_cc_phase_full = st_cross_list[seg_j]['cross_phase_corr'][0]
 
                 fhr_ph = fhr_st_phase_full[phase_mask, :]
-                fhr_up_ph = fhr_up_cc_phase_full[cross_mask, :]
+                cross_ph = fhr_up_cc_phase_full[cross_mask, :]
+
+                # v3: UP self-phase
+                up_self_phase_full = st_up_phase_list[seg_j]['phase_corr'][0]
+                up_self_ph = up_self_phase_full[up_phase_mask, :]
+
+                # Concatenate cross-phase + UP self-phase into fhr_up_ph
+                fhr_up_ph = torch.cat([cross_ph, up_self_ph], dim=0)
 
                 ds_val = float(domain_starts[orig_idx])
                 if ds_val >= 0:
@@ -700,7 +778,7 @@ def create_hdf5_dataset_from_records_list(
 
     if run_guid_analysis and hdf5_path and guid_tracking is not None:
         from guid_analysis import run_guid_analysis as _run_analysis
-        segment_dur = 5760 / 4  # 1440 sec
+        segment_dur = signal_length / 4
         try:
             _run_analysis(hdf5_path, guid_tracking, segment_duration_sec=segment_dur)
         except Exception as e:
@@ -709,7 +787,19 @@ def create_hdf5_dataset_from_records_list(
     return errors_list
 
 
-def create_records(records_base_path_ = None, output_base_path_ = None, run_guid_analysis=False):
+def create_records(records_base_path_ = None, output_base_path_ = None, run_guid_analysis=False,
+                   base_block_size=3520, overlap_percentage=1/22):
+
+    signal_length = int(base_block_size * 1.5)
+    sequence_length = signal_length // 16
+
+    # Compute scattering masks once for all datasets (v3)
+    masks = compute_scattering_masks(signal_length, scattering_T=16)
+    n_combined_cross = masks['n_combined_cross']
+    total_channels = masks['n_phase'] + n_combined_cross
+    logger.info(f"v3 channel layout: {masks['n_phase']} phase + "
+                f"{masks['n_cross']} cross + {masks['n_up_phase']} UP self-phase = "
+                f"{total_channels} total")
 
     list_of_folders_dict = {
         1: "ACIDOSIS_NO_HIE_CS",
@@ -817,50 +907,54 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
     pre_train_path = os.path.join(output_base_path_, "pre_training_dataset")
     os.makedirs(pre_train_path, exist_ok=True)
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
-    # Calculate optimal number of channels based on coefficient selection
-    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-    create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
+    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
     create_hdf5_dataset_from_records_list(
         records_list=healthy_bg_cs_files_vae_train,
         hdf5_path=pre_training_dataset,
+        base_block_size=base_block_size,
+        overlap_percentage=overlap_percentage,
         cs_label=True,
         bg_label=True,
         pre_defined_target=1,
-        run_guid_analysis=run_guid_analysis)
+        run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
-    # Calculate optimal number of channels based on coefficient selection
-    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-    create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
+    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_train,
                                           hdf5_path=pre_training_dataset,
+                                          base_block_size=base_block_size,
+                                          overlap_percentage=overlap_percentage,
                                           cs_label=False,
                                           bg_label=True,
                                           pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis)
+                                          run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
-    # Calculate optimal number of channels based on coefficient selection
-    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-    create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
+    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_test,
                                           hdf5_path=pre_training_dataset,
+                                          base_block_size=base_block_size,
+                                          overlap_percentage=overlap_percentage,
                                           cs_label=True,
                                           bg_label=True,
                                           pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis)
+                                          run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
-    # Calculate optimal number of channels based on coefficient selection
-    total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-    create_initial_hdf5(path=pre_training_dataset, len_signal=5760, n_channels=total_channels, len_sequence=360)
+    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
     create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_test,
                                           hdf5_path=pre_training_dataset,
+                                          base_block_size=base_block_size,
+                                          overlap_percentage=overlap_percentage,
                                           cs_label=False,
                                           bg_label=True,
                                           pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis)
+                                          run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
     # ---------------------------
     # Classifications
     # ---------------------------
@@ -880,106 +974,114 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
             selected_sub_group = "healthy_no_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=False,
                                                   bg_label=False,
                                                   pre_defined_target=1,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "healthy_no_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=True,
                                                   bg_label=False,
                                                   pre_defined_target=1,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "healthy_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=True,
                                                   bg_label=True,
                                                   pre_defined_target=1,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "healthy_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=False,
                                                   bg_label=True,
                                                   pre_defined_target=1,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "acidosis_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=True,
                                                   bg_label=True,
                                                   pre_defined_target=2,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "acidosis_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=False,
                                                   bg_label=True,
                                                   pre_defined_target=2,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "hie_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=True,
                                                   bg_label=True,
                                                   pre_defined_target=3,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
 
             selected_sub_group = "hie_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            # Use optimal number of channels for all dataset creation
-            total_channels = 106  # 44 phase + 62 cross-phase coefficients from v2 two-band selection
-            create_initial_hdf5(path=sub_group_path, len_signal=5760, n_channels=total_channels, len_sequence=360)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
+                                                  base_block_size=base_block_size,
+                                                  overlap_percentage=overlap_percentage,
                                                   cs_label=False,
                                                   bg_label=True,
                                                   pre_defined_target=3,
-                                                  run_guid_analysis=run_guid_analysis)
+                                                  run_guid_analysis=run_guid_analysis,
+        precomputed_masks=masks)
         run_guid_analysis = False
 
 
