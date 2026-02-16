@@ -73,7 +73,7 @@ class PlSeqVaeClassifier(LightningModelBase):
         # Extract features from batch
         y_st = batch.fhr_st      # (B, T, 43)
         y_ph = batch.fhr_ph      # (B, T, 44)
-        x_ph = batch.fhr_up_ph   # (B, T, 130)
+        x_ph = batch.fhr_up_ph   # (B, T, 137)
 
         # Get target sequence (B, len_sequence) with values 1, 2, or 3
         target_seq = batch.target  # (B, len_sequence)
