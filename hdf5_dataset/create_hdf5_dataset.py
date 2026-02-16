@@ -483,9 +483,9 @@ def create_hdf5_dataset_from_records_list(
 
     # Get coefficient selection masks (v3: raised UP cap + UP self-phase)
     if precomputed_masks is not None:
-        phase_mask = precomputed_masks['phase_mask']
-        cross_mask = precomputed_masks['cross_mask']
-        up_phase_mask = precomputed_masks['up_phase_mask']
+        phase_mask = precomputed_masks['phase_mask'].to(device)
+        cross_mask = precomputed_masks['cross_mask'].to(device)
+        up_phase_mask = precomputed_masks['up_phase_mask'].to(device)
         n_phase = precomputed_masks['n_phase']
         n_cross = precomputed_masks['n_cross']
         n_up_phase = precomputed_masks['n_up_phase']
