@@ -44,22 +44,17 @@ domain_start_min : float
     Same as ``domain_start_sec`` but converted to minutes (``domain_start_sec / 60``).
 
 segment_fhr_quality : float, range [0, 1]
-    Mean of the full-resolution (5760-sample) FHR validity weight for this segment.
-    Computed as ``mean(fhr != 0)`` over all 5760 samples. A value of 1.0 means the
-    FHR signal is present everywhere; lower values indicate gaps or signal loss.
-    This is NOT the decimated 360-point weight — it uses every sample.
-
-segment_mean_weight_decimated : float, range [0, 1]
-    Mean of the decimated (360-point) sample_weight vector produced by the MIMO
-    pipeline's ``calc_sample_weights()``. Each of the 360 points corresponds to a
-    16-sample block of the input. Included for direct comparison with the weight
-    threshold used in the HDF5 dataset creation pipeline.
+    Mean of the full-resolution sample weight for this segment. With
+    ``out_dec_factor=1``, MIMO's ``calc_sample_weights()`` produces a per-sample
+    (4 Hz) weight: 1.0 where FHR is valid (non-zero), 0.0 where FHR is absent
+    (gap/padding). This is the complete per-sample validity mask — every sample
+    is checked, not a decimated subsample.
 
 segment_passes_weight_filter : bool
-    True if ``segment_mean_weight_decimated >= weight_threshold`` (default 0.90).
+    True if ``segment_fhr_quality >= weight_threshold`` (default 0.90).
     This mirrors the quality gate in ``create_hdf5_dataset.py`` that rejects
     segments with more than ~10% signal gaps. Segments that fail are still included
-    in the CSV but flagged here.
+    in the CSV (all segments are processed regardless of quality) but flagged here.
 
 segment_n_flat_regions : int
     Total number of UP flat regions detected in this segment. Zero if no flat
@@ -81,7 +76,7 @@ flat_region_idx : int
 
 flat_start_sample : int or NaN
     Start sample index (0-based, inclusive) of the flat region within the segment's
-    5760-sample window. **NaN for segment_summary rows** because there is no
+    sample window. **NaN for segment_summary rows** because there is no
     specific flat region to reference.
 
 flat_end_sample : int or NaN
@@ -163,9 +158,8 @@ CSV_COLUMN_DESCRIPTIONS = {
     "segment_idx": "Zero-based segment index within the recording (after deduplication).",
     "domain_start_sec": "Segment start time in seconds relative to delivery (negative = before, 0 = delivery).",
     "domain_start_min": "Segment start time in minutes relative to delivery (domain_start_sec / 60).",
-    "segment_fhr_quality": "Mean full-resolution FHR validity weight [0-1]. Computed as mean(fhr != 0) over all 5760 samples.",
-    "segment_mean_weight_decimated": "Mean decimated (360-point) sample_weight from MIMO calc_sample_weights(). Each point covers 16 input samples.",
-    "segment_passes_weight_filter": "True if segment_mean_weight_decimated >= weight_threshold (default 0.90).",
+    "segment_fhr_quality": "Mean full-resolution (4 Hz) sample weight [0-1]. 1.0 = FHR present everywhere, 0.0 = all gap/padding. From MIMO calc_sample_weights() with out_dec_factor=1.",
+    "segment_passes_weight_filter": "True if segment_fhr_quality >= weight_threshold (default 0.90). Informational flag — segments are never excluded.",
     "segment_n_flat_regions": "Number of UP flat regions detected in this segment.",
     "segment_total_flat_duration_samples": "Sum of all flat region durations (samples) in this segment.",
     "segment_total_flat_duration_sec": "Sum of all flat region durations (seconds) in this segment.",
@@ -301,10 +295,9 @@ def discover_records_from_base_path(records_base_path, folder_filter=None):
     return records
 
 
-
 def _process_single_record(
     record_info,
-    base_block_size=3840,
+    base_block_size=3200,
     overlap_percentage=0.0,
     up_shift_secs=0.0,
     min_domain_start=-np.inf,
@@ -319,41 +312,44 @@ def _process_single_record(
     """Process a single .mat recording and extract all UP flat region information.
 
     Loads the recording via EarlyMaestraMimoAdaptor, segments it using the MIMO
-    ``prepare_data`` pipeline (split_long, equalization, overlap, deduplication),
-    then detects UP flat regions in each segment. For every segment a summary row
-    is emitted, and for every detected flat region an additional detail row is
-    emitted with timing, duration, and FHR quality context.
+    ``prepare_data`` pipeline (split_long, equalization, deduplication), then
+    detects UP flat regions in each segment. For every segment a summary row is
+    emitted, and for every detected flat region an additional detail row is emitted
+    with timing, duration, and FHR quality context.
 
-    The processing mirrors ``create_hdf5_dataset_from_records_list`` but skips the
-    scattering transform, allowing full-resolution (5760-sample) FHR weight
-    vectors instead of the decimated 360-point version.
+    All segments are processed regardless of signal quality — the quality flag
+    ``segment_passes_weight_filter`` is informational only.
+
+    Uses ``out_dec_factor=1`` so MIMO produces full-resolution (4 Hz) sample
+    weights — one weight per input sample, not a decimated subsample.
 
     Args:
         record_info: Dict with keys from ``discover_records_from_base_path``:
             ``record_path``, ``folder_name``, ``subgroup``, ``clinical_class``,
             ``cs_label``, ``bg_label``, ``pre_defined_target``.
         base_block_size: Base segment length in samples before the 1.5x multiplier.
-            Final segment length = floor(base_block_size * 1.5). With the default
-            3840, segments are 5760 samples = 1440 sec = 24 min at 4 Hz.
-        overlap_percentage: Fraction of overlap between consecutive segments
-            (0.0 = no overlap, 0.5 = 50% overlap with step size = half a segment).
-        up_shift_secs: Time shift applied to the UP signal in seconds. Negative
-            values advance UP relative to FHR (e.g. -20 compensates for the
-            physiological delay between uterine contraction and FHR response).
+            Final segment length = floor(base_block_size * 1.5). Default 3200
+            gives 4800 samples = 1200 sec = 20 min at 4 Hz.
+        overlap_percentage: Fraction of overlap between consecutive segments.
+            Default 0.0 (no overlap) for independent non-overlapping epochs.
+        up_shift_secs: Time shift applied to the UP signal in seconds. Default
+            0.0 (no shift) since this is a raw signal analysis tool — the UP time
+            shift is a modelling concern, not relevant for flat region detection.
         min_domain_start: Earliest segment domain_start (seconds relative to
-            delivery) to include. Segments starting before this are discarded.
+            delivery) to include. Default ``-np.inf`` keeps the complete signal
+            from the beginning of the recording.
         max_domain_start: Latest segment domain_start (seconds relative to
-            delivery) to include. Use ``np.inf`` to keep all segments including
-            post-delivery ones.
+            delivery) to include. Default ``np.inf`` keeps the complete signal
+            including any post-delivery segments.
         flat_tolerance: Maximum absolute difference between consecutive UP samples
             for the pair to be considered "flat". Tighter values (e.g. 1e-9) detect
             only truly constant regions; looser values (e.g. 1e-3) detect
             near-constant regions.
         flat_min_length: Minimum number of consecutive flat samples required for a
             region to be reported. At 4 Hz, 20 samples = 5 sec, 960 samples = 4 min.
-        weight_threshold: Minimum mean decimated sample_weight (0-1) for a segment
-            to pass the quality filter. This is recorded in
-            ``segment_passes_weight_filter`` but does not remove segments from output.
+        weight_threshold: Minimum mean sample_weight (0-1) for a segment to be
+            flagged as passing the quality filter. This is recorded in
+            ``segment_passes_weight_filter`` but does NOT remove segments from output.
         fhr_valid_threshold: Minimum percentage (0-100) of FHR-valid samples within
             a flat region for it to NOT be flagged by the FHR filter. Flat regions
             with ``flat_fhr_valid_pct < fhr_valid_threshold`` are marked as
@@ -365,10 +361,11 @@ def _process_single_record(
             counts and seconds/minutes. Default 4.0 Hz.
 
     Returns:
-        A list of row dicts. Each dict has the same set of keys (the CSV columns).
-        Rows with ``row_type='segment_summary'`` are emitted once per segment.
-        Rows with ``row_type='flat_region'`` are emitted once per detected flat
-        region. Segment-summary rows have NaN for flat-region-specific fields.
+        A tuple ``(rows, signal_data)`` where:
+        - ``rows``: list of row dicts for the CSV.
+        - ``signal_data``: dict with ``'fhr'``, ``'up'``, ``'domain_starts'``,
+          ``'sample_weight'``, ``'flat_regions_per_seg'``, ``'guid'``,
+          ``'subgroup'``, ``'clinical_class'`` for plotting. None if no segments.
     """
     record_path = record_info["record_path"]
     guid = os.path.splitext(os.path.basename(record_path))[0]
@@ -390,7 +387,7 @@ def _process_single_record(
         default_target_index=default_ti,
     )
     mimo_adaptor.read_single_input(
-        record_path, out_dec_factor=16, out_dec_factor_offset=0,
+        record_path, out_dec_factor=1, out_dec_factor_offset=0,
         target_is_onehot=True, dtype=np.float32,
     )
     mimo_prepared, _ = mimo_adaptor.mimo.prepare_data(
@@ -403,14 +400,17 @@ def _process_single_record(
         overlap_percentage=overlap_percentage,
     )
 
-    up = mimo_prepared.block_input[:, :, 0].copy()   # (N, 5760)
-    fhr = mimo_prepared.block_input[:, :, 1].copy()   # (N, 5760)
+    up = mimo_prepared.block_input[:, :, 0].copy()    # (N, seg_len)
+    fhr = mimo_prepared.block_input[:, :, 1].copy()   # (N, seg_len)
     domain_starts = mimo_prepared.domain_start
-    sample_weights = mimo_prepared.sample_weights      # (N, 360) decimated
+    # Full-resolution sample weight from MIMO with out_dec_factor=1.
+    # Shape (N, seg_len) — one weight per input sample at 4 Hz.
+    # 1.0 where FHR target is valid, 0.0 where target is PAD (FHR absent).
+    sample_weight = mimo_prepared.sample_weights       # (N, seg_len)
 
     if up.shape[0] == 0:
         logger.info(f"{guid}: no segments after prepare_data, skipping")
-        return []
+        return [], None
 
     n_bad_fhr = int((~np.isfinite(fhr)).sum())
     n_bad_up = int((~np.isfinite(up)).sum())
@@ -425,31 +425,29 @@ def _process_single_record(
     fhr[(fhr != 0) & (np.abs(fhr) < tiny)] = 0.0
     up[(up != 0) & (np.abs(up) < tiny)] = 0.0
 
-    fhr_weight_full = (fhr != 0).astype(np.float32)   # (N, 5760)
-
-    keep_idx, removed_idx, _ = deduplicate_segments(domain_starts, sample_weights)
+    keep_idx, removed_idx, _ = deduplicate_segments(domain_starts, sample_weight)
     if removed_idx:
         logger.info(f"{guid}: deduplicating {len(removed_idx)} segments")
         fhr = fhr[keep_idx]
         up = up[keep_idx]
-        fhr_weight_full = fhr_weight_full[keep_idx]
-        sample_weights = sample_weights[keep_idx]
+        sample_weight = sample_weight[keep_idx]
         domain_starts = [domain_starts[i] for i in keep_idx]
 
     rows = []
     n_segments = up.shape[0]
+    flat_regions_per_seg = []
 
     for seg_i in range(n_segments):
         ds_sec = float(domain_starts[seg_i])
         ds_min = ds_sec / 60.0
 
-        seg_fhr_quality = float(np.mean(fhr_weight_full[seg_i, :]))
-        seg_mean_weight_dec = float(np.mean(sample_weights[seg_i, :]))
-        seg_passes_weight = seg_mean_weight_dec >= weight_threshold
+        seg_fhr_quality = float(np.mean(sample_weight[seg_i, :]))
+        seg_passes_weight = seg_fhr_quality >= weight_threshold
 
         up_flat = find_flat_regions(
             up[seg_i, :], tolerance=flat_tolerance, min_length=flat_min_length,
         )
+        flat_regions_per_seg.append(up_flat)
 
         n_flat = len(up_flat)
         total_flat_samples = sum(end - start + 1 for start, end in up_flat)
@@ -465,7 +463,6 @@ def _process_single_record(
             "domain_start_sec": ds_sec,
             "domain_start_min": ds_min,
             "segment_fhr_quality": seg_fhr_quality,
-            "segment_mean_weight_decimated": seg_mean_weight_dec,
             "segment_passes_weight_filter": seg_passes_weight,
             "segment_n_flat_regions": n_flat,
             "segment_total_flat_duration_samples": total_flat_samples,
@@ -496,13 +493,14 @@ def _process_single_record(
             fr_abs_start = ds_sec + fr_start / sampling_rate
             fr_abs_end = ds_sec + fr_end / sampling_rate
 
-            fhr_slice = fhr[seg_i, fr_start:fr_end + 1]
-            fhr_valid_mask = fhr_slice != 0
-            n_valid = int(fhr_valid_mask.sum())
+            weight_slice = sample_weight[seg_i, fr_start:fr_end + 1]
+            n_valid = int((weight_slice > 0).sum())
             fhr_valid_pct = 100.0 * n_valid / fr_len
 
+            fhr_slice = fhr[seg_i, fr_start:fr_end + 1]
+            valid_mask = weight_slice > 0
             if n_valid > 0:
-                flat_mean_fhr = float(np.mean(fhr_slice[fhr_valid_mask]))
+                flat_mean_fhr = float(np.mean(fhr_slice[valid_mask]))
             else:
                 flat_mean_fhr = np.nan
 
@@ -530,17 +528,219 @@ def _process_single_record(
             }
             rows.append(row)
 
-    return rows
+    signal_data = {
+        "fhr": fhr,
+        "up": up,
+        "domain_starts": domain_starts,
+        "flat_regions_per_seg": flat_regions_per_seg,
+        "guid": guid,
+        "subgroup": subgroup,
+        "clinical_class": clinical_class,
+    }
+    return rows, signal_data
+
+
+# ---------------------------------------------------------------------------
+# Plotly signal strip plot per GUID
+# ---------------------------------------------------------------------------
+
+def plot_guid_signals(
+    signal_data,
+    output_dir,
+    sampling_rate=4.0,
+):
+    """Generate an interactive plotly signal strip plot for a single GUID.
+
+    Creates an HTML file with FHR (top) and UP (bottom) on a shared time axis
+    (minutes relative to delivery). Flat UP regions are highlighted with
+    semi-transparent red rectangles. The sample weight (FHR validity) is shown
+    as a light grey band on the FHR subplot where FHR is invalid.
+
+    Args:
+        signal_data: Dict returned by ``_process_single_record`` containing
+            ``'fhr'``, ``'up'``, ``'domain_starts'``, ``'sample_weight'``,
+            ``'flat_regions_per_seg'``, ``'guid'``, ``'subgroup'``,
+            ``'clinical_class'``.
+        output_dir: Directory where the HTML file will be saved.
+        sampling_rate: Sampling rate in Hz (default 4.0).
+
+    Returns:
+        Path to the saved HTML file, or None on failure.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        logger.warning("plotly not installed — skipping signal plot for %s",
+                       signal_data["guid"])
+        return None
+
+    guid = signal_data["guid"]
+    fhr = signal_data["fhr"]
+    up = signal_data["up"]
+    domain_starts = signal_data["domain_starts"]
+    flat_regions_per_seg = signal_data["flat_regions_per_seg"]
+    subgroup = signal_data["subgroup"]
+    clinical_class = signal_data["clinical_class"]
+
+    n_segments = fhr.shape[0]
+    if n_segments == 0:
+        return None
+
+    seg_samples = fhr.shape[1]
+    segment_duration_sec = seg_samples / sampling_rate
+    downsample = 4  # reduce point count for rendering
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.6, 0.4],
+    )
+
+    # Sort segments by domain_start for consistent plotting
+    sorted_idx = sorted(range(n_segments), key=lambda i: domain_starts[i])
+
+    flat_legend_shown = False
+
+    for seg_i in sorted_idx:
+        ds = domain_starts[seg_i]
+        t = np.linspace(
+            ds / 60.0,
+            (ds + segment_duration_sec) / 60.0,
+            seg_samples // downsample,
+            endpoint=False,
+        )
+
+        fhr_ds = fhr[seg_i, ::downsample]
+        up_ds = up[seg_i, ::downsample]
+
+        hover = f"Seg {seg_i}, epoch {ds:.0f}s ({ds/60:.1f} min)"
+
+        # FHR trace
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=fhr_ds,
+                mode="lines",
+                line=dict(color="rgb(30,30,30)", width=1),
+                name="FHR",
+                legendgroup="fhr",
+                showlegend=(seg_i == sorted_idx[0]),
+                hovertemplate=hover + "<br>FHR: %{y:.0f} bpm<extra></extra>",
+            ),
+            row=1, col=1,
+        )
+
+        # UP trace
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=up_ds,
+                mode="lines",
+                line=dict(color="rgb(50,50,150)", width=1),
+                name="UP",
+                legendgroup="up",
+                showlegend=(seg_i == sorted_idx[0]),
+                hovertemplate=hover + "<br>UP: %{y:.1f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )
+
+        # Highlight flat regions on the UP subplot
+        for fr_start, fr_end in flat_regions_per_seg[seg_i]:
+            x0_min = (ds + fr_start / sampling_rate) / 60.0
+            x1_min = (ds + (fr_end + 1) / sampling_rate) / 60.0
+            fig.add_vrect(
+                x0=x0_min, x1=x1_min,
+                fillcolor="rgba(255,60,60,0.25)",
+                line_width=0,
+                row=2, col=1,  # pyright: ignore[reportArgumentType]
+            )
+            # Also shade on FHR panel for context
+            fig.add_vrect(
+                x0=x0_min, x1=x1_min,
+                fillcolor="rgba(255,60,60,0.10)",
+                line_width=0,
+                row=1, col=1,  # pyright: ignore[reportArgumentType]
+            )
+            if not flat_legend_shown:
+                # Invisible trace just for legend entry
+                fig.add_trace(
+                    go.Scatter(
+                        x=[None], y=[None],
+                        mode="markers",
+                        marker=dict(size=10, color="rgba(255,60,60,0.25)",
+                                    symbol="square"),
+                        name="UP flat region",
+                        legendgroup="flat",
+                        showlegend=True,
+                    ),
+                    row=2, col=1,
+                )
+                flat_legend_shown = True
+
+    # Delivery marker
+    for r in (1, 2):
+        fig.add_vline(
+            x=0, line_dash="dash", line_color="red", line_width=1.5,
+            annotation_text="Delivery" if r == 1 else None,
+            annotation_position="top right" if r == 1 else None,
+            row=r, col=1,  # pyright: ignore[reportArgumentType]
+        )
+
+    n_total_flat = sum(len(fr) for fr in flat_regions_per_seg)
+    fig.update_layout(
+        title=dict(
+            text=(f"{guid} — {clinical_class} ({subgroup}) — "
+                  f"{n_segments} segments, {n_total_flat} flat regions"),
+            font_size=13,
+            x=0.5, xanchor="center", y=0.98, yanchor="top",
+        ),
+        width=3600,
+        height=350,
+        margin=dict(l=60, r=30, t=80, b=40),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=1.15,
+            xanchor="right", x=1.0,
+            font_size=10,
+        ),
+        hovermode="x unified",
+    )
+
+    fig.update_yaxes(
+        range=[50, 210], title_text="FHR (bpm)",
+        gridcolor="lightgray", gridwidth=0.5,
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        range=[0, 100], title_text="UP",
+        gridcolor="lightgray", gridwidth=0.5,
+        row=2, col=1,
+    )
+    fig.update_xaxes(
+        title_text="Time (min, relative to delivery)",
+        gridcolor="lightgray", gridwidth=0.5,
+        row=2, col=1,
+    )
+    fig.update_xaxes(gridcolor="lightgray", gridwidth=0.5, row=1, col=1)
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{guid}_up_flat.html")
+    fig.write_html(out_path, include_plotlyjs=True)
+    logger.info(f"Signal plot saved: {out_path}")
+    return out_path
 
 
 def analyze_up_flat_regions(
     records=None,
     records_base_path=None,
     output_csv_path="up_flat_analysis.csv",
-    base_block_size=3840,
-    overlap_percentage=0.5,
-    up_shift_secs=-20.0,
-    min_domain_start=-44640.0,
+    base_block_size=3200,
+    overlap_percentage=0.0,
+    up_shift_secs=0.0,
+    min_domain_start=-np.inf,
     max_domain_start=np.inf,
     flat_tolerance=1e-9,
     flat_min_length=20,
@@ -551,12 +751,15 @@ def analyze_up_flat_regions(
     folder_filter=None,
     file_limit=-1,
     include_column_descriptions=True,
+    plot_signals=True,
+    plot_output_dir=None,
 ):
     """Analyze UP flat regions across all EFM recordings and save results to CSV.
 
     Orchestrates the full analysis pipeline: discovers .mat files, processes each
     recording to detect UP flat regions (with FHR quality context), collects all
-    results into a single DataFrame, and saves to CSV.
+    results into a single DataFrame, saves to CSV, and optionally generates
+    per-GUID plotly signal strip plots.
 
     Either ``records`` (a pre-built list) or ``records_base_path`` (to auto-discover
     files) must be provided. If both are given, ``records`` takes precedence.
@@ -569,24 +772,27 @@ def analyze_up_flat_regions(
             auto-discover .mat files when ``records`` is None.
         output_csv_path: Path where the output CSV will be written.
         base_block_size: Base segment length in samples before the 1.5x multiplier.
-            Final segment length = floor(base_block_size * 1.5). With the default
-            3840, segments are 5760 samples = 1440 sec = 24 min at 4 Hz.
-        overlap_percentage: Fraction of overlap between consecutive segments
-            (0.0 = no overlap, 0.5 = 50% overlap).
-        up_shift_secs: Time shift applied to the UP signal in seconds. Negative
-            values advance UP relative to FHR (e.g. -20 compensates for the
-            physiological delay between contraction and FHR response).
+            Final segment length = floor(base_block_size * 1.5). Default 3200
+            gives 4800 samples = 1200 sec = 20 min at 4 Hz.
+        overlap_percentage: Fraction of overlap between consecutive segments.
+            Default 0.0 (no overlap).
+        up_shift_secs: Time shift applied to the UP signal in seconds. Default
+            0.0 (no shift) — UP shift is a modelling concern, not needed for
+            flat region analysis on raw signals.
         min_domain_start: Earliest segment domain_start (seconds relative to
-            delivery) to include. Default -44640 sec (~12.4 hours before delivery).
+            delivery) to include. Default ``-np.inf`` keeps the complete signal
+            from the beginning of the recording.
         max_domain_start: Latest segment domain_start (seconds relative to
-            delivery) to include. Use ``np.inf`` to keep all including post-delivery.
+            delivery) to include. Default ``np.inf`` keeps the complete signal
+            including post-delivery segments.
         flat_tolerance: Maximum absolute difference between consecutive UP samples
             for the pair to be considered "flat". Default 1e-9 detects only truly
             constant regions.
         flat_min_length: Minimum number of consecutive flat samples to qualify as a
             flat region. At 4 Hz: 20 samples = 5 sec, 960 = 4 min, 1200 = 5 min.
-        weight_threshold: Minimum mean decimated sample_weight (0-1) for a segment
-            to be flagged as passing the quality filter in the output.
+        weight_threshold: Minimum mean sample_weight (0-1) for a segment to be
+            flagged as passing the quality filter. Informational only — segments
+            are never excluded based on quality.
         fhr_valid_threshold: Minimum percentage (0-100) of FHR-valid samples within
             a flat region to NOT be flagged by the FHR filter.
         exclude_invalid_fhr_flat_regions: If True, flat regions where FHR validity
@@ -601,6 +807,11 @@ def analyze_up_flat_regions(
             top of the CSV describing each column before the header row and data.
             Each description line is prefixed with ``# ``. If False, the CSV
             contains only the standard header row followed by data rows.
+        plot_signals: If True (default), generate a per-GUID interactive plotly
+            HTML plot showing FHR and UP signals with flat regions highlighted.
+        plot_output_dir: Directory for plotly HTML files. Defaults to a ``plots/``
+            subdirectory next to the output CSV. Only used when ``plot_signals``
+            is True.
 
     Returns:
         A pandas DataFrame with one row per flat region plus one segment-summary
@@ -608,7 +819,7 @@ def analyze_up_flat_regions(
 
         - ``guid``, ``subgroup``, ``clinical_class``, ``cs_label``, ``bg_label``
         - ``segment_idx``, ``domain_start_sec``, ``domain_start_min``
-        - ``segment_fhr_quality``, ``segment_mean_weight_decimated``
+        - ``segment_fhr_quality``, ``segment_passes_weight_filter``
         - ``row_type`` (``'segment_summary'`` or ``'flat_region'``)
         - ``flat_region_idx``, ``flat_start_sample``, ``flat_end_sample``
         - ``flat_duration_samples``, ``flat_duration_sec``
@@ -638,12 +849,16 @@ def analyze_up_flat_regions(
         records = limited
         logger.info(f"After file_limit={file_limit}: {len(records)} records")
 
+    if plot_signals and plot_output_dir is None:
+        csv_dir = os.path.dirname(os.path.abspath(output_csv_path))
+        plot_output_dir = os.path.join(csv_dir, "plots")
+
     all_rows = []
     errors = []
 
     for rec in tqdm(records, desc="Analyzing UP flat regions"):
         try:
-            rows = _process_single_record(
+            rows, signal_data = _process_single_record(
                 rec,
                 base_block_size=base_block_size,
                 overlap_percentage=overlap_percentage,
@@ -658,6 +873,11 @@ def analyze_up_flat_regions(
                 sampling_rate=sampling_rate,
             )
             all_rows.extend(rows)
+
+            if plot_signals and signal_data is not None:
+                plot_guid_signals(signal_data, plot_output_dir,
+                                  sampling_rate=sampling_rate)
+
         except Exception:
             guid = os.path.splitext(os.path.basename(rec["record_path"]))[0]
             logger.error(f"Failed processing {guid}:\n{traceback.format_exc()}")
@@ -706,13 +926,19 @@ def main():
                         help="Base path containing outcome subfolders")
     parser.add_argument("--output_csv", type=str, default="up_flat_analysis.csv",
                         help="Output CSV path (default: up_flat_analysis.csv)")
-    parser.add_argument("--base_block_size", type=int, default=3840)
-    parser.add_argument("--overlap_percentage", type=float, default=0.0)
-    parser.add_argument("--up_shift_secs", type=float, default=0.0)
-    parser.add_argument("--min_domain_start", type=float, default=-44640.0)
-    parser.add_argument("--max_domain_start", type=float, default=float("inf"))
+    parser.add_argument("--base_block_size", type=int, default=3200,
+                        help="Base segment size (default 3200 -> 4800 samples = 20 min)")
+    parser.add_argument("--overlap_percentage", type=float, default=0.0,
+                        help="Segment overlap fraction (default 0.0 = no overlap)")
+    parser.add_argument("--up_shift_secs", type=float, default=0.0,
+                        help="UP time shift in seconds (default 0.0 = no shift)")
+    parser.add_argument("--min_domain_start", type=float, default=float("-inf"),
+                        help="Earliest domain_start in sec (default -inf = complete signal)")
+    parser.add_argument("--max_domain_start", type=float, default=float("inf"),
+                        help="Latest domain_start in sec (default inf = complete signal)")
     parser.add_argument("--flat_tolerance", type=float, default=1e-9)
-    parser.add_argument("--flat_min_length", type=int, default=960)
+    parser.add_argument("--flat_min_length", type=int, default=960,
+                        help="Min consecutive flat samples (default 960 = 4 min)")
     parser.add_argument("--weight_threshold", type=float, default=0.90)
     parser.add_argument("--fhr_valid_threshold", type=float, default=50.0)
     parser.add_argument("--no_exclude_invalid_fhr", action="store_true",
@@ -724,6 +950,10 @@ def main():
                         help="Max files per subgroup (-1 = all)")
     parser.add_argument("--no_column_descriptions", action="store_true",
                         help="Omit column description comments from CSV header")
+    parser.add_argument("--no_plot", action="store_true",
+                        help="Skip generating per-GUID plotly signal plots")
+    parser.add_argument("--plot_output_dir", type=str, default=None,
+                        help="Directory for plotly HTML plots (default: plots/ next to CSV)")
 
     args = parser.parse_args()
 
@@ -749,6 +979,8 @@ def main():
         folder_filter=args.folder_filter,
         file_limit=args.file_limit,
         include_column_descriptions=not args.no_column_descriptions,
+        plot_signals=not args.no_plot,
+        plot_output_dir=args.plot_output_dir,
     )
 
 
