@@ -1,3 +1,135 @@
+"""UP flat region analysis tool for EFM (CTG) recordings.
+
+Processes complete UP (uterine pressure) signals from .mat EFM recordings to
+identify flat regions — periods where the UP signal is constant or near-constant,
+indicating either a genuine absence of contractions or a transducer/signal issue.
+
+The output CSV has two types of rows, distinguished by the ``row_type`` column:
+  - ``segment_summary``: One row per segment. Provides segment-level statistics.
+    All ``flat_*`` columns (except ``flat_excluded_by_fhr_filter``) are NaN because
+    this row describes the segment as a whole, not a specific flat region.
+  - ``flat_region``: One row per detected flat region within a segment. All columns
+    are populated.
+
+Output CSV columns
+------------------
+guid : str
+    Recording identifier — the .mat filename without its extension. Uniquely
+    identifies one CTG recording.
+
+subgroup : str
+    Clinical outcome subgroup key derived from the folder name, e.g.
+    ``'hie_cs'``, ``'acidosis_no_cs'``, ``'healthy_no_bg_no_cs'``.
+
+clinical_class : str
+    High-level clinical class: ``'HEALTHY'``, ``'ACIDOSIS'``, or ``'HIE'``.
+
+cs_label : bool
+    True if the recording involved a caesarean section delivery.
+
+bg_label : bool
+    True if a blood gas measurement was available for this recording.
+
+segment_idx : int
+    Zero-based index of the segment within this recording (after deduplication).
+    Segments are produced by the MIMO ``split_long`` pipeline with configurable
+    ``base_block_size`` and ``overlap_percentage``.
+
+domain_start_sec : float
+    Start time of the segment in **seconds relative to delivery**. Negative values
+    mean before delivery, 0 means delivery time, positive means after delivery.
+    Computed by the MIMO equalization/split pipeline.
+
+domain_start_min : float
+    Same as ``domain_start_sec`` but converted to minutes (``domain_start_sec / 60``).
+
+segment_fhr_quality : float, range [0, 1]
+    Mean of the full-resolution (5760-sample) FHR validity weight for this segment.
+    Computed as ``mean(fhr != 0)`` over all 5760 samples. A value of 1.0 means the
+    FHR signal is present everywhere; lower values indicate gaps or signal loss.
+    This is NOT the decimated 360-point weight — it uses every sample.
+
+segment_mean_weight_decimated : float, range [0, 1]
+    Mean of the decimated (360-point) sample_weight vector produced by the MIMO
+    pipeline's ``calc_sample_weights()``. Each of the 360 points corresponds to a
+    16-sample block of the input. Included for direct comparison with the weight
+    threshold used in the HDF5 dataset creation pipeline.
+
+segment_passes_weight_filter : bool
+    True if ``segment_mean_weight_decimated >= weight_threshold`` (default 0.90).
+    This mirrors the quality gate in ``create_hdf5_dataset.py`` that rejects
+    segments with more than ~10% signal gaps. Segments that fail are still included
+    in the CSV but flagged here.
+
+segment_n_flat_regions : int
+    Total number of UP flat regions detected in this segment. Zero if no flat
+    regions were found.
+
+segment_total_flat_duration_samples : int
+    Sum of all flat region durations (in samples) within this segment.
+
+segment_total_flat_duration_sec : float
+    Sum of all flat region durations (in seconds) within this segment.
+
+row_type : str
+    Either ``'segment_summary'`` or ``'flat_region'``. Determines which other
+    columns are populated vs NaN.
+
+flat_region_idx : int
+    Zero-based index of this flat region within the segment. Set to -1 for
+    ``segment_summary`` rows.
+
+flat_start_sample : int or NaN
+    Start sample index (0-based, inclusive) of the flat region within the segment's
+    5760-sample window. **NaN for segment_summary rows** because there is no
+    specific flat region to reference.
+
+flat_end_sample : int or NaN
+    End sample index (inclusive) of the flat region. **NaN for segment_summary rows.**
+
+flat_duration_samples : int or NaN
+    Length of the flat region in samples (``flat_end_sample - flat_start_sample + 1``).
+    **NaN for segment_summary rows.**
+
+flat_duration_sec : float or NaN
+    Duration of the flat region in seconds (``flat_duration_samples / sampling_rate``).
+    **NaN for segment_summary rows.**
+
+flat_abs_start_sec : float or NaN
+    Absolute start time of the flat region in seconds relative to delivery.
+    Computed as ``domain_start_sec + flat_start_sample / sampling_rate``.
+    **NaN for segment_summary rows.**
+
+flat_abs_end_sec : float or NaN
+    Absolute end time of the flat region in seconds relative to delivery.
+    Computed as ``domain_start_sec + flat_end_sample / sampling_rate``.
+    **NaN for segment_summary rows.**
+
+flat_fhr_valid_pct : float or NaN, range [0, 100]
+    Percentage of samples within the flat region where FHR is valid (non-zero).
+    A value near 0% indicates the flat region overlaps with a signal gap or padding
+    (both UP and FHR are zero) — this is likely not a genuine UP flat region but
+    rather missing data. A value near 100% indicates the FHR monitor was active
+    during the flat UP period, meaning the UP flatness is genuine (no contractions
+    or transducer issue). **NaN for segment_summary rows.**
+
+flat_mean_fhr : float or NaN
+    Mean FHR value during the flat region, computed only over samples where FHR is
+    valid (non-zero). If no FHR samples are valid within the flat region (i.e.
+    ``flat_fhr_valid_pct == 0``), this is NaN because there are no valid values to
+    average. **Also NaN for segment_summary rows.**
+
+flat_mean_up : float or NaN
+    Mean UP value during the flat region (all samples, including zeros).
+    **NaN for segment_summary rows.**
+
+flat_excluded_by_fhr_filter : bool
+    True if this flat region was flagged as likely gap/padding rather than genuine
+    flat UP. The flag is set when ``exclude_invalid_fhr_flat_regions=True`` (default)
+    AND ``flat_fhr_valid_pct < fhr_valid_threshold`` (default 50%). The row is still
+    present in the CSV but downstream consumers can filter on this flag.
+    For ``segment_summary`` rows this is always False.
+"""
 
 import os
 import argparse
