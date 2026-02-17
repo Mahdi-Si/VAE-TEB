@@ -764,6 +764,10 @@ class CombinedHDF5Dataset(Dataset):
                         start_trim = self.trim_samples_decimated
                         end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
                         data = data[:, start_trim:end_trim]
+                    elif name in ['target', 'weight']:
+                        start_trim = self.trim_samples_decimated
+                        end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
+                        data = data[start_trim:end_trim]
 
                 if name in ('guid',):
                     out[name] = data.decode('utf-8') if isinstance(data, bytes) else str(data)
