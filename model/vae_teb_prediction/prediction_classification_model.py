@@ -914,7 +914,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         Args:
             y_st: Target scattering features (B, T, 43)
             y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase features (B, T, 130)
+            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
 
         Returns:
             z: Latent features (B, T, D) where D is latent_dim
@@ -958,7 +958,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         Args:
             y_st: Target scattering features (B, T, 43)
             y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase features (B, T, 130)
+            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
 
         Returns:
             Dictionary containing:
@@ -988,7 +988,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         Args:
             y_st: Target scattering features (B, T, 43)
             y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase features (B, T, 130)
+            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
             labels: Ground truth class labels (B,)
 
         Returns:
