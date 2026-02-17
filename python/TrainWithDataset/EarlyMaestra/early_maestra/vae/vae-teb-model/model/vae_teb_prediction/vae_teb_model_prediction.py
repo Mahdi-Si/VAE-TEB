@@ -47,9 +47,9 @@ except Exception:
 # C  = feature channels
 #   C_st = 43  (FHR scattering channels)
 #   C_ph = 44  (FHR phase channels)
-#   C_x  = 130 (UP+FHR cross-phase channels)
+#   C_x  = 137 (UP+FHR cross-phase + UP self-phase channels)
 # D  = latent/hidden dimensionality (typically 16)
-# R  = raw length at 4 Hz (4800 for 20 min). Relationship: R = L * s, s=16.
+# R  = raw length at 4 Hz (4800 post-trim). Base signal 5280 (22 min), 1 min trim each side. R = L * s, s=16.
 # s  = decimation factor (default 16)
 # -----------------------------------------------------------------------------
 
@@ -610,7 +610,7 @@ class SourceEncoder(nn.Module):
 
     This encoder processes the source signal features (cross-phase UP+FHR) through:
 
-    1. Initial MLP: Project 130-channel input to 32D
+    1. Initial MLP: Project 137-channel input to 16D
     2. Dilated conv stack: Multi-scale local feature extraction (dilations: 1, 2, 4)
     3. PARALLEL temporal branches:
         - Conv branch: Additional dilated convs (dilations: 8, 16) for ~35s receptive field
@@ -626,13 +626,13 @@ class SourceEncoder(nn.Module):
         - LSTM: Global context (UC history, state transitions, long-term coupling)
 
     Shapes:
-    - Input:  x_ph (B, T, 130) - Cross-phase harmonic features (UP + FHR)
+    - Input:  x_ph (B, T, 137) - Cross-phase + UP self-phase harmonic features
     - Output: mu_x (B, T, D)   - Deterministic source encoding
     """
 
     def __init__(
         self,
-        input_channels: int = 130,
+        input_channels: int = 137,
         latent_dim: int = 16,
         lstm_hidden_dim: int = 64,  # Reduced from 128 (parallel design needs less)
         lstm_num_layers: int = 3,   # Reduced from 4 (parallel design needs less)
@@ -648,8 +648,8 @@ class SourceEncoder(nn.Module):
 
         # === STAGE 1: Input MLP ===
         self.mlp = ResidualMLP(
-            input_dim=130,
-            hidden_dims=geometric_schedule(130, 16, 6),
+            input_dim=137,
+            hidden_dims=geometric_schedule(137, 16, 6),
             final_activation=False,
             use_skip_connection=True,
             activation=nn.GELU
@@ -702,7 +702,7 @@ class SourceEncoder(nn.Module):
         """Forward pass through the parallel Conv-LSTM encoder.
 
         Processing stages:
-            1. Initial MLP projects 130-channel input to 32D
+            1. Initial MLP projects 137-channel input to 16D
             2. Dilated conv stack (RF ≈ 10.75s) with dilations [1, 2, 4]
             3. PARALLEL temporal branches:
                 - Conv branch: Extended dilated convs (RF ≈ 35s) with dilations [8, 16]
@@ -711,7 +711,7 @@ class SourceEncoder(nn.Module):
             5. Output head: Generate deterministic mu_x
 
         Args:
-            x (torch.Tensor): Cross-phase harmonic features (UP+FHR), shape $(B, T, 130)$.
+            x (torch.Tensor): Cross-phase + UP self-phase harmonic features, shape $(B, T, 137)$.
             return_intermediate (bool, optional): Whether to return intermediate activations
                 for debugging/analysis. Defaults to False.
 
@@ -773,7 +773,7 @@ class SourceEncoder(nn.Module):
         Useful for incremental inference.
 
         Args:
-            x: Input tensor from optimized dataloader (batch_size, seq_len=300, channels=130) - fhr_up_ph cross-phase features
+            x: Input tensor from optimized dataloader (batch_size, seq_len=330, channels=137) - fhr_up_ph cross-phase + UP self-phase features
             timestep: Timestep up to which to encode (inclusive)
 
         Returns:
@@ -1083,9 +1083,9 @@ class Decoder(nn.Module):
     ):
         """
         Args:
-            latent_dim: Input latent dimension (default 32 for TEB model)
-            sequence_length: Input sequence length (default 300)
-            target_length: Target raw signal length (default 4800 = 20min at 4Hz)
+            latent_dim: Input latent dimension (default 16 for TEB model)
+            sequence_length: Input sequence length (default 300, post 1-min trim from 330)
+            target_length: Target raw signal length (default 4800, post 1-min trim from 5280)
         """
         super().__init__()
          
@@ -1203,7 +1203,7 @@ class SeqVae(nn.Module):
         self,
         y_st: torch.Tensor,  # (B, T, 43)
         y_ph: torch.Tensor,  # (B, T, 44)
-        x_ph: torch.Tensor,  # (B, T, 130)
+        x_ph: torch.Tensor,  # (B, T, 137)
     ) -> Dict[str, torch.Tensor]:
         """Forward pass through the complete VAE (encode + decode).
 
@@ -1216,12 +1216,11 @@ class SeqVae(nn.Module):
             6. Decode: $p(y|z)$ with Gaussian likelihood
 
         Args:
-            prediction_mode:
             y_st (torch.Tensor): Target scattering features, shape $(B, T, 43)$ where
                 $B$ is batch size, $T$ is sequence_length (300), and 43 is the number
                 of scattering transform channels.
             y_ph (torch.Tensor): Target phase harmonic features, shape $(B, T, 44)$.
-            x_ph (torch.Tensor): Source cross-phase harmonic features, shape $(B, T, 130)$.
+            x_ph (torch.Tensor): Source cross-phase + UP self-phase features, shape $(B, T, 137)$.
 
         Returns:
             Dict[str, torch.Tensor]: Dictionary containing:
@@ -1576,7 +1575,7 @@ if __name__ == "__main__":
 
     y_st_input = torch.randn(batch_size, seq_len, 43)  # UPDATED: (B, L, C) format from optimized dataloader
     y_ph_input = torch.randn(batch_size, seq_len, 44)
-    x_ph_input = torch.randn(batch_size, seq_len, 130)
+    x_ph_input = torch.randn(batch_size, seq_len, 137)
     y_raw_input = torch.randn(
         batch_size, seq_len * 16
     )

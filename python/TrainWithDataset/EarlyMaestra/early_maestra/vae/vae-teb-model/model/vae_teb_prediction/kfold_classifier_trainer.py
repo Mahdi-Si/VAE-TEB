@@ -16,7 +16,6 @@ import torch
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
-from lightning.pytorch.loggers import MLFlowLogger
 from loguru import logger
 import json
 from datetime import datetime
@@ -64,16 +63,19 @@ def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
     return datasets
 
 
-def create_mlflow_logger_from_config(
+def create_parent_mlflow_run(
     config_data: Optional[Dict],
-    run_name: str,
+    experiment_tag: str,
     extra_tags: Optional[Dict[str, str]] = None,
-) -> Optional[MLFlowLogger]:
+):
     """
-    Build an MLflow logger (outside Lightning) using the base configuration.
+    Create a parent MLflow run for a k-fold execution.
+
+    Returns:
+        Tuple of (mlflow.MlflowClient, parent_run_id) or (None, None) if disabled.
     """
     if not config_data:
-        return None
+        return None, None
 
     mlflow_cfg = (
         config_data.get('advanced_config', {})
@@ -82,28 +84,46 @@ def create_mlflow_logger_from_config(
         or {}
     )
     if not mlflow_cfg.get('enabled'):
-        return None
+        return None, None
 
-    general_cfg = config_data.get('general_config', {})
-    tags = dict(mlflow_cfg.get('tags') or {})
-    if extra_tags:
-        tags.update({k: str(v) for k, v in extra_tags.items()})
+    try:
+        import mlflow
 
-    save_dir = (
-        general_cfg.get('folders_config', {}).get('out_dir_base')
-        or os.getcwd()
-    )
+        tracking_uri = mlflow_cfg.get('tracking_uri')
+        experiment_name = mlflow_cfg.get('experiment_name') or experiment_tag
 
-    return MLFlowLogger(
-        experiment_name=mlflow_cfg.get('experiment_name')
-        or general_cfg.get('tag', 'kfold'),
-        run_name=run_name,
-        tracking_uri=mlflow_cfg.get('tracking_uri'),
-        artifact_location=mlflow_cfg.get('artifact_location'),
-        log_model=bool(mlflow_cfg.get('log_model', False)),
-        tags=tags or None,
-        save_dir=save_dir,
-    )
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+
+        client = mlflow.MlflowClient()
+
+        # Get or create experiment
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            experiment_id = client.create_experiment(experiment_name)
+        else:
+            experiment_id = experiment.experiment_id
+
+        # Build tags for the parent run
+        tags = dict(mlflow_cfg.get('tags') or {})
+        tags['kfold.role'] = 'parent'
+        if extra_tags:
+            tags.update({k: str(v) for k, v in extra_tags.items()})
+
+        run_name = f"{experiment_tag}-{time.strftime('%Y%m%d-%H%M%S')}"
+        parent_run = client.create_run(
+            experiment_id=experiment_id,
+            run_name=run_name,
+            tags=tags,
+        )
+
+        parent_run_id = parent_run.info.run_id
+        logger.info(f"Created parent MLflow run: {run_name} (id={parent_run_id})")
+        return client, parent_run_id
+
+    except Exception as e:
+        logger.warning(f"Failed to create parent MLflow run: {e}")
+        return None, None
 
 
 def estimate_class_weights(hdf5_files: List[str], chunk_size: int = 512) -> Optional[List[float]]:
@@ -154,6 +174,7 @@ def train_single_fold(
     kfold_base_path: str,
     output_base_dir: str,
     vae_checkpoint: str,
+    parent_run_id: Optional[str] = None,
     **kwargs
 ) -> Dict[str, any]:
     """
@@ -166,6 +187,7 @@ def train_single_fold(
         kfold_base_path: Base path to k-fold dataset directory
         output_base_dir: Base directory for saving results
         vae_checkpoint: Path to pre-trained VAE checkpoint
+        parent_run_id: Optional parent MLflow run ID for nested run grouping
         **kwargs: Additional config overrides
 
     Returns:
@@ -189,6 +211,7 @@ def train_single_fold(
     mlflow_cfg = tracking_cfg.setdefault('mlflow', {})
     mlflow_tags = mlflow_cfg.get('tags') or {}
     mlflow_tags.update({
+        'kfold.role': 'fold',
         'kfold.fold_id': str(fold_id),
         'kfold.gpu_id': str(gpu_id),
         'kfold.train_files': str(len(fold_datasets['train'])),
@@ -196,10 +219,11 @@ def train_single_fold(
         'kfold.test_files': str(len(fold_datasets['test'])),
         'kfold.base_path': str(kfold_base_path),
     })
+    if parent_run_id:
+        mlflow_tags['mlflow.parentRunId'] = parent_run_id
     mlflow_cfg['tags'] = mlflow_tags
     if not mlflow_cfg.get('run_name'):
-        experiment_tag = config['general_config'].get('tag', 'classifier')
-        mlflow_cfg['run_name'] = f"{experiment_tag}-fold{fold_id:02d}"
+        mlflow_cfg['run_name'] = f"fold-{fold_id:02d}"
 
     fold_output_dir = Path(output_base_dir) / f"fold_{fold_id}"
     fold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -631,6 +655,8 @@ def run_kfold_parallel(
         with open(base_config_path, 'r') as cfg_file:
             base_cfg_data = yaml.safe_load(cfg_file)
 
+    experiment_tag = (base_cfg_data or {}).get('general_config', {}).get('tag', 'classifier')
+
     execution_mode = "parallel" if (not sequential and max_parallel > 1) else "sequential"
 
     logger.info(f"Starting k-fold cross-validation (configured folds={num_folds})")
@@ -641,6 +667,17 @@ def run_kfold_parallel(
         logger.info(f"Max parallel folds: {max_parallel}")
 
     Path(output_base_dir).mkdir(parents=True, exist_ok=True)
+
+    # Create parent MLflow run — all fold runs will be nested under it
+    mlflow_client, parent_run_id = create_parent_mlflow_run(
+        base_cfg_data,
+        experiment_tag,
+        extra_tags={
+            'kfold.num_folds': str(num_folds),
+            'kfold.requested_folds': str(selected_folds),
+            'kfold.execution_mode': execution_mode,
+        },
+    )
 
     all_results = []
 
@@ -655,6 +692,7 @@ def run_kfold_parallel(
                 kfold_base_path=kfold_base_path,
                 output_base_dir=output_base_dir,
                 vae_checkpoint=vae_checkpoint,
+                parent_run_id=parent_run_id,
                 **kwargs
             )
             all_results.append(result)
@@ -675,6 +713,7 @@ def run_kfold_parallel(
                     kfold_base_path=kfold_base_path,
                     output_base_dir=output_base_dir,
                     vae_checkpoint=vae_checkpoint,
+                    parent_run_id=parent_run_id,
                     **kwargs
                 )
                 futures[future] = fold_id
@@ -744,26 +783,12 @@ def run_kfold_parallel(
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
 
-        experiment_tag = (
-            (base_cfg_data or {}).get('general_config', {}).get('tag', 'classifier')
-        )
-        summary_run_name = f"{experiment_tag}-kfold-summary-{time.strftime('%Y%m%d-%H%M%S')}"
-        summary_logger = create_mlflow_logger_from_config(
-            base_cfg_data,
-            run_name=summary_run_name,
-            extra_tags={
-                'kfold.summary': True,
-                'kfold.configured_num_folds': num_folds,
-                'kfold.requested_folds': selected_folds,
-                'kfold.successful_folds': len(successful_folds),
-            },
-        )
-
-        if summary_logger:
-            summary_logger.log_metrics(
-                {
-                    "summary/successful_folds": len(successful_folds),
-                    "summary/failed_folds": requested_fold_count - len(successful_folds),
+        # Log summary metrics and artifacts to the parent MLflow run
+        if mlflow_client and parent_run_id:
+            try:
+                summary_metrics = {
+                    "summary/successful_folds": float(len(successful_folds)),
+                    "summary/failed_folds": float(requested_fold_count - len(successful_folds)),
                     "summary/mean_val_accuracy": avg_val_acc_train,
                     "summary/std_val_accuracy": std_val_acc_train,
                     "summary/mean_test_sensitivity": avg_test_sens,
@@ -773,13 +798,12 @@ def run_kfold_parallel(
                     "summary/mean_test_fpr": avg_test_fpr,
                     "summary/std_test_fpr": std_test_fpr,
                 }
-            )
-            summary_logger.experiment.log_artifact(
-                summary_logger.run_id, str(aggregated_results_path)
-            )
-            summary_logger.experiment.log_artifact(
-                summary_logger.run_id, str(summary_path)
-            )
+                for key, value in summary_metrics.items():
+                    mlflow_client.log_metric(parent_run_id, key, value)
+                mlflow_client.log_artifact(parent_run_id, str(aggregated_results_path))
+                mlflow_client.log_artifact(parent_run_id, str(summary_path))
+            except Exception as e:
+                logger.warning(f"Failed to log summary to parent MLflow run: {e}")
 
         logger.info("=" * 80)
         logger.info("K-FOLD CROSS-VALIDATION SUMMARY")
@@ -843,6 +867,18 @@ def run_kfold_parallel(
     with open(metadata_path, 'w') as f:
         json.dump(execution_metadata, f, indent=2)
     logger.info(f"Saved execution metadata: {metadata_path}")
+
+    # Log final artifacts and terminate the parent MLflow run
+    if mlflow_client and parent_run_id:
+        try:
+            mlflow_client.log_artifact(parent_run_id, str(metadata_path))
+            aggregated_plots_dir = Path(output_base_dir) / "aggregated_plots"
+            if aggregated_plots_dir.exists():
+                mlflow_client.log_artifacts(parent_run_id, str(aggregated_plots_dir), artifact_path="aggregated_plots")
+            mlflow_client.set_terminated(parent_run_id)
+            logger.info(f"Parent MLflow run terminated: {parent_run_id}")
+        except Exception as e:
+            logger.warning(f"Failed to finalize parent MLflow run: {e}")
 
     return all_results
 
