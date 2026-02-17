@@ -150,6 +150,39 @@ from create_hdf5_dataset import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# ---------------------------------------------------------------------------
+# Column descriptions written as comment header lines in the CSV when
+# include_column_descriptions=True. Each line is prefixed with "# ".
+# ---------------------------------------------------------------------------
+CSV_COLUMN_DESCRIPTIONS = {
+    "guid": "Recording identifier — .mat filename without extension. Uniquely identifies one CTG recording.",
+    "subgroup": "Clinical outcome subgroup key, e.g. 'hie_cs', 'acidosis_no_cs', 'healthy_no_bg_no_cs'.",
+    "clinical_class": "High-level clinical class: 'HEALTHY', 'ACIDOSIS', or 'HIE'.",
+    "cs_label": "True if the recording involved a caesarean section delivery.",
+    "bg_label": "True if a blood gas measurement was available for this recording.",
+    "segment_idx": "Zero-based segment index within the recording (after deduplication).",
+    "domain_start_sec": "Segment start time in seconds relative to delivery (negative = before, 0 = delivery).",
+    "domain_start_min": "Segment start time in minutes relative to delivery (domain_start_sec / 60).",
+    "segment_fhr_quality": "Mean full-resolution FHR validity weight [0-1]. Computed as mean(fhr != 0) over all 5760 samples.",
+    "segment_mean_weight_decimated": "Mean decimated (360-point) sample_weight from MIMO calc_sample_weights(). Each point covers 16 input samples.",
+    "segment_passes_weight_filter": "True if segment_mean_weight_decimated >= weight_threshold (default 0.90).",
+    "segment_n_flat_regions": "Number of UP flat regions detected in this segment.",
+    "segment_total_flat_duration_samples": "Sum of all flat region durations (samples) in this segment.",
+    "segment_total_flat_duration_sec": "Sum of all flat region durations (seconds) in this segment.",
+    "row_type": "Row type: 'segment_summary' (one per segment) or 'flat_region' (one per detected flat region).",
+    "flat_region_idx": "Zero-based flat region index within the segment. -1 for segment_summary rows.",
+    "flat_start_sample": "Start sample index (0-based, inclusive) of the flat region. NaN for segment_summary rows.",
+    "flat_end_sample": "End sample index (inclusive) of the flat region. NaN for segment_summary rows.",
+    "flat_duration_samples": "Flat region length in samples (end - start + 1). NaN for segment_summary rows.",
+    "flat_duration_sec": "Flat region duration in seconds (flat_duration_samples / sampling_rate). NaN for segment_summary rows.",
+    "flat_abs_start_sec": "Absolute flat region start in seconds relative to delivery. NaN for segment_summary rows.",
+    "flat_abs_end_sec": "Absolute flat region end in seconds relative to delivery. NaN for segment_summary rows.",
+    "flat_fhr_valid_pct": "Percent of flat region where FHR is valid (non-zero) [0-100]. Near 0 = likely gap/padding, near 100 = genuine flat UP. NaN for segment_summary rows.",
+    "flat_mean_fhr": "Mean FHR during the flat region (valid samples only). NaN if no valid FHR samples or for segment_summary rows.",
+    "flat_mean_up": "Mean UP value during the flat region (all samples). NaN for segment_summary rows.",
+    "flat_excluded_by_fhr_filter": "True if flat region was flagged as likely gap/padding (flat_fhr_valid_pct < fhr_valid_threshold). Always False for segment_summary rows.",
+}
+
 
 SUBGROUP_METADATA = {
     "HEALTHY_NO_BG_NoCS": {
@@ -517,6 +550,7 @@ def analyze_up_flat_regions(
     sampling_rate=4.0,
     folder_filter=None,
     file_limit=-1,
+    include_column_descriptions=True,
 ):
     """Analyze UP flat regions across all EFM recordings and save results to CSV.
 
@@ -563,6 +597,10 @@ def analyze_up_flat_regions(
             ``records`` is None. If None, all 8 standard folders are scanned.
         file_limit: Maximum number of .mat files to process per subgroup. Use -1
             for no limit. Useful for quick testing on a subset.
+        include_column_descriptions: If True (default), write comment lines at the
+            top of the CSV describing each column before the header row and data.
+            Each description line is prefixed with ``# ``. If False, the CSV
+            contains only the standard header row followed by data rows.
 
     Returns:
         A pandas DataFrame with one row per flat region plus one segment-summary
@@ -630,7 +668,19 @@ def analyze_up_flat_regions(
 
     df = pd.DataFrame(all_rows)
     if not df.empty:
-        df.to_csv(output_csv_path, index=False)
+        if include_column_descriptions:
+            with open(output_csv_path, "w", newline="", encoding="utf-8") as f:
+                # Write column description header as comment lines
+                f.write("# UP Flat Region Analysis — Column Descriptions\n")
+                f.write("#\n")
+                for col in df.columns:
+                    desc = CSV_COLUMN_DESCRIPTIONS.get(col, "No description available.")
+                    f.write(f"# {col}: {desc}\n")
+                f.write("#\n")
+                # Write the actual CSV data (header + rows) after the comments
+                df.to_csv(f, index=False)
+        else:
+            df.to_csv(output_csv_path, index=False)
         logger.info(f"Saved {len(df)} rows to {output_csv_path}")
 
         n_summaries = (df["row_type"] == "segment_summary").sum()
@@ -672,6 +722,8 @@ def main():
                         help="Folder names to process (default: all 8)")
     parser.add_argument("--file_limit", type=int, default=-1,
                         help="Max files per subgroup (-1 = all)")
+    parser.add_argument("--no_column_descriptions", action="store_true",
+                        help="Omit column description comments from CSV header")
 
     args = parser.parse_args()
 
@@ -696,6 +748,7 @@ def main():
         sampling_rate=args.sampling_rate,
         folder_filter=args.folder_filter,
         file_limit=args.file_limit,
+        include_column_descriptions=not args.no_column_descriptions,
     )
 
 
