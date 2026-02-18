@@ -45,6 +45,29 @@ torch.cuda.manual_seed(42)
 # Utility functions
 #-----------------------------------------------------------------------------------------------------------------------
 
+def load_labor_onset_data(csv_path):
+    """Load labor onset times from CSV and return a GUID -> seconds mapping.
+
+    The CSV must have columns ``trace_guid`` and ``labor_onset_hours``.
+    ``labor_onset_hours`` is in hours relative to delivery (negative = before).
+    GUIDs with missing ``labor_onset_hours`` are omitted from the map.
+
+    Returns:
+        dict mapping GUID string to labor onset time in **seconds** relative
+        to delivery (same sign convention as ``epoch`` / ``domain_start``).
+    """
+    df = pd.read_csv(csv_path)
+    labor_onset_map = {}
+    for _, row in df.iterrows():
+        guid = str(row['trace_guid']).strip()
+        hours = row.get('labor_onset_hours')
+        if pd.notna(hours) and str(hours).strip() != '':
+            labor_onset_map[guid] = float(hours) * 3600.0  # hours -> seconds
+    logger.info(f"Loaded labor onset data for {len(labor_onset_map)} GUIDs "
+                f"(of {len(df)} rows) from {csv_path}")
+    return labor_onset_map
+
+
 def interpolate_bad_values(signal_2d):
     """Replace NaN/Inf values with linear interpolation, per row.
 
@@ -470,7 +493,7 @@ def create_hdf5_dataset_from_records_list(
     hdf5_path=None, records_list=None, file_limit=-1,
     base_block_size=3520, save_name=None, min_domain_start=None,
     cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=1/22,
-    run_guid_analysis=False, precomputed_masks=None):
+    run_guid_analysis=False, precomputed_masks=None, labor_onset_map=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -567,6 +590,8 @@ def create_hdf5_dataset_from_records_list(
             up[(up != 0) & (np.abs(up) < tiny)] = 0.0
             domain_starts = mimo_prepared.domain_start
             guid_key = os.path.splitext(os.path.split(record)[1])[0]
+            # Lookup labor onset time for this GUID (seconds relative to delivery)
+            labor_onset_sec = labor_onset_map.get(guid_key, float('nan')) if labor_onset_map else float('nan')
             # Surface post-delivery segments from prepare_data
             n_post_delivery = sum(1 for ds in domain_starts if ds >= 0)
             if n_post_delivery > 0:
@@ -734,6 +759,8 @@ def create_hdf5_dataset_from_records_list(
                         f"{ds_val:.1f}s (equalization padding or recording extends past delivery)")
                 if guid_tracking is not None:
                     guid_tracking[guid_key].included_domain_starts.append(ds_val)
+                # time_from_labor_onset = epoch - labor_onset (seconds since labor onset)
+                tflo = float(domain_starts[orig_idx]) - labor_onset_sec
                 append_sample(
                     path=hdf5_path,
                     fhr=fhr[orig_idx, :],
@@ -746,7 +773,8 @@ def create_hdf5_dataset_from_records_list(
                     guid=record_name[0],
                     epoch=domain_starts[orig_idx],
                     bg_label=bg_label,
-                    cs_label=cs_label)
+                    cs_label=cs_label,
+                    time_from_labor_onset=tflo)
 
             # ---- Generate signal strip plot ----
             if plot_segment_status is not None and hdf5_path:
@@ -788,7 +816,12 @@ def create_hdf5_dataset_from_records_list(
 
 
 def create_records(records_base_path_ = None, output_base_path_ = None, run_guid_analysis=False,
-                   base_block_size=3520, overlap_percentage=1/22):
+                   base_block_size=3520, overlap_percentage=1/22, labor_onset_csv_path=None):
+
+    # Load labor onset data if CSV path provided
+    labor_onset_map = None
+    if labor_onset_csv_path is not None:
+        labor_onset_map = load_labor_onset_data(labor_onset_csv_path)
 
     signal_length = int(base_block_size * 1.5)
     sequence_length = signal_length // 16
@@ -917,7 +950,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
         bg_label=True,
         pre_defined_target=1,
         run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
     pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
     create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
@@ -929,7 +963,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                           bg_label=True,
                                           pre_defined_target=1,
                                           run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
@@ -942,7 +977,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                           bg_label=True,
                                           pre_defined_target=1,
                                           run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
     pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
     create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
@@ -954,7 +990,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                           bg_label=True,
                                           pre_defined_target=1,
                                           run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
     # ---------------------------
     # Classifications
     # ---------------------------
@@ -983,7 +1020,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=False,
                                                   pre_defined_target=1,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "healthy_no_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -997,7 +1035,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=False,
                                                   pre_defined_target=1,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "healthy_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1011,7 +1050,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=1,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "healthy_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1025,7 +1065,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=1,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "acidosis_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1039,7 +1080,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=2,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "acidosis_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1053,7 +1095,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=2,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "hie_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1067,7 +1110,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=3,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
 
             selected_sub_group = "hie_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
@@ -1081,7 +1125,8 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                                                   bg_label=True,
                                                   pre_defined_target=3,
                                                   run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks)
+        precomputed_masks=masks,
+        labor_onset_map=labor_onset_map)
         run_guid_analysis = False
 
 

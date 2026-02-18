@@ -32,11 +32,12 @@ Quick start — dataset only::
     )
 
     sample = dataset[0]
-    # sample['fhr_st']           -> (S_i, 300, 43)   segments x timesteps x channels
-    # sample['target']           -> (S_i, 300)
-    # sample['delta_t']          -> (S_i,)            seconds between segments
-    # sample['segment_indices']  -> (S_i,)            ordinal grid slot
-    # sample['guid']             -> str
+    # sample['fhr_st']                    -> (S_i, 300, 43)   segments x timesteps x channels
+    # sample['target']                    -> (S_i, 300)
+    # sample['delta_t']                   -> (S_i,)            seconds between segments
+    # sample['segment_indices']           -> (S_i,)            ordinal grid slot
+    # sample['time_from_labor_onset']     -> (S_i,)            seconds since labor onset (NaN if unavailable)
+    # sample['guid']                      -> str
 
 Quick start — dataloader with padding::
 
@@ -51,13 +52,14 @@ Quick start — dataloader with padding::
     )
 
     for batch in loader:
-        fhr_st  = batch['fhr_st']           # (B, S_max, 300, 43)
-        mask    = batch['mask']             # (B, S_max)  True=valid
-        delta_t = batch['delta_t']          # (B, S_max)
-        target  = batch['target']           # (B, S_max, 300)  pad=-1
-        weight  = batch['weight']           # (B, S_max, 300)  pad=0.0
-        lengths = batch['lengths']          # (B,)
-        guids   = batch['guid']             # list[str]
+        fhr_st  = batch['fhr_st']                    # (B, S_max, 300, 43)
+        mask    = batch['mask']                      # (B, S_max)  True=valid
+        delta_t = batch['delta_t']                   # (B, S_max)
+        target  = batch['target']                    # (B, S_max, 300)  pad=-1
+        weight  = batch['weight']                    # (B, S_max, 300)  pad=0.0
+        tflo    = batch['time_from_labor_onset']     # (B, S_max)  pad=0.0, NaN if unavailable
+        lengths = batch['lengths']                   # (B,)
+        guids   = batch['guid']                      # list[str]
 
 Padding values (set in ``sequence_collate_fn``)::
 
@@ -312,6 +314,9 @@ class SignalSequenceDataset(Dataset):
                   delivery).
                 - **delta_t**: ``(S_i,)`` time gaps in seconds between
                   consecutive segments.  ``delta_t[0] = 0.0``.
+                - **time_from_labor_onset**: ``(S_i,)`` seconds since labor
+                  onset for each segment.  ``NaN`` if labor onset data was
+                  not available for this GUID during dataset creation.
                 - **segment_indices**: ``(S_i,)`` long — ordinal position on a
                   uniform grid with spacing ``segment_duration``.  Computed as
                   ``round((epoch[j] - epoch[0]) / segment_duration)``.
