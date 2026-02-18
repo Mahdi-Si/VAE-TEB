@@ -166,6 +166,7 @@ def create_initial_hdf5(
         - "epoch"     : float32, shape (N,)
         - "cs_label"  : uint8 (0 or 1), shape (N,)
         - "bg_label"  : uint8 (0 or 1), shape (N,)
+        - "time_from_labor_onset" : float32, shape (N,) - seconds since labor onset (NaN if unavailable)
         - "guid"      : variable-length UTF-8 strings, shape (N,)
 
     All datasets use per-sample chunking and LZF compression.
@@ -230,6 +231,10 @@ def create_initial_hdf5(
             dtype="u1", chunks=(1,), compression="lzf"
         )
         h5f.create_dataset(
+            "time_from_labor_onset", shape=(0,), maxshape=(None,),
+            dtype="f4", chunks=(1,), compression="lzf"
+        )
+        h5f.create_dataset(
             "guid", shape=(0,), maxshape=(None,),
             dtype=str_dt, chunks=(1,)
         )
@@ -247,7 +252,8 @@ def append_sample(
     guid: str,
     epoch: float,
     cs_label: bool,
-    bg_label: bool
+    bg_label: bool,
+    time_from_labor_onset: float = float('nan')
 ) -> None:
     """
     Append a single sample to an existing HDF5 dataset.
@@ -267,6 +273,7 @@ def append_sample(
         epoch:     Epoch as float.
         cs_label:  Case label flag.
         bg_label:  Background label flag.
+        time_from_labor_onset: Seconds since labor onset (NaN if unavailable).
     """
     with h5py.File(path, "a", libver="latest") as h5f:
         idx = h5f["fhr"].shape[0]
@@ -283,6 +290,8 @@ def append_sample(
         h5f["epoch"][idx]     = epoch
         h5f["cs_label"][idx]  = np.uint8(cs_label)
         h5f["bg_label"][idx]  = np.uint8(bg_label)
+        if "time_from_labor_onset" in h5f:
+            h5f["time_from_labor_onset"][idx] = time_from_labor_onset
         h5f["guid"][idx]      = guid
 
 
