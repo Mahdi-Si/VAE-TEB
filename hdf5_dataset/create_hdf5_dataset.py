@@ -79,12 +79,12 @@ def load_labor_onset_data(csv_path):
             labor_onset_map[guid] = float(hours) * 3600.0  # hours -> seconds
         else:
             n_missing += 1
-    logger.info(f"Loaded labor onset data for {len(labor_onset_map)} GUIDs "
-                f"({n_missing} with missing labor_onset_hours) "
-                f"from {csv_path}")
+    print(f"[TLO] Loaded labor onset data for {len(labor_onset_map)} GUIDs "
+          f"({n_missing} with missing labor_onset_hours) from {csv_path}")
     if labor_onset_map:
         sample_key = next(iter(labor_onset_map))
-        logger.info(f"  Sample CSV GUID (normalized): {sample_key}")
+        sample_val = labor_onset_map[sample_key]
+        print(f"[TLO] Sample CSV GUID (normalized): {sample_key} -> {sample_val/3600:.2f}h")
     return labor_onset_map
 
 
@@ -615,8 +615,9 @@ def create_hdf5_dataset_from_records_list(
                 normalized_key = _normalize_guid(guid_key)
                 labor_onset_sec = labor_onset_map.get(normalized_key, float('nan'))
                 if math.isnan(labor_onset_sec):
-                    logger.debug(f"  Labor onset not found for GUID: {guid_key} "
-                                 f"(normalized: {normalized_key})")
+                    print(f"  [TLO] GUID not in CSV: {guid_key} (normalized: {normalized_key})")
+                else:
+                    print(f"  [TLO] GUID matched: {guid_key} -> labor_onset={labor_onset_sec/3600:.2f}h ({labor_onset_sec:.0f}s)")
             else:
                 labor_onset_sec = float('nan')
             # Surface post-delivery segments from prepare_data
@@ -788,6 +789,7 @@ def create_hdf5_dataset_from_records_list(
                     guid_tracking[guid_key].included_domain_starts.append(ds_val)
                 # time_from_labor_onset = epoch - labor_onset (seconds since labor onset)
                 tflo = float(domain_starts[orig_idx]) - labor_onset_sec
+                print(f"    [TLO] seg {orig_idx}: epoch={domain_starts[orig_idx]:.0f}s - labor_onset={labor_onset_sec:.0f}s = tflo={tflo:.0f}s ({tflo/3600:.2f}h)")
                 append_sample(
                     path=hdf5_path,
                     fhr=fhr[orig_idx, :],
@@ -980,67 +982,67 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
     # ---------------------------
     # Vae Train and Test
     # ---------------------------
-    pre_train_path = os.path.join(output_base_path_, "pre_training_dataset")
-    os.makedirs(pre_train_path, exist_ok=True)
-    pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
-    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
-    create_hdf5_dataset_from_records_list(
-        records_list=healthy_bg_cs_files_vae_train,
-        hdf5_path=pre_training_dataset,
-        base_block_size=base_block_size,
-        overlap_percentage=overlap_percentage,
-        cs_label=True,
-        bg_label=True,
-        pre_defined_target=1,
-        run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks,
-        labor_onset_map=labor_onset_map)
+    # pre_train_path = os.path.join(output_base_path_, "pre_training_dataset")
+    # os.makedirs(pre_train_path, exist_ok=True)
+    # pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_hdf5_dataset_from_records_list(
+    #     records_list=healthy_bg_cs_files_vae_train,
+    #     hdf5_path=pre_training_dataset,
+    #     base_block_size=base_block_size,
+    #     overlap_percentage=overlap_percentage,
+    #     cs_label=True,
+    #     bg_label=True,
+    #     pre_defined_target=1,
+    #     run_guid_analysis=run_guid_analysis,
+    #     precomputed_masks=masks,
+    #     labor_onset_map=labor_onset_map)
 
-    pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
-    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
-    create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_train,
-                                          hdf5_path=pre_training_dataset,
-                                          base_block_size=base_block_size,
-                                          overlap_percentage=overlap_percentage,
-                                          cs_label=False,
-                                          bg_label=True,
-                                          pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks,
-        labor_onset_map=labor_onset_map)
+    # pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_train,
+    #                                       hdf5_path=pre_training_dataset,
+    #                                       base_block_size=base_block_size,
+    #                                       overlap_percentage=overlap_percentage,
+    #                                       cs_label=False,
+    #                                       bg_label=True,
+    #                                       pre_defined_target=1,
+    #                                       run_guid_analysis=run_guid_analysis,
+    #     precomputed_masks=masks,
+    #     labor_onset_map=labor_onset_map)
 
 
-    pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
-    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
-    create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_test,
-                                          hdf5_path=pre_training_dataset,
-                                          base_block_size=base_block_size,
-                                          overlap_percentage=overlap_percentage,
-                                          cs_label=True,
-                                          bg_label=True,
-                                          pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks,
-        labor_onset_map=labor_onset_map)
+    # pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_test,
+    #                                       hdf5_path=pre_training_dataset,
+    #                                       base_block_size=base_block_size,
+    #                                       overlap_percentage=overlap_percentage,
+    #                                       cs_label=True,
+    #                                       bg_label=True,
+    #                                       pre_defined_target=1,
+    #                                       run_guid_analysis=run_guid_analysis,
+    #     precomputed_masks=masks,
+    #     labor_onset_map=labor_onset_map)
 
-    pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
-    create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
-    create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_test,
-                                          hdf5_path=pre_training_dataset,
-                                          base_block_size=base_block_size,
-                                          overlap_percentage=overlap_percentage,
-                                          cs_label=False,
-                                          bg_label=True,
-                                          pre_defined_target=1,
-                                          run_guid_analysis=run_guid_analysis,
-        precomputed_masks=masks,
-        labor_onset_map=labor_onset_map)
+    # pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_test,
+    #                                       hdf5_path=pre_training_dataset,
+    #                                       base_block_size=base_block_size,
+    #                                       overlap_percentage=overlap_percentage,
+    #                                       cs_label=False,
+    #                                       bg_label=True,
+    #                                       pre_defined_target=1,
+    #                                       run_guid_analysis=run_guid_analysis,
+    #     precomputed_masks=masks,
+    #     labor_onset_map=labor_onset_map)
     # ---------------------------
     # Classifications
     # ---------------------------
     k_fold_cross_validation_path = os.path.join(output_base_path_, "k_fold_cross_validation_dataset")
     os.makedirs(k_fold_cross_validation_path, exist_ok=True)
-    run_guid_analysis = True
+    run_guid_analysis = False
     for fold in classification_folds:
         print('done')
         fold_path = os.path.join(k_fold_cross_validation_path, str(fold))
