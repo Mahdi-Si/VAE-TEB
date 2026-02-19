@@ -45,6 +45,11 @@ torch.cuda.manual_seed(42)
 # Utility functions
 #-----------------------------------------------------------------------------------------------------------------------
 
+def _normalize_guid(guid_str):
+    """Normalize a GUID string for matching: uppercase, remove hyphens."""
+    return guid_str.strip().upper().replace('-', '')
+
+
 def load_labor_onset_data(csv_path):
     """Load labor onset times from CSV and return a GUID -> seconds mapping.
 
@@ -52,19 +57,30 @@ def load_labor_onset_data(csv_path):
     ``labor_onset_hours`` is in hours relative to delivery (negative = before).
     GUIDs with missing ``labor_onset_hours`` are omitted from the map.
 
+    Keys are normalized (uppercase, hyphens removed) so that
+    ``8CFD48E7-EC58-42F1-9DE3-4CAB18C96D07`` and
+    ``8CFD48E7EC5842F19DE34CAB18C96D07`` both match.
+
     Returns:
-        dict mapping GUID string to labor onset time in **seconds** relative
-        to delivery (same sign convention as ``epoch`` / ``domain_start``).
+        dict mapping normalized GUID string to labor onset time in **seconds**
+        relative to delivery (same sign convention as ``epoch`` / ``domain_start``).
     """
     df = pd.read_csv(csv_path)
     labor_onset_map = {}
+    n_missing = 0
     for _, row in df.iterrows():
-        guid = str(row['trace_guid']).strip()
+        guid = _normalize_guid(str(row['trace_guid']))
         hours = row.get('labor_onset_hours')
         if pd.notna(hours) and str(hours).strip() != '':
             labor_onset_map[guid] = float(hours) * 3600.0  # hours -> seconds
+        else:
+            n_missing += 1
     logger.info(f"Loaded labor onset data for {len(labor_onset_map)} GUIDs "
-                f"(of {len(df)} rows) from {csv_path}")
+                f"({n_missing} with missing labor_onset_hours) "
+                f"from {csv_path}")
+    if labor_onset_map:
+        sample_key = next(iter(labor_onset_map))
+        logger.info(f"  Sample CSV GUID (normalized): {sample_key}")
     return labor_onset_map
 
 
@@ -591,7 +607,14 @@ def create_hdf5_dataset_from_records_list(
             domain_starts = mimo_prepared.domain_start
             guid_key = os.path.splitext(os.path.split(record)[1])[0]
             # Lookup labor onset time for this GUID (seconds relative to delivery)
-            labor_onset_sec = labor_onset_map.get(guid_key, float('nan')) if labor_onset_map else float('nan')
+            if labor_onset_map:
+                normalized_key = _normalize_guid(guid_key)
+                labor_onset_sec = labor_onset_map.get(normalized_key, float('nan'))
+                if math.isnan(labor_onset_sec):
+                    logger.debug(f"  Labor onset not found for GUID: {guid_key} "
+                                 f"(normalized: {normalized_key})")
+            else:
+                labor_onset_sec = float('nan')
             # Surface post-delivery segments from prepare_data
             n_post_delivery = sum(1 for ds in domain_starts if ds >= 0)
             if n_post_delivery > 0:
@@ -811,6 +834,22 @@ def create_hdf5_dataset_from_records_list(
             _run_analysis(hdf5_path, guid_tracking, segment_duration_sec=segment_dur)
         except Exception as e:
             logger.error(f"GUID analysis failed: {e}")
+
+    # Log labor onset match summary
+    if labor_onset_map and hdf5_path:
+        try:
+            import h5py as _h5
+            with _h5.File(hdf5_path, 'r') as _f:
+                if 'time_from_labor_onset' in _f:
+                    tflo_arr = _f['time_from_labor_onset'][:]
+                    n_total = len(tflo_arr)
+                    n_nan = int(np.isnan(tflo_arr).sum())
+                    n_valid = n_total - n_nan
+                    logger.info(f"Labor onset summary for {os.path.basename(hdf5_path)}: "
+                                f"{n_valid}/{n_total} segments matched "
+                                f"({n_nan} NaN = GUID not in CSV)")
+        except Exception as e:
+            logger.warning(f"Could not read labor onset summary: {e}")
 
     return errors_list
 
