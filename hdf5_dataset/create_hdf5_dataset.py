@@ -28,6 +28,10 @@ from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering im
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(_handler)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
