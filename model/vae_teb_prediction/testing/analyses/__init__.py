@@ -48,6 +48,13 @@ from model.vae_teb_prediction.testing.analyses.latent import (
 from model.vae_teb_prediction.testing.analyses.temporal import run_temporal_accuracy_analysis, run_within_window_analysis
 from model.vae_teb_prediction.testing.analyses.coherence import run_coherence_analysis
 from model.vae_teb_prediction.testing.analyses.trajectory import run_trajectory_analysis, TrajectoryAnalyzer
+from model.vae_teb_prediction.testing.analyses.compare_trajectory_classes import (
+    run_comparison as run_trajectory_comparison,
+    compute_frechet_distance,
+    compute_mmd_rbf,
+    compare_features_by_class,
+    compare_dimensions_by_class,
+)
 from model.vae_teb_prediction.testing.analyses.qualitative import (
     run_reconstruction_analysis,
     run_single_prediction_windows,
@@ -242,6 +249,12 @@ __all__ = [
     "summarize_trajectory",
     "summarize_latent_segments",
     "HAS_CHANGEPOINT",
+    # Cross-class comparison
+    "run_trajectory_comparison",
+    "compute_frechet_distance",
+    "compute_mmd_rbf",
+    "compare_features_by_class",
+    "compare_dimensions_by_class",
     # Combined
     "run_all_analyses",
 ]

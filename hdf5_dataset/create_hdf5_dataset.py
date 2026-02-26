@@ -51,7 +51,8 @@ torch.cuda.manual_seed(42)
 
 def _normalize_guid(guid_str):
     """Normalize a GUID string for matching: uppercase, remove hyphens."""
-    return guid_str.strip().upper().replace('-', '')
+    # return guid_str.strip().upper().replace('-', '')
+    return guid_str.strip()  # passthrough for debugging
 
 
 def load_labor_onset_data(csv_path):
