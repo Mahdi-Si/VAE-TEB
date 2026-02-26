@@ -39,6 +39,7 @@ from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import _extract_epoch, _extract_guid, _extract_label
 from model.vae_teb_prediction.testing.metrics import (
     compute_kld_per_timestep,
+    compute_trajectory_features,
     preprocess_latent,
     reduce_latent_dimensionality,
 )
@@ -50,6 +51,7 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_latent_trajectory_2d,
     plot_latent_trajectory_3d,
     plot_latent_changepoints_with_raw,
+    plot_recurrence,
     plot_segment_statistics,
     plot_trajectory_comparison,
 )
@@ -164,10 +166,10 @@ class TrajectoryAnalyzer:
         # Class configuration
         self.class_names = class_names or ["healthy", "acidosis", "HIE"]
         self.colors = {
-            "healthy": "#2ecc71",
-            "acidosis": "#e74c3c",
-            "HIE": "#9b59b6",
-            "unknown": "#95a5a6",
+            "healthy": "#609966",    # Muted green (matches COLOR_GREEN)
+            "acidosis": "#EB5B00",   # Vivid vermillion (matches COLOR_VERMILLION)
+            "HIE": "#112D4E",        # Deep navy-purple (matches COLOR_PURPLE)
+            "unknown": "#393E46",    # Dark gray (matches COLOR_GRAY)
         }
 
         # Create output directories
@@ -184,6 +186,8 @@ class TrajectoryAnalyzer:
         self.raw_data: Dict[str, Dict[str, Any]] = {}  # Store raw signals per GUID
         self.changepoint_results: Dict[str, Any] = {}
         self.segment_stats: List[Dict[str, Any]] = []
+        self.guid_trajectories: Dict[str, Dict[str, Any]] = {}
+        self.guid_features_df: Optional[pd.DataFrame] = None
 
     def run(
         self,
@@ -233,25 +237,33 @@ class TrajectoryAnalyzer:
         # Step 2: Add dynamics
         self.latent_df = self._add_dynamics(self.latent_df)
 
-        # Step 3: Apply dimensionality reduction
+        # Step 3: Apply dimensionality reduction (global fit)
         self._reduce_dimensionality()
+
+        # Step 3b: Build GUID-level stitched trajectories
+        self.guid_trajectories = self._build_guid_trajectories()
+
+        # Step 3c: Extract per-GUID trajectory features
+        self.guid_features_df = self._extract_guid_features()
 
         # Step 4: Detect changepoints and compute segment statistics
         if HAS_CHANGEPOINT and self.n_changepoints > 0:
             self._detect_changepoints_all()
             self._compute_segment_statistics()
 
-        # Step 5: Save data
+        # Step 5: Save data + export CSVs
         self.latent_df.to_parquet(self.output_dir / "latent_trajectories.parquet")
         self.epoch_df.to_parquet(self.output_dir / "epoch_summary.parquet")
+        self._export_csvs()
 
-        # Step 6: Generate plots
+        # Step 6: Generate plots (including recurrence)
         self._plot_kld_vs_time()
         if class_analysis:
             self._plot_kld_by_class()
         self._plot_kld_guid_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
         self._plot_latent_space(color_by_label=class_analysis)
         self._plot_guid_absolute_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
+        self._plot_recurrence_samples(n_samples=min(5, n_trajectory_samples))
 
         # Generate 3D trajectory plots
         if self.plot_3d:
@@ -284,6 +296,8 @@ class TrajectoryAnalyzer:
             "n_samples": len(self.latent_df),
             "n_guids": self.epoch_df["guid"].nunique() if not self.epoch_df.empty else 0,
             "n_epochs": len(self.epoch_df),
+            "n_guid_trajectories": len(self.guid_trajectories),
+            "n_guid_features": len(self.guid_features_df) if self.guid_features_df is not None else 0,
             "time_range_hours": self.time_range_hours,
             "dim_reduction_method": self.dim_reduction_method,
             "n_changepoints": self.n_changepoints,
@@ -372,20 +386,22 @@ class TrajectoryAnalyzer:
                         "kld_std": float(np.nanstd(valid_kld)) if valid_kld is not None else np.nan,
                     })
 
-                    # Store raw data for changepoint detection (first epoch per guid)
-                    if guid not in self.raw_data:
-                        fhr_signal = None
-                        if hasattr(batch, "fhr") and batch.fhr is not None:
-                            fhr_signal = batch.fhr[idx].cpu().numpy() if hasattr(batch.fhr, 'cpu') else np.asarray(batch.fhr[idx])
-                        elif hasattr(batch, "fhr_st") and batch.fhr_st is not None:
-                            fhr_signal = batch.fhr_st[idx].cpu().numpy().flatten() if hasattr(batch.fhr_st, 'cpu') else np.asarray(batch.fhr_st[idx]).flatten()
+                    # Store raw data for ALL epochs per GUID
+                    fhr_signal = None
+                    if hasattr(batch, "fhr") and batch.fhr is not None:
+                        fhr_signal = batch.fhr[idx].cpu().numpy() if hasattr(batch.fhr, 'cpu') else np.asarray(batch.fhr[idx])
+                    elif hasattr(batch, "fhr_st") and batch.fhr_st is not None:
+                        fhr_signal = batch.fhr_st[idx].cpu().numpy().flatten() if hasattr(batch.fhr_st, 'cpu') else np.asarray(batch.fhr_st[idx]).flatten()
 
-                        self.raw_data[guid] = {
-                            "latent_mean": latent_np[idx],  # (T, D)
-                            "fhr": fhr_signal,
-                            "epoch": epoch_sec,
-                            "label": label,
-                        }
+                    if guid not in self.raw_data:
+                        self.raw_data[guid] = {"epochs": [], "label": label}
+
+                    self.raw_data[guid]["epochs"].append({
+                        "latent_mean": latent_np[idx],       # (T, D)
+                        "fhr": fhr_signal,
+                        "epoch_sec": epoch_sec,
+                        "kld_timestep": kld[idx] if kld is not None else None,
+                    })
 
         # Create DataFrames
         latent_df = pd.DataFrame(latent_rows)
@@ -677,7 +693,7 @@ class TrajectoryAnalyzer:
         # Panel 2: Latent PC trajectory
         ax2 = fig.add_subplot(gs[0, 2])
         if not latent_data.empty and "pc1" in latent_data.columns:
-            ax2.scatter(latent_data["pc1"], latent_data["pc2"], c=latent_data["hours_before"], cmap="viridis", s=1, alpha=0.5)
+            ax2.scatter(latent_data["pc1"], latent_data["pc2"], c=latent_data["hours_before"], cmap="bwr", s=1, alpha=0.5)
             ax2.set_xlabel("PC1")
             ax2.set_ylabel("PC2")
             ax2.set_title("Latent Trajectory")
@@ -733,6 +749,17 @@ class TrajectoryAnalyzer:
             except Exception as e:
                 logger.warning(f"Could not compute silhouette score: {e}")
 
+        # Trajectory feature summary stats
+        if self.guid_features_df is not None and not self.guid_features_df.empty:
+            feat_cols = [c for c in self.guid_features_df.columns
+                         if c not in ("guid", "label", "n_epochs", "duration_hours")]
+            for col in feat_cols:
+                vals = self.guid_features_df[col].replace([np.inf, -np.inf], np.nan).dropna()
+                if vals.size > 0:
+                    metrics[f"traj_{col}_mean"] = float(vals.mean())
+                    metrics[f"traj_{col}_std"] = float(vals.std())
+            metrics["n_guid_trajectories"] = len(self.guid_features_df)
+
         return metrics
 
     # -------------------------------------------------------------------------
@@ -740,84 +767,14 @@ class TrajectoryAnalyzer:
     # -------------------------------------------------------------------------
 
     def _reduce_dimensionality(self) -> None:
-        """Apply dimensionality reduction to latent trajectories."""
+        """Apply dimensionality reduction globally across ALL latent points.
+
+        Fits one reducer on all valid z-columns from self.latent_df, ensuring
+        coordinates are comparable across epochs and GUIDs (required for
+        trajectory stitching). For non-linear methods on large datasets,
+        subsamples to fit then transforms the full set.
+        """
         if self.latent_df.empty:
-            return
-
-        z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
-        if not z_cols:
-            return
-
-        # Get unique (guid, epoch) combinations
-        unique_keys = self.latent_df[["guid", "epoch_sec"]].drop_duplicates()
-
-        reduced_trajectories = []
-        for _, row in unique_keys.iterrows():
-            guid, epoch = row["guid"], row["epoch_sec"]
-            mask = (self.latent_df["guid"] == guid) & (self.latent_df["epoch_sec"] == epoch)
-            subset = self.latent_df[mask].sort_values("t")
-
-            if len(subset) < 3:
-                continue
-
-            Z = subset[z_cols].values
-            if not np.all(np.isfinite(Z)):
-                continue
-
-            # Reshape to (1, T, D) for reduce_latent_dimensionality
-            Z_3d = Z[np.newaxis, :, :]
-
-            try:
-                if HAS_TORCH:
-                    Z_tensor = torch.from_numpy(Z_3d).float()
-                    reduced = reduce_latent_dimensionality(
-                        Z_tensor,
-                        method=self.dim_reduction_method,
-                        n_components=3,
-                    )
-                else:
-                    # Fallback to simple PCA if torch not available
-                    self.latent_df = self._fit_pca(self.latent_df)
-                    return
-
-                # Store reduced coordinates
-                reduced_2d = reduced[0]  # (T, 3)
-                for i, t in enumerate(subset["t"].values):
-                    reduced_trajectories.append({
-                        "guid": guid,
-                        "epoch_sec": epoch,
-                        "t": t,
-                        "rd1": reduced_2d[i, 0],
-                        "rd2": reduced_2d[i, 1],
-                        "rd3": reduced_2d[i, 2] if reduced_2d.shape[1] > 2 else 0.0,
-                    })
-            except Exception as e:
-                logger.debug(f"Dimensionality reduction failed for {guid}: {e}")
-                continue
-
-        # Merge reduced coordinates into latent_df
-        if reduced_trajectories:
-            reduced_df = pd.DataFrame(reduced_trajectories)
-            self.latent_df = self.latent_df.merge(
-                reduced_df, on=["guid", "epoch_sec", "t"], how="left"
-            )
-            # Use rd1, rd2, rd3 as pc1, pc2, pc3 for compatibility
-            if "rd1" in self.latent_df.columns:
-                self.latent_df["pc1"] = self.latent_df["rd1"]
-                self.latent_df["pc2"] = self.latent_df["rd2"]
-                self.latent_df["pc3"] = self.latent_df.get("rd3", 0.0)
-
-            logger.info(f"Applied {self.dim_reduction_method.upper()} dimensionality reduction")
-        else:
-            # Fallback to standard PCA
-            self.latent_df = self._fit_pca(self.latent_df)
-
-        # Add global PCA coordinates for cross-epoch trajectory stitching
-        self._add_global_pca()
-
-    def _add_global_pca(self, n_components: int = 3) -> None:
-        """Compute global PCA coordinates over all latent points."""
-        if self.latent_df.empty or not HAS_SKLEARN:
             return
 
         z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
@@ -826,18 +783,80 @@ class TrajectoryAnalyzer:
 
         Z = self.latent_df[z_cols].values
         valid_mask = np.all(np.isfinite(Z), axis=1)
-        if valid_mask.sum() < 10:
+        n_valid = int(valid_mask.sum())
+
+        if n_valid < 10:
+            logger.warning("Too few valid latent points for dimensionality reduction")
             return
 
-        n_components = min(n_components, len(z_cols))
-        pca = PCA(n_components=n_components)
-        X = np.full((len(Z), n_components), np.nan)
-        X[valid_mask] = pca.fit_transform(Z[valid_mask])
+        n_components = min(3, len(z_cols))
+        method = self.dim_reduction_method.lower()
 
-        for i in range(n_components):
-            self.latent_df[f"gpc{i + 1}"] = X[:, i]
+        try:
+            if method == "pca":
+                if not HAS_SKLEARN:
+                    logger.warning("sklearn not available for PCA")
+                    return
+                reducer = PCA(n_components=n_components)
+                X = np.full((len(Z), n_components), np.nan)
+                X[valid_mask] = reducer.fit_transform(Z[valid_mask])
+                var_explained = reducer.explained_variance_ratio_
+                logger.info(f"Global PCA variance explained: {var_explained.round(3)}")
+            else:
+                # For non-linear methods, use reduce_latent_dimensionality
+                # Subsample if too large (>50k points) for manifold methods
+                Z_valid = Z[valid_mask]
+                max_fit = 50000
+                if Z_valid.shape[0] > max_fit:
+                    rng = np.random.RandomState(42)
+                    fit_idx = rng.choice(Z_valid.shape[0], max_fit, replace=False)
+                    Z_fit = Z_valid[fit_idx]
+                else:
+                    Z_fit = Z_valid
 
-        logger.info(f"Global PCA variance explained: {pca.explained_variance_ratio_.round(3)}")
+                # reshape to (1, N, D) as expected by reduce_latent_dimensionality
+                Z_3d = Z_fit[np.newaxis, :, :]
+                if HAS_TORCH:
+                    Z_tensor = torch.from_numpy(Z_3d).float()
+                    reduced, reducer = reduce_latent_dimensionality(
+                        Z_tensor,
+                        method=method,
+                        n_components=n_components,
+                        return_reducer=True,
+                    )
+                    reduced_flat = reduced[0]  # (N_fit, n_components)
+
+                    # Transform remaining points if subsampled and reducer supports it
+                    if Z_valid.shape[0] > max_fit and reducer is not None and hasattr(reducer, "transform"):
+                        all_reduced = reducer.transform(Z_valid)
+                    elif Z_valid.shape[0] <= max_fit:
+                        all_reduced = reduced_flat
+                    else:
+                        # Fallback: re-run on all data with PCA
+                        logger.info(f"{method} does not support transform; falling back to global PCA for full set")
+                        pca_fallback = PCA(n_components=n_components)
+                        all_reduced = pca_fallback.fit_transform(Z_valid)
+                else:
+                    # Fallback to PCA without torch
+                    if not HAS_SKLEARN:
+                        return
+                    pca_fallback = PCA(n_components=n_components)
+                    all_reduced = pca_fallback.fit_transform(Z_valid)
+
+                X = np.full((len(Z), n_components), np.nan)
+                X[valid_mask] = all_reduced
+
+            # Write results as pc1, pc2, pc3 (and gpc1, gpc2, gpc3 alias)
+            for i in range(n_components):
+                self.latent_df[f"pc{i + 1}"] = X[:, i]
+                self.latent_df[f"gpc{i + 1}"] = X[:, i]
+
+            logger.info(f"Applied global {method.upper()} dimensionality reduction ({n_valid} points)")
+
+        except Exception as e:
+            logger.warning(f"Global dimensionality reduction failed: {e}")
+            # Fallback to per-column PCA
+            self.latent_df = self._fit_pca(self.latent_df)
 
     def _detect_changepoints_all(self) -> None:
         """Detect changepoints for all samples with stored raw data."""
@@ -852,8 +871,14 @@ class TrajectoryAnalyzer:
         detector = create_changepoint_detector(algo="pelt", model="rbf")
 
         for guid, data in self.raw_data.items():
-            latent_mean = data.get("latent_mean")
-            fhr = data.get("fhr")
+            # Use first epoch for changepoint detection
+            epochs = data.get("epochs", [])
+            if not epochs:
+                continue
+
+            first_epoch = epochs[0]
+            latent_mean = first_epoch.get("latent_mean")
+            fhr = first_epoch.get("fhr")
 
             if latent_mean is None:
                 continue
@@ -883,8 +908,13 @@ class TrajectoryAnalyzer:
         all_segment_stats = []
 
         for guid, data in self.raw_data.items():
-            latent_mean = data.get("latent_mean")
-            epoch = data.get("epoch")
+            epochs = data.get("epochs", [])
+            if not epochs:
+                continue
+
+            first_epoch = epochs[0]
+            latent_mean = first_epoch.get("latent_mean")
+            epoch = first_epoch.get("epoch_sec")
 
             if latent_mean is None:
                 continue
@@ -906,6 +936,203 @@ class TrajectoryAnalyzer:
         self.segment_stats = all_segment_stats
         if self.segment_stats:
             logger.info(f"Computed segment statistics for {len(self.segment_stats)} samples")
+
+    # -------------------------------------------------------------------------
+    # GUID-level trajectory stitching & feature extraction
+    # -------------------------------------------------------------------------
+
+    def _build_guid_trajectories(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Stitch all epochs from each GUID into continuous time-ordered trajectories.
+
+        For each GUID:
+        1. Extract all rows from latent_df, sort by t_abs_sec
+        2. For overlapping timesteps (same t_abs_sec from 2 epochs), average latent vectors
+        3. Build unified time axis, latent array, and KLD series
+
+        Returns:
+            Dict[guid] -> {
+                "latent": (T_total, D), "kld": (T_total,), "time_axis": (T_total,),
+                "label": str, "n_epochs": int, "epoch_boundaries": List[int]
+            }
+        """
+        if self.latent_df is None or self.latent_df.empty:
+            return {}
+
+        z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
+        if not z_cols:
+            return {}
+
+        trajectories: Dict[str, Dict[str, Any]] = {}
+        has_kld = "kld" in self.latent_df.columns
+
+        for guid in self.latent_df["guid"].unique():
+            subset = self.latent_df[self.latent_df["guid"] == guid].copy()
+            if subset.empty:
+                continue
+
+            label = subset["label"].iloc[0]
+            n_epochs = int(subset["epoch_sec"].nunique())
+
+            # Average overlapping timesteps (same t_abs_sec from different epochs)
+            agg_cols = {c: "mean" for c in z_cols}
+            if has_kld:
+                agg_cols["kld"] = "mean"
+            # Also average PC columns if present
+            for pc_col in ["pc1", "pc2", "pc3"]:
+                if pc_col in subset.columns:
+                    agg_cols[pc_col] = "mean"
+
+            stitched = subset.groupby("t_abs_sec", as_index=False).agg(agg_cols)
+            stitched = stitched.sort_values("t_abs_sec").reset_index(drop=True)
+
+            latent_arr = stitched[z_cols].values  # (T_total, D)
+            time_axis = stitched["t_abs_sec"].values  # (T_total,)
+            kld_arr = stitched["kld"].values if has_kld else np.full(len(stitched), np.nan)
+
+            # Compute epoch boundaries (indices where new epochs start)
+            epoch_starts = sorted(subset["epoch_sec"].unique())
+            epoch_boundaries = []
+            for es in epoch_starts:
+                first_t = subset.loc[subset["epoch_sec"] == es, "t_abs_sec"].min()
+                idx_arr = np.searchsorted(time_axis, first_t)
+                epoch_boundaries.append(int(idx_arr))
+
+            trajectories[guid] = {
+                "latent": latent_arr,
+                "kld": kld_arr,
+                "time_axis": time_axis,
+                "label": label,
+                "n_epochs": n_epochs,
+                "epoch_boundaries": epoch_boundaries,
+            }
+
+        logger.info(f"Built stitched trajectories for {len(trajectories)} GUIDs")
+        return trajectories
+
+    def _extract_guid_features(self) -> pd.DataFrame:
+        """
+        For each GUID's stitched trajectory, compute shape metrics.
+
+        Returns:
+            DataFrame with columns: guid, label, n_epochs, duration_hours,
+            path_length, displacement, tortuosity, mean_speed, std_speed,
+            max_speed, mean_accel, mean_curvature, max_curvature, spread,
+            kld_mean, kld_std, kld_slope, kld_peak, kld_range
+        """
+        if not self.guid_trajectories:
+            return pd.DataFrame()
+
+        rows = []
+        for guid, traj_data in self.guid_trajectories.items():
+            latent = traj_data["latent"]
+            kld = traj_data["kld"]
+            time_axis = traj_data["time_axis"]
+
+            if latent.shape[0] < 2:
+                continue
+
+            # Compute shape metrics
+            features = compute_trajectory_features(
+                latent,
+                kld_series=kld,
+                dt=TIMESTEP_SECONDS,
+            )
+
+            duration_sec = float(time_axis[-1] - time_axis[0]) if len(time_axis) > 1 else 0.0
+
+            row = {
+                "guid": guid,
+                "label": traj_data["label"],
+                "n_epochs": traj_data["n_epochs"],
+                "duration_hours": duration_sec / 3600.0,
+            }
+            row.update(features)
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            logger.info(f"Extracted trajectory features for {len(df)} GUIDs")
+        return df
+
+    def _export_csvs(self) -> None:
+        """Export trajectory data as CSV files for external analysis.
+
+        Produces:
+        1. guid_trajectory_features.csv — One row per GUID with shape metrics + label
+        2. latent_trajectories_stitched.csv — Per-timestep stitched data
+        """
+        # 1. Per-GUID features
+        if self.guid_features_df is not None and not self.guid_features_df.empty:
+            feat_path = self.output_dir / "guid_trajectory_features.csv"
+            self.guid_features_df.to_csv(feat_path, index=False)
+            logger.info(f"Exported GUID features to {feat_path}")
+
+        # 2. Stitched per-timestep data
+        if self.guid_trajectories:
+            z_cols = [f"z{d}" for d in range(self.latent_dim)]
+            rows = []
+            for guid, traj_data in self.guid_trajectories.items():
+                latent = traj_data["latent"]
+                kld = traj_data["kld"]
+                time_axis = traj_data["time_axis"]
+                label = traj_data["label"]
+
+                for i in range(latent.shape[0]):
+                    row = {
+                        "guid": guid,
+                        "label": label,
+                        "t_abs_sec": float(time_axis[i]),
+                        "hours_before_birth": abs(float(time_axis[i])) / 3600.0,
+                        "kld": float(kld[i]) if np.isfinite(kld[i]) else np.nan,
+                    }
+                    for d in range(min(self.latent_dim, latent.shape[1])):
+                        row[f"z{d}"] = float(latent[i, d])
+
+                    # Add PC coordinates if available in latent_df
+                    rows.append(row)
+
+            if rows:
+                stitched_df = pd.DataFrame(rows)
+
+                # Merge PC coordinates from latent_df if available
+                if self.latent_df is not None and "pc1" in self.latent_df.columns:
+                    pc_cols = [c for c in ["pc1", "pc2", "pc3"] if c in self.latent_df.columns]
+                    # Get PC values by matching guid + t_abs_sec
+                    pc_data = self.latent_df.groupby(["guid", "t_abs_sec"], as_index=False)[pc_cols].mean()
+                    stitched_df = stitched_df.merge(pc_data, on=["guid", "t_abs_sec"], how="left")
+
+                stitched_path = self.output_dir / "latent_trajectories_stitched.csv"
+                stitched_df.to_csv(stitched_path, index=False)
+                logger.info(f"Exported stitched trajectories to {stitched_path} ({len(stitched_df)} rows)")
+
+    def _plot_recurrence_samples(self, n_samples: int = 5) -> None:
+        """Generate recurrence plots for representative GUID trajectories."""
+        if not self.guid_trajectories:
+            return
+
+        plots_dir = self.output_dir / "plots"
+
+        # Select GUIDs with most timesteps
+        guid_sizes = {g: d["latent"].shape[0] for g, d in self.guid_trajectories.items()}
+        top_guids = sorted(guid_sizes, key=guid_sizes.get, reverse=True)[:n_samples]
+
+        for guid in top_guids:
+            traj_data = self.guid_trajectories[guid]
+            latent = traj_data["latent"]
+            if latent.shape[0] < 10:
+                continue
+
+            try:
+                plot_recurrence(
+                    latent,
+                    plots_dir / f"recurrence_{guid}.pdf",
+                    sample_id=guid,
+                )
+            except Exception as e:
+                logger.debug(f"Recurrence plot failed for {guid}: {e}")
+
+        logger.info(f"Generated recurrence plots for {min(n_samples, len(top_guids))} GUIDs")
 
     def _plot_3d_trajectories(self, n_samples: int = 5) -> None:
         """Generate 3D trajectory plots for selected samples."""
@@ -1031,8 +1258,13 @@ class TrajectoryAnalyzer:
             if data is None:
                 continue
 
-            latent_mean = data.get("latent_mean")
-            fhr = data.get("fhr")
+            epochs = data.get("epochs", [])
+            if not epochs:
+                continue
+
+            first_epoch = epochs[0]
+            latent_mean = first_epoch.get("latent_mean")
+            fhr = first_epoch.get("fhr")
 
             if latent_mean is None or fhr is None:
                 continue

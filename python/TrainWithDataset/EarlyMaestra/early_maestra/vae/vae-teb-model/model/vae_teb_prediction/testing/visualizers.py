@@ -1700,13 +1700,13 @@ def plot_guid_absolute_trajectory(
     color_vals = sub[sort_col].to_numpy()
     points = X.reshape(-1, 1, 2)
     segs = np.concatenate([points[:-1], points[1:]], axis=1)
-    lc = LineCollection(segs, cmap="bwr", linewidths=1.6)
+    lc = LineCollection(segs, cmap="bwr", linewidths=2.0)
     lc.set_array(color_vals[:-1])
 
     fig, ax = plt.subplots(figsize=(7.6, 4.8))
     ax.add_collection(lc)
-    ax.scatter(X[0, 0], X[0, 1], s=50, marker="o", color=COLOR_GREEN, edgecolors=COLOR_BLACK, linewidth=0.4, label="Start")
-    ax.scatter(X[-1, 0], X[-1, 1], s=60, marker="X", color=COLOR_VERMILLION, edgecolors=COLOR_BLACK, linewidth=0.4, label="End")
+    ax.scatter(X[0, 0], X[0, 1], s=80, marker="o", color=COLOR_GREEN, edgecolors=COLOR_BLACK, linewidth=0.6, label="Start", zorder=5)
+    ax.scatter(X[-1, 0], X[-1, 1], s=90, marker="X", color=COLOR_VERMILLION, edgecolors=COLOR_BLACK, linewidth=0.6, label="End", zorder=5)
 
     if show_epoch_boundaries and "epoch_sec" in sub.columns:
         epochs = sub["epoch_sec"].to_numpy()
@@ -1781,7 +1781,7 @@ def plot_latent_trajectory_2d(
 
     fig, ax = plt.subplots(figsize=(7.0, 6.0))
 
-    # Color by time
+    # Color by time — bwr colormap: blue → white → red
     if color_by_time:
         colors = plt.cm.bwr(np.linspace(0, 1, time_steps))
         scatter = ax.scatter(
@@ -1806,22 +1806,22 @@ def plot_latent_trajectory_2d(
                 xytext=trajectory[i],
                 arrowprops=dict(
                     arrowstyle="->",
-                    lw=0.8,
+                    lw=1.0,
                     color=colors[i] if color_by_time else COLOR_BLUE,
-                    alpha=0.6,
+                    alpha=0.7,
                 ),
             )
 
     # Mark start and end
     ax.scatter(
         trajectory[0, 0], trajectory[0, 1],
-        c=COLOR_GREEN, s=50, marker="o", label="Start",
-        zorder=4, edgecolor=COLOR_BLACK, linewidth=0.4
+        c=COLOR_GREEN, s=80, marker="o", label="Start",
+        zorder=5, edgecolor=COLOR_BLACK, linewidth=0.6
     )
     ax.scatter(
         trajectory[-1, 0], trajectory[-1, 1],
-        c=COLOR_VERMILLION, s=50, marker="X", label="End",
-        zorder=4, edgecolor=COLOR_BLACK, linewidth=0.4
+        c=COLOR_VERMILLION, s=80, marker="X", label="End",
+        zorder=5, edgecolor=COLOR_BLACK, linewidth=0.6
     )
 
     if color_by_time:
@@ -1872,7 +1872,7 @@ def plot_latent_trajectory_3d(
     fig = plt.figure(figsize=(8.0, 7.0))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Color by time
+    # Color by time — bwr colormap: blue → white → red
     if color_by_time:
         scatter = ax.scatter(
             trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
@@ -1888,17 +1888,17 @@ def plot_latent_trajectory_3d(
     # Draw trajectory line
     ax.plot(
         trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
-        color=COLOR_BLUE, alpha=0.4, linewidth=0.5
+        color=COLOR_GRAY, alpha=0.5, linewidth=0.8
     )
 
     # Mark start and end
     ax.scatter(
         [trajectory[0, 0]], [trajectory[0, 1]], [trajectory[0, 2]],
-        c=COLOR_GREEN, s=50, marker="o", label="Start", depthshade=False
+        c=COLOR_GREEN, s=80, marker="o", label="Start", depthshade=False
     )
     ax.scatter(
         [trajectory[-1, 0]], [trajectory[-1, 1]], [trajectory[-1, 2]],
-        c=COLOR_VERMILLION, s=50, marker="X", label="End", depthshade=False
+        c=COLOR_VERMILLION, s=80, marker="X", label="End", depthshade=False
     )
 
     if color_by_time:
@@ -2321,4 +2321,137 @@ def plot_trajectory_comparison(
 
     fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_recurrence(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    threshold: Optional[float] = None,
+) -> None:
+    """
+    Plot a recurrence plot (pairwise distance matrix) for a single trajectory.
+
+    Reveals periodicity, attractor structure, and regime transitions.
+
+    Args:
+        trajectory: Array of shape (T, D) — latent trajectory points.
+        output_path: Path to save the figure.
+        sample_id: Label for the plot title.
+        threshold: If provided, binarize the distance matrix at this threshold.
+            If None, show continuous distances as a heatmap.
+    """
+    from scipy.spatial.distance import pdist, squareform
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    T = trajectory.shape[0]
+    if T < 3:
+        return
+
+    # Compute pairwise distance matrix
+    dist_matrix = squareform(pdist(trajectory, metric="euclidean"))
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+
+    if threshold is not None:
+        # Binary recurrence plot
+        recurrence = (dist_matrix <= threshold).astype(float)
+        im = ax.imshow(recurrence, cmap="Greys", origin="lower", aspect="equal")
+        _add_colorbar(fig, im, ax, label="Recurrence")
+    else:
+        # Continuous distance heatmap — inferno for high contrast
+        im = ax.imshow(dist_matrix, cmap="inferno", origin="lower", aspect="equal")
+        _add_colorbar(fig, im, ax, label="L2 distance")
+
+    ax.set_xlabel("Timestep", fontsize=FONT_LABEL)
+    ax.set_ylabel("Timestep", fontsize=FONT_LABEL)
+    ax.set_title(f"Recurrence Plot — {sample_id}", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    _style_axes(ax, grid="none", minor_ticks=False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_feature_boxplots(
+    df: pd.DataFrame,
+    feature_cols: list,
+    output_path: Path,
+    *,
+    class_col: str = "class",
+) -> None:
+    """
+    Box/violin plots of trajectory features grouped by class.
+
+    Args:
+        df: DataFrame with feature columns and a class column.
+        feature_cols: List of feature column names to plot.
+        output_path: Path to save the figure.
+        class_col: Column name for class labels.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_features = len(feature_cols)
+    if n_features == 0:
+        return
+
+    cols = 4
+    rows = math.ceil(n_features / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.8 * rows))
+    axes = np.atleast_2d(axes).reshape(-1)
+
+    classes = sorted(df[class_col].unique())
+    class_colors_map = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+    }
+
+    for idx, feat in enumerate(feature_cols):
+        ax = axes[idx]
+        if feat not in df.columns:
+            ax.set_visible(False)
+            continue
+
+        # Skip features with all NaN or inf
+        valid = df[feat].replace([np.inf, -np.inf], np.nan).dropna()
+        if valid.empty:
+            ax.set_visible(False)
+            continue
+
+        data_by_class = []
+        labels = []
+        colors = []
+        for cls in classes:
+            vals = df.loc[df[class_col] == cls, feat].replace([np.inf, -np.inf], np.nan).dropna().values
+            if vals.size > 0:
+                data_by_class.append(vals)
+                labels.append(cls)
+                colors.append(class_colors_map.get(cls.lower(), COLOR_BLUE))
+
+        if not data_by_class:
+            ax.set_visible(False)
+            continue
+
+        bp = ax.boxplot(data_by_class, labels=labels, patch_artist=True, widths=0.6)
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+
+        ax.set_title(feat, fontsize=FONT_LABEL, fontweight="normal")
+        ax.tick_params(axis="x", rotation=30, labelsize=FONT_TICK)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    # Hide unused axes
+    for idx in range(n_features, len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle("Trajectory Features by Class", fontsize=FONT_TITLE, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
