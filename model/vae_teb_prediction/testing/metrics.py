@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -503,3 +504,188 @@ def reduce_latent_dimensionality(
     if return_reducer:
         return reduced_data, reducer
     return reduced_data
+
+
+# -----------------------------------------------------------------------------
+# Trajectory Shape Metrics
+# -----------------------------------------------------------------------------
+
+def compute_trajectory_path_length(trajectory: np.ndarray) -> float:
+    """
+    Sum of consecutive L2 distances along a trajectory.
+
+    Args:
+        trajectory: Array of shape (T, D).
+
+    Returns:
+        Total path length (scalar).
+    """
+    if trajectory.shape[0] < 2:
+        return 0.0
+    diffs = np.diff(trajectory, axis=0)
+    return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+
+def compute_trajectory_displacement(trajectory: np.ndarray) -> float:
+    """
+    L2 norm of (last - first) point in trajectory.
+
+    Args:
+        trajectory: Array of shape (T, D).
+
+    Returns:
+        Displacement (scalar).
+    """
+    if trajectory.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(trajectory[-1] - trajectory[0]))
+
+
+def compute_trajectory_tortuosity(trajectory: np.ndarray) -> float:
+    """
+    Ratio of path length to displacement. Returns inf if displacement == 0.
+
+    Args:
+        trajectory: Array of shape (T, D).
+
+    Returns:
+        Tortuosity (scalar >= 1, or inf).
+    """
+    disp = compute_trajectory_displacement(trajectory)
+    if disp == 0:
+        return float("inf")
+    return compute_trajectory_path_length(trajectory) / disp
+
+
+def compute_trajectory_speed(trajectory: np.ndarray, dt: float = 1.0) -> np.ndarray:
+    """
+    Per-step speed along a trajectory.
+
+    Args:
+        trajectory: Array of shape (T, D).
+        dt: Time step between consecutive points.
+
+    Returns:
+        Speed array of shape (T-1,).
+    """
+    if trajectory.shape[0] < 2:
+        return np.array([])
+    diffs = np.diff(trajectory, axis=0)
+    return np.linalg.norm(diffs, axis=1) / dt
+
+
+def compute_trajectory_curvature(trajectory: np.ndarray) -> np.ndarray:
+    """
+    Angle (radians) between consecutive displacement vectors.
+
+    Args:
+        trajectory: Array of shape (T, D).
+
+    Returns:
+        Curvature array of shape (T-2,).
+    """
+    if trajectory.shape[0] < 3:
+        return np.array([])
+    diffs = np.diff(trajectory, axis=0)  # (T-1, D)
+    norms = np.linalg.norm(diffs, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-12, None)
+    unit_vecs = diffs / norms
+    # Dot product of consecutive unit vectors
+    dots = np.sum(unit_vecs[:-1] * unit_vecs[1:], axis=1)
+    dots = np.clip(dots, -1.0, 1.0)
+    return np.arccos(dots)
+
+
+def compute_trajectory_spread(trajectory: np.ndarray) -> float:
+    """
+    Log-determinant of the covariance matrix of trajectory points.
+
+    Measures how spread out the trajectory is in latent space.
+
+    Args:
+        trajectory: Array of shape (T, D).
+
+    Returns:
+        Log-determinant of covariance (scalar). Returns -inf if singular.
+    """
+    if trajectory.shape[0] < trajectory.shape[1] + 1:
+        return float("-inf")
+    cov = np.cov(trajectory, rowvar=False)
+    sign, logdet = np.linalg.slogdet(cov)
+    if sign <= 0:
+        return float("-inf")
+    return float(logdet)
+
+
+def compute_trajectory_features(
+    trajectory: np.ndarray,
+    kld_series: Optional[np.ndarray] = None,
+    dt: float = 4.0,
+) -> Dict[str, float]:
+    """
+    Compute all shape metrics for a single trajectory.
+
+    Args:
+        trajectory: Array of shape (T, D) — latent trajectory.
+        kld_series: Optional array of shape (T,) — per-timestep KLD values.
+        dt: Time step in seconds between consecutive latent points.
+
+    Returns:
+        Dict with keys: path_length, displacement, tortuosity, mean_speed,
+        std_speed, max_speed, mean_accel, mean_curvature, max_curvature,
+        spread, kld_mean, kld_std, kld_slope, kld_peak, kld_range.
+    """
+    features: Dict[str, float] = {}
+
+    # Shape metrics
+    features["path_length"] = compute_trajectory_path_length(trajectory)
+    features["displacement"] = compute_trajectory_displacement(trajectory)
+    features["tortuosity"] = compute_trajectory_tortuosity(trajectory)
+
+    speed = compute_trajectory_speed(trajectory, dt=dt)
+    if speed.size > 0:
+        features["mean_speed"] = float(np.mean(speed))
+        features["std_speed"] = float(np.std(speed))
+        features["max_speed"] = float(np.max(speed))
+        # Acceleration = diff of speed
+        accel = np.diff(speed) / dt
+        features["mean_accel"] = float(np.mean(np.abs(accel))) if accel.size > 0 else 0.0
+    else:
+        features["mean_speed"] = 0.0
+        features["std_speed"] = 0.0
+        features["max_speed"] = 0.0
+        features["mean_accel"] = 0.0
+
+    curvature = compute_trajectory_curvature(trajectory)
+    if curvature.size > 0:
+        features["mean_curvature"] = float(np.mean(curvature))
+        features["max_curvature"] = float(np.max(curvature))
+    else:
+        features["mean_curvature"] = 0.0
+        features["max_curvature"] = 0.0
+
+    features["spread"] = compute_trajectory_spread(trajectory)
+
+    # KLD features
+    if kld_series is not None:
+        valid_kld = kld_series[np.isfinite(kld_series)]
+        if valid_kld.size > 0:
+            features["kld_mean"] = float(np.mean(valid_kld))
+            features["kld_std"] = float(np.std(valid_kld))
+            features["kld_peak"] = float(np.max(valid_kld))
+            features["kld_range"] = float(np.max(valid_kld) - np.min(valid_kld))
+            # Linear trend (slope)
+            if valid_kld.size > 1:
+                x = np.arange(valid_kld.size, dtype=float)
+                slope, _ = np.polyfit(x, valid_kld, 1)
+                features["kld_slope"] = float(slope)
+            else:
+                features["kld_slope"] = 0.0
+        else:
+            for k in ("kld_mean", "kld_std", "kld_slope", "kld_peak", "kld_range"):
+                features[k] = float("nan")
+    else:
+        for k in ("kld_mean", "kld_std", "kld_slope", "kld_peak", "kld_range"):
+            features[k] = float("nan")
+
+    return features
