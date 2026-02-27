@@ -630,6 +630,149 @@ def plot_latent_trajectory_3d_interactive(
     return fig
 
 
+def plot_guid_trajectory_3d_interactive(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "guid",
+    time_axis: Optional[np.ndarray] = None,
+    epoch_boundaries: Optional[List[int]] = None,
+    point_size: int = 4,
+    line_width: int = 2,
+) -> Optional[go.Figure]:
+    """
+    Create an interactive 3D plot for a full stitched GUID-level trajectory.
+
+    Color by time_axis (hours before birth) using RdBu_r colorscale.
+    Epoch boundaries are marked with separate diamond traces.
+
+    Args:
+        trajectory: Stitched trajectory array of shape (T_total, 3).
+        output_path: Path to save HTML file.
+        sample_id: GUID identifier for the title.
+        time_axis: Absolute time values (T_total,) in seconds. Color by hours.
+        epoch_boundaries: Indices where new epochs start.
+        point_size: Size of trajectory points.
+        line_width: Width of trajectory line.
+
+    Returns:
+        Plotly Figure object, or None if plotting fails.
+    """
+    _check_plotly()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+    if trajectory.shape[1] < 3:
+        return None
+
+    T = trajectory.shape[0]
+
+    # Color values
+    if time_axis is not None and len(time_axis) == T:
+        color_vals = np.abs(time_axis) / 3600.0
+        cbar_title = "Hours before birth"
+        hover_texts = [f"Time: {cv:.2f}h before birth" for cv in color_vals]
+    else:
+        color_vals = np.arange(T, dtype=float)
+        cbar_title = "Time Step"
+        hover_texts = [f"Time step: {i}" for i in range(T)]
+
+    # Main trajectory trace
+    main_trace = go.Scatter3d(
+        x=trajectory[:, 0],
+        y=trajectory[:, 1],
+        z=trajectory[:, 2],
+        mode="markers+lines",
+        marker=dict(
+            size=point_size,
+            color=color_vals,
+            colorscale="RdBu_r",
+            showscale=True,
+            colorbar=dict(
+                title=cbar_title,
+                x=1.05,
+                xanchor="left",
+                thickness=15,
+                len=0.7,
+            ),
+        ),
+        line=dict(color="rgba(100, 100, 100, 0.4)", width=line_width),
+        text=hover_texts,
+        hovertemplate="%{text}<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>",
+        name="Trajectory",
+        showlegend=True,
+    )
+
+    traces = [main_trace]
+
+    # Epoch boundary markers
+    if epoch_boundaries:
+        valid_eb = [eb for eb in epoch_boundaries if 0 <= eb < T]
+        if valid_eb:
+            eb_trace = go.Scatter3d(
+                x=trajectory[valid_eb, 0],
+                y=trajectory[valid_eb, 1],
+                z=trajectory[valid_eb, 2],
+                mode="markers",
+                marker=dict(size=6, color="#393E46", symbol="diamond", opacity=0.7),
+                name="Epoch boundary",
+                hovertemplate="Epoch boundary<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>",
+            )
+            traces.append(eb_trace)
+
+    # Start marker
+    traces.append(go.Scatter3d(
+        x=[trajectory[0, 0]], y=[trajectory[0, 1]], z=[trajectory[0, 2]],
+        mode="markers",
+        marker=dict(size=10, color="#609966", symbol="circle"),
+        name="Start",
+        hovertemplate="START<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>",
+    ))
+
+    # End marker
+    traces.append(go.Scatter3d(
+        x=[trajectory[-1, 0]], y=[trajectory[-1, 1]], z=[trajectory[-1, 2]],
+        mode="markers",
+        marker=dict(size=10, color="#EB5B00", symbol="x"),
+        name="End",
+        hovertemplate="END<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>",
+    ))
+
+    n_epochs = len(epoch_boundaries) if epoch_boundaries else 1
+    if time_axis is not None and len(time_axis) > 1:
+        hours = abs(float(time_axis[-1]) - float(time_axis[0])) / 3600.0
+    else:
+        hours = T * 4.0 / 3600.0
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=dict(
+            text=f"GUID Trajectory 3D - {sample_id} ({n_epochs} epochs, {hours:.1f}h)",
+            x=0.5,
+        ),
+        scene=dict(
+            xaxis_title="PC1",
+            yaxis_title="PC2",
+            zaxis_title="PC3",
+            aspectmode="data",
+        ),
+        width=1200,
+        height=900,
+        legend=dict(
+            x=0.02, y=0.98,
+            xanchor="left", yanchor="top",
+            bgcolor="rgba(255, 255, 255, 0.8)",
+            bordercolor="black", borderwidth=1,
+        ),
+    )
+
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    return fig
+
+
 def plot_kld_trajectory_3d_interactive(
     trajectory: np.ndarray,
     output_path: Path,
@@ -907,6 +1050,155 @@ def plot_fhr_timeline(
         linecolor="black",
         mirror=True,
     )
+
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+
+
+def plot_fhr_up_timeline(
+    fhr: np.ndarray,
+    up: Optional[np.ndarray],
+    epoch: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "sample",
+    sampling_rate_hz: float = 4.0,
+    changepoint_times: Optional[np.ndarray] = None,
+    width: int = 2000,
+    height: int = 700,
+) -> None:
+    """
+    Plot interactive FHR+UP timeline with gap-aware epochs and optional changepoints.
+
+    Creates a 2-row subplot (FHR top, UP bottom) if UP is available,
+    otherwise a single FHR row. Each epoch is a separate trace to prevent
+    line connections across temporal gaps.
+
+    Args:
+        fhr: FHR signals of shape (N, T) — one per epoch.
+        up: UP signals of shape (N, T) — one per epoch, or None.
+        epoch: Epoch values of shape (N,) — seconds before birth per epoch.
+        output_path: Path to save HTML file.
+        sample_id: Patient identifier for the title.
+        sampling_rate_hz: Sampling rate in Hz (default 4.0).
+        changepoint_times: Times (in minutes before birth) to draw as vertical lines.
+        width: Figure width in pixels.
+        height: Figure height in pixels.
+    """
+    _check_plotly()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Handle tensor conversion
+    if hasattr(fhr, "cpu"):
+        fhr = fhr.cpu().numpy()
+    if up is not None and hasattr(up, "cpu"):
+        up = up.cpu().numpy()
+    if hasattr(epoch, "cpu"):
+        epoch = epoch.cpu().numpy()
+
+    fhr = np.asarray(fhr)
+    epoch = np.asarray(epoch)
+
+    if fhr.ndim == 1:
+        fhr = fhr[None, :]
+        epoch = np.array([epoch]) if epoch.ndim == 0 else epoch[:1]
+    if up is not None:
+        up = np.asarray(up)
+        if up.ndim == 1:
+            up = up[None, :]
+
+    has_up = up is not None and up.shape[0] > 0
+    n_rows = 2 if has_up else 1
+    fig = make_subplots(
+        rows=n_rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=["FHR", "UP"] if has_up else ["FHR"],
+    )
+
+    batch_size, time_steps = fhr.shape
+    time_per_step = 1.0 / sampling_rate_hz
+
+    # Plot each epoch as separate trace
+    for i in range(batch_size):
+        seg_start_min = float(epoch[i]) / 60.0
+        seg_times = seg_start_min + np.arange(time_steps) * time_per_step / 60.0
+
+        # FHR trace
+        fig.add_trace(
+            go.Scatter(
+                x=seg_times, y=fhr[i],
+                mode="lines",
+                name="FHR" if i == 0 else None,
+                legendgroup="FHR",
+                showlegend=(i == 0),
+                line=dict(color="#EB5B00", width=1.5),
+                hovertemplate=f"Epoch {i}, Time: %{{x:.2f}} min, FHR: %{{y:.1f}}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
+
+        # UP trace
+        if has_up and i < up.shape[0]:
+            fig.add_trace(
+                go.Scatter(
+                    x=seg_times, y=up[i],
+                    mode="lines",
+                    name="UP" if i == 0 else None,
+                    legendgroup="UP",
+                    showlegend=(i == 0),
+                    line=dict(color="#3498DB", width=1.5),
+                    hovertemplate=f"Epoch {i}, Time: %{{x:.2f}} min, UP: %{{y:.1f}}<extra></extra>",
+                ),
+                row=2, col=1,
+            )
+
+    # Changepoint overlay
+    if changepoint_times is not None and len(changepoint_times) > 0:
+        for cp_t in changepoint_times:
+            for r in range(1, n_rows + 1):
+                fig.add_vline(
+                    x=float(cp_t), row=r, col=1,
+                    line=dict(color="#609966", width=2, dash="dash"),
+                    opacity=0.6,
+                )
+        # Legend entry for changepoints
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None], mode="lines",
+                name="Changepoints",
+                line=dict(color="#609966", width=2, dash="dash"),
+                showlegend=True,
+            ),
+            row=1, col=1,
+        )
+
+    fig.update_layout(
+        title=dict(text=f"FHR + UP Timeline - {sample_id}", font=dict(size=18)),
+        width=width,
+        height=height,
+        showlegend=True,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+
+    fig.update_xaxes(
+        title_text="Time (minutes before birth)",
+        gridcolor="#EEEEEE", showgrid=True,
+        showline=True, linewidth=2, linecolor="black", mirror=True,
+        row=n_rows, col=1,
+    )
+    for r in range(1, n_rows + 1):
+        label = "FHR (normalized)" if r == 1 else "UP (normalized)"
+        fig.update_yaxes(
+            title_text=label,
+            gridcolor="lightgray", showgrid=True,
+            showline=True, linewidth=2, linecolor="black", mirror=True,
+            row=r, col=1,
+        )
 
     fig.write_html(str(output_path), include_plotlyjs="cdn")
 

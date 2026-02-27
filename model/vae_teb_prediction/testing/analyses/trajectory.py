@@ -48,6 +48,7 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_kld_guid_trajectory,
     plot_kld_trajectory_3d,
     plot_guid_absolute_trajectory,
+    plot_guid_trajectory_3d,
     plot_latent_trajectory_2d,
     plot_latent_trajectory_3d,
     plot_latent_changepoints_with_raw,
@@ -79,6 +80,8 @@ try:
         plot_latent_trajectory_3d_interactive,
         plot_kld_trajectory_3d_interactive,
         plot_fhr_timeline,
+        plot_fhr_up_timeline,
+        plot_guid_trajectory_3d_interactive,
         plot_trajectory_animation,
         plot_trajectory_comparison_interactive,
     )
@@ -128,6 +131,8 @@ class TrajectoryAnalyzer:
         plot_3d: bool = True,
         plot_animations: bool = False,
         decimation_factor: int = 16,
+        changepoint_algo: str = "pelt",
+        preprocess_latent_trajectories: bool = False,
     ):
         """
         Initialize the trajectory analyzer.
@@ -145,6 +150,10 @@ class TrajectoryAnalyzer:
             plot_3d: Whether to generate 3D trajectory plots.
             plot_animations: Whether to generate trajectory animations (slower).
             decimation_factor: Ratio between raw signal and latent lengths.
+            changepoint_algo: Changepoint detection algorithm
+                ('pelt', 'binseg', 'bottomup', 'window', 'dynp', 'gradient').
+            preprocess_latent_trajectories: If True, apply robust normalization
+                and optional denoising to latent z-columns before analysis.
         """
         self.runner = runner
         self.loader = loader
@@ -162,6 +171,8 @@ class TrajectoryAnalyzer:
         self.plot_3d = plot_3d
         self.plot_animations = plot_animations
         self.decimation_factor = decimation_factor
+        self.changepoint_algo = changepoint_algo
+        self.preprocess_latent_trajectories = preprocess_latent_trajectories
 
         # Class configuration
         self.class_names = class_names or ["healthy", "acidosis", "HIE"]
@@ -177,6 +188,7 @@ class TrajectoryAnalyzer:
         (self.output_dir / "plots").mkdir(exist_ok=True)
         (self.output_dir / "dashboards").mkdir(exist_ok=True)
         (self.output_dir / "changepoint_analysis").mkdir(exist_ok=True)
+        (self.output_dir / "npy").mkdir(exist_ok=True)
         if plot_animations:
             (self.output_dir / "animations").mkdir(exist_ok=True)
 
@@ -234,6 +246,10 @@ class TrajectoryAnalyzer:
             logger.warning("No trajectory data collected!")
             return {"status": "empty", "n_samples": 0}
 
+        # Step 1b: Optional latent preprocessing
+        if self.preprocess_latent_trajectories:
+            self._preprocess_latents()
+
         # Step 2: Add dynamics
         self.latent_df = self._add_dynamics(self.latent_df)
 
@@ -251,7 +267,7 @@ class TrajectoryAnalyzer:
             self._detect_changepoints_all()
             self._compute_segment_statistics()
 
-        # Step 5: Save data + export CSVs
+        # Step 5: Save data + export CSVs (including NPY)
         self.latent_df.to_parquet(self.output_dir / "latent_trajectories.parquet")
         self.epoch_df.to_parquet(self.output_dir / "epoch_summary.parquet")
         self._export_csvs()
@@ -265,26 +281,31 @@ class TrajectoryAnalyzer:
         self._plot_guid_absolute_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
         self._plot_recurrence_samples(n_samples=min(5, n_trajectory_samples))
 
-        # Generate 3D trajectory plots
+        # Step 7: 3D trajectory plots (per-epoch + GUID-level)
         if self.plot_3d:
             self._plot_3d_trajectories(n_samples=n_trajectory_samples)
+            self._plot_guid_3d_trajectories(n_samples=n_trajectory_samples)
             self._plot_kld_3d_trajectories(n_samples=n_trajectory_samples)
 
-        # Plot changepoint analysis
+        # Step 8: Changepoint analysis plots
         if HAS_CHANGEPOINT and self.changepoint_results:
             self._plot_changepoints_with_raw(n_samples=n_trajectory_samples)
             if self.segment_stats:
                 self._plot_segment_stats()
 
-        # Step 7: Dashboards
+        # Step 9: Dashboards
         if not skip_dashboards:
             self._generate_dashboards(n_dashboards)
 
-        # Step 8: Generate animations (if enabled)
+        # Step 10: Generate animations (if enabled)
         if self.plot_animations and HAS_INTERACTIVE:
             self._generate_trajectory_animations(n_samples=min(3, n_trajectory_samples))
 
-        # Step 9: Compare class trajectories
+        # Step 10b: FHR+UP timelines
+        if HAS_INTERACTIVE:
+            self._plot_fhr_up_timelines(n_samples=min(5, n_trajectory_samples))
+
+        # Step 11: Compare class trajectories
         if class_analysis and HAS_INTERACTIVE:
             self._compare_class_trajectories()
 
@@ -393,12 +414,17 @@ class TrajectoryAnalyzer:
                     elif hasattr(batch, "fhr_st") and batch.fhr_st is not None:
                         fhr_signal = batch.fhr_st[idx].cpu().numpy().flatten() if hasattr(batch.fhr_st, 'cpu') else np.asarray(batch.fhr_st[idx]).flatten()
 
+                    up_signal = None
+                    if hasattr(batch, "up") and batch.up is not None:
+                        up_signal = batch.up[idx].cpu().numpy().flatten() if hasattr(batch.up, 'cpu') else np.asarray(batch.up[idx]).flatten()
+
                     if guid not in self.raw_data:
                         self.raw_data[guid] = {"epochs": [], "label": label}
 
                     self.raw_data[guid]["epochs"].append({
                         "latent_mean": latent_np[idx],       # (T, D)
                         "fhr": fhr_signal,
+                        "up": up_signal,
                         "epoch_sec": epoch_sec,
                         "kld_timestep": kld[idx] if kld is not None else None,
                     })
@@ -417,6 +443,51 @@ class TrajectoryAnalyzer:
 
         logger.info(f"Collected {len(epoch_df)} epochs from {len(valid_guids)} patients")
         return latent_df, epoch_df
+
+    def _preprocess_latents(self) -> None:
+        """Apply robust normalization + optional denoising to latent z-columns.
+
+        Groups latent_df by (guid, epoch_sec), normalizes each group's z-columns
+        using preprocess_latent() from metrics.py, and updates both latent_df
+        and raw_data in place.
+        """
+        if self.latent_df is None or self.latent_df.empty:
+            return
+
+        z_cols = [f"z{d}" for d in range(self.latent_dim) if f"z{d}" in self.latent_df.columns]
+        if not z_cols:
+            return
+
+        if not HAS_TORCH:
+            logger.warning("torch not available, skipping latent preprocessing")
+            return
+
+        processed_count = 0
+
+        for (guid, epoch_sec), group in self.latent_df.groupby(["guid", "epoch_sec"]):
+            Z = group[z_cols].values  # (T, D)
+            Z_tensor = torch.from_numpy(Z[np.newaxis, :, :]).float()  # (1, T, D)
+
+            try:
+                Z_processed = preprocess_latent(Z_tensor)  # (1, T, D)
+                Z_out = Z_processed[0].numpy()  # (T, D)
+
+                # Update latent_df in place
+                for d, col in enumerate(z_cols):
+                    self.latent_df.loc[group.index, col] = Z_out[:, d]
+
+                # Update raw_data
+                if guid in self.raw_data:
+                    for ep in self.raw_data[guid]["epochs"]:
+                        if ep.get("epoch_sec") == epoch_sec:
+                            ep["latent_mean"] = Z_out
+                            break
+
+                processed_count += 1
+            except Exception as e:
+                logger.debug(f"Preprocessing failed for {guid} epoch {epoch_sec}: {e}")
+
+        logger.info(f"Preprocessed latents for {processed_count} (guid, epoch) groups")
 
     def _get_label_name(self, batch: Any, idx: int) -> str:
         """Convert numeric label to class name."""
@@ -868,40 +939,43 @@ class TrajectoryAnalyzer:
             logger.debug("No raw data stored for changepoint detection")
             return
 
-        detector = create_changepoint_detector(algo="pelt", model="rbf")
+        detector = create_changepoint_detector(algo=self.changepoint_algo, model="rbf")
 
         for guid, data in self.raw_data.items():
-            # Use first epoch for changepoint detection
             epochs = data.get("epochs", [])
             if not epochs:
                 continue
 
-            first_epoch = epochs[0]
-            latent_mean = first_epoch.get("latent_mean")
-            fhr = first_epoch.get("fhr")
+            guid_cp_results = []
+            for epoch_data in epochs:
+                latent_mean = epoch_data.get("latent_mean")
+                fhr = epoch_data.get("fhr")
 
-            if latent_mean is None:
-                continue
+                if latent_mean is None:
+                    continue
 
-            try:
-                cp_result = detect_changepoints(
-                    latent_sample=latent_mean,
-                    n_changepoints=self.n_changepoints,
-                    decimation_factor=self.decimation_factor,
-                    raw_signal=fhr,
-                    detect_raw=(fhr is not None),
-                    detector=detector,
-                )
-                self.changepoint_results[guid] = cp_result
-            except Exception as e:
-                logger.debug(f"Changepoint detection failed for {guid}: {e}")
-                continue
+                try:
+                    cp_result = detect_changepoints(
+                        latent_sample=latent_mean,
+                        n_changepoints=self.n_changepoints,
+                        decimation_factor=self.decimation_factor,
+                        raw_signal=fhr,
+                        detect_raw=(fhr is not None),
+                        detector=detector,
+                    )
+                    cp_result["epoch_sec"] = epoch_data.get("epoch_sec")
+                    guid_cp_results.append(cp_result)
+                except Exception as e:
+                    logger.debug(f"Changepoint detection failed for {guid}: {e}")
+
+            if guid_cp_results:
+                self.changepoint_results[guid] = guid_cp_results
 
         if self.changepoint_results:
-            logger.info(f"Detected changepoints for {len(self.changepoint_results)} samples")
+            logger.info(f"Detected changepoints for {len(self.changepoint_results)} GUIDs")
 
     def _compute_segment_statistics(self) -> None:
-        """Compute per-segment statistics after changepoint detection."""
+        """Compute per-segment statistics after changepoint detection (all epochs)."""
         if not HAS_CHANGEPOINT or not self.raw_data:
             return
 
@@ -909,33 +983,34 @@ class TrajectoryAnalyzer:
 
         for guid, data in self.raw_data.items():
             epochs = data.get("epochs", [])
-            if not epochs:
-                continue
+            cp_results = self.changepoint_results.get(guid, [])
 
-            first_epoch = epochs[0]
-            latent_mean = first_epoch.get("latent_mean")
-            epoch = first_epoch.get("epoch_sec")
+            for epoch_idx, epoch_data in enumerate(epochs):
+                latent_mean = epoch_data.get("latent_mean")
+                epoch_sec = epoch_data.get("epoch_sec")
 
-            if latent_mean is None:
-                continue
+                if latent_mean is None:
+                    continue
 
-            try:
-                stats = summarize_latent_segments(
-                    latent_mean=latent_mean[np.newaxis, :, :] if latent_mean.ndim == 2 else latent_mean,
-                    epoch=np.array([epoch]) if epoch is not None else None,
-                    sample_ids=[guid],
-                    n_changepoints=self.n_changepoints,
-                    decimation_factor=self.decimation_factor,
-                    precomputed_changepoints=self.changepoint_results.get(guid),
-                )
-                all_segment_stats.extend(stats)
-            except Exception as e:
-                logger.debug(f"Segment statistics failed for {guid}: {e}")
-                continue
+                precomputed = cp_results[epoch_idx] if epoch_idx < len(cp_results) else None
+
+                try:
+                    stats = summarize_latent_segments(
+                        latent_mean=latent_mean[np.newaxis, :, :] if latent_mean.ndim == 2 else latent_mean,
+                        epoch=np.array([epoch_sec]) if epoch_sec is not None else None,
+                        sample_ids=[f"{guid}_ep{epoch_idx}"],
+                        n_changepoints=self.n_changepoints,
+                        decimation_factor=self.decimation_factor,
+                        precomputed_changepoints=precomputed,
+                    )
+                    all_segment_stats.extend(stats)
+                except Exception as e:
+                    logger.debug(f"Segment statistics failed for {guid} ep{epoch_idx}: {e}")
+                    continue
 
         self.segment_stats = all_segment_stats
         if self.segment_stats:
-            logger.info(f"Computed segment statistics for {len(self.segment_stats)} samples")
+            logger.info(f"Computed segment statistics for {len(self.segment_stats)} epoch(s)")
 
     # -------------------------------------------------------------------------
     # GUID-level trajectory stitching & feature extraction
@@ -1106,6 +1181,16 @@ class TrajectoryAnalyzer:
                 stitched_df.to_csv(stitched_path, index=False)
                 logger.info(f"Exported stitched trajectories to {stitched_path} ({len(stitched_df)} rows)")
 
+        # 3. Export NPY arrays for each GUID trajectory
+        if self.guid_trajectories:
+            npy_dir = self.output_dir / "npy"
+            npy_dir.mkdir(exist_ok=True)
+            for guid, traj_data in self.guid_trajectories.items():
+                np.save(npy_dir / f"{guid}_latent.npy", traj_data["latent"])
+                np.save(npy_dir / f"{guid}_kld.npy", traj_data["kld"])
+                np.save(npy_dir / f"{guid}_time.npy", traj_data["time_axis"])
+            logger.info(f"Exported NPY arrays for {len(self.guid_trajectories)} GUIDs to {npy_dir}")
+
     def _plot_recurrence_samples(self, n_samples: int = 5) -> None:
         """Generate recurrence plots for representative GUID trajectories."""
         if not self.guid_trajectories:
@@ -1245,15 +1330,198 @@ class TrajectoryAnalyzer:
 
         logger.info(f"Generated KLD 3D trajectory plots for {min(n_samples, len(top_samples))} samples")
 
+    def _plot_guid_3d_trajectories(
+        self, n_samples: int = 12, guid_list: Optional[List[str]] = None,
+    ) -> None:
+        """Generate 3D trajectory plots for stitched GUID-level trajectories."""
+        if not self.guid_trajectories:
+            return
+
+        plots_dir = self.output_dir / "plots"
+
+        # Select GUIDs
+        if guid_list:
+            selected = [g for g in guid_list if g in self.guid_trajectories]
+        else:
+            guid_sizes = {g: d["latent"].shape[0] for g, d in self.guid_trajectories.items()}
+            selected = sorted(guid_sizes, key=guid_sizes.get, reverse=True)[:n_samples]
+
+        for guid in selected:
+            traj_data = self.guid_trajectories[guid]
+            time_axis = traj_data["time_axis"]
+            epoch_boundaries = traj_data.get("epoch_boundaries", [])
+
+            # Build 3D coordinates from globally fitted PCs
+            subset = self.latent_df[self.latent_df["guid"] == guid].copy()
+            if subset.empty or "pc1" not in subset.columns or "pc3" not in subset.columns:
+                continue
+
+            # Average overlapping timesteps, sort by t_abs_sec
+            stitched = (
+                subset.groupby("t_abs_sec", as_index=False)[["pc1", "pc2", "pc3"]].mean()
+                .sort_values("t_abs_sec")
+                .reset_index(drop=True)
+            )
+
+            if len(stitched) < 5:
+                continue
+
+            traj_3d = stitched[["pc1", "pc2", "pc3"]].values
+            t_axis = stitched["t_abs_sec"].values
+
+            # Static matplotlib plot
+            try:
+                from model.vae_teb_prediction.testing.visualizers import plot_guid_trajectory_3d
+                plot_guid_trajectory_3d(
+                    traj_3d,
+                    plots_dir / f"guid_trajectory_3d_{guid}.pdf",
+                    sample_id=guid,
+                    time_axis=t_axis,
+                    epoch_boundaries=epoch_boundaries,
+                )
+            except Exception as e:
+                logger.debug(f"GUID 3D static plot failed for {guid}: {e}")
+
+            # Interactive Plotly plot
+            if HAS_INTERACTIVE:
+                try:
+                    from model.vae_teb_prediction.testing.visualizers_interactive import (
+                        plot_guid_trajectory_3d_interactive,
+                    )
+                    plot_guid_trajectory_3d_interactive(
+                        traj_3d,
+                        plots_dir / f"guid_trajectory_3d_{guid}.html",
+                        sample_id=guid,
+                        time_axis=t_axis,
+                        epoch_boundaries=epoch_boundaries,
+                    )
+                except Exception as e:
+                    logger.debug(f"GUID 3D interactive plot failed for {guid}: {e}")
+
+            # Animation (optional)
+            if self.plot_animations and HAS_INTERACTIVE:
+                try:
+                    animations_dir = self.output_dir / "animations"
+                    animations_dir.mkdir(exist_ok=True)
+                    plot_trajectory_animation(
+                        traj_3d,
+                        animations_dir / f"guid_trajectory_{guid}.gif",
+                        sample_id=guid,
+                        fps=15,
+                        duration_seconds=5.0,
+                    )
+                except Exception as e:
+                    logger.debug(f"GUID animation failed for {guid}: {e}")
+
+        logger.info(f"Generated GUID-level 3D trajectory plots for {len(selected)} GUIDs")
+
+    def _plot_fhr_up_timelines(
+        self, n_samples: int = 5, guid_list: Optional[List[str]] = None,
+    ) -> None:
+        """Generate interactive FHR+UP timelines for selected GUIDs."""
+        if not HAS_INTERACTIVE or not self.raw_data:
+            return
+
+        plots_dir = self.output_dir / "plots"
+
+        # Select GUIDs with most epochs
+        if guid_list:
+            selected = [g for g in guid_list if g in self.raw_data]
+        else:
+            guid_epoch_counts = {g: len(d["epochs"]) for g, d in self.raw_data.items()}
+            selected = sorted(guid_epoch_counts, key=guid_epoch_counts.get, reverse=True)[:n_samples]
+
+        for guid in selected:
+            data = self.raw_data[guid]
+            epochs = data.get("epochs", [])
+            if not epochs:
+                continue
+
+            # Sort epochs by epoch_sec
+            sorted_epochs = sorted(epochs, key=lambda e: e.get("epoch_sec", 0))
+
+            # Stack FHR and UP arrays
+            fhr_list = []
+            up_list = []
+            epoch_secs = []
+            has_up = False
+
+            for ep in sorted_epochs:
+                fhr = ep.get("fhr")
+                if fhr is None:
+                    continue
+                fhr_flat = fhr.flatten()
+                fhr_list.append(fhr_flat)
+                epoch_secs.append(ep.get("epoch_sec", 0))
+
+                up = ep.get("up")
+                if up is not None:
+                    up_list.append(up.flatten())
+                    has_up = True
+                else:
+                    up_list.append(np.zeros_like(fhr_flat))
+
+            if not fhr_list:
+                continue
+
+            # Ensure consistent shape by padding/truncating to max length
+            max_len = max(f.shape[0] for f in fhr_list)
+            fhr_arr = np.zeros((len(fhr_list), max_len))
+            up_arr = np.zeros((len(up_list), max_len)) if has_up else None
+
+            for i, f in enumerate(fhr_list):
+                fhr_arr[i, :f.shape[0]] = f
+            if has_up:
+                for i, u in enumerate(up_list):
+                    up_arr[i, :u.shape[0]] = u
+
+            epoch_arr = np.array(epoch_secs)
+
+            # Gather changepoint times if available
+            cp_times = None
+            cp_results = self.changepoint_results.get(guid, [])
+            if cp_results:
+                cp_time_list = []
+                for cp_r in cp_results:
+                    ep_sec = cp_r.get("epoch_sec", 0) or 0
+                    raw_cps = cp_r.get("raw_changepoints", np.array([]))
+                    if len(raw_cps) > 0:
+                        # Convert raw indices to minutes
+                        for rc in raw_cps:
+                            cp_min = (ep_sec + rc / 4.0) / 60.0
+                            cp_time_list.append(cp_min)
+                if cp_time_list:
+                    cp_times = np.array(cp_time_list)
+
+            try:
+                from model.vae_teb_prediction.testing.visualizers_interactive import (
+                    plot_fhr_up_timeline,
+                )
+                plot_fhr_up_timeline(
+                    fhr=fhr_arr,
+                    up=up_arr,
+                    epoch=epoch_arr,
+                    output_path=plots_dir / f"fhr_up_timeline_{guid}.html",
+                    sample_id=guid,
+                    changepoint_times=cp_times,
+                )
+            except Exception as e:
+                logger.debug(f"FHR+UP timeline failed for {guid}: {e}")
+
+        logger.info(f"Generated FHR+UP timelines for {len(selected)} GUIDs")
+
     def _plot_changepoints_with_raw(self, n_samples: int = 5) -> None:
-        """Plot changepoints overlaid on raw FHR signals."""
+        """Plot changepoints overlaid on raw FHR signals (all epochs)."""
         if not self.changepoint_results or not self.raw_data:
             return
 
         cp_dir = self.output_dir / "changepoint_analysis"
         samples_plotted = 0
 
-        for guid, cp_result in list(self.changepoint_results.items())[:n_samples]:
+        for guid, cp_results_list in self.changepoint_results.items():
+            if samples_plotted >= n_samples:
+                break
+
             data = self.raw_data.get(guid)
             if data is None:
                 continue
@@ -1262,28 +1530,35 @@ class TrajectoryAnalyzer:
             if not epochs:
                 continue
 
-            first_epoch = epochs[0]
-            latent_mean = first_epoch.get("latent_mean")
-            fhr = first_epoch.get("fhr")
+            for epoch_idx, epoch_data in enumerate(epochs):
+                if samples_plotted >= n_samples:
+                    break
 
-            if latent_mean is None or fhr is None:
-                continue
+                latent_mean = epoch_data.get("latent_mean")
+                fhr = epoch_data.get("fhr")
 
-            try:
-                plot_latent_changepoints_with_raw(
-                    latent_mean=latent_mean,
-                    fhr=fhr,
-                    changepoint_results=cp_result,
-                    output_path=cp_dir / f"changepoints_{guid}.pdf",
-                    sample_id=guid,
-                    decimation_factor=self.decimation_factor,
-                )
-                samples_plotted += 1
-            except Exception as e:
-                logger.debug(f"Changepoint plot failed for {guid}: {e}")
+                if latent_mean is None or fhr is None:
+                    continue
+
+                cp_result = cp_results_list[epoch_idx] if epoch_idx < len(cp_results_list) else None
+                if cp_result is None:
+                    continue
+
+                try:
+                    plot_latent_changepoints_with_raw(
+                        latent_mean=latent_mean,
+                        fhr=fhr,
+                        changepoint_results=cp_result,
+                        output_path=cp_dir / f"changepoints_{guid}_ep{epoch_idx}.pdf",
+                        sample_id=f"{guid}_ep{epoch_idx}",
+                        decimation_factor=self.decimation_factor,
+                    )
+                    samples_plotted += 1
+                except Exception as e:
+                    logger.debug(f"Changepoint plot failed for {guid} ep{epoch_idx}: {e}")
 
         if samples_plotted > 0:
-            logger.info(f"Generated changepoint plots for {samples_plotted} samples")
+            logger.info(f"Generated changepoint plots for {samples_plotted} epoch(s)")
 
     def _plot_segment_stats(self) -> None:
         """Plot aggregated segment statistics."""
@@ -1432,6 +1707,8 @@ def run_trajectory_analysis(
     n_kld_guid_plots: int = 12,
     kld_guid_list: Optional[List[str]] = None,
     decimation_factor: int = 16,
+    changepoint_algo: str = "pelt",
+    preprocess_latent_trajectories: bool = False,
 ) -> Dict[str, Any]:
     """
     Run complete trajectory analysis.
@@ -1455,6 +1732,10 @@ def run_trajectory_analysis(
         n_kld_guid_plots: Number of GUIDs to plot for per-epoch KLD trends.
         kld_guid_list: Optional list of GUIDs to plot (overrides top-N selection).
         decimation_factor: Ratio between raw signal and latent lengths.
+        changepoint_algo: Changepoint detection algorithm
+            ('pelt', 'binseg', 'bottomup', 'window', 'dynp', 'gradient').
+        preprocess_latent_trajectories: If True, apply robust normalization
+            and optional denoising to latent z-columns before analysis.
 
     Returns:
         Summary dict with statistics and output paths.
@@ -1469,6 +1750,7 @@ def run_trajectory_analysis(
         ...     dim_reduction_method='umap',
         ...     n_changepoints=5,
         ...     plot_animations=True,
+        ...     changepoint_algo='binseg',
         ... )
     """
     output_dir = runner.ensure_dir("trajectory")
@@ -1484,6 +1766,8 @@ def run_trajectory_analysis(
         plot_3d=plot_3d,
         plot_animations=plot_animations,
         decimation_factor=decimation_factor,
+        changepoint_algo=changepoint_algo,
+        preprocess_latent_trajectories=preprocess_latent_trajectories,
     )
 
     return analyzer.run(
