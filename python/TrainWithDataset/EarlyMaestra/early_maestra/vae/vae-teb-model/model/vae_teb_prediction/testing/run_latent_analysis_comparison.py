@@ -515,7 +515,7 @@ if __name__ == "__main__":
     # pre-existing CSVs, or False to run the full pipeline.
     # ----------------------------------------------------------------
 
-    COMPARE_ONLY = False
+    COMPARE_ONLY = True
 
     # --- Single-run settings (used when COMPARE_ONLY = False) ---
     CONFIG_PATH = "model/vae_teb_prediction/config.yaml"
