@@ -1915,6 +1915,108 @@ def plot_latent_trajectory_3d(
     plt.close(fig)
 
 
+def plot_guid_trajectory_3d(
+    trajectory: np.ndarray,
+    output_path: Path,
+    *,
+    sample_id: str = "guid",
+    time_axis: Optional[np.ndarray] = None,
+    epoch_boundaries: Optional[list] = None,
+    point_size: int = 10,
+    cmap: str = "bwr",
+) -> None:
+    """
+    Plot a full stitched GUID-level 3D trajectory with temporal coloring.
+
+    Shows how a patient's latent trajectory evolves over the full recording
+    (potentially many hours), with epoch boundaries marked.
+
+    Args:
+        trajectory: Stitched trajectory array of shape (T_total, 3).
+        output_path: Path to save the figure.
+        sample_id: GUID or identifier for the title.
+        time_axis: Absolute time values of shape (T_total,) in seconds.
+            If provided, colorbar shows hours before birth.
+        epoch_boundaries: Indices where new epochs start (marked with diamonds).
+        point_size: Size of trajectory points.
+        cmap: Colormap name (default 'bwr').
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if trajectory.ndim == 3:
+        trajectory = trajectory.squeeze(0)
+    if trajectory.shape[1] < 3:
+        return
+
+    T = trajectory.shape[0]
+
+    # Determine color values and label
+    if time_axis is not None and len(time_axis) == T:
+        color_vals = np.abs(time_axis) / 3600.0  # hours before birth
+        cbar_label = "Hours before birth"
+    else:
+        color_vals = np.arange(T)
+        cbar_label = "Time Step"
+
+    n_epochs = len(epoch_boundaries) if epoch_boundaries else 1
+    if time_axis is not None and len(time_axis) > 1:
+        hours = abs(float(time_axis[-1]) - float(time_axis[0])) / 3600.0
+    else:
+        hours = T * 4.0 / 3600.0
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Main scatter
+    scatter = ax.scatter(
+        trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+        c=color_vals, cmap=cmap, s=point_size, depthshade=True,
+    )
+
+    # Trajectory line
+    ax.plot(
+        trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+        color=COLOR_GRAY, alpha=0.4, linewidth=0.6,
+    )
+
+    # Epoch boundaries
+    if epoch_boundaries:
+        for eb in epoch_boundaries:
+            if 0 <= eb < T:
+                ax.scatter(
+                    [trajectory[eb, 0]], [trajectory[eb, 1]], [trajectory[eb, 2]],
+                    c=COLOR_GRAY, s=20, marker="D", alpha=0.6, depthshade=False,
+                )
+
+    # Start and end markers
+    ax.scatter(
+        [trajectory[0, 0]], [trajectory[0, 1]], [trajectory[0, 2]],
+        c=COLOR_GREEN, s=80, marker="o", label="Start", depthshade=False,
+    )
+    ax.scatter(
+        [trajectory[-1, 0]], [trajectory[-1, 1]], [trajectory[-1, 2]],
+        c=COLOR_VERMILLION, s=80, marker="X", label="End", depthshade=False,
+    )
+
+    _add_colorbar(fig, scatter, ax, label=cbar_label, shrink=0.8, pad=0.02)
+
+    ax.set_xlabel("PC1", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_ylabel("PC2", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_zlabel("PC3", fontsize=FONT_LABEL, labelpad=10)
+    ax.set_title(
+        f"GUID Trajectory 3D - {sample_id} ({n_epochs} epochs, {hours:.1f}h)",
+        fontsize=FONT_TITLE, fontweight="normal", pad=10,
+    )
+    ax.legend(loc="best", fontsize=FONT_LEGEND)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_kld_trajectory_3d(
     trajectory: np.ndarray,
     output_path: Path,
@@ -2237,6 +2339,7 @@ def plot_trajectory_comparison(
     *,
     n_components: int = 2,
     filename: str = "trajectory_comparison.pdf",
+    per_class_cmaps: Optional[Dict[str, str]] = None,
 ) -> None:
     """
     Compare latent trajectories across multiple classes in a single plot.
@@ -2247,6 +2350,8 @@ def plot_trajectory_comparison(
         output_dir: Directory to save the plot.
         n_components: Number of dimensions to plot (2 or 3).
         filename: Output filename.
+        per_class_cmaps: Dict mapping class names to colormap names for temporal
+            coloring within each class. Default: Greens/Oranges/Blues.
 
     Example:
         >>> trajectories = {"healthy": healthy_trajs, "acidosis": acidosis_trajs}
@@ -2255,7 +2360,12 @@ def plot_trajectory_comparison(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Color map for classes
+    # Default per-class colormaps for temporal coloring
+    default_cmaps = {"healthy": "Greens", "acidosis": "Oranges", "hie": "Blues"}
+    if per_class_cmaps is None:
+        per_class_cmaps = default_cmaps
+
+    # Flat color fallbacks for classes without a colormap
     class_colors = {
         "healthy": COLOR_GREEN,
         "acidosis": COLOR_VERMILLION,
@@ -2270,41 +2380,74 @@ def plot_trajectory_comparison(
         fig, ax = plt.subplots(figsize=(7.0, 6.0))
 
     for class_name, class_trajectories in trajectories.items():
-        color = class_colors.get(class_name.lower(), COLOR_BLUE)
+        cmap_name = per_class_cmaps.get(class_name.lower())
+        flat_color = class_colors.get(class_name.lower(), COLOR_BLUE)
 
         if class_trajectories.ndim == 2:
             class_trajectories = class_trajectories[None, ...]
 
         for i, traj in enumerate(class_trajectories):
-            alpha = 0.3 + 0.5 * (i == 0)  # Highlight first trajectory
+            T = traj.shape[0]
+
+            # Use per-class colormap for temporal coloring if available
+            if cmap_name is not None and T > 1:
+                cmap_obj = plt.get_cmap(cmap_name)
+                traj_colors = cmap_obj(np.linspace(0.3, 0.9, T))
+            else:
+                traj_colors = None
+
+            alpha = 0.3 + 0.5 * (i == 0)
 
             if n_components == 3 and traj.shape[1] >= 3:
-                ax.plot(
-                    traj[:, 0], traj[:, 1], traj[:, 2],
-                    color=color, alpha=alpha, linewidth=0.7,
-                    label=class_name if i == 0 else None
-                )
+                if traj_colors is not None:
+                    # Temporal coloring: scatter with colormap
+                    ax.scatter(
+                        traj[:, 0], traj[:, 1], traj[:, 2],
+                        c=traj_colors, s=8, alpha=alpha, depthshade=True,
+                        label=class_name if i == 0 else None,
+                    )
+                    ax.plot(
+                        traj[:, 0], traj[:, 1], traj[:, 2],
+                        color=flat_color, alpha=alpha * 0.5, linewidth=0.5,
+                    )
+                else:
+                    ax.plot(
+                        traj[:, 0], traj[:, 1], traj[:, 2],
+                        color=flat_color, alpha=alpha, linewidth=0.7,
+                        label=class_name if i == 0 else None,
+                    )
                 ax.scatter(
                     [traj[0, 0]], [traj[0, 1]], [traj[0, 2]],
-                    c=color, s=25, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2
+                    c=flat_color, s=25, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2,
                 )
                 ax.scatter(
                     [traj[-1, 0]], [traj[-1, 1]], [traj[-1, 2]],
-                    c=color, s=25, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2
+                    c=flat_color, s=25, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2,
                 )
             else:
-                ax.plot(
-                    traj[:, 0], traj[:, 1],
-                    color=color, alpha=alpha, linewidth=0.7,
-                    label=class_name if i == 0 else None
-                )
+                if traj_colors is not None:
+                    ax.scatter(
+                        traj[:, 0], traj[:, 1],
+                        c=traj_colors, s=8, alpha=alpha,
+                        label=class_name if i == 0 else None,
+                    )
+                    ax.plot(
+                        traj[:, 0], traj[:, 1],
+                        color=flat_color, alpha=alpha * 0.5, linewidth=0.5,
+                    )
+                else:
+                    ax.plot(
+                        traj[:, 0], traj[:, 1],
+                        color=flat_color, alpha=alpha, linewidth=0.7,
+                        label=class_name if i == 0 else None,
+                    )
                 ax.scatter(
                     traj[0, 0], traj[0, 1],
-                    c=color, s=25, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2
+                    c=flat_color, s=25, marker="o", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2,
                 )
                 ax.scatter(
                     traj[-1, 0], traj[-1, 1],
-                    c=color, s=25, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2
+                    c=flat_color, s=25, marker="X", alpha=alpha, edgecolors=COLOR_BLACK, linewidths=0.2,
                 )
 
     if n_components == 3:

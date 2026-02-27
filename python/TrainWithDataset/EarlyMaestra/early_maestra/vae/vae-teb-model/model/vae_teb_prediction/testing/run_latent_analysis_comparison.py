@@ -63,6 +63,8 @@ def _run_trajectory_analysis(
     num_workers: Optional[int] = None,
     normalize_fields: Optional[Sequence[str]] = None,
     dataset_kwargs: Optional[Dict[str, Any]] = None,
+    changepoint_algo: str = "pelt",
+    preprocess_latent: bool = False,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Run trajectory analysis using the existing pipeline.
@@ -144,6 +146,8 @@ def _run_trajectory_analysis(
         n_changepoints=n_changepoints,
         skip_dashboards=True,
         plot_3d=True,
+        changepoint_algo=changepoint_algo,
+        preprocess_latent_trajectories=preprocess_latent,
     )
 
     trajectory_dir = runner.ensure_dir("trajectory")
@@ -259,6 +263,8 @@ def run_single_run(
     time_range_hours: float = 12.0,
     dim_reduction_method: str = "pca",
     n_changepoints: int = 5,
+    changepoint_algo: str = "pelt",
+    preprocess_latent: bool = False,
 ) -> Dict[str, Any]:
     """
     Run trajectory analysis on all data, then split by label and compare.
@@ -275,6 +281,8 @@ def run_single_run(
         time_range_hours: Hours before birth to analyse.
         dim_reduction_method: Dimensionality reduction ('pca', 'umap', 'tsne', etc.).
         n_changepoints: Changepoints per sample.
+        changepoint_algo: Changepoint detection algorithm.
+        preprocess_latent: If True, apply robust normalization/denoising.
 
     Returns:
         Comparison results dict.
@@ -291,6 +299,8 @@ def run_single_run(
         time_range_hours=time_range_hours,
         dim_reduction_method=dim_reduction_method,
         n_changepoints=n_changepoints,
+        changepoint_algo=changepoint_algo,
+        preprocess_latent=preprocess_latent,
     )
 
     logger.info(f"Trajectory analysis done: {traj_results.get('n_guids', '?')} GUIDs, "
@@ -342,6 +352,8 @@ def main(
     n_changepoints: int = 5,
     runs: Optional[List[str]] = None,
     stitched: Optional[List[str]] = None,
+    changepoint_algo: str = "pelt",
+    preprocess_latent: bool = False,
 ) -> Dict[str, Any]:
     """
     Main entry point for latent trajectory comparison.
@@ -363,6 +375,8 @@ def main(
         n_changepoints: Changepoints per sample.
         runs: List of "path:label" specs for compare-only mode.
         stitched: Optional list of "path:label" specs for compare-only mode (FID/MMD).
+        changepoint_algo: Changepoint detection algorithm.
+        preprocess_latent: If True, apply robust normalization/denoising.
 
     Returns:
         Comparison results dict.
@@ -389,6 +403,8 @@ def main(
             time_range_hours=time_range_hours,
             dim_reduction_method=dim_reduction_method,
             n_changepoints=n_changepoints,
+            changepoint_algo=changepoint_algo,
+            preprocess_latent=preprocess_latent,
         )
 
 
@@ -436,6 +452,12 @@ Examples:
     single.add_argument("--time-range", type=float, default=12.0, help="Hours before birth (default: 12).")
     single.add_argument("--dim-reduction", type=str, default="pca", help="Dim reduction method (default: pca).")
     single.add_argument("--n-changepoints", type=int, default=5, help="Changepoints per sample (default: 5).")
+    single.add_argument(
+        "--changepoint-algo", type=str, default="pelt",
+        choices=["pelt", "binseg", "bottomup", "window", "dynp", "gradient"],
+        help="Changepoint detection algorithm (default: pelt).",
+    )
+    single.add_argument("--preprocess-latent", action="store_true", help="Apply robust normalization/denoising to latent z-columns.")
 
     # --- Compare-only args ---
     compare = parser.add_argument_group("compare-only options")
@@ -476,6 +498,8 @@ Examples:
         n_changepoints=args.n_changepoints,
         runs=args.runs,
         stitched=args.stitched,
+        changepoint_algo=args.changepoint_algo,
+        preprocess_latent=args.preprocess_latent,
     )
 
 
@@ -505,6 +529,8 @@ if __name__ == "__main__":
     TIME_RANGE_HOURS = 12.0
     DIM_REDUCTION_METHOD = "pca"
     N_CHANGEPOINTS = 5
+    CHANGEPOINT_ALGO = "pelt"
+    PREPROCESS_LATENT = False
 
     # --- Compare-only settings (used when COMPARE_ONLY = True) ---
     RUNS = [
@@ -543,4 +569,6 @@ if __name__ == "__main__":
             time_range_hours=TIME_RANGE_HOURS,
             dim_reduction_method=DIM_REDUCTION_METHOD,
             n_changepoints=N_CHANGEPOINTS,
+            changepoint_algo=CHANGEPOINT_ALGO,
+            preprocess_latent=PREPROCESS_LATENT,
         )
