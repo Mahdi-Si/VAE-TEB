@@ -1485,3 +1485,117 @@ def plot_trajectory_comparison_interactive(
 
     fig.write_html(str(output_path), include_plotlyjs="cdn")
     return fig
+
+
+def plot_class_latent_density_interactive(
+    latent_df: "pd.DataFrame",
+    output_path: Path,
+    *,
+    pc_x: str = "pc1",
+    pc_y: str = "pc2",
+    label_col: str = "label",
+    max_points_per_class: int = 3000,
+) -> Optional[go.Figure]:
+    """
+    Interactive 2D scatter with density contours by class.
+
+    Plotly version of plot_class_latent_density — hoverable points with
+    GUID and time metadata, plus per-class density contours.
+
+    Args:
+        latent_df: DataFrame with PC columns, label, and optional guid/t_abs_sec.
+        output_path: Path to save HTML file.
+        pc_x: Column for x-axis.
+        pc_y: Column for y-axis.
+        label_col: Column for class labels.
+        max_points_per_class: Max scatter points per class (subsampled for perf).
+
+    Returns:
+        Plotly Figure or None.
+    """
+    _check_plotly()
+
+    if pc_x not in latent_df.columns or pc_y not in latent_df.columns:
+        return None
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    class_colors = {
+        "healthy": "#609966",
+        "acidosis": "#EB5B00",
+        "hie": "#112D4E",
+        "unknown": "#393E46",
+    }
+    default_colors = ["#3F72AF", "#FFB200", "#609966", "#00ADB5", "#EB5B00"]
+
+    fig = go.Figure()
+
+    labels = [l for l in latent_df[label_col].unique() if l != "unknown"]
+
+    for idx, label in enumerate(sorted(labels)):
+        subset = latent_df[latent_df[label_col] == label].copy()
+        color = class_colors.get(label.lower(), default_colors[idx % len(default_colors)])
+
+        # Subsample for performance
+        if len(subset) > max_points_per_class:
+            subset = subset.sample(n=max_points_per_class, random_state=42)
+
+        x = subset[pc_x].values
+        y = subset[pc_y].values
+
+        # Build hover text
+        hover_parts = [f"Class: {label}"]
+        if "guid" in subset.columns:
+            hover_parts.append("GUID: %{customdata[0]}")
+        if "t_abs_sec" in subset.columns:
+            hover_parts.append("Time: %{customdata[1]:.0f}s")
+        hover_template = "<br>".join(hover_parts) + f"<br>{pc_x.upper()}: %{{x:.3f}}<br>{pc_y.upper()}: %{{y:.3f}}<extra></extra>"
+
+        customdata = []
+        if "guid" in subset.columns and "t_abs_sec" in subset.columns:
+            customdata = subset[["guid", "t_abs_sec"]].values
+        elif "guid" in subset.columns:
+            customdata = subset[["guid"]].values
+
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=y,
+                mode="markers",
+                marker=dict(size=3, color=color, opacity=0.3),
+                name=f"{label} (n={len(subset)})",
+                legendgroup=label,
+                hovertemplate=hover_template,
+                customdata=customdata if len(customdata) > 0 else None,
+            )
+        )
+
+        # Density contours
+        if len(x) >= 30:
+            fig.add_trace(
+                go.Histogram2dContour(
+                    x=x, y=y,
+                    colorscale=[[0, "rgba(0,0,0,0)"], [1, color]],
+                    showscale=False,
+                    ncontours=6,
+                    contours=dict(coloring="none", showlabels=False),
+                    line=dict(color=color, width=1.5),
+                    name=f"{label} density",
+                    legendgroup=label,
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+
+    fig.update_layout(
+        title=dict(text=f"Latent Space Density — {pc_x.upper()} vs {pc_y.upper()}", x=0.5),
+        xaxis_title=pc_x.upper(),
+        yaxis_title=pc_y.upper(),
+        width=1000,
+        height=800,
+        legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top",
+                    bgcolor="rgba(255,255,255,0.8)"),
+    )
+
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    return fig
