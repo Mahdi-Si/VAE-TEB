@@ -279,6 +279,39 @@ def _plot_feature_boxplots(
         logger.warning(f"Feature boxplots failed: {e}")
 
 
+def _plot_dimension_heatmap(
+    dim_comparison_df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    """Generate heatmap of per-dimension p-values between class pairs."""
+    try:
+        from model.vae_teb_prediction.testing.visualizers import plot_dimension_significance_heatmap
+        plot_dimension_significance_heatmap(
+            dim_comparison_df,
+            output_dir / "dimension_significance_heatmap.pdf",
+        )
+    except Exception as e:
+        logger.warning(f"Dimension heatmap failed: {e}")
+
+
+def _plot_distributional_distances(
+    pairwise_summary: List[Dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    """Generate bar chart of FID/MMD between class pairs."""
+    if not pairwise_summary:
+        return
+    try:
+        from model.vae_teb_prediction.testing.visualizers import plot_distributional_distances
+        summary_df = pd.DataFrame(pairwise_summary)
+        plot_distributional_distances(
+            summary_df,
+            output_dir / "distributional_distances.pdf",
+        )
+    except Exception as e:
+        logger.warning(f"Distributional distance plots failed: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Main comparison pipeline
 # ---------------------------------------------------------------------------
@@ -402,6 +435,12 @@ def run_comparison(
                 dim_comparison = compare_dimensions_by_class(stitched_merged, z_cols)
                 dim_comparison.to_csv(out / "dimension_comparison.csv", index=False)
                 results["n_dimensions_tested"] = len(z_cols)
+
+                # Dimension significance heatmap
+                _plot_dimension_heatmap(dim_comparison, out)
+
+    # Distributional distance plots
+    _plot_distributional_distances(pairwise_summary, out)
 
     if pairwise_summary:
         summary_df = pd.DataFrame(pairwise_summary)

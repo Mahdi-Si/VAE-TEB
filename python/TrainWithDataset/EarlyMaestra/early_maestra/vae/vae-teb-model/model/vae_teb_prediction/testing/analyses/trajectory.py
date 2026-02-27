@@ -55,6 +55,10 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_recurrence,
     plot_segment_statistics,
     plot_trajectory_comparison,
+    plot_class_mean_trajectory,
+    plot_class_latent_density,
+    plot_class_pc_evolution,
+    plot_class_dynamics_comparison,
 )
 
 try:
@@ -84,6 +88,7 @@ try:
         plot_guid_trajectory_3d_interactive,
         plot_trajectory_animation,
         plot_trajectory_comparison_interactive,
+        plot_class_latent_density_interactive,
     )
     HAS_INTERACTIVE = True
 except ImportError:
@@ -305,9 +310,8 @@ class TrajectoryAnalyzer:
         if HAS_INTERACTIVE:
             self._plot_fhr_up_timelines(n_samples=min(5, n_trajectory_samples))
 
-        # Step 11: Compare class trajectories
-        if class_analysis and HAS_INTERACTIVE:
-            self._compare_class_trajectories()
+        # Step 11: Compare class trajectories (runs if labels present)
+        self._compare_class_trajectories()
 
         # Step 10: Compute metrics
         metrics = self._compute_metrics()
@@ -1628,21 +1632,35 @@ class TrajectoryAnalyzer:
         logger.info(f"Generated trajectory animations")
 
     def _compare_class_trajectories(self) -> None:
-        """Compare trajectories across outcome classes."""
-        if not HAS_INTERACTIVE or self.latent_df.empty or "label" not in self.latent_df.columns:
+        """Compare trajectories across outcome classes.
+
+        Generates a comprehensive suite of class-comparison figures:
+        1. Overlay trajectory comparison (static + interactive) — all samples
+        2. Mean trajectory per class with ±1 std ribbon
+        3. Per-PC temporal evolution by class (PC1/PC2/PC3 over time)
+        4. Latent space density (2D KDE contours, static + interactive)
+        5. Trajectory dynamics comparison (speed/acceleration violin)
+        """
+        if self.latent_df.empty or "label" not in self.latent_df.columns:
             return
 
-        # Group trajectories by class
+        labels = [l for l in self.latent_df["label"].unique() if l != "unknown"]
+        if len(labels) < 2:
+            logger.info(f"Only {len(labels)} class(es) found — skipping class comparison")
+            return
+
+        plots_dir = self.output_dir / "plots"
+        comparison_dir = self.output_dir / "class_comparison"
+        comparison_dir.mkdir(exist_ok=True)
+
+        # ---- Collect per-epoch trajectories by class (up to 10 per class) ----
         trajectories_by_class: Dict[str, List[np.ndarray]] = defaultdict(list)
 
-        for label in self.latent_df["label"].unique():
-            if label == "unknown":
-                continue
-
+        for label in labels:
             subset = self.latent_df[self.latent_df["label"] == label]
             unique_samples = subset[["guid", "epoch_sec"]].drop_duplicates()
 
-            for _, row in unique_samples.head(5).iterrows():  # Max 5 per class
+            for _, row in unique_samples.head(10).iterrows():
                 guid, epoch = row["guid"], row["epoch_sec"]
                 mask = (subset["guid"] == guid) & (subset["epoch_sec"] == epoch)
                 sample = subset[mask].sort_values("t")
@@ -1650,7 +1668,6 @@ class TrajectoryAnalyzer:
                 if len(sample) < 5:
                     continue
 
-                # Get coordinates
                 if "rd1" in sample.columns:
                     traj = sample[["rd1", "rd2", "rd3"]].values
                 elif "pc1" in sample.columns and "pc3" in sample.columns:
@@ -1661,34 +1678,114 @@ class TrajectoryAnalyzer:
                 trajectories_by_class[label].append(traj)
 
         if not trajectories_by_class:
+            logger.warning("No valid class trajectories found")
             return
 
-        # Convert lists to arrays for plotting
-        trajectories_dict = {}
+        # ---- 1. Overlay comparison (pass ALL trajectories, not just 1) ----
+        # Build dict where each value is array (N, T, D) — pad to common T
+        trajectories_dict_all = {}
         for label, traj_list in trajectories_by_class.items():
             if traj_list:
-                # Stack first trajectory for each class (for simple comparison)
-                trajectories_dict[label] = traj_list[0]
+                max_t = max(t.shape[0] for t in traj_list)
+                n_dims = traj_list[0].shape[1]
+                padded = np.zeros((len(traj_list), max_t, n_dims))
+                for i, t in enumerate(traj_list):
+                    padded[i, :t.shape[0], :] = t
+                trajectories_dict_all[label] = padded
 
         try:
-            # Static comparison
             plot_trajectory_comparison(
-                trajectories_dict,
-                self.output_dir / "plots",
+                trajectories_dict_all,
+                comparison_dir,
                 n_components=3,
                 filename="trajectory_class_comparison.pdf",
             )
+            logger.info("Generated static class trajectory comparison")
+        except Exception as e:
+            logger.warning(f"Static class trajectory comparison failed: {e}")
 
-            # Interactive comparison
-            plot_trajectory_comparison_interactive(
-                trajectories_dict,
-                self.output_dir / "plots" / "trajectory_class_comparison.html",
-                title="Trajectory Comparison by Outcome Class",
+        if HAS_INTERACTIVE:
+            try:
+                plot_trajectory_comparison_interactive(
+                    trajectories_dict_all,
+                    comparison_dir / "trajectory_class_comparison.html",
+                    title="Trajectory Comparison by Outcome Class",
+                    n_components=3,
+                )
+                logger.info("Generated interactive class trajectory comparison")
+            except Exception as e:
+                logger.warning(f"Interactive class trajectory comparison failed: {e}")
+
+        # ---- 2. Mean trajectory per class ----
+        try:
+            plot_class_mean_trajectory(
+                trajectories_by_class,
+                comparison_dir / "mean_trajectory_by_class_3d.pdf",
                 n_components=3,
             )
-            logger.info("Generated class trajectory comparison plots")
+            plot_class_mean_trajectory(
+                trajectories_by_class,
+                comparison_dir / "mean_trajectory_by_class_2d.pdf",
+                n_components=2,
+            )
+            logger.info("Generated mean trajectory comparison plots")
         except Exception as e:
-            logger.warning(f"Class trajectory comparison failed: {e}")
+            logger.warning(f"Mean trajectory comparison failed: {e}")
+
+        # ---- 3. Per-PC temporal evolution ----
+        try:
+            plot_class_pc_evolution(
+                self.latent_df,
+                comparison_dir / "pc_evolution_by_class.pdf",
+            )
+            logger.info("Generated PC evolution by class plot")
+        except Exception as e:
+            logger.warning(f"PC evolution comparison failed: {e}")
+
+        # ---- 4. Latent density (2D KDE contours) ----
+        try:
+            plot_class_latent_density(
+                self.latent_df,
+                comparison_dir / "latent_density_pc1_pc2.pdf",
+                pc_x="pc1", pc_y="pc2",
+            )
+            plot_class_latent_density(
+                self.latent_df,
+                comparison_dir / "latent_density_pc1_pc3.pdf",
+                pc_x="pc1", pc_y="pc3",
+            )
+            logger.info("Generated latent density comparison plots")
+        except Exception as e:
+            logger.warning(f"Latent density comparison failed: {e}")
+
+        if HAS_INTERACTIVE:
+            try:
+                plot_class_latent_density_interactive(
+                    self.latent_df,
+                    comparison_dir / "latent_density_interactive.html",
+                    pc_x="pc1", pc_y="pc2",
+                )
+                logger.info("Generated interactive latent density plot")
+            except Exception as e:
+                logger.warning(f"Interactive latent density failed: {e}")
+
+        # ---- 5. Dynamics comparison (speed, acceleration) ----
+        try:
+            plot_class_dynamics_comparison(
+                self.latent_df,
+                comparison_dir / "dynamics_by_class.pdf",
+            )
+            logger.info("Generated dynamics comparison plot")
+        except Exception as e:
+            logger.warning(f"Dynamics comparison failed: {e}")
+
+        # ---- 6. KLD by class (already in main pipeline, symlink to comparison dir) ----
+        # The _plot_kld_by_class() already generates kld_by_class.pdf in plots/
+        # We generate a note in summary
+        logger.info(
+            f"Class comparison complete: {len(labels)} classes, "
+            f"{sum(len(v) for v in trajectories_by_class.values())} trajectories"
+        )
 
 
 def run_trajectory_analysis(
