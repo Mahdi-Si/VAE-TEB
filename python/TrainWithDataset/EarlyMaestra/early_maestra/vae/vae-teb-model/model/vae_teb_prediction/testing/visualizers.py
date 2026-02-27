@@ -2598,3 +2598,505 @@ def plot_feature_boxplots(
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Class Comparison Visualizations
+# ---------------------------------------------------------------------------
+
+def plot_class_mean_trajectory(
+    trajectories_by_class: Dict[str, list],
+    output_path: Path,
+    *,
+    n_components: int = 3,
+) -> None:
+    """
+    Plot mean trajectory per class with ±1 std confidence ribbon.
+
+    Shows the "average journey" through latent space for each class with
+    shaded uncertainty regions, revealing systematic differences in how
+    healthy vs pathological babies evolve.
+
+    Args:
+        trajectories_by_class: Dict mapping class names to lists of
+            trajectory arrays, each shape (T, D). Trajectories within
+            a class may have different lengths — they are resampled to
+            a common grid before averaging.
+        output_path: Path to save figure.
+        n_components: 2 or 3 PCs to plot.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    class_colors = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+        "unknown": COLOR_GRAY,
+    }
+
+    def _resample_to_grid(trajs: list, n_points: int = 100) -> np.ndarray:
+        """Resample variable-length trajectories to a common grid."""
+        resampled = []
+        for traj in trajs:
+            T = traj.shape[0]
+            if T < 2:
+                continue
+            old_t = np.linspace(0, 1, T)
+            new_t = np.linspace(0, 1, n_points)
+            interp = np.column_stack(
+                [np.interp(new_t, old_t, traj[:, d]) for d in range(traj.shape[1])]
+            )
+            resampled.append(interp)
+        return np.array(resampled) if resampled else np.empty((0, n_points, 0))
+
+    if n_components == 3:
+        fig = plt.figure(figsize=(9.0, 7.5))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig, ax = plt.subplots(figsize=(7.5, 6.0))
+
+    for class_name, traj_list in trajectories_by_class.items():
+        if not traj_list:
+            continue
+
+        n_dims = min(traj_list[0].shape[1], n_components)
+        stacked = _resample_to_grid(traj_list, n_points=100)
+
+        if stacked.shape[0] < 2:
+            # Only 1 trajectory — plot without confidence
+            traj = traj_list[0]
+            color = class_colors.get(class_name.lower(), COLOR_BLUE)
+            if n_components == 3 and n_dims >= 3:
+                ax.plot(traj[:, 0], traj[:, 1], traj[:, 2],
+                        color=color, linewidth=1.5, label=f"{class_name} (n=1)")
+            else:
+                ax.plot(traj[:, 0], traj[:, 1],
+                        color=color, linewidth=1.5, label=f"{class_name} (n=1)")
+            continue
+
+        mean_traj = stacked.mean(axis=0)  # (100, D)
+        std_traj = stacked.std(axis=0)    # (100, D)
+        color = class_colors.get(class_name.lower(), COLOR_BLUE)
+        n_trajs = stacked.shape[0]
+
+        if n_components == 3 and n_dims >= 3:
+            ax.plot(mean_traj[:, 0], mean_traj[:, 1], mean_traj[:, 2],
+                    color=color, linewidth=2.0, label=f"{class_name} (n={n_trajs})")
+            # Mark start and end of mean
+            ax.scatter([mean_traj[0, 0]], [mean_traj[0, 1]], [mean_traj[0, 2]],
+                       c=color, s=40, marker="o", edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5)
+            ax.scatter([mean_traj[-1, 0]], [mean_traj[-1, 1]], [mean_traj[-1, 2]],
+                       c=color, s=40, marker="X", edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5)
+            # Plot individual trajectories faintly
+            for i in range(min(n_trajs, 8)):
+                ax.plot(stacked[i, :, 0], stacked[i, :, 1], stacked[i, :, 2],
+                        color=color, alpha=0.15, linewidth=0.5)
+        else:
+            ax.plot(mean_traj[:, 0], mean_traj[:, 1],
+                    color=color, linewidth=2.0, label=f"{class_name} (n={n_trajs})")
+            # Confidence ribbon using distance from mean
+            for alpha, n_std in [(0.2, 1.0), (0.08, 2.0)]:
+                ax.fill_between(
+                    mean_traj[:, 0],
+                    mean_traj[:, 1] - n_std * std_traj[:, 1],
+                    mean_traj[:, 1] + n_std * std_traj[:, 1],
+                    color=color, alpha=alpha,
+                )
+            ax.scatter(mean_traj[0, 0], mean_traj[0, 1],
+                       c=color, s=40, marker="o", edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5)
+            ax.scatter(mean_traj[-1, 0], mean_traj[-1, 1],
+                       c=color, s=40, marker="X", edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5)
+
+    if n_components == 3:
+        ax.set_xlabel("PC1", fontsize=FONT_LABEL, labelpad=10)
+        ax.set_ylabel("PC2", fontsize=FONT_LABEL, labelpad=10)
+        ax.set_zlabel("PC3", fontsize=FONT_LABEL, labelpad=10)
+    else:
+        ax.set_xlabel("PC1", fontsize=FONT_LABEL)
+        ax.set_ylabel("PC2", fontsize=FONT_LABEL)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    ax.set_title("Mean Trajectory by Class (±1 std)", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.legend(loc="best", fontsize=FONT_LEGEND, framealpha=0.95)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_class_latent_density(
+    latent_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    pc_x: str = "pc1",
+    pc_y: str = "pc2",
+    label_col: str = "label",
+) -> None:
+    """
+    2D scatter with KDE contours showing class-level latent density separation.
+
+    Reveals whether healthy vs HIE babies occupy distinct regions of latent
+    space or overlap significantly.
+
+    Args:
+        latent_df: DataFrame with pc1, pc2, and label columns.
+        output_path: Path to save figure.
+        pc_x: Column name for x-axis PC.
+        pc_y: Column name for y-axis PC.
+        label_col: Column name for class label.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if pc_x not in latent_df.columns or pc_y not in latent_df.columns:
+        return
+
+    class_colors = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+        "unknown": COLOR_GRAY,
+    }
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.0))
+
+    labels = [l for l in latent_df[label_col].unique() if l != "unknown"]
+    for label in sorted(labels):
+        subset = latent_df[latent_df[label_col] == label]
+        x = subset[pc_x].dropna().values
+        y = subset[pc_y].dropna().values
+
+        if len(x) < 10:
+            continue
+
+        color = class_colors.get(label.lower(), COLOR_BLUE)
+
+        # Scatter points
+        ax.scatter(x, y, c=color, s=3, alpha=0.15, rasterized=True)
+
+        # KDE contours
+        try:
+            from scipy.stats import gaussian_kde
+            # Subsample for KDE if too many points
+            if len(x) > 5000:
+                rng = np.random.RandomState(42)
+                idx = rng.choice(len(x), 5000, replace=False)
+                x_kde, y_kde = x[idx], y[idx]
+            else:
+                x_kde, y_kde = x, y
+
+            kde = gaussian_kde(np.vstack([x_kde, y_kde]))
+            xmin, xmax = x.min(), x.max()
+            ymin, ymax = y.min(), y.max()
+            margin = 0.1
+            xr = xmax - xmin
+            yr = ymax - ymin
+            xx, yy = np.meshgrid(
+                np.linspace(xmin - margin * xr, xmax + margin * xr, 100),
+                np.linspace(ymin - margin * yr, ymax + margin * yr, 100),
+            )
+            zz = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
+            ax.contour(xx, yy, zz, levels=5, colors=[color], linewidths=0.8, alpha=0.7)
+            ax.contourf(xx, yy, zz, levels=5, colors=[color],
+                        alpha=np.linspace(0.0, 0.15, 6))
+        except Exception:
+            pass  # KDE can fail with degenerate data
+
+        # Add class label at centroid
+        ax.annotate(
+            label.capitalize(), xy=(np.median(x), np.median(y)),
+            fontsize=FONT_LABEL, fontweight="bold", color=color,
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.8),
+        )
+
+    ax.set_xlabel(pc_x.upper(), fontsize=FONT_LABEL)
+    ax.set_ylabel(pc_y.upper(), fontsize=FONT_LABEL)
+    ax.set_title(f"Latent Space Density — {pc_x.upper()} vs {pc_y.upper()}", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_class_pc_evolution(
+    latent_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    label_col: str = "label",
+    time_col: str = "t_abs_sec",
+    n_pcs: int = 3,
+    bin_minutes: float = 30.0,
+) -> None:
+    """
+    Per-PC temporal evolution by class (mean ± std in time bins).
+
+    Shows how each principal component changes over time for each class,
+    revealing whether classes diverge, converge, or remain separated.
+
+    Args:
+        latent_df: DataFrame with pc1..pcN, label, and time columns.
+        output_path: Path to save figure.
+        label_col: Column name for class labels.
+        time_col: Column name for absolute time in seconds.
+        n_pcs: Number of principal components to plot.
+        bin_minutes: Time bin width in minutes for aggregation.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pc_cols = [f"pc{i}" for i in range(1, n_pcs + 1) if f"pc{i}" in latent_df.columns]
+    if not pc_cols or time_col not in latent_df.columns or label_col not in latent_df.columns:
+        return
+
+    class_colors = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+        "unknown": COLOR_GRAY,
+    }
+
+    labels = [l for l in latent_df[label_col].unique() if l != "unknown"]
+    if not labels:
+        return
+
+    n_cols = len(pc_cols)
+    fig, axes = plt.subplots(1, n_cols, figsize=(4.0 * n_cols, 3.5), squeeze=False)
+    axes = axes[0]
+
+    # Convert time to hours before birth
+    df = latent_df.copy()
+    df["hours_before"] = -df[time_col] / 3600.0
+    bin_hours = bin_minutes / 60.0
+    df["time_bin"] = (df["hours_before"] / bin_hours).round() * bin_hours
+
+    for col_idx, pc_col in enumerate(pc_cols):
+        ax = axes[col_idx]
+
+        for label in sorted(labels):
+            subset = df[df[label_col] == label]
+            color = class_colors.get(label.lower(), COLOR_BLUE)
+
+            agg = subset.groupby("time_bin")[pc_col].agg(["mean", "std", "count"]).reset_index()
+            agg = agg[agg["count"] >= 3]  # Require at least 3 points per bin
+            agg = agg.sort_values("time_bin")
+
+            if agg.empty:
+                continue
+
+            ax.plot(agg["time_bin"], agg["mean"], color=color, linewidth=1.5,
+                    label=label.capitalize(), marker=".", markersize=3)
+            ax.fill_between(
+                agg["time_bin"],
+                agg["mean"] - agg["std"],
+                agg["mean"] + agg["std"],
+                color=color, alpha=0.15,
+            )
+
+        ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
+        ax.set_ylabel(pc_col.upper(), fontsize=FONT_LABEL)
+        ax.set_title(f"{pc_col.upper()} by Class", fontsize=FONT_LABEL + 1, fontweight="normal")
+        ax.invert_xaxis()
+        ax.legend(fontsize=FONT_LEGEND, framealpha=0.9)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle("Principal Component Evolution by Class", fontsize=FONT_TITLE, fontweight="normal", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_class_dynamics_comparison(
+    latent_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    label_col: str = "label",
+) -> None:
+    """
+    Violin/box plots comparing latent dynamics (speed, acceleration) by class.
+
+    Shows whether pathological babies have different trajectory dynamics
+    (faster/slower transitions, more/less acceleration) than healthy ones.
+
+    Args:
+        latent_df: DataFrame with speed, accel, and label columns.
+        output_path: Path to save figure.
+        label_col: Column name for class labels.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dynamic_cols = [c for c in ["speed", "accel", "kld_velocity"] if c in latent_df.columns]
+    if not dynamic_cols or label_col not in latent_df.columns:
+        return
+
+    class_colors = {
+        "healthy": COLOR_GREEN,
+        "acidosis": COLOR_VERMILLION,
+        "hie": COLOR_PURPLE,
+        "unknown": COLOR_GRAY,
+    }
+
+    labels = sorted([l for l in latent_df[label_col].unique() if l != "unknown"])
+    if not labels:
+        return
+
+    n_cols = len(dynamic_cols)
+    fig, axes = plt.subplots(1, n_cols, figsize=(3.5 * n_cols, 4.0), squeeze=False)
+    axes = axes[0]
+
+    for col_idx, dyn_col in enumerate(dynamic_cols):
+        ax = axes[col_idx]
+
+        data_by_class = []
+        colors = []
+        for label in labels:
+            vals = latent_df.loc[
+                latent_df[label_col] == label, dyn_col
+            ].replace([np.inf, -np.inf], np.nan).dropna().values
+            if vals.size > 0:
+                data_by_class.append(vals)
+                colors.append(class_colors.get(label.lower(), COLOR_BLUE))
+
+        if not data_by_class:
+            ax.set_visible(False)
+            continue
+
+        parts = ax.violinplot(data_by_class, showmeans=True, showmedians=True)
+        for i, pc in enumerate(parts["bodies"]):
+            pc.set_facecolor(colors[i])
+            pc.set_alpha(0.5)
+        for key in ("cmeans", "cmedians", "cbars", "cmins", "cmaxes"):
+            if key in parts:
+                parts[key].set_color(COLOR_BLACK)
+                parts[key].set_linewidth(0.6)
+
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels([l.capitalize() for l in labels], fontsize=FONT_TICK)
+
+        # Clean up column name for title
+        titles = {"speed": "Latent Speed", "accel": "Latent Acceleration", "kld_velocity": "KLD Velocity"}
+        ax.set_title(titles.get(dyn_col, dyn_col), fontsize=FONT_LABEL + 1, fontweight="normal")
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle("Trajectory Dynamics by Class", fontsize=FONT_TITLE, fontweight="normal", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_dimension_significance_heatmap(
+    dim_comparison_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """
+    Heatmap of per-latent-dimension p-values between class pairs.
+
+    Identifies which latent dimensions carry the most discriminative
+    information between classes. Darker cells = more significant differences.
+
+    Args:
+        dim_comparison_df: DataFrame from compare_dimensions_by_class()
+            with columns: dimension, pair, p_value, effect_size_r.
+        output_path: Path to save figure.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if dim_comparison_df.empty:
+        return
+
+    # Pivot to get dimensions x pairs matrix
+    pivot = dim_comparison_df.pivot_table(
+        index="dimension", columns="pair", values="p_value", aggfunc="first"
+    )
+
+    # Sort dimensions numerically
+    def _dim_sort_key(d: str) -> int:
+        try:
+            return int(d.replace("z", ""))
+        except ValueError:
+            return 999
+    pivot = pivot.reindex(sorted(pivot.index, key=_dim_sort_key))
+
+    fig, ax = plt.subplots(figsize=(max(6, len(pivot.columns) * 2.5), max(4, len(pivot) * 0.35)))
+
+    # Use -log10(p) for better visual contrast
+    display_vals = -np.log10(pivot.values.astype(float) + 1e-300)
+
+    im = ax.imshow(display_vals, aspect="auto", cmap="YlOrRd", interpolation="nearest")
+    _add_colorbar(fig, im, ax, label="-log₁₀(p-value)")
+
+    # Add text annotations
+    for i in range(display_vals.shape[0]):
+        for j in range(display_vals.shape[1]):
+            p_val = pivot.values[i, j]
+            if np.isfinite(p_val):
+                text = f"{p_val:.1e}"
+                text_color = "white" if display_vals[i, j] > display_vals.max() * 0.6 else COLOR_BLACK
+                ax.text(j, i, text, ha="center", va="center", fontsize=5.5, color=text_color)
+
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, fontsize=FONT_TICK, rotation=30, ha="right")
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=FONT_TICK)
+    ax.set_xlabel("Class Pair", fontsize=FONT_LABEL)
+    ax.set_ylabel("Latent Dimension", fontsize=FONT_LABEL)
+    ax.set_title("Dimension Significance (Mann-Whitney U)", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+
+    # Add significance threshold line in colorbar
+    sig_threshold = -np.log10(0.05)
+    ax.axhline(y=-0.5, color="none")  # No-op to ensure consistent rendering
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_distributional_distances(
+    pairwise_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """
+    Bar chart of pairwise FID and MMD between classes.
+
+    Summarizes overall latent distribution separability between classes.
+    Higher FID/MMD = more distinct latent representations.
+
+    Args:
+        pairwise_df: DataFrame with columns: pair, FID, MMD.
+        output_path: Path to save figure.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if pairwise_df.empty:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(8.0, 3.5))
+
+    pairs = pairwise_df["pair"].values
+    x = np.arange(len(pairs))
+    bar_colors = [COLOR_VERMILLION, COLOR_PURPLE, COLOR_GREEN, COLOR_BLUE]
+
+    for ax, metric in zip(axes, ["FID", "MMD"]):
+        vals = pairwise_df[metric].values
+        colors = [bar_colors[i % len(bar_colors)] for i in range(len(vals))]
+        bars = ax.bar(x, vals, color=colors, alpha=0.75, edgecolor=COLOR_BLACK, linewidth=0.5)
+
+        # Add value labels on bars
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=FONT_TICK)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([p.replace("_vs_", " vs ") for p in pairs],
+                           fontsize=FONT_TICK, rotation=20, ha="right")
+        ax.set_ylabel(metric, fontsize=FONT_LABEL)
+        ax.set_title(f"Pairwise {metric}", fontsize=FONT_LABEL + 1, fontweight="normal")
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle("Distributional Distances Between Classes", fontsize=FONT_TITLE, fontweight="normal", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
