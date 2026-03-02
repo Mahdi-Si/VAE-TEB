@@ -1,0 +1,154 @@
+# =============================================================================
+# Discriminative Fine-Tuning Configuration
+# =============================================================================
+# This config is used by:
+#   - discriminative_trainer.py (class-discriminative VAE-TEB fine-tuning)
+#
+# The pipeline loads a pretrained SeqVae checkpoint and fine-tunes it with
+# center loss + auxiliary classifier to create class-separable latent spaces.
+#
+# Two-phase training:
+#   Phase 1: Freeze all VAE params, train classifier head + accumulate centers
+#   Phase 2: Freeze decoder only, unfreeze all encoders with low LR
+# =============================================================================
+
+general_config:
+  tag: discriminative_finetune_phase1    # Change to phase2 for second phase
+  cuda_devices: [0, 1, 2, 3, 4]
+  lr: 0.001                              # Classifier head LR
+  lr_milestone: [100]                    # LR decay epochs
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 200                            # Phase 1: ~10 epochs; Phase 2: ~200
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 200
+    test: 200
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/discriminative
+
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model_config:
+  # VAE model settings (for reconstruction loss computation)
+  VAE_model:
+    beta_schedule: constant
+    beta_const_val: 0.005
+    kld_beta: 0.05                       # Same as pretrained model
+
+  # Pre-trained VAE checkpoint to fine-tune
+  core_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
+
+  # -------------------------------------------------------------------------
+  # Discriminative Fine-Tuning Configuration
+  # -------------------------------------------------------------------------
+  discriminative:
+    num_classes: 3                       # HEALTHY=1, ACIDOSIS=2, HIE=3
+
+    # --- Training phase ---
+    # Phase 1: Freeze all VAE, train head only (warmup)
+    # Phase 2: Freeze decoder, unfreeze all encoders
+    training_phase: 1
+
+    # --- Learning rates ---
+    lr_encoders: 1.0e-5                  # All encoder LR (phase 2 only)
+    # Classifier head uses general_config.lr (1e-3)
+
+    # --- Loss weights ---
+    # L = alpha_recon * NLL + alpha_kld * beta * KLD + alpha_center * L_center + alpha_cls * L_cls
+    alpha_recon: 1.0                     # Full reconstruction weight
+    alpha_kld: 1.0                       # Full KL divergence weight
+    alpha_center: 0.1                    # Conservative center loss weight
+    alpha_cls: 0.5                       # Classification loss weight
+
+    # --- Center loss ---
+    center_ema_decay: 0.99               # EMA decay for centroid updates
+
+    # --- Auxiliary classifier ---
+    classifier_hidden_dim: 32            # Small MLP (~5K params)
+
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+dataset_config:
+  # Training/test datasets (same as VAE pretraining)
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+
+  # Normalization statistics
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+  # -------------------------------------------------------------------------
+  # DataLoader Configuration
+  # -------------------------------------------------------------------------
+  dataloader_config:
+    num_workers: 4
+    prefetch_factor: 4
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+
+    dataset_kwargs:
+      load_fields:
+        - fhr
+        - up
+        - fhr_st
+        - fhr_ph
+        - fhr_up_ph
+        - target
+        - weight
+        - epoch
+        - cs_label
+        - bg_label
+        - guid
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: -23000
+      epoch_max: null
+      label: null
+      cache_size: 10000
+      trim_minutes: 1.0
+
+
+# =============================================================================
+# Advanced Configuration
+# =============================================================================
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-discriminative
+      run_name: null
+      artifact_location: null
+      log_model: true
+      tags:
+        project: teb_vae_discriminative
+        stage: dev
+
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val/total_loss"
+      patience: 30
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
