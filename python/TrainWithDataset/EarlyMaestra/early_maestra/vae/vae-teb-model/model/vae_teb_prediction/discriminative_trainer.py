@@ -368,6 +368,32 @@ class SamplePlotCallback(pl.Callback):
         self.plot_frequency = plot_frequency
         self.n_samples = n_samples
         self._stats: Any = None
+        self._cached_batch: Any = None
+
+    def on_fit_start(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        """Pre-cache a validation batch on CPU before training allocates GPU memory.
+
+        Fetching from the DataLoader mid-training can OOM because the dataset's
+        ``_create_tensor`` calls ``pin_memory()``, which needs GPU memory.
+        Caching here avoids that entirely.
+
+        Args:
+            trainer: The Lightning trainer instance.
+            pl_module: The Lightning module being trained.
+        """
+        if not trainer.is_global_zero:
+            return
+        try:
+            batch = next(iter(self.validation_dataloader))
+            # Store on CPU — we'll transfer to device at plot time
+            self._cached_batch = batch
+            logger.info("SamplePlotCallback: pre-cached validation batch on CPU.")
+        except Exception as exc:
+            logger.warning(f"SamplePlotCallback: failed to pre-cache batch: {exc}")
 
     def on_validation_epoch_end(
         self,
@@ -426,10 +452,12 @@ class SamplePlotCallback(pl.Callback):
         if self._stats is None:
             self._stats = _get_normalization_stats(self.validation_dataloader)
 
-        # Grab one batch from validation and transfer to device
-        batch = next(iter(self.validation_dataloader))
+        # Use pre-cached batch (avoids DataLoader worker OOM from pin_memory)
+        if self._cached_batch is None:
+            logger.warning("SamplePlotCallback: no cached batch, skipping.")
+            return
         batch = pl_module.transfer_batch_to_device(
-            batch, device, dataloader_idx=0,
+            self._cached_batch, device, dataloader_idx=0,
         )
 
         # Forward pass (no grad, eval mode)
