@@ -43,6 +43,91 @@ from train.graph_models_utils import load_checkpoint_strict
 from train.pl_model_base import LightningModelBase, MetricDict
 
 
+def map_labels(raw_labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """Map raw dataset labels ``{1, 2, 3}`` to 0-indexed class indices.
+
+    Args:
+        raw_labels: Per-sample labels of shape ``(B,)`` with values in
+            ``{1, 2, 3}`` (HEALTHY=1, ACIDOSIS=2, HIE=3).
+        num_classes: Number of target classes.
+
+            * ``2`` — Binary: HEALTHY (1) -> 0, UNHEALTHY (2 or 3) -> 1.
+            * ``3`` — Three-class: ``(raw_labels - 1)`` giving {0, 1, 2}.
+
+    Returns:
+        Integer tensor of shape ``(B,)`` with values in
+        ``{0, ..., num_classes - 1}``.
+
+    Raises:
+        ValueError: If ``num_classes`` is not 2 or 3.
+    """
+    if num_classes == 2:
+        return (raw_labels > 1).long()
+    elif num_classes == 3:
+        return (raw_labels - 1).long()
+    else:
+        raise ValueError(f"num_classes must be 2 or 3, got {num_classes}")
+
+
+def compute_class_weights_from_dataloader(
+    dataloader,
+    num_classes: int = 3,
+    max_batches: int = 50,
+) -> list[float]:
+    """Scan training data to compute inverse-frequency class weights.
+
+    Iterates over up to ``max_batches`` batches from the dataloader,
+    counts samples per class, and returns weights proportional to
+    ``1 / frequency``, normalized so the smallest weight equals 1.0.
+
+    Args:
+        dataloader: Training dataloader whose batches have a ``.target``
+            attribute of shape ``(B, T)`` with values in ``{1, 2, 3}``.
+        num_classes: Number of distinct classes (labels 1..num_classes).
+        max_batches: Maximum number of batches to scan. Set to 0 or
+            negative to scan the entire dataloader.
+
+    Returns:
+        List of ``num_classes`` floats — per-class weights ordered by
+        class index (class 1 first, class num_classes last).
+    """
+    counts = torch.zeros(num_classes, dtype=torch.long)
+    n_batches = 0
+
+    for n_batches, batch in enumerate(dataloader, start=1):
+        if 0 < max_batches < n_batches:
+            break
+        target_seq = batch.target  # (B, T)
+        raw_labels = target_seq.max(dim=1)[0]  # (B,) values in {1, 2, 3}
+        mapped = map_labels(raw_labels, num_classes)  # (B,) values in {0..C-1}
+        for c in range(num_classes):
+            counts[c] += (mapped == c).sum().item()
+
+    total = counts.sum().item()
+    if total == 0:
+        logger.warning("No samples found when computing class weights, using uniform weights")
+        return [1.0] * num_classes
+
+    # Inverse frequency: weight_c = total / (num_classes * count_c)
+    weights = []
+    for c in range(num_classes):
+        if counts[c] == 0:
+            weights.append(1.0)
+            logger.warning(f"Class {c + 1} has 0 samples in scanned batches")
+        else:
+            weights.append(total / (num_classes * counts[c].item()))
+
+    # Normalize so the smallest weight is 1.0
+    min_w = min(weights)
+    weights = [w / min_w for w in weights]
+
+    logger.info(
+        f"Auto class weights (scanned {n_batches} batches, "
+        f"{total} samples): counts={counts.tolist()}, weights={[f'{w:.2f}' for w in weights]}"
+    )
+    return weights
+
+
 class PlDiscriminativeSeqVae(LightningModelBase):
     """Lightning wrapper for discriminative VAE-TEB fine-tuning.
 
@@ -119,8 +204,10 @@ class PlDiscriminativeSeqVae(LightningModelBase):
         y_raw = batch.fhr         # (B, 4800)
         target_seq = batch.target  # (B, T) values in {1, 2, 3}
 
-        # Aggregate to single label per sample (take max across sequence)
-        labels = target_seq.max(dim=1)[0]  # (B,) values in {1, 2, 3}
+        # Aggregate to single label per sample and map to 0-indexed classes
+        raw_labels = target_seq.max(dim=1)[0]  # (B,) values in {1, 2, 3}
+        num_classes = self._orig_model.num_classes
+        labels = map_labels(raw_labels, num_classes)  # (B,) values in {0..C-1}
 
         # Forward pass
         forward_outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
@@ -148,6 +235,12 @@ class PlDiscriminativeSeqVae(LightningModelBase):
             "cls_accuracy": loss_dict["cls_accuracy"],
             "kld_beta": loss_dict["kld_beta"],
         }
+
+        # Per-class accuracies (only present when class has samples in batch)
+        for c in range(self._orig_model.num_classes):
+            key = f"cls_acc_class_{c}"
+            if key in loss_dict:
+                metrics[key] = loss_dict[key]
 
         # Log centroid distances (only on validation to avoid overhead)
         if stage == "val":
@@ -388,12 +481,20 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
         """
         super().__init__(config_file_path)
 
-    def create_model(self) -> None:
+    def create_model(
+        self,
+        class_weights: list[float] | None = None,
+    ) -> None:
         """Create the DiscriminativeSeqVae and wrap in Lightning.
 
         Reads configuration from ``model_config.discriminative`` and
         ``model_config.core_model_checkpoint`` to build the full training
         pipeline.
+
+        Args:
+            class_weights: Pre-computed class weights (e.g. from
+                ``compute_class_weights_from_dataloader``).  If provided,
+                overrides the ``class_weights`` value in the config file.
         """
         model_config = self.config.get("model_config", {})
         disc_config = model_config.get("discriminative", {})
@@ -410,6 +511,12 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
         logger.info(f"Pretrained VAE loaded from: {vae_checkpoint}")
 
         # 2. Wrap in DiscriminativeSeqVae
+        # Use passed-in class_weights (from auto-compute) or fall back to config
+        if class_weights is None:
+            cfg_weights = disc_config.get("class_weights")
+            if isinstance(cfg_weights, list):
+                class_weights = [float(w) for w in cfg_weights]
+
         self.pytorch_model = DiscriminativeSeqVae(
             vae_model=vae_model,
             num_classes=disc_config.get("num_classes", 3),
@@ -419,6 +526,7 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
             alpha_kld=disc_config.get("alpha_kld", 1.0),
             alpha_center=disc_config.get("alpha_center", 0.1),
             alpha_cls=disc_config.get("alpha_cls", 0.5),
+            class_weights=class_weights,
         )
 
         # 3. Apply phase freezing
@@ -594,12 +702,27 @@ def main() -> None:
         **dataset_kwargs,
     )
 
+    # Auto-compute class weights from training data if configured
+    disc_config = config.get("model_config", {}).get("discriminative", {})
+    num_classes = disc_config.get("num_classes", 3)
+    cfg_class_weights = disc_config.get("class_weights")
+
+    class_weights = None
+    if cfg_class_weights == "auto":
+        logger.info("Computing class weights automatically from training data...")
+        class_weights = compute_class_weights_from_dataloader(
+            train_dataloader, num_classes=num_classes,
+        )
+    elif isinstance(cfg_class_weights, list):
+        class_weights = [float(w) for w in cfg_class_weights]
+        logger.info(f"Using manual class weights from config: {class_weights}")
+
     graph_model = GraphModelDiscriminativeTrainer(
         config_file_path=r"config_discriminative.yaml"
     )
     graph_model.setup_config()
-    graph_model.create_model()
-    trainer = graph_model.train_model(train_dataloader, validation_dataloader)
+    graph_model.create_model(class_weights=class_weights)
+    graph_model.train_model(train_dataloader, validation_dataloader)
 
     end_time = time.time()
     logger.info(f"Training completed in {(end_time - start_time) / 60:.2f} minutes.")

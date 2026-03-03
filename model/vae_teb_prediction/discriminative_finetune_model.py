@@ -65,13 +65,15 @@ class DiscriminativeSeqVae(nn.Module):
         alpha_kld: float = 1.0,
         alpha_center: float = 0.1,
         alpha_cls: float = 0.5,
+        class_weights: list[float] | None = None,
     ) -> None:
         """Initialize the discriminative wrapper.
 
         Args:
             vae_model: A pretrained ``SeqVae`` instance (weights already
                 loaded).
-            num_classes: Number of clinical outcome classes.
+            num_classes: Number of clinical outcome classes (2 for binary
+                HEALTHY vs UNHEALTHY, or 3 for HEALTHY/ACIDOSIS/HIE).
             classifier_hidden_dim: Hidden dimension for the auxiliary
                 classifier MLP.
             center_ema_decay: EMA decay for centroid updates.
@@ -79,6 +81,10 @@ class DiscriminativeSeqVae(nn.Module):
             alpha_kld: Weight for KL divergence loss.
             alpha_center: Weight for temporal center loss.
             alpha_cls: Weight for auxiliary classification loss.
+            class_weights: Optional per-class weights for cross-entropy loss.
+                Length must equal ``num_classes``. Use inverse class frequency
+                to handle imbalanced datasets (e.g. ``[1.0, 5.0]`` for
+                binary when HEALTHY >> UNHEALTHY).
         """
         super().__init__()
         self.vae_model = vae_model
@@ -89,6 +95,16 @@ class DiscriminativeSeqVae(nn.Module):
         self.alpha_kld = alpha_kld
         self.alpha_center = alpha_center
         self.alpha_cls = alpha_cls
+
+        # Class weights for cross-entropy (handles class imbalance)
+        if class_weights is not None:
+            self.register_buffer(
+                "class_weights",
+                torch.tensor(class_weights, dtype=torch.float32),
+            )
+            logger.info(f"Using class weights for CE: {class_weights}")
+        else:
+            self.class_weights = None
 
         latent_dim = vae_model.latent_dim_z
 
@@ -202,8 +218,11 @@ class DiscriminativeSeqVae(nn.Module):
             y_st: Target scattering features, shape ``(B, T, 43)``.
             y_ph: Target phase harmonic features, shape ``(B, T, 44)``.
             y_raw: Raw target signal, shape ``(B, R)`` or ``(B, R, 1)``.
-            labels: Per-sample class labels, shape ``(B,)`` with values in
-                ``{1, 2, 3}``.
+            labels: Per-sample 0-indexed class indices, shape ``(B,)`` with
+                values in ``{0, ..., num_classes - 1}``.  The caller is
+                responsible for mapping raw dataset labels to this range
+                (e.g. binary: ``(raw > 1).long()``; 3-class:
+                ``(raw - 1).long()``).
             beta: KL divergence weight (same as pretrained model's beta).
 
         Returns:
@@ -227,20 +246,30 @@ class DiscriminativeSeqVae(nn.Module):
         nll_loss = vae_loss_dict["nll_loss"]
         kld_loss = vae_loss_dict["kld_loss"]
 
-        # --- Center loss ---
+        # --- Center loss (expects 0-indexed labels) ---
         z = forward_outputs["z"]  # (B, T, D)
         warmup_mask = forward_outputs["warmup_mask"]  # (T,)
         center_loss_val = self.center_loss(z, labels, warmup_mask=warmup_mask)
 
-        # --- Classification loss ---
+        # --- Classification loss (expects 0-indexed labels) ---
         cls_logits = forward_outputs["cls_logits"]  # (B, C)
-        # Map labels {1,2,3} -> {0,1,2} for cross-entropy
-        cls_targets = (labels - 1).long()
-        cls_loss = F.cross_entropy(cls_logits, cls_targets)
+        cls_targets = labels.long()
+        cls_loss = F.cross_entropy(
+            cls_logits, cls_targets, weight=self.class_weights,
+        )
 
         # Classification accuracy (detached, for monitoring only)
         cls_preds = forward_outputs["cls_preds"]
         cls_accuracy = (cls_preds == cls_targets).float().mean()
+
+        # Per-class accuracy
+        per_class_acc = {}
+        for c in range(self.num_classes):
+            mask = cls_targets == c
+            if mask.sum() > 0:
+                per_class_acc[f"cls_acc_class_{c}"] = (
+                    (cls_preds[mask] == cls_targets[mask]).float().mean().detach()
+                )
 
         # --- Combined loss ---
         total_loss = (
@@ -258,6 +287,7 @@ class DiscriminativeSeqVae(nn.Module):
             "cls_loss": cls_loss,
             "cls_accuracy": cls_accuracy.detach(),
             "kld_beta": torch.tensor(beta, device=total_loss.device),
+            **per_class_acc,
         }
 
     def get_encoder_params(self) -> list[nn.Parameter]:
