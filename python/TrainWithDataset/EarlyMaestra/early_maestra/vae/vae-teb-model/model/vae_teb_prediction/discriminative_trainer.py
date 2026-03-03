@@ -336,8 +336,9 @@ class SamplePlotCallback(pl.Callback):
     Every ``plot_frequency`` epochs, draws ``n_samples`` from the validation
     dataloader, runs a forward pass through the current model, and generates
     the same comprehensive reconstruction-analysis figure produced by
-    ``plot_single_samples.py``.  Plots are saved under
-    ``<output_dir>/sample_plots/epoch_XXXX/``.
+    ``plot_single_samples.py``.  All plots are saved in a single
+    ``<output_dir>/sample_plots/`` folder with epoch numbers in the filenames
+    (e.g. ``vae_reconstruction_analysis_epoch0010_sample0_guid_epoch-5000.pdf``).
 
     Attributes:
         validation_dataloader: Held reference to the validation dataloader.
@@ -434,29 +435,31 @@ class SamplePlotCallback(pl.Callback):
         if was_training:
             disc_model.train()
 
-        # Create per-epoch output directory
-        epoch_dir = self.output_dir / f"epoch_{trainer.current_epoch:04d}"
+        # Save all plots in a single folder with epoch in the filename
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        epoch = trainer.current_epoch
 
         n = min(self.n_samples, batch.fhr_st.size(0))
         for idx in range(n):
             guid = _extract_guid(batch, idx)
             epoch_val = _extract_epoch(batch, idx)
-            sample_name = _sanitize_folder_name(
+            base_name = _sanitize_folder_name(
                 guid or f"sample_{idx}", epoch_val or 0.0,
             )
+            sample_name = f"epoch{epoch:04d}_{base_name}"
             _plot_all_single_sample_plots(
                 runner=adapter,
                 batch=batch,
                 idx=idx,
                 outputs=outputs,
-                sample_dir=epoch_dir,
+                sample_dir=self.output_dir,
                 sample_name=sample_name,
                 stats=self._stats,
             )
 
         logger.info(
             f"Plotted {n} validation samples at epoch "
-            f"{trainer.current_epoch} -> {epoch_dir}"
+            f"{epoch} -> {self.output_dir}"
         )
 
 
