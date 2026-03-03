@@ -14,7 +14,8 @@ This module provides:
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Tuple
 
 import lightning as pl
 import numpy as np
@@ -221,6 +222,151 @@ class PlDiscriminativeSeqVae(LightningModelBase):
         return optimizer
 
 
+class _RunnerAdapter:
+    """Minimal stand-in for ``TestRunner`` used by the sample-plot callback.
+
+    ``_plot_all_single_sample_plots`` accesses ``runner.model``,
+    ``runner.warmup_steps``, and ``runner.decimation_factor``.  This adapter
+    exposes the underlying ``SeqVae`` with those attributes so the plotting
+    function works without importing the full testing infrastructure.
+    """
+
+    def __init__(self, vae_model: SeqVae) -> None:
+        self.model = vae_model
+        self.warmup_steps: int = int(vae_model.warmup_period)
+        self.decimation_factor: int = int(vae_model.decimation_factor)
+
+
+class SamplePlotCallback(pl.Callback):
+    """Lightning callback that generates single-sample VAE plots during training.
+
+    Every ``plot_frequency`` epochs, draws ``n_samples`` from the validation
+    dataloader, runs a forward pass through the current model, and generates
+    the same comprehensive reconstruction-analysis figure produced by
+    ``plot_single_samples.py``.  Plots are saved under
+    ``<output_dir>/sample_plots/epoch_XXXX/``.
+
+    Attributes:
+        validation_dataloader: Held reference to the validation dataloader.
+        output_dir: Root directory for sample plot output.
+        plot_frequency: Generate plots every N epochs.
+        n_samples: Number of samples to plot per epoch.
+    """
+
+    def __init__(
+        self,
+        validation_dataloader: Any,
+        output_dir: str,
+        plot_frequency: int = 10,
+        n_samples: int = 3,
+    ) -> None:
+        """Initialize the sample-plot callback.
+
+        Args:
+            validation_dataloader: Validation dataloader to draw samples from.
+            output_dir: Directory where ``sample_plots/`` will be created.
+            plot_frequency: Plot every N epochs.
+            n_samples: Number of samples to plot each time.
+        """
+        super().__init__()
+        self.validation_dataloader = validation_dataloader
+        self.output_dir = Path(output_dir) / "sample_plots"
+        self.plot_frequency = plot_frequency
+        self.n_samples = n_samples
+        self._stats: Any = None
+
+    def on_validation_epoch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        """Generate sample plots at the configured frequency.
+
+        Args:
+            trainer: The Lightning trainer instance.
+            pl_module: The Lightning module being trained.
+        """
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.plot_frequency != 0:
+            return
+
+        try:
+            self._generate_plots(trainer, pl_module)
+        except Exception as exc:
+            logger.warning(f"Sample plotting failed at epoch {epoch}: {exc}")
+
+    def _generate_plots(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        """Run forward pass on validation samples and generate plots.
+
+        Args:
+            trainer: The Lightning trainer instance.
+            pl_module: The Lightning module being trained.
+        """
+        # Lazy imports to avoid hard dependency on the testing module
+        from model.vae_teb_prediction.testing.plot_single_samples import (
+            _get_normalization_stats,
+            _plot_all_single_sample_plots,
+            _sanitize_folder_name,
+        )
+        from model.vae_teb_prediction.testing.collectors import (
+            _extract_epoch,
+            _extract_guid,
+        )
+
+        device = pl_module.device
+        disc_model: DiscriminativeSeqVae = pl_module._orig_model
+        vae_model = disc_model.vae_model
+        adapter = _RunnerAdapter(vae_model)
+
+        # Cache normalization stats on first call
+        if self._stats is None:
+            self._stats = _get_normalization_stats(self.validation_dataloader)
+
+        # Grab one batch from validation
+        batch = next(iter(self.validation_dataloader))
+
+        # Forward pass (no grad, eval mode)
+        was_training = disc_model.training
+        disc_model.eval()
+        with torch.no_grad():
+            outputs = disc_model(
+                y_st=batch.fhr_st.to(device),
+                y_ph=batch.fhr_ph.to(device),
+                x_ph=batch.fhr_up_ph.to(device),
+            )
+        if was_training:
+            disc_model.train()
+
+        # Create per-epoch output directory
+        epoch_dir = self.output_dir / f"epoch_{trainer.current_epoch:04d}"
+
+        n = min(self.n_samples, batch.fhr_st.size(0))
+        for idx in range(n):
+            guid = _extract_guid(batch, idx)
+            epoch_val = _extract_epoch(batch, idx)
+            sample_name = _sanitize_folder_name(
+                guid or f"sample_{idx}", epoch_val or 0.0,
+            )
+            _plot_all_single_sample_plots(
+                runner=adapter,
+                batch=batch,
+                idx=idx,
+                outputs=outputs,
+                sample_dir=epoch_dir,
+                sample_name=sample_name,
+                stats=self._stats,
+            )
+
+        logger.info(
+            f"Plotted {n} validation samples at epoch "
+            f"{trainer.current_epoch} -> {epoch_dir}"
+        )
+
+
 class GraphModelDiscriminativeTrainer(GraphModelBase):
     """Experiment scaffold for discriminative VAE-TEB fine-tuning.
 
@@ -331,7 +477,7 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
         checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
             monitor="val/total_loss",
-            filename="disc-finetune-epoch={epoch:02d}-loss={val/total_loss:.4f}",
+            filename="disc-finetune-epoch={epoch:02d}",
             save_top_k=callbacks_cfg.get("model_checkpoint", {}).get("save_top_k", 3),
             mode="min",
         )
@@ -342,12 +488,20 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
             verbose=True,
         )
 
+        sample_plot_callback = SamplePlotCallback(
+            validation_dataloader=validation_dataloader,
+            output_dir=self.train_results_dir,
+            plot_frequency=self.plot_every_epoch,
+            n_samples=3,
+        )
+
         callback_list = [
             metrics_callback,
             loss_plot_callback,
             hyperparam_callback,
             checkpoint_callback,
             early_stopping_callback,
+            sample_plot_callback,
         ]
 
         # Trainer config
