@@ -376,10 +376,16 @@ class SamplePlotCallback(pl.Callback):
     ) -> None:
         """Generate sample plots at the configured frequency.
 
+        Only runs on global rank 0 to avoid duplicate work and GPU memory
+        pressure on other ranks (matches ``PlottingAvgPredCallBack`` pattern).
+
         Args:
             trainer: The Lightning trainer instance.
             pl_module: The Lightning module being trained.
         """
+        if not trainer.is_global_zero:
+            return
+
         epoch = trainer.current_epoch
         if (epoch + 1) % self.plot_frequency != 0:
             return
@@ -420,47 +426,58 @@ class SamplePlotCallback(pl.Callback):
         if self._stats is None:
             self._stats = _get_normalization_stats(self.validation_dataloader)
 
-        # Grab one batch from validation
+        # Grab one batch from validation and transfer to device
         batch = next(iter(self.validation_dataloader))
+        batch = pl_module.transfer_batch_to_device(
+            batch, device, dataloader_idx=0,
+        )
 
         # Forward pass (no grad, eval mode)
-        was_training = disc_model.training
-        disc_model.eval()
-        with torch.no_grad():
-            outputs = disc_model(
-                y_st=batch.fhr_st.to(device),
-                y_ph=batch.fhr_ph.to(device),
-                x_ph=batch.fhr_up_ph.to(device),
-            )
-        if was_training:
-            disc_model.train()
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                outputs = disc_model(
+                    y_st=batch.fhr_st,
+                    y_ph=batch.fhr_ph,
+                    x_ph=batch.fhr_up_ph,
+                )
 
-        # Save all plots in a single folder with epoch in the filename
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        epoch = trainer.current_epoch
+            # Save all plots in a single folder with epoch in the filename
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            epoch = trainer.current_epoch
 
-        n = min(self.n_samples, batch.fhr_st.size(0))
-        for idx in range(n):
-            guid = _extract_guid(batch, idx)
-            epoch_val = _extract_epoch(batch, idx)
-            base_name = _sanitize_folder_name(
-                guid or f"sample_{idx}", epoch_val or 0.0,
-            )
-            sample_name = f"epoch{epoch:04d}_{base_name}"
-            _plot_all_single_sample_plots(
-                runner=adapter,
-                batch=batch,
-                idx=idx,
-                outputs=outputs,
-                sample_dir=self.output_dir,
-                sample_name=sample_name,
-                stats=self._stats,
-            )
+            # Move outputs to CPU before plotting to free GPU memory
+            outputs_cpu = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in outputs.items()
+            }
+            del outputs
+            torch.cuda.empty_cache()
 
-        logger.info(
-            f"Plotted {n} validation samples at epoch "
-            f"{epoch} -> {self.output_dir}"
-        )
+            n = min(self.n_samples, batch.fhr_st.size(0))
+            for idx in range(n):
+                guid = _extract_guid(batch, idx)
+                epoch_val = _extract_epoch(batch, idx)
+                base_name = _sanitize_folder_name(
+                    guid or f"sample_{idx}", epoch_val or 0.0,
+                )
+                sample_name = f"epoch{epoch:04d}_{base_name}"
+                _plot_all_single_sample_plots(
+                    runner=adapter,
+                    batch=batch,
+                    idx=idx,
+                    outputs=outputs_cpu,
+                    sample_dir=self.output_dir,
+                    sample_name=sample_name,
+                    stats=self._stats,
+                )
+
+            logger.info(
+                f"Plotted {n} validation samples at epoch "
+                f"{epoch} -> {self.output_dir}"
+            )
+        finally:
+            pl_module.train()
 
 
 class GraphModelDiscriminativeTrainer(GraphModelBase):
