@@ -36,7 +36,7 @@ model_config:
   VAE_model:
     beta_schedule: constant
     beta_const_val: 0.005
-    kld_beta: 0.05                       # Same as pretrained model
+    kld_beta: 0.001                      # Conservative KLD weight for fine-tuning
 
   # Pre-trained VAE checkpoint to fine-tune
   core_model_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
@@ -45,7 +45,10 @@ model_config:
   # Discriminative Fine-Tuning Configuration
   # -------------------------------------------------------------------------
   discriminative:
-    num_classes: 3                       # HEALTHY=1, ACIDOSIS=2, HIE=3
+    # --- Number of classes ---
+    # 2 = binary (HEALTHY=0 vs UNHEALTHY=1, where Acidosis+HIE are both UNHEALTHY)
+    # 3 = three-class (HEALTHY=0, ACIDOSIS=1, HIE=2)
+    num_classes: 2
 
     # --- Training phase ---
     # Phase 1: Freeze all VAE, train head only (warmup)
@@ -53,21 +56,29 @@ model_config:
     training_phase: 1
 
     # --- Learning rates ---
-    lr_encoders: 1.0e-5                  # All encoder LR (phase 2 only)
+    lr_encoders: 5.0e-6                  # All encoder LR (phase 2 only)
     # Classifier head uses general_config.lr (1e-3)
+
+    # --- Class weights for cross-entropy ---
+    # Compensates for class imbalance (HEALTHY >> UNHEALTHY).
+    # Options:
+    #   "auto" — scan training data at startup, compute inverse-frequency weights
+    #   [1.0, 5.0] — manual weights [HEALTHY, UNHEALTHY] (binary)
+    #   null — no weighting (not recommended for imbalanced data)
+    class_weights: auto
 
     # --- Loss weights ---
     # L = alpha_recon * NLL + alpha_kld * beta * KLD + alpha_center * L_center + alpha_cls * L_cls
     alpha_recon: 1.0                     # Full reconstruction weight
     alpha_kld: 1.0                       # Full KL divergence weight
-    alpha_center: 0.1                    # Conservative center loss weight
-    alpha_cls: 0.5                       # Classification loss weight
+    alpha_center: 0.01                   # Start very conservative, increase if needed
+    alpha_cls: 0.1                       # Start low, the class_weights handle imbalance
 
     # --- Center loss ---
     center_ema_decay: 0.99               # EMA decay for centroid updates
 
     # --- Auxiliary classifier ---
-    classifier_hidden_dim: 32            # Small MLP (~5K params)
+    classifier_hidden_dim: 64            # MLP hidden dim
 
 
 # =============================================================================
