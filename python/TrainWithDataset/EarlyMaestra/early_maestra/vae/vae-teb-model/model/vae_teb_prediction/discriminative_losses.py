@@ -9,8 +9,8 @@ with class-discriminative signals:
    a lightweight MLP that produces inter-class separation gradients.
 
 Together they enable phased fine-tuning of a pretrained SeqVae so that distinct
-outcome classes (HEALTHY, ACIDOSIS, HIE) occupy separable regions of the latent
-space while preserving reconstruction quality.
+outcome classes (e.g. HEALTHY vs UNHEALTHY, or HEALTHY/ACIDOSIS/HIE) occupy
+separable regions of the latent space while preserving reconstruction quality.
 """
 
 from __future__ import annotations
@@ -74,8 +74,10 @@ class TemporalCenterLoss(nn.Module):
         Args:
             z: Latent vectors of shape ``(B, T, D)`` where *D* equals
                 ``latent_dim``.
-            labels: Per-sample class labels of shape ``(B,)`` with integer
-                values in ``{1, 2, 3}`` (mapped internally to ``{0, 1, 2}``).
+            labels: Per-sample 0-indexed class indices of shape ``(B,)``
+                with integer values in ``{0, ..., num_classes - 1}``.
+                The caller is responsible for mapping raw dataset labels
+                to this range.
             warmup_mask: Optional boolean mask of shape ``(T,)`` where
                 ``True`` indicates a valid (post-warmup) timestep.  If
                 ``None`` all timesteps are used.
@@ -85,8 +87,7 @@ class TemporalCenterLoss(nn.Module):
         """
         B, T, _ = z.shape
 
-        # Map labels from {1,2,3} to {0,1,2}
-        class_ids = (labels - 1).long()  # (B,)
+        class_ids = labels.long()  # (B,)
 
         # Expand class ids to every timestep: (B,) -> (B, T)
         class_ids_exp = class_ids.unsqueeze(1).expand(B, T)
@@ -125,7 +126,8 @@ class TemporalCenterLoss(nn.Module):
 
         Args:
             z: Detached latent vectors of shape ``(B, T, D)``.
-            class_ids: Class indices of shape ``(B,)`` in ``{0, 1, 2}``.
+            class_ids: 0-indexed class indices of shape ``(B,)`` in
+                ``{0, ..., num_classes - 1}``.
             warmup_mask: Optional boolean mask of shape ``(T,)``.
         """
         alpha = self.ema_decay
