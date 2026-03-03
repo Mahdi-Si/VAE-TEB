@@ -17,7 +17,6 @@ general_config:
   cuda_devices: [0, 1, 2, 3, 4]
   lr: 0.001                              # Classifier head LR
   lr_milestone: [100]                    # LR decay epochs
-  checkpoint_frequency: 1
   plot_frequency: 1
   epochs: 200                            # Phase 1: ~10 epochs; Phase 2: ~200
   accumulate_grad_batches: 1
