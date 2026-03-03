@@ -18,13 +18,68 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 
 import torch
 import torch.nn as nn
 
 from train.graph_models_utils import load_checkpoint_strict
 from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
+
+
+def _infer_discriminative_hparams(
+    checkpoint_path: Union[str, Path],
+) -> Dict[str, Any]:
+    """Infer DiscriminativeSeqVae constructor kwargs from checkpoint tensor shapes.
+
+    Inspects the checkpoint state dict for discriminative-specific tensors
+    (``center_loss.centers``, ``classifier_head`` weights, ``class_weights``
+    buffer) and returns the constructor arguments needed to recreate a
+    ``DiscriminativeSeqVae`` with matching dimensions.
+
+    This avoids hard-coding defaults (e.g. ``num_classes=3``) that may not
+    match the checkpoint, which would cause shape mismatches during strict
+    loading.
+
+    Args:
+        checkpoint_path: Path to a Lightning or raw PyTorch checkpoint file.
+
+    Returns:
+        Dictionary of keyword arguments suitable for
+        ``DiscriminativeSeqVae(**kwargs)``.  May include ``num_classes``,
+        ``classifier_hidden_dim``, and ``class_weights``.  Returns an empty
+        dict if the checkpoint cannot be read or contains no discriminative
+        keys.
+    """
+    raw = torch.load(str(checkpoint_path), map_location="cpu")
+
+    # Extract state dict from Lightning checkpoint structure
+    sd: Any = raw
+    if isinstance(raw, dict):
+        for key in ("state_dict", "model_state_dict"):
+            if key in raw:
+                sd = raw[key]
+                break
+
+    if not isinstance(sd, dict):
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+
+    for key, val in sd.items():
+        if not isinstance(val, torch.Tensor):
+            continue
+        if key.endswith("center_loss.centers"):
+            kwargs["num_classes"] = val.shape[0]
+        elif key.endswith("classifier_head.mlp.0.weight"):
+            kwargs["classifier_hidden_dim"] = val.shape[0]
+        elif key.endswith("class_weights"):
+            # Create a dummy weight list of the right length so that the
+            # constructor registers a buffer matching the checkpoint.
+            kwargs.setdefault("num_classes", val.shape[0])
+            kwargs["class_weights"] = [1.0] * val.shape[0]
+
+    return kwargs
 
 
 @dataclass
@@ -120,8 +175,19 @@ class TestRunner:
                 DiscriminativeSeqVae,
             )
 
+            # Infer hyperparameters (num_classes, hidden_dim, class_weights)
+            # from the checkpoint's tensor shapes so the wrapper dimensions
+            # match the saved weights exactly.
+            disc_kwargs = _infer_discriminative_hparams(checkpoint_path)
+            if disc_kwargs:
+                logger.info(
+                    f"Inferred discriminative hparams from checkpoint: {disc_kwargs}"
+                )
+
             vae_model = SeqVae()
-            disc_model = DiscriminativeSeqVae(vae_model=vae_model)
+            disc_model = DiscriminativeSeqVae(
+                vae_model=vae_model, **disc_kwargs
+            )
             loaded = load_checkpoint_strict(
                 disc_model,
                 checkpoint_path,
