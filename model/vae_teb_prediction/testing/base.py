@@ -72,8 +72,13 @@ class TestRunner:
         device: Optional[torch.device] = None,
         **model_kwargs: Any,
     ) -> "TestRunner":
-        """
-        Create a TestRunner by loading a model from a checkpoint file.
+        """Create a TestRunner by loading a model from a checkpoint file.
+
+        Supports both standard SeqVae checkpoints and discriminative fine-tuning
+        checkpoints (``DiscriminativeSeqVae``).  The checkpoint type is
+        auto-detected: if loading into a bare ``SeqVae`` fails, the method
+        retries via a ``DiscriminativeSeqVae`` wrapper and extracts the inner
+        ``vae_model`` for testing.
 
         Args:
             checkpoint_path: Path to the model checkpoint file (.ckpt or .pt).
@@ -91,28 +96,48 @@ class TestRunner:
             ...     device=torch.device("cuda:0")
             ... )
         """
+        from loguru import logger
+
         # Auto-detect device if not provided
         if device is None:
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # Create model with architecture parameters
-        # Note: model_kwargs should match the checkpoint's architecture
-        # (e.g., latent_dim, hidden_dim, etc.)
+        # --- Attempt 1: load as a standard SeqVae checkpoint ---
         model = SeqVae()
-
-        # Load checkpoint using the robust loader that handles:
-        # - PyTorch Lightning checkpoints
-        # - torch.compile() wrapped models
-        # - Various state_dict key prefixes
         loaded = load_checkpoint_strict(model, checkpoint_path)
 
-        if loaded is None:
-            raise RuntimeError(
-                f"Failed to load checkpoint '{checkpoint_path}'. "
-                f"Check logs for details. Ensure model_kwargs match the checkpoint architecture."
+        if loaded is not None:
+            model = model.to(device)
+        else:
+            # --- Attempt 2: load as a discriminative fine-tuning checkpoint ---
+            # Discriminative checkpoints have keys prefixed with ``vae_model.``
+            # plus ``center_loss.*`` and ``classifier_head.*``.  We load into
+            # the full wrapper, then extract the inner SeqVae for testing.
+            logger.info(
+                "Standard SeqVae load failed — trying discriminative checkpoint."
+            )
+            from model.vae_teb_prediction.discriminative_finetune_model import (
+                DiscriminativeSeqVae,
             )
 
-        model = model.to(device)
+            vae_model = SeqVae()
+            disc_model = DiscriminativeSeqVae(vae_model=vae_model)
+            loaded = load_checkpoint_strict(
+                disc_model,
+                checkpoint_path,
+                module_attr_names=["vae_model"],
+            )
+            if loaded is None:
+                raise RuntimeError(
+                    f"Failed to load checkpoint '{checkpoint_path}'. "
+                    f"Tried both SeqVae and DiscriminativeSeqVae layouts. "
+                    f"Check logs for details."
+                )
+            # Extract the fine-tuned SeqVae for testing
+            model = disc_model.vae_model.to(device)
+            logger.info(
+                "Loaded discriminative checkpoint — using inner SeqVae for testing."
+            )
 
         # Extract warmup and decimation from loaded model
         warmup = int(getattr(model, "warmup_period", 30))
