@@ -511,6 +511,17 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
         ``model_config.core_model_checkpoint`` to build the full training
         pipeline.
 
+        The checkpoint can be either:
+
+        * An original pretrained VAE checkpoint (keys match ``SeqVae``) —
+          used for Phase 1 training.
+        * A Phase 1 discriminative checkpoint (keys match
+          ``DiscriminativeSeqVae``) — used for Phase 2 training.
+
+        ``load_checkpoint_strict`` automatically discovers both the wrapper
+        and the nested ``SeqVae`` (via ``module_attr_names=["vae_model"]``)
+        and loads into whichever module matches the checkpoint keys.
+
         Args:
             class_weights: Pre-computed class weights (e.g. from
                 ``compute_class_weights_from_dataloader``).  If provided,
@@ -525,10 +536,8 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
                 "model_config.core_model_checkpoint must be provided"
             )
 
-        # 1. Instantiate and load pretrained SeqVae
+        # 1. Instantiate SeqVae (weights loaded below)
         vae_model = SeqVae()
-        load_checkpoint_strict(model=vae_model, checkpoint=vae_checkpoint)
-        logger.info(f"Pretrained VAE loaded from: {vae_checkpoint}")
 
         # 2. Wrap in DiscriminativeSeqVae
         # Use passed-in class_weights (from auto-compute) or fall back to config
@@ -539,17 +548,27 @@ class GraphModelDiscriminativeTrainer(GraphModelBase):
 
         self.pytorch_model = DiscriminativeSeqVae(
             vae_model=vae_model,
-            num_classes=disc_config.get("num_classes", 3),
-            classifier_hidden_dim=disc_config.get("classifier_hidden_dim", 32),
+            num_classes=disc_config.get("num_classes", 2),
+            classifier_hidden_dim=disc_config.get("classifier_hidden_dim", 64),
             center_ema_decay=disc_config.get("center_ema_decay", 0.99),
             alpha_recon=disc_config.get("alpha_recon", 1.0),
             alpha_kld=disc_config.get("alpha_kld", 1.0),
-            alpha_center=disc_config.get("alpha_center", 0.1),
-            alpha_cls=disc_config.get("alpha_cls", 0.5),
+            alpha_center=disc_config.get("alpha_center", 0.01),
+            alpha_cls=disc_config.get("alpha_cls", 0.1),
             class_weights=class_weights,
         )
 
-        # 3. Apply phase freezing
+        # 3. Load checkpoint — works for both pretrained VAE and Phase 1
+        #    discriminative checkpoints. "vae_model" tells the loader to
+        #    also try the nested SeqVae when matching keys.
+        load_checkpoint_strict(
+            model=self.pytorch_model,
+            checkpoint=vae_checkpoint,
+            module_attr_names=["vae_model"],
+        )
+        logger.info(f"Checkpoint loaded from: {vae_checkpoint}")
+
+        # 4. Apply phase freezing
         training_phase = disc_config.get("training_phase", 1)
         self.pytorch_model.freeze_for_phase(training_phase)
 
