@@ -101,6 +101,51 @@ class GuidCoverageResult:
     error_msg: Optional[str] = None
 
 
+@dataclass
+class GuidScreeningResult:
+    """Pre-screening result for a single GUID before fold assignment.
+
+    Attributes:
+        guid: Recording identifier (filename stem).
+        record_path: Full path to the .mat file.
+        n_total_segments: Segments after MIMO prepare_data (before dedup).
+        n_after_dedup: Segments remaining after deduplication.
+        n_valid_segments: Segments passing weight + flat-region filters.
+        n_low_weight: Segments rejected by weight threshold.
+        n_flat_region: Segments rejected by flat-region detection.
+        n_duplicate: Segments removed during deduplication.
+        estimated_valid_hours: Conservative coverage estimate from valid
+            segment count: ``(n - 1) * step_minutes + segment_minutes``
+            converted to hours.
+        has_labor_onset: Whether labor onset data is available for this GUID.
+        labor_onset_hours: Labor onset time in hours relative to delivery.
+            ``float('nan')`` if unavailable.
+        domain_start_range: ``(min, max)`` domain_start of valid segments
+            in seconds. ``(nan, nan)`` if no valid segments.
+        n_post_delivery: Number of valid segments with ``domain_start >= 0``.
+        rejection_reason: Human-readable reason if GUID is rejected, else
+            ``None``.
+        error: Whether processing raised an exception.
+        error_msg: Exception message if ``error`` is True.
+    """
+    guid: str
+    record_path: str
+    n_total_segments: int
+    n_after_dedup: int
+    n_valid_segments: int
+    n_low_weight: int
+    n_flat_region: int
+    n_duplicate: int
+    estimated_valid_hours: float
+    has_labor_onset: bool
+    labor_onset_hours: float
+    domain_start_range: Tuple[float, float]
+    n_post_delivery: int
+    rejection_reason: Optional[str]
+    error: bool = False
+    error_msg: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # HDF5 reader
 # ---------------------------------------------------------------------------

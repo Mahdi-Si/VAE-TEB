@@ -11,17 +11,18 @@ import matplotlib.pyplot as plt
 import random
 
 from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
+import json
 import shutil
 import logging
 import traceback
 import math
 import random
 import h5py
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from sklearn.model_selection import KFold
 
 from hdf5_dataset import create_initial_hdf5, append_sample
-from guid_analysis import GuidTrackingEntry
+from guid_analysis import GuidTrackingEntry, GuidScreeningResult
 
 
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering import KymatioPhaseScattering1D
@@ -50,9 +51,14 @@ torch.cuda.manual_seed(42)
 #-----------------------------------------------------------------------------------------------------------------------
 
 def _normalize_guid(guid_str):
-    """Normalize a GUID string for matching: uppercase, remove hyphens."""
-    # return guid_str.strip().upper().replace('-', '')
-    return guid_str.strip()  # passthrough for debugging
+    """Normalize a GUID string for matching: uppercase, remove hyphens.
+
+    The labor onset CSV may have GUIDs formatted as
+    ``8CFD48E7-EC58-42F1-...`` while .mat filenames use
+    ``8CFD48E7EC5842F1...`` (or vice versa).  Normalizing both sides
+    ensures reliable matching.
+    """
+    return guid_str.strip().upper().replace('-', '')
 
 
 def load_labor_onset_data(csv_path):
@@ -225,6 +231,314 @@ def deduplicate_segments(domain_starts, sample_weights):
     keep_indices.sort()
     removed_indices.sort()
     return keep_indices, removed_indices, duplicate_groups
+
+
+def prescreen_guid(record_path, base_block_size=3520, overlap_percentage=1/22,
+                   labor_onset_map=None):
+    """Run MIMO + quality filtering on a single .mat file WITHOUT scattering.
+
+    Extracts the same segment pipeline as
+    ``create_hdf5_dataset_from_records_list`` (MIMO load, prepare_data,
+    sanitization, deduplication, weight + flat-region filtering) but skips
+    the expensive scattering transform, making it ~100x faster.
+
+    Args:
+        record_path: Full path to the .mat file.
+        base_block_size: Base block size for ``prepare_data``
+            (default 3520 -> 5280 sample segments = 22 min at 4 Hz).
+        overlap_percentage: Overlap fraction for ``split_long``
+            (default 1/22 -> 21 min step).
+        labor_onset_map: Optional dict mapping normalized GUID ->
+            labor onset time in seconds (from ``load_labor_onset_data``).
+
+    Returns:
+        GuidScreeningResult: Screening outcome for this GUID.
+    """
+    signal_length = int(base_block_size * 1.5)
+    step_size = int(signal_length * (1 - overlap_percentage))
+    segment_minutes = signal_length / (4 * 60)  # at 4 Hz
+    step_minutes = step_size / (4 * 60)
+
+    guid_key = os.path.splitext(os.path.basename(record_path))[0]
+
+    # Default error result
+    def _error_result(msg):
+        return GuidScreeningResult(
+            guid=guid_key, record_path=record_path,
+            n_total_segments=0, n_after_dedup=0, n_valid_segments=0,
+            n_low_weight=0, n_flat_region=0, n_duplicate=0,
+            estimated_valid_hours=0.0, has_labor_onset=False,
+            labor_onset_hours=float('nan'),
+            domain_start_range=(float('nan'), float('nan')),
+            n_post_delivery=0, rejection_reason=None,
+            error=True, error_msg=msg)
+
+    try:
+        # --- MIMO load & prepare (identical to create_hdf5_dataset_from_records_list) ---
+        mimo_adaptor = EarlyMaestraMimoAdaptor(
+            do_transpose=True, process_targets=True,
+            n_aux_labels=None, signal_indices=range(0, 2),
+            n_input_chan=2, labels=["HIE", "ACIDOSIS", "HEALTHY"],
+            up_shift_secs=-20, default_target_index=0)
+        mimo_adaptor.read_single_input(
+            record_path, out_dec_factor=16, out_dec_factor_offset=0,
+            target_is_onehot=True, dtype=np.float32)
+        mimo_prepared, _ = mimo_adaptor.mimo.prepare_data(
+            batch_size=1, do_evaluate=True, align_left=True,
+            do_split=True, do_pad=True, do_reflect=True,
+            base_length=base_block_size, do_equalize=True, do_merge=True,
+            min_domain_start=[-44640, -44640],
+            max_domain_start=[np.inf, np.inf],
+            overlap_percentage=overlap_percentage)
+
+        fhr = mimo_prepared.block_input[:, :, 1].copy()
+        up = mimo_prepared.block_input[:, :, 0].copy()
+        domain_starts = mimo_prepared.domain_start
+        sample_weights = mimo_prepared.sample_weights
+        n_total = fhr.shape[0]
+
+        # --- Sanitize signals ---
+        interpolate_bad_values(fhr)
+        interpolate_bad_values(up)
+        fhr = np.clip(fhr, 0, 500).astype(np.float32)
+        up = np.clip(up, -50, 500).astype(np.float32)
+        tiny = np.finfo(np.float32).tiny
+        fhr[(fhr != 0) & (np.abs(fhr) < tiny)] = 0.0
+        up[(up != 0) & (np.abs(up) < tiny)] = 0.0
+
+        # --- Deduplicate ---
+        keep_idx, removed_idx, _ = deduplicate_segments(domain_starts, sample_weights)
+        n_duplicate = len(removed_idx)
+        if removed_idx:
+            fhr = fhr[keep_idx]
+            up = up[keep_idx]
+            sample_weights = sample_weights[keep_idx]
+            domain_starts = [domain_starts[i] for i in keep_idx]
+        n_after_dedup = fhr.shape[0]
+
+        # --- Quality filtering (weight threshold + flat region) ---
+        n_low_weight = 0
+        n_flat_region = 0
+        valid_domain_starts = []
+        for i in range(fhr.shape[0]):
+            if np.mean(sample_weights[i, :]) < 0.90:
+                n_low_weight += 1
+                continue
+            fhr_flat = find_flat_regions(fhr[i, :], tolerance=1e-9)
+            up_flat = find_flat_regions(up[i, :], tolerance=1e-9)
+            fhr_lens = [end - start + 1 for start, end in fhr_flat]
+            up_lens = [end - start + 1 for start, end in up_flat]
+            max_flat_fhr = max(fhr_lens, default=0)
+            max_flat_up = max(up_lens, default=0)
+            total_flat_fhr = sum(l for l in fhr_lens if l >= 240)
+            if (max_flat_fhr > 480 or max_flat_up > 1200
+                    or total_flat_fhr > 1200):
+                n_flat_region += 1
+            else:
+                valid_domain_starts.append(domain_starts[i])
+
+        n_valid = len(valid_domain_starts)
+
+        # --- Coverage estimate ---
+        if n_valid > 0:
+            estimated_hours = ((n_valid - 1) * step_minutes + segment_minutes) / 60
+        else:
+            estimated_hours = 0.0
+
+        # --- Labor onset lookup ---
+        has_labor_onset = False
+        labor_onset_hours = float('nan')
+        if labor_onset_map:
+            normalized_key = _normalize_guid(guid_key)
+            lo_sec = labor_onset_map.get(normalized_key, float('nan'))
+            if not math.isnan(lo_sec):
+                has_labor_onset = True
+                labor_onset_hours = lo_sec / 3600.0
+
+        # --- Domain start range & post-delivery count ---
+        if valid_domain_starts:
+            ds_range = (min(valid_domain_starts), max(valid_domain_starts))
+            n_post_delivery = sum(1 for ds in valid_domain_starts if ds >= 0)
+        else:
+            ds_range = (float('nan'), float('nan'))
+            n_post_delivery = 0
+
+        return GuidScreeningResult(
+            guid=guid_key, record_path=record_path,
+            n_total_segments=n_total, n_after_dedup=n_after_dedup,
+            n_valid_segments=n_valid, n_low_weight=n_low_weight,
+            n_flat_region=n_flat_region, n_duplicate=n_duplicate,
+            estimated_valid_hours=estimated_hours,
+            has_labor_onset=has_labor_onset,
+            labor_onset_hours=labor_onset_hours,
+            domain_start_range=ds_range,
+            n_post_delivery=n_post_delivery,
+            rejection_reason=None)
+
+    except Exception as e:
+        return _error_result(str(e))
+
+
+def prescreen_guids_for_classification(
+    candidate_files, labor_onset_map=None,
+    base_block_size=3520, overlap_percentage=1/22,
+    min_segments_unhealthy=6, min_segments_healthy=9,
+    max_post_delivery_ratio=0.30, output_dir=None):
+    """Pre-screen all classification candidate GUIDs and return filtered file lists.
+
+    Runs ``prescreen_guid`` on every candidate, applies per-class acceptance
+    criteria, logs a comprehensive summary table, and optionally saves
+    screening results as JSON for reproducibility.
+
+    Args:
+        candidate_files: Dict mapping subgroup name -> list of .mat file paths.
+            Subgroup names must start with ``acidosis_``, ``hie_``, or
+            ``healthy_`` to determine class-specific thresholds.
+        labor_onset_map: Optional dict from ``load_labor_onset_data``.
+        base_block_size: Base block size for MIMO (default 3520).
+        overlap_percentage: Overlap fraction (default 1/22).
+        min_segments_unhealthy: Minimum valid segments for acidosis/HIE GUIDs.
+        min_segments_healthy: Minimum valid segments for healthy GUIDs.
+        max_post_delivery_ratio: Reject GUIDs where more than this fraction
+            of valid segments are post-delivery (``domain_start >= 0``).
+        output_dir: If provided, save ``guid_screening_results.json`` here.
+
+    Returns:
+        Dict mapping subgroup name -> list of .mat file paths that passed
+        screening.
+
+    Raises:
+        ValueError: If any subgroup is entirely emptied by screening.
+    """
+    all_results: Dict[str, List[GuidScreeningResult]] = {}
+    filtered_files: Dict[str, List[str]] = {}
+
+    total_candidates = sum(len(v) for v in candidate_files.values())
+    logger.info(f"Pre-screening {total_candidates} GUIDs across "
+                f"{len(candidate_files)} subgroups")
+
+    for subgroup, file_list in candidate_files.items():
+        results = []
+        for record_path in tqdm(file_list,
+                                desc=f"Pre-screening {subgroup}",
+                                leave=False):
+            result = prescreen_guid(
+                record_path, base_block_size=base_block_size,
+                overlap_percentage=overlap_percentage,
+                labor_onset_map=labor_onset_map)
+
+            # --- Apply rejection criteria ---
+            is_unhealthy = subgroup.startswith(('acidosis_', 'hie_'))
+            min_segs = min_segments_unhealthy if is_unhealthy else min_segments_healthy
+
+            if result.error:
+                result.rejection_reason = f"processing error: {result.error_msg}"
+            elif result.n_valid_segments < min_segs:
+                result.rejection_reason = (
+                    f"insufficient segments: {result.n_valid_segments} < {min_segs} "
+                    f"(~{result.estimated_valid_hours:.1f}h)")
+            elif not is_unhealthy and not result.has_labor_onset:
+                result.rejection_reason = "healthy GUID missing labor onset data"
+            elif (result.n_valid_segments > 0
+                  and result.n_post_delivery / result.n_valid_segments
+                      > max_post_delivery_ratio):
+                result.rejection_reason = (
+                    f"post-delivery ratio too high: "
+                    f"{result.n_post_delivery}/{result.n_valid_segments} "
+                    f"= {result.n_post_delivery/result.n_valid_segments:.0%} "
+                    f"> {max_post_delivery_ratio:.0%}")
+
+            results.append(result)
+
+        all_results[subgroup] = results
+        accepted = [r for r in results if r.rejection_reason is None]
+        filtered_files[subgroup] = [r.record_path for r in accepted]
+
+    # --- Log summary table ---
+    logger.info("=" * 80)
+    logger.info("GUID PRE-SCREENING SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"{'Subgroup':<28} {'Before':>7} {'After':>7} {'Rejected':>8} "
+                f"{'Error':>6} {'LowSeg':>7} {'NoTLO':>6} {'PostDel':>8}")
+    logger.info("-" * 80)
+
+    total_before = 0
+    total_after = 0
+    for subgroup in candidate_files:
+        results = all_results[subgroup]
+        n_before = len(results)
+        accepted = [r for r in results if r.rejection_reason is None]
+        n_after = len(accepted)
+        n_error = sum(1 for r in results if r.error)
+        n_low_seg = sum(1 for r in results
+                        if r.rejection_reason and 'insufficient segments' in r.rejection_reason)
+        n_no_tlo = sum(1 for r in results
+                       if r.rejection_reason and 'missing labor onset' in r.rejection_reason)
+        n_post_del = sum(1 for r in results
+                         if r.rejection_reason and 'post-delivery ratio' in r.rejection_reason)
+        total_before += n_before
+        total_after += n_after
+        logger.info(f"{subgroup:<28} {n_before:>7} {n_after:>7} "
+                    f"{n_before - n_after:>8} {n_error:>6} "
+                    f"{n_low_seg:>7} {n_no_tlo:>6} {n_post_del:>8}")
+
+    logger.info("-" * 80)
+    logger.info(f"{'TOTAL':<28} {total_before:>7} {total_after:>7} "
+                f"{total_before - total_after:>8}")
+    logger.info("=" * 80)
+
+    # --- Warnings ---
+    for subgroup in candidate_files:
+        n_before = len(all_results[subgroup])
+        n_after = len(filtered_files[subgroup])
+        if n_after == 0:
+            raise ValueError(
+                f"Pre-screening emptied subgroup '{subgroup}' "
+                f"({n_before} -> 0 GUIDs). Lower min_segments thresholds or "
+                f"check data quality.")
+        reject_pct = (n_before - n_after) / n_before * 100 if n_before else 0
+        if reject_pct > 50:
+            logger.warning(
+                f"Subgroup '{subgroup}': {reject_pct:.0f}% rejected "
+                f"({n_before} -> {n_after})")
+
+    # --- Save screening results as JSON ---
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(output_dir, "guid_screening_results.json")
+        serializable = {}
+        for subgroup, results in all_results.items():
+            serializable[subgroup] = []
+            for r in results:
+                entry = {
+                    'guid': r.guid,
+                    'record_path': r.record_path,
+                    'n_total_segments': r.n_total_segments,
+                    'n_after_dedup': r.n_after_dedup,
+                    'n_valid_segments': r.n_valid_segments,
+                    'n_low_weight': r.n_low_weight,
+                    'n_flat_region': r.n_flat_region,
+                    'n_duplicate': r.n_duplicate,
+                    'estimated_valid_hours': r.estimated_valid_hours,
+                    'has_labor_onset': r.has_labor_onset,
+                    'labor_onset_hours': (None if math.isnan(r.labor_onset_hours)
+                                          else r.labor_onset_hours),
+                    'domain_start_range': [
+                        None if math.isnan(r.domain_start_range[0])
+                        else r.domain_start_range[0],
+                        None if math.isnan(r.domain_start_range[1])
+                        else r.domain_start_range[1]],
+                    'n_post_delivery': r.n_post_delivery,
+                    'rejection_reason': r.rejection_reason,
+                    'error': r.error,
+                    'error_msg': r.error_msg,
+                }
+                serializable[subgroup].append(entry)
+        with open(json_path, 'w') as f:
+            json.dump(serializable, f, indent=2)
+        logger.info(f"Screening results saved to {json_path}")
+
+    return filtered_files
 
 
 def plot_fhr_signals(fhr_data, domain_starts, start_idx=0, sampling_rate=4, save_path=None):
@@ -921,12 +1235,57 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
     hie_cs_files = [os.path.join(hie_cs_path, f) for f in os.listdir(hie_cs_path) if f.endswith('.mat')]
     hie_no_cs_files = [os.path.join(hie_no_cs_path, f) for f in os.listdir(hie_no_cs_path) if f.endswith('.mat')]
 
-    n_healthy_no_bg_no_cs = len(healthy_no_bg_no_cs_files)
-    n_healthy_no_bg_cs = len(healthy_no_bg_cs_files)
+    # ---------------------------
+    # VAE 90/10 split (BEFORE pre-screening — VAE data doesn't need TLO/min hours)
+    # ---------------------------
     n_healthy_bg_cs = len(healthy_bg_cs_files)
     n_healthy_bg_no_cs = len(healthy_bg_no_cs_files)
-    n_healthy_total = n_healthy_no_bg_no_cs + n_healthy_no_bg_cs + n_healthy_bg_cs + n_healthy_bg_no_cs
 
+    random.shuffle(healthy_bg_cs_files)
+    healthy_bg_cs_files_vae_train = healthy_bg_cs_files[:int(n_healthy_bg_cs * 0.9)]
+    healthy_bg_cs_files_vae_test = healthy_bg_cs_files[int(n_healthy_bg_cs * 0.9):]
+
+    random.shuffle(healthy_bg_no_cs_files)
+    healthy_bg_no_cs_files_vae_train = healthy_bg_no_cs_files[:int(n_healthy_bg_no_cs * 0.9)]
+    healthy_bg_no_cs_files_vae_test = healthy_bg_no_cs_files[int(n_healthy_bg_no_cs * 0.9):]
+
+    # ---------------------------
+    # GUID pre-screening for classification candidates
+    # ---------------------------
+    # Build candidate file lists:
+    #   - unhealthy: all acidosis + hie files
+    #   - healthy: no_bg files (full) + bg files (10% vae_test only)
+    prescreening_candidates = {
+        'acidosis_cs': acidosis_cs_files,
+        'acidosis_no_cs': acidosis_no_cs_files,
+        'hie_cs': hie_cs_files,
+        'hie_no_cs': hie_no_cs_files,
+        'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files,
+        'healthy_no_bg_cs': healthy_no_bg_cs_files,
+        'healthy_bg_cs': healthy_bg_cs_files_vae_test,
+        'healthy_bg_no_cs': healthy_bg_no_cs_files_vae_test,
+    }
+
+    filtered = prescreen_guids_for_classification(
+        prescreening_candidates,
+        labor_onset_map=labor_onset_map,
+        base_block_size=base_block_size,
+        overlap_percentage=overlap_percentage,
+        output_dir=output_base_path_)
+
+    # Update file lists from pre-screening results
+    acidosis_cs_files = filtered['acidosis_cs']
+    acidosis_no_cs_files = filtered['acidosis_no_cs']
+    hie_cs_files = filtered['hie_cs']
+    hie_no_cs_files = filtered['hie_no_cs']
+    healthy_no_bg_no_cs_files = filtered['healthy_no_bg_no_cs']
+    healthy_no_bg_cs_files = filtered['healthy_no_bg_cs']
+    healthy_bg_cs_files_vae_test = filtered['healthy_bg_cs']
+    healthy_bg_no_cs_files_vae_test = filtered['healthy_bg_no_cs']
+
+    # ---------------------------
+    # Recount after pre-screening and class balance
+    # ---------------------------
     n_acidosis_cs = len(acidosis_cs_files)
     n_acidosis_no_cs = len(acidosis_no_cs_files)
     n_acidosis_total = n_acidosis_cs + n_acidosis_no_cs
@@ -938,27 +1297,62 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
     n_unhealthy_total = n_acidosis_total + n_hie_total
 
     counts_healthy = {
-        "NoBG_NoCS": n_healthy_no_bg_no_cs,
-        "NoBG_CS": n_healthy_no_bg_cs,
-        "BG_CS": n_healthy_bg_cs,
-        "BG_NoCS": n_healthy_bg_no_cs,
+        "NoBG_NoCS": len(healthy_no_bg_no_cs_files),
+        "NoBG_CS": len(healthy_no_bg_cs_files),
+        "BG_CS": len(healthy_bg_cs_files_vae_test),
+        "BG_NoCS": len(healthy_bg_no_cs_files_vae_test),
     }
 
-    total_healthy = sum(counts_healthy.values())
-    target_healthy = {k: int(round((v / total_healthy) * n_unhealthy_total)) for k, v in counts_healthy.items()}
+    total_healthy_filtered = sum(counts_healthy.values())
+    if total_healthy_filtered < n_unhealthy_total:
+        logger.warning(
+            f"Filtered healthy GUIDs ({total_healthy_filtered}) < unhealthy "
+            f"({n_unhealthy_total}). Capping healthy target to available count.")
+        n_target = total_healthy_filtered
+    else:
+        n_target = n_unhealthy_total
 
-    diff = n_unhealthy_total - sum(target_healthy.values())
+    target_healthy = {
+        k: int(round((v / total_healthy_filtered) * n_target))
+        for k, v in counts_healthy.items()
+    }
+
+    # Fix rounding residuals
+    diff = n_target - sum(target_healthy.values())
     if diff:
         largest = max(counts_healthy, key=counts_healthy.get)
-        target_healthy[largest] = target_healthy[largest] + diff
+        target_healthy[largest] += diff
 
-    random.shuffle(healthy_bg_cs_files)
-    healthy_bg_cs_files_vae_train = healthy_bg_cs_files[:int(n_healthy_bg_cs*0.9)]
-    healthy_bg_cs_files_vae_test = healthy_bg_cs_files[int(n_healthy_bg_cs*0.9):]
+    # Cap targets to available counts per subgroup, redistribute overflow
+    file_pools = {
+        "NoBG_NoCS": healthy_no_bg_no_cs_files,
+        "NoBG_CS": healthy_no_bg_cs_files,
+        "BG_CS": healthy_bg_cs_files_vae_test,
+        "BG_NoCS": healthy_bg_no_cs_files_vae_test,
+    }
+    overflow = 0
+    for k in target_healthy:
+        available = len(file_pools[k])
+        if target_healthy[k] > available:
+            overflow += target_healthy[k] - available
+            target_healthy[k] = available
+    # Redistribute overflow to subgroups with remaining capacity
+    if overflow > 0:
+        for k in sorted(target_healthy, key=lambda x: len(file_pools[x]) - target_healthy[x], reverse=True):
+            room = len(file_pools[k]) - target_healthy[k]
+            add = min(overflow, room)
+            target_healthy[k] += add
+            overflow -= add
+            if overflow == 0:
+                break
+        if overflow > 0:
+            logger.warning(f"Could not redistribute {overflow} healthy GUIDs — "
+                           f"all subgroups at capacity")
 
-    random.shuffle(healthy_bg_no_cs_files)
-    healthy_bg_no_cs_files_vae_train = healthy_bg_no_cs_files[:int(n_healthy_bg_no_cs*0.9)]
-    healthy_bg_no_cs_files_vae_test = healthy_bg_no_cs_files[int(n_healthy_bg_no_cs*0.9):]
+    logger.info(f"Class balancing (post pre-screening): "
+                f"unhealthy={n_unhealthy_total}, "
+                f"healthy target={sum(target_healthy.values())} "
+                f"({target_healthy})")
 
     healthy_no_bg_no_cs_files_subsampled = random.sample(healthy_no_bg_no_cs_files, target_healthy['NoBG_NoCS'])
     healthy_no_bg_cs_files_subsampled = random.sample(healthy_no_bg_cs_files, target_healthy['NoBG_CS'])
