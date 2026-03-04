@@ -856,25 +856,282 @@ class MultiScaleConvAttentionClassifier(BaseTimeSeriesClassifier):
         return {"logits": logits, "probs": probs, "preds": preds}
 
 
-class VaeTebTimeSeriesClassifier(nn.Module):
-    """
-    Combined VAE + Classifier model for time series classification.
+# ---------------------------------------------------------------------
+# 7. Causal CNN-LSTM classifier (depthwise separable, dilated, residual)
+# ---------------------------------------------------------------------
+class CausalConvBlock(nn.Module):
+    """Depthwise separable causal convolution block with residual connection.
 
-    This model uses a pre-trained VAE (SeqVae) to encode time series data into
-    latent representations, then classifies those representations using a
-    downstream classifier.
-
-    Architecture:
-        1. VAE Encoder: Encodes (y_st, y_ph, x_ph) -> z (B, T, D)
-        2. Classifier: Maps z -> class logits (B, num_classes)
+    Causal: output at time *t* depends only on inputs at times <= *t*.
+    Depthwise: per-channel temporal convolution (efficient, avoids cross-channel
+    mixing).  Pointwise: 1x1 conv for channel mixing and expansion.
 
     Args:
-        vae_model: Pre-trained SeqVae model for encoding
-        classifier: Any classifier from BaseTimeSeriesClassifier (LSTM, CNN, Transformer, etc.)
-        freeze_vae: If True, freeze VAE weights during training (default: True)
-        use_posterior: If True, use posterior z from q(z|x,y); else use prior mu from p(z|y)
-        sample_latent: If True, sample from latent distribution; else use mean
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_size: Temporal kernel size for depthwise conv.
+        dilation: Dilation factor (controls receptive-field growth).
+        dropout: Dropout probability applied after pointwise conv.
     """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.causal_pad = (kernel_size - 1) * dilation
+
+        # Depthwise causal conv
+        self.dw_conv = nn.Conv1d(
+            in_channels, in_channels, kernel_size,
+            dilation=dilation, groups=in_channels, bias=False,
+        )
+        self.bn1 = nn.BatchNorm1d(in_channels)
+
+        # Pointwise (1x1) for channel expansion / mixing
+        self.pw_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        # Residual projection (1x1 if channel mismatch)
+        self.residual = (
+            nn.Conv1d(in_channels, out_channels, 1, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Tensor of shape ``(B, C_in, T)``.
+
+        Returns:
+            Tensor of shape ``(B, C_out, T)``.
+        """
+        res = self.residual(x)
+
+        h = F.pad(x, (self.causal_pad, 0))  # causal left-pad
+        h = self.dw_conv(h)                   # (B, C_in, T)
+        h = self.bn1(h)
+        h = F.gelu(h)
+
+        h = self.pw_conv(h)                   # (B, C_out, T)
+        h = self.bn2(h)
+        h = F.gelu(h)
+        h = self.dropout(h)
+
+        return h + res
+
+
+class CausalCNNLSTMClassifier(BaseTimeSeriesClassifier):
+    """Causal CNN-LSTM classifier with depthwise separable dilated convolutions.
+
+    Architecture::
+
+        Input (B, T, D) -> transpose (B, D, T)
+          -> [CausalConvBlock_1: D  -> C1, dilation=d1]
+          -> [CausalConvBlock_2: C1 -> C2, dilation=d2]
+          -> [CausalConvBlock_3: C2 -> C3, dilation=d3]
+          -> transpose (B, T, C3)
+          -> BiLSTM (C3 -> 2*lstm_hidden)
+          -> LayerNorm
+          -> Pooling (mean_max -> 4*lstm_hidden)
+          -> MLP Head -> logits (B, num_classes)
+
+    Args:
+        input_dim: Feature dimension of each timestep.
+        num_classes: Number of output classes.
+        conv_channels: Channel count for each causal conv stage.
+        kernel_sizes: Kernel size per stage.
+        dilations: Dilation factor per stage.
+        lstm_hidden: LSTM hidden dim per direction (bidirectional).
+        lstm_layers: Number of stacked BiLSTM layers.
+        dropout: Dropout probability.
+        pooling: Pooling strategy (``mean_max``, ``mean``, ``max``, ``last``,
+            ``concat``).
+        mlp_multiplier: MLP hidden dim = pooled_dim * multiplier.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 16,
+        num_classes: int = 2,
+        conv_channels: Sequence[int] = (32, 64, 128),
+        kernel_sizes: Sequence[int] = (5, 7, 11),
+        dilations: Sequence[int] = (1, 2, 4),
+        lstm_hidden: int = 128,
+        lstm_layers: int = 2,
+        dropout: float = 0.1,
+        pooling: str = "mean_max",
+        mlp_multiplier: float = 2.0,
+    ):
+        super().__init__(input_dim, num_classes)
+        self.pooling = pooling.lower()
+
+        # --- Sequential causal conv stages ---
+        conv_blocks = []
+        in_ch = input_dim
+        for ch, ks, dil in zip(conv_channels, kernel_sizes, dilations):
+            conv_blocks.append(CausalConvBlock(in_ch, ch, ks, dilation=dil, dropout=dropout))
+            in_ch = ch
+        self.conv_stages = nn.Sequential(*conv_blocks)
+
+        # --- BiLSTM temporal modelling ---
+        self.lstm = nn.LSTM(
+            input_size=in_ch,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+        lstm_out_dim = lstm_hidden * 2  # bidirectional
+        self.lstm_norm = nn.LayerNorm(lstm_out_dim)
+
+        # --- Pooling ---
+        if self.pooling in ("mean_max", "concat"):
+            pooled_dim = lstm_out_dim * 2
+        else:
+            pooled_dim = lstm_out_dim
+
+        # --- MLP classification head ---
+        hidden_fc = max(int(pooled_dim * mlp_multiplier), pooled_dim)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, hidden_fc),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_fc, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> dict:
+        """Forward pass.
+
+        Args:
+            x: Tensor of shape ``(B, T, D)``.
+
+        Returns:
+            Dict with ``logits`` ``(B, num_classes)``, ``probs``, ``preds``.
+        """
+        # (B, T, D) -> (B, D, T) for Conv1d
+        h = x.transpose(1, 2)
+
+        # Sequential causal conv stages
+        h = self.conv_stages(h)  # (B, C_last, T)
+
+        # (B, C_last, T) -> (B, T, C_last) for LSTM
+        h = h.transpose(1, 2)
+
+        # BiLSTM
+        lstm_out, _ = self.lstm(h)  # (B, T, lstm_out_dim)
+        lstm_out = self.lstm_norm(lstm_out)
+
+        # Pooling
+        if self.pooling == "mean":
+            features = lstm_out.mean(dim=1)
+        elif self.pooling == "max":
+            features, _ = torch.max(lstm_out, dim=1)
+        elif self.pooling == "mean_max":
+            mean_val = lstm_out.mean(dim=1)
+            max_val, _ = torch.max(lstm_out, dim=1)
+            features = torch.cat([mean_val, max_val], dim=1)
+        elif self.pooling == "concat":
+            last_state = lstm_out[:, -1, :]
+            mean_state = lstm_out.mean(dim=1)
+            features = torch.cat([last_state, mean_state], dim=1)
+        else:
+            features = lstm_out[:, -1, :]
+
+        logits = self.classifier(features)
+        probs = F.softmax(logits, dim=-1)
+        preds = probs.argmax(dim=-1)
+
+        return {"logits": logits, "probs": probs, "preds": preds}
+
+
+# ---------------------------------------------------------------------
+# TLO (Time from Labour Onset) Embedding
+# ---------------------------------------------------------------------
+class TLOEmbedding(nn.Module):
+    """Embeds scalar Time from Labour Onset into a learned vector.
+
+    NaN values (unavailable TLO) are replaced by a learned
+    ``missing_embedding`` parameter so the model can distinguish
+    "unknown TLO" from any real value.
+
+    Args:
+        embed_dim: Dimensionality of the output embedding.
+        dropout: Dropout probability inside the MLP.
+    """
+
+    def __init__(self, embed_dim: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.missing_embedding = nn.Parameter(torch.zeros(embed_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(1, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, tlo_seconds: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            tlo_seconds: Scalar TLO per sample ``(B,)`` in seconds.
+                May contain ``NaN`` when TLO is unavailable.
+            seq_len: Temporal dimension *T* to broadcast to (e.g. 300).
+
+        Returns:
+            Embedding tensor of shape ``(B, seq_len, embed_dim)``.
+        """
+        is_valid = ~torch.isnan(tlo_seconds)
+        tlo_hours = tlo_seconds / 3600.0
+        tlo_hours = torch.where(is_valid, tlo_hours, torch.zeros_like(tlo_hours))
+
+        tlo_embed = self.mlp(tlo_hours.unsqueeze(-1))  # (B, embed_dim)
+
+        missing_mask = (~is_valid).unsqueeze(-1)  # (B, 1)
+        tlo_embed = torch.where(
+            missing_mask,
+            self.missing_embedding.unsqueeze(0).expand_as(tlo_embed),
+            tlo_embed,
+        )
+
+        return tlo_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, embed_dim)
+
+
+class VaeTebTimeSeriesClassifier(nn.Module):
+    """Combined VAE + Classifier model for time series classification.
+
+    This model uses a pre-trained VAE (SeqVae) to encode time series data into
+    latent representations, optionally concatenates a TLO (Time from Labour
+    Onset) embedding, then classifies the result.
+
+    Architecture::
+
+        VAE Encoder -> z (B, T, latent_dim)
+        [TLO scalar -> TLOEmbedding -> (B, T, tlo_embed_dim)]  # optional
+        concat -> (B, T, latent_dim + tlo_embed_dim)
+        Classifier -> logits (B, num_classes)
+
+    Args:
+        vae_model: Pre-trained SeqVae model for encoding.
+        classifier: Any classifier from ``BaseTimeSeriesClassifier``.
+        freeze_vae: If ``True``, freeze VAE weights during training.
+        use_posterior: If ``True``, use posterior z from q(z|x,y); else prior.
+        sample_latent: If ``True``, sample from latent distribution; else mean.
+        class_weights: Optional per-class weights for cross-entropy loss.
+        tlo_embed_dim: TLO embedding dimension.  ``0`` disables TLO.
+        tlo_dropout: Dropout inside TLO embedding MLP.
+    """
+
     def __init__(
         self,
         vae_model: SeqVae,
@@ -883,6 +1140,8 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         use_posterior: bool = True,
         sample_latent: bool = False,
         class_weights: Optional[Sequence[float]] = None,
+        tlo_embed_dim: int = 0,
+        tlo_dropout: float = 0.1,
     ):
         super().__init__()
         self.vae_model = vae_model
@@ -896,6 +1155,12 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         else:
             # Keep an attribute for convenience when no weights are provided
             self.class_weights = None
+
+        # TLO embedding (disabled when tlo_embed_dim == 0)
+        if tlo_embed_dim > 0:
+            self.tlo_embedding = TLOEmbedding(embed_dim=tlo_embed_dim, dropout=tlo_dropout)
+        else:
+            self.tlo_embedding = None
 
         if self.freeze_vae:
             for param in self.vae_model.parameters():
@@ -950,26 +1215,33 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         self,
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
-        x_ph: torch.Tensor
+        x_ph: torch.Tensor,
+        tlo: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        Forward pass through VAE encoder + classifier.
+        """Forward pass through VAE encoder + optional TLO embedding + classifier.
 
         Args:
-            y_st: Target scattering features (B, T, 43)
-            y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
+            y_st: Target scattering features ``(B, T, 43)``.
+            y_ph: Target phase harmonic features ``(B, T, 44)``.
+            x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
+            tlo: Optional scalar TLO per sample ``(B,)`` in seconds (may
+                contain ``NaN``).  Ignored when ``tlo_embedding`` is ``None``.
 
         Returns:
-            Dictionary containing:
-                - logits: Class logits (B, num_classes)
-                - probs: Class probabilities (B, num_classes)
-                - preds: Predicted class indices (B,)
-                - latent_features: Latent representations (B, T, D)
+            Dictionary with ``logits``, ``probs``, ``preds``,
+            ``latent_features``.
         """
         z = self.encode_features(y_st, y_ph, x_ph)  # (B, T, D)
 
-        classifier_outputs = self.classifier(z)  # (B, num_classes)
+        # Concatenate TLO embedding if enabled
+        if self.tlo_embedding is not None:
+            if tlo is None:
+                # Old HDF5 without time_from_labor_onset: treat all as missing
+                tlo = torch.full((z.shape[0],), float('nan'), device=z.device)
+            tlo_embed = self.tlo_embedding(tlo, seq_len=z.shape[1])  # (B, T, embed_dim)
+            z = torch.cat([z, tlo_embed], dim=-1)  # (B, T, D + embed_dim)
+
+        classifier_outputs = self.classifier(z)
 
         classifier_outputs["latent_features"] = z
 
@@ -981,25 +1253,22 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
         labels: torch.Tensor,
+        tlo: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        Compute classification loss.
+        """Compute classification loss.
 
         Args:
-            y_st: Target scattering features (B, T, 43)
-            y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
-            labels: Ground truth class labels (B,)
+            y_st: Target scattering features ``(B, T, 43)``.
+            y_ph: Target phase harmonic features ``(B, T, 44)``.
+            x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
+            labels: Ground truth class labels ``(B,)``.
+            tlo: Optional scalar TLO per sample ``(B,)`` in seconds.
 
         Returns:
-            Dictionary containing:
-                - loss: Cross-entropy loss (scalar)
-                - logits: Class logits (B, num_classes)
-                - probs: Class probabilities (B, num_classes)
-                - preds: Predicted class indices (B,)
-                - accuracy: Classification accuracy (scalar)
+            Dictionary with ``loss``, ``accuracy``, ``logits``, ``probs``,
+            ``preds``.
         """
-        outputs = self.forward(y_st, y_ph, x_ph)
+        outputs = self.forward(y_st, y_ph, x_ph, tlo=tlo)
         logits = outputs["logits"]
 
         # Compute cross-entropy loss
