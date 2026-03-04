@@ -47,7 +47,7 @@ model_config:
   # -------------------------------------------------------------------------
   classifier:
     vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
-    type: mamba                           # Options: 'mamba', 'multiscale_conv_attention', 'lstm', 'cnn_lstm', 'bilstm_attention', 'cnn', 'transformer'
+    type: causal_cnn_lstm                 # Options: 'causal_cnn_lstm', 'mamba', 'multiscale_conv_attention', 'lstm', 'cnn_lstm', 'bilstm_attention', 'cnn', 'transformer'
     latent_dim: 16                        # VAE latent dimension (must match checkpoint)
     num_classes: 2                        # Binary classification (healthy vs unhealthy)
     freeze_vae: true                      # Freeze VAE weights during classifier training
@@ -68,14 +68,22 @@ model_config:
 
     # CNN-specific (also used by CNN-LSTM as per-branch filter count)
     num_filters: 32                       # Number of CNN filters (32 per-branch for cnn_lstm/multiscale, 64 for standalone cnn)
-    kernel_sizes: [5, 19, 39]             # Multi-scale kernel sizes (beat-to-beat / decelerations / baseline shifts)
+    kernel_sizes: [5, 7, 11]              # Kernel sizes per stage (causal_cnn_lstm: per-stage; multiscale_conv_attention: [5,19,39])
 
     # CNN-LSTM specific
     cnn_out_dim: 64                       # Projected CNN output dimension
     lstm_hidden: 128                      # LSTM hidden dim per direction (BiLSTM)
     lstm_layers: 2                        # Number of stacked LSTM layers
 
-    # Pooling (used by mamba, cnn_lstm, multiscale_conv_attention, transformer)
+    # Causal CNN-LSTM specific (depthwise separable, dilated, residual)
+    conv_channels: [32, 64, 128]          # Channel progression per causal conv stage
+    dilations: [1, 2, 4]                  # Per-stage dilations (multi-scale receptive field)
+
+    # TLO (Time from Labour Onset) embedding
+    tlo_embed_dim: 8                      # TLO embedding dimension (0 = disabled)
+    tlo_dropout: 0.1                      # Dropout inside TLO MLP
+
+    # Pooling (used by mamba, cnn_lstm, causal_cnn_lstm, multiscale_conv_attention, transformer)
     pooling: mean_max                     # Pooling strategy: 'mean_max'/'mean'/'max'/'last'/'concat'
 
     # Mamba-specific (selective state space model)
@@ -166,6 +174,7 @@ dataset_config:
         - cs_label                        # C-section label
         - bg_label                        # Blood gas label
         - guid                            # Patient identifier
+        - time_from_labor_onset           # TLO in seconds (NaN when unavailable)
       allowed_guids: null                 # Filter to specific GUIDs (null = all)
       cs_label: null                      # Filter by C-section label (null = all)
       bg_label: null                      # Filter by blood gas label (null = all)
