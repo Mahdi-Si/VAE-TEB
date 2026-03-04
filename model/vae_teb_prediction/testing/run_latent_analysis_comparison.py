@@ -42,6 +42,9 @@ if str(project_root) not in sys.path:
 from model.vae_teb_prediction.testing.analyses.compare_trajectory_classes import (
     run_comparison,
 )
+from model.vae_teb_prediction.testing.analyses.class_separation import (
+    run_class_separation_analysis,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +160,20 @@ def _run_trajectory_analysis(
 def _split_and_compare(
     trajectory_dir: Path,
     output_dir: Optional[Path] = None,
+    discriminative_checkpoint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Split trajectory CSVs by label and run cross-class comparison.
+    """Split trajectory CSVs by label, run cross-class comparison and class separation.
 
     Reads guid_trajectory_features.csv and latent_trajectories_stitched.csv,
     groups by label, and feeds each group to the comparison pipeline.
+    Additionally runs the class separation analysis on the full
+    (unsplit) latent trajectories.
+
+    Args:
+        trajectory_dir: Path to directory containing trajectory CSVs.
+        output_dir: Output directory for comparison results.
+        discriminative_checkpoint: Optional path to discriminative checkpoint
+            for center-loss effectiveness analysis (Tier 4).
     """
     features_csv = trajectory_dir / "guid_trajectory_features.csv"
     stitched_csv = trajectory_dir / "latent_trajectories_stitched.csv"
@@ -214,6 +225,37 @@ def _split_and_compare(
 
     results = run_comparison(run_specs, str(output_dir), stitched_specs)
     logger.info(f"Comparison results saved to {output_dir}")
+
+    # --- Class separation analysis on the full (unsplit) data ---
+    latent_parquet = trajectory_dir / "latent_trajectories.parquet"
+    latent_csv = trajectory_dir / "latent_trajectories_stitched.csv"
+
+    latent_source = None
+    if latent_parquet.exists():
+        latent_source = latent_parquet
+    elif latent_csv.exists():
+        latent_source = latent_csv
+
+    if latent_source is not None:
+        try:
+            logger.info(f"Running class separation analysis from {latent_source.name}...")
+            if latent_source.suffix == ".parquet":
+                latent_df = pd.read_parquet(latent_source)
+            else:
+                latent_df = pd.read_csv(latent_source)
+
+            sep_results = run_class_separation_analysis(
+                latent_df,
+                output_dir=output_dir,
+                checkpoint_path=discriminative_checkpoint,
+            )
+            results["class_separation"] = sep_results
+        except Exception as exc:
+            logger.error(f"Class separation analysis failed: {exc}")
+            results["class_separation"] = {"error": str(exc)}
+    else:
+        logger.info("No latent_trajectories file found — skipping class separation analysis.")
+
     return results
 
 
@@ -246,6 +288,27 @@ def _print_summary(results: Dict[str, Any]) -> None:
             print(f"  Significant features (p<0.05): "
                   f"{results['significant_features']}/{results.get('n_features_tested', '?')}")
 
+    # Class separation results
+    sep = results.get("class_separation", {})
+    if sep and "error" not in sep:
+        print("\n=== Class Separation Summary ===")
+        clust = sep.get("clustering", {})
+        if clust and "error" not in clust:
+            print(f"  Silhouette: {clust.get('silhouette', '?'):.4f}")
+            print(f"  Davies-Bouldin: {clust.get('davies_bouldin', '?'):.4f}")
+            print(f"  Calinski-Harabasz: {clust.get('calinski_harabasz', '?'):.1f}")
+        cs = sep.get("cohesion_separation", {})
+        if cs and "error" not in cs:
+            print(f"  Fisher Ratio: {cs.get('fisher_ratio', '?'):.4f}")
+        ls = sep.get("linear_separability", {})
+        if ls and "error" not in ls:
+            print(f"  LogReg CV: {ls.get('logreg_mean', '?'):.4f} ± {ls.get('logreg_std', '?'):.4f}")
+            print(f"  LDA CV:    {ls.get('lda_mean', '?'):.4f} ± {ls.get('lda_std', '?'):.4f}")
+        cl = sep.get("center_loss", {})
+        if cl:
+            print(f"  Center Loss Misassignment: {cl.get('misassignment_rate', '?'):.4f}")
+            print(f"  Separation Ratio (foreign/own): {cl.get('separation_ratio', '?'):.4f}")
+
 
 # ---------------------------------------------------------------------------
 # Main entry points
@@ -265,9 +328,9 @@ def run_single_run(
     n_changepoints: int = 5,
     changepoint_algo: str = "pelt",
     preprocess_latent: bool = False,
+    discriminative_checkpoint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Run trajectory analysis on all data, then split by label and compare.
+    """Run trajectory analysis on all data, then split by label and compare.
 
     Args:
         config_path: Path to YAML config file.
@@ -283,6 +346,8 @@ def run_single_run(
         n_changepoints: Changepoints per sample.
         changepoint_algo: Changepoint detection algorithm.
         preprocess_latent: If True, apply robust normalization/denoising.
+        discriminative_checkpoint: Optional path to discriminative fine-tuning
+            checkpoint for center-loss effectiveness analysis.
 
     Returns:
         Comparison results dict.
@@ -307,7 +372,7 @@ def run_single_run(
                 f"{traj_results.get('n_epochs', '?')} epochs")
 
     comparison_output = Path(output_dir) / "class_comparison" if output_dir else None
-    results = _split_and_compare(trajectory_dir, comparison_output)
+    results = _split_and_compare(trajectory_dir, comparison_output, discriminative_checkpoint)
     _print_summary(results)
     return results
 
@@ -354,9 +419,9 @@ def main(
     stitched: Optional[List[str]] = None,
     changepoint_algo: str = "pelt",
     preprocess_latent: bool = False,
+    discriminative_checkpoint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Main entry point for latent trajectory comparison.
+    """Main entry point for latent trajectory comparison.
 
     Can be called directly from Python or driven by the CLI below.
 
@@ -377,6 +442,8 @@ def main(
         stitched: Optional list of "path:label" specs for compare-only mode (FID/MMD).
         changepoint_algo: Changepoint detection algorithm.
         preprocess_latent: If True, apply robust normalization/denoising.
+        discriminative_checkpoint: Optional path to discriminative fine-tuning
+            checkpoint for center-loss effectiveness analysis.
 
     Returns:
         Comparison results dict.
@@ -405,6 +472,7 @@ def main(
             n_changepoints=n_changepoints,
             changepoint_algo=changepoint_algo,
             preprocess_latent=preprocess_latent,
+            discriminative_checkpoint=discriminative_checkpoint,
         )
 
 
@@ -458,6 +526,10 @@ Examples:
         help="Changepoint detection algorithm (default: pelt).",
     )
     single.add_argument("--preprocess-latent", action="store_true", help="Apply robust normalization/denoising to latent z-columns.")
+    single.add_argument(
+        "--discriminative-checkpoint", type=str, default=None,
+        help="Path to discriminative fine-tuning checkpoint for center-loss analysis (Tier 4).",
+    )
 
     # --- Compare-only args ---
     compare = parser.add_argument_group("compare-only options")
@@ -500,6 +572,7 @@ Examples:
         stitched=args.stitched,
         changepoint_algo=args.changepoint_algo,
         preprocess_latent=args.preprocess_latent,
+        discriminative_checkpoint=args.discriminative_checkpoint,
     )
 
 
@@ -531,6 +604,7 @@ if __name__ == "__main__":
     N_CHANGEPOINTS = 5
     CHANGEPOINT_ALGO = "pelt"
     PREPROCESS_LATENT = False
+    DISCRIMINATIVE_CHECKPOINT = None  # Path to discriminative checkpoint for Tier 4
 
     # --- Compare-only settings (used when COMPARE_ONLY = True) ---
     RUNS = [
@@ -569,6 +643,7 @@ if __name__ == "__main__":
             time_range_hours=TIME_RANGE_HOURS,
             dim_reduction_method=DIM_REDUCTION_METHOD,
             n_changepoints=N_CHANGEPOINTS,
+            discriminative_checkpoint=DISCRIMINATIVE_CHECKPOINT,
             changepoint_algo=CHANGEPOINT_ALGO,
             preprocess_latent=PREPROCESS_LATENT,
         )
