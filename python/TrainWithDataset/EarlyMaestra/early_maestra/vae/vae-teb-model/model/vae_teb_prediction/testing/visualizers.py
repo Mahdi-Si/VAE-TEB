@@ -3100,3 +3100,308 @@ def plot_distributional_distances(
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+# ============================================================================
+# Class Separation Plots
+# ============================================================================
+
+def plot_class_separation_scatter_2d(
+    reduced_2d: np.ndarray,
+    labels: np.ndarray,
+    output_path: Path,
+    *,
+    centroids: Optional[Dict[int, np.ndarray]] = None,
+    method_name: str = "PCA",
+    label_map: Optional[Dict[int, str]] = None,
+    explained_var: Optional[np.ndarray] = None,
+) -> None:
+    """2D scatter plot of latent space colored by class with optional centroids.
+
+    Args:
+        reduced_2d: Array of shape ``(N, 2)`` with reduced coordinates.
+        labels: Integer class labels of shape ``(N,)``.
+        output_path: Path to save the figure.
+        centroids: Optional dict mapping class int → 2D centroid array.
+        method_name: Name of the dimensionality reduction method for titles.
+        label_map: Optional dict mapping int labels to display strings.
+        explained_var: Optional PCA explained variance ratios (length 2).
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    class_colors = [COLOR_GREEN, COLOR_VERMILLION, COLOR_PURPLE, COLOR_BLUE, COLOR_SKY, COLOR_ORANGE]
+    unique_labels = sorted(np.unique(labels))
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.0))
+
+    for i, c in enumerate(unique_labels):
+        mask = labels == c
+        color = class_colors[i % len(class_colors)]
+        display_name = label_map.get(c, str(c)) if label_map else str(c)
+
+        ax.scatter(
+            reduced_2d[mask, 0], reduced_2d[mask, 1],
+            c=color, s=4, alpha=0.25, label=display_name, rasterized=True,
+        )
+
+        if centroids is not None and c in centroids:
+            cx, cy = centroids[c]
+            ax.scatter(cx, cy, c=color, s=120, marker="*", edgecolors=COLOR_BLACK,
+                       linewidth=0.8, zorder=10)
+            ax.annotate(
+                display_name, xy=(cx, cy), fontsize=FONT_LABEL, fontweight="bold",
+                color=color, ha="center", va="bottom",
+                xytext=(0, 8), textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.85),
+            )
+
+    # Axis labels
+    if explained_var is not None and len(explained_var) >= 2:
+        ax.set_xlabel(f"{method_name} 1 ({explained_var[0]*100:.1f}%)", fontsize=FONT_LABEL)
+        ax.set_ylabel(f"{method_name} 2 ({explained_var[1]*100:.1f}%)", fontsize=FONT_LABEL)
+    else:
+        ax.set_xlabel(f"{method_name} 1", fontsize=FONT_LABEL)
+        ax.set_ylabel(f"{method_name} 2", fontsize=FONT_LABEL)
+
+    ax.set_title(f"Latent Space — {method_name} Projection", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.legend(loc="best", fontsize=FONT_LEGEND, markerscale=3, framealpha=0.95)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_per_dimension_boxplots(
+    X: np.ndarray,
+    labels: np.ndarray,
+    output_path: Path,
+    *,
+    label_map: Optional[Dict[int, str]] = None,
+    dim_names: Optional[list] = None,
+    max_dims: int = 16,
+) -> None:
+    """Per-dimension boxplots grouped by class.
+
+    Creates side-by-side boxplots for each latent dimension, showing the
+    distribution of each class.
+
+    Args:
+        X: Feature matrix of shape ``(N, D)``.
+        labels: Integer class labels of shape ``(N,)``.
+        output_path: Path to save the figure.
+        label_map: Optional dict mapping int labels to display strings.
+        dim_names: Optional list of dimension names.
+        max_dims: Maximum number of dimensions to plot.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_dims = min(X.shape[1], max_dims)
+    unique_labels = sorted(np.unique(labels))
+    n_classes = len(unique_labels)
+
+    class_colors = [COLOR_GREEN, COLOR_VERMILLION, COLOR_PURPLE, COLOR_BLUE, COLOR_SKY, COLOR_ORANGE]
+
+    n_cols = 4
+    n_rows = math.ceil(n_dims / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 2.5 * n_rows))
+    axes = np.atleast_2d(axes)
+
+    for d in range(n_dims):
+        ax = axes[d // n_cols, d % n_cols]
+        data = [X[labels == c, d] for c in unique_labels]
+        names = [label_map.get(c, str(c)) if label_map else str(c) for c in unique_labels]
+
+        bp = ax.boxplot(
+            data, labels=names, patch_artist=True,
+            widths=0.6, showfliers=False,
+            medianprops=dict(color=COLOR_BLACK, linewidth=1.0),
+        )
+        for j, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(class_colors[j % len(class_colors)])
+            patch.set_alpha(0.6)
+
+        dim_label = dim_names[d] if dim_names and d < len(dim_names) else f"z{d}"
+        ax.set_title(dim_label, fontsize=FONT_LABEL)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    # Hide unused axes
+    for d in range(n_dims, n_rows * n_cols):
+        axes[d // n_cols, d % n_cols].set_visible(False)
+
+    fig.suptitle("Per-Dimension Distribution by Class", fontsize=FONT_TITLE, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_centroid_distance_heatmap(
+    between_class_distances: Dict[str, float],
+    centroids: Dict[int, Any],
+    output_path: Path,
+    *,
+    label_map: Optional[Dict[int, str]] = None,
+) -> None:
+    """Pairwise centroid distance heatmap.
+
+    Args:
+        between_class_distances: Dict mapping ``"i_vs_j"`` → L2 distance.
+        centroids: Dict mapping class int → centroid (list or ndarray).
+        output_path: Path to save the figure.
+        label_map: Optional dict mapping int labels to display strings.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    classes = sorted(centroids.keys())
+    n = len(classes)
+    dist_matrix = np.zeros((n, n))
+
+    for i, ci in enumerate(classes):
+        for j, cj in enumerate(classes):
+            if i == j:
+                continue
+            key = f"{ci}_vs_{cj}" if ci < cj else f"{cj}_vs_{ci}"
+            dist_matrix[i, j] = between_class_distances.get(key, 0.0)
+
+    tick_labels = [label_map.get(c, str(c)) if label_map else str(c) for c in classes]
+
+    fig, ax = plt.subplots(figsize=(5.0, 4.5))
+    im = ax.imshow(dist_matrix, cmap="YlOrRd", aspect="auto")
+
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(tick_labels, fontsize=FONT_TICK)
+    ax.set_yticklabels(tick_labels, fontsize=FONT_TICK)
+
+    # Annotate cells
+    for i in range(n):
+        for j in range(n):
+            val = dist_matrix[i, j]
+            if val > 0:
+                text_color = "white" if val > dist_matrix.max() * 0.6 else COLOR_BLACK
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                        fontsize=FONT_TICK, color=text_color, fontweight="bold")
+
+    fig.colorbar(im, ax=ax, label="L2 Distance", shrink=0.8)
+    ax.set_title("Pairwise Centroid Distances", fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_distance_to_centroid_violins(
+    per_class_dists: Dict[int, list],
+    output_path: Path,
+    *,
+    label_map: Optional[Dict[int, str]] = None,
+    title: str = "Distance to Class Centroid",
+    foreign_dists: Optional[Dict[int, list]] = None,
+) -> None:
+    """Violin plots of per-class distance-to-centroid distributions.
+
+    Args:
+        per_class_dists: Dict mapping class int → list of own-centroid
+            distances.
+        output_path: Path to save the figure.
+        label_map: Optional dict mapping int labels to display strings.
+        title: Plot title.
+        foreign_dists: Optional dict mapping class int → list of nearest
+            foreign-centroid distances.  If provided, shown alongside own
+            distances for comparison.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    classes = sorted(per_class_dists.keys())
+    class_colors = [COLOR_GREEN, COLOR_VERMILLION, COLOR_PURPLE, COLOR_BLUE, COLOR_SKY, COLOR_ORANGE]
+
+    has_foreign = foreign_dists is not None and len(foreign_dists) > 0
+
+    if has_foreign:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.0, 5.0))
+    else:
+        fig, ax1 = plt.subplots(figsize=(6.0, 5.0))
+
+    # Own-centroid distances
+    data_own = [np.array(per_class_dists[c]) for c in classes]
+    names = [label_map.get(c, str(c)) if label_map else str(c) for c in classes]
+
+    parts = ax1.violinplot(data_own, positions=range(len(classes)), showmeans=True, showmedians=True)
+    for i, pc in enumerate(parts["bodies"]):
+        pc.set_facecolor(class_colors[i % len(class_colors)])
+        pc.set_alpha(0.6)
+    parts["cmeans"].set_color(COLOR_BLACK)
+    parts["cmedians"].set_color(COLOR_VERMILLION)
+
+    ax1.set_xticks(range(len(classes)))
+    ax1.set_xticklabels(names, fontsize=FONT_TICK)
+    ax1.set_ylabel("L2 Distance", fontsize=FONT_LABEL)
+    ax1.set_title("Dist. to Own Centroid", fontsize=FONT_LABEL + 1, fontweight="normal")
+    _style_axes(ax1, grid="major", minor_ticks=False)
+
+    # Foreign-centroid distances (if available)
+    if has_foreign:
+        data_foreign = [np.array(foreign_dists[c]) for c in classes]
+        parts_f = ax2.violinplot(data_foreign, positions=range(len(classes)), showmeans=True, showmedians=True)
+        for i, pc in enumerate(parts_f["bodies"]):
+            pc.set_facecolor(class_colors[i % len(class_colors)])
+            pc.set_alpha(0.6)
+        parts_f["cmeans"].set_color(COLOR_BLACK)
+        parts_f["cmedians"].set_color(COLOR_VERMILLION)
+
+        ax2.set_xticks(range(len(classes)))
+        ax2.set_xticklabels(names, fontsize=FONT_TICK)
+        ax2.set_ylabel("L2 Distance", fontsize=FONT_LABEL)
+        ax2.set_title("Dist. to Nearest Foreign Centroid", fontsize=FONT_LABEL + 1, fontweight="normal")
+        _style_axes(ax2, grid="major", minor_ticks=False)
+
+    fig.suptitle(title, fontsize=FONT_TITLE, fontweight="normal", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_temporal_class_separation(
+    temporal_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """2x2 grid showing class separation metrics vs time-to-birth.
+
+    Args:
+        temporal_df: DataFrame from ``compute_temporal_separation`` with
+            columns: ``bin_center``, ``silhouette``, ``davies_bouldin``,
+            ``calinski_harabasz``, ``fisher_ratio``, etc.
+        output_path: Path to save the figure.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.0, 8.0))
+    t = temporal_df["bin_center"].values
+
+    # Panel definitions: (column, ylabel, title, color, higher_is_better)
+    panels = [
+        ("silhouette", "Silhouette Score", "Silhouette vs Time", COLOR_BLUE, True),
+        ("fisher_ratio", "Fisher Ratio", "Fisher Ratio vs Time", COLOR_GREEN, True),
+        ("davies_bouldin", "Davies-Bouldin Index", "Davies-Bouldin vs Time", COLOR_VERMILLION, False),
+        ("calinski_harabasz", "CH Index", "Calinski-Harabasz vs Time", COLOR_PURPLE, True),
+    ]
+
+    for ax, (col, ylabel, title, color, _) in zip(axes.flat, panels):
+        if col in temporal_df.columns:
+            vals = temporal_df[col].values
+            valid = np.isfinite(vals)
+            ax.plot(t[valid], vals[valid], color=color, linewidth=1.2, marker="o", markersize=3)
+            ax.fill_between(t[valid], vals[valid], alpha=0.15, color=color)
+        ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
+        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+        ax.set_title(title, fontsize=FONT_LABEL + 1, fontweight="normal")
+        ax.invert_xaxis()
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle("Class Separation Evolution Over Time", fontsize=FONT_TITLE, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)

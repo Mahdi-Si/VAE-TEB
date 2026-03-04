@@ -15,6 +15,7 @@ Available analyses:
     - run_reconstruction_analysis: Detailed per-sample diagnostics plots
     - run_single_prediction_windows: Non-averaged prediction window plots
     - run_dataset_stats_analysis: Dataset statistics (GUIDs, epochs, time distribution)
+    - run_class_separation_analysis: Class separation metrics, plots, temporal evolution
     - run_all_analyses: Run all analyses with sensible defaults
 
 IMPORTANT: Trajectory analysis works best with a GUID-based DataLoader where
@@ -63,6 +64,15 @@ from model.vae_teb_prediction.testing.analyses.dataset_stats import (
     run_dataset_stats_analysis,
     collect_dataset_stats,
     compute_stats_summary,
+)
+from model.vae_teb_prediction.testing.analyses.class_separation import (
+    run_class_separation_analysis,
+    compute_cluster_quality_metrics,
+    compute_class_cohesion_separation,
+    compute_linear_separability,
+    compute_temporal_separation,
+    load_discriminative_centers,
+    compute_center_loss_effectiveness,
 )
 
 # Import changepoint analysis functions
@@ -255,6 +265,14 @@ __all__ = [
     "compute_mmd_rbf",
     "compare_features_by_class",
     "compare_dimensions_by_class",
+    # Class separation
+    "run_class_separation_analysis",
+    "compute_cluster_quality_metrics",
+    "compute_class_cohesion_separation",
+    "compute_linear_separability",
+    "compute_temporal_separation",
+    "load_discriminative_centers",
+    "compute_center_loss_effectiveness",
     # Combined
     "run_all_analyses",
 ]
