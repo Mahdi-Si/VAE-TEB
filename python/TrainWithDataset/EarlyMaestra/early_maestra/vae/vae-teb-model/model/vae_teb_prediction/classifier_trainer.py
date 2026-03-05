@@ -22,6 +22,7 @@ from model.vae_teb_prediction.prediction_classification_model import (
     TransformerClassifier,
     MambaClassifier,
     MultiScaleConvAttentionClassifier,
+    CausalCNNLSTMClassifier,
 )
 
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -84,8 +85,11 @@ class PlSeqVaeClassifier(LightningModelBase):
         # Map to binary: 1 → 0, 2&3 → 1
         binary_labels = (labels > 1).long()  # (B,) - class 0 or 1
 
+        # Extract TLO if available
+        tlo = batch.time_from_labor_onset if hasattr(batch, 'time_from_labor_onset') else None
+
         # Forward pass through the model
-        outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
         logits = outputs["logits"]  # (B, 2)
         preds = outputs["preds"]    # (B,)
 
@@ -155,16 +159,24 @@ class GraphModelClassifierTrainer(GraphModelBase):
         logger.info(f"VAE model loaded from checkpoint: {vae_checkpoint}")
 
         # Get classifier architecture and parameters
-        classifier_type = classifier_config.get('type', 'lstm')  # 'lstm', 'cnn', 'bilstm_attention', 'transformer'
+        classifier_type = classifier_config.get('type', 'lstm')
         latent_dim = classifier_config.get('latent_dim', 16)
         num_classes = classifier_config.get('num_classes', 2)
         freeze_vae = classifier_config.get('freeze_vae', True)
         use_posterior = classifier_config.get('use_posterior', True)
         sample_latent = classifier_config.get('sample_latent', False)
 
+        # TLO embedding config
+        tlo_embed_dim = classifier_config.get('tlo_embed_dim', 0)
+        tlo_dropout = classifier_config.get('tlo_dropout', 0.1)
+        classifier_input_dim = latent_dim + tlo_embed_dim
+        if tlo_embed_dim > 0:
+            logger.info(f"TLO embedding enabled: embed_dim={tlo_embed_dim}, "
+                        f"classifier input_dim={classifier_input_dim}")
+
         if classifier_type == 'lstm':
             classifier = LSTMClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 hidden_dim=classifier_config.get('hidden_dim', 128),
                 num_layers=classifier_config.get('num_layers', 2),
@@ -173,7 +185,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'cnn_lstm':
             classifier = CNNLSTMClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 num_filters=classifier_config.get('num_filters', 32),
                 kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
@@ -185,7 +197,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'cnn':
             classifier = CNN1DClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 num_filters=classifier_config.get('num_filters', 64),
                 kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
@@ -193,7 +205,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'bilstm_attention':
             classifier = BiLSTMAttentionClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 hidden_dim=classifier_config.get('hidden_dim', 128),
                 num_layers=classifier_config.get('num_layers', 1),
@@ -202,7 +214,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'transformer':
             classifier = TransformerClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 d_model=classifier_config.get('d_model', 128),
                 n_heads=classifier_config.get('n_heads', 4),
@@ -213,7 +225,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'mamba':
             classifier = MambaClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 d_model=classifier_config.get('d_model', 64),
                 d_state=classifier_config.get('d_state', 16),
@@ -226,7 +238,7 @@ class GraphModelClassifierTrainer(GraphModelBase):
             )
         elif classifier_type == 'multiscale_conv_attention':
             classifier = MultiScaleConvAttentionClassifier(
-                input_dim=latent_dim,
+                input_dim=classifier_input_dim,
                 num_classes=num_classes,
                 num_filters=classifier_config.get('num_filters', 32),
                 kernel_sizes=tuple(classifier_config.get('kernel_sizes', [5, 19, 39])),
@@ -235,6 +247,19 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 n_attn_heads=classifier_config.get('n_attn_heads', 4),
                 attn_dropout=classifier_config.get('attn_dropout', 0.1),
                 dropout=classifier_config.get('dropout', 0.1),
+                mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
+            )
+        elif classifier_type == 'causal_cnn_lstm':
+            classifier = CausalCNNLSTMClassifier(
+                input_dim=classifier_input_dim,
+                num_classes=num_classes,
+                conv_channels=list(classifier_config.get('conv_channels', [32, 64, 128])),
+                kernel_sizes=list(classifier_config.get('kernel_sizes', [5, 7, 11])),
+                dilations=list(classifier_config.get('dilations', [1, 2, 4])),
+                lstm_hidden=classifier_config.get('lstm_hidden', 128),
+                lstm_layers=classifier_config.get('lstm_layers', 2),
+                dropout=classifier_config.get('dropout', 0.1),
+                pooling=classifier_config.get('pooling', 'mean_max'),
                 mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
             )
         else:
@@ -261,6 +286,8 @@ class GraphModelClassifierTrainer(GraphModelBase):
             use_posterior=use_posterior,
             sample_latent=sample_latent,
             class_weights=class_weights,
+            tlo_embed_dim=tlo_embed_dim,
+            tlo_dropout=tlo_dropout,
         )
 
         # Log parameter counts
