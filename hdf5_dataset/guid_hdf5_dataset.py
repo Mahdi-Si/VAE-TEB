@@ -222,7 +222,8 @@ class SignalSequenceDataset(Dataset):
 
     def __del__(self) -> None:
         """Cleanup when dataset is garbage collected."""
-        self._cleanup()
+        if hasattr(self, "_guid_cache_lock"):
+            self._cleanup()
 
     # ------------------------------------------------------------------
     # Init helpers
