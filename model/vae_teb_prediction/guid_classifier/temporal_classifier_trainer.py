@@ -1,0 +1,620 @@
+"""Training pipeline for the temporal VAE classifier.
+
+Provides the PyTorch Lightning wrapper (``PlTemporalClassifier``) and the
+``GraphModelBase``-derived trainer (``GraphModelTemporalTrainer``) that
+orchestrate single-fold training of the :class:`TemporalVaeClassifier`.
+
+Typical workflow::
+
+    trainer = GraphModelTemporalTrainer(config_file_path="config_temporal.yaml")
+    trainer.setup_config()
+    trainer.create_model()
+    lightning_trainer = trainer.train_model(train_loader, val_loader)
+
+Or use the convenience :func:`train_fold` to train a single fold end-to-end
+from a config dict.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import json
+import yaml
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import lightning as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.profilers import SimpleProfiler
+from loguru import logger
+
+from train.graph_model_base import GraphModelBase
+from train.pl_model_base import LightningModelBase
+from train.callbacks import (
+    LossPlotCallback,
+    HyperparameterLoggingCallback,
+    MetricsLoggingCallback,
+)
+from train.graph_models_utils import load_checkpoint_strict
+from model.vae_teb_prediction.guid_classifier.temporal_classification_model import (
+    TemporalVaeClassifier,
+)
+
+
+# ---------------------------------------------------------------------------
+#  Lightning Module
+# ---------------------------------------------------------------------------
+
+
+class PlTemporalClassifier(LightningModelBase):
+    """PyTorch Lightning wrapper for :class:`TemporalVaeClassifier`.
+
+    Inherits from :class:`LightningModelBase` and overrides
+    :meth:`compute_loss_and_metrics` to handle GUID-sequence batches from
+    ``sequence_collate_fn``.
+
+    Important:
+        Overrides ``__init__`` to bypass ``torch.compile`` because the
+        ``TemporalVaeClassifier.forward()`` contains dynamic control flow
+        (chunked VAE encoding, variable-length packed sequences, conditional
+        feature encoding) that is incompatible with ``torch.compile`` graph
+        tracing.
+
+    Args:
+        base_model: A :class:`TemporalVaeClassifier` instance.
+        lr: Learning rate.
+        lr_milestones: Epochs for learning-rate decay.
+        class_weights: Optional per-class weights for cross-entropy loss.
+        weight_decay: AdamW weight-decay coefficient.
+    """
+
+    prog_bar_metrics = ("loss", "accuracy")
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        *,
+        lr: float = 1e-3,
+        lr_milestones: Optional[Sequence[int]] = None,
+        class_weights: Optional[List[float]] = None,
+        weight_decay: float = 1e-4,
+    ) -> None:
+        # Bypass torch.compile entirely.  LightningModelBase.__init__ calls
+        # torch.compile(base_model) which can fail on Windows and produces
+        # graph-break errors with dynamic control flow
+        # (pack_padded_sequence, chunked VAE encoding, conditional branches).
+        #
+        # We replicate the base __init__ manually, skipping the compile step.
+        pl.LightningModule.__init__(self)
+        self.save_hyperparameters(ignore=["base_model"])
+        self._orig_model = base_model
+        self._wrapper_name = self.__class__.__name__
+        self.model = base_model  # Eager mode — no torch.compile
+
+        if class_weights is not None:
+            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
+            self.register_buffer("_class_weights_buf", weight_tensor)
+            logger.info(
+                "PlTemporalClassifier: using class weights {}", class_weights,
+            )
+        else:
+            self._class_weights_buf = None
+
+    def compute_loss_and_metrics(
+        self, batch: Dict, batch_idx: int, stage: str,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Run forward pass and compute masked cross-entropy loss.
+
+        Args:
+            batch: Dict from ``sequence_collate_fn`` with keys ``fhr_st``,
+                ``fhr_ph``, ``fhr_up_ph``, ``delta_t``, ``mask``, ``lengths``,
+                ``target``, etc.
+            batch_idx: Index of the current batch within the epoch.
+            stage: One of ``'train'``, ``'val'``, ``'test'``.
+
+        Returns:
+            Tuple of ``(loss, metrics_dict)`` where ``metrics_dict`` keys are
+            short names (``loss``, ``accuracy``, ``class_0_acc``,
+            ``class_1_acc``).  The base class prefixes them with ``stage/``.
+        """
+        outputs = self.model(batch)
+        loss_dict = self._orig_model.compute_loss(outputs, batch)
+
+        loss = loss_dict["loss"]
+        metrics = {
+            "loss": loss,
+            "accuracy": loss_dict["accuracy"],
+            "class_0_acc": loss_dict["class_0_acc"],
+            "class_1_acc": loss_dict["class_1_acc"],
+        }
+        return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+#  Class Weight Estimation (GUID-level)
+# ---------------------------------------------------------------------------
+
+
+def estimate_temporal_class_weights(
+    hdf5_files: List[str],
+    **dataset_kwargs,
+) -> torch.Tensor:
+    """Estimate class weights from GUID-level labels.
+
+    Counts at GUID level (not segment level) to avoid over-counting
+    GUIDs with many segments.  Each GUID contributes one label determined
+    by the ``target.max()`` of its first segment (all segments in a GUID
+    share the same class label).
+
+    Args:
+        hdf5_files: List of HDF5 file paths for training data.
+        **dataset_kwargs: Forwarded to ``SignalSequenceDataset`` constructor
+            (e.g. ``segment_duration``, ``stats_path``, ``normalize_fields``).
+
+    Returns:
+        Tensor of shape ``(2,)`` — ``[healthy_weight, unhealthy_weight]``.
+        Weights are inverse-frequency normalised so they sum to
+        ``num_classes = 2``.
+    """
+    from hdf5_dataset.guid_hdf5_dataset import SignalSequenceDataset
+
+    dataset = SignalSequenceDataset(hdf5_files=hdf5_files, **dataset_kwargs)
+
+    counts = torch.zeros(2, dtype=torch.long)
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        # target shape: (S, 300) — take max over all timesteps & segments
+        target_tensor = sample["target"]  # (S, 300)
+        label = target_tensor.max().item()
+        binary_label = int(label > 1)  # 0=healthy, 1=unhealthy
+        counts[binary_label] += 1
+
+    total = counts.sum().float()
+    if total == 0:
+        logger.warning("No GUIDs found for class weight estimation, returning uniform weights")
+        return torch.ones(2)
+
+    num_classes = 2
+    weights = total / (num_classes * counts.float())
+    # Replace inf (zero-count class) with 1.0
+    weights = torch.where(torch.isinf(weights), torch.ones_like(weights), weights)
+
+    logger.info(
+        "Temporal class weights — GUID counts (healthy={}, unhealthy={}), weights={}",
+        counts[0].item(), counts[1].item(), weights.tolist(),
+    )
+    return weights
+
+
+# ---------------------------------------------------------------------------
+#  GraphModel Trainer
+# ---------------------------------------------------------------------------
+
+
+class GraphModelTemporalTrainer(GraphModelBase):
+    """Training pipeline for the temporal VAE classifier.
+
+    Reads configuration from ``config_temporal.yaml``, creates a
+    :class:`TemporalVaeClassifier` with a frozen VAE encoder, wraps it in
+    :class:`PlTemporalClassifier`, and runs training via PyTorch Lightning.
+
+    Inherits directory management, logging, and config loading from
+    :class:`GraphModelBase`.
+
+    Args:
+        config_file_path: Path to the YAML configuration file.  Defaults to
+            ``config_temporal.yaml`` in the same directory as this module.
+    """
+
+    def __init__(self, config_file_path: Optional[str] = None) -> None:
+        if config_file_path is None:
+            config_file_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "config_temporal.yaml",
+            )
+        super().__init__(config_file_path)
+
+    def create_model(
+        self,
+        class_weights: Optional[List[float]] = None,
+    ) -> None:
+        """Instantiate :class:`TemporalVaeClassifier` and wrap in Lightning.
+
+        Steps:
+            1. Load pre-trained VAE checkpoint.
+            2. Build :class:`TemporalVaeClassifier` from ``model_config``.
+            3. Log trainable vs frozen parameter counts.
+            4. Wrap in :class:`PlTemporalClassifier`.
+
+        Args:
+            class_weights: Optional per-class weights.  If ``None``, no
+                class weighting is applied to the cross-entropy loss.
+        """
+        model_cfg = self.config.get("model_config", {})
+
+        # ----- 1. Load VAE ------------------------------------------------ #
+        vae_checkpoint = model_cfg.get("vae_checkpoint")
+        if vae_checkpoint is None:
+            raise ValueError(
+                "vae_checkpoint must be provided in model_config"
+            )
+
+        from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
+
+        vae_model = SeqVae()
+        load_checkpoint_strict(vae_model, checkpoint=vae_checkpoint)
+        logger.info("VAE model loaded from checkpoint: {}", vae_checkpoint)
+
+        # ----- 2. Build TemporalVaeClassifier ----------------------------- #
+        seg_cfg = model_cfg.get("segment_encoder", {})
+        lstm_cfg = model_cfg.get("temporal_lstm", {})
+        feat_cfg = model_cfg.get("temporal_features", {})
+        head_cfg = model_cfg.get("classifier_head", {})
+
+        seg_idx_cfg = feat_cfg.get("segment_index", {})
+        tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
+
+        self.pytorch_model = TemporalVaeClassifier(
+            vae_model=vae_model,
+            segment_encoder_type=seg_cfg.get("type", "mean_pool"),
+            d_seg=seg_cfg.get("d_seg", 64),
+            temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
+            temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
+            temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
+            gap_encoding=model_cfg.get("gap_encoding", "concat"),
+            position_embed_dim=(
+                seg_idx_cfg.get("embed_dim", 16) if seg_idx_cfg.get("enabled", False) else 0
+            ),
+            max_position_index=seg_idx_cfg.get("max_index", 40),
+            tlo_enabled=tlo_cfg.get("enabled", False),
+            num_classes=head_cfg.get("num_classes", 2),
+            classifier_dropout=head_cfg.get("dropout", 0.1),
+            mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
+            class_weights=class_weights,
+            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+            use_posterior=model_cfg.get("use_posterior", True),
+            freeze_vae=model_cfg.get("freeze_vae", True),
+            cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+        )
+
+        # ----- 3. Log parameter counts ----------------------------------- #
+        total_params = sum(p.numel() for p in self.pytorch_model.parameters())
+        trainable_params = sum(
+            p.numel() for p in self.pytorch_model.parameters() if p.requires_grad
+        )
+        frozen_params = total_params - trainable_params
+        logger.info("Total parameters: {:,}", total_params)
+        logger.info("Trainable parameters: {:,}", trainable_params)
+        logger.info("Frozen parameters: {:,}", frozen_params)
+
+        # ----- 4. Wrap in Lightning --------------------------------------- #
+        self.pl_model = PlTemporalClassifier(
+            self.pytorch_model,
+            lr=self.lr,
+            lr_milestones=self.lr_milestones,
+            class_weights=class_weights,
+        )
+
+        trainer_hparams = {
+            "lr": self.lr,
+            "lr_milestones": self.lr_milestones,
+        }
+        self.apply_config_hyperparameters(trainer_hparams, self.pl_model)
+
+    def train_model(
+        self,
+        train_dataloader,
+        validation_dataloader,
+    ) -> pl.Trainer:
+        """Train the temporal classifier using PyTorch Lightning.
+
+        Sets up callbacks (ModelCheckpoint, EarlyStopping, LossPlot,
+        MetricsLogging, HyperparameterLogging), creates a Lightning Trainer
+        with ``use_distributed_sampler=False`` (we supply our own
+        ``LengthBucketSampler``), and calls ``trainer.fit()``.
+
+        Args:
+            train_dataloader: Training DataLoader (bucketed sequence loader).
+            validation_dataloader: Validation DataLoader.
+
+        Returns:
+            The Lightning :class:`~lightning.pytorch.Trainer` instance after
+            fitting completes.
+        """
+        callbacks_cfg = self.config.get("advanced_config", {}).get("callbacks", {})
+
+        # --- Callbacks ---------------------------------------------------- #
+        self.metrics_callback = MetricsLoggingCallback()
+        self.loss_plot_callback = LossPlotCallback(
+            output_dir=self.train_results_dir,
+            plot_frequency=self.config["general_config"].get("plot_frequency", 10),
+            mlflow_logger=self.mlflow_logger,
+        )
+        self.hyperparam_callback = HyperparameterLoggingCallback(
+            output_dir=self.train_results_dir,
+            plot_frequency=10,
+        )
+
+        ckpt_cfg = callbacks_cfg.get("model_checkpoint", {})
+        self.checkpoint_callback = ModelCheckpoint(
+            dirpath=self.model_checkpoint_dir,
+            monitor=ckpt_cfg.get("monitor", "val/loss"),
+            filename="temporal-model-epoch={epoch:02d}-loss={val/loss:.4f}",
+            save_top_k=ckpt_cfg.get("save_top_k", 3),
+            mode="min",
+        )
+
+        callback_list = [
+            self.metrics_callback,
+            self.loss_plot_callback,
+            self.hyperparam_callback,
+            self.checkpoint_callback,
+        ]
+
+        es_cfg = callbacks_cfg.get("early_stopping", {})
+        if es_cfg.get("enabled", True):
+            self.early_stopping_callback = EarlyStopping(
+                monitor=es_cfg.get("monitor", "val/loss"),
+                patience=es_cfg.get("patience", 30),
+                mode="min",
+                verbose=True,
+            )
+            callback_list.append(self.early_stopping_callback)
+
+        # --- Trainer config ----------------------------------------------- #
+        trainer_cfg = self.config.get("advanced_config", {}).get("trainer", {})
+        precision = trainer_cfg.get("precision", "32-true")
+        gradient_clip_val = trainer_cfg.get("gradient_clip_val")
+        gradient_clip_algorithm = trainer_cfg.get("gradient_clip_algorithm", "norm")
+
+        logger_reference = self.lightning_loggers if self.lightning_loggers else True
+
+        trainer_kwargs = {
+            "max_epochs": self.epochs_num,
+            "callbacks": callback_list,
+            "default_root_dir": self.train_results_dir,
+            "accumulate_grad_batches": self.accumulate_grad_batches,
+            "precision": precision,
+            "deterministic": trainer_cfg.get("deterministic", False),
+            "benchmark": trainer_cfg.get("benchmark", True),
+            "gradient_clip_val": gradient_clip_val,
+            "gradient_clip_algorithm": gradient_clip_algorithm,
+            "enable_checkpointing": True,
+            "log_every_n_steps": 1,
+            "num_sanity_val_steps": 0,
+            # CRITICAL: We use our own LengthBucketSampler — disable
+            # Lightning's automatic DistributedSampler wrapping.
+            "use_distributed_sampler": False,
+            "sync_batchnorm": False,
+            "enable_progress_bar": True,
+            "profiler": SimpleProfiler(dirpath=self.train_results_dir),
+            "logger": logger_reference,
+        }
+
+        if torch.cuda.is_available():
+            trainer_kwargs.update({
+                "accelerator": "gpu",
+                "devices": self.cuda_devices,
+                "strategy": "ddp" if len(self.cuda_devices) > 1 else "auto",
+            })
+        else:
+            trainer_kwargs.update({"accelerator": "cpu", "devices": 1})
+
+        trainer = pl.Trainer(**trainer_kwargs)
+        trainer.fit(self.pl_model, train_dataloader, validation_dataloader)
+
+        return trainer
+
+
+# ---------------------------------------------------------------------------
+#  Single-Fold Training Function
+# ---------------------------------------------------------------------------
+
+
+def train_fold(
+    fold_id: int,
+    config: Dict,
+    gpu_id: int = 0,
+) -> Tuple[str, GraphModelTemporalTrainer]:
+    """Train the temporal classifier on a single fold.
+
+    This is the primary entry point for single-fold training.  It handles
+    dataset loading, class weight estimation, config writing, model creation,
+    and training.
+
+    Args:
+        fold_id: Fold number (1-10).
+        config: Full configuration dict from ``config_temporal.yaml``.
+        gpu_id: GPU device to use.
+
+    Returns:
+        Tuple of ``(checkpoint_dir, trainer_instance)``.
+
+    Raises:
+        ValueError: If required config keys are missing.
+    """
+    import random
+    import numpy as np
+
+    logger.info("Starting temporal fold {} on GPU {}", fold_id, gpu_id)
+
+    # Seed for reproducibility
+    seed = 42 + fold_id
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # --- Dataset paths ---------------------------------------------------- #
+    from model.vae_teb_prediction.kfold_classifier_trainer import get_fold_datasets
+    from model.vae_teb_prediction.guid_classifier.length_bucket_sampler import (
+        create_bucketed_sequence_dataloader,
+    )
+
+    dataset_cfg = config.get("dataset_config", {})
+    kfold_base_path = dataset_cfg["kfold_base_path"]
+    fold_datasets = get_fold_datasets(kfold_base_path, fold_id)
+
+    dataloader_cfg = dataset_cfg.get("dataloader_config", {})
+    dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {})
+    stat_path = dataset_cfg.get("stat_path")
+    normalize_fields = dataloader_cfg.get("normalize_fields")
+
+    bucket_cfg = dataset_cfg.get("bucket_sampler", {})
+    bucket_ranges = bucket_cfg.get("bucket_ranges")
+    bucket_shuffle = bucket_cfg.get("shuffle", True)
+
+    # --- Create dataloaders ----------------------------------------------- #
+    logger.info("Fold {}: Creating bucketed sequence dataloaders...", fold_id)
+
+    common_dl_kwargs = dict(
+        num_workers=dataloader_cfg.get("num_workers", 0),
+        segment_duration=dataloader_cfg.get("segment_duration", 1200.0),
+        guid_cache_size=dataloader_cfg.get("guid_cache_size", 128),
+        stats_path=stat_path,
+        normalize_fields=normalize_fields,
+        prefetch_factor=dataloader_cfg.get("prefetch_factor", 2),
+        seed=seed,
+        **dataset_kwargs,
+    )
+
+    batch_size_train = config["general_config"]["batch_size"]["train"]
+    batch_size_test = config["general_config"]["batch_size"]["test"]
+
+    train_loader, train_dataset = create_bucketed_sequence_dataloader(
+        hdf5_files=fold_datasets["train"],
+        batch_size=batch_size_train,
+        bucket_ranges=bucket_ranges,
+        shuffle=bucket_shuffle,
+        **common_dl_kwargs,
+    )
+
+    val_loader, val_dataset = create_bucketed_sequence_dataloader(
+        hdf5_files=fold_datasets["val"],
+        batch_size=batch_size_test,
+        bucket_ranges=bucket_ranges,
+        shuffle=False,
+        **common_dl_kwargs,
+    )
+
+    logger.info(
+        "Fold {}: train={} GUIDs, val={} GUIDs",
+        fold_id, len(train_dataset), len(val_dataset),
+    )
+
+    # --- Class weights ---------------------------------------------------- #
+    class_weights = estimate_temporal_class_weights(
+        hdf5_files=fold_datasets["train"],
+        segment_duration=dataloader_cfg.get("segment_duration", 1200.0),
+        guid_cache_size=dataloader_cfg.get("guid_cache_size", 128),
+        stats_path=stat_path,
+        normalize_fields=normalize_fields,
+        **dataset_kwargs,
+    )
+    class_weights_list = class_weights.tolist()
+
+    # --- Fold-specific config --------------------------------------------- #
+    fold_output_dir = Path(config["general_config"]["folders_config"]["out_dir_base"]) / f"fold_{fold_id}"
+    fold_output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_config = config.copy()
+    fold_config["general_config"] = {**config["general_config"]}
+    fold_config["general_config"]["cuda_devices"] = [0]
+    fold_config["general_config"]["folders_config"] = {
+        "out_dir_base": str(fold_output_dir),
+    }
+
+    fold_config_path = fold_output_dir / "config.yaml"
+    with open(fold_config_path, "w") as f:
+        yaml.dump(fold_config, f, default_flow_style=False)
+    logger.info("Fold {}: config saved to {}", fold_id, fold_config_path)
+
+    # --- Create trainer and model ----------------------------------------- #
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    graph_model = GraphModelTemporalTrainer(config_file_path=str(fold_config_path))
+    graph_model.setup_config()
+    graph_model.create_model(class_weights=class_weights_list)
+
+    # --- Train ------------------------------------------------------------ #
+    logger.info("Fold {}: Starting training...", fold_id)
+    start_time = time.time()
+    trainer = graph_model.train_model(train_loader, val_loader)
+    training_time_min = (time.time() - start_time) / 60.0
+    logger.info("Fold {}: Training completed in {:.2f} minutes", fold_id, training_time_min)
+
+    # Log basic results
+    best_val_loss = trainer.callback_metrics.get("val/loss", float("inf"))
+    best_val_acc = trainer.callback_metrics.get("val/accuracy", 0.0)
+    best_ckpt_path = graph_model.checkpoint_callback.best_model_path
+
+    logger.info(
+        "Fold {}: best val_loss={:.4f}, val_accuracy={:.4f}, checkpoint={}",
+        fold_id,
+        float(best_val_loss),
+        float(best_val_acc),
+        best_ckpt_path,
+    )
+
+    fold_results = {
+        "fold_id": fold_id,
+        "training_time_minutes": training_time_min,
+        "best_val_loss_training": float(best_val_loss),
+        "best_val_accuracy_training": float(best_val_acc),
+        "best_checkpoint_path": best_ckpt_path,
+        "status": "success",
+    }
+
+    results_path = fold_output_dir / "fold_results.json"
+    with open(results_path, "w") as f:
+        json.dump(fold_results, f, indent=2)
+
+    return str(graph_model.model_checkpoint_dir), graph_model
+
+
+# ---------------------------------------------------------------------------
+#  Main entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Single-fold training entry point.
+
+    Reads ``config_temporal.yaml`` from the same directory as this module,
+    trains fold 1 by default.
+    """
+    import numpy as np
+
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "config_temporal.yaml",
+    )
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    dataset_cfg = config.get("dataset_config", {})
+    fold_ids = dataset_cfg.get("fold_ids") or [1]
+
+    gpu_ids = config["general_config"].get("cuda_devices", [0])
+
+    for idx, fold_id in enumerate(fold_ids):
+        gpu_id = gpu_ids[idx % len(gpu_ids)]
+        checkpoint_dir, trainer = train_fold(
+            fold_id=fold_id,
+            config=config,
+            gpu_id=gpu_id,
+        )
+        logger.info("Fold {} checkpoints at: {}", fold_id, checkpoint_dir)
+
+
+if __name__ == "__main__":
+    main()

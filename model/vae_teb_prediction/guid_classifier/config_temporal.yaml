@@ -1,0 +1,109 @@
+general_config:
+  tag: "temporal_classifier_run_1"
+  cuda_devices: [0, 1, 2, 3, 4]
+  max_parallel_folds: 5
+  plot_frequency: 10
+  lr: 0.001                                  # 1e-3 for randomly initialized heads
+  lr_milestone: [100]
+  epochs: 1000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 8                                 # GUIDs per batch (not segments)
+    test: 8
+  folders_config:
+    out_dir_base: /path/to/temporal_results
+
+model_config:
+  vae_checkpoint: /path/to/vae.ckpt          # Pre-trained VAE checkpoint
+  freeze_vae: true
+  use_posterior: true
+  vae_chunk_size: 32                          # Segments per VAE forward chunk
+
+  segment_encoder:
+    type: "lstm"                              # "mean_pool" | "lstm" | "cnn"
+    d_seg: 64                                 # Segment representation dimension
+    # LSTM-specific (used when type: "lstm")
+    lstm_hidden: 64                           # = d_seg for lstm type
+    # CNN-specific (used when type: "cnn")
+    cnn_kernel: 7                             # Causal conv kernel size
+
+  temporal_lstm:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+
+  gap_encoding: "concat"                      # "concat" | "time_decay" | "both"
+
+  temporal_features:
+    delta_t:
+      enabled: true
+    segment_index:
+      enabled: true                           # Learned absolute position embedding
+      embed_dim: 16
+      max_index: 40
+    time_from_labor_onset:
+      enabled: true                           # NaN-safe zero+flag encoding
+      nan_strategy: "flag"                    # "flag" (zero + binary flag)
+
+  classifier_head:
+    num_classes: 2
+    dropout: 0.1
+    mlp_multiplier: 2.0
+
+  # Memory strategy
+  precompute_latents: false                   # true = pre-compute & cache VAE latents
+
+  evaluation:
+    target_fpr: 0.2
+    decision_time_hours: 1.0
+    exclude_last_minutes: 30
+    max_gap_multiplier: null
+    generate_plots: true
+
+dataset_config:
+  kfold_base_path: /path/to/k_fold_dataset
+  num_folds: 10
+  fold_ids: null
+  stat_path: /path/to/stats.hdf5
+
+  dataloader_config:
+    num_workers: 4
+    prefetch_factor: 4
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+    segment_duration: 1200.0                  # Seconds per grid slot (20 min)
+    guid_cache_size: 128                      # GUIDs cached in memory
+    dataset_kwargs:
+      load_fields:
+        - fhr_st
+        - fhr_ph
+        - fhr_up_ph
+        - target
+        - weight
+        - epoch
+        - cs_label
+        - bg_label
+        - guid
+        - time_from_labor_onset
+      epoch_min: -23000
+      trim_minutes: 1.0
+
+  bucket_sampler:
+    enabled: true
+    bucket_ranges: [[1, 5], [6, 12], [13, 20], [21, 40]]
+    shuffle: true                             # Shuffle within buckets each epoch
+
+advanced_config:
+  trainer:
+    precision: '32-true'
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: 'norm'
+    deterministic: false
+    benchmark: true
+  callbacks:
+    early_stopping:
+      enabled: true
+      patience: 30
+      monitor: 'val/loss'
+    model_checkpoint:
+      save_top_k: 3
+      monitor: 'val/loss'

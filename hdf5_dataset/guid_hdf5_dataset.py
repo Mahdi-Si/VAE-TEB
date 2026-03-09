@@ -414,6 +414,16 @@ class SignalSequenceDataset(Dataset):
         """
         return list(self._guid_list)
 
+    @property
+    def guid_lengths(self) -> List[int]:
+        """Number of segments per GUID, in same order as ``__getitem__`` indexing.
+
+        Returns:
+            List of segment counts, one per GUID, ordered to match the
+            alphabetically sorted GUID list used by ``__getitem__``.
+        """
+        return [len(self._guid_to_inner_indices[g]) for g in self._guid_list]
+
     def get_guid_segment_counts(self) -> Dict[str, int]:
         """Return the number of segments per GUID.
 
