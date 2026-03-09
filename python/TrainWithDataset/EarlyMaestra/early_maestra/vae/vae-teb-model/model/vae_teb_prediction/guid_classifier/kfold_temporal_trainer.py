@@ -4,6 +4,10 @@ Orchestrates multi-fold training by dispatching each fold to a separate process
 (one per GPU) using :class:`concurrent.futures.ProcessPoolExecutor` with a
 ``'spawn'`` multiprocessing context for CUDA safety.
 
+Includes full MLflow integration matching the independent-segment pipeline:
+parent/child run nesting, per-fold metric and artifact logging, and cross-fold
+summary logging.
+
 Typical usage::
 
     python -m model.vae_teb_prediction.guid_classifier.kfold_temporal_trainer
@@ -27,6 +31,184 @@ from typing import Dict, List, Optional
 
 import torch
 from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+#  MLflow helpers
+# ---------------------------------------------------------------------------
+
+
+def create_parent_mlflow_run(
+    config_data: Optional[Dict],
+    experiment_tag: str,
+    extra_tags: Optional[Dict[str, str]] = None,
+):
+    """Create a parent MLflow run for the k-fold execution.
+
+    All per-fold runs are nested under this parent via the
+    ``mlflow.parentRunId`` tag.
+
+    Args:
+        config_data: Full config dict (needs ``advanced_config.tracking.mlflow``).
+        experiment_tag: Fallback experiment name.
+        extra_tags: Additional tags to attach to the parent run.
+
+    Returns:
+        Tuple of ``(mlflow.MlflowClient, parent_run_id)`` or
+        ``(None, None)`` if MLflow is disabled or unavailable.
+    """
+    if not config_data:
+        return None, None
+
+    mlflow_cfg = (
+        config_data.get("advanced_config", {})
+        .get("tracking", {})
+        .get("mlflow", {})
+        or {}
+    )
+    if not mlflow_cfg.get("enabled"):
+        return None, None
+
+    try:
+        import mlflow
+
+        tracking_uri = mlflow_cfg.get("tracking_uri")
+        experiment_name = mlflow_cfg.get("experiment_name") or experiment_tag
+
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+
+        client = mlflow.MlflowClient()
+
+        # Get or create experiment
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            experiment_id = client.create_experiment(experiment_name)
+        else:
+            experiment_id = experiment.experiment_id
+
+        # Build tags for the parent run
+        tags = dict(mlflow_cfg.get("tags") or {})
+        tags["kfold.role"] = "parent"
+        tags["kfold.model_type"] = "temporal_classifier"
+        if extra_tags:
+            tags.update({k: str(v) for k, v in extra_tags.items()})
+
+        run_name = f"{experiment_tag}-{time.strftime('%Y%m%d-%H%M%S')}"
+        parent_run = client.create_run(
+            experiment_id=experiment_id,
+            run_name=run_name,
+            tags=tags,
+        )
+
+        parent_run_id = parent_run.info.run_id
+        logger.info(
+            "Created parent MLflow run: {} (id={})", run_name, parent_run_id,
+        )
+        return client, parent_run_id
+
+    except Exception as exc:
+        logger.warning("Failed to create parent MLflow run: {}", exc)
+        return None, None
+
+
+def _inject_mlflow_fold_tags(
+    config: Dict,
+    fold_id: int,
+    gpu_id: int,
+    fold_datasets: Optional[Dict] = None,
+    parent_run_id: Optional[str] = None,
+) -> None:
+    """Inject per-fold MLflow tags into the config dict (in-place).
+
+    These tags are picked up by ``GraphModelBase._init_mlflow_logger()``
+    when the fold trainer is instantiated.
+
+    Args:
+        config: Full config dict to modify in-place.
+        fold_id: Fold number.
+        gpu_id: Assigned GPU ID.
+        fold_datasets: Optional dict with train/val/test file lists.
+        parent_run_id: Optional parent run ID for nesting.
+    """
+    advanced_cfg = config.setdefault("advanced_config", {})
+    tracking_cfg = advanced_cfg.setdefault("tracking", {})
+    mlflow_cfg = tracking_cfg.setdefault("mlflow", {})
+
+    tags = dict(mlflow_cfg.get("tags") or {})
+    tags.update({
+        "kfold.role": "fold",
+        "kfold.model_type": "temporal_classifier",
+        "kfold.fold_id": str(fold_id),
+        "kfold.gpu_id": str(gpu_id),
+    })
+    if fold_datasets:
+        tags["kfold.train_files"] = str(len(fold_datasets.get("train", [])))
+        tags["kfold.val_files"] = str(len(fold_datasets.get("val", [])))
+        tags["kfold.test_files"] = str(len(fold_datasets.get("test", [])))
+    if parent_run_id:
+        tags["mlflow.parentRunId"] = parent_run_id
+
+    mlflow_cfg["tags"] = tags
+    if not mlflow_cfg.get("run_name"):
+        mlflow_cfg["run_name"] = f"temporal-fold-{fold_id:02d}"
+
+
+def _log_fold_mlflow_metrics(
+    mlflow_logger, metrics: Dict[str, float], step: Optional[int] = None,
+) -> None:
+    """Log a dict of metrics to the fold's MLflow run.
+
+    Args:
+        mlflow_logger: Lightning MLFlowLogger instance (may be ``None``).
+        metrics: Dict of metric name → value.
+        step: Optional global step.
+    """
+    if mlflow_logger is None or not metrics:
+        return
+    cleaned = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        try:
+            cleaned[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    if cleaned:
+        try:
+            mlflow_logger.log_metrics(cleaned, step=step)
+        except Exception as exc:
+            logger.warning("Failed to log MLflow metrics: {}", exc)
+
+
+def _log_fold_mlflow_artifact(
+    mlflow_logger, path, *, is_dir: bool = False,
+) -> None:
+    """Log a file or directory as an MLflow artifact.
+
+    Args:
+        mlflow_logger: Lightning MLFlowLogger instance (may be ``None``).
+        path: File or directory path.
+        is_dir: If ``True``, log all files in the directory.
+    """
+    if mlflow_logger is None or not path:
+        return
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return
+    try:
+        if is_dir:
+            mlflow_logger.experiment.log_artifacts(
+                mlflow_logger.run_id, str(path_obj),
+            )
+        else:
+            mlflow_logger.experiment.log_artifact(
+                mlflow_logger.run_id, str(path_obj),
+            )
+    except Exception as exc:
+        logger.warning("Failed to log MLflow artifact {}: {}", path_obj, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +276,14 @@ def train_single_fold_temporal(
             fold_output_dir
         )
 
+        # Inject per-fold MLflow tags into config
+        _inject_mlflow_fold_tags(
+            config,
+            fold_id=fold_id,
+            gpu_id=gpu_id,
+            parent_run_id=parent_run_id,
+        )
+
         # Apply any additional overrides from kwargs
         for key, value in kwargs.items():
             if "." in key:
@@ -115,6 +305,15 @@ def train_single_fold_temporal(
             gpu_id=0,  # Already mapped via CUDA_VISIBLE_DEVICES
         )
         training_time_min = (time.time() - start_time) / 60.0
+
+        # Grab the MLflow logger from the trainer for post-training logging
+        graph_model = trainer_instance
+        mlflow_logger = getattr(graph_model, "mlflow_logger", None)
+        best_ckpt_path = getattr(
+            getattr(graph_model, "checkpoint_callback", None),
+            "best_model_path", None,
+        )
+        lightning_trainer = getattr(graph_model, "_trainer", None)
 
         # ----- Evaluation -----------------------------------------------------
         from model.vae_teb_prediction.guid_classifier.evaluate_temporal_classifier import (
@@ -162,6 +361,33 @@ def train_single_fold_temporal(
             eval_results.get("primary_threshold", 0.0),
             eval_results.get("test_sensitivity_mean", 0.0),
         )
+
+        # ----- Per-fold MLflow logging ----------------------------------------
+        _log_fold_mlflow_metrics(
+            mlflow_logger,
+            {
+                "train/training_time_minutes": training_time_min,
+                "eval/primary_threshold": eval_results.get("primary_threshold", 0.0),
+                "eval/validation_sensitivity": eval_results.get("validation_sensitivity", 0.0),
+                "eval/validation_specificity": eval_results.get("validation_specificity", 0.0),
+                "eval/validation_fpr": eval_results.get("validation_fpr", 0.0),
+                "eval/test_sensitivity_mean": eval_results.get("test_sensitivity_mean", 0.0),
+                "eval/test_specificity_mean": eval_results.get("test_specificity_mean", 0.0),
+                "eval/test_fpr_mean": eval_results.get("test_fpr_mean", 0.0),
+            },
+            step=getattr(lightning_trainer, "global_step", None) if lightning_trainer else None,
+        )
+
+        # Log artifacts
+        fold_config_path = fold_output_dir / "config.yaml"
+        if fold_config_path.exists():
+            _log_fold_mlflow_artifact(mlflow_logger, fold_config_path)
+        _log_fold_mlflow_artifact(mlflow_logger, results_path)
+        if best_ckpt_path:
+            _log_fold_mlflow_artifact(mlflow_logger, best_ckpt_path)
+        evaluation_dir = fold_output_dir / "evaluation"
+        if evaluation_dir.exists():
+            _log_fold_mlflow_artifact(mlflow_logger, evaluation_dir, is_dir=True)
 
         # Cleanup
         del trainer_instance
@@ -249,6 +475,26 @@ def run_kfold_temporal_parallel(
 
     Path(output_base_dir).mkdir(parents=True, exist_ok=True)
 
+    # --- Create parent MLflow run ---------------------------------------------
+    base_cfg_data = None
+    if base_config_path and os.path.exists(base_config_path):
+        with open(base_config_path, "r") as cfg_file:
+            base_cfg_data = yaml.safe_load(cfg_file)
+
+    experiment_tag = (
+        (base_cfg_data or {}).get("general_config", {}).get("tag", "temporal_classifier")
+    )
+
+    mlflow_client, parent_run_id = create_parent_mlflow_run(
+        base_cfg_data,
+        experiment_tag,
+        extra_tags={
+            "kfold.num_folds": str(num_folds),
+            "kfold.requested_folds": str(selected_folds),
+            "kfold.execution_mode": execution_mode,
+        },
+    )
+
     logger.info("=" * 80)
     logger.info("TEMPORAL K-FOLD CROSS-VALIDATION")
     logger.info("=" * 80)
@@ -257,6 +503,8 @@ def run_kfold_temporal_parallel(
     logger.info("GPUs: {}", gpu_ids)
     if execution_mode == "parallel":
         logger.info("Max parallel folds: {}", max_parallel)
+    if parent_run_id:
+        logger.info("Parent MLflow run: {}", parent_run_id)
 
     # --- Execute folds ---------------------------------------------------------
     all_results: List[Dict] = []
@@ -266,7 +514,7 @@ def run_kfold_temporal_parallel(
         kfold_base_path=kfold_base_path,
         output_base_dir=output_base_dir,
         vae_checkpoint=vae_checkpoint,
-        parent_run_id=None,
+        parent_run_id=parent_run_id,
         **kwargs,
     )
 
@@ -366,6 +614,50 @@ def run_kfold_temporal_parallel(
     metadata_path = Path(output_base_dir) / "execution_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(execution_metadata, f, indent=2)
+
+    # --- Log summary to parent MLflow run -------------------------------------
+    if mlflow_client and parent_run_id:
+        try:
+            # Log summary metrics
+            if successful:
+                test_m = summary.get("test_metrics_primary", {})
+                val_m = summary.get("validation_metrics", {})
+                parent_metrics = {
+                    "summary/successful_folds": float(len(successful)),
+                    "summary/failed_folds": float(len(all_results) - len(successful)),
+                    "summary/mean_threshold": val_m.get("mean_threshold", 0.0),
+                    "summary/mean_val_sensitivity": val_m.get("mean_sensitivity", 0.0),
+                    "summary/mean_val_specificity": val_m.get("mean_specificity", 0.0),
+                    "summary/mean_test_sensitivity": test_m.get("mean_sensitivity", 0.0),
+                    "summary/std_test_sensitivity": test_m.get("std_sensitivity", 0.0),
+                    "summary/mean_test_specificity": test_m.get("mean_specificity", 0.0),
+                    "summary/std_test_specificity": test_m.get("std_specificity", 0.0),
+                    "summary/mean_test_fpr": test_m.get("mean_fpr", 0.0),
+                    "summary/std_test_fpr": test_m.get("std_fpr", 0.0),
+                }
+                for key, value in parent_metrics.items():
+                    mlflow_client.log_metric(parent_run_id, key, float(value))
+
+            # Log artifacts
+            mlflow_client.log_artifact(parent_run_id, str(kfold_results_path))
+            mlflow_client.log_artifact(parent_run_id, str(summary_path))
+            mlflow_client.log_artifact(parent_run_id, str(metadata_path))
+
+            aggregated_plots_dir = Path(output_base_dir) / "aggregated_plots"
+            if aggregated_plots_dir.exists():
+                mlflow_client.log_artifacts(
+                    parent_run_id, str(aggregated_plots_dir),
+                    artifact_path="aggregated_plots",
+                )
+
+            # Terminate the parent run
+            mlflow_client.set_terminated(parent_run_id)
+            logger.info("Parent MLflow run terminated: {}", parent_run_id)
+
+        except Exception as exc:
+            logger.warning(
+                "Failed to finalize parent MLflow run: {}", exc,
+            )
 
     return all_results
 

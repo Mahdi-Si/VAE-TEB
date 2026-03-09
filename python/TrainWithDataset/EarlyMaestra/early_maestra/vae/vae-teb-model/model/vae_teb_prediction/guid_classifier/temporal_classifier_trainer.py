@@ -140,48 +140,27 @@ class PlTemporalClassifier(LightningModelBase):
 
 
 def estimate_temporal_class_weights(
-    hdf5_files: List[str],
-    **dataset_kwargs,
+    dataset,
 ) -> torch.Tensor:
-    """Estimate class weights from GUID-level labels.
+    """Estimate class weights from GUID-level labels using an existing dataset.
 
-    Counts at GUID level (not segment level) to avoid over-counting
-    GUIDs with many segments.  Each GUID contributes one label determined
-    by the ``target.max()`` of its first segment (all segments in a GUID
-    share the same class label).
+    Delegates to ``SignalSequenceDataset.estimate_class_weights()`` which
+    reads only the ``target`` field from HDF5 in bulk — no redundant dataset
+    creation or full signal data loading.
 
     Args:
-        hdf5_files: List of HDF5 file paths for training data.
-        **dataset_kwargs: Forwarded to ``SignalSequenceDataset`` constructor
-            (e.g. ``segment_duration``, ``stats_path``, ``normalize_fields``).
+        dataset: An already-instantiated ``SignalSequenceDataset``.
 
     Returns:
         Tensor of shape ``(2,)`` — ``[healthy_weight, unhealthy_weight]``.
         Weights are inverse-frequency normalised so they sum to
         ``num_classes = 2``.
     """
-    from hdf5_dataset.guid_hdf5_dataset import SignalSequenceDataset
+    weights, counts = dataset.estimate_class_weights(num_classes=2)
 
-    dataset = SignalSequenceDataset(paths=hdf5_files, **dataset_kwargs)
-
-    counts = torch.zeros(2, dtype=torch.long)
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        # target shape: (S, 300) — take max over all timesteps & segments
-        target_tensor = sample["target"]  # (S, 300)
-        label = target_tensor.max().item()
-        binary_label = int(label > 1)  # 0=healthy, 1=unhealthy
-        counts[binary_label] += 1
-
-    total = counts.sum().float()
-    if total == 0:
+    if counts.sum() == 0:
         logger.warning("No GUIDs found for class weight estimation, returning uniform weights")
         return torch.ones(2)
-
-    num_classes = 2
-    weights = total / (num_classes * counts.float())
-    # Replace inf (zero-count class) with 1.0
-    weights = torch.where(torch.isinf(weights), torch.ones_like(weights), weights)
 
     logger.info(
         "Temporal class weights — GUID counts (healthy={}, unhealthy={}), weights={}",
@@ -508,15 +487,10 @@ def train_fold(
     )
 
     # --- Class weights ---------------------------------------------------- #
-    class_weights = estimate_temporal_class_weights(
-        hdf5_files=fold_datasets["train"],
-        segment_duration=dataloader_cfg.get("segment_duration", 1200.0),
-        guid_cache_size=dataloader_cfg.get("guid_cache_size", 128),
-        stats_path=stat_path,
-        normalize_fields=normalize_fields,
-        **dataset_kwargs,
-    )
+    logger.info("Fold {}: Estimating class weights...", fold_id)
+    class_weights = estimate_temporal_class_weights(train_dataset)
     class_weights_list = class_weights.tolist()
+    logger.info("Fold {}: Class weights estimated: {}", fold_id, class_weights_list)
 
     # --- Fold-specific config --------------------------------------------- #
     fold_output_dir = Path(config["general_config"]["folders_config"]["out_dir_base"]) / f"fold_{fold_id}"
@@ -535,11 +509,13 @@ def train_fold(
     logger.info("Fold {}: config saved to {}", fold_id, fold_config_path)
 
     # --- Create trainer and model ----------------------------------------- #
+    logger.info("Fold {}: Loading VAE checkpoint and creating model...", fold_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     graph_model = GraphModelTemporalTrainer(config_file_path=str(fold_config_path))
     graph_model.setup_config()
     graph_model.create_model(class_weights=class_weights_list)
+    logger.info("Fold {}: Model created on GPU {}", fold_id, gpu_id)
 
     # --- Train ------------------------------------------------------------ #
     logger.info("Fold {}: Starting training...", fold_id)
