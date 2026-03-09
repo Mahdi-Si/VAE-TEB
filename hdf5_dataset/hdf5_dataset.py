@@ -866,8 +866,9 @@ class CombinedHDF5Dataset(Dataset):
     
     def __del__(self):
         """Cleanup when dataset is garbage collected."""
-        self._cleanup_handles()
-        self.clear_cache()
+        if hasattr(self, "file_handles"):
+            self._cleanup_handles()
+            self.clear_cache()
 
 
 def attribute_dict_collate(batch):
