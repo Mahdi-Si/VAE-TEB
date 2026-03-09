@@ -162,7 +162,7 @@ def estimate_temporal_class_weights(
     """
     from hdf5_dataset.guid_hdf5_dataset import SignalSequenceDataset
 
-    dataset = SignalSequenceDataset(hdf5_files=hdf5_files, **dataset_kwargs)
+    dataset = SignalSequenceDataset(paths=hdf5_files, **dataset_kwargs)
 
     counts = torch.zeros(2, dtype=torch.long)
     for i in range(len(dataset)):
