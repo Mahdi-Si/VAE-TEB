@@ -467,6 +467,70 @@ class SignalSequenceDataset(Dataset):
         self.inner_dataset.clear_cache()
         gc.collect()
 
+    def estimate_class_weights(
+        self, num_classes: int = 2,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Estimate inverse-frequency class weights from GUID-level labels.
+
+        Reads only the ``target`` field from HDF5 in bulk (no signal data),
+        computes the per-segment max, and counts per-class at the GUID level
+        using the first segment of each GUID.
+
+        Args:
+            num_classes: Number of output classes.  Binary (2) by default:
+                0 = healthy, 1 = unhealthy (target max > 1).
+
+        Returns:
+            Tuple of ``(weights, counts)`` where:
+                - ``weights``: shape ``(num_classes,)`` — inverse-frequency
+                  weights normalised so they sum to ``num_classes``.
+                - ``counts``: shape ``(num_classes,)`` — per-class GUID counts.
+        """
+        index_map = self.inner_dataset.index_map
+
+        # Collect only the first inner index per GUID — one read per GUID
+        # instead of reading ALL ~49K segments.
+        first_inner_indices = set()
+        for guid in self._guid_list:
+            first_inner_indices.add(self._guid_to_inner_indices[guid][0])
+
+        # Group only these first-segment indices by file.
+        file_groups: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for inner_idx in first_inner_indices:
+            f_idx, s_idx = index_map[inner_idx]
+            file_groups[f_idx].append((inner_idx, s_idx))
+
+        # Read only the target field for first segments and compute max.
+        target_max: Dict[int, float] = {}
+        for f_idx, pairs in file_groups.items():
+            handle = self.inner_dataset._open_handle(f_idx)
+            pairs_sorted = sorted(pairs, key=lambda p: p[1])
+            sample_indices = [p[1] for p in pairs_sorted]
+            inner_indices = [p[0] for p in pairs_sorted]
+
+            targets_raw = handle['target'][sample_indices]  # (N, seq_len)
+            seg_max = np.max(targets_raw, axis=-1)  # (N,)
+            for i, inner_idx in enumerate(inner_indices):
+                target_max[inner_idx] = seg_max[i]
+
+        # Count per class at GUID level (first segment determines label).
+        counts = torch.zeros(num_classes, dtype=torch.long)
+        for guid in self._guid_list:
+            first_inner_idx = self._guid_to_inner_indices[guid][0]
+            label_val = target_max[first_inner_idx]
+            binary_label = int(label_val > 1)  # 0=healthy, 1=unhealthy
+            counts[min(binary_label, num_classes - 1)] += 1
+
+        total = counts.sum().float()
+        if total == 0:
+            return torch.ones(num_classes), counts
+
+        weights = total / (num_classes * counts.float())
+        weights = torch.where(
+            torch.isinf(weights), torch.ones_like(weights), weights,
+        )
+        return weights, counts
+
 
 # ======================================================================
 # Collate function
