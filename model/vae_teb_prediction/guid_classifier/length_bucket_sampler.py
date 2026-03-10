@@ -102,11 +102,17 @@ class LengthBucketSampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         """Yield flat GUID indices, grouped by bucket in batch-sized chunks.
 
+        Auto-increments the internal epoch counter so that each call
+        (i.e. each training epoch) produces a different shuffle order
+        without requiring an explicit ``set_epoch()`` call.
+
         Yields:
             GUID indices such that consecutive ``batch_size`` indices share
             the same length bucket.
         """
-        rng = random.Random(self.seed + self._epoch)
+        epoch = self._epoch
+        self._epoch += 1  # Auto-increment for next epoch
+        rng = random.Random(self.seed + epoch)
         all_chunks: List[List[int]] = []
 
         for bucket_indices in self._buckets:

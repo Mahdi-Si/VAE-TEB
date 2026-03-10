@@ -272,8 +272,10 @@ def train_single_fold_temporal(
 
         fold_output_dir = Path(output_base_dir) / f"fold_{fold_id}"
         fold_output_dir.mkdir(parents=True, exist_ok=True)
+        # Set out_dir_base to the *parent* so that train_fold() appends
+        # fold_{fold_id} once — avoiding double-nesting (fold_N/fold_N/).
         config["general_config"]["folders_config"]["out_dir_base"] = str(
-            fold_output_dir
+            output_base_dir
         )
 
         # Inject per-fold MLflow tags into config
@@ -331,6 +333,12 @@ def train_single_fold_temporal(
             eval_cfg.get("decision_time_hours", 1.0)
         )
         max_gap_multiplier = eval_cfg.get("max_gap_multiplier")
+        allow_backward_compat = bool(
+            kwargs.get(
+                "allow_backward_compat",
+                eval_cfg.get("allow_backward_compat_checkpoint_loading", False),
+            )
+        )
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         eval_results = evaluate_single_fold_temporal(
@@ -341,6 +349,7 @@ def train_single_fold_temporal(
             exclude_last_minutes=exclude_last_minutes,
             decision_time_hours=decision_time_hours,
             max_gap_multiplier=max_gap_multiplier,
+            allow_backward_compat=allow_backward_compat,
         )
 
         # Merge training metadata into evaluation results
@@ -423,6 +432,7 @@ def run_kfold_temporal_parallel(
     max_parallel: Optional[int] = None,
     fold_ids: Optional[List[int]] = None,
     sequential: bool = False,
+    fold_timeout_hours: float = 6.0,
     **kwargs,
 ) -> List[Dict]:
     """Run k-fold temporal classifier training in parallel.
@@ -444,6 +454,8 @@ def run_kfold_temporal_parallel(
             ``1..num_folds``.
         sequential: If ``True``, run folds sequentially on a single GPU
             (useful for debugging).
+        fold_timeout_hours: Maximum hours per fold before timeout.
+            Defaults to 6.0.
         **kwargs: Additional config overrides forwarded to each fold.
 
     Returns:
@@ -520,13 +532,17 @@ def run_kfold_temporal_parallel(
 
     if sequential or max_parallel == 1:
         logger.info("Running folds sequentially...")
+        n_total = len(selected_folds)
         for job_idx, fold_id in enumerate(selected_folds):
             gpu_id = gpu_ids[job_idx % len(gpu_ids)]
             result = train_single_fold_temporal(
                 fold_id=fold_id, gpu_id=gpu_id, **common_kwargs,
             )
             all_results.append(result)
-            logger.info("Fold {} status: {}", fold_id, result.get("status"))
+            logger.info(
+                "Fold {} status: {} ({}/{} folds done)",
+                fold_id, result.get("status"), job_idx + 1, n_total,
+            )
     else:
         logger.info("Running folds in parallel...")
         spawn_ctx = multiprocessing.get_context("spawn")
@@ -544,22 +560,56 @@ def run_kfold_temporal_parallel(
                 )
                 futures[future] = fold_id
 
-            for future in as_completed(futures):
-                fold_id = futures[future]
-                try:
-                    result = future.result()
-                    all_results.append(result)
-                    logger.info(
-                        "Fold {} status: {}", fold_id, result.get("status"),
-                    )
-                except Exception as exc:
-                    logger.exception("Fold {} raised exception:", fold_id)
-                    all_results.append({
-                        "fold_id": fold_id,
-                        "status": "failed",
-                        "error": str(exc),
-                        "traceback": traceback.format_exc(),
-                    })
+            # Timeout on as_completed — fires if no fold completes
+            # within fold_timeout_hours (catches hung processes).
+            # NOTE: future.result(timeout=...) is NOT used because
+            # as_completed yields already-done futures, making the
+            # timeout on .result() a no-op.
+            n_done = 0
+            n_total = len(futures)
+            try:
+                for future in as_completed(
+                    futures, timeout=fold_timeout_hours * 3600,
+                ):
+                    fold_id = futures[future]
+                    try:
+                        result = future.result()
+                        all_results.append(result)
+                        n_done += 1
+                        logger.info(
+                            "Fold {} status: {} ({}/{} folds done)",
+                            fold_id, result.get("status"),
+                            n_done, n_total,
+                        )
+                    except Exception as exc:
+                        logger.exception("Fold {} raised exception:", fold_id)
+                        all_results.append({
+                            "fold_id": fold_id,
+                            "status": "failed",
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                        })
+                        n_done += 1
+            except TimeoutError:
+                timed_out_folds = [
+                    fid for fut, fid in futures.items()
+                    if not fut.done()
+                ]
+                logger.error(
+                    "Parallel execution timed out after {:.1f}h — "
+                    "{} fold(s) did not complete: {}",
+                    fold_timeout_hours,
+                    len(timed_out_folds),
+                    timed_out_folds,
+                )
+                for future, fid in futures.items():
+                    if not future.done():
+                        future.cancel()
+                        all_results.append({
+                            "fold_id": fid,
+                            "status": "timeout",
+                            "error": f"Timed out after {fold_timeout_hours}h",
+                        })
 
     all_results.sort(key=lambda x: x.get("fold_id", 0))
 
@@ -1031,6 +1081,7 @@ def main() -> None:
         max_parallel=max_parallel,
         fold_ids=fold_ids_cfg,
         sequential=not run_parallel,
+        fold_timeout_hours=general_cfg.get("fold_timeout_hours", 6.0),
     )
 
     successful = [r for r in results if r.get("status") == "success"]
