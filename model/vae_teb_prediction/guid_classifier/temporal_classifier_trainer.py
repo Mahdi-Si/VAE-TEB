@@ -401,9 +401,10 @@ class GraphModelTemporalTrainer(GraphModelBase):
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
             monitor=ckpt_cfg.get("monitor", "val/loss"),
-            filename="temporal-model-epoch={epoch:02d}-loss={val/loss:.4f}",
+            filename="temporal-model-{epoch:02d}",
             save_top_k=ckpt_cfg.get("save_top_k", 3),
             mode="min",
+            auto_insert_metric_name=False,
         )
 
         callback_list = [

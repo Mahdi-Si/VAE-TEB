@@ -105,3 +105,15 @@ advanced_config:
     model_checkpoint:
       save_top_k: 3                              # Keep top-K checkpoints by monitored metric
       monitor: 'val/loss'                        # Metric to monitor for checkpoint saving
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: temporal-classifier-kfold
+      run_name: null                             # Auto-generated if null
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae_temporal_classifier
+        stage: dev
