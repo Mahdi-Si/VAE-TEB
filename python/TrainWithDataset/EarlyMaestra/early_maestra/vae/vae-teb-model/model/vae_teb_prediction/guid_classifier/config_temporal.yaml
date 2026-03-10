@@ -70,6 +70,7 @@ dataset_config:
     normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']  # Fields to z-score normalize
     segment_duration: 1200.0                     # Grid slot duration in seconds (20 min)
     guid_cache_size: 128                         # Max GUIDs held in memory (LRU eviction)
+    pin_memory: false                            # Disable when running parallel folds to avoid CUDA OOM in workers
     dataset_kwargs:
       load_fields:                               # HDF5 fields to load per segment
         - fhr_st                                 # Scattering transform of FHR
