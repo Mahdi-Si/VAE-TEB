@@ -56,6 +56,7 @@ model_config:
     exclude_last_minutes: 30                    # Exclude segments within N min of delivery from metrics
     max_gap_multiplier: null                    # Max allowed gap between segments (null = no limit)
     generate_plots: true                        # Generate three-metric-type analysis plots
+    allow_backward_compat_checkpoint_loading: false  # true = allow partial temporal checkpoint loading during evaluation
 
 dataset_config:
   kfold_base_path: /path/to/k_fold_dataset      # Root dir containing fold_1/ ... fold_10/ HDF5 splits
