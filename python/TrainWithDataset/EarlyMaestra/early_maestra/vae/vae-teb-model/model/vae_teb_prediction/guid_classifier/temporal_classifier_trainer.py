@@ -539,6 +539,7 @@ def train_fold(
         stats_path=stat_path,
         normalize_fields=normalize_fields,
         prefetch_factor=dataloader_cfg.get("prefetch_factor", 2),
+        pin_memory=dataloader_cfg.get("pin_memory", False),
         seed=seed,
         **dataset_kwargs,
     )
