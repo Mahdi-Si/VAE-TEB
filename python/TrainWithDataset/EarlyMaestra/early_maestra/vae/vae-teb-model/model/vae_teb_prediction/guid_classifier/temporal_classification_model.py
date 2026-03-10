@@ -434,7 +434,9 @@ class TemporalVaeClassifier(nn.Module):
         Returns:
             Position embeddings ``(B, S_max, position_embed_dim)``.
         """
-        idx_clamped = segment_indices.clamp(min=0)
+        idx_clamped = segment_indices.clamp(
+            min=0, max=self.position_embedding.num_embeddings - 1,
+        )
         pos_embed = self.position_embedding(idx_clamped)
         return pos_embed * mask.unsqueeze(-1).float()
 
@@ -706,6 +708,16 @@ class TemporalVaeClassifier(nn.Module):
         # Extract valid-segment logits and targets.
         logits_valid = logits[mask]                     # (N_valid, num_classes)
         target_valid = target[mask]                     # (N_valid, 300)
+
+        # Guard: all segments padded → return zero loss.
+        if logits_valid.shape[0] == 0:
+            zero = torch.tensor(0.0, device=logits.device)
+            return {
+                "loss": zero,
+                "accuracy": 0.0,
+                "class_0_acc": 0.0,
+                "class_1_acc": 0.0,
+            }
 
         # Per-segment label: max over 300 timesteps → class ID {0,1,2,3}.
         seg_labels = target_valid.max(dim=-1)[0]        # (N_valid,)

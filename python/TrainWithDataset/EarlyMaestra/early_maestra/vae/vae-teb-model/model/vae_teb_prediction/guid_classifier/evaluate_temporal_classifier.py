@@ -29,7 +29,10 @@ import torch.nn as nn
 import yaml
 from loguru import logger
 
-from train.graph_models_utils import load_checkpoint_strict
+from train.graph_models_utils import (
+    load_checkpoint_strict,
+    _prepare_checkpoint_state_dict,
+)
 
 # NOTE: Imports from evaluate_classifier are LAZY (inside functions) because
 # that module imports SeqVae at the top level which triggers
@@ -73,7 +76,12 @@ def create_temporal_model_from_config(
         raise ValueError("vae_checkpoint must be provided in model_config")
 
     vae_model = SeqVae()
-    load_checkpoint_strict(vae_model, checkpoint=vae_checkpoint)
+    loaded_vae = load_checkpoint_strict(vae_model, checkpoint=vae_checkpoint)
+    if loaded_vae is None:
+        raise RuntimeError(
+            "Strict VAE checkpoint loading failed during temporal evaluation. "
+            f"Checkpoint: {vae_checkpoint}"
+        )
     logger.info("Evaluation: VAE loaded from {}", vae_checkpoint)
 
     # 2. Build TemporalVaeClassifier with matching architecture
@@ -204,68 +212,161 @@ def _load_temporal_checkpoint(
     model: nn.Module,
     checkpoint_path: Path,
     device: str = "cpu",
+    allow_backward_compat: bool = False,
 ) -> nn.Module:
     """Load a Lightning-saved temporal checkpoint into the model.
 
     The checkpoint is produced by Lightning's ``ModelCheckpoint`` callback
     and contains the full ``PlTemporalClassifier`` state dict.  We strip
-    the ``model.`` prefix that Lightning adds, then load with
-    ``strict=False`` so that VAE keys (absent from the temporal-only
-    checkpoint) are silently ignored.
+    the ``model.`` prefix that Lightning adds.  VAE keys from the temporal
+    checkpoint are ignored because evaluation always uses the explicit VAE
+    checkpoint declared in config.
+
+    By default, temporal keys must match the current model exactly.
+    Missing, unexpected, or shape-mismatched non-VAE keys raise immediately.
+    Set ``allow_backward_compat=True`` to permit partial loading for older
+    checkpoints, in which case incompatible non-VAE keys are skipped and left
+    randomly initialised.
 
     Args:
         model: :class:`TemporalVaeClassifier` to load weights into.
         checkpoint_path: Path to ``.ckpt`` file.
         device: Map location for ``torch.load``.
+        allow_backward_compat: If ``True``, allow partial loading of temporal
+            keys for older checkpoints.  Default ``False``.
 
     Returns:
         The model with loaded weights.
     """
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get("state_dict", ckpt)
-
-    # Lightning wraps the model: keys are "model.<original_key>"
-    cleaned = {}
-    for k, v in state_dict.items():
-        if k.startswith("model."):
-            cleaned[k[len("model."):]] = v
-        else:
-            cleaned[k] = v
-
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
-
-    # VAE keys are expected to be missing (they're loaded from a separate ckpt)
-    non_vae_missing = [k for k in missing if not k.startswith("vae_model.")]
-
-    # Categorise missing keys for clearer reporting.
-    sprint6_keys = {"position_embedding.weight", "gamma_log"}
-    sprint6_prefixes = ("temporal_lstm_cells.",)
-    new_feature_missing = [
-        k for k in non_vae_missing
-        if k in sprint6_keys or any(k.startswith(p) for p in sprint6_prefixes)
-    ]
-    other_missing = [k for k in non_vae_missing if k not in new_feature_missing]
-
-    if new_feature_missing:
-        logger.warning(
-            "New temporal feature keys missing from checkpoint (randomly "
-            "initialised): {}",
-            new_feature_missing,
+    cleaned = _prepare_checkpoint_state_dict(checkpoint_path, map_location=device)
+    if cleaned is None:
+        raise RuntimeError(
+            "Unable to extract a normalized state_dict from the temporal "
+            f"checkpoint: {checkpoint_path}"
         )
-    if other_missing:
-        logger.warning(
-            "Non-VAE keys missing from checkpoint: {}", other_missing
+
+    ignored_vae_keys = sorted(k for k in cleaned if k.startswith("vae_model."))
+    temporal_state = {
+        k: v for k, v in cleaned.items()
+        if not k.startswith("vae_model.")
+    }
+
+    model_state = model.state_dict()
+    expected_temporal = {
+        k: v for k, v in model_state.items()
+        if not k.startswith("vae_model.")
+    }
+
+    checkpoint_keys = set(temporal_state.keys())
+    expected_keys = set(expected_temporal.keys())
+
+    missing_temporal = sorted(expected_keys - checkpoint_keys)
+    unexpected_temporal = sorted(checkpoint_keys - expected_keys)
+
+    shape_mismatches = []
+    for key in sorted(expected_keys & checkpoint_keys):
+        if expected_temporal[key].shape != temporal_state[key].shape:
+            shape_mismatches.append(
+                (
+                    key,
+                    tuple(temporal_state[key].shape),
+                    tuple(expected_temporal[key].shape),
+                )
+            )
+
+    if (missing_temporal or unexpected_temporal or shape_mismatches) and not allow_backward_compat:
+        mismatch_parts = []
+        if missing_temporal:
+            mismatch_parts.append(f"missing={missing_temporal}")
+        if unexpected_temporal:
+            mismatch_parts.append(f"unexpected={unexpected_temporal}")
+        if shape_mismatches:
+            mismatch_parts.append(
+                "shape_mismatches="
+                + str(
+                    [
+                        {
+                            "key": key,
+                            "checkpoint_shape": ckpt_shape,
+                            "model_shape": model_shape,
+                        }
+                        for key, ckpt_shape, model_shape in shape_mismatches
+                    ]
+                )
+            )
+        raise RuntimeError(
+            "Temporal checkpoint is incompatible with the current model. "
+            "Non-VAE parameter mismatches are not allowed by default. "
+            "Re-run evaluation with allow_backward_compat=True only if you "
+            "intentionally want partial loading of an older checkpoint. "
+            + " ".join(mismatch_parts)
         )
-    if unexpected:
-        logger.warning("Unexpected keys in checkpoint: {}", unexpected)
+
+    if allow_backward_compat:
+        for key in unexpected_temporal:
+            temporal_state.pop(key, None)
+        for key, _, _ in shape_mismatches:
+            temporal_state.pop(key, None)
+
+    missing, unexpected = model.load_state_dict(temporal_state, strict=False)
+    non_vae_missing = sorted(k for k in missing if not k.startswith("vae_model."))
+    non_vae_unexpected = sorted(k for k in unexpected if not k.startswith("vae_model."))
+
+    if (non_vae_missing or non_vae_unexpected) and not allow_backward_compat:
+        raise RuntimeError(
+            "Temporal checkpoint load left non-VAE parameters unresolved. "
+            f"missing={non_vae_missing} unexpected={non_vae_unexpected}"
+        )
+
+    if allow_backward_compat:
+        if missing_temporal:
+            logger.warning(
+                "Backward-compatible checkpoint load: missing temporal keys "
+                "left at model init values: {}",
+                missing_temporal,
+            )
+        if unexpected_temporal:
+            logger.warning(
+                "Backward-compatible checkpoint load: unexpected temporal "
+                "keys ignored: {}",
+                unexpected_temporal,
+            )
+        if shape_mismatches:
+            logger.warning(
+                "Backward-compatible checkpoint load: shape-mismatched "
+                "temporal keys ignored: {}",
+                [
+                    {
+                        "key": key,
+                        "checkpoint_shape": ckpt_shape,
+                        "model_shape": model_shape,
+                    }
+                    for key, ckpt_shape, model_shape in shape_mismatches
+                ],
+            )
+        if non_vae_missing:
+            logger.warning(
+                "Backward-compatible checkpoint load: unresolved temporal "
+                "keys after load: {}",
+                non_vae_missing,
+            )
+        if non_vae_unexpected:
+            logger.warning(
+                "Backward-compatible checkpoint load: unexpected temporal "
+                "keys reported by load_state_dict: {}",
+                non_vae_unexpected,
+            )
 
     logger.info(
         "Temporal checkpoint loaded from {} "
-        "(missing VAE keys: {}, new feature keys: {}, unexpected: {})",
+        "(ignored VAE keys: {}, compat_mode: {}, temporal_missing: {}, "
+        "temporal_unexpected: {}, temporal_shape_mismatches: {})",
         checkpoint_path,
-        len(missing) - len(non_vae_missing),
-        len(new_feature_missing),
-        len(unexpected),
+        len(ignored_vae_keys),
+        allow_backward_compat,
+        len(missing_temporal),
+        len(unexpected_temporal),
+        len(shape_mismatches),
     )
     return model
 
@@ -279,6 +380,7 @@ def evaluate_single_fold_temporal(
     decision_time_hours: float = 1.0,
     max_gap_multiplier: Optional[float] = None,
     regenerate_predictions: bool = False,
+    allow_backward_compat: bool = False,
 ) -> Dict:
     """Full evaluation of one trained temporal fold.
 
@@ -298,6 +400,8 @@ def evaluate_single_fold_temporal(
             all).
         regenerate_predictions: If ``True``, regenerate predictions even when
             cached CSVs exist.
+        allow_backward_compat: If ``True``, allow partial loading of older
+            temporal checkpoints with missing or mismatched non-VAE keys.
 
     Returns:
         Dict with fold results including ``fold_id``, ``primary_threshold``,
@@ -330,7 +434,12 @@ def evaluate_single_fold_temporal(
 
     # --- Create model and load weights --------------------------------------
     model = create_temporal_model_from_config(config, device=device)
-    model = _load_temporal_checkpoint(model, checkpoint_path, device=device)
+    model = _load_temporal_checkpoint(
+        model,
+        checkpoint_path,
+        device=device,
+        allow_backward_compat=allow_backward_compat,
+    )
     model.to(device)
     model.eval()
 
@@ -545,6 +654,7 @@ def main(
     decision_time_hours: Optional[float] = None,
     fold_ids: Optional[List[int]] = None,
     regenerate_predictions: bool = False,
+    allow_backward_compat: Optional[bool] = None,
 ) -> Dict:
     """Run the temporal evaluation pipeline on all completed folds.
 
@@ -564,6 +674,8 @@ def main(
         decision_time_hours: Decision time (hours before birth).
         fold_ids: Specific fold IDs to evaluate.  ``None`` evaluates all.
         regenerate_predictions: Force-regenerate predictions even if cached.
+        allow_backward_compat: Allow partial loading of older temporal
+            checkpoints.  ``None`` defers to config.
 
     Returns:
         Dict with aggregated results across all folds.
@@ -602,6 +714,11 @@ def main(
         if decision_time_hours is not None
         else float(eval_cfg.get("decision_time_hours", 1.0))
     )
+    allow_backward_compat = (
+        allow_backward_compat
+        if allow_backward_compat is not None
+        else bool(eval_cfg.get("allow_backward_compat_checkpoint_loading", False))
+    )
     fold_ids = fold_ids if fold_ids is not None else dataset_cfg.get("fold_ids")
 
     logger.info("=" * 80)
@@ -611,6 +728,7 @@ def main(
     logger.info("Target FPR: {}", target_fpr)
     logger.info("Decision time: {}h", decision_time_hours)
     logger.info("Exclude last minutes: {}", exclude_last_minutes)
+    logger.info("Backward-compatible checkpoint loading: {}", allow_backward_compat)
 
     # Discover fold directories
     all_fold_dirs = sorted(
@@ -668,6 +786,7 @@ def main(
                 decision_time_hours=decision_time_hours,
                 max_gap_multiplier=max_gap_multiplier,
                 regenerate_predictions=regenerate_predictions,
+                allow_backward_compat=allow_backward_compat,
             )
             all_fold_results.append(fold_results)
             successful_folds.append(fold_id)
@@ -679,8 +798,26 @@ def main(
             logger.error(traceback.format_exc())
             failed_folds.append(fold_id)
 
-    # Aggregate results
-    aggregated = _aggregate_temporal_results(all_fold_results)
+    # Aggregate results and generate cross-fold plots through the same helper
+    # used by the k-fold trainer so standalone evaluation and training share
+    # the exact same aggregation behaviour.
+    if all_fold_results:
+        try:
+            from model.vae_teb_prediction.guid_classifier.kfold_temporal_trainer import (
+                aggregate_temporal_results,
+            )
+
+            aggregated = aggregate_temporal_results(
+                output_base_dir=str(output_base_dir),
+                fold_results=all_fold_results,
+                exclude_last_minutes=exclude_last_minutes,
+            )
+        except Exception as exc:
+            logger.error("Cross-fold evaluation aggregation failed: {}", exc)
+            aggregated = _aggregate_temporal_results(all_fold_results)
+    else:
+        aggregated = _aggregate_temporal_results(all_fold_results)
+
     aggregated["successful_folds"] = successful_folds
     aggregated["failed_folds"] = failed_folds
 

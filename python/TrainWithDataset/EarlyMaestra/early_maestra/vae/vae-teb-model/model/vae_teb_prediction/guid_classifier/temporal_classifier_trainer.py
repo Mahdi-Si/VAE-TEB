@@ -17,6 +17,7 @@ from a config dict.
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 import json
@@ -96,13 +97,10 @@ class PlTemporalClassifier(LightningModelBase):
         self.model = base_model  # Eager mode — no torch.compile
 
         if class_weights is not None:
-            weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
-            self.register_buffer("_class_weights_buf", weight_tensor)
             logger.info(
-                "PlTemporalClassifier: using class weights {}", class_weights,
+                "PlTemporalClassifier: class weights {} (applied by inner model)",
+                class_weights,
             )
-        else:
-            self._class_weights_buf = None
 
     def compute_loss_and_metrics(
         self, batch: Dict, batch_idx: int, stage: str,
@@ -169,6 +167,82 @@ def estimate_temporal_class_weights(
     return weights
 
 
+def resolve_best_checkpoint_metrics(
+    trainer: pl.Trainer,
+    pl_model: pl.LightningModule,
+    validation_dataloader,
+    checkpoint_callback: ModelCheckpoint,
+) -> Dict[str, float]:
+    """Resolve validation metrics for the actual best checkpoint.
+
+    Lightning's ``trainer.callback_metrics`` reflects the most recent epoch,
+    not necessarily the checkpoint selected by ``ModelCheckpoint``.  This
+    helper uses the callback's ``best_model_score`` for the monitored metric
+    and, when possible, runs a targeted validation pass on the best checkpoint
+    to recover the corresponding accuracy and any other validation metrics.
+
+    Args:
+        trainer: Fitted Lightning trainer.
+        pl_model: Lightning module used during training.
+        validation_dataloader: Validation dataloader for the current fold.
+        checkpoint_callback: The ModelCheckpoint instance attached to the run.
+
+    Returns:
+        Dict containing ``best_checkpoint_path``, ``best_val_loss``, and
+        ``best_val_accuracy``.
+    """
+    def _to_float(value, default: float) -> float:
+        if value is None:
+            return default
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    callback_metrics = getattr(trainer, "callback_metrics", {}) or {}
+    best_model_path = getattr(checkpoint_callback, "best_model_path", "") or ""
+    best_model_score = getattr(checkpoint_callback, "best_model_score", None)
+
+    if best_model_score is not None:
+        best_val_loss = _to_float(best_model_score, float("inf"))
+    else:
+        best_val_loss = _to_float(
+            callback_metrics.get("val/loss"),
+            float("inf"),
+        )
+
+    best_val_accuracy = _to_float(callback_metrics.get("val/accuracy"), 0.0)
+
+    if best_model_path:
+        try:
+            best_results = trainer.validate(
+                model=pl_model,
+                dataloaders=validation_dataloader,
+                ckpt_path=best_model_path,
+                verbose=False,
+            )
+            if best_results:
+                best_metrics = best_results[0]
+                if "val/loss" in best_metrics:
+                    best_val_loss = _to_float(best_metrics["val/loss"], best_val_loss)
+                if "val/accuracy" in best_metrics:
+                    best_val_accuracy = _to_float(
+                        best_metrics["val/accuracy"],
+                        best_val_accuracy,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Failed to validate best checkpoint {} for metric recovery: {}",
+                best_model_path,
+                exc,
+            )
+
+    return {
+        "best_checkpoint_path": best_model_path,
+        "best_val_loss": best_val_loss,
+        "best_val_accuracy": best_val_accuracy,
+    }
+
+
 # ---------------------------------------------------------------------------
 #  GraphModel Trainer
 # ---------------------------------------------------------------------------
@@ -225,7 +299,12 @@ class GraphModelTemporalTrainer(GraphModelBase):
         from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
 
         vae_model = SeqVae()
-        load_checkpoint_strict(vae_model, checkpoint=vae_checkpoint)
+        loaded_vae = load_checkpoint_strict(vae_model, checkpoint=vae_checkpoint)
+        if loaded_vae is None:
+            raise RuntimeError(
+                "Strict VAE checkpoint loading failed during temporal "
+                f"training setup. Checkpoint: {vae_checkpoint}"
+            )
         logger.info("VAE model loaded from checkpoint: {}", vae_checkpoint)
 
         # ----- 2. Build TemporalVaeClassifier ----------------------------- #
@@ -385,6 +464,7 @@ class GraphModelTemporalTrainer(GraphModelBase):
 
         trainer = pl.Trainer(**trainer_kwargs)
         trainer.fit(self.pl_model, train_dataloader, validation_dataloader)
+        self._trainer = trainer
 
         return trainer
 
@@ -524,24 +604,39 @@ def train_fold(
     training_time_min = (time.time() - start_time) / 60.0
     logger.info("Fold {}: Training completed in {:.2f} minutes", fold_id, training_time_min)
 
-    # Log basic results
-    best_val_loss = trainer.callback_metrics.get("val/loss", float("inf"))
-    best_val_acc = trainer.callback_metrics.get("val/accuracy", 0.0)
-    best_ckpt_path = graph_model.checkpoint_callback.best_model_path
+    # Resolve metrics for the actual best checkpoint before tearing down the
+    # validation dataloader.
+    best_metrics = resolve_best_checkpoint_metrics(
+        trainer=trainer,
+        pl_model=graph_model.pl_model,
+        validation_dataloader=val_loader,
+        checkpoint_callback=graph_model.checkpoint_callback,
+    )
+    best_val_loss = best_metrics["best_val_loss"]
+    best_val_acc = best_metrics["best_val_accuracy"]
+    best_ckpt_path = best_metrics["best_checkpoint_path"]
 
     logger.info(
         "Fold {}: best val_loss={:.4f}, val_accuracy={:.4f}, checkpoint={}",
         fold_id,
-        float(best_val_loss),
-        float(best_val_acc),
+        best_val_loss,
+        best_val_acc,
         best_ckpt_path,
     )
+
+    # Cleanup training dataloaders and dataset caches.
+    del train_loader, val_loader
+    train_dataset.clear_cache()
+    val_dataset.clear_cache()
+    del train_dataset, val_dataset
+    gc.collect()
+    logger.info("Fold {}: Training dataloaders and caches cleaned up", fold_id)
 
     fold_results = {
         "fold_id": fold_id,
         "training_time_minutes": training_time_min,
-        "best_val_loss_training": float(best_val_loss),
-        "best_val_accuracy_training": float(best_val_acc),
+        "best_val_loss_training": best_val_loss,
+        "best_val_accuracy_training": best_val_acc,
         "best_checkpoint_path": best_ckpt_path,
         "status": "success",
     }
