@@ -245,10 +245,14 @@ def _load_temporal_checkpoint(
             f"checkpoint: {checkpoint_path}"
         )
 
+    # Filter out VAE keys (evaluation uses explicit VAE checkpoint from config)
     ignored_vae_keys = sorted(k for k in cleaned if k.startswith("vae_model."))
+    # Filter out training-only buffers not needed for inference
+    _INFERENCE_IGNORED_KEYS = {"class_weights"}
+    ignored_training_keys = sorted(k for k in cleaned if k in _INFERENCE_IGNORED_KEYS)
     temporal_state = {
         k: v for k, v in cleaned.items()
-        if not k.startswith("vae_model.")
+        if not k.startswith("vae_model.") and k not in _INFERENCE_IGNORED_KEYS
     }
 
     model_state = model.state_dict()
@@ -359,10 +363,12 @@ def _load_temporal_checkpoint(
 
     logger.info(
         "Temporal checkpoint loaded from {} "
-        "(ignored VAE keys: {}, compat_mode: {}, temporal_missing: {}, "
+        "(ignored VAE keys: {}, ignored training-only keys: {}, "
+        "compat_mode: {}, temporal_missing: {}, "
         "temporal_unexpected: {}, temporal_shape_mismatches: {})",
         checkpoint_path,
         len(ignored_vae_keys),
+        len(ignored_training_keys),
         allow_backward_compat,
         len(missing_temporal),
         len(unexpected_temporal),
@@ -655,6 +661,7 @@ def main(
     fold_ids: Optional[List[int]] = None,
     regenerate_predictions: bool = False,
     allow_backward_compat: Optional[bool] = None,
+    aggregate_only: bool = False,
 ) -> Dict:
     """Run the temporal evaluation pipeline on all completed folds.
 
@@ -676,6 +683,9 @@ def main(
         regenerate_predictions: Force-regenerate predictions even if cached.
         allow_backward_compat: Allow partial loading of older temporal
             checkpoints.  ``None`` defers to config.
+        aggregate_only: If ``True``, skip per-fold inference and load existing
+            ``fold_results.json`` from each fold directory.  Only runs
+            cross-fold aggregation and plot generation.  Default ``False``.
 
     Returns:
         Dict with aggregated results across all folds.
@@ -720,6 +730,27 @@ def main(
         else bool(eval_cfg.get("allow_backward_compat_checkpoint_loading", False))
     )
     fold_ids = fold_ids if fold_ids is not None else dataset_cfg.get("fold_ids")
+
+    # --- Aggregate-only mode: skip inference, load from disk ------------------
+    if aggregate_only:
+        logger.info("=" * 80)
+        logger.info("TEMPORAL EVALUATION — AGGREGATE ONLY MODE")
+        logger.info("=" * 80)
+        logger.info("Output base dir: {}", output_base_dir)
+        logger.info("Exclude last minutes: {}", exclude_last_minutes)
+
+        from model.vae_teb_prediction.guid_classifier.kfold_temporal_trainer import (
+            aggregate_temporal_results,
+        )
+
+        aggregated = aggregate_temporal_results(
+            output_base_dir=str(output_base_dir),
+            fold_ids=fold_ids,
+            fold_results=None,  # triggers _load_fold_results_from_disk
+            exclude_last_minutes=exclude_last_minutes,
+        )
+        logger.info("Aggregate-only mode completed.")
+        return aggregated
 
     logger.info("=" * 80)
     logger.info("TEMPORAL EVALUATION PIPELINE")
@@ -879,3 +910,67 @@ def _aggregate_temporal_results(all_fold_results: List[Dict]) -> Dict:
         "test_fpr_mean": tf_m,
         "test_fpr_std": tf_s,
     }
+
+
+if __name__ == "__main__":
+    # ==========================================================================
+    # Post-Training Temporal Evaluation Pipeline
+    # ==========================================================================
+    # All settings (target_fpr, exclude_last_minutes, decision_time_hours,
+    # max_gap_multiplier, fold_ids) are read from config_temporal.yaml.
+    # You can override them by passing explicit values to main().
+
+    # Path to config file (same directory as this script)
+    CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "config_temporal.yaml"
+    )
+
+    # Read output_base_dir from config
+    with open(CONFIG_PATH, "r") as _f:
+        _cfg = yaml.safe_load(_f)
+    OUTPUT_BASE_DIR = (
+        _cfg.get("general_config", {})
+        .get("folders_config", {})
+        .get("out_dir_base", os.getcwd())
+    )
+
+    # Runtime options (not in config)
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
+    AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots
+
+    # ======================================================================
+    # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
+    # ======================================================================
+    if not AGGREGATE_ONLY:
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            config_path=CONFIG_PATH,
+            device=DEVICE,
+            regenerate_predictions=REGENERATE_PREDICTIONS,
+            aggregate_only=False,
+            # Optional overrides (uncomment to override config values):
+            # target_fpr=0.15,
+            # exclude_last_minutes=30.0,
+            # decision_time_hours=1.0,
+            # max_gap_multiplier=None,
+            # fold_ids=[1, 3, 9],  # Only evaluate specific folds
+        )
+        print("\nEvaluation pipeline completed!")
+        print(f"Results saved to: {OUTPUT_BASE_DIR}/aggregated_results.json")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
+
+    # ======================================================================
+    # MODE 2: Aggregate Only (generate aggregated plots from existing results)
+    # ======================================================================
+    else:
+        results = main(
+            output_base_dir=OUTPUT_BASE_DIR,
+            config_path=CONFIG_PATH,
+            aggregate_only=True,
+            # Optional overrides (uncomment to override config values):
+            # fold_ids=[1, 3, 9],
+            # exclude_last_minutes=30.0,
+        )
+        print("\nAggregation completed!")
+        print(f"Aggregated plots saved to: {OUTPUT_BASE_DIR}/aggregated_plots/")
