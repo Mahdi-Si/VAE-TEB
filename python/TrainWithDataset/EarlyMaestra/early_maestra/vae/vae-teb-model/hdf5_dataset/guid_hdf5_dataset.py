@@ -88,7 +88,7 @@ import traceback
 import warnings
 import numpy as np
 from typing import Sequence, List, Tuple, Dict, Any, Optional
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -170,7 +170,7 @@ class SignalSequenceDataset(Dataset):
         self.inner_dataset = CombinedHDF5Dataset(**kwargs)
 
         # GUID-level cache and its lock (rebuilt after unpickling).
-        self._guid_cache: Dict[int, AttributeDict] = {}
+        self._guid_cache: OrderedDict[int, AttributeDict] = OrderedDict()
         self._guid_cache_lock = threading.Lock()
         self._access_count = 0
 
@@ -202,7 +202,7 @@ class SignalSequenceDataset(Dataset):
         # Threading lock cannot be pickled; each worker rebuilds it.
         state['_guid_cache_lock'] = None
         # Each worker builds its own GUID cache from scratch.
-        state['_guid_cache'] = {}
+        state['_guid_cache'] = OrderedDict()
         state['_access_count'] = 0
         return state
 
@@ -330,6 +330,7 @@ class SignalSequenceDataset(Dataset):
         if self.guid_cache_size > 0:
             with self._guid_cache_lock:
                 if idx in self._guid_cache:
+                    self._guid_cache.move_to_end(idx)
                     self._access_count += 1
                     return self._guid_cache[idx]
 
@@ -366,6 +367,10 @@ class SignalSequenceDataset(Dataset):
         delta_t = torch.zeros(n_segments, dtype=torch.float32)
         if n_segments > 1:
             delta_t[1:] = epochs[1:] - epochs[:-1]
+            assert (delta_t[1:] >= 0).all(), (
+                f"GUID '{guid}': non-monotonic epochs detected. "
+                f"delta_t has negative values: {delta_t.tolist()}"
+            )
 
         # segment_indices: ordinal slot on a uniform grid of segment_duration.
         segment_indices = torch.round(
@@ -392,12 +397,11 @@ class SignalSequenceDataset(Dataset):
 
         sample = AttributeDict(out)
 
-        # Populate GUID-level cache (FIFO eviction).
+        # Populate GUID-level cache (LRU eviction).
         if self.guid_cache_size > 0:
             with self._guid_cache_lock:
                 if len(self._guid_cache) >= self.guid_cache_size:
-                    oldest_key = next(iter(self._guid_cache))
-                    del self._guid_cache[oldest_key]
+                    self._guid_cache.popitem(last=False)  # Evict LRU
                 self._guid_cache[idx] = sample
 
         self._access_count += 1
