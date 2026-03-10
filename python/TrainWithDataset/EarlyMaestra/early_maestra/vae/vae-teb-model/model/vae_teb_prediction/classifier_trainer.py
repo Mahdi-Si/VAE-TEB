@@ -339,9 +339,10 @@ class GraphModelClassifierTrainer(GraphModelBase):
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
             monitor="val/loss",
-            filename="classifier-model-epoch={epoch:02d}-loss={val/loss:.4f}",
+            filename="classifier-model-{epoch:02d}",
             save_top_k=callbacks_cfg.get("model_checkpoint", {}).get("save_top_k", 3),
             mode="min",
+            auto_insert_metric_name=False,
         )
 
         self.early_stopping_callback = EarlyStopping(
