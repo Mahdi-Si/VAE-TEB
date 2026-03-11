@@ -99,7 +99,7 @@ def build_guid_dataframe(
     labor_onset_map: Optional[Dict[str, float]] = None,
     run_mimo: bool = True,
     base_block_size: int = 3520,
-    overlap_percentage: float = 1 / 22,
+    overlap_percentage: float = 1 / 11,
 ) -> pd.DataFrame:
     """Build a DataFrame with one row per unique GUID.
 
@@ -255,7 +255,7 @@ def run(
     output_csv: Optional[str] = None,
     skip_mimo: bool = False,
     base_block_size: int = 3520,
-    overlap_percentage: float = 1 / 22,
+    overlap_percentage: float = 1 / 11,
 ) -> pd.DataFrame:
     """Run the full extraction pipeline.
 
@@ -313,7 +313,7 @@ if __name__ == "__main__":
     OUTPUT_CSV = r"classification_guids.csv"
     SKIP_MIMO = False
     BASE_BLOCK_SIZE = 3520
-    OVERLAP_PERCENTAGE = 1 / 22
+    OVERLAP_PERCENTAGE = 1 / 11
 
     run(
         pickle_path=PICKLE_PATH,
