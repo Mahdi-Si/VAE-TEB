@@ -233,7 +233,7 @@ def deduplicate_segments(domain_starts, sample_weights):
     return keep_indices, removed_indices, duplicate_groups
 
 
-def prescreen_guid(record_path, base_block_size=3520, overlap_percentage=1/22,
+def prescreen_guid(record_path, base_block_size=3520, overlap_percentage=1/11,
                    labor_onset_map=None):
     """Run MIMO + quality filtering on a single .mat file WITHOUT scattering.
 
@@ -247,7 +247,7 @@ def prescreen_guid(record_path, base_block_size=3520, overlap_percentage=1/22,
         base_block_size: Base block size for ``prepare_data``
             (default 3520 -> 5280 sample segments = 22 min at 4 Hz).
         overlap_percentage: Overlap fraction for ``split_long``
-            (default 1/22 -> 21 min step).
+            (default 1/11 -> 20 min step, continuous after 1-min trim).
         labor_onset_map: Optional dict mapping normalized GUID ->
             labor onset time in seconds (from ``load_labor_onset_data``).
 
@@ -381,7 +381,7 @@ def prescreen_guid(record_path, base_block_size=3520, overlap_percentage=1/22,
 
 def prescreen_guids_for_classification(
     candidate_files, labor_onset_map=None,
-    base_block_size=3520, overlap_percentage=1/22,
+    base_block_size=3520, overlap_percentage=1/11,
     min_segments_unhealthy=6, min_segments_healthy=9,
     max_post_delivery_ratio=0.30, output_dir=None):
     """Pre-screen all classification candidate GUIDs and return filtered file lists.
@@ -396,7 +396,7 @@ def prescreen_guids_for_classification(
             ``healthy_`` to determine class-specific thresholds.
         labor_onset_map: Optional dict from ``load_labor_onset_data``.
         base_block_size: Base block size for MIMO (default 3520).
-        overlap_percentage: Overlap fraction (default 1/22).
+        overlap_percentage: Overlap fraction (default 1/11).
         min_segments_unhealthy: Minimum valid segments for acidosis/HIE GUIDs.
         min_segments_healthy: Minimum valid segments for healthy GUIDs.
         max_post_delivery_ratio: Reject GUIDs where more than this fraction
@@ -827,7 +827,7 @@ def compute_scattering_masks(signal_length, scattering_T=16, device=None):
 def create_hdf5_dataset_from_records_list(
     hdf5_path=None, records_list=None, file_limit=-1,
     base_block_size=3520, save_name=None, min_domain_start=None,
-    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=1/22,
+    cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=1/11,
     run_guid_analysis=False, precomputed_masks=None, labor_onset_map=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1175,9 +1175,40 @@ def create_hdf5_dataset_from_records_list(
     return errors_list
 
 
-def create_records(records_base_path_ = None, output_base_path_ = None, run_guid_analysis=False,
-                   base_block_size=3520, overlap_percentage=1/22, labor_onset_csv_path=None):
+def create_records(records_base_path_=None, output_base_path_=None, run_guid_analysis=False,
+                   base_block_size=3520, overlap_percentage=1/11, labor_onset_csv_path=None,
+                   classification_pickle_path=None):
+    """Create HDF5 classification datasets with 10-fold cross-validation.
 
+    Orchestrates the full pipeline: file discovery, GUID pre-screening,
+    class balancing, fold creation, and HDF5 dataset generation. When
+    ``classification_pickle_path`` is provided, file discovery through fold
+    creation are skipped and the pre-computed folds are reused directly.
+
+    Args:
+        records_base_path_: Root directory containing the 16 StudyGroup
+            subfolders. Required when ``classification_pickle_path`` is None.
+        output_base_path_: Directory where HDF5 datasets and the pickle
+            file are written.
+        run_guid_analysis: If True, run per-GUID coverage analysis on the
+            first fold/partition.
+        base_block_size: Base signal block size in samples (default 3520).
+        overlap_percentage: Overlap fraction between consecutive segments
+            (default 1/11).
+        labor_onset_csv_path: Path to the labor onset CSV. If None, no
+            time-from-labor-onset is computed.
+        classification_pickle_path: Path to an existing
+            ``classification_dataset_records.pickle``. When provided,
+            the fold structure is loaded from this file and file discovery,
+            pre-screening, class balancing, and fold creation are skipped.
+
+    Raises:
+        ValueError: If ``classification_pickle_path`` is None and
+            ``records_base_path_`` is None, or if the pickle has an
+            unexpected structure.
+        FileNotFoundError: If ``classification_pickle_path`` is provided
+            but does not exist.
+    """
     # Load labor onset data if CSV path provided
     labor_onset_map = None
     if labor_onset_csv_path is not None:
@@ -1194,185 +1225,229 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
                 f"{masks['n_cross']} cross + {masks['n_up_phase']} UP self-phase = "
                 f"{total_channels} total")
 
-    list_of_folders_dict = {
-        1: "ACIDOSIS_NO_HIE_CS",
-        2: "ACIDOSIS_NO_HIE_NoCS",
-        3: "DEATH_lt_6_CS",
-        4: "DEATH_lt_6_NoCS",
-        5: "DISTANT_HIE_CS",
-        6: "DISTANT_HIE_NoCS",
-        7: "HEALTHY_NO_ACIDOSIS_CS",
-        8: "HEALTHY_NO_ACIDOSIS_NoCS",
-        9: "HEALTHY_NO_BG_CS",
-        10: "HEALTHY_NO_BG_NoCS",
-        11: "HIE_CS",
-        12: "HIE_NoCS",
-        13: "INTERVENTION_NO_ACIDOSIS_CS",
-        14: "INTERVENTION_NO_ACIDOSIS_NoCS",
-        15: "INTERVENTION_NO_BG_CS",
-        16: "INTERVENTION_NO_BG_NoCS",
-    }
+    if classification_pickle_path is not None:
+        # ---------------------------
+        # REUSE MODE: Load pre-computed classification folds
+        # ---------------------------
+        if not os.path.isfile(classification_pickle_path):
+            raise FileNotFoundError(
+                f"Classification pickle not found: {classification_pickle_path}")
+        logger.info(f"Loading pre-computed classification folds from: "
+                    f"{classification_pickle_path}")
+        with open(classification_pickle_path, 'rb') as f:
+            classification_folds = pickle.load(f)
+        logger.info(f"Loaded {len(classification_folds)} folds: "
+                    f"{list(classification_folds.keys())}")
 
-    healthy_no_bg_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[10], 'EFMOut')
-    healthy_no_bg_cs_path = os.path.join(records_base_path_, list_of_folders_dict[9], 'EFMOut')
-    healthy_bg_cs_path = os.path.join(records_base_path_, list_of_folders_dict[7], 'EFMOut')
-    healthy_bg_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[8], 'EFMOut')
+        # Validate pickle structure
+        expected_subgroups = {
+            'healthy_no_bg_no_cs', 'healthy_no_bg_cs', 'healthy_bg_cs',
+            'healthy_bg_no_cs', 'acidosis_cs', 'acidosis_no_cs',
+            'hie_cs', 'hie_no_cs',
+        }
+        first_fold = next(iter(classification_folds.values()))
+        first_partition = next(iter(first_fold.values()))
+        actual_subgroups = set(first_partition.keys())
+        missing = expected_subgroups - actual_subgroups
+        if missing:
+            raise ValueError(
+                f"Pickle is missing expected subgroups: {missing}. "
+                f"Found: {actual_subgroups}")
 
-    acidosis_cs_path = os.path.join(records_base_path_, list_of_folders_dict[1], 'EFMOut')
-    acidosis_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[2], 'EFMOut')
-
-    hie_cs_path =  os.path.join(records_base_path_, list_of_folders_dict[11], 'EFMOut')
-    hie_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[12], 'EFMOut')
-
-    healthy_no_bg_no_cs_files = [os.path.join(healthy_no_bg_no_cs_path, f) for f in os.listdir(healthy_no_bg_no_cs_path) if f.endswith('.mat')]
-    healthy_no_bg_cs_files = [os.path.join(healthy_no_bg_cs_path, f) for f in os.listdir(healthy_no_bg_cs_path) if f.endswith('.mat')]
-    healthy_bg_cs_files = [os.path.join(healthy_bg_cs_path, f) for f in os.listdir(healthy_bg_cs_path) if f.endswith('.mat')]
-    healthy_bg_no_cs_files = [os.path.join(healthy_bg_no_cs_path, f) for f in os.listdir(healthy_bg_no_cs_path) if f.endswith('.mat')]
-
-    acidosis_cs_files = [os.path.join(acidosis_cs_path, f) for f in os.listdir(acidosis_cs_path) if f.endswith('.mat')]
-    acidosis_no_cs_files = [os.path.join(acidosis_no_cs_path, f) for f in os.listdir(acidosis_no_cs_path) if f.endswith('.mat')]
-
-    hie_cs_files = [os.path.join(hie_cs_path, f) for f in os.listdir(hie_cs_path) if f.endswith('.mat')]
-    hie_no_cs_files = [os.path.join(hie_no_cs_path, f) for f in os.listdir(hie_no_cs_path) if f.endswith('.mat')]
-
-    # ---------------------------
-    # VAE 90/10 split (BEFORE pre-screening — VAE data doesn't need TLO/min hours)
-    # ---------------------------
-    n_healthy_bg_cs = len(healthy_bg_cs_files)
-    n_healthy_bg_no_cs = len(healthy_bg_no_cs_files)
-
-    random.shuffle(healthy_bg_cs_files)
-    healthy_bg_cs_files_vae_train = healthy_bg_cs_files[:int(n_healthy_bg_cs * 0.9)]
-    healthy_bg_cs_files_vae_test = healthy_bg_cs_files[int(n_healthy_bg_cs * 0.9):]
-
-    random.shuffle(healthy_bg_no_cs_files)
-    healthy_bg_no_cs_files_vae_train = healthy_bg_no_cs_files[:int(n_healthy_bg_no_cs * 0.9)]
-    healthy_bg_no_cs_files_vae_test = healthy_bg_no_cs_files[int(n_healthy_bg_no_cs * 0.9):]
-
-    # ---------------------------
-    # GUID pre-screening for classification candidates
-    # ---------------------------
-    # Build candidate file lists:
-    #   - unhealthy: all acidosis + hie files
-    #   - healthy: no_bg files (full) + bg files (10% vae_test only)
-    prescreening_candidates = {
-        'acidosis_cs': acidosis_cs_files,
-        'acidosis_no_cs': acidosis_no_cs_files,
-        'hie_cs': hie_cs_files,
-        'hie_no_cs': hie_no_cs_files,
-        'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files,
-        'healthy_no_bg_cs': healthy_no_bg_cs_files,
-        'healthy_bg_cs': healthy_bg_cs_files_vae_test,
-        'healthy_bg_no_cs': healthy_bg_no_cs_files_vae_test,
-    }
-
-    filtered = prescreen_guids_for_classification(
-        prescreening_candidates,
-        labor_onset_map=labor_onset_map,
-        base_block_size=base_block_size,
-        overlap_percentage=overlap_percentage,
-        output_dir=output_base_path_)
-
-    # Update file lists from pre-screening results
-    acidosis_cs_files = filtered['acidosis_cs']
-    acidosis_no_cs_files = filtered['acidosis_no_cs']
-    hie_cs_files = filtered['hie_cs']
-    hie_no_cs_files = filtered['hie_no_cs']
-    healthy_no_bg_no_cs_files = filtered['healthy_no_bg_no_cs']
-    healthy_no_bg_cs_files = filtered['healthy_no_bg_cs']
-    healthy_bg_cs_files_vae_test = filtered['healthy_bg_cs']
-    healthy_bg_no_cs_files_vae_test = filtered['healthy_bg_no_cs']
-
-    # ---------------------------
-    # Recount after pre-screening and class balance
-    # ---------------------------
-    n_acidosis_cs = len(acidosis_cs_files)
-    n_acidosis_no_cs = len(acidosis_no_cs_files)
-    n_acidosis_total = n_acidosis_cs + n_acidosis_no_cs
-
-    n_hie_cs = len(hie_cs_files)
-    n_hie_no_cs = len(hie_no_cs_files)
-    n_hie_total = n_hie_cs + n_hie_no_cs
-
-    n_unhealthy_total = n_acidosis_total + n_hie_total
-
-    counts_healthy = {
-        "NoBG_NoCS": len(healthy_no_bg_no_cs_files),
-        "NoBG_CS": len(healthy_no_bg_cs_files),
-        "BG_CS": len(healthy_bg_cs_files_vae_test),
-        "BG_NoCS": len(healthy_bg_no_cs_files_vae_test),
-    }
-
-    total_healthy_filtered = sum(counts_healthy.values())
-    if total_healthy_filtered < n_unhealthy_total:
-        logger.warning(
-            f"Filtered healthy GUIDs ({total_healthy_filtered}) < unhealthy "
-            f"({n_unhealthy_total}). Capping healthy target to available count.")
-        n_target = total_healthy_filtered
+        # Log per-fold statistics for traceability
+        for fold_name, partitions in classification_folds.items():
+            for part_name, subgroups in partitions.items():
+                total = sum(len(v) for v in subgroups.values())
+                logger.info(f"  {fold_name}/{part_name}: {total} files "
+                            f"across {len(subgroups)} subgroups")
     else:
-        n_target = n_unhealthy_total
+        # ---------------------------
+        # FULL PIPELINE: file discovery through fold creation
+        # ---------------------------
+        if records_base_path_ is None:
+            raise ValueError(
+                "records_base_path_ is required when "
+                "classification_pickle_path is not provided")
 
-    target_healthy = {
-        k: int(round((v / total_healthy_filtered) * n_target))
-        for k, v in counts_healthy.items()
-    }
+        list_of_folders_dict = {
+            1: "ACIDOSIS_NO_HIE_CS",
+            2: "ACIDOSIS_NO_HIE_NoCS",
+            3: "DEATH_lt_6_CS",
+            4: "DEATH_lt_6_NoCS",
+            5: "DISTANT_HIE_CS",
+            6: "DISTANT_HIE_NoCS",
+            7: "HEALTHY_NO_ACIDOSIS_CS",
+            8: "HEALTHY_NO_ACIDOSIS_NoCS",
+            9: "HEALTHY_NO_BG_CS",
+            10: "HEALTHY_NO_BG_NoCS",
+            11: "HIE_CS",
+            12: "HIE_NoCS",
+            13: "INTERVENTION_NO_ACIDOSIS_CS",
+            14: "INTERVENTION_NO_ACIDOSIS_NoCS",
+            15: "INTERVENTION_NO_BG_CS",
+            16: "INTERVENTION_NO_BG_NoCS",
+        }
 
-    # Fix rounding residuals
-    diff = n_target - sum(target_healthy.values())
-    if diff:
-        largest = max(counts_healthy, key=counts_healthy.get)
-        target_healthy[largest] += diff
+        healthy_no_bg_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[10], 'EFMOut')
+        healthy_no_bg_cs_path = os.path.join(records_base_path_, list_of_folders_dict[9], 'EFMOut')
+        healthy_bg_cs_path = os.path.join(records_base_path_, list_of_folders_dict[7], 'EFMOut')
+        healthy_bg_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[8], 'EFMOut')
 
-    # Cap targets to available counts per subgroup, redistribute overflow
-    file_pools = {
-        "NoBG_NoCS": healthy_no_bg_no_cs_files,
-        "NoBG_CS": healthy_no_bg_cs_files,
-        "BG_CS": healthy_bg_cs_files_vae_test,
-        "BG_NoCS": healthy_bg_no_cs_files_vae_test,
-    }
-    overflow = 0
-    for k in target_healthy:
-        available = len(file_pools[k])
-        if target_healthy[k] > available:
-            overflow += target_healthy[k] - available
-            target_healthy[k] = available
-    # Redistribute overflow to subgroups with remaining capacity
-    if overflow > 0:
-        for k in sorted(target_healthy, key=lambda x: len(file_pools[x]) - target_healthy[x], reverse=True):
-            room = len(file_pools[k]) - target_healthy[k]
-            add = min(overflow, room)
-            target_healthy[k] += add
-            overflow -= add
-            if overflow == 0:
-                break
+        acidosis_cs_path = os.path.join(records_base_path_, list_of_folders_dict[1], 'EFMOut')
+        acidosis_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[2], 'EFMOut')
+
+        hie_cs_path =  os.path.join(records_base_path_, list_of_folders_dict[11], 'EFMOut')
+        hie_no_cs_path = os.path.join(records_base_path_, list_of_folders_dict[12], 'EFMOut')
+
+        healthy_no_bg_no_cs_files = [os.path.join(healthy_no_bg_no_cs_path, f) for f in os.listdir(healthy_no_bg_no_cs_path) if f.endswith('.mat')]
+        healthy_no_bg_cs_files = [os.path.join(healthy_no_bg_cs_path, f) for f in os.listdir(healthy_no_bg_cs_path) if f.endswith('.mat')]
+        healthy_bg_cs_files = [os.path.join(healthy_bg_cs_path, f) for f in os.listdir(healthy_bg_cs_path) if f.endswith('.mat')]
+        healthy_bg_no_cs_files = [os.path.join(healthy_bg_no_cs_path, f) for f in os.listdir(healthy_bg_no_cs_path) if f.endswith('.mat')]
+
+        acidosis_cs_files = [os.path.join(acidosis_cs_path, f) for f in os.listdir(acidosis_cs_path) if f.endswith('.mat')]
+        acidosis_no_cs_files = [os.path.join(acidosis_no_cs_path, f) for f in os.listdir(acidosis_no_cs_path) if f.endswith('.mat')]
+
+        hie_cs_files = [os.path.join(hie_cs_path, f) for f in os.listdir(hie_cs_path) if f.endswith('.mat')]
+        hie_no_cs_files = [os.path.join(hie_no_cs_path, f) for f in os.listdir(hie_no_cs_path) if f.endswith('.mat')]
+
+        # ---------------------------
+        # VAE 90/10 split (BEFORE pre-screening — VAE data doesn't need TLO/min hours)
+        # ---------------------------
+        n_healthy_bg_cs = len(healthy_bg_cs_files)
+        n_healthy_bg_no_cs = len(healthy_bg_no_cs_files)
+
+        random.shuffle(healthy_bg_cs_files)
+        healthy_bg_cs_files_vae_train = healthy_bg_cs_files[:int(n_healthy_bg_cs * 0.9)]
+        healthy_bg_cs_files_vae_test = healthy_bg_cs_files[int(n_healthy_bg_cs * 0.9):]
+
+        random.shuffle(healthy_bg_no_cs_files)
+        healthy_bg_no_cs_files_vae_train = healthy_bg_no_cs_files[:int(n_healthy_bg_no_cs * 0.9)]
+        healthy_bg_no_cs_files_vae_test = healthy_bg_no_cs_files[int(n_healthy_bg_no_cs * 0.9):]
+
+        # ---------------------------
+        # GUID pre-screening for classification candidates
+        # ---------------------------
+        # Build candidate file lists:
+        #   - unhealthy: all acidosis + hie files
+        #   - healthy: no_bg files (full) + bg files (10% vae_test only)
+        prescreening_candidates = {
+            'acidosis_cs': acidosis_cs_files,
+            'acidosis_no_cs': acidosis_no_cs_files,
+            'hie_cs': hie_cs_files,
+            'hie_no_cs': hie_no_cs_files,
+            'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files,
+            'healthy_no_bg_cs': healthy_no_bg_cs_files,
+            'healthy_bg_cs': healthy_bg_cs_files_vae_test,
+            'healthy_bg_no_cs': healthy_bg_no_cs_files_vae_test,
+        }
+
+        filtered = prescreen_guids_for_classification(
+            prescreening_candidates,
+            labor_onset_map=labor_onset_map,
+            base_block_size=base_block_size,
+            overlap_percentage=overlap_percentage,
+            output_dir=output_base_path_)
+
+        # Update file lists from pre-screening results
+        acidosis_cs_files = filtered['acidosis_cs']
+        acidosis_no_cs_files = filtered['acidosis_no_cs']
+        hie_cs_files = filtered['hie_cs']
+        hie_no_cs_files = filtered['hie_no_cs']
+        healthy_no_bg_no_cs_files = filtered['healthy_no_bg_no_cs']
+        healthy_no_bg_cs_files = filtered['healthy_no_bg_cs']
+        healthy_bg_cs_files_vae_test = filtered['healthy_bg_cs']
+        healthy_bg_no_cs_files_vae_test = filtered['healthy_bg_no_cs']
+
+        # ---------------------------
+        # Recount after pre-screening and class balance
+        # ---------------------------
+        n_acidosis_cs = len(acidosis_cs_files)
+        n_acidosis_no_cs = len(acidosis_no_cs_files)
+        n_acidosis_total = n_acidosis_cs + n_acidosis_no_cs
+
+        n_hie_cs = len(hie_cs_files)
+        n_hie_no_cs = len(hie_no_cs_files)
+        n_hie_total = n_hie_cs + n_hie_no_cs
+
+        n_unhealthy_total = n_acidosis_total + n_hie_total
+
+        counts_healthy = {
+            "NoBG_NoCS": len(healthy_no_bg_no_cs_files),
+            "NoBG_CS": len(healthy_no_bg_cs_files),
+            "BG_CS": len(healthy_bg_cs_files_vae_test),
+            "BG_NoCS": len(healthy_bg_no_cs_files_vae_test),
+        }
+
+        total_healthy_filtered = sum(counts_healthy.values())
+        if total_healthy_filtered < n_unhealthy_total:
+            logger.warning(
+                f"Filtered healthy GUIDs ({total_healthy_filtered}) < unhealthy "
+                f"({n_unhealthy_total}). Capping healthy target to available count.")
+            n_target = total_healthy_filtered
+        else:
+            n_target = n_unhealthy_total
+
+        target_healthy = {
+            k: int(round((v / total_healthy_filtered) * n_target))
+            for k, v in counts_healthy.items()
+        }
+
+        # Fix rounding residuals
+        diff = n_target - sum(target_healthy.values())
+        if diff:
+            largest = max(counts_healthy, key=counts_healthy.get)
+            target_healthy[largest] += diff
+
+        # Cap targets to available counts per subgroup, redistribute overflow
+        file_pools = {
+            "NoBG_NoCS": healthy_no_bg_no_cs_files,
+            "NoBG_CS": healthy_no_bg_cs_files,
+            "BG_CS": healthy_bg_cs_files_vae_test,
+            "BG_NoCS": healthy_bg_no_cs_files_vae_test,
+        }
+        overflow = 0
+        for k in target_healthy:
+            available = len(file_pools[k])
+            if target_healthy[k] > available:
+                overflow += target_healthy[k] - available
+                target_healthy[k] = available
+        # Redistribute overflow to subgroups with remaining capacity
         if overflow > 0:
-            logger.warning(f"Could not redistribute {overflow} healthy GUIDs — "
-                           f"all subgroups at capacity")
+            for k in sorted(target_healthy, key=lambda x: len(file_pools[x]) - target_healthy[x], reverse=True):
+                room = len(file_pools[k]) - target_healthy[k]
+                add = min(overflow, room)
+                target_healthy[k] += add
+                overflow -= add
+                if overflow == 0:
+                    break
+            if overflow > 0:
+                logger.warning(f"Could not redistribute {overflow} healthy GUIDs — "
+                               f"all subgroups at capacity")
 
-    logger.info(f"Class balancing (post pre-screening): "
-                f"unhealthy={n_unhealthy_total}, "
-                f"healthy target={sum(target_healthy.values())} "
-                f"({target_healthy})")
+        logger.info(f"Class balancing (post pre-screening): "
+                    f"unhealthy={n_unhealthy_total}, "
+                    f"healthy target={sum(target_healthy.values())} "
+                    f"({target_healthy})")
 
-    healthy_no_bg_no_cs_files_subsampled = random.sample(healthy_no_bg_no_cs_files, target_healthy['NoBG_NoCS'])
-    healthy_no_bg_cs_files_subsampled = random.sample(healthy_no_bg_cs_files, target_healthy['NoBG_CS'])
-    healthy_bg_cs_files_subsampled = random.sample(healthy_bg_cs_files_vae_test, target_healthy['BG_CS'])
-    healthy_bg_no_cs_files_subsampled = random.sample(healthy_bg_no_cs_files_vae_test, target_healthy['BG_NoCS'])
+        healthy_no_bg_no_cs_files_subsampled = random.sample(healthy_no_bg_no_cs_files, target_healthy['NoBG_NoCS'])
+        healthy_no_bg_cs_files_subsampled = random.sample(healthy_no_bg_cs_files, target_healthy['NoBG_CS'])
+        healthy_bg_cs_files_subsampled = random.sample(healthy_bg_cs_files_vae_test, target_healthy['BG_CS'])
+        healthy_bg_no_cs_files_subsampled = random.sample(healthy_bg_no_cs_files_vae_test, target_healthy['BG_NoCS'])
 
-    cross_validation_records = {
-        'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files_subsampled,
-        'healthy_no_bg_cs':    healthy_no_bg_cs_files_subsampled,
-        'healthy_bg_cs':       healthy_bg_cs_files_subsampled,
-        'healthy_bg_no_cs':    healthy_bg_no_cs_files_subsampled,
-        'acidosis_cs':         acidosis_cs_files,
-        'acidosis_no_cs':      acidosis_no_cs_files,
-        'hie_cs':              hie_cs_files,
-        'hie_no_cs':           hie_no_cs_files,
-    }
-    classification_folds = create_cv_splits(cross_validation_records, n_splits=10, val_ratio=0.1, random_state=42)
-    classification_dataset_records_path = os.path.join(output_base_path_, "classification_dataset_records.pickle")
-    with open(classification_dataset_records_path, 'wb') as f:
-        pickle.dump(classification_folds, f, protocol=pickle.HIGHEST_PROTOCOL)
+        cross_validation_records = {
+            'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files_subsampled,
+            'healthy_no_bg_cs':    healthy_no_bg_cs_files_subsampled,
+            'healthy_bg_cs':       healthy_bg_cs_files_subsampled,
+            'healthy_bg_no_cs':    healthy_bg_no_cs_files_subsampled,
+            'acidosis_cs':         acidosis_cs_files,
+            'acidosis_no_cs':      acidosis_no_cs_files,
+            'hie_cs':              hie_cs_files,
+            'hie_no_cs':           hie_no_cs_files,
+        }
+        classification_folds = create_cv_splits(cross_validation_records, n_splits=10, val_ratio=0.1, random_state=42)
+        classification_dataset_records_path = os.path.join(output_base_path_, "classification_dataset_records.pickle")
+        with open(classification_dataset_records_path, 'wb') as f:
+            pickle.dump(classification_folds, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # ---------------------------
     # Vae Train and Test
@@ -1573,7 +1648,23 @@ def create_records(records_base_path_ = None, output_base_path_ = None, run_guid
 if __name__ == "__main__":
     base_folder = r'/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/'
     base_output_folder = r'/data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours'
-    create_records(records_base_path_=base_folder, output_base_path_=base_output_folder)
+
+    # Set to an existing pickle path to skip file discovery/pre-screening/fold creation.
+    # Set to None to run the full pipeline.
+    classification_pickle = None  # e.g. r'/path/to/classification_dataset_records.pickle'
+
+    base_block_size = 3520
+    overlap_percentage = 1 / 11
+    labor_onset_csv = None
+
+    create_records(
+        records_base_path_=base_folder,
+        output_base_path_=base_output_folder,
+        base_block_size=base_block_size,
+        overlap_percentage=overlap_percentage,
+        labor_onset_csv_path=labor_onset_csv,
+        classification_pickle_path=classification_pickle,
+    )
 
     # hdf_file = "test_dataset_no_cs.hdf5"
     
