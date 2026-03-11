@@ -1177,17 +1177,26 @@ def create_hdf5_dataset_from_records_list(
 
 def create_records(records_base_path_=None, output_base_path_=None, run_guid_analysis=False,
                    base_block_size=3520, overlap_percentage=1/11, labor_onset_csv_path=None,
-                   classification_pickle_path=None):
-    """Create HDF5 classification datasets with 10-fold cross-validation.
+                   classification_pickle_path=None, pretraining_only=False):
+    """Create HDF5 datasets for VAE pre-training and/or classification.
 
     Orchestrates the full pipeline: file discovery, GUID pre-screening,
-    class balancing, fold creation, and HDF5 dataset generation. When
-    ``classification_pickle_path`` is provided, file discovery through fold
-    creation are skipped and the pre-computed folds are reused directly.
+    class balancing, fold creation, and HDF5 dataset generation.
+
+    Modes of operation:
+        - ``pretraining_only=True``: Only creates VAE pre-training HDF5
+          files (train/test, CS/NoCS) from the healthy_bg subgroups using
+          a 90/10 split. No GUID pre-screening is performed. Requires
+          ``records_base_path_``.
+        - ``classification_pickle_path`` provided: Loads pre-computed fold
+          assignments and creates classification HDF5 files, skipping file
+          discovery, pre-screening, class balancing, and fold creation.
+        - Default (both None/False): Runs the full pipeline from scratch.
 
     Args:
         records_base_path_: Root directory containing the 16 StudyGroup
-            subfolders. Required when ``classification_pickle_path`` is None.
+            subfolders. Required when ``pretraining_only=True`` or when
+            ``classification_pickle_path`` is None.
         output_base_path_: Directory where HDF5 datasets and the pickle
             file are written.
         run_guid_analysis: If True, run per-GUID coverage analysis on the
@@ -1201,11 +1210,13 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             ``classification_dataset_records.pickle``. When provided,
             the fold structure is loaded from this file and file discovery,
             pre-screening, class balancing, and fold creation are skipped.
+        pretraining_only: If True, only create the VAE pre-training
+            datasets (4 HDF5 files) and skip the classification pipeline
+            entirely. No GUID pre-screening is performed.
 
     Raises:
-        ValueError: If ``classification_pickle_path`` is None and
-            ``records_base_path_`` is None, or if the pickle has an
-            unexpected structure.
+        ValueError: If ``records_base_path_`` is missing when required,
+            or if the pickle has an unexpected structure.
         FileNotFoundError: If ``classification_pickle_path`` is provided
             but does not exist.
     """
@@ -1224,6 +1235,107 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
     logger.info(f"v3 channel layout: {masks['n_phase']} phase + "
                 f"{masks['n_cross']} cross + {masks['n_up_phase']} UP self-phase = "
                 f"{total_channels} total")
+
+    # ---------------------------
+    # Pre-training only mode: create VAE datasets and return
+    # ---------------------------
+    if pretraining_only:
+        if records_base_path_ is None:
+            raise ValueError(
+                "records_base_path_ is required when pretraining_only=True")
+
+        healthy_bg_cs_path = os.path.join(
+            records_base_path_, 'HEALTHY_NO_ACIDOSIS_CS', 'EFMOut')
+        healthy_bg_no_cs_path = os.path.join(
+            records_base_path_, 'HEALTHY_NO_ACIDOSIS_NoCS', 'EFMOut')
+
+        healthy_bg_cs_files = [
+            os.path.join(healthy_bg_cs_path, f)
+            for f in os.listdir(healthy_bg_cs_path) if f.endswith('.mat')]
+        healthy_bg_no_cs_files = [
+            os.path.join(healthy_bg_no_cs_path, f)
+            for f in os.listdir(healthy_bg_no_cs_path) if f.endswith('.mat')]
+
+        # VAE 90/10 split
+        n_healthy_bg_cs = len(healthy_bg_cs_files)
+        n_healthy_bg_no_cs = len(healthy_bg_no_cs_files)
+
+        random.shuffle(healthy_bg_cs_files)
+        healthy_bg_cs_files_vae_train = healthy_bg_cs_files[:int(n_healthy_bg_cs * 0.9)]
+        healthy_bg_cs_files_vae_test = healthy_bg_cs_files[int(n_healthy_bg_cs * 0.9):]
+
+        random.shuffle(healthy_bg_no_cs_files)
+        healthy_bg_no_cs_files_vae_train = healthy_bg_no_cs_files[:int(n_healthy_bg_no_cs * 0.9)]
+        healthy_bg_no_cs_files_vae_test = healthy_bg_no_cs_files[int(n_healthy_bg_no_cs * 0.9):]
+
+        logger.info(f"Pre-training only mode: "
+                    f"healthy_bg_cs={n_healthy_bg_cs} (train={len(healthy_bg_cs_files_vae_train)}, "
+                    f"test={len(healthy_bg_cs_files_vae_test)}), "
+                    f"healthy_bg_no_cs={n_healthy_bg_no_cs} (train={len(healthy_bg_no_cs_files_vae_train)}, "
+                    f"test={len(healthy_bg_no_cs_files_vae_test)})")
+
+        # Create 4 VAE pre-training HDF5 files
+        pre_train_path = os.path.join(output_base_path_, "pre_training_dataset")
+        os.makedirs(pre_train_path, exist_ok=True)
+
+        pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_hdf5_dataset_from_records_list(
+            records_list=healthy_bg_cs_files_vae_train,
+            hdf5_path=pre_training_dataset,
+            base_block_size=base_block_size,
+            overlap_percentage=overlap_percentage,
+            cs_label=True,
+            bg_label=True,
+            pre_defined_target=1,
+            run_guid_analysis=run_guid_analysis,
+            precomputed_masks=masks,
+            labor_onset_map=labor_onset_map)
+
+        pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_hdf5_dataset_from_records_list(
+            records_list=healthy_bg_no_cs_files_vae_train,
+            hdf5_path=pre_training_dataset,
+            base_block_size=base_block_size,
+            overlap_percentage=overlap_percentage,
+            cs_label=False,
+            bg_label=True,
+            pre_defined_target=1,
+            run_guid_analysis=run_guid_analysis,
+            precomputed_masks=masks,
+            labor_onset_map=labor_onset_map)
+
+        pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_hdf5_dataset_from_records_list(
+            records_list=healthy_bg_cs_files_vae_test,
+            hdf5_path=pre_training_dataset,
+            base_block_size=base_block_size,
+            overlap_percentage=overlap_percentage,
+            cs_label=True,
+            bg_label=True,
+            pre_defined_target=1,
+            run_guid_analysis=run_guid_analysis,
+            precomputed_masks=masks,
+            labor_onset_map=labor_onset_map)
+
+        pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_hdf5_dataset_from_records_list(
+            records_list=healthy_bg_no_cs_files_vae_test,
+            hdf5_path=pre_training_dataset,
+            base_block_size=base_block_size,
+            overlap_percentage=overlap_percentage,
+            cs_label=False,
+            bg_label=True,
+            pre_defined_target=1,
+            run_guid_analysis=run_guid_analysis,
+            precomputed_masks=masks,
+            labor_onset_map=labor_onset_map)
+
+        logger.info(f"Pre-training datasets created in {pre_train_path}")
+        return []
 
     if classification_pickle_path is not None:
         # ---------------------------
@@ -1653,6 +1765,9 @@ if __name__ == "__main__":
     # Set to None to run the full pipeline.
     classification_pickle = None  # e.g. r'/path/to/classification_dataset_records.pickle'
 
+    # Set to True to only create VAE pre-training datasets (no classification).
+    pretraining_only = False
+
     base_block_size = 3520
     overlap_percentage = 1 / 11
     labor_onset_csv = None
@@ -1664,6 +1779,7 @@ if __name__ == "__main__":
         overlap_percentage=overlap_percentage,
         labor_onset_csv_path=labor_onset_csv,
         classification_pickle_path=classification_pickle,
+        pretraining_only=pretraining_only,
     )
 
     # hdf_file = "test_dataset_no_cs.hdf5"
