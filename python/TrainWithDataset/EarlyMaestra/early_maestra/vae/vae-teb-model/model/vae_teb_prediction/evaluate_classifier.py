@@ -1142,7 +1142,9 @@ def compute_time_bins(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -> n
     if len(df_bins) == 0:
         return np.array([exclude_hours, exclude_hours + bin_size_hours])
 
-    df_included = df_bins[df_bins['epoch_hours'] >= exclude_hours]
+    # Filter out post-delivery epochs (epoch_hours <= 0 after negation fix)
+    # and apply the exclusion window
+    df_included = df_bins[(df_bins['epoch_hours'] > 0) & (df_bins['epoch_hours'] >= exclude_hours)]
     if len(df_included) == 0:
         return np.array([exclude_hours, exclude_hours + bin_size_hours])
 
@@ -1174,8 +1176,8 @@ def compute_time_windows(df: pd.DataFrame, exclude_last_minutes: float = 30.0) -
     Returns:
         List of (start_hour, end_hour) tuples (positive values: 0.5 = 30min before birth)
     """
-    # CRITICAL FIX: Epochs are negative! Use abs(min()) to get furthest time from birth
-    max_epoch_hours = abs(df['epoch'].min()) / 3600
+    # Epochs are negative seconds before birth: negate min() to get furthest positive hours
+    max_epoch_hours = -df['epoch'].min() / 3600
 
     # Convert exclusion from minutes to hours
     exclude_hours = exclude_last_minutes / 60.0  # 30min = 0.5h
@@ -2039,9 +2041,8 @@ def compute_subgroup_metrics_by_time(
         logger.warning(f"No samples in subgroup: {subgroup_name}")
         return pd.DataFrame()
 
-    # Ensure epoch_hours exists
-    if 'epoch_hours' not in subgroup_df.columns:
-        subgroup_df['epoch_hours'] = abs(subgroup_df['epoch']) / 3600
+    # Ensure epoch_hours exists (positive hours before birth)
+    subgroup_df = ensure_epoch_hours(subgroup_df)
 
     results = []
 
@@ -2498,8 +2499,7 @@ def compute_committed_overall_metrics(
         bin_start, bin_end = time_bins[i], time_bins[i + 1]
         bin_center = (bin_start + bin_end) / 2
 
-        # DEBUG: Log bin info
-        logger.info(f"  [BIN {i}] bin_center={bin_center:.2f}h, range=[{bin_start:.2f}, {bin_end:.2f})")
+        logger.debug(f"  [BIN {i}] bin_center={bin_center:.2f}h, range=[{bin_start:.2f}, {bin_end:.2f})")
 
         # For COMMITTED OVERALL with FIXED denominator:
         # We check ALL positive/negative GUIDs to see if they were detected using epochs at/earlier than tau.
@@ -2527,9 +2527,9 @@ def compute_committed_overall_metrics(
         n_available_positive = len([g for g in available_guids if g in all_positive_guids])
         n_available_negative = len([g for g in available_guids if g in all_negative_guids])
 
-        logger.info(f"  [BIN {i}] GUIDs with data at τ (epoch_hours >= {bin_center:.2f}): {n_available_positive} positive, {n_available_negative} negative")
-        logger.info(f"  [BIN {i}] Detected (clinical_pred=1 where epoch_hours >= {bin_center:.2f}): {detected_positive}/{n_positive_total} positive")
-        logger.info(f"  [BIN {i}] Sensitivity = {detected_positive} / {n_positive_total} = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
+        logger.debug(f"  [BIN {i}] GUIDs with data at τ (epoch_hours >= {bin_center:.2f}): {n_available_positive} positive, {n_available_negative} negative")
+        logger.debug(f"  [BIN {i}] Detected (clinical_pred=1 where epoch_hours >= {bin_center:.2f}): {detected_positive}/{n_positive_total} positive")
+        logger.debug(f"  [BIN {i}] Sensitivity = {detected_positive} / {n_positive_total} = {detected_positive/n_positive_total if n_positive_total > 0 else 0:.4f}")
 
         # Compute metrics with FIXED denominator
         sensitivity = detected_positive / n_positive_total if n_positive_total > 0 else np.nan

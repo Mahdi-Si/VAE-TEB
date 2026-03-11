@@ -38,10 +38,11 @@ def ensure_epoch_hours(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("DataFrame missing required 'epoch' column for time conversion")
 
     df = df.copy()
-    # CRITICAL FIX: Convert negative epochs to positive hours before birth
-    # epoch=-43200s → epoch_hours=12.0h (12 hours before birth)
-    df['epoch_hours'] = abs(df['epoch']) / 3600
-    logger.debug(f"Added epoch_hours column (converted from epoch to absolute hours): {len(df)} rows")
+    # Convert epoch (seconds relative to delivery, negative=before) to positive hours before birth.
+    # Negate: epoch=-43200s → epoch_hours=12.0h (12 hours before birth)
+    # Post-delivery epochs (epoch > 0) become negative epoch_hours (correctly distinguishable).
+    df['epoch_hours'] = -df['epoch'].astype(float) / 3600
+    logger.debug(f"Added epoch_hours column (converted from epoch): {len(df)} rows")
 
     return df
 
@@ -173,12 +174,13 @@ def log_dataframe_stats(df: pd.DataFrame, label: str) -> None:
         )
 
     if 'epoch' in df.columns:
-        # Epochs are negative (time before birth). More negative = further from birth
-        min_hours = abs(df['epoch'].min() / 3600)
-        max_hours = abs(df['epoch'].max() / 3600)
+        # Epochs are negative seconds before birth (more negative = further from birth).
+        # Negate to get positive hours-before-birth.
+        furthest_hours = -df['epoch'].min() / 3600   # largest positive = furthest from birth
+        nearest_hours  = -df['epoch'].max() / 3600    # smallest positive = nearest to birth
         logger.info(
             f"  Epoch range: [{df['epoch'].min():.1f}, {df['epoch'].max():.1f}] seconds "
-            f"({max_hours:.1f}h to {min_hours:.1f}h before birth)"
+            f"({furthest_hours:.1f}h to {nearest_hours:.1f}h before birth)"
         )
 
     if 'is_filled' in df.columns:
