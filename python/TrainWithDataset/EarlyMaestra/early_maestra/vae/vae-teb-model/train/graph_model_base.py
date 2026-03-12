@@ -253,6 +253,21 @@ class GraphModelBase(ABC):
                 )
                 tracking_uri = None
 
+            # Restore the experiment if it was soft-deleted, before
+            # Lightning's MLFlowLogger tries to create a run in it.
+            try:
+                import mlflow
+                _pre_client = mlflow.MlflowClient(tracking_uri=tracking_uri)
+                _pre_expt = _pre_client.get_experiment_by_name(experiment_name)
+                if _pre_expt is not None and _pre_expt.lifecycle_stage == "deleted":
+                    _pre_client.restore_experiment(_pre_expt.experiment_id)
+                    logger.info(
+                        "Restored deleted MLflow experiment '{}' (id={})",
+                        experiment_name, _pre_expt.experiment_id,
+                    )
+            except Exception as e_restore:
+                logger.debug("MLflow experiment pre-check skipped: {}", e_restore)
+
             mlflow_logger = MLFlowLogger(
                 experiment_name=experiment_name,
                 run_name=run_name,
