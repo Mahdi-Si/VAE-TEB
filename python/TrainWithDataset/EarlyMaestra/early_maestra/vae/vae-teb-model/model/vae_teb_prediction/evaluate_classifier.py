@@ -3223,174 +3223,203 @@ def _plot_healthy_subgroups(
 # =============================================================================
 
 def generate_three_metric_type_analysis(
-    df: pd.DataFrame,
+    df_raw: pd.DataFrame,
+    thresholds: Dict[str, float],
     output_base_dir: Path,
     exclude_last_minutes: float = 30.0,
-    title_suffix: str = "Test Set"
+    title_suffix: str = "Test Set",
+    max_gap_multiplier: Optional[float] = None,
+    decision_time_hours: float = 1.0,
 ) -> Dict:
-    """
-    Complete evaluation pipeline using three metric types.
+    """Complete evaluation pipeline using three metric types with separate thresholds.
 
-    Generates:
-    1. Three separate thresholds (instantaneous, committed_cumulative, committed_overall)
-    2. Plots for each metric type
-    3. Metric type comparison plots
-    4. Subgroup analysis for ALL THREE metric types
-    5. Saves all metrics as JSON
+    Each metric type gets its own threshold and CDR application, so that
+    each one can independently achieve the target FPR at the decision time.
 
     Directory structure:
-    output_base_dir/
-        three_metric_types/
-            instantaneous/
-                sensitivity_vs_time.png
-                ...
-                subgroups/
-                    diagnosis_comparison.png
-                    ...
-            committed_cumulative/
-                sensitivity_vs_time.png
-                ...
-                subgroups/
-                    diagnosis_comparison.png
-                    ...
-            committed_overall/  # PRIMARY
-                sensitivity_vs_time.png
-                ...
-                subgroups/
-                    diagnosis_comparison.png
-                    ...
-            comparison/
-                metric_type_comparison.png
-            thresholds.json
-            metrics_summary.json
+        output_base_dir/
+            three_metric_types/
+                instantaneous/
+                    sensitivity_vs_time.png  ...
+                    subgroups/ ...
+                committed_cumulative/
+                    sensitivity_vs_time.png  ...
+                    subgroups/ ...
+                committed_overall/  # PRIMARY
+                    sensitivity_vs_time.png  ...
+                    subgroups/ ...
+                comparison/
+                    metric_type_comparison.png
+                thresholds.json
+                metrics_summary.json
 
     Args:
-        df: DataFrame with predictions and clinical_pred column
-        output_base_dir: Base directory for all outputs
-        exclude_last_minutes: Exclude last N minutes from analysis
-        title_suffix: Suffix for plot titles
+        df_raw: Raw predictions DataFrame (pre-CDR) with columns
+            ``guid``, ``epoch``, ``binary_target``, ``prob_class_1``, etc.
+        thresholds: Per-metric-type thresholds, e.g.
+            ``{'instantaneous': 0.4, 'committed_cumulative': 0.35,
+              'committed_overall': 0.3}``.
+        output_base_dir: Base directory for all outputs.
+        exclude_last_minutes: Exclude last N minutes from analysis.
+        title_suffix: Suffix for plot titles.
+        max_gap_multiplier: For ``fill_missing_epochs``.
+        decision_time_hours: Decision time in hours before delivery for
+            extracting decision-point metrics.
 
     Returns:
-        Dictionary with thresholds and metrics for all three types, including
-        subgroup analysis for each metric type
+        Dictionary with thresholds, metrics, decision-point metrics, and
+        subgroup analysis for all three types.
     """
     logger.info("=" * 80)
-    logger.info("THREE METRIC TYPE ANALYSIS - NEW PIPELINE")
+    logger.info("THREE METRIC TYPE ANALYSIS - SEPARATE THRESHOLDS PER METRIC TYPE")
     logger.info("=" * 80)
 
     analysis_dir = output_base_dir / "three_metric_types"
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compute time bins
-    df_bins = ensure_committed_epochs_filled(df)
-    time_bins = compute_time_bins(df_bins, exclude_last_minutes=exclude_last_minutes)
-    logger.info(f"Time bins: {len(time_bins)-1} bins from {time_bins[0]:.1f}h to {time_bins[-1]:.1f}h")
+    metric_type_names = ['instantaneous', 'committed_cumulative', 'committed_overall']
+    compute_funcs = {
+        'instantaneous': compute_instantaneous_metrics,
+        'committed_cumulative': compute_committed_cumulative_metrics,
+        'committed_overall': compute_committed_overall_metrics,
+    }
 
-    # Step 1: Generate plots for all three metric types
-    metrics_dict = plot_all_metric_types_for_fold(
-        df, time_bins, analysis_dir, title_suffix
-    )
+    # --- Step 1: For each metric type, apply its own CDR + compute metrics ---
+    metrics_dict = {}
+    cdr_dfs = {}  # CDR'd DataFrames per metric type (for subgroup analysis)
+    decision_point_metrics = {}
 
-    # Step 2: Generate metric type comparison
+    for mt in metric_type_names:
+        thresh = thresholds.get(mt)
+        if thresh is None:
+            logger.warning(f"No threshold for {mt} — skipping")
+            continue
+
+        logger.info(f"  [{mt}] Applying CDR with threshold={thresh:.4f}")
+        df_clinical = apply_clinical_decision_rule(df_raw.copy(), thresh, verify=False)
+
+        fill_until_birth = mt in ('committed_cumulative', 'committed_overall')
+        df_clinical = fill_missing_epochs(
+            df_clinical,
+            max_gap_multiplier=max_gap_multiplier if not fill_until_birth else None,
+            log_summary=False,
+            fill_until_birth=fill_until_birth,
+        )
+        cdr_dfs[mt] = df_clinical
+
+        # Compute time bins from the filled DataFrame
+        time_bins = compute_time_bins(df_clinical, exclude_last_minutes=exclude_last_minutes)
+        logger.info(f"  [{mt}] Time bins: {len(time_bins)-1} bins")
+
+        # Compute this metric type
+        mt_df = compute_funcs[mt](df_clinical, time_bins, subgroup_filter=None)
+        metrics_dict[mt] = mt_df
+
+        # Plot
+        metric_output_dir = analysis_dir / mt
+        plot_single_metric_type(mt_df, mt, metric_output_dir, title_suffix)
+
+        # Extract decision-point metrics
+        dp = _extract_decision_point_metrics(mt_df, decision_time_hours)
+        if dp:
+            dp['threshold'] = float(thresh)
+        decision_point_metrics[mt] = dp
+        logger.info(
+            f"  [{mt}] FPR@{decision_time_hours}h = "
+            f"{dp.get('fpr_at_decision', 'N/A')}"
+        )
+
+    # --- Step 2: Comparison plot across metric types --------------------------
     comparison_dir = analysis_dir / "comparison"
     plot_metric_type_comparison(metrics_dict, comparison_dir, title_suffix)
 
-    # Step 2b: Generate dataset stats folder
+    # --- Step 2b: Dataset stats (use committed_overall CDR for stats) ---------
+    # Pick any CDR'd df for dataset stats — they all have the same GUIDs
+    stats_df = cdr_dfs.get('committed_overall', df_raw)
+    # Recompute time bins for the stats df
+    stats_time_bins = compute_time_bins(
+        ensure_committed_epochs_filled(stats_df),
+        exclude_last_minutes=exclude_last_minutes,
+    )
     dataset_stats_dir = analysis_dir / "dataset_stats"
-    generate_fold_dataset_stats(df, time_bins, dataset_stats_dir, title_suffix)
+    generate_fold_dataset_stats(stats_df, stats_time_bins, dataset_stats_dir, title_suffix)
 
-    # Step 3: Generate subgroup analysis for ALL THREE metric types
+    # --- Step 3: Subgroup analysis per metric type (each uses its own CDR) ----
     logger.info("Generating subgroup analysis for all three metric types...")
     subgroup_filters = create_enhanced_subgroup_filters()
-
     all_subgroup_metrics = {}
 
-    # Subgroup analysis for instantaneous
-    logger.info("  - Instantaneous metric subgroups...")
-    instantaneous_subgroup_dir = analysis_dir / "instantaneous" / "subgroups"
-    instantaneous_subgroups = plot_subgroup_analysis(
-        df, time_bins, 'instantaneous',
-        subgroup_filters, instantaneous_subgroup_dir, title_suffix
-    )
-    all_subgroup_metrics['instantaneous'] = instantaneous_subgroups
+    for mt in metric_type_names:
+        if mt not in cdr_dfs or mt not in metrics_dict:
+            continue
+        logger.info(f"  - {mt} subgroups...")
+        mt_subgroup_dir = analysis_dir / mt / "subgroups"
+        mt_time_bins = compute_time_bins(
+            cdr_dfs[mt], exclude_last_minutes=exclude_last_minutes
+        )
+        mt_subgroups = plot_subgroup_analysis(
+            cdr_dfs[mt], mt_time_bins, mt,
+            subgroup_filters, mt_subgroup_dir, title_suffix,
+        )
+        all_subgroup_metrics[mt] = mt_subgroups
 
-    # Subgroup analysis for committed_cumulative
-    logger.info("  - Committed cumulative metric subgroups...")
-    cumulative_subgroup_dir = analysis_dir / "committed_cumulative" / "subgroups"
-    cumulative_subgroups = plot_subgroup_analysis(
-        df, time_bins, 'committed_cumulative',
-        subgroup_filters, cumulative_subgroup_dir, title_suffix
-    )
-    all_subgroup_metrics['committed_cumulative'] = cumulative_subgroups
-
-    # Subgroup analysis for committed_overall (PRIMARY)
-    logger.info("  - Committed overall metric (PRIMARY) subgroups...")
-    overall_subgroup_dir = analysis_dir / "committed_overall" / "subgroups"
-    overall_subgroups = plot_subgroup_analysis(
-        df, time_bins, 'committed_overall',
-        subgroup_filters, overall_subgroup_dir, title_suffix
-    )
-    all_subgroup_metrics['committed_overall'] = overall_subgroups
-
-    # Step 4: Compute subgroup dataset statistics
+    # --- Step 4: Dataset statistics -------------------------------------------
     logger.info("Computing dataset statistics for all subgroups...")
-    subgroup_statistics = compute_subgroup_statistics(df, subgroup_filters)
+    subgroup_statistics = compute_subgroup_statistics(stats_df, subgroup_filters)
 
-    # Overall dataset statistics
-    # NOTE: Convert all values to native Python types for JSON serialization
     overall_statistics = {
-        'total_guids': int(df['guid'].nunique()),
-        'total_epochs': int(len(df)),
+        'total_guids': int(stats_df['guid'].nunique()),
+        'total_epochs': int(len(stats_df)),
         'diagnosis_counts': {
-            'healthy': int(df.groupby('guid')['target'].first().eq(1).sum()),
-            'acidosis': int(df.groupby('guid')['target'].first().eq(2).sum()),
-            'hie': int(df.groupby('guid')['target'].first().eq(3).sum())
+            'healthy': int(stats_df.groupby('guid')['target'].first().eq(1).sum()),
+            'acidosis': int(stats_df.groupby('guid')['target'].first().eq(2).sum()),
+            'hie': int(stats_df.groupby('guid')['target'].first().eq(3).sum()),
         },
         'cs_counts': {
-            'cs_positive': int(df.groupby('guid')['cs_label'].first().eq(True).sum()),
-            'cs_negative': int(df.groupby('guid')['cs_label'].first().eq(False).sum())
+            'cs_positive': int(stats_df.groupby('guid')['cs_label'].first().eq(True).sum()),
+            'cs_negative': int(stats_df.groupby('guid')['cs_label'].first().eq(False).sum()),
         },
         'bg_counts': {
-            'bg_positive': int(df.groupby('guid')['bg_label'].first().eq(True).sum()),
-            'bg_negative': int(df.groupby('guid')['bg_label'].first().eq(False).sum())
-        }
+            'bg_positive': int(stats_df.groupby('guid')['bg_label'].first().eq(True).sum()),
+            'bg_negative': int(stats_df.groupby('guid')['bg_label'].first().eq(False).sum()),
+        },
     }
 
-    # Step 5: Save metrics summary with statistics
+    # --- Step 5: Save summaries -----------------------------------------------
     summary = {
+        'thresholds': {mt: float(thresholds[mt]) for mt in metric_type_names if mt in thresholds},
         'metric_types': {
-            'instantaneous': _summarize_metrics_df(metrics_dict.get('instantaneous')),
-            'committed_cumulative': _summarize_metrics_df(metrics_dict.get('committed_cumulative')),
-            'committed_overall': _summarize_metrics_df(metrics_dict.get('committed_overall'))
+            mt: _summarize_metrics_df(metrics_dict.get(mt))
+            for mt in metric_type_names
         },
+        'decision_point_metrics': decision_point_metrics,
         'subgroups': {
-            'instantaneous': {
-                name: _summarize_metrics_df(df)
-                for name, df in instantaneous_subgroups.items()
-            },
-            'committed_cumulative': {
-                name: _summarize_metrics_df(df)
-                for name, df in cumulative_subgroups.items()
-            },
-            'committed_overall': {
-                name: _summarize_metrics_df(df)
-                for name, df in overall_subgroups.items()
+            mt: {
+                name: _summarize_metrics_df(sg_df)
+                for name, sg_df in all_subgroup_metrics.get(mt, {}).items()
             }
+            for mt in metric_type_names
         },
         'dataset_statistics': {
             'overall': overall_statistics,
-            'subgroups': subgroup_statistics
-        }
+            'subgroups': subgroup_statistics,
+        },
     }
 
     with open(analysis_dir / "metrics_summary.json", 'w') as f:
         json.dump(convert_numpy_types(summary), f, indent=2)
 
-    # Save dataset statistics separately for easy access
+    # Save thresholds separately for quick reference
+    with open(analysis_dir / "thresholds.json", 'w') as f:
+        json.dump(convert_numpy_types({
+            'thresholds': {mt: float(thresholds[mt]) for mt in metric_type_names if mt in thresholds},
+            'decision_point_metrics': decision_point_metrics,
+        }), f, indent=2)
+
     with open(analysis_dir / "dataset_statistics.json", 'w') as f:
         json.dump(convert_numpy_types({
             'overall': overall_statistics,
-            'subgroups': subgroup_statistics
+            'subgroups': subgroup_statistics,
         }), f, indent=2)
 
     logger.info(f"Dataset statistics computed for {len(subgroup_statistics)} subgroups")
@@ -3399,12 +3428,13 @@ def generate_three_metric_type_analysis(
 
     return {
         'metrics_dict': metrics_dict,
+        'decision_point_metrics': decision_point_metrics,
         'subgroup_metrics': all_subgroup_metrics,
         'summary': summary,
         'dataset_statistics': {
             'overall': overall_statistics,
-            'subgroups': subgroup_statistics
-        }
+            'subgroups': subgroup_statistics,
+        },
     }
 
 
@@ -3427,6 +3457,239 @@ def _summarize_metrics_df(df: pd.DataFrame) -> Dict:
         'fpr_mean': float(valid_df['fpr'].mean()) if 'fpr' in valid_df else None,
         'fpr_std': float(valid_df['fpr'].std()) if 'fpr' in valid_df else None,
     }
+
+
+def _extract_decision_point_metrics(
+    metrics_df: pd.DataFrame,
+    decision_time_hours: float = 1.0,
+    tolerance: float = 0.5
+) -> Dict:
+    """Extract metrics at the bin closest to the decision time point.
+
+    Unlike ``_summarize_metrics_df`` which averages across ALL time bins,
+    this function returns metrics at the specific clinical decision point
+    (e.g. 1 hour before delivery).
+
+    Args:
+        metrics_df: Per-bin metrics DataFrame with columns
+            ``bin_center``, ``fpr``, ``sensitivity``, ``specificity``.
+        decision_time_hours: Target decision time in hours before delivery.
+        tolerance: Maximum allowed distance from target bin centre (hours).
+
+    Returns:
+        Dictionary with decision-point metrics, or empty dict if no valid
+        bin is found within tolerance.
+    """
+    if metrics_df is None or len(metrics_df) == 0:
+        return {}
+
+    valid_df = metrics_df[metrics_df['sensitivity'].notna()]
+    if len(valid_df) == 0:
+        return {}
+
+    idx = (valid_df['bin_center'] - decision_time_hours).abs().idxmin()
+    row = valid_df.loc[idx]
+    actual_time = float(row['bin_center'])
+
+    if abs(actual_time - decision_time_hours) > tolerance:
+        logger.warning(
+            f"No bin within {tolerance}h of decision time {decision_time_hours}h "
+            f"(closest: {actual_time:.2f}h)"
+        )
+        return {}
+
+    result = {
+        'fpr_at_decision': float(row['fpr']) if pd.notna(row.get('fpr')) else None,
+        'sensitivity_at_decision': float(row['sensitivity']),
+        'specificity_at_decision': float(row['specificity']) if pd.notna(row.get('specificity')) else None,
+        'actual_decision_time_hours': actual_time,
+    }
+    return result
+
+
+# ============================================================================
+# ROC CURVE UTILITIES
+# ============================================================================
+
+def compute_guid_level_roc(
+    df_raw: pd.DataFrame,
+    decision_time_hours: float = 1.0
+) -> Dict:
+    """Compute GUID-level ROC curve at the clinical decision time point.
+
+    For each GUID, aggregates the maximum predicted probability across all
+    epochs at or before the decision time.  This yields one score per GUID,
+    enabling a meaningful clinical ROC analysis.
+
+    Args:
+        df_raw: Raw predictions DataFrame (pre-CDR) with columns
+            ``guid``, ``epoch`` (or ``epoch_hours``), ``prob_class_1``,
+            ``binary_target``.
+        decision_time_hours: Only consider epochs at or before this time
+            (hours before delivery).
+
+    Returns:
+        Dictionary with keys ``fpr``, ``tpr``, ``thresholds``, ``auc``,
+        ``n_positive``, ``n_negative``.  Arrays are Python lists for JSON
+        serialisation.  Returns empty dict on failure.
+    """
+    df = ensure_epoch_hours(df_raw.copy())
+
+    # Keep epochs at or before the decision time (epoch_hours >= decision_time)
+    df_filtered = df[df['epoch_hours'] >= decision_time_hours].copy()
+    if len(df_filtered) == 0:
+        logger.warning(
+            f"No epochs at or before {decision_time_hours}h — cannot compute ROC"
+        )
+        return {}
+
+    # GUID-level aggregation: max probability, true label
+    guid_scores = df_filtered.groupby('guid').agg(
+        score=('prob_class_1', 'max'),
+        label=('binary_target', 'max'),
+    ).reset_index()
+
+    labels = guid_scores['label'].values.astype(int)
+    scores = guid_scores['score'].values.astype(float)
+
+    n_pos = int(labels.sum())
+    n_neg = int(len(labels) - n_pos)
+
+    if n_pos == 0 or n_neg == 0:
+        logger.warning("Only one class present — ROC undefined")
+        return {}
+
+    fpr_arr, tpr_arr, thresh_arr = roc_curve(labels, scores)
+    roc_auc = float(auc(fpr_arr, tpr_arr))
+
+    return {
+        'fpr': fpr_arr.tolist(),
+        'tpr': tpr_arr.tolist(),
+        'thresholds': thresh_arr.tolist(),
+        'auc': roc_auc,
+        'n_positive': n_pos,
+        'n_negative': n_neg,
+    }
+
+
+def plot_roc_curve(
+    roc_data: Dict,
+    output_path: Path,
+    title_suffix: str = "",
+    threshold: Optional[float] = None
+) -> None:
+    """Plot a single ROC curve and save to disk.
+
+    Args:
+        roc_data: Dictionary returned by ``compute_guid_level_roc``.
+        output_path: File path for the saved figure.
+        title_suffix: Extra text appended to the plot title.
+        threshold: If provided, marks the operating point on the curve.
+    """
+    if not roc_data:
+        return
+
+    fpr = np.array(roc_data['fpr'])
+    tpr = np.array(roc_data['tpr'])
+    roc_auc = roc_data['auc']
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot(fpr, tpr, color='#2980b9', linewidth=2,
+            label=f'ROC (AUC = {roc_auc:.3f})')
+    ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1)
+
+    if threshold is not None and 'thresholds' in roc_data:
+        thresholds = np.array(roc_data['thresholds'])
+        idx = np.argmin(np.abs(thresholds - threshold))
+        ax.plot(fpr[idx], tpr[idx], 'ro', markersize=10,
+                label=f'Operating point (t={threshold:.3f})')
+
+    title = 'GUID-Level ROC Curve'
+    if title_suffix:
+        title += f' — {title_suffix}'
+    ax.set_title(title, fontsize=13, fontweight='bold')
+    ax.set_xlabel('False Positive Rate', fontsize=11)
+    ax.set_ylabel('True Positive Rate', fontsize=11)
+    ax.legend(fontsize=10, loc='lower right')
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.grid(True, alpha=0.3)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"ROC curve saved: {output_path}")
+
+
+def plot_aggregated_roc_curves(
+    all_roc_data: List[Dict],
+    output_path: Path,
+    n_folds: int
+) -> None:
+    """Plot aggregated ROC curves across k-folds.
+
+    Overlays per-fold curves (thin lines) and adds a mean +/- std band.
+
+    Args:
+        all_roc_data: List of dicts returned by ``compute_guid_level_roc``
+            (one per fold).
+        output_path: File path for the saved figure.
+        n_folds: Total number of folds (for title).
+    """
+    valid_roc = [r for r in all_roc_data if r and 'fpr' in r]
+    if not valid_roc:
+        logger.warning("No valid ROC data for aggregated plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # Common FPR grid for interpolation
+    mean_fpr = np.linspace(0, 1, 200)
+    tprs = []
+    aucs = []
+
+    for i, rd in enumerate(valid_roc):
+        fpr = np.array(rd['fpr'])
+        tpr = np.array(rd['tpr'])
+        roc_auc = rd['auc']
+        aucs.append(roc_auc)
+
+        ax.plot(fpr, tpr, alpha=0.25, linewidth=1,
+                label=f'Fold {i} (AUC={roc_auc:.3f})')
+
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        tprs.append(interp_tpr)
+
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    std_tpr = np.std(tprs, axis=0)
+    mean_auc = float(np.mean(aucs))
+    std_auc = float(np.std(aucs))
+
+    ax.plot(mean_fpr, mean_tpr, color='#2980b9', linewidth=2.5,
+            label=f'Mean ROC (AUC={mean_auc:.3f} ± {std_auc:.3f})')
+    ax.fill_between(mean_fpr, mean_tpr - std_tpr, mean_tpr + std_tpr,
+                     color='#2980b9', alpha=0.15)
+    ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1)
+
+    ax.set_title(f'Aggregated GUID-Level ROC ({n_folds}-Fold)',
+                 fontsize=13, fontweight='bold')
+    ax.set_xlabel('False Positive Rate', fontsize=11)
+    ax.set_ylabel('True Positive Rate', fontsize=11)
+    ax.legend(fontsize=8, loc='lower right')
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.grid(True, alpha=0.3)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Aggregated ROC plot saved: {output_path}")
 
 
 # ============================================================================
@@ -3516,22 +3779,45 @@ def aggregate_existing_results(
             logger.info(f"Fold {fold_id}: Regenerating metrics from predictions...")
 
             evaluation_dir = fold_dir / "evaluation"
-            test_clinical_path = evaluation_dir / "test_predictions_clinical.csv"
+            test_raw_path = evaluation_dir / "test_predictions_raw.csv"
 
-            if not test_clinical_path.exists():
-                logger.warning(f"Fold {fold_id}: No test_predictions_clinical.csv found, skipping")
+            if not test_raw_path.exists():
+                logger.warning(f"Fold {fold_id}: No test_predictions_raw.csv found, skipping")
                 missing_data_folds.append(fold_id)
                 continue
 
-            # Load predictions
-            test_df = pd.read_csv(test_clinical_path)
+            # Load raw predictions
+            test_df_raw = pd.read_csv(test_raw_path)
+
+            # Load thresholds from threshold_info.json (or use primary threshold)
+            threshold_info_path = evaluation_dir / "threshold_info.json"
+            if threshold_info_path.exists():
+                with open(threshold_info_path, 'r') as tf:
+                    tinfo = json.load(tf)
+                regen_thresholds = tinfo.get('all_thresholds', {})
+                if not regen_thresholds:
+                    # Backward compat: only primary_threshold available
+                    pt = tinfo.get('primary_threshold', 0.5)
+                    regen_thresholds = {
+                        'instantaneous': pt,
+                        'committed_cumulative': pt,
+                        'committed_overall': pt,
+                    }
+            else:
+                pt = fold_results.get('primary_threshold', 0.5)
+                regen_thresholds = {
+                    'instantaneous': pt,
+                    'committed_cumulative': pt,
+                    'committed_overall': pt,
+                }
 
             # Regenerate three metric type analysis
             three_metric_results = generate_three_metric_type_analysis(
-                test_df,
+                test_df_raw,
+                thresholds=regen_thresholds,
                 output_base_dir=evaluation_dir,
                 exclude_last_minutes=exclude_last_minutes,
-                title_suffix=f"Fold {fold_id}"
+                title_suffix=f"Fold {fold_id}",
             )
 
             # Add to fold results
@@ -3878,33 +4164,44 @@ def _evaluate_single_fold(
         val_df_raw.to_csv(val_raw_path, index=False)
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
-    # Find PRIMARY threshold on validation set
-    logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+    # Find thresholds on validation set (one per metric type)
+    logger.info(f"Fold {fold_id}: Finding thresholds (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+
     primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
         val_df_raw,
         target_fpr=target_fpr,
         time_window_hours=decision_time_hours,
         max_gap_multiplier=max_gap_multiplier,
-        fallback_tolerance_hours=0.5
+        fallback_tolerance_hours=0.5,
     )
+    threshold_cumulative, _ = find_threshold_for_committed_cumulative_fpr_at_1h(
+        val_df_raw,
+        target_fpr=target_fpr,
+        time_window_hours=decision_time_hours,
+        fallback_tolerance_hours=0.5,
+    )
+    threshold_instantaneous, _ = find_threshold_for_instantaneous_fpr_at_1h(
+        val_df_raw,
+        target_fpr=target_fpr,
+        time_window_hours=decision_time_hours,
+        fallback_tolerance_hours=0.5,
+    )
+    all_thresholds = {
+        'instantaneous': threshold_instantaneous,
+        'committed_cumulative': threshold_cumulative,
+        'committed_overall': primary_threshold,
+    }
 
-    # Calculate accuracy from sensitivity and specificity (weighted by class prevalence)
-    # Accuracy = (TP + TN) / (TP + FP + TN + FN)
-    # With P = n_positive, N = n_negative:
-    # Accuracy = (sensitivity * P + specificity * N) / (P + N)
     n_pos = threshold_metrics.get('n_positive_total', threshold_metrics.get('n_available_positive', 1))
     n_neg = threshold_metrics.get('n_negative_total', threshold_metrics.get('n_available_negative', 1))
     sens = threshold_metrics.get('sensitivity', 0)
     spec = threshold_metrics.get('specificity', 0)
     threshold_metrics['accuracy'] = float((sens * n_pos + spec * n_neg) / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else 0.0
 
-    logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
-    logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
-    logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
-    logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
-    logger.info(f"  Validation accuracy: {threshold_metrics.get('accuracy', 0):.3f}")
+    logger.info(f"Fold {fold_id}: Thresholds - overall={primary_threshold:.4f}, "
+                f"cumulative={threshold_cumulative:.4f}, instantaneous={threshold_instantaneous:.4f}")
 
-    # Apply clinical decision rule to validation set
+    # Apply clinical decision rule to validation set (primary threshold)
     val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
     val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
     val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
@@ -3924,19 +4221,22 @@ def _evaluate_single_fold(
         test_df_raw.to_csv(test_raw_path, index=False)
         logger.info(f"Fold {fold_id}: Test predictions saved ({len(test_df_raw)} rows)")
 
-    # Apply clinical decision rule to test set
+    # Save CDR'd test predictions using primary (committed_overall) threshold
     test_df_clinical = apply_clinical_decision_rule(test_df_raw.copy(), primary_threshold)
     test_df_clinical = fill_missing_epochs(test_df_clinical, max_gap_multiplier=max_gap_multiplier)
     test_df_clinical.to_csv(evaluation_dir / "test_predictions_clinical.csv", index=False)
 
-    # Generate three metric type analysis
+    # Generate three metric type analysis (separate thresholds)
     logger.info(f"Fold {fold_id}: Generating three metric type analysis...")
     try:
         three_metric_results = generate_three_metric_type_analysis(
-            test_df_clinical,
+            test_df_raw,
+            thresholds=all_thresholds,
             output_base_dir=evaluation_dir,
             exclude_last_minutes=exclude_last_minutes,
-            title_suffix=f"Fold {fold_id}"
+            title_suffix=f"Fold {fold_id}",
+            max_gap_multiplier=max_gap_multiplier,
+            decision_time_hours=decision_time_hours,
         )
         logger.info(f"Fold {fold_id}: Three metric type analysis complete")
     except Exception as e:
@@ -3956,9 +4256,30 @@ def _evaluate_single_fold(
             'test_fpr_std': primary_summary.get('fpr_std', 0.0),
         }
 
+    # Extract decision-point metrics
+    decision_point = three_metric_results.get("decision_point_metrics", {}) if three_metric_results else {}
+
+    # ROC curve
+    roc_data = {}
+    try:
+        roc_data = compute_guid_level_roc(test_df_raw, decision_time_hours=decision_time_hours)
+        if roc_data:
+            plot_roc_curve(
+                roc_data,
+                evaluation_dir / "roc_curve.png",
+                title_suffix=f"Fold {fold_id}",
+                threshold=primary_threshold,
+            )
+            roc_csv = pd.DataFrame({'fpr': roc_data['fpr'], 'tpr': roc_data['tpr']})
+            roc_csv.to_csv(evaluation_dir / "roc_data.csv", index=False)
+            logger.info(f"Fold {fold_id}: ROC AUC = {roc_data['auc']:.4f}")
+    except Exception as e:
+        logger.warning(f"Fold {fold_id}: ROC computation failed: {e}")
+
     # Save threshold and metrics info
     threshold_info = {
         'primary_threshold': float(primary_threshold),
+        'all_thresholds': {k: float(v) for k, v in all_thresholds.items()},
         'target_fpr': float(target_fpr),
         'validation_metrics': {
             'sensitivity': float(threshold_metrics.get('sensitivity', 0)),
@@ -3968,6 +4289,8 @@ def _evaluate_single_fold(
             'time_window_hours': float(threshold_metrics.get('time_window_hours', 1.0)),
         },
         'test_metrics_primary': primary_metrics,
+        'decision_point_metrics': decision_point,
+        'roc_auc': roc_data.get('auc'),
     }
 
     with open(evaluation_dir / "threshold_info.json", 'w') as f:
@@ -3977,6 +4300,7 @@ def _evaluate_single_fold(
     fold_results = {
         'fold_id': fold_id,
         'primary_threshold': float(primary_threshold),
+        'all_thresholds': {k: float(v) for k, v in all_thresholds.items()},
         'validation_sensitivity': float(threshold_metrics.get('sensitivity', 0)),
         'validation_specificity': float(threshold_metrics.get('specificity', 0)),
         'validation_fpr': float(threshold_metrics.get('fpr', 0)),
@@ -3987,6 +4311,12 @@ def _evaluate_single_fold(
         'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
         'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
         'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
+        'decision_point_metrics': decision_point,
+        'roc_auc': roc_data.get('auc'),
+        'roc_data': {
+            'fpr': roc_data.get('fpr', []),
+            'tpr': roc_data.get('tpr', []),
+        } if roc_data else {},
         'status': 'success',
         # Include full three metric type analysis (summary only - DataFrames saved separately)
         'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {},
