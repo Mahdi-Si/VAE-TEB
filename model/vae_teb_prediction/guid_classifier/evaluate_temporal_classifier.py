@@ -91,6 +91,7 @@ def create_temporal_model_from_config(
     head_cfg = model_cfg.get("classifier_head", {})
     seg_idx_cfg = feat_cfg.get("segment_index", {})
     tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
+    dt_cfg = feat_cfg.get("delta_t", {})
 
     model = TemporalVaeClassifier(
         vae_model=vae_model,
@@ -101,12 +102,18 @@ def create_temporal_model_from_config(
         temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
         gap_encoding=model_cfg.get("gap_encoding", "concat"),
         position_embed_dim=(
-            seg_idx_cfg.get("embed_dim", 16)
+            seg_idx_cfg.get("embed_dim", 8)
             if seg_idx_cfg.get("enabled", False)
             else 0
         ),
         max_position_index=seg_idx_cfg.get("max_index", 40),
         tlo_enabled=tlo_cfg.get("enabled", False),
+        tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+        tlo_dropout=tlo_cfg.get("dropout", 0.1),
+        delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
+        delta_t_dropout=dt_cfg.get("dropout", 0.1),
+        persist_segment_state=seg_cfg.get("persist_state", False),
+        segment_state_decay=seg_cfg.get("state_decay", True),
         num_classes=head_cfg.get("num_classes", 2),
         classifier_dropout=head_cfg.get("dropout", 0.1),
         mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
