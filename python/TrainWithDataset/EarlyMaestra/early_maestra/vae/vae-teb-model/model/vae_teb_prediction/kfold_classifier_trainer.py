@@ -97,10 +97,17 @@ def create_parent_mlflow_run(
 
         client = mlflow.MlflowClient()
 
-        # Get or create experiment
+        # Get or create experiment (restore if soft-deleted)
         experiment = client.get_experiment_by_name(experiment_name)
         if experiment is None:
             experiment_id = client.create_experiment(experiment_name)
+        elif experiment.lifecycle_stage == "deleted":
+            client.restore_experiment(experiment.experiment_id)
+            experiment_id = experiment.experiment_id
+            logger.info(
+                "Restored deleted MLflow experiment '{}' (id={})",
+                experiment_name, experiment_id,
+            )
         else:
             experiment_id = experiment.experiment_id
 
@@ -332,31 +339,41 @@ def train_single_fold(
         mlflow_logger = getattr(graph_model, "mlflow_logger", None)
 
         def _log_mlflow_metrics(metrics: Dict[str, float], step: Optional[int] = None):
+            """Log metrics using MlflowClient directly (works on terminated runs)."""
             if mlflow_logger is None or not metrics:
                 return
-            cleaned = {}
+            run_id = getattr(mlflow_logger, "run_id", None)
+            client = getattr(mlflow_logger, "experiment", None)
+            if run_id is None or client is None:
+                return
             for key, value in metrics.items():
                 if value is None:
                     continue
                 if isinstance(value, torch.Tensor):
                     value = value.item()
                 try:
-                    cleaned[key] = float(value)
-                except (TypeError, ValueError):
-                    continue
-            if cleaned:
-                mlflow_logger.log_metrics(cleaned, step=step)
+                    client.log_metric(run_id, key, float(value), step=step or 0)
+                except Exception as exc:
+                    logger.warning("Failed to log MLflow metric '{}': {}", key, exc)
 
         def _log_mlflow_artifact(path: Path | str, *, is_dir: bool = False):
+            """Log artifacts using MlflowClient directly (works on terminated runs)."""
             if mlflow_logger is None or not path:
+                return
+            run_id = getattr(mlflow_logger, "run_id", None)
+            client = getattr(mlflow_logger, "experiment", None)
+            if run_id is None or client is None:
                 return
             path_obj = Path(path)
             if not path_obj.exists():
                 return
-            if is_dir:
-                mlflow_logger.experiment.log_artifacts(mlflow_logger.run_id, str(path_obj))
-            else:
-                mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(path_obj))
+            try:
+                if is_dir:
+                    client.log_artifacts(run_id, str(path_obj))
+                else:
+                    client.log_artifact(run_id, str(path_obj))
+            except Exception as exc:
+                logger.warning("Failed to log MLflow artifact '{}': {}", path_obj, exc)
 
 # NEW Clean Evaluation Implementation for kfold_classifier_trainer.py
 # Replace lines 332-493 with this code

@@ -102,6 +102,21 @@ class PlTemporalClassifier(LightningModelBase):
                 class_weights,
             )
 
+    def training_step(self, batch, batch_idx):
+        """Override to log training metrics at epoch-level only.
+
+        The base class logs with ``on_step=True`` which puts the **last step
+        value** into ``callback_metrics["train/loss"]``.  For the temporal
+        classifier the per-step values are very noisy (variable batch
+        composition from the bucket sampler), making the training loss plot
+        look like random noise.  Logging with ``on_step=False`` ensures
+        ``callback_metrics["train/loss"]`` contains the epoch average,
+        matching the behaviour of validation metrics.
+        """
+        loss, metrics = self.compute_loss_and_metrics(batch, batch_idx, stage="train")
+        self._log_metrics(metrics, stage="train", on_step=False)
+        return loss
+
     def compute_loss_and_metrics(
         self, batch: Dict, batch_idx: int, stage: str,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -576,10 +591,17 @@ def train_fold(
     )
 
     # --- Class weights ---------------------------------------------------- #
-    logger.info("Fold {}: Estimating class weights...", fold_id)
-    class_weights = estimate_temporal_class_weights(train_dataset)
-    class_weights_list = class_weights.tolist()
-    logger.info("Fold {}: Class weights estimated: {}", fold_id, class_weights_list)
+    head_cfg = config.get("model_config", {}).get("classifier_head", {})
+    use_class_weights = head_cfg.get("use_class_weights", True)
+
+    if use_class_weights:
+        logger.info("Fold {}: Estimating class weights...", fold_id)
+        class_weights = estimate_temporal_class_weights(train_dataset)
+        class_weights_list = class_weights.tolist()
+        logger.info("Fold {}: Class weights estimated: {}", fold_id, class_weights_list)
+    else:
+        class_weights_list = None
+        logger.info("Fold {}: Class weighting disabled, using uniform CE loss", fold_id)
 
     # --- Fold-specific config --------------------------------------------- #
     fold_output_dir = Path(config["general_config"]["folders_config"]["out_dir_base"]) / f"fold_{fold_id}"
@@ -598,8 +620,11 @@ def train_fold(
     logger.info("Fold {}: config saved to {}", fold_id, fold_config_path)
 
     # --- Create trainer and model ----------------------------------------- #
-    logger.info("Fold {}: Loading VAE checkpoint and creating model...", fold_id)
+    # Set CUDA_VISIBLE_DEVICES so PyTorch sees only the assigned GPU.
+    # When called from kfold_temporal_trainer the caller already set this,
+    # but when called standalone (main()) this is the only place it happens.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    logger.info("Fold {}: Loading VAE checkpoint and creating model...", fold_id)
 
     graph_model = GraphModelTemporalTrainer(config_file_path=str(fold_config_path))
     graph_model.setup_config()
