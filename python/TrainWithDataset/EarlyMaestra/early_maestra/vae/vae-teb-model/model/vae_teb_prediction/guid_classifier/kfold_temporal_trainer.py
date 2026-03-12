@@ -810,6 +810,7 @@ def aggregate_temporal_results(
     try:
         from model.vae_teb_prediction.evaluate_classifier import (
             generate_aggregated_plots,
+            plot_aggregated_roc_curves,
         )
 
         generate_aggregated_plots(
@@ -821,6 +822,29 @@ def aggregate_temporal_results(
             "Aggregated plots saved to: {}",
             output_base_dir / "aggregated_plots",
         )
+
+        # Generate aggregated ROC plot from per-fold ROC data
+        all_roc_data = [
+            r.get("roc_data_full", r.get("roc_data", {}))
+            for r in successful
+        ]
+        # roc_data may be stored as {fpr: [...], tpr: [...]} or full roc dict
+        # Normalise to the format expected by plot_aggregated_roc_curves
+        normalised_roc = []
+        for i, rd in enumerate(all_roc_data):
+            if rd and "fpr" in rd and "tpr" in rd and rd["fpr"]:
+                entry = dict(rd)
+                if "auc" not in entry:
+                    entry["auc"] = successful[i].get("roc_auc", 0.0)
+                normalised_roc.append(entry)
+        if normalised_roc:
+            agg_plots_dir = output_base_dir / "aggregated_plots"
+            agg_plots_dir.mkdir(parents=True, exist_ok=True)
+            plot_aggregated_roc_curves(
+                normalised_roc,
+                agg_plots_dir / "aggregated_roc_curves.png",
+                n_folds=len(successful),
+            )
     except Exception as exc:
         logger.error("generate_aggregated_plots failed: {}", exc)
         logger.error(traceback.format_exc())

@@ -22,6 +22,7 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import numpy as np
+import pandas as pd
 import h5py
 
 from model.vae_teb_prediction.evaluate_classifier import generate_aggregated_plots
@@ -386,9 +387,13 @@ def train_single_fold(
         from model.vae_teb_prediction.evaluate_classifier import (
             run_inference,
             find_threshold_for_committed_overall_fpr_at_1h,
+            find_threshold_for_committed_cumulative_fpr_at_1h,
+            find_threshold_for_instantaneous_fpr_at_1h,
             apply_clinical_decision_rule,
             fill_missing_epochs,
             generate_three_metric_type_analysis,
+            compute_guid_level_roc,
+            plot_roc_curve,
         )
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         evaluation_dir = fold_output_dir / "evaluation"
@@ -410,21 +415,45 @@ def train_single_fold(
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
         # --------------------------------------------------------------------
-        # FIND PRIMARY THRESHOLD (committed_overall @ decision_time_hours)
+        # FIND THRESHOLDS (one per metric type)
         # --------------------------------------------------------------------
-        logger.info(f"Fold {fold_id}: Finding PRIMARY threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+        logger.info(f"Fold {fold_id}: Finding thresholds (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+
+        # PRIMARY — committed_overall
         primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
             val_df_raw,
             target_fpr=target_fpr,
             time_window_hours=decision_time_hours,
-            fallback_tolerance_hours=0.5
+            fallback_tolerance_hours=0.5,
         )
-        logger.info(f"Fold {fold_id}: PRIMARY threshold = {primary_threshold:.4f}")
-        logger.info(f"  Validation sensitivity: {threshold_metrics.get('sensitivity', 0):.3f}")
-        logger.info(f"  Validation specificity: {threshold_metrics.get('specificity', 0):.3f}")
-        logger.info(f"  Validation FPR: {threshold_metrics.get('fpr', 0):.3f}")
 
-        # Apply clinical decision rule to validation set
+        # Committed cumulative
+        threshold_cumulative, _ = find_threshold_for_committed_cumulative_fpr_at_1h(
+            val_df_raw,
+            target_fpr=target_fpr,
+            time_window_hours=decision_time_hours,
+            fallback_tolerance_hours=0.5,
+        )
+
+        # Instantaneous
+        threshold_instantaneous, _ = find_threshold_for_instantaneous_fpr_at_1h(
+            val_df_raw,
+            target_fpr=target_fpr,
+            time_window_hours=decision_time_hours,
+            fallback_tolerance_hours=0.5,
+        )
+
+        all_thresholds = {
+            'instantaneous': threshold_instantaneous,
+            'committed_cumulative': threshold_cumulative,
+            'committed_overall': primary_threshold,
+        }
+
+        logger.info(f"Fold {fold_id}: Thresholds — overall={primary_threshold:.4f}, "
+                     f"cumulative={threshold_cumulative:.4f}, "
+                     f"instantaneous={threshold_instantaneous:.4f}")
+
+        # Apply clinical decision rule to validation set (primary threshold)
         val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
         val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
         val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
@@ -453,21 +482,24 @@ def train_single_fold(
         test_df_raw.to_csv(evaluation_dir / "test_predictions_raw.csv", index=False)
         logger.info(f"Fold {fold_id}: Test predictions saved ({len(test_df_raw)} rows)")
 
-        # Apply clinical decision rule to test set
+        # Save CDR'd test predictions using primary (committed_overall) threshold
         test_df_clinical = apply_clinical_decision_rule(test_df_raw.copy(), primary_threshold)
         test_df_clinical = fill_missing_epochs(test_df_clinical, max_gap_multiplier=max_gap_multiplier)
         test_df_clinical.to_csv(evaluation_dir / "test_predictions_clinical.csv", index=False)
 
         # --------------------------------------------------------------------
-        # GENERATE THREE METRIC TYPE ANALYSIS
+        # GENERATE THREE METRIC TYPE ANALYSIS (separate thresholds)
         # --------------------------------------------------------------------
         logger.info(f"Fold {fold_id}: Generating three metric type analysis...")
         try:
             three_metric_results = generate_three_metric_type_analysis(
-                test_df_clinical,
+                test_df_raw,
+                thresholds=all_thresholds,
                 output_base_dir=evaluation_dir,
                 exclude_last_minutes=exclude_last_minutes,
-                title_suffix=f"Fold {fold_id}"
+                title_suffix=f"Fold {fold_id}",
+                max_gap_multiplier=max_gap_multiplier,
+                decision_time_hours=decision_time_hours,
             )
             logger.info(f"Fold {fold_id}: Three metric type analysis complete")
 
@@ -481,9 +513,9 @@ def train_single_fold(
             three_metric_results = {}
 
         # --------------------------------------------------------------------
-        # COMPUTE TEST METRICS (Simple binary classification metrics)
+        # COMPUTE TEST METRICS
         # --------------------------------------------------------------------
-        # Extract PRIMARY metric (committed_overall) from three metric type results
+        # Extract PRIMARY metric (committed_overall, mean across bins)
         primary_metrics = {}
         if three_metric_results and 'summary' in three_metric_results:
             primary_summary = three_metric_results['summary'].get('metric_types', {}).get('committed_overall', {})
@@ -496,9 +528,30 @@ def train_single_fold(
                 'test_fpr_std': primary_summary.get('fpr_std', 0.0),
             }
 
+        # Extract decision-point metrics for all three metric types
+        decision_point = three_metric_results.get("decision_point_metrics", {}) if three_metric_results else {}
+
+        # --- ROC curve ------------------------------------------------------
+        roc_data = {}
+        try:
+            roc_data = compute_guid_level_roc(test_df_raw, decision_time_hours=decision_time_hours)
+            if roc_data:
+                plot_roc_curve(
+                    roc_data,
+                    evaluation_dir / "roc_curve.png",
+                    title_suffix=f"Fold {fold_id}",
+                    threshold=primary_threshold,
+                )
+                roc_csv = pd.DataFrame({'fpr': roc_data['fpr'], 'tpr': roc_data['tpr']})
+                roc_csv.to_csv(evaluation_dir / "roc_data.csv", index=False)
+                logger.info(f"Fold {fold_id}: ROC AUC = {roc_data['auc']:.4f}")
+        except Exception as e:
+            logger.warning(f"Fold {fold_id}: ROC computation failed: {e}")
+
         # Save threshold and metrics info
         threshold_info = {
             'primary_threshold': float(primary_threshold),
+            'all_thresholds': {k: float(v) for k, v in all_thresholds.items()},
             'target_fpr': float(target_fpr),
             'validation_metrics': {
                 'sensitivity': float(threshold_metrics.get('sensitivity', 0)),
@@ -508,6 +561,8 @@ def train_single_fold(
                 'time_window_hours': float(threshold_metrics.get('time_window_hours', 1.0)),
             },
             'test_metrics_primary': primary_metrics,
+            'decision_point_metrics': decision_point,
+            'roc_auc': roc_data.get('auc'),
         }
 
         # Save threshold info
@@ -517,7 +572,7 @@ def train_single_fold(
         logger.info(f"Fold {fold_id}: Evaluation completed")
 
         # --------------------------------------------------------------------
-        # RESULTS DICTIONARY (NEW metrics only)
+        # RESULTS DICTIONARY
         # --------------------------------------------------------------------
         results = {
             'fold_id': fold_id,
@@ -528,18 +583,29 @@ def train_single_fold(
 
             # PRIMARY threshold and validation metrics
             'primary_threshold': float(primary_threshold),
+            'all_thresholds': {k: float(v) for k, v in all_thresholds.items()},
             'validation_sensitivity': float(threshold_metrics.get('sensitivity', 0)),
             'validation_specificity': float(threshold_metrics.get('specificity', 0)),
             'validation_fpr': float(threshold_metrics.get('fpr', 0)),
             'validation_accuracy': float(threshold_metrics.get('accuracy', 0)),
 
-            # Test metrics (PRIMARY - committed_overall)
+            # Test metrics (PRIMARY - committed_overall, mean across bins)
             'test_sensitivity_mean': primary_metrics.get('test_sensitivity_mean', 0.0),
             'test_sensitivity_std': primary_metrics.get('test_sensitivity_std', 0.0),
             'test_specificity_mean': primary_metrics.get('test_specificity_mean', 0.0),
             'test_specificity_std': primary_metrics.get('test_specificity_std', 0.0),
             'test_fpr_mean': primary_metrics.get('test_fpr_mean', 0.0),
             'test_fpr_std': primary_metrics.get('test_fpr_std', 0.0),
+
+            # Decision-point metrics (FPR at 1h for each metric type)
+            'decision_point_metrics': decision_point,
+
+            # ROC
+            'roc_auc': roc_data.get('auc'),
+            'roc_data': {
+                'fpr': roc_data.get('fpr', []),
+                'tpr': roc_data.get('tpr', []),
+            } if roc_data else {},
 
             'status': 'success'
         }
@@ -556,23 +622,25 @@ def train_single_fold(
         logger.info(f"  Test sensitivity: {results['test_sensitivity_mean']:.3f} ± {results['test_sensitivity_std']:.3f}")
         logger.info(f"  Test specificity: {results['test_specificity_mean']:.3f} ± {results['test_specificity_std']:.3f}")
         logger.info(f"  Test FPR: {results['test_fpr_mean']:.3f} ± {results['test_fpr_std']:.3f}")
+        if roc_data.get('auc') is not None:
+            logger.info(f"  ROC AUC: {roc_data['auc']:.4f}")
 
         # Log metrics to MLflow
-        _log_mlflow_metrics(
-            {
-                "train/training_time_minutes": training_time,
-                "val/best_accuracy": best_val_acc,
-                "val/best_loss": best_val_loss,
-                "eval/primary_threshold": results['primary_threshold'],
-                "eval/validation_sensitivity": results['validation_sensitivity'],
-                "eval/validation_specificity": results['validation_specificity'],
-                "eval/validation_fpr": results['validation_fpr'],
-                "eval/test_sensitivity_mean": results['test_sensitivity_mean'],
-                "eval/test_specificity_mean": results['test_specificity_mean'],
-                "eval/test_fpr_mean": results['test_fpr_mean'],
-            },
-            step=getattr(trainer, "global_step", None),
-        )
+        mlflow_metrics = {
+            "train/training_time_minutes": training_time,
+            "val/best_accuracy": best_val_acc,
+            "val/best_loss": best_val_loss,
+            "eval/primary_threshold": results['primary_threshold'],
+            "eval/validation_sensitivity": results['validation_sensitivity'],
+            "eval/validation_specificity": results['validation_specificity'],
+            "eval/validation_fpr": results['validation_fpr'],
+            "eval/test_sensitivity_mean": results['test_sensitivity_mean'],
+            "eval/test_specificity_mean": results['test_specificity_mean'],
+            "eval/test_fpr_mean": results['test_fpr_mean'],
+        }
+        if roc_data.get('auc') is not None:
+            mlflow_metrics["eval/roc_auc"] = roc_data['auc']
+        _log_mlflow_metrics(mlflow_metrics, step=getattr(trainer, "global_step", None))
 
         # Log artifacts to MLflow
         _log_mlflow_artifact(fold_config_path)
@@ -776,6 +844,35 @@ def run_kfold_parallel(
         avg_test_fpr = sum(r.get('test_fpr_mean', 0.0) for r in successful_folds) / n
         std_test_fpr = (sum((r.get('test_fpr_mean', 0.0) - avg_test_fpr) ** 2 for r in successful_folds) / (n - 1)) ** 0.5 if n > 1 else 0.0
 
+        # Decision-point FPR aggregation per metric type
+        decision_point_agg = {}
+        for mt in ['instantaneous', 'committed_cumulative', 'committed_overall']:
+            fpr_vals = [
+                r.get('decision_point_metrics', {}).get(mt, {}).get('fpr_at_decision')
+                for r in successful_folds
+            ]
+            fpr_vals = [v for v in fpr_vals if v is not None]
+            sens_vals = [
+                r.get('decision_point_metrics', {}).get(mt, {}).get('sensitivity_at_decision')
+                for r in successful_folds
+            ]
+            sens_vals = [v for v in sens_vals if v is not None]
+            if fpr_vals:
+                arr = np.array(fpr_vals)
+                decision_point_agg[f'fpr_at_decision_{mt}_mean'] = float(arr.mean())
+                decision_point_agg[f'fpr_at_decision_{mt}_std'] = float(arr.std())
+            if sens_vals:
+                arr = np.array(sens_vals)
+                decision_point_agg[f'sensitivity_at_decision_{mt}_mean'] = float(arr.mean())
+                decision_point_agg[f'sensitivity_at_decision_{mt}_std'] = float(arr.std())
+
+        # ROC AUC aggregation
+        roc_aucs = [r.get('roc_auc') for r in successful_folds if r.get('roc_auc') is not None]
+        roc_auc_agg = {}
+        if roc_aucs:
+            arr = np.array(roc_aucs)
+            roc_auc_agg = {'roc_auc_mean': float(arr.mean()), 'roc_auc_std': float(arr.std())}
+
         summary = {
             'configured_num_folds': num_folds,
             'requested_folds': selected_folds,
@@ -793,6 +890,8 @@ def run_kfold_parallel(
                 'mean_fpr': avg_test_fpr,
                 'std_fpr': std_test_fpr,
             },
+            'decision_point_metrics': decision_point_agg,
+            **roc_auc_agg,
             'individual_results': all_results
         }
 
@@ -851,11 +950,34 @@ def run_kfold_parallel(
             successful_results = [r for r in all_results if r['status'] == 'success']
 
             try:
+                from model.vae_teb_prediction.evaluate_classifier import (
+                    plot_aggregated_roc_curves,
+                )
+
                 generate_aggregated_plots(
                     all_fold_results=successful_results,
                     output_base_dir=Path(output_base_dir),
                     n_folds=len(successful_results)
                 )
+
+                # Generate aggregated ROC plot
+                all_roc = [r.get('roc_data', {}) for r in successful_results]
+                normalised_roc = []
+                for i, rd in enumerate(all_roc):
+                    if rd and 'fpr' in rd and 'tpr' in rd and rd['fpr']:
+                        entry = dict(rd)
+                        if 'auc' not in entry:
+                            entry['auc'] = successful_results[i].get('roc_auc', 0.0)
+                        normalised_roc.append(entry)
+                if normalised_roc:
+                    agg_plots_dir = Path(output_base_dir) / 'aggregated_plots'
+                    agg_plots_dir.mkdir(parents=True, exist_ok=True)
+                    plot_aggregated_roc_curves(
+                        normalised_roc,
+                        agg_plots_dir / 'aggregated_roc_curves.png',
+                        n_folds=len(successful_results),
+                    )
+
                 logger.info("Cross-fold aggregation completed successfully")
                 logger.info(f"Aggregated plots saved to: {Path(output_base_dir) / 'aggregated_plots'}")
             except Exception as e:
