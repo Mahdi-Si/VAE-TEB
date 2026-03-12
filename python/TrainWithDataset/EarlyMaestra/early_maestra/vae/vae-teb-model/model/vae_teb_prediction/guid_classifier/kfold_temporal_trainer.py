@@ -80,10 +80,17 @@ def create_parent_mlflow_run(
 
         client = mlflow.MlflowClient()
 
-        # Get or create experiment
+        # Get or create experiment (restore if soft-deleted)
         experiment = client.get_experiment_by_name(experiment_name)
         if experiment is None:
             experiment_id = client.create_experiment(experiment_name)
+        elif experiment.lifecycle_stage == "deleted":
+            client.restore_experiment(experiment.experiment_id)
+            experiment_id = experiment.experiment_id
+            logger.info(
+                "Restored deleted MLflow experiment '{}' (id={})",
+                experiment_name, experiment_id,
+            )
         else:
             experiment_id = experiment.experiment_id
 
