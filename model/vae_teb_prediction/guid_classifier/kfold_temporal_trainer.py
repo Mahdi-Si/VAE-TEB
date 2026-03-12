@@ -321,7 +321,7 @@ def train_single_fold_temporal(
         checkpoint_dir, trainer_instance = train_fold(
             fold_id=fold_id,
             config=config,
-            gpu_id=0,  # Already mapped via CUDA_VISIBLE_DEVICES
+            gpu_id=gpu_id,
         )
         training_time_min = (time.time() - start_time) / 60.0
 
