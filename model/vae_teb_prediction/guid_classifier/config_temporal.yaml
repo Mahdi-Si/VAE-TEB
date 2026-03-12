@@ -24,6 +24,8 @@ model_config:
     d_seg: 64                                   # Segment representation dimension (ignored for mean_pool)
     lstm_hidden: 64                             # LSTM hidden size, should match d_seg
     cnn_kernel: 7                               # Causal conv kernel size (only used when type: "cnn")
+    persist_state: true                         # Carry LSTM hidden state across segments (only for type: "lstm")
+    state_decay: true                           # Apply time-decay gating to persistent segment LSTM state
 
   temporal_lstm:
     hidden_dim: 128                             # Temporal LSTM hidden size (context across segments)
@@ -34,14 +36,18 @@ model_config:
 
   temporal_features:
     delta_t:
-      enabled: true                             # Include inter-segment time gap features (hours + log-scaled)
+      enabled: true                             # Include inter-segment time gap features
+      embed_dim: 8                              # Learned MLP embedding dim (0 = raw [hours, log] 2-dim)
+      dropout: 0.1                              # Dropout in delta_t embedding MLP
     segment_index:
       enabled: true                             # Learned absolute position embedding from grid slot index
-      embed_dim: 16                             # Position embedding dimension
+      embed_dim: 8                              # Position embedding dimension (reduced from 16)
       max_index: 40                             # Max grid slot index (~36 slots + safety margin)
     time_from_labor_onset:
       enabled: true                             # Include time since labor onset (NaN-safe)
       nan_strategy: "flag"                      # NaN handling: zero value + binary availability flag
+      embed_dim: 8                              # Learned MLP embedding dim (0 = raw [hours, flag] 2-dim)
+      dropout: 0.1                              # Dropout in TLO embedding MLP
 
   classifier_head:
     num_classes: 2                              # Binary: 0=healthy, 1=unhealthy (acidosis/HIE)

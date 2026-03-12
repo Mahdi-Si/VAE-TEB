@@ -5,6 +5,12 @@ latent representations, which are then processed by a segment-level encoder
 (mean-pool, LSTM, or CNN) and a temporal LSTM across the segment sequence.
 Each segment receives a context-informed binary prediction (healthy vs unhealthy).
 
+The segment encoder LSTM can optionally persist its hidden state across
+segments (``persist_segment_state=True``), with time-decay gating to account
+for variable inter-segment gaps.  This allows within-segment temporal
+patterns (e.g. decelerations at segment boundaries) to inform the encoding
+of subsequent segments.
+
 The model takes batch dicts from ``sequence_collate_fn`` and produces
 per-segment predictions of shape ``(B, S_max, num_classes)``.
 
@@ -21,6 +27,9 @@ Example::
         segment_encoder_type="lstm",
         d_seg=64,
         temporal_lstm_hidden=128,
+        persist_segment_state=True,
+        tlo_embed_dim=8,
+        delta_t_embed_dim=8,
     )
 
     outputs = model(batch)  # batch from sequence_collate_fn
@@ -38,6 +47,115 @@ from torch import Tensor
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from loguru import logger
+
+
+# ------------------------------------------------------------------ #
+#  Learned temporal feature embeddings                                  #
+# ------------------------------------------------------------------ #
+
+
+class TemporalTLOEmbedding(nn.Module):
+    """Learned embedding for Time from Labour Onset (per-segment).
+
+    Converts scalar TLO (seconds) to a learned vector via an MLP.
+    NaN values (unavailable TLO) are replaced by a learned
+    ``missing_embedding`` parameter so the model can distinguish
+    "unknown TLO" from any real value.
+
+    Follows the same pattern as
+    :class:`~model.vae_teb_prediction.prediction_classification_model.TLOEmbedding`
+    but operates on ``(B, S_max)`` temporal sequences instead of
+    ``(B,)`` scalars.
+
+    Args:
+        embed_dim: Dimensionality of the output embedding.
+        dropout: Dropout probability inside the MLP.
+    """
+
+    def __init__(self, embed_dim: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.missing_embedding = nn.Parameter(torch.zeros(embed_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(1, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, tlo_seconds: Tensor, mask: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            tlo_seconds: TLO in seconds ``(B, S_max)``.  May contain ``NaN``
+                when TLO is unavailable.
+            mask: Boolean validity mask ``(B, S_max)``.
+
+        Returns:
+            Embedding tensor ``(B, S_max, embed_dim)``.  Padded positions
+            are zeroed.  Guaranteed NaN-free.
+        """
+        is_valid = ~torch.isnan(tlo_seconds) & mask  # (B, S_max)
+        tlo_hours = tlo_seconds / 3600.0
+        # Replace NaN with 0 for MLP input (NaN positions get missing_embedding).
+        tlo_hours = torch.where(
+            torch.isnan(tlo_hours),
+            torch.zeros_like(tlo_hours),
+            tlo_hours,
+        )
+
+        # MLP: (B, S_max, 1) → (B, S_max, embed_dim)
+        tlo_embed = self.mlp(tlo_hours.unsqueeze(-1))
+
+        # Replace NaN positions with learned missing_embedding.
+        missing_mask = (~is_valid).unsqueeze(-1)  # (B, S_max, 1)
+        tlo_embed = torch.where(
+            missing_mask,
+            self.missing_embedding.unsqueeze(0).unsqueeze(0).expand_as(tlo_embed),
+            tlo_embed,
+        )
+
+        # Zero out padded positions.
+        tlo_embed = tlo_embed * mask.unsqueeze(-1).float()
+        return tlo_embed
+
+
+class DeltaTEmbedding(nn.Module):
+    """Learned embedding for inter-segment time gaps.
+
+    Converts scalar delta_t (seconds) to a learned vector via an MLP,
+    replacing the raw ``[hours, log]`` 2-dim concatenation with a
+    richer learned representation.
+
+    Args:
+        embed_dim: Dimensionality of the output embedding.
+        dropout: Dropout probability inside the MLP.
+    """
+
+    def __init__(self, embed_dim: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(1, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, delta_t: Tensor, mask: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            delta_t: Inter-segment gap in seconds ``(B, S_max)``.
+            mask: Boolean validity mask ``(B, S_max)``.
+
+        Returns:
+            Embedding tensor ``(B, S_max, embed_dim)``.  Padded positions
+            are zeroed.
+        """
+        delta_t_hours = delta_t / 3600.0
+        dt_embed = self.mlp(delta_t_hours.unsqueeze(-1))  # (B, S_max, embed_dim)
+        return dt_embed * mask.unsqueeze(-1).float()
 
 
 class TemporalVaeClassifier(nn.Module):
@@ -63,6 +181,18 @@ class TemporalVaeClassifier(nn.Module):
             Default 40.
         tlo_enabled: Whether to use ``time_from_labor_onset`` features.
             Default ``False`` (enabled in Sprint 6).
+        tlo_embed_dim: Dimension of learned TLO embedding.  0 uses raw
+            ``[hours, flag]`` (2 dims).  Default 0.
+        tlo_dropout: Dropout for TLO embedding MLP.  Default 0.1.
+        delta_t_embed_dim: Dimension of learned delta_t embedding.  0 uses raw
+            ``[hours, log]`` (2 dims).  Default 0.
+        delta_t_dropout: Dropout for delta_t embedding MLP.  Default 0.1.
+        persist_segment_state: If ``True`` and ``segment_encoder_type='lstm'``,
+            carry LSTM hidden state across segments (with optional time-decay).
+            Default ``False``.
+        segment_state_decay: If ``True`` (and ``persist_segment_state=True``),
+            apply time-decay gating to the segment LSTM state between segments.
+            Default ``True``.
         num_classes: Number of output classes.  Default 2.
         classifier_dropout: Dropout probability in the classifier head.
             Default 0.1.
@@ -94,6 +224,12 @@ class TemporalVaeClassifier(nn.Module):
         position_embed_dim: int = 0,
         max_position_index: int = 40,
         tlo_enabled: bool = False,
+        tlo_embed_dim: int = 0,
+        tlo_dropout: float = 0.1,
+        delta_t_embed_dim: int = 0,
+        delta_t_dropout: float = 0.1,
+        persist_segment_state: bool = False,
+        segment_state_decay: bool = True,
         num_classes: int = 2,
         classifier_dropout: float = 0.1,
         mlp_multiplier: float = 2.0,
@@ -111,6 +247,10 @@ class TemporalVaeClassifier(nn.Module):
         self.gap_encoding = gap_encoding
         self.position_embed_dim = position_embed_dim
         self.tlo_enabled = tlo_enabled
+        self.tlo_embed_dim = tlo_embed_dim
+        self.delta_t_embed_dim = delta_t_embed_dim
+        self.persist_segment_state = persist_segment_state
+        self.segment_state_decay = segment_state_decay
         self.num_classes = num_classes
         self.vae_chunk_size = vae_chunk_size
         self.use_posterior = use_posterior
@@ -137,6 +277,11 @@ class TemporalVaeClassifier(nn.Module):
                 batch_first=True,
                 bidirectional=False,
             )
+            # Segment LSTM state persistence with time-decay.
+            if persist_segment_state and segment_state_decay:
+                self.gamma_seg_log = nn.Parameter(
+                    torch.full((d_seg,), -2.0)
+                )
         elif segment_encoder_type == "cnn":
             self.d_seg = d_seg
             self._cnn_kernel = cnn_kernel
@@ -151,12 +296,28 @@ class TemporalVaeClassifier(nn.Module):
                 "Expected 'mean_pool', 'lstm', or 'cnn'."
             )
 
+        # -- Learned temporal feature embeddings --------------------------- #
+        if delta_t_embed_dim > 0:
+            self.delta_t_embedding = DeltaTEmbedding(
+                embed_dim=delta_t_embed_dim,
+                dropout=delta_t_dropout,
+            )
+
+        if tlo_enabled and tlo_embed_dim > 0:
+            self.tlo_embedding = TemporalTLOEmbedding(
+                embed_dim=tlo_embed_dim,
+                dropout=tlo_dropout,
+            )
+
         # -- Temporal input dimension (computed dynamically) --------------- #
         temporal_input_dim = self.d_seg
 
-        # delta_t concat features (+2 if concat or both).
+        # delta_t features: learned embedding or raw [hours, log].
         if gap_encoding in ("concat", "both"):
-            temporal_input_dim += 2
+            if delta_t_embed_dim > 0:
+                temporal_input_dim += delta_t_embed_dim
+            else:
+                temporal_input_dim += 2
 
         # Position embedding.
         if position_embed_dim > 0:
@@ -166,11 +327,17 @@ class TemporalVaeClassifier(nn.Module):
             )
             temporal_input_dim += position_embed_dim
 
-        # Time from labor onset (TLO): hours + availability flag.
+        # Time from labor onset (TLO): learned embedding or raw [hours, flag].
         if tlo_enabled:
-            temporal_input_dim += 2
+            if tlo_embed_dim > 0:
+                temporal_input_dim += tlo_embed_dim
+            else:
+                temporal_input_dim += 2
 
         self.temporal_input_dim = temporal_input_dim
+
+        # -- LayerNorm on temporal input ----------------------------------- #
+        self.temporal_input_norm = nn.LayerNorm(temporal_input_dim)
 
         # -- Time-decay gating (T-LSTM) ------------------------------------ #
         self._temporal_lstm_hidden = temporal_lstm_hidden
@@ -226,7 +393,8 @@ class TemporalVaeClassifier(nn.Module):
         logger.info(
             "TemporalVaeClassifier created: encoder={}, d_seg={}, "
             "temporal_input_dim={}, lstm_hidden={}, lstm_layers={}, "
-            "gap={}, pos_dim={}, tlo={}, classes={}",
+            "gap={}, pos_dim={}, tlo={}, tlo_embed={}, dt_embed={}, "
+            "persist_seg={}, seg_decay={}, classes={}",
             segment_encoder_type,
             self.d_seg,
             temporal_input_dim,
@@ -235,6 +403,10 @@ class TemporalVaeClassifier(nn.Module):
             gap_encoding,
             position_embed_dim,
             tlo_enabled,
+            tlo_embed_dim,
+            delta_t_embed_dim,
+            persist_segment_state,
+            segment_state_decay,
             num_classes,
         )
 
@@ -298,6 +470,71 @@ class TemporalVaeClassifier(nn.Module):
         v_flat = torch.zeros(B * S_max, self.d_seg, device=device)
         v_flat[valid_idx] = seg_vectors
         return v_flat.reshape(B, S_max, self.d_seg)
+
+    def _encode_segments_lstm_persistent(
+        self, mu_post: Tensor, mask: Tensor, delta_t: Tensor,
+    ) -> Tensor:
+        """Encode segments via LSTM with state persistence across segments.
+
+        Processes segments in temporal order, carrying the LSTM hidden state
+        from one segment to the next.  When ``segment_state_decay`` is enabled,
+        the hidden and cell states are decayed proportionally to the
+        inter-segment time gap before processing each subsequent segment.
+
+        This allows within-segment patterns (e.g. a deceleration at the end
+        of segment j) to influence the encoding of segment j+1.
+
+        Args:
+            mu_post: Per-segment VAE posterior mean ``(B, S_max, 300, 16)``.
+            mask: Boolean validity mask ``(B, S_max)``.
+            delta_t: Inter-segment gap in seconds ``(B, S_max)``.
+
+        Returns:
+            Segment vectors ``(B, S_max, d_seg)`` with padded positions zeroed.
+        """
+        B, S_max, T, D = mu_post.shape
+        device = mu_post.device
+        d_seg = self.d_seg
+
+        v = torch.zeros(B, S_max, d_seg, device=device)
+
+        # Initialise LSTM hidden/cell state.
+        h = torch.zeros(1, B, d_seg, device=device)
+        c = torch.zeros(1, B, d_seg, device=device)
+
+        # Precompute decay rates if enabled.
+        if self.segment_state_decay and hasattr(self, "gamma_seg_log"):
+            gamma_seg = F.softplus(self.gamma_seg_log)  # (d_seg,)
+        else:
+            gamma_seg = None
+
+        for j in range(S_max):
+            # -- Time-decay before step (skip j=0, no predecessor) --------- #
+            if j > 0 and gamma_seg is not None:
+                dt_j = delta_t[:, j].unsqueeze(-1) / 3600.0  # (B, 1) hours
+                decay = torch.exp(
+                    -gamma_seg.unsqueeze(0) * dt_j
+                )  # (B, d_seg)
+                h = h * decay.unsqueeze(0)  # (1, B, d_seg)
+                c = c * decay.unsqueeze(0)
+
+            # -- Run segment LSTM over 300 timesteps ----------------------- #
+            seg_input = mu_post[:, j, :, :]  # (B, T, D)
+            _, (h_new, c_new) = self.segment_lstm(seg_input, (h, c))
+
+            # -- Store segment vector -------------------------------------- #
+            v[:, j, :] = h_new.squeeze(0)  # (B, d_seg)
+
+            # -- Update state, zeroing invalid positions ------------------- #
+            step_mask = mask[:, j].unsqueeze(0).unsqueeze(-1).float()  # (1, B, 1)
+            # For valid segments, carry forward new state.
+            # For invalid segments, carry forward old state (unchanged).
+            h = h_new * step_mask + h * (1.0 - step_mask)
+            c = c_new * step_mask + c * (1.0 - step_mask)
+
+        # Zero out padded positions in output.
+        v = v * mask.unsqueeze(-1).float()
+        return v
 
     def _encode_segments_cnn(
         self, mu_post: Tensor, mask: Tensor,
@@ -588,7 +825,14 @@ class TemporalVaeClassifier(nn.Module):
         # ---- Step 1: NaN firewall on TLO -------------------------------- #
         # Must happen before ANY tensor operations to prevent NaN propagation.
         if self.tlo_enabled and "time_from_labor_onset" in batch:
-            tlo_feat = self._encode_tlo(batch["time_from_labor_onset"], mask)
+            if self.tlo_embed_dim > 0:
+                tlo_feat = self.tlo_embedding(
+                    batch["time_from_labor_onset"], mask,
+                )
+            else:
+                tlo_feat = self._encode_tlo(
+                    batch["time_from_labor_onset"], mask,
+                )
             if self.debug:
                 assert not torch.isnan(tlo_feat).any(), "NaN in TLO features after encoding"
         else:
@@ -609,7 +853,10 @@ class TemporalVaeClassifier(nn.Module):
         if self.segment_encoder_type == "mean_pool":
             v = self._encode_segments_mean_pool(mu_post, mask)
         elif self.segment_encoder_type == "lstm":
-            v = self._encode_segments_lstm(mu_post, mask)
+            if self.persist_segment_state:
+                v = self._encode_segments_lstm_persistent(mu_post, mask, delta_t)
+            else:
+                v = self._encode_segments_lstm(mu_post, mask)
         elif self.segment_encoder_type == "cnn":
             v = self._encode_segments_cnn(mu_post, mask)
         else:
@@ -619,7 +866,10 @@ class TemporalVaeClassifier(nn.Module):
         features = [v]  # Start with segment vectors.
 
         if self.gap_encoding in ("concat", "both"):
-            features.append(self._encode_delta_t_concat(delta_t))
+            if self.delta_t_embed_dim > 0:
+                features.append(self.delta_t_embedding(delta_t, mask))
+            else:
+                features.append(self._encode_delta_t_concat(delta_t))
 
         if self.position_embed_dim > 0 and "segment_indices" in batch:
             features.append(
@@ -629,8 +879,9 @@ class TemporalVaeClassifier(nn.Module):
         if tlo_feat is not None:
             features.append(tlo_feat)
 
-        # ---- Step 5: Concatenate ---------------------------------------- #
+        # ---- Step 5: Concatenate + LayerNorm ----------------------------- #
         x = torch.cat(features, dim=-1)  # (B, S_max, temporal_input_dim)
+        x = self.temporal_input_norm(x)
 
         if self.debug:
             assert not torch.isnan(x).any(), "NaN in temporal LSTM input"
