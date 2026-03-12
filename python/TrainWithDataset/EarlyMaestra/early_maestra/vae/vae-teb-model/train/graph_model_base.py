@@ -223,7 +223,16 @@ class GraphModelBase(ABC):
         return False
 
     def _init_mlflow_logger(self) -> None:
-        """Create an MLflow logger when enabled in the experiment config."""
+        """Create an MLflow logger when enabled in the experiment config.
+
+        The ``MLFlowLogger`` constructor is lazy — it does NOT connect to the
+        tracking server.  The first real network call happens when the
+        ``experiment`` property is accessed (which creates the MLflow run).
+        We therefore explicitly trigger ``experiment`` here and treat any
+        failure as a hard error that disables MLflow for this run, rather than
+        attaching a broken logger that silently drops every metric during
+        training.
+        """
         settings = self._mlflow_settings
         enabled = bool(settings.get('enabled', False))
         if not enabled:
@@ -231,17 +240,20 @@ class GraphModelBase(ABC):
             self.lightning_loggers = []
             return
 
-        try:
-            experiment_name = settings.get('experiment_name') or self.experiment_tag
-            run_name = settings.get('run_name') or self.base_folder
-            tracking_uri = settings.get('tracking_uri')
+        tracking_uri = settings.get('tracking_uri')
+        experiment_name = settings.get('experiment_name') or self.experiment_tag
+        run_name = settings.get('run_name') or self.base_folder
 
+        try:
             # Validate tracking URI if provided
             if tracking_uri and not self._validate_tracking_uri(tracking_uri):
-                logger.warning(f"Invalid tracking URI: {tracking_uri}, using default")
+                logger.warning(
+                    "Invalid tracking URI: {}, falling back to default",
+                    tracking_uri,
+                )
                 tracking_uri = None
 
-            self.mlflow_logger = MLFlowLogger(
+            mlflow_logger = MLFlowLogger(
                 experiment_name=experiment_name,
                 run_name=run_name,
                 tracking_uri=tracking_uri,
@@ -251,6 +263,13 @@ class GraphModelBase(ABC):
                 save_dir=self.train_results_dir,
             )
 
+            # Force lazy initialisation: this creates the MlflowClient,
+            # the experiment (if needed), and the run.  If the tracking
+            # server is unreachable, the call raises and we fall through
+            # to the except block that disables MLflow entirely.
+            _ = mlflow_logger.experiment
+
+            # Connection verified — log hyperparameters
             basic_params = {
                 "tag": self.experiment_tag,
                 "lr": self.lr,
@@ -259,18 +278,33 @@ class GraphModelBase(ABC):
                 "batch_size_test": self.batch_size_test,
                 "run_directory": self.train_results_dir,
             }
-
             try:
-                self.mlflow_logger.log_hyperparams(basic_params)
+                mlflow_logger.log_hyperparams(basic_params)
             except Exception as e_params:
-                logger.warning(f"Failed to log hyperparameters: {e_params}")
+                logger.warning("Failed to log hyperparameters: {}", e_params)
 
-            self.lightning_loggers = [self.mlflow_logger]
-            logger.info(f"MLflow logger initialized successfully: {experiment_name}/{run_name}")
+            # Only attach the logger after connectivity is confirmed
+            self.mlflow_logger = mlflow_logger
+            self.lightning_loggers = [mlflow_logger]
+            logger.info(
+                "MLflow logger initialised — experiment='{}', run='{}', "
+                "run_id={}, tracking_uri={}",
+                experiment_name,
+                run_name,
+                mlflow_logger.run_id,
+                tracking_uri or "(default)",
+            )
 
         except Exception as e:
-            logger.error(f"Failed to initialize MLflow logger: {e}")
-            logger.warning("Continuing without MLflow logging")
+            logger.error(
+                "MLflow initialisation FAILED (tracking_uri={}): {}",
+                tracking_uri,
+                e,
+            )
+            logger.warning(
+                "Training will continue WITHOUT MLflow logging. "
+                "Check that the MLflow server is running and reachable."
+            )
             self.mlflow_logger = None
             self.lightning_loggers = []
 

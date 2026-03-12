@@ -159,6 +159,11 @@ def _log_fold_mlflow_metrics(
 ) -> None:
     """Log a dict of metrics to the fold's MLflow run.
 
+    Uses the underlying ``MlflowClient`` directly (not Lightning's
+    ``log_metrics`` wrapper) because Lightning's ``Trainer.fit()`` already
+    calls ``MLFlowLogger.finalize()`` which terminates the run.  The
+    ``MlflowClient`` API allows logging to terminated runs.
+
     Args:
         mlflow_logger: Lightning MLFlowLogger instance (may be ``None``).
         metrics: Dict of metric name → value.
@@ -166,27 +171,30 @@ def _log_fold_mlflow_metrics(
     """
     if mlflow_logger is None or not metrics:
         return
-    cleaned = {}
+
+    run_id = getattr(mlflow_logger, "run_id", None)
+    client = getattr(mlflow_logger, "experiment", None)
+    if run_id is None or client is None:
+        return
+
     for key, value in metrics.items():
         if value is None:
             continue
         if isinstance(value, torch.Tensor):
             value = value.item()
         try:
-            cleaned[key] = float(value)
-        except (TypeError, ValueError):
-            continue
-    if cleaned:
-        try:
-            mlflow_logger.log_metrics(cleaned, step=step)
+            client.log_metric(run_id, key, float(value), step=step or 0)
         except Exception as exc:
-            logger.warning("Failed to log MLflow metrics: {}", exc)
+            logger.warning("Failed to log MLflow metric '{}': {}", key, exc)
 
 
 def _log_fold_mlflow_artifact(
     mlflow_logger, path, *, is_dir: bool = False,
 ) -> None:
     """Log a file or directory as an MLflow artifact.
+
+    Uses the underlying ``MlflowClient`` directly so that artifacts can
+    be logged after Lightning has finalised (terminated) the run.
 
     Args:
         mlflow_logger: Lightning MLFlowLogger instance (may be ``None``).
@@ -195,18 +203,20 @@ def _log_fold_mlflow_artifact(
     """
     if mlflow_logger is None or not path:
         return
+
+    run_id = getattr(mlflow_logger, "run_id", None)
+    client = getattr(mlflow_logger, "experiment", None)
+    if run_id is None or client is None:
+        return
+
     path_obj = Path(path)
     if not path_obj.exists():
         return
     try:
         if is_dir:
-            mlflow_logger.experiment.log_artifacts(
-                mlflow_logger.run_id, str(path_obj),
-            )
+            client.log_artifacts(run_id, str(path_obj))
         else:
-            mlflow_logger.experiment.log_artifact(
-                mlflow_logger.run_id, str(path_obj),
-            )
+            client.log_artifact(run_id, str(path_obj))
     except Exception as exc:
         logger.warning("Failed to log MLflow artifact {}: {}", path_obj, exc)
 
@@ -308,7 +318,7 @@ def train_single_fold_temporal(
         )
         training_time_min = (time.time() - start_time) / 60.0
 
-        # Grab the MLflow logger from the trainer for post-training logging
+        # Grab the MLflow logger and training results for post-training logging
         graph_model = trainer_instance
         mlflow_logger = getattr(graph_model, "mlflow_logger", None)
         best_ckpt_path = getattr(
@@ -316,6 +326,20 @@ def train_single_fold_temporal(
             "best_model_path", None,
         )
         lightning_trainer = getattr(graph_model, "_trainer", None)
+
+        # Recover best-checkpoint training metrics written by train_fold().
+        # train_fold() saves these to fold_results.json, but we overwrite
+        # that file below with eval_results — so read them now.
+        _train_results_path = fold_output_dir / "fold_results.json"
+        _train_results: Dict = {}
+        if _train_results_path.exists():
+            try:
+                with open(_train_results_path) as _f:
+                    _train_results = json.load(_f)
+            except Exception:
+                pass
+        best_val_loss = _train_results.get("best_val_loss_training")
+        best_val_accuracy = _train_results.get("best_val_accuracy_training")
 
         # ----- Evaluation -----------------------------------------------------
         from model.vae_teb_prediction.guid_classifier.evaluate_temporal_classifier import (
@@ -352,10 +376,15 @@ def train_single_fold_temporal(
             allow_backward_compat=allow_backward_compat,
         )
 
-        # Merge training metadata into evaluation results
+        # Merge training metadata into evaluation results so nothing is
+        # lost when we overwrite fold_results.json below.
         eval_results["training_time_minutes"] = training_time_min
         eval_results["gpu_id"] = gpu_id
         eval_results["checkpoint_dir"] = checkpoint_dir
+        if best_val_loss is not None:
+            eval_results["best_val_loss_training"] = best_val_loss
+        if best_val_accuracy is not None:
+            eval_results["best_val_accuracy_training"] = best_val_accuracy
 
         # Save combined fold results
         results_path = fold_output_dir / "fold_results.json"
@@ -372,18 +401,21 @@ def train_single_fold_temporal(
         )
 
         # ----- Per-fold MLflow logging ----------------------------------------
+        fold_mlflow_metrics = {
+            "train/training_time_minutes": training_time_min,
+            "train/best_val_loss": best_val_loss,
+            "train/best_val_accuracy": best_val_accuracy,
+            "eval/primary_threshold": eval_results.get("primary_threshold", 0.0),
+            "eval/validation_sensitivity": eval_results.get("validation_sensitivity", 0.0),
+            "eval/validation_specificity": eval_results.get("validation_specificity", 0.0),
+            "eval/validation_fpr": eval_results.get("validation_fpr", 0.0),
+            "eval/test_sensitivity_mean": eval_results.get("test_sensitivity_mean", 0.0),
+            "eval/test_specificity_mean": eval_results.get("test_specificity_mean", 0.0),
+            "eval/test_fpr_mean": eval_results.get("test_fpr_mean", 0.0),
+        }
         _log_fold_mlflow_metrics(
             mlflow_logger,
-            {
-                "train/training_time_minutes": training_time_min,
-                "eval/primary_threshold": eval_results.get("primary_threshold", 0.0),
-                "eval/validation_sensitivity": eval_results.get("validation_sensitivity", 0.0),
-                "eval/validation_specificity": eval_results.get("validation_specificity", 0.0),
-                "eval/validation_fpr": eval_results.get("validation_fpr", 0.0),
-                "eval/test_sensitivity_mean": eval_results.get("test_sensitivity_mean", 0.0),
-                "eval/test_specificity_mean": eval_results.get("test_specificity_mean", 0.0),
-                "eval/test_fpr_mean": eval_results.get("test_fpr_mean", 0.0),
-            },
+            fold_mlflow_metrics,
             step=getattr(lightning_trainer, "global_step", None) if lightning_trainer else None,
         )
 
@@ -672,9 +704,12 @@ def run_kfold_temporal_parallel(
             if successful:
                 test_m = summary.get("test_metrics_primary", {})
                 val_m = summary.get("validation_metrics", {})
+                train_m = summary.get("training_metrics", {})
                 parent_metrics = {
                     "summary/successful_folds": float(len(successful)),
                     "summary/failed_folds": float(len(all_results) - len(successful)),
+                    "summary/mean_best_val_loss": train_m.get("mean_best_val_loss", 0.0),
+                    "summary/mean_best_val_accuracy": train_m.get("mean_best_val_accuracy", 0.0),
                     "summary/mean_threshold": val_m.get("mean_threshold", 0.0),
                     "summary/mean_val_sensitivity": val_m.get("mean_sensitivity", 0.0),
                     "summary/mean_val_specificity": val_m.get("mean_specificity", 0.0),
@@ -882,9 +917,15 @@ def _build_kfold_summary(
 
     # Training metrics
     train_time_mean, train_time_std = _ms("training_time_minutes")
+    best_val_loss_m, best_val_loss_s = _ms("best_val_loss_training")
+    best_val_acc_m, best_val_acc_s = _ms("best_val_accuracy_training")
     summary["training_metrics"] = {
         "mean_training_time_minutes": train_time_mean,
         "std_training_time_minutes": train_time_std,
+        "mean_best_val_loss": best_val_loss_m,
+        "std_best_val_loss": best_val_loss_s,
+        "mean_best_val_accuracy": best_val_acc_m,
+        "std_best_val_accuracy": best_val_acc_s,
     }
 
     # Validation metrics
