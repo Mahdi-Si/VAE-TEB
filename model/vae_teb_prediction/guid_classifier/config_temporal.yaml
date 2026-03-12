@@ -53,6 +53,7 @@ model_config:
     num_classes: 2                              # Binary: 0=healthy, 1=unhealthy (acidosis/HIE)
     dropout: 0.1                                # Dropout in MLP head
     mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier
+    use_class_weights: true                     # false = uniform CE loss (no class weighting)
 
   precompute_latents: false                     # true = skip VAE forward, load cached mu_post from disk
 
