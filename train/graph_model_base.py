@@ -284,6 +284,18 @@ class GraphModelBase(ABC):
             # to the except block that disables MLflow entirely.
             _ = mlflow_logger.experiment
 
+            # Ensure the run name is set explicitly via the mlflow.runName
+            # tag.  Some Lightning versions don't pass run_name through to
+            # client.create_run(), causing MLflow to auto-generate names
+            # like "run_1".
+            if run_name and mlflow_logger.run_id:
+                try:
+                    mlflow_logger.experiment.set_tag(
+                        mlflow_logger.run_id, "mlflow.runName", run_name,
+                    )
+                except Exception:
+                    pass
+
             # Connection verified — log hyperparameters
             basic_params = {
                 "tag": self.experiment_tag,
