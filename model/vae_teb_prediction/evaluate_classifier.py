@@ -1412,6 +1412,19 @@ def _get_clinical_subgroups():
         'healthy_cs_neg': ('Healthy CS\u2212',
                            lambda d: (d['target'] == 1) & (d['cs_label'] == False),  # noqa: E712
                            '#6ab04c'),
+        # -- Healthy, stratified by BG\u00d7CS 4-way ---------------------------
+        'healthy_bg_pos_cs_pos': ('Healthy BG+ CS+',
+                          lambda d: (d['target'] == 1) & (d['bg_label'] == True) & (d['cs_label'] == True),   # noqa: E712
+                          '#e74c3c'),
+        'healthy_bg_pos_cs_neg': ('Healthy BG+ CS\u2212',
+                          lambda d: (d['target'] == 1) & (d['bg_label'] == True) & (d['cs_label'] == False),  # noqa: E712
+                          '#3498db'),
+        'healthy_bg_neg_cs_pos': ('Healthy BG\u2212 CS+',
+                          lambda d: (d['target'] == 1) & (d['bg_label'] == False) & (d['cs_label'] == True),  # noqa: E712
+                          '#f39c12'),
+        'healthy_bg_neg_cs_neg': ('Healthy BG\u2212 CS\u2212',
+                          lambda d: (d['target'] == 1) & (d['bg_label'] == False) & (d['cs_label'] == False), # noqa: E712
+                          '#9b59b6'),
         # -- Acidosis, stratified by CS ----------------------------------
         'acidosis_cs_pos': ('Acidosis CS+',
                             lambda d: (d['target'] == 2) & (d['cs_label'] == True),  # noqa: E712
@@ -1729,7 +1742,7 @@ def _plot_subgroup_overview(
     x = np.arange(len(sg_keys))
     width = 0.38
 
-    fig, ax1 = plt.subplots(figsize=(14, 5))
+    fig, ax1 = plt.subplots(figsize=(18, 5))
 
     # GUIDs bars (left)
     bars_g = ax1.bar(x - width / 2, sg_guids, width, color=sg_colors,
@@ -1824,10 +1837,11 @@ def _plot_epochs_per_time_bin_subgroups(
     """
     Multi-panel figure: per-diagnosis time-bin breakdown with CS/BG stratification.
 
-    Layout (3 rows):
+    Layout (4 rows):
       Row 0 — Healthy: BG+ vs BG\u2212  |  Healthy: CS+ vs CS\u2212
       Row 1 — Acidosis: CS+ vs CS\u2212  |  (empty / summary text)
       Row 2 — HIE: CS+ vs CS\u2212       |  (empty / summary text)
+      Row 3 — Healthy: BG\u00d7CS 4-way  |  (summary text)
     """
     bin_centers = (time_bins[:-1] + time_bins[1:]) / 2.0
     n_bins = len(bin_centers)
@@ -1841,7 +1855,7 @@ def _plot_epochs_per_time_bin_subgroups(
             counts[i] = filt(df[mask_time]).sum()
         return counts
 
-    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    fig, axes = plt.subplots(4, 2, figsize=(16, 16))
     fig.suptitle(f"Epochs per Time Bin by Subgroup — {title_suffix}",
                  fontsize=13, fontweight='bold', y=0.98)
 
@@ -1930,6 +1944,43 @@ def _plot_epochs_per_time_bin_subgroups(
             f"  CS\u2212: {int(c_hie_cs_neg.sum())} epochs",
             transform=ax.transAxes, fontsize=10, fontfamily='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#fdebd0', alpha=0.4))
+
+    # --- Row 3, Col 0: Healthy by BG×CS 4-way ---
+    ax = axes[3, 0]
+    c_bg_pos_cs_pos = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == True) & (d['cs_label'] == True))    # noqa: E712
+    c_bg_pos_cs_neg = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == True) & (d['cs_label'] == False))   # noqa: E712
+    c_bg_neg_cs_pos = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == False) & (d['cs_label'] == True))   # noqa: E712
+    c_bg_neg_cs_neg = _bin_counts(lambda d: (d['target'] == 1) & (d['bg_label'] == False) & (d['cs_label'] == False))  # noqa: E712
+
+    bottom = np.zeros(n_bins)
+    for counts, label, color in [
+        (c_bg_neg_cs_neg, f"BG− CS− ({int(c_bg_neg_cs_neg.sum())})", '#9b59b6'),
+        (c_bg_neg_cs_pos, f"BG− CS+ ({int(c_bg_neg_cs_pos.sum())})", '#f39c12'),
+        (c_bg_pos_cs_neg, f"BG+ CS− ({int(c_bg_pos_cs_neg.sum())})", '#3498db'),
+        (c_bg_pos_cs_pos, f"BG+ CS+ ({int(c_bg_pos_cs_pos.sum())})", '#e74c3c'),
+    ]:
+        ax.bar(bin_centers, counts, width=bar_width, bottom=bottom,
+               label=label, color=color, edgecolor='white', alpha=0.85)
+        bottom += counts
+    ax.set_title("Healthy — BG×CS 4-way")
+    ax.set_ylabel("Epochs")
+    ax.set_xlabel("Hours before birth")
+    ax.legend(fontsize=7)
+    ax.invert_xaxis()
+
+    # --- Row 3, Col 1: Healthy BG×CS summary text ---
+    ax = axes[3, 1]
+    ax.axis('off')
+    n_healthy = int((df['target'] == 1).sum())
+    n_healthy_guids = int(df[df['target'] == 1]['guid'].nunique())
+    ax.text(0.1, 0.7,
+            f"Healthy: {n_healthy_guids} GUIDs, {n_healthy} epochs\n"
+            f"  BG+ CS+: {int(c_bg_pos_cs_pos.sum())} epochs\n"
+            f"  BG+ CS−: {int(c_bg_pos_cs_neg.sum())} epochs\n"
+            f"  BG− CS+: {int(c_bg_neg_cs_pos.sum())} epochs\n"
+            f"  BG− CS−: {int(c_bg_neg_cs_neg.sum())} epochs",
+            transform=ax.transAxes, fontsize=10, fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#d5f5e3', alpha=0.4))
 
     plt.tight_layout()
     plt.savefig(output_dir / "epochs_per_time_bin_subgroups.pdf", dpi=150, bbox_inches='tight')
@@ -2950,15 +3001,23 @@ def plot_subgroup_analysis(
         except Exception as e:
             logger.warning(f"Failed to compute {metric_type} for subgroup {subgroup_name}: {e}")
 
+    # Compute GUID counts for legend labels
+    subgroup_guid_counts = {}
+    for name, filt in subgroup_filters.items():
+        try:
+            subgroup_guid_counts[name] = int(df[filt(df)]['guid'].nunique())
+        except Exception:
+            subgroup_guid_counts[name] = 0
+
     if len(subgroup_metrics) == 0:
         logger.warning(f"No valid subgroup metrics computed for {metric_type}")
         return {}
 
     # Create comparison plots by category
-    _plot_diagnosis_comparison(subgroup_metrics, metric_type, output_dir, title_suffix)
-    _plot_cs_stratification(subgroup_metrics, metric_type, output_dir, title_suffix)
-    _plot_bg_stratification(subgroup_metrics, metric_type, output_dir, title_suffix)
-    _plot_healthy_subgroups(subgroup_metrics, metric_type, output_dir, title_suffix)
+    _plot_diagnosis_comparison(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
+    _plot_cs_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
+    _plot_bg_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
+    _plot_healthy_subgroups(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
 
     logger.info(f"Subgroup analysis plots generated for {metric_type}")
     return subgroup_metrics
@@ -2968,7 +3027,8 @@ def _plot_diagnosis_comparison(
     subgroup_metrics: Dict[str, pd.DataFrame],
     metric_type: str,
     output_dir: Path,
-    title_suffix: str
+    title_suffix: str,
+    subgroup_guid_counts: Optional[Dict[str, int]] = None
 ) -> None:
     """Plot comparison of basic diagnosis subgroups (healthy, acidosis, hie, unhealthy)."""
     import matplotlib.pyplot as plt
@@ -2986,8 +3046,10 @@ def _plot_diagnosis_comparison(
         df = subgroup_metrics[group]
         valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
         if len(valid_df) > 0:
+            n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+            label = f"{group.capitalize()} (N={n})" if n > 0 else group.capitalize()
             ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
-                   marker='o', label=group.capitalize(), linewidth=2.5,
+                   marker='o', label=label, linewidth=2.5,
                    color=colors.get(group, None), markersize=6)
 
     ax.set_xlabel('Hours Before Birth', fontsize=13)
@@ -3010,7 +3072,8 @@ def _plot_cs_stratification(
     subgroup_metrics: Dict[str, pd.DataFrame],
     metric_type: str,
     output_dir: Path,
-    title_suffix: str
+    title_suffix: str,
+    subgroup_guid_counts: Optional[Dict[str, int]] = None
 ) -> None:
     """Plot CS stratification for unhealthy, HIE, and Acidosis separately."""
     import matplotlib.pyplot as plt
@@ -3033,7 +3096,9 @@ def _plot_cs_stratification(
             df = subgroup_metrics[group]
             valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
-                label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                base_label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+                label = f"{base_label} (N={n})" if n > 0 else base_label
                 color = colors['pos'] if 'pos' in group else colors['neg']
                 ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
                        marker='o', label=label, linewidth=2.5,
@@ -3060,7 +3125,8 @@ def _plot_bg_stratification(
     subgroup_metrics: Dict[str, pd.DataFrame],
     metric_type: str,
     output_dir: Path,
-    title_suffix: str
+    title_suffix: str,
+    subgroup_guid_counts: Optional[Dict[str, int]] = None
 ) -> None:
     """Plot BG stratification for Acidosis only (all HIE are bg_positive)."""
     import matplotlib.pyplot as plt
@@ -3078,7 +3144,9 @@ def _plot_bg_stratification(
         df = subgroup_metrics[group]
         valid_df = df[df['sensitivity'].notna()].sort_values('bin_center', ascending=False)
         if len(valid_df) > 0:
-            label = 'BG Positive' if 'pos' in group else 'BG Negative'
+            base_label = 'BG Positive' if 'pos' in group else 'BG Negative'
+            n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+            label = f"{base_label} (N={n})" if n > 0 else base_label
             color = colors['pos'] if 'pos' in group else colors['neg']
             ax.plot(valid_df['bin_center'], valid_df['sensitivity'],
                    marker='o', label=label, linewidth=2.5,
@@ -3104,7 +3172,8 @@ def _plot_healthy_subgroups(
     subgroup_metrics: Dict[str, pd.DataFrame],
     metric_type: str,
     output_dir: Path,
-    title_suffix: str
+    title_suffix: str,
+    subgroup_guid_counts: Optional[Dict[str, int]] = None
 ) -> None:
     """
     Plot healthy subgroup stratifications (CS, BG, and combinations).
@@ -3128,7 +3197,9 @@ def _plot_healthy_subgroups(
             # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
             valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
-                label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                base_label = 'CS Positive' if 'pos' in group else 'CS Negative'
+                n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+                label = f"{base_label} (N={n})" if n > 0 else base_label
                 color = colors['pos'] if 'pos' in group else colors['neg']
                 ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
@@ -3162,7 +3233,9 @@ def _plot_healthy_subgroups(
             # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
             valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
-                label = 'BG Positive' if 'pos' in group else 'BG Negative'
+                base_label = 'BG Positive' if 'pos' in group else 'BG Negative'
+                n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+                label = f"{base_label} (N={n})" if n > 0 else base_label
                 color = colors['pos'] if 'pos' in group else colors['neg']
                 ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
@@ -3197,7 +3270,9 @@ def _plot_healthy_subgroups(
             # For healthy subgroups, use SPECIFICITY (not sensitivity which is NaN)
             valid_df = df[df['specificity'].notna()].sort_values('bin_center', ascending=False)
             if len(valid_df) > 0:
-                label = group.replace('healthy_', '').replace('_', ' ').upper()
+                base_label = group.replace('healthy_', '').replace('_', ' ').upper()
+                n = subgroup_guid_counts.get(group, 0) if subgroup_guid_counts else 0
+                label = f"{base_label} (N={n})" if n > 0 else base_label
                 ax.plot(valid_df['bin_center'], valid_df['specificity'],
                        marker='o', label=label, linewidth=2.5,
                        color=colors[i % len(colors)], markersize=6)
@@ -3822,6 +3897,23 @@ def aggregate_existing_results(
 
             # Add to fold results
             fold_results['three_metric_results_full'] = three_metric_results
+
+            # Also regenerate validation metrics if validation CSV exists
+            val_raw_path = evaluation_dir / "validation_predictions_raw.csv"
+            if val_raw_path.exists():
+                try:
+                    val_df_raw = pd.read_csv(val_raw_path)
+                    val_three_metric_results = generate_three_metric_type_analysis(
+                        val_df_raw,
+                        thresholds=regen_thresholds,
+                        output_base_dir=evaluation_dir / "validation_evaluation",
+                        exclude_last_minutes=exclude_last_minutes,
+                        title_suffix=f"Fold {fold_id} — Validation",
+                    )
+                    fold_results['val_three_metric_results_full'] = val_three_metric_results
+                except Exception as val_exc:
+                    logger.warning(f"Fold {fold_id}: Validation regeneration failed: {val_exc}")
+
             all_fold_results.append(fold_results)
             loaded_folds.append(fold_id)
             logger.info(f"Fold {fold_id}: Regenerated and loaded")
@@ -3850,6 +3942,12 @@ def aggregate_existing_results(
     logger.info("")
     generate_aggregated_plots(all_fold_results, output_base_dir, len(all_fold_results))
 
+    # Generate validation aggregated plots (if fold results contain validation data)
+    val_fold_results = [r for r in all_fold_results if r.get('val_three_metric_results_full')]
+    if val_fold_results:
+        logger.info("Generating validation aggregated plots from {} folds...", len(val_fold_results))
+        generate_aggregated_plots(val_fold_results, output_base_dir, len(val_fold_results), data_source="validation")
+
     logger.info("")
     logger.info("="*80)
     logger.info("AGGREGATION COMPLETE")
@@ -3857,6 +3955,8 @@ def aggregate_existing_results(
     logger.info(f"Loaded folds: {len(loaded_folds)} {loaded_folds}")
     logger.info(f"Missing data: {len(missing_data_folds)} {missing_data_folds}")
     logger.info(f"Aggregated plots saved to: {output_base_dir / 'aggregated_plots'}")
+    if val_fold_results:
+        logger.info(f"Validation aggregated plots saved to: {output_base_dir / 'validation_aggregated_plots'}")
     logger.info("="*80)
 
     return {
@@ -4357,7 +4457,8 @@ def _evaluate_single_fold(
         # Include full three metric type analysis (summary only - DataFrames saved separately)
         'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {},
         # Store full results including DataFrames for aggregated plotting
-        'three_metric_results_full': three_metric_results if three_metric_results else {}
+        'three_metric_results_full': three_metric_results if three_metric_results else {},
+        'val_three_metric_results_full': val_three_metric_results if val_three_metric_results else {},
     }
 
     # Save fold results
@@ -4386,6 +4487,27 @@ def _evaluate_single_fold(
             }
 
         fold_results_json['three_metric_results_full'] = three_metric_full
+
+    # Convert val_three_metric_results_full DataFrames to dicts
+    if 'val_three_metric_results_full' in fold_results_json and fold_results_json['val_three_metric_results_full']:
+        val_three_metric_full = fold_results_json['val_three_metric_results_full'].copy()
+
+        if 'metrics_dict' in val_three_metric_full:
+            val_three_metric_full['metrics_dict'] = {
+                k: v.to_dict('records') if v is not None else None
+                for k, v in val_three_metric_full['metrics_dict'].items()
+            }
+
+        if 'subgroup_metrics' in val_three_metric_full:
+            val_three_metric_full['subgroup_metrics'] = {
+                metric_type: {
+                    subgroup: df.to_dict('records') if df is not None else None
+                    for subgroup, df in subgroups.items()
+                }
+                for metric_type, subgroups in val_three_metric_full['subgroup_metrics'].items()
+            }
+
+        fold_results_json['val_three_metric_results_full'] = val_three_metric_full
 
     with open(results_path, 'w') as f:
         json.dump(convert_numpy_types(fold_results_json), f, indent=2)
@@ -5062,7 +5184,8 @@ def plot_aggregated_subgroup_comparison(
 def generate_aggregated_plots(
     all_fold_results: List[Dict],
     output_base_dir: Path,
-    n_folds: int
+    n_folds: int,
+    data_source: str = "test",
 ):
     """
     Generate aggregated plots across all folds for all three metric types and subgroups.
@@ -5071,18 +5194,23 @@ def generate_aggregated_plots(
         all_fold_results: List of fold result dictionaries
         output_base_dir: Base output directory
         n_folds: Total number of folds
+        data_source: Source of data to aggregate ("test" or "validation").
+            Controls which key is read from fold results and the output
+            directory name.
     """
     logger.info("="*80)
-    logger.info("GENERATING AGGREGATED PLOTS ACROSS FOLDS")
+    logger.info("GENERATING AGGREGATED PLOTS ACROSS FOLDS ({})", data_source)
     logger.info("="*80)
 
-    aggregated_dir = output_base_dir / "aggregated_plots"
+    dir_name = "validation_aggregated_plots" if data_source == "validation" else "aggregated_plots"
+    aggregated_dir = output_base_dir / dir_name
     aggregated_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract three_metric_results_full from each fold and reconstruct DataFrames
+    data_key = "val_three_metric_results_full" if data_source == "validation" else "three_metric_results_full"
     fold_analyses = []
     for r in all_fold_results:
-        three_metric_full = r.get('three_metric_results_full', {})
+        three_metric_full = r.get(data_key, {})
         if not three_metric_full:
             continue
 
@@ -5110,8 +5238,8 @@ def generate_aggregated_plots(
             fold_analyses.append(reconstructed)
 
     if not fold_analyses:
-        logger.warning("No three_metric_results_full data found in fold results. " +
-                      "Please re-run evaluation to generate plots, or use aggregate_existing_results().")
+        logger.warning("No {} data found in fold results. " +
+                      "Please re-run evaluation to generate plots, or use aggregate_existing_results().", data_key)
         return
 
     # Aggregate and plot each metric type
