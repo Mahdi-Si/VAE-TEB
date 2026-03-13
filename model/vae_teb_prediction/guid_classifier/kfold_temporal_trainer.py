@@ -742,6 +742,13 @@ def run_kfold_temporal_parallel(
                     artifact_path="aggregated_plots",
                 )
 
+            val_aggregated_plots_dir = Path(output_base_dir) / "validation_aggregated_plots"
+            if val_aggregated_plots_dir.exists():
+                mlflow_client.log_artifacts(
+                    parent_run_id, str(val_aggregated_plots_dir),
+                    artifact_path="validation_aggregated_plots",
+                )
+
             # Terminate the parent run
             mlflow_client.set_terminated(parent_run_id)
             logger.info("Parent MLflow run terminated: {}", parent_run_id)
@@ -849,6 +856,28 @@ def aggregate_temporal_results(
         logger.error("generate_aggregated_plots failed: {}", exc)
         logger.error(traceback.format_exc())
 
+    # --- Generate validation aggregated plots ----------------------------------
+    has_val_data = any(r.get("val_three_metric_results_full") for r in successful)
+    if has_val_data:
+        try:
+            from model.vae_teb_prediction.evaluate_classifier import (
+                generate_aggregated_plots,
+            )
+
+            val_fold_results = [r for r in successful if r.get("val_three_metric_results_full")]
+            generate_aggregated_plots(
+                all_fold_results=val_fold_results,
+                output_base_dir=output_base_dir,
+                n_folds=len(val_fold_results),
+                data_source="validation",
+            )
+            logger.info(
+                "Validation aggregated plots saved to: {}",
+                output_base_dir / "validation_aggregated_plots",
+            )
+        except Exception as exc:
+            logger.error("Validation generate_aggregated_plots failed: {}", exc)
+
     # --- Compute aggregated statistics -----------------------------------------
     from model.vae_teb_prediction.guid_classifier.evaluate_temporal_classifier import (
         _aggregate_temporal_results,
@@ -860,6 +889,16 @@ def aggregate_temporal_results(
     agg_path = output_base_dir / "aggregated_results.json"
     with open(agg_path, "w") as f:
         json.dump(_serialise(aggregated), f, indent=2)
+
+    # Save validation aggregated results if available
+    if has_val_data:
+        val_successful = [r for r in successful if r.get("val_three_metric_results_full")]
+        val_aggregated = _aggregate_temporal_results(val_successful)
+        val_aggregated["successful_folds"] = [r["fold_id"] for r in val_successful]
+        val_agg_path = output_base_dir / "validation_aggregated_results.json"
+        with open(val_agg_path, "w") as f:
+            json.dump(_serialise(val_aggregated), f, indent=2)
+        logger.info("Validation aggregated results saved to: {}", val_agg_path)
 
     logger.info("Aggregated results saved to: {}", agg_path)
     return aggregated

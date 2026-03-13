@@ -731,6 +731,7 @@ def evaluate_single_fold_temporal(
             three_metric_results.get("summary", {}) if three_metric_results else {}
         ),
         "three_metric_results_full": three_metric_results if three_metric_results else {},
+        "val_three_metric_results_full": val_three_metric_results if val_three_metric_results else {},
     }
 
     # Serialise fold results (convert DataFrames to dicts for JSON)
@@ -752,6 +753,25 @@ def evaluate_single_fold_temporal(
                 for mt, sgs in tmr_copy["subgroup_metrics"].items()
             }
         fold_results_json["three_metric_results_full"] = tmr_copy
+
+    # Serialise val_three_metric_results_full
+    val_tmr_full = fold_results_json.get("val_three_metric_results_full", {})
+    if val_tmr_full:
+        val_tmr_copy = val_tmr_full.copy()
+        if "metrics_dict" in val_tmr_copy:
+            val_tmr_copy["metrics_dict"] = {
+                k: v.to_dict("records") if v is not None else None
+                for k, v in val_tmr_copy["metrics_dict"].items()
+            }
+        if "subgroup_metrics" in val_tmr_copy:
+            val_tmr_copy["subgroup_metrics"] = {
+                mt: {
+                    sg: df.to_dict("records") if df is not None else None
+                    for sg, df in sgs.items()
+                }
+                for mt, sgs in val_tmr_copy["subgroup_metrics"].items()
+            }
+        fold_results_json["val_three_metric_results_full"] = val_tmr_copy
 
     results_path = fold_dir / "fold_results.json"
     with open(results_path, "w") as f:
