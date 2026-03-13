@@ -17,8 +17,12 @@ Typical single-fold evaluation::
 
 from __future__ import annotations
 
+import gc
 import json
+import multiprocessing
 import os
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -566,6 +570,39 @@ def evaluate_single_fold_temporal(
     val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
     val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
 
+    # --- Validation three-metric-type analysis (verify thresholds) ----------
+    logger.info("Fold {}: Generating validation three metric type analysis...", fold_id)
+    val_three_metric_results = {}
+    try:
+        val_three_metric_results = generate_three_metric_type_analysis(
+            val_df_raw,
+            thresholds=all_thresholds,
+            output_base_dir=evaluation_dir / "validation_evaluation",
+            exclude_last_minutes=exclude_last_minutes,
+            title_suffix=f"Temporal Fold {fold_id} — Validation",
+            max_gap_multiplier=max_gap_multiplier,
+            decision_time_hours=decision_time_hours,
+        )
+        # Log validation FPR at decision point for each metric type
+        val_dp = val_three_metric_results.get("decision_point_metrics", {})
+        for mt in ("committed_overall", "committed_cumulative", "instantaneous"):
+            mt_dp = val_dp.get(mt, {})
+            fpr_val = mt_dp.get("fpr_at_decision", "N/A")
+            sens_val = mt_dp.get("sensitivity_at_decision", "N/A")
+            logger.info(
+                "Fold {}: VALIDATION {} — FPR@{}h={}, Sens@{}h={} (target_fpr={})",
+                fold_id, mt, decision_time_hours, fpr_val,
+                decision_time_hours, sens_val, target_fpr,
+            )
+        logger.info("Fold {}: Validation three metric type analysis complete", fold_id)
+    except Exception as e:
+        logger.warning("Fold {}: Validation three metric type analysis failed: {}", fold_id, e)
+
+    val_decision_point = (
+        val_three_metric_results.get("decision_point_metrics", {})
+        if val_three_metric_results else {}
+    )
+
     # --- Test predictions ---------------------------------------------------
     test_raw_path = evaluation_dir / "test_predictions_raw.csv"
     if test_raw_path.exists() and not regenerate_predictions:
@@ -656,6 +693,7 @@ def evaluate_single_fold_temporal(
             "accuracy": float(threshold_metrics.get("accuracy", 0)),
             "time_window_hours": float(decision_time_hours),
         },
+        "validation_decision_point_metrics": val_decision_point,
         "test_metrics_primary": primary_metrics,
         "decision_point_metrics": decision_point,
         "roc_auc": roc_data.get("auc"),
@@ -672,6 +710,7 @@ def evaluate_single_fold_temporal(
         "validation_specificity": float(threshold_metrics.get("specificity", 0)),
         "validation_fpr": float(threshold_metrics.get("fpr", 0)),
         "validation_accuracy": float(threshold_metrics.get("accuracy", 0)),
+        "validation_decision_point_metrics": val_decision_point,
         # Mean across ALL time bins (backward compatible)
         "test_sensitivity_mean": primary_metrics.get("test_sensitivity_mean", 0.0),
         "test_sensitivity_std": primary_metrics.get("test_sensitivity_std", 0.0),
@@ -723,6 +762,98 @@ def evaluate_single_fold_temporal(
 
 
 # ---------------------------------------------------------------------------
+#  Subprocess entry point for parallel evaluation
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_single_fold_subprocess(
+    fold_dir: str,
+    gpu_id: int,
+    config_path: str,
+    target_fpr: float,
+    exclude_last_minutes: float,
+    decision_time_hours: float,
+    max_gap_multiplier: Optional[float],
+    regenerate_predictions: bool,
+    allow_backward_compat: bool,
+) -> Dict:
+    """Evaluate a single fold in a subprocess with GPU isolation.
+
+    This function is designed to be called via
+    :class:`concurrent.futures.ProcessPoolExecutor` with a ``'spawn'``
+    context.  It sets ``CUDA_VISIBLE_DEVICES`` **before** any CUDA
+    initialisation so the subprocess only sees the assigned GPU.
+
+    Args:
+        fold_dir: Path to the fold directory (e.g. ``/path/to/fold_1``).
+        gpu_id: Physical GPU ID to use for this fold.
+        config_path: Path to ``config_temporal.yaml`` (or fold-local
+            ``config.yaml``).
+        target_fpr: Target FPR for threshold optimisation.
+        exclude_last_minutes: Minutes to exclude from time-based analysis.
+        decision_time_hours: Decision time (hours before birth).
+        max_gap_multiplier: Gap multiplier for epoch filling.
+        regenerate_predictions: Force-regenerate predictions even if cached.
+        allow_backward_compat: Allow partial loading of older checkpoints.
+
+    Returns:
+        Dict with fold evaluation results.  On failure, contains
+        ``"status": "failed"`` with error details.
+    """
+    # Set CUDA_VISIBLE_DEVICES FIRST, before any CUDA init
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    fold_path = Path(fold_dir)
+    fold_id = int(fold_path.name.split("_")[1])
+    pid = os.getpid()
+    logger.info(
+        "Fold {} starting on GPU {} (pid={})...",
+        fold_id, gpu_id, pid,
+    )
+
+    try:
+        # Load config — prefer fold-local config, fall back to global
+        fold_config_path = fold_path / "config.yaml"
+        cfg_to_load = str(fold_config_path) if fold_config_path.exists() else config_path
+        with open(cfg_to_load) as f:
+            fold_config = yaml.safe_load(f)
+
+        # Inside subprocess, device is always cuda:0 (the only visible GPU)
+        fold_results = evaluate_single_fold_temporal(
+            fold_dir=fold_dir,
+            config=fold_config,
+            device="cuda:0",
+            target_fpr=target_fpr,
+            exclude_last_minutes=exclude_last_minutes,
+            decision_time_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
+            regenerate_predictions=regenerate_predictions,
+            allow_backward_compat=allow_backward_compat,
+        )
+        fold_results["gpu_id"] = gpu_id
+        logger.info(
+            "Fold {} COMPLETED on GPU {} (pid={})",
+            fold_id, gpu_id, pid,
+        )
+        return fold_results
+
+    except Exception as exc:
+        logger.exception("Fold {} FAILED on GPU {} (pid={}):", fold_id, gpu_id, pid)
+        return {
+            "fold_id": fold_id,
+            "gpu_id": gpu_id,
+            "status": "failed",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+
+# ---------------------------------------------------------------------------
 #  Main entry point
 # ---------------------------------------------------------------------------
 
@@ -739,11 +870,16 @@ def main(
     regenerate_predictions: bool = False,
     allow_backward_compat: Optional[bool] = None,
     aggregate_only: bool = False,
+    gpu_ids: Optional[List[int]] = None,
+    max_parallel: Optional[int] = None,
+    sequential: bool = False,
+    fold_timeout_hours: float = 2.0,
 ) -> Dict:
     """Run the temporal evaluation pipeline on all completed folds.
 
     Mirrors ``evaluate_classifier.main`` but uses temporal inference and
-    temporal model loading.
+    temporal model loading.  Supports parallel multi-GPU evaluation when
+    ``gpu_ids`` is provided.
 
     Args:
         output_base_dir: Base directory containing ``fold_1/``, ``fold_2/``,
@@ -752,7 +888,8 @@ def main(
             evaluation settings are read from config.  Explicit parameters
             override config values.
         target_fpr: Target FPR for threshold optimisation.
-        device: CUDA device.
+        device: CUDA device (used only in legacy sequential mode when
+            ``gpu_ids`` is ``None``).
         exclude_last_minutes: Minutes to exclude from time-based analysis.
         max_gap_multiplier: Gap multiplier for epoch filling.
         decision_time_hours: Decision time (hours before birth).
@@ -763,6 +900,15 @@ def main(
         aggregate_only: If ``True``, skip per-fold inference and load existing
             ``fold_results.json`` from each fold directory.  Only runs
             cross-fold aggregation and plot generation.  Default ``False``.
+        gpu_ids: List of GPU device IDs for parallel dispatch (e.g.
+            ``[0, 1, 2, 3]``).  ``None`` falls back to legacy sequential
+            mode using ``device``.
+        max_parallel: Maximum number of concurrent fold evaluation workers.
+            Defaults to ``min(len(gpu_ids), len(fold_dirs))``.
+        sequential: If ``True`` with ``gpu_ids`` set, run folds sequentially
+            through the subprocess path (useful for debugging GPU isolation).
+        fold_timeout_hours: Timeout in hours for parallel ``as_completed``.
+            Defaults to 2.0.
 
     Returns:
         Dict with aggregated results across all folds.
@@ -874,37 +1020,156 @@ def main(
     successful_folds: List[int] = []
     failed_folds: List[int] = []
 
-    for fold_dir in fold_dirs:
-        fold_id = int(fold_dir.name.split("_")[1])
-        try:
-            # Load fold-specific config if available
-            fold_config_path = fold_dir / "config.yaml"
-            if fold_config_path.exists():
-                with open(fold_config_path) as f:
-                    fold_config = yaml.safe_load(f)
-            else:
-                fold_config = config
+    # Resolve config_path to absolute string for subprocess serialisation
+    resolved_config_path: Optional[str] = None
+    if config_path:
+        resolved_config_path = str(Path(config_path).resolve())
 
-            fold_results = evaluate_single_fold_temporal(
+    # Common kwargs for subprocess entry point
+    subprocess_kwargs = dict(
+        config_path=resolved_config_path or "",
+        target_fpr=target_fpr,
+        exclude_last_minutes=exclude_last_minutes,
+        decision_time_hours=decision_time_hours,
+        max_gap_multiplier=max_gap_multiplier,
+        regenerate_predictions=regenerate_predictions,
+        allow_backward_compat=allow_backward_compat,
+    )
+
+    use_parallel = (
+        gpu_ids is not None
+        and not sequential
+        and (max_parallel is None or max_parallel > 1)
+    )
+
+    if gpu_ids is not None and not use_parallel:
+        # ----- Branch B: Sequential with GPU isolation (debug mode) --------
+        logger.info("Running folds sequentially with GPU isolation...")
+        n_total = len(fold_dirs)
+        for job_idx, fold_dir in enumerate(fold_dirs):
+            fold_id = int(fold_dir.name.split("_")[1])
+            gpu_id = gpu_ids[job_idx % len(gpu_ids)]
+            result = _evaluate_single_fold_subprocess(
                 fold_dir=str(fold_dir),
-                config=fold_config,
-                device=device,
-                target_fpr=target_fpr,
-                exclude_last_minutes=exclude_last_minutes,
-                decision_time_hours=decision_time_hours,
-                max_gap_multiplier=max_gap_multiplier,
-                regenerate_predictions=regenerate_predictions,
-                allow_backward_compat=allow_backward_compat,
+                gpu_id=gpu_id,
+                **subprocess_kwargs,
             )
-            all_fold_results.append(fold_results)
-            successful_folds.append(fold_id)
-            logger.info("Fold {}: COMPLETED SUCCESSFULLY", fold_id)
+            if result.get("status") == "failed":
+                logger.error(
+                    "Fold {}: FAILED — {}",
+                    fold_id, result.get("error", "unknown"),
+                )
+                failed_folds.append(fold_id)
+            else:
+                all_fold_results.append(result)
+                successful_folds.append(fold_id)
+                logger.info(
+                    "Fold {}: COMPLETED ({}/{} folds done)",
+                    fold_id, job_idx + 1, n_total,
+                )
 
-        except Exception as e:
-            logger.error("Fold {}: FAILED with error: {}", fold_id, e)
-            import traceback
-            logger.error(traceback.format_exc())
-            failed_folds.append(fold_id)
+    elif use_parallel:
+        # ----- Branch A: Parallel multi-GPU dispatch -----------------------
+        effective_max_parallel = (
+            min(len(gpu_ids), len(fold_dirs))
+            if max_parallel is None
+            else max(1, min(max_parallel, len(fold_dirs)))
+        )
+        logger.info(
+            "Running folds in parallel (GPUs={}, max_workers={})...",
+            gpu_ids, effective_max_parallel,
+        )
+
+        spawn_ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=effective_max_parallel, mp_context=spawn_ctx,
+        ) as executor:
+            futures = {}
+            for job_idx, fold_dir in enumerate(fold_dirs):
+                gpu_id = gpu_ids[job_idx % len(gpu_ids)]
+                future = executor.submit(
+                    _evaluate_single_fold_subprocess,
+                    fold_dir=str(fold_dir),
+                    gpu_id=gpu_id,
+                    **subprocess_kwargs,
+                )
+                futures[future] = int(fold_dir.name.split("_")[1])
+
+            n_done = 0
+            n_total = len(futures)
+            try:
+                for future in as_completed(
+                    futures, timeout=fold_timeout_hours * 3600,
+                ):
+                    fold_id = futures[future]
+                    try:
+                        result = future.result()
+                        if result.get("status") == "failed":
+                            logger.error(
+                                "Fold {}: FAILED — {}",
+                                fold_id, result.get("error", "unknown"),
+                            )
+                            failed_folds.append(fold_id)
+                        else:
+                            all_fold_results.append(result)
+                            successful_folds.append(fold_id)
+                        n_done += 1
+                        logger.info(
+                            "Fold {}: done ({}/{} folds complete)",
+                            fold_id, n_done, n_total,
+                        )
+                    except Exception as exc:
+                        logger.exception("Fold {} raised exception:", fold_id)
+                        failed_folds.append(fold_id)
+                        n_done += 1
+            except TimeoutError:
+                timed_out_folds = [
+                    fid for fut, fid in futures.items() if not fut.done()
+                ]
+                logger.error(
+                    "Parallel evaluation timed out after {:.1f}h — "
+                    "{} fold(s) did not complete: {}",
+                    fold_timeout_hours,
+                    len(timed_out_folds),
+                    timed_out_folds,
+                )
+                for future, fid in futures.items():
+                    if not future.done():
+                        future.cancel()
+                        failed_folds.append(fid)
+
+    else:
+        # ----- Branch C: Legacy sequential (no GPU isolation) --------------
+        for fold_dir in fold_dirs:
+            fold_id = int(fold_dir.name.split("_")[1])
+            try:
+                # Load fold-specific config if available
+                fold_config_path = fold_dir / "config.yaml"
+                if fold_config_path.exists():
+                    with open(fold_config_path) as f:
+                        fold_config = yaml.safe_load(f)
+                else:
+                    fold_config = config
+
+                fold_results = evaluate_single_fold_temporal(
+                    fold_dir=str(fold_dir),
+                    config=fold_config,
+                    device=device,
+                    target_fpr=target_fpr,
+                    exclude_last_minutes=exclude_last_minutes,
+                    decision_time_hours=decision_time_hours,
+                    max_gap_multiplier=max_gap_multiplier,
+                    regenerate_predictions=regenerate_predictions,
+                    allow_backward_compat=allow_backward_compat,
+                )
+                all_fold_results.append(fold_results)
+                successful_folds.append(fold_id)
+                logger.info("Fold {}: COMPLETED SUCCESSFULLY", fold_id)
+
+            except Exception as e:
+                logger.error("Fold {}: FAILED with error: {}", fold_id, e)
+                logger.error(traceback.format_exc())
+                failed_folds.append(fold_id)
 
     # Aggregate results and generate cross-fold plots through the same helper
     # used by the k-fold trainer so standalone evaluation and training share
@@ -991,9 +1256,10 @@ def _aggregate_temporal_results(all_fold_results: List[Dict]) -> Dict:
         "test_fpr_std": tf_s,
     }
 
-    # Aggregate decision-point metrics per metric type
+    # Aggregate decision-point metrics per metric type (test AND validation)
     metric_types = ['instantaneous', 'committed_cumulative', 'committed_overall']
     for mt in metric_types:
+        # --- Test decision-point metrics ---
         fpr_vals = []
         sens_vals = []
         thresh_vals = []
@@ -1019,6 +1285,25 @@ def _aggregate_temporal_results(all_fold_results: List[Dict]) -> Dict:
             m, s = _mean_std(thresh_vals)
             result[f"threshold_{mt}_mean"] = m
             result[f"threshold_{mt}_std"] = s
+
+        # --- Validation decision-point metrics ---
+        val_fpr_vals = []
+        val_sens_vals = []
+        for r in all_fold_results:
+            vdp = r.get("validation_decision_point_metrics", {}).get(mt, {})
+            if vdp.get("fpr_at_decision") is not None:
+                val_fpr_vals.append(vdp["fpr_at_decision"])
+            if vdp.get("sensitivity_at_decision") is not None:
+                val_sens_vals.append(vdp["sensitivity_at_decision"])
+
+        if val_fpr_vals:
+            m, s = _mean_std(val_fpr_vals)
+            result[f"val_fpr_at_decision_{mt}_mean"] = m
+            result[f"val_fpr_at_decision_{mt}_std"] = s
+        if val_sens_vals:
+            m, s = _mean_std(val_sens_vals)
+            result[f"val_sensitivity_at_decision_{mt}_mean"] = m
+            result[f"val_sensitivity_at_decision_{mt}_std"] = s
 
     # Aggregate ROC AUC
     roc_aucs = _safe_collect("roc_auc")
@@ -1057,6 +1342,13 @@ if __name__ == "__main__":
     REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
     AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots
 
+    # Parallel evaluation settings (read from config, overridable here)
+    _general_cfg = _cfg.get("general_config", {})
+    GPU_IDS = _general_cfg.get("cuda_devices", None)      # e.g. [0,1,2,3,4]
+    MAX_PARALLEL = _general_cfg.get("max_parallel_folds", None)  # e.g. 5
+    SEQUENTIAL = False      # Set True to debug subprocess path without parallelism
+    FOLD_TIMEOUT_HOURS = 2.0
+
     # ======================================================================
     # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
     # ======================================================================
@@ -1067,6 +1359,10 @@ if __name__ == "__main__":
             device=DEVICE,
             regenerate_predictions=REGENERATE_PREDICTIONS,
             aggregate_only=False,
+            gpu_ids=GPU_IDS,
+            max_parallel=MAX_PARALLEL,
+            sequential=SEQUENTIAL,
+            fold_timeout_hours=FOLD_TIMEOUT_HOURS,
             # Optional overrides (uncomment to override config values):
             # target_fpr=0.15,
             # exclude_last_minutes=30.0,
