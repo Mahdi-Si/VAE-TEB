@@ -776,6 +776,7 @@ def _evaluate_single_fold_subprocess(
     max_gap_multiplier: Optional[float],
     regenerate_predictions: bool,
     allow_backward_compat: bool,
+    ignore_fold_config: bool = False,
 ) -> Dict:
     """Evaluate a single fold in a subprocess with GPU isolation.
 
@@ -795,6 +796,8 @@ def _evaluate_single_fold_subprocess(
         max_gap_multiplier: Gap multiplier for epoch filling.
         regenerate_predictions: Force-regenerate predictions even if cached.
         allow_backward_compat: Allow partial loading of older checkpoints.
+        ignore_fold_config: If ``True``, always use the global
+            ``config_path`` and skip fold-local ``config.yaml`` files.
 
     Returns:
         Dict with fold evaluation results.  On failure, contains
@@ -812,9 +815,12 @@ def _evaluate_single_fold_subprocess(
     )
 
     try:
-        # Load config — prefer fold-local config, fall back to global
+        # Load config — prefer fold-local config unless ignored
         fold_config_path = fold_path / "config.yaml"
-        cfg_to_load = str(fold_config_path) if fold_config_path.exists() else config_path
+        if ignore_fold_config or not fold_config_path.exists():
+            cfg_to_load = config_path
+        else:
+            cfg_to_load = str(fold_config_path)
         with open(cfg_to_load) as f:
             fold_config = yaml.safe_load(f)
 
@@ -874,6 +880,7 @@ def main(
     max_parallel: Optional[int] = None,
     sequential: bool = False,
     fold_timeout_hours: float = 2.0,
+    ignore_fold_config: bool = False,
 ) -> Dict:
     """Run the temporal evaluation pipeline on all completed folds.
 
@@ -909,6 +916,10 @@ def main(
             through the subprocess path (useful for debugging GPU isolation).
         fold_timeout_hours: Timeout in hours for parallel ``as_completed``.
             Defaults to 2.0.
+        ignore_fold_config: If ``True``, always use the global
+            ``config_path`` instead of fold-local ``config.yaml`` files.
+            Useful when re-evaluating with changed config settings (e.g.
+            different ``epoch_min``).  Default ``False``.
 
     Returns:
         Dict with aggregated results across all folds.
@@ -983,6 +994,8 @@ def main(
     logger.info("Decision time: {}h", decision_time_hours)
     logger.info("Exclude last minutes: {}", exclude_last_minutes)
     logger.info("Backward-compatible checkpoint loading: {}", allow_backward_compat)
+    if ignore_fold_config:
+        logger.info("Ignoring fold-local configs — using global config_path")
 
     # Discover fold directories
     all_fold_dirs = sorted(
@@ -1034,6 +1047,7 @@ def main(
         max_gap_multiplier=max_gap_multiplier,
         regenerate_predictions=regenerate_predictions,
         allow_backward_compat=allow_backward_compat,
+        ignore_fold_config=ignore_fold_config,
     )
 
     use_parallel = (
@@ -1143,9 +1157,9 @@ def main(
         for fold_dir in fold_dirs:
             fold_id = int(fold_dir.name.split("_")[1])
             try:
-                # Load fold-specific config if available
+                # Load fold-specific config unless ignored
                 fold_config_path = fold_dir / "config.yaml"
-                if fold_config_path.exists():
+                if not ignore_fold_config and fold_config_path.exists():
                     with open(fold_config_path) as f:
                         fold_config = yaml.safe_load(f)
                 else:
@@ -1341,13 +1355,14 @@ if __name__ == "__main__":
     DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
     REGENERATE_PREDICTIONS = False  # Set to True to regenerate all predictions
     AGGREGATE_ONLY = False  # Set to True to only generate aggregated plots
+    IGNORE_FOLD_CONFIG = False  # Set to True to use global config instead of fold-local configs
 
     # Parallel evaluation settings (read from config, overridable here)
     _general_cfg = _cfg.get("general_config", {})
     GPU_IDS = _general_cfg.get("cuda_devices", None)      # e.g. [0,1,2,3,4]
     MAX_PARALLEL = _general_cfg.get("max_parallel_folds", None)  # e.g. 5
     SEQUENTIAL = False      # Set True to debug subprocess path without parallelism
-    FOLD_TIMEOUT_HOURS = 2.0
+    FOLD_TIMEOUT_HOURS = 2.0   # time out for as_completed() in parallel processing
 
     # ======================================================================
     # MODE 1: Full Evaluation Pipeline (evaluate all folds + aggregate)
@@ -1363,6 +1378,7 @@ if __name__ == "__main__":
             max_parallel=MAX_PARALLEL,
             sequential=SEQUENTIAL,
             fold_timeout_hours=FOLD_TIMEOUT_HOURS,
+            ignore_fold_config=IGNORE_FOLD_CONFIG,
             # Optional overrides (uncomment to override config values):
             # target_fpr=0.15,
             # exclude_last_minutes=30.0,
