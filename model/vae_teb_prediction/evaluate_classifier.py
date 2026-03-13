@@ -4206,6 +4206,40 @@ def _evaluate_single_fold(
     val_df_clinical = fill_missing_epochs(val_df_clinical, max_gap_multiplier=max_gap_multiplier)
     val_df_clinical.to_csv(evaluation_dir / "validation_predictions_clinical.csv", index=False)
 
+    # --- Validation three-metric-type analysis (verify thresholds) ----------
+    logger.info(f"Fold {fold_id}: Generating validation three metric type analysis...")
+    val_three_metric_results = {}
+    try:
+        val_three_metric_results = generate_three_metric_type_analysis(
+            val_df_raw,
+            thresholds=all_thresholds,
+            output_base_dir=evaluation_dir / "validation_evaluation",
+            exclude_last_minutes=exclude_last_minutes,
+            title_suffix=f"Fold {fold_id} — Validation",
+            max_gap_multiplier=max_gap_multiplier,
+            decision_time_hours=decision_time_hours,
+        )
+        # Log validation FPR at decision point for each metric type
+        val_dp = val_three_metric_results.get("decision_point_metrics", {})
+        for mt in ("committed_overall", "committed_cumulative", "instantaneous"):
+            mt_dp = val_dp.get(mt, {})
+            fpr_val = mt_dp.get("fpr_at_decision", "N/A")
+            sens_val = mt_dp.get("sensitivity_at_decision", "N/A")
+            logger.info(
+                f"Fold {fold_id}: VALIDATION {mt} — "
+                f"FPR@{decision_time_hours}h={fpr_val}, "
+                f"Sens@{decision_time_hours}h={sens_val} "
+                f"(target_fpr={target_fpr})"
+            )
+        logger.info(f"Fold {fold_id}: Validation three metric type analysis complete")
+    except Exception as e:
+        logger.warning(f"Fold {fold_id}: Validation three metric type analysis failed: {e}")
+
+    val_decision_point = (
+        val_three_metric_results.get("decision_point_metrics", {})
+        if val_three_metric_results else {}
+    )
+
     # Load or generate test predictions
     if use_cached_test:
         logger.info(f"Fold {fold_id}: Loading cached test predictions from {test_raw_path}")
@@ -4288,6 +4322,7 @@ def _evaluate_single_fold(
             'accuracy': float(threshold_metrics.get('accuracy', 0)),
             'time_window_hours': float(threshold_metrics.get('time_window_hours', 1.0)),
         },
+        'validation_decision_point_metrics': val_decision_point,
         'test_metrics_primary': primary_metrics,
         'decision_point_metrics': decision_point,
         'roc_auc': roc_data.get('auc'),
@@ -4305,6 +4340,7 @@ def _evaluate_single_fold(
         'validation_specificity': float(threshold_metrics.get('specificity', 0)),
         'validation_fpr': float(threshold_metrics.get('fpr', 0)),
         'validation_accuracy': float(threshold_metrics.get('accuracy', 0)),
+        'validation_decision_point_metrics': val_decision_point,
         'test_sensitivity_mean': primary_metrics.get('test_sensitivity_mean', 0.0),
         'test_sensitivity_std': primary_metrics.get('test_sensitivity_std', 0.0),
         'test_specificity_mean': primary_metrics.get('test_specificity_mean', 0.0),
