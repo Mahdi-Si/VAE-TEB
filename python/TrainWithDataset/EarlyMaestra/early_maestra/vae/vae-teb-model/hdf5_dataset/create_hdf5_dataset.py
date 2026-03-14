@@ -1177,26 +1177,27 @@ def create_hdf5_dataset_from_records_list(
 
 def create_records(records_base_path_=None, output_base_path_=None, run_guid_analysis=False,
                    base_block_size=3520, overlap_percentage=1/11, labor_onset_csv_path=None,
-                   classification_pickle_path=None, pretraining_only=False):
+                   classification_pickle_path=None, dataset_mode="both"):
     """Create HDF5 datasets for VAE pre-training and/or classification.
 
     Orchestrates the full pipeline: file discovery, GUID pre-screening,
     class balancing, fold creation, and HDF5 dataset generation.
 
-    Modes of operation:
-        - ``pretraining_only=True``: Only creates VAE pre-training HDF5
-          files (train/test, CS/NoCS) from the healthy_bg subgroups using
-          a 90/10 split. No GUID pre-screening is performed. Requires
+    Modes of operation (controlled by ``dataset_mode``):
+        - ``"pretrain"``: Only creates VAE pre-training HDF5 files
+          (train/test, CS/NoCS) from the healthy_bg subgroups using a
+          90/10 split. No GUID pre-screening is performed. Requires
           ``records_base_path_``.
-        - ``classification_pickle_path`` provided: Loads pre-computed fold
-          assignments and creates classification HDF5 files, skipping file
-          discovery, pre-screening, class balancing, and fold creation.
-        - Default (both None/False): Runs the full pipeline from scratch.
+        - ``"classification"``: Only creates classification HDF5 files.
+          If ``classification_pickle_path`` is provided, loads pre-computed
+          fold assignments; otherwise runs the full pipeline from scratch.
+        - ``"both"`` (default): Creates the pre-training datasets first,
+          then continues with the classification pipeline.
 
     Args:
         records_base_path_: Root directory containing the 16 StudyGroup
-            subfolders. Required when ``pretraining_only=True`` or when
-            ``classification_pickle_path`` is None.
+            subfolders. Required when ``dataset_mode`` includes pre-training
+            or when ``classification_pickle_path`` is None.
         output_base_path_: Directory where HDF5 datasets and the pickle
             file are written.
         run_guid_analysis: If True, run per-GUID coverage analysis on the
@@ -1210,13 +1211,14 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             ``classification_dataset_records.pickle``. When provided,
             the fold structure is loaded from this file and file discovery,
             pre-screening, class balancing, and fold creation are skipped.
-        pretraining_only: If True, only create the VAE pre-training
-            datasets (4 HDF5 files) and skip the classification pipeline
-            entirely. No GUID pre-screening is performed.
+        dataset_mode: Controls which datasets to create. One of
+            ``"pretrain"``, ``"classification"``, or ``"both"``
+            (default ``"both"``).
 
     Raises:
-        ValueError: If ``records_base_path_`` is missing when required,
-            or if the pickle has an unexpected structure.
+        ValueError: If ``dataset_mode`` is not a valid mode, if
+            ``records_base_path_`` is missing when required, or if the
+            pickle has an unexpected structure.
         FileNotFoundError: If ``classification_pickle_path`` is provided
             but does not exist.
     """
@@ -1236,13 +1238,20 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
                 f"{masks['n_cross']} cross + {masks['n_up_phase']} UP self-phase = "
                 f"{total_channels} total")
 
+    # Validate dataset_mode
+    valid_modes = ("pretrain", "classification", "both")
+    if dataset_mode not in valid_modes:
+        raise ValueError(
+            f"dataset_mode must be one of {valid_modes}, got '{dataset_mode}'")
+
     # ---------------------------
-    # Pre-training only mode: create VAE datasets and return
+    # Pre-training mode: create VAE datasets
     # ---------------------------
-    if pretraining_only:
+    if dataset_mode in ("pretrain", "both"):
         if records_base_path_ is None:
             raise ValueError(
-                "records_base_path_ is required when pretraining_only=True")
+                "records_base_path_ is required when dataset_mode "
+                "is 'pretrain' or 'both'")
 
         healthy_bg_cs_path = os.path.join(
             records_base_path_, 'HEALTHY_NO_ACIDOSIS_CS', 'EFMOut')
@@ -1335,6 +1344,10 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             labor_onset_map=labor_onset_map)
 
         logger.info(f"Pre-training datasets created in {pre_train_path}")
+        if dataset_mode == "pretrain":
+            return []
+
+    if dataset_mode not in ("classification", "both"):
         return []
 
     if classification_pickle_path is not None:
@@ -1491,13 +1504,16 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
         }
 
         total_healthy_filtered = sum(counts_healthy.values())
-        if total_healthy_filtered < n_unhealthy_total:
+        healthy_to_unhealthy_ratio = 3
+        n_target_desired = n_unhealthy_total * healthy_to_unhealthy_ratio
+        if total_healthy_filtered < n_target_desired:
             logger.warning(
-                f"Filtered healthy GUIDs ({total_healthy_filtered}) < unhealthy "
-                f"({n_unhealthy_total}). Capping healthy target to available count.")
+                f"Filtered healthy GUIDs ({total_healthy_filtered}) < "
+                f"{healthy_to_unhealthy_ratio}x unhealthy "
+                f"({n_target_desired}). Capping healthy target to available count.")
             n_target = total_healthy_filtered
         else:
-            n_target = n_unhealthy_total
+            n_target = n_target_desired
 
         target_healthy = {
             k: int(round((v / total_healthy_filtered) * n_target))
@@ -1765,8 +1781,8 @@ if __name__ == "__main__":
     # Set to None to run the full pipeline.
     classification_pickle = None  # e.g. r'/path/to/classification_dataset_records.pickle'
 
-    # Set to True to only create VAE pre-training datasets (no classification).
-    pretraining_only = False
+    # Dataset creation mode: "pretrain", "classification", or "both".
+    dataset_mode = "both"
 
     base_block_size = 3520
     overlap_percentage = 1 / 11
@@ -1779,7 +1795,7 @@ if __name__ == "__main__":
         overlap_percentage=overlap_percentage,
         labor_onset_csv_path=labor_onset_csv,
         classification_pickle_path=classification_pickle,
-        pretraining_only=pretraining_only,
+        dataset_mode=dataset_mode,
     )
 
     # hdf_file = "test_dataset_no_cs.hdf5"
