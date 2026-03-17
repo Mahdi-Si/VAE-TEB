@@ -158,6 +158,55 @@ class DeltaTEmbedding(nn.Module):
         return dt_embed * mask.unsqueeze(-1).float()
 
 
+class ResidualMLPBlock(nn.Module):
+    """Pre-norm residual MLP block for the classifier head.
+
+    Applies LayerNorm before the transformation (pre-norm pattern), then a
+    bottleneck MLP, and adds the result back to the input (residual
+    connection).  This stabilises gradient flow in deeper classifier heads.
+
+    Architecture::
+
+        out = x + Dropout(Linear_up(GELU(Linear_down(LayerNorm(x)))))
+
+    where ``Linear_down`` projects from ``hidden_dim`` to ``bottleneck_dim``
+    and ``Linear_up`` projects back.
+
+    Args:
+        hidden_dim: Input and output dimension (must match for the residual
+            addition).
+        bottleneck_dim: Internal bottleneck dimension of the MLP.
+        dropout: Dropout probability applied after the expansion linear
+            layer.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        bottleneck_dim: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, hidden_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor of shape ``(..., hidden_dim)``.
+
+        Returns:
+            Output tensor of the same shape as *x*.
+        """
+        return x + self.mlp(self.norm(x))
+
+
 class TemporalVaeClassifier(nn.Module):
     """Two-level temporal classifier: frozen VAE + segment encoder + temporal LSTM.
 
@@ -194,9 +243,20 @@ class TemporalVaeClassifier(nn.Module):
             apply time-decay gating to the segment LSTM state between segments.
             Default ``True``.
         num_classes: Number of output classes.  Default 2.
+        temporal_lstm_residual: If ``True``, add a skip connection around the
+            temporal LSTM: project input to hidden dim and add to LSTM output.
+            Default ``False``.
         classifier_dropout: Dropout probability in the classifier head.
             Default 0.1.
-        mlp_multiplier: MLP hidden expansion factor.  Default 2.0.
+        mlp_multiplier: MLP hidden expansion factor (legacy head only).
+            Default 2.0.
+        classifier_num_residual_blocks: Number of pre-norm
+            :class:`ResidualMLPBlock` layers before the final linear
+            projection.  0 uses the legacy shallow head.  Default 0.
+        classifier_bottleneck_dim: Bottleneck dimension inside each
+            :class:`ResidualMLPBlock`.  Default 64.
+        output_dropout: Dropout probability applied to the temporal LSTM
+            output before the classifier head.  0 disables.  Default 0.0.
         class_weights: Optional per-class loss weights for CE loss.
         vae_chunk_size: Segments per VAE encoding chunk to limit peak GPU
             memory.  Default 32.
@@ -230,9 +290,13 @@ class TemporalVaeClassifier(nn.Module):
         delta_t_dropout: float = 0.1,
         persist_segment_state: bool = False,
         segment_state_decay: bool = True,
+        temporal_lstm_residual: bool = False,
         num_classes: int = 2,
         classifier_dropout: float = 0.1,
         mlp_multiplier: float = 2.0,
+        classifier_num_residual_blocks: int = 0,
+        classifier_bottleneck_dim: int = 64,
+        output_dropout: float = 0.0,
         class_weights: Optional[Sequence[float]] = None,
         vae_chunk_size: int = 32,
         use_posterior: bool = True,
@@ -251,6 +315,7 @@ class TemporalVaeClassifier(nn.Module):
         self.delta_t_embed_dim = delta_t_embed_dim
         self.persist_segment_state = persist_segment_state
         self.segment_state_decay = segment_state_decay
+        self.temporal_lstm_residual = temporal_lstm_residual
         self.num_classes = num_classes
         self.vae_chunk_size = vae_chunk_size
         self.use_posterior = use_posterior
@@ -371,15 +436,45 @@ class TemporalVaeClassifier(nn.Module):
             dropout=temporal_lstm_dropout if temporal_lstm_layers > 1 else 0.0,
         )
 
-        # -- Classifier head ----------------------------------------------- #
-        mlp_hidden = int(temporal_lstm_hidden * mlp_multiplier)
-        self.classifier_head = nn.Sequential(
-            nn.LayerNorm(temporal_lstm_hidden),
-            nn.Linear(temporal_lstm_hidden, mlp_hidden),
-            nn.GELU(),
-            nn.Dropout(classifier_dropout),
-            nn.Linear(mlp_hidden, num_classes),
+        # -- Residual projection around temporal LSTM ---------------------- #
+        if temporal_lstm_residual:
+            self.temporal_residual_proj = nn.Linear(
+                temporal_input_dim, temporal_lstm_hidden, bias=False,
+            )
+
+        # -- Output dropout on temporal LSTM output ----------------------- #
+        self.output_drop = (
+            nn.Dropout(output_dropout) if output_dropout > 0.0
+            else nn.Identity()
         )
+
+        # -- Classifier head ----------------------------------------------- #
+        self._classifier_num_residual_blocks = classifier_num_residual_blocks
+        if classifier_num_residual_blocks > 0:
+            # Deep head: pre-norm residual blocks + final projection.
+            self.residual_blocks = nn.ModuleList([
+                ResidualMLPBlock(
+                    hidden_dim=temporal_lstm_hidden,
+                    bottleneck_dim=classifier_bottleneck_dim,
+                    dropout=classifier_dropout,
+                )
+                for _ in range(classifier_num_residual_blocks)
+            ])
+            self.classifier_head = nn.Sequential(
+                nn.LayerNorm(temporal_lstm_hidden),
+                nn.Linear(temporal_lstm_hidden, num_classes),
+            )
+        else:
+            # Legacy shallow head (backward compatible).
+            self.residual_blocks = nn.ModuleList()
+            mlp_hidden = int(temporal_lstm_hidden * mlp_multiplier)
+            self.classifier_head = nn.Sequential(
+                nn.LayerNorm(temporal_lstm_hidden),
+                nn.Linear(temporal_lstm_hidden, mlp_hidden),
+                nn.GELU(),
+                nn.Dropout(classifier_dropout),
+                nn.Linear(mlp_hidden, num_classes),
+            )
 
         # -- Class weights for loss ---------------------------------------- #
         if class_weights is not None:
@@ -393,13 +488,15 @@ class TemporalVaeClassifier(nn.Module):
         logger.info(
             "TemporalVaeClassifier created: encoder={}, d_seg={}, "
             "temporal_input_dim={}, lstm_hidden={}, lstm_layers={}, "
-            "gap={}, pos_dim={}, tlo={}, tlo_embed={}, dt_embed={}, "
-            "persist_seg={}, seg_decay={}, classes={}",
+            "lstm_residual={}, gap={}, pos_dim={}, tlo={}, tlo_embed={}, "
+            "dt_embed={}, persist_seg={}, seg_decay={}, classes={}, "
+            "residual_blocks={}, bottleneck={}, output_dropout={}",
             segment_encoder_type,
             self.d_seg,
             temporal_input_dim,
             temporal_lstm_hidden,
             temporal_lstm_layers,
+            temporal_lstm_residual,
             gap_encoding,
             position_embed_dim,
             tlo_enabled,
@@ -408,6 +505,9 @@ class TemporalVaeClassifier(nn.Module):
             persist_segment_state,
             segment_state_decay,
             num_classes,
+            classifier_num_residual_blocks,
+            classifier_bottleneck_dim,
+            output_dropout,
         )
 
     # ------------------------------------------------------------------ #
@@ -902,10 +1002,19 @@ class TemporalVaeClassifier(nn.Module):
             )
         # h: (B, S_max, temporal_lstm_hidden)
 
+        # Residual skip connection around temporal LSTM.
+        if self.temporal_lstm_residual:
+            h = h + self.temporal_residual_proj(x)
+
+        # Output dropout on LSTM hidden states.
+        h = self.output_drop(h)
+
         if self.debug:
             assert not torch.isnan(h).any(), "NaN in temporal LSTM output"
 
         # ---- Step 7: Per-segment classification -------------------------- #
+        for block in self.residual_blocks:
+            h = block(h)
         logits = self.classifier_head(h)        # (B, S_max, num_classes)
         probs = F.softmax(logits, dim=-1)       # (B, S_max, num_classes)
         preds = logits.argmax(dim=-1)           # (B, S_max)
