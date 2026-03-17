@@ -745,6 +745,47 @@ def ensure_committed_epochs_filled(
     )
 
 
+def _is_better_threshold(
+    fpr: float,
+    fpr_diff: float,
+    best_fpr: Optional[float],
+    best_fpr_diff: float,
+    target_fpr: float,
+) -> bool:
+    """Determine if a candidate threshold is better than the current best.
+
+    Conservative strategy: prefer FPR <= target_fpr over FPR > target_fpr.
+    Among conservative candidates, pick the one closest to target (highest
+    FPR still <= target).  Among aggressive candidates (only when no
+    conservative exists), pick the one closest to target.
+
+    Args:
+        fpr: FPR achieved by the candidate threshold.
+        fpr_diff: ``abs(fpr - target_fpr)`` for the candidate.
+        best_fpr: FPR of the current best threshold (``None`` if no best yet).
+        best_fpr_diff: ``abs(best_fpr - target_fpr)`` (``inf`` initially).
+        target_fpr: Target false-positive rate.
+
+    Returns:
+        ``True`` if the candidate should replace the current best.
+    """
+    is_conservative = fpr <= target_fpr
+    was_conservative = best_fpr is not None and best_fpr <= target_fpr
+
+    if is_conservative:
+        if not was_conservative:
+            # First conservative candidate always wins over aggressive
+            return True
+        # Both conservative — prefer closer to target (higher FPR ≤ target)
+        return fpr_diff < best_fpr_diff
+    else:
+        if was_conservative:
+            # Never replace a conservative best with an aggressive candidate
+            return False
+        # Both aggressive — prefer closer to target (lower FPR > target)
+        return fpr_diff < best_fpr_diff
+
+
 def find_threshold_for_instantaneous_fpr_at_1h(
     val_df: pd.DataFrame,
     target_fpr: float = 0.05,
@@ -830,7 +871,8 @@ def find_threshold_for_instantaneous_fpr_at_1h(
             break
 
         fpr_diff = abs(fpr - target_fpr)
-        if fpr_diff < best_fpr_diff:
+        best_fpr = best_metrics['fpr'] if best_metrics is not None else None
+        if _is_better_threshold(fpr, fpr_diff, best_fpr, best_fpr_diff, target_fpr):
             best_fpr_diff = fpr_diff
             best_threshold = thresh
             best_metrics = {
@@ -859,6 +901,8 @@ def find_threshold_for_instantaneous_fpr_at_1h(
     logger.info(f"Selected threshold: {best_threshold:.3f}")
     logger.info(f"Achieved instantaneous FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
     logger.info(f"Instantaneous sensitivity: {best_metrics['sensitivity']:.4f}")
+    if best_metrics['fpr'] > target_fpr:
+        logger.warning(f"Could not achieve target FPR={target_fpr} — closest conservative FPR not available")
     logger.info("=" * 80)
 
     return best_threshold, best_metrics
@@ -950,7 +994,8 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
             break
 
         fpr_diff = abs(fpr - target_fpr)
-        if fpr_diff < best_fpr_diff:
+        best_fpr = best_metrics['fpr'] if best_metrics is not None else None
+        if _is_better_threshold(fpr, fpr_diff, best_fpr, best_fpr_diff, target_fpr):
             best_fpr_diff = fpr_diff
             best_threshold = thresh
             best_metrics = {
@@ -979,6 +1024,8 @@ def find_threshold_for_committed_cumulative_fpr_at_1h(
     logger.info(f"Selected threshold: {best_threshold:.3f}")
     logger.info(f"Achieved committed_cumulative FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
     logger.info(f"Committed_cumulative sensitivity: {best_metrics['sensitivity']:.4f}")
+    if best_metrics['fpr'] > target_fpr:
+        logger.warning(f"Could not achieve target FPR={target_fpr} — closest conservative FPR not available")
     logger.info("=" * 80)
 
     return best_threshold, best_metrics
@@ -1072,7 +1119,8 @@ def find_threshold_for_committed_overall_fpr_at_1h(
             break
 
         fpr_diff = abs(fpr - target_fpr)
-        if fpr_diff < best_fpr_diff:
+        best_fpr = best_metrics['fpr'] if best_metrics is not None else None
+        if _is_better_threshold(fpr, fpr_diff, best_fpr, best_fpr_diff, target_fpr):
             best_fpr_diff = fpr_diff
             best_threshold = thresh
             best_metrics = {
@@ -1105,6 +1153,8 @@ def find_threshold_for_committed_overall_fpr_at_1h(
     logger.info(f"Achieved committed_overall FPR at {best_metrics['actual_time_hours']:.1f}h: {best_metrics['fpr']:.4f} (target: {target_fpr})")
     logger.info(f"Committed_overall sensitivity: {best_metrics['sensitivity']:.4f}")
     logger.info(f"FIXED denominators - P(t≤0)={best_metrics['n_positive_total']}, N(t≤0)={best_metrics['n_negative_total']}")
+    if best_metrics['fpr'] > target_fpr:
+        logger.warning(f"Could not achieve target FPR={target_fpr} — closest conservative FPR not available")
     logger.info("=" * 80)
 
     return best_threshold, best_metrics

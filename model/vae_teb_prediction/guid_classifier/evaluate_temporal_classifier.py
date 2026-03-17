@@ -88,7 +88,8 @@ def create_temporal_model_from_config(
         )
     logger.info("Evaluation: VAE loaded from {}", vae_checkpoint)
 
-    # 2. Build TemporalVaeClassifier with matching architecture
+    # 2. Build classifier with matching architecture
+    architecture_type = model_cfg.get("architecture_type", "temporal_lstm")
     seg_cfg = model_cfg.get("segment_encoder", {})
     lstm_cfg = model_cfg.get("temporal_lstm", {})
     feat_cfg = model_cfg.get("temporal_features", {})
@@ -97,35 +98,77 @@ def create_temporal_model_from_config(
     tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
     dt_cfg = feat_cfg.get("delta_t", {})
 
-    model = TemporalVaeClassifier(
-        vae_model=vae_model,
-        segment_encoder_type=seg_cfg.get("type", "mean_pool"),
-        d_seg=seg_cfg.get("d_seg", 64),
-        temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
-        temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
-        temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
-        gap_encoding=model_cfg.get("gap_encoding", "concat"),
-        position_embed_dim=(
-            seg_idx_cfg.get("embed_dim", 8)
-            if seg_idx_cfg.get("enabled", False)
-            else 0
-        ),
-        max_position_index=seg_idx_cfg.get("max_index", 40),
-        tlo_enabled=tlo_cfg.get("enabled", False),
-        tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-        tlo_dropout=tlo_cfg.get("dropout", 0.1),
-        delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
-        delta_t_dropout=dt_cfg.get("dropout", 0.1),
-        persist_segment_state=seg_cfg.get("persist_state", False),
-        segment_state_decay=seg_cfg.get("state_decay", True),
-        num_classes=head_cfg.get("num_classes", 2),
-        classifier_dropout=head_cfg.get("dropout", 0.1),
-        mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
-        vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-        use_posterior=model_cfg.get("use_posterior", True),
-        freeze_vae=model_cfg.get("freeze_vae", True),
-        cnn_kernel=seg_cfg.get("cnn_kernel", 7),
-    )
+    if architecture_type in ("abmil", "transmil", "causal_mil"):
+        from model.vae_teb_prediction.guid_classifier.mil_classification_model import (
+            ABMILClassifier,
+            TransMILClassifier,
+            CausalMILClassifier,
+        )
+
+        _MIL_MAP = {
+            "abmil": ABMILClassifier,
+            "transmil": TransMILClassifier,
+            "causal_mil": CausalMILClassifier,
+        }
+        mil_cfg = model_cfg.get("mil_config", {})
+        cls = _MIL_MAP[architecture_type]
+
+        model = cls(
+            vae_model=vae_model,
+            segment_encoder_type=seg_cfg.get("type", "simple"),
+            d_seg=seg_cfg.get("d_seg", 128),
+            delta_t_embed_dim=(
+                dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
+            ),
+            delta_t_dropout=dt_cfg.get("dropout", 0.1),
+            position_embed_dim=(
+                seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
+            ),
+            max_position_index=seg_idx_cfg.get("max_index", 40),
+            tlo_enabled=tlo_cfg.get("enabled", False),
+            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+            tlo_dropout=tlo_cfg.get("dropout", 0.1),
+            num_classes=head_cfg.get("num_classes", 2),
+            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+            use_posterior=model_cfg.get("use_posterior", True),
+            freeze_vae=model_cfg.get("freeze_vae", True),
+            rich_conv_channels=seg_cfg.get("rich_conv_channels", [32, 64, 128]),
+            rich_kernel_sizes=seg_cfg.get("rich_kernel_sizes", [5, 7, 11]),
+            rich_dilations=seg_cfg.get("rich_dilations", [1, 2, 4]),
+            **mil_cfg,
+        )
+        logger.info("Evaluation: Architecture {} (MIL)", architecture_type)
+    else:
+        model = TemporalVaeClassifier(
+            vae_model=vae_model,
+            segment_encoder_type=seg_cfg.get("type", "mean_pool"),
+            d_seg=seg_cfg.get("d_seg", 64),
+            temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
+            temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
+            temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
+            gap_encoding=model_cfg.get("gap_encoding", "concat"),
+            position_embed_dim=(
+                seg_idx_cfg.get("embed_dim", 8)
+                if seg_idx_cfg.get("enabled", False)
+                else 0
+            ),
+            max_position_index=seg_idx_cfg.get("max_index", 40),
+            tlo_enabled=tlo_cfg.get("enabled", False),
+            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+            tlo_dropout=tlo_cfg.get("dropout", 0.1),
+            delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
+            delta_t_dropout=dt_cfg.get("dropout", 0.1),
+            persist_segment_state=seg_cfg.get("persist_state", False),
+            segment_state_decay=seg_cfg.get("state_decay", True),
+            num_classes=head_cfg.get("num_classes", 2),
+            classifier_dropout=head_cfg.get("dropout", 0.1),
+            mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
+            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+            use_posterior=model_cfg.get("use_posterior", True),
+            freeze_vae=model_cfg.get("freeze_vae", True),
+            cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+        )
+        logger.info("Evaluation: Architecture temporal_lstm (default)")
 
     model.to(device)
     model.eval()
@@ -189,6 +232,9 @@ def run_temporal_inference(
             # TLO — may contain NaN
             tlo = batch_device.get("time_from_labor_onset")  # (B, S_max) or None
 
+            # Attention weights from MIL models (optional)
+            attn = outputs.get("attention_weights")  # (B, S_max) or None
+
             B = len(batch_device["guid"])
             for i in range(B):
                 L = lengths[i].item()
@@ -198,7 +244,7 @@ def run_temporal_inference(
                     if tlo is not None:
                         tlo_val = tlo[i, j].item() / 3600.0  # NaN preserved
 
-                    rows.append({
+                    row = {
                         "guid": batch_device["guid"][i],
                         "epoch": float(epoch_val[i, j].item()),
                         "cs_label": bool(batch_device["cs_label"][i].item()),
@@ -209,7 +255,10 @@ def run_temporal_inference(
                         "prob_class_0": float(probs[i, j, 0].item()),
                         "prob_class_1": float(probs[i, j, 1].item()),
                         "tlo_hours": tlo_val,
-                    })
+                    }
+                    if attn is not None:
+                        row["attention_weight"] = float(attn[i, j].item())
+                    rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -479,18 +528,57 @@ def evaluate_single_fold_temporal(
     stat_path = dataset_cfg.get("stat_path")
     normalize_fields = dataloader_cfg.get("normalize_fields")
     bucket_cfg = dataset_cfg.get("bucket_sampler", {})
+    use_bucketing = bucket_cfg.get("enabled", True)
     batch_size_test = config["general_config"]["batch_size"]["test"]
 
-    common_dl_kwargs = dict(
-        num_workers=dataloader_cfg.get("num_workers", 0),
-        segment_duration=dataloader_cfg.get("segment_duration", 1200.0),
-        guid_cache_size=dataloader_cfg.get("guid_cache_size", 128),
-        stats_path=stat_path,
-        normalize_fields=normalize_fields,
-        prefetch_factor=dataloader_cfg.get("prefetch_factor", 2),
-        seed=42,
-        **dataset_kwargs,
-    )
+    num_workers = dataloader_cfg.get("num_workers", 0)
+    seg_duration = dataloader_cfg.get("segment_duration", 1200.0)
+    guid_cache = dataloader_cfg.get("guid_cache_size", 128)
+    prefetch = dataloader_cfg.get("prefetch_factor", 2)
+
+    def _make_eval_loader(hdf5_files):
+        """Create an evaluation dataloader (bucketed or standard, no shuffle)."""
+        if use_bucketing:
+            loader, _ = create_bucketed_sequence_dataloader(
+                hdf5_files=hdf5_files,
+                batch_size=batch_size_test,
+                bucket_ranges=bucket_cfg.get("bucket_ranges"),
+                shuffle=False,
+                num_workers=num_workers,
+                segment_duration=seg_duration,
+                guid_cache_size=guid_cache,
+                stats_path=stat_path,
+                normalize_fields=normalize_fields,
+                prefetch_factor=prefetch,
+                seed=42,
+                **dataset_kwargs,
+            )
+            return loader
+        else:
+            from hdf5_dataset.guid_hdf5_dataset import (
+                SignalSequenceDataset,
+                sequence_collate_fn,
+            )
+            ds = SignalSequenceDataset(
+                paths=hdf5_files,
+                segment_duration=seg_duration,
+                guid_cache_size=guid_cache,
+                stats_path=stat_path,
+                normalize_fields=normalize_fields,
+                **dataset_kwargs,
+            )
+            return torch.utils.data.DataLoader(
+                ds,
+                batch_size=batch_size_test,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=sequence_collate_fn,
+                drop_last=False,
+                prefetch_factor=prefetch if num_workers > 0 else None,
+                multiprocessing_context="spawn" if num_workers > 0 else None,
+                persistent_workers=num_workers > 0,
+                pin_memory=False,
+            )
 
     # --- Validation predictions ----------------------------------------------
     val_raw_path = evaluation_dir / "validation_predictions_raw.csv"
@@ -499,13 +587,7 @@ def evaluate_single_fold_temporal(
         val_df_raw = pd.read_csv(val_raw_path)
     else:
         logger.info("Fold {}: Running validation inference...", fold_id)
-        val_loader, _ = create_bucketed_sequence_dataloader(
-            hdf5_files=fold_datasets["val"],
-            batch_size=batch_size_test,
-            bucket_ranges=bucket_cfg.get("bucket_ranges"),
-            shuffle=False,
-            **common_dl_kwargs,
-        )
+        val_loader = _make_eval_loader(fold_datasets["val"])
         val_df_raw = run_temporal_inference(model, val_loader, device=device)
         val_df_raw.to_csv(val_raw_path, index=False)
         logger.info("Fold {}: Validation predictions saved ({} rows)", fold_id, len(val_df_raw))
@@ -610,13 +692,7 @@ def evaluate_single_fold_temporal(
         test_df_raw = pd.read_csv(test_raw_path)
     else:
         logger.info("Fold {}: Running test inference...", fold_id)
-        test_loader, _ = create_bucketed_sequence_dataloader(
-            hdf5_files=fold_datasets["test"],
-            batch_size=batch_size_test,
-            bucket_ranges=bucket_cfg.get("bucket_ranges"),
-            shuffle=False,
-            **common_dl_kwargs,
-        )
+        test_loader = _make_eval_loader(fold_datasets["test"])
         test_df_raw = run_temporal_inference(model, test_loader, device=device)
         test_df_raw.to_csv(test_raw_path, index=False)
         logger.info("Fold {}: Test predictions saved ({} rows)", fold_id, len(test_df_raw))
