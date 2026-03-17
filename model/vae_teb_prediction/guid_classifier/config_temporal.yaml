@@ -14,18 +14,37 @@ general_config:
     out_dir_base: /path/to/temporal_results     # Root output dir for all folds and results
 
 model_config:
+  architecture_type: "temporal_lstm"            # "temporal_lstm" | "abmil" | "transmil" | "causal_mil"
   vae_checkpoint: /path/to/vae.ckpt            # Pre-trained frozen VAE checkpoint path
   freeze_vae: true                              # Freeze all VAE weights during training
   use_posterior: true                           # Use posterior mean (true) or prior mean (false) from VAE
   vae_chunk_size: 32                            # Segments per VAE forward chunk (controls GPU memory)
 
+  # MIL-specific config (only used when architecture_type is abmil/transmil/causal_mil)
+  mil_config:
+    attn_dim: 128                               # Gated attention internal dim (ABMIL)
+    n_heads: 4                                  # Transformer heads (TransMIL, CausalMIL)
+    n_layers: 2                                 # Transformer encoder layers (TransMIL, CausalMIL)
+    d_ff: 256                                   # Feedforward dim (TransMIL, CausalMIL)
+    d_model: 0                                  # 0 = auto match feature_dim (TransMIL, CausalMIL)
+    use_cls_token: true                         # Prepend CLS token (TransMIL)
+    monotonicity_weight: 0.1                    # Monotonicity regulariser weight (CausalMIL)
+    monotonicity_margin: 0.0                    # Hinge margin for monotonicity (CausalMIL)
+    aggregation: "max_risk"                     # GUID aggregation: "max_risk" | "attention" | "last" (CausalMIL)
+    classifier_dropout: 0.1                     # Dropout in MIL classifier head
+    mlp_multiplier: 2.0                         # MLP hidden expansion factor
+
   segment_encoder:
-    type: "lstm"                                # "mean_pool" (d_seg=16) | "lstm" | "cnn"
-    d_seg: 64                                   # Segment representation dimension (ignored for mean_pool)
-    lstm_hidden: 64                             # LSTM hidden size, should match d_seg
-    cnn_kernel: 7                               # Causal conv kernel size (only used when type: "cnn")
-    persist_state: true                         # Carry LSTM hidden state across segments (only for type: "lstm")
+    type: "lstm"                                # temporal_lstm: "mean_pool" | "lstm" | "cnn"; MIL: "simple" | "rich"
+    d_seg: 64                                   # Segment dim: 64 for temporal_lstm, recommend 128 for MIL (must be divisible by n_heads for TransMIL/CausalMIL)
+    lstm_hidden: 64                             # LSTM hidden size, should match d_seg (temporal_lstm only)
+    cnn_kernel: 7                               # Causal conv kernel size (temporal_lstm "cnn" only)
+    persist_state: true                         # Carry LSTM hidden state across segments (temporal_lstm "lstm" only)
     state_decay: true                           # Apply time-decay gating to persistent segment LSTM state
+    # Rich segment encoder params (MIL "rich" encoder only):
+    rich_conv_channels: [32, 64, 128]           # CausalConvBlock channel counts
+    rich_kernel_sizes: [5, 7, 11]               # CausalConvBlock kernel sizes
+    rich_dilations: [1, 2, 4]                   # CausalConvBlock dilation factors
 
   temporal_lstm:
     hidden_dim: 128                             # Temporal LSTM hidden size (context across segments)
@@ -94,7 +113,7 @@ dataset_config:
       trim_minutes: 1.0                          # Trim N minutes from segment edges (quality filter)
 
   bucket_sampler:
-    enabled: true                                # Group GUIDs by segment count for efficient padding
+    enabled: true                                # true = bucket by segment count (less padding, less diversity); false = standard random sampling (more diversity per batch)
     bucket_ranges: [[1, 5], [6, 12], [13, 20], [21, 40]]  # Segment count ranges per bucket
     shuffle: true                                # Shuffle within buckets and across batch order each epoch
 

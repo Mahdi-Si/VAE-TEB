@@ -144,6 +144,10 @@ class PlTemporalClassifier(LightningModelBase):
             "class_0_acc": loss_dict["class_0_acc"],
             "class_1_acc": loss_dict["class_1_acc"],
         }
+        # Capture optional CausalMIL-specific decomposed loss components.
+        for extra_key in ("loss_guid", "loss_mono"):
+            if extra_key in loss_dict:
+                metrics[extra_key] = loss_dict[extra_key]
         return loss, metrics
 
 
@@ -322,7 +326,8 @@ class GraphModelTemporalTrainer(GraphModelBase):
             )
         logger.info("VAE model loaded from checkpoint: {}", vae_checkpoint)
 
-        # ----- 2. Build TemporalVaeClassifier ----------------------------- #
+        # ----- 2. Build classifier model ---------------------------------- #
+        architecture_type = model_cfg.get("architecture_type", "temporal_lstm")
         seg_cfg = model_cfg.get("segment_encoder", {})
         lstm_cfg = model_cfg.get("temporal_lstm", {})
         feat_cfg = model_cfg.get("temporal_features", {})
@@ -332,34 +337,79 @@ class GraphModelTemporalTrainer(GraphModelBase):
         tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
         dt_cfg = feat_cfg.get("delta_t", {})
 
-        self.pytorch_model = TemporalVaeClassifier(
-            vae_model=vae_model,
-            segment_encoder_type=seg_cfg.get("type", "mean_pool"),
-            d_seg=seg_cfg.get("d_seg", 64),
-            temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
-            temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
-            temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
-            gap_encoding=model_cfg.get("gap_encoding", "concat"),
-            position_embed_dim=(
-                seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
-            ),
-            max_position_index=seg_idx_cfg.get("max_index", 40),
-            tlo_enabled=tlo_cfg.get("enabled", False),
-            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-            tlo_dropout=tlo_cfg.get("dropout", 0.1),
-            delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
-            delta_t_dropout=dt_cfg.get("dropout", 0.1),
-            persist_segment_state=seg_cfg.get("persist_state", False),
-            segment_state_decay=seg_cfg.get("state_decay", True),
-            num_classes=head_cfg.get("num_classes", 2),
-            classifier_dropout=head_cfg.get("dropout", 0.1),
-            mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
-            class_weights=class_weights,
-            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-            use_posterior=model_cfg.get("use_posterior", True),
-            freeze_vae=model_cfg.get("freeze_vae", True),
-            cnn_kernel=seg_cfg.get("cnn_kernel", 7),
-        )
+        if architecture_type in ("abmil", "transmil", "causal_mil"):
+            # --- MIL-based architecture --- #
+            from model.vae_teb_prediction.guid_classifier.mil_classification_model import (
+                ABMILClassifier,
+                TransMILClassifier,
+                CausalMILClassifier,
+            )
+
+            _MIL_MAP = {
+                "abmil": ABMILClassifier,
+                "transmil": TransMILClassifier,
+                "causal_mil": CausalMILClassifier,
+            }
+            mil_cfg = model_cfg.get("mil_config", {})
+            cls = _MIL_MAP[architecture_type]
+
+            self.pytorch_model = cls(
+                vae_model=vae_model,
+                segment_encoder_type=seg_cfg.get("type", "simple"),
+                d_seg=seg_cfg.get("d_seg", 128),
+                delta_t_embed_dim=(
+                    dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
+                ),
+                delta_t_dropout=dt_cfg.get("dropout", 0.1),
+                position_embed_dim=(
+                    seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
+                ),
+                max_position_index=seg_idx_cfg.get("max_index", 40),
+                tlo_enabled=tlo_cfg.get("enabled", False),
+                tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+                tlo_dropout=tlo_cfg.get("dropout", 0.1),
+                num_classes=head_cfg.get("num_classes", 2),
+                class_weights=class_weights,
+                vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+                use_posterior=model_cfg.get("use_posterior", True),
+                freeze_vae=model_cfg.get("freeze_vae", True),
+                rich_conv_channels=seg_cfg.get("rich_conv_channels", [32, 64, 128]),
+                rich_kernel_sizes=seg_cfg.get("rich_kernel_sizes", [5, 7, 11]),
+                rich_dilations=seg_cfg.get("rich_dilations", [1, 2, 4]),
+                **mil_cfg,
+            )
+            logger.info("Architecture: {} (MIL)", architecture_type)
+        else:
+            # --- Original temporal LSTM architecture (default) --- #
+            self.pytorch_model = TemporalVaeClassifier(
+                vae_model=vae_model,
+                segment_encoder_type=seg_cfg.get("type", "mean_pool"),
+                d_seg=seg_cfg.get("d_seg", 64),
+                temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
+                temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
+                temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
+                gap_encoding=model_cfg.get("gap_encoding", "concat"),
+                position_embed_dim=(
+                    seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
+                ),
+                max_position_index=seg_idx_cfg.get("max_index", 40),
+                tlo_enabled=tlo_cfg.get("enabled", False),
+                tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+                tlo_dropout=tlo_cfg.get("dropout", 0.1),
+                delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
+                delta_t_dropout=dt_cfg.get("dropout", 0.1),
+                persist_segment_state=seg_cfg.get("persist_state", False),
+                segment_state_decay=seg_cfg.get("state_decay", True),
+                num_classes=head_cfg.get("num_classes", 2),
+                classifier_dropout=head_cfg.get("dropout", 0.1),
+                mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
+                class_weights=class_weights,
+                vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+                use_posterior=model_cfg.get("use_posterior", True),
+                freeze_vae=model_cfg.get("freeze_vae", True),
+                cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+            )
+            logger.info("Architecture: temporal_lstm (default)")
 
         # ----- 3. Log parameter counts ----------------------------------- #
         total_params = sum(p.numel() for p in self.pytorch_model.parameters())
@@ -548,42 +598,89 @@ def train_fold(
     normalize_fields = dataloader_cfg.get("normalize_fields")
 
     bucket_cfg = dataset_cfg.get("bucket_sampler", {})
-    bucket_ranges = bucket_cfg.get("bucket_ranges")
-    bucket_shuffle = bucket_cfg.get("shuffle", True)
+    use_bucketing = bucket_cfg.get("enabled", True)
 
     # --- Create dataloaders ----------------------------------------------- #
-    logger.info("Fold {}: Creating bucketed sequence dataloaders...", fold_id)
-
-    common_dl_kwargs = dict(
-        num_workers=dataloader_cfg.get("num_workers", 0),
-        segment_duration=dataloader_cfg.get("segment_duration", 1200.0),
-        guid_cache_size=dataloader_cfg.get("guid_cache_size", 128),
-        stats_path=stat_path,
-        normalize_fields=normalize_fields,
-        prefetch_factor=dataloader_cfg.get("prefetch_factor", 2),
-        pin_memory=dataloader_cfg.get("pin_memory", False),
-        seed=seed,
-        **dataset_kwargs,
-    )
+    num_workers = dataloader_cfg.get("num_workers", 0)
+    prefetch = dataloader_cfg.get("prefetch_factor", 2)
+    pin_mem = dataloader_cfg.get("pin_memory", False)
+    seg_duration = dataloader_cfg.get("segment_duration", 1200.0)
+    guid_cache = dataloader_cfg.get("guid_cache_size", 128)
 
     batch_size_train = config["general_config"]["batch_size"]["train"]
     batch_size_test = config["general_config"]["batch_size"]["test"]
 
-    train_loader, train_dataset = create_bucketed_sequence_dataloader(
-        hdf5_files=fold_datasets["train"],
-        batch_size=batch_size_train,
-        bucket_ranges=bucket_ranges,
-        shuffle=bucket_shuffle,
-        **common_dl_kwargs,
-    )
+    if use_bucketing:
+        # --- Bucketed sampling: groups GUIDs by segment count ------------- #
+        logger.info("Fold {}: Creating bucketed sequence dataloaders...", fold_id)
 
-    val_loader, val_dataset = create_bucketed_sequence_dataloader(
-        hdf5_files=fold_datasets["val"],
-        batch_size=batch_size_test,
-        bucket_ranges=bucket_ranges,
-        shuffle=False,
-        **common_dl_kwargs,
-    )
+        bucket_ranges = bucket_cfg.get("bucket_ranges")
+        bucket_shuffle = bucket_cfg.get("shuffle", True)
+
+        common_dl_kwargs = dict(
+            num_workers=num_workers,
+            segment_duration=seg_duration,
+            guid_cache_size=guid_cache,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            prefetch_factor=prefetch,
+            pin_memory=pin_mem,
+            seed=seed,
+            **dataset_kwargs,
+        )
+
+        train_loader, train_dataset = create_bucketed_sequence_dataloader(
+            hdf5_files=fold_datasets["train"],
+            batch_size=batch_size_train,
+            bucket_ranges=bucket_ranges,
+            shuffle=bucket_shuffle,
+            **common_dl_kwargs,
+        )
+
+        val_loader, val_dataset = create_bucketed_sequence_dataloader(
+            hdf5_files=fold_datasets["val"],
+            batch_size=batch_size_test,
+            bucket_ranges=bucket_ranges,
+            shuffle=False,
+            **common_dl_kwargs,
+        )
+    else:
+        # --- Standard random sampling: full diversity per batch ----------- #
+        logger.info("Fold {}: Creating standard (non-bucketed) sequence dataloaders...", fold_id)
+
+        from hdf5_dataset.guid_hdf5_dataset import (
+            SignalSequenceDataset,
+            sequence_collate_fn,
+        )
+        from torch.utils.data import DataLoader
+
+        _ds_common = dict(
+            segment_duration=seg_duration,
+            guid_cache_size=guid_cache,
+            stats_path=stat_path,
+            normalize_fields=normalize_fields,
+            pin_memory=pin_mem,
+            **dataset_kwargs,
+        )
+        _dl_common = dict(
+            num_workers=num_workers,
+            collate_fn=sequence_collate_fn,
+            drop_last=False,
+            prefetch_factor=prefetch if num_workers > 0 else None,
+            multiprocessing_context="spawn" if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            pin_memory=False,
+        )
+
+        train_dataset = SignalSequenceDataset(paths=fold_datasets["train"], **_ds_common)
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size_train, shuffle=True, **_dl_common,
+        )
+
+        val_dataset = SignalSequenceDataset(paths=fold_datasets["val"], **_ds_common)
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size_test, shuffle=False, **_dl_common,
+        )
 
     logger.info(
         "Fold {}: train={} GUIDs, val={} GUIDs",
