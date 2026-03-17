@@ -1454,7 +1454,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
         # ---------------------------
         # Build candidate file lists:
         #   - unhealthy: all acidosis + hie files
-        #   - healthy: no_bg files (full) + bg files (10% vae_test only)
+        #   - healthy: no_bg files (full) + bg files (ALL, including VAE train)
         prescreening_candidates = {
             'acidosis_cs': acidosis_cs_files,
             'acidosis_no_cs': acidosis_no_cs_files,
@@ -1462,8 +1462,8 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             'hie_no_cs': hie_no_cs_files,
             'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files,
             'healthy_no_bg_cs': healthy_no_bg_cs_files,
-            'healthy_bg_cs': healthy_bg_cs_files_vae_test,
-            'healthy_bg_no_cs': healthy_bg_no_cs_files_vae_test,
+            'healthy_bg_cs': healthy_bg_cs_files,
+            'healthy_bg_no_cs': healthy_bg_no_cs_files,
         }
 
         filtered = prescreen_guids_for_classification(
@@ -1480,8 +1480,8 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
         hie_no_cs_files = filtered['hie_no_cs']
         healthy_no_bg_no_cs_files = filtered['healthy_no_bg_no_cs']
         healthy_no_bg_cs_files = filtered['healthy_no_bg_cs']
-        healthy_bg_cs_files_vae_test = filtered['healthy_bg_cs']
-        healthy_bg_no_cs_files_vae_test = filtered['healthy_bg_no_cs']
+        healthy_bg_cs_files = filtered['healthy_bg_cs']
+        healthy_bg_no_cs_files = filtered['healthy_bg_no_cs']
 
         # ---------------------------
         # Recount after pre-screening and class balance
@@ -1496,53 +1496,60 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
 
         n_unhealthy_total = n_acidosis_total + n_hie_total
 
-        counts_healthy = {
+        # Available pools after pre-screening (BG uses ALL files)
+        file_pools = {
+            "NoBG_NoCS": healthy_no_bg_no_cs_files,
+            "NoBG_CS": healthy_no_bg_cs_files,
+            "BG_CS": healthy_bg_cs_files,
+            "BG_NoCS": healthy_bg_no_cs_files,
+        }
+        counts_available = {k: len(v) for k, v in file_pools.items()}
+        total_healthy_available = sum(counts_available.values())
+
+        # Use original (pre-split) population sizes to compute proportions
+        # so that BG subgroups get their fair share, not the deflated 10%
+        population_counts = {
             "NoBG_NoCS": len(healthy_no_bg_no_cs_files),
             "NoBG_CS": len(healthy_no_bg_cs_files),
-            "BG_CS": len(healthy_bg_cs_files_vae_test),
-            "BG_NoCS": len(healthy_bg_no_cs_files_vae_test),
+            "BG_CS": n_healthy_bg_cs,
+            "BG_NoCS": n_healthy_bg_no_cs,
         }
+        total_population = sum(population_counts.values())
 
-        total_healthy_filtered = sum(counts_healthy.values())
-        healthy_to_unhealthy_ratio = 3
+        healthy_to_unhealthy_ratio = 5
         n_target_desired = n_unhealthy_total * healthy_to_unhealthy_ratio
-        if total_healthy_filtered < n_target_desired:
+        if total_healthy_available < n_target_desired:
             logger.warning(
-                f"Filtered healthy GUIDs ({total_healthy_filtered}) < "
+                f"Filtered healthy GUIDs ({total_healthy_available}) < "
                 f"{healthy_to_unhealthy_ratio}x unhealthy "
                 f"({n_target_desired}). Capping healthy target to available count.")
-            n_target = total_healthy_filtered
+            n_target = total_healthy_available
         else:
             n_target = n_target_desired
 
+        # Allocate proportionally based on original population sizes
         target_healthy = {
-            k: int(round((v / total_healthy_filtered) * n_target))
-            for k, v in counts_healthy.items()
+            k: int(round((population_counts[k] / total_population) * n_target))
+            for k in population_counts
         }
 
         # Fix rounding residuals
         diff = n_target - sum(target_healthy.values())
         if diff:
-            largest = max(counts_healthy, key=counts_healthy.get)
+            largest = max(population_counts, key=population_counts.get)
             target_healthy[largest] += diff
 
         # Cap targets to available counts per subgroup, redistribute overflow
-        file_pools = {
-            "NoBG_NoCS": healthy_no_bg_no_cs_files,
-            "NoBG_CS": healthy_no_bg_cs_files,
-            "BG_CS": healthy_bg_cs_files_vae_test,
-            "BG_NoCS": healthy_bg_no_cs_files_vae_test,
-        }
         overflow = 0
         for k in target_healthy:
-            available = len(file_pools[k])
+            available = counts_available[k]
             if target_healthy[k] > available:
                 overflow += target_healthy[k] - available
                 target_healthy[k] = available
         # Redistribute overflow to subgroups with remaining capacity
         if overflow > 0:
-            for k in sorted(target_healthy, key=lambda x: len(file_pools[x]) - target_healthy[x], reverse=True):
-                room = len(file_pools[k]) - target_healthy[k]
+            for k in sorted(target_healthy, key=lambda x: counts_available[x] - target_healthy[x], reverse=True):
+                room = counts_available[k] - target_healthy[k]
                 add = min(overflow, room)
                 target_healthy[k] += add
                 overflow -= add
@@ -1555,12 +1562,13 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
         logger.info(f"Class balancing (post pre-screening): "
                     f"unhealthy={n_unhealthy_total}, "
                     f"healthy target={sum(target_healthy.values())} "
-                    f"({target_healthy})")
+                    f"({target_healthy}), "
+                    f"population proportions={population_counts}")
 
         healthy_no_bg_no_cs_files_subsampled = random.sample(healthy_no_bg_no_cs_files, target_healthy['NoBG_NoCS'])
         healthy_no_bg_cs_files_subsampled = random.sample(healthy_no_bg_cs_files, target_healthy['NoBG_CS'])
-        healthy_bg_cs_files_subsampled = random.sample(healthy_bg_cs_files_vae_test, target_healthy['BG_CS'])
-        healthy_bg_no_cs_files_subsampled = random.sample(healthy_bg_no_cs_files_vae_test, target_healthy['BG_NoCS'])
+        healthy_bg_cs_files_subsampled = random.sample(healthy_bg_cs_files, target_healthy['BG_CS'])
+        healthy_bg_no_cs_files_subsampled = random.sample(healthy_bg_no_cs_files, target_healthy['BG_NoCS'])
 
         cross_validation_records = {
             'healthy_no_bg_no_cs': healthy_no_bg_no_cs_files_subsampled,
