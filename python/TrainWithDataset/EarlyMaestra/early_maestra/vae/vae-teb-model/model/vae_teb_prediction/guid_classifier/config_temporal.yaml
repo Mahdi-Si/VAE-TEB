@@ -36,8 +36,8 @@ model_config:
 
   segment_encoder:
     type: "lstm"                                # temporal_lstm: "mean_pool" | "lstm" | "cnn"; MIL: "simple" | "rich"
-    d_seg: 64                                   # Segment dim: 64 for temporal_lstm, recommend 128 for MIL (must be divisible by n_heads for TransMIL/CausalMIL)
-    lstm_hidden: 64                             # LSTM hidden size, should match d_seg (temporal_lstm only)
+    d_seg: 128                                  # Segment dim: 128 for temporal_lstm, recommend 128 for MIL (must be divisible by n_heads for TransMIL/CausalMIL)
+    lstm_hidden: 128                            # LSTM hidden size, should match d_seg (temporal_lstm only)
     cnn_kernel: 7                               # Causal conv kernel size (temporal_lstm "cnn" only)
     persist_state: true                         # Carry LSTM hidden state across segments (temporal_lstm "lstm" only)
     state_decay: true                           # Apply time-decay gating to persistent segment LSTM state
@@ -47,11 +47,12 @@ model_config:
     rich_dilations: [1, 2, 4]                   # CausalConvBlock dilation factors
 
   temporal_lstm:
-    hidden_dim: 128                             # Temporal LSTM hidden size (context across segments)
-    num_layers: 2                               # Stacked LSTM layers
-    dropout: 0.1                                # Dropout between LSTM layers
+    hidden_dim: 256                             # Temporal LSTM hidden size (context across segments)
+    num_layers: 3                               # Stacked LSTM layers
+    dropout: 0.2                                # Dropout between LSTM layers
+    residual: true                              # Skip connection: project input to hidden dim, add to LSTM output
 
-  gap_encoding: "concat"                        # How to encode inter-segment gaps: "concat" | "time_decay" | "both"
+  gap_encoding: "both"                          # How to encode inter-segment gaps: "concat" | "time_decay" | "both"
 
   temporal_features:
     delta_t:
@@ -59,8 +60,8 @@ model_config:
       embed_dim: 8                              # Learned MLP embedding dim (0 = raw [hours, log] 2-dim)
       dropout: 0.1                              # Dropout in delta_t embedding MLP
     segment_index:
-      enabled: true                             # Learned absolute position embedding from grid slot index
-      embed_dim: 8                              # Position embedding dimension (reduced from 16)
+      enabled: false                            # Disabled: LSTM captures sequential order implicitly
+      embed_dim: 8                              # Position embedding dimension (unused when disabled)
       max_index: 40                             # Max grid slot index (~36 slots + safety margin)
     time_from_labor_onset:
       enabled: true                             # Include time since labor onset (NaN-safe)
@@ -70,9 +71,12 @@ model_config:
 
   classifier_head:
     num_classes: 2                              # Binary: 0=healthy, 1=unhealthy (acidosis/HIE)
-    dropout: 0.1                                # Dropout in MLP head
-    mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier
+    dropout: 0.2                                # Dropout in classifier head / residual blocks
+    mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier (legacy head only)
     use_class_weights: true                     # false = uniform CE loss (no class weighting)
+    num_residual_blocks: 3                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
+    bottleneck_dim: 128                         # Bottleneck dimension inside each residual block
+    output_dropout: 0.3                         # Dropout on temporal LSTM output before classifier head
 
   precompute_latents: false                     # true = skip VAE forward, load cached mu_post from disk
 
