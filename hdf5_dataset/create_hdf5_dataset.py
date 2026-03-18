@@ -21,7 +21,7 @@ import h5py
 from typing import Dict, List, Optional, Tuple
 from sklearn.model_selection import KFold
 
-from hdf5_dataset import create_initial_hdf5, append_sample
+from hdf5_dataset import create_initial_hdf5, append_sample, append_samples_batch
 from guid_analysis import GuidTrackingEntry, GuidScreeningResult
 
 
@@ -383,7 +383,8 @@ def prescreen_guids_for_classification(
     candidate_files, labor_onset_map=None,
     base_block_size=3520, overlap_percentage=1/11,
     min_segments_unhealthy=6, min_segments_healthy=9,
-    max_post_delivery_ratio=0.30, output_dir=None):
+    max_post_delivery_ratio=0.30, output_dir=None,
+    num_workers=None):
     """Pre-screen all classification candidate GUIDs and return filtered file lists.
 
     Runs ``prescreen_guid`` on every candidate, applies per-class acceptance
@@ -402,6 +403,8 @@ def prescreen_guids_for_classification(
         max_post_delivery_ratio: Reject GUIDs where more than this fraction
             of valid segments are post-delivery (``domain_start >= 0``).
         output_dir: If provided, save ``guid_screening_results.json`` here.
+        num_workers: Number of parallel workers for pre-screening. Defaults to
+            ``min(os.cpu_count(), 8)``. Set to 1 to disable parallelism.
 
     Returns:
         Dict mapping subgroup name -> list of .mat file paths that passed
@@ -410,27 +413,56 @@ def prescreen_guids_for_classification(
     Raises:
         ValueError: If any subgroup is entirely emptied by screening.
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from functools import partial
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 8)
+
     all_results: Dict[str, List[GuidScreeningResult]] = {}
     filtered_files: Dict[str, List[str]] = {}
 
     total_candidates = sum(len(v) for v in candidate_files.values())
     logger.info(f"Pre-screening {total_candidates} GUIDs across "
-                f"{len(candidate_files)} subgroups")
+                f"{len(candidate_files)} subgroups "
+                f"(workers={num_workers})")
+
+    prescreen_fn = partial(
+        prescreen_guid,
+        base_block_size=base_block_size,
+        overlap_percentage=overlap_percentage,
+        labor_onset_map=labor_onset_map)
 
     for subgroup, file_list in candidate_files.items():
+        is_unhealthy = subgroup.startswith(('acidosis_', 'hie_'))
+        min_segs = min_segments_unhealthy if is_unhealthy else min_segments_healthy
         results = []
-        for record_path in tqdm(file_list,
-                                desc=f"Pre-screening {subgroup}",
-                                leave=False):
-            result = prescreen_guid(
-                record_path, base_block_size=base_block_size,
-                overlap_percentage=overlap_percentage,
-                labor_onset_map=labor_onset_map)
 
-            # --- Apply rejection criteria ---
-            is_unhealthy = subgroup.startswith(('acidosis_', 'hie_'))
-            min_segs = min_segments_unhealthy if is_unhealthy else min_segments_healthy
+        if num_workers <= 1:
+            # Sequential fallback
+            for record_path in tqdm(file_list,
+                                    desc=f"Pre-screening {subgroup}",
+                                    leave=False):
+                result = prescreen_fn(record_path)
+                results.append(result)
+        else:
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                future_to_path = {
+                    executor.submit(prescreen_fn, path): path
+                    for path in file_list}
+                for future in tqdm(as_completed(future_to_path),
+                                   total=len(future_to_path),
+                                   desc=f"Pre-screening {subgroup}",
+                                   leave=False):
+                    results.append(future.result())
 
+        # Restore original file order (as_completed returns in arbitrary order,
+        # but downstream KFold splits depend on deterministic ordering).
+        path_order = {p: i for i, p in enumerate(file_list)}
+        results.sort(key=lambda r: path_order.get(r.record_path, 0))
+
+        # --- Apply rejection criteria ---
+        for result in results:
             if result.error:
                 result.rejection_reason = f"processing error: {result.error_msg}"
             elif result.n_valid_segments < min_segs:
@@ -447,8 +479,6 @@ def prescreen_guids_for_classification(
                     f"{result.n_post_delivery}/{result.n_valid_segments} "
                     f"= {result.n_post_delivery/result.n_valid_segments:.0%} "
                     f"> {max_post_delivery_ratio:.0%}")
-
-            results.append(result)
 
         all_results[subgroup] = results
         accepted = [r for r in results if r.rejection_reason is None]
@@ -828,7 +858,8 @@ def create_hdf5_dataset_from_records_list(
     hdf5_path=None, records_list=None, file_limit=-1,
     base_block_size=3520, save_name=None, min_domain_start=None,
     cs_label=None, bg_label=None, pre_defined_target=None, device=None, overlap_percentage=1/11,
-    run_guid_analysis=False, precomputed_masks=None, labor_onset_map=None):
+    run_guid_analysis=False, precomputed_masks=None, labor_onset_map=None,
+    scatter_batch_size=16):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1029,63 +1060,104 @@ def create_hdf5_dataset_from_records_list(
                         output_dir=strip_dir)
                 continue
 
-            # ---- Step 2: Scattering on valid segments only ----
+            # ---- Step 2: Batched scattering on valid segments ----
             valid_fhr = fhr[valid_indices]
             valid_up = up[valid_indices]
             st_input = torch.from_numpy(
                 np.stack([valid_fhr, valid_up], axis=1)).float().to(device)
 
-            # Per-segment scattering (one 24-min segment at a time)
-            st_phase_list = []
-            st_cross_list = []
-            st_up_phase_list = []
-            scatter_failed = []
-            for seg_j in range(st_input.shape[0]):
-                seg = st_input[seg_j:seg_j+1]
-                try:
-                    seg_phase = st_model(x=seg,
-                                         compute_phase=True,
-                                         compute_cross_phase=False,
-                                         scattering_channel=0,
-                                         phase_channels=[0])
-                    seg_cross = st_model(x=seg,
-                                         compute_phase=False,
-                                         compute_cross_phase=True,
-                                         scattering_channel=0,
-                                         phase_channels=[0, 1])
-                    # v3: UP self-phase (channel 1 = UP)
-                    seg_up_phase = st_model(x=seg,
-                                            compute_phase=True,
-                                            compute_cross_phase=False,
-                                            scattering_channel=0,
-                                            phase_channels=[1])
-                    st_phase_list.append(seg_phase)
-                    st_cross_list.append(seg_cross)
-                    st_up_phase_list.append(seg_up_phase)
-                except RuntimeError as seg_err:
-                    orig_idx = valid_indices[seg_j]
-                    logger.error(f"{guid_key} segment {orig_idx} "
-                                 f"(epoch={domain_starts[orig_idx]}): "
-                                 f"scattering failed: {seg_err}")
-                    scatter_failed.append(seg_j)
-                    st_phase_list.append(None)
-                    st_cross_list.append(None)
-                    st_up_phase_list.append(None)
-                    if guid_tracking is not None:
-                        guid_tracking[guid_key].skipped_scatter_failed.append(
-                            float(domain_starts[orig_idx]))
+            n_valid = st_input.shape[0]
+            st_phase_list = [None] * n_valid
+            st_cross_list = [None] * n_valid
+            st_up_phase_list = [None] * n_valid
+            scatter_failed = set()
 
-            # ---- Step 3: Save valid, successfully scattered segments ----
-            for seg_j in range(len(valid_indices)):
+            for batch_start in range(0, n_valid, scatter_batch_size):
+                batch_end = min(batch_start + scatter_batch_size, n_valid)
+                batch = st_input[batch_start:batch_end]
+                try:
+                    batch_phase = st_model(
+                        x=batch, compute_phase=True,
+                        compute_cross_phase=False,
+                        scattering_channel=0, phase_channels=[0])
+                    batch_cross = st_model(
+                        x=batch, compute_phase=False,
+                        compute_cross_phase=True,
+                        scattering_channel=0, phase_channels=[0, 1])
+                    batch_up_phase = st_model(
+                        x=batch, compute_phase=True,
+                        compute_cross_phase=False,
+                        scattering_channel=0, phase_channels=[1])
+                    # Slice batch results into per-segment dicts.
+                    # Only slice tensors whose first dim matches batch size
+                    # (autoc_idx is a 1-D model buffer and must be kept as-is).
+                    bs = batch.shape[0]
+                    for local_j in range(bs):
+                        gj = batch_start + local_j
+                        st_phase_list[gj] = {
+                            k: (v[local_j:local_j+1]
+                                if isinstance(v, torch.Tensor) and v.shape[0] == bs
+                                else v)
+                            for k, v in batch_phase.items()}
+                        st_cross_list[gj] = {
+                            k: (v[local_j:local_j+1]
+                                if isinstance(v, torch.Tensor) and v.shape[0] == bs
+                                else v)
+                            for k, v in batch_cross.items()}
+                        st_up_phase_list[gj] = {
+                            k: (v[local_j:local_j+1]
+                                if isinstance(v, torch.Tensor) and v.shape[0] == bs
+                                else v)
+                            for k, v in batch_up_phase.items()}
+                except RuntimeError:
+                    # Batch failed — retry each segment individually
+                    for local_j in range(batch.shape[0]):
+                        gj = batch_start + local_j
+                        seg = st_input[gj:gj+1]
+                        try:
+                            seg_phase = st_model(
+                                x=seg, compute_phase=True,
+                                compute_cross_phase=False,
+                                scattering_channel=0, phase_channels=[0])
+                            seg_cross = st_model(
+                                x=seg, compute_phase=False,
+                                compute_cross_phase=True,
+                                scattering_channel=0, phase_channels=[0, 1])
+                            seg_up_phase = st_model(
+                                x=seg, compute_phase=True,
+                                compute_cross_phase=False,
+                                scattering_channel=0, phase_channels=[1])
+                            st_phase_list[gj] = seg_phase
+                            st_cross_list[gj] = seg_cross
+                            st_up_phase_list[gj] = seg_up_phase
+                        except RuntimeError as seg_err:
+                            orig_idx = valid_indices[gj]
+                            logger.error(
+                                f"{guid_key} segment {orig_idx} "
+                                f"(epoch={domain_starts[orig_idx]}): "
+                                f"scattering failed: {seg_err}")
+                            scatter_failed.add(gj)
+                            if guid_tracking is not None:
+                                guid_tracking[guid_key].skipped_scatter_failed.append(
+                                    float(domain_starts[orig_idx]))
+
+            # ---- Step 3: Collect and batch-write valid scattered segments ----
+            batch_fhr_l, batch_up_l = [], []
+            batch_fhr_st_l, batch_fhr_ph_l, batch_fhr_up_ph_l = [], [], []
+            batch_target_l, batch_weight_l = [], []
+            batch_guid_l, batch_epoch_l = [], []
+            batch_cs_l, batch_bg_l, batch_tlo_l = [], [], []
+
+            for seg_j in range(n_valid):
                 if seg_j in scatter_failed:
                     continue
                 orig_idx = valid_indices[seg_j]
 
-                fhr_st = st_phase_list[seg_j]['scattering'][0]
+                fhr_st_coeff = st_phase_list[seg_j]['scattering'][0]
                 fhr_st_phase_full = st_phase_list[seg_j]['phase_corr'][0]
                 fhr_up_cc_phase_full = st_cross_list[seg_j]['cross_phase_corr'][0]
 
-                fhr_ph = fhr_st_phase_full[phase_mask, :]
+                fhr_ph_coeff = fhr_st_phase_full[phase_mask, :]
                 cross_ph = fhr_up_cc_phase_full[cross_mask, :]
 
                 # v3: UP self-phase
@@ -1093,7 +1165,7 @@ def create_hdf5_dataset_from_records_list(
                 up_self_ph = up_self_phase_full[up_phase_mask, :]
 
                 # Concatenate cross-phase + UP self-phase into fhr_up_ph
-                fhr_up_ph = torch.cat([cross_ph, up_self_ph], dim=0)
+                fhr_up_ph_coeff = torch.cat([cross_ph, up_self_ph], dim=0)
 
                 ds_val = float(domain_starts[orig_idx])
                 if ds_val >= 0:
@@ -1105,20 +1177,35 @@ def create_hdf5_dataset_from_records_list(
                 # time_from_labor_onset = epoch - labor_onset (seconds since labor onset)
                 tflo = float(domain_starts[orig_idx]) - labor_onset_sec
                 print(f"    [TLO] seg {orig_idx}: epoch={domain_starts[orig_idx]:.0f}s - labor_onset={labor_onset_sec:.0f}s = tflo={tflo:.0f}s ({tflo/3600:.2f}h)")
-                append_sample(
+
+                batch_fhr_l.append(fhr[orig_idx, :])
+                batch_up_l.append(up[orig_idx, :])
+                batch_fhr_st_l.append(fhr_st_coeff.detach().cpu().numpy())
+                batch_fhr_ph_l.append(fhr_ph_coeff.detach().cpu().numpy())
+                batch_fhr_up_ph_l.append(fhr_up_ph_coeff.detach().cpu().numpy())
+                batch_target_l.append(pre_defined_target * sample_weights[orig_idx, :])
+                batch_weight_l.append(sample_weights[orig_idx, :])
+                batch_guid_l.append(record_name[0])
+                batch_epoch_l.append(domain_starts[orig_idx])
+                batch_cs_l.append(cs_label)
+                batch_bg_l.append(bg_label)
+                batch_tlo_l.append(tflo)
+
+            if batch_fhr_l:
+                append_samples_batch(
                     path=hdf5_path,
-                    fhr=fhr[orig_idx, :],
-                    up=up[orig_idx, :],
-                    fhr_st=fhr_st.detach().cpu().numpy(),
-                    fhr_ph=fhr_ph.detach().cpu().numpy(),
-                    fhr_up_ph=fhr_up_ph.detach().cpu().numpy(),
-                    target=pre_defined_target * sample_weights[orig_idx, :],
-                    weight=sample_weights[orig_idx, :],
-                    guid=record_name[0],
-                    epoch=domain_starts[orig_idx],
-                    bg_label=bg_label,
-                    cs_label=cs_label,
-                    time_from_labor_onset=tflo)
+                    fhr_batch=np.stack(batch_fhr_l),
+                    up_batch=np.stack(batch_up_l),
+                    fhr_st_batch=np.stack(batch_fhr_st_l),
+                    fhr_ph_batch=np.stack(batch_fhr_ph_l),
+                    fhr_up_ph_batch=np.stack(batch_fhr_up_ph_l),
+                    target_batch=np.stack(batch_target_l),
+                    weight_batch=np.stack(batch_weight_l),
+                    guid_batch=batch_guid_l,
+                    epoch_batch=np.array(batch_epoch_l, dtype=np.float32),
+                    cs_label_batch=np.array(batch_cs_l, dtype=np.uint8),
+                    bg_label_batch=np.array(batch_bg_l, dtype=np.uint8),
+                    tlo_batch=np.array(batch_tlo_l, dtype=np.float32))
 
             # ---- Generate signal strip plot ----
             if plot_segment_status is not None and hdf5_path:
