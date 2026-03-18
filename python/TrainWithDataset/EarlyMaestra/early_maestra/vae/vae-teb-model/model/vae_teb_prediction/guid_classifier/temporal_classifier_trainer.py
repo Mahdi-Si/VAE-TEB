@@ -336,6 +336,7 @@ class GraphModelTemporalTrainer(GraphModelBase):
         seg_idx_cfg = feat_cfg.get("segment_index", {})
         tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
         dt_cfg = feat_cfg.get("delta_t", {})
+        temp_attn_cfg = model_cfg.get("temporal_attention", {})
 
         if architecture_type in ("abmil", "transmil", "causal_mil"):
             # --- MIL-based architecture --- #
@@ -396,7 +397,9 @@ class GraphModelTemporalTrainer(GraphModelBase):
                 tlo_enabled=tlo_cfg.get("enabled", False),
                 tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
                 tlo_dropout=tlo_cfg.get("dropout", 0.1),
-                delta_t_embed_dim=dt_cfg.get("embed_dim", 0),
+                delta_t_embed_dim=(
+                    dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
+                ),
                 delta_t_dropout=dt_cfg.get("dropout", 0.1),
                 persist_segment_state=seg_cfg.get("persist_state", False),
                 segment_state_decay=seg_cfg.get("state_decay", True),
@@ -412,6 +415,10 @@ class GraphModelTemporalTrainer(GraphModelBase):
                 use_posterior=model_cfg.get("use_posterior", True),
                 freeze_vae=model_cfg.get("freeze_vae", True),
                 cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+                segment_attention_pool=seg_cfg.get("attention_pool", False),
+                temporal_attention=temp_attn_cfg.get("enabled", False),
+                temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
+                temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
             )
             logger.info("Architecture: temporal_lstm (default)")
 

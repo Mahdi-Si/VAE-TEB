@@ -38,7 +38,7 @@ Example::
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -207,6 +207,154 @@ class ResidualMLPBlock(nn.Module):
         return x + self.mlp(self.norm(x))
 
 
+class SegmentAttentionPooling(nn.Module):
+    """Learned attention pooling over within-segment LSTM hidden states.
+
+    Instead of using only the last hidden state of the segment LSTM (which
+    has a recency bias toward the final timesteps), this module computes a
+    learned attention-weighted sum over ALL hidden states.  This allows the
+    model to focus on the most informative timesteps within each 20-minute
+    segment (e.g., deceleration events, variability changes).
+
+    Architecture::
+
+        score_t = w^T tanh(W h_t + b)
+        alpha   = softmax(score, dim=T)
+        v       = sum(alpha * h, dim=T)
+
+    Args:
+        hidden_dim: Dimension of the LSTM hidden states (d_seg).
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.attention_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1, bias=False),
+        )
+
+    def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor]:
+        """Compute attention-weighted sum of hidden states.
+
+        Args:
+            hidden_states: LSTM hidden states ``(*, T, H)`` where ``T`` is
+                the number of timesteps (300) and ``H`` is the hidden dim.
+
+        Returns:
+            Tuple of ``(pooled, alpha)`` where ``pooled`` has shape ``(*, H)``
+            and ``alpha`` has shape ``(*, T)`` (attention weights for
+            interpretability).
+        """
+        scores = self.attention_net(hidden_states)  # (*, T, 1)
+        alpha = F.softmax(scores, dim=-2)           # (*, T, 1)
+        pooled = (alpha * hidden_states).sum(dim=-2)  # (*, H)
+        return pooled, alpha.squeeze(-1)
+
+
+class TemporalCellAttention(nn.Module):
+    """ATTAIN-style time-decayed attention over past temporal LSTM cell states.
+
+    At each segment position $j$, computes scaled dot-product attention over
+    all cell states $c_0, c_1, \\ldots, c_j$ from the temporal LSTM, modulated
+    by an exponential time-decay that down-weights temporally distant segments.
+    This allows the classifier to directly retrieve relevant past states
+    without relying solely on the temporal LSTM's compressed hidden state.
+
+    Based on ATTAIN (Zhang et al., IJCAI 2019).
+
+    Architecture::
+
+        q_j = W_q h_j,   k_i = W_k c_i,   v_i = W_v c_i
+        score_{j,i} = (q_j^T k_i) / sqrt(A) + log(exp(-gamma * dt_{j->i}))
+        Causal mask: score_{j,i} = -inf  for i > j
+        alpha = softmax(score, dim=keys)
+        context_j = sum_i(alpha_{j,i} * v_i)
+        output_j  = W_o [h_j || context_j]
+
+    Args:
+        hidden_dim: Dimension of temporal LSTM hidden/cell states.
+        attn_dim: Projection dimension for queries and keys.
+        dropout: Dropout probability on attention weights.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        attn_dim: int = 64,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.query_proj = nn.Linear(hidden_dim, attn_dim, bias=False)
+        self.key_proj = nn.Linear(hidden_dim, attn_dim, bias=False)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.gamma_attn_log = nn.Parameter(torch.tensor(-2.0))
+        self.scale = attn_dim ** -0.5
+        self.attn_dropout = nn.Dropout(dropout)
+        self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def forward(
+        self,
+        h: Tensor,
+        c_all: Tensor,
+        delta_t: Tensor,
+        mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Compute time-decayed causal attention over past cell states.
+
+        Args:
+            h: Temporal LSTM hidden states ``(B, S, H)``.
+            c_all: Temporal LSTM cell states ``(B, S, H)``.
+            delta_t: Inter-segment time gaps in seconds ``(B, S)``.
+            mask: Boolean validity mask ``(B, S)``.
+
+        Returns:
+            Tuple of ``(fused, alpha)`` where ``fused`` has shape
+            ``(B, S, H)`` (h augmented with attended context) and ``alpha``
+            has shape ``(B, S, S)`` (attention weights).
+        """
+        B, S, H = h.shape
+        device = h.device
+
+        q = self.query_proj(h)       # (B, S, A)
+        k = self.key_proj(c_all)     # (B, S, A)
+        v = self.value_proj(c_all)   # (B, S, H)
+
+        # Content-based attention scores.
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, S, S)
+
+        # Causal mask: position j can attend to 0..j (inclusive, not future).
+        causal_mask = torch.triu(
+            torch.ones(S, S, device=device, dtype=torch.bool), diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+
+        # Time-decay: exp(-gamma * elapsed_hours) on attention logits.
+        gamma = F.softplus(self.gamma_attn_log)
+        cum_time = torch.cumsum(delta_t, dim=1)  # (B, S)
+        # time_diff[b, j, k] = elapsed time from segment k to segment j.
+        time_diff = cum_time.unsqueeze(1) - cum_time.unsqueeze(2)  # (B, S, S)
+        time_decay = torch.exp(-gamma * time_diff.clamp(min=0) / 3600.0)
+        scores = scores + torch.log(time_decay.clamp(min=1e-8))
+
+        # Mask padded key positions.
+        key_pad_mask = ~mask.unsqueeze(1).expand(B, S, S)  # (B, S, S)
+        scores = scores.masked_fill(key_pad_mask, float("-inf"))
+
+        alpha = F.softmax(scores, dim=-1)  # (B, S, S)
+        # Guard against NaN from all-masked rows.
+        alpha = torch.where(torch.isnan(alpha), torch.zeros_like(alpha), alpha)
+        alpha = self.attn_dropout(alpha)
+
+        context = torch.bmm(alpha, v)  # (B, S, H)
+
+        # Fuse h with attended context via concatenation + projection.
+        fused = self.output_proj(torch.cat([h, context], dim=-1))  # (B, S, H)
+        fused = fused * mask.unsqueeze(-1).float()
+
+        return fused, alpha
+
+
 class TemporalVaeClassifier(nn.Module):
     """Two-level temporal classifier: frozen VAE + segment encoder + temporal LSTM.
 
@@ -302,6 +450,10 @@ class TemporalVaeClassifier(nn.Module):
         use_posterior: bool = True,
         freeze_vae: bool = True,
         cnn_kernel: int = 7,
+        segment_attention_pool: bool = False,
+        temporal_attention: bool = False,
+        temporal_attention_dim: int = 64,
+        temporal_attention_dropout: float = 0.1,
         debug: bool = False,
     ) -> None:
         super().__init__()
@@ -360,6 +512,13 @@ class TemporalVaeClassifier(nn.Module):
                 f"Unknown segment_encoder_type '{segment_encoder_type}'. "
                 "Expected 'mean_pool', 'lstm', or 'cnn'."
             )
+
+        # -- Segment attention pooling ------------------------------------- #
+        self.segment_attention_pool = (
+            segment_attention_pool and segment_encoder_type == "lstm"
+        )
+        if self.segment_attention_pool:
+            self.seg_attn_pool = SegmentAttentionPooling(self.d_seg)
 
         # -- Learned temporal feature embeddings --------------------------- #
         if delta_t_embed_dim > 0:
@@ -426,15 +585,16 @@ class TemporalVaeClassifier(nn.Module):
             else:
                 self._td_dropout = None
 
-        # -- Standard temporal LSTM (used when gap_encoding != 'time_decay') #
-        self.temporal_lstm = nn.LSTM(
-            input_size=temporal_input_dim,
-            hidden_size=temporal_lstm_hidden,
-            num_layers=temporal_lstm_layers,
-            batch_first=True,
-            bidirectional=False,
-            dropout=temporal_lstm_dropout if temporal_lstm_layers > 1 else 0.0,
-        )
+        # -- Standard temporal LSTM (only when concat mode needs it) -------- #
+        if gap_encoding == "concat":
+            self.temporal_lstm = nn.LSTM(
+                input_size=temporal_input_dim,
+                hidden_size=temporal_lstm_hidden,
+                num_layers=temporal_lstm_layers,
+                batch_first=True,
+                bidirectional=False,
+                dropout=temporal_lstm_dropout if temporal_lstm_layers > 1 else 0.0,
+            )
 
         # -- Residual projection around temporal LSTM ---------------------- #
         if temporal_lstm_residual:
@@ -476,6 +636,20 @@ class TemporalVaeClassifier(nn.Module):
                 nn.Linear(mlp_hidden, num_classes),
             )
 
+        # -- ATTAIN-style temporal attention -------------------------------- #
+        self.temporal_attention_enabled = temporal_attention
+        if temporal_attention:
+            if gap_encoding not in ("time_decay", "both"):
+                raise ValueError(
+                    "temporal_attention requires gap_encoding='time_decay' or "
+                    "'both' (custom LSTMCell loop needed for cell states)"
+                )
+            self.temporal_cell_attention = TemporalCellAttention(
+                hidden_dim=temporal_lstm_hidden,
+                attn_dim=temporal_attention_dim,
+                dropout=temporal_attention_dropout,
+            )
+
         # -- Class weights for loss ---------------------------------------- #
         if class_weights is not None:
             self.register_buffer(
@@ -490,7 +664,8 @@ class TemporalVaeClassifier(nn.Module):
             "temporal_input_dim={}, lstm_hidden={}, lstm_layers={}, "
             "lstm_residual={}, gap={}, pos_dim={}, tlo={}, tlo_embed={}, "
             "dt_embed={}, persist_seg={}, seg_decay={}, classes={}, "
-            "residual_blocks={}, bottleneck={}, output_dropout={}",
+            "residual_blocks={}, bottleneck={}, output_dropout={}, "
+            "seg_attn_pool={}, temporal_attn={}",
             segment_encoder_type,
             self.d_seg,
             temporal_input_dim,
@@ -508,6 +683,8 @@ class TemporalVaeClassifier(nn.Module):
             classifier_num_residual_blocks,
             classifier_bottleneck_dim,
             output_dropout,
+            self.segment_attention_pool,
+            temporal_attention,
         )
 
     # ------------------------------------------------------------------ #
@@ -563,8 +740,11 @@ class TemporalVaeClassifier(nn.Module):
             return torch.zeros(B, S_max, self.d_seg, device=device)
 
         mu_valid = flat[valid_idx]  # (N_valid, 300, 16)
-        _, (h_n, _) = self.segment_lstm(mu_valid)  # h_n: (1, N_valid, d_seg)
-        seg_vectors = h_n.squeeze(0)  # (N_valid, d_seg)
+        output_all, (h_n, _) = self.segment_lstm(mu_valid)
+        if self.segment_attention_pool:
+            seg_vectors = self.seg_attn_pool(output_all)[0]  # (N_valid, d_seg)
+        else:
+            seg_vectors = h_n.squeeze(0)  # (N_valid, d_seg)
 
         # Scatter back.
         v_flat = torch.zeros(B * S_max, self.d_seg, device=device)
@@ -609,6 +789,13 @@ class TemporalVaeClassifier(nn.Module):
             gamma_seg = None
 
         for j in range(S_max):
+            step_valid = mask[:, j]  # (B,) bool
+
+            # Skip steps where NO batch item has a valid segment — avoids
+            # a full 300-timestep LSTM forward pass on all-zero input.
+            if not step_valid.any():
+                continue
+
             # -- Time-decay before step (skip j=0, no predecessor) --------- #
             if j > 0 and gamma_seg is not None:
                 dt_j = delta_t[:, j].unsqueeze(-1) / 3600.0  # (B, 1) hours
@@ -620,13 +807,16 @@ class TemporalVaeClassifier(nn.Module):
 
             # -- Run segment LSTM over 300 timesteps ----------------------- #
             seg_input = mu_post[:, j, :, :]  # (B, T, D)
-            _, (h_new, c_new) = self.segment_lstm(seg_input, (h, c))
+            output_all, (h_new, c_new) = self.segment_lstm(seg_input, (h, c))
 
             # -- Store segment vector -------------------------------------- #
-            v[:, j, :] = h_new.squeeze(0)  # (B, d_seg)
+            if self.segment_attention_pool:
+                v[:, j, :] = self.seg_attn_pool(output_all)[0]  # (B, d_seg)
+            else:
+                v[:, j, :] = h_new.squeeze(0)  # (B, d_seg)
 
             # -- Update state, zeroing invalid positions ------------------- #
-            step_mask = mask[:, j].unsqueeze(0).unsqueeze(-1).float()  # (1, B, 1)
+            step_mask = step_valid.unsqueeze(0).unsqueeze(-1).float()  # (1, B, 1)
             # For valid segments, carry forward new state.
             # For invalid segments, carry forward old state (unchanged).
             h = h_new * step_mask + h * (1.0 - step_mask)
@@ -819,7 +1009,8 @@ class TemporalVaeClassifier(nn.Module):
         delta_t: Tensor,
         mask: Tensor,
         lengths: Tensor,
-    ) -> Tensor:
+        return_cell_states: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Custom LSTM loop with time-decay gating on hidden/cell state.
 
         Before each step ``j > 0`` the hidden and cell states are decayed
@@ -837,9 +1028,13 @@ class TemporalVaeClassifier(nn.Module):
             delta_t: Inter-segment gap in seconds ``(B, S_max)``.
             mask: Boolean validity mask ``(B, S_max)``.
             lengths: Segment counts per GUID ``(B,)`` int.
+            return_cell_states: If ``True``, also return per-step top-layer
+                cell states for use by :class:`TemporalCellAttention`.
 
         Returns:
-            LSTM output ``(B, S_max, hidden_dim)``.
+            When ``return_cell_states=False``: LSTM output ``(B, S_max, H)``.
+            When ``return_cell_states=True``: tuple of
+            ``(h_out, c_out)`` both ``(B, S_max, H)``.
         """
         B, S_max, _ = x.shape
         device = x.device
@@ -853,6 +1048,7 @@ class TemporalVaeClassifier(nn.Module):
         c_states = [torch.zeros(B, hidden_dim, device=device) for _ in range(num_layers)]
 
         outputs = []
+        cell_buf = [] if return_cell_states else None
         for j in range(S_max):
             # -- Time-decay before step (skip j=0, no predecessor) ---------- #
             if j > 0:
@@ -880,8 +1076,14 @@ class TemporalVaeClassifier(nn.Module):
                 c_states[layer_idx] = c_states[layer_idx] * step_mask
 
             outputs.append(h_states[-1])  # Top-layer hidden state
+            if cell_buf is not None:
+                cell_buf.append(c_states[-1].clone())
 
-        return torch.stack(outputs, dim=1)  # (B, S_max, hidden_dim)
+        h_out = torch.stack(outputs, dim=1)  # (B, S_max, hidden_dim)
+        if return_cell_states:
+            c_out = torch.stack(cell_buf, dim=1)  # (B, S_max, hidden_dim)
+            return h_out, c_out
+        return h_out
 
     # ------------------------------------------------------------------ #
     #  Forward pass                                                        #
@@ -987,9 +1189,14 @@ class TemporalVaeClassifier(nn.Module):
             assert not torch.isnan(x).any(), "NaN in temporal LSTM input"
 
         # ---- Step 6: Temporal LSTM --------------------------------------- #
+        c_all = None
         if self.gap_encoding in ("time_decay", "both"):
-            # Custom loop with time-decay gating on hidden/cell state.
-            h = self._temporal_lstm_time_decay(x, delta_t, mask, lengths)
+            if self.temporal_attention_enabled:
+                h, c_all = self._temporal_lstm_time_decay(
+                    x, delta_t, mask, lengths, return_cell_states=True,
+                )
+            else:
+                h = self._temporal_lstm_time_decay(x, delta_t, mask, lengths)
         else:
             # Standard packed-sequence LSTM (concat gap encoding).
             lengths_cpu = lengths.cpu().clamp(min=1)
@@ -1012,6 +1219,13 @@ class TemporalVaeClassifier(nn.Module):
         if self.debug:
             assert not torch.isnan(h).any(), "NaN in temporal LSTM output"
 
+        # ---- Step 6b: ATTAIN temporal attention (optional) --------------- #
+        temporal_attn_weights = None
+        if self.temporal_attention_enabled and c_all is not None:
+            h, temporal_attn_weights = self.temporal_cell_attention(
+                h, c_all, delta_t, mask,
+            )
+
         # ---- Step 7: Per-segment classification -------------------------- #
         for block in self.residual_blocks:
             h = block(h)
@@ -1019,12 +1233,15 @@ class TemporalVaeClassifier(nn.Module):
         probs = F.softmax(logits, dim=-1)       # (B, S_max, num_classes)
         preds = logits.argmax(dim=-1)           # (B, S_max)
 
-        return {
+        result = {
             "logits": logits,
             "probs": probs,
             "preds": preds,
             "mask": mask,
         }
+        if temporal_attn_weights is not None:
+            result["temporal_attention_weights"] = temporal_attn_weights
+        return result
 
     # ------------------------------------------------------------------ #
     #  Loss computation                                                    #

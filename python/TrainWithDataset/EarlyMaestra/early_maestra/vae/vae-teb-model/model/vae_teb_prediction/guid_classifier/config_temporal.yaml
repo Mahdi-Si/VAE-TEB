@@ -45,6 +45,7 @@ model_config:
     rich_conv_channels: [32, 64, 128]           # CausalConvBlock channel counts
     rich_kernel_sizes: [5, 7, 11]               # CausalConvBlock kernel sizes
     rich_dilations: [1, 2, 4]                   # CausalConvBlock dilation factors
+    attention_pool: true                          # Attention pooling over all 300 segment LSTM hidden states (vs last hidden state only)
 
   temporal_lstm:
     hidden_dim: 256                             # Temporal LSTM hidden size (context across segments)
@@ -77,6 +78,11 @@ model_config:
     num_residual_blocks: 3                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
     bottleneck_dim: 128                         # Bottleneck dimension inside each residual block
     output_dropout: 0.3                         # Dropout on temporal LSTM output before classifier head
+
+  temporal_attention:
+    enabled: true                                 # ATTAIN-style attention over past temporal LSTM cell states
+    attn_dim: 64                                  # Projection dimension for attention queries/keys
+    dropout: 0.1                                  # Dropout on attention weights
 
   precompute_latents: false                     # true = skip VAE forward, load cached mu_post from disk
 
