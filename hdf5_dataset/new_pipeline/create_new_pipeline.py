@@ -137,13 +137,11 @@ def suppress_stdout_stderr():
 
 
 def setup_verbosity(verbose: bool):
-    """Configure logging level and return tqdm disable flag.
+    """Configure logging level.  Progress bars are always shown.
 
     Args:
-        verbose: If True show INFO logs and progress bars, else ERROR only.
-
-    Returns:
-        True when tqdm bars should be disabled (i.e. verbose is False).
+        verbose: If True show INFO logs, else ERROR only.
+            Progress bars (tqdm) are always enabled regardless of this flag.
     """
     level = logging.INFO if verbose else logging.ERROR
     logging.basicConfig(
@@ -152,7 +150,6 @@ def setup_verbosity(verbose: bool):
         force=True,
     )
     logger.setLevel(level)
-    return not verbose
 
 
 # ============================================================================
@@ -878,8 +875,6 @@ def prescreen_all_guids(
     """
     if num_workers is None:
         num_workers = min(os.cpu_count() or 1, 8)
-    tqdm_disable = not verbose
-
     # Load TLO/second-stage lookup
     labor_map, ss_map = load_csv_metadata(tlo_csv_path, verbose)
 
@@ -915,7 +910,7 @@ def prescreen_all_guids(
     )
 
     if num_workers <= 1:
-        for job in tqdm(all_jobs, desc="Prescreening", disable=tqdm_disable):
+        for job in tqdm(all_jobs, desc="Prescreening"):
             results.append(fn(job))
     else:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -924,7 +919,7 @@ def prescreen_all_guids(
                 as_completed(futures),
                 total=len(futures),
                 desc="Prescreening",
-                disable=tqdm_disable,
+                disable=False,
             ):
                 results.append(future.result())
 
@@ -1230,8 +1225,6 @@ def create_hdf5_dataset_from_records_list(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tqdm_disable = not verbose
-
     scattering_T = 16
     signal_length = int(base_block_size * 1.5)
 
@@ -1249,8 +1242,7 @@ def create_hdf5_dataset_from_records_list(
         {} if run_guid_analysis else None
     )
 
-    for record in tqdm(records_list, desc=os.path.basename(hdf5_path),
-                       disable=tqdm_disable):
+    for record in tqdm(records_list, desc=os.path.basename(hdf5_path)):
         try:
             default_ti = (
                 (pre_defined_target - 1)
@@ -1554,7 +1546,7 @@ def create_new_pipeline(
         screening_csv_path: Skip Step 1, load this pre-computed CSV.
         classification_pickle_path: Skip Steps 1-3, load this pickle.
     """
-    tqdm_disable = setup_verbosity(verbose)
+    setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
 
     # Load CSV metadata (needed for HDF5 creation in all paths)
