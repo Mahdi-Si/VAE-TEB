@@ -169,7 +169,7 @@ def create_initial_hdf5(
         - "time_from_labor_onset" : float32, shape (N,) - seconds since labor onset (NaN if unavailable)
         - "guid"      : variable-length UTF-8 strings, shape (N,)
 
-    All datasets use per-sample chunking and LZF compression.
+    All datasets use chunked storage and LZF compression.
 
     Args:
         path:                    Path to output HDF5 file (overwrites if exists).
@@ -183,60 +183,65 @@ def create_initial_hdf5(
     except OSError:
         pass
 
+    # Chunk size along sample axis — balances batch write speed and random read
+    # overhead.  32 samples per chunk means batch writes (typical ~50 segments
+    # per .mat file) only create 1-2 new chunks instead of 50.
+    chunk_n = 32
+
     str_dt = h5py.string_dtype(encoding="utf-8")
     with h5py.File(path, "w", libver="latest") as h5f:
         h5f.create_dataset(
             "fhr", shape=(0, len_signal), maxshape=(None, len_signal),
-            dtype="f4", chunks=(1, len_signal), compression="lzf"
+            dtype="f4", chunks=(chunk_n, len_signal), compression="lzf"
         )
         h5f.create_dataset(
             "up", shape=(0, len_signal), maxshape=(None, len_signal),
-            dtype="f4", chunks=(1, len_signal), compression="lzf"
+            dtype="f4", chunks=(chunk_n, len_signal), compression="lzf"
         )
         # Create datasets with optimal channel counts
         # fhr_st: 43 scattering coefficients (first order)
         h5f.create_dataset(
             "fhr_st", shape=(0, 43, len_sequence), maxshape=(None, 43, len_sequence),
-            dtype="f4", chunks=(1, 43, len_sequence), compression="lzf"
+            dtype="f4", chunks=(chunk_n, 43, len_sequence), compression="lzf"
         )
-        # fhr_ph: 44 selected phase coefficients  
+        # fhr_ph: 44 selected phase coefficients
         h5f.create_dataset(
             "fhr_ph", shape=(0, 44, len_sequence), maxshape=(None, 44, len_sequence),
-            dtype="f4", chunks=(1, 44, len_sequence), compression="lzf"
+            dtype="f4", chunks=(chunk_n, 44, len_sequence), compression="lzf"
         )
         # fhr_up_ph: selected cross-phase + UP self-phase coefficients (v3)
         h5f.create_dataset(
             "fhr_up_ph", shape=(0, n_cross_phase_channels, len_sequence),
             maxshape=(None, n_cross_phase_channels, len_sequence),
-            dtype="f4", chunks=(1, n_cross_phase_channels, len_sequence), compression="lzf"
+            dtype="f4", chunks=(chunk_n, n_cross_phase_channels, len_sequence), compression="lzf"
         )
         h5f.create_dataset(
             "target", shape=(0, len_sequence), maxshape=(None, len_sequence),
-            dtype="f4", chunks=(1, len_sequence), compression="lzf"
+            dtype="f4", chunks=(chunk_n, len_sequence), compression="lzf"
         )
         h5f.create_dataset(
             "weight", shape=(0, len_sequence), maxshape=(None, len_sequence),
-            dtype="f4", chunks=(1, len_sequence), compression="lzf"
+            dtype="f4", chunks=(chunk_n, len_sequence), compression="lzf"
         )
         h5f.create_dataset(
             "epoch", shape=(0,), maxshape=(None,),
-            dtype="f4", chunks=(1,), compression="lzf"
+            dtype="f4", chunks=(chunk_n,), compression="lzf"
         )
         h5f.create_dataset(
             "cs_label", shape=(0,), maxshape=(None,),
-            dtype="u1", chunks=(1,), compression="lzf"
+            dtype="u1", chunks=(chunk_n,), compression="lzf"
         )
         h5f.create_dataset(
             "bg_label", shape=(0,), maxshape=(None,),
-            dtype="u1", chunks=(1,), compression="lzf"
+            dtype="u1", chunks=(chunk_n,), compression="lzf"
         )
         h5f.create_dataset(
             "time_from_labor_onset", shape=(0,), maxshape=(None,),
-            dtype="f4", chunks=(1,), compression="lzf"
+            dtype="f4", chunks=(chunk_n,), compression="lzf"
         )
         h5f.create_dataset(
             "guid", shape=(0,), maxshape=(None,),
-            dtype=str_dt, chunks=(1,)
+            dtype=str_dt, chunks=(chunk_n,)
         )
 
 
@@ -293,6 +298,67 @@ def append_sample(
         if "time_from_labor_onset" in h5f:
             h5f["time_from_labor_onset"][idx] = time_from_labor_onset
         h5f["guid"][idx]      = guid
+
+
+def append_samples_batch(
+    path: str,
+    fhr_batch: np.ndarray,
+    up_batch: np.ndarray,
+    fhr_st_batch: np.ndarray,
+    fhr_ph_batch: np.ndarray,
+    fhr_up_ph_batch: np.ndarray,
+    target_batch: np.ndarray,
+    weight_batch: np.ndarray,
+    guid_batch: list,
+    epoch_batch: np.ndarray,
+    cs_label_batch: np.ndarray,
+    bg_label_batch: np.ndarray,
+    tlo_batch: np.ndarray,
+) -> None:
+    """Append K samples to an existing HDF5 dataset in a single file open/close.
+
+    This is a batched version of ``append_sample`` that avoids the overhead of
+    opening the file, resizing every dataset by +1, and closing for each
+    individual sample.  All datasets are resized once by +K and written via
+    slice assignment.
+
+    Args:
+        path:            Path to existing HDF5 file.
+        fhr_batch:       Raw FHR array, shape (K, len_signal).
+        up_batch:        Raw UP array, shape (K, len_signal).
+        fhr_st_batch:    Scattering array, shape (K, n_ch, len_seq).
+        fhr_ph_batch:    Phase array, shape (K, n_ch, len_seq).
+        fhr_up_ph_batch: Cross-phase array, shape (K, n_ch, len_seq).
+        target_batch:    Target array, shape (K, len_seq).
+        weight_batch:    Weight array, shape (K, len_seq).
+        guid_batch:      List of GUID strings, length K.
+        epoch_batch:     Epoch array, shape (K,).
+        cs_label_batch:  CS label array, shape (K,), dtype uint8.
+        bg_label_batch:  BG label array, shape (K,), dtype uint8.
+        tlo_batch:       Time-from-labor-onset array, shape (K,).
+    """
+    k = fhr_batch.shape[0]
+    if k == 0:
+        return
+    with h5py.File(path, "a", libver="latest") as h5f:
+        idx = h5f["fhr"].shape[0]
+        new_size = idx + k
+        for _name, ds in h5f.items():
+            ds.resize((new_size,) + ds.shape[1:])
+        h5f["fhr"][idx:new_size]       = fhr_batch
+        h5f["up"][idx:new_size]        = up_batch
+        h5f["fhr_st"][idx:new_size]    = fhr_st_batch
+        h5f["fhr_ph"][idx:new_size]    = fhr_ph_batch
+        h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
+        h5f["target"][idx:new_size]    = target_batch
+        h5f["weight"][idx:new_size]    = weight_batch
+        h5f["epoch"][idx:new_size]     = epoch_batch
+        h5f["cs_label"][idx:new_size]  = cs_label_batch.astype(np.uint8)
+        h5f["bg_label"][idx:new_size]  = bg_label_batch.astype(np.uint8)
+        if "time_from_labor_onset" in h5f:
+            h5f["time_from_labor_onset"][idx:new_size] = tlo_batch
+        for i, g in enumerate(guid_batch):
+            h5f["guid"][idx + i] = g
 
 
 class AttributeDict(dict):
