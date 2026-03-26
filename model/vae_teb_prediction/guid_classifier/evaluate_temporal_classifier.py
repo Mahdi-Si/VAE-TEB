@@ -88,8 +88,7 @@ def create_temporal_model_from_config(
         )
     logger.info("Evaluation: VAE loaded from {}", vae_checkpoint)
 
-    # 2. Build classifier with matching architecture
-    architecture_type = model_cfg.get("architecture_type", "temporal_lstm")
+    # 2. Build classifier
     seg_cfg = model_cfg.get("segment_encoder", {})
     lstm_cfg = model_cfg.get("temporal_lstm", {})
     feat_cfg = model_cfg.get("temporal_features", {})
@@ -99,87 +98,46 @@ def create_temporal_model_from_config(
     dt_cfg = feat_cfg.get("delta_t", {})
     temp_attn_cfg = model_cfg.get("temporal_attention", {})
 
-    if architecture_type in ("abmil", "transmil", "causal_mil"):
-        from model.vae_teb_prediction.guid_classifier.mil_classification_model import (
-            ABMILClassifier,
-            TransMILClassifier,
-            CausalMILClassifier,
-        )
-
-        _MIL_MAP = {
-            "abmil": ABMILClassifier,
-            "transmil": TransMILClassifier,
-            "causal_mil": CausalMILClassifier,
-        }
-        mil_cfg = model_cfg.get("mil_config", {})
-        cls = _MIL_MAP[architecture_type]
-
-        model = cls(
-            vae_model=vae_model,
-            segment_encoder_type=seg_cfg.get("type", "simple"),
-            d_seg=seg_cfg.get("d_seg", 128),
-            delta_t_embed_dim=(
-                dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
-            ),
-            delta_t_dropout=dt_cfg.get("dropout", 0.1),
-            position_embed_dim=(
-                seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
-            ),
-            max_position_index=seg_idx_cfg.get("max_index", 40),
-            tlo_enabled=tlo_cfg.get("enabled", False),
-            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-            tlo_dropout=tlo_cfg.get("dropout", 0.1),
-            num_classes=head_cfg.get("num_classes", 2),
-            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-            use_posterior=model_cfg.get("use_posterior", True),
-            freeze_vae=model_cfg.get("freeze_vae", True),
-            rich_conv_channels=seg_cfg.get("rich_conv_channels", [32, 64, 128]),
-            rich_kernel_sizes=seg_cfg.get("rich_kernel_sizes", [5, 7, 11]),
-            rich_dilations=seg_cfg.get("rich_dilations", [1, 2, 4]),
-            **mil_cfg,
-        )
-        logger.info("Evaluation: Architecture {} (MIL)", architecture_type)
-    else:
-        model = TemporalVaeClassifier(
-            vae_model=vae_model,
-            segment_encoder_type=seg_cfg.get("type", "mean_pool"),
-            d_seg=seg_cfg.get("d_seg", 64),
-            temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
-            temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
-            temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
-            gap_encoding=model_cfg.get("gap_encoding", "concat"),
-            position_embed_dim=(
-                seg_idx_cfg.get("embed_dim", 8)
-                if seg_idx_cfg.get("enabled", False)
-                else 0
-            ),
-            max_position_index=seg_idx_cfg.get("max_index", 40),
-            tlo_enabled=tlo_cfg.get("enabled", False),
-            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-            tlo_dropout=tlo_cfg.get("dropout", 0.1),
-            delta_t_embed_dim=(
-                dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
-            ),
-            delta_t_dropout=dt_cfg.get("dropout", 0.1),
-            persist_segment_state=seg_cfg.get("persist_state", False),
-            segment_state_decay=seg_cfg.get("state_decay", True),
-            temporal_lstm_residual=lstm_cfg.get("residual", False),
-            num_classes=head_cfg.get("num_classes", 2),
-            classifier_dropout=head_cfg.get("dropout", 0.1),
-            mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
-            classifier_num_residual_blocks=head_cfg.get("num_residual_blocks", 0),
-            classifier_bottleneck_dim=head_cfg.get("bottleneck_dim", 64),
-            output_dropout=head_cfg.get("output_dropout", 0.0),
-            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-            use_posterior=model_cfg.get("use_posterior", True),
-            freeze_vae=model_cfg.get("freeze_vae", True),
-            cnn_kernel=seg_cfg.get("cnn_kernel", 7),
-            segment_attention_pool=seg_cfg.get("attention_pool", False),
-            temporal_attention=temp_attn_cfg.get("enabled", False),
-            temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
-            temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
-        )
-        logger.info("Evaluation: Architecture temporal_lstm (default)")
+    model = TemporalVaeClassifier(
+        vae_model=vae_model,
+        segment_encoder_type=seg_cfg.get("type", "mean_pool"),
+        d_seg=seg_cfg.get("d_seg", 64),
+        temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
+        temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
+        temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
+        gap_encoding=model_cfg.get("gap_encoding", "concat"),
+        position_embed_dim=(
+            seg_idx_cfg.get("embed_dim", 8)
+            if seg_idx_cfg.get("enabled", False)
+            else 0
+        ),
+        max_position_index=seg_idx_cfg.get("max_index", 40),
+        tlo_enabled=tlo_cfg.get("enabled", False),
+        tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+        tlo_dropout=tlo_cfg.get("dropout", 0.1),
+        delta_t_embed_dim=(
+            dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
+        ),
+        delta_t_dropout=dt_cfg.get("dropout", 0.1),
+        persist_segment_state=seg_cfg.get("persist_state", False),
+        segment_state_decay=seg_cfg.get("state_decay", True),
+        temporal_lstm_residual=lstm_cfg.get("residual", False),
+        num_classes=head_cfg.get("num_classes", 2),
+        classifier_dropout=head_cfg.get("dropout", 0.1),
+        mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
+        classifier_num_residual_blocks=head_cfg.get("num_residual_blocks", 0),
+        classifier_bottleneck_dim=head_cfg.get("bottleneck_dim", 64),
+        output_dropout=head_cfg.get("output_dropout", 0.0),
+        vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+        use_posterior=model_cfg.get("use_posterior", True),
+        freeze_vae=model_cfg.get("freeze_vae", True),
+        cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+        segment_attention_pool=seg_cfg.get("attention_pool", False),
+        temporal_attention=temp_attn_cfg.get("enabled", False),
+        temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
+        temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
+    )
+    logger.info("Evaluation: Architecture temporal_lstm")
 
     model.to(device)
     model.eval()
@@ -243,9 +201,6 @@ def run_temporal_inference(
             # TLO — may contain NaN
             tlo = batch_device.get("time_from_labor_onset")  # (B, S_max) or None
 
-            # Attention weights from MIL models (optional)
-            attn = outputs.get("attention_weights")  # (B, S_max) or None
-
             B = len(batch_device["guid"])
             for i in range(B):
                 L = lengths[i].item()
@@ -267,8 +222,6 @@ def run_temporal_inference(
                         "prob_class_1": float(probs[i, j, 1].item()),
                         "tlo_hours": tlo_val,
                     }
-                    if attn is not None:
-                        row["attention_weight"] = float(attn[i, j].item())
                     rows.append(row)
 
     return pd.DataFrame(rows)
@@ -492,8 +445,6 @@ def evaluate_single_fold_temporal(
         fill_missing_epochs,
         find_latest_checkpoint_in_fold,
         find_threshold_for_committed_cumulative_fpr_at_1h,
-        find_threshold_for_committed_overall_fpr_at_1h,
-        find_threshold_for_instantaneous_fpr_at_1h,
         generate_three_metric_type_analysis,
         plot_roc_curve,
     )
@@ -532,7 +483,8 @@ def evaluate_single_fold_temporal(
 
     dataset_cfg = config.get("dataset_config", {})
     kfold_base_path = dataset_cfg["kfold_base_path"]
-    fold_datasets = get_fold_datasets(kfold_base_path, fold_id)
+    test_mode = dataset_cfg.get("test_mode", None)
+    fold_datasets = get_fold_datasets(kfold_base_path, fold_id, test_mode=test_mode)
 
     dataloader_cfg = dataset_cfg.get("dataloader_config", {})
     dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {})
@@ -609,37 +561,20 @@ def evaluate_single_fold_temporal(
         fold_id, target_fpr, decision_time_hours,
     )
 
-    # PRIMARY — committed_overall
-    primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
+    # Single threshold via committed cumulative — applied to all metric types
+    threshold, threshold_metrics = find_threshold_for_committed_cumulative_fpr_at_1h(
         val_df_raw,
         target_fpr=target_fpr,
         time_window_hours=decision_time_hours,
         max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=0.5,
     )
-
-    # Committed cumulative
-    threshold_cumulative, metrics_cumulative = find_threshold_for_committed_cumulative_fpr_at_1h(
-        val_df_raw,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier,
-        fallback_tolerance_hours=0.5,
-    )
-
-    # Instantaneous
-    threshold_instantaneous, metrics_instantaneous = find_threshold_for_instantaneous_fpr_at_1h(
-        val_df_raw,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier,
-        fallback_tolerance_hours=0.5,
-    )
+    primary_threshold = threshold
 
     all_thresholds = {
-        'instantaneous': threshold_instantaneous,
-        'committed_cumulative': threshold_cumulative,
-        'committed_overall': primary_threshold,
+        'instantaneous': threshold,
+        'committed_cumulative': threshold,
+        'committed_overall': threshold,
     }
 
     # Compute accuracy from sensitivity/specificity (primary)
@@ -654,8 +589,8 @@ def evaluate_single_fold_temporal(
     )
 
     logger.info(
-        "Fold {}: Thresholds — overall={:.4f}, cumulative={:.4f}, instantaneous={:.4f}",
-        fold_id, primary_threshold, threshold_cumulative, threshold_instantaneous,
+        "Fold {}: Threshold (committed_cumulative) = {:.4f}",
+        fold_id, threshold,
     )
 
     # Apply CDR to validation set (primary threshold for backward compat)
@@ -768,6 +703,37 @@ def evaluate_single_fold_temporal(
     except Exception as e:
         logger.warning("Fold {}: ROC computation failed: {}", fold_id, e)
 
+    # --- Committed-cumulative ROC curve -------------------------------------
+    cc_roc_data = {}
+    try:
+        from model.vae_teb_prediction.evaluate_classifier import (
+            compute_committed_cumulative_roc,
+        )
+        cc_roc_data = compute_committed_cumulative_roc(
+            test_df_raw,
+            decision_time_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
+        )
+        if cc_roc_data:
+            plot_roc_curve(
+                cc_roc_data,
+                evaluation_dir / "roc_curve_committed_cumulative.png",
+                title_suffix=f"Committed Cumulative — Temporal Fold {fold_id}",
+                threshold=threshold,
+            )
+            cc_roc_csv = pd.DataFrame({
+                'fpr': cc_roc_data['fpr'],
+                'tpr': cc_roc_data['tpr'],
+            })
+            cc_roc_csv.to_csv(
+                evaluation_dir / "roc_data_committed_cumulative.csv", index=False,
+            )
+            logger.info(
+                "Fold {}: CC-ROC AUC = {:.4f}", fold_id, cc_roc_data['auc'],
+            )
+    except Exception as e:
+        logger.warning("Fold {}: CC-ROC computation failed: {}", fold_id, e)
+
     # --- Save threshold info ------------------------------------------------
     threshold_info = {
         "primary_threshold": float(primary_threshold),
@@ -784,6 +750,7 @@ def evaluate_single_fold_temporal(
         "test_metrics_primary": primary_metrics,
         "decision_point_metrics": decision_point,
         "roc_auc": roc_data.get("auc"),
+        "cc_roc_auc": cc_roc_data.get("auc"),
     }
     with open(evaluation_dir / "threshold_info.json", "w") as f:
         json.dump(convert_numpy_types(threshold_info), f, indent=2)
@@ -813,6 +780,11 @@ def evaluate_single_fold_temporal(
             "fpr": roc_data.get("fpr", []),
             "tpr": roc_data.get("tpr", []),
         } if roc_data else {},
+        "cc_roc_auc": cc_roc_data.get("auc"),
+        "cc_roc_data": {
+            "fpr": cc_roc_data.get("fpr", []),
+            "tpr": cc_roc_data.get("tpr", []),
+        } if cc_roc_data else {},
         "status": "success",
         "three_metric_analysis": (
             three_metric_results.get("summary", {}) if three_metric_results else {}

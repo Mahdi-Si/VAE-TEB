@@ -68,7 +68,8 @@ def _run_training_epochs(
 
     dataset_cfg = config.get("dataset_config", {})
     kfold_base_path = dataset_cfg["kfold_base_path"]
-    fold_datasets = get_fold_datasets(kfold_base_path, fold_id)
+    test_mode = dataset_cfg.get("test_mode", None)
+    fold_datasets = get_fold_datasets(kfold_base_path, fold_id, test_mode=test_mode)
 
     dl_cfg = dataset_cfg.get("dataloader_config", {})
     ds_kwargs = dict(dl_cfg.get("dataset_kwargs", {}))
