@@ -162,7 +162,8 @@ def precompute_fold_latents(
     use_posterior = config.get("model_config", {}).get("use_posterior", True)
 
     # ---- Resolve fold file lists --------------------------------------- #
-    fold_datasets = get_fold_datasets(kfold_base_path, fold_id)
+    test_mode = config.get("dataset_config", {}).get("test_mode", None)
+    fold_datasets = get_fold_datasets(kfold_base_path, fold_id, test_mode=test_mode)
 
     # ---- Dataset construction kwargs from config ----------------------- #
     dl_cfg = config.get("dataset_config", {}).get("dataloader_config", {})

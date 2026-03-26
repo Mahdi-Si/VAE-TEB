@@ -144,10 +144,6 @@ class PlTemporalClassifier(LightningModelBase):
             "class_0_acc": loss_dict["class_0_acc"],
             "class_1_acc": loss_dict["class_1_acc"],
         }
-        # Capture optional CausalMIL-specific decomposed loss components.
-        for extra_key in ("loss_guid", "loss_mono"):
-            if extra_key in loss_dict:
-                metrics[extra_key] = loss_dict[extra_key]
         return loss, metrics
 
 
@@ -327,7 +323,6 @@ class GraphModelTemporalTrainer(GraphModelBase):
         logger.info("VAE model loaded from checkpoint: {}", vae_checkpoint)
 
         # ----- 2. Build classifier model ---------------------------------- #
-        architecture_type = model_cfg.get("architecture_type", "temporal_lstm")
         seg_cfg = model_cfg.get("segment_encoder", {})
         lstm_cfg = model_cfg.get("temporal_lstm", {})
         feat_cfg = model_cfg.get("temporal_features", {})
@@ -338,89 +333,45 @@ class GraphModelTemporalTrainer(GraphModelBase):
         dt_cfg = feat_cfg.get("delta_t", {})
         temp_attn_cfg = model_cfg.get("temporal_attention", {})
 
-        if architecture_type in ("abmil", "transmil", "causal_mil"):
-            # --- MIL-based architecture --- #
-            from model.vae_teb_prediction.guid_classifier.mil_classification_model import (
-                ABMILClassifier,
-                TransMILClassifier,
-                CausalMILClassifier,
-            )
-
-            _MIL_MAP = {
-                "abmil": ABMILClassifier,
-                "transmil": TransMILClassifier,
-                "causal_mil": CausalMILClassifier,
-            }
-            mil_cfg = model_cfg.get("mil_config", {})
-            cls = _MIL_MAP[architecture_type]
-
-            self.pytorch_model = cls(
-                vae_model=vae_model,
-                segment_encoder_type=seg_cfg.get("type", "simple"),
-                d_seg=seg_cfg.get("d_seg", 128),
-                delta_t_embed_dim=(
-                    dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
-                ),
-                delta_t_dropout=dt_cfg.get("dropout", 0.1),
-                position_embed_dim=(
-                    seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
-                ),
-                max_position_index=seg_idx_cfg.get("max_index", 40),
-                tlo_enabled=tlo_cfg.get("enabled", False),
-                tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-                tlo_dropout=tlo_cfg.get("dropout", 0.1),
-                num_classes=head_cfg.get("num_classes", 2),
-                class_weights=class_weights,
-                vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-                use_posterior=model_cfg.get("use_posterior", True),
-                freeze_vae=model_cfg.get("freeze_vae", True),
-                rich_conv_channels=seg_cfg.get("rich_conv_channels", [32, 64, 128]),
-                rich_kernel_sizes=seg_cfg.get("rich_kernel_sizes", [5, 7, 11]),
-                rich_dilations=seg_cfg.get("rich_dilations", [1, 2, 4]),
-                **mil_cfg,
-            )
-            logger.info("Architecture: {} (MIL)", architecture_type)
-        else:
-            # --- Original temporal LSTM architecture (default) --- #
-            self.pytorch_model = TemporalVaeClassifier(
-                vae_model=vae_model,
-                segment_encoder_type=seg_cfg.get("type", "mean_pool"),
-                d_seg=seg_cfg.get("d_seg", 64),
-                temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
-                temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
-                temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
-                gap_encoding=model_cfg.get("gap_encoding", "concat"),
-                position_embed_dim=(
-                    seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
-                ),
-                max_position_index=seg_idx_cfg.get("max_index", 40),
-                tlo_enabled=tlo_cfg.get("enabled", False),
-                tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
-                tlo_dropout=tlo_cfg.get("dropout", 0.1),
-                delta_t_embed_dim=(
-                    dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
-                ),
-                delta_t_dropout=dt_cfg.get("dropout", 0.1),
-                persist_segment_state=seg_cfg.get("persist_state", False),
-                segment_state_decay=seg_cfg.get("state_decay", True),
-                temporal_lstm_residual=lstm_cfg.get("residual", False),
-                num_classes=head_cfg.get("num_classes", 2),
-                classifier_dropout=head_cfg.get("dropout", 0.1),
-                mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
-                classifier_num_residual_blocks=head_cfg.get("num_residual_blocks", 0),
-                classifier_bottleneck_dim=head_cfg.get("bottleneck_dim", 64),
-                output_dropout=head_cfg.get("output_dropout", 0.0),
-                class_weights=class_weights,
-                vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
-                use_posterior=model_cfg.get("use_posterior", True),
-                freeze_vae=model_cfg.get("freeze_vae", True),
-                cnn_kernel=seg_cfg.get("cnn_kernel", 7),
-                segment_attention_pool=seg_cfg.get("attention_pool", False),
-                temporal_attention=temp_attn_cfg.get("enabled", False),
-                temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
-                temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
-            )
-            logger.info("Architecture: temporal_lstm (default)")
+        self.pytorch_model = TemporalVaeClassifier(
+            vae_model=vae_model,
+            segment_encoder_type=seg_cfg.get("type", "mean_pool"),
+            d_seg=seg_cfg.get("d_seg", 64),
+            temporal_lstm_hidden=lstm_cfg.get("hidden_dim", 128),
+            temporal_lstm_layers=lstm_cfg.get("num_layers", 2),
+            temporal_lstm_dropout=lstm_cfg.get("dropout", 0.1),
+            gap_encoding=model_cfg.get("gap_encoding", "concat"),
+            position_embed_dim=(
+                seg_idx_cfg.get("embed_dim", 8) if seg_idx_cfg.get("enabled", False) else 0
+            ),
+            max_position_index=seg_idx_cfg.get("max_index", 40),
+            tlo_enabled=tlo_cfg.get("enabled", False),
+            tlo_embed_dim=tlo_cfg.get("embed_dim", 0),
+            tlo_dropout=tlo_cfg.get("dropout", 0.1),
+            delta_t_embed_dim=(
+                dt_cfg.get("embed_dim", 8) if dt_cfg.get("enabled", True) else 0
+            ),
+            delta_t_dropout=dt_cfg.get("dropout", 0.1),
+            persist_segment_state=seg_cfg.get("persist_state", False),
+            segment_state_decay=seg_cfg.get("state_decay", True),
+            temporal_lstm_residual=lstm_cfg.get("residual", False),
+            num_classes=head_cfg.get("num_classes", 2),
+            classifier_dropout=head_cfg.get("dropout", 0.1),
+            mlp_multiplier=head_cfg.get("mlp_multiplier", 2.0),
+            classifier_num_residual_blocks=head_cfg.get("num_residual_blocks", 0),
+            classifier_bottleneck_dim=head_cfg.get("bottleneck_dim", 64),
+            output_dropout=head_cfg.get("output_dropout", 0.0),
+            class_weights=class_weights,
+            vae_chunk_size=model_cfg.get("vae_chunk_size", 32),
+            use_posterior=model_cfg.get("use_posterior", True),
+            freeze_vae=model_cfg.get("freeze_vae", True),
+            cnn_kernel=seg_cfg.get("cnn_kernel", 7),
+            segment_attention_pool=seg_cfg.get("attention_pool", False),
+            temporal_attention=temp_attn_cfg.get("enabled", False),
+            temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
+            temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
+        )
+        logger.info("Architecture: temporal_lstm")
 
         # ----- 3. Log parameter counts ----------------------------------- #
         total_params = sum(p.numel() for p in self.pytorch_model.parameters())
@@ -601,7 +552,8 @@ def train_fold(
 
     dataset_cfg = config.get("dataset_config", {})
     kfold_base_path = dataset_cfg["kfold_base_path"]
-    fold_datasets = get_fold_datasets(kfold_base_path, fold_id)
+    test_mode = dataset_cfg.get("test_mode", None)
+    fold_datasets = get_fold_datasets(kfold_base_path, fold_id, test_mode=test_mode)
 
     dataloader_cfg = dataset_cfg.get("dataloader_config", {})
     dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {})
