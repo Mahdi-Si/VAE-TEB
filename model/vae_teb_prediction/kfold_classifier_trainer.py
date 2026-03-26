@@ -29,25 +29,35 @@ from model.vae_teb_prediction.evaluate_classifier import generate_aggregated_plo
 
 
 def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
-    """
-    Get train, val, and test dataset paths for a specific fold.
+    """Get train, val, and test dataset paths for a specific fold.
+
+    Supports two directory layouts:
+
+    * **Per-fold test** (augmented / legacy): ``fold_N/test/`` contains HDF5
+      files specific to that fold.
+    * **Shared test** (holdout): ``base_path/test/`` is a single test
+      directory shared across all folds (``fold_N/`` only has train + val).
+
+    The function auto-detects the layout: it checks the fold-level test
+    directory first, then falls back to the shared test directory.
 
     Args:
-        base_path: Base path to k-fold dataset directory
-        fold_id: Fold number (1-10)
+        base_path: Base path to k-fold dataset directory.
+        fold_id: Fold number (1-10).
 
     Returns:
-        Dictionary with 'train', 'val', 'test' keys containing lists of HDF5 file paths
+        Dictionary with ``'train'``, ``'val'``, ``'test'`` keys containing
+        lists of HDF5 file paths.
     """
     fold_dir = Path(base_path) / f"fold_{fold_id}"
 
-    datasets = {
+    datasets: Dict[str, List[str]] = {
         'train': [],
         'val': [],
         'test': []
     }
 
-    for split in ['train', 'val', 'test']:
+    for split in ['train', 'val']:
         split_dir = fold_dir / split
         if split_dir.exists():
             hdf5_files = sorted(split_dir.glob("*.hdf5"))
@@ -55,6 +65,24 @@ def get_fold_datasets(base_path: str, fold_id: int) -> Dict[str, List[str]]:
             logger.info(f"Fold {fold_id} {split}: found {len(datasets[split])} files")
         else:
             logger.warning(f"Split directory not found: {split_dir}")
+
+    # Test: check fold-level first, then shared test directory
+    test_dir_fold = fold_dir / "test"
+    test_dir_shared = Path(base_path) / "test"
+
+    if test_dir_fold.exists() and list(test_dir_fold.glob("*.hdf5")):
+        hdf5_files = sorted(test_dir_fold.glob("*.hdf5"))
+        datasets["test"] = [str(f) for f in hdf5_files]
+        logger.info(f"Fold {fold_id} test (per-fold): found {len(datasets['test'])} files")
+    elif test_dir_shared.exists() and list(test_dir_shared.glob("*.hdf5")):
+        hdf5_files = sorted(test_dir_shared.glob("*.hdf5"))
+        datasets["test"] = [str(f) for f in hdf5_files]
+        logger.info(f"Fold {fold_id} test (shared): found {len(datasets['test'])} files")
+    else:
+        logger.warning(
+            f"No test directory found for fold {fold_id}: "
+            f"checked {test_dir_fold} and {test_dir_shared}"
+        )
 
     # Validate we have data for all splits
     for split in ['train', 'val', 'test']:
