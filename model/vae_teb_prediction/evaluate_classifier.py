@@ -3697,6 +3697,107 @@ def compute_guid_level_roc(
     }
 
 
+def compute_committed_cumulative_roc(
+    df_raw: pd.DataFrame,
+    decision_time_hours: float = 1.0,
+    max_gap_multiplier: Optional[float] = None,
+    n_thresholds: int = 200,
+) -> Dict:
+    """Compute ROC curve using committed-cumulative FPR/TPR at decision time.
+
+    For each threshold candidate:
+      1. Apply CDR + fill_missing_epochs(fill_until_birth=True).
+      2. Among GUIDs with data at the decision time, count detections.
+      3. Record FPR and sensitivity (TPR) at the decision time bin.
+
+    This produces a clinically meaningful ROC that accounts for the CDR
+    forward-fill logic and the committed-cumulative denominator (GUIDs
+    available at the decision time).
+
+    Args:
+        df_raw: Raw predictions DataFrame (pre-CDR) with columns
+            ``guid``, ``epoch`` (or ``epoch_hours``), ``prob_class_1``,
+            ``binary_target``.
+        decision_time_hours: Decision time in hours before delivery.
+        max_gap_multiplier: Passed to ``fill_missing_epochs``.
+        n_thresholds: Maximum number of threshold candidates to evaluate.
+
+    Returns:
+        Dictionary with keys ``fpr``, ``tpr``, ``thresholds``, ``auc``,
+        ``n_positive``, ``n_negative``.  Returns empty dict on failure.
+    """
+    probs = df_raw['prob_class_1'].values
+    candidates = np.sort(np.unique(probs))
+    if len(candidates) > n_thresholds:
+        indices = np.linspace(0, len(candidates) - 1, n_thresholds, dtype=int)
+        candidates = candidates[indices]
+
+    fprs, tprs = [], []
+
+    for thresh in candidates:
+        df_cdr = apply_clinical_decision_rule(df_raw.copy(), thresh, verify=False)
+        df_filled = fill_missing_epochs(
+            df_cdr, fill_until_birth=True, max_gap_multiplier=max_gap_multiplier,
+        )
+        df_filled = ensure_epoch_hours(df_filled)
+
+        guid_targets = df_filled.groupby('guid')['binary_target'].max()
+        positive_guids = set(guid_targets[guid_targets == 1].index)
+        negative_guids = set(guid_targets[guid_targets == 0].index)
+
+        at_decision = df_filled[df_filled['epoch_hours'] >= decision_time_hours]
+        available_guids = set(at_decision['guid'].unique())
+
+        n_pos_avail = len(available_guids & positive_guids)
+        n_neg_avail = len(available_guids & negative_guids)
+
+        if n_pos_avail == 0 or n_neg_avail == 0:
+            continue
+
+        tp, fp = 0, 0
+        detected_guids = set(
+            at_decision.loc[at_decision['clinical_pred'] == 1, 'guid'].unique()
+        )
+        tp = len(detected_guids & positive_guids & available_guids)
+        fp = len(detected_guids & negative_guids & available_guids)
+
+        tprs.append(tp / n_pos_avail)
+        fprs.append(fp / n_neg_avail)
+
+    if len(fprs) < 2:
+        logger.warning("Not enough valid threshold points for CC-ROC")
+        return {}
+
+    fprs = np.array(fprs)
+    tprs = np.array(tprs)
+
+    sorted_idx = np.argsort(fprs)
+    fprs = fprs[sorted_idx]
+    tprs = tprs[sorted_idx]
+
+    # Add endpoints
+    fprs = np.concatenate([[0.0], fprs, [1.0]])
+    tprs = np.concatenate([[0.0], tprs, [1.0]])
+
+    # Remove duplicate FPR values (keep max TPR)
+    unique_fprs, unique_idx = np.unique(fprs, return_index=True)
+    unique_tprs = np.array([tprs[fprs == f].max() for f in unique_fprs])
+
+    roc_auc = float(np.trapz(unique_tprs, unique_fprs))
+
+    n_pos = len(positive_guids)
+    n_neg = len(negative_guids)
+
+    return {
+        'fpr': unique_fprs.tolist(),
+        'tpr': unique_tprs.tolist(),
+        'thresholds': candidates.tolist(),
+        'auc': roc_auc,
+        'n_positive': n_pos,
+        'n_negative': n_neg,
+    }
+
+
 def plot_roc_curve(
     roc_data: Dict,
     output_path: Path,

@@ -14,42 +14,23 @@ general_config:
     out_dir_base: /path/to/temporal_results     # Root output dir for all folds and results
 
 model_config:
-  architecture_type: "temporal_lstm"            # "temporal_lstm" | "abmil" | "transmil" | "causal_mil"
   vae_checkpoint: /path/to/vae.ckpt            # Pre-trained frozen VAE checkpoint path
   freeze_vae: true                              # Freeze all VAE weights during training
   use_posterior: true                           # Use posterior mean (true) or prior mean (false) from VAE
   vae_chunk_size: 32                            # Segments per VAE forward chunk (controls GPU memory)
 
-  # MIL-specific config (only used when architecture_type is abmil/transmil/causal_mil)
-  mil_config:
-    attn_dim: 128                               # Gated attention internal dim (ABMIL)
-    n_heads: 4                                  # Transformer heads (TransMIL, CausalMIL)
-    n_layers: 2                                 # Transformer encoder layers (TransMIL, CausalMIL)
-    d_ff: 256                                   # Feedforward dim (TransMIL, CausalMIL)
-    d_model: 0                                  # 0 = auto match feature_dim (TransMIL, CausalMIL)
-    use_cls_token: true                         # Prepend CLS token (TransMIL)
-    monotonicity_weight: 0.1                    # Monotonicity regulariser weight (CausalMIL)
-    monotonicity_margin: 0.0                    # Hinge margin for monotonicity (CausalMIL)
-    aggregation: "max_risk"                     # GUID aggregation: "max_risk" | "attention" | "last" (CausalMIL)
-    classifier_dropout: 0.1                     # Dropout in MIL classifier head
-    mlp_multiplier: 2.0                         # MLP hidden expansion factor
-
   segment_encoder:
-    type: "lstm"                                # temporal_lstm: "mean_pool" | "lstm" | "cnn"; MIL: "simple" | "rich"
-    d_seg: 128                                  # Segment dim: 128 for temporal_lstm, recommend 128 for MIL (must be divisible by n_heads for TransMIL/CausalMIL)
-    lstm_hidden: 128                            # LSTM hidden size, should match d_seg (temporal_lstm only)
+    type: "lstm"                                # "mean_pool" | "lstm" | "cnn"
+    d_seg: 256                                  # Segment embedding dimension
+    lstm_hidden: 256                            # LSTM hidden size, should match d_seg
     cnn_kernel: 7                               # Causal conv kernel size (temporal_lstm "cnn" only)
     persist_state: true                         # Carry LSTM hidden state across segments (temporal_lstm "lstm" only)
     state_decay: true                           # Apply time-decay gating to persistent segment LSTM state
-    # Rich segment encoder params (MIL "rich" encoder only):
-    rich_conv_channels: [32, 64, 128]           # CausalConvBlock channel counts
-    rich_kernel_sizes: [5, 7, 11]               # CausalConvBlock kernel sizes
-    rich_dilations: [1, 2, 4]                   # CausalConvBlock dilation factors
     attention_pool: true                          # Attention pooling over all 300 segment LSTM hidden states (vs last hidden state only)
 
   temporal_lstm:
-    hidden_dim: 256                             # Temporal LSTM hidden size (context across segments)
-    num_layers: 3                               # Stacked LSTM layers
+    hidden_dim: 512                             # Temporal LSTM hidden size (context across segments)
+    num_layers: 4                               # Stacked LSTM layers
     dropout: 0.2                                # Dropout between LSTM layers
     residual: true                              # Skip connection: project input to hidden dim, add to LSTM output
 
@@ -75,13 +56,13 @@ model_config:
     dropout: 0.2                                # Dropout in classifier head / residual blocks
     mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier (legacy head only)
     use_class_weights: true                     # false = uniform CE loss (no class weighting)
-    num_residual_blocks: 3                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
-    bottleneck_dim: 128                         # Bottleneck dimension inside each residual block
+    num_residual_blocks: 5                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
+    bottleneck_dim: 256                         # Bottleneck dimension inside each residual block
     output_dropout: 0.3                         # Dropout on temporal LSTM output before classifier head
 
   temporal_attention:
     enabled: true                                 # ATTAIN-style attention over past temporal LSTM cell states
-    attn_dim: 64                                  # Projection dimension for attention queries/keys
+    attn_dim: 128                                 # Projection dimension for attention queries/keys
     dropout: 0.1                                  # Dropout on attention weights
 
   precompute_latents: false                     # true = skip VAE forward, load cached mu_post from disk
@@ -96,6 +77,7 @@ model_config:
 
 dataset_config:
   kfold_base_path: /path/to/k_fold_dataset      # Root dir containing fold_1/ ... fold_10/ HDF5 splits
+  test_mode: null                                 # null = auto-detect, "holdout" = shared base_path/test/, "augmented" = fold_N/test/
   num_folds: 10                                  # Total number of cross-validation folds
   fold_ids: null                                 # Which folds to run (null = all, e.g. [1,2,3] for subset)
   stat_path: /path/to/stats.hdf5                 # Normalization statistics file (mean/std per field)

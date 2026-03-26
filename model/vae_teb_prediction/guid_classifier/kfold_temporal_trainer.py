@@ -1027,6 +1027,18 @@ def _build_kfold_summary(
         "std_fpr": test_fpr_s,
     }
 
+    # ROC AUC (GUID-level)
+    roc_aucs = [r.get("roc_auc") for r in successful if r.get("roc_auc") is not None]
+    if roc_aucs:
+        summary["roc_auc_mean"] = float(np.mean(roc_aucs))
+        summary["roc_auc_std"] = float(np.std(roc_aucs))
+
+    # Committed-cumulative ROC AUC
+    cc_roc_aucs = [r.get("cc_roc_auc") for r in successful if r.get("cc_roc_auc") is not None]
+    if cc_roc_aucs:
+        summary["cc_roc_auc_mean"] = float(np.mean(cc_roc_aucs))
+        summary["cc_roc_auc_std"] = float(np.std(cc_roc_aucs))
+
     summary["individual_results"] = all_results
 
     return summary
