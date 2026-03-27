@@ -4415,32 +4415,21 @@ def _evaluate_single_fold(
         val_df_raw.to_csv(val_raw_path, index=False)
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
-    # Find thresholds on validation set (one per metric type)
-    logger.info(f"Fold {fold_id}: Finding thresholds (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+    # Find single threshold via committed cumulative — applied to all metric types
+    logger.info(f"Fold {fold_id}: Finding threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
 
-    primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
+    threshold, threshold_metrics = find_threshold_for_committed_cumulative_fpr_at_1h(
         val_df_raw,
         target_fpr=target_fpr,
         time_window_hours=decision_time_hours,
         max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=0.5,
     )
-    threshold_cumulative, _ = find_threshold_for_committed_cumulative_fpr_at_1h(
-        val_df_raw,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        fallback_tolerance_hours=0.5,
-    )
-    threshold_instantaneous, _ = find_threshold_for_instantaneous_fpr_at_1h(
-        val_df_raw,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        fallback_tolerance_hours=0.5,
-    )
+    primary_threshold = threshold
     all_thresholds = {
-        'instantaneous': threshold_instantaneous,
-        'committed_cumulative': threshold_cumulative,
-        'committed_overall': primary_threshold,
+        'instantaneous': threshold,
+        'committed_cumulative': threshold,
+        'committed_overall': threshold,
     }
 
     n_pos = threshold_metrics.get('n_positive_total', threshold_metrics.get('n_available_positive', 1))
@@ -4449,8 +4438,7 @@ def _evaluate_single_fold(
     spec = threshold_metrics.get('specificity', 0)
     threshold_metrics['accuracy'] = float((sens * n_pos + spec * n_neg) / (n_pos + n_neg)) if (n_pos + n_neg) > 0 else 0.0
 
-    logger.info(f"Fold {fold_id}: Thresholds - overall={primary_threshold:.4f}, "
-                f"cumulative={threshold_cumulative:.4f}, instantaneous={threshold_instantaneous:.4f}")
+    logger.info(f"Fold {fold_id}: Threshold (committed_cumulative) = {threshold:.4f}")
 
     # Apply clinical decision rule to validation set (primary threshold)
     val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
@@ -4561,6 +4549,32 @@ def _evaluate_single_fold(
     except Exception as e:
         logger.warning(f"Fold {fold_id}: ROC computation failed: {e}")
 
+    # Committed-cumulative ROC curve
+    cc_roc_data = {}
+    try:
+        cc_roc_data = compute_committed_cumulative_roc(
+            test_df_raw,
+            decision_time_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
+        )
+        if cc_roc_data:
+            plot_roc_curve(
+                cc_roc_data,
+                evaluation_dir / "roc_curve_committed_cumulative.png",
+                title_suffix=f"Committed Cumulative — Fold {fold_id}",
+                threshold=threshold,
+            )
+            cc_roc_csv = pd.DataFrame({
+                'fpr': cc_roc_data['fpr'],
+                'tpr': cc_roc_data['tpr'],
+            })
+            cc_roc_csv.to_csv(
+                evaluation_dir / "roc_data_committed_cumulative.csv", index=False,
+            )
+            logger.info(f"Fold {fold_id}: CC-ROC AUC = {cc_roc_data['auc']:.4f}")
+    except Exception as e:
+        logger.warning(f"Fold {fold_id}: CC-ROC computation failed: {e}")
+
     # Save threshold and metrics info
     threshold_info = {
         'primary_threshold': float(primary_threshold),
@@ -4577,6 +4591,7 @@ def _evaluate_single_fold(
         'test_metrics_primary': primary_metrics,
         'decision_point_metrics': decision_point,
         'roc_auc': roc_data.get('auc'),
+        'cc_roc_auc': cc_roc_data.get('auc'),
     }
 
     with open(evaluation_dir / "threshold_info.json", 'w') as f:
@@ -4604,6 +4619,11 @@ def _evaluate_single_fold(
             'fpr': roc_data.get('fpr', []),
             'tpr': roc_data.get('tpr', []),
         } if roc_data else {},
+        'cc_roc_auc': cc_roc_data.get('auc'),
+        'cc_roc_data': {
+            'fpr': cc_roc_data.get('fpr', []),
+            'tpr': cc_roc_data.get('tpr', []),
+        } if cc_roc_data else {},
         'status': 'success',
         # Include full three metric type analysis (summary only - DataFrames saved separately)
         'three_metric_analysis': three_metric_results.get('summary', {}) if three_metric_results else {},
