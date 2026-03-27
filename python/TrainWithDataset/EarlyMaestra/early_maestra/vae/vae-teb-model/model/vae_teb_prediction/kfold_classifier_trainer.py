@@ -440,13 +440,12 @@ def train_single_fold(
 
         from model.vae_teb_prediction.evaluate_classifier import (
             run_inference,
-            find_threshold_for_committed_overall_fpr_at_1h,
             find_threshold_for_committed_cumulative_fpr_at_1h,
-            find_threshold_for_instantaneous_fpr_at_1h,
             apply_clinical_decision_rule,
             fill_missing_epochs,
             generate_three_metric_type_analysis,
             compute_guid_level_roc,
+            compute_committed_cumulative_roc,
             plot_roc_curve,
         )
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -469,43 +468,26 @@ def train_single_fold(
         logger.info(f"Fold {fold_id}: Validation predictions saved ({len(val_df_raw)} rows)")
 
         # --------------------------------------------------------------------
-        # FIND THRESHOLDS (one per metric type)
+        # FIND THRESHOLD (committed cumulative — applied to all metric types)
         # --------------------------------------------------------------------
-        logger.info(f"Fold {fold_id}: Finding thresholds (target_fpr={target_fpr}, time={decision_time_hours}h)...")
+        logger.info(f"Fold {fold_id}: Finding threshold (target_fpr={target_fpr}, time={decision_time_hours}h)...")
 
-        # PRIMARY — committed_overall
-        primary_threshold, threshold_metrics = find_threshold_for_committed_overall_fpr_at_1h(
+        threshold, threshold_metrics = find_threshold_for_committed_cumulative_fpr_at_1h(
             val_df_raw,
             target_fpr=target_fpr,
             time_window_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
             fallback_tolerance_hours=0.5,
         )
-
-        # Committed cumulative
-        threshold_cumulative, _ = find_threshold_for_committed_cumulative_fpr_at_1h(
-            val_df_raw,
-            target_fpr=target_fpr,
-            time_window_hours=decision_time_hours,
-            fallback_tolerance_hours=0.5,
-        )
-
-        # Instantaneous
-        threshold_instantaneous, _ = find_threshold_for_instantaneous_fpr_at_1h(
-            val_df_raw,
-            target_fpr=target_fpr,
-            time_window_hours=decision_time_hours,
-            fallback_tolerance_hours=0.5,
-        )
+        primary_threshold = threshold
 
         all_thresholds = {
-            'instantaneous': threshold_instantaneous,
-            'committed_cumulative': threshold_cumulative,
-            'committed_overall': primary_threshold,
+            'instantaneous': threshold,
+            'committed_cumulative': threshold,
+            'committed_overall': threshold,
         }
 
-        logger.info(f"Fold {fold_id}: Thresholds — overall={primary_threshold:.4f}, "
-                     f"cumulative={threshold_cumulative:.4f}, "
-                     f"instantaneous={threshold_instantaneous:.4f}")
+        logger.info(f"Fold {fold_id}: Threshold (committed_cumulative) = {threshold:.4f}")
 
         # Apply clinical decision rule to validation set (primary threshold)
         val_df_clinical = apply_clinical_decision_rule(val_df_raw.copy(), primary_threshold)
@@ -602,6 +584,32 @@ def train_single_fold(
         except Exception as e:
             logger.warning(f"Fold {fold_id}: ROC computation failed: {e}")
 
+        # Committed-cumulative ROC curve
+        cc_roc_data = {}
+        try:
+            cc_roc_data = compute_committed_cumulative_roc(
+                test_df_raw,
+                decision_time_hours=decision_time_hours,
+                max_gap_multiplier=max_gap_multiplier,
+            )
+            if cc_roc_data:
+                plot_roc_curve(
+                    cc_roc_data,
+                    evaluation_dir / "roc_curve_committed_cumulative.png",
+                    title_suffix=f"Committed Cumulative — Fold {fold_id}",
+                    threshold=threshold,
+                )
+                cc_roc_csv = pd.DataFrame({
+                    'fpr': cc_roc_data['fpr'],
+                    'tpr': cc_roc_data['tpr'],
+                })
+                cc_roc_csv.to_csv(
+                    evaluation_dir / "roc_data_committed_cumulative.csv", index=False,
+                )
+                logger.info(f"Fold {fold_id}: CC-ROC AUC = {cc_roc_data['auc']:.4f}")
+        except Exception as e:
+            logger.warning(f"Fold {fold_id}: CC-ROC computation failed: {e}")
+
         # Save threshold and metrics info
         threshold_info = {
             'primary_threshold': float(primary_threshold),
@@ -617,6 +625,7 @@ def train_single_fold(
             'test_metrics_primary': primary_metrics,
             'decision_point_metrics': decision_point,
             'roc_auc': roc_data.get('auc'),
+            'cc_roc_auc': cc_roc_data.get('auc'),
         }
 
         # Save threshold info
@@ -660,6 +669,11 @@ def train_single_fold(
                 'fpr': roc_data.get('fpr', []),
                 'tpr': roc_data.get('tpr', []),
             } if roc_data else {},
+            'cc_roc_auc': cc_roc_data.get('auc'),
+            'cc_roc_data': {
+                'fpr': cc_roc_data.get('fpr', []),
+                'tpr': cc_roc_data.get('tpr', []),
+            } if cc_roc_data else {},
 
             'status': 'success'
         }
@@ -926,6 +940,13 @@ def run_kfold_parallel(
         if roc_aucs:
             arr = np.array(roc_aucs)
             roc_auc_agg = {'roc_auc_mean': float(arr.mean()), 'roc_auc_std': float(arr.std())}
+
+        # Committed-cumulative ROC AUC aggregation
+        cc_roc_aucs = [r.get('cc_roc_auc') for r in successful_folds if r.get('cc_roc_auc') is not None]
+        if cc_roc_aucs:
+            arr = np.array(cc_roc_aucs)
+            roc_auc_agg['cc_roc_auc_mean'] = float(arr.mean())
+            roc_auc_agg['cc_roc_auc_std'] = float(arr.std())
 
         summary = {
             'configured_num_folds': num_folds,
