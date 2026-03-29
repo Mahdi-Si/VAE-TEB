@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from tqdm import tqdm
 
 from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
@@ -123,6 +123,7 @@ N_FOLDS = 10
 VAL_RATIO = 1 / 9  # used in augmented mode: 80 / 10 / 10
 RANDOM_STATE = 42
 TLO_WITH_RATIO = 0.75
+N_DURATION_BINS = 3  # quantile tertiles: short / medium / long labour
 
 NO_BG_SUBGROUPS = {"healthy_no_bg_cs", "healthy_no_bg_no_cs"}
 
@@ -305,6 +306,7 @@ def create_initial_hdf5(
     n_channels: int,
     len_sequence: int = 300,
     n_cross_phase_channels: int = 62,
+    n_up_st_channels: int = 0,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
@@ -316,6 +318,7 @@ def create_initial_hdf5(
         n_channels: Total phase + cross-phase channels.
         len_sequence: Sequence dimension length.
         n_cross_phase_channels: Channels for fhr_up_ph.
+        n_up_st_channels: Number of UP scattering channels (0 = do not create up_st dataset).
     """
     try:
         os.remove(path)
@@ -365,6 +368,16 @@ def create_initial_hdf5(
             chunks=(chunk_n, n_cross_phase_channels, len_sequence),
             compression="lzf",
         )
+        # up_st: UP scattering coefficients (optional, same structure as fhr_st)
+        if n_up_st_channels > 0:
+            h5f.create_dataset(
+                "up_st",
+                shape=(0, n_up_st_channels, len_sequence),
+                maxshape=(None, n_up_st_channels, len_sequence),
+                dtype="f4",
+                chunks=(chunk_n, n_up_st_channels, len_sequence),
+                compression="lzf",
+            )
         h5f.create_dataset(
             "target",
             shape=(0, len_sequence),
@@ -445,6 +458,7 @@ def append_samples_batch(
     bg_label_batch: np.ndarray,
     tlo_batch: np.ndarray,
     second_stage_batch: np.ndarray,
+    up_st_batch: Optional[np.ndarray] = None,
 ) -> None:
     """Append K samples to an existing HDF5 file in a single open/close.
 
@@ -461,6 +475,7 @@ def append_samples_batch(
         epoch_batch: Shape ``(K,)``, float32.
         cs_label_batch: Shape ``(K,)``, uint8.
         bg_label_batch: Shape ``(K,)``, uint8.
+        up_st_batch: Shape ``(K, 43, len_seq)``. Optional.
         tlo_batch: Shape ``(K,)``, float32.
         second_stage_batch: Shape ``(K,)``, float32.
     """
@@ -477,6 +492,8 @@ def append_samples_batch(
         h5f["fhr_st"][idx:new_size] = fhr_st_batch
         h5f["fhr_ph"][idx:new_size] = fhr_ph_batch
         h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
+        if up_st_batch is not None and "up_st" in h5f:
+            h5f["up_st"][idx:new_size] = up_st_batch
         h5f["target"][idx:new_size] = target_batch
         h5f["weight"][idx:new_size] = weight_batch
         h5f["epoch"][idx:new_size] = epoch_batch
@@ -1017,7 +1034,7 @@ def _sample_with_tlo_constraint(
 
 def select_classification_guids(
     screening_df: pd.DataFrame,
-    test_mode: str = "holdout",
+    test_mode: str = "augmented",
     bg_cls_fraction: float = HEALTHY_BG_CLS_FRACTION,
     test_holdout_fraction: float = TEST_HOLDOUT_FRACTION,
     no_bg_tlo_ratio: float = HEALTHY_NO_BG_TLO_RATIO,
@@ -1038,7 +1055,7 @@ def select_classification_guids(
 
     Args:
         screening_df: DataFrame from prescreening (all GUIDs).
-        test_mode: ``"holdout"`` (default) or ``"augmented"``.
+        test_mode: ``"augmented"`` (default) or ``"holdout"``.
         bg_cls_fraction: Fraction of eligible BG to select for classification.
         test_holdout_fraction: Fraction held out for test per subgroup.
         no_bg_tlo_ratio: Enforced TLO ratio for no-BG subgroups.
@@ -1046,7 +1063,7 @@ def select_classification_guids(
         verbose: Verbosity flag.
 
     Returns:
-        Dict with keys ``test_mode``, ``trainval``, ``test``,
+        Dict with keys ``test_mode``, ``trainval``, ``test``, ``tlo_map``,
         ``pretraining_bg_cs``, ``pretraining_bg_no_cs``, ``stats``.
     """
     rng = random.Random(random_state)
@@ -1285,14 +1302,62 @@ def select_classification_guids(
         logger.info(f"  Test mode: {test_mode}")
         logger.info("=" * 80)
 
+    # Build path -> tlo_hours lookup for stratification in create_cv_splits
+    all_trainval_paths = set()
+    for sg_paths in trainval.values():
+        all_trainval_paths.update(sg_paths)
+    path_to_tlo = screening_df.set_index("record_path")["tlo_hours"].to_dict()
+    tlo_map = {p: path_to_tlo[p] for p in all_trainval_paths if p in path_to_tlo}
+
     return {
         "test_mode": test_mode,
         "trainval": trainval,
         "test": test_guids,
+        "tlo_map": tlo_map,
         "pretraining_bg_cs": bg_pretrain.get("healthy_bg_cs", []),
         "pretraining_bg_no_cs": bg_pretrain.get("healthy_bg_no_cs", []),
         "stats": stats,
     }
+
+
+def _compute_duration_bins(
+    paths: List[str],
+    tlo_map: Dict[str, float],
+    n_bins: int = N_DURATION_BINS,
+) -> np.ndarray:
+    """Bin labour durations into quantile-based groups for stratification.
+
+    Args:
+        paths: List of record file paths.
+        tlo_map: Mapping ``record_path -> tlo_hours`` (negative hours
+            before delivery, NaN if unknown).
+        n_bins: Number of quantile bins for known durations.
+
+    Returns:
+        Integer array of bin labels aligned with *paths*.  Known durations
+        are assigned to bins ``0 .. n_bins-1`` (quantile tertiles);
+        unknown (NaN / missing) durations are assigned to bin ``n_bins``.
+        If no known durations exist, returns all zeros so that
+        stratification degenerates to plain KFold.
+    """
+    durations = np.array([
+        abs(tlo_map.get(p, float("nan"))) for p in paths
+    ])
+    known_mask = ~np.isnan(durations)
+    n_known = known_mask.sum()
+
+    if n_known == 0:
+        return np.zeros(len(paths), dtype=int)
+
+    # Quantile boundaries from known durations
+    known_durations = durations[known_mask]
+    quantiles = np.linspace(1 / n_bins, 1 - 1 / n_bins, n_bins - 1)
+    boundaries = np.quantile(known_durations, quantiles)
+
+    bins = np.empty(len(paths), dtype=int)
+    bins[known_mask] = np.digitize(known_durations, boundaries)  # 0..n_bins-1
+    bins[~known_mask] = n_bins  # "unknown" bin
+    return bins
 
 
 # ============================================================================
@@ -1306,16 +1371,22 @@ def create_cv_splits(
 ) -> Dict[str, Any]:
     """Create stratified-by-subgroup K-fold CV splits.
 
+    Within each subgroup, folds are stratified by **labour duration** (derived
+    from TLO) using quantile-based bins.  If stratification is not feasible
+    (too few GUIDs in a duration bin), falls back to plain ``KFold``.
+
     Supports two test modes:
 
     * **holdout** — ``KFold`` on the train/val pool gives 90/10 train/val per
       fold. The fixed test holdout is returned separately.
-    * **augmented** — Standard 80/10/10 via ``KFold`` + inner
+    * **augmented** (default) — Standard 80/10/10 via ``KFold`` + inner
       ``train_test_split``. Each fold's test partition is augmented with extra
       healthy no-BG GUIDs that never appear in train/val.
 
     Args:
         selection_result: Dict returned by ``select_classification_guids()``.
+            Must contain ``tlo_map`` (path → tlo_hours) for duration
+            stratification; if absent, falls back to plain KFold.
         n_splits: Number of CV folds.
         val_ratio: Inner val fraction (augmented mode only).
         random_state: Seed for reproducibility.
@@ -1327,8 +1398,14 @@ def create_cv_splits(
     test_mode = selection_result["test_mode"]
     trainval_data = selection_result["trainval"]
     test_data = selection_result["test"]
+    tlo_map: Dict[str, float] = selection_result.get("tlo_map", {})
 
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    skf = StratifiedKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state,
+    )
+    kf_fallback = KFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state,
+    )
 
     # Only split subgroups that actually have GUIDs
     active_groups = {
@@ -1344,7 +1421,26 @@ def create_cv_splits(
     for sg, paths in active_groups.items():
         n = len(paths)
         if n >= n_splits:
-            splits_per_group[sg] = list(kf.split(paths))
+            duration_bins = _compute_duration_bins(paths, tlo_map)
+            bin_counts = np.bincount(duration_bins)
+            if np.all(bin_counts[bin_counts > 0] >= n_splits):
+                try:
+                    splits_per_group[sg] = list(
+                        skf.split(paths, duration_bins)
+                    )
+                except ValueError:
+                    logger.warning(
+                        f"StratifiedKFold failed for {sg}; "
+                        f"falling back to KFold"
+                    )
+                    splits_per_group[sg] = list(kf_fallback.split(paths))
+            else:
+                logger.warning(
+                    f"Subgroup {sg}: some duration bins too small for "
+                    f"StratifiedKFold (bin counts: {bin_counts.tolist()}); "
+                    f"using KFold"
+                )
+                splits_per_group[sg] = list(kf_fallback.split(paths))
         else:
             indices = np.arange(n)
             rng_state.shuffle(indices)
@@ -1401,12 +1497,30 @@ def create_cv_splits(
 
                 # Guard: inner split needs >= 2 samples in train_val
                 if len(train_val_idx) >= 2:
-                    train_idx, val_idx = train_test_split(
-                        train_val_idx,
-                        test_size=val_ratio,
-                        shuffle=True,
-                        random_state=random_state,
-                    )
+                    # Stratify inner split by duration bins when feasible
+                    tv_paths = [
+                        active_groups[sg][i] for i in train_val_idx
+                    ]
+                    tv_bins = _compute_duration_bins(tv_paths, tlo_map)
+                    tv_bin_counts = np.bincount(tv_bins)
+                    try:
+                        if tv_bin_counts[tv_bin_counts > 0].min() >= 2:
+                            train_idx, val_idx = train_test_split(
+                                train_val_idx,
+                                test_size=val_ratio,
+                                shuffle=True,
+                                random_state=random_state,
+                                stratify=tv_bins,
+                            )
+                        else:
+                            raise ValueError("bin too small")
+                    except ValueError:
+                        train_idx, val_idx = train_test_split(
+                            train_val_idx,
+                            test_size=val_ratio,
+                            shuffle=True,
+                            random_state=random_state,
+                        )
                 else:
                     train_idx = train_val_idx
                     val_idx = np.array([], dtype=int)
@@ -1626,6 +1740,7 @@ def create_hdf5_dataset_from_records_list(
             st_phase_list = [None] * n_valid
             st_cross_list = [None] * n_valid
             st_up_phase_list = [None] * n_valid
+            st_up_scatter_list = [None] * n_valid
             scatter_failed: set = set()
 
             for batch_start in range(0, n_valid, scatter_batch_size):
@@ -1647,6 +1762,11 @@ def create_hdf5_dataset_from_records_list(
                         compute_cross_phase=False,
                         scattering_channel=0, phase_channels=[1],
                     )
+                    bus = st_model(
+                        x=batch, compute_phase=False,
+                        compute_cross_phase=False,
+                        scattering_channel=1,
+                    )
                     bs = batch.shape[0]
                     for lj in range(bs):
                         gj = batch_start + lj
@@ -1662,6 +1782,10 @@ def create_hdf5_dataset_from_records_list(
                             k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
                             for k, v in bup.items()
                         }
+                        st_up_scatter_list[gj] = {
+                            k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
+                            for k, v in bus.items()
+                        }
                 except RuntimeError:
                     for lj in range(batch.shape[0]):
                         gj = batch_start + lj
@@ -1670,9 +1794,11 @@ def create_hdf5_dataset_from_records_list(
                             sp = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[0])
                             sc = st_model(x=seg, compute_phase=False, compute_cross_phase=True, scattering_channel=0, phase_channels=[0, 1])
                             su = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[1])
+                            sus = st_model(x=seg, compute_phase=False, compute_cross_phase=False, scattering_channel=1)
                             st_phase_list[gj] = sp
                             st_cross_list[gj] = sc
                             st_up_phase_list[gj] = su
+                            st_up_scatter_list[gj] = sus
                         except RuntimeError as seg_err:
                             orig_idx = valid_indices[gj]
                             logger.error(
@@ -1688,7 +1814,7 @@ def create_hdf5_dataset_from_records_list(
 
             # Collect valid scattered segments
             b_fhr, b_up = [], []
-            b_fhr_st, b_fhr_ph, b_fhr_up_ph = [], [], []
+            b_fhr_st, b_fhr_ph, b_fhr_up_ph, b_up_st = [], [], [], []
             b_target, b_weight = [], []
             b_guid, b_epoch = [], []
             b_cs, b_bg, b_tlo, b_ss = [], [], [], []
@@ -1701,6 +1827,7 @@ def create_hdf5_dataset_from_records_list(
                 orig_idx = valid_indices[seg_j]
 
                 fhr_st_coeff = st_phase_list[seg_j]["scattering"][0]
+                up_st_coeff = st_up_scatter_list[seg_j]["scattering"][0]
                 fhr_ph_full = st_phase_list[seg_j]["phase_corr"][0]
                 cross_full = st_cross_list[seg_j]["cross_phase_corr"][0]
                 up_ph_full = st_up_phase_list[seg_j]["phase_corr"][0]
@@ -1721,6 +1848,7 @@ def create_hdf5_dataset_from_records_list(
                 b_fhr.append(fhr[orig_idx, :])
                 b_up.append(up[orig_idx, :])
                 b_fhr_st.append(fhr_st_coeff.detach().cpu().numpy())
+                b_up_st.append(up_st_coeff.detach().cpu().numpy())
                 b_fhr_ph.append(fhr_ph_coeff.detach().cpu().numpy())
                 b_fhr_up_ph.append(fhr_up_ph_coeff.detach().cpu().numpy())
                 b_target.append(pre_defined_target * sample_weights[orig_idx, :])
@@ -1748,6 +1876,7 @@ def create_hdf5_dataset_from_records_list(
                     bg_label_batch=np.array(b_bg, dtype=np.uint8),
                     tlo_batch=np.array(b_tlo, dtype=np.float32),
                     second_stage_batch=np.array(b_ss, dtype=np.float32),
+                    up_st_batch=np.stack(b_up_st),
                 )
 
         except Exception as e:
@@ -1814,6 +1943,7 @@ def _build_hdf5_for_partition(
             n_channels=total_channels,
             len_sequence=sequence_length,
             n_cross_phase_channels=n_combined_cross,
+            n_up_st_channels=43,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -1836,7 +1966,7 @@ def create_new_pipeline(
     records_base_path: str,
     output_base_path: str,
     tlo_csv_path: str,
-    test_mode: str = "holdout",
+    test_mode: str = "augmented",
     verbose: bool = True,
     scatter_batch_size: int = 16,
     num_workers: Optional[int] = None,
@@ -1849,7 +1979,8 @@ def create_new_pipeline(
         1. Prescreen all GUIDs for valid signal in last 6 hours.
         2. Select GUIDs for classification (balanced train/val,
            population-proportional test).
-        3. Create 10-fold stratified CV splits.
+        3. Create 10-fold stratified CV splits (stratified by labour
+           duration within each subgroup).
         4. Build classification HDF5 datasets.
         5. Build pretraining HDF5 datasets from BG subgroup leftovers.
 
@@ -1857,8 +1988,8 @@ def create_new_pipeline(
         records_base_path: Root dir with StudyGroup subfolders.
         output_base_path: Output directory for all generated files.
         tlo_csv_path: Path to complete CSV with TLO + second stage data.
-        test_mode: ``"holdout"`` (fixed test set, default) or
-            ``"augmented"`` (test in each fold + augmentation).
+        test_mode: ``"augmented"`` (test in each fold + augmentation,
+            default) or ``"holdout"`` (fixed test set).
         verbose: If False, suppress all output except errors.
         scatter_batch_size: Scattering batch size.
         num_workers: Parallel prescreening workers.
@@ -2018,6 +2149,7 @@ def create_new_pipeline(
 
         # --- Build fold train/val ---
         run_ga = True
+        run_eda = True
         for fold_name, fold_data in cv_result["folds"].items():
             logger.info(f"Processing {fold_name}...")
             fold_dir = os.path.join(kfold_path, fold_name)
@@ -2028,10 +2160,20 @@ def create_new_pipeline(
                     run_guid_analysis=(run_ga and partition_name == "train"),
                     **hdf5_kw,
                 )
+            if run_eda:
+                try:
+                    from fold_eda_analysis import run_fold_eda
+                    eda_dir = os.path.join(fold_dir, "fold_eda")
+                    run_fold_eda(fold_dir, eda_dir, test_dir=test_dir)
+                    logger.info(f"Fold EDA saved to {eda_dir}")
+                except Exception as e:
+                    logger.error(f"Fold EDA failed: {e}")
+                run_eda = False
             run_ga = False
 
     else:  # augmented
         run_ga = True
+        run_eda = True
         for fold_name, fold_data in cv_result["folds"].items():
             logger.info(f"Processing {fold_name}...")
             fold_dir = os.path.join(kfold_path, fold_name)
@@ -2042,6 +2184,15 @@ def create_new_pipeline(
                     run_guid_analysis=(run_ga and partition_name == "train"),
                     **hdf5_kw,
                 )
+            if run_eda:
+                try:
+                    from fold_eda_analysis import run_fold_eda
+                    eda_dir = os.path.join(fold_dir, "fold_eda")
+                    run_fold_eda(fold_dir, eda_dir)
+                    logger.info(f"Fold EDA saved to {eda_dir}")
+                except Exception as e:
+                    logger.error(f"Fold EDA failed: {e}")
+                run_eda = False
             run_ga = False
 
     logger.info("Classification datasets complete.")
@@ -2083,6 +2234,7 @@ def create_new_pipeline(
             n_channels=total_channels,
             len_sequence=sequence_length,
             n_cross_phase_channels=n_combined_cross,
+            n_up_st_channels=43,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -2132,7 +2284,7 @@ if __name__ == "__main__":
     tlo_csv_path = r"/path/to/complete_labor_onset.csv"
 
     # ---- Options ----
-    test_mode = "holdout"  # "holdout" (default) or "augmented"
+    test_mode = "augmented"  # "augmented" (default) or "holdout"
     verbose = False
     scatter_batch_size = 128
     num_workers = None  # defaults to min(cpu_count, 8)

@@ -1070,6 +1070,7 @@ def create_hdf5_dataset_from_records_list(
             st_phase_list = [None] * n_valid
             st_cross_list = [None] * n_valid
             st_up_phase_list = [None] * n_valid
+            st_up_scatter_list = [None] * n_valid
             scatter_failed = set()
 
             for batch_start in range(0, n_valid, scatter_batch_size):
@@ -1088,6 +1089,10 @@ def create_hdf5_dataset_from_records_list(
                         x=batch, compute_phase=True,
                         compute_cross_phase=False,
                         scattering_channel=0, phase_channels=[1])
+                    batch_up_scatter = st_model(
+                        x=batch, compute_phase=False,
+                        compute_cross_phase=False,
+                        scattering_channel=1)
                     # Slice batch results into per-segment dicts.
                     # Only slice tensors whose first dim matches batch size
                     # (autoc_idx is a 1-D model buffer and must be kept as-is).
@@ -1109,6 +1114,11 @@ def create_hdf5_dataset_from_records_list(
                                 if isinstance(v, torch.Tensor) and v.shape[0] == bs
                                 else v)
                             for k, v in batch_up_phase.items()}
+                        st_up_scatter_list[gj] = {
+                            k: (v[local_j:local_j+1]
+                                if isinstance(v, torch.Tensor) and v.shape[0] == bs
+                                else v)
+                            for k, v in batch_up_scatter.items()}
                 except RuntimeError:
                     # Batch failed — retry each segment individually
                     for local_j in range(batch.shape[0]):
@@ -1127,9 +1137,14 @@ def create_hdf5_dataset_from_records_list(
                                 x=seg, compute_phase=True,
                                 compute_cross_phase=False,
                                 scattering_channel=0, phase_channels=[1])
+                            seg_up_scatter = st_model(
+                                x=seg, compute_phase=False,
+                                compute_cross_phase=False,
+                                scattering_channel=1)
                             st_phase_list[gj] = seg_phase
                             st_cross_list[gj] = seg_cross
                             st_up_phase_list[gj] = seg_up_phase
+                            st_up_scatter_list[gj] = seg_up_scatter
                         except RuntimeError as seg_err:
                             orig_idx = valid_indices[gj]
                             logger.error(
@@ -1143,7 +1158,7 @@ def create_hdf5_dataset_from_records_list(
 
             # ---- Step 3: Collect and batch-write valid scattered segments ----
             batch_fhr_l, batch_up_l = [], []
-            batch_fhr_st_l, batch_fhr_ph_l, batch_fhr_up_ph_l = [], [], []
+            batch_fhr_st_l, batch_fhr_ph_l, batch_fhr_up_ph_l, batch_up_st_l = [], [], [], []
             batch_target_l, batch_weight_l = [], []
             batch_guid_l, batch_epoch_l = [], []
             batch_cs_l, batch_bg_l, batch_tlo_l = [], [], []
@@ -1154,6 +1169,7 @@ def create_hdf5_dataset_from_records_list(
                 orig_idx = valid_indices[seg_j]
 
                 fhr_st_coeff = st_phase_list[seg_j]['scattering'][0]
+                up_st_coeff = st_up_scatter_list[seg_j]['scattering'][0]
                 fhr_st_phase_full = st_phase_list[seg_j]['phase_corr'][0]
                 fhr_up_cc_phase_full = st_cross_list[seg_j]['cross_phase_corr'][0]
 
@@ -1181,6 +1197,7 @@ def create_hdf5_dataset_from_records_list(
                 batch_fhr_l.append(fhr[orig_idx, :])
                 batch_up_l.append(up[orig_idx, :])
                 batch_fhr_st_l.append(fhr_st_coeff.detach().cpu().numpy())
+                batch_up_st_l.append(up_st_coeff.detach().cpu().numpy())
                 batch_fhr_ph_l.append(fhr_ph_coeff.detach().cpu().numpy())
                 batch_fhr_up_ph_l.append(fhr_up_ph_coeff.detach().cpu().numpy())
                 batch_target_l.append(pre_defined_target * sample_weights[orig_idx, :])
@@ -1205,7 +1222,8 @@ def create_hdf5_dataset_from_records_list(
                     epoch_batch=np.array(batch_epoch_l, dtype=np.float32),
                     cs_label_batch=np.array(batch_cs_l, dtype=np.uint8),
                     bg_label_batch=np.array(batch_bg_l, dtype=np.uint8),
-                    tlo_batch=np.array(batch_tlo_l, dtype=np.float32))
+                    tlo_batch=np.array(batch_tlo_l, dtype=np.float32),
+                    up_st_batch=np.stack(batch_up_st_l))
 
             # ---- Generate signal strip plot ----
             if plot_segment_status is not None and hdf5_path:
@@ -1375,7 +1393,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
         os.makedirs(pre_train_path, exist_ok=True)
 
         pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
-        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
         create_hdf5_dataset_from_records_list(
             records_list=healthy_bg_cs_files_vae_train,
             hdf5_path=pre_training_dataset,
@@ -1389,7 +1407,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             labor_onset_map=labor_onset_map)
 
         pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
-        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
         create_hdf5_dataset_from_records_list(
             records_list=healthy_bg_no_cs_files_vae_train,
             hdf5_path=pre_training_dataset,
@@ -1403,7 +1421,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             labor_onset_map=labor_onset_map)
 
         pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
-        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
         create_hdf5_dataset_from_records_list(
             records_list=healthy_bg_cs_files_vae_test,
             hdf5_path=pre_training_dataset,
@@ -1417,7 +1435,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             labor_onset_map=labor_onset_map)
 
         pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
-        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+        create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
         create_hdf5_dataset_from_records_list(
             records_list=healthy_bg_no_cs_files_vae_test,
             hdf5_path=pre_training_dataset,
@@ -1678,7 +1696,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
     # pre_train_path = os.path.join(output_base_path_, "pre_training_dataset")
     # os.makedirs(pre_train_path, exist_ok=True)
     # pre_training_dataset = os.path.join(pre_train_path, "train_dataset_cs.hdf5")
-    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
     # create_hdf5_dataset_from_records_list(
     #     records_list=healthy_bg_cs_files_vae_train,
     #     hdf5_path=pre_training_dataset,
@@ -1692,7 +1710,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
     #     labor_onset_map=labor_onset_map)
 
     # pre_training_dataset = os.path.join(pre_train_path, "train_dataset_no_cs.hdf5")
-    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
     # create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_train,
     #                                       hdf5_path=pre_training_dataset,
     #                                       base_block_size=base_block_size,
@@ -1706,7 +1724,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
 
 
     # pre_training_dataset = os.path.join(pre_train_path, "test_dataset_cs.hdf5")
-    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
     # create_hdf5_dataset_from_records_list(records_list=healthy_bg_cs_files_vae_test,
     #                                       hdf5_path=pre_training_dataset,
     #                                       base_block_size=base_block_size,
@@ -1719,7 +1737,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
     #     labor_onset_map=labor_onset_map)
 
     # pre_training_dataset = os.path.join(pre_train_path, "test_dataset_no_cs.hdf5")
-    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+    # create_initial_hdf5(path=pre_training_dataset, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
     # create_hdf5_dataset_from_records_list(records_list=healthy_bg_no_cs_files_vae_test,
     #                                       hdf5_path=pre_training_dataset,
     #                                       base_block_size=base_block_size,
@@ -1749,7 +1767,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "healthy_no_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1764,7 +1782,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "healthy_no_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1779,7 +1797,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "healthy_bg_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1794,7 +1812,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "healthy_bg_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1809,7 +1827,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "acidosis_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1824,7 +1842,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "acidosis_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1839,7 +1857,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "hie_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
@@ -1854,7 +1872,7 @@ def create_records(records_base_path_=None, output_base_path_=None, run_guid_ana
             selected_sub_group = "hie_no_cs"
             sub_group_path = os.path.join(dataset_partition_path, f"{selected_sub_group}.hdf5")
             sub_group_records_list = sub_groups_list.get(selected_sub_group)
-            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross)
+            create_initial_hdf5(path=sub_group_path, len_signal=signal_length, n_channels=total_channels, len_sequence=sequence_length, n_cross_phase_channels=n_combined_cross, n_up_st_channels=43)
             create_hdf5_dataset_from_records_list(records_list=sub_group_records_list,
                                                   hdf5_path=sub_group_path,
                                                   base_block_size=base_block_size,
