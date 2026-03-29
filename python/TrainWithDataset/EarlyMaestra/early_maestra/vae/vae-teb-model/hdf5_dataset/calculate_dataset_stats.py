@@ -27,12 +27,13 @@ class DatasetStatsCalculator:
 
     Transformation strategy:
     - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed
+    - up_st (43 channels): channel 0 regular, channels 1-42 log-transformed (same as fhr_st)
     - fhr_ph (44 channels): all asinh-transformed for phase stability
     - fhr_up_ph (dynamic channels): all asinh-transformed for cross-phase + UP self-phase
     """
     
     def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
-        self.stats_fields = ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']
+        self.stats_fields = ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']
         self.trim_minutes = trim_minutes
 
         if device is None:
@@ -53,6 +54,7 @@ class DatasetStatsCalculator:
         # LOG normalization for scattering coefficients (except order 0)
         self.log_norm_channels_config = {
             'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude channel 0)
+            'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
         
         # ASINH normalization for phase coefficients (better for phase data)
@@ -397,7 +399,7 @@ class DatasetStatsCalculator:
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
-            f.attrs['description'] = 'Statistics for v3 selection: 43 scattering (log), 44 phase (asinh), cross-phase + UP self-phase (asinh)'
+            f.attrs['description'] = 'Statistics for v3 selection: 43 FHR scattering (log), 43 UP scattering (log), 44 phase (asinh), cross-phase + UP self-phase (asinh)'
             
             # Save statistics for each field
             for field, field_stats in stats.items():

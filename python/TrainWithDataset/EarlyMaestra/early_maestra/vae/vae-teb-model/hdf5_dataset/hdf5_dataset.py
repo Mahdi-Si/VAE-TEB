@@ -145,7 +145,8 @@ def create_initial_hdf5(
     len_signal: int,
     n_channels: int,
     len_sequence: int = 300,
-    n_cross_phase_channels: int = 62
+    n_cross_phase_channels: int = 62,
+    n_up_st_channels: int = 0,
 ) -> None:
     """
     Create a new HDF5 file with empty, resizable datasets for signal storage.
@@ -154,13 +155,15 @@ def create_initial_hdf5(
         - FHR scattering: 43 coefficients (first order only)
         - FHR phase: 44 coefficients (optimal selection)
         - FHR-UP cross-phase + UP self-phase: dynamic count (computed by compute_scattering_masks)
+        - UP scattering (optional): 43 coefficients (first order only)
 
     Datasets created (first dim unlimited):
         - "fhr"       : float32, shape (N, len_signal)
         - "up"        : float32, shape (N, len_signal)
-        - "fhr_st"    : float32, shape (N, 43, len_sequence) - Scattering coefficients
+        - "fhr_st"    : float32, shape (N, 43, len_sequence) - FHR scattering coefficients
         - "fhr_ph"    : float32, shape (N, 44, len_sequence) - Selected phase coefficients
         - "fhr_up_ph" : float32, shape (N, n_cross_phase_channels, len_sequence) - Cross-phase + UP self-phase
+        - "up_st"     : float32, shape (N, n_up_st_channels, len_sequence) - UP scattering coefficients (optional)
         - "target"    : float32, shape (N, len_sequence)
         - "weight"    : float32, shape (N, len_sequence)
         - "epoch"     : float32, shape (N,)
@@ -177,6 +180,7 @@ def create_initial_hdf5(
         n_channels:              Total number of phase + cross-phase channels (fhr_ph + fhr_up_ph).
         len_sequence:            Length of sequence dimension (default: 300).
         n_cross_phase_channels:  Number of channels for fhr_up_ph (cross-phase + UP self-phase).
+        n_up_st_channels:        Number of UP scattering channels (0 = do not create up_st dataset).
     """
     try:
         os.remove(path)
@@ -215,6 +219,14 @@ def create_initial_hdf5(
             maxshape=(None, n_cross_phase_channels, len_sequence),
             dtype="f4", chunks=(chunk_n, n_cross_phase_channels, len_sequence), compression="lzf"
         )
+        # up_st: UP scattering coefficients (optional, same structure as fhr_st)
+        if n_up_st_channels > 0:
+            h5f.create_dataset(
+                "up_st", shape=(0, n_up_st_channels, len_sequence),
+                maxshape=(None, n_up_st_channels, len_sequence),
+                dtype="f4", chunks=(chunk_n, n_up_st_channels, len_sequence),
+                compression="lzf"
+            )
         h5f.create_dataset(
             "target", shape=(0, len_sequence), maxshape=(None, len_sequence),
             dtype="f4", chunks=(chunk_n, len_sequence), compression="lzf"
@@ -258,7 +270,8 @@ def append_sample(
     epoch: float,
     cs_label: bool,
     bg_label: bool,
-    time_from_labor_onset: float = float('nan')
+    time_from_labor_onset: float = float('nan'),
+    up_st: Optional[np.ndarray] = None,
 ) -> None:
     """
     Append a single sample to an existing HDF5 dataset.
@@ -279,6 +292,7 @@ def append_sample(
         cs_label:  Case label flag.
         bg_label:  Background label flag.
         time_from_labor_onset: Seconds since labor onset (NaN if unavailable).
+        up_st:     UP scattering array, shape (n_channels, len_sequence). Optional.
     """
     with h5py.File(path, "a", libver="latest") as h5f:
         idx = h5f["fhr"].shape[0]
@@ -290,6 +304,8 @@ def append_sample(
         h5f["fhr_st"][idx]    = fhr_st
         h5f["fhr_ph"][idx]    = fhr_ph
         h5f["fhr_up_ph"][idx] = fhr_up_ph
+        if up_st is not None and "up_st" in h5f:
+            h5f["up_st"][idx] = up_st
         h5f["target"][idx]    = target
         h5f["weight"][idx]    = weight
         h5f["epoch"][idx]     = epoch
@@ -314,6 +330,7 @@ def append_samples_batch(
     cs_label_batch: np.ndarray,
     bg_label_batch: np.ndarray,
     tlo_batch: np.ndarray,
+    up_st_batch: Optional[np.ndarray] = None,
 ) -> None:
     """Append K samples to an existing HDF5 dataset in a single file open/close.
 
@@ -336,6 +353,7 @@ def append_samples_batch(
         cs_label_batch:  CS label array, shape (K,), dtype uint8.
         bg_label_batch:  BG label array, shape (K,), dtype uint8.
         tlo_batch:       Time-from-labor-onset array, shape (K,).
+        up_st_batch:     UP scattering array, shape (K, n_ch, len_seq). Optional.
     """
     k = fhr_batch.shape[0]
     if k == 0:
@@ -350,6 +368,8 @@ def append_samples_batch(
         h5f["fhr_st"][idx:new_size]    = fhr_st_batch
         h5f["fhr_ph"][idx:new_size]    = fhr_ph_batch
         h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
+        if up_st_batch is not None and "up_st" in h5f:
+            h5f["up_st"][idx:new_size] = up_st_batch
         h5f["target"][idx:new_size]    = target_batch
         h5f["weight"][idx:new_size]    = weight_batch
         h5f["epoch"][idx:new_size]     = epoch_batch
@@ -461,6 +481,7 @@ class CombinedHDF5Dataset(Dataset):
         # Updated for v3 selection (44 phase + dynamic cross-phase + UP self-phase channels).
         self.log_norm_channels_config = {
             'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude order 0)
+            'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
         self.asinh_norm_channels_config = {
             'fhr_ph': 'all',     # All 44 selected phase coefficients
@@ -835,7 +856,7 @@ class CombinedHDF5Dataset(Dataset):
                         start_trim = self.trim_samples_raw
                         end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
                         data = data[start_trim:end_trim]
-                    elif name in ['fhr_st', 'fhr_ph', 'fhr_up_ph']:
+                    elif name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']:
                         start_trim = self.trim_samples_decimated
                         end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
                         data = data[:, start_trim:end_trim]
@@ -853,13 +874,13 @@ class CombinedHDF5Dataset(Dataset):
                     tensor = self._create_tensor(np.asarray(data))
                     
                     # Apply normalization if enabled and applicable
-                    if (self.normalization_enabled and 
-                        name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph']):
+                    if (self.normalization_enabled and
+                        name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']):
                         tensor = self._normalize_data(name, tensor)
                     
                     # SPEED OPTIMIZATION: Apply permutation here once instead of multiple times in training
                     # Convert from HDF5 format (channels, sequence) to model format (sequence, channels)
-                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph'] and tensor.dim() == 2:
+                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st'] and tensor.dim() == 2:
                         tensor = tensor.transpose(0, 1)  # (channels, seq) -> (seq, channels)
                     
                     out[name] = tensor

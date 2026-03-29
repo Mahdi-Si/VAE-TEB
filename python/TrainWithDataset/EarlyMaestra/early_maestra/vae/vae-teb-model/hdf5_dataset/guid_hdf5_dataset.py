@@ -726,6 +726,7 @@ def _run_smoke_test() -> None:
         n_channels=44 + n_cross_phase_channels,
         len_sequence=len_sequence,
         n_cross_phase_channels=n_cross_phase_channels,
+        n_up_st_channels=43,
     )
 
     rng = np.random.RandomState(42)
@@ -747,6 +748,7 @@ def _run_smoke_test() -> None:
                 fhr_st=rng.randn(43, len_sequence).astype(np.float32),
                 fhr_ph=rng.randn(44, len_sequence).astype(np.float32),
                 fhr_up_ph=rng.randn(n_cross_phase_channels, len_sequence).astype(np.float32),
+                up_st=rng.randn(43, len_sequence).astype(np.float32),
                 target=np.ones(len_sequence, dtype=np.float32),
                 weight=np.ones(len_sequence, dtype=np.float32),
                 guid=guid,
