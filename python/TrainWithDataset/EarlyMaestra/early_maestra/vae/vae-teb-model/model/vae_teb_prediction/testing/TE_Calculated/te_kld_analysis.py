@@ -145,6 +145,10 @@ def load_kld_from_inference(
     dataloader_cfg = cfg.get("dataset_config", {}).get("dataloader_config", {})
     dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
 
+    # Remove epoch filtering so we get data all the way to delivery
+    dataset_kwargs.pop("epoch_max", None)
+    dataset_kwargs.pop("epoch_min", None)
+
     # Auto-detect device
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
