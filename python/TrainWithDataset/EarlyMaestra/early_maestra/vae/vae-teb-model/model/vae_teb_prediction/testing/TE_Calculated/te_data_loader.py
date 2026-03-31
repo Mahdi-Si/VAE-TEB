@@ -77,7 +77,7 @@ def load_te_data(
     if not csv_path.exists():
         raise FileNotFoundError(f"TE CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path, comment="#")
+    df = pd.read_csv(csv_path)
 
     # Rename tracing_guid -> guid for consistency with VAE outputs
     df = df.rename(columns={"tracing_guid": "guid"})
