@@ -142,7 +142,7 @@ def load_kld_from_inference(
     # Resolve stats_path, normalize_fields, and dataset_kwargs from config
     stats_path = cfg.get("dataset_config", {}).get("stats_path")
     normalize_fields = cfg.get("dataset_config", {}).get("normalize_fields")
-    dataloader_cfg = cfg.get("dataloader_config", {})
+    dataloader_cfg = cfg.get("dataset_config", {}).get("dataloader_config", {})
     dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
 
     # Auto-detect device
