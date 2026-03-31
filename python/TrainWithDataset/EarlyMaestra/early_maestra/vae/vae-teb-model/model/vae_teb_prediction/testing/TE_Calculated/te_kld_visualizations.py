@@ -168,69 +168,100 @@ def plot_per_guid_correlation_histogram(
 def plot_sample_dual_axis_trajectories(
     merged_df: pd.DataFrame,
     output_dir: Path,
-    n_guids: int = 8,
-) -> Path:
-    """Dual-axis trajectory plots for sample GUIDs.
+    guids_per_page: int = 8,
+    max_pages: int = 10,
+) -> list[Path]:
+    """Dual-axis trajectory plots for many GUIDs across multiple figures.
 
-    Selects the GUIDs with the most matched epochs and plots TE (left axis)
-    and KLD (right axis) vs. hours before delivery.
+    Ranks GUIDs by number of matched epochs and produces up to *max_pages*
+    figures, each showing *guids_per_page* GUIDs.  Every subplot uses the
+    full time range available for that GUID (no fixed hour window), with
+    the x-axis running from the earliest data to delivery (0 h).
 
     Args:
         merged_df: Merged TE-KLD DataFrame.
-        output_dir: Directory to save the figure.
-        n_guids: Number of GUIDs to plot.
+        output_dir: Directory to save figures.
+        guids_per_page: Number of GUIDs per figure (laid out 2 columns).
+        max_pages: Maximum number of figures to generate.
 
     Returns:
-        Path to the saved figure.
+        List of paths to the saved figures.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Select GUIDs with most matched epochs
+    # Rank GUIDs by number of matched epochs (descending)
     guid_counts = merged_df.groupby("guid").size().sort_values(ascending=False)
-    top_guids = guid_counts.head(n_guids).index.tolist()
+    all_guids = guid_counts.index.tolist()
 
-    nrows = (n_guids + 1) // 2
-    ncols = 2
-    fig, axes = plt.subplots(nrows, ncols, figsize=(8, 2.5 * nrows))
-    if nrows == 1:
-        axes = axes.reshape(1, -1)
-    axes_flat = axes.flatten()
+    total_guids_needed = guids_per_page * max_pages
+    selected_guids = all_guids[:total_guids_needed]
 
-    for i, guid in enumerate(top_guids):
-        ax = axes_flat[i]
-        sub = merged_df[merged_df["guid"] == guid].sort_values(
-            "domain_start_rounded"
-        )
-        hours = -sub["domain_start_rounded"].values / 3600.0
+    # Split into pages
+    pages: list[list[str]] = [
+        selected_guids[i : i + guids_per_page]
+        for i in range(0, len(selected_guids), guids_per_page)
+    ]
+    pages = pages[:max_pages]
 
-        # TE on left axis
-        ax.plot(hours, sub["ite_valid"].values, color=COLOR_BLUE,
-                linewidth=0.8, marker=".", markersize=3, label="TE")
-        ax.set_ylabel("TE (ite_valid)", color=COLOR_BLUE, fontsize=7)
-        ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
+    saved_paths: list[Path] = []
 
-        # KLD on right axis
-        ax2 = ax.twinx()
-        ax2.plot(hours, sub["kld"].values, color=COLOR_ORANGE,
-                 linewidth=0.8, marker=".", markersize=3, label="KLD")
-        ax2.set_ylabel("KLD", color=COLOR_ORANGE, fontsize=7)
-        ax2.tick_params(axis="y", labelcolor=COLOR_ORANGE)
+    for page_idx, page_guids in enumerate(pages):
+        n_guids = len(page_guids)
+        nrows = (n_guids + 1) // 2
+        ncols = 2
+        fig, axes = plt.subplots(nrows, ncols, figsize=(10, 3.0 * nrows))
+        if nrows == 1:
+            axes = axes.reshape(1, -1)
+        axes_flat = axes.flatten()
 
-        ax.set_xlabel("Hours before delivery", fontsize=7)
-        ax.set_title(f"GUID ...{guid[-6:]} (n={len(sub)})", fontsize=7)
-        ax.invert_xaxis()
-        _style_axes(ax, grid="major")
+        for i, guid in enumerate(page_guids):
+            ax = axes_flat[i]
+            sub = merged_df[merged_df["guid"] == guid].sort_values(
+                "domain_start_rounded"
+            )
+            hours = -sub["domain_start_rounded"].values / 3600.0
 
-    # Hide unused axes
-    for j in range(len(top_guids), len(axes_flat)):
-        axes_flat[j].set_visible(False)
+            # TE on left axis
+            ax.plot(
+                hours, sub["ite_valid"].values,
+                color=COLOR_BLUE, linewidth=1.2,
+                marker=".", markersize=4, label="TE",
+            )
+            ax.set_ylabel("TE (ite_valid)", color=COLOR_BLUE, fontsize=7)
+            ax.tick_params(axis="y", labelcolor=COLOR_BLUE, labelsize=6)
 
-    fig.tight_layout()
-    out_path = output_dir / "dual_axis_trajectories.png"
-    fig.savefig(out_path, dpi=SAVE_DPI)
-    plt.close(fig)
-    return out_path
+            # KLD on right axis
+            ax2 = ax.twinx()
+            ax2.plot(
+                hours, sub["kld"].values,
+                color=COLOR_VERMILLION, linewidth=1.4,
+                marker=".", markersize=4, label="KLD",
+            )
+            ax2.set_ylabel("KLD", color=COLOR_VERMILLION, fontsize=7)
+            ax2.tick_params(axis="y", labelcolor=COLOR_VERMILLION, labelsize=6)
+
+            ax.set_xlabel("Hours before delivery", fontsize=7)
+            h_min, h_max = hours.min(), hours.max()
+            ax.set_xlim(h_max + 0.2, max(h_min - 0.2, 0))
+            ax.set_title(
+                f"GUID ...{guid[-6:]}  (n={len(sub)}, "
+                f"{h_max:.1f}\u2013{h_min:.1f} h)",
+                fontsize=7,
+            )
+            _style_axes(ax, grid="major")
+
+        # Hide unused axes
+        for j in range(len(page_guids), len(axes_flat)):
+            axes_flat[j].set_visible(False)
+
+        fig.tight_layout()
+        out_path = output_dir / f"dual_axis_trajectories_{page_idx + 1:02d}.png"
+        fig.savefig(out_path, dpi=SAVE_DPI)
+        plt.close(fig)
+        saved_paths.append(out_path)
+
+    return saved_paths
 
 
 # ---------------------------------------------------------------------------
