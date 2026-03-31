@@ -139,9 +139,11 @@ def load_kld_from_inference(
     if isinstance(data_path, str):
         data_path = [data_path]
 
-    # Resolve stats_path and normalize_fields from config
+    # Resolve stats_path, normalize_fields, and dataset_kwargs from config
     stats_path = cfg.get("dataset_config", {}).get("stats_path")
     normalize_fields = cfg.get("dataset_config", {}).get("normalize_fields")
+    dataloader_cfg = cfg.get("dataloader_config", {})
+    dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
 
     # Auto-detect device
     if device is None:
@@ -163,6 +165,7 @@ def load_kld_from_inference(
         max_guids=None,
         stats_path=stats_path,
         normalize_fields=normalize_fields,
+        **dataset_kwargs,
     )
 
     logger.info("Running inference to collect KLD metrics...")
