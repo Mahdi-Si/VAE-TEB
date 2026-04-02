@@ -49,10 +49,26 @@ model_config:
     vae_checkpoint: /data/deid/isilon/MS_model/seq_vae_teb_results/new_structure/2025-12-09--[08-05]--prediction_model_L16_continued_lower_lr_and_betas_continue___/model_checkpoints/core-model-epoch=epoch=66.ckpt
     type: causal_cnn_lstm                 # Options: 'causal_cnn_lstm', 'mamba', 'multiscale_conv_attention', 'lstm', 'cnn_lstm', 'bilstm_attention', 'cnn', 'transformer'
     latent_dim: 16                        # VAE latent dimension (must match checkpoint)
-    num_classes: 2                        # Binary classification (healthy vs unhealthy)
+    num_classes: 3                        # 3 output bits for hierarchical mode (2 for binary)
     freeze_vae: true                      # Freeze VAE weights during classifier training
     use_posterior: true                   # Use posterior mean (true) or prior samples (false)
     sample_latent: false                  # Sample from posterior distribution
+
+    # -----------------------------------------------------------------------
+    # Classification Enhancements
+    # -----------------------------------------------------------------------
+    enriched_features: true               # Concatenate KLD, logvar_post, residual → 64-dim input
+    label_mode: hierarchical              # 'binary' (2-class CE) or 'hierarchical' (3-bit focal BCE)
+    attention_pool: true                  # Learned attention pooling (replaces mean_max)
+    focal_gamma: 2.0                      # Focal loss focusing parameter (0 = standard BCE)
+    label_smoothing: 0.05                 # Label smoothing for focal loss
+    bit_weights: [1.0, 2.0, 1.0]         # Per-bit loss weights [healthy, unhealthy, severe]
+
+    # Latent space augmentation (training only)
+    augmentation:
+      posterior_sampling: true            # Add noise ~ N(0, posterior_var * scale)
+      noise_scale: 0.5                   # Scale factor for posterior noise
+      temporal_jitter: 5                  # Random shift +/- N timesteps (~20 sec)
 
     # Architecture parameters (shared)
     hidden_dim: 128                       # Hidden dimension for LSTM/BiLSTM
