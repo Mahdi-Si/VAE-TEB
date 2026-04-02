@@ -482,6 +482,130 @@ def _plot_duration_bin_distribution(
 
 
 # ============================================================================
+# Plot 3b: Per-subgroup labour duration histograms by partition
+# ============================================================================
+def _plot_subgroup_duration_histograms(
+    fold_df: pd.DataFrame,
+    output_dir: str,
+) -> Optional[str]:
+    """Per-subgroup labour duration histograms split by train/val/test.
+
+    Creates a grid of subplots — one per subgroup — where each subplot
+    contains overlaid histograms for train, val, and test partitions.
+    This directly verifies that stratification by labour duration within
+    each subgroup produced similar distributions across partitions.
+
+    Args:
+        fold_df: GUID-level DataFrame from ``_build_fold_dataframe()``.
+        output_dir: Directory for saving the plot.
+
+    Returns:
+        Path to saved figure, or ``None`` if skipped.
+    """
+    df = fold_df.dropna(subset=["labour_duration_hours"])
+    if df.empty:
+        logger.warning("No TLO data for per-subgroup duration histograms — skipping")
+        return None
+
+    active_sgs = [sg for sg in _SUBGROUP_ORDER if sg in df["subgroup"].unique()]
+    if not active_sgs:
+        return None
+
+    partitions = [p for p in _PARTITION_ORDER if p in df["partition"].unique()]
+
+    out_path = os.path.join(output_dir, "subgroup_duration_histograms.png")
+
+    n_cols = min(4, len(active_sgs))
+    n_rows = math.ceil(len(active_sgs) / n_cols)
+
+    with plt.rc_context(_JOURNAL_RC):
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(3.0 * n_cols, 2.8 * n_rows),
+            squeeze=False,
+        )
+
+        for idx, sg in enumerate(active_sgs):
+            row, col = divmod(idx, n_cols)
+            ax = axes[row][col]
+            sg_df = df[df["subgroup"] == sg]
+
+            # Compute shared bin edges across all partitions for this subgroup
+            all_vals = sg_df["labour_duration_hours"].values
+            if len(all_vals) < 2:
+                ax.text(
+                    0.5, 0.5, f"n={len(all_vals)}",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=7,
+                )
+                ax.set_title(sg.replace("_", " "), fontsize=7, fontweight="bold")
+                _remove_spines(ax)
+                continue
+
+            bin_edges = np.histogram_bin_edges(all_vals, bins=15)
+
+            stats_lines: List[str] = []
+            for part in partitions:
+                subset = sg_df[sg_df["partition"] == part]["labour_duration_hours"]
+                if subset.empty:
+                    continue
+                ax.hist(
+                    subset, bins=bin_edges, alpha=0.45,
+                    color=_PARTITION_COLORS[part], label=part,
+                    edgecolor="white", linewidth=0.3,
+                )
+                stats_lines.append(
+                    f"{part}: n={len(subset)}, "
+                    f"\u03bc={subset.mean():.1f}h, "
+                    f"med={subset.median():.1f}h"
+                )
+
+            ax.set_title(sg.replace("_", " "), fontsize=7, fontweight="bold",
+                         color=_SUBGROUP_COLORS.get(sg, "black"))
+            _remove_spines(ax)
+
+            if stats_lines:
+                ax.text(
+                    0.97, 0.97, "\n".join(stats_lines),
+                    transform=ax.transAxes, fontsize=5,
+                    verticalalignment="top", horizontalalignment="right",
+                    bbox=dict(
+                        boxstyle="round,pad=0.3", facecolor="white",
+                        alpha=0.8, edgecolor="#cccccc", linewidth=0.3,
+                    ),
+                )
+
+            if row == n_rows - 1:
+                ax.set_xlabel("Duration (h)", fontsize=6)
+            if col == 0:
+                ax.set_ylabel("Count", fontsize=6)
+
+        # Hide unused axes
+        for idx in range(len(active_sgs), n_rows * n_cols):
+            row, col = divmod(idx, n_cols)
+            axes[row][col].set_visible(False)
+
+        # Single shared legend
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        if handles:
+            fig.legend(
+                handles, labels, loc="lower center",
+                ncol=len(partitions), frameon=False, fontsize=7,
+            )
+
+        fig.suptitle(
+            "Labour Duration by Subgroup (Train / Val / Test)",
+            fontsize=9, fontweight="bold", y=1.01,
+        )
+        fig.tight_layout(rect=[0, 0.04, 1, 0.99])
+        fig.savefig(out_path)
+        plt.close(fig)
+
+    logger.info(f"Saved per-subgroup duration histograms: {out_path}")
+    return out_path
+
+
+# ============================================================================
 # Plot 4: Subgroup composition (GUIDs + segments)
 # ============================================================================
 def _plot_subgroup_composition(
@@ -920,6 +1044,7 @@ def run_fold_eda(
     generated["tlo_distribution"] = _plot_tlo_distribution(fold_df, output_dir)
     generated["tlo_presence"] = _plot_tlo_presence_ratio(fold_df, output_dir)
     generated["duration_bins"] = _plot_duration_bin_distribution(fold_df, output_dir)
+    generated["subgroup_duration_hist"] = _plot_subgroup_duration_histograms(fold_df, output_dir)
     generated["subgroup_composition"] = _plot_subgroup_composition(fold_df, output_dir)
     generated["segment_coverage"] = _plot_segment_coverage(fold_df, output_dir)
     generated["class_balance"] = _plot_class_balance(fold_df, output_dir)
@@ -939,3 +1064,26 @@ def run_fold_eda(
             k: v for k, v in generated.items() if v is not None
         },
     }
+
+
+# ============================================================================
+# Run directly
+# ============================================================================
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # --- Configure these paths before running ---
+    fold_dir = r"C:\path\to\your\fold_1"  # folder with train/, val/, test/ subdirs
+    output_dir = os.path.join(fold_dir, "eda_output")
+    test_dir = None  # set if using holdout mode with a separate test directory
+
+    result = run_fold_eda(fold_dir, output_dir, test_dir=test_dir)
+    print(f"\nEDA result: {result['status']}")
+    if result["status"] == "ok":
+        print(f"  Output dir: {result['output_dir']}")
+        print(f"  GUIDs: {result['n_guids']}, Segments: {result['n_segments']}")
+        for name, path in result["generated_files"].items():
+            print(f"  {name}: {path}")
