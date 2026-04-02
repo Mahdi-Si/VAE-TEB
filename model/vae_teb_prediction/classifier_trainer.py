@@ -7,7 +7,7 @@ from train.callbacks import (
 )
 
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-
+import copy
 
 from loguru import logger
 
@@ -41,11 +41,62 @@ import time
 import yaml
 
 
+class EMACallback(pl.Callback):
+    """Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of trainable parameters updated as:
+    ``shadow = decay * shadow + (1 - decay) * param``.
+
+    At validation time, swaps model weights with EMA weights so that
+    checkpoints and metrics reflect the averaged model. Swaps back
+    after validation.
+
+    Args:
+        decay: EMA decay factor (0.999 is typical).
+    """
+
+    def __init__(self, decay: float = 0.999):
+        super().__init__()
+        self.decay = decay
+        self.shadow: dict = {}
+        self.backup: dict = {}
+
+    def on_fit_start(self, trainer, pl_module):
+        """Initialize shadow weights from model parameters."""
+        for name, param in pl_module.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Update EMA shadow weights after each training batch."""
+        for name, param in pl_module.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay,
+                )
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        """Swap to EMA weights for validation."""
+        self.backup = {}
+        for name, param in pl_module.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Restore training weights after validation."""
+        for name, param in pl_module.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+
 class PlSeqVaeClassifier(LightningModelBase):
     """PyTorch Lightning wrapper for VaeTebTimeSeriesClassifier.
 
     Supports both binary (cross-entropy) and hierarchical (focal BCE)
-    label modes, controlled by the underlying model's ``label_mode``.
+    label modes, latent-space mixup during training, and EMA model
+    averaging via external callback.
     """
 
     def __init__(
@@ -56,10 +107,12 @@ class PlSeqVaeClassifier(LightningModelBase):
         focal_gamma: float = 2.0,
         label_smoothing: float = 0.0,
         bit_weights: Optional[List[float]] = None,
+        mixup_alpha: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.label_mode = label_mode
+        self.mixup_alpha = mixup_alpha
 
         if class_weights is not None:
             weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
@@ -78,11 +131,48 @@ class PlSeqVaeClassifier(LightningModelBase):
                 f"PlSeqVaeClassifier: hierarchical mode, focal_gamma={focal_gamma}, "
                 f"label_smoothing={label_smoothing}, bit_weights={bit_weights}"
             )
+        if mixup_alpha > 0:
+            logger.info(f"PlSeqVaeClassifier: mixup enabled, alpha={mixup_alpha}")
+
+    def _build_targets(self, labels: torch.Tensor):
+        """Build float targets from raw labels for loss computation.
+
+        Args:
+            labels: Raw labels ``(B,)`` with values ``{1, 2, 3}``.
+
+        Returns:
+            Float targets suitable for the current ``label_mode``.
+            Hierarchical: ``(B, 3)`` multi-hot. Binary: ``(B, 2)`` one-hot.
+        """
+        if self.label_mode == "hierarchical":
+            return map_to_hierarchical_labels(labels)
+        binary = (labels > 1).long()
+        return torch.nn.functional.one_hot(binary, num_classes=2).float()
+
+    def _compute_loss_from_logits(
+        self, logits: torch.Tensor, targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute loss from logits and soft float targets.
+
+        Works with both mixed (soft) and non-mixed (hard) targets.
+
+        Args:
+            logits: ``(B, C)`` raw logits.
+            targets: ``(B, C)`` float targets (may be soft from mixup).
+
+        Returns:
+            Scalar loss.
+        """
+        if self.label_mode == "hierarchical":
+            return self.focal_loss(logits, targets)
+        # Soft cross-entropy: -sum(target * log_softmax(logits))
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        return -(targets * log_probs).sum(dim=-1).mean()
 
     def compute_loss_and_metrics(self, batch, batch_idx, stage: str):
         """Compute loss and metrics for classification.
 
-        Supports binary (cross-entropy) and hierarchical (focal BCE) modes.
+        Applies latent-space mixup during training when ``mixup_alpha > 0``.
 
         Args:
             batch: Batch from dataloader with target shape ``(B, len_sequence)``.
@@ -95,33 +185,37 @@ class PlSeqVaeClassifier(LightningModelBase):
         y_st = batch.fhr_st
         y_ph = batch.fhr_ph
         x_ph = batch.fhr_up_ph
-
         target_seq = batch.target
         labels = target_seq.max(dim=1)[0]  # (B,) values {1, 2, 3}
-
         tlo = batch.time_from_labor_onset if hasattr(batch, 'time_from_labor_onset') else None
 
-        outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
+        # --- Encode features ---
+        z = self.model.encode_and_prepare(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
+        targets = self._build_targets(labels)  # (B, C) float
+
+        # --- Mixup (training only) ---
+        if self.training and self.mixup_alpha > 0:
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            lam = max(lam, 1.0 - lam)  # Ensure lam >= 0.5 for stability
+            idx = torch.randperm(z.shape[0], device=z.device)
+            z = lam * z + (1.0 - lam) * z[idx]
+            targets = lam * targets + (1.0 - lam) * targets[idx]
+
+        # --- Classify mixed features ---
+        outputs = self.model.classify_features(z)
         logits = outputs["logits"]
 
-        # --- Compute loss based on label_mode ---
-        if self.label_mode == "hierarchical":
-            hier_targets = map_to_hierarchical_labels(labels)
-            loss = self.focal_loss(logits, hier_targets)
-            # Primary metric: unhealthy bit (index 1)
-            unhealthy_prob = torch.sigmoid(logits[:, 1])
-            preds = (unhealthy_prob > 0.5).long()
-        else:
-            binary_labels = (labels > 1).long()
-            loss = torch.nn.functional.cross_entropy(
-                logits, binary_labels, weight=self.class_weights,
-            )
-            preds = outputs["preds"]
+        # --- Loss ---
+        loss = self._compute_loss_from_logits(logits, targets)
 
-        # Binary labels for accuracy computation (always needed)
+        # --- Metrics (always on unmixed binary labels for consistency) ---
         binary_labels = (labels > 1).long()
-        accuracy = (preds == binary_labels).float().mean()
+        if self.label_mode == "hierarchical":
+            preds = (torch.sigmoid(logits[:, 1]) > 0.5).long()
+        else:
+            preds = logits.argmax(dim=-1)
 
+        accuracy = (preds == binary_labels).float().mean()
         per_class_acc = {}
         for c in range(2):
             mask = binary_labels == c
@@ -335,9 +429,23 @@ class GraphModelClassifierTrainer(GraphModelBase):
         logger.info(f"Trainable parameters: {trainable_params:,}")
         logger.info(f"Frozen parameters: {total_params - trainable_params:,}")
 
+        # Training procedure config
+        training_cfg = classifier_config.get('training', {})
+        mixup_alpha = training_cfg.get('mixup_alpha', 0.0)
+        weight_decay = training_cfg.get('weight_decay', 0.01)
+        scheduler_type = training_cfg.get('scheduler_type', 'cosine')
+        warmup_epochs = training_cfg.get('warmup_epochs', 10)
+        min_lr = training_cfg.get('min_lr', 1e-6)
+        max_epochs = self.config.get('general_config', {}).get('epochs', 1000)
+
         trainer_hparams = {
             "lr": self.lr,
             "lr_milestones": self.lr_milestones,
+            "weight_decay": weight_decay,
+            "scheduler_type": scheduler_type,
+            "warmup_epochs": warmup_epochs,
+            "min_lr": min_lr,
+            "max_epochs": max_epochs,
         }
 
         self.pl_model = PlSeqVaeClassifier(
@@ -349,6 +457,12 @@ class GraphModelClassifierTrainer(GraphModelBase):
             focal_gamma=focal_gamma,
             label_smoothing=label_smoothing,
             bit_weights=bit_weights,
+            mixup_alpha=mixup_alpha,
+            weight_decay=weight_decay,
+            scheduler_type=scheduler_type,
+            warmup_epochs=warmup_epochs,
+            min_lr=min_lr,
+            max_epochs=max_epochs,
         )
 
         self.apply_config_hyperparameters(trainer_hparams, self.pl_model)
@@ -377,29 +491,45 @@ class GraphModelClassifierTrainer(GraphModelBase):
             output_dir=self.train_results_dir,
             plot_frequency=10,
         )
+        ckpt_cfg = callbacks_cfg.get("model_checkpoint", {})
+        ckpt_monitor = ckpt_cfg.get("monitor", "val/accuracy")
+        ckpt_mode = ckpt_cfg.get("mode", "max")
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
-            monitor="val/loss",
+            monitor=ckpt_monitor,
             filename="classifier-model-{epoch:02d}",
-            save_top_k=callbacks_cfg.get("model_checkpoint", {}).get("save_top_k", 3),
-            mode="min",
+            save_top_k=ckpt_cfg.get("save_top_k", 3),
+            mode=ckpt_mode,
             auto_insert_metric_name=False,
         )
 
-        self.early_stopping_callback = EarlyStopping(
-            monitor="val/loss",
-            patience=30,
-            mode="min",
-            verbose=True,
-        )
-        
         callback_list = [
             self.metrics_callback,
             self.loss_plot_callback,
             self.hyperparam_callback,
             self.checkpoint_callback,
-            self.early_stopping_callback
         ]
+
+        # Early stopping
+        es_cfg = callbacks_cfg.get("early_stopping", {})
+        if es_cfg.get("enabled", True):
+            es_monitor = es_cfg.get("monitor", "val/accuracy")
+            es_mode = es_cfg.get("mode", "max")
+            self.early_stopping_callback = EarlyStopping(
+                monitor=es_monitor,
+                patience=es_cfg.get("patience", 50),
+                mode=es_mode,
+                verbose=True,
+            )
+            callback_list.append(self.early_stopping_callback)
+
+        # EMA model averaging
+        training_cfg = self.config.get("model_config", {}).get("classifier", {}).get("training", {})
+        ema_decay = training_cfg.get("ema_decay", 0.0)
+        if ema_decay > 0:
+            self.ema_callback = EMACallback(decay=ema_decay)
+            callback_list.append(self.ema_callback)
+            logger.info(f"EMA enabled with decay={ema_decay}")
 
         # Setup trainer configuration
         trainer_cfg = self.config.get("advanced_config", {}).get("trainer", {})
