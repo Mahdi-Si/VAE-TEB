@@ -53,7 +53,7 @@ model_config:
 
   classifier_head:
     num_classes: 3                              # 3 output bits for hierarchical mode (2 for binary)
-    dropout: 0.2                                # Dropout in classifier head / residual blocks
+    dropout: 0.25                               # Dropout in classifier head / residual blocks
     mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier (legacy head only)
     use_class_weights: true                     # false = uniform CE loss (no class weighting)
     num_residual_blocks: 5                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
@@ -73,6 +73,12 @@ model_config:
       posterior_sampling: true                  # Add noise ~ N(0, posterior_var * scale) during training
       noise_scale: 0.5                          # Scale factor for posterior noise
       temporal_jitter: 5                        # Random shift +/- N timesteps (~20 sec)
+    training:
+      weight_decay: 0.01                        # AdamW weight decay
+      scheduler_type: cosine                    # 'cosine' (warmup+decay) or 'multistep' (legacy)
+      warmup_epochs: 10                         # Linear LR warmup epochs
+      min_lr: 1.0e-6                            # Minimum LR at end of cosine decay
+      ema_decay: 0.999                          # EMA model averaging decay (0 = disabled)
 
   temporal_attention:
     enabled: true                                 # ATTAIN-style attention over past temporal LSTM cell states
@@ -132,12 +138,14 @@ advanced_config:
     benchmark: true                              # cuDNN benchmark mode (faster for fixed input sizes)
   callbacks:
     early_stopping:
-      enabled: true                              # Stop training when val/loss plateaus
-      patience: 30                               # Epochs without improvement before stopping
-      monitor: 'val/loss'                        # Metric to monitor for early stopping
+      enabled: true                              # Stop training when val/accuracy plateaus
+      patience: 50                               # Epochs without improvement before stopping
+      monitor: 'val/accuracy'                    # Metric to monitor for early stopping
+      mode: 'max'                                # Maximize accuracy
     model_checkpoint:
       save_top_k: 3                              # Keep top-K checkpoints by monitored metric
-      monitor: 'val/loss'                        # Metric to monitor for checkpoint saving
+      monitor: 'val/accuracy'                    # Metric to monitor for checkpoint saving
+      mode: 'max'                                # Maximize accuracy
   tracking:
     mlflow:
       enabled: true

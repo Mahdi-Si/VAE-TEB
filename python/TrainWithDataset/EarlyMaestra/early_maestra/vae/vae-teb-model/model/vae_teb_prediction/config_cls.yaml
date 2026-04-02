@@ -70,10 +70,21 @@ model_config:
       noise_scale: 0.5                   # Scale factor for posterior noise
       temporal_jitter: 5                  # Random shift +/- N timesteps (~20 sec)
 
+    # -----------------------------------------------------------------------
+    # Training Procedure (optimizer, scheduler, regularization)
+    # -----------------------------------------------------------------------
+    training:
+      weight_decay: 0.01                  # AdamW weight decay (L2 regularization)
+      scheduler_type: cosine              # 'cosine' (warmup+decay) or 'multistep' (legacy)
+      warmup_epochs: 10                   # Linear LR warmup epochs (cosine only)
+      min_lr: 1.0e-6                      # Minimum LR at end of cosine decay
+      mixup_alpha: 0.2                    # Mixup interpolation (Beta distribution param, 0 = disabled)
+      ema_decay: 0.999                    # EMA model averaging decay (0 = disabled)
+
     # Architecture parameters (shared)
     hidden_dim: 128                       # Hidden dimension for LSTM/BiLSTM
     num_layers: 3                         # Number of recurrent layers
-    dropout: 0.1                          # Dropout rate
+    dropout: 0.25                         # Dropout rate (increased from 0.1 for regularization)
     mlp_multiplier: 2.0                   # MLP head hidden dim = pooled_dim * multiplier
 
     # LSTM-specific
@@ -245,15 +256,16 @@ advanced_config:
   # -------------------------------------------------------------------------
   callbacks:
     early_stopping:
-      enabled: false
-      monitor: "val/total_loss"
-      patience: 30
+      enabled: true
+      monitor: "val/accuracy"
+      patience: 50
+      mode: "max"
       min_delta: 0.0001
 
     model_checkpoint:
-      monitor: "val/total_loss"
+      monitor: "val/accuracy"
       save_top_k: 3
-      mode: "min"
+      mode: "max"
 
     loss_plotting:
       max_history_size: 1000

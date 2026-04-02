@@ -213,17 +213,51 @@ class LightningModelBase(L.LightningModule, ABC):
         self,
         optimizer: Optimizer,
     ) -> Optional[Union[_LRScheduler, Dict[str, Union[_LRScheduler, str, int]]]]:
-        """Optional MultiStepLR scheduler builder.
+        """Build LR scheduler: cosine annealing with warmup, or legacy MultiStepLR.
 
-        Uses milestones configured via ``self.hparams.lr_milestones``. Override
-        this method to return ``None`` (no scheduler), a plain scheduler
-        instance, or the richer dict structure Lightning expects when extra
-        metadata (e.g., interval or frequency) is required.
+        Scheduler type is selected via ``self.hparams.scheduler_type``:
+
+        - ``'cosine'`` (recommended): Linear warmup for ``warmup_epochs``,
+          then cosine decay to ``min_lr``. Requires ``max_epochs``.
+        - ``'multistep'`` (legacy): Step decay at ``lr_milestones`` with
+          ``lr_gamma`` factor.
+
+        Falls back to ``'multistep'`` if ``scheduler_type`` is not set and
+        ``lr_milestones`` is provided, or returns ``None`` if neither is
+        configured.
         """
+        import math
+        from torch.optim.lr_scheduler import LambdaLR, MultiStepLR
+
+        scheduler_type = getattr(self.hparams, "scheduler_type", None)
+
+        # --- Cosine annealing with linear warmup ---
+        if scheduler_type == "cosine":
+            warmup_epochs = int(getattr(self.hparams, "warmup_epochs", 10))
+            max_epochs = int(getattr(self.hparams, "max_epochs", 1000))
+            base_lr = float(getattr(self.hparams, "lr", 1e-4))
+            min_lr = float(getattr(self.hparams, "min_lr", 1e-6))
+            min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
+
+            def cosine_warmup_lambda(epoch):
+                if epoch < warmup_epochs:
+                    # Linear warmup from 0 to 1
+                    return max(epoch / max(warmup_epochs, 1), 1e-6)
+                # Cosine decay from 1 to min_lr_ratio
+                progress = (epoch - warmup_epochs) / max(max_epochs - warmup_epochs, 1)
+                return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+
+            scheduler = LambdaLR(optimizer, lr_lambda=cosine_warmup_lambda)
+            return {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            }
+
+        # --- Legacy MultiStepLR ---
         milestones = getattr(self.hparams, "lr_milestones", None)
         if not milestones:
             return None
-        from torch.optim.lr_scheduler import MultiStepLR
 
         gamma = float(getattr(self.hparams, "lr_gamma", 0.1))
         scheduler = MultiStepLR(optimizer, milestones=list(milestones), gamma=gamma)

@@ -1460,6 +1460,47 @@ class VaeTebTimeSeriesClassifier(nn.Module):
 
         return classifier_outputs
 
+    def encode_and_prepare(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+        tlo: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode features and concatenate TLO, returning ready-to-classify features.
+
+        Useful for mixup: encode first, mix features, then classify.
+
+        Args:
+            y_st: Target scattering features ``(B, T, 43)``.
+            y_ph: Target phase harmonic features ``(B, T, 44)``.
+            x_ph: Source cross-phase features ``(B, T, 137)``.
+            tlo: Optional TLO ``(B,)`` in seconds.
+
+        Returns:
+            Feature tensor ``(B, T, D)`` ready for the classifier.
+        """
+        z = self.encode_features(y_st, y_ph, x_ph)
+        if self.tlo_embedding is not None:
+            if tlo is None:
+                tlo = torch.full((z.shape[0],), float('nan'), device=z.device)
+            tlo_embed = self.tlo_embedding(tlo, seq_len=z.shape[1])
+            z = torch.cat([z, tlo_embed], dim=-1)
+        return z
+
+    def classify_features(self, z: torch.Tensor) -> dict:
+        """Run classifier on pre-encoded features.
+
+        Args:
+            z: Feature tensor ``(B, T, D)`` from ``encode_and_prepare()``.
+
+        Returns:
+            Dict with ``logits``, ``probs``, ``preds``.
+        """
+        outputs = self.classifier(z)
+        outputs["latent_features"] = z
+        return outputs
+
     def compute_loss(
         self,
         y_st: torch.Tensor,
