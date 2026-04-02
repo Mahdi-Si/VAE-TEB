@@ -8,43 +8,210 @@ except ImportError:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
+
+
+# =====================================================================
+# Focal BCE Loss with Label Smoothing
+# =====================================================================
+
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    """Focal binary cross-entropy loss with optional label smoothing.
+
+    Combines focal loss (Lin et al. 2017) with per-bit weighting and
+    label smoothing for multi-label / hierarchical classification.
+
+    Args:
+        gamma: Focusing parameter. Higher values down-weight easy
+            examples more aggressively. 0 reduces to standard BCE.
+        alpha: Optional per-bit weight tensor of shape ``(num_bits,)``.
+        label_smoothing: Smoothing factor. Targets are moved toward 0.5
+            by this amount: ``t' = t * (1 - s) + 0.5 * s``.
+        reduction: ``'mean'`` | ``'sum'`` | ``'none'``.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
+        else:
+            self.alpha = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute focal BCE loss.
+
+        Args:
+            logits: Raw logits of shape ``(*, num_bits)``.
+            targets: Float targets of shape ``(*, num_bits)`` in ``[0, 1]``.
+
+        Returns:
+            Scalar loss (when reduction is ``'mean'`` or ``'sum'``),
+            otherwise per-element loss.
+        """
+        if self.label_smoothing > 0:
+            targets = targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+
+        p = torch.sigmoid(logits)
+        p_t = targets * p + (1.0 - targets) * (1.0 - p)
+        focal_weight = (1.0 - p_t) ** self.gamma
+        loss = focal_weight * bce
+
+        if self.alpha is not None:
+            loss = loss * self.alpha
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+# =====================================================================
+# Attention-based temporal pooling
+# =====================================================================
+
+
+class SegmentAttentionPooling(nn.Module):
+    """Learned attention pooling over temporal hidden states.
+
+    Computes a weighted sum of hidden states over the time dimension,
+    allowing the model to focus on clinically significant timesteps
+    (e.g. decelerations, variability changes) within each segment.
+
+    Architecture::
+
+        score_t = w^T tanh(W h_t + b)
+        alpha   = softmax(score, dim=T)
+        v       = sum(alpha * h, dim=T)
+
+    Args:
+        hidden_dim: Dimension of the hidden states.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.attention_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1, bias=False),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute attention-weighted sum of hidden states.
+
+        Args:
+            hidden_states: Tensor of shape ``(B, T, H)``.
+
+        Returns:
+            Tuple of ``(pooled, alpha)`` where ``pooled`` has shape
+            ``(B, H)`` and ``alpha`` has shape ``(B, T)``.
+        """
+        scores = self.attention_net(hidden_states)      # (B, T, 1)
+        alpha = F.softmax(scores, dim=-2)               # (B, T, 1)
+        pooled = (alpha * hidden_states).sum(dim=-2)    # (B, H)
+        return pooled, alpha.squeeze(-1)
+
+
+# =====================================================================
+# Hierarchical label utilities
+# =====================================================================
+
+
+def map_to_hierarchical_labels(labels: torch.Tensor) -> torch.Tensor:
+    """Map scalar class labels to hierarchical multi-hot encoding.
+
+    Encoding:
+        - Healthy  (label <= 1) → ``[1, 0, 0]``
+        - Acidosis (label == 2) → ``[0, 1, 0]``
+        - HIE      (label == 3) → ``[0, 1, 1]``
+
+    Args:
+        labels: Integer tensor of shape ``(N,)`` with values in ``{0, 1, 2, 3}``.
+            Values 0 and 1 are both treated as healthy.
+
+    Returns:
+        Float tensor of shape ``(N, 3)``.
+    """
+    targets = torch.zeros(labels.shape[0], 3, device=labels.device, dtype=torch.float32)
+    targets[labels <= 1, 0] = 1.0   # healthy bit
+    targets[labels == 2, 1] = 1.0   # unhealthy bit (acidosis)
+    targets[labels == 3, 1] = 1.0   # unhealthy bit (HIE)
+    targets[labels == 3, 2] = 1.0   # severe bit (HIE only)
+    return targets
 
 
 class BaseTimeSeriesClassifier(nn.Module):
+    """Base class for time series classifiers.
+
+    Supports two label modes controlled by ``label_mode``:
+    - ``'binary'``: Standard 2-class softmax + cross-entropy.
+    - ``'hierarchical'``: 3-bit multi-hot sigmoid + focal BCE.
+
+    Args:
+        input_dim: Input feature dimension per timestep.
+        num_classes: Number of output units (2 for binary, 3 for hierarchical).
+        label_mode: ``'binary'`` or ``'hierarchical'``.
     """
-    Base class that implements a standard compute_loss for
-    multi-class classification.
-    """
-    def __init__(self, input_dim: int, num_classes: int):
+
+    def __init__(self, input_dim: int, num_classes: int, label_mode: str = "binary"):
         super().__init__()
         self.input_dim = input_dim
         self.num_classes = num_classes
+        self.label_mode = label_mode
 
     def forward(self, x):
-        """
-        Should be implemented by subclasses.
+        """Should be implemented by subclasses.
 
         Args:
-            x: Tensor of shape (batch_size, time_steps, input_dim)
+            x: Tensor of shape ``(batch_size, time_steps, input_dim)``.
 
         Returns:
-            A dict with at least the key "logits" of shape (batch_size, num_classes).
+            A dict with at least ``"logits"`` of shape
+            ``(batch_size, num_classes)``.
         """
         raise NotImplementedError
 
-    def compute_loss(self, x, y):
-        """
-        Compute cross-entropy loss given input sequences and targets.
+    def _compute_probs_preds(self, logits: torch.Tensor) -> dict:
+        """Compute probabilities and predictions from logits.
+
+        Handles both binary (softmax) and hierarchical (sigmoid) modes.
 
         Args:
-            x: Tensor of shape (batch_size, time_steps, input_dim)
-            y: LongTensor of shape (batch_size,) with class indices.
+            logits: Raw logits of shape ``(B, num_classes)``.
 
         Returns:
-            dict with:
-              - "loss": scalar tensor
-              - all keys returned by forward() (e.g. "logits", "probs", "preds")
+            Dict with ``"logits"``, ``"probs"``, ``"preds"``.
+        """
+        if self.label_mode == "hierarchical":
+            probs = torch.sigmoid(logits)
+            # Primary prediction uses bit 1 (unhealthy indicator)
+            preds = (probs[:, 1] > 0.5).long()
+        else:
+            probs = F.softmax(logits, dim=-1)
+            preds = probs.argmax(dim=-1)
+        return {"logits": logits, "probs": probs, "preds": preds}
+
+    def compute_loss(self, x, y):
+        """Compute loss given input sequences and targets.
+
+        Args:
+            x: Tensor of shape ``(batch_size, time_steps, input_dim)``.
+            y: LongTensor of shape ``(batch_size,)`` with class indices.
+
+        Returns:
+            Dict with ``"loss"`` and all keys from ``forward()``.
         """
         outputs = self(x)
         logits = outputs["logits"]
@@ -68,16 +235,19 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
         num_layers: int = 1,
         bidirectional: bool = False,
         dropout: float = 0.1,
-        pooling: str = "last",  # 'last', 'mean', 'max', 'mean_max', 'concat'
+        pooling: str = "last",
         mlp_multiplier: float = 2.0,
         use_layer_norm: bool = True,
+        attention_pool: bool = False,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.pooling = pooling.lower()
         self.use_layer_norm = use_layer_norm
+        self.use_attention_pool = attention_pool
 
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -90,9 +260,10 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
 
         lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
 
-        if self.pooling == "mean_max":
-            feature_dim = lstm_out_dim * 2
-        elif self.pooling == "concat":
+        if attention_pool:
+            self.attn_pooling = SegmentAttentionPooling(lstm_out_dim)
+            feature_dim = lstm_out_dim
+        elif self.pooling in ("mean_max", "concat"):
             feature_dim = lstm_out_dim * 2
         else:
             feature_dim = lstm_out_dim
@@ -101,21 +272,22 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
         layers = []
         if self.use_layer_norm:
             layers.append(nn.LayerNorm(feature_dim))
-        layers.extend(
-            [
-                nn.Linear(feature_dim, hidden_fc),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_fc, num_classes),
-            ]
-        )
+        layers.extend([
+            nn.Linear(feature_dim, hidden_fc),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_fc, num_classes),
+        ])
         self.classifier = nn.Sequential(*layers)
 
     def forward(self, x):
-        # x: (B, T, D)
-        lstm_out, (h_n, c_n) = self.lstm(x)  # lstm_out: (B, T, H*)
+        lstm_out, (h_n, c_n) = self.lstm(x)
 
-        if self.pooling == "mean":
+        result = {}
+        if self.use_attention_pool:
+            features, attn_weights = self.attn_pooling(lstm_out)
+            result["attn_weights"] = attn_weights
+        elif self.pooling == "mean":
             features = lstm_out.mean(dim=1)
         elif self.pooling == "max":
             features, _ = torch.max(lstm_out, dim=1)
@@ -128,18 +300,11 @@ class LSTMClassifier(BaseTimeSeriesClassifier):
             mean_state = lstm_out.mean(dim=1)
             features = torch.cat([last_state, mean_state], dim=1)
         else:
-            # Default to last time step
             features = lstm_out[:, -1, :]
 
-        logits = self.classifier(features)  # (B, C)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {
-            "logits": logits,
-            "probs": probs,
-            "preds": preds,
-        }
+        logits = self.classifier(features)
+        result.update(self._compute_probs_preds(logits))
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -157,48 +322,31 @@ class CNN1DClassifier(BaseTimeSeriesClassifier):
         num_filters: int = 64,
         kernel_sizes=(3, 5, 7),
         dropout: float = 0.1,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
 
-        self.convs = nn.ModuleList(
-            [
-                nn.Conv1d(
-                    in_channels=input_dim,
-                    out_channels=num_filters,
-                    kernel_size=k,
-                    padding=k // 2,
-                )
-                for k in kernel_sizes
-            ]
-        )
+        self.convs = nn.ModuleList([
+            nn.Conv1d(in_channels=input_dim, out_channels=num_filters,
+                      kernel_size=k, padding=k // 2)
+            for k in kernel_sizes
+        ])
 
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(num_filters * len(kernel_sizes), num_classes)
 
     def forward(self, x):
-        # x: (B, T, D) -> (B, D, T) for Conv1d
-        x = x.transpose(1, 2)  # (B, D, T)
+        x = x.transpose(1, 2)
 
         conv_outs = []
         for conv in self.convs:
-            h = conv(x)  # (B, num_filters, T)
-            h = F.relu(h)
-            # Global max pool over time dimension
-            h = F.adaptive_max_pool1d(h, 1).squeeze(-1)  # (B, num_filters)
+            h = F.relu(conv(x))
+            h = F.adaptive_max_pool1d(h, 1).squeeze(-1)
             conv_outs.append(h)
 
-        features = torch.cat(conv_outs, dim=1)  # (B, num_filters * len(kernel_sizes))
-        features = self.dropout(features)
-
-        logits = self.fc(features)  # (B, C)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {
-            "logits": logits,
-            "probs": probs,
-            "preds": preds,
-        }
+        features = self.dropout(torch.cat(conv_outs, dim=1))
+        logits = self.fc(features)
+        return self._compute_probs_preds(logits)
 
 
 # ---------------------------------------------------------------------
@@ -230,9 +378,12 @@ class CNNLSTMClassifier(BaseTimeSeriesClassifier):
         pooling: str = "mean_max",
         mlp_multiplier: float = 2.0,
         use_layer_norm: bool = True,
+        attention_pool: bool = False,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
         self.pooling = pooling.lower()
+        self.use_attention_pool = attention_pool
 
         # --- CNN feature extraction (parallel multi-kernel) ---
         self.conv_branches = nn.ModuleList()
@@ -264,9 +415,10 @@ class CNNLSTMClassifier(BaseTimeSeriesClassifier):
         self.lstm_norm = nn.LayerNorm(lstm_out_dim) if use_layer_norm else nn.Identity()
 
         # --- Pooling ---
-        if self.pooling == "mean_max":
-            pooled_dim = lstm_out_dim * 2
-        elif self.pooling == "concat":
+        if attention_pool:
+            self.attn_pooling = SegmentAttentionPooling(lstm_out_dim)
+            pooled_dim = lstm_out_dim
+        elif self.pooling in ("mean_max", "concat"):
             pooled_dim = lstm_out_dim * 2
         else:
             pooled_dim = lstm_out_dim
@@ -285,23 +437,20 @@ class CNNLSTMClassifier(BaseTimeSeriesClassifier):
         self.classifier = nn.Sequential(*head_layers)
 
     def forward(self, x):
-        # x: (B, T, D)
-        h = x.transpose(1, 2)  # (B, D, T)
+        h = x.transpose(1, 2)
 
-        # Parallel multi-kernel CNN
         branch_outs = [branch(h) for branch in self.conv_branches]
-        h = torch.cat(branch_outs, dim=1)  # (B, concat_filters, T)
+        h = torch.cat(branch_outs, dim=1)
+        h = self.cnn_projection(h).transpose(1, 2)
 
-        # Project to cnn_out_dim
-        h = self.cnn_projection(h)  # (B, cnn_out_dim, T)
-        h = h.transpose(1, 2)  # (B, T, cnn_out_dim)
-
-        # BiLSTM
-        lstm_out, _ = self.lstm(h)  # (B, T, lstm_out_dim)
+        lstm_out, _ = self.lstm(h)
         lstm_out = self.lstm_norm(lstm_out)
 
-        # Pooling
-        if self.pooling == "mean":
+        result = {}
+        if self.use_attention_pool:
+            features, attn_weights = self.attn_pooling(lstm_out)
+            result["attn_weights"] = attn_weights
+        elif self.pooling == "mean":
             features = lstm_out.mean(dim=1)
         elif self.pooling == "max":
             features, _ = torch.max(lstm_out, dim=1)
@@ -310,21 +459,13 @@ class CNNLSTMClassifier(BaseTimeSeriesClassifier):
             max_val, _ = torch.max(lstm_out, dim=1)
             features = torch.cat([mean_val, max_val], dim=1)
         elif self.pooling == "concat":
-            last_state = lstm_out[:, -1, :]
-            mean_state = lstm_out.mean(dim=1)
-            features = torch.cat([last_state, mean_state], dim=1)
+            features = torch.cat([lstm_out[:, -1, :], lstm_out.mean(dim=1)], dim=1)
         else:
             features = lstm_out[:, -1, :]
 
         logits = self.classifier(features)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {
-            "logits": logits,
-            "probs": probs,
-            "preds": preds,
-        }
+        result.update(self._compute_probs_preds(logits))
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -347,8 +488,9 @@ class BiLSTMAttentionClassifier(BaseTimeSeriesClassifier):
         num_layers: int = 1,
         attn_dim: int = 64,
         dropout: float = 0.1,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
 
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -367,30 +509,19 @@ class BiLSTMAttentionClassifier(BaseTimeSeriesClassifier):
         self.fc = nn.Linear(lstm_out_dim, num_classes)
 
     def forward(self, x):
-        # x: (B, T, D)
-        H, _ = self.lstm(x)  # (B, T, 2H)
+        H, _ = self.lstm(x)
 
-        # Compute attention scores
-        # (B, T, attn_dim)
         attn_scores = torch.tanh(self.attn(H))
-        # Project to scalar score per time-step: (B, T)
         attn_scores = torch.matmul(attn_scores, self.attn_vector)
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # (B, T, 1)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
 
-        # Weighted sum of hidden states
-        context = (H * attn_weights).sum(dim=1)  # (B, 2H)
+        context = (H * attn_weights).sum(dim=1)
         context = self.dropout(context)
 
-        logits = self.fc(context)  # (B, C)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {
-            "logits": logits,
-            "probs": probs,
-            "preds": preds,
-            "attn_weights": attn_weights.squeeze(-1),  # (B, T)
-        }
+        logits = self.fc(context)
+        result = self._compute_probs_preds(logits)
+        result["attn_weights"] = attn_weights.squeeze(-1)
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -439,9 +570,10 @@ class TransformerClassifier(BaseTimeSeriesClassifier):
         dim_feedforward: int = 256,
         dropout: float = 0.1,
         max_len: int = 5000,
-        pooling: str = "mean",  # "mean" or "cls"
+        pooling: str = "mean",
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
 
         self.d_model = d_model
         self.pooling = pooling
@@ -450,16 +582,13 @@ class TransformerClassifier(BaseTimeSeriesClassifier):
         self.pos_encoding = PositionalEncoding(d_model, max_len=max_len)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,  # so we can keep (B, T, d_model)
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         if pooling == "cls":
-            # learnable classification token
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         else:
             self.cls_token = None
@@ -468,60 +597,30 @@ class TransformerClassifier(BaseTimeSeriesClassifier):
         self.fc = nn.Linear(d_model, num_classes)
 
     def forward(self, x, src_key_padding_mask=None):
-        """
-        Args:
-            x: Tensor (B, T, D)
-            src_key_padding_mask: optional BoolTensor (B, T) where True means "pad" / ignore.
-
-        Returns:
-            dict with "logits", "probs", "preds"
-        """
         B, T, D = x.shape
-        h = self.input_proj(x)  # (B, T, d_model)
+        h = self.input_proj(x)
 
         if self.pooling == "cls":
-            # prepend cls token to sequence
-            cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
-            h = torch.cat([cls_tokens, h], dim=1)  # (B, 1+T, d_model)
-
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            h = torch.cat([cls_tokens, h], dim=1)
             if src_key_padding_mask is not None:
-                # add padding mask for cls token (never padded)
-                cls_pad = torch.zeros(
-                    B, 1, dtype=torch.bool, device=src_key_padding_mask.device
-                )
-                src_key_padding_mask = torch.cat(
-                    [cls_pad, src_key_padding_mask], dim=1
-                )
+                cls_pad = torch.zeros(B, 1, dtype=torch.bool, device=src_key_padding_mask.device)
+                src_key_padding_mask = torch.cat([cls_pad, src_key_padding_mask], dim=1)
 
-        h = self.pos_encoding(h)  # (B, T', d_model)
-        # TransformerEncoder expects src_key_padding_mask shape (B, T')
-        encoded = self.encoder(h, src_key_padding_mask=src_key_padding_mask)  # (B, T', d_model)
+        h = self.pos_encoding(h)
+        encoded = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
 
         if self.pooling == "cls":
-            # use first token
-            features = encoded[:, 0, :]  # (B, d_model)
+            features = encoded[:, 0, :]
         else:
-            # mean pooling over non-padded positions
             if src_key_padding_mask is not None:
-                # src_key_padding_mask: True for pads, False for real
-                mask = ~src_key_padding_mask  # True for real tokens
-                mask = mask.unsqueeze(-1)  # (B, T, 1)
-                encoded = encoded * mask  # zero-out pads
-                lengths = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                features = encoded.sum(dim=1) / lengths  # (B, d_model)
+                mask = (~src_key_padding_mask).unsqueeze(-1)
+                features = (encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
             else:
-                features = encoded.mean(dim=1)  # (B, d_model)
+                features = encoded.mean(dim=1)
 
-        features = self.dropout(features)
-        logits = self.fc(features)  # (B, C)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {
-            "logits": logits,
-            "probs": probs,
-            "preds": preds,
-        }
+        logits = self.fc(self.dropout(features))
+        return self._compute_probs_preds(logits)
 
 # ---------------------------------------------------------------------
 # 5. Mamba (Selective State Space) classifier — pure PyTorch
@@ -642,9 +741,12 @@ class MambaClassifier(BaseTimeSeriesClassifier):
         dropout: float = 0.1,
         pooling: str = "mean_max",
         mlp_multiplier: float = 2.0,
+        attention_pool: bool = False,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
         self.pooling = pooling.lower()
+        self.use_attention_pool = attention_pool
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.blocks = nn.ModuleList([
@@ -653,9 +755,10 @@ class MambaClassifier(BaseTimeSeriesClassifier):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-        if self.pooling == "mean_max":
-            pooled_dim = d_model * 2
-        elif self.pooling == "concat":
+        if attention_pool:
+            self.attn_pooling = SegmentAttentionPooling(d_model)
+            pooled_dim = d_model
+        elif self.pooling in ("mean_max", "concat"):
             pooled_dim = d_model * 2
         else:
             pooled_dim = d_model
@@ -670,13 +773,16 @@ class MambaClassifier(BaseTimeSeriesClassifier):
         )
 
     def forward(self, x: torch.Tensor) -> dict:
-        # x: (B, T, input_dim)
-        h = self.input_proj(x)          # (B, T, d_model)
+        h = self.input_proj(x)
         for block in self.blocks:
-            h = block(h)                 # (B, T, d_model)
+            h = block(h)
         h = self.final_norm(h)
 
-        if self.pooling == "mean":
+        result = {}
+        if self.use_attention_pool:
+            features, attn_weights = self.attn_pooling(h)
+            result["attn_weights"] = attn_weights
+        elif self.pooling == "mean":
             features = h.mean(dim=1)
         elif self.pooling == "max":
             features, _ = torch.max(h, dim=1)
@@ -688,9 +794,8 @@ class MambaClassifier(BaseTimeSeriesClassifier):
             features = h[:, -1, :]
 
         logits = self.classifier(features)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-        return {"logits": logits, "probs": probs, "preds": preds}
+        result.update(self._compute_probs_preds(logits))
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -791,34 +896,29 @@ class MultiScaleConvAttentionClassifier(BaseTimeSeriesClassifier):
         attn_dropout: float = 0.1,
         dropout: float = 0.1,
         mlp_multiplier: float = 2.0,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
 
-        # Build Inception stack
         blocks = []
         in_ch = input_dim
         for i in range(n_inception_blocks):
             block = InceptionBlock(in_ch, num_filters, kernel_sizes, use_residual=True)
-            # InceptionBlock output channels
             in_ch = num_filters * len(kernel_sizes) + num_filters
             blocks.append(block)
         self.inception_stack = nn.Sequential(*blocks)
-        feat_dim = in_ch  # channels after inception
+        feat_dim = in_ch
 
-        # Squeeze-and-Excitation channel attention
         self.se = SqueezeExcitation(feat_dim, reduction=se_reduction)
 
-        # Multi-head self-attention over time
         self.attn_norm = nn.LayerNorm(feat_dim)
         self.self_attn = nn.MultiheadAttention(
             embed_dim=feat_dim, num_heads=n_attn_heads,
             dropout=attn_dropout, batch_first=True,
         )
 
-        # Pooling: concat global avg + global max
         pooled_dim = feat_dim * 2
 
-        # MLP head
         hidden_fc = max(int(pooled_dim * mlp_multiplier), pooled_dim)
         self.classifier = nn.Sequential(
             nn.LayerNorm(pooled_dim),
@@ -829,31 +929,20 @@ class MultiScaleConvAttentionClassifier(BaseTimeSeriesClassifier):
         )
 
     def forward(self, x: torch.Tensor) -> dict:
-        # x: (B, T, D)
-        h = x.transpose(1, 2)                 # (B, D, T)
+        h = x.transpose(1, 2)
+        h = self.se(self.inception_stack(h))
+        h = h.transpose(1, 2)
+        h_attn, _ = self.self_attn(self.attn_norm(h), self.attn_norm(h), self.attn_norm(h))
+        h = h + h_attn
 
-        # Multi-scale convolutions
-        h = self.inception_stack(h)            # (B, feat_dim, T)
-
-        # Channel attention
-        h = self.se(h)                         # (B, feat_dim, T)
-
-        # Self-attention over time dimension
-        h = h.transpose(1, 2)                  # (B, T, feat_dim)
-        h_norm = self.attn_norm(h)
-        h_attn, _ = self.self_attn(h_norm, h_norm, h_norm)
-        h = h + h_attn                         # residual
-
-        # Pool: concat(global_avg, global_max)
-        h_t = h.transpose(1, 2)               # (B, feat_dim, T)
-        avg_pool = F.adaptive_avg_pool1d(h_t, 1).squeeze(-1)  # (B, feat_dim)
-        max_pool = F.adaptive_max_pool1d(h_t, 1).squeeze(-1)  # (B, feat_dim)
-        features = torch.cat([avg_pool, max_pool], dim=1)      # (B, 2*feat_dim)
+        h_t = h.transpose(1, 2)
+        features = torch.cat([
+            F.adaptive_avg_pool1d(h_t, 1).squeeze(-1),
+            F.adaptive_max_pool1d(h_t, 1).squeeze(-1),
+        ], dim=1)
 
         logits = self.classifier(features)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-        return {"logits": logits, "probs": probs, "preds": preds}
+        return self._compute_probs_preds(logits)
 
 
 # ---------------------------------------------------------------------
@@ -969,9 +1058,12 @@ class CausalCNNLSTMClassifier(BaseTimeSeriesClassifier):
         dropout: float = 0.1,
         pooling: str = "mean_max",
         mlp_multiplier: float = 2.0,
+        attention_pool: bool = False,
+        label_mode: str = "binary",
     ):
-        super().__init__(input_dim, num_classes)
+        super().__init__(input_dim, num_classes, label_mode=label_mode)
         self.pooling = pooling.lower()
+        self.use_attention_pool = attention_pool
 
         # --- Sequential causal conv stages ---
         conv_blocks = []
@@ -994,7 +1086,10 @@ class CausalCNNLSTMClassifier(BaseTimeSeriesClassifier):
         self.lstm_norm = nn.LayerNorm(lstm_out_dim)
 
         # --- Pooling ---
-        if self.pooling in ("mean_max", "concat"):
+        if attention_pool:
+            self.attn_pooling = SegmentAttentionPooling(lstm_out_dim)
+            pooled_dim = lstm_out_dim
+        elif self.pooling in ("mean_max", "concat"):
             pooled_dim = lstm_out_dim * 2
         else:
             pooled_dim = lstm_out_dim
@@ -1032,7 +1127,11 @@ class CausalCNNLSTMClassifier(BaseTimeSeriesClassifier):
         lstm_out = self.lstm_norm(lstm_out)
 
         # Pooling
-        if self.pooling == "mean":
+        result = {}
+        if self.use_attention_pool:
+            features, attn_weights = self.attn_pooling(lstm_out)
+            result["attn_weights"] = attn_weights
+        elif self.pooling == "mean":
             features = lstm_out.mean(dim=1)
         elif self.pooling == "max":
             features, _ = torch.max(lstm_out, dim=1)
@@ -1048,10 +1147,8 @@ class CausalCNNLSTMClassifier(BaseTimeSeriesClassifier):
             features = lstm_out[:, -1, :]
 
         logits = self.classifier(features)
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1)
-
-        return {"logits": logits, "probs": probs, "preds": preds}
+        result.update(self._compute_probs_preds(logits))
+        return result
 
 
 # ---------------------------------------------------------------------
@@ -1111,15 +1208,17 @@ class VaeTebTimeSeriesClassifier(nn.Module):
     """Combined VAE + Classifier model for time series classification.
 
     This model uses a pre-trained VAE (SeqVae) to encode time series data into
-    latent representations, optionally concatenates a TLO (Time from Labour
-    Onset) embedding, then classifies the result.
+    latent representations, optionally enriches them with transfer entropy
+    signals, concatenates a TLO embedding, then classifies the result.
 
     Architecture::
 
-        VAE Encoder -> z (B, T, latent_dim)
-        [TLO scalar -> TLOEmbedding -> (B, T, tlo_embed_dim)]  # optional
-        concat -> (B, T, latent_dim + tlo_embed_dim)
-        Classifier -> logits (B, num_classes)
+        VAE Encoder -> encode_only() outputs
+          -> [enriched: mu_post || logvar_post || residual || kld]  (B, T, 64)
+          -> [or plain: mu_post]                                   (B, T, 16)
+          -> [augmentation: posterior noise + temporal jitter]      (training only)
+          -> [TLO scalar -> TLOEmbedding -> (B, T, tlo_embed_dim)] (optional)
+          -> concat -> Classifier -> logits (B, num_classes)
 
     Args:
         vae_model: Pre-trained SeqVae model for encoding.
@@ -1130,6 +1229,16 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         class_weights: Optional per-class weights for cross-entropy loss.
         tlo_embed_dim: TLO embedding dimension.  ``0`` disables TLO.
         tlo_dropout: Dropout inside TLO embedding MLP.
+        enriched_features: If ``True``, concatenate KLD, logvar_post, and
+            posterior-prior residual to mu_post (16-dim → 64-dim).
+        label_mode: ``'binary'`` for 2-class softmax or ``'hierarchical'``
+            for 3-bit multi-hot sigmoid.
+        focal_gamma: Focal loss gamma parameter.  ``0`` disables focusing.
+        label_smoothing: Label smoothing for focal/BCE loss.
+        bit_weights: Per-bit loss weights for hierarchical mode ``(3,)``.
+        augment_posterior_sample: Add posterior noise during training.
+        augment_noise_scale: Scale factor for posterior noise.
+        augment_temporal_jitter: Max random temporal shift (timesteps).
     """
 
     def __init__(
@@ -1142,6 +1251,14 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         class_weights: Optional[Sequence[float]] = None,
         tlo_embed_dim: int = 0,
         tlo_dropout: float = 0.1,
+        enriched_features: bool = False,
+        label_mode: str = "binary",
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+        bit_weights: Optional[Sequence[float]] = None,
+        augment_posterior_sample: bool = False,
+        augment_noise_scale: float = 0.5,
+        augment_temporal_jitter: int = 0,
     ):
         super().__init__()
         self.vae_model = vae_model
@@ -1149,12 +1266,30 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         self.freeze_vae = freeze_vae
         self.use_posterior = use_posterior
         self.sample_latent = sample_latent
+        self.enriched_features = enriched_features
+        self.label_mode = label_mode
+
+        # Augmentation config
+        self.augment_posterior_sample = augment_posterior_sample
+        self.augment_noise_scale = augment_noise_scale
+        self.augment_temporal_jitter = augment_temporal_jitter
+
+        # Class weights (for binary mode backward compat)
         if class_weights is not None:
             weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
             self.register_buffer("class_weights", weight_tensor)
         else:
-            # Keep an attribute for convenience when no weights are provided
             self.class_weights = None
+
+        # Focal loss (used in hierarchical mode, also available for binary)
+        bw_tensor = None
+        if bit_weights is not None:
+            bw_tensor = torch.as_tensor(bit_weights, dtype=torch.float32)
+        self.focal_loss = FocalBCEWithLogitsLoss(
+            gamma=focal_gamma,
+            alpha=bw_tensor,
+            label_smoothing=label_smoothing,
+        )
 
         # TLO embedding (disabled when tlo_embed_dim == 0)
         if tlo_embed_dim > 0:
@@ -1167,49 +1302,129 @@ class VaeTebTimeSeriesClassifier(nn.Module):
                 param.requires_grad = False
             self.vae_model.eval()
 
-    def encode_features(
+    def _run_vae_encoder(
         self,
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
-        x_ph: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Extract latent features from VAE encoder.
+        x_ph: torch.Tensor,
+    ) -> dict:
+        """Run VAE encoder and return all outputs.
 
         Args:
-            y_st: Target scattering features (B, T, 43)
-            y_ph: Target phase harmonic features (B, T, 44)
-            x_ph: Source cross-phase + UP self-phase features (B, T, 137)
+            y_st: Target scattering features ``(B, T, 43)``.
+            y_ph: Target phase harmonic features ``(B, T, 44)``.
+            x_ph: Source cross-phase features ``(B, T, 137)``.
 
         Returns:
-            z: Latent features (B, T, D) where D is latent_dim
+            Dict from ``vae_model.encode_only()`` containing
+            ``mu_post``, ``logvar_post``, ``mu_prior``, ``logvar_prior``, ``z``.
         """
         if self.freeze_vae:
             self.vae_model.eval()
             with torch.no_grad():
-                enc_outputs = self.vae_model.encode_only(
-                    y_st=y_st,
-                    y_ph=y_ph,
-                    x_ph=x_ph,
-                    sample_z=self.sample_latent
+                return self.vae_model.encode_only(
+                    y_st=y_st, y_ph=y_ph, x_ph=x_ph,
+                    sample_z=self.sample_latent,
                 )
-        else:
-            enc_outputs = self.vae_model.encode_only(
-                y_st=y_st,
-                y_ph=y_ph,
-                x_ph=x_ph,
-                sample_z=self.sample_latent
-            )
+        return self.vae_model.encode_only(
+            y_st=y_st, y_ph=y_ph, x_ph=x_ph,
+            sample_z=self.sample_latent,
+        )
 
+    @staticmethod
+    def compute_kld_per_dim(
+        mu_post: torch.Tensor,
+        logvar_post: torch.Tensor,
+        mu_prior: torch.Tensor,
+        logvar_prior: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-dimension KL divergence (transfer entropy signal).
+
+        KL(q(z|x,y) || p(z|y)) per dimension per timestep.
+
+        Args:
+            mu_post: Posterior mean ``(B, T, D)``.
+            logvar_post: Posterior log-variance ``(B, T, D)``.
+            mu_prior: Prior mean ``(B, T, D)``.
+            logvar_prior: Prior log-variance ``(B, T, D)``.
+
+        Returns:
+            Per-dim KLD of shape ``(B, T, D)``.
+        """
+        var_post = logvar_post.exp()
+        var_prior = logvar_prior.exp().clamp(min=1e-8)
+        return 0.5 * (
+            logvar_prior - logvar_post
+            + var_post / var_prior
+            + (mu_post - mu_prior).pow(2) / var_prior
+            - 1.0
+        )
+
+    def encode_features(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        x_ph: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract latent features from VAE encoder.
+
+        When ``enriched_features=True``, concatenates four 16-dim signals
+        into a 64-dim feature vector per timestep:
+
+        1. ``mu_post`` — posterior mean
+        2. ``logvar_post`` — posterior uncertainty
+        3. ``mu_post - mu_prior`` — directed transfer residual
+        4. ``kld_per_dim`` — per-dimension transfer entropy
+
+        When ``enriched_features=False``, returns only ``mu_post`` (16-dim).
+
+        Training-time augmentation (posterior noise, temporal jitter) is
+        applied to ``mu_post`` before enrichment.
+
+        Args:
+            y_st: Target scattering features ``(B, T, 43)``.
+            y_ph: Target phase harmonic features ``(B, T, 44)``.
+            x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
+
+        Returns:
+            Feature tensor ``(B, T, D)`` where D is 64 (enriched) or 16.
+        """
+        enc = self._run_vae_encoder(y_st, y_ph, x_ph)
+
+        mu_post = enc["mu_post"]
+        logvar_post = enc["logvar_post"]
+        mu_prior = enc["mu_prior"]
+        logvar_prior = enc["logvar_prior"]
+
+        # --- Training-time augmentation on mu_post ---
+        z = mu_post
         if self.use_posterior:
             if self.sample_latent:
-                z = enc_outputs["z"]  # Sampled from q(z|x,y)
-            else:
-                z = enc_outputs["mu_post"]  # Mean of q(z|x,y)
+                z = enc["z"]
         else:
-            z = enc_outputs["mu_prior"]  # Mean of p(z|y)
+            z = mu_prior
 
-        return z  # (B, T, D)
+        if self.training:
+            if self.augment_posterior_sample:
+                noise = torch.randn_like(z) * (0.5 * logvar_post).exp() * self.augment_noise_scale
+                z = z + noise
+
+            if self.augment_temporal_jitter > 0:
+                shift = torch.randint(
+                    -self.augment_temporal_jitter,
+                    self.augment_temporal_jitter + 1,
+                    (1,),
+                ).item()
+                if shift != 0:
+                    z = torch.roll(z, shifts=shift, dims=1)
+
+        if not self.enriched_features:
+            return z
+
+        # --- Enriched: concatenate 4 signals ---
+        residual = mu_post - mu_prior
+        kld = self.compute_kld_per_dim(mu_post, logvar_post, mu_prior, logvar_prior)
+        return torch.cat([z, logvar_post, residual, kld], dim=-1)
 
     def forward(
         self,
@@ -1225,7 +1440,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
             y_ph: Target phase harmonic features ``(B, T, 44)``.
             x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
             tlo: Optional scalar TLO per sample ``(B,)`` in seconds (may
-                contain ``NaN``).  Ignored when ``tlo_embedding`` is ``None``.
+                contain ``NaN``).
 
         Returns:
             Dictionary with ``logits``, ``probs``, ``preds``,
@@ -1236,13 +1451,11 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         # Concatenate TLO embedding if enabled
         if self.tlo_embedding is not None:
             if tlo is None:
-                # Old HDF5 without time_from_labor_onset: treat all as missing
                 tlo = torch.full((z.shape[0],), float('nan'), device=z.device)
-            tlo_embed = self.tlo_embedding(tlo, seq_len=z.shape[1])  # (B, T, embed_dim)
-            z = torch.cat([z, tlo_embed], dim=-1)  # (B, T, D + embed_dim)
+            tlo_embed = self.tlo_embedding(tlo, seq_len=z.shape[1])
+            z = torch.cat([z, tlo_embed], dim=-1)
 
         classifier_outputs = self.classifier(z)
-
         classifier_outputs["latent_features"] = z
 
         return classifier_outputs
@@ -1256,6 +1469,9 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         tlo: Optional[torch.Tensor] = None,
     ) -> dict:
         """Compute classification loss.
+
+        Supports both binary (cross-entropy) and hierarchical (focal BCE)
+        modes, controlled by ``self.label_mode``.
 
         Args:
             y_st: Target scattering features ``(B, T, 43)``.
@@ -1271,15 +1487,24 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         outputs = self.forward(y_st, y_ph, x_ph, tlo=tlo)
         logits = outputs["logits"]
 
-        # Compute cross-entropy loss
-        loss = F.cross_entropy(logits, labels, weight=getattr(self, "class_weights", None))
+        if self.label_mode == "hierarchical":
+            hier_targets = map_to_hierarchical_labels(labels)
+            loss = self.focal_loss(logits, hier_targets)
+            # Primary metric: unhealthy detection (bit 1)
+            unhealthy_prob = torch.sigmoid(logits[:, 1])
+            preds = (unhealthy_prob > 0.5).long()
+            binary_labels = (labels > 1).long()
+        else:
+            loss = F.cross_entropy(
+                logits, labels, weight=self.class_weights,
+            )
+            preds = outputs["preds"]
+            binary_labels = labels
 
-        # Compute accuracy
-        preds = outputs["preds"]
-        accuracy = (preds == labels).float().mean()
+        accuracy = (preds == binary_labels).float().mean()
 
         return {
             "loss": loss,
             "accuracy": accuracy,
-            **outputs
+            **outputs,
         }

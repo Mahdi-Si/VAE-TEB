@@ -52,13 +52,27 @@ model_config:
       dropout: 0.1                              # Dropout in TLO embedding MLP
 
   classifier_head:
-    num_classes: 2                              # Binary: 0=healthy, 1=unhealthy (acidosis/HIE)
+    num_classes: 3                              # 3 output bits for hierarchical mode (2 for binary)
     dropout: 0.2                                # Dropout in classifier head / residual blocks
     mlp_multiplier: 2.0                         # Hidden layer size = hidden_dim * multiplier (legacy head only)
     use_class_weights: true                     # false = uniform CE loss (no class weighting)
     num_residual_blocks: 5                      # Pre-norm residual MLP blocks before final projection (0 = legacy head)
     bottleneck_dim: 256                         # Bottleneck dimension inside each residual block
     output_dropout: 0.3                         # Dropout on temporal LSTM output before classifier head
+
+  # ---------------------------------------------------------------------------
+  # Classification Enhancements
+  # ---------------------------------------------------------------------------
+  enhancements:
+    enriched_features: true                     # Concatenate KLD, logvar_post, residual → 64-dim input
+    label_mode: hierarchical                    # 'binary' (2-class CE) or 'hierarchical' (3-bit focal BCE)
+    focal_gamma: 2.0                            # Focal loss focusing parameter (0 = standard BCE)
+    label_smoothing: 0.05                       # Label smoothing for focal loss
+    bit_weights: [1.0, 2.0, 1.0]               # Per-bit loss weights [healthy, unhealthy, severe]
+    augmentation:
+      posterior_sampling: true                  # Add noise ~ N(0, posterior_var * scale) during training
+      noise_scale: 0.5                          # Scale factor for posterior noise
+      temporal_jitter: 5                        # Random shift +/- N timesteps (~20 sec)
 
   temporal_attention:
     enabled: true                                 # ATTAIN-style attention over past temporal LSTM cell states
