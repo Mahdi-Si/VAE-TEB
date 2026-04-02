@@ -83,10 +83,10 @@ _PARTITION_COLORS = {
     "test": "#93c47d",
 }
 
-_PARTITION_HATCHES = {
-    "train": "//",
-    "val": "\\\\",
-    "test": "xx",
+_PARTITION_LINESTYLES = {
+    "train": "-",
+    "val": "--",
+    "test": ":",
 }
 
 _PARTITION_ORDER = ["train", "val", "test"]
@@ -289,15 +289,26 @@ def _plot_tlo_distribution(
         partitions = [p for p in _PARTITION_ORDER if p in df["partition"].unique()]
         stats_lines: List[str] = []
 
+        # Shared bin edges so outlines are comparable
+        all_vals = df["labour_duration_hours"].values
+        bin_edges = np.histogram_bin_edges(all_vals, bins=20)
+
         for part in partitions:
             subset = df[df["partition"] == part]["labour_duration_hours"]
             if subset.empty:
                 continue
             ax.hist(
-                subset, bins=20, alpha=0.5,
-                color=_PARTITION_COLORS[part], label=part,
-                edgecolor=_PARTITION_COLORS[part], linewidth=0.5,
-                hatch=_PARTITION_HATCHES[part],
+                subset, bins=bin_edges,
+                histtype="step", linewidth=1.5,
+                color=_PARTITION_COLORS[part],
+                linestyle=_PARTITION_LINESTYLES[part],
+                label=part,
+            )
+            # Light fill for visual weight
+            ax.hist(
+                subset, bins=bin_edges,
+                histtype="stepfilled", alpha=0.12,
+                color=_PARTITION_COLORS[part],
             )
             stats_lines.append(
                 f"{part}: n={len(subset)}, "
@@ -557,10 +568,16 @@ def _plot_subgroup_duration_histograms(
                 if subset.empty:
                     continue
                 ax.hist(
-                    subset, bins=bin_edges, alpha=0.5,
-                    color=_PARTITION_COLORS[part], label=part,
-                    edgecolor=_PARTITION_COLORS[part], linewidth=0.5,
-                    hatch=_PARTITION_HATCHES[part],
+                    subset, bins=bin_edges,
+                    histtype="step", linewidth=1.3,
+                    color=_PARTITION_COLORS[part],
+                    linestyle=_PARTITION_LINESTYLES[part],
+                    label=part,
+                )
+                ax.hist(
+                    subset, bins=bin_edges,
+                    histtype="stepfilled", alpha=0.12,
+                    color=_PARTITION_COLORS[part],
                 )
                 stats_lines.append(
                     f"{part}: n={len(subset)}, "
