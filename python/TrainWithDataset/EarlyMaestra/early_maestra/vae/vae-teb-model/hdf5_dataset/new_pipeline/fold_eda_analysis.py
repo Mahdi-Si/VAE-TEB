@@ -83,6 +83,12 @@ _PARTITION_COLORS = {
     "test": "#93c47d",
 }
 
+_PARTITION_HATCHES = {
+    "train": "//",
+    "val": "\\\\",
+    "test": "xx",
+}
+
 _PARTITION_ORDER = ["train", "val", "test"]
 
 _CLASS_COLORS = {
@@ -288,9 +294,10 @@ def _plot_tlo_distribution(
             if subset.empty:
                 continue
             ax.hist(
-                subset, bins=20, alpha=0.45,
+                subset, bins=20, alpha=0.5,
                 color=_PARTITION_COLORS[part], label=part,
-                edgecolor="white", linewidth=0.3,
+                edgecolor=_PARTITION_COLORS[part], linewidth=0.5,
+                hatch=_PARTITION_HATCHES[part],
             )
             stats_lines.append(
                 f"{part}: n={len(subset)}, "
@@ -550,9 +557,10 @@ def _plot_subgroup_duration_histograms(
                 if subset.empty:
                     continue
                 ax.hist(
-                    subset, bins=bin_edges, alpha=0.45,
+                    subset, bins=bin_edges, alpha=0.5,
                     color=_PARTITION_COLORS[part], label=part,
-                    edgecolor="white", linewidth=0.3,
+                    edgecolor=_PARTITION_COLORS[part], linewidth=0.5,
+                    hatch=_PARTITION_HATCHES[part],
                 )
                 stats_lines.append(
                     f"{part}: n={len(subset)}, "
