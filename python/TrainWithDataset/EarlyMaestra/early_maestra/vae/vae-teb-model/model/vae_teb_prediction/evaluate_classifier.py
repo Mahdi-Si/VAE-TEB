@@ -340,7 +340,7 @@ def run_inference(
 
             # Get predictions
             outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
-            probs = outputs["probs"]  # (B, 2)
+            probs = outputs["probs"]  # (B, C) where C=2 (binary) or C=3 (hierarchical)
             preds = outputs["preds"]  # (B,)
 
             # Move to CPU
@@ -348,6 +348,7 @@ def run_inference(
             binary_labels = binary_labels.cpu().numpy()
             preds = preds.cpu().numpy()
             probs = probs.cpu().numpy()
+            num_outputs = probs.shape[-1]
 
             # Compute TLO hours for output
             tlo_hours_np = (tlo.cpu().numpy() / 3600.0) if tlo is not None else None
@@ -355,6 +356,15 @@ def run_inference(
             # Store predictions
             batch_size = y_st.size(0)
             for i in range(batch_size):
+                # Handle both binary (2-class softmax) and hierarchical (3-bit sigmoid)
+                if num_outputs == 2:
+                    p0 = float(probs[i, 0])
+                    p1 = float(probs[i, 1])
+                else:
+                    # Hierarchical: bit 1 = unhealthy probability (primary signal)
+                    p1 = float(probs[i, 1])
+                    p0 = 1.0 - p1
+
                 pred_dict = {
                     'guid': guid[i] if guid is not None else f"sample_{len(predictions)}",
                     'epoch': float(epoch_val[i]) if epoch_val is not None else -1.0,
@@ -363,8 +373,8 @@ def run_inference(
                     'target': int(target_labels[i]),  # Original (1, 2, or 3)
                     'binary_target': int(binary_labels[i]),  # Binary (0 or 1)
                     'predicted_class': int(preds[i]),  # Predicted (0 or 1)
-                    'prob_class_0': float(probs[i, 0]),
-                    'prob_class_1': float(probs[i, 1]),
+                    'prob_class_0': p0,
+                    'prob_class_1': p1,
                     'tlo_hours': float(tlo_hours_np[i]) if tlo_hours_np is not None else None,
                 }
                 predictions.append(pred_dict)
