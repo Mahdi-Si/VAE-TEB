@@ -192,11 +192,12 @@ def run_temporal_inference(
                     batch_device[k] = v
 
             outputs = model(batch_device)
-            probs = outputs["probs"]       # (B, S_max, 2)
+            probs = outputs["probs"]       # (B, S_max, C) where C=2 or 3
             mask = batch_device["mask"]    # (B, S_max) bool
             lengths = batch_device["lengths"]  # (B,)
             target = batch_device["target"]    # (B, S_max, 300)
             epoch_val = batch_device["epoch"]  # (B, S_max)
+            num_outputs = probs.shape[-1]
 
             # TLO — may contain NaN
             tlo = batch_device.get("time_from_labor_onset")  # (B, S_max) or None
@@ -210,6 +211,16 @@ def run_temporal_inference(
                     if tlo is not None:
                         tlo_val = tlo[i, j].item() / 3600.0  # NaN preserved
 
+                    # Handle both binary (2-class softmax) and hierarchical (3-bit sigmoid)
+                    if num_outputs == 2:
+                        p0 = float(probs[i, j, 0].item())
+                        p1 = float(probs[i, j, 1].item())
+                        pred_cls = int(probs[i, j].argmax().item())
+                    else:
+                        p1 = float(probs[i, j, 1].item())
+                        p0 = 1.0 - p1
+                        pred_cls = int(p1 > 0.5)
+
                     row = {
                         "guid": batch_device["guid"][i],
                         "epoch": float(epoch_val[i, j].item()),
@@ -217,9 +228,9 @@ def run_temporal_inference(
                         "bg_label": bool(batch_device["bg_label"][i].item()),
                         "target": int(seg_target),
                         "binary_target": int(seg_target > 1),
-                        "predicted_class": int(probs[i, j].argmax().item()),
-                        "prob_class_0": float(probs[i, j, 0].item()),
-                        "prob_class_1": float(probs[i, j, 1].item()),
+                        "predicted_class": pred_cls,
+                        "prob_class_0": p0,
+                        "prob_class_1": p1,
                         "tlo_hours": tlo_val,
                     }
                     rows.append(row)
