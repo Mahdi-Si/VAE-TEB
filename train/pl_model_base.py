@@ -57,6 +57,10 @@ class LightningModelBase(L.LightningModule, ABC):
         lr_milestones: Optional[Iterable[int]] = None,
         weight_decay: float = 1e-4,
         module_name: Optional[str] = None,
+        scheduler_type: Optional[str] = None,
+        warmup_epochs: int = 10,
+        min_lr: float = 1e-6,
+        max_epochs: int = 1000,
     ) -> None:
         """
         Args:
@@ -65,6 +69,11 @@ class LightningModelBase(L.LightningModule, ABC):
             lr_milestones: Optional milestone epochs for the scheduler helper.
             weight_decay: AdamW weight decay applied across parameters.
             module_name: Friendly name used in logs/debug messages.
+            scheduler_type: LR scheduler type (``'cosine'`` or ``'multistep'``).
+                ``None`` falls back to multistep if milestones provided.
+            warmup_epochs: Linear warmup epochs for cosine scheduler.
+            min_lr: Minimum LR at end of cosine decay.
+            max_epochs: Total training epochs (for cosine schedule computation).
         """
         super().__init__()
         self.save_hyperparameters(ignore=['base_model'])
