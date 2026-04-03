@@ -186,10 +186,20 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
     latent_dim = classifier_config.get('latent_dim', 16)
     num_classes = classifier_config.get('num_classes', 2)
 
+    # Enhancement config
+    enriched_features = classifier_config.get('enriched_features', False)
+    label_mode = classifier_config.get('label_mode', 'binary')
+    attention_pool = classifier_config.get('attention_pool', False)
+
     # TLO embedding config
     tlo_embed_dim = classifier_config.get('tlo_embed_dim', 0)
     tlo_dropout = classifier_config.get('tlo_dropout', 0.1)
-    classifier_input_dim = latent_dim + tlo_embed_dim
+    feature_dim = latent_dim * 4 if enriched_features else latent_dim
+    classifier_input_dim = feature_dim + tlo_embed_dim
+
+    # Shared kwargs for classifiers
+    shared_kwargs = dict(label_mode=label_mode)
+    pool_kwargs = dict(attention_pool=attention_pool, **shared_kwargs)
 
     if classifier_type == 'lstm':
         classifier = LSTMClassifier(
@@ -199,6 +209,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             num_layers=classifier_config.get('num_layers', 2),
             bidirectional=classifier_config.get('bidirectional', False),
             dropout=classifier_config.get('dropout', 0.1),
+            **pool_kwargs,
         )
     elif classifier_type == 'cnn_lstm':
         classifier = CNNLSTMClassifier(
@@ -211,6 +222,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             lstm_layers=classifier_config.get('lstm_layers', 2),
             dropout=classifier_config.get('dropout', 0.1),
             pooling=classifier_config.get('pooling', 'mean_max'),
+            **pool_kwargs,
         )
     elif classifier_type == 'cnn':
         classifier = CNN1DClassifier(
@@ -219,6 +231,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             num_filters=classifier_config.get('num_filters', 64),
             kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
             dropout=classifier_config.get('dropout', 0.1),
+            **shared_kwargs,
         )
     elif classifier_type == 'bilstm_attention':
         classifier = BiLSTMAttentionClassifier(
@@ -228,6 +241,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             num_layers=classifier_config.get('num_layers', 1),
             attn_dim=classifier_config.get('attn_dim', 64),
             dropout=classifier_config.get('dropout', 0.1),
+            **shared_kwargs,
         )
     elif classifier_type == 'transformer':
         classifier = TransformerClassifier(
@@ -239,6 +253,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             dim_feedforward=classifier_config.get('dim_feedforward', 256),
             dropout=classifier_config.get('dropout', 0.1),
             pooling=classifier_config.get('pooling', 'mean'),
+            **shared_kwargs,
         )
     elif classifier_type == 'mamba':
         classifier = MambaClassifier(
@@ -252,6 +267,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             dropout=classifier_config.get('dropout', 0.1),
             pooling=classifier_config.get('pooling', 'mean_max'),
             mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
+            **pool_kwargs,
         )
     elif classifier_type == 'multiscale_conv_attention':
         classifier = MultiScaleConvAttentionClassifier(
@@ -265,6 +281,7 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             attn_dropout=classifier_config.get('attn_dropout', 0.1),
             dropout=classifier_config.get('dropout', 0.1),
             mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
+            **shared_kwargs,
         )
     elif classifier_type == 'causal_cnn_lstm':
         classifier = CausalCNNLSTMClassifier(
@@ -278,9 +295,13 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
             dropout=classifier_config.get('dropout', 0.1),
             pooling=classifier_config.get('pooling', 'mean_max'),
             mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
+            **pool_kwargs,
         )
     else:
         raise ValueError(f"Unknown classifier type: {classifier_type}")
+
+    # Augmentation config (not used at eval, but needed for model shape matching)
+    aug_config = classifier_config.get('augmentation', {})
 
     model = VaeTebTimeSeriesClassifier(
         vae_model=vae_model,
@@ -291,6 +312,14 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
         class_weights=classifier_config.get('class_weights'),
         tlo_embed_dim=tlo_embed_dim,
         tlo_dropout=tlo_dropout,
+        enriched_features=enriched_features,
+        label_mode=label_mode,
+        focal_gamma=classifier_config.get('focal_gamma', 2.0),
+        label_smoothing=classifier_config.get('label_smoothing', 0.0),
+        bit_weights=classifier_config.get('bit_weights'),
+        augment_posterior_sample=aug_config.get('posterior_sampling', False),
+        augment_noise_scale=aug_config.get('noise_scale', 0.5),
+        augment_temporal_jitter=aug_config.get('temporal_jitter', 0),
     )
 
     return model
