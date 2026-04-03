@@ -97,6 +97,8 @@ def create_temporal_model_from_config(
     tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
     dt_cfg = feat_cfg.get("delta_t", {})
     temp_attn_cfg = model_cfg.get("temporal_attention", {})
+    enhance_cfg = model_cfg.get("enhancements", {})
+    aug_cfg = enhance_cfg.get("augmentation", {})
 
     model = TemporalVaeClassifier(
         vae_model=vae_model,
@@ -136,6 +138,15 @@ def create_temporal_model_from_config(
         temporal_attention=temp_attn_cfg.get("enabled", False),
         temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
         temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
+        # Classification enhancements (must match training config)
+        enriched_features=enhance_cfg.get("enriched_features", False),
+        label_mode=enhance_cfg.get("label_mode", "binary"),
+        focal_gamma=enhance_cfg.get("focal_gamma", 2.0),
+        label_smoothing=enhance_cfg.get("label_smoothing", 0.0),
+        bit_weights=enhance_cfg.get("bit_weights", None),
+        augment_posterior_sample=aug_cfg.get("posterior_sampling", False),
+        augment_noise_scale=aug_cfg.get("noise_scale", 0.5),
+        augment_temporal_jitter=aug_cfg.get("temporal_jitter", 0),
     )
     logger.info("Evaluation: Architecture temporal_lstm")
 
