@@ -217,11 +217,15 @@ class CausalTransformerTrainer(GraphModelBase):
             trainer_kwargs["logger"] = self.lightning_loggers
 
         # Accelerator
+        # find_unused_parameters=True is required because window_export's
+        # attention pools are only used in inference mode, not during training.
         if use_cuda:
             trainer_kwargs.update({
                 "accelerator": "gpu",
                 "devices": self.cuda_devices,
-                "strategy": "ddp" if multi_gpu else "auto",
+                "strategy": (
+                    "ddp_find_unused_parameters_true" if multi_gpu else "auto"
+                ),
                 "sync_batchnorm": multi_gpu,
             })
         else:
