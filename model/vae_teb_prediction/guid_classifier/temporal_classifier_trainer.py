@@ -82,11 +82,7 @@ class PlTemporalClassifier(LightningModelBase):
         lr: float = 1e-3,
         lr_milestones: Optional[Sequence[int]] = None,
         class_weights: Optional[List[float]] = None,
-        weight_decay: float = 0.01,
-        scheduler_type: str = "cosine",
-        warmup_epochs: int = 10,
-        min_lr: float = 1e-6,
-        max_epochs: int = 1000,
+        weight_decay: float = 1e-4,
     ) -> None:
         # Bypass torch.compile entirely.  LightningModelBase.__init__ calls
         # torch.compile(base_model) which can fail on Windows and produces
@@ -337,10 +333,6 @@ class GraphModelTemporalTrainer(GraphModelBase):
         dt_cfg = feat_cfg.get("delta_t", {})
         temp_attn_cfg = model_cfg.get("temporal_attention", {})
 
-        # Enhancement config
-        enhance_cfg = model_cfg.get("enhancements", {})
-        aug_cfg = enhance_cfg.get("augmentation", {})
-
         self.pytorch_model = TemporalVaeClassifier(
             vae_model=vae_model,
             segment_encoder_type=seg_cfg.get("type", "mean_pool"),
@@ -378,15 +370,6 @@ class GraphModelTemporalTrainer(GraphModelBase):
             temporal_attention=temp_attn_cfg.get("enabled", False),
             temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
             temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
-            # --- Classification enhancements ---
-            enriched_features=enhance_cfg.get("enriched_features", False),
-            label_mode=enhance_cfg.get("label_mode", "binary"),
-            focal_gamma=enhance_cfg.get("focal_gamma", 2.0),
-            label_smoothing=enhance_cfg.get("label_smoothing", 0.0),
-            bit_weights=enhance_cfg.get("bit_weights", None),
-            augment_posterior_sample=aug_cfg.get("posterior_sampling", False),
-            augment_noise_scale=aug_cfg.get("noise_scale", 0.5),
-            augment_temporal_jitter=aug_cfg.get("temporal_jitter", 0),
         )
         logger.info("Architecture: temporal_lstm")
 
@@ -401,33 +384,16 @@ class GraphModelTemporalTrainer(GraphModelBase):
         logger.info("Frozen parameters: {:,}", frozen_params)
 
         # ----- 4. Wrap in Lightning --------------------------------------- #
-        training_cfg = enhance_cfg.get("training", {})
-        weight_decay = training_cfg.get("weight_decay", 0.01)
-        scheduler_type = training_cfg.get("scheduler_type", "cosine")
-        warmup_epochs = training_cfg.get("warmup_epochs", 10)
-        min_lr = training_cfg.get("min_lr", 1e-6)
-        max_epochs = self.config.get("general_config", {}).get("epochs", 1000)
-
         self.pl_model = PlTemporalClassifier(
             self.pytorch_model,
             lr=self.lr,
             lr_milestones=self.lr_milestones,
             class_weights=class_weights,
-            weight_decay=weight_decay,
-            scheduler_type=scheduler_type,
-            warmup_epochs=warmup_epochs,
-            min_lr=min_lr,
-            max_epochs=max_epochs,
         )
 
         trainer_hparams = {
             "lr": self.lr,
             "lr_milestones": self.lr_milestones,
-            "weight_decay": weight_decay,
-            "scheduler_type": scheduler_type,
-            "warmup_epochs": warmup_epochs,
-            "min_lr": min_lr,
-            "max_epochs": max_epochs,
         }
         self.apply_config_hyperparameters(trainer_hparams, self.pl_model)
 
@@ -468,10 +434,10 @@ class GraphModelTemporalTrainer(GraphModelBase):
         ckpt_cfg = callbacks_cfg.get("model_checkpoint", {})
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
-            monitor=ckpt_cfg.get("monitor", "val/accuracy"),
+            monitor=ckpt_cfg.get("monitor", "val/loss"),
             filename="temporal-model-{epoch:02d}",
             save_top_k=ckpt_cfg.get("save_top_k", 3),
-            mode=ckpt_cfg.get("mode", "max"),
+            mode="min",
             auto_insert_metric_name=False,
         )
 
@@ -485,20 +451,12 @@ class GraphModelTemporalTrainer(GraphModelBase):
         es_cfg = callbacks_cfg.get("early_stopping", {})
         if es_cfg.get("enabled", True):
             self.early_stopping_callback = EarlyStopping(
-                monitor=es_cfg.get("monitor", "val/accuracy"),
-                patience=es_cfg.get("patience", 50),
-                mode=es_cfg.get("mode", "max"),
+                monitor=es_cfg.get("monitor", "val/loss"),
+                patience=es_cfg.get("patience", 30),
+                mode="min",
                 verbose=True,
             )
             callback_list.append(self.early_stopping_callback)
-
-        # EMA model averaging
-        from model.vae_teb_prediction.classifier_trainer import EMACallback
-        enhance_cfg = self.config.get("model_config", {}).get("enhancements", {})
-        ema_decay = enhance_cfg.get("ema_decay", 0.0)
-        if ema_decay > 0:
-            callback_list.append(EMACallback(decay=ema_decay))
-            logger.info("EMA enabled with decay={}", ema_decay)
 
         # --- Trainer config ----------------------------------------------- #
         trainer_cfg = self.config.get("advanced_config", {}).get("trainer", {})
