@@ -97,8 +97,6 @@ def create_temporal_model_from_config(
     tlo_cfg = feat_cfg.get("time_from_labor_onset", {})
     dt_cfg = feat_cfg.get("delta_t", {})
     temp_attn_cfg = model_cfg.get("temporal_attention", {})
-    enhance_cfg = model_cfg.get("enhancements", {})
-    aug_cfg = enhance_cfg.get("augmentation", {})
 
     model = TemporalVaeClassifier(
         vae_model=vae_model,
@@ -138,15 +136,6 @@ def create_temporal_model_from_config(
         temporal_attention=temp_attn_cfg.get("enabled", False),
         temporal_attention_dim=temp_attn_cfg.get("attn_dim", 64),
         temporal_attention_dropout=temp_attn_cfg.get("dropout", 0.1),
-        # Classification enhancements (must match training config)
-        enriched_features=enhance_cfg.get("enriched_features", False),
-        label_mode=enhance_cfg.get("label_mode", "binary"),
-        focal_gamma=enhance_cfg.get("focal_gamma", 2.0),
-        label_smoothing=enhance_cfg.get("label_smoothing", 0.0),
-        bit_weights=enhance_cfg.get("bit_weights", None),
-        augment_posterior_sample=aug_cfg.get("posterior_sampling", False),
-        augment_noise_scale=aug_cfg.get("noise_scale", 0.5),
-        augment_temporal_jitter=aug_cfg.get("temporal_jitter", 0),
     )
     logger.info("Evaluation: Architecture temporal_lstm")
 
@@ -203,12 +192,11 @@ def run_temporal_inference(
                     batch_device[k] = v
 
             outputs = model(batch_device)
-            probs = outputs["probs"]       # (B, S_max, C) where C=2 or 3
+            probs = outputs["probs"]       # (B, S_max, 2)
             mask = batch_device["mask"]    # (B, S_max) bool
             lengths = batch_device["lengths"]  # (B,)
             target = batch_device["target"]    # (B, S_max, 300)
             epoch_val = batch_device["epoch"]  # (B, S_max)
-            num_outputs = probs.shape[-1]
 
             # TLO — may contain NaN
             tlo = batch_device.get("time_from_labor_onset")  # (B, S_max) or None
@@ -222,16 +210,6 @@ def run_temporal_inference(
                     if tlo is not None:
                         tlo_val = tlo[i, j].item() / 3600.0  # NaN preserved
 
-                    # Handle both binary (2-class softmax) and hierarchical (3-bit sigmoid)
-                    if num_outputs == 2:
-                        p0 = float(probs[i, j, 0].item())
-                        p1 = float(probs[i, j, 1].item())
-                        pred_cls = int(probs[i, j].argmax().item())
-                    else:
-                        p1 = float(probs[i, j, 1].item())
-                        p0 = 1.0 - p1
-                        pred_cls = int(p1 > 0.5)
-
                     row = {
                         "guid": batch_device["guid"][i],
                         "epoch": float(epoch_val[i, j].item()),
@@ -239,9 +217,9 @@ def run_temporal_inference(
                         "bg_label": bool(batch_device["bg_label"][i].item()),
                         "target": int(seg_target),
                         "binary_target": int(seg_target > 1),
-                        "predicted_class": pred_cls,
-                        "prob_class_0": p0,
-                        "prob_class_1": p1,
+                        "predicted_class": int(probs[i, j].argmax().item()),
+                        "prob_class_0": float(probs[i, j, 0].item()),
+                        "prob_class_1": float(probs[i, j, 1].item()),
                         "tlo_hours": tlo_val,
                     }
                     rows.append(row)

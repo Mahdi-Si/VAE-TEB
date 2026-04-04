@@ -7,7 +7,7 @@ from train.callbacks import (
 )
 
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-import copy
+
 
 from loguru import logger
 
@@ -23,8 +23,6 @@ from model.vae_teb_prediction.prediction_classification_model import (
     MambaClassifier,
     MultiScaleConvAttentionClassifier,
     CausalCNNLSTMClassifier,
-    FocalBCEWithLogitsLoss,
-    map_to_hierarchical_labels,
 )
 
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -41,79 +39,16 @@ import time
 import yaml
 
 
-class EMACallback(pl.Callback):
-    """Exponential Moving Average of model weights.
-
-    Maintains a shadow copy of trainable parameters updated as:
-    ``shadow = decay * shadow + (1 - decay) * param``.
-
-    At validation time, swaps model weights with EMA weights so that
-    checkpoints and metrics reflect the averaged model. Swaps back
-    after validation.
-
-    Args:
-        decay: EMA decay factor (0.999 is typical).
-    """
-
-    def __init__(self, decay: float = 0.999):
-        super().__init__()
-        self.decay = decay
-        self.shadow: dict = {}
-        self.backup: dict = {}
-
-    def on_fit_start(self, trainer, pl_module):
-        """Initialize shadow weights from model parameters."""
-        for name, param in pl_module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Update EMA shadow weights after each training batch."""
-        for name, param in pl_module.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(
-                    param.data, alpha=1.0 - self.decay,
-                )
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        """Swap to EMA weights for validation."""
-        self.backup = {}
-        for name, param in pl_module.named_parameters():
-            if name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        """Restore training weights after validation."""
-        for name, param in pl_module.named_parameters():
-            if name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-
 class PlSeqVaeClassifier(LightningModelBase):
-    """PyTorch Lightning wrapper for VaeTebTimeSeriesClassifier.
+    """
+    PyTorch Lightning wrapper for VaeTebTimeSeriesClassifier.
 
-    Supports both binary (cross-entropy) and hierarchical (focal BCE)
-    label modes, latent-space mixup during training, and EMA model
-    averaging via external callback.
+    This class handles the training/validation logic for the combined VAE+Classifier model,
+    following the same pattern as SeqVaePl from the VAE trainer.
     """
 
-    def __init__(
-        self,
-        *args,
-        class_weights: Optional[List[float]] = None,
-        label_mode: str = "binary",
-        focal_gamma: float = 2.0,
-        label_smoothing: float = 0.0,
-        bit_weights: Optional[List[float]] = None,
-        mixup_alpha: float = 0.0,
-        **kwargs,
-    ):
+    def __init__(self, *args, class_weights: Optional[List[float]] = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.label_mode = label_mode
-        self.mixup_alpha = mixup_alpha
-
         if class_weights is not None:
             weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32)
             self.register_buffer("class_weights", weight_tensor)
@@ -121,108 +56,68 @@ class PlSeqVaeClassifier(LightningModelBase):
         else:
             self.class_weights = None
 
-        # Focal loss for hierarchical mode
-        if label_mode == "hierarchical":
-            bw = torch.as_tensor(bit_weights, dtype=torch.float32) if bit_weights else None
-            self.focal_loss = FocalBCEWithLogitsLoss(
-                gamma=focal_gamma, alpha=bw, label_smoothing=label_smoothing,
-            )
-            logger.info(
-                f"PlSeqVaeClassifier: hierarchical mode, focal_gamma={focal_gamma}, "
-                f"label_smoothing={label_smoothing}, bit_weights={bit_weights}"
-            )
-        if mixup_alpha > 0:
-            logger.info(f"PlSeqVaeClassifier: mixup enabled, alpha={mixup_alpha}")
-
-    def _build_targets(self, labels: torch.Tensor):
-        """Build float targets from raw labels for loss computation.
-
-        Args:
-            labels: Raw labels ``(B,)`` with values ``{1, 2, 3}``.
-
-        Returns:
-            Float targets suitable for the current ``label_mode``.
-            Hierarchical: ``(B, 3)`` multi-hot. Binary: ``(B, 2)`` one-hot.
-        """
-        if self.label_mode == "hierarchical":
-            return map_to_hierarchical_labels(labels)
-        binary = (labels > 1).long()
-        return torch.nn.functional.one_hot(binary, num_classes=2).float()
-
-    def _compute_loss_from_logits(
-        self, logits: torch.Tensor, targets: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute loss from logits and soft float targets.
-
-        Works with both mixed (soft) and non-mixed (hard) targets.
-
-        Args:
-            logits: ``(B, C)`` raw logits.
-            targets: ``(B, C)`` float targets (may be soft from mixup).
-
-        Returns:
-            Scalar loss.
-        """
-        if self.label_mode == "hierarchical":
-            return self.focal_loss(logits, targets)
-        # Soft cross-entropy: -sum(target * log_softmax(logits))
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        return -(targets * log_probs).sum(dim=-1).mean()
-
     def compute_loss_and_metrics(self, batch, batch_idx, stage: str):
-        """Compute loss and metrics for classification.
+        """
+        Compute loss and metrics for binary classification task.
 
-        Applies latent-space mixup during training when ``mixup_alpha > 0``.
+        Target sequence contains values 1, 2, or 3 at each timestep.
+        Binary mapping: 1 → class 0, 2&3 → class 1
 
         Args:
-            batch: Batch from dataloader with target shape ``(B, len_sequence)``.
-            batch_idx: Batch index.
-            stage: Training stage (``'train'``, ``'val'``, or ``'test'``).
+            batch: Batch from dataloader with target shape (B, len_sequence)
+            batch_idx: Batch index
+            stage: Training stage ('train', 'val', or 'test')
 
         Returns:
-            Tuple of ``(loss, metrics_dict)``.
+            Tuple of (loss, metrics_dict)
         """
-        y_st = batch.fhr_st
-        y_ph = batch.fhr_ph
-        x_ph = batch.fhr_up_ph
-        target_seq = batch.target
-        labels = target_seq.max(dim=1)[0]  # (B,) values {1, 2, 3}
+        # Extract features from batch
+        y_st = batch.fhr_st      # (B, T, 43)
+        y_ph = batch.fhr_ph      # (B, T, 44)
+        x_ph = batch.fhr_up_ph   # (B, T, 137)
+
+        # Get target sequence (B, len_sequence) with values 1, 2, or 3
+        target_seq = batch.target  # (B, len_sequence)
+
+        # Aggregate sequence to single label per sample (take max across sequence)
+        labels = target_seq.max(dim=1)[0]  # (B,) - values will be 1, 2, or 3
+
+        # Map to binary: 1 → 0, 2&3 → 1
+        binary_labels = (labels > 1).long()  # (B,) - class 0 or 1
+
+        # Extract TLO if available
         tlo = batch.time_from_labor_onset if hasattr(batch, 'time_from_labor_onset') else None
 
-        # --- Encode features ---
-        z = self.model.encode_and_prepare(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
-        targets = self._build_targets(labels)  # (B, C) float
+        # Forward pass through the model
+        outputs = self.model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
+        logits = outputs["logits"]  # (B, 2)
+        preds = outputs["preds"]    # (B,)
 
-        # --- Mixup (training only) ---
-        if self.training and self.mixup_alpha > 0:
-            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-            lam = max(lam, 1.0 - lam)  # Ensure lam >= 0.5 for stability
-            idx = torch.randperm(z.shape[0], device=z.device)
-            z = lam * z + (1.0 - lam) * z[idx]
-            targets = lam * targets + (1.0 - lam) * targets[idx]
+        # Compute loss with optional class weights
+        weight = getattr(self, "class_weights", None)
+        loss = torch.nn.functional.cross_entropy(
+            logits,
+            binary_labels,
+            weight=weight,
+        )
 
-        # --- Classify mixed features ---
-        outputs = self.model.classify_features(z)
-        logits = outputs["logits"]
-
-        # --- Loss ---
-        loss = self._compute_loss_from_logits(logits, targets)
-
-        # --- Metrics (always on unmixed binary labels for consistency) ---
-        binary_labels = (labels > 1).long()
-        if self.label_mode == "hierarchical":
-            preds = (torch.sigmoid(logits[:, 1]) > 0.5).long()
-        else:
-            preds = logits.argmax(dim=-1)
-
+        # Compute accuracy
         accuracy = (preds == binary_labels).float().mean()
+
+        # Compute per-class accuracy
         per_class_acc = {}
-        for c in range(2):
+        for c in range(2):  # Binary classification: class 0 and class 1
             mask = binary_labels == c
             if mask.sum() > 0:
                 per_class_acc[f"class_{c}_acc"] = (preds[mask] == binary_labels[mask]).float().mean()
 
-        metrics = {"loss": loss, "accuracy": accuracy, **per_class_acc}
+        # Build metrics dictionary
+        metrics = {
+            "loss": loss,
+            "accuracy": accuracy,
+            **per_class_acc,
+        }
+
         return loss, metrics
 
 
@@ -237,23 +132,33 @@ class GraphModelClassifierTrainer(GraphModelBase):
         super(GraphModelClassifierTrainer, self).__init__(config_file_path)
 
     def create_model(self):
-        """Create the combined VAE + Classifier model.
-
-        Loads the pre-trained VAE, creates the classifier head (with
-        enriched features, attention pooling, and label_mode support),
-        combines them, and wraps in PyTorch Lightning.
         """
+        Create the combined VAE + Classifier model.
+
+        This method:
+        1. Loads the pre-trained VAE model
+        2. Creates the classifier head
+        3. Combines them into VaeTebTimeSeriesClassifier
+        4. Wraps in PyTorch Lightning
+        """
+        # Get classifier config
         classifier_config = self.config.get('model_config', {}).get('classifier', {})
         vae_checkpoint = classifier_config.get('vae_checkpoint')
 
         if vae_checkpoint is None:
             raise ValueError("VAE checkpoint path must be provided in config under model_config.classifier.vae_checkpoint")
 
+        # Create VAE model
         vae_model = SeqVae()
-        load_checkpoint_strict(model=vae_model, checkpoint=vae_checkpoint)
+
+        # Load pre-trained VAE weights
+        load_checkpoint_strict(
+            model=vae_model,
+            checkpoint=vae_checkpoint,
+        )
         logger.info(f"VAE model loaded from checkpoint: {vae_checkpoint}")
 
-        # --- Core config ---
+        # Get classifier architecture and parameters
         classifier_type = classifier_config.get('type', 'lstm')
         latent_dim = classifier_config.get('latent_dim', 16)
         num_classes = classifier_config.get('num_classes', 2)
@@ -261,39 +166,13 @@ class GraphModelClassifierTrainer(GraphModelBase):
         use_posterior = classifier_config.get('use_posterior', True)
         sample_latent = classifier_config.get('sample_latent', False)
 
-        # --- Enhancement config ---
-        enriched_features = classifier_config.get('enriched_features', False)
-        label_mode = classifier_config.get('label_mode', 'binary')
-        attention_pool = classifier_config.get('attention_pool', False)
-        focal_gamma = classifier_config.get('focal_gamma', 2.0)
-        label_smoothing = classifier_config.get('label_smoothing', 0.0)
-        bit_weights = classifier_config.get('bit_weights', None)
-
-        # Augmentation config
-        aug_config = classifier_config.get('augmentation', {})
-        augment_posterior_sample = aug_config.get('posterior_sampling', False)
-        augment_noise_scale = aug_config.get('noise_scale', 0.5)
-        augment_temporal_jitter = aug_config.get('temporal_jitter', 0)
-
-        # --- Compute classifier input dim ---
+        # TLO embedding config
         tlo_embed_dim = classifier_config.get('tlo_embed_dim', 0)
         tlo_dropout = classifier_config.get('tlo_dropout', 0.1)
-        feature_dim = latent_dim * 4 if enriched_features else latent_dim
-        classifier_input_dim = feature_dim + tlo_embed_dim
-
-        if enriched_features:
-            logger.info(f"Enriched features enabled: {latent_dim}-dim -> {feature_dim}-dim "
-                        f"(mu_post + logvar_post + residual + kld)")
+        classifier_input_dim = latent_dim + tlo_embed_dim
         if tlo_embed_dim > 0:
             logger.info(f"TLO embedding enabled: embed_dim={tlo_embed_dim}, "
                         f"classifier input_dim={classifier_input_dim}")
-        if label_mode == "hierarchical":
-            logger.info(f"Hierarchical label mode: 3-bit [healthy, unhealthy, severe], "
-                        f"focal_gamma={focal_gamma}, label_smoothing={label_smoothing}")
-
-        # --- Shared kwargs for classifiers that support new features ---
-        shared_kwargs = dict(label_mode=label_mode)
-        pool_kwargs = dict(attention_pool=attention_pool, **shared_kwargs)
 
         if classifier_type == 'lstm':
             classifier = LSTMClassifier(
@@ -303,7 +182,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 num_layers=classifier_config.get('num_layers', 2),
                 bidirectional=classifier_config.get('bidirectional', False),
                 dropout=classifier_config.get('dropout', 0.1),
-                **pool_kwargs,
             )
         elif classifier_type == 'cnn_lstm':
             classifier = CNNLSTMClassifier(
@@ -316,7 +194,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 lstm_layers=classifier_config.get('lstm_layers', 2),
                 dropout=classifier_config.get('dropout', 0.1),
                 pooling=classifier_config.get('pooling', 'mean_max'),
-                **pool_kwargs,
             )
         elif classifier_type == 'cnn':
             classifier = CNN1DClassifier(
@@ -325,7 +202,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 num_filters=classifier_config.get('num_filters', 64),
                 kernel_sizes=tuple(classifier_config.get('kernel_sizes', [3, 5, 7])),
                 dropout=classifier_config.get('dropout', 0.1),
-                **shared_kwargs,
             )
         elif classifier_type == 'bilstm_attention':
             classifier = BiLSTMAttentionClassifier(
@@ -335,7 +211,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 num_layers=classifier_config.get('num_layers', 1),
                 attn_dim=classifier_config.get('attn_dim', 64),
                 dropout=classifier_config.get('dropout', 0.1),
-                **shared_kwargs,
             )
         elif classifier_type == 'transformer':
             classifier = TransformerClassifier(
@@ -347,7 +222,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 dim_feedforward=classifier_config.get('dim_feedforward', 256),
                 dropout=classifier_config.get('dropout', 0.1),
                 pooling=classifier_config.get('pooling', 'mean'),
-                **shared_kwargs,
             )
         elif classifier_type == 'mamba':
             classifier = MambaClassifier(
@@ -361,7 +235,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 dropout=classifier_config.get('dropout', 0.1),
                 pooling=classifier_config.get('pooling', 'mean_max'),
                 mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
-                **pool_kwargs,
             )
         elif classifier_type == 'multiscale_conv_attention':
             classifier = MultiScaleConvAttentionClassifier(
@@ -375,7 +248,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 attn_dropout=classifier_config.get('attn_dropout', 0.1),
                 dropout=classifier_config.get('dropout', 0.1),
                 mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
-                **shared_kwargs,
             )
         elif classifier_type == 'causal_cnn_lstm':
             classifier = CausalCNNLSTMClassifier(
@@ -389,7 +261,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
                 dropout=classifier_config.get('dropout', 0.1),
                 pooling=classifier_config.get('pooling', 'mean_max'),
                 mlp_multiplier=classifier_config.get('mlp_multiplier', 2.0),
-                **pool_kwargs,
             )
         else:
             raise ValueError(f"Unknown classifier type: {classifier_type}")
@@ -400,6 +271,10 @@ class GraphModelClassifierTrainer(GraphModelBase):
         if class_weights is not None:
             if not isinstance(class_weights, (list, tuple)):
                 raise ValueError("class_weights must be a list or tuple when provided")
+            if len(class_weights) != num_classes:
+                raise ValueError(
+                    f"class_weights length ({len(class_weights)}) must match num_classes ({num_classes})"
+                )
             class_weights = [float(w) for w in class_weights]
             logger.info(f"Using class weights: {class_weights}")
 
@@ -413,39 +288,19 @@ class GraphModelClassifierTrainer(GraphModelBase):
             class_weights=class_weights,
             tlo_embed_dim=tlo_embed_dim,
             tlo_dropout=tlo_dropout,
-            enriched_features=enriched_features,
-            label_mode=label_mode,
-            focal_gamma=focal_gamma,
-            label_smoothing=label_smoothing,
-            bit_weights=bit_weights,
-            augment_posterior_sample=augment_posterior_sample,
-            augment_noise_scale=augment_noise_scale,
-            augment_temporal_jitter=augment_temporal_jitter,
         )
 
+        # Log parameter counts
         total_params = sum(p.numel() for p in self.pytorch_model.parameters())
         trainable_params = sum(p.numel() for p in self.pytorch_model.parameters() if p.requires_grad)
         logger.info(f"Total parameters: {total_params:,}")
         logger.info(f"Trainable parameters: {trainable_params:,}")
         logger.info(f"Frozen parameters: {total_params - trainable_params:,}")
 
-        # Training procedure config
-        training_cfg = classifier_config.get('training', {})
-        mixup_alpha = training_cfg.get('mixup_alpha', 0.0)
-        weight_decay = training_cfg.get('weight_decay', 0.01)
-        scheduler_type = training_cfg.get('scheduler_type', 'cosine')
-        warmup_epochs = training_cfg.get('warmup_epochs', 10)
-        min_lr = training_cfg.get('min_lr', 1e-6)
-        max_epochs = self.config.get('general_config', {}).get('epochs', 1000)
-
+        # Create PyTorch Lightning wrapper
         trainer_hparams = {
             "lr": self.lr,
             "lr_milestones": self.lr_milestones,
-            "weight_decay": weight_decay,
-            "scheduler_type": scheduler_type,
-            "warmup_epochs": warmup_epochs,
-            "min_lr": min_lr,
-            "max_epochs": max_epochs,
         }
 
         self.pl_model = PlSeqVaeClassifier(
@@ -453,16 +308,6 @@ class GraphModelClassifierTrainer(GraphModelBase):
             lr=self.lr,
             lr_milestones=self.lr_milestones,
             class_weights=class_weights,
-            label_mode=label_mode,
-            focal_gamma=focal_gamma,
-            label_smoothing=label_smoothing,
-            bit_weights=bit_weights,
-            mixup_alpha=mixup_alpha,
-            weight_decay=weight_decay,
-            scheduler_type=scheduler_type,
-            warmup_epochs=warmup_epochs,
-            min_lr=min_lr,
-            max_epochs=max_epochs,
         )
 
         self.apply_config_hyperparameters(trainer_hparams, self.pl_model)
@@ -491,45 +336,29 @@ class GraphModelClassifierTrainer(GraphModelBase):
             output_dir=self.train_results_dir,
             plot_frequency=10,
         )
-        ckpt_cfg = callbacks_cfg.get("model_checkpoint", {})
-        ckpt_monitor = ckpt_cfg.get("monitor", "val/accuracy")
-        ckpt_mode = ckpt_cfg.get("mode", "max")
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=self.model_checkpoint_dir,
-            monitor=ckpt_monitor,
+            monitor="val/loss",
             filename="classifier-model-{epoch:02d}",
-            save_top_k=ckpt_cfg.get("save_top_k", 3),
-            mode=ckpt_mode,
+            save_top_k=callbacks_cfg.get("model_checkpoint", {}).get("save_top_k", 3),
+            mode="min",
             auto_insert_metric_name=False,
         )
 
+        self.early_stopping_callback = EarlyStopping(
+            monitor="val/loss",
+            patience=30,
+            mode="min",
+            verbose=True,
+        )
+        
         callback_list = [
             self.metrics_callback,
             self.loss_plot_callback,
             self.hyperparam_callback,
             self.checkpoint_callback,
+            self.early_stopping_callback
         ]
-
-        # Early stopping
-        es_cfg = callbacks_cfg.get("early_stopping", {})
-        if es_cfg.get("enabled", True):
-            es_monitor = es_cfg.get("monitor", "val/accuracy")
-            es_mode = es_cfg.get("mode", "max")
-            self.early_stopping_callback = EarlyStopping(
-                monitor=es_monitor,
-                patience=es_cfg.get("patience", 50),
-                mode=es_mode,
-                verbose=True,
-            )
-            callback_list.append(self.early_stopping_callback)
-
-        # EMA model averaging
-        training_cfg = self.config.get("model_config", {}).get("classifier", {}).get("training", {})
-        ema_decay = training_cfg.get("ema_decay", 0.0)
-        if ema_decay > 0:
-            self.ema_callback = EMACallback(decay=ema_decay)
-            callback_list.append(self.ema_callback)
-            logger.info(f"EMA enabled with decay={ema_decay}")
 
         # Setup trainer configuration
         trainer_cfg = self.config.get("advanced_config", {}).get("trainer", {})
