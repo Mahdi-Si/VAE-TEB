@@ -48,11 +48,6 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from loguru import logger
 
-from model.vae_teb_prediction.prediction_classification_model import (
-    FocalBCEWithLogitsLoss,
-    map_to_hierarchical_labels,
-)
-
 
 # ------------------------------------------------------------------ #
 #  Learned temporal feature embeddings                                  #
@@ -460,14 +455,6 @@ class TemporalVaeClassifier(nn.Module):
         temporal_attention_dim: int = 64,
         temporal_attention_dropout: float = 0.1,
         debug: bool = False,
-        enriched_features: bool = False,
-        label_mode: str = "binary",
-        focal_gamma: float = 2.0,
-        label_smoothing: float = 0.0,
-        bit_weights: Optional[Sequence[float]] = None,
-        augment_posterior_sample: bool = False,
-        augment_noise_scale: float = 0.5,
-        augment_temporal_jitter: int = 0,
     ) -> None:
         super().__init__()
 
@@ -486,21 +473,6 @@ class TemporalVaeClassifier(nn.Module):
         self.use_posterior = use_posterior
         self.freeze_vae = freeze_vae
         self.debug = debug
-        self.enriched_features = enriched_features
-        self.label_mode = label_mode
-        self.augment_posterior_sample = augment_posterior_sample
-        self.augment_noise_scale = augment_noise_scale
-        self.augment_temporal_jitter = augment_temporal_jitter
-
-        # Feature dimension: 64 when enriched (mu_post + logvar_post + residual + kld), else 16
-        self._feature_dim = self._VAE_LATENT_DIM * 4 if enriched_features else self._VAE_LATENT_DIM
-
-        # Focal loss for hierarchical mode
-        if label_mode == "hierarchical":
-            bw = torch.as_tensor(bit_weights, dtype=torch.float32) if bit_weights else None
-            self.focal_loss_fn = FocalBCEWithLogitsLoss(
-                gamma=focal_gamma, alpha=bw, label_smoothing=label_smoothing,
-            )
 
         # -- VAE model (frozen) -------------------------------------------- #
         self.vae_model = vae_model
@@ -510,13 +482,13 @@ class TemporalVaeClassifier(nn.Module):
                 param.requires_grad = False
 
         # -- Segment encoder ----------------------------------------------- #
-        # Use _feature_dim (64 when enriched, 16 otherwise) as input size
         if segment_encoder_type == "mean_pool":
-            self.d_seg = self._feature_dim
+            # Mean-pool directly uses VAE latent dim; no extra parameters.
+            self.d_seg = self._VAE_LATENT_DIM
         elif segment_encoder_type == "lstm":
             self.d_seg = d_seg
             self.segment_lstm = nn.LSTM(
-                input_size=self._feature_dim,
+                input_size=self._VAE_LATENT_DIM,
                 hidden_size=d_seg,
                 num_layers=1,
                 batch_first=True,
@@ -531,7 +503,7 @@ class TemporalVaeClassifier(nn.Module):
             self.d_seg = d_seg
             self._cnn_kernel = cnn_kernel
             self.segment_cnn = nn.Sequential(
-                nn.Conv1d(self._feature_dim, d_seg, kernel_size=cnn_kernel, padding=0),
+                nn.Conv1d(self._VAE_LATENT_DIM, d_seg, kernel_size=cnn_kernel, padding=0),
                 nn.GELU(),
                 nn.AdaptiveAvgPool1d(1),
             )
@@ -894,18 +866,6 @@ class TemporalVaeClassifier(nn.Module):
     #  VAE encoding                                                        #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _compute_kld_per_dim(mu_post, logvar_post, mu_prior, logvar_prior):
-        """Per-dimension KL divergence (transfer entropy signal)."""
-        var_post = logvar_post.exp()
-        var_prior = logvar_prior.exp().clamp(min=1e-8)
-        return 0.5 * (
-            logvar_prior - logvar_post
-            + var_post / var_prior
-            + (mu_post - mu_prior).pow(2) / var_prior
-            - 1.0
-        )
-
     def _encode_vae_chunked(
         self,
         fhr_st: Tensor,
@@ -915,22 +875,23 @@ class TemporalVaeClassifier(nn.Module):
     ) -> Tensor:
         """Encode all valid segments through the frozen VAE in chunks.
 
-        When ``enriched_features=True``, concatenates mu_post, logvar_post,
-        posterior-prior residual, and per-dim KLD into a 64-dim feature.
+        Flattens ``(B, S_max, ...)`` to ``(B*S_max, ...)``, selects valid
+        segments via *mask*, processes them in chunks of ``vae_chunk_size``,
+        and scatters the results back into the full tensor.
 
         Args:
             fhr_st: Scattering features ``(B, S_max, 300, C_st)``.
             fhr_ph: Phase-harmonic features ``(B, S_max, 300, C_ph)``.
-            fhr_up_ph: Cross-phase features ``(B, S_max, 300, C_x)``.
+            fhr_up_ph: Cross-phase features ``(B, S_max, 300, C_x)`` where
+                ``C_x`` is dynamic (depends on coefficient selection version).
             mask: Boolean validity mask ``(B, S_max)``.
 
         Returns:
-            Features of shape ``(B, S_max, 300, D)`` where D is
-            ``_feature_dim`` (64 when enriched, 16 otherwise).
+            ``mu_post`` of shape ``(B, S_max, 300, 16)``.  Padded segments
+            are all-zero.
         """
         B, S_max, T, C_st = fhr_st.shape
         device = fhr_st.device
-        D = self._feature_dim
 
         fhr_st_flat = fhr_st.reshape(B * S_max, T, C_st)
         fhr_ph_flat = fhr_ph.reshape(B * S_max, T, fhr_ph.shape[-1])
@@ -940,11 +901,14 @@ class TemporalVaeClassifier(nn.Module):
         valid_idx = mask_flat.nonzero(as_tuple=True)[0]
         N_valid = valid_idx.numel()
 
-        features_flat = torch.zeros(B * S_max, T, D, device=device)
+        mu_post_flat = torch.zeros(
+            B * S_max, T, self._VAE_LATENT_DIM, device=device,
+        )
 
         if N_valid == 0:
-            return features_flat.reshape(B, S_max, T, D)
+            return mu_post_flat.reshape(B, S_max, T, self._VAE_LATENT_DIM)
 
+        # Ensure VAE is in eval mode.
         if self.freeze_vae:
             self.vae_model.eval()
 
@@ -958,43 +922,10 @@ class TemporalVaeClassifier(nn.Module):
                     x_ph=fhr_up_ph_flat[chunk_idx],
                     sample_z=False,
                 )
+                key = "mu_post" if self.use_posterior else "mu_prior"
+                mu_post_flat[chunk_idx] = enc[key]
 
-                mu_post = enc["mu_post"]
-                z = mu_post if self.use_posterior else enc["mu_prior"]
-
-                # Training-time augmentation
-                if self.training and self.augment_posterior_sample:
-                    noise = (
-                        torch.randn_like(z)
-                        * (0.5 * enc["logvar_post"]).exp()
-                        * self.augment_noise_scale
-                    )
-                    z = z + noise
-
-                if self.training and self.augment_temporal_jitter > 0:
-                    shift = torch.randint(
-                        -self.augment_temporal_jitter,
-                        self.augment_temporal_jitter + 1,
-                        (1,),
-                    ).item()
-                    if shift != 0:
-                        z = torch.roll(z, shifts=shift, dims=1)
-
-                if self.enriched_features:
-                    residual = mu_post - enc["mu_prior"]
-                    kld = self._compute_kld_per_dim(
-                        mu_post, enc["logvar_post"],
-                        enc["mu_prior"], enc["logvar_prior"],
-                    )
-                    chunk_features = torch.cat(
-                        [z, enc["logvar_post"], residual, kld], dim=-1,
-                    )
-                else:
-                    chunk_features = z
-
-                features_flat[chunk_idx] = chunk_features
-
-        return features_flat.reshape(B, S_max, T, D)
+        return mu_post_flat.reshape(B, S_max, T, self._VAE_LATENT_DIM)
 
     # ------------------------------------------------------------------ #
     #  Temporal feature encoders                                           #
@@ -1319,11 +1250,20 @@ class TemporalVaeClassifier(nn.Module):
     def compute_loss(
         self, outputs: Dict[str, Tensor], batch: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
-        """Compute masked loss over valid segments.
+        """Compute masked cross-entropy loss over valid segments.
 
-        Supports both binary (cross-entropy) and hierarchical (focal BCE)
-        modes. Per-segment labels are derived by taking
-        ``target.max(dim=-1)`` over the 300 within-segment timesteps.
+        Per-segment labels are derived by taking ``target.max(dim=-1)`` over
+        the 300 within-segment timesteps and mapping to binary:
+        ``{0, 1} → 0 (healthy)``, ``{2, 3} → 1 (unhealthy)``.
+
+        Only valid (non-padded) segments contribute to the loss, enforced by
+        the ``mask`` tensor.
+
+        Note:
+            Segments where all timesteps have ``weight=0`` yield
+            ``target.max()=0``, which maps to ``binary_labels=0`` (healthy).
+            This is acceptable because such segments are extremely rare
+            (quality filter requires >90% weight) and genuinely uninformative.
 
         Args:
             outputs: Dict from :meth:`forward` containing ``logits`` and
@@ -1332,39 +1272,41 @@ class TemporalVaeClassifier(nn.Module):
                 ``(B, S_max, 300)``.
 
         Returns:
-            Dict with ``loss``, ``accuracy``, ``class_0_acc``,
-            ``class_1_acc``.
+            Dict with keys:
+                ``loss`` (scalar tensor),
+                ``accuracy`` (float),
+                ``class_0_acc`` (float),
+                ``class_1_acc`` (float).
         """
         logits = outputs["logits"]   # (B, S_max, num_classes)
         mask = outputs["mask"]       # (B, S_max) bool
         target = batch["target"]     # (B, S_max, 300)
 
+        # Extract valid-segment logits and targets.
         logits_valid = logits[mask]                     # (N_valid, num_classes)
         target_valid = target[mask]                     # (N_valid, 300)
 
+        # Guard: all segments padded → return zero loss.
         if logits_valid.shape[0] == 0:
             zero = torch.tensor(0.0, device=logits.device)
             return {
-                "loss": zero, "accuracy": 0.0,
-                "class_0_acc": 0.0, "class_1_acc": 0.0,
+                "loss": zero,
+                "accuracy": 0.0,
+                "class_0_acc": 0.0,
+                "class_1_acc": 0.0,
             }
 
+        # Per-segment label: max over 300 timesteps → class ID {0,1,2,3}.
         seg_labels = target_valid.max(dim=-1)[0]        # (N_valid,)
         binary_labels = (seg_labels > 1).long()         # (N_valid,) {0,1}
 
-        # --- Loss computation ---
-        if self.label_mode == "hierarchical":
-            hier_targets = map_to_hierarchical_labels(seg_labels.long())
-            loss = self.focal_loss_fn(logits_valid, hier_targets)
-            # Primary prediction: unhealthy bit (index 1)
-            preds_valid = (torch.sigmoid(logits_valid[:, 1]) > 0.5).long()
-        else:
-            loss = F.cross_entropy(
-                logits_valid, binary_labels, weight=self.class_weights,
-            )
-            preds_valid = logits_valid.argmax(dim=-1)
+        # Cross-entropy with optional class weights.
+        loss = F.cross_entropy(
+            logits_valid, binary_labels, weight=self.class_weights,
+        )
 
-        # --- Metrics ---
+        # Metrics.
+        preds_valid = logits_valid.argmax(dim=-1)       # (N_valid,)
         accuracy = (preds_valid == binary_labels).float().mean()
 
         cls0_mask = binary_labels == 0
