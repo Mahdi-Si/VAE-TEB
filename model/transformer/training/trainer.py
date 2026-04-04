@@ -268,7 +268,11 @@ def main(config_path: Optional[str] = None) -> None:
     # --- Build dataloaders ---
     ds_cfg = trainer_obj.config["dataset_config"]
     dl_cfg = ds_cfg.get("dataloader_config", {})
-    dataset_kwargs = dl_cfg.get("dataset_kwargs", {})
+    dataset_kwargs = dict(dl_cfg.get("dataset_kwargs", {}))
+    # pin_memory must NOT be set on the dataset — it causes every dataloader
+    # worker to initialize a CUDA context on GPU 0 (~260 MiB each).  Lightning
+    # handles pin_memory at the DataLoader level automatically on CUDA.
+    dataset_kwargs.pop("pin_memory", None)
 
     common_dl_kwargs = {
         "stats_path": ds_cfg.get("stat_path"),
