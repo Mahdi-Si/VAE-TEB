@@ -169,8 +169,10 @@ def _build_diagnostic_figure(
     sample_idx: int,
     epoch: int,
     beta: float,
+    fhr_raw: Optional[torch.Tensor] = None,
+    up_raw: Optional[torch.Tensor] = None,
 ) -> plt.Figure:
-    """Build the consolidated 10-row diagnostic figure for one sample.
+    """Build the consolidated diagnostic figure for one sample.
 
     Args:
         Y: FHR-ST input ``(B, T, d_f)``.
@@ -182,6 +184,8 @@ def _build_diagnostic_figure(
         sample_idx: Index of the sample within the batch.
         epoch: Current training epoch.
         beta: Current KL beta weight.
+        fhr_raw: Optional raw FHR signal ``(B, L_raw)`` for the top plot.
+        up_raw: Optional raw UP signal ``(B, L_raw)`` for the top plot.
 
     Returns:
         The matplotlib Figure object.
@@ -218,29 +222,136 @@ def _build_diagnostic_figure(
 
     ewin_np = e_win[i].detach().cpu().numpy()                    # (embed_dim,)
 
+    # Check if raw signals are available
+    has_raw = (
+        fhr_raw is not None
+        and up_raw is not None
+        and fhr_raw.shape[0] > i
+    )
+
+    n_rows = 13 if has_raw else 12
     _apply_publication_style()
-    fig, axes = plt.subplots(10, 1, figsize=(16, 32), constrained_layout=True)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(16, 3.2 * n_rows),
+                             constrained_layout=True)
+    row = 0
 
-    # ---- Row 0: FHR-ST Input ----
-    _heatmap(axes[0], y_np.T, title="FHR Scattering Transform (Input)",
+    # ---- Row 0 (optional): Raw FHR and UP ----
+    if has_raw:
+        ax = axes[row]
+        fhr_np = fhr_raw[i].detach().cpu().numpy().ravel()
+        up_np = up_raw[i].detach().cpu().numpy().ravel()
+        fs = 4.0  # sampling rate
+        t_raw = np.arange(len(fhr_np)) / fs
+
+        ax.plot(t_raw, fhr_np, color=COLOR_BLUE, linewidth=0.8, label="FHR (bpm)")
+        ax2 = ax.twinx()
+        ax2.plot(t_raw, up_np, color=COLOR_GREEN, linewidth=0.8, label="UP (mmHg)")
+        ax2.set_ylabel("UP (mmHg)", fontsize=8, color=COLOR_GREEN)
+        ax2.tick_params(axis="y", labelcolor=COLOR_GREEN)
+
+        ax.set_title("Raw FHR and UP Signals", fontsize=9, pad=6)
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("FHR (bpm)", fontsize=8, color=COLOR_BLUE)
+        ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
+        ax.set_xlim(t_raw[0], t_raw[-1])
+        ax.margins(x=0.0)
+
+        # Combined legend
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2,
+                  loc="upper right", fontsize=7, framealpha=0.95)
+        _style_axes(ax, grid="both")
+        row += 1
+
+    # ---- FHR-ST Input ----
+    _heatmap(axes[row], y_np.T, title="FHR Scattering Transform (Input)",
              ylabel="ST Channel", label="Coeff", fig=fig)
+    row += 1
 
-    # ---- Row 1: UP-ST Input ----
-    _heatmap(axes[1], u_np.T, title="UP Scattering Transform (Input)",
+    # ---- UP-ST Input ----
+    _heatmap(axes[row], u_np.T, title="UP Scattering Transform (Input)",
              ylabel="ST Channel", label="Coeff", fig=fig)
+    row += 1
 
-    # ---- Row 2: FHR Encoder States ----
-    _heatmap(axes[2], hf_np.T, cmap="bwr", origin="lower",
+    # ---- FHR Encoder States ----
+    _heatmap(axes[row], hf_np.T, cmap="bwr", origin="lower",
              title="FHR Encoder States (H_F)", ylabel="Hidden Dim",
              label="Activation", fig=fig)
+    row += 1
 
-    # ---- Row 3: Fused Encoder States ----
-    _heatmap(axes[3], hfu_np.T, cmap="bwr", origin="lower",
+    # ---- Fused Encoder States ----
+    _heatmap(axes[row], hfu_np.T, cmap="bwr", origin="lower",
              title="Fused Encoder States (H_FU)", ylabel="Hidden Dim",
              label="Activation", fig=fig)
+    row += 1
 
-    # ---- Row 4: Gate Activations ----
-    ax = axes[4]
+    # ---- Latent Dynamics (PCA of H_FU) ----
+    ax = axes[row]
+    # PCA: project 192-dim H_FU to top 3 principal components
+    hfu_centered = hfu_np - hfu_np.mean(axis=0, keepdims=True)       # (T, d)
+    try:
+        U, S, Vt = np.linalg.svd(hfu_centered, full_matrices=False)
+        n_components = min(3, Vt.shape[0])
+        pca_proj = hfu_centered @ Vt[:n_components].T                # (T, 3)
+        variance_explained = (S[:n_components] ** 2) / (S ** 2).sum()
+        t_steps = np.arange(pca_proj.shape[0])
+        pca_colors = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN]
+        for c in range(n_components):
+            ve = variance_explained[c] * 100
+            ax.plot(t_steps, pca_proj[:, c], color=pca_colors[c],
+                    linewidth=0.9, label=f"PC{c + 1} ({ve:.1f}%)")
+        ax.set_title("Latent Dynamics \u2014 PCA of Fused Representation (H_FU)",
+                      fontsize=9, pad=6)
+    except np.linalg.LinAlgError:
+        ax.text(0.5, 0.5, "SVD failed", ha="center", va="center", fontsize=9)
+        ax.set_title("Latent Dynamics (PCA failed)", fontsize=9, pad=6)
+    ax.set_xlabel("Time Steps", fontsize=8)
+    ax.set_ylabel("PC Value", fontsize=8)
+    ax.set_xlim(0, hfu_np.shape[0] - 1)
+    ax.legend(fontsize=7, loc="upper right", framealpha=0.95)
+    _style_axes(ax, grid="both")
+    row += 1
+
+    # ---- Fusion Contribution: ||H_FU - H_F|| over time ----
+    ax = axes[row]
+    diff_norm = np.linalg.norm(hfu_np - hf_np, axis=-1)             # (T,)
+    hf_norm = np.linalg.norm(hf_np, axis=-1)                         # (T,)
+    relative_change = diff_norm / (hf_norm + 1e-8)                   # (T,)
+    t_steps = np.arange(len(diff_norm))
+
+    ax.plot(t_steps, diff_norm, color=COLOR_ORANGE, linewidth=0.9,
+            label="||H_FU \u2212 H_F||")
+    ax2 = ax.twinx()
+    ax2.plot(t_steps, relative_change * 100, color=COLOR_PURPLE,
+             linewidth=0.7, alpha=0.7, label="Relative change (%)")
+    ax2.set_ylabel("Relative Change (%)", fontsize=8, color=COLOR_PURPLE)
+    ax2.tick_params(axis="y", labelcolor=COLOR_PURPLE)
+
+    # Mark anchor positions
+    for a in anchors_np:
+        ax.axvline(a, color=COLOR_VERMILLION, linestyle=":", linewidth=0.5,
+                   alpha=0.5)
+
+    ax.set_title(
+        f"Fusion Contribution \u2014 ||H_FU \u2212 H_F|| over Time "
+        f"(mean={diff_norm.mean():.3f})",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel("Time Steps", fontsize=8)
+    ax.set_ylabel("L2 Distance", fontsize=8, color=COLOR_ORANGE)
+    ax.tick_params(axis="y", labelcolor=COLOR_ORANGE)
+    ax.set_xlim(0, len(diff_norm) - 1)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2,
+              fontsize=7, loc="upper right", framealpha=0.95)
+    _style_axes(ax, grid="both")
+    row += 1
+
+    # ---- Gate Activations ----
+    ax = axes[row]
     t = np.arange(gate_np.shape[0])
     gate_mean = gate_np.mean(axis=-1)
     gate_std = gate_np.std(axis=-1)
@@ -258,9 +369,10 @@ def _build_diagnostic_figure(
     ax.set_ylim(-0.05, 1.05)
     ax.legend(fontsize=7, loc="upper right", framealpha=0.95)
     _style_axes(ax, grid="both")
+    row += 1
 
-    # ---- Row 5: Anchor Forecast — Self vs Fused vs TE vs Target ----
-    ax = axes[5]
+    # ---- Anchor Forecast — Self vs Fused vs TE vs Target ----
+    ax = axes[row]
     # Pick the first anchor for visualization, use the largest horizon
     a0 = int(anchors_np[0])
     target_start = a0 + g + 1
@@ -297,9 +409,10 @@ def _build_diagnostic_figure(
     ax.set_ylabel("Value", fontsize=8)
     ax.legend(fontsize=6, loc="upper right", ncol=3, framealpha=0.95)
     _style_axes(ax, grid="both")
+    row += 1
 
-    # ---- Row 6: Forecast Error by Horizon ----
-    ax = axes[6]
+    # ---- Forecast Error by Horizon ----
+    ax = axes[row]
     head_names = ["Self-only", "Fused", "TE-aug"]
     head_keys = ["Y_hat_self", "Y_hat_fus", "Y_hat_te"]
     head_colors = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN]
@@ -334,9 +447,10 @@ def _build_diagnostic_figure(
     ax.set_ylabel("MAE", fontsize=8)
     ax.legend(fontsize=7, framealpha=0.95)
     _style_axes(ax, grid="major")
+    row += 1
 
-    # ---- Row 7: TE Latent — Posterior & Prior Means ----
-    ax = axes[7]
+    # ---- TE Latent — Posterior & Prior Means ----
+    ax = axes[row]
     combined = np.concatenate([mu_post.T, mu_prior.T], axis=0)  # (2*d_z, K)
     vabs = np.nanmax(np.abs(combined)) or 1.0
     im = ax.imshow(combined, aspect="auto", cmap="bwr", origin="lower",
@@ -352,9 +466,10 @@ def _build_diagnostic_figure(
         ax.spines[spine].set_color(COLOR_BLACK)
         ax.spines[spine].set_linewidth(0.6)
     _add_colorbar(fig, im, ax, label="Value")
+    row += 1
 
-    # ---- Row 8: KL Divergence per Anchor ----
-    ax = axes[8]
+    # ---- KL Divergence per Anchor ----
+    ax = axes[row]
     # Per-anchor, per-dimension KL
     kl_per_dim = 0.5 * (
         logvar_prior - logvar_post
@@ -377,9 +492,10 @@ def _build_diagnostic_figure(
     ax.set_xlabel("Anchor", fontsize=8)
     ax.set_ylabel("KL Divergence (nats)", fontsize=8)
     _style_axes(ax, grid="major")
+    row += 1
 
-    # ---- Row 9: Window Embedding ----
-    ax = axes[9]
+    # ---- Window Embedding ----
+    ax = axes[row]
     n_total = len(ewin_np)
     # Component boundaries
     boundary_f = 2 * d
@@ -503,6 +619,14 @@ class TransformerPlotCallback(Callback):
         U = batch["up_st"].to(device)
         num_samples = min(self.num_examples, Y.shape[0])
 
+        # Optional raw signals (available if load_fields includes fhr/up)
+        fhr_raw = batch.get("fhr")
+        up_raw = batch.get("up")
+        if fhr_raw is not None:
+            fhr_raw = fhr_raw.to(device)
+        if up_raw is not None:
+            up_raw = up_raw.to(device)
+
         # --- Training-mode forward (with anchors) ---
         anchors = sample_anchors(Y, U, config, training=False)
         model.eval()
@@ -529,6 +653,7 @@ class TransformerPlotCallback(Callback):
             fig = _build_diagnostic_figure(
                 Y=Y, U=U, outputs=outputs, gate=gate, e_win=e_win,
                 config=config, sample_idx=s, epoch=epoch, beta=beta,
+                fhr_raw=fhr_raw, up_raw=up_raw,
             )
             fname = (
                 f"transformer_diagnostics_epoch{epoch:04d}"
