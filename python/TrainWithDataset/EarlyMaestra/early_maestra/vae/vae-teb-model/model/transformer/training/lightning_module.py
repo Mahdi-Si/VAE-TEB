@@ -126,6 +126,33 @@ class PlCausalTransformer(LightningModelBase):
         return total, metrics
 
     # ------------------------------------------------------------------
+    # Hyperparameter override on resume
+    # ------------------------------------------------------------------
+
+    def on_train_start(self) -> None:
+        """Sync optimizer LR with hparams after checkpoint restore.
+
+        When resuming, ``apply_config_hyperparameters`` updates
+        ``self.hparams.lr`` from the current config, but the optimizer's
+        param groups still hold the checkpoint's LR.  This hook overwrites
+        the optimizer LR so the config value actually takes effect.
+        """
+        optimizer = self.optimizers()
+        if isinstance(optimizer, (list, tuple)):
+            optimizer = optimizer[0]
+        if optimizer is None:
+            return
+        target_lr = self.hparams.get("lr")
+        if target_lr is None:
+            return
+        for pg in optimizer.param_groups:
+            if pg["lr"] != target_lr:
+                logger.info(
+                    f"Overriding optimizer LR: {pg['lr']:.2e} -> {target_lr:.2e}"
+                )
+                pg["lr"] = target_lr
+
+    # ------------------------------------------------------------------
     # Stage management
     # ------------------------------------------------------------------
 
@@ -176,3 +203,45 @@ class PlCausalTransformer(LightningModelBase):
             self._current_beta = self.hparams.beta_max * min(
                 1.0, steps_in_stage3 / max(self.hparams.warmup_steps, 1)
             )
+
+    # ------------------------------------------------------------------
+    # Checkpoint state (survives resume)
+    # ------------------------------------------------------------------
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Persist stage-tracking state into the Lightning checkpoint.
+
+        Args:
+            checkpoint: The checkpoint dict being saved.
+        """
+        checkpoint["stage_state"] = {
+            "current_stage": self._current_stage,
+            "current_beta": self._current_beta,
+            "stage3_global_step": self._stage3_global_step,
+            "original_lambda_te": self._original_lambda_te,
+        }
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Restore stage-tracking state from a Lightning checkpoint.
+
+        Args:
+            checkpoint: The checkpoint dict being loaded.
+        """
+        state = checkpoint.get("stage_state")
+        if state is None:
+            logger.info("No stage_state in checkpoint; starting fresh.")
+            return
+        self._current_stage = state["current_stage"]
+        self._current_beta = state["current_beta"]
+        self._stage3_global_step = state["stage3_global_step"]
+        self._original_lambda_te = state["original_lambda_te"]
+        # Apply the restored stage immediately
+        if self._current_stage < 2:
+            self._transformer_config.lambda_te = 0.0
+        else:
+            self._transformer_config.lambda_te = self._original_lambda_te
+        logger.info(
+            f"Restored stage state from checkpoint: stage={self._current_stage}, "
+            f"beta={self._current_beta:.6f}, "
+            f"stage3_global_step={self._stage3_global_step}"
+        )
