@@ -98,6 +98,8 @@ dataset_config:
       load_fields:
         - fhr_st
         - up_st
+        - fhr                        # Raw FHR signal (for diagnostic plots)
+        - up                         # Raw UP signal (for diagnostic plots)
       trim_minutes: 1.0             # Trim 1 min from each end -> T=300
       cache_size: 5000               # LRU cache capacity per dataset
       pin_memory: false              # MUST be false; pin_memory inside workers causes

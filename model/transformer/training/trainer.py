@@ -123,19 +123,51 @@ class CausalTransformerTrainer(GraphModelBase):
             }
             self.mlflow_logger.log_hyperparams(hparams)
 
+        # --- Resume overrides (applied after checkpoint restore) ---
+        # These allow changing LR, beta_max, stage epochs, etc. when resuming.
+        # The values come from the CURRENT config, overwriting whatever the
+        # checkpoint saved.  Only non-None keys are applied.
+        self._resume_overrides = {
+            "lr": self.lr,
+            "weight_decay": self.config["general_config"].get("weight_decay", 1e-4),
+            "lr_milestones": self.lr_milestones if self.lr_milestones else None,
+            "stage1_epochs": stage1,
+            "stage2_epochs": stage2,
+            "stage3_epochs": stage3,
+            "beta_max": beta_max,
+            "warmup_steps": warmup_steps,
+        }
+
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(
             f"Model created: {total_params:,} parameters, "
             f"{self.epochs_num} epochs ({stage1}+{stage2}+{stage3})"
         )
 
-    def train_model(self, train_loader, val_loader) -> None:
+    def train_model(
+        self,
+        train_loader,
+        val_loader,
+        resume_ckpt_path: Optional[str] = None,
+    ) -> None:
         """Build callbacks, create Lightning Trainer, and run training.
 
         Args:
             train_loader: Training DataLoader.
             val_loader: Validation DataLoader.
+            resume_ckpt_path: Path to a Lightning ``.ckpt`` file to resume
+                from.  Restores model weights, optimizer state, epoch counter,
+                and the 3-stage schedule state (beta, stage, global step).
         """
+        # --- Apply config overrides when resuming ---
+        # On resume, Lightning restores hparams from the checkpoint.  We
+        # overwrite them with the CURRENT config values so that the user can
+        # change LR, beta_max, stage epochs, etc. between runs.
+        if resume_ckpt_path is not None:
+            self.apply_config_hyperparameters(
+                self._resume_overrides, self.pl_model,
+            )
+
         # --- Callbacks ---
         callbacks = []
 
@@ -242,19 +274,27 @@ class CausalTransformerTrainer(GraphModelBase):
             f"precision={trainer_kwargs['precision']}, "
             f"strategy={trainer_kwargs.get('strategy', 'auto')}"
         )
-        trainer.fit(self.pl_model, train_loader, val_loader)
+        trainer.fit(
+            self.pl_model, train_loader, val_loader,
+            ckpt_path=resume_ckpt_path,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main(config_path: Optional[str] = None) -> None:
+def main(
+    config_path: Optional[str] = None,
+    resume_ckpt_path: Optional[str] = None,
+) -> None:
     """Run the full training pipeline.
 
     Args:
         config_path: Path to the YAML config. Defaults to
             ``model/transformer/config.yaml``.
+        resume_ckpt_path: Path to a Lightning ``.ckpt`` file to resume from.
+            Restores model weights, optimizer, epoch, and stage state.
     """
     if config_path is None:
         config_path = os.path.join(
@@ -298,7 +338,9 @@ def main(config_path: Optional[str] = None) -> None:
         **dataset_kwargs,
     )
 
-    trainer_obj.train_model(train_loader, val_loader)
+    trainer_obj.train_model(
+        train_loader, val_loader, resume_ckpt_path=resume_ckpt_path,
+    )
 
 
 if __name__ == "__main__":
@@ -309,5 +351,9 @@ if __name__ == "__main__":
         "--config", type=str, default=None,
         help="Path to YAML config (default: model/transformer/config.yaml)",
     )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to a Lightning .ckpt file to resume training from.",
+    )
     args = parser.parse_args()
-    main(config_path=args.config)
+    main(config_path=args.config, resume_ckpt_path=args.resume)
