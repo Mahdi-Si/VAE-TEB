@@ -81,7 +81,8 @@ class TransformerTestRunner:
             device = torch.device(device)
 
         # Load checkpoint to extract config
-        ckpt = torch.load(str(checkpoint_path), map_location="cpu")
+        ckpt = torch.load(str(checkpoint_path), map_location="cpu",
+                          weights_only=False)
 
         # Extract TransformerConfig from checkpoint hparams
         config = cls._extract_config(ckpt, config_overrides)
