@@ -32,7 +32,11 @@ def run_per_sample_diagnostics(
     Returns:
         Summary dict with paths to generated figures.
     """
-    from model.transformer.tr_testing.visualizers import plot_sample_diagnostic
+    from model.transformer.tr_testing.visualizers import (
+        plot_sample_diagnostic,
+        plot_sample_forecast_all_channels,
+        plot_sample_latent_detail,
+    )
 
     output_dir = Path(output_dir)
     results = {}
@@ -50,15 +54,40 @@ def run_per_sample_diagnostics(
         for sample in samples:
             guid = sample.get("guid", "unknown")
             epoch = sample.get("epoch", 0)
-            fname = f"{guid}_{int(epoch)}.pdf"
-            out_path = class_dir / fname
+            base = f"{guid}_{int(epoch)}"
 
+            # 1. Main diagnostic figure (17-row overview)
+            diag_path = class_dir / f"{base}.pdf"
             try:
-                plot_sample_diagnostic(sample, out_path, runner.config)
-                paths.append(str(out_path))
+                plot_sample_diagnostic(sample, diag_path, runner.config)
+                paths.append(str(diag_path))
             except Exception as e:
                 logger.warning(
-                    f"Failed to plot sample {guid} epoch {epoch}: {e}"
+                    f"Diagnostic plot failed for {guid} epoch {epoch}: {e}"
+                )
+
+            # 2. Full-channel forecast heatmaps (GT vs all heads)
+            fc_path = class_dir / f"{base}_forecast_channels.pdf"
+            try:
+                plot_sample_forecast_all_channels(
+                    sample, fc_path, runner.config
+                )
+                paths.append(str(fc_path))
+            except Exception as e:
+                logger.warning(
+                    f"Forecast channels plot failed for {guid}: {e}"
+                )
+
+            # 3. Detailed latent visualization
+            lat_path = class_dir / f"{base}_latent_detail.pdf"
+            try:
+                plot_sample_latent_detail(
+                    sample, lat_path, runner.config
+                )
+                paths.append(str(lat_path))
+            except Exception as e:
+                logger.warning(
+                    f"Latent detail plot failed for {guid}: {e}"
                 )
 
         results[class_name] = {
