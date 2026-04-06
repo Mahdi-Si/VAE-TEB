@@ -50,7 +50,9 @@ def _create_class_loaders(
             shuffle=shuffle,
             stats_path=stats_path,
             normalize_fields=["fhr_st", "up_st"],
-            load_fields=["fhr_st", "up_st", "fhr", "up"],
+            load_fields=["fhr_st", "up_st", "fhr", "up",
+                         "guid", "epoch", "cs_label", "bg_label",
+                         "time_from_labor_onset"],
             trim_minutes=1.0,
         )
     return loaders
@@ -89,7 +91,9 @@ def _create_guid_loaders(
                 max_guids=max_guids,
                 stats_path=stats_path,
                 normalize_fields=["fhr_st", "up_st"],
-                load_fields=["fhr_st", "up_st", "fhr", "up"],
+                load_fields=["fhr_st", "up_st", "fhr", "up",
+                         "guid", "epoch", "cs_label", "bg_label",
+                         "time_from_labor_onset"],
                 trim_minutes=1.0,
             )
             loaders[class_name] = loader
