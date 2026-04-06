@@ -1,9 +1,9 @@
-"""Top-level Causal Multimodal Forecasting Transformer.
+"""Top-level Causal Multimodal Forecasting Transformer (v2).
 
 Contains:
     - sample_anchors: Standalone utility for anchor index sampling.
     - CausalMultimodalTransformer: The main nn.Module wiring all components.
-    - CausalTransformerLoss: Loss computation module (spec §16).
+    - CausalTransformerLoss: Loss computation module (spec §16, v2 extensions).
 """
 
 from typing import Dict, Optional, Tuple, Union
@@ -18,12 +18,16 @@ from .encoder import (
     CausalCrossAttentionFusion,
     CausalTransformerEncoder,
 )
-from .heads import ForecastHead, TELatentModule, WindowRepresentationExport
-from .layers import AttentionPool
+from .heads import (
+    ForecastHead,
+    SelfLatentModule,
+    TELatentModule,
+    WindowRepresentationExport,
+)
+from .layers import AttentionPool, _make_norm
 from .stems import CausalStem
 
 
-# TODO: improve forecasting heads with 
 # ---------------------------------------------------------------------------
 # Anchor sampling utility
 # ---------------------------------------------------------------------------
@@ -136,7 +140,7 @@ def _init_weights(module: nn.Module) -> None:
     """Initialize weights following existing project conventions.
 
     - Linear / Conv1d: Xavier uniform, zeros bias.
-    - LayerNorm: ones weight, zeros bias.
+    - LayerNorm / RMSNorm: ones weight, zeros bias (if present).
     """
     if isinstance(module, (nn.Linear, nn.Conv1d)):
         nn.init.xavier_uniform_(module.weight)
@@ -152,19 +156,18 @@ def _init_weights(module: nn.Module) -> None:
 # ---------------------------------------------------------------------------
 
 class CausalMultimodalTransformer(nn.Module):
-    """Causal dual-branch FHR-ST / UP-ST forecasting transformer (spec §6-§20).
+    """Causal dual-branch FHR-ST / UP-ST forecasting transformer (v2).
 
-    This model is the first-iteration self-supervised pretraining architecture.
-    It encodes FHR and UP scattering-transform sequences through causal stems,
-    modality-specific causal encoders, gated cross-attention fusion, and a
-    fused causal encoder.  It supports two operating modes:
-
-    **Training mode** (``anchor_indices`` provided): produces forecasting
-    predictions from three heads (self-only, fused, TE residual) at sampled
-    anchor points.
-
-    **Inference mode** (``anchor_indices=None``): produces a fixed-size
-    window-level embedding ``e_win`` for downstream classification.
+    v2 changes over v1:
+        - Wider backbone (d_model=256, n_heads=8).
+        - Asymmetric encoder depths (FHR: 6, UP: 3, Fused: 6).
+        - RoPE positional encoding in all attention layers.
+        - Multi-layer cross-attention fusion.
+        - SwiGLU FFN and RMSNorm throughout.
+        - Factorized latents: z_self (intrinsic FHR) + z_transfer (TE coupling).
+        - Deeper residual MLP posterior/prior networks with free bits KL.
+        - Shared-backbone forecast heads.
+        - Enriched window representation export.
 
     Args:
         config: Transformer configuration (or keyword arguments to construct
@@ -187,6 +190,8 @@ class CausalMultimodalTransformer(nn.Module):
             dilations=config.stem_dilations,
             expansion=config.stem_expansion,
             dropout=config.dropout,
+            use_rmsnorm=config.use_rmsnorm,
+            use_swiglu=config.use_swiglu,
         )
         self.up_stem = CausalStem(
             in_dim=config.d_u,
@@ -196,6 +201,8 @@ class CausalMultimodalTransformer(nn.Module):
             dilations=config.stem_dilations,
             expansion=config.stem_expansion,
             dropout=config.dropout,
+            use_rmsnorm=config.use_rmsnorm,
+            use_swiglu=config.use_swiglu,
         )
 
         # --- Modality encoders (spec §8) ---
@@ -206,6 +213,8 @@ class CausalMultimodalTransformer(nn.Module):
             ff_expansion=config.ff_expansion,
             dropout=config.dropout,
             use_checkpoint=config.gradient_checkpointing,
+            use_swiglu=config.use_swiglu,
+            use_rmsnorm=config.use_rmsnorm,
         )
         self.up_encoder = CausalTransformerEncoder(
             d_model=d,
@@ -214,13 +223,19 @@ class CausalMultimodalTransformer(nn.Module):
             ff_expansion=config.ff_expansion,
             dropout=config.dropout,
             use_checkpoint=config.gradient_checkpointing,
+            use_swiglu=config.use_swiglu,
+            use_rmsnorm=config.use_rmsnorm,
         )
 
-        # --- Cross-attention fusion (spec §9) ---
+        # --- Cross-attention fusion (spec §9, v2: multi-layer) ---
         self.fusion = CausalCrossAttentionFusion(
             d_model=d,
             n_heads=config.n_heads,
+            n_layers=config.fusion_layers,
+            ff_expansion=config.ff_expansion,
             dropout=config.dropout,
+            use_swiglu=config.use_swiglu,
+            use_rmsnorm=config.use_rmsnorm,
         )
 
         # --- Fused encoder (spec §9.4) ---
@@ -231,6 +246,8 @@ class CausalMultimodalTransformer(nn.Module):
             ff_expansion=config.ff_expansion,
             dropout=config.dropout,
             use_checkpoint=config.gradient_checkpointing,
+            use_swiglu=config.use_swiglu,
+            use_rmsnorm=config.use_rmsnorm,
         )
 
         # --- Anchor attention pools (spec §12) ---
@@ -238,7 +255,7 @@ class CausalMultimodalTransformer(nn.Module):
         self.pool_u = AttentionPool(d)
         self.pool_fu = AttentionPool(d)
 
-        # --- Forecast heads (spec §13) ---
+        # --- Forecast heads (spec §13, v2: shared backbone) ---
         self.self_head = ForecastHead(
             in_dim=d,
             d_out=config.d_f,
@@ -252,21 +269,30 @@ class CausalMultimodalTransformer(nn.Module):
             dropout=config.dropout,
         )
         self.te_head = ForecastHead(
-            in_dim=d + config.d_z,
+            in_dim=d + config.d_z_self + config.d_z_transfer,
             d_out=config.d_f,
             horizons=config.horizons,
             dropout=config.dropout,
         )
 
-        # --- TE latent module (spec §14) ---
-        self.te_module = TELatentModule(
+        # --- Self latent module (v2) ---
+        self.self_latent = SelfLatentModule(
             d_model=d,
-            d_z=config.d_z,
+            d_z_self=config.d_z_self,
             dropout=config.dropout,
         )
 
-        # --- Window representation export (spec §20) ---
-        self.window_export = WindowRepresentationExport(d, config.d_z)
+        # --- TE latent module (spec §14, v2: deeper) ---
+        self.te_module = TELatentModule(
+            d_model=d,
+            d_z=config.d_z_transfer,
+            dropout=config.dropout,
+        )
+
+        # --- Window representation export (spec §20, v2: enriched) ---
+        self.window_export = WindowRepresentationExport(
+            d, config.d_z_self, config.d_z_transfer,
+        )
 
         # Initialize weights
         self.apply(_init_weights)
@@ -297,7 +323,6 @@ class CausalMultimodalTransformer(nn.Module):
         ctx_indices = anchor_indices.unsqueeze(-1) + offsets.view(1, 1, -1)
 
         # Gather: expand h and index
-        # h: (B, T, d) -> (B, 1, T, d) -> expand -> gather along dim=2
         ctx_indices_exp = ctx_indices.unsqueeze(-1).expand(B, K, L, d)  # (B, K, L, d)
         h_exp = h.unsqueeze(1).expand(B, K, T, d)                       # (B, K, T, d)
         windows = torch.gather(h_exp, dim=2, index=ctx_indices_exp)     # (B, K, L, d)
@@ -322,7 +347,7 @@ class CausalMultimodalTransformer(nn.Module):
         Returns:
             Dictionary with either:
                 - Inference mode: ``{"e_win": (B, embed_dim)}``
-                - Training mode: all forecast predictions, TE latent parameters,
+                - Training mode: all forecast predictions, latent parameters,
                   and intermediate states for loss computation.
         """
         # --- Step 1-2: Stems ---
@@ -339,25 +364,7 @@ class CausalMultimodalTransformer(nn.Module):
 
         # --- Inference mode: export window embedding ---
         if anchor_indices is None:
-            # Compute TE mus on a fixed grid for the TE summary
-            cfg = self.config
-            grid = torch.arange(
-                cfg.valid_anchor_start, cfg.valid_anchor_end + 1, 15,
-                device=Y.device,
-            ).unsqueeze(0).expand(Y.shape[0], -1)          # (B, K_grid)
-
-            ctx_f = self._gather_anchor_contexts(H_F, grid)
-            ctx_u = self._gather_anchor_contexts(H_U, grid)
-            s_f_grid = self.pool_f(ctx_f)                  # (B*K_grid, d)
-            s_u_grid = self.pool_u(ctx_u)                  # (B*K_grid, d)
-
-            te_out = self.te_module(s_f_grid, s_u_grid)
-            B = Y.shape[0]
-            K_grid = grid.shape[1]
-            te_mus = te_out["mu_post"].view(B, K_grid, -1)  # (B, K_grid, d_z)
-
-            e_win = self.window_export(H_F, H_FU, te_mus)
-            return {"e_win": e_win}
+            return self._inference_forward(Y, H_F, H_U, H_FU)
 
         # --- Training mode: anchor-based prediction ---
         B = Y.shape[0]
@@ -376,12 +383,16 @@ class CausalMultimodalTransformer(nn.Module):
         Y_hat_self = self.self_head(s_f)                 # {h: (B*K, h, d_f)}
         Y_hat_fus = self.fused_head(s_fu)                # {h: (B*K, h, d_f)}
 
-        # Step 8: TE posterior / prior / sample
-        te_out = self.te_module(s_f, s_u)
-        z_te = te_out["z_te"]                            # (B*K, d_z)
+        # Step 8a: Self latent (v2)
+        self_out = self.self_latent(s_f)
+        z_self = self_out["z_self"]                      # (B*K, d_z_self)
 
-        # Step 9: TE residual forecast
-        te_input = torch.cat([s_f, z_te], dim=-1)       # (B*K, d + d_z)
+        # Step 8b: TE posterior / prior / sample
+        te_out = self.te_module(s_f, s_u)
+        z_transfer = te_out["z_te"]                      # (B*K, d_z_transfer)
+
+        # Step 9: TE residual forecast (input includes both latents)
+        te_input = torch.cat([s_f, z_self, z_transfer], dim=-1)
         R_hat = self.te_head(te_input)                   # {h: (B*K, h, d_f)}
 
         # Y_hat_te = stop_grad(Y_hat_self) + R_hat  (per horizon)
@@ -394,6 +405,10 @@ class CausalMultimodalTransformer(nn.Module):
             "Y_hat_fus": Y_hat_fus,
             "Y_hat_te": Y_hat_te,
             "R_hat": R_hat,
+            # Self latent outputs
+            "mu_self": self_out["mu_self"],
+            "logvar_self": self_out["logvar_self"],
+            # TE latent outputs
             "mu_post": te_out["mu_post"],
             "logvar_post": te_out["logvar_post"],
             "mu_prior": te_out["mu_prior"],
@@ -403,20 +418,74 @@ class CausalMultimodalTransformer(nn.Module):
             "H_FU": H_FU,
         }
 
+    def _inference_forward(
+        self,
+        Y: Tensor,
+        H_F: Tensor,
+        H_U: Tensor,
+        H_FU: Tensor,
+    ) -> Dict[str, Tensor]:
+        """Inference mode: produce enriched window embedding.
+
+        Args:
+            Y: FHR input of shape ``(B, T, d_F)``.
+            H_F: FHR encoder states ``(B, T, d)``.
+            H_U: UP encoder states ``(B, T, d)``.
+            H_FU: Fused encoder states ``(B, T, d)``.
+
+        Returns:
+            Dictionary with ``e_win`` of shape ``(B, output_dim)``.
+        """
+        cfg = self.config
+        B = Y.shape[0]
+
+        # Fixed anchor grid for inference
+        grid = torch.arange(
+            cfg.valid_anchor_start, cfg.valid_anchor_end + 1, 15,
+            device=Y.device,
+        ).unsqueeze(0).expand(B, -1)          # (B, K_grid)
+        K_grid = grid.shape[1]
+
+        # Gather context and pool
+        ctx_f = self._gather_anchor_contexts(H_F, grid)
+        ctx_u = self._gather_anchor_contexts(H_U, grid)
+        s_f_grid = self.pool_f(ctx_f)                    # (B*K_grid, d)
+        s_u_grid = self.pool_u(ctx_u)                    # (B*K_grid, d)
+
+        # Self latent at grid
+        self_out = self.self_latent(s_f_grid)
+        self_mus = self_out["mu_self"].view(B, K_grid, -1)  # (B, K_grid, d_z_self)
+
+        # TE latent at grid
+        te_out = self.te_module(s_f_grid, s_u_grid)
+        te_mus = te_out["mu_post"].view(B, K_grid, -1)          # (B, K_grid, d_z_transfer)
+        te_mu_priors = te_out["mu_prior"].view(B, K_grid, -1)   # (B, K_grid, d_z_transfer)
+        te_logvar_posts = te_out["logvar_post"].view(B, K_grid, -1)
+        te_logvar_priors = te_out["logvar_prior"].view(B, K_grid, -1)
+
+        e_win = self.window_export(
+            H_F, H_FU, self_mus,
+            te_mus, te_mu_priors, te_logvar_posts, te_logvar_priors,
+        )
+        return {"e_win": e_win}
+
 
 # ---------------------------------------------------------------------------
 # Loss module
 # ---------------------------------------------------------------------------
 
 class CausalTransformerLoss(nn.Module):
-    """Loss computation for the Causal Multimodal Forecasting Transformer (spec §16).
+    """Loss computation for the Causal Multimodal Forecasting Transformer (v2).
 
-    Computes five loss terms:
+    Computes seven loss terms:
         - ``L_fus``: Huber loss on fused forecasts (main loss, §16.2).
-        - ``L_delta``: Huber loss on temporal differences (dynamics, §16.3).
+        - ``L_delta``: Huber loss on first-order temporal differences (§16.3).
+        - ``L_delta2``: Huber loss on second-order temporal differences (v2).
+        - ``L_spectral``: Huber loss on spectral magnitude consistency (v2).
         - ``L_self``: Huber loss on self-only forecasts (baseline, §16.4).
         - ``L_te``: Huber loss on TE residual forecasts (§16.5).
-        - ``L_kl``: Conditional KL divergence (§16.6).
+        - ``L_kl_self``: KL divergence for z_self (v2).
+        - ``L_kl_transfer``: Conditional KL divergence for z_transfer (§16.6).
 
     Args:
         config: Transformer configuration.
@@ -511,7 +580,8 @@ class CausalTransformerLoss(nn.Module):
 
         Returns:
             Dictionary with keys ``total_loss``, ``L_fus``, ``L_delta``,
-            ``L_self``, ``L_te``, ``L_kl``.
+            ``L_delta2``, ``L_spectral``, ``L_self``, ``L_te``,
+            ``L_kl_self``, ``L_kl_transfer``.
         """
         anchor_indices = outputs["anchor_indices"]
         identity = lambda x: x
@@ -521,16 +591,12 @@ class CausalTransformerLoss(nn.Module):
             outputs["Y_hat_fus"], identity, Y, anchor_indices
         )
 
-        # L_delta: dynamics loss on temporal differences (spec §16.3)
-        def diff_fn(x: Tensor) -> Tensor:
-            return torch.diff(x, dim=1)
-
-        # For dynamics loss, compute diff of both predictions and targets
+        # L_delta: first-order dynamics loss (spec §16.3)
         L_delta = torch.tensor(0.0, device=Y.device)
         weight_sum = 0.0
         for h in self.config.horizons:
             if h < 2:
-                continue  # need at least 2 steps for diff
+                continue
             w = self.horizon_weight_map[h]
             targets = self._extract_targets(Y, anchor_indices, h)
             pred_diff = torch.diff(outputs["Y_hat_fus"][h], dim=1)
@@ -545,13 +611,50 @@ class CausalTransformerLoss(nn.Module):
         if weight_sum > 0:
             L_delta = L_delta / weight_sum
 
+        # L_delta2: second-order dynamics loss (v2)
+        L_delta2 = torch.tensor(0.0, device=Y.device)
+        weight_sum_d2 = 0.0
+        for h in self.config.horizons:
+            if h < 3:
+                continue
+            w = self.horizon_weight_map[h]
+            targets = self._extract_targets(Y, anchor_indices, h)
+            pred_diff2 = torch.diff(torch.diff(outputs["Y_hat_fus"][h], dim=1), dim=1)
+            target_diff2 = torch.diff(torch.diff(targets, dim=1), dim=1)
+            loss_h = F.huber_loss(
+                pred_diff2, target_diff2,
+                reduction="mean",
+                delta=self.config.huber_delta,
+            )
+            L_delta2 = L_delta2 + w * loss_h
+            weight_sum_d2 += w
+        if weight_sum_d2 > 0:
+            L_delta2 = L_delta2 / weight_sum_d2
+
+        # L_spectral: spectral consistency loss (v2)
+        L_spectral = torch.tensor(0.0, device=Y.device)
+        weight_sum_sp = 0.0
+        for h in self.config.horizons:
+            w = self.horizon_weight_map[h]
+            targets = self._extract_targets(Y, anchor_indices, h)
+            pred_fft = torch.fft.rfft(outputs["Y_hat_fus"][h], dim=1)
+            target_fft = torch.fft.rfft(targets, dim=1)
+            loss_h = F.huber_loss(
+                pred_fft.abs(), target_fft.abs(),
+                reduction="mean",
+                delta=0.5,
+            )
+            L_spectral = L_spectral + w * loss_h
+            weight_sum_sp += w
+        if weight_sum_sp > 0:
+            L_spectral = L_spectral / weight_sum_sp
+
         # L_self: self-only baseline loss (spec §16.4)
         L_self = self._weighted_huber(
             outputs["Y_hat_self"], identity, Y, anchor_indices
         )
 
         # L_te: TE residual loss (spec §16.5)
-        # Target = Y_target - stop_grad(Y_hat_self)
         L_te = torch.tensor(0.0, device=Y.device)
         weight_sum_te = 0.0
         for h in self.config.horizons:
@@ -567,31 +670,43 @@ class CausalTransformerLoss(nn.Module):
             weight_sum_te += w
         L_te = L_te / weight_sum_te
 
-        # L_kl: conditional KL divergence (spec §16.6)
-        L_kl = TELatentModule.kl_divergence(
+        # L_kl_self: KL divergence for z_self (v2)
+        L_kl_self = SelfLatentModule.kl_divergence(
+            outputs["mu_self"],
+            outputs["logvar_self"],
+            free_bits=self.config.free_bits,
+        )
+
+        # L_kl_transfer: conditional KL divergence for z_transfer (§16.6)
+        L_kl_transfer = TELatentModule.kl_divergence(
             outputs["mu_post"],
             outputs["logvar_post"],
             outputs["mu_prior"],
             outputs["logvar_prior"],
+            free_bits=self.config.free_bits,
         )
 
-        # Total loss (spec §16.7)
+        # Total loss (spec §16.7, v2 extensions)
+        # Note: beta_self and beta_transfer are NOT included here — they are
+        # applied by the training loop for scheduling flexibility.
         cfg = self.config
         total_loss = (
             cfg.lambda_fus * L_fus
             + cfg.lambda_delta * L_delta
+            + cfg.lambda_delta2 * L_delta2
+            + cfg.lambda_spectral * L_spectral
             + cfg.lambda_self * L_self
             + cfg.lambda_te * L_te
         )
-        # Note: beta (KL weight) is not in config because it uses warmup
-        # scheduling controlled by the training loop. We return L_kl separately
-        # so the training loop can apply beta(t) * L_kl.
 
         return {
             "total_loss": total_loss,
             "L_fus": L_fus,
             "L_delta": L_delta,
+            "L_delta2": L_delta2,
+            "L_spectral": L_spectral,
             "L_self": L_self,
             "L_te": L_te,
-            "L_kl": L_kl,
+            "L_kl_self": L_kl_self,
+            "L_kl_transfer": L_kl_transfer,
         }

@@ -75,11 +75,15 @@ class CausalTransformerTrainer(GraphModelBase):
 
         # --- Read training schedule ---
         schedule = self.config.get("training_schedule", {})
-        stage1 = schedule.get("stage1_epochs", 50)
-        stage2 = schedule.get("stage2_epochs", 50)
-        stage3 = schedule.get("stage3_epochs", 200)
-        beta_max = schedule.get("beta_max", 1e-4)
-        warmup_steps = schedule.get("warmup_steps", 5000)
+        stage1 = schedule.get("stage1_epochs", 60)
+        stage2 = schedule.get("stage2_epochs", 60)
+        stage3 = schedule.get("stage3_epochs", 180)
+        # v2: dual KL scheduling (with v1 fallback)
+        beta_max_self = schedule.get("beta_max_self", 5e-4)
+        beta_max_transfer = schedule.get(
+            "beta_max_transfer", schedule.get("beta_max", 2e-4),
+        )
+        warmup_steps = schedule.get("warmup_steps", 8000)
 
         # Override total epochs
         self.epochs_num = stage1 + stage2 + stage3
@@ -95,7 +99,8 @@ class CausalTransformerTrainer(GraphModelBase):
             stage1_epochs=stage1,
             stage2_epochs=stage2,
             stage3_epochs=stage3,
-            beta_max=beta_max,
+            beta_max_self=beta_max_self,
+            beta_max_transfer=beta_max_transfer,
             warmup_steps=warmup_steps,
         )
 
@@ -109,16 +114,22 @@ class CausalTransformerTrainer(GraphModelBase):
                     + transformer_config.up_encoder_layers
                     + transformer_config.fused_encoder_layers
                 ),
-                "d_z": transformer_config.d_z,
+                "d_z_self": transformer_config.d_z_self,
+                "d_z_transfer": transformer_config.d_z_transfer,
+                "fusion_layers": transformer_config.fusion_layers,
                 "dropout": transformer_config.dropout,
                 "num_anchors": transformer_config.num_anchors,
                 "horizons": str(transformer_config.horizons),
                 "stage1_epochs": stage1,
                 "stage2_epochs": stage2,
                 "stage3_epochs": stage3,
-                "beta_max": beta_max,
+                "beta_max_self": beta_max_self,
+                "beta_max_transfer": beta_max_transfer,
                 "warmup_steps": warmup_steps,
                 "total_epochs": self.epochs_num,
+                "free_bits": transformer_config.free_bits,
+                "use_swiglu": transformer_config.use_swiglu,
+                "use_rmsnorm": transformer_config.use_rmsnorm,
                 "gradient_checkpointing": transformer_config.gradient_checkpointing,
             }
             self.mlflow_logger.log_hyperparams(hparams)
@@ -134,7 +145,8 @@ class CausalTransformerTrainer(GraphModelBase):
             "stage1_epochs": stage1,
             "stage2_epochs": stage2,
             "stage3_epochs": stage3,
-            "beta_max": beta_max,
+            "beta_max_self": beta_max_self,
+            "beta_max_transfer": beta_max_transfer,
             "warmup_steps": warmup_steps,
         }
 

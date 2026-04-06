@@ -6,9 +6,11 @@ Public API:
     - CausalTransformerLoss: Loss computation module.
     - sample_anchors: Utility for anchor index sampling.
     - validate_anchor_indices: Validate caller-supplied anchors before forward().
+    - SelfLatentModule: Intrinsic FHR latent module (v2).
 """
 
 from .config import TransformerConfig
+from .heads import SelfLatentModule
 from .model import (
     CausalMultimodalTransformer,
     CausalTransformerLoss,
@@ -22,4 +24,5 @@ __all__ = [
     "CausalTransformerLoss",
     "sample_anchors",
     "validate_anchor_indices",
+    "SelfLatentModule",
 ]
