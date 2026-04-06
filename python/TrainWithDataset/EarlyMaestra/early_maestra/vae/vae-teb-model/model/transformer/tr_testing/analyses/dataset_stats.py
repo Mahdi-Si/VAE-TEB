@@ -91,7 +91,7 @@ def run_dataset_stats_analysis(
     Returns:
         Summary statistics dict.
     """
-    from ..visualizers import plot_dataset_overview, plot_time_distribution, plot_st_coefficient_stats
+    from model.transformer.tr_testing.visualizers import plot_dataset_overview, plot_time_distribution, plot_st_coefficient_stats
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

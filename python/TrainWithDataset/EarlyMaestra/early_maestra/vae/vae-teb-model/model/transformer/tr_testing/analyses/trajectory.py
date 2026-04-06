@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..metrics import (
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.metrics import (
     compute_gate_statistics,
     compute_kl_per_anchor,
     compute_per_anchor_mae,
@@ -42,7 +42,7 @@ def _collect_guid_trajectories(
     Returns:
         DataFrame with one row per segment, sorted by (guid, epoch).
     """
-    from ..collectors import _build_metadata_row
+    from model.transformer.tr_testing.collectors import _build_metadata_row
 
     rows = []
     count = 0
@@ -155,7 +155,7 @@ def run_trajectory_analysis(
     Returns:
         Summary dict.
     """
-    from ..visualizers import (
+    from model.transformer.tr_testing.visualizers import (
         plot_class_mean_trajectory,
         plot_embedding_drift,
         plot_guid_trajectory,
