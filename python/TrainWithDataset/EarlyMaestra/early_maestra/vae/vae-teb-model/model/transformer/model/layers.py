@@ -1,11 +1,13 @@
 """Primitive reusable layers for the Causal Multimodal Forecasting Transformer.
 
 Contains:
+    - RMSNorm: Root mean square normalization (LLaMA-style).
+    - RotaryEmbedding: Rotary positional encoding for Q/K vectors.
     - CausalConv1d: 1D convolution with left-only padding for causality.
     - CausalConvBlock: Residual depthwise-separable causal conv block (spec §7.3).
-    - CausalSelfAttention: Pre-norm multi-head self-attention with causal masking.
-    - CausalCrossAttention: Pre-norm multi-head cross-attention with causal masking.
-    - FeedForward: Pre-norm position-wise feed-forward network.
+    - CausalSelfAttention: Pre-norm multi-head self-attention with causal masking and RoPE.
+    - CausalCrossAttention: Pre-norm multi-head cross-attention with causal masking and RoPE.
+    - FeedForward: Pre-norm position-wise feed-forward network (GELU or SwiGLU).
     - AttentionPool: Learned attention-weighted pooling over a sequence dimension.
 """
 
@@ -14,6 +16,131 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+
+# ---------------------------------------------------------------------------
+# RMSNorm
+# ---------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    """Root mean square layer normalization.
+
+    Normalizes by the RMS of the input (no mean centering). Faster and
+    empirically equivalent to LayerNorm for transformer architectures.
+
+    Args:
+        d_model: Dimension of the input.
+        eps: Small constant for numerical stability.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor of shape ``(..., d)``.
+
+        Returns:
+            Normalized tensor of the same shape.
+        """
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+def _make_norm(d_model: int, use_rmsnorm: bool = True) -> nn.Module:
+    """Factory for normalization layers.
+
+    Args:
+        d_model: Dimension of the input.
+        use_rmsnorm: If True, return RMSNorm; otherwise LayerNorm.
+
+    Returns:
+        Normalization module.
+    """
+    if use_rmsnorm:
+        return RMSNorm(d_model)
+    return nn.LayerNorm(d_model)
+
+
+# ---------------------------------------------------------------------------
+# Rotary Positional Embedding (RoPE)
+# ---------------------------------------------------------------------------
+
+class RotaryEmbedding(nn.Module):
+    """Rotary positional embedding for causal self-/cross-attention.
+
+    Precomputes sinusoidal frequencies and caches cos/sin tables up to a
+    maximum sequence length.  Applies rotation to query and key tensors so
+    that dot-product attention becomes a function of relative position.
+
+    Args:
+        d_head: Dimension per attention head (must be even).
+        max_seq_len: Maximum sequence length to precompute (can grow dynamically).
+        theta_base: Base for the geometric frequency schedule.
+    """
+
+    def __init__(
+        self,
+        d_head: int,
+        max_seq_len: int = 512,
+        theta_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        assert d_head % 2 == 0, f"d_head must be even for RoPE, got {d_head}"
+        self.d_head = d_head
+
+        # Frequencies: theta_i = 1 / (base^(2i/d))  for i in [0, d/2)
+        inv_freq = 1.0 / (
+            theta_base ** (torch.arange(0, d_head, 2).float() / d_head)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, seq_len: int) -> None:
+        """Build cos/sin cache for positions [0, seq_len)."""
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (T, d/2)
+        # Duplicate for full d_head: [cos, cos] and [sin, sin]
+        emb = torch.cat([freqs, freqs], dim=-1)  # (T, d)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, q: Tensor, k: Tensor) -> tuple:
+        """Apply rotary embeddings to query and key tensors.
+
+        Args:
+            q: Query tensor of shape ``(B, H, T, d_head)``.
+            k: Key tensor of shape ``(B, H, T, d_head)``.
+
+        Returns:
+            Tuple of (rotated_q, rotated_k) with same shapes.
+        """
+        T = q.shape[2]
+        if T > self.cos_cached.shape[0]:
+            self._build_cache(T)
+        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, d)
+        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, d)
+        return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
+
+
+def _rotate_half(x: Tensor) -> Tensor:
+    """Rotate the second half of the last dimension."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Apply rotary embedding: x * cos + rotate_half(x) * sin."""
+    return x * cos + _rotate_half(x) * sin
+
+
+# ---------------------------------------------------------------------------
+# Causal Conv1d
+# ---------------------------------------------------------------------------
 
 class CausalConv1d(nn.Module):
     """1D convolution with explicit left-only padding to enforce causality.
@@ -68,19 +195,23 @@ class CausalConv1d(nn.Module):
         return self.conv(x)
 
 
+# ---------------------------------------------------------------------------
+# Causal Conv Block
+# ---------------------------------------------------------------------------
+
 class CausalConvBlock(nn.Module):
     """Residual causal convolution block matching spec §7.3.
 
     Data flow::
 
         x (B, T, d)
-        → LayerNorm
-        → transpose to (B, d, T)
-        → DWConv_causal (depthwise, groups=d)
-        → transpose to (B, T, d)
-        → Linear(d → expansion*d) → GELU
-        → Linear(expansion*d → d) → Dropout
-        → + x  (residual)
+        -> Norm
+        -> transpose to (B, d, T)
+        -> DWConv_causal (depthwise, groups=d)
+        -> transpose to (B, T, d)
+        -> Linear(d -> expansion*d) -> GELU/SiLU
+        -> Linear(expansion*d -> d) -> Dropout
+        -> + x  (residual)
 
     Args:
         d_model: Feature dimension.
@@ -88,6 +219,8 @@ class CausalConvBlock(nn.Module):
         dilation: Dilation factor for the depthwise causal convolution.
         expansion: Pointwise expansion ratio.
         dropout: Dropout probability.
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
+        use_swiglu: Whether to use SiLU activation (matching SwiGLU style).
     """
 
     def __init__(
@@ -97,9 +230,11 @@ class CausalConvBlock(nn.Module):
         dilation: int = 1,
         expansion: int = 2,
         dropout: float = 0.1,
+        use_rmsnorm: bool = True,
+        use_swiglu: bool = True,
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = _make_norm(d_model, use_rmsnorm)
         self.dw_conv = CausalConv1d(
             in_channels=d_model,
             out_channels=d_model,
@@ -107,6 +242,7 @@ class CausalConvBlock(nn.Module):
             dilation=dilation,
             groups=d_model,
         )
+        self.act = F.silu if use_swiglu else F.gelu
         self.pw_up = nn.Linear(d_model, expansion * d_model)
         self.pw_down = nn.Linear(expansion * d_model, d_model)
         self.drop = nn.Dropout(dropout)
@@ -125,13 +261,17 @@ class CausalConvBlock(nn.Module):
         h = h.transpose(1, 2)                    # (B, d, T)
         h = self.dw_conv(h)                       # (B, d, T)
         h = h.transpose(1, 2)                    # (B, T, d)
-        h = F.gelu(self.pw_up(h))                # (B, T, expansion*d)
+        h = self.act(self.pw_up(h))              # (B, T, expansion*d)
         h = self.drop(self.pw_down(h))           # (B, T, d)
         return residual + h
 
 
+# ---------------------------------------------------------------------------
+# Causal Self-Attention
+# ---------------------------------------------------------------------------
+
 class CausalSelfAttention(nn.Module):
-    """Pre-norm multi-head self-attention with causal masking.
+    """Pre-norm multi-head self-attention with causal masking and RoPE.
 
     Uses ``F.scaled_dot_product_attention(is_causal=True)`` which automatically
     selects FlashAttention or the memory-efficient backend when available.
@@ -141,6 +281,7 @@ class CausalSelfAttention(nn.Module):
         n_heads: Number of attention heads.
         dropout: Dropout probability on attention weights (applied only during
             training).
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
     """
 
     def __init__(
@@ -148,15 +289,17 @@ class CausalSelfAttention(nn.Module):
         d_model: int,
         n_heads: int,
         dropout: float = 0.1,
+        use_rmsnorm: bool = True,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = _make_norm(d_model, use_rmsnorm)
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
         self.attn_dropout = dropout
+        self.rotary = RotaryEmbedding(self.d_head)
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass.
@@ -176,6 +319,9 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Apply rotary positional encoding to Q, K
+        q, k = self.rotary(q, k)
+
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal=True,
@@ -186,8 +332,12 @@ class CausalSelfAttention(nn.Module):
         return self.drop(self.out_proj(attn_out))
 
 
+# ---------------------------------------------------------------------------
+# Causal Cross-Attention
+# ---------------------------------------------------------------------------
+
 class CausalCrossAttention(nn.Module):
-    """Pre-norm multi-head cross-attention with causal masking.
+    """Pre-norm multi-head cross-attention with causal masking and RoPE.
 
     Query comes from the target stream, key/value from the source stream.
     Both streams share the same time dimension T, and causality enforces
@@ -197,6 +347,7 @@ class CausalCrossAttention(nn.Module):
         d_model: Model dimension.
         n_heads: Number of attention heads.
         dropout: Dropout probability on attention weights.
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
     """
 
     def __init__(
@@ -204,17 +355,19 @@ class CausalCrossAttention(nn.Module):
         d_model: int,
         n_heads: int,
         dropout: float = 0.1,
+        use_rmsnorm: bool = True,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
+        self.norm_q = _make_norm(d_model, use_rmsnorm)
+        self.norm_kv = _make_norm(d_model, use_rmsnorm)
         self.q_proj = nn.Linear(d_model, d_model)
         self.kv_proj = nn.Linear(d_model, 2 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
         self.attn_dropout = dropout
+        self.rotary = RotaryEmbedding(self.d_head)
 
     def forward(self, target: Tensor, source: Tensor) -> Tensor:
         """Forward pass.
@@ -238,6 +391,9 @@ class CausalCrossAttention(nn.Module):
         k = k.transpose(1, 2)                                # (B, H, T, d_h)
         v = v.transpose(1, 2)
 
+        # Apply rotary positional encoding to Q, K
+        q, k = self.rotary(q, k)
+
         # Both streams share time dim T; causal mask enforces s <= t.
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
@@ -249,16 +405,27 @@ class CausalCrossAttention(nn.Module):
         return self.drop(self.out_proj(attn_out))
 
 
+# ---------------------------------------------------------------------------
+# Feed-Forward Network (GELU or SwiGLU)
+# ---------------------------------------------------------------------------
+
 class FeedForward(nn.Module):
     """Pre-norm position-wise feed-forward network.
 
-    Architecture: ``LayerNorm → Linear(d → ff_dim) → GELU → Dropout
-    → Linear(ff_dim → d) → Dropout``.
+    Supports two modes:
+
+    - **GELU** (default when ``use_swiglu=False``):
+      ``Norm -> Linear(d -> ff_dim) -> GELU -> Dropout -> Linear(ff_dim -> d) -> Dropout``
+    - **SwiGLU** (when ``use_swiglu=True``):
+      ``Norm -> W3(SiLU(W1(x)) * W2(x)) -> Dropout``
+      Uses ``ff_dim = int(expansion * d * 2/3)`` to keep ~same param count.
 
     Args:
         d_model: Input and output dimension.
         expansion: Expansion ratio for the hidden layer.
         dropout: Dropout probability.
+        use_swiglu: Whether to use SwiGLU gated activation.
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
     """
 
     def __init__(
@@ -266,13 +433,24 @@ class FeedForward(nn.Module):
         d_model: int,
         expansion: int = 4,
         dropout: float = 0.1,
+        use_swiglu: bool = True,
+        use_rmsnorm: bool = True,
     ) -> None:
         super().__init__()
-        ff_dim = expansion * d_model
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, ff_dim)
-        self.fc2 = nn.Linear(ff_dim, d_model)
+        self.use_swiglu = use_swiglu
+        self.norm = _make_norm(d_model, use_rmsnorm)
         self.drop = nn.Dropout(dropout)
+
+        if use_swiglu:
+            # SwiGLU: use 2/3 factor to keep param count similar to GELU path
+            ff_dim = int(expansion * d_model * 2 / 3)
+            self.w1 = nn.Linear(d_model, ff_dim)   # gate path
+            self.w2 = nn.Linear(d_model, ff_dim)   # value path
+            self.w3 = nn.Linear(ff_dim, d_model)   # output
+        else:
+            ff_dim = expansion * d_model
+            self.fc1 = nn.Linear(d_model, ff_dim)
+            self.fc2 = nn.Linear(ff_dim, d_model)
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass.
@@ -285,11 +463,19 @@ class FeedForward(nn.Module):
             the caller).
         """
         h = self.norm(x)
-        h = F.gelu(self.fc1(h))
-        h = self.drop(h)
-        h = self.fc2(h)
-        return self.drop(h)
+        if self.use_swiglu:
+            h = self.w3(F.silu(self.w1(h)) * self.w2(h))
+            return self.drop(h)
+        else:
+            h = F.gelu(self.fc1(h))
+            h = self.drop(h)
+            h = self.fc2(h)
+            return self.drop(h)
 
+
+# ---------------------------------------------------------------------------
+# Attention Pool
+# ---------------------------------------------------------------------------
 
 class AttentionPool(nn.Module):
     """Learned attention-weighted pooling over a sequence dimension.

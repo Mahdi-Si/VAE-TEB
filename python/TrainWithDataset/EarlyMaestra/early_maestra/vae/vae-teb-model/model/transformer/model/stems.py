@@ -17,11 +17,11 @@ class CausalStem(nn.Module):
 
     Architecture::
 
-        Linear(in_dim → d_model)
-        → CausalConvBlock(k=k_0, dil=dil_0)  (block 0)
-        → CausalConvBlock(k=k_1, dil=dil_1)  (block 1)
-        → ...
-        → CausalConvBlock(k=k_{N-1}, dil=dil_{N-1})  (block N-1)
+        Linear(in_dim -> d_model)
+        -> CausalConvBlock(k=k_0, dil=dil_0)  (block 0)
+        -> CausalConvBlock(k=k_1, dil=dil_1)  (block 1)
+        -> ...
+        -> CausalConvBlock(k=k_{N-1}, dil=dil_{N-1})  (block N-1)
 
     Each block uses depthwise causal convolution with increasing receptive
     field, followed by pointwise expansion and residual connection.
@@ -34,6 +34,8 @@ class CausalStem(nn.Module):
         dilations: Dilation factors per block (length must equal ``num_blocks``).
         expansion: Pointwise expansion ratio inside each block.
         dropout: Dropout probability.
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
+        use_swiglu: Whether to use SiLU activation (matching SwiGLU style).
     """
 
     def __init__(
@@ -45,6 +47,8 @@ class CausalStem(nn.Module):
         dilations: tuple = (1, 2, 4),
         expansion: int = 2,
         dropout: float = 0.1,
+        use_rmsnorm: bool = True,
+        use_swiglu: bool = True,
     ) -> None:
         super().__init__()
         self.proj = nn.Linear(in_dim, d_model)
@@ -55,6 +59,8 @@ class CausalStem(nn.Module):
                 dilation=dil,
                 expansion=expansion,
                 dropout=dropout,
+                use_rmsnorm=use_rmsnorm,
+                use_swiglu=use_swiglu,
             )
             for k, dil in zip(kernels, dilations)
         ])
