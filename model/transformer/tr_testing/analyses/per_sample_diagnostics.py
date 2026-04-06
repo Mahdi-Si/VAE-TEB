@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..collectors import collect_full_sample_data
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.collectors import collect_full_sample_data
 
 
 def run_per_sample_diagnostics(
@@ -32,7 +32,7 @@ def run_per_sample_diagnostics(
     Returns:
         Summary dict with paths to generated figures.
     """
-    from ..visualizers import plot_sample_diagnostic
+    from model.transformer.tr_testing.visualizers import plot_sample_diagnostic
 
     output_dir = Path(output_dir)
     results = {}

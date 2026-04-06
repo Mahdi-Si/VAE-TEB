@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..collectors import (
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.collectors import (
     collect_embeddings,
     collect_forecast_metrics,
     collect_loss_components,
@@ -235,7 +235,7 @@ def run_cross_class_analysis(
     Returns:
         Summary dict.
     """
-    from ..visualizers import (
+    from model.transformer.tr_testing.visualizers import (
         plot_class_mae_comparison,
         plot_confusion_matrices,
         plot_cross_class_kl_histograms,
