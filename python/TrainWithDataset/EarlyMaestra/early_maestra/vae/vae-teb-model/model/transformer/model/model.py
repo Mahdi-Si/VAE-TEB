@@ -637,8 +637,11 @@ class CausalTransformerLoss(nn.Module):
         for h in self.config.horizons:
             w = self.horizon_weight_map[h]
             targets = self._extract_targets(Y, anchor_indices, h)
-            pred_fft = torch.fft.rfft(outputs["Y_hat_fus"][h], dim=1)
-            target_fft = torch.fft.rfft(targets, dim=1)
+            # Cast to float32 for FFT — cuFFT requires power-of-2 sizes in fp16
+            pred_f32 = outputs["Y_hat_fus"][h].float()
+            tgt_f32 = targets.float()
+            pred_fft = torch.fft.rfft(pred_f32, dim=1)
+            target_fft = torch.fft.rfft(tgt_f32, dim=1)
             loss_h = F.huber_loss(
                 pred_fft.abs(), target_fft.abs(),
                 reduction="mean",
