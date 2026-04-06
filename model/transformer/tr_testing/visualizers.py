@@ -549,6 +549,350 @@ def plot_sample_diagnostic(sample_data: dict, output_path, config) -> Path:
     return output_path
 
 
+def plot_sample_forecast_all_channels(sample_data: dict, output_path,
+                                      config) -> Path:
+    """Full-channel forecast visualization for one sample.
+
+    For each horizon, shows side-by-side heatmaps of the ground truth and
+    each head's predictions across all 43 ST channels.  Also shows the
+    error heatmap (pred - GT) and a per-channel MAE bar for each head.
+
+    Layout (one row per horizon, 5 columns each):
+        [GT heatmap | Self pred | Fused pred | TE pred | Error comparison]
+
+    Args:
+        sample_data: Sample dictionary from ``collect_full_sample_data``.
+        output_path: File path for the saved figure.
+        config: ``TransformerConfig`` instance.
+
+    Returns:
+        ``Path`` to the saved figure.
+    """
+    output_path = _ensure_path(output_path)
+    apply_publication_style()
+    sd = sample_data
+    y_np = sd["Y"]  # (T, d_f)
+    anchors_np = sd["anchor_indices"]
+    horizons = config.horizons
+    g = config.guard_gap
+    K = anchors_np.shape[0]
+    d_f = y_np.shape[1]
+
+    n_horizons = len(horizons)
+    fig, axes = plt.subplots(n_horizons, 5,
+                             figsize=(22, 4 * n_horizons),
+                             constrained_layout=True)
+    if n_horizons == 1:
+        axes = axes[np.newaxis, :]
+
+    head_names = ["self", "fused", "te"]
+    head_keys = ["Y_hat_self", "Y_hat_fus", "Y_hat_te"]
+    head_display = ["Self-only", "Fused", "TE-aug"]
+
+    for ri, h in enumerate(horizons):
+        # Extract GT for the first anchor
+        a0 = int(anchors_np[0])
+        ts = a0 + g + 1
+        te = ts + h
+        if te > y_np.shape[0]:
+            for ci in range(5):
+                axes[ri, ci].set_visible(False)
+            continue
+        gt = y_np[ts:te, :]  # (h, d_f)
+
+        # Col 0: GT heatmap
+        ax = axes[ri, 0]
+        vabs = max(np.nanmax(np.abs(gt)), 1e-6)
+        ax.imshow(gt.T, aspect="auto", cmap="bwr", origin="upper",
+                  vmin=-vabs, vmax=vabs)
+        ax.set_title(f"Ground Truth (h={h})", fontsize=8)
+        ax.set_ylabel("Channel", fontsize=7)
+        ax.set_xlabel("Step", fontsize=7)
+        ax.grid(False)
+
+        # Cols 1-3: each head's prediction
+        errors_per_head = {}
+        for ci, (hname, hkey, hdisp) in enumerate(
+                zip(head_names, head_keys, head_display), start=1):
+            pred = sd[hkey][h][0, :, :]  # first anchor, (h, d_f)
+            pred = pred[:gt.shape[0], :gt.shape[1]]
+            ax = axes[ri, ci]
+            ax.imshow(pred.T, aspect="auto", cmap="bwr", origin="upper",
+                      vmin=-vabs, vmax=vabs)
+            ax.set_title(f"{hdisp} (h={h})", fontsize=8)
+            ax.set_xlabel("Step", fontsize=7)
+            ax.grid(False)
+            errors_per_head[hname] = np.abs(pred - gt).mean(axis=0)  # (d_f,)
+
+        # Col 4: per-channel MAE bar comparison across heads
+        ax = axes[ri, 4]
+        x_ch = np.arange(d_f)
+        bw = 0.25
+        for j, hname in enumerate(head_names):
+            ax.bar(x_ch + j * bw, errors_per_head[hname], bw,
+                   color=HEAD_COLORS[hname], alpha=0.8,
+                   label=HEAD_LABELS[hname], edgecolor=COLOR_BLACK,
+                   linewidth=0.2)
+        ax.set_title(f"Per-Channel MAE (h={h})", fontsize=8)
+        ax.set_xlabel("Channel", fontsize=7)
+        ax.set_ylabel("MAE", fontsize=7)
+        if ri == 0:
+            ax.legend(fontsize=5, ncol=3, framealpha=0.9)
+        style_axes(ax, grid="major")
+
+    guid = sd.get("guid", "?")
+    epoch = sd.get("epoch", "?")
+    cls_label = sd.get("class_label", "?")
+    fig.suptitle(
+        f"All-Channel Forecast -- GUID={guid}, Epoch={epoch}, "
+        f"Class={cls_label}",
+        fontsize=11, color=COLOR_PURPLE, y=1.003,
+    )
+    save_figure(fig, output_path)
+    return output_path
+
+
+def plot_sample_latent_detail(sample_data: dict, output_path,
+                              config) -> Path:
+    """Detailed latent space visualization for one sample.
+
+    Multi-panel figure with deep TE latent analysis:
+        Row 0: TE posterior mean bar plot (16 dims) per anchor — shows
+            which latent dimensions are active.
+        Row 1: TE prior mean bar plot (16 dims) per anchor — comparison
+            with posterior.
+        Row 2: Posterior - Prior difference per dim per anchor (heatmap) —
+            shows which dims carry UP information.
+        Row 3: Per-dim posterior std (exp(0.5*logvar)) per anchor (heatmap)
+            — uncertainty structure.
+        Row 4: Latent PCA — project z_te (posterior means) to 2D, one
+            point per anchor, colored by position.
+        Row 5: Per-dim distribution violin — posterior mean across anchors.
+        Row 6: Latent correlation matrix — correlations between dims
+            across anchors.
+        Row 7: z_te magnitude and KL per dim (dual bar chart).
+
+    Args:
+        sample_data: Sample dictionary from ``collect_full_sample_data``.
+        output_path: File path for the saved figure.
+        config: ``TransformerConfig`` instance.
+
+    Returns:
+        ``Path`` to the saved figure.
+    """
+    output_path = _ensure_path(output_path)
+    apply_publication_style()
+    sd = sample_data
+    mu_post = sd["mu_post"]        # (K, d_z)
+    mu_prior = sd["mu_prior"]      # (K, d_z)
+    logvar_post = sd["logvar_post"]  # (K, d_z)
+    logvar_prior = sd["logvar_prior"]  # (K, d_z)
+    anchors_np = sd["anchor_indices"]  # (K,)
+    K, d_z = mu_post.shape
+    e_win_np = sd["e_win"]
+    d = config.d_model
+
+    guid = sd.get("guid", "?")
+    epoch = sd.get("epoch", "?")
+    cls_label = sd.get("class_label", "?")
+
+    n_rows = 8
+    fig = plt.figure(figsize=(16, 3.5 * n_rows), constrained_layout=True)
+    gs = fig.add_gridspec(n_rows, 2)
+
+    # ---- Row 0: Posterior mean per dim per anchor (grouped bar) ----
+    ax = fig.add_subplot(gs[0, :])
+    x_dim = np.arange(d_z)
+    bw = 0.8 / K
+    cmap_anchors = plt.cm.viridis(np.linspace(0.2, 0.9, K))
+    for ki in range(K):
+        ax.bar(x_dim + ki * bw, mu_post[ki], bw, color=cmap_anchors[ki],
+               alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.2,
+               label=f"a={int(anchors_np[ki])}")
+    ax.set_title("TE Posterior Mean per Latent Dimension", fontsize=9, pad=6)
+    ax.set_xlabel("Latent Dim", fontsize=8)
+    ax.set_ylabel("mu_post", fontsize=8)
+    ax.set_xticks(x_dim + bw * (K - 1) / 2)
+    ax.set_xticklabels([str(d) for d in range(d_z)], fontsize=6)
+    ax.legend(fontsize=5, ncol=min(K, 8), framealpha=0.9)
+    style_axes(ax, grid="major")
+
+    # ---- Row 1: Prior mean per dim per anchor (grouped bar) ----
+    ax = fig.add_subplot(gs[1, :])
+    for ki in range(K):
+        ax.bar(x_dim + ki * bw, mu_prior[ki], bw, color=cmap_anchors[ki],
+               alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.2,
+               label=f"a={int(anchors_np[ki])}")
+    ax.set_title("TE Prior Mean per Latent Dimension", fontsize=9, pad=6)
+    ax.set_xlabel("Latent Dim", fontsize=8)
+    ax.set_ylabel("mu_prior", fontsize=8)
+    ax.set_xticks(x_dim + bw * (K - 1) / 2)
+    ax.set_xticklabels([str(d) for d in range(d_z)], fontsize=6)
+    ax.legend(fontsize=5, ncol=min(K, 8), framealpha=0.9)
+    style_axes(ax, grid="major")
+
+    # ---- Row 2: Posterior - Prior difference heatmap ----
+    ax = fig.add_subplot(gs[2, :])
+    diff = mu_post - mu_prior  # (K, d_z)
+    vabs = max(np.nanmax(np.abs(diff)), 1e-6)
+    im = ax.imshow(diff.T, aspect="auto", cmap="bwr", origin="lower",
+                   vmin=-vabs, vmax=vabs)
+    ax.set_title("Posterior - Prior Difference (UP Information Content)",
+                 fontsize=9, pad=6)
+    ax.set_ylabel("Latent Dim", fontsize=8)
+    ax.set_xlabel("Anchor Index", fontsize=8)
+    ax.set_xticks(np.arange(K))
+    ax.set_xticklabels([f"a={int(a)}" for a in anchors_np], fontsize=6)
+    ax.grid(False)
+    add_colorbar(fig, im, ax, label="mu_post - mu_prior")
+
+    # ---- Row 3: Posterior std heatmap ----
+    ax = fig.add_subplot(gs[3, :])
+    post_std = np.exp(0.5 * logvar_post)  # (K, d_z)
+    im = ax.imshow(post_std.T, aspect="auto", cmap="YlOrRd",
+                   origin="lower")
+    ax.set_title("Posterior Std (Uncertainty per Dim per Anchor)",
+                 fontsize=9, pad=6)
+    ax.set_ylabel("Latent Dim", fontsize=8)
+    ax.set_xlabel("Anchor Index", fontsize=8)
+    ax.set_xticks(np.arange(K))
+    ax.set_xticklabels([f"a={int(a)}" for a in anchors_np], fontsize=6)
+    ax.grid(False)
+    add_colorbar(fig, im, ax, label="std = exp(0.5 * logvar)")
+
+    # ---- Row 4: Latent PCA scatter (2D) ----
+    ax_l = fig.add_subplot(gs[4, 0])
+    proj, ve = _pca_svd(mu_post, 2)
+    if proj is not None and proj.shape[0] >= 2:
+        scatter = ax_l.scatter(proj[:, 0], proj[:, 1],
+                               c=np.arange(K), cmap="viridis",
+                               s=60, edgecolor=COLOR_BLACK, linewidth=0.5,
+                               zorder=3)
+        # Connect with lines to show order
+        ax_l.plot(proj[:, 0], proj[:, 1], color=COLOR_GRAY, linewidth=0.5,
+                  alpha=0.5, zorder=2)
+        for ki in range(K):
+            ax_l.annotate(f"a={int(anchors_np[ki])}", (proj[ki, 0], proj[ki, 1]),
+                         fontsize=5, ha="center", va="bottom")
+        fig.colorbar(scatter, ax=ax_l, shrink=0.8, label="Anchor order")
+        ax_l.set_xlabel(f"PC1 ({ve[0]*100:.1f}%)", fontsize=8)
+        ax_l.set_ylabel(f"PC2 ({ve[1]*100:.1f}%)", fontsize=8)
+    ax_l.set_title("TE Latent PCA (mu_post)", fontsize=9, pad=6)
+    style_axes(ax_l)
+
+    # ---- Row 4 right: TE embedding decomposition ----
+    ax_r = fig.add_subplot(gs[4, 1])
+    boundary_te = 8 * d
+    e_te = e_win_np[boundary_te:]  # (2*d_z,)
+    d_z2 = len(e_te) // 2
+    ax_r.bar(np.arange(d_z2), e_te[:d_z2], color=COLOR_BLUE, alpha=0.7,
+             label="e_TE mean", edgecolor=COLOR_BLACK, linewidth=0.2)
+    ax_r.bar(np.arange(d_z2, 2 * d_z2), e_te[d_z2:], color=COLOR_GREEN,
+             alpha=0.7, label="e_TE max", edgecolor=COLOR_BLACK,
+             linewidth=0.2)
+    ax_r.axvline(d_z2 - 0.5, color=COLOR_BLACK, linestyle="--",
+                 linewidth=0.8, alpha=0.5)
+    ax_r.set_title("TE Embedding Decomposition", fontsize=9, pad=6)
+    ax_r.set_xlabel("Dimension", fontsize=8)
+    ax_r.set_ylabel("Value", fontsize=8)
+    ax_r.legend(fontsize=7, framealpha=0.95)
+    style_axes(ax_r, grid="major")
+
+    # ---- Row 5: Per-dim posterior violin/box across anchors ----
+    ax = fig.add_subplot(gs[5, :])
+    positions = np.arange(d_z)
+    parts = ax.violinplot([mu_post[:, d] for d in range(d_z)],
+                          positions=positions, showmeans=True,
+                          showmedians=False, widths=0.7)
+    for pc in parts["bodies"]:
+        pc.set_facecolor(COLOR_SKY)
+        pc.set_alpha(0.6)
+    parts["cmeans"].set_color(COLOR_VERMILLION)
+    # Overlay prior means as reference
+    prior_mean_across = mu_prior.mean(axis=0)
+    ax.scatter(positions, prior_mean_across, color=COLOR_ORANGE, marker="x",
+               s=40, zorder=5, label="Prior mean (avg)")
+    ax.set_title("Posterior Mean Distribution Across Anchors", fontsize=9,
+                 pad=6)
+    ax.set_xlabel("Latent Dim", fontsize=8)
+    ax.set_ylabel("mu_post", fontsize=8)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([str(d) for d in range(d_z)], fontsize=6)
+    ax.legend(fontsize=7, framealpha=0.95)
+    style_axes(ax, grid="major")
+
+    # ---- Row 6: Latent correlation matrix ----
+    ax = fig.add_subplot(gs[6, 0])
+    if K >= 3:
+        corr = np.corrcoef(mu_post.T)  # (d_z, d_z)
+        im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1,
+                       aspect="equal")
+        ax.set_title("Posterior Latent Correlation", fontsize=9, pad=6)
+        ax.set_xlabel("Dim", fontsize=7)
+        ax.set_ylabel("Dim", fontsize=7)
+        add_colorbar(fig, im, ax, label="Corr")
+        ax.grid(False)
+    else:
+        ax.text(0.5, 0.5, "Need >= 3 anchors", ha="center", va="center")
+        ax.set_title("Posterior Latent Correlation", fontsize=9, pad=6)
+
+    # Prior correlation for comparison
+    ax2 = fig.add_subplot(gs[6, 1])
+    if K >= 3:
+        corr_pr = np.corrcoef(mu_prior.T)
+        im2 = ax2.imshow(corr_pr, cmap="RdBu_r", vmin=-1, vmax=1,
+                         aspect="equal")
+        ax2.set_title("Prior Latent Correlation", fontsize=9, pad=6)
+        ax2.set_xlabel("Dim", fontsize=7)
+        ax2.set_ylabel("Dim", fontsize=7)
+        add_colorbar(fig, im2, ax2, label="Corr")
+        ax2.grid(False)
+    else:
+        ax2.text(0.5, 0.5, "Need >= 3 anchors", ha="center", va="center")
+        ax2.set_title("Prior Latent Correlation", fontsize=9, pad=6)
+
+    # ---- Row 7: KL per dim + |mu_post| per dim (dual bar) ----
+    ax = fig.add_subplot(gs[7, :])
+    kl_per_dim = 0.5 * (
+        logvar_prior - logvar_post
+        + (np.exp(logvar_post) + (mu_post - mu_prior) ** 2)
+        / np.exp(logvar_prior) - 1.0
+    )  # (K, d_z)
+    kl_mean_dim = kl_per_dim.mean(axis=0)  # (d_z,)
+    mu_mag_dim = np.abs(mu_post).mean(axis=0)  # (d_z,)
+
+    x_dim = np.arange(d_z)
+    bw2 = 0.35
+    ax.bar(x_dim - bw2 / 2, kl_mean_dim, bw2, color=COLOR_PURPLE,
+           alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.2,
+           label="KL (mean over anchors)")
+    ax2_r = ax.twinx()
+    ax2_r.bar(x_dim + bw2 / 2, mu_mag_dim, bw2, color=COLOR_SKY,
+              alpha=0.7, edgecolor=COLOR_BLACK, linewidth=0.2,
+              label="|mu_post| (mean)")
+    ax.set_title("Per-Dimension KL and Posterior Magnitude", fontsize=9,
+                 pad=6)
+    ax.set_xlabel("Latent Dim", fontsize=8)
+    ax.set_ylabel("KL (nats)", fontsize=8, color=COLOR_PURPLE)
+    ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
+    ax2_r.set_ylabel("|mu_post|", fontsize=8, color=COLOR_SKY)
+    ax2_r.tick_params(axis="y", labelcolor=COLOR_SKY)
+    ax.set_xticks(x_dim)
+    ax.set_xticklabels([str(d) for d in range(d_z)], fontsize=6)
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2_r.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6,
+              loc="upper right", framealpha=0.9)
+    style_axes(ax, grid="major")
+
+    fig.suptitle(
+        f"Latent Detail -- GUID={guid}, Epoch={epoch}, Class={cls_label}",
+        fontsize=12, color=COLOR_PURPLE, y=1.002,
+    )
+    save_figure(fig, output_path)
+    return output_path
+
+
 # ===================================================================
 # Category 2: Forecasting
 # ===================================================================
@@ -2059,6 +2403,385 @@ def plot_trajectory_comparison(class_trajectories: Dict[str, Any],
     return output_path
 
 
+def plot_trajectory_comparison_3d(class_trajectories: Dict[str, Any],
+                                 output_dir) -> Path:
+    """3-D overlay of mean PCA trajectories from different classes.
+
+    Args:
+        class_trajectories: ``{"class_name": {"mean_proj": (N, 3),
+            "time": (N,)}, ...}`` per-class mean trajectories.
+        output_dir: Directory to save the figure.
+
+    Returns:
+        Path to the saved figure.
+    """
+    output_path = _ensure_path(
+        Path(output_dir) / "trajectory_comparison_3d.png")
+    if not class_trajectories:
+        return output_path
+
+    apply_publication_style()
+    classes = sorted(class_trajectories.keys())
+    class_colors = get_class_colors(classes)
+
+    fig = plt.figure(figsize=(9, 8), constrained_layout=True)
+    ax = fig.add_subplot(111, projection="3d")
+
+    for cls in classes:
+        td = class_trajectories[cls]
+        proj = td.get("mean_proj", np.empty((0, 3)))
+        if proj.shape[0] < 2 or proj.shape[1] < 3:
+            continue
+        color = class_colors[cls]
+        ax.plot(proj[:, 0], proj[:, 1], proj[:, 2], color=color,
+                linewidth=1.2, label=cls)
+        ax.scatter(proj[0, 0], proj[0, 1], proj[0, 2], color=color,
+                   marker="o", s=40, zorder=3, edgecolors=COLOR_BLACK,
+                   linewidths=0.5)
+        ax.scatter(proj[-1, 0], proj[-1, 1], proj[-1, 2], color=color,
+                   marker="X", s=50, zorder=3, edgecolors=COLOR_BLACK,
+                   linewidths=0.5)
+
+    ax.set_xlabel("PC1", fontsize=7)
+    ax.set_ylabel("PC2", fontsize=7)
+    ax.set_zlabel("PC3", fontsize=7)
+    ax.set_title("3D Mean Trajectory Comparison (PCA)", fontsize=9, pad=8)
+    ax.legend(fontsize=7, framealpha=0.95)
+    save_figure(fig, output_path)
+    return output_path
+
+
+def plot_guid_te_trajectory_3d(te_dict: Dict[str, Any], output_dir,
+                               config=None) -> Path:
+    """3-D PCA trajectory of the TE posterior means for one GUID.
+
+    Projects ``mu_post`` (N_epochs, d_z) to 3 principal components, colored
+    by time-to-delivery.  Shows the path the TE latent traces through its
+    learned space as delivery approaches.
+
+    Args:
+        te_dict: Dictionary with ``guid``, ``epochs`` (seconds),
+            ``mu_post`` (N, d_z).
+        output_dir: Directory to save the figure.
+        config: TransformerConfig (unused, for API consistency).
+
+    Returns:
+        Path to the saved figure.
+    """
+    guid = te_dict.get("guid", "unknown")
+    output_path = _ensure_path(
+        Path(output_dir) / f"te_trajectory_3d_{guid}.png")
+    mu_post = te_dict.get("mu_post")
+    if mu_post is None or mu_post.shape[0] < 3:
+        return output_path
+
+    epochs = te_dict.get("epochs", np.arange(mu_post.shape[0]))
+    sort_idx = np.argsort(epochs)
+    mu_post = mu_post[sort_idx]
+    epochs = epochs[sort_idx]
+    hours = epochs / 3600.0
+
+    apply_publication_style()
+    proj, ve = _pca_svd(mu_post, 3)
+    if proj is None or proj.shape[1] < 3:
+        return output_path
+
+    fig = plt.figure(figsize=(9, 8), constrained_layout=True)
+    ax = fig.add_subplot(111, projection="3d")
+
+    sc = ax.scatter(proj[:, 0], proj[:, 1], proj[:, 2], c=hours,
+                    cmap="viridis", s=25, edgecolors=COLOR_BLACK,
+                    linewidths=0.3, zorder=3)
+    ax.plot(proj[:, 0], proj[:, 1], proj[:, 2], color=COLOR_GRAY,
+            linewidth=0.5, alpha=0.5, zorder=2)
+
+    # Mark start and end
+    ax.scatter(*proj[0, :3], color=COLOR_GREEN, marker="o", s=60,
+               edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5,
+               label="Start")
+    ax.scatter(*proj[-1, :3], color=COLOR_VERMILLION, marker="X", s=80,
+               edgecolors=COLOR_BLACK, linewidths=0.5, zorder=5,
+               label="End (delivery)")
+
+    fig.colorbar(sc, ax=ax, shrink=0.55, pad=0.1, label="Hours before delivery")
+    ax.set_xlabel(f"PC1 ({ve[0]*100:.1f}%)", fontsize=7)
+    ax.set_ylabel(f"PC2 ({ve[1]*100:.1f}%)", fontsize=7)
+    ax.set_zlabel(f"PC3 ({ve[2]*100:.1f}%)", fontsize=7)
+    cls = te_dict.get("class_label", "?")
+    ax.set_title(f"3D TE Latent Trajectory -- {guid[:12]}... ({cls})",
+                 fontsize=9, pad=8)
+    ax.legend(fontsize=7, framealpha=0.9)
+    save_figure(fig, output_path)
+    return output_path
+
+
+def plot_te_trajectory_dashboard(traj_df: pd.DataFrame, output_dir,
+                                 config=None) -> Path:
+    """Multi-panel TE trajectory dashboard showing all TE metrics vs time.
+
+    Creates a 3x2 figure with class-mean trajectories for:
+    Row 0: KL divergence, TE residual norm
+    Row 1: TE embedding norm, posterior variance
+    Row 2: TE improvement (self-te MAE gap), gate activation
+
+    Args:
+        traj_df: Trajectory DataFrame with TE columns, ``class_label``,
+            and ``epoch`` (seconds).
+        output_dir: Directory to save the figure.
+        config: TransformerConfig (for horizon info).
+
+    Returns:
+        Path to the saved figure.
+    """
+    output_path = _ensure_path(
+        Path(output_dir) / "te_trajectory_dashboard.png")
+    if traj_df.empty:
+        return output_path
+
+    apply_publication_style()
+    classes = sorted(traj_df["class_label"].unique())
+    class_colors = get_class_colors(classes)
+
+    # Determine which TE metrics are available
+    h_max = max(config.horizons) if config else 30
+    panel_specs = [
+        ("kl_mean", "KL Divergence", "KL (nats)"),
+        (f"residual_norm_h{h_max}", f"TE Residual Norm (h={h_max})",
+         "||R_hat||"),
+        ("e_te_norm", "TE Embedding Norm", "||e_TE||"),
+        ("post_var_mean", "Posterior Variance (mean)",
+         "mean exp(logvar_post)"),
+        ("te_improvement", f"TE Improvement (h={h_max})",
+         "MAE_self - MAE_te"),
+        ("mean_gate", "Gate Activation", "Mean Gate"),
+    ]
+    # Filter to available columns
+    panel_specs = [(col, title, ylabel) for col, title, ylabel in panel_specs
+                   if col in traj_df.columns]
+    if not panel_specs:
+        return output_path
+
+    n_panels = len(panel_specs)
+    n_cols = 2
+    n_rows = (n_panels + 1) // 2
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(7 * n_cols, 3.5 * n_rows),
+                             constrained_layout=True, squeeze=False)
+
+    for idx, (col, title, ylabel) in enumerate(panel_specs):
+        ri, ci = divmod(idx, n_cols)
+        ax = axes[ri, ci]
+
+        for cls in classes:
+            cls_df = traj_df[traj_df["class_label"] == cls].dropna(
+                subset=[col])
+            if cls_df.empty:
+                continue
+            hours = cls_df["epoch"].values / 3600.0
+            vals = cls_df[col].values
+            # Sort by time
+            sort_idx = np.argsort(hours)
+            hours = hours[sort_idx]
+            vals = vals[sort_idx]
+
+            # Binned average (1-hour bins)
+            bin_edges = np.arange(
+                np.floor(hours.min()), np.ceil(hours.max()) + 1, 1.0)
+            if len(bin_edges) < 2:
+                ax.scatter(hours, vals, s=8, alpha=0.4,
+                           color=class_colors.get(cls, COLOR_GRAY),
+                           label=cls)
+                continue
+            bin_idx = np.clip(
+                np.digitize(hours, bin_edges) - 1, 0, len(bin_edges) - 2)
+            t_out, m_out, sem_out = [], [], []
+            for b in range(len(bin_edges) - 1):
+                mask = bin_idx == b
+                if mask.sum() > 0:
+                    t_out.append((bin_edges[b] + bin_edges[b + 1]) / 2)
+                    m_out.append(vals[mask].mean())
+                    sem_out.append(
+                        vals[mask].std() / max(np.sqrt(mask.sum()), 1))
+            t_out = np.array(t_out)
+            m_out = np.array(m_out)
+            sem_out = np.array(sem_out)
+
+            color = class_colors.get(cls, COLOR_GRAY)
+            ax.plot(t_out, m_out, color=color, linewidth=1.2, label=cls)
+            ax.fill_between(t_out, m_out - sem_out, m_out + sem_out,
+                            color=color, alpha=0.15)
+
+        ax.set_title(title, fontsize=9, pad=6)
+        ax.set_xlabel("Hours before delivery", fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.legend(fontsize=6, framealpha=0.9)
+        style_axes(ax, grid="both")
+
+    # Hide unused axes
+    for idx in range(n_panels, n_rows * n_cols):
+        ri, ci = divmod(idx, n_cols)
+        axes[ri, ci].set_visible(False)
+
+    fig.suptitle("TE Trajectory Dashboard", fontsize=12, color=COLOR_PURPLE,
+                 y=1.005)
+    save_figure(fig, output_path)
+    return output_path
+
+
+def plot_guid_te_trajectory(te_dict: Dict[str, Any], output_dir,
+                            config=None) -> Path:
+    """Per-GUID TE trajectory multi-panel figure.
+
+    Creates a multi-row figure for one patient showing:
+    Row 0: KL divergence + gate activation (twin axes)
+    Row 1: TE posterior mean heatmap (d_z dims x epochs)
+    Row 2: Per-dimension KL heatmap (d_z dims x epochs)
+    Row 3: TE residual norms per horizon
+    Row 4: TE improvement + posterior variance
+
+    Args:
+        te_dict: Dictionary with keys:
+            ``guid``, ``class_label``, ``epochs`` (seconds),
+            ``kl_mean``, ``mean_gate``, ``e_te_norm``, ``te_improvement``,
+            ``post_var_mean``, ``mu_post`` (N, d_z), ``mu_prior`` (N, d_z),
+            ``kl_per_dim`` (N, d_z), ``residual_norm_h{h}`` per horizon.
+        output_dir: Directory to save the figure.
+        config: TransformerConfig.
+
+    Returns:
+        Path to the saved figure.
+    """
+    guid = te_dict.get("guid", "unknown")
+    output_path = _ensure_path(
+        Path(output_dir) / f"te_trajectory_{guid}.png")
+    epochs = te_dict.get("epochs")
+    if epochs is None or len(epochs) < 2:
+        return output_path
+
+    apply_publication_style()
+    hours = epochs / 3600.0
+    sort_idx = np.argsort(hours)
+    hours = hours[sort_idx]
+    cls = te_dict.get("class_label", "unknown")
+
+    n_rows = 5
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 3.2 * n_rows),
+                             constrained_layout=True)
+
+    # --- Row 0: KL divergence + gate activation (twin axes) ---
+    ax0 = axes[0]
+    kl_vals = te_dict.get("kl_mean")
+    if kl_vals is not None:
+        kl_vals = kl_vals[sort_idx]
+        ax0.plot(hours, kl_vals, color=COLOR_BLUE, linewidth=1.2,
+                 label="KL div")
+    ax0.set_ylabel("KL (nats)", fontsize=8, color=COLOR_BLUE)
+    ax0.tick_params(axis="y", labelcolor=COLOR_BLUE)
+
+    gate_vals = te_dict.get("mean_gate")
+    if gate_vals is not None:
+        gate_vals = gate_vals[sort_idx]
+        ax0_r = ax0.twinx()
+        ax0_r.plot(hours, gate_vals, color=COLOR_ORANGE, linewidth=1.0,
+                   alpha=0.8, label="Gate")
+        ax0_r.set_ylabel("Mean Gate", fontsize=8, color=COLOR_ORANGE)
+        ax0_r.tick_params(axis="y", labelcolor=COLOR_ORANGE)
+        ax0_r.set_ylim(-0.05, 1.05)
+        lines1, labels1 = ax0.get_legend_handles_labels()
+        lines2, labels2 = ax0_r.get_legend_handles_labels()
+        ax0.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
+
+    ax0.set_title(f"KL & Gate — {guid[:12]}... ({cls})", fontsize=9, pad=6)
+    ax0.set_xlabel("Hours before delivery", fontsize=8)
+    style_axes(ax0, grid="both")
+
+    # --- Row 1: TE posterior mean heatmap ---
+    ax1 = axes[1]
+    mu_post = te_dict.get("mu_post")
+    if mu_post is not None:
+        mu_post = mu_post[sort_idx]  # (N, d_z)
+        heatmap(ax1, mu_post.T, cmap="bwr", origin="lower",
+                title="TE Posterior Mean (mu_post) over Time",
+                ylabel="Latent Dim", xlabel="Epoch Index",
+                label="Value", fig=fig)
+    else:
+        ax1.set_visible(False)
+
+    # --- Row 2: Per-dimension KL heatmap ---
+    ax2 = axes[2]
+    kl_per_dim = te_dict.get("kl_per_dim")
+    if kl_per_dim is not None:
+        kl_per_dim = kl_per_dim[sort_idx]  # (N, d_z)
+        vabs = np.nanmax(np.abs(kl_per_dim)) or 1.0
+        im = ax2.imshow(kl_per_dim.T, aspect="auto", cmap="hot",
+                        origin="lower", vmin=0, vmax=vabs)
+        ax2.set_title("Per-Dimension KL over Time", fontsize=9, pad=6)
+        ax2.set_ylabel("Latent Dim", fontsize=8)
+        ax2.set_xlabel("Epoch Index", fontsize=8)
+        fig.colorbar(im, ax=ax2, shrink=0.8, pad=0.02, label="KL (nats)")
+        ax2.grid(False)
+    else:
+        ax2.set_visible(False)
+
+    # --- Row 3: TE residual norms per horizon ---
+    ax3 = axes[3]
+    horizons = config.horizons if config else (8, 15, 30)
+    h_colors = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN]
+    has_data = False
+    for hi, h in enumerate(horizons):
+        col = f"residual_norm_h{h}"
+        vals = te_dict.get(col)
+        if vals is not None:
+            vals = vals[sort_idx]
+            c = h_colors[hi % len(h_colors)]
+            ax3.plot(hours, vals, color=c, linewidth=1.0,
+                     label=f"h={h}", alpha=0.9)
+            has_data = True
+    if has_data:
+        ax3.set_title("TE Residual Norm per Horizon", fontsize=9, pad=6)
+        ax3.set_ylabel("||R_hat||", fontsize=8)
+        ax3.set_xlabel("Hours before delivery", fontsize=8)
+        ax3.legend(fontsize=7)
+        style_axes(ax3, grid="both")
+    else:
+        ax3.set_visible(False)
+
+    # --- Row 4: TE improvement + posterior variance ---
+    ax4 = axes[4]
+    te_imp = te_dict.get("te_improvement")
+    if te_imp is not None:
+        te_imp = te_imp[sort_idx]
+        ax4.plot(hours, te_imp, color=COLOR_GREEN, linewidth=1.2,
+                 label="TE Improvement")
+        ax4.axhline(0, color=COLOR_GRAY, linestyle="--", alpha=0.5)
+    ax4.set_ylabel("MAE_self - MAE_te", fontsize=8, color=COLOR_GREEN)
+    ax4.tick_params(axis="y", labelcolor=COLOR_GREEN)
+
+    pv = te_dict.get("post_var_mean")
+    if pv is not None:
+        pv = pv[sort_idx]
+        ax4_r = ax4.twinx()
+        ax4_r.plot(hours, pv, color=COLOR_PURPLE, linewidth=1.0,
+                   alpha=0.7, label="Post. Var")
+        ax4_r.set_ylabel("Post. Variance", fontsize=8, color=COLOR_PURPLE)
+        ax4_r.tick_params(axis="y", labelcolor=COLOR_PURPLE)
+        lines1, labels1 = ax4.get_legend_handles_labels()
+        lines2, labels2 = ax4_r.get_legend_handles_labels()
+        ax4.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
+
+    ax4.set_title("TE Improvement & Posterior Variance", fontsize=9, pad=6)
+    ax4.set_xlabel("Hours before delivery", fontsize=8)
+    style_axes(ax4, grid="both")
+
+    fig.suptitle(
+        f"TE Trajectory — {guid[:16]}... ({cls})",
+        fontsize=11, color=COLOR_PURPLE, y=1.005,
+    )
+    save_figure(fig, output_path)
+    return output_path
+
+
 # ===================================================================
 # Category 6: Cross-class
 # ===================================================================
@@ -2400,7 +3123,10 @@ def plot_confusion_matrices(classification_results: Dict[str, Any],
 
 def plot_cross_class_mae_histograms(metrics_df: pd.DataFrame,
                                     output_dir) -> Path:
-    """3x3 grid (head x horizon) of overlaid MAE histograms by class.
+    """MAE histograms with one row per class and columns for head x horizon.
+
+    Each class gets its own row of subplots so distributions are
+    side-by-side for easy visual comparison with shared x-axes.
 
     Args:
         metrics_df: DataFrame with ``head``, ``horizon``, ``mae``,
@@ -2420,31 +3146,36 @@ def plot_cross_class_mae_histograms(metrics_df: pd.DataFrame,
     horizons = sorted(metrics_df["horizon"].unique())
     classes = sorted(metrics_df["class_label"].unique())
     class_colors = get_class_colors(classes)
-    n_heads = len(heads)
-    n_hor = len(horizons)
+    n_cls = len(classes)
+    n_cols = len(heads) * len(horizons)
 
-    fig, axes = plt.subplots(n_heads, n_hor,
-                             figsize=(4 * n_hor, 3.5 * n_heads),
-                             constrained_layout=True)
-    if n_heads == 1 and n_hor == 1:
-        axes = np.array([[axes]])
-    elif n_heads == 1:
-        axes = axes[np.newaxis, :]
-    elif n_hor == 1:
-        axes = axes[:, np.newaxis]
+    fig, axes = plt.subplots(n_cls, n_cols,
+                             figsize=(3.5 * n_cols, 3 * n_cls),
+                             constrained_layout=True, squeeze=False)
 
-    for ri, head in enumerate(heads):
-        for ci, h in enumerate(horizons):
-            ax = axes[ri, ci]
-            h_df = metrics_df[(metrics_df["head"] == head) &
-                              (metrics_df["horizon"] == h)]
-            data_dict = {
-                cls: h_df[h_df["class_label"] == cls]["mae"].values
-                for cls in classes
-            }
-            _overlaid_histograms(ax, data_dict, class_colors, xlabel="MAE")
-            ax.set_title(f"{HEAD_LABELS.get(head, head)}, h={h}", fontsize=9)
-            style_axes(ax)
+    for ri, cls in enumerate(classes):
+        ci = 0
+        for head in heads:
+            for h in horizons:
+                ax = axes[ri, ci]
+                vals = metrics_df[
+                    (metrics_df["class_label"] == cls) &
+                    (metrics_df["head"] == head) &
+                    (metrics_df["horizon"] == h)
+                ]["mae"].dropna().values
+                if len(vals) > 0:
+                    ax.hist(vals, bins=40, alpha=0.7,
+                            color=class_colors.get(cls, COLOR_GRAY),
+                            edgecolor=COLOR_BLACK, linewidth=0.3,
+                            density=True)
+                if ri == 0:
+                    ax.set_title(f"{HEAD_LABELS.get(head, head)}, h={h}",
+                                 fontsize=8)
+                if ci == 0:
+                    ax.set_ylabel(cls, fontsize=9, fontweight="bold")
+                ax.set_xlabel("MAE", fontsize=7)
+                style_axes(ax)
+                ci += 1
 
     fig.suptitle("MAE Distributions by Class", fontsize=11,
                  color=COLOR_PURPLE)
@@ -2454,7 +3185,7 @@ def plot_cross_class_mae_histograms(metrics_df: pd.DataFrame,
 
 def plot_cross_class_vaf_histograms(metrics_df: pd.DataFrame,
                                     output_dir) -> Path:
-    """3 subplots (one per head) of overlaid VAF histograms by class.
+    """VAF histograms with one row per class, one column per head.
 
     Args:
         metrics_df: DataFrame with ``head``, ``vaf``, ``class_label``.
@@ -2472,20 +3203,29 @@ def plot_cross_class_vaf_histograms(metrics_df: pd.DataFrame,
     heads = [h for h in _HEAD_NAMES if h in metrics_df["head"].unique()]
     classes = sorted(metrics_df["class_label"].unique())
     class_colors = get_class_colors(classes)
+    n_cls = len(classes)
 
-    fig, axes = plt.subplots(1, len(heads), figsize=(5 * len(heads), 4),
+    fig, axes = plt.subplots(n_cls, len(heads),
+                             figsize=(5 * len(heads), 3 * n_cls),
                              constrained_layout=True, squeeze=False)
 
-    for hi, head in enumerate(heads):
-        ax = axes[0, hi]
-        h_df = metrics_df[metrics_df["head"] == head]
-        data_dict = {
-            cls: h_df[h_df["class_label"] == cls]["vaf"].dropna().values
-            for cls in classes
-        }
-        _overlaid_histograms(ax, data_dict, class_colors, xlabel="VAF")
-        ax.set_title(HEAD_LABELS.get(head, head), fontsize=9)
-        style_axes(ax)
+    for ri, cls in enumerate(classes):
+        for ci, head in enumerate(heads):
+            ax = axes[ri, ci]
+            vals = metrics_df[
+                (metrics_df["class_label"] == cls) &
+                (metrics_df["head"] == head)
+            ]["vaf"].dropna().values
+            if len(vals) > 0:
+                ax.hist(vals, bins=40, alpha=0.7,
+                        color=class_colors.get(cls, COLOR_GRAY),
+                        edgecolor=COLOR_BLACK, linewidth=0.3, density=True)
+            if ri == 0:
+                ax.set_title(HEAD_LABELS.get(head, head), fontsize=9)
+            if ci == 0:
+                ax.set_ylabel(cls, fontsize=9, fontweight="bold")
+            ax.set_xlabel("VAF", fontsize=7)
+            style_axes(ax)
 
     fig.suptitle("VAF Distributions by Class", fontsize=11,
                  color=COLOR_PURPLE)
@@ -2495,7 +3235,7 @@ def plot_cross_class_vaf_histograms(metrics_df: pd.DataFrame,
 
 def plot_cross_class_snr_histograms(metrics_df: pd.DataFrame,
                                     output_dir) -> Path:
-    """3 subplots (one per head) of overlaid SNR histograms by class.
+    """SNR histograms with one row per class, one column per head.
 
     Args:
         metrics_df: DataFrame with ``head``, ``snr``, ``class_label``.
@@ -2513,20 +3253,29 @@ def plot_cross_class_snr_histograms(metrics_df: pd.DataFrame,
     heads = [h for h in _HEAD_NAMES if h in metrics_df["head"].unique()]
     classes = sorted(metrics_df["class_label"].unique())
     class_colors = get_class_colors(classes)
+    n_cls = len(classes)
 
-    fig, axes = plt.subplots(1, len(heads), figsize=(5 * len(heads), 4),
+    fig, axes = plt.subplots(n_cls, len(heads),
+                             figsize=(5 * len(heads), 3 * n_cls),
                              constrained_layout=True, squeeze=False)
 
-    for hi, head in enumerate(heads):
-        ax = axes[0, hi]
-        h_df = metrics_df[metrics_df["head"] == head]
-        data_dict = {
-            cls: h_df[h_df["class_label"] == cls]["snr"].dropna().values
-            for cls in classes
-        }
-        _overlaid_histograms(ax, data_dict, class_colors, xlabel="SNR (dB)")
-        ax.set_title(HEAD_LABELS.get(head, head), fontsize=9)
-        style_axes(ax)
+    for ri, cls in enumerate(classes):
+        for ci, head in enumerate(heads):
+            ax = axes[ri, ci]
+            vals = metrics_df[
+                (metrics_df["class_label"] == cls) &
+                (metrics_df["head"] == head)
+            ]["snr"].dropna().values
+            if len(vals) > 0:
+                ax.hist(vals, bins=40, alpha=0.7,
+                        color=class_colors.get(cls, COLOR_GRAY),
+                        edgecolor=COLOR_BLACK, linewidth=0.3, density=True)
+            if ri == 0:
+                ax.set_title(HEAD_LABELS.get(head, head), fontsize=9)
+            if ci == 0:
+                ax.set_ylabel(cls, fontsize=9, fontweight="bold")
+            ax.set_xlabel("SNR (dB)", fontsize=7)
+            style_axes(ax)
 
     fig.suptitle("SNR Distributions by Class", fontsize=11,
                  color=COLOR_PURPLE)
@@ -2536,7 +3285,7 @@ def plot_cross_class_snr_histograms(metrics_df: pd.DataFrame,
 
 def plot_cross_class_mse_histograms(metrics_df: pd.DataFrame,
                                     output_dir) -> Path:
-    """3x3 grid (head x horizon) of overlaid MSE histograms by class.
+    """MSE histograms with one row per class and columns for head x horizon.
 
     Args:
         metrics_df: DataFrame with ``head``, ``horizon``, ``mse``,
@@ -2556,31 +3305,36 @@ def plot_cross_class_mse_histograms(metrics_df: pd.DataFrame,
     horizons = sorted(metrics_df["horizon"].unique())
     classes = sorted(metrics_df["class_label"].unique())
     class_colors = get_class_colors(classes)
-    n_heads = len(heads)
-    n_hor = len(horizons)
+    n_cls = len(classes)
+    n_cols = len(heads) * len(horizons)
 
-    fig, axes = plt.subplots(n_heads, n_hor,
-                             figsize=(4 * n_hor, 3.5 * n_heads),
-                             constrained_layout=True)
-    if n_heads == 1 and n_hor == 1:
-        axes = np.array([[axes]])
-    elif n_heads == 1:
-        axes = axes[np.newaxis, :]
-    elif n_hor == 1:
-        axes = axes[:, np.newaxis]
+    fig, axes = plt.subplots(n_cls, n_cols,
+                             figsize=(3.5 * n_cols, 3 * n_cls),
+                             constrained_layout=True, squeeze=False)
 
-    for ri, head in enumerate(heads):
-        for ci, h in enumerate(horizons):
-            ax = axes[ri, ci]
-            h_df = metrics_df[(metrics_df["head"] == head) &
-                              (metrics_df["horizon"] == h)]
-            data_dict = {
-                cls: h_df[h_df["class_label"] == cls]["mse"].dropna().values
-                for cls in classes
-            }
-            _overlaid_histograms(ax, data_dict, class_colors, xlabel="MSE")
-            ax.set_title(f"{HEAD_LABELS.get(head, head)}, h={h}", fontsize=9)
-            style_axes(ax)
+    for ri, cls in enumerate(classes):
+        ci = 0
+        for head in heads:
+            for h in horizons:
+                ax = axes[ri, ci]
+                vals = metrics_df[
+                    (metrics_df["class_label"] == cls) &
+                    (metrics_df["head"] == head) &
+                    (metrics_df["horizon"] == h)
+                ]["mse"].dropna().values
+                if len(vals) > 0:
+                    ax.hist(vals, bins=40, alpha=0.7,
+                            color=class_colors.get(cls, COLOR_GRAY),
+                            edgecolor=COLOR_BLACK, linewidth=0.3,
+                            density=True)
+                if ri == 0:
+                    ax.set_title(f"{HEAD_LABELS.get(head, head)}, h={h}",
+                                 fontsize=8)
+                if ci == 0:
+                    ax.set_ylabel(cls, fontsize=9, fontweight="bold")
+                ax.set_xlabel("MSE", fontsize=7)
+                style_axes(ax)
+                ci += 1
 
     fig.suptitle("MSE Distributions by Class", fontsize=11,
                  color=COLOR_PURPLE)
@@ -2590,7 +3344,7 @@ def plot_cross_class_mse_histograms(metrics_df: pd.DataFrame,
 
 def plot_cross_class_loss_histograms(loss_df: pd.DataFrame,
                                      output_dir) -> Path:
-    """5 subplots (one per loss component) of overlaid histograms by class.
+    """Loss component histograms with one row per class, columns per component.
 
     Args:
         loss_df: DataFrame with ``class_label`` and loss columns
@@ -2613,20 +3367,27 @@ def plot_cross_class_loss_histograms(loss_df: pd.DataFrame,
 
     classes = sorted(loss_df["class_label"].unique())
     class_colors = get_class_colors(classes)
+    n_cls = len(classes)
     n_loss = len(loss_cols)
 
-    fig, axes = plt.subplots(1, n_loss, figsize=(4 * n_loss, 4),
+    fig, axes = plt.subplots(n_cls, n_loss,
+                             figsize=(4 * n_loss, 3 * n_cls),
                              constrained_layout=True, squeeze=False)
 
-    for li, lc in enumerate(loss_cols):
-        ax = axes[0, li]
-        data_dict = {
-            cls: loss_df[loss_df["class_label"] == cls][lc].dropna().values
-            for cls in classes
-        }
-        _overlaid_histograms(ax, data_dict, class_colors, xlabel=lc)
-        ax.set_title(lc, fontsize=9)
-        style_axes(ax)
+    for ri, cls in enumerate(classes):
+        for ci, lc in enumerate(loss_cols):
+            ax = axes[ri, ci]
+            vals = loss_df[loss_df["class_label"] == cls][lc].dropna().values
+            if len(vals) > 0:
+                ax.hist(vals, bins=40, alpha=0.7,
+                        color=class_colors.get(cls, COLOR_GRAY),
+                        edgecolor=COLOR_BLACK, linewidth=0.3, density=True)
+            if ri == 0:
+                ax.set_title(lc, fontsize=9)
+            if ci == 0:
+                ax.set_ylabel(cls, fontsize=9, fontweight="bold")
+            ax.set_xlabel(lc, fontsize=7)
+            style_axes(ax)
 
     fig.suptitle("Loss Component Distributions by Class", fontsize=11,
                  color=COLOR_PURPLE)
@@ -2636,7 +3397,7 @@ def plot_cross_class_loss_histograms(loss_df: pd.DataFrame,
 
 def plot_cross_class_kl_histograms(te_seg_df: pd.DataFrame,
                                    output_dir) -> Path:
-    """Single overlaid histogram of KL divergence by class.
+    """KL divergence histograms with one subplot per class (side by side).
 
     Args:
         te_seg_df: Segment-level TE DataFrame with ``kl_mean`` and
@@ -2654,16 +3415,28 @@ def plot_cross_class_kl_histograms(te_seg_df: pd.DataFrame,
     apply_publication_style()
     classes = sorted(te_seg_df["class_label"].unique())
     class_colors = get_class_colors(classes)
+    n_cls = len(classes)
 
-    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
-    data_dict = {
-        cls: te_seg_df[te_seg_df["class_label"] == cls][
+    fig, axes = plt.subplots(1, n_cls, figsize=(5 * n_cls, 4),
+                             constrained_layout=True, squeeze=False,
+                             sharey=True, sharex=True)
+
+    for ci, cls in enumerate(classes):
+        ax = axes[0, ci]
+        vals = te_seg_df[te_seg_df["class_label"] == cls][
             "kl_mean"].dropna().values
-        for cls in classes
-    }
-    _overlaid_histograms(ax, data_dict, class_colors, xlabel="KL Mean")
-    ax.set_title("KL Divergence Distribution by Class", fontsize=9, pad=6)
-    style_axes(ax)
+        if len(vals) > 0:
+            ax.hist(vals, bins=40, alpha=0.7,
+                    color=class_colors.get(cls, COLOR_GRAY),
+                    edgecolor=COLOR_BLACK, linewidth=0.3, density=True)
+        ax.set_title(cls, fontsize=9, fontweight="bold")
+        ax.set_xlabel("KL Mean", fontsize=8)
+        if ci == 0:
+            ax.set_ylabel("Density", fontsize=8)
+        style_axes(ax)
+
+    fig.suptitle("KL Divergence Distribution by Class", fontsize=11,
+                 color=COLOR_PURPLE)
     save_figure(fig, output_path)
     return output_path
 

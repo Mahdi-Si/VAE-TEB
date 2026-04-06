@@ -345,8 +345,23 @@ def run_cross_class_analysis(
         test_df = pd.concat(all_tests, ignore_index=True)
         test_df.to_csv(output_dir / "statistical_tests.csv", index=False)
 
-        _try_plot("significance_heatmap",
-                  plot_significance_heatmap, test_df, output_dir)
+        # Pivot long-format test_df to class x class p-value matrix
+        # Use Mann-Whitney results for the first metric as the heatmap
+        mw = test_df[test_df["test"] == "mann_whitney"]
+        if not mw.empty:
+            classes_sorted = sorted(set(mw["class_a"]) | set(mw["class_b"]))
+            n_cls = len(classes_sorted)
+            pval_matrix = np.ones((n_cls, n_cls))
+            cls_to_idx = {c: i for i, c in enumerate(classes_sorted)}
+            for _, row in mw.iterrows():
+                i, j = cls_to_idx[row["class_a"]], cls_to_idx[row["class_b"]]
+                pval_matrix[i, j] = row["p_value"]
+                pval_matrix[j, i] = row["p_value"]
+            pval_df = pd.DataFrame(
+                pval_matrix, index=classes_sorted, columns=classes_sorted
+            )
+            _try_plot("significance_heatmap",
+                      plot_significance_heatmap, pval_df, output_dir)
 
         # Effect sizes
         all_effects = []
@@ -355,8 +370,24 @@ def run_cross_class_analysis(
             all_effects.append(effects)
         effect_df = pd.concat(all_effects, ignore_index=True)
 
-        _try_plot("effect_size_heatmap",
-                  plot_effect_size_heatmap, effect_df, output_dir)
+        # Pivot to class x class Cohen's d matrix (use MAE as primary)
+        mae_effects = effect_df[effect_df["metric"] == "mae"]
+        if not mae_effects.empty:
+            classes_sorted = sorted(
+                set(mae_effects["class_a"]) | set(mae_effects["class_b"])
+            )
+            n_cls = len(classes_sorted)
+            d_matrix = np.zeros((n_cls, n_cls))
+            cls_to_idx = {c: i for i, c in enumerate(classes_sorted)}
+            for _, row in mae_effects.iterrows():
+                i, j = cls_to_idx[row["class_a"]], cls_to_idx[row["class_b"]]
+                d_matrix[i, j] = row["cohens_d"]
+                d_matrix[j, i] = -row["cohens_d"]
+            d_df = pd.DataFrame(
+                d_matrix, index=classes_sorted, columns=classes_sorted
+            )
+            _try_plot("effect_size_heatmap",
+                      plot_effect_size_heatmap, d_df, output_dir)
 
         # Classification on embeddings
         emb_data = {}
