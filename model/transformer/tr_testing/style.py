@@ -25,10 +25,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 COLOR_BLUE = "#3F72AF"
 COLOR_ORANGE = "#FFB200"
-COLOR_GREEN = "#609966"
+COLOR_GREEN = "#46D855"
 COLOR_SKY = "#00ADB5"
 COLOR_PURPLE = "#112D4E"
-COLOR_VERMILLION = "#EB5B00"
+COLOR_VERMILLION = "#F23F04"
 COLOR_GRAY = "#393E46"
 COLOR_BLACK = "#222831"
 COLOR_LIGHT_GRAY = "#EEEEEE"
