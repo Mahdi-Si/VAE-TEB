@@ -486,7 +486,7 @@ def _build_diagnostic_figure(
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
                 f"{val:.4f}", ha="center", va="bottom", fontsize=6)
     ax.set_title(
-        f"KL(posterior || prior) per Anchor (\u03b2={beta:.6f})",
+        f"KL(posterior || prior) per Anchor (\u03b2_transfer={beta:.6f})",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Anchor", fontsize=8)
@@ -497,22 +497,27 @@ def _build_diagnostic_figure(
     # ---- Window Embedding ----
     ax = axes[row]
     n_total = len(ewin_np)
-    # Component boundaries
+    # v2 component boundaries
+    d_z_s = config.d_z_self
+    d_z_t = config.d_z_transfer
     boundary_f = 2 * d
-    boundary_fu = boundary_f + 6 * d
-    boundary_te = n_total  # 2*d_z
+    boundary_fu = boundary_f + 10 * d
+    boundary_self = boundary_fu + 3 * d_z_s
 
     x_emb = np.arange(n_total)
     ax.bar(x_emb[:boundary_f], np.abs(ewin_np[:boundary_f]),
            color=COLOR_BLUE, alpha=0.7, width=1.0, label=f"e_F ({boundary_f}d)")
     ax.bar(x_emb[boundary_f:boundary_fu], np.abs(ewin_np[boundary_f:boundary_fu]),
            color=COLOR_ORANGE, alpha=0.7, width=1.0, label=f"e_FU ({boundary_fu - boundary_f}d)")
-    ax.bar(x_emb[boundary_fu:], np.abs(ewin_np[boundary_fu:]),
-           color=COLOR_GREEN, alpha=0.7, width=1.0, label=f"e_TE ({n_total - boundary_fu}d)")
+    ax.bar(x_emb[boundary_fu:boundary_self], np.abs(ewin_np[boundary_fu:boundary_self]),
+           color=COLOR_VERMILLION, alpha=0.7, width=1.0, label=f"e_self ({boundary_self - boundary_fu}d)")
+    ax.bar(x_emb[boundary_self:], np.abs(ewin_np[boundary_self:]),
+           color=COLOR_GREEN, alpha=0.7, width=1.0, label=f"e_TE ({n_total - boundary_self}d)")
 
     # Section dividers
     ax.axvline(boundary_f - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
     ax.axvline(boundary_fu - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.axvline(boundary_self - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
 
     ax.set_title("Window Embedding (e_win) \u2014 Component Magnitudes", fontsize=9, pad=6)
     ax.set_xlabel("Embedding Dimension", fontsize=8)
@@ -637,17 +642,20 @@ class TransformerPlotCallback(Callback):
         S_out = model.up_stem(U)
         H_F = model.fhr_encoder(F_out)
         H_U = model.up_encoder(S_out)
-        context = model.fusion.cross_attn(target=H_F, source=H_U)
+        context = model.fusion.cross_attns[0](target=H_F, source=H_U)
         gate = torch.sigmoid(
-            model.fusion.gate_proj(torch.cat([H_F, context], dim=-1))
+            model.fusion.gate_projs[0](torch.cat([H_F, context], dim=-1))
         )
 
         # --- Inference-mode forward (window embedding) ---
         inf_out = model(Y, U)
         e_win = inf_out["e_win"]
 
-        # Current beta
-        beta = getattr(pl_module, "_current_beta", 0.0)
+        # Current betas (v2: dual KL scheduling)
+        beta_transfer = getattr(pl_module, "_current_beta_transfer", 0.0)
+        beta_self = getattr(pl_module, "_current_beta_self", 0.0)
+        # Pass transfer beta for display (backward compat with figure builder)
+        beta = beta_transfer
 
         for s in range(num_samples):
             fig = _build_diagnostic_figure(
