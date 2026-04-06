@@ -317,8 +317,18 @@ def run_cross_class_analysis(
               plot_cross_class_loss_histograms, loss_df, output_dir)
     _try_plot("cross_class_kl_histograms",
               plot_cross_class_kl_histograms, te_seg_df, output_dir)
+    # Build summary table dict: {class: {metric: (mean, std)}}
+    summary_table = {}
+    for cls in metrics_df["class_label"].unique():
+        cls_df = metrics_df[metrics_df["class_label"] == cls]
+        cls_summary = {}
+        for metric in ("mae", "mse", "vaf", "snr"):
+            vals = cls_df[metric].dropna()
+            if len(vals) > 0:
+                cls_summary[metric] = (float(vals.mean()), float(vals.std()))
+        summary_table[cls] = cls_summary
     _try_plot("metric_summary_table",
-              plot_metric_summary_table, metrics_df, output_dir)
+              plot_metric_summary_table, summary_table, output_dir)
     _try_plot("class_mae_comparison",
               plot_class_mae_comparison, metrics_df, output_dir)
 

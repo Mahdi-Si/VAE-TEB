@@ -164,7 +164,9 @@ def collect_forecast_metrics(
                 mse = compute_per_anchor_mse(Y_hat, Y, anchors, g)
                 vaf = compute_per_anchor_vaf(Y_hat, Y, anchors, g)
                 snr = compute_per_anchor_snr(Y_hat, Y, anchors, g)
-                huber = compute_per_anchor_huber(Y_hat, Y, anchors, g)
+                huber = compute_per_anchor_huber(
+                    Y_hat, Y, anchors, g, runner.config.huber_delta
+                )
 
                 for h in runner.config.horizons:
                     # Average across anchors per segment
