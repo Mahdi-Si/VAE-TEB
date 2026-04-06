@@ -124,19 +124,53 @@ def run_dataset_stats_analysis(
     for class_name, loader in class_loaders.items():
         st_stats.append(_collect_st_stats(loader, class_name))
 
+    # Build dicts expected by visualizers from collected DataFrames/lists
+    plot_stats = {}
+    if not meta_df.empty:
+        plot_stats["samples_per_class"] = (
+            meta_df.groupby("class_label").size().to_dict()
+        )
+        plot_stats["guids_per_class"] = (
+            meta_df.groupby("class_label")["guid"].nunique().to_dict()
+        )
+        plot_stats["epochs_per_guid"] = (
+            meta_df.groupby("guid").size().tolist()
+        )
+        plot_stats["time_distribution"] = {
+            cls: grp["epoch_hours"].values
+            for cls, grp in meta_df.groupby("class_label")
+        }
+
+    st_plot_stats: Dict[str, Any] = {
+        "fhr_st_stats": {},
+        "up_st_stats": {},
+    }
+    for entry in st_stats:
+        cls = entry["class_label"]
+        if "fhr_st_mean" in entry:
+            st_plot_stats["fhr_st_stats"][cls] = {
+                "mean": entry["fhr_st_mean"],
+                "std": entry["fhr_st_std"],
+            }
+        if "up_st_mean" in entry:
+            st_plot_stats["up_st_stats"][cls] = {
+                "mean": entry["up_st_mean"],
+                "std": entry["up_st_std"],
+            }
+
     # Generate plots
     try:
-        plot_dataset_overview(meta_df, output_dir)
+        plot_dataset_overview(plot_stats, output_dir)
     except Exception as e:
         logger.warning(f"Dataset overview plot failed: {e}")
 
     try:
-        plot_time_distribution(meta_df, output_dir)
+        plot_time_distribution(plot_stats, output_dir)
     except Exception as e:
         logger.warning(f"Time distribution plot failed: {e}")
 
     try:
-        plot_st_coefficient_stats(st_stats, output_dir)
+        plot_st_coefficient_stats(st_plot_stats, output_dir)
     except Exception as e:
         logger.warning(f"ST coefficient stats plot failed: {e}")
 

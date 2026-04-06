@@ -191,20 +191,49 @@ def run_trajectory_analysis(
         except Exception as e:
             logger.warning(f"Plot {name} failed: {e}")
 
-    # Class-mean trajectories
+    # Build class-mean trajectory dicts for visualizers
     h_max = max(runner.config.horizons)
-    _try_plot("class_mean_kl",
-              plot_class_mean_trajectory, traj_df, output_dir,
-              metric="kl_mean")
-    _try_plot("class_mean_gate",
-              plot_class_mean_trajectory, traj_df, output_dir,
-              metric="mean_gate")
-    _try_plot(f"class_mean_mae_h{h_max}",
-              plot_class_mean_trajectory, traj_df, output_dir,
-              metric=f"mae_fused_h{h_max}")
-    _try_plot(f"class_mean_residual_h{h_max}",
-              plot_class_mean_trajectory, traj_df, output_dir,
-              metric=f"residual_norm_h{h_max}")
+
+    def _build_class_mean_dict(df, metric_col):
+        """Transform DataFrame to {class: {time, metric, sem}} dict."""
+        result = {}
+        for cls, grp in df.groupby("class_label"):
+            if metric_col not in grp.columns:
+                continue
+            # Bin by epoch_hours (1-hour bins)
+            grp = grp.dropna(subset=[metric_col])
+            if grp.empty:
+                continue
+            grp = grp.sort_values("epoch")
+            hours = grp["epoch"].values / 3600.0
+            vals = grp[metric_col].values
+            # Simple binned average
+            bin_edges = np.arange(np.floor(hours.min()), np.ceil(hours.max()) + 1, 1.0)
+            if len(bin_edges) < 2:
+                result[cls] = {"time": hours, "metric": vals, "sem": np.zeros_like(vals)}
+                continue
+            bin_idx = np.digitize(hours, bin_edges) - 1
+            bin_idx = np.clip(bin_idx, 0, len(bin_edges) - 2)
+            time_out, metric_out, sem_out = [], [], []
+            for b in range(len(bin_edges) - 1):
+                mask = bin_idx == b
+                if mask.sum() > 0:
+                    time_out.append((bin_edges[b] + bin_edges[b + 1]) / 2)
+                    metric_out.append(vals[mask].mean())
+                    sem_out.append(vals[mask].std() / max(np.sqrt(mask.sum()), 1))
+            result[cls] = {
+                "time": np.array(time_out),
+                "metric": np.array(metric_out),
+                "sem": np.array(sem_out),
+            }
+        return result
+
+    for metric_col in ["kl_mean", "mean_gate", f"mae_fused_h{h_max}",
+                        f"residual_norm_h{h_max}"]:
+        mean_dict = _build_class_mean_dict(traj_df, metric_col)
+        _try_plot(f"class_mean_{metric_col}",
+                  plot_class_mean_trajectory, mean_dict, output_dir,
+                  metric=metric_col)
 
     # Per-GUID trajectories (for GUIDs with enough epochs)
     guid_counts = traj_df.groupby("guid").size()
@@ -214,21 +243,53 @@ def run_trajectory_analysis(
     max_guid_plots = min(20, len(eligible_guids))
 
     for guid in eligible_guids[:max_guid_plots]:
-        guid_data = traj_df[traj_df["guid"] == guid]
+        gdf = traj_df[traj_df["guid"] == guid].sort_values("epoch")
+        # Transform DataFrame row to dict expected by plot_guid_trajectory
+        guid_dict = {
+            "guid": guid,
+            "class_label": gdf["class_label"].iloc[0],
+            "epochs": gdf["epoch"].values,
+            "e_win": np.array(gdf["e_win"].tolist()),
+        }
         _try_plot(
             f"guid_{guid[:8]}",
-            plot_guid_trajectory, guid_data, per_guid_dir,
+            plot_guid_trajectory, guid_dict, per_guid_dir,
         )
 
-    # Embedding drift
+    # Embedding drift — transform DataFrame to {class: array} dict
     drift_df = _compute_embedding_drift(traj_df)
     if not drift_df.empty:
+        drift_dict = {
+            cls: grp["drift_rate"].values
+            for cls, grp in drift_df.groupby("class_label")
+        }
         _try_plot("embedding_drift",
-                  plot_embedding_drift, drift_df, output_dir)
+                  plot_embedding_drift, drift_dict, output_dir)
 
-    # Cross-class trajectory comparison
+    # Cross-class trajectory comparison — build {class: {mean_proj, time}} dict
+    def _build_trajectory_comparison(df):
+        result = {}
+        for cls, grp in df.groupby("class_label"):
+            ewin_list = grp["e_win"].tolist()
+            if not ewin_list:
+                continue
+            ewin_arr = np.array(ewin_list)
+            # PCA to 2D
+            centered = ewin_arr - ewin_arr.mean(axis=0, keepdims=True)
+            try:
+                U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+                proj = centered @ Vt[:2].T
+            except np.linalg.LinAlgError:
+                proj = centered[:, :2]
+            result[cls] = {
+                "mean_proj": proj,
+                "time": grp["epoch"].values / 3600.0,
+            }
+        return result
+
+    traj_comp = _build_trajectory_comparison(traj_df)
     _try_plot("trajectory_comparison",
-              plot_trajectory_comparison, traj_df, output_dir)
+              plot_trajectory_comparison, traj_comp, output_dir)
 
     summary = {
         "plots": plots,

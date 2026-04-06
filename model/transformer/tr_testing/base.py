@@ -215,8 +215,9 @@ class TransformerTestRunner:
             if max_samples is not None and count + batch_size > max_samples:
                 # Trim batch to fit max_samples
                 trim = max_samples - count
-                for key in ("fhr_st", "up_st", "fhr", "up", "target",
-                            "weight", "guid", "epoch", "cs_label",
+                for key in ("fhr_st", "fhr_ph", "fhr_up_ph", "up_st",
+                            "fhr", "up", "target", "weight",
+                            "guid", "epoch", "cs_label",
                             "bg_label", "time_from_labor_onset"):
                     val = getattr(batch, key, None)
                     if val is not None:
