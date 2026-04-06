@@ -12,8 +12,8 @@ from typing import Any, Dict, Optional
 import pandas as pd
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..collectors import collect_forecast_metrics, collect_loss_components
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.collectors import collect_forecast_metrics, collect_loss_components
 
 
 def run_forecasting_analysis(
@@ -36,7 +36,7 @@ def run_forecasting_analysis(
     Returns:
         Summary dict with metrics DataFrames and figure paths.
     """
-    from ..visualizers import (
+    from model.transformer.tr_testing.visualizers import (
         plot_mae_histograms,
         plot_mae_boxplots_by_class,
         plot_head_comparison_scatter,

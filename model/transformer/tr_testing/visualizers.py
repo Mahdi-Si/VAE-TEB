@@ -34,7 +34,7 @@ try:
 except ImportError:
     HAS_MPL = False
 
-from .style import (
+from model.transformer.tr_testing.style import (
     apply_publication_style, style_axes, add_colorbar, heatmap, save_figure,
     get_class_colors, COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_SKY,
     COLOR_PURPLE, COLOR_VERMILLION, COLOR_GRAY, COLOR_BLACK, COLOR_LIGHT_GRAY,

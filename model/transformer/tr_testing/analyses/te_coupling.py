@@ -12,8 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..collectors import collect_te_latent_data
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.collectors import collect_te_latent_data
 
 
 def run_te_coupling_analysis(
@@ -36,7 +36,7 @@ def run_te_coupling_analysis(
     Returns:
         Summary dict with TE DataFrames and figure paths.
     """
-    from ..visualizers import (
+    from model.transformer.tr_testing.visualizers import (
         plot_kl_distributions,
         plot_kl_per_dimension,
         plot_kl_vs_anchor,
