@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..base import TransformerTestRunner
-from ..collectors import collect_embeddings, collect_gate_and_fusion
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.collectors import collect_embeddings, collect_gate_and_fusion
 
 
 def _compute_linear_separability(
@@ -125,7 +125,7 @@ def run_representation_analysis(
     Returns:
         Summary dict.
     """
-    from ..visualizers import (
+    from model.transformer.tr_testing.visualizers import (
         plot_embedding_projection,
         plot_embedding_norms,
         plot_fusion_distribution,

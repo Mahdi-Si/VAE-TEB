@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from ..base import TransformerTestRunner
+from model.transformer.tr_testing.base import TransformerTestRunner
 
 
 def run_all_analyses(
@@ -43,7 +43,7 @@ def run_all_analyses(
 
     # 1. Dataset statistics (no model needed)
     try:
-        from .dataset_stats import run_dataset_stats_analysis
+        from model.transformer.tr_testing.analyses.dataset_stats import run_dataset_stats_analysis
         logger.info("Running dataset statistics analysis...")
         results["dataset_stats"] = run_dataset_stats_analysis(
             class_loaders, runner.ensure_dir("dataset_stats")
@@ -54,7 +54,7 @@ def run_all_analyses(
 
     # 2. Forecasting analysis
     try:
-        from .forecasting import run_forecasting_analysis
+        from model.transformer.tr_testing.analyses.forecasting import run_forecasting_analysis
         logger.info("Running forecasting analysis...")
         results["forecasting"] = run_forecasting_analysis(
             runner, class_loaders, runner.ensure_dir("forecasting"),
@@ -66,7 +66,7 @@ def run_all_analyses(
 
     # 3. TE coupling analysis
     try:
-        from .te_coupling import run_te_coupling_analysis
+        from model.transformer.tr_testing.analyses.te_coupling import run_te_coupling_analysis
         logger.info("Running TE coupling analysis...")
         results["te_coupling"] = run_te_coupling_analysis(
             runner, class_loaders, runner.ensure_dir("te_coupling"),
@@ -78,7 +78,7 @@ def run_all_analyses(
 
     # 4. Representation analysis
     try:
-        from .representation import run_representation_analysis
+        from model.transformer.tr_testing.analyses.representation import run_representation_analysis
         logger.info("Running representation analysis...")
         results["representation"] = run_representation_analysis(
             runner, class_loaders, runner.ensure_dir("representation"),
@@ -91,7 +91,7 @@ def run_all_analyses(
     # 5. Trajectory analysis
     if not skip_trajectory and guid_loaders:
         try:
-            from .trajectory import run_trajectory_analysis
+            from model.transformer.tr_testing.analyses.trajectory import run_trajectory_analysis
             logger.info("Running trajectory analysis...")
             results["trajectory"] = run_trajectory_analysis(
                 runner, guid_loaders, runner.ensure_dir("trajectory"),
@@ -103,7 +103,7 @@ def run_all_analyses(
 
     # 6. Cross-class comparison
     try:
-        from .cross_class import run_cross_class_analysis
+        from model.transformer.tr_testing.analyses.cross_class import run_cross_class_analysis
         logger.info("Running cross-class analysis...")
         results["cross_class"] = run_cross_class_analysis(
             runner, class_loaders, runner.ensure_dir("cross_class"),
@@ -118,7 +118,7 @@ def run_all_analyses(
     # 7. Per-sample diagnostics
     if not skip_per_sample:
         try:
-            from .per_sample_diagnostics import run_per_sample_diagnostics
+            from model.transformer.tr_testing.analyses.per_sample_diagnostics import run_per_sample_diagnostics
             logger.info("Running per-sample diagnostics...")
             results["per_sample"] = run_per_sample_diagnostics(
                 runner, class_loaders,

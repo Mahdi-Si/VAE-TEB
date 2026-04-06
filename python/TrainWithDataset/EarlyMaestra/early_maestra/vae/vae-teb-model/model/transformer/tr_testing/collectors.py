@@ -17,8 +17,8 @@ import torch
 from loguru import logger
 from torch import Tensor
 
-from .base import TransformerTestRunner
-from .metrics import (
+from model.transformer.tr_testing.base import TransformerTestRunner
+from model.transformer.tr_testing.metrics import (
     compute_fusion_contribution,
     compute_gate_statistics,
     compute_kl_per_anchor,

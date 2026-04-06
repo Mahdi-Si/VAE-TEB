@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 from loguru import logger
 
-from .base import TransformerTestRunner
+from model.transformer.tr_testing.base import TransformerTestRunner
 
 
 def _create_class_loaders(
@@ -141,7 +141,7 @@ def run_full_test_pipeline(
     Returns:
         Summary dict with all results and figure paths.
     """
-    from .analyses import run_all_analyses
+    from model.transformer.tr_testing.analyses import run_all_analyses
 
     # Default output dir
     if output_dir is None:
