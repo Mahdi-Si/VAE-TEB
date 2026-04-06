@@ -516,8 +516,11 @@ def plot_sample_diagnostic(sample_data: dict, output_path, config) -> Path:
     # ---- Row 16: Window embedding components ----
     ax = fig.add_subplot(gs[row, :])
     n_total = len(e_win_np)
+    d_z_s = config.d_z_self
+    d_z_t = config.d_z_transfer
     boundary_f = 2 * d
-    boundary_fu = boundary_f + 6 * d
+    boundary_fu = boundary_f + 10 * d
+    boundary_self = boundary_fu + 3 * d_z_s
     x_emb = np.arange(n_total)
     ax.bar(x_emb[:boundary_f], np.abs(e_win_np[:boundary_f]),
            color=COLOR_BLUE, alpha=0.7, width=1.0,
@@ -526,12 +529,18 @@ def plot_sample_diagnostic(sample_data: dict, output_path, config) -> Path:
            np.abs(e_win_np[boundary_f:boundary_fu]),
            color=COLOR_ORANGE, alpha=0.7, width=1.0,
            label=f"e_FU ({boundary_fu - boundary_f}d)")
-    ax.bar(x_emb[boundary_fu:], np.abs(e_win_np[boundary_fu:]),
+    ax.bar(x_emb[boundary_fu:boundary_self],
+           np.abs(e_win_np[boundary_fu:boundary_self]),
+           color=COLOR_VERMILLION, alpha=0.7, width=1.0,
+           label=f"e_self ({boundary_self - boundary_fu}d)")
+    ax.bar(x_emb[boundary_self:], np.abs(e_win_np[boundary_self:]),
            color=COLOR_GREEN, alpha=0.7, width=1.0,
-           label=f"e_TE ({n_total - boundary_fu}d)")
+           label=f"e_TE ({n_total - boundary_self}d)")
     ax.axvline(boundary_f - 0.5, color=COLOR_BLACK, linewidth=0.8,
                linestyle="--", alpha=0.5)
     ax.axvline(boundary_fu - 0.5, color=COLOR_BLACK, linewidth=0.8,
+               linestyle="--", alpha=0.5)
+    ax.axvline(boundary_self - 0.5, color=COLOR_BLACK, linewidth=0.8,
                linestyle="--", alpha=0.5)
     ax.set_title("Window Embedding (e_win) -- Component Magnitudes",
                  fontsize=9, pad=6)
@@ -782,11 +791,13 @@ def plot_sample_latent_detail(sample_data: dict, output_path,
 
     # ---- Row 4 right: TE embedding decomposition ----
     ax_r = fig.add_subplot(gs[4, 1])
-    boundary_te = 8 * d
-    e_te = e_win_np[boundary_te:]  # (2*d_z,)
+    d_z_s = config.d_z_self
+    d_z_t = config.d_z_transfer
+    boundary_te = 12 * d + 3 * d_z_s
+    e_te = e_win_np[boundary_te:]  # (4*d_z_t + 2,)
     d_z2 = len(e_te) // 2
     ax_r.bar(np.arange(d_z2), e_te[:d_z2], color=COLOR_BLUE, alpha=0.7,
-             label="e_TE mean", edgecolor=COLOR_BLACK, linewidth=0.2)
+             label="e_TE first half", edgecolor=COLOR_BLACK, linewidth=0.2)
     ax_r.bar(np.arange(d_z2, 2 * d_z2), e_te[d_z2:], color=COLOR_GREEN,
              alpha=0.7, label="e_TE max", edgecolor=COLOR_BLACK,
              linewidth=0.2)
@@ -1287,11 +1298,12 @@ def plot_error_vs_time(metrics_df: pd.DataFrame, output_dir) -> Path:
 
 
 def plot_loss_decomposition(loss_df: pd.DataFrame, output_dir) -> Path:
-    """Stacked bars: L_fus, L_delta, L_self, L_te, L_kl per class.
+    """Stacked bars: all loss components per class.
 
     Args:
         loss_df: DataFrame with columns ``class_label``, ``L_fus``,
-            ``L_delta``, ``L_self``, ``L_te``, ``L_kl``.
+            ``L_delta``, ``L_delta2``, ``L_spectral``, ``L_self``,
+            ``L_te``, ``L_kl_self``, ``L_kl_transfer``.
         output_dir: Directory to save the figure.
 
     Returns:
@@ -1302,12 +1314,13 @@ def plot_loss_decomposition(loss_df: pd.DataFrame, output_dir) -> Path:
         return output_path
 
     apply_publication_style()
-    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
 
     classes = sorted(loss_df["class_label"].unique())
-    loss_components = ["L_fus", "L_delta", "L_self", "L_te", "L_kl"]
-    component_colors = [COLOR_BLUE, COLOR_ORANGE, COLOR_SKY, COLOR_GREEN,
-                        COLOR_PURPLE]
+    loss_components = ["L_fus", "L_delta", "L_delta2", "L_spectral",
+                       "L_self", "L_te", "L_kl_self", "L_kl_transfer"]
+    component_colors = [COLOR_BLUE, COLOR_ORANGE, COLOR_SAGE, COLOR_GRAY,
+                        COLOR_SKY, COLOR_GREEN, COLOR_PURPLE, COLOR_VERMILLION]
     available = [c for c in loss_components if c in loss_df.columns]
 
     x = np.arange(len(classes))
@@ -3348,7 +3361,8 @@ def plot_cross_class_loss_histograms(loss_df: pd.DataFrame,
 
     Args:
         loss_df: DataFrame with ``class_label`` and loss columns
-            ``L_fus``, ``L_delta``, ``L_self``, ``L_te``, ``L_kl``.
+            ``L_fus``, ``L_delta``, ``L_delta2``, ``L_spectral``,
+            ``L_self``, ``L_te``, ``L_kl_self``, ``L_kl_transfer``.
         output_dir: Directory to save the figure.
 
     Returns:
@@ -3360,7 +3374,8 @@ def plot_cross_class_loss_histograms(loss_df: pd.DataFrame,
         return output_path
 
     apply_publication_style()
-    loss_cols = [c for c in ["L_fus", "L_delta", "L_self", "L_te", "L_kl"]
+    loss_cols = [c for c in ["L_fus", "L_delta", "L_delta2", "L_spectral",
+                              "L_self", "L_te", "L_kl_self", "L_kl_transfer"]
                  if c in loss_df.columns]
     if not loss_cols:
         return output_path

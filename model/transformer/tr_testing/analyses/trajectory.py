@@ -114,9 +114,13 @@ def _collect_guid_trajectories(
                 .reshape(B, K, d_z).mean(dim=1).cpu().numpy()
             )  # (B, d_z)
 
-            # TE component of embedding (last 2*d_z dims of e_win)
-            boundary_te = 8 * runner.config.d_model
-            e_te = e_win[:, boundary_te:]  # (B, 2*d_z)
+            # TE component of embedding (v2 layout)
+            d_z_s = runner.config.d_z_self
+            d_z_t = runner.config.d_z_transfer
+            boundary_te = (
+                12 * runner.config.d_model + 3 * d_z_s
+            )
+            e_te = e_win[:, boundary_te:]  # (B, 4*d_z_t + 2)
 
             # Self-only MAE for comparison with fused
             self_mae = compute_per_anchor_mae(

@@ -290,16 +290,16 @@ class TransformerTestRunner:
         H_F = model.fhr_encoder(F_out)  # (B, T, d)
         H_U = model.up_encoder(S_out)   # (B, T, d)
 
-        # Cross-attention and gating
-        context = model.fusion.cross_attn(target=H_F, source=H_U)
+        # Cross-attention and gating (first fusion layer for diagnostics)
+        context = model.fusion.cross_attns[0](target=H_F, source=H_U)
         gate = torch.sigmoid(
-            model.fusion.gate_proj(
+            model.fusion.gate_projs[0](
                 torch.cat([H_F, context], dim=-1)
             )
         )
 
-        # Fused encoder
-        H_tilde = H_F + gate * context
+        # Full fusion (all layers) + fused encoder
+        H_tilde = model.fusion(H_F, H_U)
         H_FU = model.fused_encoder(H_tilde)
 
         return {
@@ -324,8 +324,9 @@ class TransformerTestRunner:
             beta: KL weight (default 0 for test — just report raw L_kl).
 
         Returns:
-            Dictionary with ``L_fus``, ``L_delta``, ``L_self``, ``L_te``,
-            ``L_kl``, ``total_loss`` (without beta*L_kl).
+            Dictionary with ``L_fus``, ``L_delta``, ``L_delta2``,
+            ``L_spectral``, ``L_self``, ``L_te``, ``L_kl_self``,
+            ``L_kl_transfer``, ``total_loss`` (without beta*L_kl).
         """
         return self.loss_fn(outputs, Y)
 
