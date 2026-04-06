@@ -1,9 +1,9 @@
-"""PyTorch Lightning wrapper for the Causal Multimodal Forecasting Transformer.
+"""PyTorch Lightning wrapper for the Causal Multimodal Forecasting Transformer (v2).
 
 Implements the 3-stage training schedule from model.md §19:
-    - Stage 1: Deterministic warm start (L_fus + L_delta + L_self only).
-    - Stage 2: Activate TE residual head (add L_te, beta still 0).
-    - Stage 3: KL warmup (ramp beta from 0 to beta_max).
+    - Stage 1: Deterministic warm start (L_fus + L_delta + L_delta2 + L_spectral + L_self only).
+    - Stage 2: Activate TE residual head (add L_te, beta_self ramps, beta_transfer=0).
+    - Stage 3: Full KL warmup (both beta_self and beta_transfer ramp to their maxes).
 """
 
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -22,10 +22,16 @@ from train.pl_model_base import LightningModelBase
 
 
 class PlCausalTransformer(LightningModelBase):
-    """Lightning module for self-supervised pretraining of the causal transformer.
+    """Lightning module for self-supervised pretraining of the causal transformer (v2).
 
     Wraps ``CausalMultimodalTransformer`` and ``CausalTransformerLoss``, handles
-    anchor sampling, 3-stage training schedule, and per-step KL beta warmup.
+    anchor sampling, 3-stage training schedule, and per-step dual KL beta warmup.
+
+    v2 changes:
+        - Dual KL scheduling: ``beta_self`` for z_self and ``beta_transfer`` for z_transfer.
+        - ``beta_self`` starts ramping in Stage 2 (z_self benefits from early regularization).
+        - ``beta_transfer`` ramps only in Stage 3 (same as v1's single beta).
+        - Logs additional metrics: L_delta2, L_spectral, L_kl_self, L_kl_transfer.
 
     Args:
         base_model: The raw ``CausalMultimodalTransformer`` module.
@@ -36,13 +42,14 @@ class PlCausalTransformer(LightningModelBase):
         lr_milestones: Epoch milestones for MultiStepLR decay.
         weight_decay: AdamW weight decay.
         stage1_epochs: Number of epochs for Stage 1 (deterministic warm start).
-        stage2_epochs: Number of epochs for Stage 2 (TE head active, no KL).
-        stage3_epochs: Number of epochs for Stage 3 (KL warmup).
-        beta_max: Maximum KL weight reached at end of warmup.
-        warmup_steps: Number of training steps over which beta ramps in Stage 3.
+        stage2_epochs: Number of epochs for Stage 2 (TE head active, beta_self ramps).
+        stage3_epochs: Number of epochs for Stage 3 (both betas ramp).
+        beta_max_self: Maximum KL weight for z_self.
+        beta_max_transfer: Maximum KL weight for z_transfer.
+        warmup_steps: Number of training steps over which betas ramp.
     """
 
-    prog_bar_metrics = ("total_loss", "L_fus", "beta")
+    prog_bar_metrics = ("total_loss", "L_fus", "beta_transfer")
 
     def __init__(
         self,
@@ -50,14 +57,17 @@ class PlCausalTransformer(LightningModelBase):
         loss_fn: CausalTransformerLoss,
         transformer_config: TransformerConfig,
         *,
-        lr: float = 1e-4,
+        lr: float = 8e-5,
         lr_milestones: Optional[Iterable[int]] = None,
         weight_decay: float = 1e-4,
-        stage1_epochs: int = 50,
-        stage2_epochs: int = 50,
-        stage3_epochs: int = 200,
-        beta_max: float = 1e-4,
-        warmup_steps: int = 5000,
+        stage1_epochs: int = 60,
+        stage2_epochs: int = 60,
+        stage3_epochs: int = 180,
+        beta_max_self: float = 5e-4,
+        beta_max_transfer: float = 2e-4,
+        warmup_steps: int = 8000,
+        # Legacy compat: accept beta_max and map to beta_max_transfer
+        beta_max: Optional[float] = None,
     ) -> None:
         super().__init__(
             base_model,
@@ -70,14 +80,20 @@ class PlCausalTransformer(LightningModelBase):
         self._transformer_config = transformer_config
         self._original_lambda_te = transformer_config.lambda_te
 
+        # Handle legacy beta_max -> beta_max_transfer
+        if beta_max is not None and beta_max_transfer == 2e-4:
+            beta_max_transfer = beta_max
+
         # Save schedule hparams (accessible via self.hparams.*)
         self.save_hyperparameters(
-            ignore=["base_model", "loss_fn", "transformer_config"],
+            ignore=["base_model", "loss_fn", "transformer_config", "beta_max"],
         )
 
         # Stage tracking state
         self._current_stage: int = 1
-        self._current_beta: float = 0.0
+        self._current_beta_self: float = 0.0
+        self._current_beta_transfer: float = 0.0
+        self._stage2_global_step: Optional[int] = None
         self._stage3_global_step: Optional[int] = None
 
     # ------------------------------------------------------------------
@@ -111,16 +127,25 @@ class PlCausalTransformer(LightningModelBase):
         outputs = self.model(Y, U, anchor_indices=anchors)
         losses = self.loss_fn(outputs, Y)
 
-        total = losses["total_loss"] + self._current_beta * losses["L_kl"]
+        # Apply dual KL weights
+        total = (
+            losses["total_loss"]
+            + self._current_beta_self * losses["L_kl_self"]
+            + self._current_beta_transfer * losses["L_kl_transfer"]
+        )
 
         metrics = {
             "total_loss": total,
             "L_fus": losses["L_fus"],
             "L_delta": losses["L_delta"],
+            "L_delta2": losses["L_delta2"],
+            "L_spectral": losses["L_spectral"],
             "L_self": losses["L_self"],
             "L_te": losses["L_te"],
-            "L_kl": losses["L_kl"],
-            "beta": self._current_beta,
+            "L_kl_self": losses["L_kl_self"],
+            "L_kl_transfer": losses["L_kl_transfer"],
+            "beta_self": self._current_beta_self,
+            "beta_transfer": self._current_beta_transfer,
             "stage": float(self._current_stage),
         }
         return total, metrics
@@ -160,11 +185,15 @@ class PlCausalTransformer(LightningModelBase):
         """Transition between training stages at epoch boundaries.
 
         Stage 1 (epoch < stage1_epochs):
-            lambda_te = 0, beta = 0.  Only fused + dynamics + self-only losses.
+            lambda_te = 0, beta_self = 0, beta_transfer = 0.
+            Only fused + dynamics + self-only losses.
+
         Stage 2 (epoch < stage1 + stage2):
-            lambda_te restored, beta = 0.  TE head active but no KL pressure.
+            lambda_te restored, beta_self ramps, beta_transfer = 0.
+            TE head active, z_self gets early KL regularization.
+
         Stage 3 (remaining epochs):
-            lambda_te restored, beta ramps via on_train_batch_start.
+            lambda_te restored, both betas ramp to their maxes.
         """
         epoch = self.current_epoch
         s1 = self.hparams.stage1_epochs
@@ -173,11 +202,14 @@ class PlCausalTransformer(LightningModelBase):
         if epoch < s1:
             new_stage = 1
             self._transformer_config.lambda_te = 0.0
-            self._current_beta = 0.0
+            self._current_beta_self = 0.0
+            self._current_beta_transfer = 0.0
         elif epoch < s2:
             new_stage = 2
             self._transformer_config.lambda_te = self._original_lambda_te
-            self._current_beta = 0.0
+            self._current_beta_transfer = 0.0
+            if self._stage2_global_step is None:
+                self._stage2_global_step = self.global_step
         else:
             new_stage = 3
             self._transformer_config.lambda_te = self._original_lambda_te
@@ -192,17 +224,28 @@ class PlCausalTransformer(LightningModelBase):
         self._current_stage = new_stage
 
     def on_train_batch_start(self, batch, batch_idx: int) -> None:
-        """Update KL beta with step-level granularity during Stage 3.
+        """Update KL betas with step-level granularity.
+
+        Stage 2: beta_self ramps, beta_transfer stays 0.
+        Stage 3: both beta_self and beta_transfer ramp.
 
         Args:
             batch: Current training batch (unused).
             batch_idx: Index of the current batch (unused).
         """
+        warmup = max(self.hparams.warmup_steps, 1)
+
+        if self._current_stage == 2 and self._stage2_global_step is not None:
+            steps_in_stage2 = self.global_step - self._stage2_global_step
+            self._current_beta_self = self.hparams.beta_max_self * min(
+                1.0, steps_in_stage2 / warmup
+            )
+
         if self._current_stage == 3 and self._stage3_global_step is not None:
             steps_in_stage3 = self.global_step - self._stage3_global_step
-            self._current_beta = self.hparams.beta_max * min(
-                1.0, steps_in_stage3 / max(self.hparams.warmup_steps, 1)
-            )
+            ramp = min(1.0, steps_in_stage3 / warmup)
+            self._current_beta_self = self.hparams.beta_max_self * ramp
+            self._current_beta_transfer = self.hparams.beta_max_transfer * ramp
 
     # ------------------------------------------------------------------
     # Checkpoint state (survives resume)
@@ -216,7 +259,9 @@ class PlCausalTransformer(LightningModelBase):
         """
         checkpoint["stage_state"] = {
             "current_stage": self._current_stage,
-            "current_beta": self._current_beta,
+            "current_beta_self": self._current_beta_self,
+            "current_beta_transfer": self._current_beta_transfer,
+            "stage2_global_step": self._stage2_global_step,
             "stage3_global_step": self._stage3_global_step,
             "original_lambda_te": self._original_lambda_te,
         }
@@ -231,10 +276,22 @@ class PlCausalTransformer(LightningModelBase):
         if state is None:
             logger.info("No stage_state in checkpoint; starting fresh.")
             return
+
         self._current_stage = state["current_stage"]
-        self._current_beta = state["current_beta"]
-        self._stage3_global_step = state["stage3_global_step"]
         self._original_lambda_te = state["original_lambda_te"]
+
+        # Handle v1 checkpoint format (single beta)
+        if "current_beta" in state:
+            self._current_beta_transfer = state["current_beta"]
+            self._current_beta_self = 0.0
+            self._stage2_global_step = None
+            self._stage3_global_step = state.get("stage3_global_step")
+        else:
+            self._current_beta_self = state["current_beta_self"]
+            self._current_beta_transfer = state["current_beta_transfer"]
+            self._stage2_global_step = state.get("stage2_global_step")
+            self._stage3_global_step = state.get("stage3_global_step")
+
         # Apply the restored stage immediately
         if self._current_stage < 2:
             self._transformer_config.lambda_te = 0.0
@@ -242,6 +299,8 @@ class PlCausalTransformer(LightningModelBase):
             self._transformer_config.lambda_te = self._original_lambda_te
         logger.info(
             f"Restored stage state from checkpoint: stage={self._current_stage}, "
-            f"beta={self._current_beta:.6f}, "
+            f"beta_self={self._current_beta_self:.6f}, "
+            f"beta_transfer={self._current_beta_transfer:.6f}, "
+            f"stage2_global_step={self._stage2_global_step}, "
             f"stage3_global_step={self._stage3_global_step}"
         )

@@ -12,7 +12,8 @@ class TransformerConfig:
         d_model: Backbone hidden dimension (width of all internal representations).
         d_f: Number of FHR scattering-transform input channels.
         d_u: Number of UP scattering-transform input channels.
-        d_z: TE latent dimension.
+        d_z_self: Intrinsic FHR latent dimension (z_self).
+        d_z_transfer: TE coupling latent dimension (z_transfer, formerly d_z).
         n_heads: Number of attention heads in all multi-head attention layers.
         dropout: Dropout probability used throughout the model.
         stem_num_blocks: Number of residual causal-convolution blocks per stem.
@@ -22,6 +23,7 @@ class TransformerConfig:
         fhr_encoder_layers: Number of causal transformer blocks in the FHR-only encoder.
         up_encoder_layers: Number of causal transformer blocks in the UP-only encoder.
         fused_encoder_layers: Number of causal transformer blocks in the fused encoder.
+        fusion_layers: Number of stacked cross-attention fusion layers.
         ff_expansion: Feed-forward expansion ratio in transformer blocks.
         seq_len: Effective sequence length T (after trimming).
         ctx_len: Local context length L_ctx for anchor-based pooling.
@@ -31,19 +33,25 @@ class TransformerConfig:
         num_anchors: Number of anchors K sampled per window during training.
         anchor_uniform_ratio: Fraction of anchors drawn uniformly (rest activity-biased).
         lambda_fus: Weight for the main fused forecasting loss.
-        lambda_delta: Weight for the dynamics (temporal difference) loss.
+        lambda_delta: Weight for the dynamics (first-order temporal difference) loss.
+        lambda_delta2: Weight for the second-order dynamics (acceleration) loss.
+        lambda_spectral: Weight for the spectral consistency loss.
         lambda_self: Weight for the self-only baseline loss.
         lambda_te: Weight for the TE residual loss.
         huber_delta: Threshold delta for the Huber loss.
+        free_bits: Per-dimension KL floor in nats (prevents posterior collapse).
+        use_swiglu: Whether to use SwiGLU feed-forward networks instead of GELU.
+        use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
         gradient_checkpointing: Whether to use gradient checkpointing in encoder blocks.
     """
 
     # --- Dimensions ---
-    d_model: int = 192
+    d_model: int = 256
     d_f: int = 43
     d_u: int = 43
-    d_z: int = 16
-    n_heads: int = 4
+    d_z_self: int = 32
+    d_z_transfer: int = 16
+    n_heads: int = 8
     dropout: float = 0.1
 
     # --- Stems ---
@@ -53,9 +61,10 @@ class TransformerConfig:
     stem_expansion: int = 2
 
     # --- Encoders ---
-    fhr_encoder_layers: int = 4
-    up_encoder_layers: int = 4
-    fused_encoder_layers: int = 4
+    fhr_encoder_layers: int = 6
+    up_encoder_layers: int = 3
+    fused_encoder_layers: int = 6
+    fusion_layers: int = 2
     ff_expansion: int = 4
 
     # --- Sequence / Anchors / Prediction ---
@@ -64,18 +73,32 @@ class TransformerConfig:
     guard_gap: int = 4
     horizons: Tuple[int, ...] = (8, 15, 30)
     horizon_weights: Tuple[float, ...] = (1.0, 1.5, 2.0)
-    num_anchors: int = 4
+    num_anchors: int = 8
     anchor_uniform_ratio: float = 0.5
 
     # --- Loss weights ---
     lambda_fus: float = 1.0
     lambda_delta: float = 0.5
-    lambda_self: float = 0.25
+    lambda_delta2: float = 0.125
+    lambda_spectral: float = 0.15
+    lambda_self: float = 0.35
     lambda_te: float = 0.25
     huber_delta: float = 1.0
 
+    # --- Latent ---
+    free_bits: float = 0.1
+
+    # --- Architecture options ---
+    use_swiglu: bool = True
+    use_rmsnorm: bool = True
+
     # --- Efficiency ---
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
+
+    @property
+    def d_z(self) -> int:
+        """Backward-compatible alias for d_z_transfer."""
+        return self.d_z_transfer
 
     @property
     def d_head(self) -> int:
@@ -135,4 +158,16 @@ class TransformerConfig:
         )
         assert 0.0 <= self.anchor_uniform_ratio <= 1.0, (
             f"anchor_uniform_ratio ({self.anchor_uniform_ratio}) must be in [0, 1]."
+        )
+        assert self.d_z_self > 0, (
+            f"d_z_self ({self.d_z_self}) must be positive."
+        )
+        assert self.d_z_transfer > 0, (
+            f"d_z_transfer ({self.d_z_transfer}) must be positive."
+        )
+        assert self.free_bits >= 0.0, (
+            f"free_bits ({self.free_bits}) must be non-negative."
+        )
+        assert self.fusion_layers >= 1, (
+            f"fusion_layers ({self.fusion_layers}) must be >= 1."
         )
