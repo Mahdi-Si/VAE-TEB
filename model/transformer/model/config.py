@@ -12,8 +12,10 @@ class TransformerConfig:
         d_model: Backbone hidden dimension (width of all internal representations).
         d_f: Number of FHR scattering-transform input channels.
         d_u: Number of UP scattering-transform input channels.
-        d_z_self: Intrinsic FHR latent dimension (z_self).
-        d_z_transfer: TE coupling latent dimension (z_transfer, formerly d_z).
+        d_z_self: Deprecated compatibility field from the experimental v2 path.
+            It is unused by the default document-aligned model.
+        d_z_transfer: TE coupling latent dimension (the only latent in the
+            default document-aligned model).
         n_heads: Number of attention heads in all multi-head attention layers.
         dropout: Dropout probability used throughout the model.
         stem_num_blocks: Number of residual causal-convolution blocks per stem.
@@ -34,24 +36,24 @@ class TransformerConfig:
         anchor_uniform_ratio: Fraction of anchors drawn uniformly (rest activity-biased).
         lambda_fus: Weight for the main fused forecasting loss.
         lambda_delta: Weight for the dynamics (first-order temporal difference) loss.
-        lambda_delta2: Weight for the second-order dynamics (acceleration) loss.
-        lambda_spectral: Weight for the spectral consistency loss.
+        lambda_delta2: Optional legacy extension weight. Defaults to 0.0.
+        lambda_spectral: Optional legacy extension weight. Defaults to 0.0.
         lambda_self: Weight for the self-only baseline loss.
         lambda_te: Weight for the TE residual loss.
         huber_delta: Threshold delta for the Huber loss.
-        free_bits: Per-dimension KL floor in nats (prevents posterior collapse).
+        free_bits: Optional legacy extension for the TE KL term. Defaults to 0.0.
         use_swiglu: Whether to use SwiGLU feed-forward networks instead of GELU.
         use_rmsnorm: Whether to use RMSNorm instead of LayerNorm.
         gradient_checkpointing: Whether to use gradient checkpointing in encoder blocks.
     """
 
     # --- Dimensions ---
-    d_model: int = 256
+    d_model: int = 192
     d_f: int = 43
     d_u: int = 43
-    d_z_self: int = 32
+    d_z_self: int = 0
     d_z_transfer: int = 16
-    n_heads: int = 8
+    n_heads: int = 4
     dropout: float = 0.1
 
     # --- Stems ---
@@ -61,10 +63,10 @@ class TransformerConfig:
     stem_expansion: int = 2
 
     # --- Encoders ---
-    fhr_encoder_layers: int = 6
-    up_encoder_layers: int = 3
-    fused_encoder_layers: int = 6
-    fusion_layers: int = 2
+    fhr_encoder_layers: int = 4
+    up_encoder_layers: int = 4
+    fused_encoder_layers: int = 4
+    fusion_layers: int = 1
     ff_expansion: int = 4
 
     # --- Sequence / Anchors / Prediction ---
@@ -73,27 +75,27 @@ class TransformerConfig:
     guard_gap: int = 4
     horizons: Tuple[int, ...] = (8, 15, 30)
     horizon_weights: Tuple[float, ...] = (1.0, 1.5, 2.0)
-    num_anchors: int = 8
+    num_anchors: int = 4
     anchor_uniform_ratio: float = 0.5
 
     # --- Loss weights ---
     lambda_fus: float = 1.0
     lambda_delta: float = 0.5
-    lambda_delta2: float = 0.125
-    lambda_spectral: float = 0.15
-    lambda_self: float = 0.35
+    lambda_delta2: float = 0.0
+    lambda_spectral: float = 0.0
+    lambda_self: float = 0.25
     lambda_te: float = 0.25
     huber_delta: float = 1.0
 
     # --- Latent ---
-    free_bits: float = 0.1
+    free_bits: float = 0.0
 
     # --- Architecture options ---
-    use_swiglu: bool = True
-    use_rmsnorm: bool = True
+    use_swiglu: bool = False
+    use_rmsnorm: bool = False
 
     # --- Efficiency ---
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
 
     @property
     def d_z(self) -> int:
@@ -159,8 +161,8 @@ class TransformerConfig:
         assert 0.0 <= self.anchor_uniform_ratio <= 1.0, (
             f"anchor_uniform_ratio ({self.anchor_uniform_ratio}) must be in [0, 1]."
         )
-        assert self.d_z_self > 0, (
-            f"d_z_self ({self.d_z_self}) must be positive."
+        assert self.d_z_self >= 0, (
+            f"d_z_self ({self.d_z_self}) must be non-negative."
         )
         assert self.d_z_transfer > 0, (
             f"d_z_transfer ({self.d_z_transfer}) must be positive."
