@@ -78,12 +78,8 @@ class CausalTransformerTrainer(GraphModelBase):
         stage1 = schedule.get("stage1_epochs", 60)
         stage2 = schedule.get("stage2_epochs", 60)
         stage3 = schedule.get("stage3_epochs", 180)
-        # v2: dual KL scheduling (with v1 fallback)
-        beta_max_self = schedule.get("beta_max_self", 5e-4)
-        beta_max_transfer = schedule.get(
-            "beta_max_transfer", schedule.get("beta_max", 2e-4),
-        )
-        warmup_steps = schedule.get("warmup_steps", 8000)
+        beta_max = schedule.get("beta_max", schedule.get("beta_max_transfer", 1e-4))
+        warmup_steps = schedule.get("warmup_steps", 5000)
 
         # Override total epochs
         self.epochs_num = stage1 + stage2 + stage3
@@ -99,8 +95,7 @@ class CausalTransformerTrainer(GraphModelBase):
             stage1_epochs=stage1,
             stage2_epochs=stage2,
             stage3_epochs=stage3,
-            beta_max_self=beta_max_self,
-            beta_max_transfer=beta_max_transfer,
+            beta_max=beta_max,
             warmup_steps=warmup_steps,
         )
 
@@ -114,7 +109,6 @@ class CausalTransformerTrainer(GraphModelBase):
                     + transformer_config.up_encoder_layers
                     + transformer_config.fused_encoder_layers
                 ),
-                "d_z_self": transformer_config.d_z_self,
                 "d_z_transfer": transformer_config.d_z_transfer,
                 "fusion_layers": transformer_config.fusion_layers,
                 "dropout": transformer_config.dropout,
@@ -123,11 +117,9 @@ class CausalTransformerTrainer(GraphModelBase):
                 "stage1_epochs": stage1,
                 "stage2_epochs": stage2,
                 "stage3_epochs": stage3,
-                "beta_max_self": beta_max_self,
-                "beta_max_transfer": beta_max_transfer,
+                "beta_max": beta_max,
                 "warmup_steps": warmup_steps,
                 "total_epochs": self.epochs_num,
-                "free_bits": transformer_config.free_bits,
                 "use_swiglu": transformer_config.use_swiglu,
                 "use_rmsnorm": transformer_config.use_rmsnorm,
                 "gradient_checkpointing": transformer_config.gradient_checkpointing,
@@ -145,8 +137,7 @@ class CausalTransformerTrainer(GraphModelBase):
             "stage1_epochs": stage1,
             "stage2_epochs": stage2,
             "stage3_epochs": stage3,
-            "beta_max_self": beta_max_self,
-            "beta_max_transfer": beta_max_transfer,
+            "beta_max": beta_max,
             "warmup_steps": warmup_steps,
         }
 

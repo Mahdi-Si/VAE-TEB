@@ -1,148 +1,115 @@
 # =============================================================================
-# Causal Multimodal Forecasting Transformer v2 — Training Configuration
+# Causal Multimodal Forecasting Transformer — Training Configuration
 # =============================================================================
-# See model/transformer/model/IMPLEMENTATION.md for full documentation.
+# See model/transformer/model.md for the source-of-truth architecture.
 # Run: python -m model.transformer.training.trainer --config model/transformer/config.yaml
 
 general_config:
-  tag: causal_transformer_pretraining_v2
-  cuda_devices: [0]                  # GPU IDs; e.g. [0,1,2,3] for multi-GPU DDP
-  lr: 8.0e-5                         # AdamW learning rate (lower for larger model)
-  weight_decay: 1.0e-4               # AdamW weight decay
-  lr_milestone: []                    # Epoch milestones for MultiStepLR (empty = no decay)
-  epochs: 300                         # Overridden by sum of training_schedule stages
+  tag: causal_transformer_pretraining
+  cuda_devices: [0]
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  lr_milestone: []
+  epochs: 300
   batch_size:
-    train: 48                         # Smaller due to larger model
+    train: 48
     test: 48
-  accumulate_grad_batches: 3          # Effective batch = batch_size * accumulate * num_gpus
+  accumulate_grad_batches: 3
   checkpoint_frequency: 10
-  plot_frequency: 5                   # Plot metrics every N epochs
+  plot_frequency: 5
   folders_config:
-    out_dir_base: ./output/transformer_pretraining_v2
+    out_dir_base: ./output/transformer_pretraining
 
 
-# =============================================================================
-# Model architecture (maps to TransformerConfig dataclass fields)
-# =============================================================================
 model_config:
   transformer:
-    # --- Dimensions (v2: wider backbone) ---
-    d_model: 256                      # Backbone hidden width (was 192)
-    d_f: 43                           # FHR scattering-transform channels
-    d_u: 43                           # UP scattering-transform channels
-    d_z_self: 32                      # Intrinsic FHR latent dimension (NEW)
-    d_z_transfer: 16                  # TE coupling latent dimension (was d_z)
-    n_heads: 8                        # Attention heads (was 4)
+    d_model: 192
+    d_f: 43
+    d_u: 43
+    d_z_transfer: 16
+    n_heads: 4
     dropout: 0.1
 
-    # --- Causal stems ---
     stem_num_blocks: 3
-    stem_kernels: [3, 5, 5]           # Kernel sizes per block
-    stem_dilations: [1, 2, 4]         # Dilation factors per block
-    stem_expansion: 2                 # Pointwise expansion ratio
+    stem_kernels: [3, 5, 5]
+    stem_dilations: [1, 2, 4]
+    stem_expansion: 2
 
-    # --- Causal transformer encoders (v2: asymmetric depths) ---
-    fhr_encoder_layers: 6             # FHR-only encoder depth (was 4)
-    up_encoder_layers: 3              # UP-only encoder depth (was 4)
-    fused_encoder_layers: 6           # Fused encoder depth (was 4)
-    fusion_layers: 2                  # Stacked cross-attention fusion layers (NEW)
-    ff_expansion: 4                   # FFN expansion ratio
+    fhr_encoder_layers: 4
+    up_encoder_layers: 4
+    fused_encoder_layers: 4
+    fusion_layers: 1
+    ff_expansion: 4
 
-    # --- Sequence / anchors / prediction ---
-    seq_len: 300                      # Effective sequence length (after 1-min trim)
-    ctx_len: 30                       # Local context length for attention pooling
-    guard_gap: 4                      # Gap between anchor and prediction start (~16s)
-    horizons: [8, 15, 30]             # Prediction horizons in time steps
-    horizon_weights: [1.0, 1.5, 2.0]  # Per-horizon loss weights
-    num_anchors: 8                    # Anchors sampled per window (was 4)
-    anchor_uniform_ratio: 0.5         # Fraction uniform vs activity-biased
+    seq_len: 300
+    ctx_len: 30
+    guard_gap: 4
+    horizons: [8, 15, 30]
+    horizon_weights: [1.0, 1.5, 2.0]
+    num_anchors: 4
+    anchor_uniform_ratio: 0.5
 
-    # --- Loss weights (v2: additional losses) ---
-    lambda_fus: 1.0                   # Fused forecasting loss (main)
-    lambda_delta: 0.5                 # First-order dynamics loss
-    lambda_delta2: 0.125              # Second-order dynamics loss (NEW)
-    lambda_spectral: 0.15             # Spectral consistency loss (NEW)
-    lambda_self: 0.35                 # Self-only baseline loss (was 0.25, increased for stacked fusion)
-    lambda_te: 0.25                   # TE residual loss (set to 0 in Stage 1 automatically)
-    huber_delta: 1.0                  # Huber loss threshold
+    lambda_fus: 1.0
+    lambda_delta: 0.5
+    lambda_self: 0.25
+    lambda_te: 0.25
+    huber_delta: 1.0
 
-    # --- Latent (v2) ---
-    free_bits: 0.1                    # Per-dimension KL floor in nats (NEW)
-
-    # --- Architecture options (v2) ---
-    use_swiglu: true                  # SwiGLU FFN instead of GELU (NEW)
-    use_rmsnorm: true                 # RMSNorm instead of LayerNorm (NEW)
-
-    # --- Efficiency ---
-    gradient_checkpointing: true      # Needed for larger model (was false)
-
-    # --- Checkpoint ---
-    checkpoint_path: null             # Path to resume from (null = train from scratch)
+    gradient_checkpointing: false
+    checkpoint_path: null
 
 
-# =============================================================================
-# 3-stage training schedule (model.md §19, v2: dual KL scheduling)
-# =============================================================================
 training_schedule:
-  stage1_epochs: 60                   # Deterministic warm start (no TE, no KL) (was 50)
-  stage2_epochs: 60                   # TE head active, beta_self ramps, beta_transfer=0 (was 50)
-  stage3_epochs: 180                  # Both betas ramp to max (was 200)
-  beta_max_self: 5.0e-4              # Max KL weight for z_self (NEW)
-  beta_max_transfer: 2.0e-4          # Max KL weight for z_transfer (was beta_max=1e-4)
-  warmup_steps: 8000                  # Steps over which betas ramp (was 5000)
+  stage1_epochs: 60
+  stage2_epochs: 60
+  stage3_epochs: 180
+  beta_max: 1.0e-4
+  warmup_steps: 5000
 
 
-# =============================================================================
-# Dataset and dataloader
-# =============================================================================
 dataset_config:
-  train_datasets: []                  # List of HDF5 file paths for training
-  val_datasets: []                    # List of HDF5 file paths for validation
-  stat_path: null                     # Path to normalization stats.hdf5
+  train_datasets: []
+  val_datasets: []
+  stat_path: null
 
   dataloader_config:
-    num_workers: 4                    # DataLoader workers (0 for debugging)
-    prefetch_factor: 2                # Batches prefetched per worker
-    normalize_fields:                 # Fields to normalize with stats
+    num_workers: 4
+    prefetch_factor: 2
+    normalize_fields:
       - fhr_st
       - up_st
-    dataset_kwargs:                   # Passed to CombinedHDF5Dataset
+    dataset_kwargs:
       load_fields:
         - fhr_st
         - up_st
-        - fhr                         # Raw FHR signal (for diagnostic plots)
-        - up                          # Raw UP signal (for diagnostic plots)
-      trim_minutes: 1.0              # Trim 1 min from each end -> T=300
-      cache_size: 5000                # LRU cache capacity per dataset
-      pin_memory: false               # MUST be false; pin_memory inside workers causes
-                                      # every worker to init a CUDA context on GPU 0.
-                                      # Pin memory is handled at the DataLoader level instead.
+        - fhr
+        - up
+      trim_minutes: 1.0
+      cache_size: 5000
+      pin_memory: false
 
 
-# =============================================================================
-# Advanced: Trainer, MLflow, callbacks
-# =============================================================================
 advanced_config:
   trainer:
-    precision: "16-mixed"             # "16-mixed" (recommended), "bf16-mixed", "32-true"
-    gradient_clip_val: 1.0            # Gradient norm clip value
-    gradient_clip_algorithm: "norm"   # "norm" or "value"
-    sync_batchnorm: true              # Sync batch norm across GPUs (auto-disabled for single GPU)
-    deterministic: false              # Set true for reproducibility (slower)
-    benchmark: true                   # cuDNN benchmarking (faster for fixed input sizes)
+    precision: "16-mixed"
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: true
+    deterministic: false
+    benchmark: true
 
   tracking:
     mlflow:
       enabled: true
       tracking_uri: "http://localhost:5000"
-      experiment_name: causal_transformer_pretraining_v2
-      run_name: null                  # Auto-generated from date + tag if null
+      experiment_name: causal_transformer_pretraining
+      run_name: null
       tags:
         project: VAE-TEB
-        model: causal_transformer_v2
+        model: causal_transformer
         stage: pretraining
-      log_model: false                # Log model artifact (large)
-      log_config_artifact: true       # Log this YAML as artifact
+      log_model: false
+      log_config_artifact: true
 
   callbacks:
     early_stopping:

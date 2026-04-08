@@ -497,27 +497,20 @@ def _build_diagnostic_figure(
     # ---- Window Embedding ----
     ax = axes[row]
     n_total = len(ewin_np)
-    # v2 component boundaries
-    d_z_s = config.d_z_self
-    d_z_t = config.d_z_transfer
     boundary_f = 2 * d
-    boundary_fu = boundary_f + 10 * d
-    boundary_self = boundary_fu + 3 * d_z_s
+    boundary_fu = boundary_f + 6 * d
 
     x_emb = np.arange(n_total)
     ax.bar(x_emb[:boundary_f], np.abs(ewin_np[:boundary_f]),
            color=COLOR_BLUE, alpha=0.7, width=1.0, label=f"e_F ({boundary_f}d)")
     ax.bar(x_emb[boundary_f:boundary_fu], np.abs(ewin_np[boundary_f:boundary_fu]),
            color=COLOR_ORANGE, alpha=0.7, width=1.0, label=f"e_FU ({boundary_fu - boundary_f}d)")
-    ax.bar(x_emb[boundary_fu:boundary_self], np.abs(ewin_np[boundary_fu:boundary_self]),
-           color=COLOR_VERMILLION, alpha=0.7, width=1.0, label=f"e_self ({boundary_self - boundary_fu}d)")
-    ax.bar(x_emb[boundary_self:], np.abs(ewin_np[boundary_self:]),
-           color=COLOR_GREEN, alpha=0.7, width=1.0, label=f"e_TE ({n_total - boundary_self}d)")
+    ax.bar(x_emb[boundary_fu:], np.abs(ewin_np[boundary_fu:]),
+           color=COLOR_GREEN, alpha=0.7, width=1.0, label=f"e_TE ({n_total - boundary_fu}d)")
 
     # Section dividers
     ax.axvline(boundary_f - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
     ax.axvline(boundary_fu - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.axvline(boundary_self - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--", alpha=0.5)
 
     ax.set_title("Window Embedding (e_win) \u2014 Component Magnitudes", fontsize=9, pad=6)
     ax.set_xlabel("Embedding Dimension", fontsize=8)
@@ -651,11 +644,7 @@ class TransformerPlotCallback(Callback):
         inf_out = model(Y, U)
         e_win = inf_out["e_win"]
 
-        # Current betas (v2: dual KL scheduling)
-        beta_transfer = getattr(pl_module, "_current_beta_transfer", 0.0)
-        beta_self = getattr(pl_module, "_current_beta_self", 0.0)
-        # Pass transfer beta for display (backward compat with figure builder)
-        beta = beta_transfer
+        beta = getattr(pl_module, "_current_beta", 0.0)
 
         for s in range(num_samples):
             fig = _build_diagnostic_figure(

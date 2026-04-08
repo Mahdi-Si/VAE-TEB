@@ -501,8 +501,10 @@ Let
 Then the valid anchors are
 
 $$
-\mathcal A_{\text{valid}} = \{a: L_{\text{ctx}} \le a \le T-g-h_{\max}\}.
+\mathcal A_{\text{valid}} = \{a: L_{\text{ctx}} - 1 \le a \le T-g-h_{\max}-1\}.
 $$
+
+All anchor indices in the implementation are **0-based** sequence positions.
 
 Use the following first-iteration settings:
 
@@ -517,7 +519,7 @@ $$
 Then
 
 $$
-\mathcal A_{\text{valid}} = \{30,\dots,266\}.
+\mathcal A_{\text{valid}} = \{29,\dots,265\}.
 $$
 
 ## 10.3 Should all time steps be used as anchors?
