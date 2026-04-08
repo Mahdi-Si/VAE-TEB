@@ -141,7 +141,7 @@ def run_representation_analysis(
 
     # Collect embeddings from all classes
     all_embeddings = {
-        "e_win": [], "e_F": [], "e_FU": [], "e_self": [], "e_TE": [],
+        "e_win": [], "e_F": [], "e_FU": [], "e_TE": [],
     }
     all_meta = []
     for class_name, loader in class_loaders.items():

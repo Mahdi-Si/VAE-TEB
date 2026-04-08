@@ -325,8 +325,8 @@ class TransformerTestRunner:
 
         Returns:
             Dictionary with ``L_fus``, ``L_delta``, ``L_delta2``,
-            ``L_spectral``, ``L_self``, ``L_te``, ``L_kl_self``,
-            ``L_kl_transfer``, ``total_loss`` (without beta*L_kl).
+            ``L_spectral``, ``L_self``, ``L_te``, ``L_kl``,
+            ``total_loss`` (without beta*L_kl).
         """
         return self.loss_fn(outputs, Y)
 

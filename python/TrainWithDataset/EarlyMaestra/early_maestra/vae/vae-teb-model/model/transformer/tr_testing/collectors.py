@@ -214,8 +214,7 @@ def collect_loss_components(
 
     Returns:
         DataFrame with columns: [common metadata, L_fus, L_delta,
-        L_delta2, L_spectral, L_self, L_te, L_kl_self, L_kl_transfer,
-        total_loss].
+        L_delta2, L_spectral, L_self, L_te, L_kl, total_loss].
     """
     rows = []
     with runner.inference_mode():
@@ -231,8 +230,7 @@ def collect_loss_components(
                 row = _build_metadata_row(batch, i, class_label)
                 for loss_name in ("L_fus", "L_delta", "L_delta2",
                                   "L_spectral", "L_self", "L_te",
-                                  "L_kl_self", "L_kl_transfer",
-                                  "total_loss"):
+                                  "L_kl", "total_loss"):
                     # These are batch-level scalars from the loss fn;
                     # store the same value for each sample in the batch
                     row[loss_name] = float(losses[loss_name].item())
@@ -372,10 +370,9 @@ def collect_embeddings(
 ) -> Dict[str, Any]:
     """Collect window embeddings and their component decomposition.
 
-    v2 embedding layout::
+    Document-aligned embedding layout::
 
-        [e_F(2d) | e_FU(10d) | e_self(3*d_z_self) |
-         e_TE(4*d_z_transfer) | e_KL(2)]
+        [e_F(2d) | e_FU(6d) | e_TE(2*d_z_transfer)]
 
     Args:
         runner: TransformerTestRunner instance.
@@ -387,20 +384,17 @@ def collect_embeddings(
         Dictionary with:
             - ``"e_win"``: ``(N, output_dim)`` full embedding array.
             - ``"e_F"``: ``(N, 2*d)`` FHR intrinsic component.
-            - ``"e_FU"``: ``(N, 10*d)`` fused component (pools + quarters + stds).
-            - ``"e_self"``: ``(N, 3*d_z_self)`` self-latent component.
-            - ``"e_TE"``: ``(N, 4*d_z_transfer + 2)`` TE coupling component
-              (TE summary + innovation + KL trajectory).
+            - ``"e_FU"``: ``(N, 6*d)`` fused component
+              (attention pool + max pool + 4 quarter means).
+            - ``"e_TE"``: ``(N, 2*d_z_transfer)`` TE coupling component
+              (mean + max of posterior means across the fixed eval anchors).
             - ``"metadata"``: DataFrame with common metadata.
     """
     d = runner.config.d_model
-    d_z_self = runner.config.d_z_self
     d_z_transfer = runner.config.d_z_transfer
     boundary_f = 2 * d
-    boundary_fu = boundary_f + 10 * d
-    boundary_self = boundary_fu + 3 * d_z_self
-    # e_TE = 4*d_z_transfer + 2
-    total_dim = 12 * d + 3 * d_z_self + 4 * d_z_transfer + 2
+    boundary_fu = boundary_f + 6 * d
+    total_dim = 8 * d + 2 * d_z_transfer
 
     all_ewin = []
     meta_rows = []
@@ -425,8 +419,7 @@ def collect_embeddings(
             "e_win": empty,
             "e_F": empty[:, :boundary_f],
             "e_FU": empty[:, boundary_f:boundary_fu],
-            "e_self": empty[:, boundary_fu:boundary_self],
-            "e_TE": empty[:, boundary_self:],
+            "e_TE": empty[:, boundary_fu:],
             "metadata": pd.DataFrame(),
         }
 
@@ -435,8 +428,7 @@ def collect_embeddings(
         "e_win": e_win,
         "e_F": e_win[:, :boundary_f],
         "e_FU": e_win[:, boundary_f:boundary_fu],
-        "e_self": e_win[:, boundary_fu:boundary_self],
-        "e_TE": e_win[:, boundary_self:],
+        "e_TE": e_win[:, boundary_fu:],
         "metadata": pd.DataFrame(meta_rows),
     }
 
@@ -588,14 +580,6 @@ def collect_full_sample_data(
                     outputs["logvar_prior"][i * K:(i + 1) * K].cpu().numpy()
                 )
 
-                # Self latent parameters (z_self)
-                sample["mu_self"] = (
-                    outputs["mu_self"][i * K:(i + 1) * K].cpu().numpy()
-                )
-                sample["logvar_self"] = (
-                    outputs["logvar_self"][i * K:(i + 1) * K].cpu().numpy()
-                )
-
                 # Window embedding
                 sample["e_win"] = e_win[i].cpu().numpy()
 
@@ -608,7 +592,7 @@ def collect_full_sample_data(
 
 
 # ---------------------------------------------------------------------------
-# Collector: self latent data (v2)
+# Collector: self latent data (deprecated compatibility shim)
 # ---------------------------------------------------------------------------
 
 def collect_self_latent_data(
@@ -617,10 +601,7 @@ def collect_self_latent_data(
     class_label: str,
     max_samples: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Collect z_self latent data at anchor and segment levels.
-
-    Analogous to ``collect_te_latent_data`` but for the intrinsic FHR
-    latent z_self with standard Gaussian prior N(0, I).
+    """Compatibility shim for the removed experimental self-latent path.
 
     Args:
         runner: TransformerTestRunner instance.
@@ -629,83 +610,10 @@ def collect_self_latent_data(
         max_samples: Maximum number of segments.
 
     Returns:
-        Tuple of (anchor_level_df, segment_level_df).
+        Tuple of empty DataFrames.
     """
-    d_z_self = runner.config.d_z_self
-    free_bits = runner.config.free_bits
-    anchor_rows = []
-    segment_rows = []
-
-    with runner.inference_mode():
-        for batch in runner.iter_batches(loader, max_samples):
-            Y = batch.fhr_st
-            U = batch.up_st
-            B = Y.shape[0]
-
-            outputs = runner.forward_with_anchors(Y, U)
-            anchors = outputs["anchor_indices"]
-            K = anchors.shape[1]
-
-            mu_self = outputs["mu_self"].cpu()         # (B*K, d_z_self)
-            logvar_self = outputs["logvar_self"].cpu()  # (B*K, d_z_self)
-
-            # KL(q(z_self) || N(0, I)) per dimension
-            kl_dim = 0.5 * (
-                mu_self.pow(2) + logvar_self.exp() - 1.0 - logvar_self
-            ).numpy()  # (B*K, d_z_self)
-            kl_total = kl_dim.sum(axis=-1)  # (B*K,)
-
-            # Reshape to (B, K, ...)
-            mu_self_np = mu_self.numpy().reshape(B, K, d_z_self)
-            logvar_self_np = logvar_self.numpy().reshape(B, K, d_z_self)
-            kl_dim_np = kl_dim.reshape(B, K, d_z_self)
-            kl_total_np = kl_total.reshape(B, K)
-            anchors_np = anchors.cpu().numpy()
-
-            for i in range(B):
-                meta = _build_metadata_row(batch, i, class_label)
-
-                # --- Anchor-level rows ---
-                for k in range(K):
-                    arow = dict(meta)
-                    arow["anchor_idx"] = k
-                    arow["anchor_timestep"] = int(anchors_np[i, k])
-                    arow["kl_total"] = kl_total_np[i, k]
-                    for d in range(d_z_self):
-                        arow[f"kl_dim_{d}"] = kl_dim_np[i, k, d]
-                        arow[f"mu_self_{d}"] = mu_self_np[i, k, d]
-                        arow[f"logvar_self_{d}"] = logvar_self_np[i, k, d]
-                    anchor_rows.append(arow)
-
-                # --- Segment-level row ---
-                srow = dict(meta)
-                srow["n_anchors"] = K
-                kl_seg = kl_total_np[i]
-                srow["kl_mean"] = kl_seg.mean()
-                srow["kl_max"] = kl_seg.max()
-                srow["kl_min"] = kl_seg.min()
-                srow["kl_std"] = kl_seg.std()
-
-                # Latent utilization: dims where mean KL > free_bits
-                dim_kl_means = kl_dim_np[i].mean(axis=0)  # (d_z_self,)
-                active_dims = int((dim_kl_means > free_bits).sum())
-                srow["active_dims"] = active_dims
-                srow["utilization"] = active_dims / d_z_self
-
-                for d in range(d_z_self):
-                    kd = kl_dim_np[i, :, d]
-                    srow[f"kl_dim_mean_{d}"] = kd.mean()
-                    srow[f"kl_dim_max_{d}"] = kd.max()
-
-                    ms = mu_self_np[i, :, d]
-                    srow[f"mu_self_mean_{d}"] = ms.mean()
-                    srow[f"mu_self_max_{d}"] = ms.max()
-                    srow[f"mu_self_min_{d}"] = ms.min()
-
-                    srow[f"logvar_self_mean_{d}"] = logvar_self_np[
-                        i, :, d
-                    ].mean()
-
-                segment_rows.append(srow)
-
-    return pd.DataFrame(anchor_rows), pd.DataFrame(segment_rows)
+    logger.info(
+        "collect_self_latent_data() is deprecated because the default "
+        "document-aligned model has no z_self path."
+    )
+    return pd.DataFrame(), pd.DataFrame()

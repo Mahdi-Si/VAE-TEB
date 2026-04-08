@@ -7,7 +7,7 @@ We have trained a Causal Multimodal Forecasting Transformer that learns:
 - **Fused FHR+UP dynamics** via cross-attention fusion with gating (H_FU)
 - **Transfer entropy coupling** (TE) — the incremental predictive contribution of UP beyond FHR's own past
 
-The model produces three forecast branches at anchor points, a TE latent space (d_z=16), and a 1600-dim window embedding for downstream classification. It was trained on scattering-transform features from fetal heart rate (FHR) and uterine pressure (UP) signals across three clinical outcome classes: HEALTHY, ACIDOSIS, and HIE.
+The model produces three forecast branches at anchor points, a TE latent space (d_z=16), and a 1568-dim window embedding for downstream classification. It was trained on scattering-transform features from fetal heart rate (FHR) and uterine pressure (UP) signals across three clinical outcome classes: HEALTHY, ACIDOSIS, and HIE.
 
 This document specifies a comprehensive testing and analysis pipeline to evaluate and visualize every aspect of the trained model across the three classes.
 
@@ -76,7 +76,7 @@ The pipeline must never crash due to class count. Cross-class analyses that requ
 
 | Tensor | Shape | Description |
 |--------|-------|-------------|
-| `e_win` | (B, 1600) | Window embedding = [e_F(384) \| e_FU(1152) \| e_TE(32)] |
+| `e_win` | (B, 1568) | Window embedding = [e_F(384) \| e_FU(1152) \| e_TE(32)] |
 
 ### Loss components
 
@@ -167,7 +167,7 @@ Analysis of the learned representations: encoder states, gate activations, fusio
 
 | Fig ID | Title | Description |
 |--------|-------|-------------|
-| 4.1 | e_win PCA (2D + 3D) | PCA of full 1600-dim embedding, colored by class |
+| 4.1 | e_win PCA (2D + 3D) | PCA of full 1568-dim embedding, colored by class |
 | 4.2 | e_F PCA | PCA of FHR component (384-dim), colored by class |
 | 4.3 | e_FU PCA | PCA of fused component (1152-dim), colored by class |
 | 4.4 | e_TE PCA | PCA of TE component (32-dim), colored by class |
@@ -346,7 +346,7 @@ class TransformerTestRunner:
     
     def forward_for_embedding(self, Y, U)
         # Inference-mode forward (no anchors)
-        # Returns: e_win (B, 1600)
+        # Returns: e_win (B, 1568)
     
     def extract_intermediates(self, Y, U)
         # Partial forward: stems + encoders + fusion + gate
@@ -423,7 +423,7 @@ def collect_te_latent_data(runner, loader, class_label, max_samples=None) -> tup
 
 def collect_embeddings(runner, loader, class_label, max_samples=None) -> dict
     # Returns: {
-    #   "e_win": (N, 1600), "e_F": (N, 384), "e_FU": (N, 1152), "e_TE": (N, 32),
+    #   "e_win": (N, 1568), "e_F": (N, 384), "e_FU": (N, 1152), "e_TE": (N, 32),
     #   "metadata": DataFrame with [common metadata]
     # }
 
@@ -433,7 +433,7 @@ def collect_gate_and_fusion(runner, loader, class_label, max_samples=None) -> pd
     #          gate_temporal_profile (saved as 300 columns: gate_t000..gate_t299),
     #          mean_fusion_dist, max_fusion_dist, relative_fusion_mean
 
-def collect_full_sample_data(runner, loader, class_label, sample_indices) -> list[dict]
+def collect_full_sample_data(runner, loader, class_label, n_samples=10) -> list[dict]
     # Full forward + intermediates for selected samples.
     # Returns list of dicts with ALL tensors needed for per-sample diagnostics
     # plus all common metadata fields.
@@ -833,5 +833,5 @@ def quick_test(checkpoint_path, class_data_paths, ...) -> dict:
 1. **Smoke test**: Run `quick_test()` on a small subset (10 samples per class) to verify all modules load and produce output without errors
 2. **Style verification**: Compare a per-sample diagnostic figure side-by-side with a training callback figure to confirm visual consistency
 3. **Metric sanity**: Verify that test set losses match the validation loss reported during training (within tolerance)
-4. **Embedding sanity**: Check that e_win dimensionality is 1600 and component boundaries (384, 1152, 32) match
+4. **Embedding sanity**: Check that e_win dimensionality is 1568 and component boundaries (384, 1152, 32) match
 5. **Full pipeline**: Run on full test set with all analyses enabled
