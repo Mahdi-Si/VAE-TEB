@@ -76,18 +76,6 @@ def run_all_analyses(
         logger.error(f"TE coupling analysis failed: {e}")
         results["te_coupling"] = {"error": str(e)}
 
-    # 3b. Self-latent (z_self) quality analysis (v2)
-    try:
-        from model.transformer.tr_testing.analyses.self_latent import run_self_latent_analysis
-        logger.info("Running self-latent (z_self) analysis...")
-        results["self_latent"] = run_self_latent_analysis(
-            runner, class_loaders, runner.ensure_dir("self_latent"),
-            max_samples=max_samples,
-        )
-    except Exception as e:
-        logger.error(f"Self-latent analysis failed: {e}")
-        results["self_latent"] = {"error": str(e)}
-
     # 4. Representation analysis
     try:
         from model.transformer.tr_testing.analyses.representation import run_representation_analysis

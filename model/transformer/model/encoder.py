@@ -178,8 +178,9 @@ class CausalCrossAttentionFusion(nn.Module):
             nn.Linear(2 * d_model, d_model)
             for _ in range(n_layers)
         ])
-        # Each fusion layer (except possibly the first in v1-compat mode)
-        # has a self-attention + FFN block for integration
+        # Optional refinement blocks. When n_layers == 1, the default document-
+        # aligned path is just cross-attention + gate, with no extra fusion-time
+        # transformer block before the fused encoder.
         self.refine_blocks = nn.ModuleList([
             CausalTransformerBlock(
                 d_model, n_heads, ff_expansion, dropout,
@@ -205,5 +206,6 @@ class CausalCrossAttentionFusion(nn.Module):
                 self.gate_projs[i](torch.cat([h, context], dim=-1))
             )                                                       # (B, T, d)
             h = h + gate * context
-            h = self.refine_blocks[i](h)
+            if self.n_layers > 1:
+                h = self.refine_blocks[i](h)
         return h
