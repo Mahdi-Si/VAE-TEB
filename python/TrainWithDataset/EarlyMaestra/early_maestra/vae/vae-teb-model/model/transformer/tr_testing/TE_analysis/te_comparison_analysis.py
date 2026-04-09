@@ -32,6 +32,11 @@ MODEL_TE_MEASURES: Dict[str, str] = {
     "residual_norm_mean_h8": "Residual norm (h=8)",
     "residual_norm_mean_h15": "Residual norm (h=15)",
     "residual_norm_mean_h30": "Residual norm (h=30)",
+    "te_forecast_gain_mean": "TE forecast gain (all h)",
+    "te_forecast_gain_mean_h8": "TE forecast gain (h=8)",
+    "te_forecast_gain_mean_h15": "TE forecast gain (h=15)",
+    "te_forecast_gain_mean_h30": "TE forecast gain (h=30)",
+    "te_relative_gain_mean": "TE relative gain (all h)",
 }
 
 EMPIRICAL_TE_MEASURES: Dict[str, str] = {
