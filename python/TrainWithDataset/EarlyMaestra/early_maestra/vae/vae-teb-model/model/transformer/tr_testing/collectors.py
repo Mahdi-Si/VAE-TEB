@@ -34,6 +34,46 @@ from model.transformer.tr_testing.metrics import (
 )
 
 
+def _compute_forecast_te_gains(
+    outputs: Dict[str, Any],
+    Y: Tensor,
+    guard_gap: int,
+) -> Dict[str, np.ndarray]:
+    """Compute forecast-based TE gains per anchor.
+
+    For each horizon h, computes:
+        - ``mse_self_h{h}``: MSE of the self-only prediction (B*K,)
+        - ``mse_te_h{h}``: MSE of the TE-augmented prediction (B*K,)
+        - ``te_gain_h{h}``: ``mse_self - mse_te`` (positive = TE helps) (B*K,)
+        - ``te_relative_gain_h{h}``: ``1 - mse_te / mse_self`` (B*K,)
+
+    Args:
+        outputs: Model forward outputs containing ``Y_hat_self`` and
+            ``Y_hat_te``.
+        Y: Raw FHR scattering features ``(B, T, d_F)``.
+        guard_gap: Guard gap between anchor and target start.
+
+    Returns:
+        Dict mapping metric name to ``(B*K,)`` numpy array.
+    """
+    mse_self = compute_per_anchor_mse(
+        outputs["Y_hat_self"], Y, outputs["anchor_indices"], guard_gap,
+    )
+    mse_te = compute_per_anchor_mse(
+        outputs["Y_hat_te"], Y, outputs["anchor_indices"], guard_gap,
+    )
+    result: Dict[str, np.ndarray] = {}
+    for h in mse_self:
+        s = mse_self[h].cpu().numpy()
+        t = mse_te[h].cpu().numpy()
+        result[f"mse_self_h{h}"] = s
+        result[f"mse_te_h{h}"] = t
+        result[f"te_gain_h{h}"] = s - t
+        # Relative gain: clamp denominator to avoid division by zero
+        result[f"te_relative_gain_h{h}"] = 1.0 - t / np.maximum(s, 1e-10)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Metadata extraction helpers
 # ---------------------------------------------------------------------------
@@ -291,6 +331,15 @@ def collect_te_latent_data(
                 h: v.reshape(B, K).cpu().numpy() for h, v in r_norms.items()
             }
 
+            # Forecast-based TE gains (MSE improvement from TE latent)
+            te_gains = _compute_forecast_te_gains(
+                outputs, Y, runner.config.guard_gap,
+            )
+            # Reshape all gain arrays from (B*K,) to (B, K)
+            te_gains = {
+                name: arr.reshape(B, K) for name, arr in te_gains.items()
+            }
+
             # Reshape to (B, K, ...)
             mu_post_np = mu_post.numpy().reshape(B, K, d_z)
             logvar_post_np = logvar_post.numpy().reshape(B, K, d_z)
@@ -317,6 +366,10 @@ def collect_te_latent_data(
                         arow[f"logvar_prior_{d}"] = logvar_prior_np[i, k, d]
                     for h in runner.config.horizons:
                         arow[f"residual_norm_h{h}"] = r_norms[h][i, k]
+                        arow[f"mse_self_h{h}"] = te_gains[f"mse_self_h{h}"][i, k]
+                        arow[f"mse_te_h{h}"] = te_gains[f"mse_te_h{h}"][i, k]
+                        arow[f"te_gain_h{h}"] = te_gains[f"te_gain_h{h}"][i, k]
+                        arow[f"te_relative_gain_h{h}"] = te_gains[f"te_relative_gain_h{h}"][i, k]
                     anchor_rows.append(arow)
 
                 # --- Segment-level row (aggregated across anchors) ---
@@ -352,6 +405,24 @@ def collect_te_latent_data(
                     srow[f"residual_norm_mean_h{h}"] = rn.mean()
                     srow[f"residual_norm_max_h{h}"] = rn.max()
                     srow[f"residual_norm_min_h{h}"] = rn.min()
+
+                    # Forecast-based TE gains (aggregated across anchors)
+                    srow[f"mse_self_mean_h{h}"] = te_gains[f"mse_self_h{h}"][i].mean()
+                    srow[f"mse_te_mean_h{h}"] = te_gains[f"mse_te_h{h}"][i].mean()
+                    srow[f"te_forecast_gain_mean_h{h}"] = te_gains[f"te_gain_h{h}"][i].mean()
+                    srow[f"te_relative_gain_mean_h{h}"] = te_gains[f"te_relative_gain_h{h}"][i].mean()
+
+                # Cross-horizon aggregate: mean TE forecast gain across all horizons
+                all_gains = [
+                    te_gains[f"te_gain_h{h}"][i].mean()
+                    for h in runner.config.horizons
+                ]
+                srow["te_forecast_gain_mean"] = float(np.mean(all_gains))
+                all_rel = [
+                    te_gains[f"te_relative_gain_h{h}"][i].mean()
+                    for h in runner.config.horizons
+                ]
+                srow["te_relative_gain_mean"] = float(np.mean(all_rel))
 
                 segment_rows.append(srow)
 
