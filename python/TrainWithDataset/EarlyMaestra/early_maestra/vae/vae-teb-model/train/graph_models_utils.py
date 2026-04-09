@@ -216,7 +216,7 @@ def _prepare_checkpoint_state_dict(
             logger.error(f"Checkpoint file not found at {checkpoint_path}")
             return None
         logger.info(f"Reading checkpoint from {checkpoint_path}")
-        checkpoint_obj = torch.load(checkpoint_path, map_location=map_location)
+        checkpoint_obj = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     state_dict = _extract_state_dict(checkpoint_obj)
     if state_dict is None:
         logger.error("Unable to extract a state_dict from the provided checkpoint reference")
