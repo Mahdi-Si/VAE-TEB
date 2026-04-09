@@ -3649,3 +3649,272 @@ def plot_st_coefficient_stats(stats: Dict[str, Any], output_dir) -> Path:
                  color=COLOR_PURPLE)
     save_figure(fig, output_path)
     return output_path
+
+
+# =========================================================================
+# Category 8: Consecutive Forecast Tiling
+# =========================================================================
+
+def plot_consecutive_forecast(
+    sample_data: dict,
+    output_path,
+    config,
+) -> Path:
+    """Plot tiled consecutive forecast for one sample.
+
+    Creates a 4-row figure:
+
+    - Row 0: Channel-averaged tiled forecast (ground truth vs self / fused /
+      TE heads).  Alternating bands mark individual forecast windows.
+      Anchor positions are shown as tick marks.  A shaded region marks
+      time steps beyond the signal length.
+    - Row 1: Three selected channels shown individually (low / mid / high
+      frequency) with the same tiling.
+    - Row 2: Per-anchor MAE grouped bars for each head (valid anchors only).
+    - Row 3: All-channel heatmap — ground truth (top half) vs fused forecast
+      (bottom half) across the tiled valid forecast range.
+
+    Args:
+        sample_data: Dictionary from ``collect_consecutive_forecast``.
+        output_path: File path for the saved figure.
+        config: ``TransformerConfig`` instance.
+
+    Returns:
+        ``Path`` to the saved figure.
+    """
+    output_path = _ensure_path(output_path)
+    apply_publication_style()
+
+    sd = sample_data
+    Y = sd["Y"]                            # (T, d_f)
+    h = sd["horizon"]
+    g = sd["guard_gap"]
+    anchors = sd["anchor_positions"]       # (K,)
+    n_valid = sd["n_valid_anchors"]
+    preds = sd["predictions"]              # {head: {h: (K,h,d_f)}}
+    vmask = sd["valid_mask"]               # (K, h)
+    T = sd["seq_len"]
+    K = len(anchors)
+    d_f = config.d_f
+
+    guid = sd.get("guid", "?")
+    epoch = sd.get("epoch", "?")
+    cls = sd.get("class_label", "?")
+
+    # Channel-averaged ground truth
+    gt_avg = Y.mean(axis=-1)               # (T,)
+
+    # Maximum time index covered by any forecast
+    max_t = int(max(a + g + h for a in anchors))
+
+    # --- Build tiled forecast arrays (channel-averaged) ---
+    head_names = ["self", "fused", "te"]
+    tiled: Dict[str, np.ndarray] = {}
+    for head_name in head_names:
+        tile = np.full(max_t + 1, np.nan)
+        pred_avg = preds[head_name][h].mean(axis=-1)  # (K, h)
+        for k in range(K):
+            start = int(anchors[k]) + g + 1
+            tile[start:start + h] = pred_avg[k]
+        tiled[head_name] = tile
+
+    # Ground truth padded to max_t
+    gt_padded = np.full(max_t + 1, np.nan)
+    gt_padded[:T] = gt_avg
+
+    # Select 3 representative channels: low, mid, high
+    ch_low, ch_mid, ch_high = 0, d_f // 2, d_f - 1
+
+    # --- Figure: 4 rows ---
+    fig = plt.figure(figsize=(16, 14), constrained_layout=True)
+    gs = fig.add_gridspec(4, 1, height_ratios=[3, 3, 2, 2])
+
+    # ---- Row 0: Channel-averaged tiled forecast ----
+    ax0 = fig.add_subplot(gs[0])
+    _draw_tiled_panel(
+        ax0, gt_padded, tiled, anchors, g, h, T, max_t,
+        ylabel="Channel-Averaged Value",
+        title=(
+            f"Consecutive Forecast Tiling (h={h}, stride={h}) — "
+            f"{cls} / {guid} / epoch={int(epoch) if isinstance(epoch, (int, float)) else epoch}"
+        ),
+    )
+
+    # ---- Row 1: Three individual channels ----
+    ax1 = fig.add_subplot(gs[1])
+    # Build per-channel tiled arrays for fused head
+    ch_indices = [ch_low, ch_mid, ch_high]
+    ch_labels = [f"Ch {ch_low} (low)", f"Ch {ch_mid} (mid)",
+                 f"Ch {ch_high} (high)"]
+    ch_colors_gt = [COLOR_GRAY, COLOR_GRAY, COLOR_GRAY]
+    ch_colors_pred = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN]
+    ch_styles_gt = ["-", "--", ":"]
+
+    for ci, (ch, ch_lbl, gt_style, pred_color) in enumerate(
+        zip(ch_indices, ch_labels, ch_styles_gt, ch_colors_pred)
+    ):
+        gt_ch = np.full(max_t + 1, np.nan)
+        gt_ch[:T] = Y[:, ch]
+        pred_ch = np.full(max_t + 1, np.nan)
+        pred_fused = preds["fused"][h][:, :, ch]  # (K, h)
+        for k in range(K):
+            start = int(anchors[k]) + g + 1
+            pred_ch[start:start + h] = pred_fused[k]
+        ax1.plot(np.arange(max_t + 1), gt_ch, color=COLOR_GRAY,
+                 linewidth=0.6, alpha=0.5, linestyle=gt_style,
+                 label=f"GT {ch_lbl}")
+        ax1.plot(np.arange(max_t + 1), pred_ch, color=pred_color,
+                 linewidth=0.8, label=f"Fused {ch_lbl}")
+
+    # Shade beyond region
+    if max_t >= T:
+        ax1.axvspan(T, max_t, alpha=0.08, color=COLOR_VERMILLION)
+    ax1.axvline(T, color=COLOR_VERMILLION, linewidth=0.6, linestyle="--",
+                alpha=0.6)
+    ax1.set_xlim(0, max_t + 1)
+    ax1.set_xlabel("Time Step", fontsize=8)
+    ax1.set_ylabel("Value", fontsize=8)
+    ax1.set_title("Per-Channel Fused Forecast (3 channels)", fontsize=9,
+                  pad=6)
+    ax1.legend(fontsize=6, loc="upper right", ncol=3, framealpha=0.95)
+    style_axes(ax1, grid="both")
+
+    # ---- Row 2: Per-anchor MAE (valid anchors only) ----
+    ax2 = fig.add_subplot(gs[2])
+    targets = sd["targets"]                # (K, h, d_f)
+    bar_w = 0.25
+    x_pos = np.arange(n_valid)
+
+    for j, (head_name, color) in enumerate([
+        ("self", HEAD_COLORS["self"]),
+        ("fused", HEAD_COLORS["fused"]),
+        ("te", HEAD_COLORS["te"]),
+    ]):
+        mae_arr = []
+        pred_h = preds[head_name][h]       # (K, h, d_f)
+        for k in range(n_valid):
+            mask = vmask[k]
+            if mask.any():
+                valid_pred = pred_h[k][mask]
+                valid_tgt = targets[k][mask]
+                mae_arr.append(np.abs(valid_pred - valid_tgt).mean())
+            else:
+                mae_arr.append(np.nan)
+        ax2.bar(x_pos + j * bar_w, mae_arr, bar_w, color=color,
+                label=HEAD_LABELS[head_name], alpha=0.85)
+
+    ax2.set_xticks(x_pos + bar_w)
+    ax2.set_xticklabels(
+        [str(int(a)) for a in anchors[:n_valid]], fontsize=6, rotation=45
+    )
+    ax2.set_xlabel("Anchor Position", fontsize=8)
+    ax2.set_ylabel("MAE", fontsize=8)
+    ax2.set_title("Per-Anchor MAE (valid anchors)", fontsize=9, pad=6)
+    ax2.legend(fontsize=7, ncol=3)
+    style_axes(ax2, grid="major")
+
+    # ---- Row 3: GT vs Fused heatmap (all channels) ----
+    ax3 = fig.add_subplot(gs[3])
+    forecast_start = int(anchors[0]) + g + 1
+    # Use only the valid range for the heatmap
+    forecast_end = min(int(anchors[n_valid - 1]) + g + h, T) \
+        if n_valid > 0 else T
+    time_len = forecast_end - forecast_start
+
+    if time_len > 0:
+        gt_heat = Y[forecast_start:forecast_end, :].T     # (d_f, time_len)
+        fused_tile = np.full((time_len, d_f), np.nan)
+        pred_fused_all = preds["fused"][h]                 # (K, h, d_f)
+        for k in range(n_valid):
+            s = int(anchors[k]) + g + 1 - forecast_start
+            e = s + h
+            if e <= time_len:
+                fused_tile[s:e, :] = pred_fused_all[k]
+            elif s < time_len:
+                fused_tile[s:time_len, :] = pred_fused_all[k, :time_len - s, :]
+        fused_heat = fused_tile.T                          # (d_f, time_len)
+
+        combined = np.concatenate([gt_heat, fused_heat], axis=0)
+        vabs = np.nanmax(np.abs(combined)) or 1.0
+        im = ax3.imshow(combined, aspect="auto", cmap="bwr", origin="upper",
+                        vmin=-vabs, vmax=vabs)
+        ax3.axhline(d_f - 0.5, color=COLOR_BLACK, linewidth=1.0)
+        ax3.set_ylabel("Channel", fontsize=8)
+        ax3.set_xlabel(f"Time Step (offset from {forecast_start})",
+                       fontsize=8)
+        ax3.set_title(
+            "GT (top) vs Fused Forecast (bottom) — All Channels",
+            fontsize=9, pad=6,
+        )
+        ax3.grid(False)
+        add_colorbar(fig, im, ax3, label="Value")
+    else:
+        ax3.text(0.5, 0.5, "No valid forecast range", ha="center",
+                 va="center", transform=ax3.transAxes, fontsize=9)
+        ax3.set_title("GT vs Fused Heatmap", fontsize=9, pad=6)
+
+    save_figure(fig, output_path)
+    return Path(output_path)
+
+
+def _draw_tiled_panel(
+    ax,
+    gt: np.ndarray,
+    tiled: Dict[str, np.ndarray],
+    anchors: np.ndarray,
+    g: int,
+    h: int,
+    T: int,
+    max_t: int,
+    *,
+    ylabel: str = "Value",
+    title: str = "",
+) -> None:
+    """Draw the main tiled-forecast panel on *ax*.
+
+    Args:
+        ax: Matplotlib Axes.
+        gt: Padded ground truth array ``(max_t + 1,)``.
+        tiled: ``{head_name: (max_t + 1,)}`` tiled predictions.
+        anchors: Anchor positions ``(K,)``.
+        g: Guard gap.
+        h: Horizon (stride).
+        T: Original signal length.
+        max_t: Maximum time index.
+        ylabel: Y-axis label.
+        title: Axes title.
+    """
+    time_axis = np.arange(max_t + 1)
+
+    # Alternating bands for each forecast window
+    for k, a in enumerate(anchors):
+        start = int(a) + g + 1
+        end = start + h
+        if k % 2 == 0:
+            ax.axvspan(start, min(end, max_t + 1), alpha=0.04,
+                       color=COLOR_GRAY)
+
+    # Ground truth
+    ax.plot(time_axis, gt, color=COLOR_GRAY, linewidth=0.8, alpha=0.6,
+            label="Ground Truth")
+
+    # Forecast heads
+    for head_name, color in [("self", HEAD_COLORS["self"]),
+                              ("fused", HEAD_COLORS["fused"]),
+                              ("te", HEAD_COLORS["te"])]:
+        ax.plot(time_axis, tiled[head_name], color=color, linewidth=1.0,
+                label=HEAD_LABELS[head_name])
+
+    # Mark signal end and beyond region
+    if max_t >= T:
+        ax.axvspan(T, max_t, alpha=0.08, color=COLOR_VERMILLION,
+                   label="Beyond signal")
+    ax.axvline(T, color=COLOR_VERMILLION, linewidth=0.6, linestyle="--",
+               alpha=0.6)
+
+    ax.set_xlim(0, max_t + 1)
+    ax.set_xlabel("Time Step", fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.set_title(title, fontsize=9, pad=6)
+    ax.legend(fontsize=7, loc="upper right", ncol=5, framealpha=0.95)
+    style_axes(ax, grid="both")
