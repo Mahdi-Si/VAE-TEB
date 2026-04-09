@@ -129,4 +129,18 @@ def run_all_analyses(
             logger.error(f"Per-sample diagnostics failed: {e}")
             results["per_sample"] = {"error": str(e)}
 
+    # 8. Consecutive forecast tiling
+    if not skip_per_sample:
+        try:
+            from model.transformer.tr_testing.analyses.consecutive_forecast import run_consecutive_forecast_analysis
+            logger.info("Running consecutive forecast analysis...")
+            results["consecutive_forecast"] = run_consecutive_forecast_analysis(
+                runner, class_loaders,
+                runner.ensure_dir("consecutive_forecast"),
+                n_samples=n_diagnostic_samples,
+            )
+        except Exception as e:
+            logger.error(f"Consecutive forecast analysis failed: {e}")
+            results["consecutive_forecast"] = {"error": str(e)}
+
     return results

@@ -253,6 +253,28 @@ class TransformerTestRunner:
         anchors = sample_anchors(Y, U, self.config, training=False)
         return self.model(Y, U, anchor_indices=anchors)
 
+    def forward_with_custom_anchors(
+        self, Y: Tensor, U: Tensor, anchor_indices: Tensor,
+    ) -> Dict[str, Any]:
+        """Forward pass with caller-specified anchor positions.
+
+        Unlike ``forward_with_anchors`` which uses a fixed eval grid,
+        this method accepts arbitrary anchor positions.  The caller is
+        responsible for ensuring that the context windows
+        ``[a - ctx_len + 1, a]`` for each anchor ``a`` lie within
+        ``[0, T-1]``.
+
+        Args:
+            Y: FHR scattering features ``(B, T, d_F)``.
+            U: UP scattering features ``(B, T, d_U)``.
+            anchor_indices: Custom anchor positions ``(B, K)`` (0-based).
+
+        Returns:
+            Model output dict with all 3 forecast heads, TE latent
+            parameters, H_F, H_FU, and anchor_indices.
+        """
+        return self.model(Y, U, anchor_indices=anchor_indices)
+
     def forward_for_embedding(
         self, Y: Tensor, U: Tensor,
     ) -> Tensor:
