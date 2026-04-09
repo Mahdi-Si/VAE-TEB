@@ -595,6 +595,151 @@ def collect_full_sample_data(
 # Collector: self latent data (deprecated compatibility shim)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Collector: consecutive forecast tiling
+# ---------------------------------------------------------------------------
+
+def collect_consecutive_forecast(
+    runner: TransformerTestRunner,
+    loader: Any,
+    class_label: str,
+    horizon: int = 30,
+    n_samples: int = 10,
+    include_beyond: bool = True,
+) -> List[Dict[str, Any]]:
+    """Collect data for consecutive (non-overlapping) forecast tiling.
+
+    Places anchors at every ``horizon`` steps starting from
+    ``valid_anchor_start`` so that forecast windows tile the signal
+    continuously without gaps or overlaps.  Optionally includes anchors
+    whose forecast extends beyond the signal length for extrapolation
+    assessment.
+
+    For anchor *a* with guard gap *g*, the forecast covers time steps
+    ``[a + g + 1, a + g + horizon]``.  With stride equal to the horizon,
+    consecutive forecast windows are contiguous.
+
+    Args:
+        runner: TransformerTestRunner instance.
+        loader: DataLoader for one class.
+        class_label: Class name string.
+        horizon: Forecast horizon used for tiling stride.  Must be one of
+            ``config.horizons``.
+        n_samples: Number of samples to collect.
+        include_beyond: If ``True``, include anchors past
+            ``valid_anchor_end`` whose context window still fits within the
+            signal length.
+
+    Returns:
+        List of dicts, one per sample.  Each dict contains:
+
+        - Common metadata (guid, epoch, class_label, etc.).
+        - ``"Y"``: Ground truth ``(T, d_f)`` numpy array.
+        - ``"horizon"``: The horizon used for tiling.
+        - ``"guard_gap"``: Guard gap from config.
+        - ``"anchor_positions"``: ``(K,)`` numpy array of anchor indices.
+        - ``"n_valid_anchors"``: Number of anchors within the valid range.
+        - ``"predictions"``: ``{head_name: {h: (K, h, d_f)}}`` for all
+          heads and all config horizons.
+        - ``"targets"``: ``(K, horizon, d_f)`` ground truth targets.
+          ``NaN`` where the target extends beyond the signal.
+        - ``"valid_mask"``: ``(K, horizon)`` bool array.  ``True`` where
+          ground truth is available.
+        - ``"seq_len"``: Signal length T.
+    """
+    cfg = runner.config
+    if horizon not in cfg.horizons:
+        raise ValueError(
+            f"horizon={horizon} not in config.horizons={cfg.horizons}"
+        )
+
+    g = cfg.guard_gap
+    T = cfg.seq_len
+    a_start = cfg.valid_anchor_start
+
+    # --- Build consecutive anchor positions ---
+    valid_anchors = list(range(a_start, cfg.valid_anchor_end + 1, horizon))
+    beyond_anchors: List[int] = []
+    if include_beyond and valid_anchors:
+        next_a = valid_anchors[-1] + horizon
+        # Include anchors whose context window fits within the signal
+        # (anchor < T and anchor >= ctx_len - 1).
+        while next_a < T and next_a >= cfg.ctx_len - 1:
+            beyond_anchors.append(next_a)
+            next_a += horizon
+    all_anchors = valid_anchors + beyond_anchors
+    n_valid = len(valid_anchors)
+    K = len(all_anchors)
+
+    anchor_t = torch.tensor(
+        all_anchors, dtype=torch.long, device=runner.device
+    )
+    samples: List[Dict[str, Any]] = []
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, n_samples):
+            Y = batch.fhr_st                              # (B, T, d_f)
+            U = batch.up_st                               # (B, T, d_u)
+            B = Y.shape[0]
+
+            # All batch items share the same anchor positions
+            anchors_batch = anchor_t.unsqueeze(0).expand(B, -1)
+            outputs = runner.forward_with_custom_anchors(
+                Y, U, anchors_batch
+            )
+
+            for i in range(B):
+                if len(samples) >= n_samples:
+                    break
+
+                meta = _build_metadata_row(batch, i, class_label)
+                Y_np = Y[i].cpu().numpy()                 # (T, d_f)
+
+                # --- Predictions per head per horizon ---
+                preds: Dict[str, Dict[int, np.ndarray]] = {}
+                for head_name, key in [("self", "Y_hat_self"),
+                                       ("fused", "Y_hat_fus"),
+                                       ("te", "Y_hat_te")]:
+                    preds[head_name] = {}
+                    for h_val in cfg.horizons:
+                        preds[head_name][h_val] = (
+                            outputs[key][h_val][i * K:(i + 1) * K]
+                            .cpu().numpy()
+                        )                                  # (K, h, d_f)
+
+                # --- Targets and validity for the tiling horizon ---
+                tgt = np.full((K, horizon, cfg.d_f), np.nan)
+                vmask = np.zeros((K, horizon), dtype=bool)
+                for k, a in enumerate(all_anchors):
+                    start = a + g + 1
+                    for t_step in range(horizon):
+                        idx = start + t_step
+                        if 0 <= idx < T:
+                            tgt[k, t_step, :] = Y_np[idx]
+                            vmask[k, t_step] = True
+
+                sample = dict(meta)
+                sample.update({
+                    "Y": Y_np,
+                    "horizon": horizon,
+                    "guard_gap": g,
+                    "anchor_positions": np.array(all_anchors),
+                    "n_valid_anchors": n_valid,
+                    "predictions": preds,
+                    "targets": tgt,
+                    "valid_mask": vmask,
+                    "seq_len": T,
+                })
+                samples.append(sample)
+
+    logger.info(
+        f"Collected {len(samples)} consecutive forecast samples "
+        f"for {class_label} (h={horizon}, {n_valid} valid + "
+        f"{len(beyond_anchors)} beyond anchors)"
+    )
+    return samples
+
+
 def collect_self_latent_data(
     runner: TransformerTestRunner,
     loader: Any,
