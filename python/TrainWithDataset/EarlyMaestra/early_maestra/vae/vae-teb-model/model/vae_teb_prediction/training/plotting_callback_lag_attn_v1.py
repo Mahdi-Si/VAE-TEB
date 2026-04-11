@@ -170,7 +170,7 @@ def _build_diagnostic_figure(
     y_st: torch.Tensor,
     y_ph: torch.Tensor,
     up_st: Optional[torch.Tensor],
-    up_self_phase: torch.Tensor,
+    up_ph: torch.Tensor,
     fhr_raw: Optional[torch.Tensor],
     up_raw: Optional[torch.Tensor],
     sample_idx: int,
@@ -192,7 +192,7 @@ def _build_diagnostic_figure(
         y_st: FHR scattering features ``(B, T, 43)``.
         y_ph: FHR phase features ``(B, T, 44)``.
         up_st: UP scattering features ``(B, T, 43)``, or ``None`` if absent.
-        up_self_phase: UP self-phase slice ``(B, T, 58)``.
+        up_ph: UP self-phase slice ``(B, T, 58)`` — virtual field from the dataset.
         fhr_raw: Raw FHR trace ``(B, R)`` or ``None``.
         up_raw: Raw UP trace ``(B, R)`` or ``None``.
         sample_idx: Index into the batch.
@@ -216,7 +216,7 @@ def _build_diagnostic_figure(
     # ---- Numpy views of the relevant tensors for this sample ---------------
     y_st_np = _np(y_st[i])                                          # (T, 43)
     y_ph_np = _np(y_ph[i])                                          # (T, 44)
-    up_self_np = _np(up_self_phase[i])                              # (T, 58)
+    up_ph_np = _np(up_ph[i])                                        # (T, 58)
     up_st_np = _np(up_st[i]) if up_st is not None else None         # (T, 43) or None
 
     mu_prior_np = _np(outs["mu_prior"][i])                          # (T, d_z)
@@ -363,12 +363,12 @@ def _build_diagnostic_figure(
     # ---- Row: UP features stacked heatmap ---------------------------------
     ax = row_axes(row_idx_of["up_feats"])
     if up_st_np is not None:
-        up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_self_np.T)  # (101, T)
+        up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (101, T)
         title_up = (
             "UP features \u2014 scattering (rows 0-42)  |  self-phase (rows 43-100)"
         )
     else:
-        up_stack, up_sep = up_self_np.T, None                               # (58, T)
+        up_stack, up_sep = up_ph_np.T, None                               # (58, T)
         title_up = "UP features \u2014 self-phase only (up_st absent)"
     heatmap(
         ax, up_stack, cmap="bwr", origin="upper",
@@ -734,9 +734,15 @@ class LagAttnV1PlotCallback(Callback):
 
         y_st = batch.fhr_st
         y_ph = batch.fhr_ph
-        fhr_up_ph = batch.fhr_up_ph
+        up_ph = _get_field(batch, "up_ph")
+        if up_ph is None:
+            logger.warning(
+                "LagAttnV1PlotCallback: batch has no `up_ph` field; skipping "
+                "this epoch's plots. Make sure 'up_ph' is in "
+                "dataset_kwargs.load_fields."
+            )
+            return
 
-        up_self = fhr_up_ph[..., 79:137]
         up_st: Optional[torch.Tensor] = None
         if use_up_st:
             up_st_field = _get_field(batch, "up_st")
@@ -747,9 +753,9 @@ class LagAttnV1PlotCallback(Callback):
                 )
                 return
             up_st = up_st_field
-            u_stream = torch.cat([up_st, up_self], dim=-1)
+            u_stream = torch.cat([up_st, up_ph], dim=-1)
         else:
-            u_stream = up_self
+            u_stream = up_ph
 
         fhr_raw = _get_field(batch, "fhr")
         up_raw = _get_field(batch, "up")
@@ -785,7 +791,7 @@ class LagAttnV1PlotCallback(Callback):
                     y_st=y_st,
                     y_ph=y_ph,
                     up_st=up_st,
-                    up_self_phase=up_self,
+                    up_ph=up_ph,
                     fhr_raw=fhr_raw,
                     up_raw=up_raw,
                     sample_idx=s,

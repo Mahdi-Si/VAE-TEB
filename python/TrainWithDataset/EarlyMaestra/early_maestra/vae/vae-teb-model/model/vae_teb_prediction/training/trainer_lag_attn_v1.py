@@ -46,11 +46,17 @@ from train.pl_model_base import LightningModelBase
 class SeqVaeLagAttnPl(LightningModelBase):
     """Lightning wrapper for :class:`SeqVaeLagAttnV1`.
 
-    Reads the target FHR features from ``batch.fhr_st`` / ``batch.fhr_ph`` and
-    builds the source stream from ``batch.up_st`` (when available) concatenated
-    with the UP self-phase portion of ``batch.fhr_up_ph`` (last 58 channels).
-    The cross-phase channels (first 79) are intentionally discarded to keep
-    the source stream source-pure.
+    Reads the four model-facing fields directly from the batch:
+
+    * ``batch.fhr_st`` — FHR scattering (target stream, 43 ch)
+    * ``batch.fhr_ph`` — FHR phase harmonics (target stream, 44 ch)
+    * ``batch.up_st`` — UP scattering (source stream, 43 ch, optional)
+    * ``batch.up_ph`` — UP self-phase (source stream, 58 ch)
+
+    ``up_ph`` is a virtual field materialised by :class:`CombinedHDF5Dataset`
+    from the last channels of the physical ``fhr_up_ph`` HDF5 dataset — the
+    79 cross-phase channels are stripped inside the loader and never reach
+    this wrapper. See the ``load_fields`` section of ``config_lag_attn_v1.yaml``.
 
     Expected keys in ``self.hparams`` (merged via ``apply_config_hyperparameters``):
 
@@ -62,33 +68,23 @@ class SeqVaeLagAttnPl(LightningModelBase):
     #: Progress bar shows total + feature losses.
     prog_bar_metrics: Tuple[str, ...] = ("total_loss", "feat_loss")
 
-    @staticmethod
-    def _slice_up_self_phase(fhr_up_ph: torch.Tensor) -> torch.Tensor:
-        """Return the UP self-phase slice ``fhr_up_ph[..., 79:137]`` → (B, T, 58).
-
-        The ``fhr_up_ph`` field stores 79 cross-phase coefficients followed by
-        58 UP self-phase coefficients. The new source stream uses only the
-        self-phase block.
-        """
-        if fhr_up_ph.shape[-1] < 137:
-            raise RuntimeError(
-                f"fhr_up_ph has only {fhr_up_ph.shape[-1]} channels; expected >= 137."
-            )
-        return fhr_up_ph[..., 79:137]
-
     def _build_source_stream(self, batch: Any) -> torch.Tensor:
         """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttnV1.forward``.
 
-        If ``use_up_st`` is True, concatenate ``up_st`` (43) with the UP self-
-        phase slice (58) giving ``(B, T, 101)``. Otherwise return just the
-        self-phase slice ``(B, T, 58)``. If ``use_up_st`` is True but the
-        batch lacks ``up_st``, raise a clear error — mixing dims mid-training
-        would break the fixed ``SourceInputAdapter``.
+        When ``use_up_st=True`` the stream is ``[up_st, up_ph]`` concatenated
+        along the channel axis → ``(B, T, 101)``. When ``use_up_st=False`` it
+        collapses to just ``up_ph`` → ``(B, T, 58)``.
         """
-        up_self = self._slice_up_self_phase(batch.fhr_up_ph)
+        up_ph = getattr(batch, "up_ph", None)
+        if up_ph is None:
+            raise RuntimeError(
+                "batch has no `up_ph` field. Make sure 'up_ph' is listed in "
+                "dataset_kwargs.load_fields of the config so "
+                "CombinedHDF5Dataset materialises it from fhr_up_ph."
+            )
         use_up_st = bool(getattr(self.orig_model, "use_up_st", False))
         if not use_up_st:
-            return up_self
+            return up_ph
         up_st = getattr(batch, "up_st", None)
         if up_st is None:
             raise RuntimeError(
@@ -97,7 +93,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
                 "load_fields in the config, rebuild the HDF5 with up_st, or "
                 "set use_up_st=False."
             )
-        return torch.cat([up_st, up_self], dim=-1)
+        return torch.cat([up_st, up_ph], dim=-1)
 
     def compute_loss_and_metrics(
         self, batch: Any, batch_idx: int, stage: str
