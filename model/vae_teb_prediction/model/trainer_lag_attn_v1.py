@@ -318,6 +318,23 @@ def main(config_path: str = _DEFAULT_CONFIG) -> None:
     np.random.seed(42)
     torch.manual_seed(42)
 
+    # Workaround for a torch._dynamo ``DDPOptimizer`` + ``use_reentrant=False``
+    # activation-checkpointing incompatibility. ``LagCrossAttention.forward``
+    # wraps its inner ``_attend`` call in ``torch.utils.checkpoint.checkpoint``
+    # (see ``attention_grad_checkpoint`` in the config). When the model is
+    # additionally compiled via ``torch.compile`` inside ``LightningModelBase``
+    # and launched under multi-GPU DDP, Dynamo's ``DDPOptimizer`` splits the
+    # graph into buckets at gradient-reduction boundaries. AOT autograd's
+    # ``min_cut_rematerialization_partition`` then asserts with
+    # ``Node add_XXXX was invalid, but is output`` because the activation
+    # checkpoint HOP ends up straddling a bucket cut. Disabling the DDP
+    # optimizer forces Dynamo to compile the module as a single graph, which
+    # preserves both ``torch.compile`` and activation checkpointing at the
+    # cost of losing bucket-overlapped grad-reduction from DDPOptimizer.
+    import torch._dynamo
+
+    torch._dynamo.config.optimize_ddp = False
+
     start_time = time.time()
 
     with open(config_path) as f:
