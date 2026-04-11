@@ -149,7 +149,7 @@ def run(input_path: str, output_path: str, verify: bool = True) -> None:
     if verify:
         logger.info("Verifying by loading into SeqVae...")
         try:
-            from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
+            from model.vae_teb_prediction.model.vae_teb_model_prediction import SeqVae
             from train.graph_models_utils import load_checkpoint_strict
 
             vae = SeqVae()
