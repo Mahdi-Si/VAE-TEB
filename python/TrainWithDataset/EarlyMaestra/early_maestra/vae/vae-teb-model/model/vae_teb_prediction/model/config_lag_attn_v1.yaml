@@ -30,7 +30,7 @@ general_config:
     test: 128
 
   folders_config:
-    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/lag_attn_v1
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v1
 
 model_config:
   VAE_model:
@@ -102,13 +102,14 @@ model_config:
 
 dataset_config:
     vae_train_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/train_dataset_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_no_cs.hdf5
     vae_test_datasets:
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/pre_training_dataset/test_dataset_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_no_cs.hdf5 # List of HDF5 file paths for validation
 
-    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/stats.hdf5                    # Path to normalization stats.hdf5
 
     kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
     num_folds: 10
@@ -141,10 +142,10 @@ dataset_config:
         cs_label: null
         bg_label: null
         epoch_min: null
-        epoch_max: -23000
+        epoch_max: -44640
         label: null
         cache_size: 10000
-        trim_minutes: 2.0
+        trim_minutes: 1.0
 
 
 # Advanced configs ========================================================
@@ -181,7 +182,7 @@ advanced_config:
     early_stopping:
       enabled: false
       monitor: "val/total_loss"
-      patience: 30
+      patience: 300
       min_delta: 0.0001
 
     model_checkpoint:
@@ -190,10 +191,10 @@ advanced_config:
       mode: "min"
 
     loss_plotting:
-      max_history_size: 1000
+      max_history_size: 10000
 
     reconstruction_plotting:
-      enabled: false
+      enabled: true
       plot_frequency: 10
       num_examples: 3
 
