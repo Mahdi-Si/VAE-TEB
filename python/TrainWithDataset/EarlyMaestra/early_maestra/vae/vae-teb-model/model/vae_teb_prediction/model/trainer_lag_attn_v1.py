@@ -404,6 +404,17 @@ def main(config_path: str = _DEFAULT_CONFIG) -> None:
     logger.info(f"normalized fields: {normalize_fields}")
     logger.info(f"load fields:       {dataset_kwargs.get('load_fields')}")
 
+    # NB: ``pin_memory`` is intentionally *not* passed here. It now lives in
+    # ``dataloader_config.dataset_kwargs.pin_memory`` (set to ``false`` in the
+    # config) so it flows through ``**dataset_kwargs`` to
+    # ``HDF5Dataset.__init__``. Passing it here as well would trigger a
+    # ``TypeError: multiple values for keyword argument 'pin_memory'``.
+    # Historical note: the previous ``pin_memory=True`` argument was
+    # misleading — ``create_optimized_dataloader`` never forwarded it to
+    # ``DataLoader(pin_memory=...)``; it only fed the dataset's in-worker
+    # ``tensor.pin_memory()`` call, which forced each worker to spawn a
+    # CUDA context on ``cuda:0`` and caused the OOM at the epoch-0
+    # train→val transition.
     train_dataloader = create_optimized_dataloader(
         hdf5_files=dataset_config.get("vae_train_datasets", []),
         batch_size=config["general_config"]["batch_size"]["train"],
@@ -412,7 +423,6 @@ def main(config_path: str = _DEFAULT_CONFIG) -> None:
         stats_path=stat_path,
         normalize_fields=normalize_fields,
         prefetch_factor=dataloader_config.get("prefetch_factor", 2),
-        pin_memory=True,
         rank=0,
         world_size=1,
         **dataset_kwargs,

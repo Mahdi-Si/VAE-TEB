@@ -134,6 +134,21 @@ dataset_config:
       # not consume it, so we skip the load+normalise tax for that field.
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
       dataset_kwargs:
+        # Disable in-worker ``tensor.pin_memory()`` inside
+        # ``HDF5Dataset._create_tensor``. Pinning inside DataLoader worker
+        # processes calls ``cudaHostAlloc``, which forces each worker to
+        # create its own CUDA context on ``cuda:0`` (~400-600 MB of VRAM per
+        # worker for kernels, cuDNN/cuBLAS handles, and allocator
+        # bookkeeping). With 7 DDP ranks × ``num_workers=4`` = 28 worker
+        # processes all pinning against ``cuda:0``, rank 0's GPU OOMs the
+        # moment Lightning spawns a fresh set of validation workers at the
+        # epoch-0 train→val transition. The DataLoader's own
+        # ``pin_memory=True`` flag (passed from ``create_optimized_dataloader``
+        # in the trainer) still pins the collated batch in the *main* process,
+        # which is the PyTorch-recommended pattern and has no worker-side
+        # context cost. Flip to ``true`` only if profiling shows the
+        # main-process pin is a bottleneck, and only with ``num_workers=0``.
+        pin_memory: false
         # `up_ph` is now a first-class HDF5 field with its own per-channel
         # asinh stats (no virtual slicing from `fhr_up_ph`). `fhr_up_ph` is
         # not loaded for v1.
