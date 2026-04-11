@@ -336,11 +336,33 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "logger": logger_reference,
         }
         if torch.cuda.is_available():
+            # ``ddp_find_unused_parameters_true`` is required because
+            # :class:`SeqVaeLagAttnV1` deliberately keeps two auxiliary logvar
+            # heads (``BaselineFutureDecoder.logvar_head`` at line 700 and
+            # ``ResidualFutureDecoder.logvar_head`` at line 768 in
+            # ``vae_teb_lag_attn_v1.py``) wired into forward but not yet
+            # consumed by ``compute_loss`` — they are placeholders for a
+            # planned switch from MSE to heteroscedastic Gaussian NLL, per the
+            # docstring at ``vae_teb_lag_attn_v1.py:664-666``. Their
+            # parameters receive ``None`` gradients on every backward pass,
+            # which makes DDP's default first-iteration bucket rebuild trip
+            # with "parameters that were not used in producing the loss". The
+            # flag tells DDP's reducer to tolerate ungraded parameters, at the
+            # cost of an extra post-backward scan across the parameter list
+            # (sub-ms overhead at this model size). When the loss eventually
+            # switches to Gaussian NLL and starts consuming
+            # ``forward_outputs['logvar_base']`` / ``['logvar_full']``, this
+            # flag can be reverted to plain ``'ddp'``.
+            ddp_strategy = (
+                "ddp_find_unused_parameters_true"
+                if len(self.cuda_devices) > 1
+                else "auto"
+            )
             trainer_kwargs.update(
                 {
                     "accelerator": "gpu",
                     "devices": self.cuda_devices,
-                    "strategy": "ddp" if len(self.cuda_devices) > 1 else "auto",
+                    "strategy": ddp_strategy,
                 }
             )
         else:
