@@ -918,7 +918,7 @@ class SeqVaeLagAttnV1(nn.Module):
         if self.use_up_st:
             self.c_u = int(c_u)
         else:
-            # Fallback: source stream is UP self-phase only (last 58 of fhr_up_ph).
+            # Fallback: source stream is UP self-phase only (58-channel `up_ph`).
             self.c_u = 58
         self.max_lag = int(max_lag)
 

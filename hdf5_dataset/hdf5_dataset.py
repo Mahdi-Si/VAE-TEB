@@ -411,6 +411,8 @@ class CombinedHDF5Dataset(Dataset):
     Args:
         paths: Path(s) to HDF5 file(s).
         load_fields: Specific fields to load (None loads all). Target and weight are always included.
+            Supports the virtual field ``'up_ph'`` which is materialized from the last
+            ``(137 - up_ph_split)`` channels of the physical ``fhr_up_ph`` dataset.
         allowed_guids: Only samples with these GUIDs are included.
         cs_label: Filter by cs_label value (True/False/None for no filtering).
         bg_label: Filter by bg_label value (True/False/None for no filtering).
@@ -424,6 +426,12 @@ class CombinedHDF5Dataset(Dataset):
         stats_path: Path to HDF5 statistics file for data normalization (None disables normalization).
         normalize_fields: List of fields to normalize (None normalizes all available fields with stats).
         trim_minutes: Optional trimming time in minutes for signal data
+        up_ph_split: Channel index in ``fhr_up_ph`` at which the cross-phase block ends
+            and the UP self-phase block begins. The virtual ``up_ph`` field is
+            ``fhr_up_ph[..., up_ph_split:]`` (after the usual (channels, seq) -> (seq, channels)
+            transpose). Default 79 matches the current v3 dataset (79 cross-phase + 58 UP
+            self-phase = 137 channels total). Change this if a dataset was built with
+            different kymatio settings.
     """
     def __init__(
         self,
@@ -440,10 +448,12 @@ class CombinedHDF5Dataset(Dataset):
         dtype: torch.dtype = torch.float32,
         stats_path: Optional[str] = None,
         normalize_fields: Optional[Sequence[str]] = None,
-        trim_minutes: Optional[float] = None
+        trim_minutes: Optional[float] = None,
+        up_ph_split: int = 79,
     ):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.load_fields = None if load_fields is None else set(load_fields)
+        self.up_ph_split = int(up_ph_split)
         self.allowed_guids = set(allowed_guids) if allowed_guids is not None else None
         self.cs_label = cs_label
         self.bg_label = bg_label
@@ -835,13 +845,26 @@ class CombinedHDF5Dataset(Dataset):
         file_idx, sample_idx = self.index_map[idx]
         f = self._open_handle(file_idx)
         out: Dict[str, Any] = {}
-        
+
         # Determine fields to load
         available_fields = self._get_sample_fields(file_idx)
         if self.load_fields is None:
             fields = list(available_fields)
         else:
             fields = list(self.load_fields)
+
+        # Virtual field 'up_ph': materialized by slicing the last channels of
+        # the physical 'fhr_up_ph' dataset. If the caller asks for 'up_ph' but
+        # not 'fhr_up_ph', we still need to internally load 'fhr_up_ph' so we
+        # can slice it — but we drop it from the returned dict afterwards so
+        # the consumer only sees 'up_ph'.
+        want_up_ph = 'up_ph' in fields
+        drop_fhr_up_ph = False
+        if want_up_ph:
+            fields = [f_name for f_name in fields if f_name != 'up_ph']
+            if 'fhr_up_ph' not in fields:
+                fields.append('fhr_up_ph')
+                drop_fhr_up_ph = True
 
         # Load data efficiently
         try:
@@ -888,7 +911,30 @@ class CombinedHDF5Dataset(Dataset):
         except Exception as e:
             warnings.warn(f"Error loading sample {idx} from {self.paths[file_idx]}: {e}")
             raise
-        
+
+        # Materialize the virtual 'up_ph' field after the normal load loop so
+        # normalization and transpose have already been applied to 'fhr_up_ph'.
+        # 'fhr_up_ph' at this point has shape (seq, channels) — slice the last
+        # (channels - up_ph_split) channels to get the UP self-phase block.
+        if want_up_ph:
+            fhr_up_ph_tensor = out.get('fhr_up_ph')
+            if fhr_up_ph_tensor is not None:
+                if fhr_up_ph_tensor.dim() != 2:
+                    raise RuntimeError(
+                        f"Expected fhr_up_ph to be 2D (seq, channels); "
+                        f"got shape {tuple(fhr_up_ph_tensor.shape)}"
+                    )
+                total_channels = fhr_up_ph_tensor.shape[-1]
+                if self.up_ph_split >= total_channels:
+                    raise RuntimeError(
+                        f"up_ph_split={self.up_ph_split} but fhr_up_ph only has "
+                        f"{total_channels} channels. No UP self-phase channels "
+                        f"remain. Check the dataset version."
+                    )
+                out['up_ph'] = fhr_up_ph_tensor[..., self.up_ph_split:].contiguous()
+                if drop_fhr_up_ph:
+                    del out['fhr_up_ph']
+
         out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
         out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))
         out.setdefault('source_file_index', file_idx)
