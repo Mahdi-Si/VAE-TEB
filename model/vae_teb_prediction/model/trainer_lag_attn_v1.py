@@ -25,7 +25,7 @@ from loguru import logger
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
-from model.vae_teb_prediction.training.plotting_callback_lag_attn_v1 import (
+from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (
     LagAttnV1PlotCallback,
 )
 from train.callbacks import (
