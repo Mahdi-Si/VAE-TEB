@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 
 from train.graph_models_utils import load_checkpoint_strict
-from model.vae_teb_prediction.vae_teb_model_prediction import SeqVae
+from model.vae_teb_prediction.model.vae_teb_model_prediction import SeqVae
 
 
 def _infer_discriminative_hparams(

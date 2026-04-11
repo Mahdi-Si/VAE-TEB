@@ -670,7 +670,7 @@ def train_fold(
         torch.cuda.manual_seed_all(seed)
 
     # --- Dataset paths ---------------------------------------------------- #
-    from model.vae_teb_prediction.kfold_classifier_trainer import (
+    from model.vae_teb_prediction.classifier.kfold_classifier_trainer import (
         get_fold_datasets,
     )
 
@@ -754,7 +754,7 @@ def train_fold(
         )
 
     elif use_bucketing:
-        from model.vae_teb_prediction.guid_classifier.length_bucket_sampler import (
+        from model.vae_teb_prediction.classifier.guid_classifier.length_bucket_sampler import (
             create_bucketed_sequence_dataloader,
         )
 
