@@ -307,18 +307,26 @@ def create_initial_hdf5(
     len_sequence: int = 300,
     n_cross_phase_channels: int = 62,
     n_up_st_channels: int = 0,
+    n_up_ph_channels: int = 0,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
     Includes v3 scattering layout and the ``second_stage_onset`` field.
+    ``fhr_up_ph`` now contains only the FHR↔UP cross-channel phase
+    coefficients; the UP self-phase harmonics live in a separate
+    first-class ``up_ph`` dataset with their own per-channel asinh stats.
 
     Args:
         path: Output HDF5 file path (overwrites if exists).
         len_signal: Raw signal length (e.g. 5760).
         n_channels: Total phase + cross-phase channels.
         len_sequence: Sequence dimension length.
-        n_cross_phase_channels: Channels for fhr_up_ph.
-        n_up_st_channels: Number of UP scattering channels (0 = do not create up_st dataset).
+        n_cross_phase_channels: Channels for ``fhr_up_ph`` (pure cross-phase,
+            equals ``masks["n_cross"]``).
+        n_up_st_channels: Number of UP scattering channels (0 = do not create
+            ``up_st`` dataset).
+        n_up_ph_channels: Number of UP self-phase harmonic channels (0 = do not
+            create ``up_ph`` dataset). Equals ``masks["n_up_phase"]``.
     """
     try:
         os.remove(path)
@@ -376,6 +384,17 @@ def create_initial_hdf5(
                 maxshape=(None, n_up_st_channels, len_sequence),
                 dtype="f4",
                 chunks=(chunk_n, n_up_st_channels, len_sequence),
+                compression="lzf",
+            )
+        # up_ph: UP self-phase harmonics (optional). First-class field with its
+        # own per-channel asinh stats — no longer concatenated into fhr_up_ph.
+        if n_up_ph_channels > 0:
+            h5f.create_dataset(
+                "up_ph",
+                shape=(0, n_up_ph_channels, len_sequence),
+                maxshape=(None, n_up_ph_channels, len_sequence),
+                dtype="f4",
+                chunks=(chunk_n, n_up_ph_channels, len_sequence),
                 compression="lzf",
             )
         h5f.create_dataset(
@@ -459,6 +478,7 @@ def append_samples_batch(
     tlo_batch: np.ndarray,
     second_stage_batch: np.ndarray,
     up_st_batch: Optional[np.ndarray] = None,
+    up_ph_batch: Optional[np.ndarray] = None,
 ) -> None:
     """Append K samples to an existing HDF5 file in a single open/close.
 
@@ -468,16 +488,21 @@ def append_samples_batch(
         up_batch: Shape ``(K, len_signal)``.
         fhr_st_batch: Shape ``(K, 43, len_seq)``.
         fhr_ph_batch: Shape ``(K, n_ph, len_seq)``.
-        fhr_up_ph_batch: Shape ``(K, n_cross, len_seq)``.
+        fhr_up_ph_batch: Shape ``(K, n_cross, len_seq)`` — cross-channel phase
+            coefficients only. UP self-phase harmonics are passed via
+            ``up_ph_batch``.
         target_batch: Shape ``(K, len_seq)``.
         weight_batch: Shape ``(K, len_seq)``.
         guid_batch: List of GUID strings, length K.
         epoch_batch: Shape ``(K,)``, float32.
         cs_label_batch: Shape ``(K,)``, uint8.
         bg_label_batch: Shape ``(K,)``, uint8.
-        up_st_batch: Shape ``(K, 43, len_seq)``. Optional.
         tlo_batch: Shape ``(K,)``, float32.
         second_stage_batch: Shape ``(K,)``, float32.
+        up_st_batch: Shape ``(K, 43, len_seq)``. Optional — only written if the
+            target HDF5 has the ``up_st`` dataset.
+        up_ph_batch: Shape ``(K, n_up_phase, len_seq)``. Optional — only written
+            if the target HDF5 has the ``up_ph`` dataset.
     """
     k = fhr_batch.shape[0]
     if k == 0:
@@ -494,6 +519,8 @@ def append_samples_batch(
         h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
         if up_st_batch is not None and "up_st" in h5f:
             h5f["up_st"][idx:new_size] = up_st_batch
+        if up_ph_batch is not None and "up_ph" in h5f:
+            h5f["up_ph"][idx:new_size] = up_ph_batch
         h5f["target"][idx:new_size] = target_batch
         h5f["weight"][idx:new_size] = weight_batch
         h5f["epoch"][idx:new_size] = epoch_batch
@@ -1814,7 +1841,8 @@ def create_hdf5_dataset_from_records_list(
 
             # Collect valid scattered segments
             b_fhr, b_up = [], []
-            b_fhr_st, b_fhr_ph, b_fhr_up_ph, b_up_st = [], [], [], []
+            b_fhr_st, b_fhr_ph, b_fhr_up_ph = [], [], []
+            b_up_st, b_up_ph = [], []
             b_target, b_weight = [], []
             b_guid, b_epoch = [], []
             b_cs, b_bg, b_tlo, b_ss = [], [], [], []
@@ -1833,9 +1861,11 @@ def create_hdf5_dataset_from_records_list(
                 up_ph_full = st_up_phase_list[seg_j]["phase_corr"][0]
 
                 fhr_ph_coeff = fhr_ph_full[phase_mask, :]
-                cross_ph = cross_full[cross_mask, :]
-                up_self_ph = up_ph_full[up_phase_mask, :]
-                fhr_up_ph_coeff = torch.cat([cross_ph, up_self_ph], dim=0)
+                # fhr_up_ph now carries ONLY the cross-channel phase
+                # coefficients. UP self-phase harmonics live in up_ph as a
+                # first-class field with their own per-channel asinh stats.
+                fhr_up_ph_coeff = cross_full[cross_mask, :]     # (n_cross, T)
+                up_ph_coeff = up_ph_full[up_phase_mask, :]       # (n_up_phase, T)
 
                 if guid_tracking is not None:
                     guid_tracking[guid_key].included_domain_starts.append(
@@ -1851,6 +1881,7 @@ def create_hdf5_dataset_from_records_list(
                 b_up_st.append(up_st_coeff.detach().cpu().numpy())
                 b_fhr_ph.append(fhr_ph_coeff.detach().cpu().numpy())
                 b_fhr_up_ph.append(fhr_up_ph_coeff.detach().cpu().numpy())
+                b_up_ph.append(up_ph_coeff.detach().cpu().numpy())
                 b_target.append(pre_defined_target * sample_weights[orig_idx, :])
                 b_weight.append(sample_weights[orig_idx, :])
                 b_guid.append(record_name)
@@ -1877,6 +1908,7 @@ def create_hdf5_dataset_from_records_list(
                     tlo_batch=np.array(b_tlo, dtype=np.float32),
                     second_stage_batch=np.array(b_ss, dtype=np.float32),
                     up_st_batch=np.stack(b_up_st),
+                    up_ph_batch=np.stack(b_up_ph),
                 )
 
         except Exception as e:
@@ -1932,6 +1964,8 @@ def _build_hdf5_for_partition(
         verbose: Verbosity flag.
     """
     os.makedirs(part_dir, exist_ok=True)
+    n_cross = int(masks["n_cross"])
+    n_up_phase = int(masks["n_up_phase"])
     for sg, records in subgroups.items():
         if not records:
             continue
@@ -1942,8 +1976,10 @@ def _build_hdf5_for_partition(
             len_signal=SIGNAL_LENGTH,
             n_channels=total_channels,
             len_sequence=sequence_length,
-            n_cross_phase_channels=n_combined_cross,
+            # fhr_up_ph now holds only the cross-channel phase coefficients.
+            n_cross_phase_channels=n_cross,
             n_up_st_channels=43,
+            n_up_ph_channels=n_up_phase,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -2225,6 +2261,8 @@ def create_new_pipeline(
         ("test_dataset_no_cs.hdf5", test_no_cs, False, True),
     ]
 
+    pretrain_n_cross = int(masks["n_cross"])
+    pretrain_n_up_phase = int(masks["n_up_phase"])
     for fname, records, cs, bg in pretrain_sets:
         hdf5_file = os.path.join(pretrain_path, fname)
         logger.info(f"Creating {fname} ({len(records)} GUIDs)...")
@@ -2233,8 +2271,10 @@ def create_new_pipeline(
             len_signal=SIGNAL_LENGTH,
             n_channels=total_channels,
             len_sequence=sequence_length,
-            n_cross_phase_channels=n_combined_cross,
+            # fhr_up_ph now holds only the cross-channel phase coefficients.
+            n_cross_phase_channels=pretrain_n_cross,
             n_up_st_channels=43,
+            n_up_ph_channels=pretrain_n_up_phase,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,

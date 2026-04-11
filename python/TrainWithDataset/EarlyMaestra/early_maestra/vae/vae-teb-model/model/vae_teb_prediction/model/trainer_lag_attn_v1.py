@@ -50,13 +50,15 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
     * ``batch.fhr_st`` — FHR scattering (target stream, 43 ch)
     * ``batch.fhr_ph`` — FHR phase harmonics (target stream, 44 ch)
-    * ``batch.up_st`` — UP scattering (source stream, 43 ch, optional)
-    * ``batch.up_ph`` — UP self-phase (source stream, 58 ch)
+    * ``batch.up_st`` — UP scattering (source stream, 43 ch; optional,
+      skipped when the model was built with ``use_up_st=False``)
+    * ``batch.up_ph`` — UP self-phase harmonics (source stream, 58 ch)
 
-    ``up_ph`` is a virtual field materialised by :class:`CombinedHDF5Dataset`
-    from the last channels of the physical ``fhr_up_ph`` HDF5 dataset — the
-    79 cross-phase channels are stripped inside the loader and never reach
-    this wrapper. See the ``load_fields`` section of ``config_lag_attn_v1.yaml``.
+    Both ``up_st`` and ``up_ph`` are first-class HDF5 datasets with their
+    own per-channel asinh/log stats. They are not derived from
+    ``fhr_up_ph``. The two tensors are concatenated on the channel axis
+    here when ``use_up_st=True`` to form the 101-channel source stream;
+    otherwise ``up_ph`` alone is used (58 channels).
 
     Expected keys in ``self.hparams`` (merged via ``apply_config_hyperparameters``):
 
@@ -73,14 +75,16 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
         When ``use_up_st=True`` the stream is ``[up_st, up_ph]`` concatenated
         along the channel axis → ``(B, T, 101)``. When ``use_up_st=False`` it
-        collapses to just ``up_ph`` → ``(B, T, 58)``.
+        collapses to just ``up_ph`` → ``(B, T, 58)``. Both fields are read
+        directly from the batch as independent HDF5 datasets.
         """
         up_ph = getattr(batch, "up_ph", None)
         if up_ph is None:
             raise RuntimeError(
                 "batch has no `up_ph` field. Make sure 'up_ph' is listed in "
-                "dataset_kwargs.load_fields of the config so "
-                "CombinedHDF5Dataset materialises it from fhr_up_ph."
+                "`dataset_kwargs.load_fields` of the config and that the HDF5 "
+                "files were built with the new_pipeline (which writes up_ph as "
+                "a first-class 58-channel dataset)."
             )
         use_up_st = bool(getattr(self.orig_model, "use_up_st", False))
         if not use_up_st:
@@ -91,7 +95,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
                 "SeqVaeLagAttnV1 was constructed with use_up_st=True but the "
                 "batch does not contain `up_st`. Either add 'up_st' to "
                 "load_fields in the config, rebuild the HDF5 with up_st, or "
-                "set use_up_st=False."
+                "set use_up_st=False (and c_u=58) on the model."
             )
         return torch.cat([up_st, up_ph], dim=-1)
 

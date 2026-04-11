@@ -73,8 +73,8 @@ Trimming interaction:
     trims ``trim_minutes`` from each end of every segment.  This affects:
 
     - Raw signals (fhr, up): 5280 -> 4800 samples  (at trim=1.0)
-    - Feature sequences (fhr_st, fhr_ph, fhr_up_ph, target, weight):
-      330 -> 300 timesteps  (at trim=1.0, decimation=16)
+    - Feature sequences (fhr_st, fhr_ph, fhr_up_ph, up_st, up_ph, target,
+      weight): 330 -> 300 timesteps  (at trim=1.0, decimation=16)
 
     ``segment_duration`` should match the effective window after trimming
     (default 1200.0 s = 20 min).

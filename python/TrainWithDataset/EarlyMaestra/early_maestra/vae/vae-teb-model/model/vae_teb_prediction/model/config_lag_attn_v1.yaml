@@ -1,19 +1,27 @@
 # Lag-Attentive Residual VAE-TEB v1 training configuration.
 #
-# Prerequisites (see plan Phase 0):
-#   * Every HDF5 file listed below must contain the `up_st` field
-#     (n_up_st_channels=43). Older pre_training_dataset files may not — the
-#     dataset loader falls back gracefully, but the UP scattering stream is
-#     then unavailable and the source adapter should be built with
-#     `use_up_st: false` to match the 58-channel fallback.
-#   * The stats file at `stat_path` must contain per-channel statistics for
-#     `up_st`. If it does not, rerun `hdf5_dataset/calculate_dataset_stats.py`
-#     before training.
+# Prerequisites:
+#   * HDF5 datasets must be produced by
+#     `hdf5_dataset/new_pipeline/create_new_pipeline.py`, which writes
+#     `up_st` (43 channels, log-normalised) and `up_ph` (58 channels,
+#     asinh-normalised) as first-class datasets alongside `fhr_st`,
+#     `fhr_ph`, and `fhr_up_ph` (now cross-channel phase only, 79
+#     channels — NOT concatenated with UP self-phase any more).
+#   * The stats file at `stat_path` must be regenerated after any dataset
+#     rebuild by running `hdf5_dataset/calculate_dataset_stats.py`. It
+#     must contain per-channel statistics for every field listed in
+#     `normalize_fields` below — in particular `up_st` and `up_ph` which
+#     are independent fields with their own asinh/log stats.
 #
-# Warm-start: the new architecture's latent width (d_z=24), internal width
-# (d_model=128) and source input channels (101) are all different from the
-# current SeqVae checkpoint, so `core_model_checkpoint` must stay null. v1
-# trains from scratch.
+# Ablation toggle: `use_up_st: true` → source stream = concat(up_st, up_ph)
+# with c_u=101. `use_up_st: false` → source stream = up_ph alone with
+# c_u=58. The model constructor raises if (c_u, use_up_st) are
+# inconsistent.
+#
+# Warm-start: the lag-attn v1 architecture's latent width (d_z=24),
+# internal width (d_model=128) and source input channel count are all
+# different from any previous SeqVae checkpoint, so `core_model_checkpoint`
+# must stay null. v1 trains from scratch.
 
 general_config:
   tag: lag_attn_v1_baseline
@@ -54,7 +62,7 @@ model_config:
     warmup_period: 30      # first 2 minutes ignored in both feature & KL losses
     sequence_length: 300
     c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
-    c_u: 101               # 43 (up_st) + 58 (up_ph) -- pre-fallback value
+    c_u: 101               # 43 (up_st) + 58 (up_ph); must equal 58 if use_up_st=false
     use_up_st: true
     lstm_layers: 2
     dropout: 0.1
@@ -120,17 +128,15 @@ dataset_config:
     dataloader_config:
       num_workers: 4
       prefetch_factor: 4
-      # Normalization is keyed by the physical HDF5 field name. 'fhr_up_ph'
-      # is still listed here because the dataset loader internally normalizes
-      # the full 137-channel block before slicing out the 58-channel 'up_ph'
-      # virtual field — this way no stats file rebuild is needed.
-      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']
+      # Normalization is keyed by the physical HDF5 field name. Every field
+      # listed here must have a matching entry in the stats HDF5.
+      # `fhr_up_ph` (cross-channel phase) is intentionally omitted: v1 does
+      # not consume it, so we skip the load+normalise tax for that field.
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
       dataset_kwargs:
-        # 'up_ph' is a virtual field: CombinedHDF5Dataset materializes it
-        # from 'fhr_up_ph[..., up_ph_split:]' at load time, then drops the
-        # unused cross-phase block from the returned sample. 'fhr_up_ph' is
-        # intentionally absent from this list so v1 consumers only ever see
-        # 'up_ph'.
+        # `up_ph` is now a first-class HDF5 field with its own per-channel
+        # asinh stats (no virtual slicing from `fhr_up_ph`). `fhr_up_ph` is
+        # not loaded for v1.
         load_fields:
           [
             'fhr',
@@ -146,7 +152,6 @@ dataset_config:
             'bg_label',
             'guid',
           ]
-        up_ph_split: 79                # 79 cross-phase + 58 UP self-phase (v3 schema)
         allowed_guids: null
         cs_label: null
         bg_label: null
