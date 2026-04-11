@@ -136,7 +136,7 @@ def precompute_fold_embeddings(
     from model.transformer.model.config import TransformerConfig
     from model.transformer.model.model import CausalMultimodalTransformer
     from model.transformer.tr_testing.base import TransformerTestRunner
-    from model.vae_teb_prediction.kfold_classifier_trainer import (
+    from model.vae_teb_prediction.classifier.kfold_classifier_trainer import (
         get_fold_datasets,
     )
     from train.graph_models_utils import load_checkpoint_strict
@@ -570,7 +570,7 @@ def create_precomputed_embedding_dataloader(
         Tuple of ``(DataLoader, PrecomputedEmbeddingDataset)``.
     """
     from hdf5_dataset.guid_hdf5_dataset import sequence_collate_fn
-    from model.vae_teb_prediction.guid_classifier.length_bucket_sampler import (
+    from model.vae_teb_prediction.classifier.guid_classifier.length_bucket_sampler import (
         LengthBucketSampler,
     )
 
