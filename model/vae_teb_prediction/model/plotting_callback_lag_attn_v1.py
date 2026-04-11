@@ -316,7 +316,8 @@ def _build_diagnostic_figure(
         y_st: FHR scattering features ``(B, T, 43)``.
         y_ph: FHR phase features ``(B, T, 44)``.
         up_st: UP scattering features ``(B, T, 43)``, or ``None`` if absent.
-        up_ph: UP self-phase slice ``(B, T, 58)`` — virtual field from the dataset.
+        up_ph: UP self-phase harmonics ``(B, T, 58)`` — first-class HDF5 field
+            with its own per-channel asinh stats.
         fhr_raw: Raw FHR trace ``(B, R)`` or ``None``.
         up_raw: Raw UP trace ``(B, R)`` or ``None``.
         sample_idx: Index into the batch.

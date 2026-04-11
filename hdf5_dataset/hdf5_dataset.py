@@ -397,22 +397,27 @@ class CombinedHDF5Dataset(Dataset):
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
 
     With Scattering transform (J=11, Q=4, T=16) and v3 coefficient selection:
-    - FHR scattering: 43 coefficients (first order)
-    - FHR phase: 44 selected coefficients
-    - FHR-UP cross-phase + UP self-phase: dynamic count (stored in fhr_up_ph)
-    
+    - FHR scattering (``fhr_st``): 43 coefficients (first order)
+    - FHR phase (``fhr_ph``): 44 selected coefficients
+    - FHR↔UP cross-channel phase (``fhr_up_ph``): ``n_cross`` coefficients
+    - UP scattering (``up_st``): 43 coefficients (first order)
+    - UP self-phase (``up_ph``): ``n_up_phase`` coefficients
+
+    All multi-channel scattering/phase fields are first-class HDF5 datasets
+    with their own per-channel statistics. ``up_ph`` is no longer virtually
+    sliced from ``fhr_up_ph`` — each of the five fields flows through the
+    same normalisation code path.
+
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
     - Multi-worker data loading
     - Memory efficiency and fast I/O
     - Advanced filtering and selective loading
     - Data normalization using precomputed statistics with optimal coefficient selection
-    
+
     Args:
         paths: Path(s) to HDF5 file(s).
         load_fields: Specific fields to load (None loads all). Target and weight are always included.
-            Supports the virtual field ``'up_ph'`` which is materialized from the last
-            ``(137 - up_ph_split)`` channels of the physical ``fhr_up_ph`` dataset.
         allowed_guids: Only samples with these GUIDs are included.
         cs_label: Filter by cs_label value (True/False/None for no filtering).
         bg_label: Filter by bg_label value (True/False/None for no filtering).
@@ -426,12 +431,6 @@ class CombinedHDF5Dataset(Dataset):
         stats_path: Path to HDF5 statistics file for data normalization (None disables normalization).
         normalize_fields: List of fields to normalize (None normalizes all available fields with stats).
         trim_minutes: Optional trimming time in minutes for signal data
-        up_ph_split: Channel index in ``fhr_up_ph`` at which the cross-phase block ends
-            and the UP self-phase block begins. The virtual ``up_ph`` field is
-            ``fhr_up_ph[..., up_ph_split:]`` (after the usual (channels, seq) -> (seq, channels)
-            transpose). Default 79 matches the current v3 dataset (79 cross-phase + 58 UP
-            self-phase = 137 channels total). Change this if a dataset was built with
-            different kymatio settings.
     """
     def __init__(
         self,
@@ -449,11 +448,9 @@ class CombinedHDF5Dataset(Dataset):
         stats_path: Optional[str] = None,
         normalize_fields: Optional[Sequence[str]] = None,
         trim_minutes: Optional[float] = None,
-        up_ph_split: int = 79,
     ):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.load_fields = None if load_fields is None else set(load_fields)
-        self.up_ph_split = int(up_ph_split)
         self.allowed_guids = set(allowed_guids) if allowed_guids is not None else None
         self.cs_label = cs_label
         self.bg_label = bg_label
@@ -488,14 +485,17 @@ class CombinedHDF5Dataset(Dataset):
         self.normalization_enabled = False
         
         # Define which channels should use LOG normalization for optimal coefficients.
-        # Updated for v3 selection (44 phase + dynamic cross-phase + UP self-phase channels).
+        # These configs are overwritten at load time by whatever the stats file
+        # says (see `_load_normalization_stats`); what is kept here is a
+        # sensible fallback used only when no stats file is provided.
         self.log_norm_channels_config = {
             'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude order 0)
             'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',     # All 44 selected phase coefficients
-            'fhr_up_ph': 'all'   # All cross-phase + UP self-phase coefficients
+            'fhr_ph': 'all',     # All 44 selected FHR phase coefficients
+            'fhr_up_ph': 'all',  # FHR↔UP cross-channel phase coefficients
+            'up_ph': 'all',      # UP self-phase harmonics (first-class field)
         }
         
         # This will be populated from the stats file, but the config above provides a fallback.
@@ -853,25 +853,14 @@ class CombinedHDF5Dataset(Dataset):
         else:
             fields = list(self.load_fields)
 
-        # Virtual field 'up_ph': materialized by slicing the last channels of
-        # the physical 'fhr_up_ph' dataset. If the caller asks for 'up_ph' but
-        # not 'fhr_up_ph', we still need to internally load 'fhr_up_ph' so we
-        # can slice it — but we drop it from the returned dict afterwards so
-        # the consumer only sees 'up_ph'.
-        want_up_ph = 'up_ph' in fields
-        drop_fhr_up_ph = False
-        if want_up_ph:
-            fields = [f_name for f_name in fields if f_name != 'up_ph']
-            if 'fhr_up_ph' not in fields:
-                fields.append('fhr_up_ph')
-                drop_fhr_up_ph = True
-
-        # Load data efficiently
+        # Load data efficiently. All scattering/phase fields are first-class
+        # HDF5 datasets — ``up_ph`` is no longer virtually sliced from
+        # ``fhr_up_ph``.
         try:
             for name in fields:
                 if name not in available_fields:
                     continue
-                    
+
                 data = f[name][sample_idx]
 
                 if self.trim_minutes is not None:
@@ -879,7 +868,7 @@ class CombinedHDF5Dataset(Dataset):
                         start_trim = self.trim_samples_raw
                         end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
                         data = data[start_trim:end_trim]
-                    elif name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']:
+                    elif name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph']:
                         start_trim = self.trim_samples_decimated
                         end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
                         data = data[:, start_trim:end_trim]
@@ -895,45 +884,22 @@ class CombinedHDF5Dataset(Dataset):
                 else:
                     # Optimized tensor creation
                     tensor = self._create_tensor(np.asarray(data))
-                    
+
                     # Apply normalization if enabled and applicable
                     if (self.normalization_enabled and
-                        name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']):
+                        name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph']):
                         tensor = self._normalize_data(name, tensor)
-                    
+
                     # SPEED OPTIMIZATION: Apply permutation here once instead of multiple times in training
                     # Convert from HDF5 format (channels, sequence) to model format (sequence, channels)
-                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st'] and tensor.dim() == 2:
+                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph'] and tensor.dim() == 2:
                         tensor = tensor.transpose(0, 1)  # (channels, seq) -> (seq, channels)
-                    
+
                     out[name] = tensor
-                    
+
         except Exception as e:
             warnings.warn(f"Error loading sample {idx} from {self.paths[file_idx]}: {e}")
             raise
-
-        # Materialize the virtual 'up_ph' field after the normal load loop so
-        # normalization and transpose have already been applied to 'fhr_up_ph'.
-        # 'fhr_up_ph' at this point has shape (seq, channels) — slice the last
-        # (channels - up_ph_split) channels to get the UP self-phase block.
-        if want_up_ph:
-            fhr_up_ph_tensor = out.get('fhr_up_ph')
-            if fhr_up_ph_tensor is not None:
-                if fhr_up_ph_tensor.dim() != 2:
-                    raise RuntimeError(
-                        f"Expected fhr_up_ph to be 2D (seq, channels); "
-                        f"got shape {tuple(fhr_up_ph_tensor.shape)}"
-                    )
-                total_channels = fhr_up_ph_tensor.shape[-1]
-                if self.up_ph_split >= total_channels:
-                    raise RuntimeError(
-                        f"up_ph_split={self.up_ph_split} but fhr_up_ph only has "
-                        f"{total_channels} channels. No UP self-phase channels "
-                        f"remain. Check the dataset version."
-                    )
-                out['up_ph'] = fhr_up_ph_tensor[..., self.up_ph_split:].contiguous()
-                if drop_fhr_up_ph:
-                    del out['fhr_up_ph']
 
         out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
         out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))

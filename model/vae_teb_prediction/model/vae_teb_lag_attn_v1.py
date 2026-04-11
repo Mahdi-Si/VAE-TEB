@@ -888,9 +888,15 @@ class SeqVaeLagAttnV1(nn.Module):
             warmup_period: Number of initial decimated steps to ignore in both
                 KL and feature losses (default 30 = 2 min).
             c_y: Target feature channel count (43 + 44 = 87).
-            c_u: Source feature channel count (101 if ``use_up_st`` else 58).
-            use_up_st: Whether ``up_st`` is available in the dataset. Controls
-                the ``SourceInputAdapter`` input dim. Deploy-time choice.
+            c_u: Source feature channel count. Must equal ``101`` when
+                ``use_up_st=True`` (43 ``up_st`` + 58 ``up_ph``) and ``58``
+                when ``use_up_st=False`` (``up_ph`` only). An inconsistent
+                ``(c_u, use_up_st)`` pair raises ``ValueError``.
+            use_up_st: Ablation toggle. ``True`` (default) feeds the source
+                adapter with the concatenation ``[up_st, up_ph]``; ``False``
+                feeds only ``up_ph``. Both fields are first-class HDF5
+                datasets with their own per-channel stats — no virtual
+                slicing from ``fhr_up_ph``.
             max_lag: Maximum past lag (L = max_lag + 1).
             num_heads: Number of attention heads.
             d_head: Per-head dimensionality (must satisfy
@@ -915,11 +921,16 @@ class SeqVaeLagAttnV1(nn.Module):
         self.warmup_period = int(warmup_period)
         self.c_y = int(c_y)
         self.use_up_st = bool(use_up_st)
-        if self.use_up_st:
-            self.c_u = int(c_u)
-        else:
-            # Fallback: source stream is UP self-phase only (58-channel `up_ph`).
-            self.c_u = 58
+        expected_c_u = 101 if self.use_up_st else 58
+        if int(c_u) != expected_c_u:
+            raise ValueError(
+                f"c_u={c_u} inconsistent with use_up_st={use_up_st}; "
+                f"expected {expected_c_u} "
+                f"(43 up_st + 58 up_ph if use_up_st=True, 58 up_ph only if False). "
+                f"up_st and up_ph are first-class HDF5 fields in the current "
+                f"dataset schema — there is no virtual-slicing fallback."
+            )
+        self.c_u = expected_c_u
         self.max_lag = int(max_lag)
 
         # --- Input adapters -------------------------------------------------

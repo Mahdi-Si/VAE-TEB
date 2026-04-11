@@ -7,7 +7,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
-from hdf5_dataset import normalize_tensor_data
+from hdf5_dataset.hdf5_dataset import normalize_tensor_data
 import argparse
 
 
@@ -15,12 +15,19 @@ class DatasetStatsCalculator:
     """
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
 
-    Updated for v3 coefficient selection (J=11, Q=4, T=16):
-    - FHR scattering: 43 coefficients (first order, channel 0 regular, others log-transformed)
-    - FHR phase: 44 selected coefficients (all asinh-transformed)
-    - FHR-UP cross-phase + UP self-phase: dynamic channel count (all asinh-transformed)
-      Cross-phase: two-band selection with UP cap 0.05 Hz
-      UP self-phase: autocorr + harmonic-2 + harmonic-3 (min_freq=0.002)
+    Updated for the v3 coefficient selection (J=11, Q=4, T=16) with ``up_ph``
+    promoted to a first-class field:
+
+    - FHR scattering: 43 coefficients (first order, channel 0 regular,
+      others log-transformed).
+    - FHR phase: 44 selected coefficients (all asinh-transformed).
+    - FHR-UP cross-phase (``fhr_up_ph``): cross-channel coefficients only
+      (no longer concatenated with the UP self-phase block). All
+      asinh-transformed. Cross-phase: two-band selection with UP cap 0.05 Hz.
+    - UP scattering (``up_st``, 43 channels): channel 0 regular, channels
+      1-42 log-transformed (same structure as ``fhr_st``).
+    - UP self-phase (``up_ph``): standalone field with its own per-channel
+      asinh stats. Autocorr + harmonic-2 + harmonic-3 (``min_freq=0.002``).
 
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
@@ -29,18 +36,21 @@ class DatasetStatsCalculator:
     - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed
     - up_st (43 channels): channel 0 regular, channels 1-42 log-transformed (same as fhr_st)
     - fhr_ph (44 channels): all asinh-transformed for phase stability
-    - fhr_up_ph (dynamic channels): all asinh-transformed for cross-phase + UP self-phase
+    - fhr_up_ph (n_cross channels): all asinh-transformed for cross-channel phase
+    - up_ph (n_up_phase channels): all asinh-transformed for UP self-phase stability
     """
-    
+
     def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
-        self.stats_fields = ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']
+        self.stats_fields = [
+            'fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph'
+        ]
         self.trim_minutes = trim_minutes
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         else:
             self.device = device
-        
+
         print(f"Using device: {self.device}")
 
         if self.trim_minutes is not None:
@@ -49,18 +59,19 @@ class DatasetStatsCalculator:
         else:
             self.trim_samples_raw = 0
             self.trim_samples_decimated = 0
-        
+
         # Define transformations for optimal coefficient selection
         # LOG normalization for scattering coefficients (except order 0)
         self.log_norm_channels_config = {
             'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude channel 0)
             'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
-        
+
         # ASINH normalization for phase coefficients (better for phase data)
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',    # All 44 selected phase coefficients
-            'fhr_up_ph': 'all'  # All selected cross-phase + UP self-phase coefficients
+            'fhr_ph': 'all',     # All 44 selected FHR phase coefficients
+            'fhr_up_ph': 'all',  # FHR↔UP cross-channel phase coefficients
+            'up_ph': 'all',      # UP self-phase harmonics
         }
         
     def _initialize_stats(self, field_shapes: Dict[str, Tuple[int, ...]]) -> Dict[str, Dict[str, Any]]:
@@ -399,7 +410,13 @@ class DatasetStatsCalculator:
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
-            f.attrs['description'] = 'Statistics for v3 selection: 43 FHR scattering (log), 43 UP scattering (log), 44 phase (asinh), cross-phase + UP self-phase (asinh)'
+            f.attrs['description'] = (
+                'Statistics for v3 selection: 43 FHR scattering (log), '
+                '43 UP scattering (log), 44 FHR phase (asinh), '
+                'cross-channel phase fhr_up_ph (asinh), '
+                'UP self-phase up_ph (asinh). up_ph is now a first-class field '
+                'with its own per-channel stats.'
+            )
             
             # Save statistics for each field
             for field, field_stats in stats.items():
