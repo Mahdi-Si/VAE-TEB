@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import lightning as pl
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
@@ -69,6 +70,54 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
     #: Progress bar shows total + feature losses.
     prog_bar_metrics: Tuple[str, ...] = ("total_loss", "feat_loss")
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        *,
+        lr: float = 1e-4,
+        lr_milestones: Optional[Iterable[int]] = None,
+        weight_decay: float = 1e-4,
+        module_name: Optional[str] = None,
+    ) -> None:
+        """Initialize the wrapper while bypassing ``torch.compile``.
+
+        ``LightningModelBase.__init__`` wraps ``base_model`` with
+        ``torch.compile`` unconditionally. That path is incompatible with
+        :class:`SeqVaeLagAttnV1` because ``LagCrossAttention.forward`` wraps
+        its inner ``_attend`` call in
+        ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`` (see
+        the ``attention_grad_checkpoint`` option in the config). When the
+        outer module is compiled, AOT autograd's
+        ``min_cut_rematerialization_partition`` asserts with
+        ``Node <name> was invalid, but is output`` during the first backward
+        pass, because forward-only nodes inside the activation-checkpointed
+        region get marked as backward-graph outputs across the partition cut.
+        Disabling ``torch._dynamo.config.optimize_ddp`` was not sufficient —
+        the assertion reappears on ``constant_pad_nd_1`` from the lag memory
+        builder's ``F.pad`` call even with Inductor as the top-level backend.
+
+        We replicate the base ``__init__`` manually, skipping the
+        ``torch.compile(base_model)`` step. The model runs eager, preserving
+        activation checkpointing (which is necessary to fit the ~900 MB lag
+        memory bank at ``B=64``). This mirrors the pattern already used by
+        :class:`PlTemporalClassifier` for a similar incompatibility.
+
+        Args:
+            base_model: The :class:`SeqVaeLagAttnV1` instance to wrap.
+            lr: Learning rate stored in ``self.hparams``.
+            lr_milestones: Optional epoch milestones for the LR scheduler.
+            weight_decay: AdamW weight decay applied across parameters.
+            module_name: Friendly name used in logs and debug messages.
+        """
+        # NB: we intentionally skip ``LightningModelBase.__init__`` and call
+        # the grandparent Lightning ``__init__`` directly so the
+        # ``torch.compile`` line in the base class is never executed.
+        pl.LightningModule.__init__(self)
+        self.save_hyperparameters(ignore=["base_model"])
+        self._orig_model = base_model
+        self._wrapper_name = module_name or self.__class__.__name__
+        self.model = base_model  # Eager mode — no torch.compile
 
     def _build_source_stream(self, batch: Any) -> torch.Tensor:
         """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttnV1.forward``.
@@ -317,23 +366,6 @@ def main(config_path: str = _DEFAULT_CONFIG) -> None:
     """Build data loaders, model, trainer and run ``fit``."""
     np.random.seed(42)
     torch.manual_seed(42)
-
-    # Workaround for a torch._dynamo ``DDPOptimizer`` + ``use_reentrant=False``
-    # activation-checkpointing incompatibility. ``LagCrossAttention.forward``
-    # wraps its inner ``_attend`` call in ``torch.utils.checkpoint.checkpoint``
-    # (see ``attention_grad_checkpoint`` in the config). When the model is
-    # additionally compiled via ``torch.compile`` inside ``LightningModelBase``
-    # and launched under multi-GPU DDP, Dynamo's ``DDPOptimizer`` splits the
-    # graph into buckets at gradient-reduction boundaries. AOT autograd's
-    # ``min_cut_rematerialization_partition`` then asserts with
-    # ``Node add_XXXX was invalid, but is output`` because the activation
-    # checkpoint HOP ends up straddling a bucket cut. Disabling the DDP
-    # optimizer forces Dynamo to compile the module as a single graph, which
-    # preserves both ``torch.compile`` and activation checkpointing at the
-    # cost of losing bucket-overlapped grad-reduction from DDPOptimizer.
-    import torch._dynamo
-
-    torch._dynamo.config.optimize_ddp = False
 
     start_time = time.time()
 
