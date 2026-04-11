@@ -41,7 +41,7 @@ model_config:
     beta_anneal_epochs: 50
     beta_cycle_len: 1000
     beta_const_val: 0.01
-    kld_beta: 0.01
+    kld_beta: 0.001
 
     # Feature-loss weighting (spec section 8.7)
     lambda_full: 1.0
@@ -151,7 +151,7 @@ dataset_config:
         cs_label: null
         bg_label: null
         epoch_min: null
-        epoch_max: -44640
+        epoch_max: -48000
         label: null
         cache_size: 10000
         trim_minutes: 1.0

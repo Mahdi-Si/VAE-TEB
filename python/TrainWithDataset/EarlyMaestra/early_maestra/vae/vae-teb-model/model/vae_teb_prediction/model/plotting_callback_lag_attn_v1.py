@@ -5,6 +5,13 @@ validation epoch (gated by ``plot_frequency``). Style helpers are imported
 from :mod:`model.transformer.tr_testing.style` so training diagnostics and
 test-time figures share the same visual language.
 
+Every row uses the same x-axis: **time in seconds, from 0 to R / fs_raw**
+(typically ``R = 4800``, ``fs_raw = 4 Hz`` → 1200 s). The raw FHR/UP trace,
+the decimated feature heatmaps, the latent heatmap, the KLD maps, the lag
+attention, and both forecast sub-rows are all aligned column-for-column —
+so a vertical line through any time point cuts every row at the same
+physical instant.
+
 Row layout
 ----------
 0.  Raw FHR + UP — twin y-axes (optional, only if ``fhr``/``up`` are loaded).
@@ -15,15 +22,21 @@ Row layout
     when ``use_up_st=False``.
 3.  Latent ``z`` heatmap (d_z, T).
 4.  Posterior μ vs prior μ stacked heatmap (2·d_z, T) with separator.
-5.  KLD per-dim — ``d_z`` tiny panels in a 4×6 grid, each on its own y-axis
-    so low-variance dimensions are still readable.
+5.  KLD per latent dim — single ``(d_z, T)`` imshow (``magma``, vmin=0),
+    aligned with every other row.
 6.  Total KLD per time step + attention entropy (twin-axis trace).
 7.  Lag attention matrix (L, T) with the argmax-lag-per-step overlay.
-8.  TE lag attribution map (``kld_per_t × mean_alpha``) (L, T).
-9.  Feature forecast at an anchor — three subplots for three selected
-    channels showing GT vs baseline vs full prediction across the horizon.
-10. Per-anchor feature MAE for baseline and full (shows the "UP gain").
-11. Residual magnitude ``||delta_mu_src||`` vs KL (twin-axis trace).
+8.  TE lag attribution — two stacked sub-panels. Top: raw
+    ``kld_per_t × mean_alpha`` with the colour range clipped to the 99th
+    percentile so rare attention spikes don't black-out the rest. Bottom:
+    the same map column-normalised (each time step divided by its own
+    max) so the lag-selection pattern is visible even when the per-step
+    KL is tiny. Columns with effectively zero KL are masked to NaN.
+9.  Feature forecast — nested 2×3 grid. The top sub-row shows the **average
+    forecast** (overlap-averaged per-anchor horizons) and the bottom sub-row
+    shows **concatenated single forecasts** (non-overlapping, stride ``H_d``)
+    for three selected feature channels. Both sub-rows overlay GT, baseline
+    (``mu_base``) and full (``mu_full``) traces.
 """
 from __future__ import annotations
 
@@ -44,17 +57,14 @@ from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec  # noqa: E402
 from model.transformer.tr_testing.style import (
     COLOR_BLACK,
     COLOR_BLUE,
-    COLOR_GRAY,
     COLOR_GREEN,
     COLOR_LIGHT_GRAY,
     COLOR_ORANGE,
     COLOR_PURPLE,
-    COLOR_SKY,
     COLOR_VERMILLION,
     SAVE_DPI,
     add_colorbar,
     apply_publication_style,
-    heatmap,
     save_figure,
     style_axes,
 )
@@ -133,10 +143,124 @@ def _kld_per_dim_np(
     )
 
 
-def _shade_warmup(ax: Any, warmup: int, *, color: str = COLOR_LIGHT_GRAY) -> None:
-    """Shade the first ``warmup`` decimated steps on an axes."""
-    if warmup and warmup > 0:
-        ax.axvspan(-0.5, warmup - 0.5, color=color, alpha=0.35, zorder=0)
+def _time_axes(
+    T: int, R: int, fs_raw: float = 4.0
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Return ``(time_raw_sec, time_dec_sec, t_max_sec)`` for unified alignment.
+
+    All diagnostic rows share a single physical-time axis. Raw FHR/UP trace
+    lives on ``time_raw`` (step ``1/fs_raw``); decimated features / latents
+    live on ``time_dec`` (step ``t_max / T``). The imshow ``extent`` and the
+    ``ax.set_xlim`` call for every axes both use ``(0.0, t_max_sec)``.
+
+    Args:
+        T: Number of decimated steps (e.g. 300).
+        R: Number of raw samples (e.g. 4800).
+        fs_raw: Raw sampling rate in Hz (default 4.0).
+
+    Returns:
+        Tuple ``(time_raw, time_dec, t_max_sec)``:
+        - ``time_raw``: ``(R,)`` seconds axis for the raw signal.
+        - ``time_dec``: ``(T,)`` seconds axis for decimated tensors; step
+          centres at ``0, Δ, 2Δ, …`` with ``Δ = t_max / T``.
+        - ``t_max_sec``: total window length in seconds (``R / fs_raw``).
+    """
+    t_max = float(R) / float(fs_raw)
+    time_raw = np.arange(R, dtype=np.float64) / float(fs_raw)
+    time_dec = np.arange(T, dtype=np.float64) * (t_max / float(T))
+    return time_raw, time_dec, t_max
+
+
+def _shade_warmup(
+    ax: Any,
+    warmup: int,
+    t_max: float,
+    T: int,
+    *,
+    color: str = COLOR_LIGHT_GRAY,
+) -> None:
+    """Shade the first ``warmup`` decimated steps, in seconds, on an axes.
+
+    Args:
+        ax: Target axes.
+        warmup: Warmup length in decimated steps.
+        t_max: Full x-axis extent in seconds (``R / fs_raw``).
+        T: Total number of decimated steps (for step-to-seconds conversion).
+        color: Shading colour.
+    """
+    if warmup and warmup > 0 and T > 0:
+        warmup_sec = float(warmup) * (t_max / float(T))
+        ax.axvspan(0.0, warmup_sec, color=color, alpha=0.35, zorder=0)
+
+
+def _average_forecast_per_channel(
+    mu_pred: np.ndarray,
+    T: int,
+    H_d: int,
+    warmup: int,
+) -> np.ndarray:
+    """Average overlapping per-anchor horizon forecasts onto the decimated axis.
+
+    Anchor ``t ∈ [warmup, T - H_d)`` contributes its per-horizon prediction
+    ``mu_pred[t, h, :]`` to the target decimated index ``τ = t + 1 + h``.
+    The returned array averages every anchor's contribution to each ``τ``.
+    Positions with no contributing anchor are set to ``NaN`` (so they render
+    as gaps in a matplotlib line plot).
+
+    Args:
+        mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
+        T: Number of decimated steps.
+        H_d: Forecast horizon in decimated steps.
+        warmup: Warmup length in decimated steps.
+
+    Returns:
+        ``(T, C)`` averaged forecast (float32).
+    """
+    C = mu_pred.shape[-1]
+    acc = np.zeros((T, C), dtype=np.float64)
+    cnt = np.zeros((T,), dtype=np.float64)
+    t_start = max(int(warmup), 0)
+    t_end = max(t_start, T - H_d)
+    for t in range(t_start, t_end):
+        tau_end = min(t + 1 + H_d, T)
+        tau = np.arange(t + 1, tau_end)
+        h = tau - (t + 1)
+        acc[tau] += mu_pred[t, h, :]
+        cnt[tau] += 1.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        avg = acc / np.where(cnt > 0.0, cnt, 1.0)[:, None]
+    avg[cnt == 0.0] = np.nan
+    return avg.astype(np.float32)
+
+
+def _concat_single_forecasts(
+    mu_pred: np.ndarray,
+    T: int,
+    H_d: int,
+    warmup: int,
+) -> np.ndarray:
+    """Non-overlapping, stride-``H_d`` concatenation of per-anchor horizons.
+
+    Starting at ``t = warmup``, walk forward in strides of ``H_d`` anchors;
+    each anchor contributes its full horizon slice ``[t+1, t+1+H_d)`` to the
+    output. Any positions not covered are ``NaN`` so matplotlib leaves gaps.
+
+    Args:
+        mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
+        T: Number of decimated steps.
+        H_d: Forecast horizon in decimated steps.
+        warmup: Warmup length in decimated steps.
+
+    Returns:
+        ``(T, C)`` concatenated forecast (float32).
+    """
+    C = mu_pred.shape[-1]
+    out = np.full((T, C), np.nan, dtype=np.float32)
+    t = max(int(warmup), 0)
+    while t + 1 + H_d <= T and t < T:
+        out[t + 1 : t + 1 + H_d, :] = mu_pred[t, :, :].astype(np.float32)
+        t += H_d
+    return out
 
 
 def _stack_feature_blocks(
@@ -211,6 +335,12 @@ def _build_diagnostic_figure(
         The constructed :class:`matplotlib.figure.Figure`. The caller is
         responsible for saving and closing it.
     """
+    # ``forecast_anchor_frac`` is kept in the signature for backwards
+    # compatibility with ``LagAttnV1PlotCallback`` config, but the new
+    # forecast row uses full-sequence averaging / concatenation instead of a
+    # single anchor, so the value is no longer used here.
+    del forecast_anchor_frac  # unused — intentionally
+
     i = sample_idx
 
     # ---- Numpy views of the relevant tensors for this sample ---------------
@@ -231,12 +361,12 @@ def _build_diagnostic_figure(
 
     mu_base_np = _np(outs["mu_base"][i])                            # (T, H_d, 87)
     mu_full_np = _np(outs["mu_full"][i])                            # (T, H_d, 87)
-    delta_mu_src_np = _np(outs["delta_mu_src"][i])                  # (T, H_d, 87)
 
-    T = y_st_np.shape[0]
-    d_z = mu_prior_np.shape[-1]
-    L = attn_np.shape[-1]
-    H_d = horizon
+    T = int(y_st_np.shape[0])
+    d_z = int(mu_prior_np.shape[-1])
+    L = int(attn_np.shape[-1])
+    H_d = int(horizon)
+    C_y = int(y_st_np.shape[-1] + y_ph_np.shape[-1])
 
     Y_full_np = np.concatenate([y_st_np, y_ph_np], axis=-1)         # (T, 87)
 
@@ -253,40 +383,33 @@ def _build_diagnostic_figure(
     eps = 1e-12
     attn_entropy_per_step = -(mean_alpha * np.log(mean_alpha + eps)).sum(axis=-1)
 
-    # Future target via unfold (on numpy).
-    if T - H_d > 0:
-        # Y_plus_np[t] == Y[t+1 : t+1+H_d, :] for t in [0, T-H_d)
-        Y_shift_np = Y_full_np[1:]                                  # (T-1, 87)
-        Y_plus_np = np.lib.stride_tricks.sliding_window_view(
-            Y_shift_np, window_shape=H_d, axis=0
-        )  # (T-H_d, 87, H_d)
-        Y_plus_np = Y_plus_np.transpose(0, 2, 1)                    # (T-H_d, H_d, 87)
+    # Full-sequence forecast reductions (average + concatenated, (T, C_y)).
+    avg_base = _average_forecast_per_channel(mu_base_np, T, H_d, warmup)
+    avg_full = _average_forecast_per_channel(mu_full_np, T, H_d, warmup)
+    concat_base = _concat_single_forecasts(mu_base_np, T, H_d, warmup)
+    concat_full = _concat_single_forecasts(mu_full_np, T, H_d, warmup)
+
+    # ------------------------------------------------------------------
+    # Shared physical-time axis (seconds) — every row uses this.
+    # ------------------------------------------------------------------
+    has_raw = fhr_raw is not None and up_raw is not None
+    fs_raw = 4.0
+    if has_raw:
+        assert fhr_raw is not None and up_raw is not None
+        R = int(_np(fhr_raw[i]).ravel().shape[0])
     else:
-        Y_plus_np = None
-
-    # Per-anchor MAE traces.
-    valid_anchors = np.arange(warmup, max(warmup, T - H_d))
-    mae_full = None
-    mae_base = None
-    if Y_plus_np is not None and valid_anchors.size > 0:
-        diff_full = np.abs(mu_full_np[valid_anchors] - Y_plus_np[valid_anchors])
-        diff_base = np.abs(mu_base_np[valid_anchors] - Y_plus_np[valid_anchors])
-        mae_full = diff_full.mean(axis=(1, 2))                      # (T_valid,)
-        mae_base = diff_base.mean(axis=(1, 2))
-
-    # Residual magnitude per anchor.
-    delta_src_l2 = np.linalg.norm(
-        delta_mu_src_np.reshape(T, -1), axis=-1
-    )                                                               # (T,)
+        # Fall back to the nominal 16× decimation so downstream math is
+        # still well-defined when the raw signal is missing from the batch.
+        R = T * 16
+    time_raw, time_dec, t_max = _time_axes(T, R, fs_raw=fs_raw)
 
     # ------------------------------------------------------------------
     # Figure and gridspec
     # ------------------------------------------------------------------
     apply_publication_style()
 
-    has_raw = fhr_raw is not None and up_raw is not None
-
-    # Row heights: raw is optional, KLD-per-dim grid takes 3x a normal row.
+    # Row heights: raw is optional; forecast slot hosts a nested 2x3 grid
+    # (two sub-rows, three channels) so it needs more vertical space.
     row_specs = []  # (name, height_ratio)
     if has_raw:
         row_specs.append(("raw", 1.0))
@@ -295,13 +418,11 @@ def _build_diagnostic_figure(
         ("up_feats", 1.4),
         ("z_latent", 1.0),
         ("post_prior", 1.1),
-        ("kld_dims", 4.0),
+        ("kld_dims", 1.2),
         ("kld_total", 0.9),
         ("lag_attn", 1.2),
-        ("te_lag", 1.2),
-        ("forecast", 1.0),
-        ("mae", 0.9),
-        ("residual", 0.9),
+        ("te_lag", 2.4),
+        ("forecast", 2.8),
     ]
     n_rows = len(row_specs)
     height_ratios = [h for _, h in row_specs]
@@ -318,7 +439,12 @@ def _build_diagnostic_figure(
     def row_axes(row: int) -> Any:
         return fig.add_subplot(gs[row, :])
 
-    row_idx_of = {name: i for i, (name, _) in enumerate(row_specs)}
+    row_idx_of = {name: idx for idx, (name, _) in enumerate(row_specs)}
+
+    def _finalise_time_axis(ax: Any) -> None:
+        """Every row ends with this so all panels line up column-for-column."""
+        ax.set_xlim(0.0, t_max)
+        _shade_warmup(ax, warmup, t_max, T)
 
     # ---- Row: Raw FHR + UP -------------------------------------------------
     if has_raw:
@@ -326,18 +452,15 @@ def _build_diagnostic_figure(
         assert fhr_raw is not None and up_raw is not None  # has_raw guard
         fhr_np = _np(fhr_raw[i]).ravel()
         up_np = _np(up_raw[i]).ravel()
-        fs = 4.0  # sampling rate in Hz
-        t_raw = np.arange(len(fhr_np)) / fs
-        ax.plot(t_raw, fhr_np, color=COLOR_BLUE, linewidth=0.8, label="FHR")
+        ax.plot(time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.8, label="FHR")
         ax2 = ax.twinx()
-        ax2.plot(t_raw, up_np, color=COLOR_GREEN, linewidth=0.8, label="UP")
+        ax2.plot(time_raw, up_np, color=COLOR_GREEN, linewidth=0.8, label="UP")
         ax.set_title("Raw FHR / UP signals", fontsize=9, pad=6)
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_ylabel("FHR (bpm, normalised)", fontsize=8, color=COLOR_BLUE)
         ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
         ax2.set_ylabel("UP (mmHg, normalised)", fontsize=8, color=COLOR_GREEN)
         ax2.tick_params(axis="y", labelcolor=COLOR_GREEN)
-        ax.set_xlim(t_raw[0], t_raw[-1])
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax.legend(
@@ -345,20 +468,28 @@ def _build_diagnostic_figure(
             loc="upper right", fontsize=7, framealpha=0.95,
         )
         style_axes(ax, grid="both")
+        _finalise_time_axis(ax)
+        ax2.set_xlim(0.0, t_max)
 
     # ---- Row: FHR features stacked heatmap --------------------------------
     ax = row_axes(row_idx_of["fhr_feats"])
     fhr_stack, fhr_sep = _stack_feature_blocks(y_st_np.T, y_ph_np.T)     # (87, T)
-    heatmap(
-        ax, fhr_stack, cmap="bwr", origin="upper",
-        title="FHR features \u2014 scattering (rows 0-42)  |  phase (rows 43-86)",
-        ylabel="Channel",
-        label="Value",
-        fig=fig,
+    vabs_fhr = float(np.nanmax(np.abs(fhr_stack))) or 1.0
+    im = ax.imshow(
+        fhr_stack, aspect="auto", cmap="bwr", origin="upper",
+        vmin=-vabs_fhr, vmax=vabs_fhr,
+        extent=[0.0, t_max, fhr_stack.shape[0] - 0.5, -0.5],
     )
+    ax.set_title(
+        "FHR features \u2014 scattering (rows 0-42)  |  phase (rows 43-86)",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Channel", fontsize=8)
     if fhr_sep is not None:
         ax.axhline(fhr_sep + 0.5, color="white", linewidth=1.2, linestyle="--")
-    _shade_warmup(ax, warmup)
+    add_colorbar(fig, im, ax, label="Value")
+    _finalise_time_axis(ax)
 
     # ---- Row: UP features stacked heatmap ---------------------------------
     ax = row_axes(row_idx_of["up_feats"])
@@ -370,35 +501,48 @@ def _build_diagnostic_figure(
     else:
         up_stack, up_sep = up_ph_np.T, None                               # (58, T)
         title_up = "UP features \u2014 self-phase only (up_st absent)"
-    heatmap(
-        ax, up_stack, cmap="bwr", origin="upper",
-        title=title_up, ylabel="Channel", label="Value", fig=fig,
+    vabs_up = float(np.nanmax(np.abs(up_stack))) or 1.0
+    im = ax.imshow(
+        up_stack, aspect="auto", cmap="bwr", origin="upper",
+        vmin=-vabs_up, vmax=vabs_up,
+        extent=[0.0, t_max, up_stack.shape[0] - 0.5, -0.5],
     )
+    ax.set_title(title_up, fontsize=9, pad=6)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Channel", fontsize=8)
     if up_sep is not None:
         ax.axhline(up_sep + 0.5, color="white", linewidth=1.2, linestyle="--")
-    _shade_warmup(ax, warmup)
+    add_colorbar(fig, im, ax, label="Value")
+    _finalise_time_axis(ax)
 
     # ---- Row: Latent z ----------------------------------------------------
     ax = row_axes(row_idx_of["z_latent"])
-    heatmap(
-        ax, z_np.T, cmap="bwr", origin="lower",
-        title=f"Latent z (d_z={d_z})", ylabel="Latent dim",
-        label="z", fig=fig,
+    z_img = z_np.T                                                  # (d_z, T)
+    vabs_z = float(np.nanmax(np.abs(z_img))) or 1.0
+    im = ax.imshow(
+        z_img, aspect="auto", cmap="bwr", origin="lower",
+        vmin=-vabs_z, vmax=vabs_z,
+        extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
-    _shade_warmup(ax, warmup)
+    ax.set_title(f"Latent z (d_z={d_z})", fontsize=9, pad=6)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Latent dim", fontsize=8)
+    add_colorbar(fig, im, ax, label="z")
+    _finalise_time_axis(ax)
 
     # ---- Row: Posterior μ vs prior μ split heatmap ------------------------
     ax = row_axes(row_idx_of["post_prior"])
     post_prior = np.concatenate([mu_post_np.T, mu_prior_np.T], axis=0)   # (2*d_z, T)
-    vabs = np.nanmax(np.abs(post_prior)) or 1.0
+    vabs_pp = float(np.nanmax(np.abs(post_prior))) or 1.0
     im = ax.imshow(
         post_prior, aspect="auto", cmap="bwr", origin="upper",
-        vmin=-vabs, vmax=vabs,
+        vmin=-vabs_pp, vmax=vabs_pp,
+        extent=[0.0, t_max, 2 * d_z - 0.5, -0.5],
     )
     ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
     ax.set_yticks([d_z // 2, d_z + d_z // 2])
     ax.set_yticklabels(["Posterior \u03bc", "Prior \u03bc\u2070"])
-    ax.set_xlabel("Time Steps", fontsize=8)
+    ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_title(
         "Posterior vs Prior means (TEB residual = posterior - prior)",
         fontsize=9, pad=6,
@@ -409,67 +553,52 @@ def _build_diagnostic_figure(
         ax.spines[spine].set_color(COLOR_BLACK)
         ax.spines[spine].set_linewidth(0.6)
     add_colorbar(fig, im, ax, label="Value")
-    _shade_warmup(ax, warmup)
+    _finalise_time_axis(ax)
 
-    # ---- Row: KLD per-dim small multiples (4 x 6 nested grid) --------------
-    sub_gs = GridSpecFromSubplotSpec(
-        4, 6, subplot_spec=gs[row_idx_of["kld_dims"], :],
-        wspace=0.35, hspace=0.55,
+    # ---- Row: KLD per-latent-dim — single imshow --------------------------
+    ax = row_axes(row_idx_of["kld_dims"])
+    kld_img = kld_per_dim.T                                         # (d_z, T)
+    # Clip tiny negative rounding artefacts from the closed-form formula.
+    kld_img = np.where(np.isfinite(kld_img), kld_img, 0.0)
+    kld_max = float(np.nanmax(kld_img)) if kld_img.size else 0.0
+    vmax_kld = kld_max if kld_max > 0.0 else 1.0
+    im = ax.imshow(
+        kld_img, aspect="auto", cmap="magma", origin="lower",
+        vmin=0.0, vmax=vmax_kld,
+        extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
-    for d in range(min(24, d_z)):
-        rr, cc = divmod(d, 6)
-        ax_d = fig.add_subplot(sub_gs[rr, cc])
-        trace = kld_per_dim[:, d]
-        ax_d.plot(np.arange(T), trace, color=COLOR_PURPLE, linewidth=0.8)
-        _shade_warmup(ax_d, warmup)
-        ax_d.set_title(
-            f"z{d}  max={trace.max():.2f}",
-            fontsize=6, pad=2,
-        )
-        ax_d.tick_params(axis="both", which="both", labelsize=5, length=2)
-        # Minimal tick labelling: left column keeps y-ticks, bottom row keeps x-ticks.
-        if cc != 0:
-            ax_d.set_yticklabels([])
-        if rr != 3:
-            ax_d.set_xticklabels([])
-        for spine in ("top", "bottom", "left", "right"):
-            ax_d.spines[spine].set_linewidth(0.4)
-            ax_d.spines[spine].set_color(COLOR_GRAY)
-    # Shared supertitle for the mini-grid (uses the first cell's position).
-    # Drop a synthetic annotation via fig.text so constrained_layout can handle it.
-    try:
-        bbox = sub_gs.get_topmost_subplotspec().get_position(fig)  # type: ignore[attr-defined]
-    except Exception:
-        bbox = None
-    if bbox is not None:
-        fig.text(
-            0.5, bbox.y1 + 0.005,
-            "KLD per latent dim (independent y-axis per dim)",
-            ha="center", va="bottom", fontsize=9, color=COLOR_BLACK,
-        )
+    ax.set_title(
+        f"KLD per latent dim (d_z={d_z} rows, time columns) \u2014 max={kld_max:.3f} nats",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Latent dim", fontsize=8)
+    for spine in ("top", "bottom", "left", "right"):
+        ax.spines[spine].set_visible(True)
+        ax.spines[spine].set_color(COLOR_BLACK)
+        ax.spines[spine].set_linewidth(0.6)
+    add_colorbar(fig, im, ax, label="KL (nats)")
+    _finalise_time_axis(ax)
 
     # ---- Row: Total KL per step + attention entropy (twin-axis) -----------
     ax = row_axes(row_idx_of["kld_total"])
-    t_steps = np.arange(T)
     ax.plot(
-        t_steps, kld_per_t_np, color=COLOR_PURPLE,
+        time_dec, kld_per_t_np, color=COLOR_PURPLE,
         linewidth=1.0, label="KL per step",
     )
     ax.set_ylabel("KL (nats)", fontsize=8, color=COLOR_PURPLE)
     ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
     ax2 = ax.twinx()
     ax2.plot(
-        t_steps, attn_entropy_per_step, color=COLOR_ORANGE,
+        time_dec, attn_entropy_per_step, color=COLOR_ORANGE,
         linewidth=0.9, alpha=0.85, label="Attention entropy",
     )
     ax2.set_ylabel("Attention entropy (nats)", fontsize=8, color=COLOR_ORANGE)
     ax2.tick_params(axis="y", labelcolor=COLOR_ORANGE)
-    _shade_warmup(ax, warmup)
     ax.set_title(
         "Total KL per timestep vs mean attention entropy", fontsize=9, pad=6,
     )
-    ax.set_xlabel("Time Steps", fontsize=8)
-    ax.set_xlim(0, T - 1)
+    ax.set_xlabel("Time (s)", fontsize=8)
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(
@@ -477,15 +606,17 @@ def _build_diagnostic_figure(
         loc="upper right", fontsize=7, framealpha=0.95,
     )
     style_axes(ax, grid="both")
+    _finalise_time_axis(ax)
+    ax2.set_xlim(0.0, t_max)
 
     # ---- Row: Lag attention matrix (mean over heads) ----------------------
     ax = row_axes(row_idx_of["lag_attn"])
     im = ax.imshow(
         mean_alpha.T, aspect="auto", cmap="viridis", origin="lower",
-        extent=[0, T - 1, 0, L - 1],
+        extent=[0.0, t_max, -0.5, L - 0.5],
     )
     ax.plot(
-        t_steps, argmax_lag, color=COLOR_VERMILLION,
+        time_dec, argmax_lag, color=COLOR_VERMILLION,
         linewidth=0.9, alpha=0.9, label="argmax lag",
     )
     ax.set_title(
@@ -493,7 +624,7 @@ def _build_diagnostic_figure(
         f"(L={L} = 0..{L - 1})",
         fontsize=9, pad=6,
     )
-    ax.set_xlabel("Time Steps (anchor t)", fontsize=8)
+    ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     for spine in ("top", "bottom", "left", "right"):
@@ -501,133 +632,150 @@ def _build_diagnostic_figure(
         ax.spines[spine].set_color(COLOR_BLACK)
         ax.spines[spine].set_linewidth(0.6)
     add_colorbar(fig, im, ax, label="Attn prob")
-    _shade_warmup(ax, warmup)
+    _finalise_time_axis(ax)
 
-    # ---- Row: TE lag map (KL-weighted attention) --------------------------
-    ax = row_axes(row_idx_of["te_lag"])
-    te_map = te_lag_np.T  # (L, T)
-    vabs_te = np.nanmax(np.abs(te_map)) or 1.0
+    # ---- Row: TE lag attribution — two stacked panels --------------------
+    # Top: raw TE map with 99th-percentile vmax clipping (robust to rare
+    # sharp attention spikes that otherwise steal the whole colour range).
+    # Bottom: per-column-normalised TE map (each time step divided by its
+    # own max), exposing the lag-selection pattern independently of the
+    # per-step KL magnitude — useful when the KL trace has large dynamic
+    # range or is globally small.
+    te_gs = GridSpecFromSubplotSpec(
+        2, 1,
+        subplot_spec=gs[row_idx_of["te_lag"], :],
+        hspace=0.55,
+    )
+
+    te_map = te_lag_np.T                                             # (L, T)
+    # Closed-form KL can occasionally produce tiny negative rounding noise;
+    # te_lag_map is a non-negative quantity by construction, so clamp.
+    te_map = np.where(np.isfinite(te_map) & (te_map > 0.0), te_map, 0.0)
+    te_global_max = float(te_map.max()) if te_map.size else 0.0
+
+    # --- Top: raw TE with 99th-percentile clipping ---
+    ax = fig.add_subplot(te_gs[0, 0])
+    te_positive = te_map[te_map > 0.0]
+    if te_positive.size > 0:
+        vmax_te_p99 = float(np.nanpercentile(te_positive, 99.0))
+    else:
+        vmax_te_p99 = 0.0
+    if vmax_te_p99 <= 0.0:
+        vmax_te_p99 = te_global_max if te_global_max > 0.0 else 1.0
     im = ax.imshow(
         te_map, aspect="auto", cmap="magma", origin="lower",
-        extent=[0, T - 1, 0, L - 1], vmin=0.0, vmax=vabs_te,
+        extent=[0.0, t_max, -0.5, L - 0.5],
+        vmin=0.0, vmax=vmax_te_p99,
     )
     ax.set_title(
-        "TE lag attribution (KL \u00d7 mean-\u03b1) \u2014 which lag drives KL at each step",
+        "TE lag attribution (KL \u00d7 mean-\u03b1) \u2014 p99-clipped "
+        f"(vmax={vmax_te_p99:.3e}, global max={te_global_max:.3e})",
         fontsize=9, pad=6,
     )
-    ax.set_xlabel("Time Steps (anchor t)", fontsize=8)
-    ax.set_ylabel("Lag \u2113", fontsize=8)
+    ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
     for spine in ("top", "bottom", "left", "right"):
         ax.spines[spine].set_visible(True)
         ax.spines[spine].set_color(COLOR_BLACK)
         ax.spines[spine].set_linewidth(0.6)
     add_colorbar(fig, im, ax, label="KL weight")
-    _shade_warmup(ax, warmup)
+    _finalise_time_axis(ax)
 
-    # ---- Row: Feature forecast at one anchor (3 subplots) -----------------
-    a0 = int(round(forecast_anchor_frac * (T - H_d - 1)))
-    a0 = max(warmup, min(a0, max(warmup, T - H_d - 1)))
+    # --- Bottom: column-normalised TE ---
+    # Each time column is divided by its own max so the lag-selection
+    # pattern is visible independently of the KL magnitude at that step.
+    # Columns where KL is effectively zero (warmup / collapsed posterior)
+    # are masked to NaN instead of being amplified by the normalisation.
+    ax = fig.add_subplot(te_gs[1, 0])
+    col_max = te_map.max(axis=0, keepdims=True)                      # (1, T)
+    col_threshold = max(1e-12, te_global_max * 1e-6)
+    valid_cols = col_max > col_threshold                             # (1, T)
+    denom = np.where(valid_cols, col_max, 1.0)
+    te_norm = np.where(valid_cols, te_map / denom, np.nan)           # (L, T)
+    im = ax.imshow(
+        te_norm, aspect="auto", cmap="viridis", origin="lower",
+        extent=[0.0, t_max, -0.5, L - 0.5],
+        vmin=0.0, vmax=1.0,
+    )
+    ax.set_title(
+        "TE lag attribution \u2014 column-normalised "
+        "(dominant lag per time step, independent of KL magnitude)",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    for spine in ("top", "bottom", "left", "right"):
+        ax.spines[spine].set_visible(True)
+        ax.spines[spine].set_color(COLOR_BLACK)
+        ax.spines[spine].set_linewidth(0.6)
+    add_colorbar(fig, im, ax, label="Column-norm")
+    _finalise_time_axis(ax)
+
+    # ---- Row: Feature forecast — avg + concatenated single forecasts ------
     chosen_channels = list(forecast_channels)[:3]
-    # Always pad to 3 with 0s if fewer specified
     while len(chosen_channels) < 3:
         chosen_channels.append(0)
 
+    fc_sub_gs = GridSpecFromSubplotSpec(
+        2, 3,
+        subplot_spec=gs[row_idx_of["forecast"], :],
+        wspace=0.22, hspace=0.45,
+    )
+
     for j, ch in enumerate(chosen_channels):
-        ax_f = fig.add_subplot(gs[row_idx_of["forecast"], j])
-        if Y_plus_np is not None and a0 < Y_plus_np.shape[0]:
-            gt = Y_plus_np[a0, :, ch]
-            pred_base = mu_base_np[a0, :, ch]
-            pred_full = mu_full_np[a0, :, ch]
-            horizon_axis = np.arange(1, H_d + 1)
-            ax_f.plot(
-                horizon_axis, gt, color=COLOR_BLACK,
-                linewidth=1.2, label="GT", zorder=4,
-            )
-            ax_f.plot(
-                horizon_axis, pred_base, color=COLOR_BLUE,
-                linewidth=1.0, alpha=0.85, label="baseline",
-            )
-            ax_f.plot(
-                horizon_axis, pred_full, color=COLOR_ORANGE,
-                linewidth=1.0, alpha=0.9, label="full",
-            )
+        ch = int(ch)
+        ch = max(0, min(ch, C_y - 1))
         block = "fhr_st" if ch < y_st_np.shape[-1] else "fhr_ph"
         local_ch = ch if ch < y_st_np.shape[-1] else ch - y_st_np.shape[-1]
-        ax_f.set_title(
-            f"Forecast @ t={a0}, ch={ch} ({block}[{local_ch}])",
+        gt_trace = Y_full_np[:, ch]
+
+        # Top sub-row — average forecast over overlapping anchors.
+        ax_avg = fig.add_subplot(fc_sub_gs[0, j])
+        ax_avg.plot(
+            time_dec, gt_trace, color=COLOR_BLACK,
+            linewidth=1.1, label="GT", zorder=4,
+        )
+        ax_avg.plot(
+            time_dec, avg_base[:, ch], color=COLOR_BLUE,
+            linewidth=1.0, alpha=0.9, label="avg baseline",
+        )
+        ax_avg.plot(
+            time_dec, avg_full[:, ch], color=COLOR_ORANGE,
+            linewidth=1.0, alpha=0.9, label="avg full",
+        )
+        ax_avg.set_title(
+            f"Avg forecast \u2014 ch={ch} ({block}[{local_ch}])",
             fontsize=9, pad=4,
         )
-        ax_f.set_xlabel("Horizon step (+\u03c4)", fontsize=7)
         if j == 0:
-            ax_f.set_ylabel("Feature value", fontsize=8)
-        ax_f.legend(loc="upper right", fontsize=6, framealpha=0.9)
-        style_axes(ax_f, grid="both")
+            ax_avg.set_ylabel("Feature value", fontsize=8)
+        ax_avg.legend(loc="upper right", fontsize=6, framealpha=0.9)
+        style_axes(ax_avg, grid="both")
+        _finalise_time_axis(ax_avg)
 
-    # ---- Row: Per-anchor feature MAE --------------------------------------
-    ax = row_axes(row_idx_of["mae"])
-    if mae_full is not None and mae_base is not None:
-        ax.plot(
-            valid_anchors, mae_base, color=COLOR_BLUE,
-            linewidth=1.0, alpha=0.9, label="baseline MAE",
+        # Bottom sub-row — non-overlapping single-horizon forecasts stitched.
+        ax_cat = fig.add_subplot(fc_sub_gs[1, j])
+        ax_cat.plot(
+            time_dec, gt_trace, color=COLOR_BLACK,
+            linewidth=1.1, label="GT", zorder=4,
         )
-        ax.plot(
-            valid_anchors, mae_full, color=COLOR_ORANGE,
-            linewidth=1.0, alpha=0.9, label="full MAE",
+        ax_cat.plot(
+            time_dec, concat_base[:, ch], color=COLOR_BLUE,
+            linewidth=1.0, alpha=0.9, label="cat baseline",
         )
-        gain = mae_base - mae_full
-        ax2 = ax.twinx()
-        ax2.plot(
-            valid_anchors, gain, color=COLOR_GREEN,
-            linewidth=0.9, alpha=0.85, label="gain (base-full)",
+        ax_cat.plot(
+            time_dec, concat_full[:, ch], color=COLOR_ORANGE,
+            linewidth=1.0, alpha=0.9, label="cat full",
         )
-        ax2.axhline(0.0, color=COLOR_GRAY, linewidth=0.5, linestyle="--")
-        ax2.set_ylabel("Gain", fontsize=8, color=COLOR_GREEN)
-        ax2.tick_params(axis="y", labelcolor=COLOR_GREEN)
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(
-            lines1 + lines2, labels1 + labels2,
-            loc="upper right", fontsize=7, framealpha=0.95,
+        ax_cat.set_title(
+            f"Concat single-horizon forecasts \u2014 ch={ch}",
+            fontsize=9, pad=4,
         )
-    ax.set_title(
-        "Per-anchor feature MAE (averaged over horizon and channels)",
-        fontsize=9, pad=6,
-    )
-    ax.set_xlabel("Anchor t", fontsize=8)
-    ax.set_ylabel("MAE", fontsize=8)
-    ax.set_xlim(0, T - 1)
-    _shade_warmup(ax, warmup)
-    style_axes(ax, grid="both")
-
-    # ---- Row: Residual magnitude vs KL -----------------------------------
-    ax = row_axes(row_idx_of["residual"])
-    ax.plot(
-        t_steps, delta_src_l2, color=COLOR_SKY,
-        linewidth=1.0, label="||\u0394\u03bc_src||",
-    )
-    ax.set_ylabel("L2 norm", fontsize=8, color=COLOR_SKY)
-    ax.tick_params(axis="y", labelcolor=COLOR_SKY)
-    ax2 = ax.twinx()
-    ax2.plot(
-        t_steps, kld_per_t_np, color=COLOR_PURPLE,
-        linewidth=0.9, alpha=0.85, label="KL per step",
-    )
-    ax2.set_ylabel("KL (nats)", fontsize=8, color=COLOR_PURPLE)
-    ax2.tick_params(axis="y", labelcolor=COLOR_PURPLE)
-    _shade_warmup(ax, warmup)
-    ax.set_title(
-        "Residual decoder usage: ||\u0394\u03bc_src|| vs KL per step",
-        fontsize=9, pad=6,
-    )
-    ax.set_xlabel("Time Steps", fontsize=8)
-    ax.set_xlim(0, T - 1)
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(
-        lines1 + lines2, labels1 + labels2,
-        loc="upper right", fontsize=7, framealpha=0.95,
-    )
-    style_axes(ax, grid="both")
+        ax_cat.set_xlabel("Time (s)", fontsize=8)
+        if j == 0:
+            ax_cat.set_ylabel("Feature value", fontsize=8)
+        ax_cat.legend(loc="upper right", fontsize=6, framealpha=0.9)
+        style_axes(ax_cat, grid="both")
+        _finalise_time_axis(ax_cat)
 
     # ---- Super title -------------------------------------------------------
     fig.suptitle(
