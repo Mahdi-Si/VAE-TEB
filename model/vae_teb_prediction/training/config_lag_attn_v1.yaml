@@ -120,16 +120,24 @@ dataset_config:
     dataloader_config:
       num_workers: 4
       prefetch_factor: 4
-      # `up_st` added to both lists (was absent in the v1/legacy config).
+      # Normalization is keyed by the physical HDF5 field name. 'fhr_up_ph'
+      # is still listed here because the dataset loader internally normalizes
+      # the full 137-channel block before slicing out the 58-channel 'up_ph'
+      # virtual field — this way no stats file rebuild is needed.
       normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st']
       dataset_kwargs:
+        # 'up_ph' is a virtual field: CombinedHDF5Dataset materializes it
+        # from 'fhr_up_ph[..., up_ph_split:]' at load time, then drops the
+        # unused cross-phase block from the returned sample. 'fhr_up_ph' is
+        # intentionally absent from this list so v1 consumers only ever see
+        # 'up_ph'.
         load_fields:
           [
             'fhr',
             'up',
             'fhr_st',
             'fhr_ph',
-            'fhr_up_ph',
+            'up_ph',
             'up_st',
             'target',
             'weight',
@@ -138,6 +146,7 @@ dataset_config:
             'bg_label',
             'guid',
           ]
+        up_ph_split: 79                # 79 cross-phase + 58 UP self-phase (v3 schema)
         allowed_guids: null
         cs_label: null
         bg_label: null
@@ -200,7 +209,7 @@ advanced_config:
 
     comprehensive_plotting:
       enabled: false    # no raw prediction in v1
-      plot_frequency: 10
+      plot_frequency: 1
 
     # Lag-attentive v1 diagnostic plotting callback. Runs on
     # on_validation_epoch_end at the given frequency and emits a
@@ -210,7 +219,7 @@ advanced_config:
     # residual usage.
     lag_attn_plotting:
       enabled: true
-      plot_frequency: 5                 # plot every 5 validation epochs
+      plot_frequency: 1                 # plot every 5 validation epochs
       num_examples: 2                   # 2 samples per trigger
       file_format: "pdf"
       forecast_channels: [0, 43, 80]    # st[0], ph[0], ph[37]
