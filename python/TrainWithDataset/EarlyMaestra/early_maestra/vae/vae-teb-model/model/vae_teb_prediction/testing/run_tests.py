@@ -651,6 +651,7 @@ if __name__ == "__main__":
         stats_path=STATS,
         config_path=CONFIG,
         max_samples=None,  # Process all samples
+        analysis_samples=400,
     )
 
     # Headline summary
