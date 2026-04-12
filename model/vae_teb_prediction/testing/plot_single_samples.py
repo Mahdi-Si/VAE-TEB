@@ -71,6 +71,32 @@ _FHR_ST_END = 43  # channel index splitting scattering from phase
 # -----------------------------------------------------------------------------
 
 
+def _auto_suptitle(fig: Any, title: str, *, base_fontsize: float, y: float = 0.995) -> None:
+    """Set a figure suptitle, shrinking the font if the text is long.
+
+    GUIDs in this project are 32-character hex strings. Combined with
+    epoch, class, and metric annotations the title line can exceed the
+    figure width at the default font size. This helper scales the font
+    down so the full title always fits without truncation or wrapping.
+
+    Args:
+        fig: Matplotlib Figure.
+        title: Full title string.
+        base_fontsize: Starting font size (used for short titles).
+        y: Vertical position passed to ``fig.suptitle``.
+    """
+    # Empirically, at base_fontsize a ~80-char title fits a 14-inch
+    # figure. Scale down linearly beyond that so the user always sees
+    # the complete GUID.
+    MAX_CHARS_AT_BASE = 80
+    n = len(title)
+    if n > MAX_CHARS_AT_BASE:
+        fontsize = max(5.0, base_fontsize * MAX_CHARS_AT_BASE / n)
+    else:
+        fontsize = base_fontsize
+    fig.suptitle(title, fontsize=fontsize, fontweight="normal", y=y)
+
+
 def _shade_warmup_min(ax: plt.Axes, warmup_min: float) -> None:
     """Shade the warmup region in minutes on a given axes."""
     if warmup_min and warmup_min > 0:
@@ -443,10 +469,7 @@ def plot_sample_lag_attn_diagnostic(
     if res_ratio is not None:
         title_bits.append(f"resid_ratio={float(res_ratio):.3f}")
 
-    fig.suptitle(
-        "  |  ".join(title_bits),
-        fontsize=FONT_TITLE, fontweight="normal", y=0.995,
-    )
+    _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -663,10 +686,7 @@ def plot_sample_signals_kld(
     if label is not None:
         title_bits.append(f"class={label}")
     if title_bits:
-        fig.suptitle(
-            "  |  ".join(title_bits),
-            fontsize=FONT_TITLE, fontweight="normal", y=0.995,
-        )
+        _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -907,10 +927,7 @@ def plot_sample_lag_attention(
     if label is not None:
         title_bits.append(f"class={label}")
     if title_bits:
-        fig.suptitle(
-            "  |  ".join(title_bits),
-            fontsize=FONT_TITLE, fontweight="normal", y=0.995,
-        )
+        _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
