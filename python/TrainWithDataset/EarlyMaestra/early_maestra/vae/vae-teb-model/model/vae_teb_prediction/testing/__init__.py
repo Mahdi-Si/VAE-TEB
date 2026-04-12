@@ -1,22 +1,25 @@
-"""
-VAE-TEB Testing Pipeline.
+"""VAE-TEB Lag-Attentive v1 testing pipeline.
 
-A modular, reusable testing framework for VAE-TEB models that provides:
-- Standardized test running with TestRunner dataclass
-- Pure metric computation functions (VAF, MSE, SNR, KLD)
-- Flexible data collection patterns
-- Publication-quality Matplotlib plots
-- Interactive Plotly visualizations
-- Composable analysis modules
+A modular testing framework tailored to :class:`SeqVaeLagAttnV1`. It
+provides:
+
+- ``TestRunner`` — minimal harness for model loading, device management,
+  batch iteration, and forward dispatch.
+- Pure metric functions over the v1 forward dict (feature forecast,
+  uplift, residual usage, attention diagnostics, TE lag maps, closed-form
+  KL).
+- Data collectors that surface those metrics in DataFrame / numpy /
+  list-of-dict formats for downstream analyses.
+- Matplotlib visualizers (feature-forecast heatmaps, attention maps,
+  uplift histograms, etc.) and Plotly interactive alternatives.
+- Composable analysis modules under ``analyses/``.
 
 Example:
     >>> from testing import TestRunner, run_all_analyses
-    >>> runner = TestRunner.from_checkpoint("model.pt", "results/")
+    >>> runner = TestRunner.from_checkpoint(
+    ...     "best.ckpt", "results/", config_path="config_lag_attn_v1.yaml"
+    ... )
     >>> results = run_all_analyses(runner, test_loader)
-
-For individual analyses:
-    >>> from testing.analyses import run_histogram_analysis, run_trajectory_analysis
-    >>> df = run_histogram_analysis(runner, test_loader)
 """
 
 from __future__ import annotations
@@ -26,71 +29,85 @@ from model.vae_teb_prediction.testing.base import TestRunner
 
 # Metric functions
 from model.vae_teb_prediction.testing.metrics import (
-    aggregate_predictions,
+    aggregate_te_lag_map,
+    compute_attention_diagnostics,
+    compute_forecast_metrics,
     compute_kld,
     compute_kld_per_sample,
     compute_kld_per_timestep,
     compute_reconstruction_metrics,
+    compute_residual_usage,
+    compute_uplift_metrics,
 )
 
 # Data collectors
 from model.vae_teb_prediction.testing.collectors import (
+    collect_attention_maps,
+    collect_forecast_errors_per_horizon,
     collect_kld_trajectory,
     collect_latents,
     collect_metrics,
     collect_predictions,
+    collect_te_lag_maps,
 )
 
 # Static visualizers (Matplotlib)
 from model.vae_teb_prediction.testing.visualizers import (
-    plot_coherence_analysis,
-    plot_coherence_signals,
-    plot_coherence_spectrum,
-    plot_cross_correlation,
+    plot_attention_mass_by_lag,
+    plot_feature_forecast_heatmap,
+    plot_forecast_error_by_horizon,
     plot_guid_absolute_trajectory,
     plot_kld_guid_trajectory,
-    plot_kld_trajectory_3d,
     plot_kld_trajectory,
+    plot_kld_trajectory_3d,
+    plot_lag_attention_heatmap,
     plot_latent_distributions,
     plot_latent_trajectory_3d,
     plot_metric_histograms,
-    plot_psd_comparison,
-    plot_reconstruction_coherence,
-    plot_reconstruction_sample,
-    plot_temporal_accuracy,
-    plot_within_window_accuracy,
-    plot_time_frequency_coherence,
+    plot_residual_usage_trace,
+    plot_te_lag_distribution,
+    plot_uplift_histogram,
 )
 
 # Interactive visualizers (Plotly)
 from model.vae_teb_prediction.testing.visualizers_interactive import (
-    plot_kld_trajectory_interactive,
     plot_kld_trajectory_3d_interactive,
+    plot_kld_trajectory_interactive,
     plot_latent_interpolation_interactive,
     plot_latent_space_3d,
     plot_latent_trajectory_3d_interactive,
     plot_metrics_comparison_interactive,
-    plot_reconstruction_interactive,
 )
 
 # Analysis modules
 from model.vae_teb_prediction.testing.analyses import (
     TrajectoryAnalyzer,
     run_all_analyses,
-    run_coherence_analysis,
+    run_anchor_position_analysis,
+    run_attention_diagnostics,
+    run_class_separation_analysis,
+    run_dataset_stats_analysis,
+    run_encoder_probe,
+    run_forecast_quality_analysis,
     run_histogram_analysis,
+    run_horizon_error_profile,
+    run_kld_lag_diagnostics,
     run_latent_distribution_analysis,
     run_latent_interpolation,
     run_latent_space_visualization,
-    run_temporal_accuracy_analysis,
+    run_residual_usage_analysis,
+    run_sample_diagnostics,
+    run_te_lag_class_analysis,
     run_trajectory_analysis,
-    run_within_window_analysis,
-    run_reconstruction_analysis,
-    run_single_prediction_windows,
+    run_uplift_analysis,
 )
 
-# Single sample plotting utility
-from model.vae_teb_prediction.testing.plot_single_samples import plot_single_samples
+# Single sample plotting
+from model.vae_teb_prediction.testing.plot_single_samples import (
+    plot_sample_lag_attention,
+    plot_sample_lag_attn_diagnostic,
+    plot_sample_signals_kld,
+)
 
 
 __all__ = [
@@ -101,31 +118,35 @@ __all__ = [
     "compute_kld",
     "compute_kld_per_sample",
     "compute_kld_per_timestep",
-    "aggregate_predictions",
+    "compute_forecast_metrics",
+    "compute_uplift_metrics",
+    "compute_residual_usage",
+    "compute_attention_diagnostics",
+    "aggregate_te_lag_map",
     # Collectors
     "collect_metrics",
     "collect_latents",
     "collect_predictions",
     "collect_kld_trajectory",
+    "collect_attention_maps",
+    "collect_te_lag_maps",
+    "collect_forecast_errors_per_horizon",
     # Static visualizers
     "plot_metric_histograms",
     "plot_latent_distributions",
-    "plot_reconstruction_sample",
-    "plot_temporal_accuracy",
     "plot_kld_trajectory",
     "plot_kld_guid_trajectory",
     "plot_kld_trajectory_3d",
     "plot_guid_absolute_trajectory",
-    "plot_coherence_analysis",
-    "plot_coherence_signals",
-    "plot_coherence_spectrum",
-    "plot_reconstruction_coherence",
-    "plot_psd_comparison",
-    "plot_cross_correlation",
-    "plot_time_frequency_coherence",
-    "plot_within_window_accuracy",
+    "plot_latent_trajectory_3d",
+    "plot_feature_forecast_heatmap",
+    "plot_forecast_error_by_horizon",
+    "plot_uplift_histogram",
+    "plot_residual_usage_trace",
+    "plot_lag_attention_heatmap",
+    "plot_te_lag_distribution",
+    "plot_attention_mass_by_lag",
     # Interactive visualizers
-    "plot_reconstruction_interactive",
     "plot_kld_trajectory_interactive",
     "plot_kld_trajectory_3d_interactive",
     "plot_latent_space_3d",
@@ -134,17 +155,26 @@ __all__ = [
     "plot_metrics_comparison_interactive",
     # Analyses
     "run_histogram_analysis",
+    "run_forecast_quality_analysis",
+    "run_horizon_error_profile",
+    "run_anchor_position_analysis",
+    "run_uplift_analysis",
+    "run_residual_usage_analysis",
+    "run_attention_diagnostics",
+    "run_te_lag_class_analysis",
+    "run_encoder_probe",
+    "run_kld_lag_diagnostics",
     "run_latent_distribution_analysis",
     "run_latent_space_visualization",
     "run_latent_interpolation",
-    "run_temporal_accuracy_analysis",
-    "run_within_window_analysis",
-    "run_reconstruction_analysis",
-    "run_single_prediction_windows",
-    "run_coherence_analysis",
     "run_trajectory_analysis",
     "TrajectoryAnalyzer",
+    "run_sample_diagnostics",
+    "run_dataset_stats_analysis",
+    "run_class_separation_analysis",
     "run_all_analyses",
     # Single sample plotting
-    "plot_single_samples",
+    "plot_sample_lag_attn_diagnostic",
+    "plot_sample_signals_kld",
+    "plot_sample_lag_attention",
 ]

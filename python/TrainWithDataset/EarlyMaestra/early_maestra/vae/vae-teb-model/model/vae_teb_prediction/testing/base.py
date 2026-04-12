@@ -1,16 +1,28 @@
 """
-Base module for the VAE-TEB testing pipeline.
+Base module for the VAE-TEB Lag-Attentive v1 testing pipeline.
 
-This module provides the TestRunner class which handles all common boilerplate
-for model testing: device management, model loading, batch iteration, and
-output directory management.
+This module provides the ``TestRunner`` class, which handles all common
+boilerplate for testing the :class:`SeqVaeLagAttnV1` model: device
+management, model construction from YAML config, checkpoint loading,
+batch iteration, and output directory management.
+
+The runner is intentionally **tied to the lag-attn v1 model I/O contract**
+because every downstream collector/analysis expects the specific forward
+dict produced by that model (``mu_full``, ``mu_base``, ``delta_mu_src``,
+``attn_weights``, ``te_lag_map``, ``kld_per_t``, etc.). See
+``new_architecture.md`` and ``vae_teb_lag_attn_v1.py`` for the authoritative
+spec of inputs/outputs.
 
 Example:
-    >>> from testing.base import TestRunner
-    >>> runner = TestRunner.from_checkpoint("model.ckpt", output_dir="results")
+    >>> runner = TestRunner.from_checkpoint(
+    ...     checkpoint_path="checkpoints/best.ckpt",
+    ...     output_dir="results/",
+    ...     config_path="model/vae_teb_prediction/model/config_lag_attn_v1.yaml",
+    ... )
     >>> with runner.inference_mode():
-    ...     for batch in runner.iter_batches(loader, max_samples=100):
-    ...         outputs = runner.model(y_st=batch.fhr_st, ...)
+    ...     for batch in runner.iter_batches(loader, max_samples=64):
+    ...         outputs = runner.forward(batch)
+    ...         y_plus = runner.build_future_target(batch)
 """
 
 from __future__ import annotations
@@ -18,203 +30,187 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
+import yaml
 
 from train.graph_models_utils import load_checkpoint_strict
-from model.vae_teb_prediction.model.vae_teb_model_prediction import SeqVae
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 
 
-def _infer_discriminative_hparams(
-    checkpoint_path: Union[str, Path],
+def _lag_attn_kwargs_from_config(
+    cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Infer DiscriminativeSeqVae constructor kwargs from checkpoint tensor shapes.
+    """Build :class:`SeqVaeLagAttnV1` constructor kwargs from a YAML config dict.
 
-    Inspects the checkpoint state dict for discriminative-specific tensors
-    (``center_loss.centers``, ``classifier_head`` weights, ``class_weights``
-    buffer) and returns the constructor arguments needed to recreate a
-    ``DiscriminativeSeqVae`` with matching dimensions.
+    Reads ``cfg["model_config"]["VAE_model"]`` and maps each supported field
+    to the corresponding constructor argument. Unknown fields are silently
+    ignored. Missing fields fall back to the model's own defaults so the
+    runner can still build a valid model even when the config is partial.
 
-    This avoids hard-coding defaults (e.g. ``num_classes=3``) that may not
-    match the checkpoint, which would cause shape mismatches during strict
-    loading.
+    ``attention_grad_checkpoint`` is **forced to ``False``** regardless of the
+    config value: checkpointing is only useful during backward, and the test
+    runner always runs under ``torch.inference_mode()``.
 
     Args:
-        checkpoint_path: Path to a Lightning or raw PyTorch checkpoint file.
+        cfg: Parsed YAML config (e.g. from ``yaml.safe_load``).
 
     Returns:
-        Dictionary of keyword arguments suitable for
-        ``DiscriminativeSeqVae(**kwargs)``.  May include ``num_classes``,
-        ``classifier_hidden_dim``, and ``class_weights``.  Returns an empty
-        dict if the checkpoint cannot be read or contains no discriminative
-        keys.
+        Keyword argument dictionary suitable for
+        ``SeqVaeLagAttnV1(**kwargs)``.
     """
-    raw = torch.load(str(checkpoint_path), map_location="cpu")
+    vae_cfg: Dict[str, Any] = (
+        (cfg.get("model_config", {}) or {}).get("VAE_model", {}) or {}
+    )
 
-    # Extract state dict from Lightning checkpoint structure
-    sd: Any = raw
-    if isinstance(raw, dict):
-        for key in ("state_dict", "model_state_dict"):
-            if key in raw:
-                sd = raw[key]
-                break
+    kwargs: Dict[str, Any] = {
+        "sequence_length": int(vae_cfg.get("sequence_length", 300)),
+        "d_model": int(vae_cfg.get("d_model", 128)),
+        "d_z": int(vae_cfg.get("d_z", 24)),
+        "horizon": int(vae_cfg.get("horizon", 30)),
+        "warmup_period": int(vae_cfg.get("warmup_period", 30)),
+        "c_y": int(vae_cfg.get("c_y", 87)),
+        "c_u": int(vae_cfg.get("c_u", 101)),
+        "use_up_st": bool(vae_cfg.get("use_up_st", True)),
+        "max_lag": int(vae_cfg.get("max_lag", 90)),
+        "num_heads": int(vae_cfg.get("num_heads", 4)),
+        "d_head": int(vae_cfg.get("d_head", 32)),
+        "lstm_layers": int(vae_cfg.get("lstm_layers", 2)),
+        "dropout": float(vae_cfg.get("dropout", 0.1)),
+        "decoder_hidden": int(vae_cfg.get("decoder_hidden", 128)),
+        "use_entmax": bool(vae_cfg.get("use_entmax", False)),
+        "attention_grad_checkpoint": False,  # force off for inference
+    }
 
-    if not isinstance(sd, dict):
-        return {}
-
-    kwargs: Dict[str, Any] = {}
-
-    for key, val in sd.items():
-        if not isinstance(val, torch.Tensor):
-            continue
-        if key.endswith("center_loss.centers"):
-            kwargs["num_classes"] = val.shape[0]
-        elif key.endswith("classifier_head.mlp.0.weight"):
-            kwargs["classifier_hidden_dim"] = val.shape[0]
-        elif key.endswith("class_weights"):
-            # Create a dummy weight list of the right length so that the
-            # constructor registers a buffer matching the checkpoint.
-            kwargs.setdefault("num_classes", val.shape[0])
-            kwargs["class_weights"] = [1.0] * val.shape[0]
+    logvar_clamp = vae_cfg.get("logvar_clamp")
+    if isinstance(logvar_clamp, (list, tuple)) and len(logvar_clamp) == 2:
+        kwargs["logvar_clamp"] = (float(logvar_clamp[0]), float(logvar_clamp[1]))
 
     return kwargs
 
 
 @dataclass
 class TestRunner:
-    """
-    Minimal test harness with zero boilerplate.
+    """Minimal test harness for :class:`SeqVaeLagAttnV1`.
 
     Handles device management, model setup, batch iteration, and output
-    directory organization. Designed to be composed with analysis functions
+    directory organisation. Designed to be composed with analysis functions
     rather than inherited from.
 
     Attributes:
-        model: The PyTorch model to test (must be on correct device).
-        device: The torch device for inference (cuda or cpu).
+        model: The loaded :class:`SeqVaeLagAttnV1` instance (on ``device``).
+        device: The torch device for inference.
         output_dir: Base directory for saving test results.
-        warmup_steps: Number of initial timesteps to mask (default 30).
-        decimation_factor: Temporal decimation factor (default 16).
+        warmup_steps: Number of initial timesteps to mask (mirrors
+            ``model.warmup_period``).
+        horizon: Forecast horizon ``H_d`` (mirrors ``model.horizon``).
+        max_lag: Maximum causal lag ``L - 1`` (mirrors ``model.max_lag``).
+        use_up_st: Whether the source stream concatenates ``up_st`` with
+            ``up_ph`` (True) or uses ``up_ph`` only (False).
 
     Example:
-        >>> runner = TestRunner.from_checkpoint("checkpoint.ckpt", "results/")
+        >>> runner = TestRunner.from_checkpoint(
+        ...     "ckpt.ckpt", "results/", config_path="config_lag_attn_v1.yaml"
+        ... )
         >>> with runner.inference_mode():
-        ...     for batch in runner.iter_batches(test_loader):
-        ...         outputs = runner.model(y_st=batch.fhr_st, ...)
+        ...     for batch in runner.iter_batches(loader):
+        ...         outputs = runner.forward(batch)
     """
 
-    model: nn.Module
+    model: SeqVaeLagAttnV1
     device: torch.device
     output_dir: Path
     warmup_steps: int = 30
-    decimation_factor: int = 16
+    horizon: int = 30
+    max_lag: int = 90
+    use_up_st: bool = True
 
-    # Private field to track if model is in eval mode
+    # Private field to track if model is in eval mode.
     _in_inference: bool = field(default=False, repr=False)
 
-    def __post_init__(self):
-        """Ensure output_dir is a Path object."""
+    def __post_init__(self) -> None:
+        """Ensure ``output_dir`` is a ``Path`` object and exists."""
         self.output_dir = Path(self.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_checkpoint(
         cls,
         checkpoint_path: Union[str, Path],
         output_dir: Union[str, Path],
+        config_path: Union[str, Path],
         device: Optional[torch.device] = None,
-        **model_kwargs: Any,
     ) -> "TestRunner":
-        """Create a TestRunner by loading a model from a checkpoint file.
-
-        Supports both standard SeqVae checkpoints and discriminative fine-tuning
-        checkpoints (``DiscriminativeSeqVae``).  The checkpoint type is
-        auto-detected: if loading into a bare ``SeqVae`` fails, the method
-        retries via a ``DiscriminativeSeqVae`` wrapper and extracts the inner
-        ``vae_model`` for testing.
+        """Create a runner by building the model from a YAML config and
+        loading its weights from a checkpoint file.
 
         Args:
-            checkpoint_path: Path to the model checkpoint file (.ckpt or .pt).
+            checkpoint_path: Path to a Lightning/PyTorch checkpoint file
+                (``.ckpt`` or ``.pt``) containing ``SeqVaeLagAttnV1``
+                weights (possibly wrapped under ``_orig_model.`` /
+                ``pytorch_model.``).
             output_dir: Directory for saving test results.
-            device: Torch device to use. If None, auto-detects (cuda:0 or cpu).
-            **model_kwargs: Additional arguments passed to SeqVae constructor.
+            config_path: Path to the trainer YAML config used to train the
+                checkpoint. ``model_config.VAE_model.*`` is parsed into the
+                model constructor kwargs.
+            device: Torch device to use. Auto-detects if None
+                (``cuda:0`` or ``cpu``).
 
         Returns:
-            TestRunner: Configured test runner with loaded model.
+            Configured :class:`TestRunner` with the loaded model.
 
-        Example:
-            >>> runner = TestRunner.from_checkpoint(
-            ...     "checkpoints/best_model.ckpt",
-            ...     output_dir="test_results/",
-            ...     device=torch.device("cuda:0")
-            ... )
+        Raises:
+            FileNotFoundError: If ``config_path`` is missing.
+            RuntimeError: If ``load_checkpoint_strict`` cannot align any
+                candidate submodule with the checkpoint state dict.
         """
         from loguru import logger
 
-        # Auto-detect device if not provided
+        cfg_path = Path(config_path)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Config file not found: {cfg_path}")
+
         if device is None:
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # --- Attempt 1: load as a standard SeqVae checkpoint ---
-        model = SeqVae()
-        loaded = load_checkpoint_strict(model, checkpoint_path)
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
 
-        if loaded is not None:
-            model = model.to(device)
-        else:
-            # --- Attempt 2: load as a discriminative fine-tuning checkpoint ---
-            # Discriminative checkpoints have keys prefixed with ``vae_model.``
-            # plus ``center_loss.*`` and ``classifier_head.*``.  We load into
-            # the full wrapper, then extract the inner SeqVae for testing.
-            logger.info(
-                "Standard SeqVae load failed — trying discriminative checkpoint."
-            )
-            from model.vae_teb_prediction.discriminative_finetune_model import (
-                DiscriminativeSeqVae,
-            )
+        model_kwargs = _lag_attn_kwargs_from_config(cfg)
+        logger.info(
+            "Building SeqVaeLagAttnV1 with kwargs: "
+            f"d_model={model_kwargs['d_model']}, d_z={model_kwargs['d_z']}, "
+            f"c_y={model_kwargs['c_y']}, c_u={model_kwargs['c_u']}, "
+            f"use_up_st={model_kwargs['use_up_st']}, horizon={model_kwargs['horizon']}, "
+            f"max_lag={model_kwargs['max_lag']}, warmup_period={model_kwargs['warmup_period']}"
+        )
 
-            # Infer hyperparameters (num_classes, hidden_dim, class_weights)
-            # from the checkpoint's tensor shapes so the wrapper dimensions
-            # match the saved weights exactly.
-            disc_kwargs = _infer_discriminative_hparams(checkpoint_path)
-            if disc_kwargs:
-                logger.info(
-                    f"Inferred discriminative hparams from checkpoint: {disc_kwargs}"
-                )
-
-            vae_model = SeqVae()
-            disc_model = DiscriminativeSeqVae(
-                vae_model=vae_model, **disc_kwargs
-            )
-            loaded = load_checkpoint_strict(
-                disc_model,
-                checkpoint_path,
-                module_attr_names=["vae_model"],
-            )
-            if loaded is None:
-                raise RuntimeError(
-                    f"Failed to load checkpoint '{checkpoint_path}'. "
-                    f"Tried both SeqVae and DiscriminativeSeqVae layouts. "
-                    f"Check logs for details."
-                )
-            # Extract the fine-tuned SeqVae for testing
-            model = disc_model.vae_model.to(device)
-            logger.info(
-                "Loaded discriminative checkpoint — using inner SeqVae for testing."
+        model = SeqVaeLagAttnV1(**model_kwargs)
+        loaded = load_checkpoint_strict(model, str(checkpoint_path))
+        if loaded is None:
+            raise RuntimeError(
+                f"Failed to load lag-attn-v1 checkpoint '{checkpoint_path}'. "
+                f"load_checkpoint_strict returned None; inspect its log output "
+                f"for candidate-module alignment details (common wrapper "
+                f"prefixes: '_orig_model.', 'model.', 'pytorch_model.')."
             )
 
-        # Extract warmup and decimation from loaded model
-        warmup = int(getattr(model, "warmup_period", 30))
-        decimation = int(getattr(model, "decimation_factor", 16))
+        model.eval()
+        model = model.to(device)
 
         return cls(
             model=model,
             device=device,
             output_dir=Path(output_dir),
-            warmup_steps=warmup,
-            decimation_factor=decimation,
+            warmup_steps=int(getattr(model, "warmup_period", 30)),
+            horizon=int(getattr(model, "horizon", 30)),
+            max_lag=int(getattr(model, "max_lag", 90)),
+            use_up_st=bool(getattr(model, "use_up_st", True)),
         )
 
     @classmethod
@@ -223,71 +219,65 @@ class TestRunner:
         trainer: Any,
         output_subdir: str = "test_results",
     ) -> "TestRunner":
-        """
-        Create a TestRunner from an existing trainer instance.
+        """Create a runner from an existing ``GraphModelVaeTebLagAttnV1Trainer``.
 
-        This is useful when you already have a trainer with a loaded model
-        and want to run tests without reloading.
+        Useful when you already have a trainer with a loaded model and want
+        to run tests without reloading the checkpoint.
 
         Args:
-            trainer: A GraphModelVaeTebSmallTrainer instance with pytorch_model.
-            output_subdir: Subdirectory name under trainer's output for results.
+            trainer: A ``GraphModelVaeTebLagAttnV1Trainer`` instance whose
+                ``pytorch_model`` is a :class:`SeqVaeLagAttnV1`.
+            output_subdir: Subdirectory name under the trainer's
+                ``test_results_dir`` for results.
 
         Returns:
-            TestRunner: Configured test runner using trainer's model.
+            Configured :class:`TestRunner` using the trainer's model.
 
         Raises:
-            ValueError: If trainer.pytorch_model is None.
-
-        Example:
-            >>> trainer = GraphModelVaeTebSmallTrainer("config.yaml")
-            >>> trainer.create_model()
-            >>> runner = TestRunner.from_trainer(trainer)
+            ValueError: If ``trainer.pytorch_model`` is None.
         """
         if trainer.pytorch_model is None:
-            raise ValueError("Trainer's pytorch_model is None. Call create_model() first.")
+            raise ValueError(
+                "Trainer's pytorch_model is None. Call create_model() first."
+            )
 
-        # Determine device from trainer's cuda_devices
         cuda_devices = getattr(trainer, "cuda_devices", [])
         if cuda_devices and torch.cuda.is_available():
             device = torch.device(f"cuda:{cuda_devices[0]}")
         else:
             device = torch.device("cpu")
 
-        # Get output directory from trainer
-        output_dir = Path(getattr(trainer, "test_results_dir", "test_results")) / output_subdir
+        output_dir = Path(
+            getattr(trainer, "test_results_dir", "test_results")
+        ) / output_subdir
 
-        # Move model to device
         model = trainer.pytorch_model.to(device)
-
-        # Extract warmup and decimation from model if available
-        warmup = int(getattr(model, "warmup_period", 30))
-        decimation = int(getattr(model, "decimation_factor", 16))
 
         return cls(
             model=model,
             device=device,
             output_dir=output_dir,
-            warmup_steps=warmup,
-            decimation_factor=decimation,
+            warmup_steps=int(getattr(model, "warmup_period", 30)),
+            horizon=int(getattr(model, "horizon", 30)),
+            max_lag=int(getattr(model, "max_lag", 90)),
+            use_up_st=bool(getattr(model, "use_up_st", True)),
         )
+
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
 
     @contextmanager
     def inference_mode(self):
-        """
-        Context manager for model evaluation with inference optimizations.
+        """Context manager for model evaluation with inference optimisations.
 
-        Sets model to eval mode and enables torch.inference_mode() for
-        faster inference without gradient tracking.
+        Sets the model to ``.eval()`` and enables ``torch.inference_mode()``
+        so forward passes run without gradient tracking and with all
+        eval-mode layer behaviours (dropout off, BN running stats).
 
         Yields:
             None
-
-        Example:
-            >>> with runner.inference_mode():
-            ...     outputs = runner.model(y_st=batch.fhr_st, ...)
         """
-        # Save original training state
         was_training = self.model.training
         self.model.eval()
         self._in_inference = True
@@ -296,7 +286,6 @@ class TestRunner:
             with torch.inference_mode():
                 yield
         finally:
-            # Restore original state (though usually we leave in eval)
             self._in_inference = False
             if was_training:
                 self.model.train()
@@ -306,103 +295,183 @@ class TestRunner:
         loader: Any,
         max_samples: Optional[int] = None,
     ) -> Iterator[Any]:
-        """
-        Iterate over batches with tensors moved to the correct device.
+        """Iterate over batches with tensors moved to ``self.device``.
 
-        Automatically moves fhr_st, fhr_ph, fhr_up_ph, and fhr tensors to
-        self.device. Metadata (guid, epoch) is kept on CPU.
+        Moves only the fields that the lag-attn v1 model needs:
+
+        - ``fhr_st``, ``fhr_ph`` — FHR feature inputs
+        - ``up_st``, ``up_ph`` — UP source stream components
+        - ``up``, ``fhr`` — raw signals kept for plotting context
+
+        Missing fields are silently skipped so the iterator tolerates
+        datasets produced by ablated configs (e.g. ``use_up_st=False`` with
+        ``up_st`` absent). Metadata fields (``guid``, ``epoch``, ``target``,
+        ``cs_label``, ``bg_label``) are intentionally left on CPU because
+        the collectors access them as Python scalars.
 
         Args:
-            loader: PyTorch DataLoader yielding batch objects.
-            max_samples: Maximum number of samples to yield. If None, yields all.
+            loader: PyTorch DataLoader yielding batch objects (normally
+                an ``AttributeDict`` from ``CombinedHDF5Dataset``).
+            max_samples: Maximum number of samples (not batches) to yield.
+                ``None`` yields all.
 
         Yields:
-            batch: Batch object with tensors on self.device.
-
-        Example:
-            >>> for batch in runner.iter_batches(test_loader, max_samples=100):
-            ...     y_st = batch.fhr_st  # Already on runner.device
+            The batch object with tensors on ``self.device``.
         """
         processed = 0
+        move_fields = ("fhr_st", "fhr_ph", "up_st", "up_ph", "up", "fhr")
 
         for batch in loader:
-            # Check sample limit
             if max_samples is not None and processed >= max_samples:
                 break
 
-            # Move main tensors to device (in-place modification of batch)
-            batch.fhr_st = batch.fhr_st.to(self.device)
-            batch.fhr_ph = batch.fhr_ph.to(self.device)
-            batch.fhr_up_ph = batch.fhr_up_ph.to(self.device)
-            batch.fhr = batch.fhr.to(self.device)
-
-            # Move UP signal if present
-            if hasattr(batch, "up") and batch.up is not None:
-                batch.up = batch.up.to(self.device)
+            for fname in move_fields:
+                t = getattr(batch, fname, None)
+                if isinstance(t, torch.Tensor):
+                    setattr(batch, fname, t.to(self.device, non_blocking=True))
 
             yield batch
 
-            # Track samples processed (batch size)
-            batch_size = batch.fhr_st.size(0)
+            batch_size = int(batch.fhr_st.size(0))
             processed += batch_size
 
     def ensure_dir(self, subdir: str) -> Path:
-        """
-        Create and return an output subdirectory.
+        """Create and return an output subdirectory.
 
         Args:
-            subdir: Name of subdirectory under self.output_dir.
+            subdir: Name of the subdirectory under ``self.output_dir``.
 
         Returns:
-            Path: The created (or existing) subdirectory path.
-
-        Example:
-            >>> histograms_dir = runner.ensure_dir("histograms")
-            >>> fig.savefig(histograms_dir / "vaf_histogram.pdf")
+            The created (or existing) subdirectory path.
         """
         path = self.output_dir / subdir
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    # ------------------------------------------------------------------
+    # Forward / target construction
+    # ------------------------------------------------------------------
+
+    def _build_u_stream(self, batch: Any) -> torch.Tensor:
+        """Assemble the 101- or 58-channel source stream for the lag-attn v1 model.
+
+        Mirrors ``SeqVaeLagAttnPl._build_source_stream`` so the runner sees
+        exactly the same source representation the trainer uses.
+
+        Args:
+            batch: Batch object with ``up_ph`` (and ``up_st`` when
+                ``self.use_up_st`` is True).
+
+        Returns:
+            Source stream tensor of shape ``(B, T, 101)`` or ``(B, T, 58)``.
+
+        Raises:
+            RuntimeError: If required fields are missing from the batch.
+        """
+        up_ph = getattr(batch, "up_ph", None)
+        if up_ph is None:
+            raise RuntimeError(
+                "Batch has no 'up_ph' field. Ensure 'up_ph' is in "
+                "dataset_kwargs.load_fields of the config."
+            )
+        if not self.use_up_st:
+            return up_ph
+
+        up_st = getattr(batch, "up_st", None)
+        if up_st is None:
+            raise RuntimeError(
+                "Model has use_up_st=True but batch has no 'up_st'. "
+                "Add 'up_st' to load_fields, or rebuild the model with "
+                "use_up_st=False and c_u=58."
+            )
+        return torch.cat([up_st, up_ph], dim=-1)
+
+    def build_future_target(self, batch: Any) -> torch.Tensor:
+        """Build the ground-truth future FHR feature trajectory ``Y_plus``.
+
+        This is the authoritative target for every feature-forecast metric
+        in the lag-attn v1 pipeline. It uses the same unfold formula that
+        ``SeqVaeLagAttnV1.compute_loss`` applies internally.
+
+        Given FHR features ``Y = cat(y_st, y_ph)`` of shape ``(B, T, 87)``,
+        the future target at anchor ``t`` is ``Y[:, t+1 : t+1+H_d, :]``.
+        Only anchors ``t in [0, T - H_d)`` have a full ``H_d``-step future;
+        the returned tensor has shape ``(B, T - H_d, H_d, 87)``.
+
+        Warmup masking is **not** applied here — collectors/metrics handle
+        the ``[warmup, T - H_d)`` slicing themselves.
+
+        Args:
+            batch: Batch object with ``fhr_st`` and ``fhr_ph`` attributes
+                already on ``self.device``.
+
+        Returns:
+            Future feature target of shape ``(B, T - H_d, H_d, 87)``.
+        """
+        Y = torch.cat([batch.fhr_st, batch.fhr_ph], dim=-1)  # (B, T, 87)
+        Y_shift = Y[:, 1:, :]                                # (B, T-1, 87)
+        H_d = int(self.horizon)
+        # unfold: (B, T-H_d, 87, H_d) → permute to (B, T-H_d, H_d, 87)
+        Y_plus = Y_shift.unfold(dimension=1, size=H_d, step=1)
+        Y_plus = Y_plus.permute(0, 1, 3, 2).contiguous()
+        return Y_plus
+
+    def valid_anchor_range(self, seq_len: Optional[int] = None) -> Tuple[int, int]:
+        """Return the valid anchor range ``[warmup, T - H_d)`` for forecast metrics.
+
+        Args:
+            seq_len: Sequence length ``T`` (defaults to the model's
+                configured ``sequence_length``).
+
+        Returns:
+            ``(warmup, T_valid)`` where ``T_valid = T - H_d`` and ``warmup``
+            is clamped into ``[0, T_valid]``.
+        """
+        if seq_len is None:
+            seq_len = int(getattr(self.model, "sequence_length", 300))
+        T_valid = max(seq_len - int(self.horizon), 0)
+        warmup = min(int(self.warmup_steps), T_valid)
+        return warmup, T_valid
 
     def forward(
         self,
         batch: Any,
         compute_loss: bool = False,
         beta: float = 1.0,
-    ) -> dict:
-        """
-        Run forward pass on a batch and return outputs.
-
-        Convenience method that extracts tensors from batch and calls model.
+        lambda_full: float = 1.0,
+        lambda_base: float = 0.5,
+    ) -> Dict[str, torch.Tensor]:
+        """Run a forward pass on a batch and optionally compute the v1 loss.
 
         Args:
-            batch: Batch object with fhr_st, fhr_ph, fhr_up_ph, fhr attributes.
-            compute_loss: If True, also compute and return loss dict.
-            beta: KLD weight for loss computation (only used if compute_loss=True).
+            batch: Batch object with ``fhr_st``, ``fhr_ph``, and the
+                appropriate UP fields on ``self.device``.
+            compute_loss: If True, also compute and attach
+                ``outputs["loss_dict"]`` from ``model.compute_loss``.
+            beta: KL weight for loss computation.
+            lambda_full: Weight on the full-feature forecast loss.
+            lambda_base: Weight on the baseline-only forecast loss.
 
         Returns:
-            dict: Model outputs including 'z', 'mu_pr', 'logvar_pr', etc.
-                  If compute_loss=True, also includes 'loss_dict'.
-
-        Example:
-            >>> outputs = runner.forward(batch, compute_loss=True)
-            >>> latent = outputs['z']
-            >>> loss = outputs['loss_dict']['total_loss']
+            The full 19-key forward-output dict from
+            :meth:`SeqVaeLagAttnV1.forward`, with an optional ``loss_dict``
+            key when ``compute_loss=True``.
         """
+        u_stream = self._build_u_stream(batch)
         outputs = self.model(
             y_st=batch.fhr_st,
             y_ph=batch.fhr_ph,
-            x_ph=batch.fhr_up_ph,
+            u_stream=u_stream,
         )
 
         if compute_loss:
-            loss_dict = self.model.compute_loss(
+            outputs["loss_dict"] = self.model.compute_loss(
                 forward_outputs=outputs,
                 y_st=batch.fhr_st,
                 y_ph=batch.fhr_ph,
-                y_raw=batch.fhr,
                 beta=beta,
+                lambda_full=lambda_full,
+                lambda_base=lambda_base,
             )
-            outputs["loss_dict"] = loss_dict
 
         return outputs
