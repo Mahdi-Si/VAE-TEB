@@ -142,7 +142,7 @@ def compute_kld(
         Returns None if required keys are missing from outputs.
 
     Example:
-        >>> outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
+        >>> outputs = model(y_st=y_st, y_ph=y_ph, u_stream=u_stream)
         >>> kld = compute_kld(outputs, warmup_steps=30)
         >>> kld_mean = torch.nanmean(kld)  # Mean ignoring warmup NaNs
     """
@@ -213,51 +213,6 @@ def compute_kld_per_sample(
     return torch.nanmean(kld, dim=(1, 2))
 
 
-def aggregate_predictions(
-    model: torch.nn.Module,
-    segments: Tensor,
-    raw_len: Optional[int] = None,
-) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-    """
-    Aggregate overlapping per-timestep prediction windows into a single signal.
-
-    The model predicts a window of H samples at each of T timesteps, creating
-    overlapping predictions. This function averages overlapping predictions
-    to produce a single raw-length signal.
-
-    Args:
-        model: The VAE model with average_raw_prediction method.
-        segments: Per-timestep prediction windows, shape (B, T, H).
-        raw_len: Target raw signal length. If None, uses model's default.
-
-    Returns:
-        Tuple of:
-            - avg_pred: Averaged predictions, shape (B, raw_len) or None
-            - valid_mask: Boolean mask of covered positions, shape (B, raw_len)
-
-    Example:
-        >>> outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph)
-        >>> avg_pred, mask = aggregate_predictions(model, outputs['mu_pr'])
-    """
-    if segments is None or segments.dim() != 3:
-        return None, None
-
-    # Check if model has averaging method
-    if not hasattr(model, "average_raw_prediction"):
-        return None, None
-
-    # Use model's averaging function
-    avg_pred = model.average_raw_prediction(segments, raw_len=raw_len)
-
-    # Create validity mask (positions that had predictions, not NaN)
-    valid_mask = torch.isfinite(avg_pred)
-
-    # Replace NaNs with zeros for downstream use
-    avg_pred = torch.nan_to_num(avg_pred, nan=0.0)
-
-    return avg_pred, valid_mask
-
-
 def compute_kld_per_timestep(
     outputs: Dict[str, Tensor],
     warmup_steps: int = 30,
@@ -285,6 +240,376 @@ def compute_kld_per_timestep(
 
     # Average over latent dimensions only (keep time)
     return torch.nanmean(kld, dim=-1)  # Shape: (B, T)
+
+
+# -----------------------------------------------------------------------------
+# Lag-Attentive V1 Feature-Forecast Metrics
+# -----------------------------------------------------------------------------
+
+
+def _feature_valid_slice(
+    warmup: int,
+    horizon: int,
+    T: int,
+) -> Tuple[int, int]:
+    """Return the ``(start, end)`` anchor range for feature-forecast metrics.
+
+    The valid range is ``[warmup, T - horizon)``. Both endpoints are clamped
+    into ``[0, max(0, T - horizon)]`` so tiny sequences fall back to an
+    empty range rather than raising.
+
+    Args:
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+        T: Sequence length ``T``.
+
+    Returns:
+        ``(start, end)`` anchor indices with ``0 <= start <= end``.
+    """
+    T_valid = max(T - int(horizon), 0)
+    start = max(0, min(int(warmup), T_valid))
+    return start, T_valid
+
+
+def compute_forecast_metrics(
+    mu_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    """Compute per-sample feature-forecast quality metrics for v1.
+
+    Evaluates the full forecast ``mu_full`` against the unfolded future
+    feature target ``y_plus`` over the valid anchor range
+    ``[warmup, T - horizon)``. Channels are split at index 43 into a
+    scattering block (``feat_mse_st``) and a phase-harmonic block
+    (``feat_mse_ph``) so diagnostics can distinguish which kind of
+    information the model is losing.
+
+    Args:
+        mu_full: Model prediction ``(B, T, H_d, C_y)``.
+        y_plus: Ground-truth future feature trajectory
+            ``(B, T - H_d, H_d, C_y)`` from
+            :meth:`TestRunner.build_future_target`.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d`` (must equal ``mu_full.size(2)``).
+
+    Returns:
+        Dict with tensors (all shape ``(B,)`` unless noted):
+
+        - ``feat_mse_total``: mean squared error over valid anchors,
+          horizon and channels.
+        - ``feat_mse_per_horizon`` ``(B, H_d)``: MSE broken out per
+          horizon step.
+        - ``feat_r2_total``: ``1 - SS_res / SS_tot`` using the channel-wise
+          variance of ``y_plus`` as denominator.
+        - ``feat_mse_st``: MSE restricted to channels ``[0, 43)``.
+        - ``feat_mse_ph``: MSE restricted to channels ``[43, C_y)``.
+    """
+    B, T, H_d, C = mu_full.shape
+    if int(H_d) != int(horizon):
+        raise ValueError(
+            f"horizon mismatch: mu_full.size(2)={H_d}, horizon={horizon}"
+        )
+
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+
+    # Align anchors. y_plus has shape (B, T - H_d, H_d, C) — already trimmed
+    # to the maximum anchor count, so slice both to [start:T_valid].
+    mu_valid = mu_full[:, start:T_valid, :, :]
+    y_valid = y_plus[:, start:T_valid, :, :]
+
+    if mu_valid.numel() == 0 or y_valid.numel() == 0:
+        zeros = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+        return {
+            "feat_mse_total": zeros,
+            "feat_mse_per_horizon": torch.zeros(
+                B, int(H_d), device=mu_full.device, dtype=mu_full.dtype
+            ),
+            "feat_r2_total": zeros,
+            "feat_mse_st": zeros,
+            "feat_mse_ph": zeros,
+        }
+
+    diff = mu_valid - y_valid                    # (B, T_v, H_d, C)
+    sq = diff.pow(2)
+
+    # Per-sample scalar MSE over (T_v, H_d, C).
+    feat_mse_total = sq.mean(dim=(1, 2, 3))
+
+    # Per-horizon MSE (B, H_d), averaged over (T_v, C).
+    feat_mse_per_horizon = sq.mean(dim=(1, 3))
+
+    # Channel-block splits (scattering vs phase). 43 is hardcoded because
+    # the v1 model concatenates fhr_st (43) followed by fhr_ph (44).
+    c_st = min(43, int(C))
+    if c_st > 0:
+        feat_mse_st = sq[..., :c_st].mean(dim=(1, 2, 3))
+    else:
+        feat_mse_st = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+    if c_st < int(C):
+        feat_mse_ph = sq[..., c_st:].mean(dim=(1, 2, 3))
+    else:
+        feat_mse_ph = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+
+    # Per-sample R^2 against per-channel mean of y_valid.
+    y_flat = y_valid.reshape(B, -1)
+    mu_flat = mu_valid.reshape(B, -1)
+    y_mean = y_flat.mean(dim=1, keepdim=True)
+    ss_res = (mu_flat - y_flat).pow(2).sum(dim=1)
+    ss_tot = (y_flat - y_mean).pow(2).sum(dim=1).clamp_min(1e-12)
+    feat_r2_total = (1.0 - ss_res / ss_tot).clamp(min=-10.0, max=1.0)
+
+    return {
+        "feat_mse_total": feat_mse_total,
+        "feat_mse_per_horizon": feat_mse_per_horizon,
+        "feat_r2_total": feat_r2_total,
+        "feat_mse_st": feat_mse_st,
+        "feat_mse_ph": feat_mse_ph,
+    }
+
+
+def compute_uplift_metrics(
+    mu_full: Tensor,
+    mu_base: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    """Compare the full forecast to the FHR-only baseline forecast.
+
+    The lag-attn v1 model decomposes its prediction as
+    ``mu_full = mu_base + delta_mu_src`` where ``mu_base`` is the
+    FHR-only baseline and ``delta_mu_src`` is the residual correction
+    driven by the latent. A positive uplift means the source/latent branch
+    is helping; a near-zero uplift on a trained checkpoint is a red flag
+    that the source branch has collapsed.
+
+    Args:
+        mu_full: Full prediction ``(B, T, H_d, C_y)``.
+        mu_base: Baseline prediction ``(B, T, H_d, C_y)``.
+        y_plus: Ground truth ``(B, T - H_d, H_d, C_y)``.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+
+    Returns:
+        Dict with ``l_full`` (per-sample full-MSE), ``l_base``
+        (per-sample base-MSE), ``uplift_abs = l_base - l_full``,
+        ``uplift_rel = uplift_abs / l_base.clamp_min(1e-12)``, all shape
+        ``(B,)``.
+    """
+    B, T = mu_full.shape[0], mu_full.shape[1]
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+
+    mu_full_v = mu_full[:, start:T_valid, :, :]
+    mu_base_v = mu_base[:, start:T_valid, :, :]
+    y_v = y_plus[:, start:T_valid, :, :]
+
+    if mu_full_v.numel() == 0:
+        zeros = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+        return {
+            "l_full": zeros,
+            "l_base": zeros,
+            "uplift_abs": zeros,
+            "uplift_rel": zeros,
+        }
+
+    l_full = (mu_full_v - y_v).pow(2).mean(dim=(1, 2, 3))
+    l_base = (mu_base_v - y_v).pow(2).mean(dim=(1, 2, 3))
+    uplift_abs = l_base - l_full
+    uplift_rel = uplift_abs / l_base.clamp_min(1e-12)
+    return {
+        "l_full": l_full,
+        "l_base": l_base,
+        "uplift_abs": uplift_abs,
+        "uplift_rel": uplift_rel,
+    }
+
+
+def compute_residual_usage(
+    delta_mu_src: Tensor,
+    mu_full: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    """Quantify how much of the final forecast comes from the source branch.
+
+    Returns per-sample L2 norms of ``delta_mu_src`` and ``mu_full``, the
+    ratio of the two (``residual_ratio``), plus a per-anchor trace of
+    ``delta_mu_src`` norm for diagnostic plots.
+
+    Args:
+        delta_mu_src: Residual correction ``(B, T, H_d, C_y)``.
+        mu_full: Full prediction ``(B, T, H_d, C_y)``.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+
+    Returns:
+        Dict with keys:
+
+        - ``delta_norm`` ``(B,)`` — ``sqrt(mean(delta^2))`` over valid
+          anchors, horizon and channels.
+        - ``full_norm`` ``(B,)`` — same for ``mu_full``.
+        - ``residual_ratio`` ``(B,)`` — ``delta_norm / full_norm`` with
+          epsilon safety.
+        - ``delta_norm_t`` ``(B, T_valid)`` — per-anchor RMS of
+          ``delta_mu_src`` (for plotting the residual trace over time).
+    """
+    B, T = mu_full.shape[0], mu_full.shape[1]
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+
+    delta_v = delta_mu_src[:, start:T_valid, :, :]
+    full_v = mu_full[:, start:T_valid, :, :]
+
+    if delta_v.numel() == 0:
+        zeros_b = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+        zeros_bt = torch.zeros(B, 0, device=mu_full.device, dtype=mu_full.dtype)
+        return {
+            "delta_norm": zeros_b,
+            "full_norm": zeros_b,
+            "residual_ratio": zeros_b,
+            "delta_norm_t": zeros_bt,
+        }
+
+    delta_norm = delta_v.pow(2).mean(dim=(1, 2, 3)).clamp_min(0.0).sqrt()
+    full_norm = full_v.pow(2).mean(dim=(1, 2, 3)).clamp_min(0.0).sqrt()
+    residual_ratio = delta_norm / full_norm.clamp_min(1e-12)
+
+    # Per-anchor trace: RMS over (H_d, C).
+    delta_norm_t = delta_v.pow(2).mean(dim=(2, 3)).clamp_min(0.0).sqrt()
+
+    return {
+        "delta_norm": delta_norm,
+        "full_norm": full_norm,
+        "residual_ratio": residual_ratio,
+        "delta_norm_t": delta_norm_t,
+    }
+
+
+def compute_attention_diagnostics(
+    attn_weights: Tensor,
+    warmup: int,
+) -> Dict[str, Tensor]:
+    """Summarise lag-attention weights produced by v1.
+
+    Computes the head-averaged attention distribution, per-anchor argmax
+    lag, per-head entropy, inter-head diversity, and dataset-level
+    "attention mass by lag". Warmup anchors have all time-indexed outputs
+    NaN-filled so aggregators can ``nanmean`` cleanly.
+
+    Args:
+        attn_weights: Raw attention probabilities ``(B, T, M, L)`` from
+            ``outputs["attn_weights"]``.
+        warmup: Number of initial anchors to mask.
+
+    Returns:
+        Dict with:
+
+        - ``alpha_bar`` ``(B, T, L)`` — head-averaged attention (NaN in
+          warmup).
+        - ``argmax_lag`` ``(B, T)`` — head-averaged argmax lag per anchor
+          (``-1`` in warmup).
+        - ``entropy`` ``(B, T, M)`` — Shannon entropy per head (NaN in
+          warmup).
+        - ``head_diversity`` ``(B, T)`` — ``1 - mean_pairwise_cosine_sim``
+          between heads at each anchor (NaN in warmup).
+        - ``alpha_mass_by_lag`` ``(B, L)`` — time-averaged (valid anchors)
+          head-averaged attention distribution.
+    """
+    if attn_weights.dim() != 4:
+        raise ValueError(
+            f"attn_weights must be (B, T, M, L), got {tuple(attn_weights.shape)}"
+        )
+    B, T, M, L = attn_weights.shape
+    device = attn_weights.device
+    dtype = attn_weights.dtype
+    warmup = max(0, min(int(warmup), T))
+
+    # Head-averaged attention (B, T, L).
+    alpha_bar = attn_weights.mean(dim=2)
+
+    # Argmax per head, then take head-wise mode via head-averaged argmax on
+    # alpha_bar (cheaper and matches the "which lag dominates" question).
+    argmax_lag = alpha_bar.argmax(dim=-1).to(torch.long)  # (B, T)
+
+    # Per-head entropy with a numerical-stability epsilon.
+    eps = 1e-12
+    entropy = -(attn_weights.clamp_min(eps) * attn_weights.clamp_min(eps).log()).sum(dim=-1)
+
+    # Head diversity: mean pairwise (1 - cosine similarity) between heads
+    # at each anchor. For M heads, there are C(M, 2) pairs.
+    if M >= 2:
+        a = attn_weights                                   # (B, T, M, L)
+        norm = a.pow(2).sum(dim=-1).clamp_min(eps).sqrt()  # (B, T, M)
+        a_norm = a / norm.unsqueeze(-1)
+        # sims[b, t, i, j] = <a_norm[b, t, i], a_norm[b, t, j]>
+        sims = torch.einsum("btil,btjl->btij", a_norm, a_norm)
+        # Exclude self-similarity and upper-triangle duplicates.
+        mask = torch.triu(torch.ones(M, M, device=device), diagonal=1).bool()
+        pair_sims = sims[:, :, mask]                       # (B, T, C(M,2))
+        head_diversity = 1.0 - pair_sims.mean(dim=-1)
+    else:
+        head_diversity = torch.zeros(B, T, device=device, dtype=dtype)
+
+    # Apply warmup masking (convert to float and NaN-fill the warmup region).
+    alpha_bar_f = alpha_bar.to(torch.float32).clone()
+    entropy_f = entropy.to(torch.float32).clone()
+    head_div_f = head_diversity.to(torch.float32).clone()
+    argmax_f = argmax_lag.clone()
+
+    if warmup > 0:
+        alpha_bar_f[:, :warmup, :] = float("nan")
+        entropy_f[:, :warmup, :] = float("nan")
+        head_div_f[:, :warmup] = float("nan")
+        argmax_f[:, :warmup] = -1
+
+    # Time-averaged alpha_mass_by_lag over valid anchors.
+    if warmup < T:
+        alpha_mass_by_lag = alpha_bar[:, warmup:, :].mean(dim=1)
+    else:
+        alpha_mass_by_lag = torch.zeros(B, L, device=device, dtype=dtype)
+
+    return {
+        "alpha_bar": alpha_bar_f,
+        "argmax_lag": argmax_f,
+        "entropy": entropy_f,
+        "head_diversity": head_div_f,
+        "alpha_mass_by_lag": alpha_mass_by_lag,
+    }
+
+
+def aggregate_te_lag_map(
+    te_lag_map: Tensor,
+    warmup: int,
+) -> Dict[str, Tensor]:
+    """Aggregate the per-timestep TE lag attribution map over time.
+
+    ``te_lag_map`` has shape ``(B, T, L)`` and carries the lag-resolved
+    transfer-entropy surrogate (``kld_per_t * mean_heads(alpha)``) at each
+    anchor. The aggregation averages over valid anchors to yield one
+    ``(L,)`` signature per sample plus the argmax lag.
+
+    Args:
+        te_lag_map: ``(B, T, L)`` from ``outputs["te_lag_map"]``.
+        warmup: Number of initial anchors to exclude.
+
+    Returns:
+        Dict with ``te_lag_mean`` ``(B, L)`` and ``te_lag_argmax`` ``(B,)``.
+    """
+    if te_lag_map.dim() != 3:
+        raise ValueError(
+            f"te_lag_map must be (B, T, L), got {tuple(te_lag_map.shape)}"
+        )
+    B, T, L = te_lag_map.shape
+    warmup = max(0, min(int(warmup), T))
+
+    if warmup < T:
+        te_mean = te_lag_map[:, warmup:, :].mean(dim=1)
+    else:
+        te_mean = torch.zeros(B, L, device=te_lag_map.device, dtype=te_lag_map.dtype)
+
+    te_argmax = te_mean.argmax(dim=-1).to(torch.long)
+    return {"te_lag_mean": te_mean, "te_lag_argmax": te_argmax}
 
 
 # -----------------------------------------------------------------------------

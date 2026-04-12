@@ -33,132 +33,6 @@ def _check_plotly():
         raise ImportError("Plotly is required for interactive visualizations. Install with: pip install plotly")
 
 
-def plot_reconstruction_interactive(
-    sample: Dict[str, Any],
-    output_path: Path,
-) -> None:
-    """
-    Create an interactive 3-panel reconstruction analysis figure.
-
-    Panels:
-        1. Signal overlay with hover showing exact values
-        2. Residual with zoom/pan
-        3. Latent heatmap with hover
-
-    Args:
-        sample: Dict with 'y_true', 'y_pred', 'y_pred_std', 'latent', 'metrics'.
-        output_path: Path to save the HTML file.
-
-    Example:
-        >>> plot_reconstruction_interactive(sample, Path("results/sample.html"))
-    """
-    _check_plotly()
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    y_true = sample["y_true"]
-    y_pred = sample["y_pred"]
-    y_pred_std = sample.get("y_pred_std")
-    latent = sample.get("latent")
-    metrics = sample.get("metrics", {})
-
-    # Create time axis in minutes
-    time = np.arange(len(y_true)) / 4.0 / 60.0
-
-    # Create subplots
-    fig = make_subplots(
-        rows=3, cols=1,
-        row_heights=[0.5, 0.2, 0.3],
-        subplot_titles=["Signal Reconstruction", "Residual", "Latent Representation"],
-        vertical_spacing=0.08,
-    )
-
-    # ----- Panel 1: Signal reconstruction -----
-    fig.add_trace(
-        go.Scatter(
-            x=time, y=y_true,
-            name="Ground Truth",
-            line=dict(color="#3F72AF", width=1),
-            hovertemplate="Time: %{x:.2f} min<br>Value: %{y:.3f}<extra>Ground Truth</extra>",
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=time, y=y_pred,
-            name="Prediction",
-            line=dict(color="#EB5B00", width=1),
-            hovertemplate="Time: %{x:.2f} min<br>Value: %{y:.3f}<extra>Prediction</extra>",
-        ),
-        row=1, col=1,
-    )
-
-    # Add uncertainty band if available
-    if y_pred_std is not None:
-        upper = y_pred + 2 * y_pred_std
-        lower = y_pred - 2 * y_pred_std
-        fig.add_trace(
-            go.Scatter(
-                x=np.concatenate([time, time[::-1]]),
-                y=np.concatenate([upper, lower[::-1]]),
-                fill="toself",
-                fillcolor="rgba(235, 91, 0, 0.2)",
-                line=dict(color="rgba(255,255,255,0)"),
-                name="±2σ",
-                showlegend=True,
-            ),
-            row=1, col=1,
-        )
-
-    # ----- Panel 2: Residual -----
-    residual = y_true - y_pred
-    fig.add_trace(
-        go.Scatter(
-            x=time, y=residual,
-            name="Residual",
-            fill="tozeroy",
-            line=dict(color="#609966", width=1),
-            hovertemplate="Time: %{x:.2f} min<br>Error: %{y:.3f}<extra>Residual</extra>",
-        ),
-        row=2, col=1,
-    )
-
-    # ----- Panel 3: Latent heatmap -----
-    if latent is not None and latent.size > 0:
-        fig.add_trace(
-            go.Heatmap(
-                z=latent.T,
-                colorscale="RdBu_r",
-                showscale=True,
-                colorbar=dict(title="Value", x=1.02),
-                hovertemplate="Timestep: %{x}<br>Dim: %{y}<br>Value: %{z:.3f}<extra></extra>",
-            ),
-            row=3, col=1,
-        )
-
-    # Update layout
-    metrics_text = f"VAF: {metrics.get('vaf', 0):.3f} | SNR: {metrics.get('snr', 0):.1f} dB | KLD: {metrics.get('kld', 0):.4f}"
-
-    fig.update_layout(
-        title=dict(
-            text=f"Sample Analysis - GUID: {sample.get('guid', 'N/A')}<br><sub>{metrics_text}</sub>",
-            x=0.5,
-        ),
-        height=800,
-        showlegend=True,
-        legend=dict(x=1.05, y=0.95),
-    )
-
-    fig.update_xaxes(title_text="Time (minutes)", row=2, col=1)
-    fig.update_yaxes(title_text="FHR", row=1, col=1)
-    fig.update_yaxes(title_text="Error", row=2, col=1)
-    fig.update_xaxes(title_text="Timestep", row=3, col=1)
-    fig.update_yaxes(title_text="Latent Dim", row=3, col=1)
-
-    fig.write_html(str(output_path), include_plotlyjs="cdn")
-
-
 def plot_kld_trajectory_interactive(
     df: pd.DataFrame,
     output_path: Path,
@@ -434,24 +308,37 @@ def plot_metrics_comparison_interactive(
     df: pd.DataFrame,
     output_path: Path,
 ) -> None:
-    """
-    Create interactive scatter matrix of metrics colored by class.
+    """Create an interactive scatter matrix of metrics coloured by class.
+
+    The default column list reflects the lag-attn v1 schema:
+    ``[feat_mse_total, uplift_rel, residual_ratio, kld_mean]``. Any column
+    not present in the DataFrame is silently skipped so the function
+    degrades gracefully when the caller passes a subset. When none of the
+    v1 columns are present it falls back to the legacy schema
+    ``[vaf, mse, snr, kld]`` so old cached outputs still render.
 
     Args:
-        df: DataFrame with 'vaf', 'mse', 'snr', 'kld', and optionally 'label'.
+        df: DataFrame from :func:`collect_metrics` with at least two of
+            ``feat_mse_total``, ``uplift_rel``, ``residual_ratio``,
+            ``kld_mean`` (and optionally ``label``).
         output_path: Path to save HTML file.
-
-    Example:
-        >>> plot_metrics_comparison_interactive(metrics_df, Path("results/metrics.html"))
     """
     _check_plotly()
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Prepare data
-    metrics_cols = ["vaf", "mse", "snr", "kld"]
+    metrics_cols = [
+        "feat_mse_total",
+        "uplift_rel",
+        "residual_ratio",
+        "kld_mean",
+    ]
     available_cols = [c for c in metrics_cols if c in df.columns]
+    if len(available_cols) < 2:
+        # Legacy fallback so this function still renders something useful
+        # when given an old histogram_metrics.csv.
+        available_cols = [c for c in ("vaf", "mse", "snr", "kld") if c in df.columns]
 
     if len(available_cols) < 2:
         return

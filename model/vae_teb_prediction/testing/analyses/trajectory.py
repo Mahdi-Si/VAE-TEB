@@ -354,9 +354,22 @@ class TrajectoryAnalyzer:
                     continue
                 latent_np = latent.cpu().numpy()  # (B, T, D)
 
-                # Compute per-timestep KLD mean over latent dims
-                kld_t = compute_kld_per_timestep(outputs, self.warmup_steps)
-                kld = kld_t.cpu().numpy() if kld_t is not None else None  # (B, T)
+                # Per-timestep KL: the model's TE analysis head already
+                # produces kld_per_t = sum_d KL(q || p) at every anchor, so
+                # we read it directly instead of recomputing via
+                # compute_kld_per_timestep. Warmup masking is applied
+                # explicitly below.
+                kld_t = outputs.get("kld_per_t")
+                if kld_t is None:
+                    # Fallback (should never trigger for lag-attn v1).
+                    kld_t = compute_kld_per_timestep(outputs, self.warmup_steps)
+                if kld_t is not None:
+                    kld_t = kld_t.detach().cpu().float()
+                    if self.warmup_steps > 0 and kld_t.size(1) > self.warmup_steps:
+                        kld_t[:, : self.warmup_steps] = float("nan")
+                    kld = kld_t.numpy()  # (B, T)
+                else:
+                    kld = None
 
                 # Get uncertainty if available
                 uncertainty = None

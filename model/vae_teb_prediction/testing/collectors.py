@@ -1,9 +1,13 @@
-"""
-Data collection utilities for VAE-TEB testing.
+"""Data collection utilities for the VAE-TEB Lag-Attentive v1 testing pipeline.
 
-This module provides reusable iteration patterns for collecting metrics,
-latent representations, and predictions from a model. Each collector
-returns data in a standard format (pandas DataFrame or numpy array).
+Each collector iterates through a DataLoader, runs :class:`TestRunner` in
+``inference_mode``, pulls the forward-dict outputs that matter for a given
+analysis, and returns data in a standard format (``pandas.DataFrame``,
+``numpy.ndarray``, or ``list[dict]``).
+
+Every collector here is tightly tied to the lag-attn v1 forward contract:
+``mu_full``, ``mu_base``, ``delta_mu_src``, ``z``, ``attn_weights``,
+``te_lag_map``, and ``kld_per_t`` (see ``new_architecture.md``).
 
 Example:
     >>> from testing.collectors import collect_metrics, collect_latents
@@ -21,25 +25,32 @@ import torch
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.metrics import (
-    aggregate_predictions,
+    aggregate_te_lag_map,
+    compute_attention_diagnostics,
+    compute_forecast_metrics,
     compute_kld_per_sample,
-    compute_kld_per_timestep,
-    compute_reconstruction_metrics,
+    compute_residual_usage,
+    compute_uplift_metrics,
 )
 
 
-def _extract_guid(batch: Any, idx: int) -> Optional[str]:
-    """
-    Extract GUID string from batch at given index.
+# -----------------------------------------------------------------------------
+# Per-sample metadata extractors
+# -----------------------------------------------------------------------------
 
-    Handles various formats: tensors, numpy arrays, lists, bytes.
+
+def _extract_guid(batch: Any, idx: int) -> Optional[str]:
+    """Extract a GUID string from a batch at a given index.
+
+    Handles tensor / numpy / list / bytes formats; returns None if the
+    GUID field is absent or unparseable.
 
     Args:
-        batch: Batch object with guid attribute.
+        batch: Batch object with ``guid`` attribute.
         idx: Index within the batch.
 
     Returns:
-        GUID string or None if extraction fails.
+        GUID string, or None if extraction fails.
     """
     guid_attr = getattr(batch, "guid", None)
     if guid_attr is None:
@@ -47,10 +58,8 @@ def _extract_guid(batch: Any, idx: int) -> Optional[str]:
 
     try:
         raw = guid_attr[idx]
-        # Handle tensor types
         if isinstance(raw, torch.Tensor):
             raw = raw.item() if raw.numel() == 1 else int(raw.item())
-        # Handle bytes
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         return str(raw)
@@ -59,15 +68,14 @@ def _extract_guid(batch: Any, idx: int) -> Optional[str]:
 
 
 def _extract_epoch(batch: Any, idx: int) -> Optional[float]:
-    """
-    Extract epoch (time before birth) from batch at given index.
+    """Extract the per-sample epoch (seconds relative to delivery).
 
     Args:
-        batch: Batch object with epoch attribute.
+        batch: Batch object with ``epoch`` attribute.
         idx: Index within the batch.
 
     Returns:
-        Epoch value in seconds (negative) or None if extraction fails.
+        Epoch in seconds (negative = before delivery), or None on failure.
     """
     epoch_attr = getattr(batch, "epoch", None)
     if epoch_attr is None:
@@ -83,15 +91,18 @@ def _extract_epoch(batch: Any, idx: int) -> Optional[float]:
 
 
 def _extract_label(batch: Any, idx: int) -> Optional[int]:
-    """
-    Extract class label from batch at given index.
+    """Extract the per-sample class label from ``target``.
+
+    The ``target`` HDF5 field stores ``class_id * weight`` per timestep, so
+    the class ID is recovered by taking the first non-zero value.
 
     Args:
-        batch: Batch object with target attribute.
+        batch: Batch object with ``target`` attribute.
         idx: Index within the batch.
 
     Returns:
-        Class label integer or None if extraction fails.
+        Class label integer (1=HEALTHY, 2=ACIDOSIS, 3=HIE), 0 if the
+        sample is all-pad, or None on failure.
     """
     target_attr = getattr(batch, "target", None)
     if target_attr is None:
@@ -100,9 +111,7 @@ def _extract_label(batch: Any, idx: int) -> Optional[int]:
     try:
         raw = target_attr[idx]
         if isinstance(raw, torch.Tensor):
-            # Target might be per-timestep; take mode or first valid
             if raw.dim() > 0:
-                # Get most common non-zero value
                 nonzero = raw[raw > 0]
                 if len(nonzero) > 0:
                     return int(nonzero[0].item())
@@ -113,66 +122,85 @@ def _extract_label(batch: Any, idx: int) -> Optional[int]:
         return None
 
 
+# -----------------------------------------------------------------------------
+# Primary collectors (replace the old raw-FHR workflow)
+# -----------------------------------------------------------------------------
+
+
 def collect_metrics(
     runner: TestRunner,
     loader: Any,
     max_samples: Optional[int] = None,
 ) -> pd.DataFrame:
-    """
-    Collect VAF, MSE, SNR, and KLD metrics for all samples.
+    """Collect per-sample feature-forecast, uplift, residual and KL metrics.
 
-    Iterates through the dataloader, runs model inference, and computes
-    reconstruction metrics and KL divergence for each sample.
+    For every sample this runs the model once, builds the unfolded future
+    feature target via :meth:`TestRunner.build_future_target`, and calls
+    :func:`compute_forecast_metrics`, :func:`compute_uplift_metrics`,
+    :func:`compute_residual_usage`, and :func:`compute_kld_per_sample`.
+
+    The resulting DataFrame preserves a ``kld`` column (an alias of
+    ``kld_mean``) so downstream consumers that key on ``kld`` (notably
+    ``TE_Calculated/te_kld_analysis.py``) keep working unchanged.
 
     Args:
-        runner: TestRunner with model and device.
-        loader: PyTorch DataLoader yielding batches.
-        max_samples: Maximum samples to process. None for all.
+        runner: :class:`TestRunner` with a loaded model and device.
+        loader: PyTorch DataLoader yielding the batch objects consumed by
+            the runner.
+        max_samples: Maximum samples to process (None = all).
 
     Returns:
-        DataFrame with columns: [guid, epoch, label, vaf, mse, snr, kld]
-
-    Example:
-        >>> df = collect_metrics(runner, test_loader)
-        >>> print(f"Mean VAF: {df['vaf'].mean():.4f}")
+        DataFrame with columns ``[guid, epoch, label, feat_mse_total,
+        feat_mse_st, feat_mse_ph, feat_r2_total, base_mse_total,
+        uplift_abs, uplift_rel, residual_ratio, kld_mean, kld]``.
     """
     records: List[Dict[str, Any]] = []
     processed = 0
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
-            batch_size = batch.fhr_st.size(0)
+            batch_size = int(batch.fhr_st.size(0))
 
-            # Forward pass
             outputs = runner.forward(batch)
+            y_plus = runner.build_future_target(batch)
 
-            # Aggregate predictions to raw signal length
-            avg_pred, valid_mask = aggregate_predictions(
-                runner.model, outputs.get("mu_pr"), raw_len=batch.fhr.size(1)
+            fcst = compute_forecast_metrics(
+                outputs["mu_full"], y_plus, runner.warmup_steps, runner.horizon
             )
+            uplift = compute_uplift_metrics(
+                outputs["mu_full"],
+                outputs["mu_base"],
+                y_plus,
+                runner.warmup_steps,
+                runner.horizon,
+            )
+            usage = compute_residual_usage(
+                outputs["delta_mu_src"],
+                outputs["mu_full"],
+                runner.warmup_steps,
+                runner.horizon,
+            )
+            kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
 
-            if avg_pred is None:
-                continue
-
-            # Compute reconstruction metrics
-            metrics = compute_reconstruction_metrics(batch.fhr, avg_pred, valid_mask)
-
-            # Compute per-sample KLD
-            kld = compute_kld_per_sample(outputs, runner.warmup_steps)
-
-            # Extract per-sample data
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
 
+                kld_val = float(kld_sample[idx].cpu().item())
                 records.append({
                     "guid": _extract_guid(batch, idx),
                     "epoch": _extract_epoch(batch, idx),
                     "label": _extract_label(batch, idx),
-                    "vaf": float(metrics["vaf"][idx].cpu().item()),
-                    "mse": float(metrics["mse"][idx].cpu().item()),
-                    "snr": float(metrics["snr"][idx].cpu().item()),
-                    "kld": float(kld[idx].cpu().item()),
+                    "feat_mse_total": float(fcst["feat_mse_total"][idx].cpu().item()),
+                    "feat_mse_st": float(fcst["feat_mse_st"][idx].cpu().item()),
+                    "feat_mse_ph": float(fcst["feat_mse_ph"][idx].cpu().item()),
+                    "feat_r2_total": float(fcst["feat_r2_total"][idx].cpu().item()),
+                    "base_mse_total": float(uplift["l_base"][idx].cpu().item()),
+                    "uplift_abs": float(uplift["uplift_abs"][idx].cpu().item()),
+                    "uplift_rel": float(uplift["uplift_rel"][idx].cpu().item()),
+                    "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
+                    "kld_mean": kld_val,
+                    "kld": kld_val,  # alias for backward compatibility
                 })
                 processed += 1
 
@@ -187,46 +215,33 @@ def collect_latents(
     loader: Any,
     max_samples: Optional[int] = None,
 ) -> np.ndarray:
-    """
-    Collect latent representations from all samples.
-
-    Returns a flattened array of shape (N * T, D) where N is number of
-    samples, T is sequence length, and D is latent dimension.
+    """Collect latent trajectories for all processed samples.
 
     Args:
-        runner: TestRunner with model and device.
-        loader: PyTorch DataLoader yielding batches.
-        max_samples: Maximum samples to process. None for all.
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
 
     Returns:
-        Numpy array of shape (total_timesteps, latent_dim).
-
-    Example:
-        >>> latents = collect_latents(runner, test_loader, max_samples=500)
-        >>> print(f"Latent shape: {latents.shape}")
+        ``(N * T, d_z)`` array with the full latent trajectory of each
+        sample flattened along the time axis.
     """
     chunks: List[np.ndarray] = []
     processed = 0
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
-            batch_size = batch.fhr_st.size(0)
+            batch_size = int(batch.fhr_st.size(0))
 
-            # Forward pass
             outputs = runner.forward(batch)
             latent = outputs.get("z")
-
             if latent is None:
                 continue
 
-            # Convert to numpy: (B, T, D)
             latent_np = latent.detach().cpu().numpy()
-
-            # Flatten batch and time: (B, T, D) -> (B*T, D)
             for i in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
-                # Reshape single sample: (T, D)
                 chunks.append(latent_np[i])
                 processed += 1
 
@@ -236,7 +251,6 @@ def collect_latents(
     if not chunks:
         return np.array([])
 
-    # Concatenate all chunks: (N*T, D)
     return np.concatenate(chunks, axis=0)
 
 
@@ -245,87 +259,106 @@ def collect_predictions(
     loader: Any,
     max_samples: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Collect detailed per-sample predictions with metadata.
+    """Collect detailed per-sample predictions for diagnostic plots.
 
-    Returns a list of dictionaries, each containing the ground truth,
-    prediction, uncertainty, latent, and metrics for one sample.
+    Each record holds numpy copies of every quantity a sample-level
+    diagnostic plot might need: the full forecast, baseline forecast,
+    residual, ground-truth feature trajectory, latent, attention weights,
+    TE lag map, per-timestep KL, raw FHR/UP traces, and summary metrics.
 
     Args:
-        runner: TestRunner with model and device.
-        loader: PyTorch DataLoader yielding batches.
-        max_samples: Maximum samples to process. None for all.
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
 
     Returns:
-        List of dicts with keys:
-            - y_true: Raw FHR signal (numpy)
-            - y_pred: Aggregated prediction (numpy)
-            - y_pred_std: Prediction uncertainty if available (numpy)
-            - latent: Latent representation (numpy)
-            - guid: Patient ID
-            - epoch: Time before birth in seconds
-            - label: Class label
-            - metrics: {vaf, mse, snr, kld}
-
-    Example:
-        >>> samples = collect_predictions(runner, test_loader, max_samples=10)
-        >>> for s in samples:
-        ...     print(f"GUID: {s['guid']}, VAF: {s['metrics']['vaf']:.3f}")
+        List of dicts, one per sample, with keys described in the module
+        docstring of ``plot_single_samples.py``.
     """
     samples: List[Dict[str, Any]] = []
     processed = 0
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
-            batch_size = batch.fhr_st.size(0)
+            batch_size = int(batch.fhr_st.size(0))
 
-            # Forward pass
             outputs = runner.forward(batch)
+            y_plus = runner.build_future_target(batch)
 
-            # Aggregate predictions
-            avg_pred, valid_mask = aggregate_predictions(
-                runner.model, outputs.get("mu_pr"), raw_len=batch.fhr.size(1)
+            fcst = compute_forecast_metrics(
+                outputs["mu_full"], y_plus, runner.warmup_steps, runner.horizon
             )
+            uplift = compute_uplift_metrics(
+                outputs["mu_full"],
+                outputs["mu_base"],
+                y_plus,
+                runner.warmup_steps,
+                runner.horizon,
+            )
+            usage = compute_residual_usage(
+                outputs["delta_mu_src"],
+                outputs["mu_full"],
+                runner.warmup_steps,
+                runner.horizon,
+            )
+            kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
 
-            # Aggregate variance for uncertainty
-            logvar_segments = outputs.get("logvar_pr")
-            avg_std = None
-            if logvar_segments is not None:
-                avg_var, _ = aggregate_predictions(
-                    runner.model, logvar_segments.exp(), raw_len=batch.fhr.size(1)
-                )
-                if avg_var is not None:
-                    avg_std = torch.sqrt(avg_var.clamp_min(1e-12))
+            mu_full_np = outputs["mu_full"].detach().cpu().numpy()
+            mu_base_np = outputs["mu_base"].detach().cpu().numpy()
+            delta_np = outputs["delta_mu_src"].detach().cpu().numpy()
+            z_np = outputs["z"].detach().cpu().numpy()
+            attn_np = outputs["attn_weights"].detach().cpu().numpy()
+            te_lag_np = outputs["te_lag_map"].detach().cpu().numpy()
+            kld_t_np = outputs["kld_per_t"].detach().cpu().numpy()
+            y_plus_np = y_plus.detach().cpu().numpy()
 
-            if avg_pred is None:
-                continue
+            # Per-dimension KL (for dim-heat plots). Closed-form KL tensor
+            # is computed by the model for us when we ask; replicate here
+            # using the same formula without re-running the encoder.
+            mu_prior = outputs["mu_prior"]
+            logvar_prior = outputs["logvar_prior"]
+            mu_post = outputs["mu_post"]
+            logvar_post = outputs["logvar_post"]
+            kld_per_dim = 0.5 * (
+                logvar_prior
+                - logvar_post
+                + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+                - 1.0
+            )
+            kld_per_dim_np = kld_per_dim.detach().cpu().numpy()
 
-            # Compute metrics
-            metrics = compute_reconstruction_metrics(batch.fhr, avg_pred, valid_mask)
-            kld = compute_kld_per_sample(outputs, runner.warmup_steps)
-            latent = outputs.get("z")
+            fhr_np = batch.fhr.detach().cpu().numpy() if hasattr(batch, "fhr") and isinstance(batch.fhr, torch.Tensor) else None
+            up_np = batch.up.detach().cpu().numpy() if hasattr(batch, "up") and isinstance(batch.up, torch.Tensor) else None
 
-            # Extract per-sample data
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
 
-                sample = {
-                    "y_true": batch.fhr[idx].cpu().numpy(),
-                    "y_pred": avg_pred[idx].cpu().numpy(),
-                    "y_pred_std": avg_std[idx].cpu().numpy() if avg_std is not None else None,
-                    "latent": latent[idx].cpu().numpy() if latent is not None else None,
+                samples.append({
+                    "mu_full": mu_full_np[idx],
+                    "mu_base": mu_base_np[idx],
+                    "delta_src": delta_np[idx],
+                    "y_plus": y_plus_np[idx],
+                    "z": z_np[idx],
+                    "attn": attn_np[idx],
+                    "te_lag": te_lag_np[idx],
+                    "kld_t": kld_t_np[idx],
+                    "kld_per_dim": kld_per_dim_np[idx],
+                    "fhr": fhr_np[idx] if fhr_np is not None else None,
+                    "up": up_np[idx] if up_np is not None else None,
                     "guid": _extract_guid(batch, idx),
                     "epoch": _extract_epoch(batch, idx),
                     "label": _extract_label(batch, idx),
                     "metrics": {
-                        "vaf": float(metrics["vaf"][idx].cpu().item()),
-                        "mse": float(metrics["mse"][idx].cpu().item()),
-                        "snr": float(metrics["snr"][idx].cpu().item()),
-                        "kld": float(kld[idx].cpu().item()),
+                        "feat_mse_total": float(fcst["feat_mse_total"][idx].cpu().item()),
+                        "feat_r2_total": float(fcst["feat_r2_total"][idx].cpu().item()),
+                        "base_mse_total": float(uplift["l_base"][idx].cpu().item()),
+                        "uplift_abs": float(uplift["uplift_abs"][idx].cpu().item()),
+                        "uplift_rel": float(uplift["uplift_rel"][idx].cpu().item()),
+                        "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
+                        "kld_mean": float(kld_sample[idx].cpu().item()),
                     },
-                }
-                samples.append(sample)
+                })
                 processed += 1
 
             if max_samples and processed >= max_samples:
@@ -339,51 +372,46 @@ def collect_kld_trajectory(
     loader: Any,
     max_samples: Optional[int] = None,
 ) -> pd.DataFrame:
-    """
-    Collect per-timestep KLD values for trajectory analysis.
+    """Collect per-timestep KL trajectory records for every sample.
 
-    Returns a DataFrame with KLD at each timestep, along with metadata
-    for grouping by patient and time before birth.
+    Reads ``outputs["kld_per_t"]`` directly (the model's TE analysis head
+    produces this as ``sum_d KL(q || p)``), so no recomputation is needed.
+    Warmup timesteps are dropped by the model's warmup masking; we skip
+    non-finite values defensively.
+
+    The CSV schema is preserved from the legacy pipeline so
+    ``TE_Calculated`` modules keep working:
+    ``[guid, epoch, hours_before, label, timestep, kld_mean, latent_0 ... latent_{d_z-1}]``.
 
     Args:
-        runner: TestRunner with model and device.
-        loader: PyTorch DataLoader yielding batches.
-        max_samples: Maximum samples to process. None for all.
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
 
     Returns:
-        DataFrame with columns:
-            - guid: Patient ID
-            - epoch: Time before birth (seconds, negative)
-            - hours_before: Time before birth in hours (positive)
-            - label: Class label
-            - timestep: Timestep index within sample
-            - kld_mean: Mean KLD over latent dimensions at this timestep
-            - latent_0, latent_1, ...: Individual latent dimension values
-
-    Example:
-        >>> df = collect_kld_trajectory(runner, test_loader)
-        >>> df_by_hour = df.groupby('hours_before')['kld_mean'].mean()
+        DataFrame with per-(sample, timestep) rows.
     """
     records: List[Dict[str, Any]] = []
     processed = 0
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
-            batch_size = batch.fhr_st.size(0)
+            batch_size = int(batch.fhr_st.size(0))
 
-            # Forward pass
             outputs = runner.forward(batch)
-
-            # Compute per-timestep KLD
-            kld_t = compute_kld_per_timestep(outputs, runner.warmup_steps)
+            kld_t = outputs.get("kld_per_t")
             latent = outputs.get("z")
-
             if kld_t is None:
                 continue
 
-            T = kld_t.size(1)
+            # Mask warmup region with NaN so we can skip it below.
+            kld_t_f = kld_t.detach().to(torch.float32).clone()
+            warmup = int(runner.warmup_steps)
+            if warmup > 0 and kld_t_f.size(1) > warmup:
+                kld_t_f[:, :warmup] = float("nan")
 
-            # Extract per-sample, per-timestep data
+            T = int(kld_t_f.size(1))
+
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
@@ -391,33 +419,221 @@ def collect_kld_trajectory(
                 guid = _extract_guid(batch, idx)
                 epoch = _extract_epoch(batch, idx)
                 label = _extract_label(batch, idx)
-
-                # Convert epoch to hours before birth (positive)
                 hours_before = -epoch / 3600.0 if epoch is not None else None
 
-                # Get per-timestep values
-                kld_vals = kld_t[idx].cpu().numpy()
+                kld_vals = kld_t_f[idx].cpu().numpy()
                 latent_vals = latent[idx].cpu().numpy() if latent is not None else None
 
                 for t in range(T):
-                    if not np.isfinite(kld_vals[t]):
+                    v = kld_vals[t]
+                    if not np.isfinite(v):
                         continue
-                    record = {
+                    record: Dict[str, Any] = {
                         "guid": guid,
                         "epoch": epoch,
                         "hours_before": hours_before,
                         "label": label,
                         "timestep": t,
-                        "kld_mean": float(kld_vals[t]),
+                        "kld_mean": float(v),
                     }
-
-                    # Add individual latent dimensions
                     if latent_vals is not None:
                         for d in range(latent_vals.shape[1]):
                             record[f"latent_{d}"] = float(latent_vals[t, d])
-
                     records.append(record)
 
+                processed += 1
+
+            if max_samples and processed >= max_samples:
+                break
+
+    return pd.DataFrame(records)
+
+
+# -----------------------------------------------------------------------------
+# New collectors for lag-attention diagnostics and forecast profiling
+# -----------------------------------------------------------------------------
+
+
+def collect_attention_maps(
+    runner: TestRunner,
+    loader: Any,
+    max_samples: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Collect per-sample lag-attention summaries.
+
+    For each sample this runs :func:`compute_attention_diagnostics` and
+    stores the head-averaged attention, argmax lag, per-head entropy,
+    head diversity, and the time-averaged ``alpha_mass_by_lag`` vector.
+
+    Args:
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
+
+    Returns:
+        List of dicts ``{guid, epoch, label, alpha_bar (T,L),
+        argmax_lag (T,), entropy (T,M), head_diversity (T,),
+        alpha_mass_by_lag (L,)}`` — all numpy arrays with NaN in warmup
+        regions.
+    """
+    records: List[Dict[str, Any]] = []
+    processed = 0
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, max_samples):
+            batch_size = int(batch.fhr_st.size(0))
+
+            outputs = runner.forward(batch)
+            diag = compute_attention_diagnostics(
+                outputs["attn_weights"], runner.warmup_steps
+            )
+
+            alpha_bar_np = diag["alpha_bar"].detach().cpu().numpy()
+            argmax_np = diag["argmax_lag"].detach().cpu().numpy()
+            entropy_np = diag["entropy"].detach().cpu().numpy()
+            head_div_np = diag["head_diversity"].detach().cpu().numpy()
+            mass_np = diag["alpha_mass_by_lag"].detach().cpu().numpy()
+
+            for idx in range(batch_size):
+                if max_samples and processed >= max_samples:
+                    break
+                records.append({
+                    "guid": _extract_guid(batch, idx),
+                    "epoch": _extract_epoch(batch, idx),
+                    "label": _extract_label(batch, idx),
+                    "alpha_bar": alpha_bar_np[idx],
+                    "argmax_lag": argmax_np[idx],
+                    "entropy": entropy_np[idx],
+                    "head_diversity": head_div_np[idx],
+                    "alpha_mass_by_lag": mass_np[idx],
+                })
+                processed += 1
+
+            if max_samples and processed >= max_samples:
+                break
+
+    return records
+
+
+def collect_te_lag_maps(
+    runner: TestRunner,
+    loader: Any,
+    max_samples: Optional[int] = None,
+) -> pd.DataFrame:
+    """Collect time-averaged TE lag signatures for every sample.
+
+    Args:
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
+
+    Returns:
+        DataFrame one-row-per-sample with columns ``[guid, epoch, label,
+        te_lag_mean_0 ... te_lag_mean_{L-1}, te_lag_argmax]``.
+    """
+    records: List[Dict[str, Any]] = []
+    processed = 0
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, max_samples):
+            batch_size = int(batch.fhr_st.size(0))
+
+            outputs = runner.forward(batch)
+            agg = aggregate_te_lag_map(outputs["te_lag_map"], runner.warmup_steps)
+
+            mean_np = agg["te_lag_mean"].detach().cpu().numpy()
+            argmax_np = agg["te_lag_argmax"].detach().cpu().numpy()
+            L = int(mean_np.shape[1])
+
+            for idx in range(batch_size):
+                if max_samples and processed >= max_samples:
+                    break
+                rec: Dict[str, Any] = {
+                    "guid": _extract_guid(batch, idx),
+                    "epoch": _extract_epoch(batch, idx),
+                    "label": _extract_label(batch, idx),
+                    "te_lag_argmax": int(argmax_np[idx]),
+                }
+                for k in range(L):
+                    rec[f"te_lag_mean_{k}"] = float(mean_np[idx, k])
+                records.append(rec)
+                processed += 1
+
+            if max_samples and processed >= max_samples:
+                break
+
+    return pd.DataFrame(records)
+
+
+def collect_forecast_errors_per_horizon(
+    runner: TestRunner,
+    loader: Any,
+    max_samples: Optional[int] = None,
+) -> pd.DataFrame:
+    """Collect per-(sample, horizon step) forecast error.
+
+    For each sample we compute :func:`compute_forecast_metrics` and unpack
+    ``feat_mse_per_horizon (B, H_d)`` into one row per horizon step, plus
+    the scattering/phase block split evaluated only at that horizon step.
+
+    Args:
+        runner: :class:`TestRunner` with a loaded model.
+        loader: PyTorch DataLoader.
+        max_samples: Maximum samples to process (None = all).
+
+    Returns:
+        DataFrame with columns ``[guid, epoch, label, h, mse_step, mse_st,
+        mse_ph]``.
+    """
+    records: List[Dict[str, Any]] = []
+    processed = 0
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, max_samples):
+            batch_size = int(batch.fhr_st.size(0))
+
+            outputs = runner.forward(batch)
+            y_plus = runner.build_future_target(batch)
+
+            mu_full = outputs["mu_full"]
+            T, H_d, C = mu_full.shape[1], mu_full.shape[2], mu_full.shape[3]
+            c_st = min(43, int(C))
+
+            warmup = int(runner.warmup_steps)
+            T_valid = max(T - int(H_d), 0)
+            start = max(0, min(warmup, T_valid))
+
+            mu_v = mu_full[:, start:T_valid, :, :]
+            y_v = y_plus[:, start:T_valid, :, :]
+            if mu_v.numel() == 0:
+                continue
+
+            diff_sq = (mu_v - y_v).pow(2)                   # (B, T_v, H_d, C)
+            mse_step = diff_sq.mean(dim=(1, 3))              # (B, H_d)
+            mse_st = diff_sq[..., :c_st].mean(dim=(1, 3)) if c_st > 0 else torch.zeros_like(mse_step)
+            mse_ph = diff_sq[..., c_st:].mean(dim=(1, 3)) if c_st < int(C) else torch.zeros_like(mse_step)
+
+            mse_step_np = mse_step.detach().cpu().numpy()
+            mse_st_np = mse_st.detach().cpu().numpy()
+            mse_ph_np = mse_ph.detach().cpu().numpy()
+
+            for idx in range(batch_size):
+                if max_samples and processed >= max_samples:
+                    break
+
+                guid = _extract_guid(batch, idx)
+                epoch = _extract_epoch(batch, idx)
+                label = _extract_label(batch, idx)
+                for h in range(int(H_d)):
+                    records.append({
+                        "guid": guid,
+                        "epoch": epoch,
+                        "label": label,
+                        "h": h,
+                        "mse_step": float(mse_step_np[idx, h]),
+                        "mse_st": float(mse_st_np[idx, h]),
+                        "mse_ph": float(mse_ph_np[idx, h]),
+                    })
                 processed += 1
 
             if max_samples and processed >= max_samples:

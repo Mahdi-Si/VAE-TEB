@@ -139,10 +139,13 @@ def load_kld_from_inference(
     if isinstance(data_path, str):
         data_path = [data_path]
 
-    # Resolve stats_path, normalize_fields, and dataset_kwargs from config
-    stats_path = cfg.get("dataset_config", {}).get("stats_path")
-    normalize_fields = cfg.get("dataset_config", {}).get("normalize_fields")
-    dataloader_cfg = cfg.get("dataset_config", {}).get("dataloader_config", {})
+    # Resolve stats_path, normalize_fields, and dataset_kwargs from config.
+    # Accept both spellings: v1 configs use "stat_path", older ones use
+    # "stats_path".
+    dataset_cfg = cfg.get("dataset_config", {}) or {}
+    stats_path = dataset_cfg.get("stat_path") or dataset_cfg.get("stats_path")
+    dataloader_cfg = dataset_cfg.get("dataloader_config", {}) or {}
+    normalize_fields = dataloader_cfg.get("normalize_fields") or dataset_cfg.get("normalize_fields")
     dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
 
     # Remove epoch filtering so we get data all the way to delivery
@@ -157,6 +160,7 @@ def load_kld_from_inference(
     runner = TestRunner.from_checkpoint(
         checkpoint_path=checkpoint_path,
         output_dir=str(Path(config_path).parent / "te_kld_tmp"),
+        config_path=config_path,
         device=torch.device(device),
     )
 

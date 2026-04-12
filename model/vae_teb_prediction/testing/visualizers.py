@@ -233,33 +233,46 @@ def plot_metric_histograms(
     add_kde: bool = False,
     add_ci: bool = True,
 ) -> None:
-    """
-    Create a 2x2 grid of histograms for VAF, MSE, SNR, and KLD.
+    """Create a single-column histogram panel for the v1 feature-forecast metrics.
+
+    Draws histograms for ``feat_mse_total``, ``uplift_rel``,
+    ``residual_ratio``, and ``kld_mean`` (falls back to the legacy
+    ``vaf/mse/snr/kld`` set when none of the new columns are present).
 
     Args:
-        df: DataFrame with columns 'vaf', 'mse', 'snr', 'kld'.
+        df: DataFrame produced by :func:`collect_metrics` (new schema) or
+            any legacy file that still carries the old column names.
         output_dir: Directory to save the plot.
-        filename: Output filename (default: metrics_histograms.pdf).
-        add_kde: Whether to add kernel density estimate overlay (default: False).
-        add_ci: Whether to include 95% confidence intervals in stats box (default: True).
-
-    Example:
-        >>> plot_metric_histograms(metrics_df, Path("results/"))
+        filename: Output filename.
+        add_kde: Whether to overlay a KDE trace (currently unused).
+        add_ci: Whether to include 95% confidence intervals in the stats
+            box.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Single-column layout with wider panels
-    fig, axes = plt.subplots(4, 1, figsize=(6.5, 8.5))
-    axes = np.atleast_1d(axes)
-
-    # Define metrics and their properties
-    metrics_config = [
+    # Lag-attn v1 primary schema.
+    v1_metrics = [
+        ("feat_mse_total", "Feature Forecast MSE", COLOR_BLUE, ""),
+        ("uplift_rel", "Baseline - Full Uplift (rel.)", COLOR_GREEN, ""),
+        ("residual_ratio", "Residual Usage Ratio", COLOR_ORANGE, ""),
+        ("kld_mean", "Transfer Entropy (KL)", COLOR_PURPLE, "nats"),
+    ]
+    # Legacy fallback (old histogram_metrics.csv).
+    legacy_metrics = [
         ("vaf", "Variance Accounted For (VAF)", COLOR_BLUE, ""),
         ("mse", "Mean Squared Error (MSE)", COLOR_GREEN, ""),
         ("snr", "Signal-to-Noise Ratio (SNR)", COLOR_ORANGE, "dB"),
         ("kld", "Transfer Entropy (KLD)", COLOR_PURPLE, "nats"),
     ]
+    if any(m[0] in df.columns for m in v1_metrics):
+        metrics_config = v1_metrics
+    else:
+        metrics_config = legacy_metrics
+
+    # Single-column layout with wider panels
+    fig, axes = plt.subplots(len(metrics_config), 1, figsize=(6.5, 8.5))
+    axes = np.atleast_1d(axes)
 
     for ax, (col, title, color, unit) in zip(axes, metrics_config):
         if col not in df.columns:
@@ -310,13 +323,13 @@ def plot_metric_histograms(
         )
 
         # Labels and styling
-        xlabel = f"{col.upper()}" + (f" ({unit})" if unit else "")
+        xlabel = f"{col}" + (f" ({unit})" if unit else "")
         ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
         ax.set_ylabel("Density", fontsize=FONT_LABEL)
         ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal", pad=8)
 
-        # Use log scale for KLD x-axis by default
-        if col == "kld":
+        # Use log scale for KL / MSE x-axis by default (values span orders of magnitude).
+        if col in ("kld", "kld_mean", "feat_mse_total") and (values > 0).all():
             ax.set_xscale('log')
 
         _style_axes(ax, grid="major", minor_ticks=False)
@@ -408,395 +421,6 @@ def plot_latent_distributions(
 
     fig.suptitle("Latent Space Distributions", fontsize=FONT_TITLE, fontweight="normal", y=0.99)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_reconstruction_sample(
-    sample: Dict[str, Any],
-    output_path: Path,
-    *,
-    fs: float = 4.0,
-) -> None:
-    """
-    Create a 3-panel figure for a single sample analysis with enhanced quality.
-
-    Panels:
-        1. Top: Raw signal with prediction overlay and uncertainty band
-        2. Middle: Residual (error) plot with distribution
-        3. Bottom: Latent representation heatmap
-
-    Args:
-        sample: Dict with keys 'y_true', 'y_pred', 'y_pred_std', 'latent', 'metrics'.
-        output_path: Full path to save the figure.
-        fs: Sampling frequency in Hz (default: 4.0).
-
-    Example:
-        >>> plot_reconstruction_sample(samples[0], Path("results/sample_0.pdf"))
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    y_true = sample["y_true"]
-    y_pred = sample["y_pred"]
-    y_pred_std = sample.get("y_pred_std")
-    latent = sample.get("latent")
-    metrics = sample.get("metrics", {})
-
-    # Create time axis
-    time = np.arange(len(y_true)) / fs / 60.0  # Convert to minutes
-
-    # Compute correlation coefficient
-    corr_coef, p_value = scipy_stats.pearsonr(y_true, y_pred)
-
-    fig, axes = plt.subplots(3, 1, figsize=(6.5, 6.5),
-                            gridspec_kw={"height_ratios": [2.5, 1, 1.5]})
-
-    # ----- Panel 1: Signal with prediction -----
-    ax1 = axes[0]
-    ax1.plot(time, y_true, label="Ground truth",
-            color=COLOR_BLUE, alpha=0.9, linewidth=0.8, zorder=2)
-    ax1.plot(time, y_pred, label="Reconstruction",
-            color=COLOR_ORANGE, alpha=0.9, linewidth=0.8, zorder=3)
-
-    # Add uncertainty band if available
-    if y_pred_std is not None:
-        ax1.fill_between(
-            time,
-            y_pred - 2 * y_pred_std,
-            y_pred + 2 * y_pred_std,
-            alpha=0.25, color=COLOR_ORANGE, label="95% CI",
-            zorder=1, linewidth=0,
-        )
-
-    # Add metrics annotation with improved formatting
-    vaf = metrics.get('vaf', np.nan)
-    snr = metrics.get('snr', np.nan)
-    kld = metrics.get('kld', np.nan)
-
-    metrics_text = (
-        f"VAF = {vaf:.3f}  |  SNR = {snr:.1f} dB\n"
-        f"KLD = {kld:.4f} bits  |  $r$ = {corr_coef:.3f}"
-    )
-    ax1.text(
-        0.02, 0.98, metrics_text,
-        transform=ax1.transAxes, fontsize=FONT_LEGEND,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
-                 edgecolor=COLOR_LIGHT_GRAY, alpha=0.95, linewidth=0.8),
-    )
-
-    ax1.set_xlabel("")
-    ax1.set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
-    ax1.set_title(
-        f"Reconstruction Quality: GUID={sample.get('guid', 'N/A')}, Epoch={sample.get('epoch', 'N/A')}",
-        fontsize=FONT_TITLE, fontweight="normal", pad=8
-    )
-    ax1.legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
-    _tighten_xaxis(ax1, time)
-    _style_axes(ax1, grid="both", minor_ticks=True)
-
-    # ----- Panel 2: Residual -----
-    ax2 = axes[1]
-    residual = y_true - y_pred
-    rmse = np.sqrt(np.mean(residual**2))
-
-    ax2.plot(time, residual, color=COLOR_GREEN, alpha=0.8, linewidth=0.6, label="Residual")
-    ax2.axhline(y=0, color=COLOR_BLACK, linewidth=0.6, alpha=0.6, zorder=3)
-    ax2.fill_between(
-        time,
-        residual,
-        0,
-        alpha=0.15,
-        color=COLOR_GREEN,
-        linewidth=0,
-        label="Residual area",
-    )
-
-    # Add RMSE annotation
-    ax2.text(
-        0.98, 0.95, f"RMSE = {rmse:.4f}",
-        transform=ax2.transAxes, fontsize=FONT_LEGEND,
-        verticalalignment="top", horizontalalignment="right",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                 edgecolor=COLOR_LIGHT_GRAY, alpha=0.95, linewidth=0.8),
-    )
-
-    ax2.set_xlabel("")
-    ax2.set_ylabel("Residual", fontsize=FONT_LABEL)
-    ax2.legend(loc="upper left", fontsize=FONT_LEGEND, framealpha=0.95)
-    _tighten_xaxis(ax2, time)
-    _style_axes(ax2, grid="major", minor_ticks=False)
-
-    # ----- Panel 3: Latent heatmap -----
-    ax3 = axes[2]
-    if latent is not None and latent.size > 0:
-        # latent shape: (T, D)
-        # Use symmetric colormap centered at zero
-        vmax = np.abs(latent).max()
-        im = ax3.imshow(
-            latent.T, aspect="auto", cmap="bwr",
-            extent=[0, time[-1] * 60 * fs, latent.shape[1] - 0.5, -0.5],
-            interpolation="nearest",
-            vmin=-vmax, vmax=vmax,
-        )
-        ax3.set_xlabel("Time (min)", fontsize=FONT_LABEL)
-        ax3.set_ylabel("Latent dimension", fontsize=FONT_LABEL)
-        ax3.set_title("Latent Representation $\\mathbf{z}(t)$", fontsize=FONT_TITLE, fontweight="normal")
-
-        _add_colorbar(fig, im, ax3, label="Value", shrink=0.8, pad=0.02)
-        _style_axes(ax3, grid="major", minor_ticks=False)
-        _tighten_xaxis(ax3, time)
-    else:
-        ax3.text(0.5, 0.5, "No latent data available",
-                ha="center", va="center", fontsize=FONT_LABEL)
-        ax3.axis("off")
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_temporal_accuracy(
-    df: pd.DataFrame,
-    output_dir: Path,
-    warmup_steps: int = 30,
-    filename: str = "temporal_accuracy.pdf",
-) -> None:
-    """
-    Plot VAF and SNR as a function of timestep position with publication quality.
-
-    Shows how reconstruction quality varies across the sequence, with
-    warmup region clearly marked.
-
-    Args:
-        df: DataFrame with 'timestep', 'vaf', 'snr' columns (per-timestep data).
-        output_dir: Directory to save the plot.
-        warmup_steps: Number of warmup steps to mark (default 30).
-        filename: Output filename.
-
-    Example:
-        >>> plot_temporal_accuracy(temporal_df, Path("results/temporal/"))
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if "timestep" not in df.columns:
-        return
-
-    # Aggregate by timestep
-    agg = df.groupby("timestep").agg({
-        "vaf": ["mean", "std", "sem"],
-        "snr": ["mean", "std", "sem"],
-    }).reset_index()
-    agg.columns = ["timestep", "vaf_mean", "vaf_std", "vaf_sem",
-                  "snr_mean", "snr_std", "snr_sem"]
-
-    # Use wider figure for better visibility
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.5, 4.6), sharex=True)
-
-    # ----- VAF plot -----
-    marker_every = max(1, len(agg) // 20)
-    ax1.plot(
-        agg["timestep"], agg["vaf_mean"],
-        color=COLOR_BLUE, linewidth=0.5, label="VAF mean",
-        marker="o", markersize=1, markevery=marker_every,
-        markerfacecolor=COLOR_BLUE, markeredgewidth=0,
-    )
-    ax1.fill_between(
-        agg["timestep"],
-        agg["vaf_mean"] - agg["vaf_std"],
-        agg["vaf_mean"] + agg["vaf_std"],
-        alpha=0.15, color=COLOR_BLUE, linewidth=0,
-        label="VAF +/- 1 SD",
-    )
-
-    # Mark warmup region with subtle styling
-    ax1.axvspan(0, warmup_steps, alpha=0.08, color=COLOR_GRAY,
-               label="Warmup", zorder=0, linewidth=0)
-    ax1.axvline(warmup_steps, color=COLOR_GRAY,
-               linewidth=0.6, alpha=0.6, zorder=1)
-
-    ax1.set_ylabel("Variance Accounted For", fontsize=FONT_LABEL)
-    ax1.set_title("Reconstruction Quality vs. Timestep",
-                 fontsize=FONT_TITLE, fontweight="normal", pad=8)
-    ax1.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
-    _set_ylim_from_data(
-        ax1,
-        np.concatenate([agg["vaf_mean"].values, (agg["vaf_mean"] + agg["vaf_std"]).values]),
-        min_zero=True,
-        clamp=(0.0, 1.0),
-    )
-    _style_axes(ax1, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax1, agg["timestep"].values)
-
-    # ----- SNR plot -----
-    ax2.plot(
-        agg["timestep"], agg["snr_mean"],
-        color=COLOR_ORANGE, linewidth=0.5, label="SNR mean",
-        marker="s", markersize=2.5, markevery=marker_every,
-        markerfacecolor=COLOR_ORANGE, markeredgewidth=0,
-    )
-    ax2.fill_between(
-        agg["timestep"],
-        agg["snr_mean"] - agg["snr_std"],
-        agg["snr_mean"] + agg["snr_std"],
-        alpha=0.15, color=COLOR_ORANGE, linewidth=0,
-        label="SNR +/- 1 SD",
-    )
-
-    ax2.axvspan(0, warmup_steps, alpha=0.08, color=COLOR_GRAY, zorder=0, linewidth=0)
-    ax2.axvline(warmup_steps, color=COLOR_GRAY,
-               linewidth=0.6, alpha=0.6, zorder=1)
-
-    ax2.set_xlabel("Timestep (prediction index)", fontsize=FONT_LABEL)
-    ax2.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=FONT_LABEL)
-    ax2.legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax2, grid="both", minor_ticks=True)
-    _set_ylim_from_data(
-        ax2,
-        np.concatenate([agg["snr_mean"].values, (agg["snr_mean"] + agg["snr_std"]).values]),
-        pad_frac=0.05,
-    )
-    _tighten_xaxis(ax2, agg["timestep"].values)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_within_window_accuracy(
-    df: pd.DataFrame,
-    output_dir: Path,
-    *,
-    fs: float = 4.0,
-    filename: str = "within_window_accuracy.pdf",
-) -> None:
-    """
-    Plot reconstruction accuracy as a function of index within the prediction window.
-
-    Args:
-        df: DataFrame with columns ['window_position', 'abs_error'] or aggregated
-            ['window_position', 'mae_mean', 'mae_std', 'vaf_mean', 'snr_mean'].
-        output_dir: Directory to save the plot.
-        fs: Sampling frequency in Hz.
-        filename: Output filename.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if df.empty or "window_position" not in df.columns:
-        return
-
-    if "mae_mean" in df.columns:
-        cols = ["window_position", "mae_mean", "mae_std"]
-        if "vaf_mean" in df.columns:
-            cols.append("vaf_mean")
-        if "snr_mean" in df.columns:
-            cols.append("snr_mean")
-        agg = df[cols].copy()
-    else:
-        if "abs_error" not in df.columns:
-            return
-        agg = df.groupby("window_position")["abs_error"].agg(["mean", "std"]).reset_index()
-        agg.columns = ["window_position", "mae_mean", "mae_std"]
-
-    has_vaf = "vaf_mean" in agg.columns
-    has_snr = "snr_mean" in agg.columns
-    n_panels = 1 + int(has_vaf) + int(has_snr)
-
-    fig, axes = plt.subplots(
-        n_panels,
-        1,
-        figsize=(6.5, 2.4 * n_panels),
-        sharex=True,
-    )
-    if n_panels == 1:
-        axes = [axes]
-
-    x = agg["window_position"].values
-    axes[0].plot(
-        x,
-        agg["mae_mean"],
-        color=COLOR_BLUE,
-        linewidth=0.5,
-        marker="o",
-        markersize=1,
-        markevery=max(1, len(x) // 30),
-        label="MAE mean",
-    )
-    axes[0].fill_between(
-        x,
-        agg["mae_mean"] - agg["mae_std"],
-        agg["mae_mean"] + agg["mae_std"],
-        color=COLOR_BLUE,
-        alpha=0.2,
-        label="MAE +/- 1 SD",
-    )
-
-    axes[0].set_ylabel("Absolute error", fontsize=FONT_LABEL)
-    axes[0].set_title("Within-Window Accuracy", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    _set_ylim_from_data(
-        axes[0],
-        np.concatenate([agg["mae_mean"].values, (agg["mae_mean"] + agg["mae_std"]).values]),
-        min_zero=True,
-        pad_frac=0.05,
-    )
-    axes[0].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(axes[0], grid="both", minor_ticks=True)
-
-    secax = axes[0].secondary_xaxis("top", functions=(lambda v: v / fs, lambda s: s * fs))
-    secax.set_xlabel("Time from window start (seconds)", fontsize=FONT_LABEL)
-    secax.tick_params(labelsize=FONT_TICK)
-
-    panel_idx = 1
-    if has_vaf:
-        axes[panel_idx].plot(
-            x,
-            agg["vaf_mean"],
-            color=COLOR_GREEN,
-            linewidth=0.6,
-            marker="o",
-            markersize=1,
-            markevery=max(1, len(x) // 30),
-            label="VAF mean",
-        )
-        axes[panel_idx].set_ylabel("VAF", fontsize=FONT_LABEL)
-        _set_ylim_from_data(
-            axes[panel_idx],
-            agg["vaf_mean"].values,
-            min_zero=True,
-            clamp=(0.0, 1.0),
-        )
-        axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
-        _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
-        panel_idx += 1
-
-    if has_snr:
-        axes[panel_idx].plot(
-            x,
-            agg["snr_mean"],
-            color=COLOR_ORANGE,
-            linewidth=0.6,
-            marker="o",
-            markersize=1,
-            markevery=max(1, len(x) // 30),
-            label="SNR mean",
-        )
-        axes[panel_idx].set_ylabel("SNR (dB)", fontsize=FONT_LABEL)
-        axes[panel_idx].legend(loc="lower right", fontsize=FONT_LEGEND, framealpha=0.95)
-        _style_axes(axes[panel_idx], grid="both", minor_ticks=True)
-        _set_ylim_from_data(
-            axes[panel_idx],
-            agg["snr_mean"].values,
-            pad_frac=0.05,
-        )
-
-    axes[-1].set_xlabel("Index from window start (samples)", fontsize=FONT_LABEL)
-    for ax in axes:
-        _tighten_xaxis(ax, x)
-
-    fig.tight_layout(pad=0.6)
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -968,689 +592,6 @@ def plot_kld_guid_trajectory(
     fig.tight_layout()
     out_name = filename or f"kld_guid_{guid}.pdf"
     fig.savefig(output_dir / out_name, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_coherence_analysis(
-    frequencies: np.ndarray,
-    coherence_original: np.ndarray,
-    coherence_reconstructed: np.ndarray,
-    output_dir: Path,
-    filename: str = "coherence_analysis.pdf",
-) -> None:
-    """
-    Plot optional UP-FHR coherence comparison between original and reconstructed signals.
-
-    Args:
-        frequencies: Frequency array in Hz.
-        coherence_original: Coherence between UP and original FHR.
-        coherence_reconstructed: Coherence between UP and reconstructed FHR.
-        output_dir: Directory to save the plot.
-        filename: Output filename.
-
-    Example:
-        >>> plot_coherence_analysis(freqs, coh_orig, coh_recon, Path("results/"))
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-
-    max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-    coh_orig = coherence_original[freq_mask]
-    coh_recon = coherence_reconstructed[freq_mask]
-
-    ax.plot(
-        freqs,
-        coh_orig,
-        color=COLOR_BLUE,
-        linewidth=0.6,
-        label="UP vs FHR (reference)",
-    )
-    ax.plot(
-        freqs,
-        coh_recon,
-        color=COLOR_ORANGE,
-        linewidth=0.9,
-        label="UP vs FHR (reconstruction)",
-    )
-
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
-    ax.set_title("UP-FHR Spectral Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, max_freq)
-    ax.set_ylim(0, 1)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_reconstruction_coherence(
-    frequencies: np.ndarray,
-    coherence_mean: np.ndarray,
-    coherence_std: np.ndarray,
-    output_dir: Path,
-    filename: str = "reconstruction_coherence.pdf",
-    significance_threshold: Optional[float] = None,
-) -> None:
-    """
-    Plot coherence between original and reconstructed FHR signals.
-
-    Args:
-        frequencies: Frequency array in Hz.
-        coherence_mean: Mean coherence across samples.
-        coherence_std: Std coherence across samples.
-        output_dir: Directory to save the plot.
-        filename: Output filename.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-    max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-    coh_mean = coherence_mean[freq_mask]
-    coh_std = coherence_std[freq_mask]
-
-    ax.plot(freqs, coh_mean, color=COLOR_BLUE, linewidth=0.5, label="Mean coherence")
-    ax.fill_between(
-        freqs,
-        coh_mean - coh_std,
-        coh_mean + coh_std,
-        color=COLOR_BLUE,
-        alpha=0.2,
-        label="Coherence +/- 1 SD",
-    )
-    if significance_threshold is not None and np.isfinite(significance_threshold):
-        ax.axhline(
-            float(significance_threshold),
-            color=COLOR_ORANGE,
-            linestyle="--",
-            linewidth=0.9,
-            label="Significance threshold",
-        )
-
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
-    ax.set_title("FHR Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, max_freq)
-    ax.set_ylim(0, 1)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_coherence_spectrum(
-    frequencies: np.ndarray,
-    coherence: np.ndarray,
-    output_path: Path,
-    *,
-    title: Optional[str] = None,
-    max_freq: Optional[float] = 0.5,
-) -> None:
-    """
-    Plot a single coherence spectrum (one line, no aggregation).
-
-    Args:
-        frequencies: Frequency array in Hz.
-        coherence: Coherence values in [0, 1].
-        output_path: Output path for the figure.
-        title: Optional title override.
-        max_freq: Optional max frequency to display.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if frequencies.size == 0 or coherence.size == 0:
-        return
-
-    if max_freq is None:
-        max_freq = float(np.nanmax(frequencies))
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-    coh = coherence[freq_mask]
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-    ax.plot(freqs, coh, color=COLOR_BLUE, linewidth=0.8, label="Coherence")
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
-    ax.set_title(title or "Coherence Spectrum", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, float(max_freq))
-    ax.set_ylim(0, 1)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_horizon_spectra(
-    frequencies: np.ndarray,
-    early_mean: np.ndarray,
-    early_std: np.ndarray,
-    late_mean: np.ndarray,
-    late_std: np.ndarray,
-    output_path: Path,
-    *,
-    title: Optional[str] = None,
-    max_freq: Optional[float] = 0.5,
-    early_label: str = "Early horizon",
-    late_label: str = "Late horizon",
-) -> None:
-    """
-    Plot early vs late horizon coherence spectra with uncertainty bands.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if frequencies.size == 0:
-        return
-
-    if max_freq is None:
-        max_freq = float(np.nanmax(frequencies))
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-    early_m = early_mean[freq_mask]
-    late_m = late_mean[freq_mask]
-    early_s = early_std[freq_mask] if early_std.size else np.zeros_like(early_m)
-    late_s = late_std[freq_mask] if late_std.size else np.zeros_like(late_m)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-    ax.plot(freqs, early_m, color=COLOR_BLUE, linewidth=0.8, label=early_label)
-    ax.fill_between(
-        freqs,
-        early_m - early_s,
-        early_m + early_s,
-        color=COLOR_BLUE,
-        alpha=0.2,
-        label=f"{early_label} +/- 1 SD",
-    )
-    ax.plot(freqs, late_m, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=late_label)
-    ax.fill_between(
-        freqs,
-        late_m - late_s,
-        late_m + late_s,
-        color=COLOR_ORANGE,
-        alpha=0.15,
-        label=f"{late_label} +/- 1 SD",
-    )
-
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Coherence", fontsize=FONT_LABEL)
-    ax.set_title(title or "Early vs Late Horizon Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, float(max_freq))
-    ax.set_ylim(0, 1)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_spectrum_delta(
-    frequencies: np.ndarray,
-    delta_mean: np.ndarray,
-    delta_std: np.ndarray,
-    output_path: Path,
-    *,
-    title: Optional[str] = None,
-    max_freq: Optional[float] = 0.5,
-    label: str = "Late - Early",
-) -> None:
-    """
-    Plot delta spectrum (late minus early) with uncertainty.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if frequencies.size == 0:
-        return
-
-    if max_freq is None:
-        max_freq = float(np.nanmax(frequencies))
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-    delta_m = delta_mean[freq_mask]
-    delta_s = delta_std[freq_mask] if delta_std.size else np.zeros_like(delta_m)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-    ax.plot(freqs, delta_m, color=COLOR_BLUE, linewidth=0.8, label=label)
-    ax.fill_between(
-        freqs,
-        delta_m - delta_s,
-        delta_m + delta_s,
-        color=COLOR_BLUE,
-        alpha=0.2,
-        label=f"{label} +/- 1 SD",
-    )
-    ax.axhline(0.0, color=COLOR_BLACK, linewidth=0.8, alpha=0.7)
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Delta Coherence", fontsize=FONT_LABEL)
-    ax.set_title(title or "Horizon Delta Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, float(max_freq))
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_time_frequency_map(
-    frequencies: np.ndarray,
-    times: np.ndarray,
-    values: np.ndarray,
-    output_path: Path,
-    *,
-    max_freq: Optional[float] = None,
-    title: Optional[str] = None,
-    cmap: str = "viridis",
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    colorbar_label: str = "Value",
-) -> None:
-    """
-    Plot a generic time-frequency map (not constrained to coherence [0,1]).
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if frequencies.size == 0 or times.size == 0 or values.size == 0:
-        return
-
-    freq_mask = slice(None)
-    if max_freq is not None:
-        freq_mask = frequencies <= max_freq
-
-    freqs = frequencies[freq_mask]
-    vals = values[freq_mask, :]
-    time_min = times / 60.0
-
-    fig, ax = plt.subplots(1, 1, figsize=(7.6, 2.6))
-    im = ax.pcolormesh(
-        time_min,
-        freqs,
-        vals,
-        shading="auto",
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-    )
-    ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_title(title or "Time-Frequency Map", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    if freqs.size:
-        ax.set_ylim(float(np.min(freqs)), float(np.max(freqs)))
-    _add_colorbar(fig, im, ax, label=colorbar_label, shrink=0.8, pad=0.02)
-    _style_axes(ax, grid="major")
-    ax.margins(x=0.0, y=0.0)
-
-    _tighten_xaxis(ax, time_min)
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_psd_comparison(
-    frequencies: np.ndarray,
-    psd_orig_mean: np.ndarray,
-    psd_orig_std: np.ndarray,
-    psd_recon_mean: np.ndarray,
-    psd_recon_std: np.ndarray,
-    output_dir: Path,
-    *,
-    psd_residual_mean: Optional[np.ndarray] = None,
-    psd_residual_std: Optional[np.ndarray] = None,
-    filename: str = "psd_comparison.pdf",
-) -> None:
-    """
-    Plot Welch PSD comparison between original and reconstructed signals.
-
-    Args:
-        frequencies: Frequency array in Hz.
-        psd_orig_mean: Mean PSD of original signal.
-        psd_orig_std: Std PSD of original signal.
-        psd_recon_mean: Mean PSD of reconstructed signal.
-        psd_recon_std: Std PSD of reconstructed signal.
-        output_dir: Directory to save plot.
-        psd_residual_mean: Optional mean PSD of residual.
-        psd_residual_std: Optional std PSD of residual.
-        filename: Output filename.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.6))
-    max_freq = min(0.5, float(np.nanmax(frequencies))) if frequencies.size else 0.5
-    freq_mask = frequencies <= max_freq
-    freqs = frequencies[freq_mask]
-
-    def _to_db(x: np.ndarray) -> np.ndarray:
-        return 10.0 * np.log10(np.maximum(x, 1e-12))
-
-    def _band_db(mean: np.ndarray, std: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        low = np.maximum(mean - std, 1e-12)
-        high = np.maximum(mean + std, 1e-12)
-        return _to_db(low), _to_db(high)
-
-    orig_db = _to_db(psd_orig_mean)[freq_mask]
-    recon_db = _to_db(psd_recon_mean)[freq_mask]
-
-    # Plot with clean styling
-    ax.plot(freqs, orig_db, color=COLOR_BLUE, linewidth=0.6,
-           label="Original mean", zorder=3)
-    ax.plot(
-        freqs,
-        recon_db,
-        color=COLOR_ORANGE,
-        linewidth=0.9,
-        label="Reconstruction mean",
-        zorder=3,
-    )
-
-    # Uncertainty bands with proper dB conversion
-    orig_low, orig_high = _band_db(psd_orig_mean, psd_orig_std)
-    recon_low, recon_high = _band_db(psd_recon_mean, psd_recon_std)
-    ax.fill_between(freqs, orig_low[freq_mask], orig_high[freq_mask],
-                    color=COLOR_BLUE, alpha=0.2, linewidth=0, zorder=1,
-                    label="Original +/- 1 SD")
-    ax.fill_between(freqs, recon_low[freq_mask], recon_high[freq_mask],
-                    color=COLOR_ORANGE, alpha=0.2, linewidth=0, zorder=2,
-                    label="Reconstruction +/- 1 SD")
-
-    if psd_residual_mean is not None:
-        resid_db = _to_db(psd_residual_mean)[freq_mask]
-        ax.plot(freqs, resid_db, color=COLOR_GREEN, linewidth=0.5,
-               label="Residual mean", zorder=3)
-        if psd_residual_std is not None:
-            resid_low, resid_high = _band_db(psd_residual_mean, psd_residual_std)
-            ax.fill_between(
-                freqs,
-                resid_low[freq_mask],
-                resid_high[freq_mask],
-                color=COLOR_GREEN,
-                alpha=0.2,
-                linewidth=0,
-                zorder=1,
-                label="Residual +/- 1 SD",
-            )
-
-    ax.set_xlabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    ax.set_ylabel("PSD (dB/Hz)", fontsize=FONT_LABEL)
-    ax.set_title("Power Spectral Density Comparison (Welch)", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.set_xlim(0, max_freq)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95)
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, freqs)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_cross_correlation(
-    lags_sec: np.ndarray,
-    corr_mean: np.ndarray,
-    corr_std: np.ndarray,
-    output_dir: Path,
-    filename: str = "cross_correlation.pdf",
-    *,
-    annotate_peak: bool = True,
-) -> None:
-    """
-    Plot cross-correlation between original and reconstructed signals with peak annotation.
-
-    Args:
-        lags_sec: Lag array in seconds.
-        corr_mean: Mean correlation values.
-        corr_std: Std correlation values.
-        output_dir: Directory to save plot.
-        filename: Output filename.
-        annotate_peak: Whether to annotate the peak correlation (default: True).
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(7.6, 2.4))
-
-    # Plot main curve with clean styling
-    ax.plot(lags_sec, corr_mean, color=COLOR_PURPLE, linewidth=0.5,
-           label="Cross-correlation", zorder=3)
-    ax.fill_between(
-        lags_sec,
-        corr_mean - corr_std,
-        corr_mean + corr_std,
-        color=COLOR_PURPLE,
-        alpha=0.2,
-        linewidth=0,
-        zorder=1,
-        label="Correlation +/- 1 SD",
-    )
-
-    # Find and annotate peak if requested
-    if annotate_peak and len(corr_mean) > 0:
-        peak_idx = np.argmax(np.abs(corr_mean))
-        peak_lag = lags_sec[peak_idx]
-        peak_corr = corr_mean[peak_idx]
-
-        ax.plot(peak_lag, peak_corr, 'o', color=COLOR_ORANGE,
-               markersize=4, markeredgecolor='white', markeredgewidth=0.3,
-               zorder=4, label=f"Peak: $r$={peak_corr:.3f} at {peak_lag:.2f}s")
-
-    # Reference lines - thin and clean
-    ax.axvline(0.0, color=COLOR_BLACK, linewidth=0.7,
-              alpha=0.6, zorder=2, label="Zero lag")
-    ax.axhline(0.0, color=COLOR_LIGHT_GRAY,
-              linewidth=0.6, alpha=0.5, zorder=0)
-
-    ax.set_xlabel("Lag (seconds)", fontsize=FONT_LABEL)
-    ax.set_ylabel("Normalized correlation", fontsize=FONT_LABEL)
-    ax.set_title("Cross-Correlation Analysis", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    ax.legend(fontsize=FONT_LEGEND, framealpha=0.95, loc="best")
-    _style_axes(ax, grid="both", minor_ticks=True)
-    _tighten_xaxis(ax, lags_sec)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_coherence_signals(
-    up_signal: Optional[np.ndarray],
-    fhr_original: np.ndarray,
-    fhr_reconstructed: np.ndarray,
-    output_path: Path,
-    *,
-    fs: float = 4.0,
-    title: Optional[str] = None,
-) -> None:
-    """
-    Plot FHR signals for a single sample, with optional UP context.
-
-    Args:
-        up_signal: UP signal array (optional).
-        fhr_original: Original FHR array.
-        fhr_reconstructed: Reconstructed FHR array.
-        output_path: Output path for the figure.
-        fs: Sampling frequency in Hz (default 4.0).
-        title: Optional title for the figure.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    min_len = min(len(fhr_original), len(fhr_reconstructed))
-    if up_signal is not None:
-        min_len = min(min_len, len(up_signal))
-        up_signal = up_signal[:min_len]
-    fhr_original = fhr_original[:min_len]
-    fhr_reconstructed = fhr_reconstructed[:min_len]
-
-    time_min = np.arange(min_len) / fs / 60.0
-
-    if up_signal is None:
-        fig, axes = plt.subplots(2, 1, figsize=(7.6, 3.2), sharex=True)
-        axes[0].plot(time_min, fhr_original, color=COLOR_BLUE, linewidth=0.6, label="Original FHR")
-        axes[0].plot(
-            time_min,
-            fhr_reconstructed,
-            color=COLOR_ORANGE,
-            linewidth=0.9,
-            label="Reconstructed FHR",
-        )
-        axes[0].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
-        axes[0].set_title(title or "FHR Reconstruction", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-        axes[0].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
-
-        residual = fhr_original - fhr_reconstructed
-        axes[1].plot(time_min, residual, color=COLOR_GREEN, linewidth=0.6)
-        axes[1].axhline(0.0, color=COLOR_BLACK, alpha=0.5, linewidth=0.7)
-        axes[1].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
-        axes[1].set_ylabel("Residual", fontsize=FONT_LABEL)
-        _style_axes(axes[0], grid="both", minor_ticks=True)
-        _style_axes(axes[1], grid="major", minor_ticks=False)
-        _tighten_xaxis(axes[0], time_min)
-        _tighten_xaxis(axes[1], time_min)
-    else:
-        fig, axes = plt.subplots(3, 1, figsize=(7.6, 4.2), sharex=True)
-        axes[0].plot(time_min, up_signal, color=COLOR_PURPLE, linewidth=0.5)
-        axes[0].set_ylabel("UP (normalized)", fontsize=FONT_LABEL)
-        axes[0].set_title(title or "UP and FHR Signals", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-
-        axes[1].plot(time_min, fhr_original, color=COLOR_BLUE, linewidth=0.7, label="Original FHR")
-        axes[1].plot(
-            time_min,
-            fhr_reconstructed,
-            color=COLOR_ORANGE,
-            linewidth=0.9,
-            label="Reconstructed FHR",
-        )
-        axes[1].set_ylabel("FHR (normalized)", fontsize=FONT_LABEL)
-        axes[1].legend(loc="upper right", fontsize=FONT_LEGEND, framealpha=0.95)
-
-        residual = fhr_original - fhr_reconstructed
-        axes[2].plot(time_min, residual, color=COLOR_GREEN, linewidth=0.5)
-        axes[2].axhline(0.0, color=COLOR_BLACK, alpha=0.5, linewidth=0.6)
-        axes[2].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
-        axes[2].set_ylabel("Residual", fontsize=FONT_LABEL)
-        _style_axes(axes[0], grid="both", minor_ticks=True)
-        _style_axes(axes[1], grid="both", minor_ticks=True)
-        _style_axes(axes[2], grid="major", minor_ticks=False)
-        _tighten_xaxis(axes[0], time_min)
-        _tighten_xaxis(axes[1], time_min)
-        _tighten_xaxis(axes[2], time_min)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_time_frequency_coherence(
-    frequencies: np.ndarray,
-    times: np.ndarray,
-    coherence_original: np.ndarray,
-    output_path: Path,
-    *,
-    coherence_reconstructed: Optional[np.ndarray] = None,
-    max_freq: Optional[float] = None,
-    title: Optional[str] = None,
-) -> None:
-    """
-    Plot time-frequency coherence maps for original and reconstructed signals.
-
-    Args:
-        frequencies: Frequency array in Hz.
-        times: Time array in seconds.
-        coherence_original: Coherence matrix (freq x time) for a reference pairing.
-        coherence_reconstructed: Optional coherence matrix (freq x time) for a comparison pairing.
-        output_path: Output path for the figure.
-        max_freq: Optional max frequency to display.
-        title: Optional title for the figure.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    freq_mask = slice(None)
-    if max_freq is not None:
-        freq_mask = frequencies <= max_freq
-
-    freqs = frequencies[freq_mask]
-    coh_orig = coherence_original[freq_mask, :]
-    time_min = times / 60.0
-
-    if coherence_reconstructed is None:
-        fig, ax = plt.subplots(1, 1, figsize=(7.6, 2.6))
-        im = ax.pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
-        ax.set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
-        ax.set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
-        ax.set_title("FHR Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-        if freqs.size:
-            ax.set_ylim(float(np.min(freqs)), float(np.max(freqs)))
-        _add_colorbar(fig, im, ax, label="Coherence", shrink=0.8, pad=0.02)
-        _style_axes(ax, grid="major")
-        ax.margins(x=0.0, y=0.0)
-
-        if title:
-            fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
-
-        _tighten_xaxis(ax, time_min)
-        fig.tight_layout(pad=0.6)
-        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-        plt.close(fig)
-        return
-
-    coh_recon = coherence_reconstructed[freq_mask, :]
-    coh_diff = coh_recon - coh_orig
-
-    fig, axes = plt.subplots(3, 1, figsize=(7.6, 4.8), sharex=True)
-
-    im0 = axes[0].pcolormesh(time_min, freqs, coh_orig, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
-    axes[0].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    axes[0].set_title("Reference Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    if freqs.size:
-        axes[0].set_ylim(float(np.min(freqs)), float(np.max(freqs)))
-    _add_colorbar(fig, im0, axes[0], label="Coherence", shrink=0.8, pad=0.02)
-
-    im1 = axes[1].pcolormesh(time_min, freqs, coh_recon, shading="auto", cmap="bwr", vmin=0.0, vmax=1.0)
-    axes[1].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    axes[1].set_title("Reconstruction Coherence", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    if freqs.size:
-        axes[1].set_ylim(float(np.min(freqs)), float(np.max(freqs)))
-    _add_colorbar(fig, im1, axes[1], label="Coherence", shrink=0.8, pad=0.02)
-
-    im2 = axes[2].pcolormesh(time_min, freqs, coh_diff, shading="auto", cmap="bwr", vmin=-1.0, vmax=1.0)
-    axes[2].set_xlabel("Time (minutes)", fontsize=FONT_LABEL)
-    axes[2].set_ylabel("Frequency (Hz)", fontsize=FONT_LABEL)
-    axes[2].set_title("Coherence Difference (Reconstruction - Reference)", fontsize=FONT_TITLE, fontweight="normal", pad=6)
-    if freqs.size:
-        axes[2].set_ylim(float(np.min(freqs)), float(np.max(freqs)))
-    _add_colorbar(fig, im2, axes[2], label="Delta", shrink=0.8, pad=0.02)
-
-    for ax in axes:
-        _style_axes(ax, grid="major")
-        _tighten_xaxis(ax, time_min)
-        ax.margins(x=0.0, y=0.0)
-
-    if title:
-        fig.suptitle(title, fontsize=FONT_TITLE, y=0.98)
-
-    fig.tight_layout(pad=0.6)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -3402,6 +2343,424 @@ def plot_temporal_class_separation(
         _style_axes(ax, grid="major", minor_ticks=False)
 
     fig.suptitle("Class Separation Evolution Over Time", fontsize=FONT_TITLE, fontweight="normal", y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Lag-Attentive V1 Feature-Forecast Primitives
+# -----------------------------------------------------------------------------
+
+
+def plot_feature_forecast_heatmap(
+    mu_full_avg: np.ndarray,
+    y_plus_avg: np.ndarray,
+    warmup: int,
+    output_path: Path,
+    *,
+    fhr_st_end: int = 43,
+    title: str = "Feature Forecast Heatmap",
+) -> None:
+    """Plot a 3-row prediction / truth / residual heatmap for a sample.
+
+    Rows stack the 87-channel future forecast as ``(channels, T_valid)``
+    imshow panels: row 0 prediction ``mu_full``, row 1 ground truth
+    ``y_plus``, row 2 residual ``(mu_full - y_plus)``. A horizontal line
+    marks the scattering/phase channel split at ``fhr_st_end`` (default 43).
+
+    Args:
+        mu_full_avg: Prediction averaged over horizon, shape ``(C, T_valid)``.
+        y_plus_avg: Ground truth averaged over horizon, shape ``(C, T_valid)``.
+        warmup: Number of initial anchors that are invalid (shaded gray).
+        output_path: Destination PDF/PNG.
+        fhr_st_end: Channel index separating scattering from phase (default 43).
+        title: Figure title.
+    """
+    if mu_full_avg.shape != y_plus_avg.shape:
+        raise ValueError(
+            f"Shape mismatch: mu_full_avg {mu_full_avg.shape} vs "
+            f"y_plus_avg {y_plus_avg.shape}"
+        )
+    C, T_valid = mu_full_avg.shape
+    residual = mu_full_avg - y_plus_avg
+    vmax = max(abs(mu_full_avg).max(), abs(y_plus_avg).max()) + 1e-12
+    res_max = abs(residual).max() + 1e-12
+
+    fig, axes = plt.subplots(3, 1, figsize=(7.2, 5.4), sharex=True)
+    titles = ("Prediction (mu_full)", "Truth (y_plus)", "Residual (mu_full - y_plus)")
+    data = (mu_full_avg, y_plus_avg, residual)
+    vlims = (vmax, vmax, res_max)
+
+    for ax, panel, panel_title, vlim in zip(axes, data, titles, vlims):
+        im = ax.imshow(
+            panel,
+            aspect="auto",
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=-vlim,
+            vmax=vlim,
+            interpolation="nearest",
+        )
+        if 0 < fhr_st_end < C:
+            ax.axhline(y=fhr_st_end - 0.5, color=COLOR_BLACK, linewidth=0.6, linestyle="--")
+        if warmup > 0 and warmup < T_valid:
+            ax.axvspan(-0.5, warmup - 0.5, color=COLOR_GRAY, alpha=0.15)
+        ax.set_ylabel(panel_title, fontsize=FONT_LABEL)
+        _add_colorbar(ax, im, label="")
+
+    axes[-1].set_xlabel("Anchor t", fontsize=FONT_LABEL)
+    fig.suptitle(title, fontsize=FONT_TITLE, fontweight="normal")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_forecast_error_by_horizon(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    title: str = "Forecast Error by Horizon Step",
+) -> None:
+    """Plot per-horizon-step MSE as a median + IQR ribbon.
+
+    Expects a long-format DataFrame with columns ``[h, mse_step]`` and
+    optionally ``mse_st``/``mse_ph`` for the channel-block overlays.
+
+    Args:
+        df: DataFrame produced by
+            :func:`collect_forecast_errors_per_horizon`.
+        output_path: Destination PDF/PNG.
+        title: Figure title.
+    """
+    if df.empty or "h" not in df.columns:
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    grouped = df.groupby("h")
+    stats = grouped["mse_step"].agg(["median", lambda s: s.quantile(0.25), lambda s: s.quantile(0.75), "mean"])
+    stats.columns = ["median", "q25", "q75", "mean"]
+    h_vals = stats.index.to_numpy()
+
+    fig, ax = plt.subplots(figsize=(5.6, 3.6))
+    ax.fill_between(h_vals, stats["q25"], stats["q75"], color=COLOR_BLUE, alpha=0.20, label="IQR")
+    ax.plot(h_vals, stats["median"], color=COLOR_BLUE, linewidth=1.2, label="median")
+    ax.plot(h_vals, stats["mean"], color=COLOR_VERMILLION, linewidth=1.0, linestyle="--", label="mean")
+
+    if "mse_st" in df.columns:
+        st_med = grouped["mse_st"].median()
+        ax.plot(h_vals, st_med, color=COLOR_GREEN, linewidth=0.9, label="mse_st median")
+    if "mse_ph" in df.columns:
+        ph_med = grouped["mse_ph"].median()
+        ax.plot(h_vals, ph_med, color=COLOR_ORANGE, linewidth=0.9, label="mse_ph median")
+
+    ax.set_xlabel("Horizon step h", fontsize=FONT_LABEL)
+    ax.set_ylabel("MSE", fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    ax.legend(loc="upper left", frameon=True)
+    _style_axes(ax, grid="major", minor_ticks=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_uplift_histogram(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    title: str = "Baseline vs Full Uplift",
+) -> None:
+    """Two-panel histogram comparing baseline and full losses plus uplift.
+
+    Left panel: overlaid histograms of ``l_full`` and ``l_base``. Right
+    panel: histogram of ``uplift_rel`` with a zero line marker.
+
+    Args:
+        df: DataFrame with columns ``l_full, l_base, uplift_rel``.
+        output_path: Destination PDF/PNG.
+        title: Figure title.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(7.6, 3.4))
+    if df.empty:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    ax = axes[0]
+    l_full = df["l_full"].to_numpy() if "l_full" in df.columns else df.get("full_mse", pd.Series(dtype=float)).to_numpy()
+    l_base = df["l_base"].to_numpy() if "l_base" in df.columns else df.get("base_mse_total", pd.Series(dtype=float)).to_numpy()
+    bins = 40
+    if l_full.size:
+        ax.hist(l_full, bins=bins, color=COLOR_BLUE, alpha=0.6, label="full MSE")
+    if l_base.size:
+        ax.hist(l_base, bins=bins, color=COLOR_ORANGE, alpha=0.5, label="baseline MSE")
+    ax.set_xlabel("Per-sample MSE", fontsize=FONT_LABEL)
+    ax.set_ylabel("Count", fontsize=FONT_LABEL)
+    ax.legend(loc="upper right", frameon=True)
+    _style_axes(ax, grid="major", minor_ticks=False)
+
+    ax = axes[1]
+    up = df["uplift_rel"].to_numpy() if "uplift_rel" in df.columns else np.array([])
+    if up.size:
+        ax.hist(up, bins=bins, color=COLOR_GREEN, alpha=0.8)
+        ax.axvline(x=0.0, color=COLOR_BLACK, linewidth=0.8, linestyle="--")
+        median = float(np.nanmedian(up))
+        ax.axvline(x=median, color=COLOR_VERMILLION, linewidth=0.8, linestyle="-", label=f"median={median:.3f}")
+        ax.legend(loc="upper right", frameon=True)
+    ax.set_xlabel("uplift_rel = (l_base - l_full) / l_base", fontsize=FONT_LABEL)
+    ax.set_ylabel("Count", fontsize=FONT_LABEL)
+    _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle(title, fontsize=FONT_TITLE, fontweight="normal")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_residual_usage_trace(
+    trace_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    title: str = "Residual Usage Over Time",
+) -> None:
+    """Plot the per-anchor residual norm trace as median + IQR across samples.
+
+    Args:
+        trace_df: Long-format DataFrame with columns ``[guid, t, delta_norm_t]``.
+        output_path: Destination PDF/PNG.
+        title: Figure title.
+    """
+    if trace_df.empty or "t" not in trace_df.columns:
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    grouped = trace_df.groupby("t")["delta_norm_t"]
+    t_vals = np.sort(trace_df["t"].unique())
+    median = grouped.median().reindex(t_vals).to_numpy()
+    q25 = grouped.quantile(0.25).reindex(t_vals).to_numpy()
+    q75 = grouped.quantile(0.75).reindex(t_vals).to_numpy()
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.4))
+    ax.fill_between(t_vals, q25, q75, color=COLOR_PURPLE, alpha=0.20, label="IQR")
+    ax.plot(t_vals, median, color=COLOR_PURPLE, linewidth=1.2, label="median")
+    ax.set_xlabel("Anchor t", fontsize=FONT_LABEL)
+    ax.set_ylabel("||delta_mu_src||", fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    ax.legend(loc="upper right", frameon=True)
+    _style_axes(ax, grid="major", minor_ticks=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_lag_attention_heatmap(
+    alpha_bar: np.ndarray,
+    argmax_lag: np.ndarray,
+    warmup: int,
+    output_path: Path,
+    *,
+    title: str = "Lag Attention",
+) -> None:
+    """Plot the head-averaged lag attention map for a single sample.
+
+    Draws a ``(T, L)`` heatmap with the argmax-lag curve overlaid and
+    the warmup region shaded out. NaN entries (warmup) render as white.
+
+    Args:
+        alpha_bar: Head-averaged attention, shape ``(T, L)``. Warmup
+            rows expected to contain NaN.
+        argmax_lag: Argmax lag per anchor, shape ``(T,)``. Warmup entries
+            should be ``-1``.
+        warmup: Number of initial anchors that are invalid.
+        output_path: Destination PDF/PNG.
+        title: Figure title.
+    """
+    if alpha_bar.ndim != 2:
+        raise ValueError(f"alpha_bar must be (T, L), got {alpha_bar.shape}")
+    T, L = alpha_bar.shape
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+    masked = np.ma.masked_invalid(alpha_bar)
+    im = ax.imshow(
+        masked.T,
+        aspect="auto",
+        origin="lower",
+        cmap="viridis",
+        interpolation="nearest",
+        extent=(-0.5, T - 0.5, -0.5, L - 0.5),
+    )
+    _add_colorbar(ax, im, label="attention")
+
+    # Overlay argmax lag curve, skipping warmup sentinel (-1).
+    valid = argmax_lag >= 0
+    if valid.any():
+        t_idx = np.arange(T)
+        ax.plot(
+            t_idx[valid],
+            argmax_lag[valid],
+            color=COLOR_VERMILLION,
+            linewidth=0.9,
+            alpha=0.9,
+            label="argmax lag",
+        )
+        ax.legend(loc="upper right", frameon=True)
+
+    if warmup > 0:
+        ax.axvspan(-0.5, warmup - 0.5, color=COLOR_GRAY, alpha=0.22)
+
+    ax.set_xlabel("Anchor t", fontsize=FONT_LABEL)
+    ax.set_ylabel("Lag k", fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    _style_axes(ax, grid="none", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_te_lag_distribution(
+    te_lag_mean: np.ndarray,
+    labels: np.ndarray,
+    output_path: Path,
+    *,
+    class_names: Optional[Dict[int, str]] = None,
+    n_bootstrap: int = 500,
+    title: str = "TE Lag Distribution by Class",
+) -> None:
+    """Plot per-class mean TE-lag trace with bootstrap 95% CI.
+
+    Args:
+        te_lag_mean: Per-sample time-averaged lag profile, shape ``(N, L)``.
+        labels: Per-sample class labels, shape ``(N,)``.
+        output_path: Destination PDF/PNG.
+        class_names: Optional mapping ``{label: display_name}``. Defaults
+            to integer labels.
+        n_bootstrap: Bootstrap resamples for the class-mean CI.
+        title: Figure title.
+    """
+    if te_lag_mean.ndim != 2:
+        raise ValueError(f"te_lag_mean must be (N, L), got {te_lag_mean.shape}")
+    N, L = te_lag_mean.shape
+
+    if class_names is None:
+        class_names = {1: "HEALTHY", 2: "ACIDOSIS", 3: "HIE"}
+
+    unique_labels = sorted(int(x) for x in np.unique(labels) if x is not None)
+    palette = [COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE]
+
+    fig, ax = plt.subplots(figsize=(6.8, 3.8))
+    x = np.arange(L)
+    rng = np.random.default_rng(0)
+
+    for ci, lab in enumerate(unique_labels):
+        mask = labels == lab
+        if not mask.any():
+            continue
+        subset = te_lag_mean[mask]
+        mean_vec = np.nanmean(subset, axis=0)
+        # Bootstrap CI over samples.
+        idxs = rng.integers(0, subset.shape[0], size=(n_bootstrap, subset.shape[0]))
+        boot_means = np.nanmean(subset[idxs], axis=1)
+        ci_lo = np.nanpercentile(boot_means, 2.5, axis=0)
+        ci_hi = np.nanpercentile(boot_means, 97.5, axis=0)
+
+        color = palette[ci % len(palette)]
+        name = class_names.get(lab, f"class {lab}")
+        ax.fill_between(x, ci_lo, ci_hi, color=color, alpha=0.18)
+        ax.plot(x, mean_vec, color=color, linewidth=1.2, label=f"{name} (n={int(mask.sum())})")
+
+    ax.set_xlabel("Lag k", fontsize=FONT_LABEL)
+    ax.set_ylabel("mean te_lag_map", fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    ax.legend(loc="upper right", frameon=True)
+    _style_axes(ax, grid="major", minor_ticks=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_attention_mass_by_lag(
+    mass_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    fs: float = 4.0,
+    decim: int = 16,
+    title: str = "Attention Mass by Lag Bin",
+) -> None:
+    """Grouped bar chart: fraction of attention mass in coarse lag bins.
+
+    Args:
+        mass_df: Wide-format DataFrame with one row per sample, columns
+            ``[label, mass_lag_0, mass_lag_1, ...]``. Per-sample row sums
+            should be ~1.
+        output_path: Destination PDF/PNG.
+        fs: Sampling rate of the raw signal (4 Hz).
+        decim: Decimation factor (16) used to convert lag index to seconds.
+        title: Figure title.
+    """
+    lag_cols = [c for c in mass_df.columns if c.startswith("mass_lag_")]
+    if not lag_cols:
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        ax.text(0.5, 0.5, "No lag mass columns", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    # Convert lag index -> seconds using decimation and fs.
+    lag_indices = np.array(sorted(int(c.split("_")[-1]) for c in lag_cols))
+    seconds_per_step = decim / float(fs)
+    lag_seconds = lag_indices * seconds_per_step
+
+    # Coarse bins (seconds).
+    bin_edges = [0.0, 10.0, 30.0, 60.0, 120.0, 360.0, 1e9]
+    bin_labels = ["0-10s", "10-30s", "30-60s", "60-120s", "120-360s", ">=360s"]
+    mass_matrix = mass_df[[f"mass_lag_{i}" for i in lag_indices]].to_numpy(dtype=float)
+
+    bin_totals = np.zeros((mass_matrix.shape[0], len(bin_labels)), dtype=float)
+    for i, (lo, hi) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+        in_bin = (lag_seconds >= lo) & (lag_seconds < hi)
+        if in_bin.any():
+            bin_totals[:, i] = mass_matrix[:, in_bin].sum(axis=1)
+
+    labels_col = mass_df.get("label")
+    if labels_col is None or labels_col.isna().all():
+        class_groups: Dict[str, np.ndarray] = {"all": bin_totals.mean(axis=0)}
+    else:
+        class_groups = {}
+        for lab in sorted(labels_col.dropna().unique()):
+            mask = (labels_col == lab).to_numpy()
+            if mask.any():
+                class_groups[str(int(lab))] = bin_totals[mask].mean(axis=0)
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.6))
+    n_groups = len(class_groups)
+    n_bins = len(bin_labels)
+    width = 0.8 / max(n_groups, 1)
+    x = np.arange(n_bins)
+    palette = [COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE]
+    for gi, (gname, means) in enumerate(class_groups.items()):
+        ax.bar(
+            x + gi * width - (n_groups - 1) * width / 2,
+            means,
+            width=width,
+            color=palette[gi % len(palette)],
+            alpha=0.85,
+            label=gname,
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_labels, rotation=0)
+    ax.set_xlabel("Lag bin (seconds)", fontsize=FONT_LABEL)
+    ax.set_ylabel("Mean attention mass", fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    ax.legend(loc="upper right", frameon=True)
+    _style_axes(ax, grid="major", minor_ticks=False)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)

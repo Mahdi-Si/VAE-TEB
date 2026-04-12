@@ -1,1210 +1,925 @@
-"""
-Single sample plotting utility for VAE-TEB testing pipeline.
+"""Per-sample diagnostic plots for the lag-attn v1 testing pipeline.
 
-This module provides functionality to randomly select samples from the test
-dataset and generate all possible single-sample plots for each, organized
-in folders named by GUID and epoch.
+This module provides a single entry point,
+:func:`plot_sample_lag_attn_diagnostic`, which builds a multi-row
+publication-quality figure summarising one sample's model behaviour:
+
+- raw FHR / UP traces (when available)
+- stacked ``mu_full_avg`` / ``y_plus_avg`` / residual heatmaps over the
+  87 feature channels
+- latent ``z`` heatmap
+- KLD-per-dim heatmap (derived from the posterior/prior moments)
+- lag attention heatmap with argmax-lag overlay
+- TE lag attribution heatmap
+
+The overlap-averaging and block-stacking helpers are imported directly
+from :mod:`model.vae_teb_prediction.model.plotting_callback_lag_attn_v1`
+so the test plots and training callback share the exact same semantics.
+Any sample field that is missing is rendered as an empty panel with a
+short "N/A" note so the function degrades gracefully with sparse dicts.
 
 Example:
-    >>> from model.vae_teb_prediction.testing.plot_single_samples import plot_single_samples
-    >>> results = plot_single_samples(
-    ...     config_path="model/vae_teb_prediction/config.yaml",
-    ...     n_samples=5,
+    >>> samples = collect_predictions(runner, loader, max_samples=3)
+    >>> plot_sample_lag_attn_diagnostic(
+    ...     samples[0], Path("out/sample_0.pdf"),
+    ...     warmup=runner.warmup_steps, horizon=runner.horizon,
     ... )
 """
 
 from __future__ import annotations
 
-import random
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
-from datetime import datetime
+from typing import Any, Dict, Optional
 
-import numpy as np
-import torch
-from loguru import logger
-import yaml
-
-# Add project root to sys.path for imports
-project_root = Path(__file__).resolve().parents[4]
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from model.vae_teb_prediction.testing.base import TestRunner
-from model.vae_teb_prediction.testing.collectors import (
-    _extract_epoch,
-    _extract_guid,
-    _extract_label,
-)
-from model.vae_teb_prediction.testing.metrics import (
-    aggregate_predictions,
-    compute_kld,
-)
 import matplotlib.pyplot as plt
-from scipy import stats as scipy_stats
+import numpy as np
+from matplotlib.gridspec import GridSpec
+
+from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (
+    _average_forecast_per_channel,
+    _shade_warmup,
+    _time_axes,
+)
 from model.vae_teb_prediction.testing.visualizers import (
-    # Colors for consistent styling
+    COLOR_BLACK,
     COLOR_BLUE,
-    COLOR_ORANGE,
+    COLOR_GRAY,
     COLOR_GREEN,
-    COLOR_SKY,
+    COLOR_LIGHT_GRAY,
+    COLOR_ORANGE,
     COLOR_PURPLE,
     COLOR_VERMILLION,
-    COLOR_GRAY,
-    COLOR_BLACK,
-    COLOR_LIGHT_GRAY,
-    COLOR_SAGE,
+    FONT_LABEL,
+    FONT_TITLE,
     SAVE_DPI,
+    _add_colorbar,
+    _style_axes,
 )
 
-# Import data loading utilities
-from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-
-# Import legacy plot utils for detailed analysis plots
-
-
-
-def _load_config(path: Union[str, Path]) -> Dict[str, Any]:
-    """Load YAML config file."""
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    return config or {}
+# Default raw window length (20 min @ 4 Hz after the 1-min trim at each
+# end: 300 × 16 = 4800 raw samples). The sample dict's "fhr" field carries
+# the raw trace only when batch.fhr was loaded by the dataset. When the
+# shape disagrees we fall back to whatever length is present.
+_DEFAULT_R = 4800
+_DEFAULT_FS_RAW = 4.0
+_DEFAULT_DECIM = 16
+_FHR_ST_END = 43  # channel index splitting scattering from phase
 
 
-def _resolve_settings(
-    config_path: Union[str, Path],
-    checkpoint_path: Optional[str] = None,
-    data_path: Optional[Union[str, List[str]]] = None,
-    output_dir: Optional[str] = None,
-    stats_path: Optional[str] = None,
-    batch_size: Optional[int] = None,
-    num_workers: Optional[int] = None,
-    normalize_fields: Optional[Sequence[str]] = None,
-) -> Dict[str, Any]:
-    """Resolve settings from config and explicit arguments."""
-    config = _load_config(config_path)
-    model_cfg = config.get("model_config", {}) or {}
-    dataset_cfg = config.get("dataset_config", {}) or {}
-    dataloader_cfg = dataset_cfg.get("dataloader_config", {}) or {}
-    folders_cfg = config.get("general_config", {}).get("folders_config", {}) or {}
-
-    # Resolve checkpoint
-    resolved_checkpoint = checkpoint_path or model_cfg.get("core_model_checkpoint")
-    if not resolved_checkpoint:
-        raise ValueError(
-            "checkpoint_path is required unless config provides model_config.core_model_checkpoint."
-        )
-
-    # Resolve data paths
-    resolved_data_paths: List[str] = []
-    if data_path:
-        if isinstance(data_path, str):
-            resolved_data_paths = [data_path]
-        else:
-            resolved_data_paths = list(data_path)
-    else:
-        resolved_data_paths = list(dataset_cfg.get("vae_test_datasets", []) or [])
-
-    if not resolved_data_paths:
-        raise ValueError(
-            "data_path is required unless config provides dataset_config.vae_test_datasets."
-        )
-
-    # Resolve output directory
-    resolved_output = output_dir
-    if resolved_output is None:
-        base_dir = folders_cfg.get("out_dir_base")
-        if base_dir:
-            now = datetime.now()
-            run_date = now.strftime("%Y-%m-%d--[%H-%M-%S]") + f"--{now.microsecond:06d}-"
-            experiment_tag = config.get("general_config", {}).get("tag", "test")
-            tag_dir = Path(base_dir) / experiment_tag
-            timestamped_dir = tag_dir / run_date
-            resolved_output = str(timestamped_dir / "single_sample_plots")
-        else:
-            resolved_output = "single_sample_plots"
-
-    # Resolve other settings
-    resolved_stats = stats_path or dataset_cfg.get("stat_path")
-    resolved_batch_size = batch_size or config.get("general_config", {}).get("batch_size", {}).get("test", 32)
-    resolved_workers = num_workers if num_workers is not None else dataloader_cfg.get("num_workers", 0)
-    resolved_normalize_fields = normalize_fields or dataloader_cfg.get("normalize_fields")
-    dataset_kwargs = dataloader_cfg.get("dataset_kwargs", {}) or {}
-
-    return {
-        "checkpoint_path": resolved_checkpoint,
-        "data_paths": resolved_data_paths,
-        "output_dir": Path(resolved_output),
-        "stats_path": resolved_stats,
-        "batch_size": resolved_batch_size,
-        "num_workers": resolved_workers,
-        "normalize_fields": resolved_normalize_fields,
-        "dataset_kwargs": dataset_kwargs,
-        "config": config,
-    }
+# -----------------------------------------------------------------------------
+# Internal helpers for the minute-axis diagnostic figures
+# -----------------------------------------------------------------------------
 
 
-def _get_normalization_stats(loader: Any) -> Optional[Dict[str, Any]]:
-    """Get normalization stats from dataset."""
-    dataset = getattr(loader, "dataset", None)
-    if dataset is None or not hasattr(dataset, "get_normalization_stats"):
-        return None
-    try:
-        return dataset.get_normalization_stats()
-    except Exception as exc:
-        logger.warning("Could not fetch normalization stats: %s", exc)
-        return None
+def _shade_warmup_min(ax: plt.Axes, warmup_min: float) -> None:
+    """Shade the warmup region in minutes on a given axes."""
+    if warmup_min and warmup_min > 0:
+        ax.axvspan(0.0, warmup_min, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
 
-def _denormalize_tensor(
-    tensor: torch.Tensor,
-    field: str,
-    stats: Optional[Dict[str, Any]],
-    *,
-    raw_start: Optional[int] = None,
-    length: Optional[int] = None,
-) -> torch.Tensor:
-    """Denormalize a tensor using statistics."""
-    if not stats or field not in stats:
-        return tensor
-    try:
-        field_stats = stats[field] or {}
-        mean = field_stats.get("mean_tensor", field_stats.get("mean", 0.0))
-        std = field_stats.get("std_tensor", field_stats.get("std", 1.0))
-
-        mean_t = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device)
-        std_t = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device)
-
-        if (
-            mean_t.dim() > 0
-            and raw_start is not None
-            and length is not None
-            and mean_t.size(-1) >= raw_start + length
-        ):
-            mean_t = mean_t.narrow(-1, raw_start, length)
-        if (
-            std_t.dim() > 0
-            and raw_start is not None
-            and length is not None
-            and std_t.size(-1) >= raw_start + length
-        ):
-            std_t = std_t.narrow(-1, raw_start, length)
-
-        while mean_t.dim() < tensor.dim():
-            mean_t = mean_t.unsqueeze(0)
-        while std_t.dim() < tensor.dim():
-            std_t = std_t.unsqueeze(0)
-
-        return tensor * (std_t + 1e-8) + mean_t
-    except Exception as exc:
-        logger.warning("Failed to denormalize %s: %s. Returning tensor as-is.", field, exc)
-        return tensor
-
-
-def _sanitize_folder_name(guid: str, epoch: Optional[float]) -> str:
-    """Create a sanitized folder name from guid and epoch."""
-    guid_safe = str(guid).replace("/", "_").replace("\\", "_").replace(":", "_")
-    if epoch is not None:
-        epoch_minutes = abs(epoch / 60.0)
-        folder_name = f"{guid_safe}_epoch_{epoch_minutes:.1f}min"
-    else:
-        folder_name = f"{guid_safe}_epoch_unknown"
-    return folder_name
-
-
-def _extract_reconstruction_features(
-    linear_output: Optional[torch.Tensor],
-    st_channels: int,
-    ph_channels: int,
-) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Extract scattering and phase harmonic reconstructions from linear output."""
-    if (
-        linear_output is None
-        or linear_output.dim() != 3
-        or linear_output.size(-1) < st_channels + ph_channels
-    ):
-        return None, None
-    linear_np = linear_output[0].detach().cpu().numpy()
-    recon_st = linear_np[:, :st_channels].T
-    recon_ph = linear_np[:, st_channels : st_channels + ph_channels].T
-    return recon_st, recon_ph
-
-
-def _apply_publication_style() -> None:
-    """Apply publication-quality matplotlib style."""
-    plt.style.use("default")
-    plt.rcParams.update({
-        "figure.dpi": 150,
-        "savefig.dpi": SAVE_DPI,
-        "savefig.format": "png",
-        "savefig.bbox": "tight",
-        "savefig.pad_inches": 0.05,
-        "font.family": "serif",
-        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
-        "font.size": 8,
-        "axes.titlesize": 9,
-        "axes.labelsize": 8,
-        "xtick.labelsize": 7,
-        "ytick.labelsize": 7,
-        "legend.fontsize": 7,
-        "legend.title_fontsize": 7,
-        "axes.linewidth": 0.6,
-        "axes.edgecolor": COLOR_BLACK,
-        "axes.labelcolor": COLOR_BLACK,
-        "axes.spines.top": True,
-        "axes.spines.right": True,
-        "axes.spines.left": True,
-        "axes.spines.bottom": True,
-        "axes.titleweight": "normal",
-        "axes.labelweight": "normal",
-        "axes.axisbelow": True,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "xtick.major.size": 3.0,
-        "ytick.major.size": 3.0,
-        "xtick.minor.size": 1.5,
-        "ytick.minor.size": 1.5,
-        "xtick.major.width": 0.5,
-        "ytick.major.width": 0.5,
-        "xtick.minor.width": 0.3,
-        "ytick.minor.width": 0.3,
-        "xtick.color": COLOR_BLACK,
-        "ytick.color": COLOR_BLACK,
-        "grid.alpha": 0.2,
-        "grid.linewidth": 0.3,
-        "grid.color": COLOR_LIGHT_GRAY,
-        "grid.linestyle": "-",
-        "legend.frameon": True,
-        "legend.framealpha": 0.95,
-        "legend.fancybox": False,
-        "legend.edgecolor": COLOR_GRAY,
-        "legend.shadow": False,
-        "lines.linewidth": 1.0,
-        "lines.markersize": 3,
-        "lines.markeredgewidth": 0.0,
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-        "savefig.facecolor": "white",
-        "errorbar.capsize": 3,
-        "mathtext.default": "regular",
-    })
-
-
-def _style_axes(ax: plt.Axes, *, grid: str = "major") -> None:
-    """Apply clean styling to axes with all four spines visible."""
-    ax.set_axisbelow(True)
-    if grid in ("both", "major"):
-        ax.grid(True, linestyle="-", alpha=0.4, linewidth=0.4, color=COLOR_LIGHT_GRAY)
-    if grid == "both":
-        ax.grid(True, which="minor", linestyle=":", alpha=0.25, linewidth=0.3, color=COLOR_LIGHT_GRAY)
-        ax.minorticks_on()
-    # Show all four spines
-    for spine in ["top", "bottom", "left", "right"]:
-        ax.spines[spine].set_visible(True)
-        ax.spines[spine].set_color(COLOR_BLACK)
-        ax.spines[spine].set_linewidth(0.6)
-
-
-def _add_colorbar(
-    fig: plt.Figure,
-    mappable: Any,
+def _draw_raw_panel(
     ax: plt.Axes,
     *,
-    label: Optional[str] = None,
-) -> plt.Axes:
-    """Attach aligned colorbar."""
-    cbar = fig.colorbar(mappable, ax=ax, shrink=0.8, pad=0.02)
-    if label:
-        cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
-    cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
-    cbar.outline.set_linewidth(0.6)
-    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
-    return cbar
+    fhr: Optional[np.ndarray],
+    up: Optional[np.ndarray],
+    time_raw_min: np.ndarray,
+    t_max_min: float,
+    warmup_min: float,
+    title: str = "Raw FHR / UP",
+) -> None:
+    """Draw the raw FHR / UP trace panel in minutes.
+
+    Args:
+        ax: Target axes. FHR is drawn on the primary y-axis; UP on a
+            twin axis if present.
+        fhr: Raw FHR trace, shape ``(R,)`` or ``None``.
+        up: Raw UP trace, shape ``(R,)`` or ``None``.
+        time_raw_min: Raw time axis in minutes, length ``R``.
+        t_max_min: Total window length in minutes (for ``set_xlim``).
+        warmup_min: Warmup region length in minutes.
+        title: Panel title.
+    """
+    drawn = False
+    if fhr is not None and fhr.ndim == 1:
+        n = min(len(fhr), len(time_raw_min))
+        ax.plot(
+            time_raw_min[:n], fhr[:n],
+            color=COLOR_BLUE, linewidth=0.7, label="FHR",
+        )
+        ax.set_ylabel("FHR (bpm)", fontsize=FONT_LABEL, color=COLOR_BLUE)
+        ax.tick_params(axis="y", colors=COLOR_BLUE, labelsize=6)
+        drawn = True
+    if up is not None and up.ndim == 1:
+        ax_up = ax.twinx()
+        n = min(len(up), len(time_raw_min))
+        ax_up.plot(
+            time_raw_min[:n], up[:n],
+            color=COLOR_VERMILLION, linewidth=0.7, alpha=0.85, label="UP",
+        )
+        ax_up.set_ylabel("UP (mmHg)", fontsize=FONT_LABEL, color=COLOR_VERMILLION)
+        ax_up.tick_params(axis="y", colors=COLOR_VERMILLION, labelsize=6)
+        drawn = True
+    if not drawn:
+        ax.text(
+            0.5, 0.5, "raw traces not available",
+            ha="center", va="center", transform=ax.transAxes,
+        )
+        ax.set_ylabel("raw", fontsize=FONT_LABEL)
+
+    ax.set_xlim(0.0, t_max_min)
+    ax.set_title(title, fontsize=FONT_LABEL, fontweight="normal")
+    _shade_warmup_min(ax, warmup_min)
+    _style_axes(ax, grid="major", minor_ticks=False)
 
 
-def _plot_coefficient_heatmap(
-    coefficients: np.ndarray,
-    output_path: Path,
+def _draw_heatmap_min(
+    ax: plt.Axes,
+    data: np.ndarray,
     *,
-    title: str,
-    ylabel: str = "Channel",
-    xlabel: str = "Time Steps",
-    cmap: str = "bwr",
+    t_max_min: float,
+    cmap: str,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
-    fs: float = 4.0,
-) -> None:
-    """Plot a heatmap of coefficient values (ST, PH, etc.)."""
-    _apply_publication_style()
+    ylabel: str = "",
+    title: str = "",
+    colorbar_label: str = "",
+    y_extent: Optional[float] = None,
+) -> Any:
+    """Draw a ``(rows, T)`` heatmap whose x-axis is time in minutes.
 
-    fig, ax = plt.subplots(figsize=(8, 3.5))
+    Args:
+        ax: Target axes.
+        data: Array of shape ``(rows, T)``.
+        t_max_min: Full x-axis extent in minutes.
+        cmap: Colormap name.
+        vmin: Minimum colour value (auto if None).
+        vmax: Maximum colour value (auto if None).
+        ylabel: Y-axis label.
+        title: Panel title.
+        colorbar_label: Colorbar label.
+        y_extent: Optional y-axis extent (rows space). Defaults to
+            ``(−0.5, rows − 0.5)`` which keeps pixel-per-row semantics.
 
-    # Auto-scale if not provided
-    if vmin is None or vmax is None:
-        vabs = np.nanmax(np.abs(coefficients))
-        vmin = -vabs
-        vmax = vabs
+    Returns:
+        The ``AxesImage`` handle, or ``None`` if the panel was empty.
+    """
+    if data.size == 0 or not np.isfinite(data).any():
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+        if title:
+            ax.set_title(title, fontsize=FONT_LABEL)
+        return None
+
+    rows = int(data.shape[0])
+    y_top = float(y_extent) if y_extent is not None else (rows - 0.5)
+    y_bot = 0.0 if y_extent is not None else -0.5
 
     im = ax.imshow(
-        coefficients,
+        data,
         aspect="auto",
+        origin="lower",
         cmap=cmap,
-        origin="upper",
         vmin=vmin,
         vmax=vmax,
+        interpolation="nearest",
+        extent=(0.0, t_max_min, y_bot, y_top),
     )
-
-    ax.set_xlabel(xlabel, fontsize=8)
-    ax.set_ylabel(ylabel, fontsize=8)
-    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
-    ax.grid(False)
-
-    _add_colorbar(fig, im, ax, label="Value")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
+    ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+    if title:
+        ax.set_title(title, fontsize=FONT_LABEL, fontweight="normal")
+    _add_colorbar(ax.figure, im, ax, label=colorbar_label)  # type: ignore[arg-type]
+    return im
 
 
-def _plot_coefficient_error_heatmap(
-    original: np.ndarray,
-    reconstructed: np.ndarray,
-    output_path: Path,
+def _imshow_panel(
+    ax: plt.Axes,
+    data: np.ndarray,
     *,
-    title: str,
-    ylabel: str = "Channel",
-) -> None:
-    """Plot reconstruction error heatmap."""
-    _apply_publication_style()
-
-    error = np.abs(original - reconstructed)
-
-    fig, axes = plt.subplots(3, 1, figsize=(8, 7), constrained_layout=True)
-
-    # Original
-    vabs = np.nanmax(np.abs(original))
-    im0 = axes[0].imshow(original, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[0].set_title("Original Coefficients", fontsize=9)
-    axes[0].set_ylabel(ylabel, fontsize=8)
-    axes[0].grid(False)
-    _add_colorbar(fig, im0, axes[0], label="Value")
-
-    # Reconstructed
-    im1 = axes[1].imshow(reconstructed, aspect="auto", cmap="bwr", origin="upper", vmin=-vabs, vmax=vabs)
-    axes[1].set_title("Reconstructed Coefficients", fontsize=9)
-    axes[1].set_ylabel(ylabel, fontsize=8)
-    axes[1].grid(False)
-    _add_colorbar(fig, im1, axes[1], label="Value")
-
-    # Error
-    im2 = axes[2].imshow(error, aspect="auto", cmap="Reds", origin="upper")
-    axes[2].set_title(f"Absolute Error (MAE: {np.nanmean(error):.4f})", fontsize=9)
-    axes[2].set_xlabel("Time Steps", fontsize=8)
-    axes[2].set_ylabel(ylabel, fontsize=8)
-    axes[2].grid(False)
-    _add_colorbar(fig, im2, axes[2], label="|Error|")
-
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_latent_heatmap(
-    latent: np.ndarray,
-    output_path: Path,
-    *,
-    title: str = "Latent Space z(t)",
-    warmup_steps: int = 0,
-) -> None:
-    """Plot latent space heatmap with optional warmup marking."""
-    _apply_publication_style()
-
-    fig, ax = plt.subplots(figsize=(8, 3))
-
-    # latent shape: (T, D) - transpose to (D, T) for display
-    latent_T = latent.T if latent.ndim == 2 else latent
-
-    vabs = np.nanmax(np.abs(latent_T))
-    im = ax.imshow(latent_T, aspect="auto", cmap="bwr", origin="lower", vmin=-vabs, vmax=vabs)
-
-    # Mark warmup boundary
-    if warmup_steps > 0:
-        ax.axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-        ax.text(warmup_steps + 1, latent_T.shape[0] * 0.95, "Warmup end", color="white", fontsize=7, va="top")
-
-    ax.set_xlabel("Time Steps", fontsize=8)
-    ax.set_ylabel("Latent Dimension", fontsize=8)
-    ax.set_title(title, fontsize=9, fontweight="normal", pad=8)
-    ax.grid(False)
-
-    _add_colorbar(fig, im, ax, label="Activation")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_kld_per_dimension(
-    kld_tensor: np.ndarray,
-    output_path: Path,
-    *,
-    title: str = "KLD per Latent Dimension",
-    warmup_steps: int = 0,
-) -> None:
-    """Plot KLD heatmap and mean trace per latent dimension."""
-    _apply_publication_style()
-
-    # kld_tensor shape: (T, D) or (D, T) - ensure (D, T)
-    if kld_tensor.ndim != 2:
-        return
-
-    # Assume (D, T) format based on typical usage
-    kld_T = kld_tensor if kld_tensor.shape[0] < kld_tensor.shape[1] else kld_tensor.T
-
-    fig, axes = plt.subplots(2, 1, figsize=(8, 4.5), gridspec_kw={"height_ratios": [2, 1]})
-
-    # Heatmap
-    im = axes[0].imshow(kld_T, aspect="auto", cmap="viridis", origin="lower")
-    if warmup_steps > 0:
-        axes[0].axvline(x=warmup_steps - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-    axes[0].set_ylabel("Latent Dimension", fontsize=8)
-    axes[0].set_title("KLD per Dimension over Time", fontsize=9)
-    axes[0].grid(False)
-    _add_colorbar(fig, im, axes[0], label="KLD (bits)")
-
-    # Mean trace
-    if kld_T.size == 0:
-        return
-
-    finite_mask = np.isfinite(kld_T)
-    if np.any(finite_mask):
-        kld_mean = np.nanmean(kld_T, axis=0)
-        overall_mean = float(np.nanmean(kld_mean))
-    else:
-        kld_mean = np.full(kld_T.shape[1], np.nan, dtype=float)
-        overall_mean = 0.0
-
-    t = np.arange(len(kld_mean))
-    axes[1].plot(t, kld_mean, color=COLOR_PURPLE, linewidth=0.8)
-    if warmup_steps > 0:
-        axes[1].axvspan(0, warmup_steps, alpha=0.1, color=COLOR_GRAY)
-        axes[1].axvline(x=warmup_steps, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
-    axes[1].set_xlabel("Time Steps", fontsize=8)
-    axes[1].set_ylabel("Mean KLD", fontsize=8)
-    axes[1].set_title(f"Mean KLD over Time (Overall: {overall_mean:.4f})", fontsize=9)
-    _style_axes(axes[1], grid="both")
-    axes[1].set_xlim(0, len(kld_mean))
-
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_residual_histogram(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    output_path: Path,
-    *,
-    title: str = "Residual Distribution",
-) -> None:
-    """Plot histogram of reconstruction residuals."""
-    _apply_publication_style()
-
-    residual = y_true - y_pred
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
-
-    # Histogram
-    n_bins = min(100, max(30, int(np.sqrt(len(residual)) * 2)))
-    counts, bins, patches = axes[0].hist(
-        residual, bins=n_bins, density=True,
-        color=COLOR_GREEN, alpha=0.7, edgecolor=COLOR_BLACK, linewidth=0.3
-    )
-
-    # Fit normal distribution
-    mean_val = np.mean(residual)
-    std_val = np.std(residual)
-    x_fit = np.linspace(bins[0], bins[-1], 200)
-    y_fit = scipy_stats.norm.pdf(x_fit, mean_val, std_val)
-    axes[0].plot(x_fit, y_fit, color=COLOR_VERMILLION, linewidth=1.2, label=f"N({mean_val:.3f}, {std_val:.3f})")
-
-    # Reference lines
-    axes[0].axvline(mean_val, color=COLOR_ORANGE, linewidth=0.9, linestyle="--", label=f"Mean: {mean_val:.4f}")
-    axes[0].axvline(0, color=COLOR_BLACK, linewidth=0.6, alpha=0.5)
-
-    axes[0].set_xlabel("Residual (True - Pred)", fontsize=8)
-    axes[0].set_ylabel("Density", fontsize=8)
-    axes[0].set_title("Residual Histogram", fontsize=9)
-    axes[0].legend(fontsize=7, framealpha=0.95)
-    _style_axes(axes[0], grid="major")
-
-    # Q-Q plot
-    scipy_stats.probplot(residual, dist="norm", plot=axes[1])
-    axes[1].set_title("Q-Q Plot (Normal)", fontsize=9)
-    axes[1].get_lines()[0].set_markersize(2)
-    axes[1].get_lines()[0].set_color(COLOR_BLUE)
-    axes[1].get_lines()[1].set_color(COLOR_VERMILLION)
-    _style_axes(axes[1], grid="major")
-
-    # Stats box
-    skewness = scipy_stats.skew(residual)
-    kurtosis = scipy_stats.kurtosis(residual)
-    stats_text = f"Skewness: {skewness:.3f}\nKurtosis: {kurtosis:.3f}\nRMSE: {np.sqrt(np.mean(residual**2)):.4f}"
-    axes[0].text(
-        0.98, 0.98, stats_text,
-        transform=axes[0].transAxes, fontsize=7,
-        verticalalignment="top", horizontalalignment="right",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=COLOR_LIGHT_GRAY, alpha=0.95)
-    )
-
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_channel_timeseries(
-    coefficients: np.ndarray,
-    output_path: Path,
-    *,
-    title: str,
-    n_channels: int = 8,
-    reconstructed: Optional[np.ndarray] = None,
-    fs: float = 4.0,
-) -> None:
-    """Plot individual channel time series (first n_channels)."""
-    _apply_publication_style()
-
-    n_ch = min(n_channels, coefficients.shape[0])
-    n_rows = (n_ch + 1) // 2
-
-    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 2 * n_rows), sharex=True)
-    axes = axes.flatten() if n_rows > 1 else [axes] if n_rows == 1 else axes
-
-    t = np.arange(coefficients.shape[1])
-
-    for i in range(n_ch):
-        ax = axes[i]
-        ax.plot(t, coefficients[i], color=COLOR_BLUE, linewidth=0.6, label="Original")
-        if reconstructed is not None and i < reconstructed.shape[0]:
-            ax.plot(t, reconstructed[i], color=COLOR_ORANGE, linewidth=0.8, alpha=0.8, label="Reconstructed")
-            mae = np.mean(np.abs(coefficients[i] - reconstructed[i]))
-            ax.set_title(f"Channel {i} (MAE: {mae:.4f})", fontsize=8)
-        else:
-            ax.set_title(f"Channel {i}", fontsize=8)
-        ax.set_ylabel("Value", fontsize=7)
-        _style_axes(ax, grid="major")
-        if i == 0:
-            ax.legend(fontsize=6, loc="upper right", framealpha=0.9)
-
-    # Hide unused axes
-    for i in range(n_ch, len(axes)):
-        axes[i].set_visible(False)
-
-    axes[-2].set_xlabel("Time Steps", fontsize=8)
-    if len(axes) > 1:
-        axes[-1].set_xlabel("Time Steps", fontsize=8)
-
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=1.01)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_error_summary(
-    y_true_np: np.ndarray,
-    y_pred_np: np.ndarray,
-    fhr_st_orig: np.ndarray,
-    fhr_st_recon: Optional[np.ndarray],
-    fhr_ph_orig: np.ndarray,
-    fhr_ph_recon: Optional[np.ndarray],
-    output_path: Path,
-    *,
-    title: str = "Reconstruction Error Summary",
-    metrics: Optional[Dict[str, float]] = None,
-) -> None:
-    """Plot comprehensive error summary with bar charts and statistics."""
-    _apply_publication_style()
-
-    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
-
-    # 1. FHR reconstruction metrics bar chart
-    ax = axes[0, 0]
-    if metrics:
-        metric_names = ["VAF", "MSE", "SNR", "KLD"]
-        metric_values = [
-            metrics.get("vaf", np.nan),
-            metrics.get("mse", np.nan),
-            metrics.get("snr", np.nan),
-            metrics.get("kld", np.nan),
-        ]
-        colors = [COLOR_BLUE, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE]
-        bars = ax.bar(metric_names, metric_values, color=colors, alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.5)
-
-        # Add value labels on bars
-        for bar, val in zip(bars, metric_values):
-            if np.isfinite(val):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                        f"{val:.4f}", ha="center", va="bottom", fontsize=7)
-
-        ax.set_ylabel("Value", fontsize=8)
-        ax.set_title("FHR Reconstruction Metrics", fontsize=9)
-        _style_axes(ax, grid="major")
-
-    # 2. Per-channel ST MAE distribution
-    ax = axes[0, 1]
-    if fhr_st_recon is not None:
-        st_mae_per_channel = np.mean(np.abs(fhr_st_orig - fhr_st_recon), axis=1)
-        ax.bar(range(len(st_mae_per_channel)), st_mae_per_channel, color=COLOR_SKY, alpha=0.8,
-               edgecolor=COLOR_BLACK, linewidth=0.3)
-        ax.axhline(np.mean(st_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
-                   linewidth=1.0, label=f"Mean: {np.mean(st_mae_per_channel):.4f}")
-        ax.set_xlabel("ST Channel", fontsize=8)
-        ax.set_ylabel("MAE", fontsize=8)
-        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
-        ax.legend(fontsize=7, framealpha=0.9)
-        _style_axes(ax, grid="major")
-    else:
-        ax.text(0.5, 0.5, "No ST reconstruction available", ha="center", va="center", fontsize=8)
-        ax.set_title("Scattering Transform Error by Channel", fontsize=9)
-
-    # 3. Per-channel PH MAE distribution
-    ax = axes[1, 0]
-    if fhr_ph_recon is not None:
-        ph_mae_per_channel = np.mean(np.abs(fhr_ph_orig - fhr_ph_recon), axis=1)
-        ax.bar(range(len(ph_mae_per_channel)), ph_mae_per_channel, color=COLOR_SAGE, alpha=0.8,
-               edgecolor=COLOR_BLACK, linewidth=0.3)
-        ax.axhline(np.mean(ph_mae_per_channel), color=COLOR_VERMILLION, linestyle="--",
-                   linewidth=1.0, label=f"Mean: {np.mean(ph_mae_per_channel):.4f}")
-        ax.set_xlabel("PH Channel", fontsize=8)
-        ax.set_ylabel("MAE", fontsize=8)
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
-        ax.legend(fontsize=7, framealpha=0.9)
-        _style_axes(ax, grid="major")
-    else:
-        ax.text(0.5, 0.5, "No PH reconstruction available", ha="center", va="center", fontsize=8)
-        ax.set_title("Phase Harmonic Error by Channel", fontsize=9)
-
-    # 4. FHR error over time
-    ax = axes[1, 1]
-    residual = y_true_np - y_pred_np
-    window_size = max(1, len(residual) // 50)
-    # Compute rolling MAE
-    rolling_mae = np.array([
-        np.mean(np.abs(residual[max(0, i - window_size):i + window_size + 1]))
-        for i in range(len(residual))
-    ])
-    t = np.arange(len(residual))
-    ax.plot(t, rolling_mae, color=COLOR_PURPLE, linewidth=0.6, label="Rolling MAE")
-    ax.axhline(np.mean(np.abs(residual)), color=COLOR_ORANGE, linestyle="--",
-               linewidth=0.9, label=f"Mean MAE: {np.mean(np.abs(residual)):.4f}")
-    ax.set_xlabel("Sample Index", fontsize=8)
-    ax.set_ylabel("MAE", fontsize=8)
-    ax.set_title("FHR Reconstruction Error Over Time", fontsize=9)
-    ax.legend(fontsize=7, framealpha=0.9)
-    ax.set_xlim(0, len(residual))
-    _style_axes(ax, grid="major")
-
-    fig.suptitle(title, fontsize=10, fontweight="normal", y=0.99)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_all_single_sample_plots(
-    runner: TestRunner,
-    batch: Any,
-    idx: int,
-    outputs: Dict[str, Any],
-    sample_dir: Path,
-    sample_name: str,
-    stats: Optional[Dict[str, Any]],
-    fs: float = 4.0,
-    beta: float = 1.0,
-    skip_interactive: bool = False,
-    dim_reduction_method: str = "pca",
-) -> Dict[str, Any]:
-    """
-    Plot a single consolidated summary figure for a sample.
+    t_max: float,
+    cmap: str,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    symmetric: bool = False,
+    ylabel: str = "",
+    separator_row: Optional[int] = None,
+    title: str = "",
+) -> Any:
+    """Draw a ``(C, T)`` heatmap that shares the pipeline-wide time axis.
 
     Args:
-        sample_dir: Output directory (root folder).
-        sample_name: Unique identifier for the sample (used in filename).
+        ax: Target matplotlib axes.
+        data: Array of shape ``(C, T)``.
+        t_max: X-axis extent in seconds.
+        cmap: Colormap name.
+        vmin: Minimum colour value (auto if None and not ``symmetric``).
+        vmax: Maximum colour value (auto if None and not ``symmetric``).
+        symmetric: If True, force ``vmin = -vmax`` from the data's maximum
+            absolute value (useful for residual / signed panels).
+        ylabel: Y-axis label.
+        separator_row: Optional row index of a horizontal separator line
+            (used to mark the scattering/phase split on feature rows).
+        title: Panel title placed above the axes.
 
     Returns:
-        Dict with paths to generated plots.
+        The ``AxesImage`` handle, or ``None`` if the panel was empty/NaN.
     """
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    plot_paths: Dict[str, Any] = {}
+    if data.size == 0 or not np.isfinite(data).any():
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+        if title:
+            ax.set_title(title, fontsize=FONT_LABEL)
+        return None
 
-    y_st = batch.fhr_st[idx : idx + 1]
-    y_ph = batch.fhr_ph[idx : idx + 1]
-    x_ph = batch.fhr_up_ph[idx : idx + 1]
-    y_raw = batch.fhr[idx : idx + 1]
-    up_raw_tensor = getattr(batch, "up", None)
-    up_raw = up_raw_tensor[idx : idx + 1] if up_raw_tensor is not None else torch.zeros_like(y_raw)
+    if symmetric:
+        vlim = float(np.nanmax(np.abs(data))) + 1e-12
+        vmin = -vlim
+        vmax = vlim
 
-    mu_pr = outputs.get("mu_pr")
-    logvar_pr = outputs.get("logvar_pr")
-    latent = outputs.get("z")
-
-    if mu_pr is None or latent is None:
-        logger.warning("Missing prediction outputs; skipping sample.")
-        return plot_paths
-
-    avg_mu, valid_mask = aggregate_predictions(
-        runner.model, mu_pr[idx : idx + 1], raw_len=y_raw.size(1)
+    C = data.shape[0]
+    im = ax.imshow(
+        data,
+        aspect="auto",
+        origin="lower",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+        extent=(0.0, t_max, -0.5, C - 0.5),
     )
-    if avg_mu is None:
-        logger.warning("Aggregated predictions missing; skipping sample.")
-        return plot_paths
+    if separator_row is not None and 0 <= separator_row < C - 1:
+        ax.axhline(
+            y=separator_row + 0.5,
+            color=COLOR_BLACK,
+            linewidth=0.5,
+            linestyle="--",
+        )
+    ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+    if title:
+        ax.set_title(title, fontsize=FONT_LABEL)
+    _add_colorbar(ax.figure, im, ax, label="")  # type: ignore[arg-type]
+    return im
 
-    avg_mu = avg_mu[0]
-    valid_mask_np = None
-    if valid_mask is not None:
-        valid_mask_np = valid_mask[0].detach().cpu().numpy().astype(bool)
 
-    kld_tensor = compute_kld(outputs, runner.warmup_steps)
-    kld_mean_np = None
-    kld_std_np = None
-    kld_sample_np = None
-    if kld_tensor is not None:
-        kld_sample = kld_tensor[idx]
-        kld_mean_np = torch.nanmean(kld_sample, dim=-1).detach().cpu().numpy()
-        kld_std_np = kld_sample.detach().cpu().numpy()
-        kld_std_np = np.nanstd(kld_std_np, axis=-1)  # (T,)
-        kld_sample_np = kld_sample.detach().cpu().numpy()  # (T, D)
+def plot_sample_lag_attn_diagnostic(
+    sample: Dict[str, Any],
+    out_path: Path,
+    warmup: int,
+    horizon: int,
+    *,
+    fhr_st_end: int = _FHR_ST_END,
+    fs_raw: float = _DEFAULT_FS_RAW,
+) -> None:
+    """Render a multi-row diagnostic figure for one sample.
 
-    fhr_st_np = y_st[0].detach().cpu().numpy().T
-    fhr_ph_np = y_ph[0].detach().cpu().numpy().T
-    fhr_up_ph_np = x_ph[0].detach().cpu().numpy().T
-    latent_np = latent[idx].detach().cpu().numpy().T
+    Args:
+        sample: Record from :func:`collect_predictions` with the keys
+            ``mu_full, mu_base, delta_src, y_plus, z, attn, te_lag, kld_t,
+            kld_per_dim, fhr, up, guid, epoch, label, metrics``.
+        out_path: Destination PDF/PNG.
+        warmup: Warmup anchors (used to shade invalid regions).
+        horizon: Forecast horizon ``H_d``.
+        fhr_st_end: Channel index separating scattering from phase
+            (default 43 for the standard v1 config).
+        fs_raw: Raw sampling rate in Hz (default 4.0).
+    """
+    mu_full = np.asarray(sample.get("mu_full"))            # (T, H_d, C)
+    y_plus = np.asarray(sample.get("y_plus"))              # (T_valid, H_d, C)
+    z = np.asarray(sample.get("z"))                        # (T, d_z)
+    attn = np.asarray(sample.get("attn"))                  # (T, M, L)
+    te_lag = np.asarray(sample.get("te_lag"))              # (T, L)
+    kld_per_dim = np.asarray(sample.get("kld_per_dim"))    # (T, d_z)
+    fhr_raw = sample.get("fhr")
+    up_raw = sample.get("up")
 
-    raw_norm_np = y_raw[0].detach().cpu().numpy().reshape(-1)
-    raw_denorm_np = _denormalize_tensor(y_raw, "fhr", stats)[0].detach().cpu().numpy().reshape(-1)
-    up_denorm_np = _denormalize_tensor(up_raw, "up", stats)[0].detach().cpu().numpy().reshape(-1)
+    if mu_full.ndim != 3:
+        raise ValueError(
+            f"sample['mu_full'] must be (T, H_d, C), got {mu_full.shape}"
+        )
 
-    avg_pred_np = avg_mu.detach().cpu().numpy().reshape(-1)
-    if valid_mask_np is not None:
-        avg_pred_np = np.where(valid_mask_np, avg_pred_np, np.nan)
+    T, H_d, C = mu_full.shape
+    if int(horizon) != int(H_d):
+        # Non-fatal — prefer the tensor shape but warn so callers notice.
+        H_d = int(H_d)
+    fhr_arr = np.asarray(fhr_raw) if fhr_raw is not None else None
+    up_arr = np.asarray(up_raw) if up_raw is not None else None
+    R = int(fhr_arr.shape[0]) if fhr_arr is not None and fhr_arr.ndim == 1 else _DEFAULT_R
+    time_raw, _, t_max = _time_axes(T=T, R=R, fs_raw=fs_raw)
 
-    pred_concat = np.full_like(raw_norm_np, np.nan, dtype=float)
-    std_concat = None
-    predictions = mu_pr[idx]
-    logvar_predictions = logvar_pr[idx] if logvar_pr is not None else None
-    if predictions.dim() == 3:
-        predictions = predictions.squeeze(0)
-    if logvar_predictions is not None and logvar_predictions.dim() == 3:
-        logvar_predictions = logvar_predictions.squeeze(0)
+    # -------- Build per-row data --------
+    mu_full_avg = _average_forecast_per_channel(
+        mu_full, T=T, H_d=H_d, warmup=warmup
+    )  # (T, C)
 
-    horizon = predictions.size(-1)
-    stride = runner.decimation_factor
-    warmup = runner.warmup_steps
-    raw_len = raw_norm_np.shape[0]
-    total_steps = predictions.size(0)
-    step_size = max(1, horizon // max(1, stride))
+    # y_plus is shape (T_valid, H_d, C); extend to (T, H_d, C) with NaN
+    # padding so we can reuse the same averaging helper for a fair visual
+    # comparison.
+    y_full = np.full((T, H_d, C), np.nan, dtype=np.float32)
+    T_valid = y_plus.shape[0] if y_plus.ndim == 3 else 0
+    if T_valid > 0:
+        y_full[:T_valid] = y_plus.astype(np.float32)
+    y_plus_avg = _average_forecast_per_channel(
+        y_full, T=T, H_d=H_d, warmup=warmup
+    )
 
-    if logvar_predictions is not None:
-        std_concat = np.full_like(raw_norm_np, np.nan, dtype=float)
+    mu_full_img = mu_full_avg.T
+    y_plus_img = y_plus_avg.T
+    residual_img = mu_full_img - y_plus_img
 
-    # Track prediction window boundaries for visualization
-    prediction_boundaries = []
+    kld_per_dim_img = (
+        kld_per_dim.T if kld_per_dim.ndim == 2 else np.zeros((1, T), dtype=np.float32)
+    )
+    z_img = z.T if z.ndim == 2 else np.zeros((1, T), dtype=np.float32)
+    attn_mean = (
+        attn.mean(axis=1).T if attn.ndim == 3 else np.zeros((1, T), dtype=np.float32)
+    )  # (L, T)
+    te_lag_img = (
+        te_lag.T if te_lag.ndim == 2 else np.zeros((1, T), dtype=np.float32)
+    )  # (L, T)
 
-    t_idx = warmup
-    while t_idx < total_steps:
-        raw_start = t_idx * stride
-        if raw_start >= raw_len:
-            break
-        raw_end = raw_start + horizon
+    # -------- Layout --------
+    n_rows = 8
+    fig, axes = plt.subplots(
+        n_rows, 1,
+        figsize=(8.6, 1.15 * n_rows + 2.0),
+        gridspec_kw={"hspace": 0.45},
+        sharex=True,
+    )
 
-        pred_segment = predictions[t_idx].detach().cpu().numpy()
-        seg_len = raw_end - raw_start
-        if raw_end > raw_len:
-            seg_len = raw_len - raw_start
-            raw_end = raw_len
-            pred_segment = pred_segment[:seg_len]
-
-        pred_concat[raw_start:raw_end] = pred_segment
-        prediction_boundaries.append(raw_start)
-
-        if std_concat is not None:
-            logvar_segment = logvar_predictions[t_idx]
-            std_segment = torch.exp(0.5 * logvar_segment).detach().cpu().numpy()
-            if std_segment.shape[0] > seg_len:
-                std_segment = std_segment[:seg_len]
-            std_concat[raw_start:raw_end] = std_segment
-
-        t_idx += step_size
-
-    _apply_publication_style()
-    fig, axes = plt.subplots(9, 1, figsize=(16, 27), constrained_layout=True)
-    if not isinstance(axes, np.ndarray):
-        axes = np.asarray([axes])
-
-    def _style_heatmap(ax: plt.Axes) -> None:
-        _style_axes(ax, grid="none")
-        ax.grid(False)
-
-    t_raw = np.arange(raw_norm_np.shape[0]) / fs
-
+    # Row 0: Raw FHR / UP traces (if present).
     ax = axes[0]
-    ax.plot(t_raw, raw_denorm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR")
-    ax.plot(t_raw, up_denorm_np, color=COLOR_GREEN, linewidth=1.2, label="UP")
-    ax.set_title("Original FHR and UP")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude")
-    ax.legend(loc="upper right", framealpha=0.95)
-    ax.set_xlim(t_raw[0], t_raw[-1])
-    ax.margins(x=0.0)
-    _style_axes(ax, grid="both")
+    drawn = False
+    if fhr_arr is not None and fhr_arr.ndim == 1:
+        n = min(len(fhr_arr), len(time_raw))
+        ax.plot(
+            time_raw[:n], fhr_arr[:n],
+            color=COLOR_BLUE, linewidth=0.7, label="FHR",
+        )
+        drawn = True
+    if up_arr is not None and up_arr.ndim == 1:
+        ax2 = ax.twinx()
+        n = min(len(up_arr), len(time_raw))
+        ax2.plot(
+            time_raw[:n], up_arr[:n],
+            color=COLOR_VERMILLION, linewidth=0.7, alpha=0.8, label="UP",
+        )
+        ax2.tick_params(axis="y", colors=COLOR_VERMILLION, labelsize=6)
+        drawn = True
+    if not drawn:
+        ax.text(
+            0.5, 0.5, "raw traces not available",
+            ha="center", va="center", transform=ax.transAxes,
+        )
+    ax.set_ylabel("raw FHR / UP", fontsize=FONT_LABEL)
+    ax.set_xlim(0.0, t_max)
+    _style_axes(ax, grid="major", minor_ticks=False)
 
-    ax = axes[1]
-    im = ax.imshow(fhr_st_np, aspect="auto", cmap="bwr", origin="upper")
-    ax.set_title("FHR Scattering Transform")
-    ax.set_xlabel("Time Steps")
-    ax.set_ylabel("ST Channel")
-    _style_heatmap(ax)
-    _add_colorbar(fig, im, ax, label="Coeff")
+    # Row 1: mu_full_avg (C, T).
+    _imshow_panel(
+        axes[1], mu_full_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        ylabel="mu_full_avg", separator_row=fhr_st_end - 1,
+        title="Average feature forecast (mu_full)",
+    )
 
-    ax = axes[2]
-    im = ax.imshow(fhr_ph_np, aspect="auto", cmap="bwr", origin="upper")
-    ax.set_title("FHR Phase Harmonics")
-    ax.set_xlabel("Time Steps")
-    ax.set_ylabel("PH Channel")
-    _style_heatmap(ax)
-    _add_colorbar(fig, im, ax, label="Coeff")
+    # Row 2: y_plus_avg (C, T).
+    _imshow_panel(
+        axes[2], y_plus_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        ylabel="y_plus_avg", separator_row=fhr_st_end - 1,
+        title="Ground truth (y_plus)",
+    )
 
-    ax = axes[3]
-    im = ax.imshow(fhr_up_ph_np, aspect="auto", cmap="bwr", origin="upper")
-    ax.set_title("FHR-UP Cross-Channel Phase Harmonics")
-    ax.set_xlabel("Time Steps")
-    ax.set_ylabel("Cross-PH Channel")
-    _style_heatmap(ax)
-    _add_colorbar(fig, im, ax, label="Coeff")
+    # Row 3: residual (C, T).
+    _imshow_panel(
+        axes[3], residual_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        ylabel="residual", separator_row=fhr_st_end - 1,
+        title="mu_full - y_plus",
+    )
 
-    ax = axes[4]
-    im = ax.imshow(latent_np, aspect="auto", cmap="bwr", origin="lower")
-    # Add warmup boundary
-    if warmup > 0:
-        ax.axvline(x=warmup - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-    ax.set_title("Latent Representation")
-    ax.set_xlabel("Time Steps")
-    ax.set_ylabel("Latent Dim")
-    _style_heatmap(ax)
-    _add_colorbar(fig, im, ax, label="Activation")
+    # Row 4: latent z.
+    _imshow_panel(
+        axes[4], z_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        ylabel="z", title="Latent z",
+    )
 
-    ax = axes[5]
-    if kld_mean_np is None:
-        ax.text(0.5, 0.5, "KLD unavailable", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        t_kld = np.arange(len(kld_mean_np))
-        ax.plot(t_kld, kld_mean_np, color=COLOR_PURPLE, linewidth=1.1, label="Mean KLD")
-        # Add warmup shading
-        if warmup > 0:
-            ax.axvspan(0, warmup, alpha=0.15, color=COLOR_GRAY, label="Warmup")
-            ax.axvline(x=warmup, color=COLOR_GRAY, linestyle="--", linewidth=0.8)
-        overall_mean = float(np.nanmean(kld_mean_np[warmup:]))
-        ax.set_xlabel("Time Steps")
-        ax.set_ylabel("Mean KLD", color=COLOR_PURPLE)
-        ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
-        ax.set_xlim(0, len(kld_mean_np))
-        _style_axes(ax, grid="both")
+    # Row 5: KLD per dim.
+    _imshow_panel(
+        axes[5], kld_per_dim_img, t_max=t_max, cmap="magma", vmin=0.0,
+        ylabel="KL per dim", title="KL(q||p) per latent dim",
+    )
 
-        # Second y-axis for KLD std across dimensions
-        if kld_std_np is not None:
-            ax2 = ax.twinx()
-            ax2.plot(t_kld, kld_std_np, color=COLOR_ORANGE, linewidth=0.9, alpha=0.85, label="Std KLD")
-            ax2.set_ylabel("Std KLD", color=COLOR_ORANGE, fontsize=8)
-            ax2.tick_params(axis="y", labelcolor=COLOR_ORANGE)
-            overall_std = float(np.nanmean(kld_std_np[warmup:]))
-            ax.set_title(
-                f"KLD over Dimensions (Mean: {overall_mean:.4f}, Std: {overall_std:.4f})"
-            )
-            # Combined legend from both axes
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7, framealpha=0.95)
-        else:
-            ax.set_title(f"Mean KLD over Dimensions (Overall: {overall_mean:.4f})")
+    # Row 6: Lag attention (L, T).
+    _imshow_panel(
+        axes[6], attn_mean, t_max=t_max, cmap="viridis",
+        ylabel="lag k", title="Head-averaged lag attention",
+    )
 
-    # KLD heatmap across all latent dimensions
-    ax = axes[6]
-    if kld_sample_np is None:
-        ax.text(0.5, 0.5, "KLD unavailable", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        # kld_sample_np shape: (T, D) — transpose to (D, T) for display
-        kld_heatmap = kld_sample_np.T
-        im = ax.imshow(kld_heatmap, aspect="auto", cmap="viridis", origin="lower")
-        if warmup > 0:
-            ax.axvline(x=warmup - 0.5, color="white", linestyle="--", linewidth=1.5, alpha=0.8)
-        ax.set_title("KLD per Latent Dimension")
-        ax.set_xlabel("Time Steps")
-        ax.set_ylabel("Latent Dimension")
-        ax.grid(False)
-        _add_colorbar(fig, im, ax, label="KLD (nats)")
+    # Row 7: TE lag attribution.
+    _imshow_panel(
+        axes[7], te_lag_img, t_max=t_max, cmap="inferno", vmin=0.0,
+        ylabel="lag k", title="TE lag attribution",
+    )
 
-    ax = axes[7]
-    ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
-    ax.plot(t_raw, avg_pred_np, color=COLOR_ORANGE, linewidth=1.2, label="Avg Prediction")
-    ax.set_title("Normalized FHR vs Average Prediction")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Normalized Amplitude")
-    ax.legend(loc="upper right", framealpha=0.95)
-    ax.set_xlim(t_raw[0], t_raw[-1])
-    ax.margins(x=0.0)
-    _style_axes(ax, grid="both")
+    for ax in axes:
+        _shade_warmup(ax, warmup, t_max, T, color=COLOR_LIGHT_GRAY)
+    axes[-1].set_xlabel("Time (s)", fontsize=FONT_LABEL)
 
-    ax = axes[8]
-    ax.plot(t_raw, raw_norm_np, color=COLOR_BLUE, linewidth=1.2, label="FHR (norm)")
-    ax.plot(t_raw, pred_concat, color=COLOR_ORANGE, linewidth=1.2, label="Single Predictions")
-    # Add fill_between for uncertainty with more visible color
-    if std_concat is not None:
-        upper = pred_concat + std_concat
-        lower = pred_concat - std_concat
-        ax.fill_between(t_raw, lower, upper, color=COLOR_SKY, alpha=0.35, label="+/-1SD")
-    # Add vertical lines at prediction window boundaries
-    for i, boundary in enumerate(prediction_boundaries):
-        boundary_sec = boundary / fs
-        ax.axvline(x=boundary_sec, color=COLOR_GRAY, linestyle=":", linewidth=0.6, alpha=0.7)
-    ax.set_title("Single-Window Predictions (Normalized)")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Normalized Amplitude")
-    ax.legend(loc="upper right", framealpha=0.95)
-    ax.set_xlim(t_raw[0], t_raw[-1])
-    ax.margins(x=0.0)
-    _style_axes(ax, grid="both")
+    # Title bar with sample metadata.
+    guid = sample.get("guid", "unknown")
+    epoch = sample.get("epoch")
+    label = sample.get("label")
+    metrics = sample.get("metrics", {}) or {}
+    feat_mse = metrics.get("feat_mse_total")
+    uplift_rel = metrics.get("uplift_rel")
+    res_ratio = metrics.get("residual_ratio")
 
-    guid = _extract_guid(batch, idx)
-    epoch = _extract_epoch(batch, idx)
-    title = f"Sample Summary | GUID={guid} | Epoch={epoch}"
-    fig.suptitle(title, fontsize=14, fontweight="normal", y=1.01, color=COLOR_BLUE)
+    title_bits = [f"guid={guid}"]
+    if epoch is not None:
+        title_bits.append(f"epoch={float(epoch):.0f}s")
+    if label is not None:
+        title_bits.append(f"class={label}")
+    if feat_mse is not None:
+        title_bits.append(f"feat_mse={float(feat_mse):.4f}")
+    if uplift_rel is not None:
+        title_bits.append(f"uplift_rel={float(uplift_rel):.3f}")
+    if res_ratio is not None:
+        title_bits.append(f"resid_ratio={float(res_ratio):.3f}")
 
-    plot_path = sample_dir / f"vae_reconstruction_analysis_{sample_name}.pdf"
-    fig.savefig(plot_path, dpi=SAVE_DPI, bbox_inches="tight")
+    fig.suptitle(
+        "  |  ".join(title_bits),
+        fontsize=FONT_TITLE, fontweight="normal", y=0.995,
+    )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
-    plot_paths["vae_reconstruction"] = str(plot_path)
-    return plot_paths
+
+# -----------------------------------------------------------------------------
+# KLD + lag attention diagnostic figures (minute-axis)
+# -----------------------------------------------------------------------------
 
 
-def plot_single_samples(
-    config_path: Union[str, Path],
-    n_samples: int = 5,
-    checkpoint_path: Optional[str] = None,
-    data_path: Optional[Union[str, List[str]]] = None,
-    output_dir: Optional[str] = None,
-    stats_path: Optional[str] = None,
-    device: Optional[str] = None,
-    batch_size: Optional[int] = None,
-    num_workers: Optional[int] = None,
-    normalize_fields: Optional[Sequence[str]] = None,
-    seed: Optional[int] = None,
-    skip_interactive: bool = False,
-    beta: float = 1.0,
-    dim_reduction_method: str = "pca",
-    fs: float = 4.0,
-    **model_kwargs: Any,
-) -> Dict[str, Any]:
-    """
-    Plot all available single-sample plots for randomly selected samples.
+def plot_sample_signals_kld(
+    *,
+    fhr: Optional[np.ndarray],
+    up: Optional[np.ndarray],
+    fhr_st: np.ndarray,
+    up_st: Optional[np.ndarray],
+    kld_per_dim: np.ndarray,
+    warmup: int,
+    out_path: Path,
+    guid: Optional[str] = None,
+    epoch: Optional[float] = None,
+    label: Optional[int] = None,
+    fs_raw: float = _DEFAULT_FS_RAW,
+    decim: int = _DEFAULT_DECIM,
+) -> None:
+    """Draw the multi-panel raw/scattering/KLD diagnostic for one sample.
+
+    The figure stacks, top to bottom:
+
+    1. Raw FHR and UP traces on a twin y-axis (if present).
+    2. FHR scattering transform ``(43, T)`` heatmap.
+    3. UP scattering transform ``(43, T)`` heatmap (skipped if absent).
+    4. Per-latent-dimension KLD traces — one compact subplot per latent
+       dimension, arranged in a grid (up to 6 columns wide).
+    5. Mean ± std of KLD across latent dimensions at every timestep.
+
+    Every panel shares a single physical-time x-axis expressed in
+    **minutes**, using ``sec_per_dec = decim / fs_raw`` to convert
+    decimated step index to seconds and then to minutes. Warmup is
+    shaded consistently across all rows.
 
     Args:
-        config_path: Path to YAML configuration file.
-        n_samples: Number of samples to randomly select and plot.
-        checkpoint_path: Path to model checkpoint (optional, uses config if not provided).
-        data_path: Path(s) to test data (optional, uses config if not provided).
-        output_dir: Output directory (optional, uses config if not provided).
-        stats_path: Path to normalization statistics (optional).
-        device: Device string ("cuda:0", "cpu"). Auto-detects if None.
-        batch_size: Batch size for data loading.
-        num_workers: Number of dataloader workers.
-        normalize_fields: Fields to normalize.
-        seed: Random seed for sample selection.
-        skip_interactive: Whether to skip Plotly interactive plots.
-        beta: Beta value for loss computation.
-        dim_reduction_method: Method for latent dimensionality reduction (pca, umap, tsne).
-        fs: Sampling frequency in Hz.
-        **model_kwargs: Additional model architecture parameters.
-
-    Returns:
-        Dict with results including paths to all generated plots.
-
-    Example:
-        >>> results = plot_single_samples(
-        ...     config_path="model/vae_teb_prediction/config.yaml",
-        ...     n_samples=5,
-        ...     seed=42,
-        ... )
+        fhr: Raw FHR trace ``(R,)`` or ``None``.
+        up: Raw UP trace ``(R,)`` or ``None``.
+        fhr_st: Normalised FHR scattering features ``(T, 43)``.
+        up_st: Normalised UP scattering features ``(T, 43)`` or ``None``.
+        kld_per_dim: Per-timestep per-dim KL, shape ``(T, d_z)``.
+        warmup: Number of warmup decimated steps.
+        out_path: Destination PDF/PNG.
+        guid: Sample GUID for the title bar.
+        epoch: Sample epoch (seconds relative to delivery) for the title.
+        label: Outcome class label for the title.
+        fs_raw: Raw sampling rate in Hz (default 4.0).
+        decim: Decimation factor mapping raw → decimated (default 16).
     """
-    # Resolve settings
-    settings = _resolve_settings(
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        data_path=data_path,
-        output_dir=output_dir,
-        stats_path=stats_path,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        normalize_fields=normalize_fields,
+    if fhr_st.ndim != 2:
+        raise ValueError(
+            f"fhr_st must be (T, C_st), got {fhr_st.shape}"
+        )
+    if kld_per_dim.ndim != 2:
+        raise ValueError(
+            f"kld_per_dim must be (T, d_z), got {kld_per_dim.shape}"
+        )
+
+    T = int(fhr_st.shape[0])
+    d_z = int(kld_per_dim.shape[1])
+
+    sec_per_dec = float(decim) / float(fs_raw)
+    t_max_min = T * sec_per_dec / 60.0
+    time_dec_min = (np.arange(T) + 0.5) * sec_per_dec / 60.0
+    warmup_min = max(0, int(warmup)) * sec_per_dec / 60.0
+
+    R = int(fhr.shape[0]) if (fhr is not None and fhr.ndim == 1) else int(T * decim)
+    time_raw_min = np.arange(R) / float(fs_raw) / 60.0
+
+    # --- Layout ---
+    use_up_st = up_st is not None and up_st.ndim == 2
+    n_cols = min(6, max(1, d_z))
+    n_kld_rows = int(np.ceil(d_z / n_cols))
+    n_top_rows = 2 + (1 if use_up_st else 0)  # raw, fhr_st, optional up_st
+    n_bot_rows = 1                              # mean ± std
+    n_total = n_top_rows + n_kld_rows + n_bot_rows
+
+    height_ratios = (
+        [1.1] * n_top_rows
+        + [0.75] * n_kld_rows
+        + [1.25] * n_bot_rows
+    )
+    fig_h = 1.3 * n_top_rows + 0.9 * n_kld_rows + 1.6
+    fig = plt.figure(figsize=(14, fig_h))
+    gs = GridSpec(
+        n_total, n_cols, figure=fig,
+        hspace=0.65, wspace=0.35,
+        height_ratios=height_ratios,
+        left=0.07, right=0.96, top=0.95, bottom=0.05,
     )
 
-    # Auto-detect device
-    device_str = device
-    if device_str is None:
-        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
-    device_torch = torch.device(device_str)
+    # --- Row 0: Raw signals ---
+    row = 0
+    ax_raw = fig.add_subplot(gs[row, :])
+    _draw_raw_panel(
+        ax_raw,
+        fhr=fhr, up=up,
+        time_raw_min=time_raw_min,
+        t_max_min=t_max_min,
+        warmup_min=warmup_min,
+        title="Raw FHR / UP",
+    )
+    row += 1
 
-    logger.info(f"Checkpoint: {settings['checkpoint_path']}")
-    logger.info(f"Data: {settings['data_paths']}")
-    logger.info(f"Output: {settings['output_dir']}")
-    logger.info(f"Device: {device_torch}")
-    logger.info(f"Number of samples: {n_samples}")
+    # --- Row 1: FHR scattering transform (channels on y, time on x) ---
+    ax_fhr = fig.add_subplot(gs[row, :])
+    _draw_heatmap_min(
+        ax_fhr, fhr_st.T,
+        t_max_min=t_max_min, cmap="viridis",
+        ylabel="fhr_st ch",
+        title="FHR scattering transform",
+        colorbar_label="",
+    )
+    _shade_warmup_min(ax_fhr, warmup_min)
+    row += 1
 
-    # Create TestRunner
-    logger.info("Loading model from checkpoint...")
-    runner = TestRunner.from_checkpoint(
-        checkpoint_path=str(settings["checkpoint_path"]),
-        output_dir=str(settings["output_dir"]),
-        device=device_torch,
-        **model_kwargs,
+    # --- Row 2 (optional): UP scattering transform ---
+    if use_up_st:
+        ax_up_st = fig.add_subplot(gs[row, :])
+        _draw_heatmap_min(
+            ax_up_st, up_st.T,  # type: ignore[union-attr]
+            t_max_min=t_max_min, cmap="viridis",
+            ylabel="up_st ch",
+            title="UP scattering transform",
+            colorbar_label="",
+        )
+        _shade_warmup_min(ax_up_st, warmup_min)
+        row += 1
+
+    # --- KLD per-dim grid ---
+    kld_grid_start = row
+    for d in range(d_z):
+        r = kld_grid_start + d // n_cols
+        c = d % n_cols
+        ax_d = fig.add_subplot(gs[r, c])
+        vals = kld_per_dim[:, d]
+        finite_vals = vals[np.isfinite(vals)]
+        y_peak = float(np.nanmax(finite_vals)) if finite_vals.size else 0.0
+
+        ax_d.plot(
+            time_dec_min, vals,
+            color=COLOR_PURPLE, linewidth=0.8, alpha=0.95,
+        )
+        ax_d.axhline(0.0, color=COLOR_GRAY, linewidth=0.3, linestyle=":")
+        ax_d.set_xlim(0.0, t_max_min)
+        if y_peak > 0.0:
+            ax_d.set_ylim(
+                min(0.0, float(np.nanmin(finite_vals)) * 1.05),
+                y_peak * 1.1,
+            )
+        ax_d.set_title(f"dim {d}", fontsize=6, pad=2)
+        ax_d.tick_params(axis="both", labelsize=5)
+        ax_d.grid(True, which="major", alpha=0.2, linewidth=0.3)
+        _shade_warmup_min(ax_d, warmup_min)
+
+        # Only bottom row of the grid carries x-tick labels; leftmost
+        # column carries y-tick labels.
+        if r != kld_grid_start + n_kld_rows - 1:
+            ax_d.tick_params(labelbottom=False)
+        if c != 0:
+            ax_d.tick_params(labelleft=False)
+
+    # Hide any empty slots when d_z < n_kld_rows * n_cols.
+    total_slots = n_kld_rows * n_cols
+    for d in range(d_z, total_slots):
+        r = kld_grid_start + d // n_cols
+        c = d % n_cols
+        ax_empty = fig.add_subplot(gs[r, c])
+        ax_empty.set_visible(False)
+    row += n_kld_rows
+
+    # --- Bottom: Mean ± std KLD over dimensions ---
+    ax_mean = fig.add_subplot(gs[row, :])
+    mean_kld = np.nanmean(kld_per_dim, axis=1)
+    std_kld = np.nanstd(kld_per_dim, axis=1)
+    ax_mean.fill_between(
+        time_dec_min,
+        mean_kld - std_kld,
+        mean_kld + std_kld,
+        color=COLOR_BLUE,
+        alpha=0.22,
+        label="±1 std",
+    )
+    ax_mean.plot(
+        time_dec_min, mean_kld,
+        color=COLOR_BLUE, linewidth=1.2, label="mean",
+    )
+    ax_mean.axhline(0.0, color=COLOR_GRAY, linewidth=0.4, linestyle=":")
+    ax_mean.set_xlim(0.0, t_max_min)
+    ax_mean.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    ax_mean.set_ylabel("KLD (nats)", fontsize=FONT_LABEL)
+    ax_mean.set_title(
+        "Mean ± std KLD across latent dimensions",
+        fontsize=FONT_LABEL, fontweight="normal",
+    )
+    ax_mean.legend(loc="upper right", fontsize=6, frameon=True)
+    _shade_warmup_min(ax_mean, warmup_min)
+    _style_axes(ax_mean, grid="major", minor_ticks=True)
+
+    # --- Title bar ---
+    title_bits = []
+    if guid is not None:
+        title_bits.append(f"guid={guid}")
+    if epoch is not None:
+        title_bits.append(f"epoch={float(epoch):.0f}s")
+    if label is not None:
+        title_bits.append(f"class={label}")
+    if title_bits:
+        fig.suptitle(
+            "  |  ".join(title_bits),
+            fontsize=FONT_TITLE, fontweight="normal", y=0.995,
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_sample_lag_attention(
+    *,
+    fhr: Optional[np.ndarray],
+    up: Optional[np.ndarray],
+    attn_weights: np.ndarray,
+    te_lag_map: np.ndarray,
+    warmup: int,
+    out_path: Path,
+    guid: Optional[str] = None,
+    epoch: Optional[float] = None,
+    label: Optional[int] = None,
+    fs_raw: float = _DEFAULT_FS_RAW,
+    decim: int = _DEFAULT_DECIM,
+) -> None:
+    """Draw the multi-panel lag-attention diagnostic for one sample.
+
+    The figure stacks, top to bottom:
+
+    1. Raw FHR and UP traces (context strip).
+    2. Head-averaged lag attention ``α̅(t, k)`` as a ``(L, T)`` heatmap
+       with the **y-axis expressed in minutes** — ``lag_minutes[k] =
+       k × decim / fs_raw / 60`` (4-second steps by default).
+    3. TE lag attribution ``kld_per_t × mean_heads(α)`` on the same
+       time-in-minutes × lag-in-minutes grid.
+    4. Attention analysis: argmax lag per anchor (blue, left y-axis,
+       in minutes) and head-averaged Shannon entropy (orange, right
+       y-axis, in nats). Both curves are warmup-masked.
+    5. Lag analysis: time-averaged head-averaged attention distribution
+       as a bar chart with the lag axis in minutes.
+
+    Args:
+        fhr: Raw FHR trace ``(R,)`` or ``None``.
+        up: Raw UP trace ``(R,)`` or ``None``.
+        attn_weights: Attention probabilities ``(T, M, L)``.
+        te_lag_map: TE lag attribution ``(T, L)``.
+        warmup: Warmup decimated steps.
+        out_path: Destination PDF/PNG.
+        guid: Sample GUID for the title bar.
+        epoch: Sample epoch (seconds relative to delivery) for the title.
+        label: Outcome class label for the title.
+        fs_raw: Raw sampling rate in Hz (default 4.0).
+        decim: Decimation factor (default 16).
+    """
+    if attn_weights.ndim != 3:
+        raise ValueError(
+            f"attn_weights must be (T, M, L), got {attn_weights.shape}"
+        )
+    if te_lag_map.ndim != 2:
+        raise ValueError(
+            f"te_lag_map must be (T, L), got {te_lag_map.shape}"
+        )
+
+    T = int(attn_weights.shape[0])
+    L = int(attn_weights.shape[2])
+    if te_lag_map.shape != (T, L):
+        raise ValueError(
+            f"te_lag_map shape {te_lag_map.shape} must match "
+            f"(T={T}, L={L}) from attn_weights"
+        )
+
+    sec_per_dec = float(decim) / float(fs_raw)
+    t_max_min = T * sec_per_dec / 60.0
+    time_dec_min = (np.arange(T) + 0.5) * sec_per_dec / 60.0
+    warmup_min = max(0, int(warmup)) * sec_per_dec / 60.0
+
+    R = int(fhr.shape[0]) if (fhr is not None and fhr.ndim == 1) else int(T * decim)
+    time_raw_min = np.arange(R) / float(fs_raw) / 60.0
+
+    # Lag axis in minutes. Lag k represents an offset of
+    # k × sec_per_dec seconds into the past; we plot k at its bin
+    # centre in minutes.
+    lag_edges_min = np.arange(L + 1) * sec_per_dec / 60.0  # (L+1,)
+    lag_centers_min = (lag_edges_min[:-1] + lag_edges_min[1:]) / 2.0
+    lag_span_min = float(lag_edges_min[-1])
+
+    # Head-averaged attention.
+    alpha_bar = attn_weights.mean(axis=1)   # (T, L)
+
+    # Warmup mask over anchors.
+    valid_mask = np.ones(T, dtype=bool)
+    warm = min(max(0, int(warmup)), T)
+    valid_mask[:warm] = False
+
+    # Argmax lag per anchor (head-averaged).
+    argmax_idx = alpha_bar.argmax(axis=1)                   # (T,)
+    argmax_lag_min = argmax_idx.astype(float) * sec_per_dec / 60.0
+    argmax_lag_min_masked = argmax_lag_min.copy()
+    argmax_lag_min_masked[~valid_mask] = np.nan
+
+    # Per-head Shannon entropy (nats).
+    eps = 1e-12
+    safe_attn = np.clip(attn_weights, eps, None)
+    entropy_per_head = -(safe_attn * np.log(safe_attn)).sum(axis=-1)  # (T, M)
+    mean_entropy = entropy_per_head.mean(axis=1)                      # (T,)
+    mean_entropy_masked = mean_entropy.copy()
+    mean_entropy_masked[~valid_mask] = np.nan
+
+    # Time-averaged attention mass per lag (over valid anchors).
+    if valid_mask.any():
+        alpha_mass_by_lag = alpha_bar[valid_mask].mean(axis=0)        # (L,)
+    else:
+        alpha_mass_by_lag = np.zeros(L)
+
+    # --- Figure layout ---
+    fig = plt.figure(figsize=(12, 14))
+    gs = GridSpec(
+        5, 1, figure=fig,
+        hspace=0.55,
+        height_ratios=[1.0, 1.9, 1.9, 1.1, 1.2],
+        left=0.10, right=0.95, top=0.94, bottom=0.06,
     )
 
-    # Create DataLoader
-    logger.info("Creating test dataloader...")
-    resolved_kwargs = settings.get("dataset_kwargs", {}) or {}
-    if "pin_memory" not in resolved_kwargs:
-        resolved_kwargs["pin_memory"] = True
-
-    loader = create_optimized_dataloader(
-        hdf5_files=[str(p) for p in settings["data_paths"]],
-        batch_size=settings["batch_size"],
-        num_workers=settings["num_workers"],
-        shuffle=False,
-        stats_path=settings["stats_path"],
-        normalize_fields=settings["normalize_fields"],
-        rank=0,
-        world_size=1,
-        **resolved_kwargs,
+    # --- Row 0: Raw signals ---
+    ax_raw = fig.add_subplot(gs[0, 0])
+    _draw_raw_panel(
+        ax_raw,
+        fhr=fhr, up=up,
+        time_raw_min=time_raw_min,
+        t_max_min=t_max_min,
+        warmup_min=warmup_min,
+        title="Raw FHR / UP",
     )
 
-    total_samples = len(loader.dataset)
-    logger.info(f"Total samples in dataset: {total_samples}")
+    # --- Row 1: Attention matrix head-averaged ---
+    ax_attn = fig.add_subplot(gs[1, 0])
+    _draw_heatmap_min(
+        ax_attn, alpha_bar.T,  # (L, T)
+        t_max_min=t_max_min,
+        cmap="viridis",
+        ylabel="Lag (min)",
+        title=r"Head-averaged lag attention  $\bar{\alpha}(t, k)$",
+        colorbar_label="attention",
+        y_extent=lag_span_min,
+    )
+    ax_attn.set_ylim(0.0, lag_span_min)
+    ax_attn.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    _shade_warmup_min(ax_attn, warmup_min)
+    # Overlay argmax-lag curve (in minutes).
+    if valid_mask.any():
+        ax_attn.plot(
+            time_dec_min[valid_mask],
+            argmax_lag_min_masked[valid_mask],
+            color=COLOR_VERMILLION,
+            linewidth=0.9,
+            alpha=0.9,
+            label="argmax lag",
+        )
+        ax_attn.legend(loc="upper right", fontsize=6, frameon=True)
 
-    # Get normalization stats
-    stats = _get_normalization_stats(loader)
+    # --- Row 2: TE lag attribution ---
+    ax_te = fig.add_subplot(gs[2, 0])
+    _draw_heatmap_min(
+        ax_te, te_lag_map.T,
+        t_max_min=t_max_min,
+        cmap="inferno",
+        vmin=0.0,
+        ylabel="Lag (min)",
+        title=r"TE lag attribution  $\mathrm{KL}_t \cdot \bar{\alpha}(t, k)$",
+        colorbar_label="TE mass",
+        y_extent=lag_span_min,
+    )
+    ax_te.set_ylim(0.0, lag_span_min)
+    ax_te.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    _shade_warmup_min(ax_te, warmup_min)
 
-    # Select random sample indices
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-
-    n_samples = min(n_samples, total_samples)
-    selected_indices = sorted(random.sample(range(total_samples), n_samples))
-    logger.info(f"Selected sample indices: {selected_indices}")
-
-    # Create output directory
-    output_path = Path(settings["output_dir"])
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Process selected samples
-    results: Dict[str, Any] = {
-        "n_samples": n_samples,
-        "selected_indices": selected_indices,
-        "samples": [],
-    }
-
-    processed = 0
-    current_batch_start = 0
-
-    with runner.inference_mode():
-        for batch in runner.iter_batches(loader, max_samples=None):
-            batch_size_actual = batch.fhr_st.size(0)
-            batch_end = current_batch_start + batch_size_actual
-
-            # Check if any selected indices are in this batch
-            batch_indices = [
-                (i, idx - current_batch_start)
-                for i, idx in enumerate(selected_indices)
-                if current_batch_start <= idx < batch_end
-            ]
-
-            if batch_indices:
-                # Run forward pass
-                outputs = runner.forward(batch)
-
-                for _, idx_in_batch in batch_indices:
-                    # Extract sample info
-                    guid = _extract_guid(batch, idx_in_batch)
-                    epoch = _extract_epoch(batch, idx_in_batch)
-                    label = _extract_label(batch, idx_in_batch)
-
-                    # Create unique sample name for filename
-                    sample_name = _sanitize_folder_name(guid or f"sample_{processed}", epoch or 0.0)
-
-                    logger.info(f"Processing sample {processed + 1}/{n_samples}: GUID={guid}, Epoch={epoch}")
-
-                    # Plot all single-sample plots (save directly to output_path)
-                    plot_paths = _plot_all_single_sample_plots(
-                        runner=runner,
-                        batch=batch,
-                        idx=idx_in_batch,
-                        outputs=outputs,
-                        sample_dir=output_path,
-                        sample_name=sample_name,
-                        stats=stats,
-                        fs=fs,
-                        beta=beta,
-                        skip_interactive=skip_interactive,
-                        dim_reduction_method=dim_reduction_method,
-                    )
-
-                    results["samples"].append({
-                        "guid": guid,
-                        "epoch": epoch,
-                        "label": label,
-                        "output_dir": str(output_path),
-                        "plots": plot_paths,
-                    })
-
-                    processed += 1
-
-            current_batch_start = batch_end
-
-            if processed >= n_samples:
-                break
-
-    logger.info(f"Completed! Generated plots for {processed} samples in {output_path}")
-    return results
-
-
-# ----- Main entry point -----
-if __name__ == "__main__":
-    # Default configuration - edit these for your setup
-    CONFIG_PATH = "model/vae_teb_prediction/config.yaml"
-    N_SAMPLES = 5
-    SEED = 42
-
-    # Run the plotting
-    results = plot_single_samples(
-        config_path=CONFIG_PATH,
-        n_samples=N_SAMPLES,
-        seed=SEED,
-        skip_interactive=False,
-        dim_reduction_method="pca",
+    # --- Row 3: Attention analysis — argmax lag + entropy over time ---
+    ax_ana = fig.add_subplot(gs[3, 0])
+    ax_ana.plot(
+        time_dec_min, argmax_lag_min_masked,
+        color=COLOR_BLUE, linewidth=1.0, label="argmax lag",
+    )
+    ax_ana.set_xlim(0.0, t_max_min)
+    ax_ana.set_ylim(0.0, lag_span_min * 1.05)
+    ax_ana.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    ax_ana.set_ylabel("Argmax lag (min)", fontsize=FONT_LABEL, color=COLOR_BLUE)
+    ax_ana.tick_params(axis="y", colors=COLOR_BLUE, labelsize=6)
+    ax_ana.set_title(
+        "Attention analysis: argmax lag & head-averaged entropy",
+        fontsize=FONT_LABEL, fontweight="normal",
     )
 
-    # Print summary
-    print(f"\n=== Single Sample Plots ===")
-    print(f"Samples processed: {results['n_samples']}")
-    for sample in results["samples"]:
-        print(f"\n  GUID: {sample['guid']}")
-        print(f"  Epoch: {sample['epoch']}")
-        print(f"  Folder: {sample['folder']}")
-        print(f"  Plots: {len(sample['plots'])}")
+    ax_ent = ax_ana.twinx()
+    ax_ent.plot(
+        time_dec_min, mean_entropy_masked,
+        color=COLOR_VERMILLION, linewidth=0.9, alpha=0.85, label="entropy",
+    )
+    ax_ent.set_ylabel("Entropy (nats)", fontsize=FONT_LABEL, color=COLOR_VERMILLION)
+    ax_ent.tick_params(axis="y", colors=COLOR_VERMILLION, labelsize=6)
+
+    _shade_warmup_min(ax_ana, warmup_min)
+    _style_axes(ax_ana, grid="major", minor_ticks=True)
+
+    # --- Row 4: Lag analysis — time-averaged attention mass per lag ---
+    ax_lag = fig.add_subplot(gs[4, 0])
+    bin_width = float(sec_per_dec / 60.0)
+    ax_lag.bar(
+        lag_centers_min,
+        alpha_mass_by_lag,
+        width=bin_width * 0.95,
+        color=COLOR_BLUE,
+        alpha=0.85,
+        edgecolor=COLOR_BLACK,
+        linewidth=0.3,
+    )
+    if alpha_mass_by_lag.size and np.isfinite(alpha_mass_by_lag).any():
+        peak_idx = int(np.nanargmax(alpha_mass_by_lag))
+        peak_lag = float(lag_centers_min[peak_idx])
+        ax_lag.axvline(
+            peak_lag,
+            color=COLOR_VERMILLION,
+            linewidth=0.8,
+            linestyle="--",
+            label=f"peak={peak_lag:.2f} min",
+        )
+        ax_lag.legend(loc="upper right", fontsize=6, frameon=True)
+    ax_lag.set_xlim(0.0, lag_span_min)
+    ax_lag.set_xlabel("Lag (min)", fontsize=FONT_LABEL)
+    ax_lag.set_ylabel(r"Time-averaged $\bar{\alpha}(k)$", fontsize=FONT_LABEL)
+    ax_lag.set_title(
+        "Lag analysis: time-averaged attention mass per lag",
+        fontsize=FONT_LABEL, fontweight="normal",
+    )
+    _style_axes(ax_lag, grid="major", minor_ticks=True)
+
+    # --- Title bar ---
+    title_bits = []
+    if guid is not None:
+        title_bits.append(f"guid={guid}")
+    if epoch is not None:
+        title_bits.append(f"epoch={float(epoch):.0f}s")
+    if label is not None:
+        title_bits.append(f"class={label}")
+    if title_bits:
+        fig.suptitle(
+            "  |  ".join(title_bits),
+            fontsize=FONT_TITLE, fontweight="normal", y=0.995,
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+__all__ = [
+    "plot_sample_lag_attn_diagnostic",
+    "plot_sample_signals_kld",
+    "plot_sample_lag_attention",
+]
