@@ -2407,7 +2407,7 @@ def plot_feature_forecast_heatmap(
         if warmup > 0 and warmup < T_valid:
             ax.axvspan(-0.5, warmup - 0.5, color=COLOR_GRAY, alpha=0.15)
         ax.set_ylabel(panel_title, fontsize=FONT_LABEL)
-        _add_colorbar(ax, im, label="")
+        _add_colorbar(fig, im, ax, label="")
 
     axes[-1].set_xlabel("Anchor t", fontsize=FONT_LABEL)
     fig.suptitle(title, fontsize=FONT_TITLE, fontweight="normal")
@@ -2597,7 +2597,7 @@ def plot_lag_attention_heatmap(
         interpolation="nearest",
         extent=(-0.5, T - 0.5, -0.5, L - 0.5),
     )
-    _add_colorbar(ax, im, label="attention")
+    _add_colorbar(fig, im, ax, label="attention")
 
     # Overlay argmax lag curve, skipping warmup sentinel (-1).
     valid = argmax_lag >= 0
