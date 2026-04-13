@@ -182,12 +182,42 @@ def collect_metrics(
             )
             kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
 
+            # Per-dim KLD (closed-form), averaged over the post-warmup
+            # anchor range. Enables the per-dimension heatmap in the
+            # TE_Calculated pipeline. Only emitted when all four moment
+            # tensors are present on the forward output.
+            per_dim_means: Optional[Any] = None
+            if (
+                "mu_prior" in outputs
+                and "logvar_prior" in outputs
+                and "mu_post" in outputs
+                and "logvar_post" in outputs
+            ):
+                mu_prior = outputs["mu_prior"]
+                logvar_prior = outputs["logvar_prior"]
+                mu_post = outputs["mu_post"]
+                logvar_post = outputs["logvar_post"]
+                kld_per_dim_t = 0.5 * (
+                    logvar_prior
+                    - logvar_post
+                    + (logvar_post.exp() + (mu_post - mu_prior) ** 2)
+                    / logvar_prior.exp()
+                    - 1.0
+                )  # (B, T, d_z)
+                T = kld_per_dim_t.shape[1]
+                warm = min(max(0, int(runner.warmup_steps)), T)
+                if warm < T:
+                    kld_valid = kld_per_dim_t[:, warm:, :]
+                else:
+                    kld_valid = kld_per_dim_t
+                per_dim_means = kld_valid.mean(dim=1).detach().cpu().numpy()
+
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
 
                 kld_val = float(kld_sample[idx].cpu().item())
-                records.append({
+                record: Dict[str, Any] = {
                     "guid": _extract_guid(batch, idx),
                     "epoch": _extract_epoch(batch, idx),
                     "label": _extract_label(batch, idx),
@@ -201,7 +231,12 @@ def collect_metrics(
                     "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
                     "kld_mean": kld_val,
                     "kld": kld_val,  # alias for backward compatibility
-                })
+                }
+                if per_dim_means is not None:
+                    dim_vec = per_dim_means[idx]
+                    for d in range(dim_vec.shape[0]):
+                        record[f"kld_dim_{d}"] = float(dim_vec[d])
+                records.append(record)
                 processed += 1
 
             if max_samples and processed >= max_samples:
