@@ -103,6 +103,69 @@ def _shade_warmup_min(ax: plt.Axes, warmup_min: float) -> None:
         ax.axvspan(0.0, warmup_min, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
 
+def _mask_warmup_time_axis(
+    data: np.ndarray, warmup: int, axis: int = -1
+) -> np.ndarray:
+    """Return a float copy of ``data`` with the warmup prefix NaN-masked.
+
+    Matplotlib's ``imshow`` renders NaN values as transparent and they are
+    ignored by auto ``vmin``/``vmax`` scaling, so NaN-masking the warmup
+    region hides any start-of-sample anomalies and prevents them from
+    compressing the colour/value range of the rest of the plot.
+
+    Args:
+        data: Array whose ``axis`` dimension is the time axis.
+        warmup: Number of leading steps on ``axis`` to mask. Values
+            ``<= 0`` leave ``data`` unchanged.
+        axis: Time-axis dimension (default last axis).
+
+    Returns:
+        A NaN-masked float copy of ``data``. Returns ``data`` unchanged
+        when ``warmup <= 0``.
+    """
+    if data is None or warmup is None or warmup <= 0:
+        return data
+    if not np.issubdtype(data.dtype, np.floating):
+        out = data.astype(np.float32, copy=True)
+    else:
+        out = data.copy()
+    n = out.shape[axis]
+    k = min(int(warmup), n)
+    if k <= 0:
+        return out
+    slicer: list = [slice(None)] * out.ndim
+    slicer[axis] = slice(0, k)
+    out[tuple(slicer)] = np.nan
+    return out
+
+
+def _mask_warmup_signal(
+    signal: Optional[np.ndarray],
+    time_min: np.ndarray,
+    warmup_min: float,
+) -> Optional[np.ndarray]:
+    """NaN-mask a 1-D signal where ``time_min < warmup_min``.
+
+    Args:
+        signal: 1-D signal (e.g., raw FHR / UP trace) or ``None``.
+        time_min: Matching time axis in minutes.
+        warmup_min: Warmup duration in minutes.
+
+    Returns:
+        A float copy of ``signal`` with samples in the warmup region set
+        to NaN. Returns ``signal`` unchanged if it is ``None`` or the
+        warmup window is empty.
+    """
+    if signal is None or warmup_min is None or warmup_min <= 0:
+        return signal
+    n = min(len(signal), len(time_min))
+    out = np.asarray(signal, dtype=np.float32).copy()
+    out = out[:n]
+    mask = time_min[:n] < float(warmup_min)
+    out[mask] = np.nan
+    return out
+
+
 def _draw_raw_panel(
     ax: plt.Axes,
     *,
@@ -128,8 +191,9 @@ def _draw_raw_panel(
     drawn = False
     if fhr is not None and fhr.ndim == 1:
         n = min(len(fhr), len(time_raw_min))
+        fhr_plot = _mask_warmup_signal(fhr[:n], time_raw_min[:n], warmup_min)
         ax.plot(
-            time_raw_min[:n], fhr[:n],
+            time_raw_min[:n], fhr_plot,
             color=COLOR_BLUE, linewidth=0.7, label="FHR",
         )
         ax.set_ylabel("FHR (bpm)", fontsize=FONT_LABEL, color=COLOR_BLUE)
@@ -138,8 +202,9 @@ def _draw_raw_panel(
     if up is not None and up.ndim == 1:
         ax_up = ax.twinx()
         n = min(len(up), len(time_raw_min))
+        up_plot = _mask_warmup_signal(up[:n], time_raw_min[:n], warmup_min)
         ax_up.plot(
-            time_raw_min[:n], up[:n],
+            time_raw_min[:n], up_plot,
             color=COLOR_VERMILLION, linewidth=0.7, alpha=0.85, label="UP",
         )
         ax_up.set_ylabel("UP (mmHg)", fontsize=FONT_LABEL, color=COLOR_VERMILLION)
@@ -363,29 +428,45 @@ def plot_sample_lag_attn_diagnostic(
     )  # (L, T)
 
     # -------- Layout --------
+    # Taller per-row height (1.55" vs. the previous 1.15") removes the
+    # empty space at the top of the saved PDF and gives each imshow panel
+    # enough room to breathe.
     n_rows = 8
     fig, axes = plt.subplots(
         n_rows, 1,
-        figsize=(8.6, 1.15 * n_rows + 2.0),
-        gridspec_kw={"hspace": 0.45},
+        figsize=(8.6, 1.55 * n_rows + 1.2),
+        gridspec_kw={"hspace": 0.5},
         sharex=True,
     )
+
+    # Warmup mask — hides start-of-sample anomalies from imshow auto
+    # scaling and from the raw-signal y-limits. ``time_raw`` is seconds
+    # here (not minutes), so the warmup threshold is also in seconds.
+    warm = max(0, int(warmup))
+    sec_per_dec = float(_DEFAULT_DECIM) / float(fs_raw)
+    warmup_s = warm * sec_per_dec
 
     # Row 0: Raw FHR / UP traces (if present).
     ax = axes[0]
     drawn = False
     if fhr_arr is not None and fhr_arr.ndim == 1:
         n = min(len(fhr_arr), len(time_raw))
+        fhr_plot = np.asarray(fhr_arr[:n], dtype=np.float32).copy()
+        if warmup_s > 0:
+            fhr_plot[time_raw[:n] < warmup_s] = np.nan
         ax.plot(
-            time_raw[:n], fhr_arr[:n],
+            time_raw[:n], fhr_plot,
             color=COLOR_BLUE, linewidth=0.7, label="FHR",
         )
         drawn = True
     if up_arr is not None and up_arr.ndim == 1:
         ax2 = ax.twinx()
         n = min(len(up_arr), len(time_raw))
+        up_plot = np.asarray(up_arr[:n], dtype=np.float32).copy()
+        if warmup_s > 0:
+            up_plot[time_raw[:n] < warmup_s] = np.nan
         ax2.plot(
-            time_raw[:n], up_arr[:n],
+            time_raw[:n], up_plot,
             color=COLOR_VERMILLION, linewidth=0.7, alpha=0.8, label="UP",
         )
         ax2.tick_params(axis="y", colors=COLOR_VERMILLION, labelsize=6)
@@ -399,48 +480,59 @@ def plot_sample_lag_attn_diagnostic(
     ax.set_xlim(0.0, t_max)
     _style_axes(ax, grid="major", minor_ticks=False)
 
+    # NaN-mask the warmup region on every (rows, T) imshow so start-of-
+    # sample anomalies do not compress the colour scale of the rest of
+    # the plot.
+    mu_full_img_m = _mask_warmup_time_axis(mu_full_img, warm, axis=-1)
+    y_plus_img_m = _mask_warmup_time_axis(y_plus_img, warm, axis=-1)
+    residual_img_m = _mask_warmup_time_axis(residual_img, warm, axis=-1)
+    z_img_m = _mask_warmup_time_axis(z_img, warm, axis=-1)
+    kld_per_dim_img_m = _mask_warmup_time_axis(kld_per_dim_img, warm, axis=-1)
+    attn_mean_m = _mask_warmup_time_axis(attn_mean, warm, axis=-1)
+    te_lag_img_m = _mask_warmup_time_axis(te_lag_img, warm, axis=-1)
+
     # Row 1: mu_full_avg (C, T).
     _imshow_panel(
-        axes[1], mu_full_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        axes[1], mu_full_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="mu_full_avg", separator_row=fhr_st_end - 1,
         title="Average feature forecast (mu_full)",
     )
 
     # Row 2: y_plus_avg (C, T).
     _imshow_panel(
-        axes[2], y_plus_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        axes[2], y_plus_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="y_plus_avg", separator_row=fhr_st_end - 1,
         title="Ground truth (y_plus)",
     )
 
     # Row 3: residual (C, T).
     _imshow_panel(
-        axes[3], residual_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        axes[3], residual_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="residual", separator_row=fhr_st_end - 1,
         title="mu_full - y_plus",
     )
 
     # Row 4: latent z.
     _imshow_panel(
-        axes[4], z_img, t_max=t_max, cmap="RdBu_r", symmetric=True,
+        axes[4], z_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="z", title="Latent z",
     )
 
     # Row 5: KLD per dim.
     _imshow_panel(
-        axes[5], kld_per_dim_img, t_max=t_max, cmap="magma", vmin=0.0,
+        axes[5], kld_per_dim_img_m, t_max=t_max, cmap="magma", vmin=0.0,
         ylabel="KL per dim", title="KL(q||p) per latent dim",
     )
 
     # Row 6: Lag attention (L, T).
     _imshow_panel(
-        axes[6], attn_mean, t_max=t_max, cmap="viridis",
+        axes[6], attn_mean_m, t_max=t_max, cmap="viridis",
         ylabel="lag k", title="Head-averaged lag attention",
     )
 
     # Row 7: TE lag attribution.
     _imshow_panel(
-        axes[7], te_lag_img, t_max=t_max, cmap="inferno", vmin=0.0,
+        axes[7], te_lag_img_m, t_max=t_max, cmap="inferno", vmin=0.0,
         ylabel="lag k", title="TE lag attribution",
     )
 
@@ -548,25 +640,28 @@ def plot_sample_signals_kld(
     time_raw_min = np.arange(R) / float(fs_raw) / 60.0
 
     # --- Layout ---
+    # Per-dim KLD traces are stacked one-per-row at the same width as the
+    # raw FHR / UP panel, so each latent dimension gets the full time
+    # axis instead of being crammed into a narrow grid cell.
     use_up_st = up_st is not None and up_st.ndim == 2
-    n_cols = min(6, max(1, d_z))
-    n_kld_rows = int(np.ceil(d_z / n_cols))
+    n_cols = 1
+    n_kld_rows = int(d_z)
     n_top_rows = 2 + (1 if use_up_st else 0)  # raw, fhr_st, optional up_st
     n_bot_rows = 1                              # mean ± std
     n_total = n_top_rows + n_kld_rows + n_bot_rows
 
     height_ratios = (
         [1.1] * n_top_rows
-        + [0.75] * n_kld_rows
+        + [0.45] * n_kld_rows
         + [1.25] * n_bot_rows
     )
-    fig_h = 1.3 * n_top_rows + 0.9 * n_kld_rows + 1.6
+    fig_h = 1.6 * n_top_rows + 0.7 * n_kld_rows + 1.8
     fig = plt.figure(figsize=(14, fig_h))
     gs = GridSpec(
         n_total, n_cols, figure=fig,
-        hspace=0.65, wspace=0.35,
+        hspace=0.55, wspace=0.25,
         height_ratios=height_ratios,
-        left=0.07, right=0.96, top=0.95, bottom=0.05,
+        left=0.07, right=0.96, top=0.96, bottom=0.04,
     )
 
     # --- Row 0: Raw signals ---
@@ -582,10 +677,15 @@ def plot_sample_signals_kld(
     )
     row += 1
 
+    # Warmup mask in decimated steps: values before ``warmup`` are NaN so
+    # start-of-sample anomalies do not compress the colour/value scales.
+    warm_dec = max(0, int(warmup))
+
     # --- Row 1: FHR scattering transform (channels on y, time on x) ---
+    fhr_st_img = _mask_warmup_time_axis(fhr_st.T, warm_dec, axis=-1)
     ax_fhr = fig.add_subplot(gs[row, :])
     _draw_heatmap_min(
-        ax_fhr, fhr_st.T,
+        ax_fhr, fhr_st_img,
         t_max_min=t_max_min, cmap="viridis",
         ylabel="fhr_st ch",
         title="FHR scattering transform",
@@ -596,9 +696,10 @@ def plot_sample_signals_kld(
 
     # --- Row 2 (optional): UP scattering transform ---
     if use_up_st:
+        up_st_img = _mask_warmup_time_axis(up_st.T, warm_dec, axis=-1)  # type: ignore[union-attr]
         ax_up_st = fig.add_subplot(gs[row, :])
         _draw_heatmap_min(
-            ax_up_st, up_st.T,  # type: ignore[union-attr]
+            ax_up_st, up_st_img,
             t_max_min=t_max_min, cmap="viridis",
             ylabel="up_st ch",
             title="UP scattering transform",
@@ -607,19 +708,20 @@ def plot_sample_signals_kld(
         _shade_warmup_min(ax_up_st, warmup_min)
         row += 1
 
-    # --- KLD per-dim grid ---
+    # --- Per-dim KLD traces (one full-width subplot per dim) ---
+    # Warmup samples are NaN-masked so they are not plotted and do not
+    # enter the per-dim auto y-limits.
+    kld_plot = _mask_warmup_time_axis(kld_per_dim, warm_dec, axis=0)
     kld_grid_start = row
     for d in range(d_z):
-        r = kld_grid_start + d // n_cols
-        c = d % n_cols
-        ax_d = fig.add_subplot(gs[r, c])
-        vals = kld_per_dim[:, d]
+        ax_d = fig.add_subplot(gs[kld_grid_start + d, 0])
+        vals = kld_plot[:, d]
         finite_vals = vals[np.isfinite(vals)]
         y_peak = float(np.nanmax(finite_vals)) if finite_vals.size else 0.0
 
         ax_d.plot(
             time_dec_min, vals,
-            color=COLOR_PURPLE, linewidth=0.8, alpha=0.95,
+            color=COLOR_PURPLE, linewidth=0.9, alpha=0.95,
         )
         ax_d.axhline(0.0, color=COLOR_GRAY, linewidth=0.3, linestyle=":")
         ax_d.set_xlim(0.0, t_max_min)
@@ -628,31 +730,20 @@ def plot_sample_signals_kld(
                 min(0.0, float(np.nanmin(finite_vals)) * 1.05),
                 y_peak * 1.1,
             )
-        ax_d.set_title(f"dim {d}", fontsize=6, pad=2)
-        ax_d.tick_params(axis="both", labelsize=5)
+        ax_d.set_ylabel(f"dim {d}", fontsize=FONT_LABEL)
+        ax_d.tick_params(axis="both", labelsize=6)
         ax_d.grid(True, which="major", alpha=0.2, linewidth=0.3)
         _shade_warmup_min(ax_d, warmup_min)
 
-        # Only bottom row of the grid carries x-tick labels; leftmost
-        # column carries y-tick labels.
-        if r != kld_grid_start + n_kld_rows - 1:
+        # Only the last per-dim row carries x-tick labels.
+        if d != d_z - 1:
             ax_d.tick_params(labelbottom=False)
-        if c != 0:
-            ax_d.tick_params(labelleft=False)
-
-    # Hide any empty slots when d_z < n_kld_rows * n_cols.
-    total_slots = n_kld_rows * n_cols
-    for d in range(d_z, total_slots):
-        r = kld_grid_start + d // n_cols
-        c = d % n_cols
-        ax_empty = fig.add_subplot(gs[r, c])
-        ax_empty.set_visible(False)
     row += n_kld_rows
 
     # --- Bottom: Mean ± std KLD over dimensions ---
     ax_mean = fig.add_subplot(gs[row, :])
-    mean_kld = np.nanmean(kld_per_dim, axis=1)
-    std_kld = np.nanstd(kld_per_dim, axis=1)
+    mean_kld = np.nanmean(kld_plot, axis=1)
+    std_kld = np.nanstd(kld_plot, axis=1)
     ax_mean.fill_between(
         time_dec_min,
         mean_kld - std_kld,
@@ -817,10 +908,16 @@ def plot_sample_lag_attention(
         title="Raw FHR / UP",
     )
 
+    # Warmup-masked copies: the (L, T) heatmaps have time on axis=-1, so
+    # masking leading columns hides the warmup region from both imshow
+    # and auto vmin/vmax scaling.
+    alpha_bar_img = _mask_warmup_time_axis(alpha_bar.T, warm, axis=-1)
+    te_lag_img = _mask_warmup_time_axis(te_lag_map.T, warm, axis=-1)
+
     # --- Row 1: Attention matrix head-averaged ---
     ax_attn = fig.add_subplot(gs[1, 0])
     _draw_heatmap_min(
-        ax_attn, alpha_bar.T,  # (L, T)
+        ax_attn, alpha_bar_img,  # (L, T)
         t_max_min=t_max_min,
         cmap="viridis",
         ylabel="Lag (min)",
@@ -846,7 +943,7 @@ def plot_sample_lag_attention(
     # --- Row 2: TE lag attribution ---
     ax_te = fig.add_subplot(gs[2, 0])
     _draw_heatmap_min(
-        ax_te, te_lag_map.T,
+        ax_te, te_lag_img,
         t_max_min=t_max_min,
         cmap="inferno",
         vmin=0.0,

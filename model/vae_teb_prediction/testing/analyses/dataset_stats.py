@@ -61,52 +61,109 @@ def seconds_to_hours_minutes(seconds: float) -> Tuple[int, int]:
 
 
 def collect_dataset_stats(loader: Any) -> pd.DataFrame:
-    """
-    Collect metadata from all samples in the dataloader.
+    """Collect metadata from all samples in the dataloader.
+
+    Fields ``guid`` and ``epoch`` are required. ``cs_label`` and
+    ``bg_label`` are optional — when a batch doesn't carry them (because
+    they weren't listed in the config's ``dataset_kwargs.load_fields``,
+    or the HDF5 file doesn't have those datasets), the corresponding
+    columns default to ``0`` for all samples and a one-time warning is
+    logged so downstream label-by-class plots register the absence
+    rather than crashing.
 
     Args:
         loader: PyTorch DataLoader for test data.
 
     Returns:
-        DataFrame with columns: [guid, epoch, cs_label, bg_label]
-        where epoch is in seconds before birth (negative values).
+        DataFrame with columns ``[guid, epoch_seconds, cs_label,
+        bg_label]`` where ``epoch_seconds`` is seconds before birth
+        (negative values).
     """
     records = []
+    warned_missing: set = set()
+
+    def _as_array(value: Any) -> Any:
+        """Normalise a batch field to something indexable (or None)."""
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "numpy"):
+            try:
+                value = value.numpy()
+            except Exception:  # noqa: BLE001
+                pass
+        return value
+
+    def _safe_len(value: Any) -> int:
+        """Return ``len(value)`` when defined, else 0."""
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return 0
 
     for batch in loader:
-        # Extract metadata from batch
-        guids = batch.get("guid", [])
-        epochs = batch.get("epoch", [])
-        cs_labels = batch.get("cs_label", [])
-        bg_labels = batch.get("bg_label", [])
+        # Required metadata.
+        guids = _as_array(batch.get("guid", None))
+        epochs = _as_array(batch.get("epoch", None))
+        if guids is None or epochs is None:
+            if "required" not in warned_missing:
+                logger.warning(
+                    "dataset_stats: batch is missing 'guid' or 'epoch' — "
+                    "skipping. Ensure these are in dataset_kwargs.load_fields."
+                )
+                warned_missing.add("required")
+            continue
 
-        # Handle tensor vs list for different metadata types
-        if hasattr(guids, "numpy"):
-            guids = guids.numpy()
-        if hasattr(epochs, "numpy"):
-            epochs = epochs.numpy()
-        if hasattr(cs_labels, "numpy"):
-            cs_labels = cs_labels.numpy()
-        if hasattr(bg_labels, "numpy"):
-            bg_labels = bg_labels.numpy()
+        batch_size = _safe_len(guids) or _safe_len(epochs) or 1
 
-        batch_size = len(guids) if hasattr(guids, "__len__") else 1
+        # Optional label fields. If missing (or present but shorter than
+        # the batch), fall back to zeros.
+        cs_labels = _as_array(batch.get("cs_label", None))
+        bg_labels = _as_array(batch.get("bg_label", None))
+        if cs_labels is None or _safe_len(cs_labels) < batch_size:
+            if "cs_label" not in warned_missing:
+                logger.warning(
+                    "dataset_stats: 'cs_label' not found in batch — "
+                    "defaulting to 0 for all samples. Add 'cs_label' to "
+                    "dataset_kwargs.load_fields to populate it."
+                )
+                warned_missing.add("cs_label")
+            cs_labels = None
+        if bg_labels is None or _safe_len(bg_labels) < batch_size:
+            if "bg_label" not in warned_missing:
+                logger.warning(
+                    "dataset_stats: 'bg_label' not found in batch — "
+                    "defaulting to 0 for all samples. Add 'bg_label' to "
+                    "dataset_kwargs.load_fields to populate it."
+                )
+                warned_missing.add("bg_label")
+            bg_labels = None
+
+        def _index(arr: Any, i: int, default: Any) -> Any:
+            if arr is None:
+                return default
+            try:
+                return arr[i]
+            except (IndexError, KeyError, TypeError):
+                return default
 
         for i in range(batch_size):
-            guid = guids[i] if hasattr(guids, "__getitem__") else guids
-            epoch = epochs[i] if hasattr(epochs, "__getitem__") else epochs
-            cs_label = cs_labels[i] if hasattr(cs_labels, "__getitem__") else cs_labels
-            bg_label = bg_labels[i] if hasattr(bg_labels, "__getitem__") else bg_labels
+            guid = _index(guids, i, "unknown")
+            epoch = _index(epochs, i, 0.0)
+            cs_label = _index(cs_labels, i, 0)
+            bg_label = _index(bg_labels, i, 0)
 
-            # Convert bytes to string if needed
             if isinstance(guid, bytes):
                 guid = guid.decode("utf-8")
 
             records.append({
-                "guid": guid,
+                "guid": str(guid),
                 "epoch_seconds": float(epoch),  # seconds before birth (negative)
-                "cs_label": int(cs_label),
-                "bg_label": int(bg_label),
+                "cs_label": int(bool(cs_label)),
+                "bg_label": int(bool(bg_label)),
             })
 
     return pd.DataFrame(records)
