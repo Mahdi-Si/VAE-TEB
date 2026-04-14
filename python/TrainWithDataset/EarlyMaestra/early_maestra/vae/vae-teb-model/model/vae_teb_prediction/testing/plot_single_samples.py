@@ -29,7 +29,7 @@ Example:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -641,9 +641,10 @@ def _draw_heatmap_direct(
         ax.axhline(
             y=float(separator_row),
             color=COLOR_BLACK,
-            linewidth=0.7,
+            linewidth=1.0,
             linestyle="-",
-            alpha=0.9,
+            alpha=1.0,
+            zorder=5,
         )
     ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
     if title:
@@ -934,6 +935,10 @@ def plot_sample_lag_attention(
     te_lag_map: np.ndarray,
     warmup: int,
     out_path: Path,
+    fhr_st: Optional[np.ndarray] = None,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_st: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
@@ -945,16 +950,25 @@ def plot_sample_lag_attention(
     The figure stacks, top to bottom:
 
     1. Raw FHR and UP traces (context strip).
-    2. Head-averaged lag attention ``α̅(t, k)`` as a ``(L, T)`` heatmap
+    2. FHR features — ``fhr_st`` concatenated with ``fhr_ph`` (if
+       provided), separated by a solid black horizontal line. Skipped
+       entirely when no FHR-feature arrays are passed.
+    3. UP features — ``up_st`` concatenated with ``up_ph`` (if
+       provided), with the same black-separator convention.
+    4. Head-averaged lag attention ``α̅(t, k)`` as a ``(L, T)`` heatmap
        with the **y-axis expressed in minutes** — ``lag_minutes[k] =
        k × decim / fs_raw / 60`` (4-second steps by default).
-    3. TE lag attribution ``kld_per_t × mean_heads(α)`` on the same
+    5. TE lag attribution ``kld_per_t × mean_heads(α)`` on the same
        time-in-minutes × lag-in-minutes grid.
-    4. Attention analysis: argmax lag per anchor (blue, left y-axis,
+    6. Attention analysis: argmax lag per anchor (blue, left y-axis,
        in minutes) and head-averaged Shannon entropy (orange, right
        y-axis, in nats). Both curves are warmup-masked.
-    5. Lag analysis: time-averaged head-averaged attention distribution
+    7. Lag analysis: time-averaged head-averaged attention distribution
        as a bar chart with the lag axis in minutes.
+
+    Column-one panels and heatmap colorbars live in separate GridSpec
+    columns, so every main panel keeps the same horizontal extent and
+    the stack aligns vertically edge-to-edge.
 
     Args:
         fhr: Raw FHR trace ``(R,)`` or ``None``.
@@ -963,6 +977,16 @@ def plot_sample_lag_attention(
         te_lag_map: TE lag attribution ``(T, L)``.
         warmup: Warmup decimated steps.
         out_path: Destination PDF/PNG.
+        fhr_st: Normalised FHR scattering features ``(T, C_st)`` or
+            ``None``. If ``None`` the FHR feature panel is skipped.
+        fhr_ph: Normalised FHR phase-harmonic features ``(T, C_ph)`` or
+            ``None``. When provided together with ``fhr_st`` the two
+            blocks are concatenated on the channel axis and separated
+            by a solid black horizontal line at ``C_st - 0.5``.
+        up_st: Normalised UP scattering features ``(T, C_st)`` or
+            ``None``. Same semantics as ``fhr_st``.
+        up_ph: Normalised UP phase-harmonic features ``(T, C_ph)`` or
+            ``None``. Same semantics as ``fhr_ph``.
         guid: Sample GUID for the title bar.
         epoch: Sample epoch (seconds relative to delivery) for the title.
         label: Outcome class label for the title.
@@ -1031,20 +1055,33 @@ def plot_sample_lag_attention(
 
     # --- Figure layout ---
     # Two-column GridSpec: column 0 holds every main panel, column 1 is a
-    # narrow gutter that only heatmap rows (1, 2) use for their colorbars.
-    # Line-plot rows (0, 3, 4) leave column 1 empty, so every main axes
-    # keeps the same horizontal extent and the stack aligns vertically.
-    fig = plt.figure(figsize=(12, 14))
+    # narrow gutter that only heatmap rows use for their colorbars. Line
+    # rows leave column 1 empty so every main axes keeps the same
+    # horizontal extent and the stack aligns vertically.
+    has_fhr_feats = fhr_st is not None and fhr_st.ndim == 2
+    has_up_feats = up_st is not None and up_st.ndim == 2
+
+    # Row order: raw, [fhr_feats], [up_feats], attn, te_lag, argmax+ent, lag mass.
+    row_heights: List[float] = [1.0]
+    if has_fhr_feats:
+        row_heights.append(1.3)
+    if has_up_feats:
+        row_heights.append(1.3)
+    row_heights.extend([1.9, 1.9, 1.1, 1.2])
+    n_rows = len(row_heights)
+    fig_h = 2.2 + sum(row_heights) * 1.05
+    fig = plt.figure(figsize=(12, fig_h))
     gs = GridSpec(
-        5, 2, figure=fig,
+        n_rows, 2, figure=fig,
         hspace=0.55, wspace=0.015,
-        height_ratios=[1.0, 1.9, 1.9, 1.1, 1.2],
+        height_ratios=row_heights,
         width_ratios=[1.0, 0.02],
         left=0.10, right=0.95, top=0.94, bottom=0.06,
     )
 
     # --- Row 0: Raw signals (column 0 only) ---
-    ax_raw = fig.add_subplot(gs[0, 0])
+    row = 0
+    ax_raw = fig.add_subplot(gs[row, 0])
     _draw_raw_panel(
         ax_raw,
         fhr=fhr, up=up,
@@ -1053,6 +1090,49 @@ def plot_sample_lag_attention(
         warmup_min=warmup_min,
         title="Raw FHR / UP",
     )
+    row += 1
+
+    # --- Row ?: FHR features (fhr_st ‖ fhr_ph) with black separator ---
+    if has_fhr_feats:
+        fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)  # type: ignore[arg-type]
+        fhr_img = _mask_warmup_time_axis(fhr_img, warm, axis=-1)
+        ax_fhr = fig.add_subplot(gs[row, 0])
+        cax_fhr = fig.add_subplot(gs[row, 1])
+        fhr_title = (
+            "FHR features (fhr_st │ fhr_ph)" if fhr_ph is not None
+            else "FHR scattering transform"
+        )
+        _draw_heatmap_direct(
+            ax_fhr, fhr_img,
+            t_max_min=t_max_min, cmap="viridis",
+            ylabel="channel",
+            title=fhr_title,
+            cbar_ax=cax_fhr,
+            separator_row=fhr_sep,
+        )
+        _shade_warmup_min(ax_fhr, warmup_min)
+        row += 1
+
+    # --- Row ?: UP features (up_st ‖ up_ph) with black separator ---
+    if has_up_feats:
+        up_img, up_sep = _combine_st_ph(up_st, up_ph)  # type: ignore[arg-type]
+        up_img = _mask_warmup_time_axis(up_img, warm, axis=-1)
+        ax_up = fig.add_subplot(gs[row, 0])
+        cax_up = fig.add_subplot(gs[row, 1])
+        up_title = (
+            "UP features (up_st │ up_ph)" if up_ph is not None
+            else "UP scattering transform"
+        )
+        _draw_heatmap_direct(
+            ax_up, up_img,
+            t_max_min=t_max_min, cmap="viridis",
+            ylabel="channel",
+            title=up_title,
+            cbar_ax=cax_up,
+            separator_row=up_sep,
+        )
+        _shade_warmup_min(ax_up, warmup_min)
+        row += 1
 
     # Warmup-masked copies: the (L, T) heatmaps have time on axis=-1, so
     # masking leading columns hides the warmup region from both imshow
@@ -1060,9 +1140,9 @@ def plot_sample_lag_attention(
     alpha_bar_img = _mask_warmup_time_axis(alpha_bar.T, warm, axis=-1)
     te_lag_img = _mask_warmup_time_axis(te_lag_map.T, warm, axis=-1)
 
-    # --- Row 1: Attention matrix head-averaged ---
-    ax_attn = fig.add_subplot(gs[1, 0])
-    cax_attn = fig.add_subplot(gs[1, 1])
+    # --- Row ?: Attention matrix head-averaged ---
+    ax_attn = fig.add_subplot(gs[row, 0])
+    cax_attn = fig.add_subplot(gs[row, 1])
     _draw_heatmap_direct(
         ax_attn, alpha_bar_img,  # (L, T)
         t_max_min=t_max_min,
@@ -1087,10 +1167,11 @@ def plot_sample_lag_attention(
             label="argmax lag",
         )
         ax_attn.legend(loc="upper right", fontsize=6, frameon=True)
+    row += 1
 
-    # --- Row 2: TE lag attribution ---
-    ax_te = fig.add_subplot(gs[2, 0])
-    cax_te = fig.add_subplot(gs[2, 1])
+    # --- Row ?: TE lag attribution ---
+    ax_te = fig.add_subplot(gs[row, 0])
+    cax_te = fig.add_subplot(gs[row, 1])
     _draw_heatmap_direct(
         ax_te, te_lag_img,
         t_max_min=t_max_min,
@@ -1105,9 +1186,10 @@ def plot_sample_lag_attention(
     ax_te.set_ylim(0.0, lag_span_min)
     ax_te.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_te, warmup_min)
+    row += 1
 
-    # --- Row 3: Attention analysis — argmax lag + entropy over time ---
-    ax_ana = fig.add_subplot(gs[3, 0])
+    # --- Row ?: Attention analysis — argmax lag + entropy over time ---
+    ax_ana = fig.add_subplot(gs[row, 0])
     ax_ana.plot(
         time_dec_min, argmax_lag_min_masked,
         color=COLOR_BLUE, linewidth=1.0, label="argmax lag",
