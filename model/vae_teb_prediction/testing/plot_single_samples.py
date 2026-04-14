@@ -574,6 +574,113 @@ def plot_sample_lag_attn_diagnostic(
 # -----------------------------------------------------------------------------
 
 
+def _draw_heatmap_direct(
+    ax: plt.Axes,
+    data: np.ndarray,
+    *,
+    t_max_min: float,
+    cmap: str,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    ylabel: str = "",
+    title: str = "",
+    y_extent: Optional[float] = None,
+    cbar_ax: Optional[plt.Axes] = None,
+    cbar_label: str = "",
+    separator_row: Optional[float] = None,
+) -> Any:
+    """Draw a ``(rows, T)`` heatmap and route the colorbar to ``cbar_ax``.
+
+    Unlike :func:`_draw_heatmap_min`, this does NOT steal horizontal width
+    from ``ax`` via ``make_axes_locatable`` — the colorbar lives in a
+    pre-allocated axes so the main plot keeps its full width and stays
+    aligned with adjacent line panels.
+
+    Args:
+        ax: Target axes (the main plot area).
+        data: Array of shape ``(rows, T)``.
+        t_max_min: Full x-axis extent in minutes.
+        cmap: Colormap name.
+        vmin, vmax: Colour-scale limits (auto when ``None``).
+        ylabel: Y-axis label.
+        title: Panel title.
+        y_extent: Optional y-axis top (rows space). Defaults to
+            ``rows - 0.5`` which gives a pixel-per-row layout.
+        cbar_ax: Dedicated axes for the colorbar. When ``None`` the
+            colorbar is skipped entirely.
+        cbar_label: Label placed alongside the colorbar.
+        separator_row: Optional horizontal line position (data y-units)
+            drawn on top of the heatmap in black. Used to mark the
+            scattering / phase-harmonic boundary on combined panels.
+
+    Returns:
+        The ``AxesImage`` handle, or ``None`` if the panel was empty.
+    """
+    if data.size == 0 or not np.isfinite(data).any():
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+        ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+        if title:
+            ax.set_title(title, fontsize=FONT_LABEL)
+        return None
+
+    rows = int(data.shape[0])
+    y_top = float(y_extent) if y_extent is not None else (rows - 0.5)
+    y_bot = 0.0 if y_extent is not None else -0.5
+
+    im = ax.imshow(
+        data,
+        aspect="auto",
+        origin="lower",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+        extent=(0.0, t_max_min, y_bot, y_top),
+    )
+    if separator_row is not None:
+        ax.axhline(
+            y=float(separator_row),
+            color=COLOR_BLACK,
+            linewidth=0.7,
+            linestyle="-",
+            alpha=0.9,
+        )
+    ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+    if title:
+        ax.set_title(title, fontsize=FONT_LABEL, fontweight="normal")
+    if cbar_ax is not None:
+        cb = ax.figure.colorbar(im, cax=cbar_ax)  # type: ignore[union-attr]
+        cb.ax.tick_params(labelsize=6)
+        if cbar_label:
+            cb.set_label(cbar_label, fontsize=FONT_LABEL)
+    return im
+
+
+def _combine_st_ph(
+    st: np.ndarray, ph: Optional[np.ndarray]
+) -> tuple[np.ndarray, Optional[float]]:
+    """Concatenate scattering and phase-harmonic channels along the channel axis.
+
+    Input arrays are ``(T, C_st)`` and ``(T, C_ph)``; the returned image is
+    transposed to ``(C_st + C_ph, T)`` for imshow with ``origin="lower"``.
+    The separator row sits between the two blocks at ``C_st - 0.5``.
+
+    Args:
+        st: Scattering features ``(T, C_st)``.
+        ph: Phase-harmonic features ``(T, C_ph)`` or ``None``.
+
+    Returns:
+        Tuple of ``(combined_image, separator_row)``. When ``ph`` is
+        ``None`` the scattering array is returned unchanged and the
+        separator row is ``None``.
+    """
+    if ph is None or ph.ndim != 2:
+        return st.T, None
+    combined = np.concatenate([st, ph], axis=1)  # (T, C_st + C_ph)
+    separator_row = float(st.shape[1]) - 0.5
+    return combined.T, separator_row
+
+
 def plot_sample_signals_kld(
     *,
     fhr: Optional[np.ndarray],
@@ -583,6 +690,8 @@ def plot_sample_signals_kld(
     kld_per_dim: np.ndarray,
     warmup: int,
     out_path: Path,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
@@ -591,28 +700,44 @@ def plot_sample_signals_kld(
 ) -> None:
     """Draw the multi-panel raw/scattering/KLD diagnostic for one sample.
 
+    The figure uses a two-column GridSpec so that every main panel — line
+    plots and heatmaps alike — occupies exactly the same width. Heatmap
+    colorbars live in a dedicated narrow right-hand column, so they never
+    steal horizontal width from the main plot and the column-one axes
+    stay aligned top-to-bottom.
+
     The figure stacks, top to bottom:
 
     1. Raw FHR and UP traces on a twin y-axis (if present).
-    2. FHR scattering transform ``(43, T)`` heatmap.
-    3. UP scattering transform ``(43, T)`` heatmap (skipped if absent).
-    4. Per-latent-dimension KLD traces — one compact subplot per latent
-       dimension, arranged in a grid (up to 6 columns wide).
+    2. FHR features — ``fhr_st`` concatenated with ``fhr_ph`` (if
+       provided), separated by a horizontal black line at the boundary.
+    3. UP features — ``up_st`` concatenated with ``up_ph`` (if provided),
+       with the same black separator convention.
+    4. Per-latent-dimension KLD traces — one full-width subplot per
+       latent dimension.
     5. Mean ± std of KLD across latent dimensions at every timestep.
 
     Every panel shares a single physical-time x-axis expressed in
     **minutes**, using ``sec_per_dec = decim / fs_raw`` to convert
     decimated step index to seconds and then to minutes. Warmup is
-    shaded consistently across all rows.
+    shaded consistently across all rows, and the pre-warmup region is
+    NaN-masked on every imshow / line so start-of-sample anomalies do
+    not compress the shared scales.
 
     Args:
         fhr: Raw FHR trace ``(R,)`` or ``None``.
         up: Raw UP trace ``(R,)`` or ``None``.
-        fhr_st: Normalised FHR scattering features ``(T, 43)``.
-        up_st: Normalised UP scattering features ``(T, 43)`` or ``None``.
+        fhr_st: Normalised FHR scattering features ``(T, C_st)``.
+        up_st: Normalised UP scattering features ``(T, C_st)`` or
+            ``None``.
         kld_per_dim: Per-timestep per-dim KL, shape ``(T, d_z)``.
         warmup: Number of warmup decimated steps.
         out_path: Destination PDF/PNG.
+        fhr_ph: Normalised FHR phase-harmonic features ``(T, C_ph)`` or
+            ``None``. When provided, concatenated with ``fhr_st`` and a
+            black horizontal line separates the two blocks.
+        up_ph: Normalised UP phase-harmonic features ``(T, C_ph)`` or
+            ``None``. Same semantics as ``fhr_ph``.
         guid: Sample GUID for the title bar.
         epoch: Sample epoch (seconds relative to delivery) for the title.
         label: Outcome class label for the title.
@@ -640,13 +765,14 @@ def plot_sample_signals_kld(
     time_raw_min = np.arange(R) / float(fs_raw) / 60.0
 
     # --- Layout ---
-    # Per-dim KLD traces are stacked one-per-row at the same width as the
-    # raw FHR / UP panel, so each latent dimension gets the full time
-    # axis instead of being crammed into a narrow grid cell.
+    # Two-column GridSpec keeps every main panel the same width: column 0
+    # holds the plot; column 1 is a narrow gutter used only by heatmap
+    # colorbars. Line panels leave column 1 empty, so the whole figure
+    # aligns vertically on the left edge and the right edge of the plot
+    # area.
     use_up_st = up_st is not None and up_st.ndim == 2
-    n_cols = 1
     n_kld_rows = int(d_z)
-    n_top_rows = 2 + (1 if use_up_st else 0)  # raw, fhr_st, optional up_st
+    n_top_rows = 2 + (1 if use_up_st else 0)  # raw, fhr_*, optional up_*
     n_bot_rows = 1                              # mean ± std
     n_total = n_top_rows + n_kld_rows + n_bot_rows
 
@@ -658,15 +784,20 @@ def plot_sample_signals_kld(
     fig_h = 1.6 * n_top_rows + 0.7 * n_kld_rows + 1.8
     fig = plt.figure(figsize=(14, fig_h))
     gs = GridSpec(
-        n_total, n_cols, figure=fig,
-        hspace=0.55, wspace=0.25,
+        n_total, 2, figure=fig,
+        hspace=0.55, wspace=0.015,
         height_ratios=height_ratios,
+        width_ratios=[1.0, 0.018],
         left=0.07, right=0.96, top=0.96, bottom=0.04,
     )
 
-    # --- Row 0: Raw signals ---
+    # Warmup mask in decimated steps: values before ``warmup`` are NaN so
+    # start-of-sample anomalies do not compress the colour/value scales.
+    warm_dec = max(0, int(warmup))
+
+    # --- Row 0: Raw signals (line plot, column 0 only) ---
     row = 0
-    ax_raw = fig.add_subplot(gs[row, :])
+    ax_raw = fig.add_subplot(gs[row, 0])
     _draw_raw_panel(
         ax_raw,
         fhr=fhr, up=up,
@@ -677,40 +808,50 @@ def plot_sample_signals_kld(
     )
     row += 1
 
-    # Warmup mask in decimated steps: values before ``warmup`` are NaN so
-    # start-of-sample anomalies do not compress the colour/value scales.
-    warm_dec = max(0, int(warmup))
-
-    # --- Row 1: FHR scattering transform (channels on y, time on x) ---
-    fhr_st_img = _mask_warmup_time_axis(fhr_st.T, warm_dec, axis=-1)
-    ax_fhr = fig.add_subplot(gs[row, :])
-    _draw_heatmap_min(
-        ax_fhr, fhr_st_img,
+    # --- Row 1: FHR features (fhr_st ‖ fhr_ph) with black separator ---
+    fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)
+    fhr_img = _mask_warmup_time_axis(fhr_img, warm_dec, axis=-1)
+    ax_fhr = fig.add_subplot(gs[row, 0])
+    cax_fhr = fig.add_subplot(gs[row, 1])
+    fhr_title = (
+        "FHR features (fhr_st │ fhr_ph)" if fhr_ph is not None
+        else "FHR scattering transform"
+    )
+    _draw_heatmap_direct(
+        ax_fhr, fhr_img,
         t_max_min=t_max_min, cmap="viridis",
-        ylabel="fhr_st ch",
-        title="FHR scattering transform",
-        colorbar_label="",
+        ylabel="channel",
+        title=fhr_title,
+        cbar_ax=cax_fhr,
+        separator_row=fhr_sep,
     )
     _shade_warmup_min(ax_fhr, warmup_min)
     row += 1
 
-    # --- Row 2 (optional): UP scattering transform ---
+    # --- Row 2 (optional): UP features (up_st ‖ up_ph) ---
     if use_up_st:
-        up_st_img = _mask_warmup_time_axis(up_st.T, warm_dec, axis=-1)  # type: ignore[union-attr]
-        ax_up_st = fig.add_subplot(gs[row, :])
-        _draw_heatmap_min(
-            ax_up_st, up_st_img,
-            t_max_min=t_max_min, cmap="viridis",
-            ylabel="up_st ch",
-            title="UP scattering transform",
-            colorbar_label="",
+        up_img, up_sep = _combine_st_ph(up_st, up_ph)  # type: ignore[arg-type]
+        up_img = _mask_warmup_time_axis(up_img, warm_dec, axis=-1)
+        ax_up = fig.add_subplot(gs[row, 0])
+        cax_up = fig.add_subplot(gs[row, 1])
+        up_title = (
+            "UP features (up_st │ up_ph)" if up_ph is not None
+            else "UP scattering transform"
         )
-        _shade_warmup_min(ax_up_st, warmup_min)
+        _draw_heatmap_direct(
+            ax_up, up_img,
+            t_max_min=t_max_min, cmap="viridis",
+            ylabel="channel",
+            title=up_title,
+            cbar_ax=cax_up,
+            separator_row=up_sep,
+        )
+        _shade_warmup_min(ax_up, warmup_min)
         row += 1
 
     # --- Per-dim KLD traces (one full-width subplot per dim) ---
-    # Warmup samples are NaN-masked so they are not plotted and do not
-    # enter the per-dim auto y-limits.
+    # Line panels live in column 0 only; column 1 remains empty so every
+    # main axes keeps the same horizontal extent as the heatmap rows.
     kld_plot = _mask_warmup_time_axis(kld_per_dim, warm_dec, axis=0)
     kld_grid_start = row
     for d in range(d_z):
@@ -740,8 +881,8 @@ def plot_sample_signals_kld(
             ax_d.tick_params(labelbottom=False)
     row += n_kld_rows
 
-    # --- Bottom: Mean ± std KLD over dimensions ---
-    ax_mean = fig.add_subplot(gs[row, :])
+    # --- Bottom: Mean ± std KLD over dimensions (column 0 only) ---
+    ax_mean = fig.add_subplot(gs[row, 0])
     mean_kld = np.nanmean(kld_plot, axis=1)
     std_kld = np.nanstd(kld_plot, axis=1)
     ax_mean.fill_between(
@@ -889,15 +1030,20 @@ def plot_sample_lag_attention(
         alpha_mass_by_lag = np.zeros(L)
 
     # --- Figure layout ---
+    # Two-column GridSpec: column 0 holds every main panel, column 1 is a
+    # narrow gutter that only heatmap rows (1, 2) use for their colorbars.
+    # Line-plot rows (0, 3, 4) leave column 1 empty, so every main axes
+    # keeps the same horizontal extent and the stack aligns vertically.
     fig = plt.figure(figsize=(12, 14))
     gs = GridSpec(
-        5, 1, figure=fig,
-        hspace=0.55,
+        5, 2, figure=fig,
+        hspace=0.55, wspace=0.015,
         height_ratios=[1.0, 1.9, 1.9, 1.1, 1.2],
+        width_ratios=[1.0, 0.02],
         left=0.10, right=0.95, top=0.94, bottom=0.06,
     )
 
-    # --- Row 0: Raw signals ---
+    # --- Row 0: Raw signals (column 0 only) ---
     ax_raw = fig.add_subplot(gs[0, 0])
     _draw_raw_panel(
         ax_raw,
@@ -916,13 +1062,15 @@ def plot_sample_lag_attention(
 
     # --- Row 1: Attention matrix head-averaged ---
     ax_attn = fig.add_subplot(gs[1, 0])
-    _draw_heatmap_min(
+    cax_attn = fig.add_subplot(gs[1, 1])
+    _draw_heatmap_direct(
         ax_attn, alpha_bar_img,  # (L, T)
         t_max_min=t_max_min,
         cmap="viridis",
         ylabel="Lag (min)",
         title=r"Head-averaged lag attention  $\bar{\alpha}(t, k)$",
-        colorbar_label="attention",
+        cbar_ax=cax_attn,
+        cbar_label="attention",
         y_extent=lag_span_min,
     )
     ax_attn.set_ylim(0.0, lag_span_min)
@@ -942,14 +1090,16 @@ def plot_sample_lag_attention(
 
     # --- Row 2: TE lag attribution ---
     ax_te = fig.add_subplot(gs[2, 0])
-    _draw_heatmap_min(
+    cax_te = fig.add_subplot(gs[2, 1])
+    _draw_heatmap_direct(
         ax_te, te_lag_img,
         t_max_min=t_max_min,
         cmap="inferno",
         vmin=0.0,
         ylabel="Lag (min)",
         title=r"TE lag attribution  $\mathrm{KL}_t \cdot \bar{\alpha}(t, k)$",
-        colorbar_label="TE mass",
+        cbar_ax=cax_te,
+        cbar_label="TE mass",
         y_extent=lag_span_min,
     )
     ax_te.set_ylim(0.0, lag_span_min)
