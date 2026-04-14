@@ -658,7 +658,7 @@ def _draw_heatmap_direct(
 
 
 def _combine_st_ph(
-    st: np.ndarray, ph: Optional[np.ndarray]
+    st: Optional[np.ndarray], ph: Optional[np.ndarray]
 ) -> tuple[np.ndarray, Optional[float]]:
     """Concatenate scattering and phase-harmonic channels along the channel axis.
 
@@ -667,14 +667,17 @@ def _combine_st_ph(
     The separator row sits between the two blocks at ``C_st - 0.5``.
 
     Args:
-        st: Scattering features ``(T, C_st)``.
+        st: Scattering features ``(T, C_st)`` or ``None``.
         ph: Phase-harmonic features ``(T, C_ph)`` or ``None``.
 
     Returns:
         Tuple of ``(combined_image, separator_row)``. When ``ph`` is
         ``None`` the scattering array is returned unchanged and the
-        separator row is ``None``.
+        separator row is ``None``. Callers must gate on ``st`` not being
+        ``None`` before invoking this helper.
     """
+    if st is None:
+        raise ValueError("_combine_st_ph requires a non-None scattering array.")
     if ph is None or ph.ndim != 2:
         return st.T, None
     combined = np.concatenate([st, ph], axis=1)  # (T, C_st + C_ph)
@@ -778,18 +781,18 @@ def plot_sample_signals_kld(
     n_total = n_top_rows + n_kld_rows + n_bot_rows
 
     height_ratios = (
-        [1.1] * n_top_rows
+        [1.4] * n_top_rows
         + [0.45] * n_kld_rows
         + [1.25] * n_bot_rows
     )
-    fig_h = 1.6 * n_top_rows + 0.7 * n_kld_rows + 1.8
+    fig_h = 1.9 * n_top_rows + 0.7 * n_kld_rows + 2.0
     fig = plt.figure(figsize=(14, fig_h))
     gs = GridSpec(
         n_total, 2, figure=fig,
-        hspace=0.55, wspace=0.015,
+        hspace=0.7, wspace=0.015,
         height_ratios=height_ratios,
         width_ratios=[1.0, 0.018],
-        left=0.07, right=0.96, top=0.96, bottom=0.04,
+        left=0.07, right=0.96, top=0.965, bottom=0.035,
     )
 
     # Warmup mask in decimated steps: values before ``warmup`` are NaN so
@@ -810,8 +813,16 @@ def plot_sample_signals_kld(
     row += 1
 
     # --- Row 1: FHR features (fhr_st ‖ fhr_ph) with black separator ---
+    # Diverging RdBu_r with symmetric limits matches the z-scored feature
+    # semantics (blue < 0 < red) and is kept consistent with the other
+    # feature and attention panels in lag_attention.pdf.
     fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)
     fhr_img = _mask_warmup_time_axis(fhr_img, warm_dec, axis=-1)
+    fhr_vmax = (
+        float(np.nanmax(np.abs(fhr_img)))
+        if np.isfinite(fhr_img).any() else 1.0
+    )
+    fhr_vmax = fhr_vmax if fhr_vmax > 0 else 1.0
     ax_fhr = fig.add_subplot(gs[row, 0])
     cax_fhr = fig.add_subplot(gs[row, 1])
     fhr_title = (
@@ -820,7 +831,8 @@ def plot_sample_signals_kld(
     )
     _draw_heatmap_direct(
         ax_fhr, fhr_img,
-        t_max_min=t_max_min, cmap="viridis",
+        t_max_min=t_max_min, cmap="RdBu_r",
+        vmin=-fhr_vmax, vmax=fhr_vmax,
         ylabel="channel",
         title=fhr_title,
         cbar_ax=cax_fhr,
@@ -831,8 +843,13 @@ def plot_sample_signals_kld(
 
     # --- Row 2 (optional): UP features (up_st ‖ up_ph) ---
     if use_up_st:
-        up_img, up_sep = _combine_st_ph(up_st, up_ph)  # type: ignore[arg-type]
+        up_img, up_sep = _combine_st_ph(up_st, up_ph)
         up_img = _mask_warmup_time_axis(up_img, warm_dec, axis=-1)
+        up_vmax = (
+            float(np.nanmax(np.abs(up_img)))
+            if np.isfinite(up_img).any() else 1.0
+        )
+        up_vmax = up_vmax if up_vmax > 0 else 1.0
         ax_up = fig.add_subplot(gs[row, 0])
         cax_up = fig.add_subplot(gs[row, 1])
         up_title = (
@@ -841,7 +858,8 @@ def plot_sample_signals_kld(
         )
         _draw_heatmap_direct(
             ax_up, up_img,
-            t_max_min=t_max_min, cmap="viridis",
+            t_max_min=t_max_min, cmap="RdBu_r",
+            vmin=-up_vmax, vmax=up_vmax,
             ylabel="channel",
             title=up_title,
             cbar_ax=cax_up,
@@ -1064,19 +1082,23 @@ def plot_sample_lag_attention(
     # Row order: raw, [fhr_feats], [up_feats], attn, te_lag, argmax+ent, lag mass.
     row_heights: List[float] = [1.0]
     if has_fhr_feats:
-        row_heights.append(1.3)
+        row_heights.append(1.6)
     if has_up_feats:
-        row_heights.append(1.3)
+        row_heights.append(1.6)
     row_heights.extend([1.9, 1.9, 1.1, 1.2])
     n_rows = len(row_heights)
-    fig_h = 2.2 + sum(row_heights) * 1.05
+    # Figure height scales with the total of the row ratios so adding the
+    # FHR/UP feature rows doesn't squash the rest of the stack. The base
+    # constants reproduce the original 14" height when only the 5 original
+    # rows are present (sum = 7.1 → fig_h ≈ 14).
+    fig_h = 1.7 * sum(row_heights) + 2.0
     fig = plt.figure(figsize=(12, fig_h))
     gs = GridSpec(
         n_rows, 2, figure=fig,
-        hspace=0.55, wspace=0.015,
+        hspace=0.7, wspace=0.015,
         height_ratios=row_heights,
         width_ratios=[1.0, 0.02],
-        left=0.10, right=0.95, top=0.94, bottom=0.06,
+        left=0.10, right=0.95, top=0.955, bottom=0.045,
     )
 
     # --- Row 0: Raw signals (column 0 only) ---
@@ -1093,9 +1115,17 @@ def plot_sample_lag_attention(
     row += 1
 
     # --- Row ?: FHR features (fhr_st ‖ fhr_ph) with black separator ---
+    # Normalised features are zero-centred (z-score) so a diverging
+    # RdBu_r colormap with symmetric limits reads cleanly: blue = below
+    # baseline, red = above.
     if has_fhr_feats:
         fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)  # type: ignore[arg-type]
         fhr_img = _mask_warmup_time_axis(fhr_img, warm, axis=-1)
+        fhr_vmax = (
+            float(np.nanmax(np.abs(fhr_img)))
+            if np.isfinite(fhr_img).any() else 1.0
+        )
+        fhr_vmax = fhr_vmax if fhr_vmax > 0 else 1.0
         ax_fhr = fig.add_subplot(gs[row, 0])
         cax_fhr = fig.add_subplot(gs[row, 1])
         fhr_title = (
@@ -1104,7 +1134,8 @@ def plot_sample_lag_attention(
         )
         _draw_heatmap_direct(
             ax_fhr, fhr_img,
-            t_max_min=t_max_min, cmap="viridis",
+            t_max_min=t_max_min, cmap="RdBu_r",
+            vmin=-fhr_vmax, vmax=fhr_vmax,
             ylabel="channel",
             title=fhr_title,
             cbar_ax=cax_fhr,
@@ -1117,6 +1148,11 @@ def plot_sample_lag_attention(
     if has_up_feats:
         up_img, up_sep = _combine_st_ph(up_st, up_ph)  # type: ignore[arg-type]
         up_img = _mask_warmup_time_axis(up_img, warm, axis=-1)
+        up_vmax = (
+            float(np.nanmax(np.abs(up_img)))
+            if np.isfinite(up_img).any() else 1.0
+        )
+        up_vmax = up_vmax if up_vmax > 0 else 1.0
         ax_up = fig.add_subplot(gs[row, 0])
         cax_up = fig.add_subplot(gs[row, 1])
         up_title = (
@@ -1125,7 +1161,8 @@ def plot_sample_lag_attention(
         )
         _draw_heatmap_direct(
             ax_up, up_img,
-            t_max_min=t_max_min, cmap="viridis",
+            t_max_min=t_max_min, cmap="RdBu_r",
+            vmin=-up_vmax, vmax=up_vmax,
             ylabel="channel",
             title=up_title,
             cbar_ax=cax_up,
@@ -1141,12 +1178,21 @@ def plot_sample_lag_attention(
     te_lag_img = _mask_warmup_time_axis(te_lag_map.T, warm, axis=-1)
 
     # --- Row ?: Attention matrix head-averaged ---
+    # RdBu_r on [0, max]: the mean attention level (~1/L) ends up mid-
+    # grey, below-average lags tint blue, above-average lags tint red —
+    # makes "where the model is looking" pop visually.
+    attn_vmax = (
+        float(np.nanmax(alpha_bar_img)) if np.isfinite(alpha_bar_img).any()
+        else 1.0
+    )
+    attn_vmax = attn_vmax if attn_vmax > 0 else 1.0
     ax_attn = fig.add_subplot(gs[row, 0])
     cax_attn = fig.add_subplot(gs[row, 1])
     _draw_heatmap_direct(
         ax_attn, alpha_bar_img,  # (L, T)
         t_max_min=t_max_min,
-        cmap="viridis",
+        cmap="RdBu_r",
+        vmin=0.0, vmax=attn_vmax,
         ylabel="Lag (min)",
         title=r"Head-averaged lag attention  $\bar{\alpha}(t, k)$",
         cbar_ax=cax_attn,
