@@ -831,7 +831,7 @@ def plot_sample_signals_kld(
     )
     _draw_heatmap_direct(
         ax_fhr, fhr_img,
-        t_max_min=t_max_min, cmap="RdBu_r",
+        t_max_min=t_max_min, cmap="bwr",
         vmin=-fhr_vmax, vmax=fhr_vmax,
         ylabel="channel",
         title=fhr_title,
@@ -858,7 +858,7 @@ def plot_sample_signals_kld(
         )
         _draw_heatmap_direct(
             ax_up, up_img,
-            t_max_min=t_max_min, cmap="RdBu_r",
+            t_max_min=t_max_min, cmap="bwr",
             vmin=-up_vmax, vmax=up_vmax,
             ylabel="channel",
             title=up_title,
@@ -1134,7 +1134,7 @@ def plot_sample_lag_attention(
         )
         _draw_heatmap_direct(
             ax_fhr, fhr_img,
-            t_max_min=t_max_min, cmap="RdBu_r",
+            t_max_min=t_max_min, cmap="bwr",
             vmin=-fhr_vmax, vmax=fhr_vmax,
             ylabel="channel",
             title=fhr_title,
@@ -1161,7 +1161,7 @@ def plot_sample_lag_attention(
         )
         _draw_heatmap_direct(
             ax_up, up_img,
-            t_max_min=t_max_min, cmap="RdBu_r",
+            t_max_min=t_max_min, cmap="bwr",
             vmin=-up_vmax, vmax=up_vmax,
             ylabel="channel",
             title=up_title,
@@ -1260,9 +1260,10 @@ def plot_sample_lag_attention(
 
     _shade_warmup_min(ax_ana, warmup_min)
     _style_axes(ax_ana, grid="major", minor_ticks=True)
+    row += 1
 
-    # --- Row 4: Lag analysis — time-averaged attention mass per lag ---
-    ax_lag = fig.add_subplot(gs[4, 0])
+    # --- Row ?: Lag analysis — time-averaged attention mass per lag ---
+    ax_lag = fig.add_subplot(gs[row, 0])
     bin_width = float(sec_per_dec / 60.0)
     ax_lag.bar(
         lag_centers_min,
