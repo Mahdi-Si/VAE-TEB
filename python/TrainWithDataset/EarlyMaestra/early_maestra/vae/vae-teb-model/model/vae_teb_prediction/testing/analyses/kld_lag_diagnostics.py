@@ -101,9 +101,15 @@ def run_kld_lag_diagnostics(
 
             # Normalised scattering features go straight to plotting.
             fhr_st_np = batch.fhr_st.detach().cpu().numpy()  # (B, T, 43)
+            fhr_ph_np = None
+            if hasattr(batch, "fhr_ph") and isinstance(batch.fhr_ph, torch.Tensor):
+                fhr_ph_np = batch.fhr_ph.detach().cpu().numpy()
             up_st_np = None
             if hasattr(batch, "up_st") and isinstance(batch.up_st, torch.Tensor):
                 up_st_np = batch.up_st.detach().cpu().numpy()
+            up_ph_np = None
+            if hasattr(batch, "up_ph") and isinstance(batch.up_ph, torch.Tensor):
+                up_ph_np = batch.up_ph.detach().cpu().numpy()
 
             fhr_np = None
             if hasattr(batch, "fhr") and isinstance(batch.fhr, torch.Tensor):
@@ -156,7 +162,9 @@ def run_kld_lag_diagnostics(
                         fhr=fhr_np[idx] if fhr_np is not None else None,
                         up=up_np[idx] if up_np is not None else None,
                         fhr_st=fhr_st_np[idx],
+                        fhr_ph=fhr_ph_np[idx] if fhr_ph_np is not None else None,
                         up_st=up_st_np[idx] if up_st_np is not None else None,
+                        up_ph=up_ph_np[idx] if up_ph_np is not None else None,
                         kld_per_dim=kld_per_dim_np[idx],
                         warmup=int(runner.warmup_steps),
                         out_path=signals_out,
