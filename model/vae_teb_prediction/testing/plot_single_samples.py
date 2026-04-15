@@ -103,6 +103,55 @@ def _shade_warmup_min(ax: plt.Axes, warmup_min: float) -> None:
         ax.axvspan(0.0, warmup_min, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
 
+def _mark_warmup_line_min(ax: plt.Axes, warmup_min: float) -> None:
+    """Draw a vertical line at the end of the warmup window (minutes axis).
+
+    Used on panels that show **real, unmasked input signals** (raw FHR/UP
+    and the normalised scattering / phase-harmonic features). The line
+    indicates where the model's warmup region ends without hiding any of
+    the underlying signal.
+
+    Args:
+        ax: Target axes whose x-axis is in minutes.
+        warmup_min: Warmup duration in minutes. No-op when ``<= 0``.
+    """
+    if warmup_min and warmup_min > 0:
+        ax.axvline(
+            x=float(warmup_min),
+            color=COLOR_GRAY,
+            linewidth=0.9,
+            linestyle="--",
+            alpha=0.85,
+            zorder=3,
+        )
+
+
+def _mark_warmup_line_sec(
+    ax: plt.Axes, warmup: int, t_max: float, T: int
+) -> None:
+    """Draw a vertical line at the end of the warmup window (seconds axis).
+
+    Same purpose as :func:`_mark_warmup_line_min` but for axes expressed
+    in seconds (``t_max = R / fs_raw``).
+
+    Args:
+        ax: Target axes whose x-axis is in seconds.
+        warmup: Warmup length in decimated steps.
+        t_max: Full x-axis extent in seconds.
+        T: Total number of decimated steps.
+    """
+    if warmup and warmup > 0 and T > 0:
+        warmup_sec = float(warmup) * (t_max / float(T))
+        ax.axvline(
+            x=warmup_sec,
+            color=COLOR_GRAY,
+            linewidth=0.9,
+            linestyle="--",
+            alpha=0.85,
+            zorder=3,
+        )
+
+
 def _mask_warmup_time_axis(
     data: np.ndarray, warmup: int, axis: int = -1
 ) -> np.ndarray:
@@ -139,33 +188,6 @@ def _mask_warmup_time_axis(
     return out
 
 
-def _mask_warmup_signal(
-    signal: Optional[np.ndarray],
-    time_min: np.ndarray,
-    warmup_min: float,
-) -> Optional[np.ndarray]:
-    """NaN-mask a 1-D signal where ``time_min < warmup_min``.
-
-    Args:
-        signal: 1-D signal (e.g., raw FHR / UP trace) or ``None``.
-        time_min: Matching time axis in minutes.
-        warmup_min: Warmup duration in minutes.
-
-    Returns:
-        A float copy of ``signal`` with samples in the warmup region set
-        to NaN. Returns ``signal`` unchanged if it is ``None`` or the
-        warmup window is empty.
-    """
-    if signal is None or warmup_min is None or warmup_min <= 0:
-        return signal
-    n = min(len(signal), len(time_min))
-    out = np.asarray(signal, dtype=np.float32).copy()
-    out = out[:n]
-    mask = time_min[:n] < float(warmup_min)
-    out[mask] = np.nan
-    return out
-
-
 def _draw_raw_panel(
     ax: plt.Axes,
     *,
@@ -188,12 +210,14 @@ def _draw_raw_panel(
         warmup_min: Warmup region length in minutes.
         title: Panel title.
     """
+    # Raw FHR / UP are real model inputs — draw them unmasked across the
+    # whole window and mark the end of the warmup region with a single
+    # vertical line rather than blanking / shading the warmup samples.
     drawn = False
     if fhr is not None and fhr.ndim == 1:
         n = min(len(fhr), len(time_raw_min))
-        fhr_plot = _mask_warmup_signal(fhr[:n], time_raw_min[:n], warmup_min)
         ax.plot(
-            time_raw_min[:n], fhr_plot,
+            time_raw_min[:n], fhr[:n],
             color=COLOR_BLUE, linewidth=0.7, label="FHR",
         )
         ax.set_ylabel("FHR (bpm)", fontsize=FONT_LABEL, color=COLOR_BLUE)
@@ -202,9 +226,8 @@ def _draw_raw_panel(
     if up is not None and up.ndim == 1:
         ax_up = ax.twinx()
         n = min(len(up), len(time_raw_min))
-        up_plot = _mask_warmup_signal(up[:n], time_raw_min[:n], warmup_min)
         ax_up.plot(
-            time_raw_min[:n], up_plot,
+            time_raw_min[:n], up[:n],
             color=COLOR_VERMILLION, linewidth=0.7, alpha=0.85, label="UP",
         )
         ax_up.set_ylabel("UP (mmHg)", fontsize=FONT_LABEL, color=COLOR_VERMILLION)
@@ -219,7 +242,7 @@ def _draw_raw_panel(
 
     ax.set_xlim(0.0, t_max_min)
     ax.set_title(title, fontsize=FONT_LABEL, fontweight="normal")
-    _shade_warmup_min(ax, warmup_min)
+    _mark_warmup_line_min(ax, warmup_min)
     _style_axes(ax, grid="major", minor_ticks=False)
 
 
@@ -440,33 +463,28 @@ def plot_sample_lag_attn_diagnostic(
     )
 
     # Warmup mask — hides start-of-sample anomalies from imshow auto
-    # scaling and from the raw-signal y-limits. ``time_raw`` is seconds
-    # here (not minutes), so the warmup threshold is also in seconds.
+    # scaling on the model-output rows. Raw inputs (row 0) are left
+    # unmasked on purpose and only get a vertical warmup-boundary line.
     warm = max(0, int(warmup))
-    sec_per_dec = float(_DEFAULT_DECIM) / float(fs_raw)
-    warmup_s = warm * sec_per_dec
 
     # Row 0: Raw FHR / UP traces (if present).
+    # Raw signals are real model inputs — draw the full trace without
+    # masking the warmup region and mark the warmup boundary with a
+    # vertical line instead.
     ax = axes[0]
     drawn = False
     if fhr_arr is not None and fhr_arr.ndim == 1:
         n = min(len(fhr_arr), len(time_raw))
-        fhr_plot = np.asarray(fhr_arr[:n], dtype=np.float32).copy()
-        if warmup_s > 0:
-            fhr_plot[time_raw[:n] < warmup_s] = np.nan
         ax.plot(
-            time_raw[:n], fhr_plot,
+            time_raw[:n], fhr_arr[:n],
             color=COLOR_BLUE, linewidth=0.7, label="FHR",
         )
         drawn = True
     if up_arr is not None and up_arr.ndim == 1:
         ax2 = ax.twinx()
         n = min(len(up_arr), len(time_raw))
-        up_plot = np.asarray(up_arr[:n], dtype=np.float32).copy()
-        if warmup_s > 0:
-            up_plot[time_raw[:n] < warmup_s] = np.nan
         ax2.plot(
-            time_raw[:n], up_plot,
+            time_raw[:n], up_arr[:n],
             color=COLOR_VERMILLION, linewidth=0.7, alpha=0.8, label="UP",
         )
         ax2.tick_params(axis="y", colors=COLOR_VERMILLION, labelsize=6)
@@ -536,7 +554,12 @@ def plot_sample_lag_attn_diagnostic(
         ylabel="lag k", title="TE lag attribution",
     )
 
-    for ax in axes:
+    # Row 0 shows real, unmasked input signals — mark the warmup boundary
+    # with a vertical line rather than shading the warmup region. Rows
+    # 1..7 show model-generated outputs whose warmup region is NaN-masked,
+    # so they keep the full shaded band for context.
+    _mark_warmup_line_sec(axes[0], warmup, t_max, T)
+    for ax in axes[1:]:
         _shade_warmup(ax, warmup, t_max, T, color=COLOR_LIGHT_GRAY)
     axes[-1].set_xlabel("Time (s)", fontsize=FONT_LABEL)
 
@@ -813,11 +836,12 @@ def plot_sample_signals_kld(
     row += 1
 
     # --- Row 1: FHR features (fhr_st ‖ fhr_ph) with black separator ---
-    # Diverging RdBu_r with symmetric limits matches the z-scored feature
-    # semantics (blue < 0 < red) and is kept consistent with the other
-    # feature and attention panels in lag_attention.pdf.
+    # Scattering / phase-harmonic features are real model inputs (derived
+    # from raw FHR) — draw them unmasked and mark the end of the warmup
+    # window with a vertical line. Diverging RdBu_r with symmetric limits
+    # matches the z-scored feature semantics (blue < 0 < red) and is kept
+    # consistent with the other feature and attention panels.
     fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)
-    fhr_img = _mask_warmup_time_axis(fhr_img, warm_dec, axis=-1)
     fhr_vmax = (
         float(np.nanmax(np.abs(fhr_img)))
         if np.isfinite(fhr_img).any() else 1.0
@@ -838,13 +862,13 @@ def plot_sample_signals_kld(
         cbar_ax=cax_fhr,
         separator_row=fhr_sep,
     )
-    _shade_warmup_min(ax_fhr, warmup_min)
+    _mark_warmup_line_min(ax_fhr, warmup_min)
     row += 1
 
     # --- Row 2 (optional): UP features (up_st ‖ up_ph) ---
+    # Real model inputs — same convention as the FHR features row.
     if use_up_st:
         up_img, up_sep = _combine_st_ph(up_st, up_ph)
-        up_img = _mask_warmup_time_axis(up_img, warm_dec, axis=-1)
         up_vmax = (
             float(np.nanmax(np.abs(up_img)))
             if np.isfinite(up_img).any() else 1.0
@@ -865,7 +889,7 @@ def plot_sample_signals_kld(
             cbar_ax=cax_up,
             separator_row=up_sep,
         )
-        _shade_warmup_min(ax_up, warmup_min)
+        _mark_warmup_line_min(ax_up, warmup_min)
         row += 1
 
     # --- Per-dim KLD traces (one full-width subplot per dim) ---
@@ -1115,12 +1139,12 @@ def plot_sample_lag_attention(
     row += 1
 
     # --- Row ?: FHR features (fhr_st ‖ fhr_ph) with black separator ---
+    # Real model inputs — draw unmasked and mark warmup with a line.
     # Normalised features are zero-centred (z-score) so a diverging
     # RdBu_r colormap with symmetric limits reads cleanly: blue = below
     # baseline, red = above.
     if has_fhr_feats:
         fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)  # type: ignore[arg-type]
-        fhr_img = _mask_warmup_time_axis(fhr_img, warm, axis=-1)
         fhr_vmax = (
             float(np.nanmax(np.abs(fhr_img)))
             if np.isfinite(fhr_img).any() else 1.0
@@ -1141,13 +1165,13 @@ def plot_sample_lag_attention(
             cbar_ax=cax_fhr,
             separator_row=fhr_sep,
         )
-        _shade_warmup_min(ax_fhr, warmup_min)
+        _mark_warmup_line_min(ax_fhr, warmup_min)
         row += 1
 
     # --- Row ?: UP features (up_st ‖ up_ph) with black separator ---
+    # Real model inputs — draw unmasked and mark warmup with a line.
     if has_up_feats:
         up_img, up_sep = _combine_st_ph(up_st, up_ph)  # type: ignore[arg-type]
-        up_img = _mask_warmup_time_axis(up_img, warm, axis=-1)
         up_vmax = (
             float(np.nanmax(np.abs(up_img)))
             if np.isfinite(up_img).any() else 1.0
@@ -1168,7 +1192,7 @@ def plot_sample_lag_attention(
             cbar_ax=cax_up,
             separator_row=up_sep,
         )
-        _shade_warmup_min(ax_up, warmup_min)
+        _mark_warmup_line_min(ax_up, warmup_min)
         row += 1
 
     # Warmup-masked copies: the (L, T) heatmaps have time on axis=-1, so
