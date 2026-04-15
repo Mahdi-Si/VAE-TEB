@@ -108,10 +108,10 @@ PALETTE_EXTENDED = [
     COLOR_TEAL_DARK,
 ]
 SAVE_DPI = 600
-FONT_LABEL = plt.rcParams["axes.labelsize"]
-FONT_TITLE = plt.rcParams["axes.titlesize"]
-FONT_TICK = plt.rcParams["xtick.labelsize"]
-FONT_LEGEND = plt.rcParams["legend.fontsize"]
+FONT_LABEL = plt.rcParams["axes.labelsize"]*1.5
+FONT_TITLE = plt.rcParams["axes.titlesize"]*1.5
+FONT_TICK = plt.rcParams["xtick.labelsize"]*1.5
+FONT_LEGEND = plt.rcParams["legend.fontsize"]*1.5
 
 
 def _style_axes(ax: plt.Axes, *, grid: str = "major", minor_ticks: bool = True) -> None:
