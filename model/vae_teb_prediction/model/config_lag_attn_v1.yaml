@@ -43,6 +43,15 @@ general_config:
 model_config:
   VAE_model:
     # KL / beta schedule
+    # TODO(beta-annealing): ``kld_beta`` is the only value the trainer
+    # currently reads (the ``beta_*`` fields below are legacy and inert).
+    # 0.001 is intentionally tiny to avoid early posterior collapse, but it
+    # also means ``KL(q||p)`` is an under-regularised TE surrogate — the
+    # bottleneck is barely a bottleneck. Before taking TE curves for a
+    # paper, wire a real β schedule: e.g. linear warm-up from 1e-4 → 0.1
+    # over the first ~50 epochs, or free-bits (Kingma et al. 2016) with a
+    # ~0.1 nat floor per latent dim. Until then, interpret KL magnitudes
+    # with caution.
     beta_schedule: constant
     beta_start: 0.0
     beta_end: 1.0
@@ -67,7 +76,13 @@ model_config:
     lstm_layers: 2
     dropout: 0.1
     decoder_hidden: 128
-    logvar_clamp: [-8.0, 8.0]
+    logvar_clamp: [-5.0, 3.0]
+    # Latent stabilisers (see vae_teb_lag_attn_v1.py PriorHead / PosteriorHead).
+    # mu_scale bounds |mu_prior|; delta_mu_scale bounds |mu_post - mu_prior|.
+    # Running stats are populated BatchNorm-style from mu_post during training.
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
 
     # Attention
     max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
@@ -86,6 +101,13 @@ model_config:
     freeze_vae: true
     use_posterior: true
     sample_latent: false
+    # IMPORTANT: after loading the frozen VAE, call
+    #   model.fit_latent_stats(train_dataloader)
+    # once to replace the approximate per-rank EMA stats with exact,
+    # DDP-consistent training-set mean/variance of ``mu_post``. Then feed
+    # ``model.normalize_latent(mu_post)`` into the classifier head so the
+    # classifier sees well-conditioned, zero-mean / unit-std latents and
+    # is not dominated by any single drifted dim.
 
     hidden_dim: 128
     num_layers: 2
@@ -182,6 +204,10 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
+    # Global gradient-norm clipping. With LSTM + lag cross-attention + KL,
+    # occasional gradient spikes are expected. 0.5 is more conservative
+    # than the 1.0 default many tutorials use; loosen to 1.0 only if you
+    # see training stalling from overly aggressive clipping.
     gradient_clip_val: 0.5
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false

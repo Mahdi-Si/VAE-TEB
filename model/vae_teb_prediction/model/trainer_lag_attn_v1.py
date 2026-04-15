@@ -162,10 +162,16 @@ class SeqVaeLagAttnPl(LightningModelBase):
         lambda_full = float(self.hparams.get("lambda_full", 1.0))
         lambda_base = float(self.hparams.get("lambda_base", 0.5))
 
+        # Pass the dataset per-step validity mask so gaps (weight ≈ 0) do
+        # not pollute feat / base / KL losses. Required for a trustworthy
+        # TE curve. ``weight`` is always present in the HDF5 schema.
+        weight = getattr(batch, "weight", None)
+
         loss_dict = self.orig_model.compute_loss(
             forward_outputs=forward_outputs,
             y_st=y_st,
             y_ph=y_ph,
+            weight=weight,
             beta=beta,
             lambda_full=lambda_full,
             lambda_base=lambda_base,
@@ -179,6 +185,12 @@ class SeqVaeLagAttnPl(LightningModelBase):
             "kld_beta": beta,
             "lambda_full": lambda_full,
             "lambda_base": lambda_base,
+            # Tanh-bound saturation diagnostics. Expect ~0 when the bounds
+            # are dormant; sustained > 0.05 means the prior / posterior
+            # wants to drift beyond the configured scale — bump mu_scale
+            # or delta_mu_scale in config_lag_attn_v1.yaml.
+            "mu_prior_sat_frac": forward_outputs["mu_prior_sat_frac"],
+            "delta_mu_sat_frac": forward_outputs["delta_mu_sat_frac"],
         }
         return total_loss, metrics
 
@@ -228,6 +240,12 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
         logvar_clamp = vae_cfg.get("logvar_clamp")
         if isinstance(logvar_clamp, (list, tuple)) and len(logvar_clamp) == 2:
             kwargs["logvar_clamp"] = (float(logvar_clamp[0]), float(logvar_clamp[1]))
+        if "mu_scale" in vae_cfg:
+            kwargs["mu_scale"] = float(vae_cfg["mu_scale"])
+        if "delta_mu_scale" in vae_cfg:
+            kwargs["delta_mu_scale"] = float(vae_cfg["delta_mu_scale"])
+        if "latent_stats_momentum" in vae_cfg:
+            kwargs["latent_stats_momentum"] = float(vae_cfg["latent_stats_momentum"])
         return kwargs
 
     def create_model(self) -> None:

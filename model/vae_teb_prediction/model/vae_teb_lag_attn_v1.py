@@ -34,11 +34,12 @@ Shape conventions
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 
 from model.vae_teb_prediction.model.vae_teb_model_prediction import (
     CausalMultiChannelConvBlock,
@@ -247,6 +248,9 @@ class _CausalConvLstmEncoder(nn.Module):
             activation=nn.GELU,
             dropout=conv_dropout,
         )
+        # Caps the encoder exit to per-step ~N(0, 1). Prevents unbounded drift
+        # that previously let a single latent dim land at ~-25 in mu_prior.
+        self.output_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode ``(B, T, d_model)`` → ``(B, T, d_model)``."""
@@ -264,9 +268,9 @@ class _CausalConvLstmEncoder(nn.Module):
         lstm_out, _ = self.lstm(x_lin)
         lstm_out = self.lstm_norm(lstm_out)
 
-        # Stage D — concat + fusion
+        # Stage D — concat + fusion, then bound the exit.
         fused = torch.cat([conv_out, lstm_out], dim=-1)  # (B, T, 2*d_model)
-        out = self.fusion(fused)  # (B, T, d_model)
+        out = self.output_norm(self.fusion(fused))       # (B, T, d_model)
         return out
 
 
@@ -346,22 +350,46 @@ class PriorHead(nn.Module):
 
     Produces three outputs from the target state ``H^y``:
 
-    * ``mu_prior`` — prior mean, shape ``(B, T, d_z)``
+    * ``mu_prior`` — prior mean, shape ``(B, T, d_z)``. Bounded via
+      ``mu_scale * tanh(raw / mu_scale)`` so ``|mu_prior| <= mu_scale``.
     * ``logvar_prior`` — prior log-variance, shape ``(B, T, d_z)``, clamped
     * ``decoder_state`` — FHR-only conditioning for the baseline decoder,
       shape ``(B, T, d_model)``
+
+    Each of the three heads is fed through its own ``LayerNorm`` so the raw
+    encoder state cannot drift unbounded through any of them.
     """
 
     def __init__(
         self,
         d_model: int = 128,
         d_z: int = 24,
-        logvar_clamp: Tuple[float, float] = (-8.0, 8.0),
+        logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
         dropout: float = 0.1,
+        mu_scale: float = 5.0,
     ) -> None:
-        """Initialize the prior head."""
+        """Initialize the prior head.
+
+        Args:
+            d_model: Encoder state width.
+            d_z: Latent dimensionality.
+            logvar_clamp: ``(min, max)`` clamps for ``logvar_prior``.
+            dropout: Dropout used inside every internal ResidualMLP.
+            mu_scale: Saturation magnitude of the tanh-bound prior mean; must
+                be positive. Set large enough to be non-restrictive (5.0 gives
+                plenty of room around the ``N(0, I)`` reference).
+        """
         super().__init__()
+        if mu_scale <= 0.0:
+            raise ValueError(f"mu_scale must be > 0, got {mu_scale}")
         self.logvar_clamp = logvar_clamp
+        self.mu_scale = float(mu_scale)
+
+        # Per-head input LayerNorms decouple the three heads from shared
+        # drift in ``h_y`` and are the cheapest available stabilizer.
+        self.mu_input_norm = nn.LayerNorm(d_model)
+        self.logvar_input_norm = nn.LayerNorm(d_model)
+        self.dec_input_norm = nn.LayerNorm(d_model)
 
         self.mu_prior_head = ResidualMLP(
             input_dim=d_model,
@@ -395,12 +423,14 @@ class PriorHead(nn.Module):
         self, h_y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(mu_prior, logvar_prior, decoder_state)``."""
-        mu_prior = self.mu_prior_head(h_y)
-        logvar_prior = self.logvar_prior_head(h_y)
+        raw_mu = self.mu_prior_head(self.mu_input_norm(h_y))
+        mu_prior = self.mu_scale * torch.tanh(raw_mu / self.mu_scale)
+
+        logvar_prior = self.logvar_prior_head(self.logvar_input_norm(h_y))
         logvar_prior = torch.clamp(
             logvar_prior, min=self.logvar_clamp[0], max=self.logvar_clamp[1]
         )
-        decoder_state = self.decoder_state_head(h_y)
+        decoder_state = self.decoder_state_head(self.dec_input_norm(h_y))
         return mu_prior, logvar_prior, decoder_state
 
 
@@ -410,21 +440,49 @@ class PosteriorHead(nn.Module):
     Uses the residual parameterisation ``mu_post = mu_prior + delta_mu`` so that
     at initialisation (with ``delta_mu_head`` zero-inited) the KL divergence
     against the prior is close to zero. This keeps early training stable when
-    ``beta`` is small.
+    ``beta`` is small. ``delta_mu`` is additionally tanh-bounded to
+    ``[-delta_mu_scale, +delta_mu_scale]`` to prevent the posterior mean from
+    drifting arbitrarily far from the prior.
+
+    Per-modality ``LayerNorm`` is applied to ``h_y`` and the attended source
+    ``a`` before the fusion concat so their scales do not bleed into each
+    other.
     """
 
     def __init__(
         self,
         d_model: int = 128,
         d_z: int = 24,
-        logvar_clamp: Tuple[float, float] = (-8.0, 8.0),
+        logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
         dropout: float = 0.1,
+        delta_mu_scale: float = 3.0,
     ) -> None:
-        """Initialize the posterior head."""
-        super().__init__()
-        self.logvar_clamp = logvar_clamp
+        """Initialize the posterior head.
 
-        fused_in = 2 * d_model  # concat [H^y, A]
+        Args:
+            d_model: Encoder state width.
+            d_z: Latent dimensionality.
+            logvar_clamp: ``(min, max)`` clamps for ``logvar_post``.
+            dropout: Dropout used inside every internal ResidualMLP.
+            delta_mu_scale: Saturation magnitude of the tanh-bounded posterior
+                delta; must be positive. ``delta_mu`` is soft-limited so the
+                posterior mean stays within ``mu_prior +/- delta_mu_scale``.
+        """
+        super().__init__()
+        if delta_mu_scale <= 0.0:
+            raise ValueError(
+                f"delta_mu_scale must be > 0, got {delta_mu_scale}"
+            )
+        self.logvar_clamp = logvar_clamp
+        self.delta_mu_scale = float(delta_mu_scale)
+
+        # Per-modality input norms keep H^y and A on comparable scales before
+        # concatenation; the existing ResidualMLP internal LN then normalises
+        # the fused 2*d_model tensor.
+        self.h_y_norm = nn.LayerNorm(d_model)
+        self.a_norm = nn.LayerNorm(d_model)
+
+        fused_in = 2 * d_model  # concat [LN(H^y), LN(A)]
         self.fusion = ResidualMLP(
             input_dim=fused_in,
             hidden_dims=geometric_schedule(fused_in, d_model, 3),
@@ -458,8 +516,13 @@ class PosteriorHead(nn.Module):
             a: Attended source summary ``(B, T, d_model)``.
             mu_prior: Prior mean ``(B, T, d_z)`` (used for the residual add).
         """
-        fused = self.fusion(torch.cat([h_y, a], dim=-1))
-        delta_mu = self.delta_mu_head(fused)
+        fused = self.fusion(
+            torch.cat([self.h_y_norm(h_y), self.a_norm(a)], dim=-1)
+        )
+        raw_delta = self.delta_mu_head(fused)
+        # tanh(0) = 0, so with ``delta_mu_head`` zero-inited the bounded
+        # ``delta_mu`` is also identically zero at step 0.
+        delta_mu = self.delta_mu_scale * torch.tanh(raw_delta / self.delta_mu_scale)
         mu_post = mu_prior + delta_mu
         logvar_post = self.logvar_post_head(fused)
         logvar_post = torch.clamp(
@@ -558,6 +621,13 @@ class LagCrossAttention(nn.Module):
         self.use_entmax = bool(use_entmax) and _HAS_ENTMAX
         self.grad_checkpoint = bool(grad_checkpoint)
 
+        # Pre-norm: standard transformer pattern. Stabilises the dot-product
+        # scores before softmax / entmax. The kv norm broadcasts across the
+        # lag dim (channel-last LayerNorm normalises the trailing d_model
+        # axis of the (B, T, L, d_model) memory tensor).
+        self.q_norm = nn.LayerNorm(d_model)
+        self.kv_norm = nn.LayerNorm(d_model)
+
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
@@ -581,9 +651,12 @@ class LagCrossAttention(nn.Module):
         Mh = self.num_heads
         d = self.d_head
 
-        Q = self.W_q(h_y).view(B, T, Mh, d)                          # (B, T, Mh, d)
-        K = self.W_k(mem).view(B, T, L, Mh, d)                       # (B, T, L, Mh, d)
-        V = self.W_v(mem).view(B, T, L, Mh, d)                       # (B, T, L, Mh, d)
+        h_y_n = self.q_norm(h_y)
+        mem_n = self.kv_norm(mem)
+
+        Q = self.W_q(h_y_n).view(B, T, Mh, d)                        # (B, T, Mh, d)
+        K = self.W_k(mem_n).view(B, T, L, Mh, d)                     # (B, T, L, Mh, d)
+        V = self.W_v(mem_n).view(B, T, L, Mh, d)                     # (B, T, L, Mh, d)
 
         # Shaw-style: add per-lag bias to keys before the dot product.
         K = K + self.lag_embeddings[None, None, :, :, :]
@@ -673,7 +746,7 @@ class BaselineFutureDecoder(nn.Module):
         out_channels: int = 87,
         d_hidden: int = 128,
         dropout: float = 0.1,
-        logvar_clamp: Tuple[float, float] = (-8.0, 8.0),
+        logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
     ) -> None:
         """Initialize the baseline decoder."""
         super().__init__()
@@ -696,6 +769,9 @@ class BaselineFutureDecoder(nn.Module):
         nn.init.normal_(self.horizon_embedding, mean=0.0, std=0.02)
 
         self.refine = _HorizonRefine(d_hidden, kernel_size=3)
+        # Long skip around ``_HorizonRefine`` is added in forward(); the output
+        # norm stabilises the sum before the output heads.
+        self.out_norm = nn.LayerNorm(d_hidden)
         self.mean_head = nn.Linear(d_hidden, out_channels)
         self.logvar_head = nn.Linear(d_hidden, out_channels)
 
@@ -710,11 +786,14 @@ class BaselineFutureDecoder(nn.Module):
         h = self.proj(decoder_state)                       # (B, T, Dh)
         h = h.unsqueeze(2).expand(-1, -1, Hd, -1)           # (B, T, Hd, Dh)
         h = h + self.horizon_embedding[None, None, :, :]
+        h_skip = h                                          # identity path
 
         # Conv refinement along the horizon axis: fold B*T together.
         h_flat = h.reshape(B * T, Hd, Dh).transpose(1, 2).contiguous()  # (B*T, Dh, Hd)
         h_flat = self.refine(h_flat)
         h = h_flat.transpose(1, 2).reshape(B, T, Hd, Dh)
+
+        h = self.out_norm(h + h_skip)                       # long skip + LN
 
         mu_base = self.mean_head(h)                         # (B, T, Hd, C)
         logvar_base = self.logvar_head(h)
@@ -741,7 +820,7 @@ class ResidualFutureDecoder(nn.Module):
         out_channels: int = 87,
         d_hidden: int = 128,
         dropout: float = 0.1,
-        logvar_clamp: Tuple[float, float] = (-8.0, 8.0),
+        logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
     ) -> None:
         """Initialize the residual decoder."""
         super().__init__()
@@ -764,6 +843,11 @@ class ResidualFutureDecoder(nn.Module):
         nn.init.normal_(self.horizon_embedding, mean=0.0, std=0.02)
 
         self.refine = _HorizonRefine(d_hidden, kernel_size=3)
+        # Long skip around ``_HorizonRefine`` is added in forward(); the output
+        # norm stabilises the sum before the output heads. The mean head is
+        # zero-inited externally so ``delta_mu_src`` is still identically zero
+        # at step 0 regardless of the skip contribution.
+        self.out_norm = nn.LayerNorm(d_hidden)
         self.mean_head = nn.Linear(d_hidden, out_channels)
         self.logvar_head = nn.Linear(d_hidden, out_channels)
 
@@ -781,10 +865,13 @@ class ResidualFutureDecoder(nn.Module):
         h = self.proj(h_in)                                 # (B, T, Dh)
         h = h.unsqueeze(2).expand(-1, -1, Hd, -1)           # (B, T, Hd, Dh)
         h = h + self.horizon_embedding[None, None, :, :]
+        h_skip = h                                          # identity path
 
         h_flat = h.reshape(B * T, Hd, Dh).transpose(1, 2).contiguous()
         h_flat = self.refine(h_flat)
         h = h_flat.transpose(1, 2).reshape(B, T, Hd, Dh)
+
+        h = self.out_norm(h + h_skip)                       # long skip + LN
 
         delta_mu_src = self.mean_head(h)                    # (B, T, Hd, C)
         logvar_full = self.logvar_head(h)
@@ -873,7 +960,10 @@ class SeqVaeLagAttnV1(nn.Module):
         lstm_layers: int = 2,
         dropout: float = 0.1,
         decoder_hidden: int = 128,
-        logvar_clamp: Tuple[float, float] = (-8.0, 8.0),
+        logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
+        mu_scale: float = 5.0,
+        delta_mu_scale: float = 3.0,
+        latent_stats_momentum: float = 0.01,
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         init_weights: bool = True,
@@ -905,7 +995,20 @@ class SeqVaeLagAttnV1(nn.Module):
             dropout: Dropout used throughout residual MLPs / attention.
             decoder_hidden: Hidden width of the structured horizon decoders.
             logvar_clamp: ``(min, max)`` clamps applied to every log-variance
-                head in the model.
+                head in the model. Default ``(-5, 3)`` keeps ``var`` in
+                ``[e^{-5}, e^3] = [0.007, 20]`` which is well-conditioned for
+                the closed-form Gaussian KL.
+            mu_scale: Saturation magnitude of the tanh-bounded ``mu_prior``;
+                must be positive. Caps the prior mean to ``|mu_prior| <=
+                mu_scale``.
+            delta_mu_scale: Saturation magnitude of the tanh-bounded
+                posterior delta; must be positive. Caps ``|mu_post -
+                mu_prior| <= delta_mu_scale``.
+            latent_stats_momentum: EMA momentum used when updating the
+                ``mu_post_running_mean`` / ``mu_post_running_var`` buffers
+                during training. Buffers are populated with a BatchNorm-style
+                running average excluding warm-up steps. Use
+                :meth:`normalize_latent` downstream to consume them.
             use_entmax: If True, use ``entmax15`` attention normalisation when
                 the ``entmax`` package is importable.
             attention_grad_checkpoint: If True, wrap ``LagCrossAttention`` in
@@ -932,6 +1035,9 @@ class SeqVaeLagAttnV1(nn.Module):
             )
         self.c_u = expected_c_u
         self.max_lag = int(max_lag)
+        self.mu_scale = float(mu_scale)
+        self.delta_mu_scale = float(delta_mu_scale)
+        self.latent_stats_momentum = float(latent_stats_momentum)
 
         # --- Input adapters -------------------------------------------------
         self.target_adapter = TargetInputAdapter(
@@ -961,7 +1067,11 @@ class SeqVaeLagAttnV1(nn.Module):
 
         # --- Prior / Lag attention / Posterior ------------------------------
         self.prior_head = PriorHead(
-            d_model=d_model, d_z=d_z, logvar_clamp=logvar_clamp, dropout=dropout
+            d_model=d_model,
+            d_z=d_z,
+            logvar_clamp=logvar_clamp,
+            dropout=dropout,
+            mu_scale=self.mu_scale,
         )
         self.lag_bank = LagMemoryBankBuilder(max_lag=max_lag)
         self.lag_attn = LagCrossAttention(
@@ -974,7 +1084,11 @@ class SeqVaeLagAttnV1(nn.Module):
             grad_checkpoint=attention_grad_checkpoint,
         )
         self.posterior_head = PosteriorHead(
-            d_model=d_model, d_z=d_z, logvar_clamp=logvar_clamp, dropout=dropout
+            d_model=d_model,
+            d_z=d_z,
+            logvar_clamp=logvar_clamp,
+            dropout=dropout,
+            delta_mu_scale=self.delta_mu_scale,
         )
 
         # --- Decoders -------------------------------------------------------
@@ -998,6 +1112,23 @@ class SeqVaeLagAttnV1(nn.Module):
 
         # --- Analysis head (no parameters) ----------------------------------
         self.te_analysis = TEAnalysisHead()
+
+        # --- Latent running stats (for downstream classifier consumption) ---
+        # These buffers are maintained as an approximate, per-rank EMA on
+        # ``mu_post`` during training (see :meth:`_update_latent_running_stats`)
+        # and are useful for monitoring only. Under DDP each rank tracks its
+        # own stream and the checkpoint persists rank-0's values.
+        #
+        # For correct downstream use (freezing the VAE and feeding
+        # :meth:`normalize_latent` output into a classifier), call
+        # :meth:`fit_latent_stats` after VAE training: it runs one eval-mode
+        # pass over the training loader and writes exact, DDP-synchronised
+        # mean/variance into these buffers.
+        self.register_buffer("mu_post_running_mean", torch.zeros(d_z))
+        self.register_buffer("mu_post_running_var", torch.ones(d_z))
+        self.register_buffer(
+            "mu_post_running_count", torch.zeros((), dtype=torch.long)
+        )
 
         # --- Weight init ----------------------------------------------------
         if init_weights:
@@ -1029,6 +1160,194 @@ class SeqVaeLagAttnV1(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
+
+    @torch.no_grad()
+    def _update_latent_running_stats(self, mu_post: torch.Tensor) -> None:
+        """Update ``mu_post_running_{mean,var,count}`` from a live batch.
+
+        Pure BatchNorm-style EMA with momentum ``self.latent_stats_momentum``.
+        No CPU sync in the hot path. Warm-up steps are masked out before
+        aggregating so early, under-conditioned states do not bias the
+        downstream normaliser.
+
+        The (0, 1) initialisation of the buffers decays exponentially —
+        within ~500 batches at the default momentum of 0.01 the residual is
+        < 1%. Call :meth:`fit_latent_stats` post-training to replace these
+        approximate EMA stats with exact, DDP-consistent training-set
+        statistics before consuming them downstream.
+        """
+        valid_t = self._build_warmup_valid_mask(
+            mu_post.size(1), device=mu_post.device
+        )                                      # (T,)
+        if not bool(valid_t.any()):
+            return
+        flat = mu_post[:, valid_t, :].reshape(-1, mu_post.size(-1))
+        if flat.numel() == 0:
+            return
+        m = self.latent_stats_momentum
+        self.mu_post_running_mean.mul_(1.0 - m).add_(
+            flat.mean(dim=0), alpha=m
+        )
+        self.mu_post_running_var.mul_(1.0 - m).add_(
+            flat.var(dim=0, unbiased=False), alpha=m
+        )
+        self.mu_post_running_count.add_(int(flat.size(0)))
+
+    def normalize_latent(
+        self, z: torch.Tensor, eps: float = 1e-5
+    ) -> torch.Tensor:
+        """Z-score ``z`` (or ``mu_post``) using the running latent stats.
+
+        Args:
+            z: Latent tensor of shape ``(..., d_z)``. Works with both sampled
+                ``z`` and deterministic ``mu_post``.
+            eps: Small constant added to the variance before the square root
+                for numerical stability.
+
+        Returns:
+            ``(z - running_mean) / sqrt(running_var + eps)`` with the same
+            shape as ``z``. If the buffers are still at their initial values
+            (no training has happened), this reduces to a near-identity
+            shift.
+        """
+        std = (self.mu_post_running_var + eps).sqrt()
+        return (z - self.mu_post_running_mean) / std
+
+    @torch.no_grad()
+    def fit_latent_stats(
+        self,
+        dataloader,
+        max_batches: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        batch_to_inputs: Optional[Callable[[Any], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
+    ) -> int:
+        """Populate ``mu_post_running_{mean,var,count}`` exactly.
+
+        Runs one eval-mode pass over ``dataloader`` and replaces the EMA
+        training-time buffers with the exact mean and variance of
+        ``mu_post`` over all valid (non-warm-up) time steps. Safe under
+        DDP: when a process group is initialised, partial sums are
+        reduced across ranks with ``all_reduce`` so every rank ends up
+        with the same buffer values.
+
+        Call this after VAE training has converged and before freezing
+        the encoder for downstream classification.
+
+        Args:
+            dataloader: Any iterable that yields batches accepted by
+                ``batch_to_inputs``. A standard training DataLoader works.
+            max_batches: If set, stop after this many batches (useful for
+                sanity checks). ``None`` uses the full loader.
+            device: Device on which to run the forward pass. Defaults to
+                the device of the model's first parameter.
+            batch_to_inputs: Callable mapping a batch object to the triple
+                ``(y_st, y_ph, u_stream)``. The default expects an
+                attribute-style batch (``batch.fhr_st``, ``batch.fhr_ph``,
+                and either ``batch.up_ph`` alone or ``torch.cat([batch.up_st,
+                batch.up_ph], dim=-1)`` depending on ``self.use_up_st``) —
+                i.e. the layout produced by the project's
+                ``CombinedHDF5Dataset`` loader.
+
+        Returns:
+            Total number of time-step samples aggregated across ranks.
+        """
+        try:
+            import torch.distributed as dist
+            dist_active = dist.is_available() and dist.is_initialized()
+        except Exception:  # pragma: no cover - distributed not available
+            dist_active = False
+            dist = None  # type: ignore[assignment]
+
+        if device is None:
+            device = next(self.parameters()).device
+        if batch_to_inputs is None:
+            batch_to_inputs = self._default_batch_to_inputs
+
+        was_training = self.training
+        self.eval()
+
+        d_z = self.d_z
+        # Numerically-stable sums in float64; one ``O(dataset)`` pass is
+        # fine and the fp32 rounding would otherwise bias the variance.
+        sum_x = torch.zeros(d_z, dtype=torch.float64, device=device)
+        sum_xx = torch.zeros(d_z, dtype=torch.float64, device=device)
+        count = torch.zeros((), dtype=torch.float64, device=device)
+
+        try:
+            for i, batch in enumerate(dataloader):
+                if max_batches is not None and i >= max_batches:
+                    break
+                y_st, y_ph, u_stream = batch_to_inputs(batch)
+                y_st = y_st.to(device, non_blocking=True)
+                y_ph = y_ph.to(device, non_blocking=True)
+                u_stream = u_stream.to(device, non_blocking=True)
+
+                enc = self.encode_only(y_st, y_ph, u_stream, sample_z=False)
+                mu_post = enc["mu_post"]                          # (B, T, d_z)
+                valid_t = self._build_warmup_valid_mask(
+                    mu_post.size(1), device=mu_post.device
+                )
+                flat = mu_post[:, valid_t, :].reshape(-1, d_z).double()
+                sum_x += flat.sum(dim=0)
+                sum_xx += (flat * flat).sum(dim=0)
+                count += flat.size(0)
+        finally:
+            if was_training:
+                self.train()
+
+        if dist_active:
+            dist.all_reduce(sum_x, op=dist.ReduceOp.SUM)
+            dist.all_reduce(sum_xx, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+
+        n_samples = int(count.item())
+        # Refuse to overwrite the buffers with zeros. Callers would otherwise
+        # silently feed hugely-scaled latents into the classifier (division
+        # by sqrt(eps)). Better to raise so the caller fixes the dataloader.
+        if n_samples == 0:
+            raise RuntimeError(
+                "fit_latent_stats: dataloader yielded zero valid samples "
+                "(no non-warm-up time steps). Check that the loader is not "
+                "empty and that sequence_length > warmup_period."
+            )
+
+        mean = sum_x / count
+        var = (sum_xx / count - mean * mean).clamp_min(0.0)
+
+        self.mu_post_running_mean.copy_(mean.float())
+        self.mu_post_running_var.copy_(var.float())
+        self.mu_post_running_count.copy_(count.long())
+
+        # Single post-fit log line so the caller can confirm the stats
+        # landed sensibly without manually inspecting buffers.
+        logger.info(
+            "[fit_latent_stats] aggregated {n} samples across {r} rank(s); "
+            "mean range [{mn:+.3f}, {mx:+.3f}], var range [{vn:.3f}, {vx:.3f}]",
+            n=n_samples,
+            r=(torch.distributed.get_world_size() if dist_active else 1),
+            mn=float(self.mu_post_running_mean.min()),
+            mx=float(self.mu_post_running_mean.max()),
+            vn=float(self.mu_post_running_var.min()),
+            vx=float(self.mu_post_running_var.max()),
+        )
+        return n_samples
+
+    def _default_batch_to_inputs(
+        self, batch: Any
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract ``(y_st, y_ph, u_stream)`` from an attribute-style batch.
+
+        Matches the convention used by :class:`SeqVaeLagAttnPl`.
+        """
+        y_st = batch.fhr_st
+        y_ph = batch.fhr_ph
+        up_ph = batch.up_ph
+        if self.use_up_st:
+            up_st = batch.up_st
+            u_stream = torch.cat([up_st, up_ph], dim=-1)
+        else:
+            u_stream = up_ph
+        return y_st, y_ph, u_stream
 
     def forward(
         self,
@@ -1063,6 +1382,23 @@ class SeqVaeLagAttnV1(nn.Module):
 
         mu_post, logvar_post = self.posterior_head(H_y, A, mu_prior)
         z = self.reparameterize(mu_post, logvar_post)      # (B, T, d_z)
+
+        # Tanh saturation diagnostics. Values >> 0 indicate the prior or
+        # posterior wants to drift beyond its tanh bound and gradients are
+        # being starved. Cheap to compute; logged by the trainer.
+        with torch.no_grad():
+            mu_prior_sat_frac = (
+                mu_prior.abs() >= (0.99 * self.mu_scale)
+            ).float().mean()
+            delta_mu_sat_frac = (
+                (mu_post - mu_prior).abs() >= (0.99 * self.delta_mu_scale)
+            ).float().mean()
+
+        # Update running stats on mu_post for downstream consumers. Training
+        # mode only; no-grad. Warm-up steps are excluded because they carry
+        # under-conditioned encoder states.
+        if self.training:
+            self._update_latent_running_stats(mu_post)
 
         mu_base, logvar_base = self.baseline_decoder(decoder_state)
         delta_mu_src, logvar_full = self.residual_decoder(decoder_state, z)
@@ -1100,6 +1436,8 @@ class SeqVaeLagAttnV1(nn.Module):
             "kld_per_t": kld_per_t,
             "te_lag_map": te_lag_map,
             "warmup_mask": warmup_mask,
+            "mu_prior_sat_frac": mu_prior_sat_frac,
+            "delta_mu_sat_frac": delta_mu_sat_frac,
         }
 
     def encode_only(
@@ -1223,25 +1561,46 @@ class SeqVaeLagAttnV1(nn.Module):
         logvar_post: torch.Tensor,
         *,
         reduce_mean: bool = True,
+        weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Aggregate the per-step closed-form KL into a scalar loss.
+
+        Args:
+            weight: Optional validity mask of shape ``(B, T)`` taking values
+                in ``[0, 1]``. Combines multiplicatively with the warm-up
+                mask so that KL at gap / invalid time steps contributes zero
+                to the loss and zero to the denominator. If ``None``, falls
+                back to warm-up-only averaging (legacy behaviour).
+        """
         kld = self.kld_tensor(
             mu_prior=mu_prior,
             logvar_prior=logvar_prior,
             mu_post=mu_post,
             logvar_post=logvar_post,
             mask_warmup=False,
-        )
-        warmup = self._warmup_steps(kld.size(1))
+        )                                                # (B, T, d_z)
+        B, T, d_z = kld.shape
+        warmup = self._warmup_steps(T)
+        device = kld.device
+        dtype = kld.dtype
+
+        # Build a non-boolean (B, T) validity mask that combines warm-up
+        # exclusion with the optional per-step weight.
+        time_mask = torch.ones(T, device=device, dtype=dtype)
         if warmup > 0:
-            if warmup >= kld.size(1):
-                return torch.zeros((), device=kld.device, dtype=kld.dtype)
-            kld = kld[:, warmup:, :]
+            time_mask[:warmup] = 0.0
+        full_mask = time_mask.unsqueeze(0).expand(B, T)   # (B, T)
+        if weight is not None:
+            full_mask = full_mask * weight.to(device=device, dtype=dtype)
+
+        # Expand across the latent dim and aggregate.
+        mask_btd = full_mask.unsqueeze(-1)                # (B, T, 1)
         if reduce_mean:
-            mean_val = torch.nanmean(kld)
-            if torch.isnan(mean_val):
-                return torch.zeros((), device=kld.device, dtype=kld.dtype)
-            return mean_val
-        return torch.nan_to_num(kld).sum()
+            denom = mask_btd.sum() * float(d_z)
+            if float(denom) <= 0.0:
+                return torch.zeros((), device=device, dtype=dtype)
+            return (kld * mask_btd).sum() / denom
+        return (kld * mask_btd).sum()
 
     # ------------------------------------------------------------------
     # Loss
@@ -1253,6 +1612,7 @@ class SeqVaeLagAttnV1(nn.Module):
         y_st: torch.Tensor,
         y_ph: torch.Tensor,
         *,
+        weight: Optional[torch.Tensor] = None,
         compute_kld_loss: bool = True,
         beta: float = 1.0,
         lambda_full: float = 1.0,
@@ -1273,6 +1633,16 @@ class SeqVaeLagAttnV1(nn.Module):
             forward_outputs: Dict returned by :meth:`forward`.
             y_st: FHR scattering features ``(B, T, 43)``.
             y_ph: FHR phase features ``(B, T, 44)``.
+            weight: Optional per-time-step validity mask from the dataset,
+                shape ``(B, T)`` with values in ``[0, 1]``. When provided,
+                (a) each future-target entry is masked by
+                ``weight[b, t] * weight[b, t+tau+1]`` so that gaps at either
+                the anchor or the future step contribute zero to the loss,
+                and (b) per-step KL is masked by ``weight[b, t]``. When
+                ``None``, only the warm-up mask is applied (legacy
+                behaviour). Passing the dataset ``weight`` field is the
+                correct setting for a trustworthy TE curve — see
+                ``new_model.md`` §"Important practical loss fix".
             compute_kld_loss: If False the KL term is set to 0 (ablation).
             beta: Weight on the KL term.
             lambda_full: Weight on ``L_feat``.
@@ -1289,6 +1659,7 @@ class SeqVaeLagAttnV1(nn.Module):
         B, T, Hd, C = mu_full.shape
         T_valid = T - Hd
         device = Y.device
+        dtype = Y.dtype
 
         # --- Future target via unfold --------------------------------------
         # Y_shift[:, t, :] = Y[:, t+1, :]
@@ -1301,15 +1672,37 @@ class SeqVaeLagAttnV1(nn.Module):
         mu_full_valid = mu_full[:, :T_valid, :, :]
         mu_base_valid = mu_base[:, :T_valid, :, :]
 
-        # --- Warmup mask on the anchor axis --------------------------------
+        # --- Warm-up mask on the anchor axis (always applied) --------------
         warmup = self._warmup_steps(T)
-        mask_t = torch.zeros(T_valid, dtype=Y.dtype, device=device)
+        warmup_t = torch.zeros(T_valid, dtype=dtype, device=device)
         if warmup < T_valid:
-            mask_t[warmup:] = 1.0
-        mask_feat = mask_t[None, :, None, None]            # (1, T_valid, 1, 1)
+            warmup_t[warmup:] = 1.0                        # (T_valid,)
 
-        num_valid_t = mask_feat.sum().clamp_min(1.0)
-        denom = num_valid_t * float(Hd * C) * float(B)
+        # --- Optional dataset weight mask ----------------------------------
+        # Build a per-(b, t, tau) weighting from weight[b, t] * weight[b, t+tau+1].
+        if weight is not None:
+            w = weight.to(device=device, dtype=dtype)      # (B, T)
+            anchor_w = w[:, :T_valid]                       # (B, T_valid)
+            # Future-step weight aligned with Y_plus via the same unfold.
+            target_w_shift = w[:, 1:]                       # (B, T-1)
+            target_w = target_w_shift.unfold(
+                dimension=1, size=Hd, step=1
+            )                                               # (B, T_valid, Hd)
+            # (B, T_valid, Hd, 1) = anchor * target, then broadcast over C.
+            mask_feat = (
+                warmup_t[None, :, None, None]
+                * anchor_w[:, :, None, None]
+                * target_w[:, :, :, None]
+            )
+        else:
+            mask_feat = warmup_t[None, :, None, None].expand(
+                B, T_valid, Hd, 1
+            )
+
+        # Denominator counts *effective* entries and always includes the
+        # channel axis so the scale matches a mean over (B, T_valid, Hd, C).
+        denom = mask_feat.sum() * float(C)
+        denom = denom.clamp_min(1.0)
 
         diff_full = (mu_full_valid - Y_plus) ** 2
         diff_base = (mu_base_valid - Y_plus) ** 2
@@ -1324,9 +1717,10 @@ class SeqVaeLagAttnV1(nn.Module):
                 mu_post=forward_outputs["mu_post"],
                 logvar_post=forward_outputs["logvar_post"],
                 reduce_mean=True,
+                weight=weight,
             )
         else:
-            kld_loss = torch.zeros((), device=device, dtype=Y.dtype)
+            kld_loss = torch.zeros((), device=device, dtype=dtype)
 
         total_loss = (
             lambda_full * feat_loss
@@ -1338,7 +1732,7 @@ class SeqVaeLagAttnV1(nn.Module):
             "base_loss": base_loss,
             "kld_loss": kld_loss,
             "total_loss": total_loss,
-            "beta": torch.tensor(float(beta), device=device, dtype=Y.dtype),
+            "beta": torch.tensor(float(beta), device=device, dtype=dtype),
         }
 
 
@@ -1356,6 +1750,7 @@ if __name__ == "__main__":
         "attended_source", "attn_weights",
         "mu_base", "logvar_base", "delta_mu_src", "mu_full", "logvar_full",
         "raw_future_pred", "kld_per_t", "te_lag_map", "warmup_mask",
+        "mu_prior_sat_frac", "delta_mu_sat_frac",
     }
 
     y_st = torch.randn(B, T, 43)
@@ -1437,7 +1832,7 @@ if __name__ == "__main__":
     print("[backward] OK")
 
     # ---- Test 2: fallback (no up_st) --------------------------------------
-    model_fb = SeqVaeLagAttnV1(use_up_st=False)
+    model_fb = SeqVaeLagAttnV1(use_up_st=False, c_u=58)
     u_fallback = torch.randn(B, T, 58)
     outs_fb = model_fb(y_st, y_ph, u_fallback)
     assert outs_fb["mu_full"].shape == (B, T, 30, 87)
@@ -1449,7 +1844,39 @@ if __name__ == "__main__":
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[params] total={n_params:,}  trainable={n_trainable:,}")
 
+    # ---- Latent-stabiliser invariants -------------------------------------
+    mu_prior_max = outs["mu_prior"].abs().max().item()
+    delta_mu_max = (outs["mu_post"] - outs["mu_prior"]).abs().max().item()
+    assert mu_prior_max <= model.mu_scale + 1e-4, (
+        f"mu_prior exceeded tanh bound: {mu_prior_max} > {model.mu_scale}"
+    )
+    assert delta_mu_max <= model.delta_mu_scale + 1e-4, (
+        f"delta_mu exceeded tanh bound: {delta_mu_max} > {model.delta_mu_scale}"
+    )
+    print(
+        f"[bounds] |mu_prior|_max={mu_prior_max:.3f} (<= {model.mu_scale})"
+        f"  |delta_mu|_max={delta_mu_max:.3f} (<= {model.delta_mu_scale})"
+    )
+
+    # ---- Running-stats buffer check ---------------------------------------
+    # A single training-mode forward should have populated the buffers.
+    model.train()
+    _ = model(y_st, y_ph, u_full)
+    assert int(model.mu_post_running_count.item()) > 0, (
+        "mu_post_running_count was not updated in training mode"
+    )
+    # normalize_latent should produce a near-zero-mean / unit-std output
+    # on the same batch used to populate the buffers.
+    with torch.no_grad():
+        z_norm = model.normalize_latent(outs["mu_post"])
+    print(
+        f"[latent-norm] count={int(model.mu_post_running_count.item())}"
+        f"  z_norm.mean~{z_norm.mean().item():+.3f}"
+        f"  z_norm.std~{z_norm.std().item():.3f}"
+    )
+
     # ---- TE surrogate scalar ----------------------------------------------
+    model.eval()
     te_scalar = model.measure_transfer_entropy(y_st, y_ph, u_full, reduce_mean=True)
     print(f"[te] scalar KL = {te_scalar.item():.3e} (posterior ~ prior at init)")
 
