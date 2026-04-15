@@ -123,6 +123,91 @@ def _extract_label(batch: Any, idx: int) -> Optional[int]:
 
 
 # -----------------------------------------------------------------------------
+# Raw-signal denormalisation (fhr / up)
+# -----------------------------------------------------------------------------
+
+
+def resolve_fhr_up_denorm_stats(
+    loader: Any,
+) -> Dict[str, Dict[str, float]]:
+    """Resolve ``(mean, std)`` for ``fhr`` and ``up`` from a loader.
+
+    The HDF5 dataloader z-score normalises ``fhr`` and ``up`` using
+    per-field scalar stats loaded from the stats HDF5. To plot the
+    **actual raw** traces we need to invert that normalisation via
+    ``x_raw = x_norm * std + mean``. This helper reaches through the
+    loader to fetch those stats when normalisation is enabled, and
+    returns an empty dict when it is not (e.g. a loader without a
+    stats file, or when ``fhr`` / ``up`` are not in ``normalize_fields``).
+
+    Args:
+        loader: DataLoader (or anything exposing a ``.dataset``) that
+            wraps a ``CombinedHDF5Dataset``.
+
+    Returns:
+        ``{"fhr": {"mean": .., "std": ..}, "up": {"mean": .., "std": ..}}``
+        containing only the fields that were actually normalised. Empty
+        dict when the loader has no stats.
+    """
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return {}
+
+    # Unwrap common PyTorch wrappers (Subset / ConcatDataset).
+    for _ in range(3):
+        inner = getattr(dataset, "dataset", None)
+        if inner is None or inner is dataset:
+            break
+        dataset = inner
+
+    getter = getattr(dataset, "get_normalization_stats", None)
+    stats_raw = getter() if callable(getter) else getattr(
+        dataset, "normalization_stats", None
+    )
+    if not isinstance(stats_raw, dict) or not stats_raw:
+        return {}
+    stats_all: Dict[str, Any] = stats_raw
+
+    out: Dict[str, Dict[str, float]] = {}
+    for field in ("fhr", "up"):
+        entry = stats_all.get(field)
+        if not isinstance(entry, dict):
+            continue
+        mean = entry.get("mean")
+        std = entry.get("std")
+        if mean is None or std is None:
+            continue
+        try:
+            out[field] = {"mean": float(mean), "std": float(std)}
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def denormalize_signal(
+    signal: Optional[np.ndarray],
+    stats: Optional[Dict[str, float]],
+) -> Optional[np.ndarray]:
+    """Invert the z-score normalisation applied to ``fhr`` / ``up``.
+
+    Args:
+        signal: Normalised 1-D array (or ``None``).
+        stats: ``{"mean": ..., "std": ...}`` from
+            :func:`resolve_fhr_up_denorm_stats`, or ``None`` to skip
+            denormalisation.
+
+    Returns:
+        ``signal * std + mean`` as a ``float32`` array when stats are
+        available; the input unchanged otherwise.
+    """
+    if signal is None or stats is None:
+        return signal
+    return np.asarray(signal, dtype=np.float32) * float(stats["std"]) + float(
+        stats["mean"]
+    )
+
+
+# -----------------------------------------------------------------------------
 # Primary collectors (replace the old raw-FHR workflow)
 # -----------------------------------------------------------------------------
 
@@ -313,6 +398,13 @@ def collect_predictions(
     samples: List[Dict[str, Any]] = []
     processed = 0
 
+    # Stats for reversing fhr/up z-score normalisation before plotting.
+    # When the loader is not normalising these fields, the helper returns
+    # an empty dict and ``denormalize_signal`` becomes a no-op.
+    denorm_stats = resolve_fhr_up_denorm_stats(loader)
+    fhr_stats = denorm_stats.get("fhr")
+    up_stats = denorm_stats.get("up")
+
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
             batch_size = int(batch.fhr_st.size(0))
@@ -379,8 +471,12 @@ def collect_predictions(
                     "te_lag": te_lag_np[idx],
                     "kld_t": kld_t_np[idx],
                     "kld_per_dim": kld_per_dim_np[idx],
-                    "fhr": fhr_np[idx] if fhr_np is not None else None,
-                    "up": up_np[idx] if up_np is not None else None,
+                    "fhr": denormalize_signal(
+                        fhr_np[idx] if fhr_np is not None else None, fhr_stats
+                    ),
+                    "up": denormalize_signal(
+                        up_np[idx] if up_np is not None else None, up_stats
+                    ),
                     "guid": _extract_guid(batch, idx),
                     "epoch": _extract_epoch(batch, idx),
                     "label": _extract_label(batch, idx),

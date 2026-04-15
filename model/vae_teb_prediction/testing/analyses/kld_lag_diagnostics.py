@@ -36,6 +36,8 @@ from model.vae_teb_prediction.testing.collectors import (
     _extract_epoch,
     _extract_guid,
     _extract_label,
+    denormalize_signal,
+    resolve_fhr_up_denorm_stats,
 )
 from model.vae_teb_prediction.testing.plot_single_samples import (
     plot_sample_lag_attention,
@@ -95,6 +97,13 @@ def run_kld_lag_diagnostics(
     records: List[Dict[str, Any]] = []
     processed = 0
 
+    # Stats for reversing fhr/up z-score normalisation before plotting.
+    # The HDF5 dataloader normalises the raw traces; inverting that here
+    # lets the plots show the actual physiological signal (bpm / mmHg).
+    denorm_stats = resolve_fhr_up_denorm_stats(loader)
+    fhr_stats = denorm_stats.get("fhr")
+    up_stats = denorm_stats.get("up")
+
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
             outputs = runner.forward(batch)
@@ -111,12 +120,16 @@ def run_kld_lag_diagnostics(
             if hasattr(batch, "up_ph") and isinstance(batch.up_ph, torch.Tensor):
                 up_ph_np = batch.up_ph.detach().cpu().numpy()
 
+            # Raw fhr / up traces: invert the z-score normalisation the
+            # dataloader applied so the plots show physiological units.
             fhr_np = None
             if hasattr(batch, "fhr") and isinstance(batch.fhr, torch.Tensor):
                 fhr_np = batch.fhr.detach().cpu().numpy()
+                fhr_np = denormalize_signal(fhr_np, fhr_stats)
             up_np = None
             if hasattr(batch, "up") and isinstance(batch.up, torch.Tensor):
                 up_np = batch.up.detach().cpu().numpy()
+                up_np = denormalize_signal(up_np, up_stats)
 
             # Closed-form KL per latent dim per timestep.
             mu_prior = outputs["mu_prior"]
