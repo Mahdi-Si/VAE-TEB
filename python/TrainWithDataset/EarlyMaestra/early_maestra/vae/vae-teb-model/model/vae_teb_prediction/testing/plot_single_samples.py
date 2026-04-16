@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LogNorm
 from matplotlib.gridspec import GridSpec
 
 from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (
@@ -605,6 +606,7 @@ def _draw_heatmap_direct(
     cmap: str,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    norm: Optional[Any] = None,
     ylabel: str = "",
     title: str = "",
     y_extent: Optional[float] = None,
@@ -650,16 +652,21 @@ def _draw_heatmap_direct(
     y_top = float(y_extent) if y_extent is not None else (rows - 0.5)
     y_bot = 0.0 if y_extent is not None else -0.5
 
-    im = ax.imshow(
-        data,
+    # When an explicit ``norm`` (e.g. LogNorm) is supplied it overrides
+    # ``vmin`` / ``vmax``; matplotlib raises if both are passed.
+    imshow_kwargs: Dict[str, Any] = dict(
         aspect="auto",
         origin="lower",
         cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
         interpolation="nearest",
         extent=(0.0, t_max_min, y_bot, y_top),
     )
+    if norm is not None:
+        imshow_kwargs["norm"] = norm
+    else:
+        imshow_kwargs["vmin"] = vmin
+        imshow_kwargs["vmax"] = vmax
+    im = ax.imshow(data, **imshow_kwargs)
     if separator_row is not None:
         ax.axhline(
             y=float(separator_row),
@@ -1001,11 +1008,16 @@ def plot_sample_lag_attention(
        with the **y-axis expressed in minutes** — ``lag_minutes[k] =
        k × decim / fs_raw / 60`` (4-second steps by default).
     5. TE lag attribution ``kld_per_t × mean_heads(α)`` on the same
-       time-in-minutes × lag-in-minutes grid.
-    6. Attention analysis: argmax lag per anchor (blue, left y-axis,
+       time-in-minutes × lag-in-minutes grid (``inferno``, linear).
+    6. Same TE lag attribution drawn with a ``seismic`` diverging
+       colormap on a linear scale — extra contrast for mid-range values.
+    7. Same TE lag attribution drawn with ``seismic`` on a log scale
+       (``LogNorm``) — pops small but non-zero regions that the linear
+       views compress into near-black/near-white.
+    8. Attention analysis: argmax lag per anchor (blue, left y-axis,
        in minutes) and head-averaged Shannon entropy (orange, right
        y-axis, in nats). Both curves are warmup-masked.
-    7. Lag analysis: time-averaged head-averaged attention distribution
+    9. Lag analysis: time-averaged head-averaged attention distribution
        as a bar chart with the lag axis in minutes.
 
     Column-one panels and heatmap colorbars live in separate GridSpec
@@ -1103,13 +1115,16 @@ def plot_sample_lag_attention(
     has_fhr_feats = fhr_st is not None and fhr_st.ndim == 2
     has_up_feats = up_st is not None and up_st.ndim == 2
 
-    # Row order: raw, [fhr_feats], [up_feats], attn, te_lag, argmax+ent, lag mass.
+    # Row order: raw, [fhr_feats], [up_feats], attn, te_lag (inferno),
+    # te_lag (seismic), te_lag (seismic+log), argmax+ent, lag mass.
+    # The two extra TE panels give diverging- and log-scaled views of the
+    # same ``te_lag_map`` so small but non-zero regions become visible.
     row_heights: List[float] = [1.0]
     if has_fhr_feats:
         row_heights.append(1.6)
     if has_up_feats:
         row_heights.append(1.6)
-    row_heights.extend([1.9, 1.9, 1.1, 1.2])
+    row_heights.extend([1.9, 1.9, 1.9, 1.9, 1.1, 1.2])
     n_rows = len(row_heights)
     # Figure height scales with the total of the row ratios so adding the
     # FHR/UP feature rows doesn't squash the rest of the stack. The base
@@ -1239,14 +1254,21 @@ def plot_sample_lag_attention(
         ax_attn.legend(loc="upper right", fontsize=6, frameon=True)
     row += 1
 
-    # --- Row ?: TE lag attribution ---
+    # --- Row ?: TE lag attribution (inferno, linear) ---
+    # Peak used by the three TE panels below so linear/seismic/log views
+    # share a common upper scale and are comparable side-by-side.
+    te_vmax = (
+        float(np.nanmax(te_lag_img)) if np.isfinite(te_lag_img).any() else 1.0
+    )
+    te_vmax = te_vmax if te_vmax > 0 else 1.0
+
     ax_te = fig.add_subplot(gs[row, 0])
     cax_te = fig.add_subplot(gs[row, 1])
     _draw_heatmap_direct(
         ax_te, te_lag_img,
         t_max_min=t_max_min,
         cmap="inferno",
-        vmin=0.0,
+        vmin=0.0, vmax=te_vmax,
         ylabel="Lag (min)",
         title=r"TE lag attribution  $\mathrm{KL}_t \cdot \bar{\alpha}(t, k)$",
         cbar_ax=cax_te,
@@ -1256,6 +1278,58 @@ def plot_sample_lag_attention(
     ax_te.set_ylim(0.0, lag_span_min)
     ax_te.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_te, warmup_min)
+    row += 1
+
+    # --- Row ?: TE lag attribution (seismic, linear) ---
+    # Diverging colormap on [0, te_vmax]: low values map to the cool
+    # (blue) half, mid values to near-white, and the peaks to saturated
+    # red. Useful when the inferno view is dominated by the top 10% and
+    # smaller regions need extra contrast.
+    ax_te_seis = fig.add_subplot(gs[row, 0])
+    cax_te_seis = fig.add_subplot(gs[row, 1])
+    _draw_heatmap_direct(
+        ax_te_seis, te_lag_img,
+        t_max_min=t_max_min,
+        cmap="seismic",
+        vmin=0.0, vmax=te_vmax,
+        ylabel="Lag (min)",
+        title=r"TE lag attribution (seismic, linear)",
+        cbar_ax=cax_te_seis,
+        cbar_label="TE mass",
+        y_extent=lag_span_min,
+    )
+    ax_te_seis.set_ylim(0.0, lag_span_min)
+    ax_te_seis.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    _shade_warmup_min(ax_te_seis, warmup_min)
+    row += 1
+
+    # --- Row ?: TE lag attribution (seismic, log) ---
+    # ``LogNorm`` requires a strictly-positive ``vmin``; we clamp to either
+    # the smallest positive observed value or ``te_vmax * 1e-3`` so two
+    # orders of magnitude of dynamic range always fit on the colorbar.
+    # Non-positive / NaN pixels stay transparent in imshow (LogNorm maps
+    # them under vmin → bottom-of-colormap, which is blue for seismic).
+    finite_positive = te_lag_img[np.isfinite(te_lag_img) & (te_lag_img > 0)]
+    if finite_positive.size > 0:
+        log_vmin = max(float(finite_positive.min()), te_vmax * 1e-3)
+    else:
+        log_vmin = te_vmax * 1e-3
+    ax_te_log = fig.add_subplot(gs[row, 0])
+    cax_te_log = fig.add_subplot(gs[row, 1])
+    _draw_heatmap_direct(
+        ax_te_log, te_lag_img,
+        t_max_min=t_max_min,
+        cmap="seismic",
+        norm=LogNorm(vmin=log_vmin, vmax=te_vmax),
+        ylabel="Lag (min)",
+        title=r"TE lag attribution (seismic, log)",
+        cbar_ax=cax_te_log,
+        cbar_label="TE mass (log)",
+        y_extent=lag_span_min,
+    )
+    ax_te_log.set_ylim(0.0, lag_span_min)
+    ax_te_log.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    _shade_warmup_min(ax_te_log, warmup_min)
     row += 1
 
     # --- Row ?: Attention analysis — argmax lag + entropy over time ---
