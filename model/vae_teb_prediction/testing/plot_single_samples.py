@@ -318,6 +318,7 @@ def _imshow_panel(
     ylabel: str = "",
     separator_row: Optional[int] = None,
     title: str = "",
+    invert_y: bool = False,
 ) -> Any:
     """Draw a ``(C, T)`` heatmap that shares the pipeline-wide time axis.
 
@@ -371,6 +372,11 @@ def _imshow_panel(
     ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
     if title:
         ax.set_title(title, fontsize=FONT_LABEL)
+    if invert_y:
+        # Place row 0 at the top so the scattering order-0 coefficient
+        # sits at the top of the panel; higher st rows go downward, and
+        # the ph block sits below that after the separator line.
+        ax.invert_yaxis()
     _add_colorbar(ax.figure, im, ax, label="")  # type: ignore[arg-type]
     return im
 
@@ -510,11 +516,15 @@ def plot_sample_lag_attn_diagnostic(
     attn_mean_m = _mask_warmup_time_axis(attn_mean, warm, axis=-1)
     te_lag_img_m = _mask_warmup_time_axis(te_lag_img, warm, axis=-1)
 
-    # Row 1: mu_full_avg (C, T).
+    # Row 1: mu_full_avg (C, T). Channels are laid out as
+    # ``fhr_st[0..fhr_st_end-1] ‖ fhr_ph[fhr_st_end..C-1]``; ``invert_y``
+    # puts st order-0 on top, higher st orders below it, then ph under
+    # the dashed separator.
     _imshow_panel(
         axes[1], mu_full_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="mu_full_avg", separator_row=fhr_st_end - 1,
         title="Average feature forecast (mu_full)",
+        invert_y=True,
     )
 
     # Row 2: y_plus_avg (C, T).
@@ -522,6 +532,7 @@ def plot_sample_lag_attn_diagnostic(
         axes[2], y_plus_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="y_plus_avg", separator_row=fhr_st_end - 1,
         title="Ground truth (y_plus)",
+        invert_y=True,
     )
 
     # Row 3: residual (C, T).
@@ -529,6 +540,7 @@ def plot_sample_lag_attn_diagnostic(
         axes[3], residual_img_m, t_max=t_max, cmap="RdBu_r", symmetric=True,
         ylabel="residual", separator_row=fhr_st_end - 1,
         title="mu_full - y_plus",
+        invert_y=True,
     )
 
     # Row 4: latent z.
@@ -613,6 +625,7 @@ def _draw_heatmap_direct(
     cbar_ax: Optional[plt.Axes] = None,
     cbar_label: str = "",
     separator_row: Optional[float] = None,
+    invert_y: bool = False,
 ) -> Any:
     """Draw a ``(rows, T)`` heatmap and route the colorbar to ``cbar_ax``.
 
@@ -679,6 +692,11 @@ def _draw_heatmap_direct(
     ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
     if title:
         ax.set_title(title, fontsize=FONT_LABEL, fontweight="normal")
+    if invert_y:
+        # Place row 0 at the top — used by st/ph feature panels so the
+        # scattering order-0 coefficient is on top, higher st orders go
+        # downward, and the ph block sits below the separator line.
+        ax.invert_yaxis()
     if cbar_ax is not None:
         cb = ax.figure.colorbar(im, cax=cbar_ax)  # type: ignore[union-attr]
         cb.ax.tick_params(labelsize=6)
@@ -868,6 +886,7 @@ def plot_sample_signals_kld(
         title=fhr_title,
         cbar_ax=cax_fhr,
         separator_row=fhr_sep,
+        invert_y=True,
     )
     _mark_warmup_line_min(ax_fhr, warmup_min)
     row += 1
@@ -895,6 +914,7 @@ def plot_sample_signals_kld(
             title=up_title,
             cbar_ax=cax_up,
             separator_row=up_sep,
+            invert_y=True,
         )
         _mark_warmup_line_min(ax_up, warmup_min)
         row += 1
@@ -1206,6 +1226,7 @@ def plot_sample_lag_attention(
             title=up_title,
             cbar_ax=cax_up,
             separator_row=up_sep,
+            invert_y=True,
         )
         _mark_warmup_line_min(ax_up, warmup_min)
         row += 1
