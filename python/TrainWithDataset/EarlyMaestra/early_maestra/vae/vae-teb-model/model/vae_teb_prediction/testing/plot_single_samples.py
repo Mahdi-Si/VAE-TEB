@@ -1199,6 +1199,7 @@ def plot_sample_lag_attention(
             title=fhr_title,
             cbar_ax=cax_fhr,
             separator_row=fhr_sep,
+            invert_y=True,
         )
         _mark_warmup_line_min(ax_fhr, warmup_min)
         row += 1
