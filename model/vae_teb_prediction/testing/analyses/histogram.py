@@ -23,7 +23,11 @@ from loguru import logger
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import collect_metrics
-from model.vae_teb_prediction.testing.visualizers import plot_metric_histograms
+from model.vae_teb_prediction.testing.visualizers import (
+    plot_metric_histograms,
+    plot_metric_histograms_by_class,
+    unique_labels_in,
+)
 
 
 # Columns the histogram plot / metadata summary will inspect. Missing
@@ -127,6 +131,15 @@ def run_histogram_analysis(
 
     output_dir = runner.ensure_dir("histograms")
     plot_metric_histograms(df, output_dir)
+
+    # Per-class panel: one subplot grid per class when >=2 classes are
+    # present in the test set (auto-detected from the ``label`` column).
+    classes_present = unique_labels_in(df.get("label"))
+    if len(classes_present) >= 2:
+        plot_metric_histograms_by_class(df, output_dir)
+        logger.info(
+            f"Per-class histograms emitted for classes {classes_present}"
+        )
 
     if save_data:
         _save_histogram_data(df, output_dir, dataset_identifier)

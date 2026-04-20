@@ -310,21 +310,34 @@ def run_full_test_pipeline(
         from model.vae_teb_prediction.testing.collectors import collect_predictions
         samples = collect_predictions(runner, standard_loader, max_samples or 500)
         import numpy as np
+        import pandas as pd
         X_rows = []
         labels = []
+        epochs = []
         for s in samples:
             z = s.get("z")
             if z is None:
                 continue
             X_rows.append(np.asarray(z).mean(axis=0))
             labels.append(s.get("label") or 0)
+            epoch_val = s.get("epoch")
+            epochs.append(float(epoch_val) if epoch_val is not None else np.nan)
         if X_rows:
-            X = np.asarray(X_rows)
+            X = np.asarray(X_rows, dtype=float)
             lab = np.asarray(labels)
+            # run_class_separation_analysis expects a DataFrame with
+            # z{i} columns, a label column, and (optionally) hours_before.
+            df_cols: Dict[str, Any] = {
+                f"z{i}": X[:, i] for i in range(X.shape[1])
+            }
+            df_cols["label"] = lab
+            ep_arr = np.asarray(epochs, dtype=float)
+            df_cols["hours_before"] = -ep_arr / 3600.0
+            latent_df = pd.DataFrame(df_cols)
             _step(
                 "class_separation",
                 run_class_separation_analysis,
-                X, lab,
+                latent_df,
                 Path(output_dir_resolved) / "class_separation",
             )
     except Exception as exc:  # noqa: BLE001

@@ -19,13 +19,18 @@ from loguru import logger
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.collectors import collect_attention_maps
 from model.vae_teb_prediction.testing.visualizers import (
+    COLOR_BLACK,
     COLOR_BLUE,
     FONT_LABEL,
+    FONT_LEGEND,
     FONT_TITLE,
     SAVE_DPI,
     _style_axes,
+    class_color_for,
+    class_label_for,
     plot_attention_mass_by_lag,
     plot_lag_attention_heatmap,
+    unique_labels_in,
 )
 
 try:
@@ -163,6 +168,71 @@ def run_attention_diagnostics(
             _style_axes(ax, grid="major", minor_ticks=False)
             fig.tight_layout()
             fig.savefig(output_dir / "head_diversity_hist.pdf", dpi=SAVE_DPI, bbox_inches="tight")
+            plt.close(fig)
+
+    # Per-class argmax-lag histogram and entropy boxplot when >=2 labels.
+    classes = unique_labels_in(argmax_df.get("label") if not argmax_df.empty else None)
+    if plt is not None and len(classes) >= 2 and not argmax_df.empty:
+        # Side-by-side argmax-lag histogram per class.
+        n_cls = len(classes)
+        fig, axes = plt.subplots(
+            1, n_cls,
+            figsize=(max(3.6, 2.8 * n_cls), 3.0),
+            sharey=True, squeeze=False,
+        )
+        for ax, lab in zip(axes[0], classes):
+            vals = argmax_df.loc[
+                argmax_df["label"] == lab, "argmax_lag"
+            ].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                ax.text(0.5, 0.5, "—", ha="center", va="center",
+                        transform=ax.transAxes)
+            else:
+                ax.hist(vals, bins=50, color=class_color_for(lab),
+                        alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.3)
+            ax.set_title(f"{class_label_for(lab)} (n={vals.size})",
+                         fontsize=FONT_TITLE * 0.8)
+            ax.set_xlabel("argmax lag k", fontsize=FONT_LABEL * 0.9)
+            _style_axes(ax, grid="major", minor_ticks=False)
+        axes[0, 0].set_ylabel("Count", fontsize=FONT_LABEL * 0.9)
+        fig.tight_layout()
+        fig.savefig(
+            output_dir / "argmax_lag_histogram_by_class.pdf",
+            dpi=SAVE_DPI, bbox_inches="tight",
+        )
+        plt.close(fig)
+
+        # Attention mass by lag, overlaid line plot per class.
+        if not mass_df.empty:
+            lag_cols = sorted(
+                (c for c in mass_df.columns if c.startswith("mass_lag_")),
+                key=lambda c: int(c.split("_")[-1]),
+            )
+            fig, ax = plt.subplots(figsize=(6.0, 3.2))
+            for lab in classes:
+                sub = mass_df[mass_df["label"] == lab]
+                if sub.empty:
+                    continue
+                mean_vec = sub[lag_cols].to_numpy(dtype=float).mean(axis=0)
+                color = class_color_for(lab)
+                ax.plot(
+                    np.arange(len(mean_vec)),
+                    mean_vec,
+                    color=color, lw=1.2,
+                    label=f"{class_label_for(lab)} (n={len(sub)})",
+                )
+            ax.set_xlabel("lag index k", fontsize=FONT_LABEL)
+            ax.set_ylabel("mean attention mass", fontsize=FONT_LABEL)
+            ax.set_title("Attention mass by lag — per class",
+                         fontsize=FONT_TITLE, fontweight="normal")
+            ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+            _style_axes(ax, grid="major", minor_ticks=False)
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / "attention_mass_by_lag_by_class.pdf",
+                dpi=SAVE_DPI, bbox_inches="tight",
+            )
             plt.close(fig)
 
     median_argmax = int(np.median(all_valid_argmax)) if all_valid_argmax else None
