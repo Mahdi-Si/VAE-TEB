@@ -335,40 +335,67 @@ def run_full_test_pipeline(
 
     # 12. Class separation (uses time-averaged latent features).
     #
-    # IMPORTANT: the standard test loader uses ``shuffle=False`` and reads
-    # the configured HDF5 files sequentially. Because each file in the
-    # lag-attn v1 pipeline carries a single outcome class (hie_no_cs,
-    # acidosis_no_cs, healthy_no_bg_no_cs, ...), capping ``max_samples``
-    # too aggressively here will exhaust the first file before reaching
-    # the second — producing a single-class subset and the misleading
-    # "Only 1 class(es) found" error from run_class_separation_analysis.
-    # We therefore respect ``max_samples`` verbatim (None → all samples)
-    # and explicitly filter to the valid clinical class ids {1, 2, 3}
-    # before handing the DataFrame to the analysis.
+    # IMPORTANT 1 — sample coverage: the standard test loader uses
+    # ``shuffle=False`` and reads the configured HDF5 files sequentially.
+    # Each file in the lag-attn v1 pipeline carries a single outcome class
+    # (hie_no_cs, acidosis_no_cs, healthy_no_bg_no_cs, ...), so capping
+    # ``max_samples`` too aggressively here exhausts the first file before
+    # reaching the second — producing the misleading "Only 1 class(es)
+    # found" error.
+    #
+    # IMPORTANT 2 — memory: we used to call ``collect_predictions`` here,
+    # which retains the full forward output (``mu_full``, ``mu_base``,
+    # ``delta_src``, ``y_plus``, ``attn``, ``te_lag``, raw ``fhr``/``up``,
+    # ...) per sample — ~13 MB per record. With ``max_samples=None`` and
+    # ten thousand+ samples in the test list that explodes to ~130 GB and
+    # the OS reaps the process (exit code 137 / SIGKILL).
+    #
+    # Class separation only needs the per-sample time-averaged latent
+    # ``z`` (24 floats) and the integer class label, so we now stream the
+    # loader directly and accumulate just those — ~32 bytes per record
+    # instead of 13 MB. Same statistical content, ~400 000× less RAM.
     try:
-        from model.vae_teb_prediction.testing.collectors import collect_predictions
-        # ``collect_predictions`` honours ``max_samples=None`` as "all".
-        # Mirror the ``_cap`` semantics here so class-separation uses the
-        # same overall-behaviour convention as every other aggregate step.
-        samples = collect_predictions(runner, standard_loader, max_samples)
         import numpy as np
         import pandas as pd
-        X_rows = []
-        labels = []
-        epochs = []
-        for s in samples:
-            z = s.get("z")
-            if z is None:
-                continue
-            lab = s.get("label")
-            # Drop pad-only (label None / 0) so they don't create a
-            # spurious zero-valued class.
-            if lab is None or int(lab) not in (1, 2, 3):
-                continue
-            X_rows.append(np.asarray(z).mean(axis=0))
-            labels.append(int(lab))
-            epoch_val = s.get("epoch")
-            epochs.append(float(epoch_val) if epoch_val is not None else np.nan)
+        import torch as _torch_local
+        from model.vae_teb_prediction.testing.collectors import (
+            _extract_epoch,
+            _extract_label,
+        )
+
+        X_rows: List[np.ndarray] = []
+        labels: List[int] = []
+        epochs: List[float] = []
+        processed = 0
+        with runner.inference_mode():
+            for batch in runner.iter_batches(standard_loader, max_samples):
+                outputs = runner.forward(batch)
+                z = outputs.get("z")
+                if z is None:
+                    continue
+                # (B, T, d_z) -> per-sample mean over time -> (B, d_z).
+                z_mean = z.mean(dim=1).detach().cpu().numpy()
+                batch_size = int(z_mean.shape[0])
+                for idx in range(batch_size):
+                    if max_samples and processed >= max_samples:
+                        break
+                    lab = _extract_label(batch, idx)
+                    # Drop pad-only (label None) and unknown class ids so
+                    # they don't create a spurious zero-valued class.
+                    if lab is None or int(lab) not in (1, 2, 3):
+                        processed += 1
+                        continue
+                    X_rows.append(z_mean[idx].astype(np.float32))
+                    labels.append(int(lab))
+                    ep = _extract_epoch(batch, idx)
+                    epochs.append(float(ep) if ep is not None else float("nan"))
+                    processed += 1
+                if max_samples and processed >= max_samples:
+                    break
+                # Free per-batch tensors immediately.
+                del outputs, z, z_mean
+                if hasattr(_torch_local, "cuda") and _torch_local.cuda.is_available():
+                    _torch_local.cuda.empty_cache()
 
         if X_rows:
             X = np.asarray(X_rows, dtype=float)
