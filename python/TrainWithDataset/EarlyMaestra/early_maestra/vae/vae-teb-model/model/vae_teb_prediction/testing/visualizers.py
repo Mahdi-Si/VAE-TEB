@@ -95,6 +95,50 @@ COLOR_LIGHT_GRAY = "#EEEEEE"
 COLOR_SAGE = "#9DC08B"
 COLOR_TEAL_DARK = "#0D7377"
 
+# Canonical class metadata: label ID -> human-readable name + plotting colour.
+# Used by every class-aware plotter so panels look identical across analyses.
+CLASS_NAMES: Dict[int, str] = {1: "HEALTHY", 2: "ACIDOSIS", 3: "HIE"}
+CLASS_COLORS: Dict[int, str] = {
+    1: COLOR_BLUE,
+    2: COLOR_ORANGE,
+    3: COLOR_VERMILLION,
+}
+
+
+def unique_labels_in(values: Any) -> list:
+    """Return the sorted list of integer class IDs actually present.
+
+    Accepts a numpy array, pandas Series, list, or None. Non-finite
+    and non-numeric values are ignored. Result is sorted ascending.
+    """
+    if values is None:
+        return []
+    try:
+        arr = np.asarray(values)
+    except Exception:
+        return []
+    if arr.size == 0:
+        return []
+    out = []
+    for v in np.unique(arr):
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv in CLASS_NAMES:
+            out.append(iv)
+    return sorted(out)
+
+
+def class_label_for(label_id: int) -> str:
+    """Pretty name for a class id, falling back to ``f"class {id}"``."""
+    return CLASS_NAMES.get(int(label_id), f"class {int(label_id)}")
+
+
+def class_color_for(label_id: int, fallback: str = COLOR_GRAY) -> str:
+    """Palette colour for a class id, falling back to gray when unknown."""
+    return CLASS_COLORS.get(int(label_id), fallback)
+
 # Multi-line palettes for complex figures
 PALETTE_PRIMARY = [COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_SKY]
 PALETTE_EXTENDED = [
@@ -345,6 +389,128 @@ def plot_metric_histograms(
         )
 
     fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0], pad=0.8)
+    fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_metric_histograms_by_class(
+    df: pd.DataFrame,
+    output_dir: Path,
+    filename: str = "metrics_histograms_by_class.pdf",
+    *,
+    label_col: str = "label",
+    metrics: Optional[list] = None,
+    max_classes_side_by_side: int = 4,
+) -> None:
+    """Per-class version of :func:`plot_metric_histograms`.
+
+    Produces a grid where each row is a metric and each column is a
+    class. When more than ``max_classes_side_by_side`` classes are
+    present the layout collapses to one column with overlaid densities
+    per class (histtype=``stepfilled``).
+
+    Args:
+        df: DataFrame with at least ``label_col`` and the metric
+            columns listed in ``metrics`` (or auto-detected v1 set).
+        output_dir: Directory to save the plot.
+        filename: Output filename.
+        label_col: Column carrying the integer class id (1/2/3).
+        metrics: Optional explicit list of ``(col, title, unit)``
+            triples. When ``None`` the v1 default set is used.
+        max_classes_side_by_side: Threshold above which the grid
+            collapses to a single column with per-class overlays.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if label_col not in df.columns:
+        # No labels available — fall back to the pooled plot.
+        plot_metric_histograms(df, output_dir, filename=filename)
+        return
+
+    if metrics is None:
+        metrics = [
+            ("feat_mse_total", "Feature Forecast MSE", ""),
+            ("feat_r2_total", "Feature Forecast R^2", ""),
+            ("uplift_rel", "Uplift (relative)", ""),
+            ("residual_ratio", "Residual Usage Ratio", ""),
+            ("kld_mean", "Transfer Entropy (KL)", "nats"),
+        ]
+    metrics = [m for m in metrics if m[0] in df.columns]
+    if not metrics:
+        return
+
+    classes = unique_labels_in(df[label_col])
+    if len(classes) < 2:
+        # Nothing to split — emit the pooled panel and return.
+        plot_metric_histograms(df, output_dir, filename=filename)
+        return
+
+    overlay_mode = len(classes) > max_classes_side_by_side
+    n_rows = len(metrics)
+    n_cols = 1 if overlay_mode else len(classes)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(max(4.0, 3.0 * n_cols) if not overlay_mode else 6.0, 2.2 * n_rows),
+        squeeze=False,
+    )
+
+    for r, (col, title, unit) in enumerate(metrics):
+        for c, label_id in enumerate(classes):
+            if overlay_mode:
+                ax = axes[r, 0]
+            else:
+                ax = axes[r, c]
+            sub = df[df[label_col] == label_id]
+            vals = sub[col].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                if not overlay_mode:
+                    ax.text(0.5, 0.5, "—", ha="center", va="center")
+                    _style_axes(ax, grid="major", minor_ticks=False)
+                continue
+            color = class_color_for(label_id)
+            n_bins = min(80, max(20, int(np.sqrt(vals.size) * 2)))
+            if overlay_mode:
+                ax.hist(
+                    vals, bins=n_bins, density=True, color=color,
+                    alpha=0.35, histtype="stepfilled",
+                    edgecolor=COLOR_BLACK, linewidth=0.4,
+                    label=f"{class_label_for(label_id)} (n={vals.size})",
+                )
+            else:
+                ax.hist(
+                    vals, bins=n_bins, density=True, color=color,
+                    alpha=0.8, edgecolor=COLOR_BLACK, linewidth=0.4,
+                )
+                ax.set_title(
+                    f"{class_label_for(label_id)} (n={vals.size})",
+                    fontsize=FONT_TITLE * 0.75,
+                )
+            ax.axvline(float(np.mean(vals)), color=COLOR_ORANGE, lw=0.7, ls="--")
+            ax.axvline(float(np.median(vals)), color=COLOR_PURPLE, lw=0.7, ls="-.")
+            if col in ("kld", "kld_mean", "feat_mse_total") and np.all(vals > 0):
+                ax.set_xscale("log")
+            _style_axes(ax, grid="major", minor_ticks=False)
+        # Row-level labelling
+        axes[r, 0].set_ylabel(
+            f"{title}" + (f" ({unit})" if unit else ""),
+            fontsize=FONT_LABEL * 0.9,
+        )
+        if overlay_mode:
+            axes[r, 0].legend(loc="best", fontsize=FONT_LEGEND * 0.9, frameon=True)
+
+    for ax in axes[-1]:
+        ax.set_xlabel("value", fontsize=FONT_LABEL * 0.9)
+
+    mode_name = "overlay" if overlay_mode else "grid"
+    fig.suptitle(
+        f"Per-class metric distributions ({mode_name}, "
+        f"{len(classes)} classes)",
+        fontsize=FONT_TITLE, y=1.0,
+    )
+    fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 

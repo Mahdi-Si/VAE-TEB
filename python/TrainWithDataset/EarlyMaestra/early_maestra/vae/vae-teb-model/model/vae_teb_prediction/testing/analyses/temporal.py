@@ -27,12 +27,17 @@ from model.vae_teb_prediction.testing.collectors import (
 from model.vae_teb_prediction.testing.visualizers import (
     plot_forecast_error_by_horizon,
     FONT_LABEL,
+    FONT_LEGEND,
     FONT_TITLE,
     SAVE_DPI,
     COLOR_BLUE,
     COLOR_VERMILLION,
     _style_axes,
+    class_color_for,
+    class_label_for,
+    unique_labels_in,
 )
+from model.vae_teb_prediction.testing.collectors import _extract_label
 
 try:
     import matplotlib.pyplot as plt
@@ -101,6 +106,40 @@ def run_horizon_error_profile(
     per_step_df.to_csv(per_step_path, index=False)
 
     plot_forecast_error_by_horizon(per_step_df, output_dir / "horizon_error.pdf")
+
+    # Per-class horizon error overlay when >= 2 classes present.
+    classes = unique_labels_in(per_step_df.get("label"))
+    if plt is not None and len(classes) >= 2:
+        fig, ax = plt.subplots(figsize=(6.0, 3.4))
+        for lab in classes:
+            sub = per_step_df[per_step_df["label"] == lab]
+            if sub.empty:
+                continue
+            grouped = sub.groupby("h")["mse_step"]
+            med = grouped.median()
+            q1 = grouped.quantile(0.25)
+            q3 = grouped.quantile(0.75)
+            xs = np.asarray(med.index.to_list(), dtype=float)
+            color = class_color_for(lab)
+            ax.plot(xs, med.to_numpy(), color=color, lw=1.2,
+                    label=f"{class_label_for(lab)} (n_rows={len(sub)})")
+            ax.fill_between(
+                xs, q1.to_numpy(), q3.to_numpy(),
+                color=color, alpha=0.18, lw=0,
+            )
+        ax.set_xlabel("horizon step h", fontsize=FONT_LABEL)
+        ax.set_ylabel("per-step MSE (median, IQR)", fontsize=FONT_LABEL)
+        ax.set_title("Horizon error — per class",
+                     fontsize=FONT_TITLE, fontweight="normal")
+        ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+        _style_axes(ax, grid="major", minor_ticks=False)
+        fig.tight_layout()
+        fig.savefig(
+            output_dir / "horizon_error_by_class.pdf",
+            dpi=SAVE_DPI, bbox_inches="tight",
+        )
+        plt.close(fig)
+
     return summary
 
 
@@ -140,6 +179,7 @@ def run_anchor_position_analysis(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     per_anchor_mse: list = []
+    per_sample_labels: list = []
     warmup = int(runner.warmup_steps)
     H_d = int(runner.horizon)
 
@@ -158,7 +198,11 @@ def run_anchor_position_analysis(
             y_v = y_plus[:, :T_valid, :, :]
             diff_sq = (mu_v - y_v).pow(2).mean(dim=(2, 3))   # (B, T_valid)
             per_anchor_mse.append(diff_sq.detach().cpu().numpy())
-            processed += int(mu_v.shape[0])
+            batch_size = int(mu_v.shape[0])
+            for idx in range(batch_size):
+                lab = _extract_label(batch, idx)
+                per_sample_labels.append(int(lab) if lab is not None else -1)
+            processed += batch_size
             if max_samples and processed >= max_samples:
                 break
 
@@ -167,6 +211,7 @@ def run_anchor_position_analysis(
         return pd.DataFrame()
 
     all_mse = np.concatenate(per_anchor_mse, axis=0)  # (N_total, T_valid)
+    all_labels = np.asarray(per_sample_labels, dtype=int)
     mse_mean = np.nanmean(all_mse, axis=0)
     mse_std = np.nanstd(all_mse, axis=0)
     n_samples = np.full(mse_mean.shape, all_mse.shape[0], dtype=int)
@@ -207,6 +252,40 @@ def run_anchor_position_analysis(
         _style_axes(ax, grid="major", minor_ticks=True)
         fig.tight_layout()
         fig.savefig(output_dir / "anchor_error.pdf", dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+    # Per-class anchor-error overlay when >= 2 classes present.
+    classes = unique_labels_in(all_labels)
+    if plt is not None and len(classes) >= 2:
+        fig, ax = plt.subplots(figsize=(6.4, 3.4))
+        for lab in classes:
+            mask = all_labels == lab
+            if not mask.any():
+                continue
+            sub = all_mse[mask]
+            mean_vec = np.nanmean(sub, axis=0)
+            std_vec = np.nanstd(sub, axis=0)
+            color = class_color_for(lab)
+            ax.plot(t_vals, mean_vec, color=color, lw=1.2,
+                    label=f"{class_label_for(lab)} (n={int(mask.sum())})")
+            ax.fill_between(
+                t_vals,
+                mean_vec - std_vec,
+                mean_vec + std_vec,
+                color=color, alpha=0.15, lw=0,
+            )
+        if warmup > 0:
+            ax.axvspan(0, min(warmup, len(t_vals) - 1),
+                       color="#CCCCCC", alpha=0.35, label="warmup")
+        ax.set_xlabel("Anchor t", fontsize=FONT_LABEL)
+        ax.set_ylabel("mean MSE over (h, c)", fontsize=FONT_LABEL)
+        ax.set_title("Anchor-position forecast error — per class",
+                     fontsize=FONT_TITLE, fontweight="normal")
+        ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+        _style_axes(ax, grid="major", minor_ticks=True)
+        fig.tight_layout()
+        fig.savefig(output_dir / "anchor_error_by_class.pdf",
+                    dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
 
     logger.info(f"Saved anchor error profile to {csv_path}")

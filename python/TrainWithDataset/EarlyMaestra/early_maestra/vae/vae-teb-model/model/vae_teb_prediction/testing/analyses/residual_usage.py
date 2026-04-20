@@ -22,13 +22,19 @@ from model.vae_teb_prediction.testing.collectors import (
 )
 from model.vae_teb_prediction.testing.metrics import compute_residual_usage
 from model.vae_teb_prediction.testing.visualizers import (
+    COLOR_BLACK,
     COLOR_PURPLE,
     FONT_LABEL,
+    FONT_LEGEND,
     FONT_TITLE,
     SAVE_DPI,
     _style_axes,
+    class_color_for,
+    class_label_for,
     plot_residual_usage_trace,
+    unique_labels_in,
 )
+import numpy as np
 
 try:
     import matplotlib.pyplot as plt
@@ -138,6 +144,74 @@ def run_residual_usage_analysis(
         plt.close(fig)
 
     plot_residual_usage_trace(trace_df, output_dir / "delta_norm_trace.pdf")
+
+    # Per-class variants: residual_ratio histograms side-by-side + per-class
+    # trace overlay on shared axes. Only emitted when >= 2 classes present.
+    classes = unique_labels_in(df.get("label"))
+    if plt is not None and len(classes) >= 2:
+        # Side-by-side residual_ratio histogram.
+        n_cls = len(classes)
+        fig, axes = plt.subplots(
+            1, n_cls,
+            figsize=(max(3.6, 2.8 * n_cls), 3.0),
+            sharey=True, squeeze=False,
+        )
+        for ax, lab in zip(axes[0], classes):
+            vals = df.loc[df["label"] == lab, "residual_ratio"].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                ax.text(0.5, 0.5, "—", ha="center", va="center",
+                        transform=ax.transAxes)
+            else:
+                ax.hist(vals, bins=30, color=class_color_for(lab),
+                        alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.4)
+            ax.axvline(collapse_threshold, color="red", ls="--", lw=0.7)
+            ax.set_title(f"{class_label_for(lab)} (n={vals.size})",
+                         fontsize=FONT_TITLE * 0.8)
+            ax.set_xlabel("residual_ratio", fontsize=FONT_LABEL * 0.9)
+            _style_axes(ax, grid="major", minor_ticks=False)
+        axes[0, 0].set_ylabel("Count", fontsize=FONT_LABEL * 0.9)
+        fig.tight_layout()
+        fig.savefig(
+            output_dir / "residual_ratio_hist_by_class.pdf",
+            dpi=SAVE_DPI, bbox_inches="tight",
+        )
+        plt.close(fig)
+
+        # Per-anchor delta_norm_t overlay by class. trace_df only has guid
+        # keys — join back with df[guid, label] so we can group.
+        if not trace_df.empty and "guid" in trace_df.columns:
+            guid_labels = df.set_index("guid")["label"].to_dict()
+            trace_lab = trace_df.copy()
+            trace_lab["label"] = trace_lab["guid"].map(guid_labels)
+            fig, ax = plt.subplots(figsize=(6.0, 3.2))
+            for lab in classes:
+                sub = trace_lab[trace_lab["label"] == lab]
+                if sub.empty:
+                    continue
+                grouped = sub.groupby("t")["delta_norm_t"]
+                med = grouped.median()
+                q1 = grouped.quantile(0.25)
+                q3 = grouped.quantile(0.75)
+                xs = np.asarray(med.index.to_list(), dtype=float)
+                color = class_color_for(lab)
+                ax.plot(xs, med.to_numpy(), color=color, lw=1.2,
+                        label=class_label_for(lab))
+                ax.fill_between(
+                    xs, q1.to_numpy(), q3.to_numpy(),
+                    color=color, alpha=0.18, lw=0,
+                )
+            ax.set_xlabel("anchor timestep t")
+            ax.set_ylabel("||delta_mu_src|| trace (median, IQR)")
+            ax.set_title("Residual magnitude over time — by class")
+            ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+            _style_axes(ax, grid="major", minor_ticks=False)
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / "delta_norm_trace_by_class.pdf",
+                dpi=SAVE_DPI, bbox_inches="tight",
+            )
+            plt.close(fig)
 
     n_collapsed = int((df["residual_ratio"] < collapse_threshold).sum())
     summary = {

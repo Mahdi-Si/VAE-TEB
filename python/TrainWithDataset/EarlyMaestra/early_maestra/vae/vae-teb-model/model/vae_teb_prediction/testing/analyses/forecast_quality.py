@@ -23,13 +23,18 @@ from model.vae_teb_prediction.testing.collectors import (
 )
 from model.vae_teb_prediction.testing.metrics import compute_forecast_metrics
 from model.vae_teb_prediction.testing.visualizers import (
+    COLOR_BLACK,
     COLOR_BLUE,
     COLOR_GREEN,
     FONT_LABEL,
+    FONT_LEGEND,
     FONT_TITLE,
     SAVE_DPI,
     _style_axes,
+    class_color_for,
+    class_label_for,
     plot_forecast_error_by_horizon,
+    unique_labels_in,
 )
 
 try:
@@ -140,6 +145,74 @@ def run_forecast_quality_analysis(
         fig.tight_layout()
         fig.savefig(output_dir / "feat_r2_total_hist.pdf", dpi=SAVE_DPI, bbox_inches="tight")
         plt.close(fig)
+
+    # Per-class variants (emitted only when >= 2 classes are present).
+    classes = unique_labels_in(df.get("label") if not df.empty else None)
+    if plt is not None and len(classes) >= 2:
+        # Horizon-error overlay: one line per class on shared axes.
+        if not per_horizon_df.empty and "h" in per_horizon_df.columns:
+            fig, ax = plt.subplots(figsize=(6.0, 3.4))
+            for lab in classes:
+                sub = per_horizon_df[per_horizon_df["label"] == lab]
+                if sub.empty:
+                    continue
+                grouped = sub.groupby("h")["mse_step"]
+                med = grouped.median()
+                q1 = grouped.quantile(0.25)
+                q3 = grouped.quantile(0.75)
+                xs = np.asarray(med.index.to_list(), dtype=float)
+                color = class_color_for(lab)
+                n_guids = int(pd.Series(sub["guid"]).nunique())
+                ax.plot(
+                    xs, med.to_numpy(), color=color, lw=1.2,
+                    label=f"{class_label_for(lab)} (n_guids={n_guids})",
+                )
+                ax.fill_between(
+                    xs, q1.to_numpy(), q3.to_numpy(),
+                    color=color, alpha=0.18, lw=0,
+                )
+            ax.set_xlabel("horizon step h")
+            ax.set_ylabel("per-step MSE (median, IQR)")
+            ax.set_title("Forecast error by horizon — by class")
+            ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+            _style_axes(ax, grid="major", minor_ticks=False)
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / "forecast_error_by_horizon_by_class.pdf",
+                dpi=SAVE_DPI, bbox_inches="tight",
+            )
+            plt.close(fig)
+
+        # Per-class MSE / R2 distributions: one subplot per class side-by-side.
+        for metric, fname in (
+            ("feat_mse_total", "feat_mse_total_hist_by_class.pdf"),
+            ("feat_r2_total", "feat_r2_total_hist_by_class.pdf"),
+        ):
+            if metric not in df.columns:
+                continue
+            n_cls = len(classes)
+            fig, axes = plt.subplots(
+                1, n_cls,
+                figsize=(max(3.6, 2.8 * n_cls), 3.2),
+                sharey=True, squeeze=False,
+            )
+            for ax, lab in zip(axes[0], classes):
+                vals = df.loc[df["label"] == lab, metric].to_numpy(dtype=float)
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    ax.text(0.5, 0.5, "—", ha="center", va="center",
+                            transform=ax.transAxes)
+                else:
+                    ax.hist(vals, bins=30, color=class_color_for(lab),
+                            alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.4)
+                ax.set_title(f"{class_label_for(lab)} (n={vals.size})",
+                             fontsize=FONT_TITLE * 0.8)
+                ax.set_xlabel(metric, fontsize=FONT_LABEL * 0.9)
+                _style_axes(ax, grid="major", minor_ticks=False)
+            axes[0, 0].set_ylabel("Count", fontsize=FONT_LABEL * 0.9)
+            fig.tight_layout()
+            fig.savefig(output_dir / fname, dpi=SAVE_DPI, bbox_inches="tight")
+            plt.close(fig)
 
     mean_per_horizon = (
         (per_horizon_mean_accum / max(n_accum, 1)) if per_horizon_mean_accum is not None else np.array([])
