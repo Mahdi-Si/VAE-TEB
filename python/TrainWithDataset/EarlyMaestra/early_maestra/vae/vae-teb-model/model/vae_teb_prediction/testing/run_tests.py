@@ -98,7 +98,15 @@ def run_full_test_pipeline(
         config_path: Path to the YAML config used to train the checkpoint.
             **Required** — the runner needs it to build the model.
         device: Torch device string (auto-detected if None).
-        max_samples: Cap on samples for per-sample analyses.
+        max_samples: Cap on samples for the aggregate (overall-behaviour)
+            analyses — histogram, forecast_quality, horizon / anchor
+            error, uplift, residual_usage, attention, te_lag, encoder
+            probe, latent distribution, latent space, kld_pca, and class
+            separation. Pass ``None`` to process **every** sample in
+            the loaded test set (recommended for final reporting runs so
+            the loader reaches every HDF5 file and every class is
+            represented). Per-sample diagnostic PDFs are capped
+            separately via ``analysis_samples``.
         batch_size: Test-time batch size (defaults to config).
         num_workers: DataLoader worker count (defaults to config).
         skip_trajectory: Skip the per-GUID trajectory analysis.
@@ -211,6 +219,24 @@ def run_full_test_pipeline(
 
     results: Dict[str, Any] = {}
 
+    # Sentinel used to mean "process every sample in the test set" for the
+    # aggregate analyses. The downstream analyses break their collection
+    # loops with ``if max_samples and processed >= max_samples`` so any
+    # integer larger than the actual dataset size terminates at dataset
+    # exhaustion rather than at the cap. Using a plain int (not None)
+    # keeps the per-analysis signatures unchanged.
+    _FULL_DATASET_CAP = 10_000_000
+
+    def _cap(user_max: Optional[int]) -> int:
+        """Resolve the per-analysis sample cap.
+
+        - ``user_max is None``: process every sample (returns the
+          ``_FULL_DATASET_CAP`` sentinel, larger than any realistic
+          test set).
+        - ``user_max`` is a positive int: honor it exactly.
+        """
+        return int(user_max) if user_max is not None else _FULL_DATASET_CAP
+
     def _step(name: str, fn, *args, **kwargs) -> None:
         try:
             logger.info("=" * 60)
@@ -228,46 +254,51 @@ def run_full_test_pipeline(
         Path(output_dir_resolved) / "dataset_stats",
     )
 
+    # For the aggregate (overall-behaviour) analyses, the cap is taken
+    # from the user's ``max_samples``. ``max_samples=None`` → process
+    # every sample in the loaded test set (see ``_cap`` above).
+    aggregate_cap = _cap(max_samples)
+
     # 2. Histogram (cheap, establishes baseline metrics).
     _step(
         "histogram",
         run_histogram_analysis,
-        runner, standard_loader, max_samples,
+        runner, standard_loader, aggregate_cap,
     )
 
     # 3. Forecast quality.
     _step(
         "forecast_quality",
         run_forecast_quality_analysis,
-        runner, standard_loader, max_samples or 500,
+        runner, standard_loader, aggregate_cap,
     )
 
     # 4. Horizon error profile.
     _step(
         "horizon_error",
         run_horizon_error_profile,
-        runner, standard_loader, min(200, max_samples or 200),
+        runner, standard_loader, aggregate_cap,
     )
 
     # 5. Anchor position analysis.
     _step(
         "anchor_error",
         run_anchor_position_analysis,
-        runner, standard_loader, min(200, max_samples or 200),
+        runner, standard_loader, aggregate_cap,
     )
 
     # 6. Uplift.
     _step(
         "uplift",
         run_uplift_analysis,
-        runner, standard_loader, max_samples or 500,
+        runner, standard_loader, aggregate_cap,
     )
 
     # 7. Residual usage.
     _step(
         "residual_usage",
         run_residual_usage_analysis,
-        runner, standard_loader, max_samples or 500,
+        runner, standard_loader, aggregate_cap,
     )
 
     # 8-9. Attention + TE lag class (gated).
@@ -275,40 +306,51 @@ def run_full_test_pipeline(
         _step(
             "attention",
             run_attention_diagnostics,
-            runner, standard_loader, min(200, max_samples or 200),
+            runner, standard_loader, aggregate_cap,
         )
         _step(
             "te_lag",
             run_te_lag_class_analysis,
-            runner, standard_loader, max_samples or 1000,
+            runner, standard_loader, aggregate_cap,
         )
 
     # 10. Encoder probe.
     _step(
         "encoder_probe",
         run_encoder_probe,
-        runner, standard_loader, min(2000, max_samples or 2000),
+        runner, standard_loader, aggregate_cap,
     )
 
     # 11. Latent distribution & space visualization.
     _step(
         "latent_distribution",
         run_latent_distribution_analysis,
-        runner, standard_loader, min(500, max_samples or 500),
+        runner, standard_loader, aggregate_cap,
     )
     _step(
         "latent_space",
         run_latent_space_visualization,
-        runner, standard_loader, min(500, max_samples or 500),
+        runner, standard_loader, aggregate_cap,
     )
 
     # 12. Class separation (uses time-averaged latent features).
+    #
+    # IMPORTANT: the standard test loader uses ``shuffle=False`` and reads
+    # the configured HDF5 files sequentially. Because each file in the
+    # lag-attn v1 pipeline carries a single outcome class (hie_no_cs,
+    # acidosis_no_cs, healthy_no_bg_no_cs, ...), capping ``max_samples``
+    # too aggressively here will exhaust the first file before reaching
+    # the second — producing a single-class subset and the misleading
+    # "Only 1 class(es) found" error from run_class_separation_analysis.
+    # We therefore respect ``max_samples`` verbatim (None → all samples)
+    # and explicitly filter to the valid clinical class ids {1, 2, 3}
+    # before handing the DataFrame to the analysis.
     try:
-        # Pull per-sample latent features via the encoder probe's output,
-        # which already writes a feature_matrix.csv. We fall back to the
-        # direct collector if that file doesn't exist.
         from model.vae_teb_prediction.testing.collectors import collect_predictions
-        samples = collect_predictions(runner, standard_loader, max_samples or 500)
+        # ``collect_predictions`` honours ``max_samples=None`` as "all".
+        # Mirror the ``_cap`` semantics here so class-separation uses the
+        # same overall-behaviour convention as every other aggregate step.
+        samples = collect_predictions(runner, standard_loader, max_samples)
         import numpy as np
         import pandas as pd
         X_rows = []
@@ -318,28 +360,58 @@ def run_full_test_pipeline(
             z = s.get("z")
             if z is None:
                 continue
+            lab = s.get("label")
+            # Drop pad-only (label None / 0) so they don't create a
+            # spurious zero-valued class.
+            if lab is None or int(lab) not in (1, 2, 3):
+                continue
             X_rows.append(np.asarray(z).mean(axis=0))
-            labels.append(s.get("label") or 0)
+            labels.append(int(lab))
             epoch_val = s.get("epoch")
             epochs.append(float(epoch_val) if epoch_val is not None else np.nan)
+
         if X_rows:
             X = np.asarray(X_rows, dtype=float)
-            lab = np.asarray(labels)
-            # run_class_separation_analysis expects a DataFrame with
-            # z{i} columns, a label column, and (optionally) hours_before.
-            df_cols: Dict[str, Any] = {
-                f"z{i}": X[:, i] for i in range(X.shape[1])
-            }
-            df_cols["label"] = lab
-            ep_arr = np.asarray(epochs, dtype=float)
-            df_cols["hours_before"] = -ep_arr / 3600.0
-            latent_df = pd.DataFrame(df_cols)
-            _step(
-                "class_separation",
-                run_class_separation_analysis,
-                latent_df,
-                Path(output_dir_resolved) / "class_separation",
+            lab_arr = np.asarray(labels)
+            unique_labs, counts = np.unique(lab_arr, return_counts=True)
+            logger.info(
+                f"class_separation: collected {len(lab_arr)} samples "
+                f"across {len(unique_labs)} class(es): "
+                + ", ".join(
+                    f"{int(u)}={int(c)}" for u, c in zip(unique_labs, counts)
+                )
             )
+            if len(unique_labs) < 2:
+                logger.error(
+                    "class_separation: only one class present in the "
+                    "collected sample set. The standard test loader reads "
+                    "HDF5 files sequentially with shuffle=False, so a "
+                    "small max_samples can miss the later class files. "
+                    "Re-run with max_samples=None (or a larger cap) so "
+                    "all test HDF5 files are covered."
+                )
+                results["class_separation"] = {
+                    "error": "single-class sample set",
+                    "n_samples": int(len(lab_arr)),
+                    "unique_labels": [int(u) for u in unique_labs],
+                }
+            else:
+                df_cols: Dict[str, Any] = {
+                    f"z{i}": X[:, i] for i in range(X.shape[1])
+                }
+                df_cols["label"] = lab_arr
+                ep_arr = np.asarray(epochs, dtype=float)
+                df_cols["hours_before"] = -ep_arr / 3600.0
+                latent_df = pd.DataFrame(df_cols)
+                _step(
+                    "class_separation",
+                    run_class_separation_analysis,
+                    latent_df,
+                    Path(output_dir_resolved) / "class_separation",
+                )
+        else:
+            logger.warning("class_separation: no latent samples collected.")
+            results["class_separation"] = {"error": "no samples"}
     except Exception as exc:  # noqa: BLE001
         logger.error(f"class_separation failed: {exc}")
         results["class_separation"] = {"error": str(exc)}
@@ -373,7 +445,7 @@ def run_full_test_pipeline(
         _step(
             "kld_pca",
             run_kld_pca_analysis,
-            runner, standard_loader, max_samples or 500,
+            runner, standard_loader, aggregate_cap,
         )
 
     # 14d. Per-class breakdown of pooled CSVs (post-processor; must be last
