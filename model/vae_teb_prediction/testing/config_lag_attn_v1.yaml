@@ -1,0 +1,273 @@
+# Lag-Attentive Residual VAE-TEB v1 training configuration.
+#
+# Prerequisites:
+#   * HDF5 datasets must be produced by
+#     `hdf5_dataset/new_pipeline/create_new_pipeline.py`, which writes
+#     `up_st` (43 channels, log-normalised) and `up_ph` (58 channels,
+#     asinh-normalised) as first-class datasets alongside `fhr_st`,
+#     `fhr_ph`, and `fhr_up_ph` (now cross-channel phase only, 79
+#     channels — NOT concatenated with UP self-phase any more).
+#   * The stats file at `stat_path` must be regenerated after any dataset
+#     rebuild by running `hdf5_dataset/calculate_dataset_stats.py`. It
+#     must contain per-channel statistics for every field listed in
+#     `normalize_fields` below — in particular `up_st` and `up_ph` which
+#     are independent fields with their own asinh/log stats.
+#
+# Ablation toggle: `use_up_st: true` → source stream = concat(up_st, up_ph)
+# with c_u=101. `use_up_st: false` → source stream = up_ph alone with
+# c_u=58. The model constructor raises if (c_u, use_up_st) are
+# inconsistent.
+#
+# Warm-start: the lag-attn v1 architecture's latent width (d_z=24),
+# internal width (d_model=128) and source input channel count are all
+# different from any previous SeqVae checkpoint, so `core_model_checkpoint`
+# must stay null. v1 trains from scratch.
+
+general_config:
+  tag: lag_attn_v1_baseline
+
+  cuda_devices: [0]
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 100
+    test: 100
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v1
+
+model_config:
+  VAE_model:
+    # KL / beta schedule
+    beta_schedule: constant
+    beta_start: 0.0
+    beta_end: 1.0
+    beta_anneal_epochs: 50
+    beta_cycle_len: 1000
+    beta_const_val: 0.01
+    kld_beta: 0.001
+
+    # Feature-loss weighting (spec section 8.7)
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # Backbone widths
+    d_model: 128
+    d_z: 24
+    horizon: 30            # H_d = 30 decimated steps = 2 min forecast
+    warmup_period: 30      # first 2 minutes ignored in both feature & KL losses
+    sequence_length: 300
+    c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
+    c_u: 101               # 43 (up_st) + 58 (up_ph); must equal 58 if use_up_st=false
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-8.0, 8.0]
+
+    # Attention
+    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    num_heads: 4
+    d_head: 32
+    use_entmax: false      # fall back to softmax; entmax is optional
+    attention_grad_checkpoint: true  # start on; ~900 MB memory bank at B=64
+
+  core_model_checkpoint: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v1/2026-04-15--[16-02]-lag_attn_v1_baseline_complete_dataset_new_model/model_checkpoints/lag-attn-v1-epoch=epoch=305.ckpt
+
+  classifier:
+    vae_checkpoint: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v1/2026-04-11--[15-52]-lag_attn_v1_baseline/model_checkpoints/lag-attn-v1-epoch=epoch=294.ckpt
+    type: lstm
+    latent_dim: 24
+    num_classes: 2
+    freeze_vae: true
+    use_posterior: true
+    sample_latent: false
+
+    hidden_dim: 128
+    num_layers: 2
+    bidirectional: false
+    attn_dim: 64
+    dropout: 0.1
+    num_filters: 64
+    kernel_sizes: [3, 5, 7]
+    d_model: 128
+    n_heads: 4
+    dim_feedforward: 256
+    pooling: mean
+
+    evaluation:
+      target_fpr: 0.05
+      compute_both_thresholds: true
+      generate_plots: true
+      decision_time_hours: 1.0
+      exclude_last_minutes: 30
+      max_gap_multiplier: null
+
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+    vae_test_datasets:
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/stats.hdf5                    # Path to normalization stats.hdf5
+
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    classifier_train_datasets: []
+    classifier_val_datasets: []
+    classifier_test_datasets: []
+
+    dataloader_config:
+      num_workers: 4
+      prefetch_factor: 4
+      # Normalization is keyed by the physical HDF5 field name. Every field
+      # listed here must have a matching entry in the stats HDF5.
+      # `fhr_up_ph` (cross-channel phase) is intentionally omitted: v1 does
+      # not consume it, so we skip the load+normalise tax for that field.
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+      dataset_kwargs:
+        # Disable in-worker ``tensor.pin_memory()`` inside
+        # ``HDF5Dataset._create_tensor``. Pinning inside DataLoader worker
+        # processes calls ``cudaHostAlloc``, which forces each worker to
+        # create its own CUDA context on ``cuda:0`` (~400-600 MB of VRAM per
+        # worker for kernels, cuDNN/cuBLAS handles, and allocator
+        # bookkeeping). With 7 DDP ranks × ``num_workers=4`` = 28 worker
+        # processes all pinning against ``cuda:0``, rank 0's GPU OOMs the
+        # moment Lightning spawns a fresh set of validation workers at the
+        # epoch-0 train→val transition. The DataLoader's own
+        # ``pin_memory=True`` flag (passed from ``create_optimized_dataloader``
+        # in the trainer) still pins the collated batch in the *main* process,
+        # which is the PyTorch-recommended pattern and has no worker-side
+        # context cost. Flip to ``true`` only if profiling shows the
+        # main-process pin is a bottleneck, and only with ``num_workers=0``.
+        pin_memory: false
+        # `up_ph` is now a first-class HDF5 field with its own per-channel
+        # asinh stats (no virtual slicing from `fhr_up_ph`). `fhr_up_ph` is
+        # not loaded for v1.
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'fhr_st',
+            'fhr_ph',
+            'up_ph',
+            'up_st',
+            'target',
+#            'weight',
+            'epoch',
+#            'cs_label',
+#            'bg_label',
+            'guid',
+          ]
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: null
+        label: null
+        cache_size: 10000
+        trim_minutes: 1.0
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-attn-v1
+      run_name: lag_attn_v1_baseline
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn_v1
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 10000
+
+    reconstruction_plotting:
+      enabled: true
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: false    # no raw prediction in v1
+      plot_frequency: 10
+
+    # Lag-attentive v1 diagnostic plotting callback. Runs on
+    # on_validation_epoch_end at the given frequency and emits a
+    # publication-quality multi-row figure per validation sample covering
+    # raw signals, stacked feature maps, latent / posterior / prior,
+    # per-dim KLD, lag attention, TE attribution, forecast, MAE and
+    # residual usage.
+    lag_attn_plotting:
+      enabled: true
+      plot_frequency: 10                 # plot every 5 validation epochs
+      num_examples: 2                   # 2 samples per trigger
+      file_format: "pdf"
+      forecast_channels: [0, 43, 80]    # st[0], ph[0], ph[37]
+      forecast_anchor_frac: 0.6         # anchor at 60% of the sequence
