@@ -240,7 +240,7 @@ def get_te_guids(csv_path: Union[str, Path]) -> List[str]:
 def fuzzy_time_match(
     te_df: pd.DataFrame,
     kld_df: pd.DataFrame,
-    max_gap_seconds: float = 300.0,
+    max_gap_seconds: float = 180.0,
     te_time_col: str = "domain_start",
     kld_time_col: str = "epoch",
 ) -> pd.DataFrame:

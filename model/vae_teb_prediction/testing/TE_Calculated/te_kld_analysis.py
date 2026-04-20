@@ -43,14 +43,20 @@ def load_kld_from_metrics_csv(
 
     The CSV is expected to come from ``collect_metrics()`` in
     ``testing/collectors.py`` and must contain at least ``guid``, ``epoch``,
-    and ``kld`` columns.
+    and ``kld`` columns. All other columns are preserved verbatim, so
+    optional TE-surrogate columns added by the v1 collector — ``label``,
+    ``kld_pc1`` / ``kld_pc2`` / ``kld_pc3``, ``posterior_drift_norm``,
+    ``attention_entropy_mean``, ``attention_concentration_mean``,
+    ``te_lag_peak``, ``te_lag_total_mass``, ``delta_src_norm`` — flow
+    straight into the merged comparison DataFrame.
 
     Args:
         csv_path: Path to the metrics CSV file.
         grid_spacing: Epoch-grid spacing for rounding ``epoch`` values.
 
     Returns:
-        DataFrame with columns: guid, epoch, epoch_rounded, kld.
+        DataFrame with all CSV columns plus an ``epoch_rounded`` column
+        used by the ``exact_grid`` matching mode.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -1152,6 +1158,17 @@ CANDIDATE_KLD_COLS: Sequence[str] = (
     "feat_mse_total",
     "uplift_abs",
     "residual_ratio",
+    # Lag-attn v1 TE surrogates (only present when the metrics CSV was
+    # produced by the new collect_metrics implementation).
+    "kld_pc1",
+    "kld_pc2",
+    "kld_pc3",
+    "kld_pca_l2_top3",
+    "posterior_drift_norm",
+    "attention_concentration_mean",
+    "attention_entropy_mean",
+    "te_lag_total_mass",
+    "delta_src_norm",
 )
 CANDIDATE_TE_COLS: Sequence[str] = (
     "ite_valid",
@@ -1360,3 +1377,139 @@ def export_summary(
             json.dump(_strip_arrays(data_quality), f, indent=2, default=str)
 
     logger.info(f"Results exported to {output_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Lag-attn v1: PCA-derived score & per-class stratification
+# ---------------------------------------------------------------------------
+
+
+def pca_trajectory(
+    df: pd.DataFrame,
+    mode: str = "pc1",
+) -> pd.Series:
+    """Synthesize a PCA-based score column from the merged DataFrame.
+
+    The metrics CSV produced by the v1 collector carries the per-sample
+    means of the top-3 PCA components (``kld_pc1``, ``kld_pc2``,
+    ``kld_pc3``). This helper combines them into a single score
+    suitable for correlation against empirical TE.
+
+    Args:
+        df: Merged DataFrame (output of :func:`merge_te_kld`) that
+            contains the ``kld_pc*`` columns.
+        mode: One of:
+            * ``"pc1"``   — use the first principal component as the score.
+            * ``"l2_top3"`` — Euclidean norm of the top-3 components.
+            * ``"sum_top3"`` — signed sum of the top-3 components.
+
+    Returns:
+        Pandas Series of the chosen score, indexed identically to ``df``.
+        The series is filled with NaN when the required columns are not
+        present (callers should ``dropna`` before using it).
+    """
+    cols = [c for c in ("kld_pc1", "kld_pc2", "kld_pc3") if c in df.columns]
+    if not cols:
+        return pd.Series(np.nan, index=df.index, name=f"kld_pca_{mode}")
+
+    arr = df[cols].to_numpy(dtype=float)
+    if mode == "pc1":
+        out = arr[:, 0]
+    elif mode == "l2_top3":
+        out = np.sqrt(np.nansum(arr ** 2, axis=1))
+    elif mode == "sum_top3":
+        out = np.nansum(arr, axis=1)
+    else:
+        raise ValueError(
+            f"Unknown pca_trajectory mode: {mode!r}. "
+            "Use one of 'pc1', 'l2_top3', 'sum_top3'."
+        )
+    return pd.Series(out, index=df.index, name=f"kld_pca_{mode}")
+
+
+def _label_to_folder(label_id: int) -> Optional[str]:
+    """Map class id (1/2/3) to a stable subfolder name."""
+    return {1: "te_kld_class_healthy", 2: "te_kld_class_acidosis", 3: "te_kld_class_hie"}.get(label_id)
+
+
+def run_te_kld_pipeline_stratified(
+    merged_df: pd.DataFrame,
+    output_dir: Union[str, Path],
+    pipeline_fn,
+    *,
+    pipeline_kwargs: Optional[Dict[str, Any]] = None,
+    label_col: str = "label",
+) -> Dict[str, Any]:
+    """Re-run an existing TE-KLD pipeline once per outcome class.
+
+    The wrapper writes:
+
+    - ``<output_dir>/te_kld_class_all/`` (pooled, original behaviour)
+    - ``<output_dir>/te_kld_class_healthy/``
+    - ``<output_dir>/te_kld_class_acidosis/``
+    - ``<output_dir>/te_kld_class_hie/``
+
+    Each subfolder receives the full output of ``pipeline_fn`` for the
+    matching class subset of ``merged_df``. ``pipeline_fn`` must accept
+    ``(merged_df, output_dir, **pipeline_kwargs)`` and write artifacts
+    to the directory it is given (compatible with the helpers in
+    ``te_kld_comparison.py``).
+
+    Args:
+        merged_df: The output of :func:`merge_te_kld` after surrogate
+            columns have been propagated through. Must include the
+            ``label`` column for stratification to occur.
+        output_dir: Root directory under which the per-class subfolders
+            are written.
+        pipeline_fn: Callable invoked once per class subset.
+        pipeline_kwargs: Optional keyword arguments forwarded to every
+            invocation of ``pipeline_fn``.
+        label_col: Column carrying integer class IDs (1=HEALTHY,
+            2=ACIDOSIS, 3=HIE). Defaults to ``"label"``.
+
+    Returns:
+        Dict ``{folder_name: pipeline_result}`` mapping each subfolder to
+        the value returned by ``pipeline_fn``.
+    """
+    pipeline_kwargs = pipeline_kwargs or {}
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+
+    pooled_dir = output_dir / "te_kld_class_all"
+    pooled_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        results["te_kld_class_all"] = pipeline_fn(
+            merged_df, pooled_dir, **pipeline_kwargs
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"stratified pipeline (pooled) failed: {exc}")
+        results["te_kld_class_all"] = {"error": str(exc)}
+
+    if label_col not in merged_df.columns:
+        logger.warning(
+            f"run_te_kld_pipeline_stratified: column {label_col!r} not "
+            f"found, skipping per-class subdirectories."
+        )
+        return results
+
+    for label_id in (1, 2, 3):
+        folder_name = _label_to_folder(label_id)
+        if folder_name is None:
+            continue
+        sub = merged_df[merged_df[label_col] == label_id]
+        if sub.empty:
+            logger.info(f"stratified pipeline: skipping {folder_name} (no rows)")
+            continue
+        sub_dir = output_dir / folder_name
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            results[folder_name] = pipeline_fn(
+                pd.DataFrame(sub.copy()), sub_dir, **pipeline_kwargs
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"stratified pipeline ({folder_name}) failed: {exc}")
+            results[folder_name] = {"error": str(exc)}
+
+    return results

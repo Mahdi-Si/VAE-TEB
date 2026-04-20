@@ -613,6 +613,127 @@ def aggregate_te_lag_map(
 
 
 # -----------------------------------------------------------------------------
+# Additional TE surrogate helpers (lag-attn v1)
+# -----------------------------------------------------------------------------
+
+
+def compute_posterior_drift(
+    mu_prior: Tensor,
+    mu_post: Tensor,
+    warmup: int,
+) -> Tensor:
+    """Compute the per-sample mean squared posterior drift.
+
+    The squared L2 norm ``||mu_post - mu_prior||^2`` over the latent
+    dimension at every anchor, averaged over the post-warmup time range.
+    This is one of the additive terms inside the closed-form KL between
+    two diagonal Gaussians and behaves as an alternative TE surrogate
+    that is independent of the variance heads.
+
+    Args:
+        mu_prior: Prior mean tensor ``(B, T, d_z)``.
+        mu_post: Posterior mean tensor ``(B, T, d_z)``.
+        warmup: Number of initial anchors to skip.
+
+    Returns:
+        Per-sample drift ``(B,)``.
+    """
+    if mu_prior.shape != mu_post.shape:
+        raise ValueError(
+            f"mu_prior and mu_post must have the same shape, "
+            f"got {tuple(mu_prior.shape)} vs {tuple(mu_post.shape)}"
+        )
+    if mu_prior.dim() != 3:
+        raise ValueError(
+            f"mu_prior must be (B, T, d_z), got {tuple(mu_prior.shape)}"
+        )
+
+    B, T, _ = mu_prior.shape
+    warm = max(0, min(int(warmup), T))
+    if warm >= T:
+        return torch.zeros(B, device=mu_prior.device, dtype=mu_prior.dtype)
+    drift_t = (mu_post[:, warm:, :] - mu_prior[:, warm:, :]).pow(2).sum(dim=-1)
+    return drift_t.mean(dim=1)
+
+
+def fit_pca_kld_per_dim(
+    kld_per_dim_t: np.ndarray,
+    n_components: int = 3,
+    random_state: int = 42,
+):
+    """Fit a PCA on flattened per-time per-dim KL trajectories.
+
+    Args:
+        kld_per_dim_t: Array of shape ``(N_samples, T, d_z)`` carrying
+            per-time per-dim KL contributions for every collected sample.
+            NaN entries (e.g. warmup) are dropped before fitting.
+        n_components: Number of PCA components to retain (default 3).
+        random_state: Seed for reproducibility (default 42).
+
+    Returns:
+        Tuple ``(pca_model, projected, explained_variance_ratio)`` where:
+            - ``pca_model`` is the fitted ``sklearn.decomposition.PCA``.
+            - ``projected`` is ``(N_samples, T, n_components)`` with NaN
+              kept where the input was NaN.
+            - ``explained_variance_ratio`` is a ``(n_components,)`` array.
+    """
+    from sklearn.decomposition import PCA
+
+    arr = np.asarray(kld_per_dim_t)
+    if arr.ndim != 3:
+        raise ValueError(
+            f"kld_per_dim_t must be (N, T, d_z), got {arr.shape}"
+        )
+    N, T, dz = arr.shape
+    flat = arr.reshape(-1, dz)
+    finite_mask = np.all(np.isfinite(flat), axis=1)
+    if not finite_mask.any():
+        raise ValueError(
+            "fit_pca_kld_per_dim received no finite rows in kld_per_dim_t"
+        )
+
+    n_components = max(1, min(int(n_components), dz, int(finite_mask.sum())))
+    pca = PCA(n_components=n_components, random_state=random_state)
+    pca.fit(flat[finite_mask])
+
+    projected = np.full((flat.shape[0], n_components), np.nan, dtype=np.float32)
+    projected[finite_mask] = pca.transform(flat[finite_mask]).astype(np.float32)
+    projected = projected.reshape(N, T, n_components)
+    return pca, projected, np.asarray(pca.explained_variance_ratio_, dtype=np.float32)
+
+
+def project_kld_per_dim(
+    kld_per_dim_t: np.ndarray,
+    pca_model,
+) -> np.ndarray:
+    """Project per-time per-dim KL trajectories through a fitted PCA.
+
+    Args:
+        kld_per_dim_t: Array of shape ``(N, T, d_z)``.
+        pca_model: Fitted sklearn ``PCA`` instance.
+
+    Returns:
+        Projected array ``(N, T, n_components)`` with NaN preserved.
+    """
+    arr = np.asarray(kld_per_dim_t)
+    if arr.ndim != 3:
+        raise ValueError(
+            f"kld_per_dim_t must be (N, T, d_z), got {arr.shape}"
+        )
+    N, T, dz = arr.shape
+    n_components = int(getattr(pca_model, "n_components_", 0))
+    if n_components <= 0:
+        raise ValueError("pca_model has no fitted components")
+
+    flat = arr.reshape(-1, dz)
+    finite_mask = np.all(np.isfinite(flat), axis=1)
+    out = np.full((flat.shape[0], n_components), np.nan, dtype=np.float32)
+    if finite_mask.any():
+        out[finite_mask] = pca_model.transform(flat[finite_mask]).astype(np.float32)
+    return out.reshape(N, T, n_components)
+
+
+# -----------------------------------------------------------------------------
 # Latent Space Preprocessing and Dimensionality Reduction
 # -----------------------------------------------------------------------------
 

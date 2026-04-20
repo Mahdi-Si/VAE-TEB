@@ -66,6 +66,10 @@ from model.vae_teb_prediction.testing.analyses.encoder_probe import run_encoder_
 from model.vae_teb_prediction.testing.analyses.kld_lag_diagnostics import (
     run_kld_lag_diagnostics,
 )
+from model.vae_teb_prediction.testing.analyses.kld_pca import run_kld_pca_analysis
+from model.vae_teb_prediction.testing.analyses.per_class_breakdown import (
+    run_per_class_breakdown,
+)
 
 # Latent / trajectory / class-separation analyses.
 from model.vae_teb_prediction.testing.analyses.latent import (
@@ -131,6 +135,8 @@ def run_all_analyses(
     skip_trajectory: bool = False,
     skip_attention: bool = False,
     skip_forecast_heatmaps: bool = False,
+    skip_kld_pca: bool = False,
+    skip_per_class_breakdown: bool = False,
     trajectory_loader: Optional[Any] = None,
     trajectory_dim_reduction: str = "pca",
     trajectory_n_changepoints: int = 5,
@@ -231,6 +237,20 @@ def run_all_analyses(
             runner, loader, max_samples=min(10, max_samples or 10),
         )
 
+    if not skip_kld_pca:
+        results["kld_pca"] = _safe(
+            "kld_pca_analysis", run_kld_pca_analysis,
+            runner, loader, max_samples=max_samples or 500,
+        )
+
+    # Per-class breakdown is a pure post-processor over the CSVs the
+    # earlier analyses just wrote, so it must run *last*.
+    if not skip_per_class_breakdown:
+        results["per_class_breakdown"] = _safe(
+            "per_class_breakdown", run_per_class_breakdown,
+            runner.output_dir,
+        )
+
     logger.info("=" * 50)
     logger.info("All analyses complete!")
     logger.info(f"Results saved to: {runner.output_dir}")
@@ -251,6 +271,8 @@ __all__ = [
     "run_te_lag_class_analysis",
     "run_encoder_probe",
     "run_kld_lag_diagnostics",
+    "run_kld_pca_analysis",
+    "run_per_class_breakdown",
     "run_latent_distribution_analysis",
     "run_latent_space_visualization",
     "run_latent_interpolation",
