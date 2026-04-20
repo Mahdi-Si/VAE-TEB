@@ -41,8 +41,10 @@ from model.vae_teb_prediction.testing.analyses import (
     run_histogram_analysis,
     run_horizon_error_profile,
     run_kld_lag_diagnostics,
+    run_kld_pca_analysis,
     run_latent_distribution_analysis,
     run_latent_space_visualization,
+    run_per_class_breakdown,
     run_residual_usage_analysis,
     run_sample_diagnostics,
     run_te_lag_class_analysis,
@@ -74,6 +76,8 @@ def run_full_test_pipeline(
     skip_trajectory: bool = False,
     skip_attention: bool = False,
     skip_forecast_heatmaps: bool = False,
+    skip_kld_pca: bool = False,
+    skip_per_class_breakdown: bool = False,
     skip_interactive: bool = False,
     analysis_samples: int = 10,
     min_epochs_per_guid: int = 10,
@@ -100,6 +104,9 @@ def run_full_test_pipeline(
         skip_trajectory: Skip the per-GUID trajectory analysis.
         skip_attention: Skip attention + TE lag class analyses.
         skip_forecast_heatmaps: Skip the per-sample diagnostic PDFs.
+        skip_kld_pca: Skip the per-dim KL PCA analysis.
+        skip_per_class_breakdown: Skip the per-class CSV/plot breakdown
+            (a pure post-processor over the pooled CSVs).
         skip_interactive: Skip Plotly interactive plots.
         analysis_samples: Number of per-sample diagnostic PDFs to emit.
         min_epochs_per_guid: Minimum epochs per GUID for trajectory
@@ -346,6 +353,23 @@ def run_full_test_pipeline(
             "kld_lag_diagnostics",
             run_kld_lag_diagnostics,
             runner, standard_loader, min(analysis_samples, max_samples or analysis_samples),
+        )
+
+    # 14c. PCA on per-dim KL trajectory.
+    if not skip_kld_pca:
+        _step(
+            "kld_pca",
+            run_kld_pca_analysis,
+            runner, standard_loader, max_samples or 500,
+        )
+
+    # 14d. Per-class breakdown of pooled CSVs (post-processor; must be last
+    # of the analysis steps so all input CSVs already exist).
+    if not skip_per_class_breakdown:
+        _step(
+            "per_class_breakdown",
+            run_per_class_breakdown,
+            runner.output_dir,
         )
 
     # 15. Interactive metrics comparison.

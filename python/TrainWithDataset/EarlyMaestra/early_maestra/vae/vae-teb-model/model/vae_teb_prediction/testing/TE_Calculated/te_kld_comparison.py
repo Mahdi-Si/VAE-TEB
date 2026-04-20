@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from loguru import logger
 
@@ -441,6 +441,391 @@ def run_comparison(
         "per_dimension": per_dim,
         "correlation_matrices": correlation_matrices,
     }
+
+
+# ======================================================================
+# Lag-attn v1: extra empirical-vs-model comparison helpers
+# ======================================================================
+
+import numpy as np
+import pandas as pd
+from scipy import stats as _sp_stats
+
+from model.vae_teb_prediction.testing.TE_Calculated.te_kld_analysis import (
+    mutual_information_knn,
+    pca_trajectory,
+)
+
+
+def _finite_pair(x: Any, y: Any) -> "tuple[np.ndarray, np.ndarray]":
+    """Return aligned, finite numpy arrays from two array-likes."""
+    arr_x = np.asarray(x, dtype=float).ravel()
+    arr_y = np.asarray(y, dtype=float).ravel()
+    mask = np.isfinite(arr_x) & np.isfinite(arr_y)
+    return arr_x[mask], arr_y[mask]
+
+
+def cross_correlation_per_guid(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    max_lag: int = 10,
+    min_n: int = 5,
+) -> pd.DataFrame:
+    """Per-GUID cross-correlation of a model score vs empirical TE.
+
+    For each GUID with at least ``min_n`` matched epochs, computes the
+    normalised cross-correlation of the score and TE traces over lags
+    ``[-max_lag, +max_lag]`` and reports the lag of the maximum
+    absolute correlation.
+
+    Args:
+        merged: Output of ``merge_te_kld``, sorted by ``epoch``.
+        score_col: Model-side score column (e.g. ``kld``, ``kld_pc1``).
+        te_col: Empirical-TE column (e.g. ``ite_valid``).
+        max_lag: Maximum absolute lag to evaluate (epochs, integer).
+        min_n: Minimum matched epochs required per GUID.
+
+    Returns:
+        DataFrame with columns ``guid, n_epochs, best_lag, best_xcorr``.
+    """
+    rows = []
+    for guid, sub in merged.groupby("guid"):
+        sub = sub.sort_values("epoch").reset_index(drop=True)
+        x, y = _finite_pair(sub[score_col], sub[te_col])
+        n = x.size
+        if n < min_n:
+            continue
+        x = (x - x.mean()) / (x.std() + 1e-12)
+        y = (y - y.mean()) / (y.std() + 1e-12)
+        best_lag = 0
+        best_val = 0.0
+        max_l = min(max_lag, n - 1)
+        for lag in range(-max_l, max_l + 1):
+            if lag < 0:
+                xc = x[-lag:]
+                yc = y[: n + lag]
+            elif lag > 0:
+                xc = x[: n - lag]
+                yc = y[lag:]
+            else:
+                xc, yc = x, y
+            if xc.size < 2:
+                continue
+            corr = float(np.dot(xc, yc) / xc.size)
+            if abs(corr) > abs(best_val):
+                best_val = corr
+                best_lag = lag
+        rows.append({
+            "guid": str(guid),
+            "n_epochs": int(n),
+            "best_lag": int(best_lag),
+            "best_xcorr": best_val,
+        })
+    return pd.DataFrame(rows)
+
+
+def bland_altman(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    standardize: bool = True,
+) -> Dict[str, float]:
+    """Bland-Altman agreement summary between two scores.
+
+    When ``standardize=True`` (default) both columns are z-scored before
+    differencing — the empirical TE and the model surrogate live in
+    different units, so the agreement of interest is on standardised
+    scales.
+
+    Args:
+        merged: Merged DataFrame.
+        score_col: Model-side score column.
+        te_col: Empirical-TE column.
+        standardize: Whether to z-score both series before computing
+            the differences.
+
+    Returns:
+        Dict with ``n``, ``mean_diff``, ``std_diff``, ``loa_low``,
+        ``loa_high`` (95% limits of agreement = mean_diff ± 1.96*std_diff).
+    """
+    x, y = _finite_pair(merged[score_col], merged[te_col])
+    if x.size < 3:
+        return {"n": int(x.size), "mean_diff": float("nan"),
+                "std_diff": float("nan"), "loa_low": float("nan"),
+                "loa_high": float("nan")}
+    if standardize:
+        x = (x - x.mean()) / (x.std() + 1e-12)
+        y = (y - y.mean()) / (y.std() + 1e-12)
+    diff = x - y
+    mean_diff = float(diff.mean())
+    std_diff = float(diff.std(ddof=1))
+    return {
+        "n": int(diff.size),
+        "mean_diff": mean_diff,
+        "std_diff": std_diff,
+        "loa_low": mean_diff - 1.96 * std_diff,
+        "loa_high": mean_diff + 1.96 * std_diff,
+    }
+
+
+def roc_auc_high_te(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    quantile: float = 0.9,
+) -> Dict[str, Any]:
+    """ROC analysis: detect "high empirical TE" events using a model score.
+
+    Binarises ``te_col`` at the given quantile (default 90th percentile)
+    and treats ``score_col`` as the discriminator. Computes the
+    Mann-Whitney U statistic and converts to AUC.
+
+    Args:
+        merged: Merged DataFrame.
+        score_col: Model-side score column (higher = positive).
+        te_col: Empirical-TE column.
+        quantile: Quantile threshold for the positive class.
+
+    Returns:
+        Dict with ``n_pos``, ``n_neg``, ``auc``, ``mw_p``, ``threshold``.
+    """
+    x, y = _finite_pair(merged[score_col], merged[te_col])
+    if x.size < 8:
+        return {"n_pos": 0, "n_neg": 0, "auc": float("nan"),
+                "mw_p": float("nan"), "threshold": float("nan")}
+    thr = float(np.quantile(y, quantile))
+    pos = x[y >= thr]
+    neg = x[y < thr]
+    if pos.size == 0 or neg.size == 0:
+        return {"n_pos": int(pos.size), "n_neg": int(neg.size),
+                "auc": float("nan"), "mw_p": float("nan"),
+                "threshold": thr}
+    u, p = _sp_stats.mannwhitneyu(pos, neg, alternative="two-sided")
+    auc = float(u) / float(pos.size * neg.size)
+    return {
+        "n_pos": int(pos.size),
+        "n_neg": int(neg.size),
+        "auc": auc,
+        "mw_p": float(p),
+        "threshold": thr,
+    }
+
+
+def per_guid_regression(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    min_n: int = 5,
+) -> pd.DataFrame:
+    """Per-GUID linear regression ``score = slope * te + intercept``.
+
+    Args:
+        merged: Merged DataFrame.
+        score_col: Model-side dependent variable.
+        te_col: Empirical-TE independent variable.
+        min_n: Minimum matched epochs required per GUID.
+
+    Returns:
+        DataFrame with ``guid, n, slope, intercept, r2`` columns.
+    """
+    rows = []
+    for guid, sub in merged.groupby("guid"):
+        x, y = _finite_pair(sub[te_col], sub[score_col])
+        if x.size < min_n or np.std(x) == 0:
+            continue
+        res = _sp_stats.linregress(x, y)
+        slope_val = float(res[0])     # slope
+        intercept_val = float(res[1]) # intercept
+        r_val = float(res[2])         # r-value
+        rows.append({
+            "guid": str(guid),
+            "n": int(x.size),
+            "slope": slope_val,
+            "intercept": intercept_val,
+            "r2": r_val * r_val,
+        })
+    return pd.DataFrame(rows)
+
+
+def conditional_ks_by_quartile(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+) -> pd.DataFrame:
+    """Two-sample KS of the model score across empirical-TE quartiles.
+
+    Splits ``te_col`` into 4 quartiles and runs a KS test of the
+    score distribution in the highest vs lowest quartile and each
+    intermediate quartile vs the lowest, providing a non-parametric
+    check that the model score *shifts* with the empirical TE.
+
+    Args:
+        merged: Merged DataFrame.
+        score_col: Model-side score column.
+        te_col: Empirical-TE column.
+
+    Returns:
+        DataFrame ``[quartile, n_q, n_ref, ks_stat, p_value]``.
+    """
+    x, y = _finite_pair(merged[score_col], merged[te_col])
+    if x.size < 16:
+        return pd.DataFrame(columns=["quartile", "n_q", "n_ref", "ks_stat", "p_value"])
+    qs = np.quantile(y, [0.25, 0.5, 0.75])
+    bins = np.digitize(y, qs)  # 0..3
+    ref = x[bins == 0]
+    rows = []
+    for q in (1, 2, 3):
+        sub = x[bins == q]
+        if sub.size < 4 or ref.size < 4:
+            rows.append({"quartile": int(q), "n_q": int(sub.size),
+                         "n_ref": int(ref.size), "ks_stat": float("nan"),
+                         "p_value": float("nan")})
+            continue
+        try:
+            ks = _sp_stats.ks_2samp(sub, ref, alternative="two-sided")
+            stat = float(getattr(ks, "statistic", ks[0]))
+            p_val = float(getattr(ks, "pvalue", ks[1]))
+        except Exception:  # noqa: BLE001
+            stat = float("nan")
+            p_val = float("nan")
+        rows.append({
+            "quartile": int(q),
+            "n_q": int(sub.size),
+            "n_ref": int(ref.size),
+            "ks_stat": stat,
+            "p_value": p_val,
+        })
+    return pd.DataFrame(rows)
+
+
+def per_guid_r2(
+    merged: pd.DataFrame,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    min_n: int = 5,
+) -> pd.DataFrame:
+    """Per-GUID R² between a model score and empirical TE.
+
+    Convenience wrapper around :func:`per_guid_regression` that returns
+    only the GUID and its R² (handy for histogramming).
+
+    Args:
+        merged: Merged DataFrame.
+        score_col: Model-side score column.
+        te_col: Empirical-TE column.
+        min_n: Minimum matched epochs.
+
+    Returns:
+        DataFrame ``[guid, n, r2]``.
+    """
+    df = per_guid_regression(merged, score_col, te_col, min_n=min_n)
+    if df.empty:
+        return df
+    return df[["guid", "n", "r2"]].copy()
+
+
+def run_pca_vs_dims_comparison(
+    merged: pd.DataFrame,
+    output_dir: Path,
+    *,
+    te_col: str = "ite_valid",
+    candidate_scores: Optional[Sequence[str]] = None,
+    n_bootstrap: int = 0,
+) -> pd.DataFrame:
+    """Score every available model surrogate against empirical TE.
+
+    Loops over the model-side TE surrogates that are present in
+    ``merged`` (raw ``kld``, PCA scores, posterior drift, attention
+    concentration, TE-lag mass, etc.), and reports Pearson, Spearman,
+    Kendall, and KSG-MI for each. Results are saved to a CSV.
+
+    Args:
+        merged: Output of :func:`merge_te_kld`. Must contain ``te_col``.
+        output_dir: Where to write ``pca_vs_dims_summary.csv``.
+        te_col: Empirical-TE column (default ``"ite_valid"``).
+        candidate_scores: Iterable of model-side columns to compare.
+            When ``None``, defaults to a sensible v1 list (and falls
+            back gracefully when columns are missing).
+        n_bootstrap: When > 0, runs an IID bootstrap on Pearson r.
+
+    Returns:
+        DataFrame with one row per surrogate.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if candidate_scores is None:
+        candidate_scores = (
+            "kld",
+            "kld_pc1",
+            "kld_pc2",
+            "kld_pc3",
+            "kld_pca_l2_top3",
+            "posterior_drift_norm",
+            "attention_concentration_mean",
+            "te_lag_total_mass",
+            "delta_src_norm",
+            "uplift_abs",
+            "residual_ratio",
+        )
+
+    df_local = merged.copy()
+    if (
+        "kld_pca_l2_top3" not in df_local.columns
+        and {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(df_local.columns)
+    ):
+        df_local["kld_pca_l2_top3"] = pca_trajectory(df_local, "l2_top3")
+
+    rows = []
+    for col in candidate_scores:
+        if col not in df_local.columns or te_col not in df_local.columns:
+            continue
+        x, y = _finite_pair(df_local[col], df_local[te_col])
+        if x.size < 8:
+            rows.append({"surrogate": col, "n": int(x.size)})
+            continue
+        pear_res = _sp_stats.pearsonr(x, y)
+        spear_res = _sp_stats.spearmanr(x, y)
+        ken_res = _sp_stats.kendalltau(x, y)
+        try:
+            mi = float(mutual_information_knn(x, y, k=3))
+        except Exception:  # noqa: BLE001
+            mi = float("nan")
+        row = {
+            "surrogate": col,
+            "n": int(x.size),
+            "pearson_r": float(pear_res[0]),
+            "pearson_p": float(pear_res[1]),
+            "spearman_rho": float(spear_res[0]),
+            "spearman_p": float(spear_res[1]),
+            "kendall_tau": float(ken_res[0]),
+            "kendall_p": float(ken_res[1]),
+            "mutual_information": mi,
+        }
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(42)
+            samples = np.empty(n_bootstrap)
+            for i in range(n_bootstrap):
+                idx = rng.integers(0, x.size, size=x.size)
+                xs, ys = x[idx], y[idx]
+                if np.std(xs) == 0 or np.std(ys) == 0:
+                    samples[i] = np.nan
+                else:
+                    samples[i] = float(np.corrcoef(xs, ys)[0, 1])
+            row["pearson_r_ci_lo"] = float(np.nanpercentile(samples, 2.5))
+            row["pearson_r_ci_hi"] = float(np.nanpercentile(samples, 97.5))
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by="spearman_rho", ascending=False, na_position="last")
+        df.to_csv(output_dir / "pca_vs_dims_summary.csv", index=False)
+        logger.info(
+            f"run_pca_vs_dims_comparison: ranked {len(df)} surrogates against "
+            f"{te_col}; top: {df.iloc[0]['surrogate'] if len(df) else 'n/a'}"
+        )
+    return df
 
 
 # ======================================================================

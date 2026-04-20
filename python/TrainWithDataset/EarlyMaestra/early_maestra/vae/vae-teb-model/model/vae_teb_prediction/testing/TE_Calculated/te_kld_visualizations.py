@@ -1225,3 +1225,250 @@ def plot_per_guid_trajectory_overlays(
     fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Lag-attn v1: extra empirical-vs-model comparison plots
+# ---------------------------------------------------------------------------
+
+
+def plot_xcorr_lag_hist(xcorr_df: pd.DataFrame, out_path: Path) -> Path:
+    """Histogram of per-GUID best lag and best xcorr value.
+
+    Args:
+        xcorr_df: Output of
+            :func:`te_kld_comparison.cross_correlation_per_guid` —
+            must contain ``best_lag`` and ``best_xcorr`` columns.
+        out_path: Path of the PDF to write.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if xcorr_df.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.0))
+    axes[0].hist(xcorr_df["best_lag"], bins=21, color=COLOR_BLUE, alpha=0.8)
+    axes[0].axvline(0, color=COLOR_BLACK, lw=0.6)
+    axes[0].set_xlabel("best lag (epochs)")
+    axes[0].set_ylabel("# GUIDs")
+    axes[0].set_title("Per-GUID best cross-correlation lag")
+    _style_axes(axes[0])
+    axes[1].hist(xcorr_df["best_xcorr"], bins=20, color=COLOR_VERMILLION, alpha=0.8)
+    axes[1].axvline(0, color=COLOR_BLACK, lw=0.6)
+    axes[1].set_xlabel("|best xcorr|")
+    axes[1].set_ylabel("# GUIDs")
+    axes[1].set_title("Per-GUID best xcorr value")
+    _style_axes(axes[1])
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_bland_altman(
+    merged_df: pd.DataFrame,
+    bland_stats: Dict[str, float],
+    out_path: Path,
+    *,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    standardize: bool = True,
+) -> Path:
+    """Bland-Altman agreement scatter for two scores.
+
+    Args:
+        merged_df: Merged TE-KLD DataFrame.
+        bland_stats: Output of :func:`te_kld_comparison.bland_altman`.
+        out_path: PDF path.
+        score_col: Model-side score column.
+        te_col: Empirical-TE column.
+        standardize: Mirror the standardisation flag used when computing
+            ``bland_stats``.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    x = np.asarray(merged_df[score_col], dtype=float)
+    y = np.asarray(merged_df[te_col], dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if x.size == 0:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    if standardize:
+        x = (x - x.mean()) / (x.std() + 1e-12)
+        y = (y - y.mean()) / (y.std() + 1e-12)
+    diff = x - y
+    avg = (x + y) / 2.0
+    fig, ax = plt.subplots(figsize=(4.6, 3.4))
+    ax.scatter(avg, diff, s=10, alpha=0.45, color=COLOR_BLUE)
+    ax.axhline(bland_stats["mean_diff"], color=COLOR_BLACK, lw=0.8,
+               label=f"mean diff = {bland_stats['mean_diff']:.3f}")
+    ax.axhline(bland_stats["loa_low"], color=COLOR_VERMILLION, lw=0.6, ls="--",
+               label=f"LoA = ({bland_stats['loa_low']:.3f}, {bland_stats['loa_high']:.3f})")
+    ax.axhline(bland_stats["loa_high"], color=COLOR_VERMILLION, lw=0.6, ls="--")
+    ax.set_xlabel(f"mean of standardised {score_col} and {te_col}")
+    ax.set_ylabel(f"{score_col} − {te_col} (standardised)")
+    ax.set_title("Bland-Altman agreement")
+    ax.legend(loc="best", frameon=True)
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_roc_curve(
+    merged_df: pd.DataFrame,
+    roc_stats: Dict[str, Any],
+    out_path: Path,
+    *,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+) -> Path:
+    """ROC curve of "high empirical TE" detection by a model score.
+
+    Args:
+        merged_df: Merged TE-KLD DataFrame.
+        roc_stats: Output of :func:`te_kld_comparison.roc_auc_high_te`
+            (used for the threshold + AUC annotation).
+        out_path: PDF path.
+        score_col: Model-side score column.
+        te_col: Empirical-TE column.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    x = np.asarray(merged_df[score_col], dtype=float)
+    y = np.asarray(merged_df[te_col], dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    fig, ax = plt.subplots(figsize=(4.2, 3.6))
+    if x.size == 0 or not np.isfinite(roc_stats.get("threshold", float("nan"))):
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    thr = float(roc_stats["threshold"])
+    pos = y >= thr
+    if pos.sum() == 0 or (~pos).sum() == 0:
+        ax.text(0.5, 0.5, "Degenerate split", ha="center", va="center",
+                transform=ax.transAxes)
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    sort_idx = np.argsort(-x)
+    pos_sorted = pos[sort_idx]
+    tpr = np.cumsum(pos_sorted) / max(int(pos.sum()), 1)
+    fpr = np.cumsum(~pos_sorted) / max(int((~pos).sum()), 1)
+    ax.plot([0, 1], [0, 1], color=COLOR_GRAY, lw=0.6, ls="--")
+    ax.plot(fpr, tpr, color=COLOR_BLUE, lw=1.2,
+            label=f"AUC = {roc_stats.get('auc', float('nan')):.3f}")
+    ax.set_xlabel(f"FPR (negatives: {te_col} < {thr:.3f})")
+    ax.set_ylabel(f"TPR (positives: {te_col} ≥ {thr:.3f})")
+    ax.set_title(f"ROC: detect high {te_col} via {score_col}")
+    ax.legend(loc="lower right", frameon=True)
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_per_guid_slope_hist(reg_df: pd.DataFrame, out_path: Path) -> Path:
+    """Histogram of per-GUID regression slopes and R² values.
+
+    Args:
+        reg_df: Output of :func:`te_kld_comparison.per_guid_regression`.
+        out_path: PDF path.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if reg_df.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.0))
+    axes[0].hist(reg_df["slope"], bins=20, color=COLOR_BLUE, alpha=0.8)
+    axes[0].axvline(0, color=COLOR_BLACK, lw=0.6)
+    axes[0].set_xlabel("regression slope (model = a · TE + b)")
+    axes[0].set_ylabel("# GUIDs")
+    axes[0].set_title("Per-GUID slope distribution")
+    _style_axes(axes[0])
+    axes[1].hist(reg_df["r2"], bins=20, color=COLOR_GREEN, alpha=0.8, range=(0, 1))
+    axes[1].set_xlabel("per-GUID R²")
+    axes[1].set_ylabel("# GUIDs")
+    axes[1].set_xlim(0, 1)
+    axes[1].set_title("Per-GUID R²")
+    _style_axes(axes[1])
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_conditional_ks_grid(
+    ks_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+) -> Path:
+    """Bar chart of KS statistics by empirical-TE quartile.
+
+    Args:
+        ks_df: Output of
+            :func:`te_kld_comparison.conditional_ks_by_quartile`.
+        out_path: PDF path.
+        score_col: Model-side score column (used in axis label).
+        te_col: Empirical-TE column (used in axis label).
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if ks_df.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.4))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    fig, ax = plt.subplots(figsize=(4.6, 3.0))
+    quartiles = ks_df["quartile"].astype(int).to_list()
+    stats = ks_df["ks_stat"].astype(float).to_list()
+    pvals = ks_df["p_value"].astype(float).to_list()
+    bars = ax.bar(quartiles, stats, color=COLOR_BLUE, alpha=0.8)
+    for q, p, b in zip(quartiles, pvals, bars):
+        if np.isfinite(p):
+            ax.text(b.get_x() + b.get_width() / 2,
+                    b.get_height() + 0.005,
+                    f"p={p:.2g}",
+                    ha="center", va="bottom", fontsize=7, color=COLOR_BLACK)
+    ax.set_xlabel(f"{te_col} quartile (vs Q1 reference)")
+    ax.set_ylabel(f"KS statistic on {score_col}")
+    ax.set_title("Conditional KS by TE quartile")
+    ax.set_xticks(quartiles)
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path

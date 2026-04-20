@@ -17,6 +17,9 @@ Example:
 
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -29,8 +32,11 @@ from model.vae_teb_prediction.testing.metrics import (
     compute_attention_diagnostics,
     compute_forecast_metrics,
     compute_kld_per_sample,
+    compute_posterior_drift,
     compute_residual_usage,
     compute_uplift_metrics,
+    fit_pca_kld_per_dim,
+    project_kld_per_dim,
 )
 
 
@@ -216,31 +222,52 @@ def collect_metrics(
     runner: TestRunner,
     loader: Any,
     max_samples: Optional[int] = None,
+    *,
+    pca_components: int = 3,
+    pca_output_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Collect per-sample feature-forecast, uplift, residual and KL metrics.
 
     For every sample this runs the model once, builds the unfolded future
     feature target via :meth:`TestRunner.build_future_target`, and calls
     :func:`compute_forecast_metrics`, :func:`compute_uplift_metrics`,
-    :func:`compute_residual_usage`, and :func:`compute_kld_per_sample`.
+    :func:`compute_residual_usage`, :func:`compute_kld_per_sample`,
+    :func:`compute_attention_diagnostics`, :func:`aggregate_te_lag_map`,
+    and :func:`compute_posterior_drift`.
 
-    The resulting DataFrame preserves a ``kld`` column (an alias of
-    ``kld_mean``) so downstream consumers that key on ``kld`` (notably
-    ``TE_Calculated/te_kld_analysis.py``) keep working unchanged.
+    Beyond the legacy ``kld``/``kld_mean`` scalar, additional TE-surrogate
+    columns are emitted for the comparison pipeline:
+    ``posterior_drift_norm``, ``delta_src_norm``, ``attention_entropy_mean``,
+    ``attention_concentration_mean``, ``te_lag_peak``,
+    ``te_lag_total_mass``, plus PCA top-3 of the per-dim KL trajectory
+    (``kld_pc1``, ``kld_pc2``, ``kld_pc3``).
 
     Args:
         runner: :class:`TestRunner` with a loaded model and device.
         loader: PyTorch DataLoader yielding the batch objects consumed by
             the runner.
         max_samples: Maximum samples to process (None = all).
+        pca_components: Number of PCA components to retain on the per-dim
+            KL trajectory (default 3).
+        pca_output_dir: Optional directory for persisting PCA artifacts
+            (``ev_ratio.json``, ``components.npy``, ``mean.npy``). When
+            ``None`` the artifacts are written under
+            ``runner.output_dir / "pca_kld"``.
 
     Returns:
-        DataFrame with columns ``[guid, epoch, label, feat_mse_total,
-        feat_mse_st, feat_mse_ph, feat_r2_total, base_mse_total,
-        uplift_abs, uplift_rel, residual_ratio, kld_mean, kld]``.
+        DataFrame with the legacy columns plus the new TE surrogates and
+        ``kld_pc1``/``kld_pc2``/``kld_pc3`` (when fitting succeeds). The
+        ``kld`` alias is preserved for backward compatibility with
+        ``TE_Calculated/te_kld_analysis.py``.
     """
     records: List[Dict[str, Any]] = []
     processed = 0
+
+    # Per-batch buffers for PCA on the per-time per-dim KL.
+    per_dim_t_chunks: List[np.ndarray] = []
+    record_index_to_sample_offset: List[int] = []
+    sample_T: Optional[int] = None
+    sample_dz: Optional[int] = None
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -267,11 +294,45 @@ def collect_metrics(
             )
             kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
 
-            # Per-dim KLD (closed-form), averaged over the post-warmup
-            # anchor range. Enables the per-dimension heatmap in the
-            # TE_Calculated pipeline. Only emitted when all four moment
-            # tensors are present on the forward output.
-            per_dim_means: Optional[Any] = None
+            # Lag-attention diagnostics (entropy / concentration).
+            attn_entropy_mean: Optional[np.ndarray] = None
+            attn_conc_mean: Optional[np.ndarray] = None
+            attn_weights = outputs.get("attn_weights")
+            if attn_weights is not None and attn_weights.dim() == 4:
+                diag = compute_attention_diagnostics(
+                    attn_weights, runner.warmup_steps
+                )
+                # entropy: (B, T, M) with NaN in warmup; collapse over heads
+                # then over time using nanmean.
+                ent = diag["entropy"].detach().cpu().numpy()
+                head_mean = np.nanmean(ent, axis=2)  # (B, T)
+                ent_mean = np.asarray(np.nanmean(head_mean, axis=1))  # (B,)
+                attn_entropy_mean = ent_mean
+                L = int(attn_weights.shape[-1])
+                norm = math.log(L) if L > 1 else 1.0
+                attn_conc_mean = 1.0 - ent_mean / max(norm, 1e-12)
+
+            # TE lag map: peak lag and total mass per sample.
+            te_lag_peak: Optional[np.ndarray] = None
+            te_lag_total_mass: Optional[np.ndarray] = None
+            te_lag_map = outputs.get("te_lag_map")
+            if te_lag_map is not None and te_lag_map.dim() == 3:
+                agg = aggregate_te_lag_map(te_lag_map, runner.warmup_steps)
+                te_lag_peak = agg["te_lag_argmax"].detach().cpu().numpy()
+                te_lag_total_mass = (
+                    agg["te_lag_mean"].detach().cpu().numpy().sum(axis=-1)
+                )
+
+            # Posterior drift surrogate (||mu_q - mu_p||^2 averaged over t).
+            drift: Optional[np.ndarray] = None
+            if "mu_prior" in outputs and "mu_post" in outputs:
+                drift = compute_posterior_drift(
+                    outputs["mu_prior"], outputs["mu_post"], runner.warmup_steps
+                ).detach().cpu().numpy()
+
+            # Per-dim KLD (closed-form), per-time per-dim tensor needed for
+            # both per-sample mean (existing) AND PCA fit (new).
+            per_dim_means: Optional[np.ndarray] = None
             if (
                 "mu_prior" in outputs
                 and "logvar_prior" in outputs
@@ -297,6 +358,16 @@ def collect_metrics(
                     kld_valid = kld_per_dim_t
                 per_dim_means = kld_valid.mean(dim=1).detach().cpu().numpy()
 
+                # Stash the (B, T, d_z) tensor with NaN in warmup for PCA.
+                per_dim_t_np = kld_per_dim_t.detach().to(torch.float32).cpu().numpy()
+                if warm > 0 and warm < T:
+                    per_dim_t_np = per_dim_t_np.copy()
+                    per_dim_t_np[:, :warm, :] = np.nan
+                per_dim_t_chunks.append(per_dim_t_np)
+                if sample_T is None:
+                    sample_T = int(per_dim_t_np.shape[1])
+                    sample_dz = int(per_dim_t_np.shape[2])
+
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
@@ -314,20 +385,87 @@ def collect_metrics(
                     "uplift_abs": float(uplift["uplift_abs"][idx].cpu().item()),
                     "uplift_rel": float(uplift["uplift_rel"][idx].cpu().item()),
                     "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
+                    "delta_src_norm": float(usage["delta_norm"][idx].cpu().item()),
                     "kld_mean": kld_val,
                     "kld": kld_val,  # alias for backward compatibility
                 }
+                if drift is not None:
+                    record["posterior_drift_norm"] = float(drift[idx])
+                if attn_entropy_mean is not None and attn_conc_mean is not None:
+                    record["attention_entropy_mean"] = float(attn_entropy_mean[idx])
+                    record["attention_concentration_mean"] = float(
+                        attn_conc_mean[idx]
+                    )
+                if te_lag_peak is not None and te_lag_total_mass is not None:
+                    record["te_lag_peak"] = int(te_lag_peak[idx])
+                    record["te_lag_total_mass"] = float(te_lag_total_mass[idx])
                 if per_dim_means is not None:
                     dim_vec = per_dim_means[idx]
                     for d in range(dim_vec.shape[0]):
                         record[f"kld_dim_{d}"] = float(dim_vec[d])
+
+                # Track which (chunk_idx, in_chunk_idx) this record maps to
+                # so we can back-fill PCA scores after the loop.
+                record_index_to_sample_offset.append(len(records))
                 records.append(record)
                 processed += 1
 
             if max_samples and processed >= max_samples:
                 break
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+
+    # --- PCA on stacked per-time per-dim KL trajectories --------------------
+    if (
+        per_dim_t_chunks
+        and sample_T is not None
+        and sample_dz is not None
+        and pca_components > 0
+    ):
+        try:
+            stacked = np.concatenate(per_dim_t_chunks, axis=0)  # (N, T, d_z)
+            stacked = stacked[: len(df)]
+            n_keep = max(1, min(int(pca_components), int(sample_dz)))
+            pca_model, projected, ev_ratio = fit_pca_kld_per_dim(
+                stacked, n_components=n_keep
+            )
+            # Per-sample mean of each component (ignoring NaN warmup).
+            with np.errstate(invalid="ignore"):
+                pc_means = np.nanmean(projected, axis=1)  # (N, k)
+            for k in range(pc_means.shape[1]):
+                df[f"kld_pc{k + 1}"] = pc_means[:, k].astype(float)
+
+            target_dir = (
+                Path(pca_output_dir)
+                if pca_output_dir is not None
+                else Path(runner.output_dir) / "pca_kld"
+            )
+            target_dir.mkdir(parents=True, exist_ok=True)
+            with open(target_dir / "ev_ratio.json", "w") as fh:
+                json.dump(
+                    {
+                        "n_components": int(pca_model.n_components_),
+                        "explained_variance_ratio": [float(x) for x in ev_ratio],
+                        "n_samples_fitted": int(stacked.shape[0]),
+                        "T": int(sample_T),
+                        "d_z": int(sample_dz),
+                    },
+                    fh,
+                    indent=2,
+                )
+            np.save(
+                target_dir / "components.npy",
+                np.asarray(pca_model.components_, dtype=np.float32),
+            )
+            np.save(
+                target_dir / "mean.npy",
+                np.asarray(pca_model.mean_, dtype=np.float32),
+            )
+        except Exception:
+            # PCA is auxiliary; never let it break the main metrics CSV.
+            pass
+
+    return df
 
 
 def collect_latents(
@@ -502,6 +640,8 @@ def collect_kld_trajectory(
     runner: TestRunner,
     loader: Any,
     max_samples: Optional[int] = None,
+    *,
+    pca_model: Any = None,
 ) -> pd.DataFrame:
     """Collect per-timestep KL trajectory records for every sample.
 
@@ -514,16 +654,30 @@ def collect_kld_trajectory(
     ``TE_Calculated`` modules keep working:
     ``[guid, epoch, hours_before, label, timestep, kld_mean, latent_0 ... latent_{d_z-1}]``.
 
+    When ``pca_model`` is supplied (an sklearn PCA fitted on per-time
+    per-dim KL via :func:`fit_pca_kld_per_dim`), the closed-form per-dim
+    KL is recomputed on the fly and projected through the model. The
+    resulting per-time scores land in extra columns ``kld_pc1_t``,
+    ``kld_pc2_t``, ``kld_pc3_t`` (or as many components as the model
+    has).
+
     Args:
         runner: :class:`TestRunner` with a loaded model.
         loader: PyTorch DataLoader.
         max_samples: Maximum samples to process (None = all).
+        pca_model: Optional fitted sklearn ``PCA`` whose components live
+            in the per-dim-KL space ``(n_components, d_z)``. When None,
+            no PC trajectory columns are emitted.
 
     Returns:
         DataFrame with per-(sample, timestep) rows.
     """
     records: List[Dict[str, Any]] = []
     processed = 0
+
+    n_pcs = 0
+    if pca_model is not None:
+        n_pcs = int(getattr(pca_model, "n_components_", 0))
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -543,6 +697,25 @@ def collect_kld_trajectory(
 
             T = int(kld_t_f.size(1))
 
+            # Optional: per-time per-dim KL projected through PCA.
+            pc_traj_np: Optional[np.ndarray] = None
+            if n_pcs > 0 and all(
+                k in outputs
+                for k in ("mu_prior", "logvar_prior", "mu_post", "logvar_post")
+            ):
+                mu_p = outputs["mu_prior"]
+                lv_p = outputs["logvar_prior"]
+                mu_q = outputs["mu_post"]
+                lv_q = outputs["logvar_post"]
+                kld_per_dim_t = 0.5 * (
+                    lv_p - lv_q + (lv_q.exp() + (mu_q - mu_p) ** 2) / lv_p.exp() - 1.0
+                )
+                arr = kld_per_dim_t.detach().to(torch.float32).cpu().numpy()
+                if warmup > 0 and warmup < T:
+                    arr = arr.copy()
+                    arr[:, :warmup, :] = np.nan
+                pc_traj_np = project_kld_per_dim(arr, pca_model)
+
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
                     break
@@ -554,6 +727,7 @@ def collect_kld_trajectory(
 
                 kld_vals = kld_t_f[idx].cpu().numpy()
                 latent_vals = latent[idx].cpu().numpy() if latent is not None else None
+                pc_vals = pc_traj_np[idx] if pc_traj_np is not None else None
 
                 for t in range(T):
                     v = kld_vals[t]
@@ -570,6 +744,9 @@ def collect_kld_trajectory(
                     if latent_vals is not None:
                         for d in range(latent_vals.shape[1]):
                             record[f"latent_{d}"] = float(latent_vals[t, d])
+                    if pc_vals is not None:
+                        for k in range(pc_vals.shape[1]):
+                            record[f"kld_pc{k + 1}_t"] = float(pc_vals[t, k])
                     records.append(record)
 
                 processed += 1
