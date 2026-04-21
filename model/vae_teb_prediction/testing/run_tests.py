@@ -755,10 +755,42 @@ def _create_dataloader(
     if "pin_memory" not in resolved_kwargs:
         resolved_kwargs["pin_memory"] = True
 
+    # CRITICAL: force num_workers=0 for the test loader.
+    #
+    # ``create_optimized_dataloader`` hard-codes
+    #   ``persistent_workers=True if num_workers > 0 else False``
+    # (hdf5_dataset.py:1047). With persistent_workers=True + spawn
+    # multiprocessing + a multi-file HDF5 dataset, PyTorch workers enter a
+    # degraded state after the FIRST full loader iteration: the second
+    # iteration silently terminates early — in our testing runs, at
+    # exactly the length of file 0's index range (~1000 samples, all of
+    # class 3/HIE).
+    #
+    # This breaks every analysis that runs after Step 0 (which does the
+    # first full pass). Symptoms:
+    #   * histogram/forecast_quality/uplift/etc. all "n=1000" regardless
+    #     of the cap we pass
+    #   * per_class_breakdown finds "n_classes=1" because all 1000 are HIE
+    #   * encoder_probe says "not enough data" (one-class subset)
+    #
+    # The fix is num_workers=0: single-process, no persistent workers,
+    # deterministic iteration. Slower than 4 workers, but correct.
+    # Users who want parallel loading should set
+    # ``dataset_kwargs.persistent_workers=False`` on their training side;
+    # the test pipeline stays single-process.
+    forced_num_workers = 0
+    if num_workers and num_workers > 0:
+        logger.warning(
+            f"Test loader: forcing num_workers=0 (config requested "
+            f"{num_workers}). Multi-worker HDF5 loading is unreliable "
+            f"across multiple loader iterations — see _create_dataloader "
+            f"for the full diagnosis."
+        )
+
     loader = create_optimized_dataloader(
         hdf5_files=[str(p) for p in paths],
         batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=forced_num_workers,
         shuffle=False,
         stats_path=stats_path,
         normalize_fields=normalize_fields,
@@ -766,7 +798,10 @@ def _create_dataloader(
         world_size=1,
         **resolved_kwargs,
     )
-    logger.info(f"Loaded {len(loader.dataset)} test samples")
+    logger.info(
+        f"Loaded {len(loader.dataset)} test samples "
+        f"(num_workers=0, persistent_workers=False)"
+    )
     return loader
 
 
@@ -785,9 +820,20 @@ def _create_guid_dataloader(
     if "pin_memory" not in resolved_kwargs:
         resolved_kwargs["pin_memory"] = True
 
-    loader_overrides: Dict[str, Any] = {}
-    if num_workers is not None:
-        loader_overrides["num_workers"] = num_workers
+    # Same num_workers=0 override as _create_dataloader — see the
+    # comment there for the full explanation. TL;DR: persistent workers
+    # + multi-file HDF5 + multiple loader iterations silently truncates
+    # subsequent passes to one file's worth of samples. num_workers=0 is
+    # slower but correct.
+    if num_workers and num_workers > 0:
+        logger.warning(
+            f"GUID test loader: forcing num_workers=0 (config requested "
+            f"{num_workers})."
+        )
+    loader_overrides: Dict[str, Any] = {
+        "num_workers": 0,
+        "persistent_workers": False,
+    }
 
     eligible_guids, loader = build_guid_filtered_dataloader(
         dataset_paths=[str(p) for p in paths],
@@ -796,11 +842,12 @@ def _create_guid_dataloader(
         sampler_shuffle=False,
         stats_path=stats_path,
         normalize_fields=normalize_fields,
-        dataloader_overrides=loader_overrides if loader_overrides else None,
+        dataloader_overrides=loader_overrides,
         **resolved_kwargs,
     )
     logger.info(
-        f"GUID loader: {len(eligible_guids)} patients (>= {min_epochs_per_guid} epochs)"
+        f"GUID loader: {len(eligible_guids)} patients "
+        f"(>= {min_epochs_per_guid} epochs, num_workers=0)"
     )
     return eligible_guids, loader
 
