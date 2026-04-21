@@ -259,6 +259,19 @@ def run_full_test_pipeline(
     # every sample in the loaded test set (see ``_cap`` above).
     aggregate_cap = _cap(max_samples)
 
+    # Heavy collectors retain full per-sample forward tensors
+    # (``collect_predictions`` ≈ 13 MB / sample, ``collect_attention_maps``
+    # ≈ 750 KB / sample). Letting them iterate the entire test set blows
+    # past available RAM and silently kills DataLoader workers, after
+    # which downstream steps see batches from only the first HDF5 file
+    # (the famous "Only 1 class(es) found" symptom). The numbers below
+    # are statistically sufficient for their respective analyses (latent
+    # scatter, linear probe, attention heatmaps) and orders of magnitude
+    # smaller than typical test sets.
+    HEAVY_PRED_CAP = min(aggregate_cap, 2000)   # collect_predictions consumers
+    HEAVY_ATTN_CAP = min(aggregate_cap, 2000)   # collect_attention_maps consumers
+    PROBE_CAP = min(aggregate_cap, 5000)       # linear-probe / latent stats
+
     # 2. Histogram (cheap, establishes baseline metrics).
     _step(
         "histogram",
@@ -303,10 +316,13 @@ def run_full_test_pipeline(
 
     # 8-9. Attention + TE lag class (gated).
     if not skip_attention:
+        # Capped: collect_attention_maps retains per-anchor (T,L), (T,M),
+        # (L,) numpy arrays per sample (~750 KB each). 2 000 samples is
+        # already plenty for stable per-anchor histograms.
         _step(
             "attention",
             run_attention_diagnostics,
-            runner, standard_loader, aggregate_cap,
+            runner, standard_loader, HEAVY_ATTN_CAP,
         )
         _step(
             "te_lag",
@@ -314,23 +330,28 @@ def run_full_test_pipeline(
             runner, standard_loader, aggregate_cap,
         )
 
-    # 10. Encoder probe.
+    # 10. Encoder probe (linear classifier — 5 000 samples is more than
+    # enough for stable AUC).
     _step(
         "encoder_probe",
         run_encoder_probe,
-        runner, standard_loader, aggregate_cap,
+        runner, standard_loader, PROBE_CAP,
     )
 
     # 11. Latent distribution & space visualization.
+    # Capped: ``run_latent_space_visualization`` calls ``collect_predictions``
+    # which retains the full ~13 MB per-sample forward output. Use the
+    # heavy-pred cap so this step doesn't poison the dataloader workers
+    # before later steps run.
     _step(
         "latent_distribution",
         run_latent_distribution_analysis,
-        runner, standard_loader, aggregate_cap,
+        runner, standard_loader, PROBE_CAP,
     )
     _step(
         "latent_space",
         run_latent_space_visualization,
-        runner, standard_loader, aggregate_cap,
+        runner, standard_loader, HEAVY_PRED_CAP,
     )
 
     # 12. Class separation (uses time-averaged latent features).
@@ -366,6 +387,11 @@ def run_full_test_pipeline(
         X_rows: List[np.ndarray] = []
         labels: List[int] = []
         epochs: List[float] = []
+        raw_label_counter: Dict[Any, int] = {}    # diagnostic: every label seen
+        n_batches = 0
+        n_seen = 0
+        n_dropped_padonly = 0
+        n_dropped_other = 0
         processed = 0
         with runner.inference_mode():
             for batch in runner.iter_batches(standard_loader, max_samples):
@@ -376,13 +402,21 @@ def run_full_test_pipeline(
                 # (B, T, d_z) -> per-sample mean over time -> (B, d_z).
                 z_mean = z.mean(dim=1).detach().cpu().numpy()
                 batch_size = int(z_mean.shape[0])
+                n_batches += 1
                 for idx in range(batch_size):
                     if max_samples and processed >= max_samples:
                         break
                     lab = _extract_label(batch, idx)
+                    n_seen += 1
+                    raw_label_counter[lab] = raw_label_counter.get(lab, 0) + 1
                     # Drop pad-only (label None) and unknown class ids so
                     # they don't create a spurious zero-valued class.
-                    if lab is None or int(lab) not in (1, 2, 3):
+                    if lab is None:
+                        n_dropped_padonly += 1
+                        processed += 1
+                        continue
+                    if int(lab) not in (1, 2, 3):
+                        n_dropped_other += 1
                         processed += 1
                         continue
                     X_rows.append(z_mean[idx].astype(np.float32))
@@ -396,6 +430,22 @@ def run_full_test_pipeline(
                 del outputs, z, z_mean
                 if hasattr(_torch_local, "cuda") and _torch_local.cuda.is_available():
                     _torch_local.cuda.empty_cache()
+
+        logger.info(
+            f"class_separation streaming: n_batches={n_batches}, "
+            f"n_seen={n_seen}, kept={len(X_rows)}, "
+            f"dropped_pad_only={n_dropped_padonly}, "
+            f"dropped_other_label={n_dropped_other}"
+        )
+        logger.info(
+            f"class_separation raw labels seen: "
+            + ", ".join(
+                f"{k!r}={v}" for k, v in sorted(
+                    raw_label_counter.items(),
+                    key=lambda kv: (kv[0] is None, kv[0]),
+                )
+            )
+        )
 
         if X_rows:
             X = np.asarray(X_rows, dtype=float)
