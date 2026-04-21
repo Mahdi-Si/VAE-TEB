@@ -996,6 +996,260 @@ def plot_sample_signals_kld(
     plt.close(fig)
 
 
+def plot_sample_signals_kld_pca(
+    *,
+    fhr: Optional[np.ndarray],
+    up: Optional[np.ndarray],
+    fhr_st: np.ndarray,
+    up_st: Optional[np.ndarray],
+    kld_pcs: np.ndarray,
+    warmup: int,
+    out_path: Path,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
+    explained_variance_ratio: Optional[np.ndarray] = None,
+    guid: Optional[str] = None,
+    epoch: Optional[float] = None,
+    label: Optional[int] = None,
+    fs_raw: float = _DEFAULT_FS_RAW,
+    decim: int = _DEFAULT_DECIM,
+) -> None:
+    """PCA variant of :func:`plot_sample_signals_kld`.
+
+    Identical layout to the per-dim KL diagnostic (raw signals row, FHR
+    feature row, optional UP feature row, per-component KLD traces, and
+    a final mean ± std panel aggregating across the PCA components).
+    The only difference is the middle block: instead of one row per
+    latent dimension (``d_z=24``), this figure draws **one row per
+    retained PCA component** (typically the top 3) projected from the
+    per-time per-dim KL by the PCA fit that ``collect_metrics`` wrote
+    to ``<output>/pca_kld/``.
+
+    Args:
+        fhr: Raw FHR trace ``(R,)`` or ``None``.
+        up: Raw UP trace ``(R,)`` or ``None``.
+        fhr_st: Normalised FHR scattering features ``(T, C_st)``.
+        up_st: Normalised UP scattering features ``(T, C_st)`` or ``None``.
+        kld_pcs: Per-timestep top-k PCA scores, shape ``(T, k)`` where
+            ``k`` is typically 3. Must come from projecting the sample's
+            ``kld_per_dim_t`` through a PCA fitted across the full test
+            set (via :func:`metrics.project_kld_per_dim`).
+        warmup: Number of warmup decimated steps.
+        out_path: Destination PDF / PNG.
+        fhr_ph: Normalised FHR phase-harmonic features ``(T, C_ph)`` or
+            ``None``. Same black-separator convention as
+            :func:`plot_sample_signals_kld`.
+        up_ph: Normalised UP phase-harmonic features ``(T, C_ph)`` or
+            ``None``.
+        explained_variance_ratio: Optional ``(k,)`` array — when
+            supplied, each per-component y-label is annotated with the
+            share of explained variance ("PC1 (54.3%)").
+        guid: Sample GUID for the title bar.
+        epoch: Sample epoch (seconds relative to delivery) for the title.
+        label: Outcome class label for the title.
+        fs_raw: Raw sampling rate in Hz (default 4.0).
+        decim: Decimation factor (default 16).
+    """
+    if fhr_st.ndim != 2:
+        raise ValueError(
+            f"fhr_st must be (T, C_st), got {fhr_st.shape}"
+        )
+    if kld_pcs.ndim != 2:
+        raise ValueError(
+            f"kld_pcs must be (T, k), got {kld_pcs.shape}"
+        )
+
+    T = int(fhr_st.shape[0])
+    n_pcs = int(kld_pcs.shape[1])
+    if kld_pcs.shape[0] != T:
+        raise ValueError(
+            f"kld_pcs time axis ({kld_pcs.shape[0]}) must match "
+            f"fhr_st time axis ({T})"
+        )
+
+    ev = (
+        np.asarray(explained_variance_ratio, dtype=float)
+        if explained_variance_ratio is not None
+        else None
+    )
+
+    sec_per_dec = float(decim) / float(fs_raw)
+    t_max_min = T * sec_per_dec / 60.0
+    time_dec_min = (np.arange(T) + 0.5) * sec_per_dec / 60.0
+    warmup_min = max(0, int(warmup)) * sec_per_dec / 60.0
+
+    R = int(fhr.shape[0]) if (fhr is not None and fhr.ndim == 1) else int(T * decim)
+    time_raw_min = np.arange(R) / float(fs_raw) / 60.0
+
+    use_up_st = up_st is not None and up_st.ndim == 2
+    n_pc_rows = int(n_pcs)
+    n_top_rows = 2 + (1 if use_up_st else 0)
+    n_bot_rows = 1
+    n_total = n_top_rows + n_pc_rows + n_bot_rows
+
+    # Give the PC trace rows noticeably more vertical space than the
+    # per-dim variant — with only 3 rows we can afford taller panels.
+    height_ratios = (
+        [1.4] * n_top_rows
+        + [0.95] * n_pc_rows
+        + [1.25] * n_bot_rows
+    )
+    fig_h = 1.9 * n_top_rows + 1.3 * n_pc_rows + 2.0
+    fig = plt.figure(figsize=(14, fig_h))
+    gs = GridSpec(
+        n_total, 2, figure=fig,
+        hspace=0.7, wspace=0.015,
+        height_ratios=height_ratios,
+        width_ratios=[1.0, 0.018],
+        left=0.07, right=0.96, top=0.965, bottom=0.035,
+    )
+
+    warm_dec = max(0, int(warmup))
+
+    # --- Row 0: Raw signals ---
+    row = 0
+    ax_raw = fig.add_subplot(gs[row, 0])
+    _draw_raw_panel(
+        ax_raw,
+        fhr=fhr, up=up,
+        time_raw_min=time_raw_min,
+        t_max_min=t_max_min,
+        warmup_min=warmup_min,
+        title="Raw FHR / UP",
+    )
+    row += 1
+
+    # --- Row 1: FHR features ---
+    fhr_img, fhr_sep = _combine_st_ph(fhr_st, fhr_ph)
+    fhr_vmax = (
+        float(np.nanmax(np.abs(fhr_img)))
+        if np.isfinite(fhr_img).any() else 1.0
+    )
+    fhr_vmax = fhr_vmax if fhr_vmax > 0 else 1.0
+    ax_fhr = fig.add_subplot(gs[row, 0])
+    cax_fhr = fig.add_subplot(gs[row, 1])
+    fhr_title = (
+        "FHR features (fhr_st │ fhr_ph)" if fhr_ph is not None
+        else "FHR scattering transform"
+    )
+    _draw_heatmap_direct(
+        ax_fhr, fhr_img,
+        t_max_min=t_max_min, cmap="bwr",
+        vmin=-fhr_vmax, vmax=fhr_vmax,
+        ylabel="channel",
+        title=fhr_title,
+        cbar_ax=cax_fhr,
+        separator_row=fhr_sep,
+        invert_y=True,
+    )
+    _mark_warmup_line_min(ax_fhr, warmup_min)
+    row += 1
+
+    # --- Row 2 (optional): UP features ---
+    if use_up_st:
+        up_img, up_sep = _combine_st_ph(up_st, up_ph)
+        up_vmax = (
+            float(np.nanmax(np.abs(up_img)))
+            if np.isfinite(up_img).any() else 1.0
+        )
+        up_vmax = up_vmax if up_vmax > 0 else 1.0
+        ax_up = fig.add_subplot(gs[row, 0])
+        cax_up = fig.add_subplot(gs[row, 1])
+        up_title = (
+            "UP features (up_st │ up_ph)" if up_ph is not None
+            else "UP scattering transform"
+        )
+        _draw_heatmap_direct(
+            ax_up, up_img,
+            t_max_min=t_max_min, cmap="bwr",
+            vmin=-up_vmax, vmax=up_vmax,
+            ylabel="channel",
+            title=up_title,
+            cbar_ax=cax_up,
+            separator_row=up_sep,
+            invert_y=True,
+        )
+        _mark_warmup_line_min(ax_up, warmup_min)
+        row += 1
+
+    # --- Per-PC KLD traces (one row per retained component) ---
+    pc_plot = _mask_warmup_time_axis(kld_pcs, warm_dec, axis=0)
+    pc_grid_start = row
+    for k in range(n_pcs):
+        ax_k = fig.add_subplot(gs[pc_grid_start + k, 0])
+        vals = pc_plot[:, k]
+        finite_vals = vals[np.isfinite(vals)]
+        y_min = float(np.nanmin(finite_vals)) if finite_vals.size else -1.0
+        y_max = float(np.nanmax(finite_vals)) if finite_vals.size else 1.0
+
+        ax_k.plot(
+            time_dec_min, vals,
+            color=COLOR_PURPLE, linewidth=1.0, alpha=0.95,
+        )
+        ax_k.axhline(0.0, color=COLOR_GRAY, linewidth=0.3, linestyle=":")
+        ax_k.set_xlim(0.0, t_max_min)
+        if np.isfinite(y_min) and np.isfinite(y_max) and y_max > y_min:
+            span = max(y_max - y_min, 1e-12)
+            ax_k.set_ylim(y_min - 0.08 * span, y_max + 0.08 * span)
+
+        if ev is not None and k < ev.size and np.isfinite(ev[k]):
+            ylabel = f"PC{k + 1}  ({100.0 * float(ev[k]):.1f}%)"
+        else:
+            ylabel = f"PC{k + 1}"
+        ax_k.set_ylabel(ylabel, fontsize=FONT_LABEL)
+        ax_k.tick_params(axis="both", labelsize=7)
+        ax_k.grid(True, which="major", alpha=0.2, linewidth=0.3)
+        _shade_warmup_min(ax_k, warmup_min)
+        if k != n_pcs - 1:
+            ax_k.tick_params(labelbottom=False)
+    row += n_pc_rows
+
+    # --- Bottom: Mean ± std across retained components ---
+    ax_mean = fig.add_subplot(gs[row, 0])
+    mean_pc = np.nanmean(pc_plot, axis=1)
+    std_pc = np.nanstd(pc_plot, axis=1)
+    ax_mean.fill_between(
+        time_dec_min,
+        mean_pc - std_pc,
+        mean_pc + std_pc,
+        color=COLOR_BLUE,
+        alpha=0.22,
+        label="±1 std",
+    )
+    ax_mean.plot(
+        time_dec_min, mean_pc,
+        color=COLOR_BLUE, linewidth=1.2, label="mean",
+    )
+    ax_mean.axhline(0.0, color=COLOR_GRAY, linewidth=0.4, linestyle=":")
+    ax_mean.set_xlim(0.0, t_max_min)
+    ax_mean.set_xlabel("Time (min)", fontsize=FONT_LABEL)
+    ax_mean.set_ylabel("KLD PCA score", fontsize=FONT_LABEL)
+    pc_list = ", ".join(f"PC{i + 1}" for i in range(n_pcs))
+    ax_mean.set_title(
+        f"Mean ± std KLD across top {n_pcs} PCA components ({pc_list})",
+        fontsize=FONT_LABEL, fontweight="normal",
+    )
+    ax_mean.legend(loc="upper right", fontsize=6, frameon=True)
+    _shade_warmup_min(ax_mean, warmup_min)
+    _style_axes(ax_mean, grid="major", minor_ticks=True)
+
+    # --- Title bar ---
+    title_bits = []
+    if guid is not None:
+        title_bits.append(f"guid={guid}")
+    if epoch is not None:
+        title_bits.append(f"epoch={float(epoch):.0f}s")
+    if label is not None:
+        title_bits.append(f"class={label}")
+    title_bits.append(f"KLD PCA top-{n_pcs}")
+    _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_sample_lag_attention(
     *,
     fhr: Optional[np.ndarray],
