@@ -263,6 +263,28 @@ def run_comparison(
             per_dim = None
 
     # ------------------------------------------------------------------
+    # 4b. PCA vs per-dim surrogate comparison.
+    #
+    # Ranks every model-side TE surrogate present in ``merged_df``
+    # (raw ``kld``, PCA scores ``kld_pc1/2/3``, L2 norm of top-3
+    # components, posterior drift, attention concentration, TE-lag
+    # mass, residual/uplift) by Pearson / Spearman / Kendall / MI
+    # against the empirical ``ite_valid``. Writes
+    # ``pca_vs_dims_summary.csv`` to the output directory.
+    #
+    # Requires the histogram CSV to carry the lag-attn v1 TE-surrogate
+    # columns (written automatically by ``collect_metrics`` in v1).
+    # Skips gracefully if they are absent.
+    # ------------------------------------------------------------------
+    pca_vs_dims_df: Optional["pd.DataFrame"] = None
+    try:
+        pca_vs_dims_df = run_pca_vs_dims_comparison(
+            merged_df, output_dir_path, te_col="ite_valid",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"run_pca_vs_dims_comparison failed: {exc}")
+
+    # ------------------------------------------------------------------
     # 4c. DTW alignment (on full trajectories)
     # ------------------------------------------------------------------
     dtw_result: Optional[Dict[str, Any]] = None
@@ -360,6 +382,104 @@ def run_comparison(
                   dtw_result, output_dir_path)
 
     # ------------------------------------------------------------------
+    # 5b. Extended empirical-vs-model comparisons (v1).
+    #
+    # For each model-side score column present in ``merged_df``
+    # (``kld`` + any PCA / TE-surrogate columns propagated from the
+    # histogram metrics CSV), compute:
+    #   - cross-correlation per GUID (lag tolerance)
+    #   - Bland-Altman agreement (standardised scales)
+    #   - ROC-AUC for "high empirical TE" event detection
+    #   - per-GUID linear regression (slope + R²)
+    #   - conditional KS across ite_valid quartiles
+    #
+    # Each helper writes a CSV; each plotter writes a PDF. Loops
+    # over the candidate score columns so PCA surrogates are
+    # exercised alongside raw ``kld``.
+    # ------------------------------------------------------------------
+    extra_comparisons: Dict[str, Dict[str, Any]] = {}
+    try:
+        extra_score_cols = ["kld"]
+        if {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns):
+            extra_score_cols.append("kld_pca_l2_top3")   # synth by run_pca_vs_dims_comparison
+            extra_score_cols.append("kld_pc1")
+        for opt_col in (
+            "posterior_drift_norm", "attention_concentration_mean",
+            "te_lag_total_mass",
+        ):
+            if opt_col in merged_df.columns:
+                extra_score_cols.append(opt_col)
+
+        # ``kld_pca_l2_top3`` is synthesised by
+        # ``run_pca_vs_dims_comparison`` above; mirror it here so the
+        # extended comparisons can use it too.
+        if (
+            "kld_pca_l2_top3" not in merged_df.columns
+            and {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns)
+        ):
+            from model.vae_teb_prediction.testing.TE_Calculated.te_kld_analysis import (  # noqa: E501
+                pca_trajectory as _pca_traj,
+            )
+            merged_df["kld_pca_l2_top3"] = _pca_traj(merged_df, "l2_top3")
+
+        from model.vae_teb_prediction.testing.TE_Calculated.te_kld_visualizations import (  # noqa: E501
+            plot_bland_altman,
+            plot_conditional_ks_grid,
+            plot_per_guid_slope_hist,
+            plot_roc_curve,
+            plot_xcorr_lag_hist,
+        )
+
+        for score_col in extra_score_cols:
+            if score_col not in merged_df.columns:
+                continue
+            sub_dir = output_dir_path / f"extended_vs_{score_col}"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                xcorr_df = cross_correlation_per_guid(
+                    merged_df, score_col=score_col, te_col="ite_valid",
+                )
+                xcorr_df.to_csv(sub_dir / "xcorr_per_guid.csv", index=False)
+                _try_plot(f"xcorr_{score_col}", plot_xcorr_lag_hist,
+                          xcorr_df, sub_dir / "xcorr_lag_hist.pdf")
+
+                bland = bland_altman(merged_df, score_col, "ite_valid")
+                _try_plot(f"bland_altman_{score_col}", plot_bland_altman,
+                          merged_df, bland, sub_dir / "bland_altman.pdf",
+                          score_col=score_col, te_col="ite_valid")
+
+                roc = roc_auc_high_te(merged_df, score_col, "ite_valid")
+                _try_plot(f"roc_{score_col}", plot_roc_curve,
+                          merged_df, roc, sub_dir / "roc_high_te.pdf",
+                          score_col=score_col, te_col="ite_valid")
+
+                reg = per_guid_regression(merged_df, score_col, "ite_valid")
+                reg.to_csv(sub_dir / "per_guid_regression.csv", index=False)
+                _try_plot(f"slope_{score_col}", plot_per_guid_slope_hist,
+                          reg, sub_dir / "per_guid_slope_hist.pdf")
+
+                ks_df = conditional_ks_by_quartile(
+                    merged_df, score_col, "ite_valid",
+                )
+                ks_df.to_csv(sub_dir / "conditional_ks.csv", index=False)
+                _try_plot(f"ks_{score_col}", plot_conditional_ks_grid,
+                          ks_df, sub_dir / "conditional_ks_grid.pdf",
+                          score_col=score_col, te_col="ite_valid")
+
+                extra_comparisons[score_col] = {
+                    "bland_altman": bland,
+                    "roc_auc_high_te": roc,
+                    "n_guids_xcorr": int(len(xcorr_df)),
+                    "n_guids_regression": int(len(reg)),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"extended comparisons failed for {score_col!r}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"extended comparisons block failed: {exc}")
+
+    # ------------------------------------------------------------------
     # 6. Export
     # ------------------------------------------------------------------
     logger.info("=" * 60)
@@ -421,6 +541,30 @@ def run_comparison(
             f"(p = {dtw_pooled.get('pearson_p', float('nan')):.2e})"
         )
     logger.info(f"  MI (nats): {mi_value:.4f}")
+
+    # PCA-vs-dims surrogate ranking (when available).
+    if pca_vs_dims_df is not None and not pca_vs_dims_df.empty:
+        top = pca_vs_dims_df.iloc[0]
+        logger.info(
+            f"  Top TE surrogate by Spearman ρ: "
+            f"{top['surrogate']!r} (rho={top.get('spearman_rho', float('nan')):.4f}, "
+            f"pearson_r={top.get('pearson_r', float('nan')):.4f}, "
+            f"MI={top.get('mutual_information', float('nan')):.4f})"
+        )
+        if "kld_pc1" in pca_vs_dims_df["surrogate"].values:
+            row = pca_vs_dims_df[pca_vs_dims_df["surrogate"] == "kld_pc1"].iloc[0]
+            logger.info(
+                f"  KLD PC1 alone:       rho={row['spearman_rho']:.4f}, "
+                f"pearson_r={row['pearson_r']:.4f}"
+            )
+        if "kld_pca_l2_top3" in pca_vs_dims_df["surrogate"].values:
+            row = pca_vs_dims_df[
+                pca_vs_dims_df["surrogate"] == "kld_pca_l2_top3"
+            ].iloc[0]
+            logger.info(
+                f"  KLD PCA L2(top-3):   rho={row['spearman_rho']:.4f}, "
+                f"pearson_r={row['pearson_r']:.4f}"
+            )
     logger.info(f"  Results saved to: {output_dir_path}")
 
     return {
@@ -440,6 +584,8 @@ def run_comparison(
         "dtw_pooled_correlation": dtw_pooled,
         "per_dimension": per_dim,
         "correlation_matrices": correlation_matrices,
+        "pca_vs_dims_summary": pca_vs_dims_df,
+        "extended_comparisons": extra_comparisons,
     }
 
 
