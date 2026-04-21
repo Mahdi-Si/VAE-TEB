@@ -238,19 +238,27 @@ def run_full_test_pipeline(
         return int(user_max) if user_max is not None else _FULL_DATASET_CAP
 
     # ------------------------------------------------------------------
-    # STEP 0: definitive dataloader probe.
+    # STEP 0: definitive dataloader probe + one-pass latent capture.
     #
-    # Runs BEFORE any analysis can poison the worker pool. Iterates the
-    # standard test loader once, with NO forward pass, and reports:
-    #   * total samples in dataset (== len(loader.dataset))
-    #   * per-file sample counts (``source_file_basename`` field on every
-    #     batch — added by HDF5Dataset.__getitem__ at hdf5_dataset.py:904)
-    #   * per-class sample counts (via ``_extract_label`` from collectors)
-    #   * raw target first-non-zero histogram (verifies the
-    #     class_id × weight semantics — catches partial-weight truncation)
+    # This step is intentionally FIRST — before any other analysis can
+    # poison the DataLoader worker pool or the HDF5 FIFO cache. We
+    # combine two jobs into one loader iteration:
     #
-    # The probe also records ``(label, source_file)`` per sample so the
-    # class_separation step can reuse this without re-iterating.
+    #   1) Probe: per-file / per-label / per-target counts, so we can
+    #      immediately hard-fail if the dataset layer isn't delivering
+    #      what the config says.
+    #   2) Latent capture: run the model forward on every batch and
+    #      store the per-sample time-averaged latent ``z_mean``
+    #      (24 floats / sample ≈ 96 bytes). This eliminates the second
+    #      loader iteration that class_separation used to need — which
+    #      was the proven source of the "Only 1 class(es) found" bug:
+    #      the loader was silently truncating by the time the 12th
+    #      analysis ran, after 11 prior iterations had populated/
+    #      thrashed the workers' FIFO caches.
+    #
+    # Memory cost: N × 24 float32 ≈ 1 MB per 10 000 samples. Irrelevant.
+    # Time cost: one model forward per sample — which every previous
+    # single-pass analysis did anyway, so no net slowdown.
     # ------------------------------------------------------------------
     import numpy as np
     from collections import defaultdict
@@ -269,56 +277,83 @@ def run_full_test_pipeline(
         "raw_target_first_nonzero_hist": defaultdict(int),
         "sample_index": [],   # List[Tuple[label, source_file_basename, epoch, guid]]
     }
+    probe_z_means: List[np.ndarray] = []   # per-sample (d_z,) float32 arrays
+
     logger.info("=" * 60)
-    logger.info("Step 0: probing test dataloader (no model forward) ...")
+    logger.info("Step 0: probing test dataloader + capturing z_mean ...")
     try:
-        for batch in standard_loader:
-            probe["n_batches"] += 1
-            batch_size = int(batch.fhr_st.size(0)) if hasattr(batch, "fhr_st") else 0
-            for idx in range(batch_size):
-                # source_file_basename is set by HDF5Dataset.__getitem__
-                src = getattr(batch, "source_file_basename", None)
-                if src is not None:
-                    try:
-                        src_val = src[idx] if hasattr(src, "__getitem__") else str(src)
-                    except Exception:
-                        src_val = "?"
-                    if isinstance(src_val, bytes):
-                        src_val = src_val.decode("utf-8", errors="replace")
-                    src_val = str(src_val)
-                else:
-                    src_val = "<no source_file_basename>"
-                probe["per_file_counts"][src_val] += 1
+        with runner.inference_mode():
+            # Use runner.iter_batches so tensors land on the runner's
+            # device without us moving them manually. max_samples=None
+            # iterates the whole loader.
+            for batch in runner.iter_batches(standard_loader, None):
+                probe["n_batches"] += 1
+                batch_size = int(batch.fhr_st.size(0)) if hasattr(batch, "fhr_st") else 0
+                if batch_size == 0:
+                    continue
 
-                lab = _probe_label(batch, idx)
-                key = "None" if lab is None else int(lab)
-                probe["per_label_counts"][key] += 1
+                # Forward pass — capture only z_mean, nothing else.
+                try:
+                    outputs = runner.forward(batch)
+                    z = outputs.get("z")
+                    if z is not None:
+                        # (B, T, d_z) -> (B, d_z) on CPU
+                        z_mean_batch = z.mean(dim=1).detach().cpu().numpy()
+                    else:
+                        z_mean_batch = None
+                    del outputs
+                except Exception as exc:
+                    logger.error(f"probe forward failed on batch {probe['n_batches']}: {exc}")
+                    z_mean_batch = None
 
-                # Raw-target first-non-zero (proves _extract_label semantics).
-                tgt_attr = getattr(batch, "target", None)
-                if tgt_attr is not None:
-                    try:
-                        raw = tgt_attr[idx]
-                        if hasattr(raw, "detach"):
-                            raw = raw.detach().cpu().numpy()
-                        else:
-                            raw = np.asarray(raw)
-                        nz = raw[raw > 0]
-                        first_nz = float(nz[0]) if nz.size else 0.0
-                    except Exception:
-                        first_nz = float("nan")
-                    bucket = round(first_nz, 2)
-                    probe["raw_target_first_nonzero_hist"][bucket] += 1
+                for idx in range(batch_size):
+                    # source_file_basename — set by HDF5Dataset.__getitem__
+                    src = getattr(batch, "source_file_basename", None)
+                    if src is not None:
+                        try:
+                            src_val = src[idx] if hasattr(src, "__getitem__") else str(src)
+                        except Exception:
+                            src_val = "?"
+                        if isinstance(src_val, bytes):
+                            src_val = src_val.decode("utf-8", errors="replace")
+                        src_val = str(src_val)
+                    else:
+                        src_val = "<no source_file_basename>"
+                    probe["per_file_counts"][src_val] += 1
 
-                ep = _probe_epoch(batch, idx)
-                guid = _probe_guid(batch, idx)
-                probe["sample_index"].append((
-                    key,
-                    src_val,
-                    float(ep) if ep is not None else float("nan"),
-                    guid,
-                ))
-                probe["n_samples_seen"] += 1
+                    lab = _probe_label(batch, idx)
+                    key = "None" if lab is None else int(lab)
+                    probe["per_label_counts"][key] += 1
+
+                    # Raw-target first-non-zero (truncation diagnostic).
+                    tgt_attr = getattr(batch, "target", None)
+                    if tgt_attr is not None:
+                        try:
+                            raw = tgt_attr[idx]
+                            if hasattr(raw, "detach"):
+                                raw = raw.detach().cpu().numpy()
+                            else:
+                                raw = np.asarray(raw)
+                            nz = raw[raw > 0]
+                            first_nz = float(nz[0]) if nz.size else 0.0
+                        except Exception:
+                            first_nz = float("nan")
+                        bucket = round(first_nz, 2)
+                        probe["raw_target_first_nonzero_hist"][bucket] += 1
+
+                    ep = _probe_epoch(batch, idx)
+                    guid = _probe_guid(batch, idx)
+                    probe["sample_index"].append((
+                        key,
+                        src_val,
+                        float(ep) if ep is not None else float("nan"),
+                        guid,
+                    ))
+                    if z_mean_batch is not None:
+                        probe_z_means.append(z_mean_batch[idx].astype(np.float32))
+                    else:
+                        probe_z_means.append(np.array([], dtype=np.float32))
+                    probe["n_samples_seen"] += 1
     except Exception as exc:  # noqa: BLE001
         logger.error(f"loader probe failed mid-iteration: {exc}")
 
@@ -518,91 +553,65 @@ def run_full_test_pipeline(
 
     # 12. Class separation (uses time-averaged latent features).
     #
-    # IMPORTANT 1 — sample coverage: the standard test loader uses
-    # ``shuffle=False`` and reads the configured HDF5 files sequentially.
-    # The Step-0 probe already established the authoritative
-    # (label, source_file) for every sample in dataset order. We zip the
-    # probe's index against this pass's forward outputs so:
-    #   - we never re-call ``_extract_label`` (the probe already did it)
-    #   - we track per-file z_mean coverage and can hard-fail if a file
-    #     drops out between Step 0 and now (the worker-poisoning case)
+    # PURE POST-PROCESSOR — does NOT iterate the dataloader.
     #
-    # IMPORTANT 2 — memory: stream a forward pass and keep only the
-    # 24-dim time-averaged latent per sample (~96 bytes) instead of the
-    # ~13 MB ``collect_predictions`` retains.
+    # All per-sample data needed (z_mean + label + source_file + epoch)
+    # was captured in the Step 0 probe pass. By the time we reach here,
+    # 11 other analyses have run, each with its own loader iteration —
+    # which has historically poisoned the dataloader workers and
+    # truncated the iterable to the first file's worth of samples
+    # (~1000 records, all class 3=HIE), producing the
+    # "Only 1 class(es) found" symptom.
+    #
+    # Reading from the probe's in-memory data eliminates that failure
+    # mode entirely: the data is already on the heap, no I/O, no model
+    # forward, no worker process involvement.
     try:
-        import torch as _torch_local
         import pandas as pd
 
         probe_index = probe.get("sample_index", [])
-        if not probe_index:
+        if not probe_index or not probe_z_means:
             raise RuntimeError(
-                "class_separation: loader probe (Step 0) produced no "
-                "sample_index — re-check the probe output"
+                "class_separation: Step 0 probe captured no samples — "
+                "check the probe output for HDF5 / dataset issues"
+            )
+        if len(probe_index) != len(probe_z_means):
+            raise RuntimeError(
+                f"class_separation: probe index ({len(probe_index)}) and "
+                f"z_means ({len(probe_z_means)}) length mismatch"
             )
 
         X_rows: List[np.ndarray] = []
         labels: List[int] = []
         epochs: List[float] = []
         per_file_kept: Dict[str, int] = defaultdict(int)
-        n_batches = 0
-        seen = 0           # absolute sample index across all batches
         dropped_padonly = 0
         dropped_other = 0
-        with runner.inference_mode():
-            for batch in runner.iter_batches(standard_loader, max_samples):
-                outputs = runner.forward(batch)
-                z = outputs.get("z")
-                if z is None:
-                    continue
-                z_mean = z.mean(dim=1).detach().cpu().numpy()  # (B, d_z)
-                batch_size = int(z_mean.shape[0])
-                n_batches += 1
-                for idx in range(batch_size):
-                    if max_samples and seen >= max_samples:
-                        break
-                    if seen >= len(probe_index):
-                        # Loader yielded more than the probe saw — should
-                        # not happen unless the dataset is non-deterministic.
-                        logger.warning(
-                            "class_separation: loader yielded more "
-                            "samples than the Step-0 probe "
-                            f"({seen + 1} > {len(probe_index)}); "
-                            "trusting current label and continuing"
-                        )
-                        lab_key, src, ep, _guid = (
-                            None, "<beyond_probe>", float("nan"), None
-                        )
-                    else:
-                        lab_key, src, ep, _guid = probe_index[seen]
 
-                    seen += 1
-                    if lab_key is None or lab_key == "None":
-                        dropped_padonly += 1
-                        continue
-                    try:
-                        lab_int = int(lab_key)
-                    except (TypeError, ValueError):
-                        dropped_other += 1
-                        continue
-                    if lab_int not in (1, 2, 3):
-                        dropped_other += 1
-                        continue
-                    X_rows.append(z_mean[idx].astype(np.float32))
-                    labels.append(lab_int)
-                    epochs.append(float(ep) if ep == ep else float("nan"))  # NaN-safe
-                    per_file_kept[src] += 1
-                if max_samples and seen >= max_samples:
-                    break
-                del outputs, z, z_mean
-                if hasattr(_torch_local, "cuda") and _torch_local.cuda.is_available():
-                    _torch_local.cuda.empty_cache()
+        for (lab_key, src, ep, _guid), zm in zip(probe_index, probe_z_means):
+            if zm.size == 0:
+                # Forward failed for this batch in Step 0 — skip.
+                dropped_other += 1
+                continue
+            if lab_key is None or lab_key == "None":
+                dropped_padonly += 1
+                continue
+            try:
+                lab_int = int(lab_key)
+            except (TypeError, ValueError):
+                dropped_other += 1
+                continue
+            if lab_int not in (1, 2, 3):
+                dropped_other += 1
+                continue
+            X_rows.append(zm)
+            labels.append(lab_int)
+            epochs.append(float(ep) if ep == ep else float("nan"))  # NaN-safe
+            per_file_kept[src] += 1
 
-        # Cross-check coverage against the Step-0 probe.
         per_file_kept = dict(per_file_kept)
         logger.info(
-            f"class_separation streaming: n_batches={n_batches}, "
-            f"seen={seen}, kept={len(X_rows)}, "
+            f"class_separation (from probe): kept={len(X_rows)}, "
             f"dropped_pad_only={dropped_padonly}, "
             f"dropped_other_label={dropped_other}"
         )
@@ -612,17 +621,6 @@ def run_full_test_pipeline(
                 f"{k}={v}" for k, v in sorted(per_file_kept.items())
             )
         )
-        probe_files = set(probe.get("per_file_counts", {}).keys())
-        kept_files = set(per_file_kept.keys())
-        missing_files = probe_files - kept_files
-        if missing_files:
-            logger.error(
-                "class_separation lost files between Step 0 and this "
-                f"step: {sorted(missing_files)}. Workers were likely "
-                "poisoned by a prior heavy step. Reduce HEAVY_PRED_CAP / "
-                "HEAVY_ATTN_CAP / num_workers, or set "
-                "persistent_workers=False on the loader."
-            )
 
         if X_rows:
             X = np.asarray(X_rows, dtype=float)
