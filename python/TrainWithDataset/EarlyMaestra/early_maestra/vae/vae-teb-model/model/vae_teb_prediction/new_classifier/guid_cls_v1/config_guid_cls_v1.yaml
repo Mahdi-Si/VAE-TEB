@@ -1,0 +1,264 @@
+# =============================================================================
+# GUID-Level Stage-Aware Classifier Configuration
+# =============================================================================
+# Used by:
+#   - precompute_latents.py (fold-specific VAE latent caches)
+#   - kfold_trainer.py (k-fold parallel training)
+#   - evaluate_guid_classifier.py (per-fold evaluation)
+#   - aggregate_results.py (cross-fold aggregation)
+#
+# See PRD.md for the full specification and decision log.
+# =============================================================================
+
+general_config:
+  tag: guid_cls_v1_run_1                     # Experiment identifier
+  cuda_devices: [0, 1, 2, 3, 4]              # GPU ids used by the k-fold orchestrator
+  max_parallel_folds: 5                      # Max folds running concurrently
+  fold_timeout_hours: 6.0                    # Wall-clock timeout per fold
+  epochs: 200                                # Maximum training epochs
+  accumulate_grad_batches: 1                 # Gradient accumulation
+  seed: 42                                   # Base seed (per-fold adds fold_id)
+
+  # Length-bucketed batch sizes (GUIDs per batch, not segments).
+  # Match LengthBucketSampler default bucket_ranges = [[1,5],[6,12],[13,20],[21,40]].
+  batch_size_by_bucket:
+    "1_5": 16
+    "6_12": 12
+    "13_20": 8
+    "21_40": 4
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/seq_vae_teb_results/guid_cls_v1
+
+
+# =============================================================================
+# VAE (pretrained SeqVaeLagAttnV1)
+# =============================================================================
+vae:
+  checkpoint: /abs/path/to/seq_vae_lag_attn_v1-best.ckpt    # MUST be overridden per-run
+  freeze_vae: true                           # true -> precompute mode; false -> live + two-stage
+  vae_chunk_size: 32                         # Live-VAE forward batch size (segments)
+  fit_latent_stats_max_batches: null         # null => full pass
+
+  # SeqVaeLagAttnV1 constructor kwargs. Must match the VAE training config
+  # (`model_config.VAE_model` in the original VAE config). The classifier
+  # cannot infer these from the checkpoint because Lightning's
+  # `save_hyperparameters(ignore=["base_model"])` strips the model kwargs.
+  model_kwargs:
+    sequence_length: 300
+    d_model: 128
+    d_z: 24
+    horizon: 30
+    warmup_period: 30
+    c_y: 87
+    c_u: 101                                 # 101 if use_up_st else 58
+    use_up_st: true
+    max_lag: 90
+    num_heads: 4
+    d_head: 32
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    use_entmax: false
+    attention_grad_checkpoint: false
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
+
+
+# =============================================================================
+# Classifier architecture
+# =============================================================================
+model_config:
+  classifier:
+    # These dimensions are auto-detected from the VAE checkpoint / cache attrs:
+    #   d_model_vae, d_z, L (= max_lag + 1), T, warmup_period
+    d_seg: 192                               # Per-segment core width after pooling over T
+    d_model: 256                             # Transformer width
+    n_layers: 3
+    n_heads: 4
+    d_head: 64                               # n_heads * d_head must equal d_model
+    d_ff: 512
+    dropout: 0.1
+    n_rel_buckets: 32                        # Log-bucketized pairwise Δt
+    rel_bucket_d_max: 40.0                   # Max Δt in 20-min slots (~13h)
+    warmup_left: 30                          # Per-segment mask left trim (steps)
+    warmup_right: 30                         # Per-segment mask right trim (steps)
+    cross_delivery_censoring: true           # Zero per-t mask when sample crosses delivery
+
+    segment_aux_head:
+      enabled: true
+      hidden_dim: 128                        # d_model/2
+    guid_head:
+      global_stats_dim: 6                    # [log(1+N), ψ(c_N), ψ(mean Δt), log(1+max κ), mean w, mean ι_sso]
+    num_classes_multi: 3                     # {0=healthy, 1=acidosis, 2=HIE}
+
+
+# =============================================================================
+# Training protocol
+# =============================================================================
+training:
+  optimizer:
+    classifier:
+      lr: 1.0e-3
+      weight_decay: 1.0e-4
+    vae:                                     # Used only when freeze_vae=false (stage 2)
+      lr: 1.0e-5
+      weight_decay: 0.0
+
+  scheduler:
+    type: multistep
+    milestones: [100]
+    gamma: 0.1
+
+  loss:
+    lambda_3: 1.0                            # 3-class CE at GUID level
+    lambda_2: 0.5                            # Binary BCE at GUID level
+    lambda_aux: 0.2                          # Per-segment 3-class CE (auxiliary)
+    lambda_aux_bin: 0.1                      # Per-segment binary BCE (auxiliary)
+    gamma_vae: 0.1                           # VAE aux loss weight (stage 2 only)
+    lambda_sp: 1.0e-4                        # L2 sparsity to θ^(0) (stage 2 only)
+    class_weight_mode: inverse_frequency      # "inverse_frequency" | "none"
+
+  prefix_training:
+    enabled: true
+    m_min: 3                                 # Minimum prefix length
+    alpha: 1.5                               # p(m) ∝ m^alpha
+
+  segment_dropout:
+    enabled: true
+    p: 0.1                                   # Per non-terminal segment drop prob
+
+  two_stage:
+    enabled: false                           # Auto-enabled when freeze_vae=false
+    stage1_epochs: 100                       # Stage 1 duration (frozen VAE)
+
+  grad_clip_val: 0.5
+  grad_clip_algorithm: norm
+  precision: "32-true"                       # or "16-mixed" / "bf16-mixed"
+  monitor: val/total_loss
+
+  early_stopping:
+    enabled: true
+    patience: 30
+    mode: min
+
+  checkpoint:
+    save_top_k: 3
+    mode: min
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
+dataset_config:
+  kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+  num_folds: 10
+  fold_ids: null                             # null = all; or [1, 3, 5]
+  test_mode: null                            # null = auto-detect, "holdout", "augmented"
+  stats_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/stats.hdf5
+
+  # Filters (see PRD §4.3).
+  trim_minutes: 1.0
+  epoch_min: -23000                          # Seconds before delivery (~6.4h)
+  epoch_max_rule: cross_delivery             # Enforces e + 1260 <= 0
+  min_samples_per_guid: 3                    # Drop GUIDs with fewer valid segments
+  min_valid_weight_fraction: 0.1             # Central-window weight coverage threshold
+
+  # Fields loaded per segment from HDF5.
+  load_fields:
+    - fhr_st
+    - fhr_ph
+    - up_st
+    - up_ph
+    - weight
+    - target
+    - epoch
+    - cs_label
+    - bg_label
+    - guid
+    - time_from_labor_onset
+    - second_stage_onset
+  normalize_fields: [fhr_st, fhr_ph, up_st, up_ph]
+
+
+# =============================================================================
+# Precompute cache
+# =============================================================================
+precompute:
+  enabled: true                              # Auto-run when freeze_vae=true and cache missing
+  out_subdir: precomputed_latents            # Relative to the run output directory
+  compression: gzip
+  compression_level: 4
+  h_y_dtype: float16                         # Store h^y as fp16 (halves storage)
+  mean_alpha_dtype: float16                  # Store attention mean over heads as fp16
+
+
+# =============================================================================
+# DataLoader
+# =============================================================================
+dataloader_config:
+  num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: false
+  mp_context: spawn                          # CUDA-safe
+
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  target_fpr: 0.2
+  decision_time_hours: 1.0
+  exclude_last_minutes: 30
+  max_gap_multiplier: null
+  fallback_tolerance_hours: 0.5
+  threshold_search_max_iters: 25
+  regenerate_predictions: false
+  aggregate_only: false
+  plot_styles:
+    guid_binary_primary: true
+    three_class_ovr: true
+
+
+# =============================================================================
+# Advanced
+# =============================================================================
+advanced_config:
+  trainer:
+    deterministic: false
+    benchmark: true
+    sync_batchnorm: false
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: http://localhost:5000
+      experiment_name: guid-cls-v1
+      run_name: null
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: guid_cls_v1
+        stage: dev
+
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: val/total_loss
+      patience: 30
+      min_delta: 0.0001
+    model_checkpoint:
+      monitor: val/total_loss
+      save_top_k: 3
+      mode: min
+    loss_plotting:
+      max_history_size: 1000
