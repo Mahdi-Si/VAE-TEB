@@ -11,6 +11,7 @@ Usage:
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -18,6 +19,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import lightning as pl
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -119,6 +121,13 @@ class SeqVaeLagAttnPl(LightningModelBase):
         self._wrapper_name = module_name or self.__class__.__name__
         self.model = base_model  # Eager mode — no torch.compile
 
+        # Loss-spike circuit breaker state. Populated lazily from ``self.hparams``
+        # on the first training step because ``apply_config_hyperparameters``
+        # runs AFTER ``__init__``. See ``_spike_cfg`` / ``_maybe_skip_step``.
+        self._spike_ema_loss: Optional[float] = None
+        self._spike_batches_seen: int = 0
+        self._spike_skips_total: int = 0
+
     def _build_source_stream(self, batch: Any) -> torch.Tensor:
         """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttnV1.forward``.
 
@@ -147,6 +156,144 @@ class SeqVaeLagAttnPl(LightningModelBase):
                 "set use_up_st=False (and c_u=58) on the model."
             )
         return torch.cat([up_st, up_ph], dim=-1)
+
+    # ------------------------------------------------------------------
+    # Loss-spike circuit breaker (new_architecture.md §8 stability notes)
+    # ------------------------------------------------------------------
+
+    _SPIKE_DEFAULTS: Dict[str, Any] = {
+        # Skip optimizer step when ``total_loss > multiplier * EMA``. 5× is
+        # conservative enough to ignore normal variance while catching the
+        # order-of-magnitude jumps that corrupt Adam's second moment.
+        "enabled": True,
+        "multiplier": 5.0,
+        # EMA smoothing: ``ema ← m * loss + (1 - m) * ema``. Smaller = longer
+        # memory of the healthy regime, harder for a slow drift to raise the
+        # threshold into the spike zone.
+        "ema_momentum": 0.02,
+        # Number of priming batches: during this window spikes are never
+        # flagged and the EMA is updated unconditionally so the running
+        # average reaches a realistic scale before gating kicks in.
+        "warmup_batches": 100,
+        # Write a warning to loguru each time a batch is skipped.
+        "warn_on_skip": True,
+    }
+
+    @property
+    def _spike_cfg(self) -> Dict[str, Any]:
+        """Resolve spike-skip config from ``self.hparams`` with defaults.
+
+        Lives here (not in ``__init__``) because ``apply_config_hyperparameters``
+        runs after construction, so the hparams namespace is not populated until
+        training actually starts.
+        """
+        cfg = dict(self._SPIKE_DEFAULTS)
+        override = self.hparams.get("loss_spike_skip")
+        if isinstance(override, dict):
+            for key in cfg:
+                if key in override and override[key] is not None:
+                    cfg[key] = override[key]
+        return cfg
+
+    def _sync_skip_decision_across_ranks(
+        self, is_spike: bool, device: torch.device
+    ) -> bool:
+        """Under DDP, broadcast the skip flag so all ranks agree.
+
+        If one rank returns ``None`` from ``training_step`` while others return
+        a loss, the DDP all-reduce in ``backward`` deadlocks. MAX-reducing the
+        bool tensor ensures that if *any* rank sees a spike, *all* ranks skip.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return is_spike
+        flag = torch.tensor([1.0 if is_spike else 0.0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item() > 0.0)
+
+    def training_step(self, batch: Any, batch_idx: int):  # type: ignore[override]
+        """Run the forward + loss, then gate the optimizer step on a spike check.
+
+        Returns ``None`` when the current total loss is either non-finite or
+        exceeds ``multiplier × EMA``; Lightning interprets a ``None`` return as
+        "skip backward and optimizer.step() for this batch", which is exactly
+        the semantics we want — the spike gradient never touches Adam's moment
+        estimates and weights are unchanged. On accepted batches the behaviour
+        is identical to the base class.
+        """
+        loss, metrics = self.compute_loss_and_metrics(batch, batch_idx, stage="train")
+
+        cfg = self._spike_cfg
+        loss_value = float(loss.detach().item())
+        is_nonfinite = not math.isfinite(loss_value)
+
+        ema_before = self._spike_ema_loss
+        seen_before = self._spike_batches_seen
+        self._spike_batches_seen += 1
+
+        is_spike = False
+        if cfg["enabled"]:
+            if is_nonfinite:
+                is_spike = True
+            elif seen_before < int(cfg["warmup_batches"]):
+                # Still priming the EMA — never flag a spike.
+                pass
+            elif ema_before is not None and ema_before > 0.0:
+                threshold = float(cfg["multiplier"]) * ema_before
+                if loss_value > threshold:
+                    is_spike = True
+
+        # Ensure all DDP ranks take the same branch (or backward deadlocks).
+        is_spike = self._sync_skip_decision_across_ranks(is_spike, device=loss.device)
+
+        # Update the EMA only on accepted batches so a spike cannot raise the
+        # bar for the next one. During warmup we always update (priming).
+        if not is_spike:
+            m = float(cfg["ema_momentum"])
+            if ema_before is None:
+                self._spike_ema_loss = loss_value
+            else:
+                self._spike_ema_loss = m * loss_value + (1.0 - m) * ema_before
+
+        if is_spike:
+            self._spike_skips_total += 1
+
+        # Surface the circuit-breaker state to the unified metrics logger.
+        ema_for_log = (
+            self._spike_ema_loss if self._spike_ema_loss is not None else loss_value
+        )
+        metrics["spike_ema_loss"] = torch.tensor(ema_for_log, device=loss.device)
+        metrics["spike_skipped"] = torch.tensor(
+            1.0 if is_spike else 0.0, device=loss.device
+        )
+        metrics["spike_skips_total"] = torch.tensor(
+            float(self._spike_skips_total), device=loss.device
+        )
+        self._log_metrics(metrics, stage="train", on_step=True)
+
+        if is_spike:
+            if cfg["warn_on_skip"]:
+                ema_str = "n/a" if ema_before is None else f"{ema_before:.4e}"
+                threshold_str = (
+                    "n/a"
+                    if ema_before is None or ema_before <= 0.0
+                    else f"{float(cfg['multiplier']) * ema_before:.4e}"
+                )
+                logger.warning(
+                    "[spike-skip] batch_idx={} loss={:.4e} ema={} "
+                    "threshold={} nonfinite={} total_skips={}",
+                    batch_idx,
+                    loss_value,
+                    ema_str,
+                    threshold_str,
+                    is_nonfinite,
+                    self._spike_skips_total,
+                )
+            # Returning None tells Lightning to skip backward + optimizer.step()
+            # for this batch. Weights, Adam moments, and LR scheduler are all
+            # left untouched. This is the circuit-breaker behaviour.
+            return None
+
+        return loss
 
     def compute_loss_and_metrics(
         self, batch: Any, batch_idx: int, stage: str
@@ -272,6 +419,9 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "kld_beta": vae_cfg.get("kld_beta", 0.01),
             "lambda_full": vae_cfg.get("lambda_full", 1.0),
             "lambda_base": vae_cfg.get("lambda_base", 0.5),
+            # Loss-spike circuit breaker. Consumed in SeqVaeLagAttnPl._spike_cfg.
+            # Missing keys fall back to the class-level ``_SPIKE_DEFAULTS``.
+            "loss_spike_skip": vae_cfg.get("loss_spike_skip", {}) or {},
         }
         self.pl_model = SeqVaeLagAttnPl(
             self.pytorch_model,
