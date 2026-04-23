@@ -91,6 +91,22 @@ model_config:
     use_entmax: false      # fall back to softmax; entmax is optional
     attention_grad_checkpoint: true  # start on; ~900 MB memory bank at B=64
 
+    # Loss-spike circuit breaker. Guards against the "KL / base loss
+    # explodes then decays" pattern observed during early training by
+    # skipping any batch whose ``total_loss`` exceeds ``multiplier × EMA``.
+    # On a skip, Lightning receives ``None`` from ``training_step``, so
+    # backward() and optimizer.step() are both bypassed — Adam's moment
+    # estimates never absorb the outlier gradient. The EMA is primed during
+    # the first ``warmup_batches`` (never gated) and updated ONLY on
+    # accepted batches thereafter, so a spike cannot raise the threshold.
+    # See ``SeqVaeLagAttnPl.training_step`` in trainer_lag_attn_v1.py.
+    loss_spike_skip:
+      enabled: true
+      multiplier: 5.0        # trip when loss > 5× running EMA
+      ema_momentum: 0.02     # EMA smoothing (smaller = longer memory)
+      warmup_batches: 100    # priming window before gating activates
+      warn_on_skip: true     # emit a loguru warning on every skip
+
   core_model_checkpoint: null
 
   classifier:
