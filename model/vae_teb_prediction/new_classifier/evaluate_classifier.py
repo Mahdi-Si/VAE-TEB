@@ -189,7 +189,12 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
     # TLO embedding config
     tlo_embed_dim = classifier_config.get('tlo_embed_dim', 0)
     tlo_dropout = classifier_config.get('tlo_dropout', 0.1)
-    classifier_input_dim = latent_dim + tlo_embed_dim
+
+    # SSO embedding config
+    sso_embed_dim = classifier_config.get('sso_embed_dim', 0)
+    sso_dropout = classifier_config.get('sso_dropout', 0.1)
+
+    classifier_input_dim = latent_dim + tlo_embed_dim + sso_embed_dim
 
     if classifier_type == 'lstm':
         classifier = LSTMClassifier(
@@ -291,6 +296,8 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
         class_weights=classifier_config.get('class_weights'),
         tlo_embed_dim=tlo_embed_dim,
         tlo_dropout=tlo_dropout,
+        sso_embed_dim=sso_embed_dim,
+        sso_dropout=sso_dropout,
     )
 
     return model
@@ -331,15 +338,16 @@ def run_inference(
             cs_label = batch.cs_label if hasattr(batch, 'cs_label') else None
             bg_label = batch.bg_label if hasattr(batch, 'bg_label') else None
 
-            # Extract TLO if available
+            # Extract TLO and SSO if available
             tlo = batch.time_from_labor_onset.to(device) if hasattr(batch, 'time_from_labor_onset') else None
+            sso = batch.second_stage_onset.to(device) if hasattr(batch, 'second_stage_onset') else None
 
             # Aggregate target to single label per sample
             target_labels = target_seq.max(dim=1)[0]  # (B,) - values 1, 2, or 3
             binary_labels = (target_labels > 1).long()  # (B,) - class 0 or 1
 
             # Get predictions
-            outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo)
+            outputs = model(y_st=y_st, y_ph=y_ph, x_ph=x_ph, tlo=tlo, sso=sso)
             probs = outputs["probs"]  # (B, 2)
             preds = outputs["preds"]  # (B,)
 
@@ -349,8 +357,9 @@ def run_inference(
             preds = preds.cpu().numpy()
             probs = probs.cpu().numpy()
 
-            # Compute TLO hours for output
+            # Compute TLO and SSO hours for output
             tlo_hours_np = (tlo.cpu().numpy() / 3600.0) if tlo is not None else None
+            sso_hours_np = (sso.cpu().numpy() / 3600.0) if sso is not None else None
 
             # Store predictions
             batch_size = y_st.size(0)
@@ -366,6 +375,7 @@ def run_inference(
                     'prob_class_0': float(probs[i, 0]),
                     'prob_class_1': float(probs[i, 1]),
                     'tlo_hours': float(tlo_hours_np[i]) if tlo_hours_np is not None else None,
+                    'sso_hours': float(sso_hours_np[i]) if sso_hours_np is not None else None,
                 }
                 predictions.append(pred_dict)
 

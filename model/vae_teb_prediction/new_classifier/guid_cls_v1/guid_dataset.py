@@ -7,7 +7,7 @@ returns one **whole GUID** per ``__getitem__``. Each GUID sample carries:
   ``kld_per_t``, ``mean_alpha``, ``weight``, ``target``);
 * per-segment scalar metadata (``epoch``, ``time_from_labor_onset``,
   ``second_stage_onset``, ``cs_label``, ``bg_label``);
-* per-segment causal metadata vector ``c_meta`` (10-d, computed in this
+* per-segment causal metadata vector ``c_meta`` (5-d, computed in this
   dataset — never inside the model);
 * GUID-level labels (3-class and binary).
 
@@ -318,18 +318,27 @@ class GuidSequenceDataset(Dataset):
             )
             hat_w = hat_w * (per_t_sec <= 0.0).astype(np.float32)
 
-        # Per-segment central window quality (used by the model's g_glob).
-        bar_w_seg = hat_w.mean(axis=1)
-        f_valid_seg = (hat_w > 0.5).mean(axis=1)
-
-        # Causally-available metadata vector c_meta (10-d) per PRD §4.4 / §6.7.
+        # Causally-available metadata vector c_meta (5-d) per PRD §4.4 / §6.7.
         # Built from epochs via the chronological order baked into ``segs``.
+        # NOTE: per-segment signal-quality summaries (mean of ``hat_w`` and
+        # valid-step fraction) are deliberately NOT part of c_meta or g_glob
+        # — they describe sensor validity, not physiology, so they would
+        # leak monitoring-quality artefacts into the classifier. ``hat_w``
+        # itself is still consumed inside the segment tokenizer purely as a
+        # masking signal.
+        # Cumulative monitoring time, per-segment Δt, and the gap ratio are
+        # likewise excluded from c_meta because they all derive from the
+        # *spans* of observed segments, which are biased by the dataset's
+        # quality filter (a noisier patient has more early segments rejected,
+        # so their first surviving ``epoch[0]`` is later, which shrinks every
+        # downstream cumulative/span statistic). They are still returned by
+        # this method because the temporal transformer's relative-time
+        # attention bias derives ``rel_bucket_idx`` from ``cum_h`` — that is
+        # a structural pairwise distance, not a per-segment feature.
         c_meta, cum_h, gap_ratio_h, dt_h = self._build_c_meta(
             epoch=epoch,
             tlo=tlo,
             sso=sso,
-            bar_w_seg=bar_w_seg.astype(np.float32),
-            f_valid_seg=f_valid_seg.astype(np.float32),
         )
 
         sample: Dict[str, Any] = {
@@ -351,8 +360,6 @@ class GuidSequenceDataset(Dataset):
             "cum_monitor_hours": torch.from_numpy(cum_h.astype(np.float32)),
             "gap_ratio": torch.from_numpy(gap_ratio_h.astype(np.float32)),
             "delta_t_hours": torch.from_numpy(dt_h.astype(np.float32)),
-            "bar_w_segment": torch.from_numpy(bar_w_seg.astype(np.float32)),
-            "f_valid_segment": torch.from_numpy(f_valid_seg.astype(np.float32)),
             "label_3": int(self._guid_labels_3[idx]),
             "label_bin": int(self._guid_labels_bin[idx]),
             "num_segments": S,
@@ -365,24 +372,31 @@ class GuidSequenceDataset(Dataset):
         epoch: np.ndarray,
         tlo: np.ndarray,
         sso: np.ndarray,
-        bar_w_seg: np.ndarray,
-        f_valid_seg: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Assemble the 10-d causal metadata vector per segment.
+        """Assemble the 5-d causal metadata vector per segment.
+
+        Layout (per segment):
+            ``c_meta = [ψ(τ_lab), m_lab, ψ(τ_sso), m_sso, ι_sso]``
+
+        where ``τ_lab``/``τ_sso`` are TLO/SSO in hours, ``m_*`` is the
+        NaN-mask flag, and ``ι_sso`` is 1 once second-stage has begun.
 
         Args:
             epoch: Per-segment epoch in seconds (sorted ascending = far →
-                near delivery).
+                near delivery). Used only to compute ``cum_h`` / ``dt_h``
+                for the *transformer's* relative-time bias — these spans
+                are NOT stacked into ``c_meta``.
             tlo: Time from labour onset in seconds (NaN allowed).
             sso: Time from second-stage onset in seconds (NaN allowed).
-            bar_w_seg: Per-segment central-window mean weight.
-            f_valid_seg: Per-segment central-window valid-step fraction.
 
         Returns:
-            ``(c_meta (S, 10), cum_h (S,), gap_ratio_h (S,), dt_h (S,))``.
-            ``cum_h`` and ``gap_ratio_h`` are also returned because the model
-            consumes them (cum_h drives the relative-time bucket index;
-            gap_ratio is logged as a diagnostic).
+            ``(c_meta (S, 5), cum_h (S,), gap_ratio_h (S,), dt_h (S,))``.
+            ``cum_h``, ``gap_ratio_h`` and ``dt_h`` are returned alongside
+            ``c_meta`` because the temporal transformer derives its
+            relative-time bucket index from ``cum_h`` and ``gap_ratio`` is
+            logged as a diagnostic — but none of these spans are exposed
+            to the head as features (they are biased by the quality
+            filter on ``epoch[0]``).
         """
         S = len(epoch)
         # Δt in hours from the previous observed segment.
@@ -397,7 +411,6 @@ class GuidSequenceDataset(Dataset):
         rho[1:] = np.maximum(0.0, dt_sec[1:] / SEGMENT_DURATION_SEC - 1.0).astype(
             np.float32
         )
-        log_kappa = np.log1p(rho)
 
         # TLO and SSO in hours, NaN handling.
         tlo_h = tlo / SECONDS_PER_HOUR
@@ -411,16 +424,11 @@ class GuidSequenceDataset(Dataset):
 
         c_meta = np.stack(
             [
-                _psi(cum_h.astype(np.float64)).astype(np.float32),
-                _psi(dt_h.astype(np.float64)).astype(np.float32),
-                log_kappa,
                 _psi(tlo_h_clean.astype(np.float64)).astype(np.float32),
                 m_tlo,
                 _psi(sso_h_clean.astype(np.float64)).astype(np.float32),
                 m_sso,
                 iota_sso,
-                bar_w_seg.astype(np.float32),
-                f_valid_seg.astype(np.float32),
             ],
             axis=1,
         )
