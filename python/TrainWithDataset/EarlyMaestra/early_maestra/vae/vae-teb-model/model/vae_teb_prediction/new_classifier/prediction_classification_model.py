@@ -1107,6 +1107,58 @@ class TLOEmbedding(nn.Module):
         return tlo_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, embed_dim)
 
 
+class SSOEmbedding(nn.Module):
+    """Embeds scalar Second Stage Onset time into a learned vector.
+
+    Mirrors :class:`TLOEmbedding` exactly — same MLP shape, same NaN
+    firewall via a learned ``missing_embedding`` parameter, same
+    seconds → hours conversion. Kept as a separate class so the two
+    embeddings have independent parameters and can be enabled or
+    disabled independently from config.
+
+    Args:
+        embed_dim: Dimensionality of the output embedding.
+        dropout: Dropout probability inside the MLP.
+    """
+
+    def __init__(self, embed_dim: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.missing_embedding = nn.Parameter(torch.zeros(embed_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(1, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, sso_seconds: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            sso_seconds: Scalar SSO per sample ``(B,)`` in seconds.
+                May contain ``NaN`` when SSO is unavailable.
+            seq_len: Temporal dimension *T* to broadcast to (e.g. 300).
+
+        Returns:
+            Embedding tensor of shape ``(B, seq_len, embed_dim)``.
+        """
+        is_valid = ~torch.isnan(sso_seconds)
+        sso_hours = sso_seconds / 3600.0
+        sso_hours = torch.where(is_valid, sso_hours, torch.zeros_like(sso_hours))
+
+        sso_embed = self.mlp(sso_hours.unsqueeze(-1))  # (B, embed_dim)
+
+        missing_mask = (~is_valid).unsqueeze(-1)  # (B, 1)
+        sso_embed = torch.where(
+            missing_mask,
+            self.missing_embedding.unsqueeze(0).expand_as(sso_embed),
+            sso_embed,
+        )
+
+        return sso_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, embed_dim)
+
+
 class VaeTebTimeSeriesClassifier(nn.Module):
     """Combined VAE + Classifier model for time series classification.
 
@@ -1118,7 +1170,8 @@ class VaeTebTimeSeriesClassifier(nn.Module):
 
         VAE Encoder -> z (B, T, latent_dim)
         [TLO scalar -> TLOEmbedding -> (B, T, tlo_embed_dim)]  # optional
-        concat -> (B, T, latent_dim + tlo_embed_dim)
+        [SSO scalar -> SSOEmbedding -> (B, T, sso_embed_dim)]  # optional
+        concat -> (B, T, latent_dim + tlo_embed_dim + sso_embed_dim)
         Classifier -> logits (B, num_classes)
 
     Args:
@@ -1130,6 +1183,9 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         class_weights: Optional per-class weights for cross-entropy loss.
         tlo_embed_dim: TLO embedding dimension.  ``0`` disables TLO.
         tlo_dropout: Dropout inside TLO embedding MLP.
+        sso_embed_dim: SSO (Second Stage Onset) embedding dimension.
+            ``0`` disables SSO.
+        sso_dropout: Dropout inside SSO embedding MLP.
     """
 
     def __init__(
@@ -1142,6 +1198,8 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         class_weights: Optional[Sequence[float]] = None,
         tlo_embed_dim: int = 0,
         tlo_dropout: float = 0.1,
+        sso_embed_dim: int = 0,
+        sso_dropout: float = 0.1,
     ):
         super().__init__()
         self.vae_model = vae_model
@@ -1161,6 +1219,12 @@ class VaeTebTimeSeriesClassifier(nn.Module):
             self.tlo_embedding = TLOEmbedding(embed_dim=tlo_embed_dim, dropout=tlo_dropout)
         else:
             self.tlo_embedding = None
+
+        # SSO embedding (disabled when sso_embed_dim == 0)
+        if sso_embed_dim > 0:
+            self.sso_embedding = SSOEmbedding(embed_dim=sso_embed_dim, dropout=sso_dropout)
+        else:
+            self.sso_embedding = None
 
         if self.freeze_vae:
             for param in self.vae_model.parameters():
@@ -1217,8 +1281,9 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         y_ph: torch.Tensor,
         x_ph: torch.Tensor,
         tlo: Optional[torch.Tensor] = None,
+        sso: Optional[torch.Tensor] = None,
     ) -> dict:
-        """Forward pass through VAE encoder + optional TLO embedding + classifier.
+        """Forward pass through VAE encoder + optional TLO/SSO embeddings + classifier.
 
         Args:
             y_st: Target scattering features ``(B, T, 43)``.
@@ -1226,6 +1291,8 @@ class VaeTebTimeSeriesClassifier(nn.Module):
             x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
             tlo: Optional scalar TLO per sample ``(B,)`` in seconds (may
                 contain ``NaN``).  Ignored when ``tlo_embedding`` is ``None``.
+            sso: Optional scalar SSO per sample ``(B,)`` in seconds (may
+                contain ``NaN``).  Ignored when ``sso_embedding`` is ``None``.
 
         Returns:
             Dictionary with ``logits``, ``probs``, ``preds``,
@@ -1239,7 +1306,15 @@ class VaeTebTimeSeriesClassifier(nn.Module):
                 # Old HDF5 without time_from_labor_onset: treat all as missing
                 tlo = torch.full((z.shape[0],), float('nan'), device=z.device)
             tlo_embed = self.tlo_embedding(tlo, seq_len=z.shape[1])  # (B, T, embed_dim)
-            z = torch.cat([z, tlo_embed], dim=-1)  # (B, T, D + embed_dim)
+            z = torch.cat([z, tlo_embed], dim=-1)  # (B, T, D + tlo_embed_dim)
+
+        # Concatenate SSO embedding if enabled
+        if self.sso_embedding is not None:
+            if sso is None:
+                # Old HDF5 without second_stage_onset: treat all as missing
+                sso = torch.full((z.shape[0],), float('nan'), device=z.device)
+            sso_embed = self.sso_embedding(sso, seq_len=z.shape[1])  # (B, T, sso_embed_dim)
+            z = torch.cat([z, sso_embed], dim=-1)  # (B, T, D + tlo_embed_dim + sso_embed_dim)
 
         classifier_outputs = self.classifier(z)
 
@@ -1254,6 +1329,7 @@ class VaeTebTimeSeriesClassifier(nn.Module):
         x_ph: torch.Tensor,
         labels: torch.Tensor,
         tlo: Optional[torch.Tensor] = None,
+        sso: Optional[torch.Tensor] = None,
     ) -> dict:
         """Compute classification loss.
 
@@ -1263,12 +1339,13 @@ class VaeTebTimeSeriesClassifier(nn.Module):
             x_ph: Source cross-phase + UP self-phase features ``(B, T, 137)``.
             labels: Ground truth class labels ``(B,)``.
             tlo: Optional scalar TLO per sample ``(B,)`` in seconds.
+            sso: Optional scalar SSO per sample ``(B,)`` in seconds.
 
         Returns:
             Dictionary with ``loss``, ``accuracy``, ``logits``, ``probs``,
             ``preds``.
         """
-        outputs = self.forward(y_st, y_ph, x_ph, tlo=tlo)
+        outputs = self.forward(y_st, y_ph, x_ph, tlo=tlo, sso=sso)
         logits = outputs["logits"]
 
         # Compute cross-entropy loss

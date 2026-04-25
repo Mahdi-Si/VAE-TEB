@@ -324,6 +324,31 @@ class SeqVaeLagAttnPl(LightningModelBase):
             lambda_base=lambda_base,
         )
         total_loss = loss_dict["total_loss"]
+
+        # --- Residual-branch diagnostics ------------------------------------
+        # These three metrics answer the question "is the residual decoder
+        # doing anything useful, and in which direction?". All are masked to
+        # match the anchor / future windows used by feat_loss and kld_loss
+        # so magnitudes are directly comparable across the loss plot.
+        #
+        # * ``delta_mu_rms``          — how much the residual moves the
+        #   forecast at each valid anchor. ``→ 0`` means "UP contributes
+        #   nothing" (healthy if KL is also ≈ 0); growing over epochs while
+        #   ``pred_gap < 0`` is the signature of double-counting.
+        # * ``mu_post_prior_gap_rms`` — Euclidean distance between posterior
+        #   and prior means in latent space, one of the two terms inside
+        #   ``KL(q‖p)``. Complements ``kld_loss`` by isolating the mean
+        #   component from the variance component.
+        # * ``pred_gap``              — prediction-space TE surrogate
+        #   ``base_loss − feat_loss``. Positive means the residual helps;
+        #   negative means it hurts. Compare against ``kld_loss`` — they
+        #   should track each other up to a Jensen gap in a healthy run.
+        diag = self._compute_residual_diagnostics(
+            forward_outputs=forward_outputs,
+            weight=weight,
+        )
+        pred_gap = loss_dict["base_loss"] - loss_dict["feat_loss"]
+
         metrics = {
             "total_loss": total_loss,
             "feat_loss": loss_dict["feat_loss"],
@@ -338,8 +363,93 @@ class SeqVaeLagAttnPl(LightningModelBase):
             # or delta_mu_scale in config_lag_attn_v1.yaml.
             "mu_prior_sat_frac": forward_outputs["mu_prior_sat_frac"],
             "delta_mu_sat_frac": forward_outputs["delta_mu_sat_frac"],
+            # Residual-branch magnitudes + prediction-space TE surrogate.
+            "delta_mu_rms": diag["delta_mu_rms"],
+            "mu_post_prior_gap_rms": diag["mu_post_prior_gap_rms"],
+            "pred_gap": pred_gap,
         }
         return total_loss, metrics
+
+    def _compute_residual_diagnostics(
+        self,
+        *,
+        forward_outputs: Dict[str, torch.Tensor],
+        weight: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Return masked RMS of ``delta_mu_src`` and the latent mean gap.
+
+        Both are computed under the same masking rules used by the loss so
+        the numbers are directly comparable to ``feat_loss`` / ``kld_loss``
+        on a run-to-run basis:
+
+        * ``delta_mu_rms`` uses the full (warmup × anchor_weight × future_weight)
+          mask that ``L_feat`` uses.
+        * ``mu_post_prior_gap_rms`` uses the (warmup × anchor_weight) mask
+          that ``L_KL`` uses.
+        """
+        warmup = int(self.orig_model._warmup_steps(
+            forward_outputs["mu_full"].size(1)
+        ))
+
+        delta_mu = forward_outputs["delta_mu_src"]          # (B, T, Hd, C)
+        B, T, Hd, _ = delta_mu.shape
+        T_valid = T - Hd
+        device = delta_mu.device
+        dtype = delta_mu.dtype
+
+        # --- Feature-window mask (same as feat_loss) -----------------------
+        warmup_t = torch.zeros(T_valid, dtype=dtype, device=device)
+        if warmup < T_valid:
+            warmup_t[warmup:] = 1.0                          # (T_valid,)
+
+        if weight is not None:
+            w = weight.to(device=device, dtype=dtype)        # (B, T)
+            anchor_w = w[:, :T_valid]                        # (B, T_valid)
+            target_w = w[:, 1:].unfold(
+                dimension=1, size=Hd, step=1
+            )                                                # (B, T_valid, Hd)
+            feat_mask = (
+                warmup_t[None, :, None]
+                * anchor_w[:, :, None]
+                * target_w
+            )                                                # (B, T_valid, Hd)
+        else:
+            feat_mask = warmup_t[None, :, None].expand(
+                B, T_valid, Hd
+            )
+
+        delta_valid = delta_mu[:, :T_valid, :, :]            # (B, T_valid, Hd, C)
+        # Per-(b, t, tau) squared norm summed over channels, then masked.
+        delta_sq = (delta_valid ** 2).sum(dim=-1)            # (B, T_valid, Hd)
+        denom = feat_mask.sum().clamp_min(1.0)
+        delta_mu_rms = torch.sqrt(
+            (delta_sq * feat_mask).sum() / denom
+        )
+
+        # --- Latent-window mask (same as kld_loss) -------------------------
+        mu_prior = forward_outputs["mu_prior"]               # (B, T, d_z)
+        mu_post = forward_outputs["mu_post"]                 # (B, T, d_z)
+        T_full = mu_prior.size(1)
+        time_mask = torch.ones(T_full, dtype=dtype, device=device)
+        warm_full = int(self.orig_model._warmup_steps(T_full))
+        if warm_full > 0:
+            time_mask[:warm_full] = 0.0
+        lat_mask = time_mask.unsqueeze(0).expand(B, T_full)   # (B, T_full)
+        if weight is not None:
+            lat_mask = lat_mask * weight.to(
+                device=device, dtype=dtype
+            )
+
+        gap_sq = ((mu_post - mu_prior) ** 2).sum(dim=-1)     # (B, T_full)
+        lat_denom = lat_mask.sum().clamp_min(1.0)
+        mu_post_prior_gap_rms = torch.sqrt(
+            (gap_sq * lat_mask).sum() / lat_denom
+        )
+
+        return {
+            "delta_mu_rms": delta_mu_rms,
+            "mu_post_prior_gap_rms": mu_post_prior_gap_rms,
+        }
 
 
 # =============================================================================

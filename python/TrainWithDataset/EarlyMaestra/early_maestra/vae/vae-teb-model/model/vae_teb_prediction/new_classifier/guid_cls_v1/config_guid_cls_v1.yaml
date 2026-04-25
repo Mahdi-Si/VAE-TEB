@@ -91,7 +91,16 @@ model_config:
       enabled: true
       hidden_dim: 128                        # d_model/2
     guid_head:
-      global_stats_dim: 6                    # [log(1+N), ψ(c_N), ψ(mean Δt), log(1+max κ), mean w, mean ι_sso]
+      global_stats_dim: 2                    # [log(1+N), mean ι_sso]
+                                              # NOTE: signal-quality dims (mean hat_w, fraction of valid steps) are
+                                              # excluded by design — they reflect sensor validity, not physiology.
+                                              # Cumulative monitoring time (ψ(c_N)), mean Δt (ψ(mean Δt)) and
+                                              # max gap (log(1+max κ)) are also excluded: they all derive from the
+                                              # spans of observed segments, which are biased by the dataset's
+                                              # quality filter on epoch[0] (a noisier patient loses early segments
+                                              # to weight/flat-region filters, shrinking every downstream span).
+                                              # Pairwise Δt is still consumed by the transformer's relative-time
+                                              # bias — that is structural distance, not a feature.
     num_classes_multi: 3                     # {0=healthy, 1=acidosis, 2=HIE}
 
 

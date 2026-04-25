@@ -74,53 +74,50 @@ def _gather_last_valid(h: torch.Tensor, segment_mask: torch.Tensor) -> torch.Ten
 def build_guid_global_stats(
     *,
     num_segments: torch.Tensor,
-    cum_monitor_hours: torch.Tensor,
-    delta_t_hours: torch.Tensor,
-    gap_ratio: torch.Tensor,
-    bar_w_segment: torch.Tensor,
     iota_sso: torch.Tensor,
     segment_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Build the 6-d ``g_glob`` vector per GUID (PRD §7.3 / desc §8.5).
+    """Build the 2-d ``g_glob`` vector per GUID (PRD §7.3 / desc §8.5).
 
     Components (per row):
-        ``[log(1+N), ψ(c_N), ψ(mean Δt), log(1+max κ), mean bar_w, mean ι_sso]``
+        ``[log(1+N), mean ι_sso]``
 
-    where ``ψ(x) = sign(x) * log(1 + |x|)``. All "mean" reductions are taken
-    over **valid** segments only.
+    where the ``mean`` reduction is taken over **valid** segments only.
+
+    Excluded by design:
+        - Signal-quality summaries (mean of ``hat_w``, fraction of valid
+          steps): describe sensor validity, not physiology.
+        - Cumulative monitoring time ``ψ(c_N)``, mean Δt ``ψ(mean Δt)``,
+          and max gap ``log(1+max κ)``: all derive from the *spans* of
+          observed segments, which are biased by the dataset's quality
+          filter — a noisier patient has more early segments rejected, so
+          their first surviving ``epoch[0]`` is later, shrinking every
+          downstream cumulative/span statistic. We refuse to feed that
+          quality-correlated bias into the head.
+
+    The pairwise ``Δt`` is still consumed by the relative-time attention
+    bias inside the transformer (it's structural, not a feature). And
+    ``hat_w`` is still consumed inside the segment tokenizer purely as a
+    masking signal.
 
     Args:
         num_segments: ``(B,)`` long.
-        cum_monitor_hours: ``(B, N)`` cumulative monitoring time in hours.
-        delta_t_hours: ``(B, N)`` per-segment Δt in hours.
-        gap_ratio: ``(B, N)`` excess gap ratio κ.
-        bar_w_segment: ``(B, N)`` per-segment central-window mean weight.
         iota_sso: ``(B, N)`` per-segment "in second stage" indicator.
         segment_mask: ``(B, N)`` bool.
 
     Returns:
-        ``(B, 6)`` global stats tensor.
+        ``(B, 2)`` global stats tensor.
     """
     mask_f = segment_mask.float()
     n_valid = mask_f.sum(dim=-1).clamp_min(1.0)
 
     log_n = torch.log1p(num_segments.float())
-    cum_last = (cum_monitor_hours * mask_f).max(dim=-1).values
-    psi_cn = torch.sign(cum_last) * torch.log1p(cum_last.abs())
-    # The first observed segment has Δt = 0 by construction, so the mean gap
-    # should be averaged over the N-1 observed transitions, not N segments.
-    n_transitions = (n_valid - 1.0).clamp_min(1.0)
-    mean_dt = (delta_t_hours * mask_f).sum(dim=-1) / n_transitions
-    psi_mean_dt = torch.sign(mean_dt) * torch.log1p(mean_dt.abs())
-    masked_kappa = torch.where(segment_mask, gap_ratio, torch.zeros_like(gap_ratio))
-    log_max_kappa = torch.log1p(masked_kappa.max(dim=-1).values.clamp_min(0.0))
-    mean_bar_w = (bar_w_segment * mask_f).sum(dim=-1) / n_valid
     mean_iota = (iota_sso * mask_f).sum(dim=-1) / n_valid
 
     return torch.stack(
-        [log_n, psi_cn, psi_mean_dt, log_max_kappa, mean_bar_w, mean_iota],
+        [log_n, mean_iota],
         dim=-1,
-    )                                                              # (B, 6)
+    )                                                              # (B, 2)
 
 
 class GuidOutcomeHead(nn.Module):
@@ -128,7 +125,8 @@ class GuidOutcomeHead(nn.Module):
 
     Args:
         d_model: Width of the temporal-transformer output (default 256).
-        global_stats_dim: Dimensionality of ``g_glob`` (default 6).
+        global_stats_dim: Dimensionality of ``g_glob`` (default 2 —
+            ``[log(1+N), mean ι_sso]``).
         num_classes_multi: Multi-class output size (default 3).
         pool_hidden_dim: Bottleneck width of the attentive-pool score MLP.
         dropout: Dropout used in the post-pool MLP.
@@ -138,7 +136,7 @@ class GuidOutcomeHead(nn.Module):
         self,
         *,
         d_model: int = 256,
-        global_stats_dim: int = 6,
+        global_stats_dim: int = 2,
         num_classes_multi: int = 3,
         pool_hidden_dim: int = 128,
         dropout: float = 0.1,

@@ -9,7 +9,7 @@ The token composition is the one mandated by ``classifier_description.md``
         → step_proj → (192-d)
         → masked attentive pool over T → s_core (192-d)
     u_TE      = [bar_K, K_max, K_late, m_lag, σ_lag, H_lag]         (6-d)
-    c_meta    (10-d, from dataset)
+    c_meta    (5-d, from dataset; TLO/SSO only — see guid_dataset.py)
     seg_token = token_proj(cat([s_core, u_TE, c_meta]))              (256-d)
 
 The model **does not** read raw ``epoch``; cross-delivery censoring is applied
@@ -181,7 +181,7 @@ class VaeSegmentTokenizer(nn.Module):
         d_model: Output token width consumed by the temporal transformer
             (default 256).
         c_meta_dim: Number of causal-metadata features supplied by the
-            dataset (default 10, see PRD §4.4).
+            dataset (default 5, see PRD §4.4 — TLO/SSO only).
         te_summary_dim: Number of TE-summary features (default 6).
         dropout: Dropout used inside residual MLPs.
         late_window_steps: Number of trailing valid steps that count as
@@ -195,7 +195,7 @@ class VaeSegmentTokenizer(nn.Module):
         d_z: int = 24,
         d_seg: int = 192,
         d_model: int = 256,
-        c_meta_dim: int = 10,
+        c_meta_dim: int = 5,
         te_summary_dim: int = 6,
         dropout: float = 0.1,
         late_window_steps: int = 75,

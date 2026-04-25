@@ -31,7 +31,7 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.temporal_transformer im
 class GuidClassifierConfig:
     """Resolved hyperparameters for :class:`GuidOutcomeClassifier`.
 
-    Defaults match PRD §13. ``c_meta_dim`` is fixed by the dataset (10) and
+    Defaults match PRD §13. ``c_meta_dim`` is fixed by the dataset (5) and
     ``te_summary_dim`` is fixed by the tokenizer (6).
     """
 
@@ -51,12 +51,12 @@ class GuidClassifierConfig:
 
     # Heads
     num_classes_multi: int = 3
-    global_stats_dim: int = 6
+    global_stats_dim: int = 2
     pool_hidden_dim: int = 128
     aux_hidden_dim: int = 128
 
     # Tokenizer
-    c_meta_dim: int = 10
+    c_meta_dim: int = 5
     te_summary_dim: int = 6
     late_window_steps: int = 75
 
@@ -189,17 +189,17 @@ class GuidOutcomeClassifier(nn.Module):
             rel_bucket_idx=batch["rel_bucket_idx"],
         )                                                     # (B, N, d_model)
 
-        # iota_sso: ``c_meta[..., 7]`` per dataset's c_meta layout.
-        iota_sso = batch["c_meta"][..., 7]
+        # iota_sso: ``c_meta[..., 4]`` per the dataset's 5-d layout
+        # ``[ψ(τ_lab), m_lab, ψ(τ_sso), m_sso, ι_sso]``. The cumulative /
+        # span statistics (``cum_h``, ``δ``, ``κ``) are deliberately NOT
+        # consumed here — they are quality-filter biased (see
+        # :func:`build_guid_global_stats` docstring).
+        iota_sso = batch["c_meta"][..., 4]
         g_glob = build_guid_global_stats(
             num_segments=batch["num_segments"],
-            cum_monitor_hours=batch["cum_monitor_hours"],
-            delta_t_hours=batch["delta_t_hours"],
-            gap_ratio=batch["gap_ratio"],
-            bar_w_segment=batch["bar_w_segment"],
             iota_sso=iota_sso,
             segment_mask=batch["segment_mask"],
-        )                                                     # (B, 6)
+        )                                                     # (B, 2)
 
         guid_out = self.guid_head(h, batch["segment_mask"], g_glob)
         aux_out = self.aux_head(h, batch["segment_mask"])

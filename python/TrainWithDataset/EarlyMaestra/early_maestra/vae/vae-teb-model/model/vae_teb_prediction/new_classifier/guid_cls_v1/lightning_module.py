@@ -43,23 +43,21 @@ def _recompute_delta_features(
     When :func:`apply_segment_dropout` flips a non-terminal segment's mask to
     False, the gap between that segment's neighbours effectively widens — but
     the collate's precomputed ``delta_t_hours``, ``cum_monitor_hours``,
-    ``gap_ratio``, ``rel_bucket_idx`` and the ψ-transformed columns 0–2 of
-    ``c_meta`` still reflect the pre-dropout ordering. This helper rebuilds
-    those features from the raw ``epoch`` tensor and the current
-    ``segment_mask`` so that:
+    ``gap_ratio`` and ``rel_bucket_idx`` still reflect the pre-dropout
+    ordering. This helper rebuilds those tensors from the raw ``epoch``
+    tensor and the current ``segment_mask`` so the transformer's
+    relative-time bias sees the wider gap between surviving neighbours.
 
-    * the transformer's relative-time bias sees the wider gap between the
-      surviving neighbours,
-    * ``build_guid_global_stats`` computes mean Δt and max κ over the
-      post-dropout observed transitions,
-    * ``c_meta[..., {0, 1, 2}]`` match the new timing per surviving segment.
+    ``c_meta`` is *not* touched: its columns are TLO/SSO statistics
+    (segment-intrinsic, unaffected by dropout) — the cumulative / Δt / κ
+    summaries are no longer part of ``c_meta`` (PRD §4.4).
 
     Operates in-place on ``batch``. Padded / dropped positions retain their
     default (zero) values since the attention mask hides them anyway.
 
     Args:
-        batch: Collated batch dict. Must contain ``segment_mask``, ``epoch``
-            and ``c_meta``.
+        batch: Collated batch dict. Must contain ``segment_mask`` and
+            ``epoch``.
         rel_num_buckets: Number of relative-time bias buckets (must match
             the transformer's bias-table size).
         rel_d_max: Δt saturation horizon in 20-min slots.
@@ -105,15 +103,11 @@ def _recompute_delta_features(
     batch["rel_bucket_idx"] = build_relative_time_bucket_index(
         cum_h, num_buckets=rel_num_buckets, d_max=rel_d_max
     )
-
-    # c_meta columns 0 (ψ(cum_h)), 1 (ψ(Δt)), 2 (log(1+κ)) depend on Δt.
-    # Columns 3-9 (TLO, SSO, quality summaries) are segment-intrinsic and
-    # unaffected by dropout — leave them alone.
-    c_meta = batch["c_meta"].clone()
-    c_meta[..., 0] = torch.sign(cum_h) * torch.log1p(cum_h.abs())
-    c_meta[..., 1] = torch.sign(delta_t) * torch.log1p(delta_t.abs())
-    c_meta[..., 2] = torch.log1p(gap_ratio)
-    batch["c_meta"] = c_meta
+    # ``c_meta`` carries only TLO/SSO (5-d, all segment-intrinsic), so
+    # nothing in it depends on Δt — no rewrite needed. The Δt / cum_h /
+    # κ summaries used to live at c_meta[..., 0..2] but were dropped from
+    # the feature surface (PRD §4.4) because they are biased by the
+    # quality filter on ``epoch[0]``.
 
 
 def sample_prefix_length(
@@ -193,8 +187,6 @@ def apply_prefix_truncation(
         "cum_monitor_hours",
         "delta_t_hours",
         "gap_ratio",
-        "bar_w_segment",
-        "f_valid_segment",
         "time_from_labor_onset",
         "second_stage_onset",
         "epoch",
@@ -225,11 +217,11 @@ def apply_segment_dropout(
     tensors themselves are left in place — the transformer ignores them via
     the mask). After the drop, :func:`_recompute_delta_features` is called to
     rebuild ``delta_t_hours`` / ``cum_monitor_hours`` / ``gap_ratio`` /
-    ``rel_bucket_idx`` and the Δt-dependent columns of ``c_meta`` from the
-    raw ``epoch`` tensor, so the transformer's relative-time bias, the
-    tokenizer's ``c_meta`` channels, and ``build_guid_global_stats`` all see
-    the *widened* gap between surviving neighbours (matching the
-    "model sees a wider gap" semantics of PRD §8.3).
+    ``rel_bucket_idx`` from the raw ``epoch`` tensor, so the transformer's
+    relative-time bias sees the *widened* gap between surviving neighbours
+    (matching the "model sees a wider gap" semantics of PRD §8.3).
+    ``c_meta`` (TLO/SSO only) is segment-intrinsic and unaffected by
+    dropout.
 
     Args:
         batch: Collated batch dict.

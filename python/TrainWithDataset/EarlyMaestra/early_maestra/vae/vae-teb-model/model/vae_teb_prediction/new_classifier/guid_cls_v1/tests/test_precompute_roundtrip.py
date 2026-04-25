@@ -82,7 +82,7 @@ def test_getitem_shapes(synthetic_cache: Path) -> None:
     assert s["mean_alpha"].shape == (4, T, L)
     assert s["weight"].shape == (4, T)
     assert s["hat_w"].shape == (4, T)
-    assert s["c_meta"].shape == (4, 10)
+    assert s["c_meta"].shape == (4, 5)
     assert s["cum_monitor_hours"].shape == (4,)
     assert s["delta_t_hours"].shape == (4,)
     assert s["target_per_t"].shape == (4, T)
@@ -101,7 +101,7 @@ def test_collate_pads_to_max_n(synthetic_cache: Path) -> None:
     for key in [
         "h_y", "mu_prior_norm", "mu_post_norm", "kld_per_t", "mean_alpha", "weight",
         "hat_w", "target_per_t", "c_meta", "cum_monitor_hours", "gap_ratio",
-        "delta_t_hours", "bar_w_segment", "f_valid_segment", "cs_label",
+        "delta_t_hours", "cs_label",
         "bg_label", "time_from_labor_onset", "second_stage_onset", "epoch",
     ]:
         short[key] = short[key][:n_short]

@@ -113,9 +113,9 @@ def guid_sequence_collate_fn(
         * ``mean_alpha``: ``(B, N, T, L)``
         * ``weight`` / ``hat_w``: ``(B, N, T)``
         * ``target_per_t``: ``(B, N, T)`` int64, padded with ``-1``
-        * ``c_meta``: ``(B, N, 10)``
+        * ``c_meta``: ``(B, N, 5)`` — TLO/SSO only; spans/quality dims
+          excluded by design (see :mod:`guid_dataset` and PRD §4.4).
         * ``cum_monitor_hours`` / ``gap_ratio`` / ``delta_t_hours``: ``(B, N)``
-        * ``bar_w_segment`` / ``f_valid_segment``: ``(B, N)``
         * ``cs_label`` / ``bg_label``: ``(B, N)`` bool
         * ``time_from_labor_onset`` / ``second_stage_onset`` / ``epoch``:
           ``(B, N)``
@@ -145,8 +145,6 @@ def guid_sequence_collate_fn(
     out["cum_monitor_hours"] = _pad_seg_tensor(batch, "cum_monitor_hours", N)
     out["gap_ratio"] = _pad_seg_tensor(batch, "gap_ratio", N)
     out["delta_t_hours"] = _pad_seg_tensor(batch, "delta_t_hours", N)
-    out["bar_w_segment"] = _pad_seg_tensor(batch, "bar_w_segment", N)
-    out["f_valid_segment"] = _pad_seg_tensor(batch, "f_valid_segment", N)
     out["cs_label"] = _pad_seg_tensor(batch, "cs_label", N).to(torch.bool)
     out["bg_label"] = _pad_seg_tensor(batch, "bg_label", N).to(torch.bool)
     out["time_from_labor_onset"] = _pad_seg_tensor(
