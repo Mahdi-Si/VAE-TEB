@@ -22,6 +22,7 @@ import pandas as pd
 from scipy import stats as scipy_stats
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.collections import LineCollection
+from matplotlib.patches import Patch
 
 # Set publication-quality style - optimized for high-impact journals
 plt.style.use("default")  # Start from clean slate
@@ -280,7 +281,7 @@ def plot_metric_histograms(
     """Create a single-column histogram panel for the v1 feature-forecast metrics.
 
     Draws histograms for ``feat_mse_total``, ``uplift_rel``,
-    ``residual_ratio``, and ``kld_mean`` (falls back to the legacy
+    ``residual_ratio``, ``kld_mean``, ``kld_sum`` and ``kld_l2`` (falls back to the legacy
     ``vaf/mse/snr/kld`` set when none of the new columns are present).
 
     Args:
@@ -300,7 +301,9 @@ def plot_metric_histograms(
         ("feat_mse_total", "Feature Forecast MSE", COLOR_BLUE, ""),
         ("uplift_rel", "Baseline - Full Uplift (rel.)", COLOR_GREEN, ""),
         ("residual_ratio", "Residual Usage Ratio", COLOR_ORANGE, ""),
-        ("kld_mean", "Transfer Entropy (KL)", COLOR_PURPLE, "nats"),
+        ("kld_mean", "KL Mean / Dim", COLOR_PURPLE, "nats"),
+        ("kld_sum", "KL Sum Across Dims", COLOR_VERMILLION, "nats"),
+        ("kld_l2", "KL Vector L2", COLOR_SKY, "nats"),
     ]
     # Legacy fallback (old histogram_metrics.csv).
     legacy_metrics = [
@@ -315,7 +318,9 @@ def plot_metric_histograms(
         metrics_config = legacy_metrics
 
     # Single-column layout with wider panels
-    fig, axes = plt.subplots(len(metrics_config), 1, figsize=(6.5, 8.5))
+    fig, axes = plt.subplots(
+        len(metrics_config), 1, figsize=(6.5, max(8.5, 2.1 * len(metrics_config)))
+    )
     axes = np.atleast_1d(axes)
 
     for ax, (col, title, color, unit) in zip(axes, metrics_config):
@@ -373,7 +378,7 @@ def plot_metric_histograms(
         ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal", pad=8)
 
         # Use log scale for KL / MSE x-axis by default (values span orders of magnitude).
-        if col in ("kld", "kld_mean", "feat_mse_total") and (values > 0).all():
+        if col in ("kld", "kld_mean", "kld_sum", "kld_l2", "feat_mse_total") and (values > 0).all():
             ax.set_xscale('log')
 
         _style_axes(ax, grid="major", minor_ticks=False)
@@ -434,7 +439,9 @@ def plot_metric_histograms_by_class(
             ("feat_r2_total", "Feature Forecast R^2", ""),
             ("uplift_rel", "Uplift (relative)", ""),
             ("residual_ratio", "Residual Usage Ratio", ""),
-            ("kld_mean", "Transfer Entropy (KL)", "nats"),
+            ("kld_mean", "KL Mean / Dim", "nats"),
+            ("kld_sum", "KL Sum Across Dims", "nats"),
+            ("kld_l2", "KL Vector L2", "nats"),
         ]
     metrics = [m for m in metrics if m[0] in df.columns]
     if not metrics:
@@ -490,7 +497,7 @@ def plot_metric_histograms_by_class(
                 )
             ax.axvline(float(np.mean(vals)), color=COLOR_ORANGE, lw=0.7, ls="--")
             ax.axvline(float(np.median(vals)), color=COLOR_PURPLE, lw=0.7, ls="-.")
-            if col in ("kld", "kld_mean", "feat_mse_total") and np.all(vals > 0):
+            if col in ("kld", "kld_mean", "kld_sum", "kld_l2", "feat_mse_total") and np.all(vals > 0):
                 ax.set_xscale("log")
             _style_axes(ax, grid="major", minor_ticks=False)
         # Row-level labelling
@@ -513,6 +520,407 @@ def plot_metric_histograms_by_class(
     fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Frequency-band forecast plotters (lag-attn v1)
+# -----------------------------------------------------------------------------
+
+# Stable band-to-color mapping. Order matches BAND_NAMES in
+# ``model/vae_teb_prediction/testing/band_partition.py`` so the legend
+# reads from slow-baseline (cooler) to beat-to-beat (warmer) bands.
+_BAND_COLORS: Dict[str, str] = {
+    "slow_baseline": COLOR_PURPLE,
+    "deceleration": COLOR_BLUE,
+    "variability": COLOR_GREEN,
+    "beat_to_beat": COLOR_VERMILLION,
+}
+
+
+def _band_color_for(band: str, fallback: str = COLOR_GRAY) -> str:
+    return _BAND_COLORS.get(str(band), fallback)
+
+
+def _ordered_bands(values: Any) -> list:
+    """Return present band names in canonical order."""
+    canonical = ("slow_baseline", "deceleration", "variability", "beat_to_beat")
+    seen = set()
+    try:
+        for v in pd.Series(values).dropna().unique():
+            seen.add(str(v))
+    except Exception:
+        return []
+    return [b for b in canonical if b in seen]
+
+
+def plot_band_violin(
+    df: pd.DataFrame,
+    value_col: str,
+    output_path: Path,
+    *,
+    title: Optional[str] = None,
+    n_channels_by_band: Optional[Dict[str, int]] = None,
+) -> None:
+    """Violin plot of ``value_col`` per band on a single axes.
+
+    Expected DataFrame columns: ``band`` (string) and ``value_col``.
+    Empty bands or all-NaN values are skipped silently.
+    """
+    bands = _ordered_bands(df.get("band"))
+    if not bands or value_col not in df.columns:
+        return
+
+    data = []
+    labels = []
+    colors = []
+    for band in bands:
+        vals = pd.to_numeric(
+            df.loc[df["band"] == band, value_col], errors="coerce"
+        ).to_numpy()
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        data.append(vals)
+        n_ch = (
+            n_channels_by_band.get(band) if n_channels_by_band is not None else None
+        )
+        if n_ch is None or n_ch <= 0:
+            labels.append(f"{band}\n(n={vals.size})")
+        else:
+            labels.append(f"{band}\nch={n_ch}, n={vals.size}")
+        colors.append(_band_color_for(band))
+    if not data:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(4.4, 1.5 * len(data) + 1.6), 3.4))
+    parts = ax.violinplot(
+        data, showmeans=False, showmedians=True, showextrema=False,
+    )
+    for body, color in zip(parts.get("bodies", []), colors):
+        body.set_facecolor(color)
+        body.set_edgecolor(COLOR_BLACK)
+        body.set_alpha(0.55)
+        body.set_linewidth(0.6)
+    if "cmedians" in parts:
+        parts["cmedians"].set_color(COLOR_BLACK)
+        parts["cmedians"].set_linewidth(0.8)
+
+    ax.set_xticks(range(1, len(data) + 1))
+    ax.set_xticklabels(labels, fontsize=FONT_LABEL * 0.85)
+    ax.set_ylabel(value_col, fontsize=FONT_LABEL)
+    ax.set_title(
+        title or f"{value_col} per frequency band",
+        fontsize=FONT_TITLE, fontweight="normal",
+    )
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_band_violin_by_class(
+    df: pd.DataFrame,
+    value_col: str,
+    output_path: Path,
+    *,
+    title: Optional[str] = None,
+) -> None:
+    """Grouped violin plot: one cluster per band, one violin per class.
+
+    Expected columns: ``band``, ``label``, ``value_col``. Bands without
+    samples in any class are skipped. Falls back to the pooled plot
+    when fewer than 2 classes are present.
+    """
+    bands = _ordered_bands(df.get("band"))
+    classes = unique_labels_in(df.get("label"))
+    if not bands or value_col not in df.columns:
+        return
+    if len(classes) < 2:
+        plot_band_violin(df, value_col, output_path, title=title)
+        return
+
+    fig, ax = plt.subplots(
+        figsize=(max(5.0, 1.7 * len(bands) + 1.6), 3.6),
+    )
+    width = 0.8 / max(len(classes), 1)
+    legend_handles: list = []
+    legend_added = set()
+    for b_idx, band in enumerate(bands):
+        for c_idx, lab in enumerate(classes):
+            vals = pd.to_numeric(
+                df.loc[(df["band"] == band) & (df["label"] == lab), value_col],
+                errors="coerce",
+            ).to_numpy()
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            pos = b_idx + 1 + (c_idx - (len(classes) - 1) / 2.0) * width
+            parts = ax.violinplot(
+                [vals], positions=[pos], widths=width * 0.9,
+                showmeans=False, showmedians=True, showextrema=False,
+            )
+            color = class_color_for(lab)
+            for body in parts.get("bodies", []):
+                body.set_facecolor(color)
+                body.set_edgecolor(COLOR_BLACK)
+                body.set_alpha(0.55)
+                body.set_linewidth(0.5)
+            if "cmedians" in parts:
+                parts["cmedians"].set_color(COLOR_BLACK)
+                parts["cmedians"].set_linewidth(0.7)
+            if lab not in legend_added:
+                legend_handles.append(
+                    Patch(facecolor=color, edgecolor=COLOR_BLACK,
+                          alpha=0.55, label=class_label_for(lab))
+                )
+                legend_added.add(lab)
+
+    ax.set_xticks(range(1, len(bands) + 1))
+    ax.set_xticklabels(bands, fontsize=FONT_LABEL * 0.9)
+    ax.set_ylabel(value_col, fontsize=FONT_LABEL)
+    ax.set_title(
+        title or f"{value_col} per frequency band — by class",
+        fontsize=FONT_TITLE, fontweight="normal",
+    )
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles, loc="best",
+            frameon=True, fontsize=FONT_LEGEND,
+        )
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ribbon_plot_per_band(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    value_col: str,
+    output_path: Path,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    x_to_minutes: Optional[float] = None,
+) -> None:
+    """Median + IQR ribbon, one line per band, all on shared axes."""
+    bands = _ordered_bands(df.get("band"))
+    if not bands or x_col not in df.columns or value_col not in df.columns:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.0, 3.6))
+    plotted = False
+    for band in bands:
+        sub = df[df["band"] == band]
+        if sub.empty:
+            continue
+        grouped = sub.groupby(x_col)[value_col]
+        med = grouped.median()
+        q1 = grouped.quantile(0.25)
+        q3 = grouped.quantile(0.75)
+        if med.empty:
+            continue
+        xs = np.asarray(med.index.to_list(), dtype=float)
+        if x_to_minutes is not None:
+            xs = xs * float(x_to_minutes)
+        color = _band_color_for(band)
+        ax.plot(xs, med.to_numpy(), color=color, lw=1.1, label=band)
+        ax.fill_between(
+            xs, q1.to_numpy(), q3.to_numpy(),
+            color=color, alpha=0.18, lw=0,
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel(xlabel, fontsize=FONT_LABEL)
+    ax.set_ylabel(ylabel, fontsize=FONT_LABEL)
+    ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
+    ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_band_horizon_error(
+    per_horizon_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    value_col: str = "mse",
+) -> None:
+    """Per-band median+IQR ribbon of forecast MSE vs horizon step ``h``."""
+    _ribbon_plot_per_band(
+        per_horizon_df,
+        x_col="h",
+        value_col=value_col,
+        output_path=output_path,
+        title="Forecast error by horizon step — per frequency band",
+        xlabel="horizon step h",
+        ylabel=f"{value_col} (median, IQR)",
+    )
+
+
+def plot_band_anchor_error(
+    per_anchor_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    value_col: str = "mse",
+    decim_step_seconds: float = 4.0,
+) -> None:
+    """Per-band median+IQR ribbon of forecast MSE vs anchor position ``t``.
+
+    The anchor axis is rescaled to minutes via ``t * decim_step_seconds /
+    60`` so the figure is directly readable in clinical time. Default
+    ``decim_step_seconds=4`` matches the v1 model's 16x decimation at
+    ``fs=4 Hz``.
+    """
+    _ribbon_plot_per_band(
+        per_anchor_df,
+        x_col="t",
+        value_col=value_col,
+        output_path=output_path,
+        title="Forecast error by anchor position — per frequency band",
+        xlabel="anchor position (min into segment)",
+        ylabel=f"{value_col} (median, IQR)",
+        x_to_minutes=decim_step_seconds / 60.0,
+    )
+
+
+def _grid_ribbon_by_class(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    value_col: str,
+    output_path: Path,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    x_to_minutes: Optional[float] = None,
+) -> None:
+    """Grid plot: rows = bands, cols = classes. Each cell is a ribbon."""
+    bands = _ordered_bands(df.get("band"))
+    classes = unique_labels_in(df.get("label"))
+    if not bands or not classes:
+        return
+    if len(classes) < 2:
+        # Fall back to single-axes pooled plot
+        _ribbon_plot_per_band(
+            df, x_col=x_col, value_col=value_col,
+            output_path=output_path, title=title,
+            xlabel=xlabel, ylabel=ylabel,
+            x_to_minutes=x_to_minutes,
+        )
+        return
+
+    n_rows = len(bands)
+    n_cols = len(classes)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(max(3.0, 2.6 * n_cols), max(2.4, 1.8 * n_rows)),
+        sharex=True, sharey="row", squeeze=False,
+    )
+
+    plotted_any = False
+    for r, band in enumerate(bands):
+        for c, lab in enumerate(classes):
+            ax = axes[r, c]
+            sub = df[(df["band"] == band) & (df["label"] == lab)]
+            if sub.empty or x_col not in sub.columns:
+                ax.text(0.5, 0.5, "—", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=FONT_LABEL * 0.9)
+                _style_axes(ax, grid="major", minor_ticks=False)
+                if c == 0:
+                    ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+                if r == 0:
+                    ax.set_title(class_label_for(lab),
+                                 fontsize=FONT_TITLE * 0.85,
+                                 fontweight="normal")
+                continue
+            grouped = sub.groupby(x_col)[value_col]
+            med = grouped.median()
+            q1 = grouped.quantile(0.25)
+            q3 = grouped.quantile(0.75)
+            if med.empty:
+                ax.text(0.5, 0.5, "—", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=FONT_LABEL * 0.9)
+                _style_axes(ax, grid="major", minor_ticks=False)
+                if c == 0:
+                    ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+                if r == 0:
+                    ax.set_title(class_label_for(lab),
+                                 fontsize=FONT_TITLE * 0.85,
+                                 fontweight="normal")
+                continue
+            xs = np.asarray(med.index.to_list(), dtype=float)
+            if x_to_minutes is not None:
+                xs = xs * float(x_to_minutes)
+            color = class_color_for(lab)
+            ax.plot(xs, med.to_numpy(), color=color, lw=1.0)
+            ax.fill_between(
+                xs, q1.to_numpy(), q3.to_numpy(),
+                color=color, alpha=0.20, lw=0,
+            )
+            plotted_any = True
+            if c == 0:
+                ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+            if r == 0:
+                ax.set_title(class_label_for(lab),
+                             fontsize=FONT_TITLE * 0.85,
+                             fontweight="normal")
+            if r == n_rows - 1:
+                ax.set_xlabel(xlabel, fontsize=FONT_LABEL * 0.85)
+            _style_axes(ax, grid="major", minor_ticks=False)
+
+    if not plotted_any:
+        plt.close(fig)
+        return
+
+    fig.suptitle(title, fontsize=FONT_TITLE, y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_band_horizon_error_by_class(
+    per_horizon_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    value_col: str = "mse",
+) -> None:
+    """Grid: per-band horizon-error ribbons split by class."""
+    _grid_ribbon_by_class(
+        per_horizon_df,
+        x_col="h",
+        value_col=value_col,
+        output_path=output_path,
+        title="Forecast error by horizon — per band, per class",
+        xlabel="horizon step h",
+        ylabel=value_col,
+    )
+
+
+def plot_band_anchor_error_by_class(
+    per_anchor_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    value_col: str = "mse",
+    decim_step_seconds: float = 4.0,
+) -> None:
+    """Grid: per-band anchor-error ribbons split by class."""
+    _grid_ribbon_by_class(
+        per_anchor_df,
+        x_col="t",
+        value_col=value_col,
+        output_path=output_path,
+        title="Forecast error by anchor position — per band, per class",
+        xlabel="anchor position (min)",
+        ylabel=value_col,
+        x_to_minutes=decim_step_seconds / 60.0,
+    )
 
 
 def plot_latent_distributions(

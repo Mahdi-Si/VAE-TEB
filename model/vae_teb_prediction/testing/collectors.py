@@ -28,15 +28,19 @@ import torch
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.metrics import (
+    aggregate_selected_pca_scores,
     aggregate_te_lag_map,
     compute_attention_diagnostics,
     compute_forecast_metrics,
+    compute_kld_aggregate_tensors,
+    compute_kld_aggregates_per_sample,
     compute_kld_per_sample,
     compute_posterior_drift,
     compute_residual_usage,
     compute_uplift_metrics,
     fit_pca_kld_per_dim,
     project_kld_per_dim,
+    select_pca_components,
 )
 
 
@@ -292,7 +296,12 @@ def collect_metrics(
                 runner.warmup_steps,
                 runner.horizon,
             )
-            kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
+            kld_agg_sample = compute_kld_aggregates_per_sample(
+                outputs, runner.warmup_steps
+            )
+            kld_sample = kld_agg_sample["kld_mean"]
+            kld_sum_sample = kld_agg_sample["kld_sum"]
+            kld_l2_sample = kld_agg_sample["kld_l2"]
 
             # Lag-attention diagnostics (entropy / concentration).
             attn_entropy_mean: Optional[np.ndarray] = None
@@ -387,6 +396,8 @@ def collect_metrics(
                     "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
                     "delta_src_norm": float(usage["delta_norm"][idx].cpu().item()),
                     "kld_mean": kld_val,
+                    "kld_sum": float(kld_sum_sample[idx].cpu().item()),
+                    "kld_l2": float(kld_l2_sample[idx].cpu().item()),
                     "kld": kld_val,  # alias for backward compatibility
                 }
                 if drift is not None:
@@ -425,15 +436,45 @@ def collect_metrics(
         try:
             stacked = np.concatenate(per_dim_t_chunks, axis=0)  # (N, T, d_z)
             stacked = stacked[: len(df)]
-            n_keep = max(1, min(int(pca_components), int(sample_dz)))
+            # Fit as many PCs as the latent KL space supports, then select the
+            # most contrastive subset. This avoids hard-coding "top 3 by
+            # eigenvalue" while keeping legacy kld_pc1..3 columns available.
+            n_fit = max(1, int(sample_dz))
             pca_model, projected, ev_ratio = fit_pca_kld_per_dim(
-                stacked, n_components=n_keep
+                stacked, n_components=n_fit
             )
             # Per-sample mean of each component (ignoring NaN warmup).
             with np.errstate(invalid="ignore"):
                 pc_means = np.nanmean(projected, axis=1)  # (N, k)
+
             for k in range(pc_means.shape[1]):
                 df[f"kld_pc{k + 1}"] = pc_means[:, k].astype(float)
+            legacy_count = min(3, pc_means.shape[1])
+            if legacy_count >= 3:
+                df["kld_pca_l2_top3"] = np.sqrt(
+                    np.nansum(pc_means[:, :3] ** 2, axis=1)
+                ).astype(float)
+
+            labels = df["label"].to_numpy() if "label" in df.columns else None
+            selection = select_pca_components(
+                projected,
+                ev_ratio,
+                n_select=max(1, int(pca_components)),
+                labels=labels,
+            )
+            selected_aggs = aggregate_selected_pca_scores(
+                selection["pc_means"],
+                selection["selected_indices"],
+                selection["signs"],
+            )
+            selected_scores = selected_aggs["selected_scores"]
+            for k in range(selected_scores.shape[1]):
+                original_pc = int(selection["selected_1based"][k])
+                df[f"kld_pc_selected_{k + 1}"] = selected_scores[:, k].astype(float)
+                df[f"kld_pc_selected_{k + 1}_source_pc"] = original_pc
+            df["kld_pca_l2_selected"] = selected_aggs["l2"].astype(float)
+            df["kld_pca_abs_sum_selected"] = selected_aggs["abs_sum"].astype(float)
+            df["kld_pca_signed_sum_selected"] = selected_aggs["signed_sum"].astype(float)
 
             target_dir = (
                 Path(pca_output_dir)
@@ -449,6 +490,26 @@ def collect_metrics(
                         "n_samples_fitted": int(stacked.shape[0]),
                         "T": int(sample_T),
                         "d_z": int(sample_dz),
+                        "legacy_top_components_emitted": int(legacy_count),
+                    },
+                    fh,
+                    indent=2,
+                )
+            with open(target_dir / "selection.json", "w") as fh:
+                json.dump(
+                    {
+                        "n_selected": int(len(selection["selected_indices"])),
+                        "selected_indices_0based": [
+                            int(x) for x in selection["selected_indices"]
+                        ],
+                        "selected_indices_1based": [
+                            int(x) for x in selection["selected_1based"]
+                        ],
+                        "signs": [float(x) for x in selection["signs"]],
+                        "contrast_type": str(selection["contrast_type"]),
+                        "score": [float(x) for x in selection["score"]],
+                        "contrast": [float(x) for x in selection["contrast"]],
+                        "explained_variance_ratio": [float(x) for x in ev_ratio],
                     },
                     fh,
                     indent=2,
@@ -567,6 +628,9 @@ def collect_predictions(
                 runner.horizon,
             )
             kld_sample = compute_kld_per_sample(outputs, runner.warmup_steps)
+            kld_agg_sample = compute_kld_aggregates_per_sample(
+                outputs, runner.warmup_steps
+            )
 
             mu_full_np = outputs["mu_full"].detach().cpu().numpy()
             mu_base_np = outputs["mu_base"].detach().cpu().numpy()
@@ -575,6 +639,15 @@ def collect_predictions(
             attn_np = outputs["attn_weights"].detach().cpu().numpy()
             te_lag_np = outputs["te_lag_map"].detach().cpu().numpy()
             kld_t_np = outputs["kld_per_t"].detach().cpu().numpy()
+            kld_agg_t = compute_kld_aggregate_tensors(outputs, runner.warmup_steps)
+            kld_sum_t_np = (
+                kld_agg_t["kld_sum_t"].detach().cpu().numpy()
+                if kld_agg_t is not None else kld_t_np
+            )
+            kld_l2_t_np = (
+                kld_agg_t["kld_l2_t"].detach().cpu().numpy()
+                if kld_agg_t is not None else kld_t_np
+            )
             y_plus_np = y_plus.detach().cpu().numpy()
 
             # Per-dimension KL (for dim-heat plots). Closed-form KL tensor
@@ -608,6 +681,8 @@ def collect_predictions(
                     "attn": attn_np[idx],
                     "te_lag": te_lag_np[idx],
                     "kld_t": kld_t_np[idx],
+                    "kld_sum_t": kld_sum_t_np[idx],
+                    "kld_l2_t": kld_l2_t_np[idx],
                     "kld_per_dim": kld_per_dim_np[idx],
                     "fhr": denormalize_signal(
                         fhr_np[idx] if fhr_np is not None else None, fhr_stats
@@ -626,6 +701,8 @@ def collect_predictions(
                         "uplift_rel": float(uplift["uplift_rel"][idx].cpu().item()),
                         "residual_ratio": float(usage["residual_ratio"][idx].cpu().item()),
                         "kld_mean": float(kld_sample[idx].cpu().item()),
+                        "kld_sum": float(kld_agg_sample["kld_sum"][idx].cpu().item()),
+                        "kld_l2": float(kld_agg_sample["kld_l2"][idx].cpu().item()),
                     },
                 })
                 processed += 1
@@ -688,6 +765,7 @@ def collect_kld_trajectory(
             latent = outputs.get("z")
             if kld_t is None:
                 continue
+            kld_agg_t = compute_kld_aggregate_tensors(outputs, runner.warmup_steps)
 
             # Mask warmup region with NaN so we can skip it below.
             kld_t_f = kld_t.detach().to(torch.float32).clone()
@@ -696,6 +774,17 @@ def collect_kld_trajectory(
                 kld_t_f[:, :warmup] = float("nan")
 
             T = int(kld_t_f.size(1))
+            kld_mean_t_f = None
+            kld_sum_t_f = None
+            kld_l2_t_f = None
+            if kld_agg_t is not None:
+                kld_mean_t_f = kld_agg_t["kld_mean_t"].detach().to(torch.float32).clone()
+                kld_sum_t_f = kld_agg_t["kld_sum_t"].detach().to(torch.float32).clone()
+                kld_l2_t_f = kld_agg_t["kld_l2_t"].detach().to(torch.float32).clone()
+                if warmup > 0 and T > warmup:
+                    kld_mean_t_f[:, :warmup] = float("nan")
+                    kld_sum_t_f[:, :warmup] = float("nan")
+                    kld_l2_t_f[:, :warmup] = float("nan")
 
             # Optional: per-time per-dim KL projected through PCA.
             pc_traj_np: Optional[np.ndarray] = None
@@ -726,6 +815,18 @@ def collect_kld_trajectory(
                 hours_before = -epoch / 3600.0 if epoch is not None else None
 
                 kld_vals = kld_t_f[idx].cpu().numpy()
+                kld_dim_mean_vals = (
+                    kld_mean_t_f[idx].cpu().numpy()
+                    if kld_mean_t_f is not None else None
+                )
+                kld_sum_vals = (
+                    kld_sum_t_f[idx].cpu().numpy()
+                    if kld_sum_t_f is not None else None
+                )
+                kld_l2_vals = (
+                    kld_l2_t_f[idx].cpu().numpy()
+                    if kld_l2_t_f is not None else None
+                )
                 latent_vals = latent[idx].cpu().numpy() if latent is not None else None
                 pc_vals = pc_traj_np[idx] if pc_traj_np is not None else None
 
@@ -741,6 +842,12 @@ def collect_kld_trajectory(
                         "timestep": t,
                         "kld_mean": float(v),
                     }
+                    if kld_dim_mean_vals is not None:
+                        record["kld_dim_mean_t"] = float(kld_dim_mean_vals[t])
+                    if kld_sum_vals is not None:
+                        record["kld_sum_t"] = float(kld_sum_vals[t])
+                    if kld_l2_vals is not None:
+                        record["kld_l2_t"] = float(kld_l2_vals[t])
                     if latent_vals is not None:
                         for d in range(latent_vals.shape[1]):
                             record[f"latent_{d}"] = float(latent_vals[t, d])

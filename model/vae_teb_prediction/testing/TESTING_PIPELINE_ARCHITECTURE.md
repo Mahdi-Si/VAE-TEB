@@ -12,6 +12,11 @@ outcome class when multiple classes are present in the data.
 
 **Location**: `model/vae_teb_prediction/testing/`
 
+**Figure reference**: see
+`model/vae_teb_prediction/testing/TESTING_FIGURE_INTERPRETATION_GUIDE.md`
+for a plain-language explanation of every standard PDF/PNG/HTML figure
+emitted by this pipeline.
+
 **Model contract** (see `model/vae_teb_prediction/model/new_architecture.md`):
 
 - **Inputs**: `y_st (B,T=300,43)`, `y_ph (B,T,44)`, `u_stream (B,T,101)`
@@ -62,9 +67,10 @@ outcome class when multiple classes are present in the data.
 testing/
 ├── __init__.py                 # Public API exports
 ├── base.py                     # TestRunner (model loading, batch dispatch, y_plus)
-├── metrics.py                  # Pure metric functions + PCA + posterior drift
+├── band_partition.py           # Channel-to-frequency-band map (slow / decel / variab / b2b)
+├── metrics.py                  # Pure metric functions + KLD aggregates + PCA selection
 ├── collectors.py               # Iteration patterns that populate DataFrames / lists
-├── visualizers.py              # Matplotlib static plots + class palette
+├── visualizers.py              # Matplotlib static plots + class palette + band plotters
 ├── visualizers_interactive.py  # Plotly interactive plots
 ├── plot_single_samples.py      # Per-sample multi-row diagnostic figure
 ├── trajectory_analysis.py      # Cross-run latent trajectory analyser (legacy helper)
@@ -75,8 +81,10 @@ testing/
 │   ├── dataset_stats.py        # Dataset coverage statistics (model-agnostic)
 │   ├── histogram.py            # Per-sample metric histograms (+ by-class variant)
 │   ├── forecast_quality.py     # Feature forecast quality (+ by-class variants)
+│   ├── frequency_band_forecast.py  # Forecast quality stratified by frequency band (+ by-class)
 │   ├── temporal.py             # Horizon-step MSE + anchor-position MSE (+ by-class)
 │   ├── uplift.py               # Baseline vs full uplift (by-class)
+│   ├── up_effect.py            # Inference-time UP perturbation / ablation analysis
 │   ├── residual_usage.py       # delta_mu_src activity / collapse (+ by-class)
 │   ├── attention_diagnostics.py# Lag attention diagnostics (+ by-class)
 │   ├── te_lag_analysis.py      # Lag-resolved TE by class
@@ -95,7 +103,7 @@ testing/
     ├── te_data_loader.py       # Load empirical IDTxl TE records
     ├── te_kld_analysis.py      # Match KLD ↔ empirical TE on (guid, epoch)
     │                           # + pca_trajectory + run_te_kld_pipeline_stratified
-    ├── te_kld_comparison.py    # Statistical comparison + 6 new helpers
+    ├── te_kld_comparison.py    # Statistical comparison + PCA/TE surrogate helpers
     ├── te_kld_visualizations.py # Plotters + 5 new class-aware plotters
     └── te_dtw.py               # DTW-based trajectory alignment
 ```
@@ -156,6 +164,37 @@ dispatch, and ground-truth construction.
   the resulting dict under `outputs["loss_dict"]`.
 - `ensure_dir(subdir)` — create and return an output subdirectory.
 
+### 1b. `band_partition.py` — Channel-to-frequency-band mapping
+
+Builds and caches the per-channel partition of the 87-channel FHR
+forecast target into the four clinical bands defined in
+`knowledge/dataset/scattering_phase_pipeline.md` Section 8:
+
+| Band            | Hz range            | Period range  |
+|-----------------|---------------------|---------------|
+| `slow_baseline` | $f < 0.008$         | $> 125\,$s    |
+| `deceleration`  | $0.008 \le f < 0.04$| 25 s – 2 min  |
+| `variability`   | $0.04 \le f \le 0.25$| 4 – 25 s    |
+| `beat_to_beat`  | $f > 0.25$          | $< 4\,$s      |
+
+The mapping is reconstructed deterministically at runtime by
+instantiating `KymatioPhaseScattering1D(J=11, Q=4, T=16, shape=5280)`
+and reading both its scattering meta (for the 43 `fhr_st` channels)
+and `select_fhr_phase_coefficients(min_freq=0.006)` (for the 44
+`fhr_ph` channels). Each fhr_ph channel is assigned to the band of
+$\xi_j$ — the upper / target frequency of the wavelet pair — since
+that band hosts the rhythm/harmonic content the coefficient describes.
+
+**Public API**:
+
+| Symbol | Description |
+|--------|-------------|
+| `BAND_NAMES` | Canonical tuple ordering (`slow_baseline`, `deceleration`, `variability`, `beat_to_beat`). |
+| `BAND_HZ_RANGES` | Dict mapping each band to `(low_hz, high_hz)`. |
+| `BandPartition` | Dataclass holding `band_names`, `band_hz_ranges`, `band_period_ranges_s`, `n_st_channels`, `n_ph_channels`, `n_total`, `st_idx[band]` (indices into `[0, 43)`), `ph_idx[band]` (indices into `[43, 87)`, already shifted into 87-channel space), `combined_idx[band]`, and `channel_metadata` (one row per 87-channel index with `[channel, kind, band, freq_hz_primary, freq_hz_secondary, harmonic_ratio]`). |
+| `build_band_partition(...)` | Builds and lru-caches a `BandPartition` for `(J, Q, T, shape, fhr_phase_min_freq, n_st, n_ph, fs)`. Defaults match the v1 dataset: `J=11, Q=4, T=16, shape=5280, fhr_phase_min_freq=0.006, n_st=43, n_ph=44, fs=4 Hz`. |
+| `BandPartition.write(out_dir)` | Persists `band_partition.json` and `band_channel_map.csv` for downstream tools and TE_Calculated. |
+
 ### 2. `metrics.py` — Pure metric functions
 
 Stateless, no side effects. KL mechanics are unchanged from the legacy
@@ -168,7 +207,10 @@ tensors.
 | `compute_kld(outputs, warmup_steps=30)` | Forward dict | `(B, T, d_z)` | Closed-form KL, warmup NaN-filled. |
 | `compute_kld_per_sample(outputs, warmup_steps=30)` | Forward dict | `(B,)` | `nanmean` over time + latent dims. |
 | `compute_kld_per_timestep(outputs, warmup_steps=30)` | Forward dict | `(B, T)` | `nanmean` over latent dims only. |
+| **`compute_kld_aggregate_tensors(outputs, warmup_steps=30)`** | Forward dict | `{kld_mean_t, kld_sum_t, kld_l2_t}` each `(B,T)` | Per-time KL mean, additive latent-dim sum, and Euclidean norm; warmup all-NaN timesteps remain NaN. |
+| **`compute_kld_aggregates_per_sample(outputs, warmup_steps=30)`** | Forward dict | `{kld_mean, kld_sum, kld_l2}` each `(B,)` | Per-sample averages of the three KLD aggregate trajectories. |
 | `compute_forecast_metrics(mu_full, y_plus, warmup, horizon)` | `(B,T,H_d,C)` + `(B,T−H_d,H_d,C)` | `{feat_mse_total, feat_mse_per_horizon, feat_r2_total, feat_mse_st, feat_mse_ph}` | Feature-forecast quality split into scattering (ch 0..42) and phase (ch 43..86). |
+| **`compute_band_forecast_metrics(mu_full, y_plus, warmup, horizon, band_combined_idx, *, return_per_anchor=True)`** | same shapes + `Dict[band, int-array]` | `{band -> {mse_total (B,), mse_per_horizon (B,H_d), r2_total (B,), n_channels, mse_per_anchor (B,T_v)}}` | Per-band channel-sliced version of `compute_forecast_metrics`. The optional `mse_per_anchor` tensor is what powers the band-x-time anchor-error grid. |
 | `compute_uplift_metrics(mu_full, mu_base, y_plus, warmup, horizon)` | same as above | `{l_full, l_base, uplift_abs, uplift_rel}` | Baseline-vs-full uplift per sample. |
 | `compute_residual_usage(delta_mu_src, mu_full, warmup, horizon)` | `(B,T,H_d,C)` | `{delta_norm, full_norm, residual_ratio, delta_norm_t}` | Source-branch activity and per-anchor trace. |
 | `compute_attention_diagnostics(attn_weights, warmup)` | `(B,T,M,L)` | `{alpha_bar, argmax_lag, entropy, head_diversity, alpha_mass_by_lag}` | Lag-attention summary with NaN-filled warmup. |
@@ -176,6 +218,8 @@ tensors.
 | **`compute_posterior_drift(mu_prior, mu_post, warmup)`** | `(B,T,d_z)×2` | `(B,)` | Per-sample mean ‖μ_q − μ_p‖² over valid t — alternative TE surrogate independent of variance heads. |
 | **`fit_pca_kld_per_dim(kld_per_dim_t, n_components=3)`** | `(N,T,d_z)` | `(PCA, projected, ev_ratio)` | Fits sklearn PCA on flattened per-time per-dim KL. NaN-safe. |
 | **`project_kld_per_dim(kld_per_dim_t, pca_model)`** | `(N,T,d_z) + PCA` | `(N,T,n_components)` | Projects new trajectories through a previously-fit PCA. |
+| **`select_pca_components(projected, ev_ratio, n_select=3, labels=None, te_values=None)`** | PCA scores `(N,T,K)` | selection dict | Ranks PCs by eigenvalue-weighted contrast: empirical TE when available, otherwise label contrast, otherwise eigenvalue. |
+| **`aggregate_selected_pca_scores(pc_means, selected_indices, signs)`** | per-sample PC means | `{selected_scores, l2, abs_sum, signed_sum}` | Builds selected-PC Euclidean, absolute-sum, and sign-aligned aggregate scores. |
 | `preprocess_latent`, `reduce_latent_dimensionality`, `compute_trajectory_*` | trajectory-level helpers (unchanged from legacy) | — | Reused by `trajectory.py` and `encoder_probe.py`. |
 
 **KLD formula** (closed form, unchanged):
@@ -194,10 +238,10 @@ Every collector lives under `runner.inference_mode()` and iterates via
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `collect_metrics(runner, loader, max_samples=None, *, pca_components=3, pca_output_dir=None)` | `pd.DataFrame` | **Extended** columns: `guid, epoch, label, feat_mse_total, feat_mse_st, feat_mse_ph, feat_r2_total, base_mse_total, uplift_abs, uplift_rel, residual_ratio, delta_src_norm, kld_mean, kld` plus the TE surrogates `posterior_drift_norm, attention_entropy_mean, attention_concentration_mean, te_lag_peak, te_lag_total_mass, kld_dim_0..23, kld_pc1, kld_pc2, kld_pc3`. The `kld` column is an alias of `kld_mean` for `TE_Calculated` compatibility. Also writes `pca_kld/ev_ratio.json` + `components.npy` + `mean.npy`. |
+| `collect_metrics(runner, loader, max_samples=None, *, pca_components=3, pca_output_dir=None)` | `pd.DataFrame` | **Extended** columns: `guid, epoch, label, feat_mse_total, feat_mse_st, feat_mse_ph, feat_r2_total, base_mse_total, uplift_abs, uplift_rel, residual_ratio, delta_src_norm, kld_mean, kld_sum, kld_l2, kld` plus the TE surrogates `posterior_drift_norm, attention_entropy_mean, attention_concentration_mean, te_lag_peak, te_lag_total_mass, kld_dim_0..23, kld_pc1..kld_pcK`, legacy `kld_pca_l2_top3`, and selected-PC columns `kld_pc_selected_*`, `kld_pca_l2_selected`, `kld_pca_abs_sum_selected`, `kld_pca_signed_sum_selected`. The `kld` column remains an alias of `kld_mean` for `TE_Calculated` compatibility. Also writes `pca_kld/ev_ratio.json`, `selection.json`, `components.npy`, and `mean.npy`. |
 | `collect_latents(runner, loader, max_samples=None)` | `np.ndarray (N*T, d_z)` | Flattened per-sample latent trajectories. |
-| `collect_predictions(runner, loader, max_samples=None)` | `List[Dict]` | ⚠️ **Heavy** — ~13 MB per sample. Retains full `mu_full, mu_base, delta_src, y_plus, z, attn, te_lag, kld_t, kld_per_dim, fhr, up` plus metadata and a `metrics` sub-dict. Consumed by `plot_sample_lag_attn_diagnostic`. **Must be capped by the caller.** |
-| `collect_kld_trajectory(runner, loader, max_samples=None, *, pca_model=None)` | `pd.DataFrame` | Long-format per-(sample, timestep) rows: `[guid, epoch, hours_before, label, timestep, kld_mean, latent_0 … latent_{d_z-1}]`. When `pca_model` is provided, adds `kld_pc1_t, kld_pc2_t, kld_pc3_t` columns. |
+| `collect_predictions(runner, loader, max_samples=None)` | `List[Dict]` | ⚠️ **Heavy** — ~13 MB per sample. Retains full `mu_full, mu_base, delta_src, y_plus, z, attn, te_lag, kld_t, kld_sum_t, kld_l2_t, kld_per_dim, fhr, up` plus metadata and a `metrics` sub-dict containing `kld_mean`, `kld_sum`, and `kld_l2`. Consumed by sample diagnostic plots. **Must be capped by the caller.** |
+| `collect_kld_trajectory(runner, loader, max_samples=None, *, pca_model=None)` | `pd.DataFrame` | Long-format per-(sample, timestep) rows: `[guid, epoch, hours_before, label, timestep, kld_mean, kld_dim_mean_t, kld_sum_t, kld_l2_t, latent_0 … latent_{d_z-1}]`. When `pca_model` is provided, adds selected/fitted `kld_pc*_t` columns. |
 | `collect_attention_maps(runner, loader, max_samples=None)` | `List[Dict]` | ⚠️ **Moderate** — ~750 KB per sample. Per-sample `{guid, epoch, label, alpha_bar (T,L), argmax_lag (T,), entropy (T,M), head_diversity (T,), alpha_mass_by_lag (L,)}`. |
 | `collect_te_lag_maps(runner, loader, max_samples=None)` | `pd.DataFrame` | One row per sample: `[guid, epoch, label, te_lag_mean_0 … te_lag_mean_{L-1}, te_lag_argmax]`. |
 | `collect_forecast_errors_per_horizon(runner, loader, max_samples=None)` | `pd.DataFrame` | Long-format per-(sample, horizon step): `[guid, epoch, label, h, mse_step, mse_st, mse_ph]`. |
@@ -241,7 +285,13 @@ These helpers are imported by every class-aware analysis.
 | `plot_attention_mass_by_lag(mass_df, out_path, fs=4, decim=16)` | PDF | Grouped bar chart of mean attention mass in coarse lag bins (0-10s, 10-30s, 30-60s, 60-120s, 120-360s, ≥360s). |
 | `plot_metric_histograms(df, output_dir, ...)` | PDF | Pooled single-column histogram panel (v1 metrics or legacy fallback). |
 | **`plot_metric_histograms_by_class(df, output_dir, ...)`** | PDF | Grid of metric × class subplots when ≤4 classes; overlaid densities when more. Falls back to the pooled plot when <2 classes present. |
-| `plot_latent_distributions(latents, output_dir)` | `latent_distributions.png` |
+| **`plot_band_violin(df, value_col, out_path, *, n_channels_by_band=…)`** | PDF | One violin per band on a single axes; annotated with channel count + sample count. |
+| **`plot_band_violin_by_class(df, value_col, out_path)`** | PDF | Grouped violin: bands on x, classes as colour. Falls back to pooled `plot_band_violin` when <2 classes. |
+| **`plot_band_horizon_error(per_horizon_df, out_path, *, value_col="mse")`** | PDF | Median+IQR ribbon, one line per band, x = horizon step `h`. |
+| **`plot_band_anchor_error(per_anchor_df, out_path, *, value_col="mse", decim_step_seconds=4.0)`** | PDF | Median+IQR ribbon, one line per band, x = anchor position rescaled to minutes. |
+| **`plot_band_horizon_error_by_class(per_horizon_df, out_path)`** | PDF | Grid of subplots — rows = bands, cols = classes, each cell is a horizon-error ribbon. Falls back to pooled when <2 classes. |
+| **`plot_band_anchor_error_by_class(per_anchor_df, out_path, *, decim_step_seconds=4.0)`** | PDF | Same shape as horizon variant but x = anchor in minutes. |
+| `plot_latent_distributions(latents, output_dir)` | `latent_distributions.pdf` |
 | `plot_kld_trajectory`, `plot_kld_guid_trajectory`, `plot_kld_trajectory_3d` | KLD trajectory plots |
 | `plot_latent_trajectory_2d/3d`, `plot_guid_absolute_trajectory`, `plot_guid_trajectory_3d` | Latent trajectory plots |
 | `plot_latent_changepoints_with_raw` | Changepoints overlaid on raw FHR strip |
@@ -324,6 +374,34 @@ pooled `forecast_error_by_horizon.pdf`, and the per-class variants
 `forecast_error_by_horizon_by_class.pdf`,
 `feat_mse_total_hist_by_class.pdf`, `feat_r2_total_hist_by_class.pdf`.
 
+#### `frequency_band_forecast.py` **(new)**
+
+```python
+def run_frequency_band_forecast_analysis(
+    runner, loader, max_samples=500, output_dir=None,
+    *, fhr_phase_min_freq=0.006, fs=4.0, decim_step_seconds=4.0,
+) -> Dict[str, Any]
+```
+
+Channel-sliced version of `forecast_quality.py`. Builds the
+`BandPartition` once, dumps `band_partition.json` and
+`band_channel_map.csv`, then iterates the loader and emits per-sample,
+per-horizon, and per-anchor MSE/R² metrics restricted to each band.
+Outputs `frequency_band_forecast/`:
+
+- `per_sample.csv` — long-format rows `[guid, epoch, label, band, n_channels, mse_total, r2_total]`.
+- `per_horizon.csv` — long-format `[guid, epoch, label, band, h, mse]`.
+- `per_anchor.csv` — long-format `[guid, epoch, label, band, t, mse]` (`t` is absolute anchor index, ≥ warmup).
+- `summary.json` — pooled and per-class mean/median MSE/R² per band.
+- Pooled PDFs: `band_mse_violin.pdf`, `band_r2_violin.pdf`, `band_horizon_error.pdf`, `band_anchor_error.pdf`.
+- Per-class PDFs (only when ≥ 2 classes present): `band_mse_violin_by_class.pdf`, `band_r2_violin_by_class.pdf`, `band_horizon_error_by_class.pdf`, `band_anchor_error_by_class.pdf`.
+
+The anchor x-axis is rescaled to minutes via `decim_step_seconds /
+60` (default `4 s / 60` for the v1 16x decimation at 4 Hz), so the
+band-vs-time plots are directly readable in clinical time. Bands with
+zero channels at runtime (very rare; possible for unusual config
+overrides) are silently dropped from plots.
+
 #### `temporal.py`
 
 ```python
@@ -346,6 +424,21 @@ def run_uplift_analysis(runner, loader, max_samples=500, output_dir=None)
 Outputs `per_sample.csv`, `uplift_histogram.pdf`,
 `uplift_rel_by_class.pdf`. Summary: `{mean_uplift_rel,
 frac_positive_uplift, by_class, n_samples}`.
+
+#### `up_effect.py` **(new)**
+
+```python
+def run_up_effect_analysis(runner, loader, max_samples=1000, output_dir=None, seed=42)
+```
+
+Inference-time UP ablation without retraining. It compares the normal
+source stream against `zero`, `batch_permute`, and `time_shuffle`
+conditions, then measures how forecast error, KLD aggregates, residual
+usage, uplift, attention concentration, and TE lag mass change relative
+to the normal UP run. Positive `forecast_degradation` means the normal
+UP stream improved FHR forecasting compared with that perturbation.
+Outputs `per_sample.csv`, `condition_deltas.csv`,
+`by_class_summary.csv`, `summary.json`, and four condition-wise boxplots.
 
 #### `residual_usage.py`
 
@@ -400,13 +493,19 @@ from `class_separation.py`.
 def run_kld_pca_analysis(runner, loader, max_samples=500, output_dir=None)
 ```
 
-Fits / loads PCA on per-dim KL trajectory, emits:
+Fits / loads PCA on per-dim KL trajectory. The PCA fit can retain all
+latent dimensions, then selects the most contrastive subset using
+eigenvalue-weighted label contrast (or empirical TE contrast in
+`TE_Calculated`). This avoids hard-coding "top 3 PCs by eigenvalue" as
+the only analysis path. Emits:
 - `kld_pca/scree.pdf` — per-component and cumulative explained variance.
 - `kld_pca/pc12_scatter_by_class.pdf` — per-sample PC1×PC2 scatter coloured by class.
+- `kld_pca/selected_pc12_scatter_by_class.pdf` — first two selected PCs
+  after sign alignment.
 - `kld_pca/pc_trajectories_overlay.pdf` — per-class mean PC trajectory vs time with SEM ribbon.
 
-Reuses the `pca_kld/{ev_ratio.json, components.npy, mean.npy}` artifacts
-already written by `collect_metrics` (no refit).
+Reuses the `pca_kld/{ev_ratio.json, selection.json, components.npy,
+mean.npy}` artifacts already written by `collect_metrics` (no refit).
 
 #### `kld_lag_diagnostics.py`
 
@@ -423,11 +522,15 @@ def run_per_class_breakdown(output_root: Path, *, parts=None) -> Dict[str, Any]
 Pure post-processor: reads existing pooled CSVs
 (`histograms/histogram_metrics.csv`,
 `forecast_quality/forecast_per_horizon.csv`,
+`frequency_band_forecast/per_sample.csv`,
 `residual_usage/per_sample.csv`, `attention/argmax_lag_per_sample.csv`,
 `uplift/per_sample.csv`) and writes per-class subfolders
 `per_class_breakdown/class_healthy/`, `class_acidosis/`, `class_hie/`
-plus a `class_overlay/` folder with cross-class overlay plots. Runs
-after all other analyses so the input CSVs exist.
+plus a `class_overlay/` folder with cross-class overlay plots,
+including per-band overlays
+`frequency_band_<band>_<metric>_overlay.pdf` and the headline
+`frequency_band_mse_by_band_overlay.pdf` bar plot. Runs after all
+other analyses so the input CSVs exist.
 
 #### `latent.py`
 
@@ -483,8 +586,8 @@ Unchanged from legacy.
 
 Registers every analysis + `run_all_analyses`. Each analysis runs under
 a shared `_safe(name, fn, ...)` wrapper so a single failure does not
-block the rest. Also registers `run_kld_pca_analysis` and
-`run_per_class_breakdown`.
+block the rest. Also registers `run_up_effect_analysis`,
+`run_kld_pca_analysis`, and `run_per_class_breakdown`.
 
 ### 8. `run_tests.py` — Main entry point + Step 0 probe
 
@@ -503,6 +606,8 @@ def run_full_test_pipeline(
     skip_attention: bool = False,
     skip_forecast_heatmaps: bool = False,
     skip_kld_pca: bool = False,
+    skip_up_effect: bool = False,
+    skip_frequency_band: bool = False,
     skip_per_class_breakdown: bool = False,
     skip_interactive: bool = False,
     analysis_samples: int = 10,
@@ -530,7 +635,8 @@ PROBE_CAP        = min(aggregate_cap, 5000)           # linear probe / latent st
 | Analysis | Cap used | Rationale |
 |---|---|---|
 | `dataset_stats` | no cap (model-agnostic) | cheap, iterates raw loader |
-| `histogram`, `forecast_quality`, `horizon_error`, `anchor_error`, `uplift`, `residual_usage`, `te_lag`, `kld_pca` | `aggregate_cap` | light per-sample memory; we want full coverage |
+| `histogram`, `forecast_quality`, `frequency_band_forecast`, `horizon_error`, `anchor_error`, `uplift`, `residual_usage`, `te_lag`, `kld_pca` | `aggregate_cap` | light per-sample memory; we want full coverage |
+| `up_effect` | `min(aggregate_cap, 1000)` | reruns forward passes under multiple UP perturbations; bounded by default |
 | `attention` | `HEAVY_ATTN_CAP=2000` | `(T,L)+(T,M)+(L,)` per sample ≈ 750 KB |
 | `encoder_probe` | `PROBE_CAP=5000` | linear probe stable at 5K |
 | `latent_distribution` | `PROBE_CAP=5000` | per-dim histograms stable at 5K |
@@ -601,23 +707,25 @@ directly — it does **not** iterate the loader.
 1. `dataset_stats`
 2. `histogram`
 3. `forecast_quality`
+3b. `frequency_band_forecast` *(gated by `skip_frequency_band`)*
 4. `horizon_error`
 5. `anchor_error`
 6. `uplift`
-7. `residual_usage`
-8. `attention` *(gated by `skip_attention`)*
-9. `te_lag` *(gated by `skip_attention`)*
-10. `encoder_probe`
-11. `latent_distribution`
-12. `latent_space`
-13. **`class_separation`** *(consumes probe data, no loader pass)*
-14. `trajectory` *(gated by `skip_trajectory`, uses GUID loader)*
-15. `sample_diagnostics` *(gated by `skip_forecast_heatmaps`)*
-16. `kld_lag_diagnostics` *(gated by `skip_forecast_heatmaps`)*
-17. `kld_pca` *(gated by `skip_kld_pca`)*
-18. `per_class_breakdown` *(gated by `skip_per_class_breakdown`, post-processor)*
-19. `metrics_comparison_interactive` *(gated by `skip_interactive`)*
-20. `_save_summary` → `test_summary.json`
+7. `up_effect` *(gated by `skip_up_effect`)*
+8. `residual_usage`
+9. `attention` *(gated by `skip_attention`)*
+10. `te_lag` *(gated by `skip_attention`)*
+11. `encoder_probe`
+12. `latent_distribution`
+13. `latent_space`
+14. **`class_separation`** *(consumes probe data, no loader pass)*
+15. `trajectory` *(gated by `skip_trajectory`, uses GUID loader)*
+16. `sample_diagnostics` *(gated by `skip_forecast_heatmaps`)*
+17. `kld_lag_diagnostics` *(gated by `skip_forecast_heatmaps`)*
+18. `kld_pca` *(gated by `skip_kld_pca`)*
+19. `per_class_breakdown` *(gated by `skip_per_class_breakdown`, post-processor)*
+20. `metrics_comparison_interactive` *(gated by `skip_interactive`)*
+21. `_save_summary` -> `test_summary.json`
 
 Both `stat_path` and `stats_path` spellings of the stats HDF5 path are
 accepted (the v1 config uses `stat_path`).
@@ -638,13 +746,16 @@ is available as a fast-path that skips slow analyses.
 | File | Contents |
 |------|----------|
 | `te_data_loader.py` | IDTxl CSV loader, `fuzzy_time_match` ±300s matching. |
-| `te_kld_analysis.py` | `load_kld_from_metrics_csv` (now carries through `kld_pc*`, `posterior_drift_norm`, `attention_entropy_mean`, `te_lag_total_mass`, `delta_src_norm`, `label`), `merge_te_kld`, correlation + bootstrap + concordance helpers, **new `pca_trajectory(df, mode='pc1'|'l2_top3'|'sum_top3')`**, **new `run_te_kld_pipeline_stratified(merged_df, output_dir, pipeline_fn, ...)`** that runs an existing pipeline once per class subset into `te_kld_class_healthy/`, `te_kld_class_acidosis/`, `te_kld_class_hie/`, plus pooled `te_kld_class_all/`. |
-| `te_kld_comparison.py` | `run_comparison(...)` orchestrator plus **six new helpers**: `cross_correlation_per_guid`, `bland_altman`, `roc_auc_high_te`, `per_guid_regression`, `conditional_ks_by_quartile`, `per_guid_r2`, and `run_pca_vs_dims_comparison(merged, output_dir)` that ranks every TE surrogate by Pearson / Spearman / Kendall / MI against `ite_valid`. |
+| `te_kld_analysis.py` | `load_kld_from_metrics_csv` carries through `kld_sum`, `kld_l2`, selected PCA aggregates, dynamic `kld_pc*`, posterior drift, attention, TE-lag, residual, and label columns. `pca_trajectory` supports legacy top-3 modes plus `l2_selected`, `abs_sum_selected`, `signed_sum_selected`, and TE-selected variants. `run_te_kld_pipeline_stratified(...)` runs an existing pipeline once per class subset into `te_kld_class_healthy/`, `te_kld_class_acidosis/`, `te_kld_class_hie/`, plus pooled `te_kld_class_all/`. |
+| `te_kld_comparison.py` | `run_comparison(...)` orchestrator plus helpers: `cross_correlation_per_guid`, `bland_altman`, `roc_auc_high_te`, `per_guid_regression`, `conditional_ks_by_quartile`, `per_guid_r2`, `_add_te_selected_pca_scores`, and `run_pca_vs_dims_comparison(merged, output_dir)` that ranks every TE surrogate by Pearson / Spearman / Kendall / MI against `ite_valid`. |
 | `te_kld_visualizations.py` | Pooled scatter, per-GUID histograms, DTW overlays, correlation heatmaps, **five new plotters**: `plot_xcorr_lag_hist`, `plot_bland_altman`, `plot_roc_curve`, `plot_per_guid_slope_hist`, `plot_conditional_ks_grid`. |
 | `te_dtw.py` | Per-GUID DTW alignment (Sakoe-Chiba band). |
 
 `load_kld_from_metrics_csv` requires `kld` (mandatory) and silently
-pulls through all v1 TE-surrogate columns if present.
+pulls through all v1 TE-surrogate columns if present. The TE comparison
+path now evaluates raw KLD mean, additive KLD sum, KLD vector L2,
+all available `kld_pcN` columns, label-selected PCA aggregates, and
+empirical-TE-selected PCA aggregates.
 
 ---
 
@@ -668,6 +779,8 @@ hist = results["histogram"]
 print(f"feat_mse_total: {hist['feat_mse_total'].mean():.6f}")
 print(f"uplift_rel:     {hist['uplift_rel'].mean():.4f}")
 print(f"kld_mean:       {hist['kld_mean'].mean():.4f}")
+print(f"kld_sum:        {hist['kld_sum'].mean():.4f}")
+print(f"kld_l2:         {hist['kld_l2'].mean():.4f}")
 
 probe = results["loader_probe"]
 print(f"Files seen:  {probe['per_file_counts']}")
@@ -694,6 +807,7 @@ from testing import TestRunner
 from testing.analyses import (
     run_histogram_analysis,
     run_forecast_quality_analysis,
+    run_frequency_band_forecast_analysis,
     run_attention_diagnostics,
     run_trajectory_analysis,
     run_kld_pca_analysis,
@@ -717,6 +831,7 @@ _, guid_loader = build_guid_filtered_dataloader([...], min_samples=10,
 
 run_histogram_analysis(runner, standard_loader, max_samples=None)
 run_forecast_quality_analysis(runner, standard_loader, max_samples=None)
+run_frequency_band_forecast_analysis(runner, standard_loader, max_samples=None)
 run_attention_diagnostics(runner, standard_loader, max_samples=2000)
 run_kld_pca_analysis(runner, standard_loader, max_samples=None)
 run_trajectory_analysis(runner, guid_loader, time_range_hours=12.0)
@@ -730,6 +845,7 @@ run_per_class_breakdown(runner.output_dir)
 | Module | External dependencies |
 |--------|----------------------|
 | `base.py` | `train.graph_models_utils.load_checkpoint_strict`, `model.vae_teb_prediction.model.vae_teb_lag_attn_v1.SeqVaeLagAttnV1`, `yaml` |
+| `band_partition.py` | `hdf5_dataset.kymatio_phase_scattering.KymatioPhaseScattering1D`, `numpy`, `pandas`, `torch` |
 | `metrics.py` | `torch`, `scipy.signal` (Savitzky-Golay), `sklearn.decomposition.PCA`, `sklearn.manifold` (t-SNE/Isomap), `umap-learn` (optional) |
 | `collectors.py` | `pandas`, `numpy`, `torch`, `sklearn.decomposition.PCA` (via metrics) |
 | `visualizers.py` | `matplotlib`, `scipy.stats` |
@@ -791,12 +907,13 @@ output_dir/
 │   ├── dataset_statistics.json
 │   └── *.csv
 ├── histograms/
-│   ├── histogram_metrics.csv                   # Also carries `kld` alias + all v1 TE surrogates
+│   ├── histogram_metrics.csv                   # Carries `kld` alias, KLD sum/L2, selected PCA, TE surrogates
 │   ├── histogram_metadata.json
 │   ├── metrics_histograms.pdf
 │   └── metrics_histograms_by_class.pdf
 ├── pca_kld/                                    # Written by collect_metrics (v1)
 │   ├── ev_ratio.json
+│   ├── selection.json
 │   ├── components.npy
 │   └── mean.npy
 ├── forecast_quality/
@@ -808,6 +925,21 @@ output_dir/
 │   ├── feat_mse_total_hist_by_class.pdf
 │   ├── feat_r2_total_hist.pdf
 │   └── feat_r2_total_hist_by_class.pdf
+├── frequency_band_forecast/
+│   ├── band_partition.json
+│   ├── band_channel_map.csv
+│   ├── per_sample.csv
+│   ├── per_horizon.csv
+│   ├── per_anchor.csv
+│   ├── summary.json
+│   ├── band_mse_violin.pdf
+│   ├── band_r2_violin.pdf
+│   ├── band_horizon_error.pdf
+│   ├── band_anchor_error.pdf
+│   ├── band_mse_violin_by_class.pdf
+│   ├── band_r2_violin_by_class.pdf
+│   ├── band_horizon_error_by_class.pdf
+│   └── band_anchor_error_by_class.pdf
 ├── horizon_error/
 │   ├── horizon_error.csv
 │   ├── forecast_errors_per_horizon.csv
@@ -821,6 +953,15 @@ output_dir/
 │   ├── per_sample.csv
 │   ├── uplift_histogram.pdf
 │   └── uplift_rel_by_class.pdf
+├── up_effect/
+│   ├── per_sample.csv
+│   ├── condition_deltas.csv
+│   ├── by_class_summary.csv
+│   ├── summary.json
+│   ├── forecast_degradation_by_condition.pdf
+│   ├── kld_sum_drop_by_condition.pdf
+│   ├── uplift_rel_drop_by_condition.pdf
+│   └── residual_ratio_drop_by_condition.pdf
 ├── residual_usage/
 │   ├── per_sample.csv
 │   ├── per_sample_trace.csv
@@ -850,10 +991,11 @@ output_dir/
 ├── kld_pca/
 │   ├── scree.pdf
 │   ├── pc12_scatter_by_class.pdf
+│   ├── selected_pc12_scatter_by_class.pdf
 │   ├── pc_trajectories_overlay.pdf
 │   └── kld_pc_trajectory.csv
 ├── latent_distribution/
-│   └── latent_distributions.png
+│   └── latent_distributions.pdf
 ├── latent_space/
 │   └── latent_space_3d.html
 ├── class_separation/
@@ -871,13 +1013,17 @@ output_dir/
 │   ├── <guid>_<epoch>.pdf
 │   └── sample_metrics.csv
 ├── kld_lag_diag/
-│   └── <guid>_<epoch>.pdf
+│   ├── <guid>_<epoch>_signals_kld.pdf
+│   ├── <guid>_<epoch>_signals_kld_pca.pdf
+│   ├── <guid>_<epoch>_lag_attention.pdf
+│   └── sample_kld_lag_summary.csv
 ├── per_class_breakdown/
 │   ├── class_healthy/
 │   │   ├── histogram_metrics.csv
 │   │   ├── metrics_histograms.pdf
 │   │   ├── forecast_per_horizon.csv
 │   │   ├── forecast_error_by_horizon.pdf
+│   │   ├── frequency_band_per_sample.csv
 │   │   ├── residual_per_sample.csv
 │   │   ├── delta_norm_trace.pdf
 │   │   └── ...
@@ -886,6 +1032,9 @@ output_dir/
 │   └── class_overlay/
 │       ├── feat_mse_total_overlay.pdf
 │       ├── forecast_mse_step_overlay.pdf
+│       ├── frequency_band_mse_by_band_overlay.pdf
+│       ├── frequency_band_<band>_mse_total_overlay.pdf
+│       ├── frequency_band_<band>_r2_total_overlay.pdf
 │       ├── residual_residual_ratio_overlay.pdf
 │       └── ...
 ├── metrics_comparison.html
@@ -930,6 +1079,7 @@ flowchart TB
         D6[compute_kld*]
         D7[compute_posterior_drift]
         D8[fit_pca_kld_per_dim]
+        D9[select_pca_components]
     end
 
     subgraph Collectors["Collectors Layer"]
@@ -945,17 +1095,19 @@ flowchart TB
     subgraph Analyses["Analyses"]
         G1[histogram]
         G2[forecast_quality]
+        G2b[frequency_band_forecast]
         G3[temporal horizon + anchor]
         G4[uplift]
-        G5[residual_usage]
-        G6[attention_diagnostics]
-        G7[te_lag_analysis]
-        G8[encoder_probe]
-        G9[latent + class_separation]
-        G10[trajectory]
-        G11[sample_diagnostics + kld_lag_diag]
-        G12[kld_pca]
-        G13[per_class_breakdown]
+        G5[up_effect]
+        G6[residual_usage]
+        G7[attention_diagnostics]
+        G8[te_lag_analysis]
+        G9[encoder_probe]
+        G10[latent + class_separation]
+        G11[trajectory]
+        G12[sample_diagnostics + kld_lag_diag]
+        G13[kld_pca]
+        G14[per_class_breakdown]
     end
 
     subgraph Viz["Visualizers"]
@@ -971,21 +1123,22 @@ flowchart TB
     B --> C1
     B --> C2
     C1 --> P1 & P2 & P3 & P4
-    P2 & P3 --> G9
+    P2 & P3 --> G10
     C1 --> E1 & E2 & E3 & E4 & E5 & E6 & E7
-    C2 --> G10
-    E1 & E2 --> D1 & D2 & D3 & D6 & D7 & D8
+    C2 --> G11
+    E1 & E2 --> D1 & D2 & D3 & D6 & D7 & D8 & D9
     E4 --> D4
     E5 --> D5
-    E1 --> G1 & G4 & G5 & G12
-    E2 --> G2 & G3 & G11
-    E4 --> G6
-    E5 --> G7
-    E3 --> G8 & G9
-    G1 & G2 & G3 & G4 & G5 & G6 & G7 & G8 & G9 & G10 & G12 --> F1
+    E1 --> G1 & G4 & G6 & G13
+    E2 --> G2 & G3 & G12
+    C1 --> G5 & G2b
+    E4 --> G7
+    E5 --> G8
+    E3 --> G9 & G10
+    G1 & G2 & G2b & G3 & G4 & G5 & G6 & G7 & G8 & G9 & G10 & G11 & G13 --> F1
     G1 --> F2
-    G11 --> F3
-    G1 & G2 & G3 & G4 & G5 & G6 --> G13
+    G12 --> F3
+    G1 & G2 & G2b & G3 & G4 & G6 & G7 --> G14
 ```
 
 ---
@@ -1011,17 +1164,21 @@ flowchart LR
     end
 
     MF & YP --> FC[compute_forecast_metrics]
+    MF & YP --> FCB[compute_band_forecast_metrics]
     MF & MB & YP --> UP[compute_uplift_metrics]
     DS & MF --> RU[compute_residual_usage]
     AT --> AD[compute_attention_diagnostics]
     TL --> TA[aggregate_te_lag_map]
     MP & LV --> KL[compute_kld*]
     MP --> PD[compute_posterior_drift]
+    KL --> AGG[KLD mean / sum / L2]
     KL --> PCA[fit_pca_kld_per_dim]
+    PCA --> SEL[select_pca_components]
     ZZ & TS --> EP[encoder_probe / class_separation]
 
-    FC & UP & RU & KL & PD & AD & TA & PCA --> DF[DataFrame\nhistogram_metrics.csv]
-    DF --> PCB[per_class_breakdown]
+    FC & UP & RU & AGG & KL & PD & AD & TA & PCA & SEL --> DF[DataFrame\nhistogram_metrics.csv]
+    FCB --> BAND_DF[DataFrame\nfrequency_band_forecast/per_sample.csv]
+    DF & BAND_DF --> PCB[per_class_breakdown]
 ```
 
 ---
@@ -1031,11 +1188,14 @@ flowchart LR
 - `histograms/histogram_metrics.csv` still carries `guid`, `epoch`, and
   a `kld` column (aliased to `kld_mean`), so
   `TE_Calculated/te_kld_analysis.py::load_kld_from_metrics_csv` keeps
-  working unchanged. New TE-surrogate columns are additive.
+  working unchanged. New TE-surrogate columns are additive, including
+  `kld_sum`, `kld_l2`, selected PCA aggregates, TE-selected PCA
+  aggregates, posterior drift, attention concentration, and TE lag mass.
 - `trajectory/kld_trajectory.csv` (from `collect_kld_trajectory`)
   retains `[guid, epoch, hours_before, label, timestep, kld_mean,
-  latent_0 … latent_{d_z-1}]`. `kld_pc1_t/…/kld_pc3_t` columns are
-  added only when a `pca_model` is supplied.
+  latent_0 … latent_{d_z-1}]`. `kld_dim_mean_t`, `kld_sum_t`, and
+  `kld_l2_t` are additive columns. `kld_pc*_t` columns are added only
+  when a `pca_model` is supplied.
 - `latent_distribution/`, `latent_space/`, `class_separation/`,
   `trajectory/`, and `dataset_stats/` output layouts are unchanged.
 
@@ -1058,6 +1218,10 @@ signals:
   fallen through.
 - `attention.median_argmax_lag` should not sit uniformly at lag 0 on a
   trained checkpoint.
+- `frequency_band_forecast/summary.json` `by_band` should show the
+  expected ordering: variability and beat-to-beat bands typically have
+  lower MSE than deceleration; deceleration band is the clinically
+  most informative slice for uplift/source-information attribution.
 - `forecast_quality.mean_r2` is the headline number. Untrained models
   give `residual_ratio ≈ 0`, `uplift_rel ≈ 0`, `r2 ≈ 0` because
   `delta_mu_src` is zero-initialised (see
@@ -1086,13 +1250,13 @@ signals:
 
 | Property | Value |
 |----------|-------|
-| Core modules | 8 (`base`, `metrics`, `collectors`, `visualizers`, `visualizers_interactive`, `plot_single_samples`, `trajectory_analysis`, `run_tests`) |
-| Analysis modules | 17 (`dataset_stats`, `histogram`, `forecast_quality`, `temporal`, `uplift`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`, `latent`, `trajectory`, `class_separation`, `compare_trajectory_classes`, `qualitative`, plus helpers `changepoint` and `significance_tests`) |
-| Lag-attn v1 analyses | 9 (`forecast_quality`, `uplift`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`) |
+| Core modules | 9 (`base`, `band_partition`, `metrics`, `collectors`, `visualizers`, `visualizers_interactive`, `plot_single_samples`, `trajectory_analysis`, `run_tests`) |
+| Analysis modules | 19 (`dataset_stats`, `histogram`, `forecast_quality`, `frequency_band_forecast`, `temporal`, `uplift`, `up_effect`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`, `latent`, `trajectory`, `class_separation`, `compare_trajectory_classes`, `qualitative`, plus helpers `changepoint` and `significance_tests`) |
+| Lag-attn v1 analyses | 11 (`forecast_quality`, `frequency_band_forecast`, `uplift`, `up_effect`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`) |
 | Step 0 probe | single loader pass, z_mean capture, loader_probe.json |
-| Visualizer primitives (v1-new) | 8 (`plot_feature_forecast_heatmap`, `plot_forecast_error_by_horizon`, `plot_uplift_histogram`, `plot_residual_usage_trace`, `plot_lag_attention_heatmap`, `plot_te_lag_distribution`, `plot_attention_mass_by_lag`, `plot_metric_histograms_by_class`) |
-| TE-surrogate metric helpers | 3 (`compute_posterior_drift`, `fit_pca_kld_per_dim`, `project_kld_per_dim`) |
-| TE_Calculated comparison helpers (new) | 7 (`cross_correlation_per_guid`, `bland_altman`, `roc_auc_high_te`, `per_guid_regression`, `conditional_ks_by_quartile`, `per_guid_r2`, `run_pca_vs_dims_comparison`), plus `pca_trajectory` and `run_te_kld_pipeline_stratified` in `te_kld_analysis`, and 5 new plotters in `te_kld_visualizations`. |
+| Visualizer primitives (v1-new) | 14 (`plot_feature_forecast_heatmap`, `plot_forecast_error_by_horizon`, `plot_uplift_histogram`, `plot_residual_usage_trace`, `plot_lag_attention_heatmap`, `plot_te_lag_distribution`, `plot_attention_mass_by_lag`, `plot_metric_histograms_by_class`, `plot_band_violin`, `plot_band_violin_by_class`, `plot_band_horizon_error`, `plot_band_anchor_error`, `plot_band_horizon_error_by_class`, `plot_band_anchor_error_by_class`) |
+| TE-surrogate metric helpers | 7 (`compute_posterior_drift`, `compute_kld_aggregate_tensors`, `compute_kld_aggregates_per_sample`, `fit_pca_kld_per_dim`, `project_kld_per_dim`, `select_pca_components`, `aggregate_selected_pca_scores`) |
+| TE_Calculated comparison helpers (new) | 8 (`cross_correlation_per_guid`, `bland_altman`, `roc_auc_high_te`, `per_guid_regression`, `conditional_ks_by_quartile`, `per_guid_r2`, `_add_te_selected_pca_scores`, `run_pca_vs_dims_comparison`), plus extended `pca_trajectory` and `run_te_kld_pipeline_stratified` in `te_kld_analysis`, and 5 new plotters in `te_kld_visualizations`. |
 | Removed | `aggregate_predictions`, `plot_reconstruction_sample`, `plot_temporal_accuracy`, `plot_within_window_accuracy`, all coherence plots, `plot_reconstruction_interactive`, `analyses/coherence.py` |
 | Forecast target | 87-channel future FHR feature trajectory (scattering + phase) over the valid anchor range `[warmup, T−H_d)` |
 | Latent dim | 24 (v1 default) |

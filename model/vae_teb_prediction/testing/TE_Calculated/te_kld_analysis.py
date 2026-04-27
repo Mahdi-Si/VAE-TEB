@@ -1154,6 +1154,8 @@ def per_dimension_kl_analysis(
 # when the columns exist in the merged dataframe.
 CANDIDATE_KLD_COLS: Sequence[str] = (
     "kld",
+    "kld_sum",
+    "kld_l2",
     "kld_max",
     "feat_mse_total",
     "uplift_abs",
@@ -1164,6 +1166,12 @@ CANDIDATE_KLD_COLS: Sequence[str] = (
     "kld_pc2",
     "kld_pc3",
     "kld_pca_l2_top3",
+    "kld_pca_l2_selected",
+    "kld_pca_abs_sum_selected",
+    "kld_pca_signed_sum_selected",
+    "kld_pca_l2_te_selected",
+    "kld_pca_abs_sum_te_selected",
+    "kld_pca_signed_sum_te_selected",
     "posterior_drift_norm",
     "attention_concentration_mean",
     "attention_entropy_mean",
@@ -1400,14 +1408,44 @@ def pca_trajectory(
             contains the ``kld_pc*`` columns.
         mode: One of:
             * ``"pc1"``   — use the first principal component as the score.
-            * ``"l2_top3"`` — Euclidean norm of the top-3 components.
-            * ``"sum_top3"`` — signed sum of the top-3 components.
+            * ``"l2_top3"`` — Euclidean norm of the legacy top-3 components.
+            * ``"sum_top3"`` — signed sum of the legacy top-3 components.
+            * ``"l2_selected"`` — Euclidean norm of contrast-selected PCs.
+            * ``"abs_sum_selected"`` — absolute sum of contrast-selected PCs.
+            * ``"signed_sum_selected"`` — sign-aligned sum of selected PCs.
 
     Returns:
         Pandas Series of the chosen score, indexed identically to ``df``.
         The series is filled with NaN when the required columns are not
         present (callers should ``dropna`` before using it).
     """
+    direct_col = {
+        "l2_selected": "kld_pca_l2_selected",
+        "abs_sum_selected": "kld_pca_abs_sum_selected",
+        "signed_sum_selected": "kld_pca_signed_sum_selected",
+        "l2_te_selected": "kld_pca_l2_te_selected",
+        "abs_sum_te_selected": "kld_pca_abs_sum_te_selected",
+        "signed_sum_te_selected": "kld_pca_signed_sum_te_selected",
+    }.get(mode)
+    if direct_col is not None and direct_col in df.columns:
+        return pd.Series(df[direct_col].to_numpy(dtype=float), index=df.index, name=direct_col)
+
+    if mode in {"l2_selected", "abs_sum_selected", "signed_sum_selected"}:
+        selected_cols = sorted(
+            (c for c in df.columns if c.startswith("kld_pc_selected_") and not c.endswith("_source_pc")),
+            key=lambda c: int(c.rsplit("_", 1)[-1]),
+        )
+        if not selected_cols:
+            return pd.Series(np.nan, index=df.index, name=f"kld_pca_{mode}")
+        arr_sel = df[selected_cols].to_numpy(dtype=float)
+        if mode == "l2_selected":
+            out_sel = np.sqrt(np.nansum(arr_sel ** 2, axis=1))
+        elif mode == "abs_sum_selected":
+            out_sel = np.nansum(np.abs(arr_sel), axis=1)
+        else:
+            out_sel = np.nansum(arr_sel, axis=1)
+        return pd.Series(out_sel, index=df.index, name=f"kld_pca_{mode}")
+
     cols = [c for c in ("kld_pc1", "kld_pc2", "kld_pc3") if c in df.columns]
     if not cols:
         return pd.Series(np.nan, index=df.index, name=f"kld_pca_{mode}")
@@ -1422,7 +1460,8 @@ def pca_trajectory(
     else:
         raise ValueError(
             f"Unknown pca_trajectory mode: {mode!r}. "
-            "Use one of 'pc1', 'l2_top3', 'sum_top3'."
+            "Use one of 'pc1', 'l2_top3', 'sum_top3', "
+            "'l2_selected', 'abs_sum_selected', 'signed_sum_selected'."
         )
     return pd.Series(out, index=df.index, name=f"kld_pca_{mode}")
 

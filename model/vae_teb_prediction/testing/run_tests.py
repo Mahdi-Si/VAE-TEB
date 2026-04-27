@@ -38,6 +38,7 @@ from model.vae_teb_prediction.testing.analyses import (
     run_dataset_stats_analysis,
     run_encoder_probe,
     run_forecast_quality_analysis,
+    run_frequency_band_forecast_analysis,
     run_histogram_analysis,
     run_horizon_error_profile,
     run_kld_lag_diagnostics,
@@ -49,6 +50,7 @@ from model.vae_teb_prediction.testing.analyses import (
     run_sample_diagnostics,
     run_te_lag_class_analysis,
     run_trajectory_analysis,
+    run_up_effect_analysis,
     run_uplift_analysis,
 )
 from model.vae_teb_prediction.testing.base import TestRunner
@@ -84,6 +86,8 @@ def run_full_test_pipeline(
     max_guids: Optional[int] = None,
     normalize_fields: Optional[Sequence[str]] = None,
     dataset_kwargs: Optional[Dict[str, Any]] = None,
+    skip_up_effect: bool = False,
+    skip_frequency_band: bool = False,
 ) -> Dict[str, Any]:
     """Run the full lag-attn v1 testing pipeline end-to-end.
 
@@ -113,6 +117,9 @@ def run_full_test_pipeline(
         skip_attention: Skip attention + TE lag class analyses.
         skip_forecast_heatmaps: Skip the per-sample diagnostic PDFs.
         skip_kld_pca: Skip the per-dim KL PCA analysis.
+        skip_up_effect: Skip inference-time UP perturbation tests.
+        skip_frequency_band: Skip the frequency-band-stratified forecast
+            quality analysis.
         skip_per_class_breakdown: Skip the per-class CSV/plot breakdown
             (a pure post-processor over the pooled CSVs).
         skip_interactive: Skip Plotly interactive plots.
@@ -483,6 +490,17 @@ def run_full_test_pipeline(
         runner, standard_loader, aggregate_cap,
     )
 
+    # 3b. Frequency-band-stratified forecast quality. Runs immediately
+    # after the headline forecast quality step so the per-class
+    # breakdown post-processor at the end of the pipeline can pick up
+    # ``frequency_band_forecast/per_sample.csv``.
+    if not skip_frequency_band:
+        _step(
+            "frequency_band_forecast",
+            run_frequency_band_forecast_analysis,
+            runner, standard_loader, aggregate_cap,
+        )
+
     # 4. Horizon error profile.
     _step(
         "horizon_error",
@@ -504,14 +522,22 @@ def run_full_test_pipeline(
         runner, standard_loader, aggregate_cap,
     )
 
-    # 7. Residual usage.
+    # 7. UP perturbation effect (no-retrain source ablation).
+    if not skip_up_effect:
+        _step(
+            "up_effect",
+            run_up_effect_analysis,
+            runner, standard_loader, min(aggregate_cap, 1000),
+        )
+
+    # 8. Residual usage.
     _step(
         "residual_usage",
         run_residual_usage_analysis,
         runner, standard_loader, aggregate_cap,
     )
 
-    # 8-9. Attention + TE lag class (gated).
+    # 9-10. Attention + TE lag class (gated).
     if not skip_attention:
         # Capped: collect_attention_maps retains per-anchor (T,L), (T,M),
         # (L,) numpy arrays per sample (~750 KB each). 2 000 samples is
@@ -982,6 +1008,10 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
             if "residual_ratio" in hist.columns else None,
             "kld_mean": float(hist["kld_mean"].mean())
             if "kld_mean" in hist.columns else None,
+            "kld_sum_mean": float(hist["kld_sum"].mean())
+            if "kld_sum" in hist.columns else None,
+            "kld_l2_mean": float(hist["kld_l2"].mean())
+            if "kld_l2" in hist.columns else None,
         }
 
     if isinstance(results.get("attention"), dict):
@@ -994,6 +1024,12 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
         summary["residual_usage"] = {
             k: v for k, v in results["residual_usage"].items()
             if isinstance(v, (int, float))
+        }
+
+    if isinstance(results.get("up_effect"), dict):
+        summary["up_effect"] = {
+            k: v for k, v in results["up_effect"].items()
+            if isinstance(v, (int, float, str))
         }
 
     if isinstance(results.get("dataset_stats"), dict):

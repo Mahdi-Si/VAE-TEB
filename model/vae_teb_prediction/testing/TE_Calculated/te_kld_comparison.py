@@ -245,6 +245,12 @@ def run_comparison(
     )
     mi_value = mutual_information_knn(x[mask], y[mask], k=3)
 
+    # When all PCA component columns are available, add empirical-TE-selected
+    # PCA aggregates before building the multi-measure correlation matrices.
+    merged_df = _add_te_selected_pca_scores(
+        merged_df, te_col="ite_valid", n_select=3
+    )
+
     corr_sp = correlation_matrix(merged_df, method="spearman")
     corr_ke = correlation_matrix(merged_df, method="kendall")
     correlation_matrices = {
@@ -399,20 +405,6 @@ def run_comparison(
     # ------------------------------------------------------------------
     extra_comparisons: Dict[str, Dict[str, Any]] = {}
     try:
-        extra_score_cols = ["kld"]
-        if {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns):
-            extra_score_cols.append("kld_pca_l2_top3")   # synth by run_pca_vs_dims_comparison
-            extra_score_cols.append("kld_pc1")
-        for opt_col in (
-            "posterior_drift_norm", "attention_concentration_mean",
-            "te_lag_total_mass",
-        ):
-            if opt_col in merged_df.columns:
-                extra_score_cols.append(opt_col)
-
-        # ``kld_pca_l2_top3`` is synthesised by
-        # ``run_pca_vs_dims_comparison`` above; mirror it here so the
-        # extended comparisons can use it too.
         if (
             "kld_pca_l2_top3" not in merged_df.columns
             and {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns)
@@ -421,6 +413,31 @@ def run_comparison(
                 pca_trajectory as _pca_traj,
             )
             merged_df["kld_pca_l2_top3"] = _pca_traj(merged_df, "l2_top3")
+        merged_df = _add_te_selected_pca_scores(
+            merged_df, te_col="ite_valid", n_select=3
+        )
+
+        extra_score_cols = ["kld"]
+        if {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns):
+            extra_score_cols.append("kld_pca_l2_top3")
+            extra_score_cols.append("kld_pc1")
+        for opt_col in (
+            "kld_sum", "kld_l2",
+            "kld_pca_l2_selected",
+            "kld_pca_abs_sum_selected",
+            "kld_pca_signed_sum_selected",
+            "kld_pca_l2_te_selected",
+            "kld_pca_abs_sum_te_selected",
+            "kld_pca_signed_sum_te_selected",
+        ):
+            if opt_col in merged_df.columns:
+                extra_score_cols.append(opt_col)
+        for opt_col in (
+            "posterior_drift_norm", "attention_concentration_mean",
+            "te_lag_total_mass",
+        ):
+            if opt_col in merged_df.columns:
+                extra_score_cols.append(opt_col)
 
         from model.vae_teb_prediction.testing.TE_Calculated.te_kld_visualizations import (  # noqa: E501
             plot_bland_altman,
@@ -565,6 +582,22 @@ def run_comparison(
                 f"  KLD PCA L2(top-3):   rho={row['spearman_rho']:.4f}, "
                 f"pearson_r={row['pearson_r']:.4f}"
             )
+        if "kld_pca_l2_selected" in pca_vs_dims_df["surrogate"].values:
+            row = pca_vs_dims_df[
+                pca_vs_dims_df["surrogate"] == "kld_pca_l2_selected"
+            ].iloc[0]
+            logger.info(
+                f"  KLD PCA L2(selected): rho={row['spearman_rho']:.4f}, "
+                f"pearson_r={row['pearson_r']:.4f}"
+            )
+        if "kld_pca_l2_te_selected" in pca_vs_dims_df["surrogate"].values:
+            row = pca_vs_dims_df[
+                pca_vs_dims_df["surrogate"] == "kld_pca_l2_te_selected"
+            ].iloc[0]
+            logger.info(
+                f"  KLD PCA L2(TE-selected): rho={row['spearman_rho']:.4f}, "
+                f"pearson_r={row['pearson_r']:.4f}"
+            )
     logger.info(f"  Results saved to: {output_dir_path}")
 
     return {
@@ -609,6 +642,60 @@ def _finite_pair(x: Any, y: Any) -> "tuple[np.ndarray, np.ndarray]":
     arr_y = np.asarray(y, dtype=float).ravel()
     mask = np.isfinite(arr_x) & np.isfinite(arr_y)
     return arr_x[mask], arr_y[mask]
+
+
+def _sorted_pc_columns(df: pd.DataFrame) -> list[str]:
+    """Return ``kld_pcN`` columns sorted by N, excluding selected-PC aliases."""
+    cols = []
+    for col in df.columns:
+        if not col.startswith("kld_pc") or col.startswith("kld_pc_selected_"):
+            continue
+        tail = col.replace("kld_pc", "", 1)
+        if tail.isdigit():
+            cols.append(col)
+    return sorted(cols, key=lambda c: int(c.replace("kld_pc", "", 1)))
+
+
+def _add_te_selected_pca_scores(
+    df: pd.DataFrame,
+    *,
+    te_col: str,
+    n_select: int = 3,
+) -> pd.DataFrame:
+    """Synthesize PCA aggregates selected by empirical-TE association.
+
+    The score is ``var(PC score) * abs(Spearman(PC, TE))``. PCA score variance
+    is proportional to the eigenvalue, so this keeps the selected PCs tied to
+    both eigenvalues and empirical TE contrast.
+    """
+    pc_cols = _sorted_pc_columns(df)
+    if not pc_cols or te_col not in df.columns:
+        return df
+    arr = df[pc_cols].to_numpy(dtype=float)
+    te = df[te_col].to_numpy(dtype=float)
+    scores = np.zeros(len(pc_cols), dtype=float)
+    signs = np.ones(len(pc_cols), dtype=float)
+    for i in range(len(pc_cols)):
+        x, y = _finite_pair(arr[:, i], te)
+        if x.size < 8 or np.std(x) == 0 or np.std(y) == 0:
+            continue
+        rho = _sp_stats.spearmanr(x, y).statistic
+        pear = np.corrcoef(x, y)[0, 1]
+        scores[i] = float(np.nanvar(x)) * abs(float(rho))
+        signs[i] = 1.0 if pear >= 0 else -1.0
+    if not np.any(scores > 0):
+        return df
+    idx = np.argsort(scores)[::-1][: max(1, min(int(n_select), len(pc_cols)))]
+    selected = arr[:, idx]
+    signed = selected * signs[idx][None, :]
+    df = df.copy()
+    df["kld_pca_l2_te_selected"] = np.sqrt(np.nansum(selected ** 2, axis=1))
+    df["kld_pca_abs_sum_te_selected"] = np.nansum(np.abs(selected), axis=1)
+    df["kld_pca_signed_sum_te_selected"] = np.nansum(signed, axis=1)
+    df["kld_pca_te_selected_source_pcs"] = ",".join(
+        str(int(i) + 1) for i in idx
+    )
+    return df
 
 
 def cross_correlation_per_guid(
@@ -902,12 +989,19 @@ def run_pca_vs_dims_comparison(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if candidate_scores is None:
+        dynamic_pc_cols = tuple(_sorted_pc_columns(merged))
         candidate_scores = (
             "kld",
-            "kld_pc1",
-            "kld_pc2",
-            "kld_pc3",
+            "kld_sum",
+            "kld_l2",
+            *dynamic_pc_cols,
             "kld_pca_l2_top3",
+            "kld_pca_l2_selected",
+            "kld_pca_abs_sum_selected",
+            "kld_pca_signed_sum_selected",
+            "kld_pca_l2_te_selected",
+            "kld_pca_abs_sum_te_selected",
+            "kld_pca_signed_sum_te_selected",
             "posterior_drift_norm",
             "attention_concentration_mean",
             "te_lag_total_mass",
@@ -922,6 +1016,24 @@ def run_pca_vs_dims_comparison(
         and {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(df_local.columns)
     ):
         df_local["kld_pca_l2_top3"] = pca_trajectory(df_local, "l2_top3")
+    selected_cols = [
+        c for c in df_local.columns
+        if c.startswith("kld_pc_selected_") and not c.endswith("_source_pc")
+    ]
+    if selected_cols:
+        if "kld_pca_l2_selected" not in df_local.columns:
+            df_local["kld_pca_l2_selected"] = pca_trajectory(df_local, "l2_selected")
+        if "kld_pca_abs_sum_selected" not in df_local.columns:
+            df_local["kld_pca_abs_sum_selected"] = pca_trajectory(
+                df_local, "abs_sum_selected"
+            )
+        if "kld_pca_signed_sum_selected" not in df_local.columns:
+            df_local["kld_pca_signed_sum_selected"] = pca_trajectory(
+                df_local, "signed_sum_selected"
+            )
+    df_local = _add_te_selected_pca_scores(
+        df_local, te_col=te_col, n_select=3
+    )
 
     rows = []
     for col in candidate_scores:
