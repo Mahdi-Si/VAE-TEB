@@ -19,7 +19,7 @@ Example:
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -242,6 +242,64 @@ def compute_kld_per_timestep(
     return torch.nanmean(kld, dim=-1)  # Shape: (B, T)
 
 
+def compute_kld_aggregate_tensors(
+    outputs: Dict[str, Tensor],
+    warmup_steps: int = 30,
+) -> Optional[Dict[str, Tensor]]:
+    """Compute explicit per-time KLD aggregates over latent dimensions.
+
+    The historical testing pipeline used ``kld_mean`` as the per-dimension
+    mean KL. For TE-style interpretation, the latent dimensions are additive,
+    so this helper also exposes the dimension-sum KL and the Euclidean norm of
+    the per-dim KL vector.
+
+    Args:
+        outputs: Model forward dict.
+        warmup_steps: Initial timesteps to NaN-mask.
+
+    Returns:
+        Dict of ``(B, T)`` tensors: ``kld_mean_t``, ``kld_sum_t``,
+        ``kld_l2_t``. Returns None when KL cannot be computed.
+    """
+    kld = compute_kld(outputs, warmup_steps)
+    if kld is None:
+        return None
+    all_nan = torch.isnan(kld).all(dim=-1)
+    kld_sum_t = torch.nansum(kld, dim=-1)
+    kld_l2_t = torch.linalg.vector_norm(torch.nan_to_num(kld, nan=0.0), dim=-1)
+    nan_fill = torch.full_like(kld_sum_t, float("nan"))
+    return {
+        "kld_mean_t": torch.nanmean(kld, dim=-1),
+        "kld_sum_t": torch.where(all_nan, nan_fill, kld_sum_t),
+        "kld_l2_t": torch.where(all_nan, nan_fill, kld_l2_t),
+    }
+
+
+def compute_kld_aggregates_per_sample(
+    outputs: Dict[str, Tensor],
+    warmup_steps: int = 30,
+) -> Dict[str, Tensor]:
+    """Compute per-sample KLD mean, sum, and L2 aggregates.
+
+    Returns one scalar per sample for each aggregate by averaging the
+    corresponding per-time series over valid post-warmup timesteps.
+    """
+    agg_t = compute_kld_aggregate_tensors(outputs, warmup_steps)
+    if agg_t is None:
+        for key in ("mu_pr", "z", "mu_prior", "mu_post"):
+            t = outputs.get(key)
+            if t is not None:
+                zeros = torch.zeros(t.size(0), device=t.device, dtype=t.dtype)
+                return {"kld_mean": zeros, "kld_sum": zeros, "kld_l2": zeros}
+        zeros = torch.zeros(1)
+        return {"kld_mean": zeros, "kld_sum": zeros, "kld_l2": zeros}
+    return {
+        "kld_mean": torch.nanmean(agg_t["kld_mean_t"], dim=1),
+        "kld_sum": torch.nanmean(agg_t["kld_sum_t"], dim=1),
+        "kld_l2": torch.nanmean(agg_t["kld_l2_t"], dim=1),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Lag-Attentive V1 Feature-Forecast Metrics
 # -----------------------------------------------------------------------------
@@ -367,6 +425,126 @@ def compute_forecast_metrics(
         "feat_mse_st": feat_mse_st,
         "feat_mse_ph": feat_mse_ph,
     }
+
+
+def compute_band_forecast_metrics(
+    mu_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+    band_combined_idx: Dict[str, "np.ndarray"],
+    *,
+    return_per_anchor: bool = True,
+) -> Dict[str, Dict[str, Tensor]]:
+    """Compute per-sample feature-forecast metrics stratified by frequency band.
+
+    Slices the squared-error tensor along the channel axis using one
+    integer index list per band, then aggregates over the same valid
+    anchor range as :func:`compute_forecast_metrics`. The returned dict
+    maps each band name to a sub-dict of tensors so the analysis layer
+    can iterate bands without unpacking individual keys.
+
+    Args:
+        mu_full: Model prediction ``(B, T, H_d, C_y)``.
+        y_plus: Ground-truth future feature trajectory ``(B, T - H_d,
+            H_d, C_y)`` from :meth:`TestRunner.build_future_target`.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d`` (must equal ``mu_full.size(2)``).
+        band_combined_idx: Mapping ``band_name -> 1-D int array of
+            channel indices`` into ``[0, C_y)``. Bands with empty
+            arrays are returned with all-zero tensors so callers can
+            still address them.
+        return_per_anchor: When ``True`` also return per-anchor MSE
+            tensors of shape ``(B, T_valid)`` per band — used by the
+            anchor-error grid plot. Set to ``False`` to save memory if
+            only horizon and total aggregates are needed.
+
+    Returns:
+        Dict ``{band_name -> {"mse_total", "mse_per_horizon",
+        "r2_total", "n_channels", optional "mse_per_anchor"}}``. All
+        per-sample tensors share the input device and dtype.
+    """
+    B, T, H_d, C = mu_full.shape
+    if int(H_d) != int(horizon):
+        raise ValueError(
+            f"horizon mismatch: mu_full.size(2)={H_d}, horizon={horizon}"
+        )
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+
+    out: Dict[str, Dict[str, Tensor]] = {}
+
+    if (T_valid - start) <= 0:
+        zero_b = torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype)
+        zero_bh = torch.zeros(B, int(H_d), device=mu_full.device, dtype=mu_full.dtype)
+        zero_bt = torch.zeros(
+            B, max(int(T_valid - start), 0),
+            device=mu_full.device, dtype=mu_full.dtype,
+        )
+        for band, idx in band_combined_idx.items():
+            entry: Dict[str, Tensor] = {
+                "mse_total": zero_b.clone(),
+                "mse_per_horizon": zero_bh.clone(),
+                "r2_total": zero_b.clone(),
+                "n_channels": torch.tensor(int(np.asarray(idx).size)),
+            }
+            if return_per_anchor:
+                entry["mse_per_anchor"] = zero_bt.clone()
+            out[band] = entry
+        return out
+
+    mu_valid = mu_full[:, start:T_valid, :, :]                  # (B, T_v, H_d, C)
+    y_valid = y_plus[:, start:T_valid, :, :]                    # (B, T_v, H_d, C)
+    diff = mu_valid - y_valid
+    sq = diff.pow(2)                                            # (B, T_v, H_d, C)
+
+    for band, idx_arr in band_combined_idx.items():
+        idx_np = np.asarray(idx_arr, dtype=np.int64)
+        n_ch = int(idx_np.size)
+        if n_ch == 0:
+            entry = {
+                "mse_total": torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype),
+                "mse_per_horizon": torch.zeros(
+                    B, int(H_d), device=mu_full.device, dtype=mu_full.dtype,
+                ),
+                "r2_total": torch.zeros(B, device=mu_full.device, dtype=mu_full.dtype),
+                "n_channels": torch.tensor(0),
+            }
+            if return_per_anchor:
+                entry["mse_per_anchor"] = torch.zeros(
+                    B, mu_valid.size(1),
+                    device=mu_full.device, dtype=mu_full.dtype,
+                )
+            out[band] = entry
+            continue
+
+        idx_t = torch.as_tensor(idx_np, device=mu_full.device, dtype=torch.long)
+        sq_band = sq.index_select(dim=-1, index=idx_t)          # (B, T_v, H_d, n_ch)
+
+        mse_total = sq_band.mean(dim=(1, 2, 3))                 # (B,)
+        mse_per_horizon = sq_band.mean(dim=(1, 3))              # (B, H_d)
+
+        # Per-band R^2 against per-channel mean of y_valid restricted to
+        # the same channel slice.
+        y_band = y_valid.index_select(dim=-1, index=idx_t)
+        mu_band = mu_valid.index_select(dim=-1, index=idx_t)
+        y_flat = y_band.reshape(B, -1)
+        mu_flat = mu_band.reshape(B, -1)
+        y_mean = y_flat.mean(dim=1, keepdim=True)
+        ss_res = (mu_flat - y_flat).pow(2).sum(dim=1)
+        ss_tot = (y_flat - y_mean).pow(2).sum(dim=1).clamp_min(1e-12)
+        r2_total = (1.0 - ss_res / ss_tot).clamp(min=-10.0, max=1.0)
+
+        entry = {
+            "mse_total": mse_total,
+            "mse_per_horizon": mse_per_horizon,
+            "r2_total": r2_total,
+            "n_channels": torch.tensor(n_ch),
+        }
+        if return_per_anchor:
+            entry["mse_per_anchor"] = sq_band.mean(dim=(2, 3))   # (B, T_v)
+        out[band] = entry
+
+    return out
 
 
 def compute_uplift_metrics(
@@ -731,6 +909,197 @@ def project_kld_per_dim(
     if finite_mask.any():
         out[finite_mask] = pca_model.transform(flat[finite_mask]).astype(np.float32)
     return out.reshape(N, T, n_components)
+
+
+def _rankdata_1d(values: np.ndarray) -> np.ndarray:
+    """Small dependency-free average-rank helper for Spearman scores."""
+    x = np.asarray(values, dtype=float)
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty_like(x, dtype=float)
+    sorted_x = x[order]
+    start = 0
+    while start < sorted_x.size:
+        end = start + 1
+        while end < sorted_x.size and sorted_x[end] == sorted_x[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    return ranks
+
+
+def _safe_abs_spearman(x: np.ndarray, y: np.ndarray) -> float:
+    """Return ``abs(Spearman rho)`` with finite/constant guards."""
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 3:
+        return 0.0
+    xr = _rankdata_1d(x[mask])
+    yr = _rankdata_1d(y[mask])
+    sx = float(np.std(xr))
+    sy = float(np.std(yr))
+    if sx <= 0.0 or sy <= 0.0:
+        return 0.0
+    return abs(float(np.corrcoef(xr, yr)[0, 1]))
+
+
+def _class_contrast_eta2(values: np.ndarray, labels: np.ndarray) -> float:
+    """Effect-size contrast for one PC across outcome labels."""
+    x = np.asarray(values, dtype=float).ravel()
+    y = np.asarray(labels).ravel()
+    mask = np.isfinite(x) & pd_notna_array(y)
+    if mask.sum() < 3:
+        return 0.0
+    x = x[mask]
+    y = y[mask]
+    classes = np.unique(y)
+    if classes.size < 2:
+        return 0.0
+    overall = float(np.mean(x))
+    total_ss = float(np.sum((x - overall) ** 2))
+    if total_ss <= 1e-12:
+        return 0.0
+    between = 0.0
+    for cls in classes:
+        vals = x[y == cls]
+        if vals.size == 0:
+            continue
+        between += float(vals.size) * (float(np.mean(vals)) - overall) ** 2
+    return max(0.0, min(1.0, between / total_ss))
+
+
+def pd_notna_array(values: np.ndarray) -> np.ndarray:
+    """Pandas-like notna for object/numeric numpy arrays without importing pandas."""
+    arr = np.asarray(values)
+    if np.issubdtype(arr.dtype, np.number):
+        return np.isfinite(arr.astype(float))
+    return np.asarray([v is not None and str(v).lower() != "nan" for v in arr])
+
+
+def select_pca_components(
+    projected: np.ndarray,
+    explained_variance_ratio: Sequence[float],
+    *,
+    n_select: int = 3,
+    labels: Optional[Sequence[Any]] = None,
+    te_values: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    """Select PCA components by eigenvalue weighted contrast.
+
+    Preference order:
+    1. empirical-TE association when ``te_values`` are supplied;
+    2. outcome-label contrast when labels contain at least two classes;
+    3. eigenvalue rank when neither contrast is usable.
+
+    Args:
+        projected: PCA scores ``(N, T, K)``.
+        explained_variance_ratio: PCA explained-variance ratio for K PCs.
+        n_select: Number of PCs to select.
+        labels: Optional sample labels for class-contrast ranking.
+        te_values: Optional empirical TE values for association ranking.
+
+    Returns:
+        Dict with selected zero-based component indices, sign alignment, scores,
+        contrast type, and per-sample PC means.
+    """
+    arr = np.asarray(projected, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"projected must be (N, T, K), got {arr.shape}")
+    with np.errstate(invalid="ignore"):
+        pc_means = np.nanmean(arr, axis=1)
+    N, K = pc_means.shape
+    ev = np.asarray(explained_variance_ratio, dtype=float)[:K]
+    if ev.size < K:
+        ev = np.pad(ev, (0, K - ev.size), constant_values=0.0)
+
+    contrast = np.ones(K, dtype=float)
+    contrast_type = "eigenvalue"
+
+    if te_values is not None:
+        te = np.asarray(te_values, dtype=float)
+        if te.size == N and np.isfinite(te).sum() >= 3:
+            contrast = np.asarray(
+                [_safe_abs_spearman(pc_means[:, k], te) for k in range(K)],
+                dtype=float,
+            )
+            if np.any(contrast > 0):
+                contrast_type = "empirical_te"
+
+    if contrast_type == "eigenvalue" and labels is not None:
+        lab = np.asarray(labels)
+        if lab.size == N and np.unique(lab[pd_notna_array(lab)]).size >= 2:
+            contrast = np.asarray(
+                [_class_contrast_eta2(pc_means[:, k], lab) for k in range(K)],
+                dtype=float,
+            )
+            if np.any(contrast > 0):
+                contrast_type = "label_contrast"
+
+    score = np.nan_to_num(ev, nan=0.0) * np.nan_to_num(contrast, nan=0.0)
+    if not np.any(score > 0):
+        score = np.nan_to_num(ev, nan=0.0)
+        contrast = np.ones(K, dtype=float)
+        contrast_type = "eigenvalue"
+
+    n_keep = max(1, min(int(n_select), K))
+    selected = np.argsort(score)[::-1][:n_keep]
+
+    signs = np.ones(n_keep, dtype=float)
+    ref: Optional[np.ndarray] = None
+    if contrast_type == "empirical_te" and te_values is not None:
+        ref = np.asarray(te_values, dtype=float)
+    elif contrast_type == "label_contrast" and labels is not None:
+        try:
+            ref = np.asarray(labels, dtype=float)
+        except (TypeError, ValueError):
+            ref = None
+    for i, pc_idx in enumerate(selected):
+        x = pc_means[:, pc_idx]
+        if ref is not None and ref.size == N:
+            mask = np.isfinite(x) & np.isfinite(ref)
+            if mask.sum() >= 3 and np.std(x[mask]) > 0 and np.std(ref[mask]) > 0:
+                corr = float(np.corrcoef(x[mask], ref[mask])[0, 1])
+                signs[i] = 1.0 if corr >= 0 else -1.0
+                continue
+        # Deterministic fallback: largest-magnitude loading/score direction positive.
+        finite_x = x[np.isfinite(x)]
+        if finite_x.size and abs(float(np.nanmin(finite_x))) > abs(float(np.nanmax(finite_x))):
+            signs[i] = -1.0
+
+    return {
+        "selected_indices": selected.astype(int),
+        "selected_1based": (selected + 1).astype(int),
+        "signs": signs.astype(float),
+        "score": score.astype(float),
+        "contrast": contrast.astype(float),
+        "contrast_type": contrast_type,
+        "pc_means": pc_means.astype(float),
+    }
+
+
+def aggregate_selected_pca_scores(
+    pc_means: np.ndarray,
+    selected_indices: Sequence[int],
+    signs: Optional[Sequence[float]] = None,
+) -> Dict[str, np.ndarray]:
+    """Aggregate selected PCA component scores per sample."""
+    means = np.asarray(pc_means, dtype=float)
+    idx = np.asarray(selected_indices, dtype=int)
+    if idx.size == 0:
+        raise ValueError("selected_indices must not be empty")
+    selected = means[:, idx]
+    sign_arr = (
+        np.ones(idx.size, dtype=float)
+        if signs is None
+        else np.asarray(signs, dtype=float)[: idx.size]
+    )
+    signed = selected * sign_arr[None, :]
+    return {
+        "selected_scores": signed,
+        "l2": np.sqrt(np.nansum(selected ** 2, axis=1)),
+        "abs_sum": np.nansum(np.abs(selected), axis=1),
+        "signed_sum": np.nansum(signed, axis=1),
+    }
 
 
 # -----------------------------------------------------------------------------

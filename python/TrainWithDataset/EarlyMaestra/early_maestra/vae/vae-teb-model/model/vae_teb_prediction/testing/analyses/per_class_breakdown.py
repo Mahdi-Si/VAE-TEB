@@ -17,7 +17,7 @@ already carry the class label.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -164,6 +164,11 @@ def _process_histogram(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
         "residual_ratio",
         "delta_src_norm",
         "kld_mean",
+        "kld_sum",
+        "kld_l2",
+        "kld_pca_l2_selected",
+        "kld_pca_abs_sum_selected",
+        "kld_pca_signed_sum_selected",
         "posterior_drift_norm",
         "attention_entropy_mean",
         "attention_concentration_mean",
@@ -300,6 +305,107 @@ def _process_attention(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
     return {"status": "ok", "n_classes": len(per_class_argmax)}
 
 
+def _process_frequency_band(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
+    """Per-class breakdown of the frequency-band forecast quality outputs.
+
+    Reads ``frequency_band_forecast/per_sample.csv`` (long-format with a
+    ``band`` column) and writes per-class subset CSVs plus a class-x-band
+    overlay PDF that puts all clinical classes on shared band axes.
+    """
+    src = _load_csv(output_root / "frequency_band_forecast" / "per_sample.csv")
+    if src is None or "label" not in src.columns or "band" not in src.columns:
+        return {"status": "missing"}
+
+    per_class: Dict[int, pd.DataFrame] = {}
+    for label_id in CLASS_NAMES:
+        sub = _filter_by_label(src, label_id)
+        if sub.empty:
+            continue
+        per_class[label_id] = sub
+        out_dir = output_root / "per_class_breakdown" / CLASS_FOLDER[label_id]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sub.to_csv(out_dir / "frequency_band_per_sample.csv", index=False)
+
+    if not per_class:
+        return {"status": "empty"}
+
+    # Class-x-band overlay: one bar per (band, class) showing mean MSE.
+    bands_present: List[str] = []
+    for df in per_class.values():
+        for band in df["band"].dropna().unique():
+            if band not in bands_present:
+                bands_present.append(str(band))
+    canonical = ("slow_baseline", "deceleration", "variability", "beat_to_beat")
+    bands_present = [b for b in canonical if b in bands_present]
+
+    if bands_present:
+        try:
+            fig, ax = plt.subplots(
+                figsize=(max(4.4, 1.6 * len(bands_present) + 1.4), 3.4)
+            )
+            n_classes = len(per_class)
+            bar_width = 0.8 / max(n_classes, 1)
+            for c_idx, (label_id, df) in enumerate(per_class.items()):
+                means = []
+                stds = []
+                for band in bands_present:
+                    vals = pd.to_numeric(
+                        df.loc[df["band"] == band, "mse_total"], errors="coerce"
+                    ).to_numpy()
+                    vals = vals[np.isfinite(vals)]
+                    if vals.size == 0:
+                        means.append(np.nan)
+                        stds.append(0.0)
+                    else:
+                        means.append(float(np.mean(vals)))
+                        stds.append(float(np.std(vals) / max(np.sqrt(vals.size), 1)))
+                xs = np.arange(len(bands_present))
+                offsets = (c_idx - (n_classes - 1) / 2.0) * bar_width
+                ax.bar(
+                    xs + offsets, means, bar_width,
+                    yerr=stds, color=CLASS_COLORS[label_id],
+                    label=f"{CLASS_NAMES[label_id]} (n={len(df)})",
+                    edgecolor="#222831", linewidth=0.4, capsize=2,
+                )
+            ax.set_xticks(np.arange(len(bands_present)))
+            ax.set_xticklabels(bands_present)
+            ax.set_ylabel("mean mse_total ± SE")
+            ax.set_title("Forecast MSE per band — by class")
+            ax.legend(loc="best", frameon=True)
+            _style_axes(ax)
+            fig.tight_layout()
+            fig.savefig(
+                overlay_dir / "frequency_band_mse_by_band_overlay.pdf"
+            )
+            plt.close(fig)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"per_class_breakdown[frequency_band]: bar plot failed: {exc}"
+            )
+
+    # Cross-class overlays for individual scalar metrics (filter on
+    # band first, otherwise we overlay distributions across all bands).
+    for col in ("mse_total", "r2_total"):
+        for band in bands_present:
+            band_subsets = {
+                lab: df.loc[df["band"] == band].copy()
+                for lab, df in per_class.items()
+            }
+            band_subsets = {k: v for k, v in band_subsets.items() if not v.empty}
+            if not band_subsets:
+                continue
+            _emit_overlay_for_metric(
+                band_subsets, col,
+                overlay_dir / f"frequency_band_{band}_{col}_overlay.pdf",
+            )
+
+    return {
+        "status": "ok",
+        "n_classes": len(per_class),
+        "n_bands": len(bands_present),
+    }
+
+
 def _process_uplift(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
     """Per-class breakdown of uplift CSVs (already class-aware in plotting)."""
     src = _load_csv(output_root / "uplift" / "per_sample.csv")
@@ -365,6 +471,7 @@ def run_per_class_breakdown(
         "residual": _process_residual_usage,
         "attention": _process_attention,
         "uplift": _process_uplift,
+        "frequency_band": _process_frequency_band,
     }
     if parts is None:
         parts = list(available_parts.keys())

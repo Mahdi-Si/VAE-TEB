@@ -311,7 +311,7 @@ def plot_metrics_comparison_interactive(
     """Create an interactive scatter matrix of metrics coloured by class.
 
     The default column list reflects the lag-attn v1 schema:
-    ``[feat_mse_total, uplift_rel, residual_ratio, kld_mean]``. Any column
+    ``[feat_mse_total, uplift_rel, residual_ratio, kld_mean, kld_sum, kld_l2]``. Any column
     not present in the DataFrame is silently skipped so the function
     degrades gracefully when the caller passes a subset. When none of the
     v1 columns are present it falls back to the legacy schema
@@ -333,6 +333,8 @@ def plot_metrics_comparison_interactive(
         "uplift_rel",
         "residual_ratio",
         "kld_mean",
+        "kld_sum",
+        "kld_l2",
     ]
     available_cols = [c for c in metrics_cols if c in df.columns]
     if len(available_cols) < 2:

@@ -33,11 +33,14 @@ from model.vae_teb_prediction.testing.metrics import (
     compute_attention_diagnostics,
     compute_forecast_metrics,
     compute_kld,
+    compute_kld_aggregate_tensors,
+    compute_kld_aggregates_per_sample,
     compute_kld_per_sample,
     compute_kld_per_timestep,
     compute_reconstruction_metrics,
     compute_residual_usage,
     compute_uplift_metrics,
+    select_pca_components,
 )
 
 # Data collectors
@@ -99,6 +102,7 @@ from model.vae_teb_prediction.testing.analyses import (
     run_sample_diagnostics,
     run_te_lag_class_analysis,
     run_trajectory_analysis,
+    run_up_effect_analysis,
     run_uplift_analysis,
 )
 
@@ -116,6 +120,8 @@ __all__ = [
     # Metrics
     "compute_reconstruction_metrics",
     "compute_kld",
+    "compute_kld_aggregate_tensors",
+    "compute_kld_aggregates_per_sample",
     "compute_kld_per_sample",
     "compute_kld_per_timestep",
     "compute_forecast_metrics",
@@ -123,6 +129,7 @@ __all__ = [
     "compute_residual_usage",
     "compute_attention_diagnostics",
     "aggregate_te_lag_map",
+    "select_pca_components",
     # Collectors
     "collect_metrics",
     "collect_latents",
@@ -160,6 +167,7 @@ __all__ = [
     "run_anchor_position_analysis",
     "run_uplift_analysis",
     "run_residual_usage_analysis",
+    "run_up_effect_analysis",
     "run_attention_diagnostics",
     "run_te_lag_class_analysis",
     "run_encoder_probe",

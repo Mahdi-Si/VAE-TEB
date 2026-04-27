@@ -55,13 +55,18 @@ def _load_pca_artifacts(pca_dir: Path) -> Optional[Dict[str, Any]]:
     ev_path = pca_dir / "ev_ratio.json"
     comp_path = pca_dir / "components.npy"
     mean_path = pca_dir / "mean.npy"
+    selection_path = pca_dir / "selection.json"
     if not ev_path.exists() or not comp_path.exists():
         return None
     with open(ev_path) as fh:
         ev = json.load(fh)
     components = np.load(comp_path)
     mean = np.load(mean_path) if mean_path.exists() else None
-    return {"ev": ev, "components": components, "mean": mean}
+    selection = None
+    if selection_path.exists():
+        with open(selection_path) as fh:
+            selection = json.load(fh)
+    return {"ev": ev, "components": components, "mean": mean, "selection": selection}
 
 
 def _build_pca_model(artifacts: Dict[str, Any]):
@@ -88,6 +93,25 @@ def _build_pca_model(artifacts: Dict[str, Any]):
     )
     pca.explained_variance_ = pca.explained_variance_ratio_.copy()
     return pca
+
+
+def _build_subset_pca_model(artifacts: Dict[str, Any], indices: np.ndarray):
+    """Build a PCA-like projector restricted to selected component rows."""
+    subset = dict(artifacts)
+    components = np.asarray(artifacts["components"], dtype=np.float32)
+    idx = np.asarray(indices, dtype=int)
+    idx = idx[(idx >= 0) & (idx < components.shape[0])]
+    if idx.size == 0:
+        idx = np.arange(min(3, components.shape[0]), dtype=int)
+    subset["components"] = components[idx]
+    ev = dict(artifacts["ev"])
+    ev_ratio = np.asarray(ev.get("explained_variance_ratio", []), dtype=np.float32)
+    ev["explained_variance_ratio"] = [
+        float(ev_ratio[i]) for i in idx if i < ev_ratio.size
+    ]
+    ev["n_components"] = int(idx.size)
+    subset["ev"] = ev
+    return _build_pca_model(subset)
 
 
 def _plot_scree(ev_ratio: np.ndarray, out_path: Path) -> None:
@@ -129,6 +153,35 @@ def _plot_pc12_scatter_by_class(df: pd.DataFrame, out_path: Path) -> None:
     ax.set_xlabel("PC1 (per-sample mean)")
     ax.set_ylabel("PC2 (per-sample mean)")
     ax.set_title("Per-sample KL PCA, top 2 components")
+    ax.legend(loc="best", frameon=True)
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_selected_pc_scatter_by_class(df: pd.DataFrame, out_path: Path) -> None:
+    """Scatter for the first two contrast-selected PC aggregates."""
+    if not {"kld_pc_selected_1", "kld_pc_selected_2"}.issubset(df.columns):
+        return
+    fig, ax = plt.subplots(figsize=(4.6, 4.0))
+    for label_id, name in CLASS_NAMES.items():
+        sub = df[df["label"] == label_id]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["kld_pc_selected_1"],
+            sub["kld_pc_selected_2"],
+            s=14,
+            alpha=0.6,
+            color=CLASS_COLORS[label_id],
+            label=f"{name} (n={len(sub)})",
+        )
+    ax.axhline(0, color="#888888", lw=0.4, zorder=0)
+    ax.axvline(0, color="#888888", lw=0.4, zorder=0)
+    ax.set_xlabel("selected PC 1 (sign-aligned)")
+    ax.set_ylabel("selected PC 2 (sign-aligned)")
+    ax.set_title("Per-sample KL PCA, contrast-selected components")
     ax.legend(loc="best", frameon=True)
     _style_axes(ax)
     fig.tight_layout()
@@ -231,7 +284,11 @@ def run_kld_pca_analysis(
     ev_ratio = np.asarray(
         artifacts["ev"]["explained_variance_ratio"], dtype=np.float32
     )
-    n_components = int(artifacts["ev"]["n_components"])
+    selection = artifacts.get("selection") or {}
+    selected_indices = np.asarray(
+        selection.get("selected_indices_0based", []), dtype=int
+    )
+    selected_count = int(selected_indices.size) if selected_indices.size else min(3, int(artifacts["ev"]["n_components"]))
 
     # Scree plot.
     _plot_scree(ev_ratio, output_dir / "scree.pdf")
@@ -241,11 +298,15 @@ def run_kld_pca_analysis(
         hist_csv = Path(runner.output_dir) / "histograms" / "histogram_metrics.csv"
         if hist_csv.exists():
             metrics_df = pd.read_csv(hist_csv)
+    if metrics_df is not None and {"kld_pc_selected_1", "kld_pc_selected_2"}.issubset(metrics_df.columns):
+        _plot_selected_pc_scatter_by_class(
+            metrics_df, output_dir / "selected_pc12_scatter_by_class.pdf"
+        )
     if metrics_df is not None and {"kld_pc1", "kld_pc2"}.issubset(metrics_df.columns):
         _plot_pc12_scatter_by_class(metrics_df, output_dir / "pc12_scatter_by_class.pdf")
 
     # Per-time per-class trajectories.
-    pca_model = _build_pca_model(artifacts)
+    pca_model = _build_subset_pca_model(artifacts, selected_indices)
     traj_df = collect_kld_trajectory(
         runner, loader, max_samples=max_samples, pca_model=pca_model
     )
@@ -253,12 +314,14 @@ def run_kld_pca_analysis(
         traj_csv = output_dir / "kld_pc_trajectory.csv"
         traj_df.to_csv(traj_csv, index=False)
         _plot_pc_trajectories_overlay(
-            traj_df, n_components, output_dir / "pc_trajectories_overlay.pdf"
+            traj_df, selected_count, output_dir / "pc_trajectories_overlay.pdf"
         )
 
     summary = {
         "n_samples": int(artifacts["ev"]["n_samples_fitted"]),
-        "n_components": n_components,
+        "n_components": int(artifacts["ev"]["n_components"]),
+        "selected_components_1based": selection.get("selected_indices_1based", []),
+        "selection_contrast_type": selection.get("contrast_type"),
         "explained_variance_ratio": [float(x) for x in ev_ratio],
         "pca_dir": str(pca_artifact_dir),
     }

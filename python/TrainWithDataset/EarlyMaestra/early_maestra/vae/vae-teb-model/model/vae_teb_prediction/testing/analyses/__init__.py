@@ -13,6 +13,7 @@ Available analyses:
 - ``run_horizon_error_profile`` — MSE vs horizon step
 - ``run_anchor_position_analysis`` — MSE vs anchor index
 - ``run_uplift_analysis`` — baseline vs full uplift
+- ``run_up_effect_analysis`` — inference-time UP perturbation tests
 - ``run_residual_usage_analysis`` — residual-branch activity / collapse
 - ``run_attention_diagnostics`` — lag attention diagnostics
 - ``run_te_lag_class_analysis`` — lag-resolved TE by class
@@ -53,6 +54,10 @@ from model.vae_teb_prediction.testing.analyses.temporal import (
     run_horizon_error_profile,
 )
 from model.vae_teb_prediction.testing.analyses.uplift import run_uplift_analysis
+from model.vae_teb_prediction.testing.analyses.up_effect import run_up_effect_analysis
+from model.vae_teb_prediction.testing.analyses.frequency_band_forecast import (
+    run_frequency_band_forecast_analysis,
+)
 from model.vae_teb_prediction.testing.analyses.residual_usage import (
     run_residual_usage_analysis,
 )
@@ -142,6 +147,8 @@ def run_all_analyses(
     trajectory_n_changepoints: int = 5,
     trajectory_plot_3d: bool = True,
     trajectory_plot_animations: bool = False,
+    skip_up_effect: bool = False,
+    skip_frequency_band: bool = False,
 ) -> Dict[str, Any]:
     """Run every lag-attn v1 analysis with sensible defaults.
 
@@ -173,6 +180,11 @@ def run_all_analyses(
         "forecast_quality", run_forecast_quality_analysis,
         runner, loader, max_samples=max_samples or 500,
     )
+    if not skip_frequency_band:
+        results["frequency_band_forecast"] = _safe(
+            "frequency_band_forecast", run_frequency_band_forecast_analysis,
+            runner, loader, max_samples=max_samples or 500,
+        )
     results["horizon_error"] = _safe(
         "horizon_error_profile", run_horizon_error_profile,
         runner, loader, max_samples=min(200, max_samples or 200),
@@ -185,6 +197,11 @@ def run_all_analyses(
         "uplift_analysis", run_uplift_analysis,
         runner, loader, max_samples=max_samples or 500,
     )
+    if not skip_up_effect:
+        results["up_effect"] = _safe(
+            "up_effect_analysis", run_up_effect_analysis,
+            runner, loader, max_samples=min(1000, max_samples or 1000),
+        )
     results["residual_usage"] = _safe(
         "residual_usage", run_residual_usage_analysis,
         runner, loader, max_samples=max_samples or 500,
@@ -263,9 +280,11 @@ __all__ = [
     # Individual analyses
     "run_histogram_analysis",
     "run_forecast_quality_analysis",
+    "run_frequency_band_forecast_analysis",
     "run_horizon_error_profile",
     "run_anchor_position_analysis",
     "run_uplift_analysis",
+    "run_up_effect_analysis",
     "run_residual_usage_analysis",
     "run_attention_diagnostics",
     "run_te_lag_class_analysis",

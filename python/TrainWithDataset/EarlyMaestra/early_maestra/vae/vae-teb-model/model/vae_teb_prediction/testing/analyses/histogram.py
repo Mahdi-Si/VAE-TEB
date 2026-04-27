@@ -38,6 +38,8 @@ _PLOT_COLUMNS = (
     "uplift_rel",
     "residual_ratio",
     "kld_mean",
+    "kld_sum",
+    "kld_l2",
 )
 
 
