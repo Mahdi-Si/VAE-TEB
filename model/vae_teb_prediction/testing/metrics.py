@@ -432,17 +432,23 @@ def compute_band_forecast_metrics(
     y_plus: Tensor,
     warmup: int,
     horizon: int,
-    band_combined_idx: Dict[str, "np.ndarray"],
+    partition_idx: Optional[Dict[str, "np.ndarray"]] = None,
     *,
     return_per_anchor: bool = True,
+    band_combined_idx: Optional[Dict[str, "np.ndarray"]] = None,
 ) -> Dict[str, Dict[str, Tensor]]:
-    """Compute per-sample feature-forecast metrics stratified by frequency band.
+    """Compute per-sample feature-forecast metrics stratified by a partition.
 
     Slices the squared-error tensor along the channel axis using one
-    integer index list per band, then aggregates over the same valid
-    anchor range as :func:`compute_forecast_metrics`. The returned dict
-    maps each band name to a sub-dict of tensors so the analysis layer
-    can iterate bands without unpacking individual keys.
+    integer index list per partition label, then aggregates over the
+    same valid anchor range as :func:`compute_forecast_metrics`. The
+    returned dict maps each label to a sub-dict of tensors so the
+    analysis layer can iterate without unpacking individual keys.
+
+    Generalised from the original "band-only" version: the partition
+    can be the clinical 4-band split, the refined 7-band split, the
+    coefficient-kind partition, the per-octave partition, or any other
+    ``label -> int_array`` mapping.
 
     Args:
         mu_full: Model prediction ``(B, T, H_d, C_y)``.
@@ -450,20 +456,40 @@ def compute_band_forecast_metrics(
             H_d, C_y)`` from :meth:`TestRunner.build_future_target`.
         warmup: Warmup anchors to skip.
         horizon: Forecast horizon ``H_d`` (must equal ``mu_full.size(2)``).
-        band_combined_idx: Mapping ``band_name -> 1-D int array of
-            channel indices`` into ``[0, C_y)``. Bands with empty
-            arrays are returned with all-zero tensors so callers can
-            still address them.
+        partition_idx: Mapping ``label -> 1-D int array of channel
+            indices`` into ``[0, C_y)``. Labels with empty arrays are
+            returned with all-zero tensors so callers can still address
+            them.
         return_per_anchor: When ``True`` also return per-anchor MSE
-            tensors of shape ``(B, T_valid)`` per band — used by the
+            tensors of shape ``(B, T_valid)`` per label — used by the
             anchor-error grid plot. Set to ``False`` to save memory if
             only horizon and total aggregates are needed.
+        band_combined_idx: Backwards-compatible alias for
+            ``partition_idx``. Either may be supplied (but not both);
+            this kwarg exists so existing callers keep working
+            unchanged.
 
     Returns:
-        Dict ``{band_name -> {"mse_total", "mse_per_horizon",
-        "r2_total", "n_channels", optional "mse_per_anchor"}}``. All
-        per-sample tensors share the input device and dtype.
+        Dict ``{label -> {"mse_total", "mse_per_horizon", "r2_total",
+        "n_channels", optional "mse_per_anchor"}}``. All per-sample
+        tensors share the input device and dtype.
     """
+    if partition_idx is None and band_combined_idx is None:
+        raise TypeError(
+            "compute_band_forecast_metrics requires partition_idx "
+            "(or its legacy alias band_combined_idx)."
+        )
+    if partition_idx is not None and band_combined_idx is not None:
+        raise TypeError(
+            "Pass either partition_idx or band_combined_idx, not both."
+        )
+    if partition_idx is None:
+        partition_idx = band_combined_idx  # type: ignore[assignment]
+    assert partition_idx is not None  # for the type checker
+
+    # Local alias keeps the existing loop body readable without renames.
+    band_combined_idx = partition_idx
+
     B, T, H_d, C = mu_full.shape
     if int(H_d) != int(horizon):
         raise ValueError(
@@ -545,6 +571,78 @@ def compute_band_forecast_metrics(
         out[band] = entry
 
     return out
+
+
+def compute_per_channel_forecast_metrics(
+    mu_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    """Compute per-sample × per-channel forecast MSE / R² over valid anchors.
+
+    Mirrors :func:`compute_band_forecast_metrics` but keeps the channel
+    axis intact instead of pooling. Used by the per-channel diagnostics
+    that ask "which exact channel is hardest to forecast?" without
+    pre-binning into a frequency band.
+
+    Args:
+        mu_full: Model prediction ``(B, T, H_d, C_y)``.
+        y_plus: Ground-truth future feature trajectory ``(B, T - H_d,
+            H_d, C_y)`` from :meth:`TestRunner.build_future_target`.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d`` (must equal ``mu_full.size(2)``).
+
+    Returns:
+        Dict with two keys:
+
+        * ``"mse_per_channel"`` : ``(B, C_y)`` — mean squared error per
+          (sample, channel), averaged over valid anchors and horizon
+          steps.
+        * ``"r2_per_channel"`` : ``(B, C_y)`` — coefficient of
+          determination per (sample, channel), clamped to
+          ``[-10, 1]`` to suppress runaway values when the per-channel
+          target variance is near zero.
+
+        Per-anchor tensors are *not* returned: keeping memory at
+        ``O(B × C)`` rather than ``O(B × T_v × C)`` lets the caller
+        write the per-channel CSV without the long-format anchor blow-up.
+    """
+    B, T, H_d, _C = mu_full.shape
+    if int(H_d) != int(horizon):
+        raise ValueError(
+            f"horizon mismatch: mu_full.size(2)={H_d}, horizon={horizon}"
+        )
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+
+    if (T_valid - start) <= 0:
+        zero_bc = torch.zeros(
+            B, int(_C), device=mu_full.device, dtype=mu_full.dtype,
+        )
+        return {
+            "mse_per_channel": zero_bc.clone(),
+            "r2_per_channel": zero_bc.clone(),
+        }
+
+    mu_valid = mu_full[:, start:T_valid, :, :]                  # (B, T_v, H_d, C)
+    y_valid = y_plus[:, start:T_valid, :, :]                    # (B, T_v, H_d, C)
+
+    # Per-channel MSE: average over (T_v, H_d) only.
+    diff = mu_valid - y_valid                                   # (B, T_v, H_d, C)
+    mse_per_channel = diff.pow(2).mean(dim=(1, 2))              # (B, C)
+
+    # Per-channel R²: 1 - SS_res / SS_tot, with SS_tot computed against
+    # the per-(sample, channel) mean of y. ss_tot is clamped to a tiny
+    # floor so flat targets don't blow R² up.
+    ss_res = diff.pow(2).sum(dim=(1, 2))                        # (B, C)
+    y_mean = y_valid.mean(dim=(1, 2), keepdim=True)             # (B, 1, 1, C)
+    ss_tot = (y_valid - y_mean).pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
+    r2_per_channel = (1.0 - ss_res / ss_tot).clamp(min=-10.0, max=1.0)
+
+    return {
+        "mse_per_channel": mse_per_channel,
+        "r2_per_channel": r2_per_channel,
+    }
 
 
 def compute_uplift_metrics(

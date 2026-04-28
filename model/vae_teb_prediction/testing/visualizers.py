@@ -538,19 +538,88 @@ _BAND_COLORS: Dict[str, str] = {
 
 
 def _band_color_for(band: str, fallback: str = COLOR_GRAY) -> str:
-    return _BAND_COLORS.get(str(band), fallback)
+    """Return a stable color for a band/partition label.
+
+    Known clinical bands ride on the canonical palette; arbitrary labels
+    (refined7, by_kind, by_octave, ...) are projected through a stable
+    hash into a cyclic palette so the same label always gets the same
+    color across runs.
+    """
+    name = str(band)
+    if name in _BAND_COLORS:
+        return _BAND_COLORS[name]
+    fallback_palette = (
+        COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_VERMILLION,
+        COLOR_PURPLE, COLOR_TEAL_DARK, COLOR_GRAY,
+    )
+    h = abs(hash(name)) % len(fallback_palette)
+    return fallback_palette[h] or fallback
 
 
-def _ordered_bands(values: Any) -> list:
-    """Return present band names in canonical order."""
-    canonical = ("slow_baseline", "deceleration", "variability", "beat_to_beat")
+_CANONICAL_4BAND_ORDER: Tuple[str, ...] = (
+    "slow_baseline", "deceleration", "variability", "beat_to_beat",
+)
+_CANONICAL_REFINED7_ORDER: Tuple[str, ...] = (
+    "baseline", "early_decel", "late_decel",
+    "lf_var", "mf_var", "beat_to_beat", "nyquist_edge",
+)
+_CANONICAL_KIND_ORDER: Tuple[str, ...] = (
+    "st_S0", "st_S1", "ph_diag", "ph_h2", "ph_h3", "ph_other",
+)
+
+
+def _ordered_bands(
+    values: Any,
+    *,
+    canonical: Optional[Tuple[str, ...]] = None,
+) -> list:
+    """Return present band/partition labels in a stable display order.
+
+    Args:
+        values: Iterable of label values (typically a DataFrame column).
+        canonical: Optional canonical ordering. When ``None`` the helper
+            tries the clinical-4 / refined-7 / by-kind orders in turn,
+            and falls back to ``sorted(seen)`` when none match (e.g.
+            ``octave_*`` labels — ``sorted`` keeps them in numeric order).
+
+    Returns:
+        List of label names in the chosen order, filtered to those
+        actually present in ``values``.
+    """
     seen = set()
     try:
         for v in pd.Series(values).dropna().unique():
             seen.add(str(v))
     except Exception:
         return []
-    return [b for b in canonical if b in seen]
+    if not seen:
+        return []
+    if canonical is not None:
+        ordered = [b for b in canonical if b in seen]
+        if ordered:
+            return ordered + sorted(seen.difference(canonical))
+        return sorted(seen)
+    # Auto-detect ordering by which canonical list shares the most labels.
+    for canon in (
+        _CANONICAL_4BAND_ORDER,
+        _CANONICAL_REFINED7_ORDER,
+        _CANONICAL_KIND_ORDER,
+    ):
+        match = [b for b in canon if b in seen]
+        if len(match) >= max(1, int(len(seen) * 0.6)):
+            return match + sorted(seen.difference(canon))
+    # Fallback: alphabetical (octave_0..octave_10 sort numerically with
+    # zero-padding only — the kymatio bank gives them as 'octave_0' etc.,
+    # so we sort by trailing integer when possible).
+    def _sort_key(name: str) -> Tuple[int, str]:
+        if name.startswith("octave_"):
+            tail = name.split("_", 1)[1]
+            try:
+                return (int(tail), name)
+            except ValueError:
+                return (10**9, name)
+        return (10**9, name)
+    return sorted(seen, key=_sort_key)
 
 
 def plot_band_violin(
@@ -921,6 +990,253 @@ def plot_band_anchor_error_by_class(
         ylabel=value_col,
         x_to_minutes=decim_step_seconds / 60.0,
     )
+
+
+def _kind_color_for(kind: str) -> str:
+    """Stable color per coefficient-kind label (st_S0, st_S1, ph_*)."""
+    palette = {
+        "st_S0":    COLOR_GRAY,
+        "st_S1":    COLOR_BLUE,
+        "ph_diag":  COLOR_GREEN,
+        "ph_h2":    COLOR_ORANGE,
+        "ph_h3":    COLOR_VERMILLION,
+        "ph_other": COLOR_PURPLE,
+    }
+    return palette.get(str(kind), COLOR_GRAY)
+
+
+def plot_per_channel_mse_vs_freq(
+    per_channel_df: pd.DataFrame,
+    channel_metadata_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    by_class: bool = False,
+) -> None:
+    """Mean per-channel forecast MSE vs centre frequency, coloured by kind.
+
+    Two stacked panels: scattering (st_S0 + st_S1) on top, phase (ph_*)
+    on bottom. Each point is one channel; x = ``freq_hz_primary`` (log
+    scale), y = mean forecast MSE across all samples (per class when
+    ``by_class=True``).
+
+    Args:
+        per_channel_df: Long-format frame from
+            ``frequency_band_forecast/per_channel/per_channel_forecast.csv``;
+            must carry ``channel, kind, freq_hz_primary, mse_total``.
+        channel_metadata_df: Static channel→band map (unused for plotting
+            here but kept in the signature so downstream callers can pass
+            it without an extra branch).
+        output_path: Destination PDF.
+        band_hz_ranges: Optional dict of band→(low, high) Hz; when
+            supplied, vertical dashed lines are drawn at each band
+            boundary in the scattering panel for orientation.
+        by_class: When True, plot one curve per class on each panel
+            instead of pooling.
+
+    No-ops silently if the input is empty.
+    """
+    if per_channel_df is None or per_channel_df.empty:
+        return
+    needed = {"channel", "kind", "freq_hz_primary", "mse_total"}
+    if not needed.issubset(per_channel_df.columns):
+        return
+
+    if by_class and "label" in per_channel_df.columns:
+        groupers: list = ["channel", "kind", "freq_hz_primary", "label"]
+    else:
+        groupers = ["channel", "kind", "freq_hz_primary"]
+    agg = per_channel_df.groupby(groupers, as_index=False)["mse_total"].mean()
+    agg = agg.rename(columns={"mse_total": "mean_mse"})
+
+    st_mask = agg["kind"].astype(str).isin(("st_S0", "st_S1"))
+    ph_mask = agg["kind"].astype(str).str.startswith("ph_")
+
+    fig, axes = plt.subplots(2, 1, figsize=(7.0, 5.4), sharex=False)
+    panels = [
+        ("Scattering channels (S0 + S1)", st_mask, axes[0]),
+        ("Phase channels (ph_diag / ph_h2 / ph_h3 / ph_other)", ph_mask, axes[1]),
+    ]
+
+    classes = unique_labels_in(agg.get("label")) if by_class else []
+
+    for title, mask, ax in panels:
+        sub = agg.loc[mask]
+        if sub.empty:
+            ax.text(
+                0.5, 0.5, "no channels for this kind group",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=FONT_LABEL,
+            )
+            ax.set_title(title, fontsize=FONT_TITLE * 0.9, fontweight="normal")
+            _style_axes(ax, grid="major", minor_ticks=False)
+            continue
+
+        if by_class and classes:
+            for lab in classes:
+                cls_sub = sub[sub["label"] == lab]
+                if cls_sub.empty:
+                    continue
+                cls_sub = cls_sub.sort_values("freq_hz_primary")
+                xs = cls_sub["freq_hz_primary"].to_numpy(dtype=float)
+                ys = cls_sub["mean_mse"].to_numpy(dtype=float)
+                ax.plot(
+                    xs, ys, "o-",
+                    color=class_color_for(lab),
+                    markersize=3.5, lw=0.9, alpha=0.85,
+                    label=class_label_for(lab),
+                )
+        else:
+            for kind, kind_sub in sub.groupby("kind"):
+                kind_sub = kind_sub.sort_values("freq_hz_primary")
+                xs = kind_sub["freq_hz_primary"].to_numpy(dtype=float)
+                ys = kind_sub["mean_mse"].to_numpy(dtype=float)
+                ax.scatter(
+                    xs, ys, s=18,
+                    color=_kind_color_for(str(kind)),
+                    edgecolors=COLOR_BLACK, linewidths=0.3,
+                    label=str(kind), alpha=0.9,
+                )
+
+        # Vertical dashed lines at clinical-4-band boundaries (skip
+        # 0.0 and inf so we don't pollute the log scale).
+        if band_hz_ranges is not None:
+            for _, (lo, hi) in band_hz_ranges.items():
+                for boundary in (lo, hi):
+                    if 0.0 < boundary < float("inf"):
+                        ax.axvline(
+                            boundary, color=COLOR_GRAY, ls="--",
+                            lw=0.4, alpha=0.5,
+                        )
+
+        # Annotate worst-3 and best-3 channels by mean MSE (pooled view
+        # only — by-class would pile on labels).
+        if not by_class:
+            pooled = sub.groupby(
+                ["channel", "kind", "freq_hz_primary"], as_index=False,
+            )["mean_mse"].mean()
+            worst3 = pooled.sort_values("mean_mse", ascending=False).head(3)
+            best3 = pooled.sort_values("mean_mse", ascending=True).head(3)
+            for _, row in worst3.iterrows():
+                if row["freq_hz_primary"] > 0:
+                    ax.annotate(
+                        f"ch{int(row['channel'])} ({row['kind']})",
+                        xy=(float(row["freq_hz_primary"]), float(row["mean_mse"])),
+                        xytext=(4, 4), textcoords="offset points",
+                        fontsize=FONT_LABEL * 0.7,
+                        color=COLOR_VERMILLION, family="monospace",
+                    )
+            for _, row in best3.iterrows():
+                if row["freq_hz_primary"] > 0:
+                    ax.annotate(
+                        f"ch{int(row['channel'])}",
+                        xy=(float(row["freq_hz_primary"]), float(row["mean_mse"])),
+                        xytext=(4, -8), textcoords="offset points",
+                        fontsize=FONT_LABEL * 0.7,
+                        color=COLOR_GREEN, family="monospace",
+                    )
+
+        ax.set_xscale("log")
+        ax.set_xlabel("centre frequency (Hz)", fontsize=FONT_LABEL)
+        ax.set_ylabel("mean forecast MSE", fontsize=FONT_LABEL)
+        ax.set_title(title, fontsize=FONT_TITLE * 0.9, fontweight="normal")
+        ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND * 0.85)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_phase_harmonic_mse(
+    per_channel_df: pd.DataFrame,
+    channel_metadata_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Mean per-channel MSE vs phase harmonic ratio (phase channels only).
+
+    Uses the per-channel CSV plus the channel-metadata table to plot
+    one point per phase channel: x = ``harmonic_ratio`` (the power
+    ``p`` from ``select_fhr_phase_coefficients``), y = mean forecast
+    MSE across all samples, color = ``freq_hz_primary`` (target wavelet
+    centre frequency in Hz, viridis), marker = coefficient ``kind``.
+
+    Args:
+        per_channel_df: Long-format per-channel CSV.
+        channel_metadata_df: Static channel metadata. Used to filter to
+            phase channels and pull the ``xi_j_hz`` color value.
+        output_path: Destination PDF.
+
+    No-ops if the input has no phase channels.
+    """
+    if per_channel_df is None or per_channel_df.empty:
+        return
+    needed = {"channel", "kind", "harmonic_ratio", "freq_hz_primary", "mse_total"}
+    if not needed.issubset(per_channel_df.columns):
+        return
+
+    sub = per_channel_df.loc[
+        per_channel_df["kind"].astype(str).str.startswith("ph_")
+    ]
+    if sub.empty:
+        return
+
+    agg = sub.groupby(
+        ["channel", "kind", "harmonic_ratio", "freq_hz_primary"],
+        as_index=False,
+    )["mse_total"].mean().rename(columns={"mse_total": "mean_mse"})
+    if agg.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+
+    # Colour scale = primary (target) frequency in Hz.
+    freqs = agg["freq_hz_primary"].to_numpy(dtype=float)
+    finite_freqs = freqs[np.isfinite(freqs) & (freqs > 0)]
+    if finite_freqs.size > 0:
+        vmin = float(np.min(finite_freqs))
+        vmax = float(np.max(finite_freqs))
+    else:
+        vmin, vmax = 0.0, 1.0
+    cmap = plt.colormaps.get_cmap("viridis")
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+    marker_for_kind = {
+        "ph_diag":  "o",
+        "ph_h2":    "s",
+        "ph_h3":    "^",
+        "ph_other": "D",
+    }
+    for kind, kind_sub in agg.groupby("kind"):
+        marker = marker_for_kind.get(str(kind), "x")
+        xs = kind_sub["harmonic_ratio"].to_numpy(dtype=float)
+        ys = kind_sub["mean_mse"].to_numpy(dtype=float)
+        cs = kind_sub["freq_hz_primary"].to_numpy(dtype=float)
+        ax.scatter(
+            xs, ys, c=cs, cmap=cmap, norm=norm,
+            marker=marker, s=42, edgecolors=COLOR_BLACK, linewidths=0.4,
+            label=str(kind), alpha=0.95,
+        )
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.02)
+    cbar.set_label("xi_j (target Hz)", fontsize=FONT_LABEL * 0.85)
+    cbar.ax.tick_params(labelsize=FONT_LABEL * 0.7)
+
+    ax.set_xlabel("phase harmonic ratio p (xi_j / xi_i)", fontsize=FONT_LABEL)
+    ax.set_ylabel("mean forecast MSE", fontsize=FONT_LABEL)
+    ax.set_title(
+        "Per-channel forecast MSE vs phase harmonic ratio",
+        fontsize=FONT_TITLE * 0.9, fontweight="normal",
+    )
+    ax.legend(
+        loc="best", frameon=True, fontsize=FONT_LEGEND * 0.85,
+        title="kind",
+    )
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_latent_distributions(

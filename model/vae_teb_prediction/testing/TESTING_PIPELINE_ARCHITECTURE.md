@@ -164,11 +164,19 @@ dispatch, and ground-truth construction.
   the resulting dict under `outputs["loss_dict"]`.
 - `ensure_dir(subdir)` — create and return an output subdirectory.
 
-### 1b. `band_partition.py` — Channel-to-frequency-band mapping
+### 1b. `band_partition.py` — Channel partitions for the 87-channel target
 
-Builds and caches the per-channel partition of the 87-channel FHR
-forecast target into the four clinical bands defined in
-`knowledge/dataset/scattering_phase_pipeline.md` Section 8:
+Builds and caches **four parallel partitions** of the 87-channel FHR
+forecast target. The mapping is reconstructed deterministically at
+runtime by instantiating `KymatioPhaseScattering1D(J=11, Q=4, T=16,
+shape=5280)` and reading both its scattering meta (for the 43
+`fhr_st` channels) and `select_fhr_phase_coefficients(min_freq=0.006)`
+(for the 44 `fhr_ph` channels). Each `fhr_ph` channel is assigned to
+the band of $\xi_j$ — the upper / target frequency of the wavelet pair
+— since that band hosts the rhythm/harmonic content the coefficient
+describes.
+
+**Partition 1 — `clinical_4band` (historic)**:
 
 | Band            | Hz range            | Period range  |
 |-----------------|---------------------|---------------|
@@ -177,23 +185,56 @@ forecast target into the four clinical bands defined in
 | `variability`   | $0.04 \le f \le 0.25$| 4 – 25 s    |
 | `beat_to_beat`  | $f > 0.25$          | $< 4\,$s      |
 
-The mapping is reconstructed deterministically at runtime by
-instantiating `KymatioPhaseScattering1D(J=11, Q=4, T=16, shape=5280)`
-and reading both its scattering meta (for the 43 `fhr_st` channels)
-and `select_fhr_phase_coefficients(min_freq=0.006)` (for the 44
-`fhr_ph` channels). Each fhr_ph channel is assigned to the band of
-$\xi_j$ — the upper / target frequency of the wavelet pair — since
-that band hosts the rhythm/harmonic content the coefficient describes.
+Defined in `knowledge/dataset/scattering_phase_pipeline.md` Section 8.
+Variability uses an inclusive upper bound at 0.25 Hz; the other bands
+are half-open.
+
+**Partition 2 — `clinical_7band` (refined)**:
+
+| Band            | Hz range          | Period range |
+|-----------------|-------------------|--------------|
+| `baseline`      | $f < 0.008$       | $> 125\,$s   |
+| `early_decel`   | $[0.008, 0.013)$  | 75 – 125 s   |
+| `late_decel`    | $[0.013, 0.04)$   | 25 – 75 s    |
+| `lf_var`        | $[0.04, 0.15)$    | 6.7 – 25 s   |
+| `mf_var`        | $[0.15, 0.25)$    | 4 – 6.7 s    |
+| `beat_to_beat`  | $[0.25, 1.0)$     | 1 – 4 s      |
+| `nyquist_edge`  | $\ge 1.0$         | $< 1\,$s     |
+
+The decel split at 0.013 Hz separates early decelerations (~75–125 s
+period, vagal) from late ones (25–75 s, hypoxic). The variability split
+at 0.15 Hz aligns with the LF / MF division in the fetal HRV
+literature. All seven bands use half-open intervals.
+
+**Partition 3 — `by_kind`** groups channels by *what the coefficient
+encodes* rather than by frequency:
+
+| Kind       | Description                                              |
+|------------|----------------------------------------------------------|
+| `st_S0`    | DC / lowpass envelope (1 channel for the canonical config) |
+| `st_S1`    | First-order wavelet envelope (42 channels)               |
+| `ph_diag`  | Within-channel autocorrelation (i = j)                   |
+| `ph_h2`    | 2nd-harmonic phase coupling (p ≈ 2)                      |
+| `ph_h3`    | 3rd-harmonic phase coupling (p ≈ 3) — typically empty    |
+| `ph_other` | Other phase pairs                                        |
+
+**Partition 4 — `by_octave`** uses the kymatio J-octave bank directly:
+`octave_k` covers `xi*fs ∈ [fs · 2^-(k+1), fs · 2^-k)` Hz. For
+`fs=4 Hz, J=11` this gives 11 bands from `~2 Hz` (octave_0) down to
+`~0.002 Hz` (octave_10), plus `octave_dc` for the S0 channel.
 
 **Public API**:
 
 | Symbol | Description |
 |--------|-------------|
-| `BAND_NAMES` | Canonical tuple ordering (`slow_baseline`, `deceleration`, `variability`, `beat_to_beat`). |
-| `BAND_HZ_RANGES` | Dict mapping each band to `(low_hz, high_hz)`. |
-| `BandPartition` | Dataclass holding `band_names`, `band_hz_ranges`, `band_period_ranges_s`, `n_st_channels`, `n_ph_channels`, `n_total`, `st_idx[band]` (indices into `[0, 43)`), `ph_idx[band]` (indices into `[43, 87)`, already shifted into 87-channel space), `combined_idx[band]`, and `channel_metadata` (one row per 87-channel index with `[channel, kind, band, freq_hz_primary, freq_hz_secondary, harmonic_ratio]`). |
+| `BAND_NAMES`, `BAND_HZ_RANGES` | clinical_4band ordering and ranges (legacy). |
+| `REFINED7_BAND_NAMES`, `REFINED7_HZ_RANGES` | clinical_7band ordering and ranges. |
+| `KIND_NAMES` | by_kind ordering (`st_S0, st_S1, ph_diag, ph_h2, ph_h3, ph_other`). |
+| `OCTAVE_DC_LABEL` | Special label `"octave_dc"` for channels with no centre frequency. |
+| `BandPartition` | Dataclass carrying every partition: clinical_4band (`band_names, band_hz_ranges, st_idx, ph_idx, combined_idx`), clinical_7band (`refined7_band_names, refined7_hz_ranges, refined7_idx`), by_kind (`kind_names, kind_idx`), by_octave (`octave_names, octave_hz_ranges, octave_idx`), plus `channel_metadata` (one row per 87-channel index with `[channel, kind, band, refined_band, octave, freq_hz_primary, freq_hz_secondary, harmonic_ratio]`). |
+| `BandPartition.partition_idx(name)` / `partition_names(name)` / `nonempty_partition(name)` | Look up indices / names / nonempty subset for any partition by name (`"clinical_4band"`, `"clinical_7band"`, `"by_kind"`, `"by_octave"`). |
 | `build_band_partition(...)` | Builds and lru-caches a `BandPartition` for `(J, Q, T, shape, fhr_phase_min_freq, n_st, n_ph, fs)`. Defaults match the v1 dataset: `J=11, Q=4, T=16, shape=5280, fhr_phase_min_freq=0.006, n_st=43, n_ph=44, fs=4 Hz`. |
-| `BandPartition.write(out_dir)` | Persists `band_partition.json` and `band_channel_map.csv` for downstream tools and TE_Calculated. |
+| `BandPartition.write(out_dir)` | Persists `band_partition.json` (with the top-level `partitions` key holding all four mappings) and `band_channel_map.csv` for downstream tools and TE_Calculated. |
 
 ### 2. `metrics.py` — Pure metric functions
 
@@ -210,7 +251,8 @@ tensors.
 | **`compute_kld_aggregate_tensors(outputs, warmup_steps=30)`** | Forward dict | `{kld_mean_t, kld_sum_t, kld_l2_t}` each `(B,T)` | Per-time KL mean, additive latent-dim sum, and Euclidean norm; warmup all-NaN timesteps remain NaN. |
 | **`compute_kld_aggregates_per_sample(outputs, warmup_steps=30)`** | Forward dict | `{kld_mean, kld_sum, kld_l2}` each `(B,)` | Per-sample averages of the three KLD aggregate trajectories. |
 | `compute_forecast_metrics(mu_full, y_plus, warmup, horizon)` | `(B,T,H_d,C)` + `(B,T−H_d,H_d,C)` | `{feat_mse_total, feat_mse_per_horizon, feat_r2_total, feat_mse_st, feat_mse_ph}` | Feature-forecast quality split into scattering (ch 0..42) and phase (ch 43..86). |
-| **`compute_band_forecast_metrics(mu_full, y_plus, warmup, horizon, band_combined_idx, *, return_per_anchor=True)`** | same shapes + `Dict[band, int-array]` | `{band -> {mse_total (B,), mse_per_horizon (B,H_d), r2_total (B,), n_channels, mse_per_anchor (B,T_v)}}` | Per-band channel-sliced version of `compute_forecast_metrics`. The optional `mse_per_anchor` tensor is what powers the band-x-time anchor-error grid. |
+| **`compute_band_forecast_metrics(mu_full, y_plus, warmup, horizon, partition_idx, *, return_per_anchor=True, band_combined_idx=None)`** | same shapes + `Dict[label, int-array]` | `{label -> {mse_total (B,), mse_per_horizon (B,H_d), r2_total (B,), n_channels, mse_per_anchor (B,T_v)}}` | Channel-sliced version of `compute_forecast_metrics`. Generalised: `partition_idx` accepts any `label -> int_array` mapping (clinical 4-band, refined 7-band, by_kind, by_octave). The legacy `band_combined_idx` keyword is preserved as a back-compat alias. |
+| **`compute_per_channel_forecast_metrics(mu_full, y_plus, warmup, horizon)`** | same shapes | `{mse_per_channel (B, C_y), r2_per_channel (B, C_y)}` | Per-sample × per-channel forecast MSE / R² over valid anchors. Channel-mean equals `feat_mse_total` from `compute_forecast_metrics`. Powers the `per_channel/` diagnostics that ask "which exact channel is hardest to forecast?" without pre-binning into a band. |
 | `compute_uplift_metrics(mu_full, mu_base, y_plus, warmup, horizon)` | same as above | `{l_full, l_base, uplift_abs, uplift_rel}` | Baseline-vs-full uplift per sample. |
 | `compute_residual_usage(delta_mu_src, mu_full, warmup, horizon)` | `(B,T,H_d,C)` | `{delta_norm, full_norm, residual_ratio, delta_norm_t}` | Source-branch activity and per-anchor trace. |
 | `compute_attention_diagnostics(attn_weights, warmup)` | `(B,T,M,L)` | `{alpha_bar, argmax_lag, entropy, head_diversity, alpha_mass_by_lag}` | Lag-attention summary with NaN-filled warmup. |
@@ -374,7 +416,7 @@ pooled `forecast_error_by_horizon.pdf`, and the per-class variants
 `forecast_error_by_horizon_by_class.pdf`,
 `feat_mse_total_hist_by_class.pdf`, `feat_r2_total_hist_by_class.pdf`.
 
-#### `frequency_band_forecast.py` **(new)**
+#### `frequency_band_forecast.py` **(extended)**
 
 ```python
 def run_frequency_band_forecast_analysis(
@@ -384,23 +426,53 @@ def run_frequency_band_forecast_analysis(
 ```
 
 Channel-sliced version of `forecast_quality.py`. Builds the
-`BandPartition` once, dumps `band_partition.json` and
-`band_channel_map.csv`, then iterates the loader and emits per-sample,
-per-horizon, and per-anchor MSE/R² metrics restricted to each band.
-Outputs `frequency_band_forecast/`:
+`BandPartition` once and runs **four parallel partitions plus a
+per-channel pass** in a single inference loop:
 
-- `per_sample.csv` — long-format rows `[guid, epoch, label, band, n_channels, mse_total, r2_total]`.
-- `per_horizon.csv` — long-format `[guid, epoch, label, band, h, mse]`.
-- `per_anchor.csv` — long-format `[guid, epoch, label, band, t, mse]` (`t` is absolute anchor index, ≥ warmup).
-- `summary.json` — pooled and per-class mean/median MSE/R² per band.
-- Pooled PDFs: `band_mse_violin.pdf`, `band_r2_violin.pdf`, `band_horizon_error.pdf`, `band_anchor_error.pdf`.
-- Per-class PDFs (only when ≥ 2 classes present): `band_mse_violin_by_class.pdf`, `band_r2_violin_by_class.pdf`, `band_horizon_error_by_class.pdf`, `band_anchor_error_by_class.pdf`.
+- `clinical_4band` — historic clinical bands (slow_baseline,
+  deceleration, variability, beat_to_beat). Same boundaries as before.
+- `clinical_7band` — finer 7-band split derived from the actual
+  scattering frequencies (baseline, early/late decel at 0.013 Hz,
+  lf/mf var at 0.15 Hz, beat_to_beat, nyquist_edge at 1 Hz).
+- `by_kind` — coefficient kind: `st_S0`, `st_S1`, `ph_diag`, `ph_h2`,
+  `ph_h3`, `ph_other`. Answers "is the model better at envelope
+  morphology (S1) than rhythm phase stability (ph_diag)?".
+- `by_octave` — kymatio J=11 octaves at fs=4 Hz, plus `octave_dc`
+  for the S0 channel.
 
-The anchor x-axis is rescaled to minutes via `decim_step_seconds /
-60` (default `4 s / 60` for the v1 16x decimation at 4 Hz), so the
-band-vs-time plots are directly readable in clinical time. Bands with
-zero channels at runtime (very rare; possible for unusual config
-overrides) are silently dropped from plots.
+Outputs under `frequency_band_forecast/`:
+
+- `band_partition.json` — every partition's labels, hz ranges and
+  channel-index lists (top-level `partitions` key).
+- `band_channel_map.csv` — one row per channel × every partition
+  axis (`channel, kind, band, refined_band, octave,
+  freq_hz_primary, freq_hz_secondary, harmonic_ratio`).
+- `summary.json` — extended schema. Top-level keys (`bands`,
+  `by_band`, `by_band_and_class`) mirror the historic
+  `clinical_4band` view; new `partitions` and `per_channel` keys
+  carry the full multi-partition + per-channel diagnostics.
+- **Top-level back-compat duplicates** of `clinical_4band/`:
+  `per_sample.csv`, `per_horizon.csv`, `per_anchor.csv`. Existing
+  consumers (`per_class_breakdown`, `TE_Calculated`) keep working.
+- `clinical_4band/`, `clinical_7band/`, `by_kind/`, `by_octave/` —
+  each subdirectory carries the same file set as the legacy top
+  level: `per_sample.csv`, `per_horizon.csv`, `per_anchor.csv` plus
+  the pooled and by-class PDFs (`band_mse_violin.pdf`,
+  `band_r2_violin.pdf`, `band_horizon_error.pdf`,
+  `band_anchor_error.pdf`, `*_by_class.pdf` when ≥2 classes).
+- `per_channel/` — `per_channel_forecast.csv` (one row per `(sample,
+  channel)` with `mse_total`, `r2_total`, plus the static channel
+  metadata), `mse_vs_freq.pdf`, `mse_vs_freq_by_class.pdf`,
+  `mse_vs_harmonic_ratio.pdf`, and `worst_channels_by_kind.csv`
+  (top-10 worst-MSE channels per kind for quick triage).
+
+The anchor x-axis is rescaled to minutes via `decim_step_seconds / 60`
+(default `4 s / 60` for the v1 16x decimation at 4 Hz). Empty
+labels (e.g. `nyquist_edge` or `ph_h3` for the canonical config) are
+silently dropped from both summary and plots. Per-class
+stratification is delegated to `per_class_breakdown.py`, which now
+walks every partition subdirectory and emits cross-class overlays
+per partition (`per_class_breakdown/class_overlay/frequency_band_<partition>_*`).
 
 #### `temporal.py`
 
