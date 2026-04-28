@@ -176,6 +176,24 @@ def _process_histogram(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
     ]
     metric_cols = [c for c in metric_cols if c in df.columns]
 
+    # Surface missing classes once before the loop. Otherwise an upstream
+    # loader that drops a whole outcome (e.g. only HIE survives the filter)
+    # produces a one-class breakdown silently.
+    if "label" in df.columns:
+        present_labels = {
+            int(v) for v in df["label"].dropna().unique()
+            if int(v) in CLASS_NAMES
+        }
+        missing = [
+            CLASS_NAMES[lid] for lid in CLASS_NAMES if lid not in present_labels
+        ]
+        if missing:
+            logger.warning(
+                f"per_class_breakdown[histogram]: classes "
+                f"{missing} have no rows in the input CSV; "
+                f"per-class subfolders / overlays for them will be skipped."
+            )
+
     per_class: Dict[int, pd.DataFrame] = {}
     for label_id in CLASS_NAMES:
         sub = _filter_by_label(df, label_id)

@@ -706,16 +706,23 @@ def run_full_test_pipeline(
 
     # 14. Sample diagnostics (gated).
     if not skip_forecast_heatmaps and analysis_samples > 0:
+        # Cap analysis_samples by max_samples when set. Use ``is None``
+        # explicitly so an explicit ``max_samples=0`` request does not get
+        # coerced back to ``analysis_samples`` by ``or``.
+        diag_cap = (
+            analysis_samples if max_samples is None
+            else min(analysis_samples, max_samples)
+        )
         _step(
             "sample_diagnostics",
             run_sample_diagnostics,
-            runner, standard_loader, min(analysis_samples, max_samples or analysis_samples),
+            runner, standard_loader, diag_cap,
         )
         # 14b. Per-sample KLD + lag-attention diagnostic figures.
         _step(
             "kld_lag_diagnostics",
             run_kld_lag_diagnostics,
-            runner, standard_loader, min(analysis_samples, max_samples or analysis_samples),
+            runner, standard_loader, diag_cap,
         )
 
     # 14c. PCA on per-dim KL trajectory.
