@@ -200,7 +200,7 @@ def compute_kld_per_sample(
     if kld is None:
         # Fallback: return zeros with correct batch size
         # Try to get batch size from any available tensor
-        for key in ("mu_pr", "z", "mu_prior", "mu_post"):
+        for key in ("z", "mu_prior", "mu_post"):
             if key in outputs and outputs[key] is not None:
                 batch_size = outputs[key].size(0)
                 device = outputs[key].device
@@ -286,7 +286,7 @@ def compute_kld_aggregates_per_sample(
     """
     agg_t = compute_kld_aggregate_tensors(outputs, warmup_steps)
     if agg_t is None:
-        for key in ("mu_pr", "z", "mu_prior", "mu_post"):
+        for key in ("z", "mu_prior", "mu_post"):
             t = outputs.get(key)
             if t is not None:
                 zeros = torch.zeros(t.size(0), device=t.device, dtype=t.dtype)

@@ -12,7 +12,7 @@ Example:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -245,9 +245,9 @@ def plot_sample_dual_axis_trajectories(
             h_min, h_max = hours.min(), hours.max()
             ax.set_xlim(h_max + 0.2, max(h_min - 0.2, 0))
             ax.set_title(
-                f"GUID ...{guid[-6:]}  (n={len(sub)}, "
-                f"{h_max:.1f}\u2013{h_min:.1f} h)",
-                fontsize=7,
+                f"GUID {_format_guid(guid)}  "
+                f"(n={len(sub)}, {h_max:.1f}\u2013{h_min:.1f} h)",
+                fontsize=5.5, family="monospace", loc="left",
             )
             _style_axes(ax, grid="major")
 
@@ -365,13 +365,14 @@ def plot_per_guid_correlation_bar(
         for p in df["spearman_p"]
     ]
 
-    fig, ax = plt.subplots(figsize=(6, max(3, len(df) * 0.15)))
+    fig, ax = plt.subplots(figsize=(9, max(3, len(df) * 0.18)))
     ax.barh(range(len(df)), df["spearman_rho"].values, color=colors,
             edgecolor="none", height=0.7)
     ax.axvline(0, color=COLOR_BLACK, linewidth=0.6)
     ax.set_yticks(range(len(df)))
     ax.set_yticklabels(
-        [f"...{g[-6:]}" for g in df["guid"].values], fontsize=5
+        [_format_guid(g) for g in df["guid"].values],
+        fontsize=4.5, family="monospace",
     )
     ax.set_xlabel("Spearman ρ (TE vs KLD)")
     ax.set_title(
@@ -473,9 +474,28 @@ def _sig_stars(p: float) -> str:
     return ""
 
 
-def _short_guid(guid: str, n: int = 8) -> str:
-    """Truncate a GUID to its leading hex digits for display."""
-    return str(guid)[:n] + "..."
+def _format_guid(guid: Any, *, max_chars: Optional[int] = None) -> str:
+    """Render a GUID for display.
+
+    Defaults to the full GUID string. Existing call-sites that previously
+    truncated to a leading-hex prefix can pass ``max_chars`` to keep the
+    same compact behaviour. The pipeline standardises on full GUIDs in
+    every figure so per-row labels can always be traced back to a
+    recording in the metrics CSV; ``max_chars`` is reserved for the rare
+    legend / annotation slot that does not have room for 32 chars.
+    """
+    s = str(guid)
+    if max_chars is not None and max_chars > 0 and len(s) > max_chars:
+        return s[:max_chars] + "..."
+    return s
+
+
+# Backwards-compat alias so any external import keeps working. New code
+# should call ``_format_guid`` directly. The default behaviour is now to
+# return the full GUID, matching the project-wide policy.
+def _short_guid(guid: Any, n: Optional[int] = None) -> str:  # noqa: D401
+    """Backwards-compat shim around :func:`_format_guid`."""
+    return _format_guid(guid, max_chars=n)
 
 
 # ---------------------------------------------------------------------------
@@ -543,13 +563,16 @@ def plot_data_quality_summary(
         df = pd.DataFrame(per_guid_match).sort_values(
             "n_matched", ascending=False
         )
-        labels = [_short_guid(g) for g in df["guid"].astype(str).tolist()]
+        labels = [_format_guid(g) for g in df["guid"].astype(str).tolist()]
         ax_bar.bar(
             range(len(df)), df["n_matched"],
             color=COLOR_BLUE, alpha=0.85,
         )
         ax_bar.set_xticks(range(len(df)))
-        ax_bar.set_xticklabels(labels, rotation=60, ha="right", fontsize=6)
+        ax_bar.set_xticklabels(
+            labels, rotation=75, ha="right", fontsize=4.5,
+            family="monospace",
+        )
         ax_bar.set_ylabel("n matched", fontsize=8)
         for i, (_, row) in enumerate(df.iterrows()):
             ax_bar.text(
@@ -772,30 +795,32 @@ def plot_trend_agreement(
 ) -> Path:
     """Per-GUID agreement bars + overall rate + binomial p annotation."""
     per_guid = trend_result.get("per_guid_agreement", {}) or {}
-    fig, ax = plt.subplots(figsize=(max(4.5, 0.4 * len(per_guid) + 2.5), 3.2))
+    n_guids = len(per_guid)
+    # Switch to a horizontal bar so full GUIDs fit on the y-axis.
+    fig, ax = plt.subplots(figsize=(7.5, max(3.2, 0.18 * n_guids + 2.5)))
     if per_guid:
         labels = list(per_guid.keys())
-        short = [_short_guid(g) for g in labels]
+        formatted = [_format_guid(g) for g in labels]
         rates = [per_guid[g]["agreement_rate"] for g in labels]
         n_trans = [per_guid[g]["n_transitions"] for g in labels]
         colors = [
             COLOR_GREEN if r >= 0.5 else COLOR_VERMILLION for r in rates
         ]
-        ax.bar(range(len(labels)), rates, color=colors, alpha=0.85)
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(short, rotation=60, ha="right", fontsize=7)
+        ax.barh(range(len(labels)), rates, color=colors, alpha=0.85)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(formatted, fontsize=4.5, family="monospace")
         for i, (r, n) in enumerate(zip(rates, n_trans)):
-            ax.text(i, r + 0.02, f"n={n}", ha="center", va="bottom",
+            ax.text(r + 0.01, i, f"n={n}", ha="left", va="center",
                     fontsize=6, color=COLOR_GRAY)
-    ax.axhline(0.5, color=COLOR_GRAY, linewidth=0.6, linestyle=":",
+    ax.axvline(0.5, color=COLOR_GRAY, linewidth=0.6, linestyle=":",
                label="chance (0.5)")
     overall = trend_result.get("sign_agreement_rate", float("nan"))
     binom_p = trend_result.get("binomial_p", float("nan"))
     if np.isfinite(overall):
-        ax.axhline(overall, color=COLOR_BLUE, linewidth=1.2,
+        ax.axvline(overall, color=COLOR_BLUE, linewidth=1.2,
                    label=f"overall={overall:.2%}")
-    ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("Sign agreement rate", fontsize=8)
+    ax.set_xlim(0.0, 1.05)
+    ax.set_xlabel("Sign agreement rate", fontsize=8)
     ax.set_title(
         f"Trend agreement — binomial p = {binom_p:.3f}",
         fontsize=10,
@@ -822,25 +847,27 @@ def plot_leave_one_out(
     full_r = loo_result.get("full_correlation", float("nan"))
     most = loo_result.get("most_influential_guid")
 
-    labels = ["full"] + [_short_guid(g) for g in leave_out.keys()]
+    labels = ["full"] + [_format_guid(g) for g in leave_out.keys()]
     values = [full_r] + list(leave_out.values())
     bar_colors = [COLOR_BLACK] + [
         COLOR_VERMILLION if g == most else COLOR_BLUE
         for g in leave_out.keys()
     ]
 
-    fig, ax = plt.subplots(figsize=(max(3.2, 0.5 * len(labels) + 2), 3.2))
-    ax.bar(range(len(labels)), values, color=bar_colors, alpha=0.85)
-    ax.axhline(0.0, color=COLOR_GRAY, linewidth=0.6, linestyle=":")
+    # Horizontal bars so full GUIDs render comfortably as y-tick labels.
+    fig, ax = plt.subplots(figsize=(7.5, max(3.2, 0.18 * len(labels) + 2.0)))
+    ax.barh(range(len(labels)), values, color=bar_colors, alpha=0.85)
+    ax.axvline(0.0, color=COLOR_GRAY, linewidth=0.6, linestyle=":")
     if np.isfinite(full_r):
-        ax.axhline(full_r, color=COLOR_GRAY, linewidth=0.6, linestyle="--",
+        ax.axvline(full_r, color=COLOR_GRAY, linewidth=0.6, linestyle="--",
                    label="full ρ")
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
-    ax.set_ylabel(f"{loo_result.get('method', 'spearman')} ρ", fontsize=8)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=4.5, family="monospace")
+    ax.invert_yaxis()
+    ax.set_xlabel(f"{loo_result.get('method', 'spearman')} ρ", fontsize=8)
     title_bits = ["Leave-one-GUID-out sensitivity"]
     if most:
-        title_bits.append(f"(most influential: {_short_guid(str(most))})")
+        title_bits.append(f"(most influential: {_format_guid(str(most))})")
     ax.set_title(" ".join(title_bits), fontsize=10)
     if any(np.isfinite(v) for v in values):
         ax.legend(fontsize=7, loc="best")
@@ -1058,7 +1085,12 @@ def plot_dtw_trajectories(
                       linewidth=0.3),
         )
 
-        ax.set_title(f"GUID {_short_guid(guid)}", fontsize=9)
+        # Full GUID stays on the title (monospace) so DTW pages remain
+        # traceable even after re-ordering by domain_start.
+        ax.set_title(
+            f"GUID {_format_guid(guid)}",
+            fontsize=6.5, family="monospace", loc="left",
+        )
         ax.set_ylabel("z-score", fontsize=8)
         ax.legend(fontsize=6, loc="upper left")
         _style_axes(ax)
@@ -1205,7 +1237,10 @@ def plot_per_guid_trajectory_overlays(
                 markersize=3, linewidth=1.0, label="TE (z)")
         ax.plot(hours, kv_z, color=COLOR_BLUE, marker="o",
                 markersize=3, linewidth=1.0, label="KLD (z)")
-        ax.set_title(f"{_short_guid(guid)} (n={len(sub)})", fontsize=8)
+        ax.set_title(
+            f"{_format_guid(guid)}  (n={len(sub)})",
+            fontsize=5.5, family="monospace", loc="left",
+        )
         ax.legend(fontsize=6, loc="upper left")
         _style_axes(ax)
         if i // ncols == nrows - 1:
@@ -1469,6 +1504,766 @@ def plot_conditional_ks_grid(
     ax.set_xticks(quartiles)
     _style_axes(ax)
     fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Distance-based comparisons (Euclidean / RMSE / NRMSE / cosine / Frechet)
+# ---------------------------------------------------------------------------
+
+
+_DISTANCE_METRIC_ORDER: Sequence[str] = (
+    "euclidean", "rmse", "nrmse", "cosine", "frechet_discrete",
+)
+
+# Metrics where higher = better (similarity) rather than lower = better
+# (distance). Plot helpers that rank GUIDs or color cells by "alignment
+# quality" must invert these so the convention "dark / top = best" is
+# uniform across the figure.
+_HIGHER_IS_BETTER_METRICS: frozenset = frozenset({"cosine"})
+
+
+def _alignment_quality(values: np.ndarray, metric: str) -> np.ndarray:
+    """Map raw metric values to a "lower = better" alignment quality.
+
+    For distance metrics this is the identity; for similarity metrics
+    (currently just ``cosine``) this returns ``-values`` so the same
+    direction logic ("smaller is better") works for sorting and
+    colormap normalisation.
+    """
+    arr = np.asarray(values, dtype=float)
+    if metric in _HIGHER_IS_BETTER_METRICS:
+        return -arr
+    return arr
+
+
+def _ensure_path(out_path: Path) -> Path:
+    """Coerce to ``Path`` and create parent directories."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def plot_per_guid_distance_heatmap(
+    per_guid_dist_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    metrics: Optional[Sequence[str]] = None,
+    score_col: Optional[str] = None,
+) -> Path:
+    """Heatmap of per-GUID distances across metrics (rows=GUIDs, cols=metrics).
+
+    Each metric column is independently min-max scaled so the colormap
+    is comparable across metrics with different units. The numeric value
+    of each cell is annotated in the original scale.
+
+    Args:
+        per_guid_dist_df: Output of
+            :func:`te_kld_distance_metrics.compute_per_guid_distances`.
+        out_path: PDF target.
+        metrics: Optional subset of distance columns to render. Defaults
+            to all metrics from ``_DISTANCE_METRIC_ORDER`` that exist on
+            the DataFrame.
+        score_col: Optional score column name to surface in the title
+            (e.g. ``"kld_pca_l2_top3"``).
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if per_guid_dist_df is None or per_guid_dist_df.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    metrics = list(metrics) if metrics else [
+        m for m in _DISTANCE_METRIC_ORDER if m in per_guid_dist_df.columns
+    ]
+    if not metrics:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No distance metrics", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    # Rank GUIDs by mean rank across metrics on the "lower = better"
+    # alignment-quality scale, so cosine (a similarity) does not pull
+    # well-aligned GUIDs to the bottom.
+    df = per_guid_dist_df.copy()
+    quality_cols = pd.DataFrame(
+        {m: _alignment_quality(df[m].to_numpy(dtype=float), m) for m in metrics},
+        index=df.index,
+    )
+    df["__rank"] = quality_cols.rank(method="average").mean(axis=1)
+    df = df.sort_values("__rank").reset_index(drop=True)
+    df = df.drop(columns="__rank")
+
+    arr = df[metrics].to_numpy(dtype=float)
+    norm = np.full_like(arr, np.nan, dtype=float)
+    for j, m in enumerate(metrics):
+        # Normalise on the alignment-quality scale so that, in every
+        # column, "dark = good alignment" and "bright = bad alignment".
+        # Cell text below still reports the raw value.
+        quality = _alignment_quality(arr[:, j], m)
+        finite = np.isfinite(quality)
+        if finite.sum() == 0:
+            continue
+        lo = float(np.nanmin(quality))
+        hi = float(np.nanmax(quality))
+        span = hi - lo
+        if span <= 1e-12:
+            norm[finite, j] = 0.0
+        else:
+            norm[finite, j] = (quality[finite] - lo) / span
+
+    n_rows = len(df)
+    height = max(3.0, 0.18 * n_rows + 1.5)
+    fig, ax = plt.subplots(figsize=(7.5, height))
+    im = ax.imshow(
+        norm, aspect="auto", cmap="viridis",
+        vmin=0.0, vmax=1.0, interpolation="nearest",
+    )
+    ax.set_xticks(range(len(metrics)))
+    ax.set_xticklabels(metrics, rotation=20, ha="right", fontsize=7)
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(
+        [_format_guid(g) for g in df["guid"].astype(str)],
+        fontsize=4.5, family="monospace",
+    )
+
+    for i in range(n_rows):
+        for j in range(len(metrics)):
+            v = arr[i, j]
+            if not np.isfinite(v):
+                continue
+            ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                    fontsize=4.5, color="white" if norm[i, j] > 0.55 else COLOR_BLACK)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    cbar.set_label("min-max within metric", fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    suffix = f" — score={score_col}" if score_col else ""
+    ax.set_title(f"Per-GUID distances{suffix}", fontsize=10, loc="left")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_distance_distribution(
+    per_guid_dist_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    score_col: Optional[str] = None,
+) -> Path:
+    """One-panel-per-metric box+strip plot of per-GUID distances.
+
+    The strip overlay surfaces every patient as a single point, which
+    makes outlier GUIDs visually obvious. The top 3 GUIDs (largest
+    distance) on each metric are annotated with their full ID.
+
+    Args:
+        per_guid_dist_df: Output of
+            :func:`te_kld_distance_metrics.compute_per_guid_distances`.
+        out_path: PDF target.
+        score_col: Optional score column name surfaced in the title.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    metrics = [m for m in _DISTANCE_METRIC_ORDER if m in per_guid_dist_df.columns]
+    if per_guid_dist_df is None or per_guid_dist_df.empty or not metrics:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    n = len(metrics)
+    fig, axes = plt.subplots(1, n, figsize=(2.4 * n + 0.6, 3.4))
+    if n == 1:
+        axes = [axes]
+
+    rng = np.random.default_rng(7)
+    for ax, metric in zip(axes, metrics):
+        vals = per_guid_dist_df[metric].to_numpy(dtype=float)
+        finite = np.isfinite(vals)
+        finite_vals = vals[finite]
+        if finite_vals.size == 0:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center")
+            ax.set_title(metric, fontsize=8)
+            continue
+        ax.boxplot(
+            finite_vals, vert=True, widths=0.55, showfliers=False,
+            patch_artist=True,
+            boxprops=dict(facecolor=COLOR_LIGHT_GRAY, color=COLOR_BLACK,
+                          linewidth=0.8),
+            medianprops=dict(color=COLOR_VERMILLION, linewidth=1.0),
+            whiskerprops=dict(color=COLOR_BLACK, linewidth=0.6),
+            capprops=dict(color=COLOR_BLACK, linewidth=0.6),
+        )
+        jitter = rng.uniform(0.85, 1.15, size=finite_vals.size)
+        ax.scatter(jitter, finite_vals, s=10, color=COLOR_BLUE,
+                   alpha=0.75, edgecolors="none")
+        # Annotate the 3 worst-aligned GUIDs (= largest distance for
+        # "lower-is-better" metrics, smallest similarity for cosine).
+        # Ranking on the alignment-quality scale keeps the convention
+        # uniform across every panel.
+        quality = _alignment_quality(finite_vals, metric)
+        order = np.argsort(quality)[::-1][:3]
+        guids_finite = per_guid_dist_df.loc[finite, "guid"].astype(str).to_numpy()
+        for k in order:
+            ax.annotate(
+                _format_guid(guids_finite[k]),
+                xy=(jitter[k], finite_vals[k]),
+                xytext=(4, 0), textcoords="offset points",
+                fontsize=4, family="monospace", color=COLOR_GRAY,
+                va="center", ha="left",
+            )
+        ax.set_title(metric, fontsize=8)
+        ax.set_xticks([1])
+        ax.set_xticklabels([f"n={finite_vals.size}"], fontsize=7)
+        _style_axes(ax)
+
+    suffix = f" — score={score_col}" if score_col else ""
+    fig.suptitle(f"Per-GUID distance distribution{suffix}", fontsize=10, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_per_guid_distance_bar(
+    per_guid_dist_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    metric: str = "euclidean",
+    score_col: Optional[str] = None,
+) -> Path:
+    """Sorted horizontal bar chart of one distance metric per GUID.
+
+    Bars are sorted ascending (best alignment at the top) and coloured
+    by outcome class when a ``label`` column is present.
+
+    Args:
+        per_guid_dist_df: Output of
+            :func:`te_kld_distance_metrics.compute_per_guid_distances`.
+        out_path: PDF target.
+        metric: Distance column to plot (default ``"euclidean"``).
+        score_col: Optional score column for the title.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if (
+        per_guid_dist_df is None or per_guid_dist_df.empty
+        or metric not in per_guid_dist_df.columns
+    ):
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    df = per_guid_dist_df.dropna(subset=[metric]).copy()
+    # Sort on the alignment-quality scale so that "best at top" holds
+    # for both distance metrics (lower is better) and similarity metrics
+    # like cosine (higher is better).
+    df["__quality"] = _alignment_quality(df[metric].to_numpy(dtype=float), metric)
+    df = df.sort_values("__quality", ascending=True).reset_index(drop=True)
+    df = df.drop(columns="__quality")
+
+    has_label = "label" in df.columns
+    if has_label:
+        try:
+            from model.vae_teb_prediction.testing.visualizers import class_color_for
+            colors = [
+                class_color_for(int(lab)) if pd.notna(lab) else COLOR_BLUE
+                for lab in df["label"]
+            ]
+        except Exception:  # noqa: BLE001
+            colors = [COLOR_BLUE] * len(df)
+    else:
+        colors = [COLOR_BLUE] * len(df)
+
+    height = max(3.0, 0.18 * len(df) + 1.6)
+    fig, ax = plt.subplots(figsize=(7.5, height))
+    ax.barh(range(len(df)), df[metric].to_numpy(dtype=float),
+            color=colors, alpha=0.85)
+    ax.set_yticks(range(len(df)))
+    ax.set_yticklabels(
+        [_format_guid(g) for g in df["guid"].astype(str)],
+        fontsize=4.5, family="monospace",
+    )
+    ax.invert_yaxis()
+    ax.set_xlabel(metric, fontsize=8)
+
+    if "n_pairs" in df.columns:
+        for i, (val, n_pairs) in enumerate(zip(
+            df[metric].to_numpy(dtype=float), df["n_pairs"].to_numpy()
+        )):
+            if np.isfinite(val):
+                ax.text(val, i, f"  n={int(n_pairs)}",
+                        ha="left", va="center", fontsize=5,
+                        color=COLOR_GRAY)
+
+    suffix = f" — score={score_col}" if score_col else ""
+    ax.set_title(f"Per-GUID {metric}{suffix}", fontsize=10, loc="left")
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_residual_trajectory_grid(
+    merged_df: pd.DataFrame,
+    per_guid_dist_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    score_col: str = "kld",
+    te_col: str = "ite_valid",
+    metric: str = "euclidean",
+    n_top: int = 6,
+    n_bottom: int = 6,
+) -> Path:
+    """Side-by-side trajectories of best- and worst-aligned GUIDs.
+
+    Z-scores both TE and the elected score per GUID, then renders the
+    paired trajectories on a shared y-axis with the residual highlighted
+    as a shaded band. The "top" rows show the GUIDs with the **smallest**
+    distance (best alignment), and the "bottom" rows show the **largest**
+    distance (worst alignment).
+
+    Args:
+        merged_df: Output of :func:`merge_te_kld`.
+        per_guid_dist_df: Output of
+            :func:`te_kld_distance_metrics.compute_per_guid_distances`.
+        out_path: PDF target.
+        score_col: Model-side score column to plot.
+        te_col: Empirical TE column.
+        metric: Distance column used to rank GUIDs.
+        n_top: Number of best-aligned GUIDs (top of figure).
+        n_bottom: Number of worst-aligned GUIDs (bottom of figure).
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if (
+        merged_df is None or merged_df.empty
+        or per_guid_dist_df is None or per_guid_dist_df.empty
+        or metric not in per_guid_dist_df.columns
+    ):
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    # Rank on alignment-quality so the "best" head and "worst" tail
+    # are correct for both distance metrics (lower=better) and the
+    # cosine similarity (higher=better).
+    ranked = per_guid_dist_df.dropna(subset=[metric]).copy()
+    ranked["__quality"] = _alignment_quality(
+        ranked[metric].to_numpy(dtype=float), metric,
+    )
+    ranked = ranked.sort_values("__quality").drop(columns="__quality")
+    if ranked.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "All distances NaN", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    top = ranked.head(n_top)
+    bottom = ranked.tail(n_bottom)
+    if metric in _HIGHER_IS_BETTER_METRICS:
+        best_label = f"Best-aligned (largest {metric})"
+        worst_label = f"Worst-aligned (smallest {metric})"
+    else:
+        best_label = f"Best-aligned (smallest {metric})"
+        worst_label = f"Worst-aligned (largest {metric})"
+    pages = [(best_label, top), (worst_label, bottom)]
+
+    time_col = (
+        "domain_start" if "domain_start" in merged_df.columns
+        else "epoch" if "epoch" in merged_df.columns
+        else merged_df.columns[1]
+    )
+
+    n_rows = max(len(top), len(bottom))
+    fig, axes = plt.subplots(
+        n_rows, 2, figsize=(11, max(2.2, 1.4 * n_rows + 0.5)),
+        squeeze=False,
+    )
+    for col_idx, (header, sub) in enumerate(pages):
+        guids = sub["guid"].astype(str).tolist()
+        for row_idx in range(n_rows):
+            ax = axes[row_idx][col_idx]
+            if row_idx >= len(guids):
+                ax.set_visible(False)
+                continue
+            guid = guids[row_idx]
+            metric_val = float(sub.iloc[row_idx][metric])
+            data = merged_df[merged_df["guid"] == guid].sort_values(time_col)
+            hours = data[time_col].to_numpy(dtype=float) / 3600.0
+            t_vals = data[te_col].to_numpy(dtype=float)
+            s_vals = data[score_col].to_numpy(dtype=float)
+
+            def _z(arr: np.ndarray) -> np.ndarray:
+                a = np.asarray(arr, dtype=float)
+                if a.size < 2 or np.std(a[np.isfinite(a)]) <= 1e-12:
+                    return np.zeros_like(a)
+                return (a - np.nanmean(a)) / np.nanstd(a)
+
+            tz = _z(t_vals)
+            sz = _z(s_vals)
+            ax.plot(hours, tz, color=COLOR_VERMILLION, marker="s",
+                    markersize=2.5, linewidth=1.0, label=f"{te_col} (z)")
+            ax.plot(hours, sz, color=COLOR_BLUE, marker="o",
+                    markersize=2.5, linewidth=1.0, label=f"{score_col} (z)")
+            ax.fill_between(hours, sz, tz,
+                             color=COLOR_GRAY, alpha=0.18, linewidth=0)
+            ax.set_title(
+                f"{_format_guid(guid)}  ({metric}={metric_val:.2f})",
+                fontsize=5.5, family="monospace", loc="left",
+            )
+            ax.tick_params(labelsize=6)
+            _style_axes(ax)
+            if row_idx == 0:
+                ax.legend(fontsize=5, loc="upper left")
+            if row_idx == n_rows - 1:
+                ax.set_xlabel("hours (negative = pre-delivery)", fontsize=6)
+
+    fig.suptitle(
+        f"Residual trajectory grid — {te_col} vs {score_col}",
+        fontsize=10, y=1.01,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# PCA-Euclidean diagnostics
+# ---------------------------------------------------------------------------
+
+
+def plot_pca_distance_curve(
+    pca_search_summary_df: pd.DataFrame,
+    out_path: Path,
+) -> Path:
+    """Pooled & macro-mean Euclidean distance vs number of PCs included.
+
+    One line per (source, ranking, aggregator) tuple, plus stars marking
+    the elected best subsets per source. Only ``aggregator == "l2"`` is
+    plotted by default to keep the figure readable; the underlying CSV
+    contains both aggregators for downstream analysis.
+
+    Args:
+        pca_search_summary_df: ``summary_df`` from
+            :func:`te_kld_distance_metrics.pca_distance_search`.
+        out_path: PDF target.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if pca_search_summary_df is None or pca_search_summary_df.empty:
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No PCA inputs", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    df = pca_search_summary_df[
+        pca_search_summary_df["aggregator"] == "l2"
+    ].copy()
+    if df.empty:
+        df = pca_search_summary_df.copy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.6), sharex=True)
+    palette = {
+        "existing|variance": (COLOR_BLUE, "-"),
+        "existing|te_corr":  (COLOR_BLUE, "--"),
+        "refit|variance":    (COLOR_VERMILLION, "-"),
+        "refit|te_corr":     (COLOR_VERMILLION, "--"),
+    }
+    for ax, ycol, title in (
+        (axes[0], "pooled_euclidean", "Pooled Euclidean"),
+        (axes[1], "macro_mean_euclidean", "Macro-mean per-GUID Euclidean"),
+    ):
+        for (source, ranking), grp in df.groupby(["source", "ranking"]):
+            ordered = grp.sort_values("k")
+            color, ls = palette.get(
+                f"{source}|{ranking}", (COLOR_GRAY, "-")
+            )
+            ax.plot(
+                ordered["k"].to_numpy(dtype=float),
+                ordered[ycol].to_numpy(dtype=float),
+                marker="o", markersize=4, linewidth=1.2,
+                color=color, linestyle=ls,
+                label=f"{source} | {ranking}",
+            )
+            # mark best per (source, ranking)
+            arr = ordered[ycol].to_numpy(dtype=float)
+            finite = np.isfinite(arr)
+            if finite.any():
+                idx = int(np.nanargmin(np.where(finite, arr, np.inf)))
+                ax.scatter(
+                    [ordered["k"].to_numpy()[idx]],
+                    [arr[idx]],
+                    marker="*", color=color, s=70,
+                    edgecolors=COLOR_BLACK, linewidths=0.4, zorder=5,
+                )
+        ax.set_xlabel("# PCs included (cumulative)", fontsize=7)
+        ax.set_ylabel(ycol, fontsize=7)
+        ax.set_title(title, fontsize=9)
+        ax.legend(fontsize=6, loc="best")
+        _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_per_pc_distance_heatmap(
+    per_pc_distance_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    metric: str = "euclidean",
+) -> Path:
+    """Heatmap rows=GUIDs cols=PCs cells=single-PC distance to TE.
+
+    Useful for asking *which PC* aligns best with TE for *which patient*.
+
+    Args:
+        per_pc_distance_df: ``per_pc_distance_df`` from
+            :func:`te_kld_distance_metrics.pca_distance_search`. Must
+            contain ``source``, ``pc``, ``guid`` and a distance column.
+        out_path: PDF target.
+        metric: Distance column to render (default ``"euclidean"``).
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if (
+        per_pc_distance_df is None or per_pc_distance_df.empty
+        or metric not in per_pc_distance_df.columns
+    ):
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    sources = sorted(per_pc_distance_df["source"].astype(str).unique())
+    n_sources = len(sources)
+    fig, axes = plt.subplots(
+        1, n_sources,
+        figsize=(5.5 * n_sources, max(3.2, 0.18 * per_pc_distance_df["guid"].nunique() + 1.8)),
+        squeeze=False,
+    )
+
+    for ax, source in zip(axes[0], sources):
+        sub = per_pc_distance_df[per_pc_distance_df["source"] == source]
+        pivot = sub.pivot_table(
+            index="guid", columns="pc", values=metric, aggfunc="mean",
+        )
+        # Order PCs naturally (kld_pc1, ..., refit_pc5).
+        cols = list(pivot.columns)
+        cols.sort(key=lambda c: (
+            0 if str(c).startswith("kld_pc") else 1,
+            int("".join(ch for ch in str(c) if ch.isdigit()) or "0"),
+        ))
+        pivot = pivot[cols]
+        # Order rows by alignment-quality (best-aligned at top), so the
+        # row order works for both distance metrics and cosine.
+        quality_arr = _alignment_quality(pivot.to_numpy(dtype=float), metric)
+        row_quality = np.nanmean(quality_arr, axis=1)
+        order_idx = np.argsort(row_quality)
+        pivot = pivot.iloc[order_idx]
+
+        arr = pivot.to_numpy(dtype=float)
+        if arr.size == 0:
+            ax.set_visible(False)
+            continue
+
+        im = ax.imshow(
+            arr, aspect="auto", cmap="magma_r",
+            interpolation="nearest",
+        )
+        ax.set_xticks(range(arr.shape[1]))
+        ax.set_xticklabels(pivot.columns, fontsize=6, rotation=30, ha="right")
+        ax.set_yticks(range(arr.shape[0]))
+        ax.set_yticklabels(
+            [_format_guid(g) for g in pivot.index.astype(str)],
+            fontsize=4.5, family="monospace",
+        )
+        ax.set_title(
+            f"source={source}: {metric} of single-PC trajectory vs TE",
+            fontsize=8, loc="left",
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+        cbar.set_label(metric, fontsize=6)
+        cbar.ax.tick_params(labelsize=5)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_joint_te_kld_pca(
+    joint_pca_result: Dict[str, Any],
+    out_path: Path,
+) -> Path:
+    """Two-panel diagnostic for the joint TE-KLD PCA.
+
+    Left panel: bar chart of the loadings of every input variable on
+    PC1..PCk (with the TE row highlighted). Right panel: PC1 vs PC2
+    scatter coloured by ``ite_valid`` quartile, with per-GUID centroids
+    annotated with their full GUID.
+
+    Args:
+        joint_pca_result: Output of
+            :func:`te_kld_distance_metrics.joint_te_kld_pca`.
+        out_path: PDF target.
+
+    Returns:
+        ``out_path``.
+    """
+    out_path = _ensure_path(out_path)
+    if (
+        joint_pca_result is None
+        or "loadings_df" not in joint_pca_result
+        or "scores_df" not in joint_pca_result
+    ):
+        fig, ax = plt.subplots(figsize=(4.0, 2.5))
+        msg = "joint PCA unavailable"
+        if isinstance(joint_pca_result, dict) and "error" in joint_pca_result:
+            msg = f"joint PCA: {joint_pca_result['error']}"
+        ax.text(0.5, 0.5, msg, ha="center", va="center")
+        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    loadings_df: pd.DataFrame = joint_pca_result["loadings_df"]
+    scores_df: pd.DataFrame = joint_pca_result["scores_df"]
+    evr = joint_pca_result.get("explained_variance_ratio", [])
+    te_col = joint_pca_result.get("te_col", "ite_valid")
+
+    fig = plt.figure(figsize=(11.5, 4.4))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.2], wspace=0.25)
+    ax_load = fig.add_subplot(gs[0, 0])
+    ax_scatter = fig.add_subplot(gs[0, 1])
+
+    pc_cols = [c for c in loadings_df.columns if c.startswith("PC")]
+    n_pc = len(pc_cols)
+    bar_width = 0.8 / max(n_pc, 1)
+    x = np.arange(len(loadings_df))
+    palette = [COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN,
+               COLOR_ORANGE, COLOR_GRAY, COLOR_BLACK]
+    for i, pc in enumerate(pc_cols):
+        ev = evr[i] if i < len(evr) else float("nan")
+        offset = (i - (n_pc - 1) / 2.0) * bar_width
+        ax_load.bar(
+            x + offset, loadings_df[pc].to_numpy(dtype=float),
+            width=bar_width,
+            color=palette[i % len(palette)],
+            alpha=0.85,
+            label=f"{pc} ({ev:.1%})",
+        )
+    ax_load.axhline(0.0, color=COLOR_BLACK, linewidth=0.5)
+    ax_load.set_xticks(x)
+    ax_load.set_xticklabels(loadings_df["variable"], rotation=20, ha="right",
+                            fontsize=7)
+    # Highlight the TE row
+    for tick in ax_load.get_xticklabels():
+        if tick.get_text() == te_col:
+            tick.set_color(COLOR_VERMILLION)
+            tick.set_fontweight("bold")
+    ax_load.set_ylabel("Loading", fontsize=8)
+    ax_load.set_title("Joint TE-KLD PCA: loadings", fontsize=9, loc="left")
+    ax_load.legend(fontsize=6, loc="best")
+    _style_axes(ax_load)
+
+    if "PC1" in scores_df.columns and "PC2" in scores_df.columns:
+        scatter_df = scores_df.dropna(subset=["PC1", "PC2"])
+        if te_col in scatter_df.columns:
+            te_vals = scatter_df[te_col].to_numpy(dtype=float)
+            try:
+                quartiles = pd.qcut(te_vals, 4, labels=False, duplicates="drop")
+                quartiles = np.asarray(quartiles, dtype=float)
+            except Exception:  # noqa: BLE001
+                quartiles = np.zeros_like(te_vals)
+            colormap = plt.colormaps.get_cmap("viridis")
+            colors = colormap(np.where(np.isfinite(quartiles), quartiles, 0) / 3.0)
+            ax_scatter.scatter(
+                scatter_df["PC1"].to_numpy(dtype=float),
+                scatter_df["PC2"].to_numpy(dtype=float),
+                s=10, c=colors, alpha=0.65, edgecolors="none",
+                rasterized=True,
+            )
+            sm = plt.cm.ScalarMappable(
+                cmap=colormap, norm=plt.Normalize(vmin=0, vmax=3),
+            )
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax_scatter, fraction=0.04, pad=0.02)
+            cbar.set_label(f"{te_col} quartile (Q1-Q4)", fontsize=6)
+            cbar.ax.tick_params(labelsize=5)
+        else:
+            ax_scatter.scatter(
+                scatter_df["PC1"].to_numpy(dtype=float),
+                scatter_df["PC2"].to_numpy(dtype=float),
+                s=10, color=COLOR_BLUE, alpha=0.6, edgecolors="none",
+            )
+        # Per-GUID centroids; annotate the top loaders in |TE| of PC1.
+        if "guid" in scatter_df.columns:
+            grouped = scatter_df.groupby("guid")[["PC1", "PC2"]].mean()
+            ax_scatter.scatter(
+                grouped["PC1"].to_numpy(dtype=float),
+                grouped["PC2"].to_numpy(dtype=float),
+                s=18, marker="x", color=COLOR_BLACK, linewidths=0.6,
+            )
+            # Annotate top-N centroids by |PC1| value.
+            order = grouped["PC1"].abs().sort_values(ascending=False).index[:6]
+            for guid in order:
+                row = grouped.loc[guid]
+                ax_scatter.annotate(
+                    _format_guid(guid),
+                    xy=(float(row["PC1"]), float(row["PC2"])),
+                    xytext=(4, 4), textcoords="offset points",
+                    fontsize=4, family="monospace",
+                    color=COLOR_BLACK,
+                )
+        ax_scatter.set_xlabel(
+            f"PC1 ({evr[0]:.1%})" if evr else "PC1", fontsize=7,
+        )
+        ax_scatter.set_ylabel(
+            f"PC2 ({evr[1]:.1%})" if len(evr) > 1 else "PC2", fontsize=7,
+        )
+        ax_scatter.set_title(
+            "PC1 vs PC2 — colored by empirical TE quartile",
+            fontsize=9, loc="left",
+        )
+        _style_axes(ax_scatter)
+    else:
+        ax_scatter.text(0.5, 0.5, "PC1/PC2 unavailable",
+                         transform=ax_scatter.transAxes,
+                         ha="center", va="center")
+
     fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
     return out_path

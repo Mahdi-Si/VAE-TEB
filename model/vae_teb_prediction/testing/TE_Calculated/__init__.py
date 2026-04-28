@@ -41,6 +41,14 @@ from model.vae_teb_prediction.testing.TE_Calculated.te_kld_analysis import (
     population_level_test,
     trend_agreement_analysis,
 )
+from model.vae_teb_prediction.testing.TE_Calculated.te_kld_distance_metrics import (
+    compute_pair_residuals,
+    compute_per_guid_distances,
+    compute_pooled_distances,
+    discrete_frechet_distance,
+    joint_te_kld_pca,
+    pca_distance_search,
+)
 from model.vae_teb_prediction.testing.TE_Calculated.te_kld_comparison import (
     run_comparison,
 )
@@ -51,15 +59,20 @@ __all__ = [
     "cluster_aware_bootstrap",
     "compute_cross_guid_correlation",
     "compute_data_quality_report",
+    "compute_pair_residuals",
     "compute_per_guid_correlations",
+    "compute_per_guid_distances",
     "compute_pooled_correlation",
+    "compute_pooled_distances",
     "concordance_analysis",
     "correlation_matrix",
+    "discrete_frechet_distance",
     "dtw_align_per_guid",
     "dtw_backend_name",
     "export_summary",
     "fuzzy_time_match",
     "get_te_guids",
+    "joint_te_kld_pca",
     "leave_one_guid_out_sensitivity",
     "load_kld_from_inference",
     "load_kld_from_metrics_csv",
@@ -68,6 +81,7 @@ __all__ = [
     "mutual_information_knn",
     "normalize_guid",
     "paired_dataset_from_dtw",
+    "pca_distance_search",
     "per_dimension_kl_analysis",
     "permutation_test_correlation",
     "population_level_test",

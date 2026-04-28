@@ -17,11 +17,13 @@ so the script can be run as-is.
 
 from __future__ import annotations
 
+import json
 import sys
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
+import pandas as pd
 from loguru import logger
 
 # Ensure project root is importable.
@@ -94,6 +96,25 @@ def _try_plot(
         logger.error(f"Plot '{name}' failed: {exc}")
         logger.debug(traceback.format_exc())
         return None
+
+
+def _json_default(obj: Any) -> Any:
+    """Coerce NumPy / pandas scalars so :func:`json.dumps` accepts them.
+
+    Falls back to ``str(obj)`` for genuinely non-serialisable values
+    (Path, ndarray, custom objects) so the dump never raises mid-run.
+    """
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:  # noqa: BLE001
+            pass
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:  # noqa: BLE001
+            pass
+    return str(obj)
 
 
 def run_comparison(
@@ -404,6 +425,7 @@ def run_comparison(
     # exercised alongside raw ``kld``.
     # ------------------------------------------------------------------
     extra_comparisons: Dict[str, Dict[str, Any]] = {}
+    extra_score_cols: list = ["kld"]
     try:
         if (
             "kld_pca_l2_top3" not in merged_df.columns
@@ -417,7 +439,6 @@ def run_comparison(
             merged_df, te_col="ite_valid", n_select=3
         )
 
-        extra_score_cols = ["kld"]
         if {"kld_pc1", "kld_pc2", "kld_pc3"}.issubset(merged_df.columns):
             extra_score_cols.append("kld_pca_l2_top3")
             extra_score_cols.append("kld_pc1")
@@ -495,6 +516,172 @@ def run_comparison(
                 )
     except Exception as exc:  # noqa: BLE001
         logger.error(f"extended comparisons block failed: {exc}")
+
+    # Step 5b can append the same column twice on retry / partial failure.
+    # Step 5c iterates this list and writes to ``distance_vs_<col>/`` -
+    # deduping here keeps the directory layout one-folder-per-score.
+    extra_score_cols = list(dict.fromkeys(extra_score_cols))
+
+    # ------------------------------------------------------------------
+    # 5c. Distance-based + PCA-Euclidean comparisons (v1).
+    #
+    # For every model-side score column already in `extra_score_cols`,
+    # compute per-GUID and pooled trajectory distances to empirical TE:
+    # Euclidean, RMSE, NRMSE, cosine, discrete Frechet. Each is plotted
+    # as a per-GUID heatmap, distribution, sorted bar, and best/worst
+    # alignment grid (full GUIDs throughout).
+    #
+    # In addition, run a PCA-Euclidean sweep (existing kld_pcN columns
+    # when present, plus a fresh PCA refit on `kld_dim_*` if available)
+    # that asks which PC subset minimises the Euclidean distance to TE,
+    # and a joint TE-KLD PCA that surfaces shared variance modes.
+    # ------------------------------------------------------------------
+    distance_results: Dict[str, Dict[str, Any]] = {}
+    pca_search: Dict[str, Any] = {}
+    joint_pca: Dict[str, Any] = {}
+    try:
+        from model.vae_teb_prediction.testing.TE_Calculated.te_kld_distance_metrics import (  # noqa: E501
+            compute_per_guid_distances,
+            compute_pooled_distances,
+            joint_te_kld_pca,
+            pca_distance_search,
+        )
+        from model.vae_teb_prediction.testing.TE_Calculated.te_kld_visualizations import (  # noqa: E501
+            plot_distance_distribution,
+            plot_joint_te_kld_pca,
+            plot_pca_distance_curve,
+            plot_per_guid_distance_bar,
+            plot_per_guid_distance_heatmap,
+            plot_per_pc_distance_heatmap,
+            plot_residual_trajectory_grid,
+        )
+
+        # Per-score-col distance summaries (per-GUID + pooled).
+        for score_col in extra_score_cols:
+            if score_col not in merged_df.columns:
+                continue
+            sub_dir = output_dir_path / f"distance_vs_{score_col}"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                per_guid_dist = compute_per_guid_distances(
+                    merged_df, score_col, "ite_valid",
+                )
+                pooled_dist = compute_pooled_distances(
+                    merged_df, score_col, "ite_valid",
+                )
+                per_guid_dist.to_csv(
+                    sub_dir / "per_guid_distances.csv", index=False,
+                )
+                with open(sub_dir / "pooled_distances.json", "w") as f:
+                    json.dump(pooled_dist, f, indent=2, default=_json_default)
+
+                _try_plot(
+                    f"distance_heatmap_{score_col}",
+                    plot_per_guid_distance_heatmap,
+                    per_guid_dist,
+                    sub_dir / "per_guid_distance_heatmap.pdf",
+                    score_col=score_col,
+                )
+                _try_plot(
+                    f"distance_distribution_{score_col}",
+                    plot_distance_distribution,
+                    per_guid_dist,
+                    sub_dir / "distance_distribution.pdf",
+                    score_col=score_col,
+                )
+                _try_plot(
+                    f"distance_bar_{score_col}",
+                    plot_per_guid_distance_bar,
+                    per_guid_dist,
+                    sub_dir / "per_guid_distance_bar.pdf",
+                    metric="euclidean",
+                    score_col=score_col,
+                )
+                _try_plot(
+                    f"residual_grid_{score_col}",
+                    plot_residual_trajectory_grid,
+                    merged_df, per_guid_dist,
+                    sub_dir / "residual_trajectory_grid.pdf",
+                    score_col=score_col,
+                    te_col="ite_valid",
+                )
+                distance_results[score_col] = {
+                    "pooled": pooled_dist,
+                    "n_guids_evaluated": int(len(per_guid_dist)),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"distance comparisons failed for {score_col!r}: {exc}"
+                )
+
+        # PCA-Euclidean sweep + joint TE-KLD PCA (one folder, pipeline-wide).
+        pca_dir = output_dir_path / "pca_euclidean"
+        pca_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            pca_search = pca_distance_search(
+                merged_df, te_col="ite_valid", max_components=5,
+            )
+            summary_df_pca = pca_search.get("summary_df", pd.DataFrame())
+            per_pc_df = pca_search.get("per_pc_distance_df", pd.DataFrame())
+            if isinstance(summary_df_pca, pd.DataFrame) and not summary_df_pca.empty:
+                summary_df_pca.to_csv(
+                    pca_dir / "pca_distance_search.csv", index=False,
+                )
+                _try_plot(
+                    "pca_distance_curve", plot_pca_distance_curve,
+                    summary_df_pca, pca_dir / "pca_distance_curve.pdf",
+                )
+            if isinstance(per_pc_df, pd.DataFrame) and not per_pc_df.empty:
+                per_pc_df.to_csv(
+                    pca_dir / "per_pc_distances.csv", index=False,
+                )
+                _try_plot(
+                    "per_pc_distance_heatmap", plot_per_pc_distance_heatmap,
+                    per_pc_df, pca_dir / "per_pc_distance_heatmap.pdf",
+                )
+            with open(pca_dir / "selected.json", "w") as f:
+                json.dump(
+                    pca_search.get("selected", {}), f, indent=2,
+                    default=_json_default,
+                )
+            with open(pca_dir / "pca_meta.json", "w") as f:
+                json.dump(
+                    pca_search.get("meta", {}), f, indent=2,
+                    default=_json_default,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"PCA distance search failed: {exc}")
+
+        try:
+            joint_pca = joint_te_kld_pca(merged_df, te_col="ite_valid")
+            if "loadings_df" in joint_pca:
+                joint_pca["loadings_df"].to_csv(
+                    pca_dir / "joint_te_kld_pca_loadings.csv", index=False,
+                )
+            if "scores_df" in joint_pca:
+                joint_pca["scores_df"].to_csv(
+                    pca_dir / "joint_te_kld_pca_scores.csv", index=False,
+                )
+            with open(pca_dir / "joint_te_kld_pca.json", "w") as f:
+                json.dump(
+                    {
+                        "explained_variance_ratio":
+                            joint_pca.get("explained_variance_ratio"),
+                        "n_used": joint_pca.get("n_used"),
+                        "columns_used": joint_pca.get("columns_used"),
+                        "backend": joint_pca.get("backend"),
+                        "error": joint_pca.get("error"),
+                    },
+                    f, indent=2, default=_json_default,
+                )
+            _try_plot(
+                "joint_te_kld_pca", plot_joint_te_kld_pca,
+                joint_pca, pca_dir / "joint_te_kld_pca.pdf",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"joint TE-KLD PCA failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"distance / PCA-Euclidean block failed: {exc}")
 
     # ------------------------------------------------------------------
     # 6. Export
@@ -598,6 +785,51 @@ def run_comparison(
                 f"  KLD PCA L2(TE-selected): rho={row['spearman_rho']:.4f}, "
                 f"pearson_r={row['pearson_r']:.4f}"
             )
+    # Distance / PCA-Euclidean summary lines.
+    if distance_results:
+        try:
+            best = min(
+                (
+                    (sc, info["pooled"].get("macro_mean_euclidean", float("nan")))
+                    for sc, info in distance_results.items()
+                    if isinstance(info.get("pooled"), dict)
+                ),
+                key=lambda pair: (
+                    pair[1] if pair[1] == pair[1] else float("inf")
+                ),
+                default=None,
+            )
+            if best is not None:
+                logger.info(
+                    f"  Best score by macro-mean Euclidean: "
+                    f"{best[0]!r}  (d={best[1]:.4f})"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+    if pca_search:
+        for source_name, info in (pca_search.get("selected") or {}).items():
+            best_pooled = info.get("best_pooled_euclidean")
+            if best_pooled and isinstance(best_pooled, dict):
+                logger.info(
+                    f"  PCA[{source_name}] best subset by pooled Euclidean: "
+                    f"k={best_pooled.get('k')}, "
+                    f"members={best_pooled.get('members')}, "
+                    f"d={best_pooled.get('pooled_euclidean', float('nan')):.4f}"
+                )
+    if joint_pca and "loadings_df" in joint_pca:
+        try:
+            loadings = joint_pca["loadings_df"]
+            te_row = loadings[loadings["variable"] == joint_pca.get(
+                "te_col", "ite_valid",
+            )]
+            if not te_row.empty and "PC1" in loadings.columns:
+                pc1_te = float(te_row.iloc[0]["PC1"])
+                logger.info(
+                    f"  Joint TE-KLD PCA: PC1 loading on TE = {pc1_te:+.3f}"
+                    f"  (|>0.4| = strong shared mode)"
+                )
+        except Exception:  # noqa: BLE001
+            pass
     logger.info(f"  Results saved to: {output_dir_path}")
 
     return {
@@ -619,6 +851,9 @@ def run_comparison(
         "correlation_matrices": correlation_matrices,
         "pca_vs_dims_summary": pca_vs_dims_df,
         "extended_comparisons": extra_comparisons,
+        "distance_results": distance_results,
+        "pca_distance_search": pca_search,
+        "joint_te_kld_pca": joint_pca,
     }
 
 

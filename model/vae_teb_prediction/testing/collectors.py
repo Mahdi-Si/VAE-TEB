@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from loguru import logger
 
 from model.vae_teb_prediction.testing.base import TestRunner
 from model.vae_teb_prediction.testing.metrics import (
@@ -522,9 +523,15 @@ def collect_metrics(
                 target_dir / "mean.npy",
                 np.asarray(pca_model.mean_, dtype=np.float32),
             )
-        except Exception:
-            # PCA is auxiliary; never let it break the main metrics CSV.
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # PCA is auxiliary; never let it break the main metrics CSV,
+            # but surface the failure so a missing kld_pc* column can be
+            # distinguished from "no per-dim KLD was collected".
+            logger.warning(
+                f"collect_metrics: PCA fit on per-dim KLD failed "
+                f"({type(exc).__name__}: {exc}); kld_pc*, kld_pca_l2_*, "
+                f"and kld_pc_selected_* columns will be omitted."
+            )
 
     return df
 
