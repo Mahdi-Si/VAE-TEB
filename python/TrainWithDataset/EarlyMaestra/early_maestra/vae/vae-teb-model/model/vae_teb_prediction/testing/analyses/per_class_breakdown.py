@@ -17,7 +17,7 @@ already carry the class label.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -323,14 +323,72 @@ def _process_attention(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
     return {"status": "ok", "n_classes": len(per_class_argmax)}
 
 
-def _process_frequency_band(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:
-    """Per-class breakdown of the frequency-band forecast quality outputs.
+# Order in which we walk partition subdirectories. Each entry is the
+# folder name under ``frequency_band_forecast/``; the legacy top-level
+# CSV is duplicated from ``clinical_4band`` and is no longer read here.
+_FBF_PARTITION_DIRS: Tuple[str, ...] = (
+    "clinical_4band",
+    "clinical_7band",
+    "by_kind",
+    "by_octave",
+)
 
-    Reads ``frequency_band_forecast/per_sample.csv`` (long-format with a
-    ``band`` column) and writes per-class subset CSVs plus a class-x-band
-    overlay PDF that puts all clinical classes on shared band axes.
+# Canonical display order per partition. When a label isn't in the
+# canonical list we keep it in alphabetical order at the end (octave_*
+# is the obvious case once `octave_dc` is mixed in).
+_FBF_CANONICAL_ORDER: Dict[str, Tuple[str, ...]] = {
+    "clinical_4band": (
+        "slow_baseline", "deceleration", "variability", "beat_to_beat",
+    ),
+    "clinical_7band": (
+        "baseline", "early_decel", "late_decel",
+        "lf_var", "mf_var", "beat_to_beat", "nyquist_edge",
+    ),
+    "by_kind": (
+        "st_S0", "st_S1", "ph_diag", "ph_h2", "ph_h3", "ph_other",
+    ),
+    "by_octave": tuple(),  # numeric order computed below
+}
+
+
+def _ordered_partition_labels(
+    df: pd.DataFrame, partition: str,
+) -> List[str]:
+    """Return the labels of ``df['band']`` in display order for a partition."""
+    seen = sorted({str(v) for v in df["band"].dropna().unique()})
+    canonical = _FBF_CANONICAL_ORDER.get(partition, tuple())
+    if canonical:
+        ordered = [b for b in canonical if b in seen]
+        leftover = [b for b in seen if b not in canonical]
+        return ordered + leftover
+    if partition == "by_octave":
+        # octave_<int> first (numeric), then octave_dc / anything else.
+        def _key(name: str) -> Tuple[int, str]:
+            if name.startswith("octave_"):
+                tail = name.split("_", 1)[1]
+                try:
+                    return (int(tail), name)
+                except ValueError:
+                    return (10**9, name)
+            return (10**9, name)
+        return sorted(seen, key=_key)
+    return seen
+
+
+def _process_frequency_band_partition(
+    output_root: Path,
+    overlay_dir: Path,
+    partition: str,
+) -> Dict[str, Any]:
+    """Run the per-class breakdown for one partition subdirectory.
+
+    Walks ``frequency_band_forecast/<partition>/per_sample.csv`` and
+    emits per-class subset CSVs into
+    ``per_class_breakdown/class_<...>/frequency_band_<partition>/`` plus
+    cross-class overlay PDFs prefixed by ``<partition>_``.
     """
-    src = _load_csv(output_root / "frequency_band_forecast" / "per_sample.csv")
+    src_dir = output_root / "frequency_band_forecast" / partition
+    src = _load_csv(src_dir / "per_sample.csv")
     if src is None or "label" not in src.columns or "band" not in src.columns:
         return {"status": "missing"}
 
@@ -340,69 +398,71 @@ def _process_frequency_band(output_root: Path, overlay_dir: Path) -> Dict[str, A
         if sub.empty:
             continue
         per_class[label_id] = sub
-        out_dir = output_root / "per_class_breakdown" / CLASS_FOLDER[label_id]
+        out_dir = (
+            output_root / "per_class_breakdown" / CLASS_FOLDER[label_id]
+            / f"frequency_band_{partition}"
+        )
         out_dir.mkdir(parents=True, exist_ok=True)
-        sub.to_csv(out_dir / "frequency_band_per_sample.csv", index=False)
+        sub.to_csv(out_dir / "per_sample.csv", index=False)
 
     if not per_class:
         return {"status": "empty"}
 
+    bands_present = _ordered_partition_labels(src, partition)
+    if not bands_present:
+        return {"status": "no_bands"}
+
     # Class-x-band overlay: one bar per (band, class) showing mean MSE.
-    bands_present: List[str] = []
-    for df in per_class.values():
-        for band in df["band"].dropna().unique():
-            if band not in bands_present:
-                bands_present.append(str(band))
-    canonical = ("slow_baseline", "deceleration", "variability", "beat_to_beat")
-    bands_present = [b for b in canonical if b in bands_present]
+    try:
+        fig, ax = plt.subplots(
+            figsize=(max(4.4, 1.4 * len(bands_present) + 1.4), 3.4)
+        )
+        n_classes = len(per_class)
+        bar_width = 0.8 / max(n_classes, 1)
+        for c_idx, (label_id, df) in enumerate(per_class.items()):
+            means: List[float] = []
+            stds: List[float] = []
+            for band in bands_present:
+                vals = pd.to_numeric(
+                    df.loc[df["band"] == band, "mse_total"], errors="coerce"
+                ).to_numpy()
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    means.append(float("nan"))
+                    stds.append(0.0)
+                else:
+                    means.append(float(np.mean(vals)))
+                    stds.append(float(np.std(vals) / max(np.sqrt(vals.size), 1)))
+            xs = np.arange(len(bands_present))
+            offsets = (c_idx - (n_classes - 1) / 2.0) * bar_width
+            ax.bar(
+                xs + offsets, means, bar_width,
+                yerr=stds, color=CLASS_COLORS[label_id],
+                label=f"{CLASS_NAMES[label_id]} (n={len(df)})",
+                edgecolor="#222831", linewidth=0.4, capsize=2,
+            )
+        ax.set_xticks(np.arange(len(bands_present)))
+        ax.set_xticklabels(bands_present, rotation=20, ha="right")
+        ax.set_ylabel("mean mse_total ± SE")
+        ax.set_title(
+            f"Forecast MSE per label ({partition}) — by class"
+        )
+        ax.legend(loc="best", frameon=True)
+        _style_axes(ax)
+        fig.tight_layout()
+        fig.savefig(
+            overlay_dir
+            / f"frequency_band_{partition}_mse_by_band_overlay.pdf"
+        )
+        plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"per_class_breakdown[frequency_band/{partition}]: "
+            f"bar plot failed: {exc}"
+        )
 
-    if bands_present:
-        try:
-            fig, ax = plt.subplots(
-                figsize=(max(4.4, 1.6 * len(bands_present) + 1.4), 3.4)
-            )
-            n_classes = len(per_class)
-            bar_width = 0.8 / max(n_classes, 1)
-            for c_idx, (label_id, df) in enumerate(per_class.items()):
-                means = []
-                stds = []
-                for band in bands_present:
-                    vals = pd.to_numeric(
-                        df.loc[df["band"] == band, "mse_total"], errors="coerce"
-                    ).to_numpy()
-                    vals = vals[np.isfinite(vals)]
-                    if vals.size == 0:
-                        means.append(np.nan)
-                        stds.append(0.0)
-                    else:
-                        means.append(float(np.mean(vals)))
-                        stds.append(float(np.std(vals) / max(np.sqrt(vals.size), 1)))
-                xs = np.arange(len(bands_present))
-                offsets = (c_idx - (n_classes - 1) / 2.0) * bar_width
-                ax.bar(
-                    xs + offsets, means, bar_width,
-                    yerr=stds, color=CLASS_COLORS[label_id],
-                    label=f"{CLASS_NAMES[label_id]} (n={len(df)})",
-                    edgecolor="#222831", linewidth=0.4, capsize=2,
-                )
-            ax.set_xticks(np.arange(len(bands_present)))
-            ax.set_xticklabels(bands_present)
-            ax.set_ylabel("mean mse_total ± SE")
-            ax.set_title("Forecast MSE per band — by class")
-            ax.legend(loc="best", frameon=True)
-            _style_axes(ax)
-            fig.tight_layout()
-            fig.savefig(
-                overlay_dir / "frequency_band_mse_by_band_overlay.pdf"
-            )
-            plt.close(fig)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"per_class_breakdown[frequency_band]: bar plot failed: {exc}"
-            )
-
-    # Cross-class overlays for individual scalar metrics (filter on
-    # band first, otherwise we overlay distributions across all bands).
+    # Per-band scalar overlays so the user can compare class distributions
+    # for one band at a time (filtered, not pooled across bands).
     for col in ("mse_total", "r2_total"):
         for band in bands_present:
             band_subsets = {
@@ -414,7 +474,8 @@ def _process_frequency_band(output_root: Path, overlay_dir: Path) -> Dict[str, A
                 continue
             _emit_overlay_for_metric(
                 band_subsets, col,
-                overlay_dir / f"frequency_band_{band}_{col}_overlay.pdf",
+                overlay_dir
+                / f"frequency_band_{partition}_{band}_{col}_overlay.pdf",
             )
 
     return {
@@ -422,6 +483,42 @@ def _process_frequency_band(output_root: Path, overlay_dir: Path) -> Dict[str, A
         "n_classes": len(per_class),
         "n_bands": len(bands_present),
     }
+
+
+def _process_frequency_band(
+    output_root: Path, overlay_dir: Path,
+) -> Dict[str, Any]:
+    """Per-class breakdown of the frequency-band forecast outputs.
+
+    Walks each of the four partition subdirectories
+    (``clinical_4band``, ``clinical_7band``, ``by_kind``, ``by_octave``)
+    produced by :func:`run_frequency_band_forecast_analysis` and emits
+    per-class subset CSVs plus class-x-label overlays for every partition.
+    """
+    results: Dict[str, Any] = {"status": "missing"}
+    per_partition: Dict[str, Dict[str, Any]] = {}
+    found_any = False
+    for partition in _FBF_PARTITION_DIRS:
+        info = _process_frequency_band_partition(
+            output_root, overlay_dir, partition,
+        )
+        per_partition[partition] = info
+        if info.get("status") == "ok":
+            found_any = True
+    if found_any:
+        results = {
+            "status": "ok",
+            "partitions": per_partition,
+            "n_partitions": int(
+                sum(
+                    1 for v in per_partition.values()
+                    if v.get("status") == "ok"
+                )
+            ),
+        }
+    else:
+        results = {"status": "missing", "partitions": per_partition}
+    return results
 
 
 def _process_uplift(output_root: Path, overlay_dir: Path) -> Dict[str, Any]:

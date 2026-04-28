@@ -56,6 +56,74 @@ BAND_HZ_RANGES: Dict[str, Tuple[float, float]] = {
     "beat_to_beat": (0.25, float("inf")),
 }
 
+# Coefficient-kind partition: groups the 87 channels by *what they
+# encode* rather than by frequency. Useful for asking "is the model
+# better at predicting envelope (st_S1) than rhythm phase stability
+# (ph_diag)?". S0 is always a singleton, ph_h3 may be empty for the
+# canonical lag-attn v1 config.
+KIND_NAMES: Tuple[str, ...] = (
+    "st_S0", "st_S1", "ph_diag", "ph_h2", "ph_h3", "ph_other",
+)
+
+# Finer 7-band partition derived from the underlying scattering frequencies.
+# All intervals are half-open ``[low, high)`` (the last band is the
+# unbounded catch-all). Boundaries chosen from the actual ``xi*fs`` content
+# of the lag-attn v1 forecast target:
+#   * baseline / early / late split at 0.013 Hz separates ~early decel
+#     (>75 s period) from late decel (25 - 75 s).
+#   * variability split at 0.15 Hz follows fetal HRV LF / MF convention.
+#   * 1 Hz cutoff isolates the highest octave near Nyquist (fs=4Hz).
+REFINED7_BAND_NAMES: Tuple[str, ...] = (
+    "baseline",
+    "early_decel",
+    "late_decel",
+    "lf_var",
+    "mf_var",
+    "beat_to_beat",
+    "nyquist_edge",
+)
+
+REFINED7_HZ_RANGES: Dict[str, Tuple[float, float]] = {
+    "baseline":     (0.0,   0.008),
+    "early_decel":  (0.008, 0.013),
+    "late_decel":   (0.013, 0.04),
+    "lf_var":       (0.04,  0.15),
+    "mf_var":       (0.15,  0.25),
+    "beat_to_beat": (0.25,  1.0),
+    "nyquist_edge": (1.0,   float("inf")),
+}
+
+# Special label for the S0 (DC) scattering channel which has no centre
+# frequency and therefore no octave bin.
+OCTAVE_DC_LABEL: str = "octave_dc"
+
+
+def _build_octave_ranges(fs: float, J: int) -> Dict[str, Tuple[float, float]]:
+    """Build the ``octave_k -> (low_hz, high_hz)`` mapping.
+
+    ``octave_k`` covers ``xi*fs`` in ``[fs * 2^-(k+1), fs * 2^-k)`` Hz,
+    matching the structure of the kymatio J-octave wavelet bank.
+
+    For ``fs=4, J=11`` the lowest octave (``octave_10``) covers roughly
+    ``[0.00195, 0.00391)`` Hz. Channels with centre frequencies *below*
+    this floor (rare) are assigned to ``octave_dc``; the S0 channel is
+    also placed there because it carries no centre frequency.
+
+    Args:
+        fs: Sampling frequency in Hz.
+        J: Number of octaves in the wavelet bank.
+
+    Returns:
+        ``OrderedDict``-like ``dict`` from octave label to ``(low, high)``
+        in Hz, sorted from highest octave (highest frequency) downwards.
+    """
+    ranges: Dict[str, Tuple[float, float]] = {}
+    for k in range(J):
+        lo = float(fs) * (2.0 ** (-(k + 1)))
+        hi = float(fs) * (2.0 ** (-k))
+        ranges[f"octave_{k}"] = (lo, hi)
+    return ranges
+
 
 def _band_for_hz(freq_hz: float) -> str:
     """Return the band name a given centre frequency falls into.
@@ -73,6 +141,44 @@ def _band_for_hz(freq_hz: float) -> str:
     if freq_hz <= BAND_HZ_RANGES["variability"][1]:
         return "variability"
     return "beat_to_beat"
+
+
+def _refined7_for_hz(freq_hz: float) -> str:
+    """Return the refined-7 band name for a given centre frequency.
+
+    Uses purely half-open intervals ``[low, high)`` from
+    :data:`REFINED7_HZ_RANGES`. Non-finite frequencies (S0 channel) map
+    to ``baseline``.
+    """
+    if not np.isfinite(freq_hz):
+        return "baseline"
+    for band in REFINED7_BAND_NAMES:
+        lo, hi = REFINED7_HZ_RANGES[band]
+        if lo <= freq_hz < hi:
+            return band
+    # Catch-all: anything at or above the last band's lower bound.
+    return REFINED7_BAND_NAMES[-1]
+
+
+def _octave_for_hz(
+    freq_hz: float,
+    octave_ranges: Dict[str, Tuple[float, float]],
+) -> str:
+    """Return the octave label for a given centre frequency.
+
+    Returns :data:`OCTAVE_DC_LABEL` for non-finite frequencies (S0) and
+    for any frequency strictly below the lowest octave's lower bound.
+    """
+    if not np.isfinite(freq_hz):
+        return OCTAVE_DC_LABEL
+    for label, (lo, hi) in octave_ranges.items():
+        if lo <= freq_hz < hi:
+            return label
+    # Frequencies above the topmost octave (xi*fs >= fs/2 = Nyquist) or
+    # below the lowest octave fall outside the J-octave bank. Highest
+    # case is impossible by construction (xi < 1.0); lowest case maps
+    # to octave_dc so the partition stays well-defined.
+    return OCTAVE_DC_LABEL
 
 
 @dataclass
@@ -111,18 +217,84 @@ class BandPartition:
     combined_idx: Dict[str, np.ndarray]
     channel_metadata: pd.DataFrame = field(repr=False)
 
+    # Coefficient-kind partition (st_S0, st_S1, ph_diag, ph_h2, ph_h3,
+    # ph_other -> indices in [0, n_total)).
+    kind_names: Tuple[str, ...] = field(default_factory=lambda: KIND_NAMES)
+    kind_idx: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Refined 7-band partition: same channels, finer frequency tiles.
+    refined7_band_names: Tuple[str, ...] = field(
+        default_factory=lambda: REFINED7_BAND_NAMES
+    )
+    refined7_hz_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    refined7_idx: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Per-octave partition derived from the kymatio J-octave wavelet bank.
+    octave_names: Tuple[str, ...] = field(default_factory=tuple)
+    octave_hz_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    octave_idx: Dict[str, np.ndarray] = field(default_factory=dict)
+
     def nonempty_bands(self) -> Tuple[str, ...]:
-        """Return the bands that contain at least one channel."""
+        """Return the clinical-4 bands that contain at least one channel."""
         return tuple(b for b in self.band_names if self.combined_idx[b].size > 0)
+
+    def nonempty_partition(self, partition: str) -> Tuple[str, ...]:
+        """Return the labels of a named partition that have at least one channel.
+
+        Args:
+            partition: One of ``"clinical_4band"``, ``"clinical_7band"``,
+                ``"by_kind"``, ``"by_octave"``.
+
+        Returns:
+            Tuple of label names in canonical order, filtered to those
+            with at least one channel.
+        """
+        names, idx = self._partition(partition)
+        return tuple(n for n in names if idx[n].size > 0)
+
+    def _partition(
+        self, partition: str,
+    ) -> Tuple[Tuple[str, ...], Dict[str, np.ndarray]]:
+        """Return ``(names, idx_dict)`` for a named partition."""
+        if partition == "clinical_4band":
+            return self.band_names, self.combined_idx
+        if partition == "clinical_7band":
+            return self.refined7_band_names, self.refined7_idx
+        if partition == "by_kind":
+            return self.kind_names, self.kind_idx
+        if partition == "by_octave":
+            return self.octave_names, self.octave_idx
+        raise KeyError(
+            f"Unknown partition {partition!r}. Use one of "
+            f"'clinical_4band', 'clinical_7band', 'by_kind', 'by_octave'."
+        )
+
+    def partition_idx(self, partition: str) -> Dict[str, np.ndarray]:
+        """Return the channel-index dict for a named partition."""
+        return self._partition(partition)[1]
+
+    def partition_names(self, partition: str) -> Tuple[str, ...]:
+        """Return the canonical label tuple for a named partition."""
+        return self._partition(partition)[0]
 
     def to_json(self) -> Dict[str, object]:
         """Return a JSON-serializable summary (without ``channel_metadata``)."""
-        return {
+
+        def _ranges_to_json(ranges: Dict[str, Tuple[float, float]]) -> Dict[str, object]:
+            return {
+                k: [
+                    float(v[0]),
+                    float(v[1]) if np.isfinite(v[1]) else None,
+                ]
+                for k, v in ranges.items()
+            }
+
+        def _idx_to_lists(idx: Dict[str, np.ndarray]) -> Dict[str, list]:
+            return {k: np.asarray(v, dtype=int).tolist() for k, v in idx.items()}
+
+        out: Dict[str, object] = {
             "band_names": list(self.band_names),
-            "band_hz_ranges": {
-                k: [float(v[0]), float(v[1]) if np.isfinite(v[1]) else None]
-                for k, v in self.band_hz_ranges.items()
-            },
+            "band_hz_ranges": _ranges_to_json(self.band_hz_ranges),
             "band_period_ranges_s": {
                 k: [
                     float(v[0]) if np.isfinite(v[0]) else None,
@@ -148,7 +320,32 @@ class BandPartition:
             "combined_indices": {
                 b: self.combined_idx[b].tolist() for b in self.band_names
             },
+            # New: collect every available partition under a single key so
+            # downstream tools can iterate uniformly without knowing which
+            # partitions exist.
+            "partitions": {
+                "clinical_4band": {
+                    "names": list(self.band_names),
+                    "hz_ranges": _ranges_to_json(self.band_hz_ranges),
+                    "idx": _idx_to_lists(self.combined_idx),
+                },
+                "clinical_7band": {
+                    "names": list(self.refined7_band_names),
+                    "hz_ranges": _ranges_to_json(self.refined7_hz_ranges),
+                    "idx": _idx_to_lists(self.refined7_idx),
+                },
+                "by_kind": {
+                    "names": list(self.kind_names),
+                    "idx": _idx_to_lists(self.kind_idx),
+                },
+                "by_octave": {
+                    "names": list(self.octave_names),
+                    "hz_ranges": _ranges_to_json(self.octave_hz_ranges),
+                    "idx": _idx_to_lists(self.octave_idx),
+                },
+            },
         }
+        return out
 
     def write(self, output_dir: Path) -> Tuple[Path, Path]:
         """Persist the partition to ``band_partition.json`` and ``band_channel_map.csv``.
@@ -344,6 +541,61 @@ def _build_band_partition_cached(
         for b in BAND_NAMES
     }
 
+    # ---- secondary partitions (kind / refined7 / octave) -----------------
+    # Build per-channel labels first; aggregate into per-label index lists
+    # afterwards so the loop logic stays O(n_total).
+    octave_ranges = _build_octave_ranges(fs=float(fs), J=int(J))
+    octave_names: Tuple[str, ...] = tuple(octave_ranges.keys()) + (OCTAVE_DC_LABEL,)
+    octave_full_ranges: Dict[str, Tuple[float, float]] = dict(octave_ranges)
+    octave_full_ranges[OCTAVE_DC_LABEL] = (0.0, float("inf"))
+
+    kind_per_channel: list = [None] * (n_st_channels + n_ph_channels)
+    refined7_per_channel: list = [None] * (n_st_channels + n_ph_channels)
+    octave_per_channel: list = [None] * (n_st_channels + n_ph_channels)
+
+    # st channels
+    for ch in range(n_st_channels):
+        if not np.isfinite(hz_st[ch]):
+            kind_per_channel[ch] = "st_S0"
+            refined7_per_channel[ch] = "baseline"
+            octave_per_channel[ch] = OCTAVE_DC_LABEL
+        else:
+            kind_per_channel[ch] = "st_S1"
+            refined7_per_channel[ch] = _refined7_for_hz(float(hz_st[ch]))
+            octave_per_channel[ch] = _octave_for_hz(
+                float(hz_st[ch]), octave_ranges,
+            )
+
+    # ph channels (channel index = n_st + k in 87-channel space)
+    for k, row in ph_meta_df.iterrows():
+        ch = int(n_st + k)
+        kind_per_channel[ch] = str(row["kind"])
+        refined7_per_channel[ch] = _refined7_for_hz(float(row["xi_j_hz"]))
+        octave_per_channel[ch] = _octave_for_hz(
+            float(row["xi_j_hz"]), octave_ranges,
+        )
+
+    kind_idx_lists: Dict[str, list] = {k: [] for k in KIND_NAMES}
+    for ch in range(n_st_channels + n_ph_channels):
+        kind_idx_lists[str(kind_per_channel[ch])].append(ch)
+    kind_idx: Dict[str, np.ndarray] = {
+        k: np.asarray(v, dtype=int) for k, v in kind_idx_lists.items()
+    }
+
+    refined7_idx_lists: Dict[str, list] = {b: [] for b in REFINED7_BAND_NAMES}
+    for ch in range(n_st_channels + n_ph_channels):
+        refined7_idx_lists[str(refined7_per_channel[ch])].append(ch)
+    refined7_idx: Dict[str, np.ndarray] = {
+        b: np.asarray(v, dtype=int) for b, v in refined7_idx_lists.items()
+    }
+
+    octave_idx_lists: Dict[str, list] = {name: [] for name in octave_names}
+    for ch in range(n_st_channels + n_ph_channels):
+        octave_idx_lists[str(octave_per_channel[ch])].append(ch)
+    octave_idx: Dict[str, np.ndarray] = {
+        name: np.asarray(v, dtype=int) for name, v in octave_idx_lists.items()
+    }
+
     # ---- channel_metadata DataFrame --------------------------------------
     rows = []
     # st channels
@@ -353,16 +605,21 @@ def _build_band_partition_cached(
             "channel": ch,
             "kind": "st_S0" if is_s0 else "st_S1",
             "band": st_band_per_channel[ch],
+            "refined_band": refined7_per_channel[ch],
+            "octave": octave_per_channel[ch],
             "freq_hz_primary": float("nan") if is_s0 else float(hz_st[ch]),
             "freq_hz_secondary": float("nan"),
             "harmonic_ratio": float("nan"),
         })
     # ph channels
     for k, row in ph_meta_df.iterrows():
+        ch_idx = int(n_st + k)
         rows.append({
-            "channel": int(n_st + k),
+            "channel": ch_idx,
             "kind": str(row["kind"]),
             "band": str(row["band"]),
+            "refined_band": refined7_per_channel[ch_idx],
+            "octave": octave_per_channel[ch_idx],
             "freq_hz_primary": float(row["xi_j_hz"]),
             "freq_hz_secondary": float(row["xi_i_hz"]),
             "harmonic_ratio": float(row["harmonic_ratio"]),
@@ -388,6 +645,14 @@ def _build_band_partition_cached(
         ph_idx=ph_idx,
         combined_idx=combined_idx,
         channel_metadata=channel_metadata,
+        kind_names=KIND_NAMES,
+        kind_idx=kind_idx,
+        refined7_band_names=REFINED7_BAND_NAMES,
+        refined7_hz_ranges=dict(REFINED7_HZ_RANGES),
+        refined7_idx=refined7_idx,
+        octave_names=octave_names,
+        octave_hz_ranges=octave_full_ranges,
+        octave_idx=octave_idx,
     )
 
 
@@ -437,6 +702,10 @@ def build_band_partition(
 __all__ = [
     "BAND_NAMES",
     "BAND_HZ_RANGES",
+    "KIND_NAMES",
+    "OCTAVE_DC_LABEL",
+    "REFINED7_BAND_NAMES",
+    "REFINED7_HZ_RANGES",
     "BandPartition",
     "build_band_partition",
 ]
