@@ -342,6 +342,21 @@ def run_kfold_parallel(
                 config_path=config_path,
                 output_dir_override=str(run_dir),
             )
+            # Mirror the parallel branch: surface per-fold status to the
+            # console immediately. Otherwise an exception inside ``train_fold``
+            # / ``evaluate_single_fold`` is captured silently into the result
+            # dict, the loop "finishes" in seconds, and the user has no clue
+            # anything went wrong until they open kfold_results.json.
+            status = results[int(fid)].get("status", "unknown")
+            if status == "ok":
+                logger.info(f"fold {fid} finished with status={status}")
+            else:
+                err = results[int(fid)].get("error", "<no error message>")
+                tb = results[int(fid)].get("traceback", "")
+                logger.error(
+                    f"fold {fid} FAILED: {err}\n"
+                    f"--- traceback (head) ---\n{tb[-2000:] if tb else '<no traceback>'}"
+                )
     else:
         ctx = multiprocessing.get_context("spawn")
         pending: List[Tuple[int, int]] = [
