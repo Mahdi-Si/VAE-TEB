@@ -3,6 +3,12 @@
 Pre-norm transformer with per-head log-bucketed relative-time biases. Takes
 the precomputed ``rel_bucket_idx`` from the collate function so the model
 itself never reads ``epoch``.
+
+Under the causal-autoregressive design (default), a lower-triangular mask
+is AND'd with the key-validity mask so position ``n`` can only attend to
+positions ``j <= n``. This makes the per-position outputs genuine
+"history-up-to-here" predictions and matches the per-position
+``PerPositionOutcomeHead`` consumed by the classifier head.
 """
 
 from __future__ import annotations
@@ -24,6 +30,9 @@ class RelativeTimeMultiHeadSelfAttention(nn.Module):
         d_head: Per-head dimensionality.
         n_buckets: Number of relative-time buckets (PRD §7.1, default 32).
         dropout: Attention dropout probability.
+        causal: If True (default), AND a lower-triangular ``(N, N)`` mask
+            with ``key_mask`` so position ``n`` only attends to positions
+            ``j <= n``. Required for autoregressive per-position prediction.
     """
 
     def __init__(
@@ -33,6 +42,8 @@ class RelativeTimeMultiHeadSelfAttention(nn.Module):
         d_head: int,
         n_buckets: int,
         dropout: float = 0.1,
+        *,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         if n_heads * d_head != d_model:
@@ -43,6 +54,7 @@ class RelativeTimeMultiHeadSelfAttention(nn.Module):
         self.n_heads = int(n_heads)
         self.d_head = int(d_head)
         self.n_buckets = int(n_buckets)
+        self.causal = bool(causal)
         self.scale = 1.0 / math.sqrt(d_head)
 
         self.W_q = nn.Linear(d_model, d_model)
@@ -54,6 +66,27 @@ class RelativeTimeMultiHeadSelfAttention(nn.Module):
         # Per-head additive bias table indexed by the (i, j) bucket id.
         self.bias = nn.Parameter(torch.zeros(n_heads, n_buckets))
         nn.init.normal_(self.bias, mean=0.0, std=0.02)
+
+        # Lazily allocated lower-triangular template grown on demand.
+        self.register_buffer(
+            "_causal_template",
+            torch.empty(0, 0, dtype=torch.bool),
+            persistent=False,
+        )
+
+    def _get_causal_mask(self, n: int, device: torch.device) -> torch.Tensor:
+        """Return a cached ``(n, n)`` lower-triangular bool mask.
+
+        Grows the cached buffer on demand. ``True`` at ``[i, j]`` means
+        position ``i`` is allowed to attend to position ``j``.
+        """
+        cur = self._causal_template
+        if cur.shape[0] >= n and cur.device == device:
+            return cur[:n, :n]
+        bigger = max(n, max(64, cur.shape[0] * 2))
+        new = torch.tril(torch.ones(bigger, bigger, dtype=torch.bool, device=device))
+        self._causal_template = new
+        return new[:n, :n]
 
     def forward(
         self,
@@ -94,12 +127,22 @@ class RelativeTimeMultiHeadSelfAttention(nn.Module):
 
         # Mask invalid keys (and rows whose query is also invalid produce a
         # safe but unused output; downstream segment_mask zeros those tokens).
+        # Under ``causal=True``, AND a lower-triangular mask so position ``n``
+        # cannot attend to positions ``j > n`` — required for the
+        # autoregressive per-position head.
         key_mask = segment_mask.view(B, 1, 1, N)                         # (B, 1, 1, N)
-        scores = scores.masked_fill(~key_mask, float("-inf"))
+        if self.causal:
+            causal_mask = self._get_causal_mask(N, x.device).view(1, 1, N, N)
+            valid = key_mask & causal_mask
+        else:
+            valid = key_mask
+        scores = scores.masked_fill(~valid, float("-inf"))
 
         # ``softmax(all -inf)`` would produce NaN; ``nan_to_num`` rescues
         # the rare row where every key is invalid (downstream segment_mask
-        # then zeros the corresponding output token).
+        # then zeros the corresponding output token). With ``causal=True``,
+        # position 0 has at least itself as a valid key when ``segment_mask[:, 0]``
+        # is True, so the rescue still only fires for fully-padded GUIDs.
         attn = F.softmax(scores, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.attn_dropout(attn)
@@ -119,6 +162,7 @@ class RelativeTimeTransformerBlock(nn.Module):
         d_ff: Feed-forward inner width.
         n_buckets: Number of relative-time buckets.
         dropout: Dropout for attention probs and FFN.
+        causal: Forwarded to :class:`RelativeTimeMultiHeadSelfAttention`.
     """
 
     def __init__(
@@ -129,6 +173,8 @@ class RelativeTimeTransformerBlock(nn.Module):
         d_ff: int,
         n_buckets: int,
         dropout: float = 0.1,
+        *,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
@@ -138,6 +184,7 @@ class RelativeTimeTransformerBlock(nn.Module):
             d_head=d_head,
             n_buckets=n_buckets,
             dropout=dropout,
+            causal=causal,
         )
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
@@ -180,6 +227,7 @@ class RelativeTimeTransformer(nn.Module):
         d_ff: Feed-forward inner width (default 512).
         n_buckets: Number of bias buckets (default 32, PRD §7.1).
         dropout: Dropout used in attn and FFN (default 0.1).
+        causal: If True (default), every block attends causally.
     """
 
     def __init__(
@@ -192,6 +240,7 @@ class RelativeTimeTransformer(nn.Module):
         d_ff: int = 512,
         n_buckets: int = 32,
         dropout: float = 0.1,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         if n_heads * d_head != d_model:
@@ -199,6 +248,7 @@ class RelativeTimeTransformer(nn.Module):
                 f"n_heads * d_head ({n_heads}*{d_head}) must equal d_model ({d_model})"
             )
         self.d_model = d_model
+        self.causal = bool(causal)
         self.layers = nn.ModuleList(
             [
                 RelativeTimeTransformerBlock(
@@ -208,6 +258,7 @@ class RelativeTimeTransformer(nn.Module):
                     d_ff=d_ff,
                     n_buckets=n_buckets,
                     dropout=dropout,
+                    causal=causal,
                 )
                 for _ in range(n_layers)
             ]

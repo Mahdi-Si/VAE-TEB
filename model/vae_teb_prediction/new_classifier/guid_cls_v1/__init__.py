@@ -4,15 +4,16 @@ Public entry points (imported lazily so the package is importable even when
 heavy deps such as torch are unavailable at import time):
 
 * :class:`GuidOutcomeClassifier` — top-level nn.Module that wraps the segment
-  tokenizer, relative-time transformer, GUID head and auxiliary per-segment
-  head.
+  tokenizer, causal relative-time transformer, and per-position outcome head.
 * :class:`PlGuidClassifier` — PyTorch Lightning wrapper implementing the
-  combined 3-class + binary + auxiliary loss.
+  per-position 3-class + binary loss with two-level masked-mean reduction.
 * :func:`train_fold` — single-fold training entry point.
 * :func:`run_kfold_parallel` — k-fold orchestrator that runs folds in parallel
   subprocesses with their own GPUs.
 * :func:`evaluate_single_fold` — per-fold inference + three-metric-type
   evaluation pipeline.
+* :func:`evaluate_kfold` — orchestrator that runs evaluation + cross-fold
+  aggregation across all (or selected) folds without retraining.
 * :func:`precompute_fold_latents` — build a frozen-VAE latent cache for one
   fold.
 
@@ -30,12 +31,16 @@ __all__ = [
     "train_fold",
     "run_kfold_parallel",
     "evaluate_single_fold",
+    "evaluate_kfold",
     "precompute_fold_latents",
 ]
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_guid_classifier import (
         evaluate_single_fold,
+    )
+    from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_kfold import (
+        evaluate_kfold,
     )
     from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import (
         GuidOutcomeClassifier,
@@ -86,6 +91,12 @@ def __getattr__(name: str):  # pragma: no cover - trivial lazy loader
         )
 
         return evaluate_single_fold
+    if name == "evaluate_kfold":
+        from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_kfold import (
+            evaluate_kfold,
+        )
+
+        return evaluate_kfold
     if name == "precompute_fold_latents":
         from model.vae_teb_prediction.new_classifier.guid_cls_v1.precompute_latents import (
             precompute_fold_latents,

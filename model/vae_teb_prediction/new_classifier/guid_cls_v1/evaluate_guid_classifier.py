@@ -36,6 +36,10 @@ from torch.utils.data import DataLoader
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.collate import (
     guid_sequence_collate_fn,
 )
+from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_3class_metrics import (
+    run_3class_evaluation_for_metric_type,
+    write_perclass_thresholds_json,
+)
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import (
     GuidClassifierConfig,
     GuidOutcomeClassifier,
@@ -250,42 +254,24 @@ def load_classifier_from_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# Prefix sweep
+# Per-position inference (causal autoregressive)
 # ---------------------------------------------------------------------------
 
 
-def _slice_batch_to_prefix(batch: Dict[str, torch.Tensor], m: int) -> Dict[str, torch.Tensor]:
-    """Return a shallow batch copy whose ``segment_mask[:, m:]`` is False.
-
-    Per-row ``num_segments`` is clamped to ``min(m, original_n)`` so that
-    rows already shorter than the swept ``m`` retain their true length when
-    ``GuidOutcomeHead`` builds the global GUID statistics (``log(1+N)``,
-    etc.). The caller still discards rows for which ``original_n < m`` —
-    this clamp just prevents stale outputs from contaminating the model's
-    intermediate computations during the sweep.
-    """
-    new_batch: Dict[str, Any] = {}
-    for k, v in batch.items():
-        new_batch[k] = v.clone() if isinstance(v, torch.Tensor) else (list(v) if isinstance(v, list) else v)
-    seg_mask: torch.Tensor = new_batch["segment_mask"]
-    seg_mask[:, m:] = False
-    new_batch["segment_mask"] = seg_mask
-    orig_num: torch.Tensor = batch["num_segments"]
-    new_batch["num_segments"] = torch.minimum(
-        orig_num,
-        torch.full_like(orig_num, m),
-    )
-    return new_batch
-
-
 @torch.no_grad()
-def run_inference_prefix_sweep(
+def run_inference_per_position(
     model: GuidOutcomeClassifier,
     loader: DataLoader,
     *,
     device: torch.device,
 ) -> pd.DataFrame:
-    """Per-GUID prefix sweep that emits one row per observed segment.
+    """One-forward-per-batch inference; emit one row per observed segment.
+
+    Under the causal autoregressive design every position's output already
+    represents the model's GUID-level prediction *given history up to that
+    position*. We therefore replace the old prefix sweep (``N_g`` forwards
+    per GUID) with a single forward per batch and read predictions at every
+    valid position.
 
     Args:
         model: Loaded classifier in eval mode.
@@ -293,7 +279,10 @@ def run_inference_prefix_sweep(
         device: Compute device.
 
     Returns:
-        DataFrame with the schema documented in PRD §11.3.
+        DataFrame with the same schema as the legacy prefix sweep (modulo
+        dropped ``aux_prob_*`` columns; ``position`` column added; the
+        ``prefix_length`` column is retained as an alias of ``position``
+        so the legacy aggregator still works).
     """
     rows: List[Dict[str, Any]] = []
     for batch in loader:
@@ -316,59 +305,52 @@ def run_inference_prefix_sweep(
         guids = list(moved["guid"])
         n_per = moved["num_segments"].cpu().numpy()
 
-        max_N = int(n_per.max())
-        for m in range(1, max_N + 1):
-            mask_alive = (n_per >= m)
-            if not mask_alive.any():
-                continue
-            sliced = _slice_batch_to_prefix(moved, m)
-            out = model(sliced)
-            prob_3 = out["prob_3"].detach().cpu().numpy()         # (B, 3)
-            prob_bin = out["prob_bin"].detach().cpu().numpy()      # (B,)
-            aux_prob_bin = out["aux_prob_bin"].detach().cpu().numpy()
-            aux_prob_3 = out["aux_prob_3"].detach().cpu().numpy()
-            for b in range(seg_mask.shape[0]):
-                if not mask_alive[b]:
-                    continue
-                seg_idx = m - 1
-                # ``target_per_t`` is already an integer class id after the
-                # dataset's ``np.rint`` round-trip; ``int(...max())`` is safe
-                # but we re-round defensively in case a downstream consumer
-                # feeds a float tensor in.
-                seg_target = int(round(float(target_per_t[b, seg_idx].max())))
+        out = model(moved)
+        prob_3 = out["prob_3"].detach().cpu().numpy()             # (B, N, 3)
+        prob_bin = out["prob_bin"].detach().cpu().numpy()         # (B, N)
+
+        B = seg_mask.shape[0]
+        for b in range(B):
+            n_b = int(n_per[b])
+            for n in range(n_b):
+                seg_target = int(round(float(target_per_t[b, n].max())))
                 if seg_target == 0:
                     # Fully-padded segment shouldn't appear here, but guard.
                     seg_target = int(labels_3[b]) + 1
-                aux_3_max = float(aux_prob_3[b, seg_idx].max())
+                position = n + 1
                 rows.append(
                     {
                         "guid": str(guids[b]),
-                        "epoch": float(epochs[b, seg_idx]),
+                        "epoch": float(epochs[b, n]),
                         "target": int(seg_target),
                         "binary_target": int(seg_target > 1),
-                        "predicted_class": int(prob_bin[b] >= 0.5),
-                        "prob_class_0": float(1.0 - prob_bin[b]),
-                        "prob_class_1": float(prob_bin[b]),
-                        "prob_healthy": float(prob_3[b, 0]),
-                        "prob_acidosis": float(prob_3[b, 1]),
-                        "prob_hie": float(prob_3[b, 2]),
-                        "predicted_class_3": int(prob_3[b].argmax()),
-                        "aux_prob_bin_segment": float(aux_prob_bin[b, seg_idx]),
-                        "aux_prob_3_segment_max": aux_3_max,
-                        "prefix_length": int(m),
-                        "cs_label": bool(cs[b, seg_idx]),
-                        "bg_label": bool(bg[b, seg_idx]),
-                        "tlo_hours": float(tlo[b, seg_idx]) / 3600.0
-                        if not np.isnan(tlo[b, seg_idx])
+                        "predicted_class": int(prob_bin[b, n] >= 0.5),
+                        "prob_class_0": float(1.0 - prob_bin[b, n]),
+                        "prob_class_1": float(prob_bin[b, n]),
+                        "prob_healthy": float(prob_3[b, n, 0]),
+                        "prob_acidosis": float(prob_3[b, n, 1]),
+                        "prob_hie": float(prob_3[b, n, 2]),
+                        "predicted_class_3": int(prob_3[b, n].argmax()),
+                        "position": int(position),
+                        # Alias: legacy aggregator code reads ``prefix_length``.
+                        "prefix_length": int(position),
+                        "cs_label": bool(cs[b, n]),
+                        "bg_label": bool(bg[b, n]),
+                        "tlo_hours": float(tlo[b, n]) / 3600.0
+                        if not np.isnan(tlo[b, n])
                         else float("nan"),
-                        "sso_hours": float(sso[b, seg_idx]) / 3600.0
-                        if not np.isnan(sso[b, seg_idx])
+                        "sso_hours": float(sso[b, n]) / 3600.0
+                        if not np.isnan(sso[b, n])
                         else float("nan"),
                         "guid_binary_target": int(labels_bin[b]),
                         "guid_class_3_target": int(labels_3[b]),
                     }
                 )
     return pd.DataFrame(rows)
+
+
+# Back-compat alias for any external consumers of the old function name.
+run_inference_prefix_sweep = run_inference_per_position
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +576,7 @@ def evaluate_single_fold(
     with h5py.File(val_cache, "r", libver="latest") as fh:
         d_model_vae = int(fh.attrs["d_model"])
         d_z = int(fh.attrs["d_z"])
+    head_hidden_raw = cls_cfg.get("head_hidden_dim")
     classifier_cfg = GuidClassifierConfig(
         d_model_vae=d_model_vae,
         d_z=d_z,
@@ -605,9 +588,8 @@ def evaluate_single_fold(
         d_ff=int(cls_cfg.get("d_ff", 512)),
         n_rel_buckets=int(cls_cfg.get("n_rel_buckets", 32)),
         num_classes_multi=int(cls_cfg.get("num_classes_multi", 3)),
-        global_stats_dim=int(cls_cfg.get("guid_head", {}).get("global_stats_dim", 2)),
-        pool_hidden_dim=int(cls_cfg.get("guid_head", {}).get("pool_hidden_dim", 128)),
-        aux_hidden_dim=int(cls_cfg.get("segment_aux_head", {}).get("hidden_dim", 128)),
+        head_hidden_dim=int(head_hidden_raw) if head_hidden_raw is not None else None,
+        causal=bool(cls_cfg.get("causal", True)),
         c_meta_dim=5,
         te_summary_dim=6,
         late_window_steps=75,
@@ -742,6 +724,22 @@ def evaluate_single_fold(
             sub_dir / "subgroups",
             title_suffix=f" - {fold_dir.name}",
         )
+        # Per-class metrics + per-class subgroup stratification +
+        # binary-by-underlying-class views (Phase 2 of the eval expansion).
+        # All artefacts land under ``sub_dir/per_class/`` and
+        # ``sub_dir/binary_by_underlying_class/`` so the legacy directory
+        # tree above is unchanged.
+        try:
+            run_3class_evaluation_for_metric_type(
+                df_clinical,
+                time_bins=bins,
+                metric_type=metric_type,
+                output_dir=sub_dir,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                f"[{fold_dir.name}] 3-class metrics ({metric_type}) failed: {exc}"
+            )
         metric_summaries[metric_type] = {
             "threshold": float(threshold),
             "n_bins": int(len(metrics_df)),
@@ -812,6 +810,19 @@ def evaluate_single_fold(
     (eval_dir / "threshold_info.json").write_text(
         json.dumps(threshold_info, indent=2, sort_keys=True), encoding="utf-8"
     )
+
+    # Per-class OvR thresholds (secondary diagnostic — primary 3-class
+    # reporting stays argmax). Written to a separate file so the existing
+    # ``threshold_info.json`` schema is unchanged.
+    try:
+        write_perclass_thresholds_json(
+            val_df,
+            output_path=eval_dir / "perclass_thresholds.json",
+            target_fpr=target_fpr,
+            decision_time_hours=decision_time_hours,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"[{fold_dir.name}] perclass threshold search failed: {exc}")
 
     # 3×3 confusion matrix at the overall threshold.
     cm = compute_confusion_matrix_3class(test_df)

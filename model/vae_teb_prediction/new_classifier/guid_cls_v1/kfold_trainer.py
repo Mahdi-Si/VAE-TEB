@@ -553,7 +553,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cuda_devices=args.cuda_devices,
         max_parallel=args.max_parallel,
         sequential=bool(args.sequential),
-        fold_timeout_hours=float(args.fold_timeout_hours),
+        fold_timeout_hours=(
+            float(args.fold_timeout_hours)
+            if args.fold_timeout_hours is not None
+            else None
+        ),
     )
     return 0
 
