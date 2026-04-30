@@ -428,6 +428,7 @@ def train_fold(
     # Model
     # ------------------------------------------------------------------
     cls_cfg = config["model_config"]["classifier"]
+    head_hidden_raw = cls_cfg.get("head_hidden_dim")
     classifier_cfg = GuidClassifierConfig(
         d_model_vae=int(train_ds.d_model_vae),
         d_z=int(train_ds.d_z),
@@ -439,9 +440,8 @@ def train_fold(
         d_ff=int(cls_cfg.get("d_ff", 512)),
         n_rel_buckets=int(cls_cfg.get("n_rel_buckets", 32)),
         num_classes_multi=int(cls_cfg.get("num_classes_multi", 3)),
-        global_stats_dim=int(cls_cfg.get("guid_head", {}).get("global_stats_dim", 2)),
-        pool_hidden_dim=int(cls_cfg.get("guid_head", {}).get("pool_hidden_dim", 128)),
-        aux_hidden_dim=int(cls_cfg.get("segment_aux_head", {}).get("hidden_dim", 128)),
+        head_hidden_dim=int(head_hidden_raw) if head_hidden_raw is not None else None,
+        causal=bool(cls_cfg.get("causal", True)),
         c_meta_dim=5,
         te_summary_dim=6,
         late_window_steps=75,
@@ -454,8 +454,6 @@ def train_fold(
     loss_weights = LossWeights(
         lambda_3=float(loss_cfg.get("lambda_3", 1.0)),
         lambda_2=float(loss_cfg.get("lambda_2", 0.5)),
-        lambda_aux=float(loss_cfg.get("lambda_aux", 0.2)),
-        lambda_aux_bin=float(loss_cfg.get("lambda_aux_bin", 0.1)),
         gamma_vae=0.0 if freeze_vae else float(loss_cfg.get("gamma_vae", 0.1)),
         lambda_sp=0.0 if freeze_vae else float(loss_cfg.get("lambda_sp", 1e-4)),
     )
@@ -464,17 +462,8 @@ def train_fold(
         loss_weights=loss_weights,
         class_weights_3=cls_w_3,
         class_weights_bin=cls_w_bin,
-        prefix_min_segments=int(
-            train_cfg.get("prefix_training", {}).get("m_min", 3)
-        ),
-        prefix_alpha=float(
-            train_cfg.get("prefix_training", {}).get("alpha", 1.5)
-        ),
         segment_dropout_p=float(
             train_cfg.get("segment_dropout", {}).get("p", 0.1)
-        ),
-        prefix_training_enabled=bool(
-            train_cfg.get("prefix_training", {}).get("enabled", True)
         ),
         segment_dropout_enabled=bool(
             train_cfg.get("segment_dropout", {}).get("enabled", True)

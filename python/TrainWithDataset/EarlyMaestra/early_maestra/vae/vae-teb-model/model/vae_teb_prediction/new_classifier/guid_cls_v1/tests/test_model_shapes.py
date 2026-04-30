@@ -26,9 +26,7 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_dataset import (  
     GuidSequenceDataset,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.heads import (  # noqa: E402
-    SegmentAuxHead,
-    GuidOutcomeHead,
-    build_guid_global_stats,
+    PerPositionOutcomeHead,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.segment_tokenizer import (  # noqa: E402
     _compute_te_summary,
@@ -102,57 +100,56 @@ def test_transformer_block_shapes() -> None:
     assert torch.all(out[1, 3:] == 0)
 
 
-def test_guid_head_shapes_and_iota_pass_through() -> None:
-    """GuidOutcomeHead emits 3-class + binary; iota_sso flows from c_meta."""
+def test_per_position_head_shapes_and_zeroed_padding() -> None:
+    """PerPositionOutcomeHead emits per-position probs; padded rows zeroed."""
     B, N, dm = 2, 4, 256
     h = torch.randn(B, N, dm)
     seg_mask = torch.ones(B, N, dtype=torch.bool)
     seg_mask[0, 3] = False
-    g_glob = torch.randn(B, 2)
-    head = GuidOutcomeHead(d_model=dm)
-    out = head(h, seg_mask, g_glob)
-    assert out["logits_3"].shape == (B, 3)
-    assert out["logit_bin"].shape == (B,)
-    assert out["prob_3"].shape == (B, 3)
-    assert torch.allclose(
-        out["prob_3"].sum(dim=-1), torch.ones(B), atol=1e-5
-    )
-    assert out["segment_importance"].shape == (B, N)
-    # Padded position must receive zero importance.
-    assert out["segment_importance"][0, 3].item() == 0.0
+    head = PerPositionOutcomeHead(d_model=dm)
+    out = head(h, seg_mask)
+    assert out["logits_3"].shape == (B, N, 3)
+    assert out["logit_bin"].shape == (B, N)
+    assert out["prob_3"].shape == (B, N, 3)
+    assert out["prob_bin"].shape == (B, N)
+    # Padded positions: prob_bin=0, prob_3 row=0 (because masked logits=0
+    # then zeroed again by the explicit mask multiply).
+    assert out["prob_bin"][0, 3].item() == 0.0
+    assert torch.all(out["prob_3"][0, 3] == 0.0)
+    # Valid positions: prob_3 sums to 1.
+    valid = seg_mask
+    sums = out["prob_3"][valid].sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
 
-def test_aux_head_zero_init_yields_uniform_probs() -> None:
-    """SegmentAuxHead heads are zero-inited; aux_prob_3 ≈ uniform."""
-    head = SegmentAuxHead(d_model=256)
-    h = torch.randn(2, 5, 256)
-    mask = torch.ones(2, 5, dtype=torch.bool)
-    mask[0, 4] = False
+def test_per_position_head_binary_init_at_half() -> None:
+    """Zero-initialised binary head should give prob_bin ≈ 0.5 at init.
+
+    Implementation detail: ``head_bin.weight`` is also zero-inited so
+    ``logit_bin == 0`` regardless of input, giving ``prob_bin == 0.5``
+    at every valid position.
+    """
+    head = PerPositionOutcomeHead(d_model=64)
+    h = torch.randn(2, 3, 64)
+    mask = torch.ones(2, 3, dtype=torch.bool)
     out = head(h, mask)
-    assert out["aux_logits_3"].shape == (2, 5, 3)
-    assert torch.allclose(
-        out["aux_prob_3"][mask], torch.full_like(out["aux_prob_3"][mask], 1 / 3)
-    )
-    assert torch.allclose(
-        out["aux_prob_bin"][mask], torch.full_like(out["aux_prob_bin"][mask], 0.5)
-    )
+    assert torch.allclose(out["prob_bin"][mask], torch.full_like(out["prob_bin"][mask], 0.5))
 
 
 def test_full_classifier_forward(loader_and_cfg) -> None:
-    """Full forward returns the documented dict with correct shapes."""
+    """Full forward returns the documented per-position dict with correct shapes."""
     loader, cfg = loader_and_cfg
     model = GuidOutcomeClassifier(cfg)
     batch = next(iter(loader))
     out = model(batch)
     B, N = batch["segment_mask"].shape
-    assert out["logits_3"].shape == (B, 3)
-    assert out["logit_bin"].shape == (B,)
-    assert out["aux_logits_3"].shape == (B, N, 3)
-    assert out["aux_logit_bin"].shape == (B, N)
+    assert out["logits_3"].shape == (B, N, 3)
+    assert out["logit_bin"].shape == (B, N)
+    assert out["prob_3"].shape == (B, N, 3)
+    assert out["prob_bin"].shape == (B, N)
     assert out["segment_tokens"].shape == (B, N, cfg.d_model)
     assert out["segment_context"].shape == (B, N, cfg.d_model)
     assert out["segment_te_summary"].shape == (B, N, cfg.te_summary_dim)
-    assert out["guid_global_stats"].shape == (B, cfg.global_stats_dim)
 
 
 def test_classifier_marker_no_compile() -> None:
@@ -183,7 +180,7 @@ def test_classifier_grad_flows() -> None:
         "num_segments": torch.full((B,), N, dtype=torch.long),
     }
     out = model(batch)
-    loss = out["logits_3"].sum() + out["logit_bin"].sum() + out["aux_logits_3"].sum()
+    loss = out["logits_3"].sum() + out["logit_bin"].sum()
     loss.backward()
     grads = [p.grad.abs().sum() for p in model.parameters() if p.grad is not None]
     assert grads, "no parameters received gradients"
@@ -216,42 +213,6 @@ def test_classifier_does_not_consume_epoch() -> None:
     assert "epoch" not in batch
     out = model(batch)
     assert "logits_3" in out
-
-
-def test_global_stats_computation() -> None:
-    """build_guid_global_stats returns ``[log(1+N), mean ι_sso]``.
-
-    Cumulative monitoring time, mean Δt, max κ and signal-quality summaries
-    were all removed from ``g_glob`` because they are biased by the dataset's
-    quality filter on ``epoch[0]`` (cumulative/span statistics) or because
-    they reflect sensor validity rather than physiology (signal quality).
-    The output is therefore now 2-d.
-    """
-    g = build_guid_global_stats(
-        num_segments=torch.tensor([4, 8]),
-        iota_sso=torch.tensor([[0.0, 0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0, 1.0]]),
-        segment_mask=torch.tensor(
-            [
-                [True, True, True, True, False],
-                [True, True, True, True, True],
-            ]
-        ),
-    )
-    assert g.shape == (2, 2)
-    # log(1+N) at N=4 / N=8.
-    assert torch.allclose(
-        g[:, 0],
-        torch.tensor(
-            [
-                torch.log1p(torch.tensor(4.0)).item(),
-                torch.log1p(torch.tensor(8.0)).item(),
-            ]
-        ),
-    )
-    # mean ι_sso should average over the *valid* segments only.
-    # Row 0: 4 valid segments, ι = [0, 0, 1, 1]              → mean = 0.5
-    # Row 1: 5 valid segments, ι = [0, 0, 0, 1, 1]            → mean = 0.4
-    assert torch.allclose(g[:, 1], torch.tensor([0.5, 0.4]), atol=1e-6)
 
 
 def test_te_summary_uses_kld_weighting() -> None:

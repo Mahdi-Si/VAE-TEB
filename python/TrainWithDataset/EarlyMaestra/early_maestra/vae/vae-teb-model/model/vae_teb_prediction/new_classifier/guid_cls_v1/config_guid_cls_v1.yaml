@@ -1,5 +1,5 @@
 # =============================================================================
-# GUID-Level Stage-Aware Classifier Configuration
+# GUID-Level Stage-Aware Classifier Configuration  (causal-AR)
 # =============================================================================
 # Used by:
 #   - precompute_latents.py (fold-specific VAE latent caches)
@@ -9,6 +9,7 @@
 #
 # See PRD.md for the full specification and decision log.
 # =============================================================================
+config_version: 2                            # Bumped: causal-AR head + per-position loss
 
 general_config:
   tag: guid_cls_v1_run_1                     # Experiment identifier
@@ -86,21 +87,8 @@ model_config:
     warmup_left: 30                          # Per-segment mask left trim (steps)
     warmup_right: 30                         # Per-segment mask right trim (steps)
     cross_delivery_censoring: true           # Zero per-t mask when sample crosses delivery
-
-    segment_aux_head:
-      enabled: true
-      hidden_dim: 128                        # d_model/2
-    guid_head:
-      global_stats_dim: 2                    # [log(1+N), mean ι_sso]
-                                              # NOTE: signal-quality dims (mean hat_w, fraction of valid steps) are
-                                              # excluded by design — they reflect sensor validity, not physiology.
-                                              # Cumulative monitoring time (ψ(c_N)), mean Δt (ψ(mean Δt)) and
-                                              # max gap (log(1+max κ)) are also excluded: they all derive from the
-                                              # spans of observed segments, which are biased by the dataset's
-                                              # quality filter on epoch[0] (a noisier patient loses early segments
-                                              # to weight/flat-region filters, shrinking every downstream span).
-                                              # Pairwise Δt is still consumed by the transformer's relative-time
-                                              # bias — that is structural distance, not a feature.
+    causal: true                             # Lower-tri attention mask — required for AR head
+    head_hidden_dim: null                    # null => defaults to d_model
     num_classes_multi: 3                     # {0=healthy, 1=acidosis, 2=HIE}
 
 
@@ -122,18 +110,16 @@ training:
     gamma: 0.1
 
   loss:
-    lambda_3: 1.0                            # 3-class CE at GUID level
-    lambda_2: 0.5                            # Binary BCE at GUID level
-    lambda_aux: 0.2                          # Per-segment 3-class CE (auxiliary)
-    lambda_aux_bin: 0.1                      # Per-segment binary BCE (auxiliary)
+    lambda_3: 1.0                            # Per-position 3-class CE (two-level reduction)
+    lambda_2: 0.5                            # Per-position binary BCE  (two-level reduction)
     gamma_vae: 0.1                           # VAE aux loss weight (stage 2 only)
     lambda_sp: 1.0e-4                        # L2 sparsity to θ^(0) (stage 2 only)
     class_weight_mode: inverse_frequency      # "inverse_frequency" | "none"
 
-  prefix_training:
-    enabled: true
-    m_min: 3                                 # Minimum prefix length
-    alpha: 1.5                               # p(m) ∝ m^alpha
+  # NOTE: prefix_training has been removed — under the causal-AR head, every
+  # position contributes a loss in one forward pass per GUID, so stochastic
+  # prefix sampling is no longer needed (and was historically biased toward
+  # long prefixes via p(m) ∝ m^1.5).
 
   segment_dropout:
     enabled: true

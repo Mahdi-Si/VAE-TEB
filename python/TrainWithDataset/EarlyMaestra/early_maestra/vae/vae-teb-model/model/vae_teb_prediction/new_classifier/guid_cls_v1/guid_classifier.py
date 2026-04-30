@@ -1,9 +1,15 @@
-"""Top-level :class:`GuidOutcomeClassifier` for ``guid_cls_v1`` (PRD §7.4).
+"""Top-level :class:`GuidOutcomeClassifier` for ``guid_cls_v1`` (causal AR).
 
-Wraps the segment tokenizer → relative-time transformer → GUID + auxiliary
-heads. The class is dataset-agnostic: it consumes the dict produced by
-:func:`guid_sequence_collate_fn` (cache-driven path). A live-VAE path is
-exposed via :meth:`from_live_batch` (deferred to Phase 7).
+Wraps the segment tokenizer → causal relative-time transformer →
+:class:`PerPositionOutcomeHead`. The class is dataset-agnostic: it
+consumes the dict produced by :func:`guid_sequence_collate_fn`
+(cache-driven path). A live-VAE path is exposed via
+:meth:`from_live_batch` (deferred to Phase 7).
+
+Output shapes are per-position: ``logits_3 (B, N, 3)``, ``logit_bin (B, N)``.
+Position ``n`` carries the model's GUID-level prediction *given history
+up to position ``n``*. The training loss is a per-position masked-mean
+CE/BCE with two-level reduction (per-GUID then batch).
 """
 
 from __future__ import annotations
@@ -15,9 +21,7 @@ import torch
 import torch.nn as nn
 
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.heads import (
-    GuidOutcomeHead,
-    SegmentAuxHead,
-    build_guid_global_stats,
+    PerPositionOutcomeHead,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.segment_tokenizer import (
     VaeSegmentTokenizer,
@@ -51,9 +55,10 @@ class GuidClassifierConfig:
 
     # Heads
     num_classes_multi: int = 3
-    global_stats_dim: int = 2
-    pool_hidden_dim: int = 128
-    aux_hidden_dim: int = 128
+    head_hidden_dim: Optional[int] = None  # defaults to ``d_model`` when None
+
+    # Causal autoregressive flag — exposed for ablations only. Default True.
+    causal: bool = True
 
     # Tokenizer
     c_meta_dim: int = 5
@@ -70,12 +75,12 @@ class GuidClassifierConfig:
 
 
 class GuidOutcomeClassifier(nn.Module):
-    """Two-level GUID-outcome classifier.
+    """Two-level causal-autoregressive GUID-outcome classifier.
 
     Level 1 (per-segment): :class:`VaeSegmentTokenizer` → 256-d token.
-    Level 2 (cross-segment): :class:`RelativeTimeTransformer` → 256-d context.
-    Heads: :class:`GuidOutcomeHead` (primary) + :class:`SegmentAuxHead`
-    (auxiliary).
+    Level 2 (cross-segment): :class:`RelativeTimeTransformer` (causal) →
+    256-d context per position.
+    Head: :class:`PerPositionOutcomeHead` applied at every position.
 
     Args:
         cfg: Resolved hyperparameter bundle.
@@ -108,18 +113,12 @@ class GuidOutcomeClassifier(nn.Module):
             d_ff=cfg.d_ff,
             n_buckets=cfg.n_rel_buckets,
             dropout=cfg.dropout,
+            causal=cfg.causal,
         )
-        self.guid_head = GuidOutcomeHead(
+        self.outcome_head = PerPositionOutcomeHead(
             d_model=cfg.d_model,
-            global_stats_dim=cfg.global_stats_dim,
             num_classes_multi=cfg.num_classes_multi,
-            pool_hidden_dim=cfg.pool_hidden_dim,
-            dropout=cfg.dropout,
-        )
-        self.aux_head = SegmentAuxHead(
-            d_model=cfg.d_model,
-            hidden_dim=cfg.aux_hidden_dim,
-            num_classes_multi=cfg.num_classes_multi,
+            hidden_dim=cfg.head_hidden_dim,
             dropout=cfg.dropout,
         )
 
@@ -165,11 +164,11 @@ class GuidOutcomeClassifier(nn.Module):
             batch: Output of :func:`guid_sequence_collate_fn`.
 
         Returns:
-            Dict with the union of the GUID-head outputs, the auxiliary-head
-            outputs, transformer artefacts (``segment_tokens``,
-            ``segment_context``, ``segment_te_summary``), and a copy of
-            ``segment_mask`` so downstream consumers don't need the raw
-            batch.
+            Dict with per-position head outputs (``logits_3 (B, N, 3)``,
+            ``logit_bin (B, N)``, ``prob_3 (B, N, 3)``, ``prob_bin (B, N)``),
+            transformer artefacts (``segment_tokens``, ``segment_context``,
+            ``segment_te_summary``), and a copy of ``segment_mask`` so
+            downstream consumers don't need the raw batch.
         """
         tok = self.tokenizer(
             h_y=batch["h_y"],
@@ -189,29 +188,14 @@ class GuidOutcomeClassifier(nn.Module):
             rel_bucket_idx=batch["rel_bucket_idx"],
         )                                                     # (B, N, d_model)
 
-        # iota_sso: ``c_meta[..., 4]`` per the dataset's 5-d layout
-        # ``[ψ(τ_lab), m_lab, ψ(τ_sso), m_sso, ι_sso]``. The cumulative /
-        # span statistics (``cum_h``, ``δ``, ``κ``) are deliberately NOT
-        # consumed here — they are quality-filter biased (see
-        # :func:`build_guid_global_stats` docstring).
-        iota_sso = batch["c_meta"][..., 4]
-        g_glob = build_guid_global_stats(
-            num_segments=batch["num_segments"],
-            iota_sso=iota_sso,
-            segment_mask=batch["segment_mask"],
-        )                                                     # (B, 2)
-
-        guid_out = self.guid_head(h, batch["segment_mask"], g_glob)
-        aux_out = self.aux_head(h, batch["segment_mask"])
+        head_out = self.outcome_head(h, batch["segment_mask"])
 
         return {
-            **guid_out,
-            **aux_out,
+            **head_out,
             "segment_tokens": segment_tokens,
             "segment_context": h,
             "segment_te_summary": tok["u_TE"],
             "segment_mask": batch["segment_mask"],
-            "guid_global_stats": g_glob,
         }
 
 

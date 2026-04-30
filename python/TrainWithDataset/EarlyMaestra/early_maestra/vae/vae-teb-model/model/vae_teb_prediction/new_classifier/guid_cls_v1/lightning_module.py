@@ -1,10 +1,15 @@
-"""PyTorch Lightning wrapper for ``GuidOutcomeClassifier``.
+"""PyTorch Lightning wrapper for ``GuidOutcomeClassifier`` (causal AR).
 
 * Bypasses ``LightningModelBase``'s automatic ``torch.compile`` (variable-N
   batches plus the live-VAE branch trip dynamic recompilation).
-* Implements prefix-length sampling, segment dropout, and the combined loss
-  (PRD §8.1-§8.3).
-* Aggregates per-epoch ``macro_f1`` and ``binary_auroc`` for monitoring.
+* Causal-AR design: every position contributes to the loss in one forward
+  pass per GUID. Prefix-length sampling has been removed — short prefixes
+  are now naturally trained by the per-position loss.
+* Keeps :func:`apply_segment_dropout` as a regulariser (consistent with the
+  PRD's segment-dropout intent).
+* Validation metrics use the last-valid position's prediction as the
+  single GUID summary so ``binary_auroc`` / ``macro_f1`` semantics match
+  the natural "final clinical decision" at the end of the recording.
 """
 
 from __future__ import annotations
@@ -110,99 +115,6 @@ def _recompute_delta_features(
     # quality filter on ``epoch[0]``.
 
 
-def sample_prefix_length(
-    n_total: int, *, m_min: int = 3, alpha: float = 1.5, generator: Optional[torch.Generator] = None
-) -> int:
-    """Sample a prefix length under ``p(m | N) ∝ m^alpha`` (PRD §8.2).
-
-    Args:
-        n_total: Number of valid segments for the GUID.
-        m_min: Minimum prefix length (default 3).
-        alpha: Power-law exponent (default 1.5).
-        generator: Optional torch RNG.
-
-    Returns:
-        Integer in ``[min(m_min, n_total), n_total]``.
-    """
-    n_total = int(n_total)
-    if n_total <= m_min:
-        return n_total
-    candidates = torch.arange(m_min, n_total + 1, dtype=torch.float32)
-    weights = candidates.pow(alpha)
-    probs = weights / weights.sum()
-    idx = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
-    return int(candidates[idx].item())
-
-
-def apply_prefix_truncation(
-    batch: Dict[str, torch.Tensor],
-    *,
-    m_min: int = 3,
-    alpha: float = 1.5,
-    rng: Optional[torch.Generator] = None,
-) -> Dict[str, torch.Tensor]:
-    """Truncate each GUID in ``batch`` to a randomly sampled prefix length.
-
-    Mutates a copy of ``batch`` in-place: ``segment_mask`` is rewritten to
-    cover only the first ``m`` segments per row, and per-segment tensors
-    beyond the prefix are zeroed (no need to resize because the model
-    already respects ``segment_mask``).
-
-    Args:
-        batch: Collated batch dict.
-        m_min: Minimum prefix length.
-        alpha: Power-law exponent.
-        rng: Optional RNG for reproducibility.
-
-    Returns:
-        New batch dict with truncated masks.
-    """
-    new_batch: Dict[str, Any] = {
-        k: (v.clone() if isinstance(v, torch.Tensor) else list(v) if isinstance(v, list) else v)
-        for k, v in batch.items()
-    }
-    seg_mask: torch.Tensor = new_batch["segment_mask"]
-    num_seg: torch.Tensor = new_batch["num_segments"]
-    B, N = seg_mask.shape
-    n_per = num_seg.tolist()
-    new_lengths: List[int] = []
-    for b in range(B):
-        m = sample_prefix_length(int(n_per[b]), m_min=m_min, alpha=alpha, generator=rng)
-        new_lengths.append(m)
-        if m < N:
-            seg_mask[b, m:] = False
-    new_batch["segment_mask"] = seg_mask
-    new_batch["num_segments"] = torch.tensor(new_lengths, dtype=torch.long, device=seg_mask.device)
-    # Per-segment tensors beyond the new prefix should be zeroed so that any
-    # accidental consumer ignoring segment_mask cannot leak them.
-    seg_keys = (
-        "h_y",
-        "mu_prior_norm",
-        "mu_post_norm",
-        "kld_per_t",
-        "mean_alpha",
-        "weight",
-        "hat_w",
-        "c_meta",
-        "cum_monitor_hours",
-        "delta_t_hours",
-        "gap_ratio",
-        "time_from_labor_onset",
-        "second_stage_onset",
-        "epoch",
-    )
-    for key in seg_keys:
-        if key in new_batch and isinstance(new_batch[key], torch.Tensor):
-            t = new_batch[key]
-            mask = seg_mask
-            while mask.dim() < t.dim():
-                mask = mask.unsqueeze(-1)
-            new_batch[key] = t * mask.to(t.dtype)
-    if "target_per_t" in new_batch:
-        new_batch["target_per_t"] = new_batch["target_per_t"] * seg_mask.unsqueeze(-1).long()
-    return new_batch
-
-
 def apply_segment_dropout(
     batch: Dict[str, torch.Tensor],
     *,
@@ -301,19 +213,52 @@ def _binary_auroc(probs_pos: torch.Tensor, target_bin: torch.Tensor) -> torch.Te
     return auc.clamp(0.0, 1.0)
 
 
+def _last_valid_idx(segment_mask: torch.Tensor) -> torch.Tensor:
+    """Return the index of the last True position per row.
+
+    Args:
+        segment_mask: ``(B, N)`` bool — True for valid segments.
+
+    Returns:
+        ``(B,)`` long tensor — index in ``[0, N-1]`` of the last True per row.
+        Rows with no valid positions get index 0 (callers should guard with
+        the row's ``num_segments`` count).
+    """
+    mask_f = segment_mask.float()
+    pos = mask_f.cumsum(dim=-1) * mask_f
+    return pos.argmax(dim=-1).clamp(min=0)
+
+
+def _gather_last_valid_per_position(
+    per_pos: torch.Tensor, segment_mask: torch.Tensor
+) -> torch.Tensor:
+    """Gather the per-position output at each row's last valid position.
+
+    Args:
+        per_pos: ``(B, N)`` or ``(B, N, C)`` per-position tensor.
+        segment_mask: ``(B, N)`` bool.
+
+    Returns:
+        ``(B,)`` if input was ``(B, N)``, else ``(B, C)``.
+    """
+    last_idx = _last_valid_idx(segment_mask)              # (B,)
+    batch_idx = torch.arange(per_pos.shape[0], device=per_pos.device)
+    return per_pos[batch_idx, last_idx]
+
+
 class PlGuidClassifier(LightningModelBase):
-    """Lightning wrapper around :class:`GuidOutcomeClassifier`.
+    """Lightning wrapper around :class:`GuidOutcomeClassifier` (causal AR).
 
     Args:
         base_model: A :class:`GuidOutcomeClassifier` instance.
-        loss_weights: Loss-component weights (PRD §8.1).
+        loss_weights: Loss-component weights.
         class_weights_3: Optional length-3 class weights.
         class_weights_bin: Optional length-2 binary weights.
-        prefix_min_segments: Minimum prefix length for prefix sampling.
-        prefix_alpha: Power-law exponent for prefix sampling.
         segment_dropout_p: Per-segment dropout probability for training.
-        prefix_training_enabled: Toggle for prefix sampling at train time.
         segment_dropout_enabled: Toggle for segment dropout.
+        rel_num_buckets: Number of relative-time bias buckets — must match
+            the transformer's bias-table size.
+        rel_d_max: Relative-time bias saturation horizon (in 20-min slots).
         lr: Classifier-group learning rate.
         lr_milestones: Optional MultiStepLR milestones.
         weight_decay: AdamW weight decay.
@@ -331,10 +276,7 @@ class PlGuidClassifier(LightningModelBase):
         loss_weights: Optional[LossWeights] = None,
         class_weights_3: Optional[torch.Tensor] = None,
         class_weights_bin: Optional[torch.Tensor] = None,
-        prefix_min_segments: int = 3,
-        prefix_alpha: float = 1.5,
         segment_dropout_p: float = 0.1,
-        prefix_training_enabled: bool = True,
         segment_dropout_enabled: bool = True,
         rel_num_buckets: int = 32,
         rel_d_max: float = 40.0,
@@ -350,13 +292,13 @@ class PlGuidClassifier(LightningModelBase):
             lr=lr,
             lr_milestones=list(lr_milestones) if lr_milestones else None,
             weight_decay=weight_decay,
-            module_name=self.__class__.__name__,
+            module_name="PlGuidClassifierV2",
         )
-        # PRD §9.1: bypass torch.compile for variable-shape batches.
+        # Bypass torch.compile for variable-shape batches.
         if getattr(base_model, "no_compile", False):
             self.model = self._orig_model
             logger.info(
-                "PlGuidClassifier: torch.compile bypassed "
+                "PlGuidClassifierV2: torch.compile bypassed "
                 "(GuidOutcomeClassifier.no_compile=True)"
             )
 
@@ -366,10 +308,7 @@ class PlGuidClassifier(LightningModelBase):
             class_weights_3=class_weights_3,
             class_weights_bin=class_weights_bin,
         )
-        self.prefix_min_segments = int(prefix_min_segments)
-        self.prefix_alpha = float(prefix_alpha)
         self.segment_dropout_p = float(segment_dropout_p)
-        self.prefix_training_enabled = bool(prefix_training_enabled)
         self.segment_dropout_enabled = bool(segment_dropout_enabled)
         self.rel_num_buckets = int(rel_num_buckets)
         self.rel_d_max = float(rel_d_max)
@@ -378,8 +317,9 @@ class PlGuidClassifier(LightningModelBase):
         self.compute_binary_auroc = bool(compute_binary_auroc)
 
         # Per-epoch validation buffers (cleared at ``on_validation_epoch_start``).
-        # Test-time metrics are produced by :mod:`evaluate_guid_classifier` via
-        # the prefix sweep — ``trainer.test`` is never called from ``train_fold``,
+        # Test-time metrics are produced by
+        # :mod:`evaluate_guid_classifier` via the per-position inference
+        # pass — ``trainer.test`` is never called from ``train_fold`` —
         # so we do not maintain a separate test-side buffer here.
         self._val_probs_3: List[torch.Tensor] = []
         self._val_target_3: List[torch.Tensor] = []
@@ -404,63 +344,64 @@ class PlGuidClassifier(LightningModelBase):
             ``(total_loss, metrics_dict)`` consumed by
             :class:`LightningModelBase`.
         """
-        if stage == "train":
-            if self.prefix_training_enabled:
-                batch = apply_prefix_truncation(
-                    batch,
-                    m_min=self.prefix_min_segments,
-                    alpha=self.prefix_alpha,
-                )
-            if self.segment_dropout_enabled:
-                batch = apply_segment_dropout(
-                    batch,
-                    p=self.segment_dropout_p,
-                    rel_num_buckets=self.rel_num_buckets,
-                    rel_d_max=self.rel_d_max,
-                )
+        del batch_idx  # unused
+        if stage == "train" and self.segment_dropout_enabled:
+            batch = apply_segment_dropout(
+                batch,
+                p=self.segment_dropout_p,
+                rel_num_buckets=self.rel_num_buckets,
+                rel_d_max=self.rel_d_max,
+            )
         outputs = self.model(batch)
         components = self.loss(outputs=outputs, batch=batch)
         total = components["total_loss"]
 
+        seg_mask = batch["segment_mask"]
+        target_3 = batch["label_3"].long()
+        target_bin = batch["label_bin"].float()
+
         with torch.no_grad():
-            preds_3 = outputs["prob_3"].argmax(dim=-1)
-            target_3 = batch["label_3"].long()
-            target_bin = batch["label_bin"].float()
+            # Single-GUID summary uses the **last-valid** position so that
+            # ``acc_3`` / ``acc_bin`` and the val buffers semantically reflect
+            # "the model's prediction at the end of the recording" — the
+            # natural final clinical decision.
+            last_prob_3 = _gather_last_valid_per_position(outputs["prob_3"], seg_mask)
+            last_prob_bin = _gather_last_valid_per_position(outputs["prob_bin"], seg_mask)
+            preds_3 = last_prob_3.argmax(dim=-1)
             acc_3 = (preds_3 == target_3).float().mean()
-            preds_bin = (outputs["prob_bin"] >= 0.5).float()
+            preds_bin = (last_prob_bin >= 0.5).float()
             acc_bin = (preds_bin == target_bin).float().mean()
-            mean_prefix = batch["num_segments"].float().mean()
+            mean_num_segments = batch["num_segments"].float().mean()
 
         metrics: MetricDict = {
             "total_loss": total,
             "ce_3": components["ce_3"],
             "bce_bin": components["bce_bin"],
-            "aux_ce_3": components["aux_ce_3"],
-            "aux_bce_bin": components["aux_bce_bin"],
             "acc_3": acc_3,
             "acc_bin": acc_bin,
-            "mean_prefix_len": mean_prefix,
+            "mean_num_segments": mean_num_segments,
         }
         if "vae_loss" in components:
             metrics["vae_loss"] = components["vae_loss"]
         if "sparsity" in components:
             metrics["sparsity"] = components["sparsity"]
 
-        # Buffer probabilities for end-of-epoch macro-F1 / AUROC (val only).
+        # Buffer last-valid probabilities for end-of-epoch macro-F1 / AUROC.
         if stage == "val":
-            self._buffer_val_outputs(outputs, target_3, target_bin)
+            self._buffer_val_outputs(last_prob_3, last_prob_bin, target_3, target_bin)
         return total, metrics
 
     def _buffer_val_outputs(
         self,
-        outputs: Dict[str, torch.Tensor],
+        last_prob_3: torch.Tensor,
+        last_prob_bin: torch.Tensor,
         target_3: torch.Tensor,
         target_bin: torch.Tensor,
     ) -> None:
-        """Accumulate per-batch val probabilities for epoch-level metrics."""
-        self._val_probs_3.append(outputs["prob_3"].detach().cpu())
+        """Accumulate per-batch last-valid probabilities for epoch metrics."""
+        self._val_probs_3.append(last_prob_3.detach().cpu())
         self._val_target_3.append(target_3.detach().cpu())
-        self._val_probs_bin.append(outputs["prob_bin"].detach().cpu())
+        self._val_probs_bin.append(last_prob_bin.detach().cpu())
         self._val_target_bin.append(target_bin.detach().cpu())
 
     def on_validation_epoch_start(self) -> None:
@@ -533,7 +474,5 @@ class PlGuidClassifier(LightningModelBase):
 
 __all__ = [
     "PlGuidClassifier",
-    "apply_prefix_truncation",
     "apply_segment_dropout",
-    "sample_prefix_length",
 ]

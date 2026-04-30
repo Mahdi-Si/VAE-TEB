@@ -202,6 +202,201 @@ def _plot_mean_confusion_matrix(
     return mean_cm
 
 
+PER_CLASS_NAMES: Tuple[str, ...] = ("healthy", "acidosis", "hie")
+METRIC_TYPES: Tuple[str, ...] = ("instantaneous", "committed_cumulative", "committed_overall")
+
+
+def _interp_metric_curve(df: pd.DataFrame, grid: np.ndarray, key: str) -> np.ndarray:
+    """Interpolate ``df[key]`` onto ``grid`` indexed by ``bin_center``."""
+    if df is None or df.empty or "bin_center" not in df.columns or key not in df.columns:
+        return np.full_like(grid, np.nan, dtype=float)
+    centers = df["bin_center"].astype(float).to_numpy()
+    values = df[key].astype(float).to_numpy()
+    valid = np.isfinite(centers) & np.isfinite(values)
+    if valid.sum() < 2:
+        return np.full_like(grid, np.nan, dtype=float)
+    order = np.argsort(centers[valid])
+    return np.interp(grid, centers[valid][order], values[valid][order])
+
+
+def _plot_mean_curve_with_band(
+    ax,
+    grid: np.ndarray,
+    per_fold: List[np.ndarray],
+    *,
+    label: str,
+    color: str,
+) -> Optional[Tuple[float, float]]:
+    """Plot mean ± std (and per-fold thin lines) on ``ax``. Returns (mean_at_x0, std_at_x0)."""
+    if not per_fold:
+        return None
+    arr = np.vstack(per_fold)
+    mean = np.nanmean(arr, axis=0)
+    std = np.nanstd(arr, axis=0)
+    for row in per_fold:
+        ax.plot(grid, row, alpha=0.20, color=color, lw=0.7)
+    ax.plot(grid, mean, color=color, lw=2.0, label=label)
+    ax.fill_between(grid, mean - std, mean + std, color=color, alpha=0.15)
+    return float(np.nanmean(mean)), float(np.nanmean(std))
+
+
+def _aggregate_perclass_metric_curves(
+    fold_dirs: List[Path], agg_root: Path
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Mean ± std per-class time-binned metric curves across folds.
+
+    Reads each fold's ``per_class/<class>_metrics.csv`` written by
+    :func:`evaluate_3class_metrics.run_3class_evaluation_for_metric_type`,
+    interpolates onto a common bin-center grid, plots into
+    ``aggregated_plots/<metric_type>/per_class/<class>_aggregated.png``,
+    and returns a summary dict with mean+std at the decision time.
+    """
+    import matplotlib.pyplot as plt  # noqa: WPS433
+
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for metric_type in METRIC_TYPES:
+        per_class_summary: Dict[str, Dict[str, float]] = {}
+        out_dir = agg_root / metric_type / "per_class"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for class_name in PER_CLASS_NAMES:
+            per_fold_sens: List[np.ndarray] = []
+            per_fold_fpr: List[np.ndarray] = []
+            grid_min, grid_max = float("inf"), float("-inf")
+            collected: List[pd.DataFrame] = []
+            for fd in fold_dirs:
+                csv = (
+                    fd
+                    / "evaluation"
+                    / "three_metric_types"
+                    / metric_type
+                    / "per_class"
+                    / f"{class_name}_metrics.csv"
+                )
+                if not csv.exists():
+                    continue
+                try:
+                    df = pd.read_csv(csv)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"could not read {csv}: {exc}")
+                    continue
+                if df.empty or "bin_center" not in df.columns:
+                    continue
+                collected.append(df)
+                centers = df["bin_center"].astype(float).to_numpy()
+                if centers.size:
+                    grid_min = min(grid_min, float(np.nanmin(centers)))
+                    grid_max = max(grid_max, float(np.nanmax(centers)))
+            if not collected:
+                continue
+            grid = np.linspace(grid_min, grid_max, 64)
+            for df in collected:
+                per_fold_sens.append(_interp_metric_curve(df, grid, "sensitivity"))
+                per_fold_fpr.append(_interp_metric_curve(df, grid, "fpr"))
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            sens_stat = _plot_mean_curve_with_band(
+                axes[0], grid, per_fold_sens, label="mean", color="C0"
+            )
+            axes[0].set_title(f"{class_name} sensitivity vs time ({metric_type})")
+            axes[0].set_xlabel("hours before delivery")
+            axes[0].set_ylabel("sensitivity")
+            axes[0].invert_xaxis()  # nearer-to-delivery on the right
+            axes[0].set_ylim(-0.05, 1.05)
+
+            fpr_stat = _plot_mean_curve_with_band(
+                axes[1], grid, per_fold_fpr, label="mean", color="C3"
+            )
+            axes[1].set_title(f"{class_name} FPR vs time ({metric_type})")
+            axes[1].set_xlabel("hours before delivery")
+            axes[1].set_ylabel("FPR")
+            axes[1].invert_xaxis()
+            axes[1].set_ylim(-0.05, 1.05)
+
+            fig.tight_layout()
+            fig.savefig(out_dir / f"{class_name}_aggregated.png", dpi=150)
+            plt.close(fig)
+
+            per_class_summary[class_name] = {
+                "n_folds": int(len(per_fold_sens)),
+                "sensitivity_mean_overall": (sens_stat or (float("nan"), float("nan")))[0],
+                "sensitivity_std_overall": (sens_stat or (float("nan"), float("nan")))[1],
+                "fpr_mean_overall": (fpr_stat or (float("nan"), float("nan")))[0],
+                "fpr_std_overall": (fpr_stat or (float("nan"), float("nan")))[1],
+            }
+        if per_class_summary:
+            summary[metric_type] = per_class_summary
+    return summary
+
+
+def _aggregate_binary_by_underlying_class_curves(
+    fold_dirs: List[Path], agg_root: Path
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Aggregate the binary-by-underlying-class CSVs across folds."""
+    import matplotlib.pyplot as plt  # noqa: WPS433
+
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for metric_type in METRIC_TYPES:
+        sub_summary: Dict[str, Dict[str, float]] = {}
+        out_dir = agg_root / metric_type / "binary_by_underlying_class"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for restrict in ("acidosis", "hie"):
+            collected: List[pd.DataFrame] = []
+            grid_min, grid_max = float("inf"), float("-inf")
+            for fd in fold_dirs:
+                csv = (
+                    fd
+                    / "evaluation"
+                    / "three_metric_types"
+                    / metric_type
+                    / "binary_by_underlying_class"
+                    / f"binary_only_{restrict}"
+                    / "metrics.csv"
+                )
+                if not csv.exists():
+                    continue
+                try:
+                    df = pd.read_csv(csv)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"could not read {csv}: {exc}")
+                    continue
+                if df.empty:
+                    continue
+                collected.append(df)
+                centers = df["bin_center"].astype(float).to_numpy()
+                if centers.size:
+                    grid_min = min(grid_min, float(np.nanmin(centers)))
+                    grid_max = max(grid_max, float(np.nanmax(centers)))
+            if not collected:
+                continue
+            grid = np.linspace(grid_min, grid_max, 64)
+            sens = [_interp_metric_curve(df, grid, "sensitivity") for df in collected]
+            fpr = [_interp_metric_curve(df, grid, "fpr") for df in collected]
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            sens_stat = _plot_mean_curve_with_band(axes[0], grid, sens, label="mean", color="C0")
+            axes[0].set_title(f"binary | only {restrict} — sensitivity ({metric_type})")
+            axes[0].set_xlabel("hours before delivery")
+            axes[0].set_ylabel("sensitivity")
+            axes[0].invert_xaxis()
+            axes[0].set_ylim(-0.05, 1.05)
+            fpr_stat = _plot_mean_curve_with_band(axes[1], grid, fpr, label="mean", color="C3")
+            axes[1].set_title(f"binary | only {restrict} — FPR ({metric_type})")
+            axes[1].set_xlabel("hours before delivery")
+            axes[1].set_ylabel("FPR")
+            axes[1].invert_xaxis()
+            axes[1].set_ylim(-0.05, 1.05)
+            fig.tight_layout()
+            fig.savefig(out_dir / f"binary_only_{restrict}_aggregated.png", dpi=150)
+            plt.close(fig)
+            sub_summary[restrict] = {
+                "n_folds": int(len(sens)),
+                "sensitivity_mean_overall": (sens_stat or (float("nan"), float("nan")))[0],
+                "fpr_mean_overall": (fpr_stat or (float("nan"), float("nan")))[0],
+            }
+        if sub_summary:
+            summary[metric_type] = sub_summary
+    return summary
+
+
 def _aggregate_legacy_metric_plots(run_dir: Path, fold_dirs: List[Path]) -> None:
     """Best-effort call into ``new_classifier.evaluate_classifier``'s
     aggregator. Failures are logged but not fatal (the aggregator depends on
@@ -339,6 +534,12 @@ def aggregate_results(
     # Legacy three-metric-type aggregator.
     _aggregate_legacy_metric_plots(run_dir, fold_dirs)
 
+    # New per-class + binary-by-underlying-class aggregations.
+    perclass_summary = _aggregate_perclass_metric_curves(fold_dirs, agg_root)
+    binary_by_class_summary = _aggregate_binary_by_underlying_class_curves(
+        fold_dirs, agg_root
+    )
+
     # Threshold + AUC scalar summary.
     def _stat(values: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
         clean = [v for v in values if v is not None and v == v]
@@ -376,6 +577,8 @@ def aggregate_results(
     }
     if mean_cm is not None:
         summary["confusion_matrix_3class_mean"] = mean_cm.tolist()
+    summary["per_class_metric_curves"] = perclass_summary
+    summary["binary_by_underlying_class_curves"] = binary_by_class_summary
 
     (run_dir / "aggregated_results.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
