@@ -213,28 +213,31 @@ def _build_callbacks(
     train_results_dir = fold_dir / "train_results"
     train_results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build a filename that embeds the monitored metric value. Lightning's
-    # ``auto_insert_metric_name=True`` only renders the metric when the
-    # template contains a placeholder matching the monitor key; passing it as
-    # ``{monitor}`` via a sanitised helper keeps the final filename parseable
-    # by :func:`find_best_checkpoint` regardless of what ``monitor`` is.
-    monitor_placeholder = "{" + monitor + ":.4f}"
-    filename_template = f"guid-cls-{{epoch:03d}}-{monitor_placeholder}"
+    # Use a fixed ``best`` filename so Lightning overwrites a single file
+    # in-place each time a better checkpoint is produced. This avoids two
+    # historical pitfalls of metric-templated names:
+    #   * Some Lightning versions don't replace ``/`` with ``_`` when
+    #     rendering ``{val/total_loss:.4f}``, which spawned an unintended
+    #     ``val/`` subdirectory.
+    #   * Multi-file ``save_top_k`` listings with metric-encoded names
+    #     accumulated stale checkpoints across runs.
+    # The end result is always exactly one file: ``checkpoints/best.ckpt``
+    # (plus optionally ``last.ckpt`` if ``save_last=True``).
+    filename_template = "best"
 
     callbacks = [
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
-            # Lightning replaces ``/`` with ``_`` inside the rendered filename,
-            # so the on-disk file looks like
-            # ``guid-cls-epoch=017-val_total_loss=0.3214.ckpt``. The evaluator
-            # prefers the authoritative ``best_model_path`` returned by the
-            # callback, and falls back to parsing this filename suffix.
+            # On-disk filename is exactly ``best.ckpt``. Lightning overwrites
+            # it whenever a better checkpoint is produced. ``train_fold``
+            # still reads ``ckpt_cb.best_model_path`` for the authoritative
+            # path; the evaluator goes through that path directly.
             filename=filename_template,
             monitor=monitor,
             mode="min",
             save_top_k=int(save_top_k),
-            save_last=True,
-            auto_insert_metric_name=True,
+            save_last=False,
+            auto_insert_metric_name=False,
         ),
         LossPlotCallback(output_dir=str(train_results_dir)),
         HyperparameterLoggingCallback(output_dir=str(train_results_dir)),
@@ -484,8 +487,8 @@ def train_fold(
     callbacks = _build_callbacks(
         fold_dir=fold_dir,
         monitor=str(train_cfg.get("monitor", "val/total_loss")),
-        save_top_k=int(train_cfg.get("checkpoint", {}).get("save_top_k", 3)),
-        es_patience=int(train_cfg.get("early_stopping", {}).get("patience", 30)),
+        save_top_k=int(train_cfg.get("checkpoint", {}).get("save_top_k", 1)),
+        es_patience=int(train_cfg.get("early_stopping", {}).get("patience", 50)),
         es_enabled=bool(train_cfg.get("early_stopping", {}).get("enabled", True)),
     )
 
