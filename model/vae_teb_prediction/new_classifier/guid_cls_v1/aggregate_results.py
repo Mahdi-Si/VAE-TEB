@@ -398,16 +398,19 @@ def _aggregate_binary_by_underlying_class_curves(
 
 
 def _aggregate_legacy_metric_plots(run_dir: Path, fold_dirs: List[Path]) -> None:
-    """Best-effort call into ``new_classifier.evaluate_classifier``'s
-    aggregator. Failures are logged but not fatal (the aggregator depends on
-    the legacy module that may have other broken pieces).
+    """Best-effort call into the in-pipeline aggregated-plot generator.
+
+    The function is named ``_aggregate_legacy_metric_plots`` for historical
+    reasons; it now delegates to ``clinical_metrics_utils.generate_aggregated_plots``
+    (the self-contained fork of the legacy aggregator). Failures are logged
+    but not fatal.
     """
     try:
-        from model.vae_teb_prediction.new_classifier.evaluate_classifier import (  # noqa: WPS433
+        from model.vae_teb_prediction.new_classifier.guid_cls_v1.clinical_metrics_utils import (  # noqa: WPS433
             generate_aggregated_plots,
         )
     except Exception as exc:
-        logger.warning(f"legacy generate_aggregated_plots unavailable: {exc}")
+        logger.warning(f"generate_aggregated_plots unavailable: {exc}")
         return
 
     fold_results: List[Dict[str, Any]] = []
