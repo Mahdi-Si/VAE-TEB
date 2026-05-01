@@ -115,11 +115,19 @@ training:
     gamma_vae: 0.1                           # VAE aux loss weight (stage 2 only)
     lambda_sp: 1.0e-4                        # L2 sparsity to θ^(0) (stage 2 only)
     class_weight_mode: inverse_frequency      # "inverse_frequency" | "none"
+    # Late-position bias on the per-GUID reduction. Position t (0-based rank
+    # within valid entries) gets weight ((rank+1)/n_valid)^alpha. With
+    # alpha=1.5, late positions carry ~80% of the per-GUID loss for N_g≈10,
+    # reproducing the spirit of the deleted prefix sampling (p(m) ∝ m^1.5)
+    # without re-introducing stochastic prefix truncation. Set to 0 to
+    # recover uniform weighting.
+    position_weight_alpha: 1.5
 
   # NOTE: prefix_training has been removed — under the causal-AR head, every
   # position contributes a loss in one forward pass per GUID, so stochastic
   # prefix sampling is no longer needed (and was historically biased toward
-  # long prefixes via p(m) ∝ m^1.5).
+  # long prefixes via p(m) ∝ m^1.5). The same late-bias is now provided by
+  # the deterministic ``position_weight_alpha`` term above.
 
   segment_dropout:
     enabled: true
@@ -129,7 +137,11 @@ training:
     enabled: false                           # Auto-enabled when freeze_vae=false
     stage1_epochs: 100                       # Stage 1 duration (frozen VAE)
 
-  grad_clip_val: 0.5
+  # Loosened from 0.5 → 1.0: the previous value was atypically tight and
+  # combined with the per-position loss collapse described in the diagnosis
+  # plan, it pinned learning at the class-prior solution after ~3 epochs.
+  # 1.0 is the standard transformer default for this model size.
+  grad_clip_val: 1.0
   grad_clip_algorithm: norm
   precision: "32-true"                       # or "16-mixed" / "bf16-mixed"
   monitor: val/total_loss

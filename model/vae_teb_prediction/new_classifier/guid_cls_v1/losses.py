@@ -32,12 +32,22 @@ class LossWeights:
     The auxiliary segment-head terms (``lambda_aux``, ``lambda_aux_bin``)
     are gone: the per-position GUID head provides the same signal at
     every visible position with full predictive capacity.
+
+    ``position_weight_alpha`` controls how strongly later positions are
+    up-weighted in the per-GUID reduction. Position ``t`` (0-indexed
+    rank within valid entries) gets weight ``((rank + 1) / n_valid) ** α``,
+    so the last valid position has weight 1.0 and earlier positions
+    decay toward 0. ``α = 0`` recovers uniform weighting (the original
+    behaviour); ``α = 1.5`` is the recommended default — late positions
+    carry roughly 80% of the per-GUID loss for a typical N_g ≈ 10.
+    Padded positions always receive zero weight.
     """
 
     lambda_3: float = 1.0
     lambda_2: float = 0.5
     gamma_vae: float = 0.0          # 0 in stage 1; 0.1 in stage 2 (set externally)
     lambda_sp: float = 0.0          # 0 in stage 1; 1e-4 in stage 2 (set externally)
+    position_weight_alpha: float = 0.0  # 0 = uniform; 1.5 = recommended late-bias
 
 
 class GuidClassifierLoss(nn.Module):
@@ -75,22 +85,71 @@ class GuidClassifierLoss(nn.Module):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _two_level_mean(per_step: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Two-level masked mean: per-GUID, then batch.
+    def _position_weights_from_mask(
+        mask: torch.Tensor,
+        alpha: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build per-position weights with optional late-position bias.
+
+        For ``alpha == 0`` returns ``mask`` cast to ``dtype`` — equivalent
+        to uniform weighting and identical to the prior behaviour. For
+        ``alpha > 0`` returns ``((rank + 1) / n_valid) ** alpha`` at each
+        valid position, where ``rank`` is the 0-based count of valid
+        positions seen so far in the row. Padded positions get zero
+        weight.
+
+        Args:
+            mask: ``(B, N)`` segment-validity mask (bool or castable).
+            alpha: Power on the rank ratio. 0 → uniform; 1.5 → recommended
+                late-bias (Phase B of the diagnosis plan).
+            dtype: Output dtype.
+
+        Returns:
+            ``(B, N)`` weight tensor, NOT normalised. The two-level mean
+            divides by ``weights.sum(dim=-1)`` per row.
+        """
+        mask_f = mask.to(dtype)
+        if alpha <= 0.0:
+            return mask_f
+        # 1-based rank within valid entries: cumsum on mask_f gives the
+        # running count of valid steps. Padded positions (mask_f = 0)
+        # would otherwise inherit the carried cumsum value, so multiply
+        # by mask_f at the end to zero them.
+        n_valid = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        rank = mask_f.cumsum(dim=-1)                          # (B, N)
+        ratio = (rank / n_valid).clamp(min=0.0, max=1.0)
+        weights = ratio.pow(float(alpha)) * mask_f
+        return weights
+
+    @staticmethod
+    def _two_level_mean(
+        per_step: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        position_weight_alpha: float = 0.0,
+    ) -> torch.Tensor:
+        """Two-level (per-GUID, then batch) weighted mean.
 
         Args:
             per_step: ``(B, N)`` per-position scalar loss values.
             mask: ``(B, N)`` segment-validity mask.
+            position_weight_alpha: Power on the rank ratio inside
+                :meth:`_position_weights_from_mask`. ``0`` reproduces the
+                prior uniform reduction; ``1.5`` up-weights late positions.
 
         Returns:
-            Scalar tensor — first averages over valid positions per row,
-            then averages across rows. Rows with zero valid positions
-            contribute zero loss and are excluded from the batch denominator.
+            Scalar tensor — first weighted-average over valid positions
+            per row, then average across rows. Rows with zero valid
+            positions contribute zero loss and are excluded from the
+            batch denominator.
         """
-        mask_f = mask.to(per_step.dtype)
-        n_per_guid = mask_f.sum(dim=-1)                       # (B,)
-        per_guid = (per_step * mask_f).sum(dim=-1) / n_per_guid.clamp_min(1.0)
-        any_valid = (n_per_guid > 0).to(per_step.dtype)       # (B,)
+        weights = GuidClassifierLoss._position_weights_from_mask(
+            mask, position_weight_alpha, per_step.dtype
+        )                                                     # (B, N)
+        weight_sum = weights.sum(dim=-1)                      # (B,)
+        per_guid = (per_step * weights).sum(dim=-1) / weight_sum.clamp_min(1.0)
+        any_valid = (weight_sum > 0).to(per_step.dtype)       # (B,)
         denom = any_valid.sum().clamp_min(1.0)
         return (per_guid * any_valid).sum() / denom
 
@@ -131,7 +190,11 @@ class GuidClassifierLoss(nn.Module):
         per_step = F.cross_entropy(
             flat_logits, target_per_pos, weight=self.class_weights_3, reduction="none"
         ).reshape(B, N)
-        return self._two_level_mean(per_step, mask)
+        return self._two_level_mean(
+            per_step,
+            mask,
+            position_weight_alpha=float(self.weights.position_weight_alpha),
+        )
 
     def _bce_per_pos(
         self,
@@ -155,7 +218,11 @@ class GuidClassifierLoss(nn.Module):
             logit_bin, target_per_pos, reduction="none"
         )
         per_step = per_step * self._bin_weight_per_pos(target_per_pos)
-        return self._two_level_mean(per_step, mask)
+        return self._two_level_mean(
+            per_step,
+            mask,
+            position_weight_alpha=float(self.weights.position_weight_alpha),
+        )
 
     def forward(
         self,
