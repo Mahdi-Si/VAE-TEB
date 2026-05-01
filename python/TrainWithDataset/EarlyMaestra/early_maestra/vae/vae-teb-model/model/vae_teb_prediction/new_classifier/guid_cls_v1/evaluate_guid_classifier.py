@@ -38,6 +38,7 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.collate import (
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_3class_metrics import (
     run_3class_evaluation_for_metric_type,
+    run_3class_global_diagnostics,
     write_perclass_thresholds_json,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import (
@@ -720,9 +721,9 @@ def evaluate_single_fold(
                 metric_type=metric_type,
                 output_dir=sub_dir,
             )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                f"[{fold_dir.name}] 3-class metrics ({metric_type}) failed: {exc}"
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                f"[{fold_dir.name}] 3-class metrics ({metric_type}) failed"
             )
         metric_summaries[metric_type] = {
             "threshold": float(threshold),
@@ -755,9 +756,15 @@ def evaluate_single_fold(
             for k, v in three_class_roc.items()
         ]
     ).to_csv(eval_dir / "roc_3class_data.csv", index=False)
-    plot_three_class_diagnostics(
-        test_df, eval_dir / "three_metric_types" / "three_class_diagnostics"
-    )
+    diag_dir = eval_dir / "three_metric_types" / "three_class_diagnostics"
+    plot_three_class_diagnostics(test_df, diag_dir)
+    # Extended per-fold 3-class diagnostics (calibration, PR curves,
+    # probability box plots). These are CDR-independent so they only need
+    # to be computed once per fold.
+    try:
+        run_3class_global_diagnostics(test_df, diag_dir)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(f"[{fold_dir.name}] 3-class global diagnostics failed")
 
     # Dataset statistics (PRD §11.8 / §14.4). Best-effort: the legacy helper
     # produces dataset_overview.pdf, subgroup_overview.pdf, etc. under the
@@ -775,8 +782,8 @@ def evaluate_single_fold(
             ds_stats_dir,
             title_suffix=f"Test Set — {fold_dir.name}",
         )
-    except Exception as exc:  # pragma: no cover - external code, optional artefact
-        logger.warning(f"[{fold_dir.name}] generate_fold_dataset_stats failed: {exc}")
+    except Exception:  # pragma: no cover - external code, optional artefact
+        logger.exception(f"[{fold_dir.name}] generate_fold_dataset_stats failed")
 
     threshold_info: Dict[str, Any] = {
         "threshold_instantaneous": float(thr_inst),
@@ -805,8 +812,8 @@ def evaluate_single_fold(
             target_fpr=target_fpr,
             decision_time_hours=decision_time_hours,
         )
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(f"[{fold_dir.name}] perclass threshold search failed: {exc}")
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(f"[{fold_dir.name}] perclass threshold search failed")
 
     # 3×3 confusion matrix at the overall threshold.
     cm = compute_confusion_matrix_3class(test_df)

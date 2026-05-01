@@ -459,6 +459,7 @@ def train_fold(
         lambda_2=float(loss_cfg.get("lambda_2", 0.5)),
         gamma_vae=0.0 if freeze_vae else float(loss_cfg.get("gamma_vae", 0.1)),
         lambda_sp=0.0 if freeze_vae else float(loss_cfg.get("lambda_sp", 1e-4)),
+        position_weight_alpha=float(loss_cfg.get("position_weight_alpha", 0.0)),
     )
     pl_model = PlGuidClassifier(
         base_model=classifier,
@@ -499,7 +500,7 @@ def train_fold(
         accelerator=accelerator,
         devices=devices,
         precision=str(train_cfg.get("precision", "32-true")),
-        gradient_clip_val=float(train_cfg.get("grad_clip_val", 0.5)),
+        gradient_clip_val=float(train_cfg.get("grad_clip_val", 1.0)),
         gradient_clip_algorithm=str(train_cfg.get("grad_clip_algorithm", "norm")),
         callbacks=callbacks,
         log_every_n_steps=1,

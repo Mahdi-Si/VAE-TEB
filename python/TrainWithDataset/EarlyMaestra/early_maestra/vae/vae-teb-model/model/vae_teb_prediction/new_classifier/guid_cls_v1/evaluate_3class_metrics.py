@@ -39,10 +39,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
+
+from loguru import logger
 
 
 # Class names + their related (1-indexed) target id and the prob column.
@@ -51,6 +57,60 @@ CLASS_INFO: Tuple[Tuple[str, int, str], ...] = (
     ("acidosis", 2, "prob_acidosis"),
     ("hie", 3, "prob_hie"),
 )
+
+# Columns that ``fill_missing_epochs`` does NOT propagate into filled rows
+# (it only knows about the binary-side columns). Forward-fill these per
+# GUID before any int-cast or argmax-style consumer touches them.
+_THREE_CLASS_FFILL_COLS: Tuple[str, ...] = (
+    "predicted_class_3",
+    "prob_healthy",
+    "prob_acidosis",
+    "prob_hie",
+)
+_THREE_CLASS_FFILL_DEFAULTS: Mapping[str, float] = {
+    "predicted_class_3": 0.0,  # default to "healthy" prediction at leading NaN
+    "prob_healthy": 1.0,
+    "prob_acidosis": 0.0,
+    "prob_hie": 0.0,
+}
+
+
+def _ffill_three_class_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fill 3-class columns left NaN by ``fill_missing_epochs``.
+
+    Background: the legacy ``fill_missing_epochs`` was written for the
+    binary pipeline and only propagates ``prob_class_0/1``, ``model_pred``,
+    ``clinical_pred``, ``binary_target``, ``target``. Any 3-class columns
+    on filled rows therefore arrive as NaN, which breaks ``.astype(int)``
+    in :func:`add_perclass_clinical_columns` (the actual error reported in
+    eval logs: ``Cannot convert non-finite values (NA or inf) to integer``).
+
+    This helper performs the equivalent forward-fill for the 3-class
+    columns within each GUID, sorted ascending in epoch (matching the
+    fill order used by the legacy fn). Leading NaN rows (a GUID whose
+    first epoch was synthesised from scratch) are filled with healthy
+    defaults so they line up with the binary-side default of
+    ``clinical_pred=0`` at the first epoch.
+
+    Args:
+        df: DataFrame post-CDR / post-fill_missing_epochs.
+
+    Returns:
+        Same DataFrame with the four 3-class columns forward-filled and
+        NaN-free. Returns ``df`` unchanged if none of the columns need
+        filling.
+    """
+    present = [c for c in _THREE_CLASS_FFILL_COLS if c in df.columns]
+    if not present:
+        return df
+    needs_fill = df[present].isna().any().any()
+    if not needs_fill:
+        return df
+    df = df.sort_values(["guid", "epoch"], ascending=[True, True], kind="mergesort").copy()
+    df[present] = df.groupby("guid", sort=False)[present].ffill()
+    fill_map = {k: _THREE_CLASS_FFILL_DEFAULTS[k] for k in present}
+    df[present] = df[present].fillna(value=fill_map)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +201,7 @@ def add_perclass_clinical_columns(
             ``clinical_pred_healthy/acidosis/hie``,
             ``binary_target_healthy/acidosis/hie``.
     """
-    df = df.copy()
+    df = _ffill_three_class_columns(df.copy())
     target = df["target"].astype(int).to_numpy()
 
     if thresholds is None:
@@ -493,7 +553,650 @@ def run_3class_evaluation_for_metric_type(
         )
         out[f"binary_only_{restrict_class}"] = m_bin
 
+    # Aggregate-style 3-class metrics (single curve, not per-class).
+    # These use the *clinical* prediction column (which under argmax mode is
+    # ``predicted_class_3`` — argmax doesn't change after CDR), so they are
+    # comparable across the three metric types.
+    try:
+        agg_root = output_dir / "aggregate"
+        agg_root.mkdir(parents=True, exist_ok=True)
+        top1_df = compute_topk_accuracy_vs_time(df_pc, time_bins=time_bins)
+        f1_df = compute_macro_f1_vs_time(df_pc, time_bins=time_bins)
+        brier_df = compute_perclass_brier_vs_time(df_pc, time_bins=time_bins)
+        top1_df.to_csv(agg_root / "top1_accuracy.csv", index=False)
+        f1_df.to_csv(agg_root / "f1_scores.csv", index=False)
+        brier_df.to_csv(agg_root / "brier_scores.csv", index=False)
+        plot_topk_accuracy_vs_time(
+            top1_df, agg_root / "top1_accuracy_vs_time.png", title_suffix=metric_type
+        )
+        plot_macro_f1_vs_time(
+            f1_df, agg_root / "f1_vs_time.png", title_suffix=metric_type
+        )
+        plot_perclass_brier_vs_time(
+            brier_df, agg_root / "brier_vs_time.png", title_suffix=metric_type
+        )
+        out["top1_accuracy"] = top1_df
+        out["f1_scores"] = f1_df
+        out["brier_scores"] = brier_df
+    except Exception:  # noqa: BLE001
+        logger.exception(f"aggregate 3-class metrics failed for {metric_type}")
+
+    # Confusion-matrix evolution (one panel per time bin, up to 8).
+    try:
+        plot_confusion_matrix_evolution(
+            df_pc, time_bins=time_bins, output_dir=output_dir / "confusion_evolution"
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(f"confusion_evolution failed for {metric_type}")
+
     return out
+
+
+# ---------------------------------------------------------------------------
+# Aggregate-style metrics over time (single curve, 3 classes pooled)
+# ---------------------------------------------------------------------------
+
+
+def _bin_assign(epoch_hours: np.ndarray, time_bins: np.ndarray) -> np.ndarray:
+    """Assign each row to a time bin index (or -1 if outside)."""
+    idx = np.digitize(epoch_hours, time_bins) - 1
+    n_bins = len(time_bins) - 1
+    idx[(idx < 0) | (idx >= n_bins)] = -1
+    return idx
+
+
+def _bin_centers(time_bins: np.ndarray) -> np.ndarray:
+    return 0.5 * (time_bins[:-1] + time_bins[1:])
+
+
+def compute_topk_accuracy_vs_time(
+    df: pd.DataFrame, time_bins: np.ndarray
+) -> pd.DataFrame:
+    """Per-bin top-1 accuracy across all 3 classes pooled.
+
+    Args:
+        df: Predictions DataFrame from
+            :func:`add_perclass_clinical_columns` (so ``predicted_class_3``
+            and ``target`` are NaN-free) with ``epoch_hours`` (hours
+            **before** birth, positive numbers).
+        time_bins: Bin edges (output of legacy ``compute_time_bins``).
+
+    Returns:
+        DataFrame ``[bin_center, top1_accuracy, n]``.
+    """
+    if "epoch_hours" not in df.columns:
+        raise KeyError("df must have 'epoch_hours' (run ensure_epoch_hours first)")
+    df = _ffill_three_class_columns(df.copy())
+    target = df["target"].astype(int).to_numpy() - 1  # -> {0, 1, 2}
+    pred = df["predicted_class_3"].astype(int).to_numpy()
+    epoch = df["epoch_hours"].astype(float).to_numpy()
+    bin_idx = _bin_assign(epoch, time_bins)
+    centers = _bin_centers(time_bins)
+    rows = []
+    for b in range(len(centers)):
+        mask = bin_idx == b
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bin_center": float(centers[b]), "top1_accuracy": float("nan"), "n": 0})
+            continue
+        acc = float((pred[mask] == target[mask]).mean())
+        rows.append({"bin_center": float(centers[b]), "top1_accuracy": acc, "n": n})
+    return pd.DataFrame(rows)
+
+
+def compute_macro_f1_vs_time(
+    df: pd.DataFrame, time_bins: np.ndarray
+) -> pd.DataFrame:
+    """Per-bin macro-F1, weighted-F1, and per-class F1 across 3 classes.
+
+    Args:
+        df: Predictions DataFrame from
+            :func:`add_perclass_clinical_columns` with ``epoch_hours``.
+        time_bins: Bin edges.
+
+    Returns:
+        DataFrame ``[bin_center, macro_f1, weighted_f1, f1_healthy,
+        f1_acidosis, f1_hie, n]``.
+    """
+    if "epoch_hours" not in df.columns:
+        raise KeyError("df must have 'epoch_hours'")
+    df = _ffill_three_class_columns(df.copy())
+    target = df["target"].astype(int).to_numpy() - 1
+    pred = df["predicted_class_3"].astype(int).to_numpy()
+    epoch = df["epoch_hours"].astype(float).to_numpy()
+    bin_idx = _bin_assign(epoch, time_bins)
+    centers = _bin_centers(time_bins)
+    rows = []
+    for b in range(len(centers)):
+        mask = bin_idx == b
+        n = int(mask.sum())
+        row: Dict[str, Any] = {"bin_center": float(centers[b]), "n": n}
+        if n == 0:
+            row.update(
+                macro_f1=float("nan"),
+                weighted_f1=float("nan"),
+                f1_healthy=float("nan"),
+                f1_acidosis=float("nan"),
+                f1_hie=float("nan"),
+            )
+            rows.append(row)
+            continue
+        y_true = target[mask]
+        y_pred = pred[mask]
+        per_class_f1 = []
+        per_class_support = []
+        for c in (0, 1, 2):
+            tp = int(((y_pred == c) & (y_true == c)).sum())
+            fp = int(((y_pred == c) & (y_true != c)).sum())
+            fn = int(((y_pred != c) & (y_true == c)).sum())
+            denom = 2 * tp + fp + fn
+            f1c = float(2 * tp / denom) if denom > 0 else float("nan")
+            per_class_f1.append(f1c)
+            per_class_support.append(int((y_true == c).sum()))
+        finite_f1 = [v for v in per_class_f1 if v == v]  # filter NaN
+        macro_f1 = float(np.mean(finite_f1)) if finite_f1 else float("nan")
+        total_support = sum(per_class_support)
+        if total_support > 0 and finite_f1:
+            weighted_f1 = float(
+                sum(
+                    (s * v) for s, v in zip(per_class_support, per_class_f1) if v == v
+                )
+                / total_support
+            )
+        else:
+            weighted_f1 = float("nan")
+        row.update(
+            macro_f1=macro_f1,
+            weighted_f1=weighted_f1,
+            f1_healthy=per_class_f1[0],
+            f1_acidosis=per_class_f1[1],
+            f1_hie=per_class_f1[2],
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def compute_perclass_brier_vs_time(
+    df: pd.DataFrame, time_bins: np.ndarray
+) -> pd.DataFrame:
+    """Per-bin Brier score (lower is better) per class.
+
+    Brier_c = mean over rows of (P(class=c) - 1{target==c})^2.
+
+    Args:
+        df: Predictions DataFrame from
+            :func:`add_perclass_clinical_columns` with ``epoch_hours``.
+        time_bins: Bin edges.
+
+    Returns:
+        DataFrame ``[bin_center, brier_healthy, brier_acidosis, brier_hie,
+        brier_macro, n]``.
+    """
+    if "epoch_hours" not in df.columns:
+        raise KeyError("df must have 'epoch_hours'")
+    df = _ffill_three_class_columns(df.copy())
+    target = df["target"].astype(int).to_numpy()  # 1, 2, 3
+    epoch = df["epoch_hours"].astype(float).to_numpy()
+    bin_idx = _bin_assign(epoch, time_bins)
+    centers = _bin_centers(time_bins)
+    probs = {
+        name: df[col].astype(float).to_numpy() for name, _, col in CLASS_INFO
+    }
+    rows = []
+    for b in range(len(centers)):
+        mask = bin_idx == b
+        n = int(mask.sum())
+        row: Dict[str, Any] = {"bin_center": float(centers[b]), "n": n}
+        if n == 0:
+            for name, _, _ in CLASS_INFO:
+                row[f"brier_{name}"] = float("nan")
+            row["brier_macro"] = float("nan")
+            rows.append(row)
+            continue
+        per_class = []
+        for name, target_id, _ in CLASS_INFO:
+            y = (target[mask] == target_id).astype(float)
+            p = probs[name][mask]
+            valid = ~np.isnan(p)
+            if not valid.any():
+                row[f"brier_{name}"] = float("nan")
+                continue
+            brier = float(np.mean((p[valid] - y[valid]) ** 2))
+            row[f"brier_{name}"] = brier
+            per_class.append(brier)
+        row["brier_macro"] = float(np.mean(per_class)) if per_class else float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Plot helpers for the new aggregate / global metrics
+# ---------------------------------------------------------------------------
+
+
+def _line_vs_time(
+    df: pd.DataFrame,
+    *,
+    y_cols: Sequence[Tuple[str, str, str]],
+    output_path: Path,
+    title: str,
+    ylabel: str,
+    ylim: Optional[Tuple[float, float]] = (0.0, 1.05),
+) -> None:
+    """Generic single-axes vs-time plot, x-inverted (time before birth).
+
+    Args:
+        df: Long-form DataFrame with at least ``bin_center`` and the y-cols.
+        y_cols: Sequence of ``(column_name, label, colour)`` triples.
+        output_path: Output PNG path.
+        title: Plot title.
+        ylabel: Y-axis label.
+        ylim: Optional ``(low, high)`` tuple (``None`` to autoscale).
+    """
+    if df is None or df.empty:
+        logger.warning(f"_line_vs_time: empty df, skipping {output_path.name}")
+        return
+    valid = df.dropna(subset=[c for c, _, _ in y_cols], how="all").sort_values(
+        "bin_center", ascending=False
+    )
+    if valid.empty:
+        logger.warning(f"_line_vs_time: no non-NaN rows for {output_path.name}")
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = valid["bin_center"].to_numpy()
+    for col, label, colour in y_cols:
+        if col not in valid.columns:
+            continue
+        ax.plot(x, valid[col].to_numpy(), marker="o", linewidth=2.5, markersize=6,
+                label=label, color=colour)
+    ax.set_xlabel("Hours Before Birth", fontsize=13)
+    ax.set_ylabel(ylabel, fontsize=13)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.invert_xaxis()
+    ax.legend(fontsize=11, loc="best")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
+
+
+def plot_topk_accuracy_vs_time(metrics_df: pd.DataFrame, output_path: Path,
+                               title_suffix: str = "") -> None:
+    """Top-1 accuracy line plot."""
+    title = "Top-1 3-class Accuracy vs Time"
+    if title_suffix:
+        title += f" ({title_suffix})"
+    _line_vs_time(
+        metrics_df,
+        y_cols=[("top1_accuracy", "Top-1 accuracy", "#2c3e50")],
+        output_path=output_path,
+        title=title,
+        ylabel="Accuracy",
+    )
+
+
+def plot_macro_f1_vs_time(metrics_df: pd.DataFrame, output_path: Path,
+                          title_suffix: str = "") -> None:
+    """Macro-F1 + weighted-F1 + per-class F1 panel."""
+    title = "F1 Scores vs Time"
+    if title_suffix:
+        title += f" ({title_suffix})"
+    _line_vs_time(
+        metrics_df,
+        y_cols=[
+            ("macro_f1", "Macro-F1", "#34495e"),
+            ("weighted_f1", "Weighted-F1", "#7f8c8d"),
+            ("f1_healthy", "F1 (Healthy)", "#27ae60"),
+            ("f1_acidosis", "F1 (Acidosis)", "#f39c12"),
+            ("f1_hie", "F1 (HIE)", "#c0392b"),
+        ],
+        output_path=output_path,
+        title=title,
+        ylabel="F1 Score",
+    )
+
+
+def plot_perclass_brier_vs_time(metrics_df: pd.DataFrame, output_path: Path,
+                                title_suffix: str = "") -> None:
+    """Per-class Brier score + macro Brier."""
+    title = "Per-class Brier Score vs Time (lower is better)"
+    if title_suffix:
+        title += f" ({title_suffix})"
+    _line_vs_time(
+        metrics_df,
+        y_cols=[
+            ("brier_macro", "Macro Brier", "#34495e"),
+            ("brier_healthy", "Healthy", "#27ae60"),
+            ("brier_acidosis", "Acidosis", "#f39c12"),
+            ("brier_hie", "HIE", "#c0392b"),
+        ],
+        output_path=output_path,
+        title=title,
+        ylabel="Brier Score",
+        ylim=(0.0, None),  # type: ignore[arg-type]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Global (per-fold, not per-metric-type) 3-class diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _last_per_guid(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the row with the largest prefix per GUID (final clinical decision)."""
+    sort_col = "prefix_length" if "prefix_length" in df.columns else "position"
+    return (
+        df.sort_values(["guid", sort_col])
+        .groupby("guid", as_index=False)
+        .tail(1)
+        .reset_index(drop=True)
+    )
+
+
+def plot_perclass_calibration(
+    df: pd.DataFrame, output_dir: Path, *, n_bins: int = 12
+) -> None:
+    """Reliability diagrams (one per class) at the GUID level (last position).
+
+    For each class ``c``, bin predictions by ``prob_c`` into ``n_bins``
+    quantile bins and plot mean predicted prob (x) vs observed positive
+    fraction (y). Diagonal = perfect calibration.
+
+    Args:
+        df: Full per-position predictions DataFrame.
+        output_dir: Output directory (created if missing).
+        n_bins: Number of equal-width probability bins (default 12).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    last = _last_per_guid(df)
+    target = last["guid_class_3_target"].astype(int).to_numpy()
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+    rows = []
+    for ax, (name, target_id, prob_col) in zip(axes, CLASS_INFO):
+        if prob_col not in last.columns:
+            ax.set_title(f"{name}: prob col missing")
+            continue
+        probs = last[prob_col].astype(float).to_numpy()
+        y = (target == (target_id - 1)).astype(int)
+        valid = ~np.isnan(probs)
+        probs = probs[valid]
+        y = y[valid]
+        if probs.size == 0:
+            ax.set_title(f"{name}: no data")
+            continue
+        bin_idx = np.digitize(probs, edges) - 1
+        bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+        mean_pred = np.full(n_bins, np.nan)
+        frac_pos = np.full(n_bins, np.nan)
+        counts = np.zeros(n_bins, dtype=int)
+        for b in range(n_bins):
+            mask = bin_idx == b
+            if mask.any():
+                mean_pred[b] = float(probs[mask].mean())
+                frac_pos[b] = float(y[mask].mean())
+                counts[b] = int(mask.sum())
+                rows.append({
+                    "class": name,
+                    "bin_low": float(edges[b]),
+                    "bin_high": float(edges[b + 1]),
+                    "mean_pred": float(mean_pred[b]),
+                    "frac_positive": float(frac_pos[b]),
+                    "n": int(counts[b]),
+                })
+        # Reliability line
+        finite = ~np.isnan(mean_pred)
+        ax.plot([0, 1], [0, 1], "--", color="grey", alpha=0.6, label="Perfect")
+        ax.plot(mean_pred[finite], frac_pos[finite], marker="o", linewidth=2,
+                color="#2c3e50", label="Observed")
+        # Calibration ECE
+        weights = counts.astype(float)
+        weights = weights / max(weights.sum(), 1.0)
+        ece = float(np.nansum(weights * np.abs(mean_pred - frac_pos)))
+        # Histogram on twin axis
+        ax2 = ax.twinx()
+        ax2.bar(centers, counts, width=(1.0 / n_bins) * 0.9, alpha=0.18,
+                color="#3498db")
+        ax2.set_yticks([])
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel(f"Predicted P({name})")
+        ax.set_ylabel("Observed positive fraction")
+        ax.set_title(f"{name} (ECE={ece:.3f}, n={int(counts.sum())})")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left", fontsize=9)
+    fig.suptitle("Per-class Reliability Diagrams (GUID-level, final position)",
+                 fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(output_dir / "calibration_perclass.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    pd.DataFrame(rows).to_csv(output_dir / "calibration_perclass.csv", index=False)
+    logger.info(f"  Saved: {output_dir.name}/calibration_perclass.png")
+
+
+def plot_perclass_pr_curves(df: pd.DataFrame, output_dir: Path) -> None:
+    """Per-class precision-recall curves at the GUID level (final position).
+
+    Three subplots (one per class) plus a combined plot.
+    """
+    from sklearn.metrics import precision_recall_curve, average_precision_score  # noqa: WPS433
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    last = _last_per_guid(df)
+    target = last["guid_class_3_target"].astype(int).to_numpy()
+    fig_combined, ax_combined = plt.subplots(figsize=(8, 6))
+    palette = {"healthy": "#27ae60", "acidosis": "#f39c12", "hie": "#c0392b"}
+    for name, target_id, prob_col in CLASS_INFO:
+        if prob_col not in last.columns:
+            continue
+        probs = last[prob_col].astype(float).to_numpy()
+        y = (target == (target_id - 1)).astype(int)
+        valid = ~np.isnan(probs)
+        probs = probs[valid]
+        y = y[valid]
+        if y.sum() == 0 or y.sum() == len(y):
+            logger.warning(f"PR curve for {name}: degenerate (positives={int(y.sum())}, n={len(y)}); skipping")
+            continue
+        precision, recall, thresholds = precision_recall_curve(y, probs)
+        ap = float(average_precision_score(y, probs))
+        # Per-class PNG
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.plot(recall, precision, color=palette[name], linewidth=2.2,
+                label=f"AP={ap:.3f}")
+        ax.fill_between(recall, 0, precision, alpha=0.15, color=palette[name])
+        baseline = float(y.mean())
+        ax.axhline(baseline, linestyle="--", color="grey", alpha=0.7,
+                   label=f"prevalence={baseline:.3f}")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.set_title(f"PR curve ({name}, GUID-level)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"pr_{name}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        # CSV dump
+        pd.DataFrame({
+            "precision": precision,
+            "recall": recall,
+            "threshold": np.append(thresholds, np.nan),  # sklearn returns N-1 thresholds
+        }).to_csv(output_dir / f"pr_{name}.csv", index=False)
+        # Combined
+        ax_combined.plot(recall, precision, color=palette[name], linewidth=2.2,
+                         label=f"{name} (AP={ap:.3f})")
+        logger.info(f"  Saved: {output_dir.name}/pr_{name}.png")
+    ax_combined.set_xlabel("Recall")
+    ax_combined.set_ylabel("Precision")
+    ax_combined.set_xlim(0, 1)
+    ax_combined.set_ylim(0, 1.02)
+    ax_combined.set_title("PR curves (one-vs-rest, GUID-level final position)")
+    ax_combined.grid(True, alpha=0.3)
+    ax_combined.legend(loc="best")
+    fig_combined.tight_layout()
+    fig_combined.savefig(output_dir / "pr_combined.png", dpi=150,
+                         bbox_inches="tight")
+    plt.close(fig_combined)
+    logger.info(f"  Saved: {output_dir.name}/pr_combined.png")
+
+
+def plot_confusion_matrix_evolution(
+    df: pd.DataFrame, time_bins: np.ndarray, output_dir: Path,
+    *, max_panels: int = 8,
+) -> None:
+    """Row-normalised 3×3 confusion matrices across time-before-birth bins.
+
+    Renders up to ``max_panels`` confusion matrices (chosen as evenly-spaced
+    bins covering the range ``time_bins``), so the user can visualise how
+    confusion shifts as we move closer to delivery.
+
+    Args:
+        df: Predictions DataFrame from
+            :func:`add_perclass_clinical_columns` with ``epoch_hours``.
+        time_bins: Bin edges.
+        output_dir: Output directory.
+        max_panels: Maximum number of CM panels to render (default 8).
+    """
+    if "epoch_hours" not in df.columns:
+        raise KeyError("df must have 'epoch_hours'")
+    df = _ffill_three_class_columns(df.copy())
+    target = df["target"].astype(int).to_numpy() - 1
+    pred = df["predicted_class_3"].astype(int).to_numpy()
+    epoch = df["epoch_hours"].astype(float).to_numpy()
+    bin_idx = _bin_assign(epoch, time_bins)
+    centers = _bin_centers(time_bins)
+    n_bins = len(centers)
+    keep = sorted(set(np.linspace(0, n_bins - 1, num=min(max_panels, n_bins), dtype=int).tolist()))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cols = min(len(keep), 4)
+    rows = int(np.ceil(len(keep) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.6, rows * 3.4))
+    axes_flat = np.atleast_1d(axes).flatten()
+    class_names = ["healthy", "acidosis", "hie"]
+    for ax_i, b in enumerate(keep):
+        ax = axes_flat[ax_i]
+        mask = bin_idx == b
+        if not mask.any():
+            ax.text(0.5, 0.5, "no data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"~{centers[b]:.2f} h before birth")
+            continue
+        cm = np.zeros((3, 3), dtype=int)
+        for t in (0, 1, 2):
+            for p in (0, 1, 2):
+                cm[t, p] = int(((target[mask] == t) & (pred[mask] == p)).sum())
+        cm_norm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
+        ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+        for i in range(3):
+            for j in range(3):
+                ax.text(j, i, f"{cm_norm[i, j]:.2f}\n({cm[i, j]})",
+                        ha="center", va="center", fontsize=8,
+                        color="black" if cm_norm[i, j] < 0.5 else "white")
+        ax.set_xticks(range(3))
+        ax.set_xticklabels(class_names, fontsize=8)
+        ax.set_yticks(range(3))
+        ax.set_yticklabels(class_names, fontsize=8)
+        ax.set_title(f"~{centers[b]:.2f} h before birth (n={int(mask.sum())})",
+                     fontsize=9)
+    # Hide unused subplots
+    for k in range(len(keep), len(axes_flat)):
+        axes_flat[k].axis("off")
+    fig.suptitle("3-class confusion evolution (row-normalised)", fontsize=13,
+                 fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(output_dir / "confusion_evolution.png", dpi=150,
+                bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_dir.name}/confusion_evolution.png")
+
+
+def plot_perclass_probability_box(df: pd.DataFrame, output_dir: Path) -> None:
+    """For each predicted-prob column, a violin/box plot stratified by true class.
+
+    Adds context to the existing ``three_class_probability_hist.png`` by
+    showing the median and IQR overlaid.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    last = _last_per_guid(df)
+    target = last["guid_class_3_target"].astype(int).to_numpy()
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+    palette = ["#27ae60", "#f39c12", "#c0392b"]
+    class_names = ["healthy", "acidosis", "hie"]
+    for ax, (name, _, prob_col) in zip(axes, CLASS_INFO):
+        if prob_col not in last.columns:
+            continue
+        data = []
+        labels = []
+        for cls_id, cls_label in enumerate(class_names):
+            mask = target == cls_id
+            if mask.sum() == 0:
+                continue
+            vals = last.loc[mask, prob_col].astype(float).to_numpy()
+            vals = vals[~np.isnan(vals)]
+            if vals.size == 0:
+                continue
+            data.append(vals)
+            labels.append(f"{cls_label}\n(n={int(mask.sum())})")
+        if not data:
+            ax.set_title(f"P({name}): no data")
+            continue
+        bp = ax.boxplot(data, labels=labels, patch_artist=True, widths=0.55,
+                        medianprops=dict(color="black", linewidth=1.5))
+        for patch, c in zip(bp["boxes"], palette[:len(data)]):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.55)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_ylabel(f"Predicted P({name})")
+        ax.set_xlabel("True class")
+        ax.set_title(f"P({name}) by true class")
+        ax.grid(True, axis="y", alpha=0.3)
+    fig.suptitle("Per-class probability distribution by ground truth",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(output_dir / "prob_by_truth_box.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_dir.name}/prob_by_truth_box.png")
+
+
+def run_3class_global_diagnostics(
+    df: pd.DataFrame, output_dir: Path
+) -> Dict[str, Any]:
+    """Run all per-fold (non-time-binned) 3-class diagnostics in one go.
+
+    These artefacts complement the per-metric-type ``per_class/`` and
+    ``binary_by_underlying_class/`` outputs. They live under the existing
+    ``three_class_diagnostics/`` directory and need to be computed only
+    once per fold (they don't depend on which CDR threshold is in play).
+
+    Args:
+        df: Full per-position predictions DataFrame (from
+            :func:`run_inference_per_position`).
+        output_dir: ``evaluation/three_class_diagnostics/``.
+
+    Returns:
+        Dict ``{section: status}``.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    statuses: Dict[str, Any] = {}
+    for name, fn in (
+        ("calibration", lambda: plot_perclass_calibration(df, output_dir / "calibration")),
+        ("pr_curves", lambda: plot_perclass_pr_curves(df, output_dir / "pr_curves")),
+        ("prob_box", lambda: plot_perclass_probability_box(df, output_dir / "prob_distributions")),
+    ):
+        try:
+            fn()
+            statuses[name] = "ok"
+        except Exception:  # noqa: BLE001
+            logger.exception(f"3-class diagnostic '{name}' failed")
+            statuses[name] = "failed"
+    return statuses
 
 
 def write_perclass_thresholds_json(
@@ -533,11 +1236,22 @@ __all__ = [
     "METRIC_TYPES",
     "add_perclass_clinical_columns",
     "compute_binary_by_underlying_class",
+    "compute_macro_f1_vs_time",
+    "compute_perclass_brier_vs_time",
     "compute_perclass_time_binned_metrics",
+    "compute_topk_accuracy_vs_time",
     "find_perclass_threshold_at_target_fpr",
     "plot_binary_by_underlying_class",
+    "plot_confusion_matrix_evolution",
+    "plot_macro_f1_vs_time",
+    "plot_perclass_brier_vs_time",
+    "plot_perclass_calibration",
     "plot_perclass_panel",
+    "plot_perclass_pr_curves",
+    "plot_perclass_probability_box",
     "plot_subgroup_perclass",
+    "plot_topk_accuracy_vs_time",
     "run_3class_evaluation_for_metric_type",
+    "run_3class_global_diagnostics",
     "write_perclass_thresholds_json",
 ]

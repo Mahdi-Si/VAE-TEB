@@ -462,13 +462,18 @@ class PlGuidClassifier(LightningModelBase):
                 f"PlGuidClassifier optimizer: classifier params={len(cls_params)}, "
                 f"vae params={len(vae_params)}"
             )
-            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.95))
+            # AdamW default betas (0.9, 0.999). The earlier (0.9, 0.95)
+            # forgot second-moment estimates ~20× faster than the default,
+            # which amplified noise on the small late-position gradients
+            # this model relies on after the per-position class-prior
+            # plateau. See diagnosis plan, Phase C.
+            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
         return torch.optim.AdamW(
             trainable_params,
             lr=float(self.hparams.lr),
             weight_decay=float(self.hparams.weight_decay),
             eps=1e-8,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.999),
         )
 
 
