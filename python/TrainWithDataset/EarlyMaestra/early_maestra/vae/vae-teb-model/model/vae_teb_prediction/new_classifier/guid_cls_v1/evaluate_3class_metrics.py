@@ -59,19 +59,24 @@ CLASS_INFO: Tuple[Tuple[str, int, str], ...] = (
 
 
 def _legacy_utils() -> Dict[str, Any]:
-    """Late-import the legacy utilities (avoids matplotlib at import time)."""
-    from model.vae_teb_prediction.new_classifier.evaluate_classifier import (  # noqa: WPS433
+    """Late-import the in-pipeline clinical-metric utilities.
+
+    All helpers live in the sibling ``clinical_metrics_utils`` module — a
+    self-contained fork of the legacy ``new_classifier/evaluate_classifier.py``
+    with all legacy-model orchestration removed. The function is named
+    ``_legacy_utils`` for historical reasons; it does not actually reach into
+    any legacy ``vae_teb_prediction.classifier`` code.
+    """
+    from model.vae_teb_prediction.new_classifier.guid_cls_v1.clinical_metrics_utils import (  # noqa: WPS433
         apply_clinical_decision_rule,
         compute_committed_cumulative_metrics,
         compute_committed_overall_metrics,
         compute_instantaneous_metrics,
         create_enhanced_subgroup_filters,
         ensure_committed_epochs_filled,
+        ensure_epoch_hours,
         find_threshold_for_committed_overall_fpr_at_1h,
         plot_single_metric_type,
-    )
-    from model.vae_teb_prediction.classifier.validation_utils import (  # noqa: WPS433
-        ensure_epoch_hours,
     )
 
     return dict(

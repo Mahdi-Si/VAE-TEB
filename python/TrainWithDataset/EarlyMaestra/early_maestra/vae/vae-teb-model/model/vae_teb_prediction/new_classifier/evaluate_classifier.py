@@ -26,18 +26,14 @@ except ModuleNotFoundError:  # seaborn is optional; plots fall back to matplotli
     sns = None
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 
-from model.vae_teb_prediction.model.vae_teb_model_prediction import SeqVae
-from model.vae_teb_prediction.classifier.prediction_classification_model import (
-    VaeTebTimeSeriesClassifier,
-    BiLSTMAttentionClassifier,
-    LSTMClassifier,
-    CNNLSTMClassifier,
-    CNN1DClassifier,
-    TransformerClassifier,
-    MambaClassifier,
-    MultiScaleConvAttentionClassifier,
-    CausalCNNLSTMClassifier,
-)
+# Legacy classifier model classes and the SeqVae base are imported lazily
+# inside ``create_model_from_config`` (and the related inference helpers
+# below) so that simply importing utility functions from this module does
+# NOT pull in the legacy ``new_classifier/prediction_classification_model``
+# chain. That chain has historically had broken sibling imports
+# (``from vae_teb_model_prediction import *``), and the new GUID-level
+# classifier pipeline (``guid_cls_v1``) only needs the metric / threshold /
+# plotting utilities here, never the legacy model classes.
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 from train.graph_models_utils import load_checkpoint_strict
 from model.vae_teb_prediction.classifier.validation_utils import (
@@ -157,7 +153,7 @@ def find_latest_checkpoint_in_fold(fold_dir: Path) -> Path:
     return ckpt_files[0]
 
 
-def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTimeSeriesClassifier:
+def create_model_from_config(config: Dict, device: str = 'cuda:0') -> "VaeTebTimeSeriesClassifier":
     """
     Create model from configuration.
 
@@ -168,6 +164,22 @@ def create_model_from_config(config: Dict, device: str = 'cuda:0') -> VaeTebTime
     Returns:
         VaeTebTimeSeriesClassifier model
     """
+    # Lazy imports: keep this legacy model wiring out of module-level scope so
+    # consumers that only need the utility functions (e.g. the new GUID-level
+    # classifier pipeline) don't trigger the legacy classifier import chain.
+    from model.vae_teb_prediction.model.vae_teb_model_prediction import SeqVae
+    from model.vae_teb_prediction.classifier.prediction_classification_model import (
+        VaeTebTimeSeriesClassifier,
+        BiLSTMAttentionClassifier,
+        LSTMClassifier,
+        CNNLSTMClassifier,
+        CNN1DClassifier,
+        TransformerClassifier,
+        MambaClassifier,
+        MultiScaleConvAttentionClassifier,
+        CausalCNNLSTMClassifier,
+    )
+
     classifier_config = config['model_config']['classifier']
 
     # Create VAE model

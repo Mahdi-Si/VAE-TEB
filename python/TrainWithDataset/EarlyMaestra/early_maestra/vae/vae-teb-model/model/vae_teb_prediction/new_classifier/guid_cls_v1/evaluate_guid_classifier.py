@@ -50,14 +50,19 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_dataset import (
 
 
 # ---------------------------------------------------------------------------
-# Lazy imports of the legacy utilities (so unit tests that don't need them
-# can run without dragging in matplotlib / sklearn at import time).
+# Lazy imports of the in-pipeline clinical-metric utilities (so unit tests
+# that don't need them can run without dragging in matplotlib / sklearn at
+# import time). All helpers live in ``clinical_metrics_utils`` — a sibling
+# module forked from the legacy ``new_classifier/evaluate_classifier.py``
+# with all legacy-model orchestration removed. There is no remaining
+# coupling to ``vae_teb_prediction.classifier`` or
+# ``vae_teb_prediction.new_classifier.prediction_classification_model``.
 # ---------------------------------------------------------------------------
 
 
 def _import_legacy_utils():
     """Import + return the dict of CDR / metric / plotting helpers we reuse."""
-    from model.vae_teb_prediction.new_classifier.evaluate_classifier import (  # noqa: WPS433
+    from model.vae_teb_prediction.new_classifier.guid_cls_v1.clinical_metrics_utils import (  # noqa: WPS433
         apply_clinical_decision_rule,
         compute_committed_cumulative_metrics,
         compute_committed_overall_metrics,
@@ -67,20 +72,18 @@ def _import_legacy_utils():
         convert_numpy_types,
         create_enhanced_subgroup_filters,
         ensure_committed_epochs_filled,
+        ensure_epoch_hours,
         fill_missing_epochs,
         find_threshold_for_committed_cumulative_fpr_at_1h,
         find_threshold_for_committed_overall_fpr_at_1h,
         find_threshold_for_instantaneous_fpr_at_1h,
         generate_fold_dataset_stats,
+        log_dataframe_stats,
         plot_aggregated_roc_curves,
         plot_all_metric_types_for_fold,
         plot_roc_curve,
         plot_single_metric_type,
         plot_subgroup_analysis,
-    )
-    from model.vae_teb_prediction.classifier.validation_utils import (  # noqa: WPS433
-        ensure_epoch_hours,
-        log_dataframe_stats,
         validate_predictions_df,
     )
 
