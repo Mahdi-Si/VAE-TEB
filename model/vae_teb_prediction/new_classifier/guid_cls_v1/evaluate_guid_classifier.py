@@ -123,16 +123,18 @@ def find_best_checkpoint(checkpoint_dir: Path) -> Path:
     ``evaluate_single_fold(best_checkpoint_path=...)`` instead of relying on
     this discovery pass.
 
-    Fallback logic (used when the caller did not provide an authoritative
-    path): the filename template in :func:`_build_callbacks` is
-    ``guid-cls-{epoch:03d}-{val/total_loss:.4f}``, so Lightning writes files
-    like ``guid-cls-epoch=017-val_total_loss=0.3214.ckpt``. We parse every
-    ``key=value`` pair in the stem, and if any key contains the substring
-    ``loss`` we treat the associated value as the checkpoint score and sort
-    **ascending** (since all training monitors are minimisation metrics).
-    This is strictly better than the previous behaviour of always parsing
-    ``stem.split("=")[-1]``, which silently extracted the epoch when the
-    monitored metric was absent from the filename.
+    Discovery order:
+
+    1. ``checkpoint_dir / "best.ckpt"`` — current convention. ``_build_callbacks``
+       configures :class:`ModelCheckpoint` with ``filename="best"``,
+       ``save_top_k=1``, and ``auto_insert_metric_name=False``, so Lightning
+       overwrites a single ``best.ckpt`` in place at the top of
+       ``checkpoints/``. This is the fast path and always wins when present.
+    2. Recursive ``rglob("*.ckpt")`` fallback for legacy layouts (e.g. older
+       runs whose filename template embedded ``epoch=`` / ``val_total_loss=``
+       tokens, or runs where Lightning created a ``val/`` subdirectory because
+       it didn't replace ``/`` in the metric name). When multiple legacy files
+       are found, the most recent by mtime is returned.
 
     Args:
         checkpoint_dir: ``fold_{k}/checkpoints/`` directory.
@@ -146,58 +148,28 @@ def find_best_checkpoint(checkpoint_dir: Path) -> Path:
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint dir missing: {checkpoint_dir}")
 
-    candidates = sorted(checkpoint_dir.glob("*.ckpt"))
+    primary = checkpoint_dir / "best.ckpt"
+    if primary.is_file():
+        logger.info(f"find_best_checkpoint: using {primary}")
+        return primary
+
+    candidates = sorted(
+        p for p in checkpoint_dir.rglob("*.ckpt") if p.name != "last.ckpt"
+    )
     if not candidates:
-        raise FileNotFoundError(f"No checkpoints in {checkpoint_dir}")
-
-    def _parse_score(stem: str) -> Optional[float]:
-        """Extract the loss-like ``key=value`` pair from the stem, if any."""
-        # The stem may contain several ``key=value`` pairs separated by
-        # ``-``; the rightmost "loss"-named key wins (it is the one the
-        # template closest to the end of the filename).
-        score: Optional[float] = None
-        for token in stem.split("-"):
-            if "=" not in token:
-                continue
-            key, _, value = token.partition("=")
-            if "loss" not in key.lower():
-                continue
-            try:
-                score = float(value)
-            except ValueError:
-                continue
-        return score
-
-    scored: List[Tuple[float, Path]] = []
-    unparseable: List[Path] = []
-    for path in candidates:
-        if path.name == "last.ckpt":
-            continue
-        score = _parse_score(path.stem)
-        if score is None:
-            unparseable.append(path)
-        else:
-            scored.append((score, path))
-
-    if scored:
-        scored.sort(key=lambda x: x[0])
-        chosen = scored[0][1]
-        logger.info(
-            f"find_best_checkpoint: picked {chosen.name} "
-            f"(parsed loss={scored[0][0]:.4f} from {len(scored)} scored candidates)"
+        raise FileNotFoundError(
+            f"No checkpoints in {checkpoint_dir} (expected 'best.ckpt')"
         )
-        return chosen
-    if unparseable:
-        unparseable.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        logger.warning(
-            f"find_best_checkpoint: no loss-named score in filenames under "
-            f"{checkpoint_dir}; falling back to most recent mtime "
-            f"({unparseable[0].name}). Pass ``best_checkpoint_path`` to "
-            f"evaluate_single_fold to guarantee the best ckpt is used."
-        )
-        return unparseable[0]
+
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+    chosen = candidates[0]
+    logger.warning(
+        f"find_best_checkpoint: 'best.ckpt' not found in {checkpoint_dir}; "
+        f"falling back to most recent legacy checkpoint ({chosen.name}). "
+        f"Pass best_checkpoint_path to evaluate_single_fold to guarantee "
+        f"the intended ckpt is used."
+    )
+    return chosen
 
 
 def load_classifier_from_checkpoint(
@@ -222,7 +194,16 @@ def load_classifier_from_checkpoint(
         Eval-mode :class:`GuidOutcomeClassifier` on ``device``.
     """
     classifier = GuidOutcomeClassifier(classifier_cfg)
-    raw = torch.load(str(checkpoint_path), map_location="cpu")
+    # ``weights_only=False`` is required because Lightning pickles the
+    # full hparam bundle (including the ``LossWeights`` dataclass) into the
+    # checkpoint. PyTorch 2.6 changed the default to ``weights_only=True``
+    # which refuses to unpickle anything outside its allowlist. Matches the
+    # convention in ``train/graph_models_utils.load_checkpoint_strict``;
+    # the source of these checkpoints is our own training pipeline so the
+    # safety relaxation is intentional.
+    raw = torch.load(
+        str(checkpoint_path), map_location="cpu", weights_only=False
+    )
     state = raw.get("state_dict", raw)
     cleaned: Dict[str, torch.Tensor] = {}
     for k, v in state.items():

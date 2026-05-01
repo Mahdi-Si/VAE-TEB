@@ -136,11 +136,11 @@ training:
 
   early_stopping:
     enabled: true
-    patience: 30
+    patience: 50
     mode: min
 
   checkpoint:
-    save_top_k: 3
+    save_top_k: 1                            # Keep only the single best checkpoint
     mode: min
 
 
@@ -249,11 +249,11 @@ advanced_config:
     early_stopping:
       enabled: true
       monitor: val/total_loss
-      patience: 30
+      patience: 50
       min_delta: 0.0001
     model_checkpoint:
       monitor: val/total_loss
-      save_top_k: 3
+      save_top_k: 1                          # Single best checkpoint per fold
       mode: min
     loss_plotting:
       max_history_size: 1000

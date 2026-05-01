@@ -275,7 +275,7 @@ def find_perclass_threshold_at_target_fpr(
     *,
     target_fpr: float = 0.2,
     decision_time_hours: float = 1.0,
-    max_iters: int = 25,
+    max_gap_multiplier: Optional[float] = None,
     fallback_tolerance_hours: float = 0.5,
 ) -> Tuple[float, Dict[str, Any]]:
     """OvR-threshold search analogous to ``find_threshold_for_committed_overall_fpr_at_1h``.
@@ -290,8 +290,9 @@ def find_perclass_threshold_at_target_fpr(
             :func:`run_inference_per_position`).
         class_name: One of ``"healthy"``, ``"acidosis"``, ``"hie"``.
         target_fpr: Target false-positive rate at the decision time.
-        decision_time_hours: Hours before delivery at which to evaluate.
-        max_iters: Bisection iteration cap (legacy default).
+        decision_time_hours: Hours before delivery at which to evaluate
+            (passed to the legacy fn as ``time_window_hours``).
+        max_gap_multiplier: Optional gap-fill multiplier (legacy default).
         fallback_tolerance_hours: Decision-time fallback window
             (legacy default).
 
@@ -309,8 +310,8 @@ def find_perclass_threshold_at_target_fpr(
     return utils["find_threshold_for_committed_overall_fpr_at_1h"](
         swap,
         target_fpr=target_fpr,
-        decision_time_hours=decision_time_hours,
-        max_iters=max_iters,
+        time_window_hours=decision_time_hours,
+        max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=fallback_tolerance_hours,
     )
 
