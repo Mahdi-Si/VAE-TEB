@@ -476,6 +476,7 @@ def train_fold(
         rel_d_max=float(cls_cfg.get("rel_bucket_d_max", 40.0)),
         lr=float(train_cfg.get("optimizer", {}).get("classifier", {}).get("lr", 1e-3)),
         lr_milestones=train_cfg.get("scheduler", {}).get("milestones") or [100],
+        lr_warmup_steps=int(train_cfg.get("lr_warmup_steps", 0)),
         weight_decay=float(
             train_cfg.get("optimizer", {}).get("classifier", {}).get("weight_decay", 1e-4)
         ),
