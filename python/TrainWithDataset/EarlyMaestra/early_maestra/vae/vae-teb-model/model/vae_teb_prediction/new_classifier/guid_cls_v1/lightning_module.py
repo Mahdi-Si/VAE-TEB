@@ -260,7 +260,11 @@ class PlGuidClassifier(LightningModelBase):
             the transformer's bias-table size.
         rel_d_max: Relative-time bias saturation horizon (in 20-min slots).
         lr: Classifier-group learning rate.
-        lr_milestones: Optional MultiStepLR milestones.
+        lr_milestones: Optional MultiStepLR milestones (epoch units).
+        lr_warmup_steps: Number of optimizer **steps** of linear warmup
+            from 0 to ``lr``. ``0`` disables warmup. Standard transformer
+            recipe is 500–2000 steps; needed when AdamW(0.9, 0.95) sees
+            bursty class-imbalanced gradients early in training.
         weight_decay: AdamW weight decay.
         vae_lr: Optional separate LR for VAE parameters (live-VAE only).
         compute_macro_f1: Whether to log macro-F1 at val/test epoch end.
@@ -282,6 +286,7 @@ class PlGuidClassifier(LightningModelBase):
         rel_d_max: float = 40.0,
         lr: float = 1e-3,
         lr_milestones: Optional[Iterable[int]] = (100,),
+        lr_warmup_steps: int = 0,
         weight_decay: float = 1e-4,
         vae_lr: float = 1e-5,
         compute_macro_f1: bool = True,
@@ -294,6 +299,9 @@ class PlGuidClassifier(LightningModelBase):
             weight_decay=weight_decay,
             module_name="PlGuidClassifierV2",
         )
+        # Stored as attribute (not in hparams) so we can read it in
+        # ``build_lr_scheduler`` without adding more arguments to the base.
+        self.lr_warmup_steps = int(lr_warmup_steps)
         # Bypass torch.compile for variable-shape batches.
         if getattr(base_model, "no_compile", False):
             self.model = self._orig_model
@@ -462,19 +470,82 @@ class PlGuidClassifier(LightningModelBase):
                 f"PlGuidClassifier optimizer: classifier params={len(cls_params)}, "
                 f"vae params={len(vae_params)}"
             )
-            # AdamW default betas (0.9, 0.999). The earlier (0.9, 0.95)
-            # forgot second-moment estimates ~20× faster than the default,
-            # which amplified noise on the small late-position gradients
-            # this model relies on after the per-position class-prior
-            # plateau. See diagnosis plan, Phase C.
-            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
+            # AdamW betas (0.9, 0.95). Reverted from (0.9, 0.999) after
+            # the latter caused early-training divergence: with extreme
+            # class-imbalance, rare-class GUIDs produce bursty gradients
+            # across batches, and β₂=0.999 averages over too long a window
+            # to capture each burst — AdamW then behaves like signed-SGD
+            # during the burst and over-shoots. β₂=0.95 adapts the second
+            # moment fast enough to scale each burst correctly.
+            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.95))
         return torch.optim.AdamW(
             trainable_params,
             lr=float(self.hparams.lr),
             weight_decay=float(self.hparams.weight_decay),
             eps=1e-8,
-            betas=(0.9, 0.999),
+            betas=(0.9, 0.95),
         )
+
+    def build_lr_scheduler(self, optimizer):
+        """Linear warmup followed by ``MultiStepLR`` decay (step-level).
+
+        When ``lr_warmup_steps == 0`` this falls back to the base class's
+        epoch-level ``MultiStepLR``. Otherwise:
+
+        * Linear ramp from ``lr / warmup_steps`` to ``lr`` over the first
+          ``warmup_steps`` optimizer steps (≈ first epoch for this
+          dataset's batch count).
+        * Hand off to ``MultiStepLR`` at the configured epoch milestones,
+          converted to step units via
+          ``trainer.estimated_stepping_batches / max_epochs``.
+
+        Lightning is told to step the scheduler every optimizer step
+        (``interval='step'``) because the warmup and the milestones must
+        live on the same time axis under :class:`SequentialLR`.
+        """
+        warmup_steps = int(getattr(self, "lr_warmup_steps", 0))
+        if warmup_steps <= 0:
+            return super().build_lr_scheduler(optimizer)
+
+        from torch.optim.lr_scheduler import LinearLR, MultiStepLR, SequentialLR
+
+        epoch_milestones = list(getattr(self.hparams, "lr_milestones", None) or [])
+        gamma = float(getattr(self.hparams, "lr_gamma", 0.1))
+
+        try:
+            total_steps = int(self.trainer.estimated_stepping_batches)
+            max_epochs = max(1, int(self.trainer.max_epochs or 1))
+            steps_per_epoch = max(1, total_steps // max_epochs)
+        except Exception:
+            steps_per_epoch = 100
+
+        warmup = LinearLR(
+            optimizer,
+            start_factor=1.0 / float(warmup_steps),
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        # Convert epoch milestones to absolute step counts. Add the warmup
+        # offset because SequentialLR re-bases each child scheduler at the
+        # boundary, so the second scheduler's "step 0" corresponds to the
+        # global step ``warmup_steps``.
+        step_milestones = [int(m) * int(steps_per_epoch) for m in epoch_milestones]
+        if step_milestones:
+            decay = MultiStepLR(optimizer, milestones=step_milestones, gamma=gamma)
+        else:
+            # No epoch milestones configured: keep LR flat after warmup.
+            decay = MultiStepLR(optimizer, milestones=[10**9], gamma=1.0)
+
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup, decay],
+            milestones=[int(warmup_steps)],
+        )
+        return {
+            "scheduler": scheduler,
+            "interval": "step",
+            "frequency": 1,
+        }
 
 
 __all__ = [
