@@ -39,7 +39,6 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.collate import (
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.evaluate_3class_metrics import (
     run_3class_evaluation_for_metric_type,
     run_3class_global_diagnostics,
-    write_perclass_thresholds_json,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import (
     GuidClassifierConfig,
@@ -629,6 +628,34 @@ def evaluate_single_fold(
     utils["validate_predictions_df"](val_df, "Validation")
     utils["validate_predictions_df"](test_df, "Test")
 
+    # Cached CSVs from older runs (pre-3-class extension) lack the
+    # ``prob_healthy / prob_acidosis / prob_hie / predicted_class_3``
+    # columns the 3-class evaluator needs. ``validate_predictions_df``
+    # only enforces the binary-side schema, so the failure would
+    # otherwise surface deep inside the per-class metric path as a
+    # ``KeyError``. Detect the gap up front and force a re-inference
+    # so the downstream pipeline is guaranteed to see a complete row
+    # schema.
+    _required_3class_cols = (
+        "prob_healthy",
+        "prob_acidosis",
+        "prob_hie",
+        "predicted_class_3",
+    )
+    for _label, _df, _csv in (
+        ("Validation", val_df, val_csv),
+        ("Test", test_df, test_csv),
+    ):
+        _missing = [c for c in _required_3class_cols if c not in _df.columns]
+        if _missing:
+            raise RuntimeError(
+                f"[{fold_dir.name}] {_label} predictions CSV {_csv} is missing "
+                f"3-class columns {_missing}. This usually means the file was "
+                f"produced by an older (binary-only) run. Re-run with "
+                f"`evaluation.regenerate_predictions: true` (or delete the "
+                f"stale CSV) to regenerate it under the current schema."
+            )
+
     val_df = utils["ensure_epoch_hours"](val_df)
     test_df = utils["ensure_epoch_hours"](test_df)
 
@@ -637,6 +664,11 @@ def evaluate_single_fold(
     decision_time_hours = float(eval_cfg.get("decision_time_hours", 1.0))
     exclude_last_minutes = float(eval_cfg.get("exclude_last_minutes", 30.0))
     max_gap_multiplier = eval_cfg.get("max_gap_multiplier")
+    fallback_tolerance_hours = float(eval_cfg.get("fallback_tolerance_hours", 0.5))
+    three_class_cfg = (eval_cfg.get("three_class") or {})
+    perclass_threshold_search_default = bool(
+        three_class_cfg.get("threshold_search_default", True)
+    )
 
     # Threshold search on validation.
     logger.info(f"[{fold_dir.name}] running threshold searches on validation")
@@ -720,6 +752,13 @@ def evaluate_single_fold(
                 time_bins=bins,
                 metric_type=metric_type,
                 output_dir=sub_dir,
+                df_val=val_df if perclass_threshold_search_default else None,
+                target_fpr=target_fpr,
+                decision_time_hours=decision_time_hours,
+                threshold_search_kwargs={
+                    "max_gap_multiplier": max_gap_multiplier,
+                    "fallback_tolerance_hours": fallback_tolerance_hours,
+                },
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
@@ -802,18 +841,12 @@ def evaluate_single_fold(
         json.dumps(threshold_info, indent=2, sort_keys=True), encoding="utf-8"
     )
 
-    # Per-class OvR thresholds (secondary diagnostic — primary 3-class
-    # reporting stays argmax). Written to a separate file so the existing
-    # ``threshold_info.json`` schema is unchanged.
-    try:
-        write_perclass_thresholds_json(
-            val_df,
-            output_path=eval_dir / "perclass_thresholds.json",
-            target_fpr=target_fpr,
-            decision_time_hours=decision_time_hours,
-        )
-    except Exception:  # pragma: no cover - defensive
-        logger.exception(f"[{fold_dir.name}] perclass threshold search failed")
+    # Per-class OvR thresholds are now persisted per-mode by
+    # ``run_3class_evaluation_for_metric_type`` as
+    # ``three_metric_types/<mode>/perclass_thresholds_<mode>.json`` —
+    # the previous single-file ``perclass_thresholds.json`` only covered
+    # the committed-overall mode and was a redundant second source of
+    # truth, so it has been removed.
 
     # 3×3 confusion matrix at the overall threshold.
     cm = compute_confusion_matrix_3class(test_df)

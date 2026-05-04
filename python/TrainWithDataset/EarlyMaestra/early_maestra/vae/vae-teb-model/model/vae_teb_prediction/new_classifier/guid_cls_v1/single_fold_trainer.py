@@ -54,8 +54,10 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.lightning_module import
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.losses import (
     LossWeights,
-    estimate_inverse_frequency_class_weights_3,
-    estimate_inverse_frequency_class_weights_bin,
+    class_prior_bin,
+    class_priors_3,
+    estimate_class_weights_3,
+    estimate_class_weights_bin,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.precompute_latents import (
     _resolve_run_dir,
@@ -454,17 +456,31 @@ def train_fold(
         )
 
     # ------------------------------------------------------------------
-    # Class weights from the *train* fold only
+    # Class weights from the *train* fold only — mode-aware (§18.17.3 B)
     # ------------------------------------------------------------------
-    cls_w_3 = estimate_inverse_frequency_class_weights_3(
-        train_ds.get_guid_labels_3class()
-    )
-    cls_w_bin = estimate_inverse_frequency_class_weights_bin(
-        train_ds.get_guid_labels_binary()
+    train_cfg_for_loss = (config.get("training", {}) or {}).get("loss", {}) or {}
+    class_weight_mode = str(
+        train_cfg_for_loss.get("class_weight_mode", "none")
+    ).lower()
+    train_labels_3 = train_ds.get_guid_labels_3class()
+    train_labels_bin = train_ds.get_guid_labels_binary()
+    cls_w_3 = estimate_class_weights_3(train_labels_3, mode=class_weight_mode)
+    cls_w_bin = estimate_class_weights_bin(
+        train_labels_bin, mode=class_weight_mode
     )
     logger.info(
-        f"[fold {fold_id}] class weights: 3-class={cls_w_3.tolist()} "
-        f"binary={cls_w_bin.tolist()}"
+        f"[fold {fold_id}] class_weight_mode={class_weight_mode!r} "
+        f"3-class={cls_w_3.tolist()} binary={cls_w_bin.tolist()}"
+    )
+
+    # Empirical priors used for head bias init (§18.17.3 D). Always
+    # computed (cheap); only applied to the head when the YAML flag is
+    # enabled.
+    prior_3 = class_priors_3(train_labels_3)
+    prior_bin = class_prior_bin(train_labels_bin)
+    logger.info(
+        f"[fold {fold_id}] train priors: 3-class={prior_3.tolist()} "
+        f"binary_pos={float(prior_bin):.4f}"
     )
 
     # ------------------------------------------------------------------
@@ -527,12 +543,28 @@ def train_fold(
 
     train_cfg = config.get("training", {}) or {}
     loss_cfg = train_cfg.get("loss", {}) or {}
+    # Head bias init from the empirical class prior (§18.17.3 D). On by
+    # default — pairs with ``class_weight_mode: none`` to put position 0
+    # at the prior at step 0 instead of forcing the optimizer to climb
+    # out of a uniform-init basin under bursty rare-class gradients.
+    if bool(loss_cfg.get("head_bias_init_from_prior", True)):
+        classifier.outcome_head.init_class_bias_from_prior(
+            prior_3=prior_3,
+            prior_bin=prior_bin,
+        )
+        logger.info(
+            f"[fold {fold_id}] head bias-init from prior: "
+            f"head_3.bias=log({prior_3.tolist()}) "
+            f"head_bin.bias=logit({float(prior_bin):.4f})"
+        )
+
     loss_weights = LossWeights(
         lambda_3=float(loss_cfg.get("lambda_3", 1.0)),
         lambda_2=float(loss_cfg.get("lambda_2", 0.5)),
         gamma_vae=0.0 if freeze_vae else float(loss_cfg.get("gamma_vae", 0.1)),
         lambda_sp=0.0 if freeze_vae else float(loss_cfg.get("lambda_sp", 1e-4)),
         position_weight_alpha=float(loss_cfg.get("position_weight_alpha", 0.0)),
+        loss_warmup_positions=int(loss_cfg.get("loss_warmup_positions", 0)),
     )
     pl_model = PlGuidClassifier(
         base_model=classifier,
@@ -549,6 +581,7 @@ def train_fold(
         rel_d_max=float(cls_cfg.get("rel_bucket_d_max", 40.0)),
         lr=float(train_cfg.get("optimizer", {}).get("classifier", {}).get("lr", 1e-3)),
         lr_milestones=train_cfg.get("scheduler", {}).get("milestones") or [100],
+        lr_gamma=float(train_cfg.get("scheduler", {}).get("gamma", 0.1)),
         lr_warmup_steps=int(train_cfg.get("lr_warmup_steps", 0)),
         weight_decay=float(
             train_cfg.get("optimizer", {}).get("classifier", {}).get("weight_decay", 1e-4)
@@ -566,6 +599,10 @@ def train_fold(
         es_patience=int(train_cfg.get("early_stopping", {}).get("patience", 50)),
         es_enabled=bool(train_cfg.get("early_stopping", {}).get("enabled", True)),
     )
+    # Stage-1 → stage-2 boundary epoch is also needed by ``min_epochs``
+    # below so EarlyStopping cannot terminate the run before stage 2 has
+    # had a chance to fire.
+    stage1_epochs: Optional[int] = None
     if not freeze_vae:
         two_stage_cfg = train_cfg.get("two_stage", {}) or {}
         stage1_epochs = int(two_stage_cfg.get("stage1_epochs", 100))
@@ -581,10 +618,33 @@ def train_fold(
             f"(stage1_epochs={stage1_epochs})"
         )
 
+    # Live-VAE runs MUST reach stage 2: pin ``min_epochs = stage1_epochs + 1``
+    # so EarlyStopping cannot fire during stage 1 even if val/total_loss
+    # plateaus early. The ``+1`` ensures stage 2 gets at least one epoch
+    # before EarlyStopping is allowed to evaluate it (and the
+    # :class:`TwoStageVaeUnfreeze` callback also resets EarlyStopping's
+    # ``best_score`` / ``wait_count`` at the boundary so stage 2 starts
+    # with a fresh patience window).
+    max_epochs_cfg = int(config["general_config"].get("epochs", 200))
+    min_epochs: Optional[int] = (
+        (stage1_epochs + 1) if (not freeze_vae and stage1_epochs is not None) else None
+    )
+    if min_epochs is not None and min_epochs > max_epochs_cfg:
+        # Lightning silently caps min_epochs at max_epochs, which would
+        # make the run finish at ``epochs`` without ever entering stage
+        # 2. Fail loudly so the misconfiguration is caught at fold start.
+        raise ValueError(
+            f"two_stage.stage1_epochs={stage1_epochs} requires "
+            f"min_epochs={min_epochs}, but general_config.epochs="
+            f"{max_epochs_cfg} is smaller — stage 2 would never run. "
+            "Either lower stage1_epochs or raise epochs."
+        )
+
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     devices = [int(gpu_id)] if accelerator == "gpu" else 1
     trainer = L.Trainer(
-        max_epochs=int(config["general_config"].get("epochs", 200)),
+        max_epochs=max_epochs_cfg,
+        min_epochs=min_epochs,
         accelerator=accelerator,
         devices=devices,
         precision=str(train_cfg.get("precision", "32-true")),

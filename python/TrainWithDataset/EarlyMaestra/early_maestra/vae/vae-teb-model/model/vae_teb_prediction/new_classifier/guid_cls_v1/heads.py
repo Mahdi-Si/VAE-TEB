@@ -18,6 +18,7 @@ contributes a per-position loss in one forward pass.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -72,9 +73,82 @@ class PerPositionOutcomeHead(nn.Module):
         self.head_3 = nn.Linear(d_model, num_classes_multi)
         self.head_bin = nn.Linear(d_model, 1)
 
-        # Zero-init binary head so initial prob_bin ≈ 0.5 (smoke-test invariant).
+        # Zero-init both head weight matrices so step-0 logits depend
+        # ONLY on the head bias. Combined with
+        # :meth:`init_class_bias_from_prior`, this puts the model
+        # exactly at the empirical prior at step 0:
+        #   * prob_bin = sigmoid(b_bin) = p^+
+        #   * prob_3   = softmax(b_3)   = p_3
+        # Without zero-initing ``head_3.weight``, the Kaiming-init
+        # ``W·z`` term adds a non-trivial random offset to the 3-class
+        # logits and the docstring's "model already predicts the prior"
+        # guarantee silently fails for the 3-class branch.
+        nn.init.zeros_(self.head_3.weight)
+        nn.init.zeros_(self.head_3.bias)
         nn.init.zeros_(self.head_bin.weight)
         nn.init.zeros_(self.head_bin.bias)
+
+    def init_class_bias_from_prior(
+        self,
+        *,
+        prior_3: Optional[torch.Tensor] = None,
+        prior_bin: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> None:
+        """Bias-init the heads from the train-fold class prior (§18.17.3 D).
+
+        Sets the head's output bias to the class log-odds so that at
+        step 0, before any features are learned, the model already
+        predicts the empirical prior. Combined with the segment-token
+        zero-pad on padded positions, this means position 0 (which only
+        sees one segment of history under the causal mask) emits the
+        prior — *exactly* the behaviour we want, because the rare-class
+        gradient noise at early positions otherwise dominates the loss
+        signal and pushes AdamW into a class-prior-collapse basin.
+
+        For the 3-class head (multinomial logits), bias is set to
+        $b_c = \\log(p_c + \\varepsilon)$. The unnormalised softmax
+        of bias-only logits then matches the prior by construction
+        (the constant offset cancels in softmax).
+
+        For the binary head (sigmoid logit), bias is set to the
+        positive-class logit
+        $b = \\log\\big(p^+ + \\varepsilon\\big)
+              - \\log\\big(1 - p^+ + \\varepsilon\\big)$.
+        With zero-init weights this gives ``prob_bin = sigmoid(b) = p^+``
+        at step 0.
+
+        Both ``head_3.weight`` and ``head_bin.weight`` are zero-init in
+        :meth:`__init__`, so the prior-from-bias guarantee is exact for
+        both heads at step 0: the ``W·z`` term contributes nothing and
+        the softmax/sigmoid sees only the bias. The first gradient step
+        breaks this symmetry as the weights begin to capture
+        feature-conditional class boundaries; the prior is the
+        starting point, not a constraint.
+
+        Args:
+            prior_3: Optional length-3 simplex tensor (sums to 1). If
+                provided, sets ``head_3.bias = log(prior_3 + eps)``.
+            prior_bin: Optional scalar in $(0, 1)$ (positive-class
+                prior). If provided, sets the binary head's bias to
+                the corresponding logit.
+            eps: Numerical guard so log doesn't blow up on zero counts.
+        """
+        with torch.no_grad():
+            if prior_3 is not None:
+                p3 = prior_3.to(dtype=self.head_3.bias.dtype,
+                                device=self.head_3.bias.device)
+                if p3.numel() != self.head_3.bias.numel():
+                    raise ValueError(
+                        f"prior_3 size {p3.numel()} does not match "
+                        f"head_3 bias size {self.head_3.bias.numel()}"
+                    )
+                self.head_3.bias.copy_(torch.log(p3 + eps))
+            if prior_bin is not None:
+                p = float(prior_bin.item() if isinstance(prior_bin, torch.Tensor) else prior_bin)
+                p = min(max(p, eps), 1.0 - eps)
+                logit = math.log(p) - math.log(1.0 - p)
+                self.head_bin.bias.fill_(logit)
 
     def forward(
         self,

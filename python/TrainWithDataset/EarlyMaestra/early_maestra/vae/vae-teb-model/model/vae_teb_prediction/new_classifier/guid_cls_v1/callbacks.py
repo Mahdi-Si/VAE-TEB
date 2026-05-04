@@ -203,6 +203,20 @@ class TwoStageVaeUnfreeze(L.Callback):
                 }
             )
 
+        # Reset any EarlyStopping callback so stage 2 starts with a fresh
+        # patience window. Stage 1's val/total_loss is computed under a
+        # frozen VAE and zeroed VAE-aux / sparsity terms; once stage 2
+        # restores those weights and unfreezes the encoder, the loss
+        # surface changes discontinuously and the stage-1 ``best_score``
+        # is no longer a meaningful target. Without this reset, an
+        # EarlyStopping that was already close to firing in stage 1
+        # would terminate stage 2 within a handful of epochs because the
+        # post-unfreeze val loss is compared against a stale baseline.
+        # ``min_epochs = stage1_epochs + 1`` (set in
+        # :func:`single_fold_trainer.train_fold`) guarantees the run
+        # reaches this point at all.
+        self._reset_early_stopping(trainer)
+
         self._fired = True
         logger.info(
             f"TwoStageVaeUnfreeze: stage 2 begin at epoch "
@@ -212,6 +226,56 @@ class TwoStageVaeUnfreeze(L.Callback):
             f"gamma_vae={self.gamma_vae_stage2}, "
             f"lambda_sp={self.lambda_sp_stage2}"
         )
+
+    @staticmethod
+    def _reset_early_stopping(trainer: L.Trainer) -> None:
+        """Clear ``best_score`` / ``wait_count`` on every EarlyStopping callback.
+
+        Iterates over ``trainer.callbacks`` (multiple EarlyStopping
+        instances are technically allowed, though we register at most
+        one) and sets:
+
+        * ``best_score`` to ``+inf`` for ``mode='min'`` callbacks (or
+          ``-inf`` for ``mode='max'``), matching what Lightning does
+          at trainer construction;
+        * ``wait_count`` to 0 so the patience counter starts over;
+        * ``stopped_epoch`` to 0 so a previously-armed terminator is
+          re-armed cleanly.
+
+        The reset is best-effort: if Lightning's internal attribute
+        names change, we log and continue rather than crash the run.
+        """
+        from lightning.pytorch.callbacks import EarlyStopping  # noqa: WPS433
+
+        for cb in trainer.callbacks:
+            if not isinstance(cb, EarlyStopping):
+                continue
+            try:
+                mode = getattr(cb, "mode", "min")
+                # Match the dtype / device of the live ``current_score``
+                # Lightning will compare against — under bf16-mixed or
+                # fp16, a fp32 CPU ``inf`` would force a silent dtype
+                # promotion every step.
+                ref = trainer.callback_metrics.get(getattr(cb, "monitor", "")) \
+                    if hasattr(trainer, "callback_metrics") else None
+                ref_dtype = ref.dtype if isinstance(ref, torch.Tensor) else torch.float32
+                ref_device = (
+                    ref.device if isinstance(ref, torch.Tensor) else torch.device("cpu")
+                )
+                fill = float("inf") if mode == "min" else float("-inf")
+                cb.best_score = torch.tensor(fill, dtype=ref_dtype, device=ref_device)
+                cb.wait_count = 0
+                cb.stopped_epoch = 0
+                logger.info(
+                    f"TwoStageVaeUnfreeze: reset EarlyStopping(monitor="
+                    f"{getattr(cb, 'monitor', '?')!r}, mode={mode!r}) — "
+                    f"stage 2 starts with a fresh patience window"
+                )
+            except (AttributeError, TypeError) as exc:  # pragma: no cover
+                logger.warning(
+                    f"TwoStageVaeUnfreeze: could not reset EarlyStopping "
+                    f"(Lightning internal layout may have changed): {exc}"
+                )
 
 
 __all__ = [
