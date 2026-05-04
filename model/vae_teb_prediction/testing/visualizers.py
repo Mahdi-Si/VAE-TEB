@@ -622,6 +622,39 @@ def _ordered_bands(
     return sorted(seen, key=_sort_key)
 
 
+def _format_band_label_with_hz(
+    band: str,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]],
+) -> str:
+    r"""Append the explicit Hz range to a band name when known.
+
+    Falls back to the bare name when ``band_hz_ranges`` is ``None`` or
+    does not contain the band (e.g. ``by_kind`` partitions, where the
+    label is a coefficient kind rather than a band).
+
+    Examples:
+        ``("deceleration", {...})`` $\rightarrow$
+        ``"deceleration\n(0.008–0.04 Hz)"``.
+    """
+    if band_hz_ranges is None:
+        return str(band)
+    rng = band_hz_ranges.get(str(band))
+    if rng is None:
+        return str(band)
+    lo, hi = float(rng[0]), float(rng[1])
+    lo_finite = np.isfinite(lo) and lo > 0.0
+    hi_finite = np.isfinite(hi)
+    # Degenerate "covers everything" range (e.g. ``octave_dc``) — collapse
+    # to a DC tag rather than emit a misleading "(> 0 Hz)" string.
+    if not lo_finite and not hi_finite:
+        return f"{band}\n(DC)"
+    if not hi_finite:
+        return f"{band}\n(> {lo:g} Hz)"
+    if not lo_finite:
+        return f"{band}\n(< {hi:g} Hz)"
+    return f"{band}\n({lo:g}–{hi:g} Hz)"
+
+
 def plot_band_violin(
     df: pd.DataFrame,
     value_col: str,
@@ -629,11 +662,22 @@ def plot_band_violin(
     *,
     title: Optional[str] = None,
     n_channels_by_band: Optional[Dict[str, int]] = None,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Violin plot of ``value_col`` per band on a single axes.
 
     Expected DataFrame columns: ``band`` (string) and ``value_col``.
     Empty bands or all-NaN values are skipped silently.
+
+    Args:
+        df: Long-format dataframe with ``band`` and ``value_col`` columns.
+        value_col: Numeric column to plot.
+        output_path: Destination PDF.
+        title: Optional figure title.
+        n_channels_by_band: Channel-count annotation per band.
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` mapping. When
+            provided, every x-tick label is suffixed with the explicit
+            Hz range so reviewers don't have to look up the cutoffs.
     """
     bands = _ordered_bands(df.get("band"))
     if not bands or value_col not in df.columns:
@@ -653,10 +697,11 @@ def plot_band_violin(
         n_ch = (
             n_channels_by_band.get(band) if n_channels_by_band is not None else None
         )
+        band_hz_label = _format_band_label_with_hz(band, band_hz_ranges)
         if n_ch is None or n_ch <= 0:
-            labels.append(f"{band}\n(n={vals.size})")
+            labels.append(f"{band_hz_label}\n(n={vals.size})")
         else:
-            labels.append(f"{band}\nch={n_ch}, n={vals.size}")
+            labels.append(f"{band_hz_label}\nch={n_ch}, n={vals.size}")
         colors.append(_band_color_for(band))
     if not data:
         return
@@ -693,19 +738,31 @@ def plot_band_violin_by_class(
     output_path: Path,
     *,
     title: Optional[str] = None,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Grouped violin plot: one cluster per band, one violin per class.
 
     Expected columns: ``band``, ``label``, ``value_col``. Bands without
     samples in any class are skipped. Falls back to the pooled plot
     when fewer than 2 classes are present.
+
+    Args:
+        df: Long-format dataframe with ``band``, ``label``, ``value_col``.
+        value_col: Numeric column to plot.
+        output_path: Destination PDF.
+        title: Optional figure title.
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` for explicit Hz
+            tick suffixes (see :func:`plot_band_violin`).
     """
     bands = _ordered_bands(df.get("band"))
     classes = unique_labels_in(df.get("label"))
     if not bands or value_col not in df.columns:
         return
     if len(classes) < 2:
-        plot_band_violin(df, value_col, output_path, title=title)
+        plot_band_violin(
+            df, value_col, output_path, title=title,
+            band_hz_ranges=band_hz_ranges,
+        )
         return
 
     fig, ax = plt.subplots(
@@ -745,7 +802,10 @@ def plot_band_violin_by_class(
                 legend_added.add(lab)
 
     ax.set_xticks(range(1, len(bands) + 1))
-    ax.set_xticklabels(bands, fontsize=FONT_LABEL * 0.9)
+    band_tick_labels = [
+        _format_band_label_with_hz(b, band_hz_ranges) for b in bands
+    ]
+    ax.set_xticklabels(band_tick_labels, fontsize=FONT_LABEL * 0.85)
     ax.set_ylabel(value_col, fontsize=FONT_LABEL)
     ax.set_title(
         title or f"{value_col} per frequency band — by class",
@@ -772,6 +832,7 @@ def _ribbon_plot_per_band(
     xlabel: str,
     ylabel: str,
     x_to_minutes: Optional[float] = None,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Median + IQR ribbon, one line per band, all on shared axes."""
     bands = _ordered_bands(df.get("band"))
@@ -794,7 +855,10 @@ def _ribbon_plot_per_band(
         if x_to_minutes is not None:
             xs = xs * float(x_to_minutes)
         color = _band_color_for(band)
-        ax.plot(xs, med.to_numpy(), color=color, lw=1.1, label=band)
+        legend_label = _format_band_label_with_hz(
+            band, band_hz_ranges,
+        ).replace("\n", "  ")
+        ax.plot(xs, med.to_numpy(), color=color, lw=1.1, label=legend_label)
         ax.fill_between(
             xs, q1.to_numpy(), q3.to_numpy(),
             color=color, alpha=0.18, lw=0,
@@ -820,8 +884,17 @@ def plot_band_horizon_error(
     output_path: Path,
     *,
     value_col: str = "mse",
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
-    """Per-band median+IQR ribbon of forecast MSE vs horizon step ``h``."""
+    """Per-band median+IQR ribbon of forecast MSE vs horizon step ``h``.
+
+    Args:
+        per_horizon_df: Long-format dataframe with ``band, h, value_col``.
+        output_path: Destination PDF.
+        value_col: Numeric column to plot (default ``"mse"``).
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` for explicit Hz
+            suffixes in the legend.
+    """
     _ribbon_plot_per_band(
         per_horizon_df,
         x_col="h",
@@ -830,6 +903,7 @@ def plot_band_horizon_error(
         title="Forecast error by horizon step — per frequency band",
         xlabel="horizon step h",
         ylabel=f"{value_col} (median, IQR)",
+        band_hz_ranges=band_hz_ranges,
     )
 
 
@@ -839,6 +913,7 @@ def plot_band_anchor_error(
     *,
     value_col: str = "mse",
     decim_step_seconds: float = 4.0,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Per-band median+IQR ribbon of forecast MSE vs anchor position ``t``.
 
@@ -846,6 +921,14 @@ def plot_band_anchor_error(
     60`` so the figure is directly readable in clinical time. Default
     ``decim_step_seconds=4`` matches the v1 model's 16x decimation at
     ``fs=4 Hz``.
+
+    Args:
+        per_anchor_df: Long-format dataframe with ``band, t, value_col``.
+        output_path: Destination PDF.
+        value_col: Numeric column to plot.
+        decim_step_seconds: Physical seconds per decimated step.
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` for explicit Hz
+            suffixes in the legend.
     """
     _ribbon_plot_per_band(
         per_anchor_df,
@@ -856,6 +939,7 @@ def plot_band_anchor_error(
         xlabel="anchor position (min into segment)",
         ylabel=f"{value_col} (median, IQR)",
         x_to_minutes=decim_step_seconds / 60.0,
+        band_hz_ranges=band_hz_ranges,
     )
 
 
@@ -869,6 +953,7 @@ def _grid_ribbon_by_class(
     xlabel: str,
     ylabel: str,
     x_to_minutes: Optional[float] = None,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Grid plot: rows = bands, cols = classes. Each cell is a ribbon."""
     bands = _ordered_bands(df.get("band"))
@@ -882,6 +967,7 @@ def _grid_ribbon_by_class(
             output_path=output_path, title=title,
             xlabel=xlabel, ylabel=ylabel,
             x_to_minutes=x_to_minutes,
+            band_hz_ranges=band_hz_ranges,
         )
         return
 
@@ -903,7 +989,10 @@ def _grid_ribbon_by_class(
                         transform=ax.transAxes, fontsize=FONT_LABEL * 0.9)
                 _style_axes(ax, grid="major", minor_ticks=False)
                 if c == 0:
-                    ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+                    ax.set_ylabel(
+                        _format_band_label_with_hz(band, band_hz_ranges),
+                        fontsize=FONT_LABEL * 0.85,
+                    )
                 if r == 0:
                     ax.set_title(class_label_for(lab),
                                  fontsize=FONT_TITLE * 0.85,
@@ -918,7 +1007,10 @@ def _grid_ribbon_by_class(
                         transform=ax.transAxes, fontsize=FONT_LABEL * 0.9)
                 _style_axes(ax, grid="major", minor_ticks=False)
                 if c == 0:
-                    ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+                    ax.set_ylabel(
+                        _format_band_label_with_hz(band, band_hz_ranges),
+                        fontsize=FONT_LABEL * 0.85,
+                    )
                 if r == 0:
                     ax.set_title(class_label_for(lab),
                                  fontsize=FONT_TITLE * 0.85,
@@ -935,7 +1027,10 @@ def _grid_ribbon_by_class(
             )
             plotted_any = True
             if c == 0:
-                ax.set_ylabel(band, fontsize=FONT_LABEL * 0.85)
+                ax.set_ylabel(
+                    _format_band_label_with_hz(band, band_hz_ranges),
+                    fontsize=FONT_LABEL * 0.85,
+                )
             if r == 0:
                 ax.set_title(class_label_for(lab),
                              fontsize=FONT_TITLE * 0.85,
@@ -959,6 +1054,7 @@ def plot_band_horizon_error_by_class(
     output_path: Path,
     *,
     value_col: str = "mse",
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Grid: per-band horizon-error ribbons split by class."""
     _grid_ribbon_by_class(
@@ -969,6 +1065,7 @@ def plot_band_horizon_error_by_class(
         title="Forecast error by horizon — per band, per class",
         xlabel="horizon step h",
         ylabel=value_col,
+        band_hz_ranges=band_hz_ranges,
     )
 
 
@@ -978,6 +1075,7 @@ def plot_band_anchor_error_by_class(
     *,
     value_col: str = "mse",
     decim_step_seconds: float = 4.0,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
     """Grid: per-band anchor-error ribbons split by class."""
     _grid_ribbon_by_class(
@@ -989,6 +1087,7 @@ def plot_band_anchor_error_by_class(
         xlabel="anchor position (min)",
         ylabel=value_col,
         x_to_minutes=decim_step_seconds / 60.0,
+        band_hz_ranges=band_hz_ranges,
     )
 
 
@@ -1236,6 +1335,603 @@ def plot_phase_harmonic_mse(
     _style_axes(ax, grid="major", minor_ticks=False)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------
+# Frequency x horizon-step heatmaps + phase-harmonic comodulograms.
+#
+# These render the channel x horizon MSE grid produced by
+# :func:`run_frequency_band_forecast_analysis`. Three flavours:
+#
+# 1. :func:`plot_freq_horizon_heatmap_scattering` — flat Hz-labelled
+#    heatmap for the 43 scattering channels (1-D frequency identity).
+# 2. :func:`plot_freq_horizon_heatmap_phase_by_kind` — 4 row-stacked
+#    heatmaps for the phase channels split by ``kind`` (``ph_diag``,
+#    ``ph_h2``, ``ph_h3``, ``ph_other``), each row annotated with the
+#    driver/response frequency pair $(\xi_i, \xi_j)$ and harmonic
+#    ratio $p$.
+# 3. :func:`plot_phase_comodulograms_by_horizon` — small-multiples
+#    comodulogram per horizon snapshot, axes $\log_2 \xi_i$ vs
+#    $\log_2 \xi_j$, with dashed harmonic ridges $\xi_j = p\,\xi_i$.
+# ----------------------------------------------------------------------
+
+
+def _format_hz_tick(value: float) -> str:
+    """Format a Hz frequency for axis ticks with adaptive precision."""
+    if not np.isfinite(value):
+        return "DC"
+    if value <= 0.0:
+        return "DC"
+    if value >= 1.0:
+        return f"{value:.2f} Hz"
+    if value >= 0.1:
+        return f"{value:.3f} Hz"
+    if value >= 0.01:
+        return f"{value:.4f} Hz"
+    return f"{value:.5f} Hz"
+
+
+def plot_freq_horizon_heatmap_scattering(
+    mse_grid: np.ndarray,
+    freq_hz: np.ndarray,
+    channel_ids: np.ndarray,
+    horizon: int,
+    fs_hz: float,
+    output_path: Path,
+    *,
+    n_samples: int,
+    n_anchors_total: int = 0,
+    log_color: bool = True,
+    metric_label: str = "Forecast MSE",
+) -> None:
+    r"""Render a (frequency $\times$ horizon-step) MSE heatmap for the scattering block.
+
+    Rows index the 43 scattering channels sorted from highest to lowest
+    centre frequency $\xi$ (in Hz), so the top of the figure shows
+    beat-to-beat content and the bottom shows the slow-baseline /
+    DC channel. The DC ``st_S0`` row (no centre frequency) is rendered
+    at the bottom with an explicit ``DC`` tick label.
+
+    Each cell shows the cross-sample mean of the per-(sample, channel,
+    horizon-step) MSE produced by
+    :func:`compute_per_channel_per_horizon_forecast_metrics`.
+
+    Args:
+        mse_grid: ``(n_rows, H_d)`` array of MSE values, already sorted
+            so that ``mse_grid[0]`` is the highest-frequency row.
+        freq_hz: ``(n_rows,)`` array of centre frequencies in Hz.
+            ``np.nan`` indicates the DC / S_0 channel.
+        channel_ids: ``(n_rows,)`` array of original channel indices in
+            the 87-channel forecast space, used in the right-margin
+            annotations.
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz (used to render the secondary
+            x-axis in seconds).
+        output_path: Destination PDF path. A sibling ``.png`` is also
+            written.
+        n_samples: Number of samples averaged into ``mse_grid``.
+        n_anchors_total: Total ``samples * valid_anchors`` averaged.
+        log_color: Use a log-scaled colormap (default).
+        metric_label: Colorbar label prefix (default ``"Forecast MSE"``).
+    """
+    if mse_grid.ndim != 2 or mse_grid.size == 0:
+        return
+    n_rows, n_cols = mse_grid.shape
+    if int(n_cols) != int(horizon):
+        return
+
+    fig_h = max(4.0, 0.18 * float(n_rows) + 1.5)
+    fig_w = max(6.0, 0.45 * float(n_cols) + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    finite_vals = mse_grid[np.isfinite(mse_grid) & (mse_grid > 0.0)]
+    if log_color and finite_vals.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_vals, 1.0))
+        vmax = float(np.percentile(finite_vals, 99.0))
+        if vmin <= 0 or not np.isfinite(vmin):
+            vmin = float(np.min(finite_vals))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(mse_grid)),
+            vmax=float(np.nanmax(mse_grid)),
+        )
+
+    im = ax.imshow(
+        mse_grid, aspect="auto", origin="upper",
+        cmap="magma", norm=norm,
+        interpolation="nearest",
+    )
+
+    # Y-axis: exact Hz tick labels, descending. Suppress every other
+    # label past 30 rows so they remain readable.
+    label_step = 1 if n_rows <= 30 else int(np.ceil(n_rows / 30.0))
+    yticks = list(range(0, n_rows, label_step))
+    if (n_rows - 1) not in yticks:
+        yticks.append(n_rows - 1)
+    yticklabels = [_format_hz_tick(float(freq_hz[i])) for i in yticks]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(yticklabels)
+    ax.set_ylabel(r"Centre frequency $\xi$ (Hz, high $\rightarrow$ low)",
+                  fontsize=FONT_LABEL)
+
+    # Mark DC band (NaN freq) with a dashed horizontal line if present.
+    dc_rows = np.where(~np.isfinite(freq_hz))[0]
+    for r in dc_rows:
+        ax.axhline(r - 0.5, color=COLOR_BLACK, linestyle="--",
+                   linewidth=0.5, alpha=0.7)
+
+    # X-axis: horizon step + seconds annotation.
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([
+        f"$h={k}$\n({k / float(fs_hz):.2f} s)" for k in range(n_cols)
+    ])
+    ax.set_xlabel(
+        "Horizon step (and elapsed time at "
+        f"$f_s = {fs_hz:g}$ Hz)",
+        fontsize=FONT_LABEL,
+    )
+
+    # Right-margin annotations: original channel index per row.
+    ax_right = ax.twinx()
+    ax_right.set_ylim(ax.get_ylim())
+    ax_right.set_yticks(yticks)
+    ax_right.set_yticklabels([f"ch {int(channel_ids[i])}" for i in yticks])
+    ax_right.tick_params(axis="y", labelsize=plt.rcParams["ytick.labelsize"])
+    ax_right.set_ylabel("Channel index (87-ch space)",
+                        fontsize=FONT_LABEL * 0.85)
+    for spine in ax_right.spines.values():
+        spine.set_visible(True)
+        spine.set_color(COLOR_BLACK)
+        spine.set_linewidth(0.5)
+
+    cbar = _add_colorbar(
+        fig, im, ax,
+        label=f"{metric_label} (log scale)" if log_color else metric_label,
+    )
+    cbar.ax.set_title(
+        f"avg over\n{n_samples} samples",
+        fontsize=plt.rcParams["axes.labelsize"] * 0.7, pad=4,
+    )
+
+    suptitle = (
+        "Scattering forecast quality — channel × horizon step\n"
+        rf"$f_s = {fs_hz:g}$ Hz, $H_d = {horizon}$, $n$ = {n_samples} samples"
+    )
+    if n_anchors_total > 0:
+        suptitle += f" × {n_anchors_total // max(n_samples, 1)} valid anchors"
+    ax.set_title(suptitle, fontsize=FONT_TITLE * 0.95, pad=10)
+
+    _style_axes(ax, grid="none", minor_ticks=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    png_path = Path(str(output_path).replace(".pdf", ".png"))
+    if png_path != output_path:
+        fig.savefig(png_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+_PHASE_KIND_ORDER: Tuple[str, ...] = ("ph_diag", "ph_h2", "ph_h3", "ph_other")
+_PHASE_KIND_TITLE: Dict[str, str] = {
+    "ph_diag":  r"$p \approx 1$ — autocorrelation ($\xi_i = \xi_j$)",
+    "ph_h2":    r"$p \approx 2$ — second-harmonic coupling",
+    "ph_h3":    r"$p \approx 3$ — third-harmonic coupling",
+    "ph_other": r"residual cross-frequency pairs",
+}
+_PHASE_KIND_MARKER: Dict[str, str] = {
+    "ph_diag": "o", "ph_h2": "^", "ph_h3": "s", "ph_other": "P",
+}
+
+
+def plot_freq_horizon_heatmap_phase_by_kind(
+    long_df: pd.DataFrame,
+    horizon: int,
+    fs_hz: float,
+    output_path: Path,
+    *,
+    n_samples: int,
+    log_color: bool = True,
+    metric_label: str = "Forecast MSE",
+) -> None:
+    r"""Phase-harmonic forecast quality heatmap, faceted by coefficient kind.
+
+    Renders one panel per ``kind`` in $\{$``ph_diag``, ``ph_h2``,
+    ``ph_h3``, ``ph_other``$\}$. Each panel sorts rows by the response
+    frequency $\xi_j$ in descending order and shows a (channel
+    $\times$ horizon-step) MSE strip with a shared color scale.
+
+    Each row carries a right-margin annotation with the
+    $(\xi_i, \xi_j, p)$ triple so the dual-frequency identity of the
+    coefficient is preserved on the page.
+
+    Args:
+        long_df: Long-format dataframe (one row per channel x horizon)
+            with columns ``channel, kind, freq_hz_primary,
+            freq_hz_secondary, harmonic_ratio, h, mse_mean``. Phase
+            channels only (``kind`` starts with ``ph_``).
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz.
+        output_path: Destination PDF path.
+        n_samples: Number of samples in the underlying mean.
+        log_color: Use ``LogNorm`` for the shared colorbar (default).
+        metric_label: Colorbar label prefix.
+    """
+    if long_df is None or long_df.empty:
+        return
+    needed = {
+        "channel", "kind", "freq_hz_primary", "freq_hz_secondary",
+        "harmonic_ratio", "h", "mse_mean",
+    }
+    if not needed.issubset(long_df.columns):
+        return
+
+    panels: Dict[str, np.ndarray] = {}
+    panel_meta: Dict[str, pd.DataFrame] = {}
+    for kind in _PHASE_KIND_ORDER:
+        sub = long_df[long_df["kind"] == kind]
+        if sub.empty:
+            continue
+        sub_meta = sub[
+            ["channel", "freq_hz_primary", "freq_hz_secondary", "harmonic_ratio"]
+        ].drop_duplicates(subset=["channel"]).copy()
+        # Sort by xi_j (response) descending; NaN sinks to the bottom.
+        sort_keys = sub_meta["freq_hz_primary"].astype(float).to_numpy()
+        sort_keys = np.where(np.isnan(sort_keys), -np.inf, sort_keys)
+        order = np.argsort(-sort_keys, kind="stable")
+        sub_meta = sub_meta.iloc[order].reset_index(drop=True)
+        ch_order = sub_meta["channel"].astype(int).tolist()
+        wide = (
+            sub.pivot_table(
+                index="channel", columns="h", values="mse_mean", aggfunc="mean",
+            )
+            .reindex(ch_order)
+            .reindex(columns=range(horizon))
+        )
+        panels[kind] = wide.to_numpy(dtype=float)
+        panel_meta[kind] = sub_meta
+
+    if not panels:
+        return
+
+    # Shared color norm across panels.
+    all_vals = np.concatenate([
+        g[np.isfinite(g)] for g in panels.values()
+    ])
+    finite_pos = all_vals[all_vals > 0.0]
+    if log_color and finite_pos.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_pos, 1.0))
+        vmax = float(np.percentile(finite_pos, 99.0))
+        if vmin <= 0:
+            vmin = float(np.min(finite_pos))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    elif all_vals.size > 0:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(all_vals)),
+            vmax=float(np.nanmax(all_vals)),
+        )
+    else:
+        return
+
+    n_panels = len(panels)
+    height_ratios = [max(1.0, panels[k].shape[0] * 0.18 + 0.5)
+                     for k in panels]
+    total_h = float(sum(height_ratios)) + 1.5
+    fig_w = max(8.0, 0.6 * float(horizon) + 5.5)
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=(fig_w, total_h),
+        gridspec_kw={"height_ratios": height_ratios},
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    im = None
+    for ax, (kind, grid) in zip(axes, panels.items()):
+        meta = panel_meta[kind]
+        im = ax.imshow(
+            grid, aspect="auto", origin="upper",
+            cmap="magma", norm=norm, interpolation="nearest",
+        )
+        n_rows = grid.shape[0]
+        # Y-axis: response frequency xi_j in Hz.
+        label_step = 1 if n_rows <= 14 else int(np.ceil(n_rows / 14.0))
+        yticks = list(range(0, n_rows, label_step))
+        if (n_rows - 1) not in yticks:
+            yticks.append(n_rows - 1)
+        yticklabels = [
+            _format_hz_tick(float(meta.iloc[i]["freq_hz_primary"]))
+            for i in yticks
+        ]
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(yticklabels)
+        ax.set_ylabel(
+            rf"$\xi_j$ (Hz)" + "\n" + _PHASE_KIND_TITLE[kind],
+            fontsize=FONT_LABEL * 0.85,
+        )
+
+        # X-axis only on the bottom panel.
+        if ax is axes[-1]:
+            ax.set_xticks(np.arange(grid.shape[1]))
+            ax.set_xticklabels([
+                f"$h={k}$\n({k / float(fs_hz):.2f} s)"
+                for k in range(grid.shape[1])
+            ])
+            ax.set_xlabel(
+                "Horizon step (and elapsed time at "
+                f"$f_s = {fs_hz:g}$ Hz)",
+                fontsize=FONT_LABEL,
+            )
+        else:
+            ax.set_xticks([])
+
+        # Right-margin annotations: (xi_i, p) per row, suppressed past
+        # 14 rows to avoid clutter (then only for the labelled rows).
+        ax_right = ax.twinx()
+        ax_right.set_ylim(ax.get_ylim())
+        ax_right.set_yticks(yticks)
+        if kind == "ph_diag":
+            annot = ["(autocorr)" for _ in yticks]
+        else:
+            annot = []
+            for i in yticks:
+                xi_i = float(meta.iloc[i]["freq_hz_secondary"])
+                p = float(meta.iloc[i]["harmonic_ratio"])
+                annot.append(
+                    rf"$\xi_i$={_format_hz_tick(xi_i)},  $p$={p:.2g}"
+                )
+        ax_right.set_yticklabels(annot)
+        ax_right.tick_params(
+            axis="y", labelsize=plt.rcParams["ytick.labelsize"] * 0.85,
+        )
+        for spine in ax_right.spines.values():
+            spine.set_visible(True)
+            spine.set_color(COLOR_BLACK)
+            spine.set_linewidth(0.5)
+
+        ax.set_title(
+            f"{kind}  ($n_{{\\mathrm{{ch}}}} = {n_rows}$)",
+            fontsize=FONT_TITLE * 0.85, loc="left", pad=4,
+        )
+        _style_axes(ax, grid="none", minor_ticks=False)
+
+    # Shared colorbar on the right of the figure.
+    if im is not None:
+        fig.subplots_adjust(right=0.86)
+        cbar_ax = fig.add_axes([0.88, 0.10, 0.02, 0.78])
+        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label(
+            f"{metric_label} (log scale)" if log_color else metric_label,
+            fontsize=FONT_LABEL,
+        )
+        cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+        cbar.outline.set_linewidth(0.6)
+        cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+
+    fig.suptitle(
+        "Phase-harmonic forecast quality — by coefficient kind\n"
+        rf"$f_s = {fs_hz:g}$ Hz, $H_d = {horizon}$, "
+        rf"$n$ = {n_samples} samples",
+        fontsize=FONT_TITLE * 1.0, y=0.995,
+    )
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    png_path = Path(str(output_path).replace(".pdf", ".png"))
+    if png_path != output_path:
+        fig.savefig(png_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_phase_comodulograms_by_horizon(
+    long_df: pd.DataFrame,
+    horizon: int,
+    fs_hz: float,
+    output_path: Path,
+    *,
+    n_samples: int,
+    snapshot_horizons: Optional[Tuple[int, ...]] = None,
+    log_color: bool = True,
+    metric_label: str = "Forecast MSE",
+) -> None:
+    r"""Cross-frequency comodulograms of phase-harmonic forecast quality.
+
+    Renders small-multiples panels at $K$ horizon snapshots; each
+    panel scatters the phase channels in a $\log_2 \xi_i$ (driver,
+    x-axis) vs $\log_2 \xi_j$ (response, y-axis) plane, with marker
+    colour encoding MSE at that horizon step. Dashed reference lines
+    at $\xi_j = p \xi_i$ for $p \in \{1, 2, 3\}$ make the harmonic
+    ridges visible.
+
+    Inspired by the comodulogram convention from phase-amplitude
+    coupling literature (Tort 2010, PMC2941206; Brainstorm PAC
+    tutorial) and the wavelet-phase-harmonic covariance matrices of
+    Mallat & Zhang 2020 (IMA).
+
+    Args:
+        long_df: Long-format phase-channel MSE dataframe; same schema
+            as :func:`plot_freq_horizon_heatmap_phase_by_kind`.
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz.
+        output_path: Destination PDF.
+        n_samples: Number of samples averaged in.
+        snapshot_horizons: Horizon steps to render. Defaults to
+            ``(0, H_d // 4, H_d // 2, H_d - 1)`` (deduplicated).
+        log_color: Use ``LogNorm`` for shared colorbar.
+        metric_label: Colorbar label prefix.
+    """
+    if long_df is None or long_df.empty:
+        return
+    needed = {
+        "kind", "freq_hz_primary", "freq_hz_secondary",
+        "harmonic_ratio", "h", "mse_mean",
+    }
+    if not needed.issubset(long_df.columns):
+        return
+
+    if snapshot_horizons is None:
+        raw = (0, max(0, horizon // 4), max(0, horizon // 2),
+               max(0, horizon - 1))
+        seen: set = set()
+        snapshots: list = []
+        for k in raw:
+            ki = int(k)
+            if 0 <= ki < int(horizon) and ki not in seen:
+                seen.add(ki)
+                snapshots.append(ki)
+        snapshot_horizons = tuple(snapshots)
+    if not snapshot_horizons:
+        return
+
+    df = long_df.dropna(subset=["freq_hz_primary", "freq_hz_secondary"]).copy()
+    df = df[(df["freq_hz_primary"] > 0) & (df["freq_hz_secondary"] > 0)]
+    if df.empty:
+        return
+
+    df["log2_xi_i"] = np.log2(df["freq_hz_secondary"].astype(float))
+    df["log2_xi_j"] = np.log2(df["freq_hz_primary"].astype(float))
+
+    snapshot_dfs: Dict[int, pd.DataFrame] = {
+        h: df[df["h"] == int(h)].copy() for h in snapshot_horizons
+    }
+    snapshot_dfs = {h: d for h, d in snapshot_dfs.items() if not d.empty}
+    if not snapshot_dfs:
+        return
+
+    all_mse = np.concatenate([
+        d["mse_mean"].to_numpy(dtype=float) for d in snapshot_dfs.values()
+    ])
+    finite_pos = all_mse[np.isfinite(all_mse) & (all_mse > 0.0)]
+    if log_color and finite_pos.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_pos, 1.0))
+        vmax = float(np.percentile(finite_pos, 99.0))
+        if vmin <= 0:
+            vmin = float(np.min(finite_pos))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(all_mse)),
+            vmax=float(np.nanmax(all_mse)),
+        )
+
+    cmap = plt.colormaps.get_cmap("magma")
+
+    n_panels = len(snapshot_dfs)
+    fig_w = max(4.0, 4.0 * float(n_panels))
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(fig_w, 4.5),
+        squeeze=False, sharex=True, sharey=True,
+    )
+    axes = axes.flatten()
+
+    # Shared axis range across panels for visual comparability.
+    xi_i_all = df["log2_xi_i"].to_numpy(dtype=float)
+    xi_j_all = df["log2_xi_j"].to_numpy(dtype=float)
+    pad = 0.2
+    ax_xmin, ax_xmax = float(xi_i_all.min()) - pad, float(xi_i_all.max()) + pad
+    ax_ymin, ax_ymax = float(xi_j_all.min()) - pad, float(xi_j_all.max()) + pad
+
+    sc = None
+    for ax, (h_step, d) in zip(axes, snapshot_dfs.items()):
+        for kind, kind_df in d.groupby("kind"):
+            marker = _PHASE_KIND_MARKER.get(str(kind), "x")
+            sc = ax.scatter(
+                kind_df["log2_xi_i"].to_numpy(dtype=float),
+                kind_df["log2_xi_j"].to_numpy(dtype=float),
+                c=kind_df["mse_mean"].to_numpy(dtype=float),
+                cmap=cmap, norm=norm,
+                marker=marker, s=42,
+                edgecolors=COLOR_BLACK, linewidths=0.4,
+                label=str(kind), alpha=0.95,
+            )
+
+        # Harmonic ridges: xi_j = p * xi_i  ->  log2(xi_j) = log2(p) + log2(xi_i)
+        xs = np.linspace(ax_xmin, ax_xmax, 100)
+        for p_val, lbl in [(1.0, r"$p=1$"), (2.0, r"$p=2$"), (3.0, r"$p=3$")]:
+            ys = np.log2(p_val) + xs
+            ax.plot(
+                xs, ys, color=COLOR_BLACK, linestyle="--",
+                linewidth=0.6, alpha=0.6,
+            )
+            # Place label near top of line within axis bounds.
+            if ys[-1] < ax_ymax:
+                ax.text(
+                    xs[-1], ys[-1], lbl, fontsize=FONT_LEGEND * 0.85,
+                    ha="right", va="bottom", color=COLOR_BLACK, alpha=0.8,
+                )
+
+        ax.set_xlim(ax_xmin, ax_xmax)
+        ax.set_ylim(ax_ymin, ax_ymax)
+        ax.set_xlabel(r"$\log_2 \xi_i$ (driver, Hz scale)",
+                      fontsize=FONT_LABEL)
+        if ax is axes[0]:
+            ax.set_ylabel(r"$\log_2 \xi_j$ (response, Hz scale)",
+                          fontsize=FONT_LABEL)
+        ax.set_title(
+            rf"$h = {int(h_step)}$  ($t = {int(h_step) / float(fs_hz):.2f}$ s)",
+            fontsize=FONT_TITLE * 0.95,
+        )
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+        # Translate a few x-ticks to actual Hz for readability.
+        xt = ax.get_xticks()
+        ax.set_xticks(xt)
+        ax.set_xticklabels([
+            f"{2.0 ** v:.3g}" if np.isfinite(v) else "" for v in xt
+        ])
+        yt = ax.get_yticks()
+        ax.set_yticks(yt)
+        ax.set_yticklabels([
+            f"{2.0 ** v:.3g}" if np.isfinite(v) else "" for v in yt
+        ])
+
+    if sc is not None:
+        fig.subplots_adjust(right=0.88)
+        cbar_ax = fig.add_axes([0.90, 0.18, 0.018, 0.65])
+        cbar = fig.colorbar(sc, cax=cbar_ax)
+        cbar.set_label(
+            f"{metric_label} (log scale)" if log_color else metric_label,
+            fontsize=FONT_LABEL,
+        )
+        cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+        cbar.outline.set_linewidth(0.6)
+        cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+
+    # Single legend collected from one panel.
+    handles = []
+    for kind in _PHASE_KIND_ORDER:
+        if (long_df["kind"] == kind).any():
+            handles.append(plt.Line2D(
+                [0], [0],
+                marker=_PHASE_KIND_MARKER.get(kind, "x"),
+                color="white", markerfacecolor=COLOR_LIGHT_GRAY,
+                markeredgecolor=COLOR_BLACK, markersize=7,
+                linestyle="", label=kind,
+            ))
+    if handles:
+        fig.legend(
+            handles=handles, loc="lower center", ncol=len(handles),
+            frameon=False, fontsize=FONT_LEGEND * 0.95,
+            bbox_to_anchor=(0.45, -0.02),
+        )
+
+    fig.suptitle(
+        "Phase-harmonic forecast quality — comodulogram by horizon snapshot\n"
+        rf"axes = $(\log_2 \xi_i,\, \log_2 \xi_j)$;  dashed = harmonic ridges "
+        rf"$\xi_j = p\,\xi_i$;  $n$ = {n_samples} samples,  "
+        rf"$f_s = {fs_hz:g}$ Hz",
+        fontsize=FONT_TITLE * 0.95, y=1.02,
+    )
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    png_path = Path(str(output_path).replace(".pdf", ".png"))
+    if png_path != output_path:
+        fig.savefig(png_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 

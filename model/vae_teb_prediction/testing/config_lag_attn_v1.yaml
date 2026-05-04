@@ -126,23 +126,44 @@ dataset_config:
       - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
       - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
       - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
-    vae_test_datasets:
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
-#      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_no_cs.hdf5
-      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+    # ----- Test dataset configuration -----
+    #
+    # **Default mode is two-phase subgroup mode.** When
+    # ``vae_test_subgroups`` is non-empty (the shipped default below),
+    # ``run_full_test_pipeline_by_subgroup`` runs the standard pipeline
+    # once per subgroup into ``<output>/phase1/<subgroup>/`` and then
+    # post-processes the per-subgroup CSVs into
+    # ``<output>/phase2/cross_subgroup/``.
+    #
+    # To fall back to the legacy single-pass mode, clear
+    # ``vae_test_subgroups`` (set it to ``{}``) and populate
+    # ``vae_test_datasets`` with a flat list of HDF5 paths.
+    vae_test_subgroups:
+      healthy_no_bg_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+      healthy_no_bg_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+      healthy_bg_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+      healthy_bg_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+      acidosis_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+      acidosis_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+      hie_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+      hie_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
 
+    # Legacy single-pass fallback. Used only when ``vae_test_subgroups``
+    # is empty. Add paths back here if you need the legacy behaviour.
+    vae_test_datasets: []
+
+    # Optional alternative to vae_test_subgroups: point at one fold/test
+    # directory and the resolver auto-globs ``*.hdf5`` and uses the
+    # filename stem as the subgroup name.
+    # vae_test_fold_dir: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test
 
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/stats.hdf5                    # Path to normalization stats.hdf5
 

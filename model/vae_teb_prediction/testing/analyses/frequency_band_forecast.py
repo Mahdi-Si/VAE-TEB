@@ -59,6 +59,7 @@ from model.vae_teb_prediction.testing.collectors import (
 from model.vae_teb_prediction.testing.metrics import (
     compute_band_forecast_metrics,
     compute_per_channel_forecast_metrics,
+    compute_per_channel_per_horizon_forecast_metrics,
 )
 from model.vae_teb_prediction.testing.visualizers import (
     plot_band_anchor_error,
@@ -67,7 +68,10 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_band_horizon_error_by_class,
     plot_band_violin,
     plot_band_violin_by_class,
+    plot_freq_horizon_heatmap_phase_by_kind,
+    plot_freq_horizon_heatmap_scattering,
     plot_per_channel_mse_vs_freq,
+    plot_phase_comodulograms_by_horizon,
     plot_phase_harmonic_mse,
     unique_labels_in,
 )
@@ -101,8 +105,25 @@ def _emit_partition_plots(
     n_channels_by_label: Dict[str, int],
     decim_step_seconds: float,
     title_suffix: str,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> None:
-    """Emit the standard violin / horizon / anchor plots for one partition."""
+    """Emit the standard violin / horizon / anchor plots for one partition.
+
+    Args:
+        per_sample_df: Per-sample MSE / R² rows for this partition.
+        per_horizon_df: Per-horizon-step rows for this partition.
+        per_anchor_df: Per-anchor rows for this partition.
+        output_dir: Subdirectory for this partition's outputs.
+        n_channels_by_label: Channel count per band label, threaded into
+            violin tick annotations.
+        decim_step_seconds: Physical seconds per decimated step.
+        title_suffix: Partition name appended to the plot titles.
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` for the
+            partition (``None`` for ``by_kind`` where labels are
+            coefficient kinds rather than frequency bands). When
+            provided, every band axis-tick / legend / row-label is
+            suffixed with the explicit Hz range.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _safe_plot(
@@ -111,6 +132,7 @@ def _emit_partition_plots(
         output_dir / "band_mse_violin.pdf",
         title=f"Per-sample forecast MSE — {title_suffix}",
         n_channels_by_band=n_channels_by_label,
+        band_hz_ranges=band_hz_ranges,
     )
     _safe_plot(
         f"violin_r2_{title_suffix}", plot_band_violin,
@@ -118,16 +140,19 @@ def _emit_partition_plots(
         output_dir / "band_r2_violin.pdf",
         title=f"Per-sample forecast R² — {title_suffix}",
         n_channels_by_band=n_channels_by_label,
+        band_hz_ranges=band_hz_ranges,
     )
     _safe_plot(
         f"horizon_{title_suffix}", plot_band_horizon_error,
         per_horizon_df, output_dir / "band_horizon_error.pdf",
         value_col="mse",
+        band_hz_ranges=band_hz_ranges,
     )
     _safe_plot(
         f"anchor_{title_suffix}", plot_band_anchor_error,
         per_anchor_df, output_dir / "band_anchor_error.pdf",
         value_col="mse", decim_step_seconds=decim_step_seconds,
+        band_hz_ranges=band_hz_ranges,
     )
 
     classes = unique_labels_in(per_sample_df.get("label"))
@@ -138,6 +163,7 @@ def _emit_partition_plots(
             per_sample_df, "mse_total",
             output_dir / "band_mse_violin_by_class.pdf",
             title=f"Per-sample forecast MSE by class — {title_suffix}",
+            band_hz_ranges=band_hz_ranges,
         )
         _safe_plot(
             f"violin_r2_by_class_{title_suffix}",
@@ -145,6 +171,7 @@ def _emit_partition_plots(
             per_sample_df, "r2_total",
             output_dir / "band_r2_violin_by_class.pdf",
             title=f"Per-sample forecast R² by class — {title_suffix}",
+            band_hz_ranges=band_hz_ranges,
         )
         _safe_plot(
             f"horizon_by_class_{title_suffix}",
@@ -152,6 +179,7 @@ def _emit_partition_plots(
             per_horizon_df,
             output_dir / "band_horizon_error_by_class.pdf",
             value_col="mse",
+            band_hz_ranges=band_hz_ranges,
         )
         _safe_plot(
             f"anchor_by_class_{title_suffix}",
@@ -160,6 +188,7 @@ def _emit_partition_plots(
             output_dir / "band_anchor_error_by_class.pdf",
             value_col="mse",
             decim_step_seconds=decim_step_seconds,
+            band_hz_ranges=band_hz_ranges,
         )
 
 
@@ -300,6 +329,23 @@ def run_frequency_band_forecast_analysis(
     per_channel_rows: List[Dict[str, Any]] = []
     processed = 0
 
+    # ----- Streaming (channel x horizon-step) accumulator -------------
+    # Maintains running sum and sum-of-squares of the per-sample
+    # (per-anchor-averaged) MSE so that after the loop we can recover
+    # the cross-sample mean and standard error without holding the full
+    # tensor in memory. Sized lazily on the first batch since
+    # ``runner.horizon`` is the only place ``H_d`` is exposed.
+    n_total_channels = int(partition.n_total)
+    H_d_runner = int(runner.horizon)
+    ch_horizon_sum = np.zeros(
+        (n_total_channels, H_d_runner), dtype=np.float64,
+    )
+    ch_horizon_sumsq = np.zeros(
+        (n_total_channels, H_d_runner), dtype=np.float64,
+    )
+    ch_horizon_n_samples: int = 0
+    ch_horizon_total_anchors: int = 0  # samples * valid_anchors
+
     # Reused metadata per channel (kind / band / refined_band / octave /
     # primary freq / harmonic ratio) — looked up once and joined into
     # every per-channel record.
@@ -346,6 +392,17 @@ def run_frequency_band_forecast_analysis(
             per_channel_mse = per_channel["mse_per_channel"].detach().cpu().numpy()
             per_channel_r2 = per_channel["r2_per_channel"].detach().cpu().numpy()
 
+            # Per-(sample, channel, horizon-step) MSE for the
+            # frequency x horizon heatmap accumulator.
+            per_ch_h = compute_per_channel_per_horizon_forecast_metrics(
+                outputs["mu_full"], y_plus,
+                runner.warmup_steps, runner.horizon,
+            )
+            mse_bch_h = (
+                per_ch_h["mse_per_channel_per_horizon"].detach().cpu().numpy()
+            )  # (B, C, H_d)
+            n_valid_anchors_batch = int(per_ch_h["n_valid_anchors"].item())
+
             batch_size = int(outputs["mu_full"].size(0))
             sample_meta: List[Dict[str, Any]] = []
             for idx in range(batch_size):
@@ -359,6 +416,21 @@ def run_frequency_band_forecast_analysis(
             n_kept = len(sample_meta)
             if n_kept == 0:
                 break
+
+            # -------- (Channel x horizon) accumulator update --------
+            # Accumulate per-sample MSE (already averaged over the
+            # valid-anchor axis inside the metric helper) into running
+            # sums for the post-loop mean / SE computation. Truncates to
+            # ``n_kept`` so we never count samples beyond ``max_samples``.
+            if n_valid_anchors_batch > 0 and mse_bch_h.shape[0] > 0:
+                kept_slice = mse_bch_h[:n_kept]                  # (n_kept, C, H_d)
+                if kept_slice.shape[0] > 0:
+                    ch_horizon_sum += kept_slice.sum(axis=0)
+                    ch_horizon_sumsq += np.square(kept_slice).sum(axis=0)
+                    ch_horizon_n_samples += int(kept_slice.shape[0])
+                    ch_horizon_total_anchors += int(
+                        kept_slice.shape[0] * n_valid_anchors_batch
+                    )
 
             # -------- Per-partition: build long-format rows --------
             for pname in _PARTITION_NAMES:
@@ -475,11 +547,24 @@ def run_frequency_band_forecast_analysis(
             label: int(partition_idx_by_partition[pname][label].size)
             for label in non_empty
         }
+        # Per-partition Hz cutoffs for explicit "(lo–hi Hz)" axis labels.
+        # ``by_kind`` deliberately has no Hz ranges (its labels are
+        # coefficient kinds, not frequency bands) and falls through to
+        # the bare-name formatter.
+        if pname == "clinical_4band":
+            partition_hz_ranges = dict(partition.band_hz_ranges)
+        elif pname == "clinical_7band":
+            partition_hz_ranges = dict(partition.refined7_hz_ranges)
+        elif pname == "by_octave":
+            partition_hz_ranges = dict(partition.octave_hz_ranges)
+        else:
+            partition_hz_ranges = None
         _emit_partition_plots(
             per_sample_df, per_horizon_df, per_anchor_df, sub_dir,
             n_channels_by_label=n_channels_by_label,
             decim_step_seconds=decim_step_seconds,
             title_suffix=pname,
+            band_hz_ranges=partition_hz_ranges,
         )
 
         by_label, by_label_and_class = _summarise_partition(
@@ -581,6 +666,125 @@ def run_frequency_band_forecast_analysis(
             "phase_kind_mse": phase_kind_mse,
         }
 
+    # ----- Channel x horizon-step heatmap (freq_horizon/) --------------
+    freq_horizon_summary: Dict[str, Any] = {}
+    freq_horizon_paths: Dict[str, str] = {}
+    if ch_horizon_n_samples > 0:
+        freq_horizon_dir = output_dir / "freq_horizon"
+        freq_horizon_dir.mkdir(parents=True, exist_ok=True)
+
+        n = float(ch_horizon_n_samples)
+        mse_mean_grid = ch_horizon_sum / n                       # (C, H_d)
+        if ch_horizon_n_samples >= 2:
+            # Population variance of per-sample MSE -> SE of the mean.
+            var_grid = (
+                ch_horizon_sumsq / n - np.square(mse_mean_grid)
+            )
+            var_grid = np.clip(var_grid, a_min=0.0, a_max=None)
+            mse_se_grid = np.sqrt(var_grid * n / (n - 1.0)) / np.sqrt(n)
+        else:
+            mse_se_grid = np.zeros_like(mse_mean_grid)
+
+        # Long-form CSV: one row per (channel, horizon-step), enriched
+        # with the channel metadata so downstream tools never have to
+        # re-derive the Hz mapping.
+        long_rows: List[Dict[str, Any]] = []
+        n_ch_grid, H_d_grid = mse_mean_grid.shape
+        for ch in range(n_ch_grid):
+            info = channel_meta_lookup.get(ch, {})
+            for h in range(H_d_grid):
+                long_rows.append({
+                    "channel": int(ch),
+                    "kind": info.get("kind"),
+                    "band": info.get("band"),
+                    "refined_band": info.get("refined_band"),
+                    "octave": info.get("octave"),
+                    "freq_hz_primary": info.get("freq_hz_primary"),
+                    "freq_hz_secondary": info.get("freq_hz_secondary"),
+                    "harmonic_ratio": info.get("harmonic_ratio"),
+                    "h": int(h),
+                    "t_seconds": float(h) / float(fs),
+                    "mse_mean": float(mse_mean_grid[ch, h]),
+                    "mse_se": float(mse_se_grid[ch, h]),
+                    "n_samples": int(ch_horizon_n_samples),
+                })
+        long_df = pd.DataFrame(long_rows)
+        long_csv = freq_horizon_dir / "channel_horizon_mse.csv"
+        long_df.to_csv(long_csv, index=False)
+        freq_horizon_paths["channel_horizon_mse_csv"] = str(long_csv)
+
+        # Wide pivot for trivial replotting + sibling Hz axis CSV.
+        wide_df = pd.DataFrame(
+            mse_mean_grid,
+            columns=[f"h{h}" for h in range(H_d_grid)],
+        )
+        wide_df.insert(0, "channel", np.arange(n_ch_grid, dtype=int))
+        wide_csv = freq_horizon_dir / "channel_horizon_mse_matrix.csv"
+        wide_df.to_csv(wide_csv, index=False)
+        freq_horizon_paths["channel_horizon_mse_matrix_csv"] = str(wide_csv)
+
+        freq_axis_df = channel_meta_df.copy()
+        freq_axis_csv = freq_horizon_dir / "channel_horizon_mse_freq_hz.csv"
+        freq_axis_df.to_csv(freq_axis_csv, index=False)
+        freq_horizon_paths["channel_horizon_mse_freq_hz_csv"] = str(freq_axis_csv)
+
+        # Scattering heatmap (st_S0 + st_S1, freq-sorted descending).
+        st_mask = channel_meta_df["kind"].isin(["st_S0", "st_S1"]).to_numpy()
+        st_channels = channel_meta_df.loc[st_mask, "channel"].astype(int).to_numpy()
+        st_freqs = channel_meta_df.loc[st_mask, "freq_hz_primary"].astype(float).to_numpy()
+        if st_channels.size > 0:
+            # Sort by Hz descending; NaN frequencies (S_0 / DC) sink to bottom.
+            sort_keys = np.where(np.isnan(st_freqs), -np.inf, st_freqs)
+            sort_order = np.argsort(-sort_keys, kind="stable")
+            st_channels_sorted = st_channels[sort_order]
+            st_freqs_sorted = st_freqs[sort_order]
+            st_grid = mse_mean_grid[st_channels_sorted, :]
+            scat_pdf = freq_horizon_dir / "scattering_freq_horizon_heatmap.pdf"
+            _safe_plot(
+                "scattering_freq_horizon_heatmap",
+                plot_freq_horizon_heatmap_scattering,
+                st_grid, st_freqs_sorted, st_channels_sorted,
+                int(H_d_grid), float(fs), scat_pdf,
+                n_samples=int(ch_horizon_n_samples),
+                n_anchors_total=int(ch_horizon_total_anchors),
+            )
+            freq_horizon_paths["scattering_heatmap_pdf"] = str(scat_pdf)
+
+        # Phase-by-kind heatmap.
+        ph_mask = channel_meta_df["kind"].isin(
+            ["ph_diag", "ph_h2", "ph_h3", "ph_other"]
+        ).to_numpy()
+        if ph_mask.any():
+            ph_long_df = long_df[long_df["channel"].isin(
+                channel_meta_df.loc[ph_mask, "channel"].astype(int).tolist()
+            )].copy()
+            ph_pdf = freq_horizon_dir / "phase_freq_horizon_heatmap_by_kind.pdf"
+            _safe_plot(
+                "phase_freq_horizon_heatmap_by_kind",
+                plot_freq_horizon_heatmap_phase_by_kind,
+                ph_long_df, int(H_d_grid), float(fs), ph_pdf,
+                n_samples=int(ch_horizon_n_samples),
+            )
+            freq_horizon_paths["phase_by_kind_heatmap_pdf"] = str(ph_pdf)
+
+            como_pdf = freq_horizon_dir / "phase_comodulograms_by_horizon.pdf"
+            _safe_plot(
+                "phase_comodulograms_by_horizon",
+                plot_phase_comodulograms_by_horizon,
+                ph_long_df, int(H_d_grid), float(fs), como_pdf,
+                n_samples=int(ch_horizon_n_samples),
+            )
+            freq_horizon_paths["phase_comodulograms_pdf"] = str(como_pdf)
+
+        freq_horizon_summary = {
+            "n_samples": int(ch_horizon_n_samples),
+            "n_anchors_total": int(ch_horizon_total_anchors),
+            "n_channels": int(n_ch_grid),
+            "horizon": int(H_d_grid),
+            "fs_hz": float(fs),
+            "saved_files": list(freq_horizon_paths.values()),
+        }
+
     # ----- Combined summary.json --------------------------------------
     legacy_summary = per_partition_summary.get(_LEGACY_DUPLICATED, {})
     legacy_per_band = legacy_summary.get("by_band", {})
@@ -606,6 +810,7 @@ def run_frequency_band_forecast_analysis(
         # New: complete per-partition view + per-channel diagnostics.
         "partitions": per_partition_summary,
         "per_channel": per_channel_summary,
+        "freq_horizon": freq_horizon_summary,
     }
 
     summary_path = output_dir / "summary.json"
@@ -617,6 +822,7 @@ def run_frequency_band_forecast_analysis(
     summary["summary_json"] = str(summary_path)
     summary["partition_paths"] = per_partition_paths
     summary["per_channel_paths"] = per_channel_paths
+    summary["freq_horizon_paths"] = freq_horizon_paths
     # Legacy top-level paths (back-compat duplicates of clinical_4band).
     if _LEGACY_DUPLICATED in per_partition_paths:
         summary["per_sample_csv"] = str(output_dir / "per_sample.csv")

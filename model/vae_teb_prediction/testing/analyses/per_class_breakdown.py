@@ -60,30 +60,45 @@ def _filter_by_label(df: pd.DataFrame, label: int) -> pd.DataFrame:
 
 
 def _emit_overlay_for_metric(
-    per_class_dfs: Dict[int, pd.DataFrame],
+    per_class_dfs: Dict[Any, pd.DataFrame],
     metric_col: str,
     out_path: Path,
     *,
     bins: int = 30,
     log: bool = False,
+    colors: Optional[Dict[Any, str]] = None,
+    names: Optional[Dict[Any, str]] = None,
+    title_suffix: str = "by class",
 ) -> None:
-    """Overlay histograms of one metric column across the three classes."""
+    """Overlay histograms of one metric column across multiple subsets.
+
+    The helper is generic over the dictionary key type. By default it
+    uses the canonical clinical class palette (``CLASS_COLORS`` /
+    ``CLASS_NAMES``), so existing per-class callers behave unchanged.
+    Pass ``colors`` / ``names`` keyed by any other identifier (e.g.
+    subgroup name) to reuse the same overlay layout for cross-subgroup
+    comparisons.
+    """
+    color_map = colors if colors is not None else CLASS_COLORS
+    name_map = names if names is not None else CLASS_NAMES
     fig, ax = plt.subplots(figsize=(5.0, 3.4))
     any_data = False
-    for label_id, df in per_class_dfs.items():
+    for key, df in per_class_dfs.items():
         if metric_col not in df.columns:
             continue
         vals = df[metric_col].to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
             continue
+        color = color_map.get(key, "#888888")
+        display = name_map.get(key, str(key))
         ax.hist(
             vals,
             bins=bins,
             histtype="stepfilled",
-            color=CLASS_COLORS[label_id],
+            color=color,
             alpha=0.4,
-            label=f"{CLASS_NAMES[label_id]} (n={vals.size})",
+            label=f"{display} (n={vals.size})",
             density=True,
         )
         any_data = True
@@ -94,7 +109,7 @@ def _emit_overlay_for_metric(
         ax.set_xscale("log")
     ax.set_xlabel(metric_col)
     ax.set_ylabel("density")
-    ax.set_title(f"{metric_col} by class")
+    ax.set_title(f"{metric_col} {title_suffix}")
     ax.legend(loc="best", frameon=True)
     _style_axes(ax)
     fig.tight_layout()
@@ -103,16 +118,25 @@ def _emit_overlay_for_metric(
 
 
 def _emit_horizon_overlay(
-    per_class_dfs: Dict[int, pd.DataFrame],
+    per_class_dfs: Dict[Any, pd.DataFrame],
     metric_col: str,
     out_path: Path,
     *,
     x_col: str = "h",
+    colors: Optional[Dict[Any, str]] = None,
+    names: Optional[Dict[Any, str]] = None,
+    title_suffix: str = "by class",
 ) -> None:
-    """Line plot of ``metric_col`` aggregated over an x-axis grouping."""
+    """Line plot of ``metric_col`` aggregated over an x-axis grouping.
+
+    Generic over the dictionary key type. See ``_emit_overlay_for_metric``
+    for the ``colors`` / ``names`` override semantics.
+    """
+    color_map = colors if colors is not None else CLASS_COLORS
+    name_map = names if names is not None else CLASS_NAMES
     fig, ax = plt.subplots(figsize=(5.4, 3.4))
     any_data = False
-    for label_id, df in per_class_dfs.items():
+    for key, df in per_class_dfs.items():
         if x_col not in df.columns or metric_col not in df.columns:
             continue
         grouped = df.groupby(x_col)[metric_col]
@@ -122,17 +146,19 @@ def _emit_horizon_overlay(
         if median.empty:
             continue
         x_vals = np.asarray(median.index.to_list(), dtype=float)
+        color = color_map.get(key, "#888888")
+        display = name_map.get(key, str(key))
         ax.plot(
             x_vals,
             median.values,
-            color=CLASS_COLORS[label_id],
-            label=f"{CLASS_NAMES[label_id]} (n={len(df)})",
+            color=color,
+            label=f"{display} (n={len(df)})",
         )
         ax.fill_between(
             x_vals,
             q1.values,
             q3.values,
-            color=CLASS_COLORS[label_id],
+            color=color,
             alpha=0.18,
             lw=0,
         )
@@ -142,7 +168,7 @@ def _emit_horizon_overlay(
         return
     ax.set_xlabel(x_col)
     ax.set_ylabel(f"{metric_col} (median, IQR)")
-    ax.set_title(f"{metric_col} vs {x_col} by class")
+    ax.set_title(f"{metric_col} vs {x_col} {title_suffix}")
     ax.legend(loc="best", frameon=True)
     _style_axes(ax)
     fig.tight_layout()
@@ -577,6 +603,23 @@ def run_per_class_breakdown(
         Dict mapping each processed analysis name to its summary status.
     """
     output_root = Path(output_root)
+
+    # Guard: the post-processor is only meaningful when the input CSV
+    # carries more than one class. The headline ``histogram_metrics.csv``
+    # is the canonical sentinel — if it has fewer than 2 distinct labels,
+    # every downstream split would be degenerate (one non-empty class
+    # folder, single-class overlays). Bail early instead.
+    headline = output_root / "histograms" / "histogram_metrics.csv"
+    headline_df = _load_csv(headline)
+    if headline_df is not None and "label" in headline_df.columns:
+        n_classes = int(headline_df["label"].dropna().nunique())
+        if n_classes < 2:
+            logger.info(
+                f"per_class_breakdown: skipped (only {n_classes} class "
+                f"present in {headline.name} — nothing to split)."
+            )
+            return {"status": "skipped_single_class", "n_classes": n_classes}
+
     overlay_dir = output_root / "per_class_breakdown" / "class_overlay"
     overlay_dir.mkdir(parents=True, exist_ok=True)
 
