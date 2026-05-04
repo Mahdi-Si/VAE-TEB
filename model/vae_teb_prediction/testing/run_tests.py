@@ -65,6 +65,76 @@ from hdf5_dataset.hdf5_dataset import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 process-pool helpers (one subgroup per GPU, used by
+# :func:`run_full_test_pipeline_by_subgroup` when ``gpu_ids`` selects more
+# than one GPU). Defined at module scope so they are picklable for the
+# ``spawn``-context :class:`concurrent.futures.ProcessPoolExecutor`.
+# ---------------------------------------------------------------------------
+
+
+def _phase1_worker_init(gpu_queue: Any) -> None:
+    """ProcessPoolExecutor initializer: pin this worker to one GPU.
+
+    Pulls a single GPU id from ``gpu_queue`` and exports
+    ``CUDA_VISIBLE_DEVICES`` in this child process. From the worker's
+    perspective the assigned physical GPU then appears as ``cuda:0``,
+    so downstream code can pass ``device="cuda:0"`` and it will land
+    on the right card regardless of which physical id was claimed.
+
+    The export happens here, before any CUDA call in this process —
+    the module-level ``import torch`` at the top of this file does not
+    initialise CUDA (it only imports the package), so the env-var
+    change is honoured by the first ``torch.device('cuda:0')`` /
+    ``model.to(device)`` call inside the task.
+    """
+    import os
+    try:
+        gpu_id = gpu_queue.get_nowait()
+    except Exception:
+        return
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(gpu_id))
+
+
+def _run_phase1_subgroup_task(
+    sg_name: str,
+    sg_paths: List[str],
+    sg_out: str,
+    pipeline_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """ProcessPoolExecutor task: run one subgroup's full Phase 1 pipeline.
+
+    Imports ``run_full_test_pipeline`` lazily so any
+    ``CUDA_VISIBLE_DEVICES`` set by :func:`_phase1_worker_init` is in
+    place by the time the runner constructs its first CUDA tensor.
+    """
+    import os
+    from loguru import logger as _worker_logger
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+    _worker_logger.info(
+        f"[phase1 worker pid={os.getpid()} cuda_visible={visible}] "
+        f"starting subgroup {sg_name!r}"
+    )
+    try:
+        result = run_full_test_pipeline(
+            data_path=list(sg_paths),
+            output_dir=sg_out,
+            **pipeline_kwargs,
+        )
+        _worker_logger.info(
+            f"[phase1 worker pid={os.getpid()}] "
+            f"subgroup {sg_name!r} complete."
+        )
+        return result if isinstance(result, dict) else {"status": "ok"}
+    except Exception as exc:  # noqa: BLE001
+        _worker_logger.error(
+            f"[phase1 worker pid={os.getpid()}] "
+            f"subgroup {sg_name!r} failed: {exc!r}"
+        )
+        return {"error": str(exc)}
+
+
 def run_full_test_pipeline(
     checkpoint_path: Optional[str],
     data_path: Optional[Union[str, List[str]]],
@@ -831,6 +901,7 @@ def run_full_test_pipeline_by_subgroup(
     skip_frequency_band: bool = False,
     skip_phase2: bool = False,
     only_subgroups: Optional[Sequence[str]] = None,
+    gpu_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """Run the testing pipeline per outcome subgroup, then compare cross-subgroup.
 
@@ -889,6 +960,17 @@ def run_full_test_pipeline_by_subgroup(
             mapping before iteration (resume convenience). Phase 2 still
             runs against whatever ``phase1/<name>/`` folders exist on
             disk after iteration completes.
+        gpu_ids: Optional list of physical GPU ids to use for Phase 1.
+            When the list has $\\ge 2$ entries the subgroup loop is
+            dispatched via a ``spawn``-context
+            :class:`concurrent.futures.ProcessPoolExecutor` with one
+            worker process per GPU; each worker is pinned to its GPU
+            via ``CUDA_VISIBLE_DEVICES`` and runs every subgroup it is
+            assigned sequentially on that GPU. The pool's ``__exit__``
+            joins all workers so Phase 2 only ever starts after every
+            subgroup has finished writing its outputs. When ``gpu_ids``
+            is ``None`` or contains a single id the original sequential
+            loop is used (no behaviour change for single-GPU users).
 
     Returns:
         ``{"phase1": {name: results_or_error_dict, ...},
@@ -955,42 +1037,170 @@ def run_full_test_pipeline_by_subgroup(
     logger.info("=" * 70)
 
     phase1_results: Dict[str, Any] = {}
-    for sg_name, sg_paths in resolved_subgroups.items():
-        sg_out = base_path / "phase1" / sg_name
-        logger.info("\n" + "#" * 70)
-        logger.info(f"# Phase 1: subgroup {sg_name!r} ({len(list(sg_paths))} file(s))")
-        logger.info(f"# Output: {sg_out}")
-        logger.info("#" * 70)
-        try:
-            phase1_results[sg_name] = run_full_test_pipeline(
-                checkpoint_path=checkpoint_path,
-                data_path=list(sg_paths),
-                output_dir=str(sg_out),
-                stats_path=stats_path,
-                config_path=config_path,
-                device=device,
-                max_samples=max_samples,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                skip_trajectory=skip_trajectory,
-                skip_attention=skip_attention,
-                skip_forecast_heatmaps=skip_forecast_heatmaps,
-                skip_kld_pca=skip_kld_pca,
-                skip_per_class_breakdown=True,   # belt-and-braces
-                skip_interactive=skip_interactive,
-                analysis_samples=analysis_samples,
-                min_epochs_per_guid=min_epochs_per_guid,
-                max_guids=max_guids,
-                normalize_fields=normalize_fields,
-                dataset_kwargs=dataset_kwargs,
-                skip_up_effect=skip_up_effect,
-                skip_frequency_band=skip_frequency_band,
-                single_class_mode=True,
+
+    # Decide whether to dispatch Phase 1 in parallel across multiple
+    # GPUs. With $\le 1$ GPU listed, fall through to the original
+    # sequential loop (zero behaviour change for single-GPU runs).
+    gpu_ids_list: List[int] = (
+        [int(g) for g in gpu_ids] if gpu_ids is not None else []
+    )
+    if len(gpu_ids_list) >= 2 and torch.cuda.is_available():
+        # Trim to actual visible device count if the caller over-listed.
+        n_visible = torch.cuda.device_count()
+        if max(gpu_ids_list) >= n_visible:
+            logger.warning(
+                f"gpu_ids contains ids >= cuda device_count={n_visible}; "
+                f"trimming to visible ids."
             )
-            logger.info(f"# Phase 1 subgroup {sg_name!r} complete.")
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"# Phase 1 subgroup {sg_name!r} failed: {exc}")
-            phase1_results[sg_name] = {"error": str(exc)}
+            gpu_ids_list = [g for g in gpu_ids_list if g < n_visible]
+    use_parallel = len(gpu_ids_list) >= 2
+
+    if use_parallel:
+        # ----- Parallel path: one subgroup per GPU at a time -----
+        # Each worker process is pinned to a single physical GPU via
+        # ``CUDA_VISIBLE_DEVICES`` and sees its card as ``cuda:0``.
+        # Phase 2 below the ``with`` block is guaranteed to run after
+        # *every* worker has joined, because
+        # :class:`ProcessPoolExecutor`'s ``__exit__`` calls
+        # ``shutdown(wait=True)``.
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        n_workers = min(len(gpu_ids_list), len(resolved_subgroups))
+        logger.info("\n" + "#" * 70)
+        logger.info(
+            f"# Phase 1 (parallel): dispatching {len(resolved_subgroups)} "
+            f"subgroup(s) across {n_workers} GPU worker(s) "
+            f"gpu_ids={gpu_ids_list[:n_workers]}"
+        )
+        logger.info("#" * 70)
+
+        ctx = mp.get_context("spawn")
+        gpu_queue = ctx.Queue()
+        for gid in gpu_ids_list[:n_workers]:
+            gpu_queue.put(int(gid))
+
+        # Static kwargs every worker shares. ``device='cuda:0'`` is
+        # correct because ``CUDA_VISIBLE_DEVICES`` masks the real id.
+        parallel_kwargs: Dict[str, Any] = dict(
+            checkpoint_path=checkpoint_path,
+            stats_path=stats_path,
+            config_path=str(config_path) if config_path is not None else None,
+            device="cuda:0",
+            max_samples=max_samples,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            skip_trajectory=skip_trajectory,
+            skip_attention=skip_attention,
+            skip_forecast_heatmaps=skip_forecast_heatmaps,
+            skip_kld_pca=skip_kld_pca,
+            skip_per_class_breakdown=True,   # belt-and-braces
+            skip_interactive=skip_interactive,
+            analysis_samples=analysis_samples,
+            min_epochs_per_guid=min_epochs_per_guid,
+            max_guids=max_guids,
+            normalize_fields=(
+                list(normalize_fields) if normalize_fields is not None else None
+            ),
+            dataset_kwargs=(
+                dict(dataset_kwargs) if dataset_kwargs is not None else None
+            ),
+            skip_up_effect=skip_up_effect,
+            skip_frequency_band=skip_frequency_band,
+            single_class_mode=True,
+        )
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_phase1_worker_init,
+            initargs=(gpu_queue,),
+        ) as executor:
+            future_to_sg: Dict[Any, str] = {}
+            for sg_name, sg_paths in resolved_subgroups.items():
+                sg_out = base_path / "phase1" / sg_name
+                sg_out.mkdir(parents=True, exist_ok=True)
+                logger.info(
+                    f"# Phase 1 (parallel): queued subgroup {sg_name!r} "
+                    f"({len(list(sg_paths))} file(s)) -> {sg_out}"
+                )
+                fut = executor.submit(
+                    _run_phase1_subgroup_task,
+                    sg_name,
+                    list(sg_paths),
+                    str(sg_out),
+                    parallel_kwargs,
+                )
+                future_to_sg[fut] = sg_name
+
+            for fut in as_completed(future_to_sg):
+                sg_name = future_to_sg[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        f"# Phase 1 subgroup {sg_name!r} worker raised: {exc}"
+                    )
+                    phase1_results[sg_name] = {"error": str(exc)}
+                    continue
+                if isinstance(result, dict) and "error" in result:
+                    logger.error(
+                        f"# Phase 1 subgroup {sg_name!r} failed: "
+                        f"{result['error']}"
+                    )
+                else:
+                    logger.info(
+                        f"# Phase 1 subgroup {sg_name!r} complete."
+                    )
+                phase1_results[sg_name] = result
+        # Executor's ``with`` block exited => every worker has joined
+        # and every Phase 1 subgroup has flushed its outputs to disk.
+        logger.info(
+            f"# Phase 1 (parallel) complete: "
+            f"{len(phase1_results)}/{len(resolved_subgroups)} subgroup(s) "
+            f"finished."
+        )
+    else:
+        # ----- Sequential path (single GPU / CPU; original behaviour) -----
+        for sg_name, sg_paths in resolved_subgroups.items():
+            sg_out = base_path / "phase1" / sg_name
+            logger.info("\n" + "#" * 70)
+            logger.info(
+                f"# Phase 1: subgroup {sg_name!r} "
+                f"({len(list(sg_paths))} file(s))"
+            )
+            logger.info(f"# Output: {sg_out}")
+            logger.info("#" * 70)
+            try:
+                phase1_results[sg_name] = run_full_test_pipeline(
+                    checkpoint_path=checkpoint_path,
+                    data_path=list(sg_paths),
+                    output_dir=str(sg_out),
+                    stats_path=stats_path,
+                    config_path=config_path,
+                    device=device,
+                    max_samples=max_samples,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    skip_trajectory=skip_trajectory,
+                    skip_attention=skip_attention,
+                    skip_forecast_heatmaps=skip_forecast_heatmaps,
+                    skip_kld_pca=skip_kld_pca,
+                    skip_per_class_breakdown=True,   # belt-and-braces
+                    skip_interactive=skip_interactive,
+                    analysis_samples=analysis_samples,
+                    min_epochs_per_guid=min_epochs_per_guid,
+                    max_guids=max_guids,
+                    normalize_fields=normalize_fields,
+                    dataset_kwargs=dataset_kwargs,
+                    skip_up_effect=skip_up_effect,
+                    skip_frequency_band=skip_frequency_band,
+                    single_class_mode=True,
+                )
+                logger.info(f"# Phase 1 subgroup {sg_name!r} complete.")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"# Phase 1 subgroup {sg_name!r} failed: {exc}")
+                phase1_results[sg_name] = {"error": str(exc)}
 
     # ----- Phase 2: cross-subgroup post-processor -----
     phase2_results: Any = None
@@ -1392,6 +1602,7 @@ if __name__ == "__main__":
     # ``vae_test_subgroups`` (or ``vae_test_fold_dir``) → two-phase driver.
     # Otherwise fall back to the legacy single-pass pipeline.
     _subgroup_map = {}
+    _gpu_ids: Optional[List[int]] = None
     if CONFIG is not None:
         try:
             from model.vae_teb_prediction.testing.analyses.subgroup_utils import (
@@ -1403,11 +1614,38 @@ if __name__ == "__main__":
                 f"Subgroup resolution failed ({exc!r}); falling back to "
                 f"the legacy single-pass pipeline."
             )
+        # Optional Phase 1 multi-GPU dispatch. Read
+        # ``dataset_config.test_gpu_ids`` (preferred) or, as a
+        # convenience fallback, ``trainer.cuda_devices`` from the
+        # testing config. When the resolved list has $\ge 2$ entries
+        # ``run_full_test_pipeline_by_subgroup`` runs each subgroup on
+        # its own GPU via a process pool; with $\le 1$ entry the
+        # original sequential loop is used.
+        try:
+            with open(CONFIG, "r", encoding="utf-8") as _fh:
+                _cfg = yaml.safe_load(_fh) or {}
+            _ds_cfg = _cfg.get("dataset_config", {}) or {}
+            _trainer_cfg = _cfg.get("trainer", {}) or {}
+            _raw_ids = _ds_cfg.get("test_gpu_ids")
+            if _raw_ids is None:
+                _raw_ids = _trainer_cfg.get("cuda_devices")
+            if isinstance(_raw_ids, (list, tuple)) and _raw_ids:
+                _gpu_ids = [int(g) for g in _raw_ids]
+                logger.info(
+                    f"__main__: resolved Phase 1 gpu_ids={_gpu_ids} "
+                    f"from config."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Failed to read test_gpu_ids from config ({exc!r}); "
+                f"falling back to single-GPU sequential dispatch."
+            )
 
     if len(_subgroup_map) >= 2:
         logger.info(
             f"__main__: dispatching to run_full_test_pipeline_by_subgroup "
-            f"({len(_subgroup_map)} subgroups)."
+            f"({len(_subgroup_map)} subgroups, "
+            f"gpu_ids={_gpu_ids if _gpu_ids else 'sequential'})."
         )
         results = run_full_test_pipeline_by_subgroup(
             subgroups=_subgroup_map,
@@ -1417,6 +1655,7 @@ if __name__ == "__main__":
             config_path=CONFIG,
             max_samples=None,
             analysis_samples=400,
+            gpu_ids=_gpu_ids,
         )
     else:
         logger.info(
