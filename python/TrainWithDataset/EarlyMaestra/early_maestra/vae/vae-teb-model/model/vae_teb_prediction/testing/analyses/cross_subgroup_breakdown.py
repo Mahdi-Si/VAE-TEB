@@ -26,7 +26,13 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from model.vae_teb_prediction.testing.visualizers import _style_axes
+from model.vae_teb_prediction.testing.visualizers import (
+    _style_axes,
+    plot_aggregate_kld_violins,
+    plot_kld_per_dim_heatmap,
+    plot_kld_trajectory_by_group,
+    plot_pc12_mean_trajectory_overlay,
+)
 from model.vae_teb_prediction.testing.analyses.per_class_breakdown import (
     _emit_horizon_overlay,
     _emit_overlay_for_metric,
@@ -529,6 +535,136 @@ def _process_kld_pca(
     return {"status": "ok", "n_subgroups": len(per_sg)}
 
 
+def _concat_with_subgroup(
+    per_sg: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Concatenate per-subgroup DataFrames into one, tagging each row with ``subgroup``.
+
+    Helper for the cross-subgroup KLD overlays below — every plot
+    primitive expects a single long DataFrame plus a ``group_col`` to
+    pivot/aggregate on, which matches the shape we want once each
+    subgroup's own ``subgroup`` column is added.
+    """
+    frames: List[pd.DataFrame] = []
+    for sg, df in per_sg.items():
+        if df is None or df.empty:
+            continue
+        out = df.copy()
+        out["subgroup"] = sg
+        frames.append(out)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _process_kld_trajectory_overlay(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Mean ± SE of ``kld_mean`` over timestep, one ribbon per subgroup."""
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "kld_pca/kld_pc_trajectory.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    if "timestep" not in combined.columns or "kld_mean" not in combined.columns:
+        return {"status": "missing_columns"}
+    plot_kld_trajectory_by_group(
+        combined,
+        overlay_dir / "kld_trajectory_overlay.pdf",
+        group_col="subgroup",
+        metric_col="kld_mean",
+        time_col="timestep",
+        title="KLD trajectory by subgroup (mean ± SE)",
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+def _process_kld_per_dim_subgroup(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Per-latent-dim mean KLD heatmap, columns = subgroup."""
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "histograms/histogram_metrics.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    # Infer d_z from the present ``kld_dim_*`` columns rather than
+    # hardcoding it: the model's latent width is recoverable directly
+    # from what was written.
+    dim_idx: List[int] = []
+    for c in combined.columns:
+        if isinstance(c, str) and c.startswith("kld_dim_"):
+            tail = c.split("_", 2)[-1]
+            try:
+                dim_idx.append(int(tail))
+            except ValueError:
+                continue
+    if not dim_idx:
+        return {"status": "missing_per_dim"}
+    d_z = max(dim_idx) + 1
+    n_per_subgroup = {sg: int(len(df)) for sg, df in per_sg.items()}
+    plot_kld_per_dim_heatmap(
+        combined, d_z,
+        overlay_dir / "kld_per_dim_by_subgroup_heatmap.pdf",
+        group_col="subgroup",
+        n_samples_per_group=n_per_subgroup,
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg), "d_z": d_z}
+
+
+def _process_kld_pc_mean_trajectory(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Per-subgroup mean trajectory in the (PC1, PC2) plane with arrows."""
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "kld_pca/kld_pc_trajectory.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    needed = {"timestep", "kld_pc1_t", "kld_pc2_t"}
+    if not needed.issubset(combined.columns):
+        return {"status": "missing_columns"}
+    plot_pc12_mean_trajectory_overlay(
+        combined,
+        overlay_dir / "kld_pc12_mean_trajectory_overlay.pdf",
+        group_col="subgroup",
+        time_col="timestep",
+        pc1_col="kld_pc1_t",
+        pc2_col="kld_pc2_t",
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+def _process_kld_aggregate_violins(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Side-by-side violins of ``kld_mean / kld_sum / kld_l2`` by subgroup."""
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "histograms/histogram_metrics.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    plot_aggregate_kld_violins(
+        combined,
+        overlay_dir / "kld_aggregate_violins.pdf",
+        group_col="subgroup",
+        metric_cols=("kld_mean", "kld_sum", "kld_l2"),
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
 # ---------------------------------------------------------------------------
 # Statistical comparison
 # ---------------------------------------------------------------------------
@@ -808,6 +944,22 @@ def run_cross_subgroup_breakdown(
         "uplift":        lambda: _process_uplift(phase1_root, overlay_dir, subgroups),
         "te_lag":        lambda: _process_te_lag(phase1_root, overlay_dir, subgroups),
         "kld_pca":       lambda: _process_kld_pca(phase1_root, overlay_dir, subgroups),
+        "kld_trajectory":
+            lambda: _process_kld_trajectory_overlay(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_per_dim_subgroup":
+            lambda: _process_kld_per_dim_subgroup(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_pc_mean_trajectory":
+            lambda: _process_kld_pc_mean_trajectory(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_aggregate_violins":
+            lambda: _process_kld_aggregate_violins(
+                phase1_root, overlay_dir, subgroups,
+            ),
         "stats":         lambda: _process_stats(phase1_root, output_dir, subgroups),
         "summary":       lambda: _process_grand_summary(
             phase1_root, output_dir, subgroups,

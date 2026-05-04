@@ -66,6 +66,9 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_band_anchor_error_by_class,
     plot_band_horizon_error,
     plot_band_horizon_error_by_class,
+    plot_band_horizon_heatmap,
+    plot_band_horizon_meanse_lines,
+    plot_channel_horizon_heatmap_band_grouped,
     plot_band_violin,
     plot_band_violin_by_class,
     plot_freq_horizon_heatmap_phase_by_kind,
@@ -106,6 +109,9 @@ def _emit_partition_plots(
     decim_step_seconds: float,
     title_suffix: str,
     band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    horizon: Optional[int] = None,
+    fs_hz: Optional[float] = None,
+    n_unique_samples: Optional[int] = None,
 ) -> None:
     """Emit the standard violin / horizon / anchor plots for one partition.
 
@@ -123,6 +129,14 @@ def _emit_partition_plots(
             coefficient kinds rather than frequency bands). When
             provided, every band axis-tick / legend / row-label is
             suffixed with the explicit Hz range.
+        horizon: Forecast horizon $H_d$. When provided together with
+            ``fs_hz``, two extra horizon plots are emitted: a
+            band $\\times$ horizon-step mean-MSE heatmap and a
+            mean $\\pm$ SE line plot with right-edge band labels.
+        fs_hz: Sampling frequency in Hz (for the same two extra plots).
+        n_unique_samples: Number of unique samples backing this
+            partition's per-sample / per-horizon DataFrames; used in
+            titles of the extra horizon plots.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,6 +168,33 @@ def _emit_partition_plots(
         value_col="mse", decim_step_seconds=decim_step_seconds,
         band_hz_ranges=band_hz_ranges,
     )
+
+    # Two new band-vs-horizon views averaged across all anchors and
+    # samples (heatmap + mean+SE lines). Skipped when the caller did
+    # not pass the runner's ``horizon`` / ``fs`` so older invocation
+    # paths stay backward-compatible.
+    if horizon is not None and fs_hz is not None:
+        n_samples_arg = int(n_unique_samples or 0)
+        _safe_plot(
+            f"band_horizon_heatmap_{title_suffix}",
+            plot_band_horizon_heatmap,
+            per_horizon_df, output_dir / "band_horizon_heatmap.pdf",
+            horizon=int(horizon),
+            fs_hz=float(fs_hz),
+            n_samples=n_samples_arg,
+            value_col="mse",
+            band_hz_ranges=band_hz_ranges,
+        )
+        _safe_plot(
+            f"band_horizon_meanse_{title_suffix}",
+            plot_band_horizon_meanse_lines,
+            per_horizon_df, output_dir / "band_horizon_meanse.pdf",
+            horizon=int(horizon),
+            fs_hz=float(fs_hz),
+            n_samples=n_samples_arg,
+            value_col="mse",
+            band_hz_ranges=band_hz_ranges,
+        )
 
     classes = unique_labels_in(per_sample_df.get("label"))
     if len(classes) >= 2:
@@ -559,12 +600,18 @@ def run_frequency_band_forecast_analysis(
             partition_hz_ranges = dict(partition.octave_hz_ranges)
         else:
             partition_hz_ranges = None
+        n_unique_samples_partition = int(
+            per_sample_df[["guid", "epoch"]].drop_duplicates().shape[0]
+        )
         _emit_partition_plots(
             per_sample_df, per_horizon_df, per_anchor_df, sub_dir,
             n_channels_by_label=n_channels_by_label,
             decim_step_seconds=decim_step_seconds,
             title_suffix=pname,
             band_hz_ranges=partition_hz_ranges,
+            horizon=int(H_d_runner),
+            fs_hz=float(fs),
+            n_unique_samples=n_unique_samples_partition,
         )
 
         by_label, by_label_and_class = _summarise_partition(
@@ -775,6 +822,32 @@ def run_frequency_band_forecast_analysis(
                 n_samples=int(ch_horizon_n_samples),
             )
             freq_horizon_paths["phase_comodulograms_pdf"] = str(como_pdf)
+
+        # Band-grouped channel-horizon heatmap, one PDF per partition
+        # whose labels carry an explicit Hz mapping. ``by_kind`` is
+        # already covered by the dedicated phase-by-kind heatmap above.
+        for grouped_partition_name, band_col, band_hz_for_part in (
+            ("clinical_4band", "band", dict(partition.band_hz_ranges)),
+            ("clinical_7band", "refined_band", dict(partition.refined7_hz_ranges)),
+            ("by_octave", "octave", dict(partition.octave_hz_ranges)),
+        ):
+            grouped_pdf = (
+                output_dir / grouped_partition_name / "channel_horizon_heatmap.pdf"
+            )
+            grouped_pdf.parent.mkdir(parents=True, exist_ok=True)
+            _safe_plot(
+                f"channel_horizon_heatmap_{grouped_partition_name}",
+                plot_channel_horizon_heatmap_band_grouped,
+                long_df, grouped_pdf,
+                horizon=int(H_d_grid),
+                fs_hz=float(fs),
+                n_samples=int(ch_horizon_n_samples),
+                band_col=band_col,
+                band_hz_ranges=band_hz_for_part,
+            )
+            freq_horizon_paths[
+                f"channel_horizon_heatmap_{grouped_partition_name}_pdf"
+            ] = str(grouped_pdf)
 
         freq_horizon_summary = {
             "n_samples": int(ch_horizon_n_samples),

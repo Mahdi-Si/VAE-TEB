@@ -943,6 +943,448 @@ def plot_band_anchor_error(
     )
 
 
+def plot_band_horizon_heatmap(
+    per_horizon_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    horizon: int,
+    fs_hz: float,
+    n_samples: int,
+    value_col: str = "mse",
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    log_color: bool = True,
+    metric_label: str = "Forecast MSE",
+) -> None:
+    r"""Band $\times$ horizon-step heatmap of mean MSE.
+
+    Pivots ``per_horizon_df`` by ``(band, h)``, takes the cross-sample
+    mean per cell, and renders an ``imshow`` with rows = bands (high
+    frequency at top, descending) and columns = horizon step
+    $h \in [0, H_d)$. Y-axis labels carry explicit Hz ranges via
+    :func:`_format_band_label_with_hz`; x-axis carries dual
+    horizon-step / elapsed-time labels at $f_s$ Hz.
+
+    Layout uses the same 3-column gridspec (heatmap | label header |
+    colorbar) as the freq-horizon channel heatmaps, so labels and
+    colorbar each get a guaranteed column.
+
+    Args:
+        per_horizon_df: Long-format dataframe with ``band, h, value_col``
+            (one row per (sample, band, horizon-step)).
+        output_path: Destination PDF path.
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz.
+        n_samples: Number of samples averaged into each cell.
+        value_col: Numeric column to aggregate (default ``"mse"``).
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` used to append Hz
+            suffixes to row labels.
+        log_color: Use a log-scaled colormap (default).
+        metric_label: Colorbar label prefix.
+    """
+    if per_horizon_df is None or per_horizon_df.empty:
+        return
+    if "band" not in per_horizon_df.columns or "h" not in per_horizon_df.columns:
+        return
+    if value_col not in per_horizon_df.columns:
+        return
+
+    bands = _ordered_bands(per_horizon_df["band"])
+    if not bands:
+        return
+
+    grid = (
+        per_horizon_df.groupby(["band", "h"])[value_col]
+        .mean()
+        .unstack(fill_value=np.nan)
+        .reindex(index=bands, columns=range(horizon))
+    )
+    mse_grid = grid.to_numpy(dtype=float)
+    n_rows, n_cols = mse_grid.shape
+    if n_rows == 0 or n_cols == 0:
+        return
+
+    finite_vals = mse_grid[np.isfinite(mse_grid) & (mse_grid > 0.0)]
+    if log_color and finite_vals.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_vals, 1.0))
+        vmax = float(np.percentile(finite_vals, 99.0))
+        if vmin <= 0 or not np.isfinite(vmin):
+            vmin = float(np.min(finite_vals))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(mse_grid)),
+            vmax=float(np.nanmax(mse_grid)),
+        )
+
+    fig_h = max(2.6, 0.42 * float(n_rows) + 1.6)
+    fig_w = max(7.0, 0.4 * float(n_cols) + 4.0)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        nrows=1, ncols=2,
+        width_ratios=[1.0, 0.025],
+        wspace=0.04,
+    )
+    ax = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+
+    im = ax.imshow(
+        mse_grid, aspect="auto", origin="upper",
+        cmap="magma", norm=norm,
+        interpolation="nearest",
+    )
+
+    yticks = list(range(n_rows))
+    yticklabels = [
+        _format_band_label_with_hz(band, band_hz_ranges)
+        for band in bands
+    ]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(yticklabels, fontsize=FONT_LABEL * 0.85)
+    ax.set_ylabel("Frequency band", fontsize=FONT_LABEL)
+
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([
+        f"$h={k}$\n({k / float(fs_hz):.2f} s)" for k in range(n_cols)
+    ])
+    ax.set_xlabel(
+        f"Horizon step (and elapsed time at $f_s = {fs_hz:g}$ Hz)",
+        fontsize=FONT_LABEL,
+    )
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(
+        f"{metric_label} (log scale)" if log_color else metric_label,
+        fontsize=FONT_LABEL,
+    )
+    cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+    cbar.ax.set_title(
+        f"avg over\n{n_samples} samples",
+        fontsize=plt.rcParams["axes.labelsize"] * 0.7, pad=4,
+    )
+
+    ax.set_title(
+        "Forecast error — band × horizon step (cross-sample mean)\n"
+        rf"$f_s = {fs_hz:g}$ Hz, $H_d = {horizon}$, $n$ = {n_samples} samples",
+        fontsize=FONT_TITLE * 0.95, pad=10,
+    )
+    _style_axes(ax, grid="none", minor_ticks=False)
+    fig.subplots_adjust(left=0.18, right=0.97, top=0.88, bottom=0.18)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_band_horizon_meanse_lines(
+    per_horizon_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    horizon: int,
+    fs_hz: float,
+    n_samples: int,
+    value_col: str = "mse",
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> None:
+    r"""Mean $\pm$ SE line plot of forecast error vs horizon step, one line per band.
+
+    Cleaner alternative to the median+IQR :func:`plot_band_horizon_error`
+    when reviewers want a quick read of how forecast quality decays with
+    horizon for each band. Each band's line is labelled at its right
+    edge ($h = H_d - 1$), so a separate legend is not needed.
+
+    SE is computed as $\mathrm{std}(value\_col) / \sqrt{n}$ across
+    samples per ``(band, h)``.
+
+    Args:
+        per_horizon_df: Long-format dataframe with ``band, h, value_col``.
+        output_path: Destination PDF.
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz.
+        n_samples: Number of samples (used in title only).
+        value_col: Numeric column to aggregate (default ``"mse"``).
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` used in
+            right-edge labels.
+    """
+    if per_horizon_df is None or per_horizon_df.empty:
+        return
+    if "band" not in per_horizon_df.columns or "h" not in per_horizon_df.columns:
+        return
+    if value_col not in per_horizon_df.columns:
+        return
+
+    bands = _ordered_bands(per_horizon_df["band"])
+    if not bands:
+        return
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.2))
+    plotted = False
+    label_y_positions: List[Tuple[float, str, str]] = []  # (y, label, color)
+    for band in bands:
+        sub = per_horizon_df[per_horizon_df["band"] == band]
+        if sub.empty:
+            continue
+        grouped = sub.groupby("h")[value_col]
+        mean = grouped.mean()
+        std = grouped.std()
+        n = grouped.count().clip(lower=1)
+        se = std / np.sqrt(n.to_numpy())
+        if mean.empty:
+            continue
+        xs = np.asarray(mean.index.to_list(), dtype=float)
+        color = _band_color_for(band)
+        ys = mean.to_numpy()
+        ax.plot(xs, ys, color=color, lw=1.6)
+        ax.fill_between(
+            xs, ys - se.to_numpy(), ys + se.to_numpy(),
+            color=color, alpha=0.18, lw=0,
+        )
+        # Right-edge label — replace newline in the Hz-suffix with " "
+        # so the inline label stays one row tall.
+        right_label = _format_band_label_with_hz(
+            band, band_hz_ranges,
+        ).replace("\n", " ")
+        label_y_positions.append((float(ys[-1]), right_label, color))
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    # Annotate each line at its right edge. Sort y positions to nudge
+    # overlapping labels apart by a small offset (visual de-collision).
+    xmax = float(horizon - 1)
+    for y, label, color in sorted(label_y_positions, key=lambda t: t[0]):
+        ax.annotate(
+            label,
+            xy=(xmax, y),
+            xytext=(6, 0),
+            textcoords="offset points",
+            ha="left", va="center",
+            fontsize=FONT_LEGEND,
+            color=color,
+            annotation_clip=False,
+        )
+
+    ax.set_xlabel(
+        f"Horizon step h (elapsed time at $f_s = {fs_hz:g}$ Hz: 0..{(horizon-1)/fs_hz:.2f} s)",
+        fontsize=FONT_LABEL,
+    )
+    ax.set_ylabel(f"{value_col} (mean ± SE)", fontsize=FONT_LABEL)
+    ax.set_title(
+        "Forecast error vs horizon step — per band\n"
+        rf"$H_d = {horizon}$, $n$ = {n_samples} samples",
+        fontsize=FONT_TITLE,
+    )
+    ax.set_xlim(-0.3, xmax + 0.6)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.subplots_adjust(left=0.10, right=0.78, top=0.88, bottom=0.13)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_channel_horizon_heatmap_band_grouped(
+    long_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    horizon: int,
+    fs_hz: float,
+    n_samples: int,
+    band_col: str,
+    band_hz_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    log_color: bool = True,
+    metric_label: str = "Forecast MSE",
+) -> None:
+    r"""Channel $\times$ horizon heatmap with rows visually grouped by band.
+
+    Same data primitive as the existing scattering / phase channel
+    heatmaps (long-form ``channel_horizon_mse.csv``), but channels in
+    the same band are placed contiguously and separated by thin
+    horizontal divider lines. Band names appear in the right-margin
+    label column. One PDF per partition (``clinical_4band``,
+    ``clinical_7band``, ``by_octave`` — ``by_kind`` is already covered
+    by the dedicated phase-by-kind heatmap).
+
+    Args:
+        long_df: Long-format dataframe with one row per
+            ``(channel, h)``; must include ``channel``, ``h``,
+            ``mse_mean`` and the band-id column ``band_col``. Optional
+            ``freq_hz_primary`` is used for the inner-row label
+            (channel id + Hz).
+        output_path: Destination PDF.
+        horizon: Forecast horizon $H_d$.
+        fs_hz: Sampling frequency in Hz.
+        n_samples: Number of samples averaged into each cell.
+        band_col: Which band column to group by — one of ``"band"``,
+            ``"refined_band"``, ``"octave"``.
+        band_hz_ranges: ``{band -> (low_hz, high_hz)}`` for Hz suffixes.
+        log_color: Use ``LogNorm`` (default).
+        metric_label: Colorbar label prefix.
+    """
+    if long_df is None or long_df.empty:
+        return
+    needed = {"channel", "h", "mse_mean", band_col}
+    if not needed.issubset(long_df.columns):
+        return
+
+    # Build the (channel × horizon) MSE matrix with bands kept
+    # contiguous in row order. Within each band, rows are sorted by
+    # ``freq_hz_primary`` descending (high freq at the top of the
+    # band's strip).
+    bands = _ordered_bands(long_df[band_col])
+    if not bands:
+        return
+
+    sort_freq_col = (
+        "freq_hz_primary" if "freq_hz_primary" in long_df.columns else None
+    )
+
+    row_order: List[int] = []
+    band_of_row: List[str] = []
+    band_boundaries: List[int] = [0]   # row index where each band starts
+    band_centres: List[float] = []
+    band_labels: List[str] = []
+
+    for band in bands:
+        sub_meta = (
+            long_df[long_df[band_col] == band]
+            [["channel"] + ([sort_freq_col] if sort_freq_col else [])]
+            .drop_duplicates(subset=["channel"]).copy()
+        )
+        if sub_meta.empty:
+            continue
+        if sort_freq_col is not None:
+            f = sub_meta[sort_freq_col].astype(float).to_numpy()
+            f_sort = np.where(np.isnan(f), -np.inf, f)
+            order = np.argsort(-f_sort, kind="stable")
+            sub_meta = sub_meta.iloc[order].reset_index(drop=True)
+        ch_list = sub_meta["channel"].astype(int).tolist()
+        start_idx = len(row_order)
+        row_order.extend(ch_list)
+        band_of_row.extend([str(band)] * len(ch_list))
+        band_boundaries.append(len(row_order))
+        band_centres.append(0.5 * (start_idx + len(row_order) - 1))
+        band_labels.append(_format_band_label_with_hz(band, band_hz_ranges))
+
+    if not row_order:
+        return
+
+    wide = (
+        long_df.pivot_table(
+            index="channel", columns="h", values="mse_mean", aggfunc="mean",
+        )
+        .reindex(row_order)
+        .reindex(columns=range(horizon))
+    )
+    mse_grid = wide.to_numpy(dtype=float)
+    n_rows, n_cols = mse_grid.shape
+    if n_rows == 0 or n_cols == 0:
+        return
+
+    finite_vals = mse_grid[np.isfinite(mse_grid) & (mse_grid > 0.0)]
+    if log_color and finite_vals.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_vals, 1.0))
+        vmax = float(np.percentile(finite_vals, 99.0))
+        if vmin <= 0 or not np.isfinite(vmin):
+            vmin = float(np.min(finite_vals))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(mse_grid)),
+            vmax=float(np.nanmax(mse_grid)),
+        )
+
+    fig_h = max(4.5, 0.18 * float(n_rows) + 1.8)
+    fig_w = max(8.5, 0.45 * float(n_cols) + 5.0)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        nrows=1, ncols=3,
+        width_ratios=[1.0, 0.18, 0.025],
+        wspace=0.04,
+    )
+    ax = fig.add_subplot(gs[0, 0])
+    ax_label = fig.add_subplot(gs[0, 1])
+    cax = fig.add_subplot(gs[0, 2])
+
+    im = ax.imshow(
+        mse_grid, aspect="auto", origin="upper",
+        cmap="magma", norm=norm,
+        interpolation="nearest",
+    )
+
+    # Channel-id ticks on the left axis (subsampled if too many).
+    label_step = 1 if n_rows <= 30 else int(np.ceil(n_rows / 30.0))
+    yticks = list(range(0, n_rows, label_step))
+    if (n_rows - 1) not in yticks:
+        yticks.append(n_rows - 1)
+    yticklabels = [f"ch {row_order[i]}" for i in yticks]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(yticklabels, fontsize=plt.rcParams["ytick.labelsize"])
+    ax.set_ylabel("Channel index (87-ch space)", fontsize=FONT_LABEL)
+
+    # Band divider lines.
+    for boundary in band_boundaries[1:-1]:
+        ax.axhline(boundary - 0.5, color=COLOR_BLACK, linestyle="-",
+                   linewidth=0.8, alpha=0.85)
+
+    # X-axis horizon ticks.
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([
+        f"$h={k}$\n({k / float(fs_hz):.2f} s)" for k in range(n_cols)
+    ])
+    ax.set_xlabel(
+        f"Horizon step (elapsed time at $f_s = {fs_hz:g}$ Hz)",
+        fontsize=FONT_LABEL,
+    )
+
+    # Right-margin band labels at the centre of each band's row span.
+    ax_label.set_xlim(0.0, 1.0)
+    ax_label.set_ylim(ax.get_ylim())
+    ax_label.set_xticks([])
+    ax_label.set_yticks([])
+    for spine in ax_label.spines.values():
+        spine.set_visible(False)
+    for centre, label in zip(band_centres, band_labels):
+        ax_label.text(
+            0.02, float(centre), label,
+            ha="left", va="center",
+            fontsize=FONT_LABEL * 0.78, fontweight="bold",
+            transform=ax_label.transData,
+        )
+    ax_label.set_title(
+        "Band\nlabel", fontsize=FONT_LABEL * 0.75, pad=4, loc="left",
+    )
+
+    # Colorbar.
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(
+        f"{metric_label} (log scale)" if log_color else metric_label,
+        fontsize=FONT_LABEL,
+    )
+    cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+    cbar.ax.set_title(
+        f"avg over\n{n_samples} samples",
+        fontsize=plt.rcParams["axes.labelsize"] * 0.7, pad=4,
+    )
+
+    ax.set_title(
+        f"Channel × horizon — band-grouped ({band_col})\n"
+        rf"$f_s = {fs_hz:g}$ Hz, $H_d = {horizon}$, $n$ = {n_samples} samples",
+        fontsize=FONT_TITLE * 0.95, pad=10,
+    )
+    _style_axes(ax, grid="none", minor_ticks=False)
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.13)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _grid_ribbon_by_class(
     df: pd.DataFrame,
     *,
@@ -1148,19 +1590,46 @@ def plot_per_channel_mse_vs_freq(
     agg = per_channel_df.groupby(groupers, as_index=False)["mse_total"].mean()
     agg = agg.rename(columns={"mse_total": "mean_mse"})
 
+    # Pull harmonic_ratio per channel for the phase-panel legend table.
+    if "harmonic_ratio" in per_channel_df.columns:
+        ch_harmonic = (
+            per_channel_df.groupby("channel", as_index=False)["harmonic_ratio"]
+            .first()
+            .set_index("channel")["harmonic_ratio"]
+        )
+    else:
+        ch_harmonic = pd.Series(dtype=float)
+
     st_mask = agg["kind"].astype(str).isin(("st_S0", "st_S1"))
     ph_mask = agg["kind"].astype(str).str.startswith("ph_")
 
-    fig, axes = plt.subplots(2, 1, figsize=(7.0, 5.4), sharex=False)
+    # Two-column layout: left column = the two scatter panels (scattering
+    # on top, phase on bottom); right column = a side legend table per
+    # panel. Replacing the previous inline ``ax.annotate`` worst/best
+    # labels — which had no collision avoidance and piled up at similar
+    # frequencies — with circled-number badges on the data points and a
+    # tabular legend in its own axis means collisions are impossible by
+    # construction.
+    fig = plt.figure(figsize=(10.5, 6.0))
+    gs = fig.add_gridspec(
+        nrows=2, ncols=2,
+        width_ratios=[1.0, 0.55],
+        hspace=0.32, wspace=0.06,
+    )
+    axes = [fig.add_subplot(gs[r, 0]) for r in range(2)]
+    axes_legend = [fig.add_subplot(gs[r, 1]) for r in range(2)]
+
     panels = [
-        ("Scattering channels (S0 + S1)", st_mask, axes[0]),
-        ("Phase channels (ph_diag / ph_h2 / ph_h3 / ph_other)", ph_mask, axes[1]),
+        ("Scattering channels (S0 + S1)", st_mask, axes[0], axes_legend[0], False),
+        ("Phase channels (ph_diag / ph_h2 / ph_h3 / ph_other)",
+         ph_mask, axes[1], axes_legend[1], True),
     ]
 
     classes = unique_labels_in(agg.get("label")) if by_class else []
 
-    for title, mask, ax in panels:
+    for title, mask, ax, ax_legend, is_phase_panel in panels:
         sub = agg.loc[mask]
+        ax_legend.set_axis_off()
         if sub.empty:
             ax.text(
                 0.5, 0.5, "no channels for this kind group",
@@ -1208,32 +1677,94 @@ def plot_per_channel_mse_vs_freq(
                             lw=0.4, alpha=0.5,
                         )
 
-        # Annotate worst-3 and best-3 channels by mean MSE (pooled view
-        # only — by-class would pile on labels).
+        # Numbered badges for the top-3 worst (1..3, vermillion) and
+        # top-3 best (4..6, green) channels — pooled view only. The
+        # per-class layout already has too many series to make
+        # numbered annotations useful, so we skip badges in that mode.
         if not by_class:
             pooled = sub.groupby(
                 ["channel", "kind", "freq_hz_primary"], as_index=False,
             )["mean_mse"].mean()
-            worst3 = pooled.sort_values("mean_mse", ascending=False).head(3)
-            best3 = pooled.sort_values("mean_mse", ascending=True).head(3)
-            for _, row in worst3.iterrows():
-                if row["freq_hz_primary"] > 0:
-                    ax.annotate(
-                        f"ch{int(row['channel'])} ({row['kind']})",
-                        xy=(float(row["freq_hz_primary"]), float(row["mean_mse"])),
-                        xytext=(4, 4), textcoords="offset points",
-                        fontsize=FONT_LABEL * 0.7,
-                        color=COLOR_VERMILLION, family="monospace",
-                    )
-            for _, row in best3.iterrows():
-                if row["freq_hz_primary"] > 0:
-                    ax.annotate(
-                        f"ch{int(row['channel'])}",
-                        xy=(float(row["freq_hz_primary"]), float(row["mean_mse"])),
-                        xytext=(4, -8), textcoords="offset points",
-                        fontsize=FONT_LABEL * 0.7,
-                        color=COLOR_GREEN, family="monospace",
-                    )
+            worst3 = pooled.sort_values("mean_mse", ascending=False).head(3).copy()
+            best3 = pooled.sort_values("mean_mse", ascending=True).head(3).copy()
+            worst3["rank"] = np.arange(1, len(worst3) + 1)
+            worst3["color"] = COLOR_VERMILLION
+            worst3["label_kind"] = "worst"
+            best3["rank"] = np.arange(4, 4 + len(best3))
+            best3["color"] = COLOR_GREEN
+            best3["label_kind"] = "best"
+
+            for _, row in pd.concat([worst3, best3], ignore_index=True).iterrows():
+                if not (float(row["freq_hz_primary"]) > 0):
+                    continue
+                ax.scatter(
+                    float(row["freq_hz_primary"]),
+                    float(row["mean_mse"]),
+                    marker="o", s=110,
+                    facecolors="white",
+                    edgecolors=row["color"], linewidths=1.6,
+                    zorder=10,
+                )
+                ax.text(
+                    float(row["freq_hz_primary"]),
+                    float(row["mean_mse"]),
+                    str(int(row["rank"])),
+                    ha="center", va="center",
+                    fontsize=FONT_LABEL * 0.75,
+                    color=row["color"], fontweight="bold",
+                    zorder=11,
+                )
+
+            # Side-panel legend: render a compact table that maps each
+            # numbered badge back to (channel, kind, freq, MSE) — plus
+            # ``harmonic_ratio`` for phase channels. Reviewers can scan
+            # the table for context without colours getting in the way.
+            header = ["#", "ch", "kind", "Hz", "MSE"]
+            if is_phase_panel:
+                header.append("p")
+
+            def _row_to_cells(row: Any) -> List[str]:
+                cells = [
+                    f"{int(row['rank'])}",
+                    f"{int(row['channel'])}",
+                    str(row["kind"]),
+                    _format_hz_tick(float(row["freq_hz_primary"])),
+                    f"{float(row['mean_mse']):.4g}",
+                ]
+                if is_phase_panel:
+                    p_val = ch_harmonic.get(int(row["channel"]), float("nan"))
+                    if p_val is None or not np.isfinite(float(p_val)):
+                        cells.append("—")
+                    else:
+                        cells.append(f"{float(p_val):.2g}")
+                return cells
+
+            cell_rows: List[List[str]] = []
+            row_colors: List[str] = []
+            for _, row in pd.concat([worst3, best3], ignore_index=True).iterrows():
+                cell_rows.append(_row_to_cells(row))
+                row_colors.append(str(row["color"]))
+
+            if cell_rows:
+                table = ax_legend.table(
+                    cellText=cell_rows,
+                    colLabels=header,
+                    cellLoc="center",
+                    loc="upper center",
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(FONT_LEGEND * 0.85)
+                table.scale(1.0, 1.25)
+                # Colour the leading "#" cell of each row to match its
+                # badge so the cross-reference is unambiguous even in
+                # greyscale prints.
+                for r_idx, color in enumerate(row_colors):
+                    cell = table[(r_idx + 1, 0)]    # +1 for header row
+                    cell.set_text_props(color=color, fontweight="bold")
+                ax_legend.set_title(
+                    "Top-3 worst (red) / best (green)",
+                    fontsize=FONT_LABEL * 0.85, pad=2,
+                )
 
         ax.set_xscale("log")
         ax.set_xlabel("centre frequency (Hz)", fontsize=FONT_LABEL)
@@ -1242,7 +1773,7 @@ def plot_per_channel_mse_vs_freq(
         ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND * 0.85)
         _style_axes(ax, grid="major", minor_ticks=False)
 
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.10)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
@@ -1421,9 +1952,21 @@ def plot_freq_horizon_heatmap_scattering(
     if int(n_cols) != int(horizon):
         return
 
+    # Layout uses an explicit 3-column gridspec so the heatmap, the
+    # right-margin channel-id column and the colorbar each get a
+    # guaranteed column. This avoids the legacy ``tight_layout`` /
+    # ``twinx``-spillover that caused ch labels to overlap the colorbar.
     fig_h = max(4.0, 0.18 * float(n_rows) + 1.5)
-    fig_w = max(6.0, 0.45 * float(n_cols) + 3.0)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig_w = max(7.5, 0.45 * float(n_cols) + 4.0)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        nrows=1, ncols=3,
+        width_ratios=[1.0, 0.10, 0.025],
+        wspace=0.04,
+    )
+    ax = fig.add_subplot(gs[0, 0])
+    ax_label = fig.add_subplot(gs[0, 1])
+    cax = fig.add_subplot(gs[0, 2])
 
     finite_vals = mse_grid[np.isfinite(mse_grid) & (mse_grid > 0.0)]
     if log_color and finite_vals.size > 0:
@@ -1476,23 +2019,37 @@ def plot_freq_horizon_heatmap_scattering(
         fontsize=FONT_LABEL,
     )
 
-    # Right-margin annotations: original channel index per row.
-    ax_right = ax.twinx()
-    ax_right.set_ylim(ax.get_ylim())
-    ax_right.set_yticks(yticks)
-    ax_right.set_yticklabels([f"ch {int(channel_ids[i])}" for i in yticks])
-    ax_right.tick_params(axis="y", labelsize=plt.rcParams["ytick.labelsize"])
-    ax_right.set_ylabel("Channel index (87-ch space)",
-                        fontsize=FONT_LABEL * 0.85)
-    for spine in ax_right.spines.values():
-        spine.set_visible(True)
-        spine.set_color(COLOR_BLACK)
-        spine.set_linewidth(0.5)
-
-    cbar = _add_colorbar(
-        fig, im, ax,
-        label=f"{metric_label} (log scale)" if log_color else metric_label,
+    # Right-margin annotations: original channel index per row, on a
+    # dedicated axis so labels never extend into the colorbar's column.
+    ax_label.set_xlim(0.0, 1.0)
+    ax_label.set_ylim(ax.get_ylim())
+    ax_label.set_xticks([])
+    ax_label.set_yticks([])
+    for spine in ax_label.spines.values():
+        spine.set_visible(False)
+    for i in yticks:
+        ax_label.text(
+            0.02, float(i),
+            f"ch {int(channel_ids[i])}",
+            ha="left", va="center",
+            fontsize=plt.rcParams["ytick.labelsize"],
+            transform=ax_label.transData,
+        )
+    ax_label.set_title(
+        "Channel ID\n(87-ch space)",
+        fontsize=FONT_LABEL * 0.75, pad=4, loc="left",
     )
+
+    # Colorbar on its own dedicated axis (no make_axes_locatable, no
+    # subplots_adjust magic).
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(
+        f"{metric_label} (log scale)" if log_color else metric_label,
+        fontsize=FONT_LABEL,
+    )
+    cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
     cbar.ax.set_title(
         f"avg over\n{n_samples} samples",
         fontsize=plt.rcParams["axes.labelsize"] * 0.7, pad=4,
@@ -1507,7 +2064,7 @@ def plot_freq_horizon_heatmap_scattering(
     ax.set_title(suptitle, fontsize=FONT_TITLE * 0.95, pad=10)
 
     _style_axes(ax, grid="none", minor_ticks=False)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.13)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     png_path = Path(str(output_path).replace(".pdf", ".png"))
     if png_path != output_path:
@@ -1623,16 +2180,33 @@ def plot_freq_horizon_heatmap_phase_by_kind(
     height_ratios = [max(1.0, panels[k].shape[0] * 0.18 + 0.5)
                      for k in panels]
     total_h = float(sum(height_ratios)) + 1.5
-    fig_w = max(8.0, 0.6 * float(horizon) + 5.5)
-    fig, axes = plt.subplots(
-        n_panels, 1, figsize=(fig_w, total_h),
-        gridspec_kw={"height_ratios": height_ratios},
-        squeeze=False,
+    fig_w = max(9.0, 0.6 * float(horizon) + 6.5)
+
+    # Three-column gridspec: heatmap | (xi_i, p) annotation column |
+    # shared colorbar (spans every row). The annotation column gets a
+    # generous width because phase labels are long
+    # (e.g. ``\xi_i=0.456, p=2.0``); putting them on a dedicated axis
+    # rather than a ``twinx`` removes any chance of bleeding into the
+    # colorbar's column.
+    fig = plt.figure(figsize=(fig_w, total_h))
+    gs = fig.add_gridspec(
+        nrows=n_panels, ncols=3,
+        width_ratios=[1.0, 0.20, 0.022],
+        height_ratios=height_ratios,
+        wspace=0.04, hspace=0.22,
     )
-    axes = axes.flatten()
+    axes_main: List[Any] = []
+    axes_label: List[Any] = []
+    for r in range(n_panels):
+        axes_main.append(fig.add_subplot(gs[r, 0]))
+        axes_label.append(fig.add_subplot(gs[r, 1]))
+    cax = fig.add_subplot(gs[:, 2])
 
     im = None
-    for ax, (kind, grid) in zip(axes, panels.items()):
+    panel_items = list(panels.items())
+    for r, ((kind, grid), ax, ax_label) in enumerate(
+        zip(panel_items, axes_main, axes_label)
+    ):
         meta = panel_meta[kind]
         im = ax.imshow(
             grid, aspect="auto", origin="upper",
@@ -1656,7 +2230,7 @@ def plot_freq_horizon_heatmap_phase_by_kind(
         )
 
         # X-axis only on the bottom panel.
-        if ax is axes[-1]:
+        if r == n_panels - 1:
             ax.set_xticks(np.arange(grid.shape[1]))
             ax.set_xticklabels([
                 f"$h={k}$\n({k / float(fs_hz):.2f} s)"
@@ -1670,11 +2244,9 @@ def plot_freq_horizon_heatmap_phase_by_kind(
         else:
             ax.set_xticks([])
 
-        # Right-margin annotations: (xi_i, p) per row, suppressed past
-        # 14 rows to avoid clutter (then only for the labelled rows).
-        ax_right = ax.twinx()
-        ax_right.set_ylim(ax.get_ylim())
-        ax_right.set_yticks(yticks)
+        # Right-margin annotations on a dedicated axis (no twinx). For
+        # ``ph_diag`` the (xi_i, xi_j) pair is degenerate so we fall
+        # back to a single ``(autocorr)`` tag.
         if kind == "ph_diag":
             annot = ["(autocorr)" for _ in yticks]
         else:
@@ -1685,14 +2257,19 @@ def plot_freq_horizon_heatmap_phase_by_kind(
                 annot.append(
                     rf"$\xi_i$={_format_hz_tick(xi_i)},  $p$={p:.2g}"
                 )
-        ax_right.set_yticklabels(annot)
-        ax_right.tick_params(
-            axis="y", labelsize=plt.rcParams["ytick.labelsize"] * 0.85,
-        )
-        for spine in ax_right.spines.values():
-            spine.set_visible(True)
-            spine.set_color(COLOR_BLACK)
-            spine.set_linewidth(0.5)
+        ax_label.set_xlim(0.0, 1.0)
+        ax_label.set_ylim(ax.get_ylim())
+        ax_label.set_xticks([])
+        ax_label.set_yticks([])
+        for spine in ax_label.spines.values():
+            spine.set_visible(False)
+        for i, label in zip(yticks, annot):
+            ax_label.text(
+                0.02, float(i), label,
+                ha="left", va="center",
+                fontsize=plt.rcParams["ytick.labelsize"] * 0.85,
+                transform=ax_label.transData,
+            )
 
         ax.set_title(
             f"{kind}  ($n_{{\\mathrm{{ch}}}} = {n_rows}$)",
@@ -1700,11 +2277,9 @@ def plot_freq_horizon_heatmap_phase_by_kind(
         )
         _style_axes(ax, grid="none", minor_ticks=False)
 
-    # Shared colorbar on the right of the figure.
+    # Shared colorbar on the right of every panel.
     if im is not None:
-        fig.subplots_adjust(right=0.86)
-        cbar_ax = fig.add_axes([0.88, 0.10, 0.02, 0.78])
-        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar = fig.colorbar(im, cax=cax)
         cbar.set_label(
             f"{metric_label} (log scale)" if log_color else metric_label,
             fontsize=FONT_LABEL,
@@ -1719,6 +2294,7 @@ def plot_freq_horizon_heatmap_phase_by_kind(
         rf"$n$ = {n_samples} samples",
         fontsize=FONT_TITLE * 1.0, y=0.995,
     )
+    fig.subplots_adjust(left=0.09, right=0.97, top=0.92, bottom=0.10)
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     png_path = Path(str(output_path).replace(".pdf", ".png"))
     if png_path != output_path:
@@ -1932,6 +2508,663 @@ def plot_phase_comodulograms_by_horizon(
     png_path = Path(str(output_path).replace(".pdf", ".png"))
     if png_path != output_path:
         fig.savefig(png_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# KLD per-dim & PC visualisations (Phase 1 + Phase 2 share these primitives
+# via the ``group_col`` keyword: pass ``"label"`` for per-class views and
+# ``"subgroup"`` for cross-subgroup overlays).
+# ---------------------------------------------------------------------------
+
+
+def _kld_dim_columns(df: pd.DataFrame, d_z: int) -> List[str]:
+    """Return the present ``kld_dim_*`` columns up to ``d_z`` in numeric order."""
+    cols: List[Tuple[int, str]] = []
+    for c in df.columns:
+        if not isinstance(c, str) or not c.startswith("kld_dim_"):
+            continue
+        tail = c.split("_", 2)[-1]
+        try:
+            i = int(tail)
+        except ValueError:
+            continue
+        if 0 <= i < d_z:
+            cols.append((i, c))
+    cols.sort(key=lambda t: t[0])
+    return [c for _, c in cols]
+
+
+def plot_kld_per_dim_heatmap(
+    df: pd.DataFrame,
+    d_z: int,
+    output_path: Path,
+    *,
+    group_col: str = "label",
+    n_samples_per_group: Optional[Dict[str, int]] = None,
+    metric_label: str = "mean KLD per dim",
+    log_color: bool = True,
+) -> None:
+    r"""Per-latent-dim mean KLD as a heatmap.
+
+    Pivots ``df`` (typically ``histograms/histogram_metrics.csv``) on the
+    ``kld_dim_0..kld_dim_{d_z-1}`` columns and renders rows = latent
+    dim, columns = group (class label or subgroup name), color = mean
+    KLD across samples in that group.
+
+    Args:
+        df: DataFrame with at least ``group_col`` and ``kld_dim_*``
+            columns. Rows are per-sample.
+        d_z: Number of latent dimensions to consider (the maximum
+            ``kld_dim_*`` column index $+ 1$).
+        output_path: Destination PDF path.
+        group_col: Column to pivot on (default ``"label"``;
+            Phase 2 callers pass ``"subgroup"``).
+        n_samples_per_group: Optional ``{group_value -> n}`` mapping;
+            when supplied, n-samples are appended to each column label.
+        metric_label: Colorbar label (default ``"mean KLD per dim"``).
+        log_color: Use ``LogNorm`` for the heatmap (default).
+    """
+    if df is None or df.empty or group_col not in df.columns:
+        return
+    dim_cols = _kld_dim_columns(df, int(d_z))
+    if not dim_cols:
+        return
+
+    grouped = df.groupby(group_col)[dim_cols].mean()
+    if grouped.empty:
+        return
+
+    # Stable column order (same as encountered) and float matrix.
+    groups = list(grouped.index)
+    matrix = grouped.to_numpy(dtype=float).T   # (d_z, n_groups)
+
+    finite_pos = matrix[np.isfinite(matrix) & (matrix > 0.0)]
+    if log_color and finite_pos.size > 0:
+        from matplotlib.colors import LogNorm
+        vmin = float(np.percentile(finite_pos, 1.0))
+        vmax = float(np.percentile(finite_pos, 99.0))
+        if vmin <= 0:
+            vmin = float(np.min(finite_pos))
+        if vmax <= vmin:
+            vmax = vmin * 10.0 if vmin > 0 else 1.0
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = plt.Normalize(
+            vmin=float(np.nanmin(matrix)),
+            vmax=float(np.nanmax(matrix)),
+        )
+
+    n_rows, n_cols = matrix.shape
+    fig_h = max(4.0, 0.28 * float(n_rows) + 1.5)
+    fig_w = max(5.5, 0.9 * float(n_cols) + 3.5)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        nrows=1, ncols=2, width_ratios=[1.0, 0.035], wspace=0.04,
+    )
+    ax = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+
+    im = ax.imshow(
+        matrix, aspect="auto", origin="lower",
+        cmap="viridis", norm=norm, interpolation="nearest",
+    )
+
+    # Y-axis: latent dim index. Annotate every cell with its value to
+    # make the heatmap readable in print as well as on screen.
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels([f"dim {i}" for i in range(n_rows)],
+                       fontsize=plt.rcParams["ytick.labelsize"])
+    ax.set_ylabel("latent dimension", fontsize=FONT_LABEL)
+
+    # X-axis: group labels with optional n-samples suffix.
+    def _col_label(g: Any) -> str:
+        if n_samples_per_group is None:
+            return str(g)
+        n = n_samples_per_group.get(g, n_samples_per_group.get(str(g)))
+        if n is None:
+            return str(g)
+        return f"{g}\n(n={int(n)})"
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([_col_label(g) for g in groups], rotation=20,
+                       ha="right", fontsize=plt.rcParams["xtick.labelsize"])
+    ax.set_xlabel(group_col, fontsize=FONT_LABEL)
+
+    # Per-cell numeric annotations — use a contrasting text colour so
+    # the value is readable on both the bright and dark ends of the
+    # colormap.
+    if n_rows * n_cols <= 200:
+        threshold = float(np.nanmedian(matrix))
+        for r in range(n_rows):
+            for c in range(n_cols):
+                v = float(matrix[r, c])
+                if not np.isfinite(v):
+                    continue
+                txt_color = "white" if v < threshold else "black"
+                ax.text(
+                    c, r, f"{v:.3g}",
+                    ha="center", va="center",
+                    fontsize=plt.rcParams["ytick.labelsize"] * 0.75,
+                    color=txt_color,
+                )
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(
+        f"{metric_label} (log scale)" if log_color else metric_label,
+        fontsize=FONT_LABEL,
+    )
+    cbar.ax.tick_params(labelsize=plt.rcParams["xtick.labelsize"])
+    cbar.outline.set_linewidth(0.6)
+    cbar.outline.set_edgecolor(COLOR_LIGHT_GRAY)
+
+    ax.set_title(
+        f"Per-dim mean KLD by {group_col}",
+        fontsize=FONT_TITLE * 0.95, pad=8,
+    )
+    _style_axes(ax, grid="none", minor_ticks=False)
+    fig.subplots_adjust(left=0.12, right=0.97, top=0.92, bottom=0.16)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_kld_per_dim_violins_by_class(
+    df: pd.DataFrame,
+    d_z: int,
+    output_path: Path,
+    *,
+    group_col: str = "label",
+) -> None:
+    r"""One violin per latent dim, coloured / split by ``group_col``.
+
+    Distributional view of the same data the per-dim heatmap aggregates.
+    Useful for spotting class-discriminative dimensions where the
+    *spread* of KLD differs across groups, not just the mean.
+
+    The grid is laid out 4 panels wide; rows wrap as needed for the
+    full $d_z$ dims. Empty / single-class panels are silently filled
+    with a placeholder.
+
+    Args:
+        df: DataFrame with ``group_col`` and ``kld_dim_*`` columns.
+        d_z: Number of latent dimensions.
+        output_path: Destination PDF path.
+        group_col: Column to split violins by (default ``"label"``).
+    """
+    if df is None or df.empty or group_col not in df.columns:
+        return
+    dim_cols = _kld_dim_columns(df, int(d_z))
+    if not dim_cols:
+        return
+
+    groups = list(df[group_col].dropna().unique())
+    if not groups:
+        return
+
+    n_panels = len(dim_cols)
+    ncols = 4
+    nrows = int(np.ceil(n_panels / ncols))
+    fig_h = max(2.6 * nrows, 3.5)
+    fig_w = max(3.0 * ncols, 8.0)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(fig_w, fig_h),
+        sharex=True, squeeze=False,
+    )
+    axes_flat = axes.flatten()
+
+    palette: Dict[Any, str] = {}
+    fallback_palette = (
+        COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_VERMILLION,
+        COLOR_PURPLE, COLOR_TEAL_DARK, COLOR_GRAY,
+    )
+    for i, g in enumerate(groups):
+        # Use the canonical class palette for {1, 2, 3} when the
+        # caller is feeding clinical labels; otherwise hash into the
+        # fallback palette so the same group always gets the same
+        # colour across runs.
+        try:
+            palette[g] = class_color_for(int(g))
+        except Exception:
+            palette[g] = fallback_palette[i % len(fallback_palette)]
+
+    for idx, dim_col in enumerate(dim_cols):
+        ax = axes_flat[idx]
+        data: List[np.ndarray] = []
+        positions: List[float] = []
+        colors: List[str] = []
+        labels: List[str] = []
+        for j, g in enumerate(groups):
+            sub = df[df[group_col] == g][dim_col].to_numpy(dtype=float)
+            sub = sub[np.isfinite(sub)]
+            if sub.size == 0:
+                continue
+            data.append(sub)
+            positions.append(float(j))
+            colors.append(palette[g])
+            labels.append(str(g))
+        if not data:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL * 0.8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(dim_col, fontsize=FONT_LABEL * 0.85)
+            continue
+        parts = ax.violinplot(
+            data, positions=positions, widths=0.85,
+            showmeans=False, showmedians=True,
+        )
+        for body, color in zip(parts.get("bodies", []), colors):
+            body.set_facecolor(color)
+            body.set_edgecolor(COLOR_BLACK)
+            body.set_alpha(0.7)
+        for spine_key in ("cmedians", "cmins", "cmaxes", "cbars"):
+            if spine_key in parts:
+                parts[spine_key].set_edgecolor(COLOR_BLACK)
+                parts[spine_key].set_linewidth(0.7)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=plt.rcParams["xtick.labelsize"] * 0.85,
+                           rotation=20, ha="right")
+        ax.set_title(dim_col, fontsize=FONT_LABEL * 0.85)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    # Hide unused panels.
+    for k in range(n_panels, nrows * ncols):
+        axes_flat[k].set_visible(False)
+
+    fig.suptitle(
+        f"Per-dim KLD distributions by {group_col}",
+        fontsize=FONT_TITLE, y=0.995,
+    )
+    fig.subplots_adjust(left=0.05, right=0.98, top=0.94, bottom=0.06)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_kld_trajectory_by_group(
+    traj_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    group_col: str = "label",
+    metric_col: str = "kld_mean",
+    time_col: str = "timestep",
+    title: Optional[str] = None,
+) -> None:
+    r"""Mean $\pm$ SE trajectory of a per-time-step KLD column, one line per group.
+
+    Aggregates ``traj_df`` (typically ``kld_pca/kld_pc_trajectory.csv``)
+    by ``(group_col, time_col)`` and plots a mean $\pm$ SE ribbon for
+    each group on shared axes.
+
+    Args:
+        traj_df: Per-(sample, timestep) dataframe. Must contain
+            ``group_col``, ``time_col``, and ``metric_col``.
+        output_path: Destination PDF.
+        group_col: Column whose distinct values become separate
+            lines / ribbons (default ``"label"``).
+        metric_col: Numeric column to aggregate per timestep
+            (default ``"kld_mean"``).
+        time_col: Time-index column (default ``"timestep"``).
+        title: Optional plot title; defaults to a sensible auto-title.
+    """
+    if traj_df is None or traj_df.empty:
+        return
+    needed = {group_col, time_col, metric_col}
+    if not needed.issubset(traj_df.columns):
+        return
+
+    groups = list(traj_df[group_col].dropna().unique())
+    if not groups:
+        return
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.8))
+    plotted = False
+    for g in groups:
+        sub = traj_df[traj_df[group_col] == g]
+        if sub.empty:
+            continue
+        grouped = sub.groupby(time_col)[metric_col]
+        mean = grouped.mean()
+        std = grouped.std().fillna(0.0)
+        n = grouped.count().clip(lower=1)
+        se = std / np.sqrt(n.to_numpy())
+        if mean.empty:
+            continue
+        xs = np.asarray(mean.index.to_list(), dtype=float)
+        ys = mean.to_numpy()
+        try:
+            color = class_color_for(int(g))
+        except Exception:
+            color = _band_color_for(str(g))
+        ax.plot(xs, ys, color=color, lw=1.6, label=str(g))
+        ax.fill_between(
+            xs, ys - se.to_numpy(), ys + se.to_numpy(),
+            color=color, alpha=0.18, lw=0,
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel(f"{time_col} (model time index)", fontsize=FONT_LABEL)
+    ax.set_ylabel(f"{metric_col} (mean ± SE)", fontsize=FONT_LABEL)
+    ax.set_title(
+        title or f"{metric_col} trajectory by {group_col}",
+        fontsize=FONT_TITLE,
+    )
+    ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND * 0.9, title=group_col)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.14)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_selected_pc_trajectories_grid(
+    traj_df: pd.DataFrame,
+    selection: Optional[Dict[str, Any]],
+    output_path: Path,
+    *,
+    group_col: str = "label",
+    time_col: str = "timestep",
+) -> None:
+    r"""Small-multiples grid of selected-PC trajectories, one panel per PC.
+
+    Reads the contrast-selected PC indices from ``selection.json``
+    (written by :func:`select_pca_components`) and renders one panel
+    per selected PC. Each panel is a mean $\pm$ SE trajectory of
+    ``kld_pc_selected_{i}_t`` (or ``kld_pc{i}_t`` as a fallback) over
+    ``time_col``, with one line per group.
+
+    Args:
+        traj_df: Per-(sample, timestep) dataframe with the per-time PC
+            columns (``kld_pc_selected_{i}_t`` preferred,
+            ``kld_pc{i}_t`` accepted as a fallback).
+        selection: ``selection.json`` payload (may be ``None`` —
+            in which case the function falls back to plotting
+            ``kld_pc1_t``, ``kld_pc2_t``, ``kld_pc3_t``).
+        output_path: Destination PDF.
+        group_col: Column to split lines by (default ``"label"``).
+        time_col: Time-index column (default ``"timestep"``).
+    """
+    if traj_df is None or traj_df.empty:
+        return
+    if group_col not in traj_df.columns or time_col not in traj_df.columns:
+        return
+
+    # Resolve which PC trajectory columns to plot.
+    pc_cols: List[Tuple[str, str]] = []   # (column_name, panel_title)
+    if selection and isinstance(selection.get("selected_indices_1based"), list):
+        for one_based in selection["selected_indices_1based"]:
+            col_sel = f"kld_pc_selected_{int(one_based)}_t"
+            col_raw = f"kld_pc{int(one_based)}_t"
+            if col_sel in traj_df.columns:
+                pc_cols.append((col_sel, f"PC {int(one_based)} (selected)"))
+            elif col_raw in traj_df.columns:
+                pc_cols.append((col_raw, f"PC {int(one_based)}"))
+    if not pc_cols:
+        for k in range(1, 4):
+            col = f"kld_pc{k}_t"
+            if col in traj_df.columns:
+                pc_cols.append((col, f"PC {k}"))
+    if not pc_cols:
+        return
+
+    contrast_type = ""
+    if selection and isinstance(selection.get("contrast_type"), str):
+        contrast_type = selection["contrast_type"]
+
+    n_panels = len(pc_cols)
+    ncols = min(3, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+    fig_h = max(3.0 * nrows, 3.5)
+    fig_w = max(4.0 * ncols, 7.5)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(fig_w, fig_h),
+        sharex=True, squeeze=False,
+    )
+    axes_flat = axes.flatten()
+
+    groups = list(traj_df[group_col].dropna().unique())
+
+    for idx, (col, panel_title) in enumerate(pc_cols):
+        ax = axes_flat[idx]
+        plotted = False
+        for g in groups:
+            sub = traj_df[traj_df[group_col] == g]
+            if sub.empty:
+                continue
+            grouped = sub.groupby(time_col)[col]
+            mean = grouped.mean()
+            std = grouped.std().fillna(0.0)
+            n = grouped.count().clip(lower=1)
+            se = std / np.sqrt(n.to_numpy())
+            if mean.empty:
+                continue
+            xs = np.asarray(mean.index.to_list(), dtype=float)
+            ys = mean.to_numpy()
+            try:
+                color = class_color_for(int(g))
+            except Exception:
+                color = _band_color_for(str(g))
+            ax.plot(xs, ys, color=color, lw=1.4, label=str(g))
+            ax.fill_between(
+                xs, ys - se.to_numpy(), ys + se.to_numpy(),
+                color=color, alpha=0.18, lw=0,
+            )
+            plotted = True
+        ax.set_title(panel_title, fontsize=FONT_LABEL * 0.95)
+        ax.set_xlabel(time_col, fontsize=FONT_LABEL * 0.85)
+        ax.set_ylabel("mean ± SE", fontsize=FONT_LABEL * 0.85)
+        if not plotted:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL * 0.8)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    # Hide unused panels.
+    for k in range(n_panels, nrows * ncols):
+        axes_flat[k].set_visible(False)
+
+    # One shared legend at the figure level.
+    handles_labels = axes_flat[0].get_legend_handles_labels()
+    if handles_labels and handles_labels[0]:
+        fig.legend(
+            handles_labels[0], handles_labels[1],
+            loc="lower center", ncol=min(len(handles_labels[0]), 4),
+            frameon=False, fontsize=FONT_LEGEND * 0.95,
+            bbox_to_anchor=(0.5, -0.02), title=group_col,
+        )
+
+    suptitle = f"Selected-PC KLD trajectories by {group_col}"
+    if contrast_type:
+        suptitle += f" — selection: {contrast_type}"
+    fig.suptitle(suptitle, fontsize=FONT_TITLE, y=0.995)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.12)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_pc12_mean_trajectory_overlay(
+    traj_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    group_col: str = "subgroup",
+    time_col: str = "timestep",
+    pc1_col: str = "kld_pc1_t",
+    pc2_col: str = "kld_pc2_t",
+) -> None:
+    r"""Per-group mean trajectory in (PC1, PC2) space with directional arrows.
+
+    For each group, computes the mean PC1 and PC2 per timestep, draws
+    the resulting curve, and overlays small arrows showing the
+    direction of time progression.
+
+    Args:
+        traj_df: Per-(sample, timestep) trajectory frame.
+        output_path: Destination PDF.
+        group_col: Column whose unique values become separate
+            trajectories (default ``"subgroup"``).
+        time_col: Per-sample time-step column.
+        pc1_col, pc2_col: PC trajectory columns (defaults match the
+            standard ``kld_pc_trajectory.csv`` schema).
+    """
+    if traj_df is None or traj_df.empty:
+        return
+    needed = {group_col, time_col, pc1_col, pc2_col}
+    if not needed.issubset(traj_df.columns):
+        return
+
+    groups = list(traj_df[group_col].dropna().unique())
+    if not groups:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.4))
+    plotted = False
+    fallback_palette = (
+        COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_VERMILLION,
+        COLOR_PURPLE, COLOR_TEAL_DARK, COLOR_GRAY,
+    )
+    for i, g in enumerate(groups):
+        sub = traj_df[traj_df[group_col] == g]
+        if sub.empty:
+            continue
+        mean_per_t = sub.groupby(time_col)[[pc1_col, pc2_col]].mean()
+        if mean_per_t.empty:
+            continue
+        xs = mean_per_t[pc1_col].to_numpy(dtype=float)
+        ys = mean_per_t[pc2_col].to_numpy(dtype=float)
+        try:
+            color = class_color_for(int(g))
+        except Exception:
+            color = fallback_palette[i % len(fallback_palette)]
+        ax.plot(xs, ys, "-o", color=color, lw=1.5, markersize=2.0,
+                label=str(g))
+        # Arrow at the median timestep -> later timestep to show direction.
+        if xs.size >= 4:
+            mid = xs.size // 2
+            ax.annotate(
+                "",
+                xy=(xs[mid + 1], ys[mid + 1]),
+                xytext=(xs[mid], ys[mid]),
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=1.2),
+            )
+        # Mark start and end points.
+        ax.scatter(xs[0], ys[0], color=color, marker="s",
+                   s=40, edgecolors=COLOR_BLACK, linewidths=0.6,
+                   zorder=11)
+        ax.scatter(xs[-1], ys[-1], color=color, marker="*",
+                   s=110, edgecolors=COLOR_BLACK, linewidths=0.6,
+                   zorder=11)
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("PC1 (mean over samples)", fontsize=FONT_LABEL)
+    ax.set_ylabel("PC2 (mean over samples)", fontsize=FONT_LABEL)
+    ax.set_title(
+        f"Per-{group_col} mean trajectory in (PC1, PC2)\n"
+        "■ = first timestep, ★ = last timestep",
+        fontsize=FONT_TITLE * 0.95,
+    )
+    ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND * 0.9,
+              title=group_col)
+    _style_axes(ax, grid="major", minor_ticks=False)
+    fig.subplots_adjust(left=0.13, right=0.97, top=0.88, bottom=0.12)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_aggregate_kld_violins(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    group_col: str = "subgroup",
+    metric_cols: Sequence[str] = ("kld_mean", "kld_sum", "kld_l2"),
+) -> None:
+    r"""Side-by-side violins of aggregate KLD metrics, one panel per metric.
+
+    Args:
+        df: Per-sample DataFrame with at least ``group_col`` and the
+            requested metric columns.
+        output_path: Destination PDF.
+        group_col: Column to split violins by (default ``"subgroup"``).
+        metric_cols: Per-sample metric columns to render, one panel each.
+    """
+    if df is None or df.empty or group_col not in df.columns:
+        return
+    metric_cols = [c for c in metric_cols if c in df.columns]
+    if not metric_cols:
+        return
+
+    groups = list(df[group_col].dropna().unique())
+    if not groups:
+        return
+
+    n_panels = len(metric_cols)
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(max(4.5 * n_panels, 7.0), 3.6),
+        sharey=False, squeeze=False,
+    )
+    axes_flat = axes.flatten()
+
+    fallback_palette = (
+        COLOR_BLUE, COLOR_ORANGE, COLOR_GREEN, COLOR_VERMILLION,
+        COLOR_PURPLE, COLOR_TEAL_DARK, COLOR_GRAY,
+    )
+    palette: Dict[Any, str] = {}
+    for i, g in enumerate(groups):
+        try:
+            palette[g] = class_color_for(int(g))
+        except Exception:
+            palette[g] = fallback_palette[i % len(fallback_palette)]
+
+    for idx, metric in enumerate(metric_cols):
+        ax = axes_flat[idx]
+        data: List[np.ndarray] = []
+        positions: List[float] = []
+        colors: List[str] = []
+        labels: List[str] = []
+        for j, g in enumerate(groups):
+            sub = df[df[group_col] == g][metric].to_numpy(dtype=float)
+            sub = sub[np.isfinite(sub)]
+            if sub.size == 0:
+                continue
+            data.append(sub)
+            positions.append(float(j))
+            colors.append(palette[g])
+            labels.append(str(g))
+        if not data:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL * 0.8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(metric, fontsize=FONT_LABEL)
+            continue
+        parts = ax.violinplot(
+            data, positions=positions, widths=0.85,
+            showmeans=False, showmedians=True,
+        )
+        for body, color in zip(parts.get("bodies", []), colors):
+            body.set_facecolor(color)
+            body.set_edgecolor(COLOR_BLACK)
+            body.set_alpha(0.7)
+        for spine_key in ("cmedians", "cmins", "cmaxes", "cbars"):
+            if spine_key in parts:
+                parts[spine_key].set_edgecolor(COLOR_BLACK)
+                parts[spine_key].set_linewidth(0.7)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, rotation=20, ha="right",
+                           fontsize=plt.rcParams["xtick.labelsize"] * 0.85)
+        ax.set_title(metric, fontsize=FONT_LABEL)
+        ax.set_ylabel(metric, fontsize=FONT_LABEL * 0.9)
+        _style_axes(ax, grid="major", minor_ticks=False)
+
+    fig.suptitle(
+        f"Aggregate KLD metrics by {group_col}",
+        fontsize=FONT_TITLE, y=0.995,
+    )
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.88, bottom=0.20, wspace=0.30)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
 
 
