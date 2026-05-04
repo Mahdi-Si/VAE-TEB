@@ -165,6 +165,18 @@ dataset_config:
     # filename stem as the subgroup name.
     # vae_test_fold_dir: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test
 
+    # Phase 1 multi-GPU dispatch. List the physical GPU ids the testing
+    # pipeline may use. With ``len(test_gpu_ids) >= 2`` the per-subgroup
+    # loop in ``run_full_test_pipeline_by_subgroup`` is dispatched via a
+    # ``spawn`` ``ProcessPoolExecutor`` with one worker per GPU; each
+    # worker is pinned via ``CUDA_VISIBLE_DEVICES`` and runs every
+    # subgroup it is assigned sequentially on that GPU. Phase 2 (the
+    # cross-subgroup post-processor) only starts after every Phase 1
+    # worker has joined. With a single-id list (or this key absent) the
+    # original sequential loop is used. Falls back to ``trainer.cuda_devices``
+    # when ``test_gpu_ids`` is omitted.
+    test_gpu_ids: [0]
+
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/stats.hdf5                    # Path to normalization stats.hdf5
 
     kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
