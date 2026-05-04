@@ -18,7 +18,7 @@ unfrozen two-stage path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,6 +41,17 @@ class LossWeights:
     behaviour); ``α = 1.5`` is the recommended default — late positions
     carry roughly 80% of the per-GUID loss for a typical N_g ≈ 10.
     Padded positions always receive zero weight.
+
+    ``loss_warmup_positions`` (``K_warm`` in §18.17.3 step E) excludes
+    the first K positions of every GUID from the loss reduction.
+    Position $n < K$ has access to only $n+1$ segments of history under
+    the causal mask; with `min_samples_per_guid=3` this means positions
+    0,1,2 are intrinsically near-unsolvable and otherwise pull the loss
+    toward the class prior solution while soaking up gradient mass that
+    should drive the model on the late, informative positions. The
+    masked positions still produce predictions (used by the prefix
+    sweep at eval); they just don't contribute gradient. Default 0
+    (no skip) preserves prior behaviour.
     """
 
     lambda_3: float = 1.0
@@ -48,6 +59,7 @@ class LossWeights:
     gamma_vae: float = 0.0          # 0 in stage 1; 0.1 in stage 2 (set externally)
     lambda_sp: float = 0.0          # 0 in stage 1; 1e-4 in stage 2 (set externally)
     position_weight_alpha: float = 0.0  # 0 = uniform; 1.5 = recommended late-bias
+    loss_warmup_positions: int = 0      # K_warm position skip (§18.17.3 E)
 
 
 class GuidClassifierLoss(nn.Module):
@@ -128,6 +140,7 @@ class GuidClassifierLoss(nn.Module):
         mask: torch.Tensor,
         *,
         position_weight_alpha: float = 0.0,
+        loss_warmup_positions: int = 0,
     ) -> torch.Tensor:
         """Two-level (per-GUID, then batch) weighted mean.
 
@@ -137,13 +150,40 @@ class GuidClassifierLoss(nn.Module):
             position_weight_alpha: Power on the rank ratio inside
                 :meth:`_position_weights_from_mask`. ``0`` reproduces the
                 prior uniform reduction; ``1.5`` up-weights late positions.
+            loss_warmup_positions: Skip the first ``K`` positions of every
+                row from the loss reduction. ``0`` keeps every valid
+                position; ``3`` is the recommended default (matches
+                ``min_samples_per_guid``). Padded positions are skipped
+                regardless.
 
         Returns:
             Scalar tensor — first weighted-average over valid positions
             per row, then average across rows. Rows with zero valid
-            positions contribute zero loss and are excluded from the
-            batch denominator.
+            positions (e.g. all-padded, or all-skipped by ``K_warm``)
+            contribute zero loss and are excluded from the batch
+            denominator.
         """
+        if loss_warmup_positions > 0:
+            # Rank-based skip: drop the first ``K_warm`` *valid* positions
+            # of every row. ``cumsum`` over the bool mask gives a 1-based
+            # rank at valid slots and a carried value at padded slots; we
+            # AND with the original mask so padded slots stay False
+            # regardless of the rank carry-over. This is robust to any
+            # padding placement (right-padded, interior gaps, etc.).
+            #
+            # NOTE: a row whose *entire* valid run is shorter than
+            # ``loss_warmup_positions`` ends up with zero kept positions
+            # and contributes zero loss — it is excluded from the batch
+            # denominator below. The recommended config pairs
+            # ``min_samples_per_guid > loss_warmup_positions`` so this
+            # never happens; with ``min_samples_per_guid == K_warm`` (the
+            # current YAML default 3 / 3), every minimally-qualifying
+            # GUID contributes zero. This is the documented behaviour
+            # (§18.17.3 E) but worth being aware of when tuning the two
+            # thresholds together.
+            rank_one_based = mask.long().cumsum(dim=-1)        # (B, N)
+            warm_keep = (rank_one_based > int(loss_warmup_positions)) & mask
+            mask = warm_keep
         weights = GuidClassifierLoss._position_weights_from_mask(
             mask, position_weight_alpha, per_step.dtype
         )                                                     # (B, N)
@@ -194,6 +234,7 @@ class GuidClassifierLoss(nn.Module):
             per_step,
             mask,
             position_weight_alpha=float(self.weights.position_weight_alpha),
+            loss_warmup_positions=int(self.weights.loss_warmup_positions),
         )
 
     def _bce_per_pos(
@@ -222,6 +263,7 @@ class GuidClassifierLoss(nn.Module):
             per_step,
             mask,
             position_weight_alpha=float(self.weights.position_weight_alpha),
+            loss_warmup_positions=int(self.weights.loss_warmup_positions),
         )
 
     def forward(
@@ -272,53 +314,154 @@ class GuidClassifierLoss(nn.Module):
         return components
 
 
-def estimate_inverse_frequency_class_weights_3(
-    labels_3: Sequence[int],
+_VALID_CLASS_WEIGHT_MODES: Tuple[str, ...] = (
+    "none",
+    "inverse_frequency",
+    "sqrt_inverse_frequency",
+)
+
+
+def _class_count_weights(
+    counts: torch.Tensor, mode: str
 ) -> torch.Tensor:
-    """3-class inverse-frequency weights at the GUID level.
+    """Convert per-class counts into a length-K weight tensor under a mode.
+
+    Args:
+        counts: Length-K float32 tensor of per-class GUID counts.
+        mode: One of ``{"none", "inverse_frequency",
+            "sqrt_inverse_frequency"}``.
+
+    Returns:
+        Length-K float32 weights. ``"none"`` returns ones.
+        ``"inverse_frequency"`` returns ``N_total / (K · N_c)`` per
+        class (so weights sum to K and the *mean* is 1).
+        ``"sqrt_inverse_frequency"`` returns the same expression with a
+        square root applied — the recommended middle ground when
+        inverse-frequency overshoots on bursty mini-batches (§18.17.3
+        step B). Classes absent from the labels get a neutral weight of
+        1.0 in every mode.
+    """
+    mode = str(mode)
+    if mode not in _VALID_CLASS_WEIGHT_MODES:
+        raise ValueError(
+            f"class weight mode {mode!r} not in {_VALID_CLASS_WEIGHT_MODES}"
+        )
+    K = int(counts.numel())
+    if mode == "none":
+        return torch.ones(K, dtype=torch.float32)
+    total = counts.sum().clamp_min(1.0)
+    raw = total / (float(K) * counts.clamp_min(1.0))
+    if mode == "sqrt_inverse_frequency":
+        raw = raw.sqrt()
+    raw = raw.to(torch.float32)
+    raw[counts == 0] = 1.0
+    return raw
+
+
+def estimate_class_weights_3(
+    labels_3: Sequence[int],
+    mode: str = "none",
+) -> torch.Tensor:
+    """3-class GUID-level class weights under a configurable mode.
 
     Args:
         labels_3: Iterable of class ids in ``{0, 1, 2}``.
+        mode: ``"none"`` (uniform — recommended after §18.17.3),
+            ``"inverse_frequency"`` (legacy default), or
+            ``"sqrt_inverse_frequency"`` (softer middle ground).
 
     Returns:
-        Length-3 ``torch.float32`` tensor. Classes absent from ``labels_3``
-        receive a neutral weight of 1.0 (rather than ``total / K``, which is
-        what the naive ``total / (K * counts.clamp_min(1))`` formula would
-        produce).
+        Length-3 ``torch.float32`` tensor.
     """
     counts = torch.zeros(3, dtype=torch.float32)
     for c in labels_3:
         counts[int(c)] += 1.0
-    total = counts.sum().clamp_min(1.0)
-    weights = total / (3.0 * counts.clamp_min(1.0))
-    weights[counts == 0] = 1.0
-    return weights
+    return _class_count_weights(counts, mode)
+
+
+def estimate_class_weights_bin(
+    labels_bin: Sequence[int],
+    mode: str = "none",
+) -> torch.Tensor:
+    """Binary GUID-level class weights under a configurable mode.
+
+    Args:
+        labels_bin: Iterable of class ids in ``{0, 1}``.
+        mode: Same options as :func:`estimate_class_weights_3`.
+
+    Returns:
+        Length-2 ``torch.float32`` tensor ``[w_neg, w_pos]``.
+    """
+    counts = torch.zeros(2, dtype=torch.float32)
+    for c in labels_bin:
+        counts[int(c)] += 1.0
+    return _class_count_weights(counts, mode)
+
+
+def estimate_inverse_frequency_class_weights_3(
+    labels_3: Sequence[int],
+) -> torch.Tensor:
+    """Back-compat shim — calls :func:`estimate_class_weights_3` with
+    ``mode="inverse_frequency"``. Prefer the new function for new code.
+    """
+    return estimate_class_weights_3(labels_3, mode="inverse_frequency")
 
 
 def estimate_inverse_frequency_class_weights_bin(
     labels_bin: Sequence[int],
 ) -> torch.Tensor:
-    """Binary inverse-frequency weights.
+    """Back-compat shim — calls :func:`estimate_class_weights_bin` with
+    ``mode="inverse_frequency"``. Prefer the new function for new code.
+    """
+    return estimate_class_weights_bin(labels_bin, mode="inverse_frequency")
+
+
+def class_priors_3(labels_3: Sequence[int]) -> torch.Tensor:
+    """Empirical 3-class GUID-level prior ``p(y=c)`` in ``{0, 1, 2}``.
 
     Args:
-        labels_bin: Iterable of class ids in ``{0, 1}``.
+        labels_3: Iterable of class ids.
 
     Returns:
-        Length-2 ``torch.float32`` tensor ``[w_neg, w_pos]``. Classes absent
-        from ``labels_bin`` receive a neutral weight of 1.0.
+        Length-3 ``torch.float32`` simplex (sums to 1). Empty input
+        falls back to the uniform prior so callers can use it as a
+        default when the train fold is empty.
+    """
+    counts = torch.zeros(3, dtype=torch.float32)
+    for c in labels_3:
+        counts[int(c)] += 1.0
+    total = counts.sum()
+    if total <= 0:
+        return torch.full((3,), 1.0 / 3.0, dtype=torch.float32)
+    return counts / total
+
+
+def class_prior_bin(labels_bin: Sequence[int]) -> torch.Tensor:
+    """Empirical positive-class prior for the binary head.
+
+    Args:
+        labels_bin: Iterable of binary labels in ``{0, 1}``.
+
+    Returns:
+        Scalar ``torch.float32`` tensor in ``(0, 1)``. Returns 0.5 when
+        ``labels_bin`` is empty so callers have a safe default.
     """
     counts = torch.zeros(2, dtype=torch.float32)
     for c in labels_bin:
         counts[int(c)] += 1.0
-    total = counts.sum().clamp_min(1.0)
-    weights = total / (2.0 * counts.clamp_min(1.0))
-    weights[counts == 0] = 1.0
-    return weights
+    total = counts.sum()
+    if total <= 0:
+        return torch.tensor(0.5, dtype=torch.float32)
+    return (counts[1] / total).to(torch.float32)
 
 
 __all__ = [
     "GuidClassifierLoss",
     "LossWeights",
+    "class_prior_bin",
+    "class_priors_3",
+    "estimate_class_weights_3",
+    "estimate_class_weights_bin",
     "estimate_inverse_frequency_class_weights_3",
     "estimate_inverse_frequency_class_weights_bin",
 ]

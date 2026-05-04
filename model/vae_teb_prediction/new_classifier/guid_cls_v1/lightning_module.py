@@ -286,6 +286,7 @@ class PlGuidClassifier(LightningModelBase):
         rel_d_max: float = 40.0,
         lr: float = 1e-3,
         lr_milestones: Optional[Iterable[int]] = (100,),
+        lr_gamma: float = 0.1,
         lr_warmup_steps: int = 0,
         weight_decay: float = 1e-4,
         vae_lr: float = 1e-5,
@@ -299,9 +300,14 @@ class PlGuidClassifier(LightningModelBase):
             weight_decay=weight_decay,
             module_name="PlGuidClassifierV2",
         )
-        # Stored as attribute (not in hparams) so we can read it in
+        # Stored as attributes (not in hparams) so we can read them in
         # ``build_lr_scheduler`` without adding more arguments to the base.
+        # ``lr_gamma`` was previously hard-coded to 0.1 by a defaulted
+        # ``getattr(self.hparams, "lr_gamma", 0.1)`` that the YAML never
+        # populated; routing it as an explicit attribute here means the
+        # ``training.scheduler.gamma`` YAML key is now actually honoured.
         self.lr_warmup_steps = int(lr_warmup_steps)
+        self.lr_gamma = float(lr_gamma)
         # Bypass torch.compile for variable-shape batches.
         if getattr(base_model, "no_compile", False):
             self.model = self._orig_model
@@ -597,7 +603,11 @@ class PlGuidClassifier(LightningModelBase):
         from torch.optim.lr_scheduler import LinearLR, MultiStepLR, SequentialLR
 
         epoch_milestones = list(getattr(self.hparams, "lr_milestones", None) or [])
-        gamma = float(getattr(self.hparams, "lr_gamma", 0.1))
+        # ``lr_gamma`` is set as an attribute in __init__ rather than via
+        # ``self.hparams`` because the base ``LightningModelBase`` does not
+        # advertise this knob; the YAML key is now plumbed through the
+        # explicit ``lr_gamma`` constructor arg.
+        gamma = float(getattr(self, "lr_gamma", 0.1))
 
         try:
             total_steps = int(self.trainer.estimated_stepping_batches)
@@ -612,11 +622,20 @@ class PlGuidClassifier(LightningModelBase):
             end_factor=1.0,
             total_iters=warmup_steps,
         )
-        # Convert epoch milestones to absolute step counts. Add the warmup
-        # offset because SequentialLR re-bases each child scheduler at the
-        # boundary, so the second scheduler's "step 0" corresponds to the
-        # global step ``warmup_steps``.
-        step_milestones = [int(m) * int(steps_per_epoch) for m in epoch_milestones]
+        # Convert epoch milestones to absolute step counts, then SUBTRACT
+        # the warmup offset because :class:`SequentialLR` re-bases each
+        # child scheduler at the transition: when the warmup phase ends,
+        # the decay scheduler's ``last_epoch`` is reset to 0, so its
+        # milestones are interpreted relative to that boundary, not to
+        # the global step counter. Without the subtraction, milestone
+        # ``M`` fires at global step ``warmup_steps + M`` — i.e. one
+        # warmup window late — which silently delayed every LR drop.
+        # ``max(1, ...)`` guards against milestones that fall inside the
+        # warmup window (those should fire as soon as warmup ends).
+        step_milestones = [
+            max(1, int(m) * int(steps_per_epoch) - int(warmup_steps))
+            for m in epoch_milestones
+        ]
         if step_milestones:
             decay = MultiStepLR(optimizer, milestones=step_milestones, gamma=gamma)
         else:

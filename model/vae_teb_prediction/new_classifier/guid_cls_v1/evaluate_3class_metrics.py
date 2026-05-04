@@ -113,6 +113,38 @@ def _ffill_three_class_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _drop_filled_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter out rows synthesised by :func:`fill_missing_epochs`.
+
+    The legacy gap-filler injects placeholder rows for missing epochs so
+    the binary-side committed metrics see a continuous decision curve;
+    those rows have ``target=1`` (healthy) by construction and a
+    forward-filled ``predicted_class_3``. The per-class
+    forward-fill-against-binary metric machinery (the legacy time-binned
+    fns) explicitly excludes them via ``is_filled==False``, but the
+    *aggregate* 3-class metrics (top-1 accuracy, macro-F1, Brier,
+    confusion-matrix evolution) read ``target`` and ``predicted_class_3``
+    directly and would otherwise count synthesised rows as ground-truth
+    healthy — inflating top-1 accuracy and skewing per-class F1 / Brier.
+
+    The flag column is only present when the upstream gap filler ran;
+    if it's absent (e.g. instantaneous-mode evaluation, which skips the
+    fill pass), this helper is a no-op.
+
+    Args:
+        df: A predictions DataFrame potentially carrying an
+            ``is_filled`` boolean column (see
+            :func:`clinical_metrics_utils.fill_missing_epochs`).
+
+    Returns:
+        ``df`` with synthesised rows removed (or ``df`` unchanged when
+        no flag column exists).
+    """
+    if "is_filled" not in df.columns:
+        return df
+    return df.loc[~df["is_filled"].astype(bool)].copy()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -135,7 +167,9 @@ def _legacy_utils() -> Dict[str, Any]:
         create_enhanced_subgroup_filters,
         ensure_committed_epochs_filled,
         ensure_epoch_hours,
+        find_threshold_for_committed_cumulative_fpr_at_1h,
         find_threshold_for_committed_overall_fpr_at_1h,
+        find_threshold_for_instantaneous_fpr_at_1h,
         plot_single_metric_type,
     )
 
@@ -147,7 +181,9 @@ def _legacy_utils() -> Dict[str, Any]:
         create_enhanced_subgroup_filters=create_enhanced_subgroup_filters,
         ensure_committed_epochs_filled=ensure_committed_epochs_filled,
         ensure_epoch_hours=ensure_epoch_hours,
+        find_threshold_for_committed_cumulative_fpr_at_1h=find_threshold_for_committed_cumulative_fpr_at_1h,
         find_threshold_for_committed_overall_fpr_at_1h=find_threshold_for_committed_overall_fpr_at_1h,
+        find_threshold_for_instantaneous_fpr_at_1h=find_threshold_for_instantaneous_fpr_at_1h,
         plot_single_metric_type=plot_single_metric_type,
     )
 
@@ -220,9 +256,12 @@ def add_perclass_clinical_columns(
         thr = float(thresholds[class_name])
         df[f"_model_pred_{class_name}"] = (df[prob_col] >= thr).astype(int)
         if utils is not None:
-            # Reuse the legacy CDR by swapping the probability column it reads.
-            tmp = df[["guid", "epoch", "binary_target", "prob_class_1"]].copy() if False else None
-            del tmp  # noqa: F841 - kept above for documentation
+            # Reuse the legacy CDR by swapping the probability column
+            # and binary target it reads. The CDR overwrites
+            # ``clinical_pred`` from ``model_pred = (prob_class_1 >=
+            # threshold)`` and forward-fills per GUID, so the per-class
+            # decision uses the same flag-and-stay semantics as the
+            # binary head — preserving binary parity by construction.
             swap = df.copy()
             swap["prob_class_1"] = swap[prob_col]
             swap["binary_target"] = swap[f"binary_target_{class_name}"]
@@ -334,21 +373,34 @@ def compute_binary_by_underlying_class(
 # ---------------------------------------------------------------------------
 
 
+_PERCLASS_THRESHOLD_FN_KEY: Mapping[str, str] = {
+    "instantaneous": "find_threshold_for_instantaneous_fpr_at_1h",
+    "committed_cumulative": "find_threshold_for_committed_cumulative_fpr_at_1h",
+    "committed_overall": "find_threshold_for_committed_overall_fpr_at_1h",
+}
+
+
 def find_perclass_threshold_at_target_fpr(
     df_val: pd.DataFrame,
     class_name: str,
     *,
     target_fpr: float = 0.2,
     decision_time_hours: float = 1.0,
+    metric_type: str = "committed_overall",
     max_gap_multiplier: Optional[float] = None,
     fallback_tolerance_hours: float = 0.5,
 ) -> Tuple[float, Dict[str, Any]]:
-    """OvR-threshold search analogous to ``find_threshold_for_committed_overall_fpr_at_1h``.
+    """OvR-threshold search per class, mode-aware.
 
-    Used as a **secondary** diagnostic. Primary 3-class reporting stays
-    argmax-based. The legacy fn reads ``prob_class_1``, so we temporarily
-    swap in the per-class probability column and per-class binary target
-    before calling it.
+    Mirrors the binary head's per-mode threshold discipline: each mode
+    (``instantaneous`` / ``committed_cumulative`` / ``committed_overall``)
+    has its own legacy threshold-search fn, and we dispatch to the
+    matching one. The legacy fn reads ``prob_class_1`` and
+    ``binary_target``, so we temporarily swap in the per-class
+    probability column and per-class binary target before calling it.
+
+    This is the primary path for selecting per-class operating points
+    when ``evaluation.three_class.threshold_search_default`` is true.
 
     Args:
         df_val: Validation prediction rows (output of
@@ -357,14 +409,29 @@ def find_perclass_threshold_at_target_fpr(
         target_fpr: Target false-positive rate at the decision time.
         decision_time_hours: Hours before delivery at which to evaluate
             (passed to the legacy fn as ``time_window_hours``).
+        metric_type: One of :data:`METRIC_TYPES`. Selects which legacy
+            threshold-search fn to call so the per-class threshold is
+            optimised under the same metric-type semantics that will
+            later score the test fold.
         max_gap_multiplier: Optional gap-fill multiplier (legacy default).
         fallback_tolerance_hours: Decision-time fallback window
             (legacy default).
 
     Returns:
-        Tuple ``(threshold, info_dict)``. ``info_dict`` carries the
-        per-class FPR / sensitivity / specificity at the decision time.
+        Tuple ``(threshold, info_dict)``. ``info_dict`` is normalised to
+        a fixed cross-mode schema:
+        ``{metric_type, class_name, target_fpr, target_time_hours,
+        actual_time_hours, fpr, sensitivity, specificity, n_positive,
+        n_negative, _extra}``. Mode-specific keys (e.g.
+        ``is_primary_metric`` from the committed-overall fn,
+        ``n_positive_available`` from cumulative) are preserved under
+        ``_extra`` for diagnostic use.
     """
+    if metric_type not in _PERCLASS_THRESHOLD_FN_KEY:
+        raise ValueError(
+            f"Unknown metric_type {metric_type!r}; expected one of "
+            f"{tuple(_PERCLASS_THRESHOLD_FN_KEY)}"
+        )
     utils = _legacy_utils()
     target_id = {name: tid for name, tid, _ in CLASS_INFO}[class_name]
     prob_col = {name: pc for name, _, pc in CLASS_INFO}[class_name]
@@ -372,13 +439,57 @@ def find_perclass_threshold_at_target_fpr(
     swap = df_val.copy()
     swap["prob_class_1"] = swap[prob_col]
     swap["binary_target"] = (swap["target"] == target_id).astype(int)
-    return utils["find_threshold_for_committed_overall_fpr_at_1h"](
+    fn = utils[_PERCLASS_THRESHOLD_FN_KEY[metric_type]]
+    threshold, raw_info = fn(
         swap,
         target_fpr=target_fpr,
         time_window_hours=decision_time_hours,
         max_gap_multiplier=max_gap_multiplier,
         fallback_tolerance_hours=fallback_tolerance_hours,
     )
+
+    # The three legacy fns return ``info`` dicts with mode-specific keys
+    # (``n_positive`` vs ``n_positive_available`` vs ``n_positive_total``,
+    # plus ``is_primary_metric`` only on the overall mode). Normalise to
+    # a single fixed schema so downstream consumers — ``aggregate_results``
+    # and the per-fold ``perclass_thresholds_<mode>.json`` writer — can
+    # rely on a stable layout. Mode-specific extras are preserved under
+    # ``_extra`` for diagnostic deep-dives.
+    info: Dict[str, Any] = {
+        "metric_type": str(metric_type),
+        "class_name": str(class_name),
+        "target_fpr": float(target_fpr),
+        "target_time_hours": float(decision_time_hours),
+        "actual_time_hours": float(
+            raw_info.get("actual_time_hours", decision_time_hours)
+        ),
+        "fpr": float(raw_info.get("fpr", float("nan"))),
+        "sensitivity": float(raw_info.get("sensitivity", float("nan"))),
+        "specificity": float(raw_info.get("specificity", float("nan"))),
+        "n_positive": int(
+            raw_info.get(
+                "n_positive",
+                raw_info.get(
+                    "n_positive_available", raw_info.get("n_positive_total", 0)
+                ),
+            )
+            or 0
+        ),
+        "n_negative": int(
+            raw_info.get(
+                "n_negative",
+                raw_info.get(
+                    "n_negative_available", raw_info.get("n_negative_total", 0)
+                ),
+            )
+            or 0
+        ),
+    }
+    extras_seen = {"actual_time_hours", "fpr", "sensitivity", "specificity"}
+    extras = {k: v for k, v in raw_info.items() if k not in extras_seen}
+    if extras:
+        info["_extra"] = extras
+    return float(threshold), info
 
 
 # ---------------------------------------------------------------------------
@@ -505,8 +616,32 @@ def run_3class_evaluation_for_metric_type(
     metric_type: str,
     output_dir: Path,
     thresholds: Optional[Mapping[str, float]] = None,
+    df_val: Optional[pd.DataFrame] = None,
+    target_fpr: float = 0.2,
+    decision_time_hours: float = 1.0,
+    threshold_search_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Compute and persist all per-class artefacts for one metric type.
+
+    Per-class operating points for the
+    ``clinical_pred_<class>`` columns are selected with the following
+    priority (highest first):
+
+    1. ``thresholds`` explicitly passed by the caller — used verbatim.
+    2. ``df_val`` provided — per-class threshold is searched on the
+       validation fold via :func:`find_perclass_threshold_at_target_fpr`
+       under the same ``metric_type`` and target FPR / decision time
+       used by the binary head, and a
+       ``perclass_thresholds_<metric_type>.json`` file is written next
+       to the per-class CSVs.
+    3. Otherwise — fall back to argmax
+       (``predicted_class_3 == c``), preserving the legacy default.
+
+    Note that argmax-derived diagnostics
+    (``predicted_class_3``, top-1 accuracy, macro-F1, confusion-matrix
+    evolution) are unaffected by this resolution: they read
+    ``predicted_class_3`` directly and remain argmax-based regardless of
+    which path produced ``clinical_pred_<class>``.
 
     Args:
         df: Predictions DataFrame after the legacy CDR has been applied
@@ -517,14 +652,56 @@ def run_3class_evaluation_for_metric_type(
         output_dir: Per-fold ``three_metric_types/<metric_type>/`` root.
             ``per_class/`` and ``binary_by_underlying_class/`` are created
             beneath it.
-        thresholds: Optional per-class OvR thresholds. ``None`` (default)
-            uses argmax for clinical predictions.
+        thresholds: Optional per-class OvR thresholds. When provided,
+            short-circuits the search and is used verbatim.
+        df_val: Optional validation predictions DataFrame. When provided
+            and ``thresholds is None``, a per-class threshold is searched
+            here at ``target_fpr`` / ``decision_time_hours`` for the
+            given ``metric_type``.
+        target_fpr: Target FPR for the per-class threshold search; only
+            used when ``df_val`` is set.
+        decision_time_hours: Hours before delivery at which the per-class
+            threshold is evaluated; only used when ``df_val`` is set.
+        threshold_search_kwargs: Optional extra kwargs forwarded to
+            :func:`find_perclass_threshold_at_target_fpr`
+            (``max_gap_multiplier``, ``fallback_tolerance_hours``).
 
     Returns:
         ``{class_name: metrics_df}`` plus the binary-by-underlying-class
         DataFrames keyed as ``binary_only_acidosis`` / ``binary_only_hie``.
     """
     out: Dict[str, pd.DataFrame] = {}
+
+    perclass_info: Dict[str, Dict[str, Any]] = {}
+    if thresholds is None and df_val is not None:
+        thresholds = {}
+        extra = dict(threshold_search_kwargs or {})
+        for class_name, _, _ in CLASS_INFO:
+            try:
+                thr, info = find_perclass_threshold_at_target_fpr(
+                    df_val,
+                    class_name=class_name,
+                    metric_type=metric_type,
+                    target_fpr=target_fpr,
+                    decision_time_hours=decision_time_hours,
+                    **extra,
+                )
+                thresholds[class_name] = float(thr)
+                perclass_info[class_name] = {"threshold": float(thr), **info}
+            except Exception:  # noqa: BLE001 — fall back to argmax for this class
+                logger.exception(
+                    f"per-class threshold search failed for class={class_name!r} "
+                    f"metric_type={metric_type!r} — falling back to argmax for this class"
+                )
+        if not thresholds:
+            thresholds = None  # all classes failed — argmax path
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / f"perclass_thresholds_{metric_type}.json").write_text(
+                json.dumps(perclass_info, indent=2, default=float),
+                encoding="utf-8",
+            )
+
     df_pc = add_perclass_clinical_columns(df, thresholds=thresholds)
 
     pc_root = output_dir / "per_class"
@@ -626,7 +803,7 @@ def compute_topk_accuracy_vs_time(
     """
     if "epoch_hours" not in df.columns:
         raise KeyError("df must have 'epoch_hours' (run ensure_epoch_hours first)")
-    df = _ffill_three_class_columns(df.copy())
+    df = _drop_filled_rows(_ffill_three_class_columns(df.copy()))
     target = df["target"].astype(int).to_numpy() - 1  # -> {0, 1, 2}
     pred = df["predicted_class_3"].astype(int).to_numpy()
     epoch = df["epoch_hours"].astype(float).to_numpy()
@@ -660,7 +837,7 @@ def compute_macro_f1_vs_time(
     """
     if "epoch_hours" not in df.columns:
         raise KeyError("df must have 'epoch_hours'")
-    df = _ffill_three_class_columns(df.copy())
+    df = _drop_filled_rows(_ffill_three_class_columns(df.copy()))
     target = df["target"].astype(int).to_numpy() - 1
     pred = df["predicted_class_3"].astype(int).to_numpy()
     epoch = df["epoch_hours"].astype(float).to_numpy()
@@ -734,7 +911,7 @@ def compute_perclass_brier_vs_time(
     """
     if "epoch_hours" not in df.columns:
         raise KeyError("df must have 'epoch_hours'")
-    df = _ffill_three_class_columns(df.copy())
+    df = _drop_filled_rows(_ffill_three_class_columns(df.copy()))
     target = df["target"].astype(int).to_numpy()  # 1, 2, 3
     epoch = df["epoch_hours"].astype(float).to_numpy()
     bin_idx = _bin_assign(epoch, time_bins)
@@ -1065,7 +1242,7 @@ def plot_confusion_matrix_evolution(
     """
     if "epoch_hours" not in df.columns:
         raise KeyError("df must have 'epoch_hours'")
-    df = _ffill_three_class_columns(df.copy())
+    df = _drop_filled_rows(_ffill_three_class_columns(df.copy()))
     target = df["target"].astype(int).to_numpy() - 1
     pred = df["predicted_class_3"].astype(int).to_numpy()
     epoch = df["epoch_hours"].astype(float).to_numpy()

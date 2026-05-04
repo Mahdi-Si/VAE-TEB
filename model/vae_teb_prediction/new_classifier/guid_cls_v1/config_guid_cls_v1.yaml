@@ -114,7 +114,16 @@ training:
     lambda_2: 0.5                            # Per-position binary BCE  (two-level reduction)
     gamma_vae: 0.1                           # VAE aux loss weight (stage 2 only)
     lambda_sp: 1.0e-4                        # L2 sparsity to θ^(0) (stage 2 only)
-    class_weight_mode: inverse_frequency      # "inverse_frequency" | "none"
+    # Class weighting at the GUID level (§18.17.3 B).
+    #   "none"                   — uniform; the post-§18.17 default. Pairs
+    #                              with the head bias-init below to produce
+    #                              calibrated logits at step 0.
+    #   "sqrt_inverse_frequency" — softer middle ground; rare class
+    #                              upweighted ~√6 ≈ 2.4× instead of 6×.
+    #   "inverse_frequency"      — legacy. With the bursty length-bucket
+    #                              sampler this drove train↓ / val↑
+    #                              divergence past epoch 2-3.
+    class_weight_mode: none                  # "none" | "sqrt_inverse_frequency" | "inverse_frequency"
     # Late-position bias on the per-GUID reduction. Position t (0-based rank
     # within valid entries) gets weight ((rank+1)/n_valid)^alpha. Lowered
     # from 1.5 → 0.5 after the 1.5 setting amplified gradient noise at late
@@ -124,6 +133,24 @@ training:
     # optimizer. Set to 0 for uniform weighting; raise gradually if
     # training is stable.
     position_weight_alpha: 0.5
+    # K_warm position skip (§18.17.3 E). Excludes the first K positions
+    # of every GUID from the loss reduction. With the causal mask,
+    # position n has access to only n+1 segments of history; n < 3 is
+    # near-unsolvable (matches min_samples_per_guid). Skipping these
+    # positions removes the gradient pull toward the class-prior basin
+    # without losing them from the prefix sweep at eval — they still
+    # produce predictions, they just don't drive training. Default 3
+    # is the recommended value; set to 0 to recover the prior behaviour.
+    loss_warmup_positions: 3
+    # Bias-init the per-position head from the empirical train-fold
+    # class prior (§18.17.3 D). When true, ``head_3.bias = log(prior + ε)``
+    # and ``head_bin.bias = logit(prior_pos + ε)`` so that at step 0,
+    # before any features are learned, the model already predicts the
+    # marginal prior. Combined with ``class_weight_mode: none``, this
+    # collapses the "memorize the rare class out of a uniform basin"
+    # gradient noise that otherwise dominates the loss in the first 2–3
+    # epochs.
+    head_bias_init_from_prior: true
 
   # NOTE: prefix_training has been removed — under the causal-AR head, every
   # position contributes a loss in one forward pass per GUID, so stochastic
@@ -237,6 +264,15 @@ evaluation:
   plot_styles:
     guid_binary_primary: true
     three_class_ovr: true
+  three_class:
+    # When true, per-class clinical_pred_<class> columns are derived
+    # from a per-class OvR probability threshold searched on the
+    # validation fold to hit ``target_fpr`` at ``decision_time_hours``
+    # — matching the binary head's operating-point discipline. When
+    # false, they fall back to argmax (predicted_class_3 == c). The
+    # argmax-derived diagnostics (top-1 accuracy, macro-F1, confusion
+    # matrix evolution) are unaffected by this toggle.
+    threshold_search_default: true
 
 
 # =============================================================================
