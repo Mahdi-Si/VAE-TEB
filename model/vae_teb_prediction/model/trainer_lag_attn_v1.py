@@ -198,11 +198,10 @@ class SeqVaeLagAttnPl(LightningModelBase):
     def _sync_skip_decision_across_ranks(
         self, is_spike: bool, device: torch.device
     ) -> bool:
-        """Under DDP, broadcast the skip flag so all ranks agree.
+        """MAX-reduce ``is_spike`` so every DDP rank takes the same branch.
 
-        If one rank returns ``None`` from ``training_step`` while others return
-        a loss, the DDP all-reduce in ``backward`` deadlocks. MAX-reducing the
-        bool tensor ensures that if *any* rank sees a spike, *all* ranks skip.
+        Diverging branches produce mismatched autograd graphs across ranks,
+        which deadlocks the all-reduce inside ``backward``.
         """
         if not (dist.is_available() and dist.is_initialized()):
             return is_spike
@@ -211,14 +210,13 @@ class SeqVaeLagAttnPl(LightningModelBase):
         return bool(flag.item() > 0.0)
 
     def training_step(self, batch: Any, batch_idx: int):  # type: ignore[override]
-        """Run the forward + loss, then gate the optimizer step on a spike check.
+        """Forward + loss, gated by a spike check.
 
-        Returns ``None`` when the current total loss is either non-finite or
-        exceeds ``multiplier × EMA``; Lightning interprets a ``None`` return as
-        "skip backward and optimizer.step() for this batch", which is exactly
-        the semantics we want — the spike gradient never touches Adam's moment
-        estimates and weights are unchanged. On accepted batches the behaviour
-        is identical to the base class.
+        On a spike (non-finite loss, or loss > ``multiplier × EMA``) returns a
+        finite zero-valued no-op loss instead of ``loss``. Lightning rejects
+        ``None`` returns under DDP, so we need a real tensor connected to a
+        parameter; ``anchor.sum() * 0.0`` keeps the all-reduce participating
+        while leaving Adam's moments untouched.
         """
         loss, metrics = self.compute_loss_and_metrics(batch, batch_idx, stage="train")
 
@@ -261,13 +259,9 @@ class SeqVaeLagAttnPl(LightningModelBase):
         ema_for_log = (
             self._spike_ema_loss if self._spike_ema_loss is not None else loss_value
         )
-        metrics["spike_ema_loss"] = torch.tensor(ema_for_log, device=loss.device)
-        metrics["spike_skipped"] = torch.tensor(
-            1.0 if is_spike else 0.0, device=loss.device
-        )
-        metrics["spike_skips_total"] = torch.tensor(
-            float(self._spike_skips_total), device=loss.device
-        )
+        metrics["spike_ema_loss"] = self._as_tensor(ema_for_log)
+        metrics["spike_skipped"] = self._as_tensor(1.0 if is_spike else 0.0)
+        metrics["spike_skips_total"] = self._as_tensor(self._spike_skips_total)
         self._log_metrics(metrics, stage="train", on_step=True)
 
         if is_spike:
@@ -288,10 +282,10 @@ class SeqVaeLagAttnPl(LightningModelBase):
                     is_nonfinite,
                     self._spike_skips_total,
                 )
-            # Returning None tells Lightning to skip backward + optimizer.step()
-            # for this batch. Weights, Adam moments, and LR scheduler are all
-            # left untouched. This is the circuit-breaker behaviour.
-            return None
+            # No-op loss built from a parameter (not the possibly-NaN ``loss``)
+            # so backward stays finite and DDP all-reduce participates.
+            anchor = next(p for p in self.parameters() if p.requires_grad)
+            return anchor.sum() * 0.0
 
         return loss
 
