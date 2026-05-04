@@ -131,13 +131,22 @@ def guid_sequence_collate_fn(
 
     B = len(batch)
     N = max(int(s["num_segments"]) for s in batch)
+    sample0 = batch[0]
 
     out: Dict[str, Any] = {}
-    out["h_y"] = _pad_seg_tensor(batch, "h_y", N)
-    out["mu_prior_norm"] = _pad_seg_tensor(batch, "mu_prior_norm", N)
-    out["mu_post_norm"] = _pad_seg_tensor(batch, "mu_post_norm", N)
-    out["kld_per_t"] = _pad_seg_tensor(batch, "kld_per_t", N)
-    out["mean_alpha"] = _pad_seg_tensor(batch, "mean_alpha", N)
+    # Cached-VAE keys (precompute path). Skipped silently when the live
+    # dataset omits them — the live forward path will compute them
+    # on-the-fly from the raw signals below.
+    if "h_y" in sample0:
+        out["h_y"] = _pad_seg_tensor(batch, "h_y", N)
+    if "mu_prior_norm" in sample0:
+        out["mu_prior_norm"] = _pad_seg_tensor(batch, "mu_prior_norm", N)
+    if "mu_post_norm" in sample0:
+        out["mu_post_norm"] = _pad_seg_tensor(batch, "mu_post_norm", N)
+    if "kld_per_t" in sample0:
+        out["kld_per_t"] = _pad_seg_tensor(batch, "kld_per_t", N)
+    if "mean_alpha" in sample0:
+        out["mean_alpha"] = _pad_seg_tensor(batch, "mean_alpha", N)
     out["weight"] = _pad_seg_tensor(batch, "weight", N)
     out["hat_w"] = _pad_seg_tensor(batch, "hat_w", N)
     out["target_per_t"] = _pad_seg_tensor(batch, "target_per_t", N, fill_value=-1)
@@ -147,6 +156,12 @@ def guid_sequence_collate_fn(
     out["delta_t_hours"] = _pad_seg_tensor(batch, "delta_t_hours", N)
     out["cs_label"] = _pad_seg_tensor(batch, "cs_label", N).to(torch.bool)
     out["bg_label"] = _pad_seg_tensor(batch, "bg_label", N).to(torch.bool)
+    # Live-VAE keys (raw signals). Present only when the dataset is
+    # :class:`LiveGuidSequenceDataset`. The classifier's
+    # :meth:`live_forward` consumes them; the cached forward ignores them.
+    for raw_key in ("fhr_st", "fhr_ph", "up_st", "up_ph"):
+        if raw_key in sample0:
+            out[raw_key] = _pad_seg_tensor(batch, raw_key, N)
     out["time_from_labor_onset"] = _pad_seg_tensor(
         batch, "time_from_labor_onset", N, fill_value=float("nan")
     )

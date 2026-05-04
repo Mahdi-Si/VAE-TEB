@@ -35,6 +35,9 @@ from loguru import logger
 from torch.utils.data import DataLoader
 
 from hdf5_dataset.length_bucket_sampler import VariableBatchBucketSampler
+from model.vae_teb_prediction.new_classifier.guid_cls_v1.callbacks import (
+    TwoStageVaeUnfreeze,
+)
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.collate import (
     guid_sequence_collate_fn,
 )
@@ -44,6 +47,7 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import 
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_dataset import (
     GuidSequenceDataset,
+    LiveGuidSequenceDataset,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.lightning_module import (
     PlGuidClassifier,
@@ -55,6 +59,8 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.losses import (
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.precompute_latents import (
     _resolve_run_dir,
+    build_vae_from_config,
+    get_fold_partition_files,
     precompute_fold_latents,
 )
 
@@ -317,73 +323,135 @@ def train_fold(
     logger.info(f"[fold {fold_id}] run_dir={run_dir} fold_dir={fold_dir}")
 
     # ------------------------------------------------------------------
-    # Precompute caches (frozen-VAE path)
+    # Precompute caches (frozen-VAE path) / VAE checkpoint load (live)
     # ------------------------------------------------------------------
     freeze_vae = bool(config["vae"].get("freeze_vae", True))
-    if not freeze_vae:
-        # Live-VAE / two-stage fine-tune mode (PRD §8.4 + Phase 7 of the
-        # implementation roadmap) is not yet wired. The supporting
-        # infrastructure is already in place:
-        #   * LossWeights.gamma_vae and lambda_sp control the stage-2 VAE
-        #     auxiliary loss + L2 sparsity terms.
-        #   * PlGuidClassifier.build_optimizer creates two parameter groups
-        #     when a ``vae`` attribute exists on the classifier, applying
-        #     ``training.optimizer.vae.lr`` (default 1e-5) to that group.
-        # To finish Phase 7 you need: (1) a ``LiveGuidSequenceDataset`` that
-        # returns raw per-segment fields per GUID (fhr_st / fhr_ph / up_st /
-        # up_ph / weight / target / epoch / tlo / sso / cs_label / bg_label),
-        # (2) a ``LiveGuidOutcomeClassifier`` that owns a ``SeqVaeLagAttnV1``
-        # module and routes raw batches through ``vae.encode_only`` before
-        # the existing tokenizer/transformer/heads, (3) a Lightning callback
-        # that toggles ``requires_grad`` on the VAE encoder + adapters +
-        # prior + posterior heads at ``training.two_stage.stage1_epochs``
-        # and refreshes the optimizer.
-        raise NotImplementedError(
-            "freeze_vae=False (live VAE + two-stage fine-tune) is scaffolded "
-            "but not yet wired end-to-end. See the comment block in "
-            "single_fold_trainer.train_fold for the implementation outline. "
-            "Set vae.freeze_vae=true to use the precompute path."
+    cls_cfg = config["model_config"]["classifier"]
+    ds_cfg = config["dataset_config"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae_module = None
+    if freeze_vae:
+        if auto_precompute:
+            precompute_fold_latents(
+                config=config,
+                fold_id=fold_id,
+                output_root=run_dir,
+                device=device,
+            )
+    else:
+        logger.info(
+            f"[fold {fold_id}] live-VAE path enabled — loading checkpoint "
+            f"and building raw-segment datasets"
         )
-    if auto_precompute:
-        precompute_fold_latents(
-            config=config,
-            fold_id=fold_id,
-            output_root=run_dir,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        )
+        vae_module = build_vae_from_config(config, device)
+        # ``build_vae_from_config`` sets eval() + requires_grad=False on every
+        # param. Keep params frozen for stage 1, but flip back into ``train()``
+        # mode so encoder dropout stays on as documented in §12.2 ("freeze
+        # parameters", not "freeze stochasticity"). The TwoStageVaeUnfreeze
+        # callback flips ``requires_grad=True`` on the documented subset at
+        # the stage-1 → stage-2 boundary.
+        vae_module.train()
 
     # ------------------------------------------------------------------
     # Datasets
     # ------------------------------------------------------------------
-    cache_root = (
-        run_dir
-        / config.get("precompute", {}).get("out_subdir", "precomputed_latents")
-        / f"fold_{fold_id}"
-    )
-    train_ds = GuidSequenceDataset(
-        cache_root / "train.hdf5",
-        warmup_left=int(config["model_config"]["classifier"]["warmup_left"]),
-        warmup_right=int(config["model_config"]["classifier"]["warmup_right"]),
-        min_samples_per_guid=int(config["dataset_config"]["min_samples_per_guid"]),
-        min_valid_weight_fraction=float(
-            config["dataset_config"]["min_valid_weight_fraction"]
-        ),
-        cross_delivery_censoring=bool(
-            config["model_config"]["classifier"]["cross_delivery_censoring"]
-        ),
-    )
-    val_ds = GuidSequenceDataset(
-        cache_root / "val.hdf5",
-        warmup_left=int(config["model_config"]["classifier"]["warmup_left"]),
-        warmup_right=int(config["model_config"]["classifier"]["warmup_right"]),
-        min_samples_per_guid=int(config["dataset_config"]["min_samples_per_guid"]),
-        min_valid_weight_fraction=float(
-            config["dataset_config"]["min_valid_weight_fraction"]
-        ),
-        cross_delivery_censoring=bool(
-            config["model_config"]["classifier"]["cross_delivery_censoring"]
-        ),
-    )
+    if freeze_vae:
+        cache_root = (
+            run_dir
+            / config.get("precompute", {}).get("out_subdir", "precomputed_latents")
+            / f"fold_{fold_id}"
+        )
+        train_ds = GuidSequenceDataset(
+            cache_root / "train.hdf5",
+            warmup_left=int(cls_cfg["warmup_left"]),
+            warmup_right=int(cls_cfg["warmup_right"]),
+            min_samples_per_guid=int(ds_cfg["min_samples_per_guid"]),
+            min_valid_weight_fraction=float(ds_cfg["min_valid_weight_fraction"]),
+            cross_delivery_censoring=bool(cls_cfg["cross_delivery_censoring"]),
+        )
+        val_ds = GuidSequenceDataset(
+            cache_root / "val.hdf5",
+            warmup_left=int(cls_cfg["warmup_left"]),
+            warmup_right=int(cls_cfg["warmup_right"]),
+            min_samples_per_guid=int(ds_cfg["min_samples_per_guid"]),
+            min_valid_weight_fraction=float(ds_cfg["min_valid_weight_fraction"]),
+            cross_delivery_censoring=bool(cls_cfg["cross_delivery_censoring"]),
+        )
+    else:
+        kfold_base_path = ds_cfg["kfold_base_path"]
+        test_mode = ds_cfg.get("test_mode")
+        train_files = get_fold_partition_files(
+            kfold_base_path, fold_id, "train", test_mode=test_mode
+        )
+        val_files = get_fold_partition_files(
+            kfold_base_path, fold_id, "val", test_mode=test_mode
+        )
+        live_T = int(config["vae"]["model_kwargs"]["sequence_length"])
+        live_warmup_left = int(cls_cfg["warmup_left"])
+        live_warmup_right = int(cls_cfg["warmup_right"])
+        live_min_samples = int(ds_cfg["min_samples_per_guid"])
+        live_min_w = float(ds_cfg["min_valid_weight_fraction"])
+        live_cross_censor = bool(cls_cfg["cross_delivery_censoring"])
+        live_epoch_min = ds_cfg.get("epoch_min")
+        live_trim = float(ds_cfg.get("trim_minutes", 1.0))
+        live_stats_path = ds_cfg.get("stats_path")
+        live_normalize_fields = ds_cfg.get("normalize_fields")
+        live_d_model_vae = int(config["vae"]["model_kwargs"]["d_model"])
+        live_d_z = int(config["vae"]["model_kwargs"]["d_z"])
+        train_ds = LiveGuidSequenceDataset(
+            train_files,
+            T=live_T,
+            warmup_left=live_warmup_left,
+            warmup_right=live_warmup_right,
+            min_samples_per_guid=live_min_samples,
+            min_valid_weight_fraction=live_min_w,
+            cross_delivery_censoring=live_cross_censor,
+            epoch_min=live_epoch_min,
+            trim_minutes=live_trim,
+            stats_path=live_stats_path,
+            normalize_fields=live_normalize_fields,
+            d_model_vae=live_d_model_vae,
+            d_z=live_d_z,
+        )
+        val_ds = LiveGuidSequenceDataset(
+            val_files,
+            T=live_T,
+            warmup_left=live_warmup_left,
+            warmup_right=live_warmup_right,
+            min_samples_per_guid=live_min_samples,
+            min_valid_weight_fraction=live_min_w,
+            cross_delivery_censoring=live_cross_censor,
+            epoch_min=live_epoch_min,
+            trim_minutes=live_trim,
+            stats_path=live_stats_path,
+            normalize_fields=live_normalize_fields,
+            d_model_vae=live_d_model_vae,
+            d_z=live_d_z,
+        )
+
+        # ------------------------------------------------------------------
+        # Latent stats: populate vae.mu_post_running_{mean,var,count} once
+        # so the live tokenizer can z-score mu_post / mu_prior with the
+        # same stats the precompute path bakes into the cache attrs.
+        # ------------------------------------------------------------------
+        from hdf5_dataset.hdf5_dataset import attribute_dict_collate  # noqa: WPS433
+        stats_loader = DataLoader(
+            train_ds._underlying,                           # raw segment view
+            batch_size=int(config["vae"].get("vae_chunk_size", 32)),
+            shuffle=False,
+            drop_last=False,
+            num_workers=0,
+            collate_fn=attribute_dict_collate,
+        )
+        n_stats = vae_module.fit_latent_stats(
+            stats_loader,
+            max_batches=config["vae"].get("fit_latent_stats_max_batches"),
+            device=device,
+        )
+        logger.info(
+            f"[fold {fold_id}] vae.fit_latent_stats finished on "
+            f"{n_stats} samples"
+        )
 
     # ------------------------------------------------------------------
     # Class weights from the *train* fold only
@@ -430,7 +498,6 @@ def train_fold(
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    cls_cfg = config["model_config"]["classifier"]
     head_hidden_raw = cls_cfg.get("head_hidden_dim")
     classifier_cfg = GuidClassifierConfig(
         d_model_vae=int(train_ds.d_model_vae),
@@ -451,6 +518,12 @@ def train_fold(
         dropout=float(cls_cfg.get("dropout", 0.1)),
     )
     classifier = GuidOutcomeClassifier(classifier_cfg)
+    if not freeze_vae:
+        # Attach the VAE submodule so ``forward`` dispatches to
+        # ``live_forward`` and ``build_optimizer`` produces a two-group
+        # AdamW (low-LR group activated when params unfreeze at stage 2).
+        classifier.vae = vae_module
+        classifier.vae_chunk_size = int(config["vae"].get("vae_chunk_size", 32))
 
     train_cfg = config.get("training", {}) or {}
     loss_cfg = train_cfg.get("loss", {}) or {}
@@ -493,6 +566,20 @@ def train_fold(
         es_patience=int(train_cfg.get("early_stopping", {}).get("patience", 50)),
         es_enabled=bool(train_cfg.get("early_stopping", {}).get("enabled", True)),
     )
+    if not freeze_vae:
+        two_stage_cfg = train_cfg.get("two_stage", {}) or {}
+        stage1_epochs = int(two_stage_cfg.get("stage1_epochs", 100))
+        callbacks.append(
+            TwoStageVaeUnfreeze(
+                stage1_epochs=stage1_epochs,
+                gamma_vae_stage2=float(loss_cfg.get("gamma_vae", 0.1)),
+                lambda_sp_stage2=float(loss_cfg.get("lambda_sp", 1e-4)),
+            )
+        )
+        logger.info(
+            f"[fold {fold_id}] TwoStageVaeUnfreeze callback registered "
+            f"(stage1_epochs={stage1_epochs})"
+        )
 
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     devices = [int(gpu_id)] if accelerator == "gpu" else 1

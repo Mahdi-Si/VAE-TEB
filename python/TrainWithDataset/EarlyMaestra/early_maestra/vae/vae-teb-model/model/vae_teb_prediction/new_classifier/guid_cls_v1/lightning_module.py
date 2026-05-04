@@ -361,7 +361,28 @@ class PlGuidClassifier(LightningModelBase):
                 rel_d_max=self.rel_d_max,
             )
         outputs = self.model(batch)
-        components = self.loss(outputs=outputs, batch=batch)
+
+        # Live-VAE auxiliary terms. Computed only when the live forward
+        # populated ``vae_outputs`` and at least one of the multipliers
+        # is non-zero (i.e. stage 2 is active or the user explicitly
+        # turned them on for ablation). Stage 1 keeps ``gamma_vae`` and
+        # ``lambda_sp`` at zero — :class:`TwoStageVaeUnfreeze` toggles
+        # them at the boundary.
+        vae_loss_scalar = None
+        sparsity_scalar = None
+        if "vae_outputs" in outputs and (
+            self.loss_weights.gamma_vae > 0.0
+            or self.loss_weights.lambda_sp > 0.0
+        ):
+            vae_loss_scalar, sparsity_scalar = self._compute_live_aux_terms(
+                outputs["vae_outputs"]
+            )
+        components = self.loss(
+            outputs=outputs,
+            batch=batch,
+            vae_loss=vae_loss_scalar,
+            sparsity_term=sparsity_scalar,
+        )
         total = components["total_loss"]
 
         seg_mask = batch["segment_mask"]
@@ -398,6 +419,72 @@ class PlGuidClassifier(LightningModelBase):
         if stage == "val":
             self._buffer_val_outputs(last_prob_3, last_prob_bin, target_3, target_bin)
         return total, metrics
+
+    def _compute_live_aux_terms(
+        self,
+        vae_outputs: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Build the per-batch VAE-aux KL + L2-anchor terms (live path).
+
+        The KL is reduced as a per-step weighted mean over the
+        classifier-time mask ``hat_w_v`` (same definition the cached
+        path uses for the per-segment summary). The L2 anchor is
+        ``Σ ‖θ − θ⁽⁰⁾‖₂²`` over the unfrozen VAE submodules — only
+        evaluated once :class:`TwoStageVaeUnfreeze` has snapshotted
+        ``θ⁽⁰⁾`` at stage 2 start.
+
+        Args:
+            vae_outputs: The ``vae_outputs`` sub-dict produced by
+                :meth:`GuidOutcomeClassifier.live_forward`.
+
+        Returns:
+            ``(vae_loss, sparsity_or_None)``. ``vae_loss`` is always a
+            scalar tensor; ``sparsity`` is ``None`` when no anchor was
+            recorded yet.
+        """
+        kld_per_t = vae_outputs["kld_per_t"]                  # (M, T)
+        hat_w_v = vae_outputs["hat_w_v"]                      # (M, T)
+        weight_sum = hat_w_v.sum().clamp_min(1.0)
+        vae_loss = (kld_per_t * hat_w_v).sum() / weight_sum
+
+        sparsity: Optional[torch.Tensor] = None
+        theta0 = getattr(self, "_vae_theta0", None)
+        names = getattr(self, "_vae_unfreeze_names", None)
+        if (
+            theta0 is not None
+            and names
+            and self.loss_weights.lambda_sp > 0.0
+        ):
+            base = getattr(self, "_orig_model", self)
+            vae = getattr(base, "vae", None)
+            if vae is not None:
+                accum = kld_per_t.new_zeros(())
+                for name in names:
+                    p0 = theta0.get(name)
+                    if p0 is None:
+                        continue
+                    p = self._lookup_param(vae, name)
+                    if p is None or not p.requires_grad:
+                        continue
+                    diff = p - p0.to(device=p.device, dtype=p.dtype)
+                    accum = accum + diff.pow(2).sum()
+                sparsity = accum
+        return vae_loss, sparsity
+
+    @staticmethod
+    def _lookup_param(
+        vae: torch.nn.Module, qualified_name: str
+    ) -> Optional[torch.nn.Parameter]:
+        """Resolve ``submodule.param.path`` against the VAE module tree."""
+        try:
+            obj: Any = vae
+            for part in qualified_name.split("."):
+                obj = getattr(obj, part)
+            if isinstance(obj, torch.nn.Parameter):
+                return obj
+        except AttributeError:
+            return None
+        return None
 
     def _buffer_val_outputs(
         self,

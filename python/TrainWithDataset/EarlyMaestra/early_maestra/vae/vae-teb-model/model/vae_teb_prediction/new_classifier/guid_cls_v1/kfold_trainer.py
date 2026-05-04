@@ -308,9 +308,11 @@ def run_kfold_parallel(
         fold_ids = list(int(f) for f in fold_ids)
 
     started = datetime.now(timezone.utc)
+    freeze_vae = bool(config.get("vae", {}).get("freeze_vae", True))
     logger.info(
         f"run_kfold_parallel: folds={fold_ids} gpus={cuda_devices} "
-        f"max_parallel={max_parallel} run_dir={run_dir}"
+        f"max_parallel={max_parallel} run_dir={run_dir} "
+        f"freeze_vae={freeze_vae}"
     )
 
     results: Dict[int, Dict[str, Any]] = {}
@@ -335,7 +337,10 @@ def run_kfold_parallel(
             "CUDA_VISIBLE_DEVICES", str(sequential_gpu)
         )
         for fid in fold_ids:
-            logger.info(f"--- fold {fid} on physical GPU {sequential_gpu} ---")
+            logger.info(
+                f"--- fold {fid} on physical GPU {sequential_gpu} "
+                f"(freeze_vae={freeze_vae}) ---"
+            )
             results[int(fid)] = _run_one_fold_subprocess(
                 fold_id=int(fid),
                 gpu_id=sequential_gpu,
@@ -381,7 +386,10 @@ def run_kfold_parallel(
                     "gpu": gpu,
                     "started_monotonic": time.monotonic(),
                 }
-                logger.info(f"submitted fold {fid} -> physical GPU {gpu}")
+                logger.info(
+                    f"submitted fold {fid} -> physical GPU {gpu} "
+                    f"(freeze_vae={freeze_vae})"
+                )
 
             progressed = False
             for fid in list(active.keys()):
