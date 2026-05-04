@@ -38,6 +38,62 @@ emitted by this pipeline.
 
 ---
 
+## Two-Phase Subgroup Mode
+
+The pipeline can run in two modes. The legacy single-pass mode pools
+every test HDF5 file into one DataLoader and post-hoc splits per-class
+analyses by the `label` column. The new two-phase subgroup mode treats
+each of the 8 canonical CTG subgroups (`healthy_no_bg_no_cs`,
+`healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`,
+`acidosis_no_cs`, `acidosis_cs`, `hie_no_cs`, `hie_cs`) as a
+first-class unit:
+
+- **Phase 1** runs `run_full_test_pipeline` once per subgroup with
+  `single_class_mode=True` and writes its full per-analysis tree under
+  `<output>/phase1/<subgroup>/`. Each subgroup is intrinsically
+  single-class so the two analyses that depend on multi-class input
+  (`class_separation`, `per_class_breakdown`) are skipped — their
+  results dict entries become `{"status": "skipped_single_class"}`.
+  The Step-0 probe still runs but the "only 1 file / 1 class" warnings
+  are downgraded from ERROR to INFO. One subgroup's failure does not
+  abort the others.
+- **Phase 2** is a CSV-driven post-processor
+  (`analyses/cross_subgroup_breakdown.py`). It reads every Phase 1
+  folder under `<output>/phase1/` and emits cross-subgroup overlay
+  PDFs plus formal statistical comparisons under
+  `<output>/phase2/cross_subgroup/`: Kruskal-Wallis $H$ test across $N$
+  subgroups for each per-sample metric, pairwise Mann-Whitney U with
+  Holm-Bonferroni correction for metrics that are significant after
+  Holm, and Cliff's $\delta$ effect-size for the headline metrics
+  ($\textit{feat\_mse\_total}$, $\textit{feat\_r2\_total}$,
+  $\textit{uplift\_rel}$, $\textit{residual\_ratio}$,
+  $\textit{kld\_mean}$, $\textit{te\_lag\_peak}$). Phase 2 is skipped
+  automatically when only one subgroup is supplied.
+
+Phase 2 is CPU-only and re-runnable from disk against any existing
+`phase1/` tree without reloading the model — call
+`run_cross_subgroup_breakdown(<phase1_root>, <output_dir>)` directly.
+This matters because Phase 1 takes hours and Phase 2 takes seconds.
+
+The driver is `run_full_test_pipeline_by_subgroup(subgroups, ...)`. The
+`subgroups` argument is a `Mapping[str, Sequence[str]]` — when not
+passed explicitly it is resolved from
+`dataset_config.vae_test_subgroups` in the YAML config (preferred) or
+from `dataset_config.vae_test_fold_dir` via auto-glob, or from the
+legacy `dataset_config.vae_test_datasets` flat list grouped by filename
+stem. The helpers `resolve_subgroups`, `CANONICAL_ORDER`,
+`SUBGROUP_TO_LABEL`, `SUBGROUP_COLORS` live in
+`analyses/subgroup_utils.py`.
+
+The `__main__` block dispatches on the resolved mapping size: when
+`>= 2` subgroups are configured it calls
+`run_full_test_pipeline_by_subgroup`; otherwise it falls through to
+the single-pass `run_full_test_pipeline`. This means existing
+deployments continue to behave exactly as before until a
+`vae_test_subgroups` block is added to the YAML.
+
+---
+
 ## Design Principles
 
 1. **Minimal** — least code necessary, no over-engineering.
@@ -92,6 +148,8 @@ testing/
 │   ├── kld_pca.py              # PCA on per-dim KL trajectory + by-class
 │   ├── kld_lag_diagnostics.py  # Per-sample KLD + lag-attention PDFs
 │   ├── per_class_breakdown.py  # Post-processor: splits pooled CSVs per class
+│   ├── subgroup_utils.py       # Subgroup discovery + canonical order + colour palette (Phase 1/2)
+│   ├── cross_subgroup_breakdown.py  # Phase 2 post-processor: cross-subgroup overlays + stats
 │   ├── latent.py               # Per-dim latent histograms + 3D PCA
 │   ├── trajectory.py           # Per-patient latent trajectory + KLD
 │   ├── class_separation.py     # Latent class-separation tiers (consumes probe)
@@ -253,6 +311,7 @@ tensors.
 | `compute_forecast_metrics(mu_full, y_plus, warmup, horizon)` | `(B,T,H_d,C)` + `(B,T−H_d,H_d,C)` | `{feat_mse_total, feat_mse_per_horizon, feat_r2_total, feat_mse_st, feat_mse_ph}` | Feature-forecast quality split into scattering (ch 0..42) and phase (ch 43..86). |
 | **`compute_band_forecast_metrics(mu_full, y_plus, warmup, horizon, partition_idx, *, return_per_anchor=True, band_combined_idx=None)`** | same shapes + `Dict[label, int-array]` | `{label -> {mse_total (B,), mse_per_horizon (B,H_d), r2_total (B,), n_channels, mse_per_anchor (B,T_v)}}` | Channel-sliced version of `compute_forecast_metrics`. Generalised: `partition_idx` accepts any `label -> int_array` mapping (clinical 4-band, refined 7-band, by_kind, by_octave). The legacy `band_combined_idx` keyword is preserved as a back-compat alias. |
 | **`compute_per_channel_forecast_metrics(mu_full, y_plus, warmup, horizon)`** | same shapes | `{mse_per_channel (B, C_y), r2_per_channel (B, C_y)}` | Per-sample × per-channel forecast MSE / R² over valid anchors. Channel-mean equals `feat_mse_total` from `compute_forecast_metrics`. Powers the `per_channel/` diagnostics that ask "which exact channel is hardest to forecast?" without pre-binning into a band. |
+| **`compute_per_channel_per_horizon_forecast_metrics(mu_full, y_plus, warmup, horizon)`** | same shapes | `{mse_per_channel_per_horizon (B, C_y, H_d), r2_per_channel_per_horizon (B, C_y, H_d), n_valid_anchors (scalar tensor)}` | Same as `compute_per_channel_forecast_metrics` but keeps the horizon axis intact. Drives the `freq_horizon/` (channel × horizon-step) heatmaps; the streaming accumulator inside `run_frequency_band_forecast_analysis` averages this across every sample/anchor. Memory $O(B \cdot C \cdot H_d)$. |
 | `compute_uplift_metrics(mu_full, mu_base, y_plus, warmup, horizon)` | same as above | `{l_full, l_base, uplift_abs, uplift_rel}` | Baseline-vs-full uplift per sample. |
 | `compute_residual_usage(delta_mu_src, mu_full, warmup, horizon)` | `(B,T,H_d,C)` | `{delta_norm, full_norm, residual_ratio, delta_norm_t}` | Source-branch activity and per-anchor trace. |
 | `compute_attention_diagnostics(attn_weights, warmup)` | `(B,T,M,L)` | `{alpha_bar, argmax_lag, entropy, head_diversity, alpha_mass_by_lag}` | Lag-attention summary with NaN-filled warmup. |
@@ -327,12 +386,16 @@ These helpers are imported by every class-aware analysis.
 | `plot_attention_mass_by_lag(mass_df, out_path, fs=4, decim=16)` | PDF | Grouped bar chart of mean attention mass in coarse lag bins (0-10s, 10-30s, 30-60s, 60-120s, 120-360s, ≥360s). |
 | `plot_metric_histograms(df, output_dir, ...)` | PDF | Pooled single-column histogram panel (v1 metrics or legacy fallback). |
 | **`plot_metric_histograms_by_class(df, output_dir, ...)`** | PDF | Grid of metric × class subplots when ≤4 classes; overlaid densities when more. Falls back to the pooled plot when <2 classes present. |
-| **`plot_band_violin(df, value_col, out_path, *, n_channels_by_band=…)`** | PDF | One violin per band on a single axes; annotated with channel count + sample count. |
-| **`plot_band_violin_by_class(df, value_col, out_path)`** | PDF | Grouped violin: bands on x, classes as colour. Falls back to pooled `plot_band_violin` when <2 classes. |
-| **`plot_band_horizon_error(per_horizon_df, out_path, *, value_col="mse")`** | PDF | Median+IQR ribbon, one line per band, x = horizon step `h`. |
-| **`plot_band_anchor_error(per_anchor_df, out_path, *, value_col="mse", decim_step_seconds=4.0)`** | PDF | Median+IQR ribbon, one line per band, x = anchor position rescaled to minutes. |
-| **`plot_band_horizon_error_by_class(per_horizon_df, out_path)`** | PDF | Grid of subplots — rows = bands, cols = classes, each cell is a horizon-error ribbon. Falls back to pooled when <2 classes. |
-| **`plot_band_anchor_error_by_class(per_anchor_df, out_path, *, decim_step_seconds=4.0)`** | PDF | Same shape as horizon variant but x = anchor in minutes. |
+| **`plot_band_violin(df, value_col, out_path, *, n_channels_by_band=…, band_hz_ranges=None)`** | PDF | One violin per band on a single axes; annotated with channel count + sample count. When `band_hz_ranges` is supplied, every x-tick label is suffixed with the explicit Hz range (e.g. `deceleration\n(0.008–0.04 Hz)`). |
+| **`plot_band_violin_by_class(df, value_col, out_path, *, band_hz_ranges=None)`** | PDF | Grouped violin: bands on x, classes as colour. Falls back to pooled `plot_band_violin` when <2 classes. Same Hz-suffix behaviour. |
+| **`plot_band_horizon_error(per_horizon_df, out_path, *, value_col="mse", band_hz_ranges=None)`** | PDF | Median+IQR ribbon, one line per band, x = horizon step `h`. Hz suffixes appear in the legend. |
+| **`plot_band_anchor_error(per_anchor_df, out_path, *, value_col="mse", decim_step_seconds=4.0, band_hz_ranges=None)`** | PDF | Median+IQR ribbon, one line per band, x = anchor position rescaled to minutes. |
+| **`plot_band_horizon_error_by_class(per_horizon_df, out_path, *, band_hz_ranges=None)`** | PDF | Grid of subplots — rows = bands, cols = classes, each cell is a horizon-error ribbon. Falls back to pooled when <2 classes. Hz suffixes on row labels. |
+| **`plot_band_anchor_error_by_class(per_anchor_df, out_path, *, decim_step_seconds=4.0, band_hz_ranges=None)`** | PDF | Same shape as horizon variant but x = anchor in minutes. |
+| **`plot_freq_horizon_heatmap_scattering(mse_grid, freq_hz, channel_ids, horizon, fs_hz, out_path, *, n_samples, n_anchors_total=0, log_color=True)`** | PDF + PNG | $(43, H_d)$ scattering heatmap with explicit Hz tick labels (high $\rightarrow$ low), x = horizon step + seconds, magma + LogNorm. Right-margin column shows the original 87-channel-space index per row. |
+| **`plot_freq_horizon_heatmap_phase_by_kind(long_df, horizon, fs_hz, out_path, *, n_samples)`** | PDF + PNG | 4-panel stack (`ph_diag`, `ph_h2`, `ph_h3`, `ph_other`); y = $\xi_j$ (response) in Hz, right-margin per-row annotation $(\xi_i, p)$ to preserve the dual-frequency identity of phase channels. Shared LogNorm colorbar. |
+| **`plot_phase_comodulograms_by_horizon(long_df, horizon, fs_hz, out_path, *, n_samples, snapshot_horizons=None)`** | PDF + PNG | Small-multiples comodulograms at $h \in \{0, H_d/4, H_d/2, H_d-1\}$ (deduplicated). Axes $\log_2 \xi_i$ (driver) $\times \log_2 \xi_j$ (response); colour = MSE; dashed reference lines at $\xi_j = p\xi_i$ for $p \in \{1, 2, 3\}$; marker shape encodes the kind. |
+| `_format_band_label_with_hz(band, band_hz_ranges)` | str | Helper that appends `(lo–hi Hz)` / `(< hi Hz)` / `(> lo Hz)` / `(DC)` to a band name. Falls back to the bare name when `band_hz_ranges` is `None` or the band is missing (e.g. `by_kind` partition where labels are coefficient kinds). |
 | `plot_latent_distributions(latents, output_dir)` | `latent_distributions.pdf` |
 | `plot_kld_trajectory`, `plot_kld_guid_trajectory`, `plot_kld_trajectory_3d` | KLD trajectory plots |
 | `plot_latent_trajectory_2d/3d`, `plot_guid_absolute_trajectory`, `plot_guid_trajectory_3d` | Latent trajectory plots |
@@ -465,6 +528,47 @@ Outputs under `frequency_band_forecast/`:
   metadata), `mse_vs_freq.pdf`, `mse_vs_freq_by_class.pdf`,
   `mse_vs_harmonic_ratio.pdf`, and `worst_channels_by_kind.csv`
   (top-10 worst-MSE channels per kind for quick triage).
+- `freq_horizon/` — channel × horizon-step heatmaps with **explicit Hz
+  axes**, averaged across every valid anchor in every sample (no extra
+  inference pass; the data is accumulated in the same `inference_mode()`
+  loop that feeds the per-band CSVs). Three figure variants plus three
+  CSVs:
+
+  - `channel_horizon_mse.csv` — long-form `(channel, kind, band,
+    refined_band, octave, freq_hz_primary, freq_hz_secondary,
+    harmonic_ratio, h, t_seconds, mse_mean, mse_se, n_samples)`.
+  - `channel_horizon_mse_matrix.csv` — wide pivot keyed by channel,
+    columns `h0, h1, …`. Companion `channel_horizon_mse_freq_hz.csv`
+    re-emits the static channel metadata so a downstream notebook
+    can replot from CSV alone.
+  - `scattering_freq_horizon_heatmap.pdf` — the 43 scattering rows
+    (`st_S0` + `st_S1`) sorted by centre frequency $\xi$ (high at
+    top, DC at bottom) against horizon step on x. Y-tick labels are
+    explicit Hz strings (e.g. `0.0312 Hz`). X-ticks render both
+    `h={k}` and `({k/fs:.2f} s)`.
+  - `phase_freq_horizon_heatmap_by_kind.pdf` — 4-panel stack
+    (`ph_diag`, `ph_h2`, `ph_h3`, `ph_other`) since phase channels
+    have a *dual* frequency identity. Each row's left axis is the
+    response frequency $\xi_j$; each row's right margin annotates
+    the driver $\xi_i$ and harmonic ratio $p$.
+  - `phase_comodulograms_by_horizon.pdf` — small-multiples
+    comodulogram per horizon snapshot ($h \in \{0, H_d/4, H_d/2,
+    H_d-1\}$ deduplicated). Axes $\log_2 \xi_i$ (driver) ×
+    $\log_2 \xi_j$ (response); colour = MSE; dashed reference lines
+    at $\xi_j = \xi_i, 2\xi_i, 3\xi_i$ make the harmonic ridges
+    visible. Marker shape encodes the kind (●/▲/■/✚). The
+    convention is borrowed from phase-amplitude-coupling
+    comodulograms (Tort 2010, Brainstorm PAC tutorial) and from
+    Mallat & Zhang 2020's phase-harmonic covariance matrices.
+
+  All band-level violin / horizon / anchor PDFs in the
+  `clinical_4band/`, `clinical_7band/`, and `by_octave/`
+  subdirectories now carry **explicit Hz suffixes** on every band
+  legend / x-tick / row label (e.g. `deceleration\n(0.008–0.04 Hz)`)
+  via the new `band_hz_ranges` kwarg threaded through the visualizer
+  helpers. `by_kind` retains the bare-name labels since its
+  partition labels are coefficient kinds rather than frequency
+  bands.
 
 The anchor x-axis is rescaled to minutes via `decim_step_seconds / 60`
 (default `4 s / 60` for the v1 16x decimation at 4 Hz). Empty
@@ -687,8 +791,40 @@ def run_full_test_pipeline(
     max_guids: Optional[int] = None,
     normalize_fields: Optional[Sequence[str]] = None,
     dataset_kwargs: Optional[Dict[str, Any]] = None,
+    single_class_mode: bool = False,
 ) -> Dict[str, Any]
 ```
+
+The `single_class_mode` flag is set by
+`run_full_test_pipeline_by_subgroup` when running each subgroup. It
+downgrades the Step-0 probe "only 1 file / 1 class" warnings to INFO
+and skips two analyses that are degenerate on single-class data:
+
+- step 14 (`class_separation`) — the Phase 2 cross-subgroup post-processor produces the cross-subgroup equivalent;
+- step 19 (`per_class_breakdown`) — every input CSV is single-class and would split trivially.
+
+Both record `{"status": "skipped_single_class"}` in the results dict so
+the skip is visible in `test_summary.json`. The default is `False` so
+direct callers of `run_full_test_pipeline` see no behaviour change.
+
+The driver function for two-phase mode:
+
+```python
+def run_full_test_pipeline_by_subgroup(
+    subgroups: Optional[Mapping[str, Sequence[str]]] = None,
+    *,
+    # Same kwargs as run_full_test_pipeline plus:
+    skip_phase2: bool = False,
+    only_subgroups: Optional[Sequence[str]] = None,
+    # ...
+) -> Dict[str, Any]
+```
+
+Returns `{"phase1": {name: results, ...}, "phase2": {...},
+"output_dir": str}`. Subgroup failures land in
+`phase1[name] = {"error": "..."}` without aborting the rest, and Phase
+2 still runs against whatever Phase 1 folders exist on disk.
+`only_subgroups` filters the input map (resume convenience).
 
 #### Sample-cap policy (`_cap` helper)
 
@@ -779,7 +915,7 @@ directly — it does **not** iterate the loader.
 1. `dataset_stats`
 2. `histogram`
 3. `forecast_quality`
-3b. `frequency_band_forecast` *(gated by `skip_frequency_band`)*
+3b. `frequency_band_forecast` *(gated by `skip_frequency_band`)* — emits the four partition trees, the per-channel diagnostics, and the new `freq_horizon/` heatmaps with explicit Hz axes. The (channel × horizon-step) accumulator is updated in the same `inference_mode()` loop that feeds the band-level CSVs, so it adds no extra GPU passes.
 4. `horizon_error`
 5. `anchor_error`
 6. `uplift`
@@ -869,6 +1005,44 @@ results = quick_test(
     data_path=None,
     n_samples=100,
     config_path="model/vae_teb_prediction/testing/config_lag_attn_v1.yaml",
+)
+```
+
+### Per-subgroup pipeline (Phase 1 + Phase 2)
+
+```python
+from testing.run_tests import run_full_test_pipeline_by_subgroup
+
+# Subgroups can be passed explicitly as a dict, or omitted to read
+# them from `dataset_config.vae_test_subgroups` in the YAML config.
+subgroups = {
+    "hie_no_cs":           ["/data/.../fold_1/test/hie_no_cs.hdf5"],
+    "healthy_no_bg_no_cs": ["/data/.../fold_1/test/healthy_no_bg_no_cs.hdf5"],
+}
+
+results = run_full_test_pipeline_by_subgroup(
+    subgroups=subgroups,
+    checkpoint_path=None,
+    config_path="model/vae_teb_prediction/testing/config_lag_attn_v1.yaml",
+    max_samples=None,
+    analysis_samples=10,
+)
+
+print(results["output_dir"])             # base directory
+print(list(results["phase1"].keys()))    # ['hie_no_cs', 'healthy_no_bg_no_cs']
+print(results["phase2"])                 # {"status": "ok", ...}
+```
+
+Phase 2 alone — re-run the cross-subgroup post-processor against an
+existing `phase1/` tree without reloading the model:
+
+```python
+from pathlib import Path
+from testing.analyses import run_cross_subgroup_breakdown
+
+run_cross_subgroup_breakdown(
+    phase1_root=Path("results/run_2026/phase1"),
+    output_dir=Path("results/run_2026/phase2/cross_subgroup"),
 )
 ```
 
@@ -1000,18 +1174,30 @@ output_dir/
 ├── frequency_band_forecast/
 │   ├── band_partition.json
 │   ├── band_channel_map.csv
-│   ├── per_sample.csv
-│   ├── per_horizon.csv
-│   ├── per_anchor.csv
+│   ├── per_sample.csv                             # legacy clinical_4band copy
+│   ├── per_horizon.csv                            # legacy clinical_4band copy
+│   ├── per_anchor.csv                             # legacy clinical_4band copy
 │   ├── summary.json
-│   ├── band_mse_violin.pdf
-│   ├── band_r2_violin.pdf
-│   ├── band_horizon_error.pdf
-│   ├── band_anchor_error.pdf
-│   ├── band_mse_violin_by_class.pdf
-│   ├── band_r2_violin_by_class.pdf
-│   ├── band_horizon_error_by_class.pdf
-│   └── band_anchor_error_by_class.pdf
+│   ├── clinical_4band/                            # one folder per partition
+│   │   ├── per_sample.csv  per_horizon.csv  per_anchor.csv
+│   │   ├── band_mse_violin.pdf      band_r2_violin.pdf
+│   │   ├── band_horizon_error.pdf   band_anchor_error.pdf
+│   │   └── band_*_by_class.pdf                    # when ≥ 2 classes
+│   ├── clinical_7band/   ...                      # same file set
+│   ├── by_kind/          ...                      # same file set (no Hz labels)
+│   ├── by_octave/        ...                      # same file set (Hz octaves)
+│   ├── per_channel/
+│   │   ├── per_channel_forecast.csv
+│   │   ├── worst_channels_by_kind.csv
+│   │   ├── mse_vs_freq.pdf  mse_vs_freq_by_class.pdf
+│   │   └── mse_vs_harmonic_ratio.pdf
+│   └── freq_horizon/                              # NEW: Hz × horizon heatmaps
+│       ├── channel_horizon_mse.csv
+│       ├── channel_horizon_mse_matrix.csv
+│       ├── channel_horizon_mse_freq_hz.csv
+│       ├── scattering_freq_horizon_heatmap.pdf
+│       ├── phase_freq_horizon_heatmap_by_kind.pdf
+│       └── phase_comodulograms_by_horizon.pdf
 ├── horizon_error/
 │   ├── horizon_error.csv
 │   ├── forecast_errors_per_horizon.csv
@@ -1112,6 +1298,65 @@ output_dir/
 ├── metrics_comparison.html
 └── test_summary.json
 ```
+
+### Subgroup-mode output layout
+
+When the pipeline is driven by `run_full_test_pipeline_by_subgroup`,
+the per-analysis tree above is replicated once per subgroup under
+`phase1/<subgroup>/` and a Phase 2 post-processor folder is added
+alongside:
+
+```text
+output_dir/
+├── subgroup_summary.json                       # top-level digest
+├── phase1/
+│   ├── healthy_no_bg_no_cs/                    # full per-analysis tree
+│   │   ├── loader_probe.json
+│   │   ├── histograms/...
+│   │   ├── forecast_quality/...
+│   │   ├── frequency_band_forecast/...
+│   │   ├── residual_usage/...
+│   │   ├── attention/...
+│   │   ├── te_lag/...
+│   │   ├── encoder_probe/...
+│   │   ├── kld_pca/...
+│   │   ├── latent_distribution/...
+│   │   ├── latent_space/...
+│   │   ├── samples_diag/...
+│   │   ├── kld_lag_diag/...
+│   │   └── test_summary.json
+│   ├── healthy_no_bg_cs/...
+│   ├── healthy_bg_no_cs/...
+│   ├── healthy_bg_cs/...
+│   ├── acidosis_no_cs/...
+│   ├── acidosis_cs/...
+│   ├── hie_no_cs/...
+│   └── hie_cs/...
+└── phase2/
+    └── cross_subgroup/                         # cross-subgroup post-processor
+        ├── overlays/
+        │   ├── histogram_<metric>_overlay.pdf
+        │   ├── forecast_<metric>_horizon_overlay.pdf
+        │   ├── residual_<col>_overlay.pdf
+        │   ├── attention_argmax_lag_overlay.pdf
+        │   ├── attention_mass_by_lag_overlay.pdf
+        │   ├── uplift_<col>_overlay.pdf
+        │   ├── te_lag_mean_overlay.pdf
+        │   └── kld_pc12_scatter_overlay.pdf
+        ├── stats/
+        │   ├── kruskal_wallis.csv              # H, p, p_holm, df, n_subgroups, significant
+        │   ├── pairwise_mann_whitney.csv       # U, p, p_holm per (metric, sg_a, sg_b)
+        │   ├── cliffs_delta.csv                # effect size for headline metrics
+        │   └── stats_summary.json
+        ├── grand_summary.pdf                   # multi-panel headline means ± SE
+        ├── grand_summary.csv
+        └── cross_subgroup_summary.json         # JSON digest
+```
+
+`class_separation/` and `per_class_breakdown/` are intentionally
+absent from each `phase1/<subgroup>/` folder — they are nonsensical
+on a single-class subgroup. Cross-subgroup statistical comparisons
+take their place in Phase 2.
 
 ---
 
@@ -1326,7 +1571,7 @@ signals:
 | Analysis modules | 19 (`dataset_stats`, `histogram`, `forecast_quality`, `frequency_band_forecast`, `temporal`, `uplift`, `up_effect`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`, `latent`, `trajectory`, `class_separation`, `compare_trajectory_classes`, `qualitative`, plus helpers `changepoint` and `significance_tests`) |
 | Lag-attn v1 analyses | 11 (`forecast_quality`, `frequency_band_forecast`, `uplift`, `up_effect`, `residual_usage`, `attention_diagnostics`, `te_lag_analysis`, `encoder_probe`, `kld_pca`, `kld_lag_diagnostics`, `per_class_breakdown`) |
 | Step 0 probe | single loader pass, z_mean capture, loader_probe.json |
-| Visualizer primitives (v1-new) | 14 (`plot_feature_forecast_heatmap`, `plot_forecast_error_by_horizon`, `plot_uplift_histogram`, `plot_residual_usage_trace`, `plot_lag_attention_heatmap`, `plot_te_lag_distribution`, `plot_attention_mass_by_lag`, `plot_metric_histograms_by_class`, `plot_band_violin`, `plot_band_violin_by_class`, `plot_band_horizon_error`, `plot_band_anchor_error`, `plot_band_horizon_error_by_class`, `plot_band_anchor_error_by_class`) |
+| Visualizer primitives (v1-new) | 17 (`plot_feature_forecast_heatmap`, `plot_forecast_error_by_horizon`, `plot_uplift_histogram`, `plot_residual_usage_trace`, `plot_lag_attention_heatmap`, `plot_te_lag_distribution`, `plot_attention_mass_by_lag`, `plot_metric_histograms_by_class`, `plot_band_violin`, `plot_band_violin_by_class`, `plot_band_horizon_error`, `plot_band_anchor_error`, `plot_band_horizon_error_by_class`, `plot_band_anchor_error_by_class`, `plot_freq_horizon_heatmap_scattering`, `plot_freq_horizon_heatmap_phase_by_kind`, `plot_phase_comodulograms_by_horizon`); all band-level functions accept an optional `band_hz_ranges` kwarg that suffixes labels with explicit Hz ranges. |
 | TE-surrogate metric helpers | 7 (`compute_posterior_drift`, `compute_kld_aggregate_tensors`, `compute_kld_aggregates_per_sample`, `fit_pca_kld_per_dim`, `project_kld_per_dim`, `select_pca_components`, `aggregate_selected_pca_scores`) |
 | TE_Calculated comparison helpers (new) | 8 (`cross_correlation_per_guid`, `bland_altman`, `roc_auc_high_te`, `per_guid_regression`, `conditional_ks_by_quartile`, `per_guid_r2`, `_add_te_selected_pca_scores`, `run_pca_vs_dims_comparison`), plus extended `pca_trajectory` and `run_te_kld_pipeline_stratified` in `te_kld_analysis`, and 5 new plotters in `te_kld_visualizations`. |
 | Removed | `aggregate_predictions`, `plot_reconstruction_sample`, `plot_temporal_accuracy`, `plot_within_window_accuracy`, all coherence plots, `plot_reconstruction_interactive`, `analyses/coherence.py` |

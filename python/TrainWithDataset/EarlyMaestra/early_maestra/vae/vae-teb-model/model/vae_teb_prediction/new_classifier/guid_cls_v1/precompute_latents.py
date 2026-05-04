@@ -403,6 +403,8 @@ def precompute_partition(
     num_workers: int = 2,
     train_stats: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
     fit_latent_stats_max_batches: Optional[int] = None,
+    vae_checkpoint_sha256_override: Optional[str] = None,
+    vae_checkpoint_path_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Precompute one partition's latent cache and write it to ``cache_path``.
 
@@ -424,13 +426,29 @@ def precompute_partition(
             attrs.
         fit_latent_stats_max_batches: Cap for the stats fit pass; ``None``
             uses the entire training loader.
+        vae_checkpoint_sha256_override: Optional pre-computed SHA-256 to
+            record in the cache attrs and signature in place of hashing
+            ``config['vae']['checkpoint']``. Used by the live-VAE eval path
+            where the source weights live inside the classifier checkpoint
+            and the original VAE checkpoint may not be reachable at
+            evaluation time.
+        vae_checkpoint_path_override: Optional path string to record alongside
+            the SHA override (e.g. the classifier ``best.ckpt``).
 
     Returns:
         Manifest dict describing the cache (counts, files, stats summary).
     """
     use_up_st = bool(config["vae"]["model_kwargs"].get("use_up_st", True))
-    ckpt_path = config["vae"]["checkpoint"]
-    ckpt_sha256 = compute_checkpoint_sha256(ckpt_path)
+    if vae_checkpoint_sha256_override is not None:
+        ckpt_sha256 = str(vae_checkpoint_sha256_override)
+        ckpt_path = (
+            str(vae_checkpoint_path_override)
+            if vae_checkpoint_path_override is not None
+            else str(config.get("vae", {}).get("checkpoint", ""))
+        )
+    else:
+        ckpt_path = config["vae"]["checkpoint"]
+        ckpt_sha256 = compute_checkpoint_sha256(ckpt_path)
     cache_input_signature, cache_input_summary_json = build_cache_input_signature(
         config=config,
         fold_id=fold_id,

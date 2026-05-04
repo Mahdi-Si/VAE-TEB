@@ -180,6 +180,8 @@ def load_classifier_from_checkpoint(
     *,
     classifier_cfg: GuidClassifierConfig,
     device: torch.device,
+    attach_vae: Optional[torch.nn.Module] = None,
+    vae_chunk_size: int = 32,
 ) -> GuidOutcomeClassifier:
     """Instantiate :class:`GuidOutcomeClassifier` and load its weights.
 
@@ -192,11 +194,25 @@ def load_classifier_from_checkpoint(
         checkpoint_path: Path to a Lightning ``.ckpt``.
         classifier_cfg: Resolved hyperparameter bundle (must match training).
         device: Target device.
+        attach_vae: Optional :class:`SeqVaeLagAttnV1` (or compatible) module
+            to attach as ``classifier.vae`` *before* the state-dict load.
+            Pass this for live-VAE checkpoints — the saved checkpoint
+            carries ``vae.*`` keys (the stage-2 fine-tuned VAE), and
+            without an attachment those keys would surface as
+            ``unexpected_keys`` and be rejected by the strict-load check
+            below. The attached module is overwritten by the checkpoint's
+            ``vae.*`` weights, so its initial parameters need only match
+            in shape (e.g. a fresh ``build_vae_from_config`` is fine).
+        vae_chunk_size: Forwarded to ``classifier.vae_chunk_size`` when
+            ``attach_vae`` is provided. Mirrors the live-train default.
 
     Returns:
         Eval-mode :class:`GuidOutcomeClassifier` on ``device``.
     """
     classifier = GuidOutcomeClassifier(classifier_cfg)
+    if attach_vae is not None:
+        classifier.vae = attach_vae
+        classifier.vae_chunk_size = int(vae_chunk_size)
     # ``weights_only=False`` is required because Lightning pickles the
     # full hparam bundle (including the ``LossWeights`` dataclass) into the
     # checkpoint. PyTorch 2.6 changed the default to ``weights_only=True``
@@ -505,6 +521,182 @@ def _build_eval_loader(
     return dataset, loader
 
 
+def _ensure_live_vae_eval_caches(
+    *,
+    fold_dir: Path,
+    config: Dict[str, Any],
+    device: torch.device,
+    cache_root: Path,
+    best_checkpoint_path: Path,
+) -> None:
+    """Build val/test latent caches at eval-time for a live-VAE run.
+
+    The live-VAE training path (``vae.freeze_vae=False``) fine-tunes the
+    VAE inside the classifier (``LiveGuidSequenceDataset`` consumes raw
+    segments and the classifier's ``live_forward`` encodes them on the
+    fly), so it never populates ``precomputed_latents/fold_{k}/``. The
+    rest of the eval pipeline is built around the cached HDF5 schema, so
+    this helper reproduces what :func:`precompute_fold_latents` would
+    have written — but driven by the post-stage-2 VAE that lives inside
+    the classifier checkpoint, not the original (pre-training) VAE
+    checkpoint referenced by ``config['vae']['checkpoint']``.
+
+    The function is idempotent: it runs ``precompute_partition`` only
+    for partitions whose cache files are missing, and skips quietly when
+    both ``val.hdf5`` and ``test.hdf5`` already exist.
+
+    Args:
+        fold_dir: ``run_dir/fold_{k}``.
+        config: Parsed YAML config.
+        device: Compute device.
+        cache_root: Output directory (``run_dir/precomputed_latents/fold_{k}``).
+        best_checkpoint_path: Path to the trained classifier checkpoint
+            (its ``vae.*`` entries are loaded into a fresh
+            :class:`SeqVaeLagAttnV1` and used for the encoding pass).
+
+    Notes:
+        ``train_stats`` for val/test are taken from the loaded VAE's
+        ``mu_post_running_*`` buffers, which are populated during training
+        (``vae.fit_latent_stats`` is called early in ``train_fold`` for the
+        live path) and refreshed by stage 2's encoder updates.
+    """
+    from hashlib import sha256 as _sha256  # noqa: WPS433
+
+    from model.vae_teb_prediction.new_classifier.guid_cls_v1.precompute_latents import (  # noqa: WPS433
+        build_vae_from_config,
+        get_fold_partition_files,
+        precompute_partition,
+    )
+
+    val_cache = cache_root / "val.hdf5"
+    test_cache = cache_root / "test.hdf5"
+    needed: List[str] = []
+    if not val_cache.exists():
+        needed.append("val")
+    if not test_cache.exists():
+        needed.append("test")
+    if not needed:
+        return
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        f"[{fold_dir.name}] live-VAE eval: missing caches "
+        f"{needed}; building from classifier checkpoint "
+        f"{best_checkpoint_path.name}"
+    )
+
+    # 1) Build a fresh VAE (architecture only) from config and attach to
+    # a classifier shell so the full state_dict (classifier + vae.*) loads
+    # in one pass. The classifier head bits are discarded — we only need
+    # the VAE submodule with stage-2 weights for encoding.
+    classifier_cfg = _build_classifier_cfg_from_config(config)
+    vae = build_vae_from_config(config, device)
+    classifier = load_classifier_from_checkpoint(
+        best_checkpoint_path,
+        classifier_cfg=classifier_cfg,
+        device=device,
+        attach_vae=vae,
+        vae_chunk_size=int(config.get("vae", {}).get("vae_chunk_size", 32)),
+    )
+    trained_vae = classifier.vae
+    if trained_vae is None:  # pragma: no cover - defensive
+        raise RuntimeError(
+            f"[{fold_dir.name}] live-VAE eval: classifier.vae is None after "
+            "checkpoint load — was this a live-VAE training run?"
+        )
+    trained_vae.eval()
+
+    # 2) Pull ``train_stats`` from the live VAE's running buffers. These
+    # were fit during training (``train_fold`` calls
+    # ``vae.fit_latent_stats`` for the live path) and updated by stage-2
+    # encoder finetuning.
+    mean_t = trained_vae.mu_post_running_mean.detach().cpu().clone()
+    var_t = trained_vae.mu_post_running_var.detach().cpu().clone()
+    count_t = int(trained_vae.mu_post_running_count.item())
+    if count_t <= 0:
+        logger.warning(
+            f"[{fold_dir.name}] live-VAE eval: VAE running stats are "
+            f"empty (count={count_t}). Caches will record zero stats; "
+            "consider re-fitting before evaluation."
+        )
+    train_stats = (mean_t, var_t, count_t)
+
+    # 3) Provenance: record the classifier checkpoint identity in the
+    # cache attrs (in place of the original VAE checkpoint SHA) so the
+    # cache signature reflects the actual weights used to encode it.
+    ckpt_bytes = best_checkpoint_path.read_bytes()
+    ckpt_sha = _sha256(ckpt_bytes).hexdigest()
+
+    ds_cfg = config["dataset_config"]
+    test_mode = ds_cfg.get("test_mode")
+    kfold_base_path = ds_cfg["kfold_base_path"]
+    fold_id = int(fold_dir.name.split("_")[-1])
+    bs_precompute = int(config.get("precompute", {}).get("batch_size", 32))
+    nw_precompute = int(config.get("precompute", {}).get("num_workers", 2))
+
+    for partition in needed:
+        files = get_fold_partition_files(
+            kfold_base_path, fold_id, partition, test_mode=test_mode
+        )
+        cache_path = cache_root / f"{partition}.hdf5"
+        precompute_partition(
+            vae=trained_vae,
+            files=files,
+            config=config,
+            cache_path=cache_path,
+            fold_id=fold_id,
+            partition=partition,
+            device=device,
+            batch_size=bs_precompute,
+            num_workers=nw_precompute,
+            train_stats=train_stats,
+            vae_checkpoint_sha256_override=ckpt_sha,
+            vae_checkpoint_path_override=str(best_checkpoint_path),
+        )
+        logger.info(
+            f"[{fold_dir.name}] live-VAE eval: wrote {partition} cache "
+            f"-> {cache_path}"
+        )
+
+    # Free the encoding model before the eval forward path reloads the
+    # classifier (without the VAE attached, since the cached path no
+    # longer needs it).
+    del classifier, trained_vae, vae
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _build_classifier_cfg_from_config(config: Dict[str, Any]) -> GuidClassifierConfig:
+    """Construct the classifier config from YAML.
+
+    Pulled out of :func:`evaluate_single_fold` so the live-VAE precompute
+    helper can build an identical config without needing the cache file
+    to peek at ``d_model`` / ``d_z``: in the live-VAE branch we read
+    those from ``config['vae']['model_kwargs']`` instead.
+    """
+    cls_cfg = config["model_config"]["classifier"]
+    vae_kwargs = config.get("vae", {}).get("model_kwargs", {})
+    head_hidden_raw = cls_cfg.get("head_hidden_dim")
+    return GuidClassifierConfig(
+        d_model_vae=int(vae_kwargs.get("d_model")),
+        d_z=int(vae_kwargs.get("d_z")),
+        d_seg=int(cls_cfg.get("d_seg", 192)),
+        d_model=int(cls_cfg.get("d_model", 256)),
+        n_layers=int(cls_cfg.get("n_layers", 3)),
+        n_heads=int(cls_cfg.get("n_heads", 4)),
+        d_head=int(cls_cfg.get("d_head", 64)),
+        d_ff=int(cls_cfg.get("d_ff", 512)),
+        n_rel_buckets=int(cls_cfg.get("n_rel_buckets", 32)),
+        num_classes_multi=int(cls_cfg.get("num_classes_multi", 3)),
+        head_hidden_dim=int(head_hidden_raw) if head_hidden_raw is not None else None,
+        causal=bool(cls_cfg.get("causal", True)),
+        c_meta_dim=5,
+        te_summary_dim=6,
+        late_window_steps=75,
+        dropout=float(cls_cfg.get("dropout", 0.1)),
+    )
+
+
 def evaluate_single_fold(
     *,
     fold_dir: Path,
@@ -549,6 +741,30 @@ def evaluate_single_fold(
     cache_root = fold_dir.parent / out_subdir / fold_dir.name
     val_cache = cache_root / "val.hdf5"
     test_cache = cache_root / "test.hdf5"
+
+    # Live-VAE training (vae.freeze_vae=False) doesn't precompute latents
+    # — the classifier's live_forward encodes raw segments. The downstream
+    # eval path is built around the cached HDF5 schema, so when the caches
+    # are missing we run a one-off precompute pass driven by the *trained*
+    # VAE (the one inside the classifier checkpoint, not the original VAE
+    # checkpoint). This reproduces what precompute_fold_latents would have
+    # written and lets the rest of the pipeline run unchanged.
+    freeze_vae = bool(config.get("vae", {}).get("freeze_vae", True))
+    if not freeze_vae and (not val_cache.exists() or not test_cache.exists()):
+        if best_checkpoint_path:
+            ckpt_for_cache = Path(best_checkpoint_path)
+            if not ckpt_for_cache.exists():
+                ckpt_for_cache = find_best_checkpoint(fold_dir / "checkpoints")
+        else:
+            ckpt_for_cache = find_best_checkpoint(fold_dir / "checkpoints")
+        _ensure_live_vae_eval_caches(
+            fold_dir=fold_dir,
+            config=config,
+            device=device,
+            cache_root=cache_root,
+            best_checkpoint_path=ckpt_for_cache,
+        )
+
     assert val_cache.exists(), f"missing val cache {val_cache}"
     assert test_cache.exists(), f"missing test cache {test_cache}"
 
