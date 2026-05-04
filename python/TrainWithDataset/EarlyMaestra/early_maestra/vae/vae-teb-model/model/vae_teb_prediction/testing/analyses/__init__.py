@@ -75,6 +75,15 @@ from model.vae_teb_prediction.testing.analyses.kld_pca import run_kld_pca_analys
 from model.vae_teb_prediction.testing.analyses.per_class_breakdown import (
     run_per_class_breakdown,
 )
+from model.vae_teb_prediction.testing.analyses.subgroup_utils import (
+    CANONICAL_ORDER as SUBGROUP_CANONICAL_ORDER,
+    SUBGROUP_COLORS,
+    SUBGROUP_TO_LABEL,
+    resolve_subgroups,
+)
+from model.vae_teb_prediction.testing.analyses.cross_subgroup_breakdown import (
+    run_cross_subgroup_breakdown,
+)
 
 # Latent / trajectory / class-separation analyses.
 from model.vae_teb_prediction.testing.analyses.latent import (
@@ -292,6 +301,12 @@ __all__ = [
     "run_kld_lag_diagnostics",
     "run_kld_pca_analysis",
     "run_per_class_breakdown",
+    # Subgroup mode (Phase 1 / Phase 2)
+    "resolve_subgroups",
+    "run_cross_subgroup_breakdown",
+    "SUBGROUP_CANONICAL_ORDER",
+    "SUBGROUP_COLORS",
+    "SUBGROUP_TO_LABEL",
     "run_latent_distribution_analysis",
     "run_latent_space_visualization",
     "run_latent_interpolation",

@@ -645,6 +645,94 @@ def compute_per_channel_forecast_metrics(
     }
 
 
+def compute_per_channel_per_horizon_forecast_metrics(
+    mu_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    r"""Compute per-(sample, channel, horizon-step) forecast MSE and $R^2$.
+
+    Mirrors :func:`compute_per_channel_forecast_metrics` but keeps **both**
+    the channel axis and the horizon axis intact instead of pooling them
+    together. Used by the channel $\times$ horizon heatmap analysis that
+    asks "which exact channel is hardest to forecast at each look-ahead
+    step?".
+
+    Memory cost is $O(B \cdot C \cdot H_d)$ which is harmless for the
+    typical lag-attn v1 setting ($B \le 32$, $C = 87$, $H_d \le 16$).
+
+    Args:
+        mu_full: Model prediction ``(B, T, H_d, C_y)``.
+        y_plus: Ground-truth future feature trajectory
+            ``(B, T - H_d, H_d, C_y)`` from
+            :meth:`TestRunner.build_future_target`.
+        warmup: Warmup anchors to skip.
+        horizon: Forecast horizon ``H_d`` (must equal ``mu_full.size(2)``).
+
+    Returns:
+        Dict with three keys:
+
+        * ``"mse_per_channel_per_horizon"`` : ``(B, C_y, H_d)`` — squared
+          error averaged over the valid-anchor axis only.
+        * ``"r2_per_channel_per_horizon"`` : ``(B, C_y, H_d)`` —
+          coefficient of determination per (sample, channel,
+          horizon-step), clamped to $[-10, 1]$ to suppress runaway
+          values when the per-(channel, horizon-step) target variance
+          is near zero.
+        * ``"n_valid_anchors"`` : 0-D tensor — number of valid anchors
+          contributing to the average. Lets a streaming caller weight
+          per-batch contributions correctly even if ``warmup`` ever
+          changes between batches.
+    """
+    B, T, H_d, _C = mu_full.shape
+    if int(H_d) != int(horizon):
+        raise ValueError(
+            f"horizon mismatch: mu_full.size(2)={H_d}, horizon={horizon}"
+        )
+    start, T_valid = _feature_valid_slice(warmup, horizon, T)
+    n_valid = max(0, int(T_valid - start))
+
+    if n_valid <= 0:
+        zero = torch.zeros(
+            B, int(_C), int(H_d), device=mu_full.device, dtype=mu_full.dtype,
+        )
+        return {
+            "mse_per_channel_per_horizon": zero.clone(),
+            "r2_per_channel_per_horizon": zero.clone(),
+            "n_valid_anchors": torch.tensor(
+                0, device=mu_full.device, dtype=torch.long,
+            ),
+        }
+
+    mu_valid = mu_full[:, start:T_valid, :, :]                  # (B, T_v, H_d, C)
+    y_valid = y_plus[:, start:T_valid, :, :]                    # (B, T_v, H_d, C)
+    diff = mu_valid - y_valid                                   # (B, T_v, H_d, C)
+
+    # Collapse the valid-anchor axis only -> (B, H_d, C); permute to
+    # (B, C, H_d) so the channel axis comes first as in the per-channel
+    # variant.
+    mse_h_c = diff.pow(2).mean(dim=1)                           # (B, H_d, C)
+    mse_per_channel_per_horizon = mse_h_c.permute(0, 2, 1).contiguous()  # (B, C, H_d)
+
+    # R² with SS_tot computed against the per-(sample, channel, h) mean
+    # of y across the valid-anchor axis. Floors ss_tot to keep flat
+    # targets from blowing R² up.
+    ss_res = diff.pow(2).sum(dim=1)                             # (B, H_d, C)
+    y_mean = y_valid.mean(dim=1, keepdim=True)                  # (B, 1, H_d, C)
+    ss_tot = (y_valid - y_mean).pow(2).sum(dim=1).clamp_min(1e-12)  # (B, H_d, C)
+    r2_h_c = (1.0 - ss_res / ss_tot).clamp(min=-10.0, max=1.0)
+    r2_per_channel_per_horizon = r2_h_c.permute(0, 2, 1).contiguous()   # (B, C, H_d)
+
+    return {
+        "mse_per_channel_per_horizon": mse_per_channel_per_horizon,
+        "r2_per_channel_per_horizon": r2_per_channel_per_horizon,
+        "n_valid_anchors": torch.tensor(
+            n_valid, device=mu_full.device, dtype=torch.long,
+        ),
+    }
+
+
 def compute_uplift_metrics(
     mu_full: Tensor,
     mu_base: Tensor,

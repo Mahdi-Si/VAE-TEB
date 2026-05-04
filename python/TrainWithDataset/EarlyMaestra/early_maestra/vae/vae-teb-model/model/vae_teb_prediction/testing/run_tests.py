@@ -19,7 +19,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
 import yaml
@@ -88,6 +88,7 @@ def run_full_test_pipeline(
     dataset_kwargs: Optional[Dict[str, Any]] = None,
     skip_up_effect: bool = False,
     skip_frequency_band: bool = False,
+    single_class_mode: bool = False,
 ) -> Dict[str, Any]:
     """Run the full lag-attn v1 testing pipeline end-to-end.
 
@@ -122,6 +123,15 @@ def run_full_test_pipeline(
             quality analysis.
         skip_per_class_breakdown: Skip the per-class CSV/plot breakdown
             (a pure post-processor over the pooled CSVs).
+        single_class_mode: When ``True``, the pipeline is being driven for
+            a single subgroup that is intrinsically single-class (Phase 1
+            of the per-subgroup driver, ``run_full_test_pipeline_by_subgroup``).
+            Three downstream behaviours change: (a) the Step-0 probe
+            "only 1 class / 1 file" warnings are downgraded to INFO, (b)
+            the ``class_separation`` analysis is skipped (results entry is
+            ``{"status": "skipped_single_class"}``), (c) the
+            ``per_class_breakdown`` post-processor is skipped. Defaults to
+            ``False`` so every existing caller behaves identically.
         skip_interactive: Skip Plotly interactive plots.
         analysis_samples: Number of per-sample diagnostic PDFs to emit.
         min_epochs_per_guid: Minimum epochs per GUID for trajectory
@@ -427,19 +437,28 @@ def run_full_test_pipeline(
     distinct_labels = sum(
         1 for k in probe["per_label_counts"] if k in (1, 2, 3)
     )
-    if distinct_files <= 1:
-        logger.error(
-            f"loader probe: only {distinct_files} HDF5 file yielded "
-            f"samples (config lists multiple). Per-class analyses will "
-            f"be degenerate. Check dataset path/filtering."
+    if single_class_mode:
+        # Phase 1 of the per-subgroup driver: each subgroup is a single
+        # HDF5 file with a single outcome class. The "only 1 file / 1
+        # class" probe signals are *expected*, not errors.
+        logger.info(
+            f"loader probe (single_class_mode): "
+            f"distinct_files={distinct_files}, distinct_labels={distinct_labels}"
         )
-    if distinct_labels < 2:
-        logger.error(
-            f"loader probe: only {distinct_labels} canonical clinical "
-            f"class(es) {{1,2,3}} found in target. _extract_label may be "
-            f"truncating fractional weights to 0, or the dataset's "
-            f"target field has unexpected encoding."
-        )
+    else:
+        if distinct_files <= 1:
+            logger.error(
+                f"loader probe: only {distinct_files} HDF5 file yielded "
+                f"samples (config lists multiple). Per-class analyses will "
+                f"be degenerate. Check dataset path/filtering."
+            )
+        if distinct_labels < 2:
+            logger.error(
+                f"loader probe: only {distinct_labels} canonical clinical "
+                f"class(es) {{1,2,3}} found in target. _extract_label may be "
+                f"truncating fractional weights to 0, or the dataset's "
+                f"target field has unexpected encoding."
+            )
 
     def _step(name: str, fn, *args, **kwargs) -> None:
         try:
@@ -592,107 +611,120 @@ def run_full_test_pipeline(
     # Reading from the probe's in-memory data eliminates that failure
     # mode entirely: the data is already on the heap, no I/O, no model
     # forward, no worker process involvement.
-    try:
-        import pandas as pd
-
-        probe_index = probe.get("sample_index", [])
-        if not probe_index or not probe_z_means:
-            raise RuntimeError(
-                "class_separation: Step 0 probe captured no samples — "
-                "check the probe output for HDF5 / dataset issues"
-            )
-        if len(probe_index) != len(probe_z_means):
-            raise RuntimeError(
-                f"class_separation: probe index ({len(probe_index)}) and "
-                f"z_means ({len(probe_z_means)}) length mismatch"
-            )
-
-        X_rows: List[np.ndarray] = []
-        labels: List[int] = []
-        epochs: List[float] = []
-        per_file_kept: Dict[str, int] = defaultdict(int)
-        dropped_padonly = 0
-        dropped_other = 0
-
-        for (lab_key, src, ep, _guid), zm in zip(probe_index, probe_z_means):
-            if zm.size == 0:
-                # Forward failed for this batch in Step 0 — skip.
-                dropped_other += 1
-                continue
-            if lab_key is None or lab_key == "None":
-                dropped_padonly += 1
-                continue
-            try:
-                lab_int = int(lab_key)
-            except (TypeError, ValueError):
-                dropped_other += 1
-                continue
-            if lab_int not in (1, 2, 3):
-                dropped_other += 1
-                continue
-            X_rows.append(zm)
-            labels.append(lab_int)
-            epochs.append(float(ep) if ep == ep else float("nan"))  # NaN-safe
-            per_file_kept[src] += 1
-
-        per_file_kept = dict(per_file_kept)
+    #
+    # In ``single_class_mode`` (Phase 1 of the per-subgroup driver) the
+    # collected samples are intrinsically single-class, so this analysis
+    # is degenerate. Skip and record the skip status — Phase 2 produces
+    # the cross-subgroup equivalent.
+    if single_class_mode:
         logger.info(
-            f"class_separation (from probe): kept={len(X_rows)}, "
-            f"dropped_pad_only={dropped_padonly}, "
-            f"dropped_other_label={dropped_other}"
+            "class_separation: skipped (single_class_mode — Phase 1 of "
+            "the per-subgroup driver). Cross-subgroup separation is "
+            "covered by Phase 2."
         )
-        logger.info(
-            "class_separation per-file z_mean coverage: "
-            + ", ".join(
-                f"{k}={v}" for k, v in sorted(per_file_kept.items())
-            )
-        )
+        results["class_separation"] = {"status": "skipped_single_class"}
+    else:
+        try:
+            import pandas as pd
 
-        if X_rows:
-            X = np.asarray(X_rows, dtype=float)
-            lab_arr = np.asarray(labels)
-            unique_labs, counts = np.unique(lab_arr, return_counts=True)
+            probe_index = probe.get("sample_index", [])
+            if not probe_index or not probe_z_means:
+                raise RuntimeError(
+                    "class_separation: Step 0 probe captured no samples — "
+                    "check the probe output for HDF5 / dataset issues"
+                )
+            if len(probe_index) != len(probe_z_means):
+                raise RuntimeError(
+                    f"class_separation: probe index ({len(probe_index)}) and "
+                    f"z_means ({len(probe_z_means)}) length mismatch"
+                )
+
+            X_rows: List[np.ndarray] = []
+            labels: List[int] = []
+            epochs: List[float] = []
+            per_file_kept: Dict[str, int] = defaultdict(int)
+            dropped_padonly = 0
+            dropped_other = 0
+
+            for (lab_key, src, ep, _guid), zm in zip(probe_index, probe_z_means):
+                if zm.size == 0:
+                    # Forward failed for this batch in Step 0 — skip.
+                    dropped_other += 1
+                    continue
+                if lab_key is None or lab_key == "None":
+                    dropped_padonly += 1
+                    continue
+                try:
+                    lab_int = int(lab_key)
+                except (TypeError, ValueError):
+                    dropped_other += 1
+                    continue
+                if lab_int not in (1, 2, 3):
+                    dropped_other += 1
+                    continue
+                X_rows.append(zm)
+                labels.append(lab_int)
+                epochs.append(float(ep) if ep == ep else float("nan"))  # NaN-safe
+                per_file_kept[src] += 1
+
+            per_file_kept = dict(per_file_kept)
             logger.info(
-                f"class_separation: collected {len(lab_arr)} samples "
-                f"across {len(unique_labs)} class(es): "
+                f"class_separation (from probe): kept={len(X_rows)}, "
+                f"dropped_pad_only={dropped_padonly}, "
+                f"dropped_other_label={dropped_other}"
+            )
+            logger.info(
+                "class_separation per-file z_mean coverage: "
                 + ", ".join(
-                    f"{int(u)}={int(c)}" for u, c in zip(unique_labs, counts)
+                    f"{k}={v}" for k, v in sorted(per_file_kept.items())
                 )
             )
-            if len(unique_labs) < 2:
-                logger.error(
-                    "class_separation: only one class present in the "
-                    "collected sample set. The standard test loader reads "
-                    "HDF5 files sequentially with shuffle=False, so a "
-                    "small max_samples can miss the later class files. "
-                    "Re-run with max_samples=None (or a larger cap) so "
-                    "all test HDF5 files are covered."
+
+            if X_rows:
+                X = np.asarray(X_rows, dtype=float)
+                lab_arr = np.asarray(labels)
+                unique_labs, counts = np.unique(lab_arr, return_counts=True)
+                logger.info(
+                    f"class_separation: collected {len(lab_arr)} samples "
+                    f"across {len(unique_labs)} class(es): "
+                    + ", ".join(
+                        f"{int(u)}={int(c)}" for u, c in zip(unique_labs, counts)
+                    )
                 )
-                results["class_separation"] = {
-                    "error": "single-class sample set",
-                    "n_samples": int(len(lab_arr)),
-                    "unique_labels": [int(u) for u in unique_labs],
-                }
+                if len(unique_labs) < 2:
+                    logger.error(
+                        "class_separation: only one class present in the "
+                        "collected sample set. The standard test loader reads "
+                        "HDF5 files sequentially with shuffle=False, so a "
+                        "small max_samples can miss the later class files. "
+                        "Re-run with max_samples=None (or a larger cap) so "
+                        "all test HDF5 files are covered."
+                    )
+                    results["class_separation"] = {
+                        "error": "single-class sample set",
+                        "n_samples": int(len(lab_arr)),
+                        "unique_labels": [int(u) for u in unique_labs],
+                    }
+                else:
+                    df_cols: Dict[str, Any] = {
+                        f"z{i}": X[:, i] for i in range(X.shape[1])
+                    }
+                    df_cols["label"] = lab_arr
+                    ep_arr = np.asarray(epochs, dtype=float)
+                    df_cols["hours_before"] = -ep_arr / 3600.0
+                    latent_df = pd.DataFrame(df_cols)
+                    _step(
+                        "class_separation",
+                        run_class_separation_analysis,
+                        latent_df,
+                        Path(output_dir_resolved) / "class_separation",
+                    )
             else:
-                df_cols: Dict[str, Any] = {
-                    f"z{i}": X[:, i] for i in range(X.shape[1])
-                }
-                df_cols["label"] = lab_arr
-                ep_arr = np.asarray(epochs, dtype=float)
-                df_cols["hours_before"] = -ep_arr / 3600.0
-                latent_df = pd.DataFrame(df_cols)
-                _step(
-                    "class_separation",
-                    run_class_separation_analysis,
-                    latent_df,
-                    Path(output_dir_resolved) / "class_separation",
-                )
-        else:
-            logger.warning("class_separation: no latent samples collected.")
-            results["class_separation"] = {"error": "no samples"}
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"class_separation failed: {exc}")
-        results["class_separation"] = {"error": str(exc)}
+                logger.warning("class_separation: no latent samples collected.")
+                results["class_separation"] = {"error": "no samples"}
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"class_separation failed: {exc}")
+            results["class_separation"] = {"error": str(exc)}
 
     # 13. Trajectory analysis (gated).
     if not skip_trajectory and guid_loader is not None:
@@ -735,7 +767,20 @@ def run_full_test_pipeline(
 
     # 14d. Per-class breakdown of pooled CSVs (post-processor; must be last
     # of the analysis steps so all input CSVs already exist).
-    if not skip_per_class_breakdown:
+    #
+    # Skipped in ``single_class_mode`` (Phase 1 of the per-subgroup
+    # driver) because every input CSV has only one class — the
+    # post-processor would emit one trivially-non-empty class folder and
+    # nothing to overlay. Phase 2 produces the cross-subgroup overlays
+    # instead.
+    if single_class_mode:
+        logger.info(
+            "per_class_breakdown: skipped (single_class_mode — Phase 1 "
+            "of the per-subgroup driver). Cross-subgroup overlays are "
+            "covered by Phase 2."
+        )
+        results["per_class_breakdown"] = {"status": "skipped_single_class"}
+    elif not skip_per_class_breakdown:
         _step(
             "per_class_breakdown",
             run_per_class_breakdown,
@@ -759,6 +804,254 @@ def run_full_test_pipeline(
     _save_summary(results, Path(output_dir_resolved))
     logger.info(f"Testing complete! Results saved to {output_dir_resolved}")
     return results
+
+
+def run_full_test_pipeline_by_subgroup(
+    subgroups: Optional[Mapping[str, Sequence[str]]] = None,
+    *,
+    checkpoint_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    stats_path: Optional[str] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    device: Optional[str] = None,
+    max_samples: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    skip_trajectory: bool = False,
+    skip_attention: bool = False,
+    skip_forecast_heatmaps: bool = False,
+    skip_kld_pca: bool = False,
+    skip_interactive: bool = False,
+    analysis_samples: int = 10,
+    min_epochs_per_guid: int = 10,
+    max_guids: Optional[int] = None,
+    normalize_fields: Optional[Sequence[str]] = None,
+    dataset_kwargs: Optional[Dict[str, Any]] = None,
+    skip_up_effect: bool = False,
+    skip_frequency_band: bool = False,
+    skip_phase2: bool = False,
+    only_subgroups: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Run the testing pipeline per outcome subgroup, then compare cross-subgroup.
+
+    Two-phase driver around :func:`run_full_test_pipeline`:
+
+    * **Phase 1** — for each entry in ``subgroups`` (a mapping
+      ``{subgroup_name: [hdf5_paths]}``) the standard pipeline runs once
+      with ``single_class_mode=True`` and ``output_dir=<base>/phase1/<name>/``.
+      Each subgroup is intrinsically single-class so ``class_separation``
+      and ``per_class_breakdown`` are skipped (degenerate on one class).
+    * **Phase 2** — if ``len(subgroups) >= 2`` (and ``skip_phase2`` is
+      ``False``), the CSV-driven post-processor
+      :func:`cross_subgroup_breakdown.run_cross_subgroup_breakdown` reads
+      every Phase 1 folder and emits cross-subgroup overlays + statistical
+      comparisons under ``<base>/phase2/cross_subgroup/``.
+
+    Phase 2 is skipped automatically when only one subgroup is supplied
+    (no comparison to make). Subgroup failures are isolated: one
+    subgroup raising does not abort the others, and Phase 2 still runs
+    against whatever Phase 1 folders exist on disk.
+
+    Args:
+        subgroups: Mapping ``{name: [hdf5_paths]}``. When ``None`` the
+            mapping is resolved via
+            :func:`analyses.subgroup_utils.resolve_subgroups` from the
+            YAML key ``dataset_config.vae_test_subgroups`` (preferred) or
+            from ``dataset_config.vae_test_datasets`` as a single
+            ``{"all": [...]}`` fallback.
+        checkpoint_path: As in :func:`run_full_test_pipeline`.
+        output_dir: Base output directory under which ``phase1/`` and
+            ``phase2/`` are created. When ``None`` the same timestamped
+            path as the single-pipeline run is used (``out_dir_base/
+            <tag>/<run_date>/test_results``).
+        stats_path: As in :func:`run_full_test_pipeline`.
+        config_path: As in :func:`run_full_test_pipeline`.
+        device: As in :func:`run_full_test_pipeline`.
+        max_samples: Cap applied uniformly to every Phase 1 invocation.
+        batch_size: As in :func:`run_full_test_pipeline`.
+        num_workers: As in :func:`run_full_test_pipeline`.
+        skip_trajectory: As in :func:`run_full_test_pipeline`.
+        skip_attention: As in :func:`run_full_test_pipeline`.
+        skip_forecast_heatmaps: As in :func:`run_full_test_pipeline`.
+        skip_kld_pca: As in :func:`run_full_test_pipeline`.
+        skip_interactive: As in :func:`run_full_test_pipeline`.
+        analysis_samples: As in :func:`run_full_test_pipeline`.
+        min_epochs_per_guid: As in :func:`run_full_test_pipeline`.
+        max_guids: As in :func:`run_full_test_pipeline`.
+        normalize_fields: As in :func:`run_full_test_pipeline`.
+        dataset_kwargs: As in :func:`run_full_test_pipeline`.
+        skip_up_effect: As in :func:`run_full_test_pipeline`.
+        skip_frequency_band: As in :func:`run_full_test_pipeline`.
+        skip_phase2: When ``True``, skip the cross-subgroup post-processor
+            even if ``len(subgroups) >= 2``. Useful when you want to run
+            Phase 2 manually later.
+        only_subgroups: Optional iterable of subgroup names to filter the
+            mapping before iteration (resume convenience). Phase 2 still
+            runs against whatever ``phase1/<name>/`` folders exist on
+            disk after iteration completes.
+
+    Returns:
+        ``{"phase1": {name: results_or_error_dict, ...},
+           "phase2": phase2_results_or_status,
+           "output_dir": str(base_dir)}``.
+    """
+    if config_path is None and subgroups is None:
+        raise ValueError(
+            "Either subgroups or config_path is required. Pass an "
+            "explicit subgroups dict, or supply config_path so "
+            "vae_test_subgroups / vae_test_datasets can be read."
+        )
+
+    # Lazy imports — these modules are added by the same refactor and
+    # may not exist yet in older checkouts. Importing here keeps
+    # ``run_full_test_pipeline`` callable on its own.
+    from model.vae_teb_prediction.testing.analyses.subgroup_utils import (
+        resolve_subgroups,
+    )
+
+    resolved_subgroups = resolve_subgroups(
+        explicit=subgroups,
+        config_path=config_path,
+    )
+    if not resolved_subgroups:
+        raise ValueError(
+            "No subgroups resolved. Pass `subgroups=...` explicitly, "
+            "or set `dataset_config.vae_test_subgroups` (or the legacy "
+            "`vae_test_datasets`) in the YAML config."
+        )
+
+    if only_subgroups is not None:
+        wanted = set(only_subgroups)
+        filtered = {n: paths for n, paths in resolved_subgroups.items() if n in wanted}
+        missing = wanted.difference(filtered)
+        if missing:
+            logger.warning(
+                f"only_subgroups: {sorted(missing)} not present in the "
+                f"resolved subgroup map; ignoring."
+            )
+        resolved_subgroups = filtered  # type: ignore[assignment]
+        if not resolved_subgroups:
+            raise ValueError(
+                "only_subgroups filtered the subgroup map down to zero "
+                "entries — nothing to run."
+            )
+
+    # Compute the timestamped base output dir exactly once so every
+    # subgroup writes under the same parent. Reuse the single-pipeline
+    # resolver for parity with existing run layouts.
+    _, base_path = _resolve_runner_settings(
+        checkpoint_path=checkpoint_path or "(deferred)",
+        output_dir=output_dir,
+        config_path=config_path,
+    )
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    logger.info("=" * 70)
+    logger.info(
+        f"Subgroup-mode pipeline: {len(resolved_subgroups)} subgroup(s) "
+        f"=> {base_path}"
+    )
+    logger.info(f"Subgroups: {list(resolved_subgroups.keys())}")
+    logger.info("=" * 70)
+
+    phase1_results: Dict[str, Any] = {}
+    for sg_name, sg_paths in resolved_subgroups.items():
+        sg_out = base_path / "phase1" / sg_name
+        logger.info("\n" + "#" * 70)
+        logger.info(f"# Phase 1: subgroup {sg_name!r} ({len(list(sg_paths))} file(s))")
+        logger.info(f"# Output: {sg_out}")
+        logger.info("#" * 70)
+        try:
+            phase1_results[sg_name] = run_full_test_pipeline(
+                checkpoint_path=checkpoint_path,
+                data_path=list(sg_paths),
+                output_dir=str(sg_out),
+                stats_path=stats_path,
+                config_path=config_path,
+                device=device,
+                max_samples=max_samples,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                skip_trajectory=skip_trajectory,
+                skip_attention=skip_attention,
+                skip_forecast_heatmaps=skip_forecast_heatmaps,
+                skip_kld_pca=skip_kld_pca,
+                skip_per_class_breakdown=True,   # belt-and-braces
+                skip_interactive=skip_interactive,
+                analysis_samples=analysis_samples,
+                min_epochs_per_guid=min_epochs_per_guid,
+                max_guids=max_guids,
+                normalize_fields=normalize_fields,
+                dataset_kwargs=dataset_kwargs,
+                skip_up_effect=skip_up_effect,
+                skip_frequency_band=skip_frequency_band,
+                single_class_mode=True,
+            )
+            logger.info(f"# Phase 1 subgroup {sg_name!r} complete.")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"# Phase 1 subgroup {sg_name!r} failed: {exc}")
+            phase1_results[sg_name] = {"error": str(exc)}
+
+    # ----- Phase 2: cross-subgroup post-processor -----
+    phase2_results: Any = None
+    n_subgroups = len(resolved_subgroups)
+    if skip_phase2:
+        logger.info("Phase 2 skipped (skip_phase2=True).")
+        phase2_results = {"status": "skipped_user"}
+    elif n_subgroups < 2:
+        logger.info("Phase 2 skipped (only 1 subgroup — no comparison to make).")
+        phase2_results = {"status": "skipped_single_subgroup"}
+    else:
+        from model.vae_teb_prediction.testing.analyses.cross_subgroup_breakdown import (
+            run_cross_subgroup_breakdown,
+        )
+        phase2_dir = base_path / "phase2" / "cross_subgroup"
+        logger.info("\n" + "#" * 70)
+        logger.info(f"# Phase 2: cross-subgroup comparison")
+        logger.info(f"# Inputs : {base_path / 'phase1'}")
+        logger.info(f"# Output : {phase2_dir}")
+        logger.info("#" * 70)
+        try:
+            phase2_results = run_cross_subgroup_breakdown(
+                phase1_root=base_path / "phase1",
+                output_dir=phase2_dir,
+            )
+            logger.info("# Phase 2 complete.")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"# Phase 2 failed: {exc}")
+            phase2_results = {"error": str(exc)}
+
+    # Persist a top-level digest so the run is recoverable from disk.
+    summary_path = base_path / "subgroup_summary.json"
+    try:
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "subgroups": list(resolved_subgroups.keys()),
+                    "n_subgroups": n_subgroups,
+                    "phase1_status": {
+                        n: ("error" if isinstance(r, dict) and "error" in r else "ok")
+                        for n, r in phase1_results.items()
+                    },
+                    "phase2_status": (
+                        phase2_results.get("status")
+                        if isinstance(phase2_results, dict) and "status" in phase2_results
+                        else ("error" if isinstance(phase2_results, dict)
+                              and "error" in phase2_results else "ok")
+                    ),
+                    "output_dir": str(base_path),
+                },
+                fh, indent=2,
+            )
+        logger.info(f"Subgroup summary saved to {summary_path}")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Failed to write subgroup_summary.json: {exc}")
+
+    return {
+        "phase1": phase1_results,
+        "phase2": phase2_results,
+        "output_dir": str(base_path),
+    }
 
 
 def _create_dataloader(
@@ -1092,21 +1385,57 @@ if __name__ == "__main__":
     CHECKPOINT: Optional[str] = None  # Use config's core_model_checkpoint if None
     DATA: Optional[str] = None  # Use config's vae_test_datasets if None
     STATS: Optional[str] = None  # Use config's dataset_config.stat_path if None
-    CONFIG: Optional[str] = "model/vae_teb_prediction/model/config_lag_attn_v1.yaml"
+    CONFIG: Optional[str] = "model/vae_teb_prediction/testing/config_lag_attn_v1.yaml"
     OUTPUT: Optional[str] = None  # Use config's folders_config.out_dir_base if None
 
-    results = run_full_test_pipeline(
-        checkpoint_path=CHECKPOINT,
-        data_path=DATA,
-        output_dir=OUTPUT,
-        stats_path=STATS,
-        config_path=CONFIG,
-        max_samples=None,  # Process all samples
-        analysis_samples=400,
-    )
+    # Dispatch on whether the YAML config requests subgroup mode.
+    # ``vae_test_subgroups`` (or ``vae_test_fold_dir``) → two-phase driver.
+    # Otherwise fall back to the legacy single-pass pipeline.
+    _subgroup_map = {}
+    if CONFIG is not None:
+        try:
+            from model.vae_teb_prediction.testing.analyses.subgroup_utils import (
+                resolve_subgroups,
+            )
+            _subgroup_map = resolve_subgroups(config_path=CONFIG)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Subgroup resolution failed ({exc!r}); falling back to "
+                f"the legacy single-pass pipeline."
+            )
 
-    # Headline summary
-    hist = results.get("histogram")
+    if len(_subgroup_map) >= 2:
+        logger.info(
+            f"__main__: dispatching to run_full_test_pipeline_by_subgroup "
+            f"({len(_subgroup_map)} subgroups)."
+        )
+        results = run_full_test_pipeline_by_subgroup(
+            subgroups=_subgroup_map,
+            checkpoint_path=CHECKPOINT,
+            output_dir=OUTPUT,
+            stats_path=STATS,
+            config_path=CONFIG,
+            max_samples=None,
+            analysis_samples=400,
+        )
+    else:
+        logger.info(
+            "__main__: dispatching to run_full_test_pipeline (single-pass)."
+        )
+        results = run_full_test_pipeline(
+            checkpoint_path=CHECKPOINT,
+            data_path=DATA,
+            output_dir=OUTPUT,
+            stats_path=STATS,
+            config_path=CONFIG,
+            max_samples=None,
+            analysis_samples=400,
+        )
+
+    # Headline summary (single-pass results only — Phase 1 results live
+    # under ``results["phase1"][<subgroup>]`` in subgroup mode and we
+    # don't print a per-subgroup table from here).
+    hist = results.get("histogram") if isinstance(results, dict) else None
     try:
         import pandas as pd
         if isinstance(hist, pd.DataFrame) and not hist.empty:
@@ -1117,5 +1446,9 @@ if __name__ == "__main__":
             print(f"uplift_rel:       {hist['uplift_rel'].mean():.4f}")
             print(f"residual_ratio:   {hist['residual_ratio'].mean():.4f}")
             print(f"kld_mean:         {hist['kld_mean'].mean():.4f}")
+        elif isinstance(results, dict) and "phase1" in results:
+            print("\n=== Subgroup-mode test complete ===")
+            print(f"Output dir: {results.get('output_dir')}")
+            print(f"Subgroups:  {list(results['phase1'].keys())}")
     except Exception:
         pass
