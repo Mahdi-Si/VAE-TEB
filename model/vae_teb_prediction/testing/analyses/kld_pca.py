@@ -37,6 +37,10 @@ from model.vae_teb_prediction.testing.visualizers import (
     COLOR_ORANGE,
     COLOR_VERMILLION,
     _style_axes,
+    plot_kld_per_dim_heatmap,
+    plot_kld_per_dim_violins_by_class,
+    plot_kld_trajectory_by_group,
+    plot_selected_pc_trajectories_grid,
 )
 
 CLASS_NAMES = {1: "HEALTHY", 2: "ACIDOSIS", 3: "HIE"}
@@ -316,6 +320,52 @@ def run_kld_pca_analysis(
         _plot_pc_trajectories_overlay(
             traj_df, selected_count, output_dir / "pc_trajectories_overlay.pdf"
         )
+
+    # ----- New Phase 1 KLD visualisations ------------------------------
+    # All four read from data already on disk (``histograms/histogram_metrics.csv``
+    # for per-dim aggregates, ``kld_pc_trajectory.csv`` for per-time
+    # trajectories, ``pca_kld/selection.json`` for the contrast-selected
+    # PC indices). Each is wrapped in a try / log block so a single
+    # bad plot doesn't abort ``run_kld_pca_analysis``.
+    components = np.asarray(artifacts.get("components"), dtype=float)
+    d_z = int(components.shape[1]) if components.ndim == 2 else 0
+    if d_z > 0 and metrics_df is not None and "label" in metrics_df.columns:
+        try:
+            plot_kld_per_dim_heatmap(
+                metrics_df, d_z,
+                output_dir / "kld_per_dim_heatmap_by_class.pdf",
+                group_col="label",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"kld_pca: kld_per_dim_heatmap_by_class failed: {exc!r}")
+        try:
+            plot_kld_per_dim_violins_by_class(
+                metrics_df, d_z,
+                output_dir / "kld_per_dim_violins_by_class.pdf",
+                group_col="label",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"kld_pca: kld_per_dim_violins_by_class failed: {exc!r}")
+
+    if not traj_df.empty and "label" in traj_df.columns:
+        try:
+            plot_kld_trajectory_by_group(
+                traj_df, output_dir / "kld_trajectory_by_class.pdf",
+                group_col="label",
+                metric_col="kld_mean",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"kld_pca: kld_trajectory_by_class failed: {exc!r}")
+        try:
+            plot_selected_pc_trajectories_grid(
+                traj_df, selection,
+                output_dir / "selected_pc_trajectories_grid.pdf",
+                group_col="label",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"kld_pca: selected_pc_trajectories_grid failed: {exc!r}"
+            )
 
     summary = {
         "n_samples": int(artifacts["ev"]["n_samples_fitted"]),
