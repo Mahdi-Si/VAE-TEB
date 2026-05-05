@@ -114,11 +114,26 @@ def build_cache_input_summary(
     partition: str,
     files: Sequence[str],
     checkpoint_sha256: str,
+    epoch_min_override: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Return the semantic inputs that determine one cache's contents."""
+    """Return the semantic inputs that determine one cache's contents.
+
+    Args:
+        epoch_min_override: When provided, this value (instead of
+            ``dataset_config.epoch_min``) is baked into the signature and
+            recorded in the cache. Used by the per-partition window-split
+            path (``evaluation.epoch_min_test``) so val/test caches can
+            be invalidated independently of the train cache when the eval
+            window changes.
+    """
     ds_cfg = config.get("dataset_config", {}) or {}
     vae_cfg = config.get("vae", {}) or {}
     precompute_cfg = config.get("precompute", {}) or {}
+    effective_epoch_min = (
+        epoch_min_override
+        if epoch_min_override is not None
+        else ds_cfg.get("epoch_min")
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "fold_id": int(fold_id),
@@ -127,7 +142,7 @@ def build_cache_input_summary(
         "vae_checkpoint_path": str(Path(vae_cfg["checkpoint"]).resolve()),
         "vae_model_kwargs": _json_safe(dict(vae_cfg.get("model_kwargs", {}))),
         "dataset": {
-            "epoch_min": ds_cfg.get("epoch_min"),
+            "epoch_min": effective_epoch_min,
             "epoch_max_rule": ds_cfg.get("epoch_max_rule", "cross_delivery"),
             "trim_minutes": float(ds_cfg.get("trim_minutes", 1.0)),
             "normalize_fields": _json_safe(
@@ -153,6 +168,7 @@ def build_cache_input_signature(
     partition: str,
     files: Sequence[str],
     checkpoint_sha256: str,
+    epoch_min_override: Optional[int] = None,
 ) -> Tuple[str, str]:
     """Stable signature used to decide whether an existing cache is reusable."""
     summary = build_cache_input_summary(
@@ -161,6 +177,7 @@ def build_cache_input_signature(
         partition=partition,
         files=files,
         checkpoint_sha256=checkpoint_sha256,
+        epoch_min_override=epoch_min_override,
     )
     summary_json = json.dumps(_json_safe(summary), sort_keys=True, separators=(",", ":"))
     signature = hashlib.sha256(summary_json.encode("utf-8")).hexdigest()
@@ -297,6 +314,7 @@ def build_segment_dataset(
     config: Dict[str, Any],
     *,
     cache_size: int = 0,
+    epoch_min_override: Optional[int] = None,
 ) -> CombinedHDF5Dataset:
     """Construct a segment-level :class:`CombinedHDF5Dataset` for precompute.
 
@@ -310,12 +328,21 @@ def build_segment_dataset(
         config: Parsed classifier config.
         cache_size: Per-segment cache size (0 disables — preferred during
             precompute since each segment is read exactly once).
+        epoch_min_override: When provided, used in place of
+            ``dataset_config.epoch_min``. Plumbed through from
+            ``precompute_fold_latents``' ``epoch_min_overrides`` so that
+            train/val/test caches can be built with different windows
+            (e.g. train on last 6h, val+test on last 12h).
 
     Returns:
         Configured dataset ready to feed a DataLoader.
     """
     ds_cfg = config.get("dataset_config", {})
-    epoch_min = ds_cfg.get("epoch_min")
+    epoch_min = (
+        epoch_min_override
+        if epoch_min_override is not None
+        else ds_cfg.get("epoch_min")
+    )
     epoch_max_rule = ds_cfg.get("epoch_max_rule", "cross_delivery")
     epoch_max = -1260.0 if epoch_max_rule == "cross_delivery" else None
     trim_minutes = float(ds_cfg.get("trim_minutes", 1.0))
@@ -405,6 +432,7 @@ def precompute_partition(
     fit_latent_stats_max_batches: Optional[int] = None,
     vae_checkpoint_sha256_override: Optional[str] = None,
     vae_checkpoint_path_override: Optional[str] = None,
+    epoch_min_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Precompute one partition's latent cache and write it to ``cache_path``.
 
@@ -434,6 +462,11 @@ def precompute_partition(
             evaluation time.
         vae_checkpoint_path_override: Optional path string to record alongside
             the SHA override (e.g. the classifier ``best.ckpt``).
+        epoch_min_override: Optional per-partition ``epoch_min`` override.
+            When set, used in place of ``dataset_config.epoch_min`` for
+            both segment-level filtering and the cache signature so this
+            partition's cache can be invalidated independently of the
+            others when only the eval window changes.
 
     Returns:
         Manifest dict describing the cache (counts, files, stats summary).
@@ -455,6 +488,7 @@ def precompute_partition(
         partition=partition,
         files=files,
         checkpoint_sha256=ckpt_sha256,
+        epoch_min_override=epoch_min_override,
     )
     d_z = int(config["vae"]["model_kwargs"]["d_z"])
     d_model_vae = int(config["vae"]["model_kwargs"]["d_model"])
@@ -473,7 +507,9 @@ def precompute_partition(
     compression = config.get("precompute", {}).get("compression", "gzip")
     compression_level = int(config.get("precompute", {}).get("compression_level", 4))
 
-    dataset = build_segment_dataset(files, config, cache_size=0)
+    dataset = build_segment_dataset(
+        files, config, cache_size=0, epoch_min_override=epoch_min_override
+    )
     if len(dataset) == 0:
         raise RuntimeError(
             f"Segment dataset is empty for fold {fold_id}/{partition} (files={files})"
@@ -835,6 +871,7 @@ def precompute_fold_latents(
     batch_size: int = 32,
     num_workers: int = 2,
     force: bool = False,
+    epoch_min_overrides: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Precompute caches for all three partitions of a single fold.
 
@@ -850,6 +887,12 @@ def precompute_fold_latents(
         batch_size: VAE forward batch size in segments.
         num_workers: DataLoader worker count.
         force: When True, ignore existing caches and recompute.
+        epoch_min_overrides: Optional mapping ``{partition: epoch_min}``
+            applied per partition in place of ``dataset_config.epoch_min``.
+            Plumbed into both segment-level filtering and the cache input
+            signature so each partition's cache invalidates independently
+            when only its window changes. Use to widen val/test relative
+            to train (e.g. ``{"val": -43200, "test": -43200}``).
 
     Returns:
         Manifest dict with one entry per partition.
@@ -876,6 +919,12 @@ def precompute_fold_latents(
         "partitions": {},
     }
 
+    overrides = dict(epoch_min_overrides or {})
+
+    def _override_for(partition: str) -> Optional[int]:
+        val = overrides.get(partition)
+        return int(val) if val is not None else None
+
     partitions: List[str] = ["train", "val", "test"]
     partition_files: Dict[str, List[str]] = {
         p: get_fold_partition_files(
@@ -890,6 +939,7 @@ def precompute_fold_latents(
             partition=p,
             files=partition_files[p],
             checkpoint_sha256=expected_sha,
+            epoch_min_override=_override_for(p),
         )
         for p in partitions
     }
@@ -955,6 +1005,7 @@ def precompute_fold_latents(
             fit_latent_stats_max_batches=config["vae"].get(
                 "fit_latent_stats_max_batches"
             ),
+            epoch_min_override=_override_for("train"),
         )
         train_stats = (
             vae.mu_post_running_mean.detach().cpu().clone(),
@@ -987,6 +1038,7 @@ def precompute_fold_latents(
             batch_size=batch_size,
             num_workers=num_workers,
             train_stats=train_stats,
+            epoch_min_override=_override_for(partition),
         )
 
     manifest_path = fold_dir / "manifest.json"

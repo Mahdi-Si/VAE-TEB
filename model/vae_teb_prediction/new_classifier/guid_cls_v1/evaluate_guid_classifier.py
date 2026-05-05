@@ -528,6 +528,7 @@ def _ensure_live_vae_eval_caches(
     device: torch.device,
     cache_root: Path,
     best_checkpoint_path: Path,
+    epoch_min_overrides: Optional[Dict[str, int]] = None,
 ) -> None:
     """Build val/test latent caches at eval-time for a live-VAE run.
 
@@ -553,6 +554,10 @@ def _ensure_live_vae_eval_caches(
         best_checkpoint_path: Path to the trained classifier checkpoint
             (its ``vae.*`` entries are loaded into a fresh
             :class:`SeqVaeLagAttnV1` and used for the encoding pass).
+        epoch_min_overrides: Optional ``{partition: epoch_min}`` dict.
+            Honoured per partition; when set for ``"val"``/``"test"`` the
+            corresponding cache is built with a wider (or narrower)
+            pre-delivery window than ``dataset_config.epoch_min``.
 
     Notes:
         ``train_stats`` for val/test are taken from the loaded VAE's
@@ -634,6 +639,7 @@ def _ensure_live_vae_eval_caches(
     bs_precompute = int(config.get("precompute", {}).get("batch_size", 32))
     nw_precompute = int(config.get("precompute", {}).get("num_workers", 2))
 
+    overrides = epoch_min_overrides or {}
     for partition in needed:
         files = get_fold_partition_files(
             kfold_base_path, fold_id, partition, test_mode=test_mode
@@ -652,6 +658,7 @@ def _ensure_live_vae_eval_caches(
             train_stats=train_stats,
             vae_checkpoint_sha256_override=ckpt_sha,
             vae_checkpoint_path_override=str(best_checkpoint_path),
+            epoch_min_override=overrides.get(partition),
         )
         logger.info(
             f"[{fold_dir.name}] live-VAE eval: wrote {partition} cache "
@@ -729,6 +736,22 @@ def evaluate_single_fold(
 
     eval_dir = fold_dir / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
+    # New, head-explicit per-fold layout (replaces the old
+    # ``three_metric_types/`` parent that intermingled binary and 3-class
+    # artefacts at every level).
+    predictions_dir = eval_dir / "predictions"
+    binary_head_dir = eval_dir / "binary_head"
+    multiclass_head_dir = eval_dir / "multiclass_head"
+    diagnostics_dir = multiclass_head_dir / "diagnostics"
+    dataset_stats_dir = eval_dir / "dataset_stats"
+    for _d in (
+        predictions_dir,
+        binary_head_dir,
+        multiclass_head_dir,
+        diagnostics_dir,
+        dataset_stats_dir,
+    ):
+        _d.mkdir(parents=True, exist_ok=True)
 
     # Cache root is derived from ``fold_dir.parent`` (i.e. the actual run
     # directory) rather than reconstructed from ``out_dir_base/tag`` so that
@@ -741,6 +764,22 @@ def evaluate_single_fold(
     cache_root = fold_dir.parent / out_subdir / fold_dir.name
     val_cache = cache_root / "val.hdf5"
     test_cache = cache_root / "test.hdf5"
+
+    # Per-partition window split (§ evaluation.epoch_min_test): when set,
+    # val and test caches are built with this wider pre-delivery window
+    # while train always uses ``dataset_config.epoch_min``. Threaded into
+    # the live-VAE eval-time precompute below; the frozen-VAE path's
+    # cache regeneration relies on the input-signature mismatch path
+    # in :func:`precompute_fold_latents` and so does not need to be
+    # invoked here.
+    eval_cfg_early = config.get("evaluation", {}) or {}
+    epoch_min_test_cfg = eval_cfg_early.get("epoch_min_test")
+    epoch_min_overrides_eval: Dict[str, int] = {}
+    if epoch_min_test_cfg is not None:
+        epoch_min_overrides_eval = {
+            "val": int(epoch_min_test_cfg),
+            "test": int(epoch_min_test_cfg),
+        }
 
     # Live-VAE training (vae.freeze_vae=False) doesn't precompute latents
     # — the classifier's live_forward encodes raw segments. The downstream
@@ -763,6 +802,7 @@ def evaluate_single_fold(
             device=device,
             cache_root=cache_root,
             best_checkpoint_path=ckpt_for_cache,
+            epoch_min_overrides=epoch_min_overrides_eval or None,
         )
 
     assert val_cache.exists(), f"missing val cache {val_cache}"
@@ -824,9 +864,18 @@ def evaluate_single_fold(
         test_cache, config=config, batch_size=eval_batch
     )
 
-    # Inference.
-    val_csv = eval_dir / "validation_predictions_raw.csv"
-    test_csv = eval_dir / "test_predictions_raw.csv"
+    # Inference. Predictions CSVs live under ``predictions/`` (new
+    # layout); legacy ``validation_predictions_raw.csv`` /
+    # ``test_predictions_raw.csv`` files at ``eval_dir`` root from older
+    # runs are still readable when present.
+    legacy_val_csv = eval_dir / "validation_predictions_raw.csv"
+    legacy_test_csv = eval_dir / "test_predictions_raw.csv"
+    val_csv = predictions_dir / "validation_raw.csv"
+    test_csv = predictions_dir / "test_raw.csv"
+    if not val_csv.exists() and legacy_val_csv.exists():
+        val_csv = legacy_val_csv
+    if not test_csv.exists() and legacy_test_csv.exists():
+        test_csv = legacy_test_csv
     if regenerate_predictions or not val_csv.exists():
         logger.info(f"[{fold_dir.name}] running val inference (prefix sweep)")
         val_df = run_inference_prefix_sweep(classifier, val_loader, device=device)
@@ -911,21 +960,27 @@ def evaluate_single_fold(
 
     # Apply CDR + persist clinical CSVs (use overall threshold as primary).
     val_clinical = utils["apply_clinical_decision_rule"](val_df, thr_overall, verify=True)
-    val_clinical.to_csv(eval_dir / "validation_predictions_clinical.csv", index=False)
+    val_clinical.to_csv(predictions_dir / "validation_clinical.csv", index=False)
     test_clinical = utils["apply_clinical_decision_rule"](test_df, thr_overall, verify=True)
-    test_clinical.to_csv(eval_dir / "test_predictions_clinical.csv", index=False)
+    test_clinical.to_csv(predictions_dir / "test_clinical.csv", index=False)
 
-    # Three-metric-type analysis on the test set, each with its own threshold.
-    metrics_dir = eval_dir / "three_metric_types"
-    metrics_dir.mkdir(parents=True, exist_ok=True)
+    # Three-metric-type analysis on the test set, each with its own
+    # threshold. Outputs land under ``binary_head/`` (binary-side curves
+    # and subgroups) and ``multiclass_head/`` (3-class per-class /
+    # subgroup / AUROC / aggregate / confusion-evolution panels). The
+    # old ``three_metric_types/`` parent that intermingled the two heads
+    # is gone.
+    binary_metrics_vs_time_dir = binary_head_dir / "metrics_vs_time"
+    binary_subgroups_dir = binary_head_dir / "subgroups_vs_time"
+    binary_metrics_vs_time_dir.mkdir(parents=True, exist_ok=True)
+    binary_subgroups_dir.mkdir(parents=True, exist_ok=True)
     metric_summaries: Dict[str, Any] = {}
+    perclass_thresholds_by_mode: Dict[str, Any] = {}
     for metric_type, threshold in (
         ("instantaneous", thr_inst),
         ("committed_cumulative", thr_cum),
         ("committed_overall", thr_overall),
     ):
-        sub_dir = metrics_dir / metric_type
-        sub_dir.mkdir(parents=True, exist_ok=True)
         df_clinical = utils["apply_clinical_decision_rule"](
             test_df, threshold, verify=False
         )
@@ -948,26 +1003,72 @@ def evaluate_single_fold(
             )
         else:
             metrics_df = utils["compute_committed_overall_metrics"](df_clinical, bins, None)
-        utils["plot_single_metric_type"](metrics_df, metric_type, sub_dir)
-        utils["plot_subgroup_analysis"](
+
+        # Persist the binary metrics-vs-time CSV (one file per mode);
+        # plotters still write multi-figure PNGs into the same dir.
+        metrics_df.to_csv(
+            binary_metrics_vs_time_dir / f"{metric_type}.csv", index=False
+        )
+        per_mode_plot_dir = binary_metrics_vs_time_dir / metric_type
+        per_mode_plot_dir.mkdir(parents=True, exist_ok=True)
+        utils["plot_single_metric_type"](
+            metrics_df,
+            metric_type,
+            per_mode_plot_dir,
+            decision_time_hours=decision_time_hours,
+        )
+
+        # Binary subgroup analysis: persist a long-format CSV summarising
+        # every subgroup's metric curve, then keep the existing rich
+        # multi-PNG renderer in a per-mode sub-directory for human review.
+        subgroup_filters = utils["create_enhanced_subgroup_filters"]()
+        subgroup_metrics_dict = utils["plot_subgroup_analysis"](
             df_clinical,
             bins,
             metric_type,
-            utils["create_enhanced_subgroup_filters"](),
-            sub_dir / "subgroups",
+            subgroup_filters,
+            binary_subgroups_dir / metric_type,
             title_suffix=f" - {fold_dir.name}",
         )
-        # Per-class metrics + per-class subgroup stratification +
-        # binary-by-underlying-class views (Phase 2 of the eval expansion).
-        # All artefacts land under ``sub_dir/per_class/`` and
-        # ``sub_dir/binary_by_underlying_class/`` so the legacy directory
-        # tree above is unchanged.
         try:
-            run_3class_evaluation_for_metric_type(
+            sub_long_rows: List[Dict[str, Any]] = []
+            for sg_name, sg_df in (subgroup_metrics_dict or {}).items():
+                if sg_df is None or len(sg_df) == 0:
+                    continue
+                for _, r in sg_df.iterrows():
+                    row = {"subgroup": sg_name}
+                    for col in (
+                        "bin_center",
+                        "sensitivity",
+                        "specificity",
+                        "fpr",
+                        "n_pos",
+                        "n_neg",
+                        "n",
+                    ):
+                        if col in r.index:
+                            row[col] = r[col]
+                    sub_long_rows.append(row)
+            if sub_long_rows:
+                pd.DataFrame(sub_long_rows).to_csv(
+                    binary_subgroups_dir / f"{metric_type}.csv", index=False
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                f"[{fold_dir.name}] binary subgroup long-format CSV "
+                f"({metric_type}) failed"
+            )
+
+        # Per-class + per-class subgroup + by-underlying-class +
+        # AUROC-vs-time + aggregate-vs-time + confusion-evolution
+        # artefacts. Now writes to ``multiclass_head/`` and
+        # ``binary_head/by_underlying_class_vs_time/`` directly.
+        try:
+            res_3c = run_3class_evaluation_for_metric_type(
                 df_clinical,
                 time_bins=bins,
                 metric_type=metric_type,
-                output_dir=sub_dir,
+                eval_root=eval_dir,
                 df_val=val_df if perclass_threshold_search_default else None,
                 target_fpr=target_fpr,
                 decision_time_hours=decision_time_hours,
@@ -975,6 +1076,9 @@ def evaluate_single_fold(
                     "max_gap_multiplier": max_gap_multiplier,
                     "fallback_tolerance_hours": fallback_tolerance_hours,
                 },
+            )
+            perclass_thresholds_by_mode[metric_type] = (
+                res_3c.get("perclass_threshold_info") or {}
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception(
@@ -985,7 +1089,7 @@ def evaluate_single_fold(
             "n_bins": int(len(metrics_df)),
         }
 
-    # Binary GUID-level ROC.
+    # Binary GUID-level ROC -> ``binary_head/roc.{csv,png}``.
     roc_data = utils["compute_guid_level_roc"](
         test_df, decision_time_hours=decision_time_hours
     )
@@ -995,38 +1099,38 @@ def evaluate_single_fold(
             "tpr": roc_data["tpr"],
             "thresholds": roc_data["thresholds"],
         }
-    ).to_csv(eval_dir / "roc_binary_data.csv", index=False)
+    ).to_csv(binary_head_dir / "roc.csv", index=False)
     utils["plot_roc_curve"](
         roc_data,
-        eval_dir / "roc_binary.png",
+        binary_head_dir / "roc.png",
         title_suffix=f" — {fold_dir.name}",
         threshold=thr_overall,
     )
 
-    # 3-class one-vs-rest ROC + confusion matrix + diagnostic plots.
+    # 3-class one-vs-rest ROC + confusion matrix + diagnostic plots ->
+    # ``multiclass_head/diagnostics/``.
     three_class_roc = compute_3class_roc_ovr(test_df)
     pd.DataFrame(
         [
             {"class": k, "auc": v["auc"]}
             for k, v in three_class_roc.items()
         ]
-    ).to_csv(eval_dir / "roc_3class_data.csv", index=False)
-    diag_dir = eval_dir / "three_metric_types" / "three_class_diagnostics"
-    plot_three_class_diagnostics(test_df, diag_dir)
+    ).to_csv(diagnostics_dir / "roc_ovr.csv", index=False)
+    plot_three_class_diagnostics(test_df, diagnostics_dir)
     # Extended per-fold 3-class diagnostics (calibration, PR curves,
     # probability box plots). These are CDR-independent so they only need
     # to be computed once per fold.
     try:
-        run_3class_global_diagnostics(test_df, diag_dir)
+        run_3class_global_diagnostics(test_df, diagnostics_dir)
     except Exception:  # pragma: no cover - defensive
         logger.exception(f"[{fold_dir.name}] 3-class global diagnostics failed")
 
-    # Dataset statistics (PRD §11.8 / §14.4). Best-effort: the legacy helper
-    # produces dataset_overview.pdf, subgroup_overview.pdf, etc. under the
-    # ``dataset_stats/`` subtree. Failures are logged but non-fatal.
+    # Dataset statistics (PRD §11.8 / §14.4). Best-effort: the legacy
+    # helper produces dataset_overview.pdf, subgroup_overview.pdf, etc.
+    # under the top-level ``dataset_stats/`` subtree (promoted out of
+    # ``three_metric_types/`` — it is time-independent). Failures are
+    # logged but non-fatal.
     try:
-        ds_stats_dir = eval_dir / "three_metric_types" / "dataset_stats"
-        ds_stats_dir.mkdir(parents=True, exist_ok=True)
         ds_time_bins = utils["compute_time_bins"](
             utils["ensure_epoch_hours"](test_df),
             exclude_last_minutes=exclude_last_minutes,
@@ -1034,7 +1138,7 @@ def evaluate_single_fold(
         utils["generate_fold_dataset_stats"](
             test_df,
             ds_time_bins,
-            ds_stats_dir,
+            dataset_stats_dir,
             title_suffix=f"Test Set — {fold_dir.name}",
         )
     except Exception:  # pragma: no cover - external code, optional artefact
@@ -1052,23 +1156,41 @@ def evaluate_single_fold(
             k: float(v["auc"]) if v["auc"] == v["auc"] else None  # NaN guard
             for k, v in three_class_roc.items()
         },
+        "epoch_min_train": (
+            int(config.get("dataset_config", {}).get("epoch_min"))
+            if config.get("dataset_config", {}).get("epoch_min") is not None
+            else None
+        ),
+        "epoch_min_test": (
+            int(epoch_min_test_cfg) if epoch_min_test_cfg is not None else None
+        ),
     }
-    (eval_dir / "threshold_info.json").write_text(
+    (eval_dir / "thresholds.json").write_text(
         json.dumps(threshold_info, indent=2, sort_keys=True), encoding="utf-8"
     )
 
-    # Per-class OvR thresholds are now persisted per-mode by
-    # ``run_3class_evaluation_for_metric_type`` as
-    # ``three_metric_types/<mode>/perclass_thresholds_<mode>.json`` —
-    # the previous single-file ``perclass_thresholds.json`` only covered
-    # the committed-overall mode and was a redundant second source of
-    # truth, so it has been removed.
+    # Consolidated per-class OvR thresholds across all 3 modes (binary
+    # parity for the 3-class head). Written as one file under
+    # ``multiclass_head/`` instead of three per-mode JSONs scattered
+    # across the old ``three_metric_types/<mode>/`` tree.
+    if perclass_thresholds_by_mode:
+        (multiclass_head_dir / "perclass_thresholds.json").write_text(
+            json.dumps(
+                utils["convert_numpy_types"](perclass_thresholds_by_mode),
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
 
-    # 3×3 confusion matrix at the overall threshold.
+    # 3×3 confusion matrix at the overall threshold ->
+    # ``multiclass_head/diagnostics/confusion_matrix.csv``.
     cm = compute_confusion_matrix_3class(test_df)
-    pd.DataFrame(cm, index=["healthy", "acidosis", "hie"], columns=["healthy", "acidosis", "hie"]).to_csv(
-        eval_dir / "three_metric_types" / "three_class_diagnostics" / "confusion_matrix_3class.csv"
-    )
+    pd.DataFrame(
+        cm,
+        index=["healthy", "acidosis", "hie"],
+        columns=["healthy", "acidosis", "hie"],
+    ).to_csv(diagnostics_dir / "confusion_matrix.csv")
 
     # Final fold-level results.
     fold_results = {
