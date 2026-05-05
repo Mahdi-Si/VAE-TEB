@@ -517,7 +517,18 @@ def evaluate_kfold(
                 aggregate_results,
             )
 
-            aggregated = aggregate_results(run_dir=run_dir, fold_ids=successful_fids)
+            decision_time_hours_cfg = (
+                (config.get("evaluation", {}) or {}).get("decision_time_hours")
+            )
+            aggregated = aggregate_results(
+                run_dir=run_dir,
+                fold_ids=successful_fids,
+                decision_time_hours=(
+                    float(decision_time_hours_cfg)
+                    if decision_time_hours_cfg is not None
+                    else None
+                ),
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"aggregate_results failed: {exc}")
     else:

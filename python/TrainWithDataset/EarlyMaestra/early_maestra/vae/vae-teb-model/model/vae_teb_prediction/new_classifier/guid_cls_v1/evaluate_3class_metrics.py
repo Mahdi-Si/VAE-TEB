@@ -160,6 +160,7 @@ def _legacy_utils() -> Dict[str, Any]:
     any legacy ``vae_teb_prediction.classifier`` code.
     """
     from model.vae_teb_prediction.new_classifier.guid_cls_v1.clinical_metrics_utils import (  # noqa: WPS433
+        annotate_decision_time,
         apply_clinical_decision_rule,
         compute_committed_cumulative_metrics,
         compute_committed_overall_metrics,
@@ -174,6 +175,7 @@ def _legacy_utils() -> Dict[str, Any]:
     )
 
     return dict(
+        annotate_decision_time=annotate_decision_time,
         apply_clinical_decision_rule=apply_clinical_decision_rule,
         compute_committed_cumulative_metrics=compute_committed_cumulative_metrics,
         compute_committed_overall_metrics=compute_committed_overall_metrics,
@@ -497,61 +499,146 @@ def find_perclass_threshold_at_target_fpr(
 # ---------------------------------------------------------------------------
 
 
-def plot_perclass_panel(
-    metrics_per_class: Mapping[str, pd.DataFrame],
-    *,
-    output_dir: Path,
-    metric_type: str,
-    title_suffix: str = "",
-) -> None:
-    """Render per-class metric panels using the legacy binary plotter.
+_CLASS_PALETTE: Mapping[str, str] = {
+    "healthy": "#27ae60",
+    "acidosis": "#f39c12",
+    "hie": "#c0392b",
+}
 
-    Each class gets its own subdirectory under ``output_dir`` (so the
-    legacy file names ``sensitivity_vs_time.png`` etc. don't collide).
 
-    Args:
-        metrics_per_class: Mapping ``{class_name: metrics_df}``.
-        output_dir: Output root for the panel set.
-        metric_type: One of ``METRIC_TYPES`` — passed through to the
-            legacy plotter for axis labelling consistency.
-        title_suffix: Optional suffix appended to the legacy title.
+def _annotate_decision_time(ax, decision_time_hours: Optional[float]) -> None:
+    """Re-export the shared decision-time annotation helper.
+
+    Wrapped here so this module doesn't import the helper at import time
+    (the legacy utils dispatcher is already lazy).
     """
     utils = _legacy_utils()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    annotate = utils.get("annotate_decision_time")
+    if annotate is None:
+        return
+    annotate(ax, decision_time_hours=decision_time_hours)
+
+
+def collect_perclass_long_format(
+    metrics_per_class: Mapping[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Stack per-class metric DataFrames into one long-format frame.
+
+    Output columns: ``[bin_center, class, sensitivity, specificity, fpr,
+    n_positive, n_negative, ...]`` (any extra columns produced by the
+    legacy time-binned fns are passed through).
+
+    Args:
+        metrics_per_class: Mapping ``{class_name: metrics_df}`` (legacy
+            wide-format per-class output).
+
+    Returns:
+        A long-format DataFrame; one row per (bin, class).
+    """
+    frames = []
     for class_name, metrics_df in metrics_per_class.items():
         if metrics_df is None or metrics_df.empty:
             continue
-        sub = output_dir / class_name
-        sub.mkdir(parents=True, exist_ok=True)
-        utils["plot_single_metric_type"](
-            metrics_df=metrics_df,
-            metric_type=metric_type,
-            output_dir=sub,
-            title_suffix=f" [{class_name}{title_suffix}]",
-        )
+        m = metrics_df.copy()
+        m.insert(0, "class", class_name)
+        frames.append(m)
+    if not frames:
+        return pd.DataFrame(columns=["bin_center", "class"])
+    return pd.concat(frames, ignore_index=True)
 
 
-def plot_subgroup_perclass(
+def plot_perclass_panel_combined(
+    metrics_per_class: Mapping[str, pd.DataFrame],
+    *,
+    output_path: Path,
+    metric_type: str,
+    decision_time_hours: Optional[float] = None,
+    title_suffix: str = "",
+) -> None:
+    """One PNG with three side-by-side panels (one per class).
+
+    Each panel shows sensitivity, specificity, and FPR vs hours before
+    birth for the given class. Replaces the previous layout that wrote
+    three separate per-class subdirectories.
+
+    Args:
+        metrics_per_class: ``{class_name: per_class_metrics_df}``.
+        output_path: Output PNG path.
+        metric_type: Drives the panel title.
+        decision_time_hours: When provided, draws a dashed vertical
+            reference line at that x value.
+        title_suffix: Extra suffix appended to the figure suptitle.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+    metric_label = {
+        "instantaneous": "Instantaneous Decisions",
+        "committed_cumulative": "Committed (Cumulative)",
+        "committed_overall": "Committed (Overall)",
+    }.get(metric_type, metric_type)
+    for ax, (class_name, _, _) in zip(axes, CLASS_INFO):
+        metrics_df = metrics_per_class.get(class_name)
+        if metrics_df is None or metrics_df.empty:
+            ax.text(0.5, 0.5, f"{class_name}: no data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        m = metrics_df.dropna(subset=["sensitivity", "specificity", "fpr"], how="all")
+        m = m.sort_values("bin_center", ascending=False)
+        x = m["bin_center"].to_numpy()
+        if "sensitivity" in m.columns:
+            ax.plot(x, m["sensitivity"], marker="o", linewidth=2.2,
+                    label="Sensitivity", color="#2ecc71")
+        if "specificity" in m.columns:
+            ax.plot(x, m["specificity"], marker="s", linewidth=2.2,
+                    label="Specificity", color="#3498db")
+        if "fpr" in m.columns:
+            ax.plot(x, m["fpr"], marker="^", linewidth=2.2,
+                    label="FPR", color="#e74c3c")
+        ax.set_title(class_name, color=_CLASS_PALETTE.get(class_name, "black"),
+                     fontweight="bold")
+        ax.set_xlabel("Hours Before Birth")
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9, loc="best")
+        _annotate_decision_time(ax, decision_time_hours)
+    axes[0].set_ylabel("Metric value")
+    suptitle = f"Per-class metrics vs time — {metric_label}"
+    if title_suffix:
+        suptitle += f" ({title_suffix})"
+    fig.suptitle(suptitle, fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
+
+
+def compute_perclass_subgroup_long_format(
     df: pd.DataFrame,
     *,
     time_bins: np.ndarray,
     metric_type: str,
-    output_dir: Path,
-) -> None:
-    """For each (class × subgroup) compute metrics and reuse the legacy plotter.
+) -> pd.DataFrame:
+    """Build a long-format DataFrame over (bin × class × subgroup).
 
-    Subgroups come from
-    :func:`evaluate_classifier.create_enhanced_subgroup_filters`.
+    Replaces the per-fold tree of 12 (class × subgroup) ``metrics.csv``
+    files with a single tidy table.
 
     Args:
         df: DataFrame from :func:`add_perclass_clinical_columns`.
-        time_bins: Bin edges in hours-before-delivery.
+        time_bins: Bin edges (hours before delivery).
         metric_type: One of ``METRIC_TYPES``.
-        output_dir: Output root. Created if missing.
+
+    Returns:
+        DataFrame with columns
+        ``[bin_center, class, subgroup, sensitivity, specificity, fpr,
+        n_positive, n_negative]`` plus any extras from the legacy
+        time-binned function.
     """
     utils = _legacy_utils()
     filters = utils["create_enhanced_subgroup_filters"]()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
     for subgroup_name, filter_fn in filters.items():
         for class_name, _, _ in CLASS_INFO:
             try:
@@ -562,46 +649,336 @@ def plot_subgroup_perclass(
                     class_name=class_name,
                     subgroup_filter=filter_fn,
                 )
-            except Exception:  # noqa: BLE001 — defensive: bad subgroup yields empty
+            except Exception:  # noqa: BLE001
                 continue
             if metrics_df is None or metrics_df.empty:
                 continue
-            sub = output_dir / class_name / subgroup_name
-            sub.mkdir(parents=True, exist_ok=True)
-            metrics_df.to_csv(sub / "metrics.csv", index=False)
-            utils["plot_single_metric_type"](
-                metrics_df=metrics_df,
-                metric_type=metric_type,
-                output_dir=sub,
-                title_suffix=f" [{class_name} | {subgroup_name}]",
-            )
+            m = metrics_df.copy()
+            m.insert(0, "subgroup", subgroup_name)
+            m.insert(0, "class", class_name)
+            frames.append(m)
+    if not frames:
+        return pd.DataFrame(columns=["bin_center", "class", "subgroup"])
+    return pd.concat(frames, ignore_index=True)
 
 
-def plot_binary_by_underlying_class(
+def plot_perclass_subgroup_long(
+    long_df: pd.DataFrame,
+    *,
+    output_path: Path,
+    metric_type: str,
+    decision_time_hours: Optional[float] = None,
+) -> None:
+    """Render the per-class × subgroup long-format DataFrame as one PNG.
+
+    Layout: 3 columns (one per class), N rows (one per subgroup); each
+    cell plots SE / SP / FPR vs hours before birth.
+    """
+    if long_df is None or long_df.empty:
+        logger.warning(
+            f"plot_perclass_subgroup_long: empty long_df, skipping {output_path.name}"
+        )
+        return
+    subgroups = sorted(long_df["subgroup"].unique().tolist())
+    n_rows = len(subgroups)
+    if n_rows == 0:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(
+        n_rows, 3,
+        figsize=(15, 3.4 * n_rows + 1),
+        sharex=True, sharey=True,
+        squeeze=False,
+    )
+    metric_label = {
+        "instantaneous": "Instantaneous",
+        "committed_cumulative": "Committed (Cumulative)",
+        "committed_overall": "Committed (Overall)",
+    }.get(metric_type, metric_type)
+    for r, subgroup_name in enumerate(subgroups):
+        for c, (class_name, _, _) in enumerate(CLASS_INFO):
+            ax = axes[r, c]
+            sub = long_df[
+                (long_df["subgroup"] == subgroup_name)
+                & (long_df["class"] == class_name)
+            ]
+            if sub.empty:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", fontsize=9)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                continue
+            sub = sub.sort_values("bin_center", ascending=False)
+            x = sub["bin_center"].to_numpy()
+            if "sensitivity" in sub.columns:
+                ax.plot(x, sub["sensitivity"], marker="o", linewidth=2.0,
+                        markersize=4, label="SE", color="#2ecc71")
+            if "specificity" in sub.columns:
+                ax.plot(x, sub["specificity"], marker="s", linewidth=2.0,
+                        markersize=4, label="SP", color="#3498db")
+            if "fpr" in sub.columns:
+                ax.plot(x, sub["fpr"], marker="^", linewidth=2.0,
+                        markersize=4, label="FPR", color="#e74c3c")
+            ax.set_ylim([0, 1.05])
+            ax.invert_xaxis()
+            ax.grid(True, alpha=0.3)
+            if r == 0:
+                ax.set_title(class_name,
+                             color=_CLASS_PALETTE.get(class_name, "black"),
+                             fontweight="bold")
+            if c == 0:
+                ax.set_ylabel(f"{subgroup_name}\nMetric value", fontsize=9)
+            if r == n_rows - 1:
+                ax.set_xlabel("Hours Before Birth")
+            if r == 0 and c == 2:
+                ax.legend(fontsize=8, loc="best")
+            _annotate_decision_time(ax, decision_time_hours)
+    fig.suptitle(
+        f"Per-class × subgroup metrics vs time — {metric_label}",
+        fontsize=14, fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
+
+
+def compute_binary_by_underlying_class_long_format(
     df: pd.DataFrame,
     *,
     time_bins: np.ndarray,
     metric_type: str,
-    output_dir: Path,
-) -> None:
-    """Plot binary metrics restricted to HEALTHY ∪ {ACIDOSIS} and HEALTHY ∪ {HIE}."""
-    utils = _legacy_utils()
-    output_dir.mkdir(parents=True, exist_ok=True)
+) -> pd.DataFrame:
+    """Stack the binary-by-underlying-class metrics into one long-format frame.
+
+    Output columns: ``[bin_center, restrict_class, sensitivity,
+    specificity, fpr, ...]``.
+    """
+    frames = []
     for restrict_class in ("acidosis", "hie"):
-        metrics_df = compute_binary_by_underlying_class(
-            df, time_bins=time_bins, metric_type=metric_type, restrict_class=restrict_class
+        m = compute_binary_by_underlying_class(
+            df, time_bins=time_bins, metric_type=metric_type,
+            restrict_class=restrict_class,
         )
-        if metrics_df is None or metrics_df.empty:
+        if m is None or m.empty:
             continue
-        sub = output_dir / f"binary_only_{restrict_class}"
-        sub.mkdir(parents=True, exist_ok=True)
-        metrics_df.to_csv(sub / "metrics.csv", index=False)
-        utils["plot_single_metric_type"](
-            metrics_df=metrics_df,
-            metric_type=metric_type,
-            output_dir=sub,
-            title_suffix=f" [binary | only {restrict_class}]",
+        out = m.copy()
+        out.insert(0, "restrict_class", restrict_class)
+        frames.append(out)
+    if not frames:
+        return pd.DataFrame(columns=["bin_center", "restrict_class"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_binary_by_underlying_class_long(
+    long_df: pd.DataFrame,
+    *,
+    output_path: Path,
+    metric_type: str,
+    decision_time_hours: Optional[float] = None,
+) -> None:
+    """Render the binary-by-underlying-class long-format DataFrame as one PNG.
+
+    Two side-by-side panels (acidosis-only, hie-only); each shows SE/SP/FPR
+    vs hours before birth.
+    """
+    if long_df is None or long_df.empty:
+        logger.warning(
+            f"plot_binary_by_underlying_class_long: empty long_df, "
+            f"skipping {output_path.name}"
         )
+        return
+    classes = ["acidosis", "hie"]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    metric_label = {
+        "instantaneous": "Instantaneous",
+        "committed_cumulative": "Committed (Cumulative)",
+        "committed_overall": "Committed (Overall)",
+    }.get(metric_type, metric_type)
+    for ax, restrict_class in zip(axes, classes):
+        sub = long_df[long_df["restrict_class"] == restrict_class]
+        if sub.empty:
+            ax.text(0.5, 0.5, f"only_{restrict_class}: no data",
+                    ha="center", va="center")
+            continue
+        sub = sub.sort_values("bin_center", ascending=False)
+        x = sub["bin_center"].to_numpy()
+        if "sensitivity" in sub.columns:
+            ax.plot(x, sub["sensitivity"], marker="o", linewidth=2.2,
+                    label="Sensitivity", color="#2ecc71")
+        if "specificity" in sub.columns:
+            ax.plot(x, sub["specificity"], marker="s", linewidth=2.2,
+                    label="Specificity", color="#3498db")
+        if "fpr" in sub.columns:
+            ax.plot(x, sub["fpr"], marker="^", linewidth=2.2,
+                    label="FPR", color="#e74c3c")
+        ax.set_xlabel("Hours Before Birth")
+        ax.set_title(f"healthy vs {restrict_class}",
+                     color=_CLASS_PALETTE.get(restrict_class, "black"),
+                     fontweight="bold")
+        ax.set_ylim([0, 1.05])
+        ax.invert_xaxis()
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=10, loc="best")
+        _annotate_decision_time(ax, decision_time_hours)
+    axes[0].set_ylabel("Metric value")
+    fig.suptitle(
+        f"Binary head — restricted to one underlying class — {metric_label}",
+        fontsize=14, fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# Per-class AUROC vs time (one-vs-rest)
+# ---------------------------------------------------------------------------
+
+
+def compute_perclass_auroc_vs_time(
+    df: pd.DataFrame,
+    *,
+    time_bins: np.ndarray,
+) -> pd.DataFrame:
+    """One-vs-rest AUROC per class per time bin.
+
+    For each ``(bin, class c)``: take the most-recent prefix per GUID
+    that falls in the bin, then compute AUROC against the binary
+    indicator ``guid_class_3_target == c``. Bins where ``y_true`` is
+    all-positive or all-negative produce NaN.
+
+    Args:
+        df: Predictions DataFrame with ``guid``, ``epoch_hours``,
+            ``prob_{healthy,acidosis,hie}``, ``guid_class_3_target``,
+            and a sortable position column (``prefix_length`` or
+            ``position``).
+        time_bins: Bin edges in hours-before-delivery.
+
+    Returns:
+        Long-format DataFrame ``[bin_center, class, auroc, n_pos, n_neg, n]``.
+    """
+    from sklearn.metrics import roc_auc_score  # noqa: WPS433
+
+    if "epoch_hours" not in df.columns:
+        raise KeyError("df must have 'epoch_hours' (run ensure_epoch_hours first)")
+    if "guid_class_3_target" not in df.columns:
+        raise KeyError("df must have 'guid_class_3_target'")
+
+    sort_col = "prefix_length" if "prefix_length" in df.columns else "position"
+    df_sorted = df.sort_values(["guid", sort_col]).copy()
+    centers = _bin_centers(time_bins)
+    rows = []
+    epoch_arr = df_sorted["epoch_hours"].astype(float).to_numpy()
+    bin_idx = _bin_assign(epoch_arr, time_bins)
+    df_sorted["_bin_idx"] = bin_idx
+    for b, center in enumerate(centers):
+        sub = df_sorted[df_sorted["_bin_idx"] == b]
+        if sub.empty:
+            for class_name, _, _ in CLASS_INFO:
+                rows.append({
+                    "bin_center": float(center),
+                    "class": class_name,
+                    "auroc": float("nan"),
+                    "n_pos": 0,
+                    "n_neg": 0,
+                    "n": 0,
+                })
+            continue
+        last = sub.groupby("guid", as_index=False).tail(1)
+        target = last["guid_class_3_target"].astype(int).to_numpy()
+        n = int(len(last))
+        for class_name, target_id, prob_col in CLASS_INFO:
+            zero_based_id = target_id - 1
+            y = (target == zero_based_id).astype(int)
+            n_pos = int(y.sum())
+            n_neg = int(n - n_pos)
+            if prob_col not in last.columns or n_pos == 0 or n_neg == 0:
+                rows.append({
+                    "bin_center": float(center),
+                    "class": class_name,
+                    "auroc": float("nan"),
+                    "n_pos": n_pos,
+                    "n_neg": n_neg,
+                    "n": n,
+                })
+                continue
+            scores = last[prob_col].astype(float).to_numpy()
+            valid = ~np.isnan(scores)
+            if valid.sum() < 2 or y[valid].sum() == 0 or y[valid].sum() == valid.sum():
+                rows.append({
+                    "bin_center": float(center),
+                    "class": class_name,
+                    "auroc": float("nan"),
+                    "n_pos": n_pos,
+                    "n_neg": n_neg,
+                    "n": n,
+                })
+                continue
+            try:
+                auroc = float(roc_auc_score(y[valid], scores[valid]))
+            except ValueError:
+                auroc = float("nan")
+            rows.append({
+                "bin_center": float(center),
+                "class": class_name,
+                "auroc": auroc,
+                "n_pos": n_pos,
+                "n_neg": n_neg,
+                "n": n,
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_perclass_auroc_vs_time(
+    auroc_df: pd.DataFrame,
+    *,
+    output_path: Path,
+    metric_type: str,
+    decision_time_hours: Optional[float] = None,
+) -> None:
+    """Plot one line per class on a single axes; AUROC vs hours before birth."""
+    if auroc_df is None or auroc_df.empty:
+        logger.warning(
+            f"plot_perclass_auroc_vs_time: empty df, skipping {output_path.name}"
+        )
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for class_name, _, _ in CLASS_INFO:
+        sub = auroc_df[auroc_df["class"] == class_name].sort_values(
+            "bin_center", ascending=False
+        )
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["bin_center"].to_numpy(),
+            sub["auroc"].to_numpy(),
+            marker="o",
+            linewidth=2.2,
+            label=class_name,
+            color=_CLASS_PALETTE.get(class_name, None),
+        )
+    ax.set_xlabel("Hours Before Birth", fontsize=13)
+    ax.set_ylabel("AUROC (one-vs-rest)", fontsize=13)
+    metric_label = {
+        "instantaneous": "Instantaneous",
+        "committed_cumulative": "Committed (Cumulative)",
+        "committed_overall": "Committed (Overall)",
+    }.get(metric_type, metric_type)
+    ax.set_title(f"Per-class AUROC vs time — {metric_label}",
+                 fontsize=14, fontweight="bold")
+    ax.set_ylim([0.4, 1.02])
+    ax.axhline(0.5, color="grey", linestyle=":", linewidth=1.0, label="chance")
+    ax.invert_xaxis()
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc="best")
+    _annotate_decision_time(ax, decision_time_hours)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -614,65 +991,84 @@ def run_3class_evaluation_for_metric_type(
     *,
     time_bins: np.ndarray,
     metric_type: str,
-    output_dir: Path,
+    eval_root: Path,
     thresholds: Optional[Mapping[str, float]] = None,
     df_val: Optional[pd.DataFrame] = None,
     target_fpr: float = 0.2,
     decision_time_hours: float = 1.0,
     threshold_search_kwargs: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, pd.DataFrame]:
+) -> Dict[str, Any]:
     """Compute and persist all per-class artefacts for one metric type.
 
-    Per-class operating points for the
-    ``clinical_pred_<class>`` columns are selected with the following
-    priority (highest first):
+    Output layout (per fold, written under ``eval_root``):
 
-    1. ``thresholds`` explicitly passed by the caller — used verbatim.
-    2. ``df_val`` provided — per-class threshold is searched on the
-       validation fold via :func:`find_perclass_threshold_at_target_fpr`
-       under the same ``metric_type`` and target FPR / decision time
-       used by the binary head, and a
-       ``perclass_thresholds_<metric_type>.json`` file is written next
-       to the per-class CSVs.
-    3. Otherwise — fall back to argmax
-       (``predicted_class_3 == c``), preserving the legacy default.
+    * ``multiclass_head/per_class_vs_time/<mode>.csv`` — long-format
+      ``(bin_center, class, sensitivity, specificity, fpr, ...)``.
+    * ``multiclass_head/per_class_vs_time/<mode>_panel.png`` —
+      combined 3-panel figure (one panel per class).
+    * ``multiclass_head/per_class_subgroups_vs_time/<mode>.csv`` —
+      long-format ``(bin_center, class, subgroup, ...)``.
+    * ``multiclass_head/per_class_subgroups_vs_time/<mode>.png`` —
+      grid of subgroup × class panels.
+    * ``multiclass_head/auroc_vs_time/<mode>.{csv,png}`` — per-class
+      one-vs-rest AUROC vs time.
+    * ``multiclass_head/aggregate_vs_time/<mode>_top1_acc.{csv,png}``,
+      ``..._macro_f1.{csv,png}``, ``..._brier_perclass.{csv,png}``.
+    * ``multiclass_head/confusion_evolution/<mode>.png``.
+    * ``binary_head/by_underlying_class_vs_time/<mode>.csv`` — long-format
+      ``(bin_center, restrict_class, ...)``.
+    * ``binary_head/by_underlying_class_vs_time/<mode>.png`` — combined plot.
 
-    Note that argmax-derived diagnostics
-    (``predicted_class_3``, top-1 accuracy, macro-F1, confusion-matrix
-    evolution) are unaffected by this resolution: they read
-    ``predicted_class_3`` directly and remain argmax-based regardless of
-    which path produced ``clinical_pred_<class>``.
+    Per-class operating points for the ``clinical_pred_<class>`` columns
+    are resolved in this order (highest priority first): explicit
+    ``thresholds`` argument; per-class OvR threshold search on ``df_val``
+    at ``target_fpr`` / ``decision_time_hours`` for this ``metric_type``;
+    fallback argmax (``predicted_class_3 == c``).
+
+    Note: argmax-derived diagnostics (top-1 accuracy, macro-F1, confusion
+    evolution) read ``predicted_class_3`` directly so they're unaffected
+    by which path produced the per-class clinical columns.
 
     Args:
-        df: Predictions DataFrame after the legacy CDR has been applied
-            (so ``binary_target`` / ``clinical_pred`` exist in their
-            binary-pooled form). Per-class columns are added internally.
+        df: Predictions DataFrame after the legacy CDR has been applied.
         time_bins: Bin edges (legacy ``compute_time_bins``).
         metric_type: One of ``METRIC_TYPES``.
-        output_dir: Per-fold ``three_metric_types/<metric_type>/`` root.
-            ``per_class/`` and ``binary_by_underlying_class/`` are created
-            beneath it.
+        eval_root: Per-fold ``evaluation/`` directory. ``binary_head/``
+            and ``multiclass_head/`` are created beneath it.
         thresholds: Optional per-class OvR thresholds. When provided,
-            short-circuits the search and is used verbatim.
+            short-circuits the search.
         df_val: Optional validation predictions DataFrame. When provided
-            and ``thresholds is None``, a per-class threshold is searched
-            here at ``target_fpr`` / ``decision_time_hours`` for the
-            given ``metric_type``.
-        target_fpr: Target FPR for the per-class threshold search; only
-            used when ``df_val`` is set.
-        decision_time_hours: Hours before delivery at which the per-class
-            threshold is evaluated; only used when ``df_val`` is set.
-        threshold_search_kwargs: Optional extra kwargs forwarded to
-            :func:`find_perclass_threshold_at_target_fpr`
+            and ``thresholds is None``, the per-class threshold is
+            searched here.
+        target_fpr: Target FPR for the per-class threshold search.
+        decision_time_hours: Hours before delivery at which thresholds
+            are evaluated; also drawn as a vertical reference line on
+            every vs-time plot via ``annotate_decision_time``.
+        threshold_search_kwargs: Optional extras for the search
             (``max_gap_multiplier``, ``fallback_tolerance_hours``).
 
     Returns:
-        ``{class_name: metrics_df}`` plus the binary-by-underlying-class
-        DataFrames keyed as ``binary_only_acidosis`` / ``binary_only_hie``.
-    """
-    out: Dict[str, pd.DataFrame] = {}
+        Dict with keys:
 
-    perclass_info: Dict[str, Dict[str, Any]] = {}
+        * ``perclass_metrics`` — long-format DataFrame
+          ``(bin_center, class, ...)``.
+        * ``perclass_subgroup_metrics`` — long-format DataFrame
+          ``(bin_center, class, subgroup, ...)``.
+        * ``binary_by_underlying_class`` — long-format DataFrame
+          ``(bin_center, restrict_class, ...)``.
+        * ``auroc_vs_time`` — DataFrame ``(bin_center, class, auroc, n_pos, n_neg, n)``.
+        * ``top1_accuracy``, ``f1_scores``, ``brier_scores`` — DataFrames.
+        * ``perclass_threshold_info`` — ``{class_name: {threshold, ...}}``
+          for caller-side aggregation (e.g. writing the consolidated
+          ``multiclass_head/perclass_thresholds.json`` file across modes).
+    """
+    multiclass_root = eval_root / "multiclass_head"
+    binary_root = eval_root / "binary_head"
+    multiclass_root.mkdir(parents=True, exist_ok=True)
+    binary_root.mkdir(parents=True, exist_ok=True)
+
+    out: Dict[str, Any] = {"perclass_threshold_info": {}}
+
     if thresholds is None and df_val is not None:
         thresholds = {}
         extra = dict(threshold_search_kwargs or {})
@@ -687,7 +1083,9 @@ def run_3class_evaluation_for_metric_type(
                     **extra,
                 )
                 thresholds[class_name] = float(thr)
-                perclass_info[class_name] = {"threshold": float(thr), **info}
+                out["perclass_threshold_info"][class_name] = {
+                    "threshold": float(thr), **info,
+                }
             except Exception:  # noqa: BLE001 — fall back to argmax for this class
                 logger.exception(
                     f"per-class threshold search failed for class={class_name!r} "
@@ -695,62 +1093,97 @@ def run_3class_evaluation_for_metric_type(
                 )
         if not thresholds:
             thresholds = None  # all classes failed — argmax path
-        else:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"perclass_thresholds_{metric_type}.json").write_text(
-                json.dumps(perclass_info, indent=2, default=float),
-                encoding="utf-8",
-            )
 
     df_pc = add_perclass_clinical_columns(df, thresholds=thresholds)
 
-    pc_root = output_dir / "per_class"
-    pc_root.mkdir(parents=True, exist_ok=True)
+    # ---- per-class vs time ----
     metrics_per_class: Dict[str, pd.DataFrame] = {}
     for class_name, _, _ in CLASS_INFO:
-        m = compute_perclass_time_binned_metrics(
+        metrics_per_class[class_name] = compute_perclass_time_binned_metrics(
             df_pc, time_bins=time_bins, metric_type=metric_type, class_name=class_name
         )
-        m.to_csv(pc_root / f"{class_name}_metrics.csv", index=False)
-        metrics_per_class[class_name] = m
-        out[class_name] = m
-    plot_perclass_panel(metrics_per_class, output_dir=pc_root, metric_type=metric_type)
-    plot_subgroup_perclass(
-        df_pc, time_bins=time_bins, metric_type=metric_type, output_dir=pc_root / "subgroups"
+    long_perclass = collect_perclass_long_format(metrics_per_class)
+    pc_dir = multiclass_root / "per_class_vs_time"
+    pc_dir.mkdir(parents=True, exist_ok=True)
+    long_perclass.to_csv(pc_dir / f"{metric_type}.csv", index=False)
+    plot_perclass_panel_combined(
+        metrics_per_class,
+        output_path=pc_dir / f"{metric_type}_panel.png",
+        metric_type=metric_type,
+        decision_time_hours=decision_time_hours,
     )
+    out["perclass_metrics"] = long_perclass
 
-    bin_root = output_dir / "binary_by_underlying_class"
-    bin_root.mkdir(parents=True, exist_ok=True)
-    plot_binary_by_underlying_class(
-        df, time_bins=time_bins, metric_type=metric_type, output_dir=bin_root
+    # ---- per-class × subgroup vs time (long-format) ----
+    long_subgroup = compute_perclass_subgroup_long_format(
+        df_pc, time_bins=time_bins, metric_type=metric_type
     )
-    for restrict_class in ("acidosis", "hie"):
-        m_bin = compute_binary_by_underlying_class(
-            df, time_bins=time_bins, metric_type=metric_type, restrict_class=restrict_class
-        )
-        out[f"binary_only_{restrict_class}"] = m_bin
+    sg_dir = multiclass_root / "per_class_subgroups_vs_time"
+    sg_dir.mkdir(parents=True, exist_ok=True)
+    long_subgroup.to_csv(sg_dir / f"{metric_type}.csv", index=False)
+    plot_perclass_subgroup_long(
+        long_subgroup,
+        output_path=sg_dir / f"{metric_type}.png",
+        metric_type=metric_type,
+        decision_time_hours=decision_time_hours,
+    )
+    out["perclass_subgroup_metrics"] = long_subgroup
 
-    # Aggregate-style 3-class metrics (single curve, not per-class).
-    # These use the *clinical* prediction column (which under argmax mode is
-    # ``predicted_class_3`` — argmax doesn't change after CDR), so they are
-    # comparable across the three metric types.
+    # ---- binary head: by underlying class (long-format) ----
+    long_bin = compute_binary_by_underlying_class_long_format(
+        df, time_bins=time_bins, metric_type=metric_type
+    )
+    bin_dir = binary_root / "by_underlying_class_vs_time"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    long_bin.to_csv(bin_dir / f"{metric_type}.csv", index=False)
+    plot_binary_by_underlying_class_long(
+        long_bin,
+        output_path=bin_dir / f"{metric_type}.png",
+        metric_type=metric_type,
+        decision_time_hours=decision_time_hours,
+    )
+    out["binary_by_underlying_class"] = long_bin
+
+    # ---- per-class AUROC vs time (NEW) ----
     try:
-        agg_root = output_dir / "aggregate"
-        agg_root.mkdir(parents=True, exist_ok=True)
+        auroc_df = compute_perclass_auroc_vs_time(df_pc, time_bins=time_bins)
+        auroc_dir = multiclass_root / "auroc_vs_time"
+        auroc_dir.mkdir(parents=True, exist_ok=True)
+        auroc_df.to_csv(auroc_dir / f"{metric_type}.csv", index=False)
+        plot_perclass_auroc_vs_time(
+            auroc_df,
+            output_path=auroc_dir / f"{metric_type}.png",
+            metric_type=metric_type,
+            decision_time_hours=decision_time_hours,
+        )
+        out["auroc_vs_time"] = auroc_df
+    except Exception:  # noqa: BLE001
+        logger.exception(f"auroc_vs_time failed for {metric_type}")
+
+    # ---- aggregate: top1, macro-F1, brier (single curves, not per-class) ----
+    try:
+        agg_dir = multiclass_root / "aggregate_vs_time"
+        agg_dir.mkdir(parents=True, exist_ok=True)
         top1_df = compute_topk_accuracy_vs_time(df_pc, time_bins=time_bins)
         f1_df = compute_macro_f1_vs_time(df_pc, time_bins=time_bins)
         brier_df = compute_perclass_brier_vs_time(df_pc, time_bins=time_bins)
-        top1_df.to_csv(agg_root / "top1_accuracy.csv", index=False)
-        f1_df.to_csv(agg_root / "f1_scores.csv", index=False)
-        brier_df.to_csv(agg_root / "brier_scores.csv", index=False)
+        top1_df.to_csv(agg_dir / f"{metric_type}_top1_acc.csv", index=False)
+        f1_df.to_csv(agg_dir / f"{metric_type}_macro_f1.csv", index=False)
+        brier_df.to_csv(agg_dir / f"{metric_type}_brier_perclass.csv", index=False)
         plot_topk_accuracy_vs_time(
-            top1_df, agg_root / "top1_accuracy_vs_time.png", title_suffix=metric_type
+            top1_df, agg_dir / f"{metric_type}_top1_acc.png",
+            title_suffix=metric_type,
+            decision_time_hours=decision_time_hours,
         )
         plot_macro_f1_vs_time(
-            f1_df, agg_root / "f1_vs_time.png", title_suffix=metric_type
+            f1_df, agg_dir / f"{metric_type}_macro_f1.png",
+            title_suffix=metric_type,
+            decision_time_hours=decision_time_hours,
         )
         plot_perclass_brier_vs_time(
-            brier_df, agg_root / "brier_vs_time.png", title_suffix=metric_type
+            brier_df, agg_dir / f"{metric_type}_brier_perclass.png",
+            title_suffix=metric_type,
+            decision_time_hours=decision_time_hours,
         )
         out["top1_accuracy"] = top1_df
         out["f1_scores"] = f1_df
@@ -758,10 +1191,13 @@ def run_3class_evaluation_for_metric_type(
     except Exception:  # noqa: BLE001
         logger.exception(f"aggregate 3-class metrics failed for {metric_type}")
 
-    # Confusion-matrix evolution (one panel per time bin, up to 8).
+    # ---- confusion-matrix evolution ----
     try:
+        ce_dir = multiclass_root / "confusion_evolution"
+        ce_dir.mkdir(parents=True, exist_ok=True)
         plot_confusion_matrix_evolution(
-            df_pc, time_bins=time_bins, output_dir=output_dir / "confusion_evolution"
+            df_pc, time_bins=time_bins,
+            output_path=ce_dir / f"{metric_type}.png",
         )
     except Exception:  # noqa: BLE001
         logger.exception(f"confusion_evolution failed for {metric_type}")
@@ -959,6 +1395,7 @@ def _line_vs_time(
     title: str,
     ylabel: str,
     ylim: Optional[Tuple[float, float]] = (0.0, 1.05),
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """Generic single-axes vs-time plot, x-inverted (time before birth).
 
@@ -969,6 +1406,8 @@ def _line_vs_time(
         title: Plot title.
         ylabel: Y-axis label.
         ylim: Optional ``(low, high)`` tuple (``None`` to autoscale).
+        decision_time_hours: When provided, draws a dashed vertical
+            reference line at that x value (via the shared annotator).
     """
     if df is None or df.empty:
         logger.warning(f"_line_vs_time: empty df, skipping {output_path.name}")
@@ -995,14 +1434,19 @@ def _line_vs_time(
         ax.set_ylim(*ylim)
     ax.invert_xaxis()
     ax.legend(fontsize=11, loc="best")
+    _annotate_decision_time(ax, decision_time_hours)
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
 
 
-def plot_topk_accuracy_vs_time(metrics_df: pd.DataFrame, output_path: Path,
-                               title_suffix: str = "") -> None:
+def plot_topk_accuracy_vs_time(
+    metrics_df: pd.DataFrame, output_path: Path,
+    title_suffix: str = "",
+    *,
+    decision_time_hours: Optional[float] = None,
+) -> None:
     """Top-1 accuracy line plot."""
     title = "Top-1 3-class Accuracy vs Time"
     if title_suffix:
@@ -1013,11 +1457,16 @@ def plot_topk_accuracy_vs_time(metrics_df: pd.DataFrame, output_path: Path,
         output_path=output_path,
         title=title,
         ylabel="Accuracy",
+        decision_time_hours=decision_time_hours,
     )
 
 
-def plot_macro_f1_vs_time(metrics_df: pd.DataFrame, output_path: Path,
-                          title_suffix: str = "") -> None:
+def plot_macro_f1_vs_time(
+    metrics_df: pd.DataFrame, output_path: Path,
+    title_suffix: str = "",
+    *,
+    decision_time_hours: Optional[float] = None,
+) -> None:
     """Macro-F1 + weighted-F1 + per-class F1 panel."""
     title = "F1 Scores vs Time"
     if title_suffix:
@@ -1034,11 +1483,16 @@ def plot_macro_f1_vs_time(metrics_df: pd.DataFrame, output_path: Path,
         output_path=output_path,
         title=title,
         ylabel="F1 Score",
+        decision_time_hours=decision_time_hours,
     )
 
 
-def plot_perclass_brier_vs_time(metrics_df: pd.DataFrame, output_path: Path,
-                                title_suffix: str = "") -> None:
+def plot_perclass_brier_vs_time(
+    metrics_df: pd.DataFrame, output_path: Path,
+    title_suffix: str = "",
+    *,
+    decision_time_hours: Optional[float] = None,
+) -> None:
     """Per-class Brier score + macro Brier."""
     title = "Per-class Brier Score vs Time (lower is better)"
     if title_suffix:
@@ -1055,6 +1509,7 @@ def plot_perclass_brier_vs_time(metrics_df: pd.DataFrame, output_path: Path,
         title=title,
         ylabel="Brier Score",
         ylim=(0.0, None),  # type: ignore[arg-type]
+        decision_time_hours=decision_time_hours,
     )
 
 
@@ -1224,7 +1679,7 @@ def plot_perclass_pr_curves(df: pd.DataFrame, output_dir: Path) -> None:
 
 
 def plot_confusion_matrix_evolution(
-    df: pd.DataFrame, time_bins: np.ndarray, output_dir: Path,
+    df: pd.DataFrame, time_bins: np.ndarray, output_path: Path,
     *, max_panels: int = 8,
 ) -> None:
     """Row-normalised 3×3 confusion matrices across time-before-birth bins.
@@ -1237,7 +1692,7 @@ def plot_confusion_matrix_evolution(
         df: Predictions DataFrame from
             :func:`add_perclass_clinical_columns` with ``epoch_hours``.
         time_bins: Bin edges.
-        output_dir: Output directory.
+        output_path: Output PNG path. Parent dir is created if missing.
         max_panels: Maximum number of CM panels to render (default 8).
     """
     if "epoch_hours" not in df.columns:
@@ -1250,7 +1705,7 @@ def plot_confusion_matrix_evolution(
     centers = _bin_centers(time_bins)
     n_bins = len(centers)
     keep = sorted(set(np.linspace(0, n_bins - 1, num=min(max_panels, n_bins), dtype=int).tolist()))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     cols = min(len(keep), 4)
     rows = int(np.ceil(len(keep) / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.6, rows * 3.4))
@@ -1288,10 +1743,9 @@ def plot_confusion_matrix_evolution(
     fig.suptitle("3-class confusion evolution (row-normalised)", fontsize=13,
                  fontweight="bold")
     fig.tight_layout()
-    fig.savefig(output_dir / "confusion_evolution.png", dpi=150,
-                bbox_inches="tight")
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"  Saved: {output_dir.name}/confusion_evolution.png")
+    logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
 
 
 def plot_perclass_probability_box(df: pd.DataFrame, output_dir: Path) -> None:
@@ -1412,21 +1866,26 @@ __all__ = [
     "CLASS_INFO",
     "METRIC_TYPES",
     "add_perclass_clinical_columns",
+    "collect_perclass_long_format",
     "compute_binary_by_underlying_class",
+    "compute_binary_by_underlying_class_long_format",
     "compute_macro_f1_vs_time",
+    "compute_perclass_auroc_vs_time",
     "compute_perclass_brier_vs_time",
+    "compute_perclass_subgroup_long_format",
     "compute_perclass_time_binned_metrics",
     "compute_topk_accuracy_vs_time",
     "find_perclass_threshold_at_target_fpr",
-    "plot_binary_by_underlying_class",
+    "plot_binary_by_underlying_class_long",
     "plot_confusion_matrix_evolution",
     "plot_macro_f1_vs_time",
+    "plot_perclass_auroc_vs_time",
     "plot_perclass_brier_vs_time",
     "plot_perclass_calibration",
-    "plot_perclass_panel",
+    "plot_perclass_panel_combined",
     "plot_perclass_pr_curves",
     "plot_perclass_probability_box",
-    "plot_subgroup_perclass",
+    "plot_perclass_subgroup_long",
     "plot_topk_accuracy_vs_time",
     "run_3class_evaluation_for_metric_type",
     "run_3class_global_diagnostics",

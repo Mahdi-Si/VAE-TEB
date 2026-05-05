@@ -395,6 +395,15 @@ def train_fold(
         live_min_w = float(ds_cfg["min_valid_weight_fraction"])
         live_cross_censor = bool(cls_cfg["cross_delivery_censoring"])
         live_epoch_min = ds_cfg.get("epoch_min")
+        # Per-partition window split (§ evaluation.epoch_min_test):
+        # train always uses the dataset window; val (and test, at eval
+        # time) widen to the eval window when configured. Keeping val
+        # in lock-step with test means the threshold-search operating
+        # point is calibrated on the same distribution test will use.
+        eval_cfg = config.get("evaluation", {}) or {}
+        live_epoch_min_val = eval_cfg.get("epoch_min_test", live_epoch_min)
+        if live_epoch_min_val is None:
+            live_epoch_min_val = live_epoch_min
         live_trim = float(ds_cfg.get("trim_minutes", 1.0))
         live_stats_path = ds_cfg.get("stats_path")
         live_normalize_fields = ds_cfg.get("normalize_fields")
@@ -423,13 +432,20 @@ def train_fold(
             min_samples_per_guid=live_min_samples,
             min_valid_weight_fraction=live_min_w,
             cross_delivery_censoring=live_cross_censor,
-            epoch_min=live_epoch_min,
+            epoch_min=live_epoch_min_val,
             trim_minutes=live_trim,
             stats_path=live_stats_path,
             normalize_fields=live_normalize_fields,
             d_model_vae=live_d_model_vae,
             d_z=live_d_z,
         )
+        if live_epoch_min_val != live_epoch_min:
+            logger.info(
+                f"[fold {fold_id}] live-VAE val window widened: "
+                f"train epoch_min={live_epoch_min} -> "
+                f"val epoch_min={live_epoch_min_val} "
+                f"(via evaluation.epoch_min_test)"
+            )
 
         # ------------------------------------------------------------------
         # Latent stats: populate vae.mu_post_running_{mean,var,count} once

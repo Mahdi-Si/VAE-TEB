@@ -2711,11 +2711,64 @@ def compute_all_metric_types(
 # New Plotting Functions (Three Metric Types)
 # =============================================================================
 
+def annotate_decision_time(
+    ax,
+    *,
+    decision_time_hours: Optional[float],
+    label: str = "decision time",
+) -> None:
+    """Draw a dashed vertical reference line at ``decision_time_hours``.
+
+    No-op when ``decision_time_hours`` is None / NaN, or when the value
+    falls outside the current x-axis range. Intended to be called on
+    every "vs hours-before-birth" plot so the threshold-search operating
+    point is visually obvious. Does not change axis limits.
+
+    Args:
+        ax: matplotlib axes (already drawn so xlim is set).
+        decision_time_hours: Time in hours before birth at which the
+            classifier's operating point was selected (typically
+            ``evaluation.decision_time_hours``).
+        label: Annotation text drawn above the line.
+    """
+    if decision_time_hours is None:
+        return
+    try:
+        x = float(decision_time_hours)
+    except (TypeError, ValueError):
+        return
+    if not np.isfinite(x):
+        return
+    xlim = ax.get_xlim()
+    lo, hi = (min(xlim), max(xlim))
+    if x < lo or x > hi:
+        return
+    ax.axvline(
+        x=x,
+        color="0.4",
+        linestyle="--",
+        linewidth=1.0,
+        zorder=0,
+    )
+    ylim = ax.get_ylim()
+    ax.text(
+        x=x,
+        y=ylim[1],
+        s=f" {label} ({x:g}h)",
+        fontsize=7,
+        color="0.4",
+        va="top",
+        ha="left",
+    )
+
+
 def plot_single_metric_type(
     metrics_df: pd.DataFrame,
     metric_type: str,
     output_dir: Path,
-    title_suffix: str = ""
+    title_suffix: str = "",
+    *,
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """
     Create comprehensive plots for a single metric type.
@@ -2779,6 +2832,7 @@ def plot_single_metric_type(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "sensitivity_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -2800,6 +2854,7 @@ def plot_single_metric_type(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "sensitivity_specificity_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -2821,6 +2876,7 @@ def plot_single_metric_type(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "sensitivity_fpr_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -2844,6 +2900,7 @@ def plot_single_metric_type(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "all_metrics_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -2863,6 +2920,7 @@ def plot_single_metric_type(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "fpr_vs_time.png", dpi=150, bbox_inches='tight')
     plt.close()

@@ -261,6 +261,13 @@ evaluation:
   threshold_search_max_iters: 25
   regenerate_predictions: false
   aggregate_only: false
+  # Per-partition epoch_min override for evaluation. When null, both
+  # val and test inherit ``dataset_config.epoch_min``. When set, val
+  # AND test caches are built with this wider window (train always
+  # uses dataset_config.epoch_min). Use to evaluate on a longer
+  # pre-delivery horizon than the model was trained on (e.g. train on
+  # last 6h, test on last 12h => set this to -43200).
+  epoch_min_test: null
   plot_styles:
     guid_binary_primary: true
     three_class_ovr: true

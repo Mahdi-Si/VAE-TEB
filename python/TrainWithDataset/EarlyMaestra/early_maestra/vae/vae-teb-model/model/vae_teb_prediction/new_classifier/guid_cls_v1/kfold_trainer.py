@@ -487,7 +487,18 @@ def run_kfold_parallel(
                 aggregate_results,
             )
 
-            aggregate_results(run_dir=run_dir, fold_ids=None)
+            decision_time_hours_cfg = (
+                (config.get("evaluation", {}) or {}).get("decision_time_hours")
+            )
+            aggregate_results(
+                run_dir=run_dir,
+                fold_ids=None,
+                decision_time_hours=(
+                    float(decision_time_hours_cfg)
+                    if decision_time_hours_cfg is not None
+                    else None
+                ),
+            )
         except Exception as exc:  # pragma: no cover - aggregation should not block training
             logger.warning(f"aggregate_results failed: {exc}")
 

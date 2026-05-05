@@ -48,9 +48,52 @@ def _list_fold_dirs(run_dir: Path) -> List[Path]:
     return folds
 
 
+def _resolve_test_predictions_csv(fold_dir: Path) -> Optional[Path]:
+    """Return the per-fold raw test-predictions CSV path under either layout.
+
+    Prefers the new layout ``evaluation/predictions/test_raw.csv``; falls
+    back to the legacy ``evaluation/test_predictions_raw.csv`` so old runs
+    can still be aggregated for binary/3-class ROC bookkeeping.
+    """
+    new_path = fold_dir / "evaluation" / "predictions" / "test_raw.csv"
+    if new_path.exists():
+        return new_path
+    legacy = fold_dir / "evaluation" / "test_predictions_raw.csv"
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def _resolve_binary_roc_csv(fold_dir: Path) -> Optional[Path]:
+    """Return the binary ROC CSV path under either layout."""
+    new_path = fold_dir / "evaluation" / "binary_head" / "roc.csv"
+    if new_path.exists():
+        return new_path
+    legacy = fold_dir / "evaluation" / "roc_binary_data.csv"
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def _resolve_thresholds_json(fold_dir: Path) -> Optional[Path]:
+    """Return the thresholds JSON path under either layout."""
+    new_path = fold_dir / "evaluation" / "thresholds.json"
+    if new_path.exists():
+        return new_path
+    legacy = fold_dir / "evaluation" / "threshold_info.json"
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def _has_new_layout(fold_dir: Path) -> bool:
+    """True iff this fold was evaluated with the new head-explicit layout."""
+    return (fold_dir / "evaluation" / "binary_head").is_dir()
+
+
 def _load_fold_test_csv(fold_dir: Path) -> Optional[pd.DataFrame]:
-    csv = fold_dir / "evaluation" / "test_predictions_raw.csv"
-    if not csv.exists():
+    csv = _resolve_test_predictions_csv(fold_dir)
+    if csv is None:
         return None
     try:
         return pd.read_csv(csv)
@@ -226,8 +269,14 @@ def _plot_mean_curve_with_band(
     *,
     label: str,
     color: str,
+    decision_time_hours: Optional[float] = None,
 ) -> Optional[Tuple[float, float]]:
-    """Plot mean ± std (and per-fold thin lines) on ``ax``. Returns (mean_at_x0, std_at_x0)."""
+    """Plot mean ± std (and per-fold thin lines) on ``ax``. Returns (mean_at_x0, std_at_x0).
+
+    When ``decision_time_hours`` is provided, draws a dashed vertical
+    reference line at that time-vs-delivery so the operating point is
+    visible on every cross-fold curve.
+    """
     if not per_fold:
         return None
     arr = np.vstack(per_fold)
@@ -237,74 +286,104 @@ def _plot_mean_curve_with_band(
         ax.plot(grid, row, alpha=0.20, color=color, lw=0.7)
     ax.plot(grid, mean, color=color, lw=2.0, label=label)
     ax.fill_between(grid, mean - std, mean + std, color=color, alpha=0.15)
+    if decision_time_hours is not None:
+        try:
+            from model.vae_teb_prediction.new_classifier.guid_cls_v1.clinical_metrics_utils import (  # noqa: WPS433
+                annotate_decision_time,
+            )
+
+            annotate_decision_time(ax, decision_time_hours=float(decision_time_hours))
+        except Exception:  # pragma: no cover - defensive
+            pass
     return float(np.nanmean(mean)), float(np.nanmean(std))
 
 
 def _aggregate_perclass_metric_curves(
-    fold_dirs: List[Path], agg_root: Path
+    fold_dirs: List[Path],
+    agg_root: Path,
+    *,
+    decision_time_hours: Optional[float] = None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Mean ± std per-class time-binned metric curves across folds.
 
-    Reads each fold's ``per_class/<class>_metrics.csv`` written by
-    :func:`evaluate_3class_metrics.run_3class_evaluation_for_metric_type`,
-    interpolates onto a common bin-center grid, plots into
-    ``aggregated_plots/<metric_type>/per_class/<class>_aggregated.png``,
-    and returns a summary dict with mean+std at the decision time.
+    Reads each fold's long-format
+    ``multiclass_head/per_class_vs_time/<metric_type>.csv`` and emits
+    cross-fold curves under
+    ``aggregated_plots/multiclass_head/per_class_vs_time/<metric_type>_<class>.{csv,png}``.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
     summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     for metric_type in METRIC_TYPES:
         per_class_summary: Dict[str, Dict[str, float]] = {}
-        out_dir = agg_root / metric_type / "per_class"
+        out_dir = agg_root / "multiclass_head" / "per_class_vs_time"
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # First pass: read each fold's long-format CSV and split by class.
+        per_fold_by_class: Dict[str, List[pd.DataFrame]] = {
+            c: [] for c in PER_CLASS_NAMES
+        }
+        for fd in fold_dirs:
+            csv = (
+                fd
+                / "evaluation"
+                / "multiclass_head"
+                / "per_class_vs_time"
+                / f"{metric_type}.csv"
+            )
+            if not csv.exists():
+                continue
+            try:
+                df = pd.read_csv(csv)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"could not read {csv}: {exc}")
+                continue
+            if df.empty or "bin_center" not in df.columns or "class" not in df.columns:
+                continue
+            for class_name in PER_CLASS_NAMES:
+                sub = df[df["class"].astype(str) == class_name]
+                if sub.empty:
+                    continue
+                per_fold_by_class[class_name].append(sub.reset_index(drop=True))
+
         for class_name in PER_CLASS_NAMES:
-            per_fold_sens: List[np.ndarray] = []
-            per_fold_fpr: List[np.ndarray] = []
-            grid_min, grid_max = float("inf"), float("-inf")
-            collected: List[pd.DataFrame] = []
-            for fd in fold_dirs:
-                csv = (
-                    fd
-                    / "evaluation"
-                    / "three_metric_types"
-                    / metric_type
-                    / "per_class"
-                    / f"{class_name}_metrics.csv"
-                )
-                if not csv.exists():
-                    continue
-                try:
-                    df = pd.read_csv(csv)
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(f"could not read {csv}: {exc}")
-                    continue
-                if df.empty or "bin_center" not in df.columns:
-                    continue
-                collected.append(df)
-                centers = df["bin_center"].astype(float).to_numpy()
-                if centers.size:
-                    grid_min = min(grid_min, float(np.nanmin(centers)))
-                    grid_max = max(grid_max, float(np.nanmax(centers)))
+            collected = per_fold_by_class[class_name]
             if not collected:
                 continue
+            grid_min = min(
+                float(np.nanmin(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            grid_max = max(
+                float(np.nanmax(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            if not (np.isfinite(grid_min) and np.isfinite(grid_max)) or grid_min >= grid_max:
+                continue
             grid = np.linspace(grid_min, grid_max, 64)
-            for df in collected:
-                per_fold_sens.append(_interp_metric_curve(df, grid, "sensitivity"))
-                per_fold_fpr.append(_interp_metric_curve(df, grid, "fpr"))
+            per_fold_sens = [
+                _interp_metric_curve(d, grid, "sensitivity") for d in collected
+            ]
+            per_fold_fpr = [
+                _interp_metric_curve(d, grid, "fpr") for d in collected
+            ]
 
             fig, axes = plt.subplots(1, 2, figsize=(10, 4))
             sens_stat = _plot_mean_curve_with_band(
-                axes[0], grid, per_fold_sens, label="mean", color="C0"
+                axes[0], grid, per_fold_sens, label="mean", color="C0",
+                decision_time_hours=decision_time_hours,
             )
             axes[0].set_title(f"{class_name} sensitivity vs time ({metric_type})")
             axes[0].set_xlabel("hours before delivery")
             axes[0].set_ylabel("sensitivity")
-            axes[0].invert_xaxis()  # nearer-to-delivery on the right
+            axes[0].invert_xaxis()
             axes[0].set_ylim(-0.05, 1.05)
 
             fpr_stat = _plot_mean_curve_with_band(
-                axes[1], grid, per_fold_fpr, label="mean", color="C3"
+                axes[1], grid, per_fold_fpr, label="mean", color="C3",
+                decision_time_hours=decision_time_hours,
             )
             axes[1].set_title(f"{class_name} FPR vs time ({metric_type})")
             axes[1].set_xlabel("hours before delivery")
@@ -313,8 +392,21 @@ def _aggregate_perclass_metric_curves(
             axes[1].set_ylim(-0.05, 1.05)
 
             fig.tight_layout()
-            fig.savefig(out_dir / f"{class_name}_aggregated.png", dpi=150)
+            fig.savefig(out_dir / f"{metric_type}_{class_name}.png", dpi=150)
             plt.close(fig)
+
+            sens_arr = np.vstack(per_fold_sens)
+            fpr_arr = np.vstack(per_fold_fpr)
+            pd.DataFrame(
+                {
+                    "bin_center": grid,
+                    "sensitivity_mean": np.nanmean(sens_arr, axis=0),
+                    "sensitivity_std": np.nanstd(sens_arr, axis=0),
+                    "fpr_mean": np.nanmean(fpr_arr, axis=0),
+                    "fpr_std": np.nanstd(fpr_arr, axis=0),
+                    "n_folds": np.sum(np.isfinite(sens_arr), axis=0),
+                }
+            ).to_csv(out_dir / f"{metric_type}_{class_name}.csv", index=False)
 
             per_class_summary[class_name] = {
                 "n_folds": int(len(per_fold_sens)),
@@ -329,64 +421,107 @@ def _aggregate_perclass_metric_curves(
 
 
 def _aggregate_binary_by_underlying_class_curves(
-    fold_dirs: List[Path], agg_root: Path
+    fold_dirs: List[Path],
+    agg_root: Path,
+    *,
+    decision_time_hours: Optional[float] = None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Aggregate the binary-by-underlying-class CSVs across folds."""
+    """Aggregate the binary-by-underlying-class long-format CSVs across folds.
+
+    Reads each fold's
+    ``binary_head/by_underlying_class_vs_time/<metric_type>.csv`` and
+    emits cross-fold curves under
+    ``aggregated_plots/binary_head/by_underlying_class_vs_time/<metric_type>_<restrict>.{csv,png}``.
+    """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
     summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     for metric_type in METRIC_TYPES:
         sub_summary: Dict[str, Dict[str, float]] = {}
-        out_dir = agg_root / metric_type / "binary_by_underlying_class"
+        out_dir = agg_root / "binary_head" / "by_underlying_class_vs_time"
         out_dir.mkdir(parents=True, exist_ok=True)
-        for restrict in ("acidosis", "hie"):
-            collected: List[pd.DataFrame] = []
-            grid_min, grid_max = float("inf"), float("-inf")
-            for fd in fold_dirs:
-                csv = (
-                    fd
-                    / "evaluation"
-                    / "three_metric_types"
-                    / metric_type
-                    / "binary_by_underlying_class"
-                    / f"binary_only_{restrict}"
-                    / "metrics.csv"
-                )
-                if not csv.exists():
+
+        per_fold_by_restrict: Dict[str, List[pd.DataFrame]] = {
+            "acidosis": [],
+            "hie": [],
+        }
+        for fd in fold_dirs:
+            csv = (
+                fd
+                / "evaluation"
+                / "binary_head"
+                / "by_underlying_class_vs_time"
+                / f"{metric_type}.csv"
+            )
+            if not csv.exists():
+                continue
+            try:
+                df = pd.read_csv(csv)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"could not read {csv}: {exc}")
+                continue
+            if df.empty or "bin_center" not in df.columns or "restrict_class" not in df.columns:
+                continue
+            for restrict in per_fold_by_restrict:
+                sub = df[df["restrict_class"].astype(str) == restrict]
+                if sub.empty:
                     continue
-                try:
-                    df = pd.read_csv(csv)
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(f"could not read {csv}: {exc}")
-                    continue
-                if df.empty:
-                    continue
-                collected.append(df)
-                centers = df["bin_center"].astype(float).to_numpy()
-                if centers.size:
-                    grid_min = min(grid_min, float(np.nanmin(centers)))
-                    grid_max = max(grid_max, float(np.nanmax(centers)))
+                per_fold_by_restrict[restrict].append(sub.reset_index(drop=True))
+
+        for restrict, collected in per_fold_by_restrict.items():
             if not collected:
                 continue
+            grid_min = min(
+                float(np.nanmin(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            grid_max = max(
+                float(np.nanmax(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            if not (np.isfinite(grid_min) and np.isfinite(grid_max)) or grid_min >= grid_max:
+                continue
             grid = np.linspace(grid_min, grid_max, 64)
-            sens = [_interp_metric_curve(df, grid, "sensitivity") for df in collected]
-            fpr = [_interp_metric_curve(df, grid, "fpr") for df in collected]
+            sens = [_interp_metric_curve(d, grid, "sensitivity") for d in collected]
+            fpr = [_interp_metric_curve(d, grid, "fpr") for d in collected]
             fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-            sens_stat = _plot_mean_curve_with_band(axes[0], grid, sens, label="mean", color="C0")
+            sens_stat = _plot_mean_curve_with_band(
+                axes[0], grid, sens, label="mean", color="C0",
+                decision_time_hours=decision_time_hours,
+            )
             axes[0].set_title(f"binary | only {restrict} — sensitivity ({metric_type})")
             axes[0].set_xlabel("hours before delivery")
             axes[0].set_ylabel("sensitivity")
             axes[0].invert_xaxis()
             axes[0].set_ylim(-0.05, 1.05)
-            fpr_stat = _plot_mean_curve_with_band(axes[1], grid, fpr, label="mean", color="C3")
+            fpr_stat = _plot_mean_curve_with_band(
+                axes[1], grid, fpr, label="mean", color="C3",
+                decision_time_hours=decision_time_hours,
+            )
             axes[1].set_title(f"binary | only {restrict} — FPR ({metric_type})")
             axes[1].set_xlabel("hours before delivery")
             axes[1].set_ylabel("FPR")
             axes[1].invert_xaxis()
             axes[1].set_ylim(-0.05, 1.05)
             fig.tight_layout()
-            fig.savefig(out_dir / f"binary_only_{restrict}_aggregated.png", dpi=150)
+            fig.savefig(out_dir / f"{metric_type}_{restrict}.png", dpi=150)
             plt.close(fig)
+
+            sens_arr = np.vstack(sens)
+            fpr_arr = np.vstack(fpr)
+            pd.DataFrame(
+                {
+                    "bin_center": grid,
+                    "sensitivity_mean": np.nanmean(sens_arr, axis=0),
+                    "sensitivity_std": np.nanstd(sens_arr, axis=0),
+                    "fpr_mean": np.nanmean(fpr_arr, axis=0),
+                    "fpr_std": np.nanstd(fpr_arr, axis=0),
+                    "n_folds": np.sum(np.isfinite(sens_arr), axis=0),
+                }
+            ).to_csv(out_dir / f"{metric_type}_{restrict}.csv", index=False)
+
             sub_summary[restrict] = {
                 "n_folds": int(len(sens)),
                 "sensitivity_mean_avg_over_bins": (sens_stat or (float("nan"), float("nan")))[0],
@@ -397,165 +532,260 @@ def _aggregate_binary_by_underlying_class_curves(
     return summary
 
 
-def _discover_perclass_subgroups(
-    fold_dirs: List[Path], metric_type: str, class_name: str
-) -> List[str]:
-    """Return the union of subgroup directory names across folds.
-
-    The subgroup set is derived dynamically from
-    :func:`clinical_metrics_utils.create_enhanced_subgroup_filters` at
-    per-fold evaluation time, so the aggregator must not hard-code its
-    keys. Iterates over every fold's
-    ``per_class/subgroups/<class>/`` directory and returns the sorted
-    union of subgroup names that contain a ``metrics.csv``. Folds
-    missing the directory are skipped silently — old runs that pre-date
-    the subgroup writer should still cross-aggregate cleanly.
-    """
-    found: set = set()
-    for fd in fold_dirs:
-        sub_root = (
-            fd
-            / "evaluation"
-            / "three_metric_types"
-            / metric_type
-            / "per_class"
-            / "subgroups"
-            / class_name
-        )
-        if not sub_root.is_dir():
-            continue
-        try:
-            for child in sub_root.iterdir():
-                if child.is_dir() and (child / "metrics.csv").exists():
-                    found.add(child.name)
-        except (FileNotFoundError, PermissionError) as exc:  # pragma: no cover
-            logger.warning(f"could not enumerate {sub_root}: {exc}")
-    return sorted(found)
-
-
 def _aggregate_perclass_subgroup_metric_curves(
-    fold_dirs: List[Path], agg_root: Path
+    fold_dirs: List[Path],
+    agg_root: Path,
+    *,
+    decision_time_hours: Optional[float] = None,
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, float]]]]:
-    """Mean ± std per-class × subgroup time-binned metric curves across folds.
+    """Mean ± std per-class × subgroup time-binned curves across folds.
 
-    Mirrors :func:`_aggregate_perclass_metric_curves` but iterates over
-    the additional ``subgroup`` axis written by
-    :func:`evaluate_3class_metrics.plot_subgroup_perclass`. For each
-    ``(metric_type, class, subgroup)`` triple, reads each fold's
-    ``per_class/subgroups/<class>/<subgroup>/metrics.csv``, interpolates
-    sensitivity / FPR onto a common bin-center grid, plots into
-    ``aggregated_plots/<metric_type>/per_class_subgroups/<class>/<subgroup>/aggregated.png``,
-    saves the per-fold curves as CSV, and returns a summary dict with
-    mean ± std per combination.
+    Reads each fold's long-format
+    ``multiclass_head/per_class_subgroups_vs_time/<metric_type>.csv``
+    (cols: ``bin_center, class, subgroup, sensitivity, specificity, fpr,
+    n_pos, n_neg, n``) and emits cross-fold curves under
+    ``aggregated_plots/multiclass_head/per_class_subgroups_vs_time/<metric_type>/<class>_<subgroup>.{csv,png}``.
 
     Returns:
         Nested dict keyed by ``[metric_type][class][subgroup]`` carrying
-        ``n_folds``, ``sensitivity_mean_avg_over_bins``, ``fpr_mean_avg_over_bins``.
+        ``n_folds``, ``sensitivity_mean_avg_over_bins``,
+        ``fpr_mean_avg_over_bins``.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
     summary: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
     for metric_type in METRIC_TYPES:
         per_class_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
-        out_root = agg_root / metric_type / "per_class_subgroups"
-        for class_name in PER_CLASS_NAMES:
-            subgroup_names = _discover_perclass_subgroups(
-                fold_dirs, metric_type, class_name
+        out_root = (
+            agg_root
+            / "multiclass_head"
+            / "per_class_subgroups_vs_time"
+            / metric_type
+        )
+
+        # First pass: read each fold's long-format CSV and group by
+        # (class, subgroup).
+        per_fold_by_combo: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+        for fd in fold_dirs:
+            csv = (
+                fd
+                / "evaluation"
+                / "multiclass_head"
+                / "per_class_subgroups_vs_time"
+                / f"{metric_type}.csv"
             )
-            if not subgroup_names:
+            if not csv.exists():
                 continue
-            class_summary: Dict[str, Dict[str, float]] = {}
-            for subgroup_name in subgroup_names:
-                collected: List[pd.DataFrame] = []
-                grid_min, grid_max = float("inf"), float("-inf")
-                for fd in fold_dirs:
-                    csv = (
-                        fd
-                        / "evaluation"
-                        / "three_metric_types"
-                        / metric_type
-                        / "per_class"
-                        / "subgroups"
-                        / class_name
-                        / subgroup_name
-                        / "metrics.csv"
-                    )
-                    try:
-                        if not csv.exists():
-                            continue
-                        df = pd.read_csv(csv)
-                    except (FileNotFoundError, OSError, pd.errors.ParserError) as exc:
-                        logger.warning(
-                            f"per-class subgroup aggregation: could not read {csv}: {exc}"
-                        )
-                        continue
-                    if df.empty or "bin_center" not in df.columns:
-                        continue
-                    collected.append(df)
-                    centers = df["bin_center"].astype(float).to_numpy()
-                    if centers.size:
-                        grid_min = min(grid_min, float(np.nanmin(centers)))
-                        grid_max = max(grid_max, float(np.nanmax(centers)))
-                if not collected or not np.isfinite([grid_min, grid_max]).all():
+            try:
+                df = pd.read_csv(csv)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"could not read {csv}: {exc}")
+                continue
+            required = {"bin_center", "class", "subgroup"}
+            if df.empty or not required.issubset(set(df.columns)):
+                continue
+            for (cls, sg), grp in df.groupby(["class", "subgroup"], dropna=False):
+                if grp.empty:
                     continue
-                grid = np.linspace(grid_min, grid_max, 64)
-                per_fold_sens = [_interp_metric_curve(df, grid, "sensitivity") for df in collected]
-                per_fold_fpr = [_interp_metric_curve(df, grid, "fpr") for df in collected]
-
-                out_dir = out_root / class_name / subgroup_name
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-                sens_stat = _plot_mean_curve_with_band(
-                    axes[0], grid, per_fold_sens, label="mean", color="C0"
+                key = (str(cls), str(sg))
+                per_fold_by_combo.setdefault(key, []).append(
+                    grp.reset_index(drop=True)
                 )
-                axes[0].set_title(
-                    f"{class_name} | {subgroup_name} sensitivity ({metric_type})"
-                )
-                axes[0].set_xlabel("hours before delivery")
-                axes[0].set_ylabel("sensitivity")
-                axes[0].invert_xaxis()
-                axes[0].set_ylim(-0.05, 1.05)
 
-                fpr_stat = _plot_mean_curve_with_band(
-                    axes[1], grid, per_fold_fpr, label="mean", color="C3"
-                )
-                axes[1].set_title(
-                    f"{class_name} | {subgroup_name} FPR ({metric_type})"
-                )
-                axes[1].set_xlabel("hours before delivery")
-                axes[1].set_ylabel("FPR")
-                axes[1].invert_xaxis()
-                axes[1].set_ylim(-0.05, 1.05)
+        if not per_fold_by_combo:
+            continue
+        out_root.mkdir(parents=True, exist_ok=True)
+        for (class_name, subgroup_name), collected in per_fold_by_combo.items():
+            if class_name not in PER_CLASS_NAMES:
+                continue
+            grid_min = min(
+                float(np.nanmin(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            grid_max = max(
+                float(np.nanmax(d["bin_center"].astype(float).to_numpy()))
+                for d in collected
+                if d["bin_center"].astype(float).to_numpy().size
+            )
+            if not (np.isfinite(grid_min) and np.isfinite(grid_max)) or grid_min >= grid_max:
+                continue
+            grid = np.linspace(grid_min, grid_max, 64)
+            per_fold_sens = [
+                _interp_metric_curve(d, grid, "sensitivity") for d in collected
+            ]
+            per_fold_fpr = [
+                _interp_metric_curve(d, grid, "fpr") for d in collected
+            ]
 
-                fig.tight_layout()
-                fig.savefig(out_dir / "aggregated.png", dpi=150)
-                plt.close(fig)
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            sens_stat = _plot_mean_curve_with_band(
+                axes[0], grid, per_fold_sens, label="mean", color="C0",
+                decision_time_hours=decision_time_hours,
+            )
+            axes[0].set_title(
+                f"{class_name} | {subgroup_name} sensitivity ({metric_type})"
+            )
+            axes[0].set_xlabel("hours before delivery")
+            axes[0].set_ylabel("sensitivity")
+            axes[0].invert_xaxis()
+            axes[0].set_ylim(-0.05, 1.05)
+            fpr_stat = _plot_mean_curve_with_band(
+                axes[1], grid, per_fold_fpr, label="mean", color="C3",
+                decision_time_hours=decision_time_hours,
+            )
+            axes[1].set_title(
+                f"{class_name} | {subgroup_name} FPR ({metric_type})"
+            )
+            axes[1].set_xlabel("hours before delivery")
+            axes[1].set_ylabel("FPR")
+            axes[1].invert_xaxis()
+            axes[1].set_ylim(-0.05, 1.05)
+            fig.tight_layout()
+            stem = f"{class_name}_{subgroup_name}"
+            fig.savefig(out_root / f"{stem}.png", dpi=150)
+            plt.close(fig)
 
-                # Per-grid mean ± std CSV so downstream consumers (notebooks,
-                # the journal-paper export) don't have to re-interpolate.
-                sens_arr = np.vstack(per_fold_sens)
-                fpr_arr = np.vstack(per_fold_fpr)
-                pd.DataFrame(
-                    {
-                        "bin_center": grid,
-                        "sensitivity_mean": np.nanmean(sens_arr, axis=0),
-                        "sensitivity_std": np.nanstd(sens_arr, axis=0),
-                        "fpr_mean": np.nanmean(fpr_arr, axis=0),
-                        "fpr_std": np.nanstd(fpr_arr, axis=0),
-                        "n_folds": np.sum(np.isfinite(sens_arr), axis=0),
-                    }
-                ).to_csv(out_dir / "aggregated.csv", index=False)
-
-                class_summary[subgroup_name] = {
-                    "n_folds": int(len(per_fold_sens)),
-                    "sensitivity_mean_avg_over_bins": (sens_stat or (float("nan"), float("nan")))[0],
-                    "sensitivity_std_avg_over_bins": (sens_stat or (float("nan"), float("nan")))[1],
-                    "fpr_mean_avg_over_bins": (fpr_stat or (float("nan"), float("nan")))[0],
-                    "fpr_std_avg_over_bins": (fpr_stat or (float("nan"), float("nan")))[1],
+            sens_arr = np.vstack(per_fold_sens)
+            fpr_arr = np.vstack(per_fold_fpr)
+            pd.DataFrame(
+                {
+                    "bin_center": grid,
+                    "sensitivity_mean": np.nanmean(sens_arr, axis=0),
+                    "sensitivity_std": np.nanstd(sens_arr, axis=0),
+                    "fpr_mean": np.nanmean(fpr_arr, axis=0),
+                    "fpr_std": np.nanstd(fpr_arr, axis=0),
+                    "n_folds": np.sum(np.isfinite(sens_arr), axis=0),
                 }
-            if class_summary:
-                per_class_summary[class_name] = class_summary
+            ).to_csv(out_root / f"{stem}.csv", index=False)
+
+            entry = {
+                "n_folds": int(len(per_fold_sens)),
+                "sensitivity_mean_avg_over_bins": (sens_stat or (float("nan"), float("nan")))[0],
+                "sensitivity_std_avg_over_bins": (sens_stat or (float("nan"), float("nan")))[1],
+                "fpr_mean_avg_over_bins": (fpr_stat or (float("nan"), float("nan")))[0],
+                "fpr_std_avg_over_bins": (fpr_stat or (float("nan"), float("nan")))[1],
+            }
+            per_class_summary.setdefault(class_name, {})[subgroup_name] = entry
+        if per_class_summary:
+            summary[metric_type] = per_class_summary
+    return summary
+
+
+def _aggregate_perclass_auroc_curves(
+    fold_dirs: List[Path],
+    agg_root: Path,
+    *,
+    decision_time_hours: Optional[float] = None,
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Mean ± std per-class one-vs-rest AUROC vs time across folds.
+
+    Reads each fold's long-format
+    ``multiclass_head/auroc_vs_time/<metric_type>.csv`` (cols:
+    ``bin_center, class, auroc, n_pos, n_neg, n``) and emits cross-fold
+    curves under
+    ``aggregated_plots/multiclass_head/auroc_vs_time/<metric_type>.{csv,png}``.
+
+    The per-class panel uses the standard 3-class palette. A horizontal
+    chance line at AUROC=0.5 is drawn for orientation.
+    """
+    import matplotlib.pyplot as plt  # noqa: WPS433
+
+    palette = {"healthy": "#27ae60", "acidosis": "#f39c12", "hie": "#c0392b"}
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for metric_type in METRIC_TYPES:
+        per_class_summary: Dict[str, Dict[str, float]] = {}
+        out_dir = agg_root / "multiclass_head" / "auroc_vs_time"
+
+        per_fold_by_class: Dict[str, List[pd.DataFrame]] = {
+            c: [] for c in PER_CLASS_NAMES
+        }
+        for fd in fold_dirs:
+            csv = (
+                fd
+                / "evaluation"
+                / "multiclass_head"
+                / "auroc_vs_time"
+                / f"{metric_type}.csv"
+            )
+            if not csv.exists():
+                continue
+            try:
+                df = pd.read_csv(csv)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"could not read {csv}: {exc}")
+                continue
+            if df.empty or "bin_center" not in df.columns or "class" not in df.columns:
+                continue
+            for class_name in PER_CLASS_NAMES:
+                sub = df[df["class"].astype(str) == class_name]
+                if sub.empty:
+                    continue
+                per_fold_by_class[class_name].append(sub.reset_index(drop=True))
+
+        if not any(per_fold_by_class.values()):
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Combined 3-class panel.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        # Determine global grid from union of bins across classes.
+        all_centers: List[float] = []
+        for collected in per_fold_by_class.values():
+            for d in collected:
+                centers = d["bin_center"].astype(float).to_numpy()
+                if centers.size:
+                    all_centers.extend(centers.tolist())
+        if not all_centers:
+            plt.close(fig)
+            continue
+        grid = np.linspace(
+            float(np.nanmin(all_centers)), float(np.nanmax(all_centers)), 64
+        )
+        long_rows: List[Dict[str, Any]] = []
+        for class_name in PER_CLASS_NAMES:
+            collected = per_fold_by_class[class_name]
+            if not collected:
+                continue
+            per_fold = [
+                _interp_metric_curve(d, grid, "auroc") for d in collected
+            ]
+            stat = _plot_mean_curve_with_band(
+                ax, grid, per_fold,
+                label=class_name, color=palette.get(class_name, "C0"),
+                decision_time_hours=decision_time_hours,
+            )
+            arr = np.vstack(per_fold)
+            for i, c in enumerate(grid):
+                long_rows.append(
+                    {
+                        "bin_center": float(c),
+                        "class": class_name,
+                        "auroc_mean": float(np.nanmean(arr[:, i])),
+                        "auroc_std": float(np.nanstd(arr[:, i])),
+                        "n_folds": int(np.sum(np.isfinite(arr[:, i]))),
+                    }
+                )
+            per_class_summary[class_name] = {
+                "n_folds": int(len(per_fold)),
+                "auroc_mean_avg_over_bins": (stat or (float("nan"), float("nan")))[0],
+                "auroc_std_avg_over_bins": (stat or (float("nan"), float("nan")))[1],
+            }
+        ax.axhline(0.5, color="grey", lw=0.8, ls=":")
+        ax.set_xlabel("hours before delivery")
+        ax.set_ylabel("AUROC (one-vs-rest)")
+        ax.set_title(f"per-class AUROC vs time ({metric_type})")
+        ax.invert_xaxis()
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(fontsize=9, loc="best")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{metric_type}.png", dpi=150)
+        plt.close(fig)
+
+        if long_rows:
+            pd.DataFrame(long_rows).to_csv(
+                out_dir / f"{metric_type}.csv", index=False
+            )
         if per_class_summary:
             summary[metric_type] = per_class_summary
     return summary
@@ -621,12 +851,21 @@ def aggregate_results(
     *,
     run_dir: Path,
     fold_ids: Optional[Sequence[int]] = None,
+    decision_time_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Aggregate fold artefacts and write summary plots / JSON.
 
     Args:
         run_dir: Run directory holding ``fold_*/`` subdirectories.
         fold_ids: Optional subset; defaults to every ``fold_*`` present.
+        decision_time_hours: Hours before delivery at which the per-fold
+            operating point was selected. When provided, every cross-fold
+            time-axis plot draws a dashed vertical reference line via
+            :func:`clinical_metrics_utils.annotate_decision_time`. When
+            ``None``, the value is auto-detected from the first fold's
+            ``thresholds.json`` (``decision_time_hours`` field, if
+            present) or by reading ``evaluation.decision_time_hours``
+            from the run-level ``config_guid_cls_v1.yaml``.
 
     Returns:
         Aggregated summary dict (also written to
@@ -639,9 +878,73 @@ def aggregate_results(
     if not fold_dirs:
         raise FileNotFoundError(f"No fold_* dirs found under {run_dir}")
 
+    # Layout detection: warn loudly when a fold still uses the old
+    # ``three_metric_types/`` tree so the operator knows that fold needs
+    # to be re-evaluated against the new layout before its long-format
+    # CSVs become available. Continue regardless; the legacy ROC / 3-class
+    # pieces still aggregate from the (preserved) raw CSVs.
+    new_layout = [fd for fd in fold_dirs if _has_new_layout(fd)]
+    if not new_layout:
+        logger.warning(
+            f"aggregate_results: none of the {len(fold_dirs)} folds under "
+            f"{run_dir} expose the new ``binary_head/`` + ``multiclass_head/`` "
+            "layout. Per-class / subgroup / AUROC cross-fold aggregations "
+            "will be empty. Re-run evaluate_kfold to refresh the per-fold "
+            "tree under the current layout."
+        )
+    elif len(new_layout) < len(fold_dirs):
+        legacy = [
+            fd.name for fd in fold_dirs if not _has_new_layout(fd)
+        ]
+        logger.warning(
+            f"aggregate_results: {len(legacy)}/{len(fold_dirs)} folds use "
+            f"the legacy ``three_metric_types/`` layout: {legacy}. Their "
+            "per-class / subgroup / AUROC contributions will be skipped. "
+            "Re-run evaluate_single_fold on those folds to refresh."
+        )
+
+    # Resolve ``decision_time_hours`` for the vertical-reference annotation
+    # on every vs-time plot (best-effort; falls back to None when neither
+    # source is available).
+    if decision_time_hours is None:
+        for fd in fold_dirs:
+            thr_path = _resolve_thresholds_json(fd)
+            if thr_path is None:
+                continue
+            try:
+                thr_payload = json.loads(thr_path.read_text(encoding="utf-8"))
+            except Exception:  # pragma: no cover
+                continue
+            cand = thr_payload.get("decision_time_hours")
+            if cand is not None:
+                try:
+                    decision_time_hours = float(cand)
+                    break
+                except (TypeError, ValueError):
+                    continue
+    if decision_time_hours is None:
+        cfg_path = run_dir / "config_guid_cls_v1.yaml"
+        if cfg_path.exists():
+            try:
+                import yaml  # noqa: WPS433
+
+                cfg_payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                cand = (
+                    (cfg_payload or {}).get("evaluation", {}) or {}
+                ).get("decision_time_hours")
+                if cand is not None:
+                    decision_time_hours = float(cand)
+            except Exception:  # pragma: no cover
+                pass
+
     agg_root = run_dir / "aggregated_plots"
     agg_root.mkdir(parents=True, exist_ok=True)
-    diag_root = agg_root / "three_class_diagnostics"
+    # New head-explicit cross-fold layout (parallel to per-fold tree).
+    binary_head_agg = agg_root / "binary_head"
+    multiclass_head_agg = agg_root / "multiclass_head"
+    diag_root = multiclass_head_agg / "diagnostics"
+    binary_head_agg.mkdir(parents=True, exist_ok=True)
+    multiclass_head_agg.mkdir(parents=True, exist_ok=True)
     diag_root.mkdir(parents=True, exist_ok=True)
 
     per_fold_binary_roc: List[Tuple[int, Dict[str, Any]]] = []
@@ -651,18 +954,17 @@ def aggregate_results(
 
     for fd in fold_dirs:
         fid = int(fd.name.split("_")[-1])
-        eval_dir = fd / "evaluation"
 
-        # Binary ROC: stored as roc_binary_data.csv (fpr, tpr, thresholds).
-        # Skip empty / malformed files so a partially-failed fold doesn't
-        # poison the cross-fold summary.
-        roc_csv = eval_dir / "roc_binary_data.csv"
-        if roc_csv.exists():
+        # Binary ROC: stored as ``binary_head/roc.csv`` (new layout) or
+        # ``roc_binary_data.csv`` (legacy). Skip empty / malformed files
+        # so a partially-failed fold doesn't poison the cross-fold summary.
+        roc_csv = _resolve_binary_roc_csv(fd)
+        if roc_csv is not None:
             try:
                 roc_df = pd.read_csv(roc_csv)
                 if roc_df.empty or "fpr" not in roc_df.columns or "tpr" not in roc_df.columns:
                     logger.warning(
-                        f"fold {fid}: roc_binary_data.csv is empty or missing "
+                        f"fold {fid}: {roc_csv.name} is empty or missing "
                         "fpr/tpr columns; skipping."
                     )
                 else:
@@ -693,38 +995,46 @@ def aggregate_results(
             except Exception as exc:  # pragma: no cover
                 logger.warning(f"fold {fid}: failed 3-class aggregation: {exc}")
 
-        # Threshold info.
-        thr_json = eval_dir / "threshold_info.json"
-        if thr_json.exists():
+        # Threshold info (new ``thresholds.json`` or legacy
+        # ``threshold_info.json``).
+        thr_json = _resolve_thresholds_json(fd)
+        if thr_json is not None:
             try:
                 per_fold_thresholds.append(
                     (fid, json.loads(thr_json.read_text(encoding="utf-8")))
                 )
             except Exception as exc:
-                logger.warning(f"fold {fid}: failed to read threshold_info.json: {exc}")
+                logger.warning(f"fold {fid}: failed to read {thr_json.name}: {exc}")
 
     binary_auc_mean = _plot_aggregated_binary_roc(
-        per_fold_binary_roc, agg_root / "aggregated_roc_binary.png"
+        per_fold_binary_roc, binary_head_agg / "roc.png"
     )
     three_class_auc_means = _plot_aggregated_3class_roc(
-        per_fold_3class_roc, agg_root / "aggregated_roc_3class_ovr"
+        per_fold_3class_roc, multiclass_head_agg / "roc_ovr"
     )
     mean_cm: Optional[np.ndarray] = None
     if per_fold_cms:
         mean_cm = _plot_mean_confusion_matrix(
-            per_fold_cms, diag_root / "mean_confusion_matrix_3class.png"
+            per_fold_cms, diag_root / "mean_confusion_matrix.png"
         )
 
-    # Legacy three-metric-type aggregator.
+    # Legacy three-metric-type aggregator (no-op on current pipeline).
     _aggregate_legacy_metric_plots(run_dir, fold_dirs)
 
-    # New per-class + binary-by-underlying-class aggregations.
-    perclass_summary = _aggregate_perclass_metric_curves(fold_dirs, agg_root)
+    # New per-class + binary-by-underlying-class + AUROC aggregations
+    # (driven by long-format CSVs; emit nothing when no fold uses the new
+    # layout).
+    perclass_summary = _aggregate_perclass_metric_curves(
+        fold_dirs, agg_root, decision_time_hours=decision_time_hours
+    )
     binary_by_class_summary = _aggregate_binary_by_underlying_class_curves(
-        fold_dirs, agg_root
+        fold_dirs, agg_root, decision_time_hours=decision_time_hours
     )
     perclass_subgroup_summary = _aggregate_perclass_subgroup_metric_curves(
-        fold_dirs, agg_root
+        fold_dirs, agg_root, decision_time_hours=decision_time_hours
+    )
+    perclass_auroc_summary = _aggregate_perclass_auroc_curves(
+        fold_dirs, agg_root, decision_time_hours=decision_time_hours
     )
 
     # Threshold + AUC scalar summary.
@@ -767,6 +1077,9 @@ def aggregate_results(
     summary["per_class_metric_curves"] = perclass_summary
     summary["binary_by_underlying_class_curves"] = binary_by_class_summary
     summary["per_class_subgroup_metric_curves"] = perclass_subgroup_summary
+    summary["per_class_auroc_vs_time"] = perclass_auroc_summary
+    if decision_time_hours is not None:
+        summary["decision_time_hours"] = float(decision_time_hours)
 
     (run_dir / "aggregated_results.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
@@ -792,10 +1105,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--run-dir", required=True, help="Run directory containing fold_*/")
     parser.add_argument("--fold-ids", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--decision-time-hours",
+        type=float,
+        default=None,
+        help=(
+            "Override the decision-time vertical-line annotation drawn on "
+            "every cross-fold vs-time plot. Defaults to the value persisted "
+            "in per-fold thresholds.json or the run-level config."
+        ),
+    )
     args = parser.parse_args(argv)
     aggregate_results(
         run_dir=Path(args.run_dir).resolve(),
         fold_ids=args.fold_ids,
+        decision_time_hours=args.decision_time_hours,
     )
     return 0
 
