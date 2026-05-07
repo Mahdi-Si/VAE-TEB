@@ -39,7 +39,15 @@ vae:
   checkpoint: /abs/path/to/seq_vae_lag_attn_v1-best.ckpt    # MUST be overridden per-run
   freeze_vae: true                           # true -> precompute mode; false -> live + two-stage
   vae_chunk_size: 32                         # Live-VAE forward batch size (segments)
-  fit_latent_stats_max_batches: null         # null => full pass
+  # Cap on the ``fit_latent_stats`` pass that populates
+  # ``vae.mu_post_running_{mean,var,count}`` for the live-VAE path. Running
+  # mean/var on the latent vector (d_z=24) converges to within ~1% in
+  # well under 200 batches, so 500 is a comfortable safety margin.
+  # ``null`` runs the full pass (~440K batches at vae_chunk_size=32 over
+  # 14M latent samples — ~7 minutes per fold). Output is cached under
+  # ``out_dir_base/_latent_stats_cache/`` keyed by the inputs that
+  # determine the result, so re-runs with the same config are free.
+  fit_latent_stats_max_batches: 500
 
   # SeqVaeLagAttnV1 constructor kwargs. Must match the VAE training config
   # (`model_config.VAE_model` in the original VAE config). The classifier
