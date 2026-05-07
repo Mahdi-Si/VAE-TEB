@@ -182,6 +182,7 @@ def load_classifier_from_checkpoint(
     device: torch.device,
     attach_vae: Optional[torch.nn.Module] = None,
     vae_chunk_size: int = 32,
+    discard_vae_keys: bool = False,
 ) -> GuidOutcomeClassifier:
     """Instantiate :class:`GuidOutcomeClassifier` and load its weights.
 
@@ -205,10 +206,24 @@ def load_classifier_from_checkpoint(
             in shape (e.g. a fresh ``build_vae_from_config`` is fine).
         vae_chunk_size: Forwarded to ``classifier.vae_chunk_size`` when
             ``attach_vae`` is provided. Mirrors the live-train default.
+        discard_vae_keys: When ``True`` and ``attach_vae`` is None, drop
+            every ``vae.*`` key from the checkpoint state-dict before the
+            strict-load check. Use this when evaluating a live-VAE
+            checkpoint via cached latents — the fine-tuned VAE weights
+            were already consumed upstream (by
+            :func:`_ensure_live_vae_eval_caches` to encode the cache)
+            and the classifier doesn't need a VAE submodule for cache
+            reads. Mutually exclusive with ``attach_vae``: passing both
+            raises ``ValueError``.
 
     Returns:
         Eval-mode :class:`GuidOutcomeClassifier` on ``device``.
     """
+    if attach_vae is not None and discard_vae_keys:
+        raise ValueError(
+            "load_classifier_from_checkpoint: attach_vae and "
+            "discard_vae_keys are mutually exclusive — pick one."
+        )
     classifier = GuidOutcomeClassifier(classifier_cfg)
     if attach_vae is not None:
         classifier.vae = attach_vae
@@ -229,15 +244,18 @@ def load_classifier_from_checkpoint(
         if k.startswith("loss."):
             continue
         if k.startswith("model.model."):
-            cleaned[k[len("model.model."):]] = v
+            stripped = k[len("model.model."):]
         elif k.startswith("model._orig_mod."):
-            cleaned[k[len("model._orig_mod."):]] = v
+            stripped = k[len("model._orig_mod."):]
         elif k.startswith("model."):
-            cleaned[k[len("model."):]] = v
+            stripped = k[len("model."):]
         elif k.startswith("_orig_model."):
-            cleaned[k[len("_orig_model."):]] = v
+            stripped = k[len("_orig_model."):]
         else:
-            cleaned[k] = v
+            stripped = k
+        if discard_vae_keys and stripped.startswith("vae."):
+            continue
+        cleaned[stripped] = v
     incompatible = classifier.load_state_dict(cleaned, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         missing = ", ".join(incompatible.missing_keys[:8]) or "none"
@@ -808,6 +826,52 @@ def evaluate_single_fold(
     assert val_cache.exists(), f"missing val cache {val_cache}"
     assert test_cache.exists(), f"missing test cache {test_cache}"
 
+    # Window-mismatch guard for the *frozen-VAE* re-eval path. Caches
+    # built during training were keyed on ``dataset_config.epoch_min``;
+    # if the user later sets ``evaluation.epoch_min_test`` and re-runs
+    # eval on those caches, they'd silently get the narrower window
+    # instead of the wider one. The signature mismatch is only acted on
+    # by ``precompute_fold_latents`` (which we don't call from the eval
+    # path for frozen-VAE), so we have to compare the stored summary
+    # ourselves and refuse to proceed if it disagrees with the override.
+    if freeze_vae and epoch_min_overrides_eval:
+        import h5py  # noqa: WPS433
+        for partition, expected_window in epoch_min_overrides_eval.items():
+            cache_file = cache_root / f"{partition}.hdf5"
+            try:
+                with h5py.File(cache_file, "r", libver="latest") as fh:
+                    summary_raw = fh.attrs.get("cache_input_summary_json", "")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not read cache attrs from {cache_file} to "
+                    f"verify epoch_min: {exc}"
+                ) from exc
+            try:
+                summary = json.loads(str(summary_raw)) if summary_raw else {}
+            except json.JSONDecodeError:
+                summary = {}
+            cached_window = (summary.get("dataset", {}) or {}).get("epoch_min")
+            if cached_window is None:
+                logger.warning(
+                    f"[{fold_dir.name}] {partition}.hdf5 has no "
+                    "cache_input_summary_json; cannot verify epoch_min "
+                    "matches evaluation.epoch_min_test — proceeding "
+                    "but window may be stale"
+                )
+                continue
+            if int(cached_window) != int(expected_window):
+                raise RuntimeError(
+                    f"[{fold_dir.name}] {partition} cache was built with "
+                    f"epoch_min={cached_window} but evaluation.epoch_min_test"
+                    f"={expected_window}. Frozen-VAE re-eval cannot widen "
+                    "the window without rebuilding the cache. Either:\n"
+                    f"  (a) re-run precompute_fold_latents with "
+                    f"epoch_min_overrides={{'{partition}': {expected_window}}}\n"
+                    "  (b) clear the stale cache and re-run training, or\n"
+                    "  (c) remove evaluation.epoch_min_test from the config "
+                    "to use the trained window."
+                )
+
     # Build classifier config off the cache dimensions.
     cls_cfg = config["model_config"]["classifier"]
     # Peek d_z / d_model_vae from the cache attrs.
@@ -849,8 +913,18 @@ def evaluate_single_fold(
             ckpt_path = find_best_checkpoint(fold_dir / "checkpoints")
     else:
         ckpt_path = find_best_checkpoint(fold_dir / "checkpoints")
+    # For live-VAE runs the checkpoint carries ``vae.*`` keys (stage-2
+    # fine-tuned weights + running latent stats). Those weights have
+    # already been consumed by ``_ensure_live_vae_eval_caches`` to encode
+    # the val/test caches above; the classifier itself reads from cache
+    # and doesn't need the VAE submodule, so we drop the ``vae.*`` keys
+    # before the strict-load check rather than instantiating a VAE we'd
+    # immediately throw away.
     classifier = load_classifier_from_checkpoint(
-        ckpt_path, classifier_cfg=classifier_cfg, device=device
+        ckpt_path,
+        classifier_cfg=classifier_cfg,
+        device=device,
+        discard_vae_keys=not freeze_vae,
     )
 
     # Build loaders.
@@ -1029,6 +1103,7 @@ def evaluate_single_fold(
             subgroup_filters,
             binary_subgroups_dir / metric_type,
             title_suffix=f" - {fold_dir.name}",
+            decision_time_hours=decision_time_hours,
         )
         try:
             sub_long_rows: List[Dict[str, Any]] = []
