@@ -342,7 +342,7 @@ Every collector lives under `runner.inference_mode()` and iterates via
 | `collect_metrics(runner, loader, max_samples=None, *, pca_components=3, pca_output_dir=None)` | `pd.DataFrame` | **Extended** columns: `guid, epoch, label, feat_mse_total, feat_mse_st, feat_mse_ph, feat_r2_total, base_mse_total, uplift_abs, uplift_rel, residual_ratio, delta_src_norm, kld_mean, kld_sum, kld_l2, kld` plus the TE surrogates `posterior_drift_norm, attention_entropy_mean, attention_concentration_mean, te_lag_peak, te_lag_total_mass, kld_dim_0..23, kld_pc1..kld_pcK`, legacy `kld_pca_l2_top3`, and selected-PC columns `kld_pc_selected_*`, `kld_pca_l2_selected`, `kld_pca_abs_sum_selected`, `kld_pca_signed_sum_selected`. The `kld` column remains an alias of `kld_mean` for `TE_Calculated` compatibility. Also writes `pca_kld/ev_ratio.json`, `selection.json`, `components.npy`, and `mean.npy`. |
 | `collect_latents(runner, loader, max_samples=None)` | `np.ndarray (N*T, d_z)` | Flattened per-sample latent trajectories. |
 | `collect_predictions(runner, loader, max_samples=None)` | `List[Dict]` | ⚠️ **Heavy** — ~13 MB per sample. Retains full `mu_full, mu_base, delta_src, y_plus, z, attn, te_lag, kld_t, kld_sum_t, kld_l2_t, kld_per_dim, fhr, up` plus metadata and a `metrics` sub-dict containing `kld_mean`, `kld_sum`, and `kld_l2`. Consumed by sample diagnostic plots. **Must be capped by the caller.** |
-| `collect_kld_trajectory(runner, loader, max_samples=None, *, pca_model=None)` | `pd.DataFrame` | Long-format per-(sample, timestep) rows: `[guid, epoch, hours_before, label, timestep, kld_mean, kld_dim_mean_t, kld_sum_t, kld_l2_t, latent_0 … latent_{d_z-1}]`. When `pca_model` is provided, adds selected/fitted `kld_pc*_t` columns. |
+| `collect_kld_trajectory(runner, loader, max_samples=None, *, pca_model=None, pca_model_top=None)` | `pd.DataFrame` | Long-format per-(sample, timestep) rows: `[guid, epoch, hours_before, label, timestep, kld_mean, kld_dim_mean_t, kld_sum_t, kld_l2_t, latent_0 … latent_{d_z-1}]`. When `pca_model` is supplied, adds the contrast-selected `kld_pc{i}_t` columns. When `pca_model_top` is supplied (typically the first $\min(6, d_z)$ PCs by eigenvalue), adds `kld_pc_top{i}_t` columns alongside — both projections share a single inference pass. |
 | `collect_attention_maps(runner, loader, max_samples=None)` | `List[Dict]` | ⚠️ **Moderate** — ~750 KB per sample. Per-sample `{guid, epoch, label, alpha_bar (T,L), argmax_lag (T,), entropy (T,M), head_diversity (T,), alpha_mass_by_lag (L,)}`. |
 | `collect_te_lag_maps(runner, loader, max_samples=None)` | `pd.DataFrame` | One row per sample: `[guid, epoch, label, te_lag_mean_0 … te_lag_mean_{L-1}, te_lag_argmax]`. |
 | `collect_forecast_errors_per_horizon(runner, loader, max_samples=None)` | `pd.DataFrame` | Long-format per-(sample, horizon step): `[guid, epoch, label, h, mse_step, mse_st, mse_ph]`. |
@@ -392,12 +392,24 @@ These helpers are imported by every class-aware analysis.
 | **`plot_band_anchor_error(per_anchor_df, out_path, *, value_col="mse", decim_step_seconds=4.0, band_hz_ranges=None)`** | PDF | Median+IQR ribbon, one line per band, x = anchor position rescaled to minutes. |
 | **`plot_band_horizon_error_by_class(per_horizon_df, out_path, *, band_hz_ranges=None)`** | PDF | Grid of subplots — rows = bands, cols = classes, each cell is a horizon-error ribbon. Falls back to pooled when <2 classes. Hz suffixes on row labels. |
 | **`plot_band_anchor_error_by_class(per_anchor_df, out_path, *, decim_step_seconds=4.0, band_hz_ranges=None)`** | PDF | Same shape as horizon variant but x = anchor in minutes. |
-| **`plot_freq_horizon_heatmap_scattering(mse_grid, freq_hz, channel_ids, horizon, fs_hz, out_path, *, n_samples, n_anchors_total=0, log_color=True)`** | PDF + PNG | $(43, H_d)$ scattering heatmap with explicit Hz tick labels (high $\rightarrow$ low), x = horizon step + seconds, magma + LogNorm. Right-margin column shows the original 87-channel-space index per row. |
-| **`plot_freq_horizon_heatmap_phase_by_kind(long_df, horizon, fs_hz, out_path, *, n_samples)`** | PDF + PNG | 4-panel stack (`ph_diag`, `ph_h2`, `ph_h3`, `ph_other`); y = $\xi_j$ (response) in Hz, right-margin per-row annotation $(\xi_i, p)$ to preserve the dual-frequency identity of phase channels. Shared LogNorm colorbar. |
+| **`plot_freq_horizon_heatmap_scattering(mse_grid, freq_hz, channel_ids, horizon, fs_hz, out_path, *, n_samples, n_anchors_total=0, log_color=True)`** | PDF + PNG | $(43, H_d)$ scattering heatmap with explicit Hz tick labels (high $\rightarrow$ low), x = horizon step + seconds, magma + LogNorm. **Now built on a 3-column `gridspec` (heatmap | right-margin labels | dedicated colorbar) so the channel-id labels never collide with the colorbar.** |
+| **`plot_freq_horizon_heatmap_phase_by_kind(long_df, horizon, fs_hz, out_path, *, n_samples)`** | PDF + PNG | 4-panel stack (`ph_diag`, `ph_h2`, `ph_h3`, `ph_other`); y = $\xi_j$ (response) in Hz, right-margin per-row annotation $(\xi_i, p)$ to preserve the dual-frequency identity of phase channels. **Now uses a 3-column `gridspec` with one shared colorbar column spanning all rows; the wide $(\xi_i, p)$ labels live in their own dedicated column instead of bleeding into the colorbar.** |
 | **`plot_phase_comodulograms_by_horizon(long_df, horizon, fs_hz, out_path, *, n_samples, snapshot_horizons=None)`** | PDF + PNG | Small-multiples comodulograms at $h \in \{0, H_d/4, H_d/2, H_d-1\}$ (deduplicated). Axes $\log_2 \xi_i$ (driver) $\times \log_2 \xi_j$ (response); colour = MSE; dashed reference lines at $\xi_j = p\xi_i$ for $p \in \{1, 2, 3\}$; marker shape encodes the kind. |
+| **`plot_band_horizon_heatmap(per_horizon_df, out_path, *, horizon, fs_hz, n_samples, value_col="mse", band_hz_ranges=None, log_color=True, metric_label="Forecast MSE")`** | PDF | $(N_{\mathrm{bands}}, H_d)$ heatmap of mean MSE per `(band, h)` after pooling across all anchors and samples. Rows ordered high $\rightarrow$ low frequency; x ticks are dual-labelled `h={k}` / `({k/f_s:.2f} s)`. One PDF per partition. |
+| **`plot_band_horizon_meanse_lines(per_horizon_df, out_path, *, horizon, fs_hz, n_samples, value_col="mse", band_hz_ranges=None)`** | PDF | One line per band, $x = h$, $y = $ mean MSE, shading $= \mathrm{SE} = \sigma / \sqrt{n}$. Band labels are placed at the right edge of each line (no legend) and reuse `_band_color_for` for visual consistency with violin plots. |
+| **`plot_channel_horizon_heatmap_band_grouped(long_df, out_path, *, horizon, fs_hz, n_samples, band_col, band_hz_ranges=None, log_color=True, metric_label="Forecast MSE")`** | PDF | Channel × horizon heatmap where channels are sorted such that members of the same band are contiguous, with thin horizontal divider lines and band labels in the right margin (3-column gridspec). Emitted for `clinical_4band` / `clinical_7band` / `by_octave`. |
+| **`plot_per_channel_mse_vs_freq(...)`** *(refactored)* | PDF | Two-panel scatter (scattering top, phase bottom) on a 2-column gridspec. Top-3 worst / top-3 best channels per panel are now drawn as **circled numbered badges** (1-3 worst in vermillion, 4-6 best in green) directly on each data point, paired with a **side-panel legend table** (`#`, `ch`, `kind`, `Hz`, `MSE`, plus `p` for phase). Eliminates inline-annotation collisions by construction. |
 | `_format_band_label_with_hz(band, band_hz_ranges)` | str | Helper that appends `(lo–hi Hz)` / `(< hi Hz)` / `(> lo Hz)` / `(DC)` to a band name. Falls back to the bare name when `band_hz_ranges` is `None` or the band is missing (e.g. `by_kind` partition where labels are coefficient kinds). |
 | `plot_latent_distributions(latents, output_dir)` | `latent_distributions.pdf` |
 | `plot_kld_trajectory`, `plot_kld_guid_trajectory`, `plot_kld_trajectory_3d` | KLD trajectory plots |
+| **`plot_kld_per_dim_heatmap(df, d_z, out_path, *, group_col="label", n_samples_per_group=None, metric_label="mean KLD per dim", log_color=True)`** | PDF | $(d_z, N_{\mathrm{groups}})$ heatmap of mean per-dim KL divergence, rows = latent dim index $i \in [0, d_z)$, columns = groups. Reads `kld_dim_*` columns from `histograms/histogram_metrics.csv`. `group_col="label"` for Phase 1, `"subgroup"` for Phase 2. |
+| **`plot_kld_per_dim_violins_by_class(df, d_z, out_path, *, group_col="label")`** | PDF | $d_z$ violin panels in a 4-wide grid; each panel is `kld_dim_i` distribution split by group. Useful for spotting class- / subgroup-discriminative latent dimensions. |
+| **`plot_kld_trajectory_by_group(traj_df, out_path, *, group_col="label", metric_col="kld_mean", time_col="timestep", title=None)`** | PDF | Per-group mean $\pm$ SE of `kld_mean` (or any selected metric) along the timestep axis. Distinct from the existing `plot_kld_trajectory` which uses the `hours_before_birth` axis. |
+| **`plot_selected_pc_trajectories_grid(traj_df, selection, out_path, *, group_col="label", time_col="timestep")`** | PDF | Small-multiples grid, one panel per selected PC (driven by `pca_kld/selection.json`); each panel shows mean $\pm$ SE of `kld_pc_selected_{i}_t` per group. Caption surfaces the contrast type that picked the components. |
+| **`plot_pc12_mean_trajectory_overlay(traj_df, out_path, *, group_col="subgroup", time_col="timestep", pc1_col="kld_pc1_t", pc2_col="kld_pc2_t")`** | PDF | Per-group mean trajectory in the (PC1, PC2) plane with directional arrows for time progression and ■ first / ★ last markers. Phase 2 cross-subgroup overlay. |
+| **`plot_aggregate_kld_violins(df, out_path, *, group_col="subgroup", metric_cols=("kld_mean", "kld_sum", "kld_l2"))`** | PDF | Three side-by-side violin panels (one per aggregate KLD metric) with subgroup on the x-axis. Phase 2 cross-subgroup overlay. |
+| **`plot_kld_segment_summary_vs_time(df, out_path, *, metric_col, title=None, group_col=None, n_samples=None, palette=None)`** | PDF | Per-(guid, epoch) segment-summary KLD trace as a function of `hours_before`, 30-min binning + mean $\pm$ SE shading. `metric_col` selects the summary (`kld_mean`, `kld_l2sq`, `kld_max`); `group_col`-aware so the same primitive feeds Phase 1 and Phase 2 overlays. |
+| **`plot_kld_pc_trajectory_grid(df, out_path, *, n_components=6, group_col=None, n_samples=None, palette=None, pc_prefix="kld_pc_top")`** | PDF | 3 $\times$ 2 small-multiples grid: one panel per PC $i \in [1, N]$, x = `hours_before` (30-min bins), y = mean $\pm$ SE of `{pc_prefix}{i}_t` per epoch. Default `pc_prefix="kld_pc_top"` reads the first-$N$-by-eigenvalue columns; pass `"kld_pc"` for contrast-selected PCs. |
 | `plot_latent_trajectory_2d/3d`, `plot_guid_absolute_trajectory`, `plot_guid_trajectory_3d` | Latent trajectory plots |
 | `plot_latent_changepoints_with_raw` | Changepoints overlaid on raw FHR strip |
 | `plot_segment_statistics`, `plot_trajectory_comparison`, `plot_recurrence` | Trajectory shape / comparison plots |
@@ -523,6 +535,16 @@ Outputs under `frequency_band_forecast/`:
   the pooled and by-class PDFs (`band_mse_violin.pdf`,
   `band_r2_violin.pdf`, `band_horizon_error.pdf`,
   `band_anchor_error.pdf`, `*_by_class.pdf` when ≥2 classes).
+  Each partition also carries two new "horizon-vs-frequency" figures:
+  - `band_horizon_heatmap.pdf` — $(N_{\mathrm{bands}}, H_d)$ heatmap
+    of mean MSE per `(band, h)` after pooling all anchors and
+    samples. Rows ordered high $\rightarrow$ low frequency.
+  - `band_horizon_meanse.pdf` — mean $\pm$ SE per band along the
+    horizon axis with right-edge band labels (no legend).
+  And — only for `clinical_4band/`, `clinical_7band/`, `by_octave/` —
+  - `channel_horizon_heatmap.pdf` — band-grouped channel × horizon
+    heatmap with horizontal divider lines at band boundaries and
+    band labels in the right margin.
 - `per_channel/` — `per_channel_forecast.csv` (one row per `(sample,
   channel)` with `mse_total`, `r2_total`, plus the static channel
   metadata), `mse_vs_freq.pdf`, `mse_vs_freq_by_class.pdf`,
@@ -1182,9 +1204,11 @@ output_dir/
 │   │   ├── per_sample.csv  per_horizon.csv  per_anchor.csv
 │   │   ├── band_mse_violin.pdf      band_r2_violin.pdf
 │   │   ├── band_horizon_error.pdf   band_anchor_error.pdf
+│   │   ├── band_horizon_heatmap.pdf band_horizon_meanse.pdf
+│   │   ├── channel_horizon_heatmap.pdf            # band-grouped (omitted for by_kind)
 │   │   └── band_*_by_class.pdf                    # when ≥ 2 classes
 │   ├── clinical_7band/   ...                      # same file set
-│   ├── by_kind/          ...                      # same file set (no Hz labels)
+│   ├── by_kind/          ...                      # same file set (no Hz labels, no channel-horizon)
 │   ├── by_octave/        ...                      # same file set (Hz octaves)
 │   ├── per_channel/
 │   │   ├── per_channel_forecast.csv
@@ -1251,7 +1275,11 @@ output_dir/
 │   ├── pc12_scatter_by_class.pdf
 │   ├── selected_pc12_scatter_by_class.pdf
 │   ├── pc_trajectories_overlay.pdf
-│   └── kld_pc_trajectory.csv
+│   ├── kld_per_dim_heatmap_by_class.pdf            # NEW: (d_z × class) mean KLD per dim
+│   ├── kld_per_dim_violins_by_class.pdf            # NEW: per-dim violins split by class
+│   ├── kld_trajectory_by_class.pdf                 # NEW: per-class mean ± SE of kld_mean(t)
+│   ├── selected_pc_trajectories_grid.pdf           # NEW: small-multiples for selected PCs
+│   └── kld_pc_trajectory.csv                       # adds kld_pc_top{1..6}_t columns
 ├── latent_distribution/
 │   └── latent_distributions.pdf
 ├── latent_space/
@@ -1261,12 +1289,18 @@ output_dir/
 │   └── *.png / *.csv
 ├── trajectory/
 │   ├── plots/
-│   ├── dashboards/
-│   ├── latent_trajectories_stitched.csv
-│   ├── kld_trajectory_raw.csv
+│   │   ├── kld_trajectory.pdf                      # existing population mean(t)
+│   │   ├── kld_by_class.pdf                        # existing class overlay
+│   │   ├── kld_trajectory_mean.pdf                 # NEW: per-segment mean vs hours_before
+│   │   ├── kld_trajectory_l2sq.pdf                 # NEW: per-segment ||KLD||_2^2 vs hours_before
+│   │   ├── kld_trajectory_max.pdf                  # NEW: per-segment max vs hours_before
+│   │   └── kld_pc_trajectory_grid.pdf              # NEW: first 6 KLD PCs as 3×2 grid
+│   ├── dashboards/                                  # skipped when keep_kld_trajectory_only=True
+│   ├── latent_trajectories_stitched.csv             # ditto (skipped in slim mode)
+│   ├── kld_trajectory_raw.csv                       # NEW columns: kld_l2sq, kld_max
 │   ├── kld_trajectory_aggregated.csv
-│   ├── guid_trajectory_features.csv
-│   └── summary.json
+│   ├── guid_trajectory_features.csv                 # skipped in slim mode
+│   └── summary.json                                 # adds {"mode": "keep_kld_trajectory_only"} when slim
 ├── samples_diag/
 │   ├── <guid>_<epoch>.pdf
 │   └── sample_metrics.csv
@@ -1342,7 +1376,15 @@ output_dir/
         │   ├── attention_mass_by_lag_overlay.pdf
         │   ├── uplift_<col>_overlay.pdf
         │   ├── te_lag_mean_overlay.pdf
-        │   └── kld_pc12_scatter_overlay.pdf
+        │   ├── kld_pc12_scatter_overlay.pdf
+        │   ├── kld_trajectory_overlay.pdf            # per-subgroup mean ± SE of kld_mean(t) [timestep axis]
+        │   ├── kld_per_dim_by_subgroup_heatmap.pdf   # (d_z × subgroup) mean KLD per dim
+        │   ├── kld_pc12_mean_trajectory_overlay.pdf  # per-subgroup mean (PC1, PC2) trajectory
+        │   ├── kld_aggregate_violins.pdf             # kld_mean / kld_sum / kld_l2 violins
+        │   ├── kld_trajectory_hours_overlay.pdf      # NEW: per-subgroup mean ± SE of kld_mean vs hours-before-birth
+        │   ├── kld_segment_l2sq_overlay.pdf          # NEW: per-subgroup mean ± SE of ||KLD||_2^2 vs hours-before-birth
+        │   ├── kld_segment_max_overlay.pdf           # NEW: per-subgroup mean ± SE of max(KLD) vs hours-before-birth
+        │   └── kld_pc_trajectory_grid_overlay.pdf    # NEW: 3×2 grid, first 6 KLD PCs vs hours-before-birth, by subgroup
         ├── stats/
         │   ├── kruskal_wallis.csv              # H, p, p_holm, df, n_subgroups, significant
         │   ├── pairwise_mann_whitney.csv       # U, p, p_holm per (metric, sg_a, sg_b)
@@ -1357,6 +1399,56 @@ output_dir/
 absent from each `phase1/<subgroup>/` folder — they are nonsensical
 on a single-class subgroup. Cross-subgroup statistical comparisons
 take their place in Phase 2.
+
+#### Cross-subgroup overlay style
+
+* **Histograms** (the `histogram_*_overlay.pdf`,
+  `residual_*_overlay.pdf`, `attention_*_overlay.pdf`,
+  `uplift_*_overlay.pdf` family produced by
+  `_emit_overlay_for_metric`) all carry a thin black borderline
+  (`edgecolor=COLOR_BLACK, linewidth=0.5`) so adjacent translucent
+  subgroup densities remain visually separable. Standalone
+  histograms (`uplift/uplift_histogram.pdf`) follow the same rule.
+* **Subgroup colours** are the **Okabe-Ito** 8-colour
+  colourblind-safe palette, ordered to keep outcome-family blocks
+  visually grouped (healthy = cool/yellow, acidosis = warm,
+  HIE = vermillion + black). The palette lives in
+  `subgroup_utils.py::SUBGROUP_COLORS` and is the single point of
+  edit — every cross-subgroup overlay routes through `_color_map()`
+  and inherits the palette automatically.
+
+### Optional: `keep_kld_trajectory_only` slim mode
+
+`run_full_test_pipeline(...)` and
+`run_full_test_pipeline_by_subgroup(...)` both accept a
+`keep_kld_trajectory_only: bool = False` kwarg, which is also
+readable from `dataset_config.keep_kld_trajectory_only` in the
+testing YAML.
+
+When `True`, the trajectory step (Phase 1) skips every per-GUID
+PDF, dashboard, recurrence plot, 3D trajectory and changepoint
+output, and only emits the population-level KLD-vs-time-to-delivery
+plots:
+
+* `trajectory/plots/kld_trajectory.pdf` — existing pooled mean(t).
+* `trajectory/plots/kld_by_class.pdf` — when `class_analysis=True`.
+* `trajectory/plots/kld_trajectory_mean.pdf` — NEW per-segment mean
+  (one scalar per `(guid, epoch)`).
+* `trajectory/plots/kld_trajectory_l2sq.pdf` — NEW per-segment
+  $\|\mathrm{KLD}\|_2^2$.
+* `trajectory/plots/kld_trajectory_max.pdf` — NEW per-segment max.
+* `trajectory/plots/kld_pc_trajectory_grid.pdf` — NEW 3$\times$2
+  small-multiples grid, first 6 KLD PCs.
+
+The four new plots are also emitted in **full mode** alongside the
+legacy outputs — they read directly from `epoch_df` (newly extended
+with `kld_l2sq, kld_max` columns) and from
+`kld_pca/kld_pc_trajectory.csv` (newly extended with
+`kld_pc_top{1..6}_t` columns). Phase 2 cross-subgroup overlays for
+each of the four families (`kld_trajectory_hours_overlay.pdf`,
+`kld_segment_l2sq_overlay.pdf`, `kld_segment_max_overlay.pdf`,
+`kld_pc_trajectory_grid_overlay.pdf`) are CSV-driven so they run
+regardless of the slim-mode flag.
 
 ---
 

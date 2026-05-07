@@ -29,7 +29,9 @@ from loguru import logger
 from model.vae_teb_prediction.testing.visualizers import (
     _style_axes,
     plot_aggregate_kld_violins,
+    plot_kld_pc_trajectory_grid,
     plot_kld_per_dim_heatmap,
+    plot_kld_segment_summary_vs_time,
     plot_kld_trajectory_by_group,
     plot_pc12_mean_trajectory_overlay,
 )
@@ -666,6 +668,158 @@ def _process_kld_aggregate_violins(
 
 
 # ---------------------------------------------------------------------------
+# KLD-vs-time-to-delivery overlays (per-segment summaries + first-6 PCs)
+# ---------------------------------------------------------------------------
+#
+# These four overlays read the raw per-(guid, epoch) KLD CSV produced by
+# the trajectory analysis (``trajectory/kld_trajectory_raw.csv``) and the
+# per-(sample, timestep) KLD-PC CSV produced by ``kld_pca``
+# (``kld_pca/kld_pc_trajectory.csv``). The plotting primitives are
+# group-aware (``group_col="subgroup"``) so the same visualizers used in
+# Phase 1 produce these Phase 2 overlays without duplication.
+
+
+def _subgroup_palette(subgroups: Sequence[str]) -> Dict[str, str]:
+    """Return a ``{subgroup_name: hex}`` palette for the requested subgroups.
+
+    Falls back to ``SUBGROUP_FALLBACK_COLOR`` for any non-canonical
+    subgroup name.
+    """
+    return {
+        sg: SUBGROUP_COLORS.get(sg, SUBGROUP_FALLBACK_COLOR)
+        for sg in subgroups
+    }
+
+
+def _process_kld_trajectory_hours_overlay(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Per-subgroup mean ± SE of ``kld_mean`` vs hours-before-birth.
+
+    Mirrors the Phase 1 ``trajectory/plots/kld_trajectory.pdf`` plot but
+    overlays one line per subgroup on the same axes. Reads
+    ``trajectory/kld_trajectory_raw.csv`` per subgroup.
+    """
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "trajectory/kld_trajectory_raw.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    if "hours_before" not in combined.columns or "kld_mean" not in combined.columns:
+        return {"status": "missing_columns"}
+    plot_kld_segment_summary_vs_time(
+        combined,
+        overlay_dir / "kld_trajectory_hours_overlay.pdf",
+        metric_col="kld_mean",
+        group_col="subgroup",
+        n_samples=int(len(combined)),
+        palette=_subgroup_palette(subgroups),
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+def _process_kld_segment_l2sq_overlay(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Per-subgroup mean ± SE of ``kld_l2sq`` vs hours-before-birth.
+
+    Reveals subgroup differences in *burstiness* of latent information —
+    a heavy ``\\|\\mathrm{KLD}\\|_2^2`` tail with similar mean indicates
+    spiky transfer rather than uniformly elevated transfer.
+    """
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "trajectory/kld_trajectory_raw.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    if "hours_before" not in combined.columns or "kld_l2sq" not in combined.columns:
+        return {"status": "missing_columns"}
+    plot_kld_segment_summary_vs_time(
+        combined,
+        overlay_dir / "kld_segment_l2sq_overlay.pdf",
+        metric_col="kld_l2sq",
+        group_col="subgroup",
+        n_samples=int(len(combined)),
+        palette=_subgroup_palette(subgroups),
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+def _process_kld_segment_max_overlay(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """Per-subgroup mean ± SE of ``kld_max`` vs hours-before-birth.
+
+    Captures the largest single-timestep KLD per segment per subgroup —
+    a higher ``max`` with similar mean indicates a few extreme spikes
+    drive the difference.
+    """
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "trajectory/kld_trajectory_raw.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    if "hours_before" not in combined.columns or "kld_max" not in combined.columns:
+        return {"status": "missing_columns"}
+    plot_kld_segment_summary_vs_time(
+        combined,
+        overlay_dir / "kld_segment_max_overlay.pdf",
+        metric_col="kld_max",
+        group_col="subgroup",
+        n_samples=int(len(combined)),
+        palette=_subgroup_palette(subgroups),
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+def _process_kld_pc_trajectory_grid_overlay(
+    phase1_root: Path,
+    overlay_dir: Path,
+    subgroups: Sequence[str],
+) -> Dict[str, Any]:
+    """6-panel grid (one panel per PC) of per-subgroup mean ± SE vs time-to-delivery.
+
+    Reads each subgroup's ``kld_pca/kld_pc_trajectory.csv`` and uses the
+    ``kld_pc_top{i}_t`` columns (first-6-by-eigenvalue) so the overlay
+    reflects the leading latent-information directions independent of
+    the contrast-selected ``kld_pc{i}_t`` family.
+    """
+    per_sg = _load_subgroup_csv(
+        phase1_root, subgroups, "kld_pca/kld_pc_trajectory.csv"
+    )
+    combined = _concat_with_subgroup(per_sg)
+    if combined.empty:
+        return {"status": "missing"}
+    has_top = any(
+        isinstance(c, str) and c.startswith("kld_pc_top") and c.endswith("_t")
+        for c in combined.columns
+    )
+    if not has_top:
+        return {"status": "missing_top_pc_columns"}
+    if "hours_before" not in combined.columns:
+        return {"status": "missing_hours_before"}
+    plot_kld_pc_trajectory_grid(
+        combined,
+        overlay_dir / "kld_pc_trajectory_grid_overlay.pdf",
+        n_components=6,
+        group_col="subgroup",
+        n_samples=int(combined.groupby(["guid", "epoch"]).ngroups),
+        palette=_subgroup_palette(subgroups),
+        pc_prefix="kld_pc_top",
+    )
+    return {"status": "ok", "n_subgroups": len(per_sg)}
+
+
+# ---------------------------------------------------------------------------
 # Statistical comparison
 # ---------------------------------------------------------------------------
 
@@ -958,6 +1112,22 @@ def run_cross_subgroup_breakdown(
             ),
         "kld_aggregate_violins":
             lambda: _process_kld_aggregate_violins(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_trajectory_hours":
+            lambda: _process_kld_trajectory_hours_overlay(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_segment_l2sq":
+            lambda: _process_kld_segment_l2sq_overlay(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_segment_max":
+            lambda: _process_kld_segment_max_overlay(
+                phase1_root, overlay_dir, subgroups,
+            ),
+        "kld_pc_trajectory_grid":
+            lambda: _process_kld_pc_trajectory_grid_overlay(
                 phase1_root, overlay_dir, subgroups,
             ),
         "stats":         lambda: _process_stats(phase1_root, output_dir, subgroups),

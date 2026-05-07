@@ -25,6 +25,7 @@ import pandas as pd
 from loguru import logger
 
 from model.vae_teb_prediction.testing.visualizers import (
+    COLOR_BLACK,
     COLOR_BLUE,
     COLOR_ORANGE,
     COLOR_VERMILLION,
@@ -100,6 +101,8 @@ def _emit_overlay_for_metric(
             alpha=0.4,
             label=f"{display} (n={vals.size})",
             density=True,
+            edgecolor=COLOR_BLACK,
+            linewidth=0.5,
         )
         any_data = True
     if not any_data:

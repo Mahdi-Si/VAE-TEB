@@ -27,17 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import yaml
 
-from model.vae_teb_prediction.testing.visualizers import (
-    COLOR_BLUE,
-    COLOR_GRAY,
-    COLOR_GREEN,
-    COLOR_ORANGE,
-    COLOR_PURPLE,
-    COLOR_SAGE,
-    COLOR_SKY,
-    COLOR_TEAL_DARK,
-    COLOR_VERMILLION,
-)
+from model.vae_teb_prediction.testing.visualizers import COLOR_GRAY
 
 # ---------------------------------------------------------------------------
 # Canonical subgroup identity
@@ -72,21 +62,23 @@ SUBGROUP_TO_LABEL: Dict[str, int] = {
     "hie_cs":              3,
 }
 
-#: Per-subgroup display colour. Stays within the per-class palette
-#: family (blue for healthy, orange for acidosis, vermillion for HIE)
-#: so a Phase 2 overlay reads as a refinement of the per-class story.
+#: Per-subgroup display colour. The 8 values are the **Okabe-Ito**
+#: colourblind-safe palette, ordered so outcome-family blocks stay
+#: visually grouped (healthy = cool/yellow, acidosis = warm,
+#: HIE = dark / red). Maximises pairwise separability across all 8
+#: subgroups in cross-subgroup overlays.
 SUBGROUP_COLORS: Dict[str, str] = {
-    # HEALTHY family — four blue/teal/green shades
-    "healthy_no_bg_no_cs": COLOR_BLUE,
-    "healthy_no_bg_cs":    COLOR_SKY,
-    "healthy_bg_no_cs":    COLOR_TEAL_DARK,
-    "healthy_bg_cs":       COLOR_PURPLE,
-    # ACIDOSIS family — orange + sage
-    "acidosis_no_cs":      COLOR_ORANGE,
-    "acidosis_cs":         COLOR_SAGE,
-    # HIE family — vermillion + green
-    "hie_no_cs":           COLOR_VERMILLION,
-    "hie_cs":              COLOR_GREEN,
+    # HEALTHY family — blue / sky / bluish green / yellow
+    "healthy_no_bg_no_cs": "#0072B2",   # blue
+    "healthy_no_bg_cs":    "#56B4E9",   # sky blue
+    "healthy_bg_no_cs":    "#009E73",   # bluish green
+    "healthy_bg_cs":       "#F0E442",   # yellow
+    # ACIDOSIS family — orange + reddish purple
+    "acidosis_no_cs":      "#E69F00",   # orange
+    "acidosis_cs":         "#CC79A7",   # reddish purple
+    # HIE family — vermillion + black
+    "hie_no_cs":           "#D55E00",   # vermillion
+    "hie_cs":              "#000000",   # black
 }
 
 #: Fallback colour for non-canonical / user-supplied subgroup names.

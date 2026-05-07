@@ -177,6 +177,21 @@ dataset_config:
     # when ``test_gpu_ids`` is omitted.
     test_gpu_ids: [0]
 
+    # Trajectory-analysis slim mode. When ``true``, the trajectory step
+    # (Phase 1) skips every per-GUID PDF, dashboard, recurrence plot, 3D
+    # trajectory and changepoint output, and only emits the
+    # population-level KLD-vs-time-to-delivery plots:
+    #   * trajectory/plots/kld_trajectory.pdf            (existing)
+    #   * trajectory/plots/kld_by_class.pdf              (when class_analysis)
+    #   * trajectory/plots/kld_trajectory_mean.pdf       (NEW per-segment mean)
+    #   * trajectory/plots/kld_trajectory_l2sq.pdf       (NEW per-segment ||.||_2^2)
+    #   * trajectory/plots/kld_trajectory_max.pdf        (NEW per-segment max)
+    #   * trajectory/plots/kld_pc_trajectory_grid.pdf    (NEW first 6 KLD PCs)
+    # Phase 2 cross-subgroup overlays for the same families are emitted
+    # regardless of this flag (they are CSV-driven). Default: false →
+    # full trajectory pipeline runs unchanged.
+    keep_kld_trajectory_only: false
+
     stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/stats.hdf5                    # Path to normalization stats.hdf5
 
     kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset

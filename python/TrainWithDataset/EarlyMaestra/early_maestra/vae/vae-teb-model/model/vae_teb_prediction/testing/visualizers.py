@@ -3347,6 +3347,287 @@ def plot_kld_trajectory(
     plt.close(fig)
 
 
+_KLD_METRIC_LABELS: Dict[str, str] = {
+    "kld_mean":  r"per-segment mean KLD",
+    "kld_l2sq":  r"per-segment $\|\mathrm{KLD}\|_2^2$",
+    "kld_max":   r"per-segment max KLD",
+    "kld_std":   r"per-segment std KLD",
+}
+
+
+def plot_kld_segment_summary_vs_time(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    metric_col: str,
+    title: Optional[str] = None,
+    group_col: Optional[str] = None,
+    n_samples: Optional[int] = None,
+    palette: Optional[Dict[str, str]] = None,
+) -> None:
+    r"""Per-segment KLD summary as a function of time-before-birth.
+
+    Aggregates per-(guid, epoch) rows of ``df`` (typically
+    ``trajectory/kld_trajectory_raw.csv``) into 30-minute bins along the
+    ``hours_before`` axis and plots mean $\pm$ SE for the chosen
+    ``metric_col``. The function generalises ``plot_kld_trajectory``
+    along two axes:
+
+    * ``metric_col`` — supports ``"kld_mean"``, ``"kld_l2sq"`` (squared
+      $L_2$ norm of the per-timestep KLD), ``"kld_max"`` (per-segment
+      maximum), or any other numeric column.
+    * ``group_col`` — when set (e.g. ``"label"`` for Phase 1,
+      ``"subgroup"`` for Phase 2), one line per group is rendered on the
+      same axes.
+
+    Args:
+        df: DataFrame with ``hours_before`` and ``metric_col``; may also
+            carry ``group_col``.
+        output_path: Destination PDF.
+        metric_col: Numeric column to summarise per epoch (already a
+            per-segment scalar — no further per-timestep aggregation).
+        title: Optional figure title; auto-generated if ``None``.
+        group_col: When set, render one mean $\pm$ SE line per group.
+        n_samples: Optional sample-count annotation for the title.
+        palette: Optional ``{group_value: color}`` mapping; unspecified
+            groups fall back to ``_band_color_for``.
+    """
+    if df is None or df.empty:
+        return
+    if "hours_before" not in df.columns or metric_col not in df.columns:
+        return
+
+    work = df.copy()
+    work["hour_bin"] = (work["hours_before"] * 2).round() / 2  # 30-min bins
+    work = work[work["hour_bin"].notna() & work[metric_col].notna()]
+    if work.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.6))
+
+    def _draw(sub: pd.DataFrame, color: str, label: str) -> bool:
+        grouped = sub.groupby("hour_bin")[metric_col]
+        mean = grouped.mean()
+        std = grouped.std().fillna(0.0)
+        n = grouped.count().clip(lower=1)
+        se = std / np.sqrt(n.to_numpy())
+        if mean.empty:
+            return False
+        xs = np.asarray(mean.index.to_list(), dtype=float)
+        ys = mean.to_numpy()
+        ax.plot(xs, ys, color=color, lw=1.4, marker="o", markersize=2.5,
+                markevery=max(1, len(xs) // 20), label=label)
+        ax.fill_between(xs, ys - se.to_numpy(), ys + se.to_numpy(),
+                        alpha=0.20, color=color, lw=0)
+        return True
+
+    plotted = False
+    if group_col and group_col in work.columns:
+        groups = [g for g in work[group_col].dropna().unique().tolist()
+                  if str(g) != "unknown"]
+        for g in groups:
+            sub = work[work[group_col] == g]
+            if sub.empty:
+                continue
+            color: Optional[str] = None
+            if palette is not None:
+                color = palette.get(g) or palette.get(str(g))
+            if color is None:
+                try:
+                    color = class_color_for(int(g))
+                except Exception:
+                    color = _band_color_for(str(g))
+            plotted = _draw(sub, color, str(g)) or plotted
+    else:
+        plotted = _draw(work, COLOR_BLUE, _KLD_METRIC_LABELS.get(metric_col, metric_col))
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    metric_label = _KLD_METRIC_LABELS.get(metric_col, metric_col)
+    ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL)
+    ax.set_ylabel(f"{metric_label} (mean $\\pm$ SE)", fontsize=FONT_LABEL)
+    auto_title = f"{metric_label} vs time before delivery"
+    if group_col:
+        auto_title = f"{auto_title} — by {group_col}"
+    if n_samples is not None:
+        auto_title = f"{auto_title} (n={int(n_samples)} samples)"
+    ax.set_title(title or auto_title, fontsize=FONT_TITLE, fontweight="normal", pad=6)
+    ax.invert_xaxis()
+    ax.legend(loc="best", frameon=True, fontsize=FONT_LEGEND * 0.9,
+              title=group_col if group_col else None)
+    _style_axes(ax, grid="both", minor_ticks=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_kld_pc_trajectory_grid(
+    df: pd.DataFrame,
+    output_path: Path,
+    *,
+    n_components: int = 6,
+    group_col: Optional[str] = None,
+    n_samples: Optional[int] = None,
+    palette: Optional[Dict[str, str]] = None,
+    pc_prefix: str = "kld_pc_top",
+) -> None:
+    r"""Small-multiples grid (3 $\times$ 2) of the first ``n_components`` KLD-PC
+    trajectories vs time before birth.
+
+    For each PC $i \in [1, N]$, summarises the per-(guid, epoch)
+    average of ``{pc_prefix}{i}_t`` (mean over the segment's timesteps)
+    and plots mean $\pm$ SE in 30-minute ``hours_before`` bins. When
+    ``group_col`` is set, one line per group is overlaid in each panel.
+
+    The default ``pc_prefix="kld_pc_top"`` reads the
+    first-N-by-eigenvalue PC trajectory columns emitted by
+    :func:`collect_kld_trajectory` when called with ``pca_model_top``.
+    Use ``pc_prefix="kld_pc"`` to plot the contrast-selected PCs
+    instead.
+
+    Args:
+        df: Per-(sample, timestep) trajectory dataframe. Must contain
+            ``hours_before`` and ``{pc_prefix}{i}_t`` for the chosen
+            ``i``s.
+        output_path: Destination PDF.
+        n_components: Number of PCs to render (default 6 → 3 $\times$ 2 grid).
+        group_col: Optional grouping column (``"label"`` Phase 1,
+            ``"subgroup"`` Phase 2).
+        n_samples: Optional sample-count annotation for the suptitle.
+        palette: Optional ``{group_value: color}`` mapping.
+        pc_prefix: Column-name prefix; expects ``{pc_prefix}{i}_t``.
+    """
+    if df is None or df.empty or "hours_before" not in df.columns:
+        return
+    if "guid" not in df.columns or "epoch" not in df.columns:
+        return
+
+    pc_cols = [f"{pc_prefix}{i + 1}_t" for i in range(int(n_components))
+               if f"{pc_prefix}{i + 1}_t" in df.columns]
+    if not pc_cols:
+        return
+
+    # Per-epoch summary: mean over the segment's timesteps for each PC.
+    agg_cols = pc_cols + ["hours_before"]
+    if group_col and group_col in df.columns:
+        agg_cols.append(group_col)
+    work = df[["guid", "epoch"] + agg_cols].copy()
+    work = work[work["hours_before"].notna()]
+    if work.empty:
+        return
+    group_keys: List[str] = ["guid", "epoch", "hours_before"]
+    if group_col and group_col in work.columns:
+        group_keys.append(group_col)
+    epoch_means = work.groupby(group_keys, dropna=False)[pc_cols].mean().reset_index()
+    epoch_means["hour_bin"] = (epoch_means["hours_before"] * 2).round() / 2
+    epoch_means = epoch_means[epoch_means["hour_bin"].notna()]
+    if epoch_means.empty:
+        return
+
+    n_panels = len(pc_cols)
+    n_cols = 2 if n_panels > 1 else 1
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(7.6, 2.4 * n_rows + 0.6),
+        sharex=True,
+        squeeze=False,
+    )
+
+    def _color_for(g: Any) -> str:
+        if palette is not None:
+            c = palette.get(g) or palette.get(str(g))
+            if c:
+                return c
+        try:
+            return class_color_for(int(g))
+        except Exception:
+            return _band_color_for(str(g))
+
+    panel_handles: Dict[str, Any] = {}
+    panel_labels: Dict[str, str] = {}
+
+    for k, pc_col in enumerate(pc_cols):
+        r, c = divmod(k, n_cols)
+        ax = axes[r][c]
+        plotted = False
+        if group_col and group_col in epoch_means.columns:
+            groups = [g for g in epoch_means[group_col].dropna().unique().tolist()
+                      if str(g) != "unknown"]
+            for g in groups:
+                sub = epoch_means[epoch_means[group_col] == g]
+                grouped = sub.groupby("hour_bin")[pc_col]
+                mean = grouped.mean()
+                std = grouped.std().fillna(0.0)
+                n = grouped.count().clip(lower=1)
+                se = std / np.sqrt(n.to_numpy())
+                if mean.empty:
+                    continue
+                xs = np.asarray(mean.index.to_list(), dtype=float)
+                ys = mean.to_numpy()
+                color = _color_for(g)
+                line, = ax.plot(xs, ys, color=color, lw=1.2,
+                                marker="o", markersize=2.0,
+                                markevery=max(1, len(xs) // 20), label=str(g))
+                ax.fill_between(xs, ys - se.to_numpy(), ys + se.to_numpy(),
+                                alpha=0.18, color=color, lw=0)
+                panel_handles[str(g)] = line
+                panel_labels[str(g)] = str(g)
+                plotted = True
+        else:
+            grouped = epoch_means.groupby("hour_bin")[pc_col]
+            mean = grouped.mean()
+            std = grouped.std().fillna(0.0)
+            n = grouped.count().clip(lower=1)
+            se = std / np.sqrt(n.to_numpy())
+            if not mean.empty:
+                xs = np.asarray(mean.index.to_list(), dtype=float)
+                ys = mean.to_numpy()
+                ax.plot(xs, ys, color=COLOR_BLUE, lw=1.2,
+                        marker="o", markersize=2.0,
+                        markevery=max(1, len(xs) // 20))
+                ax.fill_between(xs, ys - se.to_numpy(), ys + se.to_numpy(),
+                                alpha=0.22, color=COLOR_BLUE, lw=0)
+                plotted = True
+
+        ax.set_title(f"PC{k + 1}", fontsize=FONT_LABEL, pad=2)
+        if r == n_rows - 1:
+            ax.set_xlabel("Hours Before Birth", fontsize=FONT_LABEL * 0.9)
+        if c == 0:
+            ax.set_ylabel(f"{pc_col} (mean $\\pm$ SE)", fontsize=FONT_LABEL * 0.85)
+        ax.invert_xaxis()
+        _style_axes(ax, grid="major", minor_ticks=False)
+        if not plotted:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=FONT_LABEL * 0.85)
+
+    # Hide any unused axes in the final row.
+    for k in range(n_panels, n_rows * n_cols):
+        r, c = divmod(k, n_cols)
+        axes[r][c].set_visible(False)
+
+    if panel_handles:
+        fig.legend(
+            panel_handles.values(), panel_labels.values(),
+            loc="upper center", ncol=min(len(panel_handles), 4),
+            frameon=True, fontsize=FONT_LEGEND * 0.85,
+            title=group_col,
+            bbox_to_anchor=(0.5, 1.0),
+        )
+
+    suptitle = f"First {n_panels} KLD-PC trajectories vs time before delivery"
+    if group_col:
+        suptitle = f"{suptitle} — by {group_col}"
+    if n_samples is not None:
+        suptitle = f"{suptitle} (n={int(n_samples)} samples)"
+    fig.suptitle(suptitle, fontsize=FONT_TITLE, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.94 if panel_handles else 0.97])
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_kld_guid_trajectory(
     df: pd.DataFrame,
     output_dir: Path,
@@ -5315,9 +5596,11 @@ def plot_uplift_histogram(
     l_base = df["l_base"].to_numpy() if "l_base" in df.columns else df.get("base_mse_total", pd.Series(dtype=float)).to_numpy()
     bins = 40
     if l_full.size:
-        ax.hist(l_full, bins=bins, color=COLOR_BLUE, alpha=0.6, label="full MSE")
+        ax.hist(l_full, bins=bins, color=COLOR_BLUE, alpha=0.6, label="full MSE",
+                edgecolor=COLOR_BLACK, linewidth=0.5)
     if l_base.size:
-        ax.hist(l_base, bins=bins, color=COLOR_ORANGE, alpha=0.5, label="baseline MSE")
+        ax.hist(l_base, bins=bins, color=COLOR_ORANGE, alpha=0.5, label="baseline MSE",
+                edgecolor=COLOR_BLACK, linewidth=0.5)
     ax.set_xlabel("Per-sample MSE", fontsize=FONT_LABEL)
     ax.set_ylabel("Count", fontsize=FONT_LABEL)
     ax.legend(loc="upper right", frameon=True)
@@ -5326,7 +5609,8 @@ def plot_uplift_histogram(
     ax = axes[1]
     up = df["uplift_rel"].to_numpy() if "uplift_rel" in df.columns else np.array([])
     if up.size:
-        ax.hist(up, bins=bins, color=COLOR_GREEN, alpha=0.8)
+        ax.hist(up, bins=bins, color=COLOR_GREEN, alpha=0.8,
+                edgecolor=COLOR_BLACK, linewidth=0.5)
         ax.axvline(x=0.0, color=COLOR_BLACK, linewidth=0.8, linestyle="--")
         median = float(np.nanmedian(up))
         ax.axvline(x=median, color=COLOR_VERMILLION, linewidth=0.8, linestyle="-", label=f"median={median:.3f}")
