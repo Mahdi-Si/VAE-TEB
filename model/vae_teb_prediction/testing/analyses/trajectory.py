@@ -49,6 +49,8 @@ from model.vae_teb_prediction.testing.visualizers import (
     plot_kld_trajectory_3d,
     plot_guid_absolute_trajectory,
     plot_guid_trajectory_3d,
+    plot_kld_pc_trajectory_grid,
+    plot_kld_segment_summary_vs_time,
     plot_latent_trajectory_2d,
     plot_latent_trajectory_3d,
     plot_latent_changepoints_with_raw,
@@ -214,6 +216,7 @@ class TrajectoryAnalyzer:
         n_trajectory_samples: int = 5,
         n_kld_guid_plots: int = 12,
         kld_guid_list: Optional[List[str]] = None,
+        keep_kld_trajectory_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Run complete trajectory analysis pipeline.
@@ -237,6 +240,14 @@ class TrajectoryAnalyzer:
             n_trajectory_samples: Number of samples for 3D trajectory plots.
             n_kld_guid_plots: Number of GUIDs to plot for per-epoch KLD trends.
             kld_guid_list: Optional list of GUIDs to plot (overrides top-N selection).
+            keep_kld_trajectory_only: When ``True``, skip every per-GUID plot,
+                dashboard, recurrence, 3D, and changepoint output, and emit
+                only the population-level KLD-vs-time-to-delivery plots:
+                ``kld_trajectory.pdf`` (and ``kld_by_class.pdf`` if
+                ``class_analysis``), the three new segment-summary plots
+                (``kld_trajectory_{mean,l2sq,max}.pdf``), and the 6-panel
+                ``kld_pc_trajectory_grid.pdf``. Default ``False`` preserves
+                the legacy full pipeline.
 
         Returns:
             Dict with summary statistics and output paths.
@@ -250,6 +261,15 @@ class TrajectoryAnalyzer:
         if self.latent_df.empty:
             logger.warning("No trajectory data collected!")
             return {"status": "empty", "n_samples": 0}
+
+        # Slim mode: skip every per-GUID / changepoint / 3D output and only
+        # emit the population-level KLD-vs-time-to-delivery summaries plus
+        # the new 6-panel KLD-PC grid. The four target plots all read
+        # exclusively from ``self.epoch_df`` and (optionally) the on-disk
+        # ``kld_pca/kld_pc_trajectory.csv`` so the heavy preprocessing
+        # (dynamics, dim-reduction, changepoints, parquet) can be skipped.
+        if keep_kld_trajectory_only:
+            return self._run_kld_trajectory_only(class_analysis=class_analysis)
 
         # Step 1b: Optional latent preprocessing
         if self.preprocess_latent_trajectories:
@@ -281,6 +301,11 @@ class TrajectoryAnalyzer:
         self._plot_kld_vs_time()
         if class_analysis:
             self._plot_kld_by_class()
+        # Population-level KLD-vs-time-to-delivery summaries (mean / L2² /
+        # max) and the first-6-PC trajectory grid. Same plots emitted in
+        # slim mode; here they live alongside the legacy per-GUID outputs.
+        self._plot_kld_segment_summaries()
+        self._plot_kld_pc_trajectory_grid()
         self._plot_kld_guid_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
         self._plot_latent_space(color_by_label=class_analysis)
         self._plot_guid_absolute_trajectories(n_samples=n_kld_guid_plots, guid_list=kld_guid_list)
@@ -415,6 +440,13 @@ class TrajectoryAnalyzer:
 
                     # Per-epoch summary (excluding warmup)
                     valid_kld = kld[idx, self.warmup_steps:] if kld is not None else None
+                    if valid_kld is not None:
+                        finite_kld = valid_kld[np.isfinite(valid_kld)]
+                        kld_l2sq_val = float(np.sum(finite_kld ** 2)) if finite_kld.size else np.nan
+                        kld_max_val = float(np.max(finite_kld)) if finite_kld.size else np.nan
+                    else:
+                        kld_l2sq_val = np.nan
+                        kld_max_val = np.nan
                     epoch_rows.append({
                         "guid": guid,
                         "epoch_sec": epoch_sec,
@@ -422,6 +454,8 @@ class TrajectoryAnalyzer:
                         "label": label,
                         "kld_mean": float(np.nanmean(valid_kld)) if valid_kld is not None else np.nan,
                         "kld_std": float(np.nanstd(valid_kld)) if valid_kld is not None else np.nan,
+                        "kld_l2sq": kld_l2sq_val,
+                        "kld_max": kld_max_val,
                     })
 
                     # Store raw data for ALL epochs per GUID
@@ -849,6 +883,149 @@ class TrajectoryAnalyzer:
             metrics["n_guid_trajectories"] = len(self.guid_features_df)
 
         return metrics
+
+    # -------------------------------------------------------------------------
+    # KLD-trajectory-only (slim) mode
+    # -------------------------------------------------------------------------
+
+    def _run_kld_trajectory_only(self, *, class_analysis: bool) -> Dict[str, Any]:
+        """Slim path producing only the population-level KLD-vs-time plots.
+
+        Skips dynamics, dim-reduction, changepoints, parquet/CSV exports,
+        per-GUID PDFs, dashboards, recurrence, 3D, and animations. Emits
+        exactly:
+
+        * ``plots/kld_trajectory.pdf`` (existing pooled plot)
+        * ``plots/kld_by_class.pdf`` (when ``class_analysis`` and >1 class)
+        * ``plots/kld_trajectory_mean.pdf`` (NEW)
+        * ``plots/kld_trajectory_l2sq.pdf`` (NEW — $\\|\\mathrm{KLD}\\|_2^2$)
+        * ``plots/kld_trajectory_max.pdf`` (NEW — per-segment max)
+        * ``plots/kld_pc_trajectory_grid.pdf`` (NEW — first 6 KLD PCs)
+        """
+        plots_dir = self.output_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) Existing population-level KLD trajectory.
+        self._plot_kld_vs_time()
+        if class_analysis:
+            self._plot_kld_by_class()
+
+        # 2) New per-segment summary plots (mean / L2² / max).
+        self._plot_kld_segment_summaries()
+
+        # 3) New first-6-PC trajectory grid (reads kld_pc_trajectory.csv if
+        #    available; otherwise the panel-level no-data placeholder
+        #    surfaces from the visualizer).
+        self._plot_kld_pc_trajectory_grid()
+
+        # Minimal summary so the runner has something to log.
+        n_samples = int(len(self.latent_df))
+        n_guids = (
+            int(self.epoch_df["guid"].nunique())
+            if not self.epoch_df.empty else 0
+        )
+        n_epochs = int(len(self.epoch_df))
+        kld_mean_overall = (
+            float(self.epoch_df["kld_mean"].mean())
+            if (not self.epoch_df.empty
+                and "kld_mean" in self.epoch_df.columns) else float("nan")
+        )
+        summary: Dict[str, Any] = {
+            "mode": "keep_kld_trajectory_only",
+            "n_samples": n_samples,
+            "n_guids": n_guids,
+            "n_epochs": n_epochs,
+            "metrics": {"kld_mean": kld_mean_overall},
+            "time_range_hours": self.time_range_hours,
+        }
+        with open(self.output_dir / "summary.json", "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        logger.info(
+            f"Trajectory analysis (slim mode) complete: {n_guids} patients, "
+            f"{n_epochs} epochs"
+        )
+        return summary
+
+    def _plot_kld_segment_summaries(self) -> None:
+        """Emit ``kld_trajectory_{mean,l2sq,max}.pdf`` from ``self.epoch_df``.
+
+        Each metric is a per-(guid, epoch) scalar (computed in
+        ``_collect_data``); the visualizer 30-min-bins along
+        ``hours_before`` and shades mean $\\pm$ SE.
+        """
+        if self.epoch_df is None or self.epoch_df.empty:
+            return
+        plots_dir = self.output_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        n_samples = int(self.epoch_df.shape[0])
+        for metric_col, filename in (
+            ("kld_mean",  "kld_trajectory_mean.pdf"),
+            ("kld_l2sq",  "kld_trajectory_l2sq.pdf"),
+            ("kld_max",   "kld_trajectory_max.pdf"),
+        ):
+            if metric_col not in self.epoch_df.columns:
+                logger.debug(
+                    f"_plot_kld_segment_summaries: skipping {metric_col} "
+                    "(column not present)"
+                )
+                continue
+            try:
+                plot_kld_segment_summary_vs_time(
+                    self.epoch_df,
+                    plots_dir / filename,
+                    metric_col=metric_col,
+                    n_samples=n_samples,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"_plot_kld_segment_summaries: {filename} failed: {exc!r}"
+                )
+
+    def _plot_kld_pc_trajectory_grid(self) -> None:
+        """Emit ``kld_pc_trajectory_grid.pdf`` from ``kld_pca/kld_pc_trajectory.csv``.
+
+        The CSV is produced by ``run_kld_pca_analysis`` and carries
+        ``kld_pc_top{1..6}_t`` columns (after the
+        ``pca_model_top`` extension to :func:`collect_kld_trajectory`).
+        When the CSV does not exist (e.g. the user disabled
+        ``kld_pca``), the call is silently skipped.
+        """
+        plots_dir = self.output_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve the kld_pc_trajectory.csv path. ``self.output_dir`` for
+        # this analysis is ``<root>/trajectory/``; the kld_pca outputs
+        # live next door under ``<root>/kld_pca/``.
+        kld_pca_csv = self.output_dir.parent / "kld_pca" / "kld_pc_trajectory.csv"
+        if not kld_pca_csv.exists():
+            logger.debug(
+                f"_plot_kld_pc_trajectory_grid: {kld_pca_csv} not present; "
+                "skipping (run kld_pca first to populate it)."
+            )
+            return
+        try:
+            traj_df = pd.read_csv(kld_pca_csv)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"_plot_kld_pc_trajectory_grid: failed to read {kld_pca_csv}: {exc!r}"
+            )
+            return
+        if traj_df.empty:
+            return
+        n_samples = int(traj_df.groupby(["guid", "epoch"]).ngroups)
+        try:
+            plot_kld_pc_trajectory_grid(
+                traj_df,
+                plots_dir / "kld_pc_trajectory_grid.pdf",
+                n_components=6,
+                n_samples=n_samples,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"_plot_kld_pc_trajectory_grid: kld_pc_trajectory_grid.pdf "
+                f"failed: {exc!r}"
+            )
 
     # -------------------------------------------------------------------------
     # New methods for advanced trajectory analysis
@@ -1819,6 +1996,7 @@ def run_trajectory_analysis(
     decimation_factor: int = 16,
     changepoint_algo: str = "pelt",
     preprocess_latent_trajectories: bool = False,
+    keep_kld_trajectory_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Run complete trajectory analysis.
@@ -1887,4 +2065,5 @@ def run_trajectory_analysis(
         n_trajectory_samples=n_trajectory_samples,
         n_kld_guid_plots=n_kld_guid_plots,
         kld_guid_list=kld_guid_list,
+        keep_kld_trajectory_only=keep_kld_trajectory_only,
     )

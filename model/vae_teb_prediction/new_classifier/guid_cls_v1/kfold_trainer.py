@@ -29,6 +29,43 @@ import yaml
 from loguru import logger
 
 
+class KfoldFoldFailure(RuntimeError):
+    """One or more folds did not return ``status="ok"``.
+
+    Raised at the end of :func:`run_kfold_parallel` after results,
+    summary and metadata JSON have been persisted (and best-effort
+    aggregation has run on whatever folds did succeed). The orchestrator
+    used to silently swallow per-fold exceptions into
+    ``kfold_results.json`` and exit 0 — that masked real failures from
+    CI / shell scripts. This exception now bubbles all the way out so a
+    failing sweep produces a non-zero exit code.
+
+    Attributes:
+        failed_fold_ids: Sorted list of ints — fold ids whose status was
+            not ``"ok"``.
+        results_path: Absolute path to the per-fold ``kfold_results.json``
+            (which contains the captured ``error`` / ``traceback`` for
+            every failed fold).
+    """
+
+    def __init__(
+        self,
+        failed_fold_ids: Sequence[int],
+        results_path: Path,
+        first_traceback: str,
+    ) -> None:
+        self.failed_fold_ids = sorted(int(f) for f in failed_fold_ids)
+        self.results_path = Path(results_path)
+        msg = (
+            f"{len(self.failed_fold_ids)} fold(s) failed: "
+            f"{self.failed_fold_ids}. See {self.results_path} for full "
+            f"per-fold error/traceback."
+        )
+        if first_traceback:
+            msg += f"\n--- first failed-fold traceback (tail) ---\n{first_traceback[-2000:]}"
+        super().__init__(msg)
+
+
 def _resolve_run_dir_lazy(config: Dict[str, Any]) -> Path:
     """Build the run directory from config, mirroring precompute_latents."""
     base = Path(config["general_config"]["folders_config"]["out_dir_base"]).resolve()
@@ -156,7 +193,8 @@ def _summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         Summary dict suitable for ``kfold_summary.json``.
     """
     successes = [r for r in results if r.get("status") == "ok"]
-    failures = [r for r in results if r.get("status") != "ok"]
+    failures = [r for r in results if r.get("status") not in ("ok", "skipped")]
+    skipped = [r for r in results if r.get("status") == "skipped"]
 
     def _stats(key: str) -> Dict[str, Optional[float]]:
         vals: List[float] = []
@@ -186,6 +224,7 @@ def _summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "n_total": len(results),
         "n_successful": len(successes),
         "n_failed": len(failures),
+        "n_skipped": len(skipped),
         "metrics": {
             "val/total_loss": _stats("val/total_loss"),
             "val/macro_f1": _stats("val/macro_f1"),
@@ -196,6 +235,7 @@ def _summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "train_seconds": _stats("train_seconds"),
         "failed_fold_ids": sorted(int(r["fold_id"]) for r in failures),
+        "skipped_fold_ids": sorted(int(r["fold_id"]) for r in skipped),
     }
     return summary
 
@@ -251,6 +291,7 @@ def run_kfold_parallel(
     max_parallel: Optional[int] = None,
     sequential: bool = False,
     fold_timeout_hours: Optional[float] = None,
+    fail_fast: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run all (or selected) folds in parallel subprocesses.
 
@@ -264,11 +305,25 @@ def run_kfold_parallel(
             ``general_config.max_parallel_folds``.
         sequential: When True, force ``max_parallel=1`` (handy for debugging).
         fold_timeout_hours: Wall-clock timeout per fold.
+        fail_fast: When True, stop scheduling new folds and terminate
+            any active subprocesses as soon as a fold returns a non-ok
+            status. Per-fold ``kfold_results.json`` is still written for
+            whatever ran. The function still raises
+            :class:`KfoldFoldFailure` afterwards — fail_fast only changes
+            *whether the rest of the sweep is also run*. Default False
+            (let every fold finish, then raise once).
 
     Returns:
         List of per-fold result dicts (sorted by ``fold_id``). Also writes
         ``kfold_results.json``, ``kfold_summary.json`` and
         ``execution_metadata.json`` under the run directory.
+
+    Raises:
+        :class:`KfoldFoldFailure` after persisting results and running
+        best-effort aggregation if any fold did not return
+        ``status="ok"``. This causes the CLI / parent process to exit
+        non-zero instead of silently reporting "done" with failed folds
+        buried in JSON.
     """
     config = _load_config(config_path)
     run_dir = (
@@ -362,6 +417,29 @@ def run_kfold_parallel(
                     f"fold {fid} FAILED: {err}\n"
                     f"--- traceback (head) ---\n{tb[-2000:] if tb else '<no traceback>'}"
                 )
+                if fail_fast:
+                    logger.error(
+                        f"fail_fast=True — aborting sweep after fold {fid}; "
+                        "remaining folds will not be run."
+                    )
+                    # Record skipped folds so they show up in
+                    # ``kfold_results.json`` (and so the failed-fold list
+                    # at the end is complete).
+                    remaining = [
+                        int(rid) for rid in fold_ids
+                        if int(rid) not in results
+                    ]
+                    for skip_fid in remaining:
+                        results[int(skip_fid)] = {
+                            "fold_id": int(skip_fid),
+                            "status": "skipped",
+                            "error": (
+                                "fold not run because fail_fast aborted the "
+                                "sweep after an earlier failure"
+                            ),
+                            "physical_gpu_id": sequential_gpu,
+                        }
+                    break
     else:
         ctx = multiprocessing.get_context("spawn")
         pending: List[Tuple[int, int]] = [
@@ -370,9 +448,14 @@ def run_kfold_parallel(
         ]
         active: Dict[int, Dict[str, Any]] = {}
         timeout_seconds = fold_timeout_hours * 3600.0
+        # Set when ``fail_fast`` and the first non-ok fold result arrives.
+        # Drains ``pending`` (so we stop scheduling new folds) and
+        # terminates everything in ``active`` (so we stop wasting GPU
+        # time on folds that are about to be discarded anyway).
+        aborting = False
 
         while pending or active:
-            while pending and len(active) < max_parallel:
+            while pending and len(active) < max_parallel and not aborting:
                 fid, gpu = pending.pop(0)
                 result_queue = ctx.Queue()
                 proc = ctx.Process(
@@ -406,7 +489,28 @@ def run_kfold_parallel(
                     proc.join(timeout=1.0)
                     results[fid] = result
                     status = results[fid].get("status", "unknown")
-                    logger.info(f"fold {fid} finished with status={status}")
+                    if status == "ok":
+                        logger.info(f"fold {fid} finished with status={status}")
+                    else:
+                        # Surface the captured error + traceback to the
+                        # console — otherwise the parallel branch silently
+                        # swallows them into kfold_results.json and the user
+                        # has no idea why the fold died.
+                        err = results[fid].get("error", "<no error message>")
+                        tb = results[fid].get("traceback", "")
+                        logger.error(
+                            f"fold {fid} FAILED: {err}\n"
+                            f"--- traceback (tail) ---\n"
+                            f"{tb[-2000:] if tb else '<no traceback>'}"
+                        )
+                        if fail_fast and not aborting:
+                            aborting = True
+                            logger.error(
+                                f"fail_fast=True — aborting sweep after fold "
+                                f"{fid}; {len(pending)} pending fold(s) will "
+                                f"be skipped, {len(active) - 1} active "
+                                f"fold(s) will be terminated."
+                            )
                     result_queue.close()
                     del active[fid]
                     progressed = True
@@ -446,6 +550,44 @@ def run_kfold_parallel(
                         "error": (
                             f"fold exceeded timeout of {fold_timeout_hours:.2f} hours"
                         ),
+                        "physical_gpu_id": int(slot["gpu"]),
+                    }
+                    result_queue.close()
+                    del active[fid]
+                    progressed = True
+
+            # fail_fast bookkeeping: record any pending folds we will not
+            # run, and forcibly terminate everything still active.
+            if aborting and pending:
+                for skip_fid, skip_gpu in pending:
+                    results[int(skip_fid)] = {
+                        "fold_id": int(skip_fid),
+                        "status": "skipped",
+                        "error": (
+                            "fold not run because fail_fast aborted the sweep "
+                            "after an earlier failure"
+                        ),
+                        "physical_gpu_id": int(skip_gpu),
+                    }
+                pending.clear()
+            if aborting and active:
+                for fid in list(active.keys()):
+                    slot = active[fid]
+                    proc = slot["process"]
+                    result_queue = slot["queue"]
+                    logger.error(
+                        f"fail_fast: terminating active fold {fid} "
+                        f"(physical GPU {slot['gpu']})"
+                    )
+                    proc.terminate()
+                    proc.join(timeout=10.0)
+                    if proc.is_alive():  # pragma: no cover - defensive
+                        proc.kill()
+                        proc.join(timeout=5.0)
+                    results[fid] = {
+                        "fold_id": fid,
+                        "status": "failed",
+                        "error": "fold terminated by fail_fast abort",
                         "physical_gpu_id": int(slot["gpu"]),
                     }
                     result_queue.close()
@@ -506,6 +648,25 @@ def run_kfold_parallel(
         f"k-fold sweep done in {(finished - started).total_seconds():.1f}s; "
         f"results -> {run_dir / 'kfold_results.json'}"
     )
+
+    # Fail loudly if any fold did not return status="ok". Per-fold
+    # results, summary and aggregation have already been persisted, so
+    # raising here only changes the *exit code* — partial outputs are
+    # still on disk for the user to inspect. Without this raise, the
+    # CLI would exit 0 even with every fold failed, which masks the
+    # failure from CI and shell scripts.
+    failed = [r for r in ordered if r.get("status") != "ok"]
+    if failed:
+        first_tb = next(
+            (str(r.get("traceback", "")) for r in failed if r.get("traceback")),
+            "",
+        )
+        raise KfoldFoldFailure(
+            failed_fold_ids=[int(r["fold_id"]) for r in failed],
+            results_path=run_dir / "kfold_results.json",
+            first_traceback=first_tb,
+        )
+
     return ordered
 
 
@@ -578,21 +739,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="Per-fold wall-clock timeout (defaults to general_config.fold_timeout_hours)",
     )
-    args = parser.parse_args(argv)
-
-    run_kfold_parallel(
-        config_path=args.config,
-        output_dir_override=args.output_dir,
-        fold_ids=args.fold_ids,
-        cuda_devices=args.cuda_devices,
-        max_parallel=args.max_parallel,
-        sequential=bool(args.sequential),
-        fold_timeout_hours=(
-            float(args.fold_timeout_hours)
-            if args.fold_timeout_hours is not None
-            else None
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help=(
+            "Abort the sweep as soon as any fold fails (terminate active "
+            "subprocesses, skip pending folds). Default: let every fold "
+            "finish, then raise once at the end."
         ),
     )
+    args = parser.parse_args(argv)
+
+    try:
+        run_kfold_parallel(
+            config_path=args.config,
+            output_dir_override=args.output_dir,
+            fold_ids=args.fold_ids,
+            cuda_devices=args.cuda_devices,
+            max_parallel=args.max_parallel,
+            sequential=bool(args.sequential),
+            fold_timeout_hours=(
+                float(args.fold_timeout_hours)
+                if args.fold_timeout_hours is not None
+                else None
+            ),
+            fail_fast=bool(args.fail_fast),
+        )
+    except KfoldFoldFailure as exc:
+        # The exception has already logged everything that matters
+        # (per-fold tracebacks, summary). Print the final fault summary
+        # and exit non-zero so CI / shell scripts pick up the failure.
+        logger.error(str(exc))
+        return 1
     return 0
 
 

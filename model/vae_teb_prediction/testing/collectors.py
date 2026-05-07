@@ -726,6 +726,7 @@ def collect_kld_trajectory(
     max_samples: Optional[int] = None,
     *,
     pca_model: Any = None,
+    pca_model_top: Any = None,
 ) -> pd.DataFrame:
     """Collect per-timestep KL trajectory records for every sample.
 
@@ -743,7 +744,17 @@ def collect_kld_trajectory(
     KL is recomputed on the fly and projected through the model. The
     resulting per-time scores land in extra columns ``kld_pc1_t``,
     ``kld_pc2_t``, ``kld_pc3_t`` (or as many components as the model
-    has).
+    has). These typically reflect the **contrast-selected** PCs (rows
+    of ``components.npy`` indexed by ``selection.json``).
+
+    When ``pca_model_top`` is supplied, the per-dim KL is projected
+    through that second model and emitted under
+    ``kld_pc_top1_t``, ``kld_pc_top2_t``, ... — used for the
+    "first-N-by-eigenvalue" trajectory view (orthogonal to the
+    contrast-selection view).
+
+    Both projections share a single inference pass; pass either or
+    both, or neither.
 
     Args:
         runner: :class:`TestRunner` with a loaded model.
@@ -751,7 +762,10 @@ def collect_kld_trajectory(
         max_samples: Maximum samples to process (None = all).
         pca_model: Optional fitted sklearn ``PCA`` whose components live
             in the per-dim-KL space ``(n_components, d_z)``. When None,
-            no PC trajectory columns are emitted.
+            no ``kld_pc{i}_t`` columns are emitted.
+        pca_model_top: Optional second fitted PCA (typically the first
+            N PCs by eigenvalue). When set, emits ``kld_pc_top{i}_t``
+            columns alongside the selected-PC columns.
 
     Returns:
         DataFrame with per-(sample, timestep) rows.
@@ -762,6 +776,9 @@ def collect_kld_trajectory(
     n_pcs = 0
     if pca_model is not None:
         n_pcs = int(getattr(pca_model, "n_components_", 0))
+    n_pcs_top = 0
+    if pca_model_top is not None:
+        n_pcs_top = int(getattr(pca_model_top, "n_components_", 0))
 
     with runner.inference_mode():
         for batch in runner.iter_batches(loader, max_samples):
@@ -793,9 +810,10 @@ def collect_kld_trajectory(
                     kld_sum_t_f[:, :warmup] = float("nan")
                     kld_l2_t_f[:, :warmup] = float("nan")
 
-            # Optional: per-time per-dim KL projected through PCA.
+            # Optional: per-time per-dim KL projected through PCA(s).
             pc_traj_np: Optional[np.ndarray] = None
-            if n_pcs > 0 and all(
+            pc_traj_top_np: Optional[np.ndarray] = None
+            if (n_pcs > 0 or n_pcs_top > 0) and all(
                 k in outputs
                 for k in ("mu_prior", "logvar_prior", "mu_post", "logvar_post")
             ):
@@ -810,7 +828,10 @@ def collect_kld_trajectory(
                 if warmup > 0 and warmup < T:
                     arr = arr.copy()
                     arr[:, :warmup, :] = np.nan
-                pc_traj_np = project_kld_per_dim(arr, pca_model)
+                if n_pcs > 0:
+                    pc_traj_np = project_kld_per_dim(arr, pca_model)
+                if n_pcs_top > 0:
+                    pc_traj_top_np = project_kld_per_dim(arr, pca_model_top)
 
             for idx in range(batch_size):
                 if max_samples and processed >= max_samples:
@@ -836,6 +857,7 @@ def collect_kld_trajectory(
                 )
                 latent_vals = latent[idx].cpu().numpy() if latent is not None else None
                 pc_vals = pc_traj_np[idx] if pc_traj_np is not None else None
+                pc_top_vals = pc_traj_top_np[idx] if pc_traj_top_np is not None else None
 
                 for t in range(T):
                     v = kld_vals[t]
@@ -861,6 +883,9 @@ def collect_kld_trajectory(
                     if pc_vals is not None:
                         for k in range(pc_vals.shape[1]):
                             record[f"kld_pc{k + 1}_t"] = float(pc_vals[t, k])
+                    if pc_top_vals is not None:
+                        for k in range(pc_top_vals.shape[1]):
+                            record[f"kld_pc_top{k + 1}_t"] = float(pc_top_vals[t, k])
                     records.append(record)
 
                 processed += 1

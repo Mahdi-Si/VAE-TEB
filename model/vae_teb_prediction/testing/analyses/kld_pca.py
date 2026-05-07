@@ -310,9 +310,21 @@ def run_kld_pca_analysis(
         _plot_pc12_scatter_by_class(metrics_df, output_dir / "pc12_scatter_by_class.pdf")
 
     # Per-time per-class trajectories.
+    # Two PCA projections share a single inference pass:
+    #   * `pca_model` — contrast-selected PCs → kld_pc{i}_t (legacy semantics).
+    #   * `pca_model_top6` — first-6-by-eigenvalue PCs → kld_pc_top{i}_t,
+    #     used by `plot_kld_pc_trajectory_grid` to expose the leading
+    #     latent-information directions independent of class contrast.
     pca_model = _build_subset_pca_model(artifacts, selected_indices)
+    components_full = np.asarray(artifacts["components"], dtype=np.float32)
+    n_top = int(min(6, components_full.shape[0]))
+    top_indices = np.arange(n_top, dtype=int)
+    pca_model_top6 = _build_subset_pca_model(artifacts, top_indices)
     traj_df = collect_kld_trajectory(
-        runner, loader, max_samples=max_samples, pca_model=pca_model
+        runner, loader,
+        max_samples=max_samples,
+        pca_model=pca_model,
+        pca_model_top=pca_model_top6,
     )
     if not traj_df.empty:
         traj_csv = output_dir / "kld_pc_trajectory.csv"

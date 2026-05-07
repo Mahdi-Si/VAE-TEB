@@ -159,6 +159,7 @@ def run_full_test_pipeline(
     skip_up_effect: bool = False,
     skip_frequency_band: bool = False,
     single_class_mode: bool = False,
+    keep_kld_trajectory_only: bool = False,
 ) -> Dict[str, Any]:
     """Run the full lag-attn v1 testing pipeline end-to-end.
 
@@ -804,6 +805,7 @@ def run_full_test_pipeline(
             runner, guid_loader,
             time_range_hours=12.0,
             min_epochs_per_guid=min_epochs_per_guid,
+            keep_kld_trajectory_only=keep_kld_trajectory_only,
         )
 
     # 14. Sample diagnostics (gated).
@@ -902,6 +904,7 @@ def run_full_test_pipeline_by_subgroup(
     skip_phase2: bool = False,
     only_subgroups: Optional[Sequence[str]] = None,
     gpu_ids: Optional[Sequence[int]] = None,
+    keep_kld_trajectory_only: bool = False,
 ) -> Dict[str, Any]:
     """Run the testing pipeline per outcome subgroup, then compare cross-subgroup.
 
@@ -1108,6 +1111,7 @@ def run_full_test_pipeline_by_subgroup(
             skip_up_effect=skip_up_effect,
             skip_frequency_band=skip_frequency_band,
             single_class_mode=True,
+            keep_kld_trajectory_only=keep_kld_trajectory_only,
         )
 
         with ProcessPoolExecutor(
@@ -1196,6 +1200,7 @@ def run_full_test_pipeline_by_subgroup(
                     skip_up_effect=skip_up_effect,
                     skip_frequency_band=skip_frequency_band,
                     single_class_mode=True,
+                    keep_kld_trajectory_only=keep_kld_trajectory_only,
                 )
                 logger.info(f"# Phase 1 subgroup {sg_name!r} complete.")
             except Exception as exc:  # noqa: BLE001
@@ -1621,6 +1626,9 @@ if __name__ == "__main__":
         # ``run_full_test_pipeline_by_subgroup`` runs each subgroup on
         # its own GPU via a process pool; with $\le 1$ entry the
         # original sequential loop is used.
+        # Also read ``dataset_config.keep_kld_trajectory_only`` (default
+        # ``False``) so the YAML drives the trajectory-slim-mode flag.
+        _keep_kld_trajectory_only = False
         try:
             with open(CONFIG, "r", encoding="utf-8") as _fh:
                 _cfg = yaml.safe_load(_fh) or {}
@@ -1634,6 +1642,15 @@ if __name__ == "__main__":
                 logger.info(
                     f"__main__: resolved Phase 1 gpu_ids={_gpu_ids} "
                     f"from config."
+                )
+            _keep_kld_trajectory_only = bool(
+                _ds_cfg.get("keep_kld_trajectory_only", False)
+            )
+            if _keep_kld_trajectory_only:
+                logger.info(
+                    "__main__: keep_kld_trajectory_only=True — trajectory "
+                    "step will emit only the population-level KLD-vs-time "
+                    "plots."
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -1656,6 +1673,7 @@ if __name__ == "__main__":
             max_samples=None,
             analysis_samples=400,
             gpu_ids=_gpu_ids,
+            keep_kld_trajectory_only=_keep_kld_trajectory_only,
         )
     else:
         logger.info(
@@ -1669,6 +1687,7 @@ if __name__ == "__main__":
             config_path=CONFIG,
             max_samples=None,
             analysis_samples=400,
+            keep_kld_trajectory_only=_keep_kld_trajectory_only,
         )
 
     # Headline summary (single-pass results only — Phase 1 results live
