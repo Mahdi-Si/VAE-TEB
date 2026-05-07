@@ -23,6 +23,7 @@ inside a ``ProcessPoolExecutor`` subprocess.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,8 +61,10 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.losses import (
     estimate_class_weights_bin,
 )
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.precompute_latents import (
+    _file_signature,
     _resolve_run_dir,
     build_vae_from_config,
+    compute_checkpoint_sha256,
     get_fold_partition_files,
     precompute_fold_latents,
 )
@@ -285,6 +288,184 @@ def _resolve_paths(
     return run_dir, fold_dir
 
 
+def _latent_stats_cache_dir(config: Dict[str, Any]) -> Path:
+    """Resolve the shared latent-stats cache directory.
+
+    Lives outside the per-run output directory so the cache survives
+    re-runs of the same experiment tag (the cost of computing
+    ``fit_latent_stats`` is identical across re-runs as long as the
+    inputs match — checkpoint, train file partition, window, etc.).
+    """
+    base = Path(config["general_config"]["folders_config"]["out_dir_base"]).resolve()
+    return base / "_latent_stats_cache"
+
+
+def _latent_stats_cache_key(
+    *,
+    config: Dict[str, Any],
+    fold_id: int,
+    train_files: Sequence[str],
+    vae_checkpoint_sha: str,
+) -> str:
+    """SHA256 over every input that determines the running stats output.
+
+    Mirrors the cache-input-signature philosophy of
+    :func:`precompute_latents.build_cache_input_summary`. Any change to
+    the train file set, normalization config, window, VAE weights, VAE
+    architecture, chunk size, or batch cap invalidates the cache.
+    """
+    payload = {
+        "fold_id": int(fold_id),
+        "vae_checkpoint_sha256": str(vae_checkpoint_sha),
+        "vae_model_kwargs": dict(config.get("vae", {}).get("model_kwargs", {}) or {}),
+        "vae_chunk_size": int(config.get("vae", {}).get("vae_chunk_size", 32)),
+        "fit_latent_stats_max_batches": config.get("vae", {}).get(
+            "fit_latent_stats_max_batches"
+        ),
+        "dataset": {
+            "epoch_min": config.get("dataset_config", {}).get("epoch_min"),
+            "epoch_max_rule": config.get("dataset_config", {}).get(
+                "epoch_max_rule", "cross_delivery"
+            ),
+            "trim_minutes": float(
+                config.get("dataset_config", {}).get("trim_minutes", 1.0)
+            ),
+            "normalize_fields": list(
+                config.get("dataset_config", {}).get("normalize_fields") or []
+            ),
+            "stats_file": _file_signature(
+                config.get("dataset_config", {}).get("stats_path")
+            ),
+            "train_files": [_file_signature(p) for p in train_files],
+        },
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _load_or_fit_latent_stats(
+    vae_module: Any,
+    *,
+    train_underlying: Any,
+    config: Dict[str, Any],
+    fold_id: int,
+    train_files: Sequence[str],
+    device: torch.device,
+) -> int:
+    """Cache-aware wrapper around :meth:`vae.fit_latent_stats`.
+
+    On a cache hit, the persisted ``(mean, var, count)`` tensors are
+    copied straight into the VAE's running buffers and the expensive
+    encoder pass is skipped. On a miss, the function calls
+    ``fit_latent_stats`` as usual and persists the result.
+
+    The cache key is computed from every input that affects the result;
+    any change invalidates it. Misuse-resistant: a corrupted / unreadable
+    cache file falls back to recomputation rather than failing.
+
+    Args:
+        vae_module: The :class:`SeqVaeLagAttnV1` instance whose running
+            buffers will be populated.
+        train_underlying: The raw segment view of the train dataset
+            (passed straight to :class:`DataLoader`; same object the
+            previous direct call used).
+        config: Parsed YAML config.
+        fold_id: Fold id (folded into the cache key).
+        train_files: List of HDF5 paths that make up the train partition.
+        device: Compute device.
+
+    Returns:
+        Number of segment-position samples used for the stats fit
+        (matches the legacy :meth:`fit_latent_stats` return).
+    """
+    from hdf5_dataset.hdf5_dataset import attribute_dict_collate  # noqa: WPS433
+
+    vae_ckpt_path = str(Path(config["vae"]["checkpoint"]).resolve())
+    try:
+        vae_ckpt_sha = compute_checkpoint_sha256(vae_ckpt_path)
+    except Exception as exc:
+        logger.warning(
+            f"[fold {fold_id}] could not hash VAE checkpoint for cache key "
+            f"({exc}); skipping latent-stats cache for this fold."
+        )
+        vae_ckpt_sha = ""
+
+    cache_key = _latent_stats_cache_key(
+        config=config,
+        fold_id=fold_id,
+        train_files=train_files,
+        vae_checkpoint_sha=vae_ckpt_sha,
+    )
+    cache_dir = _latent_stats_cache_dir(config)
+    cache_file = cache_dir / f"{cache_key}.npz"
+
+    if vae_ckpt_sha and cache_file.exists():
+        try:
+            payload = np.load(str(cache_file))
+            mean_t = torch.from_numpy(np.asarray(payload["mean"]))
+            var_t = torch.from_numpy(np.asarray(payload["var"]))
+            count_val = int(np.asarray(payload["count"]).item())
+            with torch.no_grad():
+                vae_module.mu_post_running_mean.copy_(
+                    mean_t.to(vae_module.mu_post_running_mean.device)
+                )
+                vae_module.mu_post_running_var.copy_(
+                    var_t.to(vae_module.mu_post_running_var.device)
+                )
+                vae_module.mu_post_running_count.copy_(
+                    torch.tensor(
+                        count_val,
+                        dtype=vae_module.mu_post_running_count.dtype,
+                        device=vae_module.mu_post_running_count.device,
+                    )
+                )
+            logger.info(
+                f"[fold {fold_id}] vae.fit_latent_stats: loaded from cache "
+                f"({cache_file.name}, n={count_val})"
+            )
+            return count_val
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                f"[fold {fold_id}] latent-stats cache read failed "
+                f"({cache_file.name}: {exc}); recomputing."
+            )
+
+    stats_loader = DataLoader(
+        train_underlying,
+        batch_size=int(config["vae"].get("vae_chunk_size", 32)),
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+        collate_fn=attribute_dict_collate,
+    )
+    n_stats = vae_module.fit_latent_stats(
+        stats_loader,
+        max_batches=config["vae"].get("fit_latent_stats_max_batches"),
+        device=device,
+    )
+
+    if vae_ckpt_sha:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                str(cache_file),
+                mean=vae_module.mu_post_running_mean.detach().cpu().numpy(),
+                var=vae_module.mu_post_running_var.detach().cpu().numpy(),
+                count=np.int64(n_stats),
+            )
+            logger.info(
+                f"[fold {fold_id}] vae.fit_latent_stats: wrote cache "
+                f"({cache_file.name}, n={n_stats})"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                f"[fold {fold_id}] latent-stats cache write failed "
+                f"({cache_file}: {exc})"
+            )
+
+    return n_stats
+
+
 def train_fold(
     *,
     fold_id: int,
@@ -451,19 +632,20 @@ def train_fold(
         # Latent stats: populate vae.mu_post_running_{mean,var,count} once
         # so the live tokenizer can z-score mu_post / mu_prior with the
         # same stats the precompute path bakes into the cache attrs.
+        #
+        # ``_load_or_fit_latent_stats`` checks a content-addressed cache
+        # under ``out_dir_base/_latent_stats_cache/`` and only calls the
+        # expensive encoder pass on a miss. The default
+        # ``vae.fit_latent_stats_max_batches`` (500) caps the pass so even
+        # a cold cache finishes in seconds rather than minutes — running
+        # mean/var on a d_z=24 vector converges within ~200 batches.
         # ------------------------------------------------------------------
-        from hdf5_dataset.hdf5_dataset import attribute_dict_collate  # noqa: WPS433
-        stats_loader = DataLoader(
-            train_ds._underlying,                           # raw segment view
-            batch_size=int(config["vae"].get("vae_chunk_size", 32)),
-            shuffle=False,
-            drop_last=False,
-            num_workers=0,
-            collate_fn=attribute_dict_collate,
-        )
-        n_stats = vae_module.fit_latent_stats(
-            stats_loader,
-            max_batches=config["vae"].get("fit_latent_stats_max_batches"),
+        n_stats = _load_or_fit_latent_stats(
+            vae_module,
+            train_underlying=train_ds._underlying,
+            config=config,
+            fold_id=fold_id,
+            train_files=train_files,
             device=device,
         )
         logger.info(
