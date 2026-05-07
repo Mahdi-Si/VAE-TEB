@@ -3055,7 +3055,8 @@ def plot_subgroup_analysis(
     metric_type: str,
     subgroup_filters: Dict[str, callable],
     output_dir: Path,
-    title_suffix: str = ""
+    title_suffix: str = "",
+    decision_time_hours: Optional[float] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Generate plots comparing metrics across subgroups for a specific metric type.
@@ -3067,6 +3068,10 @@ def plot_subgroup_analysis(
         subgroup_filters: Dictionary of subgroup_name -> filter_function
         output_dir: Directory to save subgroup plots
         title_suffix: Additional suffix for titles
+        decision_time_hours: When provided, every subgroup time-axis plot
+            gets a dashed vertical reference line at that x value (so the
+            operating point used for threshold search is visually obvious
+            on each panel). Mirrors the per-class plotters' behaviour.
 
     Returns:
         Dictionary mapping subgroup_name -> metrics DataFrame
@@ -3106,10 +3111,10 @@ def plot_subgroup_analysis(
         return {}
 
     # Create comparison plots by category
-    _plot_diagnosis_comparison(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
-    _plot_cs_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
-    _plot_bg_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
-    _plot_healthy_subgroups(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts)
+    _plot_diagnosis_comparison(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts, decision_time_hours=decision_time_hours)
+    _plot_cs_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts, decision_time_hours=decision_time_hours)
+    _plot_bg_stratification(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts, decision_time_hours=decision_time_hours)
+    _plot_healthy_subgroups(subgroup_metrics, metric_type, output_dir, title_suffix, subgroup_guid_counts=subgroup_guid_counts, decision_time_hours=decision_time_hours)
 
     logger.info(f"Subgroup analysis plots generated for {metric_type}")
     return subgroup_metrics
@@ -3120,7 +3125,8 @@ def _plot_diagnosis_comparison(
     metric_type: str,
     output_dir: Path,
     title_suffix: str,
-    subgroup_guid_counts: Optional[Dict[str, int]] = None
+    subgroup_guid_counts: Optional[Dict[str, int]] = None,
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """Plot comparison of basic diagnosis subgroups (healthy, acidosis, hie, unhealthy)."""
     import matplotlib.pyplot as plt
@@ -3154,6 +3160,7 @@ def _plot_diagnosis_comparison(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "diagnosis_comparison.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -3165,7 +3172,8 @@ def _plot_cs_stratification(
     metric_type: str,
     output_dir: Path,
     title_suffix: str,
-    subgroup_guid_counts: Optional[Dict[str, int]] = None
+    subgroup_guid_counts: Optional[Dict[str, int]] = None,
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """Plot CS stratification for unhealthy, HIE, and Acidosis separately."""
     import matplotlib.pyplot as plt
@@ -3206,6 +3214,7 @@ def _plot_cs_stratification(
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
         ax.invert_xaxis()
+        annotate_decision_time(ax, decision_time_hours=decision_time_hours)
         plt.tight_layout()
         filename = f"{groups[0].rsplit('_', 2)[0]}_cs_stratification.png"
         plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
@@ -3218,7 +3227,8 @@ def _plot_bg_stratification(
     metric_type: str,
     output_dir: Path,
     title_suffix: str,
-    subgroup_guid_counts: Optional[Dict[str, int]] = None
+    subgroup_guid_counts: Optional[Dict[str, int]] = None,
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """Plot BG stratification for Acidosis only (all HIE are bg_positive)."""
     import matplotlib.pyplot as plt
@@ -3254,6 +3264,7 @@ def _plot_bg_stratification(
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
     ax.invert_xaxis()
+    annotate_decision_time(ax, decision_time_hours=decision_time_hours)
     plt.tight_layout()
     plt.savefig(output_dir / "acidosis_bg_stratification.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -3265,7 +3276,8 @@ def _plot_healthy_subgroups(
     metric_type: str,
     output_dir: Path,
     title_suffix: str,
-    subgroup_guid_counts: Optional[Dict[str, int]] = None
+    subgroup_guid_counts: Optional[Dict[str, int]] = None,
+    decision_time_hours: Optional[float] = None,
 ) -> None:
     """
     Plot healthy subgroup stratifications (CS, BG, and combinations).
@@ -3307,6 +3319,7 @@ def _plot_healthy_subgroups(
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
         ax.invert_xaxis()
+        annotate_decision_time(ax, decision_time_hours=decision_time_hours)
         plt.tight_layout()
         plt.savefig(output_dir / "healthy_cs_stratification.png", dpi=150, bbox_inches='tight')
         plt.close()
@@ -3343,6 +3356,7 @@ def _plot_healthy_subgroups(
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
         ax.invert_xaxis()
+        annotate_decision_time(ax, decision_time_hours=decision_time_hours)
         plt.tight_layout()
         plt.savefig(output_dir / "healthy_bg_stratification.png", dpi=150, bbox_inches='tight')
         plt.close()
@@ -3379,6 +3393,7 @@ def _plot_healthy_subgroups(
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
         ax.invert_xaxis()
+        annotate_decision_time(ax, decision_time_hours=decision_time_hours)
         plt.tight_layout()
         plt.savefig(output_dir / "healthy_bg_cs_combinations.png", dpi=150, bbox_inches='tight')
         plt.close()
