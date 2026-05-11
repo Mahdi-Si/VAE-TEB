@@ -34,6 +34,7 @@ if str(project_root) not in sys.path:
 from model.vae_teb_prediction.testing.analyses import (
     run_anchor_position_analysis,
     run_attention_diagnostics,
+    run_causal_te_validation,
     run_class_separation_analysis,
     run_dataset_stats_analysis,
     run_encoder_probe,
@@ -158,6 +159,7 @@ def run_full_test_pipeline(
     dataset_kwargs: Optional[Dict[str, Any]] = None,
     skip_up_effect: bool = False,
     skip_frequency_band: bool = False,
+    skip_causal_te: bool = False,
     single_class_mode: bool = False,
     keep_kld_trajectory_only: bool = False,
 ) -> Dict[str, Any]:
@@ -859,6 +861,22 @@ def run_full_test_pipeline(
             runner.output_dir,
         )
 
+    # 14e. Causal-TE validation suite. Runs after every other analysis so
+    # the CSV-driven Tests 1, 2, 3, 9 can read upstream artifacts; Tests 4
+    # and 10 share a single ``collect_predictions`` pass capped at the
+    # ``HEAVY_PRED_CAP`` ceiling. Skipped via ``skip_causal_te=True``.
+    if not skip_causal_te:
+        _step(
+            "causal_te_validation",
+            run_causal_te_validation,
+            runner, standard_loader,
+            output_dir=Path(output_dir_resolved) / "causal_te_validation",
+            max_samples=HEAVY_PRED_CAP,
+            histogram_csv=Path(output_dir_resolved) / "histograms" / "histogram_metrics.csv",
+            up_effect_dir=Path(output_dir_resolved) / "up_effect",
+            band_forecast_dir=Path(output_dir_resolved) / "frequency_band_forecast",
+        )
+
     # 15. Interactive metrics comparison.
     if not skip_interactive and isinstance(results.get("histogram"), object):
         try:
@@ -901,6 +919,7 @@ def run_full_test_pipeline_by_subgroup(
     dataset_kwargs: Optional[Dict[str, Any]] = None,
     skip_up_effect: bool = False,
     skip_frequency_band: bool = False,
+    skip_causal_te: bool = False,
     skip_phase2: bool = False,
     only_subgroups: Optional[Sequence[str]] = None,
     gpu_ids: Optional[Sequence[int]] = None,
@@ -1110,6 +1129,7 @@ def run_full_test_pipeline_by_subgroup(
             ),
             skip_up_effect=skip_up_effect,
             skip_frequency_band=skip_frequency_band,
+            skip_causal_te=skip_causal_te,
             single_class_mode=True,
             keep_kld_trajectory_only=keep_kld_trajectory_only,
         )
@@ -1199,6 +1219,7 @@ def run_full_test_pipeline_by_subgroup(
                     dataset_kwargs=dataset_kwargs,
                     skip_up_effect=skip_up_effect,
                     skip_frequency_band=skip_frequency_band,
+                    skip_causal_te=skip_causal_te,
                     single_class_mode=True,
                     keep_kld_trajectory_only=keep_kld_trajectory_only,
                 )
