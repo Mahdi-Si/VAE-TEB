@@ -84,6 +84,9 @@ from model.vae_teb_prediction.testing.analyses.subgroup_utils import (
 from model.vae_teb_prediction.testing.analyses.cross_subgroup_breakdown import (
     run_cross_subgroup_breakdown,
 )
+from model.vae_teb_prediction.testing.causal_te_validation import (
+    run_causal_te_validation,
+)
 
 # Latent / trajectory / class-separation analyses.
 from model.vae_teb_prediction.testing.analyses.latent import (

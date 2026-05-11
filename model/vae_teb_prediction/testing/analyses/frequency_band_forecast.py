@@ -244,7 +244,7 @@ def _summarise_partition(
         sub = per_sample_df[per_sample_df["band"] == label]
         if sub.empty:
             continue
-        by_label[label] = {
+        entry: Dict[str, Any] = {
             "n_samples": int(len(sub)),
             "n_channels": int(n_channels_by_label.get(label, 0)),
             "mean_mse": float(np.nanmean(sub["mse_total"].to_numpy())),
@@ -252,6 +252,14 @@ def _summarise_partition(
             "mean_r2": float(np.nanmean(sub["r2_total"].to_numpy())),
             "median_r2": float(np.nanmedian(sub["r2_total"].to_numpy())),
         }
+        if "mse_base" in sub.columns:
+            entry["mean_mse_base"] = float(np.nanmean(sub["mse_base"].to_numpy()))
+        if "uplift_abs" in sub.columns:
+            entry["mean_uplift_abs"] = float(np.nanmean(sub["uplift_abs"].to_numpy()))
+        if "uplift_rel" in sub.columns:
+            entry["mean_uplift_rel"] = float(np.nanmean(sub["uplift_rel"].to_numpy()))
+            entry["median_uplift_rel"] = float(np.nanmedian(sub["uplift_rel"].to_numpy()))
+        by_label[label] = entry
 
     by_label_and_class: Dict[str, Dict[str, Any]] = {}
     classes = unique_labels_in(per_sample_df.get("label"))
@@ -410,19 +418,34 @@ def run_frequency_band_forecast_analysis(
             y_plus = runner.build_future_target(batch)
             warmup = int(runner.warmup_steps)
 
-            # Per-partition band metrics.
+            # Per-partition band metrics for ``mu_full`` (the headline forecast)
+            # and ``mu_base`` (the FHR-only baseline). Pairing them lets us
+            # derive per-band uplift, which the causal-TE validation Test 3
+            # uses to regress band-level forecast gain on the bottleneck
+            # information $K_i$. The two calls share the same valid-anchor
+            # slice and channel index lists, so the cost is roughly one extra
+            # squared-error reduction per partition (~10 GPU ops per band).
             partition_metrics: Dict[
+                str, Dict[str, Dict[str, Any]],
+            ] = {}
+            partition_metrics_base: Dict[
                 str, Dict[str, Dict[str, Any]],
             ] = {}
             for pname in _PARTITION_NAMES:
                 idx = partition_idx_by_partition[pname]
                 if not idx:
                     partition_metrics[pname] = {}
+                    partition_metrics_base[pname] = {}
                     continue
                 partition_metrics[pname] = compute_band_forecast_metrics(
                     outputs["mu_full"], y_plus,
                     runner.warmup_steps, runner.horizon,
                     partition_idx=idx, return_per_anchor=True,
+                )
+                partition_metrics_base[pname] = compute_band_forecast_metrics(
+                    outputs["mu_base"], y_plus,
+                    runner.warmup_steps, runner.horizon,
+                    partition_idx=idx, return_per_anchor=False,
                 )
 
             # Per-channel metrics (single call, reused across plots / CSV).
@@ -484,6 +507,7 @@ def run_frequency_band_forecast_analysis(
                     ) for label in non_empty
                 }
                 bucket_metrics = partition_metrics[pname]
+                bucket_metrics_base = partition_metrics_base[pname]
                 for label in non_empty:
                     if label not in bucket_metrics:
                         continue
@@ -495,16 +519,35 @@ def run_frequency_band_forecast_analysis(
                         m["mse_per_anchor"].detach().cpu().numpy()
                         if "mse_per_anchor" in m else None
                     )
+                    # Baseline-forecast band MSE for per-band uplift derivation.
+                    mb = bucket_metrics_base.get(label)
+                    if mb is not None and "mse_total" in mb:
+                        mse_base_total = mb["mse_total"].detach().cpu().numpy()
+                    else:
+                        mse_base_total = None
                     n_ch = n_channels_by_label[label]
 
                     for idx_local, meta in enumerate(sample_meta):
                         if idx_local >= mse_total.shape[0]:
                             break
+                        full_v = float(mse_total[idx_local])
+                        if mse_base_total is not None and idx_local < mse_base_total.shape[0]:
+                            base_v = float(mse_base_total[idx_local])
+                            uplift_abs_v = base_v - full_v
+                            denom = max(base_v, 1e-12)
+                            uplift_rel_v = uplift_abs_v / denom
+                        else:
+                            base_v = float("nan")
+                            uplift_abs_v = float("nan")
+                            uplift_rel_v = float("nan")
                         per_sample_rows[pname].append({
                             **meta,
                             "band": label,
                             "n_channels": n_ch,
-                            "mse_total": float(mse_total[idx_local]),
+                            "mse_total": full_v,
+                            "mse_base": base_v,
+                            "uplift_abs": uplift_abs_v,
+                            "uplift_rel": uplift_rel_v,
                             "r2_total": float(r2_total[idx_local]),
                         })
                         for h in range(mse_per_horizon.shape[1]):

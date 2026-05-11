@@ -730,6 +730,75 @@ including per-band overlays
 `frequency_band_mse_by_band_overlay.pdf` bar plot. Runs after all
 other analyses so the input CSVs exist.
 
+#### `causal_te_validation/` **(new, suite of 6 tests)**
+
+```python
+def run_causal_te_validation(
+    runner, loader, *,
+    output_dir, max_samples,
+    histogram_csv, up_effect_dir, band_forecast_dir, seed=42,
+) -> Dict[str, Any]
+```
+
+Validates whether the model's KLD trajectory $K_t$ behaves as a
+**bottleneck transfer entropy surrogate** for $\mathrm{UP} \to
+\mathrm{FHR}$. Implements 6 of the 10 tests in
+`causal_te_validation/causal_te.md`:
+
+| Test | Topic | Inputs | New inference |
+|------|-------|--------|---------------|
+| 1 | Statistical layer on `up_effect/` (Wilcoxon + GUID-cluster CI + Holm) | `up_effect/per_sample.csv`, `condition_deltas.csv` | No |
+| 2 | KLD vs uplift random-intercept regression | `histograms/histogram_metrics.csv` | No |
+| 3 | Per-band KLD vs uplift regression | `frequency_band_forecast/<partition>/per_sample.csv` (extended with `mse_base, uplift_abs, uplift_rel`) | No |
+| 4 | Lag-attention $\to$ event alignment | shared `collect_predictions` pass | Yes (shared) |
+| 9 | Latent-dimension class contrast + bootstrap stability | `histograms/histogram_metrics.csv` | No |
+| 10 | Event-triggered KLD / TE-lag | shared `collect_predictions` pass | Yes (shared) |
+
+Tests 4 and 10 share **one** `collect_predictions` pass (capped at
+`HEAVY_PRED_CAP=2000`); the per-sample dicts are pruned to
+`{guid, epoch, label, fhr, up, kld_t, te_lag, attn}` (~ 750 KB / sample)
+before per-test processing to keep peak memory near 1.5 GB.
+
+The submodule layout:
+
+```text
+causal_te_validation/
+├── __init__.py
+├── causal_te.md                  # spec
+├── runner.py                     # orchestrator
+├── statistics.py                 # MixedLM-or-cluster-bootstrap helpers
+├── events.py                     # contraction / deceleration detection
+├── decision_rules.py             # pass / fail-mode-* aggregator
+├── plots.py                      # forest plots + headline 4-panel
+├── test_01_up_ablation_stats.py
+├── test_02_kld_uplift_regression.py
+├── test_03_band_uplift_regression.py
+├── test_04_lag_event_alignment.py
+├── test_09_dim_specificity.py
+└── test_10_event_triggered_kld.py
+```
+
+When `statsmodels` is installed every regression uses
+`MixedLM` with random intercept on `guid`; otherwise the helpers
+gracefully fall back to OLS + GUID-cluster percentile bootstrap. The
+chosen inference path is recorded in every coefficient CSV under the
+`method` column and surfaced in `summary.json` under
+`inference_method_per_test`.
+
+Tests 4 and 10 share the same per-`(guid, epoch)` baseline lookup so
+multiple segments from the same patient are *not* collapsed onto a
+single baseline value when computing event-vs-quiet deltas. Both tests
+also tolerate samples whose `te_lag`, `attn`, or `kld_t` fields are
+missing (they return `inconclusive` for that sample rather than
+raising), which keeps the suite robust to partial collector failures.
+
+The output `summary.json` aggregates per-test verdicts plus a
+manuscript-level `headline_claim` $\in$ `{strong, moderate, weak,
+inconclusive}` per the rules in `decision_rules.headline_claim`. All
+numpy scalars (including `np.bool_`), arrays, NaN/Inf floats, and
+`Path` objects are sanitised before serialisation, so the JSON is
+safe for downstream parsers that reject non-finite floats.
+
 #### `latent.py`
 
 ```python
@@ -954,6 +1023,7 @@ directly — it does **not** iterate the loader.
 17. `kld_lag_diagnostics` *(gated by `skip_forecast_heatmaps`)*
 18. `kld_pca` *(gated by `skip_kld_pca`)*
 19. `per_class_breakdown` *(gated by `skip_per_class_breakdown`, post-processor)*
+19b. `causal_te_validation` *(gated by `skip_causal_te`, suite of 6 tests; one shared `collect_predictions` pass for Tests 4 + 10, CSV-driven for Tests 1, 2, 3, 9)*
 20. `metrics_comparison_interactive` *(gated by `skip_interactive`)*
 21. `_save_summary` -> `test_summary.json`
 
@@ -1329,9 +1399,40 @@ output_dir/
 │       ├── frequency_band_<band>_r2_total_overlay.pdf
 │       ├── residual_residual_ratio_overlay.pdf
 │       └── ...
+├── causal_te_validation/
+│   ├── summary.json                            # per-test verdicts + headline_claim
+│   ├── up_ablation_stats/
+│   │   ├── wilcoxon_results.csv
+│   │   └── forest_deltas.pdf
+│   ├── kld_uplift_regression/
+│   │   ├── coefficients.csv
+│   │   └── kld_vs_uplift_scatter.pdf
+│   ├── band_uplift_regression/
+│   │   ├── per_band_coefficients.csv
+│   │   └── forest_alpha1_by_band.pdf
+│   ├── lag_event_alignment/
+│   │   ├── event_pairs.csv
+│   │   └── alignment_error_hist.pdf
+│   ├── dim_specificity/
+│   │   ├── per_dim_class_contrast.csv
+│   │   └── contrast_forest.pdf
+│   ├── event_triggered_kld/
+│   │   ├── per_sample_event_quiet.csv
+│   │   ├── summary_deltas.csv
+│   │   └── violin_event_vs_quiet.pdf
+│   └── figures/
+│       └── causal_te_summary_4panel.pdf        # manuscript headline
 ├── metrics_comparison.html
 └── test_summary.json
 ```
+
+The `frequency_band_forecast/<partition>/per_sample.csv` schema is now
+extended with three additional columns derived from the `mu_base`
+forecast: `mse_base, uplift_abs, uplift_rel`. These power Test 3
+without an extra inference pass. Existing readers ignore the new
+columns; downstream summary aggregation (`summary.json`) gains
+`mean_mse_base, mean_uplift_abs, mean_uplift_rel, median_uplift_rel`
+per band.
 
 ### Subgroup-mode output layout
 
