@@ -47,6 +47,49 @@ from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_classifier import 
 from model.vae_teb_prediction.new_classifier.guid_cls_v1.guid_dataset import (
     GuidSequenceDataset,
 )
+from model.vae_teb_prediction.new_classifier.guid_cls_v1.logging_utils import (
+    append_jsonl,
+)
+
+
+def _eval_summary_path(fold_dir: Path) -> Path:
+    """Resolve the per-fold ``evaluation_summary.jsonl`` path.
+
+    Args:
+        fold_dir: The per-fold output directory.
+
+    Returns:
+        Path to ``fold_dir/logs/evaluation_summary.jsonl``. The parent
+        directory is created if missing.
+    """
+    logs_dir = fold_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir / "evaluation_summary.jsonl"
+
+
+def _record_eval_event(fold_dir: Path, event: str, **payload: Any) -> None:
+    """Append one structured event line to ``evaluation_summary.jsonl``.
+
+    Best-effort: failures inside the logging path must never break
+    evaluation (they would mask the real result). Each record carries
+    an ISO timestamp + ``event`` discriminator so a downstream parser
+    can group by phase (``"val_inference"``, ``"test_inference"``,
+    ``"threshold_search"``, ``"evaluation_done"``, ``"evaluation_failed"``).
+    """
+    try:
+        from datetime import datetime, timezone
+
+        record = {
+            "event": str(event),
+            "iso_timestamp": datetime.now(timezone.utc).isoformat(),
+            "fold": fold_dir.name,
+            **payload,
+        }
+        append_jsonl(_eval_summary_path(fold_dir), record)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            f"[{fold_dir.name}] _record_eval_event({event}) failed: {exc}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -291,17 +334,33 @@ def run_inference_per_position(
     per GUID) with a single forward per batch and read predictions at every
     valid position.
 
+    Column emission honours the per-head gate on ``model``:
+
+      * Binary-head columns (``binary_target``, ``predicted_class``,
+        ``prob_class_0``, ``prob_class_1``) are only emitted when the
+        model carries an enabled binary head.
+      * 3-class-head columns (``prob_healthy``, ``prob_acidosis``,
+        ``prob_hie``, ``predicted_class_3``) are only emitted when the
+        model carries an enabled 3-class head.
+
+    The always-present columns (``guid``, ``epoch``, ``target``,
+    ``position``, ``prefix_length``, ``cs_label``, ``bg_label``,
+    ``tlo_hours``, ``sso_hours``, ``t_rel_sso_hours``,
+    ``guid_binary_target``, ``guid_class_3_target``) are unconditional —
+    downstream code can therefore always assume the GUID-level
+    bookkeeping columns are there and only need to check for the
+    head-specific probability columns.
+
     Args:
         model: Loaded classifier in eval mode.
         loader: Sequential DataLoader over a :class:`GuidSequenceDataset`.
         device: Compute device.
 
     Returns:
-        DataFrame with the same schema as the legacy prefix sweep (modulo
-        dropped ``aux_prob_*`` columns; ``position`` column added; the
-        ``prefix_length`` column is retained as an alias of ``position``
-        so the legacy aggregator still works).
+        DataFrame with the schema described above.
     """
+    enable_three_class = bool(getattr(model, "enable_three_class_head", True))
+    enable_binary = bool(getattr(model, "enable_binary_head", True))
     rows: List[Dict[str, Any]] = []
     for batch in loader:
         # Move tensor fields to device.
@@ -324,8 +383,12 @@ def run_inference_per_position(
         n_per = moved["num_segments"].cpu().numpy()
 
         out = model(moved)
-        prob_3 = out["prob_3"].detach().cpu().numpy()             # (B, N, 3)
-        prob_bin = out["prob_bin"].detach().cpu().numpy()         # (B, N)
+        prob_3 = (
+            out["prob_3"].detach().cpu().numpy() if enable_three_class else None
+        )                                                         # (B, N, 3) or None
+        prob_bin = (
+            out["prob_bin"].detach().cpu().numpy() if enable_binary else None
+        )                                                         # (B, N) or None
 
         B = seg_mask.shape[0]
         for b in range(B):
@@ -336,34 +399,46 @@ def run_inference_per_position(
                     # Fully-padded segment shouldn't appear here, but guard.
                     seg_target = int(labels_3[b]) + 1
                 position = n + 1
-                rows.append(
-                    {
-                        "guid": str(guids[b]),
-                        "epoch": float(epochs[b, n]),
-                        "target": int(seg_target),
-                        "binary_target": int(seg_target > 1),
-                        "predicted_class": int(prob_bin[b, n] >= 0.5),
-                        "prob_class_0": float(1.0 - prob_bin[b, n]),
-                        "prob_class_1": float(prob_bin[b, n]),
-                        "prob_healthy": float(prob_3[b, n, 0]),
-                        "prob_acidosis": float(prob_3[b, n, 1]),
-                        "prob_hie": float(prob_3[b, n, 2]),
-                        "predicted_class_3": int(prob_3[b, n].argmax()),
-                        "position": int(position),
-                        # Alias: legacy aggregator code reads ``prefix_length``.
-                        "prefix_length": int(position),
-                        "cs_label": bool(cs[b, n]),
-                        "bg_label": bool(bg[b, n]),
-                        "tlo_hours": float(tlo[b, n]) / 3600.0
-                        if not np.isnan(tlo[b, n])
-                        else float("nan"),
-                        "sso_hours": float(sso[b, n]) / 3600.0
-                        if not np.isnan(sso[b, n])
-                        else float("nan"),
-                        "guid_binary_target": int(labels_bin[b]),
-                        "guid_class_3_target": int(labels_3[b]),
-                    }
-                )
+                row: Dict[str, Any] = {
+                    "guid": str(guids[b]),
+                    "epoch": float(epochs[b, n]),
+                    "target": int(seg_target),
+                    "position": int(position),
+                    # Alias: legacy aggregator code reads ``prefix_length``.
+                    "prefix_length": int(position),
+                    "cs_label": bool(cs[b, n]),
+                    "bg_label": bool(bg[b, n]),
+                    "tlo_hours": float(tlo[b, n]) / 3600.0
+                    if not np.isnan(tlo[b, n])
+                    else float("nan"),
+                    "sso_hours": float(sso[b, n]) / 3600.0
+                    if not np.isnan(sso[b, n])
+                    else float("nan"),
+                    # ``t_rel_sso_hours`` is the explicit signed
+                    # "time relative to second-stage onset" axis
+                    # consumed by the SSO-anchored evaluation tree
+                    # (``sso_metrics_utils``). Numerically equal to
+                    # ``sso_hours`` today; kept as a separate column
+                    # so the SSO axis is self-documenting in the CSV
+                    # schema and resilient to any future rename of
+                    # the legacy ``sso_hours`` alias.
+                    "t_rel_sso_hours": float(sso[b, n]) / 3600.0
+                    if not np.isnan(sso[b, n])
+                    else float("nan"),
+                    "guid_binary_target": int(labels_bin[b]),
+                    "guid_class_3_target": int(labels_3[b]),
+                }
+                if prob_bin is not None:
+                    row["binary_target"] = int(seg_target > 1)
+                    row["predicted_class"] = int(prob_bin[b, n] >= 0.5)
+                    row["prob_class_0"] = float(1.0 - prob_bin[b, n])
+                    row["prob_class_1"] = float(prob_bin[b, n])
+                if prob_3 is not None:
+                    row["prob_healthy"] = float(prob_3[b, n, 0])
+                    row["prob_acidosis"] = float(prob_3[b, n, 1])
+                    row["prob_hie"] = float(prob_3[b, n, 2])
+                    row["predicted_class_3"] = int(prob_3[b, n].argmax())
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -874,6 +949,21 @@ def evaluate_single_fold(
 
     # Build classifier config off the cache dimensions.
     cls_cfg = config["model_config"]["classifier"]
+    # Per-head enable flags (YAML: ``model_config.classifier.heads``).
+    # Legacy configs without the ``heads`` block default both flags to
+    # True so existing artefacts are unaffected.
+    heads_cfg = cls_cfg.get("heads", {}) or {}
+    enable_three_class_head = bool(
+        (heads_cfg.get("three_class") or {}).get("enabled", True)
+    )
+    enable_binary_head = bool(
+        (heads_cfg.get("binary") or {}).get("enabled", True)
+    )
+    if not (enable_three_class_head or enable_binary_head):
+        raise ValueError(
+            f"[{fold_dir.name}] both classifier heads are disabled in "
+            "model_config.classifier.heads — eval has nothing to score."
+        )
     # Peek d_z / d_model_vae from the cache attrs.
     import h5py  # noqa: WPS433
 
@@ -898,6 +988,8 @@ def evaluate_single_fold(
         te_summary_dim=6,
         late_window_steps=75,
         dropout=float(cls_cfg.get("dropout", 0.1)),
+        enable_three_class_head=enable_three_class_head,
+        enable_binary_head=enable_binary_head,
     )
 
     # Load model. Prefer the authoritative best-checkpoint path supplied by
@@ -952,16 +1044,52 @@ def evaluate_single_fold(
         test_csv = legacy_test_csv
     if regenerate_predictions or not val_csv.exists():
         logger.info(f"[{fold_dir.name}] running val inference (prefix sweep)")
+        import time as _time_inf
+
+        _t0 = _time_inf.perf_counter()
         val_df = run_inference_prefix_sweep(classifier, val_loader, device=device)
         val_df.to_csv(val_csv, index=False)
+        _record_eval_event(
+            fold_dir,
+            "val_inference",
+            seconds=float(_time_inf.perf_counter() - _t0),
+            n_rows=int(len(val_df)),
+            n_guids=int(val_df["guid"].nunique()) if "guid" in val_df.columns else -1,
+            output_csv=str(val_csv),
+        )
     else:
         val_df = pd.read_csv(val_csv)
+        _record_eval_event(
+            fold_dir,
+            "val_inference_cached",
+            n_rows=int(len(val_df)),
+            n_guids=int(val_df["guid"].nunique()) if "guid" in val_df.columns else -1,
+            input_csv=str(val_csv),
+        )
     if regenerate_predictions or not test_csv.exists():
         logger.info(f"[{fold_dir.name}] running test inference (prefix sweep)")
+        import time as _time_inf2
+
+        _t0t = _time_inf2.perf_counter()
         test_df = run_inference_prefix_sweep(classifier, test_loader, device=device)
         test_df.to_csv(test_csv, index=False)
+        _record_eval_event(
+            fold_dir,
+            "test_inference",
+            seconds=float(_time_inf2.perf_counter() - _t0t),
+            n_rows=int(len(test_df)),
+            n_guids=int(test_df["guid"].nunique() if "guid" in test_df.columns else -1),
+            output_csv=str(test_csv),
+        )
     else:
         test_df = pd.read_csv(test_csv)
+        _record_eval_event(
+            fold_dir,
+            "test_inference_cached",
+            n_rows=int(len(test_df)),
+            n_guids=int(test_df["guid"].nunique() if "guid" in test_df.columns else -1),
+            input_csv=str(test_csv),
+        )
 
     utils = _import_legacy_utils()
     utils["validate_predictions_df"](val_df, "Validation")
@@ -969,31 +1097,30 @@ def evaluate_single_fold(
 
     # Cached CSVs from older runs (pre-3-class extension) lack the
     # ``prob_healthy / prob_acidosis / prob_hie / predicted_class_3``
-    # columns the 3-class evaluator needs. ``validate_predictions_df``
-    # only enforces the binary-side schema, so the failure would
-    # otherwise surface deep inside the per-class metric path as a
-    # ``KeyError``. Detect the gap up front and force a re-inference
-    # so the downstream pipeline is guaranteed to see a complete row
-    # schema.
-    _required_3class_cols = (
-        "prob_healthy",
-        "prob_acidosis",
-        "prob_hie",
-        "predicted_class_3",
-    )
-    for _label, _df, _csv in (
-        ("Validation", val_df, val_csv),
-        ("Test", test_df, test_csv),
-    ):
-        _missing = [c for c in _required_3class_cols if c not in _df.columns]
-        if _missing:
-            raise RuntimeError(
-                f"[{fold_dir.name}] {_label} predictions CSV {_csv} is missing "
-                f"3-class columns {_missing}. This usually means the file was "
-                f"produced by an older (binary-only) run. Re-run with "
-                f"`evaluation.regenerate_predictions: true` (or delete the "
-                f"stale CSV) to regenerate it under the current schema."
-            )
+    # columns the 3-class evaluator needs. Detect the gap up front and
+    # force a re-inference so the downstream pipeline sees a complete
+    # row schema. Only enforced when the 3-class head is enabled in
+    # this run — otherwise those columns are intentionally absent.
+    if enable_three_class_head:
+        _required_3class_cols = (
+            "prob_healthy",
+            "prob_acidosis",
+            "prob_hie",
+            "predicted_class_3",
+        )
+        for _label, _df, _csv in (
+            ("Validation", val_df, val_csv),
+            ("Test", test_df, test_csv),
+        ):
+            _missing = [c for c in _required_3class_cols if c not in _df.columns]
+            if _missing:
+                raise RuntimeError(
+                    f"[{fold_dir.name}] {_label} predictions CSV {_csv} is missing "
+                    f"3-class columns {_missing}. This usually means the file was "
+                    f"produced by an older (binary-only) run. Re-run with "
+                    f"`evaluation.regenerate_predictions: true` (or delete the "
+                    f"stale CSV) to regenerate it under the current schema."
+                )
 
     val_df = utils["ensure_epoch_hours"](val_df)
     test_df = utils["ensure_epoch_hours"](test_df)
@@ -1009,196 +1136,382 @@ def evaluate_single_fold(
         three_class_cfg.get("threshold_search_default", True)
     )
 
-    # Threshold search on validation.
-    logger.info(f"[{fold_dir.name}] running threshold searches on validation")
-    thr_inst, info_inst = utils["find_threshold_for_instantaneous_fpr_at_1h"](
-        val_df,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier,
-    )
-    thr_cum, info_cum = utils["find_threshold_for_committed_cumulative_fpr_at_1h"](
-        val_df,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier,
-    )
-    thr_overall, info_overall = utils[
-        "find_threshold_for_committed_overall_fpr_at_1h"
-    ](
-        val_df,
-        target_fpr=target_fpr,
-        time_window_hours=decision_time_hours,
-        max_gap_multiplier=max_gap_multiplier,
-    )
-
-    # Apply CDR + persist clinical CSVs (use overall threshold as primary).
-    val_clinical = utils["apply_clinical_decision_rule"](val_df, thr_overall, verify=True)
-    val_clinical.to_csv(predictions_dir / "validation_clinical.csv", index=False)
-    test_clinical = utils["apply_clinical_decision_rule"](test_df, thr_overall, verify=True)
-    test_clinical.to_csv(predictions_dir / "test_clinical.csv", index=False)
-
-    # Three-metric-type analysis on the test set, each with its own
-    # threshold. Outputs land under ``binary_head/`` (binary-side curves
-    # and subgroups) and ``multiclass_head/`` (3-class per-class /
-    # subgroup / AUROC / aggregate / confusion-evolution panels). The
-    # old ``three_metric_types/`` parent that intermingled the two heads
-    # is gone.
-    binary_metrics_vs_time_dir = binary_head_dir / "metrics_vs_time"
-    binary_subgroups_dir = binary_head_dir / "subgroups_vs_time"
-    binary_metrics_vs_time_dir.mkdir(parents=True, exist_ok=True)
-    binary_subgroups_dir.mkdir(parents=True, exist_ok=True)
+    # Threshold search on validation (binary-head only — derives the
+    # operating point that the clinical decision rule applies to every
+    # downstream metric). Under a 3-class-only run there is no binary
+    # signal to threshold, so the entire delivery-axis loop is skipped:
+    # the CDR-dependent 3-class per-class artefacts also live inside
+    # that loop and follow it down. 3-class diagnostics (OvR ROC,
+    # confusion matrix, global diagnostics) are CDR-independent and
+    # run unconditionally further below.
     metric_summaries: Dict[str, Any] = {}
     perclass_thresholds_by_mode: Dict[str, Any] = {}
-    for metric_type, threshold in (
-        ("instantaneous", thr_inst),
-        ("committed_cumulative", thr_cum),
-        ("committed_overall", thr_overall),
-    ):
-        df_clinical = utils["apply_clinical_decision_rule"](
-            test_df, threshold, verify=False
-        )
-        if metric_type != "instantaneous":
-            df_clinical = utils["fill_missing_epochs"](
-                df_clinical,
-                max_gap_multiplier=max_gap_multiplier,
-                fill_until_birth=True,
-                birth_epoch_seconds=0.0,
-            )
-        df_clinical = utils["ensure_epoch_hours"](df_clinical)
-        bins = utils["compute_time_bins"](
-            df_clinical, exclude_last_minutes=exclude_last_minutes
-        )
-        if metric_type == "instantaneous":
-            metrics_df = utils["compute_instantaneous_metrics"](df_clinical, bins, None)
-        elif metric_type == "committed_cumulative":
-            metrics_df = utils["compute_committed_cumulative_metrics"](
-                df_clinical, bins, None
-            )
-        else:
-            metrics_df = utils["compute_committed_overall_metrics"](df_clinical, bins, None)
+    thr_inst: float = float("nan")
+    thr_cum: float = float("nan")
+    thr_overall: float = float("nan")
+    info_inst: Any = None
+    info_cum: Any = None
+    info_overall: Any = None
+    if enable_binary_head:
+        logger.info(f"[{fold_dir.name}] running threshold searches on validation")
+        import time as _time_thr
 
-        # Persist the binary metrics-vs-time CSV (one file per mode);
-        # plotters still write multi-figure PNGs into the same dir.
-        metrics_df.to_csv(
-            binary_metrics_vs_time_dir / f"{metric_type}.csv", index=False
+        _t_thr = _time_thr.perf_counter()
+        thr_inst, info_inst = utils["find_threshold_for_instantaneous_fpr_at_1h"](
+            val_df,
+            target_fpr=target_fpr,
+            time_window_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
         )
-        per_mode_plot_dir = binary_metrics_vs_time_dir / metric_type
-        per_mode_plot_dir.mkdir(parents=True, exist_ok=True)
-        utils["plot_single_metric_type"](
-            metrics_df,
-            metric_type,
-            per_mode_plot_dir,
-            decision_time_hours=decision_time_hours,
+        thr_cum, info_cum = utils["find_threshold_for_committed_cumulative_fpr_at_1h"](
+            val_df,
+            target_fpr=target_fpr,
+            time_window_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
+        )
+        thr_overall, info_overall = utils[
+            "find_threshold_for_committed_overall_fpr_at_1h"
+        ](
+            val_df,
+            target_fpr=target_fpr,
+            time_window_hours=decision_time_hours,
+            max_gap_multiplier=max_gap_multiplier,
+        )
+        _record_eval_event(
+            fold_dir,
+            "threshold_search",
+            seconds=float(_time_thr.perf_counter() - _t_thr),
+            target_fpr=float(target_fpr),
+            decision_time_hours=float(decision_time_hours),
+            thr_instantaneous=float(thr_inst) if thr_inst == thr_inst else None,
+            thr_cumulative=float(thr_cum) if thr_cum == thr_cum else None,
+            thr_overall=float(thr_overall) if thr_overall == thr_overall else None,
         )
 
-        # Binary subgroup analysis: persist a long-format CSV summarising
-        # every subgroup's metric curve, then keep the existing rich
-        # multi-PNG renderer in a per-mode sub-directory for human review.
-        subgroup_filters = utils["create_enhanced_subgroup_filters"]()
-        subgroup_metrics_dict = utils["plot_subgroup_analysis"](
-            df_clinical,
-            bins,
-            metric_type,
-            subgroup_filters,
-            binary_subgroups_dir / metric_type,
-            title_suffix=f" - {fold_dir.name}",
-            decision_time_hours=decision_time_hours,
-        )
-        try:
-            sub_long_rows: List[Dict[str, Any]] = []
-            for sg_name, sg_df in (subgroup_metrics_dict or {}).items():
-                if sg_df is None or len(sg_df) == 0:
-                    continue
-                for _, r in sg_df.iterrows():
-                    row = {"subgroup": sg_name}
-                    for col in (
-                        "bin_center",
-                        "sensitivity",
-                        "specificity",
-                        "fpr",
-                        "n_pos",
-                        "n_neg",
-                        "n",
-                    ):
-                        if col in r.index:
-                            row[col] = r[col]
-                    sub_long_rows.append(row)
-            if sub_long_rows:
-                pd.DataFrame(sub_long_rows).to_csv(
-                    binary_subgroups_dir / f"{metric_type}.csv", index=False
+        # Apply CDR + persist clinical CSVs (use overall threshold as primary).
+        val_clinical = utils["apply_clinical_decision_rule"](val_df, thr_overall, verify=True)
+        val_clinical.to_csv(predictions_dir / "validation_clinical.csv", index=False)
+        test_clinical = utils["apply_clinical_decision_rule"](test_df, thr_overall, verify=True)
+        test_clinical.to_csv(predictions_dir / "test_clinical.csv", index=False)
+
+        # Three-metric-type analysis on the test set, each with its own
+        # threshold. Outputs land under ``binary_head/`` (binary-side
+        # curves and subgroups) and ``multiclass_head/`` (3-class
+        # per-class / subgroup / AUROC / aggregate /
+        # confusion-evolution panels). The old ``three_metric_types/``
+        # parent that intermingled the two heads is gone.
+        binary_metrics_vs_time_dir = binary_head_dir / "metrics_vs_time"
+        binary_subgroups_dir = binary_head_dir / "subgroups_vs_time"
+        binary_metrics_vs_time_dir.mkdir(parents=True, exist_ok=True)
+        binary_subgroups_dir.mkdir(parents=True, exist_ok=True)
+        for metric_type, threshold in (
+            ("instantaneous", thr_inst),
+            ("committed_cumulative", thr_cum),
+            ("committed_overall", thr_overall),
+        ):
+            df_clinical = utils["apply_clinical_decision_rule"](
+                test_df, threshold, verify=False
+            )
+            if metric_type != "instantaneous":
+                df_clinical = utils["fill_missing_epochs"](
+                    df_clinical,
+                    max_gap_multiplier=max_gap_multiplier,
+                    fill_until_birth=True,
+                    birth_epoch_seconds=0.0,
                 )
-        except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                f"[{fold_dir.name}] binary subgroup long-format CSV "
-                f"({metric_type}) failed"
+            df_clinical = utils["ensure_epoch_hours"](df_clinical)
+            bins = utils["compute_time_bins"](
+                df_clinical, exclude_last_minutes=exclude_last_minutes
+            )
+            if metric_type == "instantaneous":
+                metrics_df = utils["compute_instantaneous_metrics"](df_clinical, bins, None)
+            elif metric_type == "committed_cumulative":
+                metrics_df = utils["compute_committed_cumulative_metrics"](
+                    df_clinical, bins, None
+                )
+            else:
+                metrics_df = utils["compute_committed_overall_metrics"](df_clinical, bins, None)
+
+            # Persist the binary metrics-vs-time CSV (one file per mode);
+            # plotters still write multi-figure PNGs into the same dir.
+            metrics_df.to_csv(
+                binary_metrics_vs_time_dir / f"{metric_type}.csv", index=False
+            )
+            per_mode_plot_dir = binary_metrics_vs_time_dir / metric_type
+            per_mode_plot_dir.mkdir(parents=True, exist_ok=True)
+            utils["plot_single_metric_type"](
+                metrics_df,
+                metric_type,
+                per_mode_plot_dir,
+                decision_time_hours=decision_time_hours,
             )
 
-        # Per-class + per-class subgroup + by-underlying-class +
-        # AUROC-vs-time + aggregate-vs-time + confusion-evolution
-        # artefacts. Now writes to ``multiclass_head/`` and
-        # ``binary_head/by_underlying_class_vs_time/`` directly.
-        try:
-            res_3c = run_3class_evaluation_for_metric_type(
+            # Binary subgroup analysis: persist a long-format CSV summarising
+            # every subgroup's metric curve, then keep the existing rich
+            # multi-PNG renderer in a per-mode sub-directory for human review.
+            subgroup_filters = utils["create_enhanced_subgroup_filters"]()
+            subgroup_metrics_dict = utils["plot_subgroup_analysis"](
                 df_clinical,
-                time_bins=bins,
-                metric_type=metric_type,
-                eval_root=eval_dir,
-                df_val=val_df if perclass_threshold_search_default else None,
-                target_fpr=target_fpr,
+                bins,
+                metric_type,
+                subgroup_filters,
+                binary_subgroups_dir / metric_type,
+                title_suffix=f" - {fold_dir.name}",
                 decision_time_hours=decision_time_hours,
-                threshold_search_kwargs={
-                    "max_gap_multiplier": max_gap_multiplier,
-                    "fallback_tolerance_hours": fallback_tolerance_hours,
-                },
             )
-            perclass_thresholds_by_mode[metric_type] = (
-                res_3c.get("perclass_threshold_info") or {}
+            try:
+                sub_long_rows: List[Dict[str, Any]] = []
+                for sg_name, sg_df in (subgroup_metrics_dict or {}).items():
+                    if sg_df is None or len(sg_df) == 0:
+                        continue
+                    for _, r in sg_df.iterrows():
+                        row = {"subgroup": sg_name}
+                        for col in (
+                            "bin_center",
+                            "sensitivity",
+                            "specificity",
+                            "fpr",
+                            "n_pos",
+                            "n_neg",
+                            "n",
+                        ):
+                            if col in r.index:
+                                row[col] = r[col]
+                        sub_long_rows.append(row)
+                if sub_long_rows:
+                    pd.DataFrame(sub_long_rows).to_csv(
+                        binary_subgroups_dir / f"{metric_type}.csv", index=False
+                    )
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    f"[{fold_dir.name}] binary subgroup long-format CSV "
+                    f"({metric_type}) failed"
+                )
+
+            # Per-class + per-class subgroup + by-underlying-class +
+            # AUROC-vs-time + aggregate-vs-time + confusion-evolution
+            # artefacts. Now writes to ``multiclass_head/`` and
+            # ``binary_head/by_underlying_class_vs_time/`` directly.
+            # Only run when the 3-class head is enabled — otherwise the
+            # ``prob_healthy/acidosis/hie`` columns are absent and the
+            # call would fail downstream.
+            if enable_three_class_head:
+                try:
+                    res_3c = run_3class_evaluation_for_metric_type(
+                        df_clinical,
+                        time_bins=bins,
+                        metric_type=metric_type,
+                        eval_root=eval_dir,
+                        df_val=val_df if perclass_threshold_search_default else None,
+                        target_fpr=target_fpr,
+                        decision_time_hours=decision_time_hours,
+                        threshold_search_kwargs={
+                            "max_gap_multiplier": max_gap_multiplier,
+                            "fallback_tolerance_hours": fallback_tolerance_hours,
+                        },
+                    )
+                    perclass_thresholds_by_mode[metric_type] = (
+                        res_3c.get("perclass_threshold_info") or {}
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        f"[{fold_dir.name}] 3-class metrics ({metric_type}) failed"
+                    )
+            metric_summaries[metric_type] = {
+                "threshold": float(threshold),
+                "n_bins": int(len(metrics_df)),
+            }
+
+    # =====================================================================
+    # SSO-anchored three-metric-type analysis (parallel tree).
+    # =====================================================================
+    #
+    # Re-runs the three-metric-type analysis with the signed
+    # second-stage-onset axis. GUIDs that lack a second-stage timestamp are
+    # dropped up front; the figure footers report the dropped count so
+    # the omission is auditable. Output lives under
+    # ``evaluation/three_metric_types_sso/`` so the original delivery-axis
+    # tree is byte-untouched.
+    #
+    # The whole SSO block is binary-threshold-driven (CDR is applied
+    # with ``thr_*`` from the binary threshold search), so it only runs
+    # when the binary head is enabled. The inner per-class 3-class call
+    # is independently gated on the 3-class head as well.
+    if enable_binary_head:
+        try:
+            from model.vae_teb_prediction.new_classifier.guid_cls_v1 import (  # noqa: WPS433
+                sso_metrics_utils as sso_utils,
             )
+
+            sso_root = eval_dir / "three_metric_types_sso"
+            sso_root.mkdir(parents=True, exist_ok=True)
+            sso_binary_dir = sso_root / "binary_head" / "metrics_vs_time"
+            sso_subgroups_dir = sso_root / "binary_head" / "subgroups_vs_time"
+            sso_binary_dir.mkdir(parents=True, exist_ok=True)
+            sso_subgroups_dir.mkdir(parents=True, exist_ok=True)
+
+            # Pre-screen: drop GUIDs without an SSO timestamp.
+            test_sso_df = sso_utils.ensure_t_rel_sso_hours(test_df)
+            test_sso_df, sso_drop_stats = sso_utils.filter_to_sso_eligible(test_sso_df)
+            n_sso_dropped = int(sso_drop_stats["n_dropped_guids"])
+            sso_utils.write_sso_filter_summary(
+                sso_root / "sso_filter_summary.json", sso_drop_stats
+            )
+
+            if test_sso_df.empty:
+                logger.warning(
+                    f"[{fold_dir.name}] SSO eval skipped: no eligible GUIDs "
+                    "(every test GUID is missing second_stage_onset)."
+                )
+            else:
+                sso_metric_summaries: Dict[str, Any] = {}
+                for metric_type, threshold in (
+                    ("instantaneous", thr_inst),
+                    ("committed_cumulative", thr_cum),
+                    ("committed_overall", thr_overall),
+                ):
+                    df_sso_clin = utils["apply_clinical_decision_rule"](
+                        test_sso_df, threshold, verify=False
+                    )
+                    if metric_type != "instantaneous":
+                        df_sso_clin = utils["fill_missing_epochs"](
+                            df_sso_clin,
+                            max_gap_multiplier=max_gap_multiplier,
+                            fill_until_birth=True,
+                            birth_epoch_seconds=0.0,
+                        )
+                        df_sso_clin = sso_utils.recompute_t_rel_sso_after_fill(df_sso_clin)
+                    else:
+                        df_sso_clin = sso_utils.ensure_t_rel_sso_hours(df_sso_clin)
+
+                    sso_bins = sso_utils.compute_sso_time_bins(df_sso_clin)
+
+                    if metric_type == "instantaneous":
+                        sso_metrics_df = sso_utils.compute_instantaneous_metrics_sso(
+                            df_sso_clin, sso_bins, None
+                        )
+                    elif metric_type == "committed_cumulative":
+                        sso_metrics_df = sso_utils.compute_committed_cumulative_metrics_sso(
+                            df_sso_clin, sso_bins, None
+                        )
+                    else:
+                        sso_metrics_df = sso_utils.compute_committed_overall_metrics_sso(
+                            df_sso_clin, sso_bins, None
+                        )
+
+                    sso_metrics_df.to_csv(
+                        sso_binary_dir / f"{metric_type}.csv", index=False
+                    )
+                    sso_plot_dir = sso_binary_dir / metric_type
+                    sso_plot_dir.mkdir(parents=True, exist_ok=True)
+                    sso_utils.plot_single_metric_type_sso(
+                        sso_metrics_df,
+                        metric_type,
+                        sso_plot_dir,
+                        title_suffix=f" - {fold_dir.name}",
+                        n_dropped_guids=n_sso_dropped,
+                    )
+
+                    # SSO subgroup analysis (same filters as delivery-axis).
+                    try:
+                        sso_subgroup_filters = utils["create_enhanced_subgroup_filters"]()
+                        sso_sg_dict = sso_utils.plot_subgroup_analysis_sso(
+                            df_sso_clin,
+                            sso_bins,
+                            metric_type,
+                            sso_subgroup_filters,
+                            sso_subgroups_dir / metric_type,
+                            title_suffix=f" - {fold_dir.name}",
+                            n_dropped_guids=n_sso_dropped,
+                        )
+                        sso_utils.persist_subgroup_long_csv(
+                            sso_sg_dict, sso_subgroups_dir / f"{metric_type}.csv"
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception(
+                            f"[{fold_dir.name}] SSO subgroup ({metric_type}) failed"
+                        )
+
+                    # SSO per-class 3-class artefacts (only when 3-class head enabled).
+                    if enable_three_class_head:
+                        try:
+                            run_3class_evaluation_for_metric_type(
+                                df_sso_clin,
+                                time_bins=sso_bins,
+                                metric_type=metric_type,
+                                eval_root=sso_root,
+                                df_val=val_df if perclass_threshold_search_default else None,
+                                target_fpr=target_fpr,
+                                decision_time_hours=decision_time_hours,
+                                threshold_search_kwargs={
+                                    "max_gap_multiplier": max_gap_multiplier,
+                                    "fallback_tolerance_hours": fallback_tolerance_hours,
+                                },
+                                axis_mode="sso",
+                                n_dropped_guids=n_sso_dropped,
+                            )
+                        except Exception:  # pragma: no cover - defensive
+                            logger.exception(
+                                f"[{fold_dir.name}] SSO 3-class metrics ({metric_type}) failed"
+                            )
+
+                    sso_metric_summaries[metric_type] = {
+                        "threshold": float(threshold),
+                        "n_bins": int(len(sso_metrics_df)),
+                        "n_dropped_guids": n_sso_dropped,
+                    }
+                (sso_root / "metric_summaries.json").write_text(
+                    json.dumps(
+                        utils["convert_numpy_types"](sso_metric_summaries),
+                        indent=2, sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                metric_summaries["sso"] = sso_metric_summaries
         except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                f"[{fold_dir.name}] 3-class metrics ({metric_type}) failed"
-            )
-        metric_summaries[metric_type] = {
-            "threshold": float(threshold),
-            "n_bins": int(len(metrics_df)),
-        }
+            logger.exception(f"[{fold_dir.name}] SSO-anchored evaluation failed")
 
     # Binary GUID-level ROC -> ``binary_head/roc.{csv,png}``.
-    roc_data = utils["compute_guid_level_roc"](
-        test_df, decision_time_hours=decision_time_hours
-    )
-    pd.DataFrame(
-        {
-            "fpr": roc_data["fpr"],
-            "tpr": roc_data["tpr"],
-            "thresholds": roc_data["thresholds"],
-        }
-    ).to_csv(binary_head_dir / "roc.csv", index=False)
-    utils["plot_roc_curve"](
-        roc_data,
-        binary_head_dir / "roc.png",
-        title_suffix=f" — {fold_dir.name}",
-        threshold=thr_overall,
-    )
+    roc_data: Dict[str, Any] = {}
+    if enable_binary_head:
+        roc_data = utils["compute_guid_level_roc"](
+            test_df, decision_time_hours=decision_time_hours
+        )
+        pd.DataFrame(
+            {
+                "fpr": roc_data["fpr"],
+                "tpr": roc_data["tpr"],
+                "thresholds": roc_data["thresholds"],
+            }
+        ).to_csv(binary_head_dir / "roc.csv", index=False)
+        utils["plot_roc_curve"](
+            roc_data,
+            binary_head_dir / "roc.png",
+            title_suffix=f" — {fold_dir.name}",
+            threshold=thr_overall,
+        )
 
     # 3-class one-vs-rest ROC + confusion matrix + diagnostic plots ->
-    # ``multiclass_head/diagnostics/``.
-    three_class_roc = compute_3class_roc_ovr(test_df)
-    pd.DataFrame(
-        [
-            {"class": k, "auc": v["auc"]}
-            for k, v in three_class_roc.items()
-        ]
-    ).to_csv(diagnostics_dir / "roc_ovr.csv", index=False)
-    plot_three_class_diagnostics(test_df, diagnostics_dir)
-    # Extended per-fold 3-class diagnostics (calibration, PR curves,
-    # probability box plots). These are CDR-independent so they only need
-    # to be computed once per fold.
-    try:
-        run_3class_global_diagnostics(test_df, diagnostics_dir)
-    except Exception:  # pragma: no cover - defensive
-        logger.exception(f"[{fold_dir.name}] 3-class global diagnostics failed")
+    # ``multiclass_head/diagnostics/``. Skipped under binary-only runs;
+    # in that case the ``multiclass_head/`` directory exists but stays
+    # empty (the aggregator auto-detects head presence per fold).
+    three_class_roc: Dict[str, Dict[str, Any]] = {}
+    if enable_three_class_head:
+        three_class_roc = compute_3class_roc_ovr(test_df)
+        pd.DataFrame(
+            [
+                {"class": k, "auc": v["auc"]}
+                for k, v in three_class_roc.items()
+            ]
+        ).to_csv(diagnostics_dir / "roc_ovr.csv", index=False)
+        plot_three_class_diagnostics(test_df, diagnostics_dir)
+        # Extended per-fold 3-class diagnostics (calibration, PR curves,
+        # probability box plots). These are CDR-independent so they only need
+        # to be computed once per fold.
+        try:
+            run_3class_global_diagnostics(test_df, diagnostics_dir)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(f"[{fold_dir.name}] 3-class global diagnostics failed")
 
     # Dataset statistics (PRD §11.8 / §14.4). Best-effort: the legacy
     # helper produces dataset_overview.pdf, subgroup_overview.pdf, etc.
@@ -1219,18 +1532,11 @@ def evaluate_single_fold(
     except Exception:  # pragma: no cover - external code, optional artefact
         logger.exception(f"[{fold_dir.name}] generate_fold_dataset_stats failed")
 
+    # ``threshold_info`` is assembled head-aware so disabled-head keys
+    # are simply absent (rather than NaN-filled placeholders the
+    # aggregator would have to special-case). The aggregator inspects
+    # per-fold artefacts directly, so a missing key here is harmless.
     threshold_info: Dict[str, Any] = {
-        "threshold_instantaneous": float(thr_inst),
-        "threshold_cumulative": float(thr_cum),
-        "threshold_overall": float(thr_overall),
-        "validation_instantaneous": utils["convert_numpy_types"](info_inst),
-        "validation_cumulative": utils["convert_numpy_types"](info_cum),
-        "validation_overall": utils["convert_numpy_types"](info_overall),
-        "roc_auc_binary": float(roc_data.get("auc", float("nan"))),
-        "roc_auc_3class_ovr": {
-            k: float(v["auc"]) if v["auc"] == v["auc"] else None  # NaN guard
-            for k, v in three_class_roc.items()
-        },
         "epoch_min_train": (
             int(config.get("dataset_config", {}).get("epoch_min"))
             if config.get("dataset_config", {}).get("epoch_min") is not None
@@ -1239,7 +1545,31 @@ def evaluate_single_fold(
         "epoch_min_test": (
             int(epoch_min_test_cfg) if epoch_min_test_cfg is not None else None
         ),
+        # Audit trail so downstream consumers can see which heads
+        # produced this fold's artefacts without inferring from
+        # directory contents.
+        "heads_enabled": {
+            "binary": bool(enable_binary_head),
+            "three_class": bool(enable_three_class_head),
+        },
     }
+    if enable_binary_head:
+        threshold_info.update(
+            {
+                "threshold_instantaneous": float(thr_inst),
+                "threshold_cumulative": float(thr_cum),
+                "threshold_overall": float(thr_overall),
+                "validation_instantaneous": utils["convert_numpy_types"](info_inst),
+                "validation_cumulative": utils["convert_numpy_types"](info_cum),
+                "validation_overall": utils["convert_numpy_types"](info_overall),
+                "roc_auc_binary": float(roc_data.get("auc", float("nan"))),
+            }
+        )
+    if enable_three_class_head:
+        threshold_info["roc_auc_3class_ovr"] = {
+            k: float(v["auc"]) if v["auc"] == v["auc"] else None  # NaN guard
+            for k, v in three_class_roc.items()
+        }
     (eval_dir / "thresholds.json").write_text(
         json.dumps(threshold_info, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -1259,13 +1589,16 @@ def evaluate_single_fold(
         )
 
     # 3×3 confusion matrix at the overall threshold ->
-    # ``multiclass_head/diagnostics/confusion_matrix.csv``.
-    cm = compute_confusion_matrix_3class(test_df)
-    pd.DataFrame(
-        cm,
-        index=["healthy", "acidosis", "hie"],
-        columns=["healthy", "acidosis", "hie"],
-    ).to_csv(diagnostics_dir / "confusion_matrix.csv")
+    # ``multiclass_head/diagnostics/confusion_matrix.csv``. Skipped
+    # under binary-only runs (the 3-class probability columns are
+    # absent and ``compute_confusion_matrix_3class`` would raise).
+    if enable_three_class_head:
+        cm = compute_confusion_matrix_3class(test_df)
+        pd.DataFrame(
+            cm,
+            index=["healthy", "acidosis", "hie"],
+            columns=["healthy", "acidosis", "hie"],
+        ).to_csv(diagnostics_dir / "confusion_matrix.csv")
 
     # Final fold-level results.
     fold_results = {
@@ -1275,14 +1608,36 @@ def evaluate_single_fold(
         "n_test_guids": len(test_ds),
         "metric_summaries": metric_summaries,
         "threshold_info": threshold_info,
+        "heads_enabled": {
+            "binary": bool(enable_binary_head),
+            "three_class": bool(enable_three_class_head),
+        },
     }
     (fold_dir / "evaluation_results.json").write_text(
         json.dumps(utils["convert_numpy_types"](fold_results), indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    logger.info(
-        f"[{fold_dir.name}] evaluation done: thr_overall={thr_overall:.4f} "
-        f"AUC={threshold_info['roc_auc_binary']:.4f}"
+    # Headline log: include whichever metrics we actually computed.
+    log_parts = [f"[{fold_dir.name}] evaluation done"]
+    if enable_binary_head:
+        log_parts.append(f"thr_overall={thr_overall:.4f}")
+        log_parts.append(
+            f"AUC={threshold_info.get('roc_auc_binary', float('nan')):.4f}"
+        )
+    if enable_three_class_head:
+        log_parts.append("3-class diagnostics emitted")
+    logger.info(" ".join(log_parts))
+    _record_eval_event(
+        fold_dir,
+        "evaluation_done",
+        enable_binary_head=bool(enable_binary_head),
+        enable_three_class_head=bool(enable_three_class_head),
+        thr_overall=float(thr_overall) if thr_overall == thr_overall else None,
+        roc_auc_binary=(
+            float(threshold_info.get("roc_auc_binary", float("nan")))
+            if enable_binary_head
+            else None
+        ),
     )
     return fold_results
 

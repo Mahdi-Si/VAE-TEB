@@ -15,12 +15,18 @@ heads, lag-attention and decoder kept frozen) follows the doc verbatim.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import lightning as L
 import torch
 import torch.nn as nn
 from loguru import logger
+
+from model.vae_teb_prediction.new_classifier.guid_cls_v1.logging_utils import (
+    append_jsonl,
+)
 
 
 # Submodules of ``SeqVaeLagAttnV1`` that get unfrozen at stage 2.
@@ -91,6 +97,12 @@ class TwoStageVaeUnfreeze(L.Callback):
         gamma_vae_stage2: VAE-aux loss weight to restore at stage 2.
         lambda_sp_stage2: L2-anchor weight to restore at stage 2.
         unfreeze_submodules: Optional override of the unfreeze set.
+        log_path: Optional path to a JSONL file. When provided, every
+            stage transition (stage 1 begin, stage 2 fire,
+            EarlyStopping reset) is also appended as a structured
+            record so the per-fold log bundle has a machine-readable
+            trail of when each transition happened. ``None`` (default)
+            preserves the prior console-only behaviour.
     """
 
     def __init__(
@@ -100,13 +112,34 @@ class TwoStageVaeUnfreeze(L.Callback):
         gamma_vae_stage2: float,
         lambda_sp_stage2: float,
         unfreeze_submodules: Iterable[str] = _DEFAULT_UNFREEZE_SUBMODULES,
+        log_path: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self.stage1_epochs = int(stage1_epochs)
         self.gamma_vae_stage2 = float(gamma_vae_stage2)
         self.lambda_sp_stage2 = float(lambda_sp_stage2)
         self.unfreeze_submodules: Tuple[str, ...] = tuple(unfreeze_submodules)
+        self.log_path: Optional[Path] = (
+            Path(log_path) if log_path is not None else None
+        )
         self._fired = False
+
+    def _record(self, event: str, **payload) -> None:
+        """Append a stage-transition record to ``log_path`` when configured."""
+        if self.log_path is None:
+            return
+        record = {
+            "event": event,
+            "iso_timestamp": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        try:
+            append_jsonl(self.log_path, record)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                f"TwoStageVaeUnfreeze: failed to append stage transition "
+                f"record to {self.log_path}: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -162,6 +195,13 @@ class TwoStageVaeUnfreeze(L.Callback):
         logger.info(
             f"TwoStageVaeUnfreeze: stage 1 begin (frozen VAE, {len(theta0)} "
             f"params snapshotted for stage-2 anchor; stage1_epochs={self.stage1_epochs})"
+        )
+        self._record(
+            "stage1_begin",
+            epoch=int(trainer.current_epoch),
+            n_params_snapshotted=int(len(theta0)),
+            stage1_epochs=int(self.stage1_epochs),
+            unfreeze_submodules=list(self.unfreeze_submodules),
         )
 
     def on_train_epoch_start(
@@ -225,6 +265,16 @@ class TwoStageVaeUnfreeze(L.Callback):
             f"new VAE param group lr={vae_lr}; "
             f"gamma_vae={self.gamma_vae_stage2}, "
             f"lambda_sp={self.lambda_sp_stage2}"
+        )
+        self._record(
+            "stage2_begin",
+            epoch=int(trainer.current_epoch),
+            n_params_unfrozen=int(len(unfreeze_params)),
+            n_submodules=int(len(self.unfreeze_submodules)),
+            unfreeze_submodules=list(self.unfreeze_submodules),
+            vae_lr=float(vae_lr),
+            gamma_vae=float(self.gamma_vae_stage2),
+            lambda_sp=float(self.lambda_sp_stage2),
         )
 
     @staticmethod

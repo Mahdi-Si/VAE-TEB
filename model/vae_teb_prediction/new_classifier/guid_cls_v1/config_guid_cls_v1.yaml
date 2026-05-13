@@ -98,6 +98,16 @@ model_config:
     causal: true                             # Lower-tri attention mask — required for AR head
     head_hidden_dim: null                    # null => defaults to d_model
     num_classes_multi: 3                     # {0=healthy, 1=acidosis, 2=HIE}
+    heads:
+      # Per-head enable flags. When ``three_class.enabled`` is false the
+      # 3-class linear, CE loss term, per-class CSV columns, threshold
+      # search, evaluation, and cross-fold aggregation are all skipped.
+      # Same story for ``binary.enabled``. At least one must remain true —
+      # ``GuidClassifierConfig.__post_init__`` raises otherwise.
+      three_class:
+        enabled: true
+      binary:
+        enabled: true
 
 
 # =============================================================================
@@ -232,6 +242,42 @@ dataset_config:
     - time_from_labor_onset
     - second_stage_onset
   normalize_fields: [fhr_st, fhr_ph, up_st, up_ph]
+
+
+# =============================================================================
+# Logging  (per-fold persistent logs under fold_{k}/logs/)
+# =============================================================================
+# Every per-fold subprocess produces a self-contained log bundle:
+#   fold_{k}/logs/
+#     fold.log                  All loguru + stdout/stderr (train + eval)
+#     metrics.csv               Lightning CSVLogger: per-step + per-epoch scalars
+#     epoch_summary.jsonl       Per-epoch confusion matrix, per-class P/R/F1,
+#                               calibration (Brier/ECE), grad/weight norms
+#     setup.json                Snapshot of every fold-determining input
+#                               (sizes, priors, weights, optimizer cfg, vae sha)
+#     stage_transitions.jsonl   Live-VAE only: stage1 begin / stage2 fire
+#     subprocess_raw.log        Raw stdout/stderr fallback (C-level prints,
+#                               faulthandler dumps) — written by kfold_trainer
+# A sweep-wide ``kfold_progress.log`` is also written at the run root with one
+# line per fold so the user can see progress at a glance.
+# Defaults are intentionally on; flip individual flags to ``false`` to skip.
+logging:
+  log_level: INFO                            # Loguru level for the file sink
+  capture_stdout_stderr: true                # Tee sys.stdout/stderr to fold.log
+  fold_log_filename: fold.log
+  setup_json: setup.json
+  epoch_summary_jsonl: epoch_summary.jsonl
+  csv_logger:
+    enabled: true                            # Lightning CSVLogger -> metrics.csv
+    flush_logs_every_n_steps: 50
+  diagnostics_callback:
+    enabled: true
+    log_grad_norm: true                      # Per-step global L2 grad norm
+    log_weight_norm: true                    # Per-epoch global L2 weight norm
+    log_param_group_lrs: true                # train/lr_group{i} per opt group
+    log_per_class_metrics: true              # val P/R/F1 per class + confusion
+    log_calibration: true                    # binary Brier + 10-bin ECE
+    log_loss_positions: true                 # per-class effective-pos counts
 
 
 # =============================================================================

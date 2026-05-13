@@ -180,17 +180,100 @@ def apply_segment_dropout(
     return new_batch
 
 
-def _macro_f1(probs_3: torch.Tensor, target_3: torch.Tensor, num_classes: int = 3) -> torch.Tensor:
-    """Macro-averaged F1 from class probabilities."""
+def _per_class_prf1(
+    probs_3: torch.Tensor, target_3: torch.Tensor, num_classes: int = 3
+) -> Dict[str, torch.Tensor]:
+    """Per-class precision / recall / F1 + macro-F1 + confusion matrix.
+
+    Args:
+        probs_3: ``(B, C)`` class probabilities.
+        target_3: ``(B,)`` integer class targets.
+        num_classes: Number of classes; default 3.
+
+    Returns:
+        Dict with keys:
+
+        * ``precision`` / ``recall`` / ``f1`` — ``(C,)`` float tensors,
+          one entry per class. Zero when a class is absent from the
+          buffer (denominator clamped to 1).
+        * ``macro_f1`` — mean of ``f1``.
+        * ``confusion`` — ``(C, C)`` long tensor, ``[true, pred]``.
+        * ``support`` — ``(C,)`` long tensor of target counts per class.
+    """
     preds = probs_3.argmax(dim=-1)
-    f1_per_class: List[torch.Tensor] = []
+    precision = probs_3.new_zeros(num_classes)
+    recall = probs_3.new_zeros(num_classes)
+    f1 = probs_3.new_zeros(num_classes)
+    support = torch.zeros(num_classes, dtype=torch.long)
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    for true_c in range(num_classes):
+        true_mask = target_3 == true_c
+        support[true_c] = int(true_mask.sum().item())
+        for pred_c in range(num_classes):
+            confusion[true_c, pred_c] = int(
+                ((preds == pred_c) & true_mask).sum().item()
+            )
     for c in range(num_classes):
         tp = ((preds == c) & (target_3 == c)).sum().float()
         fp = ((preds == c) & (target_3 != c)).sum().float()
         fn = ((preds != c) & (target_3 == c)).sum().float()
+        precision[c] = tp / (tp + fp).clamp_min(1.0)
+        recall[c] = tp / (tp + fn).clamp_min(1.0)
         denom = (2 * tp + fp + fn).clamp_min(1.0)
-        f1_per_class.append(2 * tp / denom)
-    return torch.stack(f1_per_class).mean()
+        f1[c] = 2 * tp / denom
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "macro_f1": f1.mean(),
+        "confusion": confusion,
+        "support": support,
+    }
+
+
+def _macro_f1(probs_3: torch.Tensor, target_3: torch.Tensor, num_classes: int = 3) -> torch.Tensor:
+    """Macro-averaged F1 from class probabilities (back-compat shim)."""
+    return _per_class_prf1(probs_3, target_3, num_classes=num_classes)["macro_f1"]
+
+
+def _binary_brier(probs_pos: torch.Tensor, target_bin: torch.Tensor) -> torch.Tensor:
+    """Brier score $\\frac{1}{N}\\sum (p_i - y_i)^2$ for the binary head."""
+    target = target_bin.float()
+    return (probs_pos - target).pow(2).mean()
+
+
+def _expected_calibration_error(
+    probs_pos: torch.Tensor,
+    target_bin: torch.Tensor,
+    n_bins: int = 10,
+) -> torch.Tensor:
+    """Equal-width Expected Calibration Error (ECE) for binary probabilities.
+
+    Bins probabilities into ``n_bins`` equal-width buckets in $[0, 1]$,
+    computes the mean confidence and mean accuracy within each bucket,
+    and returns the sample-weighted mean absolute gap. Returns 0 when
+    only one bin is occupied (degenerate case where ECE is undefined).
+    """
+    target = target_bin.float()
+    n = float(target.numel())
+    if n <= 0:
+        return probs_pos.new_tensor(0.0)
+    bin_edges = torch.linspace(0.0, 1.0, n_bins + 1, device=probs_pos.device)
+    ece = probs_pos.new_tensor(0.0)
+    for i in range(n_bins):
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        if i == n_bins - 1:
+            in_bin = (probs_pos >= lo) & (probs_pos <= hi)
+        else:
+            in_bin = (probs_pos >= lo) & (probs_pos < hi)
+        count = in_bin.float().sum()
+        if count.item() <= 0:
+            continue
+        avg_conf = probs_pos[in_bin].mean()
+        avg_acc = target[in_bin].mean()
+        ece = ece + (count / n) * (avg_conf - avg_acc).abs()
+    return ece
 
 
 def _binary_auroc(probs_pos: torch.Tensor, target_bin: torch.Tensor) -> torch.Tensor:
@@ -340,6 +423,12 @@ class PlGuidClassifier(LightningModelBase):
         self._val_probs_bin: List[torch.Tensor] = []
         self._val_target_bin: List[torch.Tensor] = []
 
+        # Populated at the end of every validation epoch with a dict
+        # consumed by :class:`TrainingDiagnosticsCallback` (confusion
+        # matrix, per-class support counts, calibration scalars). Set to
+        # ``None`` when no validation has run yet.
+        self._last_val_summary: Optional[Dict[str, Any]] = None
+
     # ------------------------------------------------------------------
     # Loss / metrics dispatch
     # ------------------------------------------------------------------
@@ -395,36 +484,111 @@ class PlGuidClassifier(LightningModelBase):
         target_3 = batch["label_3"].long()
         target_bin = batch["label_bin"].float()
 
+        # Head flags come from the loss weights (single source of truth that
+        # the trainer also propagates into the model).
+        enable_three_class = bool(self.loss_weights.enable_three_class)
+        enable_binary = bool(self.loss_weights.enable_binary)
+
+        last_prob_3: Optional[torch.Tensor] = None
+        last_prob_bin: Optional[torch.Tensor] = None
+        acc_3: Optional[torch.Tensor] = None
+        acc_bin: Optional[torch.Tensor] = None
+
         with torch.no_grad():
             # Single-GUID summary uses the **last-valid** position so that
             # ``acc_3`` / ``acc_bin`` and the val buffers semantically reflect
             # "the model's prediction at the end of the recording" — the
             # natural final clinical decision.
-            last_prob_3 = _gather_last_valid_per_position(outputs["prob_3"], seg_mask)
-            last_prob_bin = _gather_last_valid_per_position(outputs["prob_bin"], seg_mask)
-            preds_3 = last_prob_3.argmax(dim=-1)
-            acc_3 = (preds_3 == target_3).float().mean()
-            preds_bin = (last_prob_bin >= 0.5).float()
-            acc_bin = (preds_bin == target_bin).float().mean()
+            if enable_three_class and "prob_3" in outputs:
+                last_prob_3 = _gather_last_valid_per_position(outputs["prob_3"], seg_mask)
+                preds_3 = last_prob_3.argmax(dim=-1)
+                acc_3 = (preds_3 == target_3).float().mean()
+            if enable_binary and "prob_bin" in outputs:
+                last_prob_bin = _gather_last_valid_per_position(outputs["prob_bin"], seg_mask)
+                preds_bin = (last_prob_bin >= 0.5).float()
+                acc_bin = (preds_bin == target_bin).float().mean()
             mean_num_segments = batch["num_segments"].float().mean()
 
         metrics: MetricDict = {
             "total_loss": total,
-            "ce_3": components["ce_3"],
-            "bce_bin": components["bce_bin"],
-            "acc_3": acc_3,
-            "acc_bin": acc_bin,
             "mean_num_segments": mean_num_segments,
         }
+        if "ce_3" in components:
+            metrics["ce_3"] = components["ce_3"]
+        if "bce_bin" in components:
+            metrics["bce_bin"] = components["bce_bin"]
+        if acc_3 is not None:
+            metrics["acc_3"] = acc_3
+        if acc_bin is not None:
+            metrics["acc_bin"] = acc_bin
         if "vae_loss" in components:
             metrics["vae_loss"] = components["vae_loss"]
         if "sparsity" in components:
             metrics["sparsity"] = components["sparsity"]
 
-        # Buffer last-valid probabilities for end-of-epoch macro-F1 / AUROC.
+        # Effective-position counters (train stage only — at val these
+        # are unmasked-position-count-equivalents and not informative).
+        # ``loss_warmup_positions`` excludes the first K valid positions
+        # of every row from the loss reduction; the count here reflects
+        # the *kept* set, so the CSV shows whether each epoch saw the
+        # rare class in actual loss-driving positions.
+        if stage == "train":
+            with torch.no_grad():
+                pos_total, pos_per_class = self._count_loss_positions(
+                    seg_mask, target_3, enable_three_class
+                )
+                metrics["loss_positions_total"] = pos_total
+                if pos_per_class is not None:
+                    for c, count in enumerate(pos_per_class):
+                        metrics[f"loss_positions_class{c}"] = count
+
+        # Buffer last-valid probabilities for end-of-epoch macro-F1 / AUROC,
+        # honouring the per-head gate.
         if stage == "val":
             self._buffer_val_outputs(last_prob_3, last_prob_bin, target_3, target_bin)
         return total, metrics
+
+    def _count_loss_positions(
+        self,
+        seg_mask: torch.Tensor,
+        target_3: torch.Tensor,
+        enable_three_class: bool,
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+        """Count per-batch positions that contribute to the loss reduction.
+
+        Mirrors the ``loss_warmup_positions`` skip applied inside
+        :meth:`GuidClassifierLoss._two_level_mean` so the reported count
+        equals the count actually used by the gradient. The per-class
+        breakdown uses the GUID-level 3-class label broadcast to every
+        kept position (the same broadcast the loss uses).
+
+        Args:
+            seg_mask: ``(B, N)`` segment validity mask.
+            target_3: ``(B,)`` long GUID-level class id.
+            enable_three_class: When False, the per-class breakdown is
+                skipped (returned ``None``).
+
+        Returns:
+            ``(positions_total, positions_per_class)``. ``positions_total``
+            is always a scalar tensor; ``positions_per_class`` is a
+            length-3 list of scalar tensors when ``enable_three_class``
+            is True, else ``None``.
+        """
+        k_warm = int(self.loss_weights.loss_warmup_positions)
+        if k_warm > 0:
+            rank_one_based = seg_mask.long().cumsum(dim=-1)
+            keep_mask = (rank_one_based > k_warm) & seg_mask
+        else:
+            keep_mask = seg_mask
+        keep_float = keep_mask.float()
+        positions_total = keep_float.sum()
+        per_class: Optional[List[torch.Tensor]] = None
+        if enable_three_class:
+            per_class = []
+            for c in range(3):
+                row_match = (target_3 == c).float().unsqueeze(1)    # (B, 1)
+                per_class.append((keep_float * row_match).sum())
+        return positions_total, per_class
 
     def _compute_live_aux_terms(
         self,
@@ -494,16 +658,27 @@ class PlGuidClassifier(LightningModelBase):
 
     def _buffer_val_outputs(
         self,
-        last_prob_3: torch.Tensor,
-        last_prob_bin: torch.Tensor,
+        last_prob_3: Optional[torch.Tensor],
+        last_prob_bin: Optional[torch.Tensor],
         target_3: torch.Tensor,
         target_bin: torch.Tensor,
     ) -> None:
-        """Accumulate per-batch last-valid probabilities for epoch metrics."""
-        self._val_probs_3.append(last_prob_3.detach().cpu())
-        self._val_target_3.append(target_3.detach().cpu())
-        self._val_probs_bin.append(last_prob_bin.detach().cpu())
-        self._val_target_bin.append(target_bin.detach().cpu())
+        """Accumulate per-batch last-valid probabilities for epoch metrics.
+
+        Args:
+            last_prob_3: 3-class probabilities at the last-valid position,
+                or ``None`` when the 3-class head is disabled.
+            last_prob_bin: Binary probabilities at the last-valid position,
+                or ``None`` when the binary head is disabled.
+            target_3: GUID-level 3-class targets.
+            target_bin: GUID-level binary targets.
+        """
+        if last_prob_3 is not None:
+            self._val_probs_3.append(last_prob_3.detach().cpu())
+            self._val_target_3.append(target_3.detach().cpu())
+        if last_prob_bin is not None:
+            self._val_probs_bin.append(last_prob_bin.detach().cpu())
+            self._val_target_bin.append(target_bin.detach().cpu())
 
     def on_validation_epoch_start(self) -> None:
         self._val_probs_3.clear()
@@ -512,16 +687,50 @@ class PlGuidClassifier(LightningModelBase):
         self._val_target_bin.clear()
 
     def on_validation_epoch_end(self) -> None:
-        if not self._val_probs_3:
-            return
-        probs_3 = torch.cat(self._val_probs_3)
-        target_3 = torch.cat(self._val_target_3)
-        probs_bin = torch.cat(self._val_probs_bin)
-        target_bin = torch.cat(self._val_target_bin)
-        if self.compute_macro_f1:
-            self.log("val/macro_f1", _macro_f1(probs_3, target_3), sync_dist=True)
-        if self.compute_binary_auroc:
+        # Skip per-head metrics when the buffer for that head is empty
+        # (either the head was disabled this run or no batches were
+        # processed). Each head is independent — if one is disabled and
+        # the other enabled, we still compute the enabled head's metric.
+        summary: Dict[str, Any] = {
+            "epoch": int(getattr(self.trainer, "current_epoch", -1)),
+            "global_step": int(getattr(self.trainer, "global_step", 0)),
+        }
+        if self.compute_macro_f1 and self._val_probs_3:
+            probs_3 = torch.cat(self._val_probs_3)
+            target_3 = torch.cat(self._val_target_3)
+            prf = _per_class_prf1(probs_3, target_3)
+            self.log("val/macro_f1", prf["macro_f1"], sync_dist=True)
+            # Per-class P/R/F1 as separate scalars so each lands in its
+            # own CSV column. Indexed by class id (0=healthy, 1=acidosis,
+            # 2=HIE) — see PRD §4.1.
+            for c in range(prf["f1"].numel()):
+                self.log(f"val/precision_class{c}", prf["precision"][c], sync_dist=True)
+                self.log(f"val/recall_class{c}", prf["recall"][c], sync_dist=True)
+                self.log(f"val/f1_class{c}", prf["f1"][c], sync_dist=True)
+            summary["n_val_guids_3"] = int(target_3.numel())
+            summary["confusion_3class"] = prf["confusion"].tolist()
+            summary["support_3class"] = prf["support"].tolist()
+            summary["precision_per_class"] = prf["precision"].detach().cpu().tolist()
+            summary["recall_per_class"] = prf["recall"].detach().cpu().tolist()
+            summary["f1_per_class"] = prf["f1"].detach().cpu().tolist()
+            summary["macro_f1"] = float(prf["macro_f1"].item())
+        if self.compute_binary_auroc and self._val_probs_bin:
+            probs_bin = torch.cat(self._val_probs_bin)
+            target_bin = torch.cat(self._val_target_bin)
             self.log("val/binary_auroc", _binary_auroc(probs_bin, target_bin), sync_dist=True)
+            brier = _binary_brier(probs_bin, target_bin)
+            ece = _expected_calibration_error(probs_bin, target_bin)
+            self.log("val/brier", brier, sync_dist=True)
+            self.log("val/ece", ece, sync_dist=True)
+            summary["n_val_guids_bin"] = int(target_bin.numel())
+            summary["bin_positive_count"] = int(target_bin.sum().item())
+            summary["bin_negative_count"] = int((target_bin.numel() - target_bin.sum().item()))
+            summary["brier"] = float(brier.item())
+            summary["ece"] = float(ece.item())
+        # Expose the structured summary so
+        # :class:`TrainingDiagnosticsCallback` can persist it to
+        # ``epoch_summary.jsonl`` without re-running the buffer math.
+        self._last_val_summary = summary
 
     # ------------------------------------------------------------------
     # Optimizer (supports two parameter groups when VAE is unfrozen)

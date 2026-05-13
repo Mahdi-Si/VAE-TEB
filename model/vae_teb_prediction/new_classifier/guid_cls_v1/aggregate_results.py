@@ -91,6 +91,50 @@ def _has_new_layout(fold_dir: Path) -> bool:
     return (fold_dir / "evaluation" / "binary_head").is_dir()
 
 
+def _fold_has_binary_head(fold_dir: Path) -> bool:
+    """True iff the fold emitted any binary-head artefact.
+
+    Detection precedence:
+      1. New layout's ``evaluation/binary_head/roc.csv``
+         (also covers the legacy ``roc_binary_data.csv`` alias via
+         :func:`_resolve_binary_roc_csv`).
+      2. Failing that, any ``binary_head/metrics_vs_time/*.csv`` —
+         covers the case where ROC was skipped but the metric-vs-time
+         loop ran.
+
+    A run with the binary head disabled writes none of these.
+    """
+    if _resolve_binary_roc_csv(fold_dir) is not None:
+        return True
+    metrics_dir = fold_dir / "evaluation" / "binary_head" / "metrics_vs_time"
+    if metrics_dir.is_dir() and any(metrics_dir.glob("*.csv")):
+        return True
+    return False
+
+
+def _fold_has_three_class_head(fold_dir: Path) -> bool:
+    """True iff the fold emitted any 3-class-head artefact.
+
+    Detection precedence:
+      1. ``evaluation/multiclass_head/diagnostics/confusion_matrix.csv``
+         (always produced when the 3-class head is enabled).
+      2. ``evaluation/multiclass_head/diagnostics/roc_ovr.csv``.
+      3. Any per-class metric CSV under
+         ``evaluation/multiclass_head/per_class_vs_time/``.
+
+    A run with the 3-class head disabled writes none of these.
+    """
+    diag = fold_dir / "evaluation" / "multiclass_head" / "diagnostics"
+    if (diag / "confusion_matrix.csv").exists():
+        return True
+    if (diag / "roc_ovr.csv").exists():
+        return True
+    perclass = fold_dir / "evaluation" / "multiclass_head" / "per_class_vs_time"
+    if perclass.is_dir() and any(perclass.rglob("*.csv")):
+        return True
+    return False
+
+
 def _load_fold_test_csv(fold_dir: Path) -> Optional[pd.DataFrame]:
     csv = _resolve_test_predictions_csv(fold_dir)
     if csv is None:
@@ -366,12 +410,28 @@ def _plot_mean_minmax_curve(
     return float(np.nanmean(mean)), float(np.nanmean(hi - lo))
 
 
-def _add_minmax_band_note(fig, n_folds: int) -> None:
-    """Add a one-line caption stating the band represents min/max across folds."""
+def _add_minmax_band_note(
+    fig,
+    n_folds: int,
+    *,
+    extra: Optional[str] = None,
+) -> None:
+    """Add a one-line caption stating the band represents min/max across folds.
+
+    Args:
+        fig: matplotlib Figure to annotate.
+        n_folds: Number of folds contributing to the band.
+        extra: Optional extra text appended after a vertical bar (used by
+            SSO-axis aggregators to surface the cross-fold dropped-GUID
+            total).
+    """
+    note = f"Shaded region: min/max across {int(n_folds)} folds"
+    if extra:
+        note = f"{note}  |  {extra}"
     fig.text(
         0.99,
         0.01,
-        f"Shaded region: min/max across {int(n_folds)} folds",
+        note,
         fontsize=9,
         color="0.4",
         ha="right",
@@ -379,22 +439,56 @@ def _add_minmax_band_note(fig, n_folds: int) -> None:
     )
 
 
+def _axis_style_agg(axis_mode: str) -> Tuple[str, bool, str]:
+    """Return (x_label, invert_x, title_axis_tag) for a given axis mode.
+
+    The third element is a short tag rendered inside the figure title in
+    SSO mode (empty string in delivery mode).
+    """
+    if axis_mode == "sso":
+        return "Hours from second stage onset", False, "axis: SSO"
+    return "Hours Before Birth", True, ""
+
+
+def _maybe_axvline_zero_agg(ax, axis_mode: str) -> None:
+    """Draw a faint vertical reference line at $t = 0$ when in SSO mode."""
+    if axis_mode != "sso":
+        return
+    xlim = ax.get_xlim()
+    lo, hi = min(xlim), max(xlim)
+    if 0.0 < lo or 0.0 > hi:
+        return
+    ax.axvline(x=0.0, color="0.35", linestyle=":", linewidth=1.1, zorder=0)
+
+
 def _aggregate_perclass_metric_curves(
     fold_dirs: List[Path],
     agg_root: Path,
+    *,
+    input_subtree: str = "multiclass_head/per_class_vs_time",
+    output_subtree: str = "multiclass_head/per_class_vs_time",
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Cross-fold per-class metric curves (mirrors ``plot_perclass_panel_combined``).
 
     Reads each fold's long-format
-    ``multiclass_head/per_class_vs_time/<metric_type>.csv`` and emits
-    one combined 3-panel PNG per metric_type
-    (``aggregated_plots/multiclass_head/per_class_vs_time/<metric_type>_panel.png``)
-    plus a per-class CSV
-    (``<metric_type>_<class>.csv`` with ``_mean / _min / _max / n_folds``
-    columns).
+    ``evaluation/<input_subtree>/<metric_type>.csv`` and emits one
+    combined 3-panel PNG per metric_type
+    (``aggregated_plots/<output_subtree>/<metric_type>_panel.png``)
+    plus a per-class CSV (``<metric_type>_<class>.csv`` with
+    ``_mean / _min / _max / n_folds`` columns).
 
     Each panel shows three lines (sensitivity, specificity, FPR) for one
     class, with min/max bands across folds. No decision-time line.
+
+    Args:
+        fold_dirs: Per-fold directories.
+        agg_root: ``aggregated_plots/`` root.
+        input_subtree: Path under each fold's ``evaluation/``.
+        output_subtree: Path under ``aggregated_plots/``.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional footer text.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -406,19 +500,13 @@ def _aggregate_perclass_metric_curves(
 
     summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     for metric_type in METRIC_TYPES:
-        out_dir = agg_root / "multiclass_head" / "per_class_vs_time"
+        out_dir = agg_root / output_subtree
 
         per_fold_by_class: Dict[str, List[pd.DataFrame]] = {
             c: [] for c in PER_CLASS_NAMES
         }
         for fd in fold_dirs:
-            csv = (
-                fd
-                / "evaluation"
-                / "multiclass_head"
-                / "per_class_vs_time"
-                / f"{metric_type}.csv"
-            )
+            csv = fd / "evaluation" / input_subtree / f"{metric_type}.csv"
             if not csv.exists():
                 continue
             try:
@@ -481,9 +569,12 @@ def _aggregate_perclass_metric_curves(
                 color=_PER_CLASS_PALETTE.get(class_name, "black"),
                 fontweight="bold",
             )
-            ax.set_xlabel("Hours Before Birth")
+            x_label, invert_x, _title_axis = _axis_style_agg(axis_mode)
+            ax.set_xlabel(x_label)
             ax.set_ylim([0, 1.05])
-            ax.invert_xaxis()
+            if invert_x:
+                ax.invert_xaxis()
+            _maybe_axvline_zero_agg(ax, axis_mode)
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=9, loc="best")
 
@@ -517,9 +608,11 @@ def _aggregate_perclass_metric_curves(
 
         axes[0].set_ylabel("Metric value")
         suptitle = f"Per-class metrics vs time — {metric_label.get(metric_type, metric_type)}"
+        if axis_mode == "sso":
+            suptitle += " (axis: SSO)"
         fig.suptitle(suptitle, fontsize=14, fontweight="bold")
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_used)
+        _add_minmax_band_note(fig, n_folds_used, extra=extra_footer)
         fig.savefig(out_dir / f"{metric_type}_panel.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -531,16 +624,34 @@ def _aggregate_perclass_metric_curves(
 def _aggregate_binary_by_underlying_class_curves(
     fold_dirs: List[Path],
     agg_root: Path,
+    *,
+    input_subtree: str = "binary_head/by_underlying_class_vs_time",
+    output_subtree: str = "binary_head/by_underlying_class_vs_time",
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Cross-fold binary curves restricted to each underlying 3-class label.
 
-    Reads ``binary_head/by_underlying_class_vs_time/<metric_type>.csv``
-    per fold and emits one combined plot per metric_type under
-    ``aggregated_plots/binary_head/by_underlying_class_vs_time/<metric_type>.png``
-    plus per-(metric_type, restrict_class) CSVs with ``_mean / _min / _max``.
+    Reads ``evaluation/<input_subtree>/<metric_type>.csv`` per fold and
+    emits one combined plot per metric_type at
+    ``aggregated_plots/<output_subtree>/<metric_type>.png`` plus
+    per-(metric_type, restrict_class) CSVs with ``_mean / _min / _max``.
 
     Layout: single axes overlaying acidosis (orange) and HIE (red)
     sensitivity curves, with min/max bands. No decision-time line.
+
+    Args:
+        fold_dirs: Per-fold directories.
+        agg_root: ``aggregated_plots/`` root.
+        input_subtree: Path under each fold's ``evaluation/`` to read
+            from. Defaults to the delivery-axis layout; pass the
+            ``three_metric_types_sso/...`` sibling for the SSO mirror.
+        output_subtree: Path under ``aggregated_plots/`` to write to.
+        axis_mode: ``'delivery'`` (inverted x-axis labelled "Hours
+            Before Birth") or ``'sso'`` (natural orientation labelled
+            "Hours from second stage onset", vertical zero-line marker).
+        extra_footer: Optional extra footer text (e.g. cross-fold
+            dropped-GUID total in SSO mode).
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -548,7 +659,7 @@ def _aggregate_binary_by_underlying_class_curves(
     summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     for metric_type in METRIC_TYPES:
         sub_summary: Dict[str, Dict[str, float]] = {}
-        out_dir = agg_root / "binary_head" / "by_underlying_class_vs_time"
+        out_dir = agg_root / output_subtree
 
         per_fold_by_restrict: Dict[str, List[pd.DataFrame]] = {
             "acidosis": [],
@@ -558,8 +669,7 @@ def _aggregate_binary_by_underlying_class_curves(
             csv = (
                 fd
                 / "evaluation"
-                / "binary_head"
-                / "by_underlying_class_vs_time"
+                / input_subtree
                 / f"{metric_type}.csv"
             )
             if not csv.exists():
@@ -631,18 +741,24 @@ def _aggregate_binary_by_underlying_class_curves(
                 ),
             }
 
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Sensitivity", fontsize=13)
-        ax.set_title(
-            f"Binary head — by underlying class — {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
+        title = (
+            f"Binary head — by underlying class — "
+            f"{metric_type.replace('_', ' ').title()}"
         )
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.legend(fontsize=11, loc="best")
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_used)
+        _add_minmax_band_note(fig, n_folds_used, extra=extra_footer)
         fig.savefig(out_dir / f"{metric_type}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -654,18 +770,31 @@ def _aggregate_binary_by_underlying_class_curves(
 def _aggregate_perclass_subgroup_metric_curves(
     fold_dirs: List[Path],
     agg_root: Path,
+    *,
+    input_subtree: str = "multiclass_head/per_class_subgroups_vs_time",
+    output_subtree: str = "multiclass_head/per_class_subgroups_vs_time",
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, float]]]]:
     """Cross-fold per-class × subgroup curves with min/max bands.
 
     Reads each fold's long-format
-    ``multiclass_head/per_class_subgroups_vs_time/<metric_type>.csv``
-    (cols: ``bin_center, class, subgroup, sensitivity, specificity,
-    fpr, n_pos, n_neg, n``) and emits cross-fold curves under
-    ``aggregated_plots/multiclass_head/per_class_subgroups_vs_time/<metric_type>/<class>_<subgroup>.{csv,png}``.
+    ``evaluation/<input_subtree>/<metric_type>.csv`` (cols:
+    ``bin_center, class, subgroup, sensitivity, specificity, fpr,
+    n_pos, n_neg, n``) and emits cross-fold curves under
+    ``aggregated_plots/<output_subtree>/<metric_type>/<class>_<subgroup>.{csv,png}``.
 
     Each (class, subgroup) cell renders a 2-panel figure (sensitivity
     + FPR), each panel showing the cross-fold mean line + a min/max
     fill_between band. No decision-time line.
+
+    Args:
+        fold_dirs: Per-fold directories.
+        agg_root: ``aggregated_plots/`` root.
+        input_subtree: Path under each fold's ``evaluation/``.
+        output_subtree: Path under ``aggregated_plots/``.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional extra footer text.
 
     Returns:
         Nested dict keyed by ``[metric_type][class][subgroup]`` carrying
@@ -677,24 +806,13 @@ def _aggregate_perclass_subgroup_metric_curves(
     summary: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
     for metric_type in METRIC_TYPES:
         per_class_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
-        out_root = (
-            agg_root
-            / "multiclass_head"
-            / "per_class_subgroups_vs_time"
-            / metric_type
-        )
+        out_root = agg_root / output_subtree / metric_type
 
         # First pass: read each fold's long-format CSV and group by
         # (class, subgroup).
         per_fold_by_combo: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
         for fd in fold_dirs:
-            csv = (
-                fd
-                / "evaluation"
-                / "multiclass_head"
-                / "per_class_subgroups_vs_time"
-                / f"{metric_type}.csv"
-            )
+            csv = fd / "evaluation" / input_subtree / f"{metric_type}.csv"
             if not csv.exists():
                 continue
             try:
@@ -737,14 +855,17 @@ def _aggregate_perclass_subgroup_metric_curves(
                 label=f"{subgroup_name} (N={len(collected)} folds)",
                 color=color, marker="o",
             )
+            x_label_per_class_sg, invert_x_per_class_sg, _ = _axis_style_agg(axis_mode)
             axes[0].set_title(
                 f"{class_name} | {subgroup_name} — sensitivity",
                 fontsize=14, fontweight="bold",
                 color=color,
             )
-            axes[0].set_xlabel("Hours Before Birth", fontsize=13)
+            axes[0].set_xlabel(x_label_per_class_sg, fontsize=13)
             axes[0].set_ylabel("Sensitivity", fontsize=13)
-            axes[0].invert_xaxis()
+            if invert_x_per_class_sg:
+                axes[0].invert_xaxis()
+            _maybe_axvline_zero_agg(axes[0], axis_mode)
             axes[0].set_ylim([0, 1.05])
             axes[0].grid(True, alpha=0.3)
             axes[0].legend(fontsize=10, loc="best")
@@ -758,9 +879,11 @@ def _aggregate_perclass_subgroup_metric_curves(
                 f"{class_name} | {subgroup_name} — FPR",
                 fontsize=14, fontweight="bold",
             )
-            axes[1].set_xlabel("Hours Before Birth", fontsize=13)
+            axes[1].set_xlabel(x_label_per_class_sg, fontsize=13)
             axes[1].set_ylabel("FPR", fontsize=13)
-            axes[1].invert_xaxis()
+            if invert_x_per_class_sg:
+                axes[1].invert_xaxis()
+            _maybe_axvline_zero_agg(axes[1], axis_mode)
             axes[1].set_ylim([0, 1.05])
             axes[1].grid(True, alpha=0.3)
             axes[1].legend(fontsize=10, loc="best")
@@ -925,33 +1048,52 @@ def _aggregate_perclass_auroc_curves(
 def _aggregate_binary_metrics_vs_time_curves(
     fold_dirs: List[Path],
     agg_root: Path,
+    *,
+    input_subtree: str = "binary_head/metrics_vs_time",
+    output_subtree: str = "binary_head/metrics_vs_time",
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Cross-fold binary head sensitivity / specificity / FPR vs time.
 
-    Reads each fold's ``binary_head/metrics_vs_time/<metric_type>.csv``
-    (cols: ``bin_center, sensitivity, specificity, fpr, n_pos, n_neg, n``)
+    Reads each fold's
+    ``evaluation/<input_subtree>/<metric_type>.csv`` (cols:
+    ``bin_center, sensitivity, specificity, fpr, n_pos, n_neg, n``)
     and emits one combined PNG per metric_type at
-    ``aggregated_plots/binary_head/metrics_vs_time/<metric_type>.png``
-    plus a CSV with ``_mean / _min / _max / n_folds`` for each metric.
+    ``aggregated_plots/<output_subtree>/<metric_type>.png`` plus a CSV
+    with ``_mean / _min / _max / n_folds`` for each metric.
 
     Layout mirrors the per-fold ``plot_single_metric_type`` style: three
     lines on a single 12×6 axes, palette
     ``{sensitivity: green, specificity: blue, fpr: red}``, no decision
     line. Min/max bands across folds.
+
+    Args:
+        fold_dirs: Per-fold directories to aggregate.
+        agg_root: ``aggregated_plots/`` root.
+        input_subtree: Path under each fold's ``evaluation/`` to read
+            from. Defaults to the delivery-axis layout; pass
+            ``"three_metric_types_sso/binary_head/metrics_vs_time"`` for
+            the SSO mirror.
+        output_subtree: Path under ``aggregated_plots/`` to write to.
+        axis_mode: ``'delivery'`` (inverted x-axis, "Hours Before Birth")
+            or ``'sso'`` (natural orientation, "Hours from second stage
+            onset", vertical zero-line marker).
+        extra_footer: Optional extra footer text (e.g. cross-fold
+            dropped-GUID total in SSO mode).
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
     summary: Dict[str, Dict[str, float]] = {}
     for metric_type in METRIC_TYPES:
-        out_dir = agg_root / "binary_head" / "metrics_vs_time"
+        out_dir = agg_root / output_subtree
 
         per_fold_frames: List[pd.DataFrame] = []
         for fd in fold_dirs:
             csv = (
                 fd
                 / "evaluation"
-                / "binary_head"
-                / "metrics_vs_time"
+                / input_subtree
                 / f"{metric_type}.csv"
             )
             if not csv.exists():
@@ -991,18 +1133,24 @@ def _aggregate_binary_metrics_vs_time_curves(
                 per_mt_summary[f"{metric_name}_mean_avg_over_bins"] = stat[0]
                 per_mt_summary[f"{metric_name}_minmax_avg_over_bins"] = stat[1]
 
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Metric value", fontsize=13)
-        ax.set_title(
-            f"Binary head — metrics vs time — {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
+        title = (
+            f"Binary head — metrics vs time — "
+            f"{metric_type.replace('_', ' ').title()}"
         )
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=11, loc="best")
         fig.tight_layout()
-        _add_minmax_band_note(fig, len(per_fold_frames))
+        _add_minmax_band_note(fig, len(per_fold_frames), extra=extra_footer)
         fig.savefig(out_dir / f"{metric_type}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1093,12 +1241,24 @@ def _plot_agg_diagnosis_comparison(
     per_fold_by_subgroup: Dict[str, List[pd.DataFrame]],
     output_dir: Path,
     metric_type: str,
+    *,
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> None:
     """Cross-fold mirror of :func:`clinical_metrics_utils._plot_diagnosis_comparison`.
 
     Renders an overlay of healthy/acidosis/hie/unhealthy sensitivity
     (specificity for healthy) curves with min/max bands. Output:
     ``output_dir/diagnosis_comparison.png`` + per-group CSVs.
+
+    Args:
+        per_fold_by_subgroup: Output of :func:`_read_binary_subgroup_long`
+            (or its SSO-axis sibling).
+        output_dir: Aggregated plots subdirectory.
+        metric_type: Display label.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional extra footer text passed through to the
+            min/max band note.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -1131,18 +1291,21 @@ def _plot_agg_diagnosis_comparison(
         )
         n_folds_max = max(n_folds_max, len(collected))
 
-    ax.set_xlabel("Hours Before Birth", fontsize=13)
+    x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+    ax.set_xlabel(x_label, fontsize=13)
     ax.set_ylabel("Sensitivity (Specificity for Healthy)", fontsize=13)
-    ax.set_title(
-        f"Diagnosis Comparison - {metric_type.replace('_', ' ').title()}",
-        fontsize=14, fontweight="bold",
-    )
+    title = f"Diagnosis Comparison - {metric_type.replace('_', ' ').title()}"
+    if title_axis:
+        title += f" ({title_axis})"
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(fontsize=11, loc="best")
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
-    ax.invert_xaxis()
+    if invert_x:
+        ax.invert_xaxis()
+    _maybe_axvline_zero_agg(ax, axis_mode)
     fig.tight_layout()
-    _add_minmax_band_note(fig, n_folds_max)
+    _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
     fig.savefig(output_dir / "diagnosis_comparison.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1151,10 +1314,20 @@ def _plot_agg_cs_stratification(
     per_fold_by_subgroup: Dict[str, List[pd.DataFrame]],
     output_dir: Path,
     metric_type: str,
+    *,
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> None:
     """Cross-fold mirror of :func:`clinical_metrics_utils._plot_cs_stratification`.
 
     Three plots: unhealthy / hie / acidosis × CS pos/neg. Sensitivity y.
+
+    Args:
+        per_fold_by_subgroup: Per-fold subgroup DataFrames.
+        output_dir: Aggregated plots subdirectory.
+        metric_type: Display label.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional extra footer text.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -1193,18 +1366,21 @@ def _plot_agg_cs_stratification(
             )
             n_folds_max = max(n_folds_max, len(collected))
 
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Sensitivity", fontsize=13)
-        ax.set_title(
-            f"{title_text} - {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
-        )
+        title = f"{title_text} - {metric_type.replace('_', ' ').title()}"
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.legend(fontsize=11, loc="best")
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_max)
+        _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
         fig.savefig(output_dir / f"{file_stem}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1213,10 +1389,20 @@ def _plot_agg_bg_stratification(
     per_fold_by_subgroup: Dict[str, List[pd.DataFrame]],
     output_dir: Path,
     metric_type: str,
+    *,
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> None:
     """Cross-fold mirror of :func:`clinical_metrics_utils._plot_bg_stratification`.
 
     One plot: acidosis × BG pos/neg. Sensitivity y.
+
+    Args:
+        per_fold_by_subgroup: Per-fold subgroup DataFrames.
+        output_dir: Aggregated plots subdirectory.
+        metric_type: Display label.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional footer text.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -1247,18 +1433,21 @@ def _plot_agg_bg_stratification(
         )
         n_folds_max = max(n_folds_max, len(collected))
 
-    ax.set_xlabel("Hours Before Birth", fontsize=13)
+    x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+    ax.set_xlabel(x_label, fontsize=13)
     ax.set_ylabel("Sensitivity", fontsize=13)
-    ax.set_title(
-        f"Acidosis by BG Status - {metric_type.replace('_', ' ').title()}",
-        fontsize=14, fontweight="bold",
-    )
+    title = f"Acidosis by BG Status - {metric_type.replace('_', ' ').title()}"
+    if title_axis:
+        title += f" ({title_axis})"
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(fontsize=11, loc="best")
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 1.05])
-    ax.invert_xaxis()
+    if invert_x:
+        ax.invert_xaxis()
+    _maybe_axvline_zero_agg(ax, axis_mode)
     fig.tight_layout()
-    _add_minmax_band_note(fig, n_folds_max)
+    _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
     fig.savefig(output_dir / "acidosis_bg_stratification.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1267,11 +1456,21 @@ def _plot_agg_healthy_subgroups(
     per_fold_by_subgroup: Dict[str, List[pd.DataFrame]],
     output_dir: Path,
     metric_type: str,
+    *,
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> None:
     """Cross-fold mirror of :func:`clinical_metrics_utils._plot_healthy_subgroups`.
 
     Three plots (CS, BG, BG×CS combos). Healthy subgroups are pure
     negatives, so y is specificity (not sensitivity).
+
+    Args:
+        per_fold_by_subgroup: Per-fold subgroup DataFrames.
+        output_dir: Aggregated plots subdirectory.
+        metric_type: Display label.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        extra_footer: Optional footer text.
     """
     import matplotlib.pyplot as plt  # noqa: WPS433
 
@@ -1301,18 +1500,21 @@ def _plot_agg_healthy_subgroups(
                 metric_name="specificity",
             )
             n_folds_max = max(n_folds_max, len(collected))
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Specificity (Correctly Identified as Healthy)", fontsize=13)
-        ax.set_title(
-            f"Healthy by CS Status - {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
-        )
+        title = f"Healthy by CS Status - {metric_type.replace('_', ' ').title()}"
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.legend(fontsize=11, loc="best")
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_max)
+        _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
         fig.savefig(output_dir / "healthy_cs_stratification.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1342,18 +1544,21 @@ def _plot_agg_healthy_subgroups(
                 metric_name="specificity",
             )
             n_folds_max = max(n_folds_max, len(collected))
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Specificity (Correctly Identified as Healthy)", fontsize=13)
-        ax.set_title(
-            f"Healthy by BG Status - {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
-        )
+        title = f"Healthy by BG Status - {metric_type.replace('_', ' ').title()}"
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.legend(fontsize=11, loc="best")
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_max)
+        _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
         fig.savefig(output_dir / "healthy_bg_stratification.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1386,18 +1591,21 @@ def _plot_agg_healthy_subgroups(
                 metric_name="specificity",
             )
             n_folds_max = max(n_folds_max, len(collected))
-        ax.set_xlabel("Hours Before Birth", fontsize=13)
+        x_label, invert_x, title_axis = _axis_style_agg(axis_mode)
+        ax.set_xlabel(x_label, fontsize=13)
         ax.set_ylabel("Specificity (Correctly Identified as Healthy)", fontsize=13)
-        ax.set_title(
-            f"Healthy BG×CS Combinations - {metric_type.replace('_', ' ').title()}",
-            fontsize=14, fontweight="bold",
-        )
+        title = f"Healthy BGxCS Combinations - {metric_type.replace('_', ' ').title()}"
+        if title_axis:
+            title += f" ({title_axis})"
+        ax.set_title(title, fontsize=14, fontweight="bold")
         ax.legend(fontsize=10, loc="best", ncol=2)
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
+        _maybe_axvline_zero_agg(ax, axis_mode)
         fig.tight_layout()
-        _add_minmax_band_note(fig, n_folds_max)
+        _add_minmax_band_note(fig, n_folds_max, extra=extra_footer)
         fig.savefig(output_dir / "healthy_bg_cs_combinations.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -1405,37 +1613,128 @@ def _plot_agg_healthy_subgroups(
 def _aggregate_binary_subgroup_curves(
     fold_dirs: List[Path],
     agg_root: Path,
+    *,
+    input_subtree: str = "binary_head/subgroups_vs_time",
+    output_subtree: str = "binary_head/subgroups_vs_time",
+    axis_mode: str = "delivery",
+    extra_footer: Optional[str] = None,
 ) -> Dict[str, Dict[str, int]]:
     """Cross-fold binary subgroup analysis.
 
     Reads each fold's
-    ``binary_head/subgroups_vs_time/<metric_type>.csv`` and dispatches to
+    ``evaluation/<input_subtree>/<metric_type>.csv`` and dispatches to
     four sub-helpers (diagnosis comparison, CS stratification, BG
     stratification, healthy subgroups) — each mirroring its per-fold
-    counterpart in ``clinical_metrics_utils.py``.
+    counterpart in ``clinical_metrics_utils.py`` /
+    ``sso_metrics_utils.py``.
 
     Outputs per metric_type land under
-    ``aggregated_plots/binary_head/subgroups_vs_time/<metric_type>/``.
+    ``aggregated_plots/<output_subtree>/<metric_type>/``.
+
+    Args:
+        fold_dirs: Per-fold directories.
+        agg_root: ``aggregated_plots/`` root.
+        input_subtree: Path under each fold's ``evaluation/``.
+        output_subtree: Path under ``aggregated_plots/``.
+        axis_mode: ``'delivery'`` or ``'sso'`` — controls subplot
+            x-axis label / inversion / zero-line / footer.
+        extra_footer: Optional extra footer text.
 
     Returns:
-        ``{metric_type: {subgroup_name: n_folds}}`` — useful as a
-        bookkeeping summary in the run-level JSON.
+        ``{metric_type: {subgroup_name: n_folds}}`` — bookkeeping
+        summary for the run-level JSON.
     """
     summary: Dict[str, Dict[str, int]] = {}
     for metric_type in METRIC_TYPES:
-        per_fold_by_subgroup = _read_binary_subgroup_long(fold_dirs, metric_type)
+        per_fold_by_subgroup = _read_binary_subgroup_long_at(
+            fold_dirs, metric_type, input_subtree=input_subtree,
+        )
         if not per_fold_by_subgroup:
             continue
-        out_dir = agg_root / "binary_head" / "subgroups_vs_time" / metric_type
+        out_dir = agg_root / output_subtree / metric_type
         out_dir.mkdir(parents=True, exist_ok=True)
-        _plot_agg_diagnosis_comparison(per_fold_by_subgroup, out_dir, metric_type)
-        _plot_agg_cs_stratification(per_fold_by_subgroup, out_dir, metric_type)
-        _plot_agg_bg_stratification(per_fold_by_subgroup, out_dir, metric_type)
-        _plot_agg_healthy_subgroups(per_fold_by_subgroup, out_dir, metric_type)
+        _plot_agg_diagnosis_comparison(
+            per_fold_by_subgroup, out_dir, metric_type,
+            axis_mode=axis_mode, extra_footer=extra_footer,
+        )
+        _plot_agg_cs_stratification(
+            per_fold_by_subgroup, out_dir, metric_type,
+            axis_mode=axis_mode, extra_footer=extra_footer,
+        )
+        _plot_agg_bg_stratification(
+            per_fold_by_subgroup, out_dir, metric_type,
+            axis_mode=axis_mode, extra_footer=extra_footer,
+        )
+        _plot_agg_healthy_subgroups(
+            per_fold_by_subgroup, out_dir, metric_type,
+            axis_mode=axis_mode, extra_footer=extra_footer,
+        )
         summary[metric_type] = {
             sg: len(frames) for sg, frames in per_fold_by_subgroup.items()
         }
     return summary
+
+
+def _read_sso_dropped_counts(
+    fold_dirs: List[Path],
+) -> Tuple[Optional[int], Dict[str, Optional[int]]]:
+    """Sum dropped-GUID counts across per-fold ``sso_filter_summary.json``.
+
+    Returns:
+        Tuple ``(total, per_fold_map)``. ``total`` is ``None`` if no
+        fold has an SSO summary; otherwise the cross-fold sum.
+        ``per_fold_map`` is keyed by fold directory name; missing folds
+        map to ``None``.
+    """
+    total: Optional[int] = None
+    per_fold: Dict[str, Optional[int]] = {}
+    for fd in fold_dirs:
+        summary_path = (
+            fd / "evaluation" / "three_metric_types_sso" / "sso_filter_summary.json"
+        )
+        if not summary_path.exists():
+            per_fold[fd.name] = None
+            continue
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            count = int(data.get("n_dropped_guids", 0))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"could not read {summary_path}: {exc}")
+            per_fold[fd.name] = None
+            continue
+        per_fold[fd.name] = count
+        total = (total or 0) + count
+    return total, per_fold
+
+
+def _read_binary_subgroup_long_at(
+    fold_dirs: List[Path],
+    metric_type: str,
+    *,
+    input_subtree: str,
+) -> Dict[str, List[pd.DataFrame]]:
+    """Path-parameterised analog of :func:`_read_binary_subgroup_long`.
+
+    Same behaviour but reads from ``evaluation/<input_subtree>/<mt>.csv``
+    so the SSO-anchored tree can reuse the per-subgroup grouping logic.
+    """
+    out: Dict[str, List[pd.DataFrame]] = {}
+    for fd in fold_dirs:
+        csv = fd / "evaluation" / input_subtree / f"{metric_type}.csv"
+        if not csv.exists():
+            continue
+        try:
+            df = pd.read_csv(csv)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"could not read {csv}: {exc}")
+            continue
+        if df.empty or "subgroup" not in df.columns or "bin_center" not in df.columns:
+            continue
+        for sg_name, grp in df.groupby("subgroup", dropna=False):
+            if grp.empty:
+                continue
+            out.setdefault(str(sg_name), []).append(grp.reset_index(drop=True))
+    return out
 
 
 def _aggregate_legacy_metric_plots(run_dir: Path, fold_dirs: List[Path]) -> None:
@@ -1592,13 +1891,45 @@ def aggregate_results(
 
     agg_root = run_dir / "aggregated_plots"
     agg_root.mkdir(parents=True, exist_ok=True)
+
+    # Auto-detect which heads were enabled in each fold. Mixed runs
+    # (some folds binary-only, others 3-class-only) emit only the
+    # aggregators that have at least one fold to consume — the head-
+    # specific sub-aggregators inside each helper already skip empty
+    # per-fold contributions gracefully.
+    heads_present_per_fold: Dict[int, Dict[str, bool]] = {}
+    for fd in fold_dirs:
+        fid = int(fd.name.split("_")[-1])
+        heads_present_per_fold[fid] = {
+            "binary": _fold_has_binary_head(fd),
+            "three_class": _fold_has_three_class_head(fd),
+        }
+    any_fold_has_binary = any(
+        v["binary"] for v in heads_present_per_fold.values()
+    )
+    any_fold_has_three_class = any(
+        v["three_class"] for v in heads_present_per_fold.values()
+    )
+    if not any_fold_has_binary and not any_fold_has_three_class:
+        logger.warning(
+            f"aggregate_results: no fold under {run_dir} has any head "
+            "artefact; the cross-fold output will be near-empty."
+        )
+    logger.info(
+        f"aggregate_results: heads present across {len(fold_dirs)} folds — "
+        f"binary={any_fold_has_binary} three_class={any_fold_has_three_class}"
+    )
+
     # New head-explicit cross-fold layout (parallel to per-fold tree).
+    # Only create the per-head subtrees that will actually be populated.
     binary_head_agg = agg_root / "binary_head"
     multiclass_head_agg = agg_root / "multiclass_head"
     diag_root = multiclass_head_agg / "diagnostics"
-    binary_head_agg.mkdir(parents=True, exist_ok=True)
-    multiclass_head_agg.mkdir(parents=True, exist_ok=True)
-    diag_root.mkdir(parents=True, exist_ok=True)
+    if any_fold_has_binary:
+        binary_head_agg.mkdir(parents=True, exist_ok=True)
+    if any_fold_has_three_class:
+        multiclass_head_agg.mkdir(parents=True, exist_ok=True)
+        diag_root.mkdir(parents=True, exist_ok=True)
 
     per_fold_binary_roc: List[Tuple[int, Dict[str, Any]]] = []
     per_fold_3class_roc: List[Tuple[int, Dict[str, Dict[str, Any]]]] = []
@@ -1611,42 +1942,47 @@ def aggregate_results(
         # Binary ROC: stored as ``binary_head/roc.csv`` (new layout) or
         # ``roc_binary_data.csv`` (legacy). Skip empty / malformed files
         # so a partially-failed fold doesn't poison the cross-fold summary.
-        roc_csv = _resolve_binary_roc_csv(fd)
-        if roc_csv is not None:
-            try:
-                roc_df = pd.read_csv(roc_csv)
-                if roc_df.empty or "fpr" not in roc_df.columns or "tpr" not in roc_df.columns:
-                    logger.warning(
-                        f"fold {fid}: {roc_csv.name} is empty or missing "
-                        "fpr/tpr columns; skipping."
-                    )
-                else:
-                    fpr = roc_df["fpr"].astype(float).tolist()
-                    tpr = roc_df["tpr"].astype(float).tolist()
-                    if len(fpr) < 2:
+        if heads_present_per_fold[fid]["binary"]:
+            roc_csv = _resolve_binary_roc_csv(fd)
+            if roc_csv is not None:
+                try:
+                    roc_df = pd.read_csv(roc_csv)
+                    if roc_df.empty or "fpr" not in roc_df.columns or "tpr" not in roc_df.columns:
                         logger.warning(
-                            f"fold {fid}: ROC has fewer than 2 points; skipping."
+                            f"fold {fid}: {roc_csv.name} is empty or missing "
+                            "fpr/tpr columns; skipping."
                         )
                     else:
-                        roc_dict = {
-                            "fpr": fpr,
-                            "tpr": tpr,
-                            "auc": float(sklearn_auc(fpr, tpr)),
-                        }
-                        per_fold_binary_roc.append((fid, roc_dict))
-            except Exception as exc:  # pragma: no cover
-                logger.warning(f"fold {fid}: failed to read binary ROC CSV: {exc}")
+                        fpr = roc_df["fpr"].astype(float).tolist()
+                        tpr = roc_df["tpr"].astype(float).tolist()
+                        if len(fpr) < 2:
+                            logger.warning(
+                                f"fold {fid}: ROC has fewer than 2 points; skipping."
+                            )
+                        else:
+                            roc_dict = {
+                                "fpr": fpr,
+                                "tpr": tpr,
+                                "auc": float(sklearn_auc(fpr, tpr)),
+                            }
+                            per_fold_binary_roc.append((fid, roc_dict))
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"fold {fid}: failed to read binary ROC CSV: {exc}")
 
         # 3-class OvR ROC: recomputed from the test predictions CSV.
-        test_df = _load_fold_test_csv(fd)
-        if test_df is not None:
-            try:
-                ovr = compute_3class_roc_ovr(test_df)
-                per_fold_3class_roc.append((fid, ovr))
-                cm = compute_confusion_matrix_3class(test_df)
-                per_fold_cms.append(cm)
-            except Exception as exc:  # pragma: no cover
-                logger.warning(f"fold {fid}: failed 3-class aggregation: {exc}")
+        # ``compute_3class_roc_ovr`` requires the ``prob_healthy/acidosis/hie``
+        # columns; under binary-only those are absent and the call would
+        # raise. The per-head gate keeps the cross-fold path symmetric.
+        if heads_present_per_fold[fid]["three_class"]:
+            test_df = _load_fold_test_csv(fd)
+            if test_df is not None:
+                try:
+                    ovr = compute_3class_roc_ovr(test_df)
+                    per_fold_3class_roc.append((fid, ovr))
+                    cm = compute_confusion_matrix_3class(test_df)
+                    per_fold_cms.append(cm)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"fold {fid}: failed 3-class aggregation: {exc}")
 
         # Threshold info (new ``thresholds.json`` or legacy
         # ``threshold_info.json``).
@@ -1659,14 +1995,18 @@ def aggregate_results(
             except Exception as exc:
                 logger.warning(f"fold {fid}: failed to read {thr_json.name}: {exc}")
 
-    binary_auc_mean = _plot_aggregated_binary_roc(
-        per_fold_binary_roc, binary_head_agg / "roc.png"
-    )
-    three_class_auc_means = _plot_aggregated_3class_roc(
-        per_fold_3class_roc, multiclass_head_agg / "roc_ovr"
-    )
+    binary_auc_mean: Optional[float] = None
+    if any_fold_has_binary:
+        binary_auc_mean = _plot_aggregated_binary_roc(
+            per_fold_binary_roc, binary_head_agg / "roc.png"
+        )
+    three_class_auc_means: Dict[str, float] = {}
+    if any_fold_has_three_class:
+        three_class_auc_means = _plot_aggregated_3class_roc(
+            per_fold_3class_roc, multiclass_head_agg / "roc_ovr"
+        )
     mean_cm: Optional[np.ndarray] = None
-    if per_fold_cms:
+    if any_fold_has_three_class and per_fold_cms:
         mean_cm = _plot_mean_confusion_matrix(
             per_fold_cms, diag_root / "mean_confusion_matrix.png"
         )
@@ -1682,18 +2022,105 @@ def aggregate_results(
     # with callers (kfold_trainer.py / evaluate_kfold.py) but is no
     # longer threaded into individual plotters; the aggregated plots
     # intentionally exclude that annotation per the v2 design.
-    perclass_summary = _aggregate_perclass_metric_curves(fold_dirs, agg_root)
-    binary_by_class_summary = _aggregate_binary_by_underlying_class_curves(
-        fold_dirs, agg_root,
-    )
-    perclass_subgroup_summary = _aggregate_perclass_subgroup_metric_curves(
-        fold_dirs, agg_root,
-    )
-    perclass_auroc_summary = _aggregate_perclass_auroc_curves(fold_dirs, agg_root)
-    binary_metrics_summary = _aggregate_binary_metrics_vs_time_curves(
-        fold_dirs, agg_root,
-    )
-    binary_subgroup_summary = _aggregate_binary_subgroup_curves(fold_dirs, agg_root)
+    perclass_summary: Dict[str, Any] = {}
+    binary_by_class_summary: Dict[str, Any] = {}
+    perclass_subgroup_summary: Dict[str, Any] = {}
+    perclass_auroc_summary: Dict[str, Any] = {}
+    binary_metrics_summary: Dict[str, Any] = {}
+    binary_subgroup_summary: Dict[str, Any] = {}
+    if any_fold_has_three_class:
+        perclass_summary = _aggregate_perclass_metric_curves(fold_dirs, agg_root)
+        perclass_subgroup_summary = _aggregate_perclass_subgroup_metric_curves(
+            fold_dirs, agg_root,
+        )
+        perclass_auroc_summary = _aggregate_perclass_auroc_curves(fold_dirs, agg_root)
+    if any_fold_has_binary:
+        binary_by_class_summary = _aggregate_binary_by_underlying_class_curves(
+            fold_dirs, agg_root,
+        )
+        binary_metrics_summary = _aggregate_binary_metrics_vs_time_curves(
+            fold_dirs, agg_root,
+        )
+        binary_subgroup_summary = _aggregate_binary_subgroup_curves(fold_dirs, agg_root)
+
+    # ------------------------------------------------------------------
+    # SSO-anchored cross-fold aggregations (parallel tree).
+    # Re-runs the binary / per-class / subgroup aggregators against each
+    # fold's ``three_metric_types_sso/`` subtree and writes the cross-fold
+    # outputs under ``aggregated_plots/sso/``. Folds without an SSO
+    # subtree are skipped gracefully by the individual aggregators (they
+    # only consume the CSVs they can find).
+    # ------------------------------------------------------------------
+    sso_summary: Dict[str, Any] = {}
+    try:
+        total_sso_dropped, sso_dropped_breakdown = _read_sso_dropped_counts(fold_dirs)
+        sso_footer = (
+            f"SSO-missing GUIDs across {len(fold_dirs)} folds: "
+            f"{total_sso_dropped}"
+            if total_sso_dropped is not None else None
+        )
+
+        if any_fold_has_binary:
+            sso_summary["binary_metrics_vs_time"] = _aggregate_binary_metrics_vs_time_curves(
+                fold_dirs, agg_root,
+                input_subtree="three_metric_types_sso/binary_head/metrics_vs_time",
+                output_subtree="sso/binary_head/metrics_vs_time",
+                axis_mode="sso",
+                extra_footer=sso_footer,
+            )
+            sso_summary["binary_subgroup_metrics"] = _aggregate_binary_subgroup_curves(
+                fold_dirs, agg_root,
+                input_subtree="three_metric_types_sso/binary_head/subgroups_vs_time",
+                output_subtree="sso/binary_head/subgroups_vs_time",
+                axis_mode="sso",
+                extra_footer=sso_footer,
+            )
+            # ``by_underlying_class_vs_time`` is written by the per-fold
+            # SSO 3-class evaluator (via ``run_3class_evaluation_for_metric_type``)
+            # only when *both* heads are enabled, so its presence at the
+            # cross-fold level still requires 3-class folds. The
+            # aggregator itself is safe to call: it simply emits nothing
+            # when every fold lacks the input CSV.
+            if any_fold_has_three_class:
+                sso_summary["binary_by_underlying_class_curves"] = (
+                    _aggregate_binary_by_underlying_class_curves(
+                        fold_dirs, agg_root,
+                        input_subtree=(
+                            "three_metric_types_sso/binary_head/"
+                            "by_underlying_class_vs_time"
+                        ),
+                        output_subtree=(
+                            "sso/binary_head/by_underlying_class_vs_time"
+                        ),
+                        axis_mode="sso",
+                        extra_footer=sso_footer,
+                    )
+                )
+        if any_fold_has_three_class:
+            sso_summary["per_class_metric_curves"] = _aggregate_perclass_metric_curves(
+                fold_dirs, agg_root,
+                input_subtree="three_metric_types_sso/multiclass_head/per_class_vs_time",
+                output_subtree="sso/multiclass_head/per_class_vs_time",
+                axis_mode="sso",
+                extra_footer=sso_footer,
+            )
+            sso_summary["per_class_subgroup_metric_curves"] = (
+                _aggregate_perclass_subgroup_metric_curves(
+                    fold_dirs, agg_root,
+                    input_subtree=(
+                        "three_metric_types_sso/multiclass_head/per_class_subgroups_vs_time"
+                    ),
+                    output_subtree="sso/multiclass_head/per_class_subgroups_vs_time",
+                    axis_mode="sso",
+                    extra_footer=sso_footer,
+                )
+            )
+        sso_summary["dropped_guids_total"] = total_sso_dropped
+        sso_summary["dropped_guids_per_fold"] = sso_dropped_breakdown
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "aggregate_results: SSO-anchored cross-fold aggregation failed"
+        )
 
     # Threshold + AUC scalar summary.
     def _stat(values: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
@@ -1710,15 +2137,24 @@ def aggregate_results(
             "n": int(len(clean)),
         }
 
+    # Summary is head-aware: only the keys whose underlying aggregator
+    # ran appear. ``heads_present`` records which heads contributed to
+    # this run for downstream audit (mixed runs are honest about per-
+    # fold breakdown).
     summary: Dict[str, Any] = {
         "n_folds": len(fold_dirs),
         "fold_ids": [int(fd.name.split("_")[-1]) for fd in fold_dirs],
-        "binary_auc": _stat([roc.get("auc", float("nan")) for _, roc in per_fold_binary_roc]),
-        "three_class_auc_ovr": {
-            cls: _stat([ovr.get(cls, {}).get("auc") for _, ovr in per_fold_3class_roc])
-            for cls in ("healthy", "acidosis", "hie")
+        "heads_present": {
+            "binary": bool(any_fold_has_binary),
+            "three_class": bool(any_fold_has_three_class),
         },
-        "thresholds": {
+        "heads_present_per_fold": heads_present_per_fold,
+    }
+    if any_fold_has_binary:
+        summary["binary_auc"] = _stat(
+            [roc.get("auc", float("nan")) for _, roc in per_fold_binary_roc]
+        )
+        summary["thresholds"] = {
             "instantaneous": _stat(
                 [t.get("threshold_instantaneous") for _, t in per_fold_thresholds]
             ),
@@ -1728,16 +2164,22 @@ def aggregate_results(
             "overall": _stat(
                 [t.get("threshold_overall") for _, t in per_fold_thresholds]
             ),
-        },
-    }
-    if mean_cm is not None:
-        summary["confusion_matrix_3class_mean"] = mean_cm.tolist()
-    summary["per_class_metric_curves"] = perclass_summary
-    summary["binary_by_underlying_class_curves"] = binary_by_class_summary
-    summary["per_class_subgroup_metric_curves"] = perclass_subgroup_summary
-    summary["per_class_auroc_vs_time"] = perclass_auroc_summary
-    summary["binary_metrics_vs_time"] = binary_metrics_summary
-    summary["binary_subgroup_metrics"] = binary_subgroup_summary
+        }
+        summary["binary_by_underlying_class_curves"] = binary_by_class_summary
+        summary["binary_metrics_vs_time"] = binary_metrics_summary
+        summary["binary_subgroup_metrics"] = binary_subgroup_summary
+    if any_fold_has_three_class:
+        summary["three_class_auc_ovr"] = {
+            cls: _stat([ovr.get(cls, {}).get("auc") for _, ovr in per_fold_3class_roc])
+            for cls in ("healthy", "acidosis", "hie")
+        }
+        if mean_cm is not None:
+            summary["confusion_matrix_3class_mean"] = mean_cm.tolist()
+        summary["per_class_metric_curves"] = perclass_summary
+        summary["per_class_subgroup_metric_curves"] = perclass_subgroup_summary
+        summary["per_class_auroc_vs_time"] = perclass_auroc_summary
+    if sso_summary:
+        summary["sso"] = sso_summary
     if decision_time_hours is not None:
         # Recorded for traceability only — the value is *not* drawn on
         # any aggregated plot.
@@ -1746,10 +2188,12 @@ def aggregate_results(
     (run_dir / "aggregated_results.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
-    logger.info(
-        f"aggregate_results: binary_auc_mean={binary_auc_mean} "
-        f"three_class_auc_ovr={three_class_auc_means}"
-    )
+    log_parts = ["aggregate_results:"]
+    if any_fold_has_binary:
+        log_parts.append(f"binary_auc_mean={binary_auc_mean}")
+    if any_fold_has_three_class:
+        log_parts.append(f"three_class_auc_ovr={three_class_auc_means}")
+    logger.info(" ".join(log_parts))
     return summary
 
 

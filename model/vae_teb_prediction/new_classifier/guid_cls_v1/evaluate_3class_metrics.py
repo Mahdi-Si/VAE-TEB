@@ -192,6 +192,9 @@ def _legacy_utils() -> Dict[str, Any]:
 
 METRIC_TYPES: Tuple[str, ...] = ("instantaneous", "committed_cumulative", "committed_overall")
 
+# Axis-mode identifiers accepted by the public entry points.
+AXIS_MODES: Tuple[str, ...] = ("delivery", "sso")
+
 
 def _legacy_metric_fn(name: str, utils: Mapping[str, Any]) -> Callable[..., pd.DataFrame]:
     return {
@@ -199,6 +202,41 @@ def _legacy_metric_fn(name: str, utils: Mapping[str, Any]) -> Callable[..., pd.D
         "committed_cumulative": utils["compute_committed_cumulative_metrics"],
         "committed_overall": utils["compute_committed_overall_metrics"],
     }[name]
+
+
+def _sso_metric_fn(name: str) -> Callable[..., pd.DataFrame]:
+    """Return the matching SSO-axis metric function.
+
+    Late-imports :mod:`sso_metrics_utils` so this module remains usable
+    in environments without matplotlib (used by some unit tests).
+    """
+    from model.vae_teb_prediction.new_classifier.guid_cls_v1 import (  # noqa: WPS433
+        sso_metrics_utils,
+    )
+
+    return {
+        "instantaneous": sso_metrics_utils.compute_instantaneous_metrics_sso,
+        "committed_cumulative": sso_metrics_utils.compute_committed_cumulative_metrics_sso,
+        "committed_overall": sso_metrics_utils.compute_committed_overall_metrics_sso,
+    }[name]
+
+
+def _metric_fn_for_axis(
+    name: str, axis_mode: str, utils: Mapping[str, Any]
+) -> Callable[..., pd.DataFrame]:
+    """Dispatch between delivery-axis and SSO-axis metric implementations.
+
+    Args:
+        name: One of :data:`METRIC_TYPES`.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        utils: Legacy utils mapping (only consumed in delivery mode).
+
+    Returns:
+        The selected metric-computation function.
+    """
+    if axis_mode == "sso":
+        return _sso_metric_fn(name)
+    return _legacy_metric_fn(name, utils)
 
 
 # ---------------------------------------------------------------------------
@@ -287,29 +325,37 @@ def compute_perclass_time_binned_metrics(
     class_name: str,
     *,
     subgroup_filter: Optional[Callable[[pd.DataFrame], pd.Series]] = None,
+    axis_mode: str = "delivery",
 ) -> pd.DataFrame:
     """Per-class wrapper around the legacy time-binned binary metrics.
 
     Renames ``clinical_pred_<class>`` → ``clinical_pred`` and
     ``binary_target_<class>`` → ``binary_target`` in a temporary view of
-    ``df`` and calls the legacy binary metric fn. Returns the same
-    columns the legacy fn returns (``bin_center``, ``sensitivity``,
-    ``fpr``, ``specificity``, ``n_*``).
+    ``df`` and calls the binary metric fn matching ``axis_mode``.
+    Returns the same columns the underlying fn returns
+    (``bin_center``, ``sensitivity``, ``fpr``, ``specificity``, ``n_*``).
 
     Args:
         df: DataFrame from :func:`add_perclass_clinical_columns`.
-        time_bins: Bin edges in hours-before-delivery (``compute_time_bins``).
+        time_bins: Bin edges. Units are hours-before-delivery when
+            ``axis_mode='delivery'`` and signed hours-from-SSO when
+            ``axis_mode='sso'``.
         metric_type: One of ``METRIC_TYPES``.
         class_name: One of ``healthy``, ``acidosis``, ``hie``.
         subgroup_filter: Optional row-level boolean mask producer.
+        axis_mode: ``'delivery'`` (default, uses ``epoch_hours``) or
+            ``'sso'`` (uses ``t_rel_sso_hours``).
 
     Returns:
         Per-class metrics DataFrame; the columns match the legacy
-        binary-side schema so :func:`plot_single_metric_type` can render
-        the result without modification.
+        binary-side schema so :func:`plot_single_metric_type` (or
+        :func:`sso_metrics_utils.plot_single_metric_type_sso`) can
+        render the result without modification.
     """
     if metric_type not in METRIC_TYPES:
         raise ValueError(f"Unknown metric_type {metric_type!r}; expected one of {METRIC_TYPES}")
+    if axis_mode not in AXIS_MODES:
+        raise ValueError(f"Unknown axis_mode {axis_mode!r}; expected one of {AXIS_MODES}")
     utils = _legacy_utils()
     pred_col = f"clinical_pred_{class_name}"
     bt_col = f"binary_target_{class_name}"
@@ -322,7 +368,7 @@ def compute_perclass_time_binned_metrics(
     swap = df.copy()
     swap["clinical_pred"] = swap[pred_col]
     swap["binary_target"] = swap[bt_col]
-    fn = _legacy_metric_fn(metric_type, utils)
+    fn = _metric_fn_for_axis(metric_type, axis_mode, utils)
     return fn(swap, time_bins, subgroup_filter)
 
 
@@ -338,6 +384,7 @@ def compute_binary_by_underlying_class(
     restrict_class: str,
     *,
     subgroup_filter: Optional[Callable[[pd.DataFrame], pd.Series]] = None,
+    axis_mode: str = "delivery",
 ) -> pd.DataFrame:
     """Binary metric on the subset HEALTHY ∪ {restrict_class}.
 
@@ -347,12 +394,14 @@ def compute_binary_by_underlying_class(
 
     Args:
         df: Full predictions DataFrame (must have ``target``,
-            ``binary_target``, ``clinical_pred`` set by the legacy CDR).
-        time_bins: Bin edges in hours-before-delivery.
+            ``binary_target``, ``clinical_pred`` set by the CDR).
+        time_bins: Bin edges. Units depend on ``axis_mode``.
         metric_type: One of ``METRIC_TYPES``.
         restrict_class: ``"acidosis"`` or ``"hie"`` — the unhealthy class
             to keep alongside HEALTHY.
         subgroup_filter: Optional row-level boolean mask producer.
+        axis_mode: Selects the underlying metric function via
+            :func:`_metric_fn_for_axis`.
 
     Returns:
         DataFrame with the same shape as the legacy binary metrics.
@@ -366,7 +415,7 @@ def compute_binary_by_underlying_class(
     if keep.empty:
         return pd.DataFrame()
     utils = _legacy_utils()
-    fn = _legacy_metric_fn(metric_type, utils)
+    fn = _metric_fn_for_axis(metric_type, axis_mode, utils)
     return fn(keep, time_bins, subgroup_filter)
 
 
@@ -547,6 +596,35 @@ def collect_perclass_long_format(
     return pd.concat(frames, ignore_index=True)
 
 
+def _axis_style(axis_mode: str) -> Tuple[str, bool]:
+    """Return (x_label, invert_x) for a given axis mode."""
+    if axis_mode == "sso":
+        return "Hours from second stage onset", False
+    return "Hours Before Birth", True
+
+
+def _maybe_add_sso_zero(ax, axis_mode: str) -> None:
+    """Draw the SSO reference line when plotting against the SSO axis."""
+    if axis_mode != "sso":
+        return
+    xlim = ax.get_xlim()
+    lo, hi = min(xlim), max(xlim)
+    if 0.0 < lo or 0.0 > hi:
+        return
+    ax.axvline(x=0.0, color="0.35", linestyle=":", linewidth=1.1, zorder=0)
+
+
+def _maybe_add_dropped_footer(fig, axis_mode: str, n_dropped_guids: int) -> None:
+    """Footer annotation reporting GUIDs dropped for the SSO eval."""
+    if axis_mode != "sso" or n_dropped_guids <= 0:
+        return
+    fig.text(
+        0.995, 0.005,
+        f"Dropped {int(n_dropped_guids)} GUIDs (no second-stage onset)",
+        fontsize=8, color="0.35", ha="right", va="bottom",
+    )
+
+
 def plot_perclass_panel_combined(
     metrics_per_class: Mapping[str, pd.DataFrame],
     *,
@@ -554,20 +632,27 @@ def plot_perclass_panel_combined(
     metric_type: str,
     decision_time_hours: Optional[float] = None,
     title_suffix: str = "",
+    axis_mode: str = "delivery",
+    n_dropped_guids: int = 0,
 ) -> None:
     """One PNG with three side-by-side panels (one per class).
 
-    Each panel shows sensitivity, specificity, and FPR vs hours before
-    birth for the given class. Replaces the previous layout that wrote
-    three separate per-class subdirectories.
+    Each panel shows sensitivity, specificity, and FPR vs the chosen
+    time axis (delivery-anchored hours before birth, or signed hours
+    from SSO).
 
     Args:
         metrics_per_class: ``{class_name: per_class_metrics_df}``.
         output_path: Output PNG path.
         metric_type: Drives the panel title.
-        decision_time_hours: When provided, draws a dashed vertical
-            reference line at that x value.
+        decision_time_hours: When provided and ``axis_mode='delivery'``,
+            draws a dashed vertical reference line at that x value.
         title_suffix: Extra suffix appended to the figure suptitle.
+        axis_mode: ``'delivery'`` (default, inverted x-axis labelled
+            "Hours Before Birth") or ``'sso'`` (natural x-axis labelled
+            "Hours from second stage onset"; vertical zero-line marks
+            SSO; figure footer reports dropped GUIDs).
+        n_dropped_guids: SSO-mode footer count. Ignored in delivery mode.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
@@ -576,6 +661,7 @@ def plot_perclass_panel_combined(
         "committed_cumulative": "Committed (Cumulative)",
         "committed_overall": "Committed (Overall)",
     }.get(metric_type, metric_type)
+    x_label, invert_x = _axis_style(axis_mode)
     for ax, (class_name, _, _) in zip(axes, CLASS_INFO):
         metrics_df = metrics_per_class.get(class_name)
         if metrics_df is None or metrics_df.empty:
@@ -584,7 +670,10 @@ def plot_perclass_panel_combined(
             ax.set_yticks([])
             continue
         m = metrics_df.dropna(subset=["sensitivity", "specificity", "fpr"], how="all")
-        m = m.sort_values("bin_center", ascending=False)
+        # In SSO mode read left-to-right (ascending); in delivery mode the
+        # subsequent ``invert_xaxis()`` displays high tau on the left so we
+        # sort descending to match the legacy panel render order.
+        m = m.sort_values("bin_center", ascending=(axis_mode == "sso"))
         x = m["bin_center"].to_numpy()
         if "sensitivity" in m.columns:
             ax.plot(x, m["sensitivity"], marker="o", linewidth=2.2,
@@ -597,18 +686,24 @@ def plot_perclass_panel_combined(
                     label="FPR", color="#e74c3c")
         ax.set_title(class_name, color=_CLASS_PALETTE.get(class_name, "black"),
                      fontweight="bold")
-        ax.set_xlabel("Hours Before Birth")
+        ax.set_xlabel(x_label)
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, loc="best")
-        _annotate_decision_time(ax, decision_time_hours)
+        if axis_mode == "delivery":
+            _annotate_decision_time(ax, decision_time_hours)
+        _maybe_add_sso_zero(ax, axis_mode)
     axes[0].set_ylabel("Metric value")
     suptitle = f"Per-class metrics vs time — {metric_label}"
+    if axis_mode == "sso":
+        suptitle += " (axis: SSO)"
     if title_suffix:
         suptitle += f" ({title_suffix})"
     fig.suptitle(suptitle, fontsize=14, fontweight="bold")
     fig.tight_layout()
+    _maybe_add_dropped_footer(fig, axis_mode, n_dropped_guids)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
@@ -619,6 +714,7 @@ def compute_perclass_subgroup_long_format(
     *,
     time_bins: np.ndarray,
     metric_type: str,
+    axis_mode: str = "delivery",
 ) -> pd.DataFrame:
     """Build a long-format DataFrame over (bin × class × subgroup).
 
@@ -627,8 +723,12 @@ def compute_perclass_subgroup_long_format(
 
     Args:
         df: DataFrame from :func:`add_perclass_clinical_columns`.
-        time_bins: Bin edges (hours before delivery).
+        time_bins: Bin edges (hours-before-delivery for
+            ``axis_mode='delivery'``; signed hours-from-SSO for
+            ``axis_mode='sso'``).
         metric_type: One of ``METRIC_TYPES``.
+        axis_mode: Selects the underlying metric function — see
+            :func:`compute_perclass_time_binned_metrics`.
 
     Returns:
         DataFrame with columns
@@ -648,6 +748,7 @@ def compute_perclass_subgroup_long_format(
                     metric_type=metric_type,
                     class_name=class_name,
                     subgroup_filter=filter_fn,
+                    axis_mode=axis_mode,
                 )
             except Exception:  # noqa: BLE001
                 continue
@@ -668,11 +769,24 @@ def plot_perclass_subgroup_long(
     output_path: Path,
     metric_type: str,
     decision_time_hours: Optional[float] = None,
+    axis_mode: str = "delivery",
+    n_dropped_guids: int = 0,
 ) -> None:
     """Render the per-class × subgroup long-format DataFrame as one PNG.
 
     Layout: 3 columns (one per class), N rows (one per subgroup); each
-    cell plots SE / SP / FPR vs hours before birth.
+    cell plots SE / SP / FPR vs the chosen time axis (delivery hours
+    before birth or signed hours from SSO).
+
+    Args:
+        long_df: Output of
+            :func:`compute_perclass_subgroup_long_format`.
+        output_path: Output PNG path.
+        metric_type: Display metric label.
+        decision_time_hours: Vertical reference line drawn at this x
+            value when ``axis_mode='delivery'``. Ignored in SSO mode.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        n_dropped_guids: SSO-mode footer count.
     """
     if long_df is None or long_df.empty:
         logger.warning(
@@ -695,6 +809,7 @@ def plot_perclass_subgroup_long(
         "committed_cumulative": "Committed (Cumulative)",
         "committed_overall": "Committed (Overall)",
     }.get(metric_type, metric_type)
+    x_label, invert_x = _axis_style(axis_mode)
     for r, subgroup_name in enumerate(subgroups):
         for c, (class_name, _, _) in enumerate(CLASS_INFO):
             ax = axes[r, c]
@@ -707,7 +822,7 @@ def plot_perclass_subgroup_long(
                 ax.set_xticks([])
                 ax.set_yticks([])
                 continue
-            sub = sub.sort_values("bin_center", ascending=False)
+            sub = sub.sort_values("bin_center", ascending=(axis_mode == "sso"))
             x = sub["bin_center"].to_numpy()
             if "sensitivity" in sub.columns:
                 ax.plot(x, sub["sensitivity"], marker="o", linewidth=2.0,
@@ -719,7 +834,8 @@ def plot_perclass_subgroup_long(
                 ax.plot(x, sub["fpr"], marker="^", linewidth=2.0,
                         markersize=4, label="FPR", color="#e74c3c")
             ax.set_ylim([0, 1.05])
-            ax.invert_xaxis()
+            if invert_x:
+                ax.invert_xaxis()
             ax.grid(True, alpha=0.3)
             if r == 0:
                 ax.set_title(class_name,
@@ -728,15 +844,18 @@ def plot_perclass_subgroup_long(
             if c == 0:
                 ax.set_ylabel(f"{subgroup_name}\nMetric value", fontsize=9)
             if r == n_rows - 1:
-                ax.set_xlabel("Hours Before Birth")
+                ax.set_xlabel(x_label)
             if r == 0 and c == 2:
                 ax.legend(fontsize=8, loc="best")
-            _annotate_decision_time(ax, decision_time_hours)
-    fig.suptitle(
-        f"Per-class × subgroup metrics vs time — {metric_label}",
-        fontsize=14, fontweight="bold",
-    )
+            if axis_mode == "delivery":
+                _annotate_decision_time(ax, decision_time_hours)
+            _maybe_add_sso_zero(ax, axis_mode)
+    suptitle = f"Per-class × subgroup metrics vs time — {metric_label}"
+    if axis_mode == "sso":
+        suptitle += " (axis: SSO)"
+    fig.suptitle(suptitle, fontsize=14, fontweight="bold")
     fig.tight_layout()
+    _maybe_add_dropped_footer(fig, axis_mode, n_dropped_guids)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
@@ -747,17 +866,25 @@ def compute_binary_by_underlying_class_long_format(
     *,
     time_bins: np.ndarray,
     metric_type: str,
+    axis_mode: str = "delivery",
 ) -> pd.DataFrame:
     """Stack the binary-by-underlying-class metrics into one long-format frame.
 
     Output columns: ``[bin_center, restrict_class, sensitivity,
     specificity, fpr, ...]``.
+
+    Args:
+        df: Predictions DataFrame.
+        time_bins: Bin edges (units depend on ``axis_mode``).
+        metric_type: One of ``METRIC_TYPES``.
+        axis_mode: ``'delivery'`` or ``'sso'``.
     """
     frames = []
     for restrict_class in ("acidosis", "hie"):
         m = compute_binary_by_underlying_class(
             df, time_bins=time_bins, metric_type=metric_type,
             restrict_class=restrict_class,
+            axis_mode=axis_mode,
         )
         if m is None or m.empty:
             continue
@@ -775,11 +902,22 @@ def plot_binary_by_underlying_class_long(
     output_path: Path,
     metric_type: str,
     decision_time_hours: Optional[float] = None,
+    axis_mode: str = "delivery",
+    n_dropped_guids: int = 0,
 ) -> None:
     """Render the binary-by-underlying-class long-format DataFrame as one PNG.
 
     Two side-by-side panels (acidosis-only, hie-only); each shows SE/SP/FPR
-    vs hours before birth.
+    vs the chosen time axis.
+
+    Args:
+        long_df: Output of
+            :func:`compute_binary_by_underlying_class_long_format`.
+        output_path: PNG path.
+        metric_type: Display metric label.
+        decision_time_hours: Vertical reference line in delivery mode.
+        axis_mode: ``'delivery'`` or ``'sso'``.
+        n_dropped_guids: SSO-mode footer count.
     """
     if long_df is None or long_df.empty:
         logger.warning(
@@ -795,13 +933,14 @@ def plot_binary_by_underlying_class_long(
         "committed_cumulative": "Committed (Cumulative)",
         "committed_overall": "Committed (Overall)",
     }.get(metric_type, metric_type)
+    x_label, invert_x = _axis_style(axis_mode)
     for ax, restrict_class in zip(axes, classes):
         sub = long_df[long_df["restrict_class"] == restrict_class]
         if sub.empty:
             ax.text(0.5, 0.5, f"only_{restrict_class}: no data",
                     ha="center", va="center")
             continue
-        sub = sub.sort_values("bin_center", ascending=False)
+        sub = sub.sort_values("bin_center", ascending=(axis_mode == "sso"))
         x = sub["bin_center"].to_numpy()
         if "sensitivity" in sub.columns:
             ax.plot(x, sub["sensitivity"], marker="o", linewidth=2.2,
@@ -812,21 +951,25 @@ def plot_binary_by_underlying_class_long(
         if "fpr" in sub.columns:
             ax.plot(x, sub["fpr"], marker="^", linewidth=2.2,
                     label="FPR", color="#e74c3c")
-        ax.set_xlabel("Hours Before Birth")
+        ax.set_xlabel(x_label)
         ax.set_title(f"healthy vs {restrict_class}",
                      color=_CLASS_PALETTE.get(restrict_class, "black"),
                      fontweight="bold")
         ax.set_ylim([0, 1.05])
-        ax.invert_xaxis()
+        if invert_x:
+            ax.invert_xaxis()
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=10, loc="best")
-        _annotate_decision_time(ax, decision_time_hours)
+        if axis_mode == "delivery":
+            _annotate_decision_time(ax, decision_time_hours)
+        _maybe_add_sso_zero(ax, axis_mode)
     axes[0].set_ylabel("Metric value")
-    fig.suptitle(
-        f"Binary head — restricted to one underlying class — {metric_label}",
-        fontsize=14, fontweight="bold",
-    )
+    suptitle = f"Binary head — restricted to one underlying class — {metric_label}"
+    if axis_mode == "sso":
+        suptitle += " (axis: SSO)"
+    fig.suptitle(suptitle, fontsize=14, fontweight="bold")
     fig.tight_layout()
+    _maybe_add_dropped_footer(fig, axis_mode, n_dropped_guids)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved: {output_path.parent.name}/{output_path.name}")
@@ -997,6 +1140,8 @@ def run_3class_evaluation_for_metric_type(
     target_fpr: float = 0.2,
     decision_time_hours: float = 1.0,
     threshold_search_kwargs: Optional[Mapping[str, Any]] = None,
+    axis_mode: str = "delivery",
+    n_dropped_guids: int = 0,
 ) -> Dict[str, Any]:
     """Compute and persist all per-class artefacts for one metric type.
 
@@ -1043,9 +1188,22 @@ def run_3class_evaluation_for_metric_type(
         target_fpr: Target FPR for the per-class threshold search.
         decision_time_hours: Hours before delivery at which thresholds
             are evaluated; also drawn as a vertical reference line on
-            every vs-time plot via ``annotate_decision_time``.
+            every delivery-axis vs-time plot via
+            ``annotate_decision_time``. Ignored on SSO-axis plots.
         threshold_search_kwargs: Optional extras for the search
             (``max_gap_multiplier``, ``fallback_tolerance_hours``).
+        axis_mode: ``'delivery'`` (default) renders the legacy
+            delivery-anchored figures (x = hours before birth, inverted).
+            ``'sso'`` renders SSO-anchored figures (x = signed hours
+            from second-stage onset, natural orientation, vertical
+            zero-line marks SSO). When ``'sso'``, the function emits
+            only the per-class vs-time, per-class × subgroup, and
+            binary-by-underlying-class artefacts; AUROC-vs-time,
+            aggregate (top-1 / macro-F1 / Brier) and
+            confusion-matrix-evolution outputs are delivery-axis only.
+        n_dropped_guids: SSO-mode figure-footer annotation reporting
+            how many GUIDs the caller pre-filtered for missing SSO.
+            Ignored in delivery mode.
 
     Returns:
         Dict with keys:
@@ -1094,13 +1252,20 @@ def run_3class_evaluation_for_metric_type(
         if not thresholds:
             thresholds = None  # all classes failed — argmax path
 
+    if axis_mode not in AXIS_MODES:
+        raise ValueError(f"axis_mode must be one of {AXIS_MODES}, got {axis_mode!r}")
+
     df_pc = add_perclass_clinical_columns(df, thresholds=thresholds)
 
     # ---- per-class vs time ----
     metrics_per_class: Dict[str, pd.DataFrame] = {}
     for class_name, _, _ in CLASS_INFO:
         metrics_per_class[class_name] = compute_perclass_time_binned_metrics(
-            df_pc, time_bins=time_bins, metric_type=metric_type, class_name=class_name
+            df_pc,
+            time_bins=time_bins,
+            metric_type=metric_type,
+            class_name=class_name,
+            axis_mode=axis_mode,
         )
     long_perclass = collect_perclass_long_format(metrics_per_class)
     pc_dir = multiclass_root / "per_class_vs_time"
@@ -1111,12 +1276,15 @@ def run_3class_evaluation_for_metric_type(
         output_path=pc_dir / f"{metric_type}_panel.png",
         metric_type=metric_type,
         decision_time_hours=decision_time_hours,
+        axis_mode=axis_mode,
+        n_dropped_guids=n_dropped_guids,
     )
     out["perclass_metrics"] = long_perclass
 
     # ---- per-class × subgroup vs time (long-format) ----
     long_subgroup = compute_perclass_subgroup_long_format(
-        df_pc, time_bins=time_bins, metric_type=metric_type
+        df_pc, time_bins=time_bins, metric_type=metric_type,
+        axis_mode=axis_mode,
     )
     sg_dir = multiclass_root / "per_class_subgroups_vs_time"
     sg_dir.mkdir(parents=True, exist_ok=True)
@@ -1126,12 +1294,15 @@ def run_3class_evaluation_for_metric_type(
         output_path=sg_dir / f"{metric_type}.png",
         metric_type=metric_type,
         decision_time_hours=decision_time_hours,
+        axis_mode=axis_mode,
+        n_dropped_guids=n_dropped_guids,
     )
     out["perclass_subgroup_metrics"] = long_subgroup
 
     # ---- binary head: by underlying class (long-format) ----
     long_bin = compute_binary_by_underlying_class_long_format(
-        df, time_bins=time_bins, metric_type=metric_type
+        df, time_bins=time_bins, metric_type=metric_type,
+        axis_mode=axis_mode,
     )
     bin_dir = binary_root / "by_underlying_class_vs_time"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1141,8 +1312,19 @@ def run_3class_evaluation_for_metric_type(
         output_path=bin_dir / f"{metric_type}.png",
         metric_type=metric_type,
         decision_time_hours=decision_time_hours,
+        axis_mode=axis_mode,
+        n_dropped_guids=n_dropped_guids,
     )
     out["binary_by_underlying_class"] = long_bin
+
+    # The AUROC-vs-time / aggregate-vs-time / confusion-evolution
+    # blocks below all read ``epoch_hours`` directly via ``_bin_assign``
+    # and use the legacy ``ensure_epoch_hours`` helper. They have no
+    # signed-axis counterpart yet, so we only run them on the
+    # delivery-anchored axis. SSO-axis equivalents can be added in a
+    # follow-up if the per-class + subgroup curves prove insufficient.
+    if axis_mode != "delivery":
+        return out
 
     # ---- per-class AUROC vs time (NEW) ----
     try:
