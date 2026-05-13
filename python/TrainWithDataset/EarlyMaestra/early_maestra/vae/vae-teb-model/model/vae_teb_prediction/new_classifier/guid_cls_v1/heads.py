@@ -54,10 +54,19 @@ class PerPositionOutcomeHead(nn.Module):
         num_classes_multi: int = 3,
         hidden_dim: Optional[int] = None,
         dropout: float = 0.1,
+        enable_three_class: bool = True,
+        enable_binary: bool = True,
     ) -> None:
         super().__init__()
+        if not (enable_three_class or enable_binary):
+            raise ValueError(
+                "PerPositionOutcomeHead: at least one of "
+                "``enable_three_class`` / ``enable_binary`` must be True."
+            )
         self.d_model = int(d_model)
         self.num_classes_multi = int(num_classes_multi)
+        self.enable_three_class: bool = bool(enable_three_class)
+        self.enable_binary: bool = bool(enable_binary)
         hidden = int(hidden_dim) if hidden_dim is not None else self.d_model
 
         self.proj = nn.Sequential(
@@ -70,8 +79,18 @@ class PerPositionOutcomeHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.head_3 = nn.Linear(d_model, num_classes_multi)
-        self.head_bin = nn.Linear(d_model, 1)
+        # Conditional head linears. Disabled heads are simply not
+        # instantiated — they hold no parameters, never produce gradients,
+        # and never appear in the forward output. Consumers must check
+        # ``if "logits_3" in out`` / ``if "logit_bin" in out``.
+        if self.enable_three_class:
+            self.head_3 = nn.Linear(d_model, num_classes_multi)
+        else:
+            self.head_3 = None  # type: ignore[assignment]
+        if self.enable_binary:
+            self.head_bin = nn.Linear(d_model, 1)
+        else:
+            self.head_bin = None  # type: ignore[assignment]
 
         # Zero-init both head weight matrices so step-0 logits depend
         # ONLY on the head bias. Combined with
@@ -83,10 +102,12 @@ class PerPositionOutcomeHead(nn.Module):
         # ``W·z`` term adds a non-trivial random offset to the 3-class
         # logits and the docstring's "model already predicts the prior"
         # guarantee silently fails for the 3-class branch.
-        nn.init.zeros_(self.head_3.weight)
-        nn.init.zeros_(self.head_3.bias)
-        nn.init.zeros_(self.head_bin.weight)
-        nn.init.zeros_(self.head_bin.bias)
+        if self.head_3 is not None:
+            nn.init.zeros_(self.head_3.weight)
+            nn.init.zeros_(self.head_3.bias)
+        if self.head_bin is not None:
+            nn.init.zeros_(self.head_bin.weight)
+            nn.init.zeros_(self.head_bin.bias)
 
     def init_class_bias_from_prior(
         self,
@@ -135,7 +156,7 @@ class PerPositionOutcomeHead(nn.Module):
             eps: Numerical guard so log doesn't blow up on zero counts.
         """
         with torch.no_grad():
-            if prior_3 is not None:
+            if prior_3 is not None and self.head_3 is not None:
                 p3 = prior_3.to(dtype=self.head_3.bias.dtype,
                                 device=self.head_3.bias.device)
                 if p3.numel() != self.head_3.bias.numel():
@@ -144,7 +165,7 @@ class PerPositionOutcomeHead(nn.Module):
                         f"head_3 bias size {self.head_3.bias.numel()}"
                     )
                 self.head_3.bias.copy_(torch.log(p3 + eps))
-            if prior_bin is not None:
+            if prior_bin is not None and self.head_bin is not None:
                 p = float(prior_bin.item() if isinstance(prior_bin, torch.Tensor) else prior_bin)
                 p = min(max(p, eps), 1.0 - eps)
                 logit = math.log(p) - math.log(1.0 - p)
@@ -165,27 +186,36 @@ class PerPositionOutcomeHead(nn.Module):
                 Padded positions are zeroed in the output for safety.
 
         Returns:
-            Dict with:
+            Dict carrying *only* the enabled heads' outputs. When both
+            heads are enabled (default):
+
               * ``logits_3``  — ``(B, N, num_classes_multi)``
               * ``logit_bin`` — ``(B, N)``
               * ``prob_3``    — ``(B, N, num_classes_multi)``  softmax
               * ``prob_bin``  — ``(B, N)``                     sigmoid
+
+            When ``enable_three_class`` is False the four 3-class keys
+            are omitted; when ``enable_binary`` is False the two binary
+            keys are omitted. Consumers must check key presence with
+            ``"key" in out`` rather than assume both heads exist.
         """
         z = self.proj(h)                                 # (B, N, d_model)
-        logits_3 = self.head_3(z)                        # (B, N, C)
-        logit_bin = self.head_bin(z).squeeze(-1)         # (B, N)
-
         mask_f = segment_mask.to(h.dtype)
-        logits_3 = logits_3 * mask_f.unsqueeze(-1)
-        logit_bin = logit_bin * mask_f
-        prob_3 = F.softmax(logits_3, dim=-1) * mask_f.unsqueeze(-1)
-        prob_bin = torch.sigmoid(logit_bin) * mask_f
-        return {
-            "logits_3": logits_3,
-            "logit_bin": logit_bin,
-            "prob_3": prob_3,
-            "prob_bin": prob_bin,
-        }
+
+        out: Dict[str, torch.Tensor] = {}
+        if self.head_3 is not None:
+            logits_3 = self.head_3(z)                    # (B, N, C)
+            logits_3 = logits_3 * mask_f.unsqueeze(-1)
+            prob_3 = F.softmax(logits_3, dim=-1) * mask_f.unsqueeze(-1)
+            out["logits_3"] = logits_3
+            out["prob_3"] = prob_3
+        if self.head_bin is not None:
+            logit_bin = self.head_bin(z).squeeze(-1)     # (B, N)
+            logit_bin = logit_bin * mask_f
+            prob_bin = torch.sigmoid(logit_bin) * mask_f
+            out["logit_bin"] = logit_bin
+            out["prob_bin"] = prob_bin
+        return out
 
 
 __all__ = [

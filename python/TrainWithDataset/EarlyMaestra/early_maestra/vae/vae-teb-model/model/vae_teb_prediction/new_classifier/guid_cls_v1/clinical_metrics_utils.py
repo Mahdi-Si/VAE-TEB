@@ -97,35 +97,47 @@ def ensure_epoch_hours(df: pd.DataFrame) -> pd.DataFrame:
 def validate_predictions_df(df: pd.DataFrame, data_type: str = "predictions") -> None:
     """Validate predictions DataFrame structure and value ranges.
 
+    The schema check is head-aware: the binary-head block
+    (``binary_target`` / ``prob_class_1``) is only enforced when those
+    columns are present. Under a 3-class-only run the binary columns
+    are intentionally omitted by ``run_inference_per_position`` and
+    there is nothing to validate on the binary side. The always-
+    present columns (``guid``, ``epoch``) are required unconditionally.
+
     Args:
         df: Predictions DataFrame to validate.
         data_type: Label for error messages (e.g. ``"Validation"``).
 
     Raises:
-        ValueError: On missing columns or out-of-range values.
+        ValueError: On missing always-required columns or out-of-range
+            values in the binary block (when that block is present).
     """
-    required_cols = ['guid', 'epoch', 'binary_target', 'prob_class_1']
-    missing_cols = set(required_cols) - set(df.columns)
-    if missing_cols:
+    always_required = ['guid', 'epoch']
+    missing_always = set(always_required) - set(df.columns)
+    if missing_always:
         raise ValueError(
-            f"{data_type} DataFrame missing required columns: {missing_cols}. "
+            f"{data_type} DataFrame missing required columns: {missing_always}. "
             f"Available columns: {list(df.columns)}"
         )
-    if not df['binary_target'].isin([0, 1]).all():
-        invalid_vals = df['binary_target'].unique()
-        invalid_count = (~df['binary_target'].isin([0, 1])).sum()
-        raise ValueError(
-            f"{data_type} has {invalid_count} samples with invalid binary_target values: "
-            f"{invalid_vals} (expected 0 or 1 only)"
-        )
-    if not ((df['prob_class_1'] >= 0) & (df['prob_class_1'] <= 1)).all():
-        invalid_count = ((df['prob_class_1'] < 0) | (df['prob_class_1'] > 1)).sum()
-        min_val = df['prob_class_1'].min()
-        max_val = df['prob_class_1'].max()
-        raise ValueError(
-            f"{data_type} has {invalid_count} samples with prob_class_1 values outside [0, 1] range. "
-            f"Range found: [{min_val:.4f}, {max_val:.4f}]"
-        )
+
+    has_binary = {'binary_target', 'prob_class_1'}.issubset(df.columns)
+    if has_binary:
+        if not df['binary_target'].isin([0, 1]).all():
+            invalid_vals = df['binary_target'].unique()
+            invalid_count = (~df['binary_target'].isin([0, 1])).sum()
+            raise ValueError(
+                f"{data_type} has {invalid_count} samples with invalid binary_target values: "
+                f"{invalid_vals} (expected 0 or 1 only)"
+            )
+        if not ((df['prob_class_1'] >= 0) & (df['prob_class_1'] <= 1)).all():
+            invalid_count = ((df['prob_class_1'] < 0) | (df['prob_class_1'] > 1)).sum()
+            min_val = df['prob_class_1'].min()
+            max_val = df['prob_class_1'].max()
+            raise ValueError(
+                f"{data_type} has {invalid_count} samples with prob_class_1 values outside [0, 1] range. "
+                f"Range found: [{min_val:.4f}, {max_val:.4f}]"
+            )
+
     duplicates = df.duplicated(subset=['guid', 'epoch'])
     if duplicates.any():
         n_dup = duplicates.sum()

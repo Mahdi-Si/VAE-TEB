@@ -57,6 +57,14 @@ class GuidClassifierConfig:
     num_classes_multi: int = 3
     head_hidden_dim: Optional[int] = None  # defaults to ``d_model`` when None
 
+    # Per-head enable flags. Default: both heads enabled (legacy behaviour).
+    # When ``enable_three_class_head`` is False the 3-class linear / CE term /
+    # 3-class evaluation + aggregation paths are skipped end-to-end; mirror
+    # for the binary head. At least one must remain True — see
+    # :meth:`__post_init__`.
+    enable_three_class_head: bool = True
+    enable_binary_head: bool = True
+
     # Causal autoregressive flag — exposed for ablations only. Default True.
     causal: bool = True
 
@@ -72,6 +80,15 @@ class GuidClassifierConfig:
     # by the model directly but lets callers serialise / round-trip the
     # effective config.
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not (self.enable_three_class_head or self.enable_binary_head):
+            raise ValueError(
+                "GuidClassifierConfig: at least one of "
+                "``enable_three_class_head`` or ``enable_binary_head`` must "
+                "be True (both disabled leaves the classifier without a "
+                "training signal)."
+            )
 
 
 class GuidOutcomeClassifier(nn.Module):
@@ -120,7 +137,14 @@ class GuidOutcomeClassifier(nn.Module):
             num_classes_multi=cfg.num_classes_multi,
             hidden_dim=cfg.head_hidden_dim,
             dropout=cfg.dropout,
+            enable_three_class=cfg.enable_three_class_head,
+            enable_binary=cfg.enable_binary_head,
         )
+        # Surface the head flags on the classifier itself so downstream
+        # consumers (inference, evaluation, lightning) can branch without
+        # having to re-read ``cfg``.
+        self.enable_three_class_head: bool = bool(cfg.enable_three_class_head)
+        self.enable_binary_head: bool = bool(cfg.enable_binary_head)
 
         # Optional VAE submodule for the live-VAE training path. Set
         # externally by ``single_fold_trainer.train_fold`` when

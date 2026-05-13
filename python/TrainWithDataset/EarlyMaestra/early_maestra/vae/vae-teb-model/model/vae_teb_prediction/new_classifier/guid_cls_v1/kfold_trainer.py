@@ -89,6 +89,155 @@ def _git_sha(cwd: Optional[str] = None) -> str:
         return ""
 
 
+def _attach_subprocess_raw_log(
+    *,
+    config_path: str,
+    fold_id: int,
+    output_dir_override: Optional[str],
+) -> Any:
+    """Open ``fold_{k}/logs/subprocess_raw.log`` and dup stdout/stderr into it.
+
+    Runs early in :func:`_run_one_fold_subprocess` (after CUDA env var
+    setup, before any torch import). Captures everything the OS-level
+    file descriptors 1 / 2 see, including C-level prints from torch /
+    h5py and ``faulthandler`` dumps on SIGTERM that loguru's
+    Python-side sink cannot reach.
+
+    **Subprocess-only.** The redirect is *permanent* for the current
+    process — ``os.dup2`` rewires fd 1 / 2 and the fallback path
+    rebinds ``sys.stdout`` / ``sys.stderr``; neither is restored on
+    return. In sequential mode this function would otherwise be called
+    in the **main** process and would steal the user's terminal for
+    the rest of the sweep. The guard at the top of the function
+    detects ``MainProcess`` via :mod:`multiprocessing` and short-circuits
+    with ``None`` so sequential ``--sequential`` and direct
+    :func:`train_fold` invocations keep their console output intact.
+    The per-fold loguru file sink attached by :func:`train_fold` itself
+    still captures Python-level output in that path.
+
+    The function is defensive: any failure to locate the fold-dir or
+    open the file is logged via ``print`` (loguru is not yet attached
+    at this point in the lifecycle) and the function returns ``None``
+    so the caller proceeds without raw capture.
+
+    Args:
+        config_path: Path to the YAML config (used to locate ``out_dir``).
+        fold_id: 1-based fold id.
+        output_dir_override: Optional run-dir override.
+
+    Returns:
+        The opened file handle, or ``None`` if attach failed or was
+        skipped because we're running in the main process. The handle
+        is *not* explicitly closed — the subprocess exit closes it.
+    """
+    import multiprocessing as _mp_check  # noqa: WPS433
+
+    if _mp_check.current_process().name == "MainProcess":
+        # Sequential mode runs ``_run_one_fold_subprocess`` directly in
+        # the main process. A permanent stdout/stderr redirect there
+        # would (a) replace the user's terminal for the rest of the
+        # sweep, fold after fold, and (b) point the parent's kfold
+        # status messages into the LAST fold's raw log. The loguru
+        # file sink attached by ``train_fold`` itself still captures
+        # all Python-level output to ``fold.log`` in this path, so
+        # we don't lose observability — just the belt-and-braces
+        # C-level capture.
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        if output_dir_override:
+            run_dir = Path(output_dir_override).resolve()
+        else:
+            run_dir = _resolve_run_dir_lazy(cfg)
+        fold_logs_dir = run_dir / f"fold_{int(fold_id)}" / "logs"
+        fold_logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = fold_logs_dir / "subprocess_raw.log"
+        raw_log = open(str(log_path), "a", encoding="utf-8", buffering=1)
+        # Tee both streams: dup the OS-level fd so even C-level writes
+        # are captured. We don't restore on exit because the subprocess
+        # is about to die anyway.
+        try:
+            os.dup2(raw_log.fileno(), sys.stdout.fileno())
+            os.dup2(raw_log.fileno(), sys.stderr.fileno())
+        except (OSError, AttributeError):  # pragma: no cover - defensive
+            # ``sys.stdout`` / ``sys.stderr`` may not have a fileno()
+            # under some pytest captures / Windows multiprocessing
+            # configurations. Fall back to attribute replacement so at
+            # least Python-side writes are captured.
+            sys.stdout = raw_log  # type: ignore[assignment]
+            sys.stderr = raw_log  # type: ignore[assignment]
+        return raw_log
+    except Exception as exc:  # pragma: no cover - defensive
+        try:
+            print(
+                f"[fold {fold_id}] _attach_subprocess_raw_log failed: {exc}",
+                file=sys.__stderr__,
+            )
+        except Exception:
+            pass
+        return None
+
+
+def _append_progress_log(
+    *,
+    run_dir: Path,
+    result: Dict[str, Any],
+) -> None:
+    """Append a one-line summary of a fold's result to ``kfold_progress.log``.
+
+    The progress log lives at ``run_dir/kfold_progress.log`` and gives
+    the user an at-a-glance view of which folds have finished, their
+    status, and headline metrics — without having to open each fold's
+    ``fold_results.json``.
+
+    Args:
+        run_dir: Sweep-wide run directory.
+        result: One per-fold result dict as returned by
+            :func:`_run_one_fold_subprocess`.
+    """
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        fold_id = int(result.get("fold_id", -1))
+        status = str(result.get("status", "unknown"))
+        bm = result.get("best_metrics") or {}
+        train_seconds = result.get("train_seconds")
+        train_seconds_str = (
+            f"{float(train_seconds):.1f}s" if train_seconds is not None else "n/a"
+        )
+        snippet_parts = [
+            f"{ts}",
+            f"fold={fold_id}",
+            f"status={status}",
+            f"train={train_seconds_str}",
+        ]
+        for key in (
+            "val/total_loss",
+            "val/macro_f1",
+            "val/binary_auroc",
+            "val/acc_3",
+            "val/acc_bin",
+        ):
+            val = bm.get(key)
+            if val is None:
+                continue
+            try:
+                snippet_parts.append(f"{key}={float(val):.4f}")
+            except (TypeError, ValueError):
+                continue
+        if status != "ok":
+            err = result.get("error")
+            if err:
+                snippet_parts.append(f"error={str(err)[:160]!r}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with open(
+            str(run_dir / "kfold_progress.log"), "a", encoding="utf-8"
+        ) as fh:
+            fh.write(" | ".join(snippet_parts) + "\n")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"_append_progress_log failed: {exc}")
+
+
 def _run_one_fold_subprocess(
     fold_id: int,
     gpu_id: int,
@@ -112,6 +261,49 @@ def _run_one_fold_subprocess(
         to ``"failed"`` on exception).
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Disable HDF5 advisory file locking inside each fold subprocess. The
+    # per-fold latent caches live on a shared NFS/isilon mount; with
+    # default locking enabled, 8 folds × N DataLoader workers all calling
+    # ``h5py.File(..., "r", swmr=True)`` can deadlock on the NFS lock
+    # manager (the documented HDF5 workaround for NFS hangs — see HDF
+    # Group FAQ). All accesses reachable from training are read-only, so
+    # disabling advisory locks is safe. ``setdefault`` lets the user
+    # override via shell env if a different storage backend ever needs
+    # the locks back.
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+    # Belt-and-braces stdout/stderr capture for the subprocess. The
+    # primary log file is the loguru ``fold.log`` attached by
+    # ``train_fold``; this raw capture catches anything that escapes
+    # loguru (C-level prints from torch/h5py, faulthandler dumps on
+    # SIGTERM, raw ``print()`` calls from third-party libraries).
+    # Best-effort — failure to open the raw log MUST NOT prevent the
+    # fold from running.
+    raw_log_handle = _attach_subprocess_raw_log(
+        config_path=config_path,
+        fold_id=fold_id,
+        output_dir_override=output_dir_override,
+    )
+
+    # Install a faulthandler that dumps a Python stack of every thread
+    # to stderr on SIGTERM. When the orchestrator's watchdog terminates a
+    # hung fold, this puts the exact deadlock site (h5py / DataLoader /
+    # queue / anywhere in Python) into the fold log instead of leaving a
+    # silent ``terminated`` exit code. Registered here — before any
+    # torch/h5py import — so the handler is installed even if the hang
+    # happens during library initialisation.
+    import faulthandler
+    import signal
+    import sys
+
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    # ``faulthandler.register`` is POSIX-only (Windows has no equivalent
+    # signal-driven dump). The training cluster is Linux, so this runs;
+    # the ``hasattr`` guard keeps a Windows dev box from crashing here.
+    if hasattr(faulthandler, "register") and hasattr(signal, "SIGTERM"):
+        faulthandler.register(  # type: ignore[attr-defined]
+            signal.SIGTERM, file=sys.stderr, all_threads=True, chain=False
+        )
 
     # Lazy imports: must come AFTER the CUDA_VISIBLE_DEVICES env var is set.
     from pathlib import Path
@@ -181,6 +373,12 @@ def _fold_worker_entry(
         output_dir_override=output_dir_override,
     )
     result_queue.put(result)
+    # Make sure the feeder thread finishes flushing the pickled result
+    # before the child exits — without close()+join_thread() a large
+    # result dict could leave a half-written pipe and the parent would
+    # see ``proc.is_alive()`` flip to False with no message waiting.
+    result_queue.close()
+    result_queue.join_thread()
 
 
 def _summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -402,6 +600,7 @@ def run_kfold_parallel(
                 config_path=config_path,
                 output_dir_override=str(run_dir),
             )
+            _append_progress_log(run_dir=run_dir, result=results[int(fid)])
             # Mirror the parallel branch: surface per-fold status to the
             # console immediately. Otherwise an exception inside ``train_fold``
             # / ``evaluate_single_fold`` is captured silently into the result
@@ -488,6 +687,7 @@ def run_kfold_parallel(
                 if result is not None:
                     proc.join(timeout=1.0)
                     results[fid] = result
+                    _append_progress_log(run_dir=run_dir, result=result)
                     status = results[fid].get("status", "unknown")
                     if status == "ok":
                         logger.info(f"fold {fid} finished with status={status}")
@@ -512,6 +712,16 @@ def run_kfold_parallel(
                                 f"fold(s) will be terminated."
                             )
                     result_queue.close()
+                    # Best-effort: wait for the queue's background feeder
+                    # thread to finish flushing on the *parent* side too.
+                    # The child already calls ``join_thread()`` after its
+                    # ``put()`` (see :func:`_fold_worker_entry`); this pair
+                    # is the documented multiprocessing.Queue shutdown
+                    # contract.
+                    try:
+                        result_queue.join_thread()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                     del active[fid]
                     progressed = True
                     continue
@@ -528,6 +738,7 @@ def run_kfold_parallel(
                         "physical_gpu_id": int(slot["gpu"]),
                     }
                     logger.error(results[fid]["error"])
+                    _append_progress_log(run_dir=run_dir, result=results[fid])
                     result_queue.close()
                     del active[fid]
                     progressed = True
@@ -552,6 +763,7 @@ def run_kfold_parallel(
                         ),
                         "physical_gpu_id": int(slot["gpu"]),
                     }
+                    _append_progress_log(run_dir=run_dir, result=results[fid])
                     result_queue.close()
                     del active[fid]
                     progressed = True

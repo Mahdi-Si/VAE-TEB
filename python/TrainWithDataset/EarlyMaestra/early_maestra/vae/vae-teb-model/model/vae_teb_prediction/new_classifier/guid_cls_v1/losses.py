@@ -60,6 +60,25 @@ class LossWeights:
     lambda_sp: float = 0.0          # 0 in stage 1; 1e-4 in stage 2 (set externally)
     position_weight_alpha: float = 0.0  # 0 = uniform; 1.5 = recommended late-bias
     loss_warmup_positions: int = 0      # K_warm position skip (§18.17.3 E)
+    # Per-head gates. When ``enable_three_class`` is False the 3-class CE
+    # term is skipped (and the result dict omits ``ce_3``); same for the
+    # binary BCE term when ``enable_binary`` is False. Mirror
+    # :class:`GuidClassifierConfig`'s per-head flags so the loss and the
+    # model agree on what to compute.
+    enable_three_class: bool = True
+    enable_binary: bool = True
+
+    def __post_init__(self) -> None:
+        # Defence-in-depth: mirrors :meth:`GuidClassifierConfig.__post_init__`
+        # so callers that build ``LossWeights`` directly (tests, custom
+        # trainers) hit the same hard error rather than tripping the
+        # downstream ``assert total is not None`` (which `-O` would strip).
+        if not (self.enable_three_class or self.enable_binary):
+            raise ValueError(
+                "LossWeights: at least one of ``enable_three_class`` / "
+                "``enable_binary`` must be True (both disabled leaves the "
+                "loss with no terms to optimise)."
+            )
 
 
 class GuidClassifierLoss(nn.Module):
@@ -278,35 +297,67 @@ class GuidClassifierLoss(nn.Module):
 
         Args:
             outputs: Forward dict from :class:`GuidOutcomeClassifier`.
-                Must contain ``logits_3 (B, N, 3)`` and ``logit_bin (B, N)``.
+                Must contain ``logits_3 (B, N, 3)`` when the 3-class
+                head is enabled and ``logit_bin (B, N)`` when the
+                binary head is enabled (see :class:`LossWeights`).
             batch: Collated batch dict (must contain ``label_3``,
                 ``label_bin``, ``segment_mask``).
             vae_loss: Optional VAE-aux loss scalar (live-VAE path only).
             sparsity_term: Optional L2 sparsity scalar (stage 2 only).
 
         Returns:
-            Dict with at minimum ``total_loss`` plus each component for
-            logging.
+            Dict with ``total_loss`` plus the per-component breakdown.
+            The disabled head's component key is omitted (``ce_3`` when
+            ``enable_three_class`` is False; ``bce_bin`` when
+            ``enable_binary`` is False).
+
+        Raises:
+            KeyError: When the gating flag is True but the corresponding
+                logits key is missing from ``outputs`` (model and loss
+                disagree on head enablement).
         """
-        target_3 = batch["label_3"].long()                  # (B,)
-        target_bin = batch["label_bin"].float()             # (B,)
         seg_mask = batch["segment_mask"]                    # (B, N)
-
-        ce_3 = self._ce_3_per_pos(outputs["logits_3"], target_3, seg_mask)
-        bce_bin = self._bce_per_pos(outputs["logit_bin"], target_bin, seg_mask)
-
         w = self.weights
-        total = w.lambda_3 * ce_3 + w.lambda_2 * bce_bin
+
+        components: Dict[str, torch.Tensor] = {}
+        total: Optional[torch.Tensor] = None
+
+        if w.enable_three_class:
+            if "logits_3" not in outputs:
+                raise KeyError(
+                    "GuidClassifierLoss: enable_three_class=True but "
+                    "'logits_3' is missing from the model's forward dict; "
+                    "did you forget to enable the 3-class head in "
+                    "GuidClassifierConfig?"
+                )
+            target_3 = batch["label_3"].long()              # (B,)
+            ce_3 = self._ce_3_per_pos(outputs["logits_3"], target_3, seg_mask)
+            components["ce_3"] = ce_3
+            total = w.lambda_3 * ce_3 if total is None else total + w.lambda_3 * ce_3
+
+        if w.enable_binary:
+            if "logit_bin" not in outputs:
+                raise KeyError(
+                    "GuidClassifierLoss: enable_binary=True but "
+                    "'logit_bin' is missing from the model's forward dict; "
+                    "did you forget to enable the binary head in "
+                    "GuidClassifierConfig?"
+                )
+            target_bin = batch["label_bin"].float()         # (B,)
+            bce_bin = self._bce_per_pos(outputs["logit_bin"], target_bin, seg_mask)
+            components["bce_bin"] = bce_bin
+            total = w.lambda_2 * bce_bin if total is None else total + w.lambda_2 * bce_bin
+
+        # ``LossWeights.__post_init__`` / GuidClassifierConfig already
+        # forbids both-disabled, so ``total`` is guaranteed non-None here.
+        assert total is not None, "no head enabled — should be unreachable"
+
         if vae_loss is not None and w.gamma_vae > 0.0:
             total = total + w.gamma_vae * vae_loss
         if sparsity_term is not None and w.lambda_sp > 0.0:
             total = total + w.lambda_sp * sparsity_term
 
-        components: Dict[str, torch.Tensor] = {
-            "total_loss": total,
-            "ce_3": ce_3,
-            "bce_bin": bce_bin,
-        }
+        components["total_loss"] = total
         if vae_loss is not None:
             components["vae_loss"] = vae_loss
         if sparsity_term is not None:
