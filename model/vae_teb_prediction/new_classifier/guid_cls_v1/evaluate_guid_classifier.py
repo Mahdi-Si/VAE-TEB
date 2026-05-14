@@ -859,20 +859,19 @@ def evaluate_single_fold(
     test_cache = cache_root / "test.hdf5"
 
     # Per-partition window split (§ evaluation.epoch_min_test): when set,
-    # val and test caches are built with this wider pre-delivery window
-    # while train always uses ``dataset_config.epoch_min``. Threaded into
-    # the live-VAE eval-time precompute below; the frozen-VAE path's
-    # cache regeneration relies on the input-signature mismatch path
-    # in :func:`precompute_fold_latents` and so does not need to be
-    # invoked here.
+    # ONLY the test cache is built with this wider pre-delivery window;
+    # train and val both inherit ``dataset_config.epoch_min`` so the
+    # threshold-search operating point is calibrated on the training
+    # distribution. Threaded into the live-VAE eval-time precompute
+    # below; the frozen-VAE path's cache regeneration relies on the
+    # input-signature mismatch path in :func:`precompute_fold_latents`
+    # and so does not need to be invoked here.
+    # See ``possible_improvements.md`` §3.5 Option C.
     eval_cfg_early = config.get("evaluation", {}) or {}
     epoch_min_test_cfg = eval_cfg_early.get("epoch_min_test")
     epoch_min_overrides_eval: Dict[str, int] = {}
     if epoch_min_test_cfg is not None:
-        epoch_min_overrides_eval = {
-            "val": int(epoch_min_test_cfg),
-            "test": int(epoch_min_test_cfg),
-        }
+        epoch_min_overrides_eval = {"test": int(epoch_min_test_cfg)}
 
     # Live-VAE training (vae.freeze_vae=False) doesn't precompute latents
     # — the classifier's live_forward encodes raw segments. The downstream
@@ -902,16 +901,33 @@ def evaluate_single_fold(
     assert test_cache.exists(), f"missing test cache {test_cache}"
 
     # Window-mismatch guard for the *frozen-VAE* re-eval path. Caches
-    # built during training were keyed on ``dataset_config.epoch_min``;
-    # if the user later sets ``evaluation.epoch_min_test`` and re-runs
-    # eval on those caches, they'd silently get the narrower window
-    # instead of the wider one. The signature mismatch is only acted on
-    # by ``precompute_fold_latents`` (which we don't call from the eval
-    # path for frozen-VAE), so we have to compare the stored summary
-    # ourselves and refuse to proceed if it disagrees with the override.
-    if freeze_vae and epoch_min_overrides_eval:
+    # built during training are keyed on a partition-specific window
+    # (train + val always use ``dataset_config.epoch_min``; test widens
+    # to ``evaluation.epoch_min_test`` when set — §3.5 Option C). If a
+    # user re-runs eval after changing either window, the stored cache
+    # may not match what the YAML now expects. The signature mismatch
+    # is only acted on by ``precompute_fold_latents`` (which we don't
+    # call from the eval path for frozen-VAE), so we compare the stored
+    # summary here and refuse to proceed on mismatch.
+    if freeze_vae:
         import h5py  # noqa: WPS433
-        for partition, expected_window in epoch_min_overrides_eval.items():
+        ds_cfg_window = (config.get("dataset_config", {}) or {}).get("epoch_min")
+        # Expected per-partition windows. ``None`` means "no check"
+        # (e.g. ``dataset_config.epoch_min`` not configured, or
+        # ``epoch_min_test`` not set so test inherits the train window).
+        expected_windows: Dict[str, Optional[int]] = {
+            "val": int(ds_cfg_window) if ds_cfg_window is not None else None,
+        }
+        if epoch_min_overrides_eval:
+            expected_windows.update(
+                {k: int(v) for k, v in epoch_min_overrides_eval.items()}
+            )
+        elif ds_cfg_window is not None:
+            # When no test override is configured, test should match train.
+            expected_windows["test"] = int(ds_cfg_window)
+        for partition, expected_window in expected_windows.items():
+            if expected_window is None:
+                continue
             cache_file = cache_root / f"{partition}.hdf5"
             try:
                 with h5py.File(cache_file, "r", libver="latest") as fh:
@@ -930,21 +946,25 @@ def evaluate_single_fold(
                 logger.warning(
                     f"[{fold_dir.name}] {partition}.hdf5 has no "
                     "cache_input_summary_json; cannot verify epoch_min "
-                    "matches evaluation.epoch_min_test — proceeding "
-                    "but window may be stale"
+                    "— proceeding but window may be stale"
                 )
                 continue
             if int(cached_window) != int(expected_window):
+                expected_source = (
+                    "evaluation.epoch_min_test"
+                    if partition == "test"
+                    else "dataset_config.epoch_min"
+                )
                 raise RuntimeError(
                     f"[{fold_dir.name}] {partition} cache was built with "
-                    f"epoch_min={cached_window} but evaluation.epoch_min_test"
-                    f"={expected_window}. Frozen-VAE re-eval cannot widen "
+                    f"epoch_min={cached_window} but {expected_source}"
+                    f"={expected_window}. Frozen-VAE re-eval cannot adjust "
                     "the window without rebuilding the cache. Either:\n"
-                    f"  (a) re-run precompute_fold_latents with "
-                    f"epoch_min_overrides={{'{partition}': {expected_window}}}\n"
+                    f"  (a) re-run precompute_fold_latents with the "
+                    f"matching epoch_min for partition {partition!r},\n"
                     "  (b) clear the stale cache and re-run training, or\n"
-                    "  (c) remove evaluation.epoch_min_test from the config "
-                    "to use the trained window."
+                    f"  (c) adjust {expected_source} to match the cached "
+                    "window."
                 )
 
     # Build classifier config off the cache dimensions.
@@ -1135,6 +1155,80 @@ def evaluate_single_fold(
     perclass_threshold_search_default = bool(
         three_class_cfg.get("threshold_search_default", True)
     )
+
+    # ------------------------------------------------------------------
+    # SSO-eligibility pre-screen (applied once for both metric trees)
+    # ------------------------------------------------------------------
+    # Drop GUIDs whose ``second_stage_onset`` is absent (NaN) or stored
+    # as the ``0.0`` sentinel ("SSO == delivery / not recorded"). The
+    # latter would otherwise produce the $-12\,\mathrm{h}$-before-SSO
+    # plot artefact on the SSO axis when the per-segment epochs are
+    # interpreted as offsets from SSO.
+    #
+    # The filter is applied *after* the raw prediction CSVs are
+    # persisted (so ``test_raw.csv`` / ``validation_raw.csv`` retain
+    # the full cohort for forensic inspection) and *before* the
+    # threshold search and every downstream metric tree (delivery
+    # axis, SSO axis, aggregator) consumes the data, so every
+    # downstream consumer sees the same eligible cohort. Gated by
+    # ``evaluation.sso_eligibility`` in the YAML.
+    sso_elig_cfg = eval_cfg.get("sso_eligibility") or {}
+    drop_nan_sso = bool(sso_elig_cfg.get("drop_nan", True))
+    drop_zero_sentinel_sso = bool(sso_elig_cfg.get("drop_zero_sentinel", True))
+    # Track filter stats for downstream consumers (figure footers, aggregator).
+    # ``None`` means the upstream filter was not invoked (legacy behaviour).
+    _val_sso_stats: Optional[Dict[str, Any]] = None
+    _test_sso_stats: Optional[Dict[str, Any]] = None
+    if drop_nan_sso or drop_zero_sentinel_sso:
+        from model.vae_teb_prediction.new_classifier.guid_cls_v1 import (  # noqa: WPS433
+            sso_metrics_utils as _sso_filter_utils,
+        )
+        val_df = _sso_filter_utils.ensure_t_rel_sso_hours(val_df)
+        test_df = _sso_filter_utils.ensure_t_rel_sso_hours(test_df)
+        val_df, _val_sso_stats = _sso_filter_utils.filter_to_sso_eligible_strict(
+            val_df,
+            drop_nan=drop_nan_sso,
+            drop_zero_sentinel=drop_zero_sentinel_sso,
+        )
+        test_df, _test_sso_stats = _sso_filter_utils.filter_to_sso_eligible_strict(
+            test_df,
+            drop_nan=drop_nan_sso,
+            drop_zero_sentinel=drop_zero_sentinel_sso,
+        )
+        _sso_filter_utils.write_sso_filter_summary(
+            eval_dir / "sso_eligibility_filter_summary.json",
+            {
+                "val": _val_sso_stats,
+                "test": _test_sso_stats,
+                "policy": {
+                    "drop_nan": drop_nan_sso,
+                    "drop_zero_sentinel": drop_zero_sentinel_sso,
+                },
+            },
+        )
+        logger.info(
+            f"[{fold_dir.name}] SSO-eligibility filter applied: "
+            f"val kept={_val_sso_stats['n_kept_guids']}/"
+            f"{_val_sso_stats['n_total_guids']} "
+            f"(nan={_val_sso_stats['n_dropped_nan']}, "
+            f"zero-sentinel={_val_sso_stats['n_dropped_zero_sentinel']}); "
+            f"test kept={_test_sso_stats['n_kept_guids']}/"
+            f"{_test_sso_stats['n_total_guids']} "
+            f"(nan={_test_sso_stats['n_dropped_nan']}, "
+            f"zero-sentinel={_test_sso_stats['n_dropped_zero_sentinel']})."
+        )
+        _record_eval_event(
+            fold_dir,
+            "sso_eligibility_filter",
+            policy_drop_nan=drop_nan_sso,
+            policy_drop_zero_sentinel=drop_zero_sentinel_sso,
+            val_kept=int(_val_sso_stats["n_kept_guids"]),
+            val_dropped_nan=int(_val_sso_stats["n_dropped_nan"]),
+            val_dropped_zero=int(_val_sso_stats["n_dropped_zero_sentinel"]),
+            test_kept=int(_test_sso_stats["n_kept_guids"]),
+            test_dropped_nan=int(_test_sso_stats["n_dropped_nan"]),
+            test_dropped_zero=int(_test_sso_stats["n_dropped_zero_sentinel"]),
+        )
 
     # Threshold search on validation (binary-head only — derives the
     # operating point that the clinical decision rule applies to every
@@ -1351,9 +1445,27 @@ def evaluate_single_fold(
             sso_subgroups_dir.mkdir(parents=True, exist_ok=True)
 
             # Pre-screen: drop GUIDs without an SSO timestamp.
+            #
+            # With the default ``evaluation.sso_eligibility`` policy this
+            # filter has already run upstream (catching NaN + zero-sentinel
+            # SSO before either tree consumed the data) and is a no-op
+            # here; we keep this defence-in-depth call so the SSO-axis
+            # tree stays NaN-safe even when the upstream policy is
+            # disabled. ``n_sso_dropped`` aggregates the upstream and
+            # local drop counts so figure footers report the true total
+            # drop for this cohort. The canonical per-fold summary is
+            # ``evaluation/sso_eligibility_filter_summary.json``; the
+            # legacy ``sso_filter_summary.json`` is left in place for
+            # back-compat with older aggregator footers.
             test_sso_df = sso_utils.ensure_t_rel_sso_hours(test_df)
             test_sso_df, sso_drop_stats = sso_utils.filter_to_sso_eligible(test_sso_df)
-            n_sso_dropped = int(sso_drop_stats["n_dropped_guids"])
+            _n_sso_dropped_here = int(sso_drop_stats["n_dropped_guids"])
+            _n_sso_dropped_upstream = (
+                int(_test_sso_stats["n_dropped_guids"])
+                if _test_sso_stats is not None
+                else 0
+            )
+            n_sso_dropped = _n_sso_dropped_here + _n_sso_dropped_upstream
             sso_utils.write_sso_filter_summary(
                 sso_root / "sso_filter_summary.json", sso_drop_stats
             )

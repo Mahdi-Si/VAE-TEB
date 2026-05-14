@@ -638,19 +638,18 @@ def _train_fold_impl(
     if freeze_vae:
         if auto_precompute:
             # Per-partition epoch_min override (§ evaluation.epoch_min_test):
-            # train always uses dataset_config.epoch_min; val/test widen to
-            # the eval window when configured. Keeping val in lock-step with
-            # test means the threshold-search operating point is calibrated
-            # on the same distribution test will use. Matches the live-VAE
-            # equivalent below.
+            # train and val always use ``dataset_config.epoch_min`` so the
+            # threshold-search operating point is calibrated on the training
+            # distribution and there is no train↔val window mismatch at
+            # training-time validation. Only the test cache widens to
+            # ``epoch_min_test`` so the final clinical-evaluation horizon
+            # can span a longer pre-delivery window than the model was
+            # trained on. See ``possible_improvements.md`` §3.5 Option C.
             eval_cfg = config.get("evaluation", {}) or {}
             epoch_min_test_cfg = eval_cfg.get("epoch_min_test")
             epoch_min_overrides: Optional[Dict[str, int]] = None
             if epoch_min_test_cfg is not None:
-                epoch_min_overrides = {
-                    "val": int(epoch_min_test_cfg),
-                    "test": int(epoch_min_test_cfg),
-                }
+                epoch_min_overrides = {"test": int(epoch_min_test_cfg)}
             precompute_fold_latents(
                 config=config,
                 fold_id=fold_id,
@@ -714,14 +713,14 @@ def _train_fold_impl(
         live_cross_censor = bool(cls_cfg["cross_delivery_censoring"])
         live_epoch_min = ds_cfg.get("epoch_min")
         # Per-partition window split (§ evaluation.epoch_min_test):
-        # train always uses the dataset window; val (and test, at eval
-        # time) widen to the eval window when configured. Keeping val
-        # in lock-step with test means the threshold-search operating
-        # point is calibrated on the same distribution test will use.
-        eval_cfg = config.get("evaluation", {}) or {}
-        live_epoch_min_val = eval_cfg.get("epoch_min_test", live_epoch_min)
-        if live_epoch_min_val is None:
-            live_epoch_min_val = live_epoch_min
+        # train and val always use ``dataset_config.epoch_min`` so the
+        # threshold-search operating point is calibrated on the training
+        # distribution and there is no train↔val window mismatch at
+        # training-time validation. The test partition (constructed in
+        # :mod:`evaluate_guid_classifier` via ``_ensure_live_vae_eval_caches``)
+        # widens to ``epoch_min_test`` when set so the final clinical-
+        # evaluation horizon can span a longer pre-delivery window.
+        # See ``possible_improvements.md`` §3.5 Option C.
         live_trim = float(ds_cfg.get("trim_minutes", 1.0))
         live_stats_path = ds_cfg.get("stats_path")
         live_normalize_fields = ds_cfg.get("normalize_fields")
@@ -750,20 +749,13 @@ def _train_fold_impl(
             min_samples_per_guid=live_min_samples,
             min_valid_weight_fraction=live_min_w,
             cross_delivery_censoring=live_cross_censor,
-            epoch_min=live_epoch_min_val,
+            epoch_min=live_epoch_min,  # val matches train (§3.5 Option C)
             trim_minutes=live_trim,
             stats_path=live_stats_path,
             normalize_fields=live_normalize_fields,
             d_model_vae=live_d_model_vae,
             d_z=live_d_z,
         )
-        if live_epoch_min_val != live_epoch_min:
-            logger.info(
-                f"[fold {fold_id}] live-VAE val window widened: "
-                f"train epoch_min={live_epoch_min} -> "
-                f"val epoch_min={live_epoch_min_val} "
-                f"(via evaluation.epoch_min_test)"
-            )
 
         # ------------------------------------------------------------------
         # Latent stats: populate vae.mu_post_running_{mean,var,count} once
