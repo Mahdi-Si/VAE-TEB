@@ -637,11 +637,26 @@ def _train_fold_impl(
         vae_checkpoint_sha = ""
     if freeze_vae:
         if auto_precompute:
+            # Per-partition epoch_min override (§ evaluation.epoch_min_test):
+            # train always uses dataset_config.epoch_min; val/test widen to
+            # the eval window when configured. Keeping val in lock-step with
+            # test means the threshold-search operating point is calibrated
+            # on the same distribution test will use. Matches the live-VAE
+            # equivalent below.
+            eval_cfg = config.get("evaluation", {}) or {}
+            epoch_min_test_cfg = eval_cfg.get("epoch_min_test")
+            epoch_min_overrides: Optional[Dict[str, int]] = None
+            if epoch_min_test_cfg is not None:
+                epoch_min_overrides = {
+                    "val": int(epoch_min_test_cfg),
+                    "test": int(epoch_min_test_cfg),
+                }
             precompute_fold_latents(
                 config=config,
                 fold_id=fold_id,
                 output_root=run_dir,
                 device=device,
+                epoch_min_overrides=epoch_min_overrides,
             )
     else:
         logger.info(
