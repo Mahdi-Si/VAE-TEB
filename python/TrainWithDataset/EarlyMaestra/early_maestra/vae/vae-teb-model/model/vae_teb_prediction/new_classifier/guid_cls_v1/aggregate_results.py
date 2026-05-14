@@ -1677,34 +1677,80 @@ def _aggregate_binary_subgroup_curves(
 
 def _read_sso_dropped_counts(
     fold_dirs: List[Path],
-) -> Tuple[Optional[int], Dict[str, Optional[int]]]:
-    """Sum dropped-GUID counts across per-fold ``sso_filter_summary.json``.
+) -> Tuple[Optional[Dict[str, int]], Dict[str, Dict[str, Any]]]:
+    """Sum dropped-GUID counts across per-fold SSO-eligibility summaries.
+
+    Reads the new ``evaluation/sso_eligibility_filter_summary.json``
+    first (written by the upstream eligibility filter in
+    :mod:`evaluate_guid_classifier`); falls back to the legacy
+    ``evaluation/three_metric_types_sso/sso_filter_summary.json``
+    (NaN-only) when the new file is absent so old per-fold artefacts
+    can still be aggregated.
 
     Returns:
-        Tuple ``(total, per_fold_map)``. ``total`` is ``None`` if no
-        fold has an SSO summary; otherwise the cross-fold sum.
-        ``per_fold_map`` is keyed by fold directory name; missing folds
-        map to ``None``.
+        Tuple ``(totals, per_fold)`` where:
+
+        * ``totals``: ``{"total": int, "nan": int, "zero": int}``
+          summed across folds. ``None`` if no fold has any SSO
+          summary on disk. ``"zero"`` is always ``0`` for folds whose
+          summary came from the legacy file (it has no
+          zero-sentinel field).
+        * ``per_fold``: ``{fold_name: {"total": int|None,
+          "nan": int|None, "zero": int|None, "source": "strict"|"legacy"|None}}``.
+          ``None`` values indicate "no summary on disk for this fold".
     """
-    total: Optional[int] = None
-    per_fold: Dict[str, Optional[int]] = {}
+    totals: Optional[Dict[str, int]] = None
+    per_fold: Dict[str, Dict[str, Any]] = {}
     for fd in fold_dirs:
-        summary_path = (
+        new_path = fd / "evaluation" / "sso_eligibility_filter_summary.json"
+        legacy_path = (
             fd / "evaluation" / "three_metric_types_sso" / "sso_filter_summary.json"
         )
-        if not summary_path.exists():
-            per_fold[fd.name] = None
-            continue
+        entry: Dict[str, Any] = {
+            "total": None,
+            "nan": None,
+            "zero": None,
+            "source": None,
+        }
         try:
-            data = json.loads(summary_path.read_text(encoding="utf-8"))
-            count = int(data.get("n_dropped_guids", 0))
+            if new_path.exists():
+                data = json.loads(new_path.read_text(encoding="utf-8"))
+                # Strict summary: ``{"val": {...}, "test": {...}, "policy": {...}}``.
+                # The footer should reflect the test cohort (what the
+                # downstream metric trees actually see).
+                test_stats = data.get("test") or {}
+                nan_count = int(test_stats.get("n_dropped_nan", 0))
+                zero_count = int(test_stats.get("n_dropped_zero_sentinel", 0))
+                total_count = int(test_stats.get(
+                    "n_dropped_guids", nan_count + zero_count
+                ))
+                entry = {
+                    "total": total_count,
+                    "nan": nan_count,
+                    "zero": zero_count,
+                    "source": "strict",
+                }
+            elif legacy_path.exists():
+                data = json.loads(legacy_path.read_text(encoding="utf-8"))
+                count = int(data.get("n_dropped_guids", 0))
+                entry = {
+                    "total": count,
+                    "nan": count,         # legacy filter is NaN-only
+                    "zero": 0,
+                    "source": "legacy",
+                }
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"could not read {summary_path}: {exc}")
-            per_fold[fd.name] = None
-            continue
-        per_fold[fd.name] = count
-        total = (total or 0) + count
-    return total, per_fold
+            logger.warning(
+                f"could not read SSO eligibility summary for {fd.name}: {exc}"
+            )
+        per_fold[fd.name] = entry
+        if entry["total"] is not None:
+            if totals is None:
+                totals = {"total": 0, "nan": 0, "zero": 0}
+            totals["total"] += int(entry["total"])
+            totals["nan"] += int(entry["nan"] or 0)
+            totals["zero"] += int(entry["zero"] or 0)
+    return totals, per_fold
 
 
 def _read_binary_subgroup_long_at(
@@ -2054,11 +2100,17 @@ def aggregate_results(
     sso_summary: Dict[str, Any] = {}
     try:
         total_sso_dropped, sso_dropped_breakdown = _read_sso_dropped_counts(fold_dirs)
-        sso_footer = (
-            f"SSO-missing GUIDs across {len(fold_dirs)} folds: "
-            f"{total_sso_dropped}"
-            if total_sso_dropped is not None else None
-        )
+        if total_sso_dropped is None:
+            sso_footer = None
+        else:
+            # Strict summary carries the NaN / zero-sentinel split; legacy
+            # summaries only report NaN drops (zero is reported as 0).
+            sso_footer = (
+                f"SSO-ineligible GUIDs across {len(fold_dirs)} folds: "
+                f"NaN={total_sso_dropped['nan']}, "
+                f"zero-sentinel={total_sso_dropped['zero']}, "
+                f"total={total_sso_dropped['total']}"
+            )
 
         if any_fold_has_binary:
             sso_summary["binary_metrics_vs_time"] = _aggregate_binary_metrics_vs_time_curves(

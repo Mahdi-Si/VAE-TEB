@@ -315,13 +315,31 @@ evaluation:
   threshold_search_max_iters: 25
   regenerate_predictions: false
   aggregate_only: false
-  # Per-partition epoch_min override for evaluation. When null, both
-  # val and test inherit ``dataset_config.epoch_min``. When set, val
-  # AND test caches are built with this wider window (train always
-  # uses dataset_config.epoch_min). Use to evaluate on a longer
-  # pre-delivery horizon than the model was trained on (e.g. train on
-  # last 6h, test on last 12h => set this to -43200).
+  # Wider pre-delivery window for the *test* partition only.
+  # When null, test inherits ``dataset_config.epoch_min``. When set,
+  # ONLY the test cache is built with this window; train and val both
+  # use ``dataset_config.epoch_min`` so the threshold-search operating
+  # point is calibrated on the training distribution and there is no
+  # train↔val window mismatch at training-time validation. Used to
+  # evaluate the final model on a longer pre-delivery horizon than
+  # it was trained on (e.g. train+val on last 6h, test on last 12h =>
+  # set this to -43200). See ``possible_improvements.md`` §3.5 Option C.
   epoch_min_test: null
+
+  # SSO eligibility filter applied once to the per-(guid, position)
+  # prediction CSVs (val + test) before threshold search and before
+  # either of the delivery-axis or SSO-axis metric trees consume them.
+  # ``drop_nan``: drop a GUID if any of its segments has NaN
+  #   ``second_stage_onset``. This was the only check the legacy
+  #   SSO-axis-only filter performed.
+  # ``drop_zero_sentinel``: drop a GUID if ALL its segments have
+  #   ``second_stage_onset == 0.0`` (a "SSO == delivery" sentinel that
+  #   produces the -12h-before-SSO plot artifact). Set false to keep
+  #   sentinel-zero GUIDs in evaluation.
+  sso_eligibility:
+    drop_nan: true
+    drop_zero_sentinel: true
+
   plot_styles:
     guid_binary_primary: true
     three_class_ovr: true

@@ -189,6 +189,128 @@ def filter_to_sso_eligible(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, An
     return out, stats
 
 
+def filter_to_sso_eligible_strict(
+    df: pd.DataFrame,
+    *,
+    drop_nan: bool = True,
+    drop_zero_sentinel: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Drop GUIDs without a *real* second-stage-onset timestamp.
+
+    Extends :func:`filter_to_sso_eligible` with a second predicate that
+    catches GUIDs whose ``second_stage_onset`` was stored as the
+    sentinel value ``0.0`` (i.e. "SSO occurred at delivery time" /
+    "SSO was not recorded"). Such GUIDs pass the NaN-only filter but
+    produce the $-12\\,\\mathrm{h}$-before-SSO plot artefact when their
+    per-segment epochs are interpreted as offsets from SSO.
+
+    A GUID is dropped iff::
+
+        (drop_nan AND has_nan) OR (drop_zero_sentinel AND all_zero)
+
+    where ``has_nan`` is true when **any** of the GUID's rows have
+    ``NaN`` in :data:`SSO_TIME_COL`, and ``all_zero`` is true when
+    **every** non-NaN row equals ``0.0`` and at least one row is
+    non-NaN (so all-NaN GUIDs are accounted for by ``has_nan`` only).
+
+    Args:
+        df: Predictions DataFrame with a populated :data:`SSO_TIME_COL`
+            column (call :func:`ensure_t_rel_sso_hours` first when
+            unsure). Must also carry a ``guid`` column.
+        drop_nan: When True, drop GUIDs where any row's SSO is NaN.
+            Recommended default; mirrors :func:`filter_to_sso_eligible`.
+        drop_zero_sentinel: When True, drop GUIDs whose non-NaN SSO
+            rows are *all* exactly ``0.0`` — the "SSO == delivery"
+            sentinel that causes the $-12\\,\\mathrm{h}$-before-SSO plot
+            artefact. Set False to keep sentinel-zero GUIDs.
+
+    Returns:
+        Tuple ``(filtered_df, stats)`` where ``stats`` carries:
+
+        * ``n_total_guids``: GUIDs in the input.
+        * ``n_kept_guids``: GUIDs retained.
+        * ``n_dropped_guids``: GUIDs removed (total).
+        * ``n_dropped_nan``: subset dropped due to NaN SSO.
+        * ``n_dropped_zero_sentinel``: subset dropped due to
+          all-zero-sentinel SSO. Disjoint from ``n_dropped_nan`` —
+          a GUID with mixed NaN+zero rows is counted in
+          ``n_dropped_nan`` only.
+        * ``dropped_guids_nan`` / ``dropped_guids_zero_sentinel``:
+          sorted lists of GUID strings per drop reason.
+        * ``policy``: ``{"drop_nan": bool, "drop_zero_sentinel": bool}``
+          echo of the calling args for downstream auditability.
+
+    Raises:
+        KeyError: When :data:`SSO_TIME_COL` or ``guid`` is missing.
+    """
+    if SSO_TIME_COL not in df.columns:
+        raise KeyError(
+            f"filter_to_sso_eligible_strict requires '{SSO_TIME_COL}'; "
+            "call ensure_t_rel_sso_hours first."
+        )
+    if "guid" not in df.columns:
+        raise KeyError(
+            "filter_to_sso_eligible_strict requires a 'guid' column."
+        )
+
+    drop_nan = bool(drop_nan)
+    drop_zero_sentinel = bool(drop_zero_sentinel)
+
+    grouped = df.groupby("guid", sort=False)[SSO_TIME_COL]
+    # Cast to bool dtype explicitly: when the input DataFrame is empty
+    # the apply returns a float64 Series and downstream ``&`` with a
+    # bool scalar raises ``TypeError``.
+    has_nan_per_guid = grouped.apply(
+        lambda s: bool(s.isna().any())
+    ).astype(bool)
+    # ``all_zero`` requires at least one non-NaN row equal to 0.0 AND every
+    # non-NaN row equal to 0.0. All-NaN GUIDs are excluded here so they get
+    # counted under the NaN path exclusively.
+    all_zero_per_guid = grouped.apply(
+        lambda s: bool(s.notna().any() and (s.dropna() == 0.0).all())
+    ).astype(bool)
+
+    # NaN path takes precedence when a GUID matches both predicates.
+    drop_for_nan = (has_nan_per_guid & drop_nan)
+    drop_for_zero = (all_zero_per_guid & drop_zero_sentinel & ~drop_for_nan)
+    keep_mask = ~(drop_for_nan | drop_for_zero)
+
+    dropped_nan_guids = sorted(has_nan_per_guid[drop_for_nan].index.tolist())
+    dropped_zero_guids = sorted(has_nan_per_guid[drop_for_zero].index.tolist())
+    eligible = has_nan_per_guid[keep_mask].index.tolist()
+
+    stats: Dict[str, Any] = {
+        "n_total_guids": int(len(has_nan_per_guid)),
+        "n_kept_guids": int(len(eligible)),
+        "n_dropped_guids": int(len(dropped_nan_guids) + len(dropped_zero_guids)),
+        "n_dropped_nan": int(len(dropped_nan_guids)),
+        "n_dropped_zero_sentinel": int(len(dropped_zero_guids)),
+        "dropped_guids_nan": [str(g) for g in dropped_nan_guids],
+        "dropped_guids_zero_sentinel": [str(g) for g in dropped_zero_guids],
+        "policy": {
+            "drop_nan": drop_nan,
+            "drop_zero_sentinel": drop_zero_sentinel,
+        },
+    }
+
+    if not eligible:
+        logger.warning(
+            "filter_to_sso_eligible_strict: all GUIDs dropped under policy "
+            f"(drop_nan={drop_nan}, drop_zero_sentinel={drop_zero_sentinel}); "
+            "returning empty DataFrame"
+        )
+        return df.iloc[0:0].copy(), stats
+
+    out = df[df["guid"].isin(eligible)].copy()
+    logger.info(
+        f"filter_to_sso_eligible_strict: kept {stats['n_kept_guids']} / "
+        f"{stats['n_total_guids']} GUIDs "
+        f"(dropped nan={stats['n_dropped_nan']}, "
+        f"zero-sentinel={stats['n_dropped_zero_sentinel']})"
+    )
+    return out, stats
+
+
 def recompute_t_rel_sso_after_fill(df: pd.DataFrame) -> pd.DataFrame:
     """Repair ``t_rel_sso_hours`` on rows synthesised by ``fill_missing_epochs``.
 
@@ -1416,6 +1538,7 @@ __all__ = [
     "SSO_TIME_COL",
     "ensure_t_rel_sso_hours",
     "filter_to_sso_eligible",
+    "filter_to_sso_eligible_strict",
     "recompute_t_rel_sso_after_fill",
     "compute_sso_time_bins",
     "compute_instantaneous_metrics_sso",
