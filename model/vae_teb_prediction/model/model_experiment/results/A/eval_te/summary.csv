@@ -1,0 +1,2 @@
+run_tag,data_tag,a,M,te_true,te_per_step,k_bar,k_bar_shuffled,pred_gap,feat_loss,base_loss,kld_loss,mu_post_prior_gap,attn_entropy,n_test,warmup,epoch,latent_stats_fitted,ckpt_path
+pol_easy_a1,benchmark_A_easy_a1,1.0,87,904.5570706307288,30.151902354357627,0.000122964579728432,0.00012296433106530458,-5.943584442138672e-05,1.0781258277893067,1.0780663919448852,0.000122964579728432,0.007845298476517201,4.408542488098145,2000,30,3,True,C:\Users\mahdi\Desktop\teb_vae_model\model\vae_teb_prediction\model\model_experiment\results\A\pol_easy_a1\final.ckpt

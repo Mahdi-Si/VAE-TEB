@@ -773,10 +773,24 @@ def _build_classifier_cfg_from_config(config: Dict[str, Any]) -> GuidClassifierC
     helper can build an identical config without needing the cache file
     to peek at ``d_model`` / ``d_z``: in the live-VAE branch we read
     those from ``config['vae']['model_kwargs']`` instead.
+
+    Per-head enable flags (``model_config.classifier.heads.*.enabled``) are
+    forwarded here so the rebuilt classifier matches the one
+    :mod:`single_fold_trainer` produced; otherwise a checkpoint trained
+    with ``three_class.enabled: false`` would be reloaded into a model with
+    an extra ``head_3`` and the strict-load check in
+    :func:`load_classifier_from_checkpoint` rejects it.
     """
     cls_cfg = config["model_config"]["classifier"]
     vae_kwargs = config.get("vae", {}).get("model_kwargs", {})
     head_hidden_raw = cls_cfg.get("head_hidden_dim")
+    heads_cfg = cls_cfg.get("heads", {}) or {}
+    enable_three_class_head = bool(
+        (heads_cfg.get("three_class") or {}).get("enabled", True)
+    )
+    enable_binary_head = bool(
+        (heads_cfg.get("binary") or {}).get("enabled", True)
+    )
     return GuidClassifierConfig(
         d_model_vae=int(vae_kwargs.get("d_model")),
         d_z=int(vae_kwargs.get("d_z")),
@@ -794,6 +808,8 @@ def _build_classifier_cfg_from_config(config: Dict[str, Any]) -> GuidClassifierC
         te_summary_dim=6,
         late_window_steps=75,
         dropout=float(cls_cfg.get("dropout", 0.1)),
+        enable_three_class_head=enable_three_class_head,
+        enable_binary_head=enable_binary_head,
     )
 
 

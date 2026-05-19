@@ -1,0 +1,225 @@
+# config_synth.yaml -- standalone synthetic-TE validation config (D2 minimal loop).
+#
+# Derived from config_lag_attn_v1.yaml but stripped of MLflow / DDP / callbacks /
+# HDF5 dataset paths -- the standalone loop (Decision D2) does not use the
+# PyTorch Lightning trainer. See synthetic_te_validation_plan.md for context.
+#
+# Phase 7 restructure: per-benchmark settings live under `benchmarks:` (one
+# block per benchmark A/B/C/E/G, each with a `data` and an optional `sweep` /
+# `rho_null` sub-block). `experiment.benchmark` selects the active block;
+# `train_minimal.resolve_active_benchmark` overlays it onto `config["data"]` /
+# `config["sweep"]` so every downstream reader keeps the flat Phase-1 shape.
+
+experiment:
+  tag: benchmark_A_baseline
+  benchmark: A                 # selects the active block under `benchmarks:`
+  seed: 0
+
+runtime:
+  device: auto                 # auto -> cuda if available, else cpu
+  cuda_device: 0               # GPU index for single-GPU runs (train_minimal etc.)
+  gpus: [0]                    # GPU slot list for synthetic/gpu_pool.py
+                               # task-parallel multi-GPU training (one model per
+                               # slot). On the 7-GPU box set [0,1,2,3,4,5,6];
+                               # a repeated index packs two models onto a GPU.
+
+paths:
+  data_dir: ./data             # cached datasets (gitignored, regenerable)
+  results_dir: ./results       # per-run checkpoints / CSVs / figures
+
+# --- per-benchmark data + sweep blocks (see model_validation.md sec. 3) -------
+# Operating regime (Decision D8): real-data UP->FHR per-step TE is ~0.05-0.3
+# nats, so Gaussian `a` lands the synthetic per-step TE mid-regime. Use
+# analytic_te.a_for_te_per_step to re-derive `a` for any other target.
+benchmarks:
+
+  # Benchmark A -- delayed linear-Gaussian (Y_j(t) = a*U_j(t-D) + eps).
+  A:
+    data:
+      sequence_length: 300       # T
+      delay: 60                  # D -- true source->target lag band {D-H,...,D-1}
+      a: 0.279                   # transfer coeff -> per-step TE 0.150, block TE 4.50
+      sigma2: 1.0                # target noise variance
+      M: 4                       # informative target/source channels
+      easy_variant: false        # true -> all 87 channels informative (proof-of-life)
+      n_train: 8000
+      n_val: 1000
+      n_test: 2000
+      c_y_st: 43                 # native channel layout (D1) -- target scattering
+      c_y_ph: 44                 # target phase harmonics
+      c_u_st: 43                 # source (UP) scattering
+      c_u_ph: 58                 # source (UP) phase harmonics
+    sweep:
+      kind: gaussian             # a_grid x m_grid, te via te_block_gaussian
+      a_grid: [0.0, 0.1591, 0.2264, 0.2791, 0.3243, 0.4023, 0.5023]
+      # per-step TE at M=4:  0.00  0.05    0.10    0.15    0.20    0.30    0.45
+      m_grid: [1, 4, 8]
+
+  # Benchmark B -- AR target + delayed source (Y_t = rho*Y_{t-1} + a*X_{t-D} + eps).
+  # te_true is rho-INDEPENDENT (the AR self-term cancels in the determinant
+  # ratio); the headline test is K~=0 at a=0 even for large rho (rho_null).
+  B:
+    data:
+      sequence_length: 300
+      delay: 60
+      a: 0.279
+      sigma2: 1.0
+      M: 4
+      rho: 0.9                   # AR(1) target self-coefficient, 0 <= rho < 1
+      burn_in: 200               # discarded prefix that kills the 1/(1-rho) transient
+      easy_variant: false
+      n_train: 8000
+      n_val: 1000
+      n_test: 2000
+      c_y_st: 43
+      c_y_ph: 44
+      c_u_st: 43
+      c_u_ph: 58
+    sweep:
+      kind: gaussian             # TE is rho-independent -> same formula as A
+      a_grid: [0.0, 0.1591, 0.2264, 0.2791, 0.3243, 0.4023, 0.5023]
+      m_grid: [1, 4, 8]
+    rho_null:
+      rho_grid: [0.0, 0.5, 0.9, 0.99]   # a=0 self-info-leakage diagnostic
+
+  # Benchmark C -- delayed binary XOR (Y_bit = X_bit(t-D) XOR Bernoulli(q)),
+  # embedded as +/-1 + Gaussian observation noise.
+  C:
+    data:
+      sequence_length: 300
+      delay: 60
+      q: 0.25                    # bit-flip probability -> per-step TE ln2 - h_b(q)
+      obs_noise: 0.1             # std of the Gaussian observation noise on +/-1
+      M: 4
+      easy_variant: false
+      n_train: 8000
+      n_val: 1000
+      n_test: 2000
+      c_y_st: 43
+      c_y_ph: 44
+      c_u_st: 43
+      c_u_ph: 58
+    sweep:
+      kind: xor                  # q_grid x m_grid, te via te_block_xor
+      q_grid: [0.01, 0.10, 0.25, 0.50]
+      m_grid: [1, 4, 8]
+
+  # Benchmark E -- two-lag Gaussian with independent source channel groups.
+  # Group 1 (channels [0,M1)) transfers at delay1; group 2 ([M1,M1+M2)) at
+  # delay2. te_true decomposes additively across the two bands.
+  E:
+    data:
+      sequence_length: 300
+      delay1: 50                 # band 1 -- lags {D1-H,...,D1-1}
+      delay2: 80                 # band 2 -- lags {D2-H,...,D2-1}
+      a1: 0.40                   # band-1 transfer coeff (higher SNR)
+      a2: 0.25                   # band-2 transfer coeff (lower SNR)
+      sigma2: 1.0
+      M1: 4                      # informative channels in group 1
+      M2: 4                      # informative channels in group 2
+      n_train: 8000
+      n_val: 1000
+      n_test: 2000
+      c_y_st: 43
+      c_y_ph: 44
+      c_u_st: 43
+      c_u_ph: 58
+    sweep:
+      kind: two_lag              # single setting; lag map should show two bands
+
+  # Benchmark G -- directionality (reverse-roles Benchmark A). The i.i.d. stream
+  # is placed in the 87-ch target slots and the dependent stream in the 101-ch
+  # source slots, so the model-slot TE is 0 (anti-causal). Used by
+  # directionality.py against a forward Benchmark-A run.
+  G:
+    data:
+      sequence_length: 300
+      delay: 60
+      a: 0.279
+      sigma2: 1.0
+      M: 4
+      reverse_roles: true        # consumed by build_dataset for the G generator
+      easy_variant: false
+      n_train: 8000
+      n_val: 1000
+      n_test: 2000
+      c_y_st: 43
+      c_y_ph: 44
+      c_u_st: 43
+      c_u_ph: 58
+
+# --- model constructor kwargs (native shapes, D1) -----------------------------
+model:
+  sequence_length: 300
+  d_model: 128
+  d_z: 24
+  horizon: 30
+  warmup_period: 30
+  c_y: 87                      # 43 + 44
+  c_u: 101                     # 43 + 58; must equal 58 if use_up_st=false
+  use_up_st: true
+  max_lag: 90
+  num_heads: 4
+  d_head: 32
+  lstm_layers: 2
+  dropout: 0.1
+  decoder_hidden: 128
+  logvar_clamp: [-5.0, 3.0]
+  mu_scale: 5.0
+  delta_mu_scale: 3.0
+  latent_stats_momentum: 0.01
+  use_entmax: false
+  attention_grad_checkpoint: true   # activation checkpointing -- keeps the
+                                    # 91-lag memory bank within GPU memory
+
+# --- loss weights (spec section 8.7) ------------------------------------------
+loss:
+  kld_beta: 0.001
+  lambda_full: 1.0
+  lambda_base: 0.5
+
+# --- optimiser / training loop ------------------------------------------------
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+  epochs: 100
+  batch_size: 32               # RTX 4080 Laptop (12 GB)-safe with grad
+                               # checkpointing (~5 GiB peak); 128 OOMs
+  grad_clip_norm: 0.5
+  lr_milestones: [60, 85]
+  lr_gamma: 0.1
+
+# --- beta sweep + HP probes (Phase 6; beta_sweep.py) --------------------------
+# The shipped kld_beta=0.001 barely regularises the bottleneck, so a single run
+# proves nothing -- the rate-distortion sweep is the experiment. `beta` mode
+# trains the fixed (a, M) dataset across `grid`; `hp` mode sweeps one of the
+# `hp_probes` axes; `rank_at_beta` re-runs the Phase-4 A-sweep at a chosen beta.
+# Benchmark-A only by design.
+beta_sweep:
+  grid: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
+  fixed_setting:
+    a: 0.279                   # per-step TE 0.150, block TE 4.50 -- mid-regime
+    M: 4
+  data_tag: benchmark_A_baseline  # cached dataset the beta/HP sweep trains on
+                                  # (fixed a/M; must match fixed_setting)
+  epochs: null                 # null -> optim.epochs; lower it for a fast sweep
+  selected_beta: null          # set after the rate-distortion analysis (6.2);
+                               # consumed by `--mode rank_at_beta` (6.3)
+  hp_probes:                   # Phase 6.4 secondary hyper-parameter probes
+    lambda_base: [0.25, 0.5, 1.0]   # residual-isolation weight (loss block)
+    d_z: [8, 24]                    # latent capacity (model block)
+    warmup_period: [15, 30, 60]     # KL/feature warm-up window (model block)
+
+# --- lag-recovery harness (Phase 5; lag_recovery.py) --------------------------
+# Quantifies whether the model localises transfer to the true lag band
+# {D-H, ..., D-1}: attention lag-mass (5.2), peak-lag error (5.3) and a faithful
+# input-level leave-one-lag-out ablation (5.4, Decision D5). For Benchmark E the
+# harness adds the two-band mass-ratio test and auto-skips the single-D LOLO.
+lag_recovery:
+  n_attention_samples: null    # cap test samples for 5.1-5.3; null -> all
+  n_ablation_samples: 512      # cap for the LOLO passes (5.4); 3-4x fwd cost
+  do_oob_probe: true           # 5.4 out-of-band sanity pass (corrupt [T-D, T))
+  ablation_seed: 0             # seed for the N(0,1) corruption + reparam RNGs
+  anchor_window: clean         # 'clean' -> meta.clean_anchor_range (headline)
+                               # 'warmup' -> [warmup, T)
+  batch_size: null             # null -> checkpoint's training batch size
