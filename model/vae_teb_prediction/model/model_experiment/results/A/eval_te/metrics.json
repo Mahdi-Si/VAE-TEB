@@ -1,5 +1,5 @@
 {
-  "created": "2026-05-18T19:40:07.478711+00:00",
+  "created": "2026-05-19T03:33:57.656373+00:00",
   "n_evaluated": 1,
   "metrics": {
     "n_settings": 1,
@@ -54,7 +54,10 @@
     {
       "run_tag": "pol_easy_a1",
       "data_tag": "benchmark_A_easy_a1",
+      "benchmark": "A",
       "a": 1.0,
+      "q": null,
+      "rho": null,
       "M": 87,
       "te_true": 904.5570706307288,
       "te_per_step": 30.151902354357627,

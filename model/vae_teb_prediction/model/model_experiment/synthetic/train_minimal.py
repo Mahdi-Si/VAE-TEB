@@ -113,6 +113,7 @@ _OVERRIDE_MAP: Dict[str, Tuple[str, str]] = {
     "grad_checkpoint": ("model", "attention_grad_checkpoint"),
     "device": ("runtime", "device"),
     "seed": ("experiment", "seed"),
+    "plot_every": ("plotting", "plot_every"),
 }
 
 
@@ -658,6 +659,32 @@ def _maybe_fit_latent_stats(
         return 0
 
 
+def _refresh_training_curves(
+    csv_path: Path, run_tag: str, plotting_cfg: Dict[str, Any]
+) -> None:
+    """Re-render the train/val loss-curve figure from the metrics CSV.
+
+    Reads ``metrics.csv`` and overwrites ``training_curves.{pdf,png}`` in the
+    same directory. The plotter is imported lazily (it pulls in matplotlib) and
+    every failure is downgraded to a warning -- a plotting bug must never abort
+    a training run.
+
+    Args:
+        csv_path: The run's ``metrics.csv`` (flushed every epoch).
+        run_tag: Run label, used in the figure title.
+        plotting_cfg: The ``plotting`` config block (``enabled`` toggle).
+    """
+    if not plotting_cfg.get("enabled", True):
+        return
+    try:
+        from model.vae_teb_prediction.model.model_experiment.synthetic.plot_training_curves import (
+            plot_training_curves,
+        )
+        plot_training_curves(csv_path, run_tag=run_tag)
+    except Exception as exc:  # noqa: BLE001 - plotting must not kill training
+        print(f"[warn] training-curve plot failed: {type(exc).__name__}: {exc}")
+
+
 # =============================================================================
 # Overrides + main training entry point
 # =============================================================================
@@ -689,7 +716,9 @@ def _apply_overrides(
         if key not in _OVERRIDE_MAP:
             raise KeyError(f"unknown override key: {key!r}")
         section, field = _OVERRIDE_MAP[key]
-        config[section][field] = value
+        # ``setdefault`` so an override into an optional section (e.g.
+        # ``plotting``) still works when a hand-built config omits the block.
+        config.setdefault(section, {})[field] = value
     return config
 
 
@@ -750,6 +779,9 @@ def train(
     exp = config["experiment"]
     optim_cfg = config["optim"]
     loss_cfg = config["loss"]
+    # Optional ``plotting`` block -- a config without it still trains fine.
+    plotting_cfg = config.get("plotting", {}) or {}
+    plot_every = int(plotting_cfg.get("plot_every", 10))
 
     set_seed(exp.get("seed", 0))
     device = resolve_device(config["runtime"])
@@ -844,6 +876,10 @@ def train(
             f"lr={lr:.1e} {dt:.1f}s{skip_note}"
         )
 
+        # Refresh the loss-curve figure (the CSV row above is already flushed).
+        if plot_every > 0 and epoch % plot_every == 0:
+            _refresh_training_curves(csv_path, run_tag, plotting_cfg)
+
         val_total = val_m["total_loss"]
         if math.isfinite(val_total) and val_total < best_val:
             best_val = val_total
@@ -879,6 +915,10 @@ def train(
             train_metrics=train_m, loss_settings=loss_settings,
             latent_stats_fitted=(n_stats > 0),
         )
+
+    # Final loss-curve refresh -- covers the case where ``epochs`` is not a
+    # multiple of ``plot_every``.
+    _refresh_training_curves(csv_path, run_tag, plotting_cfg)
 
     kbar_val = compute_kbar(model, val_loader, device)
     kbar_train = compute_kbar(model, train_loader, device, max_batches=8)
@@ -963,6 +1003,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="override runtime.device (auto / cpu / cuda / cuda:N)",
     )
     p.add_argument("--seed", type=int, default=None, help="override experiment.seed")
+    p.add_argument(
+        "--plot-every", type=int, default=None, dest="plot_every",
+        help="override plotting.plot_every (epochs between loss-curve "
+             "refreshes; 0 = render only at the end)",
+    )
     return p.parse_args(argv)
 
 
@@ -986,6 +1031,7 @@ def main(argv=None) -> None:
         "grad_checkpoint": args.grad_checkpoint,
         "device": args.device,
         "seed": args.seed,
+        "plot_every": args.plot_every,
     }
     train(config, overrides=overrides)
 
@@ -1021,6 +1067,7 @@ if __name__ == "__main__":
         "grad_checkpoint": None,            # None -> config model.attention_grad_checkpoint
         "device": "cuda:0",                 # None/"auto" -> config runtime.device
         "seed": None,                       # None -> config experiment.seed
+        "plot_every": None,                 # None -> config plotting.plot_every
     }
 
     if len(sys.argv) > 1:
