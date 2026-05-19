@@ -1,0 +1,14 @@
+# Synthetic-TE validation -- ignore large/regenerable artifacts.
+# Code, small meta.json, CSVs, and figures (PDF/PNG) stay tracked.
+
+__pycache__/
+*.pyc
+
+# cached generated datasets -- regenerable via synthetic/build_dataset.py
+data/**/*.npz
+data/**/*.npy
+
+# training artifacts
+results/**/*.ckpt
+results/**/*.pt
+results/**/*.pth

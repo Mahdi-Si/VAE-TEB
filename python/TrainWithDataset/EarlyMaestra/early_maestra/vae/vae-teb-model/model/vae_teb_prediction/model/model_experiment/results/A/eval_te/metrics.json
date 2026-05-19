@@ -1,0 +1,76 @@
+{
+  "created": "2026-05-18T19:40:07.478711+00:00",
+  "n_evaluated": 1,
+  "metrics": {
+    "n_settings": 1,
+    "metric1_null": {
+      "E_0": NaN,
+      "smallest_signal_k_bar": 0.000122964579728432,
+      "null_signal_ratio": NaN,
+      "k_bar_shuffled_mean": 0.00012296433106530458
+    },
+    "metric2_spearman": NaN,
+    "metric3_calibration": {
+      "alpha": NaN,
+      "gamma": NaN,
+      "r2": NaN
+    },
+    "metric4_pred_gain": {
+      "mean_pred_gap_te0": NaN,
+      "mean_pred_gap_te_pos": -5.943584442138672e-05,
+      "verdict_te0_near_zero": null,
+      "verdict_te_pos_positive": false
+    }
+  },
+  "per_dim_kl": {
+    "pol_easy_a1": [
+      2.6560914193396457e-05,
+      1.1982599062321242e-05,
+      7.316882692975923e-05,
+      0.00048781195073388517,
+      4.3591360736172646e-05,
+      8.82663698575925e-06,
+      1.1903401286872395e-07,
+      0.00022228386660572141,
+      6.05148816248402e-05,
+      5.6151809985749424e-05,
+      0.00015513737162109464,
+      0.0001881411299109459,
+      0.0002561211585998535,
+      6.877317355247214e-05,
+      0.00033284255187027156,
+      0.0001926430268213153,
+      9.699598012957722e-05,
+      5.506195520865731e-05,
+      7.940048817545176e-05,
+      3.61103520845063e-05,
+      9.463317837798968e-05,
+      0.00021866733732167631,
+      0.0001613861822988838,
+      2.4224094886449166e-05
+    ]
+  },
+  "rows": [
+    {
+      "run_tag": "pol_easy_a1",
+      "data_tag": "benchmark_A_easy_a1",
+      "a": 1.0,
+      "M": 87,
+      "te_true": 904.5570706307288,
+      "te_per_step": 30.151902354357627,
+      "k_bar": 0.000122964579728432,
+      "k_bar_shuffled": 0.00012296433106530458,
+      "pred_gap": -5.943584442138672e-05,
+      "feat_loss": 1.0781258277893067,
+      "base_loss": 1.0780663919448852,
+      "kld_loss": 0.000122964579728432,
+      "mu_post_prior_gap": 0.007845298476517201,
+      "attn_entropy": 4.408542488098145,
+      "n_test": 2000,
+      "warmup": 30,
+      "epoch": 3,
+      "latent_stats_fitted": true,
+      "ckpt_path": "C:\\Users\\mahdi\\Desktop\\teb_vae_model\\model\\vae_teb_prediction\\model\\model_experiment\\results\\A\\pol_easy_a1\\final.ckpt"
+    }
+  ]
+}
