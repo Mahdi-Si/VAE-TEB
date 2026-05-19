@@ -978,6 +978,202 @@ def _make_plots(
     ps.save_figure(fig, out_dir / "predgap_vs_kbar")
 
 
+def _make_checkpoint_figure(row: Dict[str, Any], out_dir: Path) -> list:
+    r"""Render a 2x2 single-checkpoint TE-diagnostics figure.
+
+    Works for **one** evaluated checkpoint (the ``single`` mode and, per cell,
+    the ``sweep`` mode). The four panels expose whether the latent bottleneck
+    is actually being used:
+
+        * per-latent-dim KL -- a flat-zero bar row is the collapse signature.
+        * $\bar K$ vs the shuffled-source null control -- a faithful surrogate
+          collapses $\bar K$ when the genuine $U\to Y$ pairing is destroyed.
+        * baseline vs full forecast loss -- ``pred_gap`` is their difference.
+        * a text panel with every scalar diagnostic and the analytic ``te_true``.
+
+    Args:
+        row: One :func:`evaluate_checkpoint` metrics row.
+        out_dir: Destination directory for the figure pair.
+
+    Returns:
+        The list of written file paths.
+    """
+    import matplotlib.pyplot as plt
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        plot_style as ps,
+    )
+
+    ps.apply_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    per_dim = np.asarray(row.get("per_dim_kl") or [], dtype=float)
+    te_true = float(row.get("te_true", float("nan")))
+    k_bar = float(row.get("k_bar", float("nan")))
+    k_shuf = float(row.get("k_bar_shuffled", float("nan")))
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.2))
+    fig.suptitle(
+        f"Checkpoint TE diagnostics -- {row.get('run_tag','?')}  "
+        f"(benchmark {row.get('benchmark','?')}, epoch {row.get('epoch')})",
+        fontsize=ps.FONT_TITLE, fontweight="bold",
+    )
+
+    # --- Panel (0,0): per-latent-dim KL -----------------------------------
+    ax = axes[0, 0]
+    if per_dim.size:
+        ax.bar(np.arange(per_dim.size), per_dim, color=ps.COLOR_BLUE, width=0.9)
+        ax.axhline(float(np.nanmean(per_dim)), color=ps.COLOR_VERMILLION,
+                   ls="--", lw=1.0, label=f"mean={np.nanmean(per_dim):.2e}")
+        ax.legend(loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "no per-dim KL recorded", ha="center", va="center",
+                transform=ax.transAxes)
+    ax.set_title(r"per-latent-dim KL (flat $\approx 0$ row = posterior collapse)")
+    ax.set_xlabel("latent dimension $d$")
+    ax.set_ylabel(r"$K_d$ (nats)")
+    ps.style_axes(ax)
+
+    # --- Panel (0,1): K_bar vs the shuffled-source null control -----------
+    ax = axes[0, 1]
+    ax.bar([0, 1], [k_bar, k_shuf], width=0.6,
+           color=[ps.COLOR_BLUE, ps.COLOR_GRAY])
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels([r"$\bar K$ (paired)", r"$\bar K$ (shuffled src)"])
+    for x, v in ((0, k_bar), (1, k_shuf)):
+        if np.isfinite(v):
+            ax.text(x, v, f"  {v:.3e}", ha="center", va="bottom",
+                    fontsize=ps.FONT_TICK)
+    ax.set_title(f"TE surrogate vs null control   (analytic te_true={te_true:.3f} nats)")
+    ax.set_ylabel(r"$\bar K$ (nats)")
+    ax.margins(y=0.18)
+    ps.style_axes(ax)
+
+    # --- Panel (1,0): baseline vs full forecast loss ----------------------
+    ax = axes[1, 0]
+    base_l = float(row.get("base_loss", float("nan")))
+    feat_l = float(row.get("feat_loss", float("nan")))
+    ax.bar([0, 1], [base_l, feat_l], width=0.6,
+           color=[ps.COLOR_ORANGE, ps.COLOR_BLUE])
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["baseline $L_{base}$", "full $L_{feat}$"])
+    for x, v in ((0, base_l), (1, feat_l)):
+        if np.isfinite(v):
+            ax.text(x, v, f"  {v:.4f}", ha="center", va="bottom",
+                    fontsize=ps.FONT_TICK)
+    ax.set_title(
+        f"forecast loss   (pred_gap = $L_{{base}}-L_{{feat}}$ = "
+        f"{float(row.get('pred_gap', float('nan'))):+.4f})"
+    )
+    ax.set_ylabel("weighted MSE")
+    ax.margins(y=0.18)
+    ps.style_axes(ax)
+
+    # --- Panel (1,1): scalar-diagnostics text -----------------------------
+    ax = axes[1, 1]
+    ax.axis("off")
+    ln_l = float(np.log(91.0))  # ln(max_lag + 1): diffuse-attention reference.
+    lines = [
+        "TE surrogate",
+        f"  te_true (block)  : {te_true:.4f} nats",
+        f"  te_per_step      : {float(row.get('te_per_step', float('nan'))):.4f} nats",
+        f"  K_bar            : {k_bar:.5f} nats",
+        f"  K_bar shuffled   : {k_shuf:.5f} nats",
+        f"  kld_loss         : {float(row.get('kld_loss', float('nan'))):.5f}",
+        "",
+        "Latent / attention",
+        f"  mu_post_prior_gap: {float(row.get('mu_post_prior_gap', float('nan'))):.5f}",
+        f"  attn_entropy     : {float(row.get('attn_entropy', float('nan'))):.4f}"
+        f"  (diffuse ref ln 91 = {ln_l:.3f})",
+        "",
+        "Run",
+        f"  epoch            : {row.get('epoch')}",
+        f"  n_test           : {row.get('n_test')}",
+        f"  warmup           : {row.get('warmup')}",
+        f"  latent_stats_fit : {row.get('latent_stats_fitted')}",
+    ]
+    ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left",
+            family="monospace", fontsize=9.0, color=ps.COLOR_BLACK,
+            transform=ax.transAxes)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    safe_tag = str(row.get("run_tag", "ckpt")).replace("/", "_")
+    return ps.save_figure(fig, out_dir / f"diagnostics_{safe_tag}")
+
+
+def _make_sweep_extras(rows: List[Dict[str, Any]], out_dir: Path) -> None:
+    r"""Render the extra sweep-level analysis figures (task 4.7 extension).
+
+    Adds two figures to the headline three:
+
+        * ``per_dim_kl_heatmap`` -- a (setting x latent-dim) heatmap of the
+          per-dimension KL, settings ordered by analytic TE. Reveals whether
+          the bottleneck recruits more latent dimensions as TE grows.
+        * ``null_control`` -- $\bar K$ against its shuffled-source control per
+          setting, with the analytic TE overlaid; the gap between the paired
+          and shuffled bars is the genuine transfer signal.
+
+    Args:
+        rows: Per-checkpoint metrics rows (>= 2 expected).
+        out_dir: Destination directory.
+    """
+    import matplotlib.pyplot as plt
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        plot_style as ps,
+    )
+
+    ps.apply_style()
+    order = sorted(range(len(rows)), key=lambda i: float(rows[i]["te_true"]))
+    rows = [rows[i] for i in order]
+    labels = [
+        f"{r.get('run_tag','?')}\nTE={float(r['te_true']):.2f}" for r in rows
+    ]
+    te = np.array([float(r["te_true"]) for r in rows])
+    kbar = np.array([float(r["k_bar"]) for r in rows])
+    kshuf = np.array([float(r["k_bar_shuffled"]) for r in rows])
+
+    # --- Figure 1: per-dim KL heatmap (setting x latent dim) --------------
+    per_dim = [np.asarray(r.get("per_dim_kl") or [], dtype=float) for r in rows]
+    width = max(len(v) for v in per_dim) if per_dim else 0
+    if width > 0:
+        grid = np.full((len(rows), width), np.nan)
+        for i, v in enumerate(per_dim):
+            grid[i, : v.size] = v
+        fig, ax = plt.subplots(figsize=(8.8, 0.5 * len(rows) + 2.2))
+        vmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 1.0
+        im = ax.imshow(grid, aspect="auto", origin="lower", cmap="magma",
+                       vmin=0.0, vmax=max(vmax, 1e-9), interpolation="nearest")
+        ax.set_yticks(np.arange(len(rows)))
+        ax.set_yticklabels(labels, fontsize=ps.FONT_TICK)
+        ax.set_xlabel("latent dimension $d$")
+        ax.set_title(r"per-dimension KL $K_d$ across sweep settings "
+                     r"(rows ordered by analytic TE)")
+        ps.add_colorbar(fig, im, ax, label=r"$K_d$ (nats)")
+        ps.style_axes(ax, grid="none")
+        fig.tight_layout()
+        ps.save_figure(fig, out_dir / "per_dim_kl_heatmap")
+
+    # --- Figure 2: K_bar vs shuffled-source null control ------------------
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
+    idx = np.arange(len(rows))
+    ax.bar(idx - 0.2, kbar, width=0.4, color=ps.COLOR_BLUE, label=r"$\bar K$ (paired)")
+    ax.bar(idx + 0.2, kshuf, width=0.4, color=ps.COLOR_GRAY,
+           label=r"$\bar K$ (shuffled source)")
+    ax2 = ax.twinx()
+    ax2.plot(idx, te, marker="o", color=ps.COLOR_VERMILLION, lw=1.2,
+             label="analytic TE")
+    ax2.set_ylabel("analytic block TE (nats)", color=ps.COLOR_VERMILLION)
+    ax2.tick_params(axis="y", colors=ps.COLOR_VERMILLION)
+    ax.set_xticks(idx)
+    ax.set_xticklabels(labels, fontsize=ps.FONT_TICK)
+    ax.set_ylabel(r"$\bar K$ (nats)")
+    ax.set_title(r"TE surrogate vs shuffled-source null control")
+    ax.legend(loc="upper left")
+    ps.style_axes(ax)
+    fig.tight_layout()
+    ps.save_figure(fig, out_dir / "null_control")
+
+
 def _print_metrics(metrics: Dict[str, Any], n: int) -> None:
     """Print the aggregated Metrics 1-4 block.
 
@@ -1114,11 +1310,17 @@ def run_sweep(
     write_metrics_json(metrics, rows, out_dir / "metrics.json")
     if len(rows) >= 2:
         _make_plots(rows, metrics, out_dir)
+        _make_sweep_extras(rows, out_dir)
     else:
         print(
-            "[plots] fewer than 2 settings evaluated -- skipping plots "
+            "[plots] fewer than 2 settings evaluated -- skipping sweep plots "
             "(the A-sweep training run is deferred; see the plan)."
         )
+    if rows:
+        pc_dir = out_dir / "per_checkpoint"
+        for row in rows:
+            _make_checkpoint_figure(row, pc_dir)
+        print(f"[plots] {len(rows)} per-checkpoint diagnostics -> {pc_dir}")
 
     _print_metrics(metrics, n=len(rows))
     print(
@@ -1336,8 +1538,12 @@ def _dispatch(
         metrics = _aggregate_metrics([row])
         write_summary_csv([row], out_dir / "summary.csv")
         write_metrics_json(metrics, [row], out_dir / "metrics.json")
+        fig_paths = _make_checkpoint_figure(row, out_dir)
         _print_metrics(metrics, n=1)
-        print(f"[done] single-checkpoint eval -> {out_dir}")
+        print(
+            f"[done] single-checkpoint eval -> {out_dir}\n"
+            f"       diagnostics figure -> {len(fig_paths)} file(s)"
+        )
         return {"rows": [row], "metrics": metrics, "out_dir": str(out_dir)}
 
     if mode == "sweep":

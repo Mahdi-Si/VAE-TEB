@@ -189,6 +189,15 @@ optim:
   lr_milestones: [60, 85]
   lr_gamma: 0.1
 
+# --- training-curve plotting (train_minimal.py) -------------------------------
+# Static train/val loss-curve figure refreshed during the epoch loop. A plotting
+# failure is caught and never aborts training. Omitting this block is safe --
+# train_minimal falls back to these same defaults.
+plotting:
+  enabled: true                # false -> skip all loss-curve rendering
+  plot_every: 10               # epochs between training_curves.{pdf,png} refreshes;
+                               # 0 -> render only once, at the end of training
+
 # --- beta sweep + HP probes (Phase 6; beta_sweep.py) --------------------------
 # The shipped kld_beta=0.001 barely regularises the bottleneck, so a single run
 # proves nothing -- the rate-distortion sweep is the experiment. `beta` mode

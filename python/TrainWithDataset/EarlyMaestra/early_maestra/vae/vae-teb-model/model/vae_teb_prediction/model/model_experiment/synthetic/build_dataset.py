@@ -59,6 +59,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal imp
     resolve_active_benchmark,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.visualize import (
+    make_dataset_gallery,
     make_preview,
 )
 
@@ -321,6 +322,9 @@ def build_dataset(
 
     pdf = make_preview(out_dir, meta_out)
     print(f"  [plot ] -> {pdf.name}")
+    gallery = make_dataset_gallery(out_dir, meta_out)
+    n_figs = len({Path(p).stem for p in gallery})
+    print(f"  [figs ] -> figures/  ({n_figs} figures, {len(gallery)} files)")
     print(f"done: {out_dir}")
     return out_dir
 
