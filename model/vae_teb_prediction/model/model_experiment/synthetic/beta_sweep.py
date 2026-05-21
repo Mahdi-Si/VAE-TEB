@@ -770,16 +770,49 @@ def run_a_sweep_at_beta(
     rows: List[Dict[str, Any]] = []
     skipped: List[str] = []
     for setting in settings:
-        a, m = setting["a"], setting["M"]
-        data_tag, base_run_tag = ev._setting_tags(benchmark, a, m)
+        m = setting["M"]
+        kind = str(setting.get("kind", ""))
+        # Each v2 sweep cell carries a single named knob; mirror the
+        # `run_sweep` dispatch in evaluate_te.py.
+        if kind == "gaussian_state_space":
+            value = float(setting["B_y"])
+            data_tag, base_run_tag = ev._setting_tags_knob(
+                benchmark, "By", value, m
+            )
+            label = f"B_y={value:g}, M={m}"
+            ensure_dataset = lambda: ev._ensure_dataset_state_space(
+                config, data_tag, value, m
+            )
+        elif kind == "arx":
+            value = float(setting["c"])
+            data_tag, base_run_tag = ev._setting_tags_knob(
+                benchmark, "c", value, m
+            )
+            label = f"c={value:g}, M={m}"
+            ensure_dataset = lambda: ev._ensure_dataset_arx(
+                config, data_tag, value, m
+            )
+        elif kind == "regime_switch":
+            value = float(setting["p_switch"])
+            data_tag, base_run_tag = ev._setting_tags_knob(
+                benchmark, "p", value, m
+            )
+            label = f"p={value:g}, M={m}"
+            ensure_dataset = lambda: ev._ensure_dataset_regime_switch(
+                config, data_tag, value, m
+            )
+        else:
+            print(f"  [skip ] unknown sweep kind {kind!r}")
+            skipped.append(f"unknown_{kind}")
+            continue
         run_tag = f"rank_at_beta/{beta_token}/{base_run_tag}"
         cache_dir = ev._data_root(config) / benchmark / data_tag
         ckpt_path = ev._results_root(config) / benchmark / run_tag / "final.ckpt"
 
         if not (cache_dir / "test.npz").is_file():
             if build_missing:
-                print(f"  [build] {data_tag}  (a={a:g}, M={m})")
-                ev._ensure_dataset(config, data_tag, a, m)
+                print(f"  [build] {data_tag}  ({label})")
+                ensure_dataset()
             else:
                 print(
                     f"  [skip ] {run_tag}: dataset '{data_tag}' not cached "
@@ -790,7 +823,7 @@ def run_a_sweep_at_beta(
 
         if not ckpt_path.is_file():
             if train_missing:
-                print(f"  [train] {run_tag}  (a={a:g}, M={m}, beta={beta:g})")
+                print(f"  [train] {run_tag}  ({label}, beta={beta:g})")
                 cfg = deepcopy(config)
                 cfg["loss"]["kld_beta"] = beta
                 if epochs is not None:

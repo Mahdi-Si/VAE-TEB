@@ -1,4 +1,4 @@
-r"""Visualisation utilities for cached synthetic TE datasets (Decision D7).
+r"""Visualisation utilities for cached synthetic TE datasets (v2; Decision V2-D2).
 
 Renders a human-readable preview of a generated benchmark so the data can be
 inspected before training and reused with confidence. The preview is a single
@@ -9,26 +9,26 @@ Public API:
     make_preview: build the one-page ``preview.{pdf,png}`` for a cached dataset.
     make_dataset_gallery: render a multi-figure ``figures/`` gallery (input /
         source heatmaps, native model fields, the forecast-target window, the
-        lag structure, the analytic-TE breakdown, value distributions) so the
-        inputs, outputs and transfer structure of a dataset can be inspected in
-        full detail rather than from the single condensed preview.
+        lag structure, value distributions) so the inputs, outputs and transfer
+        structure of a dataset can be inspected in full detail rather than from
+        the single condensed preview.
 
-The preview is **benchmark-aware** (Phase 7): panels 1, 2 and 5 are common to
-every benchmark, while panels 3, 4 and 6 are dispatched on
-``meta["benchmark"]``:
+The preview is **benchmark-aware**: panels 1, 2 and 5 are common to every
+benchmark, while panels 3, 4 and 6 are dispatched on ``meta["benchmark"]``:
 
-    * A / B / G (linear-Gaussian): delay-alignment scatter, per-channel lagged
-      cross-correlation, and a Gaussian parameter summary.
-    * C (delayed XOR): a bit-agreement scatter and per-channel bit-agreement
-      rate $P(Y_j(t) = X_j(t-D))$.
-    * E (two-lag Gaussian): a two-group delay-alignment scatter and per-channel
-      lagged correlation evaluated at each group's own delay.
+    * G1 / G1-rev (Gaussian state-space oscillator): target PSD overlay vs
+      i.i.d. baseline, oscillator phase-portrait $(s_t, s_{t-1})$, and a
+      Gaussian state-space parameter summary.
+    * G2 (smooth AR(1)-ARX): delay-alignment scatter, per-channel lagged
+      cross-correlation, and an ARX parameter summary.
+    * G3 (slow categorical regime-switch): regime-strip imshow, target
+      template overlay with regime colour-banding, and a parameter summary.
 
 Note:
     Generators run with ``standardize=True``, which z-scores every channel to
     unit variance, so a raw variance-ratio bar carries no contrast. The
-    standardisation-invariant **lagged cross-correlation** (and, for XOR, the
-    sign-based bit-agreement rate) is plotted instead.
+    standardisation-invariant **lagged cross-correlation** (G1 / G2) and a
+    regime-strip imshow (G3) are plotted instead.
 
 All figures use the shared publication style in :mod:`plot_style`.
 
@@ -37,7 +37,7 @@ Used by :mod:`build_dataset` and runnable standalone against any cached dataset.
 
 from __future__ import annotations
 
-import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -46,9 +46,6 @@ import numpy as np
 
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
     plot_style as ps,
-)
-from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
-    te_block_gaussian,
 )
 
 ps.apply_style()
@@ -92,13 +89,23 @@ def _load_split(npz_path: Path, n_sub: int) -> Dict[str, np.ndarray]:
 def _primary_delay(meta: Dict[str, Any]) -> int:
     """Return a representative delay for the trace panels.
 
+    Each v2 benchmark exposes its delay under a different key: G1 / G1-rev
+    carry a per-channel ``delays`` list (we return the first), G2 carries the
+    scalar ``delay``, and G3 carries the source reveal-lead ``delta``.
+
     Args:
         meta: The dataset metadata dict.
 
     Returns:
-        ``meta["delay"]`` for single-delay benchmarks, else ``meta["delay1"]``.
+        The benchmark-appropriate primary delay (0 if unset).
     """
-    return int(meta.get("delay", meta.get("delay1", 0)))
+    benchmark = str(meta.get("benchmark", ""))
+    if benchmark in ("G1", "G1-rev"):
+        delays = meta.get("delays") or []
+        return int(delays[0]) if delays else 0
+    if benchmark == "G3":
+        return int(meta.get("delta", 0))
+    return int(meta.get("delay", 0))
 
 
 def _lagged_corr_per_channel(
@@ -171,36 +178,24 @@ def _panels_traces(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
 def _panel_lag_band(ax: plt.Axes, meta: Dict[str, Any]) -> None:
     """Fill panel 5 (true source-lag band over the attention axis).
 
-    Handles the single band (A / B / C), the two bands (E), and the empty band
-    of the reverse-roles directionality benchmark (G).
+    Handles the single contiguous band that every v2 benchmark produces and
+    the empty band of the G1-rev directionality variant.
 
     Args:
         ax: The target subplot axis.
         meta: The dataset metadata dict.
     """
     lag_axis = np.arange(_MAX_LAG + 1)
-    benchmark = meta.get("benchmark", "?")
-    if benchmark == "E":
-        b1 = set(meta.get("lag_band_1", []))
-        b2 = set(meta.get("lag_band_2", []))
-        ax.bar(lag_axis, [1.0 if l in b1 else 0.0 for l in lag_axis],
-               width=1.0, color=_C_INFORMATIVE, label="band 1 ($D_1$)")
-        ax.bar(lag_axis, [1.0 if l in b2 else 0.0 for l in lag_axis],
-               width=1.0, color=_C_BAND, alpha=0.8, label="band 2 ($D_2$)")
-        ax.legend(loc="upper right")
-        ax.set_title(f"True source-lag bands (two-lag)\n"
-                     f"(model attention window 0..{_MAX_LAG})")
+    band = sorted(set(meta.get("true_lag_band", [])))
+    ax.bar(lag_axis, [1.0 if l in set(band) else 0.0 for l in lag_axis],
+           width=1.0, color=_C_BAND)
+    if band:
+        title = (f"True source-lag band {band[0]}..{band[-1]}\n"
+                 f"(model attention window 0..{_MAX_LAG})")
     else:
-        band = sorted(set(meta.get("true_lag_band", [])))
-        ax.bar(lag_axis, [1.0 if l in set(band) else 0.0 for l in lag_axis],
-               width=1.0, color=_C_BAND)
-        if band:
-            title = (f"True source-lag band {band[0]}..{band[-1]}\n"
-                     f"(model attention window 0..{_MAX_LAG})")
-        else:
-            title = ("No causal lag band\n"
-                     "(reverse-roles directionality benchmark -- te_true=0)")
-        ax.set_title(title)
+        title = ("No causal lag band\n"
+                 "(reverse-roles directionality benchmark -- te_true=0)")
+    ax.set_title(title)
     ax.set_xlabel("source lag $\\ell$")
     ax.set_ylabel("carries transfer")
     ax.set_xlim(-0.5, _MAX_LAG + 0.5)
@@ -228,12 +223,140 @@ def _scatter_alignment(ax: plt.Axes, src: np.ndarray, tgt: np.ndarray,
     return float(np.corrcoef(src, tgt)[0, 1]) if src.size > 1 else 0.0
 
 
-def _panels_gaussian(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
-                    meta: Dict[str, Any]) -> None:
-    """Fill panels 3, 4, 6 for the linear-Gaussian benchmarks (A / B / G).
+def _welch_psd(x: np.ndarray, n_seg: int = 256) -> tuple:
+    r"""Compute a simple Welch-style PSD with 50%-overlap Hann windows.
+
+    Avoids a SciPy dependency by using ``np.fft``. The mean is removed per
+    segment before windowing so the PSD measures variability, not the DC.
 
     Args:
-        axes: The $3 \\times 2$ array of subplot axes.
+        x: 1-D real signal.
+        n_seg: Segment length (in samples).
+
+    Returns:
+        Tuple ``(freqs, psd)`` of length ``n_seg // 2 + 1`` (Nyquist-normalised
+        frequency axis in $[0, 0.5]$ and a positive PSD).
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if x.size < n_seg:
+        n_seg = max(8, x.size)
+    window = np.hanning(n_seg)
+    win_norm = (window * window).sum()
+    hop = n_seg // 2
+    n_segments = max(1, 1 + (x.size - n_seg) // hop)
+    psd = np.zeros(n_seg // 2 + 1, dtype=np.float64)
+    for k in range(n_segments):
+        seg = x[k * hop : k * hop + n_seg]
+        if seg.size < n_seg:
+            break
+        seg = (seg - seg.mean()) * window
+        spec = np.fft.rfft(seg)
+        psd += (spec.real * spec.real + spec.imag * spec.imag)
+    psd /= max(1, n_segments) * win_norm
+    freqs = np.fft.rfftfreq(n_seg, d=1.0)
+    return freqs, psd
+
+
+def _panels_state_space(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
+                        meta: Dict[str, Any]) -> None:
+    r"""Fill panels 3, 4, 6 for the G1 / G1-rev Gaussian state-space benchmark.
+
+    Args:
+        axes: The $3 \times 2$ array of subplot axes.
+        Y: Target tensor $(n, T, C_y)$.
+        U: Source tensor $(n, T, C_u)$.
+        meta: The dataset metadata dict.
+    """
+    n = Y.shape[0]
+    M = int(meta["M"])
+    c_y = int(meta["c_y"])
+    delays = list(meta.get("delays") or [])
+    delay = int(delays[0]) if delays else 0
+    oscillators = list(meta.get("oscillators") or [])
+    target_ar = float(meta.get("target_ar", 0.0))
+    reverse = bool(meta.get("reverse_roles", False))
+    distractor_ch = M if M < c_y else 1
+
+    # --- Panel 3: target PSD overlay (informative vs distractor) ---------
+    ax = axes[1, 0]
+    n_sub = min(64, n)
+    psd_inf = np.zeros(0)
+    for s in range(n_sub):
+        f, p = _welch_psd(Y[s, :, 0])
+        psd_inf = p if psd_inf.size == 0 else psd_inf + p
+    psd_inf /= max(1, n_sub)
+    ax.semilogy(f, psd_inf + 1e-12, color=_C_INFORMATIVE, lw=1.2,
+                label="target ch 0 (oscillator)")
+    if M < c_y:
+        psd_dist = np.zeros(0)
+        for s in range(n_sub):
+            _, p = _welch_psd(Y[s, :, distractor_ch])
+            psd_dist = p if psd_dist.size == 0 else psd_dist + p
+        psd_dist /= max(1, n_sub)
+        ax.semilogy(f, psd_dist + 1e-12, color=_C_DISTRACTOR, lw=1.0,
+                    label=f"distractor ch {distractor_ch}")
+    # mark the dominant oscillator frequency.
+    if oscillators:
+        omega = float(oscillators[0][1])
+        f_osc = omega / (2.0 * np.pi)
+        ax.axvline(f_osc, color=_C_DELAY, ls=":", lw=1.0,
+                   label=fr"$\omega/2\pi$={f_osc:.3f}")
+    ax.set_title("Target PSD -- low-frequency oscillator vs distractor")
+    ax.set_xlabel("frequency (cycles / step)")
+    ax.set_ylabel("PSD")
+    ax.legend(loc="upper right")
+    ps.style_axes(ax)
+
+    # --- Panel 4: oscillator phase-portrait (s_t vs s_{t-1}) -------------
+    ax = axes[1, 1]
+    # Use the source stream (which holds the AR(2) state s_t in the
+    # forward orientation; in reverse-roles, the same coordinates show the
+    # target-side process -- still a useful identifier).
+    s_prev = U[:, :-1, 0].reshape(-1)
+    s_curr = U[:, 1:, 0].reshape(-1)
+    if s_prev.size > 8000:
+        sel = np.random.default_rng(0).choice(s_prev.size, 8000, replace=False)
+        s_prev = s_prev[sel]
+        s_curr = s_curr[sel]
+    ax.scatter(s_prev, s_curr, s=3, alpha=0.18, color=_C_SOURCE,
+               edgecolors="none")
+    portrait_title = (
+        "Source phase-portrait $s_{t-1}$ vs $s_t$  (ch 0, oscillator orbit)"
+        if not reverse
+        else "Slot phase-portrait $s_{t-1}$ vs $s_t$  (reverse-roles slot)"
+    )
+    ax.set_title(portrait_title)
+    ax.set_xlabel("$s_{t-1}$, channel 0")
+    ax.set_ylabel("$s_t$, channel 0")
+    ps.style_axes(ax)
+
+    # --- Panel 6: text summary -------------------------------------------
+    osc_str = (f"  oscillators      : {[(round(r, 3), round(w, 3)) for r, w in oscillators]}"
+               if oscillators else "  oscillators      : (none)")
+    extra = []
+    if reverse:
+        extra = [f"  direction        : {meta.get('direction')}",
+                 f"  reverse_roles    : True"]
+    _panel_text(axes[2, 1], meta, [
+        f"  delays D         : {delays}",
+        f"  target AR coeff  : {target_ar}",
+        f"  B_y (couplings)  : {meta.get('B_y')}",
+        f"  sigma2_y         : {meta.get('sigma2_y')}",
+        f"  sigma2_eta       : {meta.get('sigma2_eta')}",
+        f"  informative M    : {M} / c_y={c_y}",
+        f"  easy_variant     : {meta.get('easy_variant')}",
+        f"  representative D : {delay}",
+        osc_str,
+        *extra,
+    ])
+
+
+def _panels_arx(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
+                meta: Dict[str, Any]) -> None:
+    r"""Fill panels 3, 4, 6 for the G2 smooth AR(1)-ARX benchmark.
+
+    Args:
+        axes: The $3 \times 2$ array of subplot axes.
         Y: Target tensor $(n, T, C_y)$.
         U: Source tensor $(n, T, C_u)$.
         meta: The dataset metadata dict.
@@ -242,15 +365,10 @@ def _panels_gaussian(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     delay = int(meta["delay"])
     M = int(meta["M"])
     c_y = int(meta["c_y"])
-    a = float(meta["a"])
-    sigma2 = float(meta["sigma2"])
+    c = float(meta["c"])
     reverse = bool(meta.get("reverse_roles", False))
-    analytic_corr = (
-        0.0 if reverse
-        else (a / math.sqrt(a * a + sigma2) if (a * a + sigma2) > 0 else 0.0)
-    )
 
-    # --- Panel 3: delay-alignment scatter ---------------------------------
+    # --- Panel 3: delay-alignment scatter -------------------------------
     ax = axes[1, 0]
     src = U[:, : T - delay, 0].reshape(-1)
     tgt = Y[:, delay:, 0].reshape(-1)
@@ -258,19 +376,18 @@ def _panels_gaussian(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     note = "  (reverse roles: anti-causal, expect ~0)" if reverse else ""
     ax.set_title(
         f"Delay alignment ch 0:  $U(t-D)$ vs $Y(t)$\n"
-        f"empirical corr={emp:.3f}   analytic={analytic_corr:.3f}{note}"
+        f"empirical corr={emp:.3f}{note}"
     )
     ax.set_xlabel(f"$U(t-{delay})$, channel 0")
     ax.set_ylabel("$Y(t)$, channel 0")
     ps.style_axes(ax)
 
-    # --- Panel 4: per-channel lagged correlation --------------------------
+    # --- Panel 4: per-channel lagged correlation ------------------------
     ax = axes[1, 1]
     corr = _lagged_corr_per_channel(U, Y, delay)
     colors = [_C_INFORMATIVE if j < M else _C_DISTRACTOR for j in range(c_y)]
     ax.bar(np.arange(c_y), corr, color=colors, width=1.0)
-    ax.axhline(analytic_corr, color=_C_ANALYTIC, ls="--", lw=1.0,
-               label=f"analytic informative={analytic_corr:.3f}")
+    ax.axhline(0.0, color=_C_ANALYTIC, ls="--", lw=0.8)
     ax.set_title(
         f"Per-channel lagged corr $\\mathrm{{corr}}(U_j(t-D), Y_j(t))$\n"
         f"informative=blue ($j<M={M}$), distractor=orange"
@@ -278,163 +395,96 @@ def _panels_gaussian(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     ax.set_xlabel("target channel $j$")
     ax.set_ylabel("lagged correlation")
     ax.set_xlim(-0.5, c_y - 0.5)
-    ax.legend(loc="upper right")
     ps.style_axes(ax)
 
-    # --- Panel 6: text summary --------------------------------------------
+    # --- Panel 6: text summary -----------------------------------------
     extra = []
-    if meta.get("benchmark") == "B":
-        extra = [f"  AR coeff rho     : {meta.get('rho')}",
-                 f"  burn_in          : {meta.get('burn_in')}"]
     if reverse:
         extra = [f"  direction        : {meta.get('direction')}",
-                 f"  reverse_roles    : {meta.get('reverse_roles')}"]
+                 f"  reverse_roles    : True"]
     _panel_text(axes[2, 1], meta, [
         f"  delay D          : {delay}",
-        f"  transfer coeff a : {a}",
-        f"  noise var sigma2 : {sigma2}",
+        f"  ARX coupling c   : {c}",
+        f"  rho_u            : {meta.get('rho_u')}",
+        f"  rho_y            : {meta.get('rho_y')}",
+        f"  sigma2_eta       : {meta.get('sigma2_eta')}",
+        f"  sigma2_eps       : {meta.get('sigma2_eps')}",
+        f"  burn_in          : {meta.get('burn_in')}",
         f"  informative M    : {M} / c_y={c_y}",
         f"  easy_variant     : {meta.get('easy_variant')}",
         *extra,
     ])
 
 
-def _panels_xor(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
-               meta: Dict[str, Any]) -> None:
-    """Fill panels 3, 4, 6 for the delayed-XOR benchmark (C).
+def _panels_regime_switch(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
+                          meta: Dict[str, Any]) -> None:
+    r"""Fill panels 3, 4, 6 for the G3 slow categorical regime-switch benchmark.
 
     Args:
-        axes: The $3 \\times 2$ array of subplot axes.
+        axes: The $3 \times 2$ array of subplot axes.
         Y: Target tensor $(n, T, C_y)$.
         U: Source tensor $(n, T, C_u)$.
         meta: The dataset metadata dict.
     """
     T = Y.shape[1]
-    delay = int(meta["delay"])
     M = int(meta["M"])
     c_y = int(meta["c_y"])
-    q = float(meta["q"])
+    K = int(meta["K_classes"])
+    delta = int(meta["delta"])
+    p_switch = float(meta["p_switch"])
 
-    # --- Panel 3: delay-alignment scatter ---------------------------------
+    # Decode the per-step regime from the per-channel source one-hot. The
+    # source carries onehot(R_{t+delta}) for ch m at slots m*K..(m+1)*K.
+    onehot = U[0, :, :K]                                  # (T, K) for ch 0
+    decoded = np.argmax(onehot, axis=-1)                  # (T,)
+
+    # --- Panel 3: regime strip (sample 0, ch 0 source decode) -----------
     ax = axes[1, 0]
-    src = U[:, : T - delay, 0].reshape(-1)
-    tgt = Y[:, delay:, 0].reshape(-1)
-    emp = _scatter_alignment(ax, src, tgt, color=_C_INFORMATIVE)
+    # Show the decoded regime as a thin horizontal strip alongside the
+    # target trace; downsample if T is huge.
+    t_axis = np.arange(T)
+    strip = decoded[None, :]                              # (1, T)
+    ax.imshow(strip, aspect="auto", cmap="tab10", vmin=0, vmax=max(1, K - 1),
+              extent=(0, T, -0.5, 0.5), interpolation="nearest")
+    ax.set_yticks([])
+    ax.set_xlabel("time step $t$")
     ax.set_title(
-        f"XOR delay alignment ch 0:  $U(t-D)$ vs $Y(t)$\n"
-        f"empirical corr={emp:.3f}   analytic $1-2q$={1.0 - 2.0 * q:.3f}"
+        f"Decoded regime $R_t$ (source ch 0, $K$={K})\n"
+        f"source leaks $R_{{t+\\delta}}$ at delta={delta}"
     )
-    ax.set_xlabel(f"$U(t-{delay})$, channel 0 ($\\pm 1$ + noise)")
-    ax.set_ylabel("$Y(t)$, channel 0")
-    ps.style_axes(ax)
+    ps.style_axes(ax, grid="none")
 
-    # --- Panel 4: per-channel bit-agreement rate --------------------------
+    # --- Panel 4: target trace coloured by regime ------------------------
     ax = axes[1, 1]
-    y_bit = Y[:, delay:, :] > 0.0
-    x_bit = U[:, : T - delay, :c_y] > 0.0
-    agree = (y_bit == x_bit).mean(axis=(0, 1))
-    colors = [_C_INFORMATIVE if j < M else _C_DISTRACTOR for j in range(c_y)]
-    ax.bar(np.arange(c_y), agree, color=colors, width=1.0)
-    ax.axhline(1.0 - q, color=_C_ANALYTIC, ls="--", lw=1.0,
-               label=f"analytic informative $1-q$={1.0 - q:.3f}")
-    ax.axhline(0.5, color=_C_DELAY, ls=":", lw=1.0, label="chance 0.5")
+    y0 = Y[0, :, 0]
+    # plot baseline + colour transitions to mark regime spans
+    ax.plot(t_axis, y0, lw=0.8, color=ps.COLOR_BLACK, alpha=0.6,
+            label="target ch 0")
+    # shade regime spans with the same tab10 colormap
+    cmap = plt.get_cmap("tab10")
+    boundaries = list(np.where(np.diff(decoded) != 0)[0] + 1)
+    span_starts = [0, *boundaries]
+    span_ends = [*boundaries, T]
+    for lo, hi in zip(span_starts, span_ends):
+        ax.axvspan(lo, hi, color=cmap(int(decoded[lo]) % 10), alpha=0.18)
+    ax.set_xlim(0, T)
+    ax.set_xlabel("time step $t$")
+    ax.set_ylabel("target value")
     ax.set_title(
-        f"Per-channel bit-agreement $P(\\mathrm{{sign}}\\,Y_j(t)="
-        f"\\mathrm{{sign}}\\,X_j(t-D))$\n"
-        f"informative=blue ($j<M={M}$), distractor=orange"
+        "Target trace coloured by active regime (sample 0)"
     )
-    ax.set_xlabel("target channel $j$")
-    ax.set_ylabel("bit-agreement rate")
-    ax.set_xlim(-0.5, c_y - 0.5)
-    ax.set_ylim(0.0, 1.05)
-    ax.legend(loc="lower right")
-    ps.style_axes(ax)
-
-    # --- Panel 6: text summary --------------------------------------------
-    _panel_text(axes[2, 1], meta, [
-        f"  delay D          : {delay}",
-        f"  bit-flip prob q  : {q}",
-        f"  obs_noise        : {meta.get('obs_noise')}",
-        f"  informative M    : {M} / c_y={c_y}",
-        f"  easy_variant     : {meta.get('easy_variant')}",
-    ])
-
-
-def _panels_two_lag(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
-                   meta: Dict[str, Any]) -> None:
-    """Fill panels 3, 4, 6 for the two-lag Gaussian benchmark (E).
-
-    Args:
-        axes: The $3 \\times 2$ array of subplot axes.
-        Y: Target tensor $(n, T, C_y)$.
-        U: Source tensor $(n, T, C_u)$.
-        meta: The dataset metadata dict.
-    """
-    T = Y.shape[1]
-    delay1, delay2 = int(meta["delay1"]), int(meta["delay2"])
-    a1, a2 = float(meta["a1"]), float(meta["a2"])
-    sigma2 = float(meta["sigma2"])
-    M1, M2 = int(meta["M1"]), int(meta["M2"])
-    m_total = M1 + M2
-    c_y = int(meta["c_y"])
-
-    # --- Panel 3: two-group delay-alignment scatter -----------------------
-    ax = axes[1, 0]
-    s1 = U[:, : T - delay1, 0].reshape(-1)
-    t1 = Y[:, delay1:, 0].reshape(-1)
-    e1 = _scatter_alignment(ax, s1, t1, color=_C_INFORMATIVE)
-    s2 = U[:, : T - delay2, M1].reshape(-1)
-    t2 = Y[:, delay2:, M1].reshape(-1)
-    e2 = _scatter_alignment(ax, s2, t2, color=_C_SOURCE)
-    ax.set_title(
-        f"Two-lag delay alignment\n"
-        f"group 1 ch 0 @ $D_1$={delay1} corr={e1:.3f}   "
-        f"group 2 ch {M1} @ $D_2$={delay2} corr={e2:.3f}"
-    )
-    ax.set_xlabel("$U(t-D)$")
-    ax.set_ylabel("$Y(t)$")
-    ps.style_axes(ax)
-
-    # --- Panel 4: per-channel lagged corr at each group's own delay -------
-    ax = axes[1, 1]
-    corr1 = _lagged_corr_per_channel(U, Y, delay1)
-    corr2 = _lagged_corr_per_channel(U, Y, delay2)
-    combined = corr1.copy()
-    combined[M1:m_total] = corr2[M1:m_total]
-    colors = []
-    for j in range(c_y):
-        if j < M1:
-            colors.append(_C_INFORMATIVE)   # group 1
-        elif j < m_total:
-            colors.append(_C_SOURCE)        # group 2
-        else:
-            colors.append(_C_DISTRACTOR)    # distractor
-    ax.bar(np.arange(c_y), combined, color=colors, width=1.0)
-    ac1 = a1 / math.sqrt(a1 * a1 + sigma2)
-    ac2 = a2 / math.sqrt(a2 * a2 + sigma2)
-    ax.axhline(ac1, color=_C_INFORMATIVE, ls="--", lw=1.0,
-               label=f"group 1 ~{ac1:.3f}")
-    ax.axhline(ac2, color=_C_SOURCE, ls="--", lw=1.0,
-               label=f"group 2 ~{ac2:.3f}")
-    ax.set_title(
-        "Per-channel lagged corr at the channel's own delay\n"
-        f"group 1 ($j<{M1}$) blue, group 2 ($<{m_total}$) green, "
-        "distractor orange"
-    )
-    ax.set_xlabel("target channel $j$")
-    ax.set_ylabel("lagged correlation")
-    ax.set_xlim(-0.5, c_y - 0.5)
     ax.legend(loc="upper right")
     ps.style_axes(ax)
 
-    # --- Panel 6: text summary --------------------------------------------
+    # --- Panel 6: text summary ------------------------------------------
     _panel_text(axes[2, 1], meta, [
-        f"  delay D1 / D2    : {delay1} / {delay2}",
-        f"  coeff a1 / a2    : {a1} / {a2}",
-        f"  noise var sigma2 : {sigma2}",
-        f"  M1 / M2          : {M1} / {M2}  (c_y={c_y})",
-        f"  te_true_1        : {float(meta.get('te_true_1', 0.0)):.4f} nats",
-        f"  te_true_2        : {float(meta.get('te_true_2', 0.0)):.4f} nats",
+        f"  K_classes        : {K}",
+        f"  p_switch         : {p_switch}",
+        f"  source lead delta: {delta}",
+        f"  shared_regime    : {meta.get('shared_regime')}",
+        f"  template_period_min: {meta.get('template_period_min')}",
+        f"  sigma2_y / sigma2_u: {meta.get('sigma2_y')} / {meta.get('sigma2_u')}",
+        f"  informative M    : {M} / c_y={c_y}  (source needs M*K={M*K} <= c_u)",
     ])
 
 
@@ -516,12 +566,20 @@ def make_preview(
     )
 
     _panels_traces(axes, Y, U, meta)
-    if benchmark == "C":
-        _panels_xor(axes, Y, U, meta)
-    elif benchmark == "E":
-        _panels_two_lag(axes, Y, U, meta)
-    else:  # A / B / G and any unknown benchmark fall back to the Gaussian view.
-        _panels_gaussian(axes, Y, U, meta)
+    if benchmark in ("G1", "G1-rev"):
+        _panels_state_space(axes, Y, U, meta)
+    elif benchmark == "G2":
+        _panels_arx(axes, Y, U, meta)
+    elif benchmark == "G3":
+        _panels_regime_switch(axes, Y, U, meta)
+    else:
+        # Unknown benchmark -- leave the dispatched panels blank rather than
+        # rendering misleading content from a stale v1 layout.
+        for ax in (axes[1, 0], axes[1, 1], axes[2, 1]):
+            ax.axis("off")
+            ax.text(0.5, 0.5,
+                    f"no preview panels for benchmark {benchmark!r}",
+                    ha="center", va="center", transform=ax.transAxes)
     _panel_lag_band(axes[2, 0], meta)
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
@@ -974,95 +1032,6 @@ def _fig_lag_structure(
     return ps.save_figure(fig, fig_dir / "05_lag_structure")
 
 
-def _fig_te_structure(
-    _data: Dict[str, np.ndarray], meta: Dict[str, Any], fig_dir: Path
-) -> list:
-    r"""Figure 6 -- the analytic transfer-entropy budget (Gaussian benchmarks).
-
-    Panel 1 is the per-channel block-TE contribution; panel 2 is the
-    $\mathrm{TE}^{(H)}$-vs-$a$ curve with the dataset's operating point marked;
-    panel 3 is a text summary.
-
-    Args:
-        data: Loaded split dict (unused; kept for a uniform figure signature).
-        meta: The dataset metadata dict.
-        fig_dir: Output directory for the figure pair.
-
-    Returns:
-        The list of written file paths.
-    """
-    a = float(meta["a"])
-    sigma2 = float(meta["sigma2"])
-    M, c_y = int(meta["M"]), int(meta["c_y"])
-    H = int(meta.get("horizon", 30))
-    te_true = float(meta["te_true"])
-    te_per_channel = te_block_gaussian(a, sigma2, H, 1) if a > 0 else 0.0
-
-    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.3))
-    fig.suptitle(
-        f"Analytic transfer-entropy budget  (Benchmark {meta.get('benchmark','?')}, "
-        f"tag: {meta.get('tag','?')})",
-        fontsize=ps.FONT_TITLE, fontweight="bold",
-    )
-
-    # --- Panel 1: per-channel block-TE contribution -----------------------
-    ax = axes[0]
-    contrib = np.array([te_per_channel if j < M else 0.0 for j in range(c_y)])
-    colors = [ps.COLOR_BLUE if j < M else ps.COLOR_ORANGE for j in range(c_y)]
-    ax.bar(np.arange(c_y), contrib, color=colors, width=1.0)
-    ax.set_title(f"per-channel block TE   (sum = te_true = {te_true:.3f} nats)")
-    ax.set_xlabel("target channel $j$")
-    ax.set_ylabel("block TE contribution (nats)")
-    ax.set_xlim(-0.5, c_y - 0.5)
-    ps.style_axes(ax)
-
-    # --- Panel 2: TE-vs-a curve with the operating point ------------------
-    ax = axes[1]
-    a_curve = np.linspace(0.0, max(0.6, 2.0 * a), 200)
-    te_curve = np.array([te_block_gaussian(av, sigma2, H, M) for av in a_curve])
-    ax.plot(a_curve, te_curve, color=ps.COLOR_BLUE, lw=1.4)
-    ax.scatter([a], [te_true], s=60, color=ps.COLOR_VERMILLION, zorder=3,
-               edgecolors=ps.COLOR_BLACK, linewidths=0.5,
-               label=f"operating point\n$a$={a:g}, TE={te_true:.3f}")
-    ax.axvline(a, color=ps.COLOR_GRAY, ls=":", lw=1.0)
-    ax.set_title(fr"$\mathrm{{TE}}^{{(H)}} = \frac{{H}}{{2}} M \ln(1+a^2/\sigma^2)$  (M={M})")
-    ax.set_xlabel("transfer coefficient $a$")
-    ax.set_ylabel("block TE (nats)")
-    ax.legend(loc="upper left")
-    ps.style_axes(ax)
-
-    # --- Panel 3: text summary --------------------------------------------
-    ax = axes[2]
-    ax.axis("off")
-    snr = a * a / sigma2
-    band = sorted(set(meta.get("true_lag_band", [])))
-    band_str = f"{band[0]}..{band[-1]}" if band else "(none)"
-    lines = [
-        "Transfer-entropy ground truth",
-        f"  block TE          : {te_true:.4f} nats",
-        f"  per-step TE       : {float(meta.get('te_per_step', te_true / H)):.4f} nats",
-        f"  per-channel TE    : {te_per_channel:.4f} nats",
-        f"  horizon H         : {H}",
-        "",
-        "Signal / noise",
-        f"  transfer coeff a  : {a:g}",
-        f"  noise var sigma2  : {sigma2:g}",
-        f"  SNR a^2/sigma^2   : {snr:.4f}",
-        f"  corr a/sqrt(a^2+s): {a / math.sqrt(a * a + sigma2):.4f}" if a > 0 else
-        "  corr a/sqrt(a^2+s): 0.0000",
-        "",
-        "Channels / lags",
-        f"  informative M     : {M} / c_y={c_y}",
-        f"  true lag band     : {band_str}",
-        f"  delay D           : {meta.get('delay')}",
-    ]
-    ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left",
-            family="monospace", fontsize=9.0, color=ps.COLOR_BLACK,
-            transform=ax.transAxes)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    return ps.save_figure(fig, fig_dir / "06_te_structure")
-
-
 def _fig_distributions(
     data: Dict[str, np.ndarray], meta: Dict[str, Any], fig_dir: Path
 ) -> list:
@@ -1135,13 +1104,17 @@ def make_dataset_gallery(
     Writes a set of standalone ``.pdf`` + ``.png`` figures into
     ``<out_dir>/figures/``:
 
-        * ``01_input_heatmaps``   -- raw $Y$ / $U$ channel-by-time heatmaps.
+        * ``01_input_heatmaps``     -- raw $Y$ / $U$ channel-by-time heatmaps.
         * ``02_model_input_fields`` -- the four native fields (``fhr_st`` ...).
-        * ``03_forecast_contract`` -- history, source window and $Y^+$ target.
-        * ``04_sample_traces``    -- informative / distractor / source traces.
-        * ``05_lag_structure``    -- lagged-correlation curve + channel-lag grid.
-        * ``06_te_structure``     -- analytic-TE budget (Gaussian benchmarks A/B/G).
-        * ``07_distributions``    -- value histograms + per-channel std check.
+        * ``03_forecast_contract``  -- history, source window and $Y^+$ target.
+        * ``04_sample_traces``      -- informative / distractor / source traces.
+        * ``05_lag_structure``      -- lagged-correlation curve + channel-lag grid.
+        * ``07_distributions``      -- value histograms + per-channel std check.
+
+    (The v1 ``06_te_structure`` analytic-TE budget figure was removed alongside
+    the v1 generators in Sprint 3 -- the v2 generators emit a richer
+    ``meta.te_true`` block in ``meta.json`` that supersedes the per-channel
+    bar / TE-vs-a curve.)
 
     Args:
         out_dir: Directory holding ``{split}.npz`` and ``meta.json``.
@@ -1156,7 +1129,6 @@ def make_dataset_gallery(
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     data = _load_split(out_dir / f"{split}.npz", n_sub)
-    benchmark = meta.get("benchmark", "?")
 
     written: list = []
     written += _fig_input_heatmaps(data, meta, fig_dir)
@@ -1164,25 +1136,77 @@ def make_dataset_gallery(
     written += _fig_io_forecast(data, meta, fig_dir)
     written += _fig_sample_traces(data, meta, fig_dir)
     written += _fig_lag_structure(data, meta, fig_dir)
-    # The analytic-TE budget panel needs the Gaussian (a, sigma2) parameters
-    # and a causal TE budget -- skipped for the reverse-roles benchmark G
-    # (anti-causal, te_true = 0 by construction).
-    if benchmark in ("A", "B") and "a" in meta and "sigma2" in meta:
-        written += _fig_te_structure(data, meta, fig_dir)
     written += _fig_distributions(data, meta, fig_dir)
     return written
 
 
 if __name__ == "__main__":
-    # Self-check: build tiny caches in temp dirs and render their previews,
-    # exercising the Gaussian (A) and XOR (C) panel paths.
+    # Dual-mode dispatch (V2-D8): edit-and-run + self-check.
+    #
+    #   * EDIT-AND-RUN  -- set ``RUN_CONFIG['cache_dir']`` to an existing
+    #     ``data/<benchmark>/<tag>/`` directory; the script reads its
+    #     ``meta.json`` + ``<split>.npz`` and re-renders ``preview.{pdf,png}``
+    #     (and, with ``gallery=True``, the standalone gallery under
+    #     ``<cache_dir>/figures/``). No CLI flags needed -- run the file
+    #     directly from PyCharm / VS Code.
+    #
+    #   * SELF-CHECK    -- with the default ``RUN_CONFIG['cache_dir'] = None``
+    #     the script builds tiny G1 / G2 / G3 / G1-rev caches in temp dirs
+    #     and renders their previews, exercising every panel path. Used as a
+    #     smoke test in the v2 test suite.
     import json
+
+    RUN_CONFIG = {
+        # Set to an existing cache directory to re-render its preview, e.g.:
+        #   "cache_dir": Path(
+        #       r"C:/Users/mahdi/Desktop/teb_vae_model/model/"
+        #       r"vae_teb_prediction/model/model_experiment/data/G1/G1_baseline"
+        #   ),
+        "cache_dir": None,           # None -> run the self-check below
+        "split": "train",            # which split to render (train / val / test)
+        "n_sub": 1000,               # leading samples used by the panels
+        "gallery": False,            # True -> also write the gallery figures
+    }
+
+    if RUN_CONFIG["cache_dir"] is not None:
+        cache_dir = Path(RUN_CONFIG["cache_dir"]).resolve()
+        if not cache_dir.is_dir():
+            raise FileNotFoundError(
+                f"visualize: cache_dir does not exist: {cache_dir}"
+            )
+        meta_path = cache_dir / "meta.json"
+        if not meta_path.is_file():
+            raise FileNotFoundError(
+                f"visualize: meta.json not found in {cache_dir}"
+            )
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            cache_meta = json.load(fh)
+        pdf = make_preview(
+            cache_dir, cache_meta,
+            split=str(RUN_CONFIG["split"]),
+            n_sub=int(RUN_CONFIG["n_sub"]),
+        )
+        print(f"[preview] wrote {pdf}")
+        if RUN_CONFIG["gallery"]:
+            files = make_dataset_gallery(
+                cache_dir, cache_meta,
+                split=str(RUN_CONFIG["split"]),
+                n_sub=int(RUN_CONFIG["n_sub"]),
+            )
+            print(
+                f"[gallery] wrote {len(files)} files under "
+                f"{cache_dir / 'figures'}"
+            )
+        sys.exit(0)
+
+    # Self-check fallback: build tiny caches in temp dirs and render their
+    # previews, exercising the G1 / G2 / G3 / G1-rev panel paths.
     import tempfile
 
     from model.vae_teb_prediction.model.model_experiment.synthetic.generators import (
-        gen_delayed_gaussian,
-        gen_delayed_xor,
-        gen_two_lag_gaussian,
+        gen_regime_switch_smooth,
+        gen_smooth_arx,
+        gen_state_space_oscillator,
     )
 
     def _dump_and_preview(Y, U, meta, tag):
@@ -1212,23 +1236,36 @@ if __name__ == "__main__":
                   f"gallery: {len(gallery)} files "
                   f"({len({p.stem for p in gallery})} figures x pdf+png)")
 
-    _Ya, _Ua, _ma = gen_delayed_gaussian(
-        n=64, T=300, delay=60, a=1.0, sigma2=1.0, M=4, seed=0
+    # G1 -- Gaussian state-space oscillator (cheap MC for the smoke).
+    _Y1, _U1, _m1 = gen_state_space_oscillator(
+        n=32, T=300, oscillators=[(0.99, 0.05)], target_ar=0.95,
+        delays=[60], B_y=[0.5], sigma2_y=1.0, sigma2_eta=0.01, M=4,
+        te_n_samples=2_000, seed=0,
     )
-    _dump_and_preview(_Ya, _Ua, _ma, "smoke_A")
+    _dump_and_preview(_Y1, _U1, _m1, "smoke_G1")
 
-    _Yc, _Uc, _mc = gen_delayed_xor(n=64, T=300, delay=60, q=0.10, M=4, seed=0)
-    _dump_and_preview(_Yc, _Uc, _mc, "smoke_C")
-
-    _Ye, _Ue, _me = gen_two_lag_gaussian(
-        n=64, T=300, delay1=50, delay2=80, a1=0.4, a2=0.25,
-        sigma2=1.0, M1=4, M2=4, seed=0,
+    # G2 -- smooth AR(1) ARX.
+    _Y2, _U2, _m2 = gen_smooth_arx(
+        n=32, T=300, rho_u=0.99, rho_y=0.95, c=0.5,
+        sigma2_eta=1.0, sigma2_eps=1.0, delay=60, M=4, seed=0,
     )
-    _dump_and_preview(_Ye, _Ue, _me, "smoke_E")
+    _dump_and_preview(_Y2, _U2, _m2, "smoke_G2")
 
-    _Yg, _Ug, _mg = gen_delayed_gaussian(
-        n=64, T=300, delay=60, a=1.0, sigma2=1.0, M=4, reverse_roles=True, seed=0
+    # G3 -- slow categorical regime switch.
+    _Y3, _U3, _m3 = gen_regime_switch_smooth(
+        n=32, T=300, K_classes=10, p_switch=0.5, delta=60, M=4, seed=0,
     )
-    _dump_and_preview(_Yg, _Ug, _mg, "smoke_G")
+    _dump_and_preview(_Y3, _U3, _m3, "smoke_G3")
+
+    # G1-rev -- directionality control (te_true = 0, true_lag_band = []).
+    _Yr, _Ur, _mr = gen_state_space_oscillator(
+        n=32, T=300, oscillators=[(0.99, 0.05)], target_ar=0.95,
+        delays=[60], B_y=[0.5], sigma2_y=1.0, sigma2_eta=0.01, M=4,
+        reverse_roles=True, te_n_samples=2_000, seed=0,
+    )
+    # Override benchmark id so the make_preview dispatch picks the same panel
+    # set as the forward G1 cache.
+    _mr["benchmark"] = "G1-rev"
+    _dump_and_preview(_Yr, _Ur, _mr, "smoke_G1-rev")
 
     print("All visualize checks passed.")

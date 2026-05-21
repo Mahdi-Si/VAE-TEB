@@ -200,6 +200,8 @@ def make_dataloader(
     shuffle: bool,
     *,
     num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
     drop_last: bool = False,
 ) -> DataLoader:
     """Build a ``DataLoader`` wired with :func:`attribute_dict_collate`.
@@ -210,17 +212,31 @@ def make_dataloader(
         shuffle: Whether to shuffle every epoch (``True`` for training).
         num_workers: Worker processes. Defaults to ``0``; the split is already
             held fully in RAM (see :class:`SyntheticTEDataset`), so workers
-            would only add fork / IPC overhead.
+            would only add fork / IPC overhead on a single-GPU laptop. On
+            a multi-GPU box ``num_workers >= 2`` lets host->device copies
+            overlap with the forward pass; set via ``dataset.num_workers``
+            in ``config_synth.yaml``.
+        pin_memory: If True, request page-locked host memory for the input
+            batch. Only useful when CUDA is in use; off by default for the
+            same single-laptop reason. Set via ``dataset.pin_memory``.
+        persistent_workers: If True, keep DataLoader worker processes alive
+            across epochs. Only honoured when ``num_workers > 0``; otherwise
+            forced off by PyTorch. Set via ``dataset.persistent_workers``.
         drop_last: Whether to drop a trailing partial batch.
 
     Returns:
         A configured :class:`torch.utils.data.DataLoader`.
     """
+    # ``persistent_workers=True`` with ``num_workers=0`` raises in PyTorch;
+    # silently coerce so the YAML default never triggers a hard crash.
+    persistent = bool(persistent_workers) and int(num_workers) > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        persistent_workers=persistent,
         drop_last=drop_last,
         collate_fn=attribute_dict_collate,
     )
@@ -231,12 +247,13 @@ if __name__ == "__main__":
     import tempfile
 
     from model.vae_teb_prediction.model.model_experiment.synthetic.generators import (
-        gen_delayed_gaussian,
+        gen_smooth_arx,
     )
 
     _T, _DELAY = 300, 60
-    _Y, _U, _meta = gen_delayed_gaussian(
-        n=6, T=_T, delay=_DELAY, a=1.0, sigma2=1.0, M=4, seed=0
+    _Y, _U, _meta = gen_smooth_arx(
+        n=6, T=_T, rho_u=0.99, rho_y=0.95, c=0.5,
+        sigma2_eta=1.0, sigma2_eps=1.0, delay=_DELAY, M=4, seed=0,
     )
     with tempfile.TemporaryDirectory() as _tmp:
         _dir = Path(_tmp)

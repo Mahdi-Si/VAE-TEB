@@ -1,26 +1,30 @@
-"""Pytest checks for ``dataset`` / ``build_dataset`` -- Phase 2 of the plan.
+"""Pytest checks for ``dataset`` / ``build_dataset`` (v2 benchmarks).
 
-Verifies the cached-dataset round trip: :func:`build_dataset.build_dataset`
-writes ``{train,val,test}.npz`` + ``meta.json`` + ``preview.pdf``,
+Verifies the cached-dataset round trip end-to-end:
+:func:`build_dataset.build_dataset` writes ``{train,val,test}.npz`` +
+``meta.json`` + ``preview.pdf`` for every v2 benchmark,
 :class:`SyntheticTEDataset` loads native-shaped samples, the collate path
 produces ``AttributeDict`` batches, ``build_u_stream`` rebuilds the
 101-channel source, and one batch flows cleanly through
-``SeqVaeLagAttnV1.forward`` (Task 2.5). Run from the repo root with
-``python -m pytest``.
+``SeqVaeLagAttnV1.forward``.
+
+Sprint 3 rewrite: the v1 fixture / dispatch tests were retired alongside the
+v1 generators; the scaffolding tests (shapes / collate / build_u_stream /
+meta round-trip) are kept and re-parametrised over the v2 benchmarks.
+Run from the repo root with ``python -m pytest``.
 """
 
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 import torch
 import yaml
 
-from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
-    te_block_gaussian,
-)
 from model.vae_teb_prediction.model.model_experiment.synthetic.build_dataset import (
+    _GENERATORS,
+    _build_gen_kwargs,
     build_dataset,
-    load_config,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.dataset import (
     AttributeDict,
@@ -36,35 +40,146 @@ from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 _CONFIG_PATH = Path(__file__).resolve().parent / "config_synth.yaml"
 _T = 300
 _N_TRAIN, _N_VAL, _N_TEST = 6, 4, 4
+_EXPECTED_FORWARD_KEYS = {
+    "mu_prior", "logvar_prior", "mu_post", "logvar_post", "z",
+    "target_state", "source_state", "decoder_state", "attended_source",
+    "attn_weights", "mu_base", "logvar_base", "delta_mu_src", "mu_full",
+    "logvar_full", "raw_future_pred", "kld_per_t", "te_lag_map",
+    "warmup_mask", "mu_prior_sat_frac", "delta_mu_sat_frac",
+}
 
 
-@pytest.fixture(scope="module")
-def tiny_cache(tmp_path_factory) -> Path:
-    """Build a tiny on-disk Benchmark-A cache once for the whole module.
+def _tiny_v2_config(benchmark: str, data_dir: Path) -> Dict[str, Any]:
+    """Load ``config_synth.yaml`` with a tiny-cache override for ``benchmark``.
+
+    The cache is rooted at ``data_dir`` (a per-test ``tmp_path``), the active
+    benchmark is set to ``benchmark`` and the per-split counts are tiny so
+    the build finishes in a few seconds.
+
+    Args:
+        benchmark: The v2 benchmark id (``"G1"`` / ``"G1-rev"`` / ``"G2"`` /
+            ``"G3"``).
+        data_dir: Absolute path used as ``paths.data_dir`` (overrides
+            ``./data``).
 
     Returns:
-        The cache directory ``<tmp>/A/test_tiny`` holding the three ``.npz``
-        splits, ``meta.json`` and ``preview.pdf``.
+        The benchmark-resolved config dict ready for :func:`build_dataset`.
     """
-    tmp = tmp_path_factory.mktemp("synth_cache")
-    config = load_config(_CONFIG_PATH)
-    config["paths"]["data_dir"] = str(tmp)  # absolute -> overrides ./data
-    config["experiment"]["tag"] = "test_tiny"
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    raw["experiment"]["benchmark"] = benchmark
+    raw["experiment"]["tag"] = f"test_{benchmark}"
+    config = resolve_active_benchmark(raw)
+    config["paths"]["data_dir"] = str(data_dir)  # absolute -> overrides ./data
     config["data"]["n_train"] = _N_TRAIN
     config["data"]["n_val"] = _N_VAL
     config["data"]["n_test"] = _N_TEST
+    # G1 / G1-rev MC TE estimate is the slowest step at build time; shrink it
+    # for the tiny smoke caches.
+    if benchmark in ("G1", "G1-rev"):
+        config["data"]["te_n_samples"] = 2_000
+    return config
+
+
+@pytest.fixture(scope="module")
+def tiny_g1_cache(tmp_path_factory) -> Path:
+    """Build a tiny on-disk G1 cache once for the whole module.
+
+    Returns:
+        The cache directory ``<tmp>/G1/test_G1`` holding the three ``.npz``
+        splits, ``meta.json`` and ``preview.pdf``.
+    """
+    tmp = tmp_path_factory.mktemp("synth_cache_g1")
+    config = _tiny_v2_config("G1", tmp)
+    return build_dataset(config, force=True)
+
+
+# --- Build / artifact tests --------------------------------------------------
+
+@pytest.mark.parametrize("benchmark", ["G1", "G2", "G3"])
+def test_build_writes_all_artifacts_v2(tmp_path, benchmark):
+    """Each v2 generator emits the full cache directory contents."""
+    config = _tiny_v2_config(benchmark, tmp_path)
     out_dir = build_dataset(config, force=True)
-    return out_dir
-
-
-def test_build_writes_all_artifacts(tiny_cache: Path):
     for fname in ("train.npz", "val.npz", "test.npz", "meta.json", "preview.pdf"):
-        assert (tiny_cache / fname).is_file(), fname
-    assert (tiny_cache / "preview.pdf").stat().st_size > 0
+        assert (out_dir / fname).is_file(), fname
+    assert (out_dir / "preview.pdf").stat().st_size > 0
+    ds = SyntheticTEDataset(out_dir / "train.npz")
+    assert ds.meta["benchmark"] == benchmark
+    assert isinstance(ds.meta["te_true"], float)
+    assert ds.meta["te_true"] >= 0.0  # G1/G2/G3 all carry non-negative TE
 
 
-def test_dataset_shapes_and_dtype(tiny_cache: Path):
-    ds = SyntheticTEDataset(tiny_cache / "train.npz")
+@pytest.mark.parametrize("benchmark", ["G1", "G1-rev", "G2", "G3"])
+def test_build_dataset_dispatch_v2(benchmark):
+    """``_build_gen_kwargs`` returns a kwargs dict valid for the target generator."""
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    raw["experiment"]["benchmark"] = benchmark
+    config = resolve_active_benchmark(raw)
+    data, model = config["data"], config["model"]
+    c_y = int(data["c_y_st"]) + int(data["c_y_ph"])
+    c_u = int(data["c_u_st"]) + int(data["c_u_ph"])
+
+    gen = _GENERATORS[benchmark]
+    kwargs = _build_gen_kwargs(benchmark, data, model, c_y, c_u)
+
+    import inspect
+    sig = inspect.signature(gen)
+    valid = set(sig.parameters.keys())
+    extras = set(kwargs) - valid
+    assert not extras, (
+        f"_build_gen_kwargs[{benchmark!r}] emits unknown kwargs {extras}; "
+        f"generator signature is {sorted(valid)}"
+    )
+    assert "T" in kwargs and kwargs["T"] == int(data["sequence_length"])
+    assert kwargs["c_y"] == c_y and kwargs["c_u"] == c_u
+
+
+def test_g1_rev_te_zero(tmp_path):
+    """The G1-rev directionality variant has ``te_true == 0`` and an empty band."""
+    config = _tiny_v2_config("G1-rev", tmp_path)
+    out_dir = build_dataset(config, force=True)
+    ds = SyntheticTEDataset(out_dir / "train.npz")
+    assert ds.meta["benchmark"] == "G1-rev"
+    assert ds.meta["te_true"] == 0.0
+    assert ds.meta["true_lag_band"] == []
+    assert ds.meta["reverse_roles"] is True
+    assert ds.meta["direction"] == "Y_to_X"
+
+
+# --- Forward-pass smoke (one batch through SeqVaeLagAttnV1) ------------------
+
+@pytest.mark.parametrize("benchmark", ["G1", "G2", "G3"])
+def test_forward_pass_smoke_v2(tmp_path, benchmark):
+    """One cached batch flows through ``SeqVaeLagAttnV1.forward`` for each v2 benchmark."""
+    config = _tiny_v2_config(benchmark, tmp_path)
+    out_dir = build_dataset(config, force=True)
+
+    torch.manual_seed(0)
+    ds = SyntheticTEDataset(out_dir / "train.npz")
+    loader = make_dataloader(ds, batch_size=2, shuffle=False)
+    batch = next(iter(loader))
+
+    model = SeqVaeLagAttnV1()  # defaults match the native shapes (V2-D1)
+    model.eval()
+    with torch.no_grad():
+        out = model(batch.fhr_st, batch.fhr_ph, build_u_stream(batch))
+
+    assert set(out.keys()) == _EXPECTED_FORWARD_KEYS
+    assert out["kld_per_t"].shape == (2, _T)
+    assert out["mu_full"].shape == (2, _T, 30, 87)
+    assert out["te_lag_map"].shape == (2, _T, 91)
+    assert out["attn_weights"].shape == (2, _T, 4, 91)
+    assert torch.isfinite(out["kld_per_t"]).all()
+    assert torch.isfinite(out["mu_full"]).all()
+
+
+# --- Dataset / collate / build_u_stream / meta round-trip (kept from v1) -----
+
+def test_dataset_shapes_and_dtype(tiny_g1_cache: Path):
+    """``SyntheticTEDataset`` exposes per-sample native-shape tensors + metadata."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
     assert len(ds) == _N_TRAIN
     sample = ds[0]
     assert isinstance(sample, AttributeDict)
@@ -76,14 +191,15 @@ def test_dataset_shapes_and_dtype(tiny_cache: Path):
     for field in ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
         assert sample[field].dtype == torch.float32
     assert torch.all(sample.weight == 1.0)
-    assert isinstance(sample.guid, str) and "test_tiny_train" in sample.guid
+    assert isinstance(sample.guid, str) and "test_G1_train" in sample.guid
     assert isinstance(sample.te_true, float)
     assert sample.true_lag_band.dtype == torch.long
     assert sample.true_lag_band.shape == (30,)
 
 
-def test_collate_batch(tiny_cache: Path):
-    ds = SyntheticTEDataset(tiny_cache / "train.npz")
+def test_collate_batch(tiny_g1_cache: Path):
+    """The :func:`make_dataloader` collate emits a batched :class:`AttributeDict`."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
     loader = make_dataloader(ds, batch_size=3, shuffle=False)
     batch = next(iter(loader))
     assert isinstance(batch, AttributeDict)
@@ -96,98 +212,34 @@ def test_collate_batch(tiny_cache: Path):
     assert len(batch.guid) == 3 and all(isinstance(g, str) for g in batch.guid)
 
 
-def test_build_u_stream(tiny_cache: Path):
-    ds = SyntheticTEDataset(tiny_cache / "train.npz")
+def test_build_u_stream(tiny_g1_cache: Path):
+    """``build_u_stream`` concatenates ``up_st`` + ``up_ph`` to the 101-ch input."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
     loader = make_dataloader(ds, batch_size=3, shuffle=False)
     batch = next(iter(loader))
     u_stream = build_u_stream(batch)
     assert u_stream.shape == (3, _T, 101)
-    # The first 43 channels must be exactly up_st, the remaining 58 up_ph.
     assert torch.equal(u_stream[..., :43], batch.up_st)
     assert torch.equal(u_stream[..., 43:], batch.up_ph)
 
 
-def test_meta_json_roundtrip(tiny_cache: Path):
-    ds = SyntheticTEDataset(tiny_cache / "train.npz")
+def test_meta_json_roundtrip(tiny_g1_cache: Path):
+    """The cached ``meta.json`` carries the analytic TE, splits and channel map."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
     meta = ds.meta
-    assert meta["benchmark"] == "A"
-    assert meta["tag"] == "test_tiny"
-    expected_te = te_block_gaussian(
-        meta["a"], meta["sigma2"], meta["horizon"], meta["M"]
-    )
-    assert meta["te_true"] == pytest.approx(expected_te, abs=1e-6)
+    assert meta["benchmark"] == "G1"
+    assert meta["tag"] == "test_G1"
+    assert isinstance(meta["te_true"], float) and meta["te_true"] >= 0.0
     assert meta["split_sizes"] == {
         "train": _N_TRAIN, "val": _N_VAL, "test": _N_TEST
     }
     assert set(meta["split_seeds"]) == {"train", "val", "test"}
     assert meta["channel_map"]["fhr_st"] == [0, 43]
     assert meta["channel_map"]["up_ph"] == [43, 101]
-
-
-@pytest.mark.parametrize("benchmark", ["B", "C", "E", "G"])
-def test_build_dataset_dispatch(tmp_path, benchmark):
-    """Phase 7: build_dataset dispatches to the B / C / E / G generators."""
-    with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh)
-    raw["experiment"]["benchmark"] = benchmark
-    raw["experiment"]["tag"] = f"test_{benchmark}"
-    config = resolve_active_benchmark(raw)
-    config["paths"]["data_dir"] = str(tmp_path)  # absolute -> overrides ./data
-    config["data"]["n_train"] = 6
-    config["data"]["n_val"] = 4
-    config["data"]["n_test"] = 4
-
-    out_dir = build_dataset(config, force=True)
-    for fname in ("train.npz", "val.npz", "test.npz", "meta.json", "preview.pdf"):
-        assert (out_dir / fname).is_file(), fname
-
-    ds = SyntheticTEDataset(out_dir / "train.npz")
-    assert ds.meta["benchmark"] == benchmark
-    sample = ds[0]
-    assert sample.fhr_st.shape == (_T, 43)
-    assert sample.fhr_ph.shape == (_T, 44)
-    assert sample.up_st.shape == (_T, 43)
-    assert sample.up_ph.shape == (_T, 58)
-
-    # Benchmark-specific metadata.
-    if benchmark == "B":
-        assert "rho" in ds.meta and "burn_in" in ds.meta
-        assert ds.meta["te_true"] > 0.0
-    elif benchmark == "C":
-        assert "q" in ds.meta and "obs_noise" in ds.meta
-        assert "a" not in ds.meta and "sigma2" not in ds.meta
-    elif benchmark == "E":
-        assert "lag_band_1" in ds.meta and "lag_band_2" in ds.meta
-        assert "te_true_1" in ds.meta and "te_true_2" in ds.meta
-    elif benchmark == "G":
-        assert ds.meta["te_true"] == 0.0
-        assert ds.meta["reverse_roles"] is True
-        assert ds.meta["true_lag_band"] == []
-
-
-def test_forward_pass_smoke(tiny_cache: Path):
-    """Task 2.5: one cached batch flows through ``SeqVaeLagAttnV1.forward``."""
-    torch.manual_seed(0)
-    ds = SyntheticTEDataset(tiny_cache / "train.npz")
-    loader = make_dataloader(ds, batch_size=2, shuffle=False)
-    batch = next(iter(loader))
-
-    model = SeqVaeLagAttnV1()  # defaults already equal the native shapes.
-    model.eval()
-    with torch.no_grad():
-        out = model(batch.fhr_st, batch.fhr_ph, build_u_stream(batch))
-
-    expected_keys = {
-        "mu_prior", "logvar_prior", "mu_post", "logvar_post", "z",
-        "target_state", "source_state", "decoder_state", "attended_source",
-        "attn_weights", "mu_base", "logvar_base", "delta_mu_src", "mu_full",
-        "logvar_full", "raw_future_pred", "kld_per_t", "te_lag_map",
-        "warmup_mask", "mu_prior_sat_frac", "delta_mu_sat_frac",
-    }
-    assert set(out.keys()) == expected_keys
-    assert out["kld_per_t"].shape == (2, _T)
-    assert out["mu_full"].shape == (2, _T, 30, 87)
-    assert out["te_lag_map"].shape == (2, _T, 91)
-    assert out["attn_weights"].shape == (2, _T, 4, 91)
-    assert torch.isfinite(out["kld_per_t"]).all()
-    assert torch.isfinite(out["mu_full"]).all()
+    # G1-specific fields the generator emits. _build_gen_kwargs auto-tiles a
+    # length-1 oscillator/delay/B_y spec to M copies (here M=4 default), so the
+    # meta records one delay per informative channel.
+    assert meta["target_ar"] == pytest.approx(0.95)
+    assert meta["M"] == 4
+    assert meta["delays"] == [60] * meta["M"]
+    assert meta["true_lag_band"] == list(range(30, 60))
