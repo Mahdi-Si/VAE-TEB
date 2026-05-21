@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import random
 import sys
 import time
@@ -78,26 +79,38 @@ _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 _TENSOR_FIELDS = ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight")
 
 # Per-epoch training metrics tracked and reduced as size-weighted means.
+# ``mean_logvar_full`` / ``mean_logvar_base`` are the Sprint-5 collapse
+# diagnostics — they record the mean observation logvar over the
+# loss-masked support, so a single-channel collapse of the ``logvar_full``
+# head (its lower clamp at -5) is visible in the metrics CSV.
 _TRAIN_KEYS = (
     "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
-    "mu_prior_sat_frac", "delta_mu_sat_frac", "grad_norm",
+    "mu_prior_sat_frac", "delta_mu_sat_frac",
+    "mean_logvar_full", "mean_logvar_base",
+    "grad_norm",
 )
 # Subset persisted into the checkpoint's ``train_metrics`` block.
 _TRAIN_METRIC_KEYS = (
     "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
     "mu_prior_sat_frac", "delta_mu_sat_frac",
+    "mean_logvar_full", "mean_logvar_base",
 )
 # Per-epoch evaluation metrics (no gradient-related fields).
-_EVAL_KEYS = ("feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap")
+_EVAL_KEYS = (
+    "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
+    "mean_logvar_full", "mean_logvar_base",
+)
 
 # CSV column order (one row per epoch).
 _FIELDNAMES = [
     "epoch",
     "train_feat_loss", "train_base_loss", "train_kld_loss", "train_total_loss",
     "train_pred_gap", "train_mu_prior_sat_frac", "train_delta_mu_sat_frac",
+    "train_mean_logvar_full", "train_mean_logvar_base",
     "train_grad_norm",
     "val_feat_loss", "val_base_loss", "val_kld_loss", "val_total_loss",
     "val_pred_gap",
+    "val_mean_logvar_full", "val_mean_logvar_base",
     "lr", "epoch_seconds", "nan_skips",
 ]
 
@@ -114,12 +127,55 @@ _OVERRIDE_MAP: Dict[str, Tuple[str, str]] = {
     "device": ("runtime", "device"),
     "seed": ("experiment", "seed"),
     "plot_every": ("plotting", "plot_every"),
+    # Path overrides -- accept absolute paths on any drive, ``~`` for the
+    # user's home, or ``$VAR``/``${VAR}`` env-var references. Resolution is
+    # done lazily by :func:`resolve_user_path` so an override applied at any
+    # stage (CLI flag, RUN_CONFIG, gpu_pool patch) takes effect at use-time.
+    "data_dir": ("paths", "data_dir"),
+    "results_dir": ("paths", "results_dir"),
 }
 
 
 # =============================================================================
 # Config / device / seed helpers
 # =============================================================================
+
+def resolve_user_path(value: Any) -> Path:
+    r"""Resolve a config-supplied path to an absolute :class:`~pathlib.Path`.
+
+    Handles the three shapes a user is likely to put in
+    ``paths.data_dir`` / ``paths.results_dir`` (or pass via
+    ``--data-dir`` / ``--results-dir``):
+
+        * **Relative** (``./data``, ``results``) -- joined with
+          ``model_experiment/`` so the default ``./data`` keeps the
+          baked-in behaviour.
+        * **Absolute on any drive** (``D:/teb_data``, ``E:\caches``,
+          ``/mnt/scratch/teb``) -- used as-is; the ``model_experiment/``
+          prefix is dropped.
+        * **Home-relative** (``~/teb``) or **env-var-prefixed**
+          (``$DATA_ROOT/teb``, ``${SCRATCH}/teb``) -- expanded via
+          :func:`os.path.expanduser` and :func:`os.path.expandvars` before
+          the relative / absolute check.
+
+    Calling this helper at *use-time* (rather than canonicalising at
+    config-load time) means a late override -- a CLI flag, a
+    ``RUN_CONFIG`` dict, or a :mod:`gpu_pool` worker patch -- is honoured
+    transparently without any extra plumbing.
+
+    Args:
+        value: A path-like value (``str`` / :class:`os.PathLike`).
+
+    Returns:
+        The resolved absolute path. Symlinks are followed via
+        :meth:`Path.resolve`; missing parents do not raise.
+    """
+    raw = str(value)
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    p = Path(expanded)
+    if not p.is_absolute():
+        p = _EXPERIMENT_DIR / p
+    return p.resolve()
 
 def resolve_active_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay the active benchmark's block onto the flat top-level config.
@@ -321,7 +377,7 @@ def make_dataloaders(
             points at :mod:`build_dataset`.
     """
     exp = config["experiment"]
-    data_root = (_EXPERIMENT_DIR / str(config["paths"]["data_dir"])).resolve()
+    data_root = resolve_user_path(config["paths"]["data_dir"])
     cache_dir = data_root / str(exp["benchmark"]) / str(exp["tag"])
     train_npz = cache_dir / "train.npz"
     val_npz = cache_dir / "val.npz"
@@ -334,15 +390,27 @@ def make_dataloaders(
             f"synthetic.build_dataset --tag {exp['tag']}"
         )
 
+    # Optional DataLoader knobs (``config.dataset`` block, all defaults
+    # preserve pre-existing single-GPU behaviour). Useful on multi-GPU boxes
+    # with bigger memory where host->device copies start to dominate.
+    ds_cfg = (config.get("dataset") or {})
+    num_workers = int(ds_cfg.get("num_workers", 0))
+    pin_memory = bool(ds_cfg.get("pin_memory", False))
+    persistent_workers = bool(ds_cfg.get("persistent_workers", False))
+
     train_ds = SyntheticTEDataset(train_npz)
     train_loader = make_dataloader(
-        train_ds, batch_size, shuffle=True, drop_last=True
+        train_ds, batch_size, shuffle=True, drop_last=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
     val_loader = None
     if val_npz.is_file():
         val_ds = SyntheticTEDataset(val_npz)
         val_loader = make_dataloader(
-            val_ds, batch_size, shuffle=False, drop_last=False
+            val_ds, batch_size, shuffle=False, drop_last=False,
+            num_workers=num_workers, pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
     return train_loader, val_loader, train_ds.meta
 
@@ -377,6 +445,9 @@ def train_one_epoch(
     lambda_full: float,
     lambda_base: float,
     grad_clip_norm: float,
+    likelihood: str = "mse",
+    sigma_obs: "float | str" = 1.0,
+    free_bits: float = 0.0,
 ) -> Dict[str, float]:
     r"""Run one training epoch: forward -> loss -> backward -> clip -> step.
 
@@ -392,6 +463,11 @@ def train_one_epoch(
         lambda_full: Weight on the full-forecast feature loss.
         lambda_base: Weight on the baseline feature loss.
         grad_clip_norm: Gradient-norm clip threshold.
+        likelihood: Reconstruction likelihood passed to
+            :meth:`SeqVaeLagAttnV1.compute_loss`. Defaults to ``'mse'`` so
+            legacy configs train identically to pre-Sprint-5 behaviour.
+        sigma_obs: Observation noise (scalar or ``'learned'``).
+        free_bits: Per-dim KL floor (0.0 is a no-op).
 
     Returns:
         Size-weighted epoch means of all entries in :data:`_TRAIN_KEYS`, plus
@@ -414,6 +490,8 @@ def train_one_epoch(
             losses = model.compute_loss(
                 out, y_st, y_ph, weight=batch.weight,
                 beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
+                likelihood=likelihood, sigma_obs=sigma_obs,
+                free_bits=free_bits,
             )
             total = losses["total_loss"]
             if not torch.isfinite(total):
@@ -446,6 +524,8 @@ def train_one_epoch(
         accum["pred_gap"] += float(losses["base_loss"] - losses["feat_loss"]) * bs
         accum["mu_prior_sat_frac"] += float(out["mu_prior_sat_frac"]) * bs
         accum["delta_mu_sat_frac"] += float(out["delta_mu_sat_frac"]) * bs
+        accum["mean_logvar_full"] += float(losses["mean_logvar_full"]) * bs
+        accum["mean_logvar_base"] += float(losses["mean_logvar_base"]) * bs
         accum["grad_norm"] += float(grad_norm) * bs
         n_samples += bs
 
@@ -466,6 +546,9 @@ def evaluate(
     beta: float,
     lambda_full: float,
     lambda_base: float,
+    likelihood: str = "mse",
+    sigma_obs: "float | str" = 1.0,
+    free_bits: float = 0.0,
 ) -> Dict[str, float]:
     r"""Run one evaluation pass (no backward, no optimiser step).
 
@@ -479,6 +562,10 @@ def evaluate(
         beta: KL weight $\beta$.
         lambda_full: Weight on the full-forecast feature loss.
         lambda_base: Weight on the baseline feature loss.
+        likelihood: Reconstruction likelihood passed to
+            :meth:`SeqVaeLagAttnV1.compute_loss`. Defaults to ``'mse'``.
+        sigma_obs: Observation noise (scalar or ``'learned'``).
+        free_bits: Per-dim KL floor (0.0 is a no-op).
 
     Returns:
         Size-weighted means of :data:`_EVAL_KEYS`; all-NaN when ``loader`` is
@@ -501,12 +588,16 @@ def evaluate(
         losses = model.compute_loss(
             out, y_st, y_ph, weight=batch.weight,
             beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
+            likelihood=likelihood, sigma_obs=sigma_obs,
+            free_bits=free_bits,
         )
         accum["feat_loss"] += float(losses["feat_loss"]) * bs
         accum["base_loss"] += float(losses["base_loss"]) * bs
         accum["kld_loss"] += float(losses["kld_loss"]) * bs
         accum["total_loss"] += float(losses["total_loss"]) * bs
         accum["pred_gap"] += float(losses["base_loss"] - losses["feat_loss"]) * bs
+        accum["mean_logvar_full"] += float(losses["mean_logvar_full"]) * bs
+        accum["mean_logvar_base"] += float(losses["mean_logvar_base"]) * bs
         n_samples += bs
 
     if n_samples == 0:
@@ -662,12 +753,14 @@ def _maybe_fit_latent_stats(
 def _refresh_training_curves(
     csv_path: Path, run_tag: str, plotting_cfg: Dict[str, Any]
 ) -> None:
-    """Re-render the train/val loss-curve figure from the metrics CSV.
+    """Re-render the train/val loss-curve figures from the metrics CSV.
 
-    Reads ``metrics.csv`` and overwrites ``training_curves.{pdf,png}`` in the
-    same directory. The plotter is imported lazily (it pulls in matplotlib) and
-    every failure is downgraded to a warning -- a plotting bug must never abort
-    a training run.
+    Writes both the matplotlib ``training_curves.{pdf,png}`` grid and the
+    interactive plotly ``loss_plot_epoch.html`` (mirrors
+    :class:`train.callbacks.LossPlotCallback`) next to the CSV. Both
+    renderers are imported lazily and wrapped in independent
+    try/except blocks -- a plotting bug in one backend must never abort
+    training nor suppress the other backend's output.
 
     Args:
         csv_path: The run's ``metrics.csv`` (flushed every epoch).
@@ -683,6 +776,16 @@ def _refresh_training_curves(
         plot_training_curves(csv_path, run_tag=run_tag)
     except Exception as exc:  # noqa: BLE001 - plotting must not kill training
         print(f"[warn] training-curve plot failed: {type(exc).__name__}: {exc}")
+    try:
+        from model.vae_teb_prediction.model.model_experiment.synthetic.plot_training_curves import (
+            plot_training_curves_html,
+        )
+        plot_training_curves_html(csv_path, run_tag=run_tag)
+    except Exception as exc:  # noqa: BLE001 - plotting must not kill training
+        print(
+            f"[warn] training-curve HTML plot failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # =============================================================================
@@ -739,12 +842,16 @@ def _assemble_row(
         "train_pred_gap": train_m["pred_gap"],
         "train_mu_prior_sat_frac": train_m["mu_prior_sat_frac"],
         "train_delta_mu_sat_frac": train_m["delta_mu_sat_frac"],
+        "train_mean_logvar_full": train_m["mean_logvar_full"],
+        "train_mean_logvar_base": train_m["mean_logvar_base"],
         "train_grad_norm": train_m["grad_norm"],
         "val_feat_loss": val_m["feat_loss"],
         "val_base_loss": val_m["base_loss"],
         "val_kld_loss": val_m["kld_loss"],
         "val_total_loss": val_m["total_loss"],
         "val_pred_gap": val_m["pred_gap"],
+        "val_mean_logvar_full": val_m["mean_logvar_full"],
+        "val_mean_logvar_base": val_m["mean_logvar_base"],
         "lr": lr,
         "epoch_seconds": epoch_seconds,
         "nan_skips": train_m["nan_skips"],
@@ -792,8 +899,28 @@ def train(
     beta = float(loss_cfg["kld_beta"])
     lambda_full = float(loss_cfg["lambda_full"])
     lambda_base = float(loss_cfg["lambda_base"])
+    # Sprint-5 likelihood switch. Defaults preserve pre-Sprint-5 behaviour
+    # (MSE feat_loss / base_loss, no free-bits floor). ``sigma_obs`` accepts
+    # a positive scalar or the literal string ``'learned'``; YAML carries it
+    # as a string when set to ``learned`` and as a number otherwise.
+    likelihood = str(loss_cfg.get("likelihood", "mse"))
+    sigma_obs_raw = loss_cfg.get("sigma_obs", 1.0)
+    if isinstance(sigma_obs_raw, str) and sigma_obs_raw != "learned":
+        # Allow YAML to carry a stringified float like "1.0" — coerce.
+        try:
+            sigma_obs: "float | str" = float(sigma_obs_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"loss.sigma_obs must be a positive float or 'learned', "
+                f"got {sigma_obs_raw!r}"
+            ) from exc
+    else:
+        sigma_obs = sigma_obs_raw if isinstance(sigma_obs_raw, str) else float(sigma_obs_raw)
+    free_bits = float(loss_cfg.get("free_bits", 0.0))
     loss_settings = {
         "beta": beta, "lambda_full": lambda_full, "lambda_base": lambda_base,
+        "likelihood": likelihood, "sigma_obs": sigma_obs,
+        "free_bits": free_bits,
     }
 
     train_loader, val_loader, data_meta = make_dataloaders(config, batch_size)
@@ -816,7 +943,7 @@ def train(
     scheduler = build_scheduler(optimizer, optim_cfg)
 
     run_tag = str(config.get("run_tag") or exp["tag"])
-    results_root = (_EXPERIMENT_DIR / str(config["paths"]["results_dir"])).resolve()
+    results_root = resolve_user_path(config["paths"]["results_dir"])
     results_dir = results_root / str(exp["benchmark"]) / run_tag
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -852,10 +979,14 @@ def train(
             model, train_loader, optimizer, device,
             beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
             grad_clip_norm=grad_clip,
+            likelihood=likelihood, sigma_obs=sigma_obs,
+            free_bits=free_bits,
         )
         val_m = evaluate(
             model, val_loader, device,
             beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
+            likelihood=likelihood, sigma_obs=sigma_obs,
+            free_bits=free_bits,
         )
         if scheduler is not None:
             scheduler.step()
@@ -1008,6 +1139,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="override plotting.plot_every (epochs between loss-curve "
              "refreshes; 0 = render only at the end)",
     )
+    p.add_argument(
+        "--data-dir", type=str, default=None, dest="data_dir",
+        help="override paths.data_dir (absolute path, relative path, ~, or "
+             "$VAR; resolved via train_minimal.resolve_user_path)",
+    )
+    p.add_argument(
+        "--results-dir", type=str, default=None, dest="results_dir",
+        help="override paths.results_dir (same format as --data-dir)",
+    )
     return p.parse_args(argv)
 
 
@@ -1032,6 +1172,8 @@ def main(argv=None) -> None:
         "device": args.device,
         "seed": args.seed,
         "plot_every": args.plot_every,
+        "data_dir": args.data_dir,
+        "results_dir": args.results_dir,
     }
     train(config, overrides=overrides)
 
@@ -1068,6 +1210,10 @@ if __name__ == "__main__":
         "device": "cuda:0",                 # None/"auto" -> config runtime.device
         "seed": None,                       # None -> config experiment.seed
         "plot_every": None,                 # None -> config plotting.plot_every
+        # Path overrides -- absolute path on any drive, ``~``, or ``$VAR``.
+        # None -> use config_synth.yaml paths.data_dir / paths.results_dir.
+        "data_dir": None,                   # e.g. r"D:/teb_data" or "~/teb"
+        "results_dir": None,                # e.g. r"E:/teb_results"
     }
 
     if len(sys.argv) > 1:

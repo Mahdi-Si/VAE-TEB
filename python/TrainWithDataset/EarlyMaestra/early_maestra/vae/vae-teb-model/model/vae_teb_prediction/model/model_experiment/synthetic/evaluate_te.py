@@ -1,15 +1,17 @@
-r"""TE evaluation harness -- $\bar{K}$ versus ground-truth TE (Phase 4).
+r"""TE evaluation harness -- $\bar{K}$ versus ground-truth TE (v2 benchmarks).
 
 Loads a trained :class:`SeqVaeLagAttnV1` checkpoint, runs inference over the
 cached **test** split, and computes the four validation metrics of
-``model_validation.md`` Section 5:
+``model_validation_v2.md`` Section 9:
 
-    Metric 1 -- null error: $E_0 = |\bar{K}|$ for zero-transfer ($a=0$) data,
+    Metric 1 -- null error: $E_0 = |\bar{K}|$ for zero-transfer data,
         plus a cheap shuffled-source control.
     Metric 2 -- monotonicity: Spearman $\rho(\bar{K}, \mathrm{TE}_{\rm true})$
-        across the A-sweep.
+        across the active benchmark's sweep.
     Metric 3 -- calibration slope: fit $\bar{K} = \alpha + \gamma\,
-        \mathrm{TE}_{\rm true}$ and report $\alpha, \gamma, R^2$.
+        \mathrm{TE}_{\rm true}$ and report $\alpha, \gamma, R^2$ (the
+        $\gamma \to 1$ headline becomes meaningful in Sprint 5 once the
+        Gaussian-NLL likelihood is wired).
     Metric 4 -- predictive gain: ``pred_gap`` $= \mathcal{L}_{\rm base} -
         \mathcal{L}_{\rm feat}$ versus $\bar{K}$ and $\mathrm{TE}_{\rm true}$.
 
@@ -20,24 +22,21 @@ $t \in [\text{warmup}, T)$, obtained via
 
 This module **reuses** the training-loop helpers in :mod:`train_minimal`
 (:func:`evaluate`, :func:`compute_kbar`, ...) so the harness scores models with
-the exact loss / KL code Phase 3 trained against -- it never re-implements them.
+the exact loss / KL code training used -- it never re-implements them.
 
-Three run modes:
+Two run modes:
     * ``single`` -- evaluate one checkpoint, write a one-row summary.
-    * ``sweep``  -- enumerate the active benchmark's ``sweep`` grid
-      (Gaussian ``a_grid`` x ``m_grid``, XOR ``q_grid`` x ``m_grid``, or the
-      single two-lag cell), evaluate every cell, aggregate Metrics 1-4, render
-      the headline plots.
-    * ``rho_null`` -- the Benchmark-B headline diagnostic: $\bar K \approx 0$ at
-      $a=0$ for every $\rho$ in ``rho_null.rho_grid`` (no target-self-info
-      leakage).
+    * ``sweep``  -- enumerate the active v2 benchmark's ``sweep`` grid
+      (``gaussian_state_space`` $B_y$ x M for G1, ``arx`` $c$ x M for G2,
+      ``regime_switch`` $p$ x M for G3), evaluate every cell, aggregate
+      Metrics 1-4, render the headline plots.
 
     Missing datasets / checkpoints can be built / trained behind the opt-in
     ``build_missing`` / ``train_missing`` flags (default OFF -- the harness
     otherwise strictly evaluates what already exists on disk).
 
-Run modes (project convention -- Decision D9 in
-``synthetic_te_validation_plan.md``): like every ``synthetic/`` runner this file
+Run modes (project convention -- Decision V2-D8 in
+``model_validation_v2_plan.md``): like every ``synthetic/`` runner this file
 supports **both** a CLI and an edit-and-run ``__main__``, auto-detected from
 whether any command-line argument is present.
 
@@ -76,8 +75,9 @@ from model.vae_teb_prediction.model.model_experiment.synthetic import (
     train_minimal as tm,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
-    te_block_gaussian,
-    te_block_xor,
+    te_block_arx_gaussian,
+    te_block_state_space_gaussian,
+    te_categorical_switch_block,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.dataset import (
     AttributeDict,
@@ -94,15 +94,23 @@ _PKG_DIR = Path(__file__).resolve().parent
 _EXPERIMENT_DIR = _PKG_DIR.parent
 _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 
-# Columns of the per-setting summary CSV (task 4.8). One row per evaluated
-# checkpoint; the d_z-length ``per_dim_kl`` vector goes to ``metrics.json``.
-# ``a`` / ``q`` / ``rho`` are the benchmark-specific knobs (Gaussian / XOR / AR):
+# Columns of the per-setting summary CSV. One row per evaluated checkpoint;
+# the d_z-length ``per_dim_kl`` vector goes to ``metrics.json``. ``B_y`` / ``c``
+# / ``p_switch`` are the v2 benchmark-specific sweep knobs (G1 / G2 / G3);
 # whichever the active benchmark does not use is left blank.
 _SUMMARY_FIELDS = [
-    "run_tag", "data_tag", "benchmark", "a", "q", "rho", "M",
+    "run_tag", "data_tag", "benchmark", "B_y", "c", "p_switch", "M",
     "te_true", "te_per_step",
-    "k_bar", "k_bar_shuffled", "pred_gap", "feat_loss", "base_loss", "kld_loss",
+    # Null-control surrogates: ``k_bar_shuffled`` permutes $U$ along the batch
+    # axis, ``k_bar_reversed`` flips $U$ along $T$. Both are computed in
+    # :func:`_collect_diagnostics` during the same eval pass.
+    "k_bar", "k_bar_shuffled", "k_bar_reversed",
+    "pred_gap", "feat_loss", "base_loss", "kld_loss",
     "mu_post_prior_gap", "attn_entropy", "n_test", "warmup", "epoch",
+    # Sprint 5 calibration provenance: the likelihood + sigma_obs the
+    # checkpoint was trained under, plus the collapse diagnostic for the
+    # observation-noise head.
+    "likelihood", "sigma_obs", "free_bits", "mean_logvar_full",
     "latent_stats_fitted", "ckpt_path",
 ]
 
@@ -114,25 +122,33 @@ _SUMMARY_FIELDS = [
 def _data_root(config: Dict[str, Any]) -> Path:
     """Resolve the dataset cache root from ``paths.data_dir``.
 
+    Accepts a relative path (joined with ``model_experiment/``), an
+    absolute path on any drive (used as-is), or a path with ``~`` /
+    ``$VAR`` references (expanded). Delegates to
+    :func:`train_minimal.resolve_user_path`.
+
     Args:
         config: The parsed ``config_synth.yaml``.
 
     Returns:
-        Absolute path of ``<model_experiment>/<paths.data_dir>``.
+        Absolute path of the resolved data root.
     """
-    return (_EXPERIMENT_DIR / str(config["paths"]["data_dir"])).resolve()
+    return tm.resolve_user_path(config["paths"]["data_dir"])
 
 
 def _results_root(config: Dict[str, Any]) -> Path:
     """Resolve the results root from ``paths.results_dir``.
 
+    Same resolution rules as :func:`_data_root` -- relative, absolute on
+    any drive, or ``~`` / ``$VAR`` patterns are all honoured.
+
     Args:
         config: The parsed ``config_synth.yaml``.
 
     Returns:
-        Absolute path of ``<model_experiment>/<paths.results_dir>``.
+        Absolute path of the resolved results root.
     """
-    return (_EXPERIMENT_DIR / str(config["paths"]["results_dir"])).resolve()
+    return tm.resolve_user_path(config["paths"]["results_dir"])
 
 
 def _eval_out_dir(config: Dict[str, Any], benchmark: str) -> Path:
@@ -273,6 +289,37 @@ def shuffle_source_batch(batch: Any) -> AttributeDict:
     return shuffled
 
 
+def reverse_source_batch(batch: Any) -> AttributeDict:
+    r"""Flip the source streams of a batch along the time axis.
+
+    Produces a time-reversed null control: each source channel is replayed
+    backwards in time so the present source value at step $t$ becomes the
+    original value at step $T-1-t$, destroying any genuine
+    $U_{\le t} \to Y_{t+1:t+H}$ alignment while leaving the per-channel
+    marginals and autocorrelation magnitude untouched. A faithful TE surrogate
+    should collapse $\bar K$ towards zero (or at least move attention to the
+    wrong lags). No retraining is needed.
+
+    The returned dict **shares references** to ``fhr_st`` / ``fhr_ph`` /
+    ``weight`` with the input (shallow copy); ``up_st`` / ``up_ph`` are fresh
+    tensors from :func:`torch.flip`. Callers must not in-place mutate the
+    target streams. Models that read inputs without mutating them (the
+    contract :class:`SeqVaeLagAttnV1` honours) are safe.
+
+    Args:
+        batch: A batched :class:`AttributeDict` with ``up_st`` / ``up_ph``.
+
+    Returns:
+        A new :class:`AttributeDict` sharing ``fhr_st`` / ``fhr_ph`` /
+        ``weight`` with ``batch`` but with ``up_st`` / ``up_ph`` flipped
+        along ``dim=1`` (the time axis).
+    """
+    reversed_b = AttributeDict(batch)
+    reversed_b["up_st"] = batch.up_st.flip(dims=[1])
+    reversed_b["up_ph"] = batch.up_ph.flip(dims=[1])
+    return reversed_b
+
+
 @torch.no_grad()
 def _collect_diagnostics(
     model: SeqVaeLagAttnV1,
@@ -295,6 +342,8 @@ def _collect_diagnostics(
       untrained attention; lower means sharper lag selection.
     * ``k_bar_shuffled`` -- $\bar K$ recomputed with :func:`shuffle_source_batch`
       (the shuffled-source null control).
+    * ``k_bar_reversed`` -- $\bar K$ recomputed with :func:`reverse_source_batch`
+      (the time-reversed source null control, Sprint 6.3).
 
     Args:
         model: The trained model (moved to ``device``).
@@ -304,13 +353,15 @@ def _collect_diagnostics(
 
     Returns:
         Dict with keys ``per_dim_kl`` (list of float), ``mu_post_prior_gap``,
-        ``attn_entropy`` and ``k_bar_shuffled`` (all float).
+        ``attn_entropy``, ``k_bar_shuffled`` and ``k_bar_reversed`` (all
+        float).
     """
     model.eval()
     acc_per_dim: Optional[torch.Tensor] = None
     acc_mu_gap = 0.0
     acc_attn_ent = 0.0
     acc_k_shuffled = 0.0
+    acc_k_reversed = 0.0
     n_samples = 0
 
     for batch in loader:
@@ -344,12 +395,26 @@ def _collect_diagnostics(
         ent = torch.special.entr(attn.clamp_min(0.0)).sum(dim=-1)  # (B, T', H)
         attn_ent = float(ent.mean())
 
-        # Shuffled-source K_bar control.
-        shuffled = shuffle_source_batch(batch)
-        u_shuffled = build_u_stream(shuffled)
+        # Null-control K_bar values. The shuffle / flip transforms commute
+        # with ``build_u_stream`` (concat along the channel axis), so we
+        # operate directly on the already-built 101-channel ``u_stream`` and
+        # avoid allocating two extra AttributeDict shallow copies plus two
+        # extra channel-concat tensors per batch.
+        bs_idx = torch.randperm(bs, device=u_stream.device)
+        if bs > 1:
+            identity = torch.arange(bs, device=bs_idx.device)
+            if bool((bs_idx == identity).all()):
+                bs_idx = torch.roll(bs_idx, 1)
+        u_shuffled = u_stream[bs_idx]
         k_shuffled = float(
             model.measure_transfer_entropy(
                 y_st, y_ph, u_shuffled, reduce_mean=True
+            )
+        )
+        u_reversed = u_stream.flip(dims=[1])
+        k_reversed = float(
+            model.measure_transfer_entropy(
+                y_st, y_ph, u_reversed, reduce_mean=True
             )
         )
 
@@ -358,6 +423,7 @@ def _collect_diagnostics(
         acc_mu_gap += mu_gap * bs
         acc_attn_ent += attn_ent * bs
         acc_k_shuffled += k_shuffled * bs
+        acc_k_reversed += k_reversed * bs
         n_samples += bs
 
     if n_samples == 0:
@@ -366,12 +432,14 @@ def _collect_diagnostics(
             "mu_post_prior_gap": float("nan"),
             "attn_entropy": float("nan"),
             "k_bar_shuffled": float("nan"),
+            "k_bar_reversed": float("nan"),
         }
     return {
         "per_dim_kl": (acc_per_dim / n_samples).cpu().tolist(),
         "mu_post_prior_gap": acc_mu_gap / n_samples,
         "attn_entropy": acc_attn_ent / n_samples,
         "k_bar_shuffled": acc_k_shuffled / n_samples,
+        "k_bar_reversed": acc_k_reversed / n_samples,
     }
 
 
@@ -386,6 +454,7 @@ def evaluate_checkpoint(
     device: Optional[torch.device] = None,
     data_tag: Optional[str] = None,
     batch_size: Optional[int] = None,
+    benchmark_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     r"""Evaluate one trained checkpoint on its cached test split.
 
@@ -401,6 +470,13 @@ def evaluate_checkpoint(
             checkpoint was trained on (``ckpt["data_meta"]["tag"]``).
         batch_size: Inference batch size. Defaults to the checkpoint's training
             batch size.
+        benchmark_override: Optional benchmark name to use when resolving the
+            test cache directory; ``None`` (default) falls back to the
+            checkpoint's own benchmark. :mod:`null_controls` sets this so a
+            trained checkpoint can be re-evaluated on a sibling control cache
+            (e.g. G2 -> ``G2_wrong_delay`` / ``G2_zero_coupling``) without
+            retraining; the row's ``benchmark`` field then records the
+            override. Empty string is treated as ``None`` (falsy fallback).
 
     Returns:
         A flat metrics dict with the :data:`_SUMMARY_FIELDS` keys plus
@@ -413,7 +489,10 @@ def evaluate_checkpoint(
     ckpt_config: Dict[str, Any] = ckpt.get("config", {}) or {}
     ckpt_exp = ckpt_config.get("experiment", {})
 
-    benchmark = str(ckpt_exp.get("benchmark", config["experiment"]["benchmark"]))
+    benchmark = str(
+        benchmark_override
+        or ckpt_exp.get("benchmark", config["experiment"]["benchmark"])
+    )
     tag = data_tag or data_meta.get("tag") or ckpt_exp.get("tag")
     if tag is None:
         raise ValueError(
@@ -432,25 +511,57 @@ def evaluate_checkpoint(
     )
 
     # Provenance check -- warn (do not fail) if the test split's analytic TE
-    # disagrees with what the checkpoint recorded.
-    te_ckpt = data_meta.get("te_true")
-    te_test = test_meta.get("te_true")
-    if te_ckpt is not None and te_test is not None:
-        if abs(float(te_ckpt) - float(te_test)) > 1e-6:
-            print(
-                f"[warn] checkpoint te_true={te_ckpt} != test-split "
-                f"te_true={te_test} for tag '{tag}'. Using the test split's "
-                f"value; check that --data-tag points at the intended dataset."
-            )
+    # disagrees with what the checkpoint recorded. Skipped under
+    # ``benchmark_override``: re-evaluating a checkpoint on a sibling control
+    # cache is *meant* to change te_true, so the divergence is expected.
+    if benchmark_override is None:
+        te_ckpt = data_meta.get("te_true")
+        te_test = test_meta.get("te_true")
+        if te_ckpt is not None and te_test is not None:
+            if abs(float(te_ckpt) - float(te_test)) > 1e-6:
+                print(
+                    f"[warn] checkpoint te_true={te_ckpt} != test-split "
+                    f"te_true={te_test} for tag '{tag}'. Using the test "
+                    f"split's value; check that --data-tag points at the "
+                    f"intended dataset."
+                )
 
-    # Loss settings: prefer what the checkpoint trained with.
+    # Loss settings: prefer what the checkpoint trained with. The legacy
+    # trio (beta / lambda_full / lambda_base) has been mandatory in
+    # ``loss:`` since v1 and is read strictly. Sprint-5 keys
+    # (``likelihood`` / ``sigma_obs`` / ``free_bits``) are optional with
+    # MSE / unit-sigma / no-floor defaults, so pre-Sprint-5 checkpoints
+    # score identically.
     loss_settings = ckpt.get("loss_settings", {}) or {}
-    beta = float(loss_settings.get("beta", config["loss"]["kld_beta"]))
+    cfg_loss = config["loss"]
+    beta = float(loss_settings.get("beta", cfg_loss["kld_beta"]))
     lambda_full = float(
-        loss_settings.get("lambda_full", config["loss"]["lambda_full"])
+        loss_settings.get("lambda_full", cfg_loss["lambda_full"])
     )
     lambda_base = float(
-        loss_settings.get("lambda_base", config["loss"]["lambda_base"])
+        loss_settings.get("lambda_base", cfg_loss["lambda_base"])
+    )
+    likelihood = str(
+        loss_settings.get("likelihood", cfg_loss.get("likelihood", "mse"))
+    )
+    sigma_obs_raw = loss_settings.get(
+        "sigma_obs", cfg_loss.get("sigma_obs", 1.0)
+    )
+    if isinstance(sigma_obs_raw, str) and sigma_obs_raw != "learned":
+        try:
+            sigma_obs: "float | str" = float(sigma_obs_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"loss.sigma_obs must be a positive float or 'learned', "
+                f"got {sigma_obs_raw!r}"
+            ) from exc
+    else:
+        sigma_obs = (
+            sigma_obs_raw if isinstance(sigma_obs_raw, str)
+            else float(sigma_obs_raw)
+        )
+    free_bits = float(
+        loss_settings.get("free_bits", cfg_loss.get("free_bits", 0.0))
     )
 
     # Task 4.1 -- the TE surrogate, mean per-step KL over valid anchors.
@@ -459,6 +570,7 @@ def evaluate_checkpoint(
     eval_m = tm.evaluate(
         model, test_loader, device,
         beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
+        likelihood=likelihood, sigma_obs=sigma_obs, free_bits=free_bits,
     )
     # Task 4.2 -- the encoder-side diagnostics.
     warmup = int(getattr(model, "warmup_period", 0) or 0)
@@ -472,18 +584,25 @@ def evaluate_checkpoint(
     )
     run_tag = Path(ckpt_path).resolve().parent.name
 
+    # G1 sweeps over B_y (single-scalar coupling, broadcast across the per-channel
+    # B_y list); G2 sweeps over c; G3 sweeps over p_switch. The CSV captures
+    # whichever knob this benchmark exposes; the others stay None.
+    by_val = data_meta.get("B_y", test_meta.get("B_y"))
+    if isinstance(by_val, (list, tuple)) and by_val:
+        by_val = float(by_val[0])  # representative coupling for a multi-osc sweep
     row: Dict[str, Any] = {
         "run_tag": run_tag,
         "data_tag": str(tag),
         "benchmark": benchmark,
-        "a": data_meta.get("a", test_meta.get("a")),
-        "q": data_meta.get("q", test_meta.get("q")),
-        "rho": data_meta.get("rho", test_meta.get("rho")),
+        "B_y": by_val,
+        "c": data_meta.get("c", test_meta.get("c")),
+        "p_switch": data_meta.get("p_switch", test_meta.get("p_switch")),
         "M": data_meta.get("M", test_meta.get("M")),
         "te_true": te_true,
         "te_per_step": te_per_step,
         "k_bar": float(k_bar),
         "k_bar_shuffled": float(diag["k_bar_shuffled"]),
+        "k_bar_reversed": float(diag["k_bar_reversed"]),
         "pred_gap": float(eval_m["pred_gap"]),
         "feat_loss": float(eval_m["feat_loss"]),
         "base_loss": float(eval_m["base_loss"]),
@@ -494,12 +613,18 @@ def evaluate_checkpoint(
         "n_test": int(len(test_loader.dataset)),
         "warmup": warmup,
         "epoch": ckpt.get("epoch"),
+        # Sprint-5 calibration provenance + collapse diagnostic.
+        "likelihood": likelihood,
+        "sigma_obs": sigma_obs,
+        "free_bits": free_bits,
+        "mean_logvar_full": float(eval_m["mean_logvar_full"]),
         "latent_stats_fitted": bool(ckpt.get("latent_stats_fitted", False)),
         "ckpt_path": str(Path(ckpt_path).resolve()),
     }
     print(
         f"[eval] {run_tag}: K_bar={row['k_bar']:.5f}  "
         f"K_shuffled={row['k_bar_shuffled']:.5f}  "
+        f"K_reversed={row['k_bar_reversed']:.5f}  "
         f"pred_gap={row['pred_gap']:+.5f}  "
         f"te_true={te_true:.4f} nats  "
         f"epoch={row['epoch']}  n_test={row['n_test']}"
@@ -598,6 +723,11 @@ def _aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     kbar = np.array([r["k_bar"] for r in rows], dtype=float)
     pred_gap = np.array([r["pred_gap"] for r in rows], dtype=float)
     k_shuffled = np.array([r["k_bar_shuffled"] for r in rows], dtype=float)
+    # Time-reversed-source mean. NaN-safe so legacy rows that pre-date the
+    # column do not crash the aggregate.
+    k_reversed = np.array(
+        [r.get("k_bar_reversed", float("nan")) for r in rows], dtype=float,
+    )
 
     is_null = np.abs(te) < 1e-9
     is_signal = te > 1e-9
@@ -640,6 +770,11 @@ def _aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 float(np.nanmean(k_shuffled)) if k_shuffled.size
                 else float("nan")
             ),
+            "k_bar_reversed_mean": (
+                float(np.nanmean(k_reversed))
+                if k_reversed.size and not np.all(np.isnan(k_reversed))
+                else float("nan")
+            ),
         },
         "metric2_spearman": rho,
         "metric3_calibration": {"alpha": alpha, "gamma": gamma, "r2": r2},
@@ -662,57 +797,57 @@ def _aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Sweep enumeration & opt-in orchestration (task 4.4)
 # =============================================================================
 
-def _setting_tags(benchmark: str, a: float, m: int) -> Tuple[str, str]:
-    """Filesystem-safe ``(data_tag, run_tag)`` for one Gaussian sweep cell.
-
-    Used by the Gaussian (A / B) sweep path and by
-    :func:`beta_sweep.run_a_sweep_at_beta`.
+def _knob_token(knob_name: str, value: float) -> str:
+    """Filesystem-safe knob token, e.g. ``"By0p5"`` for ``B_y=0.5``.
 
     Args:
-        benchmark: Benchmark identifier (e.g. ``"A"``).
-        a: Transfer coefficient.
+        knob_name: Short knob label (``"By"``, ``"c"``, ``"p"``).
+        value: Numeric value.
+
+    Returns:
+        A token with ``.`` -> ``"p"`` and ``-`` -> ``"m"``.
+    """
+    return f"{knob_name}{value:g}".replace(".", "p").replace("-", "m")
+
+
+def _setting_tags_knob(
+    benchmark: str, knob_name: str, value: float, m: int
+) -> Tuple[str, str]:
+    """Filesystem-safe ``(data_tag, run_tag)`` for one v2 sweep cell.
+
+    Args:
+        benchmark: Benchmark identifier (e.g. ``"G1"``).
+        knob_name: Short knob label (``"By"`` for G1, ``"c"`` for G2,
+            ``"p"`` for G3).
+        value: Knob value.
         m: Number of informative channels.
 
     Returns:
-        Tuple ``(data_tag, run_tag)``, e.g. ``a=0.2791, M=4`` ->
-        ``("benchmark_A_sweep_a0p2791_m4", "sweep_a0p2791_m4")``.
+        Tuple ``(data_tag, run_tag)``, e.g. ``benchmark='G1', knob_name='By',
+        value=0.5, m=4`` -> ``("benchmark_G1_sweep_By0p5_m4",
+        "sweep_By0p5_m4")``.
     """
-    a_token = f"a{a:g}".replace(".", "p").replace("-", "m")
-    data_tag = f"benchmark_{benchmark}_sweep_{a_token}_m{int(m)}"
-    run_tag = f"sweep_{a_token}_m{int(m)}"
-    return data_tag, run_tag
-
-
-def _setting_tags_xor(benchmark: str, q: float, m: int) -> Tuple[str, str]:
-    """Filesystem-safe ``(data_tag, run_tag)`` for one XOR sweep cell.
-
-    Args:
-        benchmark: Benchmark identifier (e.g. ``"C"``).
-        q: Bit-flip probability.
-        m: Number of informative channels.
-
-    Returns:
-        Tuple ``(data_tag, run_tag)``, e.g. ``q=0.25, M=4`` ->
-        ``("benchmark_C_sweep_q0p25_m4", "sweep_q0p25_m4")``.
-    """
-    q_token = f"q{q:g}".replace(".", "p").replace("-", "m")
-    data_tag = f"benchmark_{benchmark}_sweep_{q_token}_m{int(m)}"
-    run_tag = f"sweep_{q_token}_m{int(m)}"
+    token = _knob_token(knob_name, value)
+    data_tag = f"benchmark_{benchmark}_sweep_{token}_m{int(m)}"
+    run_tag = f"sweep_{token}_m{int(m)}"
     return data_tag, run_tag
 
 
 def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    r"""Enumerate the active benchmark's sweep grid with analytic ground-truth TE.
+    r"""Enumerate the active v2 benchmark's sweep grid with analytic TE.
 
-    Dispatches on ``config["sweep"]["kind"]`` (Phase 7):
+    Dispatches on ``config["sweep"]["kind"]``:
 
-    * ``gaussian`` (A / B) -- crosses ``a_grid`` x ``m_grid`` with the
-      closed-form block TE $\mathrm{TE}^{(H)} = \frac{H}{2} M
-      \ln(1 + a^2/\sigma^2)$.
-    * ``xor`` (C) -- crosses ``q_grid`` x ``m_grid`` with
-      $\mathrm{TE}^{(H)} = M H (\ln 2 - h_b(q))$.
-    * ``two_lag`` (E) -- a single setting whose TE is the additive sum of the
-      two bands.
+    * ``gaussian_state_space`` (G1) -- crosses ``B_y_grid`` x ``m_grid``;
+      $\mathrm{TE}^{(H)}$ from :func:`te_block_state_space_gaussian` (MC) for
+      a single oscillator coupled with the swept $B_y$, multiplied by $M$.
+    * ``arx`` (G2) -- crosses ``c_grid`` x ``m_grid``; $\mathrm{TE}^{(H)}$
+      from the closed-form :func:`te_block_arx_gaussian`, multiplied by $M$.
+    * ``regime_switch`` (G3) -- crosses ``p_grid`` x ``m_grid``;
+      $\mathrm{TE}^{(H)} = M\cdot$ :func:`te_categorical_switch_block`.
+
+    Per V2-D6, the per-cell TE scales linearly in $M$ because each
+    informative channel pair is independent under the v2 DGPs.
 
     Args:
         config: The parsed (benchmark-resolved) config -- reads ``sweep``,
@@ -720,78 +855,138 @@ def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Returns:
         A list of setting dicts, each carrying ``kind``, ``M``, ``te_true``,
-        ``te_per_step`` and (for Gaussian / XOR) the swept knob ``a`` / ``q``.
+        ``te_per_step`` and the swept knob (``B_y`` / ``c`` / ``p_switch``).
+
+    Raises:
+        ValueError: If ``sweep.kind`` is not a known v2 dispatch.
     """
     sweep = config.get("sweep", {}) or {}
-    kind = str(sweep.get("kind", "gaussian")).lower()
+    kind = str(sweep.get("kind", "")).lower()
     horizon = int(config["model"]["horizon"])
     data = config.get("data", {}) or {}
 
     settings: List[Dict[str, Any]] = []
-    if kind == "xor":
+    if kind == "gaussian_state_space":
+        # Per-cell TE: a single oscillator with the swept B_y broadcast over
+        # the (length-len(delays)) coupling vector. MC budget per cell defaults
+        # to a smaller value than the build-time meta.te_true (which uses the
+        # data block's te_n_samples).
+        oscillators = [tuple(pair) for pair in data["oscillators"]]
+        target_ar = float(data["target_ar"])
+        delays = [int(d) for d in data["delays"]]
+        sigma2_y = float(data["sigma2_y"])
+        sigma2_eta = data["sigma2_eta"]
+        te_n_samples = int(sweep.get("te_n_samples", 20_000))
         for m in sweep.get("m_grid", []):
-            for q in sweep.get("q_grid", []):
-                te = te_block_xor(float(q), horizon, int(m))
+            for b in sweep.get("B_y_grid", []):
+                te_per_channel = te_block_state_space_gaussian(
+                    oscillators=oscillators,
+                    target_ar=target_ar,
+                    delays=delays,
+                    B_y=[float(b)] * len(delays),
+                    sigma2_y=sigma2_y,
+                    sigma2_eta=sigma2_eta,
+                    H=horizon,
+                    n_samples=te_n_samples,
+                )
+                te = float(te_per_channel) * int(m)
                 settings.append({
-                    "kind": "xor", "q": float(q), "M": int(m),
-                    "te_true": float(te), "te_per_step": float(te) / horizon,
+                    "kind": "gaussian_state_space",
+                    "B_y": float(b), "M": int(m),
+                    "te_true": te, "te_per_step": te / horizon,
                 })
-    elif kind == "two_lag":
-        sigma2 = float(data["sigma2"])
-        m1, m2 = int(data["M1"]), int(data["M2"])
-        te1 = te_block_gaussian(float(data["a1"]), sigma2, horizon, m1)
-        te2 = te_block_gaussian(float(data["a2"]), sigma2, horizon, m2)
-        te = te1 + te2
-        settings.append({
-            "kind": "two_lag", "M": m1 + m2,
-            "te_true": float(te), "te_per_step": float(te) / horizon,
-        })
-    else:  # gaussian (A / B) -- the default.
-        sigma2 = float(data["sigma2"])
+    elif kind == "arx":
+        rho_u = float(data["rho_u"])
+        rho_y = float(data["rho_y"])
+        sigma2_eta = float(data["sigma2_eta"])
+        sigma2_eps = float(data["sigma2_eps"])
+        delay = int(data["delay"])
         for m in sweep.get("m_grid", []):
-            for a in sweep.get("a_grid", []):
-                te = te_block_gaussian(float(a), sigma2, horizon, int(m))
+            for c in sweep.get("c_grid", []):
+                te_per_channel = te_block_arx_gaussian(
+                    rho_u=rho_u, rho_y=rho_y, c=float(c),
+                    sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                    H=horizon, D=delay,
+                )
+                te = float(te_per_channel) * int(m)
                 settings.append({
-                    "kind": "gaussian", "a": float(a), "M": int(m),
-                    "te_true": float(te), "te_per_step": float(te) / horizon,
+                    "kind": "arx",
+                    "c": float(c), "M": int(m),
+                    "te_true": te, "te_per_step": te / horizon,
                 })
+    elif kind == "regime_switch":
+        K = int(data["K_classes"])
+        for m in sweep.get("m_grid", []):
+            for p in sweep.get("p_grid", []):
+                te_per_channel = te_categorical_switch_block(float(p), K, horizon)
+                te = float(te_per_channel) * int(m)
+                settings.append({
+                    "kind": "regime_switch",
+                    "p_switch": float(p), "M": int(m),
+                    "te_true": te, "te_per_step": te / horizon,
+                })
+    else:
+        raise ValueError(
+            f"enumerate_sweep: unknown sweep kind {kind!r} (expected one of "
+            f"'gaussian_state_space', 'arx', 'regime_switch')."
+        )
     return settings
 
 
-def _ensure_dataset(
-    config: Dict[str, Any], data_tag: str, a: float, m: int
+def _ensure_dataset_state_space(
+    config: Dict[str, Any], data_tag: str, B_y: float, m: int
 ) -> None:
-    """Build a Gaussian sweep dataset cell if not already cached (opt-in).
+    """Build a G1 sweep dataset cell if not already cached (opt-in).
 
     Args:
         config: The parsed config (copied before override).
         data_tag: Cache tag for this cell.
-        a: Transfer coefficient.
+        B_y: Single-scalar coupling broadcast over ``data["delays"]``.
         m: Number of informative channels.
     """
     cfg = deepcopy(config)
-    bd._apply_overrides(cfg, {"tag": data_tag, "a": a, "m": m})
+    bd._apply_overrides(cfg, {"tag": data_tag, "m": m})
+    n_osc = len(cfg["data"].get("delays", [])) or 1
+    cfg["data"]["B_y"] = [float(B_y)] * n_osc
     bd.build_dataset(cfg, force=False)
 
 
-def _ensure_dataset_xor(
-    config: Dict[str, Any], data_tag: str, q: float, m: int
+def _ensure_dataset_arx(
+    config: Dict[str, Any], data_tag: str, c: float, m: int
 ) -> None:
-    """Build an XOR sweep dataset cell if not already cached (opt-in).
+    """Build a G2 sweep dataset cell if not already cached (opt-in).
 
     Args:
         config: The parsed config (copied before override).
         data_tag: Cache tag for this cell.
-        q: Bit-flip probability.
+        c: ARX coupling.
         m: Number of informative channels.
     """
     cfg = deepcopy(config)
-    bd._apply_overrides(cfg, {"tag": data_tag, "q": q, "m": m})
+    bd._apply_overrides(cfg, {"tag": data_tag, "m": m})
+    cfg["data"]["c"] = float(c)
+    bd.build_dataset(cfg, force=False)
+
+
+def _ensure_dataset_regime_switch(
+    config: Dict[str, Any], data_tag: str, p_switch: float, m: int
+) -> None:
+    """Build a G3 sweep dataset cell if not already cached (opt-in).
+
+    Args:
+        config: The parsed config (copied before override).
+        data_tag: Cache tag for this cell.
+        p_switch: Regime-change probability.
+        m: Number of informative channels.
+    """
+    cfg = deepcopy(config)
+    bd._apply_overrides(cfg, {"tag": data_tag, "m": m})
+    cfg["data"]["p_switch"] = float(p_switch)
     bd.build_dataset(cfg, force=False)
 
 
 def _ensure_dataset_simple(config: Dict[str, Any], data_tag: str) -> None:
-    """Build a knob-free dataset (e.g. the two-lag E cell) if not cached.
+    """Build a knob-free dataset (e.g. the G1-rev directionality cell) if not cached.
 
     Args:
         config: The parsed config (copied before override).
@@ -891,21 +1086,27 @@ def _make_plots(
     te = np.array([r["te_true"] for r in rows], dtype=float)
     kbar = np.array([r["k_bar"] for r in rows], dtype=float)
     pred_gap = np.array([r["pred_gap"] for r in rows], dtype=float)
-    a_vals = np.array(
-        [float(r["a"]) if r.get("a") is not None else np.nan for r in rows],
-        dtype=float,
+    # Plot 2 sweeps whichever v2 knob the active benchmark actually varied
+    # (B_y for G1, c for G2, p_switch for G3). Each row carries exactly one
+    # of these as a non-None value.
+    knob_candidates = (
+        ("B_y", "coupling $B_y$"),
+        ("c", "ARX coupling $c$"),
+        ("p_switch", "switch probability $p$"),
     )
-    q_vals = np.array(
-        [float(r["q"]) if r.get("q") is not None else np.nan for r in rows],
-        dtype=float,
-    )
-    # Plot 2 sweeps whichever knob the active benchmark actually varied.
-    if np.isfinite(a_vals).any():
-        knob_vals, knob_name = a_vals, "a"
-    elif np.isfinite(q_vals).any():
-        knob_vals, knob_name = q_vals, "q"
-    else:
-        knob_vals, knob_name = a_vals, "a"
+    knob_name = "B_y"
+    knob_label = "coupling $B_y$"
+    knob_vals = np.full(len(rows), np.nan, dtype=float)
+    for field, label in knob_candidates:
+        vals = np.array(
+            [float(r[field]) if r.get(field) is not None else np.nan
+             for r in rows], dtype=float,
+        )
+        if np.isfinite(vals).any():
+            knob_name = field
+            knob_label = label
+            knob_vals = vals
+            break
     m_vals = np.array(
         [int(r["M"]) if r["M"] is not None else -1 for r in rows], dtype=int
     )
@@ -941,13 +1142,11 @@ def _make_plots(
     ps.save_figure(fig, out_dir / "kbar_vs_te")
 
     # --- Plot 2: K_bar vs the swept knob (one series per M) ---------------
-    knob_label = (
-        "transfer coefficient $a$" if knob_name == "a"
-        else "bit-flip probability $q$"
-    )
     fig, ax = plt.subplots(figsize=(6.4, 5.0))
     for idx, m in enumerate(m_levels):
         sel = m_vals == m
+        if not np.isfinite(knob_vals[sel]).any():
+            continue
         order = np.argsort(knob_vals[sel])
         ax.plot(
             knob_vals[sel][order], kbar[sel][order],
@@ -959,6 +1158,7 @@ def _make_plots(
     ax.legend()
     ps.style_axes(ax)
     fig.tight_layout()
+    # Filesystem-safe knob slug for the filename (B_y -> B_y, p_switch -> p_switch).
     ps.save_figure(fig, out_dir / f"kbar_vs_{knob_name}")
 
     # --- Plot 3: predictive gain vs K_bar ---------------------------------
@@ -1188,7 +1388,8 @@ def _print_metrics(metrics: Dict[str, Any], n: int) -> None:
         f"\n[metrics] {n} setting(s) evaluated\n"
         f"  Metric 1 (null)        : E_0={m1['E_0']:.5f}  "
         f"null/signal ratio={m1['null_signal_ratio']:.4f}  "
-        f"K_shuffled(mean)={m1['k_bar_shuffled_mean']:.5f}\n"
+        f"K_shuffled(mean)={m1['k_bar_shuffled_mean']:.5f}  "
+        f"K_reversed(mean)={m1.get('k_bar_reversed_mean', float('nan')):.5f}\n"
         f"  Metric 2 (Spearman rho): {metrics['metric2_spearman']:.4f}\n"
         f"  Metric 3 (calibration) : alpha={m3['alpha']:.5f}  "
         f"gamma={m3['gamma']:.5f}  R^2={m3['r2']:.4f}\n"
@@ -1245,32 +1446,42 @@ def run_sweep(
     rows: List[Dict[str, Any]] = []
     skipped: List[str] = []
     for setting in settings:
-        kind = str(setting.get("kind", "gaussian"))
+        kind = str(setting.get("kind", ""))
         m = setting["M"]
-        if kind == "xor":
-            q = setting["q"]
-            data_tag, run_tag = _setting_tags_xor(benchmark, q, m)
-            label = f"q={q:g}, M={m}"
-        elif kind == "two_lag":
-            data_tag = str(config["experiment"]["tag"])
-            run_tag = "sweep_two_lag"
-            label = f"two-lag, M={m}"
-        else:  # gaussian
-            a = setting["a"]
-            data_tag, run_tag = _setting_tags(benchmark, a, m)
-            label = f"a={a:g}, M={m}"
+        # Each v2 sweep cell carries a single named knob; the dispatch picks
+        # the matching tag + ensure-dataset helper.
+        if kind == "gaussian_state_space":
+            value = float(setting["B_y"])
+            data_tag, run_tag = _setting_tags_knob(benchmark, "By", value, m)
+            label = f"B_y={value:g}, M={m}"
+            ensure_dataset = lambda: _ensure_dataset_state_space(
+                config, data_tag, value, m
+            )
+        elif kind == "arx":
+            value = float(setting["c"])
+            data_tag, run_tag = _setting_tags_knob(benchmark, "c", value, m)
+            label = f"c={value:g}, M={m}"
+            ensure_dataset = lambda: _ensure_dataset_arx(
+                config, data_tag, value, m
+            )
+        elif kind == "regime_switch":
+            value = float(setting["p_switch"])
+            data_tag, run_tag = _setting_tags_knob(benchmark, "p", value, m)
+            label = f"p={value:g}, M={m}"
+            ensure_dataset = lambda: _ensure_dataset_regime_switch(
+                config, data_tag, value, m
+            )
+        else:
+            print(f"  [skip ] unknown sweep kind {kind!r}")
+            skipped.append(f"unknown_{kind}")
+            continue
         cache_dir = data_root / benchmark / data_tag
         ckpt_path = results_root / benchmark / run_tag / "final.ckpt"
 
         if not (cache_dir / "test.npz").is_file():
             if build_missing:
                 print(f"  [build] {data_tag}  ({label})")
-                if kind == "xor":
-                    _ensure_dataset_xor(config, data_tag, q, m)
-                elif kind == "two_lag":
-                    _ensure_dataset_simple(config, data_tag)
-                else:
-                    _ensure_dataset(config, data_tag, a, m)
+                ensure_dataset()
             else:
                 print(
                     f"  [skip ] {run_tag}: dataset '{data_tag}' not cached "
@@ -1281,9 +1492,6 @@ def run_sweep(
 
         if not ckpt_path.is_file():
             if train_missing:
-                # ``label`` is kind-aware (a= / q= / two-lag); ``a`` is only
-                # bound on the Gaussian branch, so a non-Gaussian sweep would
-                # otherwise NameError here.
                 print(f"  [train] {run_tag}  ({label})")
                 _ensure_checkpoint(config, data_tag, run_tag)
             else:
@@ -1332,138 +1540,6 @@ def run_sweep(
         "metrics": metrics,
         "out_dir": str(out_dir),
         "skipped": skipped,
-    }
-
-
-# =============================================================================
-# Benchmark-B rho-null diagnostic (task 7.1)
-# =============================================================================
-
-def run_rho_null_check(
-    config: Dict[str, Any],
-    *,
-    build_missing: bool = False,
-    train_missing: bool = False,
-    device: Optional[torch.device] = None,
-) -> Dict[str, Any]:
-    r"""Benchmark-B headline test: $\bar K \approx 0$ at $a=0$ for every $\rho$.
-
-    Benchmark B's AR target carries strong self-predictability. The residual
-    bottleneck should absorb that target self-information into the baseline
-    branch, leaving $\bar K \approx 0$ when there is no source transfer
-    ($a=0$) -- *even for a highly autocorrelated target*. This routine builds
-    (opt-in) one zero-transfer B dataset per $\rho$ in ``rho_null.rho_grid``,
-    trains (opt-in) a model on each, evaluates $\bar K$ and checks that it stays
-    small across the whole $\rho$ range.
-
-    Args:
-        config: The parsed config (must have a ``rho_null`` block -- only
-            Benchmark B defines one).
-        build_missing: If True, generate any missing $\rho$-null dataset.
-        train_missing: If True, train any missing $\rho$-null checkpoint.
-        device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
-
-    Returns:
-        A results dict: ``rows``, ``out_dir``, ``skipped``, ``verdict``.
-
-    Raises:
-        ValueError: If the config carries no ``rho_null.rho_grid``.
-    """
-    benchmark = str(config["experiment"]["benchmark"])
-    device = device or tm.resolve_device(config["runtime"])
-    rho_grid = list((config.get("rho_null", {}) or {}).get("rho_grid", []))
-    if not rho_grid:
-        raise ValueError(
-            "run_rho_null_check: config has no rho_null.rho_grid -- only "
-            "Benchmark B defines one (set experiment.benchmark: B)."
-        )
-
-    out_dir = _results_root(config) / benchmark / "rho_null"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    data_root = _data_root(config)
-    results_root = _results_root(config)
-    print(
-        f"[rho_null] benchmark {benchmark}: {len(rho_grid)} rho value(s) at "
-        f"a=0  build_missing={build_missing}  train_missing={train_missing}"
-    )
-
-    rows: List[Dict[str, Any]] = []
-    skipped: List[str] = []
-    for rho in rho_grid:
-        token = f"r{float(rho):g}".replace(".", "p").replace("-", "m")
-        data_tag = f"benchmark_{benchmark}_rho_null_{token}"
-        run_tag = f"rho_null/{token}"
-        cache_dir = data_root / benchmark / data_tag
-        ckpt_path = results_root / benchmark / run_tag / "final.ckpt"
-
-        if not (cache_dir / "test.npz").is_file():
-            if build_missing:
-                print(f"  [build] {data_tag}  (a=0, rho={rho:g})")
-                cfg = deepcopy(config)
-                bd._apply_overrides(
-                    cfg, {"tag": data_tag, "a": 0.0, "rho": float(rho)}
-                )
-                bd.build_dataset(cfg, force=False)
-            else:
-                print(f"  [skip ] {run_tag}: dataset '{data_tag}' not cached "
-                      f"(pass --build-missing to generate it)")
-                skipped.append(run_tag)
-                continue
-
-        if not ckpt_path.is_file():
-            if train_missing:
-                print(f"  [train] {run_tag}  (a=0, rho={rho:g})")
-                cfg = deepcopy(config)
-                tm.train(cfg, overrides={
-                    "data_tag": data_tag, "run_tag": run_tag, "a": 0.0,
-                })
-            else:
-                print(f"  [skip ] {run_tag}: checkpoint not found ({ckpt_path}) "
-                      f"(pass --train-missing to train it)")
-                skipped.append(run_tag)
-                continue
-
-        try:
-            row = evaluate_checkpoint(
-                ckpt_path, config, device=device, data_tag=data_tag
-            )
-            row["rho"] = float(rho)
-            rows.append(row)
-        except Exception as exc:  # noqa: BLE001 - one bad cell must not abort
-            print(f"  [error] {run_tag}: {type(exc).__name__}: {exc}")
-            skipped.append(run_tag)
-
-    kbars = np.array([r["k_bar"] for r in rows], dtype=float)
-    max_abs_kbar = float(np.nanmax(np.abs(kbars))) if kbars.size else float("nan")
-    verdict = {
-        "n_rho": len(rows),
-        "max_abs_k_bar": max_abs_kbar,
-        # All rho cells have a=0 -> te_true=0; a faithful surrogate keeps K
-        # small regardless of rho. 0.05 nats mirrors the model_validation null
-        # threshold (a heuristic gate -- see plan Section 8 / Decision D8).
-        "verdict_no_leakage": (
-            bool(max_abs_kbar < 0.05) if np.isfinite(max_abs_kbar) else None
-        ),
-    }
-    write_summary_csv(rows, out_dir / "summary.csv")
-    with open(out_dir / "rho_null.json", "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "created": datetime.now(timezone.utc).isoformat(),
-                "verdict": verdict,
-                "rows": [{k: r.get(k) for k in _SUMMARY_FIELDS} for r in rows],
-            },
-            fh, indent=2,
-        )
-    print(
-        f"[done] rho_null: {len(rows)} evaluated, {len(skipped)} skipped  "
-        f"max|K_bar|={max_abs_kbar:.5f}  "
-        f"no-leakage verdict={verdict['verdict_no_leakage']}\n"
-        f"       artifacts -> {out_dir}"
-    )
-    return {
-        "rows": rows, "out_dir": str(out_dir),
-        "skipped": skipped, "verdict": verdict,
     }
 
 
@@ -1554,16 +1630,8 @@ def _dispatch(
             device=device,
         )
 
-    if mode == "rho_null":
-        return run_rho_null_check(
-            config,
-            build_missing=bool(overrides.get("build_missing")),
-            train_missing=bool(overrides.get("train_missing")),
-            device=device,
-        )
-
     raise ValueError(
-        f"unknown mode: {mode!r} (expected 'single', 'sweep' or 'rho_null')."
+        f"unknown mode: {mode!r} (expected 'single' or 'sweep')."
     )
 
 
@@ -1592,9 +1660,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--mode", type=str, default=None,
-        choices=["single", "sweep", "rho_null"],
-        help="single-checkpoint evaluation, full sweep aggregation, or the "
-             "Benchmark-B rho-null diagnostic",
+        choices=["single", "sweep"],
+        help="single-checkpoint evaluation or full v2 sweep aggregation",
     )
     p.add_argument(
         "--checkpoint", type=str, default=None,
@@ -1663,10 +1730,10 @@ if __name__ == "__main__":
     CONFIG_PATH = _DEFAULT_CONFIG
 
     RUN_CONFIG = {
-        "mode": "single",                   # "single" | "sweep" | "rho_null"
+        "mode": "single",                   # "single" | "sweep"
         # single mode: which checkpoint to evaluate.
         "checkpoint": str(
-            _EXPERIMENT_DIR / "results" / "A" / "pol_easy_a1" / "final.ckpt"
+            _EXPERIMENT_DIR / "results" / "G1" / "G1_baseline" / "final.ckpt"
         ),
         "data_tag": None,                   # None -> the checkpoint's own tag
         "benchmark": None,                  # None -> config experiment.benchmark

@@ -3,7 +3,7 @@ r"""Lag-recovery metrics -- does the model find the true source lag (Phase 5).
 Loads a trained :class:`SeqVaeLagAttnV1` checkpoint and quantifies whether the
 model localises transfer to the true source-lag band
 $\mathcal{L}^\star = \{D-H,\dots,D-1\}$, using three complementary measures
-(``synthetic_te_validation_plan.md`` Phase 5):
+(``model_validation_v2_plan.md`` Sprint 4):
 
     Task 5.2 -- attention lag-mass: the fraction of the ``te_lag_map`` mass
         $\widetilde{\mathrm{TE}}_{t,\ell} = K_t\,\bar\alpha_{t,\ell}$ that lands
@@ -11,39 +11,43 @@ $\mathcal{L}^\star = \{D-H,\dots,D-1\}$, using three complementary measures
         baseline $|\mathcal{L}^\star| / (L_{\max} + 1)$.
     Task 5.3 -- peak-lag error: the per-anchor $\arg\max_\ell$ of the lag map
         versus the band centre, plus the in-band fraction.
-    Task 5.4 -- input-level leave-one-lag-out (faithful LOLO, Decision D5): the
-        recurrent ``SourceEncoder`` makes internal lag-memory masking
-        non-causal, so ablation corrupts the **raw source input**. Benchmark A
-        is i.i.d. white noise, so future step $\tau$'s target depends on
-        exactly one source lag $\ell = D-1-\tau$ -- corrupting the whole source
-        and decomposing the loss degradation per future step is therefore a
-        faithful per-lag LOLO. See :func:`run_lag_ablation`.
+    Sprint 4.1 -- sliding-window leave-one-lag-out (v2-D5, the faithful LOLO
+        for smooth sources): the recurrent ``SourceEncoder`` makes internal
+        lag-memory masking non-causal, so ablation corrupts the **raw source
+        input**. For each lag $\ell$ in the lag grid a contiguous window of
+        ``u_stream`` centred on $t-\ell$ across all valid anchors is replaced
+        with $\mathcal{N}(0,1)$ noise; the resulting feat-loss degradation
+        $\delta_\ell$ is the per-lag importance. The v1 i.i.d.-only LOLO (whole
+        source corruption + $\tau\to\ell$ scatter) was deleted in Sprint 4
+        because the $\tau\to\ell$ bijection breaks for autocorrelated sources.
+        See :func:`run_sliding_window_lolo`.
 
 It also surfaces the Section 4.2 finding (Task 5.5): when the delay $D$ exceeds
 the attention window $L_{\max}$, the recurrent encoder still carries the source,
 so $K$ can stay non-zero. :func:`_delay_window_report` reports this for any
 checkpoint; the dedicated large-$D$ run is deferred.
 
-For the two-lag benchmark E (Task 7.3) the harness adds the **two-band mass
-ratio** (:func:`compute_two_band_mass_ratio`): the lag map should resolve two
-separate bands whose mass ratio tracks the per-band TE ratio. The single-delay
-input-level LOLO (Task 5.4) does not generalise to two delays and is skipped
-for E.
+For two-band benchmarks (e.g. ``G1_twoband`` with two distinct delays) the
+harness adds the **two-band mass ratio** (:func:`compute_two_band_mass_ratio`):
+the lag map should resolve two separate bands whose mass ratio tracks the
+per-band TE ratio. The same two-band split is also applied to the
+sliding-window LOLO profile $A_\ell$ via :func:`compute_lag_mass_from_profile`.
 
 This module **reuses** :func:`evaluate_te.load_eval_checkpoint` /
 :func:`evaluate_te.make_test_loader` and the :mod:`train_minimal` helpers so it
 scores models with the exact model / loss code the earlier phases used.
 
-Run modes (project convention -- Decision D9 in
-``synthetic_te_validation_plan.md``): like every ``synthetic/`` runner this file
-supports **both** a CLI and an edit-and-run ``__main__``, auto-detected from
-whether any command-line argument is present.
+Run modes (project convention -- Decision D9 / V2-D8): like every
+``synthetic/`` runner this file supports **both** a CLI and an edit-and-run
+``__main__``, auto-detected from whether any command-line argument is present.
 
     * CLI mode (any ``--flag`` passed)::
 
         python -m ...synthetic.lag_recovery --checkpoint PATH [--config PATH]
             [--data-tag TAG] [--benchmark B] [--batch-size N]
-            [--n-ablation-samples N] [--device DEV] [--seed S]
+            [--mode {analyze,width_sweep}] [--widths "1,5,10,20"]
+            [--window-width N] [--n-ablation-samples N] [--device DEV]
+            [--seed S]
 
     * Edit-and-run mode (no arguments) -- edit the ``RUN_CONFIG`` dict in the
       ``__main__`` block, then run the file directly (IDE / notebook)::
@@ -85,16 +89,23 @@ _EXPERIMENT_DIR = _PKG_DIR.parent
 _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 
 # Columns of the one-row summary CSV (task 5.6). The full per-lag vectors
-# (``A_lag``, ``delta_per_tau``, lag profiles) go to ``metrics.json``. The
-# ``lag_mass_band*`` columns are populated only for the two-lag benchmark E.
+# (``A_lag``, ``delta_per_lag``, lag profiles) go to ``metrics.json``. ``B_y`` /
+# ``c`` / ``p_switch`` are the v2 benchmark-specific sweep knobs (G1 / G2 / G3)
+# matching :data:`evaluate_te._SUMMARY_FIELDS`; whichever the active benchmark
+# does not use is left blank. The ``lag_mass_band*`` columns are populated only
+# for multi-band benchmarks (e.g. ``G1_twoband``). ``window_width`` records the
+# sliding-window LOLO width chosen for this row.
 _SUMMARY_FIELDS = [
-    "run_tag", "data_tag", "benchmark", "a", "M", "delay", "horizon",
-    "te_true", "warmup", "n_test", "L", "lag_band_lo", "lag_band_hi",
+    "run_tag", "data_tag", "benchmark",
+    "B_y", "c", "p_switch", "M",
+    "delay", "horizon", "te_true", "warmup", "n_test", "L",
+    "lag_band_lo", "lag_band_hi",
     "lag_mass_attn", "lag_mass_attn_uniform", "lag_mass_attn_ratio",
     "peak_lag_err_mean", "peak_lag_err_median", "peak_in_band_frac",
-    "lag_mass_lolo", "delta_oob_max",
+    "lag_mass_lolo", "window_width", "delta_oob_max",
     "lag_mass_band1", "lag_mass_band2", "lag_mass_ratio",
     "lag_mass_te_ratio", "lag_mass_ratio_err",
+    "lag_mass_lolo_band1", "lag_mass_lolo_band2",
     "k_bar", "epoch", "ckpt_path",
 ]
 
@@ -115,9 +126,7 @@ def _lag_out_dir(config: Dict[str, Any], benchmark: str) -> Path:
         the lag-recovery artifacts separate from ``eval_te`` and per-run
         training directories.
     """
-    results_root = (
-        _EXPERIMENT_DIR / str(config["paths"]["results_dir"])
-    ).resolve()
+    results_root = tm.resolve_user_path(config["paths"]["results_dir"])
     out_dir = results_root / str(benchmark) / "lag_recovery"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
@@ -608,48 +617,91 @@ def _crosscheck_per_tau(
     return worst
 
 
-_LOLO_NOTE = (
-    "For Benchmark A the source is i.i.d. white noise, so each future step's "
-    "target depends on exactly one source lag (ell = D-1-tau, which ranges "
-    "over the true band {D-H,...,D-1} as tau spans [0,H)). All transferable "
-    "information is in-band by construction, so LagMass_LOLO is ~1.0 whenever "
-    "the model uses the source at all (or NaN on a collapsed latent). The "
-    "discriminating LOLO signal for Benchmark A is the within-band shape of "
-    "A_lag / delta_per_tau, not the scalar LagMass_LOLO; the scalar becomes a "
-    "real discriminator only for autocorrelated or multi-lag source benchmarks."
-)
+def compute_lag_mass_from_profile(
+    profile: Sequence[float],
+    *,
+    lag_band: Sequence[int],
+) -> Dict[str, Any]:
+    r"""Normalise a per-lag importance vector and read off its in-band mass.
 
+    Used by the sliding-window LOLO (whose raw $\delta_\ell$ is on the same
+    lag axis as $\bar\alpha_\ell$) and by the two-band wiring of Sprint 4.5
+    (separate per-band masses on a shared denominator).
 
-def _skipped_ablation_stub(reason: str) -> Dict[str, Any]:
-    """Return a :func:`run_lag_ablation`-shaped stub for a skipped LOLO pass.
+    Steps: positive-clip the profile, divide by the total positive mass, sum
+    the entries inside ``lag_band``. The non-clip step is the same convention
+    as the v1 LOLO -- negative degradations are not informative.
 
     Args:
-        reason: Why the LOLO ablation was skipped (recorded in the JSON).
+        profile: Raw per-lag importance, length $L_{\max}+1$. ``nan`` /
+            missing entries become 0.
+        lag_band: True source-lag indices $\mathcal{L}^\star$ (or one band of
+            a multi-band benchmark). Out-of-range entries are ignored.
 
     Returns:
-        A dict with the :func:`run_lag_ablation` keys, all numeric fields set
-        to ``nan`` and all vector fields empty.
+        Dict with ``A_lag`` (normalised, length $L_{\max}+1$), ``A_lag_raw``
+        (positive-clipped, length $L_{\max}+1$), ``total`` (denominator),
+        ``band_mass`` (raw in-band sum), ``lag_mass`` (normalised in-band
+        fraction, ``nan`` on a collapsed total).
     """
+    arr = np.asarray(profile, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0)
+    raw = np.clip(arr, 0.0, None)
+    total = float(raw.sum())
+    L = raw.size
+    band_idx = np.asarray(list(lag_band), dtype=int)
+    band_idx = band_idx[(band_idx >= 0) & (band_idx < L)]
+    band_mass = float(raw[band_idx].sum()) if band_idx.size else 0.0
+    if total < 1e-12:
+        norm = np.full(L, np.nan)
+        lag_mass = float("nan")
+    else:
+        norm = raw / total
+        lag_mass = float(norm[band_idx].sum()) if band_idx.size else 0.0
     return {
-        "delta_per_tau": [],
-        "delta_per_tau_informative": [],
-        "lag_of_tau": [],
-        "A_lag": [],
-        "A_lag_raw": [],
-        "A_overflow": float("nan"),
-        "lag_mass_lolo": float("nan"),
-        "total_delta": float("nan"),
-        "delta_oob_max": float("nan"),
-        "mse_clean": [],
-        "mse_corrupt": [],
-        "n_ablation_batches": None,
-        "crosscheck_rel_err": float("nan"),
-        "lag_mass_lolo_note": reason,
+        "A_lag": norm.tolist(),
+        "A_lag_raw": raw.tolist(),
+        "total": total,
+        "band_mass": band_mass,
+        "lag_mass": lag_mass,
     }
 
 
+def _resolve_lag_grid(
+    max_lag: int,
+    *,
+    lag_band: Sequence[int],
+    coarse_step: int = 5,
+    fine_step: int = 1,
+) -> List[int]:
+    r"""Build the default lag grid for the sliding-window LOLO.
+
+    Coarse-spaced over $[0, L_{\max}]$ for cost (every ``coarse_step`` lags)
+    plus a refined stride inside the true band so the in-band shape is fully
+    resolved. The lag ``0`` is always present (zero-offset sanity), as is
+    ``max_lag`` (window edge).
+
+    Args:
+        max_lag: Maximum attention lag.
+        lag_band: True lag band indices to refine over.
+        coarse_step: Coarse stride.
+        fine_step: Fine stride inside ``lag_band``.
+
+    Returns:
+        Sorted unique list of lag indices in $[0, L_{\max}]$.
+    """
+    coarse = list(range(0, max_lag + 1, max(1, int(coarse_step))))
+    if max_lag not in coarse:
+        coarse.append(int(max_lag))
+    band = [int(ell) for ell in lag_band if 0 <= int(ell) <= max_lag]
+    if band:
+        lo, hi = min(band), max(band)
+        coarse.extend(range(lo, hi + 1, max(1, int(fine_step))))
+    return sorted(set(coarse))
+
+
 @torch.no_grad()
-def run_lag_ablation(
+def run_sliding_window_lolo(
     model: SeqVaeLagAttnV1,
     loader: Any,
     device: torch.device,
@@ -661,131 +713,182 @@ def run_lag_ablation(
     lambda_full: float,
     lambda_base: float,
     batch_size: int,
+    window_width: int = 10,
+    lag_grid: Optional[Sequence[int]] = None,
     n_ablation_samples: Optional[int] = None,
     do_oob_probe: bool = True,
     seed: int = 0,
+    coarse_step: int = 5,
+    fine_step: int = 1,
 ) -> Dict[str, Any]:
-    r"""Faithful input-level leave-one-lag-out ablation (task 5.4, Decision D5).
+    r"""Sliding-window leave-one-lag-out ablation (Sprint 4.1, V2-D5).
 
-    Corrupts the whole raw source with $\mathcal N(0, 1)$ noise and decomposes
-    the per-future-step loss degradation $\delta(\tau) = \mathrm{MSE}_{\rm
-    corrupt}(\tau) - \mathrm{MSE}_{\rm clean}(\tau)$. Because future step
-    $\tau$'s target depends only on source lag $\ell = D-1-\tau$ (white-noise
-    DGP), $[\delta(\tau)]_+$ scattered by $\ell$ yields the per-lag importance
-    $A_\ell$; lags off the attention axis accumulate into ``A_overflow`` (the
-    large-$D$ safety valve). An optional out-of-band probe corrupts the source
-    window $[T-D, T)$ -- which no scored future step depends on -- and should
-    leave the loss unchanged.
+    For each lag $\ell$ in ``lag_grid``, replaces the source slice
+    $[t_{\min}-\ell-w/2,\;t_{\max}-\ell+w/2)$ of ``u_stream`` with
+    $\mathcal{N}(0,1)$ noise and measures the resulting per-anchor feat-loss
+    degradation $\delta_\ell = \sum_\tau (\mathrm{MSE}_{\rm corrupt}(\tau) -
+    \mathrm{MSE}_{\rm clean}(\tau))$. The window is the union of per-anchor
+    width-$w$ windows centred on $t-\ell$ across the valid anchor range
+    $[t_{\min}, t_{\max})$, which is one contiguous block -- so the routine
+    needs **one forward pass per $\ell$**, not per anchor (cheap implementation
+    per Sprint 4 decision 1).
+
+    The reparameterisation RNG is paired between clean and corrupt passes so
+    $\delta_\ell$ reflects the source perturbation, not sampling noise.
 
     Args:
-        model: The trained model.
+        model: The trained model (``eval`` mode).
         loader: A test :class:`DataLoader`.
         device: Compute device.
         meta: The dataset ``meta.json`` (carries ``delay``, ``horizon``,
-            ``true_lag_band``, ``informative_channels``, ``sequence_length``).
+            ``true_lag_band``, ``informative_channels``, ``sequence_length``,
+            ``clean_anchor_range``).
         warmup: Leading anchors excluded from the loss.
         max_lag: Maximum attention lag.
-        beta: KL weight (cross-check only).
+        beta: KL weight (forwarded to the correctness cross-check only).
         lambda_full: Full-forecast loss weight (cross-check only).
         lambda_base: Baseline-forecast loss weight (cross-check only).
-        batch_size: Loader batch size (to map ``n_ablation_samples`` to a
-            batch cap).
+        batch_size: Loader batch size (maps ``n_ablation_samples`` to a batch
+            cap).
+        window_width: Width $w$ of the corruption window centred on each
+            anchor's source-lag $t-\ell$. Default 10 (typical autocorrelation
+            scale $1/(1-\rho_u) \approx 20$--$200$ for v2 sources).
+        lag_grid: Lag indices to probe. ``None`` -> :func:`_resolve_lag_grid`
+            (coarse stride + fine stride inside the true band).
         n_ablation_samples: Optional cap on the samples used per pass.
-        do_oob_probe: Whether to run the out-of-band sanity pass.
+        do_oob_probe: Whether to run the out-of-band sanity pass (corrupt the
+            tail ``[T-w, T)`` -- no scored anchor depends on it).
         seed: Base seed for the corruption / reparam RNGs.
+        coarse_step: Coarse-stride for the default lag grid.
+        fine_step: Fine-stride inside the true band for the default lag grid.
 
     Returns:
-        Dict with ``delta_per_tau`` / ``delta_per_tau_informative``,
-        ``lag_of_tau``, ``A_lag`` (normalised) / ``A_lag_raw``, ``A_overflow``,
-        ``lag_mass_lolo``, ``total_delta``, ``delta_oob_max``, ``mse_clean`` /
-        ``mse_corrupt``, ``crosscheck_rel_err`` and ``lag_mass_lolo_note``.
+        Dict with:
+
+        * ``A_lag``      -- normalised $A_\ell$, length $L_{\max}+1$
+                            (off-grid lags are 0 before normalisation).
+        * ``A_lag_raw``  -- positive-clipped $[\delta_\ell]_+$ on the same axis.
+        * ``A_overflow`` -- mass that landed outside $[0, L_{\max}]$ during
+                            grid scattering (always 0 here since the grid is
+                            in-range; kept for downstream compatibility).
+        * ``lag_grid``        -- the lag indices that were probed.
+        * ``delta_per_lag``    -- raw $\delta_\ell$ on the lag grid (length
+                                  ``len(lag_grid)``).
+        * ``mse_per_lag``      -- per-$\ell$ horizon-summed corrupt MSE
+                                  (length ``len(lag_grid)``).
+        * ``mse_clean_total``  -- horizon-summed clean MSE (scalar).
+        * ``mse_clean_per_tau`` -- per-horizon clean MSE (length $H$).
+        * ``window_width``     -- $w$ used.
+        * ``window_per_lag``   -- the $(lo, hi)$ window tuple per probed lag.
+        * ``lag_mass_lolo``    -- in-band fraction of $A_\ell$
+                                  (``nan`` if total collapses).
+        * ``total_delta``      -- $\sum_\ell [\delta_\ell]_+$.
+        * ``delta_oob_max``    -- max $|\delta|$ over the OOB probe (``nan``
+                                  if ``do_oob_probe=False``).
+        * ``n_ablation_batches`` -- batch cap actually applied.
+        * ``crosscheck_rel_err`` -- worst per-tau-MSE vs ``feat_loss`` error.
     """
-    D = int(meta["delay"])
     H = int(meta["horizon"])
     T = int(meta["sequence_length"])
-    informative = meta.get("informative_channels")
     lag_band = np.asarray(list(meta["true_lag_band"]), dtype=int)
+    clean_range = meta.get("clean_anchor_range", [warmup, T - H])
+    t_lo = int(clean_range[0])
+    t_hi = int(clean_range[1])
+    if t_hi <= t_lo:
+        t_lo, t_hi = int(warmup), int(T - H)
 
     max_batches: Optional[int] = None
     if n_ablation_samples is not None and batch_size > 0:
         max_batches = max(1, math.ceil(int(n_ablation_samples) / batch_size))
 
-    # --- correctness gate: per-tau wiring must match compute_loss ------------
+    if lag_grid is None:
+        grid = _resolve_lag_grid(
+            max_lag, lag_band=lag_band.tolist(),
+            coarse_step=coarse_step, fine_step=fine_step,
+        )
+    else:
+        grid = sorted({int(ell) for ell in lag_grid if 0 <= int(ell) <= max_lag})
+    if not grid:
+        raise ValueError(
+            f"run_sliding_window_lolo: empty lag_grid (max_lag={max_lag})."
+        )
+
+    # --- correctness gate ----------------------------------------------------
     crosscheck = _crosscheck_per_tau(
         model, loader, device, warmup=warmup,
         beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
     )
 
-    # --- clean / whole-source-corrupt passes (paired reparam draws) ----------
+    # --- clean baseline ------------------------------------------------------
     mse_clean = _per_tau_mse(
         model, loader, device, warmup=warmup, horizon=H,
         corrupt=None, seed=seed, max_batches=max_batches,
     )
-    mse_corrupt = _per_tau_mse(
-        model, loader, device, warmup=warmup, horizon=H,
-        corrupt="all", seed=seed, max_batches=max_batches,
+    mse_clean_total = float(np.nansum(mse_clean))
+
+    # --- per-lag corruption window: union of per-anchor windows --------------
+    w = int(max(1, window_width))
+    half_lo = w // 2
+    half_hi = w - half_lo
+    delta_per_lag: List[float] = []
+    mse_per_lag: List[float] = []
+    window_per_lag: List[Tuple[int, int]] = []
+    A_raw = np.zeros(max_lag + 1, dtype=float)
+
+    for ell in grid:
+        lo = max(0, t_lo - int(ell) - half_lo)
+        hi = min(T, t_hi - int(ell) + half_hi)
+        if hi <= lo:
+            window_per_lag.append((lo, lo))
+            delta_per_lag.append(0.0)
+            mse_per_lag.append(mse_clean_total)
+            continue
+        mse_corrupt = _per_tau_mse(
+            model, loader, device, warmup=warmup, horizon=H,
+            corrupt=(lo, hi), seed=seed, max_batches=max_batches,
+        )
+        mse_corrupt_total = float(np.nansum(mse_corrupt))
+        d_ell = mse_corrupt_total - mse_clean_total
+        window_per_lag.append((lo, hi))
+        delta_per_lag.append(d_ell)
+        mse_per_lag.append(mse_corrupt_total)
+        A_raw[int(ell)] = max(0.0, d_ell)
+
+    profile = compute_lag_mass_from_profile(
+        A_raw.tolist(), lag_band=lag_band.tolist(),
     )
-    delta = mse_corrupt - mse_clean                    # (H,)
 
-    # Informative-channel variant (feat_loss restricted to the M signal
-    # channels -- compute_loss never exposes this; channel dilution cancels in
-    # the normalised A_ell either way).
-    mse_clean_inf = _per_tau_mse(
-        model, loader, device, warmup=warmup, horizon=H,
-        channels=informative, corrupt=None, seed=seed, max_batches=max_batches,
-    )
-    mse_corrupt_inf = _per_tau_mse(
-        model, loader, device, warmup=warmup, horizon=H,
-        channels=informative, corrupt="all", seed=seed,
-        max_batches=max_batches,
-    )
-    delta_inf = mse_corrupt_inf - mse_clean_inf
-
-    # --- scatter delta(tau) into per-lag importance A_ell --------------------
-    lag_of_tau = D - 1 - np.arange(H)                  # (H,)
-    dpos = np.clip(delta, 0.0, None)
-    A = np.zeros(max_lag + 1, dtype=float)
-    A_overflow = 0.0
-    for tau in range(H):
-        ell = int(lag_of_tau[tau])
-        if 0 <= ell <= max_lag:
-            A[ell] += float(dpos[tau])
-        else:
-            A_overflow += float(dpos[tau])
-
-    total = float(A.sum() + A_overflow)
-    if total < 1e-12:
-        A_norm = np.full(max_lag + 1, np.nan)
-        lag_mass_lolo = float("nan")
-    else:
-        A_norm = A / total
-        band_idx = lag_band[(lag_band >= 0) & (lag_band <= max_lag)]
-        lag_mass_lolo = float(A_norm[band_idx].sum())
-
-    # --- out-of-band probe: corrupt [T-D, T) -> expect delta ~ 0 -------------
+    # --- out-of-band probe: corrupt the source tail [T - w, T) ---------------
+    # Source samples in [T - w, T) lie at lag <= w - 1 relative to anchors at
+    # T - 1; for every clean anchor t < T - H this is outside [t - max_lag, t],
+    # so no scored forecast depends on it. Delta should be ~ 0.
     delta_oob_max = float("nan")
     if do_oob_probe:
-        mse_oob = _per_tau_mse(
-            model, loader, device, warmup=warmup, horizon=H,
-            corrupt=(T - D, T), seed=seed, max_batches=max_batches,
-        )
-        delta_oob_max = float(np.nanmax(np.abs(mse_oob - mse_clean)))
+        oob_lo, oob_hi = max(0, T - w), T
+        if oob_hi > oob_lo:
+            mse_oob = _per_tau_mse(
+                model, loader, device, warmup=warmup, horizon=H,
+                corrupt=(oob_lo, oob_hi), seed=seed,
+                max_batches=max_batches,
+            )
+            delta_oob_max = float(np.nanmax(np.abs(mse_oob - mse_clean)))
 
     return {
-        "delta_per_tau": delta.tolist(),
-        "delta_per_tau_informative": delta_inf.tolist(),
-        "lag_of_tau": lag_of_tau.tolist(),
-        "A_lag": A_norm.tolist(),
-        "A_lag_raw": A.tolist(),
-        "A_overflow": A_overflow,
-        "lag_mass_lolo": lag_mass_lolo,
-        "total_delta": total,
+        "A_lag": profile["A_lag"],
+        "A_lag_raw": profile["A_lag_raw"],
+        "A_overflow": 0.0,
+        "lag_grid": list(grid),
+        "delta_per_lag": delta_per_lag,
+        "mse_per_lag": mse_per_lag,
+        "mse_clean_total": mse_clean_total,
+        "mse_clean_per_tau": mse_clean.tolist(),
+        "window_width": int(w),
+        "window_per_lag": [list(ww) for ww in window_per_lag],
+        "lag_mass_lolo": profile["lag_mass"],
+        "total_delta": profile["total"],
         "delta_oob_max": delta_oob_max,
-        "mse_clean": mse_clean.tolist(),
-        "mse_corrupt": mse_corrupt.tolist(),
         "n_ablation_batches": max_batches,
         "crosscheck_rel_err": crosscheck,
-        "lag_mass_lolo_note": _LOLO_NOTE,
     }
 
 
@@ -842,22 +945,33 @@ def _delay_window_report(
 def _band_spans(meta: Dict[str, Any]) -> List[Tuple[int, int]]:
     """Return the ``(lo, hi)`` span(s) of the true source-lag band(s).
 
+    Splits ``meta["true_lag_band"]`` into maximal contiguous runs of integers.
+    For a single-delay benchmark this returns one span; for the multi-delay
+    ``G1_twoband`` (Sprint 4.5) it returns two non-contiguous spans
+    automatically -- no extra metadata is required. Returns an empty list
+    when ``true_lag_band`` is empty (e.g. ``G1-rev`` directionality control).
+
     Args:
         meta: The dataset ``meta.json``.
 
     Returns:
-        A list of ``(lo, hi)`` inclusive spans -- two entries for the two-lag
-        benchmark E, one otherwise (empty if there is no causal lag band).
+        A list of inclusive ``(lo, hi)`` integer spans, one per contiguous
+        sub-band, in ascending order.
     """
-    if str(meta.get("benchmark")) == "E" and "lag_band_1" in meta:
-        spans = []
-        for key in ("lag_band_1", "lag_band_2"):
-            b = [int(x) for x in meta.get(key, [])]
-            if b:
-                spans.append((min(b), max(b)))
-        return spans
-    band = [int(x) for x in meta.get("true_lag_band", [])]
-    return [(min(band), max(band))] if band else []
+    band = sorted({int(x) for x in meta.get("true_lag_band", [])})
+    if not band:
+        return []
+    spans: List[Tuple[int, int]] = []
+    run_lo = band[0]
+    prev = run_lo
+    for x in band[1:]:
+        if x == prev + 1:
+            prev = x
+            continue
+        spans.append((run_lo, prev))
+        run_lo, prev = x, x
+    spans.append((run_lo, prev))
+    return spans
 
 
 def _make_plots(
@@ -881,7 +995,7 @@ def _make_plots(
     Args:
         collected: The :func:`collect_lag_tensors` output.
         lag_mass: The :func:`compute_lag_mass_attn` output.
-        ablation: The :func:`run_lag_ablation` output (or the E skip stub).
+        ablation: The :func:`run_sliding_window_lolo` output.
         meta: The dataset ``meta.json``.
         out_dir: Destination directory.
     """
@@ -934,37 +1048,67 @@ def _make_plots(
 
     # --- Plot 2: per-lag LOLO importance A_ell ----------------------------
     A = np.asarray(ablation.get("A_lag", []), dtype=float)
+    w = int(ablation.get("window_width", 0) or 0)
     fig, ax = plt.subplots(figsize=(7.4, 4.6))
-    if A.size == 0:
+    if A.size == 0 or not np.isfinite(np.nansum(A)):
         ax.text(
-            0.5, 0.5, "LOLO skipped (benchmark E:\nsingle-$D$ decomposition "
-            "does not generalise)", ha="center", va="center",
+            0.5, 0.5, "sliding-window LOLO collapsed\n"
+            "(total positive delta < 1e-12)",
+            ha="center", va="center",
             transform=ax.transAxes, fontsize=ps.FONT_LEGEND,
             color=ps.COLOR_GRAY,
         )
-        ax.set_title("input-level LOLO per-lag importance")
+        ax.set_title("sliding-window LOLO per-lag importance")
     else:
         lag_axis = np.arange(A.size)
-        in_band = np.zeros(A.size, dtype=bool)
-        for lo, hi in spans:
-            in_band |= (lag_axis >= lo) & (lag_axis <= hi)
-        colours = [ps.COLOR_VERMILLION if in_band[ell] else ps.COLOR_BLUE
-                   for ell in lag_axis]
+        # Sprint 4.6: colour bars by band (one colour per span, +1 for
+        # out-of-band) so two-band runs read off both bands at a glance.
+        band_of_ell = np.full(A.size, -1, dtype=int)
+        for i, (lo, hi) in enumerate(spans):
+            in_i = (lag_axis >= lo) & (lag_axis <= hi)
+            band_of_ell[in_i] = i
+        band_colours = (
+            ps.COLOR_VERMILLION,
+            ps.COLOR_GREEN,
+            ps.COLOR_PURPLE,
+            ps.COLOR_SAGE,
+        )
+        colours = [
+            band_colours[band_of_ell[ell] % len(band_colours)]
+            if band_of_ell[ell] >= 0 else ps.COLOR_BLUE
+            for ell in lag_axis
+        ]
         ax.bar(lag_axis, np.nan_to_num(A, nan=0.0), width=1.0, color=colours)
         lm = ablation.get("lag_mass_lolo", float("nan"))
-        ax.set_title(
-            f"input-level LOLO per-lag importance "
-            f"$A_\\ell$  (LagMass$_{{\\rm LOLO}}$={lm:.3f}, "
-            f"overflow={ablation.get('A_overflow', float('nan')):.3g})"
+        title_band = (
+            "  in-band = vermillion"
+            if len(spans) <= 1
+            else f"  bands = {len(spans)} (vermillion / green)"
         )
-        ax.set_xlabel(r"source lag $\ell$  (orange = true band)")
+        ax.set_title(
+            f"sliding-window LOLO per-lag importance $A_\\ell$  "
+            f"(LagMass$_{{\\rm LOLO}}$={lm:.3f}, "
+            f"$w$={w}){title_band}"
+        )
+        ax.set_xlabel(r"source lag $\ell$")
         ax.set_ylabel(r"$A_\ell$ (normalised)")
         ax.set_xlim(-0.5, A.size - 0.5)
+        # Window-width annotation in the upper-right corner (Sprint 4.6).
+        ax.text(
+            0.99, 0.97,
+            f"window width $w$ = {w} steps\n"
+            f"|delta|$_{{\\rm OOB}}$ = "
+            f"{ablation.get('delta_oob_max', float('nan')):.3g}",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=ps.FONT_LEGEND - 1, color=ps.COLOR_GRAY,
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white",
+                  "edgecolor": ps.COLOR_LIGHT_GRAY, "alpha": 0.85},
+        )
     ps.style_axes(ax)
     fig.tight_layout()
     ps.save_figure(fig, out_dir / "lolo_abar")
 
-    # --- Plot 3: lag profile + delta(tau), aligned on the source-lag axis -
+    # --- Plot 3: lag profile (TE-map + attention) + delta_per_lag ---------
     fig, axes, _ = ps.stacked_figure([1.2, 1.0], width=8.0, hspace=0.45)
     lag_grid = np.arange(L)
     te_profile = te_tl[anchor_lo:anchor_hi, :].mean(axis=0)
@@ -989,31 +1133,90 @@ def _make_plots(
     ax.legend(handles, [h.get_label() for h in handles], loc="upper left")
 
     ax = axes[1]
-    delta = np.asarray(ablation.get("delta_per_tau", []), dtype=float)
-    lag_of_tau = np.asarray(ablation.get("lag_of_tau", []), dtype=float)
-    if delta.size == 0 or lag_of_tau.size == 0:
+    grid = np.asarray(ablation.get("lag_grid", []), dtype=float)
+    delta = np.asarray(ablation.get("delta_per_lag", []), dtype=float)
+    if grid.size == 0 or delta.size == 0:
         ax.text(
-            0.5, 0.5, "LOLO degradation skipped (benchmark E)",
+            0.5, 0.5, "sliding-window LOLO produced no per-lag deltas",
             ha="center", va="center", transform=ax.transAxes,
             fontsize=ps.FONT_LEGEND, color=ps.COLOR_GRAY,
         )
-        ax.set_title(r"LOLO degradation $\delta(\tau)$")
+        ax.set_title(r"LOLO per-lag degradation $\delta_\ell$")
     else:
         _shade(ax)
-        ax.bar(lag_of_tau, delta, width=1.0, color=ps.COLOR_ORANGE,
-               label=r"$\delta(\tau)$ at lag $D-1-\tau$")
+        ax.bar(grid, delta, width=1.0, color=ps.COLOR_ORANGE,
+               label=r"$\delta_\ell$ ($w$=" f"{w}" r")")
         ax.axhline(0.0, color=ps.COLOR_GRAY, lw=0.8)
         ax.set_title(
-            r"LOLO degradation $\delta(\tau)$ placed at lag $D-1-\tau$"
+            r"sliding-window LOLO per-lag degradation $\delta_\ell$"
         )
         ax.set_ylabel(
-            r"$\delta = \mathrm{MSE}_{\rm corrupt}-\mathrm{MSE}_{\rm clean}$"
+            r"$\delta_\ell = \sum_\tau (\mathrm{MSE}_{\rm corrupt}"
+            r"-\mathrm{MSE}_{\rm clean})$"
         )
         ax.legend(loc="upper left")
     ax.set_xlabel(r"source lag $\ell$")
     ax.set_xlim(-0.5, L - 0.5)
     ps.style_axes(ax)
     ps.save_figure(fig, out_dir / "lag_profile")
+
+    # --- Plot 4: LOLO vs attention overlay (Sprint 4.6) -------------------
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    lag_axis = np.arange(L)
+    if A.size > 0 and np.isfinite(np.nansum(A)):
+        line_lolo = ax.plot(
+            lag_axis, np.nan_to_num(A[:L], nan=0.0),
+            color=ps.COLOR_BLUE, lw=1.4,
+            label=r"$A_\ell$ (sliding-window LOLO)",
+        )
+    else:
+        line_lolo = []
+    _shade(ax)
+    ax.set_ylabel(r"$A_\ell$ (LOLO, normalised)", color=ps.COLOR_BLUE)
+    ax.tick_params(axis="y", colors=ps.COLOR_BLUE)
+    ax.set_xlim(-0.5, L - 0.5)
+    ax.set_xlabel(r"source lag $\ell$")
+
+    ax2 = ax.twinx()
+    # Normalise attention profile so the two curves share a comparable y-range
+    # (LOLO's A_ell sums to 1; alpha sums to 1 per anchor but the per-anchor
+    # mean has L-dependent scale). Z-score-free: just rescale so the lag-sum
+    # is 1, mirroring the LOLO normalisation.
+    a_norm = np.nan_to_num(a_profile, nan=0.0)
+    a_total = float(a_norm.sum())
+    if a_total > 1e-12:
+        a_norm = a_norm / a_total
+    line_attn = ax2.plot(
+        lag_axis, a_norm, color=ps.COLOR_ORANGE, lw=1.2, alpha=0.9,
+        label=r"$\bar\alpha_\ell$ (normalised attention)",
+    )
+    ax2.set_ylabel(
+        r"$\bar\alpha_\ell$ (normalised)", color=ps.COLOR_ORANGE,
+    )
+    ax2.tick_params(axis="y", colors=ps.COLOR_ORANGE)
+
+    handles = list(line_lolo) + list(line_attn)
+    if handles:
+        ax.legend(
+            handles, [h.get_label() for h in handles], loc="upper left",
+        )
+    lm = ablation.get("lag_mass_lolo", float("nan"))
+    ax.set_title(
+        r"LOLO vs attention attribution on the same lag axis"
+        f"  ($w$={w}, "
+        f"LagMass$_{{\\rm LOLO}}$={lm:.3f})"
+    )
+    ax.text(
+        0.99, 0.97,
+        f"window width $w$ = {w} steps",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=ps.FONT_LEGEND - 1, color=ps.COLOR_GRAY,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white",
+              "edgecolor": ps.COLOR_LIGHT_GRAY, "alpha": 0.85},
+    )
+    ps.style_axes(ax)
+    fig.tight_layout()
+    ps.save_figure(fig, out_dir / "lolo_vs_attn_overlay")
 
 
 # =============================================================================
@@ -1058,7 +1261,7 @@ def _print_summary(
 
     Args:
         row: The flat metrics row.
-        ablation: The :func:`run_lag_ablation` output (or the E skip stub).
+        ablation: The :func:`run_sliding_window_lolo` output.
         two_band: The :func:`compute_two_band_mass_ratio` output for the
             two-lag benchmark E, or ``None``.
     """
@@ -1071,10 +1274,10 @@ def _print_summary(
         f"  Task 5.3  peak-lag error     : mean {row['peak_lag_err_mean']:.3f}"
         f"  median {row['peak_lag_err_median']:.3f}  "
         f"in-band {row['peak_in_band_frac']:.3f}\n"
-        f"  Task 5.4  LOLO lag-mass      : {row['lag_mass_lolo']:.4f}  "
-        f"(total delta {ablation['total_delta']:.4g}, "
-        f"oob |delta| max {row['delta_oob_max']:.4g}, "
-        f"cross-check {ablation['crosscheck_rel_err']:.2e})\n"
+        f"  Sprint 4  sliding-LOLO       : LagMass_LOLO={row['lag_mass_lolo']:.4f}"
+        f"  (w={row['window_width']}, total_delta={ablation['total_delta']:.4g},"
+        f" oob |delta| max={row['delta_oob_max']:.4g},"
+        f" cross-check {ablation['crosscheck_rel_err']:.2e})\n"
         f"  Task 5.5  delay {row['delay']} vs attn window {row['L']}  "
         f"K_bar={row['k_bar']:.5f}"
     )
@@ -1170,6 +1373,9 @@ def analyze_lag_recovery(
     do_oob = bool(lr_cfg.get("do_oob_probe", True))
     ablation_seed = int(lr_cfg.get("ablation_seed", 0))
     anchor_window = str(lr_cfg.get("anchor_window", "clean")).lower()
+    window_width = int(lr_cfg.get("window_width", 10))
+    coarse_step = int(lr_cfg.get("lag_grid_step", 5))
+    fine_step = int(lr_cfg.get("fine_lag_grid_step", 1))
 
     # --- Task 5.1: attention / lag-map tensors -------------------------------
     max_attn_batches = (
@@ -1205,61 +1411,89 @@ def analyze_lag_recovery(
         te_tl[anchor_lo:anchor_hi, :], lag_band=lag_band,
     )
 
-    # --- Task 5.4 / 7.3: LOLO ablation or the two-band mass ratio ------------
+    # --- Sprint 4.1: sliding-window LOLO (replaces v1 run_lag_ablation) ------
     k_bar = tm.compute_kbar(model, test_loader, device)
-    is_two_lag = str(test_meta.get("benchmark")) == "E"
-    two_band: Optional[Dict[str, Any]] = None
-    if is_two_lag:
-        # Benchmark E -- the single-delay LOLO decomposition does not
-        # generalise to two delays (comment C27); skip it and compute the
-        # two-band attention mass ratio (task 7.3) instead.
-        ablation = _skipped_ablation_stub(
-            "LOLO skipped for benchmark E: run_lag_ablation's single-delay "
-            "lag_of_tau = D-1-tau decomposition does not generalise to two "
-            "delays. The two-band attention mass ratio (task 7.3) is the "
-            "lag-recovery metric for E."
-        )
-        two_band = compute_two_band_mass_ratio(
-            te_tl,
-            lag_band_1=[int(x) for x in test_meta["lag_band_1"]],
-            lag_band_2=[int(x) for x in test_meta["lag_band_2"]],
-            anchor_lo=anchor_lo, anchor_hi=anchor_hi, max_lag=max_lag,
-            te_true_1=float(test_meta["te_true_1"]),
-            te_true_2=float(test_meta["te_true_2"]),
-        )
-    else:
-        ablation = run_lag_ablation(
-            model, test_loader, device, meta=test_meta, warmup=warmup,
-            max_lag=max_lag, beta=beta, lambda_full=lambda_full,
-            lambda_base=lambda_base, batch_size=batch_size,
-            n_ablation_samples=n_abl, do_oob_probe=do_oob, seed=ablation_seed,
-        )
-
-    # --- Task 5.5: delay versus attention window -----------------------------
-    dwin = _delay_window_report(test_meta, max_lag, k_bar)
+    ablation = run_sliding_window_lolo(
+        model, test_loader, device, meta=test_meta, warmup=warmup,
+        max_lag=max_lag, beta=beta, lambda_full=lambda_full,
+        lambda_base=lambda_base, batch_size=batch_size,
+        window_width=window_width,
+        n_ablation_samples=n_abl, do_oob_probe=do_oob, seed=ablation_seed,
+        coarse_step=coarse_step, fine_step=fine_step,
+    )
 
     te_true = float(
         test_meta.get("te_true", data_meta.get("te_true", float("nan")))
     )
+
+    # --- Sprint 4.5: two-band wiring (multi-delay benchmarks like G1_twoband)
+    spans = _band_spans(test_meta)
+    two_band: Optional[Dict[str, Any]] = None
+    lolo_band1: Optional[Dict[str, Any]] = None
+    lolo_band2: Optional[Dict[str, Any]] = None
+    if len(spans) >= 2:
+        # Take the first two non-contiguous bands; ignore any beyond (the v2
+        # multi-delay benchmark is two-band by construction).
+        (b1_lo, b1_hi), (b2_lo, b2_hi) = spans[0], spans[1]
+        band_1 = list(range(b1_lo, b1_hi + 1))
+        band_2 = list(range(b2_lo, b2_hi + 1))
+        # Per-band TE split: prefer generator-provided ``te_true_band1`` /
+        # ``te_true_band2`` if present. The symmetric (equal-share) prior is
+        # the safe fallback -- the ``mass_ratio`` diagnostic still flags
+        # gross imbalance even when ``te_ratio = 1``.
+        te_band_1 = float(test_meta.get("te_true_band1", te_true / 2.0))
+        te_band_2 = float(test_meta.get("te_true_band2", te_true / 2.0))
+        two_band = compute_two_band_mass_ratio(
+            te_tl, lag_band_1=band_1, lag_band_2=band_2,
+            anchor_lo=anchor_lo, anchor_hi=anchor_hi, max_lag=max_lag,
+            te_true_1=te_band_1, te_true_2=te_band_2,
+        )
+        # LOLO per-band masses (shared denominator: total positive LOLO mass).
+        lolo_band1 = compute_lag_mass_from_profile(
+            ablation["A_lag_raw"], lag_band=band_1,
+        )
+        lolo_band2 = compute_lag_mass_from_profile(
+            ablation["A_lag_raw"], lag_band=band_2,
+        )
+
+    # --- Task 5.5: delay versus attention window -----------------------------
+    dwin = _delay_window_report(test_meta, max_lag, k_bar)
     run_tag = Path(ckpt_path).resolve().parent.name
+
+    # v2 sweep knobs (V2-D6 / V2-D7): G1 -> B_y, G2 -> c, G3 -> p_switch.
+    # Pull from the cache's meta; whichever the active benchmark does not use
+    # stays None. Mirrors :data:`evaluate_te._SUMMARY_FIELDS`.
+    def _meta_scalar(key: str) -> Optional[float]:
+        val = test_meta.get(key, data_meta.get(key))
+        if val is None:
+            return None
+        if isinstance(val, (list, tuple)) and len(val) == 1:
+            val = val[0]
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
 
     row: Dict[str, Any] = {
         "run_tag": run_tag,
         "data_tag": str(tag),
         "benchmark": benchmark,
-        "a": data_meta.get("a", test_meta.get("a")),
+        "B_y": _meta_scalar("B_y"),
+        "c": _meta_scalar("c"),
+        "p_switch": _meta_scalar("p_switch"),
         "M": data_meta.get("M", test_meta.get("M")),
-        # Benchmark E has no single ``delay`` -- report the larger of the two.
         "delay": int(
-            test_meta.get("delay", test_meta.get("delay2", 0))
+            test_meta.get("delay", test_meta.get("delta", test_meta.get(
+                "delay2", (test_meta.get("delays") or [0])[-1]
+            )))
         ),
         "horizon": int(test_meta["horizon"]),
         "te_true": te_true,
         "warmup": warmup,
         "n_test": int(len(test_loader.dataset)),
         "L": int(L),
-        "lag_band_lo": int(min(lag_band)),
-        "lag_band_hi": int(max(lag_band)),
+        "lag_band_lo": int(min(lag_band)) if lag_band else None,
+        "lag_band_hi": int(max(lag_band)) if lag_band else None,
         "lag_mass_attn": lag_mass["lag_mass_attn"],
         "lag_mass_attn_uniform": lag_mass["uniform_baseline"],
         "lag_mass_attn_ratio": lag_mass["ratio_to_uniform"],
@@ -1267,12 +1501,15 @@ def analyze_lag_recovery(
         "peak_lag_err_median": peak["peak_lag_err_median"],
         "peak_in_band_frac": peak["peak_in_band_frac"],
         "lag_mass_lolo": ablation["lag_mass_lolo"],
+        "window_width": ablation["window_width"],
         "delta_oob_max": ablation["delta_oob_max"],
         "lag_mass_band1": two_band["lag_mass_1"] if two_band else None,
         "lag_mass_band2": two_band["lag_mass_2"] if two_band else None,
         "lag_mass_ratio": two_band["mass_ratio"] if two_band else None,
         "lag_mass_te_ratio": two_band["te_ratio"] if two_band else None,
         "lag_mass_ratio_err": two_band["ratio_error"] if two_band else None,
+        "lag_mass_lolo_band1": lolo_band1["lag_mass"] if lolo_band1 else None,
+        "lag_mass_lolo_band2": lolo_band2["lag_mass"] if lolo_band2 else None,
         "k_bar": float(k_bar),
         "epoch": ckpt.get("epoch"),
         "ckpt_path": str(Path(ckpt_path).resolve()),
@@ -1289,11 +1526,11 @@ def analyze_lag_recovery(
         "data_tag": str(tag),
         "benchmark": benchmark,
         "ground_truth": {
-            # Benchmark E has no single ``delay``; report the larger.
-            "delay": int(test_meta.get("delay", test_meta.get("delay2", 0))),
+            "delay": row["delay"],
             "horizon": int(test_meta["horizon"]),
             "te_true": te_true,
             "true_lag_band": lag_band,
+            "lag_band_spans": [list(s) for s in spans],
             "lag_band_centre": peak["peak_lag_centre"],
             "informative_channels": test_meta.get("informative_channels"),
             "clean_anchor_range": [int(clean_range[0]), int(clean_range[1])],
@@ -1320,21 +1557,22 @@ def analyze_lag_recovery(
             "n_anchors": peak["n_anchors"],
             "peak_lag_hist": peak["peak_lag_hist"],
         },
-        "task_5_4_lolo": {
+        "sprint_4_1_sliding_lolo": {
             "lag_mass_lolo": ablation["lag_mass_lolo"],
             "total_delta": ablation["total_delta"],
             "A_overflow": ablation["A_overflow"],
             "delta_oob_max": ablation["delta_oob_max"],
             "crosscheck_rel_err": ablation["crosscheck_rel_err"],
             "n_ablation_batches": ablation["n_ablation_batches"],
-            "lag_of_tau": ablation["lag_of_tau"],
-            "delta_per_tau": ablation["delta_per_tau"],
-            "delta_per_tau_informative": ablation["delta_per_tau_informative"],
-            "mse_clean": ablation["mse_clean"],
-            "mse_corrupt": ablation["mse_corrupt"],
+            "window_width": ablation["window_width"],
+            "lag_grid": ablation["lag_grid"],
+            "delta_per_lag": ablation["delta_per_lag"],
+            "mse_per_lag": ablation["mse_per_lag"],
+            "mse_clean_total": ablation["mse_clean_total"],
+            "mse_clean_per_tau": ablation["mse_clean_per_tau"],
+            "window_per_lag": ablation["window_per_lag"],
             "A_lag": ablation["A_lag"],
             "A_lag_raw": ablation["A_lag_raw"],
-            "lag_mass_lolo_note": ablation["lag_mass_lolo_note"],
         },
         "task_5_5_delay_vs_max_lag": dwin,
         "per_anchor": {
@@ -1344,7 +1582,16 @@ def analyze_lag_recovery(
         },
     }
     if two_band is not None:
+        metrics["sprint_4_5_two_band_attn"] = two_band
+        # Backwards-compat alias for final_report.py (which reads the legacy
+        # v1 key); the new sprint-named key above is the canonical one.
         metrics["task_7_3_two_band"] = two_band
+    if lolo_band1 is not None and lolo_band2 is not None:
+        metrics["sprint_4_5_two_band_lolo"] = {
+            "band1": lolo_band1, "band2": lolo_band2,
+        }
+    # Backwards-compat alias for final_report.py's lag-mass panel.
+    metrics["task_5_4_lolo"] = metrics["sprint_4_1_sliding_lolo"]
 
     out_dir = _lag_out_dir(config, benchmark)
     write_summary_csv(row, out_dir / "summary.csv")
@@ -1353,6 +1600,291 @@ def analyze_lag_recovery(
     _print_summary(row, ablation, two_band)
     print(f"[done] lag-recovery analysis -> {out_dir}")
     return {"row": row, "metrics": metrics, "out_dir": str(out_dir)}
+
+
+# =============================================================================
+# Sprint 4.4 -- window-width sweep
+# =============================================================================
+
+def _select_window_width(
+    widths: Sequence[int], lag_masses: Sequence[float], *, frac: float = 0.95
+) -> int:
+    r"""Smallest $w$ such that ``LagMass_LOLO(w) >= frac * max(LagMass_LOLO)``.
+
+    "Smallest" = most lag-localising; "above ``frac`` of the peak" = not
+    sacrificing measurable mass. Sprint 4.4 default ``frac=0.95``.
+
+    Args:
+        widths: The width grid (must align with ``lag_masses``).
+        lag_masses: ``LagMass_LOLO`` per width. ``nan`` entries are skipped.
+        frac: Acceptance threshold relative to the peak mass.
+
+    Returns:
+        The chosen width. If every entry is ``nan``, returns ``widths[0]``.
+    """
+    arr_w = [int(w) for w in widths]
+    arr_m = [float(m) for m in lag_masses]
+    finite = [(w, m) for w, m in zip(arr_w, arr_m) if np.isfinite(m)]
+    if not finite:
+        return arr_w[0]
+    peak = max(m for _, m in finite)
+    threshold = frac * peak
+    eligible = sorted(w for w, m in finite if m >= threshold)
+    return int(eligible[0]) if eligible else int(finite[0][0])
+
+
+def sweep_window_widths(
+    ckpt_path: Any,
+    config: Dict[str, Any],
+    *,
+    widths: Sequence[int] = (1, 5, 10, 20),
+    device: Optional[torch.device] = None,
+    data_tag: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    n_ablation_samples: Optional[int] = None,
+    selection_frac: float = 0.95,
+) -> Dict[str, Any]:
+    r"""Sweep the sliding-window LOLO across ``widths`` (Sprint 4.4).
+
+    Loads the checkpoint and test loader **once**, then re-runs
+    :func:`run_sliding_window_lolo` for each $w \in$ ``widths`` -- reusing the
+    same model, loader, lag grid and clean baseline (the cost dominator).
+    Writes ``lolo_width_sweep.csv`` (one row per width: ``window_width``,
+    ``lag_mass_lolo``, ``total_delta``, ``peak_lag``, ``delta_oob_max``,
+    ``n_ablation_batches``) and ``lolo_width_sweep.pdf`` (two panels:
+    ``LagMass_LOLO`` vs $w$ with the chosen width highlighted, and the per-
+    width $A_\ell$ profiles overlaid with the true band shaded).
+
+    The chosen width is reported in the JSON summary but **not** written back
+    into ``config_synth.yaml`` -- the user inspects the plot and edits the
+    config manually (V2-D8 / plan-mode discipline).
+
+    Args:
+        ckpt_path: Path to a ``.ckpt`` written by :func:`train_minimal.train`.
+        config: The parsed ``config_synth.yaml``.
+        widths: Window-width grid.
+        device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
+        data_tag: Test-split tag. Defaults to the checkpoint's training tag.
+        batch_size: Inference batch size.
+        n_ablation_samples: Cap on samples per LOLO pass.
+        selection_frac: Threshold for :func:`_select_window_width`.
+
+    Returns:
+        Dict with ``widths``, ``per_width`` (list of result dicts, one per
+        $w$), ``lag_mass_lolo`` (list aligned with ``widths``),
+        ``chosen_width``, ``out_dir`` and ``summary_csv`` / ``summary_pdf``
+        paths.
+    """
+    widths = sorted({int(w) for w in widths if int(w) >= 1})
+    if not widths:
+        raise ValueError("sweep_window_widths: empty `widths` list.")
+
+    device = device or tm.resolve_device(config["runtime"])
+    model, ckpt = ev.load_eval_checkpoint(ckpt_path, device)
+
+    data_meta: Dict[str, Any] = ckpt.get("data_meta", {}) or {}
+    ckpt_config: Dict[str, Any] = ckpt.get("config", {}) or {}
+    ckpt_exp = ckpt_config.get("experiment", {})
+    lr_cfg: Dict[str, Any] = config.get("lag_recovery", {}) or {}
+
+    benchmark = str(ckpt_exp.get("benchmark", config["experiment"]["benchmark"]))
+    tag = data_tag or data_meta.get("tag") or ckpt_exp.get("tag")
+    if tag is None:
+        raise ValueError(
+            f"cannot resolve a test-split tag for {ckpt_path}: the checkpoint "
+            f"carries no data_meta['tag']; pass an explicit data_tag."
+        )
+    if batch_size is None:
+        batch_size = lr_cfg.get("batch_size") or int(
+            ckpt_config.get("optim", {}).get(
+                "batch_size", config["optim"]["batch_size"]
+            )
+        )
+    batch_size = int(batch_size)
+
+    test_loader, test_meta = ev.make_test_loader(
+        config, benchmark, str(tag), batch_size
+    )
+
+    loss_settings = ckpt.get("loss_settings", {}) or {}
+    beta = float(loss_settings.get("beta", config["loss"]["kld_beta"]))
+    lambda_full = float(
+        loss_settings.get("lambda_full", config["loss"]["lambda_full"])
+    )
+    lambda_base = float(
+        loss_settings.get("lambda_base", config["loss"]["lambda_base"])
+    )
+
+    warmup = int(getattr(model, "warmup_period", 0) or 0)
+    max_lag = int(getattr(model, "max_lag", 90))
+    n_abl = (
+        n_ablation_samples
+        if n_ablation_samples is not None
+        else lr_cfg.get("n_ablation_samples", 512)
+    )
+    do_oob = bool(lr_cfg.get("do_oob_probe", True))
+    ablation_seed = int(lr_cfg.get("ablation_seed", 0))
+    coarse_step = int(lr_cfg.get("lag_grid_step", 5))
+    fine_step = int(lr_cfg.get("fine_lag_grid_step", 1))
+
+    per_width: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    for w in widths:
+        result = run_sliding_window_lolo(
+            model, test_loader, device, meta=test_meta, warmup=warmup,
+            max_lag=max_lag, beta=beta, lambda_full=lambda_full,
+            lambda_base=lambda_base, batch_size=batch_size,
+            window_width=int(w), n_ablation_samples=n_abl,
+            do_oob_probe=do_oob, seed=ablation_seed,
+            coarse_step=coarse_step, fine_step=fine_step,
+        )
+        per_width.append(result)
+        A_lag = np.nan_to_num(
+            np.asarray(result["A_lag"], dtype=float), nan=0.0,
+        )
+        peak_lag = int(np.argmax(A_lag)) if A_lag.size else -1
+        rows.append({
+            "window_width": int(w),
+            "lag_mass_lolo": result["lag_mass_lolo"],
+            "total_delta": result["total_delta"],
+            "peak_lag": peak_lag,
+            "delta_oob_max": result["delta_oob_max"],
+            "n_ablation_batches": result["n_ablation_batches"],
+        })
+
+    lag_masses = [r["lag_mass_lolo"] for r in rows]
+    chosen_width = _select_window_width(
+        widths, lag_masses, frac=selection_frac,
+    )
+
+    out_dir = _lag_out_dir(config, benchmark)
+    csv_path = out_dir / "lolo_width_sweep.csv"
+    fields = [
+        "window_width", "lag_mass_lolo", "total_delta",
+        "peak_lag", "delta_oob_max", "n_ablation_batches",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) for k in fields})
+
+    pdf_path = _plot_width_sweep(
+        widths, rows, per_width, test_meta, chosen_width,
+        max_lag=max_lag, out_dir=out_dir,
+    )
+
+    print(
+        f"\n[width sweep] {benchmark}  widths={widths}  "
+        f"chosen w={chosen_width} (>= {selection_frac:.0%} of peak)\n"
+        f"  CSV -> {csv_path}\n  PDF -> {pdf_path}"
+    )
+    return {
+        "widths": list(widths),
+        "per_width": per_width,
+        "lag_mass_lolo": lag_masses,
+        "chosen_width": int(chosen_width),
+        "selection_frac": float(selection_frac),
+        "out_dir": str(out_dir),
+        "summary_csv": str(csv_path),
+        "summary_pdf": str(pdf_path),
+    }
+
+
+def _plot_width_sweep(
+    widths: Sequence[int],
+    rows: Sequence[Dict[str, Any]],
+    per_width: Sequence[Dict[str, Any]],
+    meta: Dict[str, Any],
+    chosen_width: int,
+    *,
+    max_lag: int,
+    out_dir: Path,
+) -> Path:
+    r"""Render ``lolo_width_sweep.{pdf,png}`` (Sprint 4.4).
+
+    Panel 1: ``LagMass_LOLO`` vs $w$ as a line+marker plot, chosen width
+    highlighted. Panel 2: $A_\ell$ profiles overlaid (one curve per $w$,
+    faint-to-bold colour ramp). True band(s) shaded via :func:`_band_spans`.
+
+    Args:
+        widths: The width grid.
+        rows: One :func:`sweep_window_widths` summary row per width.
+        per_width: Full LOLO result dict per width.
+        meta: Dataset ``meta.json`` (for shading bands).
+        chosen_width: Width selected by :func:`_select_window_width`.
+        max_lag: Maximum attention lag.
+        out_dir: Destination directory.
+
+    Returns:
+        Path of the saved PDF (PNG is also written alongside).
+    """
+    import matplotlib.pyplot as plt
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        plot_style as ps,
+    )
+
+    ps.apply_style()
+    spans = _band_spans(meta)
+    fig, axes, _ = ps.stacked_figure([1.0, 1.2], width=8.0, hspace=0.45)
+
+    # Panel 1 -- LagMass_LOLO vs window width.
+    ax = axes[0]
+    masses = [float(r["lag_mass_lolo"]) for r in rows]
+    ax.plot(
+        list(widths), masses, marker="o", color=ps.COLOR_BLUE, lw=1.4,
+        label=r"LagMass$_{\rm LOLO}$",
+    )
+    # Highlight the chosen width.
+    chosen_idx = list(widths).index(int(chosen_width))
+    ax.plot(
+        [chosen_width], [masses[chosen_idx]],
+        marker="o", markersize=10, mfc="none", mec=ps.COLOR_VERMILLION,
+        mew=1.6, label=f"chosen $w^*$ = {chosen_width}",
+    )
+    ax.set_title(
+        r"sliding-window LOLO mass vs window width "
+        r"($\mathcal{L}^\star$ in-band fraction)"
+    )
+    ax.set_ylabel(r"LagMass$_{\rm LOLO}(w)$")
+    ax.set_xlabel(r"window width $w$ (time steps)")
+    ax.legend(loc="best")
+    ps.style_axes(ax)
+
+    # Panel 2 -- per-width A_ell profiles overlaid.
+    ax = axes[1]
+    cmap = plt.get_cmap("viridis")
+    n = max(1, len(per_width))
+    L = int(max_lag) + 1
+    lag_axis = np.arange(L)
+    for i, (w, result) in enumerate(zip(widths, per_width)):
+        A = np.nan_to_num(
+            np.asarray(result["A_lag"], dtype=float), nan=0.0,
+        )
+        if A.size < L:
+            A = np.pad(A, (0, L - A.size))
+        colour = cmap((i + 1) / (n + 1))
+        ax.plot(
+            lag_axis, A[:L],
+            color=colour, lw=1.2 if int(w) == int(chosen_width) else 0.9,
+            alpha=0.95 if int(w) == int(chosen_width) else 0.7,
+            label=f"$w$ = {w}{' *' if int(w) == int(chosen_width) else ''}",
+        )
+    for i, (lo, hi) in enumerate(spans):
+        ax.axvspan(
+            lo - 0.5, hi + 0.5, color=ps.COLOR_VERMILLION, alpha=0.14,
+            lw=0.0,
+            label=(r"true band $\mathcal{L}^\star$" if i == 0 else None),
+        )
+    ax.set_title(r"$A_\ell$ profile per window width")
+    ax.set_xlabel(r"source lag $\ell$")
+    ax.set_ylabel(r"$A_\ell$ (normalised)")
+    ax.set_xlim(-0.5, L - 0.5)
+    ax.legend(loc="best", fontsize=ps.FONT_LEGEND - 1.5)
+    ps.style_axes(ax)
+    ps.save_figure(fig, out_dir / "lolo_width_sweep")
+    return out_dir / "lolo_width_sweep.pdf"
 
 
 # =============================================================================
@@ -1384,20 +1916,46 @@ def _apply_overrides(
     return config
 
 
+def _parse_widths(value: Any) -> Sequence[int]:
+    """Parse a CLI / config widths value into a list of positive ints.
+
+    Accepts a comma-/space-separated string (``"1,5,10,20"`` or
+    ``"1 5 10 20"``), a list/tuple of ints, or ``None`` (returns the Sprint
+    4.4 default).
+
+    Args:
+        value: The raw widths spec.
+
+    Returns:
+        Sorted unique list of widths $\\ge 1$.
+    """
+    if value is None:
+        return (1, 5, 10, 20)
+    if isinstance(value, (list, tuple)):
+        return [int(w) for w in value if int(w) >= 1]
+    s = str(value).strip().strip("[](){}")
+    parts = [p for p in s.replace(",", " ").split() if p]
+    return [int(p) for p in parts if int(p) >= 1]
+
+
 def _dispatch(
     config: Dict[str, Any], overrides: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Resolve overrides, seed, device and run the analysis.
+
+    Dispatches on ``overrides['mode']``: ``"analyze"`` (default) ->
+    :func:`analyze_lag_recovery`; ``"width_sweep"`` ->
+    :func:`sweep_window_widths`.
 
     Args:
         config: The parsed ``config_synth.yaml``.
         overrides: Flat overrides (from ``vars(args)`` or ``RUN_CONFIG``).
 
     Returns:
-        The :func:`analyze_lag_recovery` result dict.
+        The result dict of the chosen entry point.
 
     Raises:
-        ValueError: If no checkpoint is supplied.
+        ValueError: If no checkpoint is supplied or ``mode`` is unknown.
     """
     config = deepcopy(config)
     _apply_overrides(config, overrides)
@@ -1410,11 +1968,33 @@ def _dispatch(
             "a checkpoint is required -- pass --checkpoint PATH (CLI) or set "
             "RUN_CONFIG['checkpoint'] (edit-and-run)."
         )
-    return analyze_lag_recovery(
-        ckpt, config, device=device,
-        data_tag=overrides.get("data_tag"),
-        batch_size=overrides.get("batch_size"),
-        n_ablation_samples=overrides.get("n_ablation_samples"),
+
+    if overrides.get("window_width") is not None:
+        config.setdefault("lag_recovery", {})["window_width"] = int(
+            overrides["window_width"]
+        )
+
+    mode = str(overrides.get("mode") or "analyze").lower()
+    if mode == "analyze":
+        return analyze_lag_recovery(
+            ckpt, config, device=device,
+            data_tag=overrides.get("data_tag"),
+            batch_size=overrides.get("batch_size"),
+            n_ablation_samples=overrides.get("n_ablation_samples"),
+        )
+    if mode == "width_sweep":
+        widths_arg = overrides.get("widths")
+        if widths_arg is None:
+            widths_arg = (config.get("lag_recovery") or {}).get("window_widths")
+        widths = _parse_widths(widths_arg)
+        return sweep_window_widths(
+            ckpt, config, widths=widths, device=device,
+            data_tag=overrides.get("data_tag"),
+            batch_size=overrides.get("batch_size"),
+            n_ablation_samples=overrides.get("n_ablation_samples"),
+        )
+    raise ValueError(
+        f"unknown --mode {mode!r}; expected 'analyze' or 'width_sweep'."
     )
 
 
@@ -1459,7 +2039,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--n-ablation-samples", type=int, default=None,
         dest="n_ablation_samples",
-        help="cap on the samples used per LOLO pass (task 5.4)",
+        help="cap on the samples used per LOLO pass (Sprint 4.1)",
+    )
+    p.add_argument(
+        "--mode", type=str, default="analyze",
+        choices=("analyze", "width_sweep"),
+        help="'analyze' (default, single-w LOLO + headline metrics) or "
+             "'width_sweep' (LOLO across multiple window widths; Sprint 4.4).",
+    )
+    p.add_argument(
+        "--widths", type=str, default=None,
+        help="comma- or space-separated widths for --mode width_sweep "
+             "(e.g. \"1,5,10,20\"). Defaults to config lag_recovery.window_widths.",
+    )
+    p.add_argument(
+        "--window-width", type=int, default=None, dest="window_width",
+        help="override config lag_recovery.window_width for --mode analyze.",
     )
     p.add_argument(
         "--device", type=str, default=None,
@@ -1502,7 +2097,7 @@ if __name__ == "__main__":
     RUN_CONFIG = {
         # which checkpoint to analyse.
         "checkpoint": str(
-            _EXPERIMENT_DIR / "results" / "A" / "pol_easy_a1" / "final.ckpt"
+            _EXPERIMENT_DIR / "results" / "G1" / "G1_baseline" / "final.ckpt"
         ),
         "data_tag": None,            # None -> the checkpoint's own tag
         "benchmark": None,           # None -> config experiment.benchmark
@@ -1510,6 +2105,10 @@ if __name__ == "__main__":
         "n_ablation_samples": None,  # None -> config lag_recovery value
         "device": None,              # None -> config runtime.device
         "seed": None,                # None -> config experiment.seed
+        # Sprint 4 additions:
+        "mode": "analyze",           # "analyze" | "width_sweep"
+        "widths": None,              # None -> config lag_recovery.window_widths
+        "window_width": None,        # None -> config lag_recovery.window_width
     }
 
     if len(sys.argv) > 1:

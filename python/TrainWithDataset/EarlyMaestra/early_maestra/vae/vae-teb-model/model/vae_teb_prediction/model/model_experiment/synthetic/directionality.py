@@ -1,4 +1,4 @@
-r"""Directionality test -- $\bar K_{X\to Y}$ versus $\bar K_{Y\to X}$ (task 7.4).
+r"""Directionality test -- $\bar K_{X\to Y}$ versus $\bar K_{Y\to X}$.
 
 A faithful transfer-entropy surrogate must be **direction-specific**: for a
 process whose causal arrow is $X \to Y$, the model should report a large
@@ -9,14 +9,15 @@ The model :class:`SeqVaeLagAttnV1` is directional *by construction* -- it always
 predicts the target (``fhr``) stream from the source (``up``) stream -- so the
 two directions need two separately trained models:
 
-    * **forward** -- standard Benchmark A: the i.i.d. driver $X$ occupies the
-      101-channel source slot, the dependent stream $Y$ the 87-channel target.
-      The model measures $\mathrm{TE}_{X\to Y} > 0$.
-    * **reverse** -- Benchmark G (``gen_delayed_gaussian(reverse_roles=True)``):
-      the i.i.d. driver is placed in the 87-channel *target* slot and the
-      dependent stream in the 101-channel *source* slot. The model then
-      measures $\mathrm{TE}_{Y\to X}$, whose true value is $0$ (the i.i.d.
-      target's future is unpredictable).
+    * **forward** -- v2 Benchmark G1: the AR(2)-oscillator state $X$ occupies
+      the 101-channel source slot, the dependent stream $Y$ the 87-channel
+      target. The model measures $\mathrm{TE}_{X\to Y} > 0$.
+    * **reverse** -- v2 Benchmark G1-rev
+      (``gen_state_space_oscillator(reverse_roles=True)``): the oscillator
+      state is placed in the 87-channel *target* slot and the dependent
+      stream in the 101-channel *source* slot. The model then measures
+      $\mathrm{TE}_{Y\to X}$, whose true value is $0$ (the slot-wise direction
+      is anti-causal).
 
 A strong directionality result is $\bar K_{\rm forward} \gg \bar K_{\rm
 reverse}$. This module builds (opt-in) the two datasets, trains (opt-in) a
@@ -74,9 +75,11 @@ _EXPERIMENT_DIR = _PKG_DIR.parent
 _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 
 # The two directionality runs: (label, benchmark, data_tag, run_tag).
+# The reverse cell uses the dedicated G1-rev benchmark config, which sets
+# reverse_roles=True so the slot-wise TE is 0 by construction.
 _DIRECTIONS = (
-    ("forward", "A", "benchmark_A_dir_forward", "directionality/forward"),
-    ("reverse", "G", "benchmark_G_dir_reverse", "directionality/reverse"),
+    ("forward", "G1",     "G1_dir_forward",     "directionality/forward"),
+    ("reverse", "G1-rev", "G1-rev_dir_reverse", "directionality/reverse"),
 )
 
 # Columns of the directionality summary CSV (one row per direction).
@@ -102,7 +105,7 @@ def _run_direction(
     Args:
         config: The parsed config.
         label: ``"forward"`` or ``"reverse"``.
-        benchmark: The benchmark block to use (``"A"`` forward, ``"G"`` reverse).
+        benchmark: The benchmark block to use (``"G1"`` forward, ``"G1-rev"`` reverse).
         data_tag: Cache tag for this direction's dataset.
         run_tag: Results subdirectory name for this direction's checkpoint.
         build_missing: If True, generate the dataset when it is not cached.
@@ -160,8 +163,8 @@ def run_directionality(
     r"""Run the forward-vs-reverse directionality test (task 7.4).
 
     Args:
-        config: The parsed ``config_synth.yaml`` (must carry the ``A`` and
-            ``G`` benchmark blocks).
+        config: The parsed ``config_synth.yaml`` (must carry the ``G1`` and
+            ``G1-rev`` benchmark blocks).
         device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
         build_missing: If True, generate any missing directionality dataset.
         train_missing: If True, train any missing directionality model.
@@ -174,7 +177,7 @@ def run_directionality(
     out_dir = ev._results_root(config) / "directionality"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(
-        f"[directionality] forward (Benchmark A) vs reverse (Benchmark G)  "
+        f"[directionality] forward (Benchmark G1) vs reverse (Benchmark G1-rev)  "
         f"device={device}  build_missing={build_missing}  "
         f"train_missing={train_missing}"
     )

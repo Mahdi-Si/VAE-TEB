@@ -1,12 +1,13 @@
 r"""Task-parallel multi-GPU training scheduler for the synthetic TE sweeps.
 
-The synthetic experiment trains many **independent** models -- the A-sweep
-(``a_grid`` x ``m_grid``, ~21 cells), the $\beta$ rate-distortion sweep
-(~9 cells), the hyper-parameter probes, the Benchmark-B $\rho$-null diagnostic
-and the directionality pair. Because the cells are independent, the cheapest
-and safest way to use a multi-GPU box is **task parallelism**: run one model per
-GPU and dispatch cells to whichever GPU is free -- no ``DistributedDataParallel``,
-no change to the training / loss / KL code.
+The synthetic experiment trains many **independent** models -- the knob sweep
+($B_y / c / p_{\text{switch}}$ grid x $M$ grid, ~15 cells), the $\beta$
+rate-distortion sweep (~9 cells), the hyper-parameter probes, the directionality
+pair, and the Sprint-5/7.1 calibration matrix ($\beta \times$ TE-target,
+~27 cells). Because the cells are independent, the cheapest and safest way to
+use a multi-GPU box is **task parallelism**: run one model per GPU and dispatch
+cells to whichever GPU is free -- no ``DistributedDataParallel``, no change to
+the training / loss / KL code.
 
 How it works:
     * The main process enumerates the cells for the requested ``mode`` and
@@ -37,8 +38,9 @@ is present.
         python -m ...synthetic.gpu_pool --mode a_sweep --gpus 0,1,2,3,4,5,6
         python -m ...synthetic.gpu_pool --mode beta   --gpus 0,1,2,3,4,5,6
         python -m ...synthetic.gpu_pool --mode hp --axis lambda_base --gpus 0,1
-        python -m ...synthetic.gpu_pool --mode rho_null --gpus 0,1,2,3
         python -m ...synthetic.gpu_pool --mode directionality --gpus 0,1
+        python -m ...synthetic.gpu_pool --mode calibration --benchmark G1 `
+            --gpus 0,1,2,3,4,5,6,7
         [--config PATH] [--benchmark B] [--epochs N] [--seed S]
         [--no-build] [--force] [--dry-run]
 
@@ -74,6 +76,9 @@ from model.vae_teb_prediction.model.model_experiment.synthetic import (
     build_dataset as bd,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
+    calibration as cal,
+)
+from model.vae_teb_prediction.model.model_experiment.synthetic import (
     directionality as dr,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
@@ -95,7 +100,7 @@ _MODULE = "model.vae_teb_prediction.model.model_experiment.synthetic.gpu_pool"
 # Seconds between poll sweeps of the running-worker set.
 _POLL_SECONDS = 5.0
 
-_VALID_MODES = ("a_sweep", "beta", "hp", "rho_null", "directionality")
+_VALID_MODES = ("a_sweep", "beta", "hp", "directionality", "calibration")
 
 # Per-cell summary CSV columns (one row per training cell).
 _SUMMARY_FIELDS = [
@@ -109,8 +114,9 @@ class TrainCell:
     """One independent training job dispatched to a single GPU.
 
     Attributes:
-        benchmark: Benchmark identifier (``A`` / ``B`` / ``C`` / ``E`` / ``G``)
-            the cell trains under.
+        benchmark: Benchmark identifier (``G1`` / ``G1-rev`` / ``G2`` / ``G3``
+            in v2; legacy ``A`` / ``B`` / ``C`` / ``E`` / ``G`` from v1) the
+            cell trains under.
         data_tag: Cache tag of the dataset to train on
             (``data/<benchmark>/<data_tag>/``).
         run_tag: Results subdirectory for this cell
@@ -133,11 +139,12 @@ class TrainCell:
 # =============================================================================
 
 def _cells_a_sweep(config: Dict[str, Any], build: bool) -> List[TrainCell]:
-    """Enumerate the A-sweep (``a_grid`` x ``m_grid``) training cells.
+    """Enumerate the active v2 benchmark's sweep training cells.
 
-    Reuses :func:`evaluate_te.enumerate_sweep` and the ``_setting_tags`` helpers
-    so the trained checkpoints land where :func:`evaluate_te.run_sweep` looks.
-    Handles the Gaussian (A / B), XOR (C) and two-lag (E) sweep kinds.
+    Reuses :func:`evaluate_te.enumerate_sweep` and the
+    :func:`evaluate_te._setting_tags_knob` helper so trained checkpoints land
+    where :func:`evaluate_te.run_sweep` looks. Handles the three v2 sweep
+    kinds (``gaussian_state_space`` / ``arx`` / ``regime_switch``).
 
     Args:
         config: The parsed, benchmark-resolved config.
@@ -149,26 +156,30 @@ def _cells_a_sweep(config: Dict[str, Any], build: bool) -> List[TrainCell]:
     benchmark = str(config["experiment"]["benchmark"])
     cells: List[TrainCell] = []
     for setting in ev.enumerate_sweep(config):
-        kind = str(setting.get("kind", "gaussian"))
+        kind = str(setting.get("kind", ""))
         m = int(setting["M"])
-        if kind == "xor":
-            q = float(setting["q"])
-            data_tag, run_tag = ev._setting_tags_xor(benchmark, q, m)
-            label = f"q={q:g} M={m}"
+        if kind == "gaussian_state_space":
+            value = float(setting["B_y"])
+            data_tag, run_tag = ev._setting_tags_knob(benchmark, "By", value, m)
+            label = f"B_y={value:g} M={m}"
             if build:
-                ev._ensure_dataset_xor(config, data_tag, q, m)
-        elif kind == "two_lag":
-            data_tag = str(config["experiment"]["tag"])
-            run_tag = "sweep_two_lag"
-            label = f"two-lag M={m}"
+                ev._ensure_dataset_state_space(config, data_tag, value, m)
+        elif kind == "arx":
+            value = float(setting["c"])
+            data_tag, run_tag = ev._setting_tags_knob(benchmark, "c", value, m)
+            label = f"c={value:g} M={m}"
             if build:
-                ev._ensure_dataset_simple(config, data_tag)
-        else:  # gaussian
-            a = float(setting["a"])
-            data_tag, run_tag = ev._setting_tags(benchmark, a, m)
-            label = f"a={a:g} M={m}"
+                ev._ensure_dataset_arx(config, data_tag, value, m)
+        elif kind == "regime_switch":
+            value = float(setting["p_switch"])
+            data_tag, run_tag = ev._setting_tags_knob(benchmark, "p", value, m)
+            label = f"p={value:g} M={m}"
             if build:
-                ev._ensure_dataset(config, data_tag, a, m)
+                ev._ensure_dataset_regime_switch(config, data_tag, value, m)
+        else:
+            # Unknown / missing kind -- skip rather than crash the whole pool.
+            print(f"[warn] _cells_a_sweep: unknown sweep kind {kind!r}; skipping")
+            continue
         cells.append(TrainCell(benchmark, data_tag, run_tag, label))
     return cells
 
@@ -251,46 +262,6 @@ def _cells_hp(
     return cells
 
 
-def _cells_rho_null(config: Dict[str, Any], build: bool) -> List[TrainCell]:
-    """Enumerate the Benchmark-B $\\rho$-null diagnostic cells.
-
-    One zero-transfer ($a=0$) Benchmark-B dataset per $\\rho$; the run-tags
-    mirror :func:`evaluate_te.run_rho_null_check`.
-
-    Args:
-        config: The parsed config.
-        build: If True, generate each $\\rho$-null dataset (idempotent).
-
-    Returns:
-        One :class:`TrainCell` per $\\rho$ in ``benchmarks.B.rho_null.rho_grid``.
-    """
-    cfg = deepcopy(config)
-    cfg["experiment"]["benchmark"] = "B"
-    tm.resolve_active_benchmark(cfg)
-    rho_grid = list((cfg.get("rho_null", {}) or {}).get("rho_grid", []))
-    if not rho_grid:
-        raise ValueError(
-            "rho_null mode needs benchmarks.B.rho_null.rho_grid"
-        )
-    cells: List[TrainCell] = []
-    for rho in rho_grid:
-        token = "r" + bs._fmt_token(float(rho))
-        data_tag = f"benchmark_B_rho_null_{token}"
-        run_tag = f"rho_null/{token}"
-        if build:
-            dcfg = deepcopy(cfg)
-            bd._apply_overrides(
-                dcfg, {"tag": data_tag, "a": 0.0, "rho": float(rho)}
-            )
-            bd.build_dataset(dcfg, force=False)
-        # a=0 is baked into the dataset; patch data.a so the train-time
-        # provenance check does not warn.
-        cells.append(
-            TrainCell("B", data_tag, run_tag, f"rho={rho:g}", {"data.a": 0.0})
-        )
-    return cells
-
-
 def _cells_directionality(
     config: Dict[str, Any], build: bool
 ) -> List[TrainCell]:
@@ -318,12 +289,152 @@ def _cells_directionality(
     return cells
 
 
+def _cells_calibration(
+    config: Dict[str, Any], build: bool
+) -> List[TrainCell]:
+    r"""Enumerate the calibration $(\beta \times \mathrm{TE}\text{-point})$ cells.
+
+    Mirrors the orchestration in :func:`calibration.run_calibration` (lines
+    787-810) so the resulting checkpoints land where the slope-fit step
+    later looks (``results/<benchmark>/calibration/<data_tag>/<beta_token>/``).
+    The follow-up call
+
+    .. code-block:: bash
+
+        python -m ...calibration --benchmark <B> \
+            --no-build-missing --no-train-missing
+
+    then just reads the cached ``best.ckpt`` files and fits
+    :math:`\bar K = \alpha + \gamma\,\mathrm{TE}` per :math:`\beta` -- no
+    retraining.
+
+    Two benchmarks are supported via :data:`calibration._CALIBRATION_BUILDERS`:
+    G1 (state-space oscillator, MC inverter ``B_y_for_te_block_state_space``)
+    and G2 (smooth ARX, closed-form inverter ``c_for_te_block_arx``). The
+    active benchmark is whichever of ``experiment.benchmark`` /
+    ``calibration.benchmark`` is registered; the ``gpu_pool --benchmark`` CLI
+    flag therefore flips both modes' active calibration without a YAML edit.
+
+    Args:
+        config: The parsed, benchmark-resolved config.
+        build: If True, run :func:`calibration.build_g1_calibration_caches`
+            (or G2 equivalent) to materialise any missing per-TE-target
+            cache. Idempotent: existing caches are skipped.
+
+    Returns:
+        One :class:`TrainCell` per (TE-target, :math:`\beta`) pair --
+        ``len(te_per_step_targets) * len(beta_grid)`` cells in total.
+
+    Raises:
+        ValueError: If neither ``experiment.benchmark`` nor
+            ``calibration.benchmark`` resolves to a calibration-registered
+            benchmark, or if ``te_per_step_targets`` / ``beta_grid`` are empty.
+    """
+    cal_cfg = config.get("calibration", {}) or {}
+    exp_benchmark = str(config.get("experiment", {}).get("benchmark", ""))
+    cal_benchmark = str(cal_cfg.get("benchmark", ""))
+    # Prefer experiment.benchmark when it is a calibration-registered
+    # benchmark -- that is the path the `gpu_pool --benchmark` CLI flag
+    # takes. Otherwise fall back to calibration.benchmark from the YAML.
+    if exp_benchmark in cal._CALIBRATION_BUILDERS:
+        benchmark = exp_benchmark
+    elif cal_benchmark in cal._CALIBRATION_BUILDERS:
+        benchmark = cal_benchmark
+    else:
+        raise ValueError(
+            f"calibration mode: experiment.benchmark={exp_benchmark!r} and "
+            f"calibration.benchmark={cal_benchmark!r} are neither registered "
+            f"calibration benchmarks "
+            f"{sorted(cal._CALIBRATION_BUILDERS)}."
+        )
+    spec = cal._get_calibration_spec(benchmark)
+
+    targets = [float(t) for t in
+               (cal_cfg.get("te_per_step_targets") or [0.05, 0.15, 0.30])]
+    if not targets:
+        raise ValueError(
+            "calibration mode: calibration.te_per_step_targets is empty."
+        )
+    # When the resolved benchmark differs from the YAML's
+    # ``calibration.benchmark`` (the gpu_pool ``--benchmark`` override path)
+    # any explicit ``tag_prefix`` was authored for the *original* benchmark
+    # and must be discarded so the default ``f"{benchmark}_te"`` kicks in.
+    # Mirrors :func:`calibration._apply_overrides` (calibration.py:1030).
+    if benchmark != cal_benchmark and cal_benchmark:
+        tag_prefix = f"{benchmark}_te"
+    else:
+        tag_prefix = str(cal_cfg.get("tag_prefix", f"{benchmark}_te"))
+    likelihood = str(cal_cfg.get("likelihood", "gaussian_nll"))
+    sigma_obs_raw = cal_cfg.get("sigma_obs", "learned")
+    # Preserve the polymorphism in calibration.run_calibration: 'learned'
+    # passes through as the string, anything else is coerced to float.
+    sigma_obs: "float | str" = (
+        sigma_obs_raw if (isinstance(sigma_obs_raw, str)
+                          and sigma_obs_raw == "learned")
+        else float(sigma_obs_raw)
+    )
+    free_bits = float(cal_cfg.get("free_bits", 0.0))
+
+    # beta_grid: null in the YAML -> fall back to beta_sweep.grid so the
+    # rate-distortion plot and the calibration plot share one source of
+    # truth (matches calibration.run_calibration:805-808).
+    beta_grid_raw = cal_cfg.get("beta_grid")
+    if beta_grid_raw is None:
+        beta_grid_raw = (config.get("beta_sweep", {}) or {}).get("grid", [])
+    beta_grid = [float(b) for b in (beta_grid_raw or [])]
+    if not beta_grid:
+        raise ValueError(
+            "calibration mode: calibration.beta_grid is empty and "
+            "beta_sweep.grid is also empty -- one of them must be set."
+        )
+
+    # Resolve the active benchmark block so the cache builder sees the right
+    # data section (e.g. G1's oscillators / delays for B_y inversion, or
+    # G2's rho_u / rho_y / c for ARX inversion).
+    cfg_for_build = deepcopy(config)
+    cfg_for_build["experiment"]["benchmark"] = benchmark
+    tm.resolve_active_benchmark(cfg_for_build)
+
+    if build:
+        inverter_kwargs: Dict[str, Any] = dict(cal_cfg.get("inverter", {}) or {})
+        spec.builder(
+            cfg_for_build,
+            te_per_step_targets=targets,
+            tag_prefix=tag_prefix,
+            inverter_kwargs=inverter_kwargs,
+            force=False,
+        )
+
+    # Enumerate (data_tag, beta) cells. data_tag is deterministic from
+    # tau + tag_prefix (matches calibration._emit_calibration_cache_entry).
+    cells: List[TrainCell] = []
+    for tau in targets:
+        data_tag = f"{tag_prefix}{int(round(float(tau) * 100)):03d}"
+        for beta_val in beta_grid:
+            beta_f = float(beta_val)
+            run_tag = f"calibration/{data_tag}/{cal._beta_token(beta_f)}"
+            patches: Dict[str, Any] = {
+                "loss.kld_beta": beta_f,
+                "loss.likelihood": likelihood,
+                "loss.sigma_obs": sigma_obs,
+                "loss.free_bits": free_bits,
+            }
+            cells.append(TrainCell(
+                benchmark=benchmark,
+                data_tag=data_tag,
+                run_tag=run_tag,
+                label=f"tau={tau:.3f} beta={beta_f:g}",
+                patches=patches,
+            ))
+    return cells
+
+
 _ENUMERATORS = {
     "a_sweep": lambda cfg, build, axis: _cells_a_sweep(cfg, build),
     "beta": lambda cfg, build, axis: _cells_beta(cfg, build),
     "hp": lambda cfg, build, axis: _cells_hp(cfg, axis, build),
-    "rho_null": lambda cfg, build, axis: _cells_rho_null(cfg, build),
     "directionality": lambda cfg, build, axis: _cells_directionality(cfg, build),
+    "calibration": lambda cfg, build, axis: _cells_calibration(cfg, build),
 }
 
 
@@ -830,7 +941,7 @@ if __name__ == "__main__":
     CONFIG_PATH = _DEFAULT_CONFIG
 
     RUN_CONFIG = {
-        "mode": "a_sweep",         # a_sweep | beta | hp | rho_null | directionality
+        "mode": "a_sweep",         # a_sweep | beta | hp | directionality
         "axis": "lambda_base",     # hp mode: lambda_base | d_z | warmup_period
         "gpus": None,              # e.g. [0,1,2,3,4,5,6]; None -> runtime.gpus
         "benchmark": None,         # None -> config experiment.benchmark

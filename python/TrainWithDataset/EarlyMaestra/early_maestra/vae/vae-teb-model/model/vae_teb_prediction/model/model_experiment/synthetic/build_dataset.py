@@ -1,13 +1,15 @@
-r"""One-shot dataset builder CLI -- generate, persist, and preview (Decision D7).
+r"""One-shot dataset builder CLI -- generate, persist, and preview (Decision V2-D2).
 
-This script generates a synthetic benchmark dataset **exactly once** and caches
-it so every downstream training run (every $\beta$, every hyper-parameter
-setting) reuses identical samples -- a precondition for a valid $\beta$-sweep
-comparison.
+This script generates a synthetic v2 benchmark dataset **exactly once** and
+caches it so every downstream training run (every $\beta$, every
+hyper-parameter setting) reuses identical samples -- a precondition for a
+valid $\beta$-sweep comparison.
 
 Behaviour:
     1. Read ``config_synth.yaml`` (the ``data`` / ``model`` / ``experiment``
-       blocks) and call :func:`generators.gen_delayed_gaussian`.
+       blocks) and call the active benchmark's generator from
+       :data:`_GENERATORS` (one of ``gen_state_space_oscillator``,
+       ``gen_smooth_arx``, ``gen_regime_switch_smooth``).
     2. Write to ``<data_dir>/<benchmark>/<tag>/``:
         * ``train.npz``, ``val.npz``, ``test.npz`` -- the tensor splits, each
           holding the five native fields ``fhr_st / fhr_ph / up_st / up_ph /
@@ -17,25 +19,24 @@ Behaviour:
         * ``preview.pdf`` -- a visual summary produced via :mod:`visualize`.
     3. Be idempotent: skip generation when the cache exists unless ``--force``.
 
-Run modes (project convention -- see Decision D9 in
-``synthetic_te_validation_plan.md``): the script supports **both** a CLI and an
+Run modes (project convention -- see Decision V2-D8 in
+``model_validation_v2_plan.md``): the script supports **both** a CLI and an
 edit-and-run ``__main__``, auto-detected from whether any command-line argument
 is present.
 
     * CLI mode (any ``--flag`` passed)::
 
         python -m ...synthetic.build_dataset
-        ... [--config PATH] [--force] [--tag TAG] [--easy] [--a A] [--m M]
+        ... [--config PATH] [--force] [--tag TAG] [--easy] [--m M]
 
     * Edit-and-run mode (no arguments) -- edit the ``RUN_CONFIG`` dict in the
       ``__main__`` block, then run the file directly::
 
         python -m ...synthetic.build_dataset
 
-The ``--tag/--easy/--a/--m`` overrides let later phases build variant datasets
-(e.g. the easy/``a=0`` proof-of-life splits) without editing the config.
-``--easy`` can only switch the easy variant *on*; pass a distinct ``--tag`` so
-the variant does not clobber the baseline cache.
+The ``--tag/--easy/--m`` overrides let later phases build variant datasets
+without editing the config. ``--easy`` can only switch the easy variant *on*;
+pass a distinct ``--tag`` so the variant does not clobber the baseline cache.
 """
 
 from __future__ import annotations
@@ -44,19 +45,19 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import numpy as np
 import yaml
 
 from model.vae_teb_prediction.model.model_experiment.synthetic.generators import (
-    gen_ar_gaussian,
-    gen_delayed_gaussian,
-    gen_delayed_xor,
-    gen_two_lag_gaussian,
+    gen_regime_switch_smooth,
+    gen_smooth_arx,
+    gen_state_space_oscillator,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
     resolve_active_benchmark,
+    resolve_user_path,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.visualize import (
     make_dataset_gallery,
@@ -88,14 +89,20 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     return resolve_active_benchmark(config)
 
 
-# Benchmark -> generator dispatch. Benchmark G reuses ``gen_delayed_gaussian``
-# (with ``reverse_roles=True`` supplied by :func:`_build_gen_kwargs`).
-_GENERATORS = {
-    "A": gen_delayed_gaussian,
-    "B": gen_ar_gaussian,
-    "C": gen_delayed_xor,
-    "E": gen_two_lag_gaussian,
-    "G": gen_delayed_gaussian,
+# Benchmark -> generator dispatch (v2). G1-rev shares G1's generator and only
+# differs in the `reverse_roles=True` flag (set via config, not via a dedicated
+# function). G1_twoband shares G1's generator with two-delay channel splits.
+# G2_wrong_delay / G2_zero_coupling share G2's generator and differ only in
+# `delay` / `c` (null-control variants consumed by :mod:`null_controls`). v1
+# entries (A/B/C/E/G) were removed (V2-D7).
+_GENERATORS: Dict[str, Any] = {
+    "G1":               gen_state_space_oscillator,
+    "G1-rev":           gen_state_space_oscillator,
+    "G1_twoband":       gen_state_space_oscillator,
+    "G2":               gen_smooth_arx,
+    "G2_wrong_delay":   gen_smooth_arx,
+    "G2_zero_coupling": gen_smooth_arx,
+    "G3":               gen_regime_switch_smooth,
 }
 
 
@@ -105,14 +112,15 @@ def _build_gen_kwargs(
 ) -> Dict[str, Any]:
     r"""Assemble the keyword arguments for the active benchmark's generator.
 
-    Each benchmark generator takes a different parameter set (B adds ``rho`` /
-    ``burn_in``; C swaps ``a`` / ``sigma2`` for ``q`` / ``obs_noise``; E takes
-    two delays / coefficients / channel counts; G is Benchmark A with
-    ``reverse_roles=True``). This helper reads only the keys the chosen
-    generator accepts.
+    Branches on ``benchmark`` and copies the relevant fields from the
+    benchmark-resolved ``data`` block into the kwargs dict the generator
+    expects. ``n`` and ``seed`` are *not* included -- they are supplied per
+    split by :func:`_write_split`. ``c_y`` and ``c_u`` (the resolved native
+    channel counts) and ``horizon`` (from the ``model`` block) are injected
+    so the generator output matches the model's input contract.
 
     Args:
-        benchmark: Benchmark id (``A`` / ``B`` / ``C`` / ``E`` / ``G``).
+        benchmark: Active benchmark id (one of the keys of :data:`_GENERATORS`).
         data: The (benchmark-resolved) ``data`` config block.
         model: The ``model`` config block (for ``horizon``).
         c_y: Target channel count.
@@ -120,64 +128,104 @@ def _build_gen_kwargs(
 
     Returns:
         A dict of keyword arguments for ``_GENERATORS[benchmark]`` (excluding
-        ``n`` and ``seed``, which :func:`_write_split` supplies per split).
+        ``n`` and ``seed``).
 
     Raises:
-        ValueError: If ``benchmark`` is not one of A / B / C / E / G.
+        ValueError: If ``benchmark`` is not a registered v2 benchmark.
     """
-    common: Dict[str, Any] = {
-        "T": int(data["sequence_length"]),
-        "c_y": c_y,
-        "c_u": c_u,
-        "horizon": int(model["horizon"]),
-        "standardize": True,
-    }
-    if benchmark in ("A", "G"):
-        kw = {
-            **common,
-            "delay": int(data["delay"]),
-            "a": float(data["a"]),
-            "sigma2": float(data["sigma2"]),
-            "M": int(data["M"]),
-            "easy_variant": bool(data.get("easy_variant", False)),
-        }
-        if benchmark == "G":
-            kw["reverse_roles"] = True
-        return kw
-    if benchmark == "B":
+    horizon = int(model["horizon"])
+    T = int(data["sequence_length"])
+    if benchmark in ("G1", "G1-rev", "G1_twoband"):
+        # G1-rev is G1 with reverse_roles=True (flag set in the config block);
+        # G1_twoband (Sprint 4.5) is G1 with len(delays) > 1 spread across M.
+        # The generator demands ``len(oscillators) == len(delays) == len(B_y)
+        # == M``: when the config supplies a single spec we tile it M times,
+        # and when the config supplies k > 1 specs with M % k == 0 we repeat
+        # each entry M / k times (so e.g. delays=[35, 85], M=4 -> [35, 35, 85,
+        # 85]). Asymmetric splits across delays must be set explicitly.
+        M = int(data["M"])
+
+        def _tile(lst: List[Any], name: str) -> List[Any]:
+            if len(lst) == M:
+                return lst
+            if len(lst) == 1:
+                return lst * M
+            if M % len(lst) == 0:
+                per = M // len(lst)
+                return [item for item in lst for _ in range(per)]
+            raise ValueError(
+                f"benchmark {benchmark!r}: cannot tile {name} of length "
+                f"{len(lst)} to M={M}. Provide a length matching M, length 1, "
+                f"or a length that divides M evenly."
+            )
+
+        oscillators = _tile(
+            [tuple(pair) for pair in data["oscillators"]], "oscillators",
+        )
+        delays = _tile([int(d) for d in data["delays"]], "delays")
+        B_y = _tile([float(b) for b in data["B_y"]], "B_y")
         return {
-            **common,
-            "delay": int(data["delay"]),
-            "a": float(data["a"]),
-            "sigma2": float(data["sigma2"]),
-            "M": int(data["M"]),
-            "rho": float(data["rho"]),
-            "burn_in": int(data.get("burn_in", 200)),
+            "T": T,
+            "oscillators": oscillators,
+            "target_ar": float(data["target_ar"]),
+            "delays": delays,
+            "B_y": B_y,
+            "sigma2_y": float(data["sigma2_y"]),
+            "sigma2_eta": data["sigma2_eta"],   # scalar or sequence; generator handles both
+            "M": M,
+            "c_y": c_y,
+            "c_u": c_u,
+            "horizon": horizon,
             "easy_variant": bool(data.get("easy_variant", False)),
+            "standardize": bool(data.get("standardize", True)),
+            "reverse_roles": bool(data.get("reverse_roles", False)),
+            "te_n_samples": int(data.get("te_n_samples", 50_000)),
         }
-    if benchmark == "C":
+    if benchmark in ("G2", "G2_wrong_delay", "G2_zero_coupling"):
+        # G2_wrong_delay overrides `delay` to D >> max_lag + horizon;
+        # G2_zero_coupling overrides `c` to 0. Both share G2's kwarg surface
+        # -- only the YAML values differ.
         return {
-            **common,
+            "T": T,
+            "rho_u": float(data["rho_u"]),
+            "rho_y": float(data["rho_y"]),
+            "c": float(data["c"]),
+            "sigma2_eta": float(data["sigma2_eta"]),
+            "sigma2_eps": float(data["sigma2_eps"]),
             "delay": int(data["delay"]),
-            "q": float(data["q"]),
             "M": int(data["M"]),
-            "obs_noise": float(data.get("obs_noise", 0.1)),
+            "c_y": c_y,
+            "c_u": c_u,
+            "horizon": horizon,
+            "burn_in": (None if data.get("burn_in") is None
+                        else int(data["burn_in"])),
             "easy_variant": bool(data.get("easy_variant", False)),
+            "standardize": bool(data.get("standardize", True)),
+            "reverse_roles": bool(data.get("reverse_roles", False)),
         }
-    if benchmark == "E":
+    if benchmark == "G3":
         return {
-            **common,
-            "delay1": int(data["delay1"]),
-            "delay2": int(data["delay2"]),
-            "a1": float(data["a1"]),
-            "a2": float(data["a2"]),
-            "sigma2": float(data["sigma2"]),
-            "M1": int(data["M1"]),
-            "M2": int(data["M2"]),
+            "T": T,
+            "K_classes": int(data["K_classes"]),
+            "p_switch": float(data["p_switch"]),
+            "delta": int(data["delta"]),
+            "M": int(data["M"]),
+            "omega_grid": (None if data.get("omega_grid") is None
+                           else [float(w) for w in data["omega_grid"]]),
+            "amp_grid": (None if data.get("amp_grid") is None
+                         else [float(a) for a in data["amp_grid"]]),
+            "sigma2_y": float(data.get("sigma2_y", 0.1)),
+            "sigma2_u": float(data.get("sigma2_u", 0.1)),
+            "c_y": c_y,
+            "c_u": c_u,
+            "horizon": horizon,
+            "shared_regime": bool(data.get("shared_regime", False)),
+            "template_period_min": int(data.get("template_period_min", 40)),
+            "standardize": bool(data.get("standardize", True)),
         }
     raise ValueError(
         f"build_dataset: unknown benchmark {benchmark!r} "
-        f"(expected one of A, B, C, E, G)."
+        f"(expected one of {sorted(_GENERATORS)})."
     )
 
 
@@ -259,7 +307,10 @@ def build_dataset(
             f"model block gives c_y={model['c_y']}, c_u={model['c_u']}."
         )
 
-    data_root = (_EXPERIMENT_DIR / str(config["paths"]["data_dir"])).resolve()
+    # ``paths.data_dir`` can be relative (joined with model_experiment/),
+    # absolute on any drive, or use ``~`` / ``$VAR``. See
+    # :func:`train_minimal.resolve_user_path` for the rules.
+    data_root = resolve_user_path(config["paths"]["data_dir"])
     out_dir = data_root / benchmark / tag
 
     if not force and all((out_dir / f).is_file() for f in _SPLIT_FILES):
@@ -304,6 +355,11 @@ def build_dataset(
     meta_out = dict(train_meta)
     meta_out.pop("seed", None)
     meta_out["tag"] = tag
+    # Stamp the active benchmark key over whatever the generator wrote. This
+    # disambiguates G1 from its reverse-roles variant G1-rev (both produced by
+    # ``gen_state_space_oscillator``) so downstream consumers see the real
+    # cache identity.
+    meta_out["benchmark"] = benchmark
     meta_out["split_sizes"] = split_sizes
     meta_out["split_seeds"] = split_seeds
     meta_out["channel_map"] = {
@@ -334,26 +390,19 @@ def _apply_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> None:
 
     Args:
         config: The parsed config dict (mutated in place).
-        overrides: A mapping with optional keys ``tag``, ``easy``, ``a``,
-            ``m``, ``q``, ``rho``. ``a`` / ``m`` drive the Gaussian (A / B / E)
-            sweep cells, ``q`` the XOR (C) sweep cells and ``rho`` the
-            Benchmark-B rho-null datasets. Both ``vars(argparse.Namespace)``
+        overrides: A mapping with optional keys ``tag``, ``easy``, ``m``.
+            ``m`` overrides ``data.M`` (number of informative channels) and
+            applies to every v2 benchmark. Both ``vars(argparse.Namespace)``
             (CLI mode) and the in-file ``RUN_CONFIG`` dict (edit-and-run mode)
-            satisfy this -- see Decision D9 in
-            ``synthetic_te_validation_plan.md``.
+            satisfy this -- see Decision V2-D8 in
+            ``model_validation_v2_plan.md``.
     """
     if overrides.get("tag") is not None:
         config["experiment"]["tag"] = overrides["tag"]
     if overrides.get("easy"):
         config["data"]["easy_variant"] = True
-    if overrides.get("a") is not None:
-        config["data"]["a"] = overrides["a"]
     if overrides.get("m") is not None:
         config["data"]["M"] = overrides["m"]
-    if overrides.get("q") is not None:
-        config["data"]["q"] = overrides["q"]
-    if overrides.get("rho") is not None:
-        config["data"]["rho"] = overrides["rho"]
 
 
 def main() -> None:
@@ -378,16 +427,7 @@ def main() -> None:
         help="force the easy variant (all channels informative)",
     )
     parser.add_argument(
-        "--a", type=float, default=None, help="override data.a (A / B / G)",
-    )
-    parser.add_argument(
         "--m", type=int, default=None, help="override data.M",
-    )
-    parser.add_argument(
-        "--q", type=float, default=None, help="override data.q (XOR, C)",
-    )
-    parser.add_argument(
-        "--rho", type=float, default=None, help="override data.rho (AR, B)",
     )
     args = parser.parse_args()
 
@@ -416,10 +456,7 @@ if __name__ == "__main__":
     RUN_CONFIG = {
         "tag": None,        # None -> config experiment.tag (cache subdir name)
         "easy": False,      # True -> force the easy variant (all channels)
-        "a": None,          # None -> config data.a   (Gaussian A / B / G)
-        "m": None,          # None -> config data.M
-        "q": None,          # None -> config data.q   (XOR, benchmark C)
-        "rho": None,        # None -> config data.rho (AR, benchmark B)
+        "m": None,          # None -> config data.M (informative channels)
         "force": False,     # True -> rebuild even if a complete cache exists
     }
 

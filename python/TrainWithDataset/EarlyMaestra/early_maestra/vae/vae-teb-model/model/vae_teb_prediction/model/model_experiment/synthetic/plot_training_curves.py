@@ -24,6 +24,9 @@ Public API:
     plot_training_curves: Render a run's ``metrics.csv`` into
         ``training_curves.{pdf,png}``. Reusable -- safe to call repeatedly; each
         call overwrites the previous figure.
+    plot_training_curves_html: Render the same CSV into an interactive Plotly
+        ``loss_plot_epoch.html`` -- one ``go.Scatter`` per loss column on a
+        single figure. Mirrors :class:`train.callbacks.LossPlotCallback`.
 
 Run modes (project convention -- see Decision D9 in
 ``synthetic_te_validation_plan.md``): like every ``synthetic/`` runner this file
@@ -335,6 +338,86 @@ def plot_training_curves(
     return ps.save_figure(fig, out, formats=tuple(formats))
 
 
+# Columns from the synthetic ``metrics.csv`` that are *not* loss components --
+# they're the epoch axis, the optimisation hyperparameter, the per-epoch grad
+# norm and timing / counter columns -- so the plotly figure skips them. This
+# is the synthetic-loop analogue of :data:`LossPlotCallback.hyperparam_keys` +
+# the ``epoch`` skip in ``LossPlotCallback.plot_losses``.
+_HTML_NON_LOSS_COLUMNS = frozenset({
+    "epoch", "lr", "epoch_seconds", "nan_skips", "train_grad_norm",
+})
+
+
+def plot_training_curves_html(
+    csv_path: Union[str, Path],
+    out_path: Optional[Union[str, Path]] = None,
+    *,
+    run_tag: Optional[str] = None,
+) -> Optional[Path]:
+    r"""Render ``metrics.csv`` into an interactive Plotly loss-curve HTML.
+
+    Mirrors :meth:`train.callbacks.LossPlotCallback.plot_losses`: a single
+    :class:`plotly.graph_objects.Figure` with one
+    :class:`plotly.graph_objects.Scatter` per loss column (``mode='lines+markers'``,
+    ``template='plotly_white'``). Train / val pairs of the same loss share the
+    legend so they overlay cleanly. Skips columns that are all-NaN.
+
+    The non-loss columns ``epoch`` / ``lr`` / ``epoch_seconds`` / ``nan_skips``
+    / ``train_grad_norm`` are excluded (the matplotlib figure surfaces ``lr``
+    and ``grad_norm`` on a dedicated diagnostics panel).
+
+    Args:
+        csv_path: Path to the ``metrics.csv`` to plot.
+        out_path: Destination HTML path. Defaults to
+            ``<csv parent>/loss_plot_epoch.html`` -- the same filename the
+            Lightning :class:`LossPlotCallback` writes, so future merges into
+            a shared dashboard are trivial.
+        run_tag: Run label for the figure title. Defaults to the name of the
+            directory containing the CSV.
+
+    Returns:
+        The path of the written HTML, or ``None`` when the CSV is missing or
+        has no epoch rows yet (nothing is rendered in that case).
+    """
+    import plotly.graph_objects as go
+
+    csv_path = Path(csv_path)
+    data = _read_metrics_csv(csv_path)
+    if not data or "epoch" not in data or not _has_finite(data["epoch"]):
+        print(f"[plot] nothing to plot -- no epoch rows in {csv_path}")
+        return None
+
+    epochs = data["epoch"]
+    last_epoch = int(np.nanmax(epochs))
+    label = run_tag or csv_path.parent.name
+
+    fig = go.Figure()
+    for col, values in data.items():
+        if col in _HTML_NON_LOSS_COLUMNS:
+            continue
+        if not _has_finite(values):
+            continue
+        fig.add_trace(go.Scatter(
+            x=epochs, y=values, mode="lines+markers", name=col,
+        ))
+
+    fig.update_layout(
+        title=f"Training and Validation Losses -- {label}  (epoch {last_epoch})",
+        xaxis_title="Epoch",
+        yaxis_title="Value",
+        legend_title="Metric",
+        template="plotly_white",
+    )
+
+    out = (
+        Path(out_path) if out_path is not None
+        else csv_path.parent / "loss_plot_epoch.html"
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(out))
+    return out
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -371,13 +454,12 @@ def _resolve_csv_path(
     # train_minimal config loader -- the --csv path stays torch-free.
     from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
         load_config,
+        resolve_user_path,
     )
 
     config = load_config(config_path)
     bench = benchmark or str(config["experiment"]["benchmark"])
-    results_root = (
-        _EXPERIMENT_DIR / str(config["paths"]["results_dir"])
-    ).resolve()
+    results_root = resolve_user_path(config["paths"]["results_dir"])
     return results_root / bench / run_tag / "metrics.csv"
 
 
@@ -415,11 +497,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--formats", type=str, nargs="+", default=["pdf", "png"],
         help="output image formats (default: pdf png)",
     )
+    p.add_argument(
+        "--html", action=argparse.BooleanOptionalAction, default=True,
+        help="also write loss_plot_epoch.html (plotly mirror of "
+             "LossPlotCallback). Default: on.",
+    )
     return p.parse_args(argv)
 
 
 def main(argv=None) -> None:
-    """CLI entry point: resolve the CSV path and render the figure.
+    """CLI entry point: resolve the CSV path and render the figure(s).
 
     Args:
         argv: Optional argument list (defaults to ``sys.argv``).
@@ -430,9 +517,13 @@ def main(argv=None) -> None:
     else:
         csv_path = _resolve_csv_path(args.config, args.run_tag, args.benchmark)
 
-    written = plot_training_curves(
-        csv_path, run_tag=args.run_tag, formats=args.formats
-    )
+    written: List[Path] = list(plot_training_curves(
+        csv_path, run_tag=args.run_tag, formats=args.formats,
+    ) or [])
+    if args.html:
+        html_path = plot_training_curves_html(csv_path, run_tag=args.run_tag)
+        if html_path is not None:
+            written.append(html_path)
     if written:
         print(f"[done] training curves -> {', '.join(str(p) for p in written)}")
 
@@ -459,6 +550,7 @@ if __name__ == "__main__":
         "run_tag": "pol_easy_a1",    # else resolve results/<benchmark>/<tag>/
         "benchmark": None,           # None -> config experiment.benchmark
         "formats": ["pdf", "png"],   # output image formats
+        "html": True,                # also emit plotly loss_plot_epoch.html
     }
 
     if len(sys.argv) > 1:
@@ -470,10 +562,16 @@ if __name__ == "__main__":
             csv_path = _resolve_csv_path(
                 CONFIG_PATH, RUN_CONFIG["run_tag"], RUN_CONFIG["benchmark"]
             )
-        written = plot_training_curves(
+        written: List[Path] = list(plot_training_curves(
             csv_path, run_tag=RUN_CONFIG["run_tag"],
             formats=RUN_CONFIG["formats"],
-        )
+        ) or [])
+        if RUN_CONFIG["html"]:
+            html_path = plot_training_curves_html(
+                csv_path, run_tag=RUN_CONFIG["run_tag"],
+            )
+            if html_path is not None:
+                written.append(html_path)
         if written:
             print(
                 f"[done] training curves -> "

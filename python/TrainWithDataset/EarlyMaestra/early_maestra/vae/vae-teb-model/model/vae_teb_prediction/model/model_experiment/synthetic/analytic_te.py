@@ -1,27 +1,36 @@
-r"""Closed-form ground-truth transfer-entropy formulas (Phase 1).
+r"""Closed-form ground-truth transfer-entropy formulas (v2 — low-frequency).
 
-This module holds the analytic block transfer-entropy (TE) expressions used as
-ground truth for every synthetic benchmark. All functions are pure -- ``numpy``
-and ``math`` only, no ``torch`` and no I/O -- and return values in **nats**.
-They are unit-tested in ``test_analytic_te.py`` against the reference tables in
-``synthetic_te_validation_plan.md`` Section 8.
+This module holds analytic block transfer-entropy (TE) expressions used as
+ground truth for every synthetic benchmark. All functions are pure
+(``numpy`` / ``scipy.linalg`` / ``math`` only; no ``torch``, no I/O) and
+return values in **nats**. They are unit-tested in ``test_analytic_te_v2.py``.
 
-Public API:
+Public API (v2):
     binary_entropy: Binary Shannon entropy $h_b(q)$ in nats.
-    te_block_gaussian: Delayed linear-Gaussian benchmark TE (Benchmark A / E).
-    te_block_gaussian_mc: Monte-Carlo determinant-ratio block TE for the
-        AR-target process (Benchmark B rho-cancellation cross-check).
+    te_block_gaussian: Per-step-additive delayed linear-Gaussian block TE.
     a_for_te_per_step: Inverse of the Gaussian per-step TE -> transfer coeff $a$.
-    te_block_xor: Delayed binary-XOR benchmark TE (Benchmark C).
-    te_categorical_switch: Categorical regime-switch benchmark TE (Benchmark D).
+    te_block_xor: Delayed binary-XOR benchmark TE.
+    te_categorical_switch: One-step categorical regime-switch TE.
+    te_block_gaussian_mc: Monte-Carlo determinant-ratio block TE for the
+        delayed linear-Gaussian AR-target process (cross-check helper).
+
+v2 additions:
+    te_block_arx_gaussian: Closed-form block TE for the smooth AR(1)-ARX
+        process (G2). Uses an augmented state-space, the discrete Lyapunov
+        stationary covariance, and Schur-complement log-det ratios.
+    te_block_state_space_gaussian: Monte-Carlo block TE for the AR(2)-driven
+        oscillator state-space (G1).
+    te_categorical_switch_block: Block TE for the G3 inclusive-redraw regime
+        switch (= H * te_categorical_switch, per channel).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from scipy.linalg import solve_discrete_lyapunov
 
 ArrayLike = Union[float, int, list, tuple, np.ndarray]
 
@@ -370,6 +379,834 @@ def te_categorical_switch(p: float, K: int) -> float:
     term_stay = -s * math.log(s) if s > 0.0 else 0.0
     term_off = -(K - 1) * p_off * math.log(p_off) if p_off > 0.0 else 0.0
     return float(term_stay + term_off)
+
+
+# ---------------------------------------------------------------------------
+# v2 additions: ARX, state-space oscillator, regime-switch block TE.
+# ---------------------------------------------------------------------------
+
+
+def _arx_state_space_matrices(
+    rho_u: float,
+    rho_y: float,
+    c: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    D: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Augmented state-space $(A, Q)$ for the AR(1)-ARX process.
+
+    The augmented state is
+
+    $$
+    x_t = \bigl[Y_t,\; U_t,\; U_{t-1},\; \ldots,\; U_{t-D}\bigr]^{\top}
+    \in \mathbb{R}^{D+2}.
+    $$
+
+    Under $U_t = \rho_u U_{t-1} + \eta_t$ and
+    $Y_t = \rho_y Y_{t-1} + c\,U_{t-D} + \varepsilon_t$, the state evolves as
+    $x_{t+1} = A x_t + w_{t+1}$ where $w_t$ has covariance $Q$ with only
+    the $Y$ and $U$ entries nonzero ($\sigma_\varepsilon^2$ and
+    $\sigma_\eta^2$ respectively).
+
+    Args:
+        rho_u: AR(1) coefficient of $U$, $0 \le \rho_u < 1$.
+        rho_y: AR(1) coefficient of $Y$, $0 \le \rho_y < 1$.
+        c: Source-to-target transfer coefficient.
+        sigma2_eta: Innovation variance of $U$, $> 0$.
+        sigma2_eps: Innovation variance of $Y$, $> 0$.
+        D: Source-to-target delay, $D \ge 1$.
+
+    Returns:
+        A tuple ``(A, Q)`` of ``(D+2, D+2)`` ``np.ndarray`` matrices.
+    """
+    n = D + 2
+    A = np.zeros((n, n))
+    A[0, 0] = rho_y
+    # Y_{t+1} = rho_y * Y_t + c * U_{(t+1)-D} + eps; with x_t^{(i)} = U_{t-i+1}
+    # for i >= 1, the term U_{(t+1)-D} = U_{t-D+1} = x_t^{(D)}.
+    A[0, D] = c
+    A[1, 1] = rho_u
+    # U-lag shift: x_{t+1}^{(i)} = x_t^{(i-1)} for i = 2, ..., D+1.
+    for i in range(2, D + 2):
+        A[i, i - 1] = 1.0
+    Q = np.zeros((n, n))
+    Q[0, 0] = sigma2_eps
+    Q[1, 1] = sigma2_eta
+    return A, Q
+
+
+def te_block_arx_gaussian(
+    rho_u: float,
+    rho_y: float,
+    c: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    H: int,
+    D: int,
+    *,
+    K_history: Optional[int] = None,
+) -> float:
+    r"""Closed-form block transfer entropy of the AR(1)-driven ARX process.
+
+    Computes the analytic block TE of the smooth ARX process
+
+    $$
+    U_t = \rho_u\,U_{t-1} + \eta_t,
+    \qquad
+    Y_t = \rho_y\,Y_{t-1} + c\,U_{t-D} + \varepsilon_t,
+    $$
+
+    with $\eta \sim \mathcal{N}(0, \sigma_\eta^2)$ and
+    $\varepsilon \sim \mathcal{N}(0, \sigma_\varepsilon^2)$, as the
+    log-determinant ratio
+
+    $$
+    \mathrm{TE}^{(H)}_{U \to Y}
+        = \tfrac{1}{2}\,
+        \ln\!\frac{\det \Sigma_{Y^{+} \mid Y^{-}}}{
+        \det \Sigma_{Y^{+} \mid Y^{-},\,U^{-}}},
+    $$
+
+    where $Y^{-} = Y_{t_{0}-K+1:t_{0}}$, $U^{-} = U_{t_{0}-K+1:t_{0}}$ and
+    $Y^{+} = Y_{t_{0}+1:t_{0}+H}$. The two conditional covariances are
+    obtained by Schur complement of the stationary joint covariance of
+    $(Y^{-}, U^{-}, Y^{+})$, which is built from the discrete-Lyapunov
+    stationary covariance of the augmented state
+    $x_t = [Y_t, U_t, U_{t-1}, \ldots, U_{t-D}]^{\top}$ propagated through
+    $\operatorname{Cov}(x_{t+\tau}, x_t) = A^{\tau} P$.
+
+    For Gaussian processes the determinant ratio **is** the true block
+    transfer entropy (Barnett–Barrett–Seth, 2009).
+
+    Args:
+        rho_u: AR(1) coefficient of $U$, $0 \le \rho_u < 1$.
+        rho_y: AR(1) coefficient of $Y$, $0 \le \rho_y < 1$.
+        c: Source-to-target transfer coefficient.
+        sigma2_eta: Innovation variance of $U$, $> 0$.
+        sigma2_eps: Innovation variance of $Y$, $> 0$.
+        H: Forecast horizon, $H \ge 1$.
+        D: Source-to-target delay, $D \ge 1$.
+        K_history: History depth used for both $Y^{-}$ and $U^{-}$. Defaults
+            to $D + 2H$, which is empirically sufficient for the conditional
+            covariance to have converged to its block-marginal limit.
+
+    Returns:
+        The block transfer entropy in nats.
+
+    Raises:
+        ValueError: On invalid ranges of $\rho_{*}$, $\sigma^2_{*}$, $H$, or
+            $D$.
+    """
+    if H <= 0:
+        raise ValueError(f"te_block_arx_gaussian: H must be > 0, got {H}.")
+    if D < 1:
+        raise ValueError(f"te_block_arx_gaussian: D must be >= 1, got {D}.")
+    if not 0.0 <= rho_u < 1.0:
+        raise ValueError(
+            f"te_block_arx_gaussian: rho_u must be in [0, 1), got {rho_u}."
+        )
+    if not 0.0 <= rho_y < 1.0:
+        raise ValueError(
+            f"te_block_arx_gaussian: rho_y must be in [0, 1), got {rho_y}."
+        )
+    if sigma2_eta <= 0.0 or sigma2_eps <= 0.0:
+        raise ValueError(
+            "te_block_arx_gaussian: sigma2_eta and sigma2_eps must be > 0."
+        )
+    if c == 0.0:
+        return 0.0
+
+    K = int(K_history) if K_history is not None else D + 2 * H
+
+    A, Q = _arx_state_space_matrices(rho_u, rho_y, c, sigma2_eta, sigma2_eps, D)
+    P = solve_discrete_lyapunov(A, Q)
+
+    # Precompute A^tau @ P for tau = 0, ..., max_lag where
+    # max_lag = (K + H - 1) covers every |s - t| arising in the joint cov.
+    max_lag = K + H - 1
+    APs = [P]
+    for _ in range(max_lag):
+        APs.append(A @ APs[-1])
+    R_YY = np.array([APs[t][0, 0] for t in range(max_lag + 1)])
+    R_UU = np.array([APs[t][1, 1] for t in range(max_lag + 1)])
+    R_YU_pos = np.array([APs[t][0, 1] for t in range(max_lag + 1)])
+    R_YU_neg = np.array([APs[t][1, 0] for t in range(max_lag + 1)])
+
+    # Joint covariance of (Y^-, U^-, Y^+). Pick t0 = K - 1 so Y^- and U^-
+    # occupy absolute times 0..K-1 and Y^+ occupies K..K+H-1.
+    t_Y_minus = np.arange(K)
+    t_U_minus = np.arange(K)
+    t_Y_plus = np.arange(K, K + H)
+
+    def _sym_block(times_a: np.ndarray, times_b: np.ndarray,
+                   R_arr: np.ndarray) -> np.ndarray:
+        return R_arr[np.abs(np.subtract.outer(times_a, times_b))]
+
+    def _yu_block(times_Y: np.ndarray, times_U: np.ndarray) -> np.ndarray:
+        delta = np.subtract.outer(times_Y, times_U)
+        out = np.where(
+            delta >= 0,
+            R_YU_pos[np.clip(delta, 0, max_lag)],
+            R_YU_neg[np.clip(-delta, 0, max_lag)],
+        )
+        return out
+
+    YY_mm = _sym_block(t_Y_minus, t_Y_minus, R_YY)
+    UU_mm = _sym_block(t_U_minus, t_U_minus, R_UU)
+    YU_mm = _yu_block(t_Y_minus, t_U_minus)
+
+    YY_pm = _sym_block(t_Y_plus, t_Y_minus, R_YY)   # Y^+ vs Y^-
+    YU_pm = _yu_block(t_Y_plus, t_U_minus)           # Y^+ vs U^-
+    YY_pp = _sym_block(t_Y_plus, t_Y_plus, R_YY)     # Y^+ vs Y^+
+
+    Sigma_YY_minus = YY_mm
+    Sigma_Yplus_Yminus = YY_pm
+    Sigma_Yplus_Yplus = YY_pp
+
+    # Sigma_{[Y-, U-], [Y-, U-]} block matrix.
+    Sigma_BB = np.block([[YY_mm, YU_mm], [YU_mm.T, UU_mm]])
+    Sigma_Yplus_B = np.concatenate([YY_pm, YU_pm], axis=1)
+
+    # Schur complements: Sigma_{Y+|Y-} and Sigma_{Y+|Y-,U-}.
+    rhs_Y = np.linalg.solve(Sigma_YY_minus, Sigma_Yplus_Yminus.T)
+    Sigma_cond_Y = Sigma_Yplus_Yplus - Sigma_Yplus_Yminus @ rhs_Y
+
+    rhs_YU = np.linalg.solve(Sigma_BB, Sigma_Yplus_B.T)
+    Sigma_cond_YU = Sigma_Yplus_Yplus - Sigma_Yplus_B @ rhs_YU
+
+    _sign_n, logdet_num = np.linalg.slogdet(Sigma_cond_Y)
+    _sign_d, logdet_den = np.linalg.slogdet(Sigma_cond_YU)
+    if _sign_n <= 0.0 or _sign_d <= 0.0:
+        raise RuntimeError(
+            "te_block_arx_gaussian: non-positive determinant in Schur "
+            "complement; check input ranges or raise K_history."
+        )
+    return float(0.5 * (logdet_num - logdet_den))
+
+
+def _te_block_arx_gaussian_mc(
+    rho_u: float,
+    rho_y: float,
+    c: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    H: int,
+    D: int,
+    *,
+    K_history: Optional[int] = None,
+    n_samples: int = 200_000,
+    burn_in: int = 200,
+    seed: int = 0,
+) -> float:
+    r"""Monte-Carlo cross-check of :func:`te_block_arx_gaussian`.
+
+    Simulates ``n_samples`` long ARX sequences, regresses the future block
+    $Y^{+}$ on $Y^{-}$ and on $[Y^{-}, U^{-}]$ by ordinary least squares,
+    and returns the half-log-det-ratio of the unbiased residual covariances.
+    Used only in unit tests as a numerical sanity check on the closed-form
+    determinant ratio; never called at runtime.
+
+    Args:
+        rho_u, rho_y, c, sigma2_eta, sigma2_eps, H, D, K_history: As in
+            :func:`te_block_arx_gaussian`.
+        n_samples: Number of simulated sequences (Monte-Carlo sample size).
+        burn_in: Number of warm-up steps discarded so the kept window is
+            stationary.
+        seed: Seed for the NumPy random generator.
+
+    Returns:
+        The Monte-Carlo block transfer entropy estimate in nats.
+    """
+    K = int(K_history) if K_history is not None else D + 2 * H
+    rng = np.random.default_rng(seed)
+    n = int(n_samples)
+    T = burn_in + K + H
+
+    eta = math.sqrt(sigma2_eta) * rng.standard_normal((n, T))
+    eps = math.sqrt(sigma2_eps) * rng.standard_normal((n, T))
+
+    U = np.empty((n, T), dtype=float)
+    Y = np.empty((n, T), dtype=float)
+    U_prev = np.zeros(n, dtype=float)
+    Y_prev = np.zeros(n, dtype=float)
+    for k in range(T):
+        U_prev = rho_u * U_prev + eta[:, k]
+        drive = c * U[:, k - D] if k >= D else 0.0
+        Y_prev = rho_y * Y_prev + drive + eps[:, k]
+        U[:, k] = U_prev
+        Y[:, k] = Y_prev
+
+    lo = burn_in
+    y_minus = Y[:, lo : lo + K]
+    u_minus = U[:, lo : lo + K]
+    y_plus = Y[:, lo + K : lo + K + H]
+    ones = np.ones((n, 1), dtype=float)
+
+    logdet_num = _residual_logdet(
+        np.concatenate([ones, y_minus], axis=1), y_plus
+    )
+    logdet_den = _residual_logdet(
+        np.concatenate([ones, y_minus, u_minus], axis=1), y_plus
+    )
+    return float(0.5 * (logdet_num - logdet_den))
+
+
+def _simulate_state_space_gaussian(
+    n: int,
+    T: int,
+    *,
+    oscillators: Sequence[Tuple[float, float]],
+    target_ar: float,
+    delays: Sequence[int],
+    B_y: Sequence[float],
+    sigma2_y: float,
+    sigma2_eta: Union[float, Sequence[float]],
+    burn_in: int = 500,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Simulate the G1 AR(2)-oscillator-driven Gaussian state-space.
+
+    Each informative source channel $m \in \{0, \ldots, M-1\}$ is generated
+    as an AR(2) oscillator
+
+    $$
+    s^{(m)}_t = 2\,r_m \cos(\omega_m)\,s^{(m)}_{t-1}
+        - r_m^{2}\,s^{(m)}_{t-2} + \eta^{(m)}_t,
+    \qquad
+    \eta^{(m)}_t \sim \mathcal{N}(0, \sigma^{2}_{\eta, m}).
+    $$
+
+    The target channel $m$ couples the lagged source state through
+
+    $$
+    y^{(m)}_t = A_y\,y^{(m)}_{t-1} + B_y^{(m)}\,s^{(m)}_{t-D_m}
+        + \varepsilon^{(m)}_t,
+    \qquad
+    \varepsilon^{(m)}_t \sim \mathcal{N}(0, \sigma^{2}_{y}),
+    $$
+
+    with $\sigma^2_y$ shared across channels. The simulator is shared
+    between :func:`te_block_state_space_gaussian` and the v2 generator
+    ``gen_state_space_oscillator`` so the two cannot disagree.
+
+    Args:
+        n: Number of independent sequences (samples).
+        T: Sequence length (post-burn-in).
+        oscillators: Length-$M$ list of $(r_m, \omega_m)$ pairs.
+        target_ar: Scalar target self-coefficient $A_y \in [0, 1)$.
+        delays: Length-$M$ list of source-to-target delays $D_m$.
+        B_y: Length-$M$ list of target loadings $B_y^{(m)}$.
+        sigma2_y: Target innovation variance $\sigma^2_y > 0$ (shared).
+        sigma2_eta: Source innovation variance — scalar (broadcast) or
+            length-$M$ array of positive floats.
+        burn_in: Warm-up steps discarded so the kept window is stationary.
+        seed: Seed for the NumPy random generator.
+
+    Returns:
+        A tuple ``(S, Y)`` of ``np.ndarray`` of shape ``(n, T, M)`` —
+        the oscillator state stream ``S`` (which the generator surfaces as
+        the informative source channels) and the target stream ``Y``.
+    """
+    M = len(oscillators)
+    if not (len(delays) == M and len(B_y) == M):
+        raise ValueError(
+            "_simulate_state_space_gaussian: oscillators / delays / B_y "
+            f"must all have the same length; got {M}, {len(delays)}, "
+            f"{len(B_y)}."
+        )
+    sigma2_eta_arr = _broadcast_to_m(sigma2_eta, M, "sigma2_eta")
+    if np.any(sigma2_eta_arr <= 0.0):
+        raise ValueError(
+            "_simulate_state_space_gaussian: every sigma2_eta entry must be > 0."
+        )
+    if sigma2_y <= 0.0:
+        raise ValueError(
+            "_simulate_state_space_gaussian: sigma2_y must be > 0."
+        )
+    if not 0.0 <= target_ar < 1.0:
+        raise ValueError(
+            f"_simulate_state_space_gaussian: target_ar must be in [0, 1), "
+            f"got {target_ar}."
+        )
+    rs = np.array([r for r, _ in oscillators], dtype=float)
+    omegas = np.array([w for _, w in oscillators], dtype=float)
+    if np.any((rs < 0.0) | (rs >= 1.0)):
+        raise ValueError(
+            "_simulate_state_space_gaussian: every oscillator r must lie in "
+            "[0, 1)."
+        )
+    delays_arr = np.array(delays, dtype=int)
+    if np.any(delays_arr < 1):
+        raise ValueError(
+            "_simulate_state_space_gaussian: every delay must be >= 1."
+        )
+    B_y_arr = np.array(B_y, dtype=float)
+
+    rng = np.random.default_rng(seed)
+    T_total = burn_in + T
+    D_max = int(delays_arr.max())
+    if D_max >= T_total:
+        raise ValueError(
+            "_simulate_state_space_gaussian: max delay must be < burn_in + T."
+        )
+
+    # AR(2) coefficients per channel (one-time).
+    ar1 = 2.0 * rs * np.cos(omegas)                   # (M,)
+    ar2 = -(rs ** 2)                                   # (M,)
+    eta_std = np.sqrt(sigma2_eta_arr)                  # (M,)
+    eps_std = math.sqrt(sigma2_y)
+
+    eta = rng.standard_normal((n, T_total, M)) * eta_std  # broadcast
+    eps = eps_std * rng.standard_normal((n, T_total, M))
+
+    S = np.zeros((n, T_total, M), dtype=float)
+    Y = np.zeros((n, T_total, M), dtype=float)
+    for t in range(T_total):
+        if t == 0:
+            S[:, t, :] = eta[:, t, :]
+        elif t == 1:
+            S[:, t, :] = ar1 * S[:, t - 1, :] + eta[:, t, :]
+        else:
+            S[:, t, :] = (
+                ar1 * S[:, t - 1, :] + ar2 * S[:, t - 2, :] + eta[:, t, :]
+            )
+        # Target update: y_t = A_y y_{t-1} + B_y * s_{t-D} + eps_t.
+        if t == 0:
+            Y[:, t, :] = eps[:, t, :]
+        else:
+            drive = np.zeros((n, M), dtype=float)
+            for m in range(M):
+                d_m = int(delays_arr[m])
+                if t >= d_m:
+                    drive[:, m] = B_y_arr[m] * S[:, t - d_m, m]
+            Y[:, t, :] = target_ar * Y[:, t - 1, :] + drive + eps[:, t, :]
+
+    return (
+        S[:, burn_in:, :].astype(float, copy=False),
+        Y[:, burn_in:, :].astype(float, copy=False),
+    )
+
+
+def te_block_state_space_gaussian(
+    oscillators: Sequence[Tuple[float, float]],
+    target_ar: float,
+    delays: Sequence[int],
+    B_y: Sequence[float],
+    sigma2_y: float,
+    sigma2_eta: Union[float, Sequence[float]],
+    H: int,
+    *,
+    K_history: Optional[int] = None,
+    n_samples: int = 50_000,
+    burn_in: int = 500,
+    seed: int = 0,
+) -> float:
+    r"""Monte-Carlo block transfer entropy for the G1 oscillator state-space.
+
+    For the AR(2)-oscillator-driven Gaussian state-space simulated by
+    :func:`_simulate_state_space_gaussian`, computes
+
+    $$
+    \widehat{\mathrm{TE}}^{(H)}_{U \to Y}
+        = \tfrac{1}{2}\,\bigl(
+            \ln\det \widehat\Sigma_{Y^{+} \mid Y^{-}}
+            - \ln\det \widehat\Sigma_{Y^{+} \mid Y^{-},\,U^{-}}
+        \bigr),
+    $$
+
+    where the conditional covariances are unbiased residual covariances of
+    OLS fits of $Y^{+}$ on $Y^{-}$ and on $[Y^{-}, U^{-}]$ over
+    ``n_samples`` simulated sequences. For jointly Gaussian processes the
+    determinant ratio **is** the true block transfer entropy
+    (Barnett–Barrett–Seth, 2009). The Monte-Carlo variance scales as
+    $O(K^{2} / n_{\text{samples}})$ in the worst case, so the default
+    ``n_samples = 50_000`` keeps the standard error below $\sim 1\%$ of
+    the mean across the planned benchmark grid; raise it if needed.
+
+    Args:
+        oscillators, target_ar, delays, B_y, sigma2_y, sigma2_eta,
+        burn_in, seed: As in :func:`_simulate_state_space_gaussian`.
+        H: Forecast horizon, $H \ge 1$.
+        K_history: History depth used for $Y^{-}$ and $U^{-}$. Defaults to
+            ``max(delays) + 2H``, matching the closed-form ARX setting.
+        n_samples: Number of simulated sequences.
+
+    Returns:
+        The Monte-Carlo block transfer entropy estimate in nats.
+    """
+    if H <= 0:
+        raise ValueError(f"te_block_state_space_gaussian: H must be > 0, got {H}.")
+    K = int(K_history) if K_history is not None else int(max(delays)) + 2 * H
+
+    T = K + H
+    S, Y = _simulate_state_space_gaussian(
+        n=int(n_samples),
+        T=T,
+        oscillators=oscillators,
+        target_ar=target_ar,
+        delays=delays,
+        B_y=B_y,
+        sigma2_y=sigma2_y,
+        sigma2_eta=sigma2_eta,
+        burn_in=burn_in,
+        seed=seed,
+    )
+    # Flatten the per-channel history into the design matrices (each
+    # informative channel contributes independently to Y^- and U^-).
+    n = S.shape[0]
+    M = S.shape[2]
+    y_minus = Y[:, :K, :].reshape(n, K * M)            # (n, K*M)
+    u_minus = S[:, :K, :].reshape(n, K * M)            # (n, K*M)
+    y_plus = Y[:, K : K + H, :].reshape(n, H * M)      # (n, H*M)
+    ones = np.ones((n, 1), dtype=float)
+
+    logdet_num = _residual_logdet(
+        np.concatenate([ones, y_minus], axis=1), y_plus
+    )
+    logdet_den = _residual_logdet(
+        np.concatenate([ones, y_minus, u_minus], axis=1), y_plus
+    )
+    return float(0.5 * (logdet_num - logdet_den))
+
+
+def _bisect_for_te_target(
+    eval_fn: Callable[[float], float],
+    target_te_block: float,
+    *,
+    lo: float,
+    hi: float,
+    tol: float,
+    max_iter: int,
+    label: str,
+) -> Tuple[float, float, int]:
+    r"""Bisect a monotone TE estimator to land on a target block TE.
+
+    Solves :math:`\widehat{\mathrm{TE}}(x) = \mathrm{target\_te\_block}` on
+    :math:`x \in [\mathrm{lo}, \mathrm{hi}]` by bisection. Assumes
+    ``eval_fn`` is monotone increasing on the bracket; the caller is
+    responsible for holding any stochastic seed fixed across iterations.
+
+    Stop conditions: relative bracket width *or* relative TE error falls
+    below ``tol``; the loop is capped at ``max_iter`` (returning the final
+    midpoint on the falling edge).
+
+    Args:
+        eval_fn: Maps a coupling magnitude :math:`x` to its block TE in
+            nats. Called twice for the bracket check, then up to
+            ``max_iter`` more times in the loop.
+        target_te_block: Target block TE in nats; must satisfy
+            :math:`\mathrm{eval\_fn}(\mathrm{lo}) < \mathrm{target} <
+            \mathrm{eval\_fn}(\mathrm{hi})`.
+        lo, hi: Bracket on the coupling magnitude.
+        tol, max_iter: Stop conditions.
+        label: Prefix used in the ``ValueError`` raised by the bracket
+            check (so the caller's error message identifies the inverter).
+
+    Returns:
+        ``(root, te_block_at_root, n_iter)``.
+
+    Raises:
+        ValueError: If the initial bracket does not contain ``target_te_block``.
+    """
+    te_lo = eval_fn(lo)
+    te_hi = eval_fn(hi)
+    if not (te_lo < target_te_block < te_hi):
+        raise ValueError(
+            f"{label}: initial bracket does not contain the target; "
+            f"TE({lo})={te_lo:.4f}, TE({hi})={te_hi:.4f}, "
+            f"target={target_te_block:.4f}. Widen [lo, hi]."
+        )
+
+    n_iter = 0
+    while n_iter < max_iter:
+        mid = 0.5 * (lo + hi)
+        te_mid = eval_fn(mid)
+        n_iter += 1
+        bracket_rel = (hi - lo) / max(mid, 1e-12)
+        te_rel = abs(te_mid - target_te_block) / max(target_te_block, 1e-12)
+        if bracket_rel < tol or te_rel < tol:
+            return mid, te_mid, n_iter
+        if te_mid < target_te_block:
+            lo = mid
+        else:
+            hi = mid
+
+    root = 0.5 * (lo + hi)
+    return root, eval_fn(root), n_iter + 1
+
+
+def B_y_for_te_block_state_space(
+    target_te_block: float,
+    *,
+    oscillators: Sequence[Tuple[float, float]],
+    target_ar: float,
+    delays: Sequence[int],
+    sigma2_y: float,
+    sigma2_eta: Union[float, Sequence[float]],
+    H: int,
+    K_history: Optional[int] = None,
+    n_samples: int = 50_000,
+    burn_in: int = 500,
+    seed: int = 0,
+    lo: float = 1e-4,
+    hi: float = 10.0,
+    tol: float = 1e-3,
+    max_iter: int = 40,
+) -> Dict[str, Any]:
+    r"""Invert :func:`te_block_state_space_gaussian` for a target block TE.
+
+    Solves for the **uniform** target-loading magnitude $b$ such that
+
+    $$
+    \widehat{\mathrm{TE}}^{(H)}_{U \to Y}\!\bigl(B_y = b \cdot \mathbf{1}_M\bigr)
+        = \mathrm{target\_te\_block}
+    $$
+
+    by bisection on the Monte-Carlo determinant-ratio estimator. The
+    estimator is monotone increasing in $|b|$ for fixed oscillator /
+    delay / variance hyperparameters (the cross-covariance scales linearly
+    in $b$, the determinant ratio monotonically in the cross-contribution),
+    so bisection converges robustly. ``seed`` is held fixed across
+    iterations so the Monte-Carlo noise does not break monotonicity.
+
+    The bracket $[\mathrm{lo}, \mathrm{hi}]$ must satisfy
+    $\mathrm{TE}(\mathrm{lo}) < \mathrm{target\_te\_block} < \mathrm{TE}(\mathrm{hi})$;
+    otherwise the function raises ``ValueError`` with the achieved values
+    so the caller can widen the bracket. For the
+    ``model_validation_v2_plan §5.3`` operating regime
+    (per-step TE $\in \{0.05, 0.15, 0.30\}$, block TE $\in \{1.5, 4.5, 9.0\}$
+    nats, the default G1 oscillator at $r=0.99$, $\omega=0.05$, $D=60$,
+    $A_y=0.95$, $M=4$), the default bracket $[10^{-4}, 10]$ comfortably
+    contains the root.
+
+    Args:
+        target_te_block: Target block transfer entropy in nats. Must be in
+            $[0, \mathrm{TE}(\mathrm{hi}))$; ``0`` returns immediately with
+            $B_y = 0$.
+        oscillators, target_ar, delays, sigma2_y, sigma2_eta, H, K_history,
+        n_samples, burn_in, seed: Forwarded to
+            :func:`te_block_state_space_gaussian`. The number of informative
+            channels $M$ is inferred from ``len(oscillators)``.
+        lo, hi: Initial bisection bracket on the uniform $B_y$ magnitude.
+        tol: Relative tolerance on either the bracket width or the achieved
+            block TE — the loop stops when either falls below it.
+        max_iter: Maximum bisection iterations.
+
+    Returns:
+        A dict with keys ``B_y`` (length-$M$ list of identical floats;
+        matches the forward API), ``B_y_scalar`` (the bisected magnitude),
+        ``te_block`` (achieved block TE in nats), ``te_per_step``
+        (= ``te_block / H``), and ``n_iter`` (iterations used).
+
+    Raises:
+        ValueError: If ``target_te_block < 0``, ``H <= 0``,
+            ``lo <= 0``, ``hi <= lo``, ``max_iter <= 0``, or if the initial
+            bracket does not contain the target TE.
+    """
+    if H <= 0:
+        raise ValueError(f"B_y_for_te_block_state_space: H must be > 0, got {H}.")
+    if target_te_block < 0.0:
+        raise ValueError(
+            f"B_y_for_te_block_state_space: target_te_block must be >= 0, "
+            f"got {target_te_block}."
+        )
+    if lo <= 0.0:
+        raise ValueError(
+            f"B_y_for_te_block_state_space: lo must be > 0, got {lo}."
+        )
+    if hi <= lo:
+        raise ValueError(
+            f"B_y_for_te_block_state_space: hi must be > lo, "
+            f"got lo={lo}, hi={hi}."
+        )
+    if max_iter <= 0:
+        raise ValueError(
+            f"B_y_for_te_block_state_space: max_iter must be > 0, "
+            f"got {max_iter}."
+        )
+    M = len(oscillators)
+    if M == 0:
+        raise ValueError(
+            "B_y_for_te_block_state_space: at least one oscillator is required."
+        )
+
+    if target_te_block == 0.0:
+        return {
+            "B_y": [0.0] * M,
+            "B_y_scalar": 0.0,
+            "te_block": 0.0,
+            "te_per_step": 0.0,
+            "n_iter": 0,
+        }
+
+    def _eval(b: float) -> float:
+        return te_block_state_space_gaussian(
+            oscillators=oscillators,
+            target_ar=target_ar,
+            delays=delays,
+            B_y=[b] * M,
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            H=H,
+            K_history=K_history,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            seed=seed,
+        )
+
+    b_star, te_block, n_iter = _bisect_for_te_target(
+        _eval, target_te_block, lo=lo, hi=hi, tol=tol, max_iter=max_iter,
+        label="B_y_for_te_block_state_space",
+    )
+
+    return {
+        "B_y": [float(b_star)] * M,
+        "B_y_scalar": float(b_star),
+        "te_block": float(te_block),
+        "te_per_step": float(te_block) / float(H),
+        "n_iter": int(n_iter),
+    }
+
+
+def c_for_te_block_arx(
+    target_te_block: float,
+    rho_u: float,
+    rho_y: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    H: int,
+    D: int,
+    *,
+    K_history: Optional[int] = None,
+    lo: float = 1.0e-4,
+    hi: float = 5.0,
+    tol: float = 1.0e-3,
+    max_iter: int = 40,
+) -> Dict[str, float]:
+    r"""Invert the ARX coupling :math:`c` to hit a target block TE.
+
+    Bisects the (positive) coupling magnitude :math:`c` so that the closed-form
+    block TE of the v2-G2 process matches ``target_te_block``. Because
+    :func:`te_block_arx_gaussian` is monotone increasing in :math:`|c|` for
+    fixed AR / variance hyperparameters, bisection converges robustly with no
+    Monte-Carlo noise.
+
+    The bracket :math:`[\mathrm{lo}, \mathrm{hi}]` must satisfy
+    :math:`\mathrm{TE}(\mathrm{lo}) < \mathrm{target\_te\_block} <
+    \mathrm{TE}(\mathrm{hi})`; otherwise the function raises ``ValueError``
+    with the achieved values so the caller can widen the bracket. For the
+    default G2 calibration regime (per-step TE :math:`\in \{0.05, 0.15, 0.30\}`,
+    block TE :math:`\in \{1.5, 4.5, 9.0\}` nats, the default G2 process at
+    :math:`\rho_u = 0.99`, :math:`\rho_y = 0.95`, :math:`D = 60`,
+    :math:`\sigma^2_\eta = \sigma^2_\varepsilon = 1`), the default bracket
+    :math:`[10^{-4}, 5]` comfortably contains the root.
+
+    Args:
+        target_te_block: Target *per-channel* block TE in nats. Must be
+            :math:`\ge 0`; ``0`` returns immediately with :math:`c = 0`.
+        rho_u: AR(1) coefficient of :math:`U`, :math:`0 \le \rho_u < 1`.
+        rho_y: AR(1) coefficient of :math:`Y`, :math:`0 \le \rho_y < 1`.
+        sigma2_eta: Innovation variance of :math:`U`, :math:`> 0`.
+        sigma2_eps: Innovation variance of :math:`Y`, :math:`> 0`.
+        H: Forecast horizon, :math:`H \ge 1`.
+        D: Source-to-target delay, :math:`D \ge 1`.
+        K_history: History depth forwarded to :func:`te_block_arx_gaussian`
+            (default :math:`D + 2H`).
+        lo, hi: Initial bisection bracket on :math:`c`.
+        tol: Relative tolerance on either the bracket width or the achieved
+            block TE -- the loop stops when either falls below it.
+        max_iter: Maximum bisection iterations.
+
+    Returns:
+        A dict with keys ``c_scalar`` (the bisected magnitude), ``te_block``
+        (achieved per-channel block TE in nats), ``te_per_step``
+        (``te_block / H``), and ``n_iter`` (iterations used).
+
+    Raises:
+        ValueError: If ``target_te_block < 0``, ``H <= 0``, ``D < 1``,
+            ``lo <= 0``, ``hi <= lo``, ``max_iter <= 0``, or if the initial
+            bracket does not contain the target TE.
+    """
+    if H <= 0:
+        raise ValueError(f"c_for_te_block_arx: H must be > 0, got {H}.")
+    if D < 1:
+        raise ValueError(f"c_for_te_block_arx: D must be >= 1, got {D}.")
+    if target_te_block < 0.0:
+        raise ValueError(
+            f"c_for_te_block_arx: target_te_block must be >= 0, "
+            f"got {target_te_block}."
+        )
+    if lo <= 0.0:
+        raise ValueError(f"c_for_te_block_arx: lo must be > 0, got {lo}.")
+    if hi <= lo:
+        raise ValueError(
+            f"c_for_te_block_arx: hi must be > lo, got lo={lo}, hi={hi}."
+        )
+    if max_iter <= 0:
+        raise ValueError(
+            f"c_for_te_block_arx: max_iter must be > 0, got {max_iter}."
+        )
+
+    if target_te_block == 0.0:
+        return {
+            "c_scalar": 0.0,
+            "te_block": 0.0,
+            "te_per_step": 0.0,
+            "n_iter": 0,
+        }
+
+    def _eval(c: float) -> float:
+        return te_block_arx_gaussian(
+            rho_u=rho_u, rho_y=rho_y, c=c,
+            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+            H=H, D=D, K_history=K_history,
+        )
+
+    c_star, te_block, n_iter = _bisect_for_te_target(
+        _eval, target_te_block, lo=lo, hi=hi, tol=tol, max_iter=max_iter,
+        label="c_for_te_block_arx",
+    )
+
+    return {
+        "c_scalar": float(c_star),
+        "te_block": float(te_block),
+        "te_per_step": float(te_block) / float(H),
+        "n_iter": int(n_iter),
+    }
+
+
+def te_categorical_switch_block(p: float, K: int, H: int) -> float:
+    r"""Block transfer entropy of the G3 inclusive-redraw regime switch.
+
+    For an inclusive-redraw categorical Markov chain on $K$ classes with
+    switch probability $p$, the regime at each step is renewed
+    independently of the past, so the per-step transfer entropy
+    :func:`te_categorical_switch` accumulates additively over a horizon
+    of $H$ future steps (per informative channel):
+
+    $$
+    \mathrm{TE}^{(H)}_{U \to Y}
+        = H \cdot \mathrm{TE}^{(1)}_{U \to Y}.
+    $$
+
+    The G3 generator scales by the number of independent regime processes
+    ($M$ informative channels), which is **not** done inside this helper.
+
+    Args:
+        p: Switch probability in $[0, 1]$.
+        K: Number of categorical classes, $K \ge 2$.
+        H: Forecast horizon, $H \ge 1$.
+
+    Returns:
+        The per-channel block transfer entropy in nats.
+
+    Raises:
+        ValueError: If ``p`` is outside $[0, 1]$, ``K < 2``, or ``H <= 0``.
+    """
+    if H <= 0:
+        raise ValueError(f"te_categorical_switch_block: H must be > 0, got {H}.")
+    return float(H * te_categorical_switch(p, K))
 
 
 if __name__ == "__main__":

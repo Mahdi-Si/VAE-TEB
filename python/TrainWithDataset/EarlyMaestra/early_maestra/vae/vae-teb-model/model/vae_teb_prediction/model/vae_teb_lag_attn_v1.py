@@ -1562,6 +1562,7 @@ class SeqVaeLagAttnV1(nn.Module):
         *,
         reduce_mean: bool = True,
         weight: Optional[torch.Tensor] = None,
+        free_bits: float = 0.0,
     ) -> torch.Tensor:
         """Aggregate the per-step closed-form KL into a scalar loss.
 
@@ -1571,6 +1572,11 @@ class SeqVaeLagAttnV1(nn.Module):
                 mask so that KL at gap / invalid time steps contributes zero
                 to the loss and zero to the denominator. If ``None``, falls
                 back to warm-up-only averaging (legacy behaviour).
+            free_bits: Lower bound applied per (b, t, d) on the closed-form
+                KL before aggregation. The default ``0.0`` is a no-op
+                because :math:`\\mathrm{KL}(q\\,\\|\\,p) \\ge 0` for diagonal
+                Gaussians; values ``> 0`` implement canonical free-bits
+                (model_validation_v2_plan §5.6 fallback).
         """
         kld = self.kld_tensor(
             mu_prior=mu_prior,
@@ -1579,6 +1585,8 @@ class SeqVaeLagAttnV1(nn.Module):
             logvar_post=logvar_post,
             mask_warmup=False,
         )                                                # (B, T, d_z)
+        if free_bits > 0.0:
+            kld = kld.clamp(min=float(free_bits))
         B, T, d_z = kld.shape
         warmup = self._warmup_steps(T)
         device = kld.device
@@ -1617,17 +1625,25 @@ class SeqVaeLagAttnV1(nn.Module):
         beta: float = 1.0,
         lambda_full: float = 1.0,
         lambda_base: float = 0.5,
+        likelihood: str = "mse",
+        sigma_obs: "float | str" = 1.0,
+        free_bits: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        """Compute the v1 training objective.
+        r"""Compute the v1 training objective.
 
         ``L_total = lambda_full * L_feat + lambda_base * L_base + beta * L_KL``
 
-        * ``L_feat`` — weighted MSE between ``mu_full`` and the future FHR
-          feature trajectory, over valid anchors ``t in [warmup, T - H_d)``.
-        * ``L_base`` — same form but with ``mu_base``. Forces the FHR-only
-          branch to be a strong forecaster on its own.
-        * ``L_KL`` — ``KL(q || p)`` averaged over ``t in [warmup, T)``. Note
-          that the KL window is *independent* of the feature-loss window.
+        * ``L_feat`` — per-element reconstruction term on the future FHR
+          feature trajectory, evaluated at valid anchors
+          ``t in [warmup, T - H_d)``. Either weighted MSE (default) or
+          Gaussian negative log-likelihood (Sprint 5 calibration path).
+        * ``L_base`` — same form but on ``mu_base`` / ``logvar_base``. Forces
+          the FHR-only branch to be a strong forecaster on its own.
+        * ``L_KL`` — ``KL(q || p)`` averaged over ``t in [warmup, T)``. The
+          KL window is *independent* of the feature-loss window. When
+          ``free_bits > 0`` each per-dim per-step KL is lower-bounded by
+          ``free_bits`` (canonical free-bits, no-op at the default 0.0
+          since KL is non-negative).
 
         Args:
             forward_outputs: Dict returned by :meth:`forward`.
@@ -1647,10 +1663,33 @@ class SeqVaeLagAttnV1(nn.Module):
             beta: Weight on the KL term.
             lambda_full: Weight on ``L_feat``.
             lambda_base: Weight on ``L_base``.
+            likelihood: Reconstruction likelihood. ``'mse'`` (default,
+                bit-exact with all pre-Sprint-5 checkpoints) computes the
+                weighted squared error :math:`(\hat y - y)^2`. ``'gaussian_nll'``
+                computes :math:`\tfrac12(\hat y - y)^2/\sigma^2 + \tfrac12\ln\sigma^2`
+                per element, giving ``L_feat`` units of *nats per element*
+                so it is directly comparable to ``kld_loss``. This is the
+                Sprint 5 calibration mode (model_validation_v2_plan §5.1).
+            sigma_obs: Observation noise. Only consulted when
+                ``likelihood='gaussian_nll'``. A positive float fixes
+                :math:`\sigma_{obs}` to that scalar value (so
+                :math:`\ln\sigma^2 = 2\ln\sigma_{obs}` is constant);
+                the literal string ``'learned'`` instead reuses the model's
+                already-trained ``logvar_full`` / ``logvar_base`` heads
+                (per-channel, clamped via ``logvar_clamp``). For MSE this
+                kwarg is ignored.
+            free_bits: Per-dim per-step lower bound for the KL term. The
+                default ``0.0`` is a no-op (closed-form Gaussian KL is
+                non-negative). Used only in the Sprint 5.6 conditional
+                fallback if a calibrated β collapses the latent.
 
         Returns:
-            Dict with ``feat_loss``, ``base_loss``, ``kld_loss``, ``total_loss``,
-            and ``beta``.
+            Dict with ``feat_loss``, ``base_loss``, ``kld_loss``,
+            ``total_loss``, ``beta``, ``likelihood`` (string echo), and
+            ``mean_logvar_full`` / ``mean_logvar_base`` collapse diagnostics
+            (always present for tracking; for ``likelihood='mse'`` these are
+            still computed from ``logvar_full`` / ``logvar_base`` so that
+            checkpoints record whether the heads stayed lively).
         """
         Y = torch.cat([y_st, y_ph], dim=-1)                # (B, T, C_y)
         mu_full = forward_outputs["mu_full"]               # (B, T, H_d, C_y)
@@ -1706,8 +1745,56 @@ class SeqVaeLagAttnV1(nn.Module):
 
         diff_full = (mu_full_valid - Y_plus) ** 2
         diff_base = (mu_base_valid - Y_plus) ** 2
-        feat_loss = (diff_full * mask_feat).sum() / denom
-        base_loss = (diff_base * mask_feat).sum() / denom
+
+        # Heads are always present (see forward dict invariant in §5
+        # ``new_architecture.md``); slice to the valid anchor range so the
+        # NLL branch and the diagnostics share the same support as the means.
+        logvar_full_valid = forward_outputs["logvar_full"][:, :T_valid, :, :]
+        logvar_base_valid = forward_outputs["logvar_base"][:, :T_valid, :, :]
+
+        if likelihood == "mse":
+            per_elem_full = diff_full
+            per_elem_base = diff_base
+        elif likelihood == "gaussian_nll":
+            if isinstance(sigma_obs, str):
+                if sigma_obs != "learned":
+                    raise ValueError(
+                        f"sigma_obs string must be 'learned', got {sigma_obs!r}"
+                    )
+                logvar_full_obs = logvar_full_valid
+                logvar_base_obs = logvar_base_valid
+            else:
+                sigma_obs_f = float(sigma_obs)
+                if sigma_obs_f <= 0.0:
+                    raise ValueError(
+                        "sigma_obs scalar must be positive, "
+                        f"got {sigma_obs_f}"
+                    )
+                logvar_scalar = math.log(sigma_obs_f ** 2)
+                logvar_full_obs = torch.full_like(
+                    diff_full, logvar_scalar
+                )
+                logvar_base_obs = torch.full_like(
+                    diff_base, logvar_scalar
+                )
+            # Per-element Gaussian NLL in nats:
+            #   0.5 * (mu - y)^2 / sigma^2 + 0.5 * log(sigma^2)
+            per_elem_full = (
+                0.5 * diff_full * torch.exp(-logvar_full_obs)
+                + 0.5 * logvar_full_obs
+            )
+            per_elem_base = (
+                0.5 * diff_base * torch.exp(-logvar_base_obs)
+                + 0.5 * logvar_base_obs
+            )
+        else:
+            raise ValueError(
+                "likelihood must be 'mse' or 'gaussian_nll', "
+                f"got {likelihood!r}"
+            )
+
+        feat_loss = (per_elem_full * mask_feat).sum() / denom
+        base_loss = (per_elem_base * mask_feat).sum() / denom
 
         # --- KL loss -------------------------------------------------------
         if compute_kld_loss:
@@ -1718,6 +1805,7 @@ class SeqVaeLagAttnV1(nn.Module):
                 logvar_post=forward_outputs["logvar_post"],
                 reduce_mean=True,
                 weight=weight,
+                free_bits=free_bits,
             )
         else:
             kld_loss = torch.zeros((), device=device, dtype=dtype)
@@ -1727,12 +1815,29 @@ class SeqVaeLagAttnV1(nn.Module):
             + lambda_base * base_loss
             + beta * kld_loss
         )
+
+        # Collapse diagnostics: mean over the valid (mask-weighted) support.
+        # ``mask_feat`` is (B, T_valid, H_d, 1) and broadcasts across C in
+        # the numerator, so the matching denominator is the same one the
+        # per-element losses use (``mask_feat.sum() * C``) — otherwise the
+        # diagnostic would scale with the channel count and fall outside
+        # the head's logvar_clamp band.
+        mean_logvar_full = (
+            (logvar_full_valid * mask_feat).sum() / denom
+        )
+        mean_logvar_base = (
+            (logvar_base_valid * mask_feat).sum() / denom
+        )
+
         return {
             "feat_loss": feat_loss,
             "base_loss": base_loss,
             "kld_loss": kld_loss,
             "total_loss": total_loss,
             "beta": torch.tensor(float(beta), device=device, dtype=dtype),
+            "likelihood": likelihood,
+            "mean_logvar_full": mean_logvar_full,
+            "mean_logvar_base": mean_logvar_base,
         }
 
 
