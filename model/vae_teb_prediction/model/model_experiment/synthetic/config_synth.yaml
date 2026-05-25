@@ -52,6 +52,33 @@ paths:
   # On gpu_pool the workers re-load this YAML, so editing it here is the
   # simplest way to point an entire sweep at a different drive.
 
+# --- structured channel decomposition (v2: replaces white-noise padding) -----
+# Each non-informative channel that the model's forecasting loss averages over
+# is one MSE term. v1's pure-N(0,1) padding made most target channels
+# unpredictable and the irreducible loss buried the TE signal in K_bar /
+# delta-L. v2 layout:
+#   Y = [TE (m) | self-predictable (n_self) | small-noise (n_smallnoise)]
+#   U = [TE (m_source) | AR(1) distractor (n_dist) | pure noise (n_noise)]
+# where m_source = m for G1/G2 and m_source = M * K_classes for G3.
+# build_dataset._resolve_channel_decomp derives m and m_source from data.M
+# (single source of truth) and auto-derives n_self = c_y - m - n_smallnoise
+# and n_dist = c_u - m_source - n_noise so n_smallnoise / n_noise stay fixed
+# across sweep cells (the small-noise loss floor is invariant to M).
+# The small-noise tail is EXCLUDED from per-channel z-scoring -- it stays at
+# sigma_smallnoise after standardisation so its MSE contribution is O(sigma^2).
+channel_decomp_defaults: &channel_decomp_defaults
+  target:
+    n_smallnoise:     13            # low-variance tail; ~13/87 of the Y buffer
+    sigma_smallnoise: 0.05          # std before placement; not z-scored
+    ar1_fraction:     0.5           # half of n_self is AR(1), half oscillator
+    rho_range:        [0.95, 0.995] # per-channel AR(1) rho for Y^self
+    osc_period_range: [60, 200]     # periods > horizon (H=30) so Y^self is
+                                    # forecastable from history alone
+    osc_amp_range:    [0.5, 1.5]
+  source:
+    n_noise:          17            # pure N(0,1) stress-test tail
+    rho_range:        [0.90, 0.995] # per-channel AR(1) rho for U^dist
+
 # --- per-benchmark data + sweep blocks (see model_validation_v2.md sec. 3) ----
 # v2 operating regime (Decision V2-D6): real-data UP->FHR per-step TE is
 # ~0.05-0.3 nats. Each benchmark exposes one continuous knob (B_y for G1,
@@ -82,6 +109,8 @@ benchmarks:
       c_y_ph: 44
       c_u_st: 43
       c_u_ph: 58
+      channel_decomp:               # structured distractor decomposition (v2)
+        <<: *channel_decomp_defaults
     sweep:
       kind: gaussian_state_space    # B_y_grid x m_grid, te via te_block_state_space_gaussian
       B_y_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -112,6 +141,8 @@ benchmarks:
       c_y_ph: 44
       c_u_st: 43
       c_u_ph: 58
+      channel_decomp:
+        <<: *channel_decomp_defaults
     # no sweep block -- knob-free directionality run
 
   # Benchmark G1_twoband -- two-band variant of G1 (Sprint 4.5). M=4 channels
@@ -139,6 +170,8 @@ benchmarks:
       c_y_ph: 44
       c_u_st: 43
       c_u_ph: 58
+      channel_decomp:
+        <<: *channel_decomp_defaults
     # no sweep block -- knob-free two-band diagnostic run
 
   # Benchmark G2 -- smooth AR(1)-ARX (debugging sanity benchmark, V2-D9).
@@ -169,6 +202,8 @@ benchmarks:
       c_y_ph: 44
       c_u_st: 43
       c_u_ph: 58
+      channel_decomp:
+        <<: *channel_decomp_defaults
     sweep:
       kind: arx                     # c_grid x m_grid, te via te_block_arx_gaussian
       c_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -221,6 +256,10 @@ benchmarks:
       c_y_ph: 44
       c_u_st: 43
       c_u_ph: 58
+      channel_decomp:               # G3 source TE block has width M*K_classes
+                                    # (per-channel one-hot); n_dist is
+                                    # auto-derived as c_u - M*K_classes - n_noise.
+        <<: *channel_decomp_defaults
     sweep:
       kind: regime_switch           # p_grid x m_grid, te via te_categorical_switch_block
       p_grid: [0.0, 0.25, 0.5, 0.75, 1.0]

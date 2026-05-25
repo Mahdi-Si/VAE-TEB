@@ -99,6 +99,14 @@ class SyntheticTEDataset(Dataset):
         split: Split name derived from the ``.npz`` stem (``train``/``val``/...).
         te_true: Block transfer entropy of this benchmark, in nats.
         true_lag_band: List of source lags carrying the transfer.
+        channel_decomp: Resolved structured channel decomposition
+            (``m``, ``n_self``, ``n_smallnoise``, ``m_source``, ``n_dist``,
+            ``n_noise`` plus the AR(1) / oscillator ranges) or ``None`` if
+            the cache pre-dates the v2 decomposition pipeline.
+        channel_layout: Per-block absolute channel index lists
+            ``{"Y": {"te", "self", "smallnoise"}, "U": {"te", "dist",
+            "noise"}}`` or ``None`` for legacy caches. Downstream evaluators
+            read this to colour-code or mask sub-blocks.
     """
 
     def __init__(
@@ -138,6 +146,14 @@ class SyntheticTEDataset(Dataset):
         self.true_lag_band = list(self.meta["true_lag_band"])
         self._tag: str = str(self.meta.get("tag", self.meta.get("benchmark", "syn")))
         self._lag_band_tensor = torch.tensor(self.true_lag_band, dtype=torch.long)
+        # v2 structured channel decomposition. Legacy caches written before
+        # the decomposition pipeline existed leave these as ``None``.
+        self.channel_decomp: Optional[Dict[str, Any]] = self.meta.get(
+            "channel_decomp"
+        )
+        self.channel_layout: Optional[Dict[str, Dict[str, list]]] = self.meta.get(
+            "channel_layout"
+        )
 
         # Read the split fully into RAM and close the archive handle inside
         # the ``with`` block, so the cache file is never left open.

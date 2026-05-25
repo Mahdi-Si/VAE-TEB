@@ -86,12 +86,26 @@ def test_g2_determinism() -> None:
 
 
 def test_g2_standardisation_per_channel() -> None:
-    """``standardize=True`` puts every channel on $\\mathcal{N}(0, 1)$."""
-    Y, U, _ = gen_smooth_arx(
+    r"""``standardize=True`` z-scores all channels except the Y small-noise tail.
+
+    Under the v2 structured decomposition, the last ``n_smallnoise`` target
+    channels keep their pre-placement $\sigma_{\text{smallnoise}}\ll 1$ so
+    their MSE contribution stays tiny; only the head $[0, c_y - n_{\text
+    {smallnoise}})$ block is z-scored to $\mathcal{N}(0, 1)$. The source
+    buffer is fully standardised.
+    """
+    Y, U, meta = gen_smooth_arx(
         n=64, T=300, seed=0, standardize=True, **_G2_DEFAULTS,
     )
-    assert Y.mean(dim=(0, 1)).abs().max().item() < 0.1
-    assert (Y.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
+    n_sn = int(meta["channel_decomp"]["n_smallnoise"])
+    sigma_sn = float(meta["channel_decomp"]["sigma_smallnoise"])
+    head = Y[..., : Y.shape[-1] - n_sn]
+    tail = Y[..., Y.shape[-1] - n_sn :]
+    assert head.mean(dim=(0, 1)).abs().max().item() < 0.1
+    assert (head.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
+    # Tail keeps its low-variance contract (within 30% relative slack at
+    # n=64 samples).
+    assert (tail.var(dim=(0, 1)) - sigma_sn ** 2).abs().max().item() < 0.3 * sigma_sn ** 2
     assert U.mean(dim=(0, 1)).abs().max().item() < 0.1
     assert (U.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
 
@@ -223,12 +237,17 @@ def test_g1_determinism() -> None:
 
 
 def test_g1_standardisation_per_channel() -> None:
-    """``standardize=True`` puts every channel near $\\mathcal{N}(0, 1)$."""
-    Y, U, _ = gen_state_space_oscillator(
+    r"""``standardize=True`` z-scores all channels except the Y small-noise tail."""
+    Y, U, meta = gen_state_space_oscillator(
         n=32, T=300, seed=0, standardize=True, **_G1_DEFAULTS,
     )
-    assert Y.mean(dim=(0, 1)).abs().max().item() < 0.1
-    assert (Y.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
+    n_sn = int(meta["channel_decomp"]["n_smallnoise"])
+    sigma_sn = float(meta["channel_decomp"]["sigma_smallnoise"])
+    head = Y[..., : Y.shape[-1] - n_sn]
+    tail = Y[..., Y.shape[-1] - n_sn :]
+    assert head.mean(dim=(0, 1)).abs().max().item() < 0.1
+    assert (head.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
+    assert (tail.var(dim=(0, 1)) - sigma_sn ** 2).abs().max().item() < 0.3 * sigma_sn ** 2
     assert U.mean(dim=(0, 1)).abs().max().item() < 0.1
     assert (U.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.1
 
@@ -335,12 +354,17 @@ def test_g3_determinism() -> None:
 
 
 def test_g3_standardisation_per_channel() -> None:
-    """``standardize=True`` puts every channel near $\\mathcal{N}(0, 1)$."""
-    Y, U, _ = gen_regime_switch_smooth(
+    r"""``standardize=True`` z-scores all channels except the Y small-noise tail."""
+    Y, U, meta = gen_regime_switch_smooth(
         n=64, T=300, seed=0, standardize=True, **_G3_DEFAULTS,
     )
-    assert Y.mean(dim=(0, 1)).abs().max().item() < 0.15
-    assert (Y.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.15
+    n_sn = int(meta["channel_decomp"]["n_smallnoise"])
+    sigma_sn = float(meta["channel_decomp"]["sigma_smallnoise"])
+    head = Y[..., : Y.shape[-1] - n_sn]
+    tail = Y[..., Y.shape[-1] - n_sn :]
+    assert head.mean(dim=(0, 1)).abs().max().item() < 0.15
+    assert (head.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.15
+    assert (tail.var(dim=(0, 1)) - sigma_sn ** 2).abs().max().item() < 0.3 * sigma_sn ** 2
     assert U.mean(dim=(0, 1)).abs().max().item() < 0.15
     assert (U.var(dim=(0, 1)) - 1.0).abs().max().item() < 0.15
 
@@ -451,3 +475,223 @@ def test_all_generators_return_three_outputs() -> None:
         assert "true_lag_band" in meta
         assert "informative_channels" in meta
         assert "benchmark" in meta
+
+
+# ---------------------------------------------------------------------------
+# Channel decomposition v2 (structured distractors)
+# ---------------------------------------------------------------------------
+#
+# Covers the replacement of pure-N(0,1) distractor padding with the
+# [TE | self-predictable | small-noise] target layout and the
+# [TE | AR(1) distractor | pure noise] source layout (see generators.py
+# DEFAULT_DECOMP_PARAMS and model_validation_v2.md ``Recommended channel
+# design`` section).
+
+
+@pytest.mark.parametrize(
+    "builder, benchmark, m_source_factor",
+    [
+        (lambda: gen_smooth_arx(n=4, T=300, seed=0, **_G2_DEFAULTS), "G2", 1),
+        (lambda: gen_state_space_oscillator(n=4, T=300, seed=0, **_G1_DEFAULTS), "G1", 1),
+        (lambda: gen_regime_switch_smooth(n=4, T=300, seed=0, **_G3_DEFAULTS), "G3", 10),
+    ],
+)
+def test_channel_layout_order(builder, benchmark: str, m_source_factor: int) -> None:
+    r"""``meta['channel_layout']`` reports contiguous ``[TE | mid | tail]`` blocks."""
+    _, _, meta = builder()
+    M = meta["M"]
+    layout = meta["channel_layout"]
+    decomp = meta["channel_decomp"]
+    c_y, c_u = meta["c_y"], meta["c_u"]
+    # Target side: TE -> self -> smallnoise.
+    assert layout["Y"]["te"] == list(range(0, M))
+    assert layout["Y"]["self"][0] == M
+    assert layout["Y"]["self"][-1] == M + decomp["n_self"] - 1
+    assert layout["Y"]["smallnoise"][0] == M + decomp["n_self"]
+    assert layout["Y"]["smallnoise"][-1] == c_y - 1
+    assert len(layout["Y"]["smallnoise"]) == decomp["n_smallnoise"]
+    # Source side: TE -> dist -> noise. G3 source TE block is M * K_classes.
+    m_source = M * m_source_factor
+    assert decomp["m_source"] == m_source
+    assert layout["U"]["te"] == list(range(0, m_source))
+    assert layout["U"]["dist"][0] == m_source if decomp["n_dist"] > 0 else True
+    assert layout["U"]["noise"][-1] == c_u - 1
+    # Budgets close.
+    assert M + decomp["n_self"] + decomp["n_smallnoise"] == c_y
+    assert m_source + decomp["n_dist"] + decomp["n_noise"] == c_u
+
+
+def test_self_block_has_temporal_autocorrelation() -> None:
+    r"""$Y^{\text{self}}$ has clearly positive lag-1 autocorrelation per channel.
+
+    Both AR(1) ($\rho \in [0.95, 0.995]$) and oscillator (period $\ge 60$
+    steps $\Rightarrow$ $\rho_1 = \cos(2\pi/\text{period})\gtrsim 0.94$)
+    halves produce strong short-term dependence. We assert
+    $\rho_1(\text{per channel}) > 0.5$ at the harshest of the two.
+    """
+    Y, _, meta = gen_smooth_arx(
+        n=32, T=300, seed=0, standardize=True, **_G2_DEFAULTS,
+    )
+    self_idx = meta["channel_layout"]["Y"]["self"]
+    Yself = Y[..., self_idx]                                  # (n, T, n_self)
+    x = Yself - Yself.mean(dim=(0, 1), keepdim=True)
+    num = (x[:, 1:, :] * x[:, :-1, :]).mean(dim=(0, 1))
+    den = (x ** 2).mean(dim=(0, 1)).clamp_min(1e-8)
+    rho1 = num / den
+    assert rho1.min().item() > 0.5, (
+        f"Y^self min lag-1 autocorrelation {rho1.min().item():.3f} <= 0.5; "
+        f"per-channel values = {rho1.tolist()}"
+    )
+
+
+def test_self_block_independent_of_source_te() -> None:
+    r"""$Y^{\text{self}}$ is uncoupled from $U^{\text{TE}}$ (zero-lag xcorr)."""
+    Y, U, meta = gen_smooth_arx(
+        n=64, T=300, seed=0, standardize=True, **_G2_DEFAULTS,
+    )
+    Yself = Y[..., meta["channel_layout"]["Y"]["self"]]
+    Ute = U[..., meta["channel_layout"]["U"]["te"]]
+    Ys = (Yself - Yself.mean(dim=(0, 1))).reshape(-1, Yself.shape[-1])
+    Us = (Ute - Ute.mean(dim=(0, 1))).reshape(-1, Ute.shape[-1])
+    cc = (Ys.T @ Us) / Ys.shape[0]
+    cc = cc / (Ys.std(0).unsqueeze(1) * Us.std(0).unsqueeze(0) + 1e-8)
+    max_abs = cc.abs().max().item()
+    assert max_abs < 0.12, (
+        f"Y^self ⟂ U^TE xcorr too large: {max_abs:.3f}; cross-corr matrix "
+        f"shape={tuple(cc.shape)}"
+    )
+
+
+def test_smallnoise_block_variance_after_standardise() -> None:
+    r"""The small-noise tail keeps its $\sigma^2_{\text{smallnoise}}$ variance."""
+    Y, _, meta = gen_smooth_arx(
+        n=64, T=600, seed=0, standardize=True, **_G2_DEFAULTS,
+    )
+    sn_idx = meta["channel_layout"]["Y"]["smallnoise"]
+    sigma = float(meta["channel_decomp"]["sigma_smallnoise"])
+    Ysn = Y[..., sn_idx]
+    # Empirical variance per channel: relative slack 30% at n=64, T=600.
+    var = Ysn.var(dim=(0, 1))
+    assert ((var - sigma ** 2).abs() / (sigma ** 2)).max().item() < 0.3, (
+        f"smallnoise tail variance deviates from sigma^2={sigma**2:.6f}; "
+        f"per-channel var = {var.tolist()}"
+    )
+
+
+def test_budget_validation_raises_on_oversized_smallnoise() -> None:
+    """An explicit ``channel_decomp`` with mismatched budget raises ``ValueError``."""
+    bad_decomp = {
+        "m": 4,
+        "n_self": 70,
+        "n_smallnoise": 999,                # blatantly oversized
+        "m_source": 4,
+        "n_dist": 80,
+        "n_noise": 17,
+        "sigma_smallnoise": 0.05,
+        "ar1_fraction": 0.5,
+        "rho_range_self": (0.95, 0.995),
+        "rho_range_dist": (0.90, 0.995),
+        "osc_period_range": (60, 200),
+        "osc_amp_range": (0.5, 1.5),
+    }
+    with pytest.raises(ValueError, match="budget"):
+        gen_smooth_arx(
+            n=2, T=100, seed=0, channel_decomp=bad_decomp, **_G2_DEFAULTS,
+        )
+
+
+def test_budget_validation_raises_on_m_mismatch() -> None:
+    """A ``channel_decomp`` whose ``m`` disagrees with generator ``M`` raises."""
+    decomp_wrong_m = {
+        "m": 99,                                # disagrees with M=4
+        "n_self": 70, "n_smallnoise": 13,
+        "m_source": 4, "n_dist": 80, "n_noise": 17,
+        "sigma_smallnoise": 0.05, "ar1_fraction": 0.5,
+        "rho_range_self": (0.95, 0.995), "rho_range_dist": (0.90, 0.995),
+        "osc_period_range": (60, 200), "osc_amp_range": (0.5, 1.5),
+    }
+    with pytest.raises(ValueError, match="m"):
+        gen_smooth_arx(
+            n=2, T=100, seed=0, channel_decomp=decomp_wrong_m, **_G2_DEFAULTS,
+        )
+
+
+def test_default_decomp_clamps_for_easy_variant() -> None:
+    r"""``easy_variant=True`` (M = c_y) collapses ``n_self`` / ``n_smallnoise`` to 0."""
+    _, _, meta = gen_smooth_arx(
+        n=4, T=300, seed=0, easy_variant=True, **{**_G2_DEFAULTS, "M": 4},
+    )
+    decomp = meta["channel_decomp"]
+    assert decomp["m"] == meta["c_y"]                  # full informative width
+    assert decomp["n_self"] == 0
+    assert decomp["n_smallnoise"] == 0
+    assert decomp["m_source"] == meta["c_y"]
+    # Source: c_u=101 - m_source=87 - n_noise=14 (clamped from 17) = 0.
+    assert decomp["n_dist"] == 0
+
+
+def test_determinism_with_structured_decomp() -> None:
+    r"""Same seed -> bitwise-identical buffers under structured padding too."""
+    Y1, U1, m1 = gen_smooth_arx(n=4, T=300, seed=42, **_G2_DEFAULTS)
+    Y2, U2, m2 = gen_smooth_arx(n=4, T=300, seed=42, **_G2_DEFAULTS)
+    assert torch.equal(Y1, Y2)
+    assert torch.equal(U1, U2)
+    # The resolved layout is also identical (RNG-free).
+    assert m1["channel_layout"] == m2["channel_layout"]
+
+
+def test_source_dist_block_is_ar1() -> None:
+    r"""$U^{\text{dist}}$ channels have AR(1)-like lag-1 autocorrelation."""
+    _, U, meta = gen_smooth_arx(
+        n=32, T=600, seed=0, standardize=True, **_G2_DEFAULTS,
+    )
+    dist_idx = meta["channel_layout"]["U"]["dist"]
+    Ud = U[..., dist_idx]
+    x = Ud - Ud.mean(dim=(0, 1), keepdim=True)
+    num = (x[:, 1:, :] * x[:, :-1, :]).mean(dim=(0, 1))
+    den = (x ** 2).mean(dim=(0, 1)).clamp_min(1e-8)
+    rho1 = num / den
+    # rho_range_dist defaults to (0.90, 0.995); empirical lag-1 should be high.
+    assert rho1.min().item() > 0.7, (
+        f"U^dist min lag-1 autocorrelation {rho1.min().item():.3f} <= 0.7"
+    )
+
+
+def test_source_noise_block_is_white() -> None:
+    r"""$U^{\text{noise}}$ channels are essentially white (lag-1 xcorr ≈ 0)."""
+    _, U, meta = gen_smooth_arx(
+        n=32, T=600, seed=0, standardize=True, **_G2_DEFAULTS,
+    )
+    noise_idx = meta["channel_layout"]["U"]["noise"]
+    Un = U[..., noise_idx]
+    x = Un - Un.mean(dim=(0, 1), keepdim=True)
+    num = (x[:, 1:, :] * x[:, :-1, :]).mean(dim=(0, 1))
+    den = (x ** 2).mean(dim=(0, 1)).clamp_min(1e-8)
+    rho1 = num / den
+    assert rho1.abs().max().item() < 0.1, (
+        f"U^noise max |lag-1 autocorrelation| {rho1.abs().max().item():.3f} >= 0.1"
+    )
+
+
+def test_te_true_invariant_to_decomp() -> None:
+    r"""Changing the distractor decomposition does not move ``meta['te_true']``."""
+    decomp_a = {
+        "m": 4, "n_self": 70, "n_smallnoise": 13,
+        "m_source": 4, "n_dist": 80, "n_noise": 17,
+        "sigma_smallnoise": 0.05, "ar1_fraction": 0.5,
+        "rho_range_self": (0.95, 0.995), "rho_range_dist": (0.90, 0.995),
+        "osc_period_range": (60, 200), "osc_amp_range": (0.5, 1.5),
+    }
+    decomp_b = {
+        **decomp_a,
+        "n_self": 50, "n_smallnoise": 33,           # different decomp
+        "n_dist": 90, "n_noise": 7,
+        "sigma_smallnoise": 0.10,
+    }
+    _, _, meta_a = gen_smooth_arx(
+        n=4, T=300, seed=0, channel_decomp=decomp_a, **_G2_DEFAULTS,
+    )
+    _, _, meta_b = gen_smooth_arx(
+        n=4, T=300, seed=0, channel_decomp=decomp_b, **_G2_DEFAULTS,
+    )
+    assert meta_a["te_true"] == pytest.approx(meta_b["te_true"], rel=1e-12)

@@ -28,6 +28,7 @@ Example:
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -952,9 +953,16 @@ def plot_sample_signals_kld(
     row += n_kld_rows
 
     # --- Bottom: Mean ± std KLD over dimensions (column 0 only) ---
+    # Warmup rows in ``kld_plot`` are intentionally NaN-masked, so
+    # ``nanmean`` / ``nanstd`` would emit a ``RuntimeWarning: Mean of
+    # empty slice`` for every fully-NaN timestep. Suppress that noise --
+    # the resulting NaN values are exactly what we want plotted (the
+    # warmup band is shaded separately by ``_shade_warmup_min`` below).
     ax_mean = fig.add_subplot(gs[row, 0])
-    mean_kld = np.nanmean(kld_plot, axis=1)
-    std_kld = np.nanstd(kld_plot, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        mean_kld = np.nanmean(kld_plot, axis=1)
+        std_kld = np.nanstd(kld_plot, axis=1)
     ax_mean.fill_between(
         time_dec_min,
         mean_kld - std_kld,
@@ -1205,9 +1213,12 @@ def plot_sample_signals_kld_pca(
     row += n_pc_rows
 
     # --- Bottom: Mean ± std across retained components ---
+    # Same warmup-NaN consideration as the per-dim KLD plot above.
     ax_mean = fig.add_subplot(gs[row, 0])
-    mean_pc = np.nanmean(pc_plot, axis=1)
-    std_pc = np.nanstd(pc_plot, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        mean_pc = np.nanmean(pc_plot, axis=1)
+        std_pc = np.nanstd(pc_plot, axis=1)
     ax_mean.fill_between(
         time_dec_min,
         mean_pc - std_pc,

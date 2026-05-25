@@ -137,27 +137,67 @@ def _plot_scree(ev_ratio: np.ndarray, out_path: Path) -> None:
     plt.close(fig)
 
 
+def _scatter_pooled(
+    ax: Any, df: pd.DataFrame, x_col: str, y_col: str
+) -> bool:
+    """Plot a single pooled scatter when class labels are absent.
+
+    Args:
+        ax: Matplotlib axes to draw on.
+        df: DataFrame carrying the two PC columns.
+        x_col / y_col: Column names for the scatter axes.
+
+    Returns:
+        ``True`` if at least one point was plotted (so the caller can
+        decide whether to attach a legend).
+    """
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return False
+    xs = pd.to_numeric(df[x_col], errors="coerce").to_numpy()
+    ys = pd.to_numeric(df[y_col], errors="coerce").to_numpy()
+    mask = np.isfinite(xs) & np.isfinite(ys)
+    if not mask.any():
+        return False
+    ax.scatter(
+        xs[mask], ys[mask],
+        s=14, alpha=0.6, color=COLOR_BLUE,
+        label=f"all samples (n={int(mask.sum())})",
+    )
+    return True
+
+
 def _plot_pc12_scatter_by_class(df: pd.DataFrame, out_path: Path) -> None:
-    """Per-sample PC1 vs PC2 scatter coloured by outcome class."""
+    """Per-sample PC1 vs PC2 scatter coloured by outcome class.
+
+    Falls back to a single pooled scatter when no class labels are
+    present (label-free runs, e.g. the synthetic-TE pipeline), so the
+    PDF is informative instead of blank.
+    """
     fig, ax = plt.subplots(figsize=(4.6, 4.0))
-    for label_id, name in CLASS_NAMES.items():
-        sub = df[df["label"] == label_id]
-        if sub.empty:
-            continue
-        ax.scatter(
-            sub["kld_pc1"],
-            sub["kld_pc2"],
-            s=14,
-            alpha=0.6,
-            color=CLASS_COLORS[label_id],
-            label=f"{name} (n={len(sub)})",
-        )
+    plotted_any = False
+    if "label" in df.columns:
+        for label_id, name in CLASS_NAMES.items():
+            sub = df[df["label"] == label_id]
+            if sub.empty:
+                continue
+            ax.scatter(
+                sub["kld_pc1"],
+                sub["kld_pc2"],
+                s=14,
+                alpha=0.6,
+                color=CLASS_COLORS[label_id],
+                label=f"{name} (n={len(sub)})",
+            )
+            plotted_any = True
+    if not plotted_any:
+        plotted_any = _scatter_pooled(ax, df, "kld_pc1", "kld_pc2")
     ax.axhline(0, color="#888888", lw=0.4, zorder=0)
     ax.axvline(0, color="#888888", lw=0.4, zorder=0)
     ax.set_xlabel("PC1 (per-sample mean)")
     ax.set_ylabel("PC2 (per-sample mean)")
     ax.set_title("Per-sample KL PCA, top 2 components")
-    ax.legend(loc="best", frameon=True)
+    if plotted_any:
+        ax.legend(loc="best", frameon=True)
     _style_axes(ax)
     fig.tight_layout()
     fig.savefig(out_path)
@@ -165,28 +205,40 @@ def _plot_pc12_scatter_by_class(df: pd.DataFrame, out_path: Path) -> None:
 
 
 def _plot_selected_pc_scatter_by_class(df: pd.DataFrame, out_path: Path) -> None:
-    """Scatter for the first two contrast-selected PC aggregates."""
+    """Scatter for the first two contrast-selected PC aggregates.
+
+    Falls back to a pooled scatter on label-free runs (cf.
+    :func:`_plot_pc12_scatter_by_class`).
+    """
     if not {"kld_pc_selected_1", "kld_pc_selected_2"}.issubset(df.columns):
         return
     fig, ax = plt.subplots(figsize=(4.6, 4.0))
-    for label_id, name in CLASS_NAMES.items():
-        sub = df[df["label"] == label_id]
-        if sub.empty:
-            continue
-        ax.scatter(
-            sub["kld_pc_selected_1"],
-            sub["kld_pc_selected_2"],
-            s=14,
-            alpha=0.6,
-            color=CLASS_COLORS[label_id],
-            label=f"{name} (n={len(sub)})",
+    plotted_any = False
+    if "label" in df.columns:
+        for label_id, name in CLASS_NAMES.items():
+            sub = df[df["label"] == label_id]
+            if sub.empty:
+                continue
+            ax.scatter(
+                sub["kld_pc_selected_1"],
+                sub["kld_pc_selected_2"],
+                s=14,
+                alpha=0.6,
+                color=CLASS_COLORS[label_id],
+                label=f"{name} (n={len(sub)})",
+            )
+            plotted_any = True
+    if not plotted_any:
+        plotted_any = _scatter_pooled(
+            ax, df, "kld_pc_selected_1", "kld_pc_selected_2"
         )
     ax.axhline(0, color="#888888", lw=0.4, zorder=0)
     ax.axvline(0, color="#888888", lw=0.4, zorder=0)
     ax.set_xlabel("selected PC 1 (sign-aligned)")
     ax.set_ylabel("selected PC 2 (sign-aligned)")
     ax.set_title("Per-sample KL PCA, contrast-selected components")
-    ax.legend(loc="best", frameon=True)
+    if plotted_any:
+        ax.legend(loc="best", frameon=True)
     _style_axes(ax)
     fig.tight_layout()
     fig.savefig(out_path)
@@ -198,35 +250,59 @@ def _plot_pc_trajectories_overlay(
     n_pcs: int,
     out_path: Path,
 ) -> None:
-    """Per-class mean trajectories of each top component vs timestep."""
+    """Per-class mean trajectories of each top component vs timestep.
+
+    Falls back to a pooled trace per PC when no class labels are
+    available, so the plot remains informative on label-free runs.
+    """
     pc_cols = [f"kld_pc{k + 1}_t" for k in range(n_pcs) if f"kld_pc{k + 1}_t" in traj_df.columns]
     if not pc_cols:
         return
     fig, axes = plt.subplots(len(pc_cols), 1, figsize=(7.2, 2.4 * len(pc_cols)), sharex=True)
     if len(pc_cols) == 1:
         axes = [axes]
+    any_plotted_overall = False
     for ax, col in zip(axes, pc_cols):
-        for label_id, name in CLASS_NAMES.items():
-            sub = traj_df[traj_df["label"] == label_id]
-            if sub.empty:
-                continue
-            grouped = sub.groupby("timestep")[col]
+        plotted_any = False
+        if "label" in traj_df.columns:
+            for label_id, name in CLASS_NAMES.items():
+                sub = traj_df[traj_df["label"] == label_id]
+                if sub.empty:
+                    continue
+                grouped = sub.groupby("timestep")[col]
+                mean = grouped.mean()
+                sem = grouped.sem()
+                ax.plot(mean.index, mean.values, color=CLASS_COLORS[label_id], label=name)
+                ax.fill_between(
+                    mean.index,
+                    (mean - sem).values,
+                    (mean + sem).values,
+                    color=CLASS_COLORS[label_id],
+                    alpha=0.18,
+                    lw=0,
+                )
+                plotted_any = True
+        if not plotted_any:
+            grouped = traj_df.groupby("timestep")[col]
             mean = grouped.mean()
             sem = grouped.sem()
-            ax.plot(mean.index, mean.values, color=CLASS_COLORS[label_id], label=name)
+            ax.plot(mean.index, mean.values, color=COLOR_BLUE, label="pooled")
             ax.fill_between(
                 mean.index,
                 (mean - sem).values,
                 (mean + sem).values,
-                color=CLASS_COLORS[label_id],
+                color=COLOR_BLUE,
                 alpha=0.18,
                 lw=0,
             )
+            plotted_any = True
+        any_plotted_overall = any_plotted_overall or plotted_any
         ax.set_ylabel(col)
         _style_axes(ax)
     axes[-1].set_xlabel("timestep")
-    axes[0].legend(loc="best", frameon=True)
-    fig.suptitle("PCA components of per-time per-dim KL by class")
+    if any_plotted_overall:
+        axes[0].legend(loc="best", frameon=True)
+    fig.suptitle("PCA components of per-time per-dim KL")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)

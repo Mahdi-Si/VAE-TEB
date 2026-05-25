@@ -45,12 +45,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import yaml
 
 from model.vae_teb_prediction.model.model_experiment.synthetic.generators import (
+    DEFAULT_DECOMP_PARAMS,
     gen_regime_switch_smooth,
     gen_smooth_arx,
     gen_state_space_oscillator,
@@ -104,6 +105,103 @@ _GENERATORS: Dict[str, Any] = {
     "G2_zero_coupling": gen_smooth_arx,
     "G3":               gen_regime_switch_smooth,
 }
+
+
+def _resolve_channel_decomp(
+    data: Dict[str, Any], c_y: int, c_u: int, benchmark: str,
+) -> Dict[str, Any]:
+    r"""Build a fully-specified ``channel_decomp`` dict from the YAML config.
+
+    Single source of truth for ``m``: ``data['M']`` (the existing informative-
+    channel count). The decomposition holds ``n_smallnoise`` and ``n_noise``
+    fixed at their YAML-configured values so the small-noise / pure-noise loss
+    floor is invariant across an ``M`` sweep, and derives:
+
+    $$
+    n_{\text{self}} = c_y - m - n_{\text{smallnoise}},
+    \qquad
+    n_{\text{dist}} = c_u - m_{\text{source}} - n_{\text{noise}},
+    $$
+
+    where $m_{\text{source}} = m$ for G1 / G2 and
+    $m_{\text{source}} = m\cdot K_{\text{classes}}$ for G3. Raises
+    ``ValueError`` if either derived size is negative.
+
+    Args:
+        data: The benchmark-resolved ``data`` config block. Must contain
+            ``M`` and a ``channel_decomp`` sub-block (with ``target`` and
+            ``source`` keys); falls back to :data:`DEFAULT_DECOMP_PARAMS`
+            for any missing knob.
+        c_y, c_u: Channel counts from the same ``data`` block.
+        benchmark: Active benchmark id. For G3, the source-side TE width is
+            ``M * K_classes``.
+
+    Returns:
+        A dict accepted by the generators' ``channel_decomp`` kwarg and by
+        :func:`generators._validate_channel_decomp`. Always contains
+        ``m``, ``m_source``, ``n_self``, ``n_smallnoise``, ``n_dist``,
+        ``n_noise``, ``sigma_smallnoise``, ``ar1_fraction``, and the
+        four range tuples.
+
+    Raises:
+        ValueError: If ``M`` is missing, or if the resolved ``n_self`` /
+            ``n_dist`` would be negative.
+    """
+    M = int(data["M"])
+    if benchmark == "G3":
+        m_source = M * int(data.get("K_classes", 1))
+    else:
+        m_source = M
+
+    raw = data.get("channel_decomp") or {}
+    raw_target = raw.get("target") or {}
+    raw_source = raw.get("source") or {}
+
+    def _pick(d: Dict[str, Any], key: str, fallback_key: Optional[str] = None) -> Any:
+        if key in d:
+            return d[key]
+        fb = key if fallback_key is None else fallback_key
+        return DEFAULT_DECOMP_PARAMS[fb]
+
+    n_smallnoise = int(_pick(raw_target, "n_smallnoise"))
+    n_noise = int(_pick(raw_source, "n_noise"))
+    sigma_smallnoise = float(_pick(raw_target, "sigma_smallnoise"))
+    ar1_fraction = float(_pick(raw_target, "ar1_fraction"))
+    # Target / source rho ranges are keyed by sub-block, not by global name.
+    rho_range_self = tuple(_pick(raw_target, "rho_range", "rho_range_self"))
+    rho_range_dist = tuple(_pick(raw_source, "rho_range", "rho_range_dist"))
+    osc_period_range = tuple(_pick(raw_target, "osc_period_range"))
+    osc_amp_range = tuple(_pick(raw_target, "osc_amp_range"))
+
+    n_self = c_y - M - n_smallnoise
+    n_dist = c_u - m_source - n_noise
+    if n_self < 0:
+        raise ValueError(
+            f"channel_decomp budget closure failed for target: "
+            f"c_y={c_y} - M={M} - n_smallnoise={n_smallnoise} = {n_self} < 0. "
+            f"Lower n_smallnoise, raise c_y, or lower M."
+        )
+    if n_dist < 0:
+        raise ValueError(
+            f"channel_decomp budget closure failed for source: "
+            f"c_u={c_u} - m_source={m_source} - n_noise={n_noise} = "
+            f"{n_dist} < 0. Lower n_noise, raise c_u, or lower M "
+            f"(G3: lower M*K_classes={m_source})."
+        )
+    return {
+        "m":                M,
+        "n_self":           int(n_self),
+        "n_smallnoise":     n_smallnoise,
+        "m_source":         m_source,
+        "n_dist":           int(n_dist),
+        "n_noise":          n_noise,
+        "sigma_smallnoise": sigma_smallnoise,
+        "ar1_fraction":     ar1_fraction,
+        "rho_range_self":   rho_range_self,
+        "rho_range_dist":   rho_range_dist,
+        "osc_period_range": osc_period_range,
+        "osc_amp_range":    osc_amp_range,
+    }
 
 
 def _build_gen_kwargs(
@@ -180,6 +278,7 @@ def _build_gen_kwargs(
             "standardize": bool(data.get("standardize", True)),
             "reverse_roles": bool(data.get("reverse_roles", False)),
             "te_n_samples": int(data.get("te_n_samples", 50_000)),
+            "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
     if benchmark in ("G2", "G2_wrong_delay", "G2_zero_coupling"):
         # G2_wrong_delay overrides `delay` to D >> max_lag + horizon;
@@ -202,6 +301,7 @@ def _build_gen_kwargs(
             "easy_variant": bool(data.get("easy_variant", False)),
             "standardize": bool(data.get("standardize", True)),
             "reverse_roles": bool(data.get("reverse_roles", False)),
+            "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
     if benchmark == "G3":
         return {
@@ -222,6 +322,7 @@ def _build_gen_kwargs(
             "shared_regime": bool(data.get("shared_regime", False)),
             "template_period_min": int(data.get("template_period_min", 40)),
             "standardize": bool(data.get("standardize", True)),
+            "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
     raise ValueError(
         f"build_dataset: unknown benchmark {benchmark!r} "
@@ -368,6 +469,15 @@ def build_dataset(
         "up_st": [0, c_u_st],
         "up_ph": [c_u_st, c_u_st + c_u_ph],
     }
+    # `channel_decomp` (resolved sizes) and `channel_layout` (per-block index
+    # lists) are already populated by the generators in `train_meta`; we
+    # re-stamp them here so the cache-bookkeeping `meta_out` always carries
+    # them next to `channel_map`. Downstream evaluators read these to colour-
+    # code TE / self / smallnoise channels without re-deriving the layout.
+    if "channel_decomp" in train_meta:
+        meta_out["channel_decomp"] = train_meta["channel_decomp"]
+    if "channel_layout" in train_meta:
+        meta_out["channel_layout"] = train_meta["channel_layout"]
     with open(out_dir / "meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta_out, fh, indent=2)
     band = meta_out["true_lag_band"]

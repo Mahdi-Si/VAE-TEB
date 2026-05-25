@@ -5,8 +5,27 @@ Implements the source/target processes of ``model_validation_v2.md`` Sections
 plus a metadata dict and performs no disk I/O (persistence is
 :mod:`build_dataset`'s job). Generated tensors use the model's native
 channel layout: target $Y \in \mathbb{R}^{n \times T \times 87}$ and source
-$U \in \mathbb{R}^{n \times T \times 101}$, with non-informative channels
-filled by i.i.d. $\mathcal{N}(0, 1)$ distractor noise.
+$U \in \mathbb{R}^{n \times T \times 101}$.
+
+Non-informative channels are filled with a **structured decomposition** rather
+than pure $\mathcal{N}(0, 1)$ padding (the original v1 design buried the TE
+signal in irreducible per-channel forecasting error). Each buffer has three
+contiguous blocks:
+
+* **Target $Y$** = ``[TE | self-predictable | small-noise]``
+    * informative TE channels ($m$ slots);
+    * self-predictable channels mixing AR(1) (~half) and low-frequency
+      oscillators (~half), with the property
+      $I(U_{\le t};Y^{\text{self}}_+\mid Y_{\le t})=0$ but
+      $I(Y_{\le t};Y^{\text{self}}_+)>0$;
+    * a tiny block of low-variance Gaussian noise, kept at
+      $\sigma_{\text{smallnoise}}\ll 1$ by **excluding** it from per-channel
+      z-scoring.
+
+* **Source $U$** = ``[TE | AR(1) distractor | pure noise]``
+    * informative TE channels ($m$ for G1/G2, $m\cdot K$ for G3);
+    * smooth AR(1) distractors with no coupling into $Y$;
+    * pure $\mathcal{N}(0, 1)$ stress-test channels.
 
 Public API (v2):
     gen_state_space_oscillator: Benchmark G1 -- AR(2)-driven state-space
@@ -43,7 +62,9 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te impor
 # ---------------------------------------------------------------------------
 
 
-def _standardize_per_channel(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def _standardize_per_channel(
+    x: torch.Tensor, eps: float = 1e-8, *, exclude_tail: int = 0,
+) -> torch.Tensor:
     r"""Z-score every channel of ``x`` over the batch and time axes.
 
     Standardisation is a per-channel invertible affine map, so it leaves the
@@ -53,69 +74,539 @@ def _standardize_per_channel(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor
     Args:
         x: Tensor of shape $(n, T, C)$.
         eps: Small constant added to the standard deviation for stability.
+        exclude_tail: Number of trailing channels left untouched. Used to
+            preserve the low-variance ``small-noise`` tail of the target
+            buffer (decomposition v2): standardising it would scale
+            $\sigma_{\text{smallnoise}}\ll 1$ up to unit variance and defeat
+            the purpose of keeping those channels' MSE contribution tiny.
 
     Returns:
         The per-channel standardised tensor, same shape and dtype as ``x``.
     """
-    mean = x.mean(dim=(0, 1), keepdim=True)
-    std = x.std(dim=(0, 1), keepdim=True)
-    return (x - mean) / (std + eps)
+    C = x.shape[-1]
+    if exclude_tail <= 0 or exclude_tail >= C:
+        head = x if exclude_tail < C else x[..., :0]
+        mean = head.mean(dim=(0, 1), keepdim=True)
+        std = head.std(dim=(0, 1), keepdim=True)
+        head_z = (head - mean) / (std + eps)
+        if exclude_tail >= C:
+            return x  # all channels excluded -> identity
+        return head_z
+    head = x[..., : C - exclude_tail]
+    tail = x[..., C - exclude_tail :]
+    mean = head.mean(dim=(0, 1), keepdim=True)
+    std = head.std(dim=(0, 1), keepdim=True)
+    head_z = (head - mean) / (std + eps)
+    return torch.cat([head_z, tail], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Structured channel-decomposition helpers (v2)
+# ---------------------------------------------------------------------------
+#
+# These build the per-block distractor streams used by ``_place_into_buffers``.
+# Each helper takes its own ``torch.Generator`` so call sites can control
+# determinism explicitly. Sizes ``k <= 0`` short-circuit to an empty channel
+# tensor so callers can drop a block without branching.
+
+
+# Default knobs for the structured channel decomposition. Mirrors the YAML
+# block ``channel_decomp_defaults`` in ``config_synth.yaml`` so a generator
+# called without an explicit ``channel_decomp`` kwarg (e.g. from in-process
+# tests) still produces the v2 layout. Both halves of the recipe are split
+# evenly between AR(1) and low-frequency oscillator channels.
+DEFAULT_DECOMP_PARAMS: Dict[str, Any] = {
+    "n_smallnoise":     13,
+    "n_noise":          17,
+    "sigma_smallnoise": 0.05,
+    "ar1_fraction":     0.5,
+    "rho_range_self":   (0.95, 0.995),
+    "rho_range_dist":   (0.90, 0.995),
+    "osc_period_range": (60, 200),
+    "osc_amp_range":    (0.5, 1.5),
+}
+
+
+def _make_ar1(
+    n: int, T: int, k: int, *,
+    rho_range: Tuple[float, float],
+    generator: torch.Generator,
+) -> torch.Tensor:
+    r"""Sample $k$ independent AR(1) channels with unit stationary variance.
+
+    Each channel uses its own coefficient $\rho_j\sim\mathcal{U}(\rho_{\min},
+    \rho_{\max})$ and an innovation variance $\sigma_\eta^2 = 1 - \rho_j^2$ so
+    the stationary marginal variance is $1$, keeping later z-scoring a
+    near-identity affine map.
+
+    Args:
+        n: Number of independent sequences (samples).
+        T: Sequence length.
+        k: Number of AR(1) channels.
+        rho_range: ``(rho_min, rho_max)`` for the per-channel AR coefficient.
+        generator: Caller-supplied ``torch.Generator`` for determinism.
+
+    Returns:
+        A ``(n, T, k)`` ``float32`` tensor; empty along the channel axis when
+        ``k <= 0``.
+    """
+    if k <= 0:
+        return torch.empty(n, T, 0, dtype=torch.float32)
+    lo, hi = float(rho_range[0]), float(rho_range[1])
+    rho = (lo + (hi - lo) * torch.rand(k, generator=generator)).to(torch.float32)
+    sigma_eta = torch.sqrt(torch.clamp(1.0 - rho * rho, min=1e-8))
+    eta = torch.randn(n, T, k, generator=generator, dtype=torch.float32)
+    eta = eta * sigma_eta.view(1, 1, k)
+    x = torch.empty(n, T, k, dtype=torch.float32)
+    # Initialise at the stationary distribution N(0, 1) so the first few
+    # samples are not transients.
+    x[:, 0, :] = torch.randn(n, k, generator=generator, dtype=torch.float32)
+    rho_b = rho.view(1, k)
+    for t in range(1, T):
+        x[:, t, :] = rho_b * x[:, t - 1, :] + eta[:, t, :]
+    return x
+
+
+def _make_oscillators(
+    n: int, T: int, k: int, *,
+    period_range: Tuple[int, int],
+    amp_range: Tuple[float, float],
+    generator: torch.Generator,
+) -> torch.Tensor:
+    r"""Sample $k$ low-frequency sinusoids $a_j\sin(\omega_j t + \phi_j)+\nu$.
+
+    Per-channel period $T_j\sim\mathcal{U}(\text{period\_range})$ giving
+    $\omega_j = 2\pi/T_j$; per-channel amplitude $a_j\sim\mathcal{U}(\text
+    {amp\_range})$; **per-sample, per-channel** phase $\phi\sim\mathcal{U}(0,
+    2\pi)$ so different samples in the batch do not share trivial structure.
+    A small i.i.d. noise term $0.1\,\nu$ avoids degenerate per-channel
+    autocovariance after standardisation.
+
+    Periods must exceed the forecast horizon ($H = 30$) for the future block
+    to remain predictable from history alone; this is enforced upstream by
+    the caller's ``period_range``.
+
+    Args:
+        n: Number of independent sequences.
+        T: Sequence length.
+        k: Number of oscillator channels.
+        period_range: ``(period_min, period_max)`` in time steps.
+        amp_range: ``(amp_min, amp_max)`` amplitude range.
+        generator: Caller-supplied ``torch.Generator`` for determinism.
+
+    Returns:
+        A ``(n, T, k)`` ``float32`` tensor; empty along the channel axis when
+        ``k <= 0``.
+    """
+    if k <= 0:
+        return torch.empty(n, T, 0, dtype=torch.float32)
+    pmin, pmax = float(period_range[0]), float(period_range[1])
+    amin, amax = float(amp_range[0]), float(amp_range[1])
+    periods = pmin + (pmax - pmin) * torch.rand(k, generator=generator)
+    omega = (2.0 * math.pi / periods).to(torch.float32)
+    amps = (amin + (amax - amin) * torch.rand(k, generator=generator)).to(torch.float32)
+    phi = 2.0 * math.pi * torch.rand(n, 1, k, generator=generator, dtype=torch.float32)
+    t_grid = torch.arange(T, dtype=torch.float32).view(1, T, 1)
+    signal = amps.view(1, 1, k) * torch.sin(omega.view(1, 1, k) * t_grid + phi)
+    noise = 0.1 * torch.randn(n, T, k, generator=generator, dtype=torch.float32)
+    return (signal + noise).to(torch.float32)
+
+
+def _make_self_predictable(
+    n: int, T: int, k: int, *,
+    generator: torch.Generator,
+    ar1_fraction: float = 0.5,
+    rho_range: Tuple[float, float] = (0.95, 0.995),
+    osc_period_range: Tuple[int, int] = (60, 200),
+    osc_amp_range: Tuple[float, float] = (0.5, 1.5),
+) -> torch.Tensor:
+    r"""Build the target ``self-predictable`` block (mix of AR(1) + oscillators).
+
+    The split ``k_{\text{ar1}} : k_{\text{osc}}`` is governed by
+    ``ar1_fraction`` and rounds **up** to AR(1) when ``k`` is odd at the
+    default 50/50 ratio. Both kinds of channels satisfy the design contract
+    $I(U_{\le t};Y^{\text{self}}_+\mid Y_{\le t}) = 0$ (no source coupling)
+    and $I(Y_{\le t};Y^{\text{self}}_+) > 0$ (autocorrelated past predicts
+    the future).
+
+    Args:
+        n, T, k: Tensor shape ``(n, T, k)``.
+        generator: Caller-supplied RNG.
+        ar1_fraction: Fraction of ``k`` channels filled with AR(1).
+        rho_range: Forwarded to :func:`_make_ar1`.
+        osc_period_range, osc_amp_range: Forwarded to :func:`_make_oscillators`.
+
+    Returns:
+        A ``(n, T, k)`` ``float32`` tensor.
+    """
+    if k <= 0:
+        return torch.empty(n, T, 0, dtype=torch.float32)
+    if ar1_fraction <= 0.0:
+        k_ar1 = 0
+    elif ar1_fraction >= 1.0:
+        k_ar1 = k
+    elif abs(ar1_fraction - 0.5) < 1e-6:
+        k_ar1 = (k + 1) // 2  # round up to AR(1) at the default split
+    else:
+        k_ar1 = max(0, min(k, round(k * ar1_fraction)))
+    k_osc = k - k_ar1
+    parts: List[torch.Tensor] = []
+    if k_ar1 > 0:
+        parts.append(_make_ar1(
+            n, T, k_ar1, rho_range=rho_range, generator=generator,
+        ))
+    if k_osc > 0:
+        parts.append(_make_oscillators(
+            n, T, k_osc,
+            period_range=osc_period_range, amp_range=osc_amp_range,
+            generator=generator,
+        ))
+    return torch.cat(parts, dim=-1) if parts else torch.empty(
+        n, T, 0, dtype=torch.float32
+    )
+
+
+def _make_source_distractors(
+    n: int, T: int, k: int, *,
+    generator: torch.Generator,
+    rho_range: Tuple[float, float] = (0.90, 0.995),
+) -> torch.Tensor:
+    r"""Build the source ``AR(1)-distractor`` block (no coupling into $Y$)."""
+    return _make_ar1(n, T, k, rho_range=rho_range, generator=generator)
+
+
+def _make_small_noise(
+    n: int, T: int, k: int, *,
+    generator: torch.Generator, sigma: float,
+) -> torch.Tensor:
+    r"""Tiny-variance Gaussian noise block. Kept untouched by standardisation."""
+    if k <= 0:
+        return torch.empty(n, T, 0, dtype=torch.float32)
+    return float(sigma) * torch.randn(
+        n, T, k, generator=generator, dtype=torch.float32
+    )
+
+
+def _resolve_decomp_defaults(
+    M: int, c_y: int, c_u: int, *,
+    m_source: Optional[int] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    r"""Synthesise a structured ``channel_decomp`` from the v2 defaults.
+
+    Used when a generator is called without an explicit ``channel_decomp``
+    kwarg (e.g. from in-process tests or the ``__main__`` smoke). The
+    ``n_smallnoise`` and ``n_noise`` blocks are **shrunk** silently when the
+    requested values would make ``n_self`` or ``n_dist`` negative (typical
+    for ``easy_variant=True`` where $M = c_y$). The strict counterpart used
+    by :mod:`build_dataset` is :func:`_validate_channel_decomp`, which raises
+    on any budget mismatch.
+
+    Args:
+        M: Target informative width.
+        c_y: Target channel count.
+        c_u: Source channel count.
+        m_source: Source informative width; defaults to ``M``. G3 uses
+            $M\cdot K_{\text{classes}}$ here.
+        overrides: Optional dict of keys overriding
+            :data:`DEFAULT_DECOMP_PARAMS` (e.g. a custom
+            ``sigma_smallnoise``).
+
+    Returns:
+        A fully-populated decomposition dict accepted by
+        :func:`_place_into_buffers`.
+
+    Raises:
+        ValueError: If ``M > c_y`` or ``m_source > c_u``.
+    """
+    base = dict(DEFAULT_DECOMP_PARAMS)
+    if overrides is not None:
+        base.update(overrides)
+
+    requested_n_smallnoise = int(base["n_smallnoise"])
+    requested_n_noise = int(base["n_noise"])
+    m_source_eff = int(M) if m_source is None else int(m_source)
+
+    available_y = int(c_y) - int(M)
+    if available_y < 0:
+        raise ValueError(
+            f"channel decomp: target informative width M={M} exceeds c_y={c_y}."
+        )
+    n_smallnoise = min(requested_n_smallnoise, available_y)
+    n_self = available_y - n_smallnoise
+
+    available_u = int(c_u) - m_source_eff
+    if available_u < 0:
+        raise ValueError(
+            f"channel decomp: source informative width m_source="
+            f"{m_source_eff} exceeds c_u={c_u}."
+        )
+    n_noise = min(requested_n_noise, available_u)
+    n_dist = available_u - n_noise
+
+    return {
+        "m":                int(M),
+        "n_self":           int(n_self),
+        "n_smallnoise":     int(n_smallnoise),
+        "m_source":         int(m_source_eff),
+        "n_dist":           int(n_dist),
+        "n_noise":          int(n_noise),
+        "sigma_smallnoise": float(base["sigma_smallnoise"]),
+        "ar1_fraction":     float(base["ar1_fraction"]),
+        "rho_range_self":   tuple(base["rho_range_self"]),
+        "rho_range_dist":   tuple(base["rho_range_dist"]),
+        "osc_period_range": tuple(base["osc_period_range"]),
+        "osc_amp_range":    tuple(base["osc_amp_range"]),
+    }
+
+
+def _validate_channel_decomp(
+    decomp: Dict[str, Any], M: int, c_y: int, c_u: int, *, m_source: int,
+) -> Dict[str, Any]:
+    r"""Validate a fully-specified ``channel_decomp`` dict against the budget.
+
+    Strict counterpart to :func:`_resolve_decomp_defaults`: every required
+    key must be present and the two budget identities
+
+    $$
+    m + n_{\text{self}} + n_{\text{smallnoise}} = c_y,
+    \qquad
+    m_{\text{source}} + n_{\text{dist}} + n_{\text{noise}} = c_u
+    $$
+
+    must hold exactly. Used by :mod:`build_dataset` after resolving the YAML
+    config so misconfiguration fails loudly rather than silently producing
+    the wrong layout.
+
+    Args:
+        decomp: Caller-supplied decomposition dict.
+        M: Target informative width (must match ``decomp['m']``).
+        c_y, c_u: Channel counts.
+        m_source: Source informative width (must match ``decomp['m_source']``).
+
+    Returns:
+        A normalised copy of ``decomp`` with tuple ranges instead of lists.
+
+    Raises:
+        ValueError: On missing keys, mismatched ``M`` / ``m_source``,
+            negative sizes, or any budget violation.
+    """
+    required = (
+        "m", "n_self", "n_smallnoise", "m_source", "n_dist", "n_noise",
+        "sigma_smallnoise", "ar1_fraction",
+        "rho_range_self", "rho_range_dist",
+        "osc_period_range", "osc_amp_range",
+    )
+    missing = [k for k in required if k not in decomp]
+    if missing:
+        raise ValueError(
+            f"channel_decomp missing required keys: {missing}; "
+            f"got keys {sorted(decomp.keys())}."
+        )
+    if int(decomp["m"]) != int(M):
+        raise ValueError(
+            f"channel_decomp.m={decomp['m']} mismatches generator M={M}."
+        )
+    if int(decomp["m_source"]) != int(m_source):
+        raise ValueError(
+            f"channel_decomp.m_source={decomp['m_source']} mismatches "
+            f"generator-required m_source={m_source}."
+        )
+    sizes_y = (int(decomp["m"]), int(decomp["n_self"]),
+               int(decomp["n_smallnoise"]))
+    if any(s < 0 for s in sizes_y):
+        raise ValueError(
+            f"channel_decomp target sizes must be non-negative: "
+            f"m={sizes_y[0]}, n_self={sizes_y[1]}, n_smallnoise={sizes_y[2]}."
+        )
+    if sum(sizes_y) != int(c_y):
+        raise ValueError(
+            f"channel_decomp target budget does not close: "
+            f"m + n_self + n_smallnoise = "
+            f"{sizes_y[0]} + {sizes_y[1]} + {sizes_y[2]} = {sum(sizes_y)} "
+            f"!= c_y={c_y}."
+        )
+    sizes_u = (int(decomp["m_source"]), int(decomp["n_dist"]),
+               int(decomp["n_noise"]))
+    if any(s < 0 for s in sizes_u):
+        raise ValueError(
+            f"channel_decomp source sizes must be non-negative: "
+            f"m_source={sizes_u[0]}, n_dist={sizes_u[1]}, n_noise={sizes_u[2]}."
+        )
+    if sum(sizes_u) != int(c_u):
+        raise ValueError(
+            f"channel_decomp source budget does not close: "
+            f"m_source + n_dist + n_noise = "
+            f"{sizes_u[0]} + {sizes_u[1]} + {sizes_u[2]} = {sum(sizes_u)} "
+            f"!= c_u={c_u}."
+        )
+    out = dict(decomp)
+    for key in ("rho_range_self", "rho_range_dist",
+                "osc_period_range", "osc_amp_range"):
+        out[key] = tuple(out[key])
+    out["sigma_smallnoise"] = float(out["sigma_smallnoise"])
+    out["ar1_fraction"] = float(out["ar1_fraction"])
+    for key in ("m", "n_self", "n_smallnoise",
+                "m_source", "n_dist", "n_noise"):
+        out[key] = int(out[key])
+    return out
+
+
+def _make_channel_layout(
+    decomp: Dict[str, Any], c_y: int, c_u: int,
+) -> Dict[str, Dict[str, List[int]]]:
+    r"""Return per-block absolute channel index lists for ``meta.json``.
+
+    Args:
+        decomp: A resolved / validated decomposition dict.
+        c_y, c_u: Channel counts (asserted against the decomp sizes).
+
+    Returns:
+        A two-level dict ``{"Y": {"te", "self", "smallnoise"}, "U": {"te",
+        "dist", "noise"}}`` whose leaves are absolute channel indices into
+        the corresponding buffer.
+    """
+    m = int(decomp["m"])
+    n_self = int(decomp["n_self"])
+    n_sn = int(decomp["n_smallnoise"])
+    m_src = int(decomp["m_source"])
+    n_dist = int(decomp["n_dist"])
+    n_noise = int(decomp["n_noise"])
+    assert m + n_self + n_sn == c_y, (m, n_self, n_sn, c_y)
+    assert m_src + n_dist + n_noise == c_u, (m_src, n_dist, n_noise, c_u)
+    return {
+        "Y": {
+            "te":         list(range(0, m)),
+            "self":       list(range(m, m + n_self)),
+            "smallnoise": list(range(m + n_self, c_y)),
+        },
+        "U": {
+            "te":         list(range(0, m_src)),
+            "dist":       list(range(m_src, m_src + n_dist)),
+            "noise":      list(range(m_src + n_dist, c_u)),
+        },
+    }
+
+
+def _decomp_to_json(decomp: Dict[str, Any]) -> Dict[str, Any]:
+    """Make a ``channel_decomp`` dict JSON-serialisable (tuples -> lists)."""
+    out = dict(decomp)
+    for key in ("rho_range_self", "rho_range_dist",
+                "osc_period_range", "osc_amp_range"):
+        if key in out:
+            out[key] = list(out[key])
+    return out
 
 
 def _place_into_buffers(
     informative_target: torch.Tensor,
     informative_source: torch.Tensor,
     *,
-    M: int,
+    decomp: Dict[str, Any],
     c_y: int,
     c_u: int,
     reverse_roles: bool,
-    distractor_generator: torch.Generator,
+    base_seed: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Stitch informative streams into the model's native channel layout.
+    r"""Stitch the informative streams + structured distractors into native buffers.
 
-    Places the $M$ informative streams in target channels $[0, M)$ and source
-    channels $[0, M)$; the remaining channels are i.i.d. $\mathcal{N}(0, 1)$
-    distractors. ``reverse_roles=True`` swaps which physical series lands in
-    the target slot vs. the source slot, so the model measures
-    $\mathrm{TE}_{\text{target slot} \to \text{source slot}}$ on a process
-    whose true direction was $\text{src} \to \text{tgt}$ -- the lag-attention
-    control where the true TE is zero.
+    Builds the target buffer as ``[TE | self-predictable | small-noise]`` and
+    the source buffer as ``[TE | AR(1) distractor | pure noise]``. The
+    ``small-noise`` tail is generated at $\sigma_{\text{smallnoise}}$ and is
+    excluded from per-channel z-scoring (see :func:`_standardize_per_channel`)
+    so its MSE contribution stays $O(\sigma^2)$.
+
+    ``reverse_roles=True`` swaps which informative stream goes into which
+    buffer (for the G1-rev directionality control). The distractor blocks
+    are unaffected. Requires ``decomp['m'] == decomp['m_source']`` (true for
+    G1 / G2 but **not** for G3, whose source TE block has width
+    $M\cdot K_{\text{classes}}$); attempting ``reverse_roles=True`` with
+    mismatched widths raises.
+
+    The two distractor RNG streams (target side, source side) are seeded
+    deterministically from ``base_seed`` so a single ``seed`` argument fully
+    fixes the buffer.
 
     Args:
-        informative_target: ``(n, T, M)`` tensor that goes into the target
-            buffer in the forward orientation.
-        informative_source: ``(n, T, M)`` tensor that goes into the source
-            buffer in the forward orientation.
-        M: Number of informative channels.
-        c_y: Target channel count.
-        c_u: Source channel count.
-        reverse_roles: When ``True`` swap the two streams.
-        distractor_generator: ``torch.Generator`` for the i.i.d. distractor
-            noise; passed in so the caller controls determinism.
+        informative_target: ``(n, T, decomp['m'])`` informative target stream.
+        informative_source: ``(n, T, decomp['m_source'])`` informative source.
+        decomp: A resolved / validated decomposition dict.
+        c_y, c_u: Channel counts; cross-checked against ``decomp``.
+        reverse_roles: Swap which informative stream lands in which buffer.
+        base_seed: Base seed for the two distractor RNGs (offsets
+            ``+7919`` / ``+7920``).
 
     Returns:
-        A tuple ``(Y_buf, U_buf)`` of ``float32`` tensors with the v2 native
-        shapes $(n, T, c_y)$ and $(n, T, c_u)$.
+        ``(Y_buf, U_buf)`` ``float32`` tensors of shape $(n, T, c_y)$ /
+        $(n, T, c_u)$.
     """
+    m = int(decomp["m"])
+    m_source = int(decomp["m_source"])
+    n_self = int(decomp["n_self"])
+    n_smallnoise = int(decomp["n_smallnoise"])
+    n_dist = int(decomp["n_dist"])
+    n_noise = int(decomp["n_noise"])
+
+    if informative_target.shape[-1] != m:
+        raise ValueError(
+            f"informative_target has {informative_target.shape[-1]} channels "
+            f"but decomp.m={m}."
+        )
+    if informative_source.shape[-1] != m_source:
+        raise ValueError(
+            f"informative_source has {informative_source.shape[-1]} channels "
+            f"but decomp.m_source={m_source}."
+        )
+    if reverse_roles and m != m_source:
+        raise ValueError(
+            f"reverse_roles=True requires symmetric informative widths, "
+            f"got m={m} and m_source={m_source} (G3-style asymmetric source "
+            f"layout is incompatible with the directionality control)."
+        )
+
     n, T, _ = informative_target.shape
     y_stream = informative_source if reverse_roles else informative_target
     u_stream = informative_target if reverse_roles else informative_source
 
-    Y_buf = torch.empty(n, T, c_y, dtype=torch.float32)
-    Y_buf[..., :M] = y_stream
-    if M < c_y:
-        Y_buf[..., M:] = torch.randn(
-            n, T, c_y - M, generator=distractor_generator, dtype=torch.float32
+    target_gen = torch.Generator().manual_seed(int(base_seed) + 7919)
+    source_gen = torch.Generator().manual_seed(int(base_seed) + 7920)
+
+    y_parts: List[torch.Tensor] = [y_stream]
+    if n_self > 0:
+        y_parts.append(_make_self_predictable(
+            n, T, n_self, generator=target_gen,
+            ar1_fraction=float(decomp["ar1_fraction"]),
+            rho_range=tuple(decomp["rho_range_self"]),
+            osc_period_range=tuple(decomp["osc_period_range"]),
+            osc_amp_range=tuple(decomp["osc_amp_range"]),
+        ))
+    if n_smallnoise > 0:
+        y_parts.append(_make_small_noise(
+            n, T, n_smallnoise, generator=target_gen,
+            sigma=float(decomp["sigma_smallnoise"]),
+        ))
+    Y_buf = torch.cat(y_parts, dim=-1) if len(y_parts) > 1 else y_parts[0]
+    if Y_buf.shape[-1] != c_y:
+        raise RuntimeError(
+            f"Y buffer width {Y_buf.shape[-1]} != c_y={c_y} (decomp bug)."
         )
 
-    U_buf = torch.empty(n, T, c_u, dtype=torch.float32)
-    U_buf[..., :M] = u_stream
-    if M < c_u:
-        U_buf[..., M:] = torch.randn(
-            n, T, c_u - M, generator=distractor_generator, dtype=torch.float32
+    u_parts: List[torch.Tensor] = [u_stream]
+    if n_dist > 0:
+        u_parts.append(_make_source_distractors(
+            n, T, n_dist, generator=source_gen,
+            rho_range=tuple(decomp["rho_range_dist"]),
+        ))
+    if n_noise > 0:
+        u_parts.append(torch.randn(
+            n, T, n_noise, generator=source_gen, dtype=torch.float32,
+        ))
+    U_buf = torch.cat(u_parts, dim=-1) if len(u_parts) > 1 else u_parts[0]
+    if U_buf.shape[-1] != c_u:
+        raise RuntimeError(
+            f"U buffer width {U_buf.shape[-1]} != c_u={c_u} (decomp bug)."
         )
-    return Y_buf, U_buf
+    return Y_buf.contiguous(), U_buf.contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +633,7 @@ def gen_state_space_oscillator(
     reverse_roles: bool = False,
     seed: int = 0,
     te_n_samples: int = 50_000,
+    channel_decomp: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     r"""Generate the G1 AR(2)-oscillator state-space benchmark.
 
@@ -276,18 +768,28 @@ def gen_state_space_oscillator(
     S_inf = torch.from_numpy(S_np.astype(np.float32))
     Y_inf = torch.from_numpy(Y_np.astype(np.float32))
 
-    distractor_gen = torch.Generator().manual_seed(int(seed) + 7919)
+    # Resolve the structured channel decomposition (G1 informative widths are
+    # symmetric: m_source = m = M).
+    if channel_decomp is None:
+        decomp = _resolve_decomp_defaults(M, c_y, c_u, m_source=M)
+    else:
+        decomp = _validate_channel_decomp(
+            channel_decomp, M, c_y, c_u, m_source=M,
+        )
+
     Y_buf, U_buf = _place_into_buffers(
         informative_target=Y_inf,
         informative_source=S_inf,
-        M=M,
+        decomp=decomp,
         c_y=c_y,
         c_u=c_u,
         reverse_roles=reverse_roles,
-        distractor_generator=distractor_gen,
+        base_seed=int(seed),
     )
 
     if reverse_roles:
+        # Analytic TE is computed from the informative-process spec, never
+        # from the buffer, so it is invariant to the distractor decomposition.
         te_true = 0.0
         true_lag_band: List[int] = []
         direction = "Y_to_X"
@@ -311,7 +813,9 @@ def gen_state_space_oscillator(
         direction = "X_to_Y"
 
     if standardize:
-        Y_buf = _standardize_per_channel(Y_buf)
+        Y_buf = _standardize_per_channel(
+            Y_buf, exclude_tail=int(decomp["n_smallnoise"]),
+        )
         U_buf = _standardize_per_channel(U_buf)
 
     meta: Dict[str, Any] = {
@@ -341,6 +845,8 @@ def gen_state_space_oscillator(
         "reverse_roles": reverse_roles,
         "direction": direction,
         "seed": seed,
+        "channel_decomp": _decomp_to_json(decomp),
+        "channel_layout": _make_channel_layout(decomp, c_y, c_u),
     }
     return Y_buf, U_buf, meta
 
@@ -369,6 +875,7 @@ def gen_smooth_arx(
     standardize: bool = True,
     reverse_roles: bool = False,
     seed: int = 0,
+    channel_decomp: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     r"""Generate the G2 smooth AR(1)-ARX benchmark.
 
@@ -483,15 +990,23 @@ def gen_smooth_arx(
     U_inf = U[:, burn_in:, :].contiguous()
     Y_inf = Y[:, burn_in:, :].contiguous()
 
-    distractor_gen = torch.Generator().manual_seed(int(seed) + 7919)
+    # Resolve the structured channel decomposition (G2 informative widths are
+    # symmetric: m_source = m = M).
+    if channel_decomp is None:
+        decomp = _resolve_decomp_defaults(M, c_y, c_u, m_source=M)
+    else:
+        decomp = _validate_channel_decomp(
+            channel_decomp, M, c_y, c_u, m_source=M,
+        )
+
     Y_buf, U_buf = _place_into_buffers(
         informative_target=Y_inf,
         informative_source=U_inf,
-        M=M,
+        decomp=decomp,
         c_y=c_y,
         c_u=c_u,
         reverse_roles=reverse_roles,
-        distractor_generator=distractor_gen,
+        base_seed=int(seed),
     )
 
     if reverse_roles:
@@ -499,6 +1014,8 @@ def gen_smooth_arx(
         true_lag_band: List[int] = []
         direction = "Y_to_X"
     else:
+        # Analytic TE depends only on the informative-process spec, not on
+        # the distractor decomposition; safe to compute independent of decomp.
         te_per_channel = te_block_arx_gaussian(
             rho_u=rho_u, rho_y=rho_y, c=c,
             sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
@@ -509,7 +1026,9 @@ def gen_smooth_arx(
         direction = "X_to_Y"
 
     if standardize:
-        Y_buf = _standardize_per_channel(Y_buf)
+        Y_buf = _standardize_per_channel(
+            Y_buf, exclude_tail=int(decomp["n_smallnoise"]),
+        )
         U_buf = _standardize_per_channel(U_buf)
 
     meta: Dict[str, Any] = {
@@ -536,6 +1055,8 @@ def gen_smooth_arx(
         "reverse_roles": reverse_roles,
         "direction": direction,
         "seed": seed,
+        "channel_decomp": _decomp_to_json(decomp),
+        "channel_layout": _make_channel_layout(decomp, c_y, c_u),
     }
     return Y_buf, U_buf, meta
 
@@ -598,6 +1119,7 @@ def gen_regime_switch_smooth(
     template_period_min: int = 40,
     standardize: bool = True,
     seed: int = 0,
+    channel_decomp: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     r"""Generate the G3 slow categorical regime-switch benchmark.
 
@@ -763,28 +1285,39 @@ def gen_regime_switch_smooth(
 
     Y_inf = torch.from_numpy(Y_inf_np)
     U_inf = torch.from_numpy(U_inf_np)
-
-    distractor_gen = torch.Generator().manual_seed(int(seed) + 7919)
-    Y_buf = torch.empty(n, T, c_y, dtype=torch.float32)
-    Y_buf[..., :M] = Y_inf
-    if M < c_y:
-        Y_buf[..., M:] = torch.randn(
-            n, T, c_y - M, generator=distractor_gen, dtype=torch.float32
-        )
-
     n_source_inf = M * K_classes
-    U_buf = torch.empty(n, T, c_u, dtype=torch.float32)
-    U_buf[..., :n_source_inf] = U_inf
-    if n_source_inf < c_u:
-        U_buf[..., n_source_inf:] = torch.randn(
-            n, T, c_u - n_source_inf, generator=distractor_gen, dtype=torch.float32
+
+    # Resolve the structured channel decomposition. G3 differs from G1/G2:
+    # the source TE block has width M * K_classes (per-channel one-hot), so
+    # m_source != m. The reverse_roles control is not supported here.
+    if channel_decomp is None:
+        decomp = _resolve_decomp_defaults(
+            M, c_y, c_u, m_source=n_source_inf,
         )
+    else:
+        decomp = _validate_channel_decomp(
+            channel_decomp, M, c_y, c_u, m_source=n_source_inf,
+        )
+
+    Y_buf, U_buf = _place_into_buffers(
+        informative_target=Y_inf,
+        informative_source=U_inf,
+        decomp=decomp,
+        c_y=c_y,
+        c_u=c_u,
+        reverse_roles=False,
+        base_seed=int(seed),
+    )
 
     if standardize:
-        Y_buf = _standardize_per_channel(Y_buf)
+        Y_buf = _standardize_per_channel(
+            Y_buf, exclude_tail=int(decomp["n_smallnoise"]),
+        )
         U_buf = _standardize_per_channel(U_buf)
 
     n_independent_chains = 1 if shared_regime else M
+    # Analytic TE depends only on (p_switch, K_classes, horizon, M); invariant
+    # to the distractor decomposition.
     te_true = n_independent_chains * te_categorical_switch_block(
         p_switch, K_classes, horizon
     )
@@ -815,6 +1348,8 @@ def gen_regime_switch_smooth(
         "reverse_roles": False,
         "direction": "X_to_Y",
         "seed": seed,
+        "channel_decomp": _decomp_to_json(decomp),
+        "channel_layout": _make_channel_layout(decomp, c_y, c_u),
     }
     return Y_buf, U_buf, meta
 
