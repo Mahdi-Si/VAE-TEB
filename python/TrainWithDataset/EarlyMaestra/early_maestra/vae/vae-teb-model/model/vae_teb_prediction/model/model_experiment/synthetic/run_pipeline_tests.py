@@ -16,7 +16,48 @@ CLI and an edit-and-run ``RUN_CONFIG`` dict. The dispatch is automatic:
 if any ``sys.argv[1:]`` is present the CLI parser owns the run;
 otherwise the ``RUN_CONFIG`` dict at the bottom is consumed.
 
-Output layout: ``<results_dir>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/``.
+Selection model
+---------------
+
+Checkpoint -- pass exactly one of:
+
+* ``--checkpoint-path /abs/path/to/final.ckpt`` -- recommended for any
+  checkpoint that does not sit at the canonical
+  ``<results_root>/<benchmark>/<run_tag>/<filename>`` location (sweep
+  cells, beta-sweep outputs, calibration cells, custom backup paths,
+  ...).
+* ``--run-tag <tag> [--checkpoint final.ckpt]`` -- resolves to
+  ``<results_root>/<benchmark>/<run_tag>/<checkpoint>``.
+
+Dataset -- in priority order:
+
+1. ``--data-npz /abs/path/to/test.npz`` -- explicit, no lookup.
+2. ``--data-tag <tag>`` -- resolves to
+   ``<data_root>/<benchmark>/<data_tag>/test.npz``.
+3. Auto-resolved from the checkpoint's embedded ``data_meta``
+   (``train_minimal.py`` writes the training split's ``meta.json`` into
+   every checkpoint, so the matching cache is reachable without any
+   user input). This branch only fires when ``--checkpoint-path`` is
+   used; the tag-based branch always requires an explicit ``--data-tag``.
+
+The checkpoint and dataset are **decoupled by design**: a single
+checkpoint can be evaluated against any compatible cache (e.g. a
+G1_baseline model on the G1_twoband test split for cross-evaluation).
+
+Output layout -- in priority order:
+
+1. ``--output-dir <dir>`` (explicit; final path is
+   ``<dir>/testing_pipeline/<output_tag>/`` -- wait, see below).
+
+   Specifically: when you pass ``--output-dir``, the runner uses
+   ``<output_dir>/<output_tag>/`` as the actual output location, so the
+   ``<output_tag>`` always appears as a leaf so multiple runs against
+   the same checkpoint stay siblings.
+2. ``--checkpoint-path`` is set ->
+   ``<ckpt.parent>/testing_pipeline/<output_tag>/`` (outputs land next
+   to the checkpoint -- exactly the right behaviour for sweep cells).
+3. Tag-based ->
+   ``<results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/``.
 
 The ``<output_tag>`` is **required** so multiple test runs on the same
 checkpoint (e.g. ``final.ckpt`` vs ``best.ckpt``, or different
@@ -30,13 +71,30 @@ raw ``fhr``/``up`` signals, no clinical labels, no per-epoch metadata):
 * ``class_separation`` / ``per_class_breakdown`` -- auto-skipped by
   ``single_class_mode=True`` because synthetic data carries no class label.
 
-Example:
-    >>> # Edit the RUN_CONFIG dict below, then:
-    >>> python -m model.vae_teb_prediction.model.model_experiment.synthetic.run_pipeline_tests
-    >>> # Or as a CLI:
-    >>> python -m model.vae_teb_prediction.model.model_experiment.synthetic.run_pipeline_tests \
-    ...     --benchmark G1 --data-tag G1_baseline --run-tag G1_baseline \
-    ...     --checkpoint final.ckpt --output-tag smoke --max-samples 200
+Examples:
+    Edit ``RUN_CONFIG`` then::
+
+        python -m model.vae_teb_prediction.model.model_experiment.synthetic.run_pipeline_tests
+
+    CLI -- tag-based (canonical layout)::
+
+        python -m ...synthetic.run_pipeline_tests \
+            --benchmark G1 --run-tag G1_baseline --checkpoint final.ckpt \
+            --data-tag G1_baseline --output-tag smoke --max-samples 200
+
+    CLI -- direct paths (sweep cells, deep trees)::
+
+        python -m ...synthetic.run_pipeline_tests \
+            --checkpoint-path results/G1/beta_sweep/beta_1e-3/cell_a/final.ckpt \
+            --output-tag beta_1e3_cellA
+        # data_tag + benchmark auto-resolved from the checkpoint's data_meta;
+        # outputs land in results/G1/beta_sweep/beta_1e-3/cell_a/testing_pipeline/beta_1e3_cellA/.
+
+    CLI -- cross-evaluate (train on G1_baseline, test on G1_twoband)::
+
+        python -m ...synthetic.run_pipeline_tests \
+            --checkpoint-path results/G1/G1_baseline/best.ckpt \
+            --data-tag G1_twoband --output-tag cross_eval_twoband
 """
 
 from __future__ import annotations
@@ -150,23 +208,31 @@ def _locate_test_split(
     return test_npz
 
 
-def _checkpoint_model_kwargs(ckpt_path: Path) -> Dict[str, Any]:
-    r"""Extract the ``model_kwargs`` block from a synthetic checkpoint.
+def _load_checkpoint_meta(ckpt_path: Path) -> Dict[str, Any]:
+    r"""Load the full ``train_minimal`` checkpoint dict (architecture + provenance).
 
     ``train_minimal.py`` saves checkpoints as a plain ``torch.save({...})``
-    dict containing ``model_state_dict``, ``model_kwargs``, ``config``,
-    ``data_meta`` and a few diagnostics. We need only ``model_kwargs`` to
-    reconstruct the model under :class:`SeqVaeLagAttnV1`. Reading the
-    architecture from the checkpoint (rather than from a paired YAML)
-    guarantees the testing pipeline builds the exact shape the weights
-    were trained for.
+    dict containing:
+
+    * ``model_state_dict`` -- the weights;
+    * ``model_kwargs``     -- exact constructor args for
+      :class:`SeqVaeLagAttnV1`;
+    * ``data_meta``        -- a copy of the training split's ``meta.json``
+      including ``tag``, ``benchmark``, ``te_true``, ``true_lag_band``;
+    * ``config``           -- the full effective post-override config;
+    * ``loss_settings``, ``epoch``, ``val_total_loss``, ``train_metrics``,
+      ``latent_stats_fitted``, ``torch_version``, ``created``.
+
+    The downstream auto-resolution code reads ``data_meta`` to pick the
+    matching dataset when the caller does not supply ``--data-tag`` /
+    ``--benchmark`` explicitly.
 
     Args:
-        ckpt_path: Path to ``final.ckpt`` or ``best.ckpt``.
+        ckpt_path: Path to ``final.ckpt`` / ``best.ckpt`` (or any other
+            file written by :func:`train_minimal.train`).
 
     Returns:
-        The ``model_kwargs`` dict ready to feed
-        ``SeqVaeLagAttnV1(**kwargs)``.
+        The full checkpoint dict.
 
     Raises:
         KeyError: If the checkpoint does not carry ``model_kwargs``.
@@ -177,6 +243,11 @@ def _checkpoint_model_kwargs(ckpt_path: Path) -> Dict[str, Any]:
             f"{ckpt_path} is not a train_minimal checkpoint -- "
             f"`model_kwargs` is missing. Available keys: {sorted(ckpt)}"
         )
+    return ckpt
+
+
+def _checkpoint_model_kwargs(ckpt: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the ``model_kwargs`` constructor args from a loaded checkpoint."""
     return dict(ckpt["model_kwargs"])
 
 
@@ -231,11 +302,23 @@ def _synth_to_testing_config(
 
 def run_synthetic_pipeline_tests(
     *,
-    benchmark: str,
-    data_tag: str,
-    run_tag: str,
     output_tag: str,
+    # ----- Checkpoint selection: pass *either* checkpoint_path *or* the
+    # (run_tag, checkpoint_filename) pair (with benchmark either explicit
+    # or read from the config). -----
+    checkpoint_path: Optional[Path] = None,
+    run_tag: Optional[str] = None,
     checkpoint_filename: str = "final.ckpt",
+    # ----- Dataset selection: pass *either* data_npz *or* data_tag (the
+    # latter resolves to data/<benchmark>/<data_tag>/test.npz). When both
+    # are omitted *and* checkpoint_path is supplied, the dataset is
+    # auto-resolved from the checkpoint's embedded `data_meta`. -----
+    data_npz: Optional[Path] = None,
+    data_tag: Optional[str] = None,
+    benchmark: Optional[str] = None,
+    # ----- Where outputs land: explicit > <checkpoint_dir>/testing_pipeline/<output_tag>/ > <results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/.
+    output_dir: Optional[Path] = None,
+    # ----- Misc -----
     config_path: Optional[Path] = None,
     device: Optional[str] = None,
     max_samples: Optional[int] = None,
@@ -250,33 +333,68 @@ def run_synthetic_pipeline_tests(
 ) -> Dict[str, Any]:
     r"""Top-level driver: run the testing pipeline on a synthetic checkpoint.
 
-    Builds a :class:`SyntheticTEDataset` over the test split paired with
-    the checkpoint, translates the architecture kwargs into a
-    testing-pipeline YAML, then delegates to
+    Two equivalent ways to point at a checkpoint:
+
+    1. **Direct path** -- pass ``checkpoint_path=<abs/path/to/final.ckpt>``.
+       This is the right choice for deeply-nested sweep cells like
+       ``results/G1/beta_sweep/beta_1e-3/cell_a/final.ckpt`` that the
+       ``<run_tag>/<filename>`` convention cannot address.
+    2. **Tag-based** -- pass ``run_tag`` (with ``benchmark`` either
+       explicit or read from ``experiment.benchmark`` in the config) and
+       ``checkpoint_filename`` (defaults to ``final.ckpt``). The
+       checkpoint lands at
+       ``<results_root>/<benchmark>/<run_tag>/<checkpoint_filename>``.
+
+    Dataset resolution mirrors the same flexibility:
+
+    * If ``data_npz`` is supplied, that ``.npz`` is loaded directly.
+    * Otherwise if ``data_tag`` is supplied, the dataset is
+      ``data/<benchmark>/<data_tag>/test.npz``.
+    * Otherwise, when ``checkpoint_path`` is supplied, the dataset is
+      auto-resolved from the checkpoint's embedded ``data_meta`` --
+      ``train_minimal`` saves the training split's ``meta.json`` inside
+      every checkpoint, so ``data_meta.benchmark`` and ``data_meta.tag``
+      reconstruct the matching cache path.
+
+    Note that the checkpoint and dataset are **decoupled by design**:
+    you can cross-evaluate a G1_baseline checkpoint against the
+    G1_twoband test split just by passing ``data_tag="G1_twoband"``.
+
+    Builds a :class:`SyntheticTEDataset`, translates the checkpoint's
+    ``model_kwargs`` into a testing-pipeline YAML, then delegates to
     :func:`run_full_test_pipeline` via ``loader_override``. After the
     pipeline returns it writes a ``synthetic_ground_truth.json`` sidecar
     pairing the run's outputs with the dataset's analytic
-    ``te_true`` / ``true_lag_band`` so cross-referencing with
-    :mod:`evaluate_te` is trivial.
+    ``te_true`` / ``true_lag_band``.
 
     Args:
-        benchmark: Benchmark identifier (e.g. ``G1`` / ``G2`` / ``G3``).
-        data_tag: Cache tag selecting
-            ``data/<benchmark>/<data_tag>/test.npz``.
+        output_tag: Folder name under ``testing_pipeline/`` (required so
+            multiple runs against the same checkpoint coexist as siblings).
+        checkpoint_path: Absolute path to the checkpoint. Mutually
+            exclusive with ``run_tag``.
         run_tag: Training-run subdirectory under
-            ``results/<benchmark>/`` holding the checkpoint.
-        output_tag: Folder name under
-            ``results/<benchmark>/<run_tag>/testing_pipeline/`` for this
-            run's outputs. Required.
-        checkpoint_filename: Either ``final.ckpt`` or ``best.ckpt``
-            (or any custom filename in the run directory).
+            ``<results_root>/<benchmark>/``. Mutually exclusive with
+            ``checkpoint_path``.
+        checkpoint_filename: Filename inside the run directory
+            (only consulted when ``run_tag`` is used).
+        data_npz: Absolute path to a ``test.npz`` cache split.
+        data_tag: Cache tag (alternative to ``data_npz``).
+        benchmark: Benchmark identifier (e.g. ``G1`` / ``G2`` / ``G3``).
+            When omitted, derived from the checkpoint's ``data_meta``
+            (if ``checkpoint_path`` is used) or from
+            ``experiment.benchmark`` in ``config_synth.yaml`` (if
+            ``run_tag`` is used).
+        output_dir: Absolute output directory. Defaults to:
+            (a) ``<ckpt.parent>/testing_pipeline/<output_tag>/`` when
+            ``checkpoint_path`` is used, or
+            (b) ``<results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/``
+            when ``run_tag`` is used.
         config_path: Path to ``config_synth.yaml`` (defaults to the
-            packaged one). Only ``paths.data_dir`` and
-            ``paths.results_dir`` are consumed.
+            packaged one). Used only when ``run_tag`` / ``data_tag``
+            need ``paths.data_dir`` / ``paths.results_dir`` resolution.
         device: Torch device override (``cuda:0``, ``cpu``, ``auto``).
-            Defaults to ``cuda:0`` if available, else CPU.
-        max_samples: Cap for aggregate analyses. ``None`` means iterate
-            the whole test split.
+        max_samples: Cap for aggregate analyses. ``None`` iterates the
+            whole test split.
         analysis_samples: Number of per-sample diagnostic PDFs to emit.
         batch_size: Test-time batch size. ``None`` reuses
             ``optim.batch_size`` from the synthetic config (default 32).
@@ -292,8 +410,17 @@ def run_synthetic_pipeline_tests(
         The result dict from :func:`run_full_test_pipeline`.
 
     Raises:
+        ValueError: If neither ``checkpoint_path`` nor ``run_tag`` is
+            supplied, or if dataset resolution fails after exhausting
+            ``data_npz`` / ``data_tag`` / ``data_meta`` fallbacks.
         FileNotFoundError: If the checkpoint or test split is missing.
     """
+    if checkpoint_path is None and run_tag is None:
+        raise ValueError(
+            "Must supply either `checkpoint_path` (absolute path) or "
+            "`run_tag` (subdirectory under results/<benchmark>/)."
+        )
+
     cfg_path = Path(config_path) if config_path is not None else _DEFAULT_CONFIG
     if not cfg_path.is_file():
         raise FileNotFoundError(f"config not found: {cfg_path}")
@@ -302,23 +429,79 @@ def run_synthetic_pipeline_tests(
     data_root = _data_root(synth_config)
     results_root = _results_root(synth_config)
 
-    ckpt_path = _locate_checkpoint(
-        results_root, benchmark, run_tag, checkpoint_filename
-    )
-    test_npz = _locate_test_split(data_root, benchmark, data_tag)
+    # --- Resolve checkpoint ----------------------------------------------
+    if checkpoint_path is not None:
+        ckpt_path = Path(checkpoint_path).resolve()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+    else:
+        # `benchmark` may still be None here -- fill from the config
+        # default before locating the checkpoint.
+        resolved_benchmark = benchmark or str(
+            (synth_config.get("experiment") or {}).get("benchmark", "G1")
+        )
+        ckpt_path = _locate_checkpoint(
+            results_root, resolved_benchmark, str(run_tag), checkpoint_filename
+        )
+        benchmark = resolved_benchmark
 
-    # Output dir -- one sibling folder per output_tag.
-    output_dir = (
-        results_root
-        / str(benchmark)
-        / str(run_tag)
-        / "testing_pipeline"
-        / str(output_tag)
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # --- Load checkpoint dict ONCE (architecture + provenance) -----------
+    ckpt = _load_checkpoint_meta(ckpt_path)
+    model_kwargs = _checkpoint_model_kwargs(ckpt)
+    ckpt_data_meta = ckpt.get("data_meta") or {}
 
-    # Architecture from the checkpoint -- single source of truth.
-    model_kwargs = _checkpoint_model_kwargs(ckpt_path)
+    # --- Resolve dataset -------------------------------------------------
+    if data_npz is not None:
+        test_npz = Path(data_npz).resolve()
+        if not test_npz.is_file():
+            raise FileNotFoundError(f"data_npz not found: {test_npz}")
+        # Pull benchmark / data_tag from npz parent if not given.
+        if benchmark is None:
+            benchmark = test_npz.parent.parent.name
+        if data_tag is None:
+            data_tag = test_npz.parent.name
+    else:
+        # Need a benchmark + data_tag pair. Auto-derive from data_meta
+        # if either is missing and the checkpoint carries that info.
+        if benchmark is None and ckpt_data_meta.get("benchmark"):
+            benchmark = str(ckpt_data_meta["benchmark"])
+            logger.info(
+                f"benchmark auto-resolved from checkpoint data_meta: {benchmark}"
+            )
+        if data_tag is None and ckpt_data_meta.get("tag"):
+            data_tag = str(ckpt_data_meta["tag"])
+            logger.info(
+                f"data_tag auto-resolved from checkpoint data_meta: {data_tag}"
+            )
+        if benchmark is None:
+            raise ValueError(
+                "Could not resolve `benchmark`: pass --benchmark, --data-npz, "
+                "or use a checkpoint that carries data_meta.benchmark."
+            )
+        if data_tag is None:
+            raise ValueError(
+                "Could not resolve `data_tag`: pass --data-tag, --data-npz, "
+                "or use a checkpoint that carries data_meta.tag."
+            )
+        test_npz = _locate_test_split(data_root, benchmark, data_tag)
+
+    # --- Resolve output dir ----------------------------------------------
+    if output_dir is not None:
+        resolved_output = Path(output_dir).resolve() / str(output_tag)
+    elif checkpoint_path is not None:
+        # Sweep-cell convention: put outputs next to the checkpoint.
+        resolved_output = ckpt_path.parent / "testing_pipeline" / str(output_tag)
+    else:
+        # Tag-based convention: <results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/.
+        resolved_output = (
+            results_root
+            / str(benchmark)
+            / str(run_tag)
+            / "testing_pipeline"
+            / str(output_tag)
+        )
+    resolved_output.mkdir(parents=True, exist_ok=True)
+    output_dir = resolved_output
 
     # Resolve batch size: explicit > synth config > default 32.
     effective_batch_size = (
@@ -329,9 +512,10 @@ def run_synthetic_pipeline_tests(
 
     # Translate synthetic config -> testing-pipeline YAML on disk so
     # TestRunner.from_checkpoint(config_path=...) can read it.
+    run_tag_str: str = str(run_tag) if run_tag else ckpt_path.parent.name
     testing_cfg = _synth_to_testing_config(
         model_kwargs,
-        tag=f"{benchmark}_{run_tag}_{output_tag}",
+        tag=f"{benchmark}_{run_tag_str}_{output_tag}",
         out_dir_base=output_dir.parent,
         batch_size=effective_batch_size,
     )
@@ -367,8 +551,9 @@ def run_synthetic_pipeline_tests(
     logger.info("Synthetic testing-pipeline run")
     logger.info(f"  benchmark        : {benchmark}")
     logger.info(f"  data_tag         : {data_tag}")
-    logger.info(f"  run_tag          : {run_tag}")
+    logger.info(f"  run_tag          : {run_tag_str}")
     logger.info(f"  checkpoint       : {ckpt_path}")
+    logger.info(f"  test_split       : {test_npz}")
     logger.info(f"  output_tag       : {output_tag}")
     logger.info(f"  output_dir       : {output_dir}")
     logger.info(f"  device           : {device_str}")
@@ -410,9 +595,9 @@ def run_synthetic_pipeline_tests(
     # ground truth, the checkpoint provenance, and the headline KL surrogate.
     _write_synthetic_ground_truth(
         output_dir=output_dir,
-        benchmark=benchmark,
-        data_tag=data_tag,
-        run_tag=run_tag,
+        benchmark=str(benchmark),
+        data_tag=str(data_tag),
+        run_tag=run_tag_str,
         output_tag=output_tag,
         ckpt_path=ckpt_path,
         dataset=dataset,
@@ -497,35 +682,68 @@ def _write_synthetic_ground_truth(
 
 def _parse_cli(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the lag-attn-v1 testing pipeline on a synthetic checkpoint.",
+        description=(
+            "Run the lag-attn-v1 testing pipeline on a synthetic checkpoint.\n\n"
+            "Two ways to point at a checkpoint:\n"
+            "  (1) --checkpoint-path <abs/path/to/final.ckpt>  -- recommended\n"
+            "      for deep sweep cells.\n"
+            "  (2) --run-tag <tag> [--checkpoint final.ckpt] -- resolves to\n"
+            "      <results_root>/<benchmark>/<run_tag>/<checkpoint>.\n\n"
+            "Dataset resolution (in priority order):\n"
+            "  --data-npz <abs/path/to/test.npz>\n"
+            "    > --data-tag <tag> (-> data/<benchmark>/<data_tag>/test.npz)\n"
+            "    > auto-resolve from checkpoint's embedded data_meta\n"
+            "      (only when --checkpoint-path is used)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config", type=Path, default=_DEFAULT_CONFIG,
         help="Path to config_synth.yaml (uses paths.data_dir / paths.results_dir).",
     )
+    # ---- checkpoint selection ----
     parser.add_argument(
-        "--benchmark", type=str, required=False, default=None,
-        help="Benchmark identifier (defaults to experiment.benchmark from the config).",
-    )
-    parser.add_argument(
-        "--data-tag", type=str, required=False, default=None,
-        help="Cache tag selecting data/<benchmark>/<data_tag>/test.npz "
-             "(defaults to experiment.tag from the config).",
+        "--checkpoint-path", type=Path, default=None,
+        help="Absolute path to the .ckpt file. Mutually exclusive with --run-tag.",
     )
     parser.add_argument(
         "--run-tag", type=str, required=False, default=None,
         help="Run subdirectory under results/<benchmark>/ holding the checkpoint "
-             "(defaults to --data-tag).",
+             "(used together with --checkpoint).",
     )
     parser.add_argument(
         "--checkpoint", type=str, default="final.ckpt",
-        help="Checkpoint filename inside the run directory (default final.ckpt).",
+        help="Checkpoint filename inside the run directory (default final.ckpt). "
+             "Only consulted when --run-tag is used.",
+    )
+    # ---- dataset selection ----
+    parser.add_argument(
+        "--data-npz", type=Path, default=None,
+        help="Absolute path to a test.npz cache file (overrides --data-tag).",
     )
     parser.add_argument(
-        "--output-tag", type=str, required=True,
-        help="Required folder name under "
-             "results/<benchmark>/<run_tag>/testing_pipeline/.",
+        "--data-tag", type=str, required=False, default=None,
+        help="Cache tag selecting data/<benchmark>/<data_tag>/test.npz. "
+             "When omitted *and* --checkpoint-path is used, the dataset is "
+             "auto-resolved from the checkpoint's data_meta.",
     )
+    parser.add_argument(
+        "--benchmark", type=str, required=False, default=None,
+        help="Benchmark identifier (G1/G2/G3). When omitted, derived from "
+             "data_meta or experiment.benchmark in the config.",
+    )
+    # ---- output layout ----
+    parser.add_argument(
+        "--output-tag", type=str, required=True,
+        help="Required folder name appended under <output_dir>/testing_pipeline/.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Explicit output directory. Defaults: <ckpt.parent>/testing_pipeline/<output_tag>/ "
+             "(when --checkpoint-path is used) or "
+             "<results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/.",
+    )
+    # ---- misc ----
     parser.add_argument(
         "--device", type=str, default="auto",
         help="Torch device (auto / cpu / cuda:N).",
@@ -551,96 +769,57 @@ def _parse_cli(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _resolve_run_keys(
-    *,
-    config_path: Path,
-    benchmark: Optional[str],
-    data_tag: Optional[str],
-    run_tag: Optional[str],
-) -> tuple[str, str, str]:
-    r"""Fall back to ``experiment.benchmark`` / ``experiment.tag`` from the YAML.
+def _normalise_run_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce a ``RUN_CONFIG`` dict into :func:`run_synthetic_pipeline_tests` kwargs.
 
-    Mirrors the project convention used by every other ``synthetic/``
-    runner: if the caller omits the keys, read them from the active
-    benchmark in ``config_synth.yaml``.
+    Pure helper -- accepts the user's edit-and-run dict, casts the
+    path-like fields to :class:`pathlib.Path`, applies defaults, and
+    returns the keyword-argument dict the runner expects.
+
+    Args:
+        cfg: A dict shaped like ``RUN_CONFIG`` (see ``__main__``).
+
+    Returns:
+        Kwargs ready to splat into :func:`run_synthetic_pipeline_tests`.
     """
-    synth = _load_yaml(config_path)
-    experiment = synth.get("experiment", {}) or {}
-    bm = benchmark or str(experiment.get("benchmark", "G1"))
-    dt = data_tag or str(experiment.get("tag", bm))
-    rt = run_tag or dt
-    return bm, dt, rt
-
-
-# =============================================================================
-# Edit-and-run config (V2-D8)
-# =============================================================================
-
-
-RUN_CONFIG: Dict[str, Any] = {
-    "config_path": None,        # None -> _DEFAULT_CONFIG
-    "benchmark": None,          # None -> config_synth.yaml: experiment.benchmark
-    "data_tag": None,           # None -> config_synth.yaml: experiment.tag
-    "run_tag": None,            # None -> defaults to data_tag
-    "checkpoint": "final.ckpt", # filename inside results/<benchmark>/<run_tag>/
-    "output_tag": "default",    # required; folder name under testing_pipeline/
-    "device": "auto",
-    "max_samples": None,        # None -> whole test split
-    "analysis_samples": 10,
-    "batch_size": None,         # None -> synth optim.batch_size (default 32)
-    "skip_up_effect": False,
-    "skip_frequency_band": False,
-    "skip_attention": False,
-    "skip_forecast_heatmaps": False,
-    "skip_kld_pca": False,
-    "skip_interactive": False,
-}
-
-
-def _from_run_config() -> Dict[str, Any]:
-    """Build :func:`run_synthetic_pipeline_tests` kwargs from ``RUN_CONFIG``."""
-    cfg_path = RUN_CONFIG.get("config_path")
+    cfg_path = cfg.get("config_path")
     cfg_path = Path(cfg_path) if cfg_path else _DEFAULT_CONFIG
-    bm, dt, rt = _resolve_run_keys(
-        config_path=cfg_path,
-        benchmark=RUN_CONFIG.get("benchmark"),
-        data_tag=RUN_CONFIG.get("data_tag"),
-        run_tag=RUN_CONFIG.get("run_tag"),
-    )
     return dict(
-        benchmark=bm,
-        data_tag=dt,
-        run_tag=rt,
-        output_tag=str(RUN_CONFIG["output_tag"]),
-        checkpoint_filename=str(RUN_CONFIG.get("checkpoint", "final.ckpt")),
+        checkpoint_path=(
+            Path(cfg["checkpoint_path"]) if cfg.get("checkpoint_path") else None
+        ),
+        run_tag=cfg.get("run_tag"),
+        checkpoint_filename=str(cfg.get("checkpoint", "final.ckpt")),
+        data_npz=(Path(cfg["data_npz"]) if cfg.get("data_npz") else None),
+        data_tag=cfg.get("data_tag"),
+        benchmark=cfg.get("benchmark"),
+        output_tag=str(cfg["output_tag"]),
+        output_dir=(Path(cfg["output_dir"]) if cfg.get("output_dir") else None),
         config_path=cfg_path,
-        device=RUN_CONFIG.get("device", "auto"),
-        max_samples=RUN_CONFIG.get("max_samples"),
-        analysis_samples=int(RUN_CONFIG.get("analysis_samples", 10)),
-        batch_size=RUN_CONFIG.get("batch_size"),
-        skip_up_effect=bool(RUN_CONFIG.get("skip_up_effect", False)),
-        skip_frequency_band=bool(RUN_CONFIG.get("skip_frequency_band", False)),
-        skip_attention=bool(RUN_CONFIG.get("skip_attention", False)),
-        skip_forecast_heatmaps=bool(RUN_CONFIG.get("skip_forecast_heatmaps", False)),
-        skip_kld_pca=bool(RUN_CONFIG.get("skip_kld_pca", False)),
-        skip_interactive=bool(RUN_CONFIG.get("skip_interactive", False)),
+        device=cfg.get("device", "auto"),
+        max_samples=cfg.get("max_samples"),
+        analysis_samples=int(cfg.get("analysis_samples", 10)),
+        batch_size=cfg.get("batch_size"),
+        skip_up_effect=bool(cfg.get("skip_up_effect", False)),
+        skip_frequency_band=bool(cfg.get("skip_frequency_band", False)),
+        skip_attention=bool(cfg.get("skip_attention", False)),
+        skip_forecast_heatmaps=bool(cfg.get("skip_forecast_heatmaps", False)),
+        skip_kld_pca=bool(cfg.get("skip_kld_pca", False)),
+        skip_interactive=bool(cfg.get("skip_interactive", False)),
     )
 
 
 def _from_cli_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Build :func:`run_synthetic_pipeline_tests` kwargs from parsed CLI args."""
-    bm, dt, rt = _resolve_run_keys(
-        config_path=args.config,
-        benchmark=args.benchmark,
-        data_tag=args.data_tag,
-        run_tag=args.run_tag,
-    )
     return dict(
-        benchmark=bm,
-        data_tag=dt,
-        run_tag=rt,
-        output_tag=args.output_tag,
+        checkpoint_path=args.checkpoint_path,
+        run_tag=args.run_tag,
         checkpoint_filename=args.checkpoint,
+        data_npz=args.data_npz,
+        data_tag=args.data_tag,
+        benchmark=args.benchmark,
+        output_tag=args.output_tag,
+        output_dir=args.output_dir,
         config_path=args.config,
         device=args.device,
         max_samples=args.max_samples,
@@ -656,11 +835,70 @@ def _from_cli_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    # =========================================================================
+    # >>>>>>>>>>>>>>>>>>>>  EDIT BELOW TO RUN FROM YOUR IDE  <<<<<<<<<<<<<<<<<<<
+    # =========================================================================
+    #
+    # This block is the edit-and-run entry point (V2-D8 convention -- mirrors
+    # `evaluate_te.py`, `lag_recovery.py`, etc.). If you launch the file with
+    # NO command-line args (e.g. via "Run File" in your IDE, or
+    # ``python -m ...synthetic.run_pipeline_tests``), the ``RUN_CONFIG`` dict
+    # below drives the run.
+    #
+    # If you DO pass any CLI flag, argparse takes over and ``RUN_CONFIG`` is
+    # ignored. So you can keep one tested configuration here for IDE runs and
+    # still drive sweeps from the shell.
+    #
+    # Selection priorities (same as the CLI flags):
+    #   checkpoint:  checkpoint_path > (run_tag + checkpoint)
+    #   dataset:     data_npz > data_tag > auto-from ckpt["data_meta"]
+    #                (the auto branch fires only when checkpoint_path is set)
+    #   output dir:  output_dir > <ckpt.parent>/testing_pipeline/<output_tag>/
+    #                (when checkpoint_path is set) >
+    #                <results_root>/<benchmark>/<run_tag>/testing_pipeline/<output_tag>/
+    # =========================================================================
+
+    RUN_CONFIG: Dict[str, Any] = {
+        # ---- CHECKPOINT --- pick ONE pattern (path OR tag) ------------------
+        # Pattern A: deep path (recommended for sweep cells / calibration cells).
+        "checkpoint_path": None,
+        # e.g. "model/vae_teb_prediction/model/model_experiment/results/G1/G1_baseline/final.ckpt"
+
+        # Pattern B: tag-based. Used only when checkpoint_path is None.
+        "run_tag":    None,           # subdir under results/<benchmark>/
+        "checkpoint": "final.ckpt",   # filename inside that subdir
+
+        # ---- DATASET --- highest non-None wins. Auto-resolve only fires
+        # when checkpoint_path is set AND both fields below are None. ---------
+        "data_npz":  None,            # absolute path to a test.npz
+        "data_tag":  None,            # tag under data/<benchmark>/<data_tag>/
+        "benchmark": None,            # derived from data_meta when omitted
+
+        # ---- OUTPUT --- output_tag is REQUIRED ------------------------------
+        "output_tag": "default",      # leaf folder under testing_pipeline/
+        "output_dir": None,           # full override; otherwise auto-resolved
+
+        # ---- RUN KNOBS ------------------------------------------------------
+        "config_path":      None,     # None -> packaged synthetic/config_synth.yaml
+        "device":           "auto",   # "auto" | "cpu" | "cuda:0" | ...
+        "max_samples":      None,     # None -> whole test split
+        "analysis_samples": 10,       # per-sample diagnostic PDFs
+        "batch_size":       None,     # None -> synth optim.batch_size
+
+        # ---- ANALYSIS GATES -------------------------------------------------
+        "skip_up_effect":         False,
+        "skip_frequency_band":    False,
+        "skip_attention":         False,
+        "skip_forecast_heatmaps": False,
+        "skip_kld_pca":           False,
+        "skip_interactive":       False,
+    }
+
     if len(sys.argv) > 1:
         kwargs = _from_cli_args(_parse_cli(sys.argv[1:]))
         logger.info(f"CLI mode: {kwargs}")
     else:
-        kwargs = _from_run_config()
+        kwargs = _normalise_run_config(RUN_CONFIG)
         logger.info(f"RUN_CONFIG mode: {kwargs}")
 
     run_synthetic_pipeline_tests(**kwargs)
