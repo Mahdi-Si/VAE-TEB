@@ -162,6 +162,8 @@ def run_full_test_pipeline(
     skip_causal_te: bool = False,
     single_class_mode: bool = False,
     keep_kld_trajectory_only: bool = False,
+    loader_override: Optional[Any] = None,
+    guid_loader_override: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run the full lag-attn v1 testing pipeline end-to-end.
 
@@ -213,6 +215,19 @@ def run_full_test_pipeline(
         normalize_fields: Fields to apply per-channel normalisation to.
         dataset_kwargs: Additional constructor kwargs for
             ``CombinedHDF5Dataset``.
+        loader_override: Optional pre-built standard test DataLoader. When
+            supplied, the pipeline skips ``_create_dataloader`` and uses
+            this loader instead — letting non-HDF5 datasets (e.g. the
+            synthetic ``.npz`` benchmarks in
+            ``model_experiment/synthetic/``) drive the same analysis suite
+            without touching the HDF5 plumbing. ``data_path``,
+            ``stats_path``, ``normalize_fields`` and ``dataset_kwargs``
+            become unused in this mode. Defaults to ``None`` so every
+            existing caller behaves identically.
+        guid_loader_override: Optional pre-built per-GUID DataLoader for the
+            trajectory step. When supplied, ``_create_guid_dataloader`` is
+            skipped. Pass ``None`` together with ``skip_trajectory=True``
+            for datasets without GUID-organised history (e.g. synthetic).
 
     Returns:
         Dict with one entry per analysis step.
@@ -235,35 +250,51 @@ def run_full_test_pipeline(
     elif data_path is not None:
         data_paths = list(data_path)
 
-    (
-        data_paths,
-        stats_path_resolved,
-        batch_size_resolved,
-        num_workers_resolved,
-        normalize_fields_resolved,
-        dataset_kwargs_resolved,
-    ) = _resolve_dataloader_settings(
-        data_paths=data_paths,
-        stats_path=stats_path,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        normalize_fields=normalize_fields,
-        dataset_kwargs=dataset_kwargs,
-        config_path=config_path,
-    )
-
-    if not data_paths:
-        raise ValueError(
-            "No test data provided. Pass data_path or supply config_path with "
-            "dataset_config.vae_test_datasets."
+    # When a pre-built loader is supplied (e.g. for synthetic .npz benchmarks)
+    # every HDF5-specific resolver is bypassed: paths, stats, normalize_fields
+    # and the dataset-construction kwargs are all irrelevant. We still resolve
+    # batch_size / num_workers from the config so logging is consistent.
+    using_loader_override = loader_override is not None
+    if using_loader_override:
+        stats_path_resolved: Optional[str] = None
+        normalize_fields_resolved: Optional[Sequence[str]] = None
+        dataset_kwargs_resolved: Dict[str, Any] = {}
+        batch_size_resolved = batch_size if batch_size is not None else 0
+        num_workers_resolved = num_workers if num_workers is not None else 0
+    else:
+        (
+            data_paths,
+            stats_path_resolved,
+            batch_size_resolved,
+            num_workers_resolved,
+            normalize_fields_resolved,
+            dataset_kwargs_resolved,
+        ) = _resolve_dataloader_settings(
+            data_paths=data_paths,
+            stats_path=stats_path,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            normalize_fields=normalize_fields,
+            dataset_kwargs=dataset_kwargs,
+            config_path=config_path,
         )
+
+        if not data_paths:
+            raise ValueError(
+                "No test data provided. Pass data_path or supply config_path "
+                "with dataset_config.vae_test_datasets, or hand in a pre-built "
+                "loader via loader_override."
+            )
 
     device_obj = torch.device(
         device if device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
 
     logger.info(f"Checkpoint: {checkpoint_path_resolved}")
-    logger.info(f"Data:       {data_paths}")
+    if using_loader_override:
+        logger.info("Data:       <loader_override supplied — HDF5 path resolution skipped>")
+    else:
+        logger.info(f"Data:       {data_paths}")
     logger.info(f"Output:     {output_dir_resolved}")
     logger.info(f"Stats:      {stats_path_resolved}")
     logger.info(f"Config:     {config_path}")
@@ -280,32 +311,52 @@ def run_full_test_pipeline(
     )
 
     # ----- Step 2: Create DataLoaders -----
-    logger.info("Creating standard test dataloader...")
-    standard_loader = _create_dataloader(
-        data_paths,
-        batch_size_resolved,
-        stats_path_resolved,
-        normalize_fields=normalize_fields_resolved,
-        num_workers=num_workers_resolved,
-        dataset_kwargs=dataset_kwargs_resolved,
-    )
+    if using_loader_override:
+        logger.info(
+            "Using caller-supplied standard test dataloader "
+            f"(dataset size = {len(getattr(loader_override, 'dataset', []))})."
+        )
+        standard_loader = loader_override
+    else:
+        logger.info("Creating standard test dataloader...")
+        standard_loader = _create_dataloader(
+            data_paths,
+            batch_size_resolved,
+            stats_path_resolved,
+            normalize_fields=normalize_fields_resolved,
+            num_workers=num_workers_resolved,
+            dataset_kwargs=dataset_kwargs_resolved,
+        )
 
     guid_loader = None
     if not skip_trajectory:
-        logger.info("Creating GUID-based dataloader for trajectory analysis...")
-        try:
-            _, guid_loader = _create_guid_dataloader(
-                data_paths,
-                stats_path=stats_path_resolved,
-                min_epochs_per_guid=min_epochs_per_guid,
-                max_guids=max_guids,
-                normalize_fields=normalize_fields_resolved,
-                num_workers=num_workers_resolved,
-                dataset_kwargs=dataset_kwargs_resolved,
+        if guid_loader_override is not None:
+            logger.info(
+                "Using caller-supplied GUID dataloader for trajectory analysis."
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Failed to build GUID dataloader: {exc}")
+            guid_loader = guid_loader_override
+        elif using_loader_override:
+            logger.info(
+                "skip_trajectory=False but loader_override supplied without "
+                "guid_loader_override; trajectory analysis will be skipped "
+                "(no HDF5 paths to build a per-GUID loader from)."
+            )
             guid_loader = None
+        else:
+            logger.info("Creating GUID-based dataloader for trajectory analysis...")
+            try:
+                _, guid_loader = _create_guid_dataloader(
+                    data_paths,
+                    stats_path=stats_path_resolved,
+                    min_epochs_per_guid=min_epochs_per_guid,
+                    max_guids=max_guids,
+                    normalize_fields=normalize_fields_resolved,
+                    num_workers=num_workers_resolved,
+                    dataset_kwargs=dataset_kwargs_resolved,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Failed to build GUID dataloader: {exc}")
+                guid_loader = None
 
     results: Dict[str, Any] = {}
 

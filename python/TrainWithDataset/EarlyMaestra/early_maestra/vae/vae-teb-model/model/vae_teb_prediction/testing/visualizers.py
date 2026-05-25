@@ -111,6 +111,15 @@ def unique_labels_in(values: Any) -> list:
 
     Accepts a numpy array, pandas Series, list, or None. Non-finite
     and non-numeric values are ignored. Result is sorted ascending.
+
+    Note:
+        ``np.unique`` calls ``.sort()`` on the underlying array, which
+        raises ``TypeError`` when the array is object-dtype containing
+        only ``None`` (Python's ``None < None`` is undefined). We
+        therefore pre-filter to integer-coercible values *before*
+        deduplicating, which keeps the function safe on label-free
+        datasets (e.g. synthetic-TE batches) where ``df["label"]`` is
+        all-``None``.
     """
     if values is None:
         return []
@@ -120,15 +129,18 @@ def unique_labels_in(values: Any) -> list:
         return []
     if arr.size == 0:
         return []
-    out = []
-    for v in np.unique(arr):
+    seen: set = set()
+    iterable = arr.tolist() if hasattr(arr, "tolist") else arr
+    for v in iterable:
+        if v is None:
+            continue
         try:
             iv = int(v)
         except (TypeError, ValueError):
             continue
         if iv in CLASS_NAMES:
-            out.append(iv)
-    return sorted(out)
+            seen.add(iv)
+    return sorted(seen)
 
 
 def class_label_for(label_id: int) -> str:
@@ -5172,7 +5184,10 @@ def plot_class_separation_scatter_2d(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     class_colors = [COLOR_GREEN, COLOR_VERMILLION, COLOR_PURPLE, COLOR_BLUE, COLOR_SKY, COLOR_ORANGE]
-    unique_labels = sorted(np.unique(labels))
+    # Pre-filter None to keep ``np.unique`` from raising on object-dtype
+    # arrays that hold only ``None`` (label-free datasets).
+    _valid = [x for x in np.asarray(labels).tolist() if x is not None]
+    unique_labels = sorted({x for x in _valid})
 
     fig, ax = plt.subplots(figsize=(7.5, 6.0))
 
@@ -5239,7 +5254,10 @@ def plot_per_dimension_boxplots(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_dims = min(X.shape[1], max_dims)
-    unique_labels = sorted(np.unique(labels))
+    # Pre-filter None to keep ``np.unique`` from raising on object-dtype
+    # arrays that hold only ``None`` (label-free datasets).
+    _valid = [x for x in np.asarray(labels).tolist() if x is not None]
+    unique_labels = sorted({x for x in _valid})
     n_classes = len(unique_labels)
 
     class_colors = [COLOR_GREEN, COLOR_VERMILLION, COLOR_PURPLE, COLOR_BLUE, COLOR_SKY, COLOR_ORANGE]
@@ -5755,7 +5773,11 @@ def plot_te_lag_distribution(
     if class_names is None:
         class_names = {1: "HEALTHY", 2: "ACIDOSIS", 3: "HIE"}
 
-    unique_labels = sorted(int(x) for x in np.unique(labels) if x is not None)
+    # Pre-filter None before deduplicating: ``np.unique`` calls
+    # ``.sort()`` on the underlying array, which raises ``TypeError``
+    # on an object-dtype array of only ``None``.
+    _valid_labels = [x for x in np.asarray(labels).tolist() if x is not None]
+    unique_labels = sorted({int(x) for x in _valid_labels})
     palette = [COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE]
 
     fig, ax = plt.subplots(figsize=(6.8, 3.8))
