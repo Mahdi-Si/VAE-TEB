@@ -2924,6 +2924,12 @@ def plot_selected_pc_trajectories_grid(
     if selection and isinstance(selection.get("contrast_type"), str):
         contrast_type = selection["contrast_type"]
 
+    # When ``group_col`` has no non-null values (label-free runs), fall
+    # back to a single pooled trace per PC so the grid is informative
+    # instead of an array of "no data" panels.
+    groups = list(traj_df[group_col].dropna().unique())
+    pooled_mode = len(groups) == 0
+
     n_panels = len(pc_cols)
     ncols = min(3, n_panels)
     nrows = int(np.ceil(n_panels / ncols))
@@ -2935,15 +2941,24 @@ def plot_selected_pc_trajectories_grid(
     )
     axes_flat = axes.flatten()
 
-    groups = list(traj_df[group_col].dropna().unique())
-
     for idx, (col, panel_title) in enumerate(pc_cols):
         ax = axes_flat[idx]
         plotted = False
-        for g in groups:
-            sub = traj_df[traj_df[group_col] == g]
-            if sub.empty:
-                continue
+        iter_groups = [None] if pooled_mode else groups
+        for g in iter_groups:
+            if pooled_mode:
+                sub = traj_df
+                label = "pooled"
+                color = COLOR_BLUE
+            else:
+                sub = traj_df[traj_df[group_col] == g]
+                if sub.empty:
+                    continue
+                label = str(g)
+                try:
+                    color = class_color_for(int(g))
+                except Exception:
+                    color = _band_color_for(str(g))
             grouped = sub.groupby(time_col)[col]
             mean = grouped.mean()
             std = grouped.std().fillna(0.0)
@@ -2953,11 +2968,7 @@ def plot_selected_pc_trajectories_grid(
                 continue
             xs = np.asarray(mean.index.to_list(), dtype=float)
             ys = mean.to_numpy()
-            try:
-                color = class_color_for(int(g))
-            except Exception:
-                color = _band_color_for(str(g))
-            ax.plot(xs, ys, color=color, lw=1.4, label=str(g))
+            ax.plot(xs, ys, color=color, lw=1.4, label=label)
             ax.fill_between(
                 xs, ys - se.to_numpy(), ys + se.to_numpy(),
                 color=color, alpha=0.18, lw=0,
@@ -5783,28 +5794,46 @@ def plot_te_lag_distribution(
     fig, ax = plt.subplots(figsize=(6.8, 3.8))
     x = np.arange(L)
     rng = np.random.default_rng(0)
+    plotted_any = False
 
-    for ci, lab in enumerate(unique_labels):
-        mask = labels == lab
-        if not mask.any():
-            continue
-        subset = te_lag_mean[mask]
-        mean_vec = np.nanmean(subset, axis=0)
-        # Bootstrap CI over samples.
-        idxs = rng.integers(0, subset.shape[0], size=(n_bootstrap, subset.shape[0]))
-        boot_means = np.nanmean(subset[idxs], axis=1)
-        ci_lo = np.nanpercentile(boot_means, 2.5, axis=0)
-        ci_hi = np.nanpercentile(boot_means, 97.5, axis=0)
+    if unique_labels:
+        for ci, lab in enumerate(unique_labels):
+            mask = labels == lab
+            if not mask.any():
+                continue
+            subset = te_lag_mean[mask]
+            mean_vec = np.nanmean(subset, axis=0)
+            # Bootstrap CI over samples.
+            idxs = rng.integers(0, subset.shape[0], size=(n_bootstrap, subset.shape[0]))
+            boot_means = np.nanmean(subset[idxs], axis=1)
+            ci_lo = np.nanpercentile(boot_means, 2.5, axis=0)
+            ci_hi = np.nanpercentile(boot_means, 97.5, axis=0)
 
-        color = palette[ci % len(palette)]
-        name = class_names.get(lab, f"class {lab}")
-        ax.fill_between(x, ci_lo, ci_hi, color=color, alpha=0.18)
-        ax.plot(x, mean_vec, color=color, linewidth=1.2, label=f"{name} (n={int(mask.sum())})")
+            color = palette[ci % len(palette)]
+            name = class_names.get(lab, f"class {lab}")
+            ax.fill_between(x, ci_lo, ci_hi, color=color, alpha=0.18)
+            ax.plot(x, mean_vec, color=color, linewidth=1.2, label=f"{name} (n={int(mask.sum())})")
+            plotted_any = True
+    else:
+        # Label-free input (synthetic-TE runs etc.): emit a single
+        # pooled trace so the PDF carries the lag profile instead of an
+        # empty axes + "No artists with labels" legend warning.
+        mean_vec = np.nanmean(te_lag_mean, axis=0)
+        if N > 0:
+            idxs = rng.integers(0, N, size=(n_bootstrap, N))
+            boot_means = np.nanmean(te_lag_mean[idxs], axis=1)
+            ci_lo = np.nanpercentile(boot_means, 2.5, axis=0)
+            ci_hi = np.nanpercentile(boot_means, 97.5, axis=0)
+            ax.fill_between(x, ci_lo, ci_hi, color=COLOR_BLUE, alpha=0.18)
+        ax.plot(x, mean_vec, color=COLOR_BLUE, linewidth=1.2,
+                label=f"pooled (n={int(N)})")
+        plotted_any = True
 
     ax.set_xlabel("Lag k", fontsize=FONT_LABEL)
     ax.set_ylabel("mean te_lag_map", fontsize=FONT_LABEL)
     ax.set_title(title, fontsize=FONT_TITLE, fontweight="normal")
-    ax.legend(loc="upper right", frameon=True)
+    if plotted_any:
+        ax.legend(loc="upper right", frameon=True)
     _style_axes(ax, grid="major", minor_ticks=True)
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")

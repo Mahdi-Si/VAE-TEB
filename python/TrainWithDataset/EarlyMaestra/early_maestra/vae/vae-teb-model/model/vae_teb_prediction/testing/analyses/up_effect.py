@@ -93,8 +93,13 @@ def _attention_concentration(outputs: Dict[str, torch.Tensor], warmup: int) -> n
         return np.full(batch_size, np.nan, dtype=float)
     diag = compute_attention_diagnostics(attn, warmup)
     ent = diag["entropy"].detach().cpu().numpy()
-    head_mean = np.nanmean(ent, axis=2)
-    ent_mean = np.asarray(np.nanmean(head_mean, axis=1))
+    # Warmup rows are entirely NaN -- suppress the expected
+    # ``RuntimeWarning: Mean of empty slice`` from ``nanmean``.
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", category=RuntimeWarning)
+        head_mean = np.nanmean(ent, axis=2)
+        ent_mean = np.asarray(np.nanmean(head_mean, axis=1))
     L = int(attn.shape[-1])
     norm = math.log(L) if L > 1 else 1.0
     return 1.0 - ent_mean / max(norm, 1e-12)

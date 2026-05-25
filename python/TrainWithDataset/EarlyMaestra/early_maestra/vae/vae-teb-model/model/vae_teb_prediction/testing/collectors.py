@@ -313,10 +313,15 @@ def collect_metrics(
                     attn_weights, runner.warmup_steps
                 )
                 # entropy: (B, T, M) with NaN in warmup; collapse over heads
-                # then over time using nanmean.
+                # then over time using nanmean. Warmup rows are entirely NaN
+                # by design, so ``nanmean`` emits ``RuntimeWarning: Mean of
+                # empty slice`` for them -- expected, not a bug, suppress.
                 ent = diag["entropy"].detach().cpu().numpy()
-                head_mean = np.nanmean(ent, axis=2)  # (B, T)
-                ent_mean = np.asarray(np.nanmean(head_mean, axis=1))  # (B,)
+                import warnings as _w
+                with _w.catch_warnings():
+                    _w.simplefilter("ignore", category=RuntimeWarning)
+                    head_mean = np.nanmean(ent, axis=2)  # (B, T)
+                    ent_mean = np.asarray(np.nanmean(head_mean, axis=1))  # (B,)
                 attn_entropy_mean = ent_mean
                 L = int(attn_weights.shape[-1])
                 norm = math.log(L) if L > 1 else 1.0

@@ -17,6 +17,7 @@ Run from the repo root with ``python -m pytest``.
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -243,3 +244,66 @@ def test_meta_json_roundtrip(tiny_g1_cache: Path):
     assert meta["M"] == 4
     assert meta["delays"] == [60] * meta["M"]
     assert meta["true_lag_band"] == list(range(30, 60))
+
+
+# --- Channel decomposition v2 (structured distractors) -----------------------
+
+
+@pytest.mark.parametrize("benchmark", ["G1", "G2", "G3"])
+def test_meta_records_channel_decomp(tmp_path, benchmark):
+    r"""``meta.json`` carries the resolved ``channel_decomp`` + ``channel_layout``."""
+    config = _tiny_v2_config(benchmark, tmp_path)
+    out_dir = build_dataset(config, force=True)
+    ds = SyntheticTEDataset(out_dir / "train.npz")
+    assert "channel_decomp" in ds.meta
+    assert "channel_layout" in ds.meta
+    decomp = ds.meta["channel_decomp"]
+    layout = ds.meta["channel_layout"]
+    assert decomp["m"] == ds.meta["M"]
+    # Target budget closes against c_y; source budget against c_u.
+    c_y, c_u = ds.meta["c_y"], ds.meta["c_u"]
+    assert decomp["m"] + decomp["n_self"] + decomp["n_smallnoise"] == c_y
+    assert decomp["m_source"] + decomp["n_dist"] + decomp["n_noise"] == c_u
+    # Layout reports the absolute index lists.
+    assert layout["Y"]["te"][0] == 0
+    assert layout["Y"]["smallnoise"][-1] == c_y - 1
+    assert layout["U"]["te"][0] == 0
+    assert layout["U"]["noise"][-1] == c_u - 1
+    # G3 source TE width is M*K_classes; G1/G2 is M.
+    if benchmark == "G3":
+        assert decomp["m_source"] == ds.meta["M"] * ds.meta["K_classes"]
+    else:
+        assert decomp["m_source"] == ds.meta["M"]
+
+
+def test_dataset_attaches_layout_attrs(tiny_g1_cache: Path):
+    """``SyntheticTEDataset.channel_decomp`` / ``.channel_layout`` are populated."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
+    assert ds.channel_decomp is not None
+    assert ds.channel_layout is not None
+    assert ds.channel_decomp["m"] == ds.meta["M"]
+    # Indices into the model's native (B, T, c_y) / (B, T, c_u) buffers.
+    layout = ds.channel_layout
+    assert layout["Y"]["te"][0] == 0
+    assert max(layout["Y"]["smallnoise"]) == ds.meta["c_y"] - 1
+    assert max(layout["U"]["noise"]) == ds.meta["c_u"] - 1
+
+
+def test_smallnoise_tail_variance_in_cached_split(tiny_g1_cache: Path):
+    r"""The cached Y small-noise tail keeps $\sigma^2_{\text{smallnoise}}$ on disk."""
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
+    layout = ds.channel_layout
+    decomp = ds.channel_decomp
+    sigma = float(decomp["sigma_smallnoise"])
+    # Build the full Y buffer from the cached fhr_st / fhr_ph fields.
+    fhr_st = ds._arrays["fhr_st"]                  # (n, T, 43)
+    fhr_ph = ds._arrays["fhr_ph"]                  # (n, T, 44)
+    Y = torch.from_numpy(np.concatenate([fhr_st, fhr_ph], axis=-1))
+    sn_idx = layout["Y"]["smallnoise"]
+    Ysn = Y[..., sn_idx]
+    var = Ysn.var(dim=(0, 1))
+    # Tiny tmp cache (n=6); use loose 60% relative slack.
+    assert ((var - sigma ** 2).abs() / (sigma ** 2)).max().item() < 0.6, (
+        f"smallnoise tail variance deviates from sigma^2={sigma**2:.6f}; "
+        f"per-channel var = {var.tolist()}"
+    )
