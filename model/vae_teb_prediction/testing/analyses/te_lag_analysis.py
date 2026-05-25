@@ -83,9 +83,12 @@ def run_te_lag_class_analysis(
     labels = df["label"].to_numpy() if "label" in df.columns else np.full(len(df), None)
     N, L = lag_matrix.shape
 
-    # Per-class mean + bootstrap CI.
+    # Per-class mean + bootstrap CI. ``np.unique`` raises on
+    # object-dtype arrays containing only ``None`` (Python's
+    # ``None < None`` is undefined), so pre-filter before deduplicating.
     class_rows = []
-    unique_labels = sorted(int(x) for x in np.unique(labels) if x is not None)
+    valid_labels = [x for x in labels.tolist() if x is not None]
+    unique_labels = sorted({int(x) for x in valid_labels})
     for lab in unique_labels:
         mask = labels == lab
         subset = lag_matrix[mask]
