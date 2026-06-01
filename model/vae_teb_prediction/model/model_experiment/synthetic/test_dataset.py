@@ -195,7 +195,10 @@ def test_dataset_shapes_and_dtype(tiny_g1_cache: Path):
     assert isinstance(sample.guid, str) and "test_G1_train" in sample.guid
     assert isinstance(sample.te_true, float)
     assert sample.true_lag_band.dtype == torch.long
-    assert sample.true_lag_band.shape == (30,)
+    # G1 variable lag: the union band is {0, ..., max(drawn delay)-1}; its
+    # length depends on the per-sample delays actually drawn (delay_max=15).
+    d_max = max(ds.meta["delays_per_sample"])
+    assert sample.true_lag_band.tolist() == list(range(0, d_max))
 
 
 def test_collate_batch(tiny_g1_cache: Path):
@@ -209,7 +212,7 @@ def test_collate_batch(tiny_g1_cache: Path):
     assert batch.up_st.shape == (3, _T, 43)
     assert batch.up_ph.shape == (3, _T, 58)
     assert batch.weight.shape == (3, _T)
-    assert batch.true_lag_band.shape == (3, 30)
+    assert batch.true_lag_band.shape == (3, len(ds.true_lag_band))
     assert len(batch.guid) == 3 and all(isinstance(g, str) for g in batch.guid)
 
 
@@ -242,8 +245,14 @@ def test_meta_json_roundtrip(tiny_g1_cache: Path):
     # meta records one delay per informative channel.
     assert meta["target_ar"] == pytest.approx(0.95)
     assert meta["M"] == 4
-    assert meta["delays"] == [60] * meta["M"]
-    assert meta["true_lag_band"] == list(range(30, 60))
+    # G1 variable per-sample lag (real-data regime): delays are drawn in
+    # {delay_min..delay_max} per sample (shared across channels), and the union
+    # band is {0, ..., max(drawn delay)-1}.
+    assert meta["variable_delay"] is True
+    assert meta["delay_min"] == 1 and meta["delay_max"] == 15
+    dps = meta["delays_per_sample"]
+    assert min(dps) >= 1 and max(dps) <= 15
+    assert meta["true_lag_band"] == list(range(0, max(dps)))
 
 
 # --- Channel decomposition v2 (structured distractors) -----------------------

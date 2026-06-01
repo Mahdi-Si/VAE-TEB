@@ -75,6 +75,10 @@ from model.vae_teb_prediction.model.model_experiment.synthetic import (
     train_minimal as tm,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
+    B_y_for_mean_te_block_state_space,
+    c_for_mean_te_block_arx,
+    mean_te_block_arx_over_delays,
+    mean_te_block_state_space_over_delays,
     te_block_arx_gaussian,
     te_block_state_space_gaussian,
     te_categorical_switch_block,
@@ -100,6 +104,7 @@ _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 # whichever the active benchmark does not use is left blank.
 _SUMMARY_FIELDS = [
     "run_tag", "data_tag", "benchmark", "B_y", "c", "p_switch", "M",
+    "delay_min", "delay_max", "target_te",
     "te_true", "te_per_step",
     # Null-control surrogates: ``k_bar_shuffled`` permutes $U$ along the batch
     # axis, ``k_bar_reversed`` flips $U$ along $T$. Both are computed in
@@ -598,6 +603,8 @@ def evaluate_checkpoint(
         "c": data_meta.get("c", test_meta.get("c")),
         "p_switch": data_meta.get("p_switch", test_meta.get("p_switch")),
         "M": data_meta.get("M", test_meta.get("M")),
+        "delay_min": data_meta.get("delay_min", test_meta.get("delay_min")),
+        "delay_max": data_meta.get("delay_max", test_meta.get("delay_max")),
         "te_true": te_true,
         "te_per_step": te_per_step,
         "k_bar": float(k_bar),
@@ -838,16 +845,21 @@ def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Dispatches on ``config["sweep"]["kind"]``:
 
-    * ``gaussian_state_space`` (G1) -- crosses ``B_y_grid`` x ``m_grid``;
-      $\mathrm{TE}^{(H)}$ from :func:`te_block_state_space_gaussian` (MC) for
-      a single oscillator coupled with the swept $B_y$, multiplied by $M$.
-    * ``arx`` (G2) -- crosses ``c_grid`` x ``m_grid``; $\mathrm{TE}^{(H)}$
-      from the closed-form :func:`te_block_arx_gaussian`, multiplied by $M$.
+    * ``gaussian_state_space`` (G1) -- with a ``target_te_grid`` (variable
+      delays), the uniform coupling $B_y$ is **solved per (target, M)** via
+      :func:`B_y_for_mean_te_block_state_space` so the cell lands on the
+      requested *mean* block TE (real-data [0.1, 3] band), holding TE fixed as
+      $M$ varies. Otherwise crosses the legacy ``B_y_grid`` x ``m_grid`` using
+      the mean-over-delays TE (variable) or single-delay TE (fixed).
+    * ``arx`` (G2) -- same, with ``c`` solved via
+      :func:`c_for_mean_te_block_arx` (closed form) or the legacy ``c_grid``.
     * ``regime_switch`` (G3) -- crosses ``p_grid`` x ``m_grid``;
       $\mathrm{TE}^{(H)} = M\cdot$ :func:`te_categorical_switch_block`.
 
-    Per V2-D6, the per-cell TE scales linearly in $M$ because each
-    informative channel pair is independent under the v2 DGPs.
+    Per V2-D6, the per-channel TE scales linearly in $M$ because each
+    informative channel pair is independent under the v2 DGPs; with
+    ``target_te_grid`` the per-channel target is therefore the cell target
+    divided by $M$.
 
     Args:
         config: The parsed (benchmark-resolved) config -- reads ``sweep``,
@@ -865,55 +877,127 @@ def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     horizon = int(config["model"]["horizon"])
     data = config.get("data", {}) or {}
 
+    # Variable per-sample delays (delay_min/delay_max) vs fixed delays/delay.
+    variable_delay = (
+        data.get("delay_min") is not None or data.get("delay_max") is not None
+    )
+    K_history = data.get("K_history")
+    K_history = None if K_history is None else int(K_history)
+
     settings: List[Dict[str, Any]] = []
     if kind == "gaussian_state_space":
-        # Per-cell TE: a single oscillator with the swept B_y broadcast over
-        # the (length-len(delays)) coupling vector. MC budget per cell defaults
-        # to a smaller value than the build-time meta.te_true (which uses the
-        # data block's te_n_samples).
+        # Per-channel TE (single oscillator spec); the cell TE is that value x M
+        # since the M informative channels are independent. With a
+        # ``target_te_grid`` the coupling B_y is *solved* per (target, M) so the
+        # cell lands on the requested mean block TE (real-data [0.1, 3] band),
+        # holding TE fixed as M varies (isolating channel dilution).
         oscillators = [tuple(pair) for pair in data["oscillators"]]
         target_ar = float(data["target_ar"])
-        delays = [int(d) for d in data["delays"]]
         sigma2_y = float(data["sigma2_y"])
         sigma2_eta = data["sigma2_eta"]
-        te_n_samples = int(sweep.get("te_n_samples", 20_000))
-        for m in sweep.get("m_grid", []):
-            for b in sweep.get("B_y_grid", []):
-                te_per_channel = te_block_state_space_gaussian(
-                    oscillators=oscillators,
-                    target_ar=target_ar,
-                    delays=delays,
-                    B_y=[float(b)] * len(delays),
-                    sigma2_y=sigma2_y,
-                    sigma2_eta=sigma2_eta,
-                    H=horizon,
-                    n_samples=te_n_samples,
+        te_n_samples = int(sweep.get("te_n_samples", 12_000))
+        target_te_grid = sweep.get("target_te_grid")
+        if target_te_grid is not None:
+            if not variable_delay:
+                raise ValueError(
+                    "enumerate_sweep: target_te_grid requires variable delays "
+                    "(delay_min/delay_max) in the data block."
                 )
-                te = float(te_per_channel) * int(m)
-                settings.append({
-                    "kind": "gaussian_state_space",
-                    "B_y": float(b), "M": int(m),
-                    "te_true": te, "te_per_step": te / horizon,
-                })
+            dmin, dmax = int(data["delay_min"]), int(data["delay_max"])
+            for m in sweep.get("m_grid", []):
+                for t_target in target_te_grid:
+                    sol = B_y_for_mean_te_block_state_space(
+                        target_te_block=float(t_target) / int(m),
+                        delay_min=dmin, delay_max=dmax,
+                        oscillators=oscillators, target_ar=target_ar,
+                        sigma2_y=sigma2_y, sigma2_eta=sigma2_eta,
+                        H=horizon, K_history=K_history, n_samples=te_n_samples,
+                    )
+                    te = float(sol["te_block"]) * int(m)
+                    settings.append({
+                        "kind": "gaussian_state_space",
+                        "B_y": float(sol["B_y_scalar"]), "M": int(m),
+                        "te_true": te, "te_per_step": te / horizon,
+                        "target_te": float(t_target),
+                    })
+        else:
+            for m in sweep.get("m_grid", []):
+                for b in sweep.get("B_y_grid", []):
+                    if variable_delay:
+                        te_per_channel = mean_te_block_state_space_over_delays(
+                            delay_min=int(data["delay_min"]),
+                            delay_max=int(data["delay_max"]),
+                            oscillators=oscillators, target_ar=target_ar,
+                            B_y=float(b), sigma2_y=sigma2_y,
+                            sigma2_eta=sigma2_eta, H=horizon,
+                            K_history=K_history, n_samples=te_n_samples,
+                        )
+                    else:
+                        delays = [int(d) for d in data["delays"]]
+                        te_per_channel = te_block_state_space_gaussian(
+                            oscillators=oscillators, target_ar=target_ar,
+                            delays=delays, B_y=[float(b)] * len(delays),
+                            sigma2_y=sigma2_y, sigma2_eta=sigma2_eta,
+                            H=horizon, n_samples=te_n_samples,
+                        )
+                    te = float(te_per_channel) * int(m)
+                    settings.append({
+                        "kind": "gaussian_state_space",
+                        "B_y": float(b), "M": int(m),
+                        "te_true": te, "te_per_step": te / horizon,
+                    })
     elif kind == "arx":
         rho_u = float(data["rho_u"])
         rho_y = float(data["rho_y"])
         sigma2_eta = float(data["sigma2_eta"])
         sigma2_eps = float(data["sigma2_eps"])
-        delay = int(data["delay"])
-        for m in sweep.get("m_grid", []):
-            for c in sweep.get("c_grid", []):
-                te_per_channel = te_block_arx_gaussian(
-                    rho_u=rho_u, rho_y=rho_y, c=float(c),
-                    sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
-                    H=horizon, D=delay,
+        target_te_grid = sweep.get("target_te_grid")
+        if target_te_grid is not None:
+            if not variable_delay:
+                raise ValueError(
+                    "enumerate_sweep: target_te_grid requires variable delays "
+                    "(delay_min/delay_max) in the data block."
                 )
-                te = float(te_per_channel) * int(m)
-                settings.append({
-                    "kind": "arx",
-                    "c": float(c), "M": int(m),
-                    "te_true": te, "te_per_step": te / horizon,
-                })
+            dmin, dmax = int(data["delay_min"]), int(data["delay_max"])
+            for m in sweep.get("m_grid", []):
+                for t_target in target_te_grid:
+                    sol = c_for_mean_te_block_arx(
+                        target_te_block=float(t_target) / int(m),
+                        delay_min=dmin, delay_max=dmax,
+                        rho_u=rho_u, rho_y=rho_y,
+                        sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                        H=horizon, M=1, K_history=K_history,
+                    )
+                    te = float(sol["te_block"]) * int(m)
+                    settings.append({
+                        "kind": "arx",
+                        "c": float(sol["c_scalar"]), "M": int(m),
+                        "te_true": te, "te_per_step": te / horizon,
+                        "target_te": float(t_target),
+                    })
+        else:
+            for m in sweep.get("m_grid", []):
+                for c in sweep.get("c_grid", []):
+                    if variable_delay:
+                        te_per_channel = mean_te_block_arx_over_delays(
+                            delay_min=int(data["delay_min"]),
+                            delay_max=int(data["delay_max"]),
+                            rho_u=rho_u, rho_y=rho_y, c=float(c),
+                            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                            H=horizon, M=1, K_history=K_history,
+                        )
+                    else:
+                        te_per_channel = te_block_arx_gaussian(
+                            rho_u=rho_u, rho_y=rho_y, c=float(c),
+                            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                            H=horizon, D=int(data["delay"]),
+                        )
+                    te = float(te_per_channel) * int(m)
+                    settings.append({
+                        "kind": "arx",
+                        "c": float(c), "M": int(m),
+                        "te_true": te, "te_per_step": te / horizon,
+                    })
     elif kind == "regime_switch":
         K = int(data["K_classes"])
         for m in sweep.get("m_grid", []):

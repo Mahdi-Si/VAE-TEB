@@ -44,7 +44,7 @@ G4 (switched sinusoid) is deferred to Sprint 7 per ``model_validation_v2_plan
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -98,6 +98,75 @@ def _standardize_per_channel(
     std = head.std(dim=(0, 1), keepdim=True)
     head_z = (head - mean) / (std + eps)
     return torch.cat([head_z, tail], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Variable per-sample delay helpers (shared by G1 / G2)
+# ---------------------------------------------------------------------------
+
+
+def _draw_per_sample_delays(
+    n: int, delay_min: int, delay_max: int, seed: int,
+) -> np.ndarray:
+    r"""Draw one delay per sample, $d_i \sim \mathrm{Uniform}\{d_{\min},\dots,
+    d_{\max}\}$ (inclusive).
+
+    Args:
+        n: Number of samples.
+        delay_min: Smallest delay (inclusive), $\ge 1$.
+        delay_max: Largest delay (inclusive).
+        seed: Base seed; offset so the delay draw is independent of the
+            simulator's own noise RNG (which also keys off ``seed``).
+
+    Returns:
+        An integer ``np.ndarray`` of shape ``(n,)``.
+    """
+    rng = np.random.default_rng(int(seed) + 99_991)
+    return rng.integers(int(delay_min), int(delay_max) + 1, size=n)
+
+
+def _union_lag_band(delays: Sequence[int], horizon: int) -> List[int]:
+    r"""Source lags carrying transfer: the union of $\{D-H,\dots,D-1\}$.
+
+    A delay shorter than the horizon $H$ clamps the band to start at lag 0,
+    so a variable small-delay dataset yields $\{0,\dots,\max_i d_i - 1\}$.
+
+    Args:
+        delays: The (distinct) source-to-target delays present in the dataset.
+        horizon: Forecast horizon $H$.
+
+    Returns:
+        The sorted list of source lags in the true band.
+    """
+    lags: set = set()
+    for d in delays:
+        lags.update(range(max(0, int(d) - horizon), int(d)))
+    return sorted(lags)
+
+
+def _mean_te_over_samples(
+    delays_per_sample: Sequence[int],
+    te_of_delay: Callable[[int], float],
+) -> Tuple[float, List[float], Dict[int, float]]:
+    r"""Map an exact per-delay block TE over the per-sample delays.
+
+    Each sample's $M$ informative channels share one delay, so its exact block
+    TE is ``te_of_delay(d_i)``. The dataset ground truth is the mean over the
+    drawn delays. ``te_of_delay`` is evaluated once per distinct delay.
+
+    Args:
+        delays_per_sample: The delay drawn for each sample.
+        te_of_delay: Maps a delay to its exact block TE in nats.
+
+    Returns:
+        ``(te_true, te_per_sample, te_by_delay)`` -- the dataset-mean TE, the
+        per-sample TE list, and the ``{delay: TE}`` lookup.
+    """
+    te_by_delay = {
+        d: float(te_of_delay(d)) for d in sorted(set(int(x) for x in delays_per_sample))
+    }
+    te_per_sample = [te_by_delay[int(d)] for d in delays_per_sample]
+    return float(np.mean(te_per_sample)), te_per_sample, te_by_delay
 
 
 # ---------------------------------------------------------------------------
@@ -620,14 +689,17 @@ def gen_state_space_oscillator(
     *,
     oscillators: Sequence[Tuple[float, float]],
     target_ar: float,
-    delays: Sequence[int],
     B_y: Sequence[float],
     sigma2_y: float,
     sigma2_eta: Union[float, Sequence[float]],
     M: int,
+    delays: Optional[Sequence[int]] = None,
+    delay_min: Optional[int] = None,
+    delay_max: Optional[int] = None,
     c_y: int = 87,
     c_u: int = 101,
     horizon: int = 30,
+    K_history: Optional[int] = None,
     easy_variant: bool = False,
     standardize: bool = True,
     reverse_roles: bool = False,
@@ -676,7 +748,21 @@ def gen_state_space_oscillator(
         oscillators: Length-$M$ list of $(r_m, \omega_m)$ pairs with
             $r_m \in [0, 1)$.
         target_ar: Scalar target self-coefficient $A_y \in [0, 1)$.
-        delays: Length-$M$ list of source-to-target delays $D_m \ge H$.
+        delays: **Fixed mode** — length-$M$ list of per-channel
+            source-to-target delays $D_m \ge 1$ shared across all samples
+            (used by the multi-band variant). Mutually exclusive with
+            ``delay_min`` / ``delay_max``.
+        delay_min: **Variable mode** — smallest delay in the per-sample range
+            $\{d_{\min},\dots,d_{\max}\}$. Each sample draws one delay
+            $d_i \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$ shared across
+            all $M$ informative channels (matching real recordings where the
+            source→target lag varies between subjects). When $d_i < H$ the
+            source directly drives only the first $\sim d_i$ forecast steps and
+            the per-sample lag band collapses to $\{0,\dots,d_i-1\}$; the rest of
+            the horizon is reachable through the smooth source's own
+            autocorrelation. Requires ``delay_max``; mutually exclusive with
+            ``delays``.
+        delay_max: Largest delay (inclusive) in the per-sample range.
         B_y: Length-$M$ list of target loadings $B_y^{(m)}$.
         sigma2_y: Shared target innovation variance $\sigma^{2}_{y} > 0$.
         sigma2_eta: Source innovation variance -- scalar (broadcast) or
@@ -686,6 +772,11 @@ def gen_state_space_oscillator(
         c_y: Target channel count (default 87).
         c_u: Source channel count (default 101).
         horizon: Forecast horizon $H$.
+        K_history: History depth forwarded to the analytic TE estimator. With
+            a near-unit-root source ($r \approx 0.99$) set this generously
+            (e.g. 120-200) so the conditioning captures the long source
+            memory; ``None`` defaults to ``max(delays) + 2H`` inside the
+            estimator.
         easy_variant: If ``True``, tile the user-supplied oscillator specs to
             fill every target channel ($M$ becomes $c_y$, avoiding channel
             dilution).
@@ -720,8 +811,39 @@ def gen_state_space_oscillator(
     oscillators_list: List[Tuple[float, float]] = [
         (float(o[0]), float(o[1])) for o in oscillators
     ]
-    delays_list: List[int] = [int(d) for d in delays]
     B_y_list: List[float] = [float(b) for b in B_y]
+
+    # Resolve the delay mode: fixed per-channel (``delays``) XOR variable
+    # per-sample (``delay_min`` / ``delay_max``).
+    variable_mode = delays is None
+    delay_lo: Optional[int] = None
+    delay_hi: Optional[int] = None
+    if variable_mode:
+        if delay_min is None or delay_max is None:
+            raise ValueError(
+                "gen_state_space_oscillator: provide either `delays` (fixed "
+                "per-channel) or both `delay_min` and `delay_max` (variable "
+                "per-sample)."
+            )
+        delay_lo, delay_hi = int(delay_min), int(delay_max)
+        if not (1 <= delay_lo <= delay_hi):
+            raise ValueError(
+                "gen_state_space_oscillator: require 1 <= delay_min <= "
+                f"delay_max, got delay_min={delay_min}, delay_max={delay_max}."
+            )
+        if delay_hi >= T:
+            raise ValueError(
+                f"gen_state_space_oscillator: delay_max={delay_hi} must be "
+                f"< T={T}."
+            )
+        delays_list: Optional[List[int]] = None
+    else:
+        if delay_min is not None or delay_max is not None:
+            raise ValueError(
+                "gen_state_space_oscillator: `delays` is mutually exclusive "
+                "with `delay_min` / `delay_max`."
+            )
+        delays_list = [int(d) for d in delays]
 
     if easy_variant:
         # Tile the supplied specs to fill c_y target channels.
@@ -733,25 +855,50 @@ def gen_state_space_oscillator(
             )
         reps = (c_y + base - 1) // base
         oscillators_list = (oscillators_list * reps)[:c_y]
-        delays_list = (delays_list * reps)[:c_y]
         B_y_list = (B_y_list * reps)[:c_y]
+        if delays_list is not None:
+            delays_list = (delays_list * reps)[:c_y]
         if not isinstance(sigma2_eta, (int, float)):
             sigma2_eta_list = list(sigma2_eta)
             sigma2_eta = (sigma2_eta_list * reps)[:c_y]
         M = c_y
 
-    if not (len(oscillators_list) == M and len(delays_list) == M
-            and len(B_y_list) == M):
+    if len(oscillators_list) != M or len(B_y_list) != M:
         raise ValueError(
-            "gen_state_space_oscillator: len(oscillators) / len(delays) / "
-            f"len(B_y) must all equal M={M}; got {len(oscillators_list)} / "
-            f"{len(delays_list)} / {len(B_y_list)}."
+            "gen_state_space_oscillator: len(oscillators) / len(B_y) must "
+            f"equal M={M}; got {len(oscillators_list)} / {len(B_y_list)}."
         )
-    if min(delays_list) < horizon:
-        raise ValueError(
-            f"gen_state_space_oscillator: every delay must be >= horizon="
-            f"{horizon}, got delays={delays_list}."
-        )
+    if delays_list is not None:
+        if len(delays_list) != M:
+            raise ValueError(
+                "gen_state_space_oscillator: len(delays) must equal M="
+                f"{M}; got {len(delays_list)}."
+            )
+        if min(delays_list) < 1:
+            raise ValueError(
+                "gen_state_space_oscillator: every fixed delay must be >= 1, "
+                f"got delays={delays_list}."
+            )
+
+    # Build the delay argument for the simulator: a length-M list in fixed
+    # mode, or an (n, M) per-sample array (one delay per sample, shared across
+    # channels) in variable mode. ``distinct_delays`` drives the exact
+    # per-delay analytic TE below.
+    delays_per_sample: Optional[List[int]] = None
+    if variable_mode:
+        assert delay_lo is not None and delay_hi is not None
+        d_samples = _draw_per_sample_delays(n, delay_lo, delay_hi, seed)  # (n,)
+        delays_per_sample = [int(x) for x in d_samples]
+        delays_arg: Union[List[int], np.ndarray] = np.repeat(
+            d_samples[:, None], M, axis=1
+        ).astype(int)                                       # (n, M)
+        distinct_delays = sorted(set(delays_per_sample))
+        D_max_used = delay_hi
+    else:
+        assert delays_list is not None
+        delays_arg = delays_list
+        distinct_delays = sorted(set(delays_list))
+        D_max_used = max(delays_list)
 
     # Simulate via the same helper that computes the analytic TE.
     S_np, Y_np = _simulate_state_space_gaussian(
@@ -759,7 +906,7 @@ def gen_state_space_oscillator(
         T=T,
         oscillators=oscillators_list,
         target_ar=target_ar,
-        delays=delays_list,
+        delays=delays_arg,
         B_y=B_y_list,
         sigma2_y=sigma2_y,
         sigma2_eta=sigma2_eta,
@@ -787,13 +934,33 @@ def gen_state_space_oscillator(
         base_seed=int(seed),
     )
 
+    # Exact block TE. Analytic TE is computed from the informative-process
+    # spec, never from the buffer, so it is invariant to the distractor
+    # decomposition.
+    te_per_sample: Optional[List[float]] = None
+    te_by_delay: Optional[Dict[int, float]] = None
     if reverse_roles:
-        # Analytic TE is computed from the informative-process spec, never
-        # from the buffer, so it is invariant to the distractor decomposition.
         te_true = 0.0
         true_lag_band: List[int] = []
         direction = "Y_to_X"
+    elif variable_mode:
+        # Each sample's M channels share one delay; its exact block TE is
+        # te_block_state_space_gaussian(delays=[d]*M), averaged over the drawn
+        # delays for the dataset ground truth.
+        assert delays_per_sample is not None
+        te_true, te_per_sample, te_by_delay = _mean_te_over_samples(
+            delays_per_sample,
+            lambda d: te_block_state_space_gaussian(
+                oscillators=oscillators_list, target_ar=target_ar,
+                delays=[d] * M, B_y=B_y_list, sigma2_y=sigma2_y,
+                sigma2_eta=sigma2_eta, H=horizon, K_history=K_history,
+                n_samples=te_n_samples, seed=int(seed) + 1_337 + d,
+            ),
+        )
+        true_lag_band = _union_lag_band(distinct_delays, horizon)
+        direction = "X_to_Y"
     else:
+        assert delays_list is not None
         te_true = te_block_state_space_gaussian(
             oscillators=oscillators_list,
             target_ar=target_ar,
@@ -802,14 +969,11 @@ def gen_state_space_oscillator(
             sigma2_y=sigma2_y,
             sigma2_eta=sigma2_eta,
             H=horizon,
+            K_history=K_history,
             n_samples=te_n_samples,
             seed=int(seed) + 1_337,
         )
-        lag_set = set()
-        for D_m in delays_list:
-            for ell in range(max(0, D_m - horizon), D_m):
-                lag_set.add(ell)
-        true_lag_band = sorted(lag_set)
+        true_lag_band = _union_lag_band(delays_list, horizon)
         direction = "X_to_Y"
 
     if standardize:
@@ -824,10 +988,21 @@ def gen_state_space_oscillator(
         "te_per_step": float(te_true) / horizon,
         "true_lag_band": true_lag_band,
         "informative_channels": list(range(M)),
-        "clean_anchor_range": [max(delays_list) - 1, T - horizon],
+        "clean_anchor_range": [D_max_used - 1, T - horizon],
         "oscillators": [list(o) for o in oscillators_list],
         "target_ar": float(target_ar),
-        "delays": delays_list,
+        "delays": (delays_list if not variable_mode else distinct_delays),
+        "delay_min": delay_lo,
+        "delay_max": delay_hi,
+        "variable_delay": variable_mode,
+        "delays_per_sample": delays_per_sample,
+        "te_per_sample": te_per_sample,
+        "te_by_delay": (
+            {str(k): float(v) for k, v in te_by_delay.items()}
+            if te_by_delay is not None
+            else None
+        ),
+        "K_history": (None if K_history is None else int(K_history)),
         "B_y": B_y_list,
         "sigma2_y": float(sigma2_y),
         "sigma2_eta": (
@@ -865,11 +1040,14 @@ def gen_smooth_arx(
     c: float,
     sigma2_eta: float,
     sigma2_eps: float,
-    delay: int,
     M: int,
+    delay: Optional[int] = None,
+    delay_min: Optional[int] = None,
+    delay_max: Optional[int] = None,
     c_y: int = 87,
     c_u: int = 101,
     horizon: int = 30,
+    K_history: Optional[int] = None,
     burn_in: Optional[int] = None,
     easy_variant: bool = False,
     standardize: bool = True,
@@ -891,10 +1069,10 @@ def gen_smooth_arx(
 
     with $\eta \sim \mathcal{N}(0, \sigma_\eta^{2})$,
     $\varepsilon \sim \mathcal{N}(0, \sigma_\varepsilon^{2})$, all parameters
-    shared across channels (only noise realisations differ). For
-    $D \ge H$ every future target step depends on an already-observed source
-    value, so the analytic block TE is :func:`te_block_arx_gaussian`
-    (computed once per cache build and written to ``meta.te_true``).
+    shared across channels (only noise realisations differ). The per-channel
+    block TE is the closed-form :func:`te_block_arx_gaussian`; for variable
+    per-sample delays the dataset ground truth is its mean over the delays
+    drawn (written to ``meta.te_true``).
 
     Args:
         n: Number of independent sequences (samples).
@@ -904,10 +1082,20 @@ def gen_smooth_arx(
         c: Scalar source-to-target transfer coefficient.
         sigma2_eta: Source innovation variance $> 0$.
         sigma2_eps: Target innovation variance $> 0$.
-        delay: Source-to-target delay $D$ with $D \ge H$.
         M: Number of informative channels, $1 \le M \le \min(c_y, c_u)$.
+        delay: **Fixed mode** — a single source-to-target delay $D \ge 1$
+            shared by every sample and channel. Mutually exclusive with
+            ``delay_min`` / ``delay_max``.
+        delay_min: **Variable mode** — smallest delay in the per-sample range
+            $\{d_{\min},\dots,d_{\max}\}$; each sample draws one delay shared
+            across its $M$ channels. When $d < H$ the per-sample lag band is
+            $\{0,\dots,d-1\}$. Requires ``delay_max``; mutually exclusive with
+            ``delay``.
+        delay_max: Largest delay (inclusive) in the per-sample range.
         c_y, c_u: Target / source channel counts (defaults 87 / 101).
         horizon: Forecast horizon $H$.
+        K_history: History depth forwarded to :func:`te_block_arx_gaussian`
+            (``None`` -> ``D + 2H``).
         burn_in: Warm-up steps discarded for stationarity. Defaults to
             ``max(200, 5 / (1 - max(rho_u, rho_y)))``.
         easy_variant: If ``True`` set $M = c_y$ (all target channels
@@ -918,8 +1106,7 @@ def gen_smooth_arx(
 
     Returns:
         ``(Y, U, meta)`` per the v2 contract; ``meta.te_true`` is the
-        per-channel ARX block TE scaled by $M$ (or $0$ when
-        ``reverse_roles=True``).
+        $M$-scaled (mean) ARX block TE (or $0$ when ``reverse_roles=True``).
 
     Raises:
         ValueError: On any inconsistent input.
@@ -932,11 +1119,32 @@ def gen_smooth_arx(
         raise ValueError(
             f"gen_smooth_arx: horizon must be > 0, got {horizon}."
         )
-    if delay < horizon:
-        raise ValueError(
-            f"gen_smooth_arx: require delay >= horizon, got delay={delay}, "
-            f"horizon={horizon}."
-        )
+    # Resolve the delay mode: fixed scalar (``delay``) XOR variable per-sample
+    # (``delay_min`` / ``delay_max``).
+    if delay is None:
+        if delay_min is None or delay_max is None:
+            raise ValueError(
+                "gen_smooth_arx: provide either `delay` (fixed) or both "
+                "`delay_min` and `delay_max` (variable per-sample)."
+            )
+        if not (1 <= int(delay_min) <= int(delay_max)):
+            raise ValueError(
+                "gen_smooth_arx: require 1 <= delay_min <= delay_max, got "
+                f"delay_min={delay_min}, delay_max={delay_max}."
+            )
+        delay_lo, delay_hi = int(delay_min), int(delay_max)
+    else:
+        if delay_min is not None or delay_max is not None:
+            raise ValueError(
+                "gen_smooth_arx: `delay` is mutually exclusive with "
+                "`delay_min` / `delay_max`."
+            )
+        if int(delay) < 1:
+            raise ValueError(
+                f"gen_smooth_arx: delay must be >= 1, got {delay}."
+            )
+        delay_lo = delay_hi = int(delay)
+    variable_mode = delay is None
     if not 0.0 <= rho_u < 1.0:
         raise ValueError(
             f"gen_smooth_arx: rho_u must be in [0, 1), got {rho_u}."
@@ -964,10 +1172,22 @@ def gen_smooth_arx(
 
     gen = torch.Generator().manual_seed(int(seed))
     T_total = burn_in + T
-    if delay >= T_total:
+    if delay_hi >= T_total:
         raise ValueError(
-            f"gen_smooth_arx: delay={delay} must be < burn_in + T={T_total}."
+            f"gen_smooth_arx: max delay={delay_hi} must be < "
+            f"burn_in + T={T_total}."
         )
+
+    # Per-sample delay: one delay per sample, shared across its M channels.
+    if variable_mode:
+        rng_delay = np.random.default_rng(int(seed) + 99_991)
+        d_samples = rng_delay.integers(delay_lo, delay_hi + 1, size=n)
+    else:
+        d_samples = np.full(n, delay_lo, dtype=int)
+    delays_per_sample: List[int] = [int(x) for x in d_samples]
+    d_col = torch.as_tensor(d_samples, dtype=torch.long)        # (n,)
+    rows = torch.arange(n)
+
     eta = math.sqrt(sigma2_eta) * torch.randn(
         n, T_total, M, generator=gen, dtype=torch.float32
     )
@@ -981,11 +1201,15 @@ def gen_smooth_arx(
     Y[:, 0, :] = eps[:, 0, :]
     for t in range(1, T_total):
         U[:, t, :] = rho_u * U[:, t - 1, :] + eta[:, t, :]
-        if t >= delay:
-            drive = c * U[:, t - delay, :]
-            Y[:, t, :] = rho_y * Y[:, t - 1, :] + drive + eps[:, t, :]
-        else:
-            Y[:, t, :] = rho_y * Y[:, t - 1, :] + eps[:, t, :]
+        # Gather the per-sample lagged source U[i, t - d_i, :]; rows with
+        # t < d_i contribute no drive.
+        active = (t >= d_col)                                   # (n,) bool
+        idx = torch.clamp(t - d_col, min=0)                     # (n,)
+        gathered = U[rows, idx, :]                              # (n, M)
+        drive = torch.where(
+            active[:, None], c * gathered, torch.zeros_like(gathered)
+        )
+        Y[:, t, :] = rho_y * Y[:, t - 1, :] + drive + eps[:, t, :]
 
     U_inf = U[:, burn_in:, :].contiguous()
     Y_inf = Y[:, burn_in:, :].contiguous()
@@ -1009,20 +1233,28 @@ def gen_smooth_arx(
         base_seed=int(seed),
     )
 
+    # Analytic TE depends only on the informative-process spec, not on the
+    # distractor decomposition; safe to compute independent of decomp.
+    distinct_delays = sorted(set(delays_per_sample))
+    te_per_sample: Optional[List[float]] = None
+    te_by_delay: Optional[Dict[int, float]] = None
     if reverse_roles:
         te_true = 0.0
         true_lag_band: List[int] = []
         direction = "Y_to_X"
     else:
-        # Analytic TE depends only on the informative-process spec, not on
-        # the distractor decomposition; safe to compute independent of decomp.
-        te_per_channel = te_block_arx_gaussian(
-            rho_u=rho_u, rho_y=rho_y, c=c,
-            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
-            H=horizon, D=delay,
+        # Each sample's M channels are independent and share one delay, so its
+        # block TE is M * te_block_arx_gaussian(D=d), averaged over the drawn
+        # delays for the dataset ground truth.
+        te_true, te_per_sample, te_by_delay = _mean_te_over_samples(
+            delays_per_sample,
+            lambda d: M * te_block_arx_gaussian(
+                rho_u=rho_u, rho_y=rho_y, c=c,
+                sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                H=horizon, D=d, K_history=K_history,
+            ),
         )
-        te_true = M * te_per_channel
-        true_lag_band = list(range(delay - horizon, delay))
+        true_lag_band = _union_lag_band(distinct_delays, horizon)
         direction = "X_to_Y"
 
     if standardize:
@@ -1037,13 +1269,24 @@ def gen_smooth_arx(
         "te_per_step": float(te_true) / horizon,
         "true_lag_band": true_lag_band,
         "informative_channels": list(range(M)),
-        "clean_anchor_range": [delay - 1, T - horizon],
+        "clean_anchor_range": [delay_hi - 1, T - horizon],
         "rho_u": float(rho_u),
         "rho_y": float(rho_y),
         "c": float(c),
         "sigma2_eta": float(sigma2_eta),
         "sigma2_eps": float(sigma2_eps),
-        "delay": delay,
+        "delay": (delay_lo if not variable_mode else None),
+        "delay_min": (delay_lo if variable_mode else None),
+        "delay_max": (delay_hi if variable_mode else None),
+        "variable_delay": variable_mode,
+        "delays_per_sample": delays_per_sample,
+        "te_per_sample": te_per_sample,
+        "te_by_delay": (
+            {str(k): float(v) for k, v in te_by_delay.items()}
+            if te_by_delay is not None
+            else None
+        ),
+        "K_history": (None if K_history is None else int(K_history)),
         "M": M,
         "horizon": horizon,
         "sequence_length": T,

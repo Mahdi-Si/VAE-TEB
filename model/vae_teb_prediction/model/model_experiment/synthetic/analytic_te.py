@@ -658,7 +658,7 @@ def _simulate_state_space_gaussian(
     *,
     oscillators: Sequence[Tuple[float, float]],
     target_ar: float,
-    delays: Sequence[int],
+    delays: Union[Sequence[int], np.ndarray],
     B_y: Sequence[float],
     sigma2_y: float,
     sigma2_eta: Union[float, Sequence[float]],
@@ -695,7 +695,12 @@ def _simulate_state_space_gaussian(
         T: Sequence length (post-burn-in).
         oscillators: Length-$M$ list of $(r_m, \omega_m)$ pairs.
         target_ar: Scalar target self-coefficient $A_y \in [0, 1)$.
-        delays: Length-$M$ list of source-to-target delays $D_m$.
+        delays: Source-to-target delays $D_m$. Either a length-$M$ sequence
+            (one delay per channel, shared across all $n$ samples — the fast
+            path used by the analytic TE) **or** an $(n, M)$ integer array of
+            **per-sample, per-channel** delays (used by the variable-delay
+            generator, where each sample draws its own lag). Every entry must
+            be $\ge 1$.
         B_y: Length-$M$ list of target loadings $B_y^{(m)}$.
         sigma2_y: Target innovation variance $\sigma^2_y > 0$ (shared).
         sigma2_eta: Source innovation variance — scalar (broadcast) or
@@ -709,11 +714,36 @@ def _simulate_state_space_gaussian(
         the informative source channels) and the target stream ``Y``.
     """
     M = len(oscillators)
-    if not (len(delays) == M and len(B_y) == M):
+    if len(B_y) != M:
         raise ValueError(
-            "_simulate_state_space_gaussian: oscillators / delays / B_y "
-            f"must all have the same length; got {M}, {len(delays)}, "
-            f"{len(B_y)}."
+            "_simulate_state_space_gaussian: oscillators / B_y must have the "
+            f"same length; got {M}, {len(B_y)}."
+        )
+    # ``delays`` may be a length-M sequence (shared across samples) or an
+    # (n, M) array of per-sample, per-channel delays.
+    delays_in = np.asarray(delays, dtype=int)
+    if delays_in.ndim == 1:
+        if delays_in.shape[0] != M:
+            raise ValueError(
+                "_simulate_state_space_gaussian: 1-D delays must have length "
+                f"M={M}, got {delays_in.shape[0]}."
+            )
+        per_sample = False
+    elif delays_in.ndim == 2:
+        if delays_in.shape != (n, M):
+            raise ValueError(
+                "_simulate_state_space_gaussian: 2-D (per-sample) delays must "
+                f"have shape (n, M)=({n}, {M}), got {tuple(delays_in.shape)}."
+            )
+        per_sample = True
+    else:
+        raise ValueError(
+            "_simulate_state_space_gaussian: delays must be 1-D (M,) or "
+            f"2-D (n, M), got ndim={delays_in.ndim}."
+        )
+    if np.any(delays_in < 1):
+        raise ValueError(
+            "_simulate_state_space_gaussian: every delay must be >= 1."
         )
     sigma2_eta_arr = _broadcast_to_m(sigma2_eta, M, "sigma2_eta")
     if np.any(sigma2_eta_arr <= 0.0):
@@ -745,11 +775,12 @@ def _simulate_state_space_gaussian(
 
     rng = np.random.default_rng(seed)
     T_total = burn_in + T
-    D_max = int(delays_arr.max())
+    D_max = int(delays_in.max())
     if D_max >= T_total:
         raise ValueError(
             "_simulate_state_space_gaussian: max delay must be < burn_in + T."
         )
+    row = np.arange(n)
 
     # AR(2) coefficients per channel (one-time).
     ar1 = 2.0 * rs * np.cos(omegas)                   # (M,)
@@ -776,10 +807,21 @@ def _simulate_state_space_gaussian(
             Y[:, t, :] = eps[:, t, :]
         else:
             drive = np.zeros((n, M), dtype=float)
-            for m in range(M):
-                d_m = int(delays_arr[m])
-                if t >= d_m:
-                    drive[:, m] = B_y_arr[m] * S[:, t - d_m, m]
+            if not per_sample:
+                # Fast path: one delay per channel, shared across samples.
+                for m in range(M):
+                    d_m = int(delays_in[m])
+                    if t >= d_m:
+                        drive[:, m] = B_y_arr[m] * S[:, t - d_m, m]
+            else:
+                # Per-sample, per-channel delay: masked gather over samples.
+                for m in range(M):
+                    d_col = delays_in[:, m]                 # (n,)
+                    active = t >= d_col                     # (n,) bool
+                    if active.any():
+                        idx = np.clip(t - d_col, 0, None)   # (n,)
+                        src = S[row, idx, m]                # gather over samples
+                        drive[active, m] = B_y_arr[m] * src[active]
             Y[:, t, :] = target_ar * Y[:, t - 1, :] + drive + eps[:, t, :]
 
     return (
@@ -1168,6 +1210,380 @@ def c_for_te_block_arx(
         label="c_for_te_block_arx",
     )
 
+    return {
+        "c_scalar": float(c_star),
+        "te_block": float(te_block),
+        "te_per_step": float(te_block) / float(H),
+        "n_iter": int(n_iter),
+    }
+
+
+def _validate_delay_range(delay_min: int, delay_max: int, label: str) -> None:
+    r"""Validate an inclusive integer delay range $\{d_{\min},\dots,d_{\max}\}$.
+
+    Args:
+        delay_min: Smallest delay in the range, $\ge 1$.
+        delay_max: Largest delay in the range, $\ge d_{\min}$.
+        label: Caller name, used only in the error message.
+
+    Raises:
+        ValueError: If ``delay_min < 1`` or ``delay_max < delay_min``.
+    """
+    if delay_min < 1:
+        raise ValueError(f"{label}: delay_min must be >= 1, got {delay_min}.")
+    if delay_max < delay_min:
+        raise ValueError(
+            f"{label}: delay_max must be >= delay_min, got "
+            f"delay_min={delay_min}, delay_max={delay_max}."
+        )
+
+
+def mean_te_block_state_space_over_delays(
+    *,
+    delay_min: int,
+    delay_max: int,
+    oscillators: Sequence[Tuple[float, float]],
+    target_ar: float,
+    B_y: Union[float, Sequence[float]],
+    sigma2_y: float,
+    sigma2_eta: Union[float, Sequence[float]],
+    H: int,
+    K_history: Optional[int] = None,
+    n_samples: int = 50_000,
+    burn_in: int = 500,
+    seed: int = 0,
+) -> float:
+    r"""Mean block TE of the G1 oscillator state-space over a delay range.
+
+    For the variable-delay G1 generator each sample draws a single delay
+    $d \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$ shared across its $M$
+    informative channels. Because every channel of a sample uses the same
+    delay, the exact block TE of that sample is
+    :func:`te_block_state_space_gaussian` evaluated at ``delays = [d]*M``. The
+    dataset-level ground-truth TE is the expectation over the (uniform) delay
+    distribution,
+
+    $$
+    \overline{\mathrm{TE}}
+        = \frac{1}{d_{\max}-d_{\min}+1}
+          \sum_{d=d_{\min}}^{d_{\max}}
+          \widehat{\mathrm{TE}}^{(H)}_{U\to Y}\!\bigl(\text{delays}=[d]\!*\!M\bigr),
+    $$
+
+    which this helper computes (the build reports the *realised* sample mean,
+    which converges to this as $n\to\infty$).
+
+    Args:
+        delay_min: Smallest delay in the range, $\ge 1$.
+        delay_max: Largest delay in the range (inclusive), $\ge d_{\min}$.
+        oscillators: Length-$M$ list of $(r_m, \omega_m)$ oscillator specs.
+        target_ar: Target self-coefficient $A_y \in [0, 1)$.
+        B_y: Uniform target loading magnitude (scalar) or length-$M$ list.
+        sigma2_y: Target innovation variance $\sigma^2_y > 0$.
+        sigma2_eta: Source innovation variance (scalar or length-$M$).
+        H: Forecast horizon, $H \ge 1$.
+        K_history: History depth forwarded to
+            :func:`te_block_state_space_gaussian`. With a near-unit-root source
+            this should be set generously (e.g. 120-200) so the conditioning
+            captures the long source memory; defaults to ``max(delays)+2H``.
+        n_samples: Monte-Carlo sample size per delay.
+        burn_in: Warm-up steps discarded per simulation.
+        seed: Base seed; delay $d$ uses ``seed + d`` so each MC estimate is
+            distinct but held fixed across coupling-bisection iterations.
+
+    Returns:
+        The mean block transfer entropy over the delay range, in nats.
+    """
+    if H <= 0:
+        raise ValueError(
+            f"mean_te_block_state_space_over_delays: H must be > 0, got {H}."
+        )
+    _validate_delay_range(
+        delay_min, delay_max, "mean_te_block_state_space_over_delays"
+    )
+    M = len(oscillators)
+    if M == 0:
+        raise ValueError(
+            "mean_te_block_state_space_over_delays: at least one oscillator "
+            "is required."
+        )
+    B_y_arr = _broadcast_to_m(B_y, M, "B_y")
+    total = 0.0
+    n_delays = delay_max - delay_min + 1
+    for d in range(delay_min, delay_max + 1):
+        total += te_block_state_space_gaussian(
+            oscillators=oscillators,
+            target_ar=target_ar,
+            delays=[int(d)] * M,
+            B_y=B_y_arr.tolist(),
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            H=H,
+            K_history=K_history,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            seed=int(seed) + int(d),
+        )
+    return float(total / n_delays)
+
+
+def B_y_for_mean_te_block_state_space(
+    target_te_block: float,
+    *,
+    delay_min: int,
+    delay_max: int,
+    oscillators: Sequence[Tuple[float, float]],
+    target_ar: float,
+    sigma2_y: float,
+    sigma2_eta: Union[float, Sequence[float]],
+    H: int,
+    K_history: Optional[int] = None,
+    n_samples: int = 50_000,
+    burn_in: int = 500,
+    seed: int = 0,
+    lo: float = 1e-4,
+    hi: float = 10.0,
+    tol: float = 1e-3,
+    max_iter: int = 40,
+) -> Dict[str, Any]:
+    r"""Invert the mean-over-delays G1 block TE for a uniform $B_y$ magnitude.
+
+    Bisects the uniform target-loading magnitude $b$ so that
+    :func:`mean_te_block_state_space_over_delays` (with ``B_y = b``) equals
+    ``target_te_block``. The mean of monotone-increasing MC TE estimators is
+    itself monotone increasing in $|b|$, so bisection converges; seeds are
+    held fixed across iterations.
+
+    Args:
+        target_te_block: Target mean block TE in nats, $\ge 0$. ``0`` returns
+            immediately with $B_y = 0$.
+        delay_min, delay_max, oscillators, target_ar, sigma2_y, sigma2_eta,
+        H, K_history, n_samples, burn_in, seed: Forwarded to
+            :func:`mean_te_block_state_space_over_delays`.
+        lo, hi: Initial bisection bracket on the uniform $B_y$ magnitude.
+        tol, max_iter: Stop conditions, as in :func:`_bisect_for_te_target`.
+
+    Returns:
+        A dict with ``B_y`` (length-$M$ list of identical floats), ``B_y_scalar``,
+        ``te_block`` (achieved mean block TE), ``te_per_step`` (= ``te_block/H``)
+        and ``n_iter``.
+
+    Raises:
+        ValueError: On invalid arguments or if the bracket misses the target.
+    """
+    if H <= 0:
+        raise ValueError(
+            f"B_y_for_mean_te_block_state_space: H must be > 0, got {H}."
+        )
+    if target_te_block < 0.0:
+        raise ValueError(
+            "B_y_for_mean_te_block_state_space: target_te_block must be >= 0, "
+            f"got {target_te_block}."
+        )
+    if lo <= 0.0:
+        raise ValueError(
+            f"B_y_for_mean_te_block_state_space: lo must be > 0, got {lo}."
+        )
+    if hi <= lo:
+        raise ValueError(
+            f"B_y_for_mean_te_block_state_space: hi must be > lo, "
+            f"got lo={lo}, hi={hi}."
+        )
+    if max_iter <= 0:
+        raise ValueError(
+            f"B_y_for_mean_te_block_state_space: max_iter must be > 0, "
+            f"got {max_iter}."
+        )
+    _validate_delay_range(
+        delay_min, delay_max, "B_y_for_mean_te_block_state_space"
+    )
+    M = len(oscillators)
+    if M == 0:
+        raise ValueError(
+            "B_y_for_mean_te_block_state_space: at least one oscillator is "
+            "required."
+        )
+
+    if target_te_block == 0.0:
+        return {
+            "B_y": [0.0] * M,
+            "B_y_scalar": 0.0,
+            "te_block": 0.0,
+            "te_per_step": 0.0,
+            "n_iter": 0,
+        }
+
+    def _eval(b: float) -> float:
+        return mean_te_block_state_space_over_delays(
+            delay_min=delay_min,
+            delay_max=delay_max,
+            oscillators=oscillators,
+            target_ar=target_ar,
+            B_y=b,
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            H=H,
+            K_history=K_history,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            seed=seed,
+        )
+
+    b_star, te_block, n_iter = _bisect_for_te_target(
+        _eval, target_te_block, lo=lo, hi=hi, tol=tol, max_iter=max_iter,
+        label="B_y_for_mean_te_block_state_space",
+    )
+    return {
+        "B_y": [float(b_star)] * M,
+        "B_y_scalar": float(b_star),
+        "te_block": float(te_block),
+        "te_per_step": float(te_block) / float(H),
+        "n_iter": int(n_iter),
+    }
+
+
+def mean_te_block_arx_over_delays(
+    *,
+    delay_min: int,
+    delay_max: int,
+    rho_u: float,
+    rho_y: float,
+    c: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    H: int,
+    M: int = 1,
+    K_history: Optional[int] = None,
+) -> float:
+    r"""Mean block TE of the G2 ARX process over a delay range.
+
+    For the variable-delay G2 generator each sample draws one delay
+    $d \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$ shared across its $M$
+    channels. The per-channel block TE is the closed-form
+    :func:`te_block_arx_gaussian`; the $M$ channels are independent so the
+    sample TE is $M$ times the per-channel value, and the dataset mean is the
+    uniform delay average
+
+    $$
+    \overline{\mathrm{TE}}
+        = \frac{M}{d_{\max}-d_{\min}+1}
+          \sum_{d=d_{\min}}^{d_{\max}}
+          \mathrm{TE}^{(H)}_{U\to Y}\!\bigl(D=d\bigr).
+    $$
+
+    Args:
+        delay_min: Smallest delay, $\ge 1$.
+        delay_max: Largest delay (inclusive), $\ge d_{\min}$.
+        rho_u, rho_y, c, sigma2_eta, sigma2_eps, H, K_history: Forwarded to
+            :func:`te_block_arx_gaussian`.
+        M: Number of independent informative channels (the per-channel TE is
+            scaled by $M$, matching the generator's ``te_true``).
+
+    Returns:
+        The mean block transfer entropy over the delay range, in nats.
+    """
+    if H <= 0:
+        raise ValueError(
+            f"mean_te_block_arx_over_delays: H must be > 0, got {H}."
+        )
+    if M < 1:
+        raise ValueError(
+            f"mean_te_block_arx_over_delays: M must be >= 1, got {M}."
+        )
+    _validate_delay_range(delay_min, delay_max, "mean_te_block_arx_over_delays")
+    total = 0.0
+    n_delays = delay_max - delay_min + 1
+    for d in range(delay_min, delay_max + 1):
+        total += te_block_arx_gaussian(
+            rho_u=rho_u, rho_y=rho_y, c=c,
+            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+            H=H, D=int(d), K_history=K_history,
+        )
+    return float(M * total / n_delays)
+
+
+def c_for_mean_te_block_arx(
+    target_te_block: float,
+    *,
+    delay_min: int,
+    delay_max: int,
+    rho_u: float,
+    rho_y: float,
+    sigma2_eta: float,
+    sigma2_eps: float,
+    H: int,
+    M: int = 1,
+    K_history: Optional[int] = None,
+    lo: float = 1.0e-4,
+    hi: float = 5.0,
+    tol: float = 1.0e-3,
+    max_iter: int = 40,
+) -> Dict[str, float]:
+    r"""Invert the mean-over-delays G2 block TE for the ARX coupling $c$.
+
+    Bisects the coupling magnitude $c$ so that
+    :func:`mean_te_block_arx_over_delays` equals ``target_te_block`` (the
+    $M$-scaled dataset TE). The closed-form per-delay TE is monotone in $|c|$,
+    so the mean is too and bisection converges with no Monte-Carlo noise.
+
+    Args:
+        target_te_block: Target $M$-scaled mean block TE in nats, $\ge 0$.
+            ``0`` returns immediately with $c = 0$.
+        delay_min, delay_max, rho_u, rho_y, sigma2_eta, sigma2_eps, H, M,
+        K_history: Forwarded to :func:`mean_te_block_arx_over_delays`.
+        lo, hi: Initial bisection bracket on $c$.
+        tol, max_iter: Stop conditions, as in :func:`_bisect_for_te_target`.
+
+    Returns:
+        A dict with ``c_scalar`` (bisected coupling), ``te_block`` (achieved
+        $M$-scaled mean block TE), ``te_per_step`` (= ``te_block/H``) and
+        ``n_iter``.
+
+    Raises:
+        ValueError: On invalid arguments or if the bracket misses the target.
+    """
+    if H <= 0:
+        raise ValueError(f"c_for_mean_te_block_arx: H must be > 0, got {H}.")
+    if M < 1:
+        raise ValueError(f"c_for_mean_te_block_arx: M must be >= 1, got {M}.")
+    if target_te_block < 0.0:
+        raise ValueError(
+            "c_for_mean_te_block_arx: target_te_block must be >= 0, "
+            f"got {target_te_block}."
+        )
+    if lo <= 0.0:
+        raise ValueError(f"c_for_mean_te_block_arx: lo must be > 0, got {lo}.")
+    if hi <= lo:
+        raise ValueError(
+            f"c_for_mean_te_block_arx: hi must be > lo, got lo={lo}, hi={hi}."
+        )
+    if max_iter <= 0:
+        raise ValueError(
+            f"c_for_mean_te_block_arx: max_iter must be > 0, got {max_iter}."
+        )
+    _validate_delay_range(delay_min, delay_max, "c_for_mean_te_block_arx")
+
+    if target_te_block == 0.0:
+        return {
+            "c_scalar": 0.0,
+            "te_block": 0.0,
+            "te_per_step": 0.0,
+            "n_iter": 0,
+        }
+
+    def _eval(c: float) -> float:
+        return mean_te_block_arx_over_delays(
+            delay_min=delay_min,
+            delay_max=delay_max,
+            rho_u=rho_u, rho_y=rho_y, c=c,
+            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+            H=H, M=M, K_history=K_history,
+        )
+
+    c_star, te_block, n_iter = _bisect_for_te_target(
+        _eval, target_te_block, lo=lo, hi=hi, tol=tol, max_iter=max_iter,
+        label="c_for_mean_te_block_arx",
+    )
     return {
         "c_scalar": float(c_star),
         "te_block": float(te_block),
