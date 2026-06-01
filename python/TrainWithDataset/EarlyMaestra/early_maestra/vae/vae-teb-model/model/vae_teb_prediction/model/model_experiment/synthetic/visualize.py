@@ -91,7 +91,9 @@ def _primary_delay(meta: Dict[str, Any]) -> int:
 
     Each v2 benchmark exposes its delay under a different key: G1 / G1-rev
     carry a per-channel ``delays`` list (we return the first), G2 carries the
-    scalar ``delay``, and G3 carries the source reveal-lead ``delta``.
+    scalar ``delay``, and G3 carries the source reveal-lead ``delta``. Under
+    the variable per-sample-delay regime ``delay`` / ``delays`` may be absent
+    or ``None`` and ``delay_max`` is used as the representative value.
 
     Args:
         meta: The dataset metadata dict.
@@ -102,10 +104,17 @@ def _primary_delay(meta: Dict[str, Any]) -> int:
     benchmark = str(meta.get("benchmark", ""))
     if benchmark in ("G1", "G1-rev"):
         delays = meta.get("delays") or []
-        return int(delays[0]) if delays else 0
+        if delays:
+            return int(delays[0])
+        dmax = meta.get("delay_max")
+        return int(dmax) if dmax is not None else 0
     if benchmark == "G3":
         return int(meta.get("delta", 0))
-    return int(meta.get("delay", 0))
+    # G2 family: fixed scalar ``delay`` or variable ``delay_max``.
+    d = meta.get("delay")
+    if d is None:
+        d = meta.get("delay_max")
+    return int(d) if d is not None else 0
 
 
 def _lagged_corr_per_channel(
@@ -362,7 +371,10 @@ def _panels_arx(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
         meta: The dataset metadata dict.
     """
     T = Y.shape[1]
-    delay = int(meta["delay"])
+    # Variable per-sample delay: ``meta["delay"]`` is None, so use the
+    # representative ``delay_max`` for the alignment panels.
+    delay = _primary_delay(meta)
+    variable = bool(meta.get("variable_delay", False))
     M = int(meta["M"])
     c_y = int(meta["c_y"])
     c = float(meta["c"])
@@ -402,8 +414,12 @@ def _panels_arx(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     if reverse:
         extra = [f"  direction        : {meta.get('direction')}",
                  f"  reverse_roles    : True"]
+    delay_line = (
+        f"  delay range      : {meta.get('delay_min')}..{meta.get('delay_max')}"
+        if variable else f"  delay D          : {delay}"
+    )
     _panel_text(axes[2, 1], meta, [
-        f"  delay D          : {delay}",
+        delay_line,
         f"  ARX coupling c   : {c}",
         f"  rho_u            : {meta.get('rho_u')}",
         f"  rho_y            : {meta.get('rho_y')}",

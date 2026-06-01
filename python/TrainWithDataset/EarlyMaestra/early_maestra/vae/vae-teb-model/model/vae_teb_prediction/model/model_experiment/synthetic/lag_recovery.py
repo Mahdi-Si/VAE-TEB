@@ -907,6 +907,33 @@ _LARGE_D_NOTE = (
 )
 
 
+def _resolve_repr_delay(meta: Dict[str, Any]) -> int:
+    r"""Resolve a representative scalar delay $D$ from a cache ``meta``.
+
+    Handles every v2 layout: a fixed scalar ``delay`` (G2 fixed mode), a
+    variable per-sample range (``delay = None`` + ``delay_max``), a multi-band
+    ``delays`` list (returns the largest), the G3 reveal-lead ``delta``, and
+    the legacy two-lag ``delay2``. Defaults to 0 when none is present.
+
+    Args:
+        meta: The dataset metadata dict.
+
+    Returns:
+        The representative delay (the upper end for variable / multi-band).
+    """
+    d = meta.get("delay")
+    if d is None:
+        delays = meta.get("delays") or []
+        d = meta.get("delay_max")
+        if d is None:
+            d = meta.get("delta")
+        if d is None:
+            d = meta.get("delay2")
+        if d is None:
+            d = delays[-1] if delays else 0
+    return int(d) if d is not None else 0
+
+
 def _delay_window_report(
     meta: Dict[str, Any], max_lag: int, k_bar: float
 ) -> Dict[str, Any]:
@@ -922,8 +949,7 @@ def _delay_window_report(
         ``lag_band_in_window``, ``lag_band_overflow_count``, ``k_bar`` and the
         Section 4.2 ``large_d_note``.
     """
-    # The two-lag benchmark E has no single ``delay``; report the larger.
-    D = int(meta.get("delay", meta.get("delay2", meta.get("delay1", 0))))
+    D = _resolve_repr_delay(meta)
     L = int(max_lag) + 1
     band = np.asarray(list(meta["true_lag_band"]), dtype=int)
     overflow = int(np.sum(band > max_lag))
@@ -1482,11 +1508,7 @@ def analyze_lag_recovery(
         "c": _meta_scalar("c"),
         "p_switch": _meta_scalar("p_switch"),
         "M": data_meta.get("M", test_meta.get("M")),
-        "delay": int(
-            test_meta.get("delay", test_meta.get("delta", test_meta.get(
-                "delay2", (test_meta.get("delays") or [0])[-1]
-            )))
-        ),
+        "delay": _resolve_repr_delay(test_meta),
         "horizon": int(test_meta["horizon"]),
         "te_true": te_true,
         "warmup": warmup,

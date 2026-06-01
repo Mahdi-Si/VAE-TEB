@@ -12,12 +12,18 @@ Test plan follows ``model_validation_v2_plan.md`` Sprint 1.6.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
+    B_y_for_mean_te_block_state_space,
     B_y_for_te_block_state_space,
+    _simulate_state_space_gaussian,
     _te_block_arx_gaussian_mc,
+    c_for_mean_te_block_arx,
     c_for_te_block_arx,
+    mean_te_block_arx_over_delays,
+    mean_te_block_state_space_over_delays,
     te_block_arx_gaussian,
     te_block_gaussian,
     te_block_state_space_gaussian,
@@ -446,3 +452,85 @@ def test_c_inverter_rejects_bad_args() -> None:
         c_for_te_block_arx(
             target_te_block=1.0, max_iter=0, **base_kwargs,
         )
+
+
+# ---------------------------------------------------------------------------
+# (g) variable per-sample delays + mean-over-delays TE (real-data small-lag)
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_per_sample_delays_match_scalar_path() -> None:
+    """An (n, M) delay array of a constant ``d`` reproduces the scalar path
+    bit-for-bit, so the variable-delay gather introduces no drift in TE."""
+    osc = [(0.99, 0.05), (0.98, 0.07)]
+    common = dict(
+        oscillators=osc, target_ar=0.95, B_y=[0.3, 0.5],
+        sigma2_y=1.0, sigma2_eta=0.01, burn_in=80, seed=11,
+    )
+    S1, Y1 = _simulate_state_space_gaussian(n=12, T=60, delays=[7, 7], **common)
+    d2 = np.full((12, 2), 7, dtype=int)
+    S2, Y2 = _simulate_state_space_gaussian(n=12, T=60, delays=d2, **common)
+    assert np.array_equal(S1, S2)
+    assert np.array_equal(Y1, Y2)
+
+
+def test_mean_te_single_delay_equals_block_te() -> None:
+    """A degenerate range (delay_min == delay_max) reduces to the single-delay
+    block TE."""
+    osc = [(0.99, 0.05)]
+    single = te_block_state_space_gaussian(
+        oscillators=osc, target_ar=0.95, delays=[8], B_y=[0.5],
+        sigma2_y=1.0, sigma2_eta=0.01, H=30, K_history=120,
+        n_samples=4000, seed=3 + 8,
+    )
+    mean = mean_te_block_state_space_over_delays(
+        delay_min=8, delay_max=8, oscillators=osc, target_ar=0.95,
+        B_y=0.5, sigma2_y=1.0, sigma2_eta=0.01, H=30, K_history=120,
+        n_samples=4000, seed=3,
+    )
+    assert mean == pytest.approx(single, rel=1e-9)
+
+
+def test_mean_te_arx_monotone_in_coupling() -> None:
+    """The mean-over-delays ARX TE is monotone increasing in ``c``."""
+    kw = dict(
+        delay_min=1, delay_max=15, rho_u=0.99, rho_y=0.95,
+        sigma2_eta=1.0, sigma2_eps=1.0, H=30, M=4,
+    )
+    vals = [mean_te_block_arx_over_delays(c=c, **kw) for c in (0.0, 0.02, 0.05, 0.1)]
+    assert vals[0] == pytest.approx(0.0, abs=1e-9)
+    assert all(b > a for a, b in zip(vals, vals[1:]))
+
+
+@pytest.mark.parametrize("target", [0.1, 1.0, 3.0])
+def test_c_for_mean_te_block_arx_roundtrip(target: float) -> None:
+    """The closed-form ARX mean inverter lands on a real-data-band target."""
+    sol = c_for_mean_te_block_arx(
+        target_te_block=target, delay_min=1, delay_max=15,
+        rho_u=0.99, rho_y=0.95, sigma2_eta=1.0, sigma2_eps=1.0,
+        H=30, M=4,
+    )
+    assert sol["te_block"] == pytest.approx(target, rel=5e-3)
+    assert sol["c_scalar"] > 0.0
+
+
+def test_B_y_for_mean_te_block_state_space_roundtrip() -> None:
+    """The MC state-space mean inverter lands on a real-data-band target."""
+    sol = B_y_for_mean_te_block_state_space(
+        target_te_block=1.0, delay_min=1, delay_max=15,
+        oscillators=[(0.99, 0.05)] * 4, target_ar=0.95,
+        sigma2_y=1.0, sigma2_eta=0.01, H=30, K_history=160,
+        n_samples=4000, lo=1e-4, hi=10.0, tol=1e-2,
+    )
+    assert sol["te_block"] == pytest.approx(1.0, rel=5e-2)
+    assert sol["B_y_scalar"] > 0.0
+
+
+def test_mean_te_zero_coupling_is_zero() -> None:
+    """B_y = 0 ⇒ mean block TE is ~0 (null control)."""
+    te = mean_te_block_state_space_over_delays(
+        delay_min=1, delay_max=10, oscillators=[(0.99, 0.05)], target_ar=0.95,
+        B_y=0.0, sigma2_y=1.0, sigma2_eta=0.01, H=30, K_history=120,
+        n_samples=3000,
+    )
+    assert te == pytest.approx(0.0, abs=2e-2)

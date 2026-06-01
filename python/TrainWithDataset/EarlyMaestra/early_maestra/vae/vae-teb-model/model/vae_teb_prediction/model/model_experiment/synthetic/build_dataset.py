@@ -260,13 +260,11 @@ def _build_gen_kwargs(
         oscillators = _tile(
             [tuple(pair) for pair in data["oscillators"]], "oscillators",
         )
-        delays = _tile([int(d) for d in data["delays"]], "delays")
         B_y = _tile([float(b) for b in data["B_y"]], "B_y")
-        return {
+        kwargs: Dict[str, Any] = {
             "T": T,
             "oscillators": oscillators,
             "target_ar": float(data["target_ar"]),
-            "delays": delays,
             "B_y": B_y,
             "sigma2_y": float(data["sigma2_y"]),
             "sigma2_eta": data["sigma2_eta"],   # scalar or sequence; generator handles both
@@ -274,28 +272,39 @@ def _build_gen_kwargs(
             "c_y": c_y,
             "c_u": c_u,
             "horizon": horizon,
+            "K_history": (None if data.get("K_history") is None
+                          else int(data["K_history"])),
             "easy_variant": bool(data.get("easy_variant", False)),
             "standardize": bool(data.get("standardize", True)),
             "reverse_roles": bool(data.get("reverse_roles", False)),
             "te_n_samples": int(data.get("te_n_samples", 50_000)),
             "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
+        # Delay mode: variable per-sample (`delay_min`/`delay_max`) XOR fixed
+        # per-channel (`delays`, used by the multi-band variant).
+        if data.get("delay_min") is not None or data.get("delay_max") is not None:
+            kwargs["delay_min"] = int(data["delay_min"])
+            kwargs["delay_max"] = int(data["delay_max"])
+        else:
+            kwargs["delays"] = _tile([int(d) for d in data["delays"]], "delays")
+        return kwargs
     if benchmark in ("G2", "G2_wrong_delay", "G2_zero_coupling"):
-        # G2_wrong_delay overrides `delay` to D >> max_lag + horizon;
-        # G2_zero_coupling overrides `c` to 0. Both share G2's kwarg surface
-        # -- only the YAML values differ.
-        return {
+        # G2_zero_coupling overrides `c` to 0; G2_wrong_delay overrides the
+        # delay range to lags >> max_lag + horizon. All share G2's kwarg
+        # surface -- only the YAML values differ.
+        kwargs = {
             "T": T,
             "rho_u": float(data["rho_u"]),
             "rho_y": float(data["rho_y"]),
             "c": float(data["c"]),
             "sigma2_eta": float(data["sigma2_eta"]),
             "sigma2_eps": float(data["sigma2_eps"]),
-            "delay": int(data["delay"]),
             "M": int(data["M"]),
             "c_y": c_y,
             "c_u": c_u,
             "horizon": horizon,
+            "K_history": (None if data.get("K_history") is None
+                          else int(data["K_history"])),
             "burn_in": (None if data.get("burn_in") is None
                         else int(data["burn_in"])),
             "easy_variant": bool(data.get("easy_variant", False)),
@@ -303,6 +312,14 @@ def _build_gen_kwargs(
             "reverse_roles": bool(data.get("reverse_roles", False)),
             "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
+        # Variable per-sample delay (`delay_min`/`delay_max`) XOR fixed scalar
+        # (`delay`).
+        if data.get("delay_min") is not None or data.get("delay_max") is not None:
+            kwargs["delay_min"] = int(data["delay_min"])
+            kwargs["delay_max"] = int(data["delay_max"])
+        else:
+            kwargs["delay"] = int(data["delay"])
+        return kwargs
     if benchmark == "G3":
         return {
             "T": T,

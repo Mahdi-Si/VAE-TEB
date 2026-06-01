@@ -225,10 +225,20 @@ def build_g1_calibration_caches(
         return seq
 
     oscillators = [tuple(pair) for pair in _tile(data["oscillators"], "oscillators")]
-    delays = [int(d) for d in _tile(data["delays"], "delays")]
     sigma2_y = float(data["sigma2_y"])
     sigma2_eta = data["sigma2_eta"]
     target_ar = float(data["target_ar"])
+    # Variable per-sample delay (delay_min/delay_max) -> invert the
+    # mean-over-delays block TE; fixed delays (delays) -> the single-delay
+    # inverter. K_history (if set) is forwarded so the inverter's MC matches
+    # the cache build.
+    variable_mode = (
+        data.get("delay_min") is not None or data.get("delay_max") is not None
+    )
+    if data.get("K_history") is not None and "K_history" not in inv_kwargs:
+        inv_kwargs["K_history"] = int(data["K_history"])
+    if not variable_mode:
+        delays = [int(d) for d in _tile(data["delays"], "delays")]
 
     results: List[Dict[str, Any]] = []
     for tau in te_per_step_targets:
@@ -239,16 +249,29 @@ def build_g1_calibration_caches(
             f"[caches] target per-step TE={tau:.3f}  "
             f"-> target block={target_block:.3f} nats  tag='{tag}'"
         )
-        sol = ate.B_y_for_te_block_state_space(
-            target_te_block=target_block,
-            oscillators=oscillators,
-            target_ar=target_ar,
-            delays=delays,
-            sigma2_y=sigma2_y,
-            sigma2_eta=sigma2_eta,
-            H=horizon,
-            **inv_kwargs,
-        )
+        if variable_mode:
+            sol = ate.B_y_for_mean_te_block_state_space(
+                target_te_block=target_block,
+                delay_min=int(data["delay_min"]),
+                delay_max=int(data["delay_max"]),
+                oscillators=oscillators,
+                target_ar=target_ar,
+                sigma2_y=sigma2_y,
+                sigma2_eta=sigma2_eta,
+                H=horizon,
+                **inv_kwargs,
+            )
+        else:
+            sol = ate.B_y_for_te_block_state_space(
+                target_te_block=target_block,
+                oscillators=oscillators,
+                target_ar=target_ar,
+                delays=delays,
+                sigma2_y=sigma2_y,
+                sigma2_eta=sigma2_eta,
+                H=horizon,
+                **inv_kwargs,
+            )
         print(
             f"          inverter solved B_y={sol['B_y_scalar']:.4f}  "
             f"(achieved block TE={sol['te_block']:.3f} nats, "
@@ -331,12 +354,24 @@ def build_g2_calibration_caches(
     data = config["data"]
     horizon = int(config["model"]["horizon"])
     inv_kwargs: Dict[str, Any] = dict(inverter_kwargs or {})
+    # The ARX inverter is closed-form; drop the MC-only knob if the shared
+    # `inverter` config block carries it.
+    inv_kwargs.pop("n_samples", None)
 
     rho_u = float(data["rho_u"])
     rho_y = float(data["rho_y"])
     sigma2_eta = float(data["sigma2_eta"])
     sigma2_eps = float(data["sigma2_eps"])
-    delay = int(data["delay"])
+    # Variable per-sample delay -> per-channel mean-over-delays inverter
+    # (M=1 keeps the per-channel target convention); fixed delay -> the
+    # single-delay closed-form inverter.
+    variable_mode = (
+        data.get("delay_min") is not None or data.get("delay_max") is not None
+    )
+    if data.get("K_history") is not None and "K_history" not in inv_kwargs:
+        inv_kwargs["K_history"] = int(data["K_history"])
+    if not variable_mode:
+        delay = int(data["delay"])
 
     results: List[Dict[str, Any]] = []
     for tau in te_per_step_targets:
@@ -348,13 +383,24 @@ def build_g2_calibration_caches(
             f"-> target per-channel block={target_block:.3f} nats  "
             f"tag='{tag}'"
         )
-        sol = ate.c_for_te_block_arx(
-            target_te_block=target_block,
-            rho_u=rho_u, rho_y=rho_y,
-            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
-            H=horizon, D=delay,
-            **inv_kwargs,
-        )
+        if variable_mode:
+            sol = ate.c_for_mean_te_block_arx(
+                target_te_block=target_block,
+                delay_min=int(data["delay_min"]),
+                delay_max=int(data["delay_max"]),
+                rho_u=rho_u, rho_y=rho_y,
+                sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                H=horizon, M=1,
+                **inv_kwargs,
+            )
+        else:
+            sol = ate.c_for_te_block_arx(
+                target_te_block=target_block,
+                rho_u=rho_u, rho_y=rho_y,
+                sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+                H=horizon, D=delay,
+                **inv_kwargs,
+            )
         print(
             f"          inverter solved c={sol['c_scalar']:.4f}  "
             f"(achieved per-channel block TE={sol['te_block']:.3f} nats, "

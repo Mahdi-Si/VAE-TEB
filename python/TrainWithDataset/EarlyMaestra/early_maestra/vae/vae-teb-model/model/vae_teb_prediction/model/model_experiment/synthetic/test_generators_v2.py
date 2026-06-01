@@ -321,6 +321,94 @@ def test_g1_easy_variant() -> None:
 
 
 # ---------------------------------------------------------------------------
+# G1 / G2 variable per-sample delay (real-data small-lag regime)
+# ---------------------------------------------------------------------------
+
+
+_G1_VAR_DEFAULTS = dict(
+    oscillators=[(0.99, 0.05)] * 4,
+    target_ar=0.95,
+    B_y=[0.02] * 4,
+    sigma2_y=1.0,
+    sigma2_eta=0.01,
+    M=4,
+    delay_min=1,
+    delay_max=15,
+    K_history=160,
+    te_n_samples=4_000,
+)
+
+
+def test_g1_variable_delay_range_and_band() -> None:
+    r"""Variable G1: per-sample delays land in $\{1..15\}$ and the union band
+    is $\{0,\dots,d_{\max}-1\}$."""
+    _, _, meta = gen_state_space_oscillator(n=128, T=200, seed=0, **_G1_VAR_DEFAULTS)
+    dps = meta["delays_per_sample"]
+    assert meta["variable_delay"] is True
+    assert len(dps) == 128
+    assert min(dps) >= 1 and max(dps) <= 15
+    assert meta["delay_min"] == 1 and meta["delay_max"] == 15
+    assert meta["true_lag_band"] == list(range(0, max(dps)))
+
+
+def test_g1_variable_delay_te_is_sample_mean() -> None:
+    """Variable G1: ``te_true`` equals the mean of the per-sample exact TE."""
+    _, _, meta = gen_state_space_oscillator(n=96, T=200, seed=1, **_G1_VAR_DEFAULTS)
+    tps = np.asarray(meta["te_per_sample"], dtype=float)
+    assert len(tps) == 96
+    assert meta["te_true"] == pytest.approx(float(tps.mean()), rel=1e-12)
+    # te_by_delay keys cover every distinct drawn delay.
+    distinct = {str(d) for d in set(meta["delays_per_sample"])}
+    assert set(meta["te_by_delay"].keys()) == distinct
+    # Real-data band check: this coupling sits inside [0.1, 3] nats.
+    assert 0.1 <= meta["te_true"] <= 3.0
+
+
+def test_g1_variable_delay_determinism() -> None:
+    """Variable G1: same seed ⇒ identical draws and data."""
+    Y1, U1, m1 = gen_state_space_oscillator(n=16, T=160, seed=5, **_G1_VAR_DEFAULTS)
+    Y2, U2, m2 = gen_state_space_oscillator(n=16, T=160, seed=5, **_G1_VAR_DEFAULTS)
+    assert m1["delays_per_sample"] == m2["delays_per_sample"]
+    assert torch.equal(Y1, Y2) and torch.equal(U1, U2)
+
+
+def test_g1_variable_vs_fixed_mutual_exclusion() -> None:
+    """Supplying both ``delays`` and ``delay_min`` is rejected."""
+    bad = dict(_G1_VAR_DEFAULTS)
+    bad["delays"] = [5] * 4
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        gen_state_space_oscillator(n=4, T=120, seed=0, **bad)
+
+
+def test_g2_variable_delay_range_and_band() -> None:
+    r"""Variable G2: per-sample delays in $\{1..15\}$, band $\{0,\dots,d_{\max}-1\}$,
+    ``te_true`` is the per-sample mean, and it sits in the real-data band."""
+    _, _, meta = gen_smooth_arx(
+        n=128, T=200, rho_u=0.99, rho_y=0.95, c=0.035,
+        sigma2_eta=1.0, sigma2_eps=1.0, M=4,
+        delay_min=1, delay_max=15, K_history=160, seed=0,
+    )
+    dps = meta["delays_per_sample"]
+    assert meta["variable_delay"] is True
+    assert min(dps) >= 1 and max(dps) <= 15
+    assert meta["true_lag_band"] == list(range(0, max(dps)))
+    tps = np.asarray(meta["te_per_sample"], dtype=float)
+    assert meta["te_true"] == pytest.approx(float(tps.mean()), rel=1e-9)
+    assert 0.1 <= meta["te_true"] <= 3.0
+
+
+def test_g2_variable_delay_fixed_mode_still_works() -> None:
+    """G2 fixed scalar ``delay`` mode is preserved (single delay, band {D-H..D-1})."""
+    _, _, meta = gen_smooth_arx(
+        n=8, T=300, rho_u=0.99, rho_y=0.95, c=0.5,
+        sigma2_eta=1.0, sigma2_eps=1.0, delay=60, M=4, seed=0,
+    )
+    assert meta["variable_delay"] is False
+    assert meta["delay"] == 60
+    assert meta["true_lag_band"] == list(range(60 - 30, 60))
+
+
+# ---------------------------------------------------------------------------
 # G3 (regime switch)
 # ---------------------------------------------------------------------------
 
