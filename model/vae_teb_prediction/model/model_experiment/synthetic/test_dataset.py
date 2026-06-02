@@ -195,9 +195,10 @@ def test_dataset_shapes_and_dtype(tiny_g1_cache: Path):
     assert isinstance(sample.guid, str) and "test_G1_train" in sample.guid
     assert isinstance(sample.te_true, float)
     assert sample.true_lag_band.dtype == torch.long
-    # G1 variable lag: the union band is {0, ..., max(drawn delay)-1}; its
-    # length depends on the per-sample delays actually drawn (delay_max=15).
-    d_max = max(ds.meta["delays_per_sample"])
+    # G1 within-signal random-walk lag: the union band is {0, ..., max visited
+    # lag - 1}; the realised lags live in meta["delay_histogram"] (the per-sample
+    # trajectory is not stored).
+    d_max = max(int(k) for k in ds.meta["delay_histogram"])
     assert sample.true_lag_band.tolist() == list(range(0, d_max))
 
 
@@ -241,18 +242,20 @@ def test_meta_json_roundtrip(tiny_g1_cache: Path):
     assert meta["channel_map"]["fhr_st"] == [0, 43]
     assert meta["channel_map"]["up_ph"] == [43, 101]
     # G1-specific fields the generator emits. _build_gen_kwargs auto-tiles a
-    # length-1 oscillator/delay/B_y spec to M copies (here M=4 default), so the
+    # length-1 oscillator/delay/B_y spec to M copies (here M=16 default), so the
     # meta records one delay per informative channel.
     assert meta["target_ar"] == pytest.approx(0.95)
-    assert meta["M"] == 4
-    # G1 variable per-sample lag (real-data regime): delays are drawn in
-    # {delay_min..delay_max} per sample (shared across channels), and the union
-    # band is {0, ..., max(drawn delay)-1}.
+    assert meta["M"] == 16
+    # G1 within-signal random-walk lag (real-data regime): the lag drifts as a
+    # bounded reflecting walk in {delay_min..delay_max}; the per-sample trajectory
+    # is summarised by delay_histogram, and the union band is {0, ..., max-1}.
     assert meta["variable_delay"] is True
+    assert meta["delay_walk"] is True
     assert meta["delay_min"] == 1 and meta["delay_max"] == 15
-    dps = meta["delays_per_sample"]
-    assert min(dps) >= 1 and max(dps) <= 15
-    assert meta["true_lag_band"] == list(range(0, max(dps)))
+    assert meta["delays_per_sample"] is None
+    hist = {int(k): int(v) for k, v in meta["delay_histogram"].items()}
+    assert min(hist) >= 1 and max(hist) <= 15
+    assert meta["true_lag_band"] == list(range(0, max(hist)))
 
 
 # --- Channel decomposition v2 (structured distractors) -----------------------

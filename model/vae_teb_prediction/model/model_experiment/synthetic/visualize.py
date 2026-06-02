@@ -92,8 +92,9 @@ def _primary_delay(meta: Dict[str, Any]) -> int:
     Each v2 benchmark exposes its delay under a different key: G1 / G1-rev
     carry a per-channel ``delays`` list (we return the first), G2 carries the
     scalar ``delay``, and G3 carries the source reveal-lead ``delta``. Under
-    the variable per-sample-delay regime ``delay`` / ``delays`` may be absent
-    or ``None`` and ``delay_max`` is used as the representative value.
+    the within-signal random-walk regime the lag drifts, so the realised mean
+    lag (``delay_mean``) is returned; under the per-sample-constant variable
+    regime ``delay`` / ``delays`` may be ``None`` and ``delay_max`` is used.
 
     Args:
         meta: The dataset metadata dict.
@@ -101,6 +102,11 @@ def _primary_delay(meta: Dict[str, Any]) -> int:
     Returns:
         The benchmark-appropriate primary delay (0 if unset).
     """
+    # Within-signal random walk: the lag drifts over the run, so the
+    # representative single lag for the alignment panels is the realised mean,
+    # not a band edge or the first distinct value.
+    if meta.get("delay_walk") and meta.get("delay_mean") is not None:
+        return int(round(float(meta["delay_mean"])))
     benchmark = str(meta.get("benchmark", ""))
     if benchmark in ("G1", "G1-rev"):
         delays = meta.get("delays") or []
@@ -346,15 +352,23 @@ def _panels_state_space(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     if reverse:
         extra = [f"  direction        : {meta.get('direction')}",
                  f"  reverse_roles    : True"]
+    if meta.get("delay_walk"):
+        delay_line = (
+            f"  lag walk         : {meta.get('delay_min')}..{meta.get('delay_max')} "
+            f"(p_step={meta.get('delay_walk_step_prob')}, mean~{delay})"
+        )
+    elif meta.get("variable_delay"):
+        delay_line = f"  delay range      : {meta.get('delay_min')}..{meta.get('delay_max')}"
+    else:
+        delay_line = f"  delays D         : {delays}"
     _panel_text(axes[2, 1], meta, [
-        f"  delays D         : {delays}",
+        delay_line,
         f"  target AR coeff  : {target_ar}",
         f"  B_y (couplings)  : {meta.get('B_y')}",
         f"  sigma2_y         : {meta.get('sigma2_y')}",
         f"  sigma2_eta       : {meta.get('sigma2_eta')}",
         f"  informative M    : {M} / c_y={c_y}",
         f"  easy_variant     : {meta.get('easy_variant')}",
-        f"  representative D : {delay}",
         osc_str,
         *extra,
     ])
@@ -414,10 +428,15 @@ def _panels_arx(axes: np.ndarray, Y: np.ndarray, U: np.ndarray,
     if reverse:
         extra = [f"  direction        : {meta.get('direction')}",
                  f"  reverse_roles    : True"]
-    delay_line = (
-        f"  delay range      : {meta.get('delay_min')}..{meta.get('delay_max')}"
-        if variable else f"  delay D          : {delay}"
-    )
+    if meta.get("delay_walk"):
+        delay_line = (
+            f"  lag walk         : {meta.get('delay_min')}..{meta.get('delay_max')} "
+            f"(p_step={meta.get('delay_walk_step_prob')}, mean~{delay})"
+        )
+    elif variable:
+        delay_line = f"  delay range      : {meta.get('delay_min')}..{meta.get('delay_max')}"
+    else:
+        delay_line = f"  delay D          : {delay}"
     _panel_text(axes[2, 1], meta, [
         delay_line,
         f"  ARX coupling c   : {c}",

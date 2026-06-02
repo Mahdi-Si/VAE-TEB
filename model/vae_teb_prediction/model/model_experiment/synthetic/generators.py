@@ -169,6 +169,146 @@ def _mean_te_over_samples(
     return float(np.mean(te_per_sample)), te_per_sample, te_by_delay
 
 
+def _draw_delay_walks(
+    n: int, T_total: int, delay_min: int, delay_max: int,
+    step_prob: float, seed: int,
+) -> np.ndarray:
+    r"""Draw one bounded reflecting integer random walk per sample.
+
+    Each sample's lag $d_{i,t}$ evolves within the recording as
+
+    $$
+    d_{i,0} \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\},\qquad
+    d_{i,t} = \mathrm{reflect}\!\big(d_{i,t-1} + \xi_{i,t}\big),
+    $$
+
+    where $\xi_{i,t} = \pm 1$ each with probability $p_{\text{step}}/2$ and
+    $\xi_{i,t} = 0$ otherwise, with reflecting boundaries at $d_{\min}$ and
+    $d_{\max}$. A small $p_{\text{step}}$ (mean hold $\approx 1/p_{\text{step}}$
+    steps) keeps the lag locally constant over the forecast horizon $H$ while
+    letting it drift across the signal; the symmetric reflecting walk has a
+    near-uniform stationary distribution on $\{d_{\min},\dots,d_{\max}\}$.
+
+    The walk is drawn over the full ``T_total = burn_in + T`` simulated span so
+    the process is near-stationary on the kept window, and is shared across a
+    sample's $M$ informative channels by the caller.
+
+    Args:
+        n: Number of samples.
+        T_total: Total simulated length (burn-in + kept window).
+        delay_min: Smallest lag (inclusive), $\ge 1$.
+        delay_max: Largest lag (inclusive).
+        step_prob: Probability $p_{\text{step}}$ of a $\pm 1$ move per step.
+        seed: Base seed; offset so the walk RNG is independent of the
+            simulator's noise RNG.
+
+    Returns:
+        An integer ``np.ndarray`` of shape ``(n, T_total)``.
+    """
+    if not (1 <= int(delay_min) <= int(delay_max)):
+        raise ValueError(
+            "_draw_delay_walks: require 1 <= delay_min <= delay_max, got "
+            f"delay_min={delay_min}, delay_max={delay_max}."
+        )
+    if not 0.0 <= float(step_prob) <= 1.0:
+        raise ValueError(
+            f"_draw_delay_walks: step_prob must be in [0, 1], got {step_prob}."
+        )
+    lo, hi = int(delay_min), int(delay_max)
+    rng = np.random.default_rng(int(seed) + 99_991)
+    walk = np.empty((n, int(T_total)), dtype=int)
+    walk[:, 0] = rng.integers(lo, hi + 1, size=n)
+    span = hi - lo
+    for t in range(1, int(T_total)):
+        u = rng.random(n)
+        step = np.where(u < step_prob / 2.0, -1, np.where(u < step_prob, 1, 0))
+        nxt = walk[:, t - 1] + step
+        if span > 0:
+            # Reflect into [lo, hi] (one ±1 step never overshoots by > 1).
+            nxt = np.where(nxt < lo, lo + 1, nxt)
+            nxt = np.where(nxt > hi, hi - 1, nxt)
+        else:
+            nxt[:] = lo
+        walk[:, t] = nxt
+    return walk
+
+
+def _mean_te_over_delay_histogram(
+    delay_counts: Dict[int, int],
+    te_of_delay: Callable[[int], float],
+) -> Tuple[float, Dict[int, float]]:
+    r"""Histogram-weighted mean block TE over a realised lag distribution.
+
+    Under a slow lag random walk the lag is locally constant over the forecast
+    horizon, so each anchor's exact block TE is ``te_of_delay(d)`` at its
+    prevailing lag $d$. The dataset ground truth is therefore the mean over the
+    realised lag occupancy
+
+    $$
+    \mathrm{TE}_{\text{true}} = \sum_d \hat p(d)\,\mathrm{TE}(d),
+    \qquad
+    \hat p(d) = \frac{\text{count}(d)}{\sum_{d'} \text{count}(d')}.
+    $$
+
+    ``te_of_delay`` is evaluated once per distinct visited lag.
+
+    Args:
+        delay_counts: Histogram ``{lag: count}`` over valid anchor positions.
+        te_of_delay: Maps a constant lag to its exact block TE in nats.
+
+    Returns:
+        ``(te_true, te_by_delay)`` -- the histogram-weighted mean TE and the
+        ``{lag: TE}`` lookup.
+    """
+    total = float(sum(delay_counts.values()))
+    if total <= 0.0:
+        raise ValueError("_mean_te_over_delay_histogram: empty delay histogram.")
+    te_by_delay = {int(d): float(te_of_delay(int(d))) for d in sorted(delay_counts)}
+    te_true = sum(
+        (delay_counts[d] / total) * te_by_delay[d] for d in te_by_delay
+    )
+    return float(te_true), te_by_delay
+
+
+def _delay_walk_meta(
+    delay_walk_mode: bool,
+    delay_walk_step_prob: float,
+    delay_counts: Optional[Dict[int, int]],
+) -> Dict[str, Any]:
+    r"""Metadata describing the within-signal lag random walk.
+
+    Returns the ``delay_walk`` flag plus, when the walk is active, the step
+    probability, the realised lag histogram ``{lag: count}`` and its mean.
+    Every field is ``None`` when the walk is inactive so the ``meta`` schema is
+    uniform across the fixed / per-sample-constant / walk delay modes.
+
+    Args:
+        delay_walk_mode: Whether the within-signal random walk is active.
+        delay_walk_step_prob: The walk's $\pm 1$ step probability.
+        delay_counts: Realised ``{lag: count}`` histogram (``None`` if inactive).
+
+    Returns:
+        A dict with keys ``delay_walk``, ``delay_walk_step_prob``,
+        ``delay_histogram`` and ``delay_mean``.
+    """
+    if not delay_walk_mode or delay_counts is None:
+        return {
+            "delay_walk": delay_walk_mode,
+            "delay_walk_step_prob": None,
+            "delay_histogram": None,
+            "delay_mean": None,
+        }
+    total = sum(delay_counts.values())
+    return {
+        "delay_walk": True,
+        "delay_walk_step_prob": float(delay_walk_step_prob),
+        "delay_histogram": {str(k): int(v) for k, v in delay_counts.items()},
+        "delay_mean": float(
+            sum(k * v for k, v in delay_counts.items()) / total
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Structured channel-decomposition helpers (v2)
 # ---------------------------------------------------------------------------
@@ -696,6 +836,8 @@ def gen_state_space_oscillator(
     delays: Optional[Sequence[int]] = None,
     delay_min: Optional[int] = None,
     delay_max: Optional[int] = None,
+    delay_walk: bool = False,
+    delay_walk_step_prob: float = 0.02,
     c_y: int = 87,
     c_u: int = 101,
     horizon: int = 30,
@@ -763,6 +905,16 @@ def gen_state_space_oscillator(
             autocorrelation. Requires ``delay_max``; mutually exclusive with
             ``delays``.
         delay_max: Largest delay (inclusive) in the per-sample range.
+        delay_walk: If ``True`` (variable mode only), the lag $d_{i,t}$ drifts
+            **within** each signal as a slow bounded reflecting random walk on
+            $\{d_{\min},\dots,d_{\max}\}$ (the realistic CTG regime) instead of
+            being a per-sample constant. The walk is slow enough to be locally
+            constant over the horizon $H$, so the dataset ground-truth TE is the
+            realised-histogram-weighted mean of the per-lag exact block TE. The
+            union lag band is $\{0,\dots,\max_t d_{i,t}-1\}$.
+        delay_walk_step_prob: Probability $p_{\text{step}}$ of a $\pm 1$ lag move
+            per step (mean hold $\approx 1/p_{\text{step}}$). Only used when
+            ``delay_walk=True``.
         B_y: Length-$M$ list of target loadings $B_y^{(m)}$.
         sigma2_y: Shared target innovation variance $\sigma^{2}_{y} > 0$.
         sigma2_eta: Source innovation variance -- scalar (broadcast) or
@@ -880,16 +1032,35 @@ def gen_state_space_oscillator(
                 f"got delays={delays_list}."
             )
 
-    # Build the delay argument for the simulator: a length-M list in fixed
-    # mode, or an (n, M) per-sample array (one delay per sample, shared across
-    # channels) in variable mode. ``distinct_delays`` drives the exact
-    # per-delay analytic TE below.
+    # Build the delay argument for the simulator. Three modes:
+    #   * fixed         -> a length-M list (one delay per channel);
+    #   * variable walk -> an (n, T_total, M) per-time random walk shared
+    #     across channels (``delay_walk=True``); the lag drifts within each
+    #     signal (the realistic CTG regime);
+    #   * variable const-> an (n, M) per-sample constant delay (legacy).
+    # ``distinct_delays`` / the realised histogram drive the analytic TE below.
+    burn_in = 500
     delays_per_sample: Optional[List[int]] = None
-    if variable_mode:
+    delay_walk_counts: Optional[Dict[int, int]] = None
+    delay_walk_mode = variable_mode and delay_walk
+    if delay_walk_mode:
+        assert delay_lo is not None and delay_hi is not None
+        walk = _draw_delay_walks(
+            n, burn_in + T, delay_lo, delay_hi, delay_walk_step_prob, seed,
+        )                                                   # (n, T_total)
+        delays_arg: Union[List[int], np.ndarray] = np.repeat(
+            walk[:, :, None], M, axis=2
+        ).astype(int)                                       # (n, T_total, M)
+        kept = walk[:, burn_in:]                            # (n, T) realised lags
+        vals, counts = np.unique(kept, return_counts=True)
+        delay_walk_counts = {int(v): int(c) for v, c in zip(vals, counts)}
+        distinct_delays = sorted(delay_walk_counts)
+        D_max_used = delay_hi
+    elif variable_mode:
         assert delay_lo is not None and delay_hi is not None
         d_samples = _draw_per_sample_delays(n, delay_lo, delay_hi, seed)  # (n,)
         delays_per_sample = [int(x) for x in d_samples]
-        delays_arg: Union[List[int], np.ndarray] = np.repeat(
+        delays_arg = np.repeat(
             d_samples[:, None], M, axis=1
         ).astype(int)                                       # (n, M)
         distinct_delays = sorted(set(delays_per_sample))
@@ -910,6 +1081,7 @@ def gen_state_space_oscillator(
         B_y=B_y_list,
         sigma2_y=sigma2_y,
         sigma2_eta=sigma2_eta,
+        burn_in=burn_in,
         seed=seed,
     )
     S_inf = torch.from_numpy(S_np.astype(np.float32))
@@ -937,25 +1109,59 @@ def gen_state_space_oscillator(
     # Exact block TE. Analytic TE is computed from the informative-process
     # spec, never from the buffer, so it is invariant to the distractor
     # decomposition.
+    sigma2_eta_per_ch: List[float] = (
+        [float(sigma2_eta)] * M
+        if isinstance(sigma2_eta, (int, float))
+        else [float(s) for s in sigma2_eta]
+    )
+
+    def _g1_te_of_delay(d: int) -> float:
+        r"""Single-shared-delay block TE summed over the $M$ channels.
+
+        The informative channels are mutually independent (no cross-channel
+        coupling), so the $M$-channel block TE equals the sum of the
+        single-channel block TEs. Computing it channel-by-channel keeps every
+        Monte-Carlo determinant ratio well-conditioned ($K$ regressors, not
+        $K\cdot M$) and so avoids the high-$M$ singularity; identical channel
+        specs are evaluated once and reused.
+        """
+        total = 0.0
+        cache: Dict[Tuple[Tuple[float, float], float, float], float] = {}
+        for m in range(M):
+            key = (oscillators_list[m], B_y_list[m], sigma2_eta_per_ch[m])
+            if key not in cache:
+                cache[key] = te_block_state_space_gaussian(
+                    oscillators=[oscillators_list[m]], target_ar=target_ar,
+                    delays=[int(d)], B_y=[B_y_list[m]], sigma2_y=sigma2_y,
+                    sigma2_eta=sigma2_eta_per_ch[m], H=horizon,
+                    K_history=K_history, n_samples=te_n_samples,
+                    seed=int(seed) + 1_337 + int(d),
+                )
+            total += cache[key]
+        return total
+
     te_per_sample: Optional[List[float]] = None
     te_by_delay: Optional[Dict[int, float]] = None
     if reverse_roles:
         te_true = 0.0
         true_lag_band: List[int] = []
         direction = "Y_to_X"
+    elif delay_walk_mode:
+        # The lag drifts as a slow random walk; over any H-step block it is
+        # locally constant, so the dataset TE is the realised-histogram-weighted
+        # mean of the per-lag exact block TE (locally-constant approximation).
+        assert delay_walk_counts is not None
+        te_true, te_by_delay = _mean_te_over_delay_histogram(
+            delay_walk_counts, _g1_te_of_delay,
+        )
+        true_lag_band = _union_lag_band(distinct_delays, horizon)
+        direction = "X_to_Y"
     elif variable_mode:
-        # Each sample's M channels share one delay; its exact block TE is
-        # te_block_state_space_gaussian(delays=[d]*M), averaged over the drawn
-        # delays for the dataset ground truth.
+        # Each sample's M channels share one delay; its exact block TE is the
+        # per-channel sum, averaged over the drawn delays for the dataset truth.
         assert delays_per_sample is not None
         te_true, te_per_sample, te_by_delay = _mean_te_over_samples(
-            delays_per_sample,
-            lambda d: te_block_state_space_gaussian(
-                oscillators=oscillators_list, target_ar=target_ar,
-                delays=[d] * M, B_y=B_y_list, sigma2_y=sigma2_y,
-                sigma2_eta=sigma2_eta, H=horizon, K_history=K_history,
-                n_samples=te_n_samples, seed=int(seed) + 1_337 + d,
-            ),
+            delays_per_sample, _g1_te_of_delay,
         )
         true_lag_band = _union_lag_band(distinct_delays, horizon)
         direction = "X_to_Y"
@@ -995,6 +1201,7 @@ def gen_state_space_oscillator(
         "delay_min": delay_lo,
         "delay_max": delay_hi,
         "variable_delay": variable_mode,
+        **_delay_walk_meta(delay_walk_mode, delay_walk_step_prob, delay_walk_counts),
         "delays_per_sample": delays_per_sample,
         "te_per_sample": te_per_sample,
         "te_by_delay": (
@@ -1044,6 +1251,8 @@ def gen_smooth_arx(
     delay: Optional[int] = None,
     delay_min: Optional[int] = None,
     delay_max: Optional[int] = None,
+    delay_walk: bool = False,
+    delay_walk_step_prob: float = 0.02,
     c_y: int = 87,
     c_u: int = 101,
     horizon: int = 30,
@@ -1092,6 +1301,15 @@ def gen_smooth_arx(
             $\{0,\dots,d-1\}$. Requires ``delay_max``; mutually exclusive with
             ``delay``.
         delay_max: Largest delay (inclusive) in the per-sample range.
+        delay_walk: If ``True`` (variable mode only), the lag $d_{i,t}$ drifts
+            **within** each signal as a slow bounded reflecting random walk on
+            $\{d_{\min},\dots,d_{\max}\}$ instead of a per-sample constant. The
+            walk is locally constant over the horizon $H$, so ``meta.te_true`` is
+            the realised-histogram-weighted mean of the per-lag closed-form
+            block TE. The union lag band is $\{0,\dots,\max_t d_{i,t}-1\}$.
+        delay_walk_step_prob: Probability $p_{\text{step}}$ of a $\pm 1$ lag move
+            per step (mean hold $\approx 1/p_{\text{step}}$). Only used when
+            ``delay_walk=True``.
         c_y, c_u: Target / source channel counts (defaults 87 / 101).
         horizon: Forecast horizon $H$.
         K_history: History depth forwarded to :func:`te_block_arx_gaussian`
@@ -1178,14 +1396,31 @@ def gen_smooth_arx(
             f"burn_in + T={T_total}."
         )
 
-    # Per-sample delay: one delay per sample, shared across its M channels.
-    if variable_mode:
-        rng_delay = np.random.default_rng(int(seed) + 99_991)
-        d_samples = rng_delay.integers(delay_lo, delay_hi + 1, size=n)
+    # Resolve the lag schedule. Three modes:
+    #   * fixed / per-sample constant -> one delay per sample (``d_col``);
+    #   * variable random walk        -> a per-time lag ``d_walk[:, t]`` that
+    #     drifts within each signal (``delay_walk=True``, the realistic regime).
+    delay_walk_mode = variable_mode and delay_walk
+    delay_walk_counts: Optional[Dict[int, int]] = None
+    delays_per_sample: Optional[List[int]] = None
+    d_walk: Optional[torch.Tensor] = None
+    if delay_walk_mode:
+        walk_np = _draw_delay_walks(
+            n, T_total, delay_lo, delay_hi, delay_walk_step_prob, seed,
+        )                                                       # (n, T_total)
+        d_walk = torch.as_tensor(walk_np, dtype=torch.long)
+        kept = walk_np[:, burn_in:]                             # (n, T)
+        vals, counts = np.unique(kept, return_counts=True)
+        delay_walk_counts = {int(v): int(c) for v, c in zip(vals, counts)}
+        d_col = torch.zeros(n, dtype=torch.long)               # unused
     else:
-        d_samples = np.full(n, delay_lo, dtype=int)
-    delays_per_sample: List[int] = [int(x) for x in d_samples]
-    d_col = torch.as_tensor(d_samples, dtype=torch.long)        # (n,)
+        if variable_mode:
+            rng_delay = np.random.default_rng(int(seed) + 99_991)
+            d_samples = rng_delay.integers(delay_lo, delay_hi + 1, size=n)
+        else:
+            d_samples = np.full(n, delay_lo, dtype=int)
+        delays_per_sample = [int(x) for x in d_samples]
+        d_col = torch.as_tensor(d_samples, dtype=torch.long)    # (n,)
     rows = torch.arange(n)
 
     eta = math.sqrt(sigma2_eta) * torch.randn(
@@ -1201,10 +1436,12 @@ def gen_smooth_arx(
     Y[:, 0, :] = eps[:, 0, :]
     for t in range(1, T_total):
         U[:, t, :] = rho_u * U[:, t - 1, :] + eta[:, t, :]
-        # Gather the per-sample lagged source U[i, t - d_i, :]; rows with
-        # t < d_i contribute no drive.
-        active = (t >= d_col)                                   # (n,) bool
-        idx = torch.clamp(t - d_col, min=0)                     # (n,)
+        # Gather the lagged source U[i, t - d_{i,t}, :]; rows with t < d
+        # contribute no drive. ``d_t`` is the per-time random-walk lag when
+        # ``delay_walk=True``, else the per-sample constant ``d_col``.
+        d_t = d_walk[:, t] if d_walk is not None else d_col    # (n,)
+        active = (t >= d_t)                                     # (n,) bool
+        idx = torch.clamp(t - d_t, min=0)                      # (n,)
         gathered = U[rows, idx, :]                              # (n, M)
         drive = torch.where(
             active[:, None], c * gathered, torch.zeros_like(gathered)
@@ -1234,27 +1471,39 @@ def gen_smooth_arx(
     )
 
     # Analytic TE depends only on the informative-process spec, not on the
-    # distractor decomposition; safe to compute independent of decomp.
-    distinct_delays = sorted(set(delays_per_sample))
+    # distractor decomposition; safe to compute independent of decomp. Each
+    # channel's per-lag block TE is the closed-form M * te_block_arx_gaussian.
+    def _te_of_delay(d: int) -> float:
+        return M * te_block_arx_gaussian(
+            rho_u=rho_u, rho_y=rho_y, c=c,
+            sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
+            H=horizon, D=d, K_history=K_history,
+        )
+
     te_per_sample: Optional[List[float]] = None
     te_by_delay: Optional[Dict[int, float]] = None
     if reverse_roles:
         te_true = 0.0
         true_lag_band: List[int] = []
         direction = "Y_to_X"
-    else:
-        # Each sample's M channels are independent and share one delay, so its
-        # block TE is M * te_block_arx_gaussian(D=d), averaged over the drawn
-        # delays for the dataset ground truth.
-        te_true, te_per_sample, te_by_delay = _mean_te_over_samples(
-            delays_per_sample,
-            lambda d: M * te_block_arx_gaussian(
-                rho_u=rho_u, rho_y=rho_y, c=c,
-                sigma2_eta=sigma2_eta, sigma2_eps=sigma2_eps,
-                H=horizon, D=d, K_history=K_history,
-            ),
+    elif delay_walk_mode:
+        # The lag drifts as a slow random walk; locally constant over the
+        # horizon, so the dataset TE is the realised-histogram-weighted mean of
+        # the per-lag closed-form block TE.
+        assert delay_walk_counts is not None
+        te_true, te_by_delay = _mean_te_over_delay_histogram(
+            delay_walk_counts, _te_of_delay,
         )
-        true_lag_band = _union_lag_band(distinct_delays, horizon)
+        true_lag_band = _union_lag_band(sorted(delay_walk_counts), horizon)
+        direction = "X_to_Y"
+    else:
+        # Each sample's M channels share one delay; its block TE is
+        # M * te_block_arx_gaussian(D=d), averaged over the drawn delays.
+        assert delays_per_sample is not None
+        te_true, te_per_sample, te_by_delay = _mean_te_over_samples(
+            delays_per_sample, _te_of_delay,
+        )
+        true_lag_band = _union_lag_band(sorted(set(delays_per_sample)), horizon)
         direction = "X_to_Y"
 
     if standardize:
@@ -1279,6 +1528,7 @@ def gen_smooth_arx(
         "delay_min": (delay_lo if variable_mode else None),
         "delay_max": (delay_hi if variable_mode else None),
         "variable_delay": variable_mode,
+        **_delay_walk_meta(delay_walk_mode, delay_walk_step_prob, delay_walk_counts),
         "delays_per_sample": delays_per_sample,
         "te_per_sample": te_per_sample,
         "te_by_delay": (

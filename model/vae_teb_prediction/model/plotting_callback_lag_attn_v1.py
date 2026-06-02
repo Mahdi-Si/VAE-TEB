@@ -2,7 +2,7 @@
 
 Generates a consolidated multi-row publication-quality figure on every
 validation epoch (gated by ``plot_frequency``). Style helpers are imported
-from :mod:`model.transformer.tr_testing.style` so training diagnostics and
+from :mod:`utils.style` so training diagnostics and
 test-time figures share the same visual language.
 
 The layout follows :mod:`model.vae_teb_prediction.testing.plot_single_samples`:
@@ -64,7 +64,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
 
-from model.transformer.tr_testing.style import (
+from utils.style import (
     COLOR_BLACK,
     COLOR_BLUE,
     COLOR_GREEN,
@@ -78,7 +78,16 @@ from model.transformer.tr_testing.style import (
     style_axes,
 )
 
-
+COLOR_BLUE = "#3F72AF"
+COLOR_ORANGE = "#FFB200"
+COLOR_GREEN = "#46D855"
+COLOR_SKY = "#00ADB5"
+COLOR_PURPLE = "#5642EB"
+COLOR_VERMILLION = "#F23F04"
+COLOR_GRAY = "#393E46"
+COLOR_BLACK = "#000000"
+COLOR_LIGHT_GRAY = "#EEEEEE"
+COLOR_SAGE = "#A3E782"
 # =============================================================================
 # Small helpers
 # =============================================================================

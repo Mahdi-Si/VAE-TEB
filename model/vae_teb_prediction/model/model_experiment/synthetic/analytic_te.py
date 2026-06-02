@@ -695,12 +695,15 @@ def _simulate_state_space_gaussian(
         T: Sequence length (post-burn-in).
         oscillators: Length-$M$ list of $(r_m, \omega_m)$ pairs.
         target_ar: Scalar target self-coefficient $A_y \in [0, 1)$.
-        delays: Source-to-target delays $D_m$. Either a length-$M$ sequence
-            (one delay per channel, shared across all $n$ samples — the fast
-            path used by the analytic TE) **or** an $(n, M)$ integer array of
-            **per-sample, per-channel** delays (used by the variable-delay
-            generator, where each sample draws its own lag). Every entry must
-            be $\ge 1$.
+        delays: Source-to-target delays $D_m$. One of three shapes: a
+            length-$M$ sequence (one delay per channel, shared across all $n$
+            samples — the fast path used by the analytic TE); an $(n, M)$
+            integer array of **per-sample, per-channel** delays (the
+            per-sample-constant variable-delay generator); or an
+            $(n, T_{\text{total}}, M)$ integer array of **per-sample,
+            per-time, per-channel** delays (the within-signal random-walk
+            generator, where the lag $d_{i,t}$ drifts over time). $T_{\text{
+            total}} = \text{burn\_in} + T$. Every entry must be $\ge 1$.
         B_y: Length-$M$ list of target loadings $B_y^{(m)}$.
         sigma2_y: Target innovation variance $\sigma^2_y > 0$ (shared).
         sigma2_eta: Source innovation variance — scalar (broadcast) or
@@ -719,16 +722,19 @@ def _simulate_state_space_gaussian(
             "_simulate_state_space_gaussian: oscillators / B_y must have the "
             f"same length; got {M}, {len(B_y)}."
         )
-    # ``delays`` may be a length-M sequence (shared across samples) or an
-    # (n, M) array of per-sample, per-channel delays.
+    # ``delays`` may be a length-M sequence (shared across samples), an
+    # (n, M) array of per-sample / per-channel delays, or an (n, T_total, M)
+    # array of per-sample / per-time / per-channel delays (the random-walk
+    # generator). ``per_time`` selects the time-indexed gather in the loop.
     delays_in = np.asarray(delays, dtype=int)
+    per_sample = False
+    per_time = False
     if delays_in.ndim == 1:
         if delays_in.shape[0] != M:
             raise ValueError(
                 "_simulate_state_space_gaussian: 1-D delays must have length "
                 f"M={M}, got {delays_in.shape[0]}."
             )
-        per_sample = False
     elif delays_in.ndim == 2:
         if delays_in.shape != (n, M):
             raise ValueError(
@@ -736,10 +742,18 @@ def _simulate_state_space_gaussian(
                 f"have shape (n, M)=({n}, {M}), got {tuple(delays_in.shape)}."
             )
         per_sample = True
+    elif delays_in.ndim == 3:
+        if delays_in.shape[0] != n or delays_in.shape[2] != M:
+            raise ValueError(
+                "_simulate_state_space_gaussian: 3-D (per-time) delays must "
+                f"have shape (n, T_total, M)=({n}, *, {M}), got "
+                f"{tuple(delays_in.shape)}."
+            )
+        per_time = True
     else:
         raise ValueError(
-            "_simulate_state_space_gaussian: delays must be 1-D (M,) or "
-            f"2-D (n, M), got ndim={delays_in.ndim}."
+            "_simulate_state_space_gaussian: delays must be 1-D (M,), "
+            f"2-D (n, M), or 3-D (n, T_total, M), got ndim={delays_in.ndim}."
         )
     if np.any(delays_in < 1):
         raise ValueError(
@@ -766,15 +780,15 @@ def _simulate_state_space_gaussian(
             "_simulate_state_space_gaussian: every oscillator r must lie in "
             "[0, 1)."
         )
-    delays_arr = np.array(delays, dtype=int)
-    if np.any(delays_arr < 1):
-        raise ValueError(
-            "_simulate_state_space_gaussian: every delay must be >= 1."
-        )
     B_y_arr = np.array(B_y, dtype=float)
 
     rng = np.random.default_rng(seed)
     T_total = burn_in + T
+    if per_time and delays_in.shape[1] != T_total:
+        raise ValueError(
+            "_simulate_state_space_gaussian: 3-D (per-time) delays must span "
+            f"burn_in + T = {T_total} time steps, got {delays_in.shape[1]}."
+        )
     D_max = int(delays_in.max())
     if D_max >= T_total:
         raise ValueError(
@@ -807,16 +821,18 @@ def _simulate_state_space_gaussian(
             Y[:, t, :] = eps[:, t, :]
         else:
             drive = np.zeros((n, M), dtype=float)
-            if not per_sample:
+            if not (per_sample or per_time):
                 # Fast path: one delay per channel, shared across samples.
                 for m in range(M):
                     d_m = int(delays_in[m])
                     if t >= d_m:
                         drive[:, m] = B_y_arr[m] * S[:, t - d_m, m]
             else:
-                # Per-sample, per-channel delay: masked gather over samples.
+                # Per-sample (2-D) or per-time random-walk (3-D) delay: masked
+                # gather over samples. The per-time path reads the lag at the
+                # current step, ``d_{i,t}``, shared across the M channels.
                 for m in range(M):
-                    d_col = delays_in[:, m]                 # (n,)
+                    d_col = delays_in[:, t, m] if per_time else delays_in[:, m]
                     active = t >= d_col                     # (n,) bool
                     if active.any():
                         idx = np.clip(t - d_col, 0, None)   # (n,)

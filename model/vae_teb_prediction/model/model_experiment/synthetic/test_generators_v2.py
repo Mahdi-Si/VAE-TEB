@@ -36,6 +36,8 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te impor
     te_categorical_switch_block,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.generators import (
+    _draw_delay_walks,
+    _mean_te_over_delay_histogram,
     gen_regime_switch_smooth,
     gen_smooth_arx,
     gen_state_space_oscillator,
@@ -406,6 +408,99 @@ def test_g2_variable_delay_fixed_mode_still_works() -> None:
     assert meta["variable_delay"] is False
     assert meta["delay"] == 60
     assert meta["true_lag_band"] == list(range(60 - 30, 60))
+
+
+# ---------------------------------------------------------------------------
+# Within-signal random-walk lag (Sprint 9)
+# ---------------------------------------------------------------------------
+
+
+def test_draw_delay_walks_bounds_and_reflection() -> None:
+    r"""The walk stays in $[d_{\min}, d_{\max}]$ and reflects at the boundaries."""
+    walk = _draw_delay_walks(
+        n=500, T_total=400, delay_min=1, delay_max=15, step_prob=0.05, seed=3,
+    )
+    assert walk.shape == (500, 400)
+    assert walk.min() >= 1 and walk.max() <= 15
+    # Initial value is uniform in [1, 15]; every column stays in-bounds.
+    assert set(np.unique(walk)).issubset(set(range(1, 16)))
+
+
+def test_draw_delay_walks_mean_hold_matches_step_prob() -> None:
+    r"""The fraction of steps that change the lag is $\approx p_{\text{step}}$."""
+    p = 0.03
+    walk = _draw_delay_walks(
+        n=400, T_total=2000, delay_min=1, delay_max=15, step_prob=p, seed=0,
+    )
+    frac_changed = float((np.diff(walk, axis=1) != 0).mean())
+    assert frac_changed == pytest.approx(p, abs=0.01)
+
+
+def test_draw_delay_walks_determinism_and_independence() -> None:
+    """Same seed -> identical walk; the walk is per-sample independent."""
+    a = _draw_delay_walks(8, 100, 1, 15, 0.1, seed=7)
+    b = _draw_delay_walks(8, 100, 1, 15, 0.1, seed=7)
+    assert np.array_equal(a, b)
+    # Different samples take different trajectories (not all rows identical).
+    assert not np.all(a == a[0:1, :])
+
+
+def test_draw_delay_walks_step_prob_zero_is_constant() -> None:
+    """With ``step_prob=0`` the lag never moves from its initial draw."""
+    walk = _draw_delay_walks(16, 50, 1, 15, 0.0, seed=1)
+    assert np.array_equal(walk, walk[:, :1].repeat(50, axis=1))
+
+
+def test_mean_te_over_delay_histogram_weighting() -> None:
+    """Histogram-weighted mean matches a hand-computed expectation."""
+    counts = {2: 3, 5: 1}            # p(2)=0.75, p(5)=0.25
+    te_true, by_delay = _mean_te_over_delay_histogram(counts, lambda d: float(d))
+    assert by_delay == {2: 2.0, 5: 5.0}
+    assert te_true == pytest.approx(0.75 * 2.0 + 0.25 * 5.0)
+
+
+def test_g1_delay_walk_meta_and_band() -> None:
+    r"""G1 walk: ``delay_walk`` metadata, band $\{0,\dots,\max_t d-1\}$, histogram."""
+    kw = dict(_G1_VAR_DEFAULTS)
+    kw.update(delay_walk=True, delay_walk_step_prob=0.05)
+    _, _, meta = gen_state_space_oscillator(n=64, T=200, seed=0, **kw)
+    assert meta["delay_walk"] is True
+    assert meta["variable_delay"] is True
+    assert meta["delays_per_sample"] is None          # trajectory not stored
+    assert meta["delay_walk_step_prob"] == 0.05
+    hist = {int(k): int(v) for k, v in meta["delay_histogram"].items()}
+    assert min(hist) >= 1 and max(hist) <= 15
+    assert meta["true_lag_band"] == list(range(0, max(hist)))
+    # te_true is the histogram-weighted mean of te_by_delay.
+    total = sum(hist.values())
+    expect = sum((hist[d] / total) * float(meta["te_by_delay"][str(d)]) for d in hist)
+    assert meta["te_true"] == pytest.approx(expect, rel=1e-9)
+
+
+def test_g2_delay_walk_meta_and_band() -> None:
+    """G2 walk: ``delay_walk`` metadata, histogram-weighted ``te_true``."""
+    _, _, meta = gen_smooth_arx(
+        n=64, T=200, rho_u=0.99, rho_y=0.95, c=0.035,
+        sigma2_eta=1.0, sigma2_eps=1.0, M=4,
+        delay_min=1, delay_max=15, delay_walk=True, delay_walk_step_prob=0.05,
+        K_history=160, seed=0,
+    )
+    assert meta["delay_walk"] is True
+    assert meta["delays_per_sample"] is None
+    hist = {int(k): int(v) for k, v in meta["delay_histogram"].items()}
+    total = sum(hist.values())
+    expect = sum((hist[d] / total) * float(meta["te_by_delay"][str(d)]) for d in hist)
+    assert meta["te_true"] == pytest.approx(expect, rel=1e-9)
+
+
+def test_g1_delay_walk_determinism() -> None:
+    """G1 walk: same seed -> identical data and histogram."""
+    kw = dict(_G1_VAR_DEFAULTS)
+    kw.update(delay_walk=True, delay_walk_step_prob=0.05)
+    Y1, U1, m1 = gen_state_space_oscillator(n=16, T=160, seed=5, **kw)
+    Y2, U2, m2 = gen_state_space_oscillator(n=16, T=160, seed=5, **kw)
+    assert torch.equal(Y1, Y2) and torch.equal(U1, U2)
+    assert m1["delay_histogram"] == m2["delay_histogram"]
 
 
 # ---------------------------------------------------------------------------

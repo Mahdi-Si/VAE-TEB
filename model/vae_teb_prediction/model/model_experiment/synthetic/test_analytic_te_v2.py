@@ -474,6 +474,34 @@ def test_simulate_per_sample_delays_match_scalar_path() -> None:
     assert np.array_equal(Y1, Y2)
 
 
+def test_simulate_per_time_constant_walk_matches_scalar_path() -> None:
+    """An (n, T_total, M) delay array constant in time/sample reproduces the
+    scalar path bit-for-bit, so the random-walk per-time gather adds no TE drift
+    when the lag does not move."""
+    osc = [(0.99, 0.05), (0.98, 0.07)]
+    common = dict(
+        oscillators=osc, target_ar=0.95, B_y=[0.3, 0.5],
+        sigma2_y=1.0, sigma2_eta=0.01, burn_in=80, seed=11,
+    )
+    n, T, burn = 12, 60, 80
+    S1, Y1 = _simulate_state_space_gaussian(n=n, T=T, delays=[7, 7], **common)
+    d3 = np.full((n, burn + T, 2), 7, dtype=int)        # (n, T_total, M) constant
+    S3, Y3 = _simulate_state_space_gaussian(n=n, T=T, delays=d3, **common)
+    assert np.array_equal(S1, S3)
+    assert np.array_equal(Y1, Y3)
+
+
+def test_simulate_per_time_wrong_T_total_raises() -> None:
+    """A 3-D delay array whose time span != burn_in + T is rejected."""
+    osc = [(0.99, 0.05)]
+    with pytest.raises(ValueError, match="burn_in"):
+        _simulate_state_space_gaussian(
+            n=4, T=30, oscillators=osc, target_ar=0.9, B_y=[0.3],
+            sigma2_y=1.0, sigma2_eta=0.01, burn_in=50,
+            delays=np.full((4, 30, 1), 5, dtype=int),  # should be 50+30
+        )
+
+
 def test_mean_te_single_delay_equals_block_te() -> None:
     """A degenerate range (delay_min == delay_max) reduces to the single-delay
     block TE."""
