@@ -178,8 +178,8 @@ def _collate(results_root: Path) -> Dict[str, Any]:
 
     Returns:
         A nested dict ``{benchmarks: {<b>: {eval_te, lag_recovery,
-        beta_sweep, null_controls}}, directionality}`` with ``None`` for any
-        artifact that has not been produced yet.
+        beta_sweep, beta_grid, null_controls, calibration}}, directionality}``
+        with ``None`` for any artifact that has not been produced yet.
     """
     per_bench: Dict[str, Any] = {}
     for b in _BENCHMARKS:
@@ -190,6 +190,12 @@ def _collate(results_root: Path) -> Dict[str, Any]:
             ),
             "beta_sweep": _load_json(
                 results_root / b / "beta_sweep" / "analysis.json"
+            ),
+            # beta x M x TE grid written by :func:`beta_sweep.run_beta_grid`
+            # to ``results/<bench>/beta_grid/analysis.json`` (per-(M, TE) beta
+            # curves + the multi-line figures). Tolerant of absence.
+            "beta_grid": _load_json(
+                results_root / b / "beta_grid" / "analysis.json"
             ),
             # Null-control re-evaluations written by :mod:`null_controls` to
             # ``results/<source_benchmark>/null_controls/metrics.json``.
@@ -748,6 +754,9 @@ def build_final_report(
                 ),
                 "beta_sweep": (
                     collated["benchmarks"][b]["beta_sweep"] is not None
+                ),
+                "beta_grid": (
+                    collated["benchmarks"][b]["beta_grid"] is not None
                 ),
                 "null_controls": (
                     collated["benchmarks"][b]["null_controls"] is not None

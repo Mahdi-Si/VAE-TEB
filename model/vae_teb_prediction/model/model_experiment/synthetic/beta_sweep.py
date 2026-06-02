@@ -9,6 +9,12 @@ that experiment with three run modes:
     * ``beta`` (tasks 6.1, 6.2) -- train the fixed $(a, M)$ benchmark dataset at
       every $\beta$ in ``beta_sweep.grid``, evaluate each checkpoint, build the
       rate-distortion curve and recommend a $\beta$.
+    * ``beta_grid`` -- cross ``beta_sweep.grid`` with the full
+      $(M, \mathrm{TE})$ sweep grid (``enumerate_sweep``) so $\bar K$ vs $\beta$
+      can be read as one coloured line per $M$ (faceted by TE) and per TE
+      (faceted by $M$), plus a per-$\beta$ calibration slice. The
+      $(M, \mathrm{TE})$ grid is the active benchmark's ``sweep.m_grid`` /
+      ``target_te_grid``, optionally narrowed by ``beta_sweep.beta_grid``.
     * ``hp`` (task 6.4) -- the same orchestration over a secondary
       hyper-parameter axis (``lambda_base`` / ``d_z`` / ``warmup_period`` from
       ``beta_sweep.hp_probes``), at the config's $\beta$.
@@ -93,6 +99,12 @@ _SUMMARY_FIELDS = [
     "k_bar", "k_bar_shuffled", "pred_gap", "feat_loss", "base_loss", "kld_loss",
     "mu_post_prior_gap", "attn_entropy", "epoch", "ckpt_path",
 ]
+
+# ``beta_grid`` mode (--mode beta_grid) crosses beta x M x TE, so its per-cell
+# CSV/JSON carries the grid coordinates (``M``, ``target_te``) and whichever
+# generator knob the active benchmark solved per cell (``B_y`` for G1, ``c`` for
+# G2, ``p_switch`` for G3) on top of the shared 1-D-sweep columns.
+_BETA_GRID_FIELDS = _SUMMARY_FIELDS + ["M", "target_te", "B_y", "c", "p_switch"]
 
 
 # =============================================================================
@@ -415,20 +427,27 @@ def _analyse(rows: List[Dict[str, Any]], axis: str) -> Dict[str, Any]:
 # Output: CSV / JSON / plots
 # =============================================================================
 
-def write_summary_csv(rows: List[Dict[str, Any]], path: Path) -> None:
+def write_summary_csv(
+    rows: List[Dict[str, Any]],
+    path: Path,
+    fields: Optional[List[str]] = None,
+) -> None:
     """Write the per-cell summary CSV.
 
     Args:
         rows: Per-cell rows from :func:`_run_one`.
         path: Destination CSV path (overwritten).
+        fields: Column list; defaults to :data:`_SUMMARY_FIELDS` (the 1-D sweep
+            schema). ``beta_grid`` mode passes :data:`_BETA_GRID_FIELDS`.
     """
+    fields = fields or _SUMMARY_FIELDS
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_SUMMARY_FIELDS)
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: row.get(k) for k in _SUMMARY_FIELDS})
+            writer.writerow({k: row.get(k) for k in fields})
 
 
 def write_analysis_json(
@@ -436,6 +455,7 @@ def write_analysis_json(
     rows: List[Dict[str, Any]],
     axis: str,
     path: Path,
+    fields: Optional[List[str]] = None,
 ) -> None:
     """Write the rate-distortion / HP analysis plus per-cell rows as JSON.
 
@@ -444,7 +464,10 @@ def write_analysis_json(
         rows: Per-cell rows (the ``per_dim_kl`` vectors live here).
         axis: The sweep axis.
         path: Destination JSON path (overwritten).
+        fields: Per-row field list; defaults to :data:`_SUMMARY_FIELDS`.
+            ``beta_grid`` mode passes :data:`_BETA_GRID_FIELDS`.
     """
+    fields = fields or _SUMMARY_FIELDS
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -453,7 +476,7 @@ def write_analysis_json(
         "n_cells": len(rows),
         "analysis": analysis,
         "per_dim_kl": {r["run_tag"]: r.get("per_dim_kl", []) for r in rows},
-        "rows": [{k: r.get(k) for k in _SUMMARY_FIELDS} for r in rows],
+        "rows": [{k: r.get(k) for k in fields} for r in rows],
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
@@ -890,6 +913,491 @@ def _print_metrics_safe(metrics: Dict[str, Any], n: int) -> None:
 
 
 # =============================================================================
+# Mode: beta x M x TE grid (multi-line K_bar-vs-beta across channels / TE)
+# =============================================================================
+
+def _knob_for_setting(setting: Dict[str, Any]) -> Tuple[str, str, float]:
+    """Resolve the generator knob a v2 sweep setting varies.
+
+    Args:
+        setting: One :func:`evaluate_te.enumerate_sweep` setting dict.
+
+    Returns:
+        Tuple ``(knob_token, knob_field, value)`` -- ``knob_token`` is the short
+        tag label (``"By"`` / ``"c"`` / ``"p"``) consumed by
+        :func:`evaluate_te._setting_tags_knob`; ``knob_field`` is the CSV column
+        (``"B_y"`` / ``"c"`` / ``"p_switch"``); ``value`` is the solved knob.
+
+    Raises:
+        ValueError: If ``setting["kind"]`` is not a known v2 dispatch.
+    """
+    kind = str(setting.get("kind", ""))
+    if kind == "gaussian_state_space":
+        return "By", "B_y", float(setting["B_y"])
+    if kind == "arx":
+        return "c", "c", float(setting["c"])
+    if kind == "regime_switch":
+        return "p", "p_switch", float(setting["p_switch"])
+    raise ValueError(f"unknown sweep kind {kind!r}")
+
+
+def _ensure_dataset_for_setting(
+    config: Dict[str, Any], kind: str, data_tag: str, value: float, m: int
+) -> None:
+    """Materialise the (beta-independent) dataset for one sweep setting.
+
+    Dispatches to the kind-specific :mod:`evaluate_te` dataset builder so both
+    :func:`run_beta_grid` and :func:`gpu_pool._cells_beta_grid` share one
+    mapping from ``setting["kind"]`` to its idempotent ``_ensure_dataset_*``.
+
+    Args:
+        config: The parsed config (copied before override by the builder).
+        kind: The sweep ``kind`` (``gaussian_state_space`` / ``arx`` /
+            ``regime_switch``).
+        data_tag: Cache tag for this cell.
+        value: The solved knob ($B_y$ / $c$ / $p_{\\rm switch}$).
+        m: Number of informative channels.
+
+    Raises:
+        ValueError: If ``kind`` is not a known v2 dispatch.
+    """
+    if kind == "gaussian_state_space":
+        ev._ensure_dataset_state_space(config, data_tag, value, m)
+    elif kind == "arx":
+        ev._ensure_dataset_arx(config, data_tag, value, m)
+    elif kind == "regime_switch":
+        ev._ensure_dataset_regime_switch(config, data_tag, value, m)
+    else:
+        raise ValueError(f"unknown sweep kind {kind!r}")
+
+
+def _enumerate_beta_grid_settings(
+    config: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    r"""Enumerate the $(M, \mathrm{TE})$ settings for the $\beta$ grid.
+
+    Reuses :func:`evaluate_te.enumerate_sweep` on a config whose ``sweep``
+    block is optionally narrowed by ``beta_sweep.beta_grid.{m_grid,
+    target_te_grid}`` -- so the 270-cell default grid can be shrunk from the
+    config without touching the active benchmark's ``sweep`` block.
+
+    Args:
+        config: The parsed, benchmark-resolved config.
+
+    Returns:
+        The :func:`evaluate_te.enumerate_sweep` settings list (one per
+        $(M, \mathrm{TE})$ cell), each crossed with every $\beta$ downstream.
+    """
+    override = (config.get("beta_sweep", {}) or {}).get("beta_grid", {}) or {}
+    cfg_enum = deepcopy(config)
+    cfg_enum.setdefault("sweep", {})
+    if override.get("m_grid") is not None:
+        cfg_enum["sweep"]["m_grid"] = [int(m) for m in override["m_grid"]]
+    if override.get("target_te_grid") is not None:
+        cfg_enum["sweep"]["target_te_grid"] = [
+            float(t) for t in override["target_te_grid"]
+        ]
+    return ev.enumerate_sweep(cfg_enum)
+
+
+def run_beta_grid(
+    config: Dict[str, Any],
+    *,
+    build_missing: bool = False,
+    train_missing: bool = False,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    r"""Sweep $\beta$ across the full $(M, \mathrm{TE})$ grid.
+
+    Crosses every $(M, \mathrm{TE})$ cell of
+    :func:`evaluate_te.enumerate_sweep` (the coupling solved per cell, with the
+    analytic ``te_true``) with ``beta_sweep.grid``. The cell **datasets** are
+    $\beta$-independent and identical to the Phase-4 A-sweep caches
+    (``benchmark_<B>_sweep_<knob>_m<M>``), so each is built once and reused for
+    every $\beta$; only the ``loss.kld_beta`` patch and the
+    $\beta$-namespaced ``run_tag`` (``beta_grid/<base>/b<token>``) differ across
+    the inner loop. Training, scoring and dataset materialisation reuse
+    :mod:`train_minimal` / :mod:`evaluate_te` verbatim.
+
+    Args:
+        config: The parsed ``config_synth.yaml``.
+        build_missing: If True, generate any missing $(M, \mathrm{TE})$ dataset.
+        train_missing: If True, train any missing cell checkpoint (multi-hour;
+            270 cells at the G1 default).
+        device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
+
+    Returns:
+        A results dict: ``axis`` (``"beta_grid"``), ``rows``, ``analysis``,
+        ``out_dir`` and ``skipped``.
+
+    Raises:
+        ValueError: If ``beta_sweep.grid`` is empty.
+    """
+    benchmark = str(config["experiment"]["benchmark"])
+    device = device or tm.resolve_device(config["runtime"])
+    bs = config.get("beta_sweep", {}) or {}
+    beta_grid = [float(v) for v in (bs.get("grid") or [])]
+    if not beta_grid:
+        raise ValueError("beta_grid mode needs a populated beta_sweep.grid.")
+    epochs = bs.get("epochs")
+
+    settings = _enumerate_beta_grid_settings(config)
+    out_dir = ev._results_root(config) / benchmark / "beta_grid"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[beta_grid] benchmark={benchmark}  {len(settings)} (M, TE) cell(s) x "
+        f"{len(beta_grid)} beta = {len(settings) * len(beta_grid)} run(s)  "
+        f"device={device}  build_missing={build_missing}  "
+        f"train_missing={train_missing}"
+    )
+
+    rows: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for setting in settings:
+        m = int(setting["M"])
+        try:
+            knob_token, knob_field, value = _knob_for_setting(setting)
+        except ValueError as exc:
+            print(f"  [skip ] {exc}")
+            skipped.append(f"unknown_kind_m{m}")
+            continue
+        data_tag, base_run_tag = ev._setting_tags_knob(
+            benchmark, knob_token, value, m
+        )
+        cache_dir = ev._data_root(config) / benchmark / data_tag
+
+        # Ensure the (beta-independent) cell dataset once, then reuse it.
+        if not (cache_dir / "test.npz").is_file():
+            if build_missing:
+                print(f"  [build] {data_tag}  ({knob_field}={value:g}, M={m})")
+                _ensure_dataset_for_setting(
+                    config, str(setting["kind"]), data_tag, value, m
+                )
+            else:
+                for beta in beta_grid:
+                    skipped.append(
+                        f"beta_grid/{base_run_tag}/b{_fmt_token(beta)}"
+                    )
+                print(
+                    f"  [skip ] dataset '{data_tag}' not cached "
+                    f"(pass build_missing=True); skipped its {len(beta_grid)} "
+                    f"beta cells."
+                )
+                continue
+
+        target_te = setting.get("target_te")
+        for beta in beta_grid:
+            run_tag = f"beta_grid/{base_run_tag}/b{_fmt_token(beta)}"
+            ckpt_path = (
+                ev._results_root(config) / benchmark / run_tag / "final.ckpt"
+            )
+            if not ckpt_path.is_file():
+                if not train_missing:
+                    print(f"  [skip ] {run_tag}: checkpoint not found.")
+                    skipped.append(run_tag)
+                    continue
+                cfg = deepcopy(config)
+                cfg["loss"]["kld_beta"] = beta
+                if epochs is not None:
+                    cfg["optim"]["epochs"] = int(epochs)
+                print(
+                    f"  [train] {run_tag}  ({knob_field}={value:g}, M={m}, "
+                    f"beta={beta:g})"
+                )
+                tm.train(
+                    cfg, overrides={"data_tag": data_tag, "run_tag": run_tag}
+                )
+
+            try:
+                row = ev.evaluate_checkpoint(
+                    ckpt_path, config, device=device, data_tag=data_tag
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad cell mustn't abort
+                print(f"  [error] {run_tag}: {type(exc).__name__}: {exc}")
+                skipped.append(run_tag)
+                continue
+
+            # Stamp robust grid coordinates from the *setting* (the faceting
+            # keys). ``te_true`` is left as evaluate_checkpoint set it -- the
+            # realised, histogram-weighted ``meta.te_true`` of the cached
+            # dataset, which is the correct calibration x-axis (v2 sec. 3.1.1),
+            # not the nominal enumeration target (kept separately as
+            # ``target_te`` for clean panel grouping).
+            row["axis"] = "beta_grid"
+            row["value"] = float(beta)
+            row["beta"] = float(beta)
+            row["M"] = m
+            row["target_te"] = (
+                float(target_te) if target_te is not None else None
+            )
+            row[knob_field] = value
+            rows.append(row)
+
+    analysis = _beta_grid_analysis(rows)
+    write_summary_csv(rows, out_dir / "summary.csv", fields=_BETA_GRID_FIELDS)
+    write_analysis_json(
+        analysis, rows, "beta_grid", out_dir / "analysis.json",
+        fields=_BETA_GRID_FIELDS,
+    )
+    if len(rows) >= 2:
+        _make_beta_grid_plots(rows, out_dir)
+    else:
+        print(
+            "[plots] fewer than 2 cells evaluated -- skipping plots "
+            "(the grid training run is deferred; see the plan)."
+        )
+    print(
+        f"[done] beta_grid: {len(rows)} evaluated, {len(skipped)} skipped\n"
+        f"       artifacts -> {out_dir}"
+    )
+    return {
+        "axis": "beta_grid",
+        "rows": rows,
+        "analysis": analysis,
+        "out_dir": str(out_dir),
+        "skipped": skipped,
+    }
+
+
+def _beta_grid_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    r"""Per-$(M, \mathrm{TE})$ rate-distortion summary of the $\beta$ grid.
+
+    For each $(M, \mathrm{TE})$ group the $\bar K(\beta)$ curve is recorded and
+    the $\beta$ whose $\bar K$ lands nearest the analytic ``te_true`` is picked
+    (a closest-match heuristic per group, mirroring
+    :func:`_rate_distortion_analysis`).
+
+    Args:
+        rows: Per-cell rows from :func:`run_beta_grid`.
+
+    Returns:
+        A nested analysis dict: ``groups`` is one entry per $(M, \mathrm{TE})$
+        with its curve and ``selected_beta``.
+    """
+    if not rows:
+        return {"axis": "beta_grid", "n_cells": 0, "note": "no cells evaluated"}
+
+    groups: Dict[Tuple[int, Optional[float]], List[Dict[str, Any]]] = {}
+    for r in rows:
+        key = (int(r["M"]), r.get("target_te"))
+        groups.setdefault(key, []).append(r)
+
+    def _sort_key(item: Tuple[Tuple[int, Optional[float]], Any]) -> Tuple[int, float]:
+        (m, tt), _ = item
+        return (m, float(tt) if tt is not None else float("inf"))
+
+    cells: List[Dict[str, Any]] = []
+    for (m, tt), grp in sorted(groups.items(), key=_sort_key):
+        betas = np.array([float(g["beta"]) for g in grp], dtype=float)
+        kbar = np.array([float(g["k_bar"]) for g in grp], dtype=float)
+        te_true = float(grp[0]["te_true"])
+        order = np.argsort(betas)
+        curve = [
+            {"beta": float(betas[i]), "k_bar": float(kbar[i])} for i in order
+        ]
+        diff = np.abs(kbar - te_true)
+        finite = np.isfinite(diff)
+        sel = (
+            float(betas[int(np.argmin(np.where(finite, diff, np.inf)))])
+            if finite.any() else None
+        )
+        cells.append({
+            "M": m, "target_te": tt, "te_true": te_true,
+            "selected_beta": sel, "curve": curve,
+        })
+
+    return {
+        "axis": "beta_grid",
+        "n_cells": len(rows),
+        "n_groups": len(cells),
+        "m_levels": sorted({int(r["M"]) for r in rows}),
+        "te_levels": sorted(
+            {float(r["target_te"]) for r in rows
+             if r.get("target_te") is not None}
+        ),
+        "beta_grid": sorted({float(r["beta"]) for r in rows}),
+        "groups": cells,
+        "note": (
+            "per-(M, target_te) beta curve; selected_beta minimises "
+            "|K_bar - te_true| within each group (closest-match heuristic)."
+        ),
+    }
+
+
+def _make_beta_grid_plots(
+    rows: List[Dict[str, Any]], out_dir: Path
+) -> None:
+    r"""Render the three multi-line $\beta$-grid figures.
+
+    * ``kbar_vs_beta__byTE.{pdf,png}`` -- one panel per target-TE level; within
+      a panel $\bar K$ vs $\beta$ (log-x) with one coloured line per $M$ and a
+      dashed line at the realised ``te_true``.
+    * ``kbar_vs_beta__byM.{pdf,png}`` -- one panel per $M$; one coloured line
+      per target-TE level.
+    * ``kbar_vs_te__byBeta.{pdf,png}`` -- one panel per $\beta$; $\bar K$ vs the
+      realised ``te_true`` scattered and coloured by $M$ (the per-$\beta$
+      calibration slice). No identity line is drawn: under the default ``mse``
+      likelihood $\bar K$ is scale-free, so only the monotone trend is meaningful.
+
+    Args:
+        rows: Per-cell rows (>= 2) from :func:`run_beta_grid`.
+        out_dir: Destination directory.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        plot_style as ps,
+    )
+
+    ps.apply_style()
+
+    def _color(idx: int) -> str:
+        return ps.PALETTE_EXTENDED[idx % len(ps.PALETTE_EXTENDED)]
+
+    def _te_key(r: Dict[str, Any]) -> float:
+        """Faceting key: the nominal target TE, or the realised TE if absent."""
+        return (
+            float(r["target_te"]) if r.get("target_te") is not None
+            else round(float(r["te_true"]), 4)
+        )
+
+    betas = np.array([float(r["beta"]) for r in rows], dtype=float)
+    kbar = np.array([float(r["k_bar"]) for r in rows], dtype=float)
+    te_true = np.array([float(r["te_true"]) for r in rows], dtype=float)
+    m_vals = np.array([int(r["M"]) for r in rows], dtype=int)
+    te_keys = np.array([_te_key(r) for r in rows], dtype=float)
+
+    m_levels = sorted(set(m_vals.tolist()))
+    te_levels = sorted(set(te_keys.tolist()))
+    beta_levels = sorted(set(betas.tolist()))
+
+    def _new_grid(n: int, *, sharey: bool):
+        """A near-square constrained subplot grid for ``n`` panels.
+
+        ``sharex`` is always on (every panel shares the $\\beta$ / TE axis);
+        spare axes are switched off. ``layout="constrained"`` reserves room for
+        the suptitle and an out-of-panel legend so neither overlaps the data.
+        Returns ``(fig, flat_axes, ncols)``.
+        """
+        ncols = int(np.ceil(np.sqrt(max(n, 1))))
+        nrows = int(np.ceil(max(n, 1) / ncols))
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(3.9 * ncols, 3.2 * nrows), squeeze=False,
+            sharex=True, sharey=sharey, layout="constrained",
+        )
+        flat = axes.ravel()
+        for j in range(n, len(flat)):
+            flat[j].axis("off")
+        return fig, flat, ncols
+
+    def _dedupe_axis_labels(flat, n, ncols, xlabel, ylabel):
+        """Keep the $x$ label only on each column's lowest panel, $y$ on column 0.
+
+        Ragged-grid safe (a partly-filled last row): a panel is the lowest in
+        its column iff no used panel sits ``ncols`` slots later. ``sharex`` hides
+        x tick numbers on non-bottom *rows*, which would also strip them from a
+        column's lowest panel when the slot below is an (empty) spare -- so tick
+        numbers are forced back on there. Per-panel $y$ tick numbers are left as
+        ``sharey`` set them (off-grid panels may differ in scale).
+        """
+        for i, ax in enumerate(flat[:n]):
+            is_col_bottom = i + ncols >= n
+            ax.set_xlabel(xlabel if is_col_bottom else "")
+            ax.set_ylabel(ylabel if i % ncols == 0 else "")
+            if is_col_bottom:
+                ax.tick_params(axis="x", labelbottom=True)
+
+    def _facet_kbar_vs_beta(
+        fname, *, panel_vals, panel_levels, panel_title, series_vals,
+        series_levels, series_label, suptitle, draw_ref,
+    ):
+        """K_bar-vs-beta faceted by ``panel_vals``, one line per ``series_vals``."""
+        fig, flat, ncols = _new_grid(len(panel_levels), sharey=False)
+        for pi, pv in enumerate(panel_levels):
+            ax = flat[pi]
+            pmask = panel_vals == pv
+            for idx, sv in enumerate(series_levels):
+                sel = pmask & (series_vals == sv)
+                if not sel.any():
+                    continue
+                order = np.argsort(betas[sel])
+                ax.plot(betas[sel][order], kbar[sel][order], marker="o",
+                        color=_color(idx), label=series_label(sv))
+            if draw_ref and pmask.any():
+                ref = float(np.nanmean(te_true[pmask]))
+                if np.isfinite(ref):
+                    ax.axhline(ref, color=ps.COLOR_GRAY, ls="--", lw=1.0)
+            ax.set_xscale("log")
+            ax.set_title(panel_title(pv))
+            ps.style_axes(ax)
+        _dedupe_axis_labels(
+            flat, len(panel_levels), ncols,
+            r"bottleneck coefficient $\beta$", r"$\bar K$ (nats)",
+        )
+        handles = [
+            Line2D([0], [0], color=_color(i), marker="o", label=series_label(sv))
+            for i, sv in enumerate(series_levels)
+        ]
+        if draw_ref:
+            handles.append(Line2D(
+                [0], [0], color=ps.COLOR_GRAY, ls="--",
+                label=r"realised $\mathrm{TE}_{\rm true}$",
+            ))
+        fig.legend(handles=handles, loc="outside right upper")
+        fig.suptitle(suptitle)
+        ps.save_figure(fig, out_dir / fname)
+
+    # --- Figures 1 & 2: K_bar vs beta, faceted by TE / by M ---------------
+    _facet_kbar_vs_beta(
+        "kbar_vs_beta__byTE",
+        panel_vals=te_keys, panel_levels=te_levels,
+        panel_title=lambda te: fr"target TE = {te:g} nats",
+        series_vals=m_vals, series_levels=m_levels,
+        series_label=lambda m: f"M={m}",
+        suptitle=r"$\bar K$ vs $\beta$  (panel: target TE, line: $M$)",
+        draw_ref=True,
+    )
+    _facet_kbar_vs_beta(
+        "kbar_vs_beta__byM",
+        panel_vals=m_vals, panel_levels=m_levels,
+        panel_title=lambda m: fr"$M$ = {m}",
+        series_vals=te_keys, series_levels=te_levels,
+        series_label=lambda te: fr"TE={te:g}",
+        suptitle=r"$\bar K$ vs $\beta$  (panel: $M$, line: target TE)",
+        draw_ref=False,
+    )
+
+    # --- Figure 3: calibration -- K_bar vs realised TE, panel per beta ----
+    # x (true TE) and y (K_bar) share scales across beta panels, so sharey=True
+    # makes the per-beta calibration directly comparable.
+    fig, flat, ncols = _new_grid(len(beta_levels), sharey=True)
+    m_handles = [
+        Line2D([0], [0], color=_color(i), marker="o", linestyle="none", label=f"M={m}")
+        for i, m in enumerate(m_levels)
+    ]
+    for pi, beta in enumerate(beta_levels):
+        ax = flat[pi]
+        panel = betas == beta
+        for idx, m in enumerate(m_levels):
+            sel = panel & (m_vals == m)
+            if not sel.any():
+                continue
+            ax.scatter(te_true[sel], kbar[sel], s=40, color=_color(idx),
+                       edgecolors=ps.COLOR_BLACK, linewidths=0.4, zorder=3)
+        ax.set_title(fr"$\beta$ = {beta:g}")
+        ps.style_axes(ax)
+    _dedupe_axis_labels(
+        flat, len(beta_levels), ncols,
+        "analytic block TE (nats)", r"$\bar K$ (nats)",
+    )
+    fig.legend(handles=m_handles, loc="outside right upper")
+    fig.suptitle(r"calibration: $\bar K$ vs true TE  (panel: $\beta$, colour: $M$)")
+    ps.save_figure(fig, out_dir / "kbar_vs_te__byBeta")
+
+
+# =============================================================================
 # Overrides + dispatch
 # =============================================================================
 
@@ -950,6 +1458,11 @@ def _dispatch(
             config, axis="beta", build_missing=build_missing,
             train_missing=train_missing, device=device,
         )
+    if mode == "beta_grid":
+        return run_beta_grid(
+            config, build_missing=build_missing,
+            train_missing=train_missing, device=device,
+        )
     if mode == "hp":
         axis = overrides.get("axis")
         if axis not in _HP_AXES:
@@ -975,7 +1488,8 @@ def _dispatch(
             train_missing=train_missing, device=device,
         )
     raise ValueError(
-        f"unknown mode: {mode!r} (expected 'beta', 'hp' or 'rank_at_beta')."
+        f"unknown mode: {mode!r} (expected 'beta', 'beta_grid', 'hp' or "
+        f"'rank_at_beta')."
     )
 
 
@@ -1004,9 +1518,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--mode", type=str, default=None,
-        choices=["beta", "hp", "rank_at_beta"],
-        help="beta sweep (6.1/6.2) / HP probe (6.4) / A-sweep at a chosen "
-             "beta (6.3)",
+        choices=["beta", "beta_grid", "hp", "rank_at_beta"],
+        help="beta sweep (6.1/6.2) / beta x M x TE grid / HP probe (6.4) / "
+             "A-sweep at a chosen beta (6.3)",
     )
     p.add_argument(
         "--axis", type=str, default=None, choices=list(_HP_AXES),
@@ -1070,7 +1584,7 @@ if __name__ == "__main__":
     CONFIG_PATH = _DEFAULT_CONFIG
 
     RUN_CONFIG = {
-        "mode": "beta",            # "beta" | "hp" | "rank_at_beta"
+        "mode": "beta",            # "beta" | "beta_grid" | "hp" | "rank_at_beta"
         "axis": "lambda_base",     # hp mode: lambda_base | d_z | warmup_period
         "beta": None,              # rank_at_beta mode: None -> selected_beta
         "build_missing": False,    # generate any missing dataset (opt-in)
