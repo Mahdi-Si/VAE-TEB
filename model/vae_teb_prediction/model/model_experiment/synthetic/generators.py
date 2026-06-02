@@ -309,6 +309,49 @@ def _delay_walk_meta(
     }
 
 
+def _true_lag_trajectory(
+    n: int,
+    T: int,
+    *,
+    walk_kept: Optional[np.ndarray] = None,
+    delays_per_sample: Optional[Sequence[int]] = None,
+    delays_list: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    r"""Per-sample, per-kept-step source→target delay $d_{i,t}$ of shape $(n, T)$.
+
+    This is the ground-truth lag that drives the target at each kept time step,
+    used to overlay the "true informative lag" on the lag-attention diagnostic.
+    Exactly one of the three sources is supplied, matching the three delay modes:
+
+    * ``walk_kept`` -- the kept-window slice ``walk[:, burn_in:]`` of the
+      within-signal random walk (``delay_walk=True``); the lag drifts over $t$.
+    * ``delays_per_sample`` -- one constant delay per sample, broadcast across
+      $t$ (variable per-sample-constant mode); a flat line per sample.
+    * ``delays_list`` -- a fixed per-channel delay list; the **representative**
+      (smallest) delay is broadcast to every sample and step. A single curve
+      cannot show a multi-band fixed design (e.g. ``G1_twoband``), so only the
+      primary band is drawn; the full union is still available via
+      ``true_lag_band``.
+
+    Args:
+        n: Number of samples.
+        T: Kept sequence length.
+        walk_kept: Realised lag walk ``(n, T)`` or ``None``.
+        delays_per_sample: Per-sample constant delays ``(n,)`` or ``None``.
+        delays_list: Fixed per-channel delays or ``None``.
+
+    Returns:
+        An ``int16`` ``np.ndarray`` of shape ``(n, T)``.
+    """
+    if walk_kept is not None:
+        return np.ascontiguousarray(walk_kept, dtype=np.int16)
+    if delays_per_sample is not None:
+        d = np.asarray(delays_per_sample, dtype=np.int16)
+        return np.ascontiguousarray(np.broadcast_to(d[:, None], (n, T)))
+    assert delays_list is not None
+    return np.full((n, T), int(min(int(x) for x in delays_list)), dtype=np.int16)
+
+
 # ---------------------------------------------------------------------------
 # Structured channel-decomposition helpers (v2)
 # ---------------------------------------------------------------------------
@@ -1042,6 +1085,7 @@ def gen_state_space_oscillator(
     burn_in = 500
     delays_per_sample: Optional[List[int]] = None
     delay_walk_counts: Optional[Dict[int, int]] = None
+    walk_kept: Optional[np.ndarray] = None
     delay_walk_mode = variable_mode and delay_walk
     if delay_walk_mode:
         assert delay_lo is not None and delay_hi is not None
@@ -1052,6 +1096,7 @@ def gen_state_space_oscillator(
             walk[:, :, None], M, axis=2
         ).astype(int)                                       # (n, T_total, M)
         kept = walk[:, burn_in:]                            # (n, T) realised lags
+        walk_kept = kept
         vals, counts = np.unique(kept, return_counts=True)
         delay_walk_counts = {int(v): int(c) for v, c in zip(vals, counts)}
         distinct_delays = sorted(delay_walk_counts)
@@ -1188,11 +1233,26 @@ def gen_state_space_oscillator(
         )
         U_buf = _standardize_per_channel(U_buf)
 
+    # Per-sample, per-step ground-truth lag d_{i,t} (n, T) for the lag-attention
+    # overlay. ``None`` for the reverse-roles zero-TE control (no true lag to
+    # show). Popped into the split ``.npz`` by ``build_dataset._write_split``.
+    true_lag_tt: Optional[np.ndarray] = None
+    if not reverse_roles:
+        # Source priority in the helper (walk -> per-sample -> fixed) already
+        # selects the right mode, so all three can be passed unconditionally.
+        true_lag_tt = _true_lag_trajectory(
+            n, T,
+            walk_kept=walk_kept,
+            delays_per_sample=delays_per_sample,
+            delays_list=delays_list,
+        )
+
     meta: Dict[str, Any] = {
         "benchmark": "G1",
         "te_true": float(te_true),
         "te_per_step": float(te_true) / horizon,
         "true_lag_band": true_lag_band,
+        "true_lag_tt": true_lag_tt,
         "informative_channels": list(range(M)),
         "clean_anchor_range": [D_max_used - 1, T - horizon],
         "oscillators": [list(o) for o in oscillators_list],
@@ -1403,6 +1463,7 @@ def gen_smooth_arx(
     delay_walk_mode = variable_mode and delay_walk
     delay_walk_counts: Optional[Dict[int, int]] = None
     delays_per_sample: Optional[List[int]] = None
+    walk_kept: Optional[np.ndarray] = None
     d_walk: Optional[torch.Tensor] = None
     if delay_walk_mode:
         walk_np = _draw_delay_walks(
@@ -1410,6 +1471,7 @@ def gen_smooth_arx(
         )                                                       # (n, T_total)
         d_walk = torch.as_tensor(walk_np, dtype=torch.long)
         kept = walk_np[:, burn_in:]                             # (n, T)
+        walk_kept = kept
         vals, counts = np.unique(kept, return_counts=True)
         delay_walk_counts = {int(v): int(c) for v, c in zip(vals, counts)}
         d_col = torch.zeros(n, dtype=torch.long)               # unused
@@ -1512,11 +1574,22 @@ def gen_smooth_arx(
         )
         U_buf = _standardize_per_channel(U_buf)
 
+    # Per-sample, per-step ground-truth lag d_{i,t} (n, T) for the lag-attention
+    # overlay (``None`` for the reverse-roles zero-TE control). ``_write_split``
+    # pops this into the split ``.npz``; the walk / per-sample-constant / fixed
+    # modes all resolve to a single (n, T) trajectory.
+    true_lag_tt: Optional[np.ndarray] = None
+    if not reverse_roles:
+        true_lag_tt = _true_lag_trajectory(
+            n, T, walk_kept=walk_kept, delays_per_sample=delays_per_sample,
+        )
+
     meta: Dict[str, Any] = {
         "benchmark": "G2",
         "te_true": float(te_true),
         "te_per_step": float(te_true) / horizon,
         "true_lag_band": true_lag_band,
+        "true_lag_tt": true_lag_tt,
         "informative_channels": list(range(M)),
         "clean_anchor_range": [delay_hi - 1, T - horizon],
         "rho_u": float(rho_u),
@@ -1815,11 +1888,16 @@ def gen_regime_switch_smooth(
         p_switch, K_classes, horizon
     )
 
+    # Fixed single delay shared by every sample and step -> a flat (n, T)
+    # true-lag trajectory for the lag-attention overlay.
+    true_lag_tt = _true_lag_trajectory(n, T, delays_list=[int(delta)])
+
     meta: Dict[str, Any] = {
         "benchmark": "G3",
         "te_true": float(te_true),
         "te_per_step": float(te_true) / horizon,
         "true_lag_band": list(range(delta - horizon, delta)),
+        "true_lag_tt": true_lag_tt,
         "informative_channels": list(range(M)),
         "informative_source_channels": list(range(M * K_classes)),
         "clean_anchor_range": [delta - 1, T - horizon],

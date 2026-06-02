@@ -1273,13 +1273,16 @@ def plot_sample_lag_attention(
     fhr_ph: Optional[np.ndarray] = None,
     up_st: Optional[np.ndarray] = None,
     up_ph: Optional[np.ndarray] = None,
+    true_lag_tt: Optional[np.ndarray] = None,
+    true_lag_band: Optional[np.ndarray] = None,
+    horizon: int = 30,
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
     fs_raw: float = _DEFAULT_FS_RAW,
     decim: int = _DEFAULT_DECIM,
 ) -> None:
-    """Draw the multi-panel lag-attention diagnostic for one sample.
+    r"""Draw the multi-panel lag-attention diagnostic for one sample.
 
     The figure stacks, top to bottom:
 
@@ -1331,6 +1334,17 @@ def plot_sample_lag_attention(
         label: Outcome class label for the title.
         fs_raw: Raw sampling rate in Hz (default 4.0).
         decim: Decimation factor (default 16).
+        true_lag_tt: Synthetic-data ground-truth source→target lag $d_t$ per
+            time step ``(T,)`` in decimated steps, or ``None`` (real data /
+            legacy caches). When given, the informative lag band
+            $\{\max(0, d_t - H)\dots d_t - 1\}$ is shaded green on the
+            attention / TE-lag heatmaps and its upper edge $d_t - 1$ is drawn
+            as a dashed "true lag" curve, so the model's argmax lag can be
+            checked against the truth at every $t$.
+        true_lag_band: Dataset-level union lag band (sequence of lag indices)
+            or ``None``; shaded on the time-averaged lag-mass bar chart.
+        horizon: Forecast horizon $H$ (decimated steps), used to clamp the
+            informative-band floor to $\max(0, d_t - H)$. Default 30.
     """
     if attn_weights.ndim != 3:
         raise ValueError(
@@ -1391,6 +1405,35 @@ def plot_sample_lag_attention(
         alpha_mass_by_lag = alpha_bar[valid_mask].mean(axis=0)        # (L,)
     else:
         alpha_mass_by_lag = np.zeros(L)
+
+    # --- Ground-truth lag overlay (synthetic data only) ---
+    # The informative band is {max(0, d_t - H) .. d_t - 1} in lag-index space
+    # (matches ``_union_lag_band`` / lag_recovery); converted to minutes it is
+    # shaded under the dashed band-edge curve d_t - 1.
+    true_lag_edge_min: Optional[np.ndarray] = None
+    band_lo_min: Optional[np.ndarray] = None
+    band_hi_min: Optional[np.ndarray] = None
+    if true_lag_tt is not None:
+        d = np.asarray(true_lag_tt, dtype=float).reshape(-1)
+        if d.shape[0] == T:
+            band_lo_min = np.maximum(0.0, d - float(horizon)) * sec_per_dec / 60.0
+            band_hi_min = np.maximum(0.0, d - 1.0) * sec_per_dec / 60.0
+            true_lag_edge_min = band_hi_min
+
+    def _overlay_true_lag(ax: Any, *, fill: bool) -> None:
+        """Draw the true informative lag band / edge on a time×lag panel."""
+        if true_lag_edge_min is None:
+            return
+        if fill:
+            ax.fill_between(
+                time_dec_min, band_lo_min, band_hi_min,
+                color=COLOR_GREEN, alpha=0.13, linewidth=0.0, zorder=1,
+            )
+        ax.plot(
+            time_dec_min, true_lag_edge_min,
+            color=COLOR_GREEN, linewidth=1.0, linestyle="--",
+            alpha=0.95, zorder=4, label="true lag",
+        )
 
     # --- Figure layout ---
     # Two-column GridSpec: column 0 holds every main panel, column 1 is a
@@ -1528,7 +1571,10 @@ def plot_sample_lag_attention(
     ax_attn.set_ylim(0.0, lag_span_min)
     ax_attn.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_attn, warmup_min)
-    # Overlay argmax-lag curve (in minutes).
+    # Overlay the true informative-lag band (synthetic only) under the model's
+    # argmax-lag curve (both in minutes), so "did attention pick the right lag
+    # at each t?" is answered by eye.
+    _overlay_true_lag(ax_attn, fill=True)
     if valid_mask.any():
         ax_attn.plot(
             time_dec_min[valid_mask],
@@ -1538,6 +1584,7 @@ def plot_sample_lag_attention(
             alpha=0.9,
             label="argmax lag",
         )
+    if valid_mask.any() or true_lag_edge_min is not None:
         ax_attn.legend(loc="upper right", fontsize=6, frameon=True)
     row += 1
 
@@ -1565,6 +1612,9 @@ def plot_sample_lag_attention(
     ax_te.set_ylim(0.0, lag_span_min)
     ax_te.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_te, warmup_min)
+    _overlay_true_lag(ax_te, fill=False)
+    if true_lag_edge_min is not None:
+        ax_te.legend(loc="upper right", fontsize=6, frameon=True)
     row += 1
 
     # --- Row ?: TE lag attribution (seismic, linear) ---
@@ -1588,6 +1638,7 @@ def plot_sample_lag_attention(
     ax_te_seis.set_ylim(0.0, lag_span_min)
     ax_te_seis.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_te_seis, warmup_min)
+    _overlay_true_lag(ax_te_seis, fill=False)
     row += 1
 
     # --- Row ?: TE lag attribution (seismic, log) ---
@@ -1617,6 +1668,7 @@ def plot_sample_lag_attention(
     ax_te_log.set_ylim(0.0, lag_span_min)
     ax_te_log.set_xlabel("Time (min)", fontsize=FONT_LABEL)
     _shade_warmup_min(ax_te_log, warmup_min)
+    _overlay_true_lag(ax_te_log, fill=False)
     row += 1
 
     # --- Row ?: Attention analysis — argmax lag + entropy over time ---
@@ -1625,6 +1677,15 @@ def plot_sample_lag_attention(
         time_dec_min, argmax_lag_min_masked,
         color=COLOR_BLUE, linewidth=1.0, label="argmax lag",
     )
+    # Ground-truth lag (synthetic only): the direct per-t comparison against
+    # the model's argmax.
+    if true_lag_edge_min is not None:
+        ax_ana.plot(
+            time_dec_min, true_lag_edge_min,
+            color=COLOR_GREEN, linewidth=1.0, linestyle="--",
+            alpha=0.95, label="true lag",
+        )
+        ax_ana.legend(loc="upper right", fontsize=6, frameon=True)
     ax_ana.set_xlim(0.0, t_max_min)
     ax_ana.set_ylim(0.0, lag_span_min * 1.05)
     ax_ana.set_xlabel("Time (min)", fontsize=FONT_LABEL)
@@ -1659,6 +1720,15 @@ def plot_sample_lag_attention(
         edgecolor=COLOR_BLACK,
         linewidth=0.3,
     )
+    # Shade the dataset-level true informative band (synthetic only) so the
+    # attention mass can be read against where the transfer actually lives.
+    if true_lag_band is not None and len(true_lag_band) > 0:
+        tb = np.asarray(true_lag_band, dtype=float)
+        ax_lag.axvspan(
+            float(tb.min()) * sec_per_dec / 60.0,
+            (float(tb.max()) + 1.0) * sec_per_dec / 60.0,
+            color=COLOR_GREEN, alpha=0.13, linewidth=0.0, label="true band",
+        )
     if alpha_mass_by_lag.size and np.isfinite(alpha_mass_by_lag).any():
         peak_idx = int(np.nanargmax(alpha_mass_by_lag))
         peak_lag = float(lag_centers_min[peak_idx])
@@ -1669,6 +1739,9 @@ def plot_sample_lag_attention(
             linestyle="--",
             label=f"peak={peak_lag:.2f} min",
         )
+    if (true_lag_band is not None and len(true_lag_band) > 0) or (
+        alpha_mass_by_lag.size and np.isfinite(alpha_mass_by_lag).any()
+    ):
         ax_lag.legend(loc="upper right", fontsize=6, frameon=True)
     ax_lag.set_xlim(0.0, lag_span_min)
     ax_lag.set_xlabel("Lag (min)", fontsize=FONT_LABEL)
