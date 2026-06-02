@@ -390,6 +390,17 @@ def _write_split(
     c_u_ph = split_channels["c_u_ph"]
     T = int(gen_kwargs["T"])
 
+    # Per-sample, per-step ground-truth lag d_{i,t} (n, T). Pulled out of
+    # ``meta`` (it is a large, non-JSON array) and written into this split's
+    # ``.npz`` aligned to its samples. ``None`` for zero-TE controls; absent
+    # from legacy generators -> the lag-attention overlay simply isn't drawn.
+    true_lag_tt = meta.pop("true_lag_tt", None)
+    extra_arrays: Dict[str, Any] = {}
+    if true_lag_tt is not None:
+        extra_arrays["true_lag_tt"] = np.ascontiguousarray(
+            np.asarray(true_lag_tt, dtype=np.int16)
+        )
+
     np.savez(
         out_dir / f"{split}.npz",
         fhr_st=np.ascontiguousarray(Y_np[..., :c_y_st]),
@@ -397,6 +408,7 @@ def _write_split(
         up_st=np.ascontiguousarray(U_np[..., :c_u_st]),
         up_ph=np.ascontiguousarray(U_np[..., c_u_st : c_u_st + c_u_ph]),
         weight=np.ones((n, T), dtype=np.float32),
+        **extra_arrays,
     )
     print(f"  [{split:5s}] n={n:6d}  seed={seed}  ->  {split}.npz")
     return meta

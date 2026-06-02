@@ -841,7 +841,10 @@ def _setting_tags_knob(
     return data_tag, run_tag
 
 
-def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+def enumerate_sweep(
+    config: Dict[str, Any],
+    dropped_out: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     r"""Enumerate the active v2 benchmark's sweep grid with analytic TE.
 
     Dispatches on ``config["sweep"]["kind"]``:
@@ -862,9 +865,23 @@ def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     ``target_te_grid`` the per-channel target is therefore the cell target
     divided by $M$.
 
+    For G1 (``gaussian_state_space``) the coupling is solved by bisecting a
+    **Monte-Carlo** TE estimator, which has an upward finite-sample bias floor
+    $F$. At high $M$ + low ``target_te`` the per-channel target $t/M$ can fall
+    at or below $F$, where the bisection bracket check fails. Such cells are
+    **trimmed** (not solved): a cell is kept only when $t/M > F\cdot\text{margin}$
+    (``sweep.te_floor_margin``, default $1.5$); $F$ is probed once per benchmark
+    at the solver's lower bracket $B_y = 10^{-4}$. Any residual solver failure
+    is also caught and trimmed rather than raised. G2 (``arx``) uses a
+    closed-form TE with no MC floor, so no cell is trimmed there.
+
     Args:
         config: The parsed (benchmark-resolved) config -- reads ``sweep``,
             ``data`` and ``model.horizon``.
+        dropped_out: Optional list; when provided, every trimmed cell is
+            appended as a dict with ``kind``, ``M``, ``target_te``,
+            ``per_channel_target``, ``floor`` and ``reason``. Default ``None``
+            keeps the call source-compatible with existing callers.
 
     Returns:
         A list of setting dicts, each carrying ``kind``, ``M``, ``te_true``,
@@ -905,15 +922,58 @@ def enumerate_sweep(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "(delay_min/delay_max) in the data block."
                 )
             dmin, dmax = int(data["delay_min"]), int(data["delay_max"])
+            # Per-channel MC bias floor of the state-space TE estimator. The
+            # coupling solver bisects this Monte-Carlo estimator, so a cell
+            # whose per-channel target (= t_target / M) lands at or below the
+            # floor makes the bracket check fail in
+            # ``analytic_te._bisect_for_te_target``. The floor is
+            # M-independent (solving always uses the single oscillator spec),
+            # so probe it once at the solver's lower bracket B_y = 1e-4 and
+            # trim every unreachable (M, target_te) cell.
+            floor_margin = float(sweep.get("te_floor_margin", 1.5))
+            te_floor = float(mean_te_block_state_space_over_delays(
+                delay_min=dmin, delay_max=dmax,
+                oscillators=oscillators, target_ar=target_ar,
+                B_y=1e-4, sigma2_y=sigma2_y, sigma2_eta=sigma2_eta,
+                H=horizon, K_history=K_history, n_samples=te_n_samples,
+            ))
+            min_per_channel = te_floor * floor_margin
+
+            def _drop(m: int, t_target: float, per_channel: float,
+                      reason: str) -> None:
+                """Record (and log) a G1 cell trimmed below the MC floor."""
+                if dropped_out is not None:
+                    dropped_out.append({
+                        "kind": "gaussian_state_space", "M": int(m),
+                        "target_te": float(t_target),
+                        "per_channel_target": per_channel,
+                        "floor": te_floor, "reason": reason,
+                    })
+                print(
+                    f"[sweep] drop G1 cell M={m} target_te={t_target:g} "
+                    f"(per-channel {per_channel:.4g}): {reason}"
+                )
+
             for m in sweep.get("m_grid", []):
                 for t_target in target_te_grid:
-                    sol = B_y_for_mean_te_block_state_space(
-                        target_te_block=float(t_target) / int(m),
-                        delay_min=dmin, delay_max=dmax,
-                        oscillators=oscillators, target_ar=target_ar,
-                        sigma2_y=sigma2_y, sigma2_eta=sigma2_eta,
-                        H=horizon, K_history=K_history, n_samples=te_n_samples,
-                    )
+                    per_channel = float(t_target) / int(m)
+                    if per_channel <= min_per_channel:
+                        _drop(m, t_target, per_channel,
+                              f"below MC floor*margin {min_per_channel:.4g}")
+                        continue
+                    try:
+                        sol = B_y_for_mean_te_block_state_space(
+                            target_te_block=per_channel,
+                            delay_min=dmin, delay_max=dmax,
+                            oscillators=oscillators, target_ar=target_ar,
+                            sigma2_y=sigma2_y, sigma2_eta=sigma2_eta,
+                            H=horizon, K_history=K_history,
+                            n_samples=te_n_samples,
+                        )
+                    except ValueError as exc:  # bracket miss near the floor
+                        _drop(m, t_target, per_channel,
+                              f"solver bracket failed: {exc}")
+                        continue
                     te = float(sol["te_block"]) * int(m)
                     settings.append({
                         "kind": "gaussian_state_space",
@@ -1514,7 +1574,9 @@ def run_sweep(
         device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
 
     Returns:
-        A results dict: ``rows``, ``metrics``, ``out_dir``, ``skipped``.
+        A results dict: ``rows``, ``metrics``, ``out_dir``, ``skipped`` and
+        ``dropped`` (G1 cells trimmed below the MC floor; also stored under
+        ``metrics["dropped_cells"]`` and written to ``metrics.json``).
     """
     benchmark = str(config["experiment"]["benchmark"])
     device = device or tm.resolve_device(config["runtime"])
@@ -1522,11 +1584,21 @@ def run_sweep(
     data_root = _data_root(config)
     results_root = _results_root(config)
 
-    settings = enumerate_sweep(config)
+    dropped: List[Dict[str, Any]] = []
+    settings = enumerate_sweep(config, dropped_out=dropped)
     print(
         f"[sweep] benchmark {benchmark}: {len(settings)} sweep setting(s)  "
         f"build_missing={build_missing}  train_missing={train_missing}"
     )
+    if dropped:
+        n_total = len(settings) + len(dropped)
+        cells = ", ".join(
+            f"(M={d['M']}, target_te={d['target_te']:g})" for d in dropped
+        )
+        print(
+            f"[sweep] trimmed {len(dropped)}/{n_total} unreachable cell(s) "
+            f"below the MC floor: {cells}"
+        )
 
     rows: List[Dict[str, Any]] = []
     skipped: List[str] = []
@@ -1599,6 +1671,7 @@ def run_sweep(
 
     metrics = _aggregate_metrics(rows)
     metrics["n_skipped"] = len(skipped)
+    metrics["dropped_cells"] = dropped
     write_summary_csv(rows, out_dir / "summary.csv")
     write_metrics_json(metrics, rows, out_dir / "metrics.json")
     if len(rows) >= 2:
@@ -1625,6 +1698,7 @@ def run_sweep(
         "metrics": metrics,
         "out_dir": str(out_dir),
         "skipped": skipped,
+        "dropped": dropped,
     }
 
 

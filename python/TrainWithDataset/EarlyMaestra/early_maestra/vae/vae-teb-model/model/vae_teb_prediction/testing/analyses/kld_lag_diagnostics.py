@@ -197,6 +197,16 @@ def run_kld_lag_diagnostics(
             if hasattr(batch, "up_ph") and isinstance(batch.up_ph, torch.Tensor):
                 up_ph_np = batch.up_ph.detach().cpu().numpy()
 
+            # Synthetic-data ground truth for the lag-attention overlay: the
+            # per-step true lag d_{i,t} (B, T) and the dataset-level informative
+            # band. Both are absent for real (HDF5) batches -> overlay skipped.
+            true_lag_tt_np = None
+            if hasattr(batch, "true_lag_tt") and isinstance(batch.true_lag_tt, torch.Tensor):
+                true_lag_tt_np = batch.true_lag_tt.detach().cpu().numpy()
+            true_lag_band_np = None
+            if hasattr(batch, "true_lag_band") and isinstance(batch.true_lag_band, torch.Tensor):
+                true_lag_band_np = batch.true_lag_band.detach().cpu().numpy()
+
             # Raw fhr / up traces: invert the z-score normalisation the
             # dataloader applied so the plots show physiological units.
             fhr_np = None
@@ -318,6 +328,12 @@ def run_kld_lag_diagnostics(
                         fhr_ph=fhr_ph_np[idx] if fhr_ph_np is not None else None,
                         up_st=up_st_np[idx] if up_st_np is not None else None,
                         up_ph=up_ph_np[idx] if up_ph_np is not None else None,
+                        true_lag_tt=(
+                            true_lag_tt_np[idx] if true_lag_tt_np is not None else None
+                        ),
+                        true_lag_band=(
+                            true_lag_band_np[idx] if true_lag_band_np is not None else None
+                        ),
                         guid=guid,
                         epoch=epoch,
                         label=label,

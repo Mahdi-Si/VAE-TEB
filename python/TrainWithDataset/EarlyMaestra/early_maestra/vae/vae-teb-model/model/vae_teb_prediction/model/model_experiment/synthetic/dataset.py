@@ -164,6 +164,14 @@ class SyntheticTEDataset(Dataset):
             self._arrays = {
                 f: np.asarray(npz[f], dtype=np.float32) for f in _FIELDS
             }
+            # Optional per-sample, per-step ground-truth lag $d_{i,t}$ of shape
+            # $(n, T)$, written by ``build_dataset`` for the synthetic
+            # benchmarks. Absent from legacy caches and from real (HDF5) data,
+            # in which case the lag-attention overlay is simply skipped.
+            self._true_lag_tt: Optional[np.ndarray] = (
+                np.asarray(npz["true_lag_tt"]) if "true_lag_tt" in npz.files
+                else None
+            )
         self._n = int(self._arrays["fhr_st"].shape[0])
 
     def __len__(self) -> int:
@@ -179,7 +187,9 @@ class SyntheticTEDataset(Dataset):
             An :class:`AttributeDict` with the five native tensor fields
             (``fhr_st``, ``fhr_ph``, ``up_st``, ``up_ph``, ``weight``) plus the
             per-sample metadata ``te_true`` (float), ``true_lag_band``
-            (``long`` tensor) and ``guid`` (str).
+            (``long`` tensor) and ``guid`` (str). When the cache carries the
+            per-step ground-truth lag, ``true_lag_tt`` (``long`` tensor of shape
+            $(T,)$) is also attached for the lag-attention overlay.
         """
         sample = AttributeDict()
         for field in _FIELDS:
@@ -189,6 +199,10 @@ class SyntheticTEDataset(Dataset):
             sample[field] = torch.from_numpy(arr)
         sample["te_true"] = self.te_true
         sample["true_lag_band"] = self._lag_band_tensor
+        if self._true_lag_tt is not None:
+            sample["true_lag_tt"] = torch.from_numpy(
+                self._true_lag_tt[idx].astype(np.int64)
+            )                                                    # (T,) long
         sample["guid"] = f"{self._tag}_{self.split}_{idx:06d}"
         return sample
 
@@ -273,6 +287,14 @@ if __name__ == "__main__":
     )
     with tempfile.TemporaryDirectory() as _tmp:
         _dir = Path(_tmp)
+        # The generator stamps the per-step true lag into meta as a numpy
+        # array; ``build_dataset`` pops it into the ``.npz``. Mirror that here
+        # so the self-check exercises the ``true_lag_tt`` round-trip and keeps
+        # ``meta.json`` JSON-serialisable.
+        _true_lag_tt = _meta.pop("true_lag_tt", None)
+        _extra: Dict[str, Any] = {}
+        if _true_lag_tt is not None:
+            _extra["true_lag_tt"] = np.asarray(_true_lag_tt, dtype=np.int16)
         np.savez(
             _dir / "train.npz",
             fhr_st=_Y[..., :43].numpy(),
@@ -280,6 +302,7 @@ if __name__ == "__main__":
             up_st=_U[..., :43].numpy(),
             up_ph=_U[..., 43:101].numpy(),
             weight=np.ones((6, _T), dtype=np.float32),
+            **_extra,
         )
         _meta_out = dict(_meta)
         _meta_out["tag"] = "smoke"
@@ -294,6 +317,8 @@ if __name__ == "__main__":
         assert _s.up_st.shape == (_T, 43), _s.up_st.shape
         assert _s.up_ph.shape == (_T, 58), _s.up_ph.shape
         assert _s.weight.shape == (_T,), _s.weight.shape
+        if _true_lag_tt is not None:
+            assert _s.true_lag_tt.shape == (_T,), _s.true_lag_tt.shape
         print(f"[sample] guid={_s.guid}  te_true={_s.te_true:.4f}")
 
         _loader = make_dataloader(_ds, batch_size=3, shuffle=False)
