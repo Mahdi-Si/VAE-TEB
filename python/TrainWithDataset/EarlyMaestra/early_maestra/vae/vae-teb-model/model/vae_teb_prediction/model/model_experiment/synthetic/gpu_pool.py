@@ -37,6 +37,7 @@ is present.
 
         python -m ...synthetic.gpu_pool --mode a_sweep --gpus 0,1,2,3,4,5,6
         python -m ...synthetic.gpu_pool --mode beta   --gpus 0,1,2,3,4,5,6
+        python -m ...synthetic.gpu_pool --mode beta_grid --gpus 0,1,2,3,4,5,6
         python -m ...synthetic.gpu_pool --mode hp --axis lambda_base --gpus 0,1
         python -m ...synthetic.gpu_pool --mode directionality --gpus 0,1
         python -m ...synthetic.gpu_pool --mode calibration --benchmark G1 `
@@ -100,7 +101,9 @@ _MODULE = "model.vae_teb_prediction.model.model_experiment.synthetic.gpu_pool"
 # Seconds between poll sweeps of the running-worker set.
 _POLL_SECONDS = 5.0
 
-_VALID_MODES = ("a_sweep", "beta", "hp", "directionality", "calibration")
+_VALID_MODES = (
+    "a_sweep", "beta", "beta_grid", "hp", "directionality", "calibration",
+)
 
 # Per-cell summary CSV columns (one row per training cell).
 _SUMMARY_FIELDS = [
@@ -216,6 +219,63 @@ def _cells_beta(config: Dict[str, Any], build: bool) -> List[TrainCell]:
         cells.append(
             TrainCell(benchmark, data_tag, run_tag, f"beta={value:g}", patches)
         )
+    return cells
+
+
+def _cells_beta_grid(config: Dict[str, Any], build: bool) -> List[TrainCell]:
+    r"""Enumerate the $\beta \times M \times \mathrm{TE}$ grid training cells.
+
+    A merge of :func:`_cells_a_sweep` (the $(M, \mathrm{TE})$ datasets, solved
+    coupling per cell) and :func:`_cells_beta` (the $\beta$ patch). The cell
+    datasets are $\beta$-independent and identical to the A-sweep caches, so
+    each is built once and reused across every $\beta$; run-tags are
+    $\beta$-namespaced (``beta_grid/<base>/b<token>``) to match
+    :func:`beta_sweep.run_beta_grid`. The $(M, \mathrm{TE})$ grid honours the
+    optional ``beta_sweep.beta_grid`` narrowing via
+    :func:`beta_sweep._enumerate_beta_grid_settings`.
+
+    Args:
+        config: The parsed, benchmark-resolved config.
+        build: If True, generate each $(M, \mathrm{TE})$ dataset (idempotent).
+
+    Returns:
+        One :class:`TrainCell` per (setting, :math:`\beta`) pair --
+        ``len(settings) * len(beta_sweep.grid)`` cells in total.
+
+    Raises:
+        ValueError: If ``beta_sweep.grid`` is empty.
+    """
+    benchmark = str(config["experiment"]["benchmark"])
+    bsconf = config.get("beta_sweep", {}) or {}
+    beta_grid = [float(v) for v in (bsconf.get("grid") or [])]
+    if not beta_grid:
+        raise ValueError("beta_grid mode needs a populated beta_sweep.grid")
+    epochs = bsconf.get("epochs")
+
+    cells: List[TrainCell] = []
+    for setting in bs._enumerate_beta_grid_settings(config):
+        m = int(setting["M"])
+        try:
+            knob_token, knob_field, value = bs._knob_for_setting(setting)
+        except ValueError:
+            print(f"[warn] _cells_beta_grid: unknown sweep kind; skipping M={m}")
+            continue
+        data_tag, base_run_tag = ev._setting_tags_knob(
+            benchmark, knob_token, value, m
+        )
+        if build:
+            bs._ensure_dataset_for_setting(
+                config, str(setting["kind"]), data_tag, value, m
+            )
+        for beta in beta_grid:
+            run_tag = f"beta_grid/{base_run_tag}/b{bs._fmt_token(beta)}"
+            patches: Dict[str, Any] = {"loss.kld_beta": beta}
+            if epochs is not None:
+                patches["optim.epochs"] = int(epochs)
+            cells.append(TrainCell(
+                benchmark, data_tag, run_tag,
+                f"{knob_field}={value:g} M={m} beta={beta:g}", patches,
+            ))
     return cells
 
 
@@ -432,6 +492,7 @@ def _cells_calibration(
 _ENUMERATORS = {
     "a_sweep": lambda cfg, build, axis: _cells_a_sweep(cfg, build),
     "beta": lambda cfg, build, axis: _cells_beta(cfg, build),
+    "beta_grid": lambda cfg, build, axis: _cells_beta_grid(cfg, build),
     "hp": lambda cfg, build, axis: _cells_hp(cfg, axis, build),
     "directionality": lambda cfg, build, axis: _cells_directionality(cfg, build),
     "calibration": lambda cfg, build, axis: _cells_calibration(cfg, build),
@@ -941,7 +1002,8 @@ if __name__ == "__main__":
     CONFIG_PATH = _DEFAULT_CONFIG
 
     RUN_CONFIG = {
-        "mode": "a_sweep",         # a_sweep | beta | hp | directionality
+        "mode": "a_sweep",         # a_sweep | beta | beta_grid | hp |
+                                   #   directionality | calibration
         "axis": "lambda_base",     # hp mode: lambda_base | d_z | warmup_period
         "gpus": None,              # e.g. [0,1,2,3,4,5,6]; None -> runtime.gpus
         "benchmark": None,         # None -> config experiment.benchmark

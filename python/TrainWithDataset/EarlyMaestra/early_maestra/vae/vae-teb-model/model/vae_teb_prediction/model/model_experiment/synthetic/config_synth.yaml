@@ -113,9 +113,9 @@ benchmarks:
       standardize: true
       reverse_roles: false
       te_n_samples: 20000           # MC sample size per distinct delay for meta.te_true
-      n_train: 8000
-      n_val: 1000
-      n_test: 2000
+      n_train: 20000
+      n_val: 3000
+      n_test: 3000
       c_y_st: 43                    # native channel layout (V2-D1)
       c_y_ph: 44
       c_u_st: 43
@@ -359,7 +359,7 @@ optim:
                                # 128 (and set model.attention_grad_checkpoint:
                                # false for the ~10-15% speedup it buys).
   grad_clip_norm: 0.5
-  lr_milestones: [60, 85]
+  lr_milestones: [10, 50]
   lr_gamma: 0.1
 
 # --- training-curve plotting (train_minimal.py) ------------------------------
@@ -378,10 +378,22 @@ plotting:
 # `hp_probes` axes. v2-G1 is the primary benchmark; the fixed_setting matches
 # the active sweep knob (B_y for G1, c for G2, p_switch for G3).
 beta_sweep:
-  grid: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
+  grid: [1e-8, 1e-7, 1e-6, 3e-6, 1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
   fixed_setting:
     B_y: 0.007157              # mid-regime for the G1 lag walk (block TE ~1 nat @M=16)
     M: 16
+  # beta_grid mode (beta_sweep.py --mode beta_grid; gpu_pool.py --mode beta_grid)
+  # crosses `grid` (beta) with the active benchmark's full (M x TE) sweep grid,
+  # so K_bar-vs-beta can be read as one coloured line per M (faceted by TE) and
+  # per TE (faceted by M), plus a per-beta calibration slice. The cell datasets
+  # are the A-sweep (knob x M) caches, reused across every beta -- so this is
+  # len(sweep.m_grid) x len(sweep.target_te_grid) x len(grid) training runs
+  # (G1 default: 6 x 5 x 9 = 270). Narrow the grid here WITHOUT editing the
+  # benchmark `sweep` block: null -> use the active benchmark's sweep.m_grid /
+  # sweep.target_te_grid; an explicit list overrides just that axis.
+  beta_grid:
+    m_grid: [8, 16, 32]               # e.g. [1, 4, 16, 64] to shrink the channel axis
+    target_te_grid: [0.7, 1.5, 3]       # e.g. [0.1, 0.7, 3.0] to shrink the TE axis
   data_tag: G1_baseline        # cached dataset the beta/HP sweep trains on
                                # (fixed B_y/M; must match fixed_setting + G1 data)
   epochs: null                 # null -> optim.epochs; lower it for a fast sweep
