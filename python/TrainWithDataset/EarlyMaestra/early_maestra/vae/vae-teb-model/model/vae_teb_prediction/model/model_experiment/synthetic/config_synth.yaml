@@ -98,12 +98,16 @@ benchmarks:
       sequence_length: 300
       oscillators: [[0.99, 0.05]]   # [(r, omega)] -- period ~125 steps (low-freq)
       target_ar: 0.95
-      delay_min: 1                  # variable per-sample lag in {1..15} steps
+      delay_min: 1                  # within-signal lag walk in {1..15} steps
       delay_max: 15                 # ~1 min; ell* = {0, ..., 14}
-      B_y: [0.02]                   # coupling -> mean block TE ~1.3 nats @M=4
+      delay_walk: true              # lag drifts within each signal as a slow
+                                    # reflecting random walk (realistic CTG regime)
+      delay_walk_step_prob: 0.02    # +-1 move prob/step (mean hold ~50 steps >> H)
+      B_y: [0.007157]               # coupling -> mean block TE ~1 nat @M=16
+                                    # (re-solved via B_y_for_mean_te_block_state_space)
       sigma2_y: 1.0
       sigma2_eta: 0.01
-      M: 4                          # informative target/source channels
+      M: 16                         # informative target/source channels (default)
       K_history: 160                # generous history for the near-unit-root source
       easy_variant: false           # true -> tile spec to fill all c_y channels
       standardize: true
@@ -121,7 +125,7 @@ benchmarks:
     sweep:
       kind: gaussian_state_space    # target_te_grid x m_grid, coupling solved per target
       target_te_grid: [0.1, 0.3, 0.7, 1.5, 3.0]   # mean block TE (nats), real-data band
-      m_grid: [1, 4, 8]
+      m_grid: [1, 4, 8, 16, 32, 64]
       te_n_samples: 12000           # smaller MC budget per cell during enumeration
       K_history: 160
 
@@ -133,12 +137,14 @@ benchmarks:
       sequence_length: 300
       oscillators: [[0.99, 0.05]]
       target_ar: 0.95
-      delay_min: 1                  # variable lag (matches G1); irrelevant to a
+      delay_min: 1                  # lag walk (matches G1); irrelevant to a
       delay_max: 15                 # zero-TE control but keeps the DGP identical
-      B_y: [0.02]
+      delay_walk: true
+      delay_walk_step_prob: 0.02
+      B_y: [0.007157]
       sigma2_y: 1.0
       sigma2_eta: 0.01
-      M: 4
+      M: 16
       K_history: 160
       easy_variant: false
       standardize: true
@@ -198,12 +204,15 @@ benchmarks:
       sequence_length: 300
       rho_u: 0.99
       rho_y: 0.95
-      c: 0.035                      # ARX coupling -> mean block TE ~1 nat @M=4
+      c: 0.011315                   # ARX coupling -> mean block TE ~1 nat @M=16
+                                    # (re-solved via c_for_mean_te_block_arx)
       sigma2_eta: 1.0
       sigma2_eps: 1.0
-      delay_min: 1                  # variable per-sample lag in {1..15} steps
+      delay_min: 1                  # within-signal lag walk in {1..15} steps
       delay_max: 15                 # ell* = {0, ..., 14}
-      M: 4
+      delay_walk: true              # lag drifts within each signal (realistic CTG)
+      delay_walk_step_prob: 0.02
+      M: 16
       K_history: 160
       burn_in: null                 # null -> auto-pick max(200, 5/(1-max(rho_u, rho_y)))
       easy_variant: false
@@ -221,7 +230,7 @@ benchmarks:
     sweep:
       kind: arx                     # target_te_grid x m_grid, coupling solved per target
       target_te_grid: [0.1, 0.3, 0.7, 1.5, 3.0]   # mean block TE (nats), real-data band
-      m_grid: [1, 4, 8]
+      m_grid: [1, 4, 8, 16, 32, 64]
 
   # G2 null control: delay D much larger than model.max_lag + model.horizon,
   # so the model's lag-attention window cannot reach the true source-to-target
@@ -236,6 +245,7 @@ benchmarks:
       <<: *g2_data
       delay_min: 200                # >> model.max_lag + model.horizon: the
       delay_max: 200                # attention window cannot reach the true lag
+      delay_walk: false             # fixed far lag (control); no within-signal walk
 
   # G2 null control: zero coupling => source and target are independent
   # (true TE = 0 by construction). Any well-behaved surrogate must collapse
@@ -244,6 +254,7 @@ benchmarks:
     data:
       <<: *g2_data
       c: 0.0                        # zero coupling -> true TE = 0
+      delay_walk: false             # fixed-lag control; walk is irrelevant at c=0
 
   # Benchmark G3 -- slow categorical regime-switch with smooth oscillator
   # target. Per-channel inclusive-redraw Markov chain over K classes drives
@@ -369,10 +380,10 @@ plotting:
 beta_sweep:
   grid: [1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
   fixed_setting:
-    B_y: 0.02                  # mid-regime for G1 variable-lag (block TE ~1.3 nats)
-    M: 4
+    B_y: 0.007157              # mid-regime for the G1 lag walk (block TE ~1 nat @M=16)
+    M: 16
   data_tag: G1_baseline        # cached dataset the beta/HP sweep trains on
-                               # (fixed B_y/M; must match fixed_setting)
+                               # (fixed B_y/M; must match fixed_setting + G1 data)
   epochs: null                 # null -> optim.epochs; lower it for a fast sweep
   selected_beta: null          # set after the rate-distortion analysis (Sprint 5);
                                # consumed by Sprint-5 calibration runs

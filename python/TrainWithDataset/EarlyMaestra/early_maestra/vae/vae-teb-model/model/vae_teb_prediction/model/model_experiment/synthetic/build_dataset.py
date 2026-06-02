@@ -280,11 +280,16 @@ def _build_gen_kwargs(
             "te_n_samples": int(data.get("te_n_samples", 50_000)),
             "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
-        # Delay mode: variable per-sample (`delay_min`/`delay_max`) XOR fixed
-        # per-channel (`delays`, used by the multi-band variant).
+        # Delay mode: variable (`delay_min`/`delay_max`) XOR fixed per-channel
+        # (`delays`, used by the multi-band variant). In variable mode the lag
+        # drifts within each signal as a random walk when `delay_walk` is set.
         if data.get("delay_min") is not None or data.get("delay_max") is not None:
             kwargs["delay_min"] = int(data["delay_min"])
             kwargs["delay_max"] = int(data["delay_max"])
+            kwargs["delay_walk"] = bool(data.get("delay_walk", False))
+            kwargs["delay_walk_step_prob"] = float(
+                data.get("delay_walk_step_prob", 0.02)
+            )
         else:
             kwargs["delays"] = _tile([int(d) for d in data["delays"]], "delays")
         return kwargs
@@ -312,11 +317,16 @@ def _build_gen_kwargs(
             "reverse_roles": bool(data.get("reverse_roles", False)),
             "channel_decomp": _resolve_channel_decomp(data, c_y, c_u, benchmark),
         }
-        # Variable per-sample delay (`delay_min`/`delay_max`) XOR fixed scalar
-        # (`delay`).
+        # Variable delay (`delay_min`/`delay_max`) XOR fixed scalar (`delay`).
+        # In variable mode the lag drifts within each signal as a random walk
+        # when `delay_walk` is set (the G2 controls override it to false).
         if data.get("delay_min") is not None or data.get("delay_max") is not None:
             kwargs["delay_min"] = int(data["delay_min"])
             kwargs["delay_max"] = int(data["delay_max"])
+            kwargs["delay_walk"] = bool(data.get("delay_walk", False))
+            kwargs["delay_walk_step_prob"] = float(
+                data.get("delay_walk_step_prob", 0.02)
+            )
         else:
             kwargs["delay"] = int(data["delay"])
         return kwargs

@@ -104,7 +104,7 @@ _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
 # whichever the active benchmark does not use is left blank.
 _SUMMARY_FIELDS = [
     "run_tag", "data_tag", "benchmark", "B_y", "c", "p_switch", "M",
-    "delay_min", "delay_max", "target_te",
+    "delay_min", "delay_max", "delay_walk", "target_te",
     "te_true", "te_per_step",
     # Null-control surrogates: ``k_bar_shuffled`` permutes $U$ along the batch
     # axis, ``k_bar_reversed`` flips $U$ along $T$. Both are computed in
@@ -605,6 +605,7 @@ def evaluate_checkpoint(
         "M": data_meta.get("M", test_meta.get("M")),
         "delay_min": data_meta.get("delay_min", test_meta.get("delay_min")),
         "delay_max": data_meta.get("delay_max", test_meta.get("delay_max")),
+        "delay_walk": data_meta.get("delay_walk", test_meta.get("delay_walk")),
         "te_true": te_true,
         "te_per_step": te_per_step,
         "k_bar": float(k_bar),
