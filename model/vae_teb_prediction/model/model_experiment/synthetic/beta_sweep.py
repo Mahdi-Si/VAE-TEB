@@ -578,9 +578,16 @@ def _make_sweep_plots(
         return
 
     # --- HP axis: K_bar vs value, pred_gap vs value -------------------------
+    # Descriptive x-axis label per HP knob (falls back to the raw key).
+    _hp_xlabel = {
+        "lambda_base": r"residual weight $\lambda_{\rm base}$",
+        "d_z": r"latent dim $d_z$",
+        "warmup_period": "warm-up period (steps)",
+    }.get(axis, axis)
+
     fig, ax = plt.subplots(figsize=(6.4, 5.0))
     ax.plot(value, kbar, marker="o", color=ps.COLOR_BLUE)
-    ax.set_xlabel(axis)
+    ax.set_xlabel(_hp_xlabel)
     ax.set_ylabel(r"$\bar K$ (nats)")
     ax.set_title(fr"$\bar K$ vs {axis}")
     ps.style_axes(ax)
@@ -590,7 +597,7 @@ def _make_sweep_plots(
     fig, ax = plt.subplots(figsize=(6.4, 5.0))
     ax.axhline(0.0, color=ps.COLOR_GRAY, ls="--", lw=0.9)
     ax.plot(value, pred_gap, marker="o", color=ps.COLOR_BLUE)
-    ax.set_xlabel(axis)
+    ax.set_xlabel(_hp_xlabel)
     ax.set_ylabel(r"pred_gap $= \mathcal{L}_{\rm base}-\mathcal{L}_{\rm feat}$")
     ax.set_title(fr"predictive gain vs {axis}")
     ps.style_axes(ax)
@@ -1228,7 +1235,11 @@ def _beta_grid_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _make_beta_grid_plots(
     rows: List[Dict[str, Any]], out_dir: Path
 ) -> None:
-    r"""Render the three multi-line $\beta$-grid figures.
+    r"""Render the four multi-line $\beta$-grid figures.
+
+    Every panel is fully labelled (each carries its own $x$/$y$ label and tick
+    numbers via :func:`_label_all_panels`), so no panel relies on a neighbour
+    for context.
 
     * ``kbar_vs_beta__byTE.{pdf,png}`` -- one panel per target-TE level; within
       a panel $\bar K$ vs $\beta$ (log-x) with one coloured line per $M$ and a
@@ -1239,6 +1250,11 @@ def _make_beta_grid_plots(
       realised ``te_true`` scattered and coloured by $M$ (the per-$\beta$
       calibration slice). No identity line is drawn: under the default ``mse``
       likelihood $\bar K$ is scale-free, so only the monotone trend is meaningful.
+    * ``predgap_vs_kbar__byTE.{pdf,png}`` -- one panel per target-TE level; one
+      line per $M$ traces the $(\bar K,\ \mathrm{pred\_gap})$ path as $\beta$
+      increases (arrow = increasing $\beta$), with a dashed $\mathrm{pred\_gap}=0$
+      reference. Points above $0$ mean the source/residual branch improved the
+      forecast, so this reads whether latent KLD translates into prediction gain.
 
     Args:
         rows: Per-cell rows (>= 2) from :func:`run_beta_grid`.
@@ -1268,6 +1284,11 @@ def _make_beta_grid_plots(
     te_true = np.array([float(r["te_true"]) for r in rows], dtype=float)
     m_vals = np.array([int(r["M"]) for r in rows], dtype=int)
     te_keys = np.array([_te_key(r) for r in rows], dtype=float)
+    pred_gap = np.array(
+        [float(r["pred_gap"]) if r.get("pred_gap") is not None else np.nan
+         for r in rows],
+        dtype=float,
+    )
 
     m_levels = sorted(set(m_vals.tolist()))
     te_levels = sorted(set(te_keys.tolist()))
@@ -1292,29 +1313,34 @@ def _make_beta_grid_plots(
             flat[j].axis("off")
         return fig, flat, ncols
 
-    def _dedupe_axis_labels(flat, n, ncols, xlabel, ylabel):
-        """Keep the $x$ label only on each column's lowest panel, $y$ on column 0.
+    def _label_all_panels(flat, n, xlabel, ylabel):
+        """Label every used panel and force its $x$/$y$ tick numbers back on.
 
-        Ragged-grid safe (a partly-filled last row): a panel is the lowest in
-        its column iff no used panel sits ``ncols`` slots later. ``sharex`` hides
-        x tick numbers on non-bottom *rows*, which would also strip them from a
-        column's lowest panel when the slot below is an (empty) spare -- so tick
-        numbers are forced back on there. Per-panel $y$ tick numbers are left as
-        ``sharey`` set them (off-grid panels may differ in scale).
+        ``_new_grid`` sets ``sharex=True`` (and optionally ``sharey``), which
+        blanks the tick numbers on inner panels and lets matplotlib drop their
+        axis labels. For the synthetic-TE figures every panel must
+        self-describe, so this writes the $x$ and $y$ label onto *every* used
+        panel and re-enables ``labelbottom`` / ``labelleft`` so the tick numbers
+        show on all of them. Spare (switched-off) axes past ``n`` are untouched.
+
+        Args:
+            flat: The flat axes array from :func:`_new_grid`.
+            n: Number of *used* panels (the leading ``flat[:n]``).
+            xlabel: Common $x$-axis label (LaTeX allowed).
+            ylabel: Common $y$-axis label (LaTeX allowed).
         """
-        for i, ax in enumerate(flat[:n]):
-            is_col_bottom = i + ncols >= n
-            ax.set_xlabel(xlabel if is_col_bottom else "")
-            ax.set_ylabel(ylabel if i % ncols == 0 else "")
-            if is_col_bottom:
-                ax.tick_params(axis="x", labelbottom=True)
+        for ax in flat[:n]:
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.tick_params(axis="x", labelbottom=True)
+            ax.tick_params(axis="y", labelleft=True)
 
     def _facet_kbar_vs_beta(
         fname, *, panel_vals, panel_levels, panel_title, series_vals,
         series_levels, series_label, suptitle, draw_ref,
     ):
         """K_bar-vs-beta faceted by ``panel_vals``, one line per ``series_vals``."""
-        fig, flat, ncols = _new_grid(len(panel_levels), sharey=False)
+        fig, flat, _ = _new_grid(len(panel_levels), sharey=False)
         for pi, pv in enumerate(panel_levels):
             ax = flat[pi]
             pmask = panel_vals == pv
@@ -1332,8 +1358,8 @@ def _make_beta_grid_plots(
             ax.set_xscale("log")
             ax.set_title(panel_title(pv))
             ps.style_axes(ax)
-        _dedupe_axis_labels(
-            flat, len(panel_levels), ncols,
+        _label_all_panels(
+            flat, len(panel_levels),
             r"bottleneck coefficient $\beta$", r"$\bar K$ (nats)",
         )
         handles = [
@@ -1372,7 +1398,7 @@ def _make_beta_grid_plots(
     # --- Figure 3: calibration -- K_bar vs realised TE, panel per beta ----
     # x (true TE) and y (K_bar) share scales across beta panels, so sharey=True
     # makes the per-beta calibration directly comparable.
-    fig, flat, ncols = _new_grid(len(beta_levels), sharey=True)
+    fig, flat, _ = _new_grid(len(beta_levels), sharey=True)
     m_handles = [
         Line2D([0], [0], color=_color(i), marker="o", linestyle="none", label=f"M={m}")
         for i, m in enumerate(m_levels)
@@ -1388,13 +1414,62 @@ def _make_beta_grid_plots(
                        edgecolors=ps.COLOR_BLACK, linewidths=0.4, zorder=3)
         ax.set_title(fr"$\beta$ = {beta:g}")
         ps.style_axes(ax)
-    _dedupe_axis_labels(
-        flat, len(beta_levels), ncols,
+    _label_all_panels(
+        flat, len(beta_levels),
         "analytic block TE (nats)", r"$\bar K$ (nats)",
     )
     fig.legend(handles=m_handles, loc="outside right upper")
     fig.suptitle(r"calibration: $\bar K$ vs true TE  (panel: $\beta$, colour: $M$)")
     ps.save_figure(fig, out_dir / "kbar_vs_te__byBeta")
+
+    # --- Figure 4: prediction gain vs KLD, trajectory over beta -----------
+    # One panel per target TE; within a panel one line per M traces the path
+    # through the (K_bar, pred_gap) plane as beta increases. A point above the
+    # dashed pred_gap=0 line means the source/residual branch improved the
+    # forecast; the arrow marks the increasing-beta direction so the
+    # rate (K_bar) vs gain (pred_gap) trade-off is readable per (TE, M).
+    fig, flat, _ = _new_grid(len(te_levels), sharey=False)
+    for pi, tv in enumerate(te_levels):
+        ax = flat[pi]
+        ax.axhline(0.0, color=ps.COLOR_GRAY, ls="--", lw=0.9)
+        for idx, m in enumerate(m_levels):
+            sel = (te_keys == tv) & (m_vals == m)
+            sel &= np.isfinite(kbar) & np.isfinite(pred_gap)
+            if not sel.any():
+                continue
+            order = np.argsort(betas[sel])           # beta ascending
+            bx = betas[sel][order]
+            kx = kbar[sel][order]
+            py = pred_gap[sel][order]
+            ax.plot(kx, py, marker="o", color=_color(idx), label=f"M={m}")
+            if kx.size >= 2:
+                # arrowhead pointing toward the largest beta.
+                ax.annotate(
+                    "", xy=(kx[-1], py[-1]), xytext=(kx[-2], py[-2]),
+                    arrowprops=dict(arrowstyle="->", color=_color(idx), lw=1.0),
+                )
+            for j in (0, -1):                        # annotate beta endpoints
+                ax.annotate(
+                    fr"$\beta$={bx[j]:g}", (kx[j], py[j]), fontsize=6,
+                    color=ps.COLOR_GRAY, textcoords="offset points",
+                    xytext=(4, 4),
+                )
+        ax.set_title(fr"target TE = {tv:g} nats")
+        ps.style_axes(ax)
+    _label_all_panels(
+        flat, len(te_levels), r"$\bar K$ (nats)",
+        r"pred\_gap $= \mathcal{L}_{\rm base} - \mathcal{L}_{\rm feat}$",
+    )
+    predgap_handles = [
+        Line2D([0], [0], color=_color(i), marker="o", label=f"M={m}")
+        for i, m in enumerate(m_levels)
+    ]
+    fig.legend(handles=predgap_handles, loc="outside right upper")
+    fig.suptitle(
+        r"prediction gain vs KLD over $\beta$  "
+        r"(panel: target TE, line: $M$, arrow: increasing $\beta$)"
+    )
+    ps.save_figure(fig, out_dir / "predgap_vs_kbar__byTE")
 
 
 # =============================================================================

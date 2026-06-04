@@ -109,18 +109,25 @@ def _fake_rows() -> List[Dict[str, Any]]:
     for m in (1, 4):
         for te in (0.1, 1.0):
             for beta in (1.0e-4, 1.0e-2):
+                # pred_gap = base_loss - feat_loss; chosen so the trajectory
+                # figure has a non-trivial, beta-dependent path per (M, TE).
+                base_loss = 1.0
+                feat_loss = base_loss - (0.05 * m * te - 0.5 * beta)
                 rows.append({
                     "M": m, "target_te": te, "beta": beta,
                     "te_true": te, "k_bar": te * (1.0 + 0.1 * m) - beta,
+                    "base_loss": base_loss, "feat_loss": feat_loss,
+                    "pred_gap": base_loss - feat_loss,
                 })
     return rows
 
 
 def test_make_beta_grid_plots_writes_figures(tmp_path):
-    """``_make_beta_grid_plots`` renders the three multi-line figures."""
+    """``_make_beta_grid_plots`` renders the four multi-line figures."""
     bs._make_beta_grid_plots(_fake_rows(), tmp_path)
     for stem in (
         "kbar_vs_beta__byTE", "kbar_vs_beta__byM", "kbar_vs_te__byBeta",
+        "predgap_vs_kbar__byTE",
     ):
         assert (tmp_path / f"{stem}.pdf").is_file(), stem
         assert (tmp_path / f"{stem}.png").is_file(), stem
