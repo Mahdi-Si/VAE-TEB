@@ -1458,7 +1458,7 @@ def _make_beta_grid_plots(
         ps.style_axes(ax)
     _label_all_panels(
         flat, len(te_levels), r"$\bar K$ (nats)",
-        r"pred\_gap $= \mathcal{L}_{\rm base} - \mathcal{L}_{\rm feat}$",
+        r"pred_gap $= \mathcal{L}_{\rm base} - \mathcal{L}_{\rm feat}$",
     )
     predgap_handles = [
         Line2D([0], [0], color=_color(i), marker="o", label=f"M={m}")
