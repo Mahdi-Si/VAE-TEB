@@ -1425,6 +1425,8 @@ def _apply_overrides(
         config["runtime"]["device"] = overrides["device"]
     if overrides.get("seed") is not None:
         config["experiment"]["seed"] = overrides["seed"]
+    # data_dir / results_dir overrides -> config["paths"] (None -> YAML default).
+    tm.apply_path_overrides(config, overrides)
     return config
 
 
@@ -1552,6 +1554,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--seed", type=int, default=None, help="override experiment.seed",
     )
+    p.add_argument(
+        "--data-dir", type=str, default=None, dest="data_dir",
+        help="override paths.data_dir (absolute/relative path, ~, or $VAR); "
+             "None -> config paths.data_dir",
+    )
+    p.add_argument(
+        "--results-dir", type=str, default=None, dest="results_dir",
+        help="override paths.results_dir (same format as --data-dir); "
+             "None -> config paths.results_dir",
+    )
     return p.parse_args(argv)
 
 
@@ -1592,6 +1604,8 @@ if __name__ == "__main__":
         "benchmark": None,         # None -> config experiment.benchmark
         "device": None,            # None -> config runtime.device
         "seed": None,              # None -> config experiment.seed
+        "data_dir": None,          # None -> config paths.data_dir
+        "results_dir": None,       # None -> config paths.results_dir
     }
 
     if len(sys.argv) > 1:

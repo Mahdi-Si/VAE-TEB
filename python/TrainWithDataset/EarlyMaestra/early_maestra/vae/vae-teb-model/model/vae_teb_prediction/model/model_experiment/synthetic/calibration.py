@@ -1075,6 +1075,8 @@ def _apply_overrides(
         config.setdefault("calibration", {})["benchmark"] = bench
         # Reset tag_prefix so e.g. switching to G2 doesn't reuse a G1_te... tag.
         config["calibration"].pop("tag_prefix", None)
+    # data_dir / results_dir overrides -> config["paths"] (None -> YAML default).
+    tm.apply_path_overrides(config, overrides)
     return config
 
 
@@ -1128,6 +1130,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--seed", type=int, default=None, help="override experiment.seed",
     )
+    p.add_argument(
+        "--data-dir", type=str, default=None, dest="data_dir",
+        help="override paths.data_dir (absolute/relative path, ~, or $VAR); "
+             "None -> config paths.data_dir",
+    )
+    p.add_argument(
+        "--results-dir", type=str, default=None, dest="results_dir",
+        help="override paths.results_dir (same format as --data-dir); "
+             "None -> config paths.results_dir",
+    )
     return p.parse_args(argv)
 
 
@@ -1154,6 +1166,8 @@ if __name__ == "__main__":
         "train_missing": False,
         "device": None,
         "seed": None,
+        "data_dir": None,         # None -> config paths.data_dir
+        "results_dir": None,      # None -> config paths.results_dir
     }
 
     if len(sys.argv) > 1:

@@ -177,6 +177,44 @@ def resolve_user_path(value: Any) -> Path:
         p = _EXPERIMENT_DIR / p
     return p.resolve()
 
+
+def apply_path_overrides(
+    config: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    r"""Route ``data_dir`` / ``results_dir`` overrides into ``config['paths']``.
+
+    Shared by every synthetic runner (``beta_sweep``, ``evaluate_te``,
+    ``calibration``, ``null_controls``, ``lag_recovery``, ``directionality``,
+    ``build_dataset``, ``gpu_pool``) so a custom dataset / output location can
+    be supplied **once** -- via a ``--data-dir`` / ``--results-dir`` CLI flag or
+    the in-file ``RUN_CONFIG`` dict -- instead of editing
+    ``config_synth.yaml``. A ``None`` value is ignored, so the YAML's
+    ``paths.data_dir`` / ``paths.results_dir`` stay the default (Decision V2-D8
+    "respect the config" semantics): the override is the exception, the config
+    is the rule.
+
+    The raw value is stored verbatim; resolution is deferred to
+    :func:`resolve_user_path` at use-time, so a relative path, an absolute path
+    on any drive, ``~`` and ``$VAR`` / ``${VAR}`` references are all honoured
+    exactly as they are for the YAML values.
+
+    Args:
+        config: The config dict (mutated in place). A missing ``paths`` block
+            is created only when an override is actually written, so the
+            all-``None`` no-op path leaves ``config`` untouched.
+        overrides: Flat ``{key: value}`` overrides; only ``data_dir`` /
+            ``results_dir`` are consumed, every other key is ignored.
+
+    Returns:
+        The same ``config`` dict.
+    """
+    for key in ("data_dir", "results_dir"):
+        value = overrides.get(key)
+        if value is not None:
+            config.setdefault("paths", {})[key] = value
+    return config
+
+
 def resolve_active_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay the active benchmark's block onto the flat top-level config.
 

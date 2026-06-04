@@ -57,6 +57,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.generators import
     gen_state_space_oscillator,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
+    apply_path_overrides,
     resolve_active_benchmark,
     resolve_user_path,
 )
@@ -552,6 +553,8 @@ def _apply_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> None:
         config["data"]["easy_variant"] = True
     if overrides.get("m") is not None:
         config["data"]["M"] = overrides["m"]
+    # data_dir / results_dir overrides -> config["paths"] (None -> YAML default).
+    apply_path_overrides(config, overrides)
 
 
 def main() -> None:
@@ -578,6 +581,16 @@ def main() -> None:
     parser.add_argument(
         "--m", type=int, default=None, help="override data.M",
     )
+    parser.add_argument(
+        "--data-dir", type=str, default=None, dest="data_dir",
+        help="override paths.data_dir (absolute/relative path, ~, or $VAR); "
+             "None -> config paths.data_dir",
+    )
+    parser.add_argument(
+        "--results-dir", type=str, default=None, dest="results_dir",
+        help="override paths.results_dir (same format as --data-dir); "
+             "None -> config paths.results_dir",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -603,10 +616,12 @@ if __name__ == "__main__":
     CONFIG_PATH = _DEFAULT_CONFIG
 
     RUN_CONFIG = {
-        "tag": None,        # None -> config experiment.tag (cache subdir name)
-        "easy": False,      # True -> force the easy variant (all channels)
-        "m": None,          # None -> config data.M (informative channels)
-        "force": False,     # True -> rebuild even if a complete cache exists
+        "tag": None,         # None -> config experiment.tag (cache subdir name)
+        "easy": False,       # True -> force the easy variant (all channels)
+        "m": None,           # None -> config data.M (informative channels)
+        "force": False,      # True -> rebuild even if a complete cache exists
+        "data_dir": None,    # None -> config paths.data_dir
+        "results_dir": None, # None -> config paths.results_dir
     }
 
     if len(sys.argv) > 1:
