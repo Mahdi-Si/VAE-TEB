@@ -738,6 +738,8 @@ def run_gpu_pool(
     force: bool = False,
     epochs: Optional[int] = None,
     seed: Optional[int] = None,
+    data_dir: Optional[str] = None,
+    results_dir: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Enumerate, build and train one sweep mode across multiple GPUs.
@@ -756,6 +758,13 @@ def run_gpu_pool(
         epochs: Optional global ``optim.epochs`` override applied to every cell
             (handy for a fast end-to-end shake-out).
         seed: Optional global ``experiment.seed`` override applied to every cell.
+        data_dir: Optional ``paths.data_dir`` override (custom dataset cache
+            location). Applied to this process's config -- so dataset
+            enumeration / build and ``out_dir`` honour it -- and propagated to
+            every worker as a ``paths.data_dir`` patch (workers reload the YAML
+            fresh). ``None`` -> the YAML's ``paths.data_dir``.
+        results_dir: Optional ``paths.results_dir`` override (custom output
+            location); same dual application as ``data_dir``.
         dry_run: If True, print the enumerated cells and exit without building
             datasets or training.
 
@@ -770,17 +779,28 @@ def run_gpu_pool(
         raise ValueError(
             f"unknown mode {mode!r}; expected one of {_VALID_MODES}"
         )
+    # Apply any data_dir / results_dir override BEFORE enumeration so dataset
+    # build (ev._data_root) and out_dir (ev._results_root) resolve against it.
+    tm.apply_path_overrides(
+        config, {"data_dir": data_dir, "results_dir": results_dir}
+    )
     if not dry_run:
         _warn_unavailable_gpus(gpus)
     out_dir = ev._results_root(config) / "gpu_pool" / mode
     cells = _ENUMERATORS[mode](config, build and not dry_run, axis)
 
     # Global per-cell patches (applied on top of each cell's own patches).
+    # Workers reload the YAML fresh, so the path overrides must travel as
+    # patches too (the worker patch loop writes them into config["paths"]).
     for cell in cells:
         if epochs is not None:
             cell.patches["optim.epochs"] = int(epochs)
         if seed is not None:
             cell.patches["experiment.seed"] = int(seed)
+        if data_dir is not None:
+            cell.patches["paths.data_dir"] = data_dir
+        if results_dir is not None:
+            cell.patches["paths.results_dir"] = results_dir
 
     print(
         f"[gpu-pool] mode={mode}  {len(cells)} cell(s)  "
@@ -940,6 +960,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="global experiment.seed override applied to every cell",
     )
     p.add_argument(
+        "--data-dir", type=str, default=None, dest="data_dir",
+        help="override paths.data_dir (absolute/relative path, ~, or $VAR) "
+             "for every cell; None -> config paths.data_dir",
+    )
+    p.add_argument(
+        "--results-dir", type=str, default=None, dest="results_dir",
+        help="override paths.results_dir (same format as --data-dir) for "
+             "every cell; None -> config paths.results_dir",
+    )
+    p.add_argument(
         "--no-build", action="store_true", dest="no_build",
         help="assume datasets are already cached; skip dataset generation",
     )
@@ -979,7 +1009,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     run_gpu_pool(
         config, args.config, mode=args.mode or "a_sweep", gpus=gpus,
         axis=args.axis, build=not args.no_build, force=args.force,
-        epochs=args.epochs, seed=args.seed, dry_run=args.dry_run,
+        epochs=args.epochs, seed=args.seed,
+        data_dir=args.data_dir, results_dir=args.results_dir,
+        dry_run=args.dry_run,
     )
 
 
@@ -1009,6 +1041,8 @@ if __name__ == "__main__":
         "benchmark": None,         # None -> config experiment.benchmark
         "epochs": None,            # global optim.epochs override (None -> config)
         "seed": None,              # global experiment.seed override
+        "data_dir": None,          # None -> config paths.data_dir
+        "results_dir": None,       # None -> config paths.results_dir
         "no_build": False,         # True -> assume datasets already cached
         "force": False,            # True -> retrain even if final.ckpt exists
         "dry_run": False,          # True -> just list the cells and exit
@@ -1030,5 +1064,6 @@ if __name__ == "__main__":
             config, CONFIG_PATH, mode=RUN_CONFIG["mode"], gpus=gpus,
             axis=RUN_CONFIG["axis"], build=not RUN_CONFIG["no_build"],
             force=RUN_CONFIG["force"], epochs=RUN_CONFIG["epochs"],
-            seed=RUN_CONFIG["seed"], dry_run=RUN_CONFIG["dry_run"],
+            seed=RUN_CONFIG["seed"], data_dir=RUN_CONFIG["data_dir"],
+            results_dir=RUN_CONFIG["results_dir"], dry_run=RUN_CONFIG["dry_run"],
         )
