@@ -351,6 +351,12 @@ benchmarks:
       te_floor_margin: 1.5                      # trim cells whose per-channel target
                                                 # (target_te / M) <= MC-floor * margin
       build_seed: 0                             # base seed for cell generation + shuffle
+      build_workers: auto                       # multi-core build (mixed_dataset.py):
+                                                # auto = cpu_count-1 fans the per-distinct-key
+                                                # solves + per-cell generation over a process
+                                                # pool. Set an int to cap (memory), or 1 to
+                                                # force serial. Output is byte-identical to
+                                                # serial regardless of worker count.
       holdout:                                  # interior (M, TE, band) triples NEVER
                                                 # trained -> a separate test-only cache
                                                 # for extrapolation. Each value (M / TE /
@@ -431,6 +437,30 @@ dataset:
   num_workers: 0               # >= 2 on a multi-GPU box (per-worker pool slot)
   pin_memory: false            # true when CUDA is in use on multi-GPU boxes
   persistent_workers: false    # only honoured when num_workers > 0
+
+# --- multi-GPU DDP training (read ONLY by synthetic/train_ddp.py) ------------
+# Data-parallel DDP for the single large G1_mix final-model run. The beta x M x
+# TE sweeps stay on the task-parallel synthetic/gpu_pool.py (one cell per GPU);
+# DDP is wasteful there. train_ddp.py forces experiment.benchmark=G1_mix, so this
+# block is effectively G1_mix-scoped. Lightning spawns its own DDP workers from a
+# single `python -m ...train_ddp --devices 8` invocation (no torchrun).
+#
+# Batch / LR policy (locked): the per-GPU batch is optim.batch_size, so the
+# GLOBAL batch is optim.batch_size * n_gpus; lr is linearly scaled (lr * n_gpus)
+# with a short warmup. On Windows single-GPU dev (--devices 1) the strategy
+# downgrades to "auto" and LR scaling + warmup are no-ops (matches train_minimal).
+ddp:
+  devices: 8                   # CLI --devices overrides; 1 on Windows dev
+  strategy: ddp_find_unused_parameters_true   # -> "auto" when devices == 1
+  precision: 32-true           # consider bf16-mixed on H100/A100
+  sync_batchnorm: true         # only active when devices > 1 (no BN today; harmless)
+  lr_scaling: true             # effective_lr = optim.lr * n_gpus
+  warmup_epochs: 5             # linear LR warmup; 0 disables (also disabled when n_gpus == 1)
+  num_sanity_val_steps: 0
+  gradient_clip_val: 0.5       # == optim.grad_clip_norm (Trainer-managed under DDP)
+  gradient_clip_algorithm: norm
+# 8-GPU Linux recipe: also set dataset.num_workers: 2, pin_memory: true,
+# persistent_workers: true (size RAM first -- each worker copies the in-RAM pool).
 
 # --- optimiser / training loop -----------------------------------------------
 optim:

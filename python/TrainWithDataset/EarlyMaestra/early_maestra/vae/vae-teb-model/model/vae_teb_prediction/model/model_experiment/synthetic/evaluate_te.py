@@ -757,8 +757,29 @@ def _aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Metric 2 -- monotonicity / rank.
     rho = _spearman_rho(te, kbar)
 
-    # Metric 3 -- calibration slope.
+    # Metric 3 -- calibration slope (pooled over all M).
     alpha, gamma, r2 = _linear_calibration(te, kbar)
+
+    # Metric 3b -- per-M calibration. Because the per-channel TE is held fixed
+    # as M varies (channel-dilution isolation, V2-D6 / Section 3.1.1), the
+    # calibration slope is expected to differ across M; the pooled fit hides
+    # this. Group rows by M and fit / correlate each channel count separately.
+    m_vals_agg = np.array(
+        [int(r["M"]) if r.get("M") is not None else -1 for r in rows],
+        dtype=int,
+    )
+    calib_by_m: Dict[str, Any] = {}
+    for m in sorted(set(m_vals_agg.tolist())):
+        if m < 0:
+            continue
+        sel = m_vals_agg == m
+        te_m, kbar_m = te[sel], kbar[sel]
+        a_m, g_m, r2_m = _linear_calibration(te_m, kbar_m)
+        rho_m = _spearman_rho(te_m, kbar_m)
+        calib_by_m[str(int(m))] = {
+            "alpha": a_m, "gamma": g_m, "r2": r2_m,
+            "spearman": rho_m, "n": int(np.count_nonzero(sel)),
+        }
 
     # Metric 4 -- predictive gain.
     pg_null = pred_gap[is_null]
@@ -786,6 +807,7 @@ def _aggregate_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "metric2_spearman": rho,
         "metric3_calibration": {"alpha": alpha, "gamma": gamma, "r2": r2},
+        "metric3b_calibration_by_M": calib_by_m,
         "metric4_pred_gain": {
             "mean_pred_gap_te0": mean_pg_null,
             "mean_pred_gap_te_pos": mean_pg_signal,
@@ -1261,6 +1283,11 @@ def _make_plots(
     fig, ax = plt.subplots(figsize=(6.4, 5.0))
     for idx, m in enumerate(m_levels):
         sel = m_vals == m
+        # Connect the per-M circles with a line in the same palette colour
+        # (ordered along the TE axis), so each channel count reads as a trend.
+        order_te = np.argsort(te[sel])
+        ax.plot(te[sel][order_te], kbar[sel][order_te], color=_m_color(idx),
+                lw=1.0, zorder=2, label="_nolegend_")
         ax.scatter(te[sel], kbar[sel], s=44, color=_m_color(idx),
                    edgecolors=ps.COLOR_BLACK, linewidths=0.4,
                    zorder=3, label=f"M={m}")
@@ -1311,6 +1338,11 @@ def _make_plots(
     ax.axhline(0.0, color=ps.COLOR_GRAY, ls="--", lw=0.9, zorder=1)
     for idx, m in enumerate(m_levels):
         sel = m_vals == m
+        # Connect the per-M circles with a same-colour line ordered along the
+        # K_bar axis -- traces the (K_bar, pred_gap) trajectory as the knob grows.
+        order_k = np.argsort(kbar[sel])
+        ax.plot(kbar[sel][order_k], pred_gap[sel][order_k], color=_m_color(idx),
+                lw=1.0, zorder=2, label="_nolegend_")
         ax.scatter(kbar[sel], pred_gap[sel], s=44, color=_m_color(idx),
                    edgecolors=ps.COLOR_BLACK, linewidths=0.4,
                    zorder=3, label=f"M={m}")
@@ -1321,6 +1353,103 @@ def _make_plots(
     ps.style_axes(ax)
     fig.tight_layout()
     ps.save_figure(fig, out_dir / "predgap_vs_kbar")
+
+
+def _make_calibration_by_m(
+    rows: List[Dict[str, Any]], metrics: Dict[str, Any], out_dir: Path
+) -> None:
+    r"""Render the per-$M$ calibration grid (``kbar_vs_te__byM``).
+
+    One subplot per number of informative channels $M$, each plotting that
+    channel count's $\bar K$ against the analytic block TE with its **own**
+    least-squares fit $\bar K = \alpha_M + \gamma_M\,\mathrm{TE}$ and Spearman
+    $\rho_M$. Because the per-channel TE is held fixed as $M$ varies (channel
+    dilution, Section 3.1.1), the calibration slope is expected to differ
+    across $M$; the pooled :func:`_make_plots` ``kbar_vs_te`` figure hides this,
+    so this grid breaks it out per channel count. The per-$M$ fit / correlation
+    values come straight from ``metrics['metric3b_calibration_by_M']`` (computed
+    once in :func:`_aggregate_metrics`), so the figure never re-fits.
+
+    Args:
+        rows: Per-checkpoint metrics rows (>= 2 expected).
+        metrics: The :func:`_aggregate_metrics` output (reads
+            ``metric3b_calibration_by_M``).
+        out_dir: Destination directory.
+    """
+    import math
+
+    import matplotlib.pyplot as plt
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        plot_style as ps,
+    )
+
+    ps.apply_style()
+
+    def _m_color(idx: int) -> str:
+        """Pick a stable palette colour for the ``idx``-th $M$ level."""
+        return ps.PALETTE_EXTENDED[idx % len(ps.PALETTE_EXTENDED)]
+
+    te = np.array([r["te_true"] for r in rows], dtype=float)
+    kbar = np.array([r["k_bar"] for r in rows], dtype=float)
+    m_vals = np.array(
+        [int(r["M"]) if r["M"] is not None else -1 for r in rows], dtype=int
+    )
+    m_levels = [m for m in sorted(set(m_vals.tolist())) if m >= 0]
+    if not m_levels:
+        return
+
+    calib_by_m = metrics.get("metric3b_calibration_by_M", {}) or {}
+
+    n = len(m_levels)
+    ncols = int(math.ceil(math.sqrt(n)))
+    nrows = int(math.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4.4 * ncols, 3.8 * nrows), squeeze=False
+    )
+    flat_axes = axes.ravel()
+
+    for idx, m in enumerate(m_levels):
+        ax = flat_axes[idx]
+        sel = m_vals == m
+        te_m, kbar_m = te[sel], kbar[sel]
+        ax.scatter(te_m, kbar_m, s=44, color=_m_color(idx),
+                   edgecolors=ps.COLOR_BLACK, linewidths=0.4, zorder=3)
+        cal = calib_by_m.get(str(int(m)), {})
+        alpha, gamma = cal.get("alpha"), cal.get("gamma")
+        rho = cal.get("spearman", float("nan"))
+        r2 = cal.get("r2", float("nan"))
+        if (alpha is not None and gamma is not None
+                and np.isfinite(alpha) and np.isfinite(gamma)
+                and np.isfinite(te_m).any()):
+            xs = np.linspace(float(np.nanmin(te_m)), float(np.nanmax(te_m)), 100)
+            ax.plot(
+                xs, gamma * xs + alpha, ls="--", lw=1.1, color=ps.COLOR_BLACK,
+                zorder=2,
+                label=fr"fit: ${gamma:.3g}\,\mathrm{{TE}}+{alpha:.3g}$",
+            )
+            ax.legend(loc="best")
+        title = fr"M={m}"
+        if isinstance(rho, float) and np.isfinite(rho):
+            title += fr"   ($\rho$={rho:.3f}"
+            if isinstance(r2, float) and np.isfinite(r2):
+                title += fr", $R^2$={r2:.3f}"
+            title += ")"
+        ax.set_title(title)
+        ax.set_xlabel("analytic block TE (nats)")
+        ax.set_ylabel(r"$\bar K$ (nats)")
+        ps.style_axes(ax)
+
+    # Hide any unused trailing axes so a non-square grid stays clean.
+    for j in range(n, len(flat_axes)):
+        flat_axes[j].axis("off")
+
+    fig.suptitle(
+        r"$\bar K$ vs analytic block TE -- per informative-channel count $M$",
+        fontsize=ps.FONT_TITLE, fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    ps.save_figure(fig, out_dir / "kbar_vs_te__byM")
 
 
 def _make_checkpoint_figure(row: Dict[str, Any], out_dir: Path) -> list:
@@ -1676,6 +1805,7 @@ def run_sweep(
     write_metrics_json(metrics, rows, out_dir / "metrics.json")
     if len(rows) >= 2:
         _make_plots(rows, metrics, out_dir)
+        _make_calibration_by_m(rows, metrics, out_dir)
         _make_sweep_extras(rows, out_dir)
     else:
         print(
