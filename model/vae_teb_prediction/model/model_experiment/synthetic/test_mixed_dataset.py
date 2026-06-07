@@ -55,6 +55,10 @@ def _tiny_config(
     mix["n_per_cell_test"] = n_test
     mix["inverter"] = {"n_samples": te_n_samples, "lo": 1e-4, "hi": 10.0,
                        "tol": 0.05, "max_iter": 8}
+    # Force serial builds in the test suite: keeps tiny round-trips fast and
+    # portable, and (critically) the monkeypatched enumerate_mix_cells tests
+    # serial -- a process worker would import a fresh module without their patch.
+    mix["build_workers"] = 1
     cfg["data"]["te_n_samples"] = te_n_samples
     cfg["data"]["sequence_length"] = 120
     cfg["model"]["sequence_length"] = 120

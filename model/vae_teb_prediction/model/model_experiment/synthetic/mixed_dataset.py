@@ -48,10 +48,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -82,6 +84,67 @@ _HOLDOUT_SUFFIX = "_holdout"
 # Independent per-split / per-cell seed offsets so train / val / test and the
 # distinct cells never share an RNG stream.
 _SPLIT_OFFSET = {"train": 0, "val": 1, "test": 2}
+
+
+# =============================================================================
+# Multi-core build helpers
+# =============================================================================
+#
+# The two CPU-bound build phases -- the per-distinct-key coupling solves
+# (:func:`enumerate_mix_cells`) and the per-(cell, split) sample generation
+# (:func:`build_mixed_split`) -- are embarrassingly parallel: every unit uses a
+# **local** ``np.random.default_rng(seed)`` (no global RNG state) with a
+# deterministic, order-independent seed, and the results are reassembled in a
+# fixed order. Running them across processes therefore yields **byte-identical**
+# output (see ``test_deterministic_build``). Processes (not threads) are used
+# because the generator / solver do real Python-level work that holds the GIL.
+
+
+def _resolve_build_workers(mix: Dict[str, Any], n_tasks: int) -> int:
+    r"""Resolve the worker count for a build phase from ``mix.build_workers``.
+
+    Args:
+        mix: The ``benchmarks.G1_mix.mix`` sub-block. ``build_workers`` may be
+            ``"auto"`` / ``0`` / ``None`` (use ``os.cpu_count() - 1``) or a
+            positive int cap. Absent ⇒ ``"auto"``.
+        n_tasks: Number of independent tasks in this phase. The result is capped
+            at ``n_tasks`` so a 1-task phase always runs serially.
+
+    Returns:
+        The clamped worker count in ``[1, n_tasks]``. ``1`` means run serially.
+    """
+    raw = mix.get("build_workers", "auto")
+    if raw in (None, 0, "auto", "Auto", "AUTO"):
+        workers = max(1, (os.cpu_count() or 1) - 1)
+    else:
+        workers = int(raw)
+    return max(1, min(workers, max(1, n_tasks)))
+
+
+def _parallel_or_serial(
+    fn: Callable[[Any], Any], arg_list: List[Any], workers: int
+) -> List[Any]:
+    r"""Map ``fn`` over ``arg_list``, preserving input order.
+
+    Runs serially when ``workers <= 1`` or there is at most one task (so the tiny
+    test builds and the monkeypatched unit tests never spawn a process pool);
+    otherwise fans out over a :class:`ProcessPoolExecutor`. Results are returned
+    in submission order regardless of completion order, which is what keeps the
+    pooled output byte-identical to the serial build.
+
+    Args:
+        fn: A **module-level** (picklable) callable taking one picklable arg.
+        arg_list: The per-task argument objects.
+        workers: Worker count from :func:`_resolve_build_workers`.
+
+    Returns:
+        ``[fn(a) for a in arg_list]`` (computed in parallel when ``workers > 1``).
+    """
+    if workers <= 1 or len(arg_list) <= 1:
+        return [fn(a) for a in arg_list]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fn, a) for a in arg_list]
+        return [f.result() for f in futures]
 
 
 @dataclass(frozen=True)
@@ -251,8 +314,57 @@ def _solve_cell_b_y(
     return out
 
 
+def _solve_key_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Solve one distinct $(d_{\min}, d_{\max}, \mathrm{TE}/M)$ key (pool worker).
+
+    Module-level + picklable so :func:`enumerate_mix_cells` can fan the distinct
+    solves over a :class:`ProcessPoolExecutor`. Mirrors the inverter call inside
+    :func:`_solve_cell_b_y` exactly, but catches the near-floor bracket miss and
+    reports it (rather than memoising) so the assembly pass can drop / hard-fail
+    the cell with the same message the serial loop used.
+
+    Args:
+        task: A dict carrying ``key`` (the ``(d_min, d_max, per_channel)`` tuple),
+            ``delay_min`` / ``delay_max`` / ``per_channel_target`` and the shared
+            DGP params (``oscillators`` / ``target_ar`` / ``sigma2_y`` /
+            ``sigma2_eta`` / ``horizon`` / ``K_history`` / ``inverter_cfg``).
+
+    Returns:
+        ``{"key", "ok": True, "B_y_scalar", "te_block"}`` on success, else
+        ``{"key", "ok": False, "reason": "solver bracket failed: ..."}``.
+    """
+    inverter_cfg = task["inverter_cfg"]
+    try:
+        sol = B_y_for_mean_te_block_state_space(
+            target_te_block=float(task["per_channel_target"]),
+            delay_min=int(task["delay_min"]),
+            delay_max=int(task["delay_max"]),
+            oscillators=task["oscillators"],
+            target_ar=float(task["target_ar"]),
+            sigma2_y=float(task["sigma2_y"]),
+            sigma2_eta=task["sigma2_eta"],
+            H=int(task["horizon"]),
+            K_history=task["K_history"],
+            n_samples=int(inverter_cfg.get("n_samples", 12_000)),
+            lo=float(inverter_cfg.get("lo", 1e-4)),
+            hi=float(inverter_cfg.get("hi", 10.0)),
+            tol=float(inverter_cfg.get("tol", 5e-3)),
+            max_iter=int(inverter_cfg.get("max_iter", 30)),
+        )
+    except ValueError as exc:  # bracket miss near the MC floor
+        return {"key": task["key"], "ok": False,
+                "reason": f"solver bracket failed: {exc}"}
+    return {
+        "key": task["key"], "ok": True,
+        "B_y_scalar": float(sol["B_y_scalar"]),
+        "te_block": float(sol["te_block"]),
+    }
+
+
 def enumerate_mix_cells(
     config: Dict[str, Any],
+    *,
+    workers: int = 1,
 ) -> Tuple[List[MixCell], List[Dict[str, Any]]]:
     r"""Enumerate, solve, and trim the mixture grid.
 
@@ -260,11 +372,22 @@ def enumerate_mix_cells(
     ``mix.lag_bands``. For each cell the per-channel target $\mathrm{TE}/M$ is
     checked against the per-band Monte-Carlo floor (cells at/below
     ``floor * te_floor_margin`` are trimmed) and, if reachable, the coupling
-    $B_y$ is solved via :func:`_solve_cell_b_y`. Held-out triples
-    (``mix.holdout``) are flagged but kept (they form the extrapolation cache).
+    $B_y$ is solved by the inverter. Held-out triples (``mix.holdout``) are
+    flagged but kept (they form the extrapolation cache).
+
+    The solves run in three passes so they can be parallelised without changing
+    the result: (1) a cheap serial pass that decides per ``(m, t, band)`` whether
+    the cell is floor-trimmed or needs a solve and collects the **distinct**
+    ``(d_min, d_max, TE/M)`` solve keys (this replaces the in-loop memo); (2) a
+    parallel pass that solves the distinct keys over a process pool; (3) a cheap
+    serial pass that assembles ``(cells, dropped)`` in the original nested order
+    with identical drop / held-out-error / message semantics.
 
     Args:
         config: The parsed config carrying ``benchmarks.G1_mix``.
+        workers: Process-pool size for the distinct-key solves. ``1`` (default)
+            runs serially -- which the monkeypatched unit tests rely on, since a
+            spawned worker would import a fresh module without their patch.
 
     Returns:
         ``(cells, dropped)`` -- the kept :class:`MixCell` list (stable
@@ -317,10 +440,17 @@ def enumerate_mix_cells(
             n_samples=te_n_samples,
         ))
 
-    cache: Dict[Tuple[int, int, float], Dict[str, float]] = {}
-    cells: List[MixCell] = []
-    dropped: List[Dict[str, Any]] = []
-    next_id = 0
+    # Shared solve params (identical across keys -- the solve is M-independent).
+    solve_common = dict(
+        oscillators=oscillators, target_ar=target_ar, sigma2_y=sigma2_y,
+        sigma2_eta=sigma2_eta, horizon=horizon, K_history=K_history,
+        inverter_cfg=inverter_cfg,
+    )
+
+    # --- Pass 1 (serial, cheap): decide floor-trim vs needs-solve, in order, and
+    # collect the distinct (d_min, d_max, TE/M) solve keys. ---------------------
+    plan: List[Tuple[Any, ...]] = []
+    distinct_tasks: Dict[Tuple[int, int, float], Dict[str, Any]] = {}
     for m in m_grid:
         for t_target in target_te_grid:
             for band in band_names:
@@ -328,52 +458,77 @@ def enumerate_mix_cells(
                 per_channel = float(t_target) / int(m)
                 min_per_channel = band_floor[band] * floor_margin
                 held = (int(m), float(t_target), band) in holdout_set
-                reason: Optional[str] = None
-                sol: Optional[Dict[str, float]] = None
+                meta = {
+                    "M": int(m), "target_te": float(t_target), "band": band,
+                    "dmin": dmin, "dmax": dmax,
+                    "per_channel": per_channel, "held": held,
+                }
                 if per_channel <= min_per_channel:
-                    reason = (
+                    meta["reason"] = (
                         f"per-channel target {per_channel:.4g} <= MC floor*"
                         f"margin {min_per_channel:.4g}"
                     )
+                    plan.append(("floor", meta))
                 else:
-                    try:
-                        sol = _solve_cell_b_y(
-                            dmin, dmax, per_channel, oscillators=oscillators,
-                            target_ar=target_ar, sigma2_y=sigma2_y,
-                            sigma2_eta=sigma2_eta, horizon=horizon,
-                            K_history=K_history, inverter_cfg=inverter_cfg,
-                            cache=cache,
-                        )
-                    except ValueError as exc:  # bracket miss near the floor
-                        reason = f"solver bracket failed: {exc}"
-                if reason is not None or sol is None:
-                    if held:
-                        raise ValueError(
-                            f"held-out cell (M={m}, TE={t_target}, band={band}) "
-                            f"is unreachable: {reason}. Pick a held-out triple "
-                            f"above the MC floor."
-                        )
-                    dropped.append({
-                        "M": int(m), "target_te": float(t_target), "band": band,
-                        "per_channel_target": per_channel,
-                        "floor": band_floor[band], "reason": reason,
-                    })
-                    print(
-                        f"[mix] drop cell M={m} TE={t_target:g} band={band}: "
-                        f"{reason}"
-                    )
-                    continue
-                te_block = sol["te_block"]
-                cells.append(MixCell(
-                    cell_id=next_id, M=int(m), target_te=float(t_target),
-                    band=band, delay_min=dmin, delay_max=dmax,
-                    per_channel_target=per_channel,
-                    B_y_scalar=sol["B_y_scalar"],
-                    te_block_realised=te_block,
-                    te_cell_realised=te_block * int(m),
-                    band_idx=band_idx[band], held_out=held,
-                ))
-                next_id += 1
+                    key = (int(dmin), int(dmax), round(float(per_channel), 9))
+                    if key not in distinct_tasks:
+                        distinct_tasks[key] = {
+                            "key": key, "delay_min": dmin, "delay_max": dmax,
+                            "per_channel_target": per_channel, **solve_common,
+                        }
+                    plan.append(("solve", key, meta))
+
+    # --- Pass 2 (parallel): solve the distinct keys over a process pool. --------
+    key_order = list(distinct_tasks.keys())
+    solve_results = _parallel_or_serial(
+        _solve_key_task, [distinct_tasks[k] for k in key_order], workers
+    )
+    solved: Dict[Tuple[int, int, float], Dict[str, Any]] = {
+        r["key"]: r for r in solve_results
+    }
+
+    # --- Pass 3 (serial, cheap): assemble in the original nested order. ---------
+    cells: List[MixCell] = []
+    dropped: List[Dict[str, Any]] = []
+    next_id = 0
+    for entry in plan:
+        if entry[0] == "floor":
+            meta = entry[1]
+            reason: Optional[str] = meta["reason"]
+            res = None
+        else:
+            _, key, meta = entry
+            res = solved[key]
+            reason = None if res["ok"] else res["reason"]
+        if reason is not None:
+            if meta["held"]:
+                raise ValueError(
+                    f"held-out cell (M={meta['M']}, TE={meta['target_te']}, "
+                    f"band={meta['band']}) is unreachable: {reason}. Pick a "
+                    f"held-out triple above the MC floor."
+                )
+            dropped.append({
+                "M": meta["M"], "target_te": meta["target_te"],
+                "band": meta["band"], "per_channel_target": meta["per_channel"],
+                "floor": band_floor[meta["band"]], "reason": reason,
+            })
+            print(
+                f"[mix] drop cell M={meta['M']} TE={meta['target_te']:g} "
+                f"band={meta['band']}: {reason}"
+            )
+            continue
+        assert res is not None  # a non-floor, non-failed entry has a solve
+        te_block = res["te_block"]
+        cells.append(MixCell(
+            cell_id=next_id, M=meta["M"], target_te=meta["target_te"],
+            band=meta["band"], delay_min=meta["dmin"], delay_max=meta["dmax"],
+            per_channel_target=meta["per_channel"],
+            B_y_scalar=res["B_y_scalar"],
+            te_block_realised=te_block,
+            te_cell_realised=te_block * meta["M"],
+            band_idx=band_idx[meta["band"]], held_out=meta["held"],
+        ))
+        next_id += 1
     return cells, dropped
 
 
@@ -440,6 +595,31 @@ def _gen_cell_split(
     return Y.numpy(), U.numpy(), meta
 
 
+def _gen_cell_task(
+    task: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    r"""Generate one $(\text{cell}, \text{split})$ (pool worker).
+
+    Module-level + picklable wrapper around :func:`_gen_cell_split` so
+    :func:`build_mixed_split` can fan the per-cell generation over a
+    :class:`ProcessPoolExecutor`. The cell ``seed`` is computed in the parent
+    (deterministic, order-independent) and passed in, so the output is identical
+    to the serial build regardless of worker scheduling.
+
+    Args:
+        task: A dict with ``cell`` / ``n`` / ``seed`` and the shared
+            ``data`` / ``c_y`` / ``c_u`` / ``horizon`` / ``te_n_samples`` args.
+
+    Returns:
+        ``(Y, U, meta)`` as returned by :func:`_gen_cell_split`.
+    """
+    return _gen_cell_split(
+        task["cell"], task["n"], task["seed"],
+        data=task["data"], c_y=task["c_y"], c_u=task["c_u"],
+        horizon=task["horizon"], te_n_samples=task["te_n_samples"],
+    )
+
+
 def build_mixed_split(
     cells: List[MixCell],
     split: str,
@@ -453,6 +633,7 @@ def build_mixed_split(
     base_seed: int,
     held_out_cache: bool,
     split_channels: Dict[str, int],
+    workers: int = 1,
 ) -> Dict[str, np.ndarray]:
     r"""Generate every cell's split, concatenate, and shuffle the pool.
 
@@ -467,6 +648,9 @@ def build_mixed_split(
         base_seed: Mixture base seed (``mix.build_seed``).
         held_out_cache: Stamped into every ``sample_held_out`` of this cache.
         split_channels: ``{c_y_st, c_y_ph, c_u_st, c_u_ph}``.
+        workers: Process-pool size for the per-cell generation. ``1`` (default)
+            runs serially. Each cell's seed is computed here (deterministic,
+            order-independent), so any worker count yields identical output.
 
     Returns:
         A dict of stacked, shuffled arrays: the five native fields, optional
@@ -479,16 +663,24 @@ def build_mixed_split(
     T = int(data["sequence_length"])
     split_off = _SPLIT_OFFSET[split]
 
+    # Generate every cell (parallel over a process pool when workers > 1), then
+    # assemble in cell order so the pooled output is byte-identical to serial.
+    gen_tasks = [
+        {
+            "cell": cell, "n": n_per_cell,
+            "seed": int(base_seed) + split_off * 100_003 + cell.cell_id * 101,
+            "data": data, "c_y": c_y, "c_u": c_u,
+            "horizon": horizon, "te_n_samples": te_n_samples,
+        }
+        for cell in cells
+    ]
+    gen_results = _parallel_or_serial(_gen_cell_task, gen_tasks, workers)
+
     fhr_st, fhr_ph, up_st, up_ph = [], [], [], []
     lag_tt: List[np.ndarray] = []
     s_te, s_M, s_dmin, s_dmax, s_band, s_cell = [], [], [], [], [], []
     have_lag_tt = True
-    for cell in cells:
-        seed = int(base_seed) + split_off * 100_003 + cell.cell_id * 101
-        Y_np, U_np, meta = _gen_cell_split(
-            cell, n_per_cell, seed, data=data, c_y=c_y, c_u=c_u,
-            horizon=horizon, te_n_samples=te_n_samples,
-        )
+    for cell, (Y_np, U_np, meta) in zip(cells, gen_results):
         fhr_st.append(np.ascontiguousarray(Y_np[..., :c_y_st]))
         fhr_ph.append(np.ascontiguousarray(Y_np[..., c_y_st:c_y_st + c_y_ph]))
         up_st.append(np.ascontiguousarray(U_np[..., :c_u_st]))
@@ -701,8 +893,15 @@ def build_g1_mix(
     base_seed = int(mix.get("build_seed", exp.get("seed", 0)))
 
     print(f"building {_BENCHMARK} (tag '{tag}', holdout={holdout}) -> {out_dir}")
-    print("[mix] enumerating + solving cells ...")
-    all_cells, dropped = enumerate_mix_cells(config)
+    # Worker count for the distinct-key solves (upper-bounded by the full grid;
+    # ``_parallel_or_serial`` / ``_resolve_build_workers`` clamp to the real task
+    # count, so a 1-cell grid or ``build_workers: 1`` stays serial).
+    n_grid = (
+        len(mix["m_grid"]) * len(mix["target_te_grid"]) * len(mix["lag_bands"])
+    )
+    solve_workers = _resolve_build_workers(mix, n_grid)
+    print(f"[mix] enumerating + solving cells (workers={solve_workers}) ...")
+    all_cells, dropped = enumerate_mix_cells(config, workers=solve_workers)
     cells = [c for c in all_cells if c.held_out == holdout]
     # Re-id so cell_id is contiguous within this cache (manifest + provenance
     # stay self-consistent; cross-cache identity is the (M, TE, band) triple).
@@ -730,15 +929,20 @@ def build_g1_mix(
             "val": int(mix.get("n_per_cell_val", 0)),
             "test": int(mix.get("n_per_cell_test", 0)),
         }
+    gen_workers = _resolve_build_workers(mix, len(cells))
     splits: Dict[str, Dict[str, np.ndarray]] = {}
     for split, n_pc in split_sizes.items():
         if n_pc <= 0:
             continue
-        print(f"[mix] generating split '{split}' (n_per_cell={n_pc}) ...")
+        print(
+            f"[mix] generating split '{split}' "
+            f"(n_per_cell={n_pc}, workers={gen_workers}) ..."
+        )
         splits[split] = build_mixed_split(
             cells, split, n_pc, data=data, c_y=c_y, c_u=c_u, horizon=horizon,
             te_n_samples=gen_te_n_samples, base_seed=base_seed,
             held_out_cache=holdout, split_channels=split_channels,
+            workers=gen_workers,
         )
 
     write_mixed_cache(
