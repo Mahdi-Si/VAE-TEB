@@ -27,9 +27,13 @@ Multi-GPU correctness highlights:
   exact sums) over a **sharded** loader so the aggregated count is truthful.
 * **LR scaling.** The locked policy keeps the per-GPU batch (so the global batch
   is ``batch_size * n_gpus``) and scales ``lr`` linearly with a short warmup.
-* **Checkpoint bridge.** ``final.ckpt`` stores the bare ``SeqVaeLagAttnV1``
-  state dict (unprefixed) + ``model_kwargs`` so the strict loader
-  ``load_checkpoint_strict`` matches exactly.
+* **Checkpoint bridge.** ``final.ckpt`` (post latent-stats fit) and ``best.ckpt``
+  (lowest ``val/total_loss``, converted from the Lightning best snapshot) store
+  the bare ``SeqVaeLagAttnV1`` state dict (unprefixed) + ``model_kwargs`` so the
+  strict loader ``load_checkpoint_strict`` matches exactly.
+* **Monitoring.** A rank-0 callback emits the single-GPU-equivalent
+  ``metrics.csv`` + ``training_curves.{pdf,png}`` / ``loss_plot_epoch.html``
+  figures every ``plotting.plot_every`` epochs.
 
 Run modes (Decision V2-D8): a CLI and an edit-and-run ``RUN_CONFIG``,
 auto-detected from whether any command-line argument is present::
@@ -44,6 +48,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -64,8 +69,14 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.pl_module_synth i
     SyntheticSeqVaeLagAttnPl,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
+    _EVAL_KEYS,
+    _FIELDNAMES,
     _OVERRIDE_MAP,
+    _TRAIN_KEYS,
     _TRAIN_METRIC_KEYS,
+    _assemble_row,
+    _refresh_training_curves,
+    append_csv_row,
     apply_path_overrides,
     build_model,
     load_config,
@@ -74,6 +85,8 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal imp
     save_checkpoint,
     set_seed,
 )
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+from train.graph_models_utils import load_checkpoint_strict
 
 _PKG_DIR = Path(__file__).resolve().parent
 _DEFAULT_CONFIG = _PKG_DIR / "config_synth.yaml"
@@ -191,6 +204,106 @@ def _apply_train_overrides(
 
 
 # =============================================================================
+# Loss-curve plotting (rank-0 only)
+# =============================================================================
+class _SyntheticCurveCallback(pl.Callback):
+    r"""Rank-0 callback that mirrors the single-GPU loss-curve pipeline.
+
+    Each epoch it appends one :data:`train_minimal._FIELDNAMES`-schema row to
+    ``metrics.csv`` -- built from the epoch-level, distributed-synced metrics in
+    ``trainer.callback_metrics`` (validation metrics are reduced across ranks
+    via ``sync_dist=True`` in :class:`train.pl_model_base.LightningModelBase`) --
+    and, every ``plot_every`` epochs plus once at fit end, re-renders
+    ``training_curves.{pdf,png}`` and ``loss_plot_epoch.html`` via
+    :func:`train_minimal._refresh_training_curves`. The figures are therefore
+    identical in look and location to a single-GPU :mod:`train_minimal` run.
+
+    DDP-safety: every disk write / render happens **only on global rank 0** and
+    reads already-reduced metrics, so no collective op runs inside the rank-0
+    branch (one would otherwise deadlock the other ranks). The render path is
+    wrapped in ``try/except`` inside ``_refresh_training_curves``, so a plotting
+    failure never aborts training.
+
+    Three columns have no DDP source and fall back gracefully (the renderers
+    tolerate NaN): ``train_grad_norm`` (gradient clipping is ``Trainer``-managed),
+    ``nan_skips`` (taken from ``train/spike_skips_total`` when present, else 0),
+    and ``epoch_seconds`` (timed by this callback).
+
+    Args:
+        csv_path: Destination ``metrics.csv``; figures are written next to it.
+        run_tag: Run label used in figure titles.
+        plotting_cfg: The ``plotting`` config block (carries the ``enabled``
+            toggle that ``_refresh_training_curves`` honours).
+        plot_every: Render cadence in epochs; ``0`` renders only at fit end.
+        has_val: Whether a validation loader exists. When ``True`` the row is
+            written at ``on_validation_epoch_end`` (so val metrics are present);
+            when ``False`` it is written at ``on_train_epoch_end``.
+    """
+
+    def __init__(
+        self,
+        *,
+        csv_path: Path,
+        run_tag: str,
+        plotting_cfg: Dict[str, Any],
+        plot_every: int,
+        has_val: bool,
+    ) -> None:
+        self.csv_path = Path(csv_path)
+        self.run_tag = run_tag
+        self.plotting_cfg = plotting_cfg
+        self.plot_every = int(plot_every)
+        self.has_val = bool(has_val)
+        self._epoch_t0: Optional[float] = None
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Stamp the epoch start time for the ``epoch_seconds`` column."""
+        self._epoch_t0 = time.time()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Write the metrics row when there is no validation loop."""
+        if not self.has_val:
+            self._write_and_maybe_plot(trainer)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Write the metrics row after validation (the common path)."""
+        if self.has_val:
+            self._write_and_maybe_plot(trainer)
+
+    def on_fit_end(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Final render -- covers ``epochs < plot_every`` (cf. train_minimal)."""
+        if not trainer.is_global_zero:
+            return
+        _refresh_training_curves(self.csv_path, self.run_tag, self.plotting_cfg)
+
+    def _write_and_maybe_plot(self, trainer: pl.Trainer) -> None:
+        """Append one CSV row on rank 0 and refresh figures on schedule."""
+        if not trainer.is_global_zero:
+            return
+        if trainer.sanity_checking:
+            return
+        cm = trainer.callback_metrics
+        train_m: Dict[str, float] = {
+            k: _as_float(cm.get(f"train/{k}", float("nan"))) for k in _TRAIN_KEYS
+        }
+        train_m["grad_norm"] = float("nan")  # clipping is Trainer-managed
+        train_m["nan_skips"] = int(
+            _as_float(cm.get("train/spike_skips_total", 0.0))
+        )
+        val_m: Dict[str, float] = {
+            k: _as_float(cm.get(f"val/{k}", float("nan"))) for k in _EVAL_KEYS
+        }
+        epoch = int(trainer.current_epoch) + 1  # 1-based, matching train_minimal
+        lr = _as_float(cm.get("lr", float("nan")))
+        dt = time.time() - self._epoch_t0 if self._epoch_t0 is not None else float("nan")
+        append_csv_row(
+            self.csv_path, _assemble_row(epoch, train_m, val_m, lr, dt), _FIELDNAMES
+        )
+        if self.plot_every > 0 and epoch % self.plot_every == 0:
+            _refresh_training_curves(self.csv_path, self.run_tag, self.plotting_cfg)
+
+
+# =============================================================================
 # Trainer
 # =============================================================================
 def _build_trainer(
@@ -201,6 +314,8 @@ def _build_trainer(
     devices: Union[int, List[int]],
     n_gpus: int,
     has_val: bool,
+    run_tag: str,
+    plotting_cfg: Dict[str, Any],
 ) -> pl.Trainer:
     """Construct the ``pl.Trainer``, mirroring ``trainer_lag_attn_v1``.
 
@@ -209,8 +324,12 @@ def _build_trainer(
     ``use_distributed_sampler=True`` so the DataModule's plain loaders are
     sharded automatically, and a ``CSVLogger`` + ``ModelCheckpoint`` for
     monitoring. The synthetic-format checkpoints are written separately by
-    :func:`_export_checkpoints` (the Lightning ``ModelCheckpoint`` file is a
-    convenience artifact and is **not** consumed by ``mixed_eval``).
+    :func:`_export_checkpoints` (the Lightning ``ModelCheckpoint`` file lives in
+    ``lightning_ckpts/`` and is **not** consumed by ``mixed_eval``; it is the
+    snapshot of the best-val weights that ``_export_checkpoints`` converts into
+    the synthetic-format ``best.ckpt``). When ``plotting.enabled`` a rank-0
+    :class:`_SyntheticCurveCallback` emits the single-GPU-equivalent
+    ``metrics.csv`` + loss-curve figures.
     """
     callbacks: List[Any] = [LearningRateMonitor(logging_interval="epoch")]
     if has_val:
@@ -221,6 +340,16 @@ def _build_trainer(
                 mode="min",
                 save_top_k=1,
                 filename="lightning_best-{epoch:02d}",
+            )
+        )
+    if plotting_cfg.get("enabled", True):
+        callbacks.append(
+            _SyntheticCurveCallback(
+                csv_path=results_dir / "metrics.csv",
+                run_tag=run_tag,
+                plotting_cfg=plotting_cfg,
+                plot_every=int(plotting_cfg.get("plot_every", 10)),
+                has_val=has_val,
             )
         )
 
@@ -264,7 +393,7 @@ def _export_checkpoints(
     epochs: int,
     n_stats: int,
 ) -> None:
-    """Write ``final.ckpt`` in the synthetic ``save_checkpoint`` format (rank 0).
+    """Write ``final.ckpt`` and ``best.ckpt`` in the synthetic format (rank 0).
 
     The bare ``SeqVaeLagAttnV1`` (``pl_model.orig_model``) is checkpointed so the
     state-dict keys are unprefixed and align exactly with the strict loader. The
@@ -273,6 +402,25 @@ def _export_checkpoints(
     only ``beta`` but ``mixed_eval.per_cell_lag_recovery`` reads ``kld_beta``, so
     the duplicate keeps the LOLO ablation on the trained $\\beta$ rather than the
     ``0.001`` default fallback.
+
+    Two artifacts are produced, matching the single-GPU :mod:`train_minimal`
+    contract:
+
+    * ``final.ckpt`` -- the trained model after :meth:`fit_latent_stats`, so
+      ``latent_stats_fitted=(n_stats > 0)``.
+    * ``best.ckpt`` -- the lowest ``val/total_loss`` snapshot. The DDP loop keeps
+      no per-epoch model copy of its own, so the Lightning ``ModelCheckpoint``
+      (``lightning_ckpts/lightning_best-*.ckpt``) is the only record of the
+      best-val weights; they are loaded into a fresh
+      ``SeqVaeLagAttnV1(**model_kwargs)`` via ``load_checkpoint_strict`` (which
+      strips the ``model.`` / ``_orig_model.`` wrapper prefixes and dedups the
+      duplicate registration) and re-saved here with ``latent_stats_fitted=False``
+      (the best snapshot predates the latent-stats fit, exactly as single-GPU).
+      With no validation split the Lightning best does not exist, so ``best.ckpt``
+      falls back to a copy of ``final.ckpt`` (cf. ``train_minimal``). Either way
+      the synthetic ``best.ckpt`` / ``final.ckpt`` are the consumable artifacts;
+      the Lightning file stays in ``lightning_ckpts/`` and is never named
+      ``best.ckpt`` / ``final.ckpt``.
     """
     cm = trainer.callback_metrics
     train_metrics = {
@@ -299,6 +447,56 @@ def _export_checkpoints(
     )
     print(f"[train_ddp] wrote {results_dir / 'final.ckpt'} "
           f"(latent_stats_fitted={n_stats > 0}, samples={n_stats})")
+
+    # --- best.ckpt: synthetic-format mirror of the Lightning best snapshot -----
+    ckpt_cb = getattr(trainer, "checkpoint_callback", None)
+    best_path = getattr(ckpt_cb, "best_model_path", "") or ""
+    if best_path and Path(best_path).is_file():
+        # YAML / checkpoint store ``logvar_clamp`` as a list; the constructor
+        # wants a tuple (same coercion ``evaluate_te.load_eval_checkpoint`` does).
+        best_kwargs = dict(model_kwargs)
+        clamp = best_kwargs.get("logvar_clamp")
+        if clamp is not None and not isinstance(clamp, tuple):
+            best_kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
+        best_model = SeqVaeLagAttnV1(**best_kwargs)
+        if load_checkpoint_strict(best_model, best_path, map_location="cpu") is None:
+            raise RuntimeError(
+                f"load_checkpoint_strict could not align the Lightning best "
+                f"checkpoint {best_path} with SeqVaeLagAttnV1(**model_kwargs)."
+            )
+        best_score = _as_float(getattr(ckpt_cb, "best_model_score", float("nan")))
+        save_checkpoint(
+            results_dir / "best.ckpt",
+            model=best_model,
+            model_kwargs=model_kwargs,
+            config=config,
+            data_meta=data_meta,
+            epoch=int(trainer.current_epoch or epochs),
+            val_loss=best_score,
+            train_metrics=train_metrics,
+            loss_settings=loss_settings_aug,
+            latent_stats_fitted=False,
+        )
+        print(f"[train_ddp] wrote {results_dir / 'best.ckpt'} "
+              f"(from {Path(best_path).name}, val/total_loss={best_score:.4f}, "
+              f"latent_stats_fitted=False)")
+    else:
+        # No validation split / no best tracked -> mirror train_minimal's
+        # fallback: best.ckpt == final.ckpt (with the fitted latent stats).
+        save_checkpoint(
+            results_dir / "best.ckpt",
+            model=pl_model.orig_model,
+            model_kwargs=model_kwargs,
+            config=config,
+            data_meta=data_meta,
+            epoch=int(trainer.current_epoch or epochs),
+            val_loss=val_loss,
+            train_metrics=train_metrics,
+            loss_settings=loss_settings_aug,
+            latent_stats_fitted=(n_stats > 0),
+        )
+        print(f"[train_ddp] wrote {results_dir / 'best.ckpt'} "
+              f"(fallback = final.ckpt, latent_stats_fitted={n_stats > 0})")
 
 
 # =============================================================================
@@ -382,12 +580,19 @@ def train_ddp(
     ).is_file()
 
     epochs = int(optim_cfg["epochs"])
+    plotting_cfg = config.get("plotting") or {}
     trainer = _build_trainer(
         ddp_cfg=ddp_cfg, results_dir=results_dir, epochs=epochs,
         devices=devices, n_gpus=n_gpus, has_val=has_val,
+        run_tag=run_tag, plotting_cfg=plotting_cfg,
     )
 
     if _env_rank_zero():
+        # Start the per-epoch metrics log fresh (mirrors train_minimal), so the
+        # rank-0 _SyntheticCurveCallback does not append to a stale run's CSV.
+        csv_path = results_dir / "metrics.csv"
+        if csv_path.is_file():
+            csv_path.unlink()
         with open(results_dir / "config_used.yaml", "w", encoding="utf-8") as fh:
             yaml.safe_dump(config, fh, sort_keys=False)
         print(
