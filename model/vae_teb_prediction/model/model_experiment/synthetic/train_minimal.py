@@ -253,6 +253,16 @@ def resolve_active_benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     config["sweep"] = deepcopy(block.get("sweep", {}))
     if "rho_null" in block:
         config["rho_null"] = deepcopy(block["rho_null"])
+    # Optional per-benchmark loss overlay: a benchmark block may carry a
+    # ``loss`` sub-block whose keys are merged onto (not replacing) the global
+    # ``loss`` block. This lets a benchmark pin its own likelihood / sigma_obs
+    # (e.g. ``G1_mix`` trains under ``gaussian_nll`` for nat-scale calibration)
+    # without flipping the global default for every other benchmark. No-op for
+    # any block that does not define ``loss``, so existing benchmarks are
+    # unaffected.
+    if "loss" in block:
+        config.setdefault("loss", {})
+        config["loss"].update(deepcopy(block["loss"]))
     return config
 
 

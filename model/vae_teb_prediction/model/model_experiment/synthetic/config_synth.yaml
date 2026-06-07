@@ -297,6 +297,85 @@ benchmarks:
       m_grid: [1, 4]                # M=4 -> 40 source ch; M=8 -> 80 ch (still <= 101)
                                     # Keep [1, 4] for safety against larger K_classes.
 
+  # Benchmark G1_mix -- mixed-population generalization experiment (one model on
+  # a heterogeneous pool). Unlike every other benchmark, G1_mix is NOT built by
+  # build_dataset's single-generator path: synthetic.mixed_dataset solves and
+  # generates one cell per (M, target_te, lag_band) triple and concatenates the
+  # samples into a single cache, stamping per-sample provenance (sample_te_true /
+  # sample_M / sample_delay_min/max / sample_band_id / sample_cell_id /
+  # sample_held_out) so synthetic.mixed_eval can recover K_bar / lag / TE per
+  # sub-population and test held-out (M, TE, band) extrapolation. All cells share
+  # the G1 AR(2)-oscillator DGP with the within-signal random-walk lag.
+  # The `loss` overlay pins gaussian_nll so K_bar is on a nat scale (gamma -> 1
+  # calibration) without changing the global default for G1 / G2 / G3.
+  G1_mix:
+    data:
+      sequence_length: 300
+      oscillators: [[0.99, 0.05]]   # single spec; tiled to each cell's M
+      target_ar: 0.95
+      sigma2_y: 1.0
+      sigma2_eta: 0.01
+      K_history: 160                # generous history for the near-unit-root source
+      standardize: true             # per-cell z-score; the pool is NOT re-standardized
+      reverse_roles: false
+      delay_walk: true              # lag drifts within each signal (realistic CTG regime)
+      delay_walk_step_prob: 0.02
+      te_n_samples: 2000            # GENERATION budget only: the generator's
+                                    # meta.te_true is DISCARDED (sample_te_true
+                                    # comes from the inverter solve below), and
+                                    # the sample data is independent of this, so
+                                    # a small value just speeds the build. The
+                                    # accurate per-cell TE uses mix.inverter.n_samples.
+      c_y_st: 43                    # native channel layout (V2-D1)
+      c_y_ph: 44
+      c_u_st: 43
+      c_u_ph: 58
+      channel_decomp:
+        <<: *channel_decomp_defaults
+    # Per-benchmark loss overlay (merged onto the global `loss` block by
+    # train_minimal.resolve_active_benchmark) -- nat-scale calibration.
+    loss:
+      likelihood: gaussian_nll      # feat / base losses in nats
+      sigma_obs: learned            # reuse the model's logvar_full / logvar_base heads
+    # Mixed-population grid + holdout (consumed by synthetic.mixed_dataset).
+    mix:
+      m_grid: [8, 16, 32]                       # informative-channel axis
+      target_te_grid: [0.1, 0.7, 1.5, 3.0]      # mean block TE (nats), held fixed across M
+      lag_bands:                                # name -> [delay_min, delay_max]
+        short: [1, 8]                           # band ell* = {0, ..., 7}
+        mid:   [1, 15]                          # band ell* = {0, ..., 14}
+        long:  [1, 31]                          # band ell* = {0, ..., 30}
+      n_per_cell_train: 1000                    # samples per (M, TE, band) cell
+      n_per_cell_val:   200
+      n_per_cell_test:  300
+      te_floor_margin: 1.5                      # trim cells whose per-channel target
+                                                # (target_te / M) <= MC-floor * margin
+      build_seed: 0                             # base seed for cell generation + shuffle
+      holdout:                                  # interior (M, TE, band) triples NEVER
+                                                # trained -> a separate test-only cache
+                                                # for extrapolation. Each value (M / TE /
+                                                # band) still appears in trained cells.
+        - [16, 0.7, mid]
+        - [16, 1.5, short]
+        - [8,  1.5, long]
+        - [32, 0.7, short]
+        - [16, 3.0, long]
+        - [32, 1.5, mid]
+      inverter:                                 # B_y_for_mean_te_block_state_space knobs
+        n_samples: 12000
+        lo: 1.0e-4
+        hi: 10.0
+        tol: 0.005
+        max_iter: 30
+    # Per-group evaluation knobs (consumed by synthetic.mixed_eval).
+    eval:
+      warmup: null                              # null -> model.warmup_period
+      window_width: 10                          # sliding-window LOLO width (steps)
+      lag_grid_step: 5                          # coarse LOLO stride
+      fine_lag_grid_step: 1                     # fine stride inside each cell's band
+      n_lolo_per_cell: 256                      # cap LOLO samples per cell
+      null_controls: [shuffle, reverse]         # per-cell source-corruption controls
+
 # --- model constructor kwargs (native shapes, V2-D1) -------------------------
 model:
   sequence_length: 300

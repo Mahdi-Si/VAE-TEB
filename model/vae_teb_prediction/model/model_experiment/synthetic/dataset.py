@@ -44,6 +44,21 @@ from torch.utils.data._utils.collate import default_collate
 # Tensor fields stored in every split ``.npz`` (native model channel layout).
 _FIELDS = ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight")
 
+# Optional per-sample provenance arrays written **only** by the mixed-population
+# builder (:mod:`mixed_dataset`). Each is length ``n`` and aligned to ``fhr_st``.
+# Homogeneous caches written by :mod:`build_dataset` do not carry these keys, so
+# the loader treats them as strictly optional (gated on ``npz.files``) and the
+# legacy single-setting behaviour is preserved bit-for-bit.
+_PROVENANCE_FIELDS = (
+    "sample_te_true",    # float32 -- cell-level mean block TE $\bar{\mathrm{TE}}$
+    "sample_M",          # int16   -- informative-channel count of the sample
+    "sample_delay_min",  # int16   -- lag-band floor $d_{\min}$
+    "sample_delay_max",  # int16   -- lag-band ceiling $d_{\max}$
+    "sample_band_id",    # int8    -- lag-band index (0=short, 1=mid, 2=long)
+    "sample_cell_id",    # int16   -- index into the mixture manifest cell list
+    "sample_held_out",   # int8    -- 0 in-mix, 1 held-out cache
+)
+
 
 class AttributeDict(dict):
     """A ``dict`` that also supports attribute-style access.
@@ -172,6 +187,13 @@ class SyntheticTEDataset(Dataset):
                 np.asarray(npz["true_lag_tt"]) if "true_lag_tt" in npz.files
                 else None
             )
+            # Optional per-sample provenance (mixed-population caches only).
+            # All-or-nothing: present only when the cache was written by
+            # ``mixed_dataset``. ``None`` for every homogeneous cache.
+            present = [f for f in _PROVENANCE_FIELDS if f in npz.files]
+            self._provenance: Optional[Dict[str, np.ndarray]] = (
+                {f: np.asarray(npz[f]) for f in present} if present else None
+            )
         self._n = int(self._arrays["fhr_st"].shape[0])
 
     def __len__(self) -> int:
@@ -189,7 +211,10 @@ class SyntheticTEDataset(Dataset):
             per-sample metadata ``te_true`` (float), ``true_lag_band``
             (``long`` tensor) and ``guid`` (str). When the cache carries the
             per-step ground-truth lag, ``true_lag_tt`` (``long`` tensor of shape
-            $(T,)$) is also attached for the lag-attention overlay.
+            $(T,)$) is also attached for the lag-attention overlay. For a
+            mixed-population cache (:mod:`mixed_dataset`), ``te_true`` is the
+            sample's own cell TE and the grouping scalars ``M``, ``delay_min``,
+            ``delay_max``, ``band_id``, ``cell_id`` and ``held_out`` are added.
         """
         sample = AttributeDict()
         for field in _FIELDS:
@@ -203,6 +228,22 @@ class SyntheticTEDataset(Dataset):
             sample["true_lag_tt"] = torch.from_numpy(
                 self._true_lag_tt[idx].astype(np.int64)
             )                                                    # (T,) long
+        if self._provenance is not None:
+            # Override the dataset-level ``te_true`` with this sample's own
+            # cell TE and attach the per-sample grouping scalars. Only plain
+            # Python scalars are added (no per-sample ``true_lag_band`` tensor)
+            # so batches mixing different ``delay_max`` collate cleanly to
+            # ``(B,)`` -- a ragged band tensor would break ``default_collate``.
+            # The evaluator rebuilds each group's band $\{0,\dots,d_{\max}-1\}$
+            # from ``delay_max``.
+            prov = self._provenance
+            sample["te_true"] = float(prov["sample_te_true"][idx])
+            sample["M"] = int(prov["sample_M"][idx])
+            sample["delay_min"] = int(prov["sample_delay_min"][idx])
+            sample["delay_max"] = int(prov["sample_delay_max"][idx])
+            sample["band_id"] = int(prov["sample_band_id"][idx])
+            sample["cell_id"] = int(prov["sample_cell_id"][idx])
+            sample["held_out"] = int(prov["sample_held_out"][idx])
         sample["guid"] = f"{self._tag}_{self.split}_{idx:06d}"
         return sample
 
