@@ -17,10 +17,11 @@ What it guards:
 """
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.train_ddp import 
     train_ddp,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
+    _FIELDNAMES,
     load_config,
 )
 from train.graph_models_utils import load_checkpoint_strict
@@ -77,8 +79,13 @@ def _write_cache(cache_dir: Path, n: int, stem: str) -> None:
                        "true_lag_band": [1, 2, 3]}, fh)
 
 
-def _run(tmp: Path) -> Tuple[Path, Dict]:
-    """Build caches, run a 1-epoch single-device train_ddp, return ckpt + state."""
+def _run(tmp: Path) -> Path:
+    """Build caches, run a 2-epoch single-device train_ddp, return the run dir.
+
+    Two epochs with ``plot_every=1`` force at least one periodic loss-curve
+    refresh (in addition to the unconditional ``on_fit_end`` render), so the
+    figure assertions exercise the scheduled path rather than only the final one.
+    """
     tag = "ddp_smoke"
     data_dir = tmp / "data"
     results_dir = tmp / "results"
@@ -95,43 +102,80 @@ def _run(tmp: Path) -> Tuple[Path, Dict]:
             "data_tag": tag,
             "run_tag": tag,
             "devices": 1,
-            "epochs": 1,
+            "epochs": 2,
             "batch_size": 4,
+            "plot_every": 1,
             "data_dir": str(data_dir),
             "results_dir": str(results_dir),
         },
     )
-    ckpt_path = results_dir / "G1_mix" / tag / "final.ckpt"
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    return ckpt_path, ckpt
+    return results_dir / "G1_mix" / tag
+
+
+def _assert_loss_settings(ls: Dict) -> None:
+    """Assert the ``loss_settings`` block carries the full downstream contract."""
+    for key in ("beta", "kld_beta", "lambda_full", "lambda_base",
+                "likelihood", "sigma_obs", "free_bits"):
+        assert key in ls, f"loss_settings missing {key!r}"
+    assert ls["kld_beta"] == ls["beta"], "kld_beta must mirror beta"
+    # G1_mix overlay pins the nat-scale likelihood.
+    assert ls["likelihood"] == "gaussian_nll"
+
+
+def _assert_strict_loadable(ckpt: Dict) -> None:
+    """Assert the ckpt rebuilds + strict-loads into a fresh model exactly."""
+    fresh = SeqVaeLagAttnV1(**ckpt["model_kwargs"])
+    assert set(ckpt["model_state_dict"]) == set(fresh.state_dict()), (
+        "checkpoint state_dict keys do not match SeqVaeLagAttnV1(**model_kwargs)"
+    )
+    # Exercise the exact downstream contract mixed_eval / evaluate_te use.
+    loaded = load_checkpoint_strict(fresh, ckpt, map_location="cpu")
+    assert loaded is not None, "load_checkpoint_strict rejected the ckpt"
 
 
 def test_train_ddp_smoke() -> None:
-    """One-epoch single-device run produces a loadable synthetic-format ckpt."""
+    """Single-device run produces loadable ckpts + single-GPU-style figures."""
     with tempfile.TemporaryDirectory() as _tmp:
-        ckpt_path, ckpt = _run(Path(_tmp))
+        run_dir = _run(Path(_tmp))
 
-        assert ckpt_path.is_file(), f"final.ckpt missing at {ckpt_path}"
+        # --- final.ckpt: post latent-stats fit, full synthetic-format bridge ---
+        final_path = run_dir / "final.ckpt"
+        assert final_path.is_file(), f"final.ckpt missing at {final_path}"
+        final = torch.load(final_path, map_location="cpu", weights_only=False)
+        _assert_strict_loadable(final)
+        assert final["latent_stats_fitted"] is True, "fit_latent_stats did not run"
+        _assert_loss_settings(final["loss_settings"])
 
-        # State-dict keys must match a fresh model exactly (strict-loader rule).
-        fresh = SeqVaeLagAttnV1(**ckpt["model_kwargs"])
-        assert set(ckpt["model_state_dict"]) == set(fresh.state_dict()), (
-            "checkpoint state_dict keys do not match SeqVaeLagAttnV1(**model_kwargs)"
+        # --- best.ckpt: synthetic-format mirror of the Lightning best snapshot --
+        best_path = run_dir / "best.ckpt"
+        assert best_path.is_file(), f"best.ckpt missing at {best_path}"
+        best = torch.load(best_path, map_location="cpu", weights_only=False)
+        _assert_strict_loadable(best)
+        assert best["latent_stats_fitted"] is False, (
+            "best.ckpt must predate the latent-stats fit (latent_stats_fitted=False)"
         )
-        # Exercise the exact downstream contract mixed_eval / evaluate_te use.
-        loaded = load_checkpoint_strict(fresh, ckpt, map_location="cpu")
-        assert loaded is not None, "load_checkpoint_strict rejected the ckpt"
+        _assert_loss_settings(best["loss_settings"])
+        assert "benchmark" in best["data_meta"] or "tag" in best["data_meta"], (
+            "best.ckpt lost data_meta"
+        )
 
-        assert ckpt["latent_stats_fitted"] is True, "fit_latent_stats did not run"
+        # No Lightning-format file is ever named best.ckpt / final.ckpt.
+        for cons in (final, best):
+            assert "model_kwargs" in cons, "consumable ckpt lost model_kwargs"
 
-        ls = ckpt["loss_settings"]
-        for key in ("beta", "kld_beta", "lambda_full", "lambda_base",
-                    "likelihood", "sigma_obs", "free_bits"):
-            assert key in ls, f"loss_settings missing {key!r}"
-        assert ls["kld_beta"] == ls["beta"], "kld_beta must mirror beta"
-        # G1_mix overlay pins the nat-scale likelihood.
-        assert ls["likelihood"] == "gaussian_nll"
-        print("[test_train_ddp] OK -- final.ckpt bridge verified")
+        # --- loss-curve artifacts (single-GPU look + location) -----------------
+        csv_path = run_dir / "metrics.csv"
+        assert csv_path.is_file(), f"metrics.csv missing at {csv_path}"
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh))
+        assert header == _FIELDNAMES, (
+            f"metrics.csv header diverges from single-GPU schema:\n"
+            f"  got: {header}\n  want: {_FIELDNAMES}"
+        )
+        assert (run_dir / "loss_plot_epoch.html").is_file(), "loss HTML missing"
+        assert (run_dir / "training_curves.png").is_file(), "curves PNG missing"
+
+        print("[test_train_ddp] OK -- final/best ckpt bridge + figures verified")
 
 
 if __name__ == "__main__":
