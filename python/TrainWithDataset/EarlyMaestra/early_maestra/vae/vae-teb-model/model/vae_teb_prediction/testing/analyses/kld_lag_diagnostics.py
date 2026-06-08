@@ -38,6 +38,7 @@ from model.vae_teb_prediction.testing.collectors import (
     _extract_epoch,
     _extract_guid,
     _extract_label,
+    _extract_te_true,
     denormalize_signal,
     resolve_fhr_up_denorm_stats,
 )
@@ -242,6 +243,25 @@ def run_kld_lag_diagnostics(
                 guid = _extract_guid(batch, idx)
                 epoch = _extract_epoch(batch, idx)
                 label = _extract_label(batch, idx)
+                # Per-sample analytic true TE (None for real / HDF5 batches).
+                true_te = _extract_te_true(batch, idx)
+
+                # Scalar TE surrogate K-bar for the title bar: sum over latent
+                # dims (the ``mixed_eval`` reduction), then mean over the
+                # warmup-trimmed window [warm:T) -- the same window as the
+                # ``kld_mean_all`` summary stat below (no per-sample d_max floor /
+                # T-H bound, so it stays portable to real batches). ``None`` if
+                # the window is empty.
+                warm = int(runner.warmup_steps)
+                kld_one = kld_per_dim_np[idx]                      # (T, d_z)
+                kld_one_tail = (
+                    kld_one[warm:] if 0 < warm < kld_one.shape[0] else kld_one
+                )
+                kbar_sample = (
+                    float(kld_one_tail.sum(axis=-1).mean())
+                    if kld_one_tail.size
+                    else None
+                )
 
                 safe_guid = (
                     str(guid).replace("/", "_")
@@ -272,6 +292,8 @@ def run_kld_lag_diagnostics(
                         guid=guid,
                         epoch=epoch,
                         label=label,
+                        kld_value=kbar_sample,
+                        true_te=true_te,
                         fs_raw=fs_raw,
                         decim=decim,
                     )
@@ -304,6 +326,8 @@ def run_kld_lag_diagnostics(
                             guid=guid,
                             epoch=epoch,
                             label=label,
+                            kld_value=kbar_sample,
+                            true_te=true_te,
                             fs_raw=fs_raw,
                             decim=decim,
                         )
@@ -337,6 +361,8 @@ def run_kld_lag_diagnostics(
                         guid=guid,
                         epoch=epoch,
                         label=label,
+                        kld_value=kbar_sample,
+                        true_te=true_te,
                         fs_raw=fs_raw,
                         decim=decim,
                     )
@@ -358,6 +384,8 @@ def run_kld_lag_diagnostics(
                     "guid": guid,
                     "epoch": epoch,
                     "label": label,
+                    "te_true": true_te,
+                    "kbar_sum": kbar_sample,
                     "signals_kld_pdf": str(signals_out.name) if signals_out else None,
                     "signals_kld_pca_pdf": str(pca_out.name) if pca_out else None,
                     "lag_attention_pdf": str(lag_out.name) if lag_out else None,

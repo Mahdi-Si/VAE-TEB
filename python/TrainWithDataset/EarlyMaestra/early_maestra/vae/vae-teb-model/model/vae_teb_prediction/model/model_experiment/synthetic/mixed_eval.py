@@ -601,6 +601,10 @@ def evaluate_mixed(
         "warmup": warmup,
         "horizon": horizon,
         "calibration": {"in_mix": slices_in, "holdout": slices_ho},
+        "kld_te_association": {
+            "in_mix": kld_te_association(arrs_in),
+            "holdout": kld_te_association(arrs_ho) if rows_ho else {},
+        },
         "n_cells_in_mix": len(rows_in),
         "n_cells_holdout": len(rows_ho),
         "generalization": generalization,
@@ -742,6 +746,11 @@ def _render_figures(
         ("lag_band_recovery", _fig_lag_recovery),
         ("generalization_gap", _fig_generalization),
         ("null_controls", _fig_null_controls),
+        ("kld_vs_te_scatter", _fig_kld_vs_te_scatter),
+        ("te_recovery_scatter", _fig_te_recovery_scatter),
+        ("te_residual_vs_te", _fig_te_residual_vs_te),
+        ("kld_vs_te_binned", _fig_kld_vs_te_binned),
+        ("corr_by_M_bars", _fig_corr_by_m_bars),
     ):
         try:
             fn(out_dir / name, rows_in, rows_ho, arrs, slices, controls)
@@ -924,6 +933,269 @@ def _fig_null_controls(path, rows_in, rows_ho, arrs, slices, controls) -> None:
                        rotation=90, fontsize=6)
     ax.set_ylabel(r"mean latent KL  $\bar K$")
     ax.set_title("Null controls: source shuffle / reverse collapse")
+    ax.legend(fontsize=8, frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+# =============================================================================
+# KLD-vs-TE association: per-sample scatter, recovery, residual, binning
+# =============================================================================
+
+
+def _mutual_info(x: np.ndarray, y: np.ndarray) -> float:
+    r"""Estimate the mutual information $I(X; Y)$ in nats between two 1-D arrays.
+
+    Prefers the k-NN estimator :func:`sklearn.feature_selection.mutual_info_regression`
+    (output already in nats); falls back to the Gaussian closed form
+    $-\tfrac12\ln(1-\rho^2)$ from the Pearson correlation $\rho$ when sklearn is
+    unavailable or the estimator fails.
+
+    Args:
+        x: Predictor samples $(N,)$.
+        y: Target samples $(N,)$.
+
+    Returns:
+        The estimated mutual information in nats (``nan`` if degenerate).
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    if x.size < 3 or np.std(x) <= 0.0 or np.std(y) <= 0.0:
+        return float("nan")
+    try:
+        from sklearn.feature_selection import mutual_info_regression
+
+        mi = mutual_info_regression(
+            x.reshape(-1, 1), y, discrete_features=False, random_state=0
+        )
+        return float(mi[0])
+    except Exception:  # noqa: BLE001 -- fall back to the Gaussian approximation
+        rho = float(np.corrcoef(x, y)[0, 1])
+        rho = min(max(rho, -0.999999), 0.999999)
+        return float(-0.5 * np.log(1.0 - rho ** 2))
+
+
+def _assoc_stats(kbar: np.ndarray, te: np.ndarray) -> Dict[str, float]:
+    r"""Compute the KLD-vs-TE association summary (Pearson / Spearman / MI / OLS).
+
+    Args:
+        kbar: Per-sample mean latent KL $\bar K$ $(N,)$.
+        te: Per-sample true block TE $(N,)$.
+
+    Returns:
+        ``{"pearson", "spearman", "mi", "alpha", "gamma", "r2", "n"}`` -- any
+        entry is ``nan`` when its estimator is undefined (e.g. a single distinct
+        TE value).
+    """
+    kbar = np.asarray(kbar, dtype=float).ravel()
+    te = np.asarray(te, dtype=float).ravel()
+    out: Dict[str, float] = {
+        "pearson": float("nan"), "spearman": float("nan"), "mi": float("nan"),
+        "alpha": float("nan"), "gamma": float("nan"), "r2": float("nan"),
+        "n": float(kbar.size),
+    }
+    if kbar.size < 2:
+        return out
+    try:
+        from scipy.stats import pearsonr, spearmanr
+
+        if np.std(te) > 0 and np.std(kbar) > 0:
+            out["pearson"] = float(pearsonr(te, kbar)[0])
+            out["spearman"] = float(spearmanr(te, kbar).statistic)
+    except Exception:  # noqa: BLE001
+        if np.std(te) > 0 and np.std(kbar) > 0:
+            out["pearson"] = float(np.corrcoef(te, kbar)[0, 1])
+    out["mi"] = _mutual_info(kbar, te)
+    try:
+        fit = fit_calibration_slope(list(zip(te.tolist(), kbar.tolist())))
+        out.update({"alpha": float(fit["alpha"]), "gamma": float(fit["gamma"]),
+                    "r2": float(fit["r2"])})
+    except ValueError:
+        pass
+    return out
+
+
+def kld_te_association(arrs: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    r"""Headline KLD-vs-TE association over all samples + per-$M$ slices.
+
+    Args:
+        arrs: The aligned per-sample arrays from :func:`collect_per_sample_kbar`.
+
+    Returns:
+        ``{"overall": stats, "by_M": {M: stats}}`` with :func:`_assoc_stats`
+        dicts.
+    """
+    kbar = np.asarray(arrs["kbar"], dtype=float)
+    te = np.asarray(arrs["te_true"], dtype=float)
+    m = np.asarray(arrs["M"], dtype=int)
+    by_M: Dict[str, Any] = {}
+    for mm in sorted(set(m.tolist())):
+        sel = m == mm
+        by_M[str(int(mm))] = _assoc_stats(kbar[sel], te[sel])
+    return {"overall": _assoc_stats(kbar, te), "by_M": by_M}
+
+
+def _scatter_by_m(ax, te: np.ndarray, kbar: np.ndarray, m: np.ndarray) -> None:
+    """Scatter ``(te, kbar)`` coloured by ``M`` onto ``ax`` (one label per M)."""
+    for mm in sorted(set(np.asarray(m, dtype=int).tolist())):
+        sel = np.asarray(m, dtype=int) == mm
+        ax.scatter(
+            te[sel], kbar[sel], s=10, alpha=0.35, linewidths=0.0,
+            color=_M_COLORS.get(int(mm), ps.COLOR_PURPLE), label=f"M={int(mm)}",
+            zorder=2,
+        )
+
+
+def _fig_kld_vs_te_scatter(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-sample $\bar K$ vs true TE scatter with OLS line + correlation / MI."""
+    import matplotlib.pyplot as plt
+
+    te = np.asarray(arrs["te_true"], dtype=float)
+    kbar = np.asarray(arrs["kbar"], dtype=float)
+    m = np.asarray(arrs["M"], dtype=int)
+    if te.size == 0:
+        return
+    st = _assoc_stats(kbar, te)
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.2))
+    _scatter_by_m(ax, te, kbar, m)
+    if np.isfinite(st["gamma"]):
+        xs = np.linspace(float(te.min()), float(te.max()), 50)
+        ax.plot(xs, st["alpha"] + st["gamma"] * xs, color=ps.COLOR_BLACK, lw=1.6,
+                zorder=4,
+                label=(rf"OLS: $\bar K$={st['gamma']:.2f}$\,$TE+{st['alpha']:.2f}"))
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
+    ax.set_title("Per-sample KLD vs true TE")
+    txt = (
+        f"N = {int(st['n'])}\n"
+        f"Pearson r = {st['pearson']:.3f}\n"
+        f"Spearman $\\rho$ = {st['spearman']:.3f}\n"
+        f"MI = {st['mi']:.3f} nats\n"
+        f"$R^2$ = {st['r2']:.3f}"
+    )
+    ax.text(0.03, 0.97, txt, transform=ax.transAxes, va="top", ha="left",
+            fontsize=8, bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
+                                  alpha=0.85))
+    ax.legend(fontsize=7, loc="lower right", frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+def _overall_fit(slices: Dict[str, Any]) -> Tuple[float, float]:
+    """Return ``(alpha, gamma)`` of the overall in-mix calibration fit."""
+    overall = (slices or {}).get("overall") or {}
+    alpha = float(overall.get("alpha", 0.0))
+    gamma = float(overall.get("gamma", 1.0))
+    if abs(gamma) <= 1e-12:
+        gamma = float("nan")
+    return alpha, gamma
+
+
+def _fig_te_recovery_scatter(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-sample recovered TE $(\bar K-\alpha)/\gamma$ vs true TE, with $y=x$."""
+    import matplotlib.pyplot as plt
+
+    te = np.asarray(arrs["te_true"], dtype=float)
+    kbar = np.asarray(arrs["kbar"], dtype=float)
+    m = np.asarray(arrs["M"], dtype=int)
+    if te.size == 0:
+        return
+    alpha, gamma = _overall_fit(slices)
+    te_pred = (kbar - alpha) / gamma
+    rmse = float(np.sqrt(np.nanmean((te_pred - te) ** 2)))
+    bias = float(np.nanmean(te_pred - te))
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.2))
+    finite = np.isfinite(te_pred)
+    hi = max(float(te.max()), float(np.nanmax(te_pred[finite])) if finite.any() else 0.0)
+    lo = min(0.0, float(np.nanmin(te_pred[finite])) if finite.any() else 0.0)
+    ax.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY, label="$y=x$")
+    _scatter_by_m(ax, te, te_pred, m)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"recovered TE  $(\bar K-\alpha)/\gamma$  (nats)")
+    ax.set_title("Per-sample TE recovery (overall in-mix calibration)")
+    ax.text(0.03, 0.97,
+            f"RMSE = {rmse:.3f} nats\nbias = {bias:+.3f} nats\n"
+            f"$\\gamma$ = {gamma:.2f}, $\\alpha$ = {alpha:.2f}",
+            transform=ax.transAxes, va="top", ha="left", fontsize=8,
+            bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY, alpha=0.85))
+    ax.legend(fontsize=7, loc="lower right", frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+def _fig_te_residual_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-sample recovery residual $(\widehat{TE}-\mathrm{TE})$ vs true TE."""
+    import matplotlib.pyplot as plt
+
+    te = np.asarray(arrs["te_true"], dtype=float)
+    kbar = np.asarray(arrs["kbar"], dtype=float)
+    m = np.asarray(arrs["M"], dtype=int)
+    if te.size == 0:
+        return
+    alpha, gamma = _overall_fit(slices)
+    resid = (kbar - alpha) / gamma - te
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.axhline(0.0, ls="--", lw=1.0, color=ps.COLOR_GRAY, zorder=1)
+    _scatter_by_m(ax, te, resid, m)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"recovery residual  $\widehat{\mathrm{TE}}-\mathrm{TE}$  (nats)")
+    ax.set_title("TE recovery residual vs true TE (heteroscedasticity)")
+    ax.legend(fontsize=7, loc="upper right", frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+def _fig_kld_vs_te_binned(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""$\bar K$ mean $\pm$ std per distinct true-TE level over the sample cloud."""
+    import matplotlib.pyplot as plt
+
+    te = np.asarray(arrs["te_true"], dtype=float)
+    kbar = np.asarray(arrs["kbar"], dtype=float)
+    if te.size == 0:
+        return
+    levels = np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
+    means = np.array([kbar[np.round(te, 6) == lv].mean() for lv in levels])
+    stds = np.array([kbar[np.round(te, 6) == lv].std() for lv in levels])
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.0))
+    ax.scatter(te, kbar, s=8, alpha=0.18, linewidths=0.0, color=ps.COLOR_LIGHT_GRAY,
+               zorder=1, label="samples")
+    ax.errorbar(levels, means, yerr=stds, fmt="o-", color=ps.COLOR_VERMILLION,
+                ecolor=ps.COLOR_GRAY, elinewidth=1.0, capsize=3, lw=1.6, ms=5,
+                zorder=3, label=r"mean $\pm$ std per TE level")
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
+    ax.set_title("KLD monotonicity across true-TE levels")
+    ax.legend(fontsize=7, loc="upper left", frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+def _fig_corr_by_m_bars(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Grouped bars of Pearson $r$ / Spearman $\rho$ / MI of $\bar K$ vs TE per $M$."""
+    import matplotlib.pyplot as plt
+
+    assoc = kld_te_association(arrs)["by_M"]
+    if not assoc:
+        return
+    ms = sorted(int(k) for k in assoc)
+    x = np.arange(len(ms))
+    metrics = [("pearson", "Pearson r", ps.COLOR_BLUE),
+               ("spearman", r"Spearman $\rho$", ps.COLOR_GREEN),
+               ("mi", "MI (nats)", ps.COLOR_VERMILLION)]
+    width = 0.8 / len(metrics)
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.2 * len(ms) + 2.0), 4.2))
+    for k, (key, label, color) in enumerate(metrics):
+        vals = [assoc[str(mm)].get(key, float("nan")) for mm in ms]
+        ax.bar(x + k * width, vals, width, label=label, color=color)
+    ax.set_xticks(x + width)
+    ax.set_xticklabels([str(mm) for mm in ms])
+    ax.set_xlabel("informative-channel count $M$")
+    ax.set_ylabel("association of $\\bar K$ with TE")
+    ax.set_title("KLD-vs-TE association by channel count $M$")
     ax.legend(fontsize=8, frameon=False)
     ps.style_axes(ax)
     ps.save_figure(fig, path)

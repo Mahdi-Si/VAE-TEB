@@ -133,6 +133,36 @@ def _extract_label(batch: Any, idx: int) -> Optional[int]:
         return None
 
 
+def _extract_te_true(batch: Any, idx: int) -> Optional[float]:
+    r"""Extract the per-sample analytic true transfer entropy (nats).
+
+    Synthetic batches built from :class:`SyntheticTEDataset` carry a
+    ``te_true`` field per sample (the dataset-level block TE, or the per-cell
+    ``sample_te_true`` for the mixed-population cache). Real CTG / HDF5 batches
+    have no such field, so this returns ``None`` and the caller simply omits the
+    annotation.
+
+    Args:
+        batch: Batch object that may carry a ``te_true`` attribute.
+        idx: Index within the batch.
+
+    Returns:
+        The true block TE $\mathrm{TE}_{\mathrm{true}}$ in nats, or ``None`` if
+        the field is absent or unparseable.
+    """
+    te_attr = getattr(batch, "te_true", None)
+    if te_attr is None:
+        return None
+
+    try:
+        raw = te_attr[idx]
+        if isinstance(raw, torch.Tensor):
+            return float(raw.item())
+        return float(raw)
+    except Exception:
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Raw-signal denormalisation (fhr / up)
 # -----------------------------------------------------------------------------
