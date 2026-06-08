@@ -30,7 +30,14 @@ Multi-GPU correctness highlights:
 * **Checkpoint bridge.** ``final.ckpt`` (post latent-stats fit) and ``best.ckpt``
   (lowest ``val/total_loss``, converted from the Lightning best snapshot) store
   the bare ``SeqVaeLagAttnV1`` state dict (unprefixed) + ``model_kwargs`` so the
-  strict loader ``load_checkpoint_strict`` matches exactly.
+  strict loader ``load_checkpoint_strict`` matches exactly. Both are also written
+  **every validation epoch during training** (rank-0
+  :class:`_SyntheticCheckpointCallback`, ``latent_stats_fitted=False``) so a run
+  stopped before the last epoch (Ctrl-C on a rising val loss, early stop, crash)
+  still leaves consumable checkpoints; the post-fit export then finalizes them.
+* **Early stopping.** Opt-in via ``ddp.early_stopping`` (or ``--early-stop-patience``)
+  on the ``sync_dist``-reduced ``val/total_loss`` -- a graceful stop still runs the
+  post-fit latent-stats fit + checkpoint finalization.
 * **Monitoring.** A rank-0 callback emits the single-GPU-equivalent
   ``metrics.csv`` + ``training_curves.{pdf,png}`` / ``loss_plot_epoch.html``
   figures every ``plotting.plot_every`` epochs.
@@ -56,7 +63,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import lightning as pl
 import torch
 import yaml
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from lightning.pytorch.loggers import CSVLogger
 
 from model.vae_teb_prediction.model.model_experiment.synthetic.datamodule_synth import (
@@ -104,6 +115,15 @@ _DDP_DEFAULTS: Dict[str, Any] = {
     "num_sanity_val_steps": 0,
     "gradient_clip_val": 0.5,
     "gradient_clip_algorithm": "norm",
+    # Optional early stopping (off by default -> unchanged 100-epoch behaviour).
+    # Only active when a validation split exists; see ``_build_trainer``.
+    "early_stopping": {
+        "enabled": False,
+        "monitor": "val/total_loss",
+        "mode": "min",
+        "patience": 15,
+        "min_delta": 0.0,
+    },
 }
 
 
@@ -182,6 +202,27 @@ def _as_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def _augment_loss_settings(loss_settings: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Return a copy of ``loss_settings`` with ``kld_beta`` mirroring ``beta``.
+
+    ``train_minimal`` persists only ``beta`` in the checkpoint, but
+    :func:`mixed_eval.per_cell_lag_recovery` reads ``kld_beta``; duplicating the
+    key keeps the LOLO ablation on the trained $\beta$ rather than the ``0.001``
+    default fallback. Used by both :func:`_export_checkpoints` and
+    :class:`_SyntheticCheckpointCallback` so every persisted ``loss_settings`` is
+    identical regardless of when (mid-training vs end-of-fit) it is written.
+
+    Args:
+        loss_settings: The resolved loss settings from :func:`_resolve_loss_settings`.
+
+    Returns:
+        A shallow copy with ``kld_beta == beta``.
+    """
+    augmented = dict(loss_settings)
+    augmented["kld_beta"] = loss_settings["beta"]
+    return augmented
 
 
 def _apply_train_overrides(
@@ -304,6 +345,139 @@ class _SyntheticCurveCallback(pl.Callback):
 
 
 # =============================================================================
+# Synthetic-format checkpointing (rank-0, written DURING training)
+# =============================================================================
+class _SyntheticCheckpointCallback(pl.Callback):
+    r"""Rank-0 callback that writes the synthetic ``best.ckpt`` / ``final.ckpt``
+    **every validation epoch**, so an interrupted run is always evaluable.
+
+    The end-of-fit :func:`_export_checkpoints` only runs if ``trainer.fit``
+    returns normally. A hard interruption (``Ctrl-C`` because the validation loss
+    is climbing, a crash, or a killed job) skips it entirely, leaving only the
+    Lightning ``lightning_best-*.ckpt`` -- which carries no ``model_kwargs`` and
+    cannot be loaded by :mod:`mixed_eval` / :mod:`run_pipeline_tests`. This
+    callback closes that gap by persisting both consumable artifacts as training
+    progresses:
+
+    * ``final.ckpt`` -- the *latest* model, rewritten every epoch.
+    * ``best.ckpt`` -- the lowest ``val/total_loss`` snapshot so far.
+
+    Both are written via :func:`train_minimal.save_checkpoint` (byte-identical to
+    the end-of-fit format) from ``pl_module.orig_model``. In DDP the model
+    parameters are gradient-synced across ranks, so rank-0's copy is
+    authoritative; only the EMA ``mu_post_running_*`` buffers are rank-local and
+    un-fitted, hence ``latent_stats_fitted=False`` (matching the single-GPU
+    ``best.ckpt`` semantics -- :func:`mixed_eval`'s $\bar K$ reads the encoder
+    outputs, not those buffers). On graceful completion the post-fit
+    :func:`_export_checkpoints` **overwrites** both with the finalized versions
+    (latent-fitted ``final.ckpt``; ``best.ckpt`` re-derived from the Lightning
+    best across all epochs), so a completed run's artifacts are unchanged.
+
+    DDP-safety: every write happens **only on global rank 0** and reads the
+    already-reduced ``trainer.callback_metrics`` (``val/total_loss`` is logged
+    with ``sync_dist=True``), so no collective op runs in the rank-0 branch.
+
+    Args:
+        results_dir: Run directory; ``best.ckpt`` / ``final.ckpt`` land here.
+        model_kwargs: Exact ``SeqVaeLagAttnV1`` constructor kwargs (stored so the
+            strict loader can rebuild the architecture).
+        config: The effective (post-override) config.
+        datamodule: The :class:`SyntheticTEDataModule`; its ``data_meta`` (the
+            dataset ``meta.json``) is read **lazily** at write time, because the
+            datamodule only populates it in ``setup`` (called inside
+            ``trainer.fit``) -- a snapshot taken at construction would be empty.
+        loss_settings: The augmented loss settings (must already carry
+            ``kld_beta``; see :func:`_augment_loss_settings`).
+        epochs: Configured ``max_epochs`` (used as the epoch fallback).
+        has_val: Whether a validation loader exists. When ``True`` the write
+            happens at ``on_validation_epoch_end``; otherwise at
+            ``on_train_epoch_end`` and ``best.ckpt`` mirrors ``final.ckpt``.
+        monitor: Metric key tracked for the best snapshot.
+    """
+
+    def __init__(
+        self,
+        *,
+        results_dir: Path,
+        model_kwargs: Dict[str, Any],
+        config: Dict[str, Any],
+        datamodule: Any,
+        loss_settings: Dict[str, Any],
+        epochs: int,
+        has_val: bool,
+        monitor: str = "val/total_loss",
+    ) -> None:
+        self.results_dir = Path(results_dir)
+        self.model_kwargs = model_kwargs
+        self.config = config
+        self.datamodule = datamodule
+        self.loss_settings = loss_settings
+        self.epochs = int(epochs)
+        self.has_val = bool(has_val)
+        self.monitor = monitor
+        self._best = float("inf")
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Write checkpoints when there is no validation loop."""
+        if not self.has_val:
+            self._write(trainer, pl_module)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Write checkpoints after validation (the common path)."""
+        if self.has_val:
+            self._write(trainer, pl_module)
+
+    def _write(self, trainer: pl.Trainer, pl_module: Any) -> None:
+        """Persist ``final.ckpt`` (always) and ``best.ckpt`` (on improvement)."""
+        if not trainer.is_global_zero:
+            return
+        if trainer.sanity_checking:
+            return
+        cm = trainer.callback_metrics
+        train_metrics = {
+            k: _as_float(cm[f"train/{k}"])
+            for k in _TRAIN_METRIC_KEYS
+            if f"train/{k}" in cm
+        }
+        cur = _as_float(cm.get(self.monitor, float("nan")))
+        epoch = int(trainer.current_epoch) + 1  # 1-based, matching train_minimal
+        data_meta = dict(getattr(self.datamodule, "data_meta", {}) or {})
+
+        save_checkpoint(
+            self.results_dir / "final.ckpt",
+            model=pl_module.orig_model,
+            model_kwargs=self.model_kwargs,
+            config=self.config,
+            data_meta=data_meta,
+            epoch=epoch,
+            val_loss=cur,
+            train_metrics=train_metrics,
+            loss_settings=self.loss_settings,
+            latent_stats_fitted=False,
+        )
+
+        # Best snapshot: lowest val/total_loss so far. With no validation split
+        # there is no monitor, so best.ckpt simply mirrors final.ckpt. The
+        # ``cur == cur`` guard rejects NaN (NaN compares unequal to itself).
+        improved = (not self.has_val) or (cur == cur and cur < self._best)
+        if improved:
+            if self.has_val and cur == cur:
+                self._best = cur
+            save_checkpoint(
+                self.results_dir / "best.ckpt",
+                model=pl_module.orig_model,
+                model_kwargs=self.model_kwargs,
+                config=self.config,
+                data_meta=data_meta,
+                epoch=epoch,
+                val_loss=cur,
+                train_metrics=train_metrics,
+                loss_settings=self.loss_settings,
+                latent_stats_fitted=False,
+            )
+
+
+# =============================================================================
 # Trainer
 # =============================================================================
 def _build_trainer(
@@ -316,6 +490,7 @@ def _build_trainer(
     has_val: bool,
     run_tag: str,
     plotting_cfg: Dict[str, Any],
+    extra_callbacks: Optional[List[Any]] = None,
 ) -> pl.Trainer:
     """Construct the ``pl.Trainer``, mirroring ``trainer_lag_attn_v1``.
 
@@ -330,6 +505,11 @@ def _build_trainer(
     the synthetic-format ``best.ckpt``). When ``plotting.enabled`` a rank-0
     :class:`_SyntheticCurveCallback` emits the single-GPU-equivalent
     ``metrics.csv`` + loss-curve figures.
+
+    Args:
+        extra_callbacks: Additional callbacks appended after the built-in ones
+            (e.g. the :class:`_SyntheticCheckpointCallback` that writes the
+            consumable ``best.ckpt`` / ``final.ckpt`` during training).
     """
     callbacks: List[Any] = [LearningRateMonitor(logging_interval="epoch")]
     if has_val:
@@ -342,6 +522,16 @@ def _build_trainer(
                 filename="lightning_best-{epoch:02d}",
             )
         )
+    es_cfg = ddp_cfg.get("early_stopping") or {}
+    if has_val and bool(es_cfg.get("enabled", False)):
+        callbacks.append(
+            EarlyStopping(
+                monitor=str(es_cfg.get("monitor", "val/total_loss")),
+                mode=str(es_cfg.get("mode", "min")),
+                patience=int(es_cfg.get("patience", 15)),
+                min_delta=float(es_cfg.get("min_delta", 0.0)),
+            )
+        )
     if plotting_cfg.get("enabled", True):
         callbacks.append(
             _SyntheticCurveCallback(
@@ -352,6 +542,8 @@ def _build_trainer(
                 has_val=has_val,
             )
         )
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
 
     trainer_kwargs: Dict[str, Any] = {
         "max_epochs": epochs,
@@ -430,8 +622,7 @@ def _export_checkpoints(
     }
     val_loss = _as_float(cm.get("val/total_loss", float("nan")))
 
-    loss_settings_aug = dict(loss_settings)
-    loss_settings_aug["kld_beta"] = loss_settings["beta"]
+    loss_settings_aug = _augment_loss_settings(loss_settings)
 
     save_checkpoint(
         results_dir / "final.ckpt",
@@ -532,6 +723,17 @@ def train_ddp(
     exp = config["experiment"]
     optim_cfg = config["optim"]
     ddp_cfg = {**_DDP_DEFAULTS, **(config.get("ddp") or {})}
+    # Deep-merge the early_stopping sub-block (the shallow ** above would drop
+    # the defaults if the YAML sets only a subset of keys) and apply the CLI
+    # ``--early-stop-patience`` override (setting it also enables early stopping).
+    ddp_cfg["early_stopping"] = {
+        **_DDP_DEFAULTS["early_stopping"],
+        **((config.get("ddp") or {}).get("early_stopping") or {}),
+    }
+    es_patience = overrides.get("early_stop_patience")
+    if es_patience is not None:
+        ddp_cfg["early_stopping"]["enabled"] = True
+        ddp_cfg["early_stopping"]["patience"] = int(es_patience)
 
     seed = int(exp.get("seed", 0))
     pl.seed_everything(seed, workers=True)
@@ -581,10 +783,27 @@ def train_ddp(
 
     epochs = int(optim_cfg["epochs"])
     plotting_cfg = config.get("plotting") or {}
+
+    # Write the consumable best.ckpt / final.ckpt DURING training (rank-0) so an
+    # interrupted run (Ctrl-C on a rising val loss, crash) stays evaluable. On
+    # graceful completion the post-fit _export_checkpoints overwrites both with
+    # the finalized (latent-fitted) versions.
+    loss_settings_aug = _augment_loss_settings(loss_settings)
+    synthetic_ckpt_cb = _SyntheticCheckpointCallback(
+        results_dir=results_dir,
+        model_kwargs=model_kwargs,
+        config=config,
+        datamodule=dm,
+        loss_settings=loss_settings_aug,
+        epochs=epochs,
+        has_val=has_val,
+    )
+
     trainer = _build_trainer(
         ddp_cfg=ddp_cfg, results_dir=results_dir, epochs=epochs,
         devices=devices, n_gpus=n_gpus, has_val=has_val,
         run_tag=run_tag, plotting_cfg=plotting_cfg,
+        extra_callbacks=[synthetic_ckpt_cb],
     )
 
     if _env_rank_zero():
@@ -670,6 +889,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--data-dir", type=str, default=None, dest="data_dir")
     p.add_argument("--results-dir", type=str, default=None, dest="results_dir")
+    p.add_argument("--early-stop-patience", type=int, default=None,
+                   dest="early_stop_patience",
+                   help="enable EarlyStopping on val/total_loss with this "
+                        "patience (epochs); omitted -> use config ddp.early_stopping")
     return p.parse_args(argv)
 
 
@@ -688,6 +911,7 @@ def main(argv=None) -> None:
         "seed": args.seed,
         "data_dir": args.data_dir,
         "results_dir": args.results_dir,
+        "early_stop_patience": args.early_stop_patience,
     }
     train_ddp(config, overrides=overrides)
 
@@ -709,6 +933,8 @@ if __name__ == "__main__":
         "seed": None,                # None -> config experiment.seed
         "data_dir": None,
         "results_dir": None,
+        "early_stop_patience": None, # int -> enable EarlyStopping with this patience;
+                                     # None -> use config ddp.early_stopping block
     }
 
     if len(sys.argv) > 1:

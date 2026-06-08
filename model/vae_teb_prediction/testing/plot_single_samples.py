@@ -748,6 +748,8 @@ def plot_sample_signals_kld(
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
+    kld_value: Optional[float] = None,
+    true_te: Optional[float] = None,
     fs_raw: float = _DEFAULT_FS_RAW,
     decim: int = _DEFAULT_DECIM,
 ) -> None:
@@ -995,6 +997,10 @@ def plot_sample_signals_kld(
         title_bits.append(f"epoch={float(epoch):.0f}s")
     if label is not None:
         title_bits.append(f"class={label}")
+    if kld_value is not None:
+        title_bits.append(rf"$\bar K$={float(kld_value):.3f} nats")
+    if true_te is not None:
+        title_bits.append(f"true TE={float(true_te):.3f} nats")
     if title_bits:
         _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
@@ -1019,6 +1025,8 @@ def plot_sample_signals_kld_pca(
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
+    kld_value: Optional[float] = None,
+    true_te: Optional[float] = None,
     fs_raw: float = _DEFAULT_FS_RAW,
     decim: int = _DEFAULT_DECIM,
 ) -> None:
@@ -1252,6 +1260,10 @@ def plot_sample_signals_kld_pca(
         title_bits.append(f"epoch={float(epoch):.0f}s")
     if label is not None:
         title_bits.append(f"class={label}")
+    if kld_value is not None:
+        title_bits.append(rf"$\bar K$={float(kld_value):.3f} nats")
+    if true_te is not None:
+        title_bits.append(f"true TE={float(true_te):.3f} nats")
     title_bits.append(f"KLD PCA top-{n_pcs}")
     _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
@@ -1279,6 +1291,8 @@ def plot_sample_lag_attention(
     guid: Optional[str] = None,
     epoch: Optional[float] = None,
     label: Optional[int] = None,
+    kld_value: Optional[float] = None,
+    true_te: Optional[float] = None,
     fs_raw: float = _DEFAULT_FS_RAW,
     decim: int = _DEFAULT_DECIM,
 ) -> None:
@@ -1760,6 +1774,10 @@ def plot_sample_lag_attention(
         title_bits.append(f"epoch={float(epoch):.0f}s")
     if label is not None:
         title_bits.append(f"class={label}")
+    if kld_value is not None:
+        title_bits.append(rf"$\bar K$={float(kld_value):.3f} nats")
+    if true_te is not None:
+        title_bits.append(f"true TE={float(true_te):.3f} nats")
     if title_bits:
         _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 

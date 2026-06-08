@@ -21,17 +21,20 @@ import csv
 import json
 import tempfile
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_ddp import (
+    _SyntheticCheckpointCallback,
+    _augment_loss_settings,
     train_ddp,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
     _FIELDNAMES,
+    build_model,
     load_config,
 )
 from train.graph_models_utils import load_checkpoint_strict
@@ -79,12 +82,20 @@ def _write_cache(cache_dir: Path, n: int, stem: str) -> None:
                        "true_lag_band": [1, 2, 3]}, fh)
 
 
-def _run(tmp: Path) -> Path:
-    """Build caches, run a 2-epoch single-device train_ddp, return the run dir.
+def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
+    """Build caches, run a short single-device train_ddp, return the run dir.
 
     Two epochs with ``plot_every=1`` force at least one periodic loss-curve
     refresh (in addition to the unconditional ``on_fit_end`` render), so the
     figure assertions exercise the scheduled path rather than only the final one.
+
+    Args:
+        tmp: Temporary directory holding the data + results trees.
+        extra_overrides: Optional overrides merged on top of the defaults (e.g.
+            ``{"early_stop_patience": 1, "epochs": 3}``).
+
+    Returns:
+        The run directory ``<results>/G1_mix/<tag>``.
     """
     tag = "ddp_smoke"
     data_dir = tmp / "data"
@@ -96,19 +107,20 @@ def _run(tmp: Path) -> Path:
     config = load_config(_CONFIG)
     config["model"].update(_SMALL_MODEL)        # shrink the architecture
 
-    train_ddp(
-        config,
-        overrides={
-            "data_tag": tag,
-            "run_tag": tag,
-            "devices": 1,
-            "epochs": 2,
-            "batch_size": 4,
-            "plot_every": 1,
-            "data_dir": str(data_dir),
-            "results_dir": str(results_dir),
-        },
-    )
+    overrides: Dict[str, Any] = {
+        "data_tag": tag,
+        "run_tag": tag,
+        "devices": 1,
+        "epochs": 2,
+        "batch_size": 4,
+        "plot_every": 1,
+        "data_dir": str(data_dir),
+        "results_dir": str(results_dir),
+    }
+    if extra_overrides:
+        overrides.update(extra_overrides)
+
+    train_ddp(config, overrides=overrides)
     return results_dir / "G1_mix" / tag
 
 
@@ -178,5 +190,96 @@ def test_train_ddp_smoke() -> None:
         print("[test_train_ddp] OK -- final/best ckpt bridge + figures verified")
 
 
+# =============================================================================
+# Unit test for the during-training checkpoint callback
+# =============================================================================
+class _StubModule:
+    """Minimal stand-in for the PL wrapper exposing ``orig_model``."""
+
+    def __init__(self, model: SeqVaeLagAttnV1) -> None:
+        self.orig_model = model
+
+
+class _StubDataModule:
+    """Minimal stand-in exposing the ``data_meta`` the callback reads lazily."""
+
+    def __init__(self, data_meta: Dict[str, Any]) -> None:
+        self.data_meta = data_meta
+
+
+class _FakeTrainer:
+    """Rank-0 fake trainer carrying the metrics the callback consumes."""
+
+    def __init__(self, *, epoch: int, val_loss: float) -> None:
+        self.is_global_zero = True
+        self.sanity_checking = False
+        self.current_epoch = epoch
+        self.callback_metrics = {"val/total_loss": torch.tensor(float(val_loss))}
+
+
+def test_synthetic_checkpoint_callback_unit() -> None:
+    """The callback writes consumable best/final ckpts and tracks the val min.
+
+    Drives the callback directly (no Lightning) over two epochs -- improving then
+    worsening -- and asserts both artifacts are strict-loadable with
+    ``latent_stats_fitted=False``, that ``final.ckpt`` always reflects the latest
+    epoch, and that ``best.ckpt`` is **not** overwritten once the loss worsens.
+    """
+    with tempfile.TemporaryDirectory() as _tmp:
+        run_dir = Path(_tmp)
+        config = load_config(_CONFIG)
+        config["model"].update(_SMALL_MODEL)
+        model, model_kwargs = build_model(config["model"], torch.device("cpu"))
+        loss_aug = _augment_loss_settings({
+            "beta": 0.001, "lambda_full": 1.0, "lambda_base": 0.5,
+            "likelihood": "gaussian_nll", "sigma_obs": "learned", "free_bits": 0.0,
+        })
+        dm = _StubDataModule({"tag": "ddp_smoke", "benchmark": "G1_mix"})
+        cb = _SyntheticCheckpointCallback(
+            results_dir=run_dir, model_kwargs=model_kwargs, config=config,
+            datamodule=dm, loss_settings=loss_aug, epochs=2, has_val=True,
+        )
+        stub = _StubModule(model)
+        best_p, final_p = run_dir / "best.ckpt", run_dir / "final.ckpt"
+
+        # --- epoch 1: val improves to 1.0 -> both files written -----------------
+        cb.on_validation_epoch_end(_FakeTrainer(epoch=0, val_loss=1.0), stub)
+        assert best_p.is_file() and final_p.is_file(), "callback wrote no ckpts"
+        best1 = torch.load(best_p, map_location="cpu", weights_only=False)
+        _assert_strict_loadable(best1)
+        assert best1["latent_stats_fitted"] is False, "mid-train ckpt must be unfitted"
+        assert "tag" in best1["data_meta"], "data_meta lost (lazy read failed)"
+        assert abs(best1["val_total_loss"] - 1.0) < 1e-6
+
+        # --- epoch 2: val worsens to 2.0 -> final updates, best is preserved ----
+        cb.on_validation_epoch_end(_FakeTrainer(epoch=1, val_loss=2.0), stub)
+        best2 = torch.load(best_p, map_location="cpu", weights_only=False)
+        final2 = torch.load(final_p, map_location="cpu", weights_only=False)
+        assert abs(best2["val_total_loss"] - 1.0) < 1e-6, (
+            "best.ckpt must NOT be rewritten when the val loss worsens"
+        )
+        assert abs(final2["val_total_loss"] - 2.0) < 1e-6, (
+            "final.ckpt must always reflect the latest epoch"
+        )
+        assert final2["latent_stats_fitted"] is False
+
+        print("[test_train_ddp] OK -- during-training checkpoint callback verified")
+
+
+def test_train_ddp_early_stopping() -> None:
+    """Enabling early stopping does not break training; ckpts stay loadable."""
+    with tempfile.TemporaryDirectory() as _tmp:
+        run_dir = _run(
+            Path(_tmp), extra_overrides={"early_stop_patience": 1, "epochs": 3}
+        )
+        for name in ("best.ckpt", "final.ckpt"):
+            ckpt = torch.load(run_dir / name, map_location="cpu", weights_only=False)
+            _assert_strict_loadable(ckpt)
+            _assert_loss_settings(ckpt["loss_settings"])
+        print("[test_train_ddp] OK -- early stopping run produced loadable ckpts")
+
+
 if __name__ == "__main__":
     test_train_ddp_smoke()
+    test_synthetic_checkpoint_callback_unit()
+    test_train_ddp_early_stopping()

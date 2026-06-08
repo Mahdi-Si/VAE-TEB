@@ -459,6 +459,18 @@ ddp:
   num_sanity_val_steps: 0
   gradient_clip_val: 0.5       # == optim.grad_clip_norm (Trainer-managed under DDP)
   gradient_clip_algorithm: norm
+  # Optional early stopping (train_ddp.py only). Off by default -> the full
+  # optim.epochs run as before. Only active when a val.npz split exists; the
+  # monitored val/total_loss is sync_dist-reduced so every rank stops together.
+  # These defaults also live in train_ddp._DDP_DEFAULTS, so this block is
+  # optional -- omit it and the same values apply. CLI: --early-stop-patience N
+  # enables it and sets the patience without editing this file.
+  early_stopping:
+    enabled: false             # true -> stop when val/total_loss stops improving
+    monitor: val/total_loss
+    mode: min
+    patience: 15               # epochs with no improvement before stopping
+    min_delta: 0.0             # min change counted as an improvement
 # 8-GPU Linux recipe: also set dataset.num_workers: 2, pin_memory: true,
 # persistent_workers: true (size RAM first -- each worker copies the in-RAM pool).
 
