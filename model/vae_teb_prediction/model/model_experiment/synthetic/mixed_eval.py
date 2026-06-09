@@ -1113,6 +1113,22 @@ _M_COLORS = {8: ps.COLOR_BLUE, 16: ps.COLOR_VERMILLION, 32: ps.COLOR_GREEN}
 _BAND_MARKERS = {"short": "o", "mid": "s", "long": "^"}
 
 
+def _caption(fig, text: str) -> None:
+    r"""Add an italic "how to read this" caption beneath a figure.
+
+    Placed just below the figure box (figure $y<0$) so it never overlaps the
+    axes; :func:`plot_style.save_figure` writes with a tight bounding box, which
+    captures the caption. Keep ``text`` to roughly one line in the form
+    "what is plotted -- what good looks like".
+
+    Args:
+        fig: The figure to annotate.
+        text: The caption string (plain text; ``wrap`` re-flows long lines).
+    """
+    fig.text(0.5, -0.015, text, ha="center", va="top", fontsize=7.0,
+             color=ps.COLOR_GRAY, style="italic", wrap=True)
+
+
 def _render_figures(
     out_dir: Path,
     rows_in: List[Dict[str, Any]],
@@ -1131,6 +1147,7 @@ def _render_figures(
         # Calibration + recovery (per-cell)
         ("calibration_scatter", _fig_calibration),
         ("kld_vs_te_percell", _fig_kld_vs_te_percell),
+        ("kld_vs_te_allsamples", _fig_kld_vs_te_allsamples),
         ("kld_within_cell_spread", _fig_kld_within_cell_spread),
         ("te_recovery_percell", _fig_te_recovery_percell),
         ("corr_by_M_bars", _fig_corr_by_m_bars),
@@ -1218,6 +1235,9 @@ def _fig_calibration(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         sup += (fr"  —  overall $\gamma$={overall['gamma']:.2f}, "
                 fr"$\alpha$={overall['alpha']:.2f}, $R^2$={overall.get('r2', float('nan')):.2f}")
     fig.suptitle(sup, fontsize=11)
+    _caption(fig, "Per-(M,TE) cell mean KL vs true block TE, one panel per "
+                  "lag-band; dashed y=x, line = per-band OLS. Well-calibrated: "
+                  "points track y=x with slope gamma -> 1.")
     ps.save_figure(fig, path)
 
 
@@ -1264,6 +1284,9 @@ def _fig_grid_heatmaps(path, rows_in, rows_ho, arrs, slices, controls) -> None:
             ax.set_title(f"{label} | band={band}", fontsize=8)
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.suptitle("Per-cell recovery over the (M x TE x band) grid", fontsize=11)
+    _caption(fig, "Per-cell mean KL (top row) and TE-recovery RMSE (bottom row) "
+                  "over the M x TE grid, one column per band. Good: KL brightens "
+                  "with TE; RMSE uniformly low.")
     ps.save_figure(fig, path)
 
 
@@ -1298,6 +1321,9 @@ def _fig_lag_recovery(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.set_title(f"LagMass | band={band}", fontsize=8)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.suptitle(r"Sliding-window LOLO lag mass in $\mathcal{L}^\star$", fontsize=11)
+    _caption(fig, "Leave-one-lag-out importance mass inside the true lag band "
+                  "(0-1), as an M x TE heatmap per band. Good: near 1 -- ablating "
+                  "in-band source lags hurts the forecast most.")
     ps.save_figure(fig, path)
 
 
@@ -1330,6 +1356,9 @@ def _fig_generalization(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.legend(fontsize=7, frameon=False)
         ps.style_axes(ax)
     fig.suptitle("Held-out extrapolation gap", fontsize=11)
+    _caption(fig, "Held-out cells (vermillion) vs the trained-M-mean reference "
+                  "(gray) for TE-RMSE and lag-mass. Good: held-out markers close "
+                  "to the reference -- interpolates to unseen (M,TE,band).")
     ps.save_figure(fig, path)
 
 
@@ -1370,6 +1399,9 @@ def _fig_null_controls(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ps.style_axes(ax)
     fig.suptitle("Null controls: source corruption should collapse $\\bar K$",
                  fontsize=11)
+    _caption(fig, "Clean K-bar (x) vs source-corrupted K-bar (y) per cell, one "
+                  "panel per control; dashed y=x = no collapse. Good: points far "
+                  "below y=x (median ratio << 1) -- corruption destroys the signal.")
     ps.save_figure(fig, path)
 
 
@@ -1538,13 +1570,33 @@ def _fig_kld_vs_te_percell(path, rows_in, rows_ho, arrs, slices, controls) -> No
     _scatter_cells(ax, rows_in, rows_ho, "te_true", "kbar_mean")
     alpha, gamma = _overall_fit(slices)
     hi = max((r["te_true"] for r in all_rows), default=1.0) * 1.05 + 1e-6
+    ref_handles = []  # line references shown alongside the M/band proxy legend
     if np.isfinite(gamma):
         xs = np.linspace(0.0, hi, 50)
-        ax.plot(xs, alpha + gamma * xs, color=ps.COLOR_BLACK, lw=1.6, zorder=4,
-                label=rf"OLS: $\bar K$={gamma:.2f}$\,$TE+{alpha:.2f}")
+        ref_handles += ax.plot(
+            xs, alpha + gamma * xs, color=ps.COLOR_BLACK, lw=1.6, zorder=4,
+            label=rf"OLS: $\bar K$={gamma:.2f}$\,$TE+{alpha:.2f}")
+    # Empirical TE~0 anchor: there is no zero-coupling cell, so the shuffled- (or
+    # reversed-) source K-bar stands in for TE=0. Shuffling U kills the directed
+    # term I_q(Z;U|Y), leaving the prior-mismatch floor E[KL(q(z|Y)||p(z|Y))]
+    # that the calibration intercept alpha should match (validation plan Sec. 1).
+    null_key = next((k for k in ("null_shuffle_kbar", "null_reverse_kbar")
+                     if rows_in and k in rows_in[0]), None)
+    if null_key is not None:
+        vals = [r[null_key] for r in rows_in
+                if np.isfinite(r.get(null_key, float("nan")))]
+        if vals:
+            floor = float(np.mean(vals))
+            ref_handles.append(ax.axhline(
+                floor, ls=":", lw=1.2, color=ps.COLOR_GREEN, zorder=2,
+                label=rf"null-source floor $\approx$ {floor:.2f} "
+                      rf"(empirical TE$\approx$0)"))
     ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
     ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
     ax.set_title("Per-cell KLD vs true TE")
+    _caption(fig, "One point per cell: mean latent KL vs analytic true block TE; "
+                  "line = overall OLS calibration. Good: monotone, slope gamma ~ 1, "
+                  "high R^2. Association is per-cell, not per-sample.")
     ax.text(0.03, 0.97,
             f"cells = {int(st['n'])}\n"
             f"Pearson r = {st['pearson']:.3f}\n"
@@ -1553,7 +1605,7 @@ def _fig_kld_vs_te_percell(path, rows_in, rows_ho, arrs, slices, controls) -> No
             f"$R^2$ = {st['r2']:.3f}",
             transform=ax.transAxes, va="top", ha="left", fontsize=8,
             bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY, alpha=0.85))
-    ax.legend(handles=_cell_legend_handles(all_rows), fontsize=7,
+    ax.legend(handles=ref_handles + _cell_legend_handles(all_rows), fontsize=7,
               loc="lower right", frameon=False, ncol=2)
     ps.style_axes(ax)
     ps.save_figure(fig, path)
@@ -1587,6 +1639,8 @@ def _fig_te_recovery_percell(path, rows_in, rows_ho, arrs, slices, controls) -> 
     ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
     ax.set_ylabel(r"recovered TE  $(\bar K-\alpha)/\gamma$  (nats)")
     ax.set_title("Per-cell TE recovery (overall in-mix calibration)")
+    _caption(fig, "Each cell's recovered TE (K-bar - alpha)/gamma vs its true TE; "
+                  "dashed y=x. Good: points on y=x with low RMSE and near-zero bias.")
     ax.text(0.03, 0.97,
             f"RMSE = {rmse:.3f} nats\nbias = {bias:+.3f} nats\n"
             f"$\\gamma$ = {gamma:.2f}, $\\alpha$ = {alpha:.2f}",
@@ -1630,7 +1684,58 @@ def _fig_kld_within_cell_spread(path, rows_in, rows_ho, arrs, slices, controls) 
     ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
     ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
     ax.set_title("Within-cell KLD spread across true-TE levels")
+    _caption(fig, "Per-sample K-bar distribution at each true-TE level (violin) "
+                  "plus the per-level mean. Good: medians rise monotonically with "
+                  "TE and the spread stays modest.")
     ax.legend(fontsize=7, loc="upper left", frameon=False)
+    ps.style_axes(ax)
+    ps.save_figure(fig, path)
+
+
+def _fig_kld_vs_te_allsamples(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Full per-sample scatter of $\bar K$ vs true block TE (every in-mix sample).
+
+    Draws **all** samples (colour = $M$) with a small horizontal jitter so the
+    few discrete true-TE levels read as vertical *distributions* rather than
+    infinitely-thin lines: the true block TE is an analytic **per-cell** quantity
+    (every sample in a cell shares one $\mathrm{TE}_{\mathrm{true}}$), so without
+    jitter the cloud collapses onto $\sim 4$ vertical stacks. Per-cell means
+    (black rings) and the overall calibration line are overlaid for reference.
+    """
+    import matplotlib.pyplot as plt
+
+    te = np.asarray(arrs.get("te_true", []), dtype=float)
+    kb = np.asarray(arrs.get("kbar", []), dtype=float)
+    m = np.asarray(arrs.get("M", []), dtype=int)
+    if te.size == 0:
+        return
+    levels = np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
+    span = float(np.min(np.diff(levels))) if levels.size > 1 else 1.0
+    rng = np.random.default_rng(0)
+    jitter = (rng.random(te.size) - 0.5) * 0.18 * span
+
+    fig, ax = plt.subplots(figsize=(7.0, 5.2))
+    for mm in sorted(set(m.tolist())):
+        sel = m == mm
+        ax.scatter(te[sel] + jitter[sel], kb[sel], s=6, alpha=0.25, linewidths=0.0,
+                   color=_M_COLORS.get(int(mm), ps.COLOR_PURPLE), label=f"M={mm}",
+                   zorder=2)
+    for r in rows_in:
+        ax.scatter(r["te_true"], r["kbar_mean"], s=42, facecolors="none",
+                   edgecolors=ps.COLOR_BLACK, linewidths=1.0, zorder=4)
+    alpha, gamma = _overall_fit(slices)
+    if np.isfinite(gamma):
+        xs = np.linspace(0.0, float(te.max()) * 1.02 + 1e-6, 50)
+        ax.plot(xs, alpha + gamma * xs, color=ps.COLOR_BLACK, lw=1.6, zorder=5,
+                label=rf"OLS: $\bar K$={gamma:.2f}$\,$TE+{alpha:.2f}")
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"per-sample mean latent KL  $\bar K$  (nats)")
+    ax.set_title(f"All-sample KLD vs true TE  (N={te.size}, black rings = per-cell mean; "
+                 f"x jittered)")
+    ax.legend(fontsize=7, loc="lower right", frameon=False)
+    _caption(fig, "Every sample's K-bar vs its cell's true TE (x jittered; true "
+                  "TE is one value per cell, so points form discrete columns). "
+                  "Rings = per-cell means. Tight columns = low per-sample noise.")
     ps.style_axes(ax)
     ps.save_figure(fig, path)
 
@@ -1668,6 +1773,9 @@ def _fig_pred_gain_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None
         [{"M": v["M"], "band": v["band"]} for v in pg_in.values()]
     )
     ax.legend(handles=handles, fontsize=7, loc="upper left", frameon=False, ncol=2)
+    _caption(fig, "Prediction gain dL = L_base - L_feat per cell vs true TE; "
+                  "dashed dL=0. Good: dL ~ 0 at low TE and rising with TE -- the "
+                  "source path helps the forecast only when info is real.")
     ps.style_axes(ax)
     ps.save_figure(fig, path)
 
@@ -1701,6 +1809,9 @@ def _fig_pred_gain_vs_kbar(path, rows_in, rows_ho, arrs, slices, controls) -> No
     ax.set_xlabel(r"mean latent KL  $\bar K$  (nats)")
     ax.set_ylabel(r"prediction gain  $\Delta\mathcal{L}$  (nats)")
     ax.set_title(r"Does latent KL buy prediction? $(\bar K,\ \Delta\mathcal{L})$ plane")
+    _caption(fig, "Per-cell (K-bar, dL) plane coloured by true TE. Above dL=0 = "
+                  "latent KL bought real predictive gain; an upward trend means "
+                  "more KL converts to more forecast improvement.")
     ps.style_axes(ax)
     ps.save_figure(fig, path)
 
@@ -1753,6 +1864,9 @@ def _fig_lag_profiles(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.legend(fontsize=7, loc="upper right", frameon=False)
         ps.style_axes(ax)
     fig.suptitle(r"Per-cell sliding-window LOLO lag profile $A_\ell$", fontsize=11)
+    _caption(fig, "Per-cell leave-one-lag-out importance A_l vs source lag, one "
+                  "panel per band; shaded = true band {0..dmax-1}. Good: every "
+                  "curve peaks inside the shaded band.")
     ps.save_figure(fig, path)
 
 
@@ -1810,6 +1924,9 @@ def _fig_attn_vs_lag(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.legend(handles=ln1 + ln2, fontsize=7, loc="upper right", frameon=False)
         ps.style_axes(ax)
     fig.suptitle("Attention vs LOLO lag profile (band-averaged)", fontsize=11)
+    _caption(fig, "Band-averaged lag attention (orange) and LOLO importance "
+                  "(blue) vs source lag; shaded = true band. Good: both "
+                  "concentrate on and agree over the shaded band.")
     ps.save_figure(fig, path)
 
 
@@ -1848,6 +1965,9 @@ def _fig_per_dim_kl(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     axes[1].set_xlim(-0.5, d_z - 0.5)
     ps.style_axes(axes[1])
     fig.suptitle("Latent KL allocation across dimensions", fontsize=11)
+    _caption(fig, "Mean KL per latent dimension: per-M heatmap (top), "
+                  "averaged-over-M bar (bottom). A dimension dark across all M is "
+                  "collapsed/unused; broad use = healthy latent.")
     ps.save_figure(fig, path)
 
 
@@ -1883,6 +2003,9 @@ def _fig_kld_vs_time(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     ax.set_xlabel(r"timestep $t$")
     ax.set_ylabel(r"mean per-step KL  $K_t$  (nats)")
     ax.set_title("KLD trajectory over time by lag-band")
+    _caption(fig, "Mean per-step KL K_t vs time, one line per band; dashed = "
+                  "warm-up, dotted = each band's clean-window floor. Good: a "
+                  "decaying transient then a stable steady state past the floor.")
     ax.legend(fontsize=7, loc="upper right", frameon=False)
     ps.style_axes(ax)
     ps.save_figure(fig, path)
@@ -1910,6 +2033,9 @@ def _fig_corr_by_m_bars(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     ax.set_xlabel("informative-channel count $M$")
     ax.set_ylabel("association of $\\bar K$ with TE")
     ax.set_title("KLD-vs-TE association by channel count $M$")
+    _caption(fig, "Per-cell association of K-bar with TE, split by "
+                  "informative-channel count M. Good: Pearson/Spearman near 1 and "
+                  "high MI for every M (no decay as M grows).")
     ax.legend(fontsize=8, frameon=False)
     ps.style_axes(ax)
     ps.save_figure(fig, path)
