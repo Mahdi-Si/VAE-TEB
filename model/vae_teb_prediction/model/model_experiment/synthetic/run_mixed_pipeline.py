@@ -19,23 +19,29 @@ Stage order (each individually skippable via ``PIPELINE['stages']``):
     3. ``build_extrap``     -- the $M$-extrapolation test-only caches
                                ``data/G1_mix/<tag>_extrap_m<M>/`` for every
                                ``mix.holdout_m`` value (or ``PIPELINE['extrap_m']``).
-    4. ``beta_calibration`` -- OPTIONAL (heavy: one pooled training per
+    4. ``data_previews``    -- journal-quality data-anatomy figures for the
+                               in-mix cache (:mod:`visualize_mixed`): per-channel
+                               source/target panels with the true lag walk,
+                               colour-matched lag sections, the TE $\times$
+                               lag-band gallery and the channel atlas, under
+                               ``data/G1_mix/<tag>/previews/``. Non-fatal.
+    5. ``beta_calibration`` -- OPTIONAL (heavy: one pooled training per
                                $\beta$). Runs :mod:`mixed_calibration` in a
                                subprocess, then reads the selected
                                $\beta^\star = \arg\min_\beta
                                \operatorname{mean}_M|\gamma_M - 1|
                                + \lambda_\alpha \operatorname{mean}_M|\alpha_M|$
                                from ``results/G1_mix/mixed_calibration/calibration.json``.
-    5. ``train``            -- the final pooled model via :mod:`train_ddp` in a
+    6. ``train``            -- the final pooled model via :mod:`train_ddp` in a
                                subprocess (so Lightning's DDP launcher re-executes
                                the *training* module, never this pipeline).
-    6. ``eval_in_mix``      -- :func:`mixed_eval.evaluate_mixed` on the in-mix +
+    7. ``eval_in_mix``      -- :func:`mixed_eval.evaluate_mixed` on the in-mix +
                                interior-holdout caches
                                (``results/G1_mix/<run_tag>/mixed_eval/``).
-    7. ``eval_extrap``      -- one :func:`mixed_eval.evaluate_mixed` pass per
+    8. ``eval_extrap``      -- one :func:`mixed_eval.evaluate_mixed` pass per
                                extrapolation cache, each writing to its own
                                ``mixed_eval_extrap_m<M>/`` subdirectory.
-    8. ``pipeline_tests``   -- the broad model-diagnostic pipeline
+    9. ``pipeline_tests``   -- the broad model-diagnostic pipeline
                                (:mod:`run_pipeline_tests` $\to$
                                ``testing.run_tests.run_full_test_pipeline``:
                                histograms, forecast quality, attention / lag
@@ -45,7 +51,7 @@ Stage order (each individually skippable via ``PIPELINE['stages']``):
                                against the in-mix test split. Outputs land in
                                ``results/G1_mix/<run_tag>/testing_pipeline/<output_tag>/``.
 
-Why subprocesses for stages 4-5: Lightning's multi-GPU DDP launcher re-executes
+Why subprocesses for stages 5-6: Lightning's multi-GPU DDP launcher re-executes
 ``sys.executable + sys.argv`` in every worker rank. If training ran in-process,
 each rank would re-run this *entire pipeline* (builds, evals, ...). Driving the
 training CLI in a child process keeps the re-executed module scoped to
@@ -110,6 +116,7 @@ _STAGE_ORDER = (
     "build_in_mix",
     "build_holdout",
     "build_extrap",
+    "data_previews",
     "beta_calibration",
     "train",
     "eval_in_mix",
@@ -341,6 +348,10 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     n_stages = len(_STAGE_ORDER)
     status: Dict[str, Any] = {}
 
+    def _stage_banner(name: str, note: str = "") -> None:
+        """Banner with the stage index derived from :data:`_STAGE_ORDER`."""
+        _banner(_STAGE_ORDER.index(name) + 1, n_stages, name, note)
+
     print(
         f"[pipeline] G1_mix end-to-end run\n"
         f"           config      = {config_path}\n"
@@ -352,7 +363,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # --- 1. in-mix pool -------------------------------------------------------
-    _banner(1, n_stages, "build_in_mix")
+    _stage_banner("build_in_mix")
     if not stages["build_in_mix"]:
         status["build_in_mix"] = "skipped (disabled)"
         print("[pipeline] disabled.")
@@ -364,7 +375,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         status["build_in_mix"] = "done"
 
     # --- 2. interior held-out cache -------------------------------------------
-    _banner(2, n_stages, "build_holdout")
+    _stage_banner("build_holdout")
     if not stages["build_holdout"]:
         status["build_holdout"] = "skipped (disabled)"
         print("[pipeline] disabled.")
@@ -376,7 +387,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         status["build_holdout"] = "done"
 
     # --- 3. M-extrapolation caches ---------------------------------------------
-    _banner(3, n_stages, "build_extrap", note=f"M in {extrap_ms}" if extrap_ms else "none configured")
+    _stage_banner("build_extrap", note=f"M in {extrap_ms}" if extrap_ms else "none configured")
     if not stages["build_extrap"] or not extrap_ms:
         status["build_extrap"] = "skipped (disabled)" if not stages["build_extrap"] else "skipped (no holdout_m)"
         print("[pipeline] disabled or no extrapolation M configured.")
@@ -389,9 +400,33 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
             build_g1_mix(config, force=force_rebuild, extrap_m=int(m))
         status["build_extrap"] = "done"
 
-    # --- 4. beta calibration sweep (optional, heavy) ---------------------------
+    # --- 4. data-anatomy previews (visualize_mixed) -----------------------------
+    in_mix_cache = data_root / _BENCHMARK / tag
+    _stage_banner("data_previews")
+    if not stages["data_previews"]:
+        status["data_previews"] = "skipped (disabled)"
+        print("[pipeline] disabled.")
+    elif dry_run:
+        status["data_previews"] = "dry-run"
+        print(f"[pipeline] would render data-anatomy previews -> "
+              f"{in_mix_cache / 'previews'}")
+    else:
+        # Lazy import (pulls matplotlib); a preview failure must never gate
+        # the training / evaluation stages.
+        try:
+            from model.vae_teb_prediction.model.model_experiment.synthetic.visualize_mixed import (
+                render_mixed_previews,
+            )
+            render_mixed_previews(in_mix_cache)
+            status["data_previews"] = "done"
+        except Exception as exc:  # noqa: BLE001 -- diagnostics only
+            print(f"[pipeline][warn] data previews failed: "
+                  f"{type(exc).__name__}: {exc}")
+            status["data_previews"] = "failed (non-fatal)"
+
+    # --- 5. beta calibration sweep (optional, heavy) ---------------------------
     beta = pipeline.get("beta")
-    _banner(4, n_stages, "beta_calibration")
+    _stage_banner("beta_calibration")
     if stages["beta_calibration"]:
         _run_subprocess(_calibration_cmd(pipeline, config_path), dry_run=dry_run)
         status["beta_calibration"] = "dry-run" if dry_run else "done"
@@ -430,7 +465,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # --- 5. final pooled training (DDP-safe subprocess) ------------------------
-    _banner(5, n_stages, "train", note=f"devices={pipeline.get('devices', 1)}")
+    _stage_banner("train", note=f"devices={pipeline.get('devices', 1)}")
     run_dir = results_root / _BENCHMARK / run_tag
     ckpt_path = run_dir / ckpt_name
     if not stages["train"]:
@@ -452,7 +487,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         status["train"] = "dry-run" if dry_run else "done"
 
     # --- 6. per-group eval: in-mix + interior holdout ---------------------------
-    _banner(6, n_stages, "eval_in_mix", note=f"ckpt={ckpt_name}")
+    _stage_banner("eval_in_mix", note=f"ckpt={ckpt_name}")
     if not stages["eval_in_mix"]:
         status["eval_in_mix"] = "skipped (disabled)"
         print("[pipeline] disabled.")
@@ -468,7 +503,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         status["eval_in_mix"] = "done"
 
     # --- 7. per-group eval: M-extrapolation caches ------------------------------
-    _banner(7, n_stages, "eval_extrap", note=f"M in {extrap_ms}" if extrap_ms else "none configured")
+    _stage_banner("eval_extrap", note=f"M in {extrap_ms}" if extrap_ms else "none configured")
     if not stages["eval_extrap"] or not extrap_ms:
         status["eval_extrap"] = "skipped (disabled)" if not stages["eval_extrap"] else "skipped (no holdout_m)"
         print("[pipeline] disabled or no extrapolation M configured.")
@@ -501,7 +536,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     pt_output_tag = str(pt.get("output_tag") or Path(ckpt_name).stem)
     pt_out_dir = run_dir / "testing_pipeline" / pt_output_tag
     test_npz = data_root / _BENCHMARK / tag / "test.npz"
-    _banner(8, n_stages, "pipeline_tests", note=f"ckpt={ckpt_name}")
+    _stage_banner("pipeline_tests", note=f"ckpt={ckpt_name}")
     if not stages["pipeline_tests"]:
         status["pipeline_tests"] = "skipped (disabled)"
         print("[pipeline] disabled.")
@@ -549,6 +584,8 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     print(f"  beta used          {status['beta_used']:g}")
     print("[pipeline] artifacts:")
     print(f"  caches      {data_root / _BENCHMARK}")
+    if stages["data_previews"]:
+        print(f"  previews    {in_mix_cache / 'previews'}")
     print(f"  run         {run_dir}")
     print(f"  eval        {run_dir / 'mixed_eval'}")
     for m in extrap_ms:
@@ -599,12 +636,14 @@ if __name__ == "__main__":
             "build_in_mix": True,    # 1. data/G1_mix/<tag>/
             "build_holdout": True,   # 2. data/G1_mix/<tag>_holdout/
             "build_extrap": True,    # 3. data/G1_mix/<tag>_extrap_m<M>/ per M
-            "beta_calibration": False,  # 4. OPTIONAL beta sweep (one pooled
+            "data_previews": True,   # 4. data-anatomy figures (visualize_mixed)
+                                     #    -> data/G1_mix/<tag>/previews/
+            "beta_calibration": False,  # 5. OPTIONAL beta sweep (one pooled
                                         #    training per beta -- expensive)
-            "train": True,           # 5. final pooled model (train_ddp)
-            "eval_in_mix": True,     # 6. mixed_eval on in-mix + holdout
-            "eval_extrap": True,     # 7. mixed_eval per extrapolation cache
-            "pipeline_tests": True,  # 8. broad testing/ diagnostics on the
+            "train": True,           # 6. final pooled model (train_ddp)
+            "eval_in_mix": True,     # 7. mixed_eval on in-mix + holdout
+            "eval_extrap": True,     # 8. mixed_eval per extrapolation cache
+            "pipeline_tests": True,  # 9. broad testing/ diagnostics on the
                                      #    same <ckpt_name> (run_pipeline_tests)
         },
         # --- beta_calibration sub-stage settings (stage 4 only) --------------------

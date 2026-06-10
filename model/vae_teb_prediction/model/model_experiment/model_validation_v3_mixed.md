@@ -248,10 +248,16 @@ One-shot alternative (build + sweep + select in one process):
 
 **Single-file end-to-end driver:** `synthetic/run_mixed_pipeline.py` runs every
 stage above in the correct order — build the in-mix / holdout / extrap-$M$
-caches, (optionally) the $\beta$ sweep + selection, the final `train_ddp` run
-at $\beta^\star$, the `mixed_eval` passes (in-mix + holdout, plus one per
-extrapolation cache, each in its own `mixed_eval_extrap_m<M>/` subdirectory),
-and finally the broad model-diagnostic pipeline (`run_pipeline_tests.py` →
+caches, the **data-anatomy previews** (`synthetic/visualize_mixed.py`:
+per-channel source/target panels with the true lag walk $d_t$, colour-matched
+"this source section drives this target section $d_t$ steps later" annotations,
+the AR-filtered *driven component* overlay, an innovation-cross-correlation
+evidence panel, the TE $\times$ lag-band case gallery, and the full channel
+atlas — written to `data/G1_mix/<tag>/previews/`), (optionally) the $\beta$
+sweep + selection, the final `train_ddp` run at $\beta^\star$, the
+`mixed_eval` passes (in-mix + holdout, plus one per extrapolation cache, each
+in its own `mixed_eval_extrap_m<M>/` subdirectory), and finally the broad
+model-diagnostic pipeline (`run_pipeline_tests.py` →
 `testing.run_full_test_pipeline`: histograms, forecast quality, attention / lag
 diagnostics, KL-PCA, residual usage, …) on the **same** $\beta^\star$
 checkpoint, under `results/G1_mix/<run_tag>/testing_pipeline/<output_tag>/`.
