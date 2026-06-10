@@ -458,8 +458,9 @@ def make_dataloaders(
     num_workers = int(ds_cfg.get("num_workers", 0))
     pin_memory = bool(ds_cfg.get("pin_memory", False))
     persistent_workers = bool(ds_cfg.get("persistent_workers", False))
+    mmap = ds_cfg.get("mmap", "auto")
 
-    train_ds = SyntheticTEDataset(train_npz)
+    train_ds = SyntheticTEDataset(train_npz, mmap=mmap)
     train_loader = make_dataloader(
         train_ds, batch_size, shuffle=True, drop_last=True,
         num_workers=num_workers, pin_memory=pin_memory,
@@ -467,7 +468,7 @@ def make_dataloaders(
     )
     val_loader = None
     if val_npz.is_file():
-        val_ds = SyntheticTEDataset(val_npz)
+        val_ds = SyntheticTEDataset(val_npz, mmap=mmap)
         val_loader = make_dataloader(
             val_ds, batch_size, shuffle=False, drop_last=False,
             num_workers=num_workers, pin_memory=pin_memory,

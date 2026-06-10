@@ -33,16 +33,27 @@ Note:
 from __future__ import annotations
 
 import json
+import struct
+import zipfile
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from numpy.lib import format as _npy_format
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 
 # Tensor fields stored in every split ``.npz`` (native model channel layout).
 _FIELDS = ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight")
+
+# Large per-timestep arrays worth memory-mapping ($O(n \cdot T \cdot C)$ bytes).
+# The per-sample provenance arrays are $O(n)$ scalars and stay eagerly loaded.
+_MMAP_FIELDS = _FIELDS + ("true_lag_tt",)
+
+# One member spec of an uncompressed ``.npz``: (absolute byte offset of the
+# array data inside the archive file, dtype, shape, 'C'/'F' memory order).
+_MemberSpec = Tuple[int, np.dtype, Tuple[int, ...], str]
 
 # Optional per-sample provenance arrays written **only** by the mixed-population
 # builder (:mod:`mixed_dataset`). Each is length ``n`` and aligned to ``fhr_st``.
@@ -96,18 +107,106 @@ def attribute_dict_collate(batch: list) -> AttributeDict:
     return AttributeDict(default_collate(batch))
 
 
+class _MmapUnsupported(Exception):
+    """Raised when a cache ``.npz`` cannot be memory-mapped (eager fallback)."""
+
+
+def _read_npz_member_specs(npz_path: Path) -> Dict[str, _MemberSpec]:
+    r"""Locate every array of an **uncompressed** ``.npz`` inside the archive.
+
+    ``np.load(..., mmap_mode=...)`` ignores ``mmap_mode`` for ``.npz`` archives,
+    but the caches written by :mod:`build_dataset` / :mod:`mixed_dataset` use
+    ``np.savez`` (ZIP **stored**, not deflated), so each ``.npy`` member sits as
+    a contiguous byte range inside the archive file. This helper resolves, per
+    member, the absolute byte offset of the raw array data (local ZIP header
+    $\to$ ``.npy`` header $\to$ data start) plus its dtype / shape / order, so
+    the caller can hand each one to :class:`numpy.memmap` directly -- no
+    decompression, no copy, and the OS page cache shares the bytes across every
+    process that maps the same file (the DDP multi-rank RAM fix).
+
+    Args:
+        npz_path: Path to the ``.npz`` archive.
+
+    Returns:
+        Mapping ``{array_name: (data_offset, dtype, shape, order)}`` with the
+        trailing ``.npy`` stripped from each member name.
+
+    Raises:
+        _MmapUnsupported: If any member is compressed, uses an unsupported
+            ``.npy`` format version, holds Python objects, or is empty --
+            callers fall back to the eager in-RAM loader.
+    """
+    specs: Dict[str, _MemberSpec] = {}
+    with zipfile.ZipFile(npz_path) as zf, open(npz_path, "rb") as fh:
+        for info in zf.infolist():
+            if info.compress_type != zipfile.ZIP_STORED:
+                raise _MmapUnsupported(
+                    f"member {info.filename!r} is compressed"
+                )
+            # Local file header: 30 fixed bytes, then filename + extra field
+            # (lengths at offsets 26/28; they can differ from the central
+            # directory's, so they must be read from the local header itself).
+            fh.seek(info.header_offset)
+            header = fh.read(30)
+            if len(header) != 30 or header[:4] != b"PK\x03\x04":
+                raise _MmapUnsupported(
+                    f"member {info.filename!r}: bad local file header"
+                )
+            n_name, n_extra = struct.unpack("<HH", header[26:30])
+            fh.seek(info.header_offset + 30 + n_name + n_extra)
+            try:
+                version = _npy_format.read_magic(fh)
+                if version == (1, 0):
+                    shape, fortran, dtype = _npy_format.read_array_header_1_0(fh)
+                elif version == (2, 0):
+                    shape, fortran, dtype = _npy_format.read_array_header_2_0(fh)
+                else:
+                    raise _MmapUnsupported(
+                        f"member {info.filename!r}: npy format {version}"
+                    )
+            except ValueError as exc:
+                raise _MmapUnsupported(
+                    f"member {info.filename!r}: {exc}"
+                ) from exc
+            if dtype.hasobject:
+                raise _MmapUnsupported(
+                    f"member {info.filename!r}: object dtype"
+                )
+            if int(np.prod(shape)) == 0:
+                raise _MmapUnsupported(
+                    f"member {info.filename!r}: empty array"
+                )
+            name = info.filename
+            if name.endswith(".npy"):
+                name = name[:-4]
+            specs[name] = (fh.tell(), dtype, tuple(shape), "F" if fortran else "C")
+    return specs
+
+
 class SyntheticTEDataset(Dataset):
     r"""Dataset over a single cached synthetic-TE split (``train``/``val``/``test``).
 
-    The dataset is a pure loader: it reads one ``.npz`` written by
-    :mod:`build_dataset` fully into RAM, closes the archive handle, and exposes
-    each sample as an :class:`AttributeDict`. Closing the handle keeps the
-    cache file unlocked (safe for temp-dir cleanup on Windows) and per-sample
-    access needs no disk round trip. The analytic ground truth -- block
-    transfer entropy ``te_true`` and the ``true_lag_band`` $\{D-H,\dots,D-1\}$
-    -- lives in the shared ``meta.json`` and is attached to every sample so
-    downstream evaluators (``evaluate_te``, ``lag_recovery``) can reach it from
-    any batch.
+    The dataset is a pure loader over one ``.npz`` written by
+    :mod:`build_dataset` / :mod:`mixed_dataset`, exposing each sample as an
+    :class:`AttributeDict`. Two backing modes exist:
+
+    * **Memory-mapped** (default, ``mmap='auto'``): the large per-timestep
+      arrays are :class:`numpy.memmap` views straight into the uncompressed
+      ``.npz``, so the process holds **no private copy** of the split -- pages
+      are demand-loaded and shared through the OS page cache. Under DDP this
+      is the difference between $1\times$ and $\text{world\_size}\times$ the
+      pool size in host RAM (8 ranks each eagerly loading a multi-GB pool is
+      what OOM-killed the ``G1_mix`` run). ``__getitem__`` copies each row
+      into a fresh writable ``float32`` tensor, so consumers never see the
+      read-only mapping.
+    * **Eager** (``mmap=False``, or automatic fallback when the archive is
+      compressed / not mappable): the original behaviour -- read everything
+      into RAM as ``float32`` and close the handle.
+
+    The analytic ground truth -- block transfer entropy ``te_true`` and the
+    ``true_lag_band`` $\{D-H,\dots,D-1\}$ -- lives in the shared ``meta.json``
+    and is attached to every sample so downstream evaluators (``evaluate_te``,
+    ``lag_recovery``) can reach it from any batch.
 
     Attributes:
         meta: The decoded ``meta.json`` dict (analytic ground truth + config).
@@ -128,6 +227,8 @@ class SyntheticTEDataset(Dataset):
         self,
         npz_path: Union[str, Path],
         meta_path: Optional[Union[str, Path]] = None,
+        *,
+        mmap: Union[bool, str] = "auto",
     ) -> None:
         """Open a cached split.
 
@@ -136,6 +237,13 @@ class SyntheticTEDataset(Dataset):
                 :mod:`build_dataset`.
             meta_path: Path to the shared ``meta.json``. Defaults to
                 ``meta.json`` next to ``npz_path``.
+            mmap: Backing mode for the large per-timestep arrays. ``'auto'``
+                (default) or ``True`` memory-maps them straight out of the
+                uncompressed ``.npz`` (shared page cache across processes; the
+                multi-rank DDP RAM fix) and silently falls back to the eager
+                in-RAM loader when the archive is not mappable (e.g.
+                ``savez_compressed``). ``False`` forces the eager loader.
+                The realised mode is exposed as :attr:`mmap_active`.
 
         Raises:
             FileNotFoundError: If ``npz_path`` or the resolved ``meta.json``
@@ -170,31 +278,114 @@ class SyntheticTEDataset(Dataset):
             "channel_layout"
         )
 
-        # Read the split fully into RAM and close the archive handle inside
-        # the ``with`` block, so the cache file is never left open.
-        with np.load(self.npz_path) as npz:
-            missing = [f for f in _FIELDS if f not in npz.files]
+        # --- backing arrays: memory-mapped (default) or eager in-RAM ---------
+        self._mmap_specs: Optional[Dict[str, _MemberSpec]] = None
+        self.mmap_active: bool = False
+        specs: Optional[Dict[str, _MemberSpec]] = None
+        if mmap is not False:
+            try:
+                specs = _read_npz_member_specs(self.npz_path)
+            except (_MmapUnsupported, zipfile.BadZipFile, OSError) as exc:
+                print(
+                    f"[dataset][note] {self.npz_path.name}: memory-mapping "
+                    f"unavailable ({exc}); loading eagerly into RAM."
+                )
+                specs = None
+
+        if specs is not None:
+            missing = [f for f in _FIELDS if f not in specs]
             if missing:
                 raise KeyError(f"{self.npz_path} is missing fields: {missing}")
-            self._arrays = {
-                f: np.asarray(npz[f], dtype=np.float32) for f in _FIELDS
+            # Keep only the large per-timestep members as lazy memmaps; the
+            # archive file is reopened (read-only) by each np.memmap view.
+            self._mmap_specs = {
+                name: specs[name] for name in _MMAP_FIELDS if name in specs
             }
-            # Optional per-sample, per-step ground-truth lag $d_{i,t}$ of shape
-            # $(n, T)$, written by ``build_dataset`` for the synthetic
-            # benchmarks. Absent from legacy caches and from real (HDF5) data,
-            # in which case the lag-attention overlay is simply skipped.
-            self._true_lag_tt: Optional[np.ndarray] = (
-                np.asarray(npz["true_lag_tt"]) if "true_lag_tt" in npz.files
-                else None
-            )
-            # Optional per-sample provenance (mixed-population caches only).
-            # All-or-nothing: present only when the cache was written by
-            # ``mixed_dataset``. ``None`` for every homogeneous cache.
-            present = [f for f in _PROVENANCE_FIELDS if f in npz.files]
-            self._provenance: Optional[Dict[str, np.ndarray]] = (
-                {f: np.asarray(npz[f]) for f in present} if present else None
-            )
+            self._reopen_memmaps()
+            # Optional per-sample provenance (mixed-population caches only):
+            # O(n) scalars, loaded eagerly so pickling stays trivially cheap.
+            present = [f for f in _PROVENANCE_FIELDS if f in specs]
+            if present:
+                with np.load(self.npz_path) as npz:
+                    self._provenance: Optional[Dict[str, np.ndarray]] = {
+                        f: np.asarray(npz[f]) for f in present
+                    }
+            else:
+                self._provenance = None
+            self.mmap_active = True
+        else:
+            # Eager fallback: read the split fully into RAM and close the
+            # archive handle inside the ``with`` block, so the cache file is
+            # never left open (the pre-mmap behaviour, bit-for-bit).
+            with np.load(self.npz_path) as npz:
+                missing = [f for f in _FIELDS if f not in npz.files]
+                if missing:
+                    raise KeyError(
+                        f"{self.npz_path} is missing fields: {missing}"
+                    )
+                self._arrays = {
+                    f: np.asarray(npz[f], dtype=np.float32) for f in _FIELDS
+                }
+                # Optional per-sample, per-step ground-truth lag $d_{i,t}$ of
+                # shape $(n, T)$, written by ``build_dataset`` for the
+                # synthetic benchmarks. Absent from legacy caches and from
+                # real (HDF5) data, in which case the lag-attention overlay is
+                # simply skipped.
+                self._true_lag_tt: Optional[np.ndarray] = (
+                    np.asarray(npz["true_lag_tt"])
+                    if "true_lag_tt" in npz.files else None
+                )
+                # Optional per-sample provenance (mixed caches only).
+                present = [f for f in _PROVENANCE_FIELDS if f in npz.files]
+                self._provenance = (
+                    {f: np.asarray(npz[f]) for f in present} if present
+                    else None
+                )
         self._n = int(self._arrays["fhr_st"].shape[0])
+
+    # ------------------------------------------------------------------
+    # Memory-map plumbing (spawn-safe pickling)
+    # ------------------------------------------------------------------
+    def _reopen_memmaps(self) -> None:
+        """(Re)open the :class:`numpy.memmap` views from ``_mmap_specs``.
+
+        Called from ``__init__`` and again from :meth:`__setstate__` after
+        unpickling in a DataLoader worker -- every process maps the same file
+        regions, so the OS page cache backs them all with one physical copy.
+        """
+        assert self._mmap_specs is not None
+        specs = self._mmap_specs
+
+        def _open(name: str) -> np.memmap:
+            offset, dtype, shape, order = specs[name]
+            return np.memmap(
+                self.npz_path, dtype=dtype, mode="r", offset=offset,
+                shape=shape, order=("F" if order == "F" else "C"),
+            )
+
+        self._arrays = {f: _open(f) for f in _FIELDS}
+        self._true_lag_tt = (
+            _open("true_lag_tt") if "true_lag_tt" in self._mmap_specs else None
+        )
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Drop the (unpicklable-as-views) memmaps; keep the cheap specs.
+
+        Without this, pickling a memmap-backed dataset for a ``spawn``-start
+        DataLoader worker would serialise the **entire** mapped data as a
+        plain ndarray -- exactly the per-process copy the mapping avoids.
+        """
+        state = dict(self.__dict__)
+        if self._mmap_specs is not None:
+            state["_arrays"] = None
+            state["_true_lag_tt"] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore state and re-map the array views in the new process."""
+        self.__dict__.update(state)
+        if self._mmap_specs is not None:
+            self._reopen_memmaps()
 
     def __len__(self) -> int:
         return self._n
@@ -281,12 +472,14 @@ def make_dataloader(
         dataset: A :class:`SyntheticTEDataset`.
         batch_size: Samples per batch.
         shuffle: Whether to shuffle every epoch (``True`` for training).
-        num_workers: Worker processes. Defaults to ``0``; the split is already
-            held fully in RAM (see :class:`SyntheticTEDataset`), so workers
-            would only add fork / IPC overhead on a single-GPU laptop. On
-            a multi-GPU box ``num_workers >= 2`` lets host->device copies
-            overlap with the forward pass; set via ``dataset.num_workers``
-            in ``config_synth.yaml``.
+        num_workers: Worker processes. Defaults to ``0``; the split is served
+            from the shared page cache (memmap) or RAM (eager fallback) -- see
+            :class:`SyntheticTEDataset` -- so workers would only add fork /
+            IPC overhead on a single-GPU laptop. On a multi-GPU box
+            ``num_workers >= 2`` lets host->device copies overlap with the
+            forward pass; set via ``dataset.num_workers`` in
+            ``config_synth.yaml``. Memmap-backed datasets pickle cheaply
+            (specs only), so spawn-start workers do not copy the data.
         pin_memory: If True, request page-locked host memory for the input
             batch. Only useful when CUDA is in use; off by default for the
             same single-laptop reason. Set via ``dataset.pin_memory``.
@@ -326,7 +519,11 @@ if __name__ == "__main__":
         n=6, T=_T, rho_u=0.99, rho_y=0.95, c=0.5,
         sigma2_eta=1.0, sigma2_eps=1.0, delay=_DELAY, M=4, seed=0,
     )
-    with tempfile.TemporaryDirectory() as _tmp:
+    # ``ignore_cleanup_errors``: the default memmap-backed dataset keeps the
+    # ``.npz`` mapped until garbage-collected, and Windows cannot delete a
+    # mapped file -- the explicit ``del`` below releases it, this is belt and
+    # braces for non-refcounting interpreters.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _tmp:
         _dir = Path(_tmp)
         # The generator stamps the per-step true lag into meta as a numpy
         # array; ``build_dataset`` pops it into the ``.npz``. Mirror that here
@@ -351,6 +548,7 @@ if __name__ == "__main__":
             json.dump(_meta_out, _fh, indent=2)
 
         _ds = SyntheticTEDataset(_dir / "train.npz")
+        assert _ds.mmap_active, "np.savez cache should memory-map"
         assert len(_ds) == 6, len(_ds)
         _s = _ds[0]
         assert _s.fhr_st.shape == (_T, 43), _s.fhr_st.shape
@@ -369,5 +567,8 @@ if __name__ == "__main__":
         assert _u.shape == (3, _T, 101), _u.shape
         assert len(_batch.guid) == 3 and isinstance(_batch.guid[0], str)
         print(f"[batch]  u_stream={tuple(_u.shape)}  guids={list(_batch.guid)}")
+        # Release the memmaps before the temp dir is deleted (Windows cannot
+        # remove a file that is still mapped).
+        del _s, _batch, _u, _loader, _ds
 
     print("All dataset checks passed.")

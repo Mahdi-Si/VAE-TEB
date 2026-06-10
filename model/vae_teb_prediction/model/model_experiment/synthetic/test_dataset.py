@@ -301,6 +301,79 @@ def test_dataset_attaches_layout_attrs(tiny_g1_cache: Path):
     assert max(layout["U"]["noise"]) == ds.meta["c_u"] - 1
 
 
+def test_mmap_dataset_matches_eager(tiny_g1_cache: Path):
+    """The memmap-backed loader returns samples identical to the eager loader.
+
+    ``np.savez`` caches are uncompressed, so the default ``mmap='auto'`` must
+    engage; every tensor field, dtype and metadata scalar must match the
+    ``mmap=False`` (eager) reference bit-for-bit.
+    """
+    ds_eager = SyntheticTEDataset(tiny_g1_cache / "train.npz", mmap=False)
+    ds_mmap = SyntheticTEDataset(tiny_g1_cache / "train.npz")  # default auto
+    assert ds_eager.mmap_active is False
+    assert ds_mmap.mmap_active is True
+    assert isinstance(ds_mmap._arrays["fhr_st"], np.memmap)
+    assert len(ds_mmap) == len(ds_eager)
+    for idx in (0, len(ds_eager) - 1):
+        a, b = ds_eager[idx], ds_mmap[idx]
+        for field in ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
+            assert b[field].dtype == torch.float32
+            assert torch.equal(a[field], b[field]), field
+        assert a.guid == b.guid
+        assert a.te_true == b.te_true
+        assert torch.equal(a.true_lag_band, b.true_lag_band)
+        if "true_lag_tt" in a:
+            assert torch.equal(a.true_lag_tt, b.true_lag_tt)
+    # The returned tensors are writable copies, not views into the read-only
+    # mapping (an in-place op must not raise / touch the cache).
+    sample = ds_mmap[0]
+    sample.fhr_st += 1.0
+
+
+def test_mmap_falls_back_on_compressed_npz(tiny_g1_cache: Path, tmp_path):
+    """A ``savez_compressed`` archive silently falls back to the eager loader."""
+    import shutil
+
+    with np.load(tiny_g1_cache / "train.npz") as npz:
+        arrays = {k: npz[k] for k in npz.files}
+    np.savez_compressed(tmp_path / "train.npz", **arrays)
+    shutil.copy(tiny_g1_cache / "meta.json", tmp_path / "meta.json")
+
+    ds = SyntheticTEDataset(tmp_path / "train.npz")  # auto -> fallback
+    assert ds.mmap_active is False
+    ref = SyntheticTEDataset(tiny_g1_cache / "train.npz", mmap=False)
+    a, b = ref[0], ds[0]
+    for field in ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
+        assert torch.equal(a[field], b[field]), field
+
+
+def test_mmap_dataset_pickles_without_data(tiny_g1_cache: Path):
+    """Pickling a memmap dataset ships specs, not arrays (spawn-safe workers).
+
+    A spawn-start DataLoader worker receives the dataset via pickle; the
+    payload must stay far below the mapped data size (otherwise every worker
+    would materialise a private copy -- the exact regression the mapping
+    exists to prevent), and the unpickled dataset must serve identical
+    samples through the re-opened mappings.
+    """
+    import pickle
+
+    ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
+    assert ds.mmap_active is True
+    payload = pickle.dumps(ds)
+    mapped_bytes = sum(ds._arrays[f].nbytes for f in ds._arrays)
+    assert len(payload) < mapped_bytes / 4, (
+        f"pickle payload {len(payload)} B suspiciously large vs "
+        f"{mapped_bytes} B mapped -- did the memmaps get serialised?"
+    )
+    ds2 = pickle.loads(payload)
+    assert ds2.mmap_active is True
+    a, b = ds[1], ds2[1]
+    for field in ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
+        assert torch.equal(a[field], b[field]), field
+    assert a.guid == b.guid
+
+
 def test_smallnoise_tail_variance_in_cached_split(tiny_g1_cache: Path):
     r"""The cached Y small-noise tail keeps $\sigma^2_{\text{smallnoise}}$ on disk."""
     ds = SyntheticTEDataset(tiny_g1_cache / "train.npz")
