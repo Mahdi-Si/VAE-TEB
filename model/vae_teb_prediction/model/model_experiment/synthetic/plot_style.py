@@ -112,6 +112,31 @@ PALETTE_EXTENDED = [
     COLOR_TEAL_DARK,
 ]
 
+# Shared semantic maps for the mixed-population figures so every panel (in
+# ``mixed_eval`` and ``mixed_calibration``) uses one M->colour / band->marker
+# mapping. ``M_COLOR_CYCLE`` is the fallback order for M values not in the map
+# (e.g. the M-extrapolation caches at M=4 / M=64).
+M_COLORS = {4: COLOR_SKY, 8: COLOR_BLUE, 16: COLOR_VERMILLION,
+            32: COLOR_GREEN, 64: COLOR_PURPLE}
+M_COLOR_CYCLE = PALETTE_EXTENDED
+BAND_MARKERS = {"short": "o", "mid": "s", "long": "^"}
+
+
+def color_for_M(m: int) -> str:
+    """Return the canonical colour for an informative-channel count $M$.
+
+    Args:
+        m: The informative-channel count.
+
+    Returns:
+        The mapped colour, or a deterministic fallback from
+        :data:`M_COLOR_CYCLE` for an unmapped $M$.
+    """
+    if int(m) in M_COLORS:
+        return M_COLORS[int(m)]
+    return M_COLOR_CYCLE[int(m) % len(M_COLOR_CYCLE)]
+
+
 SAVE_DPI = 600
 
 # Explicit per-element font sizes (1.5x the rcParams base sizes below). Pass

@@ -888,6 +888,7 @@ def gen_state_space_oscillator(
     easy_variant: bool = False,
     standardize: bool = True,
     reverse_roles: bool = False,
+    randomize_channel_layout: bool = False,
     seed: int = 0,
     te_n_samples: int = 50_000,
     channel_decomp: Optional[Dict[str, Any]] = None,
@@ -1233,6 +1234,33 @@ def gen_state_space_oscillator(
         )
         U_buf = _standardize_per_channel(U_buf)
 
+    # Optional channel-position randomization (default off -> existing caches are
+    # byte-identical). Permuting the channel axis is a relabelling: it leaves the
+    # block TE and the per-channel predictability invariant (z-scoring is
+    # per-channel, hence permutation-commuting), but it removes the positional
+    # leak by which a model could decode $M$ from *which* front channels are
+    # active. The gather index is recorded so the layout is reproducible; the
+    # informative channels move from $[0, M)$ to ``new_informative_*``.
+    channel_perm_y: Optional[List[int]] = None
+    channel_perm_u: Optional[List[int]] = None
+    new_informative_y: Optional[List[int]] = None
+    new_informative_u: Optional[List[int]] = None
+    if randomize_channel_layout:
+        perm_rng = np.random.default_rng(int(seed) + 7777)
+        perm_y = perm_rng.permutation(c_y)
+        perm_u = perm_rng.permutation(c_u)
+        Y_buf = Y_buf[..., torch.as_tensor(perm_y, dtype=torch.long)]
+        U_buf = U_buf[..., torch.as_tensor(perm_u, dtype=torch.long)]
+        channel_perm_y = [int(x) for x in perm_y]
+        channel_perm_u = [int(x) for x in perm_u]
+        # New position of each originally-informative channel c in [0, M):
+        # Y_buf[..., j] == Y_old[..., perm_y[j]], so c sits at inv_perm[c].
+        inv_y = np.argsort(perm_y)
+        inv_u = np.argsort(perm_u)
+        m_src = int(decomp.get("m_source", M))
+        new_informative_y = [int(inv_y[c]) for c in range(M)]
+        new_informative_u = [int(inv_u[c]) for c in range(m_src)]
+
     # Per-sample, per-step ground-truth lag d_{i,t} (n, T) for the lag-attention
     # overlay. ``None`` for the reverse-roles zero-TE control (no true lag to
     # show). Popped into the split ``.npz`` by ``build_dataset._write_split``.
@@ -1289,6 +1317,11 @@ def gen_state_space_oscillator(
         "seed": seed,
         "channel_decomp": _decomp_to_json(decomp),
         "channel_layout": _make_channel_layout(decomp, c_y, c_u),
+        "randomize_channel_layout": bool(randomize_channel_layout),
+        "channel_perm_y": channel_perm_y,
+        "channel_perm_u": channel_perm_u,
+        "new_informative_y": new_informative_y,
+        "new_informative_u": new_informative_u,
     }
     return Y_buf, U_buf, meta
 

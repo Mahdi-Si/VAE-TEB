@@ -10,7 +10,12 @@ The figure has six panels (a $3\times2$ grid):
     * total loss $\mathcal{L}_{\mathrm{total}}$
     * feature loss $\mathcal{L}_{\mathrm{feat}}$
     * baseline loss $\mathcal{L}_{\mathrm{base}}$
-    * KL loss $\mathcal{L}_{\mathrm{KL}}$ (log $y$ -- it spans decades)
+    * KL loss $\mathcal{L}_{\mathrm{KL}}$ (log $y$ -- it spans decades). The
+      solid pair is the loss-side per-dim mean ``kld_loss`` (nats per latent
+      dim per step); when the CSV carries ``train_kld_nats`` / ``val_kld_nats``
+      a dashed pair overlays the **dim-summed** KL ($= d_z \cdot$ ``kld_loss``,
+      nats per step) -- the scale of the TE surrogate $\bar K$ that
+      ``mixed_eval`` / ``evaluate_te`` compare against the analytic block TE.
     * predictive gap ``pred_gap`` $= \mathcal{L}_{\mathrm{base}} -
       \mathcal{L}_{\mathrm{feat}}$ (linear -- it is negative early in training)
     * optimisation diagnostics: learning rate + gradient norm (twin $y$-axes)
@@ -182,6 +187,7 @@ def _plot_curve(
     color: str,
     label: str,
     marker: Optional[str],
+    linestyle: Optional[str] = None,
 ) -> bool:
     """Draw one epoch-indexed curve on ``ax`` if it carries finite data.
 
@@ -192,13 +198,16 @@ def _plot_curve(
         color: Line colour.
         label: Legend label.
         marker: Point marker, or ``None`` for a plain line.
+        linestyle: Optional line style (e.g. ``'--'``); ``None`` keeps the
+            rcParams default solid line.
 
     Returns:
         ``True`` when a curve was drawn (so the caller can decide on a legend).
     """
     if not _has_finite(values):
         return False
-    ax.plot(epochs, values, color=color, label=label, marker=marker)
+    kwargs = {} if linestyle is None else {"ls": linestyle}
+    ax.plot(epochs, values, color=color, label=label, marker=marker, **kwargs)
     return True
 
 
@@ -273,7 +282,24 @@ def plot_training_curves(
             ax, epochs, val, color=ps.COLOR_ORANGE, label="val",
             marker=val_marker,
         )
-        if log_hint and _use_log(train, val):
+        nats_t = nats_v = None
+        if train_col == "train_kld_loss":
+            # Dashed overlay: the dim-summed KL in nats/step (= d_z x kld_loss,
+            # same loss mask) -- directly comparable to the K-bar that
+            # mixed_eval / evaluate_te plot against the analytic block TE.
+            nats_t = data.get("train_kld_nats")
+            nats_v = data.get("val_kld_nats")
+            drew_t = _plot_curve(
+                ax, epochs, nats_t, color=ps.COLOR_GREEN,
+                label=r"train $\bar K$ (nats/step)", marker=marker,
+                linestyle="--",
+            ) or drew_t
+            drew_v = _plot_curve(
+                ax, epochs, nats_v, color=ps.COLOR_PURPLE,
+                label=r"val $\bar K$ (nats/step)", marker=val_marker,
+                linestyle="--",
+            ) or drew_v
+        if log_hint and _use_log(train, val, nats_t, nats_v):
             ax.set_yscale("log")
         ax.set_title(title)
         ax.set_ylabel(ylabel)

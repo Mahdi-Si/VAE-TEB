@@ -83,32 +83,45 @@ _TENSOR_FIELDS = ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight")
 # diagnostics — they record the mean observation logvar over the
 # loss-masked support, so a single-channel collapse of the ``logvar_full``
 # head (its lower clamp at -5) is visible in the metrics CSV.
+#
+# KLD scale note (two units, both correct, $\times d_z$ apart):
+#   * ``kld_loss`` is the loss-side KL — the masked mean over
+#     $(b, t, d)$, i.e. **nats per latent dimension per step**. This is the
+#     quantity $\beta$ multiplies in the objective.
+#   * ``kld_nats`` $= d_z \cdot$ ``kld_loss`` — the same masked mean but with
+#     the latent dimensions **summed**, i.e. **nats per step**. For diagonal
+#     Gaussians $\mathrm{KL}(q\,\|\,p) = \sum_d \mathrm{KL}_d$, so this is the
+#     scale of the TE surrogate $\bar K$ that ``mixed_eval`` / ``evaluate_te``
+#     plot against the analytic block TE. Read ``kld_nats`` (not ``kld_loss``)
+#     when comparing training curves with the $\bar K$-vs-TE figures.
 _TRAIN_KEYS = (
-    "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
+    "feat_loss", "base_loss", "kld_loss", "kld_nats", "total_loss", "pred_gap",
     "mu_prior_sat_frac", "delta_mu_sat_frac",
     "mean_logvar_full", "mean_logvar_base",
     "grad_norm",
 )
 # Subset persisted into the checkpoint's ``train_metrics`` block.
 _TRAIN_METRIC_KEYS = (
-    "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
+    "feat_loss", "base_loss", "kld_loss", "kld_nats", "total_loss", "pred_gap",
     "mu_prior_sat_frac", "delta_mu_sat_frac",
     "mean_logvar_full", "mean_logvar_base",
 )
 # Per-epoch evaluation metrics (no gradient-related fields).
 _EVAL_KEYS = (
-    "feat_loss", "base_loss", "kld_loss", "total_loss", "pred_gap",
+    "feat_loss", "base_loss", "kld_loss", "kld_nats", "total_loss", "pred_gap",
     "mean_logvar_full", "mean_logvar_base",
 )
 
 # CSV column order (one row per epoch).
 _FIELDNAMES = [
     "epoch",
-    "train_feat_loss", "train_base_loss", "train_kld_loss", "train_total_loss",
+    "train_feat_loss", "train_base_loss", "train_kld_loss", "train_kld_nats",
+    "train_total_loss",
     "train_pred_gap", "train_mu_prior_sat_frac", "train_delta_mu_sat_frac",
     "train_mean_logvar_full", "train_mean_logvar_base",
     "train_grad_norm",
-    "val_feat_loss", "val_base_loss", "val_kld_loss", "val_total_loss",
+    "val_feat_loss", "val_base_loss", "val_kld_loss", "val_kld_nats",
+    "val_total_loss",
     "val_pred_gap",
     "val_mean_logvar_full", "val_mean_logvar_base",
     "lr", "epoch_seconds", "nan_skips",
@@ -568,6 +581,11 @@ def train_one_epoch(
         accum["feat_loss"] += float(losses["feat_loss"]) * bs
         accum["base_loss"] += float(losses["base_loss"]) * bs
         accum["kld_loss"] += float(losses["kld_loss"]) * bs
+        # Dim-summed KL in nats/step: exact rescale on the same loss mask
+        # ($\mathrm{KL} = \sum_d \mathrm{KL}_d$), comparable to eval-side $\bar K$.
+        accum["kld_nats"] += (
+            float(losses["kld_loss"]) * int(out["mu_post"].shape[-1]) * bs
+        )
         accum["total_loss"] += float(total) * bs
         accum["pred_gap"] += float(losses["base_loss"] - losses["feat_loss"]) * bs
         accum["mu_prior_sat_frac"] += float(out["mu_prior_sat_frac"]) * bs
@@ -642,6 +660,9 @@ def evaluate(
         accum["feat_loss"] += float(losses["feat_loss"]) * bs
         accum["base_loss"] += float(losses["base_loss"]) * bs
         accum["kld_loss"] += float(losses["kld_loss"]) * bs
+        accum["kld_nats"] += (
+            float(losses["kld_loss"]) * int(out["mu_post"].shape[-1]) * bs
+        )
         accum["total_loss"] += float(losses["total_loss"]) * bs
         accum["pred_gap"] += float(losses["base_loss"] - losses["feat_loss"]) * bs
         accum["mean_logvar_full"] += float(losses["mean_logvar_full"]) * bs
@@ -886,6 +907,7 @@ def _assemble_row(
         "train_feat_loss": train_m["feat_loss"],
         "train_base_loss": train_m["base_loss"],
         "train_kld_loss": train_m["kld_loss"],
+        "train_kld_nats": train_m.get("kld_nats", float("nan")),
         "train_total_loss": train_m["total_loss"],
         "train_pred_gap": train_m["pred_gap"],
         "train_mu_prior_sat_frac": train_m["mu_prior_sat_frac"],
@@ -896,6 +918,7 @@ def _assemble_row(
         "val_feat_loss": val_m["feat_loss"],
         "val_base_loss": val_m["base_loss"],
         "val_kld_loss": val_m["kld_loss"],
+        "val_kld_nats": val_m.get("kld_nats", float("nan")),
         "val_total_loss": val_m["total_loss"],
         "val_pred_gap": val_m["pred_gap"],
         "val_mean_logvar_full": val_m["mean_logvar_full"],

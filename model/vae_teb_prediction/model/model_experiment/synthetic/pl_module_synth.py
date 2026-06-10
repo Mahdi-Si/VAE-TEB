@@ -184,6 +184,11 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
             "feat_loss": loss_dict["feat_loss"],
             "base_loss": loss_dict["base_loss"],
             "kld_loss": loss_dict["kld_loss"],
+            # Dim-summed KL in nats/step ($\mathrm{KL} = \sum_d \mathrm{KL}_d$
+            # for the diagonal Gaussians) -- the scale of the TE surrogate
+            # $\bar K$ that mixed_eval plots, vs the per-dim ``kld_loss``.
+            "kld_nats": loss_dict["kld_loss"]
+            * float(forward_outputs["mu_post"].shape[-1]),
             "pred_gap": pred_gap,
             "mu_prior_sat_frac": forward_outputs["mu_prior_sat_frac"],
             "delta_mu_sat_frac": forward_outputs["delta_mu_sat_frac"],

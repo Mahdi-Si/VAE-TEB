@@ -103,6 +103,7 @@ _POLL_SECONDS = 5.0
 
 _VALID_MODES = (
     "a_sweep", "beta", "beta_grid", "hp", "directionality", "calibration",
+    "mix_beta",
 )
 
 # Per-cell summary CSV columns (one row per training cell).
@@ -489,6 +490,88 @@ def _cells_calibration(
     return cells
 
 
+def _cells_mix_beta(
+    config: Dict[str, Any], build: bool
+) -> List[TrainCell]:
+    r"""Enumerate the ``G1_mix`` $\beta$-sweep cells (one pooled model per $\beta$).
+
+    Unlike every other mode, all cells share **one** heterogeneous pool (the
+    ``G1_mix`` mixed-population cache) and differ only in the KL weight $\beta$.
+    The pooled model trains under the per-benchmark Gaussian-NLL loss overlay so
+    $\bar K$ has a nat scale; :mod:`mixed_calibration` then evaluates each
+    $\beta$'s checkpoint, fits $\bar K = \alpha + \gamma\,\mathrm{TE}$ per $M$,
+    and selects $\beta^\star = \arg\min_\beta |\gamma - 1| + \lambda|\alpha|$.
+
+    The in-mix and held-out pools are built **once** here (idempotent
+    :func:`mixed_dataset.build_g1_mix`) before dispatch, so the parallel workers
+    never race. Each :class:`TrainCell` reuses the shared run-tag helper
+    :func:`mixed_calibration._beta_run_tag`, so each checkpoint lands where
+    :func:`mixed_calibration.evaluate_betas` later looks
+    (``results/G1_mix/mixed_calibration/b<token>/final.ckpt``).
+
+    Args:
+        config: The parsed config (any active benchmark; this forces ``G1_mix``).
+        build: If True, materialise the in-mix + held-out pools (idempotent).
+
+    Returns:
+        One :class:`TrainCell` per $\beta$ in the resolved grid.
+
+    Raises:
+        ValueError: If the $\beta$ grid resolves empty.
+    """
+    # Lazy imports break the import cycle (mixed_calibration imports gpu_pool):
+    # both run only at call time, after both modules have finished loading.
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        mixed_calibration as mc,
+    )
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        mixed_dataset as md,
+    )
+
+    cfg = deepcopy(config)
+    cfg["experiment"]["benchmark"] = mc._BENCHMARK
+    tm.resolve_active_benchmark(cfg)
+
+    betas = mc._resolve_beta_grid(cfg)
+    if not betas:
+        raise ValueError(
+            "mix_beta mode: no beta grid resolved -- set "
+            "mix_calibration.beta_grid, calibration.beta_grid, or "
+            "beta_sweep.grid."
+        )
+    in_mix_tag = str(cfg["experiment"]["tag"])
+
+    if build:
+        # Build the in-mix + held-out pools once, serially, in this process.
+        md.build_g1_mix(cfg, force=False, holdout=False)
+        md.build_g1_mix(cfg, force=False, holdout=True)
+
+    # The Gaussian-NLL loss overlay already lives in the resolved config; mirror
+    # it onto every cell as belt-and-suspenders so the swept beta trains under
+    # nat-scale feat/base losses even if the overlay is ever dropped.
+    loss_overlay = (cfg.get("benchmarks", {}).get(mc._BENCHMARK, {}) or {}).get(
+        "loss", {}
+    ) or {}
+    likelihood = str(loss_overlay.get("likelihood", "gaussian_nll"))
+    sigma_obs = loss_overlay.get("sigma_obs", "learned")
+
+    cells: List[TrainCell] = []
+    for beta_val in betas:
+        beta_f = float(beta_val)
+        cells.append(TrainCell(
+            benchmark=mc._BENCHMARK,
+            data_tag=in_mix_tag,
+            run_tag=mc._beta_run_tag(beta_f),
+            label=f"G1_mix beta={beta_f:g}",
+            patches={
+                "loss.kld_beta": beta_f,
+                "loss.likelihood": likelihood,
+                "loss.sigma_obs": sigma_obs,
+            },
+        ))
+    return cells
+
+
 _ENUMERATORS = {
     "a_sweep": lambda cfg, build, axis: _cells_a_sweep(cfg, build),
     "beta": lambda cfg, build, axis: _cells_beta(cfg, build),
@@ -496,6 +579,7 @@ _ENUMERATORS = {
     "hp": lambda cfg, build, axis: _cells_hp(cfg, axis, build),
     "directionality": lambda cfg, build, axis: _cells_directionality(cfg, build),
     "calibration": lambda cfg, build, axis: _cells_calibration(cfg, build),
+    "mix_beta": lambda cfg, build, axis: _cells_mix_beta(cfg, build),
 }
 
 
