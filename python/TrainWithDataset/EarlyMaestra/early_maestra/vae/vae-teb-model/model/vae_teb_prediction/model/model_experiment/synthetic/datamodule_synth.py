@@ -74,6 +74,7 @@ class SyntheticTEDataModule(pl.LightningDataModule):
         self._num_workers = int(ds_cfg.get("num_workers", 0))
         self._pin_memory = bool(ds_cfg.get("pin_memory", False))
         self._persistent_workers = bool(ds_cfg.get("persistent_workers", False))
+        self._mmap = ds_cfg.get("mmap", "auto")
 
         self._train_ds: Optional[SyntheticTEDataset] = None
         self._val_ds: Optional[SyntheticTEDataset] = None
@@ -83,11 +84,17 @@ class SyntheticTEDataModule(pl.LightningDataModule):
     # Lightning hooks
     # ------------------------------------------------------------------
     def setup(self, stage: Optional[str] = None) -> None:
-        """Load the in-memory train / optional val splits on every rank.
+        r"""Open the train / optional val splits on every rank.
 
-        ``SyntheticTEDataset`` reads the whole ``.npz`` into RAM and closes the
-        handle in ``__init__`` (spawn-safe, picklable), so each rank holds its
-        own copy. Raises the same guidance as
+        With the default ``dataset.mmap: auto``, ``SyntheticTEDataset``
+        memory-maps the uncompressed ``.npz`` instead of reading it into RAM:
+        every DDP rank (and every DataLoader worker) maps the **same** file
+        regions, so the OS page cache holds **one** physical copy of the pool
+        for the whole box -- not ``world_size`` private copies. (Eagerly
+        loading the multi-GB ``G1_mix`` pool on all 8 ranks at once is what
+        used to trip the kernel OOM killer, SIGKILL / exit ``-9``, right after
+        DDP registration.) Set ``dataset.mmap: false`` to restore the eager
+        per-rank in-RAM behaviour. Raises the same guidance as
         :func:`train_minimal.make_dataloaders` when the cache is missing.
         """
         train_npz = self._cache_dir / "train.npz"
@@ -99,10 +106,10 @@ class SyntheticTEDataModule(pl.LightningDataModule):
                 f"  python -m model.vae_teb_prediction.model.model_experiment."
                 f"synthetic.mixed_dataset --tag {self._config['experiment']['tag']}"
             )
-        self._train_ds = SyntheticTEDataset(train_npz)
+        self._train_ds = SyntheticTEDataset(train_npz, mmap=self._mmap)
         self._data_meta = dict(self._train_ds.meta)
         if val_npz.is_file():
-            self._val_ds = SyntheticTEDataset(val_npz)
+            self._val_ds = SyntheticTEDataset(val_npz, mmap=self._mmap)
 
     def train_dataloader(self) -> DataLoader:
         """Shuffled training loader; Lightning injects the DistributedSampler."""

@@ -445,13 +445,20 @@ loss:
 # --- DataLoader knobs (read by train_minimal.make_dataloaders) ---------------
 # Defaults preserve the single-GPU laptop behaviour. On a multi-GPU box (>= 40
 # GB VRAM) bump num_workers to 2 and pin_memory to true so host->device copies
-# can overlap with the forward pass on each slot independently. The full
-# splits are already held in RAM by SyntheticTEDataset, so any value > 0 here
-# just buys you copy-overlap, not disk parallelism.
+# can overlap with the forward pass on each slot independently. With
+# mmap: auto the splits are served from the shared OS page cache, so workers
+# buy copy-overlap, not disk parallelism.
 dataset:
   num_workers: 0               # >= 2 on a multi-GPU box (per-worker pool slot)
   pin_memory: false            # true when CUDA is in use on multi-GPU boxes
   persistent_workers: false    # only honoured when num_workers > 0
+  mmap: auto                   # auto/true -> memory-map the uncompressed .npz
+                               # splits: all DDP ranks + DataLoader workers
+                               # share ONE page-cache copy of the pool instead
+                               # of each holding a private in-RAM copy (the
+                               # G1_mix 8-rank host-OOM fix). Falls back to
+                               # eager loading when the archive is not
+                               # mappable. false -> always load eagerly.
 
 # --- multi-GPU DDP training (read ONLY by synthetic/train_ddp.py) ------------
 # Data-parallel DDP for the single large G1_mix final-model run. The beta x M x
@@ -487,7 +494,8 @@ ddp:
     patience: 15               # epochs with no improvement before stopping
     min_delta: 0.0             # min change counted as an improvement
 # 8-GPU Linux recipe: also set dataset.num_workers: 2, pin_memory: true,
-# persistent_workers: true (size RAM first -- each worker copies the in-RAM pool).
+# persistent_workers: true. With dataset.mmap: auto the pool is page-cache
+# shared across ranks and workers, so the host-RAM cost stays ~one pool copy.
 
 # --- optimiser / training loop -----------------------------------------------
 optim:
