@@ -136,6 +136,9 @@ def cache_and_model(tmp_path_factory):
     cfg["experiment"]["benchmark"] = "G1_mix"
     resolve_active_benchmark(cfg)
     mix = cfg["benchmarks"]["G1_mix"]["mix"]
+    mix["build_workers"] = 1  # serial build in tests (cf. test_mixed_dataset);
+    # a spawned pool worker re-imports the package fresh, which is fragile
+    # under pytest's import mode and pointless for a 2-cell grid.
     mix["m_grid"] = [8, 16]
     mix["target_te_grid"] = [1.5]
     mix["lag_bands"] = {"mid": [1, 15]}
@@ -181,28 +184,27 @@ def test_collect_per_sample_kbar_shapes_and_controls(cache_and_model):
 
 
 def test_per_sample_kbar_window_matches_manual(cache_and_model):
-    """The per-sample window mean equals a hand-computed masked mean."""
+    """The per-sample window mean equals the masked mean of the same KL tensor.
+
+    Compares ``_per_sample_kld``'s scalar ``kbar`` against a hand-computed masked
+    mean of *its own* returned full-sequence ``kld_bt`` -- so the check is exact
+    and self-consistent (no separate, dropout-perturbed encoder pass).
+    """
     ds = cache_and_model["ds"]
     model = cache_and_model["model"]
+    model.eval()
     loader = make_dataloader(ds, batch_size=4, shuffle=False)
     batch = next(iter(loader))
     from model.vae_teb_prediction.model.model_experiment.synthetic.dataset import (
         build_u_stream,
     )
-    with torch.no_grad():
-        enc = model.encode_only(batch.fhr_st, batch.fhr_ph,
-                                build_u_stream(batch), sample_z=True)
-        kld = model.kld_tensor(
-            mu_prior=enc["mu_prior"], logvar_prior=enc["logvar_prior"],
-            mu_post=enc["mu_post"], logvar_post=enc["logvar_post"],
-            mask_warmup=False).sum(-1)                    # (B, T)
-    got = ME._per_sample_kbar(
+    got, _, _, kld_bt = ME._per_sample_kld(
         model, batch.fhr_st, batch.fhr_ph, build_u_stream(batch),
         batch["delay_max"], warmup=30, horizon=30)
-    T = kld.shape[1]
-    for i in range(kld.shape[0]):
+    T = kld_bt.shape[1]
+    for i in range(kld_bt.shape[0]):
         lo = max(30, int(batch["delay_max"][i]) - 1)
-        manual = float(kld[i, lo:T - 30].mean())
+        manual = float(kld_bt[i, lo:T - 30].mean())
         assert got[i] == pytest.approx(manual, abs=1e-5)
 
 

@@ -392,33 +392,36 @@ def group_recovery(
     return rows
 
 
-def fit_calibration_slices(
+def _fit_slices_from_response(
     arrs: Dict[str, np.ndarray],
     cells_by_id: Dict[int, Dict[str, Any]],
+    response: np.ndarray,
 ) -> Dict[str, Any]:
-    r"""Fit $\bar K = \alpha + \gamma\,\mathrm{TE}$ overall + per-$M$ + per-band.
+    r"""Fit $\text{response} = \alpha + \gamma\,\mathrm{TE}$ overall + per-$M$ + per-band.
 
+    Shared core of :func:`fit_calibration_slices` (response $= \bar K$) and
+    :func:`fit_calibration_slices_nullsub` (response $= \bar K - \bar K_{\text{null}}$).
     The headline slope uses **per-cell means** (one point per cell); a singular
     or under-determined slice (fewer than two distinct cell TEs) is skipped.
 
     Args:
-        arrs: The aligned per-sample arrays.
+        arrs: The aligned per-sample arrays (carry ``cell_id`` / ``te_true`` / ``M``).
         cells_by_id: Manifest cell dicts keyed by ``cell_id``.
+        response: Per-sample response array aligned with ``arrs['cell_id']``.
 
     Returns:
-        ``{"overall": fit, "by_M": {M: fit}, "by_band": {band: fit}}`` where
-        each ``fit`` is the :func:`fit_calibration_slope` dict, or ``None`` if
-        the slice was singular.
+        ``{"overall": fit, "by_M": {M: fit}, "by_band": {band: fit}}`` where each
+        ``fit`` is the :func:`fit_calibration_slope` dict, or ``None`` if singular.
     """
     cell_ids = np.asarray(arrs["cell_id"], dtype=int)
-    kbar = np.asarray(arrs["kbar"], dtype=float)
+    resp = np.asarray(response, dtype=float)
     te = np.asarray(arrs["te_true"], dtype=float)
     per_cell: List[Tuple[float, float, int, str]] = []
     for cid in sorted(set(cell_ids.tolist())):
         sel = cell_ids == cid
         cell = cells_by_id.get(int(cid), {})
         per_cell.append((
-            float(np.mean(te[sel])), float(np.mean(kbar[sel])),
+            float(np.mean(te[sel])), float(np.mean(resp[sel])),
             int(cell.get("M", arrs["M"][sel][0])),
             str(cell.get("band", "")),
         ))
@@ -437,6 +440,97 @@ def fit_calibration_slices(
     for b in sorted({c[3] for c in per_cell}):
         by_band[b] = _fit([(t, k) for t, k, _, bb in per_cell if bb == b])
     return {"overall": overall, "by_M": by_M, "by_band": by_band}
+
+
+def fit_calibration_slices(
+    arrs: Dict[str, np.ndarray],
+    cells_by_id: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    r"""Fit $\bar K = \alpha + \gamma\,\mathrm{TE}$ overall + per-$M$ + per-band.
+
+    Args:
+        arrs: The aligned per-sample arrays.
+        cells_by_id: Manifest cell dicts keyed by ``cell_id``.
+
+    Returns:
+        ``{"overall": fit, "by_M": {M: fit}, "by_band": {band: fit}}``.
+    """
+    return _fit_slices_from_response(arrs, cells_by_id, np.asarray(arrs["kbar"]))
+
+
+def fit_calibration_slices_nullsub(
+    arrs: Dict[str, np.ndarray],
+    cells_by_id: Dict[int, Dict[str, Any]],
+    *,
+    control: str = "shuffle",
+) -> Dict[str, Any]:
+    r"""Fit the **null-subtracted** calibration $(\bar K - \bar K_{\text{null}})$ vs TE.
+
+    Shuffling the source $U$ destroys the directed term $I_q(Z;U\mid Y)$ while
+    leaving the prior-mismatch / estimation floor
+    $\mathbb{E}_Y[\mathrm{KL}(q_\phi(z\mid Y)\,\|\,p_\psi(z\mid Y))]$ intact, so
+    $\bar K_{\text{shuffle}}$ estimates that floor. Regressing the
+    floor-subtracted response should drive the intercept $\alpha \to 0$ while
+    leaving $\gamma$ essentially unchanged -- a direct check that the calibration
+    intercept *is* the floor (model_validation_v3_mixed identity validation).
+
+    Args:
+        arrs: The aligned per-sample arrays (must carry ``kbar_<control>``).
+        cells_by_id: Manifest cell dicts keyed by ``cell_id``.
+        control: Null-control name (``shuffle`` / ``reverse``) present in ``arrs``.
+
+    Returns:
+        The same shape as :func:`fit_calibration_slices`, or ``{}`` if the
+        control was not collected.
+    """
+    key = f"kbar_{control}"
+    if key not in arrs:
+        return {}
+    response = np.asarray(arrs["kbar"], dtype=float) - np.asarray(arrs[key], dtype=float)
+    return _fit_slices_from_response(arrs, cells_by_id, response)
+
+
+def calibration_primary_summary(
+    slices: Dict[str, Any], *, gamma_tol: float = 0.2,
+) -> Dict[str, Any]:
+    r"""Summarise the **per-$M$** calibration as the headline result.
+
+    The mixed pool crosses the channel-dilution axis $M$, so a single pooled
+    slope conflates the $M$-dependence of $\bar K$ with the TE-dependence. The
+    per-$M$ slopes are therefore the primary report; this collapses them into a
+    compact summary (mean / median $\gamma$, spread, and the fraction of $M$
+    slices that meet $|\gamma - 1| \le \texttt{gamma\_tol}$).
+
+    Args:
+        slices: The ``fit_calibration_slices`` output (``{"overall", "by_M", ...}``).
+        gamma_tol: Tolerance for the per-$M$ calibration pass (validation plan §8,
+            Metric 3 threshold ``0.2``).
+
+    Returns:
+        ``{"gamma_by_M", "alpha_by_M", "mean_gamma", "median_gamma",
+        "gamma_spread", "n_M", "frac_M_calibrated"}`` (empty if no per-$M$ fit).
+    """
+    by_M = (slices or {}).get("by_M", {}) or {}
+    gamma_by_M: Dict[str, float] = {}
+    alpha_by_M: Dict[str, float] = {}
+    for m, fit in by_M.items():
+        if isinstance(fit, dict) and fit:
+            gamma_by_M[str(m)] = float(fit.get("gamma", float("nan")))
+            alpha_by_M[str(m)] = float(fit.get("alpha", float("nan")))
+    gammas = np.asarray(
+        [g for g in gamma_by_M.values() if np.isfinite(g)], dtype=float
+    )
+    if gammas.size == 0:
+        return {"gamma_by_M": gamma_by_M, "alpha_by_M": alpha_by_M, "n_M": 0}
+    return {
+        "gamma_by_M": gamma_by_M,
+        "alpha_by_M": alpha_by_M,
+        "mean_gamma": float(np.mean(gammas)),
+        "median_gamma": float(np.median(gammas)),
+        "gamma_spread": float(np.max(gammas) - np.min(gammas)),
+        "n_M": int(gammas.size),
+        "frac_M_calibrated": float(np.mean(np.abs(gammas - 1.0) <= float(gamma_tol))),
+    }
 
 
 # =============================================================================
@@ -864,6 +958,7 @@ def evaluate_mixed(
     in_mix_tag: str,
     holdout_tag: Optional[str] = None,
     ckpt_name: str = "final.ckpt",
+    out_subdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     r"""Evaluate the ``G1_mix`` model per-group on in-mix + held-out caches.
 
@@ -873,6 +968,11 @@ def evaluate_mixed(
         in_mix_tag: In-mix cache tag (``data/G1_mix/<in_mix_tag>/``).
         holdout_tag: Optional held-out cache tag for extrapolation.
         ckpt_name: Checkpoint file name (``final.ckpt`` or ``best.ckpt``).
+        out_subdir: Output subdirectory under the run dir. ``None`` keeps the
+            default ``mixed_eval``; pass a distinct name (e.g.
+            ``mixed_eval_extrap_m64``) when evaluating several held-out /
+            extrapolation caches against the same checkpoint, so each pass
+            keeps its own artifacts instead of overwriting the previous one.
 
     Returns:
         The full metrics dict (also written to ``metrics.json``).
@@ -893,7 +993,7 @@ def evaluate_mixed(
     controls = tuple(eval_cfg.get("null_controls", ["shuffle", "reverse"]))
     bs = int(eval_cfg.get("batch_size") or config.get("optim", {}).get("batch_size", 32))
 
-    out_dir = run_dir / _OUT_SUBDIR
+    out_dir = run_dir / (out_subdir or _OUT_SUBDIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- in-mix recovery -----------------------------------------------------
@@ -907,6 +1007,10 @@ def evaluate_mixed(
         controls=controls,
     )
     slices_in = fit_calibration_slices(arrs_in, cells_in)
+    slices_in_nullsub = (
+        fit_calibration_slices_nullsub(arrs_in, cells_in, control=controls[0])
+        if controls else {}
+    )
     overall = slices_in["overall"] or {"alpha": 0.0, "gamma": 1.0, "r2": float("nan")}
     rows_in = group_recovery(
         arrs_in, cells_in, alpha=float(overall["alpha"]),
@@ -934,6 +1038,7 @@ def evaluate_mixed(
     # --- held-out extrapolation ---------------------------------------------
     rows_ho: List[Dict[str, Any]] = []
     slices_ho: Dict[str, Any] = {}
+    slices_ho_nullsub: Dict[str, Any] = {}
     arrs_ho: Dict[str, Any] = {}
     if holdout_tag is not None:
         try:
@@ -951,6 +1056,10 @@ def evaluate_mixed(
                 gamma=float(overall["gamma"]), controls=controls,
             )
             slices_ho = fit_calibration_slices(arrs_ho, cells_ho)
+            slices_ho_nullsub = (
+                fit_calibration_slices_nullsub(arrs_ho, cells_ho, control=controls[0])
+                if controls else {}
+            )
             lag_ho = per_cell_lag_recovery(
                 model, ds_ho, cells_ho, cellids_ho, device, horizon=horizon,
                 T=int(ds_ho.meta.get("sequence_length", T)), max_lag=max_lag,
@@ -978,7 +1087,16 @@ def evaluate_mixed(
         "ckpt": str(ckpt_path),
         "warmup": warmup,
         "horizon": horizon,
-        "calibration": {"in_mix": slices_in, "holdout": slices_ho},
+        "calibration": {
+            "in_mix": slices_in,
+            "in_mix_nullsub": slices_in_nullsub,
+            "holdout": slices_ho,
+            "holdout_nullsub": slices_ho_nullsub,
+        },
+        "calibration_primary": {
+            "in_mix": calibration_primary_summary(slices_in),
+            "holdout": calibration_primary_summary(slices_ho) if rows_ho else {},
+        },
         "kld_te_association": {
             "in_mix": kld_te_association(arrs_in),
             "holdout": kld_te_association(arrs_ho) if rows_ho else {},
@@ -1001,7 +1119,9 @@ def evaluate_mixed(
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
     with open(out_dir / "calibration.json", "w", encoding="utf-8") as fh:
-        json.dump({"in_mix": slices_in, "holdout": slices_ho,
+        json.dump({"in_mix": slices_in, "in_mix_nullsub": slices_in_nullsub,
+                   "holdout": slices_ho, "holdout_nullsub": slices_ho_nullsub,
+                   "primary_per_M": metrics["calibration_primary"]["in_mix"],
                    "alpha": float(overall["alpha"]),
                    "gamma": float(overall["gamma"])}, fh, indent=2)
     with open(out_dir / "generalization.json", "w", encoding="utf-8") as fh:
@@ -1011,8 +1131,15 @@ def evaluate_mixed(
 
     g = overall.get("gamma", float("nan"))
     a = overall.get("alpha", float("nan"))
+    prim = metrics["calibration_primary"]["in_mix"]
+    gamma_by_M = prim.get("gamma_by_M", {})
+    per_m_str = "  ".join(f"M={m}:{gv:.3f}" for m, gv in sorted(
+        gamma_by_M.items(), key=lambda kv: int(kv[0])))
     print(
         f"[mixed_eval] done -> {out_dir}\n"
+        f"  PRIMARY per-M gamma: {per_m_str or '(none)'}  "
+        f"(mean={prim.get('mean_gamma', float('nan')):.3f}, "
+        f"frac|gamma-1|<=0.2={prim.get('frac_M_calibrated', float('nan')):.2f})\n"
         f"  overall calibration: gamma={g:.3f} alpha={a:.3f} "
         f"r2={overall.get('r2', float('nan')):.3f} over {len(rows_in)} cells"
     )
@@ -1109,8 +1236,11 @@ def _write_per_sample_csv(
             ])
 
 
-_M_COLORS = {8: ps.COLOR_BLUE, 16: ps.COLOR_VERMILLION, 32: ps.COLOR_GREEN}
-_BAND_MARKERS = {"short": "o", "mid": "s", "long": "^"}
+# Shared semantic maps (one source of truth in plot_style) so mixed_eval and
+# mixed_calibration colour M / mark bands identically; ``ps.color_for_M`` adds a
+# deterministic fallback for the M-extrapolation caches (M=4 / M=64).
+_M_COLORS = ps.M_COLORS
+_BAND_MARKERS = ps.BAND_MARKERS
 
 
 def _caption(fig, text: str) -> None:
@@ -1146,6 +1276,8 @@ def _render_figures(
     for name, fn in (
         # Calibration + recovery (per-cell)
         ("calibration_scatter", _fig_calibration),
+        ("calibration_by_M", _fig_calibration_by_M),
+        ("prior_mismatch", _fig_prior_mismatch),
         ("kld_vs_te_percell", _fig_kld_vs_te_percell),
         ("kld_vs_te_allsamples", _fig_kld_vs_te_allsamples),
         ("kld_within_cell_spread", _fig_kld_within_cell_spread),
@@ -1238,6 +1370,122 @@ def _fig_calibration(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     _caption(fig, "Per-(M,TE) cell mean KL vs true block TE, one panel per "
                   "lag-band; dashed y=x, line = per-band OLS. Well-calibrated: "
                   "points track y=x with slope gamma -> 1.")
+    ps.save_figure(fig, path)
+
+
+def _fig_calibration_by_M(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-cell $\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$, **faceted by $M$** (PRIMARY).
+
+    The pool crosses the channel-dilution axis $M$, so the per-$M$ slope is the
+    headline calibration (a single pooled slope conflates the $M$-dependence with
+    the TE-dependence). One panel per $M$: colour = lag-band, filled = in-mix /
+    hollow = held-out, dashed $y=x$, and the per-$M$ OLS line with its
+    $\gamma_M$ annotated. The target is $\gamma_M \to 1$ for **every** $M$.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    all_rows = rows_in + rows_ho
+    ms, _, bands = _grid_axes(all_rows)
+    if not ms:
+        return
+    band_color = {b: ps.PALETTE_PRIMARY[i % len(ps.PALETTE_PRIMARY)]
+                  for i, b in enumerate(bands)}
+    te_vals = [r["te_true"] for r in all_rows] or [0.0, 1.0]
+    kb_vals = [r["kbar_mean"] for r in all_rows] or [0.0, 1.0]
+    hi = max(max(te_vals), max(kb_vals)) * 1.05 + 1e-6
+    by_M = slices.get("by_M", {}) or {}
+    te_line = np.linspace(0, hi, 50)
+
+    fig, axes = plt.subplots(1, len(ms), figsize=(3.4 * len(ms), 4.0),
+                             squeeze=False, sharex=True, sharey=True)
+    for ci, m in enumerate(ms):
+        ax = axes[0][ci]
+        ax.plot([0, hi], [0, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY, zorder=1)
+        for rows, filled in ((rows_in, True), (rows_ho, False)):
+            for r in rows:
+                if r["M"] != m:
+                    continue
+                color = band_color.get(r["band"], ps.COLOR_PURPLE)
+                ax.scatter(r["te_true"], r["kbar_mean"],
+                           c=color if filled else "none", edgecolors=color,
+                           marker="o", s=55, linewidths=1.4, zorder=3)
+        fit = by_M.get(str(m))
+        if fit:
+            ax.plot(te_line, fit["alpha"] + fit["gamma"] * te_line,
+                    color=ps.color_for_M(m), lw=1.5,
+                    label=fr"$\gamma_M$={fit['gamma']:.2f}, $\alpha$={fit['alpha']:.2f}")
+            ax.legend(fontsize=7, loc="upper left", frameon=False)
+        ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+        if ci == 0:
+            ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
+        ax.set_title(f"M = {m}", fontsize=9)
+        ps.style_axes(ax)
+    handles = [Line2D([0], [0], marker="o", ls="", color=band_color.get(b, ps.COLOR_PURPLE),
+                      label=f"band={b}") for b in bands]
+    if handles:
+        axes[0][-1].legend(handles=handles, fontsize=7, loc="lower right",
+                           frameon=False, title="filled=in-mix\nhollow=held-out",
+                           title_fontsize=6)
+    fig.suptitle("Per-M calibration (the headline slice): "
+                 r"$\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$", fontsize=11)
+    _caption(fig, "One panel per informative-channel count M; line = per-M OLS. "
+                  "Headline claim: gamma_M -> 1 for every M (channel dilution "
+                  "does not break the nat-scale).")
+    ps.save_figure(fig, path)
+
+
+def _fig_prior_mismatch(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-$M$: calibration intercept $\alpha$ vs the null floors (identity check).
+
+    The decomposition
+    $\mathbb{E}[K_t] = I_q(Z;U\mid Y) + \mathbb{E}_Y[\mathrm{KL}(q_\phi(z\mid Y)\|p_\psi(z\mid Y))]$
+    means the calibration intercept $\alpha$ *should equal* the irreducible floor:
+    the latent KL when no directed source information is present. Two independent
+    estimates of that floor are the shuffled-source $\bar K_{\text{shuffle}}$ and
+    (if built) the zero-coupling TE$=0$ cell's $\bar K$. A well-specified model
+    has, per $M$, $\alpha \approx \bar K_{\text{shuffle}} \approx \bar K(\mathrm{TE}=0)$.
+    """
+    import matplotlib.pyplot as plt
+
+    if "shuffle" not in controls:
+        return
+    ms, _, _ = _grid_axes(rows_in)
+    if not ms:
+        return
+    by_M = slices.get("by_M", {}) or {}
+
+    def _mean_key(rows, m, key):
+        vals = [float(r[key]) for r in rows
+                if r["M"] == m and key in r and np.isfinite(float(r[key]))]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    alpha = [float((by_M.get(str(m)) or {}).get("alpha", np.nan)) for m in ms]
+    shuf = [_mean_key(rows_in, m, "null_shuffle_kbar") for m in ms]
+    te0 = [float(np.mean([r["kbar_mean"] for r in rows_in
+                          if r["M"] == m and float(r.get("target_te", -1.0)) == 0.0])
+                 ) if any(r["M"] == m and float(r.get("target_te", -1.0)) == 0.0
+                          for r in rows_in) else float("nan") for m in ms]
+
+    x = np.arange(len(ms), dtype=float)
+    w = 0.26
+    fig, ax = plt.subplots(figsize=(1.6 * len(ms) + 2.5, 4.4))
+    ax.bar(x - w, alpha, width=w, color=ps.COLOR_VERMILLION,
+           label=r"calibration intercept $\alpha_M$")
+    ax.bar(x, shuf, width=w, color=ps.COLOR_BLUE,
+           label=r"$\bar K_{\mathrm{shuffle}}$ (null floor)")
+    ax.bar(x + w, te0, width=w, color=ps.COLOR_GREEN,
+           label=r"$\bar K(\mathrm{TE}{=}0)$ cell")
+    ax.axhline(0.0, color=ps.COLOR_BLACK, lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"M={m}" for m in ms])
+    ax.set_ylabel(r"latent KL floor (nats)")
+    ax.set_title(r"Prior-mismatch check: intercept $\alpha$ vs null floors")
+    ax.legend(fontsize=7, frameon=False, loc="best")
+    ps.style_axes(ax)
+    _caption(fig, "Per M: the calibration intercept should equal the no-transfer "
+                  "floor (shuffled source, and the TE=0 cell). Large alpha above "
+                  "the floors = leaked directed signal into the intercept.")
     ps.save_figure(fig, path)
 
 
@@ -2064,6 +2312,11 @@ def main() -> None:
                         dest="holdout_tag", help="held-out cache tag")
     parser.add_argument("--ckpt-name", type=str, default="final.ckpt",
                         dest="ckpt_name")
+    parser.add_argument("--out-subdir", type=str, default=None,
+                        dest="out_subdir",
+                        help="output subdir under the run dir (default "
+                             "'mixed_eval'); use a distinct name per "
+                             "extrapolation cache to avoid overwriting")
     parser.add_argument("--data-dir", type=str, default=None, dest="data_dir")
     parser.add_argument("--results-dir", type=str, default=None, dest="results_dir")
     args = parser.parse_args()
@@ -2075,6 +2328,7 @@ def main() -> None:
     evaluate_mixed(
         config, run_tag=args.run_tag, in_mix_tag=args.in_mix_tag,
         holdout_tag=args.holdout_tag, ckpt_name=args.ckpt_name,
+        out_subdir=args.out_subdir,
     )
 
 
@@ -2085,6 +2339,7 @@ if __name__ == "__main__":
         "in_mix_tag": "G1_mix_base",
         "holdout_tag": "G1_mix_base_holdout",
         "ckpt_name": "final.ckpt",
+        "out_subdir": None,      # None -> 'mixed_eval'; set per extrap cache
         "data_dir": None,
         "results_dir": None,
     }
@@ -2101,4 +2356,5 @@ if __name__ == "__main__":
             in_mix_tag=RUN_CONFIG["in_mix_tag"],
             holdout_tag=RUN_CONFIG["holdout_tag"],
             ckpt_name=RUN_CONFIG["ckpt_name"],
+            out_subdir=RUN_CONFIG["out_subdir"],
         )

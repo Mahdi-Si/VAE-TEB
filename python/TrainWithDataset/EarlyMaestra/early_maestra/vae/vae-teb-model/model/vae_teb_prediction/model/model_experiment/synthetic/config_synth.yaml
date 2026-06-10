@@ -318,6 +318,12 @@ benchmarks:
       K_history: 160                # generous history for the near-unit-root source
       standardize: true             # per-cell z-score; the pool is NOT re-standardized
       reverse_roles: false
+      randomize_channel_layout: false  # true -> informative channels at random (per-cell,
+                                       # seeded) positions instead of [0:M); removes the
+                                       # positional leak (model can't decode M from which
+                                       # front channels are active). TE-invariant (z-score
+                                       # commutes with the permutation). Default off so the
+                                       # baseline pool is byte-identical.
       delay_walk: true              # lag drifts within each signal (realistic CTG regime)
       delay_walk_step_prob: 0.02
       te_n_samples: 2000            # GENERATION budget only: the generator's
@@ -340,14 +346,23 @@ benchmarks:
     # Mixed-population grid + holdout (consumed by synthetic.mixed_dataset).
     mix:
       m_grid: [8, 16, 32]                       # informative-channel axis
-      target_te_grid: [0.1, 0.7, 1.5, 3.0]      # mean block TE (nats), held fixed across M
+      target_te_grid: [0.0, 0.1, 0.7, 1.5, 3.0] # mean block TE (nats), held fixed across M.
+                                                # 0.0 = zero-coupling NULL cell (B_y=0,
+                                                # true TE=0): bypasses the inverter + MC-floor
+                                                # trim and anchors the calibration intercept
+                                                # alpha. One null per (M, band); never hold
+                                                # one out (it must be trained).
       lag_bands:                                # name -> [delay_min, delay_max]
         short: [1, 8]                           # band ell* = {0, ..., 7}
         mid:   [1, 15]                          # band ell* = {0, ..., 14}
         long:  [1, 31]                          # band ell* = {0, ..., 30}
       n_per_cell_train: 1000                    # samples per (M, TE, band) cell
-      n_per_cell_val:   200
-      n_per_cell_test:  300
+      n_per_cell_val:   200                     # On the 8x A6000 / 128-core box, 2000/400/600
+      n_per_cell_test:  300                     # tightens per-cell K-bar variance (more RAM).
+      holdout_m: [4, 64]                        # M values OUTSIDE m_grid -> test-only
+                                                # extrapolation caches data/G1_mix/<tag>_extrap_m{4,64}
+                                                # (genuine extrapolation across the dilution axis;
+                                                # the interior `holdout` triples test interpolation).
       te_floor_margin: 1.5                      # trim cells whose per-channel target
                                                 # (target_te / M) <= MC-floor * margin
       build_seed: 0                             # base seed for cell generation + shuffle
@@ -558,6 +573,20 @@ calibration:
     hi: 10.0
     tol: 0.005
     max_iter: 30
+
+# --- mixed-population calibration (mixed_calibration.py) ----------------------
+# beta-sweep + calibration-based beta-selection for the ONE pooled G1_mix model.
+# Unlike `calibration` (one model per (beta, TE-point) single-cell), this trains
+# the SAME heterogeneous pool once per beta, evaluates each with mixed_eval, fits
+# the PER-M slope K_bar = alpha + gamma*TE, and selects
+#   beta* = argmin_beta mean_M|gamma_M - 1| + alpha_penalty*mean_M|alpha_M|.
+# The grid is centred on the nat-scale regime (the G1_mix loss overlay pins
+# gaussian_nll): too-small beta leaves the KL ~free (gamma >> 1); too-large beta
+# collapses the latent (gamma -> 0). Resolution order in mixed_calibration:
+# mix_calibration.beta_grid -> calibration.beta_grid -> beta_sweep.grid.
+mix_calibration:
+  beta_grid: [1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1, 3.0e-1, 1.0, 3.0]
+  alpha_penalty: 0.05            # lambda_alpha in the per-M beta selector
 
 # --- lag-recovery harness (Phase 5; lag_recovery.py) -------------------------
 # Quantifies whether the model localises transfer to the true lag band

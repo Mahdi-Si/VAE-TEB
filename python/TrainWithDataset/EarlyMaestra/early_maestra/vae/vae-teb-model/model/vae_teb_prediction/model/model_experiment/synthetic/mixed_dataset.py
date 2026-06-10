@@ -51,6 +51,7 @@ import json
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -103,6 +104,12 @@ _SPLIT_OFFSET = {"train": 0, "val": 1, "test": 2}
 def _resolve_build_workers(mix: Dict[str, Any], n_tasks: int) -> int:
     r"""Resolve the worker count for a build phase from ``mix.build_workers``.
 
+    The environment variable ``SYNTH_BUILD_WORKERS`` overrides the config when
+    set (e.g. ``SYNTH_BUILD_WORKERS=1`` forces serial builds). This is useful for
+    debugging and for test runners where the OS process-spawn semantics (Windows
+    ``spawn`` under pytest) make a process pool flaky; the production Linux box
+    (``fork``) is unaffected and can leave it unset to use all cores.
+
     Args:
         mix: The ``benchmarks.G1_mix.mix`` sub-block. ``build_workers`` may be
             ``"auto"`` / ``0`` / ``None`` (use ``os.cpu_count() - 1``) or a
@@ -113,7 +120,9 @@ def _resolve_build_workers(mix: Dict[str, Any], n_tasks: int) -> int:
     Returns:
         The clamped worker count in ``[1, n_tasks]``. ``1`` means run serially.
     """
-    raw = mix.get("build_workers", "auto")
+    raw = os.environ.get("SYNTH_BUILD_WORKERS")
+    if raw is None or raw == "":
+        raw = mix.get("build_workers", "auto")
     if raw in (None, 0, "auto", "Auto", "AUTO"):
         workers = max(1, (os.cpu_count() or 1) - 1)
     else:
@@ -463,7 +472,21 @@ def enumerate_mix_cells(
                     "dmin": dmin, "dmax": dmax,
                     "per_channel": per_channel, "held": held,
                 }
-                if per_channel <= min_per_channel:
+                if float(t_target) == 0.0:
+                    # Zero-coupling NULL cell: $B_y = 0$, true block TE $= 0$
+                    # exactly. Bypass the MC-floor trim AND the bisection inverter
+                    # (which cannot bracket a target of $0$) -- the assembly pass
+                    # fabricates the $B_y = 0$ solve directly. A null must be
+                    # trained (it anchors the calibration intercept $\alpha$), so a
+                    # held-out TE$=0$ triple is a hard error.
+                    if held:
+                        raise ValueError(
+                            f"zero-coupling null cell (M={m}, TE=0.0, "
+                            f"band={band}) must be trained, not held out -- "
+                            f"remove it from mix.holdout."
+                        )
+                    plan.append(("zero", meta))
+                elif per_channel <= min_per_channel:
                     meta["reason"] = (
                         f"per-channel target {per_channel:.4g} <= MC floor*"
                         f"margin {min_per_channel:.4g}"
@@ -496,6 +519,11 @@ def enumerate_mix_cells(
             meta = entry[1]
             reason: Optional[str] = meta["reason"]
             res = None
+        elif entry[0] == "zero":
+            # Synthetic solve for the zero-coupling null cell (no inverter call).
+            meta = entry[1]
+            reason = None
+            res = {"ok": True, "B_y_scalar": 0.0, "te_block": 0.0}
         else:
             _, key, meta = entry
             res = solved[key]
@@ -588,6 +616,7 @@ def _gen_cell_split(
         horizon=horizon,
         K_history=None if data.get("K_history") is None else int(data["K_history"]),
         standardize=bool(data.get("standardize", True)),
+        randomize_channel_layout=bool(data.get("randomize_channel_layout", False)),
         seed=seed,
         te_n_samples=te_n_samples,
         channel_decomp=decomp,
@@ -842,29 +871,57 @@ def write_mixed_cache(
 
 def build_g1_mix(
     config: Dict[str, Any], *, force: bool = False, holdout: bool = False,
+    extrap_m: Optional[int] = None,
 ) -> Path:
-    r"""Build the in-mix (or held-out) ``G1_mix`` cache.
+    r"""Build the in-mix, held-out, or **M-extrapolation** ``G1_mix`` cache.
+
+    Three test caches share this builder:
+
+    * ``holdout=False, extrap_m=None`` -- the in-mix pool (all three splits from
+      the trained cells), ``data/G1_mix/<tag>/``.
+    * ``holdout=True`` -- the test-only held-out cache (the held-out cells, an
+      *interpolation* extrapolation test), ``data/G1_mix/<tag>_holdout/``.
+    * ``extrap_m=<M>`` -- a test-only cache at an informative-channel count $M$
+      **outside** the trained ``m_grid`` (a genuine extrapolation across the
+      channel-dilution axis), ``data/G1_mix/<tag>_extrap_m<M>/``. The grid is
+      rebuilt at the single $M$ with no holdout, and every sample is stamped
+      ``sample_held_out=1`` so :mod:`mixed_eval` scores it on the in-mix
+      calibration exactly like the held-out cache.
 
     Args:
         config: The parsed config carrying ``benchmarks.G1_mix``. The active
-            ``experiment.tag`` names the base cache; the held-out cache appends
-            ``_holdout``.
+            ``experiment.tag`` names the base cache.
         force: Regenerate even when a complete cache already exists.
-        holdout: If ``True`` build the test-only extrapolation cache from the
-            held-out cells; else build all three splits from the trained cells.
+        holdout: Build the test-only held-out cache from the held-out cells.
+        extrap_m: If set, build the test-only $M$-extrapolation cache at this
+            (untrained) $M$. Mutually exclusive with ``holdout``.
 
     Returns:
-        The cache directory ``data/G1_mix/<tag>[_holdout]/``.
+        The cache directory.
 
     Raises:
-        ValueError: On channel-count mismatch or an unreachable held-out cell.
+        ValueError: On channel-count mismatch, an unreachable held-out cell, or
+            ``holdout`` and ``extrap_m`` both set.
     """
+    if holdout and extrap_m is not None:
+        raise ValueError("build_g1_mix: pass at most one of holdout / extrap_m.")
+    if extrap_m is not None:
+        # M-extrapolation: rebuild the grid at a single untrained M, no holdout.
+        config = deepcopy(config)
+        _mix_block(config)["m_grid"] = [int(extrap_m)]
+        _mix_block(config)["holdout"] = []
+    # Test-only caches: the held-out cache and every extrapolation cache.
+    test_only = holdout or (extrap_m is not None)
+
     exp = config["experiment"]
     data = config["data"]
     model = config["model"]
     mix = _mix_block(config)
     base_tag = str(exp["tag"])
-    tag = base_tag + _HOLDOUT_SUFFIX if holdout else base_tag
+    if extrap_m is not None:
+        tag = f"{base_tag}_extrap_m{int(extrap_m)}"
+    else:
+        tag = base_tag + _HOLDOUT_SUFFIX if holdout else base_tag
 
     c_y_st, c_y_ph = int(data["c_y_st"]), int(data["c_y_ph"])
     c_u_st, c_u_ph = int(data["c_u_st"]), int(data["c_u_ph"])
@@ -880,7 +937,10 @@ def build_g1_mix(
 
     data_root = resolve_user_path(config["paths"]["data_dir"])
     out_dir = data_root / _BENCHMARK / tag
-    if not force and all((out_dir / f).is_file() for f in _SPLIT_FILES):
+    # Test-only caches (holdout / extrapolation) never carry train/val splits,
+    # so requiring the full _SPLIT_FILES would force a rebuild on every run.
+    required = ("test.npz", "meta.json") if test_only else _SPLIT_FILES
+    if not force and all((out_dir / f).is_file() for f in required):
         print(f"cache exists, skipping: {out_dir}  (use --force to rebuild)")
         return out_dir
 
@@ -921,7 +981,7 @@ def build_g1_mix(
     max_M = max(c.M for c in cells)
     rep_decomp = _resolve_channel_decomp({**data, "M": max_M}, c_y, c_u, "G1")
 
-    if holdout:
+    if test_only:
         split_sizes = {"test": int(mix.get("n_per_cell_test", 0))}
     else:
         split_sizes = {
@@ -941,12 +1001,12 @@ def build_g1_mix(
         splits[split] = build_mixed_split(
             cells, split, n_pc, data=data, c_y=c_y, c_u=c_u, horizon=horizon,
             te_n_samples=gen_te_n_samples, base_seed=base_seed,
-            held_out_cache=holdout, split_channels=split_channels,
+            held_out_cache=test_only, split_channels=split_channels,
             workers=gen_workers,
         )
 
     write_mixed_cache(
-        out_dir, splits, cells=cells, tag=tag, held_out_cache=holdout,
+        out_dir, splits, cells=cells, tag=tag, held_out_cache=test_only,
         data=data, model=model, mix=mix, split_channels=split_channels,
         representative_decomp=_decomp_to_json(rep_decomp),
         channel_layout=_make_channel_layout(rep_decomp, c_y, c_u),
@@ -983,6 +1043,12 @@ def main() -> None:
                         help="override experiment.tag (cache subdir name)")
     parser.add_argument("--holdout", action="store_true",
                         help="build the test-only held-out extrapolation cache")
+    parser.add_argument("--extrap-m", type=int, default=None, dest="extrap_m",
+                        help="build a test-only M-extrapolation cache at this "
+                             "(untrained) informative-channel count M; with "
+                             "--extrap-m all builds every mix.holdout_m value")
+    parser.add_argument("--extrap-m-all", action="store_true", dest="extrap_m_all",
+                        help="build every mix.holdout_m extrapolation cache")
     parser.add_argument("--force", action="store_true",
                         help="regenerate even if a complete cache exists")
     parser.add_argument("--data-dir", type=str, default=None, dest="data_dir",
@@ -996,7 +1062,13 @@ def main() -> None:
     # Re-resolve so config['data'] / loss reflect the G1_mix block.
     resolve_active_benchmark(config)
     _apply_overrides(config, vars(args))
-    build_g1_mix(config, force=args.force, holdout=args.holdout)
+    if args.extrap_m_all:
+        for m_val in _mix_block(config).get("holdout_m", []):
+            build_g1_mix(config, force=args.force, extrap_m=int(m_val))
+    elif args.extrap_m is not None:
+        build_g1_mix(config, force=args.force, extrap_m=int(args.extrap_m))
+    else:
+        build_g1_mix(config, force=args.force, holdout=args.holdout)
 
 
 if __name__ == "__main__":
@@ -1006,6 +1078,8 @@ if __name__ == "__main__":
     RUN_CONFIG = {
         "tag": "G1_mix_base",   # cache subdir under data/G1_mix/
         "holdout": False,       # True -> build the held-out test-only cache
+        "extrap_m": None,       # int -> build the M-extrapolation cache at this M
+        "extrap_m_all": False,  # True -> build every mix.holdout_m extrap cache
         "force": False,         # True -> rebuild even if a complete cache exists
         "data_dir": None,       # None -> config paths.data_dir
         "results_dir": None,    # None -> config paths.results_dir
@@ -1018,4 +1092,12 @@ if __name__ == "__main__":
         config["experiment"]["benchmark"] = _BENCHMARK
         resolve_active_benchmark(config)
         _apply_overrides(config, RUN_CONFIG)
-        build_g1_mix(config, force=RUN_CONFIG["force"], holdout=RUN_CONFIG["holdout"])
+        if RUN_CONFIG["extrap_m_all"]:
+            for m_val in _mix_block(config).get("holdout_m", []):
+                build_g1_mix(config, force=RUN_CONFIG["force"], extrap_m=int(m_val))
+        elif RUN_CONFIG["extrap_m"] is not None:
+            build_g1_mix(config, force=RUN_CONFIG["force"],
+                         extrap_m=int(RUN_CONFIG["extrap_m"]))
+        else:
+            build_g1_mix(config, force=RUN_CONFIG["force"],
+                         holdout=RUN_CONFIG["holdout"])
