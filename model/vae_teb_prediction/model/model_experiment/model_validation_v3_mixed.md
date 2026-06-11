@@ -227,6 +227,16 @@ defaults): `optim.batch_size: 128`, `model.attention_grad_checkpoint: false`
 persistent_workers: true}`, and optionally `mix.n_per_cell_*: 2000/400/600`.
 `mix.build_workers: auto` already fans the build across the 128 cores.
 
+**Host RAM (the exit `-9` fix).** With `dataset.mmap: auto` (the default),
+`SyntheticTEDataset` memory-maps the uncompressed split `.npz` instead of
+reading it into RAM, so all DDP ranks *and* all DataLoader workers share
+**one** page-cache copy of the pool (~227 KB/sample ⇒ ~10 GB at 1000/200 per
+cell, ~21 GB at 2000/400). Before this fix each of the 8 ranks eagerly held a
+private copy ($8\times$ the pool, plus worker copies), which tripped the
+kernel OOM killer (rank SIGKILLed, exit `-9`) right after DDP registration.
+The first epoch demand-pages from disk; later epochs run at RAM speed.
+`dataset.mmap: false` restores the eager per-process load.
+
 ```bash
 M=model.vae_teb_prediction.model.model_experiment.synthetic
 # 1. Sweep beta (builds the in-mix + held-out pools once, then 8 trainings):
@@ -309,7 +319,10 @@ eval window is the per-sample clean window on test). To make this readable at
 a glance, training now also logs **`kld_nats`** $= d_z \cdot$ `kld_loss`
 (`train_kld_nats` / `val_kld_nats` CSV columns, a dashed overlay in the
 `training_curves` KL panel, and a `kld_nats` entry in each checkpoint's
-`train_metrics`). Compare **`kld_nats`** with the $\bar K$-vs-TE figures.
+`train_metrics`). Compare **`kld_nats`** with the $\bar K$-vs-TE figures; the
+`mixed_eval` `kld_vs_te_overview` figure plots $\bar K$ (dim-summed nats) and
+$\bar K / d_z$ (the `kld_loss` scale) side by side to make this $d_z$ factor
+explicit.
 
 **Why not switch back to `mse`?** The likelihood is *not* the cause of the
 scale gap — $\bar K$ is a latent-space KL and is computed identically under
@@ -337,5 +350,9 @@ under-regularised regime ($I_q(Z;U\mid Y) \gg \mathrm{TE}$, §2) — the fix is
 > triples and to untrained $M\in\{4,64\}$ with a small generalisation gap.
 
 The headline figures are `mixed_calibration/gamma_vs_beta`, and from the
-$\beta^\star$ eval: `calibration_by_M`, `prior_mismatch`, `lag_profiles`,
-`pred_gain_vs_te`, and `generalization_gap`.
+$\beta^\star$ eval: the master `kld_vs_te` (per-cell $\bar K$ vs TE, faceted
+$M \times$ band, each $M$-row on its own adaptive scale), `kld_vs_te_overview`
+(the dim-summed-nats and per-dim $\bar K / d_z$ scales side by side),
+`calibration_health` (per-$M$ $\gamma_M$ with the $|\gamma-1|\le0.2$ target band
+plus the local-$\gamma$ $\bar K/\mathrm{TE}$ heatmap), `prior_mismatch`,
+`lag_profiles`, `pred_gain_vs_te`, and `generalization_gap`.

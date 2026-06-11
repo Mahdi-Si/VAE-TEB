@@ -259,5 +259,131 @@ def test_evaluate_mixed_end_to_end(cache_and_model, tmp_path):
     assert (out / "per_sample.csv").is_file()
     assert (out / "calibration.json").is_file()
     assert (out / "metrics.json").is_file()
-    assert (out / "calibration_scatter.pdf").is_file()
+    assert (out / "kld_vs_te.pdf").is_file()
+    assert (out / "calibration_health.pdf").is_file()
     assert metrics["n_cells_in_mix"] >= 1
+
+    # --- Workstream A additions: new metric blocks, columns and figure --------
+    assert "lag_recovery_summary" in metrics
+    assert "lag_walk" in metrics
+    lrs = metrics["lag_recovery_summary"]["in_mix"]
+    assert lrs["threshold"] == pytest.approx(0.8)
+    assert "frac_cells_lolo_ge" in lrs and "frac_cells_attn_ge" in lrs
+    header = (out / "per_cell.csv").read_text(encoding="utf-8").splitlines()[0]
+    for col in ("lag_mass_attn", "lag_mass_attn_ratio", "peak_lag_err_mean",
+                "peak_in_band_frac", "lag_walk_mae", "lag_walk_within1_frac"):
+        assert col in header, col
+    # The tiny G1 cache carries the per-step lag walk -> the lag-walk figure and
+    # the per-cell lag-walk metric are produced.
+    with np.load(cache_and_model["test_npz"]) as npz:
+        has_walk = "true_lag_tt" in npz.files
+    if has_walk:
+        assert (out / "lag_walk.pdf").is_file()
+        assert metrics["lag_walk"]["in_mix"], "lag_walk summary should be non-empty"
+
+
+# ---------------------------------------------------------------------------
+# Workstream A pure functions: lag-mass rollup, lag-walk summary, cell meta
+# ---------------------------------------------------------------------------
+
+def test_lag_recovery_summary_thresholds():
+    """Per-cell LagMass rolls up to the criterion-#4 pass fractions."""
+    rows = [
+        {"M": 8, "band": "mid", "lag_mass_lolo": 0.90, "lag_mass_attn": 0.85},
+        {"M": 8, "band": "mid", "lag_mass_lolo": 0.50, "lag_mass_attn": 0.70},
+        {"M": 16, "band": "short", "lag_mass_lolo": 0.95,
+         "lag_mass_attn": float("nan")},
+    ]
+    s = ME.lag_recovery_summary(rows, threshold=0.8)
+    assert s["n_cells"] == 3
+    assert s["frac_cells_lolo_ge"] == pytest.approx(2.0 / 3.0)
+    # attn: only the two finite values {0.85, 0.70} count -> 1/2 >= 0.8.
+    assert s["frac_cells_attn_ge"] == pytest.approx(0.5)
+    assert s["by_M"]["8"]["frac_lolo_ge"] == pytest.approx(0.5)
+    assert s["by_M"]["16"]["frac_lolo_ge"] == pytest.approx(1.0)
+    assert ME.lag_recovery_summary([]) == {}
+
+
+def test_lag_walk_summary():
+    """Aggregates per-cell lag-walk MAE / within-1 / corr; empty when absent."""
+    rows = [
+        {"lag_walk_mae": 1.0, "lag_walk_within1_frac": 0.8, "lag_walk_corr": 0.5},
+        {"lag_walk_mae": 3.0, "lag_walk_within1_frac": 0.4, "lag_walk_corr": 0.7},
+    ]
+    s = ME._lag_walk_summary(rows)
+    assert s["n_cells"] == 2
+    assert s["mean_mae"] == pytest.approx(2.0)
+    assert s["max_mae"] == pytest.approx(3.0)
+    assert s["mean_within1_frac"] == pytest.approx(0.6)
+    assert s["mean_corr"] == pytest.approx(0.6)
+    assert ME._lag_walk_summary([{"M": 8}]) == {}
+
+
+def test_pearson_helper():
+    """Streaming Pearson matches numpy on a perfectly correlated stream."""
+    x = np.array([1.0, 2.0, 3.0, 4.0])
+    y = 2.0 * x + 1.0
+    n = float(x.size)
+    got = ME._pearson(
+        float(x.sum()), float(y.sum()), float((x * x).sum()),
+        float((y * y).sum()), float((x * y).sum()), n,
+    )
+    assert got == pytest.approx(1.0, abs=1e-9)
+    assert np.isnan(ME._pearson(0.0, 0.0, 0.0, 0.0, 0.0, 1.0))  # n<2 -> nan
+
+
+def test_cell_eval_meta_superset():
+    """``_cell_eval_meta`` extends ``_cell_meta`` with the single-cell scalars."""
+    cell = {"cell_id": 1, "M": 16, "target_te": 1.5, "te_cell_realised": 1.42,
+            "band": "mid", "delay_min": 1, "delay_max": 15, "B_y_scalar": 0.02}
+    meta = ME._cell_eval_meta(cell, horizon=30, T=120)
+    # base (_cell_meta) fields
+    assert meta["true_lag_band"] == list(range(15))
+    assert meta["clean_anchor_range"] == [14, 90]
+    assert meta["horizon"] == 30 and meta["sequence_length"] == 120
+    # added scalars
+    assert meta["te_true"] == pytest.approx(1.42)
+    assert meta["te_per_step"] == pytest.approx(1.42 / 30.0)
+    assert meta["M"] == 16 and meta["delay_max"] == 15 and meta["delay"] == 15
+    assert meta["B_y"] == pytest.approx(0.02)
+
+
+def test_collect_per_cell_attn_diag_runs(cache_and_model):
+    """Attention LagMass / peak-lag / lag-walk run per cell on the tiny cache."""
+    ds = cache_and_model["ds"]
+    model = cache_and_model["model"]
+    with np.load(cache_and_model["test_npz"]) as npz:
+        cellids = np.asarray(npz["sample_cell_id"], int)
+        has_walk = "true_lag_tt" in npz.files
+    cells_by_id = {int(c["cell_id"]): c for c in ds.meta["mixture"]["cells"]}
+    out = ME.collect_per_cell_attn_diag(
+        model, ds, cells_by_id, cellids, torch.device("cpu"),
+        warmup=30, horizon=30, T=120, max_lag=90,
+        eval_cfg={"n_lolo_per_cell": 4, "batch_size": 4}, do_lag_walk=True,
+    )
+    assert set(out) == set(cells_by_id)
+    for res in out.values():
+        assert np.isfinite(res["lag_mass_attn_uniform"])
+        assert "lag_mass_attn_ratio" in res
+        assert "peak_lag_err_mean" in res and "peak_in_band_frac" in res
+        if has_walk:
+            assert "lag_walk_mae" in res
+            assert len(res["lag_walk_true_mean"]) == 120
+            assert len(res["lag_walk_pred_mean"]) == 120
+
+
+def test_collect_per_cell_attn_diag_no_walk_when_disabled(cache_and_model):
+    """``do_lag_walk=False`` omits the lag-walk fields but keeps LagMass."""
+    ds = cache_and_model["ds"]
+    model = cache_and_model["model"]
+    with np.load(cache_and_model["test_npz"]) as npz:
+        cellids = np.asarray(npz["sample_cell_id"], int)
+    cells_by_id = {int(c["cell_id"]): c for c in ds.meta["mixture"]["cells"]}
+    out = ME.collect_per_cell_attn_diag(
+        model, ds, cells_by_id, cellids, torch.device("cpu"),
+        warmup=30, horizon=30, T=120, max_lag=90,
+        eval_cfg={"n_lolo_per_cell": 4, "batch_size": 4}, do_lag_walk=False,
+    )
+    for res in out.values():
+        assert "lag_mass_attn" in res
+        assert "lag_walk_mae" not in res
