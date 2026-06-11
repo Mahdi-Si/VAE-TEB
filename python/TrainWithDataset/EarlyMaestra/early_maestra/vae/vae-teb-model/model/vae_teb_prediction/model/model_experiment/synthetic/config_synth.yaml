@@ -396,6 +396,21 @@ benchmarks:
       fine_lag_grid_step: 1                     # fine stride inside each cell's band
       n_lolo_per_cell: 256                      # cap LOLO samples per cell
       null_controls: [shuffle, reverse]         # per-cell source-corruption controls
+      lag_mass_threshold: 0.8                   # success criterion #4 pass threshold
+      lag_walk:                                 # per-step d_t-vs-attention recovery
+        enabled: true                           #   (uses the cache's true_lag_tt)
+      # Faithful per-cell reproduction of the single-cell lag_recovery /
+      # evaluate_te analyses (synthetic.mixed_per_cell_diag). Heavy: a forward /
+      # LOLO pass per cell -> driven by run_mixed_pipeline's opt-in
+      # `per_cell_diagnostics` stage (default off). These are the fallback
+      # defaults; PIPELINE['per_cell_diagnostics'] overrides per run.
+      per_cell_diag:
+        caches: [in_mix, holdout, extrap]       # which caches to reproduce on
+        run_lag_recovery: true                  # analyze_lag_recovery per cell
+        run_eval_te: true                       # evaluate_checkpoint per cell
+        run_width_sweep: false                  # LOLO window-width sweep per cell
+        width_grid: [1, 5, 10, 20]              # sweep widths
+        n_per_cell: null                        # null -> whole cell test split
 
 # --- model constructor kwargs (native shapes, V2-D1) -------------------------
 model:

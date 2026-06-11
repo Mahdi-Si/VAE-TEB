@@ -460,6 +460,8 @@ def evaluate_checkpoint(
     data_tag: Optional[str] = None,
     batch_size: Optional[int] = None,
     benchmark_override: Optional[str] = None,
+    model_ckpt: Optional[Tuple[Any, Dict[str, Any]]] = None,
+    loader_meta: Optional[Tuple[Any, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     r"""Evaluate one trained checkpoint on its cached test split.
 
@@ -468,13 +470,17 @@ def evaluate_checkpoint(
 
     Args:
         ckpt_path: Path to a ``.ckpt`` written by :func:`train_minimal.train`.
+            Still used for the ``run_tag`` / ``ckpt_path`` provenance fields
+            even when ``model_ckpt`` is injected, so pass the real path.
         config: The parsed ``config_synth.yaml`` (used for ``paths`` and
             optimiser-loss fallbacks only).
         device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
         data_tag: Test-split tag to evaluate against. Defaults to the tag the
-            checkpoint was trained on (``ckpt["data_meta"]["tag"]``).
+            checkpoint was trained on (``ckpt["data_meta"]["tag"]``). When
+            ``loader_meta`` is injected this is used only as the row's
+            ``data_tag`` label.
         batch_size: Inference batch size. Defaults to the checkpoint's training
-            batch size.
+            batch size. Ignored when ``loader_meta`` is injected.
         benchmark_override: Optional benchmark name to use when resolving the
             test cache directory; ``None`` (default) falls back to the
             checkpoint's own benchmark. :mod:`null_controls` sets this so a
@@ -482,13 +488,27 @@ def evaluate_checkpoint(
             (e.g. G2 -> ``G2_wrong_delay`` / ``G2_zero_coupling``) without
             retraining; the row's ``benchmark`` field then records the
             override. Empty string is treated as ``None`` (falsy fallback).
+        model_ckpt: Optional pre-loaded ``(model, ckpt)`` pair. When given, the
+            checkpoint is **not** re-read from disk -- :mod:`mixed_per_cell_diag`
+            uses this to evaluate the same model on many per-cell loaders
+            without reloading it each time.
+        loader_meta: Optional pre-built ``(loader, meta)`` pair. When given,
+            :func:`make_test_loader` is bypassed and the on-disk single-cell
+            cache requirement is lifted; the caller supplies a per-cell loader
+            and a single-cell-style ``meta`` (``te_true`` / ``M`` / ``delay_*``
+            / ``B_y``). The checkpoint-vs-test TE provenance warning is skipped
+            in this mode (a per-cell TE deliberately differs from the pooled
+            training TE).
 
     Returns:
         A flat metrics dict with the :data:`_SUMMARY_FIELDS` keys plus
         ``benchmark`` and ``per_dim_kl``.
     """
     device = device or tm.resolve_device(config["runtime"])
-    model, ckpt = load_eval_checkpoint(ckpt_path, device)
+    if model_ckpt is not None:
+        model, ckpt = model_ckpt
+    else:
+        model, ckpt = load_eval_checkpoint(ckpt_path, device)
 
     data_meta: Dict[str, Any] = ckpt.get("data_meta", {}) or {}
     ckpt_config: Dict[str, Any] = ckpt.get("config", {}) or {}
@@ -511,15 +531,20 @@ def evaluate_checkpoint(
             )
         )
 
-    test_loader, test_meta = make_test_loader(
-        config, benchmark, str(tag), int(batch_size)
-    )
+    if loader_meta is not None:
+        test_loader, test_meta = loader_meta
+    else:
+        test_loader, test_meta = make_test_loader(
+            config, benchmark, str(tag), int(batch_size)
+        )
 
     # Provenance check -- warn (do not fail) if the test split's analytic TE
     # disagrees with what the checkpoint recorded. Skipped under
     # ``benchmark_override``: re-evaluating a checkpoint on a sibling control
-    # cache is *meant* to change te_true, so the divergence is expected.
-    if benchmark_override is None:
+    # cache is *meant* to change te_true, so the divergence is expected. Also
+    # skipped when ``loader_meta`` is injected: a per-cell TE deliberately
+    # differs from the pooled training TE.
+    if benchmark_override is None and loader_meta is None:
         te_ckpt = data_meta.get("te_true")
         te_test = test_meta.get("te_true")
         if te_ckpt is not None and te_test is not None:

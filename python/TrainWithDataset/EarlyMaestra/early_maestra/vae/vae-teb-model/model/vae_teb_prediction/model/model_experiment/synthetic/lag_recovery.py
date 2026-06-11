@@ -1330,6 +1330,9 @@ def analyze_lag_recovery(
     data_tag: Optional[str] = None,
     batch_size: Optional[int] = None,
     n_ablation_samples: Optional[int] = None,
+    model_ckpt: Optional[Tuple[Any, Dict[str, Any]]] = None,
+    loader_meta: Optional[Tuple[Any, Dict[str, Any]]] = None,
+    out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     r"""Run the Phase-5 lag-recovery analysis on one trained checkpoint.
 
@@ -1340,20 +1343,39 @@ def analyze_lag_recovery(
 
     Args:
         ckpt_path: Path to a ``.ckpt`` written by :func:`train_minimal.train`.
+            Still used for the ``run_tag`` / ``ckpt_path`` provenance fields
+            even when ``model_ckpt`` is injected, so pass the real path.
         config: The parsed ``config_synth.yaml``.
         device: Compute device. Defaults to :func:`train_minimal.resolve_device`.
         data_tag: Test-split tag. Defaults to the tag the checkpoint trained on.
+            When ``loader_meta`` is injected this is used only as the row's
+            ``data_tag`` label.
         batch_size: Inference batch size. Defaults to the ``lag_recovery``
             config value, else the checkpoint's training batch size.
         n_ablation_samples: Cap on the samples used per LOLO pass. Defaults to
             the ``lag_recovery`` config value.
+        model_ckpt: Optional pre-loaded ``(model, ckpt)`` pair. When given the
+            checkpoint is **not** re-read from disk -- :mod:`mixed_per_cell_diag`
+            uses this to analyse the same model over many per-cell loaders.
+        loader_meta: Optional pre-built ``(loader, meta)`` pair. When given,
+            :func:`evaluate_te.make_test_loader` is bypassed; the caller
+            supplies a per-cell loader and a single-cell-style ``meta``
+            (``true_lag_band`` / ``clean_anchor_range`` / ``horizon`` /
+            ``te_true`` / ``delay_*``).
+        out_dir: Optional destination directory. When ``None`` (default)
+            the artifacts land in ``results/<benchmark>/lag_recovery/``;
+            otherwise this directory is used verbatim (created if absent), so
+            per-cell runs can write to their own subdirectory.
 
     Returns:
         Dict with ``row`` (the flat metrics row), ``metrics`` (the JSON
         payload) and ``out_dir``.
     """
     device = device or tm.resolve_device(config["runtime"])
-    model, ckpt = ev.load_eval_checkpoint(ckpt_path, device)
+    if model_ckpt is not None:
+        model, ckpt = model_ckpt
+    else:
+        model, ckpt = ev.load_eval_checkpoint(ckpt_path, device)
 
     data_meta: Dict[str, Any] = ckpt.get("data_meta", {}) or {}
     ckpt_config: Dict[str, Any] = ckpt.get("config", {}) or {}
@@ -1375,9 +1397,12 @@ def analyze_lag_recovery(
         )
     batch_size = int(batch_size)
 
-    test_loader, test_meta = ev.make_test_loader(
-        config, benchmark, str(tag), batch_size
-    )
+    if loader_meta is not None:
+        test_loader, test_meta = loader_meta
+    else:
+        test_loader, test_meta = ev.make_test_loader(
+            config, benchmark, str(tag), batch_size
+        )
 
     # Loss settings: prefer what the checkpoint trained with (cross-check only).
     loss_settings = ckpt.get("loss_settings", {}) or {}
@@ -1615,7 +1640,8 @@ def analyze_lag_recovery(
     # Backwards-compat alias for final_report.py's lag-mass panel.
     metrics["task_5_4_lolo"] = metrics["sprint_4_1_sliding_lolo"]
 
-    out_dir = _lag_out_dir(config, benchmark)
+    out_dir = out_dir if out_dir is not None else _lag_out_dir(config, benchmark)
+    out_dir.mkdir(parents=True, exist_ok=True)
     write_summary_csv(row, out_dir / "summary.csv")
     write_metrics_json(metrics, out_dir / "metrics.json")
     _make_plots(collected, lag_mass, ablation, test_meta, out_dir)
@@ -1665,6 +1691,9 @@ def sweep_window_widths(
     batch_size: Optional[int] = None,
     n_ablation_samples: Optional[int] = None,
     selection_frac: float = 0.95,
+    model_ckpt: Optional[Tuple[Any, Dict[str, Any]]] = None,
+    loader_meta: Optional[Tuple[Any, Dict[str, Any]]] = None,
+    out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     r"""Sweep the sliding-window LOLO across ``widths`` (Sprint 4.4).
 
@@ -1690,6 +1719,12 @@ def sweep_window_widths(
         batch_size: Inference batch size.
         n_ablation_samples: Cap on samples per LOLO pass.
         selection_frac: Threshold for :func:`_select_window_width`.
+        model_ckpt: Optional pre-loaded ``(model, ckpt)`` pair (skips the disk
+            reload; used by :mod:`mixed_per_cell_diag` for per-cell sweeps).
+        loader_meta: Optional pre-built ``(loader, meta)`` pair (bypasses
+            :func:`evaluate_te.make_test_loader`).
+        out_dir: Optional destination directory; ``None`` keeps the default
+            ``results/<benchmark>/lag_recovery/``.
 
     Returns:
         Dict with ``widths``, ``per_width`` (list of result dicts, one per
@@ -1702,7 +1737,10 @@ def sweep_window_widths(
         raise ValueError("sweep_window_widths: empty `widths` list.")
 
     device = device or tm.resolve_device(config["runtime"])
-    model, ckpt = ev.load_eval_checkpoint(ckpt_path, device)
+    if model_ckpt is not None:
+        model, ckpt = model_ckpt
+    else:
+        model, ckpt = ev.load_eval_checkpoint(ckpt_path, device)
 
     data_meta: Dict[str, Any] = ckpt.get("data_meta", {}) or {}
     ckpt_config: Dict[str, Any] = ckpt.get("config", {}) or {}
@@ -1724,9 +1762,12 @@ def sweep_window_widths(
         )
     batch_size = int(batch_size)
 
-    test_loader, test_meta = ev.make_test_loader(
-        config, benchmark, str(tag), batch_size
-    )
+    if loader_meta is not None:
+        test_loader, test_meta = loader_meta
+    else:
+        test_loader, test_meta = ev.make_test_loader(
+            config, benchmark, str(tag), batch_size
+        )
 
     loss_settings = ckpt.get("loss_settings", {}) or {}
     beta = float(loss_settings.get("beta", config["loss"]["kld_beta"]))
@@ -1779,7 +1820,8 @@ def sweep_window_widths(
         widths, lag_masses, frac=selection_frac,
     )
 
-    out_dir = _lag_out_dir(config, benchmark)
+    out_dir = out_dir if out_dir is not None else _lag_out_dir(config, benchmark)
+    out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "lolo_width_sweep.csv"
     fields = [
         "window_width", "lag_mass_lolo", "total_delta",

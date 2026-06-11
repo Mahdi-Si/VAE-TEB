@@ -41,7 +41,13 @@ Stage order (each individually skippable via ``PIPELINE['stages']``):
     8. ``eval_extrap``      -- one :func:`mixed_eval.evaluate_mixed` pass per
                                extrapolation cache, each writing to its own
                                ``mixed_eval_extrap_m<M>/`` subdirectory.
-    9. ``pipeline_tests``   -- the broad model-diagnostic pipeline
+    9. ``per_cell_diagnostics`` -- OPTIONAL (heavy: a forward / LOLO pass per
+                               cell). The faithful single-cell ``lag_recovery`` /
+                               ``evaluate_te`` analyses run once per sub-population
+                               (:func:`mixed_per_cell_diag.run_mixed_per_cell_diag`),
+                               writing per-cell figures + a cross-cell rollup under
+                               ``results/G1_mix/<run_tag>/per_cell/<cache>/``.
+   10. ``pipeline_tests``   -- the broad model-diagnostic pipeline
                                (:mod:`run_pipeline_tests` $\to$
                                ``testing.run_tests.run_full_test_pipeline``:
                                histograms, forecast quality, attention / lag
@@ -121,13 +127,18 @@ _STAGE_ORDER = (
     "train",
     "eval_in_mix",
     "eval_extrap",
+    "per_cell_diagnostics",
     "pipeline_tests",
 )
 
 # Defaults applied when PIPELINE['stages'] omits a key. Everything runs except
-# the beta sweep -- one pooled training per beta is far too expensive to start
-# by accident; it must be opted into explicitly.
-_STAGE_DEFAULTS = {name: name != "beta_calibration" for name in _STAGE_ORDER}
+# the two heavy opt-in stages -- the beta sweep (one pooled training per beta)
+# and the per-cell diagnostics (a forward / LOLO pass per cell across every
+# cache) are far too expensive to start by accident; they must be opted into.
+_STAGE_DEFAULTS = {
+    name: name not in ("beta_calibration", "per_cell_diagnostics")
+    for name in _STAGE_ORDER
+}
 
 
 # =============================================================================
@@ -522,7 +533,49 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
             )
         status["eval_extrap"] = "done"
 
-    # --- 8. broad model-diagnostic testing pipeline ------------------------------
+    # --- 8. faithful per-cell single-cell diagnostics (opt-in, heavy) -----------
+    pcd_raw = pipeline.get("per_cell_diagnostics")
+    if pcd_raw is not None and not isinstance(pcd_raw, dict):
+        # Same stage-name collision guard as `pipeline_tests`: the toggle lives
+        # under 'stages'; a top-level bool would otherwise be coerced to {} and
+        # the (expensive) stage would silently run with defaults.
+        raise ValueError(
+            "PIPELINE['per_cell_diagnostics'] must be a dict of stage settings; "
+            "to disable the stage set "
+            "PIPELINE['stages']['per_cell_diagnostics'] = False."
+        )
+    _stage_banner("per_cell_diagnostics", note=f"ckpt={ckpt_name}")
+    if not stages["per_cell_diagnostics"]:
+        status["per_cell_diagnostics"] = "skipped (disabled)"
+        print("[pipeline] disabled.")
+    elif dry_run:
+        status["per_cell_diagnostics"] = "dry-run"
+        print(f"[pipeline] would run per-cell lag_recovery / evaluate_te "
+              f"diagnostics on {ckpt_path}\n           -> {run_dir / 'per_cell'}")
+    else:
+        # Lazy import (pulls matplotlib via the reused single-cell renderers).
+        from model.vae_teb_prediction.model.model_experiment.synthetic.mixed_per_cell_diag import (
+            run_mixed_per_cell_diag,
+        )
+        eval_blk = config["benchmarks"][_BENCHMARK].get("eval", {}) or {}
+        pcd = dict(eval_blk.get("per_cell_diag", {}) or {})
+        pcd.update({
+            k: v for k, v in dict(pcd_raw or {}).items() if v is not None
+        })
+        extrap_tags = [f"{tag}_extrap_m{m}" for m in extrap_ms]
+        run_mixed_per_cell_diag(
+            config, run_tag=run_tag, in_mix_tag=tag, holdout_tag=holdout_tag,
+            extrap_tags=extrap_tags, ckpt_name=ckpt_name,
+            caches=tuple(pcd.get("caches", ["in_mix"])),
+            run_lag_recovery=bool(pcd.get("run_lag_recovery", True)),
+            run_eval_te=bool(pcd.get("run_eval_te", True)),
+            run_width_sweep=bool(pcd.get("run_width_sweep", False)),
+            width_grid=tuple(pcd.get("width_grid", [1, 5, 10, 20])),
+            n_per_cell=pcd.get("n_per_cell"),
+        )
+        status["per_cell_diagnostics"] = "done"
+
+    # --- 9. broad model-diagnostic testing pipeline ------------------------------
     pt_raw = pipeline.get("pipeline_tests")
     if pt_raw is not None and not isinstance(pt_raw, dict):
         # Guard the stage-name collision: the toggle lives under 'stages';
@@ -590,6 +643,8 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     print(f"  eval        {run_dir / 'mixed_eval'}")
     for m in extrap_ms:
         print(f"  extrap eval {run_dir / f'mixed_eval_extrap_m{m}'}")
+    if stages["per_cell_diagnostics"]:
+        print(f"  per-cell    {run_dir / 'per_cell'}")
     if stages["pipeline_tests"]:
         print(f"  diagnostics {pt_out_dir}")
     if stages["beta_calibration"]:
@@ -643,7 +698,10 @@ if __name__ == "__main__":
             "train": True,           # 6. final pooled model (train_ddp)
             "eval_in_mix": True,     # 7. mixed_eval on in-mix + holdout
             "eval_extrap": True,     # 8. mixed_eval per extrapolation cache
-            "pipeline_tests": True,  # 9. broad testing/ diagnostics on the
+            "per_cell_diagnostics": False,  # 9. OPTIONAL faithful per-cell
+                                     #    lag_recovery / evaluate_te reproduction
+                                     #    (forward / LOLO pass per cell -- heavy)
+            "pipeline_tests": True,  # 10. broad testing/ diagnostics on the
                                      #    same <ckpt_name> (run_pipeline_tests)
         },
         # --- beta_calibration sub-stage settings (stage 4 only) --------------------
@@ -656,7 +714,17 @@ if __name__ == "__main__":
             "betas": None,            # None -> config mix_calibration.beta_grid
             "epochs": None,           # None -> optim.epochs
         },
-        # --- pipeline_tests sub-stage settings (stage 8 only) ----------------------
+        # --- per_cell_diagnostics sub-stage settings (stage 9 only) ----------------
+        # Each None falls back to config benchmarks.G1_mix.eval.per_cell_diag.
+        "per_cell_diagnostics": {
+            "caches": None,           # None -> config (e.g. [in_mix, holdout, extrap])
+            "run_lag_recovery": None, # None -> config (analyze_lag_recovery per cell)
+            "run_eval_te": None,      # None -> config (evaluate_checkpoint per cell)
+            "run_width_sweep": None,  # None -> config (LOLO window-width sweep; heavy)
+            "width_grid": None,       # None -> config [1, 5, 10, 20]
+            "n_per_cell": None,       # None -> config (whole cell test split)
+        },
+        # --- pipeline_tests sub-stage settings (stage 10 only) ---------------------
         "pipeline_tests": {
             "output_tag": None,       # None -> ckpt_name stem ('final'); leaf
                                       # under <run_dir>/testing_pipeline/

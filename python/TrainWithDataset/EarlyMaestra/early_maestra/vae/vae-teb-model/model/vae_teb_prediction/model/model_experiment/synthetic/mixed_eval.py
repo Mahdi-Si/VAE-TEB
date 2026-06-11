@@ -59,6 +59,8 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.evaluate_te impor
     shuffle_source_batch,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.lag_recovery import (
+    compute_lag_mass_attn,
+    compute_peak_lag_error,
     run_sliding_window_lolo,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic import plot_style as ps
@@ -790,6 +792,371 @@ def collect_per_cell_pred_gain(
 
 
 # =============================================================================
+# Per-cell attention LagMass / peak-lag (tasks 5.2-5.3) + lag-walk recovery
+# =============================================================================
+
+
+def _pearson(
+    sx: float, sy: float, sxx: float, syy: float, sxy: float, n: float,
+) -> float:
+    """Streaming Pearson correlation from running sums (``nan`` if degenerate)."""
+    if n < 2.0:
+        return float("nan")
+    cov = sxy - sx * sy / n
+    vx = sxx - sx * sx / n
+    vy = syy - sy * sy / n
+    denom = float(np.sqrt(vx * vy))
+    return float(cov / denom) if denom > 1e-12 else float("nan")
+
+
+@torch.no_grad()
+def collect_per_cell_attn_diag(
+    model: Any,
+    dataset: SyntheticTEDataset,
+    cells_by_id: Dict[int, Dict[str, Any]],
+    cell_id_array: np.ndarray,
+    device: torch.device,
+    *,
+    warmup: int,
+    horizon: int,
+    T: int,
+    max_lag: int,
+    eval_cfg: Dict[str, Any],
+    do_lag_walk: bool = True,
+) -> Dict[int, Dict[str, Any]]:
+    r"""Per-cell attention LagMass / peak-lag (tasks 5.2-5.3) + lag-walk recovery.
+
+    One light encoder-only ``@torch.no_grad`` pass per cell (no decoder, no
+    backward). For each cell it accumulates the head-averaged $K_t$-weighted lag
+    map $\widetilde{\mathrm{TE}}_{t,\ell} = K_t\,\bar\alpha_{t,\ell}$ over the
+    cell's samples and, when the cache carries the per-step true lag walk
+    ``true_lag_tt`` ($d_t$), the per-step recovered lag
+    $\hat d_t = \arg\max_\ell \bar\alpha_{t,\ell}$.
+
+    From the mean lag map it derives the attention LagMass (task 5.2, with the
+    uniform baseline + ratio) via :func:`lag_recovery.compute_lag_mass_attn` and
+    the per-anchor peak-lag error / in-band fraction (task 5.3) via
+    :func:`lag_recovery.compute_peak_lag_error` -- exactly the two diagnostics
+    that :func:`per_cell_lag_recovery` (LOLO-only) does not produce. The
+    lag-walk block reports the clean-window per-step $|\hat d_t - d_t|$ MAE, the
+    within-1 fraction, the Pearson correlation and the mean true / recovered
+    trajectories (for the figure).
+
+    Args:
+        model: The trained model in ``eval`` mode.
+        dataset: The mixed-cache dataset.
+        cells_by_id: Manifest cell dicts keyed by ``cell_id``.
+        cell_id_array: Per-sample ``sample_cell_id`` (dataset order).
+        device: Compute device.
+        warmup: Warm-up floor.
+        horizon: Forecast horizon $H$ (clean-window upper bound is $T-H$).
+        T: Sequence length.
+        max_lag: Maximum attention lag ($L = L_{\max}+1$).
+        eval_cfg: The ``benchmarks.G1_mix.eval`` block (``n_lolo_per_cell`` cap,
+            ``batch_size``).
+        do_lag_walk: When ``True`` and the cache carries ``true_lag_tt``, also
+            compute the per-step lag-walk recovery.
+
+    Returns:
+        ``{cell_id: {...}}`` -- each row carries ``lag_mass_attn`` /
+        ``lag_mass_attn_uniform`` / ``lag_mass_attn_ratio`` /
+        ``peak_lag_err_mean`` / ``peak_lag_err_median`` / ``peak_in_band_frac``
+        and, when ``true_lag_tt`` is present, ``lag_walk_mae`` /
+        ``lag_walk_within1_frac`` / ``lag_walk_corr`` / ``lag_walk_true_mean`` /
+        ``lag_walk_pred_mean`` (length-$T$ lists) / ``lag_walk_band`` /
+        ``lag_walk_delay_max``.
+    """
+    cap = eval_cfg.get("n_lolo_per_cell")
+    cap = None if cap is None else int(cap)
+    bs = int(eval_cfg.get("batch_size") or 32)
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for cid, cell in sorted(cells_by_id.items()):
+        loader = _cell_subset_loader(dataset, cid, cell_id_array, bs, cap=cap)
+        if loader is None:
+            continue
+        dmax = int(cell["delay_max"])
+        band = list(range(dmax))
+        anchor_lo = max(int(warmup), dmax - 1)
+        anchor_hi = int(T - horizon)
+
+        te_sum: Optional[np.ndarray] = None
+        n_samples = 0
+        lw_err_sum = lw_within1 = lw_count = 0.0
+        lw_sx = lw_sy = lw_sxx = lw_syy = lw_sxy = 0.0
+        true_sum_t: Optional[np.ndarray] = None
+        pred_sum_t: Optional[np.ndarray] = None
+        n_walk = 0
+        have_walk = False
+
+        for batch in loader:
+            batch = move_batch(batch, device)
+            y_st, y_ph = batch.fhr_st, batch.fhr_ph
+            enc = model.encode_only(y_st, y_ph, build_u_stream(batch), sample_z=True)
+            kld = model.kld_tensor(
+                mu_prior=enc["mu_prior"], logvar_prior=enc["logvar_prior"],
+                mu_post=enc["mu_post"], logvar_post=enc["logvar_post"],
+                mask_warmup=False,
+            )                                                    # (B, T, d_z)
+            kld_bt = kld.sum(dim=-1)                             # (B, T)
+            mean_alpha = enc["attn_weights"].mean(dim=2)         # (B, T, L)
+            te_lag = kld_bt.unsqueeze(-1) * mean_alpha           # (B, T, L)
+            te_b = te_lag.sum(dim=0).detach().cpu().to(torch.float64).numpy()
+            te_sum = te_b if te_sum is None else te_sum + te_b
+            n_samples += int(y_st.size(0))
+
+            tlt = batch.get("true_lag_tt") if do_lag_walk else None
+            if tlt is not None:
+                have_walk = True
+                pred_lag = mean_alpha.argmax(dim=-1)             # (B, T) long
+                true_lag = tlt.to(device=pred_lag.device, dtype=torch.long)
+                Bn, Tn = int(pred_lag.shape[0]), int(pred_lag.shape[1])
+                lo = min(anchor_lo, Tn)
+                hi = min(anchor_hi, Tn)
+                if hi > lo:
+                    p = pred_lag[:, lo:hi].to(torch.float64)
+                    t = true_lag[:, lo:hi].to(torch.float64)
+                    err = (p - t).abs()
+                    lw_err_sum += float(err.sum())
+                    lw_within1 += float((err <= 1.0).sum())
+                    lw_count += float(err.numel())
+                    lw_sx += float(t.sum())
+                    lw_sy += float(p.sum())
+                    lw_sxx += float((t * t).sum())
+                    lw_syy += float((p * p).sum())
+                    lw_sxy += float((t * p).sum())
+                t_full = true_lag.to(torch.float64).sum(dim=0).cpu().numpy()
+                p_full = pred_lag.to(torch.float64).sum(dim=0).cpu().numpy()
+                true_sum_t = t_full if true_sum_t is None else true_sum_t + t_full
+                pred_sum_t = p_full if pred_sum_t is None else pred_sum_t + p_full
+                n_walk += Bn
+
+        if te_sum is None or n_samples == 0:
+            continue
+        te_mean = te_sum / float(n_samples)
+        lm = compute_lag_mass_attn(
+            te_mean, lag_band=band, anchor_lo=anchor_lo,
+            anchor_hi=anchor_hi, max_lag=max_lag,
+        )
+        anchor_slice = (
+            te_mean[anchor_lo:anchor_hi, :] if anchor_hi > anchor_lo else te_mean
+        )
+        pk = compute_peak_lag_error(anchor_slice, lag_band=band)
+        row: Dict[str, Any] = {
+            "lag_mass_attn": lm["lag_mass_attn"],
+            "lag_mass_attn_uniform": lm["uniform_baseline"],
+            "lag_mass_attn_ratio": lm["ratio_to_uniform"],
+            "peak_lag_err_mean": pk["peak_lag_err_mean"],
+            "peak_lag_err_median": pk["peak_lag_err_median"],
+            "peak_in_band_frac": pk["peak_in_band_frac"],
+        }
+        if have_walk and lw_count > 0:
+            row["lag_walk_mae"] = lw_err_sum / lw_count
+            row["lag_walk_within1_frac"] = lw_within1 / lw_count
+            row["lag_walk_corr"] = _pearson(
+                lw_sx, lw_sy, lw_sxx, lw_syy, lw_sxy, lw_count,
+            )
+            if n_walk > 0 and true_sum_t is not None and pred_sum_t is not None:
+                row["lag_walk_true_mean"] = (true_sum_t / n_walk).tolist()
+                row["lag_walk_pred_mean"] = (pred_sum_t / n_walk).tolist()
+                row["lag_walk_band"] = str(cell.get("band", ""))
+                row["lag_walk_delay_max"] = dmax
+        out[int(cid)] = row
+    return out
+
+
+def _attach_attn_diag(
+    arrs: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    model: Any,
+    dataset: SyntheticTEDataset,
+    cells_by_id: Dict[int, Dict[str, Any]],
+    cell_id_array: np.ndarray,
+    device: torch.device,
+    *,
+    warmup: int,
+    horizon: int,
+    T: int,
+    max_lag: int,
+    eval_cfg: Dict[str, Any],
+    do_lag_walk: bool = True,
+) -> None:
+    r"""Run :func:`collect_per_cell_attn_diag` and merge into rows / arrs.
+
+    Defensive: a forward failure leaves the new fields as ``nan`` (so the CSV
+    columns still exist) and the lag-walk trajectory dict empty -- the encoder
+    calibration / LOLO artifacts stay valid.
+
+    Args:
+        arrs: Per-sample dict (mutated: ``lag_walk_by_cell`` added).
+        rows: Per-cell rows (mutated: ``lag_mass_attn`` / ``peak_lag_*`` /
+            ``lag_walk_*`` added per row).
+        model, dataset, cells_by_id, cell_id_array, device: As for
+            :func:`collect_per_cell_attn_diag`.
+        warmup, horizon, T, max_lag, eval_cfg, do_lag_walk: Forwarded unchanged.
+    """
+    _new_fields = (
+        "lag_mass_attn", "lag_mass_attn_ratio", "peak_lag_err_mean",
+        "peak_in_band_frac", "lag_walk_mae", "lag_walk_within1_frac",
+        "lag_walk_corr",
+    )
+    for row in rows:
+        for k in _new_fields:
+            row.setdefault(k, float("nan"))
+    try:
+        diag = collect_per_cell_attn_diag(
+            model, dataset, cells_by_id, cell_id_array, device,
+            warmup=warmup, horizon=horizon, T=T, max_lag=max_lag,
+            eval_cfg=eval_cfg, do_lag_walk=do_lag_walk,
+        )
+    except Exception as exc:  # noqa: BLE001 -- diagnostics must never gate eval
+        print(f"[mixed_eval] attention / lag-walk diagnostics skipped: {exc}")
+        diag = {}
+    walk: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        d = diag.get(int(row["cell_id"]), {})
+        for k in _new_fields:
+            if k in d:
+                row[k] = d[k]
+        if "lag_walk_true_mean" in d:
+            walk[int(row["cell_id"])] = {
+                "true_mean": d["lag_walk_true_mean"],
+                "pred_mean": d["lag_walk_pred_mean"],
+                "band": d.get("lag_walk_band", ""),
+                "delay_max": d.get("lag_walk_delay_max", 0),
+                "mae": d.get("lag_walk_mae", float("nan")),
+            }
+    arrs["lag_walk_by_cell"] = walk
+
+
+def lag_recovery_summary(
+    rows: List[Dict[str, Any]], *, threshold: float = 0.8,
+) -> Dict[str, Any]:
+    r"""Roll the per-cell LagMass up to the criterion-#4 pass/fail fractions.
+
+    Success criterion #4 (``model_validation_v3_mixed.md`` §6) asks for per-cell
+    LagMass $\ge 0.8$. The per-cell ``lag_mass_lolo`` (LOLO) and ``lag_mass_attn``
+    (attention) are collected by the eval but were never thresholded; this
+    summary reports the fraction of cells clearing ``threshold`` overall and
+    per $M$ / per band.
+
+    Args:
+        rows: Per-cell rows carrying ``lag_mass_lolo`` / ``lag_mass_attn`` /
+            ``M`` / ``band``.
+        threshold: The LagMass pass threshold (default $0.8$).
+
+    Returns:
+        ``{}`` when ``rows`` is empty, else a dict with the overall and
+        per-$M$ / per-band pass fractions and mean LagMass.
+    """
+    if not rows:
+        return {}
+
+    def _frac_ge(vals: Sequence[float]) -> float:
+        a = np.asarray(list(vals), dtype=float)
+        a = a[np.isfinite(a)]
+        return float(np.mean(a >= threshold)) if a.size else float("nan")
+
+    def _mean(vals: Sequence[float]) -> float:
+        a = np.asarray(list(vals), dtype=float)
+        a = a[np.isfinite(a)]
+        return float(a.mean()) if a.size else float("nan")
+
+    lolo = [r.get("lag_mass_lolo", float("nan")) for r in rows]
+    attn = [r.get("lag_mass_attn", float("nan")) for r in rows]
+    by_M: Dict[str, Any] = {}
+    for m in sorted({int(r["M"]) for r in rows}):
+        sub = [r for r in rows if int(r["M"]) == m]
+        by_M[str(m)] = {
+            "frac_lolo_ge": _frac_ge([r.get("lag_mass_lolo", float("nan")) for r in sub]),
+            "frac_attn_ge": _frac_ge([r.get("lag_mass_attn", float("nan")) for r in sub]),
+            "mean_lolo": _mean([r.get("lag_mass_lolo", float("nan")) for r in sub]),
+        }
+    by_band: Dict[str, Any] = {}
+    for b in sorted({str(r.get("band", "")) for r in rows}):
+        sub = [r for r in rows if str(r.get("band", "")) == b]
+        by_band[b] = {
+            "frac_lolo_ge": _frac_ge([r.get("lag_mass_lolo", float("nan")) for r in sub]),
+            "frac_attn_ge": _frac_ge([r.get("lag_mass_attn", float("nan")) for r in sub]),
+        }
+    return {
+        "threshold": float(threshold),
+        "n_cells": len(rows),
+        "frac_cells_lolo_ge": _frac_ge(lolo),
+        "frac_cells_attn_ge": _frac_ge(attn),
+        "mean_lag_mass_lolo": _mean(lolo),
+        "mean_lag_mass_attn": _mean(attn),
+        "by_M": by_M,
+        "by_band": by_band,
+    }
+
+
+def _lag_walk_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    r"""Aggregate the per-cell lag-walk recovery (``{}`` if never computed)."""
+    mae = np.asarray(
+        [r.get("lag_walk_mae", float("nan")) for r in rows], dtype=float
+    )
+    mae = mae[np.isfinite(mae)]
+    if mae.size == 0:
+        return {}
+    w = np.asarray(
+        [r.get("lag_walk_within1_frac", float("nan")) for r in rows], dtype=float
+    )
+    c = np.asarray(
+        [r.get("lag_walk_corr", float("nan")) for r in rows], dtype=float
+    )
+    w = w[np.isfinite(w)]
+    c = c[np.isfinite(c)]
+    return {
+        "n_cells": int(mae.size),
+        "mean_mae": float(mae.mean()),
+        "max_mae": float(mae.max()),
+        "mean_within1_frac": float(w.mean()) if w.size else float("nan"),
+        "mean_corr": float(c.mean()) if c.size else float("nan"),
+    }
+
+
+def _cell_eval_meta(
+    cell: Dict[str, Any], horizon: int, T: int,
+) -> Dict[str, Any]:
+    r"""Single-cell-style ``meta`` for one mixed-pool cell.
+
+    Superset of :func:`_cell_meta`: adds the scalar provenance
+    (``te_true`` / ``te_per_step`` / ``M`` / ``delay_*`` / ``B_y`` / ``band``)
+    that the injected single-cell evaluators
+    (:func:`evaluate_te.evaluate_checkpoint`,
+    :func:`lag_recovery.analyze_lag_recovery`) read from a cache ``meta.json``.
+    Used by :mod:`mixed_per_cell_diag` so those functions run per sub-population
+    without materialising a one-cell cache on disk.
+
+    Args:
+        cell: A manifest cell dict.
+        horizon: Forecast horizon $H$.
+        T: Sequence length.
+
+    Returns:
+        The per-cell ``meta`` dict.
+    """
+    dmax = int(cell["delay_max"])
+    te_true = float(
+        cell.get("te_cell_realised", cell.get("target_te", float("nan")))
+    )
+    meta = _cell_meta(cell, horizon, T)
+    meta.update({
+        "te_true": te_true,
+        "te_per_step": te_true / float(horizon) if horizon else float("nan"),
+        "M": int(cell.get("M", 0)),
+        "delay_min": int(cell.get("delay_min", 0)),
+        "delay_max": dmax,
+        "delay": dmax,
+        "B_y": float(cell.get("B_y_scalar", float("nan"))),
+        "target_te": float(cell.get("target_te", float("nan"))),
+        "band": str(cell.get("band", "")),
+    })
+    return meta
+
+
+# =============================================================================
 # Orchestration
 # =============================================================================
 
@@ -992,6 +1359,9 @@ def evaluate_mixed(
     warmup = int(model_cfg["warmup_period"]) if warmup_cfg is None else int(warmup_cfg)
     controls = tuple(eval_cfg.get("null_controls", ["shuffle", "reverse"]))
     bs = int(eval_cfg.get("batch_size") or config.get("optim", {}).get("batch_size", 32))
+    lag_walk_cfg = eval_cfg.get("lag_walk", {}) or {}
+    do_lag_walk = bool(lag_walk_cfg.get("enabled", True))
+    lag_mass_threshold = float(eval_cfg.get("lag_mass_threshold", 0.8))
 
     out_dir = run_dir / (out_subdir or _OUT_SUBDIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1033,6 +1403,13 @@ def evaluate_mixed(
         model, ds_in, cells_in, cellids_in, device, warmup=warmup,
         horizon=horizon, loss_settings=loss_settings,
         eval_cfg={**eval_cfg, "batch_size": bs},
+    )
+    print("[mixed_eval] per-cell attention LagMass / lag-walk (in-mix) ...")
+    _attach_attn_diag(
+        arrs_in, rows_in,
+        model, ds_in, cells_in, cellids_in, device, warmup=warmup,
+        horizon=horizon, T=T, max_lag=max_lag,
+        eval_cfg={**eval_cfg, "batch_size": bs}, do_lag_walk=do_lag_walk,
     )
 
     # --- held-out extrapolation ---------------------------------------------
@@ -1077,6 +1454,13 @@ def evaluate_mixed(
                 horizon=horizon, loss_settings=loss_settings,
                 eval_cfg={**eval_cfg, "batch_size": bs},
             )
+            _attach_attn_diag(
+                arrs_ho, rows_ho,
+                model, ds_ho, cells_ho, cellids_ho, device, warmup=warmup,
+                horizon=horizon, T=int(ds_ho.meta.get("sequence_length", T)),
+                max_lag=max_lag,
+                eval_cfg={**eval_cfg, "batch_size": bs}, do_lag_walk=do_lag_walk,
+            )
         except FileNotFoundError as exc:
             print(f"[mixed_eval] held-out cache skipped: {exc}")
 
@@ -1108,6 +1492,17 @@ def evaluate_mixed(
         "pred_gain": {
             "in_mix": _pred_gain_summary(arrs_in),
             "holdout": _pred_gain_summary(arrs_ho) if rows_ho else {},
+        },
+        "lag_recovery_summary": {
+            "in_mix": lag_recovery_summary(rows_in, threshold=lag_mass_threshold),
+            "holdout": (
+                lag_recovery_summary(rows_ho, threshold=lag_mass_threshold)
+                if rows_ho else {}
+            ),
+        },
+        "lag_walk": {
+            "in_mix": _lag_walk_summary(rows_in),
+            "holdout": _lag_walk_summary(rows_ho) if rows_ho else {},
         },
         "n_cells_in_mix": len(rows_in),
         "n_cells_holdout": len(rows_ho),
@@ -1195,7 +1590,10 @@ def _generalization_gaps(
 _BASE_CELL_FIELDS = [
     "split", "cell_id", "M", "target_te", "band", "delay_min", "delay_max",
     "B_y", "te_true", "n", "kbar_mean", "kbar_std", "te_pred_mean", "te_rmse",
-    "te_bias", "lag_mass_lolo", "peak_lag_err", "delta_L", "feat_loss",
+    "te_bias", "lag_mass_lolo", "peak_lag_err",
+    "lag_mass_attn", "lag_mass_attn_ratio", "peak_lag_err_mean",
+    "peak_in_band_frac", "lag_walk_mae", "lag_walk_within1_frac",
+    "lag_walk_corr", "delta_L", "feat_loss",
     "base_loss", "held_out",
 ]
 
@@ -1274,16 +1672,15 @@ def _render_figures(
     """
     ps.apply_style()
     for name, fn in (
-        # Calibration + recovery (per-cell)
-        ("calibration_scatter", _fig_calibration),
-        ("calibration_by_M", _fig_calibration_by_M),
-        ("prior_mismatch", _fig_prior_mismatch),
-        ("kld_vs_te_percell", _fig_kld_vs_te_percell),
-        ("kld_vs_te_allsamples", _fig_kld_vs_te_allsamples),
-        ("kld_within_cell_spread", _fig_kld_within_cell_spread),
+        # Calibration + recovery (per-cell). The headline KLD-vs-TE view is the
+        # ``kld_vs_te`` master grid (M rows x band cols); ``kld_vs_te_overview``
+        # shows the two KLD scales (dim-summed nats vs per-dim) side by side; and
+        # ``calibration_health`` collapses the per-M slopes into a pass/fail view.
+        ("kld_vs_te", _fig_kld_vs_te),
+        ("kld_vs_te_overview", _fig_kld_vs_te_overview),
+        ("calibration_health", _fig_calibration_health),
         ("te_recovery_percell", _fig_te_recovery_percell),
-        ("corr_by_M_bars", _fig_corr_by_m_bars),
-        ("grid_heatmaps", _fig_grid_heatmaps),
+        ("prior_mismatch", _fig_prior_mismatch),
         # Prediction gain (decoder pass)
         ("pred_gain_vs_te", _fig_pred_gain_vs_te),
         ("pred_gain_vs_kbar", _fig_pred_gain_vs_kbar),
@@ -1291,6 +1688,7 @@ def _render_figures(
         ("lag_band_recovery", _fig_lag_recovery),
         ("lag_profiles", _fig_lag_profiles),
         ("attn_vs_lag", _fig_attn_vs_lag),
+        ("lag_walk", _fig_lag_walk),
         # KLD structure
         ("per_dim_kl", _fig_per_dim_kl),
         ("kld_vs_time", _fig_kld_vs_time),
@@ -1304,134 +1702,345 @@ def _render_figures(
             print(f"[mixed_eval] figure '{name}' skipped: {exc}")
 
 
-def _fig_calibration(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Per-cell $\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$, **faceted by lag-band**.
+def _fig_kld_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Master KLD-vs-TE grid -- rows $= M$, cols $=$ lag-band ("all together").
 
-    One panel per band keeps the three encodings legible: colour = $M$,
-    filled = in-mix / hollow = held-out, dashed $y=x$ reference, and the per-$M$
-    OLS calibration lines *for that band only*. The shared overall slope
-    $\gamma$ is printed in the supertitle.
-    """
-    import matplotlib.pyplot as plt
+    The single headline view of the calibration across every axis at once. Each
+    panel is one $(M, \text{band})$ cell-group and shows three layers:
 
-    all_rows = rows_in + rows_ho
-    _, _, bands = _grid_axes(all_rows)
-    if not bands:
-        return
-    te_vals = [r["te_true"] for r in all_rows] or [0.0, 1.0]
-    kb_vals = [r["kbar_mean"] for r in all_rows] or [0.0, 1.0]
-    hi = max(max(te_vals), max(kb_vals)) * 1.05 + 1e-6
-    by_band = slices.get("by_band", {}) or {}
-    te_line = np.linspace(0, hi, 50)
+    * the faint per-sample $\bar K$ cloud (jittered over the few discrete
+      true-TE levels so each cell reads as a vertical column);
+    * the per-cell mean $\bar K$ with a $\pm\,$std error bar on top
+      (filled $=$ in-mix, hollow $=$ held-out / extrapolation);
+    * the panel's own OLS line with its slope $\gamma$ annotated (fitted on the
+      cell means; falls back to the per-$M$ slope when a panel has fewer than
+      two distinct true-TE values).
 
-    fig, axes = plt.subplots(1, len(bands), figsize=(3.6 * len(bands), 4.0),
-                             squeeze=False, sharex=True, sharey=True)
-    for ci, band in enumerate(bands):
-        ax = axes[0][ci]
-        ax.plot([0, hi], [0, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY,
-                label="$y=x$", zorder=1)
-        for rows, filled in ((rows_in, True), (rows_ho, False)):
-            for r in rows:
-                if r["band"] != band:
-                    continue
-                color = _M_COLORS.get(r["M"], ps.COLOR_PURPLE)
-                ax.scatter(
-                    r["te_true"], r["kbar_mean"],
-                    c=color if filled else "none", edgecolors=color,
-                    marker="o", s=55, linewidths=1.4, zorder=3,
-                )
-        fit = by_band.get(band)
-        if fit:
-            ax.plot(te_line, fit["alpha"] + fit["gamma"] * te_line,
-                    color=ps.COLOR_BLACK, lw=1.3, alpha=0.85,
-                    label=fr"$\gamma$={fit['gamma']:.2f}")
-        ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
-        if ci == 0:
-            ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
-        ax.set_title(f"band = {band}", fontsize=9)
-        ax.legend(fontsize=7, loc="upper left", frameon=False)
-        ps.style_axes(ax)
-    # M-colour legend on the last panel.
-    handles = [
-        plt.Line2D([0], [0], marker="o", ls="", color=_M_COLORS.get(m, ps.COLOR_PURPLE),
-                   label=f"M={m}")
-        for m in sorted({r["M"] for r in all_rows})
-    ]
-    if handles:
-        axes[0][-1].legend(handles=handles, fontsize=7, loc="lower right",
-                           frameon=False, title="filled=in-mix\nhollow=held-out",
-                           title_fontsize=6)
-    overall = slices.get("overall")
-    sup = "Mixed-population calibration (per cell)"
-    if overall:
-        sup += (fr"  —  overall $\gamma$={overall['gamma']:.2f}, "
-                fr"$\alpha$={overall['alpha']:.2f}, $R^2$={overall.get('r2', float('nan')):.2f}")
-    fig.suptitle(sup, fontsize=11)
-    _caption(fig, "Per-(M,TE) cell mean KL vs true block TE, one panel per "
-                  "lag-band; dashed y=x, line = per-band OLS. Well-calibrated: "
-                  "points track y=x with slope gamma -> 1.")
-    ps.save_figure(fig, path)
+    Each $M$-row gets its **own** adaptive $\bar K$ scale (``sharey="row"``)
+    because $\bar K$ grows with the channel count $M$; the old figures shared a
+    single TE-locked scale that crushed every point into a thin strip. There is
+    **no** $y=x$ line: at the default $\beta$ the bottleneck is under-regularised
+    so $\gamma \gg 1$, which would make $y=x$ misleading (see the banner).
 
-
-def _fig_calibration_by_M(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Per-cell $\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$, **faceted by $M$** (PRIMARY).
-
-    The pool crosses the channel-dilution axis $M$, so the per-$M$ slope is the
-    headline calibration (a single pooled slope conflates the $M$-dependence with
-    the TE-dependence). One panel per $M$: colour = lag-band, filled = in-mix /
-    hollow = held-out, dashed $y=x$, and the per-$M$ OLS line with its
-    $\gamma_M$ annotated. The target is $\gamma_M \to 1$ for **every** $M$.
+    Args:
+        path: Output path stem (``.pdf`` / ``.png`` appended by ``save_figure``).
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out / extrapolation per-cell rows.
+        arrs: In-mix per-sample arrays (``kbar`` / ``te_true`` / ``M`` /
+            ``band_id`` and the ``per_dim_kl_by_M`` diagnostic for $d_z$).
+        slices: The calibration slices (``overall`` / ``by_M`` / ``by_band``).
+        controls: Null-control names (unused here; kept for signature parity).
     """
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
     all_rows = rows_in + rows_ho
-    ms, _, bands = _grid_axes(all_rows)
+    ms, tes, bands = _grid_axes(all_rows)
+    if not (ms and bands):
+        return
+    by_M = slices.get("by_M", {}) or {}
+    cells = _cells_by_M_band(all_rows)
+    rows_by_m: Dict[int, List[Dict[str, Any]]] = {}
+    for r in all_rows:
+        rows_by_m.setdefault(int(r["M"]), []).append(r)
+    extrap_ms = {m for m, rs in rows_by_m.items()
+                 if rs and all(int(x.get("held_out", 0)) for x in rs)}
+
+    te = np.asarray(arrs.get("te_true", []), dtype=float)
+    kb = np.asarray(arrs.get("kbar", []), dtype=float)
+    m_arr = np.asarray(arrs.get("M", []), dtype=int)
+    band_arr = np.asarray(arrs.get("band_id", []), dtype=int)
+    # Horizontal jitter so each cell's single true-TE value reads as a column.
+    levels = (np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
+              if te.size else np.array([0.0]))
+    span = float(np.min(np.diff(levels))) if levels.size > 1 else 1.0
+    rng = np.random.default_rng(0)
+    jitter = (rng.random(te.size) - 0.5) * 0.18 * span if te.size else np.zeros(0)
+    te_hi = (max(tes) if tes else 1.0) * 1.05 + 1e-6
+    te_lo = (min(tes) if tes else 0.0) - 0.12
+    xs_line = np.linspace(0.0, te_hi, 50)
+
+    fig, axes = plt.subplots(
+        len(ms), len(bands),
+        figsize=(3.4 * len(bands), 2.7 * len(ms) + 0.8),
+        squeeze=False, sharex=True, sharey="row",
+    )
+    for ri, m in enumerate(ms):
+        color = ps.color_for_M(m)
+        row_vals: List[float] = []
+        for ci, band in enumerate(bands):
+            ax = axes[ri][ci]
+            bid = _BAND_ID.get(band)
+            if te.size and bid is not None:
+                sel = (m_arr == m) & (band_arr == bid)
+                if np.any(sel):
+                    ax.scatter(te[sel] + jitter[sel], kb[sel], s=5, alpha=0.16,
+                               linewidths=0.0, color=color, zorder=1)
+                    row_vals.extend(kb[sel].tolist())
+            cell_te: List[float] = []
+            cell_kb: List[float] = []
+            for r in cells.get((m, band), []):
+                filled = not int(r.get("held_out", 0))
+                ax.errorbar(
+                    r["te_true"], r["kbar_mean"],
+                    yerr=float(r.get("kbar_std", 0.0)), fmt="o", ms=5,
+                    color=color, markerfacecolor=color if filled else "none",
+                    markeredgecolor=color, ecolor=color, elinewidth=1.0,
+                    capsize=2, zorder=3,
+                )
+                cell_te.append(float(r["te_true"]))
+                cell_kb.append(float(r["kbar_mean"]))
+                row_vals.append(float(r["kbar_mean"]))
+            fit: Optional[Dict[str, Any]] = None
+            if len(set(np.round(cell_te, 6).tolist())) >= 2:
+                cand = _assoc_stats(np.asarray(cell_kb), np.asarray(cell_te))
+                if np.isfinite(cand.get("gamma", float("nan"))):
+                    fit = cand
+            if fit is None:
+                fit = by_M.get(str(m))
+            if fit and np.isfinite(fit.get("gamma", float("nan"))):
+                ax.plot(xs_line, fit["alpha"] + fit["gamma"] * xs_line,
+                        color=ps.COLOR_BLACK, lw=1.2, alpha=0.85, zorder=2)
+                ax.text(0.04, 0.96, fr"$\gamma$={fit['gamma']:.1f}",
+                        transform=ax.transAxes, va="top", ha="left",
+                        fontsize=7, color=ps.COLOR_BLACK)
+            if ri == 0:
+                ax.set_title(f"band = {band}", fontsize=9)
+            if ri == len(ms) - 1:
+                ax.set_xlabel(
+                    r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+            if ci == 0:
+                tag = "  (extrap)" if m in extrap_ms else ""
+                ax.set_ylabel(f"M = {m}{tag}\n" + r"$\bar K$  (nats)")
+            ps.style_axes(ax)
+        if row_vals:
+            ps.auto_ylim(axes[ri][0], np.asarray(row_vals, dtype=float),
+                         min_zero=True, pad_frac=0.10)
+    axes[0][0].set_xlim(te_lo, te_hi)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", ls="", color=ps.COLOR_GRAY,
+               markerfacecolor=ps.COLOR_GRAY, label="in-mix"),
+        Line2D([0], [0], marker="o", ls="", color=ps.COLOR_GRAY,
+               markerfacecolor="none", label="held-out / extrap"),
+    ]
+    axes[0][-1].legend(handles=legend_handles, fontsize=6, loc="lower right",
+                       frameon=False)
+
+    alpha, gamma = _overall_fit(slices)
+    sup = r"Master KLD-vs-TE  (rows $= M$, cols $=$ lag-band)"
+    if np.isfinite(gamma):
+        sup += fr"  —  overall $\gamma$={gamma:.1f}, $\alpha$={alpha:.2f}"
+    fig.suptitle(sup, fontsize=11)
+    fig.subplots_adjust(top=0.93, hspace=0.22, wspace=0.08)
+
+    dz = _dz_from(arrs)
+    dz_txt = (f"$\\bar K$ is summed over $d_z$={dz} latent dims "
+              f"(≈ $d_z$ × loss-side kld_loss).  " if dz else
+              r"$\bar K$ is summed over the latent dims.  ")
+    banner = (dz_txt + r"$\gamma \gg 1$ means the bottleneck is under-regularised "
+              r"at this $\beta$; $\gamma \to 1$ ($\bar K \approx \mathrm{TE}$) needs "
+              r"$\beta$-selection (mixed_calibration).")
+    banner_color = (ps.COLOR_VERMILLION if np.isfinite(gamma) and gamma > 1.5
+                    else ps.COLOR_GRAY)
+    fig.text(0.5, -0.045, banner, ha="center", va="top", fontsize=7.5,
+             color=banner_color, wrap=True)
+    _caption(fig, "Per-cell mean K-bar (points, +-std) over the faint per-sample "
+                  "cloud, vs true block TE; rows = M, cols = band, each row on "
+                  "its own K-bar scale, no y=x. Good: monotone rise with TE and a "
+                  "consistent per-panel gamma across bands.")
+    ps.save_figure(fig, path)
+
+
+def _fig_kld_vs_te_overview(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""KLD-vs-TE on **both scales side by side**: dim-summed nats and per-dim.
+
+    One point per cell (colour $= M$, marker $=$ band, filled $=$ in-mix /
+    hollow $=$ held-out). The **left** panel plots the headline $\bar K$ in
+    dim-summed nats -- the correct unit to compare against the analytic block TE.
+    The **right** panel plots the same cells in per-dimension units
+    $\bar K / d_z$, the scale of the loss-side ``kld_loss``: it lands near the TE
+    range only because of the $\div d_z$ factor, **not** because the model is
+    calibrated. Both carry the overall OLS line and the null-source floor (the
+    empirical $\mathrm{TE} \approx 0$ anchor).
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out per-cell rows.
+        arrs: In-mix per-sample arrays (for $d_z$ and the null floor).
+        slices: The calibration slices (overall fit).
+        controls: Null-control names (unused; signature parity).
+    """
+    import matplotlib.pyplot as plt
+
+    all_rows = rows_in + rows_ho
+    if not all_rows:
+        return
+    alpha, gamma = _overall_fit(slices)
+    st = percell_association(rows_in).get("overall", {})
+    dz = _dz_from(arrs)
+    null_key = next((k for k in ("null_shuffle_kbar", "null_reverse_kbar")
+                     if rows_in and k in rows_in[0]), None)
+    floor = float("nan")
+    if null_key is not None:
+        vals = [r[null_key] for r in rows_in
+                if np.isfinite(r.get(null_key, float("nan")))]
+        floor = float(np.mean(vals)) if vals else float("nan")
+    te_hi = max((r["te_true"] for r in all_rows), default=1.0) * 1.05 + 1e-6
+
+    panels: List[Tuple[str, float, str]] = [
+        ("dim-summed nats (TE unit)", 1.0,
+         r"mean latent KL  $\bar K$  (nats, summed over $d_z$)"),
+    ]
+    if dz:
+        panels.append((
+            f"per-dim  $\\bar K/d_z$  ($d_z$={dz}, loss-side scale)", 1.0 / dz,
+            r"per-dim latent KL  $\bar K/d_z$  (nats)"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 5.0),
+                             squeeze=False)
+    for ci, (title, scale, ylabel) in enumerate(panels):
+        ax = axes[0][ci]
+        for r in all_rows:
+            r["_kbar_scaled"] = float(r["kbar_mean"]) * scale
+        _scatter_cells(ax, rows_in, rows_ho, "te_true", "_kbar_scaled")
+        ref_handles = []
+        if np.isfinite(gamma):
+            xs = np.linspace(0.0, te_hi, 50)
+            ref_handles += ax.plot(
+                xs, (alpha + gamma * xs) * scale, color=ps.COLOR_BLACK, lw=1.6,
+                zorder=4,
+                label=fr"OLS: $\gamma$={gamma * scale:.2f} TE+{alpha * scale:.2f}")
+        if np.isfinite(floor):
+            ref_handles.append(ax.axhline(
+                floor * scale, ls=":", lw=1.2, color=ps.COLOR_GREEN, zorder=2,
+                label=rf"null floor $\approx$ {floor * scale:.2f} "
+                      rf"(TE$\approx$0)"))
+        ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=9)
+        if ci == 0 and st:
+            ax.text(0.03, 0.97,
+                    f"cells = {int(st.get('n', 0))}\n"
+                    f"Pearson r = {st.get('pearson', float('nan')):.3f}\n"
+                    f"Spearman $\\rho$ = {st.get('spearman', float('nan')):.3f}\n"
+                    f"MI = {st.get('mi', float('nan')):.3f} nats\n"
+                    f"$R^2$ = {st.get('r2', float('nan')):.3f}",
+                    transform=ax.transAxes, va="top", ha="left", fontsize=8,
+                    bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
+                              alpha=0.85))
+        ax.legend(handles=ref_handles + _cell_legend_handles(all_rows),
+                  fontsize=7, loc="lower right", frameon=False, ncol=2)
+        ps.style_axes(ax)
+    for r in all_rows:
+        r.pop("_kbar_scaled", None)
+    fig.suptitle("KLD vs TE on both scales (per cell)", fontsize=11)
+    _caption(fig, "Same per-cell points on two y-scales: dim-summed nats (left, "
+                  "the TE unit) and per-dim K-bar/d_z (right, the loss-side "
+                  "scale). The per-dim panel only looks closer to TE because of "
+                  "the /d_z factor -- it is not a calibration.")
+    ps.save_figure(fig, path)
+
+
+def _fig_calibration_health(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Calibration health: per-$M$ slope $\gamma_M$ + local-$\gamma$ heatmaps.
+
+    Collapses the per-$M$ / per-cell calibration into a pass-fail glance. The
+    **left** panel is a $\gamma_M$ lollipop with the $|\gamma - 1| \le 0.2$
+    target band shaded and $\gamma = 1$ marked; the y-axis switches to log when
+    any $\gamma_M \ge 5$ so the calibrated target and an under-regularised
+    $\gamma \approx 40$ both stay legible. The **right** panels (one per band)
+    show the local slope $\gamma_{\mathrm{loc}} = \bar K / \mathrm{TE}$ per cell
+    over the $M \times \mathrm{TE}$ grid (the $\mathrm{TE} = 0$ column is
+    dropped) on a diverging colour map centred at $\gamma = 1$: white cells are
+    calibrated, red cells over-encode (under-regularised), blue cells
+    under-encode.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out per-cell rows.
+        arrs: Per-sample arrays (unused here; signature parity).
+        slices: The calibration slices (``by_M`` for the slopes).
+        controls: Null-control names (unused; signature parity).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    all_rows = rows_in + rows_ho
+    ms, tes, bands = _grid_axes(all_rows)
     if not ms:
         return
-    band_color = {b: ps.PALETTE_PRIMARY[i % len(ps.PALETTE_PRIMARY)]
-                  for i, b in enumerate(bands)}
-    te_vals = [r["te_true"] for r in all_rows] or [0.0, 1.0]
-    kb_vals = [r["kbar_mean"] for r in all_rows] or [0.0, 1.0]
-    hi = max(max(te_vals), max(kb_vals)) * 1.05 + 1e-6
     by_M = slices.get("by_M", {}) or {}
-    te_line = np.linspace(0, hi, 50)
-
-    fig, axes = plt.subplots(1, len(ms), figsize=(3.4 * len(ms), 4.0),
-                             squeeze=False, sharex=True, sharey=True)
-    for ci, m in enumerate(ms):
-        ax = axes[0][ci]
-        ax.plot([0, hi], [0, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY, zorder=1)
-        for rows, filled in ((rows_in, True), (rows_ho, False)):
-            for r in rows:
-                if r["M"] != m:
-                    continue
-                color = band_color.get(r["band"], ps.COLOR_PURPLE)
-                ax.scatter(r["te_true"], r["kbar_mean"],
-                           c=color if filled else "none", edgecolors=color,
-                           marker="o", s=55, linewidths=1.4, zorder=3)
+    prim = calibration_primary_summary(slices)
+    gamma_by_M: Dict[int, float] = {}
+    for m in ms:
         fit = by_M.get(str(m))
-        if fit:
-            ax.plot(te_line, fit["alpha"] + fit["gamma"] * te_line,
-                    color=ps.color_for_M(m), lw=1.5,
-                    label=fr"$\gamma_M$={fit['gamma']:.2f}, $\alpha$={fit['alpha']:.2f}")
-            ax.legend(fontsize=7, loc="upper left", frameon=False)
-        ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
-        if ci == 0:
-            ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
-        ax.set_title(f"M = {m}", fontsize=9)
-        ps.style_axes(ax)
-    handles = [Line2D([0], [0], marker="o", ls="", color=band_color.get(b, ps.COLOR_PURPLE),
-                      label=f"band={b}") for b in bands]
-    if handles:
-        axes[0][-1].legend(handles=handles, fontsize=7, loc="lower right",
-                           frameon=False, title="filled=in-mix\nhollow=held-out",
-                           title_fontsize=6)
-    fig.suptitle("Per-M calibration (the headline slice): "
-                 r"$\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$", fontsize=11)
-    _caption(fig, "One panel per informative-channel count M; line = per-M OLS. "
-                  "Headline claim: gamma_M -> 1 for every M (channel dilution "
-                  "does not break the nat-scale).")
+        if isinstance(fit, dict) and np.isfinite(fit.get("gamma", float("nan"))):
+            gamma_by_M[m] = float(fit["gamma"])
+
+    tes_pos = [t for t in tes if t > 1e-9]
+    grids = {b: _local_gamma_grid(all_rows, ms, tes_pos, b) for b in bands}
+    ncols = 1 + len(bands)
+    fig, axes = plt.subplots(
+        1, ncols, figsize=(3.2 + 2.7 * len(bands), 4.2), squeeze=False,
+        gridspec_kw={"width_ratios": [1.4] + [1.0] * len(bands)},
+    )
+
+    axg = axes[0][0]
+    xs = np.arange(len(ms))
+    axg.axhspan(0.8, 1.2, color=ps.COLOR_SAGE, alpha=0.3, zorder=0,
+                label=r"$|\gamma-1|$ <= 0.2")
+    axg.axhline(1.0, ls=":", lw=1.0, color=ps.COLOR_BLACK, zorder=1)
+    for x, m in zip(xs, ms):
+        g = gamma_by_M.get(m, float("nan"))
+        if not np.isfinite(g):
+            continue
+        axg.vlines(x, 1.0, g, color=ps.color_for_M(m), lw=1.6, zorder=2)
+        axg.scatter([x], [g], s=70, color=ps.color_for_M(m), zorder=3)
+    gammas = np.array([gamma_by_M.get(m, np.nan) for m in ms], dtype=float)
+    finite_g = gammas[np.isfinite(gammas)]
+    if finite_g.size and float(np.max(finite_g)) >= 5.0:
+        axg.set_yscale("log")
+    axg.set_xticks(xs)
+    axg.set_xticklabels([f"M={m}" for m in ms])
+    axg.set_ylabel(r"per-$M$ calibration slope $\gamma_M$")
+    title = "Per-M calibration"
+    if prim:
+        title += (f"\nmean $\\gamma$={prim.get('mean_gamma', float('nan')):.2f},  "
+                  f"frac $|\\gamma-1|$<=0.2 = "
+                  f"{prim.get('frac_M_calibrated', float('nan')):.2f}")
+    axg.set_title(title, fontsize=9)
+    axg.legend(fontsize=7, loc="best", frameon=False)
+    ps.style_axes(axg)
+
+    finite_vals = np.concatenate(
+        [g[np.isfinite(g)].ravel() for g in grids.values()]
+    ) if grids else np.array([])
+    vmax = max(float(np.max(finite_vals)) if finite_vals.size else 2.0, 1.2)
+    norm = TwoSlopeNorm(vcenter=1.0, vmin=0.0, vmax=vmax)
+    im = None
+    for bi, band in enumerate(bands):
+        ax = axes[0][1 + bi]
+        im = ax.imshow(grids[band], aspect="auto", origin="lower",
+                       cmap="RdBu_r", norm=norm)
+        ax.set_xticks(range(len(tes_pos)))
+        ax.set_xticklabels([f"{t:g}" for t in tes_pos])
+        ax.set_yticks(range(len(ms)))
+        ax.set_yticklabels([str(m) for m in ms])
+        ax.set_xlabel(r"true block TE (nats)")
+        if bi == 0:
+            ax.set_ylabel("M")
+        ax.set_title(f"local $\\gamma$ | band={band}", fontsize=8)
+    if im is not None:
+        ps.add_colorbar(fig, im, axes[0][-1],
+                        label=r"local $\gamma=\bar K/\mathrm{TE}$")
+    fig.suptitle(r"Calibration health ($\gamma \to 1$ = calibrated)", fontsize=11)
+    _caption(fig, "Left: per-M slope gamma_M vs the |gamma-1|<=0.2 target band "
+                  "(log-y when gamma>>1). Right: local gamma = K-bar/TE per cell "
+                  "(TE>0); white = calibrated, red = under-regularised. gamma->1 "
+                  "needs beta-selection.")
     ps.save_figure(fig, path)
 
 
@@ -1498,44 +2107,85 @@ def _grid_axes(rows: List[Dict[str, Any]]) -> Tuple[List[int], List[float], List
     return ms, tes, bands
 
 
-def _fig_grid_heatmaps(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    """Per-cell K-bar and TE-recovery error as M x TE heatmaps, faceted by band."""
-    import matplotlib.pyplot as plt
+# Inverse of the band-name map used by ``_fig_kld_vs_time`` (band_id -> name), so
+# the master grid can select per-sample strip points by ``arrs['band_id']``.
+_BAND_ID = {"short": 0, "mid": 1, "long": 2}
 
-    rows = rows_in + rows_ho
-    ms, tes, bands = _grid_axes(rows)
-    if not (ms and tes and bands):
-        return
+
+def _dz_from(arrs: Dict[str, Any]) -> Optional[int]:
+    r"""Read the latent dimensionality $d_z$ from the per-dim KL diagnostics.
+
+    The figures need $d_z$ only for the per-dimension $\bar K / d_z$ scale; it is
+    recovered from the length of any ``per_dim_kl_by_M`` (or ``per_dim_kl_by_cell``)
+    entry so the ``_fig_*`` signature does not have to carry ``config``.
+
+    Args:
+        arrs: The per-sample array dict from :func:`collect_per_sample_kbar`.
+
+    Returns:
+        The latent dimension $d_z$, or ``None`` if no per-dim diagnostic is
+        present (the per-dim panel is then silently skipped).
+    """
+    for key in ("per_dim_kl_by_M", "per_dim_kl_by_cell"):
+        table = arrs.get(key) or {}
+        for vec in table.values():
+            if vec is not None and len(vec) > 0:
+                return int(len(vec))
+    return None
+
+
+def _cells_by_M_band(
+    rows: List[Dict[str, Any]],
+) -> Dict[Tuple[int, str], List[Dict[str, Any]]]:
+    r"""Group per-cell rows by the $(M, \text{band})$ key for the master grid.
+
+    Args:
+        rows: Per-cell rows (in-mix and/or held-out).
+
+    Returns:
+        ``{(M, band) -> [rows]}``.
+    """
+    out: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        out.setdefault((int(r["M"]), str(r["band"])), []).append(r)
+    return out
+
+
+def _local_gamma_grid(
+    rows: List[Dict[str, Any]],
+    ms: Sequence[int],
+    tes: Sequence[float],
+    band: str,
+) -> np.ndarray:
+    r"""Build the $M \times \mathrm{TE}$ grid of the local slope $\bar K/\mathrm{TE}$.
+
+    The local slope $\gamma_{\mathrm{loc}} = \bar K / \mathrm{TE}_{\mathrm{true}}$
+    is the per-cell calibration deviation: $\gamma_{\mathrm{loc}} \approx 1$ is
+    calibrated, $\gg 1$ is under-regularised. Cells with $\mathrm{TE} \le 0$ (the
+    null anchor) are left ``nan`` since the ratio is undefined.
+
+    Args:
+        rows: Per-cell rows (in-mix and/or held-out).
+        ms: Row order (informative-channel counts $M$).
+        tes: Column order (target block TE values, $> 0$).
+        band: The lag-band to slice.
+
+    Returns:
+        A $(\,|ms|, |tes|)$ array of $\bar K / \mathrm{TE}$ (``nan`` where the
+        cell is absent or $\mathrm{TE} \le 0$).
+    """
     lut = {(r["M"], r["target_te"], r["band"]): r for r in rows}
-    nrows, ncols = 2, len(bands)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 6.0),
-                             squeeze=False)
-    metrics = [("kbar_mean", r"$\bar K$"), ("te_rmse", "TE RMSE")]
-    for ri, (key, label) in enumerate(metrics):
-        for ci, band in enumerate(bands):
-            ax = axes[ri][ci]
-            grid = np.full((len(ms), len(tes)), np.nan)
-            for i, m in enumerate(ms):
-                for j, te in enumerate(tes):
-                    r = lut.get((m, te, band))
-                    if r is not None:
-                        grid[i, j] = r.get(key, np.nan)
-            im = ax.imshow(grid, aspect="auto", origin="lower", cmap="viridis")
-            ax.set_xticks(range(len(tes)))
-            ax.set_xticklabels([f"{t:g}" for t in tes])
-            ax.set_yticks(range(len(ms)))
-            ax.set_yticklabels([str(m) for m in ms])
-            if ri == nrows - 1:
-                ax.set_xlabel(r"target TE (nats)")
-            if ci == 0:
-                ax.set_ylabel(f"{label}\nM")
-            ax.set_title(f"{label} | band={band}", fontsize=8)
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle("Per-cell recovery over the (M x TE x band) grid", fontsize=11)
-    _caption(fig, "Per-cell mean KL (top row) and TE-recovery RMSE (bottom row) "
-                  "over the M x TE grid, one column per band. Good: KL brightens "
-                  "with TE; RMSE uniformly low.")
-    ps.save_figure(fig, path)
+    grid = np.full((len(ms), len(tes)), np.nan)
+    for i, m in enumerate(ms):
+        for j, t in enumerate(tes):
+            r = lut.get((m, t, band))
+            if r is None:
+                continue
+            te_true = float(r.get("te_true", float("nan")))
+            kb = float(r.get("kbar_mean", float("nan")))
+            if np.isfinite(te_true) and te_true > 1e-9 and np.isfinite(kb):
+                grid[i, j] = kb / te_true
+    return grid
 
 
 def _fig_lag_recovery(path, rows_in, rows_ho, arrs, slices, controls) -> None:
@@ -1797,68 +2447,6 @@ def _cell_legend_handles(rows: List[Dict[str, Any]]):
     return h_m + h_b
 
 
-def _fig_kld_vs_te_percell(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Per-cell $\bar K$ vs $\mathrm{TE}_{\mathrm{true}}$ with the calibration line.
-
-    One point per cell (mean $\bar K$ at its true block TE) -- the correct
-    granularity, free of the per-sample overplot against the four discrete TE
-    levels. The overall OLS line and the **per-cell** association
-    (Pearson / Spearman / MI / $R^2$) are annotated.
-    """
-    import matplotlib.pyplot as plt
-
-    all_rows = rows_in + rows_ho
-    if not all_rows:
-        return
-    te = np.asarray([r["te_true"] for r in rows_in], dtype=float)
-    kb = np.asarray([r["kbar_mean"] for r in rows_in], dtype=float)
-    st = _assoc_stats(kb, te)
-
-    fig, ax = plt.subplots(figsize=(6.6, 5.2))
-    _scatter_cells(ax, rows_in, rows_ho, "te_true", "kbar_mean")
-    alpha, gamma = _overall_fit(slices)
-    hi = max((r["te_true"] for r in all_rows), default=1.0) * 1.05 + 1e-6
-    ref_handles = []  # line references shown alongside the M/band proxy legend
-    if np.isfinite(gamma):
-        xs = np.linspace(0.0, hi, 50)
-        ref_handles += ax.plot(
-            xs, alpha + gamma * xs, color=ps.COLOR_BLACK, lw=1.6, zorder=4,
-            label=rf"OLS: $\bar K$={gamma:.2f}$\,$TE+{alpha:.2f}")
-    # Empirical TE~0 anchor: there is no zero-coupling cell, so the shuffled- (or
-    # reversed-) source K-bar stands in for TE=0. Shuffling U kills the directed
-    # term I_q(Z;U|Y), leaving the prior-mismatch floor E[KL(q(z|Y)||p(z|Y))]
-    # that the calibration intercept alpha should match (validation plan Sec. 1).
-    null_key = next((k for k in ("null_shuffle_kbar", "null_reverse_kbar")
-                     if rows_in and k in rows_in[0]), None)
-    if null_key is not None:
-        vals = [r[null_key] for r in rows_in
-                if np.isfinite(r.get(null_key, float("nan")))]
-        if vals:
-            floor = float(np.mean(vals))
-            ref_handles.append(ax.axhline(
-                floor, ls=":", lw=1.2, color=ps.COLOR_GREEN, zorder=2,
-                label=rf"null-source floor $\approx$ {floor:.2f} "
-                      rf"(empirical TE$\approx$0)"))
-    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
-    ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
-    ax.set_title("Per-cell KLD vs true TE")
-    _caption(fig, "One point per cell: mean latent KL vs analytic true block TE; "
-                  "line = overall OLS calibration. Good: monotone, slope gamma ~ 1, "
-                  "high R^2. Association is per-cell, not per-sample.")
-    ax.text(0.03, 0.97,
-            f"cells = {int(st['n'])}\n"
-            f"Pearson r = {st['pearson']:.3f}\n"
-            f"Spearman $\\rho$ = {st['spearman']:.3f}\n"
-            f"MI = {st['mi']:.3f} nats\n"
-            f"$R^2$ = {st['r2']:.3f}",
-            transform=ax.transAxes, va="top", ha="left", fontsize=8,
-            bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY, alpha=0.85))
-    ax.legend(handles=ref_handles + _cell_legend_handles(all_rows), fontsize=7,
-              loc="lower right", frameon=False, ncol=2)
-    ps.style_axes(ax)
-    ps.save_figure(fig, path)
-
-
 def _fig_te_recovery_percell(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     r"""Per-cell recovered TE $(\bar K-\alpha)/\gamma$ vs true TE, with $y=x$.
 
@@ -1880,15 +2468,22 @@ def _fig_te_recovery_percell(path, rows_in, rows_ho, arrs, slices, controls) -> 
 
     preds = [r["_te_pred"] for r in all_rows if np.isfinite(r["_te_pred"])]
     hi = max([r["te_true"] for r in all_rows] + preds, default=1.0) * 1.05 + 1e-6
-    lo = min([0.0] + preds)
+    lo = min([0.0] + preds) - 0.02 * abs(hi)
     fig, ax = plt.subplots(figsize=(6.6, 5.2))
     ax.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY, label="$y=x$")
     _scatter_cells(ax, rows_in, rows_ho, "te_true", "_te_pred")
+    # Both axes are in TE-nats, so equalise their ranges to keep y=x an exact
+    # diagonal (independent autoscaling would tilt the reference line).
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
     ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
     ax.set_ylabel(r"recovered TE  $(\bar K-\alpha)/\gamma$  (nats)")
     ax.set_title("Per-cell TE recovery (overall in-mix calibration)")
     _caption(fig, "Each cell's recovered TE (K-bar - alpha)/gamma vs its true TE; "
-                  "dashed y=x. Good: points on y=x with low RMSE and near-zero bias.")
+                  "dashed y=x. Recovery divides out the overall gamma, so it works "
+                  "even when gamma>>1 (under-regularised); residual scatter is the "
+                  "per-cell calibration error. Good: points on y=x, low RMSE, "
+                  "near-zero bias.")
     ax.text(0.03, 0.97,
             f"RMSE = {rmse:.3f} nats\nbias = {bias:+.3f} nats\n"
             f"$\\gamma$ = {gamma:.2f}, $\\alpha$ = {alpha:.2f}",
@@ -1900,92 +2495,6 @@ def _fig_te_recovery_percell(path, rows_in, rows_ho, arrs, slices, controls) -> 
     ps.save_figure(fig, path)
     for r in all_rows:
         r.pop("_te_pred", None)
-
-
-def _fig_kld_within_cell_spread(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Within-cell $\bar K$ spread: a violin per distinct true-TE level.
-
-    Shows the full per-sample $\bar K$ distribution at each true-TE level
-    (faithful to the spread) without the overplotted cloud, plus the per-level
-    mean trace -- the monotonicity check the per-cell scatter summarises.
-    """
-    import matplotlib.pyplot as plt
-
-    te = np.asarray(arrs.get("te_true", []), dtype=float)
-    kbar = np.asarray(arrs.get("kbar", []), dtype=float)
-    if te.size == 0:
-        return
-    levels = np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
-    groups = [kbar[np.round(te, 6) == lv] for lv in levels]
-    means = np.array([g.mean() if g.size else np.nan for g in groups])
-
-    fig, ax = plt.subplots(figsize=(6.6, 5.0))
-    widths = max(0.04, 0.6 * float(np.min(np.diff(levels))) if levels.size > 1 else 0.3)
-    parts = ax.violinplot(groups, positions=levels, widths=widths,
-                          showmeans=False, showextrema=False)
-    for body in parts["bodies"]:
-        body.set_facecolor(ps.COLOR_BLUE)
-        body.set_alpha(0.45)
-        body.set_edgecolor(ps.COLOR_GRAY)
-    ax.plot(levels, means, "o-", color=ps.COLOR_VERMILLION, lw=1.6, ms=5,
-            zorder=3, label=r"per-level mean $\bar K$")
-    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
-    ax.set_ylabel(r"mean latent KL  $\bar K$  (nats)")
-    ax.set_title("Within-cell KLD spread across true-TE levels")
-    _caption(fig, "Per-sample K-bar distribution at each true-TE level (violin) "
-                  "plus the per-level mean. Good: medians rise monotonically with "
-                  "TE and the spread stays modest.")
-    ax.legend(fontsize=7, loc="upper left", frameon=False)
-    ps.style_axes(ax)
-    ps.save_figure(fig, path)
-
-
-def _fig_kld_vs_te_allsamples(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Full per-sample scatter of $\bar K$ vs true block TE (every in-mix sample).
-
-    Draws **all** samples (colour = $M$) with a small horizontal jitter so the
-    few discrete true-TE levels read as vertical *distributions* rather than
-    infinitely-thin lines: the true block TE is an analytic **per-cell** quantity
-    (every sample in a cell shares one $\mathrm{TE}_{\mathrm{true}}$), so without
-    jitter the cloud collapses onto $\sim 4$ vertical stacks. Per-cell means
-    (black rings) and the overall calibration line are overlaid for reference.
-    """
-    import matplotlib.pyplot as plt
-
-    te = np.asarray(arrs.get("te_true", []), dtype=float)
-    kb = np.asarray(arrs.get("kbar", []), dtype=float)
-    m = np.asarray(arrs.get("M", []), dtype=int)
-    if te.size == 0:
-        return
-    levels = np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
-    span = float(np.min(np.diff(levels))) if levels.size > 1 else 1.0
-    rng = np.random.default_rng(0)
-    jitter = (rng.random(te.size) - 0.5) * 0.18 * span
-
-    fig, ax = plt.subplots(figsize=(7.0, 5.2))
-    for mm in sorted(set(m.tolist())):
-        sel = m == mm
-        ax.scatter(te[sel] + jitter[sel], kb[sel], s=6, alpha=0.25, linewidths=0.0,
-                   color=_M_COLORS.get(int(mm), ps.COLOR_PURPLE), label=f"M={mm}",
-                   zorder=2)
-    for r in rows_in:
-        ax.scatter(r["te_true"], r["kbar_mean"], s=42, facecolors="none",
-                   edgecolors=ps.COLOR_BLACK, linewidths=1.0, zorder=4)
-    alpha, gamma = _overall_fit(slices)
-    if np.isfinite(gamma):
-        xs = np.linspace(0.0, float(te.max()) * 1.02 + 1e-6, 50)
-        ax.plot(xs, alpha + gamma * xs, color=ps.COLOR_BLACK, lw=1.6, zorder=5,
-                label=rf"OLS: $\bar K$={gamma:.2f}$\,$TE+{alpha:.2f}")
-    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
-    ax.set_ylabel(r"per-sample mean latent KL  $\bar K$  (nats)")
-    ax.set_title(f"All-sample KLD vs true TE  (N={te.size}, black rings = per-cell mean; "
-                 f"x jittered)")
-    ax.legend(fontsize=7, loc="lower right", frameon=False)
-    _caption(fig, "Every sample's K-bar vs its cell's true TE (x jittered; true "
-                  "TE is one value per cell, so points form discrete columns). "
-                  "Rings = per-cell means. Tight columns = low per-sample noise.")
-    ps.style_axes(ax)
-    ps.save_figure(fig, path)
 
 
 # =============================================================================
@@ -2115,6 +2624,63 @@ def _fig_lag_profiles(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     _caption(fig, "Per-cell leave-one-lag-out importance A_l vs source lag, one "
                   "panel per band; shaded = true band {0..dmax-1}. Good: every "
                   "curve peaks inside the shaded band.")
+    ps.save_figure(fig, path)
+
+
+def _fig_lag_walk(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Per-step lag-walk recovery: true $d_t$ vs recovered $\hat d_t$ over time.
+
+    Uses the per-cell mean trajectories from
+    :func:`collect_per_cell_attn_diag` (the heterogeneous random-walk-lag DGP's
+    per-step ground truth ``true_lag_tt``). A faithful model tracks the true lag
+    walk $d_t$ (solid) with its argmax-attention recovery
+    $\hat d_t = \arg\max_\ell \bar\alpha_{t,\ell}$ (dashed); the band-mean MAE
+    annotates each panel.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    walk = arrs.get("lag_walk_by_cell", {}) or {}
+    if not walk:
+        return
+    by_band: Dict[str, List[Dict[str, Any]]] = {}
+    for v in walk.values():
+        by_band.setdefault(str(v.get("band", "")), []).append(v)
+    bands = sorted(by_band, key=lambda b: {"short": 0, "mid": 1, "long": 2}.get(b, 99))
+    fig, axes = plt.subplots(1, len(bands), figsize=(4.2 * len(bands), 3.8),
+                             squeeze=False, sharey=True)
+    for ci, band in enumerate(bands):
+        ax = axes[0][ci]
+        maes: List[float] = []
+        for v in by_band[band]:
+            true_t = np.asarray(v.get("true_mean", []), dtype=float)
+            pred_t = np.asarray(v.get("pred_mean", []), dtype=float)
+            if true_t.size == 0 or pred_t.size == 0:
+                continue
+            t_axis = np.arange(true_t.size)
+            ax.plot(t_axis, true_t, color=ps.COLOR_BLUE, lw=1.1, alpha=0.7)
+            ax.plot(t_axis, pred_t, color=ps.COLOR_ORANGE, lw=1.0, ls="--",
+                    alpha=0.7)
+            maes.append(float(v.get("mae", float("nan"))))
+        mae_arr = np.asarray(maes, dtype=float)
+        mae_arr = mae_arr[np.isfinite(mae_arr)]
+        mae_txt = f"MAE={mae_arr.mean():.2f}" if mae_arr.size else "MAE=n/a"
+        ax.set_xlabel(r"time step $t$")
+        if ci == 0:
+            ax.set_ylabel(r"source lag $d_t$")
+        ax.set_title(f"band = {band}  ({mae_txt})", fontsize=9)
+        ps.style_axes(ax)
+    handles = [
+        Line2D([0], [0], color=ps.COLOR_BLUE, lw=1.1, label=r"true $d_t$"),
+        Line2D([0], [0], color=ps.COLOR_ORANGE, lw=1.0, ls="--",
+               label=r"recovered $\hat d_t$"),
+    ]
+    fig.legend(handles=handles, fontsize=8, loc="upper right", frameon=False)
+    fig.suptitle(r"Per-step lag-walk recovery: true vs argmax-attention $d_t$",
+                 fontsize=11)
+    _caption(fig, "Mean true lag walk d_t (blue) vs recovered argmax-attention "
+                  "d_hat_t (orange dashed) over time, one panel per band. Good: "
+                  "dashed tracks solid; low MAE.")
     ps.save_figure(fig, path)
 
 
@@ -2255,36 +2821,6 @@ def _fig_kld_vs_time(path, rows_in, rows_ho, arrs, slices, controls) -> None:
                   "warm-up, dotted = each band's clean-window floor. Good: a "
                   "decaying transient then a stable steady state past the floor.")
     ax.legend(fontsize=7, loc="upper right", frameon=False)
-    ps.style_axes(ax)
-    ps.save_figure(fig, path)
-
-
-def _fig_corr_by_m_bars(path, rows_in, rows_ho, arrs, slices, controls) -> None:
-    r"""Grouped bars of **per-cell** Pearson $r$ / Spearman $\rho$ / MI of $\bar K$ vs TE per $M$."""
-    import matplotlib.pyplot as plt
-
-    assoc = percell_association(rows_in)["by_M"]
-    if not assoc:
-        return
-    ms = sorted(int(k) for k in assoc)
-    x = np.arange(len(ms))
-    metrics = [("pearson", "Pearson r", ps.COLOR_BLUE),
-               ("spearman", r"Spearman $\rho$", ps.COLOR_GREEN),
-               ("mi", "MI (nats)", ps.COLOR_VERMILLION)]
-    width = 0.8 / len(metrics)
-    fig, ax = plt.subplots(figsize=(max(6.0, 1.2 * len(ms) + 2.0), 4.2))
-    for k, (key, label, color) in enumerate(metrics):
-        vals = [assoc[str(mm)].get(key, float("nan")) for mm in ms]
-        ax.bar(x + k * width, vals, width, label=label, color=color)
-    ax.set_xticks(x + width)
-    ax.set_xticklabels([str(mm) for mm in ms])
-    ax.set_xlabel("informative-channel count $M$")
-    ax.set_ylabel("association of $\\bar K$ with TE")
-    ax.set_title("KLD-vs-TE association by channel count $M$")
-    _caption(fig, "Per-cell association of K-bar with TE, split by "
-                  "informative-channel count M. Good: Pearson/Spearman near 1 and "
-                  "high MI for every M (no decay as M grows).")
-    ax.legend(fontsize=8, frameon=False)
     ps.style_axes(ax)
     ps.save_figure(fig, path)
 

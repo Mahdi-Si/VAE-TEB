@@ -18,6 +18,7 @@ What it guards:
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import tempfile
 from pathlib import Path
@@ -121,6 +122,11 @@ def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
         overrides.update(extra_overrides)
 
     train_ddp(config, overrides=overrides)
+    # Break Lightning's reference cycles now: they keep the datamodule's
+    # memmap-backed datasets (and thus train.npz / val.npz mappings) alive
+    # until an eventual collection, and Windows cannot delete a mapped file --
+    # the caller's TemporaryDirectory cleanup would fail with WinError 32.
+    gc.collect()
     return results_dir / "G1_mix" / tag
 
 
