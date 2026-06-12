@@ -37,6 +37,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import textwrap
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -78,7 +79,13 @@ __all__ = [
     "FONT_TITLE",
     "FONT_TICK",
     "FONT_LEGEND",
+    "FONT_SUPTITLE",
     "SAVE_DPI",
+    "M_COLORS",
+    "M_COLOR_CYCLE",
+    "BAND_MARKERS",
+    "color_for_M",
+    "add_caption",
 ]
 
 # -----------------------------------------------------------------------------
@@ -142,10 +149,17 @@ SAVE_DPI = 600
 # Explicit per-element font sizes (1.5x the rcParams base sizes below). Pass
 # these to ``set_xlabel(..., fontsize=FONT_LABEL)`` etc. when a specific panel
 # needs a larger label than the rcParams default, so sizing stays uniform.
+# LEGACY: these 1.5x sizes predate the smaller-text revision and read oversized
+# next to the rcParams defaults; prefer the rcParams sizes (omit ``fontsize``)
+# and FONT_SUPTITLE for figure-level titles.
 FONT_LABEL = 12.0   # axes.labelsize 8 * 1.5
 FONT_TITLE = 13.5   # axes.titlesize 9 * 1.5
 FONT_TICK = 10.5    # xtick.labelsize 7 * 1.5
 FONT_LEGEND = 10.5  # legend.fontsize 7 * 1.5
+
+# Figure-level suptitle size: just above the 9pt axes titles so the hierarchy
+# reads (suptitle > panel title > labels > ticks) without dwarfing the panels.
+FONT_SUPTITLE = 9.5
 
 # -----------------------------------------------------------------------------
 # rcParams
@@ -466,6 +480,49 @@ def save_figure(
     if close:
         plt.close(fig)
     return written
+
+
+def add_caption(
+    fig: Figure,
+    caption: str,
+    *,
+    note: Optional[str] = None,
+    note_color: Optional[str] = None,
+    fontsize: float = 6.5,
+) -> None:
+    r"""Add an italic "how to read this" caption (and optional note) below a figure.
+
+    Both texts are placed at figure $y < 0$ so they never overlap the axes;
+    the ``savefig.bbox: tight`` rcParam captures them in the written file. The
+    texts are **pre-wrapped** with :func:`textwrap.fill` to a width derived
+    from the figure width, and the optional ``note`` is stacked *below* the
+    caption using the wrapped line count -- unlike matplotlib's lazy
+    ``wrap=True``, whose wrapped height is invisible to manual y-offsets and
+    made independently placed caption/banner texts collide.
+
+    Args:
+        fig: The figure to annotate.
+        caption: The caption string, roughly "what is plotted -- what good
+            looks like". Plain text; wrapped automatically.
+        note: Optional extra warning / interpretation line rendered upright
+            (non-italic) below the caption, e.g. a calibration health banner.
+        note_color: Colour for ``note``; defaults to the caption gray.
+        fontsize: Font size for both texts.
+    """
+    wrap_width = max(60, int(16 * float(fig.get_figwidth())))
+    wrapped = textwrap.fill(str(caption), width=wrap_width)
+    y0 = -0.012
+    fig.text(0.5, y0, wrapped, ha="center", va="top", fontsize=fontsize,
+             color=COLOR_GRAY, style="italic")
+    if note:
+        # Line height in figure coords: points -> inches -> figure fraction,
+        # with a 1.45 leading factor matching matplotlib's default spacing.
+        line_h = (fontsize * 1.45) / 72.0 / float(fig.get_figheight())
+        n_lines = wrapped.count("\n") + 1
+        y_note = y0 - n_lines * line_h - 0.6 * line_h
+        fig.text(0.5, y_note, textwrap.fill(str(note), width=wrap_width),
+                 ha="center", va="top", fontsize=fontsize,
+                 color=note_color or COLOR_GRAY)
 
 
 def tighten_xaxis(ax: Axes, x: np.ndarray) -> None:

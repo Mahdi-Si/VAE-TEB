@@ -40,8 +40,17 @@ Stage order (each individually skippable via ``PIPELINE['stages']``):
                                (``results/G1_mix/<run_tag>/mixed_eval/``).
     8. ``eval_extrap``      -- one :func:`mixed_eval.evaluate_mixed` pass per
                                extrapolation cache, each writing to its own
-                               ``mixed_eval_extrap_m<M>/`` subdirectory.
-    9. ``per_cell_diagnostics`` -- OPTIONAL (heavy: a forward / LOLO pass per
+                               ``mixed_eval_extrap_m<M>/`` subdirectory (each
+                               pass also writes its ``per_sample.csv`` with the
+                               extrapolation rows under ``split=holdout``,
+                               consumed by ``combined_figures``).
+    9. ``combined_figures`` -- the combined per-sample scatter suite pooled
+                               over every eval pass (all $M$ colours in one
+                               figure), re-rendered purely from the CSV/JSON
+                               artifacts (:func:`mixed_eval.render_combined_per_sample_scatter`)
+                               into ``results/G1_mix/<run_tag>/combined_figures/``.
+                               Cheap and non-fatal.
+   10. ``per_cell_diagnostics`` -- OPTIONAL (heavy: a forward / LOLO pass per
                                cell). The faithful single-cell ``lag_recovery`` /
                                ``evaluate_te`` analyses run once per sub-population
                                (:func:`mixed_per_cell_diag.run_mixed_per_cell_diag`),
@@ -127,6 +136,7 @@ _STAGE_ORDER = (
     "train",
     "eval_in_mix",
     "eval_extrap",
+    "combined_figures",
     "per_cell_diagnostics",
     "pipeline_tests",
 )
@@ -526,14 +536,40 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     else:
         for m in extrap_ms:
             extrap_tag = f"{tag}_extrap_m{m}"
+            # in_mix_light: the canonical in-mix diagnostics already live in
+            # mixed_eval/ (stage 7); these passes only need the in-mix
+            # calibration to score the extrapolation cells.
             evaluate_mixed(
                 config, run_tag=run_tag, in_mix_tag=tag,
                 holdout_tag=extrap_tag, ckpt_name=ckpt_name,
-                out_subdir=f"mixed_eval_extrap_m{m}",
+                out_subdir=f"mixed_eval_extrap_m{m}", in_mix_light=True,
             )
         status["eval_extrap"] = "done"
 
-    # --- 8. faithful per-cell single-cell diagnostics (opt-in, heavy) -----------
+    # --- 9. combined per-sample figures across every eval pass ------------------
+    _stage_banner("combined_figures")
+    if not stages["combined_figures"]:
+        status["combined_figures"] = "skipped (disabled)"
+        print("[pipeline] disabled.")
+    elif dry_run:
+        status["combined_figures"] = "dry-run"
+        print(f"[pipeline] would render the combined per-sample figures from "
+              f"the eval CSVs -> {run_dir / 'combined_figures'}")
+    else:
+        # CSV/JSON -> matplotlib only (no checkpoint, no GPU); a failure must
+        # never gate the remaining stages -- same policy as data_previews.
+        try:
+            from model.vae_teb_prediction.model.model_experiment.synthetic.mixed_eval import (
+                render_combined_per_sample_scatter,
+            )
+            written = render_combined_per_sample_scatter(run_dir)
+            status["combined_figures"] = "done" if written else "skipped (no CSVs)"
+        except Exception as exc:  # noqa: BLE001 -- figures only
+            print(f"[pipeline][warn] combined figures failed: "
+                  f"{type(exc).__name__}: {exc}")
+            status["combined_figures"] = "failed (non-fatal)"
+
+    # --- 10. faithful per-cell single-cell diagnostics (opt-in, heavy) ----------
     pcd_raw = pipeline.get("per_cell_diagnostics")
     if pcd_raw is not None and not isinstance(pcd_raw, dict):
         # Same stage-name collision guard as `pipeline_tests`: the toggle lives
@@ -575,7 +611,7 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         )
         status["per_cell_diagnostics"] = "done"
 
-    # --- 9. broad model-diagnostic testing pipeline ------------------------------
+    # --- 11. broad model-diagnostic testing pipeline -----------------------------
     pt_raw = pipeline.get("pipeline_tests")
     if pt_raw is not None and not isinstance(pt_raw, dict):
         # Guard the stage-name collision: the toggle lives under 'stages';
@@ -643,6 +679,8 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     print(f"  eval        {run_dir / 'mixed_eval'}")
     for m in extrap_ms:
         print(f"  extrap eval {run_dir / f'mixed_eval_extrap_m{m}'}")
+    if stages["combined_figures"]:
+        print(f"  combined    {run_dir / 'combined_figures'}")
     if stages["per_cell_diagnostics"]:
         print(f"  per-cell    {run_dir / 'per_cell'}")
     if stages["pipeline_tests"]:
@@ -698,10 +736,15 @@ if __name__ == "__main__":
             "train": True,           # 6. final pooled model (train_ddp)
             "eval_in_mix": True,     # 7. mixed_eval on in-mix + holdout
             "eval_extrap": True,     # 8. mixed_eval per extrapolation cache
-            "per_cell_diagnostics": False,  # 9. OPTIONAL faithful per-cell
+            "combined_figures": True,  # 9. combined per-sample scatter suite
+                                     #    pooled over every eval pass (CSV ->
+                                     #    figures only; cheap, non-fatal)
+            "per_cell_diagnostics": False,  # 10. OPTIONAL faithful per-cell
                                      #    lag_recovery / evaluate_te reproduction
-                                     #    (forward / LOLO pass per cell -- heavy)
-            "pipeline_tests": True,  # 10. broad testing/ diagnostics on the
+                                     #    (forward / LOLO pass per cell -- heavy;
+                                     #    the evaluate_te-style kbar_vs_te plots
+                                     #    already render by default in stage 7-8)
+            "pipeline_tests": True,  # 11. broad testing/ diagnostics on the
                                      #    same <ckpt_name> (run_pipeline_tests)
         },
         # --- beta_calibration sub-stage settings (stage 4 only) --------------------

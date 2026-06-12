@@ -372,9 +372,12 @@ def _innovation_xcorr_profile(
 
 
 def _caption(fig, text: str) -> None:
-    """Add the italic "how to read this" caption used across mixed figures."""
-    fig.text(0.5, -0.012, text, ha="center", va="top", fontsize=7.5,
-             color=ps.COLOR_GRAY, style="italic", wrap=True)
+    """Add the italic "how to read this" caption used across mixed figures.
+
+    Delegates to :func:`plot_style.add_caption`, which pre-wraps the text so
+    its height is known and nothing placed below the figure can collide.
+    """
+    ps.add_caption(fig, text)
 
 
 # =============================================================================
@@ -458,12 +461,11 @@ def plot_sample_anatomy(
     ax.set_ylabel(r"lag $d_t$ (steps)")
     ax.set_ylim(0.0, d_max + 2.0)
     ax.set_title(
-        rf"True coupling lag $d_t$ (reflecting random walk):  "
-        rf"$Y_{{m,t}} = a_y Y_{{m,t-1}} + B_y\, s_{{m,\,t - d_t}} + "
-        rf"\varepsilon_t$ with $d_t$ drifting in $[{d_min}, {d_max}]$ "
-        rf"(mean hold $\approx 50$ steps), shared by all $M={M}$ "
+        rf"True coupling lag $d_t$:  $Y_{{m,t}} = a_y Y_{{m,t-1}} + "
+        rf"B_y\, s_{{m,\,t - d_t}} + \varepsilon_t$,  "
+        rf"$d_t \in [{d_min}, {d_max}]$, shared by all $M={M}$ "
         rf"informative channels",
-        fontsize=8.5,
+        fontsize=8,
     )
     ps.style_axes(ax)
     ps.tighten_xaxis(ax, t)
@@ -526,9 +528,9 @@ def plot_sample_anatomy(
             0.995, 0.96,
             rf"informative pair $m={k}$:  TE/channel $\approx$ {te_ch:.3g} nats"
             rf"  |  corr$(Y,\ \mathrm{{driven}})$ = {r_al:.2f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
+            transform=ax.transAxes, ha="right", va="top", fontsize=6.5,
             bbox=dict(boxstyle="round,pad=0.25", fc="white",
-                      ec=ps.COLOR_GRAY, lw=0.5, alpha=0.9),
+                      ec="none", alpha=0.75),
         )
         if k == 0:
             # Legend above the axes so it never collides with the traces.
@@ -562,9 +564,9 @@ def plot_sample_anatomy(
         0.995, 0.96,
         rf"zero-transfer contrast:  TE $= 0$ by construction  |  "
         rf"corr = {r_null:.2f}",
-        transform=ax.transAxes, ha="right", va="top", fontsize=7.5,
+        transform=ax.transAxes, ha="right", va="top", fontsize=6.5,
         bbox=dict(boxstyle="round,pad=0.25", fc="white",
-                  ec=ps.COLOR_GRAY, lw=0.5, alpha=0.9),
+                  ec="none", alpha=0.75),
     )
     ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.005), fontsize=6.8,
               frameon=False, ncol=3)
@@ -630,12 +632,13 @@ def plot_sample_anatomy(
         rf"($d \in [{d_min}, {d_max}]$),  cell TE $= {te_cell:.3g}$ nats "
         rf"($\approx {te_ch:.3g}$/channel),  $B_y = "
         rf"{float(cell.get('B_y_scalar', float('nan'))):.4g}$",
-        fontsize=11,
+        fontsize=ps.FONT_SUPTITLE,
     )
     _caption(
         fig,
-        "One sample, fully annotated. Top: the drifting true lag d_t. Middle: "
-        "each informative source channel (upper band) drives its target "
+        "One sample, fully annotated. Top: the drifting true lag d_t (a "
+        "reflecting random walk, mean hold ~50 steps). Middle: each "
+        "informative source channel (upper band) drives its target "
         "channel (lower band) d_t steps later -- the dashed trace is the "
         "lag-aligned source passed through the target's own AR filter (the "
         "DGP integrates the lagged source, so this is the component Y "
@@ -745,9 +748,9 @@ def plot_te_lag_gallery(
                 (rf"TE$={te_real:.2f}$ nats,  corr$={r_mean:.2f}\pm{r_std:.2f}$"
                  rf" over $M$ ch."
                  + ("  [held-out]" if held else "")),
-                transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                transform=ax.transAxes, ha="right", va="top", fontsize=6.2,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                          ec=ps.COLOR_GRAY, lw=0.4, alpha=0.9),
+                          ec="none", alpha=0.75),
             )
             if ri == 0:
                 dmin, dmax = int(cell["delay_min"]), int(cell["delay_max"])
@@ -769,7 +772,7 @@ def plot_te_lag_gallery(
         rf"G1_mix transfer-entropy $\times$ lag-band gallery at $M={m_star}$ "
         rf"informative channels (representative channel pair, one sample "
         rf"per cell)",
-        fontsize=11,
+        fontsize=ps.FONT_SUPTITLE,
     )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     _caption(
@@ -858,7 +861,7 @@ def plot_channel_atlas(
         rf"G1_mix channel atlas -- cell {cell['cell_id']}: every channel of "
         rf"one sample  ($M={M}$ informative, band `{cell.get('band', '')}`, "
         rf"cell TE $= {te_cell:.3g}$ nats)",
-        fontsize=11,
+        fontsize=ps.FONT_SUPTITLE,
     )
     _caption(
         fig,

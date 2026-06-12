@@ -262,7 +262,7 @@ def plot_training_curves(
         """Apply shared axis cosmetics after a panel's curves are drawn."""
         ax.set_xlabel("epoch")
         if drew:
-            ax.legend(loc="best")
+            ax.legend(loc="best", fontsize=6.5)
         ps.style_axes(ax)
         if n_epochs >= 2:
             ps.tighten_xaxis(ax, epochs)
@@ -339,9 +339,9 @@ def plot_training_curves(
         ax_lr.set_yscale("log")
     ax_lr.set_title("Optimisation diagnostics")
     ax_lr.set_xlabel("epoch")
-    ax_lr.set_ylabel("learning rate", color=ps.COLOR_GREEN)
+    ax_lr.set_ylabel("learning rate", color=ps.COLOR_GREEN, fontsize=7)
     ax_lr.tick_params(axis="y", colors=ps.COLOR_GREEN)
-    ax_gn.set_ylabel("gradient norm", color=ps.COLOR_PURPLE)
+    ax_gn.set_ylabel("gradient norm", color=ps.COLOR_PURPLE, fontsize=7)
     ax_gn.tick_params(axis="y", colors=ps.COLOR_PURPLE)
     ax_gn.grid(False)
     ps.style_axes(ax_lr)
@@ -352,11 +352,14 @@ def plot_training_curves(
     handles_lr, labels_lr = ax_lr.get_legend_handles_labels()
     handles_gn, labels_gn = ax_gn.get_legend_handles_labels()
     if handles_lr or handles_gn:
-        ax_lr.legend(handles_lr + handles_gn, labels_lr + labels_gn, loc="best")
+        # 'upper left' rather than 'best': 'best' tends to settle on the
+        # early-epoch grad-norm spike and cover it.
+        ax_lr.legend(handles_lr + handles_gn, labels_lr + labels_gn,
+                     loc="upper left", fontsize=6.5)
 
     fig.suptitle(
         f"Training curves -- {label}  (epoch {last_epoch})",
-        fontsize=ps.FONT_TITLE,
+        fontsize=ps.FONT_SUPTITLE,
     )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
 

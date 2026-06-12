@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import sys
 from pathlib import Path
@@ -1326,6 +1327,7 @@ def evaluate_mixed(
     holdout_tag: Optional[str] = None,
     ckpt_name: str = "final.ckpt",
     out_subdir: Optional[str] = None,
+    in_mix_light: bool = False,
 ) -> Dict[str, Any]:
     r"""Evaluate the ``G1_mix`` model per-group on in-mix + held-out caches.
 
@@ -1340,6 +1342,14 @@ def evaluate_mixed(
             ``mixed_eval_extrap_m64``) when evaluating several held-out /
             extrapolation caches against the same checkpoint, so each pass
             keeps its own artifacts instead of overwriting the previous one.
+        in_mix_light: When ``True``, restrict the in-mix cache to what the
+            held-out scoring actually needs -- the per-sample $\bar K$ pass,
+            the calibration fits and the per-cell recovery -- and skip the
+            expensive in-mix lag-recovery / prediction-gain / attention
+            diagnostics. Meant for the per-extrapolation-cache passes, whose
+            canonical in-mix artifacts already live in ``mixed_eval/``; the
+            figures guard on the missing diagnostics and the in-mix per-cell
+            rows simply carry ``nan`` lag / $\Delta\mathcal{L}$ fields.
 
     Returns:
         The full metrics dict (also written to ``metrics.json``).
@@ -1386,31 +1396,40 @@ def evaluate_mixed(
         arrs_in, cells_in, alpha=float(overall["alpha"]),
         gamma=float(overall["gamma"]), controls=controls,
     )
-    print("[mixed_eval] per-cell lag recovery (in-mix) ...")
-    lag_in = per_cell_lag_recovery(
-        model, ds_in, cells_in, cellids_in, device, horizon=horizon, T=T,
-        max_lag=max_lag, warmup=warmup, loss_settings=loss_settings,
-        eval_cfg={**eval_cfg, "batch_size": bs},
-    )
-    for row in rows_in:
-        lr = lag_in.get(row["cell_id"], {})
-        row["lag_mass_lolo"] = lr.get("lag_mass_lolo", float("nan"))
-        row["peak_lag_err"] = lr.get("peak_lag_err", float("nan"))
-    _attach_lag_profiles(arrs_in, lag_in, cells_in)
-    print("[mixed_eval] per-cell prediction gain (in-mix) ...")
-    _attach_pred_gain(
-        arrs_in, rows_in,
-        model, ds_in, cells_in, cellids_in, device, warmup=warmup,
-        horizon=horizon, loss_settings=loss_settings,
-        eval_cfg={**eval_cfg, "batch_size": bs},
-    )
-    print("[mixed_eval] per-cell attention LagMass / lag-walk (in-mix) ...")
-    _attach_attn_diag(
-        arrs_in, rows_in,
-        model, ds_in, cells_in, cellids_in, device, warmup=warmup,
-        horizon=horizon, T=T, max_lag=max_lag,
-        eval_cfg={**eval_cfg, "batch_size": bs}, do_lag_walk=do_lag_walk,
-    )
+    if in_mix_light:
+        # Per-extrap pass: the in-mix cache is only needed for the calibration
+        # that scores the held-out cells; the heavy in-mix diagnostics already
+        # live in the canonical mixed_eval/ artifacts.
+        print("[mixed_eval] in-mix diagnostics skipped (in_mix_light).")
+        for row in rows_in:
+            row["lag_mass_lolo"] = float("nan")
+            row["peak_lag_err"] = float("nan")
+    else:
+        print("[mixed_eval] per-cell lag recovery (in-mix) ...")
+        lag_in = per_cell_lag_recovery(
+            model, ds_in, cells_in, cellids_in, device, horizon=horizon, T=T,
+            max_lag=max_lag, warmup=warmup, loss_settings=loss_settings,
+            eval_cfg={**eval_cfg, "batch_size": bs},
+        )
+        for row in rows_in:
+            lr = lag_in.get(row["cell_id"], {})
+            row["lag_mass_lolo"] = lr.get("lag_mass_lolo", float("nan"))
+            row["peak_lag_err"] = lr.get("peak_lag_err", float("nan"))
+        _attach_lag_profiles(arrs_in, lag_in, cells_in)
+        print("[mixed_eval] per-cell prediction gain (in-mix) ...")
+        _attach_pred_gain(
+            arrs_in, rows_in,
+            model, ds_in, cells_in, cellids_in, device, warmup=warmup,
+            horizon=horizon, loss_settings=loss_settings,
+            eval_cfg={**eval_cfg, "batch_size": bs},
+        )
+        print("[mixed_eval] per-cell attention LagMass / lag-walk (in-mix) ...")
+        _attach_attn_diag(
+            arrs_in, rows_in,
+            model, ds_in, cells_in, cellids_in, device, warmup=warmup,
+            horizon=horizon, T=T, max_lag=max_lag,
+            eval_cfg={**eval_cfg, "batch_size": bs}, do_lag_walk=do_lag_walk,
+        )
 
     # --- held-out extrapolation ---------------------------------------------
     rows_ho: List[Dict[str, Any]] = []
@@ -1510,7 +1529,10 @@ def evaluate_mixed(
     }
 
     _write_per_cell_csv(out_dir / "per_cell.csv", rows_in, rows_ho, controls)
-    _write_per_sample_csv(out_dir / "per_sample.csv", arrs_in, controls)
+    _write_per_sample_csv(
+        out_dir / "per_sample.csv",
+        [("in_mix", arrs_in), ("holdout", arrs_ho)], controls,
+    )
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
     with open(out_dir / "calibration.json", "w", encoding="utf-8") as fh:
@@ -1522,7 +1544,10 @@ def evaluate_mixed(
     with open(out_dir / "generalization.json", "w", encoding="utf-8") as fh:
         json.dump(generalization, fh, indent=2)
 
-    _render_figures(out_dir, rows_in, rows_ho, arrs_in, slices_in, controls)
+    _render_figures(
+        out_dir, rows_in, rows_ho, arrs_in, slices_in, controls,
+        arrs_ho=arrs_ho, slices_nullsub=slices_in_nullsub,
+    )
 
     g = overall.get("gamma", float("nan"))
     a = overall.get("alpha", float("nan"))
@@ -1587,6 +1612,200 @@ def _generalization_gaps(
 # CSV / figure writers
 # =============================================================================
 
+# =============================================================================
+# Combined replot-only figures (CSV/JSON -> matplotlib, no checkpoint / GPU)
+# =============================================================================
+
+def render_combined_per_sample_scatter(
+    run_dir: Path,
+    *,
+    eval_subdirs: Optional[Sequence[str]] = None,
+    out_subdir: str = "combined_figures",
+) -> Optional[List[Path]]:
+    r"""Re-render the per-sample scatter suite pooled over **all** eval passes.
+
+    Reads ``per_sample.csv`` / ``per_cell.csv`` from the in-mix pass plus every
+    ``mixed_eval_extrap_m<M>`` pass and the in-mix ``calibration.json``, so all
+    $M$ colours (trained $\{8,16,32\}$ **and** extrapolation $\{4,64\}$) appear
+    in one figure. Pure CSV/JSON $\to$ matplotlib -- no checkpoint and no GPU,
+    so it re-runs on a laptop against copied result directories
+    (``python -m ...mixed_eval --combined-only --run-tag <tag>``).
+
+    Outputs under ``<run_dir>/<out_subdir>/``:
+
+    * ``per_sample_scatter_all`` -- the $2\times2$ raw + calibrated headline
+      (:func:`_render_scatter_2x2`; in-mix filled, interior holdout open
+      triangles, extrapolation open squares).
+    * ``per_sample_scatter_all_nullsub`` -- the null-subtracted pair (when the
+      shuffle columns exist).
+    * ``per_sample_kbar_ecdf_all`` -- the per-$M$ ECDF panels (all $M$).
+    * the ``evaluate_te``-style per-cell suite (``kbar_vs_te`` /
+      ``kbar_vs_B_y`` / ``predgap_vs_kbar`` / ``kbar_vs_te__byM``) pooled over
+      every cache (fixed evaluate_te filenames inside the combined directory).
+
+    Args:
+        run_dir: The run directory ``results/G1_mix/<run_tag>/``.
+        eval_subdirs: Eval pass subdirectories to pool; ``None`` auto-discovers
+            ``["mixed_eval"]`` plus every ``mixed_eval_extrap_m*`` directory
+            (numerically sorted). The first entry provides the in-mix split
+            and the calibration.
+        out_subdir: Output subdirectory name under ``run_dir``.
+
+    Returns:
+        The list of rendered figure path stems, or ``None`` when no
+        ``per_sample.csv`` was found.
+    """
+    run_dir = Path(run_dir)
+    if eval_subdirs is None:
+        extraps = sorted(
+            (d.name for d in run_dir.glob("mixed_eval_extrap_m*") if d.is_dir()),
+            key=lambda nm: int(nm.rsplit("m", 1)[-1])
+            if nm.rsplit("m", 1)[-1].isdigit() else 0,
+        )
+        eval_subdirs = ["mixed_eval"] + extraps
+    if not eval_subdirs:
+        return None
+    base_dir = run_dir / eval_subdirs[0]
+    base_csv = base_dir / "per_sample.csv"
+    if not base_csv.is_file():
+        print(f"[mixed_eval] combined figures skipped: no {base_csv}")
+        return None
+
+    # --- pool the per-sample frames (base keeps both splits; extrap passes
+    # contribute only their own holdout rows -- their in-mix rows duplicate
+    # the base file) -----------------------------------------------------------
+    base = _read_per_sample_csv(base_csv)
+    frames: List[Dict[str, np.ndarray]] = [base]
+    rows_all: List[Dict[str, Any]] = []
+    if (base_dir / "per_cell.csv").is_file():
+        rows_all.extend(_read_per_cell_csv(base_dir / "per_cell.csv"))
+    for sub in eval_subdirs[1:]:
+        csv_path = run_dir / sub / "per_sample.csv"
+        if not csv_path.is_file():
+            print(f"[mixed_eval][note] combined: missing {csv_path}, skipped.")
+            continue
+        arrs = _read_per_sample_csv(csv_path)
+        keep = np.asarray(arrs["split"]) == "holdout"
+        if not np.any(keep):
+            print(f"[mixed_eval][note] combined: {csv_path} has no holdout "
+                  f"rows (legacy format?) -- contributes nothing.")
+            continue
+        m_tok = sub.rsplit("m", 1)[-1]
+        label = f"extrap M={m_tok}" if m_tok.isdigit() else f"extrap {sub}"
+        sel = {k: np.asarray(v)[keep] for k, v in arrs.items()}
+        sel["split"] = np.asarray([label] * int(keep.sum()))
+        frames.append(sel)
+        cell_path = run_dir / sub / "per_cell.csv"
+        if cell_path.is_file():
+            rows_all.extend(r for r in _read_per_cell_csv(cell_path)
+                            if str(r.get("split", "")) == "holdout")
+
+    # Align every frame on the base columns (missing columns pad with nan).
+    samples: Dict[str, np.ndarray] = {}
+    for k in base:
+        parts: List[np.ndarray] = []
+        for fr in frames:
+            n = int(np.asarray(fr["kbar"]).shape[0])
+            if k in fr:
+                parts.append(np.asarray(fr[k]))
+            elif k == "split":
+                parts.append(np.asarray(["holdout"] * n))
+            else:
+                parts.append(np.full(n, np.nan))
+        samples[k] = np.concatenate(parts)
+
+    # --- calibration (pooled + per-M + nullsub) from the in-mix pass ----------
+    slices: Dict[str, Any] = {}
+    slices_ns: Dict[str, Any] = {}
+    cal_path = base_dir / "calibration.json"
+    if cal_path.is_file():
+        with open(cal_path, "r", encoding="utf-8") as fh:
+            cal = json.load(fh)
+        in_mix = cal.get("in_mix") or {}
+        overall = in_mix.get("overall") or {
+            "alpha": cal.get("alpha", 0.0), "gamma": cal.get("gamma", 1.0)}
+        slices = {"overall": overall, "by_M": in_mix.get("by_M") or {}}
+        slices_ns = cal.get("in_mix_nullsub") or {}
+    else:
+        print(f"[mixed_eval][note] combined: no {cal_path}; calibrated panels "
+              f"use a unit fit.")
+
+    out_dir = run_dir / out_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ps.apply_style()
+    written: List[Path] = []
+
+    def _try(name: str, fn) -> None:
+        """Render one combined figure defensively."""
+        try:
+            fn()
+            written.append(out_dir / name)
+        except Exception as exc:  # noqa: BLE001 -- replot must never abort
+            print(f"[mixed_eval] combined figure '{name}' skipped: {exc}")
+
+    in_sel = np.asarray(samples["split"]) == "in_mix"
+    samples_in = {k: np.asarray(v)[in_sel] for k, v in samples.items()
+                  if k != "split"}
+    rest_sel = ~in_sel
+    samples_rest = (
+        {k: np.asarray(v)[rest_sel] for k, v in samples.items() if k != "split"}
+        if np.any(rest_sel) else None
+    )
+    rows_in = [r for r in rows_all if not int(r.get("held_out", 0) or 0)]
+    rows_ho = [r for r in rows_all if int(r.get("held_out", 0) or 0)]
+
+    _try("per_sample_scatter_all", lambda: _render_scatter_2x2(
+        out_dir / "per_sample_scatter_all", samples, slices))
+    if "kbar_shuffle" in samples and slices_ns:
+        _try("per_sample_scatter_all_nullsub",
+             lambda: _fig_per_sample_nullsub(
+                 out_dir / "per_sample_scatter_all_nullsub", [], [],
+                 samples_in, {}, (), slices_nullsub=slices_ns))
+    _try("per_sample_kbar_ecdf_all", lambda: _fig_per_sample_ecdf(
+        out_dir / "per_sample_kbar_ecdf_all", rows_in, rows_ho, samples_in,
+        {}, (), arrs_ho=samples_rest))
+    if rows_all:
+        _try("evalte_suite", lambda: _fig_evalte_suite(
+            out_dir / "evalte_suite", rows_in, rows_ho, {}, slices, ()))
+    print(f"[mixed_eval] combined figures -> {out_dir} "
+          f"({len(written)} figure groups)")
+    return written or None
+
+
+def _read_per_cell_csv(path: Path) -> List[Dict[str, Any]]:
+    r"""Load a ``per_cell.csv`` back into per-cell row dicts.
+
+    Numeric fields are parsed to ``float`` (empty cells $\to$ ``nan``) with the
+    identity fields cast back to ``int``; ``band`` / ``split`` stay strings.
+
+    Args:
+        path: The CSV path.
+
+    Returns:
+        One dict per row, shaped like the :func:`group_recovery` rows.
+    """
+    int_fields = {"cell_id", "M", "delay_min", "delay_max", "n", "held_out"}
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", newline="", encoding="utf-8") as fh:
+        for raw in csv.DictReader(fh):
+            row: Dict[str, Any] = {}
+            for k, v in raw.items():
+                if k is None:
+                    continue
+                if k in ("band", "split"):
+                    row[k] = str(v or "")
+                    continue
+                try:
+                    num = float(v) if v not in (None, "") else float("nan")
+                except (TypeError, ValueError):
+                    row[k] = v
+                    continue
+                row[k] = (int(num) if k in int_fields and np.isfinite(num)
+                          else num)
+            rows.append(row)
+    return rows
+
+
 _BASE_CELL_FIELDS = [
     "split", "cell_id", "M", "target_te", "band", "delay_min", "delay_max",
     "B_y", "te_true", "n", "kbar_mean", "kbar_std", "te_pred_mean", "te_rmse",
@@ -1615,23 +1834,92 @@ def _write_per_cell_csv(
 
 
 def _write_per_sample_csv(
-    path: Path, arrs: Dict[str, np.ndarray], controls: Sequence[str],
+    path: Path,
+    splits: Sequence[Tuple[str, Dict[str, np.ndarray]]],
+    controls: Sequence[str],
 ) -> None:
-    """Write the in-mix per-sample table (cell id / M / band / kbar / te)."""
+    r"""Write the per-sample table (cell id / M / band / $\bar K$ / TE) for all splits.
+
+    One row per sample across every provided split, so post-hoc figures (the
+    combined per-sample scatter) can pool in-mix, held-out and extrapolation
+    samples without re-running the GPU eval. The legacy column order is kept
+    and the ``held_out`` / ``split`` columns are appended at the end.
+
+    Args:
+        path: Output CSV path.
+        splits: ``[(split_name, arrs), ...]`` pairs from
+            :func:`collect_per_sample_kbar`; entries without a ``kbar`` array
+            are skipped (e.g. an absent held-out cache).
+        controls: Null-control names whose ``kbar_<ctrl>`` columns to include
+            (missing arrays are written as ``nan``).
+    """
     fields = ["cell_id", "M", "band_id", "delay_max", "te_true", "kbar"]
     for ctrl in controls:
         fields.append(f"kbar_{ctrl}")
-    n = arrs["kbar"].shape[0]
+    fields += ["held_out", "split"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(fields)
-        for i in range(n):
-            writer.writerow([
-                int(arrs["cell_id"][i]), int(arrs["M"][i]),
-                int(arrs["band_id"][i]), int(arrs["delay_max"][i]),
-                float(arrs["te_true"][i]), float(arrs["kbar"][i]),
-                *[float(arrs[f"kbar_{c}"][i]) for c in controls],
-            ])
+        for split_name, arrs in splits:
+            if not arrs or "kbar" not in arrs:
+                continue
+            n = int(np.asarray(arrs["kbar"]).shape[0])
+            ctrl_cols = [
+                np.asarray(arrs.get(f"kbar_{c}", np.full(n, np.nan)), dtype=float)
+                for c in controls
+            ]
+            for i in range(n):
+                writer.writerow([
+                    int(arrs["cell_id"][i]), int(arrs["M"][i]),
+                    int(arrs["band_id"][i]), int(arrs["delay_max"][i]),
+                    float(arrs["te_true"][i]), float(arrs["kbar"][i]),
+                    *[float(col[i]) for col in ctrl_cols],
+                    int(arrs["held_out"][i]), str(split_name),
+                ])
+
+
+def _read_per_sample_csv(path: Path) -> Dict[str, np.ndarray]:
+    r"""Load a ``per_sample.csv`` back into aligned per-sample arrays.
+
+    The inverse of :func:`_write_per_sample_csv`, used by the replot-only
+    combined renderer (:func:`render_combined_per_sample_scatter`). Tolerates
+    **legacy** files written before the ``held_out`` / ``split`` columns
+    existed: all rows are then treated as ``split="in_mix"``, ``held_out=0``.
+
+    Args:
+        path: The CSV path.
+
+    Returns:
+        A dict of aligned arrays with the :func:`collect_per_sample_kbar` flat
+        keys (``kbar`` / ``te_true`` / ``M`` / ``band_id`` / ``cell_id`` /
+        ``delay_max`` / ``held_out`` plus any ``kbar_<ctrl>`` columns present)
+        and a ``split`` string array.
+    """
+    cols: Dict[str, List[str]] = {}
+    with open(path, "r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            for k, v in row.items():
+                if k is not None:
+                    cols.setdefault(k, []).append(v if v is not None else "")
+    n = len(next(iter(cols.values()), []))
+    int_cols = {"cell_id", "M", "band_id", "delay_max", "held_out"}
+    out: Dict[str, np.ndarray] = {}
+    for k, vals in cols.items():
+        if k == "split":
+            out[k] = np.asarray([v or "in_mix" for v in vals], dtype=str)
+        elif k in int_cols:
+            out[k] = np.asarray([int(float(v)) for v in vals], dtype=int)
+        else:
+            out[k] = np.asarray(
+                [float(v) if v != "" else float("nan") for v in vals],
+                dtype=float,
+            )
+    if "held_out" not in out:
+        out["held_out"] = np.zeros(n, dtype=int)
+    if "split" not in out:
+        out["split"] = np.asarray(["in_mix"] * n, dtype=str)
+    return out
 
 
 # Shared semantic maps (one source of truth in plot_style) so mixed_eval and
@@ -1641,20 +1929,22 @@ _M_COLORS = ps.M_COLORS
 _BAND_MARKERS = ps.BAND_MARKERS
 
 
-def _caption(fig, text: str) -> None:
+def _caption(fig, text: str, *, note: Optional[str] = None,
+             note_color: Optional[str] = None) -> None:
     r"""Add an italic "how to read this" caption beneath a figure.
 
-    Placed just below the figure box (figure $y<0$) so it never overlaps the
-    axes; :func:`plot_style.save_figure` writes with a tight bounding box, which
-    captures the caption. Keep ``text`` to roughly one line in the form
-    "what is plotted -- what good looks like".
+    Thin wrapper over :func:`plot_style.add_caption`, which pre-wraps the text
+    and stacks the optional ``note`` *below* the caption with exact line-height
+    math, so the two figure texts can never collide. Keep ``text`` to roughly
+    one line in the form "what is plotted -- what good looks like".
 
     Args:
         fig: The figure to annotate.
-        text: The caption string (plain text; ``wrap`` re-flows long lines).
+        text: The caption string (plain text; wrapped automatically).
+        note: Optional upright warning / interpretation line below the caption.
+        note_color: Colour for ``note``.
     """
-    fig.text(0.5, -0.015, text, ha="center", va="top", fontsize=7.0,
-             color=ps.COLOR_GRAY, style="italic", wrap=True)
+    ps.add_caption(fig, text, note=note, note_color=note_color)
 
 
 def _render_figures(
@@ -1664,11 +1954,27 @@ def _render_figures(
     arrs: Dict[str, np.ndarray],
     slices: Dict[str, Any],
     controls: Sequence[str],
+    *,
+    arrs_ho: Optional[Dict[str, np.ndarray]] = None,
+    slices_nullsub: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Render the per-group / generalization figures (defensive).
+    r"""Render the per-group / generalization figures (defensive).
 
     Each figure is wrapped so a plotting failure never aborts the eval (the
     JSON / CSV artifacts are the source of truth).
+
+    Args:
+        out_dir: Output directory for the figure files.
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out / extrapolation per-cell rows.
+        arrs: In-mix per-sample arrays from :func:`collect_per_sample_kbar`.
+        slices: In-mix calibration slices (``overall`` / ``by_M`` / ``by_band``).
+        controls: Null-control names collected into ``arrs``.
+        arrs_ho: Optional held-out per-sample arrays (the per-sample scatter
+            suite overlays them as open markers).
+        slices_nullsub: Optional null-subtracted calibration slices
+            (:func:`fit_calibration_slices_nullsub`), used by the
+            null-subtracted per-sample figure.
     """
     ps.apply_style()
     for name, fn in (
@@ -1681,6 +1987,23 @@ def _render_figures(
         ("calibration_health", _fig_calibration_health),
         ("te_recovery_percell", _fig_te_recovery_percell),
         ("prior_mismatch", _fig_prior_mismatch),
+        # Per-SAMPLE KLD-vs-TE scatter suite (every test sample, raw +
+        # calibrated; in-mix cloud + held-out / extrapolation overlays).
+        ("per_sample_scatter", functools.partial(
+            _fig_per_sample_scatter, arrs_ho=arrs_ho)),
+        ("per_sample_nullsub", functools.partial(
+            _fig_per_sample_nullsub, slices_nullsub=slices_nullsub)),
+        ("per_sample_te_error", functools.partial(
+            _fig_per_sample_te_error, arrs_ho=arrs_ho)),
+        ("per_sample_kbar_ecdf", functools.partial(
+            _fig_per_sample_ecdf, arrs_ho=arrs_ho)),
+        ("per_sample_null_scatter", functools.partial(
+            _fig_per_sample_null_scatter, arrs_ho=arrs_ho)),
+        # evaluate_te-style cross-cell suite (kbar_vs_te / kbar_vs_B_y /
+        # predgap_vs_kbar / kbar_vs_te__byM, reusing evaluate_te's renderers).
+        ("evalte_suite", _fig_evalte_suite),
+        ("per_dim_kl_by_cell", _fig_per_dim_kl_by_cell_heatmap),
+        ("null_control_bars", _fig_null_control_bars),
         # Prediction gain (decoder pass)
         ("pred_gain_vs_te", _fig_pred_gain_vs_te),
         ("pred_gain_vs_kbar", _fig_pred_gain_vs_kbar),
@@ -1828,27 +2151,27 @@ def _fig_kld_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None:
                        frameon=False)
 
     alpha, gamma = _overall_fit(slices)
-    sup = r"Master KLD-vs-TE  (rows $= M$, cols $=$ lag-band)"
-    if np.isfinite(gamma):
-        sup += fr"  —  overall $\gamma$={gamma:.1f}, $\alpha$={alpha:.2f}"
-    fig.suptitle(sup, fontsize=11)
-    fig.subplots_adjust(top=0.93, hspace=0.22, wspace=0.08)
+    fig.suptitle(r"Master KLD-vs-TE  (rows $= M$, cols $=$ lag-band)",
+                 fontsize=ps.FONT_SUPTITLE)
+    fig.subplots_adjust(top=0.94, hspace=0.22, wspace=0.08)
 
     dz = _dz_from(arrs)
-    dz_txt = (f"$\\bar K$ is summed over $d_z$={dz} latent dims "
-              f"(≈ $d_z$ × loss-side kld_loss).  " if dz else
-              r"$\bar K$ is summed over the latent dims.  ")
-    banner = (dz_txt + r"$\gamma \gg 1$ means the bottleneck is under-regularised "
-              r"at this $\beta$; $\gamma \to 1$ ($\bar K \approx \mathrm{TE}$) needs "
-              r"$\beta$-selection (mixed_calibration).")
+    dz_txt = (f"K-bar is summed over d_z={dz} latent dims "
+              f"(~ d_z x loss-side kld_loss).  " if dz else
+              "K-bar is summed over the latent dims.  ")
+    fit_txt = (f"Overall gamma={gamma:.1f}, alpha={alpha:.2f}.  "
+               if np.isfinite(gamma) else "")
+    banner = (dz_txt + fit_txt +
+              "gamma >> 1 means the bottleneck is under-regularised at this "
+              "beta; gamma -> 1 (K-bar ~ TE) needs beta-selection "
+              "(mixed_calibration).")
     banner_color = (ps.COLOR_VERMILLION if np.isfinite(gamma) and gamma > 1.5
                     else ps.COLOR_GRAY)
-    fig.text(0.5, -0.045, banner, ha="center", va="top", fontsize=7.5,
-             color=banner_color, wrap=True)
     _caption(fig, "Per-cell mean K-bar (points, +-std) over the faint per-sample "
                   "cloud, vs true block TE; rows = M, cols = band, each row on "
                   "its own K-bar scale, no y=x. Good: monotone rise with TE and a "
-                  "consistent per-panel gamma across bands.")
+                  "consistent per-panel gamma across bands.",
+             note=banner, note_color=banner_color)
     ps.save_figure(fig, path)
 
 
@@ -1927,15 +2250,22 @@ def _fig_kld_vs_te_overview(path, rows_in, rows_ho, arrs, slices, controls) -> N
                     f"Spearman $\\rho$ = {st.get('spearman', float('nan')):.3f}\n"
                     f"MI = {st.get('mi', float('nan')):.3f} nats\n"
                     f"$R^2$ = {st.get('r2', float('nan')):.3f}",
-                    transform=ax.transAxes, va="top", ha="left", fontsize=8,
+                    transform=ax.transAxes, va="top", ha="left", fontsize=6.5,
                     bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
                               alpha=0.85))
-        ax.legend(handles=ref_handles + _cell_legend_handles(all_rows),
-                  fontsize=7, loc="lower right", frameon=False, ncol=2)
+        # Per-axes legend keeps only the reference lines; the (larger) shared
+        # M-colour / band-marker key moves to one figure-level legend below.
+        if ref_handles:
+            ax.legend(handles=ref_handles, fontsize=6.5, loc="lower right",
+                      frameon=False)
         ps.style_axes(ax)
     for r in all_rows:
         r.pop("_kbar_scaled", None)
-    fig.suptitle("KLD vs TE on both scales (per cell)", fontsize=11)
+    fig.subplots_adjust(bottom=0.17)
+    fig.legend(handles=_cell_legend_handles(all_rows), loc="lower center",
+               ncol=8, fontsize=6.5, frameon=False,
+               bbox_to_anchor=(0.5, 0.01))
+    fig.suptitle("KLD vs TE on both scales (per cell)", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Same per-cell points on two y-scales: dim-summed nats (left, "
                   "the TE unit) and per-dim K-bar/d_z (right, the loss-side "
                   "scale). The per-dim panel only looks closer to TE because of "
@@ -2036,7 +2366,7 @@ def _fig_calibration_health(path, rows_in, rows_ho, arrs, slices, controls) -> N
     if im is not None:
         ps.add_colorbar(fig, im, axes[0][-1],
                         label=r"local $\gamma=\bar K/\mathrm{TE}$")
-    fig.suptitle(r"Calibration health ($\gamma \to 1$ = calibrated)", fontsize=11)
+    fig.suptitle(r"Calibration health ($\gamma \to 1$ = calibrated)", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Left: per-M slope gamma_M vs the |gamma-1|<=0.2 target band "
                   "(log-y when gamma>>1). Right: local gamma = K-bar/TE per cell "
                   "(TE>0); white = calibrated, red = under-regularised. gamma->1 "
@@ -2218,7 +2548,7 @@ def _fig_lag_recovery(path, rows_in, rows_ho, arrs, slices, controls) -> None:
             ax.set_ylabel("M")
         ax.set_title(f"LagMass | band={band}", fontsize=8)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle(r"Sliding-window LOLO lag mass in $\mathcal{L}^\star$", fontsize=11)
+    fig.suptitle(r"Sliding-window LOLO lag mass in $\mathcal{L}^\star$", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Leave-one-lag-out importance mass inside the true lag band "
                   "(0-1), as an M x TE heatmap per band. Good: near 1 -- ablating "
                   "in-band source lags hurts the forecast most.")
@@ -2253,7 +2583,7 @@ def _fig_generalization(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.set_title(title, fontsize=9)
         ax.legend(fontsize=7, frameon=False)
         ps.style_axes(ax)
-    fig.suptitle("Held-out extrapolation gap", fontsize=11)
+    fig.suptitle("Held-out extrapolation gap", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Held-out cells (vermillion) vs the trained-M-mean reference "
                   "(gray) for TE-RMSE and lag-mass. Good: held-out markers close "
                   "to the reference -- interpolates to unseen (M,TE,band).")
@@ -2296,7 +2626,7 @@ def _fig_null_controls(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.legend(fontsize=7, loc="upper left", frameon=False)
         ps.style_axes(ax)
     fig.suptitle("Null controls: source corruption should collapse $\\bar K$",
-                 fontsize=11)
+                 fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Clean K-bar (x) vs source-corrupted K-bar (y) per cell, one "
                   "panel per control; dashed y=x = no collapse. Good: points far "
                   "below y=x (median ratio << 1) -- corruption destroys the signal.")
@@ -2487,14 +2817,941 @@ def _fig_te_recovery_percell(path, rows_in, rows_ho, arrs, slices, controls) -> 
     ax.text(0.03, 0.97,
             f"RMSE = {rmse:.3f} nats\nbias = {bias:+.3f} nats\n"
             f"$\\gamma$ = {gamma:.2f}, $\\alpha$ = {alpha:.2f}",
-            transform=ax.transAxes, va="top", ha="left", fontsize=8,
+            transform=ax.transAxes, va="top", ha="left", fontsize=6.5,
             bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY, alpha=0.85))
-    ax.legend(handles=_cell_legend_handles(all_rows), fontsize=7,
+    ax.legend(handles=_cell_legend_handles(all_rows), fontsize=6.5,
               loc="lower right", frameon=False, ncol=2)
     ps.style_axes(ax)
     ps.save_figure(fig, path)
     for r in all_rows:
         r.pop("_te_pred", None)
+
+
+# =============================================================================
+# Per-SAMPLE KLD-vs-TE scatter suite
+# =============================================================================
+# Every test sample as one point (not per-cell aggregates): the raw / calibrated
+# per-sample views requested by model_validation_v3_mixed. A hexbin density
+# variant was considered and rejected -- colour already encodes M, so the
+# alpha-blended cloud plus the log-y panel handles density without losing the
+# M map.
+
+# Marker class per split: 0 = in-mix (filled dot), 1 = interior holdout (open
+# triangle), 2 = M-extrapolation (open square).
+_SPLIT_MARKERS = {0: ("o", True), 1: ("^", False), 2: ("s", False)}
+_SPLIT_LABELS = {0: "in-mix", 1: "held-out", 2: "extrap"}
+
+
+def _per_m_fits(slices: Dict[str, Any]) -> Dict[int, Dict[str, float]]:
+    r"""Extract the finite per-$M$ $(\alpha_M, \gamma_M)$ fits from a slices dict.
+
+    Args:
+        slices: A :func:`fit_calibration_slices` output.
+
+    Returns:
+        ``{M -> fit}`` keeping only fits with a finite $\gamma_M$.
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    for m, fit in ((slices or {}).get("by_M", {}) or {}).items():
+        if isinstance(fit, dict) and np.isfinite(fit.get("gamma", float("nan"))):
+            out[int(m)] = fit
+    return out
+
+
+def _te_jitter(te: np.ndarray, *, frac: float = 0.18, seed: int = 0) -> np.ndarray:
+    r"""Horizontal jitter over the discrete true-TE levels.
+
+    The pool's true TE takes a handful of discrete values (one per cell), so an
+    un-jittered per-sample scatter collapses into vertical lines. The jitter
+    width is ``frac`` of the smallest gap between distinct TE levels, matching
+    the master-grid cloud.
+
+    Args:
+        te: Per-sample true TE $(N,)$.
+        frac: Jitter span as a fraction of the smallest TE-level gap.
+        seed: RNG seed (fixed so every panel of a figure shares one draw).
+
+    Returns:
+        The jitter offsets $(N,)$.
+    """
+    te = np.asarray(te, dtype=float)
+    if te.size == 0:
+        return np.zeros(0)
+    levels = np.array(sorted(set(np.round(te, 6).tolist())), dtype=float)
+    span = float(np.min(np.diff(levels))) if levels.size > 1 else 1.0
+    rng = np.random.default_rng(seed)
+    return (rng.random(te.size) - 0.5) * frac * span
+
+
+def _merge_sample_arrays(
+    arrs: Dict[str, Any],
+    arrs_ho: Optional[Dict[str, Any]] = None,
+) -> Dict[str, np.ndarray]:
+    r"""Concatenate in-mix and held-out per-sample arrays with split labels.
+
+    Args:
+        arrs: In-mix per-sample arrays (must carry ``kbar``).
+        arrs_ho: Optional held-out / extrapolation arrays from the same
+            :func:`collect_per_sample_kbar` call signature.
+
+    Returns:
+        Aligned flat arrays plus a ``split`` string array
+        (``in_mix`` / ``holdout``). Keys missing on the held-out side are
+        padded with ``nan`` so every array stays aligned.
+    """
+    flat_keys = [
+        k for k in ("kbar", "te_true", "M", "band_id", "cell_id",
+                    "delay_max", "held_out")
+        if k in arrs
+    ] + [k for k in arrs if k.startswith("kbar_")]
+    ho = arrs_ho or {}
+    ho_ok = "kbar" in ho
+    n_ho = int(np.asarray(ho["kbar"]).shape[0]) if ho_ok else 0
+    out: Dict[str, np.ndarray] = {}
+    for k in flat_keys:
+        a = np.asarray(arrs[k])
+        if ho_ok:
+            b = np.asarray(ho[k]) if k in ho else np.full(n_ho, np.nan)
+            out[k] = np.concatenate([a, b])
+        else:
+            out[k] = a
+    n_in = int(np.asarray(arrs["kbar"]).shape[0])
+    out["split"] = np.asarray(["in_mix"] * n_in + ["holdout"] * n_ho)
+    return out
+
+
+def _split_marker_class(split: np.ndarray) -> np.ndarray:
+    r"""Map split labels onto the :data:`_SPLIT_MARKERS` marker classes.
+
+    Args:
+        split: Per-sample split labels (``in_mix`` / ``holdout`` /
+            ``extrap M=<m>`` from the combined renderer).
+
+    Returns:
+        Integer classes $(N,)$: 0 in-mix, 1 holdout, 2 extrapolation.
+    """
+    out = np.zeros(len(split), dtype=int)
+    for i, s in enumerate(split):
+        label = str(s)
+        if "extrap" in label:
+            out[i] = 2
+        elif label not in ("in_mix", "in-mix"):
+            out[i] = 1
+    return out
+
+
+def _scatter_per_sample_panel(
+    ax: Any,
+    samples: Dict[str, np.ndarray],
+    *,
+    y: np.ndarray,
+    jitter: np.ndarray,
+    fits: Optional[Dict[int, Dict[str, float]]] = None,
+    pooled_fit: Optional[Dict[str, float]] = None,
+    identity: bool = False,
+    logy: bool = False,
+) -> None:
+    r"""Draw one per-sample cloud panel (the shared core of the scatter suite).
+
+    Renders the jittered per-sample cloud coloured by $M$ -- filled dots for
+    in-mix samples, open triangles / squares for held-out / extrapolation
+    samples drawn on top -- plus optional per-$M$ OLS lines, a pooled dashed
+    black line, and a $y=x$ identity reference with equalised limits. The
+    clouds are ``rasterized`` so a $>10^4$-point figure stays a small PDF with
+    vector text.
+
+    Args:
+        ax: Target axes.
+        samples: Aligned per-sample arrays carrying ``te_true`` / ``M`` /
+            ``split``.
+        y: Per-sample y values aligned with ``samples`` (raw $\bar K$, a
+            calibrated $\widehat{\mathrm{TE}}$, or a null-subtracted response).
+        jitter: Pre-computed horizontal jitter (one draw shared by every panel
+            of the figure).
+        fits: Optional ``{M -> fit}`` drawn as thin lines in the $M$ colour.
+        pooled_fit: Optional pooled fit drawn as a dashed black line.
+        identity: Draw $y=x$ and equalise the limits (both axes in TE nats);
+            limits are clipped to the $[0.5, 99.5]$ y-percentiles so a few
+            extreme samples cannot crush the panel.
+        logy: Use a log y scale; non-positive values are masked out (a true
+            KL is non-negative -- they only arise in synthetic tests) so a
+            stray floored point cannot stretch the axis by orders of magnitude.
+    """
+    te = np.asarray(samples["te_true"], dtype=float)
+    m_arr = np.asarray(samples["M"], dtype=int)
+    split = np.asarray(samples.get("split", np.asarray(["in_mix"] * te.size)))
+    mclass = _split_marker_class(split)
+    yv = np.asarray(y, dtype=float)
+    if logy:
+        yv = np.where(yv > 0, yv, np.nan)
+    for cls, (marker, filled) in _SPLIT_MARKERS.items():
+        cls_sel = mclass == cls
+        if not np.any(cls_sel):
+            continue
+        for m in sorted(set(m_arr[cls_sel].tolist())):
+            sel = cls_sel & (m_arr == m)
+            color = ps.color_for_M(m)
+            if filled:
+                ax.scatter(te[sel] + jitter[sel], yv[sel], s=4, alpha=0.20,
+                           linewidths=0.0, color=color, rasterized=True,
+                           zorder=1)
+            else:
+                ax.scatter(te[sel] + jitter[sel], yv[sel], s=9, marker=marker,
+                           facecolors="none", edgecolors=color, linewidths=0.4,
+                           alpha=0.45, rasterized=True, zorder=2)
+    finite_te = te[np.isfinite(te)]
+    te_hi = (float(finite_te.max()) * 1.05 + 1e-6) if finite_te.size else 1.0
+    xs = np.linspace(0.0, te_hi, 50)
+    for m, fit in sorted((fits or {}).items()):
+        if fit and np.isfinite(fit.get("gamma", float("nan"))):
+            ax.plot(xs, fit["alpha"] + fit["gamma"] * xs,
+                    color=ps.color_for_M(m), lw=1.0, alpha=0.9, zorder=3)
+    if pooled_fit and np.isfinite(pooled_fit.get("gamma", float("nan"))):
+        ax.plot(xs, pooled_fit["alpha"] + pooled_fit["gamma"] * xs,
+                ls="--", lw=1.2, color=ps.COLOR_BLACK, zorder=4)
+    if logy:
+        ax.set_yscale("log")
+    if identity:
+        fy = yv[np.isfinite(yv)]
+        hi = te_hi
+        lo = -0.12
+        if fy.size:
+            hi = max(hi, float(np.percentile(fy, 99.5)))
+            lo = min(lo, float(np.percentile(fy, 0.5)))
+        ax.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY,
+                zorder=2)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+    ps.style_axes(ax)
+
+
+def _per_sample_legend_handles(
+    samples: Dict[str, np.ndarray],
+    *,
+    with_fit_lines: bool = True,
+    identity: bool = False,
+):
+    r"""Figure-level legend handles for the per-sample scatter suite.
+
+    Args:
+        samples: The merged per-sample arrays (reads ``M`` / ``split``).
+        with_fit_lines: Include the per-$M$ / pooled OLS line entries.
+        identity: Include the $y=x$ entry.
+
+    Returns:
+        A list of proxy ``Line2D`` handles.
+    """
+    from matplotlib.lines import Line2D
+
+    m_arr = np.asarray(samples["M"], dtype=int)
+    mclass = _split_marker_class(np.asarray(samples.get("split", [])))
+    handles = [
+        Line2D([0], [0], marker="o", ls="", color=ps.color_for_M(m),
+               label=f"M={m}")
+        for m in sorted(set(m_arr.tolist()))
+    ]
+    for cls in (1, 2):
+        if np.any(mclass == cls):
+            marker, _ = _SPLIT_MARKERS[cls]
+            handles.append(Line2D(
+                [0], [0], marker=marker, ls="", color=ps.COLOR_GRAY,
+                markerfacecolor="none", label=_SPLIT_LABELS[cls]))
+    if with_fit_lines:
+        handles.append(Line2D([0], [0], ls="-", lw=1.0, color=ps.COLOR_GRAY,
+                              label="per-M OLS"))
+        handles.append(Line2D([0], [0], ls="--", lw=1.2, color=ps.COLOR_BLACK,
+                              label="pooled OLS"))
+    if identity:
+        handles.append(Line2D([0], [0], ls="--", lw=1.0, color=ps.COLOR_GRAY,
+                              label=r"$y=x$"))
+    return handles
+
+
+def _fig_per_sample_scatter(
+    path, rows_in, rows_ho, arrs, slices, controls, *, arrs_ho=None,
+) -> None:
+    r"""Headline per-sample $\bar K$ vs true TE -- raw and calibrated, $2\times2$.
+
+    Every test sample is one point (colour $= M$, jittered over the discrete
+    TE levels; held-out / extrapolation samples as open markers on top):
+
+    * **(0,0) raw, linear** -- $\bar K$ in dim-summed nats with the per-$M$ and
+      pooled OLS lines; a secondary right axis shows the same points on the
+      loss-side per-dim scale $\bar K / d_z$ (a pure linear rescale -- the
+      ``kld_loss`` unit).
+    * **(0,1) raw, log-y** -- keeps small-$M$ and large-$M$ clouds readable at
+      once when $\bar K$ spans orders of magnitude.
+    * **(1,0) pooled-calibrated** -- $\widehat{\mathrm{TE}} = (\bar K -
+      \alpha)/\gamma$ with the overall fit, against $y=x$. Residual per-$M$
+      banding here *is* the per-$M$ miscalibration.
+    * **(1,1) per-$M$-calibrated** -- each sample uses its own
+      $(\alpha_M, \gamma_M)$; samples whose $M$ has no in-mix fit (the
+      extrapolation caches) fall back to the pooled fit (flagged ``*`` in the
+      RMSE block).
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (unused; signature parity).
+        rows_ho: Held-out per-cell rows (unused; signature parity).
+        arrs: In-mix per-sample arrays.
+        slices: In-mix calibration slices.
+        controls: Null-control names (unused; signature parity).
+        arrs_ho: Optional held-out / extrapolation per-sample arrays.
+    """
+    samples = _merge_sample_arrays(arrs, arrs_ho)
+    if np.asarray(samples.get("kbar", np.zeros(0))).size == 0:
+        return
+    _render_scatter_2x2(path, samples, slices, dz=_dz_from(arrs))
+
+
+def _render_scatter_2x2(
+    path,
+    samples: Dict[str, np.ndarray],
+    slices: Dict[str, Any],
+    *,
+    dz: Optional[int] = None,
+) -> None:
+    r"""Core renderer of the $2\times2$ per-sample scatter (samples-level API).
+
+    Shared by :func:`_fig_per_sample_scatter` (one eval pass) and
+    :func:`render_combined_per_sample_scatter` (CSV-pooled across passes, where
+    ``samples['split']`` carries richer labels like ``extrap M=4``).
+
+    Args:
+        path: Output path stem.
+        samples: Aligned per-sample arrays (``kbar`` / ``te_true`` / ``M`` /
+            ``split``).
+        slices: Calibration slices providing the pooled and per-$M$ fits.
+        dz: Latent dimensionality for the loss-side $\bar K/d_z$ twin scale;
+            ``None`` omits the secondary axis (e.g. the CSV replot path, where
+            $d_z$ is not recorded).
+    """
+    import matplotlib.pyplot as plt
+
+    kb = np.asarray(samples.get("kbar", np.zeros(0)), dtype=float)
+    if kb.size == 0:
+        return
+    te = np.asarray(samples["te_true"], dtype=float)
+    m_arr = np.asarray(samples["M"], dtype=int)
+    in_sel = np.asarray(samples["split"]) == "in_mix"
+    jitter = _te_jitter(te)
+    per_m = _per_m_fits(slices)
+    pooled = (slices or {}).get("overall") or {}
+    alpha, gamma = _overall_fit(slices)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.0, 8.4))
+    fig.subplots_adjust(top=0.92, bottom=0.13, hspace=0.30, wspace=0.26)
+
+    # --- (0,0) raw, linear, with the loss-side K/dz twin scale --------------
+    ax = axes[0][0]
+    _scatter_per_sample_panel(ax, samples, y=kb, jitter=jitter,
+                              fits=per_m, pooled_fit=pooled)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"mean latent KL  $\bar K$  (nats, summed over $d_z$)")
+    ax.set_title("raw, linear", fontsize=8)
+    gtxt = "\n".join(
+        fr"$\gamma_{{M={m}}}$={fit['gamma']:.1f}"
+        for m, fit in sorted(per_m.items())
+    )
+    if np.isfinite(gamma):
+        gtxt = (gtxt + "\n" if gtxt else "") + fr"$\gamma$={gamma:.1f} (pooled)"
+    if gtxt:
+        ax.text(0.02, 0.98, gtxt, transform=ax.transAxes, va="top", ha="left",
+                fontsize=6, color=ps.COLOR_BLACK)
+    if dz:
+        sec = ax.secondary_yaxis(
+            "right", functions=(lambda v: v / dz, lambda v: v * dz))
+        sec.set_ylabel(fr"$\bar K/d_z$  (loss-side, $d_z$={dz})", fontsize=7)
+        sec.tick_params(labelsize=6)
+
+    # --- (0,1) raw, log-y ----------------------------------------------------
+    ax = axes[0][1]
+    _scatter_per_sample_panel(ax, samples, y=kb, jitter=jitter,
+                              fits=per_m, pooled_fit=pooled, logy=True)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"$\bar K$  (nats, log scale)")
+    ax.set_title("raw, log-y", fontsize=8)
+
+    # --- (1,0) pooled-calibrated ---------------------------------------------
+    ax = axes[1][0]
+    te_hat = (kb - alpha) / gamma if np.isfinite(gamma) else np.full_like(kb, np.nan)
+    _scatter_per_sample_panel(ax, samples, y=te_hat, jitter=jitter,
+                              identity=True)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"$\widehat{\mathrm{TE}} = (\bar K-\alpha)/\gamma$  (nats)")
+    ax.set_title("calibrated (pooled fit)", fontsize=8)
+    err = te_hat[in_sel] - te[in_sel]
+    err = err[np.isfinite(err)]
+    if err.size:
+        ax.text(0.02, 0.98,
+                f"RMSE = {float(np.sqrt(np.mean(err ** 2))):.3f} nats\n"
+                f"bias = {float(np.mean(err)):+.3f} nats\n"
+                fr"$\gamma$={gamma:.2f}, $\alpha$={alpha:.2f}",
+                transform=ax.transAxes, va="top", ha="left", fontsize=6.5,
+                bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
+                          alpha=0.85))
+
+    # --- (1,1) per-M-calibrated ----------------------------------------------
+    ax = axes[1][1]
+    te_hat_m = np.full_like(kb, np.nan)
+    rmse_lines: List[str] = []
+    for m in sorted(set(m_arr.tolist())):
+        sel = m_arr == m
+        fit = per_m.get(m)
+        fallback = fit is None
+        use = pooled if fallback else fit
+        g_m = float(use.get("gamma", float("nan")))
+        a_m = float(use.get("alpha", float("nan")))
+        if not np.isfinite(g_m) or abs(g_m) <= 1e-12:
+            continue
+        te_hat_m[sel] = (kb[sel] - a_m) / g_m
+        err_m = te_hat_m[sel & in_sel] - te[sel & in_sel]
+        err_m = err_m[np.isfinite(err_m)]
+        if err_m.size:
+            star = "*" if fallback else ""
+            rmse_lines.append(
+                f"M={m}{star}: RMSE={float(np.sqrt(np.mean(err_m ** 2))):.3f}")
+    _scatter_per_sample_panel(ax, samples, y=te_hat_m, jitter=jitter,
+                              identity=True)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"$\widehat{\mathrm{TE}} = (\bar K-\alpha_M)/\gamma_M$  (nats)")
+    ax.set_title("calibrated (per-M fits)", fontsize=8)
+    if rmse_lines:
+        ax.text(0.02, 0.98, "\n".join(rmse_lines) +
+                ("\n* pooled fallback" if any("*" in s for s in rmse_lines)
+                 else ""),
+                transform=ax.transAxes, va="top", ha="left", fontsize=6,
+                bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
+                          alpha=0.85))
+
+    handles = _per_sample_legend_handles(samples, identity=True)
+    fig.legend(handles=handles, loc="lower center",
+               ncol=min(8, len(handles)), fontsize=6.5, frameon=False,
+               bbox_to_anchor=(0.5, 0.045))
+    fig.suptitle(r"Per-sample $\bar K$ vs true TE -- raw and calibrated",
+                 fontsize=ps.FONT_SUPTITLE)
+    _caption(fig, "Every test sample (jittered x, colour = M; open markers = "
+                  "held-out / extrapolation). Top: raw K-bar, linear and log, "
+                  "with per-M and pooled OLS lines (right axis of the linear "
+                  "panel = loss-side K-bar/d_z). Bottom: calibrated TE-hat vs "
+                  "y=x, pooled (left) and per-M (right). Good: clouds straddle "
+                  "y=x with no per-M banding.")
+    ps.save_figure(fig, path)
+
+
+def _fig_per_sample_nullsub(
+    path, rows_in, rows_ho, arrs, slices, controls, *, slices_nullsub=None,
+) -> None:
+    r"""Per-sample **null-subtracted** response vs TE, raw and calibrated.
+
+    The response $\bar K - \bar K_{\text{shuffle}}$ removes the prior-mismatch
+    floor sample-wise (the shuffle destroys the directed term but keeps the
+    floor), so the calibrated panel checks the intercept-is-floor identity:
+    $\alpha_{\text{ns}} \to 0$ with $\gamma$ unchanged
+    (``model_validation_v3_mixed`` §2).
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (unused; signature parity).
+        rows_ho: Held-out per-cell rows (unused; signature parity).
+        arrs: In-mix per-sample arrays (must carry ``kbar_shuffle``).
+        slices: In-mix calibration slices (unused; signature parity).
+        controls: Null-control names (unused; signature parity).
+        slices_nullsub: The :func:`fit_calibration_slices_nullsub` output.
+    """
+    import matplotlib.pyplot as plt
+
+    if "kbar_shuffle" not in arrs or not slices_nullsub:
+        return
+    a_ns, g_ns = _overall_fit(slices_nullsub)
+    if not np.isfinite(g_ns):
+        return
+    kb = np.asarray(arrs["kbar"], dtype=float)
+    resp = kb - np.asarray(arrs["kbar_shuffle"], dtype=float)
+    te = np.asarray(arrs["te_true"], dtype=float)
+    samples = _merge_sample_arrays(arrs)
+    jitter = _te_jitter(te)
+    per_m_ns = _per_m_fits(slices_nullsub)
+    pooled_ns = (slices_nullsub or {}).get("overall") or {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.4))
+    fig.subplots_adjust(bottom=0.20, wspace=0.26, top=0.88)
+
+    ax = axes[0]
+    _scatter_per_sample_panel(ax, samples, y=resp, jitter=jitter,
+                              fits=per_m_ns, pooled_fit=pooled_ns)
+    ax.axhline(0.0, ls=":", lw=0.9, color=ps.COLOR_GRAY, zorder=2)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"$\bar K - \bar K_{\mathrm{shuffle}}$  (nats)")
+    ax.set_title("null-subtracted response", fontsize=8)
+
+    ax = axes[1]
+    te_hat = (resp - a_ns) / g_ns
+    _scatter_per_sample_panel(ax, samples, y=te_hat, jitter=jitter,
+                              identity=True)
+    ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_ylabel(r"$\widehat{\mathrm{TE}}_{\mathrm{ns}}$  (nats)")
+    ax.set_title("null-subtracted, calibrated", fontsize=8)
+    err = te_hat - te
+    err = err[np.isfinite(err)]
+    if err.size:
+        ax.text(0.02, 0.98,
+                f"RMSE = {float(np.sqrt(np.mean(err ** 2))):.3f} nats\n"
+                fr"$\gamma_{{\rm ns}}$={g_ns:.2f}, "
+                fr"$\alpha_{{\rm ns}}$={a_ns:.3f} (want $\approx$0)",
+                transform=ax.transAxes, va="top", ha="left", fontsize=6.5,
+                bbox=dict(boxstyle="round", fc="white", ec=ps.COLOR_GRAY,
+                          alpha=0.85))
+
+    handles = _per_sample_legend_handles(samples, identity=True)
+    fig.legend(handles=handles, loc="lower center",
+               ncol=min(8, len(handles)), fontsize=6.5, frameon=False,
+               bbox_to_anchor=(0.5, 0.01))
+    fig.suptitle(r"Per-sample null-subtracted $\bar K$ vs true TE",
+                 fontsize=ps.FONT_SUPTITLE)
+    _caption(fig, "Left: per-sample K-bar minus its shuffled-source K-bar "
+                  "(the sample-wise floor estimate) with per-M and pooled "
+                  "null-subtracted fits. Right: the calibrated TE-hat vs y=x. "
+                  "Good: intercept ~0 (identity holds) and clouds on y=x.")
+    ps.save_figure(fig, path)
+
+
+def _fig_per_sample_te_error(
+    path, rows_in, rows_ho, arrs, slices, controls, *, arrs_ho=None,
+) -> None:
+    r"""Distribution of the per-sample calibrated-TE error per TE level and $M$.
+
+    Grouped boxplots of $\widehat{\mathrm{TE}} - \mathrm{TE}_{\mathrm{true}}$
+    under the **per-$M$** calibration (pooled fallback where no per-$M$ fit
+    exists), one box per $(\mathrm{TE}\ \text{level}, M)$. This answers whether
+    a *single sample's* $\bar K$ yields a usable TE estimate -- the per-cell
+    RMSE figures average the sample noise away.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (for the cell $\to$ target-TE map).
+        rows_ho: Held-out per-cell rows (same).
+        arrs: In-mix per-sample arrays.
+        slices: In-mix calibration slices.
+        controls: Null-control names (unused; signature parity).
+        arrs_ho: Optional held-out / extrapolation per-sample arrays.
+    """
+    import matplotlib.pyplot as plt
+
+    samples = _merge_sample_arrays(arrs, arrs_ho)
+    kb = np.asarray(samples.get("kbar", np.zeros(0)), dtype=float)
+    if kb.size == 0:
+        return
+    te = np.asarray(samples["te_true"], dtype=float)
+    m_arr = np.asarray(samples["M"], dtype=int)
+    level = _target_te_levels(samples, rows_in + rows_ho)
+    per_m = _per_m_fits(slices)
+    pooled = (slices or {}).get("overall") or {}
+
+    te_hat = np.full_like(kb, np.nan)
+    for m in sorted(set(m_arr.tolist())):
+        fit = per_m.get(m) or pooled
+        g_m = float(fit.get("gamma", float("nan")))
+        a_m = float(fit.get("alpha", float("nan")))
+        if np.isfinite(g_m) and abs(g_m) > 1e-12:
+            sel = m_arr == m
+            te_hat[sel] = (kb[sel] - a_m) / g_m
+    err = te_hat - te
+
+    levels = sorted({float(v) for v in level[np.isfinite(level)]})
+    ms = sorted(set(m_arr.tolist()))
+    if not levels or not ms:
+        return
+    fig, ax = plt.subplots(figsize=(7.6, 4.4))
+    ax.axhline(0.0, ls="--", lw=0.9, color=ps.COLOR_GRAY, zorder=1)
+    step = 0.8 / max(len(ms), 1)
+    for j, m in enumerate(ms):
+        color = ps.color_for_M(m)
+        for i, lv in enumerate(levels):
+            sel = (m_arr == m) & np.isclose(level, lv) & np.isfinite(err)
+            if int(sel.sum()) < 8:
+                continue
+            pos = i + (j - (len(ms) - 1) / 2.0) * step
+            ax.boxplot(
+                err[sel], positions=[pos], widths=step * 0.8,
+                showfliers=False, patch_artist=True,
+                boxprops=dict(facecolor="none", edgecolor=color, lw=0.9),
+                whiskerprops=dict(color=color, lw=0.8),
+                capprops=dict(color=color, lw=0.8),
+                medianprops=dict(color=color, lw=1.3),
+            )
+    ax.set_xticks(range(len(levels)))
+    ax.set_xticklabels([f"{lv:g}" for lv in levels])
+    ax.set_xlabel(r"true block TE level  (nats)")
+    ax.set_ylabel(r"$\widehat{\mathrm{TE}} - \mathrm{TE}_{\mathrm{true}}$  (nats)")
+    ax.set_title("Per-sample TE error by TE level and M (per-M calibration)")
+    from matplotlib.lines import Line2D
+
+    ax.legend(handles=[Line2D([0], [0], color=ps.color_for_M(m), lw=1.3,
+                              label=f"M={m}") for m in ms],
+              fontsize=6.5, loc="upper left", frameon=False,
+              ncol=min(5, len(ms)))
+    ps.style_axes(ax)
+    _caption(fig, "Boxes (no fliers) of the single-sample calibrated TE error "
+                  "per true-TE level, one box per M. Good: medians on zero "
+                  "with whiskers small relative to the TE-level spacing -- "
+                  "then one sample suffices to rank TE.")
+    ps.save_figure(fig, path)
+
+
+def _target_te_levels(
+    samples: Dict[str, np.ndarray], rows: List[Dict[str, Any]],
+) -> np.ndarray:
+    r"""Per-sample grid-level TE (the cell's ``target_te``) for grouping.
+
+    The realised per-cell TE differs slightly across bands at the same grid
+    value, which would split one nominal level into several nearby groups; the
+    manifest ``target_te`` restores the intended grouping. Samples whose cell
+    is unknown fall back to their realised TE rounded to 2 decimals.
+
+    Args:
+        samples: Merged per-sample arrays (reads ``cell_id`` / ``te_true``).
+        rows: Per-cell rows carrying ``cell_id`` / ``target_te``.
+
+    Returns:
+        Per-sample level values $(N,)$.
+    """
+    target_by_cell = {
+        int(r["cell_id"]): float(r.get("target_te", float("nan")))
+        for r in rows
+    }
+    cell_ids = np.asarray(samples["cell_id"], dtype=float)
+    te = np.asarray(samples["te_true"], dtype=float)
+    out = np.full(te.shape, np.nan)
+    for i in range(te.size):
+        cid = int(cell_ids[i]) if np.isfinite(cell_ids[i]) else -1
+        tgt = target_by_cell.get(cid, float("nan"))
+        out[i] = tgt if np.isfinite(tgt) else float(np.round(te[i], 2))
+    return out
+
+
+def _fig_per_sample_ecdf(
+    path, rows_in, rows_ho, arrs, slices, controls, *, arrs_ho=None,
+) -> None:
+    r"""ECDFs of the per-sample $\bar K$ per TE level, one panel per $M$.
+
+    The per-sample separability view: two TE levels are distinguishable from a
+    *single* sample exactly when their $\bar K$ ECDFs barely overlap. Colour
+    encodes the TE level (viridis, dark $\to$ bright with increasing TE); the
+    x axis is logarithmic.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (for the target-TE level map).
+        rows_ho: Held-out per-cell rows (same).
+        arrs: In-mix per-sample arrays.
+        slices: Calibration slices (unused; signature parity).
+        controls: Null-control names (unused; signature parity).
+        arrs_ho: Optional held-out / extrapolation per-sample arrays (adds the
+            extrapolation $M$ panels).
+    """
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    samples = _merge_sample_arrays(arrs, arrs_ho)
+    kb = np.asarray(samples.get("kbar", np.zeros(0)), dtype=float)
+    if kb.size == 0:
+        return
+    m_arr = np.asarray(samples["M"], dtype=int)
+    level = _target_te_levels(samples, rows_in + rows_ho)
+    levels = sorted({float(v) for v in level[np.isfinite(level)]})
+    ms = sorted(set(m_arr.tolist()))
+    if not levels or not ms:
+        return
+    cmap = mpl.colormaps["viridis"]
+    fig, axes = plt.subplots(1, len(ms),
+                             figsize=(3.0 * len(ms) + 0.6, 3.4),
+                             squeeze=False, sharey=True)
+    for ci, m in enumerate(ms):
+        ax = axes[0][ci]
+        for i, lv in enumerate(levels):
+            sel = (m_arr == m) & np.isclose(level, lv) & np.isfinite(kb)
+            n = int(sel.sum())
+            if n < 8:
+                continue
+            xs = np.sort(np.maximum(kb[sel], 1e-12))
+            ys = np.arange(1, n + 1) / n
+            ax.step(xs, ys, where="post", lw=1.1,
+                    color=cmap(i / max(len(levels) - 1, 1)),
+                    label=f"TE={lv:g}")
+        ax.set_xscale("log")
+        ax.set_title(f"M = {m}", fontsize=8)
+        ax.set_xlabel(r"$\bar K$  (nats, log)")
+        if ci == 0:
+            ax.set_ylabel("ECDF")
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(fontsize=6, loc="lower right", frameon=False)
+        ps.style_axes(ax)
+    fig.suptitle(r"Per-sample $\bar K$ ECDF per TE level (panels $= M$)",
+                 fontsize=ps.FONT_SUPTITLE)
+    _caption(fig, "Empirical CDF of single-sample K-bar per true-TE level, "
+                  "one panel per M. Good: curves ordered left-to-right by TE "
+                  "with little horizontal overlap -- adjacent TE levels are "
+                  "then separable from one sample.")
+    ps.save_figure(fig, path)
+
+
+def _fig_per_sample_null_scatter(
+    path, rows_in, rows_ho, arrs, slices, controls, *, arrs_ho=None,
+) -> None:
+    r"""Per-sample clean vs shuffled-source $\bar K$ (log-log), colour $= M$.
+
+    The sample-wise null-control view (the per-cell version is
+    ``null_controls``): shuffling the source destroys the directed term, so
+    TE$>0$ samples should lift off the $y=x$ diagonal while TE$=0$ samples sit
+    on it. Per-(M, TE-level) median diamonds anchor the cloud.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (for the target-TE level map).
+        rows_ho: Held-out per-cell rows (same).
+        arrs: In-mix per-sample arrays (must carry ``kbar_shuffle``).
+        slices: Calibration slices (unused; signature parity).
+        controls: Null-control names (unused; signature parity).
+        arrs_ho: Optional held-out / extrapolation per-sample arrays.
+    """
+    import matplotlib.pyplot as plt
+
+    if "kbar_shuffle" not in arrs:
+        return
+    samples = _merge_sample_arrays(arrs, arrs_ho)
+    if "kbar_shuffle" not in samples:
+        return
+    kb = np.maximum(np.asarray(samples["kbar"], dtype=float), 1e-12)
+    ks = np.maximum(np.asarray(samples["kbar_shuffle"], dtype=float), 1e-12)
+    m_arr = np.asarray(samples["M"], dtype=int)
+    level = _target_te_levels(samples, rows_in + rows_ho)
+
+    fig, ax = plt.subplots(figsize=(5.4, 5.0))
+    finite = np.isfinite(kb) & np.isfinite(ks)
+    if not np.any(finite):
+        return
+    lo = float(min(kb[finite].min(), ks[finite].min())) * 0.8
+    hi = float(max(kb[finite].max(), ks[finite].max())) * 1.25
+    ax.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color=ps.COLOR_GRAY, zorder=2)
+    for m in sorted(set(m_arr.tolist())):
+        sel = (m_arr == m) & finite
+        if not np.any(sel):
+            continue
+        color = ps.color_for_M(m)
+        ax.scatter(ks[sel], kb[sel], s=4, alpha=0.20, linewidths=0.0,
+                   color=color, rasterized=True, zorder=1, label=f"M={m}")
+        for lv in sorted({float(v) for v in level[sel][np.isfinite(level[sel])]}):
+            lsel = sel & np.isclose(level, lv)
+            if int(lsel.sum()) < 8:
+                continue
+            ax.scatter(float(np.median(ks[lsel])), float(np.median(kb[lsel])),
+                       s=30, marker="D", color=color,
+                       edgecolors=ps.COLOR_BLACK, linewidths=0.5, zorder=4)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel(r"$\bar K$ under shuffled source  (nats, log)")
+    ax.set_ylabel(r"$\bar K$ clean  (nats, log)")
+    ax.set_title("Per-sample clean vs shuffled-source K-bar")
+    ax.legend(fontsize=6.5, loc="upper left", frameon=False)
+    ps.style_axes(ax)
+    _caption(fig, "Each sample's clean K-bar against its shuffled-source "
+                  "K-bar (log-log; diamonds = per-(M, TE-level) medians; "
+                  "dashed y=x). Good: TE=0 medians on y=x (no spurious "
+                  "directed signal) and TE>0 medians lifted above it.")
+    ps.save_figure(fig, path)
+
+
+# =============================================================================
+# evaluate_te-style cross-cell suite (kbar_vs_te / kbar_vs_B_y / ...)
+# =============================================================================
+
+def _fig_evalte_suite(path, rows_in, rows_ho, arrs, slices, controls) -> None:
+    r"""Render the ``evaluate_te`` headline plots from the mixed per-cell rows.
+
+    Adapts the per-cell rows into :mod:`evaluate_te`'s row schema and calls its
+    own renderers (no duplicated plotting code), writing ``kbar_vs_te``,
+    ``kbar_vs_B_y``, ``predgap_vs_kbar`` (:func:`evaluate_te._make_plots`) and
+    ``kbar_vs_te__byM`` (:func:`evaluate_te._make_calibration_by_m`) next to
+    the other figures. This is the zero-compute counterpart of the heavy
+    ``per_cell_diagnostics`` rollup: one point per cell, with the per-$M$ fits
+    taken from the in-mix calibration where available and re-fitted from the
+    per-cell means otherwise (held-out-only $M$, e.g. the extrapolation
+    caches).
+
+    Args:
+        path: Dispatch path stem; only its parent directory is used (the
+            evaluate_te renderers write their own fixed filenames).
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out / extrapolation per-cell rows.
+        arrs: Per-sample arrays (unused; signature parity).
+        slices: In-mix calibration slices (the pooled fit annotation).
+        controls: Null-control names (unused; signature parity).
+    """
+    from model.vae_teb_prediction.model.model_experiment.synthetic import (
+        evaluate_te as ev,
+    )
+
+    out_dir = Path(path).parent
+    all_rows = rows_in + rows_ho
+    if len(all_rows) < 2:
+        return
+    eval_rows = [
+        {
+            "te_true": float(r["te_true"]),
+            "k_bar": float(r["kbar_mean"]),
+            "pred_gap": float(r.get("delta_L", float("nan"))),
+            "B_y": float(r.get("B_y", float("nan"))),
+            "c": None,
+            "p_switch": None,
+            "M": int(r["M"]),
+            "run_tag": f"c{r['cell_id']} M={r['M']} {r['band']}",
+        }
+        for r in all_rows
+    ]
+
+    # Per-M fit/association: in-mix cells for trained Ms (matches the
+    # calibration slices), held-out cells only for Ms absent from the mix.
+    in_ms = {int(r["M"]) for r in rows_in}
+    by_m_rows: Dict[int, List[Dict[str, Any]]] = {}
+    for r in all_rows:
+        m = int(r["M"])
+        if int(r.get("held_out", 0)) and m in in_ms:
+            continue
+        by_m_rows.setdefault(m, []).append(r)
+    metric3b = {
+        str(m): _assoc_stats(
+            np.asarray([x["kbar_mean"] for x in rs], dtype=float),
+            np.asarray([x["te_true"] for x in rs], dtype=float),
+        )
+        for m, rs in sorted(by_m_rows.items())
+    }
+    metrics = {
+        "metric3_calibration": (slices or {}).get("overall") or {},
+        "metric2_spearman": float(
+            percell_association(rows_in).get("overall", {})
+            .get("spearman", float("nan"))
+        ) if rows_in else float("nan"),
+        "metric3b_calibration_by_M": metric3b,
+    }
+    ev._make_plots(eval_rows, metrics, out_dir)
+    ev._make_calibration_by_m(eval_rows, metrics, out_dir)
+
+
+def _fig_per_dim_kl_by_cell_heatmap(
+    path, rows_in, rows_ho, arrs, slices, controls,
+) -> None:
+    r"""Per-cell $\times$ latent-dim KL heatmap, cells ordered by true TE.
+
+    The mixed analogue of ``evaluate_te``'s sweep ``per_dim_kl_heatmap``:
+    reveals whether the bottleneck recruits more latent dimensions as the TE
+    grows (rows brighten and widen upward) and complements the by-$M$
+    ``per_dim_kl`` figure with per-cell resolution.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows.
+        rows_ho: Held-out per-cell rows.
+        arrs: Per-sample arrays carrying ``per_dim_kl_by_cell``.
+        slices: Calibration slices (unused; signature parity).
+        controls: Null-control names (unused; signature parity).
+    """
+    import matplotlib.pyplot as plt
+
+    table = arrs.get("per_dim_kl_by_cell") or {}
+    cells = {int(r["cell_id"]): r for r in rows_in + rows_ho}
+    cids = [int(c) for c in table if int(c) in cells and len(table[c]) > 0]
+    if not cids:
+        return
+    cids.sort(key=lambda c: float(cells[c]["te_true"]))
+    d_z = max(len(table[c]) for c in cids)
+    grid = np.full((len(cids), d_z), np.nan)
+    labels = []
+    for i, cid in enumerate(cids):
+        vec = np.asarray(table[cid], dtype=float)
+        grid[i, : vec.size] = vec
+        r = cells[cid]
+        labels.append(
+            f"c{cid} M={r['M']} {str(r['band'])[:1]} TE={r['te_true']:.2f}")
+    fig, ax = plt.subplots(
+        figsize=(max(6.4, 0.22 * d_z + 2.6), 0.16 * len(cids) + 1.8))
+    vmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 1.0
+    im = ax.imshow(grid, aspect="auto", origin="lower", cmap="magma",
+                   vmin=0.0, vmax=max(vmax, 1e-9), interpolation="nearest")
+    ax.set_yticks(np.arange(len(cids)))
+    ax.set_yticklabels(labels, fontsize=5.5)
+    ax.set_xticks(np.arange(0, d_z, 4))
+    ax.set_xlabel("latent dimension $d$")
+    ax.set_title(r"Per-dimension KL $K_d$ per cell (rows ordered by true TE)")
+    ps.add_colorbar(fig, im, ax, label=r"$K_d$ (nats)")
+    ps.style_axes(ax, grid="none")
+    _caption(fig, "Clean-window mean KL per latent dimension, one row per "
+                  "cell ordered bottom-to-top by true TE. Good: more / "
+                  "brighter active dims as TE grows; a flat ~0 row signals "
+                  "posterior collapse for that cell.")
+    ps.save_figure(fig, path)
+
+
+def _fig_null_control_bars(
+    path, rows_in, rows_ho, arrs, slices, controls,
+) -> None:
+    r"""Paired vs shuffled-source $\bar K$ bars per cell with the true TE overlay.
+
+    The mixed analogue of ``evaluate_te``'s sweep ``null_control`` figure: the
+    gap between each cell's paired and shuffled bars is its genuine directed
+    signal, and the vermillion line shows the analytic TE on its own axis.
+
+    Args:
+        path: Output path stem.
+        rows_in: In-mix per-cell rows (need ``null_shuffle_kbar``).
+        rows_ho: Held-out per-cell rows.
+        arrs: Per-sample arrays (unused; signature parity).
+        slices: Calibration slices (unused; signature parity).
+        controls: Null-control names (selects the ``null_<ctrl>_kbar`` column).
+    """
+    import matplotlib.pyplot as plt
+
+    ctrl = next((c for c in controls if c == "shuffle"),
+                controls[0] if controls else None)
+    if ctrl is None:
+        return
+    key = f"null_{ctrl}_kbar"
+    rows = [r for r in rows_in + rows_ho
+            if np.isfinite(r.get(key, float("nan")))]
+    if not rows:
+        return
+    rows.sort(key=lambda r: float(r["te_true"]))
+    n = len(rows)
+    te = np.asarray([r["te_true"] for r in rows], dtype=float)
+    kbar = np.asarray([r["kbar_mean"] for r in rows], dtype=float)
+    knull = np.asarray([r[key] for r in rows], dtype=float)
+    labels = [f"c{r['cell_id']}\nM{r['M']}{str(r['band'])[:1]}" for r in rows]
+
+    fig, ax = plt.subplots(figsize=(max(7.6, 0.22 * n + 2.2), 4.6))
+    idx = np.arange(n)
+    ax.bar(idx - 0.2, kbar, width=0.4, color=ps.COLOR_BLUE,
+           label=r"$\bar K$ (paired)")
+    ax.bar(idx + 0.2, knull, width=0.4, color=ps.COLOR_GRAY,
+           label=fr"$\bar K$ ({ctrl} source)")
+    ax2 = ax.twinx()
+    ax2.plot(idx, te, marker="o", ms=2.5, color=ps.COLOR_VERMILLION, lw=1.1,
+             label="analytic TE")
+    ax2.set_ylabel("analytic block TE (nats)", color=ps.COLOR_VERMILLION,
+                   fontsize=7)
+    ax2.tick_params(axis="y", colors=ps.COLOR_VERMILLION, labelsize=6)
+    ax.set_xticks(idx)
+    ax.set_xticklabels(labels, fontsize=5.5, rotation=90)
+    ax.set_ylabel(r"$\bar K$  (nats)")
+    ax.set_title("TE surrogate vs shuffled-source null control (per cell)")
+    ax.legend(loc="upper left", fontsize=6.5, frameon=False)
+    ps.style_axes(ax)
+    _caption(fig, "Per-cell paired vs source-corrupted K-bar (bars, left "
+                  "axis) with the analytic TE overlay (line, right axis); "
+                  "cells ordered by true TE. Good: the paired-minus-shuffled "
+                  "gap tracks the TE line and vanishes at TE=0.")
+    ps.save_figure(fig, path)
 
 
 # =============================================================================
@@ -2514,7 +3771,7 @@ def _fig_pred_gain_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None
     pg_in = arrs.get("pred_gain_by_cell", {}) or {}
     if not pg_in:
         return
-    fig, ax = plt.subplots(figsize=(6.6, 5.0))
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
     ax.axhline(0.0, ls="--", lw=1.0, color=ps.COLOR_GRAY, zorder=1,
                label=r"$\Delta\mathcal{L}=0$")
     for v in pg_in.values():
@@ -2529,7 +3786,10 @@ def _fig_pred_gain_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None
     handles = _cell_legend_handles(
         [{"M": v["M"], "band": v["band"]} for v in pg_in.values()]
     )
-    ax.legend(handles=handles, fontsize=7, loc="upper left", frameon=False, ncol=2)
+    # Legend outside the axes: the up-to-9-entry key used to sit on the
+    # top-left data region.
+    ax.legend(handles=handles, fontsize=6.5, frameon=False,
+              loc="center left", bbox_to_anchor=(1.01, 0.5))
     _caption(fig, "Prediction gain dL = L_base - L_feat per cell vs true TE; "
                   "dashed dL=0. Good: dL ~ 0 at low TE and rising with TE -- the "
                   "source path helps the forecast only when info is real.")
@@ -2620,7 +3880,7 @@ def _fig_lag_profiles(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         ax.set_title(f"band = {band}", fontsize=9)
         ax.legend(fontsize=7, loc="upper right", frameon=False)
         ps.style_axes(ax)
-    fig.suptitle(r"Per-cell sliding-window LOLO lag profile $A_\ell$", fontsize=11)
+    fig.suptitle(r"Per-cell sliding-window LOLO lag profile $A_\ell$", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Per-cell leave-one-lag-out importance A_l vs source lag, one "
                   "panel per band; shaded = true band {0..dmax-1}. Good: every "
                   "curve peaks inside the shaded band.")
@@ -2675,9 +3935,12 @@ def _fig_lag_walk(path, rows_in, rows_ho, arrs, slices, controls) -> None:
         Line2D([0], [0], color=ps.COLOR_ORANGE, lw=1.0, ls="--",
                label=r"recovered $\hat d_t$"),
     ]
-    fig.legend(handles=handles, fontsize=8, loc="upper right", frameon=False)
+    # Anchored just above the axes row (right of the centred suptitle) so the
+    # figure-level legend cannot sit on the traces.
+    fig.legend(handles=handles, fontsize=6.5, loc="lower right",
+               frameon=False, ncol=2, bbox_to_anchor=(0.995, 0.985))
     fig.suptitle(r"Per-step lag-walk recovery: true vs argmax-attention $d_t$",
-                 fontsize=11)
+                 fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Mean true lag walk d_t (blue) vs recovered argmax-attention "
                   "d_hat_t (orange dashed) over time, one panel per band. Good: "
                   "dashed tracks solid; low MAE.")
@@ -2737,7 +4000,7 @@ def _fig_attn_vs_lag(path, rows_in, rows_ho, arrs, slices, controls) -> None:
             ax2.tick_params(axis="y", colors=ps.COLOR_BLUE)
         ax.legend(handles=ln1 + ln2, fontsize=7, loc="upper right", frameon=False)
         ps.style_axes(ax)
-    fig.suptitle("Attention vs LOLO lag profile (band-averaged)", fontsize=11)
+    fig.suptitle("Attention vs LOLO lag profile (band-averaged)", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Band-averaged lag attention (orange) and LOLO importance "
                   "(blue) vs source lag; shaded = true band. Good: both "
                   "concentrate on and agree over the shaded band.")
@@ -2771,14 +4034,16 @@ def _fig_per_dim_kl(path, rows_in, rows_ho, arrs, slices, controls) -> None:
     axes[0].set_yticklabels([str(m) for m in ms])
     axes[0].set_ylabel("M")
     axes[0].set_xlabel(r"latent dimension index")
+    axes[0].set_xticks(np.arange(0, d_z, 4))
     axes[0].set_title(r"Per-dimension mean KL  $\overline{\mathrm{KL}}_d$  (clean window)")
     ps.add_colorbar(fig, im, axes[0], label="nats")
     axes[1].bar(np.arange(d_z), grid.mean(axis=0), color=ps.COLOR_BLUE)
     axes[1].set_xlabel(r"latent dimension index")
     axes[1].set_ylabel("mean over M")
+    axes[1].set_xticks(np.arange(0, d_z, 4))
     axes[1].set_xlim(-0.5, d_z - 0.5)
     ps.style_axes(axes[1])
-    fig.suptitle("Latent KL allocation across dimensions", fontsize=11)
+    fig.suptitle("Latent KL allocation across dimensions", fontsize=ps.FONT_SUPTITLE)
     _caption(fig, "Mean KL per latent dimension: per-M heatmap (top), "
                   "averaged-over-M bar (bottom). A dimension dark across all M is "
                   "collapsed/unused; broad use = healthy latent.")
@@ -2855,12 +4120,21 @@ def main() -> None:
                              "extrapolation cache to avoid overwriting")
     parser.add_argument("--data-dir", type=str, default=None, dest="data_dir")
     parser.add_argument("--results-dir", type=str, default=None, dest="results_dir")
+    parser.add_argument("--combined-only", action="store_true",
+                        dest="combined_only",
+                        help="only re-render the combined per-sample figures "
+                             "from the existing per_sample/per_cell CSVs "
+                             "(replot-only: no checkpoint, no GPU)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     config["experiment"]["benchmark"] = _BENCHMARK
     resolve_active_benchmark(config)
     _apply_overrides(config, vars(args))
+    if args.combined_only:
+        results_root = resolve_user_path(config["paths"]["results_dir"])
+        render_combined_per_sample_scatter(results_root / _BENCHMARK / args.run_tag)
+        return
     evaluate_mixed(
         config, run_tag=args.run_tag, in_mix_tag=args.in_mix_tag,
         holdout_tag=args.holdout_tag, ckpt_name=args.ckpt_name,
@@ -2878,6 +4152,8 @@ if __name__ == "__main__":
         "out_subdir": None,      # None -> 'mixed_eval'; set per extrap cache
         "data_dir": None,
         "results_dir": None,
+        "combined_only": False,  # True -> only re-render combined_figures/
+                                 # from the existing CSVs (no checkpoint/GPU)
     }
 
     if len(sys.argv) > 1:
@@ -2887,10 +4163,15 @@ if __name__ == "__main__":
         config["experiment"]["benchmark"] = _BENCHMARK
         resolve_active_benchmark(config)
         _apply_overrides(config, RUN_CONFIG)
-        evaluate_mixed(
-            config, run_tag=RUN_CONFIG["run_tag"],
-            in_mix_tag=RUN_CONFIG["in_mix_tag"],
-            holdout_tag=RUN_CONFIG["holdout_tag"],
-            ckpt_name=RUN_CONFIG["ckpt_name"],
-            out_subdir=RUN_CONFIG["out_subdir"],
-        )
+        if RUN_CONFIG.get("combined_only"):
+            results_root = resolve_user_path(config["paths"]["results_dir"])
+            render_combined_per_sample_scatter(
+                results_root / _BENCHMARK / str(RUN_CONFIG["run_tag"]))
+        else:
+            evaluate_mixed(
+                config, run_tag=RUN_CONFIG["run_tag"],
+                in_mix_tag=RUN_CONFIG["in_mix_tag"],
+                holdout_tag=RUN_CONFIG["holdout_tag"],
+                ckpt_name=RUN_CONFIG["ckpt_name"],
+                out_subdir=RUN_CONFIG["out_subdir"],
+            )
