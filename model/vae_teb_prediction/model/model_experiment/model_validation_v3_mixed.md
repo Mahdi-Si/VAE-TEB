@@ -356,3 +356,23 @@ $M \times$ band, each $M$-row on its own adaptive scale), `kld_vs_te_overview`
 `calibration_health` (per-$M$ $\gamma_M$ with the $|\gamma-1|\le0.2$ target band
 plus the local-$\gamma$ $\bar K/\mathrm{TE}$ heatmap), `prior_mismatch`,
 `lag_profiles`, `pred_gain_vs_te`, and `generalization_gap`.
+
+**Per-sample scatter suite** (every test sample as one point, colour $= M$,
+rendered in every eval pass): `per_sample_scatter` ($2\times2$: raw $\bar K$
+vs TE on linear and log scales — the linear panel carries a secondary
+$\bar K/d_z$ axis on the loss-side `kld_loss` scale — plus pooled- and
+per-$M$-calibrated $\widehat{\mathrm{TE}}$ vs $y=x$), `per_sample_nullsub`
+(the sample-wise floor-subtracted response $\bar K - \bar K_{\text{shuffle}}$,
+raw + calibrated), `per_sample_te_error` (boxplots of the single-sample
+calibrated-TE error per TE level $\times$ $M$), `per_sample_kbar_ecdf`
+(per-$M$ ECDFs per TE level — single-sample separability) and
+`per_sample_null_scatter` (per-sample clean vs shuffled $\bar K$, log–log).
+The `evaluate_te`-style cross-cell suite (`kbar_vs_te`, `kbar_vs_B_y`,
+`predgap_vs_kbar`, `kbar_vs_te__byM`, `per_dim_kl_by_cell`,
+`null_control_bars`) renders alongside them at zero extra compute by adapting
+the per-cell rows into `evaluate_te`'s own renderers. The pipeline's
+default-on `combined_figures` stage pools the `per_sample.csv` /
+`per_cell.csv` of the in-mix and every `mixed_eval_extrap_m<M>` pass into
+`results/G1_mix/<run_tag>/combined_figures/` (all five $M$ colours in one
+figure); it is pure CSV $\to$ matplotlib and can be re-rendered without GPU
+via `python -m ...synthetic.mixed_eval --combined-only --run-tag <tag>`.

@@ -273,6 +273,16 @@ def test_evaluate_mixed_end_to_end(cache_and_model, tmp_path):
     for col in ("lag_mass_attn", "lag_mass_attn_ratio", "peak_lag_err_mean",
                 "peak_in_band_frac", "lag_walk_mae", "lag_walk_within1_frac"):
         assert col in header, col
+
+    # --- Per-sample scatter suite + evaluate_te-style figures -----------------
+    ps_header = (out / "per_sample.csv").read_text(
+        encoding="utf-8").splitlines()[0]
+    assert ps_header.endswith("held_out,split")
+    assert (out / "per_sample_scatter.pdf").is_file()
+    assert (out / "per_sample_null_scatter.pdf").is_file()
+    # evaluate_te-style cross-cell suite rendered via the row adapter:
+    assert (out / "kbar_vs_te.pdf").is_file()
+    assert (out / "kbar_vs_te__byM.pdf").is_file()
     # The tiny G1 cache carries the per-step lag walk -> the lag-walk figure and
     # the per-cell lag-walk metric are produced.
     with np.load(cache_and_model["test_npz"]) as npz:
@@ -387,3 +397,153 @@ def test_collect_per_cell_attn_diag_no_walk_when_disabled(cache_and_model):
     for res in out.values():
         assert "lag_mass_attn" in res
         assert "lag_walk_mae" not in res
+
+
+# ---------------------------------------------------------------------------
+# Per-sample CSV round-trip + per-sample scatter suite (no model / GPU)
+# ---------------------------------------------------------------------------
+
+def _arrs_with_controls(alpha: float, gamma: float):
+    """``_synthetic_arrs`` plus a fake shuffle control (10% of clean kbar)."""
+    arrs, cells = _synthetic_arrs(alpha, gamma)
+    arrs["kbar_shuffle"] = 0.1 * arrs["kbar"]
+    return arrs, cells
+
+
+def test_write_and_read_per_sample_csv_roundtrip(tmp_path):
+    """Both splits round-trip through the CSV with held_out / split intact."""
+    arrs, _ = _arrs_with_controls(0.2, 0.8)
+    arrs_ho, _ = _arrs_with_controls(0.2, 0.8)
+    arrs_ho["held_out"] = np.ones_like(arrs_ho["held_out"])
+    path = tmp_path / "per_sample.csv"
+    ME._write_per_sample_csv(
+        path, [("in_mix", arrs), ("holdout", arrs_ho)], ("shuffle",))
+    got = ME._read_per_sample_csv(path)
+    n = arrs["kbar"].size
+    assert got["kbar"].size == 2 * n
+    assert np.allclose(got["kbar"][:n], arrs["kbar"])
+    assert np.allclose(got["kbar_shuffle"][n:], arrs_ho["kbar_shuffle"])
+    assert np.array_equal(got["M"][:n], arrs["M"])
+    assert set(got["split"][:n]) == {"in_mix"}
+    assert set(got["split"][n:]) == {"holdout"}
+    assert np.all(got["held_out"][n:] == 1)
+    # Empty splits are skipped without error.
+    ME._write_per_sample_csv(path, [("in_mix", arrs), ("holdout", {})], ())
+    assert ME._read_per_sample_csv(path)["kbar"].size == n
+
+
+def test_read_per_sample_csv_legacy_format(tmp_path):
+    """A pre-split CSV (no held_out/split columns) defaults to in_mix rows."""
+    path = tmp_path / "per_sample.csv"
+    path.write_text(
+        "cell_id,M,band_id,delay_max,te_true,kbar\n"
+        "0,8,1,15,0.5,1.0\n"
+        "1,16,1,15,1.5,2.0\n",
+        encoding="utf-8",
+    )
+    got = ME._read_per_sample_csv(path)
+    assert np.array_equal(got["held_out"], [0, 0])
+    assert set(got["split"]) == {"in_mix"}
+    assert np.allclose(got["kbar"], [1.0, 2.0])
+
+
+def test_per_sample_scatter_figures_smoke(tmp_path):
+    """Every per-sample figure renders from hand-built arrays (no model)."""
+    arrs, cells = _arrs_with_controls(0.2, 0.8)
+    slices = ME.fit_calibration_slices(arrs, cells)
+    slices_ns = ME.fit_calibration_slices_nullsub(arrs, cells, control="shuffle")
+    rows = ME.group_recovery(arrs, cells, alpha=0.2, gamma=0.8,
+                             controls=("shuffle",))
+    arrs_ho, _ = _arrs_with_controls(0.2, 0.8)
+    arrs_ho["held_out"] = np.ones_like(arrs_ho["held_out"])
+
+    ME._fig_per_sample_scatter(
+        tmp_path / "per_sample_scatter", rows, [], arrs, slices, ("shuffle",),
+        arrs_ho=arrs_ho)
+    ME._fig_per_sample_nullsub(
+        tmp_path / "per_sample_nullsub", rows, [], arrs, slices, ("shuffle",),
+        slices_nullsub=slices_ns)
+    ME._fig_per_sample_te_error(
+        tmp_path / "per_sample_te_error", rows, [], arrs, slices, ("shuffle",))
+    ME._fig_per_sample_ecdf(
+        tmp_path / "per_sample_kbar_ecdf", rows, [], arrs, slices, ("shuffle",))
+    ME._fig_per_sample_null_scatter(
+        tmp_path / "per_sample_null_scatter", rows, [], arrs, slices,
+        ("shuffle",))
+    for name in ("per_sample_scatter", "per_sample_nullsub",
+                 "per_sample_te_error", "per_sample_kbar_ecdf",
+                 "per_sample_null_scatter"):
+        assert (tmp_path / f"{name}.pdf").is_file(), name
+
+
+def test_evalte_suite_adapter_smoke(tmp_path):
+    """The evaluate_te renderers run on adapted mixed per-cell rows."""
+    arrs, cells = _arrs_with_controls(0.0, 1.0)
+    # Per-cell per-dim KL so the by-cell heatmap also renders.
+    arrs["per_dim_kl_by_cell"] = {
+        c: (np.linspace(0.0, 1.0, 8) * (c + 1)).tolist() for c in (0, 1, 2)
+    }
+    slices = ME.fit_calibration_slices(arrs, cells)
+    rows = ME.group_recovery(arrs, cells, alpha=0.0, gamma=1.0,
+                             controls=("shuffle",))
+    for r in rows:
+        r["delta_L"] = 0.01 * r["te_true"]
+
+    ME._fig_evalte_suite(tmp_path / "evalte_suite", rows, [], arrs, slices, ())
+    for name in ("kbar_vs_te", "kbar_vs_B_y", "predgap_vs_kbar",
+                 "kbar_vs_te__byM"):
+        assert (tmp_path / f"{name}.pdf").is_file(), name
+    ME._fig_per_dim_kl_by_cell_heatmap(
+        tmp_path / "per_dim_kl_by_cell", rows, [], arrs, slices, ())
+    assert (tmp_path / "per_dim_kl_by_cell.pdf").is_file()
+    ME._fig_null_control_bars(
+        tmp_path / "null_control_bars", rows, [], arrs, slices, ("shuffle",))
+    assert (tmp_path / "null_control_bars.pdf").is_file()
+
+
+def test_render_combined_per_sample_scatter(tmp_path):
+    """The replot-only combined renderer pools CSVs across eval passes."""
+    import json
+
+    arrs, cells = _arrs_with_controls(0.2, 0.8)
+    rows = ME.group_recovery(arrs, cells, alpha=0.2, gamma=0.8,
+                             controls=("shuffle",))
+    arrs_ho, _ = _arrs_with_controls(0.2, 0.8)
+    arrs_ho["held_out"] = np.ones_like(arrs_ho["held_out"])
+
+    run_dir = tmp_path / "run"
+    base = run_dir / "mixed_eval"
+    base.mkdir(parents=True)
+    ME._write_per_sample_csv(
+        base / "per_sample.csv",
+        [("in_mix", arrs), ("holdout", arrs_ho)], ("shuffle",))
+    ME._write_per_cell_csv(base / "per_cell.csv", rows, [], ("shuffle",))
+    slices = ME.fit_calibration_slices(arrs, cells)
+    with open(base / "calibration.json", "w", encoding="utf-8") as fh:
+        json.dump({
+            "alpha": 0.2, "gamma": 0.8,
+            "in_mix": slices,
+            "in_mix_nullsub": ME.fit_calibration_slices_nullsub(
+                arrs, cells, control="shuffle"),
+        }, fh)
+
+    # One extrapolation pass at an untrained M=4.
+    arrs_m4, _ = _arrs_with_controls(0.2, 0.8)
+    arrs_m4["M"] = np.full_like(arrs_m4["M"], 4)
+    arrs_m4["held_out"] = np.ones_like(arrs_m4["held_out"])
+    extrap = run_dir / "mixed_eval_extrap_m4"
+    extrap.mkdir(parents=True)
+    ME._write_per_sample_csv(
+        extrap / "per_sample.csv",
+        [("in_mix", arrs), ("holdout", arrs_m4)], ("shuffle",))
+
+    written = ME.render_combined_per_sample_scatter(run_dir)
+    assert written, "expected at least one combined figure"
+    out = run_dir / "combined_figures"
+    assert (out / "per_sample_scatter_all.pdf").is_file()
+    assert (out / "per_sample_kbar_ecdf_all.pdf").is_file()
+    # evaluate_te-style suite pooled from per_cell.csv:
+    assert (out / "kbar_vs_te.pdf").is_file()
+
+    # A missing run dir is a graceful no-op.
+    assert ME.render_combined_per_sample_scatter(tmp_path / "nope") is None

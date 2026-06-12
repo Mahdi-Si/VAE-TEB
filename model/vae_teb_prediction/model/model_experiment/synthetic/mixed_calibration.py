@@ -507,13 +507,13 @@ def _fig_gamma_vs_beta(tables: Dict[str, Any], selected: Dict[str, Any], out_dir
     ps.apply_style()
     fig, ax = plt.subplots(figsize=(6.6, 5.0))
     per_M = tables.get("per_M", {}) or {}
-    palette = ps.PALETTE_EXTENDED
-    for i, m in enumerate(sorted(per_M, key=lambda s: int(s))):
+    for m in sorted(per_M, key=lambda s: int(s)):
         rows = sorted(per_M[m], key=lambda r: float(r["beta"]))
         bs = [float(r["beta"]) for r in rows]
         gs = [float(r.get("gamma", np.nan)) for r in rows]
+        # Canonical M -> colour map (shared with every mixed_eval figure).
         ax.plot(bs, gs, marker="o", markersize=4, linewidth=1.3,
-                color=palette[i % len(palette)], label=rf"$M={m}$")
+                color=ps.color_for_M(int(m)), label=rf"$M={m}$")
     ov = sorted(tables.get("overall", []), key=lambda r: float(r["beta"]))
     if ov:
         ax.plot([float(r["beta"]) for r in ov],
@@ -530,9 +530,12 @@ def _fig_gamma_vs_beta(tables: Dict[str, Any], selected: Dict[str, Any], out_dir
     ax.set_ylabel(r"calibration slope $\gamma$")
     ax.set_title(r"per-$M$ calibration slope $\gamma(\beta)$ "
                  r"($\gamma\to1$ is the target)")
-    ax.legend(loc="best", frameon=False, ncol=2, fontsize=ps.FONT_LEGEND)
+    ax.legend(loc="best", frameon=False, ncol=2)
     ps.style_axes(ax)
     fig.tight_layout()
+    ps.add_caption(fig, "Calibration slope gamma per M vs the KL weight beta "
+                        "(log x); dotted = gamma=1 target, dashed = selected "
+                        "beta*. Good: every M line crosses ~1 near beta*.")
     ps.save_figure(fig, out_dir / "gamma_vs_beta")
 
 
@@ -567,9 +570,12 @@ def _fig_selection_score(
     ax.set_xlabel(r"KL weight $\beta$")
     ax.set_ylabel("selection score (lower is better)")
     ax.set_title(r"$\beta$ selection: per-$M$ calibration score")
-    ax.legend(loc="best", frameon=False, fontsize=ps.FONT_LEGEND)
+    ax.legend(loc="best", frameon=False)
     ps.style_axes(ax)
     fig.tight_layout()
+    ps.add_caption(fig, "The beta-selection score and its two terms (per-M "
+                        "slope deviation + alpha penalty) vs beta; beta* "
+                        "minimises the vermillion score curve.")
     ps.save_figure(fig, out_dir / "selection_score_vs_beta")
 
 

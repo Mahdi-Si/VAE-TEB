@@ -1471,7 +1471,7 @@ def _make_calibration_by_m(
 
     fig.suptitle(
         r"$\bar K$ vs analytic block TE -- per informative-channel count $M$",
-        fontsize=ps.FONT_TITLE, fontweight="bold",
+        fontsize=ps.FONT_SUPTITLE,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     ps.save_figure(fig, out_dir / "kbar_vs_te__byM")
@@ -1514,7 +1514,7 @@ def _make_checkpoint_figure(row: Dict[str, Any], out_dir: Path) -> list:
     fig.suptitle(
         f"Checkpoint TE diagnostics -- {row.get('run_tag','?')}  "
         f"(benchmark {row.get('benchmark','?')}, epoch {row.get('epoch')})",
-        fontsize=ps.FONT_TITLE, fontweight="bold",
+        fontsize=ps.FONT_SUPTITLE,
     )
 
     # --- Panel (0,0): per-latent-dim KL -----------------------------------
@@ -1540,8 +1540,7 @@ def _make_checkpoint_figure(row: Dict[str, Any], out_dir: Path) -> list:
     ax.set_xticklabels([r"$\bar K$ (paired)", r"$\bar K$ (shuffled src)"])
     for x, v in ((0, k_bar), (1, k_shuf)):
         if np.isfinite(v):
-            ax.text(x, v, f"  {v:.3e}", ha="center", va="bottom",
-                    fontsize=ps.FONT_TICK)
+            ax.text(x, v, f"  {v:.3e}", ha="center", va="bottom", fontsize=7)
     ax.set_title(f"TE surrogate vs null control   (analytic te_true={te_true:.3f} nats)")
     ax.set_ylabel(r"$\bar K$ (nats)")
     ax.margins(y=0.18)
@@ -1557,8 +1556,7 @@ def _make_checkpoint_figure(row: Dict[str, Any], out_dir: Path) -> list:
     ax.set_xticklabels(["baseline $L_{base}$", "full $L_{feat}$"])
     for x, v in ((0, base_l), (1, feat_l)):
         if np.isfinite(v):
-            ax.text(x, v, f"  {v:.4f}", ha="center", va="bottom",
-                    fontsize=ps.FONT_TICK)
+            ax.text(x, v, f"  {v:.4f}", ha="center", va="bottom", fontsize=7)
     ax.set_title(
         f"forecast loss   (pred_gap = $L_{{base}}-L_{{feat}}$ = "
         f"{float(row.get('pred_gap', float('nan'))):+.4f})"
@@ -1643,7 +1641,7 @@ def _make_sweep_extras(rows: List[Dict[str, Any]], out_dir: Path) -> None:
         im = ax.imshow(grid, aspect="auto", origin="lower", cmap="magma",
                        vmin=0.0, vmax=max(vmax, 1e-9), interpolation="nearest")
         ax.set_yticks(np.arange(len(rows)))
-        ax.set_yticklabels(labels, fontsize=ps.FONT_TICK)
+        ax.set_yticklabels(labels, fontsize=6)
         ax.set_xlabel("latent dimension $d$")
         ax.set_title(r"per-dimension KL $K_d$ across sweep settings "
                      r"(rows ordered by analytic TE)")
@@ -1664,10 +1662,13 @@ def _make_sweep_extras(rows: List[Dict[str, Any]], out_dir: Path) -> None:
     ax2.set_ylabel("analytic block TE (nats)", color=ps.COLOR_VERMILLION)
     ax2.tick_params(axis="y", colors=ps.COLOR_VERMILLION)
     ax.set_xticks(idx)
-    ax.set_xticklabels(labels, fontsize=ps.FONT_TICK)
+    # Rotate when the sweep has many settings (e.g. the mixed per-cell rollup)
+    # so the two-line labels cannot collide.
+    ax.set_xticklabels(labels, fontsize=6,
+                       rotation=90 if len(rows) > 8 else 0)
     ax.set_ylabel(r"$\bar K$ (nats)")
     ax.set_title(r"TE surrogate vs shuffled-source null control")
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left", fontsize=6.5)
     ps.style_axes(ax)
     fig.tight_layout()
     ps.save_figure(fig, out_dir / "null_control")
