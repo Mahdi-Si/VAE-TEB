@@ -761,6 +761,7 @@ def train_ddp(
     # fresh (the synthetic checkpoints carry no optimizer state). Every DDP
     # rank loads identically, so the ranks start in sync.
     resume_ckpt = overrides.get("resume_ckpt")
+    resume_meta: Optional[Dict[str, Any]] = None
     if resume_ckpt:
         resume_path = Path(resume_ckpt)
         if not resume_path.is_file():
@@ -769,7 +770,11 @@ def train_ddp(
                 f"synthetic-format checkpoint of a previous run, e.g. "
                 f"results/G1_mix/<run_tag>/final.ckpt."
             )
-        if load_checkpoint_strict(model, str(resume_path),
+        # Read the checkpoint once and reuse the dict for BOTH the strict weight
+        # load and the warm-start banner's "checkpoint was trained with"
+        # metadata, so the (large) state dict is loaded from disk only once.
+        ckpt_obj = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if load_checkpoint_strict(model, ckpt_obj,
                                   map_location="cpu") is None:
             raise RuntimeError(
                 f"load_checkpoint_strict could not align {resume_path} with "
@@ -777,9 +782,23 @@ def train_ddp(
                 f"from a run with the same model.* config (final.ckpt / "
                 f"best.ckpt, not a Lightning lightning_best-*.ckpt)."
             )
-        if _env_rank_zero():
-            print(f"[train_ddp] warm start: model weights loaded from "
-                  f"{resume_path} (optimizer / LR schedule start fresh)")
+        # Snapshot the source run's training hyperparameters for the banner so
+        # the warm-start summary can contrast them against THIS run's fresh
+        # config values. These are read-only -- they never feed back into the
+        # optimizer / scheduler / loss, which are rebuilt from the current config.
+        ckpt_dict = ckpt_obj if isinstance(ckpt_obj, dict) else {}
+        ckpt_optim = (ckpt_dict.get("config") or {}).get("optim", {}) or {}
+        ckpt_loss = ckpt_dict.get("loss_settings", {}) or {}
+        resume_meta = {
+            "path": resume_path,
+            "epoch": ckpt_dict.get("epoch"),
+            "lr": ckpt_optim.get("lr"),
+            "lr_milestones": ckpt_optim.get("lr_milestones"),
+            "lr_gamma": ckpt_optim.get("lr_gamma"),
+            "weight_decay": ckpt_optim.get("weight_decay"),
+            "beta": ckpt_loss.get("beta", ckpt_loss.get("kld_beta")),
+        }
+        del ckpt_obj, ckpt_dict  # weights are already in `model`; free the rest
 
     loss_settings = _resolve_loss_settings(config["loss"])
 
@@ -814,6 +833,30 @@ def train_ddp(
 
     epochs = int(optim_cfg["epochs"])
     plotting_cfg = config.get("plotting") or {}
+
+    # Warm-start verification banner (rank-0). When resuming, make it explicit
+    # that THIS run takes every training hyperparameter fresh from the config and
+    # restarts the optimizer / LR schedule / epoch counter from zero -- so a
+    # milestone configured for epoch N fires at epoch N of the resumed run, not
+    # at original-epoch-N. The checkpoint values are printed only for contrast.
+    if resume_meta is not None and _env_rank_zero():
+        warmup_used = int(ddp_cfg["warmup_epochs"]) if do_scale else 0
+        print(
+            f"\n[train_ddp] WARM START from {resume_meta['path']}\n"
+            f"        checkpoint trained: epoch={resume_meta['epoch']} "
+            f"lr={resume_meta['lr']} milestones={resume_meta['lr_milestones']} "
+            f"gamma={resume_meta['lr_gamma']} "
+            f"weight_decay={resume_meta['weight_decay']} beta={resume_meta['beta']}\n"
+            f"        THIS run uses (from config; fresh optimizer/schedule; epoch 0):\n"
+            f"          lr={base_lr:g} (effective {effective_lr:g})  "
+            f"milestones={optim_cfg.get('lr_milestones')}  "
+            f"gamma={float(optim_cfg.get('lr_gamma', 0.1)):g}  "
+            f"weight_decay={float(optim_cfg.get('weight_decay', 0.0)):g}\n"
+            f"          warmup_epochs={warmup_used}  "
+            f"beta={float(loss_settings['beta']):g}  epochs={epochs}\n"
+            f"        -> schedules restart from epoch 0; a milestone at epoch N "
+            f"fires at epoch N of THIS run."
+        )
 
     # Write the consumable best.ckpt / final.ckpt DURING training (rank-0) so an
     # interrupted run (Ctrl-C on a rising val loss, crash) stays evaluable. On
@@ -927,8 +970,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--resume-ckpt", type=str, default=None, dest="resume_ckpt",
                    help="continue training from this synthetic-format "
                         "checkpoint (results/G1_mix/<run_tag>/final.ckpt or "
-                        "best.ckpt): the model weights are loaded, the "
-                        "optimizer starts fresh; omitted -> train from scratch")
+                        "best.ckpt): the model WEIGHTS are loaded, while every "
+                        "training hyperparameter (lr, lr_milestones/lr_gamma, "
+                        "weight_decay, beta) is taken fresh from the config and "
+                        "the optimizer / LR schedule / epoch counter restart "
+                        "from zero -- edit config_synth.yaml optim/loss to "
+                        "change them; omitted -> train from scratch")
     return p.parse_args(argv)
 
 
