@@ -746,6 +746,13 @@ if __name__ == "__main__":
                                      #   lightning_ckpts/lightning_best-*.ckpt.
                                      #   Weights only: the optimizer / LR
                                      #   schedule / epoch counter start fresh.
+                                     #   Every training hyperparameter (lr,
+                                     #   scheduled LR changes lr_milestones /
+                                     #   lr_gamma, weight_decay, beta) is taken
+                                     #   FRESH from config_synth.yaml at resume
+                                     #   time -- edit its optim:/loss: blocks to
+                                     #   override them; a milestone at epoch N
+                                     #   then fires at epoch N of the resumed run.
                                      #   Training is still skipped when
                                      #   <run_dir>/<ckpt_name> already exists,
                                      #   so continue into a NEW run_tag or set

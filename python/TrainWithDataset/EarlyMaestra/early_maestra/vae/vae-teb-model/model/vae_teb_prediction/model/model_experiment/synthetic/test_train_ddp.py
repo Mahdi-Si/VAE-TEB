@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
@@ -87,7 +88,11 @@ def _write_cache(cache_dir: Path, n: int, stem: str) -> None:
                        "true_lag_band": [1, 2, 3]}, fh)
 
 
-def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
+def _run(
+    tmp: Path,
+    extra_overrides: Optional[Dict[str, Any]] = None,
+    config_patch: Optional[Dict[str, Any]] = None,
+) -> Path:
     """Build caches, run a short single-device train_ddp, return the run dir.
 
     Two epochs with ``plot_every=1`` force at least one periodic loss-curve
@@ -98,9 +103,15 @@ def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
         tmp: Temporary directory holding the data + results trees.
         extra_overrides: Optional overrides merged on top of the defaults (e.g.
             ``{"early_stop_patience": 1, "epochs": 3}``).
+        config_patch: Optional per-section config edits applied **before**
+            training (e.g. ``{"optim": {"lr_milestones": [1]}}``). Mirrors
+            editing ``config_synth.yaml`` directly -- the channel for
+            hyperparameters such as ``lr_milestones`` / ``lr_gamma`` that have
+            no flat override key in ``_OVERRIDE_MAP``.
 
     Returns:
-        The run directory ``<results>/G1_mix/<tag>``.
+        The run directory ``<results>/G1_mix/<run_tag>`` (``run_tag`` honours an
+        ``extra_overrides['run_tag']``, else the default data tag).
     """
     tag = "ddp_smoke"
     data_dir = tmp / "data"
@@ -111,6 +122,14 @@ def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
 
     config = load_config(_CONFIG)
     config["model"].update(_SMALL_MODEL)        # shrink the architecture
+    if config_patch:
+        # Deep-update one level of sections (optim / loss / ...), mirroring a
+        # hand edit of the YAML's optim:/loss: blocks.
+        for section, values in config_patch.items():
+            if isinstance(values, dict):
+                config.setdefault(section, {}).update(values)
+            else:
+                config[section] = values
 
     overrides: Dict[str, Any] = {
         "data_tag": tag,
@@ -131,7 +150,7 @@ def _run(tmp: Path, extra_overrides: Optional[Dict[str, Any]] = None) -> Path:
     # until an eventual collection, and Windows cannot delete a mapped file --
     # the caller's TemporaryDirectory cleanup would fail with WinError 32.
     gc.collect()
-    return results_dir / "G1_mix" / tag
+    return results_dir / "G1_mix" / str(overrides["run_tag"])
 
 
 def _assert_loss_settings(ls: Dict) -> None:
@@ -294,18 +313,26 @@ def test_train_ddp_resume_ckpt(monkeypatch) -> None:
         calls: list = []
 
         def _spy(model, ckpt, **kw):
-            calls.append(str(ckpt))
+            calls.append(ckpt)
             return load_checkpoint_strict(model, ckpt, **kw)
 
         monkeypatch.setattr(TD, "load_checkpoint_strict", _spy)
+        # The warm start now passes the LOADED synthetic-format dict (one disk
+        # read, reused for the verification banner), not the path string, so
+        # identify it by a stable stored field rather than the path.
+        src_created = torch.load(
+            src, map_location="cpu", weights_only=False
+        ).get("created")
         _run(tmp, extra_overrides={
             "run_tag": "ddp_resume", "resume_ckpt": str(src), "epochs": 1,
         })
         resumed_dir = run_dir.parent / "ddp_resume"
         assert (resumed_dir / "final.ckpt").is_file(), "resumed run wrote no ckpt"
-        # The first loader call is the warm start (later calls come from the
-        # post-fit Lightning-best bridge in _export_checkpoints).
-        assert calls and calls[0] == str(src), (
+        # The first loader call is the warm start, which receives the synthetic
+        # dict loaded from src (later calls come from the post-fit Lightning-best
+        # bridge in _export_checkpoints, which passes a Path).
+        assert calls, "warm start never called the loader"
+        assert isinstance(calls[0], dict) and calls[0].get("created") == src_created, (
             "warm start never loaded the provided resume_ckpt"
         )
 
@@ -315,6 +342,79 @@ def test_train_ddp_resume_ckpt(monkeypatch) -> None:
                 "resume_ckpt": str(tmp / "missing.ckpt"),
             })
         gc.collect()
+
+
+def test_train_ddp_resume_uses_resume_time_config() -> None:
+    """A resumed run takes its LR schedule + beta FRESH from the resume-time
+    config and restarts the schedule from epoch 0.
+
+    Run A trains from scratch under the default config (``lr_milestones=[10, 50]``,
+    so no decay within the 2-epoch budget). Run B resumes from A's ``final.ckpt``
+    but patches the ``optim`` / ``loss`` blocks the way a user would edit
+    ``config_synth.yaml``: ``lr_milestones=[1]``, ``lr_gamma=0.1``, ``lr=1e-3``,
+    ``kld_beta=5e-3``. The assertions prove B used B's config, not the
+    checkpoint's:
+
+    * ``config_used.yaml`` shows B's milestones ``[1]`` and beta ``5e-3`` (A's
+      shows ``[10, 50]``), so training read the resume-time config.
+    * ``metrics.csv`` ``lr`` column spans both the base lr ``1e-3`` and the
+      decayed ``base*gamma=1e-4``: the ``[1]`` milestone fires within the short
+      resumed run, so the schedule restarted from epoch 0 (it would never decay
+      within these few epochs if the schedule had resumed at A's final epoch).
+    """
+    with tempfile.TemporaryDirectory() as _tmp:
+        tmp = Path(_tmp)
+        run_a = _run(tmp)                            # scratch run -> A/final.ckpt
+        src = run_a / "final.ckpt"
+        assert src.is_file()
+
+        # epochs=4 so the LR decay is observable despite the DDP `lr` column
+        # lagging one epoch (the `on_epoch` LR metric is committed to
+        # callback_metrics at epoch end, after the in-epoch validation that
+        # writes each row -- so the first row is NaN and the decay shows late).
+        run_b = _run(
+            tmp,
+            extra_overrides={"run_tag": "ddp_resume_cfg",
+                             "resume_ckpt": str(src), "epochs": 4},
+            config_patch={
+                "optim": {"lr": 1e-3, "lr_milestones": [1], "lr_gamma": 0.1},
+                "loss": {"kld_beta": 5e-3},
+            },
+        )
+        assert (run_b / "final.ckpt").is_file(), "resumed run wrote no ckpt"
+
+        # --- fresh config used, not the checkpoint's --------------------------
+        cfg_a = yaml.safe_load(
+            (run_a / "config_used.yaml").read_text(encoding="utf-8")
+        )
+        cfg_b = yaml.safe_load(
+            (run_b / "config_used.yaml").read_text(encoding="utf-8")
+        )
+        assert cfg_a["optim"]["lr_milestones"] == [10, 50], (
+            "scratch run A should keep the default milestones"
+        )
+        assert cfg_b["optim"]["lr_milestones"] == [1], (
+            "resumed run did not pick up the override lr_milestones from config"
+        )
+        assert float(cfg_b["loss"]["kld_beta"]) == pytest.approx(5e-3), (
+            "resumed run did not pick up the override beta from config"
+        )
+
+        # --- schedule restarts from epoch 0 -----------------------------------
+        with open(run_b / "metrics.csv", newline="", encoding="utf-8") as fh:
+            lrs = [float(row["lr"]) for row in csv.DictReader(fh)]
+        logged = [x for x in lrs if x == x]          # drop the NaN warm-up row(s)
+        assert len(logged) >= 2, f"need >=2 logged LR rows, got {lrs}"
+        assert max(logged) == pytest.approx(1e-3, rel=1e-3), (
+            f"expected the base lr 1e-3 to appear in the resumed run; got {lrs}"
+        )
+        assert min(logged) == pytest.approx(1e-4, rel=1e-3), (
+            f"expected base*gamma=1e-4 after the [1] milestone -- the schedule "
+            f"must restart from epoch 0 of the resumed run; got {lrs}"
+        )
+        gc.collect()
+        print("[test_train_ddp] OK -- resume uses resume-time LR schedule + beta "
+              "from epoch 0")
 
 
 def test_train_ddp_early_stopping() -> None:
@@ -333,4 +433,5 @@ def test_train_ddp_early_stopping() -> None:
 if __name__ == "__main__":
     test_train_ddp_smoke()
     test_synthetic_checkpoint_callback_unit()
+    test_train_ddp_resume_uses_resume_time_config()
     test_train_ddp_early_stopping()
