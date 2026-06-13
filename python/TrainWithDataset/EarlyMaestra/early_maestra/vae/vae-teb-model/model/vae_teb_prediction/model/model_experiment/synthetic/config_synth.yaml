@@ -545,11 +545,12 @@ dataset:
 # downgrades to "auto" and LR scaling + warmup are no-ops (matches train_minimal).
 ddp:
   devices: 8                   # CLI --devices overrides; 1 on Windows dev
-  strategy: ddp                # plain DDP. The forced G1_mix benchmark trains
-                               # with gaussian_nll + sigma_obs=learned, so the
-                               # logvar_full / logvar_base heads both receive
-                               # grads (no unused params) -- this drops the
-                               # per-backward unused-param scan.
+  strategy: ddp_find_unused_parameters_true   # REQUIRED: under the G1_mix
+                               # gaussian_nll path the lag-attention output
+                               # projection (lag_attn.W_o.weight / .bias) gets
+                               # NO gradient, so plain "ddp" raises "parameters
+                               # not used in producing the loss". The unused-
+                               # param scan is sub-ms at this model size.
                                # -> "auto" when devices == 1
   precision: 32-true           # consider bf16-mixed on H100/A100
   sync_batchnorm: true         # only active when devices > 1 (no BN today; harmless)
