@@ -42,23 +42,37 @@ general_config:
 
 model_config:
   VAE_model:
-    # KL / beta schedule
-    # TODO(beta-annealing): ``kld_beta`` is the only value the trainer
-    # currently reads (the ``beta_*`` fields below are legacy and inert).
-    # 0.001 is intentionally tiny to avoid early posterior collapse, but it
-    # also means ``KL(q||p)`` is an under-regularised TE surrogate — the
-    # bottleneck is barely a bottleneck. Before taking TE curves for a
-    # paper, wire a real β schedule: e.g. linear warm-up from 1e-4 → 0.1
-    # over the first ~50 epochs, or free-bits (Kingma et al. 2016) with a
-    # ~0.1 nat floor per latent dim. Until then, interpret KL magnitudes
-    # with caution.
-    beta_schedule: constant
-    beta_start: 0.0
-    beta_end: 1.0
-    beta_anneal_epochs: 50
-    beta_cycle_len: 1000
-    beta_const_val: 0.01
-    kld_beta: 0.001
+    # KL / beta schedule (A1/A2 — calibrated ELBO).
+    # ``beta_schedule`` is resolved per-epoch by
+    # ``SeqVaeLagAttnPl._resolve_beta``. kind: linear_warmup ramps β from
+    # ``start`` to ``end`` over the first ``warmup_epochs`` epochs, then holds
+    # at ``end`` — the residual decoder learns to use z under weak pressure
+    # before the bottleneck tightens for a calibrated TE reading. kind:
+    # constant uses ``value`` (or the ``kld_beta`` fallback below). Because the
+    # NLL reconstruction (below) is in nats, β≈0.1 is now a real bottleneck,
+    # not the old "barely a bottleneck" 0.001.
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001        # fallback when beta_schedule.kind == constant
+    free_bits: 0.1         # nats per latent dim per step; 0.0 disables
+
+    # Reconstruction likelihood (A1). 'gaussian_nll' puts feat / base losses in
+    # nats so they are directly comparable to kld_loss (β=1 is the true ELBO).
+    # 'mse' is the legacy squared-feature objective. ``sigma_obs`` is the fixed
+    # observation-noise scalar; switch to 'learned' to consume the decoder
+    # logvar heads (heteroscedastic NLL) — that also lets train_model drop the
+    # DDP find_unused_parameters flag (see D10 in train_model).
+    likelihood: gaussian_nll
+    sigma_obs: 1.0
+
+    # A3 — baseline/residual gradient separation. Form the full prediction as
+    # sg(mu_base) + delta_mu_src for L_feat so the feature gradient trains only
+    # the residual / posterior / source path, keeping K_t from absorbing
+    # FHR-self-explainable variance.
+    detach_baseline_in_full: true
 
     # Feature-loss weighting (spec section 8.7)
     lambda_full: 1.0
@@ -88,8 +102,48 @@ model_config:
     max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
     num_heads: 4
     d_head: 32
-    use_entmax: false      # fall back to softmax; entmax is optional
-    attention_grad_checkpoint: true  # start on; ~900 MB memory bank at B=64
+    # B5 — entmax15 gives exactly-zero weights for irrelevant lags (sharper
+    # "which lag matters"). Requires the `entmax` package; falls back to
+    # softmax automatically if it is not importable. Keep `false` for the
+    # softmax ablation arm.
+    use_entmax: true
+    # B6 — keys/values are now projected once from H^u with banded strided
+    # views (no (B,T,L,d_model) bank), so the ~900 MB bank is gone and
+    # gradient checkpointing is no longer required. Set `true` only if you hit
+    # memory pressure at very large batch sizes.
+    attention_grad_checkpoint: false
+    # B4 — lag-embedding smoothness penalty (mean squared adjacent-lag diff of
+    # the Shaw bias) for a smoother, physiologically plausible te_lag_map.
+    lag_smoothness_lambda: 1.0e-3
+    # B4 — lag-bias init: 'normal' (no extra param) or 'alibi_decay' (learnable
+    # monotonic lag penalty so the model earns long-lag usage).
+    lag_bias_init: normal
+
+    # C7 — head-structured latent. Partition z into num_heads groups, each
+    # conditioned only on its attention head's summary a^(m), so the per-head
+    # KL K_t^(m) is a genuine additive decomposition (sum_m K_t^(m) = K_t) and
+    # te_lag_map becomes sum_m K_t^(m) * alpha^(m). Requires d_z % num_heads
+    # == 0 (24 / 4 = 6). Breaks checkpoint alignment with flat-latent runs.
+    head_structured_latent: true
+
+    # D8/D9 — shared horizon decoder core. ``depth`` dilated horizon-conv
+    # blocks (dilations 1,2,4,...) + FiLM conditioning on the decoder state,
+    # shared between the baseline and residual decoders so the residual is a
+    # correction in the baseline's representation space. ``attn`` (horizon
+    # self-attention) is not implemented in this revision.
+    horizon_refine:
+      depth: 3
+      kernel: 3
+      film: true
+      attn: false
+
+    # E11 — append dilated conv blocks (kernel 15) to both encoders for a
+    # longer exponential receptive field over the 20-min window; the 2-layer
+    # uni-LSTM is kept. ``temporal_backbone`` is reserved for a future SSM
+    # option and currently must be 'lstm'.
+    encoder:
+      extra_dilations: [8, 16]
+      temporal_backbone: lstm
 
     # Loss-spike circuit breaker. Guards against the "KL / base loss
     # explodes then decays" pattern observed during early training by

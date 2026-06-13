@@ -44,9 +44,11 @@ _N_TRAIN, _N_VAL, _N_TEST = 6, 4, 4
 _EXPECTED_FORWARD_KEYS = {
     "mu_prior", "logvar_prior", "mu_post", "logvar_post", "z",
     "target_state", "source_state", "decoder_state", "attended_source",
+    # C7: per-head attended summaries a^(m) and the additive per-head KL.
+    "attended_source_heads",
     "attn_weights", "mu_base", "logvar_base", "delta_mu_src", "mu_full",
-    "logvar_full", "raw_future_pred", "kld_per_t", "te_lag_map",
-    "warmup_mask", "mu_prior_sat_frac", "delta_mu_sat_frac",
+    "logvar_full", "raw_future_pred", "kld_per_t", "kld_per_t_per_head",
+    "te_lag_map", "warmup_mask", "mu_prior_sat_frac", "delta_mu_sat_frac",
 }
 
 

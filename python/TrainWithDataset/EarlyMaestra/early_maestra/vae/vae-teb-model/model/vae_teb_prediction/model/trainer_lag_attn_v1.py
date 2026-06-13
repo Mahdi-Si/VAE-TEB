@@ -289,6 +289,53 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
         return loss
 
+    def _resolve_beta(self, epoch: int) -> float:
+        r"""Resolve the KL weight :math:`\beta` for ``epoch`` (A2).
+
+        Reads the structured ``beta_schedule`` hparam. Supported kinds:
+
+        * ``constant`` — returns ``beta_schedule.value`` when present, else
+          the legacy ``kld_beta`` hparam (default ``0.01``).
+        * ``linear_warmup`` — linearly ramps from ``start`` to ``end`` over the
+          first ``warmup_epochs`` epochs, then holds at ``end``:
+
+          .. math::
+              \beta(e) = start + (end - start)\,
+                         \min\!\left(1, \tfrac{e}{warmup\_epochs}\right).
+
+        A weak early :math:`\beta` lets the residual decoder *learn to use*
+        :math:`z` before the bottleneck tightens for a calibrated TE reading.
+        When no ``beta_schedule`` dict is configured the legacy constant
+        ``kld_beta`` is used, preserving pre-A2 behaviour.
+
+        Args:
+            epoch: Current training epoch (``self.current_epoch``).
+
+        Returns:
+            The scalar :math:`\beta` weighting ``kld_loss`` this epoch.
+        """
+        sched = self.hparams.get("beta_schedule")
+        if not isinstance(sched, dict):
+            return float(self.hparams.get("kld_beta", 0.01))
+        kind = str(sched.get("kind", "constant"))
+        if kind == "constant":
+            value = sched.get("value")
+            if value is not None:
+                return float(value)
+            return float(self.hparams.get("kld_beta", 0.01))
+        if kind == "linear_warmup":
+            start = float(sched.get("start", 1.0e-4))
+            end = float(sched.get("end", 0.1))
+            warmup_epochs = int(sched.get("warmup_epochs", 50))
+            if warmup_epochs <= 0:
+                return end
+            frac = min(1.0, max(0.0, float(epoch) / float(warmup_epochs)))
+            return start + (end - start) * frac
+        raise ValueError(
+            f"Unknown beta_schedule.kind={kind!r}; expected "
+            "'constant' or 'linear_warmup'."
+        )
+
     def compute_loss_and_metrics(
         self, batch: Any, batch_idx: int, stage: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -299,9 +346,28 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
         forward_outputs = self.model(y_st, y_ph, u_stream)
 
-        beta = float(self.hparams.get("kld_beta", 0.01))
+        # A2: epoch-dependent β from the structured schedule (falls back to the
+        # constant ``kld_beta`` when no schedule is configured).
+        beta = self._resolve_beta(self.current_epoch)
         lambda_full = float(self.hparams.get("lambda_full", 1.0))
         lambda_base = float(self.hparams.get("lambda_base", 0.5))
+
+        # A1: calibrated ELBO. ``likelihood='gaussian_nll'`` puts feat / base
+        # losses in nats so they are directly comparable to ``kld_loss``;
+        # ``sigma_obs`` is the fixed observation-noise scalar (or 'learned' to
+        # activate the decoder logvar heads). A2: ``free_bits`` floors the
+        # per-dim KL. A3: ``detach_baseline_in_full`` stop-gradients the
+        # baseline inside the full-prediction term.
+        likelihood = str(self.hparams.get("likelihood", "mse"))
+        sigma_obs = self.hparams.get("sigma_obs", 1.0)
+        if not isinstance(sigma_obs, str):
+            sigma_obs = float(sigma_obs)
+        free_bits = float(self.hparams.get("free_bits", 0.0))
+        detach_baseline_in_full = bool(
+            self.hparams.get("detach_baseline_in_full", False)
+        )
+        # B4: lag-embedding smoothness weight.
+        lambda_lag = float(self.hparams.get("lambda_lag", 0.0))
 
         # Pass the dataset per-step validity mask so gaps (weight ≈ 0) do
         # not pollute feat / base / KL losses. Required for a trustworthy
@@ -316,6 +382,11 @@ class SeqVaeLagAttnPl(LightningModelBase):
             beta=beta,
             lambda_full=lambda_full,
             lambda_base=lambda_base,
+            likelihood=likelihood,
+            sigma_obs=sigma_obs,
+            free_bits=free_bits,
+            detach_baseline_in_full=detach_baseline_in_full,
+            lambda_lag=lambda_lag,
         )
         total_loss = loss_dict["total_loss"]
 
@@ -361,6 +432,8 @@ class SeqVaeLagAttnPl(LightningModelBase):
             "delta_mu_rms": diag["delta_mu_rms"],
             "mu_post_prior_gap_rms": diag["mu_post_prior_gap_rms"],
             "pred_gap": pred_gap,
+            # B4 lag-embedding smoothness penalty (raw, pre-weighting).
+            "lag_smoothness": loss_dict["lag_smoothness"],
         }
         return total_loss, metrics
 
@@ -487,7 +560,23 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "attention_grad_checkpoint": bool(
                 vae_cfg.get("attention_grad_checkpoint", True)
             ),
+            # B4 — lag-bias init: 'normal' (default) or 'alibi_decay'.
+            "lag_bias_init": str(vae_cfg.get("lag_bias_init", "normal")),
+            # C7 — head-structured latent (per-head additive KL).
+            "head_structured_latent": bool(
+                vae_cfg.get("head_structured_latent", False)
+            ),
         }
+        # D8 — shared horizon decoder core (depth / kernel / FiLM).
+        horizon_cfg = vae_cfg.get("horizon_refine", {}) or {}
+        kwargs["horizon_depth"] = int(horizon_cfg.get("depth", 2))
+        kwargs["horizon_kernel"] = int(horizon_cfg.get("kernel", 3))
+        kwargs["horizon_film"] = bool(horizon_cfg.get("film", False))
+        # E11 — extra encoder dilations for a longer receptive field.
+        encoder_cfg = vae_cfg.get("encoder", {}) or {}
+        kwargs["encoder_extra_dilations"] = tuple(
+            int(x) for x in (encoder_cfg.get("extra_dilations", []) or [])
+        )
         logvar_clamp = vae_cfg.get("logvar_clamp")
         if isinstance(logvar_clamp, (list, tuple)) and len(logvar_clamp) == 2:
             kwargs["logvar_clamp"] = (float(logvar_clamp[0]), float(logvar_clamp[1]))
@@ -523,6 +612,20 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "kld_beta": vae_cfg.get("kld_beta", 0.01),
             "lambda_full": vae_cfg.get("lambda_full", 1.0),
             "lambda_base": vae_cfg.get("lambda_base", 0.5),
+            # A1/A2/A3 calibration core. ``beta_schedule`` (dict) is resolved
+            # per-epoch by ``SeqVaeLagAttnPl._resolve_beta``; ``likelihood`` /
+            # ``sigma_obs`` select the reconstruction NLL; ``free_bits`` floors
+            # the per-dim KL; ``detach_baseline_in_full`` stop-gradients the
+            # baseline inside the full-prediction term.
+            "beta_schedule": vae_cfg.get("beta_schedule"),
+            "likelihood": vae_cfg.get("likelihood", "mse"),
+            "sigma_obs": vae_cfg.get("sigma_obs", 1.0),
+            "free_bits": vae_cfg.get("free_bits", 0.0),
+            "detach_baseline_in_full": vae_cfg.get(
+                "detach_baseline_in_full", False
+            ),
+            # B4 — lag-embedding smoothness weight (lambda_lag).
+            "lambda_lag": vae_cfg.get("lag_smoothness_lambda", 0.0),
             # Loss-spike circuit breaker. Consumed in SeqVaeLagAttnPl._spike_cfg.
             # Missing keys fall back to the class-level ``_SPIKE_DEFAULTS``.
             "loss_spike_skip": vae_cfg.get("loss_spike_skip", {}) or {},
@@ -608,28 +711,37 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "logger": logger_reference,
         }
         if torch.cuda.is_available():
-            # ``ddp_find_unused_parameters_true`` is required because
-            # :class:`SeqVaeLagAttnV1` deliberately keeps two auxiliary logvar
-            # heads (``BaselineFutureDecoder.logvar_head`` at line 700 and
-            # ``ResidualFutureDecoder.logvar_head`` at line 768 in
-            # ``vae_teb_lag_attn_v1.py``) wired into forward but not yet
-            # consumed by ``compute_loss`` — they are placeholders for a
-            # planned switch from MSE to heteroscedastic Gaussian NLL, per the
-            # docstring at ``vae_teb_lag_attn_v1.py:664-666``. Their
-            # parameters receive ``None`` gradients on every backward pass,
-            # which makes DDP's default first-iteration bucket rebuild trip
-            # with "parameters that were not used in producing the loss". The
-            # flag tells DDP's reducer to tolerate ungraded parameters, at the
-            # cost of an extra post-backward scan across the parameter list
-            # (sub-ms overhead at this model size). When the loss eventually
-            # switches to Gaussian NLL and starts consuming
-            # ``forward_outputs['logvar_base']`` / ``['logvar_full']``, this
-            # flag can be reverted to plain ``'ddp'``.
-            ddp_strategy = (
-                "ddp_find_unused_parameters_true"
-                if len(self.cuda_devices) > 1
-                else "auto"
+            # D10 — DDP strategy depends on whether the decoder logvar heads
+            # receive gradients. ``SeqVaeLagAttnV1`` keeps two auxiliary logvar
+            # heads (``BaselineFutureDecoder.logvar_head`` /
+            # ``ResidualFutureDecoder.logvar_head``) wired into forward. They
+            # are consumed by ``compute_loss`` ONLY when
+            # ``likelihood='gaussian_nll'`` AND ``sigma_obs='learned'``
+            # (heteroscedastic NLL). In every other config (MSE, or
+            # gaussian_nll with a fixed scalar ``sigma_obs``) they receive
+            # ``None`` gradients, so DDP's first-iteration bucket rebuild trips
+            # with "parameters that were not used in producing the loss" unless
+            # we set ``find_unused_parameters``. Once ``sigma_obs='learned'``
+            # activates the heads, plain ``'ddp'`` is correct and drops the
+            # extra post-backward scan.
+            vae_cfg = (
+                self.config.get("model_config", {}).get("VAE_model", {}) or {}
             )
+            sigma_obs = vae_cfg.get("sigma_obs", 1.0)
+            likelihood = str(vae_cfg.get("likelihood", "mse"))
+            logvar_heads_consumed = (
+                likelihood == "gaussian_nll"
+                and isinstance(sigma_obs, str)
+                and sigma_obs == "learned"
+            )
+            if len(self.cuda_devices) > 1:
+                ddp_strategy = (
+                    "ddp"
+                    if logvar_heads_consumed
+                    else "ddp_find_unused_parameters_true"
+                )
+            else:
+                ddp_strategy = "auto"
             trainer_kwargs.update(
                 {
                     "accelerator": "gpu",

@@ -298,6 +298,8 @@ def test_return_dict_invariants(model, batch, forward_out):
     expected = {
         "feat_loss", "base_loss", "kld_loss", "total_loss", "beta",
         "likelihood", "mean_logvar_full", "mean_logvar_base",
+        # B4: lag-embedding smoothness penalty (0.0 when lambda_lag == 0).
+        "lag_smoothness",
     }
     for like, sig in (("mse", 1.0), ("gaussian_nll", 1.0),
                       ("gaussian_nll", "learned")):

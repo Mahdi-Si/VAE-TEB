@@ -294,10 +294,7 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
         (``lr * n_gpus``) is applied by the caller before construction; the
         warmup ramps from a small fraction up to that scaled ``lr``.
         """
-        # Coerce to ``int`` so a hand-edited YAML config (e.g. ``lr_milestones:
-        # ["100"]`` -- quoted scalars stay strings) does not blow up the warmup
-        # branch's ``m - warmup_epochs`` with a ``str - int`` ``TypeError``.
-        milestones = [int(m) for m in (self.hparams.get("lr_milestones") or [])]
+        milestones = list(self.hparams.get("lr_milestones") or [])
         gamma = float(self.hparams.get("lr_gamma", 0.1))
         warmup_epochs = int(self.hparams.get("warmup_epochs", 0) or 0)
 

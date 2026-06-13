@@ -172,8 +172,8 @@ class _CausalConvLstmEncoder(nn.Module):
         self,
         *,
         d_model: int,
-        cnn_kernels: Tuple[int, int, int],
-        cnn_dilations: Tuple[int, int, int],
+        cnn_kernels: Tuple[int, ...],
+        cnn_dilations: Tuple[int, ...],
         lstm_layers: int,
         lstm_dropout: float,
         conv_dropout: float,
@@ -192,38 +192,35 @@ class _CausalConvLstmEncoder(nn.Module):
             dropout=conv_dropout,
         )
 
-        # Stage B — three stacked causal conv blocks with inter-block skips
-        k1, k2, k3 = cnn_kernels
-        d1, d2, d3 = cnn_dilations
-        self.conv_1 = CausalMultiChannelConvBlock(
-            in_channels=d_model,
-            out_channels=d_model,
-            filter_size=k1,
-            dilation=d1,
-            dropout=conv_dropout,
-            activation=nn.GELU,
+        # Stage B — N stacked causal conv blocks with inter-block skips (E11:
+        # the schedule length is configurable so longer-dilation blocks can be
+        # appended for a longer exponential receptive field).
+        if len(cnn_kernels) != len(cnn_dilations):
+            raise ValueError(
+                "cnn_kernels and cnn_dilations must have equal length, got "
+                f"{len(cnn_kernels)} and {len(cnn_dilations)}"
+            )
+        if len(cnn_kernels) < 1:
+            raise ValueError("need at least one causal conv block")
+        self.convs = nn.ModuleList(
+            [
+                CausalMultiChannelConvBlock(
+                    in_channels=d_model,
+                    out_channels=d_model,
+                    filter_size=k,
+                    dilation=dil,
+                    dropout=conv_dropout,
+                    activation=nn.GELU,
+                )
+                for k, dil in zip(cnn_kernels, cnn_dilations)
+            ]
         )
-        self.conv_2 = CausalMultiChannelConvBlock(
-            in_channels=d_model,
-            out_channels=d_model,
-            filter_size=k2,
-            dilation=d2,
-            dropout=conv_dropout,
-            activation=nn.GELU,
-        )
-        self.conv_3 = CausalMultiChannelConvBlock(
-            in_channels=d_model,
-            out_channels=d_model,
-            filter_size=k3,
-            dilation=d3,
-            dropout=conv_dropout,
-            activation=nn.GELU,
-        )
-        self.stack_skip_norm_1 = nn.GroupNorm(
-            num_groups=min(8, d_model), num_channels=d_model
-        )
-        self.stack_skip_norm_2 = nn.GroupNorm(
-            num_groups=min(8, d_model), num_channels=d_model
+        # One inter-block skip norm between each adjacent conv pair.
+        self.stack_skip_norms = nn.ModuleList(
+            [
+                nn.GroupNorm(num_groups=min(8, d_model), num_channels=d_model)
+                for _ in range(len(self.convs) - 1)
+            ]
         )
         self.conv_out_norm = nn.LayerNorm(d_model)
 
@@ -259,10 +256,10 @@ class _CausalConvLstmEncoder(nn.Module):
 
         # Stage B — conv stack with skips (inputs in (B, C, T))
         x_conv = x_lin.transpose(1, 2).contiguous()  # (B, d_model, T)
-        c1 = self.conv_1(x_conv)
-        c2 = self.conv_2(c1) + self.stack_skip_norm_1(c1)
-        c3 = self.conv_3(c2) + self.stack_skip_norm_2(c2)
-        conv_out = self.conv_out_norm(c3.transpose(1, 2).contiguous() + x_lin)
+        out = self.convs[0](x_conv)
+        for i in range(1, len(self.convs)):
+            out = self.convs[i](out) + self.stack_skip_norms[i - 1](out)
+        conv_out = self.conv_out_norm(out.transpose(1, 2).contiguous() + x_lin)
 
         # Stage C — LSTM
         lstm_out, _ = self.lstm(x_lin)
@@ -285,8 +282,8 @@ class TargetEncoder(nn.Module):
     def __init__(
         self,
         d_model: int = 128,
-        cnn_kernels: Tuple[int, int, int] = (3, 7, 11),
-        cnn_dilations: Tuple[int, int, int] = (1, 2, 4),
+        cnn_kernels: Tuple[int, ...] = (3, 7, 11),
+        cnn_dilations: Tuple[int, ...] = (1, 2, 4),
         lstm_layers: int = 2,
         lstm_dropout: float = 0.1,
         conv_dropout: float = 0.1,
@@ -318,8 +315,8 @@ class SourceEncoder(nn.Module):
     def __init__(
         self,
         d_model: int = 128,
-        cnn_kernels: Tuple[int, int, int] = (3, 5, 11),
-        cnn_dilations: Tuple[int, int, int] = (1, 2, 4),
+        cnn_kernels: Tuple[int, ...] = (3, 5, 11),
+        cnn_dilations: Tuple[int, ...] = (1, 2, 4),
         lstm_layers: int = 2,
         lstm_dropout: float = 0.1,
         conv_dropout: float = 0.1,
@@ -456,8 +453,11 @@ class PosteriorHead(nn.Module):
         logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
         dropout: float = 0.1,
         delta_mu_scale: float = 3.0,
+        head_structured: bool = False,
+        num_heads: int = 4,
+        d_head: int = 32,
     ) -> None:
-        """Initialize the posterior head.
+        r"""Initialize the posterior head.
 
         Args:
             d_model: Encoder state width.
@@ -467,6 +467,18 @@ class PosteriorHead(nn.Module):
             delta_mu_scale: Saturation magnitude of the tanh-bounded posterior
                 delta; must be positive. ``delta_mu`` is soft-limited so the
                 posterior mean stays within ``mu_prior +/- delta_mu_scale``.
+            head_structured: C7 toggle. When ``True`` the latent is partitioned
+                into ``num_heads`` groups of ``d_z / num_heads`` dims, and each
+                group's posterior is produced *only* from that attention head's
+                summary :math:`a^{(m)}` fused with ``H^y``. This makes the
+                per-group KL :math:`K_t^{(m)}` a genuine additive decomposition
+                :math:`K_t=\sum_m K_t^{(m)}`. The prior stays shared/un-grouped
+                (target-only, invariant 2). When ``False`` the legacy flat
+                fusion ``[LN(H^y) || LN(A)]`` is used.
+            num_heads: Number of latent groups when ``head_structured``
+                (``d_z % num_heads == 0`` required).
+            d_head: Per-head summary width :math:`a^{(m)}` (the attention
+                ``d_head``), used only when ``head_structured``.
         """
         super().__init__()
         if delta_mu_scale <= 0.0:
@@ -475,33 +487,70 @@ class PosteriorHead(nn.Module):
             )
         self.logvar_clamp = logvar_clamp
         self.delta_mu_scale = float(delta_mu_scale)
+        self.head_structured = bool(head_structured)
+        self.num_heads = int(num_heads)
 
-        # Per-modality input norms keep H^y and A on comparable scales before
-        # concatenation; the existing ResidualMLP internal LN then normalises
-        # the fused 2*d_model tensor.
+        # ``H^y`` norm is shared across the flat and head-structured paths.
         self.h_y_norm = nn.LayerNorm(d_model)
-        self.a_norm = nn.LayerNorm(d_model)
 
-        fused_in = 2 * d_model  # concat [LN(H^y), LN(A)]
-        self.fusion = ResidualMLP(
-            input_dim=fused_in,
-            hidden_dims=geometric_schedule(fused_in, d_model, 3),
-            final_activation=True,
-            use_skip_connection=True,
-            use_input_layer_norm=True,
-            activation=nn.GELU,
-            dropout=dropout,
-        )
-        self.delta_mu_head = nn.Linear(d_model, d_z)
-        self.logvar_post_head = ResidualMLP(
-            input_dim=d_model,
-            hidden_dims=geometric_schedule(d_model, d_z, 4),
-            final_activation=False,
-            use_skip_connection=True,
-            use_input_layer_norm=True,
-            activation=nn.GELU,
-            dropout=dropout,
-        )
+        if self.head_structured:
+            if d_z % num_heads != 0:
+                raise ValueError(
+                    f"head_structured posterior needs d_z % num_heads == 0, "
+                    f"got d_z={d_z}, num_heads={num_heads}"
+                )
+            self.group = d_z // num_heads
+            self.d_head = int(d_head)
+            # LayerNorm applied to each head's a^(m) (trailing d_head axis).
+            self.a_head_norm = nn.LayerNorm(d_head)
+            fuse_in = d_model + d_head
+            fuse_out = max(2 * self.group, 16)
+            # One small fusion + (delta_mu, logvar) head per latent group.
+            self.fusion = nn.ModuleList(
+                [
+                    ResidualMLP(
+                        input_dim=fuse_in,
+                        hidden_dims=geometric_schedule(fuse_in, fuse_out, 2),
+                        final_activation=True,
+                        use_skip_connection=True,
+                        use_input_layer_norm=True,
+                        activation=nn.GELU,
+                        dropout=dropout,
+                    )
+                    for _ in range(num_heads)
+                ]
+            )
+            self.delta_mu_head = nn.ModuleList(
+                [nn.Linear(fuse_out, self.group) for _ in range(num_heads)]
+            )
+            self.logvar_post_head = nn.ModuleList(
+                [nn.Linear(fuse_out, self.group) for _ in range(num_heads)]
+            )
+        else:
+            # Per-modality input norms keep H^y and A on comparable scales
+            # before concatenation; the ResidualMLP internal LN then normalises
+            # the fused 2*d_model tensor.
+            self.a_norm = nn.LayerNorm(d_model)
+            fused_in = 2 * d_model  # concat [LN(H^y), LN(A)]
+            self.fusion = ResidualMLP(
+                input_dim=fused_in,
+                hidden_dims=geometric_schedule(fused_in, d_model, 3),
+                final_activation=True,
+                use_skip_connection=True,
+                use_input_layer_norm=True,
+                activation=nn.GELU,
+                dropout=dropout,
+            )
+            self.delta_mu_head = nn.Linear(d_model, d_z)
+            self.logvar_post_head = ResidualMLP(
+                input_dim=d_model,
+                hidden_dims=geometric_schedule(d_model, d_z, 4),
+                final_activation=False,
+                use_skip_connection=True,
+                use_input_layer_norm=True,
+                activation=nn.GELU,
+                dropout=dropout,
+            )
 
     def forward(
         self,
@@ -513,18 +562,31 @@ class PosteriorHead(nn.Module):
 
         Args:
             h_y: Target state ``(B, T, d_model)``.
-            a: Attended source summary ``(B, T, d_model)``.
+            a: Attended source summary. ``(B, T, d_model)`` for the flat path;
+                ``(B, T, num_heads, d_head)`` per-head summaries for the
+                head-structured path.
             mu_prior: Prior mean ``(B, T, d_z)`` (used for the residual add).
         """
-        fused = self.fusion(
-            torch.cat([self.h_y_norm(h_y), self.a_norm(a)], dim=-1)
-        )
-        raw_delta = self.delta_mu_head(fused)
-        # tanh(0) = 0, so with ``delta_mu_head`` zero-inited the bounded
-        # ``delta_mu`` is also identically zero at step 0.
+        if self.head_structured:
+            hy = self.h_y_norm(h_y)                               # (B, T, d_model)
+            raw_deltas, logvars = [], []
+            for m in range(self.num_heads):
+                a_m = self.a_head_norm(a[:, :, m, :])             # (B, T, d_head)
+                fused_m = self.fusion[m](torch.cat([hy, a_m], dim=-1))
+                raw_deltas.append(self.delta_mu_head[m](fused_m))  # (B, T, group)
+                logvars.append(self.logvar_post_head[m](fused_m))
+            raw_delta = torch.cat(raw_deltas, dim=-1)             # (B, T, d_z)
+            logvar_post = torch.cat(logvars, dim=-1)             # (B, T, d_z)
+        else:
+            fused = self.fusion(
+                torch.cat([self.h_y_norm(h_y), self.a_norm(a)], dim=-1)
+            )
+            raw_delta = self.delta_mu_head(fused)
+            logvar_post = self.logvar_post_head(fused)
+        # tanh(0) = 0, so with the delta_mu head(s) zero-inited the bounded
+        # ``delta_mu`` is identically zero at step 0 (warm-start invariant).
         delta_mu = self.delta_mu_scale * torch.tanh(raw_delta / self.delta_mu_scale)
         mu_post = mu_prior + delta_mu
-        logvar_post = self.logvar_post_head(fused)
         logvar_post = torch.clamp(
             logvar_post, min=self.logvar_clamp[0], max=self.logvar_clamp[1]
         )
@@ -575,6 +637,35 @@ class LagMemoryBankBuilder(nn.Module):
         return mem, m_lag
 
 
+def _alibi_slopes(num_heads: int) -> torch.Tensor:
+    r"""ALiBi-style geometric per-head slopes for the lag-decay bias (B4).
+
+    Returns positive slopes :math:`m_h` (one per head) following the
+    power-of-two schedule of Press et al. (2022). A score bias
+    :math:`-m_h\,\ell` then penalises larger lags, so each head starts biased
+    toward short lags and must *earn* long-lag usage.
+
+    Args:
+        num_heads: Number of attention heads.
+
+    Returns:
+        Tensor of shape ``(num_heads,)`` with the per-head slopes.
+    """
+
+    def _pow2_slopes(n: int) -> list:
+        start = 2.0 ** (-(2.0 ** -(math.log2(n) - 3.0)))
+        return [start * (start ** i) for i in range(n)]
+
+    if math.log2(num_heads).is_integer():
+        slopes = _pow2_slopes(num_heads)
+    else:  # pragma: no cover - num_heads is a power of two in practice
+        closest = 2 ** int(math.floor(math.log2(num_heads)))
+        slopes = _pow2_slopes(closest)
+        extra = _pow2_slopes(2 * closest)[0::2][: num_heads - closest]
+        slopes = slopes + extra
+    return torch.tensor(slopes, dtype=torch.float32)
+
+
 class LagCrossAttention(nn.Module):
     """Multi-head cross-attention from current FHR state to lagged UP memory.
 
@@ -582,6 +673,13 @@ class LagCrossAttention(nn.Module):
     position encoding). Attention scores are masked using the lag validity
     mask, then normalised with ``softmax`` (or ``entmax15`` if available and
     enabled via ``use_entmax=True``).
+
+    Memory layout (B6): keys/values are projected **once** from the source
+    state ``H^u`` ``(B, T, d_model)`` and the lag window is formed with
+    strided views (``unfold``) over the projected ``(B, T, num_heads, d_head)``
+    tensors. No ``(B, T, L, d_model)`` memory bank is ever materialised, so
+    peak activation memory drops by ``~L``× versus the old materialised path.
+    The forward result is numerically identical to that path.
     """
 
     def __init__(
@@ -593,6 +691,7 @@ class LagCrossAttention(nn.Module):
         dropout: float = 0.1,
         use_entmax: bool = False,
         grad_checkpoint: bool = False,
+        lag_bias_init: str = "normal",
     ) -> None:
         """Initialize the attention module.
 
@@ -606,7 +705,13 @@ class LagCrossAttention(nn.Module):
                 for sparse attention. Falls back to ``softmax`` otherwise.
             grad_checkpoint: If True, wrap the attention op in
                 ``torch.utils.checkpoint.checkpoint`` to trade compute for
-                memory (the lag memory bank can be ~900 MB at B=64).
+                memory. With the B6 view-based projection the retained memory
+                is already small, so this can usually stay False.
+            lag_bias_init: ``'normal'`` (default) adds no extra parameter and
+                is bit-identical to the pre-B4 path. ``'alibi_decay'`` seeds a
+                *learnable* per-(head, lag) scalar score bias with an
+                ALiBi-style negative slope (B4), so distant lags start mildly
+                penalised and the model must earn long-lag usage.
         """
         super().__init__()
         if num_heads * d_head != d_model:
@@ -634,71 +739,124 @@ class LagCrossAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
         self.attn_dropout = nn.Dropout(dropout)
 
-        # Per-lag learned bias broadcast-added to keys.
+        # Per-lag learned bias broadcast-added to keys (Shaw-style).
         self.lag_embeddings = nn.Parameter(
             torch.zeros(self.L, num_heads, d_head)
         )
         nn.init.normal_(self.lag_embeddings, mean=0.0, std=0.02)
 
+        # B4 — optional ALiBi-style monotonic lag decay. 'normal' registers no
+        # extra parameter (path identical to pre-B4). 'alibi_decay' seeds a
+        # learnable per-(head, lag) scalar score bias with a negative slope.
+        if lag_bias_init not in ("normal", "alibi_decay"):
+            raise ValueError(
+                "lag_bias_init must be 'normal' or 'alibi_decay', "
+                f"got {lag_bias_init!r}"
+            )
+        self.lag_bias_init = lag_bias_init
+        if lag_bias_init == "alibi_decay":
+            slopes = _alibi_slopes(num_heads)                  # (num_heads,)
+            lags = torch.arange(self.L, dtype=torch.float32)   # (L,)
+            decay = -slopes[:, None] * lags[None, :]           # (num_heads, L)
+            self.lag_score_bias = nn.Parameter(decay)
+        else:
+            self.register_parameter("lag_score_bias", None)
+
+    def _build_lag_mask(
+        self, seq_len: int, device: Optional[torch.device] = None
+    ) -> torch.Tensor:
+        """Return the ``(T, L)`` lag-validity mask (``True`` iff ``t - l >= 0``)."""
+        t_ar = torch.arange(seq_len, device=device)[:, None]
+        l_ar = torch.arange(self.L, device=device)[None, :]
+        return t_ar - l_ar >= 0                                       # (T, L) bool
+
     def _attend(
         self,
         h_y: torch.Tensor,
-        mem: torch.Tensor,
+        h_u: torch.Tensor,
         m_lag: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T = h_y.shape[0], h_y.shape[1]
         L = self.L
         Mh = self.num_heads
         d = self.d_head
 
-        h_y_n = self.q_norm(h_y)
-        mem_n = self.kv_norm(mem)
+        # Project Q from the target state and K/V from the source state ONCE.
+        Q = self.W_q(self.q_norm(h_y)).view(B, T, Mh, d)             # (B, T, Mh, d)
+        hu_n = self.kv_norm(h_u)                                     # (B, T, d_model)
+        Kp = self.W_k(hu_n).view(B, T, Mh, d)                       # (B, T, Mh, d)
+        Vp = self.W_v(hu_n).view(B, T, Mh, d)                       # (B, T, Mh, d)
 
-        Q = self.W_q(h_y_n).view(B, T, Mh, d)                        # (B, T, Mh, d)
-        K = self.W_k(mem_n).view(B, T, L, Mh, d)                     # (B, T, L, Mh, d)
-        V = self.W_v(mem_n).view(B, T, L, Mh, d)                     # (B, T, L, Mh, d)
+        # Banded lag windows as strided views over the projected K/V — no
+        # (B, T, L, d_model) bank is materialised. Window index ``j`` maps to
+        # lag ``L - 1 - j`` (oldest first); all lag-indexed tensors (bias,
+        # mask, returned alpha) are flipped on the small ``L`` axis so the
+        # large windows stay as views.
+        Kp_pad = F.pad(Kp, (0, 0, 0, 0, L - 1, 0))                  # (B, T+L-1, Mh, d)
+        Vp_pad = F.pad(Vp, (0, 0, 0, 0, L - 1, 0))
+        Kw = Kp_pad.unfold(1, L, 1)                                  # (B, T, Mh, d, L) view
+        Vw = Vp_pad.unfold(1, L, 1)                                  # (B, T, Mh, d, L) view
 
-        # Shaw-style: add per-lag bias to keys before the dot product.
-        K = K + self.lag_embeddings[None, None, :, :, :]
+        # Content score <q_t, k_{t-l}> + Shaw bias <q_t, r_l>, window order.
+        scores = torch.einsum("btmd,btmdj->btmj", Q, Kw)
+        scores = scores + torch.einsum(
+            "btmd,jmd->btmj", Q, self.lag_embeddings.flip(0)
+        )
+        scores = scores * self.scale
+        if self.lag_score_bias is not None:                         # B4 alibi_decay
+            scores = scores + self.lag_score_bias.flip(-1)[None, None, :, :]
 
-        scores = torch.einsum("btmd,btlmd->btml", Q, K) * self.scale  # (B, T, Mh, L)
-        # Mask invalid lags (where t - l < 0). ``m_lag`` is (B, T, L).
-        invalid = (~m_lag)[:, :, None, :]                             # (B, T, 1, L)
-        scores = scores.masked_fill(invalid, float("-inf"))
+        # Lag validity (window order): position ``j`` valid iff ``t-(L-1-j) >= 0``.
+        m_win = m_lag.flip(-1).to(torch.bool)                       # (T, L)
+        scores = scores.masked_fill(~m_win[None, :, None, :], float("-inf"))
 
         if self.use_entmax and _entmax15 is not None:
-            alpha = _entmax15(scores, dim=-1)
+            alpha_win = _entmax15(scores, dim=-1)
         else:
-            alpha = F.softmax(scores, dim=-1)
-        alpha = torch.nan_to_num(alpha, nan=0.0)  # guard when *all* lags invalid
-        alpha = self.attn_dropout(alpha)
+            alpha_win = F.softmax(scores, dim=-1)
+        alpha_win = torch.nan_to_num(alpha_win, nan=0.0)  # guard all-invalid row
+        alpha_win = self.attn_dropout(alpha_win)
 
-        head_out = torch.einsum("btml,btlmd->btmd", alpha, V)         # (B, T, Mh, d)
-        out = self.W_o(head_out.reshape(B, T, Mh * d))                # (B, T, d_model)
-        return out, alpha
+        head_out = torch.einsum("btmj,btmdj->btmd", alpha_win, Vw)  # (B, T, Mh, d)
+        out = self.W_o(head_out.reshape(B, T, Mh * d))             # (B, T, d_model)
+
+        alpha = alpha_win.flip(-1)                                  # lag order (B,T,Mh,L)
+        # ``head_out`` is the per-head attended summary a^(m) *before* W_o
+        # (C7 head-structured posterior consumes it; the flat path ignores it).
+        return out, alpha, head_out
 
     def forward(
         self,
         h_y: torch.Tensor,
-        mem: torch.Tensor,
-        m_lag: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Attend from ``h_y`` over lagged ``mem``.
+        h_u: torch.Tensor,
+        m_lag: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Attend from ``h_y`` over lagged projections of ``h_u``.
 
         Args:
             h_y: Target state ``(B, T, d_model)``.
-            mem: Lagged source memory ``(B, T, L, d_model)``.
-            m_lag: Lag validity mask ``(B, T, L)``.
+            h_u: Source state ``(B, T, d_model)``. Keys/values are projected
+                directly from this sequence; the lag window is built with
+                strided views (no ``(B, T, L, d_model)`` bank).
+            m_lag: Optional lag-validity mask. ``(T, L)`` is preferred; a legacy
+                ``(B, T, L)`` mask is accepted (collapsed to ``(T, L)`` since it
+                depends only on ``(t, l)``). Built on the fly when ``None``.
 
         Returns:
-            ``(A, alpha)`` where ``A`` has shape ``(B, T, d_model)`` and
-            ``alpha`` has shape ``(B, T, num_heads, L)``.
+            ``(A, alpha, a_heads)`` where ``A`` has shape ``(B, T, d_model)``,
+            ``alpha`` has shape ``(B, T, num_heads, L)`` in lag order
+            (index 0 = current step), and ``a_heads`` has shape
+            ``(B, T, num_heads, d_head)`` (per-head summaries before ``W_o``).
         """
+        if m_lag is None:
+            m_lag = self._build_lag_mask(h_y.shape[1], device=h_y.device)
+        elif m_lag.dim() == 3:
+            m_lag = m_lag[0]
         if self.grad_checkpoint and self.training:
             return torch.utils.checkpoint.checkpoint(
-                self._attend, h_y, mem, m_lag, use_reentrant=False
+                self._attend, h_y, h_u, m_lag, use_reentrant=False
             )
-        return self._attend(h_y, mem, m_lag)
+        return self._attend(h_y, h_u, m_lag)
 
 
 # =============================================================================
@@ -707,28 +865,117 @@ class LagCrossAttention(nn.Module):
 
 
 class _HorizonRefine(nn.Module):
-    """Two 1D convs along the forecast-horizon axis with GELU + GroupNorm."""
+    """Stack of dilated 1D convs along the forecast-horizon axis (D8).
 
-    def __init__(self, d_hidden: int, kernel_size: int = 3) -> None:
+    Each block is ``Conv1d -> GroupNorm -> GELU`` with a residual add. The
+    dilation schedule defaults to ``(1, 2, 4, ...)`` so the horizon receptive
+    field grows exponentially with depth.
+    """
+
+    def __init__(
+        self,
+        d_hidden: int,
+        kernel_size: int = 3,
+        dilations: Tuple[int, ...] = (1, 2),
+    ) -> None:
         super().__init__()
-        self.conv_1 = nn.Conv1d(
-            d_hidden, d_hidden, kernel_size=kernel_size,
-            padding=kernel_size // 2,
-        )
-        self.norm_1 = nn.GroupNorm(num_groups=min(8, d_hidden), num_channels=d_hidden)
-        self.conv_2 = nn.Conv1d(
-            d_hidden, d_hidden, kernel_size=kernel_size,
-            padding=kernel_size // 2,
-        )
-        self.norm_2 = nn.GroupNorm(num_groups=min(8, d_hidden), num_channels=d_hidden)
+        self.blocks = nn.ModuleList()
+        for dil in dilations:
+            pad = (kernel_size // 2) * dil
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "conv": nn.Conv1d(
+                            d_hidden, d_hidden, kernel_size=kernel_size,
+                            padding=pad, dilation=dil,
+                        ),
+                        "norm": nn.GroupNorm(
+                            num_groups=min(8, d_hidden), num_channels=d_hidden
+                        ),
+                    }
+                )
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Refine ``(N, d_hidden, H_d)`` along the horizon axis."""
-        y = self.conv_1(x)
-        y = F.gelu(self.norm_1(y))
-        y = self.conv_2(y)
-        y = F.gelu(self.norm_2(y))
-        return x + y
+        for blk in self.blocks:
+            y = blk["conv"](x)
+            y = F.gelu(blk["norm"](y))
+            x = x + y
+        return x
+
+
+class HorizonDecoderCore(nn.Module):
+    r"""Shared horizon-refinement core for both future decoders (D8 + D9).
+
+    Holds the forecast-step embedding, optional FiLM modulation, the dilated
+    horizon-conv refine stack, and the output ``LayerNorm``. Both decoders feed
+    their projected ``(B, T, d_hidden)`` state through the *same* core
+    (:meth:`decode`), so (D9) the residual decoder operates as a correction in
+    the baseline's representation space, the horizon dynamics are learned once,
+    and parameter count drops. Only the input ``proj`` and the output
+    ``mean_head`` / ``logvar_head`` differ between decoders.
+
+    FiLM (D8) modulates the horizon-expanded features with per-channel
+    :math:`(\gamma, \beta)` generated from the projected state; the generator is
+    zero-inited so the core starts as an identity-FiLM (warm-start safe).
+    """
+
+    def __init__(
+        self,
+        d_hidden: int = 128,
+        horizon: int = 30,
+        kernel_size: int = 3,
+        depth: int = 2,
+        film: bool = False,
+    ) -> None:
+        """Initialize the shared horizon core.
+
+        Args:
+            d_hidden: Decoder hidden width.
+            horizon: Forecast horizon ``H_d``.
+            kernel_size: Horizon-conv kernel size.
+            depth: Number of dilated conv blocks (dilations ``1, 2, 4, ...``).
+            film: If True, apply FiLM conditioning per horizon step.
+        """
+        super().__init__()
+        self.horizon = int(horizon)
+        self.d_hidden = int(d_hidden)
+        self.film = bool(film)
+
+        # Internal forecast-step embedding (not dataset-time metadata).
+        self.horizon_embedding = nn.Parameter(torch.zeros(horizon, d_hidden))
+        nn.init.normal_(self.horizon_embedding, mean=0.0, std=0.02)
+
+        depth = max(1, int(depth))
+        dilations = tuple(2 ** i for i in range(depth))
+        self.refine = _HorizonRefine(
+            d_hidden, kernel_size=kernel_size, dilations=dilations
+        )
+        if self.film:
+            # Zero-init → gamma=beta=0 → identity FiLM at step 0.
+            self.film_gen = nn.Linear(d_hidden, 2 * d_hidden)
+            nn.init.zeros_(self.film_gen.weight)
+            nn.init.zeros_(self.film_gen.bias)
+        else:
+            self.film_gen = None
+        self.out_norm = nn.LayerNorm(d_hidden)
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        """Expand ``(B, T, d_hidden)`` over the horizon and refine → ``(B, T, H_d, d_hidden)``."""
+        B, T, Dh = h.shape
+        Hd = self.horizon
+        feat = h.unsqueeze(2).expand(-1, -1, Hd, -1)          # (B, T, Hd, Dh)
+        feat = feat + self.horizon_embedding[None, None, :, :]
+        if self.film_gen is not None:
+            gamma, beta = self.film_gen(h).chunk(2, dim=-1)    # (B, T, Dh) each
+            feat = feat * (1.0 + gamma[:, :, None, :]) + beta[:, :, None, :]
+        skip = feat                                            # identity path
+        flat = feat.reshape(B * T, Hd, Dh).transpose(1, 2).contiguous()
+        flat = self.refine(flat)
+        feat = flat.transpose(1, 2).reshape(B, T, Hd, Dh)
+        feat = self.out_norm(feat + skip)                      # long skip + LN
+        return feat
 
 
 class BaselineFutureDecoder(nn.Module):
@@ -736,13 +983,14 @@ class BaselineFutureDecoder(nn.Module):
 
     Produces :math:`\\hat{Y}^{base}` and (auxiliary) ``logvar_base``. In v1 only
     the mean is consumed by the loss, but the logvar head is wired for a
-    future switch to heteroscedastic Gaussian NLL.
+    future switch to heteroscedastic Gaussian NLL. The horizon dynamics are
+    handled by a shared :class:`HorizonDecoderCore` (D9).
     """
 
     def __init__(
         self,
+        core: HorizonDecoderCore,
         d_model: int = 128,
-        horizon: int = 30,
         out_channels: int = 87,
         d_hidden: int = 128,
         dropout: float = 0.1,
@@ -750,7 +998,7 @@ class BaselineFutureDecoder(nn.Module):
     ) -> None:
         """Initialize the baseline decoder."""
         super().__init__()
-        self.horizon = int(horizon)
+        self.core = core
         self.out_channels = int(out_channels)
         self.d_hidden = int(d_hidden)
         self.logvar_clamp = logvar_clamp
@@ -764,14 +1012,6 @@ class BaselineFutureDecoder(nn.Module):
             activation=nn.GELU,
             dropout=dropout,
         )
-        # Internal forecast-step embedding (not dataset-time metadata).
-        self.horizon_embedding = nn.Parameter(torch.zeros(horizon, d_hidden))
-        nn.init.normal_(self.horizon_embedding, mean=0.0, std=0.02)
-
-        self.refine = _HorizonRefine(d_hidden, kernel_size=3)
-        # Long skip around ``_HorizonRefine`` is added in forward(); the output
-        # norm stabilises the sum before the output heads.
-        self.out_norm = nn.LayerNorm(d_hidden)
         self.mean_head = nn.Linear(d_hidden, out_channels)
         self.logvar_head = nn.Linear(d_hidden, out_channels)
 
@@ -779,24 +1019,10 @@ class BaselineFutureDecoder(nn.Module):
         self, decoder_state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(mu_base, logvar_base)`` each of shape ``(B, T, H_d, C)``."""
-        B, T, _ = decoder_state.shape
-        Hd = self.horizon
-        Dh = self.d_hidden
-
         h = self.proj(decoder_state)                       # (B, T, Dh)
-        h = h.unsqueeze(2).expand(-1, -1, Hd, -1)           # (B, T, Hd, Dh)
-        h = h + self.horizon_embedding[None, None, :, :]
-        h_skip = h                                          # identity path
-
-        # Conv refinement along the horizon axis: fold B*T together.
-        h_flat = h.reshape(B * T, Hd, Dh).transpose(1, 2).contiguous()  # (B*T, Dh, Hd)
-        h_flat = self.refine(h_flat)
-        h = h_flat.transpose(1, 2).reshape(B, T, Hd, Dh)
-
-        h = self.out_norm(h + h_skip)                       # long skip + LN
-
-        mu_base = self.mean_head(h)                         # (B, T, Hd, C)
-        logvar_base = self.logvar_head(h)
+        feat = self.core.decode(h)                          # (B, T, Hd, Dh)
+        mu_base = self.mean_head(feat)                      # (B, T, Hd, C)
+        logvar_base = self.logvar_head(feat)
         logvar_base = torch.clamp(
             logvar_base, min=self.logvar_clamp[0], max=self.logvar_clamp[1]
         )
@@ -809,14 +1035,15 @@ class ResidualFutureDecoder(nn.Module):
     Consumes the target-only decoder state and the latent ``z``. At
     initialisation the final mean head is zero-inited so that ``delta_mu_src ≈ 0``
     and ``mu_full ≈ mu_base``. Training learns to diverge only when the latent
-    carries genuinely incremental UP information.
+    carries genuinely incremental UP information. Shares the
+    :class:`HorizonDecoderCore` with the baseline decoder (D9).
     """
 
     def __init__(
         self,
+        core: HorizonDecoderCore,
         d_model: int = 128,
         d_z: int = 24,
-        horizon: int = 30,
         out_channels: int = 87,
         d_hidden: int = 128,
         dropout: float = 0.1,
@@ -824,7 +1051,7 @@ class ResidualFutureDecoder(nn.Module):
     ) -> None:
         """Initialize the residual decoder."""
         super().__init__()
-        self.horizon = int(horizon)
+        self.core = core
         self.out_channels = int(out_channels)
         self.d_hidden = int(d_hidden)
         self.logvar_clamp = logvar_clamp
@@ -839,15 +1066,6 @@ class ResidualFutureDecoder(nn.Module):
             activation=nn.GELU,
             dropout=dropout,
         )
-        self.horizon_embedding = nn.Parameter(torch.zeros(horizon, d_hidden))
-        nn.init.normal_(self.horizon_embedding, mean=0.0, std=0.02)
-
-        self.refine = _HorizonRefine(d_hidden, kernel_size=3)
-        # Long skip around ``_HorizonRefine`` is added in forward(); the output
-        # norm stabilises the sum before the output heads. The mean head is
-        # zero-inited externally so ``delta_mu_src`` is still identically zero
-        # at step 0 regardless of the skip contribution.
-        self.out_norm = nn.LayerNorm(d_hidden)
         self.mean_head = nn.Linear(d_hidden, out_channels)
         self.logvar_head = nn.Linear(d_hidden, out_channels)
 
@@ -857,24 +1075,11 @@ class ResidualFutureDecoder(nn.Module):
         z: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(delta_mu_src, logvar_full)`` of shape ``(B, T, H_d, C)``."""
-        B, T, _ = decoder_state.shape
-        Hd = self.horizon
-        Dh = self.d_hidden
-
         h_in = torch.cat([decoder_state, z], dim=-1)        # (B, T, d_model + d_z)
         h = self.proj(h_in)                                 # (B, T, Dh)
-        h = h.unsqueeze(2).expand(-1, -1, Hd, -1)           # (B, T, Hd, Dh)
-        h = h + self.horizon_embedding[None, None, :, :]
-        h_skip = h                                          # identity path
-
-        h_flat = h.reshape(B * T, Hd, Dh).transpose(1, 2).contiguous()
-        h_flat = self.refine(h_flat)
-        h = h_flat.transpose(1, 2).reshape(B, T, Hd, Dh)
-
-        h = self.out_norm(h + h_skip)                       # long skip + LN
-
-        delta_mu_src = self.mean_head(h)                    # (B, T, Hd, C)
-        logvar_full = self.logvar_head(h)
+        feat = self.core.decode(h)                          # (B, T, Hd, Dh)
+        delta_mu_src = self.mean_head(feat)                 # (B, T, Hd, C)
+        logvar_full = self.logvar_head(feat)
         logvar_full = torch.clamp(
             logvar_full, min=self.logvar_clamp[0], max=self.logvar_clamp[1]
         )
@@ -903,30 +1108,60 @@ class RawRefinementDecoder(nn.Module):
 
 
 class TEAnalysisHead(nn.Module):
-    """Derive per-timestep KL and a lag-resolved TE attribution map.
+    r"""Derive per-timestep KL and a lag-resolved TE attribution map.
 
     This is a pure function (no learnable parameters). It consumes the per-
     timestep KL tensor and the attention weights and returns:
 
     * ``kld_per_t`` — ``(B, T)``, total KL summed over latent dims
-    * ``te_lag_map`` — ``(B, T, L)``, lag attribution ``K_t * mean_m alpha_{t,m,l}``
+      :math:`K_t = \sum_d \mathrm{KL}_{t,d}`.
+    * ``te_lag_map`` — ``(B, T, L)``, lag attribution.
+    * ``kld_per_t_per_head`` — ``(B, T, num_heads)``, the per-group KL
+      :math:`K_t^{(m)}` (latent dims partitioned into ``num_heads`` contiguous
+      groups). When the latent is head-structured (C7) this is a genuine
+      additive decomposition :math:`K_t=\sum_m K_t^{(m)}` and the attribution
+      becomes :math:`\widetilde{TE}_{t,\ell}=\sum_m K_t^{(m)}\,\alpha^{(m)}_{t,\ell}`.
+
+    When ``head_structured`` is False the legacy attribution
+    :math:`K_t\cdot\bar\alpha_{t,\ell}` (mean over heads) is returned instead,
+    while ``kld_per_t_per_head`` still reports the contiguous-group split for
+    diagnostics.
     """
 
     def forward(
         self,
         kld_btd: torch.Tensor,
         attn_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(kld_per_t, te_lag_map)``.
+        head_structured: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(kld_per_t, te_lag_map, kld_per_t_per_head)``.
 
         Args:
             kld_btd: Per-step KL tensor ``(B, T, d_z)``.
             attn_weights: Attention probabilities ``(B, T, num_heads, L)``.
+            head_structured: Whether the latent groups are head-aligned (C7).
+                Controls only the ``te_lag_map`` definition.
         """
+        B, T, dz = kld_btd.shape
+        num_heads = attn_weights.shape[2]
         kld_per_t = kld_btd.sum(dim=-1)                        # (B, T)
-        mean_alpha = attn_weights.mean(dim=-2)                 # (B, T, L)
-        te_lag_map = kld_per_t.unsqueeze(-1) * mean_alpha       # (B, T, L)
-        return kld_per_t, te_lag_map
+
+        if dz % num_heads == 0:
+            group = dz // num_heads
+            kld_per_head = kld_btd.view(B, T, num_heads, group).sum(dim=-1)
+        else:  # pragma: no cover - d_z is divisible by num_heads in practice
+            kld_per_head = kld_per_t.unsqueeze(-1).expand(B, T, num_heads) / num_heads
+
+        if head_structured and dz % num_heads == 0:
+            # Rigorous per-head attribution: sum_m K_t^(m) * alpha^(m)_{t,l}.
+            te_lag_map = torch.einsum(
+                "btm,btml->btl", kld_per_head, attn_weights
+            )                                                 # (B, T, L)
+        else:
+            mean_alpha = attn_weights.mean(dim=-2)            # (B, T, L)
+            te_lag_map = kld_per_t.unsqueeze(-1) * mean_alpha
+
+        return kld_per_t, te_lag_map, kld_per_head
 
 
 # =============================================================================
@@ -960,12 +1195,18 @@ class SeqVaeLagAttnV1(nn.Module):
         lstm_layers: int = 2,
         dropout: float = 0.1,
         decoder_hidden: int = 128,
+        horizon_depth: int = 2,
+        horizon_kernel: int = 3,
+        horizon_film: bool = False,
+        encoder_extra_dilations: Tuple[int, ...] = (),
         logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
         mu_scale: float = 5.0,
         delta_mu_scale: float = 3.0,
         latent_stats_momentum: float = 0.01,
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
+        lag_bias_init: str = "normal",
+        head_structured_latent: bool = False,
         init_weights: bool = True,
     ) -> None:
         """Initialize ``SeqVaeLagAttnV1``.
@@ -994,6 +1235,14 @@ class SeqVaeLagAttnV1(nn.Module):
             lstm_layers: Depth of the encoder LSTM branches.
             dropout: Dropout used throughout residual MLPs / attention.
             decoder_hidden: Hidden width of the structured horizon decoders.
+            horizon_depth: Number of dilated conv blocks in the shared horizon
+                refine core (D8).
+            horizon_kernel: Horizon-conv kernel size (D8).
+            horizon_film: If True, FiLM-condition each horizon step on the
+                decoder state (D8).
+            encoder_extra_dilations: Extra dilations appended to both encoders'
+                causal conv stacks (E11) for a longer receptive field, e.g.
+                ``(8, 16)``. Each appended block uses kernel size 15.
             logvar_clamp: ``(min, max)`` clamps applied to every log-variance
                 head in the model. Default ``(-5, 3)`` keeps ``var`` in
                 ``[e^{-5}, e^3] = [0.007, 20]`` which is well-conditioned for
@@ -1012,7 +1261,14 @@ class SeqVaeLagAttnV1(nn.Module):
             use_entmax: If True, use ``entmax15`` attention normalisation when
                 the ``entmax`` package is importable.
             attention_grad_checkpoint: If True, wrap ``LagCrossAttention`` in
-                gradient checkpointing.
+                gradient checkpointing. With the B6 view-based projection the
+                retained memory is small, so this can usually stay False.
+            lag_bias_init: Lag-bias init for ``LagCrossAttention`` — ``'normal'``
+                (default) or ``'alibi_decay'`` (B4 monotonic lag penalty).
+            head_structured_latent: C7 toggle. When ``True`` the latent is
+                partitioned into ``num_heads`` groups, each conditioned only on
+                its attention head's summary, giving an additive per-head KL
+                decomposition (requires ``d_z % num_heads == 0``).
             init_weights: If True, apply the standard :func:`initialization`
                 helper and then enforce the zero-init on delta heads.
         """
@@ -1038,6 +1294,12 @@ class SeqVaeLagAttnV1(nn.Module):
         self.mu_scale = float(mu_scale)
         self.delta_mu_scale = float(delta_mu_scale)
         self.latent_stats_momentum = float(latent_stats_momentum)
+        self.head_structured_latent = bool(head_structured_latent)
+        if self.head_structured_latent and int(d_z) % int(num_heads) != 0:
+            raise ValueError(
+                f"head_structured_latent requires d_z % num_heads == 0, "
+                f"got d_z={d_z}, num_heads={num_heads}"
+            )
 
         # --- Input adapters -------------------------------------------------
         self.target_adapter = TargetInputAdapter(
@@ -1048,18 +1310,26 @@ class SeqVaeLagAttnV1(nn.Module):
         )
 
         # --- Encoders -------------------------------------------------------
+        # E11: append one dilated conv block per ``encoder_extra_dilations``
+        # entry (kernel 15) for a longer exponential receptive field; the
+        # 2-layer uni-LSTM is unchanged. Base schedule = dilations (1, 2, 4).
+        extra_dil = tuple(int(x) for x in encoder_extra_dilations)
+        extra_ker = tuple(15 for _ in extra_dil)
+        target_kernels = (3, 7, 11) + extra_ker
+        source_kernels = (3, 5, 11) + extra_ker
+        encoder_dilations = (1, 2, 4) + extra_dil
         self.target_encoder = TargetEncoder(
             d_model=d_model,
-            cnn_kernels=(3, 7, 11),
-            cnn_dilations=(1, 2, 4),
+            cnn_kernels=target_kernels,
+            cnn_dilations=encoder_dilations,
             lstm_layers=lstm_layers,
             lstm_dropout=dropout,
             conv_dropout=dropout,
         )
         self.source_encoder = SourceEncoder(
             d_model=d_model,
-            cnn_kernels=(3, 5, 11),
-            cnn_dilations=(1, 2, 4),
+            cnn_kernels=source_kernels,
+            cnn_dilations=encoder_dilations,
             lstm_layers=lstm_layers,
             lstm_dropout=dropout,
             conv_dropout=dropout,
@@ -1082,6 +1352,7 @@ class SeqVaeLagAttnV1(nn.Module):
             dropout=dropout,
             use_entmax=use_entmax,
             grad_checkpoint=attention_grad_checkpoint,
+            lag_bias_init=lag_bias_init,
         )
         self.posterior_head = PosteriorHead(
             d_model=d_model,
@@ -1089,21 +1360,34 @@ class SeqVaeLagAttnV1(nn.Module):
             logvar_clamp=logvar_clamp,
             dropout=dropout,
             delta_mu_scale=self.delta_mu_scale,
+            head_structured=self.head_structured_latent,
+            num_heads=num_heads,
+            d_head=d_head,
         )
 
         # --- Decoders -------------------------------------------------------
-        self.baseline_decoder = BaselineFutureDecoder(
-            d_model=d_model,
+        # D9: a single shared horizon core (forecast-step embedding + FiLM +
+        # dilated refine + out-norm) is used by both decoders, so the residual
+        # operates as a correction in the baseline's representation space.
+        self.horizon_core = HorizonDecoderCore(
+            d_hidden=decoder_hidden,
             horizon=horizon,
+            kernel_size=horizon_kernel,
+            depth=horizon_depth,
+            film=horizon_film,
+        )
+        self.baseline_decoder = BaselineFutureDecoder(
+            core=self.horizon_core,
+            d_model=d_model,
             out_channels=c_y,
             d_hidden=decoder_hidden,
             dropout=dropout,
             logvar_clamp=logvar_clamp,
         )
         self.residual_decoder = ResidualFutureDecoder(
+            core=self.horizon_core,
             d_model=d_model,
             d_z=d_z,
-            horizon=horizon,
             out_channels=c_y,
             d_hidden=decoder_hidden,
             dropout=dropout,
@@ -1141,14 +1425,28 @@ class SeqVaeLagAttnV1(nn.Module):
     # Init helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _zero_linear(layer: nn.Linear) -> None:
+        """Zero a Linear layer's weight (and bias if present)."""
+        nn.init.zeros_(layer.weight)
+        if layer.bias is not None:
+            nn.init.zeros_(layer.bias)
+
     def _zero_init_delta_heads(self) -> None:
-        """Zero the posterior delta-mu and residual-decoder mean heads."""
-        nn.init.zeros_(self.posterior_head.delta_mu_head.weight)
-        if self.posterior_head.delta_mu_head.bias is not None:
-            nn.init.zeros_(self.posterior_head.delta_mu_head.bias)
-        nn.init.zeros_(self.residual_decoder.mean_head.weight)
-        if self.residual_decoder.mean_head.bias is not None:
-            nn.init.zeros_(self.residual_decoder.mean_head.bias)
+        """Zero the posterior delta-mu and residual-decoder mean heads.
+
+        The posterior ``delta_mu_head`` is a single ``Linear`` in the flat
+        configuration and a per-group ``ModuleList`` of ``Linear`` when the
+        latent is head-structured (C7); both are zeroed so ``mu_post = mu_prior``
+        at step 0 (warm-start invariant).
+        """
+        delta_head = self.posterior_head.delta_mu_head
+        if isinstance(delta_head, nn.ModuleList):
+            for layer in delta_head:
+                self._zero_linear(layer)
+        else:
+            self._zero_linear(delta_head)
+        self._zero_linear(self.residual_decoder.mean_head)
 
     # ------------------------------------------------------------------
     # Forward / sampling
@@ -1377,10 +1675,16 @@ class SeqVaeLagAttnV1(nn.Module):
 
         mu_prior, logvar_prior, decoder_state = self.prior_head(H_y)
 
-        mem, m_lag = self.lag_bank(H_u)                    # (B, T, L, d_model), (B, T, L)
-        A, alpha = self.lag_attn(H_y, mem, m_lag)          # (B, T, d_model), (B, T, M, L)
+        # B6: keys/values are projected directly from H_u inside the attention
+        # (banded strided views); no (B, T, L, d_model) memory bank is built.
+        # A_heads are the per-head summaries a^(m) before W_o (C7).
+        A, alpha, A_heads = self.lag_attn(H_y, H_u)        # (B,T,dm), (B,T,M,L), (B,T,M,dh)
 
-        mu_post, logvar_post = self.posterior_head(H_y, A, mu_prior)
+        # C7: the head-structured posterior consumes per-head summaries; the
+        # flat posterior consumes the W_o-fused A. Invariant 1 holds either way
+        # (source reaches the latent only via the PosteriorHead).
+        post_src = A_heads if self.head_structured_latent else A
+        mu_post, logvar_post = self.posterior_head(H_y, post_src, mu_prior)
         z = self.reparameterize(mu_post, logvar_post)      # (B, T, d_z)
 
         # Tanh saturation diagnostics. Values >> 0 indicate the prior or
@@ -1412,7 +1716,9 @@ class SeqVaeLagAttnV1(nn.Module):
             logvar_post=logvar_post,
             mask_warmup=False,
         )
-        kld_per_t, te_lag_map = self.te_analysis(kld_btd, alpha)
+        kld_per_t, te_lag_map, kld_per_t_per_head = self.te_analysis(
+            kld_btd, alpha, head_structured=self.head_structured_latent
+        )
 
         warmup_mask = self._build_warmup_valid_mask(H_y.size(1), device=H_y.device)
 
@@ -1426,6 +1732,7 @@ class SeqVaeLagAttnV1(nn.Module):
             "source_state": H_u,
             "decoder_state": decoder_state,
             "attended_source": A,
+            "attended_source_heads": A_heads,
             "attn_weights": alpha,
             "mu_base": mu_base,
             "logvar_base": logvar_base,
@@ -1434,6 +1741,7 @@ class SeqVaeLagAttnV1(nn.Module):
             "logvar_full": logvar_full,
             "raw_future_pred": None,
             "kld_per_t": kld_per_t,
+            "kld_per_t_per_head": kld_per_t_per_head,
             "te_lag_map": te_lag_map,
             "warmup_mask": warmup_mask,
             "mu_prior_sat_frac": mu_prior_sat_frac,
@@ -1454,9 +1762,9 @@ class SeqVaeLagAttnV1(nn.Module):
         H_y = self.target_encoder(Y_tilde)
         H_u = self.source_encoder(U_tilde)
         mu_prior, logvar_prior, decoder_state = self.prior_head(H_y)
-        mem, m_lag = self.lag_bank(H_u)
-        A, alpha = self.lag_attn(H_y, mem, m_lag)
-        mu_post, logvar_post = self.posterior_head(H_y, A, mu_prior)
+        A, alpha, A_heads = self.lag_attn(H_y, H_u)
+        post_src = A_heads if self.head_structured_latent else A
+        mu_post, logvar_post = self.posterior_head(H_y, post_src, mu_prior)
         z = self.reparameterize(mu_post, logvar_post) if sample_z else mu_post
         return {
             "mu_prior": mu_prior,
@@ -1468,6 +1776,7 @@ class SeqVaeLagAttnV1(nn.Module):
             "source_state": H_u,
             "decoder_state": decoder_state,
             "attended_source": A,
+            "attended_source_heads": A_heads,
             "attn_weights": alpha,
         }
 
@@ -1628,6 +1937,8 @@ class SeqVaeLagAttnV1(nn.Module):
         likelihood: str = "mse",
         sigma_obs: "float | str" = 1.0,
         free_bits: float = 0.0,
+        detach_baseline_in_full: bool = False,
+        lambda_lag: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         r"""Compute the v1 training objective.
 
@@ -1682,6 +1993,24 @@ class SeqVaeLagAttnV1(nn.Module):
                 default ``0.0`` is a no-op (closed-form Gaussian KL is
                 non-negative). Used only in the Sprint 5.6 conditional
                 fallback if a calibrated β collapses the latent.
+            lambda_lag: B4 lag-embedding smoothness weight. When ``> 0`` a
+                penalty
+                :math:`\lambda_{lag}\,\overline{\lVert r^{(m)}_{\ell+1}-r^{(m)}_{\ell}\rVert^2}`
+                (mean squared first difference of ``lag_embeddings`` along the
+                lag axis) is added to ``total_loss``, encouraging a smooth,
+                physiologically plausible ``te_lag_map``. ``0.0`` (default)
+                disables it and skips the computation.
+            detach_baseline_in_full: A3 baseline/residual gradient
+                separation. When ``True`` the full-prediction
+                reconstruction is formed as
+                :math:`\mathrm{sg}(\mu^{base}) + \Delta\mu^{src}` (the
+                baseline is stop-gradiented), so ``L_feat`` trains only the
+                residual / posterior / source path while ``L_base`` alone
+                shapes the baseline. This keeps :math:`K_t` from absorbing
+                FHR-self-explainable variance — the baseline cannot be left
+                weak to push variance into ``z``. ``False`` (default)
+                reproduces the legacy behaviour where ``L_feat`` gradients
+                also flow into the baseline branch.
 
         Returns:
             Dict with ``feat_loss``, ``base_loss``, ``kld_loss``,
@@ -1692,8 +2021,17 @@ class SeqVaeLagAttnV1(nn.Module):
             checkpoints record whether the heads stayed lively).
         """
         Y = torch.cat([y_st, y_ph], dim=-1)                # (B, T, C_y)
-        mu_full = forward_outputs["mu_full"]               # (B, T, H_d, C_y)
         mu_base = forward_outputs["mu_base"]               # (B, T, H_d, C_y)
+        if detach_baseline_in_full:
+            # A3: stop-gradient the baseline inside the full term. The forward
+            # pass already returns ``mu_full = mu_base + delta_mu_src``; here we
+            # rebuild it with a detached baseline so ``L_feat`` only trains the
+            # residual / posterior / source path. ``base_loss`` below keeps the
+            # non-detached ``mu_base``, so the baseline is shaped solely by
+            # ``L_base`` and the KL stays a clean source-incremental surrogate.
+            mu_full = mu_base.detach() + forward_outputs["delta_mu_src"]
+        else:
+            mu_full = forward_outputs["mu_full"]           # (B, T, H_d, C_y)
 
         B, T, Hd, C = mu_full.shape
         T_valid = T - Hd
@@ -1810,10 +2148,19 @@ class SeqVaeLagAttnV1(nn.Module):
         else:
             kld_loss = torch.zeros((), device=device, dtype=dtype)
 
+        # --- B4 lag-embedding smoothness penalty ---------------------------
+        if lambda_lag > 0.0:
+            r = self.lag_attn.lag_embeddings                  # (L, num_heads, d_head)
+            lag_diff = r[1:] - r[:-1]                          # (L-1, num_heads, d_head)
+            lag_smoothness = (lag_diff ** 2).mean()
+        else:
+            lag_smoothness = torch.zeros((), device=device, dtype=dtype)
+
         total_loss = (
             lambda_full * feat_loss
             + lambda_base * base_loss
             + beta * kld_loss
+            + lambda_lag * lag_smoothness
         )
 
         # Collapse diagnostics: mean over the valid (mask-weighted) support.
@@ -1838,6 +2185,7 @@ class SeqVaeLagAttnV1(nn.Module):
             "likelihood": likelihood,
             "mean_logvar_full": mean_logvar_full,
             "mean_logvar_base": mean_logvar_base,
+            "lag_smoothness": lag_smoothness,
         }
 
 
@@ -1852,10 +2200,10 @@ if __name__ == "__main__":
     expected_keys = {
         "mu_prior", "logvar_prior", "mu_post", "logvar_post", "z",
         "target_state", "source_state", "decoder_state",
-        "attended_source", "attn_weights",
+        "attended_source", "attended_source_heads", "attn_weights",
         "mu_base", "logvar_base", "delta_mu_src", "mu_full", "logvar_full",
-        "raw_future_pred", "kld_per_t", "te_lag_map", "warmup_mask",
-        "mu_prior_sat_frac", "delta_mu_sat_frac",
+        "raw_future_pred", "kld_per_t", "kld_per_t_per_head", "te_lag_map",
+        "warmup_mask", "mu_prior_sat_frac", "delta_mu_sat_frac",
     }
 
     y_st = torch.randn(B, T, 43)
@@ -1878,7 +2226,9 @@ if __name__ == "__main__":
     assert outs["source_state"].shape == (B, T, 128)
     assert outs["decoder_state"].shape == (B, T, 128)
     assert outs["attended_source"].shape == (B, T, 128)
+    assert outs["attended_source_heads"].shape == (B, T, 4, 32)
     assert outs["attn_weights"].shape == (B, T, 4, 91)
+    assert outs["kld_per_t_per_head"].shape == (B, T, 4)
     assert outs["mu_base"].shape == (B, T, 30, 87)
     assert outs["logvar_base"].shape == (B, T, 30, 87)
     assert outs["delta_mu_src"].shape == (B, T, 30, 87)
@@ -1984,5 +2334,67 @@ if __name__ == "__main__":
     model.eval()
     te_scalar = model.measure_transfer_entropy(y_st, y_ph, u_full, reduce_mean=True)
     print(f"[te] scalar KL = {te_scalar.item():.3e} (posterior ~ prior at init)")
+
+    # ---- Test 3: C7 head-structured latent --------------------------------
+    torch.manual_seed(0)
+    model_hs = SeqVaeLagAttnV1(use_up_st=True, head_structured_latent=True).eval()
+    outs_hs = model_hs(y_st, y_ph, u_full)
+    assert outs_hs["kld_per_t_per_head"].shape == (B, T, 4)
+    assert outs_hs["attended_source_heads"].shape == (B, T, 4, 32)
+    # Warm-start: grouped delta-mu heads zero-inited → mu_post == mu_prior.
+    init_delta_hs = outs_hs["delta_mu_src"].abs().max().item()
+    assert init_delta_hs < 1e-6, f"residual delta not zero at init: {init_delta_hs}"
+    gap_hs = (outs_hs["mu_post"] - outs_hs["mu_prior"]).abs().max().item()
+    assert gap_hs < 1e-6, f"mu_post != mu_prior at init (head-structured): {gap_hs}"
+    # Additive KL decomposition: sum_m K_t^(m) == K_t (exact, up to fp noise).
+    kld_btd_hs = model_hs.kld_tensor(
+        outs_hs["mu_prior"], outs_hs["logvar_prior"],
+        outs_hs["mu_post"], outs_hs["logvar_post"], mask_warmup=False,
+    )
+    k_t = kld_btd_hs.sum(-1)
+    k_sum = outs_hs["kld_per_t_per_head"].sum(-1)
+    add_err = (k_t - k_sum).abs().max().item()
+    print(f"[C7] max|K_t - sum_m K_t^(m)| = {add_err:.2e}")
+    assert add_err < 1e-4, f"per-head KL is not additive: {add_err}"
+    # te_lag_map stays (B, T, L).
+    assert outs_hs["te_lag_map"].shape == (B, T, 91)
+    model_hs.compute_loss(outs_hs, y_st, y_ph, beta=0.1)["total_loss"].backward()
+    print("[C7] head-structured latent OK (additive KL, warm-start, backward)")
+
+    # ---- Test 4: full config (all phases on, mirrors config_lag_attn_v1) ---
+    torch.manual_seed(0)
+    model_full = SeqVaeLagAttnV1(
+        use_up_st=True,
+        use_entmax=True,                 # B5
+        attention_grad_checkpoint=False,  # B6
+        lag_bias_init="alibi_decay",     # B4
+        head_structured_latent=True,     # C7
+        horizon_depth=3, horizon_kernel=3, horizon_film=True,  # D8/D9
+        encoder_extra_dilations=(8, 16),  # E11
+    )
+    outs_full = model_full(y_st, y_ph, u_full)
+    assert outs_full["mu_full"].shape == (B, T, 30, 87)
+    assert outs_full["kld_per_t_per_head"].shape == (B, T, 4)
+    # Warm-start still holds with FiLM (zero-inited) + alibi decay + all phases.
+    assert (outs_full["delta_mu_src"].abs().max().item()) < 1e-6
+    assert ((outs_full["mu_full"] - outs_full["mu_base"]).abs().max().item()) < 1e-6
+    # A1 gaussian_nll + A2 free_bits + A3 detach + B4 lag smoothness end-to-end.
+    L_full = model_full.compute_loss(
+        outs_full, y_st, y_ph, beta=0.1,
+        likelihood="gaussian_nll", sigma_obs=1.0, free_bits=0.1,
+        detach_baseline_in_full=True, lambda_lag=1e-3,
+    )
+    for k in ("feat_loss", "base_loss", "kld_loss", "lag_smoothness", "total_loss"):
+        assert torch.isfinite(L_full[k]), f"non-finite {k}"
+    L_full["total_loss"].backward()
+    n_full = sum(p.numel() for p in model_full.parameters())
+    print(
+        f"[full] feat={L_full['feat_loss'].item():.4f}"
+        f"  base={L_full['base_loss'].item():.4f}"
+        f"  kld={L_full['kld_loss'].item():.4f}"
+        f"  lag_sm={L_full['lag_smoothness'].item():.2e}"
+        f"  params={n_full:,}"
+    )
+    print("[full] all-phases config forward/loss/backward OK")
 
     print("All smoke checks passed.")
