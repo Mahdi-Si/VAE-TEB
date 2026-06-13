@@ -107,7 +107,7 @@ _BENCHMARK = "G1_mix"
 # reads it). Every key is overridable from the YAML / CLI.
 _DDP_DEFAULTS: Dict[str, Any] = {
     "devices": 8,
-    "strategy": "ddp",
+    "strategy": "ddp_find_unused_parameters_true",
     "precision": "32-true",
     "sync_batchnorm": True,
     "lr_scaling": True,
@@ -494,9 +494,9 @@ def _build_trainer(
 ) -> pl.Trainer:
     """Construct the ``pl.Trainer``, mirroring ``trainer_lag_attn_v1``.
 
-    Uses plain ``ddp`` for >1 GPU -- the forced ``G1_mix`` benchmark trains with
-    ``gaussian_nll`` + ``sigma_obs='learned'`` so both logvar heads receive
-    gradients (no unused parameters),
+    Uses ``ddp_find_unused_parameters_true`` for >1 GPU -- the lag-attention
+    output projection (``lag_attn.W_o``) receives no gradient under the G1_mix
+    loss, so plain ``ddp`` raises "parameters not used in producing the loss",
     ``use_distributed_sampler=True`` so the DataModule's plain loaders are
     sharded automatically, and a ``CSVLogger`` + ``ModelCheckpoint`` for
     monitoring. The synthetic-format checkpoints are written separately by
