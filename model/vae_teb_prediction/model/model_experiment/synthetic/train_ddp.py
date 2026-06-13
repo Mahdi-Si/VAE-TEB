@@ -703,8 +703,10 @@ def train_ddp(
             routine forces ``G1_mix`` and re-overlays its data / loss block).
         overrides: Optional flat overrides -- the shared ``_OVERRIDE_MAP`` keys
             (``data_tag`` / ``beta`` / ``epochs`` / ``batch_size`` / ``lr`` /
-            ``seed`` / ``data_dir`` / ``results_dir``), ``run_tag``, and the
-            DDP-only ``devices``.
+            ``seed`` / ``data_dir`` / ``results_dir``), ``run_tag``, the
+            DDP-only ``devices``, and ``resume_ckpt`` (path to a previous
+            run's synthetic-format ``final.ckpt`` / ``best.ckpt`` whose model
+            weights warm-start this run; ``None`` trains from scratch).
 
     Returns:
         A small results dict: ``run_tag``, ``results_dir``, ``n_gpus``,
@@ -749,6 +751,35 @@ def train_ddp(
     # Build the model on CPU so no rank pre-allocates on cuda:0 before Lightning
     # assigns devices. Keep ``model_kwargs`` for the checkpoint bridge.
     model, model_kwargs = build_model(config["model"], torch.device("cpu"))
+
+    # Optional warm start (--resume-ckpt): continue training from the weights
+    # of a previous run instead of a random init. Provide a SYNTHETIC-format
+    # checkpoint written by train_ddp / train_minimal -- i.e.
+    # ``results/G1_mix/<run_tag>/final.ckpt`` (or ``best.ckpt``) -- NOT a
+    # Lightning ``lightning_ckpts/lightning_best-*.ckpt``. Only the model
+    # weights are restored; the optimizer / LR schedule / epoch counter start
+    # fresh (the synthetic checkpoints carry no optimizer state). Every DDP
+    # rank loads identically, so the ranks start in sync.
+    resume_ckpt = overrides.get("resume_ckpt")
+    if resume_ckpt:
+        resume_path = Path(resume_ckpt)
+        if not resume_path.is_file():
+            raise FileNotFoundError(
+                f"--resume-ckpt not found: {resume_path}. Provide the "
+                f"synthetic-format checkpoint of a previous run, e.g. "
+                f"results/G1_mix/<run_tag>/final.ckpt."
+            )
+        if load_checkpoint_strict(model, str(resume_path),
+                                  map_location="cpu") is None:
+            raise RuntimeError(
+                f"load_checkpoint_strict could not align {resume_path} with "
+                f"SeqVaeLagAttnV1(**model_kwargs) -- the checkpoint must come "
+                f"from a run with the same model.* config (final.ckpt / "
+                f"best.ckpt, not a Lightning lightning_best-*.ckpt)."
+            )
+        if _env_rank_zero():
+            print(f"[train_ddp] warm start: model weights loaded from "
+                  f"{resume_path} (optimizer / LR schedule start fresh)")
 
     loss_settings = _resolve_loss_settings(config["loss"])
 
@@ -893,6 +924,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    dest="early_stop_patience",
                    help="enable EarlyStopping on val/total_loss with this "
                         "patience (epochs); omitted -> use config ddp.early_stopping")
+    p.add_argument("--resume-ckpt", type=str, default=None, dest="resume_ckpt",
+                   help="continue training from this synthetic-format "
+                        "checkpoint (results/G1_mix/<run_tag>/final.ckpt or "
+                        "best.ckpt): the model weights are loaded, the "
+                        "optimizer starts fresh; omitted -> train from scratch")
     return p.parse_args(argv)
 
 
@@ -912,6 +948,7 @@ def main(argv=None) -> None:
         "data_dir": args.data_dir,
         "results_dir": args.results_dir,
         "early_stop_patience": args.early_stop_patience,
+        "resume_ckpt": args.resume_ckpt,
     }
     train_ddp(config, overrides=overrides)
 
@@ -935,6 +972,11 @@ if __name__ == "__main__":
         "results_dir": None,
         "early_stop_patience": None, # int -> enable EarlyStopping with this patience;
                                      # None -> use config ddp.early_stopping block
+        "resume_ckpt": None,         # path to a previous run's synthetic-format
+                                     # checkpoint -- results/G1_mix/<run_tag>/
+                                     # final.ckpt (or best.ckpt) -- to continue
+                                     # training from its weights (fresh
+                                     # optimizer); None -> train from scratch
     }
 
     if len(sys.argv) > 1:

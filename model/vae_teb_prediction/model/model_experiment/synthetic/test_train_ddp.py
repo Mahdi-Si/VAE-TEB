@@ -25,9 +25,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
+import pytest
 import torch
 
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+from model.vae_teb_prediction.model.model_experiment.synthetic import (
+    train_ddp as TD,
+)
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_ddp import (
     _SyntheticCheckpointCallback,
     _augment_loss_settings,
@@ -270,6 +274,47 @@ def test_synthetic_checkpoint_callback_unit() -> None:
         assert final2["latent_stats_fitted"] is False
 
         print("[test_train_ddp] OK -- during-training checkpoint callback verified")
+
+
+def test_train_ddp_resume_ckpt(monkeypatch) -> None:
+    """``resume_ckpt`` warm-starts from a prior run; a bad path fails fast.
+
+    Trains a scratch run, then a second run whose ``resume_ckpt`` points at the
+    first run's ``final.ckpt``; a spy on :func:`load_checkpoint_strict` asserts
+    the warm start actually loaded that file (the loader contract itself is
+    covered by :func:`_assert_strict_loadable`). A non-existent path must raise
+    ``FileNotFoundError`` before any training starts.
+    """
+    with tempfile.TemporaryDirectory() as _tmp:
+        tmp = Path(_tmp)
+        run_dir = _run(tmp)                          # scratch run -> final.ckpt
+        src = run_dir / "final.ckpt"
+        assert src.is_file()
+
+        calls: list = []
+
+        def _spy(model, ckpt, **kw):
+            calls.append(str(ckpt))
+            return load_checkpoint_strict(model, ckpt, **kw)
+
+        monkeypatch.setattr(TD, "load_checkpoint_strict", _spy)
+        _run(tmp, extra_overrides={
+            "run_tag": "ddp_resume", "resume_ckpt": str(src), "epochs": 1,
+        })
+        resumed_dir = run_dir.parent / "ddp_resume"
+        assert (resumed_dir / "final.ckpt").is_file(), "resumed run wrote no ckpt"
+        # The first loader call is the warm start (later calls come from the
+        # post-fit Lightning-best bridge in _export_checkpoints).
+        assert calls and calls[0] == str(src), (
+            "warm start never loaded the provided resume_ckpt"
+        )
+
+        with pytest.raises(FileNotFoundError):
+            _run(tmp, extra_overrides={
+                "run_tag": "ddp_bad",
+                "resume_ckpt": str(tmp / "missing.ckpt"),
+            })
+        gc.collect()
 
 
 def test_train_ddp_early_stopping() -> None:
