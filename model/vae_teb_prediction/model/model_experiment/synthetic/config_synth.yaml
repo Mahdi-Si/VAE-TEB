@@ -432,9 +432,63 @@ model:
   mu_scale: 5.0
   delta_mu_scale: 3.0
   latent_stats_momentum: 0.01
-  use_entmax: false
-  attention_grad_checkpoint: true   # activation checkpointing -- keeps the
-                                    # 91-lag memory bank within GPU memory
+  use_entmax: false            # softmax lag attention (baseline arm). Set true
+                               # for entmax15 (exactly-zero weights on irrelevant
+                               # lags -> sharper te_lag_map); needs the `entmax`
+                               # package on the box. Kept false here so the
+                               # lag-recovery metric is read on the softmax
+                               # baseline (production config_lag_attn_v1 uses true).
+  attention_grad_checkpoint: false  # OFF on 48 GB A6000 for the ~10-15% speedup
+                                    # (no backward recompute). B6 removed the
+                                    # materialised (B,T,L,d_model) lag bank, so
+                                    # the retained memory is small even at false;
+                                    # set true only on <= ~12 GB GPUs.
+
+  # --- Phases 1-4 architecture (aligns the harness with the production model
+  #     config_lag_attn_v1.yaml so the synthetic validation certifies the SAME
+  #     architecture). These are FLAT SeqVaeLagAttnV1 constructor kwargs because
+  #     synthetic.train_minimal.build_model passes the `model` block verbatim
+  #     (SeqVaeLagAttnV1(**model_cfg)) -- do NOT nest them under
+  #     horizon_refine:/encoder: the way config_lag_attn_v1.yaml does.
+
+  # C7 -- head-structured latent. Partition z into `num_heads` groups of
+  # d_z/num_heads dims (24/4 = 6), each conditioned ONLY on its attention head's
+  # summary a^(m). This makes the per-head KL K_t^(m) a genuine *additive*
+  # decomposition (sum_m K_t^(m) = K_t) and redefines te_lag_map to
+  # sum_m K_t^(m) * alpha^(m) (still shape (B,T,L)) -- a rigorous per-lag
+  # attribution that directly sharpens the v2 lag-recovery / v3 per-M
+  # diagnostics. The prior stays shared/target-only, so K_bar (the calibration
+  # target) is the same quantity. Requires d_z % num_heads == 0.
+  head_structured_latent: true
+
+  # B4 -- lag-bias initialisation. 'normal' adds no extra parameter; 'alibi_decay'
+  # seeds a learnable per-(head,lag) score bias with an ALiBi short-lag-favouring
+  # slope. Kept 'normal' ON PURPOSE for the validation: the synthetic lag bands
+  # are short (delay_max <= 31, true lags ~{0..30}), so an ALiBi short-lag prior
+  # would let the model "recover" the lag partly because it was *told* to prefer
+  # short lags -- confounding the lag-recovery metric. 'normal' keeps lag
+  # recovery an honest, data-driven test.
+  lag_bias_init: normal
+
+  # D8/D9 -- shared horizon decoder core. A single core (forecast-step embedding
+  # + FiLM + dilated horizon convs + out-norm) is shared by the baseline and
+  # residual decoders, so the residual is a correction in the baseline's space
+  # and horizon dynamics are learned once. A STRONGER baseline forecaster is
+  # exactly what the TE-validation premise needs (v2 sec. 3.3 / 9.2): the only
+  # way to push feat_loss below base_loss is genuine source-incremental info, so
+  # K_t stays a clean TE surrogate. depth = number of dilated conv blocks
+  # (dilations 1,2,4,...); film conditions each horizon step on the decoder state.
+  horizon_depth: 3
+  horizon_kernel: 3
+  horizon_film: true
+
+  # E11 -- longer encoder receptive field. Append dilated conv blocks (kernel 15)
+  # at these extra dilations to both encoders' causal conv stacks (base dilations
+  # are 1,2,4), keeping the 2-layer uni-LSTM. The synthetic self-dynamics are
+  # long (AR(1) rho ~0.95-0.99, oscillator periods 60-200 steps over T=300), so a
+  # longer RF strengthens the target-only baseline (again sharpening the TE
+  # estimate). [] disables the extension (3-block baseline encoder).
+  encoder_extra_dilations: [8, 16]
 
 # --- loss weights (spec section 8.7) -----------------------------------------
 loss:
@@ -464,9 +518,12 @@ loss:
 # mmap: auto the splits are served from the shared OS page cache, so workers
 # buy copy-overlap, not disk parallelism.
 dataset:
-  num_workers: 0               # >= 2 on a multi-GPU box (per-worker pool slot)
-  pin_memory: false            # true when CUDA is in use on multi-GPU boxes
-  persistent_workers: false    # only honoured when num_workers > 0
+  num_workers: 4               # PER-RANK: 4 * 8 ranks = 32 worker procs on the
+                               # 128-core box (keep num_workers * n_gpus well
+                               # under nproc). Use 0 on the single-GPU laptop.
+  pin_memory: true             # overlap host->device copies with compute (CUDA)
+  persistent_workers: true     # keep workers (+ shared memmaps) alive across
+                               # epochs; only honoured when num_workers > 0
   mmap: auto                   # auto/true -> memory-map the uncompressed .npz
                                # splits: all DDP ranks + DataLoader workers
                                # share ONE page-cache copy of the pool instead
@@ -488,7 +545,12 @@ dataset:
 # downgrades to "auto" and LR scaling + warmup are no-ops (matches train_minimal).
 ddp:
   devices: 8                   # CLI --devices overrides; 1 on Windows dev
-  strategy: ddp_find_unused_parameters_true   # -> "auto" when devices == 1
+  strategy: ddp                # plain DDP. The forced G1_mix benchmark trains
+                               # with gaussian_nll + sigma_obs=learned, so the
+                               # logvar_full / logvar_base heads both receive
+                               # grads (no unused params) -- this drops the
+                               # per-backward unused-param scan.
+                               # -> "auto" when devices == 1
   precision: 32-true           # consider bf16-mixed on H100/A100
   sync_batchnorm: true         # only active when devices > 1 (no BN today; harmless)
   lr_scaling: true             # effective_lr = optim.lr * n_gpus
@@ -517,11 +579,10 @@ optim:
   lr: 0.001
   weight_decay: 0.0
   epochs: 100
-  batch_size: 32               # RTX 4080 Laptop (12 GB)-safe with grad
-                               # checkpointing (~5 GiB peak); 128 OOMs on
-                               # 12 GB. On a 40+ GB A100/H100 use batch_size:
-                               # 128 (and set model.attention_grad_checkpoint:
-                               # false for the ~10-15% speedup it buys).
+  batch_size: 128              # 48 GB A6000 / 8-GPU box: global batch =
+                               # 128 * n_gpus, lr scaled (lr * n_gpus) + warmup.
+                               # RTX 4080 Laptop (12 GB): use 32 (128 OOMs on
+                               # 12 GB even with grad checkpointing ~5 GiB peak).
   grad_clip_norm: 0.5
   lr_milestones: [10, 50]
   lr_gamma: 0.1
