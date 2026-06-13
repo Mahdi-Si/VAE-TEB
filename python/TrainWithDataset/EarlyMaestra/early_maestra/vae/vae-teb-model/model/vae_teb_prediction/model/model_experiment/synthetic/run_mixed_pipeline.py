@@ -35,6 +35,11 @@ Stage order (each individually skippable via ``PIPELINE['stages']``):
     6. ``train``            -- the final pooled model via :mod:`train_ddp` in a
                                subprocess (so Lightning's DDP launcher re-executes
                                the *training* module, never this pipeline).
+                               ``PIPELINE['resume_ckpt']`` optionally continues
+                               training from a previous run's synthetic-format
+                               checkpoint (``results/G1_mix/<run_tag>/final.ckpt``
+                               or ``best.ckpt``; weights only, fresh optimizer);
+                               ``None`` trains from scratch.
     7. ``eval_in_mix``      -- :func:`mixed_eval.evaluate_mixed` on the in-mix +
                                interior-holdout caches
                                (``results/G1_mix/<run_tag>/mixed_eval/``).
@@ -306,6 +311,7 @@ def _train_cmd(
         ("--lr", "lr"),
         ("--seed", "seed"),
         ("--early-stop-patience", "early_stop_patience"),
+        ("--resume-ckpt", "resume_ckpt"),
         ("--data-dir", "data_dir"),
         ("--results-dir", "results_dir"),
     ):
@@ -485,8 +491,13 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         float(beta) if beta is not None else float(config["loss"].get("kld_beta"))
     )
 
-    # --- 5. final pooled training (DDP-safe subprocess) ------------------------
-    _stage_banner("train", note=f"devices={pipeline.get('devices', 1)}")
+    # --- 6. final pooled training (DDP-safe subprocess) ------------------------
+    resume_ckpt = pipeline.get("resume_ckpt")
+    _stage_banner(
+        "train",
+        note=f"devices={pipeline.get('devices', 1)}"
+             + (f", resume from {resume_ckpt}" if resume_ckpt else ""),
+    )
     run_dir = results_root / _BENCHMARK / run_tag
     ckpt_path = run_dir / ckpt_name
     if not stages["train"]:
@@ -496,7 +507,19 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         status["train"] = "skipped (exists)"
         print(f"[pipeline] checkpoint exists, skipping training: {ckpt_path}\n"
               f"           (set force_retrain=True to retrain)")
+        if resume_ckpt:
+            print("[pipeline][note] resume_ckpt is set but training was "
+                  "skipped -- continue into a NEW run_tag or set "
+                  "force_retrain=True.")
     else:
+        # Fail before launching the subprocess so a typo in the path does not
+        # cost a DDP spin-up (dry runs only print the would-be command).
+        if resume_ckpt and not dry_run and not Path(resume_ckpt).is_file():
+            raise FileNotFoundError(
+                f"PIPELINE['resume_ckpt'] not found: {resume_ckpt}. Provide "
+                f"the synthetic-format checkpoint of a previous run, e.g. "
+                f"results/G1_mix/<previous_run_tag>/final.ckpt."
+            )
         _run_subprocess(
             _train_cmd(
                 pipeline, config_path,
@@ -713,6 +736,20 @@ if __name__ == "__main__":
         "lr": None,                  # None -> optim.lr
         "seed": None,                # None -> experiment.seed
         "early_stop_patience": None, # int -> enable EarlyStopping on val loss
+        "resume_ckpt": None,         # None -> train from scratch.
+                                     # Path  -> CONTINUE training from that
+                                     #   checkpoint's weights. Provide the
+                                     #   SYNTHETIC-format checkpoint written by
+                                     #   train_ddp, i.e.
+                                     #   results/G1_mix/<previous_run_tag>/final.ckpt
+                                     #   (or best.ckpt) -- NOT a Lightning
+                                     #   lightning_ckpts/lightning_best-*.ckpt.
+                                     #   Weights only: the optimizer / LR
+                                     #   schedule / epoch counter start fresh.
+                                     #   Training is still skipped when
+                                     #   <run_dir>/<ckpt_name> already exists,
+                                     #   so continue into a NEW run_tag or set
+                                     #   force_retrain=True.
         "ckpt_name": "final.ckpt",   # checkpoint evaluated by stages 6-7
         # --- extrapolation axis ---------------------------------------------------
         "extrap_m": None,            # None -> config mix.holdout_m (e.g. [4, 64]);
