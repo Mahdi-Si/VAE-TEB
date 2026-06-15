@@ -171,9 +171,11 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
     else:
         sigma_obs = sigma_obs_raw if isinstance(sigma_obs_raw, str) else float(sigma_obs_raw)
     free_bits = float(loss_cfg.get("free_bits", 0.0))
+    detach_baseline_in_full = bool(loss_cfg.get("detach_baseline_in_full", False))
     return {
         "beta": beta, "lambda_full": lambda_full, "lambda_base": lambda_base,
         "likelihood": likelihood, "sigma_obs": sigma_obs, "free_bits": free_bits,
+        "detach_baseline_in_full": detach_baseline_in_full,
     }
 
 
@@ -815,6 +817,7 @@ def train_ddp(
         likelihood=loss_settings["likelihood"],
         sigma_obs=loss_settings["sigma_obs"],
         free_bits=loss_settings["free_bits"],
+        detach_baseline_in_full=loss_settings["detach_baseline_in_full"],
         warmup_epochs=int(ddp_cfg["warmup_epochs"]) if do_scale else 0,
         loss_spike_skip=config.get("loss_spike_skip"),
     )
