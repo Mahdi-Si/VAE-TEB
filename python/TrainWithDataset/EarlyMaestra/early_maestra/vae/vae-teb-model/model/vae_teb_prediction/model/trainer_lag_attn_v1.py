@@ -11,6 +11,7 @@ Usage:
 """
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import time
@@ -586,6 +587,22 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             kwargs["delta_mu_scale"] = float(vae_cfg["delta_mu_scale"])
         if "latent_stats_momentum" in vae_cfg:
             kwargs["latent_stats_momentum"] = float(vae_cfg["latent_stats_momentum"])
+        # Future-proofing: forward any *flat* ``VAE_model`` key that names a real
+        # ``SeqVaeLagAttnV1`` constructor argument but isn't already handled
+        # above, so a newly-added architecture flag is honoured here too instead
+        # of being silently dropped (which would rebuild the default architecture
+        # and break ``load_checkpoint_strict`` alignment -- the same failure mode
+        # ``testing.base._lag_attn_kwargs_from_config`` guards against). The
+        # nested config groups translated explicitly above keep precedence.
+        valid_params = set(
+            inspect.signature(SeqVaeLagAttnV1.__init__).parameters
+        )
+        nested_groups = {"horizon_refine", "encoder"}
+        for name, value in vae_cfg.items():
+            if name in kwargs or name in nested_groups or name == "init_weights":
+                continue
+            if name in valid_params and value is not None:
+                kwargs[name] = value
         return kwargs
 
     def create_model(self) -> None:

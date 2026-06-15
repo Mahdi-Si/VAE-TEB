@@ -510,6 +510,7 @@ def train_one_epoch(
     likelihood: str = "mse",
     sigma_obs: "float | str" = 1.0,
     free_bits: float = 0.0,
+    detach_baseline_in_full: bool = False,
 ) -> Dict[str, float]:
     r"""Run one training epoch: forward -> loss -> backward -> clip -> step.
 
@@ -530,6 +531,9 @@ def train_one_epoch(
             legacy configs train identically to pre-Sprint-5 behaviour.
         sigma_obs: Observation noise (scalar or ``'learned'``).
         free_bits: Per-dim KL floor (0.0 is a no-op).
+        detach_baseline_in_full: A3 — when ``True`` the full prediction uses
+            ``sg(mu_base)`` for ``L_feat`` so the feature gradient trains only
+            the residual / posterior / source path. No-op on forward values.
 
     Returns:
         Size-weighted epoch means of all entries in :data:`_TRAIN_KEYS`, plus
@@ -554,6 +558,7 @@ def train_one_epoch(
                 beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
                 likelihood=likelihood, sigma_obs=sigma_obs,
                 free_bits=free_bits,
+                detach_baseline_in_full=detach_baseline_in_full,
             )
             total = losses["total_loss"]
             if not torch.isfinite(total):
@@ -616,6 +621,7 @@ def evaluate(
     likelihood: str = "mse",
     sigma_obs: "float | str" = 1.0,
     free_bits: float = 0.0,
+    detach_baseline_in_full: bool = False,
 ) -> Dict[str, float]:
     r"""Run one evaluation pass (no backward, no optimiser step).
 
@@ -633,6 +639,10 @@ def evaluate(
             :meth:`SeqVaeLagAttnV1.compute_loss`. Defaults to ``'mse'``.
         sigma_obs: Observation noise (scalar or ``'learned'``).
         free_bits: Per-dim KL floor (0.0 is a no-op).
+        detach_baseline_in_full: A3 flag, forwarded for signature parity with
+            :func:`train_one_epoch`. Numerically a no-op here since this pass
+            runs under ``torch.no_grad`` (stop-gradient changes nothing without
+            a backward pass).
 
     Returns:
         Size-weighted means of :data:`_EVAL_KEYS`; all-NaN when ``loader`` is
@@ -657,6 +667,7 @@ def evaluate(
             beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
             likelihood=likelihood, sigma_obs=sigma_obs,
             free_bits=free_bits,
+            detach_baseline_in_full=detach_baseline_in_full,
         )
         accum["feat_loss"] += float(losses["feat_loss"]) * bs
         accum["base_loss"] += float(losses["base_loss"]) * bs
@@ -989,10 +1000,13 @@ def train(
     else:
         sigma_obs = sigma_obs_raw if isinstance(sigma_obs_raw, str) else float(sigma_obs_raw)
     free_bits = float(loss_cfg.get("free_bits", 0.0))
+    # A3 — baseline/residual gradient separation (training-only; no-op at eval).
+    detach_baseline_in_full = bool(loss_cfg.get("detach_baseline_in_full", False))
     loss_settings = {
         "beta": beta, "lambda_full": lambda_full, "lambda_base": lambda_base,
         "likelihood": likelihood, "sigma_obs": sigma_obs,
         "free_bits": free_bits,
+        "detach_baseline_in_full": detach_baseline_in_full,
     }
 
     train_loader, val_loader, data_meta = make_dataloaders(config, batch_size)
@@ -1053,12 +1067,14 @@ def train(
             grad_clip_norm=grad_clip,
             likelihood=likelihood, sigma_obs=sigma_obs,
             free_bits=free_bits,
+            detach_baseline_in_full=detach_baseline_in_full,
         )
         val_m = evaluate(
             model, val_loader, device,
             beta=beta, lambda_full=lambda_full, lambda_base=lambda_base,
             likelihood=likelihood, sigma_obs=sigma_obs,
             free_bits=free_bits,
+            detach_baseline_in_full=detach_baseline_in_full,
         )
         if scheduler is not None:
             scheduler.step()

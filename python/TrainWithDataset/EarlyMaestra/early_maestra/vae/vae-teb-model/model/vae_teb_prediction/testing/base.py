@@ -27,6 +27,7 @@ Example:
 
 from __future__ import annotations
 
+import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,15 +43,31 @@ from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 def _lag_attn_kwargs_from_config(
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Build :class:`SeqVaeLagAttnV1` constructor kwargs from a YAML config dict.
+    r"""Build :class:`SeqVaeLagAttnV1` constructor kwargs from a YAML config dict.
 
-    Reads ``cfg["model_config"]["VAE_model"]`` and maps each supported field
-    to the corresponding constructor argument. Unknown fields are silently
-    ignored. Missing fields fall back to the model's own defaults so the
-    runner can still build a valid model even when the config is partial.
+    Reads ``cfg["model_config"]["VAE_model"]`` and forwards **every** field that
+    names a real :class:`SeqVaeLagAttnV1` constructor argument, falling back to
+    the constructor's own default for any argument the config omits. The valid
+    argument set is discovered from the constructor signature via
+    :func:`inspect.signature`, so architecture-defining flags -- e.g.
+    ``head_structured_latent``, ``horizon_film``, ``horizon_depth``,
+    ``horizon_kernel``, ``encoder_extra_dilations``, ``lag_bias_init`` -- flow
+    through automatically and the rebuilt module's ``state_dict`` matches the
+    checkpoint that recorded them. Fields that are not constructor arguments are
+    ignored.
+
+    This is what makes a checkpoint trained with a non-default architecture
+    loadable: the synthetic trainer persists the *exact* resolved constructor
+    kwargs in the checkpoint (``model_kwargs``) and
+    ``run_pipeline_tests._synth_to_testing_config`` copies them verbatim under
+    ``model_config.VAE_model``; the standalone testing YAML
+    (``config_lag_attn_v1.yaml``) carries the same keys. Cherry-picking only a
+    legacy subset (the previous behaviour) silently rebuilt the *default*
+    architecture and made every non-default-arch checkpoint fail
+    ``load_checkpoint_strict`` alignment.
 
     ``attention_grad_checkpoint`` is **forced to ``False``** regardless of the
-    config value: checkpointing is only useful during backward, and the test
+    config value: checkpointing only helps the backward pass, and the test
     runner always runs under ``torch.inference_mode()``.
 
     Args:
@@ -64,28 +81,36 @@ def _lag_attn_kwargs_from_config(
         (cfg.get("model_config", {}) or {}).get("VAE_model", {}) or {}
     )
 
-    kwargs: Dict[str, Any] = {
-        "sequence_length": int(vae_cfg.get("sequence_length", 300)),
-        "d_model": int(vae_cfg.get("d_model", 128)),
-        "d_z": int(vae_cfg.get("d_z", 24)),
-        "horizon": int(vae_cfg.get("horizon", 30)),
-        "warmup_period": int(vae_cfg.get("warmup_period", 30)),
-        "c_y": int(vae_cfg.get("c_y", 87)),
-        "c_u": int(vae_cfg.get("c_u", 101)),
-        "use_up_st": bool(vae_cfg.get("use_up_st", True)),
-        "max_lag": int(vae_cfg.get("max_lag", 90)),
-        "num_heads": int(vae_cfg.get("num_heads", 4)),
-        "d_head": int(vae_cfg.get("d_head", 32)),
-        "lstm_layers": int(vae_cfg.get("lstm_layers", 2)),
-        "dropout": float(vae_cfg.get("dropout", 0.1)),
-        "decoder_hidden": int(vae_cfg.get("decoder_hidden", 128)),
-        "use_entmax": bool(vae_cfg.get("use_entmax", False)),
-        "attention_grad_checkpoint": False,  # force off for inference
-    }
+    # Discover the real constructor arguments so any architecture flag the
+    # checkpoint was trained with is honoured (and unknown config keys dropped).
+    # ``init_weights`` is intentionally left at its constructor default (the
+    # loaded checkpoint overwrites the weights regardless).
+    params = inspect.signature(SeqVaeLagAttnV1.__init__).parameters
+    kwargs: Dict[str, Any] = {}
+    for name, param in params.items():
+        if name in ("self", "init_weights"):
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if name in vae_cfg and vae_cfg[name] is not None:
+            kwargs[name] = vae_cfg[name]
+        elif param.default is not inspect.Parameter.empty:
+            kwargs[name] = param.default
 
-    logvar_clamp = vae_cfg.get("logvar_clamp")
-    if isinstance(logvar_clamp, (list, tuple)) and len(logvar_clamp) == 2:
-        kwargs["logvar_clamp"] = (float(logvar_clamp[0]), float(logvar_clamp[1]))
+    # YAML lists -> tuples where the constructor stores tuples (mirrors the
+    # coercion in ``train_minimal.build_model`` / ``evaluate_te._load_model``).
+    clamp = kwargs.get("logvar_clamp")
+    if isinstance(clamp, (list, tuple)) and len(clamp) == 2:
+        kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
+    extra_dil = kwargs.get("encoder_extra_dilations")
+    if extra_dil is not None:
+        kwargs["encoder_extra_dilations"] = tuple(int(x) for x in extra_dil)
+
+    # Inference only: gradient checkpointing helps the backward pass alone.
+    kwargs["attention_grad_checkpoint"] = False
 
     return kwargs
 

@@ -343,6 +343,10 @@ benchmarks:
     loss:
       likelihood: gaussian_nll      # feat / base losses in nats
       sigma_obs: learned            # reuse the model's logvar_full / logvar_base heads
+      detach_baseline_in_full: true # A3 — sg(mu_base) in L_feat so the feature
+                                    # gradient trains only the residual/posterior/
+                                    # source path (matches the production recipe;
+                                    # keeps K_t from absorbing FHR-self variance).
     # Mixed-population grid + holdout (consumed by synthetic.mixed_dataset).
     mix:
       m_grid: [8, 16, 32]                       # informative-channel axis

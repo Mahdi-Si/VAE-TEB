@@ -84,6 +84,7 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
         likelihood: str = "mse",
         sigma_obs: "float | str" = 1.0,
         free_bits: float = 0.0,
+        detach_baseline_in_full: bool = False,
         warmup_epochs: int = 0,
         loss_spike_skip: Optional[Dict[str, Any]] = None,
         module_name: Optional[str] = None,
@@ -108,6 +109,12 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
             likelihood: ``'mse'`` or ``'gaussian_nll'`` (synthetic Sprint-5).
             sigma_obs: Positive scalar or the literal ``'learned'``.
             free_bits: Per-dim per-step KL floor (``0.0`` is a no-op).
+            detach_baseline_in_full: A3 baseline/residual gradient separation.
+                When ``True``, the full prediction is formed as
+                $\\mathrm{sg}(\\mu^{base}) + \\Delta\\mu^{src}$ for
+                $\\mathcal L_{feat}$ so the feature gradient trains only the
+                residual / posterior / source path (keeps $K_t$ from absorbing
+                FHR-self-explainable variance). Forward values are unchanged.
             warmup_epochs: Linear LR warmup length; ``0`` disables it.
             loss_spike_skip: Optional overrides for the spike circuit breaker.
             module_name: Friendly name used in logs.
@@ -132,6 +139,7 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
                 "likelihood": likelihood,
                 "sigma_obs": sigma_obs,
                 "free_bits": free_bits,
+                "detach_baseline_in_full": detach_baseline_in_full,
                 "warmup_epochs": warmup_epochs,
                 "loss_spike_skip": loss_spike_skip,
                 "module_name": module_name,
@@ -175,6 +183,7 @@ class SyntheticSeqVaeLagAttnPl(LightningModelBase):
             likelihood=str(hp["likelihood"]),
             sigma_obs=hp["sigma_obs"],
             free_bits=float(hp["free_bits"]),
+            detach_baseline_in_full=bool(hp["detach_baseline_in_full"]),
         )
         total_loss = loss_dict["total_loss"]
         pred_gap = loss_dict["base_loss"] - loss_dict["feat_loss"]
