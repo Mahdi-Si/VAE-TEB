@@ -530,18 +530,24 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         )
         status["train"] = "dry-run" if dry_run else "done"
 
-    # --- 6. per-group eval: in-mix + interior holdout ---------------------------
+    # --- 6. per-group eval: in-mix (+ interior holdout iff it was built) --------
+    # Only pull the interior held-out cache into the eval when stage 2 actually
+    # built it; with `build_holdout` disabled the in-mix `test.npz` is the sole
+    # evaluation set (and `evaluate_mixed` skips its held-out block on `None`),
+    # so no "held-out cache skipped" FileNotFoundError is emitted.
+    eval_holdout_tag = holdout_tag if stages["build_holdout"] else None
     _stage_banner("eval_in_mix", note=f"ckpt={ckpt_name}")
     if not stages["eval_in_mix"]:
         status["eval_in_mix"] = "skipped (disabled)"
         print("[pipeline] disabled.")
     elif dry_run:
         status["eval_in_mix"] = "dry-run"
-        print(f"[pipeline] would evaluate run '{run_tag}' on '{tag}' + "
-              f"'{holdout_tag}' -> {run_dir / 'mixed_eval'}")
+        ho_note = f" + '{eval_holdout_tag}'" if eval_holdout_tag else ""
+        print(f"[pipeline] would evaluate run '{run_tag}' on '{tag}'{ho_note} "
+              f"-> {run_dir / 'mixed_eval'}")
     else:
         evaluate_mixed(
-            config, run_tag=run_tag, in_mix_tag=tag, holdout_tag=holdout_tag,
+            config, run_tag=run_tag, in_mix_tag=tag, holdout_tag=eval_holdout_tag,
             ckpt_name=ckpt_name,
         )
         status["eval_in_mix"] = "done"
@@ -759,7 +765,10 @@ if __name__ == "__main__":
                                      #   force_retrain=True.
         "ckpt_name": "final.ckpt",   # checkpoint evaluated by stages 6-7
         # --- extrapolation axis ---------------------------------------------------
-        "extrap_m": None,            # None -> config mix.holdout_m (e.g. [4, 64]);
+        "extrap_m": [],              # [] -> NO M-extrapolation caches (build_extrap /
+                                     #   eval_extrap become no-ops, per-cell extrap_tags
+                                     #   empty). We evaluate ONLY the in-mix test split.
+                                     # None -> config mix.holdout_m (e.g. [4, 64]);
                                      # or an explicit list like [64]
         # --- paths (None -> config paths.*) ---------------------------------------
         "data_dir": None,
@@ -771,15 +780,20 @@ if __name__ == "__main__":
         # --- stage toggles (always executed in this order) -------------------------
         "stages": {
             "build_in_mix": True,    # 1. data/G1_mix/<tag>/
-            "build_holdout": True,   # 2. data/G1_mix/<tag>_holdout/
-            "build_extrap": True,    # 3. data/G1_mix/<tag>_extrap_m<M>/ per M
+            # NOTE: build_holdout / build_extrap / eval_extrap default to True in
+            # _STAGE_DEFAULTS -- they must be set to explicit False here (NOT
+            # commented out, which would fall back to the True default).
+            "build_holdout": False,  # 2. DISABLED: no separate interior holdout
+                                     #    cache; we use the in-mix test split only.
+            "build_extrap": False,   # 3. DISABLED: no M-extrapolation caches
+                                     #    (also zeroed by extrap_m=[]).
             "data_previews": True,   # 4. data-anatomy figures (visualize_mixed)
                                      #    -> data/G1_mix/<tag>/previews/
             "beta_calibration": False,  # 5. OPTIONAL beta sweep (one pooled
                                         #    training per beta -- expensive)
             "train": True,           # 6. final pooled model (train_ddp)
-            "eval_in_mix": True,     # 7. mixed_eval on in-mix + holdout
-            "eval_extrap": True,     # 8. mixed_eval per extrapolation cache
+            "eval_in_mix": True,     # 7. mixed_eval on the in-mix test split
+            "eval_extrap": False,    # 8. DISABLED: no extrapolation eval passes
             "combined_figures": True,  # 9. combined per-sample scatter suite
                                      #    pooled over every eval pass (CSV ->
                                      #    figures only; cheap, non-fatal)
@@ -804,7 +818,9 @@ if __name__ == "__main__":
         # --- per_cell_diagnostics sub-stage settings (stage 9 only) ----------------
         # Each None falls back to config benchmarks.G1_mix.eval.per_cell_diag.
         "per_cell_diagnostics": {
-            "caches": None,           # None -> config (e.g. [in_mix, holdout, extrap])
+            "caches": ["in_mix"],     # in-mix only (holdout / extrap caches are not
+                                      #   built); None -> config (e.g.
+                                      #   [in_mix, holdout, extrap])
             "run_lag_recovery": None, # None -> config (analyze_lag_recovery per cell)
             "run_eval_te": None,      # None -> config (evaluate_checkpoint per cell)
             "run_width_sweep": None,  # None -> config (LOLO window-width sweep; heavy)
