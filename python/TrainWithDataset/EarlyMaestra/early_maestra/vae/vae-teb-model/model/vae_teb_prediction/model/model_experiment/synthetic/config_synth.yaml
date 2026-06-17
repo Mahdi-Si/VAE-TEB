@@ -409,7 +409,9 @@ benchmarks:
       # `per_cell_diagnostics` stage (default off). These are the fallback
       # defaults; PIPELINE['per_cell_diagnostics'] overrides per run.
       per_cell_diag:
-        caches: [in_mix, holdout, extrap]       # which caches to reproduce on
+        caches: [in_mix]                        # which caches to reproduce on
+                                                # (holdout / extrap caches are no longer
+                                                # built by run_mixed_pipeline)
         run_lag_recovery: true                  # analyze_lag_recovery per cell
         run_eval_te: true                       # evaluate_checkpoint per cell
         run_width_sweep: false                  # LOLO window-width sweep per cell
