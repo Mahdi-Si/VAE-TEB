@@ -37,7 +37,10 @@ import torch
 import yaml
 
 from train.graph_models_utils import load_checkpoint_strict
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# TEMP: legacy pre-refactor model so old (pre-375b50d) checkpoints load.
+# Revert to the line below it once testing of the old checkpoint is done.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_old import SeqVaeLagAttnV1
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
 
 
 def _lag_attn_kwargs_from_config(
