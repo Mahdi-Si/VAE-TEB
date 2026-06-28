@@ -928,6 +928,203 @@ def te_block_state_space_gaussian(
     return float(0.5 * (logdet_num - logdet_den))
 
 
+def snr_per_step_for_te_block(te_block: float, H: int, M: int) -> float:
+    r"""Per-step, per-channel innovation SNR implied by a block TE.
+
+    Inverts the block$\to$per-step decomposition $\mathrm{TE}^{(H)}_{\text{block}}
+    \approx H\,M\cdot\tfrac12\ln(1+\mathrm{SNR})$ for a Gaussian channel:
+
+    $$
+    \mathrm{SNR}
+        \;=\; \frac{\operatorname{Var}(\text{source drive})}{\sigma_y^2}
+        \;\approx\; \exp\!\Big(\frac{2\,\mathrm{TE}^{(H)}_{\text{block}}}{H\,M}\Big) - 1 .
+    $$
+
+    A back-of-envelope extractability gauge: a finite model needs the
+    source-driven component to be a non-trivial fraction of the target
+    innovation variance. Values $\lesssim 0.01$ (≈1 %) are effectively
+    unextractable at the usual per-cell sample sizes.
+
+    Args:
+        te_block: Block transfer entropy in nats ($\ge 0$).
+        H: Forecast horizon ($\ge 1$).
+        M: Informative-channel count ($\ge 1$).
+
+    Returns:
+        The implied per-step, per-channel SNR (dimensionless, $\ge 0$).
+    """
+    if H <= 0 or M <= 0:
+        raise ValueError("snr_per_step_for_te_block: H and M must be > 0.")
+    return float(math.expm1(2.0 * max(float(te_block), 0.0) / (float(H) * float(M))))
+
+
+def _ridge_holdout_logdet(
+    x_tr: np.ndarray, y_tr: np.ndarray,
+    x_te: np.ndarray, y_te: np.ndarray, ridge: float,
+) -> float:
+    r"""Log-det of the held-out residual covariance of a ridge fit.
+
+    Fits $\hat B = (X_{\mathrm{tr}}^\top X_{\mathrm{tr}} + \lambda I)^{-1}
+    X_{\mathrm{tr}}^\top Y_{\mathrm{tr}}$ (the intercept column is left
+    unpenalised) and returns $\ln\det\hat\Sigma$ with
+    $\hat\Sigma = R_{\mathrm{te}}^\top R_{\mathrm{te}} / n_{\mathrm{te}}$ on the
+    held-out residuals $R_{\mathrm{te}} = Y_{\mathrm{te}} - X_{\mathrm{te}}\hat B$.
+    Evaluating on held-out rows is what stops over-fitting from spuriously
+    shrinking the residual covariance (and inflating the gain). A small jitter
+    keeps the covariance positive-definite for ``slogdet``.
+
+    Args:
+        x_tr, y_tr: Training design / target matrices.
+        x_te, y_te: Held-out design / target matrices.
+        ridge: $L_2$ penalty scaled by the mean diagonal of the training Gram.
+
+    Returns:
+        The natural log-determinant of the held-out residual covariance.
+    """
+    gram = x_tr.T @ x_tr
+    p = gram.shape[0]
+    lam = float(ridge) * (float(np.trace(gram)) / max(p, 1))
+    reg = lam * np.eye(p)
+    reg[0, 0] = 0.0  # do not penalise the intercept column
+    coef = np.linalg.solve(gram + reg, x_tr.T @ y_tr)
+    resid = y_te - x_te @ coef
+    cov = resid.T @ resid / float(resid.shape[0])
+    h = cov.shape[0]
+    jitter = 1e-8 * (float(np.trace(cov)) / max(h, 1) + 1e-12)
+    _sign, logdet = np.linalg.slogdet(cov + jitter * np.eye(h))
+    return float(logdet)
+
+
+def realizable_te_block_from_arrays(
+    Y: np.ndarray,
+    U: np.ndarray,
+    *,
+    M: int,
+    K: int,
+    H: int,
+    delay_max: Optional[int] = None,
+    anchor: Optional[int] = None,
+    ridge: float = 1e-2,
+    train_frac: float = 0.7,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    r"""Block TE *realizable* by a finite ridge predictor on cached arrays.
+
+    Estimates the same Barnett--Barrett--Seth determinant-ratio block transfer
+    entropy as :func:`te_block_state_space_gaussian`, but on **already-generated,
+    z-scored cache arrays** and at the *training* sample size, using a held-out
+    split so over-fitting cannot inflate the gain:
+
+    $$
+    \widehat{\mathrm{TE}}^{(H),\,\text{real}}_{U\to Y}
+        = \tfrac12\Big(
+            \ln\det\widehat\Sigma^{\text{test}}_{Y^{+}\mid Y^{-}}
+          - \ln\det\widehat\Sigma^{\text{test}}_{Y^{+}\mid Y^{-},\,U^{-}}
+        \Big),
+    $$
+
+    where the two ridge regressions ($Y^{+}\!\sim\!Y^{-}$ and
+    $Y^{+}\!\sim\![Y^{-},U^{-}]$) are fit on a training partition and the
+    residual covariances are evaluated on a held-out partition. The informative
+    source channels ``U[:, :, :M]`` are exactly the oscillator state the analytic
+    TE conditions on (the generator writes them into the front channels), so the
+    ratio is directly comparable to a cell's ``te_cell_realised``.
+
+    Comparing this to the analytic block TE answers the realizability question
+    that gates the experiment: a ratio $\to 1$ means an optimal-ish predictor
+    *can* extract the TE at this sample size (so a downstream calibration failure
+    is a model/training problem); a ratio $\ll 1$ means the TE is *not
+    extractable* at this $n$ (a data-design problem -- concentrate the signal).
+
+    Args:
+        Y: Target cache array of shape $(n, T, C_y)$ (z-scored).
+        U: Source cache array of shape $(n, T, C_u)$; channels $[0, M)$ are the
+            informative oscillator state.
+        M: Informative-channel count of the cell.
+        K: History depth for the target self-history $Y^{-}$ (use the cell's
+            ``K_history``).
+        H: Forecast horizon.
+        delay_max: Upper lag of the cell's band; the source regressors $U^{-}$
+            are scoped to lags $0..\,$``delay_max`` (the band the true coupling
+            lives in), so the held-out gain reflects a lag-selecting predictor
+            rather than a blind $K$-lag regression that pays the estimation
+            variance of $K\,M$ noisy source coefficients. ``None`` uses the full
+            $K$ source lags (matches the analytic support but is noisier at
+            finite $n$).
+        anchor: Anchor index $t_0$ (history $[t_0-K, t_0)$, future
+            $[t_0, t_0+H)$). Defaults to a mid-sequence position for
+            stationarity.
+        ridge: $L_2$ penalty added to the regressor Gram diagonal (relative to
+            its mean), shared across the reduced and full fits. Negligible for
+            the low-$M$ headline cells where regressors $\ll$ samples.
+        train_frac: Fraction of samples used to fit; the remainder evaluates the
+            residual covariance.
+        seed: Seed for the train/test row shuffle.
+
+    Returns:
+        Dict with ``realizable_gain`` (nats, block), ``snr_per_step``,
+        ``m_used``, ``anchor``, ``n_train``, ``n_test`` and ``ill_conditioned``
+        (``True`` with ``realizable_gain = nan`` when the held-out set is too
+        small to estimate the $HM \times HM$ residual covariance, i.e.
+        ``n_test <= H * m_used`` -- which happens only for the heavily diluted,
+        non-gated high-$M$ cells).
+    """
+    Y = np.asarray(Y, dtype=float)
+    U = np.asarray(U, dtype=float)
+    if Y.ndim != 3 or U.ndim != 3:
+        raise ValueError(
+            "realizable_te_block_from_arrays: Y and U must be (n, T, C)."
+        )
+    n, T, _ = Y.shape
+    m_used = int(min(int(M), Y.shape[2], U.shape[2]))
+    if m_used <= 0:
+        raise ValueError("realizable_te_block_from_arrays: M must be >= 1.")
+    t0 = (max(int(K), (T - int(H)) // 2) if anchor is None else int(anchor))
+    if t0 < int(K) or t0 + int(H) > T:
+        raise ValueError(
+            f"realizable_te_block_from_arrays: anchor {t0} needs K={K} history "
+            f"and H={H} future within T={T}."
+        )
+    Yc = Y[:, :, :m_used]
+    Uc = U[:, :, :m_used]
+    # Target self-history: full K lags (shared by both fits, so its estimation
+    # variance cancels in the gain). Source history: scoped to the band lags
+    # 0..delay_max, since the true coupling lies in-band -- regressing on all K
+    # source lags is asymptotically identical but pays the held-out estimation
+    # variance of K*M noisy coefficients, which a lag-attention model avoids.
+    w_u = (int(K) if delay_max is None
+           else int(min(int(delay_max) + 1, t0 + 1, int(K))))
+    y_minus = Yc[:, t0 - K : t0, :].reshape(n, K * m_used)
+    u_minus = Uc[:, t0 - w_u + 1 : t0 + 1, :].reshape(n, w_u * m_used)
+    y_plus = Yc[:, t0 : t0 + H, :].reshape(n, H * m_used)
+    ones = np.ones((n, 1), dtype=float)
+    x_red = np.concatenate([ones, y_minus], axis=1)
+    x_full = np.concatenate([ones, y_minus, u_minus], axis=1)
+
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n)
+    n_tr = max(1, int(round(float(train_frac) * n)))
+    tr, te = perm[:n_tr], perm[n_tr:]
+    out: Dict[str, Any] = {
+        "m_used": m_used, "anchor": t0,
+        "n_train": int(n_tr), "n_test": int(te.size),
+    }
+    if int(te.size) <= H * m_used:
+        out.update(realizable_gain=float("nan"), snr_per_step=float("nan"),
+                   ill_conditioned=True)
+        return out
+    ld_red = _ridge_holdout_logdet(x_red[tr], y_plus[tr], x_red[te], y_plus[te],
+                                   ridge)
+    ld_full = _ridge_holdout_logdet(x_full[tr], y_plus[tr], x_full[te],
+                                    y_plus[te], ridge)
+    gain = float(0.5 * (ld_red - ld_full))
+    out.update(realizable_gain=gain,
+               snr_per_step=float(math.expm1(2.0 * max(gain, 0.0)
+                                             / (H * m_used))),
+               ill_conditioned=False)
+    return out
+
+
 def _bisect_for_te_target(
     eval_fn: Callable[[float], float],
     target_te_block: float,
