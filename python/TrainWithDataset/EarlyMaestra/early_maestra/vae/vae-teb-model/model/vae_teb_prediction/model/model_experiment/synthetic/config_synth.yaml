@@ -96,8 +96,8 @@ benchmarks:
   G1:
     data:
       sequence_length: 300
-      oscillators: [[0.99, 0.05]]   # [(r, omega)] -- period ~125 steps (low-freq)
-      target_ar: 0.95
+      oscillators: [[0.80, 0.10]]   # [(r, omega)] de-smoothed -> lags identifiable (v3-mix patch; was [0.99,0.05])
+      target_ar: 0.40               # de-correlated target -> clean baseline removal (v3-mix patch; was 0.95)
       delay_min: 1                  # within-signal lag walk in {1..15} steps
       delay_max: 15                 # ~1 min; ell* = {0, ..., 14}
       delay_walk: true              # lag drifts within each signal as a slow
@@ -108,7 +108,7 @@ benchmarks:
       sigma2_y: 1.0
       sigma2_eta: 0.01
       M: 16                         # informative target/source channels (default)
-      K_history: 160                # generous history for the near-unit-root source
+      K_history: 64                 # shorter history -> finite-sample realizability (v3-mix patch; was 160)
       easy_variant: false           # true -> tile spec to fill all c_y channels
       standardize: true
       reverse_roles: false
@@ -311,11 +311,11 @@ benchmarks:
   G1_mix:
     data:
       sequence_length: 300
-      oscillators: [[0.99, 0.05]]   # single spec; tiled to each cell's M
-      target_ar: 0.95
+      oscillators: [[0.80, 0.10]]   # single spec; tiled to each cell's M (de-smoothed -> lags identifiable; v3-mix patch; was [0.99,0.05])
+      target_ar: 0.40               # de-correlated target -> clean baseline removal (v3-mix patch; was 0.95)
       sigma2_y: 1.0
       sigma2_eta: 0.01
-      K_history: 160                # generous history for the near-unit-root source
+      K_history: 64                 # shorter history -> finite-sample realizability (v3-mix patch; was 160)
       standardize: true             # per-cell z-score; the pool is NOT re-standardized
       reverse_roles: false
       randomize_channel_layout: false  # true -> informative channels at random (per-cell,
@@ -324,7 +324,9 @@ benchmarks:
                                        # front channels are active). TE-invariant (z-score
                                        # commutes with the permutation). Default off so the
                                        # baseline pool is byte-identical.
-      delay_walk: true              # lag drifts within each signal (realistic CTG regime)
+      delay_walk: false             # FIXED per-sample lag -> clean headline calibration (v3-mix patch; was true).
+                                    # The random-walk robustness pool is a SEPARATE build (override to true,
+                                    # tag G1_mix_walk) per run_mixed_pipeline; it tests lag tracking, not calibration.
       delay_walk_step_prob: 0.02
       te_n_samples: 2000            # GENERATION budget only: the generator's
                                     # meta.te_true is DISCARDED (sample_te_true
@@ -349,14 +351,15 @@ benchmarks:
                                     # keeps K_t from absorbing FHR-self variance).
     # Mixed-population grid + holdout (consumed by synthetic.mixed_dataset).
     mix:
-      m_grid: [8, 16, 32]                       # informative-channel axis
-      target_te_grid: [0.0, 0.1, 0.7, 1.5, 3.0] # mean block TE (nats), held fixed across M.
+      m_grid: [1, 2, 8, 32]                     # informative-channel axis (low M = concentrated headline; high M = dilution stress; v3-mix patch; was [8,16,32])
+      target_te_grid: [0.0, 0.3, 0.8, 1.5, 3.0] # mean block TE (nats), held fixed across M (dropped unreachable 0.1; v3-mix patch).
                                                 # 0.0 = zero-coupling NULL cell (B_y=0,
                                                 # true TE=0): bypasses the inverter + MC-floor
                                                 # trim and anchors the calibration intercept
                                                 # alpha. One null per (M, band); never hold
                                                 # one out (it must be trained).
       lag_bands:                                # name -> [delay_min, delay_max]
+        tiny:  [4, 4]                           # FIXED identifiable lag, band ell* = {0, ..., 3} (headline calibration band; v3-mix patch)
         short: [1, 8]                           # band ell* = {0, ..., 7}
         mid:   [1, 15]                          # band ell* = {0, ..., 14}
         long:  [1, 31]                          # band ell* = {0, ..., 30}
@@ -380,16 +383,16 @@ benchmarks:
                                                 # trained -> a separate test-only cache
                                                 # for extrapolation. Each value (M / TE /
                                                 # band) still appears in trained cells.
-        - [16, 0.7, mid]
-        - [16, 1.5, short]
-        - [8,  1.5, long]
-        - [32, 0.7, short]
-        - [16, 3.0, long]
-        - [32, 1.5, mid]
+        - [2,  0.8, short]
+        - [8,  1.5, tiny]
+        - [1,  1.5, mid]
+        - [32, 0.8, short]
+        - [2,  3.0, mid]
+        - [8,  3.0, tiny]
       inverter:                                 # B_y_for_mean_te_block_state_space knobs
         n_samples: 12000
         lo: 1.0e-4
-        hi: 10.0
+        hi: 25.0                                # raised: aggressive dynamics shrink source variance -> larger B_y to hit TE (v3-mix patch; was 10.0)
         tol: 0.005
         max_iter: 30
     # Per-group evaluation knobs (consumed by synthetic.mixed_eval).
@@ -401,6 +404,16 @@ benchmarks:
       n_lolo_per_cell: 256                      # cap LOLO samples per cell
       null_controls: [shuffle, reverse]         # per-cell source-corruption controls
       lag_mass_threshold: 0.8                   # success criterion #4 pass threshold
+      realizability:                            # R0 model-free realizability gate (v3-mix patch;
+                                                # mixed_eval.collect_per_cell_realizable_gain +
+                                                # analytic_te.realizable_te_block_from_arrays)
+        frac_threshold: 0.7                     # headline cell passes if realizable_gain/te_true >= this
+        headline_m: [1, 2]                      # M values that MUST be realizable (gated)
+        headline_bands: [tiny, short]           # bands that MUST be realizable (gated)
+        ridge: 1.0e-2                           # ridge penalty for the probe regressions
+        n_anchors: 3                            # average the probe over this many sequence anchors
+        n_seeds: 2                              # ... and this many train/test splits
+        sample_size: null                       # null -> all cell samples in the split (~n_per_cell_train)
       lag_walk:                                 # per-step d_t-vs-attention recovery
         enabled: true                           #   (uses the cache's true_lag_tt)
       # Faithful per-cell reproduction of the single-cell lag_recovery /

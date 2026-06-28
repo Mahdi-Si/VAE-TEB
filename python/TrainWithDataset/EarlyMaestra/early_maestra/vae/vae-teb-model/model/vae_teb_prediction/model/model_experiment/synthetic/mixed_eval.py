@@ -64,6 +64,10 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.lag_recovery impo
     compute_peak_lag_error,
     run_sliding_window_lolo,
 )
+from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te import (
+    realizable_te_block_from_arrays,
+    snr_per_step_for_te_block,
+)
 from model.vae_teb_prediction.model.model_experiment.synthetic import plot_style as ps
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (
     apply_path_overrides,
@@ -1319,6 +1323,284 @@ def _pred_gain_summary(arrs: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# Realizability probe + collapse gate (model-free R0 / post-train R1)
+# =============================================================================
+
+def collect_per_cell_realizable_gain(
+    config: Dict[str, Any],
+    tag: str,
+    *,
+    split: str = "train",
+    horizon: int,
+    K: int,
+    ridge: float = 1e-2,
+    sample_size: Optional[int] = None,
+    n_anchors: int = 3,
+    n_seeds: int = 2,
+) -> Dict[int, Dict[str, Any]]:
+    r"""Per-cell *realizable* block TE on a cache split, independent of the model.
+
+    For each cell, ridge-regresses the cached future target on its past, and on
+    [past target, in-band past source], at the cell's own sample size, and
+    reports the held-out determinant-ratio gain
+    (:func:`analytic_te.realizable_te_block_from_arrays`) against the cell's
+    analytic ``te_cell_realised``. Averaged over a few sequence anchors and
+    train/test splits for stability. Reads the raw z-scored arrays straight from
+    ``<split>.npz`` -- no checkpoint, no GPU -- so it can gate the pipeline
+    *before* any training (the R0 pre-flight).
+
+    Args:
+        config: Parsed config (``paths.data_dir``).
+        tag: Cache tag under ``data/G1_mix/``.
+        split: Cache split to probe (``train`` mirrors the model's sample size).
+        horizon: Forecast horizon $H$.
+        K: History depth (the cell's ``K_history``).
+        ridge: Ridge penalty forwarded to the probe.
+        sample_size: Cap on samples per cell (``None`` uses the whole split).
+        n_anchors: Number of sequence anchors averaged per cell.
+        n_seeds: Number of train/test splits averaged per cell.
+
+    Returns:
+        ``{cell_id -> {realizable_gain, te_true, realizable_frac, snr_per_step,
+        M, band, n, ill_conditioned}}``.
+    """
+    data_root = resolve_user_path(config["paths"]["data_dir"])
+    npz_path = data_root / _BENCHMARK / tag / f"{split}.npz"
+    if not npz_path.is_file():
+        raise FileNotFoundError(
+            f"realizability: split not found: {npz_path}. Build the cache first."
+        )
+    with np.load(npz_path) as z:
+        fhr = np.concatenate([z["fhr_st"], z["fhr_ph"]], axis=-1)
+        up = np.concatenate([z["up_st"], z["up_ph"]], axis=-1)
+        cell_ids = np.asarray(z["sample_cell_id"], dtype=int)
+    # The mixture manifest lives in the shared meta.json sidecar (split-agnostic);
+    # read it directly rather than constructing the full dataset over this split.
+    with open(npz_path.parent / "meta.json", "r", encoding="utf-8") as fh:
+        cells_by_id = _cells_by_id(json.load(fh).get("mixture", {}))
+    T = int(fhr.shape[1])
+    lo_a, hi_a = int(K), int(T - horizon)
+    if hi_a <= lo_a or int(n_anchors) <= 1:
+        anchors: List[Optional[int]] = [None]
+    else:
+        anchors = [int(round(lo_a + (hi_a - lo_a) * f))
+                   for f in np.linspace(0.35, 0.65, int(n_anchors))]
+    out: Dict[int, Dict[str, Any]] = {}
+    for cid, cell in sorted(cells_by_id.items()):
+        Mc = int(cell.get("M", 1))
+        dmax = int(cell.get("delay_max", 0))
+        te_true = float(cell.get("te_cell_realised",
+                                 cell.get("target_te", float("nan"))))
+        idx = np.nonzero(cell_ids == int(cid))[0]
+        if sample_size is not None and idx.size > int(sample_size):
+            idx = idx[: int(sample_size)]
+        snr = snr_per_step_for_te_block(max(te_true, 0.0), horizon, max(Mc, 1))
+        rec: Dict[str, Any] = {
+            "M": Mc, "band": str(cell.get("band", "")), "te_true": te_true,
+            "snr_per_step": snr, "n": int(idx.size),
+        }
+        if Mc <= 0 or idx.size < (horizon * Mc + 10):
+            rec.update(realizable_gain=float("nan"),
+                       realizable_frac=float("nan"), ill_conditioned=True)
+            out[int(cid)] = rec
+            continue
+        Yc, Uc = fhr[idx], up[idx]
+        gains: List[float] = []
+        for a in anchors:
+            for s in range(int(max(1, n_seeds))):
+                r = realizable_te_block_from_arrays(
+                    Yc, Uc, M=Mc, K=int(K), H=int(horizon),
+                    delay_max=dmax, anchor=a, ridge=ridge, seed=s,
+                )
+                if not r.get("ill_conditioned") and np.isfinite(r["realizable_gain"]):
+                    gains.append(float(r["realizable_gain"]))
+        if not gains:
+            rec.update(realizable_gain=float("nan"),
+                       realizable_frac=float("nan"), ill_conditioned=True)
+        else:
+            g = float(np.mean(gains))
+            rec.update(
+                realizable_gain=g,
+                realizable_frac=(float(g / te_true) if te_true > 1e-9
+                                 else float("nan")),
+                ill_conditioned=False,
+            )
+        out[int(cid)] = rec
+    return out
+
+
+def _attach_realizability(
+    rows: List[Dict[str, Any]], realiz: Dict[int, Dict[str, Any]],
+) -> None:
+    """Merge per-cell realizable-gain fields into the per-cell rows (in place)."""
+    for row in rows:
+        r = realiz.get(int(row["cell_id"]), {})
+        row["realizable_gain"] = r.get("realizable_gain", float("nan"))
+        row["realizable_frac"] = r.get("realizable_frac", float("nan"))
+        row["snr_per_step"] = r.get("snr_per_step", float("nan"))
+
+
+def _realizability_summary(
+    realiz: Dict[int, Dict[str, Any]], *,
+    frac_threshold: float, headline_m: Sequence[int],
+    headline_bands: Sequence[str],
+) -> Dict[str, Any]:
+    r"""Summarise the R0 realizability gate.
+
+    Passes when every *headline* (low-$M$, identifiable-band, TE > 0) cell has
+    ``realizable_frac >= frac_threshold`` -- i.e. an honest finite-sample linear
+    predictor recovers most of the analytic TE, so a downstream calibration
+    failure would be a model/training problem, not a data one.
+    """
+    hm = {int(m) for m in headline_m}
+    hb = {str(b) for b in headline_bands}
+
+    def is_signal(r: Dict[str, Any]) -> bool:
+        return float(r.get("te_true", 0.0)) > 1e-9
+
+    def is_headline(r: Dict[str, Any]) -> bool:
+        return (is_signal(r) and int(r.get("M", -1)) in hm
+                and str(r.get("band", "")) in hb)
+
+    def frac_ok(rs: List[Dict[str, Any]]) -> float:
+        vals = [float(r.get("realizable_frac", float("nan"))) for r in rs]
+        vals = [v for v in vals if np.isfinite(v)]
+        return float(np.mean([v >= frac_threshold for v in vals])) if vals else float("nan")
+
+    rows = list(realiz.values())
+    sig = [r for r in rows if is_signal(r)]
+    headline = [r for r in sig if is_headline(r)]
+    failing = sorted(
+        int(cid) for cid, r in realiz.items()
+        if is_headline(r) and not (float(r.get("realizable_frac", 0.0)) >= frac_threshold)
+    )
+    return {
+        "frac_threshold": float(frac_threshold),
+        "n_signal_cells": len(sig),
+        "n_headline_cells": len(headline),
+        "frac_realizable_all_signal": frac_ok(sig),
+        "frac_realizable_headline": frac_ok(headline),
+        "headline_pass": bool(headline) and not failing,
+        "failing_headline_cell_ids": failing,
+        "by_M": {int(m): frac_ok([r for r in sig if int(r.get("M", -1)) == int(m)])
+                 for m in sorted({int(r.get("M", -1)) for r in sig})},
+    }
+
+
+def _collapse_summary(
+    arrs: Dict[str, Any], *,
+    kl_dim_threshold: float = 1e-3, null_ratio_max: float = 0.5,
+    min_active_dims: int = 4,
+) -> Dict[str, Any]:
+    r"""Posterior-collapse gate (R1): null-shuffle ratio + active latent dims.
+
+    A signal-bearing cell (TE > 0) is "collapsed" if the source-shuffled
+    $\bar K$ is within ``null_ratio_max`` of the clean $\bar K$ (the posterior
+    barely responds to the source) or fewer than ``min_active_dims`` latent dims
+    carry KL above ``kl_dim_threshold``. Reports the worst signal cell.
+    """
+    kbar = np.asarray(arrs.get("kbar", []), dtype=float)
+    cellid = np.asarray(arrs.get("cell_id", []), dtype=int)
+    te = np.asarray(arrs.get("te_true", []), dtype=float)
+    shuffle_key = next((k for k in ("kbar_shuffle", "kbar_reverse")
+                        if k in arrs), None)
+    kshuf = (np.asarray(arrs.get(shuffle_key, []), dtype=float)
+             if shuffle_key else None)
+    per_dim = arrs.get("per_dim_kl_by_cell", {}) or {}
+    if cellid.size == 0:
+        return {}
+    sig_cids = {int(c) for c in np.unique(cellid[te > 1e-9])} if te.size else set()
+    ratios: Dict[int, float] = {}
+    active: Dict[int, int] = {}
+    for cid in np.unique(cellid):
+        mask = cellid == cid
+        kb = float(np.nanmean(kbar[mask])) if kbar.size else float("nan")
+        if kshuf is not None and kshuf.size:
+            ratios[int(cid)] = (float(np.nanmean(kshuf[mask])) / kb
+                                if kb > 1e-12 else float("nan"))
+        dims = per_dim.get(int(cid))
+        if dims is not None:
+            active[int(cid)] = int(np.sum(np.asarray(dims, dtype=float)
+                                          > kl_dim_threshold))
+    sig_ratios = [v for c, v in ratios.items() if c in sig_cids and np.isfinite(v)]
+    sig_active = [v for c, v in active.items() if c in sig_cids]
+    collapsed = sorted(
+        c for c in sig_cids
+        if (np.isfinite(ratios.get(c, float("nan")))
+            and ratios.get(c, 0.0) > null_ratio_max)
+        or (c in active and active[c] < min_active_dims)
+    )
+    return {
+        "null_ratio_max": float(null_ratio_max),
+        "min_active_dims": int(min_active_dims),
+        "max_null_shuffle_ratio_signal": (float(np.nanmax(sig_ratios))
+                                          if sig_ratios else float("nan")),
+        "min_active_dims_signal": int(min(sig_active)) if sig_active else -1,
+        "n_collapsed_signal_cells": len(collapsed),
+        "collapsed_cell_ids": collapsed,
+        "any_collapsed": bool(collapsed),
+    }
+
+
+def run_realizability_preflight(
+    config: Dict[str, Any], tag: str, *,
+    split: str = "train", out_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    r"""Model-free R0 pre-flight: probe realizability on a cache and gate.
+
+    Prints a per-cell table, writes ``realizability.json`` (when ``out_dir`` is
+    given) and returns ``{"summary": ..., "per_cell": ...}`` -- the pipeline
+    reads ``summary['headline_pass']`` to decide whether to proceed to training.
+    """
+    model_cfg = config["model"]
+    horizon = int(model_cfg["horizon"])
+    data_cfg = config["benchmarks"][_BENCHMARK]["data"]
+    K = int(data_cfg.get("K_history", 64))
+    rcfg = (config["benchmarks"][_BENCHMARK].get("eval", {}) or {}).get(
+        "realizability", {}) or {}
+    realiz = collect_per_cell_realizable_gain(
+        config, tag, split=split, horizon=horizon, K=K,
+        ridge=float(rcfg.get("ridge", 1e-2)),
+        sample_size=rcfg.get("sample_size"),
+        n_anchors=int(rcfg.get("n_anchors", 3)),
+        n_seeds=int(rcfg.get("n_seeds", 2)),
+    )
+    summary = _realizability_summary(
+        realiz,
+        frac_threshold=float(rcfg.get("frac_threshold", 0.7)),
+        headline_m=rcfg.get("headline_m", [1, 2]),
+        headline_bands=rcfg.get("headline_bands", ["tiny", "short"]),
+    )
+    print(f"[realizability] cache '{tag}' split '{split}' (K={K}, H={horizon}):")
+    print(f"  {'cell':>4} {'M':>3} {'band':>6} {'te_true':>8} {'realiz':>8} "
+          f"{'frac':>6} {'snr/st':>7} {'note':>5}")
+    for cid in sorted(realiz):
+        r = realiz[cid]
+        note = "ILL" if r.get("ill_conditioned") else ("HEAD" if (
+            int(r.get("M", -1)) in {int(m) for m in rcfg.get("headline_m", [1, 2])}
+            and str(r.get("band", "")) in {str(b) for b in rcfg.get(
+                "headline_bands", ["tiny", "short"])}
+            and float(r.get("te_true", 0.0)) > 1e-9) else "")
+        print(f"  {cid:>4} {int(r.get('M', 0)):>3} {str(r.get('band', '')):>6} "
+              f"{float(r.get('te_true', float('nan'))):>8.3f} "
+              f"{float(r.get('realizable_gain', float('nan'))):>8.3f} "
+              f"{float(r.get('realizable_frac', float('nan'))):>6.2f} "
+              f"{float(r.get('snr_per_step', float('nan'))):>7.4f} {note:>5}")
+    verdict = "PASS" if summary["headline_pass"] else "FAIL"
+    print(f"[realizability] R0 headline gate: {verdict} "
+          f"(threshold frac>={summary['frac_threshold']}; "
+          f"headline frac_realizable={summary['frac_realizable_headline']}; "
+          f"failing cells={summary['failing_headline_cell_ids']})")
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "realizability.json", "w", encoding="utf-8") as fh:
+            json.dump({"summary": summary,
+                       "per_cell": {str(k): v for k, v in realiz.items()}},
+                      fh, indent=2)
+    return {"summary": summary, "per_cell": realiz}
+
+
 def evaluate_mixed(
     config: Dict[str, Any],
     *,
@@ -1396,6 +1678,7 @@ def evaluate_mixed(
         arrs_in, cells_in, alpha=float(overall["alpha"]),
         gamma=float(overall["gamma"]), controls=controls,
     )
+    realiz_in: Dict[int, Dict[str, Any]] = {}
     if in_mix_light:
         # Per-extrap pass: the in-mix cache is only needed for the calibration
         # that scores the held-out cells; the heavy in-mix diagnostics already
@@ -1430,6 +1713,23 @@ def evaluate_mixed(
             horizon=horizon, T=T, max_lag=max_lag,
             eval_cfg={**eval_cfg, "batch_size": bs}, do_lag_walk=do_lag_walk,
         )
+        print("[mixed_eval] per-cell realizability probe (in-mix train split) ...")
+        try:
+            rcfg = eval_cfg.get("realizability", {}) or {}
+            realiz_in = collect_per_cell_realizable_gain(
+                config, in_mix_tag, split="train", horizon=horizon,
+                K=int(config["benchmarks"][_BENCHMARK]["data"].get("K_history", 64)),
+                ridge=float(rcfg.get("ridge", 1e-2)),
+                sample_size=rcfg.get("sample_size"),
+                n_anchors=int(rcfg.get("n_anchors", 3)),
+                n_seeds=int(rcfg.get("n_seeds", 2)),
+            )
+        except (FileNotFoundError, KeyError) as exc:
+            print(f"[mixed_eval] realizability probe skipped: {exc}")
+            realiz_in = {}
+
+    _attach_realizability(rows_in, realiz_in)
+    arrs_in["realizable_by_cell"] = realiz_in
 
     # --- held-out extrapolation ---------------------------------------------
     rows_ho: List[Dict[str, Any]] = []
@@ -1511,6 +1811,21 @@ def evaluate_mixed(
         "pred_gain": {
             "in_mix": _pred_gain_summary(arrs_in),
             "holdout": _pred_gain_summary(arrs_ho) if rows_ho else {},
+        },
+        "realizability": {
+            "in_mix": _realizability_summary(
+                realiz_in,
+                frac_threshold=float(
+                    (eval_cfg.get("realizability", {}) or {}).get("frac_threshold", 0.7)),
+                headline_m=(eval_cfg.get("realizability", {}) or {}).get(
+                    "headline_m", [1, 2]),
+                headline_bands=(eval_cfg.get("realizability", {}) or {}).get(
+                    "headline_bands", ["tiny", "short"]),
+            ) if realiz_in else {},
+        },
+        "collapse": {
+            "in_mix": _collapse_summary(arrs_in),
+            "holdout": _collapse_summary(arrs_ho) if rows_ho else {},
         },
         "lag_recovery_summary": {
             "in_mix": lag_recovery_summary(rows_in, threshold=lag_mass_threshold),
@@ -1813,7 +2128,8 @@ _BASE_CELL_FIELDS = [
     "lag_mass_attn", "lag_mass_attn_ratio", "peak_lag_err_mean",
     "peak_in_band_frac", "lag_walk_mae", "lag_walk_within1_frac",
     "lag_walk_corr", "delta_L", "feat_loss",
-    "base_loss", "held_out",
+    "base_loss", "realizable_gain", "realizable_frac", "snr_per_step",
+    "held_out",
 ]
 
 
@@ -3779,20 +4095,45 @@ def _fig_pred_gain_vs_te(path, rows_in, rows_ho, arrs, slices, controls) -> None
         ax.scatter(v["te_true"], v["delta_L"], c=color, edgecolors=ps.COLOR_BLACK,
                    marker=_BAND_MARKERS.get(v["band"], "D"), s=55,
                    linewidths=0.5, zorder=3)
+    # Reference curves: the analytic TE is the *optimal* predictor's gain (y=x),
+    # and the model-free ridge probe (grey x) is the gain a finite linear
+    # predictor realises at the training sample size. A model dL well below the
+    # realizable curve means the VAE is not extracting an available signal (R2).
+    from matplotlib.lines import Line2D
+    rb = arrs.get("realizable_by_cell", {}) or {}
+    te_pts = [float(v["te_true"]) for v in pg_in.values()
+              if np.isfinite(v.get("te_true", float("nan")))]
+    rb_ok = [r for r in rb.values()
+             if np.isfinite(r.get("te_true", float("nan")))
+             and np.isfinite(r.get("realizable_gain", float("nan")))]
+    xmax = max(te_pts + [r["te_true"] for r in rb_ok] + [1.0])
+    xs = np.linspace(0.0, float(xmax), 50)
+    ax.plot(xs, xs, ls=":", lw=1.0, color=ps.COLOR_BLACK, zorder=1)
+    if rb_ok:
+        ax.scatter([r["te_true"] for r in rb_ok],
+                   [r["realizable_gain"] for r in rb_ok],
+                   marker="x", s=34, c=ps.COLOR_GRAY, alpha=0.8, zorder=2)
     ax.set_xlabel(r"true block TE  $\mathrm{TE}_{\mathrm{true}}$  (nats)")
     ax.set_ylabel(r"prediction gain  $\Delta\mathcal{L}=\mathcal{L}_{\mathrm{base}}"
                   r"-\mathcal{L}_{\mathrm{feat}}$  (nats)")
     ax.set_title("Prediction gain vs true TE")
-    handles = _cell_legend_handles(
+    handles = list(_cell_legend_handles(
         [{"M": v["M"], "band": v["band"]} for v in pg_in.values()]
-    )
+    )) + [
+        Line2D([0], [0], ls=":", color=ps.COLOR_BLACK,
+               label=r"$\Delta\mathcal{L}=\mathrm{TE}$ (optimal)"),
+        Line2D([0], [0], ls="none", marker="x", color=ps.COLOR_GRAY,
+               label="realizable (ridge @ n_train)"),
+    ]
     # Legend outside the axes: the up-to-9-entry key used to sit on the
     # top-left data region.
     ax.legend(handles=handles, fontsize=6.5, frameon=False,
               loc="center left", bbox_to_anchor=(1.01, 0.5))
     _caption(fig, "Prediction gain dL = L_base - L_feat per cell vs true TE; "
-                  "dashed dL=0. Good: dL ~ 0 at low TE and rising with TE -- the "
-                  "source path helps the forecast only when info is real.")
+                  "dashed dL=0, dotted y=x (optimal), grey x = realizable ridge "
+                  "gain at n_train. Good: dL rises with TE and tracks the "
+                  "realizable curve; dL << realizable => available source info "
+                  "left unused.")
     ps.style_axes(ax)
     ps.save_figure(fig, path)
 
@@ -4125,6 +4466,15 @@ def main() -> None:
                         help="only re-render the combined per-sample figures "
                              "from the existing per_sample/per_cell CSVs "
                              "(replot-only: no checkpoint, no GPU)")
+    parser.add_argument("--realizability-only", action="store_true",
+                        dest="realizability_only",
+                        help="only run the model-free R0 realizability probe on "
+                             "the in-mix cache's train split, print the R0 table "
+                             "and write realizability.json (no checkpoint, no "
+                             "GPU); exit code 2 if the headline gate fails")
+    parser.add_argument("--realizability-split", type=str, default="train",
+                        dest="realizability_split",
+                        help="cache split to probe for --realizability-only")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -4135,6 +4485,14 @@ def main() -> None:
         results_root = resolve_user_path(config["paths"]["results_dir"])
         render_combined_per_sample_scatter(results_root / _BENCHMARK / args.run_tag)
         return
+    if args.realizability_only:
+        results_root = resolve_user_path(config["paths"]["results_dir"])
+        out_dir = results_root / _BENCHMARK / args.run_tag / (
+            args.out_subdir or _OUT_SUBDIR)
+        res = run_realizability_preflight(
+            config, args.in_mix_tag, split=args.realizability_split,
+            out_dir=out_dir)
+        sys.exit(0 if res["summary"].get("headline_pass") else 2)
     evaluate_mixed(
         config, run_tag=args.run_tag, in_mix_tag=args.in_mix_tag,
         holdout_tag=args.holdout_tag, ckpt_name=args.ckpt_name,

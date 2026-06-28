@@ -118,6 +118,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.mixed_dataset imp
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.mixed_eval import (  # noqa: E402
     evaluate_mixed,
+    run_realizability_preflight,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal import (  # noqa: E402
     apply_path_overrides,
@@ -136,6 +137,7 @@ _STAGE_ORDER = (
     "build_in_mix",
     "build_holdout",
     "build_extrap",
+    "r0_realizability",
     "data_previews",
     "beta_calibration",
     "train",
@@ -426,6 +428,32 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         for m in extrap_ms:
             build_g1_mix(config, force=force_rebuild, extrap_m=int(m))
         status["build_extrap"] = "done"
+
+    # --- 3b. R0 realizability pre-flight (model-free gate) ----------------------
+    _stage_banner("r0_realizability")
+    if not stages["r0_realizability"]:
+        status["r0_realizability"] = "skipped (disabled)"
+        print("[pipeline] disabled.")
+    elif dry_run:
+        status["r0_realizability"] = "dry-run"
+        print(f"[pipeline] would probe realizability of data/{_BENCHMARK}/{tag}/ "
+              f"(train split) and gate on the headline cells.")
+    else:
+        res = run_realizability_preflight(
+            config, tag, split="train", out_dir=data_root / _BENCHMARK / tag,
+        )
+        if not res["summary"].get("headline_pass", False):
+            status["r0_realizability"] = "FAILED"
+            raise RuntimeError(
+                "[pipeline] R0 realizability gate FAILED: the headline cells' "
+                "transfer entropy is not extractable at the training sample size "
+                "(realizable_frac < threshold for cells "
+                f"{res['summary'].get('failing_headline_cell_ids')}). Concentrate "
+                "the signal (lower M / shorter-fixed lag / higher TE) in "
+                "benchmarks.G1_mix before training -- see the cache's "
+                "realizability.json."
+            )
+        status["r0_realizability"] = "done"
 
     # --- 4. data-anatomy previews (visualize_mixed) -----------------------------
     in_mix_cache = data_root / _BENCHMARK / tag
@@ -787,6 +815,9 @@ if __name__ == "__main__":
                                      #    cache; we use the in-mix test split only.
             "build_extrap": False,   # 3. DISABLED: no M-extrapolation caches
                                      #    (also zeroed by extrap_m=[]).
+            "r0_realizability": True,  # 3b. model-free R0 gate: probe whether the
+                                       #    headline cells' TE is extractable at
+                                       #    n_train BEFORE training; hard-stops if not.
             "data_previews": True,   # 4. data-anatomy figures (visualize_mixed)
                                      #    -> data/G1_mix/<tag>/previews/
             "beta_calibration": False,  # 5. OPTIONAL beta sweep (one pooled

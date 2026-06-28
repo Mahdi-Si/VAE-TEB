@@ -14,6 +14,23 @@ Code: `synthetic/mixed_dataset.py` (build) · `synthetic/train_ddp.py` /
 `synthetic/gpu_pool.py` (train) · `synthetic/mixed_calibration.py` ($\beta$
 sweep + selection) · `synthetic/mixed_eval.py` (per-group recovery).
 
+> **⚠️ Patch (2026-06-27) — see `model_validation_v3_mixed_patch_plan.md`.** The original grid
+> collapsed for *every* cell: at $M{=}16$, block $\mathrm{TE}{=}1.5$, $H{=}30$ the
+> per-step-per-channel TE is $\approx 0.003$ nats (source drive $\approx 0.6\%$ of the target
+> innovation variance) — below a finite model's noise floor on a near-unit-root target with an
+> unidentifiable lag, so $\bar K$ floored out and **no $\beta$ could calibrate**. The patch
+> *concentrates the signal* so it is extractable and *gates on realizability*: aggressive DGP
+> retune ($r{=}0.80$, $A_y{=}0.40$, $K_{\text{history}}{=}64$); a fixed identifiable headline band
+> `tiny:[4,4]` with low $M\in\{1,2\}$ and `delay_walk:false`; a model-free **R0 gate** — a held-out
+> ridge probe (`analytic_te.realizable_te_block_from_arrays`,
+> `mixed_eval.run_realizability_preflight`, pipeline stage `r0_realizability`) that measures how
+> much of the analytic TE a finite predictor recovers at the training sample size and **hard-stops
+> before training** if the headline cells are not realizable; plus post-train **collapse /
+> prediction-gain** gates (`mixed_eval._collapse_summary`; the `pred_gain_vs_te` figure now overlays
+> the realizable curve and the $y{=}x$ optimal line). The random-walk-lag pool is kept as a separate
+> robustness build (`G1_mix_walk`); high-$M$ / wide-band cells become a graceful-degradation axis.
+> Gates R0–R6 and exact config keys are in the patch plan.
+
 ---
 
 ## 1. Paradigm and rationale

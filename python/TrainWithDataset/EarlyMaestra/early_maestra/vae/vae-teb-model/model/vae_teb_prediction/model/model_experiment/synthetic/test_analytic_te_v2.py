@@ -24,6 +24,8 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.analytic_te impor
     c_for_te_block_arx,
     mean_te_block_arx_over_delays,
     mean_te_block_state_space_over_delays,
+    realizable_te_block_from_arrays,
+    snr_per_step_for_te_block,
     te_block_arx_gaussian,
     te_block_gaussian,
     te_block_state_space_gaussian,
@@ -174,6 +176,69 @@ def test_state_space_oscillator_positive_te() -> None:
         seed=0,
     )
     assert ss > 0.5, f"oscillator TE collapsed: {ss}"
+
+
+# ---------------------------------------------------------------------------
+# (c2) realizable_te_block_from_arrays — finite-sample realizability probe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("By", [0.6, 1.2])
+def test_realizable_probe_recovers_analytic_te(By: float) -> None:
+    """On the same linear-Gaussian DGP, the held-out ridge probe recovers most
+    of the analytic block TE for a concentrated (M=1, fixed short lag) cell."""
+    common = dict(oscillators=[(0.8, 0.1)], target_ar=0.4, sigma2_y=1.0,
+                  sigma2_eta=0.01)
+    H, K = 30, 64
+    te = te_block_state_space_gaussian(
+        delays=[4], B_y=[By], H=H, K_history=K, n_samples=40_000, seed=1, **common,
+    )
+    S, Y = _simulate_state_space_gaussian(
+        n=1000, T=300, delays=[4], B_y=[By], seed=7, **common,
+    )
+    r = realizable_te_block_from_arrays(Y, S, M=1, K=K, H=H, delay_max=4, seed=0)
+    assert not r["ill_conditioned"]
+    assert 0.6 * te <= r["realizable_gain"] <= 1.4 * te, (
+        f"realizable={r['realizable_gain']:.4f} vs analytic={te:.4f}"
+    )
+
+
+def test_realizable_probe_zero_coupling_is_near_zero() -> None:
+    """With no source coupling the realizable gain is ~0 (no spurious signal)."""
+    common = dict(oscillators=[(0.8, 0.1)], target_ar=0.4, sigma2_y=1.0,
+                  sigma2_eta=0.01)
+    S, Y = _simulate_state_space_gaussian(
+        n=1000, T=300, delays=[4], B_y=[0.0], seed=3, **common,
+    )
+    r = realizable_te_block_from_arrays(Y, S, M=1, K=64, H=30, delay_max=4, seed=0)
+    # The held-out gain must not manufacture *positive* TE where there is none;
+    # a small negative value is the expected noise floor (estimating the band's
+    # source coefficients on data they do not actually help predict).
+    assert -0.3 < r["realizable_gain"] < 0.1, r["realizable_gain"]
+
+
+def test_realizable_probe_ill_conditioned_flag() -> None:
+    """When the held-out set cannot estimate the HM x HM residual covariance
+    (n_test <= H*M) the probe flags ill_conditioned with a nan gain."""
+    common = dict(oscillators=[(0.8, 0.1)] * 8, target_ar=0.4, sigma2_y=1.0,
+                  sigma2_eta=0.01)
+    S, Y = _simulate_state_space_gaussian(
+        n=120, T=300, delays=[4] * 8, B_y=[0.5] * 8, seed=2, **common,
+    )
+    # n_test = 0.3*120 = 36 < H*M = 30*8 = 240 -> ill-conditioned.
+    r = realizable_te_block_from_arrays(Y, S, M=8, K=64, H=30, delay_max=4, seed=0)
+    assert r["ill_conditioned"]
+    assert np.isnan(r["realizable_gain"])
+
+
+def test_snr_per_step_for_te_block_roundtrip() -> None:
+    """The SNR helper inverts the block->per-step Gaussian channel relation."""
+    H, M = 30, 4
+    snr = snr_per_step_for_te_block(1.5, H, M)
+    assert abs(H * M * 0.5 * np.log1p(snr) - 1.5) < 1e-9
+    assert snr_per_step_for_te_block(0.0, H, M) == 0.0
+    with pytest.raises(ValueError):
+        snr_per_step_for_te_block(1.0, 0, M)
 
 
 # ---------------------------------------------------------------------------
