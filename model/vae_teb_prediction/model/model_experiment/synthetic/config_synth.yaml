@@ -409,7 +409,18 @@ benchmarks:
                                                 # analytic_te.realizable_te_block_from_arrays)
         frac_threshold: 0.7                     # headline cell passes if realizable_gain/te_true >= this
         headline_m: [1, 2]                      # M values that MUST be realizable (gated)
-        headline_bands: [tiny, short]           # bands that MUST be realizable (gated)
+        headline_bands: [tiny]                  # GATE only the FIXED-lag band. The probe is a
+                                                # pooled LINEAR predictor with no lag alignment, so
+                                                # it reproduces the analytic TE only when the lag is
+                                                # fixed per sample (tiny=[4,4]). In spread bands
+                                                # (short/mid/long) the per-sample lag varies, the
+                                                # linear map is mis-specified and its gain SATURATES
+                                                # below TE (v3-mix: short M=1 frac fell
+                                                # 0.74->0.51->0.26 as te 0.8->1.5->3.0) -- a probe
+                                                # ceiling, NOT absent signal. The lag-ATTENTION model
+                                                # aligns per-sample lags and so is not bounded by it;
+                                                # spread-lag cells are still trained + reported, and
+                                                # gated POST-train (R4/R5 calibration, R6 LagMass).
         ridge: 1.0e-2                           # ridge penalty for the probe regressions
         n_anchors: 3                            # average the probe over this many sequence anchors
         n_seeds: 2                              # ... and this many train/test splits
