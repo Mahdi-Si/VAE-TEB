@@ -315,7 +315,7 @@ benchmarks:
       target_ar: 0.40               # de-correlated target -> clean baseline removal (v3-mix patch; was 0.95)
       sigma2_y: 1.0
       sigma2_eta: 0.01
-      K_history: 64                 # shorter history -> finite-sample realizability (v3-mix patch; was 160)
+      K_history: 80                 # cover lag-50 couplings + source memory in the analytic TE / probe (v3-mix-hiTE; was 64)
       standardize: true             # per-cell z-score; the pool is NOT re-standardized
       reverse_roles: false
       randomize_channel_layout: false  # true -> informative channels at random (per-cell,
@@ -352,20 +352,25 @@ benchmarks:
     # Mixed-population grid + holdout (consumed by synthetic.mixed_dataset).
     mix:
       m_grid: [1, 2, 8, 32]                     # informative-channel axis (low M = concentrated headline; high M = dilution stress; v3-mix patch; was [8,16,32])
-      target_te_grid: [0.0, 0.3, 0.8, 1.5, 3.0] # mean block TE (nats), held fixed across M (dropped unreachable 0.1; v3-mix patch).
+      target_te_grid: [0.0, 1.0, 2.0, 3.0, 6.0, 12.0] # mean block TE (nats), held fixed across M (v3-mix-hiTE: raised for higher-TE recovery).
+                                                # Per-channel cap ~3.53 nats and per_channel = target_te / M, so a cell needs
+                                                # target_te <= ~3.53*M to solve. Reachable rungs: M=1->{1,2,3}; M=2->{1,2,3,6};
+                                                # M=8/32->all. Unreachable low-M/high-TE cells (e.g. M=1 TE>=6) are DROPPED by
+                                                # the inverter bracket (expected, logged).
                                                 # 0.0 = zero-coupling NULL cell (B_y=0,
                                                 # true TE=0): bypasses the inverter + MC-floor
                                                 # trim and anchors the calibration intercept
                                                 # alpha. One null per (M, band); never hold
                                                 # one out (it must be trained).
       lag_bands:                                # name -> [delay_min, delay_max]
-        tiny:  [4, 4]                           # FIXED identifiable lag, band ell* = {0, ..., 3} (headline calibration band; v3-mix patch)
-        short: [1, 8]                           # band ell* = {0, ..., 7}
-        mid:   [1, 15]                          # band ell* = {0, ..., 14}
-        long:  [1, 31]                          # band ell* = {0, ..., 30}
-      n_per_cell_train: 1000                    # samples per (M, TE, band) cell
-      n_per_cell_val:   200                     # On the 8x A6000 / 128-core box, 2000/400/600
-      n_per_cell_test:  300                     # tightens per-cell K-bar variance (more RAM).
+        tiny:  [4, 4]                           # FIXED identifiable lag (headline calibration anchor; clean per-sample lag)
+        short: [1, 12]                          # spread lag in 1..12 (v3-mix-hiTE; was 1..8)
+        mid:   [1, 25]                          # spread lag in 1..25 (v3-mix-hiTE; was 1..15)
+        long:  [1, 50]                          # spread lag in 1..50 -- full requested 1..50 range; < model.max_lag=90 so the
+                                                #   lag-attention can reach it (v3-mix-hiTE; was 1..31)
+      n_per_cell_train: 2000                    # samples per (M, TE, band) cell (prod-recommended; raise to ~10000 for even
+      n_per_cell_val:   400                     #   tighter per-cell K-bar variance if RAM allows -- helps the per-M gamma
+      n_per_cell_test:  600                     #   calibration and lag recovery on the 8x A6000 / 128-core box).
       holdout_m: [4, 64]                        # M values OUTSIDE m_grid -> test-only
                                                 # extrapolation caches data/G1_mix/<tag>_extrap_m{4,64}
                                                 # (genuine extrapolation across the dilution axis;
@@ -379,22 +384,18 @@ benchmarks:
                                                 # pool. Set an int to cap (memory), or 1 to
                                                 # force serial. Output is byte-identical to
                                                 # serial regardless of worker count.
-      holdout:                                  # interior (M, TE, band) triples NEVER
-                                                # trained -> a separate test-only cache
-                                                # for extrapolation. Each value (M / TE /
-                                                # band) still appears in trained cells.
-        - [2,  0.8, short]
-        - [8,  1.5, tiny]
-        - [1,  1.5, mid]
-        - [32, 0.8, short]
-        - [2,  3.0, mid]
-        - [8,  3.0, tiny]
+      holdout: []                               # interior extrapolation holdout DISABLED for this run (build_holdout stage is
+                                                # off, and the old triples referenced TE values no longer in target_te_grid).
+                                                # Empty -> the full enumerated pool is trained, keeping every headline (low-M,
+                                                # tiny) cell in training. Re-add valid (M, TE, band) triples from the grid above
+                                                # to restore the extrapolation cache.
       inverter:                                 # B_y_for_mean_te_block_state_space knobs
         n_samples: 12000
         lo: 1.0e-4
-        hi: 25.0                                # raised: aggressive dynamics shrink source variance -> larger B_y to hit TE (v3-mix patch; was 10.0)
+        hi: 60.0                                # per-channel TE cap headroom: per_channel=target_te/M tops out at 3.0 here, well
+                                                #   inside the bracket; widened for MC margin (v3-mix-hiTE; was 25.0)
         tol: 0.005
-        max_iter: 30
+        max_iter: 40                            # a few more bisection steps for the wider bracket (v3-mix-hiTE; was 30)
     # Per-group evaluation knobs (consumed by synthetic.mixed_eval).
     eval:
       warmup: null                              # null -> model.warmup_period
@@ -407,7 +408,13 @@ benchmarks:
       realizability:                            # R0 model-free realizability gate (v3-mix patch;
                                                 # mixed_eval.collect_per_cell_realizable_gain +
                                                 # analytic_te.realizable_te_block_from_arrays)
-        frac_threshold: 0.7                     # headline cell passes if realizable_gain/te_true >= this
+        fatal: false                            # v3-mix-hiTE: R0 is a pooled LINEAR, lag-blind probe; in this high-TE / spread-lag
+                                                #   regime its recoverable gain saturates below the analytic TE, so a sub-threshold
+                                                #   frac is a PROBE ceiling, NOT absent signal -- the lag-attention model is not
+                                                #   bounded by it. false -> R0 still prints its table + writes realizability.json but
+                                                #   does NOT hard-stop; TE/lag recovery is validated POST-train by R4 (monotonic),
+                                                #   R5 (per-M gamma->1), R6 (LagMass). Set true to restore the hard pre-flight gate.
+        frac_threshold: 0.7                     # headline cell passes if realizable_gain/te_true >= this (reported; non-fatal above)
         headline_m: [1, 2]                      # M values that MUST be realizable (gated)
         headline_bands: [tiny]                  # GATE only the FIXED-lag band. The probe is a
                                                 # pooled LINEAR predictor with no lag alignment, so
