@@ -442,18 +442,43 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         res = run_realizability_preflight(
             config, tag, split="train", out_dir=data_root / _BENCHMARK / tag,
         )
+        # Whether a failed headline gate HARD-STOPS the run. The R0 probe is a
+        # pooled *linear*, lag-blind predictor: it reproduces the analytic TE
+        # only for fixed-lag, moderate-TE cells. In a high-TE / spread-lag
+        # regime (delays up to ~model.max_lag) its recoverable gain saturates
+        # below the analytic TE, so frac < threshold is a PROBE ceiling, not
+        # absent signal -- the lag-attention model is not bounded by it. Set
+        # benchmarks.<bench>.eval.realizability.fatal: false to keep R0 as a
+        # printed diagnostic and let the post-train gates (R4/R5/R6) validate;
+        # true (the default) preserves the hard pre-flight gate.
+        r0_cfg = ((config["benchmarks"][_BENCHMARK].get("eval", {}) or {})
+                  .get("realizability", {}) or {})
+        r0_fatal = bool(r0_cfg.get("fatal", True))
         if not res["summary"].get("headline_pass", False):
-            status["r0_realizability"] = "FAILED"
-            raise RuntimeError(
-                "[pipeline] R0 realizability gate FAILED: the headline cells' "
-                "transfer entropy is not extractable at the training sample size "
-                "(realizable_frac < threshold for cells "
-                f"{res['summary'].get('failing_headline_cell_ids')}). Concentrate "
-                "the signal (lower M / shorter-fixed lag / higher TE) in "
-                "benchmarks.G1_mix before training -- see the cache's "
-                "realizability.json."
+            failing = res["summary"].get("failing_headline_cell_ids")
+            if r0_fatal:
+                status["r0_realizability"] = "FAILED"
+                raise RuntimeError(
+                    "[pipeline] R0 realizability gate FAILED: the headline "
+                    "cells' transfer entropy is not extractable at the training "
+                    f"sample size (realizable_frac < threshold for cells {failing}). "
+                    "Concentrate the signal (lower M / shorter-fixed lag) in "
+                    "benchmarks.G1_mix, or set eval.realizability.fatal: false to "
+                    "treat R0 as a non-fatal diagnostic -- see realizability.json."
+                )
+            status["r0_realizability"] = "warned (non-fatal)"
+            print(
+                "[pipeline][warn] R0 linear pre-flight did NOT clear the headline "
+                f"threshold (cells {failing}). Continuing because "
+                "eval.realizability.fatal=false: the linear probe saturates / is "
+                "lag-blind in this high-TE, spread-lag regime, so its frac is a "
+                "lower bound the lag-attention model is not bound by. TE/lag "
+                "recovery is validated POST-train by R4 (monotonicity), R5 "
+                "(per-M calibration gamma->1) and R6 (LagMass). See the printed "
+                "R0 table + realizability.json for the per-cell realizable gain."
             )
-        status["r0_realizability"] = "done"
+        else:
+            status["r0_realizability"] = "done"
 
     # --- 4. data-anatomy previews (visualize_mixed) -----------------------------
     in_mix_cache = data_root / _BENCHMARK / tag
@@ -802,7 +827,8 @@ if __name__ == "__main__":
         "data_dir": None,
         "results_dir": None,
         # --- behaviour -------------------------------------------------------------
-        "force_rebuild": False,      # rebuild caches even when complete
+        "force_rebuild": True,       # v3-mix-hiTE: TE grid + delays changed, so the pool MUST rebuild once;
+                                     #   set back to False after the new G1_mix_base cache is built.
         "force_retrain": False,      # retrain even when <ckpt_name> exists
         "dry_run": False,            # print the plan (incl. subprocess cmds) only
         # --- stage toggles (always executed in this order) -------------------------
