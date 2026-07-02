@@ -290,10 +290,11 @@ def test_train_v2_smoke(tiny_config, force_cpu) -> None:
     assert result["figures"], "expected at least one loss-curve figure"
     for path in result["figures"]:
         assert Path(path).is_file()
-    # The live HTML callback leaves a self-contained interactive curve at fit end
-    # (sibling of the matplotlib figures); plotly is available in this env.
-    html = Path(result["figures"][0]).with_suffix(".html")
-    assert html.is_file(), f"expected live HTML loss curve at {html}"
+    # The interactive HTML curve is now the only training-curve output: the post-fit
+    # render records it in ``result["figures"]`` and the live ``LossPlotHtmlCallback``
+    # rewrites the same file each epoch. plotly is available in this env.
+    html = Path(result["figures"][0])
+    assert html.suffix == ".html" and html.is_file(), f"expected HTML loss curve at {html}"
 
 
 # ---------------------------------------------------------------------------

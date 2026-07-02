@@ -173,7 +173,7 @@ def test_generate_pilot_samples_deterministic(enumerated, fast_config) -> None:
 # v2 provenance keys the cache MUST expose and the v1 keys it MUST NOT.
 _V2_PROVENANCE = (
     "sample_te_true", "sample_te_scat", "sample_frac_phi",
-    "sample_delay", "sample_cell_id", "sample_held_out",
+    "sample_delay", "sample_cell_id", "sample_held_out", "sample_raw_index",
 )
 _V1_ONLY_PROVENANCE = (
     "sample_M", "sample_delay_min", "sample_delay_max", "sample_band_id",
@@ -239,6 +239,12 @@ def test_build_cache_provenance_and_schema(built_cache) -> None:
             assert npz["sample_delay"].dtype == np.int16
             assert npz["sample_cell_id"].dtype == np.int16
             assert npz["sample_held_out"].dtype == np.int8
+            assert npz["sample_raw_index"].dtype == np.int32
+            # Each cell contributes rows 0..n_per_cell-1; after the shared shuffle the
+            # index still spans exactly [0, n_per_cell) (per-cell count = n / 2 cells).
+            n_per_cell = n // 2
+            assert npz["sample_raw_index"].min() == 0
+            assert npz["sample_raw_index"].max() == n_per_cell - 1
             for key in ("sample_te_true", "sample_te_scat", "sample_frac_phi"):
                 assert npz[key].dtype == np.float32
             # true_lag_tt is the flat fixed lag D=8 everywhere (fixed-lag mode).
@@ -285,6 +291,51 @@ def test_build_cache_shuffle_row_alignment(built_cache) -> None:
         assert int(delay[i]) == 8
     # The pool is genuinely shuffled (not left in per-cell blocks).
     assert not np.array_equal(cell_ids, np.sort(cell_ids))
+
+
+def test_raw_provider_roundtrip(built_cache, tiny_cfg) -> None:
+    r"""``make_raw_provider`` regenerates the exact raw window for a shuffled cache row.
+
+    The cache stores only features, but each row's ``(sample_cell_id, sample_raw_index)`` is a
+    deterministic regeneration key. The provider must return the same analysis-window slice as
+    a direct :func:`generate_pilot_samples` for that cell/row -- so the samples_diag first panel
+    shows the raw waveform that actually produced the row's features.
+    """
+    out_dir, cells = built_cache
+    cells_by_id = {int(c.cell_id): c for c in cells}
+    with np.load(out_dir / "test.npz") as npz:
+        cid = np.asarray(npz["sample_cell_id"])
+        ridx = np.asarray(npz["sample_raw_index"])
+
+    provider = bd.make_raw_provider(tiny_cfg, "test", cache_dir=out_dir)
+    win = slice(240, 5040)                      # TRIM_STEPS(15) * DECIMATION(16) each end
+    # Check one row per cell (covers null + signal).
+    for target_cid in sorted(cells_by_id):
+        row = int(np.flatnonzero(cid == target_cid)[0])
+        fhr_win, up_win = provider(int(cid[row]), int(ridx[row]))
+        assert fhr_win.shape == (4800,) and up_win.shape == (4800,)
+        raw = bd.generate_pilot_samples(cells_by_id[target_cid], 6, "test", tiny_cfg)
+        exp_fhr = raw["fhr_raw"][int(ridx[row]), win].astype(np.float32)
+        exp_up = raw["up_raw"][int(ridx[row]), win].astype(np.float32)
+        assert np.allclose(fhr_win, exp_fhr, atol=1e-5)
+        assert np.allclose(up_win, exp_up, atol=1e-5)
+
+
+def test_raw_provider_feeds_dataset(built_cache, tiny_cfg) -> None:
+    r"""A dataset with a ``raw_provider`` exposes ``fhr`` / ``up`` on each item; default omits."""
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import (
+        dataset_v2 as ds2,
+    )
+
+    out_dir, _ = built_cache
+    provider = bd.make_raw_provider(tiny_cfg, "test", cache_dir=out_dir)
+    with_raw = ds2.SyntheticTEDatasetV2(out_dir / "test.npz", raw_provider=provider)
+    item = with_raw[0]
+    assert "raw_index" in item
+    assert item["fhr"].shape == (4800,) and item["up"].shape == (4800,)
+    # Default (no provider): raw-free, so training / eval loaders never regenerate.
+    plain = ds2.SyntheticTEDatasetV2(out_dir / "test.npz")
+    assert "fhr" not in plain[0] and "up" not in plain[0]
 
 
 def test_build_cache_deterministic(tiny_cfg, adapter, tmp_path_factory) -> None:

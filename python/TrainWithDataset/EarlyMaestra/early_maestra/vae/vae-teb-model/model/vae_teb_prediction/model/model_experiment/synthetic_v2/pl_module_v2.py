@@ -840,19 +840,22 @@ def train_v2(
         "n_stats": 0,
     }
 
-    # Loss curves from the Lightning CSV log (rank-0 only). Skipped on the
-    # ``skip_checkpoint`` path (``beta_select``'s throwaway per-beta runs) so they do
-    # not overwrite the headline run's ``training_curves`` figure.
+    # Interactive training-curve HTML from the Lightning CSV log (rank-0 only). This
+    # finalises the same self-contained ``training_curves.html`` the live
+    # ``LossPlotHtmlCallback`` rewrites each epoch, and records its path in
+    # ``result["figures"]``. Skipped on the ``skip_checkpoint`` path
+    # (``beta_select``'s throwaway per-beta runs) so they do not overwrite the headline
+    # run's figure. ``plot_loss_curves_html`` returns ``None`` if plotly is missing.
     if getattr(trainer, "is_global_zero", True):
         metrics_csv = Path(trainer.logger.log_dir) / "metrics.csv"
         result["metrics_csv"] = metrics_csv
         if metrics_csv.is_file() and not overrides.get("skip_checkpoint"):
             try:
-                from .visualize_v2 import plot_loss_curves
+                from .visualize_v2 import plot_loss_curves_html
 
-                result["figures"] = plot_loss_curves(
+                result["figures"] = plot_loss_curves_html(
                     metrics_csv, results_dir / "figures" / "training_curves"
-                )
+                ) or []
             except Exception as exc:  # pragma: no cover - plotting is non-fatal
                 logger.warning(
                     "[train_v2] loss-curve render failed (non-fatal): {}", exc

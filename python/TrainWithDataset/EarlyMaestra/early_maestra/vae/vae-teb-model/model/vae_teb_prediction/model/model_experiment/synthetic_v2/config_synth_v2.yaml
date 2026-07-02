@@ -101,9 +101,12 @@ benchmarks:
                                # coupling is under-preserved (Sprint-3 frac_Phi ~0.4-0.7). All
                                # locked lags D>=8 pass the frac_Phi gate.
       lag_mode: fixed                              # {fixed, band}; band deferred
-      n_per_cell_train: 800    # S4-T01 lock: lighter first full build (was 2000/400/600);
-      n_per_cell_val: 200      # ~19.5k samples over the 5x3 grid. Scale up by re-running the
-      n_per_cell_test: 300     # build stage with larger counts (deterministic from seeds).
+      n_per_cell_train: 800    # train pool for the model fit.
+      # val/test bumped (300->800, 200->400) so the per-sample TE-vs-K-bar scatter and the
+      # per-lag calibration small-multiples have smooth, well-populated clouds (the eval
+      # consumes the WHOLE split; deterministic from seeds, so a rebuild just enlarges it).
+      n_per_cell_val: 400
+      n_per_cell_test: 800
       inverter:                # B_y_for_mean_te_block_state_space knobs (widened hi for M=1)
         n_samples: 12000
         lo: 1.0e-4
@@ -194,7 +197,9 @@ ddp:
   strategy: ddp_find_unused_parameters_true
   precision: 32-true
   sync_batchnorm: true
-  lr_scaling: true
+  lr_scaling: false            # headline run: 8 GPUs x batch 32 = global 256; keep LR at
+                               # optim.lr (0.001) rather than 8x-scaling it on this small
+                               # (12k-sample) cache. With scaling off, warmup_epochs is unused.
   warmup_epochs: 5
   num_sanity_val_steps: 0
   gradient_clip_val: 0.5
@@ -211,7 +216,8 @@ optim:
   lr: 0.001
   weight_decay: 0.0
   epochs: 100
-  batch_size: 128              # RTX 4080 laptop: use 32
+  batch_size: 32               # PER-GPU batch. Headline: 8 GPUs -> global batch 256
+                               # (~47 steps/epoch on the 12k-sample train split).
   grad_clip_norm: 0.5
   lr_milestones: [10, 50]
   lr_gamma: 0.1

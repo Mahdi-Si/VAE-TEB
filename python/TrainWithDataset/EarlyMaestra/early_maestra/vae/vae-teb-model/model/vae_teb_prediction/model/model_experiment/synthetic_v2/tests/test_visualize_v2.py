@@ -223,6 +223,32 @@ def _fake_realizability() -> dict:
     ]}
 
 
+def _fake_per_sample(n_per_cell: int = 60) -> dict:
+    r"""A ``per_sample_eval.npz``-shaped dict of length-N arrays over the same cells.
+
+    Mirrors the four ``_fake_metrics`` cells (TE $\in \{0,1,2,3\}$, lags $\{8, 12\}$) with a
+    per-sample $\bar K$ scatter around the cell mean, so the per-sample scatter / per-lag
+    calibration figures have a real cloud to draw.
+    """
+    cells = [(0.0, 8), (1.0, 8), (2.0, 12), (3.0, 8)]
+    rng = np.random.default_rng(1)
+    kbar, te_inj, te_scat, cell_id, delay = [], [], [], [], []
+    for cid, (te, D) in enumerate(cells):
+        kbar.append(0.2 + 0.4 * te + 0.05 * rng.standard_normal(n_per_cell))
+        te_inj.append(np.full(n_per_cell, te))
+        te_scat.append(np.full(n_per_cell, te * 0.9))
+        cell_id.append(np.full(n_per_cell, cid))
+        delay.append(np.full(n_per_cell, D))
+    return {
+        "kbar": np.concatenate(kbar),
+        "te_inj": np.concatenate(te_inj),
+        "te_scat": np.concatenate(te_scat),
+        "cell_id": np.concatenate(cell_id),
+        "delay": np.concatenate(delay),
+        "split": np.asarray("test"),
+    }
+
+
 def test_diagnostics_panel_writes(tmp_path: Path) -> None:
     r"""[diag] The 2x2 diagnostics panel renders from a metrics dict."""
     out = viz.plot_diagnostics_panel(_fake_metrics(), tmp_path / "diagnostics")
@@ -241,6 +267,34 @@ def test_aggregate_figures_write(tmp_path: Path) -> None:
     _assert_written(viz.plot_frac_phi_distribution(metrics, tmp_path / "frac_dist",
                                                    frac_threshold=0.7))
     _assert_written(viz.plot_lag_mass_summary(metrics, tmp_path / "lag_summary"))
+
+
+def test_te_kld_scatter_writes(tmp_path: Path) -> None:
+    r"""[aggregate] The per-sample TE-vs-K̄ scatter renders (and the no-data fallback)."""
+    metrics = _fake_metrics()
+    metrics["calibration"].update({
+        "gamma_inj_sample": 0.4, "alpha_inj_sample": 0.2, "r2_inj_sample": 0.9,
+        "gamma_scat_sample": 0.44, "alpha_scat_sample": 0.2, "r2_scat_sample": 0.88,
+        "n_samples": 240,
+    })
+    per_sample = _fake_per_sample()
+    _assert_written(viz.plot_te_kld_scatter(per_sample, metrics, tmp_path / "te_kld_scatter"))
+    # Graceful placeholder when no per-sample arrays are available.
+    _assert_written(viz.plot_te_kld_scatter(None, metrics, tmp_path / "te_kld_empty"))
+
+
+def test_calibration_by_lag_per_sample(tmp_path: Path) -> None:
+    r"""[aggregate] calibration_by_lag draws per-lag small multiples from per-sample data."""
+    metrics = _fake_metrics()
+    metrics["calibration"]["by_lag"] = {
+        "8": {"gamma_inj": 0.40, "alpha_inj": 0.20, "r2_inj": 0.90,
+              "gamma_scat": 0.44, "alpha_scat": 0.20, "r2_scat": 0.88, "n": 180},
+        "12": {"gamma_inj": 0.41, "alpha_inj": 0.19, "r2_inj": 0.90,
+               "gamma_scat": 0.45, "alpha_scat": 0.20, "r2_scat": 0.88, "n": 60},
+    }
+    per_sample = _fake_per_sample()
+    _assert_written(viz.plot_calibration_by_lag(metrics, tmp_path / "calib_by_lag_ps",
+                                                per_sample=per_sample))
 
 
 # ---------------------------------------------------------------------------
@@ -514,36 +568,52 @@ def test_test_plots_bridge_writes_te_annotated_diagnostics(tmp_path: Path) -> No
 # Interactive Plotly HTML loss curve (S5-T04 live callback backend)
 # ---------------------------------------------------------------------------
 def _write_lightning_metrics_csv(path: Path, *, n_epochs: int = 3) -> None:
-    r"""Write a minimal Lightning-style ``metrics.csv`` with ``_epoch``-suffixed columns."""
+    r"""Write a realistic Lightning-style ``metrics.csv``.
+
+    Mirrors the real v2 log: every metric is forked into a ``_step`` and an ``_epoch``
+    column, ``train`` / ``val`` are separate keys, and the bookkeeping ``epoch`` /
+    ``step`` columns plus the ``LearningRateMonitor`` ``lr-AdamW`` duplicate are present
+    -- so the HTML enumeration's suffix-collapse and exclusion logic is exercised.
+    """
     import csv as _csv
 
-    fieldnames = [
-        "epoch",
-        "train/total_loss_epoch",
-        "val/total_loss_epoch",
-        "train/feat_loss_epoch",
-        "train/base_loss_epoch",
-        "train/kld_nats_epoch",
-        "val/kld_nats_epoch",
+    train_metrics = [
+        "total_loss", "feat_loss", "base_loss", "kld_loss", "kld_nats",
+        "pred_gap", "mu_prior_sat_frac", "delta_mu_sat_frac", "kld_beta",
+        "spike_ema_loss", "spike_skips_total",
     ]
+    val_metrics = [
+        "total_loss", "feat_loss", "base_loss", "kld_loss", "kld_nats",
+        "pred_gap", "mu_prior_sat_frac", "delta_mu_sat_frac", "kld_beta",
+    ]
+    fieldnames = ["epoch", "step"]
+    for m in train_metrics:
+        fieldnames += [f"train/{m}_step", f"train/{m}_epoch"]
+    for m in val_metrics:
+        fieldnames.append(f"val/{m}_epoch")
+    fieldnames += ["lr", "lr-AdamW"]
+
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = _csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for epoch in range(n_epochs):
             scale = 1.0 / (epoch + 1)
-            writer.writerow({
+            row = {
                 "epoch": epoch,
-                "train/total_loss_epoch": 1.0 * scale,
-                "val/total_loss_epoch": 1.1 * scale,
-                "train/feat_loss_epoch": 0.7 * scale,
-                "train/base_loss_epoch": 0.3 * scale,
-                "train/kld_nats_epoch": 0.5 * (epoch + 1),
-                "val/kld_nats_epoch": 0.4 * (epoch + 1),
-            })
+                "step": (epoch + 1) * 10,
+                "lr": 1e-3 * scale,
+                "lr-AdamW": 1e-3 * scale,
+            }
+            for i, m in enumerate(train_metrics):
+                row[f"train/{m}_step"] = ""  # step rows blank at the epoch aggregate
+                row[f"train/{m}_epoch"] = round(scale * (i + 1), 4)
+            for i, m in enumerate(val_metrics):
+                row[f"val/{m}_epoch"] = round(scale * (i + 1) * 1.1, 4)
+            writer.writerow(row)
 
 
 def test_loss_curves_html_written(tmp_path) -> None:
-    r"""``plot_loss_curves_html`` writes a self-contained interactive ``.html`` curve."""
+    r"""``plot_loss_curves_html`` overlays every logged metric as its own distinct trace."""
     pytest.importorskip("plotly")
     metrics_csv = tmp_path / "metrics.csv"
     _write_lightning_metrics_csv(metrics_csv)
@@ -557,6 +627,25 @@ def test_loss_curves_html_written(tmp_path) -> None:
     assert html_path.is_file() and html_path.stat().st_size > 0
     # ``include_plotlyjs=True`` embeds the library, so the file is self-contained.
     assert "plotly" in html_path.read_text(encoding="utf-8").lower()
+
+    # Every logged metric becomes its own trace -- far more than the old 6-trace curve --
+    # and no two traces share a colour. Assert on the enumeration + colour helpers.
+    import csv as _csv
+
+    with open(metrics_csv, newline="", encoding="utf-8") as handle:
+        rows = list(_csv.DictReader(handle))
+    triples = viz._enumerate_html_metrics(rows)
+    keys = [k for _, k, _ in triples]
+    labels = [lbl for lbl, _, _ in triples]
+    assert len(triples) > 6
+    # Bookkeeping / duplicate columns are excluded; the bare ``lr`` trace is kept.
+    assert not any(k in ("epoch", "step", "lr-AdamW") for k in keys)
+    assert "lr" in keys
+    # A metric's train series is drawn immediately before its val twin.
+    assert labels.index("val total_loss") == labels.index("train total_loss") + 1
+    # Distinct colour per trace.
+    colors = viz._html_trace_colors(len(triples))
+    assert len(set(colors)) == len(colors) == len(triples)
 
 
 def test_loss_curves_html_missing_csv_is_noop(tmp_path) -> None:

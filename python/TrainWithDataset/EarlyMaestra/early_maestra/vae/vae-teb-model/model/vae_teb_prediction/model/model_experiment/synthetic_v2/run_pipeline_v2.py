@@ -506,6 +506,7 @@ def run_test_plots(
     import torch  # local: pulls the model / testing stack
 
     from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
+        make_raw_provider,
         resolve_cache_dir,
     )
     from model.vae_teb_prediction.model.model_experiment.synthetic_v2.dataset_v2 import (
@@ -551,8 +552,24 @@ def run_test_plots(
         use_up_st=bool(getattr(model, "use_up_st", True)),
     )
 
-    dataset = SyntheticTEDatasetV2(npz)
-    loader = make_dataloader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    # Attach a deterministic raw-waveform regenerator so the per-sample diagnostic's first panel
+    # shows the raw 4 Hz FHR/UP (regenerated on demand from ``sample_raw_index``; the raw is not
+    # cached). num_workers=0 keeps the regeneration on the single plotting process, and only the
+    # first ``analysis_samples`` rows are ever touched.
+    used_split = Path(npz).stem
+    try:
+        raw_provider = make_raw_provider(
+            config, used_split, benchmark=benchmark, cache_dir=cache_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 -- raw panel is a nicety; never block the diagnostics
+        print(f"[test_plots] raw provider unavailable ({exc}); first panel will be empty.")
+        raw_provider = None
+
+    dataset = SyntheticTEDatasetV2(npz, raw_provider=raw_provider)
+    # Only the first ``analysis_samples`` rows are diagnosed, so a small batch keeps raw
+    # regeneration to the few cells actually plotted (the loader isn't fully consumed).
+    plot_batch_size = max(1, min(int(batch_size), int(analysis_samples)))
+    loader = make_dataloader(dataset, batch_size=plot_batch_size, shuffle=False, num_workers=0)
 
     samples_dir = out / "samples_diag"
     sample_res = run_sample_diagnostics(

@@ -1,9 +1,10 @@
 r"""Training callbacks for ``synthetic_v2``.
 
-Currently a single callback: :class:`LossPlotHtmlCallback`, which refreshes an
-interactive Plotly HTML loss / KL curve *during* training so a long headline run can be
-watched mid-flight, rather than only seeing the static matplotlib PDF/PNG produced once
-at the end. It is wired into the trainer by
+Currently a single callback: :class:`LossPlotHtmlCallback`, which refreshes the
+interactive Plotly HTML training curve (one distinctly-coloured trace per logged metric)
+*during* training so a long headline run can be watched mid-flight. This interactive HTML
+is the only training-curve output -- there is no static matplotlib PDF/PNG twin. It is
+wired into the trainer by
 :func:`~model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2._build_trainer_v2`
 when the ``plotting`` config block enables it (``plotting.enabled`` and ``plotting.html``).
 

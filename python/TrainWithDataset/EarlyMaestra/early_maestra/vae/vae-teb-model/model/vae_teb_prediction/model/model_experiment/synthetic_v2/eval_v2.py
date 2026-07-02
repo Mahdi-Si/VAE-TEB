@@ -1101,8 +1101,9 @@ def collect_per_sample_kbar(
 
     Returns:
         A dict of length-$N$ arrays (``kbar``, ``te_inj``, ``te_scat``, ``frac_phi``,
-        ``cell_id``, ``delay``, ``held_out``, and ``kbar_<control>`` per control), plus
-        ``lag_profiles`` (``{cell_id: (L,) float64}``), ``lag_counts``, ``n`` and ``T``.
+        ``cell_id``, ``delay``, ``held_out``, ``pred_gain``, ``uplift_rel``, and
+        ``kbar_<control>`` per control), plus ``lag_profiles`` (``{cell_id: (L,) float64}``),
+        ``kbar_over_time``, ``lag_counts``, ``n`` and ``T``.
     """
     import torch
 
@@ -1343,8 +1344,12 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         arrs: The dict returned by :func:`collect_per_sample_kbar`.
 
     Returns:
-        A dict with ``gamma_inj``/``gamma_scat``/``alpha_*``/``r2_*``, ``spearman_*``,
-        ``monotonic_*``, ``n_cells`` and a ``per_cell`` table.
+        A dict with the per-cell ``gamma_inj``/``gamma_scat``/``alpha_*``/``r2_*``,
+        ``spearman_*``, ``monotonic_*``, ``n_cells`` and a ``per_cell`` table, plus the
+        full-$N$ pooled per-sample fit (``gamma_inj_sample``/``gamma_scat_sample``/
+        ``alpha_*_sample``/``r2_*_sample``, ``n_samples``) and a ``by_lag`` table of
+        per-lag per-sample slopes (``{D: {gamma_inj, alpha_inj, r2_inj, gamma_scat, ...,
+        n}}``).
     """
     per_cell = _group_per_cell(arrs)
     cells = list(per_cell.values())
@@ -1361,6 +1366,36 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
     fit_scat = _safe_fit(scat_points)
     rho_inj = _spearman_sign(inj_points)
     rho_scat = _spearman_sign(scat_points)
+
+    # --- pooled per-SAMPLE calibration (the full-N "overall average behaviour") ----------
+    # The per-cell fit above uses only ~15 points; the pooled per-sample fit uses every
+    # evaluated sample, so the reported slope reflects the whole distribution (and the
+    # per-sample scatter figure regresses on the same points). te_inj / te_scat are
+    # per-cell-constant, so x still spans the discrete TE levels -> the slope is defined.
+    kbar_a = np.asarray(arrs["kbar"], dtype=np.float64)
+    te_inj_a = np.asarray(arrs["te_inj"], dtype=np.float64)
+    te_scat_a = np.asarray(arrs["te_scat"], dtype=np.float64)
+    fit_inj_s = _safe_fit(list(zip(te_inj_a, kbar_a)))
+    fit_scat_s = _safe_fit(list(zip(te_scat_a, kbar_a)))
+
+    # --- per-lag calibration (one fit per lag D over its per-sample points) ---------------
+    delay_a = np.asarray(arrs.get("delay", np.zeros_like(kbar_a)))
+    by_lag: Dict[int, Dict[str, Any]] = {}
+    for d in np.unique(delay_a[np.isfinite(delay_a.astype(np.float64))]) \
+            if delay_a.size else []:
+        sel = delay_a == d
+        f_i = _safe_fit(list(zip(te_inj_a[sel], kbar_a[sel])))
+        f_s = _safe_fit(list(zip(te_scat_a[sel], kbar_a[sel])))
+        by_lag[int(d)] = {
+            "gamma_inj": f_i["gamma"] if f_i else None,
+            "alpha_inj": f_i["alpha"] if f_i else None,
+            "r2_inj": f_i["r2"] if f_i else None,
+            "gamma_scat": f_s["gamma"] if f_s else None,
+            "alpha_scat": f_s["alpha"] if f_s else None,
+            "r2_scat": f_s["r2"] if f_s else None,
+            "n": int(np.sum(sel)),
+        }
+
     return {
         "gamma_inj": fit_inj["gamma"] if fit_inj else None,
         "alpha_inj": fit_inj["alpha"] if fit_inj else None,
@@ -1373,6 +1408,15 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         "monotonic_inj": bool(rho_inj is not None and rho_inj > 0),
         "monotonic_scat": bool(rho_scat is not None and rho_scat > 0),
         "n_cells": len(cells),
+        # Pooled per-sample fit + per-lag table (Enhancement A/D): full-N calibration.
+        "n_samples": int(kbar_a.size),
+        "gamma_inj_sample": fit_inj_s["gamma"] if fit_inj_s else None,
+        "alpha_inj_sample": fit_inj_s["alpha"] if fit_inj_s else None,
+        "r2_inj_sample": fit_inj_s["r2"] if fit_inj_s else None,
+        "gamma_scat_sample": fit_scat_s["gamma"] if fit_scat_s else None,
+        "alpha_scat_sample": fit_scat_s["alpha"] if fit_scat_s else None,
+        "r2_scat_sample": fit_scat_s["r2"] if fit_scat_s else None,
+        "by_lag": by_lag,
         "per_cell": [
             {k: c[k] for k in ("cell_id", "te_inj", "te_scat", "kbar", "delay", "n", "frac_phi")}
             for c in cells
@@ -1625,6 +1669,45 @@ def _resolve_eval_checkpoint(out_dir: Path, ckpt: Optional[Any]) -> Path:
     )
 
 
+def _write_per_sample_eval(
+    arrs: Dict[str, Any],
+    out_dir: Path,
+    split: str,
+    controls: Sequence[str],
+) -> Path:
+    r"""Write the length-$N$ per-sample eval arrays to ``per_sample_eval.npz`` (Enhancement A).
+
+    ``metrics.json`` collapses everything to ~15 per-cell means; this side-car keeps the full
+    per-sample vectors so the per-sample TE-vs-$\bar K$ scatter and the per-lag calibration can
+    plot every evaluated sample (and re-fit on the same points the pooled calibration used).
+
+    Args:
+        arrs: The dict returned by :func:`collect_per_sample_kbar`.
+        out_dir: The run directory to write into.
+        split: The evaluated split name (stored as a 0-d string array).
+        controls: The null controls whose per-sample $\bar K$ arrays are also stored.
+
+    Returns:
+        The written ``per_sample_eval.npz`` :class:`Path`.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    keys = ("kbar", "te_inj", "te_scat", "frac_phi",
+            "cell_id", "delay", "held_out", "pred_gain", "uplift_rel")
+    payload: Dict[str, np.ndarray] = {
+        k: np.asarray(arrs[k]) for k in keys if k in arrs
+    }
+    for ctrl in controls:
+        key = f"kbar_{ctrl}"
+        if key in arrs and np.asarray(arrs[key]).size:
+            payload[key] = np.asarray(arrs[key])
+    payload["split"] = np.asarray(str(split))
+    path = out_dir / "per_sample_eval.npz"
+    np.savez(str(path), **payload)
+    logger.info("run_eval: wrote %s (n=%d)", path, int(np.asarray(arrs["kbar"]).shape[0]))
+    return path
+
+
 def _pick_eval_loader(dm, split: str):
     r"""Pick an ordered eval loader for ``split`` with a test -> val -> train fallback."""
     order = [split] + [s for s in ("test", "val", "train") if s != split]
@@ -1715,6 +1798,11 @@ def run_eval(
         model, loader, dev, warmup=warmup, horizon=horizon,
         controls=controls, control_seed=seed,
     )
+
+    # Persist the length-N per-sample arrays (kept out of metrics.json, which stays per-cell).
+    # These back the per-sample TE-vs-KLD scatter and the per-lag calibration figures, so the
+    # analysis is no longer collapsed to ~15 cell means before plotting.
+    _write_per_sample_eval(arrs, out_dir, used_split, controls)
 
     calibration = fit_calibration(arrs)
     cells_by_id = _cells_by_id_from_arrs(arrs)
