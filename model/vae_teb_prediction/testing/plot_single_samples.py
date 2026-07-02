@@ -382,6 +382,61 @@ def _imshow_panel(
     return im
 
 
+def _derive_delay(
+    delay: Optional[int],
+    true_lag_tt: Optional[np.ndarray],
+    true_lag_band: Optional[np.ndarray],
+) -> Optional[int]:
+    r"""Recover the fixed lag $D$ from any available synthetic-TE provenance.
+
+    Prefers the explicit ``delay``; otherwise the (constant, fixed-mode) per-step
+    ``true_lag_tt``; otherwise ``max(true_lag_band) + 1`` since
+    $\mathcal L^\star = \{\max(0, D-H), \dots, D-1\}$.
+
+    Args:
+        delay: The explicit fixed lag $D$, if known.
+        true_lag_tt: Per-step true lag $(T,)$ (fixed-mode: a flat line at $D$).
+        true_lag_band: The true informative-lag band $\mathcal L^\star$.
+
+    Returns:
+        The recovered integer lag $D$, or ``None`` when nothing is available.
+    """
+    if delay is not None:
+        try:
+            return int(round(float(delay)))
+        except (TypeError, ValueError):
+            pass
+    for arr, offset in ((true_lag_tt, 0), (true_lag_band, 1)):
+        if arr is not None:
+            a = np.asarray(arr, dtype=float).reshape(-1)
+            a = a[np.isfinite(a)]
+            if a.size:
+                return int(round(float(a.max()))) + offset
+    return None
+
+
+def _overlay_true_lag_band(ax: plt.Axes, D: int, horizon: int, n_lags: int) -> None:
+    r"""Shade the true informative-lag band $\mathcal L^\star$ on a lag$\times$time panel.
+
+    Marks $\mathcal L^\star = \{\max(0, D-H), \dots, D-1\}$ (a horizontal band, since the
+    lag is fixed) plus the band edge $D-1$ (where attention should peak for $y_{t+1}$).
+
+    Args:
+        ax: The lag-panel axes (lag index on y, ``origin='lower'``).
+        D: The fixed source->target lag.
+        horizon: The forecast horizon $H$.
+        n_lags: The number of lag rows $L$ (for clamping).
+    """
+    if D is None or n_lags <= 0:
+        return
+    lo = max(0, int(D) - int(horizon))
+    hi = min(int(D) - 1, n_lags - 1)
+    if hi < lo:
+        return
+    ax.axhspan(lo - 0.5, hi + 0.5, color=COLOR_GREEN, alpha=0.16, linewidth=0.0, zorder=3)
+    ax.axhline(hi, color=COLOR_GREEN, lw=1.0, ls="--", alpha=0.95, zorder=4)
+
+
 def plot_sample_lag_attn_diagnostic(
     sample: Dict[str, Any],
     out_path: Path,
@@ -390,8 +445,22 @@ def plot_sample_lag_attn_diagnostic(
     *,
     fhr_st_end: int = _FHR_ST_END,
     fs_raw: float = _DEFAULT_FS_RAW,
+    true_te: Optional[float] = None,
+    te_scat: Optional[float] = None,
+    te_raw: Optional[float] = None,
+    frac_phi: Optional[float] = None,
+    delay: Optional[int] = None,
+    kld_value: Optional[float] = None,
+    true_lag_tt: Optional[np.ndarray] = None,
+    true_lag_band: Optional[np.ndarray] = None,
 ) -> None:
-    """Render a multi-row diagnostic figure for one sample.
+    r"""Render a multi-row diagnostic figure for one sample.
+
+    All ``true_te`` / ``te_scat`` / ``te_raw`` / ``frac_phi`` / ``delay`` / ``kld_value``
+    / ``true_lag_tt`` / ``true_lag_band`` arguments are **optional synthetic-TE
+    provenance** (S7-T06): when supplied (synthetic v2 samples) they are rendered in the
+    title and the true informative-lag band is shaded on the attention / TE-lag panels;
+    when ``None`` (real CTG / HDF5 samples) the figure is unchanged.
 
     Args:
         sample: Record from :func:`collect_predictions` with the keys
@@ -403,6 +472,15 @@ def plot_sample_lag_attn_diagnostic(
         fhr_st_end: Channel index separating scattering from phase
             (default 43 for the standard v1 config).
         fs_raw: Raw sampling rate in Hz (default 4.0).
+        true_te: Injected block TE $\mathrm{TE}_{\mathrm{inj}}$ (nats).
+        te_scat: Scattering-realizable TE $\mathrm{TE}_{\mathrm{scat}}$ (nats).
+        te_raw: Raw-domain TE $\mathrm{TE}_{\mathrm{raw}}$ (nats).
+        frac_phi: Preservation fraction $\mathrm{frac}_\Phi = \mathrm{TE}_{\mathrm{scat}} /
+            \mathrm{TE}_{\mathrm{inj}}$.
+        delay: The fixed source->target lag $D$ (decimated steps).
+        kld_value: The model's per-sample $\bar K$ surrogate (nats/step).
+        true_lag_tt: Per-step true lag $(T,)$ used to derive the band when ``delay`` is absent.
+        true_lag_band: The true informative-lag band $\mathcal L^\star$.
     """
     mu_full = np.asarray(sample.get("mu_full"))            # (T, H_d, C)
     y_plus = np.asarray(sample.get("y_plus"))              # (T_valid, H_d, C)
@@ -568,6 +646,14 @@ def plot_sample_lag_attn_diagnostic(
         ylabel="lag k", title="TE lag attribution",
     )
 
+    # Overlay the true informative-lag band on the two lag panels (S7-T06); a no-op when
+    # no synthetic-TE provenance is supplied (real CTG / HDF5 samples).
+    D_true = _derive_delay(delay, true_lag_tt, true_lag_band)
+    if D_true is not None:
+        n_lags = int(attn_mean.shape[0])
+        for lag_ax in (axes[6], axes[7]):
+            _overlay_true_lag_band(lag_ax, D_true, horizon, n_lags)
+
     # Row 0 shows real, unmasked input signals — mark the warmup boundary
     # with a vertical line rather than shading the warmup region. Rows
     # 1..7 show model-generated outputs whose warmup region is NaN-masked,
@@ -597,6 +683,20 @@ def plot_sample_lag_attn_diagnostic(
         title_bits.append(f"uplift_rel={float(uplift_rel):.3f}")
     if res_ratio is not None:
         title_bits.append(f"resid_ratio={float(res_ratio):.3f}")
+
+    # Synthetic-TE provenance (plain text; only present for synthetic v2 samples).
+    if kld_value is not None:
+        title_bits.append(f"Kbar={float(kld_value):.3f}")
+    if true_te is not None:
+        title_bits.append(f"TE_inj={float(true_te):.3f}")
+    if te_scat is not None:
+        title_bits.append(f"TE_scat={float(te_scat):.3f}")
+    if te_raw is not None:
+        title_bits.append(f"TE_raw={float(te_raw):.3f}")
+    if frac_phi is not None:
+        title_bits.append(f"frac_Phi={float(frac_phi):.2f}")
+    if D_true is not None:
+        title_bits.append(f"D={int(D_true)}")
 
     _auto_suptitle(fig, "  |  ".join(title_bits), base_fontsize=FONT_TITLE)
 
