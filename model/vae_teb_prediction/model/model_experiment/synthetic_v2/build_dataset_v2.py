@@ -27,7 +27,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -329,6 +329,119 @@ def generate_pilot_samples(
     )
     raw["meta"]["cell_id"] = int(cell.cell_id)
     return raw
+
+
+def make_raw_provider(
+    config: Dict[str, Any],
+    split: str,
+    *,
+    benchmark: str = "G1_raw",
+    cache_dir: Optional[Path] = None,
+) -> Callable[[int, int], Tuple[np.ndarray, np.ndarray]]:
+    r"""Build a memoised raw-waveform regenerator keyed by ``(cell_id, raw_index)``.
+
+    The v2 cache stores only the $300$-step scattering features, not the raw $4\,\mathrm{Hz}$
+    FHR/UP waveforms (§17). The per-sample diagnostic figure's first panel nonetheless wants the
+    raw traces. Because generation is fully seed-deterministic (:func:`generate_pilot_samples`
+    via :func:`cell_seed`) and the cache stamps each row's within-cell index
+    (``sample_raw_index``), the exact raw pair for any shuffled cache row can be regenerated on
+    demand from ``(cell_id, raw_index)`` alone — nothing raw needs to be persisted.
+
+    The returned closure regenerates each cell's ``n_per_cell`` raw pairs **once** (cached by
+    ``cell_id``) and indexes the requested row, returning the analysis-window slice
+    ``[TRIM_STEPS·DECIMATION : n_raw − TRIM_STEPS·DECIMATION]`` — the $4800$-sample /
+    $20\,\mathrm{min}$ window aligned to the $300$-step feature grid. Only the handful of samples
+    actually plotted (:func:`run_pipeline_v2.run_test_plots` stops at ``analysis_samples``)
+    trigger a regeneration, so at most a few cells are ever rebuilt.
+
+    The authoritative build manifest (``meta.json``: the exact solved $B$, the built
+    ``n_per_cell``, and ``seeds``) is used when present, so the regenerated raw matches what was
+    actually cached even if ``config`` has since changed (e.g. a bigger grid); a fresh
+    deterministic :func:`enumerate_cells_v2` is the fallback.
+
+    Args:
+        config: The parsed ``config_synth_v2.yaml`` tree.
+        split: The cache split the rows come from (``test`` / ``val`` / ``train``); selects the
+            generation seed offset and the ``n_per_cell`` count.
+        benchmark: Active benchmark key under ``benchmarks``.
+        cache_dir: Override for the cache directory holding ``meta.json`` (defaults to
+            :func:`resolve_cache_dir`).
+
+    Returns:
+        A callable ``provider(cell_id, raw_index) -> (fhr_win, up_win)`` returning two 1-D
+        ``float32`` arrays in physical units (bpm / mmHg). Raises :class:`KeyError` for an
+        unknown ``cell_id`` or an out-of-range ``raw_index``.
+    """
+    from .raw_generators import DECIMATION
+    from .scattering_adapter import TRIM_STEPS
+
+    bench = config["benchmarks"][benchmark]
+    n_raw = int(bench["raw"]["n_raw"])
+    win = slice(int(TRIM_STEPS) * int(DECIMATION), n_raw - int(TRIM_STEPS) * int(DECIMATION))
+
+    cells_by_id: Dict[int, CellV2] = {}
+    n_per_cell: Optional[int] = None
+    base_seed: Optional[int] = None
+    render_mode: Optional[str] = None
+
+    cdir = resolve_cache_dir(config, benchmark=benchmark) if cache_dir is None else Path(cache_dir)
+    meta_path = cdir / "meta.json"
+    if meta_path.is_file():
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            for c in meta.get("cells", []) or []:
+                cid = int(c["cell_id"])
+                cells_by_id[cid] = CellV2(
+                    cell_id=cid,
+                    target_te=float(c.get("target_te", 0.0)),
+                    D=int(c["D"]),
+                    B_y_scalar=float(c.get("B_y_scalar", 0.0)),
+                    te_block_realised=float(
+                        c.get("te_block_realised", c.get("te_inj", 0.0))
+                    ),
+                )
+            n_meta = (meta.get("n_per_cell", {}) or {}).get(split)
+            n_per_cell = int(n_meta) if n_meta is not None else None
+            seeds_meta = meta.get("seeds", {}) or {}
+            base_seed = int(seeds_meta.get("dgp", seeds_meta.get("base_seed", 0))) \
+                if seeds_meta else None
+            render_mode = meta.get("render_mode")
+        except Exception as exc:  # noqa: BLE001 -- fall back to a fresh enumeration below
+            logger.warning("make_raw_provider: meta.json unusable (%s); re-enumerating.", exc)
+            cells_by_id = {}
+
+    if not cells_by_id:
+        cells, _ = enumerate_cells_v2(config, benchmark=benchmark)
+        cells_by_id = {int(c.cell_id): c for c in cells}
+    if n_per_cell is None:
+        n_per_cell = int(bench["mix"][f"n_per_cell_{split}"])
+
+    cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+    def provider(cell_id: int, raw_index: int) -> Tuple[np.ndarray, np.ndarray]:
+        cid = int(cell_id)
+        if cid not in cells_by_id:
+            raise KeyError(f"make_raw_provider: unknown cell_id {cid}")
+        if cid not in cache:
+            raw = generate_pilot_samples(
+                cells_by_id[cid], int(n_per_cell), split, config,
+                benchmark=benchmark, base_seed=base_seed, render_mode=render_mode,
+            )
+            cache[cid] = (
+                np.ascontiguousarray(raw["fhr_raw"], dtype=np.float32),
+                np.ascontiguousarray(raw["up_raw"], dtype=np.float32),
+            )
+        fhr_all, up_all = cache[cid]
+        ri = int(raw_index)
+        if not 0 <= ri < fhr_all.shape[0]:
+            raise KeyError(
+                f"make_raw_provider: raw_index {ri} out of range for cell {cid} "
+                f"(n_per_cell={fhr_all.shape[0]})"
+            )
+        return fhr_all[ri, win].copy(), up_all[ri, win].copy()
+
+    return provider
 
 
 # ===========================================================================
@@ -660,7 +773,8 @@ def assemble_split(
 
     Returns:
         ``(arrays, cell_probe)`` — the pooled, shuffled cache arrays (four fields +
-        ``weight`` + ``true_lag_tt`` + the six ``sample_*`` provenance arrays), and a
+        ``weight`` + ``true_lag_tt`` + the seven ``sample_*`` provenance arrays, incl.
+        ``sample_raw_index`` for deterministic raw regeneration), and a
         ``{cell_id: {'te_scat', 'frac_phi', 'n_used'}}`` map of the per-cell probe result.
     """
     from .scattering_adapter import normalise_fields  # local: numpy-only, but co-located with torch
@@ -669,6 +783,7 @@ def assemble_split(
     per_field: Dict[str, List[np.ndarray]] = {name: [] for name in _FIELD_NAMES}
     lag_list: List[np.ndarray] = []
     te_true, te_scat_a, frac_a, delay_a, cell_a, held_a, weight_a = [], [], [], [], [], [], []
+    raw_idx_a: List[np.ndarray] = []  # within-cell row index -> deterministic raw regeneration key
     cell_probe: Dict[int, Dict[str, Any]] = {}
 
     for cell in cells:
@@ -713,6 +828,11 @@ def assemble_split(
         delay_a.append(np.full(n_c, cell.D, dtype=np.int16))
         cell_a.append(np.full(n_c, cell.cell_id, dtype=np.int16))
         held_a.append(np.zeros(n_c, dtype=np.int8))
+        # Within-cell row index (0..n_c-1), in the pre-shuffle generation order. This is the
+        # deterministic key that lets a plot re-generate the exact raw waveform for a shuffled
+        # cache row via ``make_raw_provider`` (cell parts are read in cell_id order and each row
+        # is the i-th sample of ``generate_pilot_samples(cell, n_c, split)``).
+        raw_idx_a.append(np.arange(n_c, dtype=np.int32))
         weight_a.append(np.ones((n_c, t_c), dtype=np.float32))
 
     arrays: Dict[str, np.ndarray] = {
@@ -726,6 +846,7 @@ def assemble_split(
     arrays["sample_delay"] = np.concatenate(delay_a, axis=0)
     arrays["sample_cell_id"] = np.concatenate(cell_a, axis=0)
     arrays["sample_held_out"] = np.concatenate(held_a, axis=0)
+    arrays["sample_raw_index"] = np.concatenate(raw_idx_a, axis=0)
 
     # One shared row-aligned permutation (ported from mixed_dataset.build_mixed_split):
     # a small split offset off the shuffle seed keeps train/val/test independent.

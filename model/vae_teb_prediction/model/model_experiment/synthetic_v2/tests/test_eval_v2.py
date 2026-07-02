@@ -270,6 +270,14 @@ def test_calib_both_te_and_monotonic() -> None:
     assert cal["gamma_scat"] is not None
     assert cal["monotonic_inj"] is True and cal["monotonic_scat"] is True
     assert len(cal["per_cell"]) == 4
+    # Pooled per-sample fit over all N points recovers the same slope (Enhancement A/D).
+    assert cal["n_samples"] == 8
+    assert cal["gamma_inj_sample"] == pytest.approx(0.6, abs=0.02)
+    assert cal["r2_inj_sample"] is not None
+    # Per-lag table: this fixture is all D=4, so a single lag group over all 8 points.
+    assert set(cal["by_lag"]) == {4}
+    assert cal["by_lag"][4]["gamma_inj"] == pytest.approx(0.6, abs=0.02)
+    assert cal["by_lag"][4]["n"] == 8
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +436,18 @@ def test_null_run_eval_writes_metrics(eval_fixture) -> None:
         assert gate in on_disk, gate
     assert on_disk["n_cells"] == 2
     assert on_disk["split"] == "test"
-    for key in ("gamma_inj", "gamma_scat", "alpha_inj", "monotonic_inj"):
+    for key in ("gamma_inj", "gamma_scat", "alpha_inj", "monotonic_inj",
+                "gamma_inj_sample", "gamma_scat_sample", "by_lag"):
         assert key in on_disk["calibration"]
+    assert "n_samples" in on_disk
+
+    # The per-sample side-car is written with the length-N arrays (Enhancement A).
+    ps_path = results_dir / "per_sample_eval.npz"
+    assert ps_path.is_file()
+    with np.load(ps_path, allow_pickle=False) as psz:
+        for k in ("kbar", "te_inj", "te_scat", "cell_id", "delay"):
+            assert k in psz.files, k
+        assert psz["kbar"].shape[0] == on_disk["n_samples"] == 2 * 4
     # both null controls evaluated (config default [shuffle, reverse]).
     assert set(on_disk["null_controls"]) == {"shuffle", "reverse"}
     # null probe reads the null cell's dressing-only TE_scat.

@@ -38,16 +38,19 @@ Note:
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from numpy.lib import format as _npy_format
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
+
+logger = logging.getLogger(__name__)
 
 # Tensor fields stored in every split ``.npz`` (native model channel layout).
 _FIELDS = ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight")
@@ -72,6 +75,7 @@ _PROVENANCE_FIELDS = (
     "sample_delay",      # int16   -- fixed source->target lag D
     "sample_cell_id",    # int16   -- index into the meta['cells'] manifest
     "sample_held_out",   # int8    -- 0 in-mix, 1 held-out cache
+    "sample_raw_index",  # int32   -- within-cell row index (deterministic raw regen key)
 )
 
 
@@ -199,8 +203,9 @@ class SyntheticTEDatasetV2(Dataset):
         meta_path: Optional[Union[str, Path]] = None,
         *,
         mmap: Union[bool, str] = "auto",
+        raw_provider: Optional[Callable[[int, int], Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> None:
-        """Open a cached split.
+        r"""Open a cached split.
 
         Args:
             npz_path: Path to a ``{train,val,test}.npz`` produced by
@@ -212,11 +217,19 @@ class SyntheticTEDatasetV2(Dataset):
                 silently falls back to the eager loader when the archive is not
                 mappable. ``False`` forces the eager loader. The realised mode is
                 exposed as :attr:`mmap_active`.
+            raw_provider: Optional ``(cell_id, raw_index) -> (fhr_win, up_win)`` callable
+                (see :func:`build_dataset_v2.make_raw_provider`). When supplied,
+                :meth:`__getitem__` deterministically regenerates each row's raw $4\,\mathrm{Hz}$
+                FHR/UP waveform and exposes it as ``fhr`` / ``up`` so the per-sample diagnostic
+                figure's first panel can draw it. Default ``None`` keeps the loader raw-free (no
+                regeneration cost) for training / evaluation. Requires the ``sample_raw_index``
+                provenance field in the cache.
 
         Raises:
             FileNotFoundError: If ``npz_path`` or the resolved ``meta.json`` is absent.
             KeyError: If the ``.npz`` is missing one of the native fields.
         """
+        self._raw_provider = raw_provider
         self.npz_path = Path(npz_path)
         if not self.npz_path.is_file():
             raise FileNotFoundError(f"cache split not found: {self.npz_path}")
@@ -317,6 +330,9 @@ class SyntheticTEDatasetV2(Dataset):
         if self._mmap_specs is not None:
             state["_arrays"] = None
             state["_true_lag_tt"] = None
+        # The raw provider is a closure (not picklable) and is only used on the
+        # single-process plotting path; workers get a raw-free dataset.
+        state["_raw_provider"] = None
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -339,9 +355,11 @@ class SyntheticTEDatasetV2(Dataset):
             ``fhr_ph``, ``up_st``, ``up_ph``, ``weight``), the per-step ground-truth lag
             ``true_lag_tt`` $(T,)$ when present, and the per-sample metadata: ``te_true``
             (this sample's cell $\mathrm{TE}_{\mathrm{inj}}$), ``te_scat``, ``frac_phi``,
-            ``delay`` (the fixed lag $D$), ``cell_id``, ``held_out``, ``true_lag_band``
-            (``long`` tensor) and ``guid`` (str). No ``M`` / ``delay_min`` /
-            ``delay_max`` / ``band_id`` keys (v2 is single-pathway, fixed lag).
+            ``delay`` (the fixed lag $D$), ``cell_id``, ``held_out``, ``raw_index``,
+            ``true_lag_band`` (``long`` tensor) and ``guid`` (str). When a ``raw_provider`` is
+            attached, also ``fhr`` / ``up`` (raw $4\,\mathrm{Hz}$ waveforms, physical units,
+            $4800$ samples). No ``M`` / ``delay_min`` / ``delay_max`` / ``band_id`` keys (v2 is
+            single-pathway, fixed lag).
         """
         sample = AttributeDict()
         for field in _FIELDS:
@@ -369,6 +387,25 @@ class SyntheticTEDatasetV2(Dataset):
             # exposed guarded so the standard-testing TE bridge (S7-T06) can pick it up.
             if "sample_te_raw" in prov:
                 sample["te_raw"] = float(prov["sample_te_raw"][idx])
+            if "sample_raw_index" in prov:
+                sample["raw_index"] = int(prov["sample_raw_index"][idx])
+            # Deterministically regenerate this row's raw 4 Hz FHR/UP (physical units) when a
+            # provider is attached, so the per-sample diagnostic's first panel can draw it.
+            # ``collect_predictions`` reads ``batch.fhr`` / ``batch.up`` (a no-op denormalise
+            # when the loader carries no fhr/up stats), so nothing else needs changing.
+            if self._raw_provider is not None and "sample_raw_index" in prov:
+                try:
+                    fhr_win, up_win = self._raw_provider(
+                        int(prov["sample_cell_id"][idx]),
+                        int(prov["sample_raw_index"][idx]),
+                    )
+                    sample["fhr"] = torch.from_numpy(np.asarray(fhr_win, dtype=np.float32))
+                    sample["up"] = torch.from_numpy(np.asarray(up_win, dtype=np.float32))
+                except Exception as exc:  # noqa: BLE001 -- raw is a plotting nicety, never fatal
+                    logger.warning(
+                        "dataset_v2: raw regeneration failed for idx %d (%s); "
+                        "skipping raw panel.", idx, exc,
+                    )
         sample["guid"] = f"{self._tag}_{self.split}_{idx:06d}"
         return sample
 

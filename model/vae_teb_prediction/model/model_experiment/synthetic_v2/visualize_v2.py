@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib
 
@@ -48,8 +48,6 @@ _FHR_COLOR = ps.COLOR_BLUE
 _UP_COLOR = ps.COLOR_VERMILLION
 _BASELINE_COLOR = ps.COLOR_GRAY
 _HIGHLIGHT_COLOR = ps.COLOR_SKY  # coupled-channel marker: contrasts against magma
-_TRAIN_COLOR = ps.COLOR_BLUE
-_VAL_COLOR = ps.COLOR_VERMILLION
 _INJ_COLOR = ps.COLOR_BLUE       # TE_inj series
 _SCAT_COLOR = ps.COLOR_VERMILLION  # TE_scat series
 _BAND_COLOR = ps.COLOR_GREEN     # true lag band / reference
@@ -356,91 +354,139 @@ def _read_metric_series(rows: List[Dict[str, str]], metric: str) -> tuple:
     return epochs, [per_epoch[e] for e in epochs]
 
 
-def plot_loss_curves(
-    metrics_csv: Union[str, Path],
-    out_path: Union[str, Path],
-    *,
-    title: Optional[str] = None,
-    formats: tuple = ("pdf", "png"),
-    dpi: int = _DPI,
-) -> List[Path]:
-    r"""Write the training loss / KL curves from a Lightning ``metrics.csv`` (S5-T04).
+# Metrics excluded from the interactive training-curve HTML: the CSV bookkeeping
+# columns (``epoch`` is the x-axis, ``step`` the global step) and the redundant
+# ``LearningRateMonitor`` duplicate of ``lr`` (the bare ``lr`` trace is kept).
+_HTML_EXCLUDE_METRICS = frozenset({"epoch", "step", "lr-AdamW"})
 
-    Two panels: (left) the total loss $\mathcal L$ with the residual
-    ($\mathcal L_{\mathrm{feat}}$) and baseline ($\mathcal L_{\mathrm{base}}$)
-    components for train (and val when present); (right) the dim-summed KL
-    ``kld_nats`` $= \mathrm{KL}\cdot d_z$ -- the $\bar K$ TE-surrogate scale -- so
-    posterior collapse (``kld_nats`` $\to 0$) is visible at a glance.
+# Canonical metric order so the legend reads loss -> KL -> saturation/health ->
+# lr, with each metric's train series immediately followed by its val twin.
+# Metrics not listed here are appended in first-seen order so nothing the model
+# logs is ever silently dropped from the curve.
+_HTML_METRIC_ORDER = (
+    "total_loss",
+    "feat_loss",
+    "base_loss",
+    "kld_loss",
+    "kld_nats",
+    "pred_gap",
+    "mu_prior_sat_frac",
+    "delta_mu_sat_frac",
+    "kld_beta",
+    "mean_logvar_full",
+    "mean_logvar_base",
+    "spike_ema_loss",
+    "spike_skipped",
+    "spike_skips_total",
+    "lr",
+)
+
+
+def _enumerate_html_metrics(rows: List[Dict[str, str]]) -> List[tuple]:
+    r"""Order the logical metric series to draw in the interactive training curve.
+
+    Lightning's ``CSVLogger`` forks every ``on_step=on_epoch=True`` metric into a
+    ``<key>_step`` and a ``<key>_epoch`` column; this collapses that fork to the
+    logical key, drops the bookkeeping / duplicate columns in
+    :data:`_HTML_EXCLUDE_METRICS`, and orders the survivors by
+    :data:`_HTML_METRIC_ORDER` with each metric's ``train`` series (solid) placed
+    immediately before its ``val`` series (dashed). Unrecognised metrics are appended
+    in first-seen order so a newly-logged quantity appears automatically.
 
     Args:
-        metrics_csv: Path to the Lightning ``CSVLogger`` ``metrics.csv``.
-        out_path: Output path stem (formats appended) or a full path.
-        title: Optional figure suptitle.
-        formats: Output formats to write.
-        dpi: Raster DPI for PNG output.
+        rows: The parsed ``metrics.csv`` rows (from :class:`csv.DictReader`).
 
     Returns:
-        The list of written file paths.
-
-    Raises:
-        FileNotFoundError: If ``metrics_csv`` does not exist.
+        A list of ``(label, csv_key, is_val)`` triples in draw order, where
+        ``csv_key`` is the logical key handed to :func:`_read_metric_series` (e.g.
+        ``train/total_loss``) and ``is_val`` selects the dashed line style.
     """
-    metrics_csv = Path(metrics_csv)
-    if not metrics_csv.is_file():
-        raise FileNotFoundError(f"metrics.csv not found: {metrics_csv}")
-    with open(metrics_csv, "r", newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+    if not rows:
+        return []
 
-    fig, (ax_loss, ax_kl) = plt.subplots(1, 2, figsize=(11.0, 4.2))
+    present: List[str] = []
+    seen: set = set()
+    for col in rows[0].keys():
+        if col.endswith("_epoch"):
+            base = col[:-6]
+        elif col.endswith("_step"):
+            base = col[:-5]
+        else:
+            base = col
+        if base in _HTML_EXCLUDE_METRICS or base in seen:
+            continue
+        seen.add(base)
+        present.append(base)
 
-    # --- panel 1: total / feature / baseline losses -------------------------
-    loss_specs = (
-        ("train/total_loss", _TRAIN_COLOR, "-", "train total"),
-        ("val/total_loss", _VAL_COLOR, "-", "val total"),
-        ("train/feat_loss", _TRAIN_COLOR, "--", "train feat"),
-        ("train/base_loss", _BASELINE_COLOR, ":", "train base"),
-    )
-    plotted_loss = False
-    for metric, color, ls, label in loss_specs:
-        epochs, values = _read_metric_series(rows, metric)
-        if epochs:
-            ax_loss.plot(epochs, values, color=color, ls=ls, lw=1.2, label=label)
-            plotted_loss = True
-    ax_loss.set_xlabel("epoch")
-    ax_loss.set_ylabel("loss")
-    ax_loss.set_title("loss", fontsize=10.0)
-    if plotted_loss:
-        ax_loss.legend(loc="upper right", fontsize=7.5, frameon=False)
+    def _split(base: str) -> tuple:
+        for stage in ("train", "val"):
+            if base.startswith(f"{stage}/"):
+                return stage, base[len(stage) + 1:]
+        return None, base
 
-    # --- panel 2: kld_nats (the K-bar surrogate scale) ----------------------
-    plotted_kl = False
-    for metric, color, label in (
-        ("train/kld_nats", _TRAIN_COLOR, "train"),
-        ("val/kld_nats", _VAL_COLOR, "val"),
-    ):
-        epochs, values = _read_metric_series(rows, metric)
-        if epochs:
-            ax_kl.plot(epochs, values, color=color, lw=1.2, label=label)
-            plotted_kl = True
-    ax_kl.set_xlabel("epoch")
-    ax_kl.set_ylabel(r"$\bar K$  (kld_nats, nats/step)")
-    ax_kl.set_title("KL divergence (TE surrogate)", fontsize=10.0)
-    if plotted_kl:
-        ax_kl.legend(loc="upper right", fontsize=7.5, frameon=False)
+    by_metric: Dict[str, Dict[Optional[str], str]] = {}
+    first_seen: List[str] = []
+    for base in present:
+        stage, metric = _split(base)
+        if metric not in by_metric:
+            by_metric[metric] = {}
+            first_seen.append(metric)
+        by_metric[metric][stage] = base
 
-    for ax in (ax_loss, ax_kl):
-        ax.margins(x=0.02)
-        ps.style_axes(ax)
+    def _emit(metric: str) -> List[tuple]:
+        stages = by_metric.get(metric, {})
+        out: List[tuple] = []
+        if "train" in stages:
+            out.append((f"train {metric}", stages["train"], False))
+        if None in stages:  # stage-less (e.g. ``lr``): a single solid trace
+            out.append((metric, stages[None], False))
+        if "val" in stages:
+            out.append((f"val {metric}", stages["val"], True))
+        return out
 
-    fig.suptitle(title or "synthetic_v2 training curves", fontsize=ps.FONT_SUPTITLE)
-    fig.tight_layout()
+    result: List[tuple] = []
+    done: set = set()
+    for metric in _HTML_METRIC_ORDER:
+        if metric in by_metric:
+            result.extend(_emit(metric))
+            done.add(metric)
+    for metric in first_seen:
+        if metric not in done:
+            result.extend(_emit(metric))
+            done.add(metric)
+    return result
 
-    written: List[Path] = []
-    for path in _resolve_output_paths(out_path, formats):
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        written.append(path)
-    plt.close(fig)
-    return written
+
+def _html_trace_colors(n: int) -> List[str]:
+    r"""Return ``n`` distinct hex colours (house palette first, Plotly ``Dark24`` overflow).
+
+    The interactive training curve overlays every logged metric (~20 traces) and each
+    line must have a unique colour. The house :data:`plot_style_v2.PALETTE_EXTENDED`
+    supplies 8 brand-consistent hues; any beyond that are drawn -- de-duplicated --
+    from Plotly's 24-colour ``Dark24`` qualitative set (dark, legible on the
+    ``plotly_white`` template), for ~30 distinct colours in total. The list only
+    repeats if more than ~30 traces are requested.
+
+    Args:
+        n: Number of distinct colours required.
+
+    Returns:
+        A list of ``n`` hex colour strings.
+    """
+    palette: List[str] = list(ps.PALETTE_EXTENDED)
+    try:
+        from plotly.colors import qualitative
+
+        have = {c.upper() for c in palette}
+        for hexcol in qualitative.Dark24:
+            if hexcol.upper() not in have:
+                palette.append(hexcol)
+                have.add(hexcol.upper())
+    except ImportError:  # pragma: no cover - caller already imported plotly
+        pass
+    if not palette:  # defensive: never modulo by zero
+        palette = ["#1f77b4"]
+    return [palette[i % len(palette)] for i in range(n)]
 
 
 def plot_loss_curves_html(
@@ -450,21 +496,33 @@ def plot_loss_curves_html(
     title: Optional[str] = None,
     include_plotlyjs: bool = True,
 ) -> Optional[List[Path]]:
-    r"""Write an interactive Plotly HTML loss / KL curve from a Lightning ``metrics.csv``.
+    r"""Write one interactive Plotly HTML overlaying every training metric as its own trace.
 
-    The interactive twin of :func:`plot_loss_curves`: the same two panels -- (left) the
-    total loss $\mathcal L$ with its residual ($\mathcal L_{\mathrm{feat}}$) and baseline
-    ($\mathcal L_{\mathrm{base}}$) components, and (right) the dim-summed KL ``kld_nats``
-    $= \mathrm{KL}\cdot d_z$ (the $\bar K$ TE-surrogate) -- and the same palette, rendered
-    to a single ``.html`` that opens offline in a browser. It is consumed live during
-    training by
+    Reads the Lightning ``CSVLogger`` ``metrics.csv`` and renders a single-panel
+    ``go.Figure`` in which **every** logged per-epoch metric -- the losses
+    ($\mathcal L$, $\mathcal L_{\mathrm{feat}}$, $\mathcal L_{\mathrm{base}}$), the
+    per-dim KL and its dim-summed twin ``kld_nats`` ($\bar K = \mathrm{KL}\cdot d_z$,
+    the TE surrogate), the predictive gap, the $\mu$ / $\Delta\mu$ saturation
+    fractions, $\beta$, the spike-breaker diagnostics, and the learning rate -- is
+    drawn as its own distinctly-coloured line. Each metric's ``train`` series is solid
+    and its ``val`` twin dashed, placed adjacently in the legend; colours come from
+    :func:`_html_trace_colors` so no two lines share a hue. This mirrors the v1
+    ``synthetic/plot_training_curves.py`` interactive curve (one figure, one trace per
+    metric) rather than a curated subset. It is consumed live during training by
     :class:`~model.vae_teb_prediction.model.model_experiment.synthetic_v2.callbacks_v2.LossPlotHtmlCallback`,
     which rewrites it every few epochs so a long run can be watched mid-flight.
 
+    The metric set is discovered dynamically from the CSV header via
+    :func:`_enumerate_html_metrics` (resolving Lightning's ``_step`` / ``_epoch`` fork
+    through :func:`_read_metric_series`), so a newly-logged quantity appears
+    automatically without editing this function. The very wide dynamic range across
+    metrics (e.g. $\mathcal L \gg$ ``kld_beta`` $= 10^{-3}$; ``*_sat_frac`` $\in [0,1]$)
+    is handled by Plotly's interactivity -- double-click a legend entry to isolate a
+    trace and autoscale.
+
     Plotly is an optional dependency: if it is not importable this warns and returns
-    ``None`` rather than raising, so a missing install never breaks training. Series are
-    read via :func:`_read_metric_series`, which resolves the Lightning ``_epoch`` column
-    suffix and de-duplicates per epoch.
+    ``None`` rather than raising, so a missing install never breaks training. The output
+    embeds ``plotly.js`` by default so the file opens offline.
 
     Args:
         metrics_csv: Path to the Lightning ``CSVLogger`` ``metrics.csv``.
@@ -480,7 +538,6 @@ def plot_loss_curves_html(
     """
     try:
         import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
     except ImportError as exc:  # pragma: no cover - optional dependency
         logger.warning(
             "[visualize_v2] plotly unavailable ({}); skipping HTML loss curve.", exc
@@ -497,69 +554,35 @@ def plot_loss_curves_html(
     with open(metrics_csv, "r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
 
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=("loss", "KL divergence (TE surrogate)"),
-        horizontal_spacing=0.10,
-    )
-
-    # --- panel 1: total / feature / baseline losses -------------------------
-    loss_specs = (
-        ("train/total_loss", _TRAIN_COLOR, "solid", "train total"),
-        ("val/total_loss", _VAL_COLOR, "solid", "val total"),
-        ("train/feat_loss", _TRAIN_COLOR, "dash", "train feat"),
-        ("train/base_loss", _BASELINE_COLOR, "dot", "train base"),
-    )
-    for metric, color, dash, label in loss_specs:
-        epochs, values = _read_metric_series(rows, metric)
+    # Collect every non-empty per-epoch series in canonical draw order, then colour
+    # them distinctly (house palette first). Two passes so the house colours land on
+    # the metrics that actually have data.
+    series: List[tuple] = []
+    for label, key, is_val in _enumerate_html_metrics(rows):
+        epochs, values = _read_metric_series(rows, key)
         if epochs:
-            fig.add_trace(
-                go.Scatter(
-                    x=epochs,
-                    y=values,
-                    mode="lines+markers",
-                    name=label,
-                    line=dict(color=color, dash=dash, width=1.6),
-                    marker=dict(size=4),
-                    legendgroup="loss",
-                ),
-                row=1,
-                col=1,
-            )
+            series.append((label, is_val, epochs, values))
 
-    # --- panel 2: kld_nats (the K-bar surrogate scale) ----------------------
-    for metric, color, label in (
-        ("train/kld_nats", _TRAIN_COLOR, "train"),
-        ("val/kld_nats", _VAL_COLOR, "val"),
-    ):
-        epochs, values = _read_metric_series(rows, metric)
-        if epochs:
-            fig.add_trace(
-                go.Scatter(
-                    x=epochs,
-                    y=values,
-                    mode="lines+markers",
-                    name=f"kld {label}",
-                    line=dict(color=color, width=1.6),
-                    marker=dict(size=4),
-                    legendgroup="kl",
-                ),
-                row=1,
-                col=2,
+    colors = _html_trace_colors(len(series))
+    fig = go.Figure()
+    for (label, is_val, epochs, values), color in zip(series, colors):
+        fig.add_trace(
+            go.Scatter(
+                x=epochs,
+                y=values,
+                mode="lines+markers",
+                name=label,
+                line=dict(color=color, dash="dash" if is_val else "solid", width=1.6),
+                marker=dict(size=4),
             )
+        )
 
-    fig.update_xaxes(title_text="epoch", row=1, col=1)
-    fig.update_xaxes(title_text="epoch", row=1, col=2)
-    fig.update_yaxes(title_text="loss", row=1, col=1)
-    fig.update_yaxes(title_text="kld_nats (nats/step)", row=1, col=2)
     fig.update_layout(
         title=title or "synthetic_v2 training curves",
+        xaxis_title="epoch",
+        yaxis_title="value",
+        legend_title="metric",
         template="plotly_white",
-        hovermode="x unified",
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0.0
-        ),
         margin=dict(l=60, r=30, t=90, b=50),
     )
 
@@ -1044,22 +1067,133 @@ def _group_stats(x: np.ndarray, y: np.ndarray) -> Dict[float, Dict[str, float]]:
     return out
 
 
-def plot_calibration_by_lag(
+def _spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
+    r"""Spearman rank correlation of two 1-D arrays (``nan`` when undefined)."""
+    if x.size < 2:
+        return float("nan")
+    rx = np.argsort(np.argsort(x)).astype(np.float64)
+    ry = np.argsort(np.argsort(y)).astype(np.float64)
+    if np.std(rx) == 0 or np.std(ry) == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _kbar_vs_te_panel(
+    ax,
+    te: np.ndarray,
+    kbar: np.ndarray,
+    cell_id: np.ndarray,
+    *,
+    cal: Dict[str, Any],
+    pref: str,
+    color: str,
+    xlabel: str,
+    fit: Optional[Tuple[Optional[float], Optional[float], Optional[float]]] = None,
+    show_box: bool = True,
+) -> int:
+    r"""Draw one per-sample $\bar K$-vs-TE panel: cloud + per-level box + means + fit.
+
+    Since the injected / realizable TE is constant within a cell, the x-axis is a small set of
+    discrete levels; the per-sample $\bar K$ spread at each level is shown as a jittered point
+    cloud plus a box, with the per-cell means and the calibration line overlaid.
+
+    Args:
+        ax: Target axes.
+        te: Per-sample TE (x), length $N$.
+        kbar: Per-sample $\bar K$ (y), length $N$.
+        cell_id: Per-sample cell id (for the per-cell-mean markers).
+        cal: The ``metrics['calibration']`` dict (for the pooled-sample fit fallback).
+        pref: ``'inj'`` or ``'scat'`` — selects the ``gamma_<pref>_sample`` fit keys.
+        color: Series colour.
+        xlabel: X-axis label.
+        fit: Optional explicit ``(gamma, alpha, r2)`` to draw instead of the pooled-sample fit
+            (used for the per-lag panels).
+        show_box: Whether to draw the per-level box overlay.
+
+    Returns:
+        The number of finite points plotted.
+    """
+    te = np.asarray(te, dtype=float)
+    kbar = np.asarray(kbar, dtype=float)
+    cell_id = np.asarray(cell_id, dtype=float)
+    m = np.isfinite(te) & np.isfinite(kbar)
+    if int(m.sum()) < 2 or np.ptp(te[m]) <= 0:
+        _no_data(ax, "no per-sample data")
+        ax.set_xlabel(xlabel)
+        return int(m.sum())
+    te_m, kb_m, cid_m = te[m], kbar[m], cell_id[m]
+    levels = np.unique(te_m)
+    span = float(levels.max() - levels.min()) or 1.0
+    jw = 0.02 * span + 1e-3                       # jitter half-width
+    bw = 0.05 * span + 1e-3                       # box half-width
+
+    rng = np.random.default_rng(0)               # fixed jitter for reproducible figures
+    ax.scatter(te_m + rng.uniform(-jw, jw, size=te_m.shape[0]), kb_m,
+               s=6, color=color, alpha=0.12, linewidths=0, zorder=2)
+
+    if show_box:
+        data = [kb_m[te_m == lv] for lv in levels]
+        bp = ax.boxplot(data, positions=levels, widths=2 * bw, showfliers=False,
+                        patch_artist=True, manage_ticks=False, zorder=3)
+        for patch in bp["boxes"]:
+            patch.set(facecolor="white", edgecolor=_BASELINE_COLOR, alpha=0.9, linewidth=0.8)
+        for med in bp["medians"]:
+            med.set(color=color, linewidth=1.3)
+        for part in bp["whiskers"] + bp["caps"]:
+            part.set(color=_BASELINE_COLOR, linewidth=0.7)
+
+    cmx, cmy = [], []
+    for c in np.unique(cid_m):
+        s = cid_m == c
+        cmx.append(float(np.mean(te_m[s])))
+        cmy.append(float(np.mean(kb_m[s])))
+    ax.scatter(cmx, cmy, s=30, marker="D", facecolor=_BASELINE_COLOR,
+               edgecolor="white", linewidths=0.6, zorder=5, label="per-cell mean")
+
+    xs = np.linspace(0.0, float(levels.max()) * 1.05 + 1e-6, 50)
+    if fit is not None:
+        g, a, r2 = fit
+    else:
+        g = cal.get(f"gamma_{pref}_sample")
+        a = cal.get(f"alpha_{pref}_sample")
+        r2 = cal.get(f"r2_{pref}_sample")
+    if g is not None and a is not None and np.isfinite(g) and np.isfinite(a):
+        r2f = float(r2) if r2 is not None and np.isfinite(r2) else float("nan")
+        ax.plot(xs, a + g * xs, color=color, lw=1.4,
+                label=rf"fit $\gamma$={g:.3f}, $R^2$={r2f:.2f}", zorder=6)
+    ax.plot(xs, xs, color=_BASELINE_COLOR, lw=0.6, ls=":", label="y=x", zorder=4)
+
+    pear = float(np.corrcoef(te_m, kb_m)[0, 1])
+    rho = _spearman_rho(te_m, kb_m)
+    ax.set_xlabel(xlabel)
+    ax.set_title(rf"$r$={pear:.2f}, $\rho$={rho:.2f}, $n$={int(te_m.size)}")
+    ax.legend(loc="upper left", frameon=False, fontsize=6.0)
+    return int(te_m.size)
+
+
+def plot_te_kld_scatter(
+    per_sample: Optional[Dict[str, Any]],
     metrics: Dict[str, Any],
     out_path: Union[str, Path],
     *,
     formats: tuple = ("pdf", "png"),
     dpi: int = _DPI,
 ) -> List[Path]:
-    r"""Write grouped $\bar K$-vs-TE calibration scatter coloured by lag cell (S7-T08).
+    r"""Write the per-sample average-TE vs average-$\bar K$ scatter (Enhancement B).
 
-    Population-level evidence (not an example): per-cell $\bar K$ against
-    $\mathrm{TE}_{\mathrm{inj}}$ (left) and $\mathrm{TE}_{\mathrm{scat}}$ (right), each point
-    coloured by its lag $D$, with the fitted calibration line, the $y=x$ reference, and the
-    per-cell count annotated. Degrades gracefully to a single group when ``D`` is absent.
+    Every evaluated test/val sample is one point: its time-averaged latent KL $\bar K$ (y)
+    against its cell's transfer entropy (x) — the injected label $\mathrm{TE}_{\mathrm{inj}}$
+    (left) and the realizable $\mathrm{TE}_{\mathrm{scat}}$ (right). Because TE is constant
+    within a cell, the x-axis is a few discrete levels and the panel shows the full per-sample
+    $\bar K$ distribution (jittered cloud + box), the per-cell means, and the pooled per-sample
+    calibration line $\bar K = \alpha + \gamma\,\mathrm{TE}$. This is the sample-level view the
+    per-cell calibration (~15 points) cannot show.
 
     Args:
-        metrics: The ``metrics.json`` dict from :func:`eval_v2.run_eval`.
+        per_sample: The dict of length-$N$ arrays loaded from ``per_sample_eval.npz``
+            (``kbar``, ``te_inj``, ``te_scat``, ``cell_id``, ...); a ``None`` / empty dict
+            renders a placeholder.
+        metrics: The ``metrics.json`` dict (for the calibration fit and run/split labels).
         out_path: Output path stem or full path.
         formats: Output formats to write.
         dpi: Raster DPI for PNG output.
@@ -1068,6 +1202,108 @@ def plot_calibration_by_lag(
         The list of written file paths.
     """
     cal = metrics.get("calibration", {}) or {}
+    ps_arr = per_sample or {}
+    kbar = np.asarray(ps_arr.get("kbar", []), dtype=float)
+    fig, (ax_inj, ax_scat) = plt.subplots(1, 2, figsize=(11.0, 4.8), sharey=True)
+    if kbar.size == 0:
+        for ax in (ax_inj, ax_scat):
+            _no_data(ax, "no per_sample_eval.npz (run --stage eval)")
+            ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    cell_id = np.asarray(ps_arr.get("cell_id", np.zeros_like(kbar)), dtype=float)
+    _kbar_vs_te_panel(ax_inj, ps_arr.get("te_inj", []), kbar, cell_id,
+                      cal=cal, pref="inj", color=_INJ_COLOR,
+                      xlabel=r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)")
+    _kbar_vs_te_panel(ax_scat, ps_arr.get("te_scat", []), kbar, cell_id,
+                      cal=cal, pref="scat", color=_SCAT_COLOR,
+                      xlabel=r"$\mathrm{TE}_{\mathrm{scat}}$ (nats)")
+    ax_inj.set_ylabel(r"$\bar K$ (nats/step)")
+    for ax in (ax_inj, ax_scat):
+        ps.style_axes(ax)
+    split_val = ps_arr.get("split", metrics.get("split", "?"))
+    split = str(split_val.item()) if hasattr(split_val, "item") else str(split_val)
+    fig.suptitle(rf"synthetic_v2 per-sample $\bar K$ vs TE  ($n$={int(kbar.size)} samples, "
+                 rf"split {split}, run {metrics.get('run_tag', '?')})",
+                 fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_calibration_by_lag(
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    per_sample: Optional[Dict[str, Any]] = None,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the $\bar K$-vs-TE calibration broken out by lag $D$ (S7-T08, Enhancement C).
+
+    When ``per_sample`` is supplied this is **per-sample small multiples**: one column per lag
+    $D$ (top row vs $\mathrm{TE}_{\mathrm{inj}}$, bottom vs $\mathrm{TE}_{\mathrm{scat}}$), each
+    panel showing that lag's full per-sample $\bar K$ distribution (cloud + box), its per-cell
+    means, and its own fitted $\gamma$ — so a lag group has hundreds/thousands of points rather
+    than the ~5 per-cell markers the legacy view drew. Without ``per_sample`` it falls back to
+    the legacy per-cell scatter coloured by $D$.
+
+    Args:
+        metrics: The ``metrics.json`` dict from :func:`eval_v2.run_eval`.
+        out_path: Output path stem or full path.
+        per_sample: The per-sample arrays from ``per_sample_eval.npz`` (``kbar``, ``te_inj``,
+            ``te_scat``, ``cell_id``, ``delay``); ``None`` selects the legacy per-cell fallback.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    cal = metrics.get("calibration", {}) or {}
+
+    # --- Per-sample small-multiples branch (Enhancement C) --------------------------------
+    # One panel per lag D over its per-SAMPLE points (hundreds/thousands each), so a lag group
+    # is a real distribution rather than the ~5 per-cell markers the legacy view showed. Top
+    # row vs TE_inj, bottom row vs TE_scat; each panel carries that lag's own fitted gamma.
+    if per_sample is not None and np.asarray(per_sample.get("kbar", [])).size:
+        kbar = np.asarray(per_sample["kbar"], dtype=float)
+        te_inj = np.asarray(per_sample.get("te_inj", []), dtype=float)
+        te_scat = np.asarray(per_sample.get("te_scat", []), dtype=float)
+        cell_id = np.asarray(per_sample.get("cell_id", np.zeros_like(kbar)), dtype=float)
+        delay = np.asarray(per_sample.get("delay", np.zeros_like(kbar)), dtype=float)
+        lags = np.unique(delay[np.isfinite(delay)])
+        by_lag = cal.get("by_lag", {}) or {}
+
+        def _lag_fit(d: float, pref: str):
+            entry = by_lag.get(str(int(d)), by_lag.get(int(d)))
+            if not isinstance(entry, dict):
+                return None
+            return (entry.get(f"gamma_{pref}"), entry.get(f"alpha_{pref}"),
+                    entry.get(f"r2_{pref}"))
+
+        ncol = max(1, int(lags.size))
+        fig, axes = plt.subplots(2, ncol, figsize=(3.7 * ncol + 0.6, 8.4),
+                                 sharey=True, squeeze=False)
+        for j, d in enumerate(lags):
+            sel = delay == d
+            for row, (te, pref, color, xlab) in enumerate((
+                (te_inj, "inj", _INJ_COLOR, r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)"),
+                (te_scat, "scat", _SCAT_COLOR, r"$\mathrm{TE}_{\mathrm{scat}}$ (nats)"),
+            )):
+                axc = axes[row][j]
+                _kbar_vs_te_panel(axc, te[sel], kbar[sel], cell_id[sel],
+                                  cal=cal, pref=pref, color=color, xlabel=xlab,
+                                  fit=_lag_fit(d, pref))
+                axc.set_title(rf"$D$={int(d)}  |  " + axc.get_title(), fontsize=8.0)
+                ps.style_axes(axc)
+        axes[0][0].set_ylabel(r"$\bar K$ (nats/step)")
+        axes[1][0].set_ylabel(r"$\bar K$ (nats/step)")
+        fig.suptitle(rf"synthetic_v2 calibration by lag (per-sample; $n$={int(kbar.size)} "
+                     rf"samples, run {metrics.get('run_tag', '?')})",
+                     fontsize=ps.FONT_SUPTITLE)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        return _save_fig(fig, out_path, formats, dpi)
+
+    # --- Legacy per-cell fallback (no per_sample arrays available) ------------------------
     pc = _per_cell_arrays(metrics)
     D = pc["D"]
     lags = np.unique(D[np.isfinite(D)])

@@ -44,6 +44,31 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _load_per_sample(results_dir: Path) -> Optional[Dict[str, Any]]:
+    r"""Load the length-$N$ per-sample eval arrays from ``per_sample_eval.npz``.
+
+    Written by :func:`eval_v2.run_eval`; backs the per-sample TE-vs-$\bar K$ scatter and the
+    per-lag calibration small-multiples. Returns ``None`` when absent (older runs) so the
+    figures fall back gracefully.
+
+    Args:
+        results_dir: The run directory holding ``per_sample_eval.npz``.
+
+    Returns:
+        A dict of arrays keyed by field name, or ``None``.
+    """
+    path = results_dir / "per_sample_eval.npz"
+    if not path.is_file():
+        return None
+    try:
+        import numpy as np
+        with np.load(path, allow_pickle=False) as npz:
+            return {k: npz[k] for k in npz.files}
+    except Exception as exc:  # noqa: BLE001  (report must not fail on a bad side-car)
+        logger.warning("final_report_v2: could not read %s (%s)", path, exc)
+        return None
+
+
 def _fmt(x: Any, spec: str = ".4g") -> str:
     r"""Format a scalar for markdown (``n/a`` for ``None`` / non-finite)."""
     if x is None:
@@ -160,6 +185,7 @@ def final_report_v2(
             visualize_v2 as viz,
         )
         figures_dir.mkdir(parents=True, exist_ok=True)
+        per_sample = _load_per_sample(results_dir)
         frac_thr = None
         try:
             frac_thr = (config.get("benchmarks", {}).get(benchmark, {})
@@ -169,7 +195,10 @@ def final_report_v2(
         plot_specs = [
             ("headline_diagnostics",
              lambda p: viz.plot_diagnostics_panel(metrics, p, realizability=realizability)),
-            ("calibration_by_lag", lambda p: viz.plot_calibration_by_lag(metrics, p)),
+            ("te_kld_scatter",
+             lambda p: viz.plot_te_kld_scatter(per_sample, metrics, p)),
+            ("calibration_by_lag",
+             lambda p: viz.plot_calibration_by_lag(metrics, p, per_sample=per_sample)),
             ("frac_phi_distribution",
              lambda p: viz.plot_frac_phi_distribution(metrics, p, frac_threshold=frac_thr)),
             ("lag_mass_summary", lambda p: viz.plot_lag_mass_summary(metrics, p)),
@@ -235,8 +264,12 @@ def _render_markdown(
         "",
         "| gate | value |",
         "|---|---|",
-        f"| $\\gamma_{{\\mathrm{{inj}}}}$ (K̄ vs TE_inj) | {_fmt(cal.get('gamma_inj'))} |",
-        f"| $\\gamma_{{\\mathrm{{scat}}}}$ (K̄ vs TE_scat) | {_fmt(cal.get('gamma_scat'))} |",
+        f"| $\\gamma_{{\\mathrm{{inj}}}}$ (K̄ vs TE_inj, per-cell) | {_fmt(cal.get('gamma_inj'))} |",
+        f"| $\\gamma_{{\\mathrm{{scat}}}}$ (K̄ vs TE_scat, per-cell) | {_fmt(cal.get('gamma_scat'))} |",
+        f"| $\\gamma_{{\\mathrm{{inj}}}}$ per-sample (n={(metrics or {}).get('n_samples', '?')}) | "
+        f"{_fmt(cal.get('gamma_inj_sample'))} ($R^2$={_fmt(cal.get('r2_inj_sample'), '.2f')}) |",
+        f"| $\\gamma_{{\\mathrm{{scat}}}}$ per-sample | "
+        f"{_fmt(cal.get('gamma_scat_sample'))} ($R^2$={_fmt(cal.get('r2_scat_sample'), '.2f')}) |",
         f"| mean frac_Φ (signal cells) | {_fmt(frac.get('mean'))} "
         f"[{_fmt(frac.get('min'))}, {_fmt(frac.get('max'))}] |",
         f"| mean LagMass | {_fmt(lag.get('mean_lag_mass'))} "
@@ -245,6 +278,24 @@ def _render_markdown(
     for ctrl, res in nul.items():
         lines.append(f"| null_ratio ({ctrl}) → 0 | {_fmt((res or {}).get('mean_ratio'))} |")
     lines.append("")
+
+    # --- per-lag per-sample calibration table (Enhancement C/D) ------------------------
+    by_lag = (cal or {}).get("by_lag") or {}
+    if by_lag:
+        lines += [
+            "### Calibration by lag (per-sample fit)", "",
+            "| D | $\\gamma_{\\mathrm{inj}}$ | $R^2_{\\mathrm{inj}}$ "
+            "| $\\gamma_{\\mathrm{scat}}$ | $R^2_{\\mathrm{scat}}$ | n |",
+            "|---|---|---|---|---|---|",
+        ]
+        for d in sorted(by_lag, key=lambda k: int(k)):
+            e = by_lag[d] or {}
+            lines.append(
+                f"| {d} | {_fmt(e.get('gamma_inj'))} | {_fmt(e.get('r2_inj'), '.2f')} "
+                f"| {_fmt(e.get('gamma_scat'))} | {_fmt(e.get('r2_scat'), '.2f')} "
+                f"| {e.get('n', '?')} |"
+            )
+        lines.append("")
 
     if metrics is None:
         lines += [
@@ -305,12 +356,18 @@ def _render_markdown(
                   "TE-annotated per-sample diagnostics.", ""]
 
     # --- figure gallery ----------------------------------------------------------------
+    # The interactive training curve is an HTML (not a PDF/PNG), so ``_gather_figures``
+    # never picks it up; link it explicitly at the top of the gallery when present.
     lines += ["## Figure gallery", ""]
-    if figures:
-        for fig in figures:
-            rel = _rel(fig, results_dir)
-            lines.append(f"- [`{fig.name}`]({rel})")
-    else:
+    tc_html = results_dir / "figures" / "training_curves.html"
+    if tc_html.is_file():
+        lines.append(
+            f"- [`training_curves.html`]({_rel(tc_html, results_dir)}) "
+            "— interactive training curves (every logged metric; open in a browser)"
+        )
+    for fig in figures:
+        lines.append(f"- [`{fig.name}`]({_rel(fig, results_dir)})")
+    if not figures and not tc_html.is_file():
         lines.append("> ⚠ no figures found under `figures/` — run the preview / eval / "
                      "report stages to populate the gallery.")
     lines.append("")
