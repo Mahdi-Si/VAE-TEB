@@ -58,6 +58,11 @@ def run_sample_diagnostics(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Synthetic-TE provenance columns are added only when at least one sample carries a
+    # true TE (S7-T06): this keeps real-data ``sample_metrics.csv`` byte-for-byte the same
+    # while synthetic v2 runs gain the TE / lag columns.
+    has_te = any(s.get("te_true") is not None for s in samples)
+
     metrics_rows: List[Dict[str, Any]] = []
     plotted = 0
     for i, sample in enumerate(samples):
@@ -71,24 +76,49 @@ def run_sample_diagnostics(
         out_path = output_dir / f"{safe_guid}_{epoch_str}.pdf"
 
         try:
+            # Thread the synthetic-TE provenance through (all optional / ``None`` on real
+            # data, so the diagnostic is unchanged there).
+            # ``kld_mean`` is a universal metric (present on real data too), so the K̄ title
+            # bit is gated on this sample carrying synthetic-TE provenance -- otherwise the
+            # real-data diagnostic would gain a K̄ token and break the "unchanged on real
+            # data" invariant.
+            is_synth = sample.get("te_true") is not None
             plot_sample_lag_attn_diagnostic(
                 sample,
                 out_path,
                 warmup=runner.warmup_steps,
                 horizon=runner.horizon,
+                true_te=sample.get("te_true"),
+                te_scat=sample.get("te_scat"),
+                te_raw=sample.get("te_raw"),
+                frac_phi=sample.get("frac_phi"),
+                delay=sample.get("sample_delay"),
+                kld_value=metrics.get("kld_mean") if is_synth else None,
+                true_lag_tt=sample.get("true_lag_tt"),
+                true_lag_band=sample.get("true_lag_band"),
             )
             plotted += 1
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Failed to plot sample {guid}: {exc}")
             continue
 
-        metrics_rows.append({
+        row: Dict[str, Any] = {
             "guid": guid,
             "epoch": epoch,
             "label": label,
             "out_path": str(out_path.name),
             **metrics,
-        })
+        }
+        if has_te:
+            row.update({
+                "te_true": sample.get("te_true"),
+                "te_scat": sample.get("te_scat"),
+                "te_raw": sample.get("te_raw"),
+                "frac_phi": sample.get("frac_phi"),
+                "sample_delay": sample.get("sample_delay"),
+                "cell_id": sample.get("cell_id"),
+            })
+        metrics_rows.append(row)
 
     summary_df = pd.DataFrame(metrics_rows)
     summary_csv = output_dir / "sample_metrics.csv"

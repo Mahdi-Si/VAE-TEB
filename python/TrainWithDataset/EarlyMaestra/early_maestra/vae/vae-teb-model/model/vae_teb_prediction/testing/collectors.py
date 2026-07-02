@@ -163,6 +163,79 @@ def _extract_te_true(batch: Any, idx: int) -> Optional[float]:
         return None
 
 
+def _extract_scalar_field(batch: Any, field: str, idx: int) -> Optional[float]:
+    r"""Extract an optional per-sample float ``field`` from a batch (guarded).
+
+    Synthetic v2 batches carry per-sample scalars such as ``te_scat``, ``frac_phi``, and
+    ``te_raw``; real CTG / HDF5 batches do not. Returns ``None`` when the field is absent
+    or unparseable so callers can simply omit the annotation.
+
+    Args:
+        batch: Batch object that may carry a ``field`` attribute of shape ``(B,)``.
+        field: The attribute name to read (e.g. ``"te_scat"``).
+        idx: Index within the batch.
+
+    Returns:
+        The per-sample float, or ``None`` if the field is absent / unparseable.
+    """
+    attr = getattr(batch, field, None)
+    if attr is None:
+        return None
+    try:
+        raw = attr[idx]
+        if isinstance(raw, torch.Tensor):
+            return float(raw.item())
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _extract_int_field(batch: Any, field: str, idx: int) -> Optional[int]:
+    r"""Extract an optional per-sample integer ``field`` from a batch (guarded).
+
+    Args:
+        batch: Batch object that may carry a ``field`` attribute of shape ``(B,)``.
+        field: The attribute name (e.g. ``"cell_id"``).
+        idx: Index within the batch.
+
+    Returns:
+        The per-sample integer, or ``None`` if absent / unparseable.
+    """
+    value = _extract_scalar_field(batch, field, idx)
+    return None if value is None else int(round(value))
+
+
+def _extract_delay(batch: Any, idx: int) -> Optional[int]:
+    r"""Extract the per-sample fixed lag $D$ (``delay`` or ``sample_delay``), guarded."""
+    for field in ("delay", "sample_delay"):
+        if getattr(batch, field, None) is not None:
+            return _extract_int_field(batch, field, idx)
+    return None
+
+
+def _extract_array_field(batch: Any, field: str, idx: int) -> Optional[np.ndarray]:
+    r"""Extract an optional per-sample array ``field`` (e.g. ``true_lag_tt``) from a batch.
+
+    Args:
+        batch: Batch object that may carry a ``field`` attribute of shape ``(B, ...)``.
+        field: The attribute name (e.g. ``"true_lag_tt"`` or ``"true_lag_band"``).
+        idx: Index within the batch.
+
+    Returns:
+        The per-sample array as ``numpy``, or ``None`` if the field is absent.
+    """
+    attr = getattr(batch, field, None)
+    if attr is None:
+        return None
+    try:
+        raw = attr[idx]
+        if isinstance(raw, torch.Tensor):
+            return raw.detach().cpu().numpy()
+        return np.asarray(raw)
+    except Exception:
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Raw-signal denormalisation (fhr / up)
 # -----------------------------------------------------------------------------
@@ -735,6 +808,17 @@ def collect_predictions(
                     "guid": _extract_guid(batch, idx),
                     "epoch": _extract_epoch(batch, idx),
                     "label": _extract_label(batch, idx),
+                    # Synthetic-TE provenance (S7-T06): present only for synthetic v2
+                    # batches; ``None`` for real CTG / HDF5 batches (additive + guarded,
+                    # so the real-data path is behaviourally unchanged).
+                    "te_true": _extract_te_true(batch, idx),
+                    "te_scat": _extract_scalar_field(batch, "te_scat", idx),
+                    "te_raw": _extract_scalar_field(batch, "te_raw", idx),
+                    "frac_phi": _extract_scalar_field(batch, "frac_phi", idx),
+                    "sample_delay": _extract_delay(batch, idx),
+                    "cell_id": _extract_int_field(batch, "cell_id", idx),
+                    "true_lag_tt": _extract_array_field(batch, "true_lag_tt", idx),
+                    "true_lag_band": _extract_array_field(batch, "true_lag_band", idx),
                     "metrics": {
                         "feat_mse_total": float(fcst["feat_mse_total"][idx].cpu().item()),
                         "feat_r2_total": float(fcst["feat_r2_total"][idx].cpu().item()),
