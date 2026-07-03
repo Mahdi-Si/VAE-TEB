@@ -223,13 +223,19 @@ def test_normalisation_is_monotone() -> None:
 
 
 def test_scattering_heatmap_written(adapter_full, strong_fields, tmp_path) -> None:
-    r"""The scattering-heatmap figure is written in both requested formats."""
+    r"""The scattering + phase-harmonic heatmap figure is written in both formats.
+
+    Passes the phase-harmonic fields so the four-panel path (scattering pair + phase
+    pair) is exercised; the two-panel back-compat path is a simple subset.
+    """
     fields, _ = strong_fields
     idx = adapter_full.coupled_channel_indices()["up_st"]
     written = plot_scattering_heatmap(
         fields["fhr_st"][:2],
         fields["up_st"][:2],
         tmp_path / "scattering_heatmap",
+        fhr_ph=fields["fhr_ph"][:2],
+        up_ph=fields["up_ph"][:2],
         coupled_idx=idx,
         center_freqs=adapter_full.center_freqs_np,
         fs=adapter_full.fs,

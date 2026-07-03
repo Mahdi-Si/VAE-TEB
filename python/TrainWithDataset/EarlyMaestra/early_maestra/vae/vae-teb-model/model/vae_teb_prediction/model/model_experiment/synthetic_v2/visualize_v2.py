@@ -16,6 +16,17 @@ panel (:func:`plot_diagnostics_panel`), and the TE-aware aggregate figures
 (:func:`plot_calibration_by_lag`, :func:`plot_frac_phi_distribution`,
 :func:`plot_lag_mass_summary`).
 
+S7-T10 adds the data-generation *story* figures — the **controls** behind the previews
+above rather than their outputs, reusing the pipeline's own math (:mod:`raw_generators`,
+:mod:`analytic_te`) via lazy imports so this module stays free of the torch / kymatio
+transform: the frequency recipe (:func:`plot_band_spectra`, Welch PSD with the
+physiological bands + coupled carrier + LF notch, §4-§5); the TE control law
+(:func:`plot_te_authoring`, the $\mathrm{TE}^{(H)}(B)$ sweep with the inverter-solved
+$B$ per target and the SNR extractability law, §9); the coupling pathway / lag
+(:func:`plot_latent_coupling`, source $\to$ target with the delay $D$ and the true lag
+band $\mathcal L^\star$, §6); and the carrier de-risk (:func:`plot_am_separation`,
+envelope spectrum vs the analyzing-wavelet passband at $0.06$ vs $0.02\,\mathrm{Hz}$, §7).
+
 See ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprints 1, 2, 7.
 """
 
@@ -23,7 +34,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib
 
@@ -47,13 +58,50 @@ ps.apply_style()
 _FHR_COLOR = ps.COLOR_BLUE
 _UP_COLOR = ps.COLOR_VERMILLION
 _BASELINE_COLOR = ps.COLOR_GRAY
-_HIGHLIGHT_COLOR = ps.COLOR_SKY  # coupled-channel marker: contrasts against magma
+_HIGHLIGHT_COLOR = ps.COLOR_SKY  # band annotations / latent overlay (heatmap marker is _HEATMAP_MARK_COLOR)
 _INJ_COLOR = ps.COLOR_BLUE       # TE_inj series
 _SCAT_COLOR = ps.COLOR_VERMILLION  # TE_scat series
 _BAND_COLOR = ps.COLOR_GREEN     # true lag band / reference
 
 # Default raster resolution for PNG output across the gallery (PDF is vector).
 _DPI = ps.SAVE_DPI
+
+# Diverging blue-white-red colormap for every coefficient / phase-harmonic heatmap.
+# The model-facing features are per-channel z-scored (mean $\approx 0$), so a diverging
+# map reads their sign directly -- blue $< 0$, white $\approx 0$, red $> 0$ -- provided
+# the colour scale is centred on zero (see :func:`_symmetric_limits`).
+_HEATMAP_CMAP = "bwr"
+# Marker colour for the coupled-channel line / annotations drawn over the ``bwr`` maps.
+# Black reads cleanly against blue, white, and red alike (the old teal blended into the
+# blue tail of the diverging scale).
+_HEATMAP_MARK_COLOR = ps.COLOR_BLACK
+
+
+def _symmetric_limits(arrays: List[np.ndarray], pct: float = 99.0) -> Tuple[float, float]:
+    r"""Return a zero-centred ``(vmin, vmax)`` for a diverging colour scale.
+
+    Pools every supplied array, takes the ``pct`` percentile of the *absolute* values
+    as a robust half-range $L$ (so a few outliers do not wash the map out), and returns
+    $(-L, +L)$. This places the midpoint of :data:`_HEATMAP_CMAP` (white) exactly on
+    $0$, which is what makes a ``bwr`` heatmap of z-scored coefficients read its sign
+    honestly.
+
+    Args:
+        arrays: The 2-D heatmap arrays that must share one colour scale.
+        pct: Percentile of $|x|$ used for the symmetric limit (default $99$, i.e. the
+            top $1\%$ of magnitudes are clipped).
+
+    Returns:
+        A ``(vmin, vmax) = (-L, +L)`` tuple; falls back to a tiny non-zero range when
+        the pooled data is flat.
+    """
+    pooled = np.concatenate([np.asarray(a, dtype=float).ravel() for a in arrays])
+    lim = float(np.percentile(np.abs(pooled), pct)) if pooled.size else 0.0
+    if not np.isfinite(lim) or lim <= 0.0:
+        lim = float(np.max(np.abs(pooled))) if pooled.size else 1.0
+        if not np.isfinite(lim) or lim <= 0.0:
+            lim = 1e-6
+    return -lim, lim
 
 
 def _resolve_output_paths(out_path: Union[str, Path], formats: tuple) -> List[Path]:
@@ -85,6 +133,8 @@ def plot_raw_preview(
     meta: Optional[Dict[str, Any]] = None,
     fs: float = 4.0,
     sample: int = 0,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
     formats: tuple = ("pdf", "png"),
     dpi: int = _DPI,
 ) -> List[Path]:
@@ -92,7 +142,11 @@ def plot_raw_preview(
 
     Renders one sample's raw waveforms as two stacked panels: FHR (bpm) on top with
     its baseline $\mu_{\mathrm{FHR}}$ marked, and UP (mmHg) below with its resting
-    tone $\mu_{\mathrm{UP}}$ marked. The title carries the cell provenance
+    tone $\mu_{\mathrm{UP}}$ marked. When the phase-harmonic correlation fields
+    ``fhr_ph`` / ``up_ph`` are supplied, two further channel$\times$time heatmaps of
+    those correlations are stacked below the traces (diverging :data:`_HEATMAP_CMAP`
+    ``bwr`` on a zero-centred scale), so the raw sample and the phase structure the
+    model reads are shown together. The title carries the cell provenance
     ($\mathrm{TE}_{\mathrm{inj}}$, lag $D$, coupling $B$) when supplied in ``meta``.
 
     Note: with the default ``am_carrier`` render the FHR coupled term is a modulated
@@ -108,6 +162,9 @@ def plot_raw_preview(
         meta: Optional provenance dict (keys ``te_inj``, ``D``, ``B``, ``f_pulse``).
         fs: Raw sampling rate in Hz (for the time axis).
         sample: Row index to plot when the inputs are 2-D.
+        fhr_ph: Optional FHR phase-harmonic correlation field, $(n, T, C)$ or $(T, C)$;
+            when both phase fields are given a phase-harmonic heatmap pair is added.
+        up_ph: Optional UP phase-harmonic correlation field, same layout as ``fhr_ph``.
         formats: Output formats to write (e.g. ``("pdf", "png")``).
         dpi: Raster DPI for PNG output.
 
@@ -136,7 +193,18 @@ def plot_raw_preview(
         bits.append(f"B = {coupling:.3g}")
     title = "synthetic_v2 raw preview" + (("   (" + ", ".join(bits) + ")") if bits else "")
 
-    fig, (ax_fhr, ax_up) = plt.subplots(2, 1, figsize=(10.0, 5.0), sharex=True)
+    # With phase fields, use the house colorbar-gutter stack (two traces + two heatmaps);
+    # without them keep the lean two-panel trace figure.
+    have_phase = fhr_ph is not None and up_ph is not None
+    caxes: List[Optional[Any]] = [None, None]
+    if have_phase:
+        fig, axes, caxes = ps.stacked_figure(
+            [1.3, 1.3, 1.5, 1.5], width=10.0,
+            colorbar=[False, False, True, True], hspace=0.55,
+        )
+        ax_fhr, ax_up, ax_fhr_ph, ax_up_ph = axes
+    else:
+        fig, (ax_fhr, ax_up) = plt.subplots(2, 1, figsize=(10.0, 5.0), sharex=True)
 
     ax_fhr.plot(t_min, fhr, color=_FHR_COLOR, lw=0.6)
     ax_fhr.axhline(float(fhr.mean()), color=_BASELINE_COLOR, lw=0.9, ls="--",
@@ -152,7 +220,6 @@ def plot_raw_preview(
     ax_up.axhline(float(up.mean()), color=_BASELINE_COLOR, lw=0.9, ls="--",
                   label=rf"resting tone $\mu_{{\mathrm{{UP}}}} \approx$ {up.mean():.0f} mmHg")
     ax_up.set_ylabel("UP (mmHg)")
-    ax_up.set_xlabel("time (min)")
     # Annotate the coupled contraction band (the UP source of the pathway).
     ax_up.text(0.01, 0.04, "coupled contraction band (source)", transform=ax_up.transAxes,
                color=_HIGHLIGHT_COLOR, fontsize=6.5, va="bottom", ha="left")
@@ -162,6 +229,31 @@ def plot_raw_preview(
         ps.tighten_xaxis(ax, t_min)
         ps.style_axes(ax)
 
+    if have_phase:
+        fhr_p = _to_channels_time(fhr_ph, sample)  # (C, T)
+        up_p = _to_channels_time(up_ph, sample)
+        ph_vmin, ph_vmax = _symmetric_limits([fhr_p, up_p])
+        step_s = 16.0 / fs
+        for ax, cax, data, name in (
+            (ax_fhr_ph, caxes[2], fhr_p, "FHR"),
+            (ax_up_ph, caxes[3], up_p, "UP"),
+        ):
+            d_ch, d_t = data.shape
+            panel_t_max = d_t * step_s / 60.0
+            im = ax.imshow(
+                data, aspect="auto", origin="lower",
+                extent=(0.0, panel_t_max, -0.5, d_ch - 0.5),
+                vmin=ph_vmin, vmax=ph_vmax, cmap=_HEATMAP_CMAP, interpolation="nearest",
+            )
+            ax.set_ylabel(f"{name} phase-harm. channel")
+            ps.attach_colorbar(fig, im, cax, label="z-scored value")
+        ax_fhr_ph.set_title("phase-harmonic correlation", fontsize=9.0)
+        ax_up_ph.set_xlabel("time (min)")
+        for ax in (ax_fhr, ax_up):  # bottom heatmap carries the shared time axis
+            plt.setp(ax.get_xticklabels(), visible=False)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    ax_up.set_xlabel("time (min)")
     fig.tight_layout()
 
     # Only strip a trailing extension if it is one of the requested output formats;
@@ -202,6 +294,8 @@ def plot_scattering_heatmap(
     up_st: np.ndarray,
     out_path: Union[str, Path],
     *,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
     coupled_idx: Optional[int] = None,
     center_freqs: Optional[np.ndarray] = None,
     fs: float = 4.0,
@@ -209,19 +303,27 @@ def plot_scattering_heatmap(
     formats: tuple = ("pdf", "png"),
     dpi: int = _DPI,
 ) -> List[Path]:
-    r"""Write stacked FHR / UP scattering-coefficient heatmaps (S2-T04).
+    r"""Write stacked FHR / UP scattering + phase-harmonic heatmaps (S2-T04).
 
     Renders the $43$-channel first-order scattering fields as two stacked
-    channel$\times$time heatmaps (FHR on top, UP below) sharing one colorbar in a
-    dedicated gutter (so the panel rows are not shrunk by per-axes colorbars). The
-    fs-correct coupled pulse-shape channel (``coupled_idx``) is marked on both panels.
-    When ``center_freqs`` (normalised $\xi$) is supplied, y-tick labels are shown in Hz
+    channel$\times$time heatmaps (FHR then UP), and -- when the phase-harmonic
+    correlation fields ``fhr_ph`` / ``up_ph`` are supplied -- two further heatmaps of
+    those correlations below them. Every panel uses the diverging :data:`_HEATMAP_CMAP`
+    (``bwr``) on a zero-centred scale (:func:`_symmetric_limits`), so the sign of the
+    z-scored coefficients reads directly. Each panel gets its own colorbar in a dedicated
+    gutter (via :func:`plot_style_v2.stacked_figure`); the scattering pair shares one
+    colour scale and the phase pair shares another. The fs-correct coupled pulse-shape
+    channel (``coupled_idx``) is marked on the scattering panels. When ``center_freqs``
+    (normalised $\xi$) is supplied, the scattering panels' y-tick labels are shown in Hz
     (physical Hz $= \xi\,f_s$); channel $0$ is the order-0 low-pass baseline (``S0``).
 
     Args:
         fhr_st: FHR scattering field, $(n, T, C)$ or $(T, C)$ (normalised).
         up_st: UP scattering field, $(n, T, C)$ or $(T, C)$ (normalised).
         out_path: Output path stem (formats appended) or a full path.
+        fhr_ph: Optional FHR phase-harmonic correlation field, $(n, T, C)$ or $(T, C)$;
+            when both phase fields are given a phase-harmonic heatmap pair is added.
+        up_ph: Optional UP phase-harmonic correlation field, same layout as ``fhr_ph``.
         coupled_idx: Scattering channel index carrying the coupled carrier (highlighted).
         center_freqs: Normalised $\xi$ centre frequencies of the $C-1$ first-order
             channels (for Hz y-labels); channel $0$ is order-0.
@@ -238,73 +340,84 @@ def plot_scattering_heatmap(
     n_ch, n_t = fhr.shape
     # Decimated step = 16 raw samples; time axis in minutes.
     step_s = 16.0 / fs
-    t_max_min = n_t * step_s / 60.0
 
-    # Shared, robust colour scale across both panels (features are z-scored).
-    both = np.concatenate([fhr.ravel(), up.ravel()])
-    vmin, vmax = np.percentile(both, [1.0, 99.0])
-    if vmin == vmax:
-        vmin, vmax = float(both.min()), float(both.max() + 1e-6)
+    # Zero-centred, robust colour scale shared across the scattering pair (features are
+    # per-channel z-scored, so blue/red = below/above the channel mean).
+    scat_vmin, scat_vmax = _symmetric_limits([fhr, up])
 
-    fig = plt.figure(figsize=(10.0, 6.0))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 0.03], hspace=0.18, wspace=0.03)
-    ax_fhr = fig.add_subplot(gs[0, 0])
-    ax_up = fig.add_subplot(gs[1, 0], sharex=ax_fhr)
-    cax = fig.add_subplot(gs[:, 1])
+    # (name, data, kind) per panel, top to bottom. The phase-harmonic pair is appended
+    # only when both fields are supplied (kept optional for back-compat / lean callers).
+    panels: List[Tuple[str, np.ndarray, str]] = [
+        ("FHR", fhr, "scat"), ("UP", up, "scat"),
+    ]
+    have_phase = fhr_ph is not None and up_ph is not None
+    ph_vmin = ph_vmax = 0.0
+    if have_phase:
+        fhr_p = _to_channels_time(fhr_ph, sample)
+        up_p = _to_channels_time(up_ph, sample)
+        ph_vmin, ph_vmax = _symmetric_limits([fhr_p, up_p])
+        panels += [("FHR", fhr_p, "phase"), ("UP", up_p, "phase")]
 
-    im = None
-    for ax, data, name in ((ax_fhr, fhr, "FHR"), (ax_up, up, "UP")):
+    fig, axes, caxes = ps.stacked_figure(
+        [1.6] * len(panels), width=10.0, colorbar=[True] * len(panels), hspace=0.5,
+    )
+
+    for ax, cax, (name, data, kind) in zip(axes, caxes, panels):
+        vmin, vmax = (scat_vmin, scat_vmax) if kind == "scat" else (ph_vmin, ph_vmax)
+        d_ch, d_t = data.shape
+        panel_t_max = d_t * step_s / 60.0
         im = ax.imshow(
             data,
             aspect="auto",
             origin="lower",
-            extent=(0.0, t_max_min, -0.5, n_ch - 0.5),
+            extent=(0.0, panel_t_max, -0.5, d_ch - 0.5),
             vmin=vmin,
             vmax=vmax,
-            cmap="magma",
+            cmap=_HEATMAP_CMAP,
             interpolation="nearest",
         )
-        ax.set_ylabel(f"{name} scat. channel")
-        if coupled_idx is not None:
-            ax.axhline(coupled_idx, color=_HIGHLIGHT_COLOR, lw=1.2, ls="--")
-            ax.text(
-                0.01 * t_max_min,
-                coupled_idx + 0.6,
-                f"coupled ch {coupled_idx}",
-                color=_HIGHLIGHT_COLOR,
-                va="bottom",
-                ha="left",
-                fontsize=7.5,
-            )
-        # Keep the full thin-black box (house style); no grid on heatmaps.
+        if kind == "scat":
+            ax.set_ylabel(f"{name} scat. channel")
+            if coupled_idx is not None:
+                ax.axhline(coupled_idx, color=_HEATMAP_MARK_COLOR, lw=1.2, ls="--")
+                ax.text(
+                    0.01 * panel_t_max,
+                    coupled_idx + 0.6,
+                    f"coupled ch {coupled_idx}",
+                    color=_HEATMAP_MARK_COLOR,
+                    va="bottom",
+                    ha="left",
+                    fontsize=7.5,
+                )
+        else:
+            ax.set_ylabel(f"{name} phase-harm. channel")
+        ps.attach_colorbar(fig, im, cax, label="z-scored value")
 
-    # Hz y-tick labels when the centre frequencies are supplied.
+    # Hz y-tick labels for the scattering panels when centre frequencies are supplied.
     if center_freqs is not None:
         cf = np.asarray(center_freqs, dtype=float)
         tick_ch = [0] + list(range(5, n_ch, 8))
-        labels = []
-        for ch in tick_ch:
-            if ch == 0:
-                labels.append("S0")
-            else:
-                labels.append(f"{cf[ch - 1] * fs:.3f}")
-        for ax in (ax_fhr, ax_up):
-            ax.set_yticks(tick_ch)
-            ax.set_yticklabels(labels)
-        ax_fhr.set_ylabel("FHR channel (Hz)")
-        ax_up.set_ylabel("UP channel (Hz)")
+        labels = ["S0" if ch == 0 else f"{cf[ch - 1] * fs:.3f}" for ch in tick_ch]
+        for ax, (name, _data, kind) in zip(axes, panels):
+            if kind == "scat":
+                ax.set_yticks(tick_ch)
+                ax.set_yticklabels(labels)
+                ax.set_ylabel(f"{name} channel (Hz)")
 
-    ax_fhr.set_title("synthetic_v2 scattering coefficients (normalised)", fontsize=10.0)
-    ax_up.set_xlabel("time (min)")
-    plt.setp(ax_fhr.get_xticklabels(), visible=False)
-    fig.colorbar(im, cax=cax, label="z-scored magnitude")
+    axes[0].set_title(
+        "synthetic_v2 scattering coefficients"
+        + (" & phase-harmonic correlation" if have_phase else "")
+        + " (normalised)",
+        fontsize=10.0,
+    )
+    if have_phase:
+        axes[2].set_title("phase-harmonic correlation", fontsize=9.0)
+    # Time label only on the bottom panel; hide the inner panels' x-tick labels.
+    axes[-1].set_xlabel("time (min)")
+    for ax in axes[:-1]:
+        plt.setp(ax.get_xticklabels(), visible=False)
 
-    written: List[Path] = []
-    for path in _resolve_output_paths(out_path, formats):
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        written.append(path)
-    plt.close(fig)
-    return written
+    return _save_fig(fig, out_path, formats, dpi)
 
 
 def _read_metric_series(rows: List[Dict[str, str]], metric: str) -> tuple:
@@ -389,9 +502,9 @@ def _enumerate_html_metrics(rows: List[Dict[str, str]]) -> List[tuple]:
     ``<key>_step`` and a ``<key>_epoch`` column; this collapses that fork to the
     logical key, drops the bookkeeping / duplicate columns in
     :data:`_HTML_EXCLUDE_METRICS`, and orders the survivors by
-    :data:`_HTML_METRIC_ORDER` with each metric's ``train`` series (solid) placed
-    immediately before its ``val`` series (dashed). Unrecognised metrics are appended
-    in first-seen order so a newly-logged quantity appears automatically.
+    :data:`_HTML_METRIC_ORDER` with each metric's ``train`` series placed immediately
+    before its ``val`` series in the legend. Unrecognised metrics are appended in
+    first-seen order so a newly-logged quantity appears automatically.
 
     Args:
         rows: The parsed ``metrics.csv`` rows (from :class:`csv.DictReader`).
@@ -399,7 +512,8 @@ def _enumerate_html_metrics(rows: List[Dict[str, str]]) -> List[tuple]:
     Returns:
         A list of ``(label, csv_key, is_val)`` triples in draw order, where
         ``csv_key`` is the logical key handed to :func:`_read_metric_series` (e.g.
-        ``train/total_loss``) and ``is_val`` selects the dashed line style.
+        ``train/total_loss``) and ``is_val`` marks the validation twin (used only for
+        legend ordering; every trace is drawn solid).
     """
     if not rows:
         return []
@@ -504,9 +618,10 @@ def plot_loss_curves_html(
     per-dim KL and its dim-summed twin ``kld_nats`` ($\bar K = \mathrm{KL}\cdot d_z$,
     the TE surrogate), the predictive gap, the $\mu$ / $\Delta\mu$ saturation
     fractions, $\beta$, the spike-breaker diagnostics, and the learning rate -- is
-    drawn as its own distinctly-coloured line. Each metric's ``train`` series is solid
-    and its ``val`` twin dashed, placed adjacently in the legend; colours come from
-    :func:`_html_trace_colors` so no two lines share a hue. This mirrors the v1
+    drawn as its own distinctly-coloured **solid** line (no dashed styling). Each
+    metric's ``train`` series and its ``val`` twin are placed adjacently in the legend
+    and told apart by colour; colours come from :func:`_html_trace_colors` so no two
+    lines share a hue. This mirrors the v1
     ``synthetic/plot_training_curves.py`` interactive curve (one figure, one trace per
     metric) rather than a curated subset. It is consumed live during training by
     :class:`~model.vae_teb_prediction.model.model_experiment.synthetic_v2.callbacks_v2.LossPlotHtmlCallback`,
@@ -572,7 +687,7 @@ def plot_loss_curves_html(
                 y=values,
                 mode="lines+markers",
                 name=label,
-                line=dict(color=color, dash="dash" if is_val else "solid", width=1.6),
+                line=dict(color=color, width=1.6),
                 marker=dict(size=4),
             )
         )
@@ -712,10 +827,8 @@ def plot_raw_scatter_paired(
     step_s = 16.0 / fs
     t_dec_min = (np.arange(n_t) * step_s) / 60.0
 
-    both = np.concatenate([fhr_cf.ravel(), up_cf.ravel()])
-    vmin, vmax = np.percentile(both, [1.0, 99.0])
-    if vmin == vmax:
-        vmin, vmax = float(both.min()), float(both.max() + 1e-6)
+    # Zero-centred, robust scale for the diverging ``bwr`` map shared by both heatmaps.
+    vmin, vmax = _symmetric_limits([fhr_cf, up_cf])
 
     fig, axes, caxes = ps.stacked_figure(
         [1.1, 1.6, 1.1, 1.6],
@@ -744,9 +857,9 @@ def plot_raw_scatter_paired(
         im = ax.imshow(
             data, aspect="auto", origin="lower",
             extent=(0.0, t_dec_min[-1] if n_t else 0.0, -0.5, n_ch - 0.5),
-            vmin=vmin, vmax=vmax, cmap="magma", interpolation="nearest",
+            vmin=vmin, vmax=vmax, cmap=_HEATMAP_CMAP, interpolation="nearest",
         )
-        ax.axhline(coupled_idx, color=_HIGHLIGHT_COLOR, lw=1.0, ls="--")
+        ax.axhline(coupled_idx, color=_HEATMAP_MARK_COLOR, lw=1.0, ls="--")
         ax.set_ylabel(f"{name} scat. channel")
         if latent is not None:
             lat = np.asarray(latent, dtype=float)
@@ -759,7 +872,7 @@ def plot_raw_scatter_paired(
             )
             ax.legend(loc="upper right", frameon=False, fontsize=6.5)
         if cax is not None:
-            ps.attach_colorbar(fig, im, cax, label="z-scored magnitude")
+            ps.attach_colorbar(fig, im, cax, label="z-scored value")
 
     if center_freqs is not None:
         cf = np.asarray(center_freqs, dtype=float)
@@ -890,6 +1003,495 @@ def plot_latent_am_decomposition(
     if bits:
         suptitle += "   (" + ", ".join(bits) + ")"
     fig.suptitle(suptitle, fontsize=ps.FONT_SUPTITLE, y=0.985)
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+# ---------------------------------------------------------------------------
+# Data-generation story figures: the CONTROLS behind the previews above.
+# These illustrate *how* the data is authored -- the frequency recipe (§4-§5),
+# the TE control law (§9), the coupling pathway / lag (§6), and the carrier
+# de-risk (§7) -- reusing the pipeline's own math (``raw_generators`` /
+# ``analytic_te``), imported lazily so this module's top level stays free of the
+# torch / kymatio transform stack.
+# ---------------------------------------------------------------------------
+
+#: Coupled FHR deceleration (VLF) band in Hz (EXPLAINED §4). Deliberately *excluded*
+#: from :data:`raw_generators.FHRV_BANDS` -- it is reserved for the coupled pathway --
+#: so it is named here only for shading.
+_VLF_DECEL_BAND: Tuple[float, float] = (0.003, 0.03)
+#: Coupled UP contraction-rhythm band in Hz (EXPLAINED §4): the AR(2) source
+#: envelope's spectral support ($\sim 0.004\,\mathrm{Hz}$ peak).
+_UP_CONTRACTION_BAND: Tuple[float, float] = (0.003, 0.0083)
+
+
+def plot_band_spectra(
+    fhr_raw: np.ndarray,
+    up_raw: np.ndarray,
+    out_path: Union[str, Path],
+    *,
+    fs: float = 4.0,
+    meta: Optional[Dict[str, Any]] = None,
+    nperseg: Optional[int] = None,
+    sample: int = 0,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the frequency-recipe figure: Welch PSDs with the physiological bands marked (§4-§5).
+
+    Two stacked panels show the Welch power spectral density (log-log) of one raw FHR
+    and one raw UP waveform, with the physiologically-placed bands of the composition
+    model shaded on top. This makes the §5 additive model legible -- each raw signal is a
+    sum of independent, physiologically-placed bands plus **one** coupled carrier:
+
+    $$x_{\mathrm{UP}}(t) = \mu_{\mathrm{UP}} + u_{\mathrm c}(t) + \mathrm{drift}(t) + \varepsilon(t),
+    \qquad
+    x_{\mathrm{FHR}}(t) = \mu_{\mathrm{FHR}} - y_{\mathrm d}(t)
+    + \textstyle\sum_{\mathrm{band}} \mathrm{FHRV} + \mathrm{accel} + \varepsilon(t).$$
+
+    The FHR panel marks the independent baseline-wander band
+    (:data:`raw_generators.FHR_WANDER_BAND`), the deceleration band
+    ($\mathcal V\!\mathrm{LF}$, :data:`_VLF_DECEL_BAND`), and the independent FHRV
+    LF/MF/HF dressing (:data:`raw_generators.FHRV_BANDS`). The UP panel marks the slow
+    drift (:data:`raw_generators.UP_DRIFT_BAND`) and the contraction-rhythm band
+    (:data:`_UP_CONTRACTION_BAND`). Both panels draw the locked pulse carrier
+    $f_{\mathrm{pulse}}$ (from ``meta``) and shade the excised LF notch neighbourhood
+    $[f_{\mathrm{pulse}} 2^{-1/Q}, f_{\mathrm{pulse}} 2^{+1/Q}]$ (``meta['fhrv_notch']``).
+    These deceleration / contraction bands are the *envelope* rhythms of the coupled
+    pathway (where $c, d$ live on the decimated grid); by the §7 AM rendering the coupled
+    term itself is carried at $f_{\mathrm{pulse}}$ (sidebands around the carrier), not as
+    standalone power in those bands.
+
+    Args:
+        fhr_raw: FHR waveform(s), shape $(n, N)$ or $(N,)$ (bpm).
+        up_raw: UP waveform(s), shape $(n, N)$ or $(N,)$ (mmHg).
+        out_path: Output path stem or full path.
+        fs: Raw sampling rate in Hz.
+        meta: Provenance dict; reads ``f_pulse`` (carrier Hz) and ``fhrv_notch`` (the
+            $(\mathrm{lo}, \mathrm{hi})$ notch neighbourhood, or ``None`` if disabled).
+        nperseg: Welch segment length; defaults to $\min(N, 4096)$ (long enough to
+            resolve the sub-$0.01\,\mathrm{Hz}$ physiological bands).
+        sample: Row index to plot when the inputs are batched.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    from scipy.signal import welch
+
+    from .raw_generators import FHRV_BANDS, FHR_WANDER_BAND, UP_DRIFT_BAND
+
+    fhr = np.asarray(fhr_raw, dtype=float)
+    up = np.asarray(up_raw, dtype=float)
+    if fhr.ndim == 2:
+        fhr = fhr[sample]
+    if up.ndim == 2:
+        up = up[sample]
+
+    n_min = int(min(fhr.shape[-1], up.shape[-1]))
+    seg = int(nperseg) if nperseg is not None else min(n_min, 4096)
+    seg = max(16, min(seg, n_min))  # size from the shorter signal so both grids match
+    f_fhr, p_fhr = welch(fhr, fs=fs, nperseg=seg, detrend="constant")
+    f_up, p_up = welch(up, fs=fs, nperseg=seg, detrend="constant")
+    # Drop the DC bin (f = 0) so the log-frequency axis is well defined.
+    f_fhr, p_fhr = f_fhr[1:], p_fhr[1:]
+    f_up, p_up = f_up[1:], p_up[1:]
+
+    meta = meta or {}
+    f_pulse = float(meta.get("f_pulse", 0.06))
+    if "fhrv_notch" in meta:
+        notch = meta["fhrv_notch"]  # tuple, or None when the notch is disabled
+    else:  # meta lacks it -- reconstruct the default Q=4 neighbourhood for the preview
+        notch = (f_pulse * 2.0 ** (-0.25), f_pulse * 2.0 ** (0.25))
+
+    x_lo = float(min(f_fhr[0], f_up[0]))
+    x_hi = fs / 2.0
+
+    def _shade(ax, lo: float, hi: float, color, alpha: float, label: str) -> None:
+        ax.axvspan(lo, hi, color=color, alpha=alpha, lw=0.0)
+        xc = float(np.clip(np.sqrt(max(lo, x_lo) * hi), x_lo, x_hi))
+        ax.text(xc, 0.965, label, transform=ax.get_xaxis_transform(), ha="center",
+                va="top", rotation=90, fontsize=5.5, color=_BASELINE_COLOR)
+
+    fig, axes, _ = ps.stacked_figure([1.5, 1.5], width=10.0, hspace=0.5,
+                                     colorbar=False, margins=(0.10, 0.95, 0.92, 0.06))
+    ax_fhr, ax_up = axes
+
+    ax_fhr.semilogy(f_fhr, p_fhr, color=_FHR_COLOR, lw=0.8)
+    _shade(ax_fhr, *FHR_WANDER_BAND, _BASELINE_COLOR, 0.10, "wander")
+    _shade(ax_fhr, *_VLF_DECEL_BAND, _HIGHLIGHT_COLOR, 0.16, "decel band (VLF)")
+    for (name, band), col in zip(FHRV_BANDS.items(), (ps.COLOR_ORANGE, ps.COLOR_GREEN,
+                                                      ps.COLOR_PURPLE)):
+        _shade(ax_fhr, *band, col, 0.10, f"FHRV {name}")
+    ax_fhr.set_ylabel(r"FHR PSD (bpm$^2$/Hz)")
+    ax_fhr.set_title("FHR: independent dressing + deceleration bands "
+                     "(coupled term AM-rendered onto the carrier)")
+
+    ax_up.semilogy(f_up, p_up, color=_UP_COLOR, lw=0.8)
+    _shade(ax_up, *UP_DRIFT_BAND, _BASELINE_COLOR, 0.10, "slow drift")
+    _shade(ax_up, *_UP_CONTRACTION_BAND, _HIGHLIGHT_COLOR, 0.16, "contraction rhythm")
+    ax_up.set_ylabel(r"UP PSD (mmHg$^2$/Hz)")
+    ax_up.set_xlabel("frequency (Hz)")
+    ax_up.set_title("UP: slow drift + contraction rhythm "
+                    "(coupled term AM-rendered onto the same carrier)")
+
+    for ax in (ax_fhr, ax_up):
+        ax.axvline(f_pulse, color=_HEATMAP_MARK_COLOR, lw=1.1, ls="--",
+                   label=rf"$f_{{\mathrm{{pulse}}}}$={f_pulse:g} Hz")
+        if notch is not None:
+            ax.axvspan(float(notch[0]), float(notch[1]), color=_HEATMAP_MARK_COLOR,
+                       alpha=0.14, lw=0.0, label="LF notch")
+        ax.set_xscale("log")
+        ax.set_xlim(x_lo, x_hi)
+        ax.legend(loc="lower left", frameon=False, fontsize=6.0)
+        ps.style_axes(ax)
+
+    fig.suptitle("synthetic_v2 band recipe: additive physiological bands + one coupled carrier",
+                 fontsize=ps.FONT_SUPTITLE, y=0.985)
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_te_authoring(
+    config: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    benchmark: str = "G1_raw",
+    delay: int = 8,
+    target_te_grid: Optional[Sequence[float]] = None,
+    n_b: int = 9,
+    n_samples: int = 6000,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the TE-control figure: author by TE, solve for coupling $B$, gauge extractability (§9).
+
+    Panel (a) is the **authoring map**: the Monte-Carlo block transfer entropy
+    $\mathrm{TE}^{(H)}(B)$ swept over the coupling magnitude $B$ at a fixed lag $D$
+    (:func:`analytic_te.te_block_state_space_gaussian`), with the solved coupling for
+    each authored ``target_te`` overlaid as marked points -- each solved by the exact
+    inverter :func:`analytic_te.B_y_for_mean_te_block_state_space` the build uses, so the
+    figure reproduces "author a TE, get a $B$". Panel (b) is the **extractability law**
+    $$\mathrm{SNR} \approx e^{2\,\mathrm{TE}^{(H)}/(H M)} - 1$$
+    (:func:`analytic_te.snr_per_step_for_te_block`, $M = \mathrm{len(oscillators)} = 1$ for
+    the single-pathway benchmark), with the grid TEs marked and
+    the $\sim\!1\%$ per-step innovation SNR below which the coupling is effectively
+    unextractable shaded. Together: we author by TE, solve for $B$, and the SNR law sets
+    what a finite-sample predictor can recover.
+
+    Self-contained from ``config`` (reads ``benchmarks.<b>.data`` / ``.mix`` and
+    ``model.horizon``); no realizability preflight required. The Monte-Carlo is the only
+    cost -- keep ``n_samples`` / ``n_b`` modest for a fast preview.
+
+    Args:
+        config: The parsed ``config_synth_v2.yaml`` tree.
+        out_path: Output path stem or full path.
+        benchmark: Active benchmark key under ``benchmarks``.
+        delay: Fixed source$\to$target lag $D$ (decimated steps) for the sweep and solves.
+        target_te_grid: Authored block TEs (nats) to solve/mark; defaults to
+            ``benchmarks.<b>.mix.target_te_grid``.
+        n_b: Number of $B$ points in the $\mathrm{TE}^{(H)}(B)$ sweep.
+        n_samples: Monte-Carlo sample count for each TE evaluation and solve.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    from .analytic_te import (
+        B_y_for_mean_te_block_state_space,
+        snr_per_step_for_te_block,
+        te_block_state_space_gaussian,
+    )
+
+    bench = config["benchmarks"][benchmark]
+    data = bench["data"]
+    inv = bench["mix"]["inverter"]
+    oscillators = [tuple(spec) for spec in data["oscillators"]]
+    target_ar = float(data["target_ar"])
+    sigma2_y = float(data["sigma2_y"])
+    sigma2_eta = float(data["sigma2_eta"])
+    h_data = int(data["horizon"])          # defines TE_inj (matches the inverter)
+    k_history = int(data["K_history"])
+    h_model = int(config["model"]["horizon"])  # the model forecast horizon (SNR law)
+    seed = int(config.get("seeds", {}).get("inverter_mc", 0))
+    m_channels = len(oscillators)
+
+    grid = list(target_te_grid) if target_te_grid is not None else list(bench["mix"]["target_te_grid"])
+    positive = [float(t) for t in grid if float(t) > 0.0]
+
+    # Solve B for each authored TE -- the overlay points (exact inverter, fixed lag).
+    solved: List[Tuple[float, float, float]] = []  # (target_te, B*, te_block_realised)
+    for te in positive:
+        try:
+            sol = B_y_for_mean_te_block_state_space(
+                target_te_block=te, delay_min=int(delay), delay_max=int(delay),
+                oscillators=oscillators, target_ar=target_ar, sigma2_y=sigma2_y,
+                sigma2_eta=sigma2_eta, H=h_data, K_history=k_history,
+                n_samples=int(n_samples), lo=float(inv["lo"]), hi=float(inv["hi"]),
+                tol=float(inv["tol"]), max_iter=int(inv["max_iter"]), seed=seed,
+            )
+            solved.append((te, float(sol["B_y_scalar"]), float(sol["te_block"])))
+        except ValueError:
+            continue  # bracket missed this target -- skip the unsolvable cell
+
+    fig, axes, _ = ps.stacked_figure([1.5, 1.5], width=9.0, hspace=0.6,
+                                     colorbar=False, margins=(0.11, 0.95, 0.92, 0.07))
+    ax_a, ax_b = axes
+
+    if solved:
+        b_max = max(b for _, b, _ in solved)
+        b_grid = np.linspace(0.0, 1.15 * b_max, int(n_b))
+        curve = np.array([
+            te_block_state_space_gaussian(
+                oscillators, target_ar, [int(delay)], [float(b)], sigma2_y, sigma2_eta,
+                h_data, K_history=k_history, n_samples=int(n_samples), seed=seed)
+            for b in b_grid
+        ])
+        ax_a.plot(b_grid, curve, color=_BASELINE_COLOR, lw=1.3, marker="o", ms=2.5,
+                  label=r"$\mathrm{TE}^{(H)}(B)$ (Monte-Carlo)")
+        for i, (te, b_star, te_real) in enumerate(solved):
+            col = ps.PALETTE_PRIMARY[i % len(ps.PALETTE_PRIMARY)]
+            ax_a.plot([b_star], [te_real], marker="D", ms=7, color=col, ls="none",
+                      label=rf"target {te:g} $\to B={b_star:.3g}$")
+            ax_a.plot([0.0, b_star, b_star], [te_real, te_real, 0.0], color=col, lw=0.7,
+                      ls=":", alpha=0.7)
+        ax_a.set_ylabel(r"$\mathrm{TE}^{(H)}$ (nats)")
+        ax_a.legend(loc="lower right", frameon=False, fontsize=6.0)
+    else:
+        _no_data(ax_a, "no solvable target TEs in the bracket")
+    ax_a.set_xlabel(r"coupling magnitude $B$")
+    ax_a.set_title(rf"author by TE $\to$ solve for $B$  (fixed lag $D={int(delay)}$, $H={h_data}$)")
+    ps.style_axes(ax_a)
+
+    te_hi = max([t for _, _, t in solved] + [max(grid) if grid else 0.0] + [1e-3])
+    te_axis = np.linspace(0.0, 1.1 * te_hi, 200)
+    snr_pct = 100.0 * np.array([snr_per_step_for_te_block(float(t), h_model, m_channels)
+                                for t in te_axis])
+    ax_b.axhspan(0.0, 1.0, color=_BASELINE_COLOR, alpha=0.10)
+    ax_b.plot(te_axis, snr_pct, color=_INJ_COLOR, lw=1.5,
+              label=r"$\mathrm{SNR}\approx e^{2\,\mathrm{TE}^{(H)}/(HM)}-1$")
+    for te in positive:
+        s = 100.0 * snr_per_step_for_te_block(float(te), h_model, m_channels)
+        ax_b.plot([te], [s], marker="s", ms=6, color=_SCAT_COLOR, ls="none")
+    ax_b.axhline(1.0, color=_BASELINE_COLOR, lw=0.9, ls="--")
+    ax_b.text(1.1 * te_hi, 1.0, "  ~1% unextractable floor", ha="right", va="bottom",
+              fontsize=6.5, color=_BASELINE_COLOR)
+    ax_b.set_xlabel(r"injected block TE $\mathrm{TE}^{(H)}$ (nats)")
+    ax_b.set_ylabel("per-step innovation SNR (%)")
+    ax_b.set_title(rf"extractability law: SNR sets what is recoverable  ($H={h_model}$, $M={m_channels}$)")
+    ax_b.set_xlim(0.0, 1.1 * te_hi)
+    ax_b.legend(loc="upper left", frameon=False, fontsize=6.5)
+    ps.style_axes(ax_b)
+
+    fig.suptitle(f"synthetic_v2 TE authoring & extractability (benchmark {benchmark})",
+                 fontsize=ps.FONT_SUPTITLE, y=0.985)
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_latent_coupling(
+    latents: Dict[str, np.ndarray],
+    out_path: Union[str, Path],
+    *,
+    D: int,
+    horizon: int,
+    fs: float = 4.0,
+    decimation: int = 16,
+    max_lag: Optional[int] = None,
+    sample: int = 0,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the coupling-pathway figure: source $\to$ target with the delay $D$ made visible (§6).
+
+    Panel 1 overlays the decimated coupled latents -- target $d$ (FHR deceleration depth),
+    source $c$ (UP contraction strength), and $c$ shifted forward by $D$ steps ($c_{k-D}$)
+    -- so the alignment of the shifted source with the target's response is legible: the
+    §6.2 target obeys $d_k = A_y d_{k-1} + B\,c_{k-D} + \varepsilon_k$, i.e. contraction
+    strength drives deceleration depth $D$ steps later. Panel 2 is the standardized
+    cross-correlation $\mathrm{corr}(d_k, c_{k-\ell})$ vs lag $\ell$ (pooled over all rows),
+    which peaks near $\ell = D$; the true past-source lag band
+    $\mathcal L^\star = \{\max(0, D-H), \dots, D-1\}$ -- the lags a horizon-$H$ forecaster
+    must attend to -- is shaded.
+
+    Args:
+        latents: The ``latents`` dict from :func:`raw_generators.generate_cell_raw`
+            (uses ``c`` and ``d``, each $(n, T')$ or $(T',)$ on the decimated grid).
+        out_path: Output path stem or full path.
+        D: The source$\to$target coupling lag (decimated steps).
+        horizon: The forecast horizon $H$ (sets the true lag band width).
+        fs: Raw sampling rate in Hz (the latents live on ``fs / decimation``).
+        decimation: Decimation factor mapping the raw grid to the latent grid.
+        max_lag: Largest lag $\ell$ shown; defaults to $D + H + 5$.
+        sample: Row index to plot in panel 1 when the arrays are batched.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    c1 = _latent_row(latents, "c", sample)
+    d1 = _latent_row(latents, "d", sample)
+    c_all = np.asarray(latents["c"], dtype=float)
+    d_all = np.asarray(latents["d"], dtype=float)
+    if c_all.ndim == 1:
+        c_all = c_all[None, :]
+    if d_all.ndim == 1:
+        d_all = d_all[None, :]
+
+    D = int(D)
+    horizon = int(horizon)
+    t_tot = int(c1.shape[-1])
+    fs_dec = fs / float(decimation)
+    t_min = np.arange(t_tot) / fs_dec / 60.0
+    delay_s = D * decimation / fs
+    lag_hi = int(max_lag) if max_lag else D + horizon + 5
+
+    fig, axes, _ = ps.stacked_figure([1.4, 1.4], width=10.0, hspace=0.55,
+                                     colorbar=False, margins=(0.10, 0.95, 0.92, 0.08))
+    ax_t, ax_x = axes
+
+    # Panel 1: the latent pair with the source shifted by D onto the target's response.
+    ax_t.plot(t_min, d1, color=_FHR_COLOR, lw=1.1, label=r"$d$ (target: FHR decel depth)")
+    ax_t.plot(t_min, c1, color=_UP_COLOR, lw=0.9, alpha=0.6,
+              label=r"$c$ (source: UP contraction)")
+    c_shift = np.full(t_tot, np.nan)
+    if D < t_tot:
+        c_shift[D:] = c1[: t_tot - D]
+    ax_t.plot(t_min, c_shift, color=_HIGHLIGHT_COLOR, lw=1.2, ls="--",
+              label=rf"$c_{{k-D}}$ (source shifted by $D={D}$)")
+    ax_t.axhline(0.0, color=_BASELINE_COLOR, lw=0.6, ls=":")
+    ax_t.set_ylabel("latent value")
+    ax_t.set_xlabel("time (min)")
+    ax_t.set_title(rf"coupling pathway: UP contraction $\to$ FHR deceleration, "
+                   rf"delay $D={D}$ steps (${delay_s:g}$ s)")
+    ax_t.legend(loc="upper right", frameon=False, fontsize=6.0, ncol=3)
+    ps.tighten_xaxis(ax_t, t_min)
+    ps.style_axes(ax_t)
+
+    # Panel 2: standardized cross-correlation pooled over rows, peaking at lag D.
+    cz = (c_all - c_all.mean(axis=1, keepdims=True)) / (c_all.std(axis=1, keepdims=True) + 1e-12)
+    dz = (d_all - d_all.mean(axis=1, keepdims=True)) / (d_all.std(axis=1, keepdims=True) + 1e-12)
+    t_c = cz.shape[1]
+    lags = np.arange(0, min(lag_hi, t_c - 1) + 1)
+    xcorr = np.array([float(np.mean(dz[:, lag:] * cz[:, : t_c - lag])) if lag < t_c else np.nan
+                      for lag in lags])
+    lo = max(0, D - horizon)
+    ax_x.axvspan(lo - 0.5, D - 0.5, color=_BAND_COLOR, alpha=0.15,
+                 label=rf"true lag band $\mathcal{{L}}^\star=\{{{lo},\dots,{D - 1}\}}$")
+    ax_x.plot(lags, xcorr, color=_SCAT_COLOR, lw=1.2, marker="o", ms=2.5)
+    ax_x.axhline(0.0, color=_BASELINE_COLOR, lw=0.6, ls=":")
+    ax_x.axvline(D, color=_HEATMAP_MARK_COLOR, lw=1.1, ls="--", label=rf"$D={D}$")
+    ax_x.set_xlabel(r"lag $\ell$ (decimated steps)")
+    ax_x.set_ylabel(r"corr$(d_k,\,c_{k-\ell})$")
+    ax_x.set_title(r"cross-correlation peaks at the coupling delay $D$")
+    ax_x.set_xlim(0, int(lags[-1]) if lags.size else lag_hi)
+    ax_x.legend(loc="upper right", frameon=False, fontsize=6.5)
+    ps.style_axes(ax_x)
+
+    fig.suptitle(f"synthetic_v2 coupling pathway & lag  (D={D}, H={horizon})",
+                 fontsize=ps.FONT_SUPTITLE, y=0.985)
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_am_separation(
+    config: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    benchmark: str = "G1_raw",
+    f_pulse_compare: float = 0.02,
+    decimation: int = 16,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the carrier de-risk figure: envelope spectrum vs analyzing-wavelet passband (§7).
+
+    On one frequency axis (the decimated grid) it overlays the AR(2) coupling-envelope
+    power spectrum $S_{\mathrm{env}}(f)$ (:func:`raw_generators.ar2_psd`, peaked near
+    $0.004\,\mathrm{Hz}$) and the analyzing-wavelet passband -- a Gaussian centred at the
+    carrier $f_{\mathrm{pulse}}$ of $e^{-1}$ half-width $\sigma_{\mathrm{wav}}$, i.e.
+    $e^{-((f - f_{\mathrm{pulse}})/\sigma_{\mathrm{wav}})^2}$, matching the demodulation
+    weight of :func:`raw_generators.am_separation_margin` (the constant-$Q$ wavelet width)
+    -- for **two** carriers:
+    the locked $f_{\mathrm{pulse}}$ and the rejected ``f_pulse_compare`` ($0.02\,\mathrm{Hz}$).
+    The separation margin
+    $$\mathrm{margin} = \sigma_{\mathrm{wav}} / f_{\mathrm{env,peak}}$$
+    is annotated for each. It shows *why* the carrier is locked at $0.06\,\mathrm{Hz}$: at
+    $0.02\,\mathrm{Hz}$ the (narrower, lower) constant-$Q$ passband sits close to the envelope
+    band, so amplitude demodulation cannot cleanly separate carrier from envelope and the
+    injected TE does not survive (EXPLAINED §7.2).
+
+    Args:
+        config: The parsed ``config_synth_v2.yaml`` tree.
+        out_path: Output path stem or full path.
+        benchmark: Active benchmark key under ``benchmarks``.
+        f_pulse_compare: The rejected carrier (Hz) to contrast against the locked one.
+        decimation: Decimation factor (sets the decimated Nyquist and $S_{\mathrm{env}}$ grid).
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    from .raw_generators import am_separation_margin, ar2_psd
+
+    bench = config["benchmarks"][benchmark]
+    data = bench["data"]
+    raw = bench["raw"]
+    scattering = bench["scattering"]
+    r, w = float(data["oscillators"][0][0]), float(data["oscillators"][0][1])
+    sigma2_eta = float(data["sigma2_eta"])
+    f_pulse = float(raw["f_pulse"])
+    q_factor = int(scattering["Q"])
+    fs = float(raw["fs"])
+    am_offset_ratio = float(raw["am_offset_ratio"])
+    fs_dec = fs / float(decimation)
+
+    margin_main = am_separation_margin(
+        r=r, w=w, f_pulse=f_pulse, Q=q_factor, fs=fs, decimation=int(decimation),
+        am_offset_ratio=am_offset_ratio, sigma2_eta=sigma2_eta,
+    )
+    margin_alt = am_separation_margin(
+        r=r, w=w, f_pulse=float(f_pulse_compare), Q=q_factor, fs=fs, decimation=int(decimation),
+        am_offset_ratio=am_offset_ratio, sigma2_eta=sigma2_eta,
+    )
+
+    f = np.linspace(1e-4, fs_dec / 2.0, 2000)
+    s_env = ar2_psd(f, r, w, sigma2_eta, fs_dec)
+    s_env = s_env / float(s_env.max())
+
+    def _passband(fc: float, sigma: float) -> np.ndarray:
+        return np.exp(-((f - fc) / sigma) ** 2)
+
+    sig_main = float(margin_main["sigma_wav_hz"])
+    sig_alt = float(margin_alt["sigma_wav_hz"])
+    f_env_peak = float(margin_main["f_env_peak"])
+
+    fig, ax = plt.subplots(figsize=(9.0, 4.4))
+    ax.fill_between(f, 0.0, s_env, color=_UP_COLOR, alpha=0.12)
+    ax.plot(f, s_env, color=_UP_COLOR, lw=1.5,
+            label=r"AR(2) envelope PSD $S_{\mathrm{env}}(f)$ (normalised)")
+    ax.plot(f, _passband(f_pulse, sig_main), color=_HIGHLIGHT_COLOR, lw=1.8,
+            label=rf"wavelet @ {f_pulse:g} Hz (locked; margin={margin_main['margin_peak']:.1f})")
+    ax.plot(f, _passband(float(f_pulse_compare), sig_alt), color=_BASELINE_COLOR, lw=1.5,
+            ls="--",
+            label=rf"wavelet @ {f_pulse_compare:g} Hz (rejected; margin={margin_alt['margin_peak']:.1f})")
+    ax.axvline(f_pulse, color=_HIGHLIGHT_COLOR, lw=0.8, ls=":")
+    ax.axvline(float(f_pulse_compare), color=_BASELINE_COLOR, lw=0.8, ls=":")
+    ax.axvline(f_env_peak, color=_UP_COLOR, lw=0.8, ls=":")
+    ax.annotate(rf"$f_{{\mathrm{{env,peak}}}}\approx{f_env_peak:.4g}$ Hz",
+                xy=(f_env_peak, 0.5), xytext=(f_env_peak + 0.01, 0.7),
+                fontsize=6.5, color=_UP_COLOR,
+                arrowprops=dict(arrowstyle="->", color=_UP_COLOR, lw=0.7))
+    ax.set_xlabel("frequency (Hz)")
+    ax.set_ylabel("normalised power / wavelet response")
+    ax.set_xlim(0.0, fs_dec / 2.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.legend(loc="upper right", frameon=False, fontsize=6.5)
+    ax.set_title(r"AM separation: envelope band vs constant-$Q$ carrier passband")
+    ps.style_axes(ax)
+    fig.suptitle("synthetic_v2 AM separation: why the carrier is locked at 0.06 Hz",
+                 fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     return _save_fig(fig, out_path, formats, dpi)
 
 
@@ -1067,12 +1669,32 @@ def _group_stats(x: np.ndarray, y: np.ndarray) -> Dict[float, Dict[str, float]]:
     return out
 
 
+def _rankdata_average(a: np.ndarray) -> np.ndarray:
+    r"""Tie-aware (midrank) ranks: tied values share the mean of their ordinal ranks.
+
+    Plain ``argsort(argsort(a))`` assigns arbitrary *distinct* ranks to ties, which biases the
+    rank correlation when a variable has few distinct levels with many ties (e.g. the per-sample
+    TE axis). This returns proper average ranks, matching ``scipy.stats.rankdata(method='average')``
+    without the scipy dependency.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    order = a.argsort(kind="mergesort")
+    ordinal = np.empty(a.size, dtype=np.float64)
+    ordinal[order] = np.arange(1, a.size + 1, dtype=np.float64)
+    uniq, inv, cnt = np.unique(a, return_inverse=True, return_counts=True)
+    sums = np.zeros(uniq.size, dtype=np.float64)
+    np.add.at(sums, inv, ordinal)
+    return (sums / cnt)[inv]
+
+
 def _spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
-    r"""Spearman rank correlation of two 1-D arrays (``nan`` when undefined)."""
+    r"""Tie-aware Spearman rank correlation of two 1-D arrays (``nan`` when undefined)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
     if x.size < 2:
         return float("nan")
-    rx = np.argsort(np.argsort(x)).astype(np.float64)
-    ry = np.argsort(np.argsort(y)).astype(np.float64)
+    rx = _rankdata_average(x)
+    ry = _rankdata_average(y)
     if np.std(rx) == 0 or np.std(ry) == 0:
         return float("nan")
     return float(np.corrcoef(rx, ry)[0, 1])
@@ -1113,15 +1735,26 @@ def _kbar_vs_te_panel(
     Returns:
         The number of finite points plotted.
     """
-    te = np.asarray(te, dtype=float)
-    kbar = np.asarray(kbar, dtype=float)
-    cell_id = np.asarray(cell_id, dtype=float)
+    te = np.asarray(te, dtype=float).reshape(-1)
+    kbar = np.asarray(kbar, dtype=float).reshape(-1)
+    cell_id = np.asarray(cell_id, dtype=float).reshape(-1)
+    # Guard against a missing / partially-written per_sample array (e.g. te_scat absent): a
+    # length-mismatched te would otherwise raise a broadcast error instead of a clean placeholder.
+    if te.shape != kbar.shape or kbar.size == 0:
+        _no_data(ax, "no per-sample data")
+        ax.set_xlabel(xlabel)
+        return 0
+    if cell_id.shape != kbar.shape:
+        cell_id = np.zeros_like(kbar)
     m = np.isfinite(te) & np.isfinite(kbar)
-    if int(m.sum()) < 2 or np.ptp(te[m]) <= 0:
+    if int(m.sum()) < 2:
         _no_data(ax, "no per-sample data")
         ax.set_xlabel(xlabel)
         return int(m.sum())
     te_m, kb_m, cid_m = te[m], kbar[m], cell_id[m]
+    # A single TE level (e.g. a lag mapped to one cell) has no x-spread: still show the full
+    # per-sample K-bar distribution (cloud + box), just without a slope / correlation.
+    has_spread = bool(np.ptp(te_m) > 0)
     levels = np.unique(te_m)
     span = float(levels.max() - levels.min()) or 1.0
     jw = 0.02 * span + 1e-3                       # jitter half-width
@@ -1157,16 +1790,20 @@ def _kbar_vs_te_panel(
         g = cal.get(f"gamma_{pref}_sample")
         a = cal.get(f"alpha_{pref}_sample")
         r2 = cal.get(f"r2_{pref}_sample")
-    if g is not None and a is not None and np.isfinite(g) and np.isfinite(a):
+    # A fit / correlation is only defined when TE varies across the panel's samples.
+    if has_spread and g is not None and a is not None and np.isfinite(g) and np.isfinite(a):
         r2f = float(r2) if r2 is not None and np.isfinite(r2) else float("nan")
         ax.plot(xs, a + g * xs, color=color, lw=1.4,
                 label=rf"fit $\gamma$={g:.3f}, $R^2$={r2f:.2f}", zorder=6)
     ax.plot(xs, xs, color=_BASELINE_COLOR, lw=0.6, ls=":", label="y=x", zorder=4)
 
-    pear = float(np.corrcoef(te_m, kb_m)[0, 1])
-    rho = _spearman_rho(te_m, kb_m)
     ax.set_xlabel(xlabel)
-    ax.set_title(rf"$r$={pear:.2f}, $\rho$={rho:.2f}, $n$={int(te_m.size)}")
+    if has_spread:
+        pear = float(np.corrcoef(te_m, kb_m)[0, 1])
+        rho = _spearman_rho(te_m, kb_m)
+        ax.set_title(rf"$r$={pear:.2f}, $\rho$={rho:.2f}, $n$={int(te_m.size)}")
+    else:
+        ax.set_title(rf"single TE level, $n$={int(te_m.size)}")
     ax.legend(loc="upper left", frameon=False, fontsize=6.0)
     return int(te_m.size)
 

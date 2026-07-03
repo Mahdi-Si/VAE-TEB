@@ -392,20 +392,25 @@ class SyntheticTEDatasetV2(Dataset):
             # Deterministically regenerate this row's raw 4 Hz FHR/UP (physical units) when a
             # provider is attached, so the per-sample diagnostic's first panel can draw it.
             # ``collect_predictions`` reads ``batch.fhr`` / ``batch.up`` (a no-op denormalise
-            # when the loader carries no fhr/up stats), so nothing else needs changing.
+            # when the loader carries no fhr/up stats), so nothing else needs changing. The
+            # keys are set for EVERY item (the provider is total: real window or a NaN window),
+            # so a batch never collates with inconsistent keys -- a partial raw failure would
+            # otherwise crash ``default_collate`` and abort the whole diagnostics stage.
             if self._raw_provider is not None and "sample_raw_index" in prov:
+                win_len = int(getattr(self._raw_provider, "window_length", 0))
                 try:
                     fhr_win, up_win = self._raw_provider(
                         int(prov["sample_cell_id"][idx]),
                         int(prov["sample_raw_index"][idx]),
                     )
+                except Exception as exc:  # noqa: BLE001 -- raw is a plotting nicety, never fatal
+                    logger.warning("dataset_v2: raw regeneration failed for idx %d (%s)",
+                                   idx, exc)
+                    fhr_win = up_win = (np.full(win_len, np.nan, np.float32)
+                                        if win_len else None)
+                if fhr_win is not None:
                     sample["fhr"] = torch.from_numpy(np.asarray(fhr_win, dtype=np.float32))
                     sample["up"] = torch.from_numpy(np.asarray(up_win, dtype=np.float32))
-                except Exception as exc:  # noqa: BLE001 -- raw is a plotting nicety, never fatal
-                    logger.warning(
-                        "dataset_v2: raw regeneration failed for idx %d (%s); "
-                        "skipping raw panel.", idx, exc,
-                    )
         sample["guid"] = f"{self._tag}_{self.split}_{idx:06d}"
         return sample
 

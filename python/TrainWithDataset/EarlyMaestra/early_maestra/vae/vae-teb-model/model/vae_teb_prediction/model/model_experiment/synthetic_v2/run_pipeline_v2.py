@@ -225,6 +225,7 @@ def scatter_preview(
     out_stem = _results_dir(config, benchmark) / "figures" / "scattering_heatmap_preview"
     figures = plot_scattering_heatmap(
         fields["fhr_st"], fields["up_st"], out_stem,
+        fhr_ph=fields["fhr_ph"], up_ph=fields["up_ph"],
         coupled_idx=idx, center_freqs=adapter.center_freqs_np, fs=adapter.fs,
     )
 
@@ -277,10 +278,14 @@ def data_previews(
         ScatteringAdapter,
     )
     from model.vae_teb_prediction.model.model_experiment.synthetic_v2.visualize_v2 import (
+        plot_am_separation,
+        plot_band_spectra,
         plot_latent_am_decomposition,
+        plot_latent_coupling,
         plot_raw_preview,
         plot_raw_scatter_paired,
         plot_scattering_heatmap,
+        plot_te_authoring,
     )
 
     bench = config["benchmarks"][benchmark]
@@ -306,10 +311,12 @@ def data_previews(
 
     written: List[Any] = []
     written += plot_raw_preview(
-        raw["fhr_raw"], raw["up_raw"], figs_dir / "raw_preview", meta=prev_meta, fs=adapter.fs
+        raw["fhr_raw"], raw["up_raw"], figs_dir / "raw_preview", meta=prev_meta, fs=adapter.fs,
+        fhr_ph=fields["fhr_ph"], up_ph=fields["up_ph"],
     )
     written += plot_scattering_heatmap(
         fields["fhr_st"], fields["up_st"], figs_dir / "scattering_heatmap",
+        fhr_ph=fields["fhr_ph"], up_ph=fields["up_ph"],
         coupled_idx=idx, center_freqs=adapter.center_freqs_np, fs=adapter.fs,
     )
     written += plot_latent_am_decomposition(
@@ -322,14 +329,38 @@ def data_previews(
         latent_c=raw["latents"]["c"], latent_d=raw["latents"]["d"],
         center_freqs=adapter.center_freqs_np, fs=adapter.fs, meta=meta,
     )
+
+    # Data-generation *story* figures (the controls behind the previews above): the
+    # frequency recipe (§4-§5), the coupling pathway / lag (§6), the carrier de-risk
+    # (§7), and the TE control law (§9). All four are self-contained from this single
+    # strong cell + ``config`` -- no realizability preflight required; ``te_authoring``
+    # is the only one that runs its own (modest) Monte-Carlo.
+    horizon = int(config["model"]["horizon"])
+    written += plot_band_spectra(
+        raw["fhr_raw"], raw["up_raw"], figs_dir / "band_spectra", fs=adapter.fs, meta=meta,
+    )
+    written += plot_latent_coupling(
+        raw["latents"], figs_dir / "latent_coupling", D=delay, horizon=horizon, fs=adapter.fs,
+    )
+    written += plot_am_separation(
+        config, figs_dir / "am_separation", benchmark=benchmark,
+    )
+    written += plot_te_authoring(
+        config, figs_dir / "te_authoring", benchmark=benchmark, delay=delay,
+    )
+
     if include_null:
         raw0 = generate_cell_raw(
             max(2, n // 2), B=0.0, D=delay, config=config, benchmark=benchmark,
             seed=seed + 1, te_inj=0.0, render_mode=render_mode,
         )
+        # Transform the null cell too so its raw preview also carries the phase-harmonic
+        # panels -- the contrast (coupling present vs absent) is the point of the null.
+        fields0, _ = adapter.transform_and_normalise(raw0["fhr_raw"], raw0["up_raw"])
         written += plot_raw_preview(
             raw0["fhr_raw"], raw0["up_raw"], figs_dir / "raw_preview_null",
             meta={"te_inj": 0.0, "D": delay, "B": 0.0, "f_pulse": f_pulse}, fs=adapter.fs,
+            fhr_ph=fields0["fhr_ph"], up_ph=fields0["up_ph"],
         )
 
     print(f"[data-previews] strong cell target_te={target_te:g} D={delay} "
