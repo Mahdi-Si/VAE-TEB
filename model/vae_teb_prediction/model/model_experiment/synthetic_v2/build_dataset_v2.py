@@ -354,93 +354,109 @@ def make_raw_provider(
     actually plotted (:func:`run_pipeline_v2.run_test_plots` stops at ``analysis_samples``)
     trigger a regeneration, so at most a few cells are ever rebuilt.
 
-    The authoritative build manifest (``meta.json``: the exact solved $B$, the built
-    ``n_per_cell``, and ``seeds``) is used when present, so the regenerated raw matches what was
-    actually cached even if ``config`` has since changed (e.g. a bigger grid); a fresh
-    deterministic :func:`enumerate_cells_v2` is the fallback.
+    **Fully cache-authoritative.** Because :func:`raw_generators.generate_cell_raw` scales the
+    AM envelope by the *batch-pooled* latent std, a row's raw amplitude depends on the ``n``
+    passed to it — so regenerating with a different ``n`` than the build used would silently
+    rescale the waveform. This provider therefore takes the per-cell ``n`` from the **cache's own
+    row counts** (``sample_cell_id`` bincount), the solved $B$ / seeds / render mode / ``n_raw``
+    (window geometry) from ``meta.json``, and **refuses to build** (raises) when either is missing
+    — :func:`run_pipeline_v2.run_test_plots` then simply omits the raw panel rather than plotting a
+    waveform inconsistent with the row's cached features. The live ``config`` is used only for the
+    generation-invariant latent/raw physics (oscillators, ``f_pulse``, band powers), which the
+    normal build → plot workflow does not change without a rebuild.
 
     Args:
         config: The parsed ``config_synth_v2.yaml`` tree.
         split: The cache split the rows come from (``test`` / ``val`` / ``train``); selects the
-            generation seed offset and the ``n_per_cell`` count.
+            generation seed offset and the split's ``.npz``.
         benchmark: Active benchmark key under ``benchmarks``.
-        cache_dir: Override for the cache directory holding ``meta.json`` (defaults to
-            :func:`resolve_cache_dir`).
+        cache_dir: Override for the cache directory holding ``meta.json`` + ``<split>.npz``
+            (defaults to :func:`resolve_cache_dir`).
 
     Returns:
-        A callable ``provider(cell_id, raw_index) -> (fhr_win, up_win)`` returning two 1-D
-        ``float32`` arrays in physical units (bpm / mmHg). Raises :class:`KeyError` for an
-        unknown ``cell_id`` or an out-of-range ``raw_index``.
+        A **total** callable ``provider(cell_id, raw_index) -> (fhr_win, up_win)`` returning two
+        1-D ``float32`` arrays of length ``n_raw - 2·TRIM_STEPS·DECIMATION`` in physical units
+        (bpm / mmHg); on any failure (unknown cell / out-of-range row / regen error) it returns a
+        NaN-filled window of the same length rather than raising, so a batch never ends up with
+        inconsistent keys. The returned function carries a ``window_length`` attribute.
+
+    Raises:
+        FileNotFoundError / ValueError / KeyError: At construction, when ``meta.json`` or the
+            split ``.npz`` (with ``sample_cell_id``) is absent/unusable — raw is then unavailable.
     """
     from .raw_generators import DECIMATION
     from .scattering_adapter import TRIM_STEPS
 
-    bench = config["benchmarks"][benchmark]
-    n_raw = int(bench["raw"]["n_raw"])
-    win = slice(int(TRIM_STEPS) * int(DECIMATION), n_raw - int(TRIM_STEPS) * int(DECIMATION))
-
-    cells_by_id: Dict[int, CellV2] = {}
-    n_per_cell: Optional[int] = None
-    base_seed: Optional[int] = None
-    render_mode: Optional[str] = None
-
     cdir = resolve_cache_dir(config, benchmark=benchmark) if cache_dir is None else Path(cache_dir)
-    meta_path = cdir / "meta.json"
-    if meta_path.is_file():
-        try:
-            with open(meta_path, "r", encoding="utf-8") as handle:
-                meta = json.load(handle)
-            for c in meta.get("cells", []) or []:
-                cid = int(c["cell_id"])
-                cells_by_id[cid] = CellV2(
-                    cell_id=cid,
-                    target_te=float(c.get("target_te", 0.0)),
-                    D=int(c["D"]),
-                    B_y_scalar=float(c.get("B_y_scalar", 0.0)),
-                    te_block_realised=float(
-                        c.get("te_block_realised", c.get("te_inj", 0.0))
-                    ),
-                )
-            n_meta = (meta.get("n_per_cell", {}) or {}).get(split)
-            n_per_cell = int(n_meta) if n_meta is not None else None
-            seeds_meta = meta.get("seeds", {}) or {}
-            base_seed = int(seeds_meta.get("dgp", seeds_meta.get("base_seed", 0))) \
-                if seeds_meta else None
-            render_mode = meta.get("render_mode")
-        except Exception as exc:  # noqa: BLE001 -- fall back to a fresh enumeration below
-            logger.warning("make_raw_provider: meta.json unusable (%s); re-enumerating.", exc)
-            cells_by_id = {}
 
+    meta_path = cdir / "meta.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"make_raw_provider: no meta.json under {cdir}")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    cells_by_id: Dict[int, CellV2] = {}
+    for c in meta.get("cells", []) or []:
+        cid = int(c["cell_id"])
+        cells_by_id[cid] = CellV2(
+            cell_id=cid, target_te=float(c.get("target_te", 0.0)), D=int(c["D"]),
+            B_y_scalar=float(c.get("B_y_scalar", 0.0)),
+            te_block_realised=float(c.get("te_block_realised", c.get("te_inj", 0.0))),
+        )
     if not cells_by_id:
-        cells, _ = enumerate_cells_v2(config, benchmark=benchmark)
-        cells_by_id = {int(c.cell_id): c for c in cells}
-    if n_per_cell is None:
-        n_per_cell = int(bench["mix"][f"n_per_cell_{split}"])
+        raise ValueError(f"make_raw_provider: meta.json under {cdir} has no cells")
+    seeds_meta = meta.get("seeds", {}) or {}
+    base_seed = int(seeds_meta.get("dgp", seeds_meta.get("base_seed", 0)))
+    render_mode = meta.get("render_mode")
+    # Window geometry from the manifest's raw block (authoritative), not the live config.
+    n_raw = int(((meta.get("raw") or {}).get("n_raw"))
+                or config["benchmarks"][benchmark]["raw"]["n_raw"])
+    win = slice(int(TRIM_STEPS) * int(DECIMATION), n_raw - int(TRIM_STEPS) * int(DECIMATION))
+    win_len = int(win.stop - win.start)
+
+    # Per-cell sample count straight from the cache: the number of rows stamped with each
+    # cell_id equals the n the build passed to generate_cell_raw for that (cell, split), so the
+    # pooled-std AM amplitude (and thus the row's raw) is reproduced exactly.
+    split_npz = cdir / f"{split}.npz"
+    if not split_npz.is_file():
+        raise FileNotFoundError(f"make_raw_provider: no {split}.npz under {cdir}")
+    with np.load(split_npz) as npz:
+        if "sample_cell_id" not in npz.files:
+            raise KeyError(f"make_raw_provider: {split}.npz lacks sample_cell_id")
+        cell_ids = np.asarray(npz["sample_cell_id"]).astype(np.int64)
+    n_by_cell = {int(cid): int(np.count_nonzero(cell_ids == cid))
+                 for cid in np.unique(cell_ids)}
 
     cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    nan_win = np.full(win_len, np.nan, dtype=np.float32)
 
     def provider(cell_id: int, raw_index: int) -> Tuple[np.ndarray, np.ndarray]:
-        cid = int(cell_id)
-        if cid not in cells_by_id:
-            raise KeyError(f"make_raw_provider: unknown cell_id {cid}")
-        if cid not in cache:
-            raw = generate_pilot_samples(
-                cells_by_id[cid], int(n_per_cell), split, config,
-                benchmark=benchmark, base_seed=base_seed, render_mode=render_mode,
-            )
-            cache[cid] = (
-                np.ascontiguousarray(raw["fhr_raw"], dtype=np.float32),
-                np.ascontiguousarray(raw["up_raw"], dtype=np.float32),
-            )
-        fhr_all, up_all = cache[cid]
-        ri = int(raw_index)
-        if not 0 <= ri < fhr_all.shape[0]:
-            raise KeyError(
-                f"make_raw_provider: raw_index {ri} out of range for cell {cid} "
-                f"(n_per_cell={fhr_all.shape[0]})"
-            )
-        return fhr_all[ri, win].copy(), up_all[ri, win].copy()
+        r"""Return the (fhr, up) analysis window for one row; a NaN window on any failure."""
+        cid, ri = int(cell_id), int(raw_index)
+        try:
+            if cid not in cells_by_id or cid not in n_by_cell:
+                raise KeyError(f"unknown cell_id {cid}")
+            if cid not in cache:
+                raw = generate_pilot_samples(
+                    cells_by_id[cid], int(n_by_cell[cid]), split, config,
+                    benchmark=benchmark, base_seed=base_seed, render_mode=render_mode,
+                )
+                # Retain only the trimmed analysis window (drop the 15-step/end edges).
+                cache[cid] = (
+                    np.ascontiguousarray(raw["fhr_raw"][:, win], dtype=np.float32),
+                    np.ascontiguousarray(raw["up_raw"][:, win], dtype=np.float32),
+                )
+            fhr_all, up_all = cache[cid]
+            if not 0 <= ri < fhr_all.shape[0]:
+                raise IndexError(
+                    f"raw_index {ri} out of range for cell {cid} (n={fhr_all.shape[0]})"
+                )
+            return fhr_all[ri].copy(), up_all[ri].copy()
+        except Exception as exc:  # noqa: BLE001 -- raw is a plotting nicety; degrade to blank
+            logger.warning("make_raw_provider: raw unavailable for (cell=%d, row=%d): %s",
+                           cid, ri, exc)
+            return nan_win.copy(), nan_win.copy()
 
+    provider.window_length = win_len  # type: ignore[attr-defined]
     return provider
 
 

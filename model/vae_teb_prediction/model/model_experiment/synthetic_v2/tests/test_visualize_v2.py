@@ -12,6 +12,8 @@ Test selection (``-k``):
     * ``metadata_bridge`` / ``sample_te`` -- standard-testing TE bridge (S7-T06)
     * ``aggregate`` / ``te_columns`` -- TE-aware aggregate figures (S7-T08)
     * ``report``           -- final report assembly (S7-T05)
+    * ``spectra`` / ``authoring`` / ``coupling`` / ``separation`` -- data-generation
+      story figures (band recipe §4-5, TE authoring §9, latent coupling §6, AM separation §7)
 """
 
 from __future__ import annotations
@@ -105,6 +107,28 @@ def test_raw_preview_writes_pdf_and_png(tmp_path: Path) -> None:
     assert {p.suffix for p in map(Path, out)} == {".pdf", ".png"}
 
 
+def test_raw_preview_with_phase_harmonics(tmp_path: Path) -> None:
+    r"""[raw] Supplying the phase-harmonic fields adds the heatmap panels and still writes.
+
+    Exercises the four-panel path (two raw traces + two ``bwr`` phase-harmonic heatmaps);
+    the fields are tiny random z-scored stand-ins (the real transform is covered by the
+    slow scattering-adapter test).
+    """
+    rng = np.random.default_rng(3)
+    n_raw, t_dec = 1200, 300
+    fhr = 140.0 + 5.0 * rng.standard_normal(n_raw)
+    up = 15.0 + 3.0 * rng.standard_normal(n_raw)
+    fhr_ph = rng.standard_normal((t_dec, 44)).astype(np.float32)
+    up_ph = rng.standard_normal((t_dec, 58)).astype(np.float32)
+    out = viz.plot_raw_preview(
+        fhr, up, tmp_path / "raw_preview_ph",
+        meta={"te_inj": 2.0, "D": 8, "B": 1.23, "f_pulse": 0.06},
+        fhr_ph=fhr_ph, up_ph=up_ph,
+    )
+    _assert_written(out)
+    assert {p.suffix for p in map(Path, out)} == {".pdf", ".png"}
+
+
 # ---------------------------------------------------------------------------
 # S7-T02: raw + scattering paired preview
 # ---------------------------------------------------------------------------
@@ -169,6 +193,53 @@ def test_latent_am_decomposition_writes(tmp_path: Path, render_mode: str) -> Non
     out = viz.plot_latent_am_decomposition(
         out_gen["latents"], tmp_path / f"decomp_{render_mode}",
         f_pulse=out_gen["meta"]["f_pulse"], meta=out_gen["meta"],
+    )
+    _assert_written(out)
+
+
+# ---------------------------------------------------------------------------
+# Data-generation story figures (the controls): band recipe / TE authoring /
+# latent coupling / AM separation
+# ---------------------------------------------------------------------------
+
+
+def test_band_spectra_writes(tmp_path: Path) -> None:
+    r"""[spectra] The band-recipe Welch-PSD figure writes a PDF and a 600-dpi PNG."""
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import (
+        raw_generators as rg,
+    )
+    gen = rg.generate_cell_raw(2, B=1.5, D=8, config=_tiny_config(), seed=0, te_inj=2.0)
+    out = viz.plot_band_spectra(
+        gen["fhr_raw"], gen["up_raw"], tmp_path / "band_spectra",
+        fs=gen["meta"]["fs"], meta=gen["meta"],
+    )
+    _assert_written(out)
+    assert {p.suffix for p in map(Path, out)} == {".pdf", ".png"}
+
+
+def test_latent_coupling_writes(tmp_path: Path) -> None:
+    r"""[coupling] The coupling-pathway + lag figure writes a PDF and a PNG."""
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import (
+        raw_generators as rg,
+    )
+    gen = rg.generate_cell_raw(3, B=1.5, D=8, config=_tiny_config(), seed=0, te_inj=2.0)
+    out = viz.plot_latent_coupling(
+        gen["latents"], tmp_path / "latent_coupling", D=8, horizon=30, fs=gen["meta"]["fs"],
+    )
+    _assert_written(out)
+
+
+def test_am_separation_writes(tmp_path: Path) -> None:
+    r"""[separation] The AM-separation carrier de-risk figure writes a PDF and a PNG (analytic, fast)."""
+    out = viz.plot_am_separation(_tiny_config(), tmp_path / "am_separation")
+    _assert_written(out)
+
+
+def test_te_authoring_writes(tmp_path: Path) -> None:
+    r"""[authoring] The TE-authoring figure writes a PDF and a PNG (tiny B-sweep + MC to stay fast)."""
+    out = viz.plot_te_authoring(
+        _tiny_config(), tmp_path / "te_authoring", delay=8, n_b=3, n_samples=400,
+        target_te_grid=[0.0, 1.0],
     )
     _assert_written(out)
 

@@ -1801,8 +1801,12 @@ def run_eval(
 
     # Persist the length-N per-sample arrays (kept out of metrics.json, which stays per-cell).
     # These back the per-sample TE-vs-KLD scatter and the per-lag calibration figures, so the
-    # analysis is no longer collapsed to ~15 cell means before plotting.
-    _write_per_sample_eval(arrs, out_dir, used_split, controls)
+    # analysis is no longer collapsed to ~15 cell means before plotting. Guarded + non-fatal:
+    # a diagnostic side-car must never abort the eval or lose the primary metrics.json.
+    try:
+        _write_per_sample_eval(arrs, out_dir, used_split, controls)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("run_eval: per_sample_eval.npz not written (%s)", exc)
 
     calibration = fit_calibration(arrs)
     cells_by_id = _cells_by_id_from_arrs(arrs)
