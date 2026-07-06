@@ -4,7 +4,7 @@ For each fold ``k`` and partition ``p ∈ {train, val, test}`` this script:
 
 1. Builds a segment-level :class:`CombinedHDF5Dataset` over the fold's HDF5
    files with the same filters the classifier will use.
-2. Loads :class:`SeqVaeLagAttnV1` with the pretrained checkpoint.
+2. Loads :class:`SeqVaeLagAttn` with the pretrained checkpoint.
 3. (For the train partition only) runs ``vae.fit_latent_stats`` to obtain
    exact per-fold ``mu_post`` mean / variance.
 4. Iterates the segment loader and calls ``vae.encode_only`` with
@@ -49,7 +49,11 @@ from hdf5_dataset.hdf5_dataset import (
     CombinedHDF5Dataset,
     attribute_dict_collate,
 )
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# The checkpoint model-class guard lives with v2; importing it is version-agnostic.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
 from train.graph_models_utils import load_checkpoint_strict
 
 
@@ -268,8 +272,8 @@ def get_fold_partition_files(
 def build_vae_from_config(
     config: Dict[str, Any],
     device: torch.device,
-) -> SeqVaeLagAttnV1:
-    """Instantiate ``SeqVaeLagAttnV1`` and load the pretrained checkpoint.
+) -> SeqVaeLagAttn:
+    """Instantiate ``SeqVaeLagAttn`` and load the pretrained checkpoint.
 
     Args:
         config: Parsed classifier config (top-level dict).
@@ -295,11 +299,16 @@ def build_vae_from_config(
         model_kwargs["logvar_clamp"] = (float(lv[0]), float(lv[1]))
 
     logger.info(
-        "Building SeqVaeLagAttnV1 with kwargs: "
+        "Building SeqVaeLagAttn with kwargs: "
         + ", ".join(f"{k}={v}" for k, v in model_kwargs.items())
     )
-    model = SeqVaeLagAttnV1(**model_kwargs)
-    load_checkpoint_strict(model=model, checkpoint=ckpt_path)
+    # Guard the checkpoint's stored class against the active alias BEFORE building,
+    # so a v1<->v2 mismatch fails with an actionable message instead of a cryptic
+    # state_dict key error. Deserialise once and hand the blob to the strict load.
+    blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    check_model_class(blob, SeqVaeLagAttn.__name__)
+    model = SeqVaeLagAttn(**model_kwargs)
+    load_checkpoint_strict(model=model, checkpoint=blob)
     logger.info(f"Loaded VAE weights from {ckpt_path}")
 
     model.to(device)
@@ -419,7 +428,7 @@ def _segment_keep_mask(epochs: np.ndarray) -> np.ndarray:
 
 def precompute_partition(
     *,
-    vae: SeqVaeLagAttnV1,
+    vae: SeqVaeLagAttn,
     files: Sequence[str],
     config: Dict[str, Any],
     cache_path: Path,
@@ -1076,7 +1085,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         Exit code (0 on success).
     """
     parser = argparse.ArgumentParser(
-        description="Precompute SeqVaeLagAttnV1 latents per fold for guid_cls_v1"
+        description="Precompute SeqVaeLagAttn latents per fold for guid_cls_v1"
     )
     parser.add_argument("--config", required=True, help="Path to YAML config")
     grp = parser.add_mutually_exclusive_group(required=True)

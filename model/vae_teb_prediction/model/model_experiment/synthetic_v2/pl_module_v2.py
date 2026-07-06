@@ -1,4 +1,4 @@
-r"""Lightning wrapper + training driver for ``SeqVaeLagAttnV1`` on ``synthetic_v2``.
+r"""Lightning wrapper + training driver for ``SeqVaeLagAttn`` on ``synthetic_v2``.
 
 Sprint 5 (S5-T01/T02/T03/T04). This module trains the **unchanged** VAE-TEB
 lag-attention model on the cached ``synthetic_v2`` splits and is the analogue of the
@@ -32,6 +32,7 @@ See ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprint 5 and
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -59,7 +60,9 @@ import torch.distributed as dist  # noqa: E402
 import torch.nn as nn  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1  # noqa: E402
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn  # noqa: E402
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn  # noqa: E402
 from train.graph_models_utils import load_checkpoint_strict  # noqa: E402
 from train.pl_model_base import LightningModelBase  # noqa: E402
 
@@ -119,7 +122,7 @@ def _resolve_epoch_metric(name: str) -> str:
 # Lightning module (S5-T01)
 # ============================================================================
 class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
-    r"""Lightning wrapper for :class:`SeqVaeLagAttnV1` on ``synthetic_v2`` TE data.
+    r"""Lightning wrapper for :class:`SeqVaeLagAttn` on ``synthetic_v2`` TE data.
 
     Reads the four model-facing fields from each batch and calls
     ``orig_model.compute_loss`` with the synthetic calibration knobs, so a run
@@ -158,8 +161,10 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         sigma_obs: "float | str" = 1.0,
         free_bits: float = 0.0,
         detach_baseline_in_full: bool = False,
+        lambda_lag: float = 0.0,
         warmup_epochs: int = 0,
         loss_spike_skip: Optional[Dict[str, Any]] = None,
+        curriculum: Optional[Dict[str, Any]] = None,
         module_name: Optional[str] = None,
     ) -> None:
         r"""Initialize the wrapper while bypassing ``torch.compile``.
@@ -171,7 +176,7 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         skipped).
 
         Args:
-            base_model: The :class:`SeqVaeLagAttnV1` instance to wrap.
+            base_model: The :class:`SeqVaeLagAttn` instance to wrap.
             lr: Learning rate (already LR-scaled by the caller for DDP).
             lr_milestones: Epoch milestones for the post-warmup ``MultiStepLR``.
             lr_gamma: Multiplicative decay applied at each milestone.
@@ -204,8 +209,10 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
                 "sigma_obs": sigma_obs,
                 "free_bits": free_bits,
                 "detach_baseline_in_full": detach_baseline_in_full,
+                "lambda_lag": lambda_lag,
                 "warmup_epochs": warmup_epochs,
                 "loss_spike_skip": loss_spike_skip,
+                "curriculum": curriculum,
                 "module_name": module_name,
             }
         )
@@ -217,6 +224,36 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         self._spike_ema_loss: Optional[float] = None
         self._spike_batches_seen: int = 0
         self._spike_skips_total: int = 0
+
+    def _apply_curriculum(self, epoch: int) -> Optional[float]:
+        r"""Apply the v2 curriculum stage for ``epoch`` and return its $\beta$.
+
+        Reads the ``curriculum`` hparam (``{enabled, stages}``); when enabled and
+        the wrapped model supports it (v2), calls
+        ``model.set_curriculum_stage(epoch, stages)`` to flip the branch flags and
+        ``active_lags`` in place and writes the resolved per-epoch $\beta$ into
+        ``self.hparams['kld_beta']`` (read verbatim by
+        :meth:`compute_loss_and_metrics`). A no-op for v1 or when disabled.
+
+        Args:
+            epoch: The epoch whose stage to apply (``self.current_epoch``).
+
+        Returns:
+            The resolved $\beta$, or ``None`` when the curriculum is inactive.
+        """
+        cur = self.hparams.get("curriculum")
+        if not isinstance(cur, dict) or not cur.get("enabled", False):
+            return None
+        stages = cur.get("stages")
+        if not stages or not hasattr(self.orig_model, "set_curriculum_stage"):
+            return None
+        beta = float(self.orig_model.set_curriculum_stage(int(epoch), stages))
+        self.hparams["kld_beta"] = beta
+        return beta
+
+    def _on_train_epoch_start_hook(self) -> None:
+        """Apply the curriculum stage at the start of each training epoch."""
+        self._apply_curriculum(self.current_epoch)
 
     # ------------------------------------------------------------------
     # Loss / metrics
@@ -255,6 +292,7 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             sigma_obs=hp["sigma_obs"],
             free_bits=float(hp["free_bits"]),
             detach_baseline_in_full=bool(hp["detach_baseline_in_full"]),
+            lambda_lag=float(hp.get("lambda_lag", 0.0)),
         )
         total_loss = loss_dict["total_loss"]
         pred_gap = loss_dict["base_loss"] - loss_dict["feat_loss"]
@@ -264,10 +302,17 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             "feat_loss": loss_dict["feat_loss"],
             "base_loss": loss_dict["base_loss"],
             "kld_loss": loss_dict["kld_loss"],
-            # Dim-summed KL in nats/step ($\mathrm{KL} = \sum_d \mathrm{KL}_d$) --
-            # the scale of the TE surrogate $\bar K$, vs the per-dim ``kld_loss``.
-            "kld_nats": loss_dict["kld_loss"]
-            * float(forward_outputs["mu_post"].shape[-1]),
+            # KL in nats/step (the scale of the TE surrogate $\bar K$). v1's
+            # ``kld_loss`` is a per-dim mean, so nats/step $= \mathrm{kld\_loss}
+            # \cdot d_z$. v2's ``kld_loss`` is already summed over heads and latent
+            # dims (nats/step), so it is used directly; v2 is detected by its
+            # decomposed-KL return keys.
+            "kld_nats": (
+                loss_dict["kld_loss"]
+                if "kld_content_loss" in loss_dict
+                else loss_dict["kld_loss"]
+                * float(forward_outputs["mu_post"].shape[-1])
+            ),
             "pred_gap": pred_gap,
             "mu_prior_sat_frac": forward_outputs["mu_prior_sat_frac"],
             "delta_mu_sat_frac": forward_outputs["delta_mu_sat_frac"],
@@ -275,6 +320,28 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             "mean_logvar_base": loss_dict.get("mean_logvar_base"),
             "kld_beta": float(hp["kld_beta"]),
         }
+
+        # --- v2-only diagnostics (S7-T03), key-presence guarded -------------
+        # ``delta_l`` is the production ``pred_gap`` under a different name; add
+        # it so the synthetic side logs the section-26 gain too. The rest are
+        # emitted only when the v2 model provides them (no-op under v1).
+        metrics["delta_l"] = loss_dict.get("delta_l", pred_gap)
+        for _k in ("kld_lag_loss", "kld_content_loss", "kld_content_raw",
+                   "r_lag", "rms_src", "lag_tv", "lag_entropy_reg"):
+            _v = loss_dict.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
+        for _k in ("lag_entropy", "n_active"):
+            _v = forward_outputs.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
+        _exp_lag = forward_outputs.get("expected_lag")
+        if _exp_lag is not None:
+            metrics["expected_lag_mean"] = _exp_lag.mean()
+            if hasattr(self.orig_model, "expected_lag_seconds"):
+                metrics["expected_lag_sec_mean"] = (
+                    self.orig_model.expected_lag_seconds(_exp_lag).mean()
+                )
         return total_loss, metrics
 
     # ------------------------------------------------------------------
@@ -402,25 +469,57 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
 # ============================================================================
 def build_model(
     model_cfg: Dict[str, Any], device: torch.device
-) -> Tuple[SeqVaeLagAttnV1, Dict[str, Any]]:
-    r"""Construct :class:`SeqVaeLagAttnV1` from the ``model`` config block.
+) -> Tuple[SeqVaeLagAttn, Dict[str, Any]]:
+    r"""Construct :class:`SeqVaeLagAttn` from the ``model`` config block.
+
+    The block is a 1:1 map of the keyword-only constructor arguments. Two extra
+    conventions make it a version-robust drop-in for the ``SeqVaeLagAttn``
+    comment-toggle alias:
+
+    * A nested ``v2`` sub-block holds the v2-only tuning (``use_entmax``, the
+      source lag-atom scales, the model-owned lag-regularizer weights, the
+      physical-time and optional-feature flags). It is merged over the flat keys
+      **only when the active alias is v2** (detected by the ``source_scales``
+      constructor parameter) and is always stripped before construction, so the
+      shared block stays a clean v1 reproduction when the alias is v1.
+    * Any remaining key the active constructor does not accept is dropped (with a
+      debug log), mirroring the production trainer's ``inspect.signature`` guard,
+      so a superset config never raises a bare ``TypeError``.
 
     Args:
-        model_cfg: The ``model`` block -- a 1:1 map of the keyword-only
-            constructor arguments (``c_y=87`` / ``c_u=101`` for the v2 features).
+        model_cfg: The ``model`` block (flat v1 kwargs plus an optional nested
+            ``v2`` overlay). ``c_y=87`` / ``c_u=101`` for the v2 features.
         device: Device to move the model onto.
 
     Returns:
         ``(model, model_kwargs)`` where ``model_kwargs`` is the exact resolved
-        constructor kwargs (stored verbatim in the checkpoint so downstream phases
-        rebuild the architecture without the config).
+        (flat, overlay-merged, signature-filtered) constructor kwargs, stored
+        verbatim in the checkpoint so downstream phases rebuild the architecture
+        without the config.
     """
     kwargs = deepcopy(dict(model_cfg))
+    # Strip the nested v2 overlay (never a constructor arg) and merge it only when
+    # the active alias class is v2. A rebuild from a checkpoint's flat
+    # ``model_kwargs`` carries no ``v2`` key, so this is a no-op there.
+    v2_overlay = kwargs.pop("v2", None)
+    accepted = set(inspect.signature(SeqVaeLagAttn.__init__).parameters)
+    if v2_overlay and "source_scales" in accepted:
+        kwargs.update(deepcopy(dict(v2_overlay)))
+    # Drop any key the active constructor does not accept (e.g. v2-only keys under
+    # a v1 alias). Keeps the shared config a superset without a TypeError.
+    dropped = [k for k in kwargs if k not in accepted]
+    for key in dropped:
+        del kwargs[key]
+    if dropped:
+        logger.debug(
+            "[build_model] dropped {} config key(s) not accepted by {}: {}",
+            len(dropped), SeqVaeLagAttn.__name__, dropped,
+        )
     # YAML gives ``logvar_clamp`` as a list; the constructor expects a tuple.
     clamp = kwargs.get("logvar_clamp")
     if clamp is not None:
         kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
-    model = SeqVaeLagAttnV1(**kwargs)
+    model = SeqVaeLagAttn(**kwargs)
     model.to(device)
     return model, kwargs
 
@@ -462,6 +561,7 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
         )
     free_bits = float(loss_cfg.get("free_bits", 0.0))
     detach_baseline_in_full = bool(loss_cfg.get("detach_baseline_in_full", False))
+    lambda_lag = float(loss_cfg.get("lag_smoothness_lambda", 0.0))
     return {
         "beta": beta,
         "lambda_full": lambda_full,
@@ -470,6 +570,7 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "sigma_obs": sigma_obs,
         "free_bits": free_bits,
         "detach_baseline_in_full": detach_baseline_in_full,
+        "lambda_lag": lambda_lag,
     }
 
 
@@ -500,9 +601,9 @@ def _batch_to_inputs(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tens
 
 
 def _maybe_fit_latent_stats(
-    model: SeqVaeLagAttnV1, loader: Any, device: torch.device
+    model: SeqVaeLagAttn, loader: Any, device: torch.device
 ) -> int:
-    r"""Run :meth:`SeqVaeLagAttnV1.fit_latent_stats` over the training set.
+    r"""Run :meth:`SeqVaeLagAttn.fit_latent_stats` over the training set.
 
     Replaces the noisy EMA ``mu_post_running_*`` buffers with exact statistics.
     Non-fatal: returns ``0`` on any failure (or if the method is absent) so the
@@ -532,7 +633,7 @@ def _maybe_fit_latent_stats(
 def save_checkpoint_v2(
     path: Path,
     *,
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     model_kwargs: Dict[str, Any],
     config: Dict[str, Any],
     data_meta: Dict[str, Any],
@@ -546,7 +647,7 @@ def save_checkpoint_v2(
 
     The bare (unprefixed) ``state_dict`` is stored under ``model_state_dict`` -- the
     key :func:`train.graph_models_utils.load_checkpoint_strict` scans for. A
-    downstream phase rebuilds the model via ``SeqVaeLagAttnV1(**model_kwargs)`` then
+    downstream phase rebuilds the model via ``SeqVaeLagAttn(**model_kwargs)`` then
     loads this file ``strict=True``. The write is atomic (temp + ``os.replace``).
 
     Args:
@@ -562,7 +663,18 @@ def save_checkpoint_v2(
             vs. the noisy EMA buffers.
         train_metrics: Optional last-epoch training metrics.
     """
+    # Persist the CURRENT runtime curriculum state. active_lags / enable_* are
+    # constructor params but are mutated in place per-epoch by the curriculum and
+    # are NOT part of the state_dict, so refresh model_kwargs from the live model
+    # to keep a rebuilt (SeqVaeLagAttn(**model_kwargs)) model faithful to the stage
+    # the weights were trained under. No-op for v1 (attributes absent).
+    model_kwargs = dict(model_kwargs)
+    for _key in ("active_lags", "enable_source", "enable_residual", "enable_kl"):
+        if hasattr(model, _key):
+            model_kwargs[_key] = getattr(model, _key)
+
     ckpt = {
+        "model_class": type(model).__name__,
         "model_state_dict": model.state_dict(),
         "model_kwargs": model_kwargs,
         "config": config,
@@ -788,8 +900,21 @@ def train_v2(
 
     resume = overrides.get("resume_ckpt")
     if resume:
+        from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (
+            check_model_class,
+        )
+
         logger.info("[train_v2] warm-starting from {}", resume)
-        load_checkpoint_strict(model, str(resume), map_location="cpu")
+        # Guard the model class BEFORE the strict load so a v1<->v2 mismatch fails
+        # with an actionable message instead of a cryptic state_dict key error.
+        blob = torch.load(str(resume), map_location="cpu", weights_only=False)
+        check_model_class(blob, SeqVaeLagAttn.__name__)
+        if load_checkpoint_strict(model, blob) is None:
+            raise RuntimeError(
+                f"could not align resume checkpoint {resume!r} into "
+                f"{SeqVaeLagAttn.__name__} (no matching module keys); refusing "
+                f"to silently train from random initial weights."
+            )
 
     pl_model = SyntheticSeqVaeLagAttnV2Pl(
         model,
@@ -804,8 +929,12 @@ def train_v2(
         sigma_obs=loss_settings["sigma_obs"],
         free_bits=loss_settings["free_bits"],
         detach_baseline_in_full=loss_settings["detach_baseline_in_full"],
+        lambda_lag=loss_settings["lambda_lag"],
         warmup_epochs=int(ddp_cfg["warmup_epochs"]) if do_scale else 0,
         loss_spike_skip=config.get("loss_spike_skip"),
+        # Overrides win over config so callers (e.g. beta_select) can disable the
+        # curriculum for a fixed-beta run without mutating the shared config.
+        curriculum=overrides.get("curriculum", config.get("curriculum")),
     )
 
     batch_size = int(overrides.get("batch_size", optim_cfg["batch_size"]))
@@ -913,7 +1042,7 @@ def _export_best(
     best_path: Path,
     *,
     trainer: pl.Trainer,
-    fallback_model: SeqVaeLagAttnV1,
+    fallback_model: SeqVaeLagAttn,
     model_cfg: Dict[str, Any],
     model_kwargs: Dict[str, Any],
     config: Dict[str, Any],
@@ -927,7 +1056,7 @@ def _export_best(
     r"""Write ``best.ckpt`` from the Lightning best snapshot, else from the final model.
 
     When a validation split produced a :class:`ModelCheckpoint` best path, load it
-    into a fresh :class:`SeqVaeLagAttnV1` (stripping the Lightning wrapper prefixes
+    into a fresh :class:`SeqVaeLagAttn` (stripping the Lightning wrapper prefixes
     via :func:`load_checkpoint_strict`) and re-save it in the v2 format. Any failure
     falls back to saving the current in-memory model (i.e. ``best == final``).
     """
@@ -1020,6 +1149,10 @@ def beta_select(
             **overrides,
             "epochs": epochs,
             "loss": {**(overrides.get("loss") or {}), "kld_beta": beta},
+            # The sweep needs the swept beta to stick; the per-epoch curriculum
+            # hook would otherwise overwrite kld_beta every epoch, so disable it
+            # for these fixed-beta calibration runs.
+            "curriculum": {"enabled": False},
             "skip_checkpoint": True,
             "progress_bar": overrides.get("progress_bar", False),
         }

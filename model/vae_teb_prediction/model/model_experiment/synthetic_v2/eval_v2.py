@@ -1065,6 +1065,64 @@ def _corrupt_source(u_stream, mode: str, *, generator=None):
     raise ValueError(f"unknown null control mode: {mode!r}")
 
 
+# The per-sample KLD *summary* family (§14.5). Every entry is a model-free scalar
+# reduction of the ``forward`` KLD tensors over each sample's clean window
+# $\mathcal W_i$, giving several "flavours" of the surrogate $\bar K$ to correlate
+# against the transfer entropy. They fall in four groups:
+#
+#   * time-summaries of the total per-step KL $K_t$ = ``kld_per_t`` over $\mathcal W_i$:
+#     ``kbar`` (mean, the canonical surrogate), ``kbar_sum`` (integrated nats),
+#     ``kbar_max`` (peak coupling), ``kbar_median`` (robust centre), ``kbar_p90``
+#     (upper tail);
+#   * window variants (means of $K_t$ over a different support): ``kbar_full`` (all
+#     $T$ steps) and ``kbar_postwarm`` ($[w, T-H)$, warm-up excluded but WITHOUT the
+#     per-sample delay floor) -- isolate the effect of the averaging window;
+#   * directed-KL split of ``te_lag_map`` over the true lag band
+#     $\mathcal L^\star = \{\max(0, D-H), \dots, D-1\}$: ``kbar_inband`` (the KL the
+#     attention routes to the *correct* source lags) and ``kbar_outband`` (the rest;
+#     ``kbar_inband + kbar_outband == kbar`` because $\sum_\ell$ ``te_lag_map`` $= K_t$).
+#
+# The per-head split ``kld_per_t_per_head`` is stored separately as ``kbar_head``
+# $(N, \text{num\_heads})$ and expanded to ``kbar_head0 .. kbar_head{M-1}`` (which of
+# the contiguous latent groups carries the coupling). Keep this list, the
+# ``_write_per_sample_eval`` payload, :func:`fit_calibration`'s ``kld_variants`` block,
+# and ``visualize_v2`` in sync.
+KLD_SCALAR_VARIANTS: Tuple[str, ...] = (
+    "kbar", "kbar_sum", "kbar_max", "kbar_median", "kbar_p90",
+    "kbar_full", "kbar_postwarm", "kbar_inband", "kbar_outband",
+)
+
+
+def _row_window_reductions(x_bt: np.ndarray, valid_bt: np.ndarray) -> Dict[str, np.ndarray]:
+    r"""Per-row reductions of ``x_bt`` over each sample's boolean clean window (§14.5).
+
+    Reduces the $(B, T)$ per-step KL to several per-sample scalars, each over that row's
+    valid clean window $\mathcal W_i$ (the same mask :func:`_clean_window_mean` averages):
+    the integrated ``sum`` ($\sum_{t\in\mathcal W} K_t$, total nats), the ``max`` (peak
+    coupling), the robust ``median``, and the upper-tail ``p90``. A row with an empty
+    window gets ``nan``.
+
+    Args:
+        x_bt: Per-step values $(B, T)$ (e.g. ``kld_per_t``).
+        valid_bt: Boolean clean-window mask $(B, T)$.
+
+    Returns:
+        A dict of $(B,)$ ``float64`` arrays keyed ``sum`` / ``max`` / ``median`` / ``p90``.
+    """
+    B = int(x_bt.shape[0])
+    out = {k: np.full(B, np.nan, dtype=np.float64)
+           for k in ("sum", "max", "median", "p90")}
+    for i in range(B):
+        w = x_bt[i][valid_bt[i]]
+        if w.size == 0:
+            continue
+        out["sum"][i] = float(w.sum())
+        out["max"][i] = float(w.max())
+        out["median"][i] = float(np.median(w))
+        out["p90"][i] = float(np.percentile(w, 90.0))
+    return out
+
+
 def collect_per_sample_kbar(
     model,
     loader,
@@ -1102,8 +1160,12 @@ def collect_per_sample_kbar(
     Returns:
         A dict of length-$N$ arrays (``kbar``, ``te_inj``, ``te_scat``, ``frac_phi``,
         ``cell_id``, ``delay``, ``held_out``, ``pred_gain``, ``uplift_rel``, and
-        ``kbar_<control>`` per control), plus ``lag_profiles`` (``{cell_id: (L,) float64}``),
-        ``kbar_over_time``, ``lag_counts``, ``n`` and ``T``.
+        ``kbar_<control>`` per control), the KLD summary family
+        (:data:`KLD_SCALAR_VARIANTS`: ``kbar_sum`` / ``kbar_max`` / ``kbar_median`` /
+        ``kbar_p90`` / ``kbar_full`` / ``kbar_postwarm`` / ``kbar_inband`` /
+        ``kbar_outband``) plus per-head ``kbar_head`` $(N, \text{num\_heads})$ and its
+        expanded ``kbar_head0 .. kbar_head{M-1}`` columns, plus ``lag_profiles``
+        (``{cell_id: (L,) float64}``), ``kbar_over_time``, ``lag_counts``, ``n`` and ``T``.
     """
     import torch
 
@@ -1117,7 +1179,11 @@ def collect_per_sample_kbar(
         "kbar": [], "te_inj": [], "te_scat": [], "frac_phi": [],
         "cell_id": [], "delay": [], "held_out": [],
         "pred_gain": [], "uplift_rel": [],
+        # KLD summary family (§14.5): time-summaries, window variants, directed-KL split.
+        "kbar_sum": [], "kbar_max": [], "kbar_median": [], "kbar_p90": [],
+        "kbar_full": [], "kbar_postwarm": [], "kbar_inband": [], "kbar_outband": [],
     }
+    head_chunks: List[np.ndarray] = []   # per-batch (B, num_heads) clean-window per-head KL
     control_cols: Dict[str, List[np.ndarray]] = {c: [] for c in controls}
     lag_sum: Dict[int, np.ndarray] = {}
     lag_cnt: Dict[int, int] = {}
@@ -1149,6 +1215,51 @@ def collect_per_sample_kbar(
                 kld_bt, delay_t, warmup=warmup, horizon=horizon
             )
             cols["kbar"].append(kbar.detach().cpu().numpy())
+
+            # --- KLD summary family over the clean window (§14.5) --------------------
+            # One pass of reductions on the per-step KL; reused below for the per-cell
+            # kbar-over-time profile so ``kld_per_t`` is moved to host memory once.
+            vmask = valid.to(kld_bt.dtype)                                # (B, T)
+            vdenom = vmask.sum(dim=1).clamp(min=1.0)                      # (B,)
+            kld_np = kld_bt.detach().cpu().numpy().astype(np.float64)     # (B, T)
+            valid_np = valid.detach().cpu().numpy()                       # (B, T) bool
+            red = _row_window_reductions(kld_np, valid_np)
+            cols["kbar_sum"].append(red["sum"])
+            cols["kbar_max"].append(red["max"])
+            cols["kbar_median"].append(red["median"])
+            cols["kbar_p90"].append(red["p90"])
+            # Window variants: full-sequence mean and post-warm-up mean (no delay floor).
+            cols["kbar_full"].append(kld_np.mean(axis=1))
+            hi_pw = int(kld_np.shape[1] - horizon)
+            if hi_pw > int(warmup):
+                cols["kbar_postwarm"].append(kld_np[:, int(warmup):hi_pw].mean(axis=1))
+            else:
+                cols["kbar_postwarm"].append(np.full(bsz, np.nan, dtype=np.float64))
+
+            # Directed-KL split over the true lag band L* = {max(0,D-H)..D-1}: the KL the
+            # attention routes to the correct source lags (in-band) vs the rest (out-band).
+            # te_lag_map sums to kld_per_t over lags, so in+out == kbar exactly.
+            te_map = out.get("te_lag_map", None)
+            if te_map is not None:
+                Lc = int(te_map.shape[-1])
+                l_idx = torch.arange(Lc, device=device).unsqueeze(0)       # (1, L)
+                lo_b = torch.clamp(delay_t.long() - int(horizon), min=0).unsqueeze(1)
+                hi_b = delay_t.long().unsqueeze(1)                         # (B, 1)
+                band = ((l_idx >= lo_b) & (l_idx < hi_b)).to(te_map.dtype)  # (B, L)
+                inband_t = (te_map * band.unsqueeze(1)).sum(dim=-1)         # (B, T)
+                kbar_inb = (inband_t * vmask).sum(dim=1) / vdenom          # (B,)
+                cols["kbar_inband"].append(kbar_inb.detach().cpu().numpy())
+                cols["kbar_outband"].append((kbar - kbar_inb).detach().cpu().numpy())
+            else:
+                cols["kbar_inband"].append(np.full(bsz, np.nan, dtype=np.float64))
+                cols["kbar_outband"].append(np.full(bsz, np.nan, dtype=np.float64))
+
+            # Per-head KL split: clean-window mean of each contiguous latent group's KL.
+            kph = out.get("kld_per_t_per_head", None)
+            if kph is not None:
+                head_kbar = (kph * vmask.unsqueeze(-1)).sum(dim=1) / vdenom.unsqueeze(-1)
+                head_chunks.append(head_kbar.detach().cpu().numpy())
+
             cid = _prov_or(batch, "cell_id", 0, np.int64, bsz)
             cols["cell_id"].append(cid)
             cols["delay"].append(delay_np)
@@ -1199,8 +1310,8 @@ def collect_per_sample_kbar(
             prof_np = prof.detach().cpu().numpy().astype(np.float64)
             L = prof_np.shape[1]
             # Per-cell per-step KL trajectory (the K-bar-over-time profile, before the
-            # clean-window collapse), summed per cell alongside the lag profile.
-            kld_np = kld_bt.detach().cpu().numpy().astype(np.float64)   # (B, T)
+            # clean-window collapse), summed per cell alongside the lag profile. ``kld_np``
+            # was already moved to host memory above for the KLD summary family.
             for i in range(prof_np.shape[0]):
                 c = int(cid[i])
                 if c not in lag_sum:
@@ -1220,6 +1331,11 @@ def collect_per_sample_kbar(
                 control_cols[ctrl].append(kbar_c.detach().cpu().numpy())
 
     result: Dict[str, Any] = {k: np.concatenate(v) for k, v in cols.items()}
+    if head_chunks:
+        head_arr = np.concatenate(head_chunks, axis=0)      # (N, num_heads)
+        result["kbar_head"] = head_arr
+        for m in range(int(head_arr.shape[1])):
+            result[f"kbar_head{m}"] = head_arr[:, m]
     for ctrl, chunks in control_cols.items():
         result[f"kbar_{ctrl}"] = np.concatenate(chunks) if chunks else np.zeros(0)
     result["lag_profiles"] = {c: lag_sum[c] / max(1, lag_cnt[c]) for c in lag_sum}
@@ -1331,6 +1447,52 @@ def _spearman_sign(points: Sequence[Tuple[float, float]]) -> Optional[float]:
     return float(np.corrcoef(rt, rk)[0, 1])
 
 
+def _rank_average(a: np.ndarray) -> np.ndarray:
+    r"""Tie-aware (midrank) ranks: tied values share the mean of their ordinal ranks.
+
+    Matches ``scipy.stats.rankdata(method='average')`` without the dependency. Needed
+    because the per-sample TE axis has few distinct levels with many ties, which biases
+    a plain ``argsort(argsort(.))`` rank.
+
+    Args:
+        a: A 1-D array.
+
+    Returns:
+        The average ranks of ``a``.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    order = a.argsort(kind="mergesort")
+    ordinal = np.empty(a.size, dtype=np.float64)
+    ordinal[order] = np.arange(1, a.size + 1, dtype=np.float64)
+    uniq, inv, cnt = np.unique(a, return_inverse=True, return_counts=True)
+    sums = np.zeros(uniq.size, dtype=np.float64)
+    np.add.at(sums, inv, ordinal)
+    return (sums / cnt)[inv]
+
+
+def _pearson_finite(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    r"""Pearson correlation over the finite $(x, y)$ pairs (``None`` when undefined)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    m = np.isfinite(x) & np.isfinite(y)
+    if int(m.sum()) < 2 or np.std(x[m]) == 0 or np.std(y[m]) == 0:
+        return None
+    return float(np.corrcoef(x[m], y[m])[0, 1])
+
+
+def _spearman_finite(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    r"""Tie-aware Spearman rank correlation over the finite $(x, y)$ pairs (``None`` if undefined)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    m = np.isfinite(x) & np.isfinite(y)
+    if int(m.sum()) < 2:
+        return None
+    rx, ry = _rank_average(x[m]), _rank_average(y[m])
+    if np.std(rx) == 0 or np.std(ry) == 0:
+        return None
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
 def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
     r"""Fit $\bar K = \alpha + \gamma\,\mathrm{TE}$ vs both $\mathrm{TE}_{\mathrm{inj}}$
     and $\mathrm{TE}_{\mathrm{scat}}$ (S6-T02).
@@ -1347,9 +1509,11 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         A dict with the per-cell ``gamma_inj``/``gamma_scat``/``alpha_*``/``r2_*``,
         ``spearman_*``, ``monotonic_*``, ``n_cells`` and a ``per_cell`` table, plus the
         full-$N$ pooled per-sample fit (``gamma_inj_sample``/``gamma_scat_sample``/
-        ``alpha_*_sample``/``r2_*_sample``, ``n_samples``) and a ``by_lag`` table of
+        ``alpha_*_sample``/``r2_*_sample``, ``n_samples``), a ``by_lag`` table of
         per-lag per-sample slopes (``{D: {gamma_inj, alpha_inj, r2_inj, gamma_scat, ...,
-        n}}``).
+        n}}``), and a ``kld_variants`` table of per-KLD-summary calibrations
+        (``{variant: {gamma_inj, r2_inj, pearson_inj, spearman_inj, gamma_scat, ..., n}}``;
+        §14.5) covering every :data:`KLD_SCALAR_VARIANTS` entry and per-head column present.
     """
     per_cell = _group_per_cell(arrs)
     cells = list(per_cell.values())
@@ -1396,6 +1560,31 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
             "n": int(np.sum(sel)),
         }
 
+    # --- per-variant calibration (§14.5): every KLD summary vs TE_inj / TE_scat ----------
+    # Each variant is a per-sample scalar (an alternative flavour of $\bar K$); we report
+    # its pooled per-sample slope $\gamma$, $R^2$, Pearson $r$ and (tie-aware) Spearman
+    # $\rho$ against both TEs, so the report/figures can rank which KLD summary tracks TE
+    # best. Includes ``kbar`` itself and the per-head columns present in ``arrs``.
+    variant_names = [v for v in KLD_SCALAR_VARIANTS if v in arrs]
+    variant_names += sorted(
+        k for k in arrs
+        if str(k).startswith("kbar_head") and np.asarray(arrs.get(k)).ndim == 1
+    )
+    kld_variants: Dict[str, Any] = {}
+    for v in variant_names:
+        y = np.asarray(arrs[v], dtype=np.float64)
+        if y.shape != kbar_a.shape:
+            continue
+        entry: Dict[str, Any] = {"n": int(np.isfinite(y).sum())}
+        for pref, te in (("inj", te_inj_a), ("scat", te_scat_a)):
+            f = _safe_fit(list(zip(te, y)))
+            entry[f"gamma_{pref}"] = f["gamma"] if f else None
+            entry[f"alpha_{pref}"] = f["alpha"] if f else None
+            entry[f"r2_{pref}"] = f["r2"] if f else None
+            entry[f"pearson_{pref}"] = _pearson_finite(te, y)
+            entry[f"spearman_{pref}"] = _spearman_finite(te, y)
+        kld_variants[v] = entry
+
     return {
         "gamma_inj": fit_inj["gamma"] if fit_inj else None,
         "alpha_inj": fit_inj["alpha"] if fit_inj else None,
@@ -1417,6 +1606,9 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         "alpha_scat_sample": fit_scat_s["alpha"] if fit_scat_s else None,
         "r2_scat_sample": fit_scat_s["r2"] if fit_scat_s else None,
         "by_lag": by_lag,
+        # Per-variant KLD-summary calibration (§14.5): {variant: {gamma_*, r2_*,
+        # pearson_*, spearman_*, n}} vs both TE_inj and TE_scat.
+        "kld_variants": kld_variants,
         "per_cell": [
             {k: c[k] for k in ("cell_id", "te_inj", "te_scat", "kbar", "delay", "n", "frac_phi")}
             for c in cells
@@ -1692,8 +1884,13 @@ def _write_per_sample_eval(
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    keys = ("kbar", "te_inj", "te_scat", "frac_phi",
+    base = ("kbar", "te_inj", "te_scat", "frac_phi",
             "cell_id", "delay", "held_out", "pred_gain", "uplift_rel")
+    # The KLD summary family (§14.5) + per-head columns back the KLD-vs-TE figures; the
+    # 2-D ``kbar_head`` matrix is stored too so a caller can recover the head structure.
+    variants = tuple(v for v in KLD_SCALAR_VARIANTS if v != "kbar")
+    head = tuple(k for k in arrs if str(k).startswith("kbar_head"))
+    keys = base + variants + head
     payload: Dict[str, np.ndarray] = {
         k: np.asarray(arrs[k]) for k in keys if k in arrs
     }

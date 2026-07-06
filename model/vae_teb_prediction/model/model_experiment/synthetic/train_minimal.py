@@ -1,8 +1,8 @@
-r"""Standalone minimal training loop for ``SeqVaeLagAttnV1`` (Decision D2).
+r"""Standalone minimal training loop for ``SeqVaeLagAttn`` (Decision D2).
 
 A compact, dependency-light PyTorch loop -- **no PyTorch Lightning, no DDP, no
 HDF5, no MLflow**. It exercises the *real* model and the *real* loss
-(:meth:`SeqVaeLagAttnV1.forward` / :meth:`SeqVaeLagAttnV1.compute_loss`) so
+(:meth:`SeqVaeLagAttn.forward` / :meth:`SeqVaeLagAttn.compute_loss`) so
 fidelity to the production training path is preserved while keeping the
 synthetic $\beta$-sweep fast and fully controlled.
 
@@ -61,7 +61,9 @@ import numpy as np
 import torch
 import yaml
 
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from model.vae_teb_prediction.model.model_experiment.synthetic.dataset import (
     SyntheticTEDataset,
     build_u_stream,
@@ -347,8 +349,8 @@ def set_seed(seed: int) -> None:
 
 def build_model(
     model_cfg: Dict[str, Any], device: torch.device
-) -> Tuple[SeqVaeLagAttnV1, Dict[str, Any]]:
-    """Construct :class:`SeqVaeLagAttnV1` from the ``model`` config block.
+) -> Tuple[SeqVaeLagAttn, Dict[str, Any]]:
+    """Construct :class:`SeqVaeLagAttn` from the ``model`` config block.
 
     Args:
         model_cfg: The ``model`` block -- a 1:1 map of the keyword-only
@@ -369,7 +371,7 @@ def build_model(
     clamp = kwargs.get("logvar_clamp")
     if clamp is not None:
         kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
-    model = SeqVaeLagAttnV1(**kwargs)
+    model = SeqVaeLagAttn(**kwargs)
     model.to(device)
     return model, kwargs
 
@@ -498,7 +500,7 @@ def move_batch(batch: Any, device: torch.device) -> Any:
 # =============================================================================
 
 def train_one_epoch(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -527,7 +529,7 @@ def train_one_epoch(
         lambda_base: Weight on the baseline feature loss.
         grad_clip_norm: Gradient-norm clip threshold.
         likelihood: Reconstruction likelihood passed to
-            :meth:`SeqVaeLagAttnV1.compute_loss`. Defaults to ``'mse'`` so
+            :meth:`SeqVaeLagAttn.compute_loss`. Defaults to ``'mse'`` so
             legacy configs train identically to pre-Sprint-5 behaviour.
         sigma_obs: Observation noise (scalar or ``'learned'``).
         free_bits: Per-dim KL floor (0.0 is a no-op).
@@ -611,7 +613,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Optional[Any],
     device: torch.device,
     *,
@@ -636,7 +638,7 @@ def evaluate(
         lambda_full: Weight on the full-forecast feature loss.
         lambda_base: Weight on the baseline feature loss.
         likelihood: Reconstruction likelihood passed to
-            :meth:`SeqVaeLagAttnV1.compute_loss`. Defaults to ``'mse'``.
+            :meth:`SeqVaeLagAttn.compute_loss`. Defaults to ``'mse'``.
         sigma_obs: Observation noise (scalar or ``'learned'``).
         free_bits: Per-dim KL floor (0.0 is a no-op).
         detach_baseline_in_full: A3 flag, forwarded for signature parity with
@@ -688,7 +690,7 @@ def evaluate(
 
 @torch.no_grad()
 def compute_kbar(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Optional[Any],
     device: torch.device,
     max_batches: Optional[int] = None,
@@ -696,7 +698,7 @@ def compute_kbar(
     r"""Mean TE surrogate $\bar K$ over a loader.
 
     $\bar K$ is the per-step KL $K_t$ averaged over valid (non-warm-up) time
-    steps, computed via :meth:`SeqVaeLagAttnV1.measure_transfer_entropy`.
+    steps, computed via :meth:`SeqVaeLagAttn.measure_transfer_entropy`.
 
     Args:
         model: The (trained) model.
@@ -752,7 +754,7 @@ def append_csv_row(
 def save_checkpoint(
     path: Path,
     *,
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     model_kwargs: Dict[str, Any],
     config: Dict[str, Any],
     data_meta: Dict[str, Any],
@@ -766,7 +768,7 @@ def save_checkpoint(
 
     The bare (unprefixed) ``state_dict`` is stored under ``model_state_dict``
     -- the key :func:`train.graph_models_utils.load_checkpoint_strict` scans
-    for. Phase 4 rebuilds the model via ``SeqVaeLagAttnV1(**model_kwargs)``
+    for. Phase 4 rebuilds the model via ``SeqVaeLagAttn(**model_kwargs)``
     then loads this file ``strict=True``.
 
     Args:
@@ -783,6 +785,7 @@ def save_checkpoint(
             buffers) vs. the noisy EMA buffers.
     """
     ckpt = {
+        "model_class": type(model).__name__,
         "model_state_dict": model.state_dict(),
         "model_kwargs": model_kwargs,
         "config": config,
@@ -804,9 +807,9 @@ def save_checkpoint(
 
 
 def _maybe_fit_latent_stats(
-    model: SeqVaeLagAttnV1, train_loader: Any, device: torch.device
+    model: SeqVaeLagAttn, train_loader: Any, device: torch.device
 ) -> int:
-    """Run :meth:`SeqVaeLagAttnV1.fit_latent_stats` over the training set.
+    """Run :meth:`SeqVaeLagAttn.fit_latent_stats` over the training set.
 
     Replaces the noisy EMA ``mu_post_running_*`` buffers (momentum 0.01) with
     exact statistics, so a checkpoint is trustworthy for downstream consumers.
@@ -944,7 +947,7 @@ def _assemble_row(
 def train(
     config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    r"""Train :class:`SeqVaeLagAttnV1` on a cached synthetic benchmark dataset.
+    r"""Train :class:`SeqVaeLagAttn` on a cached synthetic benchmark dataset.
 
     This is the reusable entry point. The Phase-6 ``beta_sweep`` calls it
     directly with ``overrides={"beta": ..., "run_tag": ...}``.
@@ -1182,7 +1185,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         ``None`` so an unspecified flag falls back to the config value.
     """
     p = argparse.ArgumentParser(
-        description="Standalone training loop for SeqVaeLagAttnV1 on "
+        description="Standalone training loop for SeqVaeLagAttn on "
                     "synthetic transfer-entropy benchmark data."
     )
     p.add_argument(

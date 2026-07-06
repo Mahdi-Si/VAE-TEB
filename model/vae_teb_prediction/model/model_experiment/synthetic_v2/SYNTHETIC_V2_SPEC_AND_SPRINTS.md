@@ -3,8 +3,11 @@
 Status: Sprints 0-4 complete; Sprint 5 code + pilot smoke complete (headline run S5-T04 deferred to user);
 Sprint 6 complete (eval machinery + tests + pilot-checkpoint smoke; headline gate numbers await S5-T04);
 Sprint 7 complete (journal figures + plot_style_v2, TE-aware standard-testing sample plots, pulse_train variant,
-final_report_v2, README; figure/report numbers await the S5-T04 headline run)
-Last updated: 2026-07-01
+final_report_v2, README; figure/report numbers await the S5-T04 headline run);
+Sprint 8 complete (KLD-summary family vs TE — §14.5: multiple KLD definitions + summarisations stamped per sample,
+per-variant calibration, and five standalone KLD↔TE figures; plus per-split eval/plots/report by default —
+train/val/test each into results/<tag>/<split>/ with a cross-split index; numbers await the S5-T04 headline run)
+Last updated: 2026-07-06
 Owner: Mahdi-Si
 
 > Companion design/math reference: `SYNTHETIC_V2_RAW_TE_PIPELINE_EXPLAINED.md` (same folder).
@@ -386,6 +389,7 @@ argmax-lag error, null-ratio, mean frac_Phi) plus the figure gallery and a markd
 | Sprint 5 | Training | Headline training run produces a checkpoint + loss curves | Sprint 4 |
 | Sprint 6 | Evaluation gates | gamma_inj / gamma_scat, lag recovery, null collapse from the checkpoint; end-to-end smoke | Sprint 5 |
 | Sprint 7 | Journal figures, standard test plots, pulse_train, report, README | Full figure gallery + TE-aware `run_tests.py` sample PDFs + report + README; pulse_train frac_Phi vs am_carrier | Sprint 6 |
+| Sprint 8 | KLD-summary family vs TE (§14.5) + per-split reporting | Per-sample family of KLD summaries (time/window/directed/per-head) + per-variant calibration + five standalone KLD↔TE figures + report section; eval/plots/report run per split (train/val/test → own folders) with a cross-split index | Sprint 6 |
 
 ---
 
@@ -1196,6 +1200,116 @@ xcorr peak at `D`, 0.06-vs-0.02 wavelet/envelope overlap).
 
 ---
 
+## Sprint 8: KLD-summary family vs TE (§14.5)
+
+Goal: The evaluation collapses the model's KLD to a **single** per-sample scalar ($\bar K$ = clean-window
+mean of `kld_per_t`) and relates only that to TE. The model actually exposes three KLD tensors
+(`kld_per_t`, `kld_per_t_per_head`, `te_lag_map`), and there are many ways to summarise a per-step KL
+trajectory into a per-sample number. This sprint computes a **family** of per-sample KLD summaries and
+relates every one to the transfer entropy, so we can see *which* KLD definition / summarisation best tracks
+TE and understand the $\bar K \leftrightarrow \mathrm{TE}$ relationship in depth — not just whether the one
+canonical $\bar K$ is calibrated. Model / loss / trainer are unchanged (used only through `forward`).
+Demoable outcome: `--stage eval` stamps the family into `per_sample_eval.npz` + a `calibration.kld_variants`
+block; `--stage report` renders five standalone KLD↔TE figures and a variant-ranking table.
+Depends on: Sprint 6 (per-sample collection + calibration + `metrics.json`).
+
+#### S8-T01: Per-sample KLD summary family in the collector
+
+Description: Extend `eval_v2.collect_per_sample_kbar` to compute, per sample over the clean window
+$\mathcal W_i$, the full KLD summary family (`KLD_SCALAR_VARIANTS` + per-head): the time-summaries
+(`kbar` mean / `kbar_sum` / `kbar_max` / `kbar_median` / `kbar_p90` of `kld_per_t`), the window variants
+(`kbar_full`, `kbar_postwarm`), the directed-KL split (`kbar_inband` / `kbar_outband` from `te_lag_map`
+over $\mathcal L^\star$), and the per-head KL (`kbar_head{m}` from `kld_per_t_per_head`). Persist them all
+in `per_sample_eval.npz` (`_write_per_sample_eval`). Reductions are pure NumPy (`_row_window_reductions`);
+the per-head/in-band tensors reuse the already-fetched forward outputs (no extra forward).
+
+Acceptance criteria:
+- `collect_per_sample_kbar` returns and `_write_per_sample_eval` persists every family key with shape
+  `(N,)` (and `kbar_head` `(N, num_heads)`); absent tensors degrade to `nan` / omission, never a crash.
+- Invariants hold: `kbar_inband + kbar_outband == kbar` (exact); `kbar_sum == kbar · |W|` on a constant
+  trajectory; per-head equal-split sums to the total.
+
+Files affected: `synthetic_v2/eval_v2.py`; `synthetic_v2/tests/test_eval_v2.py`.
+
+Validation: `pytest .../test_eval_v2.py -k "row_window or summary_family" -q` passes.
+
+#### S8-T02: Per-variant calibration block
+
+Description: Extend `eval_v2.fit_calibration` to emit a `kld_variants` block: for each summary (incl.
+per-head), the pooled per-sample slope $\gamma$, $R^2$, Pearson $r$ and (tie-aware) Spearman $\rho$
+against **both** $\mathrm{TE}_{\mathrm{inj}}$ and $\mathrm{TE}_{\mathrm{scat}}$. Keep all existing keys
+(back-compat).
+
+Acceptance criteria:
+- `metrics.json` gains `calibration.kld_variants` with an entry per present summary; a summary that is a
+  scalar multiple of `kbar` shares its correlation and scales its slope; a flat per-head KL reads
+  $r \approx 0$.
+
+Files affected: `synthetic_v2/eval_v2.py`; `synthetic_v2/tests/test_eval_v2.py`.
+
+Validation: `pytest .../test_eval_v2.py -k "kld_variants" -q` passes.
+
+#### S8-T03: Five standalone KLD↔TE figures
+
+Description: Add to `visualize_v2.py` (all standalone, saved separately): `plot_kld_variants_vs_te`
+(one panel per summary vs TE, each with its own fit + $r$/$\rho$; `te_axis` ∈ {inj, scat}),
+`plot_kld_te_correlation` (the ranked "which summary tracks TE best" bars vs both TEs),
+`plot_kld_te_density` (per-sample hexbin density + fit + residual-by-TE-level panel),
+`plot_kld_distribution_by_te` (per-TE-level violins), and `plot_per_head_kld_vs_te` (which latent head
+carries the coupling). All degrade to a placeholder on missing data.
+
+Acceptance criteria:
+- Each figure writes non-empty PDF+PNG from a per-sample fixture + `kld_variants` metrics, and renders a
+  placeholder when `per_sample` / `kld_variants` is absent.
+
+Files affected: `synthetic_v2/visualize_v2.py`; `synthetic_v2/tests/test_visualize_v2.py`.
+
+Validation: `pytest .../test_visualize_v2.py -k "kld_variant" -q` passes.
+
+#### S8-T04: Report + gallery wiring + config knob
+
+Description: Wire the five figures into `final_report_v2` (gallery `plot_specs`), add a "KLD summary vs TE"
+section to `report.md` (the variant-ranking table from `kld_variants`), and add the
+`eval.kld_analysis.density_variant` config knob selecting which single summary the density / violin figures
+feature (the full family is always computed).
+
+Acceptance criteria:
+- `--stage report` emits `kld_variants_vs_te{,_scat}`, `kld_te_correlation`, `kld_te_density`,
+  `kld_distribution_by_te`, `per_head_kld_vs_te` into the gallery and the ranking table into `report.md`;
+  `density_variant` is honoured.
+
+Files affected: `synthetic_v2/final_report_v2.py`; `synthetic_v2/config_synth_v2.yaml`;
+`synthetic_v2/README.md`; `synthetic_v2/tests/test_visualize_v2.py`.
+
+Validation: `pytest .../test_visualize_v2.py -k "report" -q` passes; `--stage report` writes the section +
+figures.
+
+#### S8-T05: Per-split evaluation + all-figures-by-default
+
+Description: Make `eval` / `test_plots` / `report` grade and plot **every** cached dataset split
+(train, val, test) by default — each into its own `results/<tag>/<split>/` subfolder — so we can see
+how the model does on each split, not just test. Add `run_pipeline_v2._resolve_splits` (present splits
+from the cache; `--split all` default, a name restricts), `_eval_splits` / `_test_plots_splits` /
+`_report_splits`, and a top-level cross-split index `results/<tag>/report.md` tabulating the headline
+gates (γ vs both TEs, per-sample γ, LagMass, null ratios) side by side. `final_report_v2` gains a
+`split` label + reads the split-independent `realizability.json` from the parent and links the shared
+`../figures/` gallery. The full figure gallery is rendered for every split by default (no figure gated
+behind a flag). The `--split` CLI default flips from `test` to `all`; the split-independent
+data-generation figures stay at the tag root.
+
+Acceptance criteria:
+- `--stage eval` / `--stage report` (no `--split`) produce `results/<tag>/<split>/` for each present
+  split (`metrics.json`, `per_sample_eval.npz`, `figures/`, `report.md`) and the cross-split index.
+- `--split NAME` restricts to one split; `final_report_v2`'s direct API stays backward-compatible.
+
+Files affected: `synthetic_v2/run_pipeline_v2.py`; `synthetic_v2/final_report_v2.py`;
+`synthetic_v2/README.md`.
+
+Validation: driver argparse default `split == "all"`; a per-split report smoke writes each split's
+gallery + the index; the existing `-k report` / `run_eval` tests stay green (backward-compat).
+
+---
+
 ## Full task list
 
 - S0-T01: Package skeleton, config, and solve-te demo hook
@@ -1241,6 +1355,11 @@ xcorr peak at `D`, 0.06-vs-0.02 wavelet/envelope overlap).
 - S7-T08: TE-aware aggregate plot upgrades
 - S7-T09: Module README / usage doc
 - S7-T10: Data-generation story figures (band recipe, TE authoring, latent coupling, AM separation)
+- S8-T01: Per-sample KLD summary family in the collector
+- S8-T02: Per-variant calibration block
+- S8-T03: Five standalone KLD↔TE figures
+- S8-T04: Report + gallery wiring + config knob
+- S8-T05: Per-split evaluation + all-figures-by-default
 
 ---
 
@@ -1621,6 +1740,47 @@ xcorr peak at `D`, 0.06-vs-0.02 wavelet/envelope overlap).
 > **Deferred (unchanged from Sprint 5/6):** the figures and report render against the *pilot*
 > checkpoint until the user launches the full **S5-T04** headline run (`--stage train`, no
 > `--pilot`); re-run `--stage {eval, test_plots, report}` afterwards for the real gate numbers.
+
+### Sprint 8: KLD-summary family vs TE (§14.5)  — DONE (2026-07-06)
+- [x] S8-T01: Per-sample KLD summary family in the collector
+- [x] S8-T02: Per-variant calibration block
+- [x] S8-T03: Five standalone KLD↔TE figures
+- [x] S8-T04: Report + gallery wiring + config knob
+- [x] S8-T05: Per-split evaluation + all-figures-by-default
+
+> Sprint 8 broadened the $\bar K \leftrightarrow \mathrm{TE}$ analysis from the single canonical
+> $\bar K$ to a **family** of per-sample KLD summaries, all model-free reductions of the three
+> `forward` KLD tensors (`kld_per_t`, `kld_per_t_per_head`, `te_lag_map`) over the clean window.
+> **S8-T01** (`eval_v2.py`): `collect_per_sample_kbar` now also emits the time-summaries
+> (`kbar_sum`/`kbar_max`/`kbar_median`/`kbar_p90`), the window variants (`kbar_full`/`kbar_postwarm`),
+> the directed-KL split (`kbar_inband`/`kbar_outband` over $\mathcal L^\star$, with
+> `kbar_inband + kbar_outband == kbar` exact), and the per-head KL (`kbar_head` `(N,H)` + `kbar_head{m}`);
+> `_row_window_reductions` does the per-row NumPy reductions and `_write_per_sample_eval` persists the
+> lot (`KLD_SCALAR_VARIANTS` registry). No extra forward — the per-head/in-band tensors reuse the
+> already-fetched outputs. **S8-T02**: `fit_calibration` gained a `calibration.kld_variants` block
+> ($\gamma$/$R^2$/Pearson $r$/tie-aware Spearman $\rho$ per summary vs both TEs; `_pearson_finite` /
+> `_spearman_finite` / `_rank_average` helpers). **S8-T03** (`visualize_v2.py`): five standalone figures
+> — `plot_kld_variants_vs_te` (grid, `te_axis` inj/scat), `plot_kld_te_correlation` (ranked bars),
+> `plot_kld_te_density` (hexbin + residual-by-level), `plot_kld_distribution_by_te` (violins),
+> `plot_per_head_kld_vs_te` — all degrading to a placeholder on missing data, reusing the `_kbar_vs_te_panel`
+> helper (now with a `show_identity` toggle). **S8-T04**: wired all five into `final_report_v2`'s gallery,
+> added a "KLD summary vs TE" ranking table to `report.md` (`_kld_variants_section`), and added the
+> `eval.kld_analysis.density_variant` config knob (the full family is always computed; the knob only
+> selects the featured single-summary figure). **S8-T05** made `eval` / `test_plots` / `report` run
+> **per split by default**: `run_pipeline_v2._resolve_splits` discovers every cached split and
+> `_eval_splits` / `_test_plots_splits` / `_report_splits` write each into its own
+> `results/<tag>/<split>/` folder (full figure gallery per split), plus a top-level cross-split
+> `report.md` index tabulating the headline gates for train/val/test side by side;
+> `final_report_v2` gained a `split` label, a parent-fallback for the split-independent
+> `realizability.json`, and a link to the shared `../figures/` gallery. The `--split` CLI default
+> flipped `test` → `all`; the split-independent data-generation figures stay at the tag root.
+>
+> **Tests: full eval+visualize suite green** (`test_eval_v2.py` +3: `_row_window_reductions`, the
+> collected family + invariants, the `kld_variants` block; `test_visualize_v2.py` +2: the five figures
+> render, and the empty-data placeholders). An end-to-end `final_report_v2` smoke confirms all six new
+> gallery figures are gathered and the report section renders. Like the rest of the gallery, the numbers
+> are meaningful only after the user's full **S5-T04** headline run; re-run `--stage {eval, report}`
+> afterwards.
 
 ---
 

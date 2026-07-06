@@ -27,7 +27,19 @@ $B$ per target and the SNR extractability law, §9); the coupling pathway / lag
 band $\mathcal L^\star$, §6); and the carrier de-risk (:func:`plot_am_separation`,
 envelope spectrum vs the analyzing-wavelet passband at $0.06$ vs $0.02\,\mathrm{Hz}$, §7).
 
-See ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprints 1, 2, 7.
+Sprint 8 (S8) adds the KLD-summary-family analysis (§14.5): the model exposes several
+KLD tensors (``kld_per_t`` total, ``kld_per_t_per_head``, ``te_lag_map``) and each can be
+summarised over a sample's clean window in several ways, so these figures relate *every*
+such summary to the transfer entropy rather than only the canonical $\bar K$ —
+:func:`plot_kld_variants_vs_te` (one panel per KLD flavour vs TE),
+:func:`plot_kld_te_correlation` (the ranked "which summary tracks TE best"),
+:func:`plot_kld_te_density` (per-sample density + fit residuals),
+:func:`plot_kld_distribution_by_te` (per-TE-level violins), and
+:func:`plot_per_head_kld_vs_te` (which latent head carries the coupling). They are backed
+by the per-sample arrays in ``per_sample_eval.npz`` and the ``calibration.kld_variants``
+block of ``metrics.json``.
+
+See ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprints 1, 2, 7, 8.
 """
 
 from __future__ import annotations
@@ -772,6 +784,8 @@ def plot_raw_scatter_paired(
     coupled_idx: int,
     latent_c: Optional[np.ndarray] = None,
     latent_d: Optional[np.ndarray] = None,
+    fhr_ph: Optional[np.ndarray] = None,
+    up_ph: Optional[np.ndarray] = None,
     center_freqs: Optional[np.ndarray] = None,
     fs: float = 4.0,
     trim: int = 15,
@@ -780,16 +794,20 @@ def plot_raw_scatter_paired(
     formats: tuple = ("pdf", "png"),
     dpi: int = _DPI,
 ) -> List[Path]:
-    r"""Write the headline raw + scattering paired preview (S7-T02).
+    r"""Write the headline raw + scattering (+ phase-harmonic) paired preview (S7-T02).
 
-    Four stacked panels sharing aligned colorbar gutters: raw FHR trace, FHR scattering
-    heatmap, raw UP trace, UP scattering heatmap. The fs-correct coupled pulse-shape
-    channel (``coupled_idx``) is highlighted on both heatmaps, and the decimated latent
-    (sliced to the feature grid ``[trim:trim+T]``) is overlaid on that channel so its
-    tracking is visible on a strong cell.
+    Stacked panels sharing aligned colorbar gutters: raw FHR trace, FHR scattering
+    heatmap, raw UP trace, UP scattering heatmap. When the phase-harmonic correlation
+    fields ``fhr_ph`` / ``up_ph`` are supplied, a phase-harmonic heatmap is inserted below
+    each scattering panel (six panels total), so the **full model input** -- both the
+    scattering *magnitude* channels and the *phase-harmonic* channels -- is shown next to
+    the raw signal. The fs-correct coupled pulse-shape channel (``coupled_idx``) is
+    highlighted on both scattering heatmaps, and the decimated latent (sliced to the
+    feature grid ``[trim:trim+T]``) is overlaid on that channel so its tracking is visible
+    on a strong cell.
 
-    The caller supplies the already-transformed, normalised ``*_st`` fields (so this
-    module stays free of the torch / kymatio transform).
+    The caller supplies the already-transformed, normalised ``*_st`` / ``*_ph`` fields (so
+    this module stays free of the torch / kymatio transform).
 
     Args:
         fhr_raw: FHR waveform(s), $(n, N)$ or $(N,)$ (bpm).
@@ -801,6 +819,9 @@ def plot_raw_scatter_paired(
         latent_c: Source latent $c$ on the decimated grid, $(n, T_{\mathrm{tot}})$ or
             $(T_{\mathrm{tot}},)$; overlaid on the UP heatmap when supplied.
         latent_d: Target latent $d$, same layout; overlaid on the FHR heatmap.
+        fhr_ph: Optional FHR phase-harmonic correlation field, $(n, T, C)$ or $(T, C)$;
+            when both phase fields are given a phase-harmonic heatmap pair is added.
+        up_ph: Optional UP phase-harmonic correlation field, same layout as ``fhr_ph``.
         center_freqs: Normalised $\xi$ centre frequencies for Hz y-labels.
         fs: Raw sampling rate in Hz.
         trim: Symmetric decimated trim per end (feature grid = ``latent[trim:trim+T]``).
@@ -827,16 +848,31 @@ def plot_raw_scatter_paired(
     step_s = 16.0 / fs
     t_dec_min = (np.arange(n_t) * step_s) / 60.0
 
-    # Zero-centred, robust scale for the diverging ``bwr`` map shared by both heatmaps.
+    # Zero-centred, robust scale for the diverging ``bwr`` map shared by both scattering
+    # heatmaps (features are per-channel z-scored, so blue/red = below/above the mean).
     vmin, vmax = _symmetric_limits([fhr_cf, up_cf])
 
-    fig, axes, caxes = ps.stacked_figure(
-        [1.1, 1.6, 1.1, 1.6],
-        width=11.0,
-        colorbar=[False, True, False, True],
-        hspace=0.55,
-    )
-    ax_fhr_raw, ax_fhr_st, ax_up_raw, ax_up_st = axes
+    # Optional phase-harmonic panels: the other half of the model input. When supplied a
+    # phase heatmap is inserted below each scattering panel (FHR block, then UP block), so
+    # the layout grows from 4 to 6 panels; the phase pair shares its own colour scale.
+    have_phase = fhr_ph is not None and up_ph is not None
+    if have_phase:
+        fhr_pf = _to_channels_time(fhr_ph, sample)
+        up_pf = _to_channels_time(up_ph, sample)
+        ph_vmin, ph_vmax = _symmetric_limits([fhr_pf, up_pf])
+        heights = [1.0, 1.5, 1.5, 1.0, 1.5, 1.5]
+        cbar = [False, True, True, False, True, True]
+    else:
+        heights = [1.1, 1.6, 1.1, 1.6]
+        cbar = [False, True, False, True]
+
+    fig, axes, caxes = ps.stacked_figure(heights, width=11.0, colorbar=cbar, hspace=0.55)
+    if have_phase:
+        ax_fhr_raw, ax_fhr_st, ax_fhr_ph, ax_up_raw, ax_up_st, ax_up_ph = axes
+    else:
+        ax_fhr_raw, ax_fhr_st, ax_up_raw, ax_up_st = axes
+        ax_fhr_ph = ax_up_ph = None
+    cax_of = dict(zip(axes, caxes))
 
     # --- raw traces ---
     ax_fhr_raw.plot(t_raw_min, fhr, color=_FHR_COLOR, lw=0.5)
@@ -850,9 +886,9 @@ def plot_raw_scatter_paired(
         ps.style_axes(ax)
 
     # --- scattering heatmaps with the coupled channel highlighted + latent overlay ---
-    for ax, cax, data, name, latent in (
-        (ax_fhr_st, caxes[1], fhr_cf, "FHR", latent_d),
-        (ax_up_st, caxes[3], up_cf, "UP", latent_c),
+    for ax, data, name, latent in (
+        (ax_fhr_st, fhr_cf, "FHR", latent_d),
+        (ax_up_st, up_cf, "UP", latent_c),
     ):
         im = ax.imshow(
             data, aspect="auto", origin="lower",
@@ -871,8 +907,19 @@ def plot_raw_scatter_paired(
                 label="latent (z, on coupled ch)",
             )
             ax.legend(loc="upper right", frameon=False, fontsize=6.5)
-        if cax is not None:
-            ps.attach_colorbar(fig, im, cax, label="z-scored value")
+        ps.attach_colorbar(fig, im, cax_of[ax], label="z-scored value")
+
+    # --- phase-harmonic heatmaps (the other half of the model input) ---
+    if have_phase:
+        for ax, data, name in ((ax_fhr_ph, fhr_pf, "FHR"), (ax_up_ph, up_pf, "UP")):
+            ph_ch, ph_t = data.shape
+            im = ax.imshow(
+                data, aspect="auto", origin="lower",
+                extent=(0.0, ph_t * step_s / 60.0, -0.5, ph_ch - 0.5),
+                vmin=ph_vmin, vmax=ph_vmax, cmap=_HEATMAP_CMAP, interpolation="nearest",
+            )
+            ax.set_ylabel(f"{name} phase-h. channel")
+            ps.attach_colorbar(fig, im, cax_of[ax], label="z-scored value")
 
     if center_freqs is not None:
         cf = np.asarray(center_freqs, dtype=float)
@@ -883,7 +930,7 @@ def plot_raw_scatter_paired(
             ax.set_yticks(tick_ch)
             ax.set_yticklabels(labels)
 
-    ax_up_st.set_xlabel("time (min)")
+    (ax_up_ph if have_phase else ax_up_st).set_xlabel("time (min)")
 
     meta = meta or {}
     bits = []
@@ -1712,6 +1759,7 @@ def _kbar_vs_te_panel(
     xlabel: str,
     fit: Optional[Tuple[Optional[float], Optional[float], Optional[float]]] = None,
     show_box: bool = True,
+    show_identity: bool = True,
 ) -> int:
     r"""Draw one per-sample $\bar K$-vs-TE panel: cloud + per-level box + means + fit.
 
@@ -1731,6 +1779,8 @@ def _kbar_vs_te_panel(
         fit: Optional explicit ``(gamma, alpha, r2)`` to draw instead of the pooled-sample fit
             (used for the per-lag panels).
         show_box: Whether to draw the per-level box overlay.
+        show_identity: Whether to draw the $y=x$ reference (meaningful only for nats/step
+            variants; suppressed for scale-different summaries such as the integrated sum).
 
     Returns:
         The number of finite points plotted.
@@ -1795,7 +1845,8 @@ def _kbar_vs_te_panel(
         r2f = float(r2) if r2 is not None and np.isfinite(r2) else float("nan")
         ax.plot(xs, a + g * xs, color=color, lw=1.4,
                 label=rf"fit $\gamma$={g:.3f}, $R^2$={r2f:.2f}", zorder=6)
-    ax.plot(xs, xs, color=_BASELINE_COLOR, lw=0.6, ls=":", label="y=x", zorder=4)
+    if show_identity:
+        ax.plot(xs, xs, color=_BASELINE_COLOR, lw=0.6, ls=":", label="y=x", zorder=4)
 
     ax.set_xlabel(xlabel)
     if has_spread:
@@ -2567,6 +2618,476 @@ def plot_null_controls(
     ax.set_ylabel(r"null ratio $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$")
     ax.set_title(r"null controls per cell  ($\to 0$ signal, $\approx 1$ null)")
     ax.legend(loc="upper right", frameon=False, fontsize=6.5, title="control")
+    ps.style_axes(ax)
+    fig.tight_layout()
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+# =============================================================================
+# S8: the KLD-summary family vs TE (§14.5). The model exposes several KLD tensors
+# (kld_per_t total, kld_per_t_per_head, te_lag_map) and each can be summarised over
+# a sample's clean window in several ways; these figures relate every such summary
+# to the transfer entropy so the reader can see WHICH KLD flavour tracks TE best,
+# not just the single canonical K-bar. Backed by the per-sample arrays in
+# ``per_sample_eval.npz`` and the ``calibration.kld_variants`` block of ``metrics.json``.
+# =============================================================================
+
+# Human-readable labels + display order for the KLD summary family (keys match the
+# arrays ``eval_v2.collect_per_sample_kbar`` emits). Variants not listed here (e.g.
+# extra per-head columns) are appended with a derived label.
+KLD_VARIANT_LABELS = {
+    "kbar": r"mean $K_t$ (clean window)",
+    "kbar_sum": r"sum $K_t$ (integrated)",
+    "kbar_max": r"max $K_t$ (peak)",
+    "kbar_median": r"median $K_t$",
+    "kbar_p90": r"p90 $K_t$",
+    "kbar_full": r"mean $K_t$ (full seq.)",
+    "kbar_postwarm": r"mean $K_t$ (post-warmup)",
+    "kbar_inband": r"in-band KL ($\mathcal{L}^\star$)",
+    "kbar_outband": r"out-band KL",
+}
+
+# The one variant whose units are integrated nats (not nats/step); its $y=x$ reference
+# is meaningless, so the per-panel identity line is suppressed for it.
+_NON_RATE_VARIANTS = frozenset({"kbar_sum"})
+
+
+def _kld_variant_label(key: str) -> str:
+    r"""Human-readable label for a KLD summary key (falls back for per-head columns)."""
+    if key in KLD_VARIANT_LABELS:
+        return KLD_VARIANT_LABELS[key]
+    if str(key).startswith("kbar_head"):
+        return rf"head {str(key).replace('kbar_head', '')} KL"
+    return str(key)
+
+
+def _kld_variant_keys(source: Dict[str, Any]) -> List[str]:
+    r"""Ordered KLD summary keys present in a per-sample dict or a ``kld_variants`` block.
+
+    Returns the canonical :data:`KLD_VARIANT_LABELS` order first, then any per-head
+    ``kbar_head{m}`` columns, keeping only entries actually present (and, for a per-sample
+    array dict, only non-empty 1-D arrays).
+
+    Args:
+        source: Either the ``per_sample_eval.npz`` array dict or a ``kld_variants`` dict.
+
+    Returns:
+        The ordered list of variant keys to plot.
+    """
+    def _present(k: str) -> bool:
+        v = source.get(k)
+        if v is None:
+            return False
+        arr = np.asarray(v)
+        # A per-sample array must be a non-empty 1-D vector; a kld_variants entry is a dict.
+        return isinstance(v, dict) or (arr.ndim == 1 and arr.size > 0) or arr.ndim == 0
+    ordered = [k for k in KLD_VARIANT_LABELS if _present(k)]
+    heads = sorted(k for k in source
+                   if str(k).startswith("kbar_head") and k not in KLD_VARIANT_LABELS
+                   and str(k)[len("kbar_head"):].isdigit() and _present(k))
+    return ordered + heads
+
+
+def _variant_fit(cal: Dict[str, Any], variant: str, pref: str) -> Optional[tuple]:
+    r"""Return the ``(gamma, alpha, r2)`` per-sample fit for one variant from ``kld_variants``."""
+    entry = (cal.get("kld_variants") or {}).get(variant)
+    if not isinstance(entry, dict):
+        return None
+    return (entry.get(f"gamma_{pref}"), entry.get(f"alpha_{pref}"), entry.get(f"r2_{pref}"))
+
+
+def plot_kld_variants_vs_te(
+    per_sample: Optional[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    te_axis: str = "inj",
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the KLD-summary-family vs TE grid (S8): one panel per KLD flavour.
+
+    Each panel plots one per-sample KLD summary (y) against the transfer entropy (x,
+    ``te_axis`` selects $\mathrm{TE}_{\mathrm{inj}}$ or $\mathrm{TE}_{\mathrm{scat}}$): the
+    jittered per-sample cloud, the per-level box, the per-cell means, and that variant's own
+    per-sample fit $\gamma$ with its Pearson $r$ / Spearman $\rho$. This is the direct answer
+    to "different versions of KLD and different ways of summarising it, related to TE" — the
+    time-summaries (mean / sum / max / median / p90), the window variants (full / post-warmup),
+    the directed-KL split (in-band / out-band over $\mathcal L^\star$) and the per-head KL are
+    all shown side by side so the reader can see which flavour is most calibrated. The default
+    x-axis is $\mathrm{TE}_{\mathrm{inj}}$ (the exact, trustworthy label; §10); the per-variant
+    correlations against BOTH TEs are ranked compactly by :func:`plot_kld_te_correlation`.
+
+    Args:
+        per_sample: The length-$N$ per-sample arrays from ``per_sample_eval.npz`` (needs the
+            ``kbar*`` summary columns, ``te_inj`` / ``te_scat`` and ``cell_id``). ``None`` /
+            empty renders a placeholder.
+        metrics: The ``metrics.json`` dict (for ``calibration.kld_variants`` fits + labels).
+        out_path: Output path stem or full path.
+        te_axis: ``"inj"`` (default) or ``"scat"`` — which TE to place on the x-axis.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    cal = metrics.get("calibration", {}) or {}
+    ps_arr = per_sample or {}
+    pref = "scat" if str(te_axis) == "scat" else "inj"
+    te_key = f"te_{pref}"
+    te_label = (r"$\mathrm{TE}_{\mathrm{scat}}$" if pref == "scat"
+                else r"$\mathrm{TE}_{\mathrm{inj}}$")
+    variants = _kld_variant_keys(ps_arr)
+    kbar = np.asarray(ps_arr.get("kbar", []), dtype=float)
+    if kbar.size == 0 or not variants:
+        fig, ax = plt.subplots(figsize=(7.0, 4.2))
+        _no_data(ax, "no per_sample_eval.npz KLD variants (run --stage eval)")
+        ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    te = np.asarray(ps_arr.get(te_key, []), dtype=float)
+    cell_id = np.asarray(ps_arr.get("cell_id", np.zeros_like(kbar)), dtype=float)
+    palette = ps.PALETTE_EXTENDED
+
+    n = len(variants)
+    ncol = 3 if n > 4 else max(1, n)
+    nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.0 * ncol + 0.5, 3.3 * nrow + 0.5),
+                             squeeze=False)
+    flat = [ax for row in axes for ax in row]
+    for j, v in enumerate(variants):
+        ax = flat[j]
+        y = np.asarray(ps_arr.get(v, []), dtype=float)
+        _kbar_vs_te_panel(
+            ax, te, y, cell_id, cal=cal, pref=pref,
+            color=palette[j % len(palette)], xlabel=f"{te_label} (nats)",
+            fit=_variant_fit(cal, v, pref), show_identity=v not in _NON_RATE_VARIANTS,
+        )
+        ax.set_ylabel(_kld_variant_label(v))
+        ax.set_title(f"{_kld_variant_label(v)}  |  " + ax.get_title(), fontsize=7.5)
+        ps.style_axes(ax)
+    for ax in flat[n:]:
+        ax.set_visible(False)
+
+    split_val = ps_arr.get("split", metrics.get("split", "?"))
+    split = str(split_val.item()) if hasattr(split_val, "item") else str(split_val)
+    fig.suptitle(rf"synthetic_v2 KLD summaries vs {te_label}  ($n$={int(kbar.size)} samples, "
+                 rf"split {split}, run {metrics.get('run_tag', '?')})",
+                 fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_kld_te_correlation(
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the "which KLD summary tracks TE best" ranking (S8).
+
+    A one-glance comparison across the whole KLD summary family: for every variant, the
+    Pearson $r$ and (tie-aware) Spearman $\rho$ of its per-sample values against
+    $\mathrm{TE}_{\mathrm{inj}}$ (left) and $\mathrm{TE}_{\mathrm{scat}}$ (right), read from
+    the ``calibration.kld_variants`` block. Variants are ordered by $|\rho_{\mathrm{inj}}|$
+    (best tracker on top) and each bar group is annotated with the per-sample slope $\gamma$.
+    This turns "different versions of KLD vs TE" into a ranked, quantitative summary.
+
+    Args:
+        metrics: The ``metrics.json`` dict from :func:`eval_v2.run_eval`.
+        out_path: Output path stem or full path.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    cal = metrics.get("calibration", {}) or {}
+    kv = cal.get("kld_variants") or {}
+    variants = _kld_variant_keys(kv)
+    fig, (ax_inj, ax_scat) = plt.subplots(1, 2, figsize=(11.0, max(3.5, 0.5 * len(variants) + 1.8)),
+                                          sharey=True)
+    if not variants:
+        for ax in (ax_inj, ax_scat):
+            _no_data(ax, "no calibration.kld_variants (run --stage eval)")
+            ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    def _val(v: str, key: str) -> float:
+        x = (kv.get(v) or {}).get(key)
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    # Order by |Spearman rho vs TE_inj| so the best rank-tracker sits on top.
+    variants = sorted(variants, key=lambda v: abs(_val(v, "spearman_inj"))
+                      if np.isfinite(_val(v, "spearman_inj")) else -1.0)
+    labels = [_kld_variant_label(v) for v in variants]
+    yy = np.arange(len(variants))
+    h = 0.38
+    for ax, pref, title in ((ax_inj, "inj", r"vs $\mathrm{TE}_{\mathrm{inj}}$"),
+                            (ax_scat, "scat", r"vs $\mathrm{TE}_{\mathrm{scat}}$")):
+        pear = np.array([_val(v, f"pearson_{pref}") for v in variants])
+        spear = np.array([_val(v, f"spearman_{pref}") for v in variants])
+        ax.barh(yy + h / 2, pear, height=h, color=_INJ_COLOR, label="Pearson $r$")
+        ax.barh(yy - h / 2, spear, height=h, color=_SCAT_COLOR, label=r"Spearman $\rho$")
+        for y, v in zip(yy, variants):
+            g = _val(v, f"gamma_{pref}")
+            if np.isfinite(g):
+                ax.text(0.02, y, rf"$\gamma$={g:.2g}", transform=ax.get_yaxis_transform(),
+                        va="center", ha="left", fontsize=5.5, color=_BASELINE_COLOR)
+        ax.axvline(0.0, color=_BASELINE_COLOR, lw=0.7)
+        ax.set_xlim(-1.05, 1.05)
+        ax.set_xlabel("correlation with TE")
+        ax.set_title(title)
+        ax.legend(loc="lower right", frameon=False, fontsize=6.5)
+        ps.style_axes(ax)
+    ax_inj.set_yticks(yy)
+    ax_inj.set_yticklabels(labels, fontsize=7.0)
+    fig.suptitle(f"synthetic_v2 KLD-summary vs TE correlation ranking  "
+                 f"(run {metrics.get('run_tag', '?')})", fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_kld_te_density(
+    per_sample: Optional[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    variant: str = "kbar",
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the per-sample $\bar K$-vs-$\mathrm{TE}_{\mathrm{inj}}$ density + residual view (S8).
+
+    A finer look at the primary relationship than the discrete scatter: a hexbin density of
+    every sample's KLD summary ``variant`` (default $\bar K$) against $\mathrm{TE}_{\mathrm{inj}}$
+    (x lightly jittered so the within-level density is legible) with the pooled per-sample fit
+    overlaid (left), and the fit residuals $\bar K_i - (\alpha + \gamma\,\mathrm{TE}_i)$ boxed per
+    TE level (right) — the residual panel exposes nonlinearity and heteroscedasticity that a bare
+    slope hides. The colour is sample count per hex.
+
+    Args:
+        per_sample: The length-$N$ per-sample arrays from ``per_sample_eval.npz``. ``None`` /
+            empty renders a placeholder.
+        metrics: The ``metrics.json`` dict (for the fit; ``variant``'s fit is used when present).
+        out_path: Output path stem or full path.
+        variant: Which KLD summary column to plot (default ``"kbar"``).
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    cal = metrics.get("calibration", {}) or {}
+    ps_arr = per_sample or {}
+    y = np.asarray(ps_arr.get(variant, []), dtype=float)
+    te = np.asarray(ps_arr.get("te_inj", []), dtype=float)
+    fig, (ax_den, ax_res) = plt.subplots(1, 2, figsize=(11.0, 4.6))
+    m = np.isfinite(y) & np.isfinite(te)
+    if int(m.sum()) < 2 or np.ptp(te[m]) <= 0:
+        for ax in (ax_den, ax_res):
+            _no_data(ax, "no per-sample KLD/TE data (run --stage eval)")
+            ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+    y, te = y[m], te[m]
+
+    # Per-variant fit if available, else the pooled kbar fit, else an on-the-fly OLS.
+    fit = _variant_fit(cal, variant, "inj")
+    if fit is not None and fit[0] is not None and fit[1] is not None:
+        g, a = float(fit[0]), float(fit[1])
+    elif cal.get("gamma_inj_sample") is not None:
+        g, a = float(cal["gamma_inj_sample"]), float(cal.get("alpha_inj_sample", 0.0))
+    else:
+        g, a = np.polyfit(te, y, 1)
+
+    span = float(np.ptp(te)) or 1.0
+    rng = np.random.default_rng(0)
+    te_j = te + rng.uniform(-0.02 * span, 0.02 * span, size=te.shape[0])
+    hb = ax_den.hexbin(te_j, y, gridsize=32, cmap="viridis", mincnt=1, linewidths=0.0)
+    ps.add_colorbar(fig, hb, ax_den, label="samples per hex")
+    xs = np.linspace(float(te.min()), float(te.max()), 50)
+    ax_den.plot(xs, a + g * xs, color=_SCAT_COLOR, lw=1.6,
+                label=rf"fit $\gamma$={g:.3f}")
+    ax_den.set_xlabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)")
+    ax_den.set_ylabel(_kld_variant_label(variant))
+    ax_den.set_title(rf"density  ($n$={int(y.size)}, $r$={float(np.corrcoef(te, y)[0, 1]):.2f})")
+    ax_den.legend(loc="upper left", frameon=False, fontsize=7.0)
+    ps.style_axes(ax_den)
+
+    # Residuals about the fit, boxed per TE level: reveals curvature / spread structure.
+    resid = y - (a + g * te)
+    levels = np.unique(te)
+    data = [resid[te == lv] for lv in levels]
+    bw = 0.05 * span + 1e-3
+    bp = ax_res.boxplot(data, positions=levels, widths=2 * bw, showfliers=False,
+                        patch_artist=True, manage_ticks=False)
+    for patch in bp["boxes"]:
+        patch.set(facecolor="white", edgecolor=_INJ_COLOR, alpha=0.9, linewidth=0.9)
+    for med in bp["medians"]:
+        med.set(color=_SCAT_COLOR, linewidth=1.3)
+    for part in bp["whiskers"] + bp["caps"]:
+        part.set(color=_BASELINE_COLOR, linewidth=0.7)
+    ax_res.axhline(0.0, color=_BASELINE_COLOR, lw=0.8, ls="--")
+    ax_res.set_xlabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)")
+    ax_res.set_ylabel("residual (obs $-$ fit)")
+    ax_res.set_title("fit residuals by TE level")
+    ps.style_axes(ax_res)
+
+    fig.suptitle(rf"synthetic_v2 {_kld_variant_label(variant)} vs TE density  "
+                 rf"(run {metrics.get('run_tag', '?')})", fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def _violin_by_level(ax, te: np.ndarray, y: np.ndarray, *, color: str) -> int:
+    r"""Draw per-TE-level violins of ``y`` with the per-level mean overlaid; return level count."""
+    m = np.isfinite(te) & np.isfinite(y)
+    if int(m.sum()) < 2:
+        _no_data(ax, "no per-sample data")
+        return 0
+    te, y = te[m], y[m]
+    levels = np.unique(te)
+    data = [y[te == lv] for lv in levels if np.isfinite(y[te == lv]).any()]
+    pos = [float(lv) for lv in levels if np.isfinite(y[te == lv]).any()]
+    if not data:
+        _no_data(ax, "no per-sample data")
+        return 0
+    span = float(np.ptp(levels)) or 1.0
+    parts = ax.violinplot(data, positions=pos, widths=0.12 * span + 1e-3,
+                          showmeans=True, showextrema=False)
+    for body in parts["bodies"]:
+        body.set(facecolor=color, edgecolor=_BASELINE_COLOR, alpha=0.35, linewidth=0.7)
+    if "cmeans" in parts:
+        parts["cmeans"].set(color=color, linewidth=1.4)
+    return len(pos)
+
+
+def plot_kld_distribution_by_te(
+    per_sample: Optional[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    variant: str = "kbar",
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write per-TE-level violin distributions of a KLD summary (S8).
+
+    The full per-sample $\bar K$ distribution at each discrete TE level as violins (with the
+    per-level mean), side by side for $\mathrm{TE}_{\mathrm{inj}}$ (left) and
+    $\mathrm{TE}_{\mathrm{scat}}$ (right). Where the discrete scatter shows individual points,
+    this shows the *shape* and *separation* of the $\bar K$ distribution across TE levels — how
+    cleanly the model's KLD separates neighbouring transfer-entropy levels.
+
+    Args:
+        per_sample: The length-$N$ per-sample arrays from ``per_sample_eval.npz``. ``None`` /
+            empty renders a placeholder.
+        metrics: The ``metrics.json`` dict (for run/split labels).
+        out_path: Output path stem or full path.
+        variant: Which KLD summary column to plot (default ``"kbar"``).
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    ps_arr = per_sample or {}
+    y = np.asarray(ps_arr.get(variant, []), dtype=float)
+    fig, (ax_inj, ax_scat) = plt.subplots(1, 2, figsize=(11.0, 4.6), sharey=True)
+    if y.size == 0:
+        for ax in (ax_inj, ax_scat):
+            _no_data(ax, "no per_sample_eval.npz (run --stage eval)")
+            ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+    for ax, te_key, color, lab in (
+        (ax_inj, "te_inj", _INJ_COLOR, r"$\mathrm{TE}_{\mathrm{inj}}$"),
+        (ax_scat, "te_scat", _SCAT_COLOR, r"$\mathrm{TE}_{\mathrm{scat}}$"),
+    ):
+        te = np.asarray(ps_arr.get(te_key, []), dtype=float)
+        _violin_by_level(ax, te, y, color=color)
+        ax.set_xlabel(f"{lab} (nats)")
+        ax.set_title(f"{lab}")
+        ps.style_axes(ax)
+    ax_inj.set_ylabel(_kld_variant_label(variant))
+    fig.suptitle(rf"synthetic_v2 {_kld_variant_label(variant)} distribution by TE level  "
+                 rf"(run {metrics.get('run_tag', '?')})", fontsize=ps.FONT_SUPTITLE)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_per_head_kld_vs_te(
+    per_sample: Optional[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Write the per-head KL vs $\mathrm{TE}_{\mathrm{inj}}$ figure (S8).
+
+    The latent KL splits additively into ``num_heads`` contiguous-group KLs
+    (``kld_per_t_per_head``); this plots each head's per-sample clean-window mean KL against
+    $\mathrm{TE}_{\mathrm{inj}}$ as per-level means with a per-head OLS trend, so it is visible
+    *which* latent head carries the injected coupling (its KL rises with TE) versus which stay
+    flat. The total $\bar K$ per-level mean is drawn as a gray reference.
+
+    Args:
+        per_sample: The length-$N$ per-sample arrays from ``per_sample_eval.npz`` (needs the
+            ``kbar_head{m}`` columns). ``None`` / empty (or no head columns) renders a placeholder.
+        metrics: The ``metrics.json`` dict (for run/split labels).
+        out_path: Output path stem or full path.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    ps_arr = per_sample or {}
+    head_keys = sorted((k for k in ps_arr
+                        if str(k).startswith("kbar_head")
+                        and str(k)[len("kbar_head"):].isdigit()),
+                       key=lambda k: int(str(k)[len("kbar_head"):]))
+    te = np.asarray(ps_arr.get("te_inj", []), dtype=float)
+    fig, ax = plt.subplots(figsize=(7.5, 5.0))
+    if not head_keys or te.size == 0:
+        _no_data(ax, "no per-head KLD columns (run --stage eval)")
+        ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    palette = ps.PALETTE_EXTENDED
+    for j, hk in enumerate(head_keys):
+        y = np.asarray(ps_arr.get(hk, []), dtype=float)
+        stats = _group_stats(te, y)
+        groups = sorted(stats)
+        if not groups:
+            continue
+        gx = np.array(groups)
+        gy = np.array([stats[g]["mean"] for g in groups])
+        color = palette[j % len(palette)]
+        rho = _spearman_rho(te, y)
+        ax.plot(gx, gy, marker="o", ms=4, lw=1.0, color=color,
+                label=rf"head {int(str(hk)[len('kbar_head'):])} ($\rho$={rho:.2f})")
+        fit = _ols_line(te, y)
+        if fit is not None:
+            xs, ys, _ = fit
+            ax.plot(xs, ys, color=color, lw=0.8, ls="--", alpha=0.7)
+    # Total K-bar per-level mean as a gray reference.
+    kbar = np.asarray(ps_arr.get("kbar", []), dtype=float)
+    if kbar.size:
+        st = _group_stats(te, kbar)
+        gs = sorted(st)
+        if gs:
+            ax.plot(np.array(gs), np.array([st[g]["mean"] for g in gs]),
+                    marker="s", ms=4, lw=1.2, color=_BASELINE_COLOR, label=r"total $\bar K$")
+    ax.set_xlabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)")
+    ax.set_ylabel(r"per-head mean KL (nats/step)")
+    ax.set_title(rf"per-head KL vs TE  (which latent head carries the coupling; "
+                 rf"run {metrics.get('run_tag', '?')})")
+    ax.legend(loc="upper left", frameon=False, fontsize=6.5)
     ps.style_axes(ax)
     fig.tight_layout()
     return _save_fig(fig, out_path, formats, dpi)
