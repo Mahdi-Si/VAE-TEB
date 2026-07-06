@@ -42,6 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
 import yaml  # noqa: E402  (import after the sys.path bootstrap)
 
 from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (  # noqa: E402
+    resolve_cache_dir,
     solve_cell_coupling,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic_v2.raw_generators import (  # noqa: E402
@@ -327,6 +328,7 @@ def data_previews(
         raw["fhr_raw"], raw["up_raw"], fields["fhr_st"], fields["up_st"],
         figs_dir / "raw_scatter_paired", coupled_idx=idx,
         latent_c=raw["latents"]["c"], latent_d=raw["latents"]["d"],
+        fhr_ph=fields["fhr_ph"], up_ph=fields["up_ph"],
         center_freqs=adapter.center_freqs_np, fs=adapter.fs, meta=meta,
     )
 
@@ -545,8 +547,10 @@ def run_test_plots(
         make_dataloader,
     )
     from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
+        SeqVaeLagAttn,
         build_model,
     )
+    from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
     from model.vae_teb_prediction.testing.analyses.kld_lag_diagnostics import (
         run_kld_lag_diagnostics,
     )
@@ -566,6 +570,9 @@ def run_test_plots(
     # load the state dict from the SAME already-deserialised blob (load_checkpoint_strict
     # accepts an object containing a state_dict) so the file is not read/unpickled twice.
     blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    # Fail fast (before construction) if the checkpoint was written by a different
+    # model class than the currently-active SeqVaeLagAttn alias.
+    check_model_class(blob, SeqVaeLagAttn.__name__)
     model, _ = build_model(dict(blob["model_kwargs"]), device)
     if load_checkpoint_strict(model, blob) is None:
         raise RuntimeError(f"could not load v2 checkpoint {ckpt_path} into the model")
@@ -623,6 +630,183 @@ def run_test_plots(
         "sample_diagnostics": sample_res,
         "kld_lag_diagnostics": kld_lag_res,
     }
+
+
+# =============================================================================
+# Per-split evaluation / reporting (grade EVERY dataset split, not just test)
+# =============================================================================
+
+# The dataset splits, in report order. A default run grades and plots every split
+# whose cache exists (train AND val AND test) into its OWN results subfolder
+# ``results/<tag>/<split>/`` so we can see how the model does on each; an explicit
+# ``--split NAME`` restricts to one.
+_ALL_SPLITS = ("train", "val", "test")
+
+
+def _resolve_splits(config: Dict[str, Any], benchmark: str,
+                    split: Optional[str]) -> List[str]:
+    r"""Resolve which dataset splits to evaluate / plot.
+
+    ``split`` of ``None`` / ``"all"`` selects **every** split whose cache ``.npz`` exists
+    (in ``train, val, test`` order), so a default run grades train, val AND test; an
+    explicit name restricts to that one split. Falls back to ``["test"]`` when nothing is
+    discoverable (e.g. before a build), matching the prior single-split default.
+
+    Args:
+        config: The parsed ``config_synth_v2.yaml`` tree.
+        benchmark: Active benchmark key under ``benchmarks``.
+        split: ``None`` / ``"all"`` for every present split, or a single split name.
+
+    Returns:
+        The ordered list of split names to process.
+    """
+    present: List[str] = []
+    try:
+        cache_dir = resolve_cache_dir(config, benchmark=benchmark)
+        present = [s for s in _ALL_SPLITS if (cache_dir / f"{s}.npz").is_file()]
+    except Exception:  # noqa: BLE001 -- cache path not resolvable yet (pre-build)
+        present = []
+    if split in (None, "", "all", "ALL"):
+        return present or ["test"]
+    return [str(split)]
+
+
+def _split_dir(results_dir: Path, split: str) -> Path:
+    r"""The per-split output directory ``results/<tag>/<split>/`` (created)."""
+    d = results_dir / split
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _eval_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
+                 splits: Sequence[str], results_dir: Path) -> Dict[str, Any]:
+    r"""Run ``eval_v2.run_eval`` for each split into its own ``results/<tag>/<split>/`` dir.
+
+    Args:
+        config: The parsed config tree.
+        benchmark: Active benchmark key.
+        ckpt: Explicit checkpoint path, or ``None`` for auto-discovery.
+        splits: The splits to grade.
+        results_dir: The run's ``results/<tag>/`` root.
+
+    Returns:
+        ``{split: metrics_dict}`` for each graded split.
+    """
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
+        run_eval,
+    )
+    out: Dict[str, Any] = {}
+    for s in splits:
+        sdir = _split_dir(results_dir, s)
+        print(f"[eval:{s}] grading -> {sdir / 'metrics.json'}")
+        metrics = run_eval(config, benchmark=benchmark, ckpt=ckpt, split=s, out_dir=sdir)
+        _print_eval_metrics(metrics)
+        out[s] = metrics
+    return out
+
+
+def _test_plots_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
+                       analysis_samples: int, splits: Sequence[str],
+                       results_dir: Path) -> None:
+    r"""Render the standard-testing per-sample diagnostics for each split (guarded)."""
+    for s in splits:
+        sdir = _split_dir(results_dir, s)
+        try:
+            run_test_plots(config, benchmark=benchmark, ckpt=ckpt, split=s,
+                           analysis_samples=analysis_samples, out_dir=sdir)
+        except Exception as exc:  # noqa: BLE001 -- diagnostics only, never fatal
+            print(f"[test_plots:{s}][warn] {type(exc).__name__}: {exc}")
+
+
+def _report_splits(config: Dict[str, Any], benchmark: str, *, splits: Sequence[str],
+                   results_dir: Path) -> Dict[str, Path]:
+    r"""Assemble a full report + figure gallery per split, then a cross-split index.
+
+    Each split's report and figures land in ``results/<tag>/<split>/`` (so every dataset
+    gets its own gallery); a top-level ``results/<tag>/report.md`` cross-links them and
+    tabulates the headline gates side by side so the splits are directly comparable.
+
+    Args:
+        config: The parsed config tree.
+        benchmark: Active benchmark key.
+        splits: The splits to report.
+        results_dir: The run's ``results/<tag>/`` root.
+
+    Returns:
+        ``{split: report_path}``.
+    """
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.final_report_v2 import (
+        final_report_v2,
+    )
+    paths: Dict[str, Path] = {}
+    for s in splits:
+        sdir = _split_dir(results_dir, s)
+        p = final_report_v2(config, benchmark=benchmark, out_dir=sdir, split=s)
+        print(f"[report:{s}] wrote {p}")
+        paths[s] = p
+    _write_split_index(results_dir, list(splits))
+    return paths
+
+
+def _write_split_index(results_dir: Path, splits: Sequence[str]) -> Path:
+    r"""Write a top-level ``report.md`` cross-linking every split's report + gate table.
+
+    Reads each split's ``metrics.json`` and tabulates the headline gates (γ vs TE_inj /
+    TE_scat, per-sample slope, LagMass, null ratios) side by side, so "how are we doing on
+    train vs val vs test" is answerable at a glance.
+
+    Args:
+        results_dir: The run's ``results/<tag>/`` root.
+        splits: The processed splits.
+
+    Returns:
+        The written ``report.md`` :class:`Path`.
+    """
+    import json
+
+    def _g(x: Any) -> str:
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            return "n/a"
+        return f"{xf:.4g}" if xf == xf else "n/a"
+
+    tag = results_dir.name
+    lines: List[str] = [
+        f"# synthetic_v2 per-split report index — `{tag}`", "",
+        "Every dataset split is graded and plotted into its own subfolder so the model's "
+        "behaviour can be compared across splits (over-/under-fitting shows up as a "
+        "train-vs-test gap in these gates).", "",
+        "| split | n | γ_inj (cell) | γ_scat (cell) | γ_inj (sample) | mean LagMass | "
+        "null (shuffle) | null (reverse) | report |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for s in splits:
+        m_path = results_dir / s / "metrics.json"
+        d: Dict[str, Any] = {}
+        if m_path.is_file():
+            try:
+                d = json.loads(m_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                d = {}
+        cal = d.get("calibration", {}) or {}
+        lag = d.get("lag_recovery", {}) or {}
+        nul = d.get("null_controls", {}) or {}
+        link = f"[`{s}/report.md`]({s}/report.md)" if m_path.is_file() else "_(no metrics)_"
+        lines.append(
+            f"| {s} | {d.get('n_samples', 'n/a')} | {_g(cal.get('gamma_inj'))} "
+            f"| {_g(cal.get('gamma_scat'))} | {_g(cal.get('gamma_inj_sample'))} "
+            f"| {_g(lag.get('mean_lag_mass'))} "
+            f"| {_g((nul.get('shuffle') or {}).get('mean_ratio'))} "
+            f"| {_g((nul.get('reverse') or {}).get('mean_ratio'))} | {link} |"
+        )
+    lines += ["", "Split-independent data-generation figures (raw / scattering / latent / "
+              "TE-authoring) live in [`figures/`](figures/); interactive training curves in "
+              "[`figures/training_curves.html`](figures/training_curves.html).", ""]
+    path = results_dir / "report.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[report] wrote cross-split index {path}")
+    return path
 
 
 # =============================================================================
@@ -797,7 +981,9 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     devices = pipeline.get("devices")
     epochs = pipeline.get("epochs")
     ckpt = pipeline.get("ckpt")
-    split = str(pipeline.get("split", "test"))
+    # ``split=None`` (the default) grades/plots EVERY available split (train, val, test)
+    # into its own ``results/<tag>/<split>/`` subfolder; an explicit name restricts to one.
+    split = pipeline.get("split", None)
     analysis_samples = int(pipeline.get("analysis_samples", 4))
     results_dir = _results_dir(config, benchmark)
     n_stages = len(_STAGE_ORDER)
@@ -975,57 +1161,50 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         )
         status["train"] = "dry-run" if dry_run else "done"
 
-    # --- eval (grade the checkpoint) -----------------------------------------
-    _sb("eval", note=f"split={split}")
+    # Which splits to grade / plot: every available split by default (each into its own
+    # results/<tag>/<split>/ subfolder), or the one requested via ``split``.
+    splits = _resolve_splits(config, benchmark, split)
+
+    # --- eval (grade the checkpoint, per split) ------------------------------
+    _sb("eval", note=f"splits={splits}")
     if not stages["eval"]:
         status["eval"] = "skipped (disabled)"
         print("[pipeline] disabled.")
     elif dry_run:
         status["eval"] = "dry-run"
-        print(f"[pipeline] would grade the checkpoint -> {results_dir / 'metrics.json'}")
+        print(f"[pipeline] would grade the checkpoint on splits {splits} -> "
+              f"{results_dir / '<split>' / 'metrics.json'}")
     else:
-        from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
-            run_eval,
-        )
-        metrics = run_eval(
-            config, benchmark=benchmark, ckpt=ckpt, split=split, out_dir=results_dir,
-        )
-        _print_eval_metrics(metrics)
+        _eval_splits(config, benchmark, ckpt=ckpt, splits=splits, results_dir=results_dir)
         status["eval"] = "done"
 
-    # --- test_plots (standard testing per-sample diagnostics) ----------------
-    _sb("test_plots", note=f"split={split}")
+    # --- test_plots (standard testing per-sample diagnostics, per split) -----
+    _sb("test_plots", note=f"splits={splits}")
     if not stages["test_plots"]:
         status["test_plots"] = "skipped (disabled)"
         print("[pipeline] disabled.")
     elif dry_run:
         status["test_plots"] = "dry-run"
-        print(f"[pipeline] would render {analysis_samples} TE-annotated sample PDFs.")
+        print(f"[pipeline] would render {analysis_samples} TE-annotated sample PDFs per "
+              f"split {splits}.")
     else:
         # Figures only -- never gate the run on a plotting failure.
-        try:
-            run_test_plots(
-                config, benchmark=benchmark, ckpt=ckpt, split=split,
-                analysis_samples=analysis_samples,
-            )
-            status["test_plots"] = "done"
-        except Exception as exc:  # noqa: BLE001 -- diagnostics only
-            print(f"[pipeline][warn] test_plots failed: {type(exc).__name__}: {exc}")
-            status["test_plots"] = "failed (non-fatal)"
+        _test_plots_splits(config, benchmark, ckpt=ckpt,
+                           analysis_samples=analysis_samples, splits=splits,
+                           results_dir=results_dir)
+        status["test_plots"] = "done"
 
-    # --- report (assemble the markdown report) -------------------------------
-    _sb("report")
+    # --- report (assemble the markdown report + gallery, per split) ----------
+    _sb("report", note=f"splits={splits}")
     if not stages["report"]:
         status["report"] = "skipped (disabled)"
         print("[pipeline] disabled.")
     elif dry_run:
         status["report"] = "dry-run"
-        print(f"[pipeline] would assemble the report under {results_dir}.")
+        print(f"[pipeline] would assemble a report per split {splits} under {results_dir}.")
     else:
-        from model.vae_teb_prediction.model.model_experiment.synthetic_v2.final_report_v2 import (
-            final_report_v2,
-        )
-        report_path = final_report_v2(config, benchmark=benchmark)
+        _report_splits(config, benchmark, splits=splits, results_dir=results_dir)
+        report_path = results_dir / "report.md"  # the cross-split index
         print(f"[report] wrote {report_path}")
         status["report"] = "done"
 
@@ -1151,11 +1330,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split",
-        default="test",
-        choices=["test", "val", "train"],
+        default="all",
+        choices=["all", "test", "val", "train"],
         help=(
-            "With --stage eval / test_plots, the split to use (default 'test'; falls "
-            "back to val/train when the requested split is not cached)."
+            "With --stage eval / test_plots / report, which split(s) to process. Default "
+            "'all' grades and plots EVERY cached split (train, val, test) into its own "
+            "results/<tag>/<split>/ subfolder; a single name restricts to that split."
         ),
     )
     parser.add_argument(
@@ -1325,49 +1505,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"  wrote {result['out_path']}")
             return 0
         if args.stage == "eval":
-            # S6: grade a trained checkpoint -> metrics.json (calibration vs TE_inj /
-            # TE_scat, lag recovery, null-control collapse). eval_v2 pulls torch / the
-            # loader + model stack, so import it lazily here.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
-                run_eval,
-            )
-            out_dir = _results_dir(config, benchmark)
-            metrics = run_eval(
-                config, benchmark=benchmark, ckpt=args.ckpt, split=args.split,
-                out_dir=out_dir,
-            )
-            _print_eval_metrics(metrics)
-            print(f"  wrote {out_dir / 'metrics.json'}")
+            # S6/S8: grade a trained checkpoint -> per-split metrics.json + per_sample_eval.npz
+            # (calibration vs TE_inj / TE_scat incl. the KLD-summary family, lag recovery,
+            # null-control collapse). By default EVERY available split (train/val/test) is
+            # graded into its own results/<tag>/<split>/ subfolder; --split restricts to one.
+            results_dir = _results_dir(config, benchmark)
+            splits = _resolve_splits(config, benchmark, args.split)
+            _eval_splits(config, benchmark, ckpt=args.ckpt, splits=splits,
+                         results_dir=results_dir)
+            print(f"  wrote per-split metrics under {results_dir / '<split>'}")
             return 0
         if args.stage == "test_plots":
-            # S7-T07: bridge a v2 cache split through the standard testing pipeline so the
-            # per-sample diagnostics carry the synthetic TE provenance. Imports the model /
-            # testing stack lazily via run_test_plots.
-            run_test_plots(
-                config, benchmark=benchmark, ckpt=args.ckpt, split=args.split,
-                analysis_samples=args.analysis_samples,
-            )
+            # S7-T07: bridge each v2 cache split through the standard testing pipeline so the
+            # per-sample diagnostics carry the synthetic TE provenance. Runs per split into
+            # results/<tag>/<split>/test_plots/ (all splits by default; --split restricts).
+            results_dir = _results_dir(config, benchmark)
+            splits = _resolve_splits(config, benchmark, args.split)
+            _test_plots_splits(config, benchmark, ckpt=args.ckpt,
+                               analysis_samples=args.analysis_samples, splits=splits,
+                               results_dir=results_dir)
             return 0
         if args.stage == "report":
-            # S7-T05: assemble the full markdown report + headline figure from meta.json /
-            # metrics.json / realizability.json / the figure gallery / the standard-testing
-            # sample diagnostics. Degrades gracefully when an artifact is missing (so it can
-            # run before the headline train/eval); the minimal eval_v2.write_report remains
-            # the internal metrics-only fallback.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.final_report_v2 import (
-                final_report_v2,
-            )
-            # Graceful degradation is intentional (the report can run before the headline
-            # eval), but warn loudly when metrics.json is absent so a skipped/failed eval is
-            # not mistaken for a completed report.
-            if not (_results_dir(config, benchmark) / "metrics.json").is_file():
+            # S7-T05/S8: assemble a full markdown report + figure gallery PER split (from that
+            # split's meta.json / metrics.json / per_sample_eval.npz / realizability.json /
+            # sample diagnostics) into results/<tag>/<split>/, plus a top-level cross-split
+            # index. Degrades gracefully when an artifact is missing (so it can run before the
+            # headline train/eval).
+            results_dir = _results_dir(config, benchmark)
+            splits = _resolve_splits(config, benchmark, args.split)
+            if not any((results_dir / s / "metrics.json").is_file() for s in splits):
                 print(
-                    "[report] WARNING: no metrics.json found; the report's calibration / "
-                    "lag / null gates will read 'n/a'. Run --stage eval for the full report.",
+                    "[report] WARNING: no per-split metrics.json found; the reports' "
+                    "calibration / lag / null gates will read 'n/a'. Run --stage eval first.",
                     file=sys.stderr,
                 )
-            report_path = final_report_v2(config, benchmark=benchmark)
-            print(f"[report] wrote {report_path}")
+            _report_splits(config, benchmark, splits=splits, results_dir=results_dir)
+            print(f"[report] wrote per-split reports + cross-split index under {results_dir}")
             return 0
         raise NotImplementedError(
             f"stage '{args.stage}' lands in a later sprint; Sprints 3-6 implement "
@@ -1402,7 +1575,9 @@ if __name__ == "__main__":
         "epochs": None,                   # None -> optim.epochs
         # --- eval / test_plots knobs ------------------------------------------
         "ckpt": None,                     # None -> best/final under results/<tag>/
-        "split": "test",                  # eval / test_plots split (falls back val/train)
+        "split": None,                    # eval / test_plots / report split; None -> ALL
+                                          #   cached splits (train, val, test), each into
+                                          #   its own results/<tag>/<split>/ subfolder
         "analysis_samples": 4,            # TE-annotated per-sample PDFs in test_plots
         # --- diagnostic-stage settings ----------------------------------------
         "solve_te_args": None,            # (target_te, D) required iff stages.solve_te

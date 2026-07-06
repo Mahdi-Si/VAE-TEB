@@ -23,13 +23,13 @@ Multi-GPU correctness highlights:
 
 * **Latent stats.** The model's ``mu_post_running_*`` EMA buffers diverge across
   ranks during training. After ``fit`` we call
-  :meth:`SeqVaeLagAttnV1.fit_latent_stats` on **every** rank (it ``all_reduce``s
+  :meth:`SeqVaeLagAttn.fit_latent_stats` on **every** rank (it ``all_reduce``s
   exact sums) over a **sharded** loader so the aggregated count is truthful.
 * **LR scaling.** The locked policy keeps the per-GPU batch (so the global batch
   is ``batch_size * n_gpus``) and scales ``lr`` linearly with a short warmup.
 * **Checkpoint bridge.** ``final.ckpt`` (post latent-stats fit) and ``best.ckpt``
   (lowest ``val/total_loss``, converted from the Lightning best snapshot) store
-  the bare ``SeqVaeLagAttnV1`` state dict (unprefixed) + ``model_kwargs`` so the
+  the bare ``SeqVaeLagAttn`` state dict (unprefixed) + ``model_kwargs`` so the
   strict loader ``load_checkpoint_strict`` matches exactly. Both are also written
   **every validation epoch during training** (rank-0
   :class:`_SyntheticCheckpointCallback`, ``latent_stats_fitted=False``) so a run
@@ -96,7 +96,9 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal imp
     save_checkpoint,
     set_seed,
 )
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from train.graph_models_utils import load_checkpoint_strict
 
 _PKG_DIR = Path(__file__).resolve().parent
@@ -381,7 +383,7 @@ class _SyntheticCheckpointCallback(pl.Callback):
 
     Args:
         results_dir: Run directory; ``best.ckpt`` / ``final.ckpt`` land here.
-        model_kwargs: Exact ``SeqVaeLagAttnV1`` constructor kwargs (stored so the
+        model_kwargs: Exact ``SeqVaeLagAttn`` constructor kwargs (stored so the
             strict loader can rebuild the architecture).
         config: The effective (post-override) config.
         datamodule: The :class:`SyntheticTEDataModule`; its ``data_meta`` (the
@@ -590,7 +592,7 @@ def _export_checkpoints(
 ) -> None:
     """Write ``final.ckpt`` and ``best.ckpt`` in the synthetic format (rank 0).
 
-    The bare ``SeqVaeLagAttnV1`` (``pl_model.orig_model``) is checkpointed so the
+    The bare ``SeqVaeLagAttn`` (``pl_model.orig_model``) is checkpointed so the
     state-dict keys are unprefixed and align exactly with the strict loader. The
     ``loss_settings`` carries **both** ``beta`` and ``kld_beta`` (and the
     lambda / likelihood / sigma_obs / free_bits knobs): ``train_minimal`` stores
@@ -607,7 +609,7 @@ def _export_checkpoints(
       no per-epoch model copy of its own, so the Lightning ``ModelCheckpoint``
       (``lightning_ckpts/lightning_best-*.ckpt``) is the only record of the
       best-val weights; they are loaded into a fresh
-      ``SeqVaeLagAttnV1(**model_kwargs)`` via ``load_checkpoint_strict`` (which
+      ``SeqVaeLagAttn(**model_kwargs)`` via ``load_checkpoint_strict`` (which
       strips the ``model.`` / ``_orig_model.`` wrapper prefixes and dedups the
       duplicate registration) and re-saved here with ``latent_stats_fitted=False``
       (the best snapshot predates the latent-stats fit, exactly as single-GPU).
@@ -652,11 +654,11 @@ def _export_checkpoints(
         clamp = best_kwargs.get("logvar_clamp")
         if clamp is not None and not isinstance(clamp, tuple):
             best_kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
-        best_model = SeqVaeLagAttnV1(**best_kwargs)
+        best_model = SeqVaeLagAttn(**best_kwargs)
         if load_checkpoint_strict(best_model, best_path, map_location="cpu") is None:
             raise RuntimeError(
                 f"load_checkpoint_strict could not align the Lightning best "
-                f"checkpoint {best_path} with SeqVaeLagAttnV1(**model_kwargs)."
+                f"checkpoint {best_path} with SeqVaeLagAttn(**model_kwargs)."
             )
         best_score = _as_float(getattr(ckpt_cb, "best_model_score", float("nan")))
         save_checkpoint(
@@ -699,7 +701,7 @@ def _export_checkpoints(
 def train_ddp(
     config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Train ``SeqVaeLagAttnV1`` on the ``G1_mix`` pool across all GPUs (DDP).
+    """Train ``SeqVaeLagAttn`` on the ``G1_mix`` pool across all GPUs (DDP).
 
     Args:
         config: The parsed ``config_synth.yaml`` (any active benchmark; this
@@ -781,7 +783,7 @@ def train_ddp(
                                   map_location="cpu") is None:
             raise RuntimeError(
                 f"load_checkpoint_strict could not align {resume_path} with "
-                f"SeqVaeLagAttnV1(**model_kwargs) -- the checkpoint must come "
+                f"SeqVaeLagAttn(**model_kwargs) -- the checkpoint must come "
                 f"from a run with the same model.* config (final.ckpt / "
                 f"best.ckpt, not a Lightning lightning_best-*.ckpt)."
             )

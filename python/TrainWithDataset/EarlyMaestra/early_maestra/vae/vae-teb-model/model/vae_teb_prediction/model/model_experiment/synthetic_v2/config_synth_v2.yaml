@@ -143,6 +143,13 @@ benchmarks:
       null_controls: [shuffle, reverse]
       lag_mass_threshold: 0.8
       lag_tolerance_steps: 1    # +-1-step tolerance for the 4 s phi-averaging lag blur
+      kld_analysis:             # S8 / EXPLAINED §14.5: KLD-summary family vs TE figures
+        # The full per-sample KLD family -- time-summaries (mean/sum/max/median/p90),
+        # window variants (full / post-warmup), the directed-KL split (in-band / out-band
+        # over the true lag band L*), and the per-head KL -- is ALWAYS computed into
+        # per_sample_eval.npz and calibration.kld_variants; this knob only picks which
+        # single summary the featured density / violin figures highlight.
+        density_variant: kbar   # one of the kbar* summary columns (default: canonical K_bar)
 
 # --- model constructor kwargs (inherited verbatim from synthetic/config_synth.yaml;
 #     the UNCHANGED SeqVaeLagAttnV1 consumes the v2 features at c_y=87 / c_u=101) ---
@@ -173,6 +180,76 @@ model:
   horizon_kernel: 3
   horizon_film: true
   encoder_extra_dilations: [8, 16]
+
+  # --- v2 overlay (applied ONLY when the SeqVaeLagAttn alias is v2) ----------
+  # build_model (pl_module_v2) strips this nested block and merges it over the
+  # flat keys above when the active model class is SeqVaeLagAttnV2 (detected by
+  # the ``source_scales`` constructor arg); under the v1 alias it is ignored, so
+  # the flat block stays a faithful v1 reproduction (use_entmax: false). This is
+  # how a single ``run_pipeline_v2 --stage train`` trains v2 end-to-end after the
+  # one-line alias toggle. See vae-teb-lag-attn-v2-spec-and-sprints.md S6-T01.
+  v2:
+    use_entmax: true                       # entmax15 sparse lag posterior
+    # v2 target encoder (gated causal TCN; replaces the v1 conv+LSTM).
+    target_encoder_blocks: 6
+    target_kernel: 5
+    target_dilations: [1, 2, 4, 8, 16, 32]
+    # v2 bounded source lag-atom encoder.
+    source_scales: [3, 9, 21]
+    d_u: 96
+    # lag attention / posterior.
+    d_k: 16
+    d_e: 32
+    active_lags: 8
+    active_lags_warmup: 16
+    # content-KL free bits (nats/dim; floors K^Z only) + lag regularizers.
+    kappa_z: 0.05
+    lambda_tv: 1.0e-4
+    lambda_ent: 0.0
+    context_dim: 5
+    # physical-time lag reporting (Sprint 7 diagnostics).
+    step_seconds: 4.0
+    delta_up_seconds: 20.0                  # dataset applies a fixed 20 s UP delay
+    # optional flag-gated features (Sprint 7; default off).
+    use_crossphase_bias: false
+    c_cross: 79
+    use_outcome_head: false
+    outcome_classes: 3
+
+# --- v2 curriculum (arch spec section 23; consumed only under the v2 alias) ---
+# train_v2 passes this to SyntheticSeqVaeLagAttnV2Pl, whose _apply_curriculum
+# calls model.set_curriculum_stage(epoch, stages) each epoch. A no-op for v1
+# (the method is absent). Stage 1 pretrains the target-only baseline; Stage 2
+# attaches the source residual with a weak constant beta at Ka=16; Stage 3
+# anneals Ka to 8 and warms beta to beta_max over 50 epochs. Boundaries suit the
+# optim.epochs=100 headline run; a --pilot smoke stays in Stage 1, so the
+# S6-T01 smoke test disables the curriculum to exercise the full source path.
+curriculum:
+  enabled: true
+  stages:
+    - start_epoch: 0
+      active_lags: 16
+      enable_source: false
+      enable_residual: false
+      enable_kl: false
+      beta: 0.0
+    - start_epoch: 5
+      active_lags: 16
+      enable_source: true
+      enable_residual: true
+      enable_kl: true
+      beta: {kind: constant, value: 1.0e-4}
+    - start_epoch: 15
+      active_lags: 8
+      enable_source: true
+      enable_residual: true
+      enable_kl: true
+      beta:
+        kind: linear_warmup
+        start: 1.0e-4
+        end: 5.0e-2
+        warmup_epochs: 50
+        warmup_start_epoch: 15
 
 # --- loss weights (inherited from v1) ----------------------------------------
 loss:

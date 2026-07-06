@@ -110,7 +110,7 @@ class _StubModel:
 
     def __init__(self, T: int, L: int, *, kld_value: float = 1.0, lag_peak: int = 2,
                  horizon: int = _HORIZON, c_y: int = _C_FHR_ST + _C_FHR_PH,
-                 perfect_full: bool = False):
+                 perfect_full: bool = False, num_heads: int = 0):
         self._T = int(T)
         self._L = int(L)
         self._kld = float(kld_value)
@@ -118,6 +118,7 @@ class _StubModel:
         self._Hd = int(horizon)
         self._C = int(c_y)
         self._perfect = bool(perfect_full)
+        self._num_heads = int(num_heads)   # >0 -> also emit kld_per_t_per_head (equal split)
 
     def eval(self):
         return self
@@ -138,7 +139,7 @@ class _StubModel:
             if T_valid > 0:
                 Y_plus = Y[:, 1:, :].unfold(1, self._Hd, 1).permute(0, 1, 3, 2)
                 mu_full[:, :T_valid] = Y_plus
-        return {
+        out = {
             "kld_per_t": kld,
             "te_lag_map": lagmap,
             "attn_weights": attn,
@@ -146,6 +147,11 @@ class _StubModel:
             "mu_base": mu_base,
             "mu_full": mu_full,
         }
+        if self._num_heads > 0:
+            out["kld_per_t_per_head"] = torch.full(
+                (B, self._T, self._num_heads), self._kld / self._num_heads
+            )
+        return out
 
 
 def _fake_batch(n: int, *, T: int, cell_id: int, te_inj: float, te_scat: float,
@@ -278,6 +284,90 @@ def test_calib_both_te_and_monotonic() -> None:
     assert set(cal["by_lag"]) == {4}
     assert cal["by_lag"][4]["gamma_inj"] == pytest.approx(0.6, abs=0.02)
     assert cal["by_lag"][4]["n"] == 8
+
+
+# ---------------------------------------------------------------------------
+# S8: KLD summary family (§14.5)
+# ---------------------------------------------------------------------------
+def test_row_window_reductions() -> None:
+    r"""``_row_window_reductions`` reduces each row over its boolean window; empty -> nan."""
+    x = np.array([[1.0, 2.0, 3.0, 4.0, 5.0], [10.0, 20.0, 30.0, 40.0, 50.0]])
+    valid = np.array([[False, True, True, True, False],
+                      [True, True, False, False, False]])
+    red = eval_v2._row_window_reductions(x, valid)
+    assert red["sum"][0] == pytest.approx(9.0)        # 2+3+4
+    assert red["max"][0] == pytest.approx(4.0)
+    assert red["median"][0] == pytest.approx(3.0)
+    assert red["p90"][0] == pytest.approx(np.percentile([2.0, 3.0, 4.0], 90.0))
+    assert red["sum"][1] == pytest.approx(30.0) and red["max"][1] == pytest.approx(20.0)
+    empty = eval_v2._row_window_reductions(np.zeros((1, 3)), np.zeros((1, 3), bool))
+    assert np.isnan(empty["sum"][0]) and np.isnan(empty["max"][0])
+
+
+def test_kld_summary_family_collected() -> None:
+    r"""``collect_per_sample_kbar`` emits the KLD summary family + per-head columns.
+
+    With a constant per-step KL the time-summaries collapse to the same value; the directed
+    split satisfies ``kbar_inband + kbar_outband == kbar``; and the per-head clean-window KL
+    is the equal split. The clean window for ``D=4, w=2, H=4, T=16`` is ``[3, 12)`` (length 9),
+    so the integrated sum is ``2.0 * 9``.
+    """
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=2.0, lag_peak=3, num_heads=2)
+    loader = [
+        _fake_batch(4, T=T, cell_id=1, te_inj=2.0, te_scat=1.8, frac_phi=0.9,
+                    delay=4, seed=3),
+    ]
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, loader, torch.device("cpu"), warmup=_WARMUP, horizon=_HORIZON,
+    )
+    n = arrs["n"]
+    for key in ("kbar_sum", "kbar_max", "kbar_median", "kbar_p90", "kbar_full",
+                "kbar_postwarm", "kbar_inband", "kbar_outband",
+                "kbar_head", "kbar_head0", "kbar_head1"):
+        assert key in arrs, key
+    for key in ("kbar_sum", "kbar_max", "kbar_median", "kbar_p90", "kbar_full",
+                "kbar_postwarm", "kbar_inband", "kbar_outband", "kbar_head0"):
+        assert np.asarray(arrs[key]).shape == (n,), key
+    assert arrs["kbar_head"].shape == (n, 2)
+    # constant kld=2.0 over the clean window -> every time-summary collapses to 2.0.
+    for key in ("kbar", "kbar_max", "kbar_median", "kbar_p90", "kbar_full", "kbar_postwarm"):
+        assert np.allclose(arrs[key], 2.0), key
+    assert np.allclose(arrs["kbar_sum"], 18.0)                       # 2.0 * |[3,12)| = 18
+    assert np.allclose(arrs["kbar_head0"], 1.0) and np.allclose(arrs["kbar_head1"], 1.0)
+    # directed-KL split identity (exact by construction).
+    assert np.allclose(arrs["kbar_inband"] + arrs["kbar_outband"], arrs["kbar"])
+    # peak lag 3 is inside L* = {0..3} for D=4, H=4 -> in-band carries the te_lag_map mass.
+    assert np.all(arrs["kbar_inband"] > 0.0)
+
+
+def test_fit_calibration_kld_variants() -> None:
+    r"""``fit_calibration`` emits a ``kld_variants`` block ranking each summary vs both TEs."""
+    rng = np.random.default_rng(0)
+    cell_ids = np.repeat([0, 1, 2, 3], 20)
+    te_inj = np.repeat([0.0, 1.0, 2.0, 3.0], 20).astype(float)
+    te_scat = te_inj * 1.1
+    kbar = 0.3 + 0.5 * te_inj + rng.normal(0, 0.01, 80)
+    arrs = {
+        "cell_id": cell_ids, "te_inj": te_inj, "te_scat": te_scat, "kbar": kbar,
+        "delay": np.full(80, 4), "frac_phi": np.full(80, 1.1), "held_out": np.zeros(80),
+        "kbar_sum": kbar * 10.0, "kbar_max": kbar * 2.0,
+        "kbar_inband": kbar * 0.6, "kbar_outband": kbar * 0.4,
+        "kbar_head0": kbar * 0.6, "kbar_head1": np.full(80, 0.1),
+    }
+    cal = eval_v2.fit_calibration(arrs)
+    kv = cal["kld_variants"]
+    for v in ("kbar", "kbar_sum", "kbar_max", "kbar_inband", "kbar_outband",
+              "kbar_head0", "kbar_head1"):
+        assert v in kv, v
+        for key in ("gamma_inj", "r2_inj", "pearson_inj", "spearman_inj",
+                    "gamma_scat", "spearman_scat", "n"):
+            assert key in kv[v], (v, key)
+    assert kv["kbar"]["pearson_inj"] > 0.99                          # kbar tracks TE tightly
+    assert abs(kv["kbar_head1"]["pearson_inj"]) < 0.3               # flat head ~ uncorrelated
+    # a pure scalar multiple of kbar shares the correlation but scales the slope.
+    assert kv["kbar_sum"]["gamma_inj"] == pytest.approx(10.0 * kv["kbar"]["gamma_inj"], rel=1e-6)
+    assert kv["kbar_sum"]["pearson_inj"] == pytest.approx(kv["kbar"]["pearson_inj"], rel=1e-6)
 
 
 # ---------------------------------------------------------------------------

@@ -37,10 +37,17 @@ import torch
 import yaml
 
 from train.graph_models_utils import load_checkpoint_strict
-# TEMP: legacy pre-refactor model so old (pre-375b50d) checkpoints load.
-# Revert to the line below it once testing of the old checkpoint is done.
-from model.vae_teb_prediction.model.vae_teb_lag_attn_old import SeqVaeLagAttnV1
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line
+# (S6-T03). The active line is v1 (the committed default); uncomment the v2 line
+# and comment the v1 line to evaluate a v2 checkpoint. The ``_old`` line is the
+# legacy pre-refactor module kept only to align old (pre-375b50d) checkpoints;
+# toggle it in (and comment the others) for that one case.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn  # ACTIVE (v1)
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_old import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# The checkpoint model-class guard lives with v2; importing it is version-agnostic.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
 
 
 def _lag_attn_kwargs_from_config(
@@ -88,7 +95,7 @@ def _lag_attn_kwargs_from_config(
     # checkpoint was trained with is honoured (and unknown config keys dropped).
     # ``init_weights`` is intentionally left at its constructor default (the
     # loaded checkpoint overwrites the weights regardless).
-    params = inspect.signature(SeqVaeLagAttnV1.__init__).parameters
+    params = inspect.signature(SeqVaeLagAttn.__init__).parameters
     kwargs: Dict[str, Any] = {}
     for name, param in params.items():
         if name in ("self", "init_weights"):
@@ -146,7 +153,7 @@ class TestRunner:
         ...         outputs = runner.forward(batch)
     """
 
-    model: SeqVaeLagAttnV1
+    model: SeqVaeLagAttn
     device: torch.device
     output_dir: Path
     warmup_steps: int = 30
@@ -171,21 +178,32 @@ class TestRunner:
         cls,
         checkpoint_path: Union[str, Path],
         output_dir: Union[str, Path],
-        config_path: Union[str, Path],
+        config_path: Optional[Union[str, Path]] = None,
         device: Optional[torch.device] = None,
     ) -> "TestRunner":
-        """Create a runner by building the model from a YAML config and
-        loading its weights from a checkpoint file.
+        """Create a runner by building the active-alias model and loading weights.
+
+        Two build paths, tried in order (mirroring ``run_pipeline_v2``):
+
+        1. **Version-agnostic** -- when the checkpoint carries its own
+           ``model_kwargs`` (every ``save_checkpoint_v2`` /
+           ``train_minimal.save_checkpoint`` file does), the model is rebuilt
+           directly from those kwargs via the ``SeqVaeLagAttn`` alias. A
+           :func:`check_model_class` guard runs first, so loading a v2 checkpoint
+           under the v1 alias (or vice versa) fails with an actionable message
+           **before** construction rather than a cryptic ``state_dict`` error.
+           ``config_path`` is not required on this path.
+        2. **Legacy config** -- for old (pre-``model_kwargs`` / ``_old``)
+           checkpoints, ``config_path`` is parsed into constructor kwargs via
+           :func:`_lag_attn_kwargs_from_config` (the original behaviour).
 
         Args:
             checkpoint_path: Path to a Lightning/PyTorch checkpoint file
-                (``.ckpt`` or ``.pt``) containing ``SeqVaeLagAttnV1``
-                weights (possibly wrapped under ``_orig_model.`` /
-                ``pytorch_model.``).
+                (``.ckpt`` or ``.pt``), possibly wrapped under ``_orig_model.`` /
+                ``pytorch_model.``.
             output_dir: Directory for saving test results.
-            config_path: Path to the trainer YAML config used to train the
-                checkpoint. ``model_config.VAE_model.*`` is parsed into the
-                model constructor kwargs.
+            config_path: Trainer YAML config. Optional when the checkpoint has
+                ``model_kwargs``; required for the legacy path.
             device: Torch device to use. Auto-detects if None
                 (``cuda:0`` or ``cpu``).
 
@@ -193,39 +211,75 @@ class TestRunner:
             Configured :class:`TestRunner` with the loaded model.
 
         Raises:
-            FileNotFoundError: If ``config_path`` is missing.
+            FileNotFoundError: If the legacy path is taken and ``config_path`` is
+                missing.
+            ValueError: If the checkpoint's ``model_class`` does not match the
+                active alias, or no build path is available.
             RuntimeError: If ``load_checkpoint_strict`` cannot align any
                 candidate submodule with the checkpoint state dict.
         """
         from loguru import logger
 
-        cfg_path = Path(config_path)
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
         if device is None:
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        with cfg_path.open("r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        # Deserialise once so both the guard and the strict load see the same blob.
+        blob = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        ckpt_kwargs = blob.get("model_kwargs") if isinstance(blob, dict) else None
 
-        model_kwargs = _lag_attn_kwargs_from_config(cfg)
+        if ckpt_kwargs:
+            # Path 1: rebuild from the checkpoint's own kwargs (version-agnostic).
+            if config_path is not None:
+                logger.warning(
+                    "TestRunner.from_checkpoint: checkpoint carries its own "
+                    "model_kwargs, so the supplied config_path={} is IGNORED "
+                    "for architecture reconstruction (the checkpoint's kwargs "
+                    "take precedence). Pass config_path=None to silence this, "
+                    "or rebuild without model_kwargs to force the legacy "
+                    "config-driven path.",
+                    config_path,
+                )
+            check_model_class(blob, SeqVaeLagAttn.__name__)
+            model_kwargs = dict(ckpt_kwargs)
+            if isinstance(model_kwargs.get("logvar_clamp"), list):
+                lv = model_kwargs["logvar_clamp"]
+                model_kwargs["logvar_clamp"] = (float(lv[0]), float(lv[1]))
+            source = "checkpoint model_kwargs"
+        else:
+            # Path 2: legacy checkpoints carry no kwargs; parse the YAML config.
+            if config_path is None:
+                raise ValueError(
+                    "checkpoint has no 'model_kwargs'; a config_path is required "
+                    "to rebuild the model (legacy path)."
+                )
+            cfg_path = Path(config_path)
+            if not cfg_path.exists():
+                raise FileNotFoundError(f"Config file not found: {cfg_path}")
+            with cfg_path.open("r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            model_kwargs = _lag_attn_kwargs_from_config(cfg)
+            source = f"config {cfg_path.name}"
+
         logger.info(
-            "Building SeqVaeLagAttnV1 with kwargs: "
-            f"d_model={model_kwargs['d_model']}, d_z={model_kwargs['d_z']}, "
-            f"c_y={model_kwargs['c_y']}, c_u={model_kwargs['c_u']}, "
-            f"use_up_st={model_kwargs['use_up_st']}, horizon={model_kwargs['horizon']}, "
-            f"max_lag={model_kwargs['max_lag']}, warmup_period={model_kwargs['warmup_period']}"
+            "Building {} from {} with kwargs: "
+            "d_model={}, d_z={}, c_y={}, c_u={}, use_up_st={}, horizon={}, "
+            "max_lag={}, warmup_period={}",
+            SeqVaeLagAttn.__name__, source,
+            model_kwargs.get("d_model"), model_kwargs.get("d_z"),
+            model_kwargs.get("c_y"), model_kwargs.get("c_u"),
+            model_kwargs.get("use_up_st"), model_kwargs.get("horizon"),
+            model_kwargs.get("max_lag"), model_kwargs.get("warmup_period"),
         )
 
-        model = SeqVaeLagAttnV1(**model_kwargs)
-        loaded = load_checkpoint_strict(model, str(checkpoint_path))
+        model = SeqVaeLagAttn(**model_kwargs)
+        loaded = load_checkpoint_strict(model, blob)
         if loaded is None:
             raise RuntimeError(
-                f"Failed to load lag-attn-v1 checkpoint '{checkpoint_path}'. "
-                f"load_checkpoint_strict returned None; inspect its log output "
-                f"for candidate-module alignment details (common wrapper "
-                f"prefixes: '_orig_model.', 'model.', 'pytorch_model.')."
+                f"Failed to load {SeqVaeLagAttn.__name__} checkpoint "
+                f"'{checkpoint_path}'. load_checkpoint_strict returned None; "
+                f"inspect its log output for candidate-module alignment details "
+                f"(common wrapper prefixes: '_orig_model.', 'model.', "
+                f"'pytorch_model.')."
             )
 
         model.eval()

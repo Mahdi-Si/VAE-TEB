@@ -148,6 +148,7 @@ def final_report_v2(
     *,
     benchmark: str = "G1_raw",
     out_dir: Optional[Path] = None,
+    split: Optional[str] = None,
     render_headline: bool = True,
 ) -> Path:
     r"""Assemble the full ``synthetic_v2`` markdown report + headline figure (S7-T05).
@@ -155,13 +156,20 @@ def final_report_v2(
     Collates ``meta.json`` (build manifest / three-TE-per-cell table), ``metrics.json``
     (calibration / lag / null gates), ``realizability.json`` (model-free preservation),
     the figure gallery, and the standard-testing ``sample_metrics.csv`` + a representative
-    TE-annotated sample PDF into ``results/<tag>/report.md``. Missing artifacts degrade to
+    TE-annotated sample PDF into ``<out_dir>/report.md``. Missing artifacts degrade to
     an explicit "not available" note rather than failing.
+
+    When ``out_dir`` is a **per-split** directory (``results/<tag>/<split>/``, as the driver
+    passes for each of train / val / test), the split-independent ``realizability.json`` is
+    read from the parent ``results/<tag>/`` if not present locally, and the report links the
+    shared split-independent figure gallery (``../figures/``).
 
     Args:
         config: The parsed ``config_synth_v2.yaml`` tree.
         benchmark: Active benchmark key under ``benchmarks``.
         out_dir: Optional override for the run directory (defaults to ``results/<tag>/``).
+        split: Optional split label (``train`` / ``val`` / ``test``) for the report header
+            when ``out_dir`` is a per-split directory.
         render_headline: When ``True`` and ``metrics.json`` is present, render the headline
             diagnostics figure into ``figures/headline_diagnostics.{pdf,png}``.
 
@@ -173,8 +181,15 @@ def final_report_v2(
     figures_dir = results_dir / "figures"
 
     metrics = _load_json(results_dir / "metrics.json")
-    realizability = _load_json(results_dir / "realizability.json")
+    # realizability.json is split-independent (model-free preflight): read it locally, else
+    # from the parent tag root when this is a per-split subfolder.
+    realizability = (_load_json(results_dir / "realizability.json")
+                     or _load_json(results_dir.parent / "realizability.json"))
     meta = _load_json(cache_dir / "meta.json") if cache_dir is not None else None
+    # The shared, split-independent figure gallery (raw / scattering / latent story +
+    # training curves) lives at the tag root; link it from a per-split report.
+    shared_figures = results_dir.parent / "figures"
+    have_shared = shared_figures.is_dir() and shared_figures != figures_dir
 
     # Render the headline diagnostics figure plus the full aggregate + prediction-gap
     # gallery from the metrics (and realizability, for TE_raw). Each plot is guarded
@@ -192,6 +207,15 @@ def final_report_v2(
                         .get("eval", {}).get("realizability", {}).get("frac_threshold"))
         except AttributeError:
             frac_thr = None
+        # Which KLD summary the single-variant figures (density / violins) feature; the full
+        # family is always computed in per_sample_eval.npz (§14.5).
+        density_variant = "kbar"
+        try:
+            density_variant = str((config.get("benchmarks", {}).get(benchmark, {})
+                                   .get("eval", {}).get("kld_analysis", {}) or {})
+                                  .get("density_variant", "kbar"))
+        except AttributeError:
+            density_variant = "kbar"
         plot_specs = [
             ("headline_diagnostics",
              lambda p: viz.plot_diagnostics_panel(metrics, p, realizability=realizability)),
@@ -199,6 +223,20 @@ def final_report_v2(
              lambda p: viz.plot_te_kld_scatter(per_sample, metrics, p)),
             ("calibration_by_lag",
              lambda p: viz.plot_calibration_by_lag(metrics, p, per_sample=per_sample)),
+            # KLD-summary family vs TE (§14.5): different KLD definitions + summarisations.
+            ("kld_variants_vs_te",
+             lambda p: viz.plot_kld_variants_vs_te(per_sample, metrics, p)),
+            ("kld_variants_vs_te_scat",
+             lambda p: viz.plot_kld_variants_vs_te(per_sample, metrics, p, te_axis="scat")),
+            ("kld_te_correlation",
+             lambda p: viz.plot_kld_te_correlation(metrics, p)),
+            ("kld_te_density",
+             lambda p: viz.plot_kld_te_density(per_sample, metrics, p, variant=density_variant)),
+            ("kld_distribution_by_te",
+             lambda p: viz.plot_kld_distribution_by_te(per_sample, metrics, p,
+                                                       variant=density_variant)),
+            ("per_head_kld_vs_te",
+             lambda p: viz.plot_per_head_kld_vs_te(per_sample, metrics, p)),
             ("frac_phi_distribution",
              lambda p: viz.plot_frac_phi_distribution(metrics, p, frac_threshold=frac_thr)),
             ("lag_mass_summary", lambda p: viz.plot_lag_mass_summary(metrics, p)),
@@ -222,6 +260,7 @@ def final_report_v2(
 
     lines = _render_markdown(
         config, benchmark, results_dir, metrics, meta, realizability, rep, figures,
+        split=split, shared_figures=(shared_figures if have_shared else None),
     )
     report_path = results_dir / "report.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -238,16 +277,21 @@ def _render_markdown(
     realizability: Optional[Dict[str, Any]],
     rep: Optional[Dict[str, str]],
     figures: List[Path],
+    *,
+    split: Optional[str] = None,
+    shared_figures: Optional[Path] = None,
 ) -> List[str]:
     r"""Build the report markdown lines from the collated artifacts."""
     tag = str(config.get("experiment", {}).get("tag", benchmark))
+    split_label = split or (metrics or {}).get("split")
     cal = (metrics or {}).get("calibration", {}) or {}
     lag = (metrics or {}).get("lag_recovery", {}) or {}
     nul = (metrics or {}).get("null_controls", {}) or {}
     frac = (metrics or {}).get("frac_phi", {}) or {}
 
+    title_split = f" — split `{split_label}`" if split_label else ""
     lines: List[str] = [
-        f"# synthetic_v2 final report — `{tag}`",
+        f"# synthetic_v2 final report — `{tag}`{title_split}",
         "",
         f"- benchmark: `{benchmark}`",
         f"- render mode: `{(meta or {}).get('render_mode', (config.get('benchmarks', {}).get(benchmark, {}).get('raw', {}) or {}).get('render_mode', 'am_carrier'))}`",
@@ -296,6 +340,9 @@ def _render_markdown(
                 f"| {e.get('n', '?')} |"
             )
         lines.append("")
+
+    # --- KLD-summary family vs TE (§14.5) --------------------------------------------------
+    lines += _kld_variants_section(cal)
 
     if metrics is None:
         lines += [
@@ -370,6 +417,12 @@ def _render_markdown(
     if not figures and not tc_html.is_file():
         lines.append("> ⚠ no figures found under `figures/` — run the preview / eval / "
                      "report stages to populate the gallery.")
+    # Per-split reports link the shared, split-independent data-generation gallery.
+    if shared_figures is not None:
+        lines.append(
+            f"- _(split-independent data-generation figures: "
+            f"[`{_rel(shared_figures, results_dir)}/`]({_rel(shared_figures, results_dir)}/))_"
+        )
     lines.append("")
 
     lines += [
@@ -378,6 +431,82 @@ def _render_markdown(
         f"_Report assembled by `final_report_v2` for run `{tag}`._",
         "",
     ]
+    return lines
+
+
+# Human-readable labels + display order for the KLD summary family (mirrors
+# ``visualize_v2.KLD_VARIANT_LABELS``; kept local so the report needs no matplotlib import).
+_KLD_VARIANT_LABELS = {
+    "kbar": "mean K_t (clean window)",
+    "kbar_sum": "sum K_t (integrated)",
+    "kbar_max": "max K_t (peak)",
+    "kbar_median": "median K_t",
+    "kbar_p90": "p90 K_t",
+    "kbar_full": "mean K_t (full seq.)",
+    "kbar_postwarm": "mean K_t (post-warmup)",
+    "kbar_inband": "in-band KL (L*)",
+    "kbar_outband": "out-band KL",
+}
+
+
+def _kld_variant_label(key: str) -> str:
+    r"""Human-readable label for a KLD summary key (falls back for per-head columns)."""
+    if key in _KLD_VARIANT_LABELS:
+        return _KLD_VARIANT_LABELS[key]
+    if str(key).startswith("kbar_head"):
+        return f"head {str(key).replace('kbar_head', '')} KL"
+    return str(key)
+
+
+def _kld_variants_section(cal: Dict[str, Any]) -> List[str]:
+    r"""Render the KLD-summary-family vs TE correlation table (§14.5) for the report.
+
+    Reads the ``calibration.kld_variants`` block written by :func:`eval_v2.fit_calibration`
+    and tabulates, per KLD summary, its per-sample slope $\gamma$, Pearson $r$ and Spearman
+    $\rho$ against both $\mathrm{TE}_{\mathrm{inj}}$ and $\mathrm{TE}_{\mathrm{scat}}$, ranked
+    by $|\rho_{\mathrm{inj}}|$ so the best-tracking summary is first. Returns an explicit
+    "not available" note when the block is absent (older runs).
+
+    Args:
+        cal: The ``metrics['calibration']`` dict.
+
+    Returns:
+        The markdown lines for the section.
+    """
+    kv = (cal or {}).get("kld_variants") or {}
+    lines: List[str] = ["## KLD summary vs TE (which flavour tracks TE)", ""]
+    if not kv:
+        lines += ["> ⚠ no `calibration.kld_variants` — re-run `--stage eval` to populate the "
+                  "KLD-summary family (mean/sum/max/median/p90, window, in-band/out-band, "
+                  "per-head).", ""]
+        return lines
+    lines += [
+        "Every model-free KLD summary (§14.5) regressed on the transfer entropy: the "
+        "per-sample slope $\\gamma$, Pearson $r$ and Spearman $\\rho$ vs both TEs, ranked by "
+        "$|\\rho_{\\mathrm{inj}}|$ (best tracker first). See `kld_variants_vs_te`, "
+        "`kld_te_correlation`, `kld_te_density` in the gallery.",
+        "",
+        "| KLD summary | $\\gamma_{\\mathrm{inj}}$ | $r_{\\mathrm{inj}}$ "
+        "| $\\rho_{\\mathrm{inj}}$ | $\\gamma_{\\mathrm{scat}}$ | $\\rho_{\\mathrm{scat}}$ | n |",
+        "|---|---|---|---|---|---|---|",
+    ]
+
+    def _absrho(item: Any) -> float:
+        v = (kv.get(item) or {}).get("spearman_inj")
+        try:
+            return abs(float(v))
+        except (TypeError, ValueError):
+            return -1.0
+
+    for v in sorted(kv, key=_absrho, reverse=True):
+        e = kv[v] or {}
+        lines.append(
+            f"| {_kld_variant_label(v)} | {_fmt(e.get('gamma_inj'))} "
+            f"| {_fmt(e.get('pearson_inj'), '.2f')} | {_fmt(e.get('spearman_inj'), '.2f')} "
+            f"| {_fmt(e.get('gamma_scat'))} | {_fmt(e.get('spearman_scat'), '.2f')} "
+            f"| {e.get('n', '?')} |"
+        )
+    lines.append("")
     return lines
 
 

@@ -156,10 +156,14 @@ def test_raw_scatter_paired_writes_and_tracks(tmp_path: Path) -> None:
                               + 0.1 * rng.standard_normal(t_dec)).astype(np.float32)
     up_st[:, coupled_idx] = (latent_c[trim:trim + t_dec]
                              + 0.1 * rng.standard_normal(t_dec)).astype(np.float32)
+    # Phase-harmonic fields (the other half of the model input); exercise the 6-panel path.
+    fhr_ph = rng.standard_normal((t_dec, 44)).astype(np.float32)
+    up_ph = rng.standard_normal((t_dec, 58)).astype(np.float32)
 
     out = viz.plot_raw_scatter_paired(
         fhr_raw, up_raw, fhr_st, up_st, tmp_path / "paired",
         coupled_idx=coupled_idx, latent_c=latent_c, latent_d=latent_d,
+        fhr_ph=fhr_ph, up_ph=up_ph,
         center_freqs=np.linspace(0.001, 0.37, n_ch - 1), trim=trim,
         meta={"te_inj": 3.0, "D": 8},
     )
@@ -366,6 +370,82 @@ def test_calibration_by_lag_per_sample(tmp_path: Path) -> None:
     per_sample = _fake_per_sample()
     _assert_written(viz.plot_calibration_by_lag(metrics, tmp_path / "calib_by_lag_ps",
                                                 per_sample=per_sample))
+
+
+# ---------------------------------------------------------------------------
+# S8: KLD-summary family vs TE figures (§14.5)
+# ---------------------------------------------------------------------------
+
+
+def _fake_per_sample_full(n_per_cell: int = 60) -> dict:
+    r"""Augment :func:`_fake_per_sample` with the KLD summary family + per-head columns.
+
+    Adds the ``kbar_sum`` / ``kbar_max`` / ``kbar_median`` / ``kbar_p90`` / ``kbar_full`` /
+    ``kbar_postwarm`` / ``kbar_inband`` / ``kbar_outband`` scalar summaries and the per-head
+    ``kbar_head{m}`` columns (head 0 carries the coupling, the rest are flat), so the S8
+    figures have a full family to draw.
+    """
+    ps = _fake_per_sample(n_per_cell)
+    base = ps["kbar"]
+    ps["kbar_sum"] = base * 100.0
+    ps["kbar_max"] = base * 2.0
+    ps["kbar_median"] = base.copy()
+    ps["kbar_p90"] = base * 1.5
+    ps["kbar_full"] = base * 0.9
+    ps["kbar_postwarm"] = base * 0.95
+    inb = base * 0.6
+    ps["kbar_inband"] = inb
+    ps["kbar_outband"] = base - inb
+    rng = np.random.default_rng(2)
+    for m in range(4):
+        ps[f"kbar_head{m}"] = (base * 0.6 if m == 0 else 0.1 + 0.02 * rng.standard_normal(base.size))
+    ps["kbar_head"] = np.stack([ps[f"kbar_head{m}"] for m in range(4)], axis=1)
+    return ps
+
+
+def _fake_kld_variants() -> dict:
+    r"""A ``calibration.kld_variants``-shaped dict spanning the summary family + two heads."""
+    names = ["kbar", "kbar_sum", "kbar_max", "kbar_median", "kbar_p90", "kbar_full",
+             "kbar_postwarm", "kbar_inband", "kbar_outband", "kbar_head0", "kbar_head1"]
+    kv = {}
+    for i, v in enumerate(names):
+        kv[v] = {"gamma_inj": 0.4 - 0.02 * i, "alpha_inj": 0.2, "r2_inj": 0.9,
+                 "pearson_inj": 0.95 - 0.06 * i, "spearman_inj": 0.93 - 0.06 * i,
+                 "gamma_scat": 0.44, "alpha_scat": 0.2, "r2_scat": 0.88,
+                 "pearson_scat": 0.9, "spearman_scat": 0.9, "n": 240}
+    return kv
+
+
+def test_kld_variant_figures_write(tmp_path: Path) -> None:
+    r"""[kld] The S8 KLD-summary-family figures render from per-sample + kld_variants data."""
+    metrics = _fake_metrics()
+    metrics["calibration"]["kld_variants"] = _fake_kld_variants()
+    metrics["calibration"].update({
+        "gamma_inj_sample": 0.4, "alpha_inj_sample": 0.2, "r2_inj_sample": 0.9,
+        "gamma_scat_sample": 0.44, "alpha_scat_sample": 0.2, "r2_scat_sample": 0.88,
+        "n_samples": 240,
+    })
+    ps = _fake_per_sample_full()
+    _assert_written(viz.plot_kld_variants_vs_te(ps, metrics, tmp_path / "kld_variants"))
+    _assert_written(viz.plot_kld_variants_vs_te(ps, metrics, tmp_path / "kld_variants_scat",
+                                                te_axis="scat"))
+    _assert_written(viz.plot_kld_te_correlation(metrics, tmp_path / "kld_corr"))
+    _assert_written(viz.plot_kld_te_density(ps, metrics, tmp_path / "kld_density"))
+    _assert_written(viz.plot_kld_te_density(ps, metrics, tmp_path / "kld_density_inband",
+                                            variant="kbar_inband"))
+    _assert_written(viz.plot_kld_distribution_by_te(ps, metrics, tmp_path / "kld_dist"))
+    _assert_written(viz.plot_per_head_kld_vs_te(ps, metrics, tmp_path / "per_head_kld"))
+
+
+def test_kld_variant_figures_degrade_on_empty(tmp_path: Path) -> None:
+    r"""[kld] The S8 figures degrade gracefully with no per-sample / no kld_variants data."""
+    metrics = {"run_tag": "empty", "split": "test", "calibration": {}}
+    _assert_written(viz.plot_kld_variants_vs_te({}, metrics, tmp_path / "kv_empty"))
+    _assert_written(viz.plot_kld_variants_vs_te(None, metrics, tmp_path / "kv_none"))
+    _assert_written(viz.plot_kld_te_correlation(metrics, tmp_path / "kc_empty"))
+    _assert_written(viz.plot_kld_te_density({}, metrics, tmp_path / "kd_empty"))
+    _assert_written(viz.plot_kld_distribution_by_te({}, metrics, tmp_path / "kdist_empty"))
+    _assert_written(viz.plot_per_head_kld_vs_te({}, metrics, tmp_path / "ph_empty"))
 
 
 # ---------------------------------------------------------------------------

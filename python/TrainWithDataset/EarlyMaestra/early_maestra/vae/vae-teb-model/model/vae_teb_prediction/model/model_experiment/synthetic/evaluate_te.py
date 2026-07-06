@@ -1,6 +1,6 @@
 r"""TE evaluation harness -- $\bar{K}$ versus ground-truth TE (v2 benchmarks).
 
-Loads a trained :class:`SeqVaeLagAttnV1` checkpoint, runs inference over the
+Loads a trained :class:`SeqVaeLagAttn` checkpoint, runs inference over the
 cached **test** split, and computes the four validation metrics of
 ``model_validation_v2.md`` Section 9:
 
@@ -17,7 +17,7 @@ cached **test** split, and computes the four validation metrics of
 
 $\bar{K}$ is the per-step KL $K_t$ averaged over valid anchors
 $t \in [\text{warmup}, T)$, obtained via
-:meth:`SeqVaeLagAttnV1.measure_transfer_entropy`. Checkpoints are reloaded with
+:meth:`SeqVaeLagAttn.measure_transfer_entropy`. Checkpoints are reloaded with
 ``train/graph_models_utils.py:load_checkpoint_strict``.
 
 This module **reuses** the training-loop helpers in :mod:`train_minimal`
@@ -67,7 +67,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
     build_dataset as bd,
 )
@@ -178,8 +180,8 @@ def _eval_out_dir(config: Dict[str, Any], benchmark: str) -> Path:
 
 def load_eval_checkpoint(
     ckpt_path: Any, device: torch.device
-) -> Tuple[SeqVaeLagAttnV1, Dict[str, Any]]:
-    """Reconstruct a :class:`SeqVaeLagAttnV1` and load its trained weights.
+) -> Tuple[SeqVaeLagAttn, Dict[str, Any]]:
+    """Reconstruct a :class:`SeqVaeLagAttn` and load its trained weights.
 
     The model architecture is rebuilt from the ``model_kwargs`` stored in the
     checkpoint (so the harness needs no config to match the trained shapes),
@@ -215,12 +217,12 @@ def load_eval_checkpoint(
     if clamp is not None and not isinstance(clamp, tuple):
         model_kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
 
-    model = SeqVaeLagAttnV1(**model_kwargs)
+    model = SeqVaeLagAttn(**model_kwargs)
     loaded = load_checkpoint_strict(model, ckpt)
     if loaded is None:
         raise RuntimeError(
             f"load_checkpoint_strict could not align weights for {ckpt_path}. "
-            f"The checkpoint's architecture does not match SeqVaeLagAttnV1("
+            f"The checkpoint's architecture does not match SeqVaeLagAttn("
             f"**model_kwargs)."
         )
     model.to(device).eval()
@@ -309,7 +311,7 @@ def reverse_source_batch(batch: Any) -> AttributeDict:
     ``weight`` with the input (shallow copy); ``up_st`` / ``up_ph`` are fresh
     tensors from :func:`torch.flip`. Callers must not in-place mutate the
     target streams. Models that read inputs without mutating them (the
-    contract :class:`SeqVaeLagAttnV1` honours) are safe.
+    contract :class:`SeqVaeLagAttn` honours) are safe.
 
     Args:
         batch: A batched :class:`AttributeDict` with ``up_st`` / ``up_ph``.
@@ -327,7 +329,7 @@ def reverse_source_batch(batch: Any) -> AttributeDict:
 
 @torch.no_grad()
 def _collect_diagnostics(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     device: torch.device,
     *,
@@ -1968,7 +1970,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         ``--train-missing`` default to ``False``.
     """
     p = argparse.ArgumentParser(
-        description="Transfer-entropy evaluation harness for SeqVaeLagAttnV1 "
+        description="Transfer-entropy evaluation harness for SeqVaeLagAttn "
                     "on synthetic benchmark data (Phase 4)."
     )
     p.add_argument(

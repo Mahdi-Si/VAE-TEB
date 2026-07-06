@@ -1,6 +1,6 @@
 r"""Lag-recovery metrics -- does the model find the true source lag (Phase 5).
 
-Loads a trained :class:`SeqVaeLagAttnV1` checkpoint and quantifies whether the
+Loads a trained :class:`SeqVaeLagAttn` checkpoint and quantifies whether the
 model localises transfer to the true source-lag band
 $\mathcal{L}^\star = \{D-H,\dots,D-1\}$, using three complementary measures
 (``model_validation_v2_plan.md`` Sprint 4):
@@ -70,7 +70,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from model.vae_teb_prediction.model.model_experiment.synthetic import (
     evaluate_te as ev,
 )
@@ -138,7 +140,7 @@ def _lag_out_dir(config: Dict[str, Any], benchmark: str) -> Path:
 
 @torch.no_grad()
 def collect_lag_tensors(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     device: torch.device,
     *,
@@ -147,7 +149,7 @@ def collect_lag_tensors(
 ) -> Dict[str, Any]:
     r"""Collect the head-averaged attention and lag map over the test loader.
 
-    One ``eval``-mode :meth:`SeqVaeLagAttnV1.forward` pass, accumulating
+    One ``eval``-mode :meth:`SeqVaeLagAttn.forward` pass, accumulating
     batch-axis means while keeping the ``(T, L)`` axes intact. The full
     ``(B, T, L)`` tensors are never stacked -- only running ``(T, L)`` sums.
 
@@ -428,7 +430,7 @@ def _per_tau_terms(
     r"""Masked squared error summed over $(B, T_{valid}, C)$, kept per horizon.
 
     Replicates the future-target construction of
-    :meth:`SeqVaeLagAttnV1.compute_loss` (``vae_teb_lag_attn_v1.py:1664-1700``):
+    :meth:`SeqVaeLagAttn.compute_loss` (``vae_teb_lag_attn_v1.py:1664-1700``):
     ``Y_plus[b, t, tau, c] = Y[b, t+1+tau, c]`` via ``unfold``. Synthetic data
     has an all-ones ``weight`` field, so the mask reduces to the warm-up anchor
     mask.
@@ -472,7 +474,7 @@ def _per_tau_terms(
 
 @torch.no_grad()
 def _per_tau_mse(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     device: torch.device,
     *,
@@ -554,7 +556,7 @@ def _per_tau_mse(
 
 @torch.no_grad()
 def _crosscheck_per_tau(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     device: torch.device,
     *,
@@ -568,7 +570,7 @@ def _crosscheck_per_tau(
 
     For the first ``n_batches`` batches, ``num_tau.sum() / (H_d \cdot denom)``
     (from :func:`_per_tau_terms`) must equal
-    :meth:`SeqVaeLagAttnV1.compute_loss`'s ``feat_loss`` on the *same* forward
+    :meth:`SeqVaeLagAttn.compute_loss`'s ``feat_loss`` on the *same* forward
     output -- the single most important correctness gate of task 5.4.
 
     Args:
@@ -702,7 +704,7 @@ def _resolve_lag_grid(
 
 @torch.no_grad()
 def run_sliding_window_lolo(
-    model: SeqVaeLagAttnV1,
+    model: SeqVaeLagAttn,
     loader: Any,
     device: torch.device,
     *,
@@ -2079,7 +2081,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         (fall back to ``config_synth.yaml`` / the checkpoint).
     """
     p = argparse.ArgumentParser(
-        description="Lag-recovery harness for SeqVaeLagAttnV1 on synthetic "
+        description="Lag-recovery harness for SeqVaeLagAttn on synthetic "
                     "benchmark data (Phase 5)."
     )
     p.add_argument(

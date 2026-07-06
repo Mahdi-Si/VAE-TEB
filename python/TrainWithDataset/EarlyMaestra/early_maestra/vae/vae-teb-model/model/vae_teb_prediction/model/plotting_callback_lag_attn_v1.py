@@ -187,6 +187,40 @@ def _time_axes(
     return time_raw, time_dec, t_max
 
 
+def _attach_lag_seconds_axis(
+    ax: Any, step_seconds: float, delta_up_seconds: float
+) -> Any:
+    r"""Add a right-hand secondary y-axis in physical seconds (arch spec section 27).
+
+    Maps a decimated lag index $\ell$ to $\mathrm{lag}_{\mathrm{phys}}(\ell) =
+    s\,\ell + \Delta_{UP}$ (``step_seconds`` $s$, ``delta_up_seconds``
+    $\Delta_{UP}$), so the lag panels read in both model-lag and physical-second
+    coordinates. Non-fatal: any Matplotlib error is swallowed so plotting never
+    crashes training.
+
+    Args:
+        ax: The lag-panel axes (primary y is the decimated lag $\ell$).
+        step_seconds: Decimated step duration $s$ in seconds.
+        delta_up_seconds: Fixed preprocessing UP shift $\Delta_{UP}$ in seconds.
+
+    Returns:
+        The created secondary axis, or ``None`` if it could not be attached.
+    """
+    s = float(step_seconds)
+    d = float(delta_up_seconds)
+    if s <= 0.0:
+        return None
+    try:
+        sec = ax.secondary_yaxis(
+            "right",
+            functions=(lambda l: s * l + d, lambda v: (v - d) / s),
+        )
+        sec.set_ylabel("Lag (s)", fontsize=8)
+        return sec
+    except Exception:  # noqa: BLE001 — plotting must never crash training
+        return None
+
+
 def _shade_warmup(
     ax: Any,
     warmup: int,
@@ -337,6 +371,8 @@ def _build_diagnostic_figure(
     feat_loss: float,
     base_loss: float,
     kld_loss: float,
+    step_seconds: float = 4.0,
+    delta_up_seconds: float = 0.0,
 ) -> Any:
     """Build the full diagnostic figure for one validation sample.
 
@@ -635,8 +671,16 @@ def _build_diagnostic_figure(
         vmin=0.0, vmax=vmax_kld,
         extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
+    # Under v2 the flat mu_post / logvar_post are law-of-total-variance mixture
+    # moments, so this closed-form per-dim KL is a moment-matched *proxy*: it no
+    # longer row-sums to ``kld_per_t`` (the exact decomposed $K_t = K^R + K^Z$
+    # shown in the Total-KL panel below). Annotate it so the two KL panels read
+    # as mutually consistent (S6-T01). v2 is detected by its decomposed KL key.
+    _kld_proxy = "kld_content" in outs
     ax.set_title(
-        f"KLD per latent dim (d_z={d_z} rows) \u2014 max={kld_max:.3f} nats",
+        f"KLD per latent dim (d_z={d_z} rows) \u2014 max={kld_max:.3f} nats"
+        + (" \u2014 moment-matched proxy (exact $K_t$ in Total-KL panel)"
+           if _kld_proxy else ""),
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
@@ -692,6 +736,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Attn prob")
@@ -727,6 +772,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "KL weight")
     _finalise_time_axis(ax)
@@ -749,6 +795,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Column-norm")
     _finalise_time_axis(ax)
@@ -969,6 +1016,10 @@ class LagAttnV1PlotCallback(Callback):
 
             warmup = int(getattr(model, "warmup_period", 0))
             horizon = int(getattr(model, "horizon", 30))
+            # Physical-time lag axis (arch spec section 27). Read guarded so a v1
+            # model (which lacks these attrs) still renders the lag panels.
+            step_seconds = float(getattr(model, "step_seconds", 4.0))
+            delta_up_seconds = float(getattr(model, "delta_up_seconds", 0.0))
 
             num_samples = min(self.num_examples, y_st.shape[0])
             for s in range(num_samples):
@@ -992,6 +1043,8 @@ class LagAttnV1PlotCallback(Callback):
                     feat_loss=feat_loss,
                     base_loss=base_loss,
                     kld_loss=kld_loss,
+                    step_seconds=step_seconds,
+                    delta_up_seconds=delta_up_seconds,
                 )
                 fname = (
                     f"lag_attn_v1_epoch{epoch:04d}_sample{s}_"

@@ -1,4 +1,4 @@
-"""Lightning wrapper + Graph-model trainer for ``SeqVaeLagAttnV1``.
+"""Lightning wrapper + Graph-model trainer for ``SeqVaeLagAttn``.
 
 This file mirrors the layout of :mod:`model.vae_teb_prediction.training.trainer`
 but targets the new lag-attentive v1 model defined in
@@ -28,7 +28,9 @@ from lightning.pytorch.profilers import SimpleProfiler
 from loguru import logger
 
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1
+# Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
+from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (
     LagAttnV1PlotCallback,
 )
@@ -48,7 +50,7 @@ from train.pl_model_base import LightningModelBase
 
 
 class SeqVaeLagAttnPl(LightningModelBase):
-    """Lightning wrapper for :class:`SeqVaeLagAttnV1`.
+    """Lightning wrapper for :class:`SeqVaeLagAttn`.
 
     Reads the four model-facing fields directly from the batch:
 
@@ -87,7 +89,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
         ``LightningModelBase.__init__`` wraps ``base_model`` with
         ``torch.compile`` unconditionally. That path is incompatible with
-        :class:`SeqVaeLagAttnV1` because ``LagCrossAttention.forward`` wraps
+        :class:`SeqVaeLagAttn` because ``LagCrossAttention.forward`` wraps
         its inner ``_attend`` call in
         ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`` (see
         the ``attention_grad_checkpoint`` option in the config). When the
@@ -107,7 +109,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
         :class:`PlTemporalClassifier` for a similar incompatibility.
 
         Args:
-            base_model: The :class:`SeqVaeLagAttnV1` instance to wrap.
+            base_model: The :class:`SeqVaeLagAttn` instance to wrap.
             lr: Learning rate stored in ``self.hparams``.
             lr_milestones: Optional epoch milestones for the LR scheduler.
             weight_decay: AdamW weight decay applied across parameters.
@@ -130,7 +132,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
         self._spike_skips_total: int = 0
 
     def _build_source_stream(self, batch: Any) -> torch.Tensor:
-        """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttnV1.forward``.
+        """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttn.forward``.
 
         When ``use_up_st=True`` the stream is ``[up_st, up_ph]`` concatenated
         along the channel axis → ``(B, T, 101)``. When ``use_up_st=False`` it
@@ -151,7 +153,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
         up_st = getattr(batch, "up_st", None)
         if up_st is None:
             raise RuntimeError(
-                "SeqVaeLagAttnV1 was constructed with use_up_st=True but the "
+                "SeqVaeLagAttn was constructed with use_up_st=True but the "
                 "batch does not contain `up_st`. Either add 'up_st' to "
                 "load_fields in the config, rebuild the HDF5 with up_st, or "
                 "set use_up_st=False (and c_u=58) on the model."
@@ -337,6 +339,47 @@ class SeqVaeLagAttnPl(LightningModelBase):
             "'constant' or 'linear_warmup'."
         )
 
+    def _apply_curriculum(self, epoch: int) -> Optional[float]:
+        r"""Apply the v2 curriculum stage for ``epoch`` and return its $\beta$.
+
+        Reads the ``curriculum`` hparam (``{enabled, stages}``); when enabled and
+        the active model supports it (v2), calls
+        ``model.set_curriculum_stage(epoch, stages)`` to flip
+        ``enable_source``/``enable_residual``/``enable_kl``/``active_lags`` in place
+        and writes the resolved per-epoch $\beta$ into
+        ``self.hparams['kld_beta']`` (which :meth:`_resolve_beta` returns when no
+        ``beta_schedule`` dict is set). A no-op for v1 or when disabled.
+
+        Args:
+            epoch: The epoch whose stage to apply (``self.current_epoch``).
+
+        Returns:
+            The resolved $\beta$, or ``None`` when the curriculum is inactive.
+        """
+        cur = self.hparams.get("curriculum")
+        if not isinstance(cur, dict) or not cur.get("enabled", False):
+            return None
+        stages = cur.get("stages")
+        if not stages or not hasattr(self.orig_model, "set_curriculum_stage"):
+            return None
+        beta = float(self.orig_model.set_curriculum_stage(int(epoch), stages))
+        self.hparams["kld_beta"] = beta
+        # The curriculum is authoritative over beta. ``_resolve_beta`` prefers a
+        # ``beta_schedule`` dict over ``kld_beta``, so a leftover/co-configured
+        # schedule would silently discard the per-stage beta. Clear it (once) so
+        # ``_resolve_beta`` returns the curriculum's ``kld_beta``.
+        if isinstance(self.hparams.get("beta_schedule"), dict):
+            logger.warning(
+                "Both a curriculum schedule and a beta_schedule are configured; "
+                "the curriculum is authoritative over beta. Ignoring beta_schedule."
+            )
+            self.hparams["beta_schedule"] = None
+        return beta
+
+    def _on_train_epoch_start_hook(self) -> None:
+        """Apply the curriculum stage at the start of each training epoch."""
+        self._apply_curriculum(self.current_epoch)
+
     def compute_loss_and_metrics(
         self, batch: Any, batch_idx: int, stage: str
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -436,6 +479,28 @@ class SeqVaeLagAttnPl(LightningModelBase):
             # B4 lag-embedding smoothness penalty (raw, pre-weighting).
             "lag_smoothness": loss_dict["lag_smoothness"],
         }
+
+        # --- v2-only diagnostics (S7-T03) -----------------------------------
+        # Emitted only when present, so this shared builder stays valid when the
+        # SeqVaeLagAttn alias is flipped back to v1 (which emits none of these).
+        for _k in (
+            "kld_lag_loss", "kld_content_loss", "kld_content_raw", "r_lag",
+            "rms_src", "lag_tv", "lag_entropy_reg",
+        ):
+            _v = loss_dict.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
+        for _k in ("lag_entropy", "n_active"):
+            _v = forward_outputs.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
+        _exp_lag = forward_outputs.get("expected_lag")
+        if _exp_lag is not None:
+            metrics["expected_lag_mean"] = _exp_lag.mean()
+            if hasattr(self.orig_model, "expected_lag_seconds"):
+                metrics["expected_lag_sec_mean"] = (
+                    self.orig_model.expected_lag_seconds(_exp_lag).mean()
+                )
         return total_loss, metrics
 
     def _compute_residual_diagnostics(
@@ -528,7 +593,7 @@ class SeqVaeLagAttnPl(LightningModelBase):
 class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
     """Experiment driver for the lag-attentive v1 model.
 
-    Mirrors ``GraphModelVaeTebSmallTrainer`` but builds ``SeqVaeLagAttnV1``
+    Mirrors ``GraphModelVaeTebSmallTrainer`` but builds ``SeqVaeLagAttn``
     from config and uses the new Lightning wrapper.
     """
 
@@ -588,14 +653,14 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
         if "latent_stats_momentum" in vae_cfg:
             kwargs["latent_stats_momentum"] = float(vae_cfg["latent_stats_momentum"])
         # Future-proofing: forward any *flat* ``VAE_model`` key that names a real
-        # ``SeqVaeLagAttnV1`` constructor argument but isn't already handled
+        # ``SeqVaeLagAttn`` constructor argument but isn't already handled
         # above, so a newly-added architecture flag is honoured here too instead
         # of being silently dropped (which would rebuild the default architecture
         # and break ``load_checkpoint_strict`` alignment -- the same failure mode
         # ``testing.base._lag_attn_kwargs_from_config`` guards against). The
         # nested config groups translated explicitly above keep precedence.
         valid_params = set(
-            inspect.signature(SeqVaeLagAttnV1.__init__).parameters
+            inspect.signature(SeqVaeLagAttn.__init__).parameters
         )
         nested_groups = {"horizon_refine", "encoder"}
         for name, value in vae_cfg.items():
@@ -606,20 +671,36 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
         return kwargs
 
     def create_model(self) -> None:
-        """Instantiate ``SeqVaeLagAttnV1`` and wrap it in ``SeqVaeLagAttnPl``."""
+        """Instantiate ``SeqVaeLagAttn`` and wrap it in ``SeqVaeLagAttnPl``."""
         model_kwargs = self._build_model_kwargs()
         logger.info(
-            "Building SeqVaeLagAttnV1 with kwargs: "
+            "Building SeqVaeLagAttn with kwargs: "
             + ", ".join(f"{k}={v}" for k, v in model_kwargs.items())
         )
-        self.pytorch_model = SeqVaeLagAttnV1(**model_kwargs)
+        self.pytorch_model = SeqVaeLagAttn(**model_kwargs)
 
         self.checkpoint = self.config.get("model_config", {}).get("core_model_checkpoint")
         if self.checkpoint is not None:
-            load_checkpoint_strict(
-                model=self.pytorch_model,
-                checkpoint=self.checkpoint,
+            from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (
+                check_model_class,
             )
+
+            # Guard the checkpoint's model class against the active alias BEFORE
+            # loading so a v1<->v2 mismatch fails with an actionable message, and
+            # verify the strict alignment actually matched a module (a None return
+            # means no keys aligned -- otherwise training would silently proceed
+            # from random weights).
+            blob = torch.load(
+                str(self.checkpoint), map_location="cpu", weights_only=False
+            )
+            check_model_class(blob, SeqVaeLagAttn.__name__)
+            if load_checkpoint_strict(
+                model=self.pytorch_model, checkpoint=blob
+            ) is None:
+                raise RuntimeError(
+                    f"could not align core_model_checkpoint {self.checkpoint!r} "
+                    f"into {SeqVaeLagAttn.__name__} (no matching module keys)."
+                )
             logger.info(f"Model loaded from checkpoint: {self.checkpoint}")
 
         vae_cfg = self.config.get("model_config", {}).get("VAE_model", {}) or {}
@@ -643,6 +724,9 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             ),
             # B4 — lag-embedding smoothness weight (lambda_lag).
             "lambda_lag": vae_cfg.get("lag_smoothness_lambda", 0.0),
+            # v2 curriculum schedule ({enabled, stages}), consumed per-epoch by
+            # ``SeqVaeLagAttnPl._apply_curriculum``. Ignored (no-op) for v1.
+            "curriculum": vae_cfg.get("curriculum"),
             # Loss-spike circuit breaker. Consumed in SeqVaeLagAttnPl._spike_cfg.
             # Missing keys fall back to the class-level ``_SPIKE_DEFAULTS``.
             "loss_spike_skip": vae_cfg.get("loss_spike_skip", {}) or {},
@@ -657,6 +741,51 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _select_ddp_strategy(
+        num_devices: int,
+        likelihood: str,
+        sigma_obs: Any,
+        curriculum_enabled: bool = False,
+    ) -> str:
+        r"""Select the Lightning DDP ``strategy`` string for the run.
+
+        Rules:
+
+        * Single device (``num_devices <= 1``): ``"auto"`` (no DDP).
+        * v2 curriculum run (``curriculum_enabled``): pin
+          ``"ddp_find_unused_parameters_true"`` for the whole run because the
+          curriculum flips branch participation across epochs; the S4-T03 grad-mask
+          additionally keeps every parameter connected, so this is a conservative
+          belt-and-suspenders choice.
+        * Otherwise the choice hinges on the decoder logvar heads
+          (``BaselineFutureDecoder.logvar_head`` /
+          ``ResidualFutureDecoder.logvar_head``), which are consumed ONLY when
+          ``likelihood='gaussian_nll'`` AND ``sigma_obs='learned'``. When consumed,
+          plain ``"ddp"`` is correct (and drops the extra post-backward scan);
+          otherwise those heads get ``None`` gradients and DDP requires
+          ``"ddp_find_unused_parameters_true"``.
+
+        Args:
+            num_devices: Number of CUDA devices for the run.
+            likelihood: ``"mse"`` or ``"gaussian_nll"``.
+            sigma_obs: Observation-noise scalar or the string ``"learned"``.
+            curriculum_enabled: Whether a v2 curriculum schedule is active.
+
+        Returns:
+            The Lightning ``strategy`` string.
+        """
+        if num_devices <= 1:
+            return "auto"
+        if curriculum_enabled:
+            return "ddp_find_unused_parameters_true"
+        logvar_heads_consumed = (
+            likelihood == "gaussian_nll"
+            and isinstance(sigma_obs, str)
+            and sigma_obs == "learned"
+        )
+        return "ddp" if logvar_heads_consumed else "ddp_find_unused_parameters_true"
 
     def train_model(self, train_dataloader, validation_dataloader):
         """Build callbacks + Lightning Trainer and run ``trainer.fit``."""
@@ -728,37 +857,16 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
             "logger": logger_reference,
         }
         if torch.cuda.is_available():
-            # D10 — DDP strategy depends on whether the decoder logvar heads
-            # receive gradients. ``SeqVaeLagAttnV1`` keeps two auxiliary logvar
-            # heads (``BaselineFutureDecoder.logvar_head`` /
-            # ``ResidualFutureDecoder.logvar_head``) wired into forward. They
-            # are consumed by ``compute_loss`` ONLY when
-            # ``likelihood='gaussian_nll'`` AND ``sigma_obs='learned'``
-            # (heteroscedastic NLL). In every other config (MSE, or
-            # gaussian_nll with a fixed scalar ``sigma_obs``) they receive
-            # ``None`` gradients, so DDP's first-iteration bucket rebuild trips
-            # with "parameters that were not used in producing the loss" unless
-            # we set ``find_unused_parameters``. Once ``sigma_obs='learned'``
-            # activates the heads, plain ``'ddp'`` is correct and drops the
-            # extra post-backward scan.
             vae_cfg = (
                 self.config.get("model_config", {}).get("VAE_model", {}) or {}
             )
-            sigma_obs = vae_cfg.get("sigma_obs", 1.0)
-            likelihood = str(vae_cfg.get("likelihood", "mse"))
-            logvar_heads_consumed = (
-                likelihood == "gaussian_nll"
-                and isinstance(sigma_obs, str)
-                and sigma_obs == "learned"
+            curriculum = vae_cfg.get("curriculum") or {}
+            ddp_strategy = self._select_ddp_strategy(
+                num_devices=len(self.cuda_devices),
+                likelihood=str(vae_cfg.get("likelihood", "mse")),
+                sigma_obs=vae_cfg.get("sigma_obs", 1.0),
+                curriculum_enabled=bool(curriculum.get("enabled", False)),
             )
-            if len(self.cuda_devices) > 1:
-                ddp_strategy = (
-                    "ddp"
-                    if logvar_heads_consumed
-                    else "ddp_find_unused_parameters_true"
-                )
-            else:
-                ddp_strategy = "auto"
             trainer_kwargs.update(
                 {
                     "accelerator": "gpu",
