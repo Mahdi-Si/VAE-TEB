@@ -456,11 +456,15 @@ def _print_eval_metrics(metrics: Dict[str, Any]) -> None:
     print(f"  frac_Phi (signal): mean={_f(frac.get('mean'))}")
 
 
-def _resolve_test_ckpt(results_dir: Path, ckpt: Optional[str]) -> Path:
-    r"""Resolve the checkpoint for the test-plots bridge (explicit > best > final).
+def _resolve_run_ckpt(results_dir: Path, ckpt: Optional[str]) -> Path:
+    r"""Resolve a run's checkpoint from the run root (explicit > best > final).
+
+    Used by the eval and test-plots bridges. The checkpoint is written by the train
+    stage into the **run root** ``results/<tag>/`` (never into a per-split subfolder),
+    so callers must pass that root here even when their per-split ``out_dir`` differs.
 
     Args:
-        results_dir: The run directory (``results/<tag>/``).
+        results_dir: The run root directory (``results/<tag>/``).
         ckpt: Optional explicit checkpoint path.
 
     Returns:
@@ -559,7 +563,7 @@ def run_test_plots(
     from train.graph_models_utils import load_checkpoint_strict
 
     results_dir = _results_dir(config, benchmark) if out_dir is None else Path(out_dir)
-    ckpt_path = _resolve_test_ckpt(results_dir, ckpt)
+    ckpt_path = _resolve_run_ckpt(results_dir, ckpt)
     cache_dir = resolve_cache_dir(config, benchmark=benchmark)
     npz = _resolve_split_npz(cache_dir, split)
     batch_size = int(config.get("optim", {}).get("batch_size", 32))
@@ -695,11 +699,16 @@ def _eval_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
     from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
         run_eval,
     )
+    # Resolve the checkpoint ONCE from the run root: the train stage writes best/final.ckpt
+    # into results/<tag>/, but each split evaluates into its own results/<tag>/<split>/
+    # ``out_dir``. Passing that per-split ``out_dir`` as the checkpoint search root would
+    # (and did) fail auto-discovery, so we hand every split the resolved explicit path.
+    ckpt_path = str(_resolve_run_ckpt(results_dir, ckpt))
     out: Dict[str, Any] = {}
     for s in splits:
         sdir = _split_dir(results_dir, s)
         print(f"[eval:{s}] grading -> {sdir / 'metrics.json'}")
-        metrics = run_eval(config, benchmark=benchmark, ckpt=ckpt, split=s, out_dir=sdir)
+        metrics = run_eval(config, benchmark=benchmark, ckpt=ckpt_path, split=s, out_dir=sdir)
         _print_eval_metrics(metrics)
         out[s] = metrics
     return out
@@ -709,10 +718,18 @@ def _test_plots_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional
                        analysis_samples: int, splits: Sequence[str],
                        results_dir: Path) -> None:
     r"""Render the standard-testing per-sample diagnostics for each split (guarded)."""
+    # Resolve the checkpoint from the run root (best/final live in results/<tag>/, not in
+    # the per-split out_dir passed below). Guarded so a missing checkpoint only warns --
+    # these diagnostics must never gate the run.
+    try:
+        ckpt_path = str(_resolve_run_ckpt(results_dir, ckpt))
+    except FileNotFoundError as exc:
+        print(f"[test_plots][warn] {exc}")
+        return
     for s in splits:
         sdir = _split_dir(results_dir, s)
         try:
-            run_test_plots(config, benchmark=benchmark, ckpt=ckpt, split=s,
+            run_test_plots(config, benchmark=benchmark, ckpt=ckpt_path, split=s,
                            analysis_samples=analysis_samples, out_dir=sdir)
         except Exception as exc:  # noqa: BLE001 -- diagnostics only, never fatal
             print(f"[test_plots:{s}][warn] {type(exc).__name__}: {exc}")
