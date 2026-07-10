@@ -106,11 +106,23 @@ class _StubModel:
     zeros (so the prediction gain $\Delta L = L_{\mathrm{base}} - L_{\mathrm{full}} = 0$);
     with ``perfect_full=True`` the full head is the exact future block (a perfect forecast)
     while the baseline stays zero, giving a strictly positive $\Delta L$.
+
+    With ``source_sensitive=True`` the stub additionally *depends on the source*: it memorises
+    the first ``u_stream`` it sees (the clean one) and, when handed a different one, returns
+    ``mu_full = -Y_plus`` instead of ``+Y_plus``. That realises the prediction-space ordering
+    $\mathcal L_{\mathrm{feat}} < \mathcal L_{\mathrm{base}} < \mathcal L_{\mathrm{feat}}^{\text{corrupted}}$
+    exactly (`0 < \|Y\|^2 < 4\|Y\|^2`), which is what S3-T02b / S3-T03 must detect. The
+    default stub ignores ``u_stream``, so its corrupted forwards are indistinguishable and
+    every penalty is zero -- the null-cell behaviour.
+
+    ``n_calls`` counts ``__call__`` invocations, so a test can assert that scoring a control
+    costs exactly one extra forward and no more.
     """
 
     def __init__(self, T: int, L: int, *, kld_value: float = 1.0, lag_peak: int = 2,
                  horizon: int = _HORIZON, c_y: int = _C_FHR_ST + _C_FHR_PH,
-                 perfect_full: bool = False, num_heads: int = 0):
+                 perfect_full: bool = False, num_heads: int = 0,
+                 source_sensitive: bool = False):
         self._T = int(T)
         self._L = int(L)
         self._kld = float(kld_value)
@@ -119,11 +131,16 @@ class _StubModel:
         self._C = int(c_y)
         self._perfect = bool(perfect_full)
         self._num_heads = int(num_heads)   # >0 -> also emit kld_per_t_per_head (equal split)
+        self._source_sensitive = bool(source_sensitive)
+        self._ref_u = None
+        self._cur_y = None
+        self.n_calls = 0
 
     def eval(self):
         return self
 
     def __call__(self, y_st, y_ph, u_stream):
+        self.n_calls += 1
         B = int(y_st.shape[0])
         kld = torch.full((B, self._T), self._kld)
         lagmap = torch.zeros(B, self._T, self._L)
@@ -132,13 +149,25 @@ class _StubModel:
         attn[:, :, :, self._peak] = 0.5
         mu_base = torch.zeros(B, self._T, self._Hd, self._C)
         mu_full = torch.zeros(B, self._T, self._Hd, self._C)
+        corrupted = False
+        if self._source_sensitive:
+            # ``collect_per_sample_kbar`` builds ``y_st`` once per batch and reuses that exact
+            # tensor object for the clean forward and every control forward, while only
+            # ``u_stream`` is corrupted. So a new ``y_st`` identity means "new batch, this is
+            # the clean forward"; the same identity with a different ``u_stream`` means
+            # "this is a control forward".
+            if y_st is not self._cur_y:
+                self._cur_y = y_st
+                self._ref_u = u_stream.clone()
+            else:
+                corrupted = not torch.equal(self._ref_u, u_stream)
         if self._perfect:
             # Perfect full forecast: fill mu_full with the true unfolded future block.
             Y = torch.cat([y_st, y_ph], dim=-1)                       # (B, T, C_y)
             T_valid = self._T - self._Hd
             if T_valid > 0:
                 Y_plus = Y[:, 1:, :].unfold(1, self._Hd, 1).permute(0, 1, 3, 2)
-                mu_full[:, :T_valid] = Y_plus
+                mu_full[:, :T_valid] = -Y_plus if corrupted else Y_plus
         out = {
             "kld_per_t": kld,
             "te_lag_map": lagmap,
@@ -241,6 +270,112 @@ def test_pred_gain_sign() -> None:
     # mu_base == 0, mu_full == Y_plus (perfect) -> L_base > 0, L_full == 0 -> gain > 0.
     assert np.all(arrs["pred_gain"] > 0.0)
     assert np.all(arrs["uplift_rel"] > 0.0)
+
+
+# ---------------------------------------------------------------------------
+# S3-T02a/b: absolute forecast losses, clean and corrupted
+# ---------------------------------------------------------------------------
+def _sensitive_loader(T: int, n: int = 3):
+    return [_fake_batch(n, T=T, cell_id=1, te_inj=2.0, te_scat=1.8, frac_phi=0.9,
+                        delay=4, seed=11)]
+
+
+def test_feat_loss_and_base_loss_reconstruct_pred_gain() -> None:
+    r"""S3-T02a: the absolute losses are surfaced and ``pred_gain`` stays exactly their diff."""
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True)
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, _sensitive_loader(T), torch.device("cpu"),
+        warmup=_WARMUP, horizon=_HORIZON,
+    )
+    assert "feat_loss" in arrs and "base_loss" in arrs
+    assert np.allclose(arrs["pred_gain"], arrs["base_loss"] - arrs["feat_loss"])
+    # Perfect full forecast, zero baseline.
+    assert np.allclose(arrs["feat_loss"], 0.0, atol=1e-6)
+    assert np.all(arrs["base_loss"] > 0.0)
+
+
+def test_corrupted_forward_scored_once_per_control() -> None:
+    r"""S3-T02b: scoring the controls costs exactly one extra forward per control per batch."""
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True,
+                       source_sensitive=True)
+    loader = _sensitive_loader(T)
+    eval_v2.collect_per_sample_kbar(
+        model, loader, torch.device("cpu"), warmup=_WARMUP, horizon=_HORIZON,
+        controls=["shuffle", "reverse"],
+    )
+    # 1 clean + 2 corrupted forwards, per batch. No extra pass for the forecast losses.
+    assert model.n_calls == len(loader) * 3
+
+
+def test_corrupted_feat_loss_realises_the_prediction_space_ordering() -> None:
+    r"""A source-exploiting model forecasts worse under a corrupted source.
+
+    The stub returns $+Y^+$ under the true source and $-Y^+$ under a corrupted one, against a
+    zero baseline. So $\mathcal L_{\mathrm{feat}} = 0$, $\mathcal L_{\mathrm{base}} = \|Y^+\|^2$
+    and $\mathcal L_{\mathrm{feat}}^{\text{corrupted}} = 4\|Y^+\|^2$, giving the S3-T03 gate
+    $\mathcal L_{\mathrm{feat}} < \mathcal L_{\mathrm{base}} < \mathcal L_{\mathrm{feat}}^{\pi(U)}$
+    with a strictly positive ``shuffle_penalty``.
+    """
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True,
+                       source_sensitive=True)
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, _sensitive_loader(T), torch.device("cpu"),
+        warmup=_WARMUP, horizon=_HORIZON, controls=["shuffle", "reverse"],
+    )
+    for ctrl in ("shuffle", "reverse"):
+        assert f"feat_loss_{ctrl}" in arrs and f"shuffle_penalty_{ctrl}" in arrs
+        assert np.all(arrs["feat_loss"] < arrs["base_loss"])
+        assert np.all(arrs["base_loss"] < arrs[f"feat_loss_{ctrl}"])
+        assert np.all(arrs[f"shuffle_penalty_{ctrl}"] > 0.0)
+        # -Y_plus against 0 baseline is exactly 4x the baseline loss.
+        assert np.allclose(arrs[f"feat_loss_{ctrl}"], 4.0 * arrs["base_loss"], rtol=1e-5)
+        assert np.allclose(
+            arrs[f"shuffle_penalty_{ctrl}"], arrs[f"feat_loss_{ctrl}"] - arrs["feat_loss"])
+
+
+def test_corrupted_losses_collapse_on_a_source_blind_model() -> None:
+    r"""A model that ignores the source pays no penalty -- the null-cell behaviour."""
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True)
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, _sensitive_loader(T), torch.device("cpu"),
+        warmup=_WARMUP, horizon=_HORIZON, controls=["shuffle"],
+    )
+    assert np.allclose(arrs["shuffle_penalty_shuffle"], 0.0, atol=1e-6)
+    assert np.allclose(arrs["feat_loss_shuffle"], arrs["feat_loss"], atol=1e-6)
+
+
+def test_no_controls_leaves_the_corrupted_arrays_absent() -> None:
+    r"""``controls: []`` must not synthesise empty control columns."""
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True)
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, _sensitive_loader(T), torch.device("cpu"),
+        warmup=_WARMUP, horizon=_HORIZON, controls=[],
+    )
+    assert "feat_loss" in arrs and "base_loss" in arrs
+    for absent in ("kbar_shuffle", "feat_loss_shuffle", "shuffle_penalty_shuffle"):
+        assert absent not in arrs, absent
+
+
+def test_per_sample_npz_carries_the_new_loss_columns(tmp_path) -> None:
+    r"""S3-T02: the new columns survive the ``per_sample_eval.npz`` round-trip."""
+    T, L = 16, _MAX_LAG + 1
+    model = _StubModel(T, L, kld_value=1.0, lag_peak=3, perfect_full=True,
+                       source_sensitive=True)
+    arrs = eval_v2.collect_per_sample_kbar(
+        model, _sensitive_loader(T), torch.device("cpu"),
+        warmup=_WARMUP, horizon=_HORIZON, controls=["shuffle"],
+    )
+    path = eval_v2._write_per_sample_eval(arrs, tmp_path, "val", ["shuffle"])
+    with np.load(path, allow_pickle=False) as z:
+        for key in ("feat_loss", "base_loss", "pred_gain",
+                    "kbar_shuffle", "feat_loss_shuffle", "shuffle_penalty_shuffle"):
+            assert key in z.files, f"{key} missing from per_sample_eval.npz"
+        assert np.allclose(z["pred_gain"], z["base_loss"] - z["feat_loss"])
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +693,66 @@ def test_null_run_eval_writes_metrics(eval_fixture) -> None:
     assert Path(report_path).is_file()
     text = Path(report_path).read_text(encoding="utf-8")
     assert "Calibration" in text and "Lag recovery" in text and "Null controls" in text
+
+
+# ---------------------------------------------------------------------------
+# S4-T03: arm + model provenance in the artifacts
+# ---------------------------------------------------------------------------
+def test_run_eval_stamps_provenance(eval_fixture) -> None:
+    r"""Three structurally-identical arms must not produce three indistinguishable artifacts.
+
+    ``model_class`` / ``model_kwargs`` are read off the **graded checkpoint**, not the config,
+    so the recorded kwargs are provably those of the weights that produced these numbers.
+    """
+    cfg, results_dir = eval_fixture
+    metrics = eval_v2.run_eval(
+        cfg, benchmark="G1_raw", split="test", out_dir=results_dir,
+        batch_size=4, device="cpu", arm="parity",
+    )
+    with open(results_dir / "metrics.json", "r", encoding="utf-8") as handle:
+        on_disk = json.load(handle)
+
+    for key in ("arm", "model_class", "model_kwargs", "loss_settings", "cache_dir", "ckpt"):
+        assert key in on_disk, key
+    assert on_disk["arm"] == "parity"
+    assert on_disk["model_class"] == "SeqVaeLagAttnV1"
+    assert on_disk["cache_dir"] == str(resolve_cache_dir(cfg, benchmark="G1_raw"))
+
+    # The recorded kwargs equal the graded checkpoint's, not the config's. In memory they are
+    # identical; on disk they differ only by JSON's tuple -> list coercion (``logvar_clamp``),
+    # which ``_jsonable`` applies on write. Assert both, so a genuine kwarg drift is caught.
+    blob = torch.load(results_dir / "final.ckpt", map_location="cpu", weights_only=False)
+    assert metrics["model_kwargs"] == blob["model_kwargs"]
+    assert on_disk["model_kwargs"] == eval_v2._jsonable(blob["model_kwargs"])
+    assert on_disk["model_class"] == blob["model_class"]
+
+    # ... and the per-sample side-car can be traced back on its own.
+    with np.load(results_dir / "per_sample_eval.npz", allow_pickle=False) as psz:
+        assert str(psz["arm"]) == "parity"
+        assert str(psz["model_class"]) == "SeqVaeLagAttnV1"
+
+    # The report header names the arm and the class.
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import final_report_v2 as fr
+    lines = fr._render_markdown(cfg, "G1_raw", results_dir, metrics, None, None, None, [],
+                                split="test")
+    header = "\n".join(lines[:12])
+    assert "parity" in header and "SeqVaeLagAttnV1" in header
+
+
+def test_run_eval_falls_back_to_the_checkpoint_arm(eval_fixture) -> None:
+    r"""``arm=None`` (a bare ``run_eval`` call) reads the arm the checkpoint was trained under."""
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import pl_module_v2 as plm
+
+    cfg, results_dir = eval_fixture
+    model, kwargs = plm.build_model(cfg["model"], torch.device("cpu"))
+    plm.save_checkpoint_v2(
+        results_dir / "final.ckpt", model=model, model_kwargs=kwargs, config=cfg,
+        data_meta={}, epoch=1, val_loss=float("nan"), loss_settings={},
+        latent_stats_fitted=False, arm="v3_noncausal",
+    )
+    metrics = eval_v2.run_eval(cfg, benchmark="G1_raw", split="test", out_dir=results_dir,
+                               batch_size=4, device="cpu")
+    assert metrics["arm"] == "v3_noncausal"
 
 
 # ---------------------------------------------------------------------------

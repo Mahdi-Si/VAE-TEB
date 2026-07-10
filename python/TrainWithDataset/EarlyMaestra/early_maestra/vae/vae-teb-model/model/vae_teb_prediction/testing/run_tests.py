@@ -34,8 +34,10 @@ if str(project_root) not in sys.path:
 from model.vae_teb_prediction.testing.analyses import (
     run_anchor_position_analysis,
     run_attention_diagnostics,
+    run_calibration_analysis,
     run_causal_te_validation,
     run_class_separation_analysis,
+    run_cmi_comparison,
     run_dataset_stats_analysis,
     run_encoder_probe,
     run_forecast_quality_analysis,
@@ -158,6 +160,9 @@ def run_full_test_pipeline(
     normalize_fields: Optional[Sequence[str]] = None,
     dataset_kwargs: Optional[Dict[str, Any]] = None,
     skip_up_effect: bool = False,
+    skip_calibration: bool = False,
+    skip_cmi_comparison: bool = False,
+    empirical_te_csv: Optional[str] = None,
     skip_frequency_band: bool = False,
     skip_causal_te: bool = False,
     single_class_mode: bool = False,
@@ -194,6 +199,12 @@ def run_full_test_pipeline(
         skip_forecast_heatmaps: Skip the per-sample diagnostic PDFs.
         skip_kld_pca: Skip the per-dim KL PCA analysis.
         skip_up_effect: Skip inference-time UP perturbation tests.
+        skip_calibration: Skip the predictive-distribution calibration report.
+        skip_cmi_comparison: Skip the neural + empirical CMI corroboration of
+            ``K_raw`` (G11).
+        empirical_te_csv: Optional path to a precomputed IDTxl empirical-TE CSV
+            (with ``guid`` and ``ite_valid`` columns) joined into the CMI
+            comparison at the patient level; a logged skip when absent.
         skip_frequency_band: Skip the frequency-band-stratified forecast
             quality analysis.
         skip_per_class_breakdown: Skip the per-class CSV/plot breakdown
@@ -673,6 +684,26 @@ def run_full_test_pipeline(
             runner, standard_loader, min(aggregate_cap, 1000),
         )
 
+    # 7b. Calibration of the learned predictive distribution (G10). Needs `logvar_full`;
+    # degrades to a logged skip on a model that does not emit it.
+    if not skip_calibration:
+        _step(
+            "calibration",
+            run_calibration_analysis,
+            runner, standard_loader, aggregate_cap,
+        )
+
+    # 7c. Neural + empirical CMI corroboration of K_raw (G11). Needs the encoder states and
+    # the raw KL; degrades to a logged skip on a model that does not emit them. The empirical-TE
+    # column is populated only when `empirical_te_csv` is supplied (else logged-skipped).
+    if not skip_cmi_comparison:
+        _step(
+            "cmi_comparison",
+            run_cmi_comparison,
+            runner, standard_loader, aggregate_cap,
+            empirical_te_csv=empirical_te_csv,
+        )
+
     # 8. Residual usage.
     _step(
         "residual_usage",
@@ -969,6 +1000,9 @@ def run_full_test_pipeline_by_subgroup(
     normalize_fields: Optional[Sequence[str]] = None,
     dataset_kwargs: Optional[Dict[str, Any]] = None,
     skip_up_effect: bool = False,
+    skip_calibration: bool = False,
+    skip_cmi_comparison: bool = False,
+    empirical_te_csv: Optional[str] = None,
     skip_frequency_band: bool = False,
     skip_causal_te: bool = False,
     skip_phase2: bool = False,
@@ -1179,6 +1213,9 @@ def run_full_test_pipeline_by_subgroup(
                 dict(dataset_kwargs) if dataset_kwargs is not None else None
             ),
             skip_up_effect=skip_up_effect,
+            skip_calibration=skip_calibration,
+            skip_cmi_comparison=skip_cmi_comparison,
+            empirical_te_csv=empirical_te_csv,
             skip_frequency_band=skip_frequency_band,
             skip_causal_te=skip_causal_te,
             single_class_mode=True,
@@ -1269,6 +1306,9 @@ def run_full_test_pipeline_by_subgroup(
                     normalize_fields=normalize_fields,
                     dataset_kwargs=dataset_kwargs,
                     skip_up_effect=skip_up_effect,
+                    skip_calibration=skip_calibration,
+                    skip_cmi_comparison=skip_cmi_comparison,
+                    empirical_te_csv=empirical_te_csv,
                     skip_frequency_band=skip_frequency_band,
                     skip_causal_te=skip_causal_te,
                     single_class_mode=True,
@@ -1601,6 +1641,22 @@ def _save_summary(results: Dict[str, Any], output_dir: Path) -> None:
             if "kld_l2" in hist.columns else None,
         }
 
+    if isinstance(results.get("calibration"), dict):
+        # G10 headline: proper scoring rules plus the coverage error at each nominal level.
+        # `nll_gain_over_constant <= 0` means the learned variance head beats nothing.
+        summary["calibration"] = {
+            k: v for k, v in results["calibration"].items()
+            if isinstance(v, (int, float, str))
+        }
+
+    if isinstance(results.get("cmi_comparison"), dict):
+        # G11 headline: rank correlations of the neural CMI bounds (and empirical TE) with
+        # K_raw. Positive rho corroborates K_raw as a source-specific information measure.
+        summary["cmi_comparison"] = {
+            k: v for k, v in results["cmi_comparison"].items()
+            if isinstance(v, (int, float, str, bool))
+        }
+
     if isinstance(results.get("attention"), dict):
         summary["attention"] = {
             k: v for k, v in results["attention"].items()
@@ -1701,11 +1757,18 @@ if __name__ == "__main__":
         # Also read ``dataset_config.keep_kld_trajectory_only`` (default
         # ``False``) so the YAML drives the trajectory-slim-mode flag.
         _keep_kld_trajectory_only = False
+        _empirical_te_csv: Optional[str] = None
         try:
             with open(CONFIG, "r", encoding="utf-8") as _fh:
                 _cfg = yaml.safe_load(_fh) or {}
             _ds_cfg = _cfg.get("dataset_config", {}) or {}
             _trainer_cfg = _cfg.get("trainer", {}) or {}
+            _model_cfg = _cfg.get("model_config", {}) or {}
+            # Optional empirical-TE CSV (IDTxl) for the G11 CMI comparison; may live under
+            # either dataset_config or model_config. Absent -> the empirical column is skipped.
+            _empirical_te_csv = _ds_cfg.get("empirical_te_csv") or _model_cfg.get(
+                "empirical_te_csv"
+            )
             _raw_ids = _ds_cfg.get("test_gpu_ids")
             if _raw_ids is None:
                 _raw_ids = _trainer_cfg.get("cuda_devices")
@@ -1745,6 +1808,7 @@ if __name__ == "__main__":
             max_samples=None,
             analysis_samples=400,
             gpu_ids=_gpu_ids,
+            empirical_te_csv=_empirical_te_csv,
             keep_kld_trajectory_only=_keep_kld_trajectory_only,
         )
     else:
@@ -1759,6 +1823,7 @@ if __name__ == "__main__":
             config_path=CONFIG,
             max_samples=None,
             analysis_samples=400,
+            empirical_te_csv=_empirical_te_csv,
             keep_kld_trajectory_only=_keep_kld_trajectory_only,
         )
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -688,6 +688,314 @@ def collect_latents(
     return np.concatenate(chunks, axis=0)
 
 
+def _optional_numpy(tensor: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    """Detach a tensor to numpy, tolerating ``None`` (a key an older model never emitted)."""
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().numpy()
+
+
+def collect_calibration(
+    runner: TestRunner,
+    loader: Any,
+    max_samples: Optional[int] = None,
+    *,
+    levels: Sequence[float] = (0.5, 0.8, 0.9, 0.95),
+    n_bins: int = 20,
+) -> Dict[str, Any]:
+    r"""Collect calibration statistics for the learned predictive distribution (G10).
+
+    The decoder emits ``logvar_full`` on every forward, so no model change is needed -- but no
+    collector read it before Sprint 5. Reading it turns the point forecast ``mu_full`` into a
+    per-element Gaussian :math:`\mathcal{N}(\mu, \sigma^2)`, which can then be scored as a
+    *distribution*: NLL, CRPS, interval coverage, and PIT reliability.
+
+    A homoscedastic reference is fitted alongside. It matters twice: it says whether the
+    learned :math:`\sigma` earns its keep, and it keeps the report meaningful on a checkpoint
+    trained with a fixed ``sigma_obs``, whose ``logvar_full`` head never received a gradient
+    (the model records no ``sigma_obs``, so this cannot be detected automatically).
+
+    Args:
+        runner: The configured :class:`TestRunner`.
+        loader: A dataloader yielding batches with the model's input fields.
+        max_samples: Cap on the number of samples to consume.
+        levels: Nominal central-interval levels for coverage.
+        n_bins: Quantile resolution of the reliability curves.
+
+    Returns:
+        A dict with ``per_sample`` (:class:`pandas.DataFrame`, one row per sample),
+        ``per_horizon`` (long-format DataFrame keyed by ``h``), ``reliability`` (long-format
+        DataFrame of nominal vs empirical PIT quantiles per horizon), and ``summary``
+        (scalar dict, including the constant-sigma baseline).
+
+    Raises:
+        RuntimeError: If the model emits no ``logvar_full`` key at all.
+    """
+    from model.vae_teb_prediction.testing.metrics import (
+        compute_crps,
+        compute_interval_coverage,
+        compute_nll,
+        compute_reliability_by_horizon,
+        fit_constant_sigma,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    horizon_rows: List[Dict[str, Any]] = []
+    reliability_sum: Optional[torch.Tensor] = None
+    nominal: Optional[torch.Tensor] = None
+    n_batches = 0
+    resid_sq_sum, resid_count = 0.0, 0
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, max_samples):
+            outputs = runner.forward(batch)
+            logvar_full = outputs.get("logvar_full")
+            if logvar_full is None:
+                raise RuntimeError(
+                    "model emitted no 'logvar_full'; calibration needs the decoder's "
+                    "observation log-variance head."
+                )
+            mu_full = outputs["mu_full"]
+            y_plus = runner.build_future_target(batch)
+            warmup, horizon = runner.warmup_steps, runner.horizon
+
+            nll = compute_nll(mu_full, logvar_full, y_plus, warmup, horizon)
+            crps = compute_crps(mu_full, logvar_full, y_plus, warmup, horizon)
+            cov = compute_interval_coverage(
+                mu_full, logvar_full, y_plus, warmup, horizon, levels=levels
+            )
+            rel = compute_reliability_by_horizon(
+                mu_full, logvar_full, y_plus, warmup, horizon, n_bins=n_bins
+            )
+
+            if nominal is None:
+                nominal = rel["nominal"].detach().cpu()
+            empirical = rel["empirical"].detach().cpu()
+            if torch.isfinite(empirical).all():
+                reliability_sum = (
+                    empirical if reliability_sum is None else reliability_sum + empirical
+                )
+                n_batches += 1
+
+            # Pooled residual scale, for the constant-sigma reference.
+            sigma_hat = fit_constant_sigma(mu_full, y_plus, warmup, horizon)
+            n_elem = int(mu_full[:, warmup : max(mu_full.shape[1] - horizon, warmup)].numel())
+            resid_sq_sum += float(sigma_hat) ** 2 * n_elem
+            resid_count += n_elem
+
+            batch_size = int(mu_full.shape[0])
+            for idx in range(batch_size):
+                row: Dict[str, Any] = {
+                    "guid": _extract_guid(batch, idx),
+                    "epoch": _extract_epoch(batch, idx),
+                    "label": _extract_label(batch, idx),
+                    "nll": float(nll["nll_total"][idx]),
+                    "nll_st": float(nll["nll_st"][idx]),
+                    "nll_ph": float(nll["nll_ph"][idx]),
+                    "crps": float(crps["crps_total"][idx]),
+                    "crps_st": float(crps["crps_st"][idx]),
+                    "crps_ph": float(crps["crps_ph"][idx]),
+                    "sharpness": float(cov["sharpness"][idx]),
+                }
+                for j, level in enumerate(levels):
+                    row[f"coverage_{int(round(level * 100))}"] = float(cov["coverage"][idx, j])
+                rows.append(row)
+
+                for h in range(int(nll["nll_per_horizon"].shape[1])):
+                    horizon_rows.append({
+                        "guid": row["guid"],
+                        "label": row["label"],
+                        "h": h,
+                        "nll": float(nll["nll_per_horizon"][idx, h]),
+                        "crps": float(crps["crps_per_horizon"][idx, h]),
+                        "sharpness": float(cov["sharpness_per_horizon"][idx, h]),
+                    })
+
+    per_sample = pd.DataFrame(rows)
+    per_horizon = pd.DataFrame(horizon_rows)
+
+    reliability = pd.DataFrame()
+    if reliability_sum is not None and nominal is not None and n_batches > 0:
+        mean_empirical = (reliability_sum / n_batches).numpy()
+        reliability = pd.DataFrame([
+            {"h": h, "nominal": float(nominal[b]), "empirical": float(mean_empirical[h, b])}
+            for h in range(mean_empirical.shape[0])
+            for b in range(mean_empirical.shape[1])
+        ])
+
+    const_sigma = math.sqrt(resid_sq_sum / resid_count) if resid_count else float("nan")
+    summary: Dict[str, Any] = {
+        "n_samples": int(len(per_sample)),
+        "constant_sigma": const_sigma,
+    }
+    if not per_sample.empty:
+        summary.update(
+            nll_mean=float(per_sample["nll"].mean()),
+            crps_mean=float(per_sample["crps"].mean()),
+            sharpness_mean=float(per_sample["sharpness"].mean()),
+        )
+        for level in levels:
+            key = f"coverage_{int(round(level * 100))}"
+            summary[key] = float(per_sample[key].mean())
+            summary[f"{key}_error"] = summary[key] - float(level)
+        # What the learned heteroscedastic sigma buys over one global scale.
+        if math.isfinite(const_sigma) and const_sigma > 0.0:
+            summary["nll_constant_sigma"] = (
+                0.9189385332046727
+                + math.log(const_sigma)
+                + 0.5  # E[(y-mu)^2] / const_sigma^2 == 1 by construction
+            )
+            summary["nll_gain_over_constant"] = (
+                summary["nll_constant_sigma"] - summary["nll_mean"]
+            )
+    if not reliability.empty:
+        summary["reliability_max_deviation"] = float(
+            (reliability["empirical"] - reliability["nominal"]).abs().max()
+        )
+
+    logger.info(
+        "calibration: {} samples, NLL {:.4f}, CRPS {:.4f}, sharpness {:.4f}, "
+        "constant sigma {:.4f}",
+        summary["n_samples"], summary.get("nll_mean", float("nan")),
+        summary.get("crps_mean", float("nan")), summary.get("sharpness_mean", float("nan")),
+        const_sigma,
+    )
+    return {
+        "per_sample": per_sample,
+        "per_horizon": per_horizon,
+        "reliability": reliability,
+        "summary": summary,
+    }
+
+
+def _anchor_support_mask(runner: TestRunner, seq_len: int, device: torch.device) -> torch.Tensor:
+    r"""Return the ``(T,)`` training-KL anchor mask ``[warmup, T-H)`` used by the v3 model.
+
+    Prefers the model's own :meth:`_kld_support_mask` so the CMI features are summarised over
+    exactly the anchors that carry supervised gradient (and feed :math:`K_{\mathrm{raw}}`),
+    falling back to an explicit ``[warmup, T-H)`` window for models without that method.
+
+    Args:
+        runner: The configured :class:`TestRunner`.
+        seq_len: Sequence length ``T``.
+        device: Device for the returned mask.
+
+    Returns:
+        A ``(T,)`` float tensor of 1.0 (in support) / 0.0 (excluded).
+    """
+    mask_fn = getattr(runner.model, "_kld_support_mask", None)
+    if callable(mask_fn):
+        try:
+            return mask_fn(seq_len, device=device, dtype=torch.float32)
+        except Exception:  # noqa: BLE001 - fall back to the explicit window
+            pass
+    mask = torch.zeros(seq_len, device=device, dtype=torch.float32)
+    warmup, t_valid = runner.valid_anchor_range(seq_len)
+    if t_valid > warmup:
+        mask[warmup:t_valid] = 1.0
+    return mask
+
+
+def collect_cmi_features(
+    runner: TestRunner,
+    loader: Any,
+    max_samples: Optional[int] = None,
+) -> Dict[str, Any]:
+    r"""Collect per-sample features for the neural-CMI comparison (G11, S6-T02).
+
+    For every sample the estimator needs one triple :math:`(u, y, c)` plus the model's raw KL:
+
+    - ``u`` -- the source causal summary :math:`H^u`, anchor-mean of ``source_state``;
+    - ``c`` -- the target causal summary :math:`H^y = c_t`, anchor-mean of ``target_state``;
+    - ``y`` -- the future-target summary, anchor-mean of the unfolded forecast window
+      :math:`Y^+` flattened over ``(H, C_y)``;
+    - ``k_raw`` -- :math:`K_{\mathrm{raw}}[b] = \sum_t m_t\,\texttt{kld\_per\_t}[b,t] / \sum_t
+      m_t`, the per-step raw KL averaged over the anchor support (summed over latent dims).
+
+    All summaries are anchor-means over the training support :math:`[w_{\mathrm{warm}}, T-H)`
+    (:func:`_anchor_support_mask`), so ``c`` is the fixed-dimensional causal target history the
+    spec pins as the conditioning set.
+
+    Args:
+        runner: The configured :class:`TestRunner`.
+        loader: Dataloader yielding batches with the model's input fields.
+        max_samples: Cap on the number of samples to consume.
+
+    Returns:
+        A dict with numpy arrays ``u`` ``(N, d_u)``, ``y`` ``(N, d_y)``, ``c`` ``(N, d_c)``,
+        ``k_raw`` ``(N,)``, ``guids`` ``(N,)`` (object), ``labels`` ``(N,)`` (object), and the
+        scalar ``n_samples``.
+
+    Raises:
+        RuntimeError: If the model emits no ``target_state`` / ``source_state`` / ``kld_per_t``.
+    """
+    u_rows: List[np.ndarray] = []
+    y_rows: List[np.ndarray] = []
+    c_rows: List[np.ndarray] = []
+    k_raw: List[float] = []
+    guids: List[Optional[str]] = []
+    labels: List[Optional[int]] = []
+
+    with runner.inference_mode():
+        for batch in runner.iter_batches(loader, max_samples):
+            outputs = runner.forward(batch)
+            target_state = outputs.get("target_state")
+            source_state = outputs.get("source_state")
+            kld_per_t = outputs.get("kld_per_t")
+            if target_state is None or source_state is None or kld_per_t is None:
+                raise RuntimeError(
+                    "model emitted no 'target_state'/'source_state'/'kld_per_t'; the CMI "
+                    "comparison needs the encoder states and the raw per-step KL."
+                )
+
+            y_plus = runner.build_future_target(batch)  # (B, T-H, H, C_y)
+            T = int(target_state.shape[1])
+            device = target_state.device
+            mask = _anchor_support_mask(runner, T, device)  # (T,)
+            denom = float(mask.sum().item())
+            if denom <= 0.0:
+                mask = torch.ones(T, device=device, dtype=torch.float32)
+                denom = float(T)
+
+            m_state = mask.view(1, T, 1)
+            # Anchor-mean of the encoder states over the support window.
+            u_avg = (source_state * m_state).sum(dim=1) / denom  # (B, d_u)
+            c_avg = (target_state * m_state).sum(dim=1) / denom  # (B, d_c)
+            # Future-target summary: mean over the anchor axis of Y_plus, then flatten (H, C).
+            warmup, t_valid = runner.valid_anchor_range(T)
+            y_slice = y_plus[:, warmup:t_valid]  # (B, n_anchor, H, C_y)
+            if y_slice.shape[1] == 0:
+                y_slice = y_plus
+            y_avg = y_slice.mean(dim=1)  # (B, H, C_y)
+            y_flat = y_avg.reshape(y_avg.shape[0], -1)  # (B, H*C_y)
+            # Per-sample raw K over the anchor support.
+            k_b = (kld_per_t * mask.view(1, T)).sum(dim=1) / denom  # (B,)
+
+            u_np = _optional_numpy(u_avg)
+            c_np = _optional_numpy(c_avg)
+            y_np = _optional_numpy(y_flat)
+            k_np = _optional_numpy(k_b)
+            for idx in range(int(target_state.shape[0])):
+                u_rows.append(u_np[idx])
+                c_rows.append(c_np[idx])
+                y_rows.append(y_np[idx])
+                k_raw.append(float(k_np[idx]))
+                guids.append(_extract_guid(batch, idx))
+                labels.append(_extract_label(batch, idx))
+
+    n = len(k_raw)
+    logger.info("cmi_comparison: collected {} per-sample (u, y, c, K_raw) triples", n)
+    return {
+        "u": np.asarray(u_rows, dtype=np.float32) if n else np.zeros((0, 0), np.float32),
+        "y": np.asarray(y_rows, dtype=np.float32) if n else np.zeros((0, 0), np.float32),
+        "c": np.asarray(c_rows, dtype=np.float32) if n else np.zeros((0, 0), np.float32),
+        "k_raw": np.asarray(k_raw, dtype=np.float64),
+        "guids": np.asarray(guids, dtype=object),
+        "labels": np.asarray(labels, dtype=object),
+        "n_samples": n,
+    }
+
+
 def collect_predictions(
     runner: TestRunner,
     loader: Any,
@@ -749,6 +1057,11 @@ def collect_predictions(
 
             mu_full_np = outputs["mu_full"].detach().cpu().numpy()
             mu_base_np = outputs["mu_base"].detach().cpu().numpy()
+            # Decoder observation log-variances (G7). Present in every forward, but no
+            # collector read them before Sprint 5; they turn the point forecast into a
+            # predictive distribution.
+            logvar_full_np = _optional_numpy(outputs.get("logvar_full"))
+            logvar_base_np = _optional_numpy(outputs.get("logvar_base"))
             delta_np = outputs["delta_mu_src"].detach().cpu().numpy()
             z_np = outputs["z"].detach().cpu().numpy()
             attn_np = outputs["attn_weights"].detach().cpu().numpy()
@@ -790,6 +1103,8 @@ def collect_predictions(
                 samples.append({
                     "mu_full": mu_full_np[idx],
                     "mu_base": mu_base_np[idx],
+                    "logvar_full": None if logvar_full_np is None else logvar_full_np[idx],
+                    "logvar_base": None if logvar_base_np is None else logvar_base_np[idx],
                     "delta_src": delta_np[idx],
                     "y_plus": y_plus_np[idx],
                     "z": z_np[idx],

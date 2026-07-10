@@ -497,6 +497,68 @@ def test_pulse_train_render_shapes_and_positivity(config: dict) -> None:
     assert (lat["u_c"] >= 0).all() and (lat["y_d"] >= 0).all()
 
 
+# ---------------------------------------------------------------------------
+# §7.4: carrier-free ``direct`` render variant
+# ---------------------------------------------------------------------------
+
+
+def test_direct_render_one_sided_shapes_and_deflections(config: dict) -> None:
+    r"""``render_mode='direct'`` (default one-sided) yields clinically one-sided raw pairs.
+
+    No carrier / no AM: the coupled bands are the rectified upsampled latents, so
+    ``u_c``/``y_d`` are non-negative, the "carrier" is flat, and UP rises above its tone
+    while FHR dips below its baseline.
+    """
+    out = rg.generate_cell_raw(4, B=1.5, D=_D, config=config, seed=0, te_inj=2.0,
+                               render_mode="direct")
+    assert out["fhr_raw"].shape == (4, _N_RAW)
+    assert out["up_raw"].shape == (4, _N_RAW)
+    assert np.isfinite(out["fhr_raw"]).all() and np.isfinite(out["up_raw"]).all()
+    assert out["meta"]["render_mode"] == "direct"
+    assert out["meta"]["direct_one_sided"] is True
+    # No carrier notch is applied in direct mode.
+    assert out["meta"]["fhrv_notch"] is None
+
+    lat = out["latents"]
+    # Flat unit "carrier" (no carrier), one-sided coupled deflections, envelope == band.
+    assert np.allclose(lat["carrier_u"], 1.0) and np.allclose(lat["carrier_y"], 1.0)
+    assert (lat["u_c"] >= 0.0).all() and (lat["y_d"] >= 0.0).all()
+    assert np.allclose(lat["A_u"], lat["u_c"]) and np.allclose(lat["A_y"], lat["y_d"])
+    # The coupled UP deflection actually fires (contractions present) and stays within a
+    # physiological-scale envelope (peak set by contraction_mmHg[1]).
+    peak_mmHg = float(config["benchmarks"]["G1_raw"]["raw"]["contraction_mmHg"][1])
+    assert lat["u_c"].max() > 0.0
+    assert lat["u_c"].max() <= 3.0 * peak_mmHg
+
+
+def test_direct_render_bipolar_preserves_sign(config: dict) -> None:
+    r"""``raw.direct.one_sided=false`` renders the zero-mean bipolar coupled latent (both signs)."""
+    cfg = copy.deepcopy(config)
+    cfg["benchmarks"]["G1_raw"]["raw"].setdefault("direct", {})["one_sided"] = False
+    out = rg.generate_cell_raw(4, B=1.5, D=_D, config=cfg, seed=0, te_inj=2.0,
+                               render_mode="direct")
+    assert out["meta"]["render_mode"] == "direct"
+    assert out["meta"]["direct_one_sided"] is False
+    lat = out["latents"]
+    # Bipolar: the coupled bands take both signs (unlike the rectified one-sided variant).
+    assert lat["u_c"].min() < 0.0 < lat["u_c"].max()
+    assert lat["y_d"].min() < 0.0 < lat["y_d"].max()
+
+
+def test_direct_render_null_cell_has_no_coupled_signal(config: dict) -> None:
+    r"""A ``B=0`` direct cell carries no source→target coupling: ``u_c`` and ``d`` decouple."""
+    out = rg.generate_cell_raw(6, B=0.0, D=_D, config=config, seed=1, te_inj=0.0,
+                               render_mode="direct")
+    c = out["latents"]["c"]
+    d = out["latents"]["d"]
+    # With B=0 the target latent d is independent of the source c (|corr| ~ 0, not ~ 1).
+    cc = c - c.mean(axis=1, keepdims=True)
+    dc = d - d.mean(axis=1, keepdims=True)
+    denom = (cc ** 2).sum(axis=1) ** 0.5 * (dc ** 2).sum(axis=1) ** 0.5
+    corr = np.abs((cc * dc).sum(axis=1) / (denom + 1e-12)).mean()
+    assert corr < 0.3
+
+
 @pytest.mark.parametrize("r, w", [(0.0, 0.10), (0.80, 0.0)])
 def test_am_separation_rejects_degenerate_oscillator(r: float, w: float) -> None:
     r"""A degenerate oscillator (r=0 or w=0) raises a clear error instead of crashing."""

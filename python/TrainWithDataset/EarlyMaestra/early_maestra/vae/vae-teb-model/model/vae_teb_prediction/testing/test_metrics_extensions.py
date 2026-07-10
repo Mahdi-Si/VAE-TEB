@@ -32,7 +32,9 @@ def test_kld_mean_sum_l2_aggregates_respect_warmup():
     # Per-dim KL is 0.5 * delta_mu^2 because variances match.
     expected_dim = torch.tensor([[float("nan"), 1.25, 1.0, 4.0]])
     expected_sum = torch.tensor([[float("nan"), 2.5, 2.0, 8.0]])
-    expected_l2 = torch.tensor([[float("nan"), np.sqrt(0.5**2 + 2.0**2), 2.0, 8.0]])
+    # float(...) keeps the tensor float32; np.sqrt returns np.float64, which would promote it
+    # and make torch.allclose raise "Float did not match Double".
+    expected_l2 = torch.tensor([[float("nan"), float(np.sqrt(0.5**2 + 2.0**2)), 2.0, 8.0]])
 
     assert torch.allclose(per_t["kld_mean_t"][:, 1:], expected_dim[:, 1:])
     assert torch.isnan(per_t["kld_sum_t"][0, 0])

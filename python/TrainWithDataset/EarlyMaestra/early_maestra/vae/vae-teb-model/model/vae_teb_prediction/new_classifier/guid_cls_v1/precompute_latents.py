@@ -51,9 +51,9 @@ from hdf5_dataset.hdf5_dataset import (
 )
 # Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2 as SeqVaeLagAttn
 # The checkpoint model-class guard lives with v2; importing it is version-agnostic.
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import check_model_class
 from train.graph_models_utils import load_checkpoint_strict
 
 

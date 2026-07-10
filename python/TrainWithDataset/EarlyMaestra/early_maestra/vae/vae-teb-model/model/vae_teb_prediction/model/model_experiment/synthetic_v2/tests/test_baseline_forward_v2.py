@@ -23,7 +23,7 @@ import torch  # noqa: E402
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import (  # noqa: E402
     SeqVaeLagAttnV1,
 )
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (  # noqa: E402
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (  # noqa: E402
     SeqVaeLagAttnV2,
 )
 

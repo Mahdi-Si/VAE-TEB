@@ -163,8 +163,9 @@ def plot_raw_preview(
 
     Note: with the default ``am_carrier`` render the FHR coupled term is a modulated
     sinusoid symmetric about the baseline (best for the sign-blind scattering modulus),
-    not a one-sided clinical deceleration dip; the waveform-realistic ``pulse_train``
-    variant lands in Sprint 7.
+    not a one-sided clinical deceleration dip; the waveform-realistic ``pulse_train`` and
+    the carrier-free ``direct`` (§7.4) renders instead show one-sided contraction /
+    deceleration deflections in the raw traces.
 
     Args:
         fhr_raw: FHR waveform(s), shape ``(n, N)`` or ``(N,)`` (bpm).
@@ -494,7 +495,16 @@ _HTML_METRIC_ORDER = (
     "base_loss",
     "kld_loss",
     "kld_nats",
+    "kld_raw",
+    "kld_train",
+    "kld_active_frac",
     "pred_gap",
+    # Source-permutation control (S3-T01), a no-grad readout. ``feat_loss_perm`` is a
+    # ``source_state`` batch derangement -- NOT eval's input-stream ``feat_loss_shuffle``.
+    "kld_shuffled",
+    "kld_shuffled_ratio",
+    "feat_loss_perm",
+    "shuffle_penalty",
     "mu_prior_sat_frac",
     "delta_mu_sat_frac",
     "kld_beta",
@@ -1550,16 +1560,24 @@ def _per_cell_arrays(metrics: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     Returns:
         A dict of parallel float arrays keyed by column name (``te_inj``, ``te_scat``,
-        ``kbar_mean``, ``frac_phi``, ``lag_mass``, ``D``, ``n``) plus any per-control
-        null-ratio columns (``null_<ctrl>_ratio``). Missing entries are ``nan``.
+        ``kbar_mean``, ``frac_phi``, ``lag_mass``, ``D``, ``n``, ``feat_loss``,
+        ``base_loss``) plus any per-control null-ratio columns (``null_<ctrl>_ratio``) and
+        prediction-space control columns (``feat_loss_<ctrl>``, ``shuffle_penalty_<ctrl>``,
+        ``ordering_pass_<ctrl>``, the latter as ``1.0`` / ``0.0`` / ``nan``). Missing entries
+        are ``nan``.
     """
     rows = metrics.get("per_cell", []) or []
     keys = ["cell_id", "te_inj", "te_scat", "D", "kbar_mean", "n", "frac_phi",
-            "pred_gain", "uplift_rel", "lag_mass", "peak_lag_err"]
+            "feat_loss", "base_loss", "pred_gain", "uplift_rel", "lag_mass", "peak_lag_err"]
     null_keys = sorted({k for r in rows for k in r if str(k).startswith("null_")
                         and str(k).endswith("_ratio")})
+    # Prediction-space control columns (S3-T03), discovered rather than enumerated so a new
+    # control name reaches the figures without touching this helper.
+    pred_keys = sorted({k for r in rows for k in r
+                        if str(k).startswith(("feat_loss_", "shuffle_penalty_",
+                                              "ordering_pass_"))})
     out: Dict[str, np.ndarray] = {}
-    for key in keys + null_keys:
+    for key in keys + null_keys + pred_keys:
         vals = []
         for r in rows:
             v = r.get(key)
@@ -1589,7 +1607,11 @@ def plot_diagnostics_panel(
        (slope/intercept/$R^2$ and cell count $n$ annotated).
     2. **Preservation**: per-cell $\mathrm{frac}_\Phi$ bars with the ideal-1 reference.
     3. **Lag recovery**: per-cell LagMass bars with the pass threshold.
-    4. **Null control**: per-cell null-ratio bars ($\to 0$ for a signal-using model).
+    4. **Prediction control**: per-cell shuffle-penalty bars
+       $\mathcal L_{\mathrm{feat}}^{\pi(U)} - \mathcal L_{\mathrm{feat}}$, which a
+       source-exploiting model drives **above** the zero reference. (This panel used to plot
+       the KL null ratio against a "$\to 0$" caption; that ratio is a readout, not a gate --
+       see :func:`plot_kl_shuffle_readout`.)
 
     Args:
         metrics: The dict written by :func:`eval_v2.run_eval`.
@@ -1640,17 +1662,26 @@ def plot_diagnostics_panel(
               ylabel="LagMass", title="lag recovery (attention in $\\mathcal{L}^\\star$)",
               ref=float(thr) if thr is not None else None, ref_label="threshold")
 
-    # --- (4) null ratio per cell --------------------------------------------
-    null_cols = [k for k in pc if k.startswith("null_") and k.endswith("_ratio")]
-    if null_cols:
-        col = null_cols[0]
+    # --- (4) prediction-space control per cell -------------------------------
+    # The headline control is the SHUFFLE PENALTY, not the KL null ratio. A model that
+    # exploits the source forecasts worse under a corrupted one, so the penalty
+    # $\mathcal L_{\mathrm{feat}}^{\pi(U)} - \mathcal L_{\mathrm{feat}}$ must be positive on
+    # every signal cell; the reference line therefore sits at 0 as a *floor to clear*, not as
+    # a target to approach. (The old panel plotted the KL null ratio against a "$\to 0$"
+    # caption, which no honest model can satisfy -- v3 Finding F2. That ratio now lives in
+    # its own figure, ``plot_kl_shuffle_readout``.)
+    pen_cols = sorted(k for k in pc if k.startswith("shuffle_penalty_"))
+    if pen_cols:
+        col = pen_cols[0]
+        ctrl = col[len("shuffle_penalty_"):]
         _cell_bar(ax_null, pc[col], pc["cell_id"], color=_SCAT_COLOR,
-                  ylabel="null ratio", title=f"null control ({col})  $\\to 0$", ref=0.0,
+                  ylabel="shuffle penalty",
+                  title=f"prediction control ({ctrl}): penalty $> 0$", ref=0.0,
                   ref_label=None)
     else:
-        ax_null.text(0.5, 0.5, "no null controls in metrics", ha="center", va="center",
-                     transform=ax_null.transAxes, color=_BASELINE_COLOR)
-        ax_null.set_title("null control")
+        ax_null.text(0.5, 0.5, "no prediction controls in metrics", ha="center",
+                     va="center", transform=ax_null.transAxes, color=_BASELINE_COLOR)
+        ax_null.set_title("prediction control")
 
     for a in (ax_cal, ax_frac, ax_lag, ax_null):
         ps.style_axes(a)
@@ -2574,12 +2605,102 @@ def plot_null_controls(
     formats: tuple = ("pdf", "png"),
     dpi: int = _DPI,
 ) -> List[Path]:
-    r"""Write per-cell null-control ratios for **all** controls (shuffle + reverse).
+    r"""Write the per-cell **prediction-space** control: feat vs base vs corrupted-source feat.
 
-    Complements the 2$\times$2 diagnostics panel (which shows only the first control): the
-    per-cell null ratio $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$ for every
-    configured control (source shuffle and time-reverse), grouped per cell. A model that
-    genuinely uses the source has ratios $\to 0$ on signal cells and $\approx 1$ on nulls.
+    Three bars per cell -- $\mathcal L_{\mathrm{feat}}$, $\mathcal L_{\mathrm{base}}$ and
+    $\mathcal L_{\mathrm{feat}}^{\pi(U)}$ for each configured input-stream corruption. The
+    gate a model must clear on every signal cell is
+
+    .. math::
+
+        \mathcal L_{\mathrm{feat}} < \mathcal L_{\mathrm{base}}
+        < \mathcal L_{\mathrm{feat}}^{\pi(U)},
+
+    i.e. the source helps, and the *true* source is what helps. On the
+    $\mathrm{TE}_{\mathrm{inj}} = 0$ null cells the three bars coincide.
+
+    This figure replaced a per-cell plot of $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$
+    with a reference line at $0$ (S3-T04a). That ratio is a readout, not a gate -- it cannot
+    vanish on an honest model -- and now has its own figure, :func:`plot_kl_shuffle_readout`.
+
+    Args:
+        metrics: The dict written by :func:`eval_v2.run_eval`.
+        out_path: Output path stem or full path.
+        realizability: Unused (uniform gallery signature).
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    pc = _per_cell_arrays(metrics)
+    ctrls = sorted(k[len("feat_loss_"):] for k in pc if k.startswith("feat_loss_"))
+    cell_ids = pc.get("cell_id", np.zeros(0))
+    keep = np.isfinite(cell_ids)
+    order = np.argsort(cell_ids[keep])
+    cids = cell_ids[keep][order]
+    fig, ax = plt.subplots(figsize=(max(7.5, 0.75 * len(cids) + 2.0), 4.4))
+    if not ctrls or len(cids) == 0 or "feat_loss" not in pc:
+        _no_data(ax, "no prediction controls in metrics")
+        ps.style_axes(ax)
+        return _save_fig(fig, out_path, formats, dpi)
+
+    series = [(r"$\mathcal{L}_{\mathrm{feat}}$", pc["feat_loss"]),
+              (r"$\mathcal{L}_{\mathrm{base}}$", pc["base_loss"])]
+    series += [(rf"$\mathcal{{L}}_{{\mathrm{{feat}}}}^{{{c}}}$", pc[f"feat_loss_{c}"])
+               for c in ctrls]
+    x = np.arange(len(cids))
+    nb = len(series)
+    width = 0.86 / nb
+    palette = ps.PALETTE_EXTENDED
+    for j, (label, vals) in enumerate(series):
+        ax.bar(x + (j - (nb - 1) / 2.0) * width, vals[keep][order], width=width,
+               color=palette[j % len(palette)], label=label)
+
+    # Mark the cells where the ordering fails, so a reader sees the verdict, not just bars.
+    for c in ctrls:
+        col = pc.get(f"ordering_pass_{c}")
+        if col is None:
+            continue
+        vals = col[keep][order]
+        for i, v in enumerate(vals):
+            if np.isfinite(v) and v < 0.5:
+                ax.annotate("FAIL", (x[i], 0.0), xytext=(0, -14),
+                            textcoords="offset points", ha="center",
+                            fontsize=5.5, color=_SCAT_COLOR)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{int(c)}" for c in cids], fontsize=6.0)
+    ax.set_xlabel("cell id")
+    ax.set_ylabel("clean-window forecast MSE")
+    ax.set_title("prediction-space control per cell "
+                 r"(gate: $\mathcal{L}_{\mathrm{feat}} < \mathcal{L}_{\mathrm{base}} "
+                 r"< \mathcal{L}_{\mathrm{feat}}^{\pi(U)}$)")
+    ax.legend(loc="upper right", frameon=False, fontsize=6.5, ncol=max(1, nb // 2))
+    ps.style_axes(ax)
+    fig.tight_layout()
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_kl_shuffle_readout(
+    metrics: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    realizability: Optional[Dict[str, Any]] = None,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Render the demoted KL-space ratio $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$.
+
+    This figure exists to make a negative result **legible**, not to hide it (S3-T04b). The
+    ratio was once the headline gate, under the expectation that it vanishes on a model that
+    uses the source. It cannot: $\mathrm{KL}(q \,\|\, p)$ measures that the source moved the
+    posterior, not that it moved it *correctly*, and a deranged source driven through a
+    posterior trained only on matched pairs is out of distribution -- so it typically moves
+    the belief *more*. v3 measured $\bar K_{\mathrm{shuffled}} / \bar K_{\mathrm{true}} \in
+    [1.02, 1.10]$ on a model that was demonstrably exploiting the source (Finding F2).
+
+    The reference line therefore sits at $1$, not $0$. The discriminating gate lives in
+    :func:`plot_null_controls`, which plots the prediction-space losses.
 
     Args:
         metrics: The dict written by :func:`eval_v2.run_eval`.
@@ -2593,7 +2714,7 @@ def plot_null_controls(
     """
     pc = _per_cell_arrays(metrics)
     null_cols = sorted(k for k in pc if k.startswith("null_") and k.endswith("_ratio"))
-    cell_ids = pc["cell_id"]
+    cell_ids = pc.get("cell_id", np.zeros(0))
     keep = np.isfinite(cell_ids)
     order = np.argsort(cell_ids[keep])
     cids = cell_ids[keep][order]
@@ -2611,15 +2732,24 @@ def plot_null_controls(
         label = col.replace("null_", "").replace("_ratio", "")
         ax.bar(x + (j - (nc - 1) / 2.0) * width, vals, width=width,
                color=palette[j % len(palette)], label=label)
-    ax.axhline(0.0, color=_BASELINE_COLOR, lw=0.7, ls=":")
+    ax.axhline(1.0, color=_BASELINE_COLOR, lw=0.8, ls="--")
+    ax.annotate(r"$\approx 1$ is expected, even when the source IS used",
+                xy=(0.5, 1.0), xycoords=("axes fraction", "data"),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", fontsize=6.0, color=_BASELINE_COLOR)
     ax.set_xticks(x)
     ax.set_xticklabels([f"{int(c)}" for c in cids], fontsize=6.0)
     ax.set_xlabel("cell id")
-    ax.set_ylabel(r"null ratio $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$")
-    ax.set_title(r"null controls per cell  ($\to 0$ signal, $\approx 1$ null)")
+    ax.set_ylabel(r"$\bar K_{\mathrm{shuffled}} / \bar K_{\mathrm{signal}}$")
+    ax.set_title("KL-space null ratio per cell  (readout, NOT a gate)")
     ax.legend(loc="upper right", frameon=False, fontsize=6.5, title="control")
+    fig.text(0.01, 0.005,
+             "Readout only: KL(q||p) measures that the source moved the posterior, not that "
+             "it moved it correctly (v3 Finding F2).\nThe discriminating gate is the "
+             "prediction-space control.",
+             fontsize=5.5, color=_BASELINE_COLOR, va="bottom")
     ps.style_axes(ax)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     return _save_fig(fig, out_path, formats, dpi)
 
 
@@ -2696,6 +2826,27 @@ def _variant_fit(cal: Dict[str, Any], variant: str, pref: str) -> Optional[tuple
     return (entry.get(f"gamma_{pref}"), entry.get(f"alpha_{pref}"), entry.get(f"r2_{pref}"))
 
 
+#: Colour for a KLD summary that averages over steps outside the model's KL support.
+_OOS_COLOR = "#9e9e9e"
+
+
+def _is_out_of_support(kld_variants: Dict[str, Any], variant: str) -> bool:
+    r"""Whether ``variant`` is stamped ``out_of_support`` by :func:`eval_v2.fit_calibration`.
+
+    ``False`` for a legacy ``metrics.json`` written before S4-T01, and for every variant under
+    ``kld_support: full`` (the v1 / ``parity`` configuration), so nothing is greyed there.
+
+    Args:
+        kld_variants: The ``calibration.kld_variants`` block.
+        variant: The summary key.
+
+    Returns:
+        Whether the variant must be excluded from best-variant selection.
+    """
+    entry = (kld_variants or {}).get(variant)
+    return bool(isinstance(entry, dict) and entry.get("out_of_support", False))
+
+
 def plot_kld_variants_vs_te(
     per_sample: Optional[Dict[str, Any]],
     metrics: Dict[str, Any],
@@ -2748,6 +2899,7 @@ def plot_kld_variants_vs_te(
     te = np.asarray(ps_arr.get(te_key, []), dtype=float)
     cell_id = np.asarray(ps_arr.get("cell_id", np.zeros_like(kbar)), dtype=float)
     palette = ps.PALETTE_EXTENDED
+    kv = cal.get("kld_variants") or {}
 
     n = len(variants)
     ncol = 3 if n > 4 else max(1, n)
@@ -2758,13 +2910,21 @@ def plot_kld_variants_vs_te(
     for j, v in enumerate(variants):
         ax = flat[j]
         y = np.asarray(ps_arr.get(v, []), dtype=float)
+        # S4-T01: grey + annotate a summary that averages over the model's untrained region.
+        oos = _is_out_of_support(kv, v)
         _kbar_vs_te_panel(
             ax, te, y, cell_id, cal=cal, pref=pref,
-            color=palette[j % len(palette)], xlabel=f"{te_label} (nats)",
+            color=_OOS_COLOR if oos else palette[j % len(palette)],
+            xlabel=f"{te_label} (nats)",
             fit=_variant_fit(cal, v, pref), show_identity=v not in _NON_RATE_VARIANTS,
         )
         ax.set_ylabel(_kld_variant_label(v))
-        ax.set_title(f"{_kld_variant_label(v)}  |  " + ax.get_title(), fontsize=7.5)
+        title = _kld_variant_label(v) + ("  [OUT OF SUPPORT]" if oos else "")
+        ax.set_title(f"{title}  |  " + ax.get_title(), fontsize=7.5)
+        if oos:
+            ax.text(0.02, 0.96, "averaged outside the KL support;\nnot a TE surrogate",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=5.5,
+                    color=_OOS_COLOR)
         ps.style_axes(ax)
     for ax in flat[n:]:
         ax.set_visible(False)
@@ -2794,6 +2954,10 @@ def plot_kld_te_correlation(
     (best tracker on top) and each bar group is annotated with the per-sample slope $\gamma$.
     This turns "different versions of KLD vs TE" into a ranked, quantitative summary.
 
+    A variant stamped ``out_of_support`` (S4-T01: ``kbar_full`` under anchor-aligned KL
+    support) is rendered **greyed and annotated, and sorted to the bottom**, so the ranking can
+    never crown a summary that is partly measuring an untrained region of the sequence.
+
     Args:
         metrics: The ``metrics.json`` dict from :func:`eval_v2.run_eval`.
         out_path: Output path stem or full path.
@@ -2821,18 +2985,28 @@ def plot_kld_te_correlation(
         except (TypeError, ValueError):
             return float("nan")
 
-    # Order by |Spearman rho vs TE_inj| so the best rank-tracker sits on top.
-    variants = sorted(variants, key=lambda v: abs(_val(v, "spearman_inj"))
-                      if np.isfinite(_val(v, "spearman_inj")) else -1.0)
-    labels = [_kld_variant_label(v) for v in variants]
+    # Order by |Spearman rho vs TE_inj| so the best rank-tracker sits on top. Out-of-support
+    # variants sort BELOW every in-support one regardless of their correlation: a high rho on
+    # a window the model was never trained to shape is not evidence of a better surrogate.
+    variants = sorted(
+        variants,
+        key=lambda v: (
+            0 if _is_out_of_support(kv, v) else 1,
+            abs(_val(v, "spearman_inj")) if np.isfinite(_val(v, "spearman_inj")) else -1.0,
+        ),
+    )
+    labels = [_kld_variant_label(v) + (" (out of support)" if _is_out_of_support(kv, v) else "")
+              for v in variants]
     yy = np.arange(len(variants))
     h = 0.38
     for ax, pref, title in ((ax_inj, "inj", r"vs $\mathrm{TE}_{\mathrm{inj}}$"),
                             (ax_scat, "scat", r"vs $\mathrm{TE}_{\mathrm{scat}}$")):
         pear = np.array([_val(v, f"pearson_{pref}") for v in variants])
         spear = np.array([_val(v, f"spearman_{pref}") for v in variants])
-        ax.barh(yy + h / 2, pear, height=h, color=_INJ_COLOR, label="Pearson $r$")
-        ax.barh(yy - h / 2, spear, height=h, color=_SCAT_COLOR, label=r"Spearman $\rho$")
+        pear_c = [_OOS_COLOR if _is_out_of_support(kv, v) else _INJ_COLOR for v in variants]
+        spear_c = [_OOS_COLOR if _is_out_of_support(kv, v) else _SCAT_COLOR for v in variants]
+        ax.barh(yy + h / 2, pear, height=h, color=pear_c, label="Pearson $r$")
+        ax.barh(yy - h / 2, spear, height=h, color=spear_c, label=r"Spearman $\rho$")
         for y, v in zip(yy, variants):
             g = _val(v, f"gamma_{pref}")
             if np.isfinite(g):
@@ -2848,7 +3022,14 @@ def plot_kld_te_correlation(
     ax_inj.set_yticklabels(labels, fontsize=7.0)
     fig.suptitle(f"synthetic_v2 KLD-summary vs TE correlation ranking  "
                  f"(run {metrics.get('run_tag', '?')})", fontsize=ps.FONT_SUPTITLE)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if any(_is_out_of_support(kv, v) for v in variants):
+        fig.text(0.01, 0.005,
+                 "Greyed: averaged over steps outside the model's KL support (anchor-aligned "
+                 "training); excluded from best-variant selection. Use kbar_postwarm.",
+                 fontsize=5.5, color=_BASELINE_COLOR, va="bottom")
+        fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    else:
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
     return _save_fig(fig, out_path, formats, dpi)
 
 
@@ -3089,5 +3270,292 @@ def plot_per_head_kld_vs_te(
                  rf"run {metrics.get('run_tag', '?')})")
     ax.legend(loc="upper left", frameon=False, fontsize=6.5)
     ps.style_axes(ax)
+    fig.tight_layout()
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 5 (G-E) / Sprint 6 (G-F): the two analysis figures
+# ---------------------------------------------------------------------------
+def plot_calibration_by_te(
+    by_te: Any,
+    out_path: Union[str, Path],
+    *,
+    level: float = 0.9,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Coverage error and sharpness, resolved by injected TE level and horizon (S5-T03).
+
+    Two heatmaps over the $(\mathrm{TE}_{\mathrm{inj}}, h)$ grid. The left panel shows the
+    signed coverage error $c - p$ at a single nominal level $p$ on a diverging scale centred at
+    zero: blue is over-coverage (intervals too wide), red is over-confidence. The right panel
+    shows the predictive spread $\bar\sigma$.
+
+    The diagnostic question is whether the learned variance is honest *uniformly*. A row of red
+    at high $\mathrm{TE}_{\mathrm{inj}}$ says the model is over-confident exactly where the
+    coupling is strong -- a failure $\bar K$ alone could never surface.
+
+    Args:
+        by_te: The long-format ``calibration_by_te`` table (a ``pandas.DataFrame`` or a list of
+            row dicts) keyed ``(te_level, horizon, level)``.
+        out_path: Output stem or full path.
+        level: The nominal central-interval level to render.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    rows = by_te.to_dict("records") if hasattr(by_te, "to_dict") else list(by_te or [])
+    rows = [r for r in rows if abs(float(r["level"]) - float(level)) < 1e-9]
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.2))
+    if not rows:
+        for ax in axes:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", fontsize=9)
+            ax.set_axis_off()
+        return _save_fig(fig, out_path, formats, dpi)
+
+    te_levels = sorted({float(r["te_level"]) for r in rows})
+    horizons = sorted({int(r["horizon"]) for r in rows})
+    cov_err = np.full((len(te_levels), len(horizons)), np.nan)
+    sharp = np.full((len(te_levels), len(horizons)), np.nan)
+    for r in rows:
+        i, j = te_levels.index(float(r["te_level"])), horizons.index(int(r["horizon"]))
+        cov_err[i, j] = float(r["coverage_error"])
+        sharp[i, j] = float(r["sharpness"])
+
+    lim = float(np.nanmax(np.abs(cov_err))) if np.isfinite(cov_err).any() else 1.0
+    lim = max(lim, 1e-6)
+    panels = (
+        (axes[0], cov_err, "coolwarm_r", Normalize(vmin=-lim, vmax=lim),
+         rf"coverage error $c - {level:g}$"),
+        (axes[1], sharp, "viridis", None, r"sharpness $\bar\sigma$"),
+    )
+    for ax, data, cmap, norm, title in panels:
+        im = ax.imshow(data, aspect="auto", origin="lower", cmap=cmap, norm=norm,
+                       extent=(horizons[0] - 0.5, horizons[-1] + 0.5, -0.5,
+                               len(te_levels) - 0.5))
+        ax.set_yticks(range(len(te_levels)))
+        ax.set_yticklabels([f"{t:g}" for t in te_levels])
+        ax.set_xlabel("horizon step $h$")
+        ax.set_ylabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)")
+        ax.set_title(title, fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ps.style_axes(ax)
+    fig.suptitle("Predictive calibration stratified by injected TE", fontsize=9)
+    fig.tight_layout()
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+def plot_lag_intervention(
+    summary: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    formats: tuple = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Interventional importance versus attention mass, per cell (S6-T04).
+
+    One small multiple per cell. Bars are the relative interventional importance
+    $\Delta L_{\mathrm{rel}}(G) = \Delta L_G / \mathcal{L}_{\mathrm{feat}}$ of each fixed
+    physiologic band; the overlaid line is the normalised ``te_lag_map`` mass the attention puts
+    on the same band. If the attention is a faithful attribution, the two agree.
+
+    The true lag $D$ is drawn as a vertical marker on the band that contains it, and the panel
+    title carries the per-cell in-band gate
+    $\Delta L_{\mathrm{rel}}(\mathcal{L}^\star) > \Delta L_{\mathrm{rel}}(\{\ell \ge D\})$.
+
+    Args:
+        summary: The ``lag_intervention.json`` payload.
+        out_path: Output stem or full path.
+        formats: Output formats to write.
+        dpi: Raster DPI for PNG output.
+
+    Returns:
+        The list of written file paths.
+    """
+    bands: Dict[str, Any] = summary.get("bands") or {}
+    per_cell: Dict[str, Any] = summary.get("per_cell") or {}
+    cells = sorted(per_cell.values(), key=lambda c: (c.get("te_inj") or 0.0, c.get("delay") or 0))
+    if not cells or not bands:
+        fig, ax = plt.subplots(figsize=(5.0, 2.5))
+        ax.text(0.5, 0.5, "no lag-intervention data", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return _save_fig(fig, out_path, formats, dpi)
+
+    names = list(bands)
+    x = np.arange(len(names))
+    ncol = min(3, len(cells))
+    nrow = int(np.ceil(len(cells) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 2.5 * nrow), squeeze=False)
+
+    for idx, cell in enumerate(cells):
+        ax = axes[idx // ncol][idx % ncol]
+        delta = np.array([cell.get(f"delta_L_rel_{n}", np.nan) for n in names], dtype=float)
+        mass = np.array([cell.get(f"mass_{n}", np.nan) for n in names], dtype=float)
+
+        ax.bar(x, delta, color=_INJ_COLOR, alpha=0.85, label=r"$\Delta L_{\mathrm{rel}}$")
+        ax.axhline(0.0, color=_BASELINE_COLOR, lw=0.6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, fontsize=6, rotation=45, ha="right")
+        ax.set_ylabel(r"$\Delta L_{\mathrm{rel}}$", fontsize=7)
+
+        twin = ax.twinx()
+        twin.plot(x, mass, color=_SCAT_COLOR, marker="o", ms=3, lw=1.0,
+                  label="attention mass")
+        twin.set_ylabel("te_lag_map mass", fontsize=7, color=_SCAT_COLOR)
+        twin.tick_params(axis="y", labelcolor=_SCAT_COLOR, labelsize=6)
+
+        # Mark the band containing the true lag D.
+        delay = cell.get("delay")
+        if delay is not None:
+            for j, name in enumerate(names):
+                lo, hi = bands[name]
+                if int(lo) <= int(delay) <= int(hi):
+                    ax.axvspan(j - 0.5, j + 0.5, color=_BAND_COLOR, alpha=0.15, zorder=0)
+                    ax.annotate(rf"$D={delay}$", xy=(j, 0), xytext=(j, 0),
+                                fontsize=6, color=_BAND_COLOR, ha="center", va="bottom")
+                    break
+
+        te = cell.get("te_inj")
+        gate = cell.get("inband_gate_pass")
+        verdict = "—" if gate is None else ("pass" if gate else "FAIL")
+        ax.set_title(
+            rf"cell {cell.get('cell_id')}  $\mathrm{{TE}}={te:.1f}$  "
+            rf"$\mathcal{{L}}^\star$ gate: {verdict}" if te is not None else "",
+            fontsize=7,
+        )
+        ps.style_axes(ax)
+
+    for idx in range(len(cells), nrow * ncol):
+        axes[idx // ncol][idx % ncol].set_axis_off()
+
+    overall = summary.get("overall") or {}
+    frac = overall.get("inband_gate_pass_frac")
+    frac_txt = "n/a" if frac is None else f"{frac:.0%}"
+    fig.suptitle(
+        f"Interventional lag attribution (arm {summary.get('arm', '?')}, "
+        f"split {summary.get('split', '?')}): in-band gate {frac_txt} of "
+        f"{overall.get('n_signal_cells', '?')} signal cells",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    return _save_fig(fig, out_path, formats, dpi)
+
+
+#: Series drawn by :func:`plot_cmi_comparison`, in legend order.
+_CMI_SERIES: Tuple[Tuple[str, str, str], ...] = (
+    ("cmi_latent", "CMI (ground-truth latents)", "o"),
+    ("cmi_feature_gt", "CMI (features, GT conditioning)", "s"),
+    ("cmi_feature_model", r"CMI (features, $\mathtt{target\_state}$)", "^"),
+)
+
+
+def plot_cmi_comparison(
+    summary: Dict[str, Any],
+    out_path: Union[str, Path],
+    *,
+    formats: Sequence[str] = ("pdf", "png"),
+    dpi: int = _DPI,
+) -> List[Path]:
+    r"""Per-cell $\mathrm{TE}_{\mathrm{inj}}$ against $\bar K$ and each CMI configuration.
+
+    Left panel: every estimate versus the injected TE, with $95\%$ intervals, the identity line,
+    and the **InfoNCE ceiling** $\log K$ drawn and labelled. Cells stamped ``near_ceiling`` are
+    marked, because no absolute-nats claim is made for them. Right panel: the per-cell
+    model-coupling bias $\mathrm{CMI}(\texttt{target\_state}) - \mathrm{CMI}(\text{GT})$.
+
+    Args:
+        summary: The ``cmi.json`` payload from :func:`cmi_v3.run_cmi_comparison`.
+        out_path: Stem (no suffix) for the rendered files.
+        formats: Output formats.
+        dpi: Raster resolution.
+
+    Returns:
+        The written paths.
+    """
+    per_cell = summary.get("per_cell") or {}
+    cells = [per_cell[k] for k in sorted(per_cell, key=lambda x: int(x))]
+    if not cells:
+        fig, ax = plt.subplots(figsize=(5.0, 2.5))
+        ax.text(0.5, 0.5, "no CMI data", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return _save_fig(fig, out_path, formats, dpi)
+
+    configs = summary.get("configs") or []
+    ceiling = summary.get("ceiling_nats")
+    claim_frac = summary.get("ceiling_claim_frac") or 0.0
+    te = np.array([c.get("te_inj", np.nan) for c in cells], dtype=float)
+    kbar = np.array([c.get("kbar", np.nan) for c in cells], dtype=float)
+
+    has_bias = any("bias" in c for c in cells)
+    fig, axes = plt.subplots(1, 2 if has_bias else 1, figsize=(9.0 if has_bias else 5.0, 3.4),
+                             squeeze=False)
+    ax = axes[0][0]
+
+    lim = float(np.nanmax(te)) * 1.08 if np.isfinite(te).any() else 1.0
+    ax.plot([0, lim], [0, lim], color=_BASELINE_COLOR, lw=0.8, ls=":", label="identity", zorder=1)
+
+    colors = (_INJ_COLOR, _SCAT_COLOR, _BAND_COLOR)
+    for (key, label, marker), color in zip(_CMI_SERIES, colors):
+        name = key.replace("cmi_", "")
+        if name not in configs:
+            continue
+        est = np.array([(c.get(key) or {}).get("estimate", np.nan) for c in cells], dtype=float)
+        lo = np.array([(c.get(key) or {}).get("ci_lo", np.nan) for c in cells], dtype=float)
+        hi = np.array([(c.get(key) or {}).get("ci_hi", np.nan) for c in cells], dtype=float)
+        err = np.vstack([np.clip(est - lo, 0, None), np.clip(hi - est, 0, None)])
+        ax.errorbar(te, est, yerr=err, fmt=marker, ms=4, lw=0.9, capsize=2,
+                    color=color, label=label, zorder=3)
+        near = np.array([bool((c.get(key) or {}).get("near_ceiling")) for c in cells])
+        if near.any():
+            ax.scatter(te[near], est[near], s=70, facecolors="none", edgecolors=color,
+                       lw=0.8, zorder=4)
+
+    ax.plot(te, kbar, marker="x", ms=5, mew=1.2, lw=0.0, color="#444444",
+            label=r"$\bar K$ (model KL surrogate)", zorder=5)
+
+    if ceiling:
+        ax.axhline(ceiling, color=_SCAT_COLOR, lw=0.9, ls="--", zorder=1)
+        ax.annotate(rf"InfoNCE ceiling $\log K = {ceiling:.2f}$ nats",
+                    xy=(0.98, ceiling), xycoords=("axes fraction", "data"),
+                    va="bottom", ha="right", fontsize=6, color=_SCAT_COLOR)
+        if claim_frac:
+            ax.axhline(claim_frac * ceiling, color=_SCAT_COLOR, lw=0.6, ls=":", alpha=0.7)
+            ax.annotate(rf"no absolute claim above {claim_frac * ceiling:.2f}",
+                        xy=(0.98, claim_frac * ceiling), xycoords=("axes fraction", "data"),
+                        va="bottom", ha="right", fontsize=5.5, color=_SCAT_COLOR, alpha=0.8)
+        ax.set_ylim(top=ceiling * 1.12)
+
+    ax.set_xlabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)", fontsize=8)
+    ax.set_ylabel("nats", fontsize=8)
+    ax.legend(fontsize=5.5, loc="lower right", framealpha=0.9)
+    ps.style_axes(ax)
+
+    if has_bias:
+        ax2 = axes[0][1]
+        bias = np.array([(c.get("bias") or {}).get("estimate", np.nan) for c in cells], dtype=float)
+        blo = np.array([(c.get("bias") or {}).get("ci_lo", np.nan) for c in cells], dtype=float)
+        bhi = np.array([(c.get("bias") or {}).get("ci_hi", np.nan) for c in cells], dtype=float)
+        err = np.vstack([np.clip(bias - blo, 0, None), np.clip(bhi - bias, 0, None)])
+        ax2.errorbar(te, bias, yerr=err, fmt="o", ms=4, lw=0.9, capsize=2, color=_INJ_COLOR)
+        ax2.axhline(0.0, color=_BASELINE_COLOR, lw=0.8)
+        ax2.set_xlabel(r"$\mathrm{TE}_{\mathrm{inj}}$ (nats)", fontsize=8)
+        ax2.set_ylabel(r"$\mathrm{CMI}(\mathtt{target\_state}) - \mathrm{CMI}(\mathrm{GT})$",
+                       fontsize=7)
+        ax2.set_title("model-coupling bias (rank-level claim only)", fontsize=8)
+        ps.style_axes(ax2)
+
+    rec = summary.get("recovery") or {}
+    rho = rec.get("spearman_cmi_te_inj")
+    rho_txt = "n/a" if rho is None else f"{rho:.3f}"
+    fig.suptitle(
+        f"Neural CMI vs injected TE (arm {summary.get('arm', '?')}, "
+        f"split {summary.get('split', '?')}): "
+        rf"$\rho(\mathrm{{CMI}}_{{\mathrm{{latent}}}}, \mathrm{{TE}}_{{\mathrm{{inj}}}})$ = "
+        f"{rho_txt} over {rec.get('n_cells', '?')} cells",
+        fontsize=9,
+    )
     fig.tight_layout()
     return _save_fig(fig, out_path, formats, dpi)

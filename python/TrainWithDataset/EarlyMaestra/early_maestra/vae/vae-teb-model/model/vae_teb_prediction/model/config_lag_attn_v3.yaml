@@ -1,0 +1,371 @@
+# Lag-Attentive Residual VAE-TEB v3 training configuration.
+#
+# v3 is a scientific-cleanliness fork of v1 (see vae_teb_lag_attn_v3.py and
+# vae-teb-lag-attn-v3-spec-and-sprints.md). It keeps v1's architecture and data
+# interface byte-for-byte and changes only how the latent log-variances are
+# produced/bounded and how the reported TE-surrogate KL is masked and summarised:
+#   * posterior_logvar: residual  -> KL == 0 exactly at initialisation (G1)
+#   * logvar_bound: smooth         -> no zero-gradient clamp plateaus (G2)
+#   * kld_support: anchor          -> train the KL only over supervised anchors (G3)
+# The parity configuration (posterior_logvar=independent, logvar_bound=clamp,
+# kld_support=full) reduces v3 to v1 exactly.
+#
+# Prerequisites (unchanged from v1):
+#   * HDF5 datasets must be produced by
+#     `hdf5_dataset/new_pipeline/create_new_pipeline.py`, which writes
+#     `up_st` (43 channels, log-normalised) and `up_ph` (58 channels,
+#     asinh-normalised) as first-class datasets alongside `fhr_st`,
+#     `fhr_ph`, and `fhr_up_ph`.
+#   * The stats file at `stat_path` must be regenerated after any dataset
+#     rebuild by running `hdf5_dataset/calculate_dataset_stats.py`.
+#
+# Ablation toggle: `use_up_st: true` -> source stream = concat(up_st, up_ph)
+# with c_u=101. `use_up_st: false` -> source stream = up_ph alone with c_u=58.
+#
+# Warm-start: v3 can best-effort warm-start from a v1 checkpoint
+# (submodule-by-submodule; see trainer_lag_attn_v3.py, Sprint 4). Left null here
+# so v3 trains from scratch by default.
+
+general_config:
+  tag: lag_attn_v3_baseline
+
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 128
+    test: 128
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v3
+
+model_config:
+  VAE_model:
+    # KL / beta schedule (A1/A2 — calibrated ELBO).
+    # ``beta_schedule`` is resolved per-epoch by
+    # ``SeqVaeLagAttnV3Pl._resolve_beta``. kind: linear_warmup ramps β from
+    # ``start`` to ``end`` over the first ``warmup_epochs`` epochs, then holds
+    # at ``end``.
+    #
+    # BETA RETUNE NOTE (v3): the v3 KL scale differs from v1 for two reasons:
+    #   (1) posterior_logvar=residual makes K start at 0 and grow only as the
+    #       source path earns it (v1 started at an O(1) random-mismatch floor);
+    #   (2) kld_support=anchor drops the last ``horizon`` steps from the KL
+    #       denominator, changing the mean KL scale.
+    # The value below is a sensible starting point; retune ``end`` empirically
+    # against the logged ``kld_raw`` trajectory (spec Section 11 / S7-T04).
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001        # fallback when beta_schedule.kind == constant
+    free_bits: 0.1         # nats per latent dim per step; 0.0 disables
+
+    # Reconstruction likelihood (A1, G7 — production). ``sigma_obs='learned'`` makes
+    # ``compute_loss`` consume the decoder ``logvar_full``/``logvar_base`` heads, giving a
+    # heteroscedastic per-point predictive Gaussian (the calibration report, G10, needs this)
+    # and letting ``_select_ddp_strategy`` resolve to plain 'ddp'. Use a positive float
+    # (e.g. 1.0) only to reduce v3 to a fixed-variance debug run.
+    likelihood: gaussian_nll
+    sigma_obs: learned
+
+    # A3 — baseline/residual gradient separation.
+    detach_baseline_in_full: true
+
+    # Feature-loss weighting (spec section 8.7)
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # Backbone widths
+    d_model: 128
+    d_z: 24
+    horizon: 30            # H_d = 30 decimated steps = 2 min forecast
+    warmup_period: 30      # first 2 minutes ignored in both feature & KL losses
+    sequence_length: 300
+    c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
+    c_u: 101               # 43 (up_st) + 58 (up_ph); must equal 58 if use_up_st=false
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-5.0, 3.0]
+    # Latent stabilisers (see vae_teb_lag_attn_v1.py PriorHead / PosteriorHead).
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
+
+    # --- v3 causal history states (G0) ------------------------------------
+    # v1 normalises with nn.GroupNorm applied to (B, C, T) tensors (in
+    # CausalMultiChannelConvBlock.pre_norm and _CausalConvLstmEncoder's
+    # stack_skip_norms). GroupNorm reduces over every non-batch dim inside a
+    # group -- i.e. over (C/G, T) -- so its statistics pool ACROSS TIME and
+    # H_y[t] ends up a function of Y[>t]. The "prior" p(z_t | Y_<=t) then
+    # secretly conditions on the future, and K_t is not a transfer-entropy
+    # surrogate at all, whatever G1-G6 do to it. Measured leak into
+    # target_state[t] from resampling y[>t]: ~3.4% relative at T=300, 0.0
+    # once causal_norm is on.
+    #
+    # 'true' swaps the 10 encoder GroupNorms for CausalGroupNorm (same
+    # parameter names and shapes, so a v1 warm-start still aligns key-for-key).
+    # 'false' keeps v1's behaviour and is required for Sprint-0 golden parity.
+    # The decoders and the shared horizon core are untouched: their GroupNorms
+    # pool over the forecast-horizon axis within one anchor, which mixes that
+    # anchor's outputs rather than inputs across time (probed: zero leak).
+    causal_norm: true
+
+    # --- v3 log-variance controls (G1, G2) --------------------------------
+    # logvar_bound: 'smooth' maps every log-variance head through
+    #   lo + (hi-lo)*sigmoid(r) over logvar_clamp, eliminating clamp's
+    #   zero-gradient plateaus. 'clamp' reproduces exact v1 numerics (parity).
+    logvar_bound: smooth
+    # posterior_logvar: 'residual' makes logvar_post a zero-init residual around
+    #   the prior's pre-bound raw logvar, so KL == 0 exactly at init and every
+    #   nat is earned by source conditioning. 'independent' = v1 (parity).
+    posterior_logvar: residual
+    # delta_logvar_scale: saturation magnitude s_l of the tanh-bounded posterior
+    #   log-variance delta (residual mode).
+    delta_logvar_scale: 2.0
+    # kld_support: 'anchor' trains the KL only over supervised anchors
+    #   [warmup, T-horizon); 'full' = v1 warm-up-only support (parity).
+    kld_support: anchor
+
+    # --- Source-permutation control (G6) — READOUT ONLY -------------------
+    # The control deranges UP across the batch and reports
+    #   K_shuffled = KL( q(z | Y, pi(U)) || p(z | Y) ).
+    # It is fused into the single main forward (the source encoder is
+    # batch-independent, so permuting `source_state` equals re-encoding pi(U));
+    # see SeqVaeLagAttnV3.perm_kl_from_forward.
+    #
+    # lambda_perm > 0 would ALSO add lambda_perm * K_shuffled to the loss.
+    # It is deliberately 0. Measured on a causal, source-coupled synthetic task
+    # (fresh batches, held-out eval), with the model demonstrably using the
+    # source (feat_loss 3.87 vs base_loss 14.20):
+    #
+    #   lambda_perm=0.0  ->  K_true 6.04  K_shuffled 6.62   ratio 1.10
+    #   lambda_perm=0.0  ->  K_true 6.37  K_shuffled 6.49   ratio 1.02   (seed 1)
+    #   lambda_perm=0.5  ->  K_true 3.00  K_shuffled 2.51   ratio 0.84
+    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
+    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
+    #
+    # Two conclusions. (1) KL(q||p) measures "the source moved my belief", not
+    # "...correctly": a deranged UP is still a UP and the posterior, trained
+    # only on matched pairs, reacts to it out-of-distribution -- so K_shuffled
+    # >= K_true even for a model that plainly uses the source. kld_raw alone is
+    # therefore NOT a source-specific TE surrogate. (2) The only way L_perm can
+    # suppress K_shuffled is to teach the posterior to ignore mismatched
+    # sources, which competes directly with using the source at all; in 2 of 4
+    # seeds it destroyed the source pathway outright while total_loss still
+    # looked healthy.
+    #
+    # The control that DOES discriminate lives in prediction space and needs no
+    # auxiliary loss -- logged every validation step as `feat_loss_shuffled`:
+    #     feat_loss  <  base_loss  <  feat_loss_shuffled
+    #     (3.87)        (14.20)       (26.32)
+    # i.e. a wrong source is worse than no source. Watch `shuffle_penalty`
+    # (= feat_loss_shuffled - feat_loss) stay large and positive, and
+    # `pred_gap` (= base_loss - feat_loss) stay positive.
+    #
+    # Set lambda_perm > 0 only as a deliberate experiment, and watch pred_gap:
+    # a collapsed run has pred_gap ~ 0 and kld_raw ~ 0 together.
+    lambda_perm: 0.0
+    perm_every_n_batches: 4
+
+    # Attention
+    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    num_heads: 4
+    d_head: 32
+    use_entmax: true
+    attention_grad_checkpoint: false
+    lag_smoothness_lambda: 1.0e-3
+    # B4/G5 — lag-bias init. 'alibi_decay' seeds a learnable (num_heads, L)
+    # attention-score bias with a per-head negative slope -m_h * ell, giving a
+    # physiologic short-lag prior. 'normal' (flat, no bias parameter) is the v1
+    # parity setting.
+    lag_bias_init: alibi_decay
+
+    # C7 — head-structured latent. Production head-structured decision is
+    # revisited in Sprint 7; kept true (as v1 production) — both paths are
+    # tested for zero-KL init.
+    head_structured_latent: true
+
+    # With head_structured_latent=true the posterior consumes A_heads, so the
+    # attention's output projection lag_attn.W_o feeds only the diagnostic
+    # `attended_source` key: it receives no gradient and the optimiser never
+    # updates it (true in v1 too). Freezing it is numerically a no-op, but it
+    # drops the parameter from DDP's expectation set so the run can use plain
+    # 'ddp' instead of ddp_find_unused_parameters_true. Set false to keep W_o
+    # trainable — _select_ddp_strategy will then fall back automatically.
+    freeze_unused_attn_proj: true
+
+    # D8/D9 — shared horizon decoder core.
+    horizon_refine:
+      depth: 3
+      kernel: 3
+      film: true
+      attn: false
+
+    # E11 — append dilated conv blocks (kernel 15) to both encoders.
+    encoder:
+      extra_dilations: [8, 16]
+      temporal_backbone: lstm
+
+    # Loss-spike circuit breaker (ported to the manual-optimization path in
+    # trainer_lag_attn_v3.py; the spike statistic is computed on the MAIN loss
+    # only so the periodic L_perm jump cannot trip it — Sprint 4).
+    loss_spike_skip:
+      enabled: true
+      multiplier: 5.0        # trip when loss > 5× running EMA
+      ema_momentum: 0.02     # EMA smoothing (smaller = longer memory)
+      warmup_batches: 100    # priming window before gating activates
+      warn_on_skip: true     # emit a loguru warning on every skip
+
+  core_model_checkpoint: null
+
+  classifier:
+    vae_checkpoint: /path/to/your/trained/vae/checkpoint.ckpt
+    type: lstm
+    latent_dim: 24
+    num_classes: 2
+    freeze_vae: true
+    use_posterior: true
+    sample_latent: false
+    # IMPORTANT: after loading the frozen VAE, call
+    #   model.fit_latent_stats(train_dataloader)
+    # once to replace the approximate per-rank EMA stats with exact,
+    # DDP-consistent training-set mean/variance of ``mu_post``.
+
+    hidden_dim: 128
+    num_layers: 2
+    bidirectional: false
+    attn_dim: 64
+    dropout: 0.1
+    num_filters: 64
+    kernel_sizes: [3, 5, 7]
+    d_model: 128
+    n_heads: 4
+    dim_feedforward: 256
+    pooling: mean
+
+    evaluation:
+      target_fpr: 0.05
+      compute_both_thresholds: true
+      generate_plots: true
+      decision_time_hours: 1.0
+      exclude_last_minutes: 30
+      max_gap_multiplier: null
+
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_no_cs.hdf5
+    vae_test_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_no_cs.hdf5 # List of HDF5 file paths for validation
+
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/stats.hdf5                    # Path to normalization stats.hdf5
+
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    classifier_train_datasets: []
+    classifier_val_datasets: []
+    classifier_test_datasets: []
+
+    dataloader_config:
+      num_workers: 4
+      prefetch_factor: 4
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+      dataset_kwargs:
+        pin_memory: false
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'fhr_st',
+            'fhr_ph',
+            'up_ph',
+            'up_st',
+            'target',
+            'weight',
+            'epoch',
+            'cs_label',
+            'bg_label',
+            'guid',
+          ]
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: -48000
+        label: null
+        cache_size: 10000
+        trim_minutes: 1.0
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-attn-v3
+      run_name: lag_attn_v3_baseline
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn_v3
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 10000
+
+    reconstruction_plotting:
+      enabled: true
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: false    # no raw prediction in v3
+      plot_frequency: 1
+
+    lag_attn_plotting:
+      enabled: true
+      plot_frequency: 1                 # plot every validation epoch
+      num_examples: 2                   # 2 samples per trigger
+      file_format: "pdf"
+      forecast_channels: [0, 43, 80]    # st[0], ph[0], ph[37]
+      forecast_anchor_frac: 0.6         # anchor at 60% of the sequence

@@ -255,18 +255,36 @@ def _fake_metrics() -> dict:
     both null controls, ``warmup``/``horizon``, and a **string-keyed** ``per_cell_profiles``
     (mixed lags D in {8, 12} + a null cell) mimicking the JSON round-trip so the
     ``int()``-coercion in :func:`visualize_v2._per_cell_profiles` is exercised.
+
+    Also carries the S3-T03 prediction-space control: per-cell ``feat_loss`` / ``base_loss`` /
+    ``feat_loss_<ctrl>`` / ``shuffle_penalty_<ctrl>`` / ``ordering_pass_<ctrl>``, plus the
+    ``prediction_controls`` block. The signal cells are built to *pass* the gate
+    (``feat < base < feat_shuffle``); the null cell has all three losses coincident. The
+    ``null_*_ratio`` columns are retained -- they are now a readout, near 1.0 everywhere,
+    rather than a quantity expected to vanish (v3 Finding F2).
     """
     cells = [(0.0, 8), (1.0, 8), (2.0, 12), (3.0, 8)]
     per_cell = []
     for cid, (te, D) in enumerate(cells):
+        feat = 2.0 if te == 0 else 2.0 - 0.3 * te
+        base = 2.0
+        f_sh = 2.0 if te == 0 else 2.0 + 0.5 * te
+        f_rv = 2.0 if te == 0 else 2.0 + 0.4 * te
         per_cell.append({
             "cell_id": cid, "te_inj": te, "te_scat": te * 0.9, "D": D,
             "kbar_mean": 0.2 + 0.4 * te, "n": 300, "frac_phi": None if te == 0 else 1.1,
+            "feat_loss": feat, "base_loss": base,
             "pred_gain": 0.0 if te == 0 else 0.02 * te,
             "uplift_rel": 0.0 if te == 0 else 0.05 * te,
             "lag_mass": 0.0 if te == 0 else 0.85, "peak_lag_err": 0.0,
-            "null_shuffle_ratio": 1.0 if te == 0 else 0.1,
-            "null_reverse_ratio": 0.98 if te == 0 else 0.12,
+            # Readouts (near 1.0 even on a model that uses the source).
+            "null_shuffle_ratio": 1.0 if te == 0 else 1.05,
+            "null_reverse_ratio": 0.98 if te == 0 else 1.08,
+            # The discriminating gate.
+            "feat_loss_shuffle": f_sh, "shuffle_penalty_shuffle": f_sh - feat,
+            "ordering_pass_shuffle": None if te == 0 else True,
+            "feat_loss_reverse": f_rv, "shuffle_penalty_reverse": f_rv - feat,
+            "ordering_pass_reverse": None if te == 0 else True,
         })
     rng = np.random.default_rng(0)
     profiles = {}
@@ -279,12 +297,37 @@ def _fake_metrics() -> dict:
             "kbar_over_time": list(0.2 + 0.4 * te + 0.05 * rng.standard_normal(300)),
             "lag_count": 300,
         }
+    signal = [r for r in per_cell if r["te_inj"] > 0]
     return {
         "run_tag": "unit", "split": "test", "warmup": 30, "horizon": 30,
         "calibration": {"gamma_inj": 0.98, "alpha_inj": 0.2, "r2_inj": 0.99,
                         "gamma_scat": 1.05, "alpha_scat": 0.2, "r2_scat": 0.98,
                         "n_cells": len(per_cell)},
         "lag_recovery": {"mean_lag_mass": 0.85, "lag_mass_threshold": 0.8},
+        "prediction_controls": {
+            "controls": ["shuffle", "reverse"],
+            "n_signal_cells": len(signal),
+            "overall": {
+                "feat_loss": float(np.mean([r["feat_loss"] for r in signal])),
+                "base_loss": float(np.mean([r["base_loss"] for r in signal])),
+                "feat_loss_shuffle": float(np.mean([r["feat_loss_shuffle"] for r in signal])),
+                "shuffle_penalty_shuffle": float(
+                    np.mean([r["shuffle_penalty_shuffle"] for r in signal])),
+                "ordering_pass_shuffle": True,
+                "feat_loss_reverse": float(np.mean([r["feat_loss_reverse"] for r in signal])),
+                "shuffle_penalty_reverse": float(
+                    np.mean([r["shuffle_penalty_reverse"] for r in signal])),
+                "ordering_pass_reverse": True,
+                "ordering_pass": True, "ordering_pass_frac": 1.0,
+            },
+            "per_cell": {r["cell_id"]: r for r in per_cell},
+        },
+        "null_controls": {
+            "shuffle": {"mean_ratio": 1.05, "expected_to_vanish": False,
+                        "note": "readout only (v3 Finding F2)", "per_cell": {}},
+            "reverse": {"mean_ratio": 1.08, "expected_to_vanish": False,
+                        "note": "readout only (v3 Finding F2)", "per_cell": {}},
+        },
         "per_cell": per_cell,
         "per_cell_profiles": profiles,
     }
@@ -467,11 +510,12 @@ def test_pred_gain_figures_write(tmp_path: Path) -> None:
 
 
 def test_profile_figures_write(tmp_path: Path) -> None:
-    r"""[profile] The per-cell lag-profile / KLD-over-time / null-control figures render."""
+    r"""[profile] The per-cell lag-profile / KLD-over-time / control figures render."""
     metrics = _fake_metrics()
     _assert_written(viz.plot_lag_profiles(metrics, tmp_path / "lag_profiles"))
     _assert_written(viz.plot_kld_vs_time(metrics, tmp_path / "kld_vs_time"))
     _assert_written(viz.plot_null_controls(metrics, tmp_path / "null_controls"))
+    _assert_written(viz.plot_kl_shuffle_readout(metrics, tmp_path / "kl_shuffle_readout"))
 
 
 def test_pred_gain_and_profiles_degrade_on_empty(tmp_path: Path) -> None:
@@ -482,6 +526,36 @@ def test_pred_gain_and_profiles_degrade_on_empty(tmp_path: Path) -> None:
     _assert_written(viz.plot_lag_profiles(empty, tmp_path / "lagprof_empty"))
     _assert_written(viz.plot_kld_vs_time(empty, tmp_path / "kldt_empty"))
     _assert_written(viz.plot_null_controls(empty, tmp_path / "null_empty"))
+    _assert_written(viz.plot_kl_shuffle_readout(empty, tmp_path / "shuffle_readout_empty"))
+
+
+def test_null_controls_degrades_on_a_legacy_metrics_json(tmp_path: Path) -> None:
+    r"""[null] A pre-S3 ``metrics.json`` has no ``feat_loss_<ctrl>``; render "no data", not a crash.
+
+    Legacy runs carry only the ``null_<ctrl>_ratio`` columns. The prediction-space figure must
+    say so plainly rather than half-render, while the KL-shuffle readout still plots them.
+    """
+    legacy = _fake_metrics()
+    for row in legacy["per_cell"]:
+        for key in list(row):
+            if key.startswith(("feat_loss", "base_loss", "shuffle_penalty",
+                               "ordering_pass")):
+                row.pop(key)
+    legacy.pop("prediction_controls")
+    _assert_written(viz.plot_null_controls(legacy, tmp_path / "null_legacy"))
+    _assert_written(viz.plot_kl_shuffle_readout(legacy, tmp_path / "readout_legacy"))
+    _assert_written(viz.plot_diagnostics_panel(legacy, tmp_path / "panel_legacy"))
+
+
+def test_no_figure_claims_a_kl_ratio_should_vanish() -> None:
+    r"""[null] S3-T04a: no figure title, label or reference line asserts ``-> 0`` for a KL ratio.
+
+    The retired caption read ``null controls per cell  (-> 0 signal, ~ 1 null)`` with an
+    ``axhline(0)``. Grepping the source is the only way to keep it retired.
+    """
+    src = Path(viz.__file__).read_text(encoding="utf-8")
+    for banned in (r"($\to 0$ signal", "null control ({col})  $\\to 0$"):
+        assert banned not in src, f"a '-> 0' KL-ratio caption survives: {banned!r}"
 
 
 def test_report_assembles_gallery_and_gates(tmp_path: Path) -> None:
@@ -807,3 +881,90 @@ def test_loss_curves_html_missing_csv_is_noop(tmp_path) -> None:
     )
     assert out is None
     assert not (tmp_path / "figures" / "curve.html").exists()
+
+
+# ---------------------------------------------------------------------------
+# S7-T05: the CMI comparison figure
+# ---------------------------------------------------------------------------
+def _cmi_summary(*, with_bias: bool = True) -> dict:
+    r"""A hand-written ``cmi.json`` payload, so the figure test never fits a critic."""
+    cells = {}
+    for i, te in enumerate((0.0, 0.5, 1.0, 2.0, 3.0)):
+        cell = {
+            "cell_id": i, "te_inj": te, "te_scat": te * 2.5, "delay": 8,
+            "kbar": 0.58,
+            "cmi_latent": {"estimate": 0.7 * te, "ci_lo": 0.7 * te - 0.05,
+                           "ci_hi": 0.7 * te + 0.05, "near_ceiling": te > 2.77},
+            "cmi_feature_gt": {"estimate": 0.72 * te, "ci_lo": 0.72 * te - 0.05,
+                               "ci_hi": 0.72 * te + 0.05, "near_ceiling": te > 2.77},
+            "cmi_feature_model": {"estimate": 0.66 * te, "ci_lo": 0.66 * te - 0.06,
+                                  "ci_hi": 0.66 * te + 0.06, "near_ceiling": te > 2.77},
+        }
+        if with_bias:
+            cell["bias"] = {"estimate": -0.06 * te, "ci_lo": -0.06 * te - 0.04,
+                            "ci_hi": -0.06 * te + 0.04}
+        cells[str(i)] = cell
+    return {
+        "per_cell": cells,
+        "configs": ["latent", "feature_gt", "feature_model"],
+        "ceiling_nats": 3.4657, "ceiling_claim_frac": 0.8,
+        "recovery": {"spearman_cmi_te_inj": 0.96, "n_cells": 5},
+        "arm": "v3_prod", "split": "val",
+    }
+
+
+def test_plot_cmi_comparison_writes_pdf_and_png(tmp_path) -> None:
+    written = viz.plot_cmi_comparison(_cmi_summary(), tmp_path / "cmi_comparison")
+    assert {p.suffix for p in written} == {".pdf", ".png"}
+    assert all(p.is_file() and p.stat().st_size > 0 for p in written)
+
+
+def test_plot_cmi_comparison_draws_and_labels_the_infonce_ceiling(tmp_path, monkeypatch) -> None:
+    r"""The $\log K$ ceiling is drawn *and named*: no absolute-nats claim is read above it.
+
+    A figure that plots CMI estimates without its ceiling invites exactly the misreading Sprint 7
+    exists to prevent -- an InfoNCE bound saturating at $\log K$ looks like a model that plateaus.
+    """
+    captured: dict = {}
+
+    real_save = viz._save_fig
+
+    def _spy(fig, out_path, formats, dpi, *, close=True):
+        captured["fig"] = fig
+        return real_save(fig, out_path, formats, dpi, close=close)
+
+    monkeypatch.setattr(viz, "_save_fig", _spy)
+    summary = _cmi_summary()
+    viz.plot_cmi_comparison(summary, tmp_path / "cmi")
+
+    ax = captured["fig"].axes[0]
+    ceiling = summary["ceiling_nats"]
+    hlines = [ln.get_ydata()[0] for ln in ax.get_lines()
+              if len(set(ln.get_ydata())) == 1 and len(ln.get_ydata()) >= 2]
+    assert any(abs(y - ceiling) < 1e-6 for y in hlines), f"no ceiling line at {ceiling}: {hlines}"
+    claim = summary["ceiling_claim_frac"] * ceiling
+    assert any(abs(y - claim) < 1e-6 for y in hlines), "no `no absolute claim` line"
+
+    texts = [t.get_text() for t in ax.texts]
+    assert any("InfoNCE ceiling" in t and "3.47" in t for t in texts), texts
+    assert any("no absolute claim above 2.77" in t for t in texts), texts
+
+    # ..and the near-ceiling cell (TE = 3.0 > 2.77) is ringed.
+    assert any(c["cmi_latent"]["near_ceiling"] for c in summary["per_cell"].values())
+
+
+def test_plot_cmi_comparison_survives_a_single_cell(tmp_path) -> None:
+    summary = _cmi_summary()
+    one = dict(summary, per_cell={"0": summary["per_cell"]["0"]})
+    written = viz.plot_cmi_comparison(one, tmp_path / "one_cell")
+    assert all(p.is_file() and p.stat().st_size > 0 for p in written)
+
+
+def test_plot_cmi_comparison_without_bias_drops_the_right_panel(tmp_path) -> None:
+    written = viz.plot_cmi_comparison(_cmi_summary(with_bias=False), tmp_path / "no_bias")
+    assert all(p.is_file() and p.stat().st_size > 0 for p in written)
+
+
+def test_plot_cmi_comparison_degrades_on_empty(tmp_path) -> None:
+    written = viz.plot_cmi_comparison({}, tmp_path / "empty_cmi")
+    assert all(p.is_file() and p.stat().st_size > 0 for p in written)

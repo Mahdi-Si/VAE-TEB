@@ -22,7 +22,7 @@ emitted by this pipeline.
 - **Inputs**: `y_st (B,T=300,43)`, `y_ph (B,T,44)`, `u_stream (B,T,101)`
   where `u_stream = concat(up_st, up_ph)` (or `(B,T,58)` = `up_ph` only
   when `use_up_st=False`).
-- **Forward-dict outputs** (21 keys): latent moments
+- **Forward-dict outputs** (21 v1 keys): latent moments
   `mu_prior/logvar_prior/mu_post/logvar_post (B,T,24)`, sampled
   `z (B,T,24)`, encoder states
   `target_state/source_state/decoder_state/attended_source (B,T,128)`,
@@ -30,6 +30,15 @@ emitted by this pipeline.
   forecasts `mu_base/mu_full (B,T,H_d=30,87)`, residual `delta_mu_src`,
   diagnostics `kld_per_t (B,T)` and `te_lag_map (B,T,L)`, plus
   `warmup_mask (T,)`, `mu_prior_sat_frac`, `delta_mu_sat_frac`.
+  - **v3 additive keys** (23 total; the additive contract G9 keeps the 21 v1
+    keys byte-for-byte): `kld_active_frac` (scalar; fraction of latent dims
+    with $K_j > \epsilon$, G4) and `raw_logvar_prior (B,T,24)` (the prior's
+    *pre-bound* raw log-variance the residual posterior sums against, G1/G6).
+    The v3 forward dict also carries `logvar_full/logvar_base (B,T,H_d,87)`
+    (the decoder observation log-variance heads, always emitted but read only
+    under `sigma_obs='learned'`; the calibration step surfaces them) and the
+    per-head diagnostics `attended_source_heads (B,T,M,d_head)` /
+    `kld_per_t_per_head (B,T,M)`.
 - **Ground-truth forecast target**: `Y_plus (B, T−H_d=270, H_d=30, 87)`
   built via `TestRunner.build_future_target(batch)` from `fhr_st +
   fhr_ph`. Valid anchors are `t ∈ [warmup=30, T−H_d=270)`.
@@ -462,6 +471,36 @@ def run_xxx(runner, loader, max_samples=..., output_dir=None) -> Dict[str, Any]:
 Every analysis that produces aggregate metrics auto-detects the
 clinical classes present via `unique_labels_in(df["label"])` and emits
 `*_by_class.pdf` variants alongside the pooled output.
+
+#### v3 additions — calibration (G10) and cmi_comparison (G11)
+
+Two `_step`s were added for v3 (both run by default via the `skip_calibration` /
+`skip_cmi_comparison` function flags — they are code toggles, not YAML keys):
+
+- **`calibration.py::run_calibration_analysis`** — scores the learned predictive Gaussian
+  $\mathcal{N}(\mu_{\mathrm{full}}, \sigma_{\mathrm{full}}^2)$ as a *distribution*: NLL, CRPS,
+  central-interval coverage, and PIT reliability by horizon, against a fitted homoscedastic
+  reference. Needs `logvar_full`, which was always emitted but unread until Sprint 5;
+  `collectors.collect_calibration` now surfaces it (a logged skip on a model that omits it).
+  Writes `calibration/{per_sample,per_horizon,reliability}.csv`, `summary.json`, and the
+  reliability / coverage / sharpness PDFs.
+- **`cmi_comparison.py::run_cmi_comparison`** — corroborates the transfer-entropy surrogate
+  $K_{\mathrm{raw}}$ against an independent neural CMI lower bound (both InfoNCE and MINE
+  bounds, cross-fitted) of $I(U_{\le t}; Y^+ \mid c_t)$ conditioned on the model's own
+  `target_state`, and optionally against the `TE_Calculated/` empirical TE (via the
+  `dataset_config.empirical_te_csv` path; a logged skip when absent). Alignment is
+  **rank-level** (signed Spearman) with **patient-level bootstrap CIs**
+  (`causal_te_validation.statistics.guid_bootstrap_ci`); magnitudes are not comparable
+  because the estimate is model-coupled through $c_t$. Writes
+  `cmi_comparison/{per_sample,comparison_table}.csv`, `summary.json`, and `cmi_comparison.pdf`.
+  Both steps' scalar summaries are merged into `test_summary.json`.
+
+**v3 alias seam.** `base.py` (lines ~46–50) carries a comment-toggle import block. To run the
+v3 pipeline, uncomment `from ...vae_teb_lag_attn_v3 import SeqVaeLagAttnV3 as SeqVaeLagAttn`
+and comment the active v1 line; `check_model_class` guards a mismatched checkpoint. Because
+`_lag_attn_kwargs_from_config` discovers constructor args via `inspect.signature`, v3's new
+flags (`causal_norm`, `logvar_bound`, `posterior_logvar`, `kld_support`,
+`freeze_unused_attn_proj`, …) flow through automatically. Use `config_lag_attn_v3.yaml`.
 
 #### `dataset_stats.py`
 

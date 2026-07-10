@@ -47,10 +47,21 @@ class SyntheticTEDataModuleV2(pl.LightningDataModule):
         batch_size: **Per-GPU** batch size (under DDP the global batch is
             ``batch_size * world_size``).
         benchmark: Active benchmark key (defaults to ``experiment.benchmark``).
+        cache_dir: Optional explicit cache directory. When given it overrides
+            :func:`build_dataset_v2.resolve_cache_dir` (which keys on
+            ``experiment.data_tag`` or ``experiment.tag``); useful for tests that
+            point at a fixture cache, or a caller that has already resolved the
+            shared ``data_tag`` directory. Absent ``cache_dir`` reproduces today's
+            resolution exactly.
     """
 
     def __init__(
-        self, config: Dict[str, Any], *, batch_size: int, benchmark: Optional[str] = None
+        self,
+        config: Dict[str, Any],
+        *,
+        batch_size: int,
+        benchmark: Optional[str] = None,
+        cache_dir: Optional[Path] = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -60,7 +71,11 @@ class SyntheticTEDataModuleV2(pl.LightningDataModule):
             if benchmark is not None
             else config.get("experiment", {}).get("benchmark", "G1_raw")
         )
-        self._cache_dir: Path = resolve_cache_dir(config, benchmark=self._benchmark)
+        self._cache_dir: Path = (
+            Path(cache_dir)
+            if cache_dir is not None
+            else resolve_cache_dir(config, benchmark=self._benchmark)
+        )
 
         ds_cfg = config.get("dataset") or {}
         self._num_workers = int(ds_cfg.get("num_workers", 0))

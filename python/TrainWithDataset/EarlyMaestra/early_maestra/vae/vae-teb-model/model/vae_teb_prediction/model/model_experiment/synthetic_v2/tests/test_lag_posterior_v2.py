@@ -20,7 +20,7 @@ import torch  # noqa: E402
 
 import pytest  # noqa: E402
 
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (  # noqa: E402
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (  # noqa: E402
     LagPosteriorAttention,
     LagPriorHead,
     SmoothLagBias,
@@ -225,7 +225,7 @@ def test_active_set() -> None:
 
 def test_model_active_lags_settable() -> None:
     """The model exposes a settable ``active_lags`` attribute (default 8)."""
-    from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2
+    from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2
 
     model = SeqVaeLagAttnV2()
     assert model.active_lags == 8

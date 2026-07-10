@@ -482,20 +482,28 @@ def make_raw_provider(
 
 
 def resolve_cache_dir(config: Dict[str, Any], *, benchmark: str = "G1_raw") -> Path:
-    r"""Resolve the ``<data_dir>/<benchmark>/<tag>/`` cache directory for this run.
+    r"""Resolve the ``<data_dir>/<benchmark>/<data_tag>/`` cache directory for this run.
 
     Mirrors the v1 ``datamodule_synth`` convention (``data_root / benchmark / tag``)
     and :func:`run_pipeline_v2._results_dir`: a relative ``paths.data_dir`` resolves
-    against this module's directory, and the leaf is ``experiment.tag``.
+    against this module's directory.
+
+    The cache leaf keys on the optional ``experiment.data_tag`` (falling back to
+    ``experiment.tag``), whereas the *results* dir always keys on ``experiment.tag``.
+    This lets several runs (e.g. the three ``synthetic_v3`` arms under
+    ``tag: G1_raw_v3``) share one immutable ``.npz`` cache (``data_tag:
+    G1_raw_v2_notch``) while writing per-run results. When ``data_tag`` is absent the
+    returned path is byte-identical to the historical ``experiment.tag`` behaviour.
 
     Args:
-        config: The parsed ``config_synth_v2.yaml`` tree.
+        config: The parsed ``config_synth_v2.yaml`` / ``config_synth_v3.yaml`` tree.
         benchmark: Active benchmark key (also the middle path component).
 
     Returns:
         The cache directory as an absolute :class:`Path` (not created).
     """
-    tag = str(config.get("experiment", {}).get("tag", benchmark))
+    experiment = config.get("experiment", {})
+    tag = str(experiment.get("data_tag") or experiment.get("tag", benchmark))
     # Expand ``~`` and ``$VAR`` / ``${VAR}`` (matching the v1 ``resolve_user_path``) BEFORE
     # the absolute check, so an env-/home-relative ``data_dir`` (e.g. ``${SCRATCH}/te_cache``
     # on the prod box) resolves to the intended mount rather than a literal directory joined

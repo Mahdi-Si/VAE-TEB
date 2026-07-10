@@ -770,6 +770,15 @@ def generate_cell_raw(
     the pulse-shape carrier. The coupled term $B c_{k-D}$ inside $d_k$ is the only
     source→target dependency; everything else is independent dressing.
 
+    In ``render_mode='direct'`` (§7.4) there is **no carrier** ($g \equiv 1$) and **no AM
+    modulation**: the coupled bands are the upsampled latents scaled straight to
+    physiological peak amplitude — $u_{\mathrm c} = \gamma_u\,(\tilde c)_+$ and
+    $y_{\mathrm d} = \gamma_y\,(\tilde d)_+$ under the default one-sided rectifier
+    $(\cdot)_+$ (clinically upward contractions / downward decelerations), or the bipolar
+    $u_{\mathrm c} = \gamma_u\,\tilde c$, $y_{\mathrm d} = \gamma_y\,\tilde d$ when
+    ``raw.direct.one_sided`` is false. This yields realistic raw FHR/UP-like traces but
+    forfeits the carrier's guarantee of a known coupled scattering channel.
+
     Args:
         n: Number of samples to generate.
         B: Coupling strength (the solved ``B_y_scalar``; ``0.0`` for a null cell).
@@ -779,15 +788,22 @@ def generate_cell_raw(
         seed: Umbrella seed for this cell's generation (spawns independent substreams).
         te_inj: Optional injected-TE label to stamp into the returned ``meta``.
         render_mode: Override for ``raw.render_mode`` -- ``am_carrier`` (default, signed
-            narrowband cosine carrier) or ``pulse_train`` (one-sided raised-cosine event
-            train; the waveform-realistic variant, §7.3 / S7-T04).
+            narrowband cosine carrier), ``pulse_train`` (one-sided raised-cosine event
+            train; the waveform-realistic variant, §7.3 / S7-T04), or ``direct`` (no
+            carrier and no AM modulation: the coupled latents are rendered *directly* as
+            the low-frequency contraction / deceleration waveform, §7.4). ``direct`` trades
+            the known-scattering-channel TE guarantee (the carrier's raison d'être) for
+            clinically realistic raw FHR/UP-like traces; its ``one_sided`` shape knob is
+            read from ``raw.direct``.
 
     Returns:
         A dict with keys ``fhr_raw`` ``(n, N_raw)``, ``up_raw`` ``(n, N_raw)``,
         ``true_lag_tt`` ``(n, T_tot)`` int16, ``latents`` (the coupled-pathway
         intermediates ``c``, ``d``, ``c_tilde``, ``d_tilde``, ``A_u``, ``A_y``,
-        ``carrier_u``, ``carrier_y``, ``u_c``, ``y_d``), and ``meta`` (``D``, ``B``,
-        ``te_inj``, ``render_mode``, ``T_tot``, ``n_raw``, ``fs``, ``f_pulse``).
+        ``carrier_u``, ``carrier_y``, ``u_c``, ``y_d``; in ``direct`` mode ``A_u==u_c``,
+        ``A_y==y_d`` and the carriers are flat ones), and ``meta`` (``D``, ``B``,
+        ``te_inj``, ``render_mode``, ``direct_one_sided``, ``T_tot``, ``n_raw``, ``fs``,
+        ``f_pulse``).
     """
     bench = config["benchmarks"][benchmark]
     data = bench["data"]
@@ -795,11 +811,19 @@ def generate_cell_raw(
     # ``is None`` (not truthiness): a falsy override such as '' must be validated, not
     # silently replaced by the config default.
     render_mode = raw.get("render_mode", "am_carrier") if render_mode is None else render_mode
-    if render_mode not in ("am_carrier", "pulse_train"):
+    if render_mode not in ("am_carrier", "pulse_train", "direct"):
         raise ValueError(
             f"generate_cell_raw: unknown render_mode {render_mode!r} "
-            "(expected 'am_carrier' or 'pulse_train')."
+            "(expected 'am_carrier', 'pulse_train', or 'direct')."
         )
+    # ``direct`` (§7.4) renders the coupled latents straight onto the raw grid with no
+    # carrier and no amplitude modulation, so several carrier-specific steps below are
+    # bypassed (the f_pulse envelope low-pass, the FHRV carrier notch, the AM envelope,
+    # and the carrier itself).
+    is_direct = render_mode == "direct"
+    # Set inside the ``direct`` branch below; stays ``None`` for the carrier renders so it
+    # is stamped into ``meta`` only when meaningful.
+    one_sided: Optional[bool] = None
 
     fs = float(raw["fs"])
     N = int(raw["n_raw"])
@@ -820,8 +844,10 @@ def generate_cell_raw(
     # (the locked f_pulse=0.06 Hz sits inside FHRV LF 0.03-0.15). Enabled by default; the
     # notch width matches the coupled-channel selection tolerance in
     # ``scattering_adapter.coupled_channel_indices``. ``scattering`` is only bound here.
+    # In ``direct`` mode there is no coupled carrier channel to protect, so the notch is
+    # meaningless -- keep the full (more realistic) FHRV dressing regardless of the flag.
     fhrv_notch: Optional[Tuple[float, float]] = None
-    if bool(raw.get("fhrv_notch_enabled", True)):
+    if bool(raw.get("fhrv_notch_enabled", True)) and not is_direct:
         Q = int(config["benchmarks"][benchmark]["scattering"]["Q"])
         fhrv_notch = (f_pulse * 2.0 ** (-1.0 / Q), f_pulse * 2.0 ** (1.0 / Q))
     r, w = float(data["oscillators"][0][0]), float(data["oscillators"][0][1])
@@ -855,9 +881,12 @@ def generate_cell_raw(
     # detrend=False keeps the envelope *strictly* band-limited below the carrier: a
     # re-added endpoint ramp would leak broadband content near f_pulse and slightly
     # contaminate the coupled carrier channel. Edge ringing is discarded by the
-    # downstream 15-step/end trim.
-    c_tilde = upsample_bandlimited(c, DECIMATION, fs_dec=fs_dec, lowpass_hz=f_pulse, detrend=False)
-    d_tilde = upsample_bandlimited(d, DECIMATION, fs_dec=fs_dec, lowpass_hz=f_pulse, detrend=False)
+    # downstream 15-step/end trim. In ``direct`` mode there is no carrier, so the
+    # f_pulse anti-alias cutoff is dropped and the full (already-slow) latent band is
+    # kept as the rendered contraction / deceleration waveform.
+    envelope_lowpass = None if is_direct else f_pulse
+    c_tilde = upsample_bandlimited(c, DECIMATION, fs_dec=fs_dec, lowpass_hz=envelope_lowpass, detrend=False)
+    d_tilde = upsample_bandlimited(d, DECIMATION, fs_dec=fs_dec, lowpass_hz=envelope_lowpass, detrend=False)
 
     # Scale each envelope by the *pooled* (over the batch) std of its own upsampled
     # latent, so UP and FHR are calibrated symmetrically (pooled std is stable across
@@ -869,41 +898,72 @@ def generate_cell_raw(
     ref_c = AM_MAX_SIGMA_MULT * (sigma_c_up if sigma_c_up > 0.0 else fallback)
     ref_d = AM_MAX_SIGMA_MULT * (sigma_d_up if sigma_d_up > 0.0 else fallback)
 
-    # ``amp_peak`` is the envelope value at the +ref extreme (the physiological *peak*,
-    # index [1] of the config range); the DC offset a0 is set by ``am_offset_ratio``,
-    # so the [0] entry is a nominal floor and is intentionally not consumed here.
-    A_u = am_envelope(
-        c_tilde, sigma_ref=ref_c, am_offset_ratio=ratio, amp_peak=float(raw["contraction_mmHg"][1])
-    )
-    A_y = am_envelope(
-        d_tilde, sigma_ref=ref_d, am_offset_ratio=ratio, amp_peak=float(raw["decel_depth_bpm"][1])
-    )
-    # Independent per-sample carrier phases for UP and FHR: the scattering modulus is
-    # phase-blind, so this does not change the (envelope-carried) coupling in
-    # up_st/fhr_st, but it removes the shared-carrier cross-correlation artifact that a
-    # single deterministic carrier would create between the two raw signals. A (n, 1)
-    # phase broadcasts through the carrier builder to a per-sample (n, N) carrier.
-    if render_mode == "am_carrier":
-        # Signed narrowband cosine carrier (default): cleanest AM model, symmetric about
-        # the baseline -- best for the sign-blind scattering modulus (§7.1).
-        phase_u = rng_carrier.uniform(0.0, 2.0 * math.pi, size=(n, 1))
-        phase_y = rng_carrier.uniform(0.0, 2.0 * math.pi, size=(n, 1))
-        carrier_u = make_carrier(N, fs, f_pulse, phase=phase_u)
-        carrier_y = make_carrier(N, fs, f_pulse, phase=phase_y)
-    else:  # render_mode == "pulse_train"
-        # One-sided raised-cosine event train (waveform-realistic variant, §7.3): upward
-        # contractions / downward decelerations. Its fundamental sits at ``rate_hz`` (the
-        # carrier ``f_pulse`` by default), so the same fs-correct pulse-shape scattering
-        # channel carries the coupling; its (generally lower) frac_Phi is measured in S7-T04.
-        pt = raw.get("pulse_train", {}) or {}
-        rate_hz = float(pt.get("rate_hz", f_pulse))
-        duty = float(pt.get("duty", 0.5))
-        phase_u = rng_carrier.uniform(0.0, 1.0, size=(n, 1))  # phase in cycles
-        phase_y = rng_carrier.uniform(0.0, 1.0, size=(n, 1))
-        carrier_u = make_pulse_train(N, fs, rate_hz, duty=duty, phase=phase_u)
-        carrier_y = make_pulse_train(N, fs, rate_hz, duty=duty, phase=phase_y)
-    u_c = A_u * carrier_u
-    y_d = A_y * carrier_y
+    if is_direct:
+        # --- direct rendering: no carrier, no AM modulation (§7.4) --------------------
+        # The coupled latents ARE the low-frequency contraction / deceleration waveform.
+        # Each is scaled so the physiological peak amplitude (``contraction_mmHg[1]`` above
+        # tone; ``decel_depth_bpm[1]`` below baseline) is reached at the +k_ref sigma
+        # extreme -- the full peak slope, not the AM modulation slope a1 (there is no a0
+        # positivity margin to reserve here). ``one_sided`` (default) applies a positive
+        # rectifier so UP renders one-sided upward contractions and FHR one-sided downward
+        # decelerations (clinically realistic); ``one_sided: false`` keeps the zero-mean
+        # bipolar latent, which preserves the exact *linear* c->d coupling but lets UP swing
+        # below its resting tone. Either way the carrier's known-scattering-channel TE
+        # guarantee is gone: the coupled information now spreads across the low-frequency
+        # scattering channels rather than concentrating in the f_pulse pulse-shape channel.
+        direct_cfg = raw.get("direct", {}) or {}
+        one_sided = bool(direct_cfg.get("one_sided", True))
+        gain_u = float(raw["contraction_mmHg"][1]) / ref_c
+        gain_y = float(raw["decel_depth_bpm"][1]) / ref_d
+        if one_sided:
+            u_c = gain_u * np.maximum(c_tilde, 0.0)
+            y_d = gain_y * np.maximum(d_tilde, 0.0)
+        else:
+            u_c = gain_u * c_tilde
+            y_d = gain_y * d_tilde
+        # Expose a flat unit "carrier" and treat the rendered deflection as its own
+        # envelope so the S7 latent/AM decomposition figure stays well-defined (its
+        # carrier panel simply reads flat at 1, communicating "no carrier").
+        A_u, A_y = u_c, y_d
+        carrier_u = np.ones(N, dtype=float)
+        carrier_y = np.ones(N, dtype=float)
+    else:
+        # --- am_carrier / pulse_train rendering: coupled band = envelope x carrier -----
+        # ``amp_peak`` is the envelope value at the +ref extreme (the physiological *peak*,
+        # index [1] of the config range); the DC offset a0 is set by ``am_offset_ratio``,
+        # so the [0] entry is a nominal floor and is intentionally not consumed here.
+        A_u = am_envelope(
+            c_tilde, sigma_ref=ref_c, am_offset_ratio=ratio, amp_peak=float(raw["contraction_mmHg"][1])
+        )
+        A_y = am_envelope(
+            d_tilde, sigma_ref=ref_d, am_offset_ratio=ratio, amp_peak=float(raw["decel_depth_bpm"][1])
+        )
+        # Independent per-sample carrier phases for UP and FHR: the scattering modulus is
+        # phase-blind, so this does not change the (envelope-carried) coupling in
+        # up_st/fhr_st, but it removes the shared-carrier cross-correlation artifact that a
+        # single deterministic carrier would create between the two raw signals. A (n, 1)
+        # phase broadcasts through the carrier builder to a per-sample (n, N) carrier.
+        if render_mode == "am_carrier":
+            # Signed narrowband cosine carrier (default): cleanest AM model, symmetric about
+            # the baseline -- best for the sign-blind scattering modulus (§7.1).
+            phase_u = rng_carrier.uniform(0.0, 2.0 * math.pi, size=(n, 1))
+            phase_y = rng_carrier.uniform(0.0, 2.0 * math.pi, size=(n, 1))
+            carrier_u = make_carrier(N, fs, f_pulse, phase=phase_u)
+            carrier_y = make_carrier(N, fs, f_pulse, phase=phase_y)
+        else:  # render_mode == "pulse_train"
+            # One-sided raised-cosine event train (waveform-realistic variant, §7.3): upward
+            # contractions / downward decelerations. Its fundamental sits at ``rate_hz`` (the
+            # carrier ``f_pulse`` by default), so the same fs-correct pulse-shape scattering
+            # channel carries the coupling; its (generally lower) frac_Phi is measured in S7-T04.
+            pt = raw.get("pulse_train", {}) or {}
+            rate_hz = float(pt.get("rate_hz", f_pulse))
+            duty = float(pt.get("duty", 0.5))
+            phase_u = rng_carrier.uniform(0.0, 1.0, size=(n, 1))  # phase in cycles
+            phase_y = rng_carrier.uniform(0.0, 1.0, size=(n, 1))
+            carrier_u = make_pulse_train(N, fs, rate_hz, duty=duty, phase=phase_u)
+            carrier_y = make_pulse_train(N, fs, rate_hz, duty=duty, phase=phase_y)
+        u_c = A_u * carrier_u
+        y_d = A_y * carrier_y
 
     # --- DC + independent dressing ---
     mu_fhr, mu_up = draw_dc(
@@ -947,6 +1007,7 @@ def generate_cell_raw(
             "B": float(B),
             "te_inj": None if te_inj is None else float(te_inj),
             "render_mode": render_mode,
+            "direct_one_sided": one_sided,
             "T_tot": T_tot,
             "n_raw": N,
             "fs": fs,

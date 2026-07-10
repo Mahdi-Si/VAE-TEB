@@ -27,8 +27,11 @@ import argparse
 import subprocess
 import sys
 import time
+from collections import OrderedDict
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Make the repo root importable whether this file is run as a script
 # (``python .../run_pipeline_v2.py``) or as a module
@@ -38,6 +41,18 @@ from typing import Any, Dict, List, Optional, Sequence
 _REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+#: Canonical dotted name of this module.
+_QUALNAME = "model.vae_teb_prediction.model.model_experiment.synthetic_v2.run_pipeline_v2"
+
+# Under ``python run_pipeline_v2.py`` (or ``-m``) this file is bound as ``__main__``. The stage
+# plugins loaded by :func:`_load_stage_plugins` reach ``register_stage`` through the *dotted*
+# name, which would import a SECOND copy of this module with its own, empty ``_STAGE_REGISTRY``
+# -- so every plugin stage would register into a registry nobody reads, and ``--stage
+# calibration`` would be rejected as an invalid choice. Aliasing ``__main__`` under the dotted
+# name first makes both spellings resolve to one module object.
+if __name__ == "__main__" and _QUALNAME not in sys.modules:
+    sys.modules[_QUALNAME] = sys.modules[__name__]
 
 import yaml  # noqa: E402  (import after the sys.path bootstrap)
 
@@ -52,21 +67,171 @@ from model.vae_teb_prediction.model.model_experiment.synthetic_v2.raw_generators
 
 _MODULE_FILE = Path(__file__).resolve()
 _MODULE_DIR = _MODULE_FILE.parent
+#: The argparse ``--config`` default. Stays v1/v2 so the CLI and its regression tests are
+#: unchanged; the v3 ablation ladder is entered by pointing ``--config`` (or the ``PIPELINE``
+#: dict's ``config_path``) at :data:`_DEFAULT_CONFIG_V3`.
 _DEFAULT_CONFIG = _MODULE_DIR / "config_synth_v2.yaml"
+_DEFAULT_CONFIG_V3 = _MODULE_DIR / "config_synth_v3.yaml"
 
-# Pipeline stages registered for ``--help`` visibility. All implemented:
-# ``r0_realizability`` (S3), ``build`` (S4), ``data_previews`` (S7 figure gallery),
-# ``train`` + ``beta_select`` (S5), ``eval`` (S6), ``test_plots`` + ``report`` (S7).
-_STAGES = [
-    "build",
-    "r0_realizability",
-    "data_previews",
-    "train",
-    "beta_select",
-    "eval",
-    "test_plots",
-    "report",
-]
+# =============================================================================
+# Stage registry (S4-T05)
+# =============================================================================
+# Every stage table -- the ``--stage`` choices, the dict driver's execution order, its
+# on-by-default set, and the arm-scoped set -- is DERIVED from this one registry, so adding a
+# stage means calling :func:`register_stage` from the module that implements it and editing
+# nothing here or in ``main()``. That is what lets the Sprint 5/6/7 analyses
+# (``calibration`` / ``lag_intervention`` / ``cmi``) land as three file-disjoint modules
+# instead of three edits to the same dispatch block.
+
+
+@dataclass(frozen=True)
+class StageContext:
+    r"""Everything a stage function needs, from either driver (CLI or the ``PIPELINE`` dict).
+
+    Attributes:
+        config: The parsed config tree, **already arm-resolved** by the dispatcher.
+        benchmark: Active benchmark key under ``benchmarks``.
+        arm: Resolved arm name; ``None`` for the arm-less v1/v2 layout and for every
+            model-free stage.
+        ckpt: Explicit checkpoint path, else the stage resolves best/final under the run dir.
+        split: A single split name, or ``None`` for "every cached split".
+        analysis_samples: Per-sample diagnostic PDFs to emit (``test_plots``).
+        max_samples: Optional per-split sample cap for the expensive analysis stages.
+        pilot: Short-run smoke (``train``) / pilot grid (``build``, ``r0_realizability``).
+        full: Opt into the full locked grid where ``pilot`` is the default.
+        args: The raw argparse namespace when dispatched from the CLI, else ``None``. Only
+            the built-in ``train`` / ``beta_select`` stages read it (for ``_train_overrides``);
+            registered analysis stages must use the explicit fields above so they work under
+            both drivers.
+    """
+
+    config: Dict[str, Any]
+    benchmark: str
+    arm: Optional[str] = None
+    ckpt: Optional[str] = None
+    split: Optional[str] = None
+    analysis_samples: int = 4
+    max_samples: Optional[int] = None
+    pilot: bool = False
+    full: bool = False
+    args: Optional[argparse.Namespace] = None
+
+    def run_dir(self) -> Path:
+        r"""``results/<tag>/<arm>/`` (or ``results/<tag>/`` when arm-less)."""
+        return _run_dir(self.config, self.benchmark, self.arm)
+
+    def tag_root(self) -> Path:
+        r"""``results/<tag>/`` -- the arm-independent root (data-story figures, arms_report)."""
+        return _results_dir(self.config, self.benchmark)
+
+    def splits(self) -> List[str]:
+        r"""The splits this stage should process."""
+        return list(_resolve_splits(self.config, self.benchmark, self.split))
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    r"""One registered pipeline stage.
+
+    Attributes:
+        name: Stage key, used by ``--stage`` and by ``PIPELINE['stages']``.
+        order: Execution order in the dict driver (lower runs first).
+        default_on: Whether the dict driver runs it when ``PIPELINE['stages']`` omits the key.
+        model_dependent: Whether its output depends on the model, and is therefore scoped to
+            ``results/<tag>/<arm>/`` and repeated per arm. Model-free stages run once at the
+            arm-less root and never require ``--arm``.
+        run: ``(StageContext) -> int``. ``None`` for the four diagnostic stages that the dict
+            driver handles inline and that ``--stage`` never dispatches.
+        cli: Whether ``--stage`` exposes it.
+        fatal: When ``False``, an exception is caught, logged as ``failed (non-fatal)``, and
+            the run continues. The append-only analysis stages register with ``fatal=False``
+            so a diverging CMI fit can never abort a headline run.
+        help: One-line description for ``--help``.
+    """
+
+    name: str
+    order: int
+    default_on: bool
+    model_dependent: bool
+    run: Optional[Callable[[StageContext], int]] = None
+    cli: bool = True
+    fatal: bool = True
+    help: str = ""
+
+
+_STAGE_REGISTRY: "OrderedDict[str, StageSpec]" = OrderedDict()
+
+
+def register_stage(spec: StageSpec) -> None:
+    r"""Register a pipeline stage, keeping the registry sorted by ``spec.order``.
+
+    Args:
+        spec: The stage to register.
+
+    Raises:
+        ValueError: When ``spec.name`` is already registered.
+    """
+    if spec.name in _STAGE_REGISTRY:
+        raise ValueError(f"stage {spec.name!r} is already registered")
+    _STAGE_REGISTRY[spec.name] = spec
+    for key in sorted(_STAGE_REGISTRY, key=lambda k: _STAGE_REGISTRY[k].order):
+        _STAGE_REGISTRY.move_to_end(key)
+
+
+def stage_names() -> List[str]:
+    r"""Stage keys exposed by ``--stage``, in execution order."""
+    return [n for n, s in _STAGE_REGISTRY.items() if s.cli]
+
+
+def stage_order() -> Tuple[str, ...]:
+    r"""Every registered stage key, in dict-driver execution order."""
+    return tuple(_STAGE_REGISTRY)
+
+
+def stage_defaults() -> Dict[str, bool]:
+    r"""``{stage: default_on}`` for the dict driver."""
+    return {n: s.default_on for n, s in _STAGE_REGISTRY.items()}
+
+
+def model_dependent_stages() -> frozenset:
+    r"""Stages whose output depends on the model, and which are therefore arm-scoped."""
+    return frozenset(n for n, s in _STAGE_REGISTRY.items() if s.model_dependent)
+
+
+#: Modules that register extra stages on import. Each is optional: a missing or broken
+#: analysis module degrades to "that stage is unavailable", never to an import error at
+#: startup. Sprints 5/6/7 append to this tuple and touch nothing else in this file.
+_STAGE_PLUGIN_MODULES: Tuple[str, ...] = (
+    "calibration_v3",
+    "lag_intervention_v3",
+    "cmi_v3",
+    "arms_report_v3",
+)
+_PLUGINS_LOADED = False
+
+
+def _load_stage_plugins() -> None:
+    r"""Import the optional analysis modules so their :func:`register_stage` calls fire.
+
+    Idempotent, and warn-don't-gate: a plugin that fails to import (missing optional
+    dependency, syntax error under development) prints a warning and leaves its stage
+    unregistered, rather than taking the whole driver down with it.
+    """
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    _PLUGINS_LOADED = True
+    import importlib
+    for mod in _STAGE_PLUGIN_MODULES:
+        try:
+            importlib.import_module(
+                f"model.vae_teb_prediction.model.model_experiment.synthetic_v2.{mod}"
+            )
+        except ModuleNotFoundError:
+            continue  # not shipped yet (Sprints 5-7)
+        except Exception as exc:  # noqa: BLE001 -- a broken plugin must not gate the driver
+            print(f"[stages][warn] plugin {mod} failed to import: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def load_config(path: Any) -> Dict[str, Any]:
@@ -100,6 +265,147 @@ def _results_dir(config: Dict[str, Any], benchmark: str) -> Path:
     if not results_dir.is_absolute():
         results_dir = _MODULE_DIR / results_dir
     return results_dir / tag
+
+
+def _run_dir(config: Dict[str, Any], benchmark: str,
+             arm: Optional[str] = None) -> Path:
+    r"""Resolve the per-run output root ``results/<tag>/<arm>/`` (or ``results/<tag>/``).
+
+    Model-dependent artifacts (checkpoints, per-split ``metrics.json`` /
+    ``per_sample_eval.npz`` / reports) are arm-scoped so the three ``synthetic_v3`` arms
+    coexist under one ``experiment.tag``. The split-independent, model-free artifacts
+    (``realizability.json``, the data-story gallery, ``recovery.json``) stay at the
+    arm-less ``results/<tag>/`` root and are written once. ``arm=None`` reproduces
+    :func:`_results_dir` exactly, preserving the v1 / v2 single-arm layout.
+
+    Args:
+        config: The parsed config tree.
+        benchmark: Active benchmark key (fallback tag).
+        arm: The arm name, or ``None`` for the arm-less run root.
+
+    Returns:
+        The run root :class:`Path` (not created).
+    """
+    base = _results_dir(config, benchmark)
+    return base / str(arm) if arm else base
+
+
+def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Recursively merge ``over`` into a deep copy of ``base`` (``over`` wins).
+
+    Nested dicts are merged key-by-key rather than replaced wholesale, so an arm delta
+    that sets a single ``model`` kwarg does not drop the rest of the base ``model`` block.
+    """
+    out = deepcopy(base)
+    for key, val in over.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = deepcopy(val)
+    return out
+
+
+def resolve_arm(config: Dict[str, Any], arm: Optional[str]) -> Dict[str, Any]:
+    r"""Deep-merge ``arms.<arm>`` over the base ``model`` / ``loss`` blocks.
+
+    The three ``synthetic_v3`` arms (``parity`` / ``v3_noncausal`` / ``v3_prod``) differ
+    only in a handful of ``model`` kwargs while sharing one cache, one seed set, and one
+    objective. ``arms.<name>`` carries just those per-arm deltas; this pure resolver merges
+    them (arm wins; nested dicts merged, not replaced) over the base config so the rest of
+    the pipeline sees a single flat config. ``arm=None`` (or a config with no ``arms``
+    block for that name) returns the input unchanged, preserving the v1 / v2 single-arm
+    path. The input is never mutated; the ``arms`` block is left intact for provenance.
+
+    Args:
+        config: The parsed config tree (with an optional ``arms`` block).
+        arm: The arm name to resolve, or ``None`` for the base config.
+
+    Returns:
+        A new config dict with the arm delta merged in (or the input when ``arm`` is
+        ``None``).
+
+    Raises:
+        ValueError: If ``arm`` is given but not present in the ``arms`` block.
+    """
+    if arm is None:
+        return config
+    arms = config.get("arms") or {}
+    if arm not in arms:
+        raise ValueError(
+            f"unknown arm {arm!r}; configured arms: {sorted(arms)}"
+        )
+    return _deep_merge(config, dict(arms[arm] or {}))
+
+
+# Stages whose output depends on the model (and are therefore arm-scoped) are declared by
+# ``StageSpec.model_dependent`` and read back through :func:`model_dependent_stages`. The
+# remaining stages (``build`` / ``r0_realizability`` / ``data_previews`` / ...) are model-free
+# and run once at the arm-less ``results/<tag>/`` root.
+
+
+def _select_arm(config: Dict[str, Any], arm_flag: Optional[str]) -> Optional[str]:
+    r"""Resolve the effective arm for a model-dependent stage from ``--arm`` + the config.
+
+    Enforces the arm contract at the CLI boundary: an explicit ``--arm`` must name a
+    configured arm; with no flag, a single-arm config defaults to its sole arm, a config
+    with no ``arms`` block runs arm-less (the v1 / v2 path), and a multi-arm config demands
+    an explicit choice rather than silently grading only one arm.
+
+    Args:
+        config: The parsed config tree.
+        arm_flag: The ``--arm`` value (``None`` when the flag is absent).
+
+    Returns:
+        The resolved arm name, or ``None`` for the arm-less path.
+
+    Raises:
+        SystemExit: On an unknown ``--arm``, or a multi-arm config with no ``--arm`` (a
+            non-zero exit with an actionable message).
+    """
+    arms = config.get("arms") or {}
+    if arm_flag:
+        if arm_flag not in arms:
+            raise SystemExit(
+                f"[arm] unknown --arm {arm_flag!r}; configured arms: "
+                f"{sorted(arms) or '(none)'}"
+            )
+        return arm_flag
+    if not arms:
+        return None
+    if len(arms) == 1:
+        return next(iter(arms))
+    raise SystemExit(
+        f"[arm] this config defines {len(arms)} arms {sorted(arms)}; pass --arm NAME "
+        "to select one."
+    )
+
+
+def _flatten_leaves(tree: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    r"""Flatten a nested dict to ``{'a.b.c': leaf}`` so a nested arm delta reads at a glance."""
+    out: Dict[str, Any] = {}
+    for key, val in tree.items():
+        path = f"{prefix}{key}"
+        if isinstance(val, dict):
+            out.update(_flatten_leaves(val, f"{path}."))
+        else:
+            out[path] = val
+    return out
+
+
+def _print_arm_plan(config: Dict[str, Any], arm: Optional[str]) -> None:
+    r"""Print an arm's resolved model class and only the ``model`` kwargs it overrides (dry-run).
+
+    The per-arm deltas live inside ``arms.<name>.model.v3`` (they must override the base ``v3``
+    overlay, which ``build_model`` applies last), so the delta is flattened to leaf paths rather
+    than printing the whole merged overlay.
+    """
+    resolved = resolve_arm(config, arm)
+    cls = str((resolved.get("model") or {}).get("class", "SeqVaeLagAttn (alias -> v1)"))
+    label = arm if arm is not None else "(arm-less)"
+    arm_model = ((config.get("arms") or {}).get(arm or "", {}) or {}).get("model") or {}
+    delta = _flatten_leaves(dict(arm_model)) if arm else {}
+    suffix = f"  delta={delta}" if delta else ("  (no model delta vs base)" if arm else "")
+    print(f"[pipeline]   arm {label}: class={cls}{suffix}")
 
 
 def solve_te(
@@ -387,7 +693,7 @@ def _train_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         The overrides dict for :func:`pl_module_v2.train_v2`.
     """
     train_cfg = config.get("train", {}) or {}
-    overrides: Dict[str, Any] = {}
+    overrides: Dict[str, Any] = {"pilot": bool(args.pilot)}
     if args.pilot:
         overrides["epochs"] = int(train_cfg.get("pilot_epochs", 3))
         overrides["limit_train_batches"] = int(train_cfg.get("pilot_limit_train_batches", 4))
@@ -395,8 +701,47 @@ def _train_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         overrides["batch_size"] = int(train_cfg.get("pilot_batch_size", 16))
     if args.epochs is not None:
         overrides["epochs"] = int(args.epochs)
-    overrides["devices"] = args.devices if args.devices is not None else train_cfg.get("devices", 1)
+    overrides["devices"] = _resolve_train_devices(
+        config, devices=args.devices, pilot=bool(args.pilot)
+    )
+    if getattr(args, "max_samples", None) is not None:
+        overrides["max_samples"] = int(args.max_samples)
     return overrides
+
+
+def _resolve_train_devices(
+    config: Dict[str, Any], *, devices: Any = None, pilot: bool = False,
+) -> Any:
+    r"""Resolve the Lightning ``devices`` spec for a training stage.
+
+    Precedence: an explicit ``devices`` (``--devices`` / ``PIPELINE["devices"]``) beats
+    everything; a ``pilot`` run takes the pilot-oriented ``train.devices``; a headline run
+    takes ``ddp.devices`` -- the documented multi-GPU knob -- falling back to
+    ``train.devices``.
+
+    Before this, ``ddp.devices`` was never read anywhere and ``train.devices`` (``1``) was
+    the only fallback, so a headline train without an explicit ``--devices`` silently
+    trained on a single GPU on an 8-GPU box.
+
+    Both drivers share this, so the printed plan matches what the subprocess receives.
+
+    Args:
+        config: The parsed config tree.
+        devices: An explicit devices spec, or ``None`` to resolve from the config.
+        pilot: Whether this is a short ``--pilot`` training smoke.
+
+    Returns:
+        The Lightning ``devices`` spec (an int count or a comma-separated GPU list).
+    """
+    if devices is not None:
+        return devices
+    train_cfg = config.get("train") or {}
+    if pilot:
+        return train_cfg.get("devices", 1)
+    ddp_devices = (config.get("ddp") or {}).get("devices")
+    if ddp_devices is not None:
+        return ddp_devices
+    return train_cfg.get("devices", 1)
 
 
 def _print_train_result(result: Dict[str, Any]) -> None:
@@ -500,10 +845,127 @@ def _resolve_split_npz(cache_dir: Path, split: str) -> Path:
     )
 
 
+def _build_runner_and_loader(
+    config: Dict[str, Any],
+    *,
+    benchmark: str = "G1_raw",
+    arm: Optional[str] = None,
+    ckpt: Optional[str] = None,
+    split: str = "test",
+    out_dir: Optional[Path] = None,
+    batch_size: Optional[int] = None,
+    attach_raw_provider: bool = False,
+) -> Tuple[Any, Any, str, Path]:
+    r"""Build a ``TestRunner`` + v2 ``DataLoader`` from a checkpoint (S4-T04).
+
+    The shared seam behind every model-dependent analysis stage: ``test_plots``,
+    ``calibration`` (S5), ``lag_intervention`` (S6) and ``cmi`` (S7) all need exactly this
+    pair, and nothing about it is specific to any of them.
+
+    The model is rebuilt from the checkpoint's own ``model_class`` + ``model_kwargs`` and
+    cross-checked against the class the config expects, so grading arm B's checkpoint under
+    arm C's config raises rather than silently loading the wrong architecture (S1-T04). The
+    three arms are structurally identical except for ``posterior_logvar``, so a strict
+    state-dict load would not always catch the swap.
+
+    Note:
+        ``attach_raw_provider`` is off by default. The provider is only needed by the
+        ``test_plots`` raw panel, it regenerates waveforms on demand, and importing it drags in
+        the scattering adapter (and hence ``kymatio``). Keeping it opt-in lets the analysis
+        stages import this helper on a machine without ``kymatio`` installed.
+
+    Args:
+        config: The parsed config tree (already arm-resolved by the caller).
+        benchmark: Active benchmark key under ``benchmarks``.
+        arm: Resolved arm name, used only to locate ``results/<tag>/<arm>/`` when ``out_dir``
+            is omitted.
+        ckpt: Explicit checkpoint path, else ``best.ckpt`` / ``final.ckpt`` under the run dir.
+        split: Cache split to load (``test`` / ``val`` / ``train``).
+        out_dir: Directory the runner writes its artifacts under (defaults to the run dir).
+        batch_size: Loader batch size (defaults to ``optim.batch_size``).
+        attach_raw_provider: Regenerate raw 4 Hz FHR/UP per sample (``test_plots`` only). The
+            provider is lazy, so only the rows the caller actually consumes are regenerated.
+
+    Returns:
+        ``(runner, loader, used_split, ckpt_path)``.
+
+    Raises:
+        FileNotFoundError: When no checkpoint can be resolved.
+        RuntimeError: When the checkpoint's weights do not load into the rebuilt model.
+    """
+    import torch  # local: pulls the model / testing stack
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
+        resolve_cache_dir,
+    )
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.dataset_v2 import (
+        SyntheticTEDatasetV2,
+        make_dataloader,
+    )
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
+        rebuild_model_from_checkpoint,
+        resolved_model_class_name,
+    )
+    from model.vae_teb_prediction.testing.base import TestRunner
+    from train.graph_models_utils import load_checkpoint_strict
+
+    run_dir = _run_dir(config, benchmark, arm)
+    results_dir = run_dir if out_dir is None else Path(out_dir)
+    ckpt_path = _resolve_run_ckpt(run_dir, ckpt)
+    cache_dir = resolve_cache_dir(config, benchmark=benchmark)
+    npz = _resolve_split_npz(cache_dir, split)
+    bs = int(config.get("optim", {}).get("batch_size", 32)) if batch_size is None \
+        else int(batch_size)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Rebuild the EXACT architecture from the checkpoint's embedded model_class + model_kwargs
+    # (weights_only=False: a trusted local checkpoint carrying non-tensor metadata), then load
+    # the state dict from the SAME already-deserialised blob (load_checkpoint_strict accepts an
+    # object containing a state_dict) so the file is not read/unpickled twice.
+    blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    expected_class = resolved_model_class_name(config["model"])
+    model, _ = rebuild_model_from_checkpoint(blob, device, expected_class=expected_class)
+    if load_checkpoint_strict(model, blob) is None:
+        raise RuntimeError(f"could not load v2 checkpoint {ckpt_path} into the model")
+    model.eval()
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+    runner = TestRunner(
+        model=model,
+        device=device,
+        output_dir=results_dir,
+        warmup_steps=int(getattr(model, "warmup_period", 30)),
+        horizon=int(getattr(model, "horizon", 30)),
+        max_lag=int(getattr(model, "max_lag", 90)),
+        use_up_st=bool(getattr(model, "use_up_st", True)),
+    )
+
+    used_split = Path(npz).stem
+    raw_provider = None
+    if attach_raw_provider:
+        # Deterministic raw-waveform regenerator for the per-sample diagnostic's first panel
+        # (regenerated on demand from ``sample_raw_index``; the raw is never cached).
+        from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (  # noqa: E501
+            make_raw_provider,
+        )
+        try:
+            raw_provider = make_raw_provider(
+                config, used_split, benchmark=benchmark, cache_dir=cache_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the raw panel is a nicety, never a blocker
+            print(f"[runner] raw provider unavailable ({exc}); raw panel will be empty.")
+            raw_provider = None
+
+    dataset = SyntheticTEDatasetV2(npz, raw_provider=raw_provider)
+    loader = make_dataloader(dataset, batch_size=bs, shuffle=False, num_workers=0)
+    return runner, loader, used_split, ckpt_path
+
+
 def run_test_plots(
     config: Dict[str, Any],
     *,
     benchmark: str = "G1_raw",
+    arm: Optional[str] = None,
     ckpt: Optional[str] = None,
     split: str = "test",
     analysis_samples: int = 4,
@@ -531,87 +993,31 @@ def run_test_plots(
     Args:
         config: The parsed ``config_synth_v2.yaml`` tree.
         benchmark: Active benchmark key under ``benchmarks``.
-        ckpt: Optional explicit checkpoint path (else best/final under ``results/<tag>/``).
+        arm: Resolved arm name (``None`` for the arm-less v1/v2 layout).
+        ckpt: Optional explicit checkpoint path (else best/final under the run dir).
         split: Which cache split to plot (default ``test``; falls back to val/train).
         analysis_samples: Number of TE-annotated per-sample diagnostic PDFs to emit.
-        out_dir: Optional override for the run directory (defaults to ``results/<tag>/``).
+        out_dir: Optional override for the run directory (defaults to the run dir).
 
     Returns:
         A dict ``{'out_dir': Path, 'samples_dir': Path, 'sample_diagnostics': ...,
         'kld_lag_diagnostics': ...}``.
     """
-    import torch  # local: pulls the model / testing stack
-
-    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
-        make_raw_provider,
-        resolve_cache_dir,
-    )
-    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.dataset_v2 import (
-        SyntheticTEDatasetV2,
-        make_dataloader,
-    )
-    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
-        SeqVaeLagAttn,
-        build_model,
-    )
-    from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
     from model.vae_teb_prediction.testing.analyses.kld_lag_diagnostics import (
         run_kld_lag_diagnostics,
     )
     from model.vae_teb_prediction.testing.analyses.qualitative import run_sample_diagnostics
-    from model.vae_teb_prediction.testing.base import TestRunner
-    from train.graph_models_utils import load_checkpoint_strict
 
-    results_dir = _results_dir(config, benchmark) if out_dir is None else Path(out_dir)
-    ckpt_path = _resolve_run_ckpt(results_dir, ckpt)
-    cache_dir = resolve_cache_dir(config, benchmark=benchmark)
-    npz = _resolve_split_npz(cache_dir, split)
-    batch_size = int(config.get("optim", {}).get("batch_size", 32))
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # Rebuild the exact v1 architecture from the checkpoint's embedded model_kwargs
-    # (weights_only=False: a trusted local checkpoint carrying non-tensor metadata), then
-    # load the state dict from the SAME already-deserialised blob (load_checkpoint_strict
-    # accepts an object containing a state_dict) so the file is not read/unpickled twice.
-    blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    # Fail fast (before construction) if the checkpoint was written by a different
-    # model class than the currently-active SeqVaeLagAttn alias.
-    check_model_class(blob, SeqVaeLagAttn.__name__)
-    model, _ = build_model(dict(blob["model_kwargs"]), device)
-    if load_checkpoint_strict(model, blob) is None:
-        raise RuntimeError(f"could not load v2 checkpoint {ckpt_path} into the model")
-    model.eval()
-
+    results_dir = _run_dir(config, benchmark, arm) if out_dir is None else Path(out_dir)
     out = results_dir / "test_plots"
-    out.mkdir(parents=True, exist_ok=True)
-    runner = TestRunner(
-        model=model,
-        device=device,
-        output_dir=out,
-        warmup_steps=int(getattr(model, "warmup_period", 30)),
-        horizon=int(getattr(model, "horizon", 30)),
-        max_lag=int(getattr(model, "max_lag", 90)),
-        use_up_st=bool(getattr(model, "use_up_st", True)),
-    )
-
-    # Attach a deterministic raw-waveform regenerator so the per-sample diagnostic's first panel
-    # shows the raw 4 Hz FHR/UP (regenerated on demand from ``sample_raw_index``; the raw is not
-    # cached). num_workers=0 keeps the regeneration on the single plotting process, and only the
-    # first ``analysis_samples`` rows are ever touched.
-    used_split = Path(npz).stem
-    try:
-        raw_provider = make_raw_provider(
-            config, used_split, benchmark=benchmark, cache_dir=cache_dir,
-        )
-    except Exception as exc:  # noqa: BLE001 -- raw panel is a nicety; never block the diagnostics
-        print(f"[test_plots] raw provider unavailable ({exc}); first panel will be empty.")
-        raw_provider = None
-
-    dataset = SyntheticTEDatasetV2(npz, raw_provider=raw_provider)
-    # Only the first ``analysis_samples`` rows are diagnosed, so a small batch keeps raw
+    # Only the first ``analysis_samples`` rows are diagnosed, so a small batch keeps the raw
     # regeneration to the few cells actually plotted (the loader isn't fully consumed).
-    plot_batch_size = max(1, min(int(batch_size), int(analysis_samples)))
-    loader = make_dataloader(dataset, batch_size=plot_batch_size, shuffle=False, num_workers=0)
+    batch_size = int(config.get("optim", {}).get("batch_size", 32))
+    plot_batch_size = max(1, min(batch_size, int(analysis_samples)))
+    runner, loader, _used_split, _ckpt_path = _build_runner_and_loader(
+        config, benchmark=benchmark, arm=arm, ckpt=ckpt, split=split, out_dir=out,
+        batch_size=plot_batch_size, attach_raw_provider=True,
+    )
 
     samples_dir = out / "samples_diag"
     sample_res = run_sample_diagnostics(
@@ -683,15 +1089,17 @@ def _split_dir(results_dir: Path, split: str) -> Path:
 
 
 def _eval_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
-                 splits: Sequence[str], results_dir: Path) -> Dict[str, Any]:
-    r"""Run ``eval_v2.run_eval`` for each split into its own ``results/<tag>/<split>/`` dir.
+                 splits: Sequence[str], results_dir: Path,
+                 arm: Optional[str] = None) -> Dict[str, Any]:
+    r"""Run ``eval_v2.run_eval`` for each split into its own ``<run_dir>/<split>/`` dir.
 
     Args:
         config: The parsed config tree.
         benchmark: Active benchmark key.
         ckpt: Explicit checkpoint path, or ``None`` for auto-discovery.
         splits: The splits to grade.
-        results_dir: The run's ``results/<tag>/`` root.
+        results_dir: The run's ``results/<tag>/<arm>/`` root.
+        arm: Resolved arm name, stamped into each split's ``metrics.json`` (S4-T03).
 
     Returns:
         ``{split: metrics_dict}`` for each graded split.
@@ -700,15 +1108,17 @@ def _eval_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
         run_eval,
     )
     # Resolve the checkpoint ONCE from the run root: the train stage writes best/final.ckpt
-    # into results/<tag>/, but each split evaluates into its own results/<tag>/<split>/
-    # ``out_dir``. Passing that per-split ``out_dir`` as the checkpoint search root would
-    # (and did) fail auto-discovery, so we hand every split the resolved explicit path.
+    # into results/<tag>/<arm>/, but each split evaluates into its own
+    # results/<tag>/<arm>/<split>/ ``out_dir``. Passing that per-split ``out_dir`` as the
+    # checkpoint search root would (and did) fail auto-discovery, so we hand every split the
+    # resolved explicit path.
     ckpt_path = str(_resolve_run_ckpt(results_dir, ckpt))
     out: Dict[str, Any] = {}
     for s in splits:
         sdir = _split_dir(results_dir, s)
         print(f"[eval:{s}] grading -> {sdir / 'metrics.json'}")
-        metrics = run_eval(config, benchmark=benchmark, ckpt=ckpt_path, split=s, out_dir=sdir)
+        metrics = run_eval(config, benchmark=benchmark, ckpt=ckpt_path, split=s,
+                           out_dir=sdir, arm=arm)
         _print_eval_metrics(metrics)
         out[s] = metrics
     return out
@@ -716,10 +1126,10 @@ def _eval_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
 
 def _test_plots_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional[str],
                        analysis_samples: int, splits: Sequence[str],
-                       results_dir: Path) -> None:
+                       results_dir: Path, arm: Optional[str] = None) -> None:
     r"""Render the standard-testing per-sample diagnostics for each split (guarded)."""
-    # Resolve the checkpoint from the run root (best/final live in results/<tag>/, not in
-    # the per-split out_dir passed below). Guarded so a missing checkpoint only warns --
+    # Resolve the checkpoint from the run root (best/final live in results/<tag>/<arm>/, not
+    # in the per-split out_dir passed below). Guarded so a missing checkpoint only warns --
     # these diagnostics must never gate the run.
     try:
         ckpt_path = str(_resolve_run_ckpt(results_dir, ckpt))
@@ -729,7 +1139,7 @@ def _test_plots_splits(config: Dict[str, Any], benchmark: str, *, ckpt: Optional
     for s in splits:
         sdir = _split_dir(results_dir, s)
         try:
-            run_test_plots(config, benchmark=benchmark, ckpt=ckpt_path, split=s,
+            run_test_plots(config, benchmark=benchmark, arm=arm, ckpt=ckpt_path, split=s,
                            analysis_samples=analysis_samples, out_dir=sdir)
         except Exception as exc:  # noqa: BLE001 -- diagnostics only, never fatal
             print(f"[test_plots:{s}][warn] {type(exc).__name__}: {exc}")
@@ -761,25 +1171,36 @@ def _report_splits(config: Dict[str, Any], benchmark: str, *, splits: Sequence[s
         p = final_report_v2(config, benchmark=benchmark, out_dir=sdir, split=s)
         print(f"[report:{s}] wrote {p}")
         paths[s] = p
-    _write_split_index(results_dir, list(splits))
+    _write_split_index(results_dir, list(splits), config=config, benchmark=benchmark)
     return paths
 
 
-def _write_split_index(results_dir: Path, splits: Sequence[str]) -> Path:
+def _write_split_index(results_dir: Path, splits: Sequence[str], *,
+                       config: Optional[Dict[str, Any]] = None,
+                       benchmark: str = "G1_raw") -> Path:
     r"""Write a top-level ``report.md`` cross-linking every split's report + gate table.
 
     Reads each split's ``metrics.json`` and tabulates the headline gates (γ vs TE_inj /
     TE_scat, per-sample slope, LagMass, null ratios) side by side, so "how are we doing on
     train vs val vs test" is answerable at a glance.
 
+    The index is written at the **run** root (``results/<tag>/<arm>/`` under a v3 config), so
+    two of its links depend on the layout (S4-T06): ``figures/training_curves.html`` is local
+    to the run root, while the split-independent data-generation gallery lives one level up at
+    the *tag* root. The heading likewise names the experiment tag, not the arm directory.
+
     Args:
-        results_dir: The run's ``results/<tag>/`` root.
+        results_dir: The run root (``results/<tag>/<arm>/``, or ``results/<tag>/`` arm-less).
         splits: The processed splits.
+        config: The parsed config tree, used to resolve the tag root. When omitted the tag is
+            read from the directory name (the pre-arm behaviour).
+        benchmark: Active benchmark key.
 
     Returns:
         The written ``report.md`` :class:`Path`.
     """
     import json
+    import os
 
     def _g(x: Any) -> str:
         try:
@@ -788,7 +1209,13 @@ def _write_split_index(results_dir: Path, splits: Sequence[str]) -> Path:
             return "n/a"
         return f"{xf:.4g}" if xf == xf else "n/a"
 
-    tag = results_dir.name
+    if config is not None:
+        root = _results_dir(config, benchmark)
+        tag = root.name
+    else:
+        root, tag = results_dir, results_dir.name
+    # ``figures`` when the index sits at the tag root, ``../figures`` when it sits in an arm dir.
+    shared_rel = os.path.relpath(root / "figures", results_dir).replace(os.sep, "/")
     lines: List[str] = [
         f"# synthetic_v2 per-split report index — `{tag}`", "",
         "Every dataset split is graded and plotted into its own subfolder so the model's "
@@ -818,7 +1245,8 @@ def _write_split_index(results_dir: Path, splits: Sequence[str]) -> Path:
             f"| {_g((nul.get('reverse') or {}).get('mean_ratio'))} | {link} |"
         )
     lines += ["", "Split-independent data-generation figures (raw / scattering / latent / "
-              "TE-authoring) live in [`figures/`](figures/); interactive training curves in "
+              f"TE-authoring) live in [`{shared_rel}/`]({shared_rel}/); interactive training "
+              "curves for this run in "
               "[`figures/training_curves.html`](figures/training_curves.html).", ""]
     path = results_dir / "report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -830,31 +1258,18 @@ def _write_split_index(results_dir: Path, splits: Sequence[str]) -> Path:
 # Edit-and-run dict driver (no argparse needed; mirrors synthetic/run_mixed_pipeline)
 # =============================================================================
 
-# Canonical stage order. ``run_pipeline`` validates ``PIPELINE['stages']`` against
-# this tuple so a typo fails loudly instead of silently skipping a stage.
-_STAGE_ORDER = (
-    "solve_te",          # quick coupling query for one (target_te, D) -- diagnostic
-    "am_check",          # AM envelope-vs-wavelet separation pre-check -- diagnostic
-    "recover",           # frac_Phi render-knob sweep -- opt-in tuning
-    "r0_realizability",  # three-TE de-risk pre-flight (writes realizability.json)
-    "build",             # generate -> scatter -> normalise -> cache
-    "data_previews",     # annotated raw + scattering + latent gallery for a strong cell
-    "scatter_preview",   # scattering heatmap of a strong cell -- diagnostic
-    "beta_select",       # KL-weight sweep -- opt-in (DDP-safe subprocess)
-    "train",             # fit the model -> checkpoint + loss curves (DDP-safe subprocess)
-    "eval",              # grade the checkpoint -> metrics.json
-    "test_plots",        # standard testing per-sample TE-annotated diagnostics
-    "report",            # assemble the markdown report + figure gallery
-)
+# The canonical stage order and the on-by-default set are DERIVED from ``_STAGE_REGISTRY``
+# via :func:`stage_order` / :func:`stage_defaults` (S4-T05). ``run_pipeline`` validates
+# ``PIPELINE['stages']`` against ``stage_order()`` so a typo fails loudly instead of silently
+# skipping a stage, and a plugin-registered analysis stage becomes a valid key automatically.
 
-# Defaults applied when ``PIPELINE['stages']`` omits a key: the core
-# build -> train -> eval -> test_plots -> report path is ON; the diagnostics /
-# opt-in tuning stages are OFF (they must be enabled explicitly).
-_STAGE_DEFAULTS = {
-    name: name in ("r0_realizability", "build", "data_previews", "train", "eval",
-                   "test_plots", "report")
-    for name in _STAGE_ORDER
-}
+#: Stages the dict driver dispatches with bespoke inline logic (subprocess re-exec, cache-hit
+#: skipping, per-split fan-out). Everything else registered as ``model_dependent`` is handed to
+#: :func:`_dispatch_stage` generically at the tail of the per-arm loop.
+_BUILTIN_PIPELINE_STAGES: frozenset = frozenset({
+    "solve_te", "am_check", "recover", "r0_realizability", "build", "data_previews",
+    "scatter_preview", "beta_select", "train", "eval", "test_plots", "report",
+})
 
 
 def _banner(step: int, total: int, name: str, note: str = "") -> None:
@@ -896,6 +1311,59 @@ def _run_subprocess(cmd: List[str], *, dry_run: bool) -> None:
         )
 
 
+def _warn_if_checkpoint_is_stale(
+    ckpt_path: Path, config: Dict[str, Any], *, epochs: Optional[int] = None,
+) -> None:
+    r"""Print a loud warning when an existing checkpoint does not match the live config.
+
+    ``train`` skips silently when ``final.ckpt`` exists (which is what makes a long
+    multi-arm run resumable). The failure mode that guards against a wasted week is the
+    inverse: a leftover **pilot** checkpoint under the same ``experiment.tag`` makes every
+    downstream stage grade a 400-step model and emit a complete, plausible-looking
+    ``arms_report.md``. The checkpoint records the epoch it stopped at and the
+    $\beta$ schedule actually used, so both are checked against the config here.
+
+    Never raises: this is a readout, and a checkpoint from a legitimately resumed run
+    should not abort the pipeline.
+
+    Args:
+        ckpt_path: The existing ``final.ckpt``.
+        config: The arm-resolved config tree.
+        epochs: The pipeline's epoch override, or ``None`` for ``optim.epochs``.
+    """
+    try:
+        import torch
+
+        blob = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    except Exception as exc:  # noqa: BLE001 -- a readout must never break the run
+        print(f"[pipeline]   (could not inspect {ckpt_path.name}: {exc})")
+        return
+
+    stopped_at = blob.get("epoch")
+    want_epochs = int(epochs) if epochs is not None else int(config["optim"]["epochs"])
+    ckpt_beta = (blob.get("loss_settings") or {}).get("beta_schedule")
+    cfg_beta = (config.get("loss") or {}).get("beta_schedule")
+
+    print(f"[pipeline]   existing ckpt: arm={blob.get('arm')!r} "
+          f"class={blob.get('model_class')!r} stopped_at_epoch={stopped_at}")
+
+    warnings: List[str] = []
+    if isinstance(stopped_at, int) and stopped_at + 1 < want_epochs:
+        warnings.append(
+            f"it stopped at epoch {stopped_at + 1} but the config asks for {want_epochs} "
+            f"-- this looks like a PILOT checkpoint"
+        )
+    if ckpt_beta != cfg_beta:
+        warnings.append(
+            f"its beta_schedule {ckpt_beta} != the config's {cfg_beta}"
+        )
+    for msg in warnings:
+        print(f"[pipeline]   WARNING: {msg}")
+    if warnings:
+        print("[pipeline]   WARNING: every downstream stage will grade THIS checkpoint. "
+              "Delete the arm's results dir, or set force_retrain=True.")
+
+
 def _stage_subprocess_cmd(
     config_path: Path,
     stage: str,
@@ -903,6 +1371,8 @@ def _stage_subprocess_cmd(
     devices: Any = None,
     epochs: Optional[int] = None,
     pilot: bool = False,
+    arm: Optional[str] = None,
+    max_samples: Optional[int] = None,
 ) -> List[str]:
     r"""Assemble a ``--stage {train,beta_select}`` subprocess command (DDP-safe).
 
@@ -912,6 +1382,9 @@ def _stage_subprocess_cmd(
         devices: Lightning devices spec (``None`` keeps the config/train default).
         epochs: Optional epoch override.
         pilot: Pass ``--pilot`` for the short training smoke.
+        arm: The resolved ``synthetic_v3`` arm; forwarded as ``--arm`` so the DDP
+            re-exec trains and checkpoints under the same arm.
+        max_samples: Optional per-split sample cap, forwarded as ``--max-samples``.
 
     Returns:
         The command list.
@@ -926,6 +1399,10 @@ def _stage_subprocess_cmd(
         cmd += ["--devices", str(devices)]
     if epochs is not None:
         cmd += ["--epochs", str(int(epochs))]
+    if arm is not None:
+        cmd += ["--arm", str(arm)]
+    if max_samples is not None:
+        cmd += ["--max-samples", str(int(max_samples))]
     return cmd
 
 
@@ -949,6 +1426,8 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     * ``force_retrain`` -- ``True`` retrains even when ``final.ckpt`` exists.
     * ``train_pilot`` -- ``True`` runs the short training smoke (``--pilot``).
     * ``devices`` / ``epochs`` -- training overrides forwarded to the subprocess.
+    * ``arms`` -- the ``synthetic_v3`` arm sweep for the model-dependent stages
+      (``None`` -> every arm in the config's ``arms`` block, or one arm-less v1/v2 run).
     * ``ckpt`` / ``split`` / ``analysis_samples`` -- ``eval`` / ``test_plots`` knobs.
     * ``solve_te_args`` -- ``(target_te, D)`` for the ``solve_te`` stage.
     * ``scatter_preview`` -- sub-dict ``{target_te, delay, n}`` for that stage.
@@ -970,13 +1449,14 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         RuntimeError: When a subprocess stage exits non-zero.
     """
     t_start = time.time()
-    stages = dict(_STAGE_DEFAULTS)
+    _load_stage_plugins()   # so a plugin-registered analysis stage is a valid PIPELINE key
+    order = stage_order()
+    stages = stage_defaults()
     stages.update(pipeline.get("stages") or {})
-    unknown = set(stages) - set(_STAGE_ORDER)
+    unknown = set(stages) - set(order)
     if unknown:
         raise ValueError(
-            f"unknown stage keys {sorted(unknown)}; valid stages are "
-            f"{list(_STAGE_ORDER)}."
+            f"unknown stage keys {sorted(unknown)}; valid stages are {list(order)}."
         )
 
     dry_run = bool(pipeline.get("dry_run", False))
@@ -996,6 +1476,9 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     force_retrain = bool(pipeline.get("force_retrain", False))
     train_pilot = bool(pipeline.get("train_pilot", False))
     devices = pipeline.get("devices")
+    # Resolve once, here, so the printed plan, the banner and the subprocess command all
+    # agree. ``None`` -> ddp.devices for a headline run, train.devices under train_pilot.
+    resolved_devices = _resolve_train_devices(config, devices=devices, pilot=train_pilot)
     epochs = pipeline.get("epochs")
     ckpt = pipeline.get("ckpt")
     # ``split=None`` (the default) grades/plots EVERY available split (train, val, test)
@@ -1003,11 +1486,11 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
     split = pipeline.get("split", None)
     analysis_samples = int(pipeline.get("analysis_samples", 4))
     results_dir = _results_dir(config, benchmark)
-    n_stages = len(_STAGE_ORDER)
+    n_stages = len(order)
     status: Dict[str, Any] = {}
 
     def _sb(name: str, note: str = "") -> None:
-        _banner(_STAGE_ORDER.index(name) + 1, n_stages, name, note)
+        _banner(order.index(name) + 1, n_stages, name, note)
 
     print(
         f"[pipeline] synthetic_v2 edit-and-run\n"
@@ -1094,11 +1577,18 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
             build_all,
         )
-        out_dir = build_all(
-            config, benchmark=benchmark, pilot=pilot, resume=not force_rebuild,
-        )
-        print(f"[build] wrote cache -> {out_dir}")
-        status["build"] = "done"
+        cache_dir = resolve_cache_dir(config, benchmark=benchmark)
+        if cache_is_complete(cache_dir) and not force_rebuild:
+            # build_all rewrites every split .npz unconditionally; never do that to a
+            # populated cache without an explicit force_rebuild.
+            print(f"[build] cache up to date -> {cache_dir}")
+            status["build"] = "skipped (cache up to date)"
+        else:
+            out_dir = build_all(
+                config, benchmark=benchmark, pilot=pilot, resume=not force_rebuild,
+            )
+            print(f"[build] wrote cache -> {out_dir}")
+            status["build"] = "done"
 
     # --- data_previews (raw + scattering + latent gallery) -------------------
     _sb("data_previews")
@@ -1142,96 +1632,181 @@ def run_pipeline(pipeline: Dict[str, Any]) -> Dict[str, Any]:
         )
         status["scatter_preview"] = "done"
 
-    # --- beta_select (opt-in KL sweep; DDP-safe subprocess) ------------------
-    _sb("beta_select")
-    if not stages["beta_select"]:
-        status["beta_select"] = "skipped (disabled)"
-        print("[pipeline] disabled.")
-    else:
-        _run_subprocess(
-            _stage_subprocess_cmd(
-                config_path, "beta_select", devices=devices, epochs=epochs,
-                pilot=train_pilot,
-            ),
-            dry_run=dry_run,
-        )
-        status["beta_select"] = "dry-run" if dry_run else "done"
-
-    # --- train (fit -> checkpoint; DDP-safe subprocess) ----------------------
-    ckpt_final = results_dir / "final.ckpt"
-    _sb("train", note=f"devices={devices if devices is not None else 1}"
-                      + (", pilot" if train_pilot else ""))
-    if not stages["train"]:
-        status["train"] = "skipped (disabled)"
-        print("[pipeline] disabled.")
-    elif ckpt_final.is_file() and not force_retrain:
-        status["train"] = "skipped (exists)"
-        print(f"[pipeline] checkpoint exists, skipping training: {ckpt_final}\n"
-              f"           (set force_retrain=True to retrain)")
-    else:
-        _run_subprocess(
-            _stage_subprocess_cmd(
-                config_path, "train", devices=devices, epochs=epochs,
-                pilot=train_pilot,
-            ),
-            dry_run=dry_run,
-        )
-        status["train"] = "dry-run" if dry_run else "done"
+    # --- model-dependent stages, swept per arm -------------------------------
+    # The model-free stages above run ONCE at the arm-less results/<tag>/ root. The stages
+    # below consume or produce a checkpoint, so they repeat for every configured arm into
+    # results/<tag>/<arm>/. ``arms`` defaults to every arm in the config's ``arms`` block
+    # (so a v3 config sweeps parity / v3_noncausal / v3_prod), or to a single arm-less run
+    # for a v1 / v2 config.
+    arm_list = list(pipeline.get("arms") or list(config.get("arms") or {}) or [None])
 
     # Which splits to grade / plot: every available split by default (each into its own
-    # results/<tag>/<split>/ subfolder), or the one requested via ``split``.
+    # results/<tag>/<arm>/<split>/ subfolder), or the one requested via ``split``.
     splits = _resolve_splits(config, benchmark, split)
 
-    # --- eval (grade the checkpoint, per split) ------------------------------
-    _sb("eval", note=f"splits={splits}")
-    if not stages["eval"]:
-        status["eval"] = "skipped (disabled)"
-        print("[pipeline] disabled.")
-    elif dry_run:
-        status["eval"] = "dry-run"
-        print(f"[pipeline] would grade the checkpoint on splits {splits} -> "
-              f"{results_dir / '<split>' / 'metrics.json'}")
-    else:
-        _eval_splits(config, benchmark, ckpt=ckpt, splits=splits, results_dir=results_dir)
-        status["eval"] = "done"
+    for arm in arm_list:
+        arm_cfg = resolve_arm(config, arm)
+        arm_dir = _run_dir(config, benchmark, arm)
+        arm_note = f"arm={arm}" if arm is not None else ""
 
-    # --- test_plots (standard testing per-sample diagnostics, per split) -----
-    _sb("test_plots", note=f"splits={splits}")
-    if not stages["test_plots"]:
-        status["test_plots"] = "skipped (disabled)"
-        print("[pipeline] disabled.")
-    elif dry_run:
-        status["test_plots"] = "dry-run"
-        print(f"[pipeline] would render {analysis_samples} TE-annotated sample PDFs per "
-              f"split {splits}.")
-    else:
-        # Figures only -- never gate the run on a plotting failure.
-        _test_plots_splits(config, benchmark, ckpt=ckpt,
-                           analysis_samples=analysis_samples, splits=splits,
-                           results_dir=results_dir)
-        status["test_plots"] = "done"
+        def _asb(name: str, note: str = "", _arm_note: str = arm_note) -> None:
+            joined = ", ".join(x for x in (_arm_note, note) if x)
+            _banner(order.index(name) + 1, n_stages, name, joined)
 
-    # --- report (assemble the markdown report + gallery, per split) ----------
-    _sb("report", note=f"splits={splits}")
-    if not stages["report"]:
-        status["report"] = "skipped (disabled)"
-        print("[pipeline] disabled.")
-    elif dry_run:
-        status["report"] = "dry-run"
-        print(f"[pipeline] would assemble a report per split {splits} under {results_dir}.")
-    else:
-        _report_splits(config, benchmark, splits=splits, results_dir=results_dir)
-        report_path = results_dir / "report.md"  # the cross-split index
-        print(f"[report] wrote {report_path}")
-        status["report"] = "done"
+        def _skey(name: str, _arm: Optional[str] = arm) -> str:
+            return f"{name}[{_arm}]" if _arm is not None else name
+
+        if dry_run and arm is not None:
+            _print_arm_plan(config, arm)
+
+        # --- beta_select (opt-in KL sweep; DDP-safe subprocess) --------------
+        _asb("beta_select")
+        if not stages["beta_select"]:
+            status[_skey("beta_select")] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+        else:
+            _run_subprocess(
+                _stage_subprocess_cmd(
+                    config_path, "beta_select", devices=resolved_devices, epochs=epochs,
+                    pilot=train_pilot, arm=arm,
+                ),
+                dry_run=dry_run,
+            )
+            status[_skey("beta_select")] = "dry-run" if dry_run else "done"
+
+        # --- train (fit -> checkpoint; DDP-safe subprocess) ------------------
+        ckpt_final = arm_dir / "final.ckpt"
+        _asb("train", note=f"devices={resolved_devices}"
+                          + (", pilot" if train_pilot else ""))
+        if not stages["train"]:
+            status[_skey("train")] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+        elif ckpt_final.is_file() and not force_retrain:
+            status[_skey("train")] = "skipped (exists)"
+            print(f"[pipeline] checkpoint exists, skipping training: {ckpt_final}\n"
+                  f"           (set force_retrain=True to retrain)")
+            _warn_if_checkpoint_is_stale(ckpt_final, arm_cfg, epochs=epochs)
+        else:
+            _run_subprocess(
+                _stage_subprocess_cmd(
+                    config_path, "train", devices=resolved_devices, epochs=epochs,
+                    pilot=train_pilot, arm=arm,
+                ),
+                dry_run=dry_run,
+            )
+            status[_skey("train")] = "dry-run" if dry_run else "done"
+
+        # --- eval (grade the checkpoint, per split) --------------------------
+        _asb("eval", note=f"splits={splits}")
+        if not stages["eval"]:
+            status[_skey("eval")] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+        elif dry_run:
+            status[_skey("eval")] = "dry-run"
+            print(f"[pipeline] would grade the checkpoint on splits {splits} -> "
+                  f"{arm_dir / '<split>' / 'metrics.json'}")
+        else:
+            _eval_splits(arm_cfg, benchmark, ckpt=ckpt, splits=splits,
+                         results_dir=arm_dir, arm=arm)
+            status[_skey("eval")] = "done"
+
+        # --- test_plots (standard testing per-sample diagnostics, per split) -
+        _asb("test_plots", note=f"splits={splits}")
+        if not stages["test_plots"]:
+            status[_skey("test_plots")] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+        elif dry_run:
+            status[_skey("test_plots")] = "dry-run"
+            print(f"[pipeline] would render {analysis_samples} TE-annotated sample PDFs "
+                  f"per split {splits}.")
+        else:
+            # Figures only -- never gate the run on a plotting failure.
+            _test_plots_splits(arm_cfg, benchmark, ckpt=ckpt, arm=arm,
+                               analysis_samples=analysis_samples, splits=splits,
+                               results_dir=arm_dir)
+            status[_skey("test_plots")] = "done"
+
+        # --- plugin-registered analysis stages (calibration / lag_intervention / cmi) ----
+        # Append-only: each was contributed by its own module via ``register_stage`` and is
+        # dispatched generically here, so adding one touches neither this loop nor ``main()``.
+        #
+        # These run BEFORE ``report`` on purpose. Each plugin either folds a block into the
+        # split's ``metrics.json`` (calibration -> ``calibration_predictive``) or drops a
+        # side-car JSON the report's registered section reads (lag_intervention). Dispatching
+        # them after ``report`` -- as this loop originally did -- rendered every new section
+        # as ``n/a`` on a one-shot pipeline pass. Their ``StageSpec.order`` therefore only
+        # sequences them among *themselves*; their position relative to the builtins is fixed
+        # here.
+        for name in order:
+            spec = _STAGE_REGISTRY[name]
+            if name in _BUILTIN_PIPELINE_STAGES or not spec.model_dependent or spec.run is None:
+                continue
+            _asb(name)
+            if not stages.get(name, spec.default_on):
+                status[_skey(name)] = "skipped (disabled)"
+                print("[pipeline] disabled.")
+                continue
+            if dry_run:
+                status[_skey(name)] = "dry-run"
+                print(f"[pipeline] would run stage {name} on splits {splits}.")
+                continue
+            ctx = StageContext(
+                config=arm_cfg, benchmark=benchmark, arm=arm, ckpt=ckpt, split=split,
+                analysis_samples=analysis_samples,
+                max_samples=pipeline.get("max_samples"),
+            )
+            rc = _dispatch_stage(spec, ctx)
+            status[_skey(name)] = "done" if rc == 0 else f"exit {rc}"
+
+        # --- report (assemble the markdown report + gallery, per split) ------
+        # Last, so it sees every analysis block the plugin stages just wrote.
+        _asb("report", note=f"splits={splits}")
+        if not stages["report"]:
+            status[_skey("report")] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+        elif dry_run:
+            status[_skey("report")] = "dry-run"
+            print(f"[pipeline] would assemble a report per split {splits} under {arm_dir}.")
+        else:
+            _report_splits(arm_cfg, benchmark, splits=splits, results_dir=arm_dir)
+            report_path = arm_dir / "report.md"  # the cross-split index
+            print(f"[report] wrote {report_path}")
+            status[_skey("report")] = "done"
+
+    # --- cross-arm, model-free plugin stages (arms_report) ---------------------
+    # These read *every* arm's artifacts and write once at the arm-less results/<tag>/ root, so
+    # they belong after the sweep, not inside it. The generic per-arm loop above skips them
+    # (`not spec.model_dependent`), and `main()` gives them `arm=None`, so this block is the only
+    # place the dict driver dispatches them.
+    for name in order:
+        spec = _STAGE_REGISTRY[name]
+        if (name in _BUILTIN_PIPELINE_STAGES or spec.model_dependent
+                or spec.run is None):
+            continue
+        _banner(order.index(name) + 1, n_stages, name)
+        if not stages.get(name, spec.default_on):
+            status[name] = "skipped (disabled)"
+            print("[pipeline] disabled.")
+            continue
+        if dry_run:
+            status[name] = "dry-run"
+            print(f"[pipeline] would run stage {name} across arms {arm_list}.")
+            continue
+        ctx = StageContext(
+            config=config, benchmark=benchmark, arm=None, split=split,
+            analysis_samples=analysis_samples, max_samples=pipeline.get("max_samples"),
+        )
+        rc = _dispatch_stage(spec, ctx)
+        status[name] = "done" if rc == 0 else f"exit {rc}"
 
     # --- summary --------------------------------------------------------------
     elapsed = time.time() - t_start
     print("\n" + "=" * 78)
     print(f"[pipeline] finished in {elapsed / 60.0:.1f} min")
-    for name in _STAGE_ORDER:
-        print(f"  {name:18s} {status.get(name, '?')}")
-    print(f"[pipeline] artifacts under {results_dir}")
+    for name, st in status.items():
+        print(f"  {name:24s} {st}")
+    print(f"[pipeline] artifacts under {results_dir} (arms: "
+          f"{[a for a in arm_list if a is not None] or 'none'})")
     status["benchmark"] = benchmark
     status["results_dir"] = str(results_dir)
     return status
@@ -1284,18 +1859,16 @@ def build_parser() -> argparse.ArgumentParser:
             "coupled channel, and writes a scattering heatmap under results/<tag>/figures/."
         ),
     )
+    # ``--stage`` choices come from the registry, so a plugin-registered analysis stage is
+    # dispatchable (and documented) without editing this parser.
+    _load_stage_plugins()
     parser.add_argument(
         "--stage",
-        choices=_STAGES,
-        help=(
-            "Pipeline stage to run. Implemented: r0_realizability (S3-T05, the three-TE "
-            "de-risk pre-flight), build (S4, generate -> scatter -> normalise -> cache), "
-            "train (S5-T02, fit the model -> checkpoint + loss curves; add --pilot for a "
-            "short smoke), beta_select (S5-T03, pick the least-collapsed KL over "
-            "beta_select.beta_grid), eval (S6, grade a checkpoint -> metrics.json), "
-            "data_previews (render the raw / scattering / latent figure gallery for a "
-            "strong cell), and report (assemble report.md + the full figure gallery)."
-        ),
+        choices=stage_names(),
+        help="Pipeline stage to run. " + "; ".join(
+            f"{n} ({_STAGE_REGISTRY[n].help})" for n in stage_names()
+            if _STAGE_REGISTRY[n].help
+        ) + ".",
     )
     parser.add_argument(
         "--epochs",
@@ -1326,6 +1899,15 @@ def build_parser() -> argparse.ArgumentParser:
             "With --stage r0_realizability / build, run the FULL locked mix grid at "
             "mix.n_per_cell_{train,val,test} instead of the pilot grid (expensive). "
             "Mutually exclusive with --pilot."
+        ),
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "With --stage build, regenerate over a COMPLETE cache. Without it, build "
+            "reports 'cache up to date' and exits without touching the .npz files; "
+            "build_all always rewrites every split, so this guards the production cache."
         ),
     )
     parser.add_argument(
@@ -1362,6 +1944,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "With --stage test_plots, the number of per-sample TE-annotated diagnostic "
             "PDFs to emit through the standard testing pipeline (default 4)."
+        ),
+    )
+    parser.add_argument(
+        "--arm",
+        default=None,
+        help=(
+            "The synthetic_v3 ablation arm (e.g. 'parity' / 'v3_noncausal' / 'v3_prod') "
+            "resolved by deep-merging arms.<name> over the base model/loss blocks. "
+            "Model-dependent stages write under results/<tag>/<arm>/. Required when the "
+            "config defines more than one arm; a single-arm config defaults to it; a "
+            "config with no 'arms' block ignores it (the v1 / v2 path)."
+        ),
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-split cap on the number of samples (forwarded to the stages "
+            "that honour it; leaves the full grid when unset)."
         ),
     )
     return parser
@@ -1459,113 +2061,227 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         if args.pilot and args.full:
             parser.error("--pilot and --full are mutually exclusive.")
-        if args.stage == "r0_realizability":
-            # Default to the pilot grid: the full mix grid generates tens of thousands of
-            # scattering passes and is opt-in via --full only.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
-                run_realizability_preflight,
-            )
-            run_realizability_preflight(
-                config, benchmark=benchmark, pilot=not args.full,
-                out_dir=_results_dir(config, benchmark),
-            )
-            return 0
-        if args.stage == "build":
-            # S4: enumerate -> generate -> scatter -> normalise -> cache. Default to the
-            # pilot grid (a quick smoke); the locked full mix grid is opt-in via --full.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
-                build_all,
-            )
-            out_dir = build_all(config, benchmark=benchmark, pilot=not args.full)
-            print(f"[build] wrote cache -> {out_dir}")
-            for split in ("train", "val", "test"):
-                npz = out_dir / f"{split}.npz"
-                if npz.is_file():
-                    print(f"  {split:5s} -> {npz}")
-            print(f"  meta   -> {out_dir / 'meta.json'}")
-            print(f"  stats  -> {out_dir / 'norm_stats.npz'}")
-            return 0
-        if args.stage == "data_previews":
-            # Render the data-domain gallery (raw + scattering + latent) for a strong cell
-            # into results/<tag>/figures/. Pulls torch / kymatio via the adapter, so the
-            # import lives inside data_previews.
-            data_previews(config, benchmark=benchmark)
-            return 0
-        if args.stage == "train":
-            # S5-T02: fit the unchanged model on the cached splits -> checkpoint + loss
-            # curves. --pilot runs a short smoke (few epochs, a handful of batches) on the
-            # real cache; the full headline run is --stage train with no --pilot.
-            # pl_module_v2 pulls torch / lightning, so import it lazily here.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
-                train_v2,
-            )
-            overrides = _train_overrides(config, args)
-            result = train_v2(config, overrides, benchmark=benchmark)
-            _print_train_result(result)
-            return 0
-        if args.stage == "beta_select":
-            # S5-T03: pick the least-collapsed KL weight over beta_select.beta_grid.
-            # Explicitly invoking the stage force-runs it even when disabled in config.
-            from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
-                beta_select,
-            )
-            overrides = _train_overrides(config, args)
-            overrides["force"] = True
-            result = beta_select(config, overrides, benchmark=benchmark)
-            print(f"[beta_select] selected beta = {result['selected_beta']:g}")
-            for row in result["results"]:
-                print(
-                    f"  beta={row['beta']:.3e}  kld_nats={row['kld_nats']:.4f}  "
-                    f"total_loss={row['total_loss']:.4f}"
-                )
-            if result.get("out_path"):
-                print(f"  wrote {result['out_path']}")
-            return 0
-        if args.stage == "eval":
-            # S6/S8: grade a trained checkpoint -> per-split metrics.json + per_sample_eval.npz
-            # (calibration vs TE_inj / TE_scat incl. the KLD-summary family, lag recovery,
-            # null-control collapse). By default EVERY available split (train/val/test) is
-            # graded into its own results/<tag>/<split>/ subfolder; --split restricts to one.
-            results_dir = _results_dir(config, benchmark)
-            splits = _resolve_splits(config, benchmark, args.split)
-            _eval_splits(config, benchmark, ckpt=args.ckpt, splits=splits,
-                         results_dir=results_dir)
-            print(f"  wrote per-split metrics under {results_dir / '<split>'}")
-            return 0
-        if args.stage == "test_plots":
-            # S7-T07: bridge each v2 cache split through the standard testing pipeline so the
-            # per-sample diagnostics carry the synthetic TE provenance. Runs per split into
-            # results/<tag>/<split>/test_plots/ (all splits by default; --split restricts).
-            results_dir = _results_dir(config, benchmark)
-            splits = _resolve_splits(config, benchmark, args.split)
-            _test_plots_splits(config, benchmark, ckpt=args.ckpt,
-                               analysis_samples=args.analysis_samples, splits=splits,
-                               results_dir=results_dir)
-            return 0
-        if args.stage == "report":
-            # S7-T05/S8: assemble a full markdown report + figure gallery PER split (from that
-            # split's meta.json / metrics.json / per_sample_eval.npz / realizability.json /
-            # sample diagnostics) into results/<tag>/<split>/, plus a top-level cross-split
-            # index. Degrades gracefully when an artifact is missing (so it can run before the
-            # headline train/eval).
-            results_dir = _results_dir(config, benchmark)
-            splits = _resolve_splits(config, benchmark, args.split)
-            if not any((results_dir / s / "metrics.json").is_file() for s in splits):
-                print(
-                    "[report] WARNING: no per-split metrics.json found; the reports' "
-                    "calibration / lag / null gates will read 'n/a'. Run --stage eval first.",
-                    file=sys.stderr,
-                )
-            _report_splits(config, benchmark, splits=splits, results_dir=results_dir)
-            print(f"[report] wrote per-split reports + cross-split index under {results_dir}")
-            return 0
-        raise NotImplementedError(
-            f"stage '{args.stage}' lands in a later sprint; Sprints 3-6 implement "
-            "'r0_realizability', 'build', 'train', 'beta_select', 'eval', and 'report'."
+        spec = _STAGE_REGISTRY.get(args.stage)
+        if spec is None or spec.run is None:
+            parser.error(f"stage {args.stage!r} is registered but has no runner.")
+            return 2  # unreachable; parser.error exits
+        # Resolve the arm ONLY for model-dependent stages, then deep-merge its delta over
+        # the base model / loss blocks. The model-free stages (build / r0_realizability /
+        # data_previews) run once at the arm-less ``results/<tag>/`` root and never require
+        # --arm, even under a multi-arm config.
+        arm = _select_arm(config, args.arm) if spec.model_dependent else None
+        config = resolve_arm(config, arm)
+        ctx = StageContext(
+            config=config, benchmark=benchmark, arm=arm, ckpt=args.ckpt,
+            split=args.split, analysis_samples=args.analysis_samples,
+            max_samples=getattr(args, "max_samples", None),
+            pilot=bool(args.pilot), full=bool(args.full), args=args,
         )
+        return _dispatch_stage(spec, ctx)
 
     parser.print_help()
     return 0
+
+
+def _dispatch_stage(spec: StageSpec, ctx: StageContext) -> int:
+    r"""Run one stage, honouring its ``fatal`` policy.
+
+    A ``fatal=False`` stage that raises is reported as ``failed (non-fatal)`` and returns 0,
+    so a diverging CMI fit or a broken calibration figure cannot abort a headline run. This is
+    the same warn-don't-gate convention ``_test_plots_splits`` already applies per split.
+
+    Args:
+        spec: The registered stage.
+        ctx: The resolved stage context.
+
+    Returns:
+        The stage's exit code (``0`` for a swallowed non-fatal failure).
+    """
+    assert spec.run is not None
+    if spec.fatal:
+        return spec.run(ctx)
+    try:
+        return spec.run(ctx)
+    except Exception as exc:  # noqa: BLE001 -- opt-in analyses never gate the run
+        print(f"[{spec.name}] failed (non-fatal): {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 0
+
+
+# -----------------------------------------------------------------------------
+# Built-in stage runners (registered at import; ``main()`` never names them)
+# -----------------------------------------------------------------------------
+def _stage_r0_realizability(ctx: StageContext) -> int:
+    r"""Three-TE model-free de-risk pre-flight -> ``results/<tag>/realizability.json``."""
+    # Default to the pilot grid: the full mix grid generates tens of thousands of scattering
+    # passes and is opt-in via --full only.
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.eval_v2 import (
+        run_realizability_preflight,
+    )
+    run_realizability_preflight(
+        ctx.config, benchmark=ctx.benchmark, pilot=not ctx.full, out_dir=ctx.tag_root(),
+    )
+    return 0
+
+
+_CACHE_ARTIFACTS = ("train.npz", "val.npz", "test.npz", "meta.json", "norm_stats.npz")
+
+
+def cache_is_complete(cache_dir: Path) -> bool:
+    r"""Whether ``cache_dir`` holds a complete, loadable split cache.
+
+    Args:
+        cache_dir: The resolved cache leaf (see :func:`resolve_cache_dir`).
+
+    Returns:
+        ``True`` when every artifact in :data:`_CACHE_ARTIFACTS` is present.
+    """
+    return all((cache_dir / name).is_file() for name in _CACHE_ARTIFACTS)
+
+
+def _print_cache_contents(out_dir: Path) -> None:
+    r"""Print the split / meta / stats paths under a built cache leaf."""
+    for split in ("train", "val", "test"):
+        npz = out_dir / f"{split}.npz"
+        if npz.is_file():
+            print(f"  {split:5s} -> {npz}")
+    print(f"  meta   -> {out_dir / 'meta.json'}")
+    print(f"  stats  -> {out_dir / 'norm_stats.npz'}")
+
+
+def _stage_build(ctx: StageContext) -> int:
+    r"""Enumerate -> generate -> scatter -> normalise -> cache.
+
+    Refuses to touch a complete cache without ``--force-rebuild``. ``build_all``
+    unconditionally re-fits the normaliser and rewrites every split ``.npz``, and the
+    Stage-1 parts are keyed on ``(split, cell_id)`` alone, so a default (``pilot``)
+    build against a populated production ``data_tag`` would silently overwrite it with
+    the small pilot grid -- a different cell count *and* different lags.
+    """
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
+        build_all,
+    )
+    # Print the resolved cache leaf BEFORE any generation, so a stale or typo'd
+    # ``experiment.data_tag`` (which would silently rebuild ~12k samples into the wrong
+    # directory) is visible up front rather than after the work.
+    cache_dir = resolve_cache_dir(ctx.config, benchmark=ctx.benchmark)
+    print(f"[build] cache dir -> {cache_dir}")
+    force = bool(getattr(ctx.args, "force_rebuild", False))
+    if cache_is_complete(cache_dir) and not force:
+        print(f"[build] cache up to date -> {cache_dir}")
+        print("[build] nothing to do (pass --force-rebuild to regenerate in place).")
+        _print_cache_contents(cache_dir)
+        return 0
+    grid = "full locked mix grid" if ctx.full else "PILOT grid (pass --full for the locked mix grid)"
+    if cache_is_complete(cache_dir):
+        print(f"[build] WARNING: --force-rebuild will OVERWRITE the complete cache at {cache_dir}")
+    print(f"[build] grid -> {grid}")
+    out_dir = build_all(ctx.config, benchmark=ctx.benchmark, pilot=not ctx.full)
+    print(f"[build] wrote cache -> {out_dir}")
+    _print_cache_contents(out_dir)
+    return 0
+
+
+def _stage_data_previews(ctx: StageContext) -> int:
+    r"""Render the data-domain gallery (raw + scattering + latent) into ``<tag>/figures/``."""
+    data_previews(ctx.config, benchmark=ctx.benchmark)
+    return 0
+
+
+def _stage_train(ctx: StageContext) -> int:
+    r"""Fit the model on the cached splits -> checkpoint + loss curves."""
+    # pl_module_v2 pulls torch / lightning, so import it lazily here.
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
+        train_v2,
+    )
+    assert ctx.args is not None, "the train stage needs the CLI namespace for _train_overrides"
+    overrides = _train_overrides(ctx.config, ctx.args)
+    overrides["arm"] = ctx.arm
+    _print_train_result(train_v2(ctx.config, overrides, benchmark=ctx.benchmark))
+    return 0
+
+
+def _stage_beta_select(ctx: StageContext) -> int:
+    r"""Pick the least-collapsed KL weight over ``beta_select.beta_grid``."""
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.pl_module_v2 import (
+        beta_select,
+    )
+    assert ctx.args is not None, "the beta_select stage needs the CLI namespace"
+    overrides = _train_overrides(ctx.config, ctx.args)
+    # Explicitly invoking the stage force-runs it even when disabled in config.
+    overrides["force"] = True
+    overrides["arm"] = ctx.arm
+    result = beta_select(ctx.config, overrides, benchmark=ctx.benchmark)
+    print(f"[beta_select] selected beta = {result['selected_beta']:g}")
+    for row in result["results"]:
+        print(f"  beta={row['beta']:.3e}  kld_nats={row['kld_nats']:.4f}  "
+              f"total_loss={row['total_loss']:.4f}")
+    if result.get("out_path"):
+        print(f"  wrote {result['out_path']}")
+    return 0
+
+
+def _stage_eval(ctx: StageContext) -> int:
+    r"""Grade a trained checkpoint -> per-split ``metrics.json`` + ``per_sample_eval.npz``."""
+    results_dir = ctx.run_dir()
+    _eval_splits(ctx.config, ctx.benchmark, ckpt=ctx.ckpt, splits=ctx.splits(),
+                 results_dir=results_dir, arm=ctx.arm)
+    print(f"  wrote per-split metrics under {results_dir / '<split>'}")
+    return 0
+
+
+def _stage_test_plots(ctx: StageContext) -> int:
+    r"""Bridge each cache split through the standard-testing per-sample diagnostics."""
+    _test_plots_splits(ctx.config, ctx.benchmark, ckpt=ctx.ckpt, arm=ctx.arm,
+                       analysis_samples=ctx.analysis_samples, splits=ctx.splits(),
+                       results_dir=ctx.run_dir())
+    return 0
+
+
+def _stage_report(ctx: StageContext) -> int:
+    r"""Assemble a markdown report + figure gallery per split, plus a cross-split index."""
+    results_dir = ctx.run_dir()
+    splits = ctx.splits()
+    if not any((results_dir / s / "metrics.json").is_file() for s in splits):
+        print("[report] WARNING: no per-split metrics.json found; the reports' calibration / "
+              "lag / control gates will read 'n/a'. Run --stage eval first.", file=sys.stderr)
+    _report_splits(ctx.config, ctx.benchmark, splits=splits, results_dir=results_dir)
+    print(f"[report] wrote per-split reports + cross-split index under {results_dir}")
+    return 0
+
+
+#: The built-in stages, registered at import so ``stage_names()`` / ``stage_order()`` are
+#: populated before ``build_parser`` or ``run_pipeline`` read them.
+_BUILTIN_STAGE_SPECS: Tuple[StageSpec, ...] = (
+    # order   name                default_on  model_dependent  cli
+    StageSpec("solve_te", 0, False, False, None, cli=False,
+              help="quick coupling query (dict driver only; CLI uses --solve-te)"),
+    StageSpec("am_check", 1, False, False, None, cli=False,
+              help="AM envelope-vs-wavelet separation pre-check (dict driver only)"),
+    StageSpec("recover", 2, False, False, None, cli=False,
+              help="frac_Phi render-knob sweep (dict driver only)"),
+    StageSpec("r0_realizability", 3, True, False, _stage_r0_realizability,
+              help="three-TE model-free de-risk pre-flight"),
+    StageSpec("build", 4, True, False, _stage_build,
+              help="generate -> scatter -> normalise -> cache"),
+    StageSpec("data_previews", 5, True, False, _stage_data_previews,
+              help="raw + scattering + latent figure gallery"),
+    StageSpec("scatter_preview", 6, False, False, None, cli=False,
+              help="scattering heatmap (dict driver only; CLI uses --scatter-preview)"),
+    StageSpec("beta_select", 7, False, True, _stage_beta_select,
+              help="KL-weight sweep (opt-in)"),
+    StageSpec("train", 8, True, True, _stage_train,
+              help="fit the model -> checkpoint + loss curves"),
+    StageSpec("eval", 9, True, True, _stage_eval,
+              help="grade the checkpoint -> metrics.json"),
+    StageSpec("test_plots", 10, True, True, _stage_test_plots,
+              help="standard-testing per-sample TE-annotated diagnostics"),
+    StageSpec("report", 11, True, True, _stage_report,
+              help="markdown report + figure gallery"),
+)
+
+for _builtin_spec in _BUILTIN_STAGE_SPECS:
+    register_stage(_builtin_spec)
 
 
 if __name__ == "__main__":
@@ -1575,27 +2291,38 @@ if __name__ == "__main__":
     # (e.g. `--stage train`, `--solve-te 2.0 8`) instead dispatches to the argparse
     # CLI in main() -- that same CLI is what the DDP-safe train/beta_select
     # subprocesses re-enter, so it is kept alongside the dict driver.
+    # HEADLINE synthetic_v3 three-arm run (S8-T03). To go back to the v1/v2 path, set
+    # ``config_path`` to ``_DEFAULT_CONFIG`` and ``arms`` to ``None``.
     PIPELINE: Dict[str, Any] = {
         # --- identifiers ------------------------------------------------------
-        "config_path": _DEFAULT_CONFIG,   # config_synth_v2.yaml
+        "config_path": _DEFAULT_CONFIG_V3,  # config_synth_v3.yaml (the ablation ladder)
         "benchmark": None,                # None -> experiment.benchmark (G1_raw)
         # --- grid / build behaviour -------------------------------------------
         "pilot": False,                   # r0_realizability + build grid: True=pilot,
                                           #   False=full locked mix grid
         "force_rebuild": False,           # True -> regenerate cached build parts
-                                          #   (resume=False); False keeps the resume skip
+                                          #   (resume=False). Leave False: `build` refuses
+                                          #   to overwrite a complete cache without it.
         # --- training knobs ----------------------------------------------------
         "train_pilot": False,             # True -> short training smoke (--pilot)
         "force_retrain": False,           # True -> retrain even when final.ckpt exists
-        "devices": 1,                     # Lightning devices: 1 local, 8 on the A6000 box,
-                                          #   or "0,1,2,3"; >1 selects DDP (subprocessed)
-        "epochs": None,                   # None -> optim.epochs
+                                          #   (False makes the whole run resumable per arm)
+        "devices": None,                  # None -> ddp.devices (headline, =8) /
+                                          #   train.devices (--pilot, =1). An int, or
+                                          #   "0,1,2,3"; >1 selects DDP (subprocessed).
+        "epochs": None,                   # None -> optim.epochs (=100)
+        "arms": ["v3_prod", "parity", "v3_noncausal"],
+                                          # v3_prod first: it is the headline claim, so a
+                                          #   run that dies overnight still yields it.
+                                          #   None -> every arm in the config's 'arms' block.
         # --- eval / test_plots knobs ------------------------------------------
-        "ckpt": None,                     # None -> best/final under results/<tag>/
+        "ckpt": None,                     # None -> best/final under results/<tag>/<arm>/
         "split": None,                    # eval / test_plots / report split; None -> ALL
                                           #   cached splits (train, val, test), each into
-                                          #   its own results/<tag>/<split>/ subfolder
+                                          #   its own results/<tag>/<arm>/<split>/ subfolder
         "analysis_samples": 4,            # TE-annotated per-sample PDFs in test_plots
+        "max_samples": None,              # None -> each stage's own config cap
+                                          #   (cmi.max_samples=512, calibration=2000)
         # --- diagnostic-stage settings ----------------------------------------
         "solve_te_args": None,            # (target_te, D) required iff stages.solve_te
         "scatter_preview": {"target_te": 2.0, "delay": 8, "n": 16},
@@ -1603,19 +2330,30 @@ if __name__ == "__main__":
         # --- behaviour ---------------------------------------------------------
         "dry_run": False,                 # print the plan (incl. subprocess cmds) only
         # --- stage toggles (executed in _STAGE_ORDER) -------------------------
+        # Model-free stages run once; model-dependent stages run once per arm, and the
+        # analysis plugins run before `report` so its sections are populated.
         "stages": {
             "solve_te": False,            # quick coupling query -- needs solve_te_args
             "am_check": False,            # AM-separation pre-check (diagnostic)
             "recover": False,             # frac_Phi render-knob sweep (opt-in)
-            "r0_realizability": True,     # three-TE de-risk pre-flight
-            "build": True,                # generate -> scatter -> normalise -> cache
-            "data_previews": True,        # raw + scattering + latent gallery
+            "r0_realizability": False,    # OFF: at pilot=False this regenerates the full
+                                          #   12k grid through the scattering transform
+                                          #   (~1 h) to re-answer a question S1-T05 already
+                                          #   settled (frac_phi is 2.4-5.9x; eval.
+                                          #   realizability.fatal is false). Flip on for a
+                                          #   fresh benchmark.
+            "build": True,                # no-op cache-hit check when data_tag exists
+            "data_previews": True,        # raw + scattering + latent gallery (cheap, once)
             "scatter_preview": False,     # scattering heatmap (diagnostic; superseded)
-            "beta_select": False,         # KL-weight sweep (opt-in)
-            "train": True,                # fit -> checkpoint (DDP-safe subprocess)
-            "eval": True,                 # grade -> metrics.json
+            "beta_select": False,         # KL-weight sweep (opt-in; beta is set in config)
+            "train": True,                # fit -> checkpoint (DDP-safe subprocess, per arm)
+            "eval": True,                 # grade -> metrics.json (gamma, controls, lag)
+            "calibration": True,          # G-E: NLL / CRPS / coverage, stratified by TE
+            "lag_intervention": True,     # G-F: leave-one-lag-band-out delta_L (opt-in)
+            "cmi": True,                  # G-G: neural CMI in absolute nats (opt-in)
             "test_plots": True,           # standard testing per-sample diagnostics
-            "report": True,               # markdown report + figures
+            "report": True,               # markdown report + figures, per arm per split
+            "arms_report": True,          # THE cross-arm table (once, after the sweep)
         },
     }
 

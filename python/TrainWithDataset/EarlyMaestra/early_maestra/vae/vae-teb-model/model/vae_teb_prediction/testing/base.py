@@ -44,10 +44,11 @@ from train.graph_models_utils import load_checkpoint_strict
 # legacy pre-refactor module kept only to align old (pre-375b50d) checkpoints;
 # toggle it in (and comment the others) for that one case.
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn  # ACTIVE (v1)
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_v3 import SeqVaeLagAttnV3 as SeqVaeLagAttn  # v3 (scientific-cleanliness fork of v1)
 # from model.vae_teb_prediction.model.vae_teb_lag_attn_old import SeqVaeLagAttnV1 as SeqVaeLagAttn
 # The checkpoint model-class guard lives with v2; importing it is version-agnostic.
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import check_model_class
 
 
 def _lag_attn_kwargs_from_config(

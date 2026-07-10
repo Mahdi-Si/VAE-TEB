@@ -40,6 +40,7 @@ from .build_dataset_v2 import (
     CellV2,
     enumerate_cells_v2,
     generate_pilot_samples,
+    resolve_cache_dir,
     solve_cell_coupling,
 )
 from .raw_generators import DECIMATION, am_separation_margin, ar2_lag1_autocorr
@@ -962,24 +963,29 @@ def _jsonable(obj: Any) -> Any:
 # ===========================================================================
 
 
-def _run_results_dir(config: Dict[str, Any], benchmark: str) -> Path:
-    r"""Resolve the ``results/<tag>/`` directory (local copy of the driver helper).
+def _run_results_dir(config: Dict[str, Any], benchmark: str,
+                     arm: Optional[str] = None) -> Path:
+    r"""Resolve the ``results/<tag>/<arm>/`` directory (local copy of the driver helper).
 
-    Duplicated from ``run_pipeline_v2._results_dir`` so :func:`run_eval` does not import
-    the driver (which imports this module) and create a cycle.
+    Duplicated from ``run_pipeline_v2._run_dir`` so :func:`run_eval` does not import the
+    driver (which imports this module) and create a cycle. ``arm`` scopes the run root to
+    ``results/<tag>/<arm>/`` for the ``synthetic_v3`` arms; ``arm=None`` reproduces the
+    arm-less ``results/<tag>/`` exactly.
 
     Args:
-        config: The parsed ``config_synth_v2.yaml`` tree.
+        config: The parsed config tree.
         benchmark: Active benchmark key (fallback tag).
+        arm: The resolved arm name, or ``None`` for the arm-less run root.
 
     Returns:
-        The ``results/<tag>`` directory as an absolute :class:`Path` (not created).
+        The run root directory as an absolute :class:`Path` (not created).
     """
     tag = str(config.get("experiment", {}).get("tag", benchmark))
     results_dir = Path(config.get("paths", {}).get("results_dir", "./results"))
     if not results_dir.is_absolute():
         results_dir = Path(__file__).resolve().parent / results_dir
-    return results_dir / tag
+    base = results_dir / tag
+    return base / str(arm) if arm else base
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1031,42 @@ def _clean_window_mean(kld_bt, delay, *, warmup: int, horizon: int):
     return kbar, valid
 
 
+def _masked_forecast_loss(mu, y_plus, valid):
+    r"""Per-sample clean-window MSE of a forecast mean against the unfolded future target.
+
+    $$\mathcal{L}_b \;=\; \frac{1}{|\mathcal{T}_b|\, H_d\, C_y}
+      \sum_{t \in \mathcal{T}_b} \sum_{h=1}^{H_d} \sum_{c=1}^{C_y}
+      \bigl(\mu_{b,t,h,c} - Y^+_{b,t,h,c}\bigr)^2,$$
+
+    where $\mathcal{T}_b$ is sample $b$'s clean window from :func:`_clean_window_mean`, namely
+    $[\max(\text{warmup},\, D_b - 1),\; T - H)$. The normalisation matches the model's own
+    ``compute_loss`` MSE, so the returned value is on the same scale as ``feat_loss`` /
+    ``base_loss`` in ``per_sample_eval.npz``.
+
+    This is the **single source of truth** for the forecast loss. ``collect_per_sample_kbar``
+    scores the clean and the corrupted forwards with it, and ``lag_intervention_v3`` scores
+    the lag-band-masked forwards with it, so
+    $\Delta L_G = \mathcal{L}^{\text{masked }G} - \mathcal{L}_{\mathrm{feat}}$ is a difference
+    of two identically-normalised quantities rather than of two independent re-derivations.
+
+    Args:
+        mu: Forecast mean $(B, T, H_d, C_y)$; only its first $T - H_d$ anchors are scored.
+        y_plus: Unfolded future target $(B, T - H_d, H_d, C_y)$, i.e. the one-step-shifted
+            ``Y[:, 1:].unfold(1, H_d, 1)``. Both ``eval_v2`` and
+            ``TestRunner.build_future_target`` produce exactly this.
+        valid: $(B, T)$ boolean clean-window mask from :func:`_clean_window_mean`.
+
+    Returns:
+        $(B,)$ tensor of per-sample losses.
+    """
+    t_valid = int(y_plus.shape[1])
+    hd, c_y = int(y_plus.shape[2]), int(y_plus.shape[3])
+    m = valid[:, :t_valid].to(mu.dtype)                      # (B, T_valid)
+    w = m[:, :, None, None]
+    cnt = m.sum(dim=1).clamp(min=1.0) * float(hd * c_y)      # (B,)
+    return (((mu[:, :t_valid] - y_plus) ** 2) * w).sum(dim=(1, 2, 3)) / cnt
+
+
 def _corrupt_source(u_stream, mode: str, *, generator=None):
     r"""Corrupt the source stream $U$ for a null control (EXPLAINED §14.4).
 
@@ -1036,8 +1078,14 @@ def _corrupt_source(u_stream, mode: str, *, generator=None):
       batch cannot be shuffled, so it is returned unchanged.
     * ``reverse`` -- a time-reversal of the source stream (destroys the causal lag).
 
-    A well-calibrated model's $\bar K$ should collapse to the intercept $\alpha$ under
-    either, so ``null_ratio`` $= \bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}} \to 0$.
+    Warning:
+        It is tempting to expect $\bar K$ to collapse to the intercept $\alpha$ under either
+        corruption, giving ``null_ratio`` $\to 0$. It does not, and cannot:
+        $\mathrm{KL}(q\,\|\,p)$ measures that the source moved the posterior, not that it
+        moved it *correctly*, and a corrupted source is out of distribution for a posterior
+        trained only on matched pairs -- so it typically moves the belief **more** (v3 Finding
+        F2). What *does* collapse is the corrupted forecast's accuracy, which is why these
+        forwards are also scored in prediction space (:func:`prediction_controls`).
 
     Args:
         u_stream: The source tensor $(B, T, C_u)$.
@@ -1092,6 +1140,14 @@ KLD_SCALAR_VARIANTS: Tuple[str, ...] = (
     "kbar_full", "kbar_postwarm", "kbar_inband", "kbar_outband",
 )
 
+#: Summaries that average $K_t$ over steps the model was never trained to shape, and are
+#: therefore **not** admissible as a TE surrogate when ``kld_support == "anchor"`` (S4-T01).
+#: ``kbar_full`` spans the warm-up prefix and the untrained final-$H$ tail. It is still
+#: collected and written to ``per_sample_eval.npz`` -- it is evidence about what the untrained
+#: region does -- but it is flagged ``out_of_support`` and excluded from best-variant
+#: selection. ``kbar_postwarm`` is the exact anchor support and is the right comparator.
+_OUT_OF_SUPPORT_UNDER_ANCHOR: Tuple[str, ...] = ("kbar_full",)
+
 
 def _row_window_reductions(x_bt: np.ndarray, valid_bt: np.ndarray) -> Dict[str, np.ndarray]:
     r"""Per-row reductions of ``x_bt`` over each sample's boolean clean window (§14.5).
@@ -1139,14 +1195,22 @@ def collect_per_sample_kbar(
     ``kld_per_t`` over each sample's clean window (:func:`_clean_window_mean`), and stamps
     the per-sample provenance (``te_inj``/``te_scat``/``frac_phi``/``cell_id``/``delay``/
     ``held_out``). For each requested null control it re-runs ``forward`` with a corrupted
-    source (:func:`_corrupt_source`) and records $\bar K_{\mathrm{null}}$. In the **same
-    pass** it accumulates, per ``cell_id``, the clean-window mean of the model's
-    ``te_lag_map`` (the KLD-weighted per-lag attribution) into a lag profile, so the S6-T03
-    lag recovery needs no second forward.
+    source (:func:`_corrupt_source`) and records $\bar K_{\mathrm{null}}$ **and** the
+    corrupted forecast loss. In the **same pass** it accumulates, per ``cell_id``, the
+    clean-window mean of the model's ``te_lag_map`` (the KLD-weighted per-lag attribution)
+    into a lag profile, so the S6-T03 lag recovery needs no second forward.
 
     v2 drops the v1 ``M`` / ``band_id`` grouping and the ``per_dim_kl_by_M`` /
     ``kld_time_by_band`` structures (single pathway, fixed lag); grouping is by
     ``cell_id`` with the window floor from the per-sample ``delay``.
+
+    Warning:
+        ``feat_loss_<control>`` scores an **input-stream** corruption: the source stream $U$
+        is time-reversed or row-permuted *before* the encoder, so the whole source pathway
+        sees garbage. It is a different object from the training-time ``feat_loss_perm``
+        logged by ``pl_module_v2``, which deranges the already-encoded ``source_state`` along
+        the batch axis and leaves the encoders untouched. The two corruptions have different
+        magnitudes and must never be tabulated as comparable.
 
     Args:
         model: A loaded :class:`SeqVaeLagAttnV1` in ``eval`` mode.
@@ -1159,13 +1223,20 @@ def collect_per_sample_kbar(
 
     Returns:
         A dict of length-$N$ arrays (``kbar``, ``te_inj``, ``te_scat``, ``frac_phi``,
-        ``cell_id``, ``delay``, ``held_out``, ``pred_gain``, ``uplift_rel``, and
-        ``kbar_<control>`` per control), the KLD summary family
+        ``cell_id``, ``delay``, ``held_out``, ``feat_loss``, ``base_loss``, ``pred_gain``,
+        ``uplift_rel``, and per control ``kbar_<control>`` / ``feat_loss_<control>`` /
+        ``shuffle_penalty_<control>``), the KLD summary family
         (:data:`KLD_SCALAR_VARIANTS`: ``kbar_sum`` / ``kbar_max`` / ``kbar_median`` /
         ``kbar_p90`` / ``kbar_full`` / ``kbar_postwarm`` / ``kbar_inband`` /
         ``kbar_outband``) plus per-head ``kbar_head`` $(N, \text{num\_heads})$ and its
         expanded ``kbar_head0 .. kbar_head{M-1}`` columns, plus ``lag_profiles``
         (``{cell_id: (L,) float64}``), ``kbar_over_time``, ``lag_counts``, ``n`` and ``T``.
+
+        ``feat_loss`` and ``base_loss`` are the clean-window MSEs
+        $\mathcal L_{\mathrm{feat}}$ / $\mathcal L_{\mathrm{base}}$ whose difference is
+        ``pred_gain``; ``shuffle_penalty_<control>`` is
+        $\mathcal L_{\mathrm{feat}}^{\text{corrupted}} - \mathcal L_{\mathrm{feat}}$, which
+        must be **positive** on a model that genuinely exploits the source.
     """
     import torch
 
@@ -1178,13 +1249,20 @@ def collect_per_sample_kbar(
     cols: Dict[str, List[np.ndarray]] = {
         "kbar": [], "te_inj": [], "te_scat": [], "frac_phi": [],
         "cell_id": [], "delay": [], "held_out": [],
-        "pred_gain": [], "uplift_rel": [],
+        "feat_loss": [], "base_loss": [], "pred_gain": [], "uplift_rel": [],
         # KLD summary family (§14.5): time-summaries, window variants, directed-KL split.
         "kbar_sum": [], "kbar_max": [], "kbar_median": [], "kbar_p90": [],
         "kbar_full": [], "kbar_postwarm": [], "kbar_inband": [], "kbar_outband": [],
     }
     head_chunks: List[np.ndarray] = []   # per-batch (B, num_heads) clean-window per-head KL
     control_cols: Dict[str, List[np.ndarray]] = {c: [] for c in controls}
+    # Prediction-space control columns (S3-T02b), keyed by their FULL name rather than
+    # sharing the ``kbar_`` prefix, so ``_write_per_sample_eval``'s explicit key list and
+    # the ``kbar_head*`` glob never collide with them.
+    pred_loss_cols: Dict[str, List[np.ndarray]] = {}
+    for _c in controls:
+        pred_loss_cols[f"feat_loss_{_c}"] = []
+        pred_loss_cols[f"shuffle_penalty_{_c}"] = []
     lag_sum: Dict[int, np.ndarray] = {}
     lag_cnt: Dict[int, int] = {}
     kbar_t_sum: Dict[int, np.ndarray] = {}   # cell_id -> (T,) sum of per-step kld
@@ -1275,28 +1353,41 @@ def collect_per_sample_kbar(
             # used, not just encoded. Reuses the forecast heads already in ``out``
             # (mu_full = mu_base + delta_mu_src); the future target is the one-step-shifted
             # unfold of $Y = [y_{st}\,\|\,y_{ph}]$, matching ``compute_loss`` (MSE).
+            #
+            # The future target and its clean-window weights are built ONCE per batch and
+            # reused by the corrupted forwards below (S3-T02b), so scoring a control costs
+            # no extra unfold and no extra forward.
             mu_full = out.get("mu_full")
             mu_base = out.get("mu_base")
+            nan_b = torch.full((bsz,), float("nan"), device=device)
+            have_target = False
+            Y_plus = None
+            T_valid = 0
             if mu_full is not None and mu_base is not None:
                 Hd = int(mu_full.shape[2])
                 T_valid = int(y_st.shape[1]) - Hd
                 if T_valid > 0:
+                    have_target = True
                     Y = torch.cat([y_st, y_ph], dim=-1)              # (B, T, C_y)
-                    C_y = int(Y.shape[-1])
                     Y_plus = Y[:, 1:, :].unfold(1, Hd, 1).permute(0, 1, 3, 2)  # (B,Tv,Hd,C)
-                    m = valid[:, :T_valid].to(mu_full.dtype)         # eval clean-window mask
-                    w = m[:, :, None, None]
-                    cnt = m.sum(dim=1).clamp(min=1.0) * float(Hd * C_y)   # (B,)
-                    l_full = (((mu_full[:, :T_valid] - Y_plus) ** 2) * w).sum(dim=(1, 2, 3)) / cnt
-                    l_base = (((mu_base[:, :T_valid] - Y_plus) ** 2) * w).sum(dim=(1, 2, 3)) / cnt
-                    pred_gain = l_base - l_full
-                    uplift_rel = pred_gain / l_base.clamp(min=1e-12)
-                else:
-                    pred_gain = torch.full((bsz,), float("nan"), device=device)
-                    uplift_rel = torch.full((bsz,), float("nan"), device=device)
+
+            def _forecast_loss(mu):
+                r"""Clean-window MSE of a forecast mean against the shared future target."""
+                return _masked_forecast_loss(mu, Y_plus, valid)
+
+            if have_target:
+                l_full = _forecast_loss(mu_full)
+                l_base = _forecast_loss(mu_base)
+                pred_gain = l_base - l_full
+                uplift_rel = pred_gain / l_base.clamp(min=1e-12)
             else:
-                pred_gain = torch.full((bsz,), float("nan"), device=device)
-                uplift_rel = torch.full((bsz,), float("nan"), device=device)
+                l_full = l_base = nan_b
+                pred_gain = nan_b
+                uplift_rel = nan_b
+            # S3-T02a: the absolute per-sample forecast losses, not just their difference.
+            # ``pred_gain == base_loss - feat_loss`` remains exact by construction.
+            cols["feat_loss"].append(l_full.detach().cpu().numpy())
+            cols["base_loss"].append(l_base.detach().cpu().numpy())
             cols["pred_gain"].append(pred_gain.detach().cpu().numpy())
             cols["uplift_rel"].append(uplift_rel.detach().cpu().numpy())
 
@@ -1322,6 +1413,10 @@ def collect_per_sample_kbar(
                 kbar_t_sum[c] += kld_np[i]
                 lag_cnt[c] += 1
 
+            # Null controls: exactly ONE corrupted forward per control per batch. Both the
+            # KL-space readout (``kbar_<ctrl>``) and the prediction-space gate
+            # (``feat_loss_<ctrl>``, S3-T02b) are scored from that single forward, against
+            # the same ``Y_plus`` and the same clean-window weights built above.
             for ctrl in controls:
                 u_bad = _corrupt_source(u_stream, ctrl, generator=gen)
                 out_c = model(y_st, y_ph, u_bad)
@@ -1329,6 +1424,16 @@ def collect_per_sample_kbar(
                     out_c["kld_per_t"], delay_t, warmup=warmup, horizon=horizon
                 )
                 control_cols[ctrl].append(kbar_c.detach().cpu().numpy())
+
+                mu_full_c = out_c.get("mu_full")
+                if have_target and mu_full_c is not None:
+                    l_full_c = _forecast_loss(mu_full_c)
+                else:
+                    l_full_c = nan_b
+                pred_loss_cols[f"feat_loss_{ctrl}"].append(
+                    l_full_c.detach().cpu().numpy())
+                pred_loss_cols[f"shuffle_penalty_{ctrl}"].append(
+                    (l_full_c - l_full).detach().cpu().numpy())
 
     result: Dict[str, Any] = {k: np.concatenate(v) for k, v in cols.items()}
     if head_chunks:
@@ -1338,6 +1443,8 @@ def collect_per_sample_kbar(
             result[f"kbar_head{m}"] = head_arr[:, m]
     for ctrl, chunks in control_cols.items():
         result[f"kbar_{ctrl}"] = np.concatenate(chunks) if chunks else np.zeros(0)
+    for name, chunks in pred_loss_cols.items():
+        result[name] = np.concatenate(chunks) if chunks else np.zeros(0)
     result["lag_profiles"] = {c: lag_sum[c] / max(1, lag_cnt[c]) for c in lag_sum}
     result["kbar_over_time"] = {c: kbar_t_sum[c] / max(1, lag_cnt[c]) for c in kbar_t_sum}
     result["lag_counts"] = {c: int(lag_cnt[c]) for c in lag_cnt}
@@ -1493,7 +1600,58 @@ def _spearman_finite(x: np.ndarray, y: np.ndarray) -> Optional[float]:
     return float(np.corrcoef(rx, ry)[0, 1])
 
 
-def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
+#: Bootstrap resamples for the null-cell confidence interval (S4-T02).
+_N_BOOT: int = 2000
+
+#: Default gate on $\bar K$ over the $\mathrm{TE}_{\mathrm{inj}} = 0$ cells, in nats.
+_KBAR_NULL_THRESHOLD: float = 0.05
+
+
+def _bootstrap_ci(
+    values: np.ndarray,
+    *,
+    n_boot: int = _N_BOOT,
+    ci: float = 0.95,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float, float]:
+    r"""Percentile bootstrap CI of the mean of ``values``.
+
+    Resamples ``values`` with replacement ``n_boot`` times and takes the empirical quantiles
+    of the resampled means. Non-finite entries are dropped first. There is no closed-form
+    alternative here: the null cells number ~3, so a normal-approximation interval on a
+    3-point mean would be a fiction.
+
+    Args:
+        values: 1-D array of per-cell means.
+        n_boot: Number of bootstrap resamples.
+        ci: Central coverage of the returned interval (``0.95`` -> 2.5%/97.5% quantiles).
+        rng: Seeded generator; a fresh default one is used when omitted (so callers that
+            need reproducibility must pass their own).
+
+    Returns:
+        ``(mean, ci_lo, ci_hi)``; all three are ``nan`` when nothing finite remains.
+    """
+    x = np.asarray(values, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    if x.size == 1:
+        return float(x[0]), float(x[0]), float(x[0])
+    gen = rng if rng is not None else np.random.default_rng()
+    idx = gen.integers(0, x.size, size=(int(n_boot), x.size))
+    means = x[idx].mean(axis=1)
+    lo_q = (1.0 - float(ci)) / 2.0
+    lo, hi = np.quantile(means, [lo_q, 1.0 - lo_q])
+    return float(x.mean()), float(lo), float(hi)
+
+
+def fit_calibration(
+    arrs: Dict[str, Any],
+    *,
+    kld_support: str = "full",
+    kbar_null_threshold: float = _KBAR_NULL_THRESHOLD,
+    boot_seed: int = 0,
+) -> Dict[str, Any]:
     r"""Fit $\bar K = \alpha + \gamma\,\mathrm{TE}$ vs both $\mathrm{TE}_{\mathrm{inj}}$
     and $\mathrm{TE}_{\mathrm{scat}}$ (S6-T02).
 
@@ -1502,8 +1660,27 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
     $\gamma_{\mathrm{scat}} \to 1$ (§14.1); reporting against both TEs makes any
     $\mathrm{frac}_\Phi$ inflation visible.
 
+    Two v3-specific readings are added on top (Sprint 4).
+
+    **Out-of-support summaries (S4-T01).** Under ``kld_support == "anchor"`` the model is only
+    trained to shape $K_t$ on the anchor-aligned support, so ``kbar_full`` -- which averages
+    ``kld_per_t`` over **all** $T$ -- is partly measuring a warm-up prefix and an untrained
+    final-$H$ tail. It stays in the table (it is evidence) but is stamped
+    ``out_of_support: True`` so no consumer can crown it best-variant. ``kbar_postwarm`` is
+    the correct anchor-support comparator.
+
+    **Null-cell intercept (S4-T02).** v3 initialises with $K \equiv 0$, so the intercept
+    $\alpha$ no longer absorbs a random log-variance-head floor. That makes
+    $\bar K \big|_{\mathrm{TE}_{\mathrm{inj}} = 0} \to 0$ a claim the model can actually be
+    held to -- one v1 structurally could not satisfy -- and a calibrated surrogate additionally
+    has $\alpha \approx \bar K \big|_{\mathrm{TE} = 0}$.
+
     Args:
         arrs: The dict returned by :func:`collect_per_sample_kbar`.
+        kld_support: The evaluated model's ``kld_support`` (``"full"`` / ``"anchor"``). Read
+            with ``getattr(model, "kld_support", "full")`` so a v1 alias never raises.
+        kbar_null_threshold: Gate on the mean $\bar K$ over the null cells, in nats.
+        boot_seed: Seed for the null-cell bootstrap, so the CI is reproducible.
 
     Returns:
         A dict with the per-cell ``gamma_inj``/``gamma_scat``/``alpha_*``/``r2_*``,
@@ -1511,9 +1688,12 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         full-$N$ pooled per-sample fit (``gamma_inj_sample``/``gamma_scat_sample``/
         ``alpha_*_sample``/``r2_*_sample``, ``n_samples``), a ``by_lag`` table of
         per-lag per-sample slopes (``{D: {gamma_inj, alpha_inj, r2_inj, gamma_scat, ...,
-        n}}``), and a ``kld_variants`` table of per-KLD-summary calibrations
-        (``{variant: {gamma_inj, r2_inj, pearson_inj, spearman_inj, gamma_scat, ..., n}}``;
-        §14.5) covering every :data:`KLD_SCALAR_VARIANTS` entry and per-head column present.
+        n}}``), a ``kld_variants`` table of per-KLD-summary calibrations
+        (``{variant: {gamma_inj, r2_inj, pearson_inj, spearman_inj, gamma_scat, ...,
+        out_of_support, n}}``; §14.5) covering every :data:`KLD_SCALAR_VARIANTS` entry and
+        per-head column present, and ``kbar_at_null_cells``
+        (``{mean, std, ci_lo, ci_hi, n_cells, threshold, pass}``, or ``None`` when the grid
+        has no ``te_inj == 0`` cell).
     """
     per_cell = _group_per_cell(arrs)
     cells = list(per_cell.values())
@@ -1575,7 +1755,14 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
         y = np.asarray(arrs[v], dtype=np.float64)
         if y.shape != kbar_a.shape:
             continue
-        entry: Dict[str, Any] = {"n": int(np.isfinite(y).sum())}
+        entry: Dict[str, Any] = {
+            "n": int(np.isfinite(y).sum()),
+            # S4-T01: ``kbar_full`` averages over the whole sequence, so under anchor-aligned
+            # KL support it partly measures a region the model was never trained to shape.
+            # Kept, flagged, and excluded from best-variant selection.
+            "out_of_support": bool(v in _OUT_OF_SUPPORT_UNDER_ANCHOR
+                                   and str(kld_support) == "anchor"),
+        }
         for pref, te in (("inj", te_inj_a), ("scat", te_scat_a)):
             f = _safe_fit(list(zip(te, y)))
             entry[f"gamma_{pref}"] = f["gamma"] if f else None
@@ -1585,7 +1772,28 @@ def fit_calibration(arrs: Dict[str, Any]) -> Dict[str, Any]:
             entry[f"spearman_{pref}"] = _spearman_finite(te, y)
         kld_variants[v] = entry
 
+    # --- null-cell intercept gate (S4-T02) ------------------------------------------------
+    null_kbars = np.asarray([c["kbar"] for c in cells if float(c["te_inj"]) == 0.0],
+                            dtype=np.float64)
+    if null_kbars.size:
+        mean_null, ci_lo, ci_hi = _bootstrap_ci(
+            null_kbars, rng=np.random.default_rng(int(boot_seed)))
+        kbar_at_null_cells: Optional[Dict[str, Any]] = {
+            "mean": mean_null,
+            "std": float(np.std(null_kbars)) if null_kbars.size > 1 else 0.0,
+            "ci_lo": ci_lo,
+            "ci_hi": ci_hi,
+            "n_cells": int(null_kbars.size),
+            "n_boot": int(_N_BOOT),
+            "threshold": float(kbar_null_threshold),
+            "pass": bool(np.isfinite(mean_null) and mean_null < float(kbar_null_threshold)),
+        }
+    else:
+        kbar_at_null_cells = None
+
     return {
+        "kld_support": str(kld_support),
+        "kbar_at_null_cells": kbar_at_null_cells,
         "gamma_inj": fit_inj["gamma"] if fit_inj else None,
         "alpha_inj": fit_inj["alpha"] if fit_inj else None,
         "r2_inj": fit_inj["r2"] if fit_inj else None,
@@ -1739,20 +1947,39 @@ def recover_lags(
 # ---------------------------------------------------------------------------
 
 
+#: Caption for the demoted KL-space null ratio, carried in ``metrics.json`` so no downstream
+#: consumer can read it as a "must reach zero" gate. See :func:`null_ratios`.
+NULL_RATIO_NOTE: str = (
+    "Readout only, NOT a gate: KL(q||p) measures 'the source moved my belief', not "
+    "'...correctly'. A deranged source is still a source, and a posterior trained on matched "
+    "pairs reacts to it out of distribution -- typically more strongly. Expect a finite value "
+    "near 1.0 even on a model that demonstrably exploits the source (v3 Finding F2). The gate "
+    "that does discriminate is metrics['prediction_controls']."
+)
+
+
 def null_ratios(arrs: Dict[str, Any], controls: Sequence[str]) -> Dict[str, Any]:
-    r"""Per-cell and overall null ratios $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$
-    (S6-T04).
+    r"""Per-cell and overall null ratios $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}}$.
 
     For each control the ratio is computed per cell and averaged over the **signal** cells
-    ($\mathrm{TE}_{\mathrm{inj}} > 0$); it should trend to $0$ for a calibrated model
-    (§14.4).
+    ($\mathrm{TE}_{\mathrm{inj}} > 0$).
+
+    Warning:
+        This is a **readout, not a gate** (S3-T03). Earlier revisions of this pipeline gated
+        on $\bar K_{\mathrm{null}} / \bar K_{\mathrm{signal}} \to 0$, which no honest model can
+        satisfy: $\mathrm{KL}(q \,\|\, p)$ measures that the source moved the posterior, not
+        that it moved it *correctly*. v3 measured the ratio in $[1.02, 1.10]$ on a model that
+        was demonstrably exploiting the source (Finding F2). Each returned control therefore
+        carries ``expected_to_vanish: False`` and a ``note``. The discriminating gate is
+        :func:`prediction_controls`.
 
     Args:
         arrs: The dict from :func:`collect_per_sample_kbar` (needs ``kbar_<control>``).
         controls: The evaluated controls.
 
     Returns:
-        ``{control: {mean_ratio, per_cell}}`` for every control present in ``arrs``.
+        ``{control: {mean_ratio, per_cell, expected_to_vanish, note}}`` for every control
+        present in ``arrs``.
     """
     cid = np.asarray(arrs["cell_id"])
     te_inj = np.asarray(arrs["te_inj"])
@@ -1779,8 +2006,147 @@ def null_ratios(arrs: Dict[str, Any], controls: Sequence[str]) -> Dict[str, Any]
         out[ctrl] = {
             "mean_ratio": float(np.mean(ratios)) if ratios else None,
             "per_cell": per_cell,
+            # Sibling keys, so the existing ``nul[ctrl]["mean_ratio"]`` readers are unaffected.
+            "expected_to_vanish": False,
+            "note": NULL_RATIO_NOTE,
         }
     return out
+
+
+#: Relative tolerance for the null-cell coincidence check in :func:`prediction_controls`.
+#: Relative, not absolute, because the forecast losses are MSEs in normalised scattering units
+#: whose scale is set by the build's ``norm_stats``, not by anything the model controls. The
+#: value is a knob: on the 400-step pilot checkpoint the residual head is still adding a
+#: source-independent perturbation worth ~5% of ``base_loss``, so 0.05 sits right at the edge.
+#: Re-tune it against a trained checkpoint (S8-T04) rather than reading it as a physical bound.
+_NULL_CELL_RTOL: float = 0.05
+
+
+def prediction_controls(
+    arrs: Dict[str, Any],
+    controls: Sequence[str],
+    *,
+    null_tol: float = _NULL_CELL_RTOL,
+) -> Dict[str, Any]:
+    r"""The prediction-space control that replaces the KL null ratio as the headline gate.
+
+    A wrong source must be **worse than no source**. Per cell, over the same clean window as
+    $\bar K$:
+
+    .. math::
+
+        \mathcal L_{\mathrm{feat}} \;<\; \mathcal L_{\mathrm{base}}
+        \;<\; \mathcal L_{\mathrm{feat}}^{\pi(U)},
+        \qquad
+        \text{shuffle\_penalty} = \mathcal L_{\mathrm{feat}}^{\pi(U)}
+        - \mathcal L_{\mathrm{feat}} \;>\; 0 .
+
+    The left inequality says the source helps; the right says the *true* source helps, rather
+    than the source pathway merely adding capacity. Unlike the KL ratio this cannot be passed
+    by a posterior that simply reacts strongly to out-of-distribution input, because the
+    forecast is scored against the real future.
+
+    The ordering is asserted only on **signal** cells ($\mathrm{TE}_{\mathrm{inj}} > 0$),
+    mirroring :func:`null_ratios`' convention. On the $\mathrm{TE}_{\mathrm{inj}} = 0$ null
+    cells there is nothing for the source to carry, so the three losses must instead
+    *coincide*: that is checked as ``null_cell_consistent``, within ``null_tol`` **relative to
+    that cell's** $\mathcal L_{\mathrm{base}}$.
+
+    Note:
+        ``feat_loss_<control>`` scores an **input-stream** corruption, not the training-time
+        ``feat_loss_perm`` (a ``source_state`` batch derangement). The two are different
+        objects; see :func:`collect_per_sample_kbar`.
+
+    Note:
+        The left inequality is a real constraint on an *undertrained* model, not a formality.
+        The residual head perturbs $\mu_{\mathrm{full}}$ away from $\mu_{\mathrm{base}}$ from
+        the first step, and until the source pathway carries information that perturbation is
+        source-independent noise that only *hurts* the forecast. So a fresh run reads
+        $\mathcal L_{\mathrm{feat}} > \mathcal L_{\mathrm{base}}$ with
+        $\text{shuffle\_penalty} \approx 0$: the gate is something training earns.
+
+    Args:
+        arrs: The dict from :func:`collect_per_sample_kbar`; needs ``feat_loss``,
+            ``base_loss`` and ``feat_loss_<control>``.
+        controls: The evaluated controls.
+        null_tol: Tolerance for the null-cell coincidence check, **relative** to that cell's
+            ``base_loss`` (the losses are MSEs in normalised units of arbitrary scale).
+
+    Returns:
+        ``{"controls", "n_signal_cells", "overall", "per_cell"}``. ``overall`` carries the mean
+        losses over signal cells plus ``ordering_pass_<ctrl>``, ``ordering_pass`` (all controls,
+        all signal cells) and ``ordering_pass_frac``. ``per_cell`` maps ``cell_id`` to its
+        losses, ``te_inj``, per-control ``ordering_pass_<ctrl>`` / ``shuffle_penalty_<ctrl>``,
+        and ``null_cell_consistent`` (``None`` on signal cells).
+    """
+    present = [c for c in controls
+               if f"feat_loss_{c}" in arrs and np.asarray(arrs[f"feat_loss_{c}"]).size]
+    cid = np.asarray(arrs["cell_id"])
+    te_inj = np.asarray(arrs["te_inj"])
+    feat = np.asarray(arrs.get("feat_loss", np.full(cid.shape, np.nan)))
+    base = np.asarray(arrs.get("base_loss", np.full(cid.shape, np.nan)))
+
+    per_cell: Dict[int, Dict[str, Any]] = {}
+    signal_cells: List[int] = []
+    for c in np.unique(cid):
+        sel = cid == c
+        te_c = float(_nanmean_safe(te_inj[sel]))
+        f_c = float(_nanmean_safe(feat[sel]))
+        b_c = float(_nanmean_safe(base[sel]))
+        is_signal = te_c > 0.0
+        if is_signal:
+            signal_cells.append(int(c))
+        entry: Dict[str, Any] = {
+            "te_inj": te_c, "feat_loss": f_c, "base_loss": b_c,
+            "pred_gain": b_c - f_c, "null_cell_consistent": None,
+        }
+        spreads: List[float] = [abs(f_c - b_c)]
+        for ctrl in present:
+            fc_c = float(_nanmean_safe(np.asarray(arrs[f"feat_loss_{ctrl}"])[sel]))
+            entry[f"feat_loss_{ctrl}"] = fc_c
+            entry[f"shuffle_penalty_{ctrl}"] = fc_c - f_c
+            # The gate is meaningless on a null cell (no true source to be wrong about).
+            entry[f"ordering_pass_{ctrl}"] = (
+                bool(np.isfinite([f_c, b_c, fc_c]).all() and f_c < b_c < fc_c)
+                if is_signal else None
+            )
+            spreads.append(abs(fc_c - f_c))
+        if not is_signal:
+            scale = abs(b_c) if np.isfinite(b_c) and abs(b_c) > 1e-12 else 1.0
+            entry["null_cell_consistent"] = bool(
+                np.isfinite(spreads).all() and max(spreads) < float(null_tol) * scale)
+        per_cell[int(c)] = entry
+
+    overall: Dict[str, Any] = {
+        "feat_loss": float(_nanmean_safe(np.asarray(
+            [per_cell[c]["feat_loss"] for c in signal_cells]))) if signal_cells else None,
+        "base_loss": float(_nanmean_safe(np.asarray(
+            [per_cell[c]["base_loss"] for c in signal_cells]))) if signal_cells else None,
+    }
+    passes: List[bool] = []
+    for ctrl in present:
+        if signal_cells:
+            overall[f"feat_loss_{ctrl}"] = float(_nanmean_safe(np.asarray(
+                [per_cell[c][f"feat_loss_{ctrl}"] for c in signal_cells])))
+            overall[f"shuffle_penalty_{ctrl}"] = float(_nanmean_safe(np.asarray(
+                [per_cell[c][f"shuffle_penalty_{ctrl}"] for c in signal_cells])))
+            ctrl_pass = [bool(per_cell[c][f"ordering_pass_{ctrl}"]) for c in signal_cells]
+            overall[f"ordering_pass_{ctrl}"] = bool(all(ctrl_pass))
+            passes.extend(ctrl_pass)
+        else:
+            overall[f"feat_loss_{ctrl}"] = None
+            overall[f"shuffle_penalty_{ctrl}"] = None
+            overall[f"ordering_pass_{ctrl}"] = None
+    overall["ordering_pass"] = bool(passes and all(passes))
+    overall["ordering_pass_frac"] = (
+        float(np.mean(passes)) if passes else None)
+
+    return {
+        "controls": list(present),
+        "n_signal_cells": len(signal_cells),
+        "overall": overall,
+        "per_cell": per_cell,
+    }
 
 
 def _null_probe(arrs: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
@@ -1866,6 +2232,9 @@ def _write_per_sample_eval(
     out_dir: Path,
     split: str,
     controls: Sequence[str],
+    *,
+    arm: Optional[str] = None,
+    model_class: Optional[str] = None,
 ) -> Path:
     r"""Write the length-$N$ per-sample eval arrays to ``per_sample_eval.npz`` (Enhancement A).
 
@@ -1877,7 +2246,10 @@ def _write_per_sample_eval(
         arrs: The dict returned by :func:`collect_per_sample_kbar`.
         out_dir: The run directory to write into.
         split: The evaluated split name (stored as a 0-d string array).
-        controls: The null controls whose per-sample $\bar K$ arrays are also stored.
+        controls: The null controls whose per-sample $\bar K$ and forecast-loss arrays are
+            also stored (``kbar_<ctrl>``, ``feat_loss_<ctrl>``, ``shuffle_penalty_<ctrl>``).
+        arm: Resolved arm name, stored as a 0-d string array (S4-T03).
+        model_class: The graded checkpoint's model class, stored as a 0-d string array.
 
     Returns:
         The written ``per_sample_eval.npz`` :class:`Path`.
@@ -1885,7 +2257,8 @@ def _write_per_sample_eval(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     base = ("kbar", "te_inj", "te_scat", "frac_phi",
-            "cell_id", "delay", "held_out", "pred_gain", "uplift_rel")
+            "cell_id", "delay", "held_out",
+            "feat_loss", "base_loss", "pred_gain", "uplift_rel")
     # The KLD summary family (§14.5) + per-head columns back the KLD-vs-TE figures; the
     # 2-D ``kbar_head`` matrix is stored too so a caller can recover the head structure.
     variants = tuple(v for v in KLD_SCALAR_VARIANTS if v != "kbar")
@@ -1895,10 +2268,16 @@ def _write_per_sample_eval(
         k: np.asarray(arrs[k]) for k in keys if k in arrs
     }
     for ctrl in controls:
-        key = f"kbar_{ctrl}"
-        if key in arrs and np.asarray(arrs[key]).size:
-            payload[key] = np.asarray(arrs[key])
+        # ``kbar_<ctrl>`` is the KL-space readout; the two ``*_loss`` columns are the
+        # prediction-space control that actually discriminates (S3-T02b / S3-T03).
+        for key in (f"kbar_{ctrl}", f"feat_loss_{ctrl}", f"shuffle_penalty_{ctrl}"):
+            if key in arrs and np.asarray(arrs[key]).size:
+                payload[key] = np.asarray(arrs[key])
     payload["split"] = np.asarray(str(split))
+    # Provenance as 0-d string arrays (S4-T03), so a stray .npz can always be traced back to
+    # the arm and architecture that produced it.
+    payload["arm"] = np.asarray(str(arm) if arm is not None else "")
+    payload["model_class"] = np.asarray(str(model_class) if model_class is not None else "")
     path = out_dir / "per_sample_eval.npz"
     np.savez(str(path), **payload)
     logger.info("run_eval: wrote %s (n=%d)", path, int(np.asarray(arrs["kbar"]).shape[0]))
@@ -1929,6 +2308,7 @@ def run_eval(
     out_dir: Optional[Path] = None,
     batch_size: Optional[int] = None,
     device: Optional[Any] = None,
+    arm: Optional[str] = None,
 ) -> Dict[str, Any]:
     r"""Run the Sprint 6 evaluation gates on a trained checkpoint (S6-T04).
 
@@ -1942,9 +2322,12 @@ def run_eval(
         benchmark: Active benchmark key under ``benchmarks``.
         ckpt: Explicit checkpoint path (else ``best.ckpt``/``final.ckpt`` in ``out_dir``).
         split: The split to evaluate (``test`` by default; falls back to val/train).
-        out_dir: The run directory (defaults to ``results/<tag>/``).
+        out_dir: The run directory (defaults to ``results/<tag>/<arm>/``).
         batch_size: Eval batch size (defaults to ``optim.batch_size``).
         device: Torch device (defaults to CUDA when available).
+        arm: The resolved arm name, used only to arm-scope the fallback ``out_dir``
+            when it is not passed explicitly (the driver always passes an arm+split
+            ``out_dir``).
 
     Returns:
         The assembled ``metrics`` dict (also written to ``out_dir/metrics.json``).
@@ -1952,7 +2335,6 @@ def run_eval(
     import torch
 
     from .datamodule_v2 import SyntheticTEDataModuleV2
-    from .pl_module_v2 import build_model
 
     # Ensure the repo root (six levels up: synthetic_v2 -> model_experiment -> model ->
     # vae_teb_prediction -> model -> <repo root>) leads sys.path so ``train.*`` resolves
@@ -1972,13 +2354,26 @@ def run_eval(
     tolerance = int(ev.get("lag_tolerance_steps", 1))
     lag_threshold = float(ev.get("lag_mass_threshold", 0.8))
 
-    out_dir = _run_results_dir(config, benchmark) if out_dir is None else Path(out_dir)
+    out_dir = (_run_results_dir(config, benchmark, arm) if out_dir is None
+               else Path(out_dir))
     dev = (torch.device(device) if device is not None
            else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     ckpt_path = _resolve_eval_checkpoint(out_dir, ckpt)
 
-    model, _ = build_model(model_cfg, dev)
-    loaded = load_checkpoint_strict(model, str(ckpt_path), map_location=str(dev))
+    # Rebuild from the CHECKPOINT's own class + kwargs (not the config), so an arm is always
+    # graded with the architecture it was trained under; the config supplies only the eval
+    # knobs (warmup / horizon / null controls) read above. Deserialise the blob ONCE and
+    # cross-check its ``model_class`` against the class the config expects (a v3 checkpoint
+    # graded under a v1 config -- or vice versa -- raises rather than silently mismatching).
+    from .pl_module_v2 import (
+        rebuild_model_from_checkpoint,
+        resolved_model_class_name,
+    )
+
+    blob = torch.load(str(ckpt_path), map_location=str(dev), weights_only=False)
+    expected_class = resolved_model_class_name(model_cfg)
+    model, _ = rebuild_model_from_checkpoint(blob, dev, expected_class=expected_class)
+    loaded = load_checkpoint_strict(model, blob)
     if loaded is None:
         raise RuntimeError(f"checkpoint load failed (state-dict mismatch): {ckpt_path}")
     model = loaded.to(dev)
@@ -2000,18 +2395,34 @@ def run_eval(
     # These back the per-sample TE-vs-KLD scatter and the per-lag calibration figures, so the
     # analysis is no longer collapsed to ~15 cell means before plotting. Guarded + non-fatal:
     # a diagnostic side-car must never abort the eval or lose the primary metrics.json.
+    # S4-T03: provenance read off the graded CHECKPOINT (not the config), so the recorded
+    # kwargs are provably those of the weights that produced these numbers. Three
+    # structurally-identical arms otherwise leave three indistinguishable artifact trees.
+    resolved_arm = arm if arm is not None else blob.get("arm")
+    model_class = str(blob.get("model_class", type(model).__name__))
+    model_kwargs = dict(blob.get("model_kwargs", {}) or {})
+
     try:
-        _write_per_sample_eval(arrs, out_dir, used_split, controls)
+        _write_per_sample_eval(arrs, out_dir, used_split, controls,
+                               arm=resolved_arm, model_class=model_class)
     except Exception as exc:  # noqa: BLE001
         logger.warning("run_eval: per_sample_eval.npz not written (%s)", exc)
 
-    calibration = fit_calibration(arrs)
+    # ``kld_support`` lives only on v3 instances; the getattr guard keeps the v1 alias working.
+    calibration = fit_calibration(
+        arrs,
+        kld_support=str(getattr(model, "kld_support", "full")),
+        kbar_null_threshold=float(ev.get("kbar_null_threshold", _KBAR_NULL_THRESHOLD)),
+        boot_seed=seed,
+    )
     cells_by_id = _cells_by_id_from_arrs(arrs)
     lag = recover_lags(
         arrs["lag_profiles"], cells_by_id,
         horizon=horizon, tolerance=tolerance, threshold=lag_threshold,
     )
     nulls = null_ratios(arrs, controls)
+    # The headline control (S3-T03). ``null_ratios`` above is retained as a readout only.
+    pred_controls = prediction_controls(arrs, controls)
     probe = _null_probe(arrs, out_dir)
 
     # frac_Phi summary over the signal cells (from the build-stamped per-sample value).
@@ -2026,8 +2437,10 @@ def run_eval(
 
     # Merged per-cell table for the report / CSV.
     null_by_cell = {ctrl: nulls[ctrl]["per_cell"] for ctrl in nulls}
+    pred_by_cell = pred_controls["per_cell"]
     per_cell_table: List[Dict[str, Any]] = []
     for cid, cell in sorted(cells_by_id.items()):
+        pcell = pred_by_cell.get(cid, {})
         row = {
             "cell_id": cid,
             "te_inj": cell["te_inj"],
@@ -2036,13 +2449,21 @@ def run_eval(
             "kbar_mean": cell["kbar"],
             "n": cell["n"],
             "frac_phi": cell["frac_phi"],
+            "feat_loss": pcell.get("feat_loss"),
+            "base_loss": pcell.get("base_loss"),
             "pred_gain": cell["pred_gain"],
             "uplift_rel": cell["uplift_rel"],
             "lag_mass": lag["per_cell"].get(cid, {}).get("lag_mass"),
             "peak_lag_err": lag["per_cell"].get(cid, {}).get("peak_lag_err"),
         }
         for ctrl in nulls:
+            # KL-space readout (near 1.0 on an honest model; see NULL_RATIO_NOTE).
             row[f"null_{ctrl}_ratio"] = null_by_cell[ctrl].get(cid, {}).get("null_ratio")
+        for ctrl in pred_controls["controls"]:
+            # Prediction-space gate: the columns the headline figure and report render.
+            row[f"feat_loss_{ctrl}"] = pcell.get(f"feat_loss_{ctrl}")
+            row[f"shuffle_penalty_{ctrl}"] = pcell.get(f"shuffle_penalty_{ctrl}")
+            row[f"ordering_pass_{ctrl}"] = pcell.get(f"ordering_pass_{ctrl}")
         per_cell_table.append(row)
 
     # Per-cell variable-length diagnostics (kept out of the flat table): the attention
@@ -2063,6 +2484,12 @@ def run_eval(
     metrics: Dict[str, Any] = {
         "run_tag": str(config.get("experiment", {}).get("tag", benchmark)),
         "benchmark": benchmark,
+        # --- provenance (S4-T03): which arm, which architecture, which data, which weights --
+        "arm": resolved_arm,
+        "model_class": model_class,
+        "model_kwargs": model_kwargs,
+        "loss_settings": dict(config.get("loss", {}) or {}),
+        "cache_dir": str(resolve_cache_dir(config, benchmark=benchmark)),
         "ckpt": str(ckpt_path),
         "split": used_split,
         "device": str(dev),
@@ -2073,6 +2500,7 @@ def run_eval(
         "n_cells": calibration["n_cells"],
         "calibration": calibration,
         "lag_recovery": lag,
+        "prediction_controls": pred_controls,
         "null_controls": nulls,
         "null_probe": probe,
         "frac_phi": frac_summary,
@@ -2087,7 +2515,7 @@ def run_eval(
     return metrics
 
 
-def _fmt(x: Any) -> str:
+def _fmt(x: Any, spec: str = ".4g") -> str:
     r"""Format a scalar for the markdown report (``n/a`` for ``None``/non-finite)."""
     if x is None:
         return "n/a"
@@ -2097,15 +2525,16 @@ def _fmt(x: Any) -> str:
         return str(x)
     if not np.isfinite(xf):
         return "n/a"
-    return f"{xf:.4g}"
+    return format(xf, spec)
 
 
 def write_report(metrics: Dict[str, Any], out_dir: Path) -> Path:
     r"""Write the minimal Sprint-6 markdown report from ``metrics`` (S6-T04).
 
-    A compact summary of the calibration, lag-recovery, null-control and preservation
-    gates. This is intentionally minimal: Sprint 7 (S7-T05 ``final_report_v2``) supersedes
-    it with the full journal report and figure gallery.
+    A compact summary of the calibration, lag-recovery, prediction-control and preservation
+    gates, plus the KL-space null ratio as a **readout**. This is intentionally minimal:
+    Sprint 7 (S7-T05 ``final_report_v2``) supersedes it with the full journal report and
+    figure gallery.
 
     Args:
         metrics: The dict returned by :func:`run_eval`.
@@ -2119,6 +2548,7 @@ def write_report(metrics: Dict[str, Any], out_dir: Path) -> Path:
     cal = metrics.get("calibration", {})
     lag = metrics.get("lag_recovery", {})
     nul = metrics.get("null_controls", {})
+    pred = metrics.get("prediction_controls", {}) or {}
     probe = metrics.get("null_probe", {})
     frac = metrics.get("frac_phi", {})
 
@@ -2149,13 +2579,44 @@ def write_report(metrics: Dict[str, Any], out_dir: Path) -> Path:
         f"- fraction within +-{lag.get('tolerance')} step: "
         f"{_fmt(lag.get('frac_within_tol'))}",
         "",
-        "## Null controls  (null_ratio = K-bar_null / K-bar_signal -> 0)",
+        "## Prediction controls  (gate: L_feat < L_base < L_feat_corrupted)",
+        "",
+    ]
+    p_over = pred.get("overall") or {}
+    p_ctrls = pred.get("controls") or []
+    if not p_ctrls:
+        lines.append("- n/a (no prediction controls in metrics)")
+    else:
+        lines.append(
+            f"- L_feat = {_fmt(p_over.get('feat_loss'))}, "
+            f"L_base = {_fmt(p_over.get('base_loss'))} (signal cells)")
+        for ctrl in p_ctrls:
+            verdict = p_over.get(f"ordering_pass_{ctrl}")
+            mark = "n/a" if verdict is None else ("pass" if verdict else "FAIL")
+            lines.append(
+                f"- {ctrl}: L_feat_corrupted = {_fmt(p_over.get(f'feat_loss_{ctrl}'))}, "
+                f"penalty = {_fmt(p_over.get(f'shuffle_penalty_{ctrl}'))}, "
+                f"ordering = {mark}")
+        lines.append(
+            f"- signal cells passing: {_fmt(p_over.get('ordering_pass_frac'), '.0%')} "
+            f"of {pred.get('n_signal_cells', '?')}")
+    lines += [
+        "",
+        # The heading is load-bearing (asserted by test_null_run_eval_writes_metrics), but the
+        # caption is not: the ratio is a readout, not a gate. See eval_v2.NULL_RATIO_NOTE.
+        "## Null controls  (readout: K-bar_null / K-bar_signal, expected ~1, NOT ->0)",
         "",
     ]
     for ctrl, res in nul.items():
         lines.append(f"- {ctrl}: mean null_ratio = {_fmt(res.get('mean_ratio'))}")
     lines += [
         f"- null-cell TE_scat (dressing only): {_fmt(probe.get('null_te_scat_mean'))}",
+        "",
+        "> KL(q||p) measures that the source moved the belief, not that it moved it "
+        "correctly; a deranged source is still a source, and is out of distribution for a "
+        "posterior trained on matched pairs. This ratio therefore sits near 1.0 even on a "
+        "model that demonstrably exploits the source (v3 Finding F2). The discriminating "
+        "gate is the prediction control above.",
         "",
         "## Preservation",
         "",

@@ -4,7 +4,7 @@ A default-off, separable Stage-4 classifier that pools the per-timestep
 transfer-entropy representation of a frozen (or lightly fine-tuned) variational
 model into a segment-level outcome prediction. Kept in its own module (it consumes
 only a forward dict, so it imports nothing from the core model) to keep the main
-``vae_teb_lag_attn_v2`` module manageable; the core model imports
+``vae_teb_lag_attn_trfr`` module manageable; the core model imports
 :class:`OutcomeHead` and constructs it only when ``use_outcome_head=True``.
 
 Per section 22, the per-step classification representation is

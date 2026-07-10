@@ -24,12 +24,99 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _MODULE_DIR = Path(__file__).resolve().parent
+
+
+# =============================================================================
+# Report-section registry (S4-T05)
+# =============================================================================
+@dataclass(frozen=True)
+class SectionContext:
+    r"""Everything a report section may read.
+
+    Attributes:
+        config: The parsed config tree.
+        benchmark: Active benchmark key.
+        results_dir: The **per-split** directory the report is being written into.
+        metrics: The split's ``metrics.json``, or ``None`` when it has not been graded.
+        meta: The cache's ``meta.json``, or ``None``.
+        realizability: The model-free ``realizability.json``, or ``None``.
+        split: The split label, or ``None``.
+    """
+
+    config: Dict[str, Any]
+    benchmark: str
+    results_dir: Path
+    metrics: Optional[Dict[str, Any]] = None
+    meta: Optional[Dict[str, Any]] = None
+    realizability: Optional[Dict[str, Any]] = None
+    split: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SectionSpec:
+    r"""One registered report section.
+
+    Attributes:
+        name: Short identifier, used in the ``n/a`` note when the section raises.
+        order: Render order among registered sections (lower renders first).
+        render: ``(SectionContext) -> List[str]`` returning markdown lines.
+    """
+
+    name: str
+    order: int
+    render: Callable[[SectionContext], List[str]] = field(repr=False)
+
+
+_SECTION_REGISTRY: List[SectionSpec] = []
+
+
+def register_section(spec: SectionSpec) -> None:
+    r"""Register an append-only report section, keeping the list sorted by ``spec.order``.
+
+    Sprints 5/6/7 each contribute one section from their own module, so the fixed section
+    order in :func:`_render_markdown` never has to be edited (and three analyses can be built
+    in parallel without touching the same block).
+
+    Args:
+        spec: The section to register.
+
+    Raises:
+        ValueError: When ``spec.name`` is already registered.
+    """
+    if any(s.name == spec.name for s in _SECTION_REGISTRY):
+        raise ValueError(f"report section {spec.name!r} is already registered")
+    _SECTION_REGISTRY.append(spec)
+    _SECTION_REGISTRY.sort(key=lambda s: s.order)
+
+
+def _render_registered_sections(ctx: SectionContext) -> List[str]:
+    r"""Render every registered section, degrading a raising one to an ``n/a`` note.
+
+    A report is a diagnostic artifact: losing the whole thing because one experimental
+    section hit a missing key is a worse failure than printing that one section as ``n/a``.
+
+    Args:
+        ctx: The section context.
+
+    Returns:
+        The concatenated markdown lines of every registered section.
+    """
+    lines: List[str] = []
+    for spec in _SECTION_REGISTRY:
+        try:
+            lines += list(spec.render(ctx))
+        except Exception as exc:  # noqa: BLE001 -- one bad section never loses the report
+            logger.warning("final_report_v2: section %s failed (%s)", spec.name, exc)
+            lines += [f"## {spec.name}", "", f"> ⚠ n/a — section failed: "
+                      f"{type(exc).__name__}: {exc}", ""]
+    return lines
 
 
 def _load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -97,18 +184,44 @@ def _gather_figures(*dirs: Path) -> List[Path]:
     return sorted(seen.values(), key=lambda p: p.name)
 
 
+def tag_root(config: Dict[str, Any], benchmark: str) -> Path:
+    r"""The arm-**independent** run root, ``results/<tag>/`` (S4-T06).
+
+    Resolved absolutely from the config rather than by walking ``.parent`` up from the report's
+    output directory, because that walk has a different depth in each layout:
+
+    ==============================  ========================  ============================
+    layout                          report ``results_dir``    depth to ``results/<tag>/``
+    ==============================  ========================  ============================
+    v1 / v2 (arm-less)              ``<tag>/<split>/``        ``.parent``
+    v3 (arm-scoped)                 ``<tag>/<arm>/<split>/``  ``.parents[1]``
+    ==============================  ========================  ============================
+
+    The split-independent data-generation gallery (``figures/``) and ``realizability.json``
+    live here; the per-arm ``training_curves.html`` does not.
+
+    Args:
+        config: The parsed config tree.
+        benchmark: Active benchmark key, used as the tag fallback.
+
+    Returns:
+        The ``results/<tag>/`` :class:`Path` (not created).
+    """
+    tag = str(config.get("experiment", {}).get("tag", benchmark))
+    results_root = Path(config.get("paths", {}).get("results_dir", "./results"))
+    if not results_root.is_absolute():
+        results_root = _MODULE_DIR / results_root
+    return results_root / tag
+
+
 def _resolve_results_and_cache(
     config: Dict[str, Any], benchmark: str, out_dir: Optional[Path]
 ) -> tuple[Path, Optional[Path]]:
-    r"""Resolve the ``results/<tag>`` dir and the cache dir (for ``meta.json``)."""
-    tag = str(config.get("experiment", {}).get("tag", benchmark))
+    r"""Resolve the report's output dir and the cache dir (for ``meta.json``)."""
     if out_dir is not None:
         results_dir = Path(out_dir)
     else:
-        results_root = Path(config.get("paths", {}).get("results_dir", "./results"))
-        if not results_root.is_absolute():
-            results_root = _MODULE_DIR / results_root
-        results_dir = results_root / tag
+        results_dir = tag_root(config, benchmark)
     cache_dir: Optional[Path] = None
     try:
         from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v2 import (
@@ -180,15 +293,26 @@ def final_report_v2(
     results_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = results_dir / "figures"
 
+    # S4-T06: three distinct anchors, because the arm layout inserts one directory level.
+    #
+    #   tag_root    results/<tag>/            data-story figures/, realizability.json
+    #   run_root    results/<tag>/<arm>/      figures/training_curves.html   (== tag_root when
+    #                                                                         arm-less)
+    #   results_dir results/<tag>/<arm>/<sp>/ this split's figures/
+    #
+    # Resolving the first by ``.parent`` (as this did) silently pointed at the ARM directory
+    # under a v3 config, so a per-split report linked the arm's training curves as if they were
+    # the shared data-generation gallery -- and the shared gallery was never linked at all.
+    root = tag_root(config, benchmark)
+    run_root = results_dir.parent
+
     metrics = _load_json(results_dir / "metrics.json")
     # realizability.json is split-independent (model-free preflight): read it locally, else
-    # from the parent tag root when this is a per-split subfolder.
+    # from the tag root.
     realizability = (_load_json(results_dir / "realizability.json")
-                     or _load_json(results_dir.parent / "realizability.json"))
+                     or _load_json(root / "realizability.json"))
     meta = _load_json(cache_dir / "meta.json") if cache_dir is not None else None
-    # The shared, split-independent figure gallery (raw / scattering / latent story +
-    # training curves) lives at the tag root; link it from a per-split report.
-    shared_figures = results_dir.parent / "figures"
+    shared_figures = root / "figures"
     have_shared = shared_figures.is_dir() and shared_figures != figures_dir
 
     # Render the headline diagnostics figure plus the full aggregate + prediction-gap
@@ -246,7 +370,10 @@ def final_report_v2(
             ("three_te", lambda p: viz.plot_three_te(metrics, p, realizability=realizability)),
             ("lag_profiles", lambda p: viz.plot_lag_profiles(metrics, p)),
             ("kld_vs_time", lambda p: viz.plot_kld_vs_time(metrics, p)),
+            # The discriminating gate (prediction space) and, beside it, the demoted KL-space
+            # ratio under an honest caption -- the negative result is shown, not hidden.
             ("null_controls", lambda p: viz.plot_null_controls(metrics, p)),
+            ("kl_shuffle_readout", lambda p: viz.plot_kl_shuffle_readout(metrics, p)),
         ]
         for name, fn in plot_specs:
             try:
@@ -261,6 +388,7 @@ def final_report_v2(
     lines = _render_markdown(
         config, benchmark, results_dir, metrics, meta, realizability, rep, figures,
         split=split, shared_figures=(shared_figures if have_shared else None),
+        run_root=run_root,
     )
     report_path = results_dir / "report.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -280,13 +408,22 @@ def _render_markdown(
     *,
     split: Optional[str] = None,
     shared_figures: Optional[Path] = None,
+    run_root: Optional[Path] = None,
 ) -> List[str]:
-    r"""Build the report markdown lines from the collated artifacts."""
+    r"""Build the report markdown lines from the collated artifacts.
+
+    Args:
+        run_root: The **arm** run dir (``results/<tag>/<arm>/``, or the tag root when
+            arm-less), where training writes ``figures/training_curves.html``. Defaults to
+            ``results_dir.parent``.
+    """
     tag = str(config.get("experiment", {}).get("tag", benchmark))
+    run_root = run_root if run_root is not None else results_dir.parent
     split_label = split or (metrics or {}).get("split")
     cal = (metrics or {}).get("calibration", {}) or {}
     lag = (metrics or {}).get("lag_recovery", {}) or {}
     nul = (metrics or {}).get("null_controls", {}) or {}
+    pred = (metrics or {}).get("prediction_controls", {}) or {}
     frac = (metrics or {}).get("frac_phi", {}) or {}
 
     title_split = f" — split `{split_label}`" if split_label else ""
@@ -294,6 +431,10 @@ def _render_markdown(
         f"# synthetic_v2 final report — `{tag}`{title_split}",
         "",
         f"- benchmark: `{benchmark}`",
+        # Provenance (S4-T03). Three structurally-identical arms otherwise produce three
+        # indistinguishable reports; the arm and class come from the GRADED checkpoint.
+        f"- arm: `{(metrics or {}).get('arm') or 'n/a'}`   "
+        f"model class: `{(metrics or {}).get('model_class', 'n/a')}`",
         f"- render mode: `{(meta or {}).get('render_mode', (config.get('benchmarks', {}).get(benchmark, {}).get('raw', {}) or {}).get('render_mode', 'am_carrier'))}`",
         f"- checkpoint: `{(metrics or {}).get('ckpt', 'n/a')}`",
         f"- split: `{(metrics or {}).get('split', 'n/a')}`"
@@ -319,9 +460,10 @@ def _render_markdown(
         f"| mean LagMass | {_fmt(lag.get('mean_lag_mass'))} "
         f"(thr {_fmt(lag.get('lag_mass_threshold'))}) |",
     ]
-    for ctrl, res in nul.items():
-        lines.append(f"| null_ratio ({ctrl}) → 0 | {_fmt((res or {}).get('mean_ratio'))} |")
+    lines += _null_cell_rows(cal)
+    lines += _prediction_controls_rows(pred)
     lines.append("")
+    lines += _readouts_section(nul)
 
     # --- per-lag per-sample calibration table (Enhancement C/D) ------------------------
     by_lag = (cal or {}).get("by_lag") or {}
@@ -343,6 +485,16 @@ def _render_markdown(
 
     # --- KLD-summary family vs TE (§14.5) --------------------------------------------------
     lines += _kld_variants_section(cal)
+
+    # --- append-only sections contributed by the analysis modules (S4-T05) -----------------
+    # Each registered section is a pure ``(SectionContext) -> List[str]`` and is rendered
+    # inside its own guard, so a Sprint 5/6/7 analysis can add a section from its own file
+    # and a raising section degrades to an "n/a" note rather than losing the whole report.
+    lines += _render_registered_sections(
+        SectionContext(config=config, benchmark=benchmark, results_dir=results_dir,
+                       metrics=metrics, meta=meta, realizability=realizability,
+                       split=split_label)
+    )
 
     if metrics is None:
         lines += [
@@ -406,7 +558,10 @@ def _render_markdown(
     # The interactive training curve is an HTML (not a PDF/PNG), so ``_gather_figures``
     # never picks it up; link it explicitly at the top of the gallery when present.
     lines += ["## Figure gallery", ""]
-    tc_html = results_dir / "figures" / "training_curves.html"
+    # Training writes the interactive curve into the RUN root's figures dir
+    # (``results/<tag>/<arm>/figures/``), never into a per-split subfolder. Looking for it
+    # under ``results_dir`` -- as this did -- produced a link that was dead in every layout.
+    tc_html = run_root / "figures" / "training_curves.html"
     if tc_html.is_file():
         lines.append(
             f"- [`training_curves.html`]({_rel(tc_html, results_dir)}) "
@@ -429,6 +584,126 @@ def _render_markdown(
         "---",
         "",
         f"_Report assembled by `final_report_v2` for run `{tag}`._",
+        "",
+    ]
+    return lines
+
+
+def _null_cell_rows(cal: Dict[str, Any]) -> List[str]:
+    r"""Headline-gate rows for the null-cell intercept (S4-T02).
+
+    v3 initialises with $K \equiv 0$, so the calibration intercept $\alpha$ is no longer
+    absorbing a random log-variance-head floor. That makes
+    $\bar K \big|_{\mathrm{TE}_{\mathrm{inj}} = 0} \to 0$ a claim the model can be held to --
+    one v1 structurally could not satisfy -- and it is the cleanest single number separating
+    the ``parity`` arm from the v3 arms. The two are rendered adjacently because a calibrated
+    surrogate has $\alpha \approx \bar K \big|_{\mathrm{TE} = 0}$: a large gap between them
+    means the affine fit is being dragged by the signal cells.
+
+    Args:
+        cal: The ``metrics['calibration']`` dict (possibly empty or pre-S4).
+
+    Returns:
+        Markdown table rows to append to the headline-gates table.
+    """
+    knc = (cal or {}).get("kbar_at_null_cells")
+    if not knc:
+        return [r"| $\bar K$ at null cells (TE_inj = 0) | n/a |",
+                f"| $\\alpha_{{\\mathrm{{inj}}}}$ (calibration intercept) "
+                f"| {_fmt((cal or {}).get('alpha_inj'))} |"]
+    verdict = "pass" if knc.get("pass") else "**FAIL**"
+    return [
+        f"| $\\bar K$ at null cells (TE_inj = 0) | {_fmt(knc.get('mean'))} "
+        f"[{_fmt(knc.get('ci_lo'))}, {_fmt(knc.get('ci_hi'))}] nats, {verdict} "
+        f"(thr {_fmt(knc.get('threshold'))}, n={knc.get('n_cells', '?')} cells) |",
+        f"| $\\alpha_{{\\mathrm{{inj}}}}$ (calibration intercept) "
+        f"| {_fmt((cal or {}).get('alpha_inj'))} |",
+    ]
+
+
+def _prediction_controls_rows(pred: Dict[str, Any]) -> List[str]:
+    r"""Headline-gate rows for the prediction-space control (S3-T05).
+
+    Renders, per input-stream corruption, the mean shuffle penalty
+    $\mathcal L_{\mathrm{feat}}^{\pi(U)} - \mathcal L_{\mathrm{feat}}$ over the signal cells
+    and the verdict on the ordering
+    $\mathcal L_{\mathrm{feat}} < \mathcal L_{\mathrm{base}} < \mathcal L_{\mathrm{feat}}^{\pi(U)}$.
+    A pre-S3 ``metrics.json`` has no ``prediction_controls`` block and renders ``n/a`` rather
+    than raising.
+
+    Args:
+        pred: The ``metrics['prediction_controls']`` block (possibly empty).
+
+    Returns:
+        Markdown table rows to append to the headline-gates table.
+    """
+    overall = (pred or {}).get("overall") or {}
+    controls = (pred or {}).get("controls") or []
+    if not controls:
+        return ["| prediction control (feat < base < feat_corrupted) | n/a |"]
+    rows = [
+        f"| $\\mathcal{{L}}_{{\\mathrm{{feat}}}}$ / $\\mathcal{{L}}_{{\\mathrm{{base}}}}$ "
+        f"(signal cells) | {_fmt(overall.get('feat_loss'))} / {_fmt(overall.get('base_loss'))} |",
+    ]
+    for ctrl in controls:
+        verdict = overall.get(f"ordering_pass_{ctrl}")
+        mark = "n/a" if verdict is None else ("pass" if verdict else "**FAIL**")
+        rows.append(
+            f"| ordering gate ({ctrl}): "
+            f"$\\mathcal{{L}}_{{\\mathrm{{feat}}}} < \\mathcal{{L}}_{{\\mathrm{{base}}}} "
+            f"< \\mathcal{{L}}_{{\\mathrm{{feat}}}}^{{\\pi(U)}}$ | {mark} "
+            f"(penalty {_fmt(overall.get(f'shuffle_penalty_{ctrl}'))}) |"
+        )
+    frac = overall.get("ordering_pass_frac")
+    rows.append(
+        f"| signal cells passing the ordering gate | {_fmt(frac, '.0%')} "
+        f"of {(pred or {}).get('n_signal_cells', '?')} |"
+    )
+    return rows
+
+
+def _readouts_section(nul: Dict[str, Any]) -> List[str]:
+    r"""Render the demoted KL-space null ratio in its own table, with an honest caption.
+
+    This used to be a headline gate captioned ``null_ratio -> 0``. It is not a gate:
+    $\mathrm{KL}(q \,\|\, p)$ measures that the source moved the posterior, not that it moved
+    it *correctly*, and a deranged source is out of distribution for a posterior trained on
+    matched pairs -- so it usually moves the belief *more*. v3 measured the ratio in
+    $[1.02, 1.10]$ on a model that was demonstrably exploiting the source (Finding F2).
+
+    Note:
+        The eval-time ``feat_loss_<control>`` corrupts the **input stream**; the training-time
+        ``feat_loss_perm`` deranges the already-encoded ``source_state`` along the batch axis.
+        They are different corruptions, so they are never rendered in the same table.
+
+    Args:
+        nul: The ``metrics['null_controls']`` block (possibly empty).
+
+    Returns:
+        Markdown lines for the ``## Readouts`` section.
+    """
+    lines = [
+        "## Readouts (not gates)",
+        "",
+        "| readout | value |",
+        "|---|---|",
+    ]
+    if not nul:
+        lines += ["| $\\bar K_{\\mathrm{shuffled}} / \\bar K_{\\mathrm{signal}}$ | n/a |", ""]
+        return lines
+    for ctrl, res in nul.items():
+        lines.append(
+            f"| $\\bar K_{{\\mathrm{{{ctrl}}}}} / \\bar K_{{\\mathrm{{signal}}}}$ "
+            f"| {_fmt((res or {}).get('mean_ratio'))} |"
+        )
+    lines += [
+        "",
+        "> The KL-space null ratio is **expected to sit near 1.0**, even on a model that "
+        "demonstrably exploits the source. $\\mathrm{KL}(q\\,\\|\\,p)$ measures that the "
+        "source moved the belief, not that it moved it correctly; a deranged source is still "
+        "a source, and it is out of distribution for a posterior trained on matched pairs "
+        "(v3 Finding F2). The control that discriminates is the prediction-space ordering in "
+        "the headline gates above.",
         "",
     ]
     return lines
@@ -467,6 +742,11 @@ def _kld_variants_section(cal: Dict[str, Any]) -> List[str]:
     by $|\rho_{\mathrm{inj}}|$ so the best-tracking summary is first. Returns an explicit
     "not available" note when the block is absent (older runs).
 
+    A variant stamped ``out_of_support`` (S4-T01: ``kbar_full`` under anchor-aligned KL
+    support) is marked with a dagger and **sorted below every in-support variant**, so the
+    table's first row -- the one a reader takes as "the best surrogate" -- can never be a
+    summary that is partly measuring an untrained region of the sequence.
+
     Args:
         cal: The ``metrics['calibration']`` dict.
 
@@ -491,6 +771,9 @@ def _kld_variants_section(cal: Dict[str, Any]) -> List[str]:
         "|---|---|---|---|---|---|---|",
     ]
 
+    def _oos(item: Any) -> bool:
+        return bool((kv.get(item) or {}).get("out_of_support", False))
+
     def _absrho(item: Any) -> float:
         v = (kv.get(item) or {}).get("spearman_inj")
         try:
@@ -498,14 +781,27 @@ def _kld_variants_section(cal: Dict[str, Any]) -> List[str]:
         except (TypeError, ValueError):
             return -1.0
 
-    for v in sorted(kv, key=_absrho, reverse=True):
+    # In-support variants first (by |rho|), then the flagged ones. An out-of-support summary
+    # with a high correlation is not a better surrogate; it is a measurement of a region the
+    # model was never trained to shape.
+    for v in sorted(kv, key=lambda k: (not _oos(k), _absrho(k)), reverse=True):
         e = kv[v] or {}
+        label = _kld_variant_label(v) + (" †" if _oos(v) else "")
         lines.append(
-            f"| {_kld_variant_label(v)} | {_fmt(e.get('gamma_inj'))} "
+            f"| {label} | {_fmt(e.get('gamma_inj'))} "
             f"| {_fmt(e.get('pearson_inj'), '.2f')} | {_fmt(e.get('spearman_inj'), '.2f')} "
             f"| {_fmt(e.get('gamma_scat'))} | {_fmt(e.get('spearman_scat'), '.2f')} "
             f"| {e.get('n', '?')} |"
         )
+    if any(_oos(v) for v in kv):
+        lines += [
+            "",
+            "> † **Out of support.** This summary averages $K_t$ over steps the model was "
+            "never trained to shape (the warm-up prefix and the untrained final-$H$ tail), "
+            "because this checkpoint uses anchor-aligned KL support (`kld_support: anchor`). "
+            "It is reported as evidence but excluded from best-variant selection; "
+            "`kbar_postwarm` is the exact anchor support and is the correct comparator.",
+        ]
     lines.append("")
     return lines
 
@@ -524,8 +820,26 @@ def _te_raw_by_cell(realizability: Optional[Dict[str, Any]]) -> Dict[Any, Any]:
 
 
 def _rel(path: Path, base: Path) -> str:
-    r"""Best-effort relative path (POSIX) of ``path`` against ``base`` for markdown links."""
+    r"""Relative path (POSIX) of ``path`` against ``base``, for markdown links.
+
+    Uses :func:`os.path.relpath`, not :meth:`Path.relative_to`, because the latter cannot walk
+    upwards: it raises whenever ``path`` is not *under* ``base``, which is exactly the case for
+    the shared data-generation gallery (``results/<tag>/figures/``) linked from a per-split
+    report (``results/<tag>/<arm>/<split>/``). The previous fallback emitted an **absolute
+    filesystem path**, producing a link that broke the moment the report left this machine.
+
+    Falls back to the POSIX absolute path only when the two live on different drives, where no
+    relative path exists.
+
+    Args:
+        path: The link target.
+        base: The directory the markdown file lives in.
+
+    Returns:
+        A POSIX-style relative link (possibly containing ``..``).
+    """
+    import os
     try:
-        return path.relative_to(base).as_posix()
-    except ValueError:
+        return Path(os.path.relpath(path, base)).as_posix()
+    except ValueError:  # different drives on Windows -- no relative path exists
         return path.as_posix()

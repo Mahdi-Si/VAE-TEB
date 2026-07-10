@@ -30,7 +30,7 @@ from loguru import logger
 from hdf5_dataset.hdf5_dataset import create_optimized_dataloader
 # Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (
     LagAttnV1PlotCallback,
 )
@@ -217,9 +217,12 @@ class SeqVaeLagAttnPl(LightningModelBase):
 
         On a spike (non-finite loss, or loss > ``multiplier × EMA``) returns a
         finite zero-valued no-op loss instead of ``loss``. Lightning rejects
-        ``None`` returns under DDP, so we need a real tensor connected to a
-        parameter; ``anchor.sum() * 0.0`` keeps the all-reduce participating
-        while leaving Adam's moments untouched.
+        ``None`` returns under DDP, so we need a real tensor connected to the
+        parameters. The no-op must span *every* trainable parameter, not one
+        anchor: the forward has already armed DDP's reducer, which then expects a
+        gradient hook per parameter and errors on the next iteration if any is
+        missing. Summing all of them keeps the all-reduce participating while
+        leaving Adam's moments untouched.
         """
         loss, metrics = self.compute_loss_and_metrics(batch, batch_idx, stage="train")
 
@@ -285,10 +288,18 @@ class SeqVaeLagAttnPl(LightningModelBase):
                     is_nonfinite,
                     self._spike_skips_total,
                 )
-            # No-op loss built from a parameter (not the possibly-NaN ``loss``)
-            # so backward stays finite and DDP all-reduce participates.
-            anchor = next(p for p in self.parameters() if p.requires_grad)
-            return anchor.sum() * 0.0
+            # No-op loss built from the parameters (not the possibly-NaN ``loss``)
+            # so backward stays finite. It must span EVERY trainable parameter: the
+            # forward above already armed DDP's reducer, which expects one gradient
+            # hook per parameter. A single-parameter anchor leaves the rest unreduced
+            # and the next iteration raises ``Expected to have finished reduction in
+            # the prior iteration`` -- under find_unused_parameters=False AND =True.
+            # ``nan_to_num`` keeps the value finite when a parameter has itself gone NaN.
+            return sum(
+                torch.nan_to_num(p).sum()
+                for p in self.parameters()
+                if p.requires_grad
+            ) * 0.0
 
         return loss
 
@@ -681,7 +692,7 @@ class GraphModelVaeTebLagAttnV1Trainer(GraphModelBase):
 
         self.checkpoint = self.config.get("model_config", {}).get("core_model_checkpoint")
         if self.checkpoint is not None:
-            from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (
+            from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (
                 check_model_class,
             )
 
