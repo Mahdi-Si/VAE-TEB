@@ -41,7 +41,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic_v2 import (  # no
 from model.vae_teb_prediction.model.plotting_callback_lag_attn_v1 import (  # noqa: E402
     LagAttnV1PlotCallback,
 )
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (  # noqa: E402
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (  # noqa: E402
     SeqVaeLagAttnV2,
     check_model_class,
 )

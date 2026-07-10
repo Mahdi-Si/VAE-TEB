@@ -50,7 +50,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import (  # noqa: E402
     SeqVaeLagAttnV1,
 )
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (  # noqa: E402
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (  # noqa: E402
     SeqVaeLagAttnV2,
 )
 
@@ -297,7 +297,7 @@ def test_pipeline_train_eval_v2_dropin(tiny_v2_config, use_v2_alias, force_cpu) 
 def test_checkpoint_guard_rejects_v2_under_v1(tiny_v2_config, use_v2_alias,
                                               force_cpu, monkeypatch) -> None:
     r"""``check_model_class`` refuses a v2 checkpoint when the alias is flipped to v1."""
-    from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import check_model_class
+    from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import check_model_class
 
     result = plm.train_v2(
         tiny_v2_config,

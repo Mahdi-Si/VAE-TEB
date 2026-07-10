@@ -1,3 +1,0 @@
-# Per-run artifacts land here, under results/<benchmark>/<run_tag>/.
-# Checkpoints (*.ckpt/*.pt) are gitignored; CSVs and figures stay tracked.
-# This placeholder keeps the directory tracked.

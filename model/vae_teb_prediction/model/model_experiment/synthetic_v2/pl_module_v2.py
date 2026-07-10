@@ -62,7 +62,7 @@ from loguru import logger  # noqa: E402
 
 # Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn  # noqa: E402
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn  # noqa: E402
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2 as SeqVaeLagAttn  # noqa: E402
 from train.graph_models_utils import load_checkpoint_strict  # noqa: E402
 from train.pl_model_base import LightningModelBase  # noqa: E402
 
@@ -163,6 +163,7 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         detach_baseline_in_full: bool = False,
         lambda_lag: float = 0.0,
         warmup_epochs: int = 0,
+        beta_schedule: Optional[Dict[str, Any]] = None,
         loss_spike_skip: Optional[Dict[str, Any]] = None,
         curriculum: Optional[Dict[str, Any]] = None,
         module_name: Optional[str] = None,
@@ -211,6 +212,7 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
                 "detach_baseline_in_full": detach_baseline_in_full,
                 "lambda_lag": lambda_lag,
                 "warmup_epochs": warmup_epochs,
+                "beta_schedule": beta_schedule,
                 "loss_spike_skip": loss_spike_skip,
                 "curriculum": curriculum,
                 "module_name": module_name,
@@ -224,6 +226,63 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         self._spike_ema_loss: Optional[float] = None
         self._spike_batches_seen: int = 0
         self._spike_skips_total: int = 0
+
+        # CPU generator for the source-permutation control's batch derangement (S3-T01).
+        # Seeded per rank so the shuffles differ across ranks (their data differs); the
+        # *schedule* is rank-invariant, which is what DDP actually requires. Present
+        # unconditionally -- ``perm_kl_from_forward(generator=...)`` dereferences it, and a
+        # v1 model simply never reaches that call.
+        self._perm_generator = torch.Generator()
+        self._perm_generator.manual_seed(1234 + int(getattr(self, "global_rank", 0) or 0))
+        self._perm_lambda_warned: bool = False
+
+    # ------------------------------------------------------------------
+    # Source-permutation control (S3-T01) -- readout only
+    # ------------------------------------------------------------------
+    def _sync_perm_decision(self, do_perm: bool, device: torch.device) -> bool:
+        r"""MIN-reduce ``do_perm`` so no rank runs the control alone.
+
+        Ported from ``trainer_lag_attn_v3._sync_perm_decision``. ``batch_idx`` is already
+        rank-invariant, but a rank whose local batch is degenerate ($B < 2$) cannot be
+        deranged. Reducing with ``MIN`` means one such rank vetoes the control everywhere,
+        so every rank takes the same branch.
+
+        Args:
+            do_perm: This rank's local decision.
+            device: Device to allocate the reduction buffer on.
+
+        Returns:
+            The agreed decision (``do_perm`` verbatim outside a distributed run).
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return do_perm
+        flag = torch.tensor([1.0 if do_perm else 0.0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item() > 0.0)
+
+    def _should_run_perm(self, batch_idx: int, batch_size: int, stage: str) -> bool:
+        r"""Decide whether to evaluate the source-permutation control on this step.
+
+        Ported from ``trainer_lag_attn_v3._should_run_perm``, with the model attribute read
+        through ``getattr`` because the synthetic wrapper also hosts v1 / v2 models that have
+        no ``perm_every_n_batches``. Validation runs the control on every step (under
+        ``no_grad`` it is cheap, and ``val/shuffle_penalty`` is the headline readout);
+        training subsamples it on a rank-invariant ``batch_idx`` schedule.
+
+        Args:
+            batch_idx: Batch index within the epoch (rank-invariant).
+            batch_size: Local batch size; a batch with $B < 2$ cannot be deranged.
+            stage: ``'train'`` / ``'val'`` / ``'test'``.
+
+        Returns:
+            Whether this rank wants to run the control (before the MIN reduction).
+        """
+        if batch_size < 2:
+            return False
+        if stage != "train":
+            return True
+        every = max(int(getattr(self.orig_model, "perm_every_n_batches", 4)), 1)
+        return batch_idx % every == 0
 
     def _apply_curriculum(self, epoch: int) -> Optional[float]:
         r"""Apply the v2 curriculum stage for ``epoch`` and return its $\beta$.
@@ -251,9 +310,63 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         self.hparams["kld_beta"] = beta
         return beta
 
+    def _resolve_beta(self, epoch: int) -> float:
+        r"""Resolve $\beta$ for ``epoch`` from the ``beta_schedule`` hparam.
+
+        Ported from ``trainer_lag_attn_v1._resolve_beta``. Supports two kinds:
+
+        * ``constant`` -- ``value`` if given, else the current ``kld_beta``;
+        * ``linear_warmup`` -- ``start + (end - start) * min(1, epoch / warmup_epochs)``,
+          holding at ``end`` afterwards (``warmup_epochs <= 0`` returns ``end`` immediately).
+
+        When no ``beta_schedule`` is configured this returns the current ``kld_beta`` verbatim,
+        so writing it back is a no-op and the constant-$\beta$ (v1) / curriculum (v2) behaviour
+        is preserved. This is not cosmetic for v3: it starts at $K \equiv 0$ and must *grow*
+        $K$ to earn prediction gain, whereas v1 starts with $K > 0$ from a random log-variance
+        head and $\beta$ pushes it down.
+
+        Args:
+            epoch: The epoch to resolve (``self.current_epoch``).
+
+        Returns:
+            The resolved $\beta$.
+
+        Raises:
+            ValueError: On an unknown ``beta_schedule.kind``.
+        """
+        sched = self.hparams.get("beta_schedule")
+        if not isinstance(sched, dict):
+            return float(self.hparams.get("kld_beta", 0.01))
+        kind = str(sched.get("kind", "constant"))
+        if kind == "constant":
+            value = sched.get("value")
+            if value is not None:
+                return float(value)
+            return float(self.hparams.get("kld_beta", 0.01))
+        if kind == "linear_warmup":
+            start = float(sched.get("start", 1.0e-4))
+            end = float(sched.get("end", 0.1))
+            warmup_epochs = int(sched.get("warmup_epochs", 50))
+            if warmup_epochs <= 0:
+                return end
+            frac = min(1.0, max(0.0, float(epoch) / float(warmup_epochs)))
+            return start + (end - start) * frac
+        raise ValueError(
+            f"Unknown beta_schedule.kind={kind!r}; expected 'constant' or 'linear_warmup'."
+        )
+
     def _on_train_epoch_start_hook(self) -> None:
-        """Apply the curriculum stage at the start of each training epoch."""
+        r"""Resolve the per-epoch $\beta$ at the start of each training epoch.
+
+        Precedence (S2-T01b): the v2 curriculum runs first (a no-op for v1 / v3), then the
+        ``beta_schedule`` is resolved and wins. When ``beta_schedule`` is absent,
+        :meth:`_resolve_beta` returns the current ``kld_beta`` unchanged, so a curriculum's
+        per-stage $\beta$ (v2) or the fixed ``kld_beta`` (v1) survives. Configuring BOTH a
+        curriculum and a ``beta_schedule`` therefore lets the schedule override the curriculum;
+        ``beta_select`` nulls the schedule so its swept $\beta$ is not overwritten (S2-T01b).
+        """
         self._apply_curriculum(self.current_epoch)
+        self.hparams["kld_beta"] = self._resolve_beta(self.current_epoch)
 
     # ------------------------------------------------------------------
     # Loss / metrics
@@ -302,24 +415,42 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             "feat_loss": loss_dict["feat_loss"],
             "base_loss": loss_dict["base_loss"],
             "kld_loss": loss_dict["kld_loss"],
-            # KL in nats/step (the scale of the TE surrogate $\bar K$). v1's
-            # ``kld_loss`` is a per-dim mean, so nats/step $= \mathrm{kld\_loss}
-            # \cdot d_z$. v2's ``kld_loss`` is already summed over heads and latent
-            # dims (nats/step), so it is used directly; v2 is detected by its
-            # decomposed-KL return keys.
+            # KL in nats/step (the scale of the TE surrogate $\bar K$). v1's ``kld_loss`` is
+            # a per-dim mean, so nats/step $= \mathrm{kld} \cdot d_z$. Under v3 with
+            # ``free_bits > 0`` the optimised ``kld_loss`` is the FLOORED ``kld_train``, which
+            # is NOT a TE surrogate; only the raw KL may be read as one (G4). So read
+            # ``kld_raw`` when the model exposes it, else fall back to ``kld_loss`` (they
+            # coincide at ``free_bits = 0``). v2's ``kld_loss`` is already summed over heads
+            # and latent dims (nats/step) and is used directly (detected by its decomposed-KL
+            # return keys).
             "kld_nats": (
                 loss_dict["kld_loss"]
                 if "kld_content_loss" in loss_dict
-                else loss_dict["kld_loss"]
+                else loss_dict.get("kld_raw", loss_dict["kld_loss"])
                 * float(forward_outputs["mu_post"].shape[-1])
             ),
             "pred_gap": pred_gap,
             "mu_prior_sat_frac": forward_outputs["mu_prior_sat_frac"],
             "delta_mu_sat_frac": forward_outputs["delta_mu_sat_frac"],
-            "mean_logvar_full": loss_dict.get("mean_logvar_full"),
-            "mean_logvar_base": loss_dict.get("mean_logvar_base"),
             "kld_beta": float(hp["kld_beta"]),
         }
+
+        # --- v3 diagnostics (S2-T03), key-presence guarded ------------------
+        # kld_raw (TE surrogate) vs kld_train (free-bit-floored optimised KL) so the beta
+        # schedule's effect on the bottleneck is visible; kld_active_frac = fraction of latent
+        # dims with K_j > eps (G4); mean_logvar_{full,base} monitor variance collapse. All are
+        # ``.get``-guarded and, crucially, only added when NOT None -- ``_log_metrics`` cannot
+        # log a None (v1 / mse runs leave the logvar means unset).
+        for _k in ("kld_raw", "kld_train", "kld_active_frac"):
+            _v = loss_dict.get(_k)
+            if _v is None:
+                _v = forward_outputs.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
+        for _k in ("mean_logvar_full", "mean_logvar_base"):
+            _v = loss_dict.get(_k)
+            if _v is not None:
+                metrics[_k] = _v
 
         # --- v2-only diagnostics (S7-T03), key-presence guarded -------------
         # ``delta_l`` is the production ``pred_gap`` under a different name; add
@@ -342,7 +473,113 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
                 metrics["expected_lag_sec_mean"] = (
                     self.orig_model.expected_lag_seconds(_exp_lag).mean()
                 )
+
+        self._add_perm_control_metrics(
+            metrics, forward_outputs, loss_dict, y_st=y_st, y_ph=y_ph,
+            weight=getattr(batch, "weight", None), batch_idx=batch_idx, stage=stage,
+        )
         return total_loss, metrics
+
+    def _add_perm_control_metrics(
+        self,
+        metrics: Dict[str, torch.Tensor],
+        forward_outputs: Dict[str, torch.Tensor],
+        loss_dict: Dict[str, torch.Tensor],
+        *,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        weight: Optional[torch.Tensor],
+        batch_idx: int,
+        stage: str,
+    ) -> None:
+        r"""Add the source-permutation control metrics in place (S3-T01, readout only).
+
+        Deranges ``source_state`` along the batch axis and re-runs only the lag attention +
+        posterior head (``perm_kl_from_forward``) and the source-dependent decoder path
+        (``perm_forward_outputs``), reusing the completed forward's encoder states. Two
+        readouts fall out:
+
+        * $K_{\mathrm{shuffled}} / K_{\mathrm{raw}}$ -- the KL-space ratio. Per v3 Finding F2
+          this sits near $1$ on an honest model and is **not** expected to vanish:
+          $\mathrm{KL}(q \,\|\, p)$ measures "the source moved my belief", not "...correctly".
+        * $\mathcal L_{\mathrm{feat}}^{\pi(U)} - \mathcal L_{\mathrm{feat}}$ -- the
+          prediction-space penalty, which *does* discriminate: a model exploiting the source
+          must forecast worse under a wrong source.
+
+        Everything runs under ``no_grad``. The synthetic pipeline pins ``lambda_perm: 0.0``
+        (a hard non-goal), so the control never enters the objective and never builds an
+        autograd graph; ``total_loss`` is left untouched, which matters because
+        :meth:`training_step` feeds the spike circuit breaker the *returned* loss.
+
+        Naming: this is a ``source_state`` **batch derangement**, logged as ``feat_loss_perm``.
+        The evaluation-time controls in ``eval_v2`` corrupt the **input stream** (``shuffle`` /
+        ``reverse``) and are logged as ``feat_loss_shuffle`` / ``feat_loss_reverse``. They are
+        different corruptions and must never be tabulated as comparable.
+
+        Args:
+            metrics: The metrics dict to extend in place.
+            forward_outputs: The completed forward's outputs.
+            loss_dict: The completed ``compute_loss`` result (supplies ``kld_raw``/``feat_loss``).
+            y_st: Scattering-coefficient FHR target $(B, T, 43)$.
+            y_ph: Phase-harmonic FHR target $(B, T, 44)$.
+            weight: Optional per-sample weight broadcastable to $(B, T)$.
+            batch_idx: Batch index within the epoch.
+            stage: ``'train'`` / ``'val'`` / ``'test'``.
+        """
+        if not hasattr(self.orig_model, "perm_kl_from_forward"):
+            return  # v1 / v2: no perm API, nothing is logged and nothing changes.
+
+        hp = self.hparams
+        lambda_perm = float(getattr(self.orig_model, "lambda_perm", 0.0))
+        if lambda_perm > 0.0 and not self._perm_lambda_warned:
+            self._perm_lambda_warned = True
+            logger.warning(
+                "lambda_perm={} is ignored: the synthetic_v2 wrapper runs the permutation "
+                "control as a no-grad READOUT only (v3 Finding F2). Use "
+                "trainer_lag_attn_v3 to optimise L_perm.",
+                lambda_perm,
+            )
+
+        # ``kld_raw`` is the un-floored KL, i.e. the only term readable as a TE surrogate (G4).
+        kld_raw = loss_dict.get("kld_raw", loss_dict["kld_loss"])
+        keys = ("kld_shuffled", "kld_shuffled_ratio", "feat_loss_perm", "shuffle_penalty")
+
+        do_perm = self._sync_perm_decision(
+            self._should_run_perm(batch_idx, int(y_st.size(0)), stage), y_st.device
+        )
+        if not do_perm:
+            # Zero-fill so the CSV columns stay dense; ``_log_metrics`` cannot log ``None``.
+            zero = torch.zeros_like(kld_raw.detach())
+            for key in keys:
+                metrics[key] = zero
+            return
+
+        with torch.no_grad():
+            perm = self.orig_model.perm_kl_from_forward(
+                forward_outputs, weight=weight, generator=self._perm_generator
+            )
+            permuted = self.orig_model.perm_forward_outputs(
+                forward_outputs, perm_index=perm["perm_index"]
+            )
+            shuffled = self.orig_model.compute_loss(
+                forward_outputs=permuted,
+                y_st=y_st,
+                y_ph=y_ph,
+                weight=weight,
+                compute_kld_loss=False,
+                beta=0.0,
+                lambda_full=float(hp["lambda_full"]),
+                lambda_base=float(hp["lambda_base"]),
+                likelihood=str(hp["likelihood"]),
+                sigma_obs=hp["sigma_obs"],
+                detach_baseline_in_full=bool(hp["detach_baseline_in_full"]),
+            )
+
+        kld_shuffled = perm["kld_shuffled"]
+        metrics["kld_shuffled"] = kld_shuffled
+        metrics["kld_shuffled_ratio"] = kld_shuffled / kld_raw.detach().clamp_min(1e-8)
+        metrics["feat_loss_perm"] = shuffled["feat_loss"]
+        metrics["shuffle_penalty"] = shuffled["feat_loss"] - loss_dict["feat_loss"].detach()
 
     # ------------------------------------------------------------------
     # Spike-skip circuit breaker
@@ -421,10 +658,20 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
                     batch_idx, loss_value, ema_str, is_nonfinite,
                     self._spike_skips_total,
                 )
-            # No-op loss built from a parameter (not the possibly-NaN ``loss``) so
-            # backward stays finite and DDP all-reduce keeps participating.
-            anchor = next(p for p in self.parameters() if p.requires_grad)
-            return anchor.sum() * 0.0
+            # No-op loss built from the parameters (not the possibly-NaN ``loss``) so
+            # backward stays finite. It must touch EVERY trainable parameter: the real
+            # forward above already armed DDP's reducer, which then expects a gradient
+            # hook to fire for each one. A single-parameter anchor leaves the rest
+            # unreduced and the next iteration raises ``Expected to have finished
+            # reduction in the prior iteration`` -- under find_unused_parameters=False
+            # AND =True alike. ``nan_to_num`` keeps the *value* finite when a parameter
+            # has itself gone NaN (its gradient is 0 either way, but a NaN loss would be
+            # logged and monitored).
+            return sum(
+                torch.nan_to_num(p).sum()
+                for p in self.parameters()
+                if p.requires_grad
+            ) * 0.0
 
         return loss
 
@@ -467,6 +714,59 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
 # ============================================================================
 # Builders (ported from synthetic/train_minimal.py + train_ddp.py)
 # ============================================================================
+# Config-driven model-class registry. The committed :data:`SeqVaeLagAttn` toggle alias
+# stays the default (v1 today); the ``synthetic_v3`` ablation ladder selects
+# ``SeqVaeLagAttnV3`` by an optional ``model.class`` string instead of flipping the
+# toggle, so the v1/v2 synthetic paths and ``test_rollback_v1`` are untouched. The v1
+# key is the alias's *runtime* ``__name__`` (never the bare literal), keeping the alias
+# the single source of truth for the default and satisfying the alias-seam guards.
+_KNOWN_MODEL_CLASSES: Tuple[str, ...] = (
+    SeqVaeLagAttn.__name__,
+    "SeqVaeLagAttnV2",
+    "SeqVaeLagAttnV3",
+)
+
+
+def _resolve_model_class(name: Optional[str]) -> type:
+    r"""Resolve a ``model.class`` name to its class, defaulting to the committed alias.
+
+    Resolution is lazy: only the toggle alias is imported at module load; the v2 / v3
+    classes are imported here, on demand, the first time a config selects them. An absent
+    ``name`` returns the alias, so every existing v1 / v2 caller is byte-unchanged.
+
+    Args:
+        name: The ``model.class`` value, or ``None`` to use the committed alias.
+
+    Returns:
+        The resolved model class (an :class:`torch.nn.Module` subclass).
+
+    Raises:
+        ValueError: If ``name`` is a non-empty string outside
+            :data:`_KNOWN_MODEL_CLASSES`.
+    """
+    if name is None:
+        return SeqVaeLagAttn
+    name = str(name)
+    if name == SeqVaeLagAttn.__name__:
+        # Whatever the committed toggle currently points at (v1 today).
+        return SeqVaeLagAttn
+    if name == "SeqVaeLagAttnV3":
+        from model.vae_teb_prediction.model.vae_teb_lag_attn_v3 import (
+            SeqVaeLagAttnV3,
+        )
+
+        return SeqVaeLagAttnV3
+    if name == "SeqVaeLagAttnV2":
+        from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (
+            SeqVaeLagAttnV2,
+        )
+
+        return SeqVaeLagAttnV2
+    raise ValueError(
+        f"unknown model.class {name!r}; known classes: {_KNOWN_MODEL_CLASSES}"
+    )
+
+
 def build_model(
     model_cfg: Dict[str, Any], device: torch.device
 ) -> Tuple[SeqVaeLagAttn, Dict[str, Any]]:
@@ -476,52 +776,137 @@ def build_model(
     conventions make it a version-robust drop-in for the ``SeqVaeLagAttn``
     comment-toggle alias:
 
-    * A nested ``v2`` sub-block holds the v2-only tuning (``use_entmax``, the
+    * An optional ``class`` key selects the constructor from the config-driven
+      :func:`_resolve_model_class` registry (e.g. ``SeqVaeLagAttnV3`` for the
+      ``synthetic_v3`` arms); absent, it falls back to the committed
+      :data:`SeqVaeLagAttn` toggle alias. The resolved class drives **both** the
+      ``inspect.signature`` filter and the construction, so a v3-only kwarg is never
+      dropped just because the toggle still points at v1.
+    * Two nested overlays hold version-specific tuning: ``v2`` (``use_entmax``, the
       source lag-atom scales, the model-owned lag-regularizer weights, the
-      physical-time and optional-feature flags). It is merged over the flat keys
-      **only when the active alias is v2** (detected by the ``source_scales``
-      constructor parameter) and is always stripped before construction, so the
-      shared block stays a clean v1 reproduction when the alias is v1.
-    * Any remaining key the active constructor does not accept is dropped (with a
+      physical-time / optional-feature flags) and ``v3`` (``causal_norm``,
+      ``posterior_logvar``, ``logvar_bound``, ``kld_support``, ...). Each is merged
+      over the flat keys only when the *resolved* class accepts its sentinel
+      parameter (``source_scales`` for v2, ``posterior_logvar`` for v3) and both are
+      always stripped before construction, so the shared block stays a clean v1
+      reproduction under a v1 class.
+    * Any remaining key the resolved constructor does not accept is dropped (with a
       debug log), mirroring the production trainer's ``inspect.signature`` guard,
       so a superset config never raises a bare ``TypeError``.
 
     Args:
-        model_cfg: The ``model`` block (flat v1 kwargs plus an optional nested
-            ``v2`` overlay). ``c_y=87`` / ``c_u=101`` for the v2 features.
+        model_cfg: The ``model`` block (an optional ``class`` key, flat v1 kwargs,
+            plus optional nested ``v2`` / ``v3`` overlays). ``c_y=87`` / ``c_u=101``
+            for the v2 features.
         device: Device to move the model onto.
 
     Returns:
         ``(model, model_kwargs)`` where ``model_kwargs`` is the exact resolved
         (flat, overlay-merged, signature-filtered) constructor kwargs, stored
         verbatim in the checkpoint so downstream phases rebuild the architecture
-        without the config.
+        without the config. The resolved class is recoverable as ``type(model)``.
     """
     kwargs = deepcopy(dict(model_cfg))
-    # Strip the nested v2 overlay (never a constructor arg) and merge it only when
-    # the active alias class is v2. A rebuild from a checkpoint's flat
-    # ``model_kwargs`` carries no ``v2`` key, so this is a no-op there.
+    # Resolve the constructor from the optional ``model.class`` (default: the toggle
+    # alias). ``cls`` drives the signature filter AND the construction -- pointing
+    # ``accepted`` at the alias while constructing a v3 would silently drop every
+    # v3-only kwarg and build v3's defaults, so both must use the same resolved class.
+    cls = _resolve_model_class(kwargs.pop("class", None))
+    accepted = set(inspect.signature(cls.__init__).parameters)
+    # Strip the nested version overlays (never constructor args) and merge each only
+    # when the resolved class accepts its sentinel parameter. A rebuild from a
+    # checkpoint's flat ``model_kwargs`` carries no overlay key, so this is a no-op there.
     v2_overlay = kwargs.pop("v2", None)
-    accepted = set(inspect.signature(SeqVaeLagAttn.__init__).parameters)
+    v3_overlay = kwargs.pop("v3", None)
     if v2_overlay and "source_scales" in accepted:
         kwargs.update(deepcopy(dict(v2_overlay)))
-    # Drop any key the active constructor does not accept (e.g. v2-only keys under
-    # a v1 alias). Keeps the shared config a superset without a TypeError.
+    if v3_overlay and "posterior_logvar" in accepted:
+        kwargs.update(deepcopy(dict(v3_overlay)))
+    # Drop any key the resolved constructor does not accept (e.g. v3-only keys under
+    # a v1 class). Keeps the shared config a superset without a TypeError.
     dropped = [k for k in kwargs if k not in accepted]
     for key in dropped:
         del kwargs[key]
     if dropped:
         logger.debug(
             "[build_model] dropped {} config key(s) not accepted by {}: {}",
-            len(dropped), SeqVaeLagAttn.__name__, dropped,
+            len(dropped), cls.__name__, dropped,
         )
     # YAML gives ``logvar_clamp`` as a list; the constructor expects a tuple.
     clamp = kwargs.get("logvar_clamp")
     if clamp is not None:
         kwargs["logvar_clamp"] = (float(clamp[0]), float(clamp[1]))
-    model = SeqVaeLagAttn(**kwargs)
+    # ``LagCrossAttention`` silently degrades ``use_entmax=True`` to softmax when the
+    # optional ``entmax`` package is missing, while ``model_kwargs`` still records
+    # ``True``. On the ablation ladder that would drop the sparse-attention leg of the
+    # parity -> v3_noncausal contrast and leave the checkpoint's provenance lying about
+    # it. Refuse to build instead.
+    if kwargs.get("use_entmax"):
+        try:
+            import entmax  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise RuntimeError(
+                "model.use_entmax is true but the 'entmax' package is not importable, "
+                "so LagCrossAttention would silently fall back to softmax while the "
+                "checkpoint recorded use_entmax=True. Install it (`pip install entmax`) "
+                "or set use_entmax: false."
+            ) from exc
+    model = cls(**kwargs)
     model.to(device)
     return model, kwargs
+
+
+def resolved_model_class_name(model_cfg: Dict[str, Any]) -> str:
+    r"""The class name a ``model`` block resolves to (via ``model.class`` or the alias).
+
+    Lets a grading path state the class it *expects* from a checkpoint without importing any
+    concrete model class (so the alias-seam guards stay green).
+    """
+    return _resolve_model_class(model_cfg.get("class")).__name__
+
+
+def rebuild_model_from_checkpoint(
+    blob: Dict[str, Any],
+    device: torch.device,
+    *,
+    expected_class: Optional[str] = None,
+) -> Tuple[SeqVaeLagAttn, Dict[str, Any]]:
+    r"""Rebuild a model from a checkpoint blob's OWN class + kwargs (architecture-faithful).
+
+    A checkpoint must always be graded with the architecture it was trained under. The three
+    ``synthetic_v3`` arms share one flat kwarg layout but differ in ``posterior_logvar`` (and,
+    for ``v3_prod``, ``causal_norm``), so rebuilding from ``blob["model_kwargs"]`` -- rather
+    than from the run config -- is what stops arm B's checkpoint being silently graded as arm
+    C. The stored ``model_class`` selects the constructor through the registry, so a v3
+    checkpoint never falls back to the v1 alias (which a bare ``build_model(model_kwargs)``
+    would, since the flat kwargs carry no ``class`` key).
+
+    Args:
+        blob: A deserialised checkpoint dict (carrying ``model_class`` / ``model_kwargs``).
+        device: Device to build the rebuilt model on.
+        expected_class: When given, the class name the caller expects (e.g. the configured
+            ``model.class``). A mismatch raises via
+            :func:`vae_teb_lag_attn_trfr.check_model_class`; a blob with no stored
+            ``model_class`` (a legacy checkpoint) warns and falls back to the committed alias.
+            Absent, no cross-check is made.
+
+    Returns:
+        ``(model, model_kwargs)`` -- the model built on ``device`` and its resolved kwargs.
+
+    Raises:
+        ValueError: When ``expected_class`` is given and the blob's ``model_class`` differs.
+    """
+    from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import check_model_class
+
+    if expected_class is not None:
+        check_model_class(blob, expected_class)
+    rebuild_cfg = dict(blob.get("model_kwargs") or {})
+    stored_class = blob.get("model_class")
+    if stored_class:
+        # Route the checkpoint's own class through the registry (never the flat-kwargs alias
+        # fallback), so an arm trained as v3 rebuilds as v3.
+        rebuild_cfg["class"] = stored_class
+    return build_model(rebuild_cfg, device)
 
 
 def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -562,6 +947,11 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
     free_bits = float(loss_cfg.get("free_bits", 0.0))
     detach_baseline_in_full = bool(loss_cfg.get("detach_baseline_in_full", False))
     lambda_lag = float(loss_cfg.get("lag_smoothness_lambda", 0.0))
+    # Optional per-epoch beta schedule (v3): a ``{kind: constant|linear_warmup, ...}`` dict
+    # resolved by :meth:`SyntheticSeqVaeLagAttnV2Pl._resolve_beta` each epoch. Absent, the
+    # constant ``kld_beta`` above is used (v1 / v2 behaviour unchanged).
+    beta_schedule = loss_cfg.get("beta_schedule")
+    beta_schedule = dict(beta_schedule) if isinstance(beta_schedule, dict) else None
     return {
         "beta": beta,
         "lambda_full": lambda_full,
@@ -571,6 +961,7 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "free_bits": free_bits,
         "detach_baseline_in_full": detach_baseline_in_full,
         "lambda_lag": lambda_lag,
+        "beta_schedule": beta_schedule,
     }
 
 
@@ -642,6 +1033,7 @@ def save_checkpoint_v2(
     loss_settings: Dict[str, Any],
     latent_stats_fitted: bool,
     train_metrics: Optional[Dict[str, float]] = None,
+    arm: Optional[str] = None,
 ) -> None:
     r"""Save a training checkpoint in the v1-compatible format.
 
@@ -662,6 +1054,9 @@ def save_checkpoint_v2(
         latent_stats_fitted: Whether :meth:`fit_latent_stats` ran (exact buffers)
             vs. the noisy EMA buffers.
         train_metrics: Optional last-epoch training metrics.
+        arm: The resolved ``synthetic_v3`` arm name (``parity`` / ``v3_noncausal`` /
+            ``v3_prod``), or ``None`` for the arm-less v1 / v2 path. Recorded in the
+            blob so any figure traces back to the exact arm that produced it.
     """
     # Persist the CURRENT runtime curriculum state. active_lags / enable_* are
     # constructor params but are mutated in place per-epoch by the curriculum and
@@ -675,6 +1070,7 @@ def save_checkpoint_v2(
 
     ckpt = {
         "model_class": type(model).__name__,
+        "arm": arm,
         "model_state_dict": model.state_dict(),
         "model_kwargs": model_kwargs,
         "config": config,
@@ -706,6 +1102,18 @@ def _results_dir(config: Dict[str, Any], benchmark: str) -> Path:
     return results_dir / tag
 
 
+def _run_dir(config: Dict[str, Any], benchmark: str,
+             arm: Optional[str] = None) -> Path:
+    r"""Resolve the per-run output root ``results/<tag>/<arm>/`` (matches ``run_pipeline_v2``).
+
+    Arm-scopes the checkpoint / log / figure write sites so the three ``synthetic_v3`` arms
+    coexist under one ``experiment.tag``. ``arm=None`` reproduces :func:`_results_dir`
+    exactly (the v1 / v2 single-arm path).
+    """
+    base = _results_dir(config, benchmark)
+    return base / str(arm) if arm else base
+
+
 def _callback_metrics_to_floats(trainer: pl.Trainer) -> Dict[str, float]:
     r"""Extract the trainer's ``callback_metrics`` as a plain ``{name: float}`` dict."""
     out: Dict[str, float] = {}
@@ -715,6 +1123,56 @@ def _callback_metrics_to_floats(trainer: pl.Trainer) -> Dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _select_ddp_strategy(
+    num_devices: int,
+    likelihood: str,
+    sigma_obs: Any,
+    curriculum_enabled: bool = False,
+    *,
+    head_structured_latent: bool = False,
+    freeze_unused_attn_proj: bool = False,
+) -> str:
+    r"""Resolve the DDP strategy string for a v3 run (ported from ``trainer_lag_attn_v3``).
+
+    Returns plain ``'ddp'`` (``find_unused_parameters=False``) only when EVERY parameter is
+    guaranteed a gradient every step, so the reducer never waits on a variable that is not
+    marked ready. Two starvation sources are accounted for:
+
+    * the decoder log-variance heads are dead unless the objective consumes them
+      (``gaussian_nll`` + ``sigma_obs='learned'``);
+    * ``head_structured_latent`` starves ``lag_attn.W_o`` unless it is frozen
+      (``freeze_unused_attn_proj``), in which case it carries no grad by design.
+
+    A curriculum (which switches branches on/off per epoch) always needs
+    ``find_unused_parameters``. Single-device runs return ``'auto'``.
+
+    Args:
+        num_devices: Number of training devices.
+        likelihood: The reconstruction likelihood (``'mse'`` / ``'gaussian_nll'``).
+        sigma_obs: The observation-noise setting (a float, or the literal ``'learned'``).
+        curriculum_enabled: Whether the v2 curriculum is active.
+        head_structured_latent: Whether the latent is head-structured.
+        freeze_unused_attn_proj: Whether ``lag_attn.W_o`` is frozen.
+
+    Returns:
+        ``'auto'`` (single device), ``'ddp'`` (full grad coverage), or
+        ``'ddp_find_unused_parameters_true'``.
+    """
+    if num_devices <= 1:
+        return "auto"
+    if curriculum_enabled:
+        return "ddp_find_unused_parameters_true"
+    logvar_heads_consumed = (
+        likelihood == "gaussian_nll"
+        and isinstance(sigma_obs, str)
+        and sigma_obs == "learned"
+    )
+    attn_proj_starved = bool(head_structured_latent) and not bool(freeze_unused_attn_proj)
+    if logvar_heads_consumed and not attn_proj_starved:
+        return "ddp"
+    return "ddp_find_unused_parameters_true"
 
 
 def _build_trainer_v2(
@@ -875,6 +1333,10 @@ def train_v2(
     """
     overrides = dict(overrides or {})
     benchmark = str(benchmark or config.get("experiment", {}).get("benchmark", "G1_raw"))
+    # The resolved arm name (``None`` for the v1 / v2 single-arm path). Carried through
+    # ``overrides`` by the driver so a DDP re-exec keeps the same arm; used to arm-scope
+    # the run dir and to stamp the checkpoint provenance.
+    arm = overrides.get("arm")
 
     seed = int(
         config.get("seeds", {}).get(
@@ -898,23 +1360,75 @@ def train_v2(
     # Model on CPU first (Lightning assigns devices inside ``fit``).
     model, model_kwargs = build_model(config["model"], torch.device("cpu"))
 
+    # Re-seed AFTER model construction (S2-T06). The three arms are structurally different
+    # (``parity`` has an independent log-variance head and no ALiBi lag bias, so it draws a
+    # different number of RNG samples while initialising), which would leave the global RNG in
+    # a different state per arm and hence give each arm a DIFFERENT DataLoader shuffle order.
+    # Section 7 promises all arms share one cache order, so that a gamma difference is
+    # attributable to the model alone. The weights are already drawn; this pins only the data
+    # order (and the workers' seeds).
+    pl.seed_everything(seed, workers=True)
+
+    # Resolve the DDP strategy when the config defers (``strategy`` absent or ``auto``): a v3
+    # run with learned-variance NLL + head-structured latent + frozen attn proj has full grad
+    # coverage, so it resolves to plain ``'ddp'`` rather than paying for
+    # ``find_unused_parameters`` every step. An explicit ``ddp.strategy`` still wins (S2-T04).
+    if str(ddp_cfg.get("strategy", "auto")) in ("", "auto", "None"):
+        curriculum_cfg = overrides.get("curriculum", config.get("curriculum")) or {}
+        ddp_cfg = {**ddp_cfg, "strategy": _select_ddp_strategy(
+            n_gpus,
+            loss_settings["likelihood"],
+            loss_settings["sigma_obs"],
+            curriculum_enabled=bool(curriculum_cfg.get("enabled", False)),
+            head_structured_latent=bool(model_kwargs.get("head_structured_latent", False)),
+            freeze_unused_attn_proj=bool(model_kwargs.get("freeze_unused_attn_proj", False)),
+        )}
+
+    # Startup provenance: the headline runbook's first watch-signal is that this reads
+    # ``DDP strategy: ddp`` and not ``ddp_find_unused_parameters_true``. ``n_gpus <= 1``
+    # forces ``'auto'`` in ``_build_trainer_v2``, so log the *effective* value.
+    logger.info(
+        "[train_v2] devices={} | n_gpus={} | DDP strategy: {}",
+        devices, n_gpus, str(ddp_cfg["strategy"]) if n_gpus > 1 else "auto",
+    )
+
     resume = overrides.get("resume_ckpt")
     if resume:
-        from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (
+        from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (
             check_model_class,
         )
 
         logger.info("[train_v2] warm-starting from {}", resume)
-        # Guard the model class BEFORE the strict load so a v1<->v2 mismatch fails
-        # with an actionable message instead of a cryptic state_dict key error.
+        # Guard the model class BEFORE the strict load so a class mismatch fails with an
+        # actionable message instead of a cryptic state_dict key error. Validate against the
+        # class actually being trained (``type(model)``), not the committed alias, so a v3 arm
+        # accepts a v3 warm-start while still rejecting a foreign-class checkpoint.
         blob = torch.load(str(resume), map_location="cpu", weights_only=False)
-        check_model_class(blob, SeqVaeLagAttn.__name__)
+        check_model_class(blob, type(model).__name__)
         if load_checkpoint_strict(model, blob) is None:
             raise RuntimeError(
                 f"could not align resume checkpoint {resume!r} into "
-                f"{SeqVaeLagAttn.__name__} (no matching module keys); refusing "
+                f"{type(model).__name__} (no matching module keys); refusing "
                 f"to silently train from random initial weights."
             )
+
+    # Beta schedule: the headline run uses ``loss.beta_schedule``; a ``--pilot`` run swaps in
+    # ``train.pilot_beta_schedule`` (a short warm-up) so the zero-KL bottleneck can open inside
+    # the few-epoch pilot budget -- a 20-epoch warm-up would keep beta pinned near ``start`` the
+    # whole pilot and the S2-T05 bottleneck-health gate could never fire (S2-T05).
+    beta_schedule = loss_settings.get("beta_schedule")
+    if overrides.get("pilot"):
+        pilot_sched = (config.get("train") or {}).get("pilot_beta_schedule")
+        if isinstance(pilot_sched, dict):
+            beta_schedule = dict(pilot_sched)
+    # An explicit top-level ``beta_schedule`` override wins over both (``beta_select`` forces
+    # it to ``None`` so its swept fixed beta is not overwritten each epoch -- S2-T01b).
+    if "beta_schedule" in overrides:
+        beta_schedule = overrides["beta_schedule"]
+    # Record the schedule that was ACTUALLY used (the pilot swap / beta_select null included)
+    # in the checkpoint's loss_settings, so a run's provenance never claims the headline ramp
+    # when a short pilot ramp produced the weights.
+    loss_settings = {**loss_settings, "beta_schedule": beta_schedule}
 
     pl_model = SyntheticSeqVaeLagAttnV2Pl(
         model,
@@ -931,6 +1445,7 @@ def train_v2(
         detach_baseline_in_full=loss_settings["detach_baseline_in_full"],
         lambda_lag=loss_settings["lambda_lag"],
         warmup_epochs=int(ddp_cfg["warmup_epochs"]) if do_scale else 0,
+        beta_schedule=beta_schedule,
         loss_spike_skip=config.get("loss_spike_skip"),
         # Overrides win over config so callers (e.g. beta_select) can disable the
         # curriculum for a fixed-beta run without mutating the shared config.
@@ -943,7 +1458,7 @@ def train_v2(
     has_val = dm.val_dataloader() is not None
 
     epochs = int(overrides.get("epochs", optim_cfg["epochs"]))
-    results_dir = _results_dir(config, benchmark)
+    results_dir = _run_dir(config, benchmark, arm)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     trainer = _build_trainer_v2(
@@ -1016,6 +1531,7 @@ def train_v2(
             loss_settings=loss_settings,
             latent_stats_fitted=n_stats > 0,
             train_metrics=final_metrics,
+            arm=arm,
         )
         best_path = results_dir / "best.ckpt"
         _export_best(
@@ -1031,6 +1547,7 @@ def train_v2(
             loss_settings=loss_settings,
             latent_stats_fitted=n_stats > 0,
             has_val=has_val,
+            arm=arm,
         )
         result["checkpoint"] = final_path
         result["best"] = best_path
@@ -1050,8 +1567,9 @@ def _export_best(
     epoch: int,
     val_loss: float,
     loss_settings: Dict[str, Any],
-    latent_stats_fitted: bool,
     has_val: bool,
+    latent_stats_fitted: bool,
+    arm: Optional[str] = None,
 ) -> None:
     r"""Write ``best.ckpt`` from the Lightning best snapshot, else from the final model.
 
@@ -1074,7 +1592,7 @@ def _export_best(
             save_checkpoint_v2(
                 best_path, model=fresh, model_kwargs=model_kwargs, config=config,
                 data_meta=data_meta, epoch=epoch, val_loss=val_loss,
-                loss_settings=loss_settings, latent_stats_fitted=False,
+                loss_settings=loss_settings, latent_stats_fitted=False, arm=arm,
             )
             return
         except Exception as exc:  # pragma: no cover - defensive fallback
@@ -1086,7 +1604,7 @@ def _export_best(
     save_checkpoint_v2(
         best_path, model=fallback_model, model_kwargs=model_kwargs, config=config,
         data_meta=data_meta, epoch=epoch, val_loss=val_loss,
-        loss_settings=loss_settings, latent_stats_fitted=latent_stats_fitted,
+        loss_settings=loss_settings, latent_stats_fitted=latent_stats_fitted, arm=arm,
     )
 
 
@@ -1122,6 +1640,7 @@ def beta_select(
     """
     overrides = dict(overrides or {})
     benchmark = str(benchmark or config.get("experiment", {}).get("benchmark", "G1_raw"))
+    arm = overrides.get("arm")  # arm-scope the sweep output; forwarded to each train_v2 run
     bs_cfg = dict(config.get("beta_select") or {})
     enabled = bool(bs_cfg.get("enabled", False)) or bool(overrides.pop("force", False))
 
@@ -1148,11 +1667,14 @@ def beta_select(
         run_over = {
             **overrides,
             "epochs": epochs,
-            "loss": {**(overrides.get("loss") or {}), "kld_beta": beta},
-            # The sweep needs the swept beta to stick; the per-epoch curriculum
-            # hook would otherwise overwrite kld_beta every epoch, so disable it
-            # for these fixed-beta calibration runs.
+            "loss": {**(overrides.get("loss") or {}), "kld_beta": beta,
+                     "beta_schedule": None},
+            # The sweep needs the swept beta to stick; BOTH the per-epoch curriculum hook and
+            # the beta_schedule would otherwise overwrite kld_beta every epoch, so disable the
+            # curriculum AND force the schedule off (the top-level override wins over the pilot
+            # schedule too) for these fixed-beta calibration runs (S2-T01b).
             "curriculum": {"enabled": False},
+            "beta_schedule": None,
             "skip_checkpoint": True,
             "progress_bar": overrides.get("progress_bar", False),
         }
@@ -1180,7 +1702,7 @@ def beta_select(
         max(finite, key=lambda r: r["kld_nats"])["beta"] if finite else fixed_beta
     )
 
-    out_path = _results_dir(config, benchmark) / "beta_select.json"
+    out_path = _run_dir(config, benchmark, arm) / "beta_select.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as handle:
         json.dump(

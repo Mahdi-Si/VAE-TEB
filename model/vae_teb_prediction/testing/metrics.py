@@ -1690,3 +1690,403 @@ def compute_trajectory_features(
             features[k] = float("nan")
 
     return features
+
+
+# =============================================================================
+# Calibration metrics (G10)
+# =============================================================================
+#
+# These kernels judge the *predictive distribution* the decoder emits under
+# ``sigma_obs='learned'``, not merely its mean. They all slice the anchor axis with
+# ``_feature_valid_slice``, so they cover exactly the anchors ``[warmup, T - H_d)`` that
+# ``compute_forecast_metrics`` and the training loss use, and are therefore directly
+# comparable to both.
+#
+# Caveat worth stating loudly: on a checkpoint trained with a *fixed* ``sigma_obs`` the
+# decoder's ``logvar_full`` head receives no gradient, so these numbers describe an untrained
+# head. The model does not record which likelihood it was trained under, so callers cannot
+# detect that case automatically -- always report ``fit_constant_sigma`` alongside as the
+# homoscedastic reference.
+
+#: 0.5 * log(2*pi). The training NLL omits this constant; a proper scoring rule needs it.
+_HALF_LOG_2PI = 0.9189385332046727
+
+#: 1 / sqrt(pi), the closed-form Gaussian CRPS constant.
+_INV_SQRT_PI = 0.5641895835477563
+
+
+def _standard_normal_cdf(z: Tensor) -> Tensor:
+    r"""Standard-normal CDF :math:`\Phi(z) = \tfrac12\left[1 + \mathrm{erf}(z/\sqrt2)\right]`."""
+    return 0.5 * (1.0 + torch.erf(z * 0.7071067811865476))
+
+
+def _standard_normal_pdf(z: Tensor) -> Tensor:
+    r"""Standard-normal PDF :math:`\varphi(z) = e^{-z^2/2}/\sqrt{2\pi}`."""
+    return torch.exp(-0.5 * z * z) * 0.3989422804014327
+
+
+def _valid_triplet(
+    mu_full: Tensor,
+    logvar_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    r"""Slice ``(mu, sigma, y)`` down to the supervised anchor range.
+
+    ``mu_full`` / ``logvar_full`` run over all ``T`` anchors while ``y_plus`` has only
+    ``T - H_d`` of them; both are cut to ``[warmup, T - H_d)``.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        logvar_full: Forecast observation log-variance ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+
+    Returns:
+        ``(mu, sigma, y)``, each ``(B, T_v, H_d, C)``, with
+        :math:`\sigma = \exp(\tfrac12 \log\sigma^2)`.
+    """
+    T = int(mu_full.shape[1])
+    start, end = _feature_valid_slice(warmup, horizon, T)
+    mu = mu_full[:, start:end]
+    logvar = logvar_full[:, start:end]
+    y = y_plus[:, start:end]
+    return mu, torch.exp(0.5 * logvar), y
+
+
+def _split_channel_blocks(per_elem: Tensor) -> Dict[str, Tensor]:
+    """Reduce an elementwise score to total / per-horizon / scattering / phase summaries.
+
+    The channel split index 43 is hardcoded, matching ``compute_forecast_metrics``: the model
+    concatenates ``fhr_st`` (43 channels) followed by ``fhr_ph`` (44).
+    """
+    B, _, _, C = per_elem.shape
+    c_st = min(43, int(C))
+    zeros = torch.zeros(B, device=per_elem.device, dtype=per_elem.dtype)
+    return {
+        "total": per_elem.mean(dim=(1, 2, 3)),
+        "per_horizon": per_elem.mean(dim=(1, 3)),
+        "st": per_elem[..., :c_st].mean(dim=(1, 2, 3)) if c_st > 0 else zeros,
+        "ph": per_elem[..., c_st:].mean(dim=(1, 2, 3)) if c_st < int(C) else zeros.clone(),
+    }
+
+
+def _empty_score(B: int, horizon: int, prefix: str, ref: Tensor) -> Dict[str, Tensor]:
+    """Zero-filled result for a degenerate (empty) anchor range."""
+    zeros = torch.zeros(B, device=ref.device, dtype=ref.dtype)
+    return {
+        f"{prefix}_total": zeros,
+        f"{prefix}_per_horizon": torch.zeros(B, int(horizon), device=ref.device, dtype=ref.dtype),
+        f"{prefix}_st": zeros.clone(),
+        f"{prefix}_ph": zeros.clone(),
+    }
+
+
+def compute_nll(
+    mu_full: Tensor,
+    logvar_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+    *,
+    include_const: bool = True,
+) -> Dict[str, Tensor]:
+    r"""Per-sample Gaussian negative log-likelihood of the future target, in nats.
+
+    .. math::
+
+        -\log p(y \mid \mu, \sigma) = \tfrac12 \log(2\pi) + \log\sigma
+        + \frac{(y-\mu)^2}{2\sigma^2}
+
+    Note:
+        The **training** loss (``SeqVaeLagAttnV1.compute_loss``) omits the
+        :math:`\tfrac12\log 2\pi` constant. Pass ``include_const=False`` to reproduce it
+        exactly; the default includes it so the value is a proper scoring rule. The two differ
+        by :math:`0.9189385` nats per element.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        logvar_full: Forecast observation log-variance ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+        include_const: Whether to add :math:`\tfrac12\log 2\pi`.
+
+    Returns:
+        ``nll_total`` ``(B,)``, ``nll_per_horizon`` ``(B, H_d)``, and ``nll_st`` / ``nll_ph``
+        ``(B,)`` for the scattering and phase channel blocks. Lower is better.
+    """
+    mu, sigma, y = _valid_triplet(mu_full, logvar_full, y_plus, warmup, horizon)
+    if mu.shape[1] == 0:
+        return _empty_score(mu.shape[0], horizon, "nll", mu)
+
+    z = (y - mu) / sigma
+    per_elem = 0.5 * z.pow(2) + torch.log(sigma)
+    if include_const:
+        per_elem = per_elem + _HALF_LOG_2PI
+    return {f"nll_{k}": v for k, v in _split_channel_blocks(per_elem).items()}
+
+
+def crps_gaussian(mu: Tensor, sigma: Tensor, y: Tensor) -> Tensor:
+    r"""Closed-form CRPS of a Gaussian predictive distribution, elementwise.
+
+    .. math::
+
+        \mathrm{CRPS}\big(\mathcal{N}(\mu,\sigma^2), y\big)
+        = \sigma\left[z\big(2\Phi(z) - 1\big) + 2\varphi(z) - \frac{1}{\sqrt{\pi}}\right],
+        \qquad z = \frac{y - \mu}{\sigma}
+
+    At :math:`y = \mu` this reduces to :math:`\sigma(\sqrt{2}-1)/\sqrt{\pi}
+    \approx 0.2337\,\sigma`.
+
+    Args:
+        mu: Predictive mean.
+        sigma: Predictive standard deviation (strictly positive).
+        y: Observation.
+
+    Returns:
+        Elementwise CRPS with the same shape as the inputs. Lower is better.
+    """
+    z = (y - mu) / sigma
+    return sigma * (
+        z * (2.0 * _standard_normal_cdf(z) - 1.0)
+        + 2.0 * _standard_normal_pdf(z)
+        - _INV_SQRT_PI
+    )
+
+
+def crps_sample(samples: Tensor, y: Tensor) -> Tensor:
+    r"""Sample-based CRPS estimator, for predictive distributions with no closed form.
+
+    .. math::
+
+        \mathrm{CRPS} = \mathbb{E}\lvert X - y\rvert
+        - \tfrac12 \mathbb{E}\lvert X - X'\rvert
+
+    with :math:`X, X'` independent draws from the predictive distribution. The spread term is
+    the unbiased Gini mean difference, evaluated through its sorted-order identity
+
+    .. math::
+
+        \mathbb{E}\lvert X - X'\rvert
+        = \frac{2}{n(n-1)} \sum_{i=1}^{n} \bigl(2i - n - 1\bigr)\, x_{(i)},
+
+    so the estimator costs :math:`O(n \log n)` time and :math:`O(n)` memory rather than
+    materialising the :math:`n \times n` pairwise-difference tensor.
+
+    Args:
+        samples: Draws ``(n, ...)`` with the sample axis first.
+        y: Observation, broadcastable to ``samples[0]``.
+
+    Returns:
+        CRPS with the sample axis reduced.
+
+    Raises:
+        ValueError: If fewer than two draws are supplied.
+    """
+    n = int(samples.shape[0])
+    if n < 2:
+        raise ValueError(f"crps_sample needs at least 2 draws, got {n}")
+
+    term_obs = (samples - y.unsqueeze(0)).abs().mean(dim=0)
+    ordered, _ = torch.sort(samples, dim=0)
+    rank = torch.arange(1, n + 1, device=samples.device, dtype=samples.dtype)
+    coeff = (2.0 * rank - n - 1).reshape(-1, *([1] * (samples.dim() - 1)))
+    gini = (coeff * ordered).sum(dim=0) * (2.0 / (n * (n - 1)))
+    return term_obs - 0.5 * gini
+
+
+def compute_crps(
+    mu_full: Tensor,
+    logvar_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Dict[str, Tensor]:
+    r"""Per-sample continuous ranked probability score over the supervised anchors.
+
+    CRPS rewards a forecast for being accurate *and* appropriately sharp. Unlike NLL it stays
+    finite when an observation lands far in the tail, so one outlier cannot dominate the
+    report.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        logvar_full: Forecast observation log-variance ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+
+    Returns:
+        ``crps_total`` ``(B,)``, ``crps_per_horizon`` ``(B, H_d)``, ``crps_st`` / ``crps_ph``
+        ``(B,)``. Lower is better, and the score is in the target's units.
+    """
+    mu, sigma, y = _valid_triplet(mu_full, logvar_full, y_plus, warmup, horizon)
+    if mu.shape[1] == 0:
+        return _empty_score(mu.shape[0], horizon, "crps", mu)
+
+    per_elem = crps_gaussian(mu, sigma, y)
+    return {f"crps_{k}": v for k, v in _split_channel_blocks(per_elem).items()}
+
+
+def compute_interval_coverage(
+    mu_full: Tensor,
+    logvar_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+    *,
+    levels: Sequence[float] = (0.5, 0.8, 0.9, 0.95),
+) -> Dict[str, Tensor]:
+    r"""Empirical coverage of central prediction intervals, per sample and per level.
+
+    For nominal level :math:`p` the interval is
+    :math:`\mu \pm \Phi^{-1}\!\left(\tfrac{1+p}{2}\right)\sigma`. A calibrated forecaster
+    covers the truth a fraction :math:`p` of the time. Systematic under-coverage means the
+    learned :math:`\sigma` is too small -- the over-confidence that a variance-collapsed model
+    hides from MSE entirely.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        logvar_full: Forecast observation log-variance ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+        levels: Nominal central-interval levels, each strictly inside ``(0, 1)``.
+
+    Returns:
+        ``coverage`` ``(B, n_levels)``; ``nominal`` ``(n_levels,)``; ``sharpness`` ``(B,)``,
+        the mean predictive :math:`\sigma` in the target's units; and
+        ``sharpness_per_horizon`` ``(B, H_d)``.
+
+    Raises:
+        ValueError: If any level lies outside ``(0, 1)``.
+    """
+    if any(not (0.0 < float(p) < 1.0) for p in levels):
+        raise ValueError(f"levels must lie strictly inside (0, 1), got {tuple(levels)}")
+
+    mu, sigma, y = _valid_triplet(mu_full, logvar_full, y_plus, warmup, horizon)
+    B = int(mu.shape[0])
+    nominal = torch.tensor([float(p) for p in levels], device=mu.device, dtype=mu.dtype)
+    if mu.shape[1] == 0:
+        return {
+            "coverage": torch.zeros(B, len(levels), device=mu.device, dtype=mu.dtype),
+            "nominal": nominal,
+            "sharpness": torch.zeros(B, device=mu.device, dtype=mu.dtype),
+            "sharpness_per_horizon": torch.zeros(
+                B, int(horizon), device=mu.device, dtype=mu.dtype
+            ),
+        }
+
+    abs_z = ((y - mu) / sigma).abs()
+    # Inverse standard-normal CDF at (1+p)/2, via erfinv.
+    z_crit = 1.4142135623730951 * torch.erfinv(nominal)
+    inside = abs_z.unsqueeze(-1) <= z_crit.view(1, 1, 1, 1, -1)
+    return {
+        "coverage": inside.to(mu.dtype).mean(dim=(1, 2, 3)),
+        "nominal": nominal,
+        "sharpness": sigma.mean(dim=(1, 2, 3)),
+        "sharpness_per_horizon": sigma.mean(dim=(1, 3)),
+    }
+
+
+def compute_reliability_by_horizon(
+    mu_full: Tensor,
+    logvar_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+    *,
+    n_bins: int = 20,
+) -> Dict[str, Tensor]:
+    r"""Probability-integral-transform reliability curves, resolved by horizon step.
+
+    The PIT of a Gaussian forecast is :math:`u = \Phi\!\left((y-\mu)/\sigma\right)`. If the
+    forecast is calibrated then :math:`u \sim \mathrm{Uniform}(0,1)`, so the empirical CDF of
+    :math:`u` traces the diagonal. The shape of any deviation is diagnostic: an S-curve means
+    the variance is misspecified, a shifted curve means the mean is biased.
+
+    Pooled over batch, anchors and channels, but kept separate per horizon step, because
+    calibration typically degrades with lead time.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        logvar_full: Forecast observation log-variance ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+        n_bins: Number of quantile levels at which to evaluate the empirical CDF.
+
+    Returns:
+        ``nominal`` ``(n_bins,)`` -- the quantile levels;
+        ``empirical`` ``(H_d, n_bins)`` -- observed fraction of PIT values at or below each
+        level, per horizon step;
+        ``empirical_pooled`` ``(n_bins,)`` -- the same, pooled over horizons;
+        ``pit_mean`` / ``pit_var`` ``(H_d,)`` -- :math:`1/2` and :math:`1/12` when calibrated;
+        ``ks_stat`` ``(H_d,)`` -- Kolmogorov-Smirnov distance from uniform.
+    """
+    mu, sigma, y = _valid_triplet(mu_full, logvar_full, y_plus, warmup, horizon)
+    device, dtype = mu.device, mu.dtype
+    H_d = int(mu.shape[2]) if mu.shape[1] > 0 else int(horizon)
+    nominal = torch.linspace(0.0, 1.0, int(n_bins) + 1, device=device, dtype=dtype)[1:]
+
+    if mu.shape[1] == 0:
+        nan_h = torch.full((H_d,), float("nan"), device=device, dtype=dtype)
+        return {
+            "nominal": nominal,
+            "empirical": torch.full((H_d, int(n_bins)), float("nan"), device=device, dtype=dtype),
+            "empirical_pooled": torch.full(
+                (int(n_bins),), float("nan"), device=device, dtype=dtype
+            ),
+            "pit_mean": nan_h,
+            "pit_var": nan_h.clone(),
+            "ks_stat": nan_h.clone(),
+        }
+
+    pit = _standard_normal_cdf((y - mu) / sigma)          # (B, T_v, H_d, C)
+    pit_by_h = pit.permute(2, 0, 1, 3).reshape(H_d, -1)   # (H_d, N)
+
+    empirical = (pit_by_h.unsqueeze(-1) <= nominal.view(1, 1, -1)).to(dtype).mean(dim=1)
+    pooled = (pit_by_h.reshape(-1, 1) <= nominal.view(1, -1)).to(dtype).mean(dim=0)
+
+    return {
+        "nominal": nominal,
+        "empirical": empirical,
+        "empirical_pooled": pooled,
+        "pit_mean": pit_by_h.mean(dim=1),
+        "pit_var": pit_by_h.var(dim=1, unbiased=False),
+        "ks_stat": (empirical - nominal.view(1, -1)).abs().max(dim=1).values,
+    }
+
+
+def fit_constant_sigma(
+    mu_full: Tensor,
+    y_plus: Tensor,
+    warmup: int,
+    horizon: int,
+) -> Tensor:
+    r"""Maximum-likelihood homoscedastic :math:`\sigma` over the supervised anchors.
+
+    The reference every calibration report needs: the best a *single* global noise scale can
+    do. If the learned heteroscedastic :math:`\sigma` does not beat this on NLL and CRPS, the
+    learned variance is buying nothing. It also supplies a meaningful predictive distribution
+    for a checkpoint trained with a fixed ``sigma_obs``, whose ``logvar_full`` head never
+    received a gradient.
+
+    Args:
+        mu_full: Forecast mean ``(B, T, H_d, C)``.
+        y_plus: Unfolded future target ``(B, T - H_d, H_d, C)``.
+        warmup: Number of initial anchors to skip.
+        horizon: Forecast horizon ``H_d``.
+
+    Returns:
+        A scalar tensor
+        :math:`\hat{\sigma} = \sqrt{\operatorname{mean}\left[(y-\mu)^2\right]}`.
+    """
+    T = int(mu_full.shape[1])
+    start, end = _feature_valid_slice(warmup, horizon, T)
+    if end <= start:
+        return torch.zeros((), device=mu_full.device, dtype=mu_full.dtype)
+    resid = y_plus[:, start:end] - mu_full[:, start:end]
+    return resid.pow(2).mean().sqrt()

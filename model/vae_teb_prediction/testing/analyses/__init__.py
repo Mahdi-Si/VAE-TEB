@@ -14,6 +14,8 @@ Available analyses:
 - ``run_anchor_position_analysis`` — MSE vs anchor index
 - ``run_uplift_analysis`` — baseline vs full uplift
 - ``run_up_effect_analysis`` — inference-time UP perturbation tests
+- ``run_calibration_analysis`` — predictive-distribution calibration (NLL/CRPS/coverage)
+- ``run_cmi_comparison`` — neural + empirical CMI corroboration of K_raw (G11)
 - ``run_residual_usage_analysis`` — residual-branch activity / collapse
 - ``run_attention_diagnostics`` — lag attention diagnostics
 - ``run_te_lag_class_analysis`` — lag-resolved TE by class
@@ -54,6 +56,8 @@ from model.vae_teb_prediction.testing.analyses.temporal import (
     run_horizon_error_profile,
 )
 from model.vae_teb_prediction.testing.analyses.uplift import run_uplift_analysis
+from model.vae_teb_prediction.testing.analyses.calibration import run_calibration_analysis
+from model.vae_teb_prediction.testing.analyses.cmi_comparison import run_cmi_comparison
 from model.vae_teb_prediction.testing.analyses.up_effect import run_up_effect_analysis
 from model.vae_teb_prediction.testing.analyses.frequency_band_forecast import (
     run_frequency_band_forecast_analysis,
@@ -160,7 +164,10 @@ def run_all_analyses(
     trajectory_plot_3d: bool = True,
     trajectory_plot_animations: bool = False,
     skip_up_effect: bool = False,
+    skip_calibration: bool = False,
+    skip_cmi_comparison: bool = False,
     skip_frequency_band: bool = False,
+    empirical_te_csv: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run every lag-attn v1 analysis with sensible defaults.
 
@@ -213,6 +220,17 @@ def run_all_analyses(
         results["up_effect"] = _safe(
             "up_effect_analysis", run_up_effect_analysis,
             runner, loader, max_samples=min(1000, max_samples or 1000),
+        )
+    if not skip_calibration:
+        results["calibration"] = _safe(
+            "calibration", run_calibration_analysis,
+            runner, loader, max_samples=max_samples or 500,
+        )
+    if not skip_cmi_comparison:
+        results["cmi_comparison"] = _safe(
+            "cmi_comparison", run_cmi_comparison,
+            runner, loader, max_samples=max_samples or 500,
+            empirical_te_csv=empirical_te_csv,
         )
     results["residual_usage"] = _safe(
         "residual_usage", run_residual_usage_analysis,
@@ -292,6 +310,8 @@ __all__ = [
     # Individual analyses
     "run_histogram_analysis",
     "run_forecast_quality_analysis",
+    "run_calibration_analysis",
+    "run_cmi_comparison",
     "run_frequency_band_forecast_analysis",
     "run_horizon_error_profile",
     "run_anchor_position_analysis",

@@ -56,7 +56,11 @@ benchmarks:
     raw:                       # v2-only raw rendering (§5-§7). f_pulse is TRUE Hz.
       fs: 4.0
       n_raw: 5280              # 22 min ; transform input length
-      render_mode: am_carrier  # {am_carrier (default), pulse_train}
+      render_mode: am_carrier  # {am_carrier (default), pulse_train, direct}. `direct`
+                               # drops the carrier + AM modulation and renders the coupled
+                               # latents straight onto the raw grid (see raw.direct below):
+                               # realistic FHR/UP-like traces, but the injected TE is no
+                               # longer concentrated in a known scattering channel.
       f_pulse: 0.06            # Hz : contraction/deceleration pulse-shape carrier.
                                # S4-T01 lock: raised 0.02 -> 0.06 per the Sprint-3 de-risk
                                # (results/G1_raw_recovered/): at 0.02 the injected TE is not
@@ -74,6 +78,16 @@ benchmarks:
       pulse_train:             # S7-T04 : knobs for render_mode == pulse_train (waveform-realistic)
         rate_hz: 0.06          # event rate = fundamental (defaults to f_pulse if omitted)
         duty: 0.5              # raised-cosine bump width as a fraction of the period
+      direct:                  # knobs for render_mode == direct (no carrier / no AM modulation).
+        one_sided: true        # true  -> clinically one-sided deflections: UP contractions rise
+                               #          above tone, FHR decelerations dip below baseline
+                               #          (positive rectifier on the coupled latent).
+                               # false -> zero-mean bipolar rendering that preserves the exact
+                               #          linear c->d coupling but lets UP swing below its tone.
+                               # NOTE: without the carrier the injected TE spreads across the
+                               # low-frequency scattering channels instead of concentrating in
+                               # the f_pulse pulse-shape channel -- keep am_carrier when the
+                               # TE-in-a-known-scattering-channel guarantee is required.
       mu_fhr_bpm: [110, 160]   # physiological baseline draw range (neutral 140)
       mu_up: [5, 25]           # mmHg (IUPC); use [10, 20] for toco units
       baseline_wander_std: { fhr: 3.0, up: 2.0 }   # independent VLF wander (0 TE)

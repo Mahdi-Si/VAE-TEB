@@ -23,7 +23,7 @@ sys.path.insert(0, _REPO_ROOT)
 import yaml  # noqa: E402
 
 import model.vae_teb_prediction.model.trainer_lag_attn_v1 as trainer_mod  # noqa: E402
-from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (  # noqa: E402
+from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (  # noqa: E402
     SeqVaeLagAttnV2,
 )
 

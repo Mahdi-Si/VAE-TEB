@@ -39,7 +39,7 @@ from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import (  # noqa: E402
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import (  # noqa: E402
     SeqVaeLagAttnV1 as SeqVaeLagAttn,
 )
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import (
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import (
 #     SeqVaeLagAttnV2 as SeqVaeLagAttn,
 # )
 

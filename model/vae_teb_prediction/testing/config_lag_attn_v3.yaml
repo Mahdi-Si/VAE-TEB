@@ -1,0 +1,267 @@
+# Lag-Attentive Residual VAE-TEB **v3** testing configuration (S7-T02).
+#
+# Retargeted copy of ``config_lag_attn_v1.yaml`` for the v3 scientific-cleanliness fork.
+# ``TestRunner.from_checkpoint`` prefers the checkpoint's stamped ``model_kwargs`` (the
+# version-agnostic rebuild path guarded by ``check_model_class``), so the ``model_config``
+# block below is only the *fallback* used when a checkpoint carries no ``model_kwargs``. It is
+# nevertheless kept faithful to the v3 production architecture so a config-only rebuild is
+# valid and self-documenting.
+#
+# To run the v3 pipeline:
+#   1. Uncomment the v3 import in ``testing/base.py`` (the alias seam) so ``SeqVaeLagAttn``
+#      resolves to ``SeqVaeLagAttnV3`` (comment out the active v1 line). ``check_model_class``
+#      guards a mismatched checkpoint.
+#   2. Point ``core_model_checkpoint`` at a trained v3 checkpoint.
+#   3. ``python -m model.vae_teb_prediction.testing.run_tests`` (subgroup mode by default).
+#
+# The calibration (G10) and cmi_comparison (G11) steps are NOT config-driven -- they are code
+# toggles (``skip_calibration`` / ``skip_cmi_comparison`` default False), so both run
+# automatically. The only new config key is the optional empirical-TE CSV path below.
+
+general_config:
+  tag: lag_attn_v3_baseline
+
+  cuda_devices: [0]
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 100
+    test: 100
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v3
+
+model_config:
+  VAE_model:
+    # Reconstruction likelihood (G7). Not constructor args -- ignored by
+    # ``_lag_attn_kwargs_from_config`` -- but recorded for provenance.
+    likelihood: gaussian_nll
+    sigma_obs: learned
+    kld_beta: 0.001
+
+    # Feature-loss weighting (spec section 8.7)
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # Backbone widths (identical to v1 / v3 training config)
+    d_model: 128
+    d_z: 24
+    horizon: 30            # H_d = 30 decimated steps = 2 min forecast
+    warmup_period: 30      # first 2 minutes ignored in both feature & KL losses
+    sequence_length: 300
+    c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
+    c_u: 101               # 43 (up_st) + 58 (up_ph); must equal 58 if use_up_st=false
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
+
+    # Attention
+    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    num_heads: 4
+    d_head: 32
+    use_entmax: false      # fall back to softmax; entmax is optional
+    attention_grad_checkpoint: false  # TestRunner forces this off regardless
+
+    # --- v3 flags (G0-G6). Match config_lag_attn_v3.yaml production settings. ---
+    causal_norm: true               # G0 (F1): CausalGroupNorm; strictly causal target_state
+    logvar_bound: smooth            # G2: smooth sigmoid bound (no clamp plateaus)
+    posterior_logvar: residual      # G1: zero-init residual around the prior; KL==0 at init
+    delta_logvar_scale: 2.0         # G1: tanh saturation of the posterior logvar delta
+    kld_support: anchor             # G3: KL support = [warmup, T-horizon)
+    lag_bias_init: alibi_decay      # G5: learnable ALiBi lag-decay bias
+    head_structured_latent: true    # production latent (S7-T01 decision)
+    freeze_unused_attn_proj: true   # F3: freezes the dead lag_attn.W_o for plain 'ddp'
+    lambda_perm: 0.0                # G6 ships as a readout only (Finding F2)
+    perm_every_n_batches: 4
+
+  # NOTE: no v3 checkpoint exists until a training run produces one. Point this at the trained
+  # v3 checkpoint before running the pipeline.
+  core_model_checkpoint: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v3/CHANGE_ME/model_checkpoints/lag-attn-v3-epoch=epoch=000.ckpt
+
+  classifier:
+    # The downstream classifier is not exercised by the core v3 testing pipeline
+    # (run_tests); retargeted here only for completeness.
+    vae_checkpoint: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_v3/CHANGE_ME/model_checkpoints/lag-attn-v3-epoch=epoch=000.ckpt
+    type: lstm
+    latent_dim: 24
+    num_classes: 2
+    freeze_vae: true
+    use_posterior: true
+    sample_latent: false
+
+    hidden_dim: 128
+    num_layers: 2
+    bidirectional: false
+    attn_dim: 64
+    dropout: 0.1
+    num_filters: 64
+    kernel_sizes: [3, 5, 7]
+    d_model: 128
+    n_heads: 4
+    dim_feedforward: 256
+    pooling: mean
+
+    evaluation:
+      target_fpr: 0.05
+      compute_both_thresholds: true
+      generate_plots: true
+      decision_time_hours: 1.0
+      exclude_last_minutes: 30
+      max_gap_multiplier: null
+
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/acidosis_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/healthy_no_bg_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/train/hie_no_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/val/hie_no_cs.hdf5
+
+    # ----- Test dataset configuration (two-phase subgroup mode by default) -----
+    vae_test_subgroups:
+      healthy_no_bg_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_no_cs.hdf5
+      healthy_no_bg_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_no_bg_cs.hdf5
+      healthy_bg_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_no_cs.hdf5
+      healthy_bg_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/healthy_bg_cs.hdf5
+      acidosis_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_no_cs.hdf5
+      acidosis_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/acidosis_cs.hdf5
+      hie_no_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_no_cs.hdf5
+      hie_cs:
+        - /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/k_fold_cross_validation_dataset/fold_1/test/hie_cs.hdf5
+
+    # Legacy single-pass fallback (used only when vae_test_subgroups is empty).
+    vae_test_datasets: []
+
+    # G11 empirical-TE baseline. Optional path to a precomputed IDTxl empirical-TE CSV
+    # (columns ``guid`` and ``ite_valid``). When set, the cmi_comparison step joins its
+    # patient-mean into the comparison table; when null the empirical column is a logged skip.
+    empirical_te_csv: null
+
+    test_gpu_ids: [0]
+    keep_kld_trajectory_only: false
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/full_st_ph_dataset/stats.hdf5
+
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    classifier_train_datasets: []
+    classifier_val_datasets: []
+    classifier_test_datasets: []
+
+    dataloader_config:
+      num_workers: 4
+      prefetch_factor: 4
+      normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+      dataset_kwargs:
+        pin_memory: false
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'fhr_st',
+            'fhr_ph',
+            'up_ph',
+            'up_st',
+            'target',
+            'epoch',
+            'guid',
+          ]
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: null
+        label: null
+        cache_size: 10000
+        trim_minutes: 1.0
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-attn-v3
+      run_name: lag_attn_v3_baseline
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn_v3
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 10000
+
+    reconstruction_plotting:
+      enabled: true
+      plot_frequency: 10
+      num_examples: 3
+
+    comprehensive_plotting:
+      enabled: false    # no raw prediction in v3
+      plot_frequency: 10
+
+    lag_attn_plotting:
+      enabled: true
+      plot_frequency: 10
+      num_examples: 2
+      file_format: "pdf"
+      forecast_channels: [0, 43, 80]
+      forecast_anchor_frac: 0.6

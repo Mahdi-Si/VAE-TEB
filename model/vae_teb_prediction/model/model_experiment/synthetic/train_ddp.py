@@ -98,7 +98,7 @@ from model.vae_teb_prediction.model.model_experiment.synthetic.train_minimal imp
 )
 # Canonical model-class alias -- comment-toggle to switch v1 <-> v2 in one line.
 from model.vae_teb_prediction.model.vae_teb_lag_attn_v1 import SeqVaeLagAttnV1 as SeqVaeLagAttn
-# from model.vae_teb_prediction.model.vae_teb_lag_attn_v2 import SeqVaeLagAttnV2 as SeqVaeLagAttn
+# from model.vae_teb_prediction.model.vae_teb_lag_attn_trfr import SeqVaeLagAttnV2 as SeqVaeLagAttn
 from train.graph_models_utils import load_checkpoint_strict
 
 _PKG_DIR = Path(__file__).resolve().parent

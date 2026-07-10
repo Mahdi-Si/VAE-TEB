@@ -5918,3 +5918,272 @@ def plot_attention_mass_by_lag(
     fig.tight_layout()
     fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+# =============================================================================
+# Calibration plots (G10)
+# =============================================================================
+
+
+def plot_reliability_curve(
+    df: pd.DataFrame,
+    output_path: Any,
+    *,
+    title: str = "Reliability (PIT) by horizon",
+) -> None:
+    r"""Plot empirical vs nominal PIT quantiles, one line per horizon step.
+
+    A calibrated forecast traces the diagonal. Bowing *above* the diagonal at low quantiles
+    and below it at high quantiles means the predictive distribution is too wide; the mirror
+    shape means it is over-confident. A curve shifted bodily off the diagonal indicates a
+    biased mean rather than a mis-scaled variance.
+
+    Args:
+        df: Long-format frame with columns ``h``, ``nominal``, ``empirical``.
+        output_path: Destination path; the extension selects the format.
+        title: Figure title.
+    """
+    fig, ax = plt.subplots(figsize=(4.6, 4.4))
+    if df is None or df.empty:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        _style_axes(ax)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    horizons = sorted(df["h"].unique())
+    cmap = plt.get_cmap("viridis")
+    for i, h in enumerate(horizons):
+        sub = df[df["h"] == h].sort_values("nominal")
+        shade = cmap(i / max(len(horizons) - 1, 1))
+        ax.plot(sub["nominal"], sub["empirical"], color=shade, linewidth=1.1, alpha=0.85)
+
+    ax.plot([0, 1], [0, 1], color=COLOR_BLACK, linestyle="--", linewidth=1.2,
+            label="perfect calibration")
+    pooled = df.groupby("nominal", as_index=False)["empirical"].mean()
+    ax.plot(pooled["nominal"], pooled["empirical"], color=COLOR_VERMILLION, linewidth=2.0,
+            label="pooled over horizons")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, max(horizons)))
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("horizon step $h$", fontsize=FONT_LABEL * 0.6)
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("nominal quantile", fontsize=FONT_LABEL * 0.7)
+    ax.set_ylabel("empirical PIT fraction", fontsize=FONT_LABEL * 0.7)
+    ax.set_title(title, fontsize=FONT_TITLE * 0.6)
+    ax.legend(loc="upper left", frameon=False, fontsize=FONT_LEGEND * 0.55)
+    _style_axes(ax)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_coverage_vs_nominal(
+    df: pd.DataFrame,
+    output_path: Any,
+    *,
+    title: str = "Interval coverage vs nominal level",
+) -> None:
+    r"""Plot empirical central-interval coverage against its nominal level.
+
+    Points below the diagonal mean under-coverage: the learned :math:`\sigma` is too small and
+    the model is over-confident. This is the failure that mean-squared error cannot see, and
+    the reason the calibration report exists.
+
+    Args:
+        df: Per-sample frame carrying ``coverage_50``, ``coverage_80``, ... columns.
+        output_path: Destination path.
+        title: Figure title.
+    """
+    fig, ax = plt.subplots(figsize=(4.6, 4.4))
+    columns = [c for c in df.columns if c.startswith("coverage_") and not c.endswith("_error")] \
+        if df is not None and not df.empty else []
+    if not columns:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        _style_axes(ax)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    levels = sorted(int(c.rsplit("_", 1)[1]) / 100.0 for c in columns)
+    means, los, his = [], [], []
+    for level in levels:
+        values = df[f"coverage_{int(round(level * 100))}"].to_numpy()
+        means.append(float(np.mean(values)))
+        los.append(float(np.quantile(values, 0.25)))
+        his.append(float(np.quantile(values, 0.75)))
+
+    ax.plot([0, 1], [0, 1], color=COLOR_BLACK, linestyle="--", linewidth=1.2,
+            label="perfect calibration")
+    ax.fill_between(levels, los, his, color=COLOR_BLUE, alpha=0.2, linewidth=0,
+                    label="per-sample IQR")
+    ax.plot(levels, means, color=COLOR_BLUE, marker="o", markersize=5, linewidth=1.6,
+            label="mean coverage")
+
+    for level, mean in zip(levels, means):
+        ax.annotate(f"{mean - level:+.3f}", (level, mean), textcoords="offset points",
+                    xytext=(6, -12), fontsize=FONT_TICK * 0.5, color=COLOR_GRAY)
+
+    ax.set_xlim(0.4, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("nominal level $p$", fontsize=FONT_LABEL * 0.7)
+    ax.set_ylabel("empirical coverage", fontsize=FONT_LABEL * 0.7)
+    ax.set_title(title, fontsize=FONT_TITLE * 0.6)
+    ax.legend(loc="upper left", frameon=False, fontsize=FONT_LEGEND * 0.55)
+    _style_axes(ax)
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_sharpness_by_horizon(
+    df: pd.DataFrame,
+    output_path: Any,
+    *,
+    constant_sigma: Optional[float] = None,
+    title: str = "Predictive spread and score by horizon",
+) -> None:
+    r"""Plot the learned :math:`\sigma`, the NLL, and the CRPS against lead time.
+
+    Sharpness alone is meaningless -- a collapsed variance is maximally sharp and useless -- so
+    it is drawn beside the two proper scoring rules, and against the homoscedastic
+    :math:`\hat{\sigma}` the model has to beat to justify its variance head.
+
+    Args:
+        df: Long-format frame with columns ``h``, ``sharpness``, ``nll``, ``crps``.
+        output_path: Destination path.
+        constant_sigma: The fitted global :math:`\hat{\sigma}` reference line, if available.
+        title: Figure suptitle.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(11.4, 3.4))
+    if df is None or df.empty:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            _style_axes(ax)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    grouped = df.groupby("h")
+    steps = np.asarray(sorted(df["h"].unique()))
+    panels = (
+        ("sharpness", r"predictive $\sigma$", COLOR_BLUE),
+        ("nll", "NLL [nats]", COLOR_VERMILLION),
+        ("crps", "CRPS", COLOR_ORANGE),
+    )
+    for ax, (column, ylabel, colour) in zip(axes, panels):
+        median = grouped[column].median().to_numpy()
+        q25 = grouped[column].quantile(0.25).to_numpy()
+        q75 = grouped[column].quantile(0.75).to_numpy()
+        ax.fill_between(steps, q25, q75, color=colour, alpha=0.2, linewidth=0, label="IQR")
+        ax.plot(steps, median, color=colour, linewidth=1.6, label="median")
+        if column == "sharpness" and constant_sigma is not None and np.isfinite(constant_sigma):
+            ax.axhline(constant_sigma, color=COLOR_BLACK, linestyle=":", linewidth=1.2,
+                       label=r"constant $\hat{\sigma}$")
+        ax.set_xlabel("horizon step $h$", fontsize=FONT_LABEL * 0.7)
+        ax.set_ylabel(ylabel, fontsize=FONT_LABEL * 0.7)
+        ax.legend(loc="best", frameon=False, fontsize=FONT_LEGEND * 0.55)
+        _style_axes(ax)
+
+    fig.suptitle(title, fontsize=FONT_TITLE * 0.6)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _rank_1d(values: np.ndarray) -> np.ndarray:
+    """Average-rank of the finite entries (NaN-preserving), scaled to ``[0, 1]``."""
+    x = np.asarray(values, dtype=float)
+    out = np.full(x.shape, np.nan, dtype=float)
+    mask = np.isfinite(x)
+    if int(mask.sum()) < 2:
+        return out
+    sub = x[mask]
+    order = np.argsort(sub, kind="mergesort")
+    ranks = np.empty_like(sub)
+    ranks[order] = np.arange(1, sub.size + 1, dtype=float)
+    out[mask] = (ranks - 1.0) / (sub.size - 1.0)
+    return out
+
+
+def plot_cmi_comparison(
+    comparison_table: pd.DataFrame,
+    per_sample: pd.DataFrame,
+    output_path: Any,
+    *,
+    title: str = r"$K_{\mathrm{raw}}$ vs neural CMI and empirical TE",
+) -> None:
+    r"""Plot the CMI corroboration: rank correlations and per-sample rank agreement (G11).
+
+    :math:`K_{\mathrm{raw}}`, the neural CMI bounds, and empirical TE live on different scales
+    (nats/step, nats, bits), so their magnitudes are not directly comparable -- the deliverable
+    is **rank-level** agreement. The left panel shows Spearman :math:`\rho` of each independent
+    estimate against :math:`K_{\mathrm{raw}}`; the right panel shows the per-sample rank scatter
+    that those correlations summarise. Per-quantity means and patient-level bootstrap CIs are in
+    ``comparison_table.csv`` (they are not plotted because their scales differ).
+
+    Args:
+        comparison_table: Frame with columns ``quantity`` and ``spearman_vs_kraw``.
+        per_sample: Frame with ``k_raw`` and ``cmi_*`` (and optional ``ite_valid``) columns.
+        output_path: Destination path; the extension selects the format.
+        title: Figure suptitle.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0))
+    has_table = comparison_table is not None and not comparison_table.empty
+    has_samples = per_sample is not None and not per_sample.empty
+    if not has_table or not has_samples:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            _style_axes(ax)
+        fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    _pretty = {"cmi_infonce": "InfoNCE", "cmi_mine": "MINE", "ite_valid": "empirical TE"}
+    _colours = {"cmi_infonce": COLOR_BLUE, "cmi_mine": COLOR_VERMILLION, "ite_valid": COLOR_ORANGE}
+
+    # Panel 1: rank correlation with K_raw for every non-K_raw quantity.
+    ax = axes[0]
+    rows = comparison_table[comparison_table["quantity"] != "k_raw"]
+    names = [_pretty.get(q, q) for q in rows["quantity"]]
+    rhos = rows["spearman_vs_kraw"].to_numpy(dtype=float)
+    bar_colours = [_colours.get(q, COLOR_GRAY) for q in rows["quantity"]]
+    ypos = np.arange(len(names))
+    ax.barh(ypos, rhos, color=bar_colours, alpha=0.85, height=0.6)
+    ax.axvline(0.0, color=COLOR_BLACK, linewidth=1.0)
+    for yp, rho in zip(ypos, rhos):
+        ax.annotate(f"{rho:+.2f}", (rho, yp), textcoords="offset points",
+                    xytext=(4 if rho >= 0 else -22, -3), fontsize=FONT_TICK * 0.55,
+                    color=COLOR_BLACK)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(names, fontsize=FONT_LABEL * 0.6)
+    ax.set_xlim(-1.05, 1.05)
+    ax.set_xlabel(r"Spearman $\rho$ with $K_{\mathrm{raw}}$", fontsize=FONT_LABEL * 0.7)
+    ax.set_title("rank corroboration", fontsize=FONT_TITLE * 0.55)
+    _style_axes(ax)
+
+    # Panel 2: per-sample rank scatter, K_raw vs each estimate.
+    ax = axes[1]
+    kr = _rank_1d(per_sample["k_raw"].to_numpy(dtype=float))
+    ax.plot([0, 1], [0, 1], color=COLOR_BLACK, linestyle="--", linewidth=1.1)
+    for col in ("cmi_infonce", "cmi_mine", "ite_valid"):
+        if col not in per_sample.columns:
+            continue
+        yr = _rank_1d(per_sample[col].to_numpy(dtype=float))
+        m = np.isfinite(kr) & np.isfinite(yr)
+        if int(m.sum()) < 2:
+            continue
+        ax.scatter(kr[m], yr[m], s=14, alpha=0.5, color=_colours.get(col, COLOR_GRAY),
+                   edgecolors="none", label=_pretty.get(col, col))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel(r"normalised rank of $K_{\mathrm{raw}}$", fontsize=FONT_LABEL * 0.7)
+    ax.set_ylabel("normalised rank of estimate", fontsize=FONT_LABEL * 0.7)
+    ax.set_title("per-sample rank agreement", fontsize=FONT_TITLE * 0.55)
+    ax.legend(loc="upper left", frameon=False, fontsize=FONT_LEGEND * 0.55)
+    _style_axes(ax)
+
+    fig.suptitle(title, fontsize=FONT_TITLE * 0.6)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
