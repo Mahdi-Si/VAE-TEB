@@ -149,6 +149,15 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         # collapsed EMA (e.g. from near-zero Gaussian-NLL loss under learned
         # variance) can never freeze training indefinitely. 0 disables the hatch.
         "max_consecutive_skips": 25,
+        # Absolute floor on the EMA used for the ``> multiplier x ema`` spike test.
+        # The documented freeze is a collapsed EMA (variance-collapse NLL -> ~0) that
+        # makes ``multiplier x ema`` un-clearable, so every healthy-scale batch reads as a
+        # spike forever. Flooring the *comparison base* (not the stored EMA, so the
+        # momentum dynamics are untouched) means a collapsed EMA can never push the
+        # threshold below ``multiplier x ema_floor``; set ``ema_floor`` so that product
+        # comfortably exceeds a healthy loss. ``0.0`` (default) reproduces the old
+        # behaviour exactly.
+        "ema_floor": 0.0,
     }
 
     def __init__(
@@ -319,14 +328,23 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
         self.hparams["kld_beta"] = beta
         return beta
 
+    @staticmethod
+    def _lerp(a: float, b: float, frac: float) -> float:
+        r"""Linearly interpolate ``a -> b`` with ``frac`` clamped to $[0, 1]$."""
+        return a + (b - a) * min(1.0, max(0.0, frac))
+
     def _resolve_beta(self, epoch: int) -> float:
         r"""Resolve $\beta$ for ``epoch`` from the ``beta_schedule`` hparam.
 
-        Ported from ``trainer_lag_attn_v1._resolve_beta``. Supports two kinds:
+        Ported from ``trainer_lag_attn_v1._resolve_beta`` and extended. Supports three kinds:
 
         * ``constant`` -- ``value`` if given, else the current ``kld_beta``;
         * ``linear_warmup`` -- ``start + (end - start) * min(1, epoch / warmup_epochs)``,
           holding at ``end`` afterwards (``warmup_epochs <= 0`` returns ``end`` immediately).
+        * ``linear_warmup_then_ramp`` -- ``linear_warmup`` up to ``end``, held open until
+          ``ramp_start_epoch``, then ramped ``end -> ramp_end`` over
+          ``[ramp_start_epoch, ramp_end_epoch)`` and held at ``ramp_end``. ``ramp_start_epoch``
+          is floored at ``warmup_epochs`` so the curve is continuous for any key ordering.
 
         When no ``beta_schedule`` is configured this returns the current ``kld_beta`` verbatim,
         so writing it back is a no-op and the constant-$\beta$ (v1) / curriculum (v2) behaviour
@@ -358,10 +376,38 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             warmup_epochs = int(sched.get("warmup_epochs", 50))
             if warmup_epochs <= 0:
                 return end
-            frac = min(1.0, max(0.0, float(epoch) / float(warmup_epochs)))
-            return start + (end - start) * frac
+            return self._lerp(start, end, float(epoch) / float(warmup_epochs))
+        if kind == "linear_warmup_then_ramp":
+            # v3 concentrated-signal schedule (S8-T04): open the zero-KL bottleneck LOW so
+            # the source path switches on (``start -> end`` over ``warmup_epochs``), hold it
+            # open, then RAMP $\beta$ UP (``end -> ramp_end`` over
+            # ``[ramp_start_epoch, ramp_end_epoch)``) to squeeze the coupling-independent KL
+            # drift-floor down toward the *earned* KL while the signal dims are already
+            # anchored by the reconstruction gradient. This attacks the "K grows without a
+            # fixed point at fixed low beta" dynamic that produced the null-cell floor.
+            start = float(sched.get("start", 1.0e-5))
+            end = float(sched.get("end", 3.0e-4))
+            warmup_epochs = int(sched.get("warmup_epochs", 20))
+            ramp_end = float(sched.get("ramp_end", end))
+            # Floor ramp_start at warmup_epochs so a mis-ordered config
+            # (warmup_epochs > ramp_start_epoch) cannot exit warm-up straight into mid-ramp
+            # -- the curve stays continuous (and monotone for ramp_end >= end) for any ordering.
+            ramp_start_epoch = max(
+                int(sched.get("ramp_start_epoch", warmup_epochs)), warmup_epochs)
+            ramp_end_epoch = int(sched.get("ramp_end_epoch", ramp_start_epoch))
+            e = float(epoch)
+            if warmup_epochs > 0 and e < warmup_epochs:
+                return self._lerp(start, end, e / float(warmup_epochs))
+            if ramp_end_epoch <= ramp_start_epoch or e < ramp_start_epoch:
+                return end  # held open at ``end`` (or no squeeze window configured)
+            if e >= ramp_end_epoch:
+                return ramp_end
+            return self._lerp(
+                end, ramp_end,
+                (e - ramp_start_epoch) / float(ramp_end_epoch - ramp_start_epoch))
         raise ValueError(
-            f"Unknown beta_schedule.kind={kind!r}; expected 'constant' or 'linear_warmup'."
+            f"Unknown beta_schedule.kind={kind!r}; expected 'constant', 'linear_warmup', "
+            "or 'linear_warmup_then_ramp'."
         )
 
     def _on_train_epoch_start_hook(self) -> None:
@@ -650,7 +696,11 @@ class SyntheticSeqVaeLagAttnV2Pl(LightningModelBase):
             elif seen_before < int(cfg["warmup_batches"]):
                 pass  # Still priming the EMA -- never flag a spike.
             elif ema_before is not None and ema_before > 0.0:
-                if loss_value > float(cfg["multiplier"]) * ema_before:
+                # Floor the comparison base so a collapsed EMA cannot make the threshold
+                # un-clearable (see ``ema_floor`` in ``_SPIKE_DEFAULTS``). ``ema_floor=0``
+                # leaves ``ema_ref == ema_before`` for any positive EMA (a no-op).
+                ema_ref = max(ema_before, float(cfg.get("ema_floor", 0.0)))
+                if loss_value > float(cfg["multiplier"]) * ema_ref:
                     is_spike = True
 
         is_spike = self._sync_skip_decision_across_ranks(is_spike, device=loss.device)
@@ -996,9 +1046,10 @@ def _resolve_loss_settings(loss_cfg: Dict[str, Any]) -> Dict[str, Any]:
     free_bits = float(loss_cfg.get("free_bits", 0.0))
     detach_baseline_in_full = bool(loss_cfg.get("detach_baseline_in_full", False))
     lambda_lag = float(loss_cfg.get("lag_smoothness_lambda", 0.0))
-    # Optional per-epoch beta schedule (v3): a ``{kind: constant|linear_warmup, ...}`` dict
-    # resolved by :meth:`SyntheticSeqVaeLagAttnV2Pl._resolve_beta` each epoch. Absent, the
-    # constant ``kld_beta`` above is used (v1 / v2 behaviour unchanged).
+    # Optional per-epoch beta schedule (v3): a
+    # ``{kind: constant|linear_warmup|linear_warmup_then_ramp, ...}`` dict resolved by
+    # :meth:`SyntheticSeqVaeLagAttnV2Pl._resolve_beta` each epoch. Absent, the constant
+    # ``kld_beta`` above is used (v1 / v2 behaviour unchanged).
     beta_schedule = loss_cfg.get("beta_schedule")
     beta_schedule = dict(beta_schedule) if isinstance(beta_schedule, dict) else None
     return {

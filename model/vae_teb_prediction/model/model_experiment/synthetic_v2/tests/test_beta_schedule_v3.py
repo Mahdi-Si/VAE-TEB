@@ -67,6 +67,58 @@ def test_linear_warmup_matches_formula() -> None:
         assert abs(wrap._resolve_beta(e) - expected) < 1e-12, e
 
 
+def test_linear_warmup_then_ramp_arithmetic() -> None:
+    """S8-T04: open low (warmup), hold at ``end``, then ramp UP to ``ramp_end``."""
+    s, end, w = 1.0e-5, 3.0e-4, 20
+    ramp_end, rs, re = 3.0e-3, 55, 90
+    wrap = _make_wrapper(beta_schedule={
+        "kind": "linear_warmup_then_ramp", "start": s, "end": end, "warmup_epochs": w,
+        "ramp_end": ramp_end, "ramp_start_epoch": rs, "ramp_end_epoch": re})
+    # warm-up ramp (start -> end)
+    assert abs(wrap._resolve_beta(0) - s) < 1e-15
+    assert abs(wrap._resolve_beta(10) - (s + (end - s) * 0.5)) < 1e-15
+    # held open at ``end`` through [w, rs)
+    assert wrap._resolve_beta(w) == end
+    assert wrap._resolve_beta(rs - 1) == end
+    assert wrap._resolve_beta(rs) == end  # ramp fraction 0 at rs
+    # up-ramp (end -> ramp_end)
+    mid = end + (ramp_end - end) * ((72 - rs) / (re - rs))
+    assert abs(wrap._resolve_beta(72) - mid) < 1e-15
+    # held at ramp_end after re
+    assert wrap._resolve_beta(re) == ramp_end
+    assert wrap._resolve_beta(re + 50) == ramp_end
+    # monotone non-decreasing across the whole schedule
+    seq = [wrap._resolve_beta(e) for e in range(0, re + 5)]
+    assert all(b2 >= b1 - 1e-15 for b1, b2 in zip(seq, seq[1:]))
+
+
+def test_linear_warmup_then_ramp_misordered_stays_continuous() -> None:
+    """ramp_start_epoch < warmup_epochs must NOT jump: ramp_start is floored at warmup."""
+    end, ramp_end = 3.0e-4, 3.0e-3
+    wrap = _make_wrapper(beta_schedule={
+        "kind": "linear_warmup_then_ramp", "start": 0.0, "end": end, "warmup_epochs": 30,
+        "ramp_end": ramp_end, "ramp_start_epoch": 10, "ramp_end_epoch": 50})
+    # At the warm-up boundary the value is exactly ``end`` (no jump into mid-ramp).
+    assert abs(wrap._resolve_beta(29) - end * (29 / 30)) < 1e-15
+    assert abs(wrap._resolve_beta(30) - end) < 1e-15
+    # The ramp only begins at the floored start (== warmup_epochs == 30), not at epoch 10.
+    assert abs(wrap._resolve_beta(40) - (end + (ramp_end - end) * ((40 - 30) / (50 - 30)))) < 1e-15
+    # Whole curve is continuous (no step > a small per-epoch delta) and monotone.
+    seq = [wrap._resolve_beta(e) for e in range(0, 55)]
+    steps = [b2 - b1 for b1, b2 in zip(seq, seq[1:])]
+    assert all(s >= -1e-15 for s in steps)              # monotone non-decreasing
+    assert max(steps) < (ramp_end - end) / (50 - 30) + 1e-9  # no discontinuous jump
+
+
+def test_linear_warmup_then_ramp_no_squeeze_holds_end() -> None:
+    """With no squeeze window (ramp_end_epoch <= ramp_start_epoch) it holds at ``end``."""
+    wrap = _make_wrapper(beta_schedule={
+        "kind": "linear_warmup_then_ramp", "start": 0.0, "end": 5e-4, "warmup_epochs": 10,
+        "ramp_end": 5e-3, "ramp_start_epoch": 50, "ramp_end_epoch": 50})
+    assert wrap._resolve_beta(10) == 5e-4
+    assert wrap._resolve_beta(200) == 5e-4
+
+
 def test_warmup_epochs_nonpositive_returns_end() -> None:
     wrap = _make_wrapper(
         beta_schedule={"kind": "linear_warmup", "start": 1e-5, "end": 1e-3,
