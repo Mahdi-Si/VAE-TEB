@@ -72,6 +72,8 @@ _MODULE_DIR = _MODULE_FILE.parent
 #: dict's ``config_path``) at :data:`_DEFAULT_CONFIG_V3`.
 _DEFAULT_CONFIG = _MODULE_DIR / "config_synth_v2.yaml"
 _DEFAULT_CONFIG_V3 = _MODULE_DIR / "config_synth_v3.yaml"
+#: Long-lag per-sample "band" experiment (D_i ~ Uniform{lo..hi}, 3-5 min windows).
+_DEFAULT_CONFIG_BAND = _MODULE_DIR / "config_synth_v3_band.yaml"
 
 # =============================================================================
 # Stage registry (S4-T05)
@@ -2295,7 +2297,7 @@ if __name__ == "__main__":
     # ``config_path`` to ``_DEFAULT_CONFIG`` and ``arms`` to ``None``.
     PIPELINE: Dict[str, Any] = {
         # --- identifiers ------------------------------------------------------
-        "config_path": _DEFAULT_CONFIG_V3,  # config_synth_v3.yaml (the ablation ladder)
+        "config_path": _DEFAULT_CONFIG_BAND,  # config_synth_v3_band.yaml (long-lag band experiment)
         "benchmark": None,                # None -> experiment.benchmark (G1_raw)
         # --- grid / build behaviour -------------------------------------------
         "pilot": False,                   # r0_realizability + build grid: True=pilot,
@@ -2325,8 +2327,11 @@ if __name__ == "__main__":
                                           #   (cmi.max_samples=512, calibration=2000)
         # --- diagnostic-stage settings ----------------------------------------
         "solve_te_args": None,            # (target_te, D) required iff stages.solve_te
-        "scatter_preview": {"target_te": 2.0, "delay": 8, "n": 16},
-        "data_previews": {"target_te": 2.0, "delay": 8, "n": 16, "include_null": True},
+        # delay=60 (= 4 min) is a representative single lag inside the band grid, so the
+        # preview gallery reflects the long-lag coupling (data_previews solves a standalone
+        # cell at this lag; it is not looked up in the band grid).
+        "scatter_preview": {"target_te": 2.0, "delay": 60, "n": 16},
+        "data_previews": {"target_te": 2.0, "delay": 60, "n": 16, "include_null": True},
         # --- behaviour ---------------------------------------------------------
         "dry_run": False,                 # print the plan (incl. subprocess cmds) only
         # --- stage toggles (executed in _STAGE_ORDER) -------------------------
