@@ -2,8 +2,9 @@ r"""Tests for the Sprint 3 cell enumeration + pilot generation (S3-T01).
 
 Covers :func:`build_dataset_v2.enumerate_cells_v2` (null cell kept with $B = 0$,
 signal cells solved within the inverter tolerance, unsolvable cells logged and
-dropped rather than crashing, ``band`` lag mode rejected), the deterministic
-per-(cell, split) seed, and :func:`build_dataset_v2.generate_pilot_samples`.
+dropped rather than crashing, and ``band`` lag mode enumerating per-sample lag
+windows), the deterministic per-(cell, split) seed, and
+:func:`build_dataset_v2.generate_pilot_samples`.
 
 The inverter Monte-Carlo is the slow part, so a trimmed grid + smaller ``n_samples``
 is used throughout. See ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprint 3, S3-T01.
@@ -86,12 +87,53 @@ def test_enumerate_dedup_and_types(enumerated) -> None:
     assert {c.D for c in cells} == {8}
 
 
-def test_enumerate_band_mode_rejected(fast_config) -> None:
-    r"""``lag_mode: band`` is not implemented in the initial build and must raise."""
-    cfg = copy.deepcopy(fast_config)
-    cfg["benchmarks"]["G1_raw"]["mix"]["lag_mode"] = "band"
-    with pytest.raises(ValueError, match="lag_mode"):
-        bd.enumerate_cells_v2(cfg)
+def _band_config(base: dict) -> dict:
+    r"""A trimmed band-mode copy: one tight long window + a cheap inverter Monte-Carlo."""
+    cfg = copy.deepcopy(base)
+    mix = cfg["benchmarks"]["G1_raw"]["mix"]
+    mix["target_te_grid"] = [0.0, 2.0]
+    mix["lag_mode"] = "band"
+    mix["lag_bands"] = [[45, 52]]
+    mix["lag_band_units"] = "steps"
+    mix["inverter"]["n_samples"] = 4000
+    # K_history must span the longest lag (>= 52); the fixed default (80) already does, but
+    # the long-lag regime uses 140 for margin.
+    cfg["benchmarks"]["G1_raw"]["data"]["K_history"] = 140
+    return cfg
+
+
+def test_enumerate_band_mode(base_config) -> None:
+    r"""``lag_mode: band`` enumerates ``(te, [lo, hi])`` cells with a per-delay TE map."""
+    cfg = _band_config(base_config)
+    cells, dropped = bd.enumerate_cells_v2(cfg)
+    assert dropped == []
+    # 2 target_te x 1 band = 2 cells.
+    assert len(cells) == 2
+    for cell in cells:
+        assert cell.lag_mode == "band"
+        assert (cell.delay_min, cell.delay_max) == (45, 52)
+        # te_by_delay covers the full inclusive window.
+        assert set(cell.te_by_delay.keys()) == set(range(45, 53))
+
+    null = [c for c in cells if c.target_te == 0.0][0]
+    assert null.B_y_scalar == 0.0
+    assert all(v == 0.0 for v in null.te_by_delay.values())
+
+    signal = [c for c in cells if c.target_te > 0.0][0]
+    assert signal.B_y_scalar > 0.0
+    # The mean block TE over the window lands on the requested target within a few percent.
+    mean_te = float(np.mean(list(signal.te_by_delay.values())))
+    assert abs(mean_te - signal.target_te) / signal.target_te < 0.05
+
+
+def test_band_and_fixed_solve_coincide_at_degenerate_window(base_config) -> None:
+    r"""A degenerate band ``[D, D]`` solves the same coupling as fixed lag ``D``."""
+    cfg = copy.deepcopy(base_config)
+    cfg["benchmarks"]["G1_raw"]["mix"]["inverter"]["n_samples"] = 4000
+    fixed = bd.solve_cell_coupling(cfg, 2.0, 8)            # fixed: delay_max defaults to None
+    band = bd.solve_cell_coupling(cfg, 2.0, 8, 8)         # degenerate band [8, 8]
+    assert abs(fixed["B_y_scalar"] - band["B_y_scalar"]) < 1e-9
+    assert "te_by_delay" not in fixed  # fixed cells carry no per-delay map
 
 
 def test_enumerate_drops_unsolvable(fast_config) -> None:

@@ -160,6 +160,9 @@ model_config:
       ema_momentum: 0.02     # EMA smoothing (smaller = longer memory)
       warmup_batches: 100    # priming window before gating activates
       warn_on_skip: true     # emit a loguru warning on every skip
+      # After this many CONSECUTIVE skips, force-accept one (finite-loss) batch and
+      # hard-re-seed the EMA -- prevents a collapsed EMA from freezing training. 0 off.
+      max_consecutive_skips: 25
 
   core_model_checkpoint: null
 

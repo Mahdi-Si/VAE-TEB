@@ -513,6 +513,7 @@ _HTML_METRIC_ORDER = (
     "spike_ema_loss",
     "spike_skipped",
     "spike_skips_total",
+    "spike_forced_accepts_total",
     "lr",
 )
 

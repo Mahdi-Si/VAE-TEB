@@ -692,6 +692,7 @@ class LagCrossAttention(nn.Module):
         use_entmax: bool = False,
         grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
+        alibi_slope_scale: float = 1.0,
     ) -> None:
         """Initialize the attention module.
 
@@ -712,6 +713,11 @@ class LagCrossAttention(nn.Module):
                 *learnable* per-(head, lag) scalar score bias with an
                 ALiBi-style negative slope (B4), so distant lags start mildly
                 penalised and the model must earn long-lag usage.
+            alibi_slope_scale: Multiplier on the ``'alibi_decay'`` per-head slopes
+                (default ``1.0`` — bit-identical to the standard ALiBi init). Values
+                ``< 1`` soften the long-lag penalty so a deliberately long true lag (e.g.
+                a 3–5 min ``band``-mode coupling) is reachable at init; ``0`` gives a flat
+                (still learnable) bias. Ignored when ``lag_bias_init == 'normal'``.
         """
         super().__init__()
         if num_heads * d_head != d_model:
@@ -754,8 +760,9 @@ class LagCrossAttention(nn.Module):
                 f"got {lag_bias_init!r}"
             )
         self.lag_bias_init = lag_bias_init
+        self.alibi_slope_scale = float(alibi_slope_scale)
         if lag_bias_init == "alibi_decay":
-            slopes = _alibi_slopes(num_heads)                  # (num_heads,)
+            slopes = _alibi_slopes(num_heads) * float(alibi_slope_scale)  # (num_heads,)
             lags = torch.arange(self.L, dtype=torch.float32)   # (L,)
             decay = -slopes[:, None] * lags[None, :]           # (num_heads, L)
             self.lag_score_bias = nn.Parameter(decay)
@@ -1206,6 +1213,7 @@ class SeqVaeLagAttnV1(nn.Module):
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
+        alibi_slope_scale: float = 1.0,
         head_structured_latent: bool = False,
         init_weights: bool = True,
     ) -> None:
@@ -1265,6 +1273,10 @@ class SeqVaeLagAttnV1(nn.Module):
                 retained memory is small, so this can usually stay False.
             lag_bias_init: Lag-bias init for ``LagCrossAttention`` — ``'normal'``
                 (default) or ``'alibi_decay'`` (B4 monotonic lag penalty).
+            alibi_slope_scale: Multiplier on the ``'alibi_decay'`` slopes (default
+                ``1.0`` = bit-identical). ``< 1`` softens the long-lag penalty so a
+                deliberately long true lag is reachable at init; ignored under
+                ``'normal'``.
             head_structured_latent: C7 toggle. When ``True`` the latent is
                 partitioned into ``num_heads`` groups, each conditioned only on
                 its attention head's summary, giving an additive per-head KL
@@ -1353,6 +1365,7 @@ class SeqVaeLagAttnV1(nn.Module):
             use_entmax=use_entmax,
             grad_checkpoint=attention_grad_checkpoint,
             lag_bias_init=lag_bias_init,
+            alibi_slope_scale=alibi_slope_scale,
         )
         self.posterior_head = PosteriorHead(
             d_model=d_model,

@@ -397,18 +397,43 @@ class SeqVaeLagAttnV3Pl(SeqVaeLagAttnPl):
 
         is_spike = self._sync_skip_decision_across_ranks(is_spike, device=train_loss.device)
 
-        if not is_spike:
+        # Escape hatch (see SeqVaeLagAttnPl.training_step): after
+        # ``max_consecutive_skips`` skips in a row, force-accept this (finite-loss)
+        # batch and HARD-re-seed the EMA to ``main_value`` so the threshold recovers in
+        # one step. Without it a collapsed EMA -- near-zero Gaussian-NLL loss under
+        # learned variance, v3's production default -- skips forever. The finite gate is
+        # rank-synced (MIN-reduce) so ranks never diverge.
+        max_consec = int(cfg["max_consecutive_skips"])
+        forced_local = (
+            is_spike and not is_nonfinite and max_consec > 0
+            and self._spike_consecutive >= max_consec
+        )
+        forced_accept = self._sync_force_accept_decision(
+            forced_local, device=train_loss.device
+        )
+
+        if forced_accept:
+            self._spike_ema_loss = main_value
+            self._spike_consecutive = 0
+            self._spike_forced_accepts_total += 1
+            is_spike = False
+        elif is_spike:
+            self._spike_consecutive += 1
+            self._spike_skips_total += 1
+        else:
             m = float(cfg["ema_momentum"])
             self._spike_ema_loss = (
                 main_value if ema_before is None else m * main_value + (1.0 - m) * ema_before
             )
-        else:
-            self._spike_skips_total += 1
+            self._spike_consecutive = 0
 
         ema_for_log = self._spike_ema_loss if self._spike_ema_loss is not None else main_value
         metrics["spike_ema_loss"] = self._as_tensor(ema_for_log)
         metrics["spike_skipped"] = self._as_tensor(1.0 if is_spike else 0.0)
         metrics["spike_skips_total"] = self._as_tensor(self._spike_skips_total)
+        metrics["spike_forced_accepts_total"] = self._as_tensor(
+            self._spike_forced_accepts_total
+        )
         self._log_metrics(metrics, stage="train", on_step=True)
 
         if is_spike:

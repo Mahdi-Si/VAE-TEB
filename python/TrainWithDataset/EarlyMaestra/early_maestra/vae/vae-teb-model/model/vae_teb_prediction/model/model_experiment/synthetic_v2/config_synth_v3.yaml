@@ -305,6 +305,22 @@ loss:
     end: 1.0e-4
     warmup_epochs: 20
 
+# --- loss-spike circuit breaker (TOP-LEVEL, NOT under `loss:`) --------------------------
+# The synthetic driver reads this at config.get("loss_spike_skip") (pl_module_v2.py train_v2),
+# NOT under `loss:` -- a `loss.loss_spike_skip` block would be silently ignored. This is the
+# most exposed synthetic path (gaussian_nll + sigma_obs: learned), i.e. the exact regime whose
+# near-zero/negative loss collapses the spike EMA and froze the headline run, so the escape-hatch
+# safety valve is made explicit here. Omitting the block falls back to the code defaults.
+loss_spike_skip:
+  enabled: true
+  multiplier: 5.0        # trip when total_loss > 5× running EMA
+  ema_momentum: 0.02     # EMA smoothing (smaller = longer memory)
+  warmup_batches: 100    # priming window before gating activates
+  warn_on_skip: true     # emit a loguru warning on every skip
+  # After this many CONSECUTIVE skips, force-accept one (finite-loss) batch and hard-re-seed
+  # the EMA to it, so a collapsed EMA can never freeze training indefinitely. 0 disables it.
+  max_consecutive_skips: 25
+
 # --- the three-arm ablation ladder (S0-T04a resolve_arm deep-merges arms.<name>) --------
 # Each arm carries ONLY its per-arm deltas, INSIDE model.v3 so they override the base v3
 # overlay (see the v3-overlay comment above). parity -> v3_noncausal isolates G1/G2/G3/G5;
