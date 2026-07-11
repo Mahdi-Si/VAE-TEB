@@ -1,30 +1,29 @@
-# config_synth_v3.yaml -- synthetic_v2 raw -> scattering -> block-TE on SeqVaeLagAttnV3.
+# config_synth_v3_band.yaml -- synthetic_v2 raw -> scattering -> block-TE on SeqVaeLagAttnV3,
+# with LONG, PER-SAMPLE-VARIABLE lags (`lag_mode: band`).
 #
-# Purpose: re-run the ENTIRE synthetic_v2 experiment against SeqVaeLagAttnV3 (causal
-# prior + zero-KL init + discriminating null control) on the SAME cache the v1 run used,
-# so the K_bar-versus-TE calibration is measured on a model whose prior is actually causal.
-# See SYNTHETIC_V3_SPEC_AND_SPRINTS.md.
+# Purpose: like config_synth_v3.yaml, but the UP->FHR coupling reaches back 3-5 minutes and
+# each sample draws its own lag D_i ~ Uniform{lo..hi} from a tight window (`mix.lag_bands`),
+# instead of a single fixed short lag per cell. This tests whether the model recovers a
+# distant, non-immediate, per-sample-variable source->target lag against a known ground truth.
 #
-# Additive and opt-in: config_synth_v2.yaml and the committed pl_module_v2 alias are
-# untouched, so the v1 path is the default and this file is entered only by pointing the
-# driver at it (`run_pipeline_v2.py --config config_synth_v3.yaml`). Every v3-specific key
-# (experiment.data_tag, model.class, model.v3, arms, loss.beta_schedule,
-# train.pilot_beta_schedule) is inert when absent.
+# Deltas vs config_synth_v3.yaml (everything else is identical):
+#   * experiment.tag / data_tag  -> a SEPARATE results dir and a FRESH cache (a lag change
+#     keys the build fingerprint, so the shared G1_raw_v2_notch cache is NOT reused).
+#   * data.K_history: 80 -> 140  -> the analytic-TE history must span the longest lag
+#     (>= D_max + 2H = 75 + 60 = 135); at 80 the injected-TE label under-measures and the
+#     solved coupling B is wrong. This is the #1 correctness gate.
+#   * mix.lag_mode: band + mix.lag_bands / lag_band_units  -> the per-sample lag windows.
+#   * model.v3.alibi_slope_scale: 0.25  -> soften the ALiBi recent-lag prior so a long true
+#     lag is reachable at init.
+#   * eval.lag_intervention.bands  -> refined to resolve the 45-75 step (3-5 min) window.
 #
-# The `benchmarks:`, `dataset:`, `optim:`, `plotting:` blocks are copied VERBATIM from
-# config_synth_v2.yaml: the three arms consume the same immutable .npz bytes, so any gamma
-# difference is attributable to the model, not to a data change. Do not edit them here.
+# Additive and opt-in: entered only via `run_pipeline_v2.py --config config_synth_v3_band.yaml`.
 
 experiment:
-  tag: G1_raw_v3               # results/<tag>/<arm>/... (per-arm, per this run)
-  # The cache leaf keys on data_tag (falling back to tag); the results dir keys on tag. This
-  # is what lets the three arms under tag: G1_raw_v3 read ONE immutable cache (S0-T01).
-  #
-  # HEADLINE / PROD RUN (current): `G1_raw_v2_notch` -- the full 12k-sample cache the v1
-  # run used -- so the v1-vs-v3 gamma comparison is on identical .npz bytes.
-  # DEV BOX: switch to `G1_raw_localpilot`, the reduced pilot cache built by S0-T00. The
-  # two coexist because their data_tags differ.
-  data_tag: G1_raw_v2_notch
+  tag: G1_raw_v3_band          # results/<tag>/<arm>/... (SEPARATE from the fixed v3 run)
+  # A lag change keys the build fingerprint, so band mode needs a FRESH cache under its own
+  # data_tag; the fixed G1_raw_v2_notch / G1_raw_v3 caches are never touched.
+  data_tag: G1_raw_v3_band_3to5min
   benchmark: G1_raw            # selects the active block under `benchmarks:`
   seed: 0
 
@@ -53,7 +52,9 @@ benchmarks:
     data:                      # coupled latent pair on the DECIMATED grid (§6)
       sequence_length: 300     # decimated, after trim
       horizon: 30
-      K_history: 80
+      K_history: 140           # BAND: hard gate is K >= max lag (75) -- below it the block-TE label
+                               # under-measures (K=60 loses ~36% at D=75). 140 = D_max + 2H matches the
+                               # analytic estimator's default margin and removes residual bias. Was 80.
       oscillators: [[0.80, 0.10]]   # (r, omega) -> contraction rhythm ~0.004 Hz ; SINGLE pathway
       target_ar: 0.40
       sigma2_y: 1.0
@@ -92,20 +93,33 @@ benchmarks:
 
     mix:                       # cell grid (§9.3) -- NO m_grid (single pathway)
       target_te_grid: [0.0, 0.5, 1.0, 2.0, 3.0]   # nats, incl. 0.0 null anchor
-      lag_grid: [8, 12, 20]                        # decimated steps ; fixed per-cell lag.
-      lag_mode: fixed
+      lag_mode: band                               # {fixed, band}; band = per-sample lag draw
+      # Each sample draws D_i ~ Uniform{lo..hi} (inclusive) from a window; step = 4 s, so these
+      # are 3.0-3.5 / 3.5-4.0 / 4.0-4.5 / 4.5-5.0 minutes. Crossed with target_te_grid.
+      lag_bands: [[45, 52], [52, 60], [60, 67], [67, 75]]
+      lag_band_units: steps                        # {steps, minutes}
+      lag_grid: [8, 12, 20]                        # ignored under lag_mode: band (kept for reference)
       n_per_cell_train: 800
       n_per_cell_val: 400
       n_per_cell_test: 800
       inverter:
         n_samples: 12000
         lo: 1.0e-4
-        hi: 60.0
+        hi: 120.0               # BAND: widened from 60 so long-lag couplings at te=3.0 stay in-bracket
         tol: 0.005
         max_iter: 40
 
     eval:
       realizability:
+        # BAND CAVEAT: the R0 frac_Phi probe conditions Y+ on a U- window of depth delay_max
+        # (67-75 here). At long lags that wide conditioning set induces a finite-sample
+        # OVER-ATTRIBUTION bias in the held-out block-TE determinant ratio (measured
+        # frac_Phi ~ 4 at te_inj = 2.0, well-conditioned -- ill_frac = 0, ridge does not
+        # help). This is intrinsic to the R0 method at long lags, NOT a rendering failure:
+        # the injected-TE labels are exact. `fatal: false` keeps it a warn-only readout;
+        # frac_over_one (frac_Phi > frac_upper) correctly flags the probe as unreliable
+        # here rather than passing. Judge long-lag realizability by the analytic te_scat
+        # trend and the model's actual lag recovery, not this build-time gate.
         fatal: false
         frac_threshold: 0.7
         frac_upper: 1.3
@@ -114,7 +128,8 @@ benchmarks:
         n_seeds: 2
         pilot:
           target_te_grid: [0.0, 1.0, 2.0, 3.0]
-          lag_grid: [4, 8]
+          lag_grid: [4, 8]          # fixed-mode pilot (unused under lag_mode: band)
+          lag_bands: [[45, 52]]     # band-mode pilot: one 3.0-3.5 min window
           n_per_cell: 384
         recovery:
           f_pulse_grid: [0.02, 0.04, 0.06]
@@ -157,12 +172,17 @@ benchmarks:
       # pilot the source pathway has not switched on, so every delta_L sits at ~0 and the
       # gate is a training-progress signal, not a verdict (see Section 11).
       lag_intervention:
+        # BAND: refined to resolve the 45-75 step (3-5 min) coupling window, which the
+        # default {31-60, 61-90} partition would smear across two coarse bins.
         bands:
-          "0-5": [0, 5]
-          "6-15": [6, 15]
-          "16-30": [16, 30]
-          "31-60": [31, 60]
-          "61-90": [61, 90]
+          "0-14": [0, 14]
+          "15-29": [15, 29]
+          "30-44": [30, 44]
+          "45-52": [45, 52]
+          "53-60": [53, 60]
+          "61-67": [61, 67]
+          "68-75": [68, 75]
+          "76-90": [76, 90]
         max_samples: 512
         margin_delta_L: 0.0
         noop_atol: 1.0e-6
@@ -261,6 +281,7 @@ model:
     delta_logvar_scale: 2.0
     kld_support: anchor            # G3: anchor-aligned KL support
     lag_bias_init: alibi_decay     # G5: ALiBi lag decay
+    alibi_slope_scale: 0.25        # BAND: soften the recent-lag penalty so a 3-5 min lag is reachable
     use_entmax: true               # sparse lag attention
     freeze_unused_attn_proj: true  # frees `find_unused_parameters=False` under head_structured_latent
     lambda_perm: 0.0               # v3 Finding F2: permutation control is a READOUT only, never a loss

@@ -541,6 +541,7 @@ class SeqVaeLagAttnV3(SeqVaeLagAttnV1):
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
+        alibi_slope_scale: float = 1.0,
         head_structured_latent: bool = False,
         init_weights: bool = True,
         logvar_bound: str = "clamp",
@@ -616,6 +617,7 @@ class SeqVaeLagAttnV3(SeqVaeLagAttnV1):
             use_entmax=use_entmax,
             attention_grad_checkpoint=attention_grad_checkpoint,
             lag_bias_init=lag_bias_init,
+            alibi_slope_scale=alibi_slope_scale,
             head_structured_latent=head_structured_latent,
             init_weights=init_weights,
         )

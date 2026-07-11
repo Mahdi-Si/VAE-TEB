@@ -130,6 +130,10 @@ class SeqVaeLagAttnPl(LightningModelBase):
         self._spike_ema_loss: Optional[float] = None
         self._spike_batches_seen: int = 0
         self._spike_skips_total: int = 0
+        # Escape-hatch state (see ``training_step``): run-length of consecutive skips,
+        # and a monotone count of force-accepts (the auto-rescue alarm).
+        self._spike_consecutive: int = 0
+        self._spike_forced_accepts_total: int = 0
 
     def _build_source_stream(self, batch: Any) -> torch.Tensor:
         """Build the ``u_stream`` tensor consumed by ``SeqVaeLagAttn.forward``.
@@ -180,6 +184,11 @@ class SeqVaeLagAttnPl(LightningModelBase):
         "warmup_batches": 100,
         # Write a warning to loguru each time a batch is skipped.
         "warn_on_skip": True,
+        # Escape hatch: after this many CONSECUTIVE skips, force-accept the next
+        # (finite-loss) batch and hard-re-seed the EMA to that batch's loss, so a
+        # collapsed EMA (e.g. from near-zero Gaussian-NLL loss under learned
+        # variance) can never freeze training indefinitely. 0 disables the hatch.
+        "max_consecutive_skips": 25,
     }
 
     @property
@@ -210,6 +219,24 @@ class SeqVaeLagAttnPl(LightningModelBase):
             return is_spike
         flag = torch.tensor([1.0 if is_spike else 0.0], device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item() > 0.0)
+
+    def _sync_force_accept_decision(
+        self, forced: bool, device: torch.device
+    ) -> bool:
+        """MIN-reduce ``forced`` so a force-accept happens only if EVERY rank agrees.
+
+        The escape hatch's finite-loss gate is computed from the *local* loss, so it
+        is not rank-invariant on its own: one rank going non-finite while others stay
+        finite would otherwise diverge the accept/skip autograd branches and deadlock
+        the DDP all-reduce in ``backward``. MIN-reducing means any ineligible rank
+        (non-finite loss, or not yet at the consecutive-skip cap) vetoes the
+        force-accept everywhere, so all ranks take the same branch.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return forced
+        flag = torch.tensor([1.0 if forced else 0.0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
         return bool(flag.item() > 0.0)
 
     def training_step(self, batch: Any, batch_idx: int):  # type: ignore[override]
@@ -249,17 +276,37 @@ class SeqVaeLagAttnPl(LightningModelBase):
         # Ensure all DDP ranks take the same branch (or backward deadlocks).
         is_spike = self._sync_skip_decision_across_ranks(is_spike, device=loss.device)
 
-        # Update the EMA only on accepted batches so a spike cannot raise the
-        # bar for the next one. During warmup we always update (priming).
-        if not is_spike:
+        # Escape hatch: after ``max_consecutive_skips`` skips in a row, force-accept
+        # this (finite-loss) batch and HARD-re-seed the EMA to its loss so the
+        # threshold recovers to a healthy scale in one step. Without this a collapsed
+        # EMA skips every batch forever (the EMA only updates on accepted steps, so it
+        # can never thaw on its own). The finite gate is rank-synced (MIN-reduce) so no
+        # rank force-accepts a step another rank must skip.
+        max_consec = int(cfg["max_consecutive_skips"])
+        forced_local = (
+            is_spike and not is_nonfinite and max_consec > 0
+            and self._spike_consecutive >= max_consec
+        )
+        forced_accept = self._sync_force_accept_decision(forced_local, device=loss.device)
+
+        # Update the EMA only on accepted batches so a spike cannot raise the bar for
+        # the next one (warmup always updates, priming). A forced-accept HARD-re-seeds
+        # the EMA to the current loss (a momentum step barely moves a collapsed EMA).
+        if forced_accept:
+            self._spike_ema_loss = loss_value
+            self._spike_consecutive = 0
+            self._spike_forced_accepts_total += 1
+            is_spike = False
+        elif is_spike:
+            self._spike_consecutive += 1
+            self._spike_skips_total += 1
+        else:
             m = float(cfg["ema_momentum"])
             if ema_before is None:
                 self._spike_ema_loss = loss_value
             else:
                 self._spike_ema_loss = m * loss_value + (1.0 - m) * ema_before
-
-        if is_spike:
-            self._spike_skips_total += 1
+            self._spike_consecutive = 0
 
         # Surface the circuit-breaker state to the unified metrics logger.
         ema_for_log = (
@@ -268,6 +315,9 @@ class SeqVaeLagAttnPl(LightningModelBase):
         metrics["spike_ema_loss"] = self._as_tensor(ema_for_log)
         metrics["spike_skipped"] = self._as_tensor(1.0 if is_spike else 0.0)
         metrics["spike_skips_total"] = self._as_tensor(self._spike_skips_total)
+        metrics["spike_forced_accepts_total"] = self._as_tensor(
+            self._spike_forced_accepts_total
+        )
         self._log_metrics(metrics, stage="train", on_step=True)
 
         if is_spike:

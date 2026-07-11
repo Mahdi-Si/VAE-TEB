@@ -151,3 +151,67 @@ def test_breaker_can_be_disabled(v3_pl, stub_batch, monkeypatch):
         pl_module.training_step(stub_batch, i)
 
     assert pl_module._spike_skips_total == 0
+
+
+def test_consecutive_skips_force_accept_and_reseed(v3_pl, stub_batch, perturb_posterior,
+                                                   monkeypatch):
+    """After ``max_consecutive_skips`` skips in a row, force-accept one finite batch.
+
+    The breaker takes the real gradient step, HARD-re-seeds the EMA to that batch's loss,
+    and resets the run-length -- so a collapsed EMA (the near-zero Gaussian-NLL regime that
+    froze the headline run) can never skip every batch indefinitely.
+    """
+    cap = 3
+    pl_module = v3_pl(hparams={"loss_spike_skip": {
+        "warmup_batches": 2, "multiplier": 5.0, "max_consecutive_skips": cap}})
+    perturb_posterior(pl_module.orig_model)
+    _install_skip_probe(pl_module)
+
+    _drive(pl_module, stub_batch, n_steps=4)  # prime the EMA
+    ema_before = pl_module._spike_ema_loss
+    assert pl_module._spike_skips_total == 0
+
+    _explode(pl_module, monkeypatch, factor=1000.0)
+
+    # A skipped step returns the zero no-op; a force-accepted step returns the real loss.
+    # (``_spike_skipped_last`` from the probe records the PRE-hatch decision, so it cannot
+    # distinguish a force-accept -- assert on the returned loss / counters instead.)
+    outs = []
+    for step in range(cap + 1):
+        torch.manual_seed(200 + step)
+        outs.append(pl_module.training_step(stub_batch, step))
+
+    for step in range(cap):
+        assert float(outs[step]) == 0.0, f"step {step} should be skipped (zero no-op)"
+    forced = outs[cap]
+
+    assert pl_module._spike_skips_total == cap, "a forced accept must not count as a skip"
+    assert pl_module._spike_forced_accepts_total == 1
+    assert pl_module._spike_consecutive == 0, "the run-length must reset after a forced accept"
+    # Hard re-seed (not a momentum blend): the EMA jumps to the forced step's main loss.
+    assert pl_module._spike_ema_loss != ema_before
+    assert pl_module._spike_ema_loss == float(forced)
+    # The forced step returns the REAL loss (attached, nonzero), not the zero no-op.
+    assert forced.requires_grad and torch.isfinite(forced) and float(forced) != 0.0
+
+
+def test_nonfinite_is_never_force_accepted_even_at_cap(v3_pl, stub_batch, monkeypatch):
+    """A non-finite loss is ALWAYS skipped -- the hatch must never force-accept a NaN.
+
+    Force-accepting a NaN would take a NaN gradient step and, under DDP, diverge the
+    accept/skip autograd branch across ranks. The finite gate must hold even past the cap.
+    """
+    cap = 3
+    pl_module = v3_pl(hparams={"loss_spike_skip": {
+        "warmup_batches": 0, "multiplier": 5.0, "max_consecutive_skips": cap}})
+    _install_skip_probe(pl_module)
+    _explode(pl_module, monkeypatch, factor=float("nan"))
+
+    for step in range(cap + 3):  # well past the cap
+        torch.manual_seed(300 + step)
+        out = pl_module.training_step(stub_batch, step)
+        assert pl_module._spike_skipped_last, f"NaN step {step} must always skip"
+        assert math.isfinite(float(out)), "the no-op loss must stay finite"
+
+    assert pl_module._spike_forced_accepts_total == 0
+    assert pl_module._spike_skips_total == cap + 3

@@ -59,3 +59,33 @@ def test_alibi_bias_receives_gradient(tiny_kwargs, inputs):
 def test_invalid_lag_bias_init_raises(tiny_kwargs):
     with pytest.raises(ValueError):
         SeqVaeLagAttnV3(lag_bias_init="exponential", **tiny_kwargs)
+
+
+def test_alibi_slope_scale_default_is_identity(tiny_kwargs):
+    r"""``alibi_slope_scale=1.0`` (default) reproduces the standard ALiBi init exactly."""
+    default = SeqVaeLagAttnV3(lag_bias_init="alibi_decay", **tiny_kwargs)
+    explicit = SeqVaeLagAttnV3(
+        lag_bias_init="alibi_decay", alibi_slope_scale=1.0, **tiny_kwargs
+    )
+    assert torch.equal(
+        default.lag_attn.lag_score_bias.detach(),
+        explicit.lag_attn.lag_score_bias.detach(),
+    )
+
+
+def test_alibi_slope_scale_softens_the_slope(tiny_kwargs):
+    r"""``alibi_slope_scale=s`` scales the per-lag decay bias by ``s`` (softer long-lag prior)."""
+    base = SeqVaeLagAttnV3(lag_bias_init="alibi_decay", **tiny_kwargs)
+    soft = SeqVaeLagAttnV3(
+        lag_bias_init="alibi_decay", alibi_slope_scale=0.25, **tiny_kwargs
+    )
+    assert torch.allclose(
+        soft.lag_attn.lag_score_bias.detach(),
+        0.25 * base.lag_attn.lag_score_bias.detach(),
+    )
+    # The softened bias penalises the far lag ~4x less, so distant lags stay reachable.
+    far = tiny_kwargs["max_lag"]
+    assert bool(
+        (soft.lag_attn.lag_score_bias.detach()[:, far]
+         > base.lag_attn.lag_score_bias.detach()[:, far]).all()
+    )

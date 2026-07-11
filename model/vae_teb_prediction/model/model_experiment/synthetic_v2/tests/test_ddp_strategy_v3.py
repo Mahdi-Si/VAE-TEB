@@ -190,6 +190,31 @@ def test_no_spike_while_priming(monkeypatch) -> None:
     assert torch.isfinite(out).all()
 
 
+def test_spike_breaker_force_accepts_after_cap(monkeypatch) -> None:
+    """At the consecutive-skip cap the breaker force-accepts one batch and re-seeds the EMA.
+
+    This is the regression for the headline-run freeze: a collapsed EMA (near-zero
+    learned-variance NLL loss) otherwise skips every batch forever. Sitting exactly at the
+    cap, the next real batch must be accepted, the EMA hard-re-seeded off the collapsed
+    value, the run-length reset, and the forced accept must NOT count as a skip.
+    """
+    _, wrap = _wrap_with_schedule()
+    monkeypatch.setattr(wrap, "_log_metrics", lambda *a, **k: None)
+    cap = int(wrap._spike_cfg["max_consecutive_skips"])
+    wrap._spike_batches_seen = int(wrap._spike_cfg["warmup_batches"])  # past priming
+    wrap._spike_ema_loss = 1e-6           # collapsed EMA: any real loss is a >5x spike
+    wrap._spike_consecutive = cap         # exactly at the cap -> next step is force-accepted
+
+    out = wrap.training_step(_batch(), 0)
+
+    assert wrap._spike_skips_total == 0, "a forced accept must not count as a skip"
+    assert wrap._spike_forced_accepts_total == 1
+    assert wrap._spike_consecutive == 0
+    assert torch.isfinite(out).all() and float(out) != 0.0
+    # Hard re-seed off the collapsed 1e-6 to the real batch-loss scale.
+    assert wrap._spike_ema_loss == float(out)
+
+
 # -- 2-rank gloo DDP reducer smoke ------------------------------------------
 # Run in spawned worker processes; must be importable at module level for pickling.
 def _ddp_worker(rank: int, world_size: int, err_queue) -> None:  # pragma: no cover

@@ -223,6 +223,11 @@ model_config:
       ema_momentum: 0.02     # EMA smoothing (smaller = longer memory)
       warmup_batches: 100    # priming window before gating activates
       warn_on_skip: true     # emit a loguru warning on every skip
+      # Escape hatch: after this many CONSECUTIVE skips, force-accept the next
+      # (finite-loss) batch and hard-re-seed the EMA to it. Prevents the collapsed-EMA
+      # deadlock that freezes learned-variance NLL runs (loss → 0/neg → EMA → 0 →
+      # 5×EMA below every batch → skip forever). 0 disables the hatch.
+      max_consecutive_skips: 25
 
   core_model_checkpoint: null
 

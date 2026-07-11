@@ -12,9 +12,15 @@ intercept anchor and the null control (§9.3).
 Sprint 3 implements enumeration + the coupling solve + in-memory pilot generation
 (:func:`generate_pilot_samples`), reusing :func:`raw_generators.generate_cell_raw`
 so the Sprint 4 cache build shares the same generation path. The single source and
-single target mean there is **no** ``M`` (informative-channel) axis and — for the
-initial build — a **fixed** per-cell lag only (``lag_mode: fixed``); ``band`` mode is
-deferred (the inverter retains the band-averaging math for later).
+single target mean there is **no** ``M`` (informative-channel) axis.
+
+Two lag modes are supported. ``lag_mode: fixed`` gives every sample in a cell the same
+lag ``D`` (``mix.lag_grid``). ``lag_mode: band`` draws a per-sample lag
+$D_i \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$ from each configured window
+(``mix.lag_bands``); the coupling $B$ is solved once against the mean block TE over the
+window and each sample is labelled with its own $\mathrm{TE}_{\mathrm{inj}}(D_i)$ from a
+per-delay TE map (``CellV2.te_by_delay``). Band mode enables long, non-immediate,
+per-sample-variable lags while keeping the injected-TE ground truth exact.
 
 See ``SYNTHETIC_V2_RAW_TE_PIPELINE_EXPLAINED.md`` §6, §9, §17 and
 ``SYNTHETIC_V2_SPEC_AND_SPRINTS.md`` Sprints 3–4.
@@ -34,8 +40,9 @@ import numpy as np
 from .analytic_te import (
     B_y_for_mean_te_block_state_space,
     snr_per_step_for_te_block,
+    te_block_state_space_gaussian,
 )
-from .raw_generators import generate_cell_raw
+from .raw_generators import DECIMATION, generate_cell_raw
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +64,35 @@ _CELL_SEED_STRIDE: int = 101
 
 @dataclass(frozen=True)
 class CellV2:
-    r"""One $(\texttt{target\_te}, D)$ cell of the single-pathway v2 grid.
+    r"""One cell of the single-pathway v2 grid — $(\texttt{target\_te}, D)$ (fixed) or
+    $(\texttt{target\_te}, [d_{\min}, d_{\max}])$ (band).
 
-    Unlike v1's ``MixCell`` there is no ``M`` (informative-channel count) and no
-    lag ``band`` — v2 has exactly one source, one target, and a fixed per-cell lag.
+    Unlike v1's ``MixCell`` there is no ``M`` (informative-channel count). In
+    ``lag_mode: fixed`` a cell carries one lag ``D`` shared by every sample; in
+    ``lag_mode: band`` it carries a lag window $[d_{\min}, d_{\max}]$ from which each
+    sample draws its own $D_i$, plus a per-delay TE map so every sample can be labelled
+    with its exact $\mathrm{TE}_{\mathrm{inj}}(D_i)$.
 
     Attributes:
         cell_id: Stable index of the cell within the pool (assigned in enumeration
             order; null cells included).
         target_te: The *requested* injected block TE in nats ($\ge 0$; ``0`` is the
-            null anchor).
-        D: The fixed source→target lag $D \ge 1$ in decimated steps.
+            null anchor). In band mode this is the *mean-over-window* target.
+        D: The representative lag in decimated steps ($\ge 1$). In band mode this equals
+            ``delay_min`` and is used only as a fallback/summary; the per-sample lags are
+            drawn from $[\texttt{delay\_min}, \texttt{delay\_max}]$.
         B_y_scalar: The solved coupling $B$ (the inverter's ``B_y_scalar``; ``0`` for
             a null cell).
-        te_block_realised: The *achieved* block TE at ``B_y_scalar`` — the exact
-            $\mathrm{TE}_{\mathrm{inj}}$ label the cell is graded against. Equals the
-            requested ``target_te`` within the inverter tolerance; ``0`` for a null.
+        te_block_realised: The *achieved* block TE at ``B_y_scalar`` — the cell-level
+            $\mathrm{TE}_{\mathrm{inj}}$ label. In fixed mode this is the exact per-sample
+            label; in band mode it is the mean over the window (per-sample labels come
+            from ``te_by_delay``). ``0`` for a null.
+        lag_mode: ``'fixed'`` or ``'band'`` — how per-sample lags are assigned.
+        delay_min: Smallest per-sample lag (inclusive). Equals ``D`` in fixed mode.
+        delay_max: Largest per-sample lag (inclusive). Equals ``D`` in fixed mode.
+        te_by_delay: Band mode only — ``{delay: TE_block(delay) at B_y_scalar}`` over the
+            full window $[d_{\min}, d_{\max}]$, used to label each sample by its drawn
+            $D_i$. ``None`` in fixed mode.
     """
 
     cell_id: int
@@ -80,23 +100,32 @@ class CellV2:
     D: int
     B_y_scalar: float
     te_block_realised: float
+    lag_mode: str = "fixed"
+    delay_min: int = -1
+    delay_max: int = -1
+    te_by_delay: Optional[Dict[int, float]] = None
 
 
 def solve_cell_coupling(
     config: Dict[str, Any],
     target_te: float,
-    delay: int,
+    delay_min: int,
+    delay_max: Optional[int] = None,
     *,
     benchmark: str = "G1_raw",
 ) -> Dict[str, Any]:
-    r"""Solve the coupling $B$ for a cell authored by ``(target_te, D)`` (§9.1).
+    r"""Solve the coupling $B$ for a cell — fixed lag ``D`` or a lag window (§9.1).
 
     Reads the single-pathway latent spec (``benchmarks.<benchmark>.data``), the
     inverter knobs (``mix.inverter``), and the Monte-Carlo seed
-    (``seeds.inverter_mc``) from ``config`` and calls the ported inverter with a
-    fixed lag ($d_{\min} = d_{\max} = D$). The per-step SNR uses
-    $M = \mathrm{len(oscillators)}$ ($= 1$ in v2), matching the $M$ the inverter's
-    ``te_block`` already reflects.
+    (``seeds.inverter_mc``) from ``config`` and calls the ported inverter over the lag
+    range $[d_{\min}, d_{\max}]$. When ``delay_max is None`` (or equal to ``delay_min``)
+    this is the fixed-lag solve ($d_{\min} = d_{\max} = D$, byte-identical to the prior
+    behaviour). When ``delay_max > delay_min`` the inverter matches ``target_te`` to the
+    *mean* block TE over the uniform window, and a **per-delay TE map** ``te_by_delay``
+    (the block TE at the solved $B$ for each $d \in [d_{\min}, d_{\max}]$) is attached so
+    each band sample can be labelled with its own $\mathrm{TE}_{\mathrm{inj}}(D_i)$. The
+    per-step SNR uses $M = \mathrm{len(oscillators)}$ ($= 1$ in v2).
 
     This is the single owner of the inverter call: :func:`run_pipeline_v2.solve_te`
     and :func:`enumerate_cells_v2` both delegate here so the CLI demo and the build
@@ -104,13 +133,19 @@ def solve_cell_coupling(
 
     Args:
         config: The parsed ``config_synth_v2.yaml`` tree.
-        target_te: Target injected block TE in nats ($\ge 0$; ``0`` is a null cell).
-        delay: Fixed source→target lag $D \ge 1$ in decimated steps.
+        target_te: Target injected block TE in nats ($\ge 0$; ``0`` is a null cell). In
+            band mode this is the *mean-over-window* target.
+        delay_min: Smallest source→target lag $\ge 1$ in decimated steps (the fixed lag
+            ``D`` when ``delay_max`` is ``None``).
+        delay_max: Largest source→target lag (inclusive). ``None`` (default) → fixed lag
+            equal to ``delay_min``.
         benchmark: Active benchmark key under ``benchmarks``.
 
     Returns:
-        The inverter's result dict augmented with ``snr_per_step``: keys ``B_y``,
-        ``B_y_scalar``, ``te_block``, ``te_per_step``, ``n_iter``, ``snr_per_step``.
+        The inverter's result dict augmented with ``snr_per_step`` (keys ``B_y``,
+        ``B_y_scalar``, ``te_block``, ``te_per_step``, ``n_iter``, ``snr_per_step``) and,
+        when ``delay_max > delay_min``, ``te_by_delay`` (``{delay: block TE at solved B}``
+        over the full window).
 
     Raises:
         ValueError: If the inverter's bracket $[\texttt{lo}, \texttt{hi}]$ does not
@@ -123,17 +158,24 @@ def solve_cell_coupling(
     seed = int(config.get("seeds", {}).get("inverter_mc", 0))
     oscillators = [tuple(spec) for spec in data["oscillators"]]
     horizon = int(data["horizon"])
+    k_history = int(data["K_history"])
+    lo_d = int(delay_min)
+    hi_d = lo_d if delay_max is None else int(delay_max)
+    if hi_d < lo_d:
+        raise ValueError(
+            f"solve_cell_coupling: delay_max ({hi_d}) < delay_min ({lo_d})."
+        )
 
     solution = B_y_for_mean_te_block_state_space(
         target_te_block=float(target_te),
-        delay_min=int(delay),
-        delay_max=int(delay),
+        delay_min=lo_d,
+        delay_max=hi_d,
         oscillators=oscillators,
         target_ar=float(data["target_ar"]),
         sigma2_y=float(data["sigma2_y"]),
         sigma2_eta=float(data["sigma2_eta"]),
         H=horizon,
-        K_history=int(data["K_history"]),
+        K_history=k_history,
         n_samples=int(inverter["n_samples"]),
         lo=float(inverter["lo"]),
         hi=float(inverter["hi"]),
@@ -144,7 +186,80 @@ def solve_cell_coupling(
     solution["snr_per_step"] = snr_per_step_for_te_block(
         solution["te_block"], horizon, len(oscillators)
     )
+    # Band cells label each sample by its own drawn lag, so map the block TE at the
+    # solved B over the whole window. (Same MC seed convention as the inverter's
+    # mean_te_block_state_space_over_delays: seed + d per delay.)
+    if hi_d > lo_d:
+        b_scalar = float(solution["B_y_scalar"])
+        solution["te_by_delay"] = {
+            d: float(
+                te_block_state_space_gaussian(
+                    oscillators=oscillators,
+                    target_ar=float(data["target_ar"]),
+                    delays=[d] * len(oscillators),
+                    B_y=[b_scalar] * len(oscillators),
+                    sigma2_y=float(data["sigma2_y"]),
+                    sigma2_eta=float(data["sigma2_eta"]),
+                    H=horizon,
+                    K_history=k_history,
+                    n_samples=int(inverter["n_samples"]),
+                    seed=seed + d,
+                )
+            )
+            for d in range(lo_d, hi_d + 1)
+        }
     return solution
+
+
+def _step_seconds(bench: Dict[str, Any]) -> float:
+    r"""Decimated latent-grid step duration in seconds: ``DECIMATION / raw.fs`` (= 4 s).
+
+    Lags are defined on the decimated *latent* grid (stride ``raw_generators.DECIMATION``),
+    which the pipeline locks equal to ``scattering.T``; ``DECIMATION`` is the canonical
+    basis for a lag's minute↔step conversion.
+    """
+    return float(DECIMATION) / float(bench["raw"]["fs"])
+
+
+def resolve_lag_bands(
+    mix: Dict[str, Any],
+    bench: Dict[str, Any],
+    override: Optional[Sequence[Sequence[float]]] = None,
+) -> List[Tuple[int, int]]:
+    r"""Resolve ``mix.lag_bands`` to a list of inclusive integer step windows.
+
+    Each entry is a ``[lo, hi]`` pair. When ``mix.lag_band_units == 'minutes'`` the pairs
+    are interpreted in minutes and converted to decimated steps via
+    ``round(minutes * 60 / step_seconds)`` (``step_seconds = scattering.T / raw.fs``);
+    otherwise (``'steps'``, the default) they are used verbatim as integer steps.
+
+    Args:
+        mix: The ``benchmarks.<benchmark>.mix`` block.
+        bench: The ``benchmarks.<benchmark>`` block (for the step duration).
+        override: Optional explicit band list (e.g. a pilot grid); ``mix.lag_bands`` is
+            used when ``None``.
+
+    Returns:
+        A list of ``(lo, hi)`` int step windows with ``1 <= lo <= hi``.
+    """
+    raw_bands = list(mix["lag_bands"] if override is None else override)
+    units = str(mix.get("lag_band_units", "steps"))
+    step_s = _step_seconds(bench)
+    out: List[Tuple[int, int]] = []
+    for pair in raw_bands:
+        lo_raw, hi_raw = pair[0], pair[1]
+        if units == "minutes":
+            lo = int(round(float(lo_raw) * 60.0 / step_s))
+            hi = int(round(float(hi_raw) * 60.0 / step_s))
+        else:
+            lo, hi = int(lo_raw), int(hi_raw)
+        if not (1 <= lo <= hi):
+            raise ValueError(
+                f"resolve_lag_bands: each band needs 1 <= lo <= hi, got "
+                f"[{lo}, {hi}] (from {pair!r}, units={units!r})."
+            )
+        out.append((lo, hi))
+    return out
 
 
 def enumerate_cells_v2(
@@ -153,18 +268,27 @@ def enumerate_cells_v2(
     benchmark: str = "G1_raw",
     target_te_grid: Optional[Sequence[float]] = None,
     lag_grid: Optional[Sequence[int]] = None,
+    lag_bands: Optional[Sequence[Sequence[float]]] = None,
 ) -> Tuple[List[CellV2], List[Dict[str, Any]]]:
     r"""Enumerate and solve the cell grid (§9.3).
 
-    Crosses ``target_te_grid`` with ``lag_grid`` (fixed lag). For each pair:
+    Crosses ``target_te_grid`` with the lag grid. Two lag modes:
+
+    * ``lag_mode: fixed`` — crosses with ``lag_grid`` (one lag ``D`` per cell); memoised
+      on ``(round(target_te, 9), D)``.
+    * ``lag_mode: band`` — crosses with ``lag_bands`` (a ``[lo, hi]`` window per cell);
+      each sample later draws its own $D_i \sim \mathrm{Uniform}\{lo,\dots,hi\}$. The
+      coupling is solved against the mean block TE over the window and memoised on
+      ``(round(target_te, 9), lo, hi)``; the per-delay TE map ``te_by_delay`` is attached
+      for per-sample labelling.
+
+    For each cell:
 
     * ``target_te == 0`` → a **null** cell ($B = 0$, ``te_block_realised = 0``),
       kept without invoking the inverter.
-    * ``target_te > 0`` → solve the coupling via :func:`solve_cell_coupling`. The
-      inverter Monte-Carlo is memoised on ``(round(target_te, 9), D)`` so identical
-      authored cells solve once. A cell whose bracket misses the target (the
-      inverter raises :class:`ValueError`) is **logged and dropped** — collected in
-      the returned ``dropped`` list rather than aborting enumeration.
+    * ``target_te > 0`` → solve the coupling via :func:`solve_cell_coupling`. A cell whose
+      bracket misses the target (the inverter raises :class:`ValueError`) is **logged and
+      dropped** — collected in the returned ``dropped`` list rather than aborting.
 
     ``cell_id`` is assigned in enumeration order over the *kept* cells (dropped cells
     do not consume an id), so the pool's ids are contiguous.
@@ -174,76 +298,94 @@ def enumerate_cells_v2(
         benchmark: Active benchmark key under ``benchmarks``.
         target_te_grid: Override for ``mix.target_te_grid`` (e.g. the pilot grid); the
             config value is used when ``None``.
-        lag_grid: Override for ``mix.lag_grid``; the config value is used when ``None``.
+        lag_grid: Override for ``mix.lag_grid`` (fixed mode); config value when ``None``.
+        lag_bands: Override for ``mix.lag_bands`` (band mode); config value when ``None``.
 
     Returns:
         ``(cells, dropped)`` — the kept :class:`CellV2` list (contiguous ``cell_id``)
-        and a list of ``{'target_te', 'D', 'reason'}`` dicts for unsolvable cells.
+        and a list of ``{'target_te', 'D'/'delay_min'/'delay_max', 'reason'}`` dicts for
+        unsolvable cells.
 
     Raises:
-        ValueError: If ``mix.lag_mode`` is not ``fixed`` (``band`` mode is deferred).
+        ValueError: If ``mix.lag_mode`` is not ``fixed`` or ``band``.
     """
     bench = config["benchmarks"][benchmark]
     mix = bench["mix"]
     lag_mode = str(mix.get("lag_mode", "fixed"))
-    if lag_mode != "fixed":
+    if lag_mode not in ("fixed", "band"):
         raise ValueError(
-            f"enumerate_cells_v2: only lag_mode 'fixed' is implemented in the "
-            f"initial build, got {lag_mode!r} (band mode is deferred; see "
-            "SYNTHETIC_V2_SPEC_AND_SPRINTS.md non-goals)."
+            f"enumerate_cells_v2: lag_mode must be 'fixed' or 'band', got {lag_mode!r}."
         )
     te_grid = list(mix["target_te_grid"] if target_te_grid is None else target_te_grid)
-    lags = list(mix["lag_grid"] if lag_grid is None else lag_grid)
+    # Windows as (lo, hi) step pairs; fixed mode is the degenerate lo == hi == D window.
+    if lag_mode == "band":
+        windows = resolve_lag_bands(mix, bench, lag_bands)
+    else:
+        lags = list(mix["lag_grid"] if lag_grid is None else lag_grid)
+        windows = [(int(d), int(d)) for d in lags]
 
     cells: List[CellV2] = []
     dropped: List[Dict[str, Any]] = []
-    solved_cache: Dict[Tuple[float, int], Dict[str, Any]] = {}
+    solved_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     next_id = 0
 
     for target_te in te_grid:
         target_te = float(target_te)
-        for delay in lags:
-            delay = int(delay)
+        for lo_d, hi_d in windows:
+            is_band = hi_d > lo_d
             if target_te == 0.0:
+                te_by_delay = (
+                    {d: 0.0 for d in range(lo_d, hi_d + 1)} if is_band else None
+                )
                 cells.append(
-                    CellV2(cell_id=next_id, target_te=0.0, D=delay,
-                           B_y_scalar=0.0, te_block_realised=0.0)
+                    CellV2(
+                        cell_id=next_id, target_te=0.0, D=lo_d,
+                        B_y_scalar=0.0, te_block_realised=0.0,
+                        lag_mode=lag_mode, delay_min=lo_d, delay_max=hi_d,
+                        te_by_delay=te_by_delay,
+                    )
                 )
                 next_id += 1
                 continue
 
-            key = (round(target_te, 9), delay)
+            key = (round(target_te, 9), lo_d, hi_d)
             solution = solved_cache.get(key)
             if solution is None:
                 try:
                     solution = solve_cell_coupling(
-                        config, target_te, delay, benchmark=benchmark
+                        config, target_te, lo_d, hi_d, benchmark=benchmark
                     )
                 except ValueError as exc:
                     reason = str(exc)
                     logger.warning(
                         "enumerate_cells_v2: dropping unsolvable cell "
-                        "(target_te=%g, D=%d): %s", target_te, delay, reason
+                        "(target_te=%g, lag=[%d,%d]): %s",
+                        target_te, lo_d, hi_d, reason,
                     )
                     dropped.append(
-                        {"target_te": target_te, "D": delay, "reason": reason}
+                        {"target_te": target_te, "D": lo_d,
+                         "delay_min": lo_d, "delay_max": hi_d, "reason": reason}
                     )
                     continue
                 solved_cache[key] = solution
 
+            te_by_delay = solution.get("te_by_delay") if is_band else None
             cells.append(
                 CellV2(
                     cell_id=next_id,
                     target_te=target_te,
-                    D=delay,
+                    D=lo_d,
                     B_y_scalar=float(solution["B_y_scalar"]),
                     te_block_realised=float(solution["te_block"]),
+                    lag_mode=lag_mode, delay_min=lo_d, delay_max=hi_d,
+                    te_by_delay=te_by_delay,
                 )
             )
             next_id += 1
 
     logger.info(
-        "enumerate_cells_v2: %d cells kept (%d null, %d signal), %d dropped.",
+        "enumerate_cells_v2: [%s] %d cells kept (%d null, %d signal), %d dropped.",
+        lag_mode,
         len(cells),
         sum(1 for c in cells if c.target_te == 0.0),
         sum(1 for c in cells if c.target_te != 0.0),
@@ -311,12 +453,20 @@ def generate_pilot_samples(
 
     Returns:
         The :func:`raw_generators.generate_cell_raw` dict (``fhr_raw``, ``up_raw``,
-        ``true_lag_tt``, ``latents``, ``meta``), with ``meta['cell_id']`` added.
+        ``true_lag_tt``, ``sample_delay``, ``latents``, ``meta``), with ``meta['cell_id']``
+        added. In band mode ``sample_delay`` is the ``(n,)`` per-sample lag vector.
     """
     seeds = config.get("seeds", {})
     if base_seed is None:
         base_seed = int(seeds.get("dgp", seeds.get("base_seed", 0)))
     seed = cell_seed(base_seed, cell.cell_id, split)
+    band_kwargs: Dict[str, Any] = {}
+    if cell.lag_mode == "band":
+        band_kwargs = {
+            "lag_mode": "band",
+            "delay_min": int(cell.delay_min),
+            "delay_max": int(cell.delay_max),
+        }
     raw = generate_cell_raw(
         int(n),
         B=cell.B_y_scalar,
@@ -326,6 +476,7 @@ def generate_pilot_samples(
         seed=seed,
         te_inj=cell.te_block_realised,
         render_mode=render_mode,
+        **band_kwargs,
     )
     raw["meta"]["cell_id"] = int(cell.cell_id)
     return raw
@@ -397,10 +548,16 @@ def make_raw_provider(
     cells_by_id: Dict[int, CellV2] = {}
     for c in meta.get("cells", []) or []:
         cid = int(c["cell_id"])
+        # Reconstruct the band window so the per-sample lag draw (seeded from cell_seed)
+        # reproduces exactly. Absent keys (a fixed-mode cache) default to the fixed lag D.
+        lag_mode = str(c.get("lag_mode", "fixed"))
+        d_lo = int(c.get("delay_min", c["D"]))
+        d_hi = int(c.get("delay_max", c["D"]))
         cells_by_id[cid] = CellV2(
             cell_id=cid, target_te=float(c.get("target_te", 0.0)), D=int(c["D"]),
             B_y_scalar=float(c.get("B_y_scalar", 0.0)),
             te_block_realised=float(c.get("te_block_realised", c.get("te_inj", 0.0))),
+            lag_mode=lag_mode, delay_min=d_lo, delay_max=d_hi,
         )
     if not cells_by_id:
         raise ValueError(f"make_raw_provider: meta.json under {cdir} has no cells")
@@ -557,7 +714,7 @@ def _part_fingerprint(
     # cached part. Represent fhrv_band_power deterministically (sorted key=value pairs).
     fhrv_power = raw.get("fhrv_band_power", {}) or {}
     fhrv_power_str = ",".join(f"{k}={float(v):.10g}" for k, v in sorted(fhrv_power.items()))
-    return "|".join([
+    parts = [
         "v2",
         f"n={int(n)}",
         f"cid={int(cell.cell_id)}",
@@ -572,7 +729,13 @@ def _part_fingerprint(
         f"fhrv_notch={bool(raw.get('fhrv_notch_enabled', True))}",
         f"Q={bench.get('scattering', {}).get('Q')}",
         f"fhrv_power={fhrv_power_str}",
-    ])
+    ]
+    # Band cells depend on the per-sample lag window (and the draw is deterministic from
+    # the cell seed). Appended only in band mode so fixed fingerprints -- and therefore
+    # existing fixed part caches -- stay byte-identical.
+    if cell.lag_mode == "band":
+        parts.append(f"band={int(cell.delay_min)},{int(cell.delay_max)}")
+    return "|".join(parts)
 
 
 def _read_part_fingerprint(path: Path) -> Optional[str]:
@@ -685,6 +848,11 @@ def build_split_parts(
         )
         part = {name: np.asarray(fields_cf[name], dtype=np.float32) for name in _FIELD_NAMES}
         part["true_lag_tt"] = true_lag
+        # Band mode: persist the per-sample lag vector so ``assemble_split`` can stamp the
+        # per-sample delay and its per-delay TE label. Fixed parts get no such key, so the
+        # part schema is byte-identical to the existing fixed caches.
+        if cell.lag_mode == "band" and raw.get("sample_delay") is not None:
+            part["sample_delay"] = np.asarray(raw["sample_delay"], dtype=np.int16)
         part["_fingerprint"] = np.array(fingerprint)
         _savez_atomic(pp, part)
         logger.info(
@@ -815,6 +983,11 @@ def assemble_split(
         with np.load(pp) as part:
             cf = {name: np.asarray(part[name]) for name in _FIELD_NAMES}
             true_lag = np.asarray(part["true_lag_tt"], dtype=np.int16)
+            # Band mode persisted the per-sample lag vector; fixed parts have no such key.
+            sample_delay_cell = (
+                np.asarray(part["sample_delay"], dtype=np.int16)
+                if "sample_delay" in part.files else None
+            )
         normed_cf = normalise_fields(cf, stats)
         fields = {
             name: np.ascontiguousarray(np.transpose(normed_cf[name], (0, 2, 1)))
@@ -846,10 +1019,25 @@ def assemble_split(
         for name in _FIELD_NAMES:
             per_field[name].append(fields[name])
         lag_list.append(true_lag)
-        te_true.append(np.full(n_c, cell.te_block_realised, dtype=np.float32))
+        # Band cells label each sample by its own drawn lag D_i via the per-delay TE map;
+        # fixed cells stamp the single cell lag and TE. (A band cell whose map is somehow
+        # absent falls back to the cell-level constants rather than aborting the build.)
+        if cell.lag_mode == "band" and sample_delay_cell is not None:
+            delay_a.append(sample_delay_cell)
+            if cell.te_by_delay is not None:
+                te_true.append(
+                    np.array(
+                        [cell.te_by_delay[int(x)] for x in sample_delay_cell],
+                        dtype=np.float32,
+                    )
+                )
+            else:
+                te_true.append(np.full(n_c, cell.te_block_realised, dtype=np.float32))
+        else:
+            delay_a.append(np.full(n_c, cell.D, dtype=np.int16))
+            te_true.append(np.full(n_c, cell.te_block_realised, dtype=np.float32))
         te_scat_a.append(np.full(n_c, te_scat_v, dtype=np.float32))
         frac_a.append(np.full(n_c, frac_v, dtype=np.float32))
-        delay_a.append(np.full(n_c, cell.D, dtype=np.int16))
         cell_a.append(np.full(n_c, cell.cell_id, dtype=np.int16))
         held_a.append(np.zeros(n_c, dtype=np.int8))
         # Within-cell row index (0..n_c-1), in the pre-shuffle generation order. This is the
@@ -934,7 +1122,25 @@ def write_cache_v2(
     c_y_ph = int(adapter.fhr_ph_channels)
     c_u_st = int(adapter.scattering_channels)
     c_u_ph = int(adapter.up_ph_channels)
-    max_delay = max((int(c.D) for c in cells), default=1)
+
+    def _cell_hi(c: CellV2) -> int:
+        return int(c.delay_max) if int(c.delay_max) >= 1 else int(c.D)
+
+    def _cell_lo(c: CellV2) -> int:
+        return int(c.delay_min) if int(c.delay_min) >= 1 else int(c.D)
+
+    max_delay = max((_cell_hi(c) for c in cells), default=1)
+    any_band = any(c.lag_mode == "band" for c in cells)
+    # Fixed mode keeps the historical {0 .. max D - 1} band (byte-identical). Band mode
+    # uses the tighter per-window union L* = U {max(0, lo - H) .. hi - 1}, since a sample
+    # with lag D_i drives the horizon only through source lags {max(0, D_i - H) .. D_i-1}.
+    if any_band:
+        band_set: set = set()
+        for c in cells:
+            band_set.update(range(max(0, _cell_lo(c) - horizon), _cell_hi(c)))
+        true_lag_band = sorted(int(x) for x in band_set)
+    else:
+        true_lag_band = list(range(int(max_delay)))
     te_pooled = float(np.mean([c.te_block_realised for c in cells])) if cells else 0.0
 
     cell_manifest: List[Dict[str, Any]] = []
@@ -944,6 +1150,9 @@ def write_cache_v2(
             "cell_id": int(c.cell_id),
             "target_te": float(c.target_te),
             "D": int(c.D),
+            "lag_mode": str(c.lag_mode),
+            "delay_min": _cell_lo(c),
+            "delay_max": _cell_hi(c),
             "B_y_scalar": float(c.B_y_scalar),
             "te_block_realised": float(c.te_block_realised),
             "te_scat_measured": probe.get("te_scat"),
@@ -956,7 +1165,7 @@ def write_cache_v2(
         "render_mode": str(bench["raw"].get("render_mode", "am_carrier")),
         "te_true": te_pooled,
         "te_per_step": te_pooled / horizon if horizon else 0.0,
-        "true_lag_band": list(range(int(max_delay))),
+        "true_lag_band": true_lag_band,
         "horizon": horizon,
         "sequence_length": T,
         "clean_anchor_range": [int(max_delay) - 1, T - horizon],
@@ -973,8 +1182,13 @@ def write_cache_v2(
         "n_per_cell": {s: int(n) for s, n in n_per_split.items()},
         "grid": {
             "target_te_grid": [float(t) for t in mix["target_te_grid"]],
-            "lag_grid": [int(d) for d in mix["lag_grid"]],
             "lag_mode": str(mix.get("lag_mode", "fixed")),
+            **({"lag_grid": [int(d) for d in mix["lag_grid"]]}
+               if mix.get("lag_grid") is not None else {}),
+            **({"lag_bands": [list(w) for w in sorted(
+                {(int(c.delay_min), int(c.delay_max))
+                 for c in cells if c.lag_mode == "band"})]}
+               if any_band else {}),
         },
         "raw": bench["raw"],
         "scattering": bench["scattering"],
@@ -984,8 +1198,11 @@ def write_cache_v2(
     }
     _write_json_atomic(out_dir / "meta.json", meta)
     logger.info(
-        "write_cache_v2: meta.json te_true(pooled)=%.4f nats  lag_band=0..%d  cells=%d",
-        te_pooled, int(max_delay) - 1, len(cells),
+        "write_cache_v2: meta.json te_true(pooled)=%.4f nats  lag_band=%d..%d  cells=%d",
+        te_pooled,
+        (true_lag_band[0] if true_lag_band else 0),
+        (true_lag_band[-1] if true_lag_band else 0),
+        len(cells),
     )
     return out_dir
 
@@ -1016,8 +1233,9 @@ def build_all(
         out_dir: Cache directory override (defaults to :func:`resolve_cache_dir`).
         adapter: A prebuilt :class:`scattering_adapter.ScatteringAdapter` to reuse
             (the filter bank is expensive; tests share one). Built here when ``None``.
-        grid_override: ``{'target_te_grid', 'lag_grid'}`` to force a specific grid
-            (tests use a tiny one); overrides ``pilot`` / config.
+        grid_override: ``{'target_te_grid', 'lag_grid', 'lag_bands'}`` to force a specific
+            grid (tests use a tiny one); overrides ``pilot`` / config. ``lag_grid`` is used
+            in ``lag_mode: fixed`` and ``lag_bands`` in ``lag_mode: band``.
         n_override: ``{'train', 'val', 'test'}`` sample counts to force (tests use tiny N).
 
     Returns:
@@ -1032,12 +1250,17 @@ def build_all(
             config, benchmark=benchmark,
             target_te_grid=grid_override.get("target_te_grid"),
             lag_grid=grid_override.get("lag_grid"),
+            lag_bands=grid_override.get("lag_bands"),
         )
     elif pilot:
         pil = bench["eval"]["realizability"]["pilot"]
+        # ``lag_grid`` (fixed) / ``lag_bands`` (band) are both forwarded; enumerate picks
+        # the one matching ``mix.lag_mode`` and ignores the other.
         cells, dropped = enumerate_cells_v2(
             config, benchmark=benchmark,
-            target_te_grid=pil["target_te_grid"], lag_grid=pil["lag_grid"],
+            target_te_grid=pil["target_te_grid"],
+            lag_grid=pil.get("lag_grid"),
+            lag_bands=pil.get("lag_bands"),
         )
     else:
         cells, dropped = enumerate_cells_v2(config, benchmark=benchmark)

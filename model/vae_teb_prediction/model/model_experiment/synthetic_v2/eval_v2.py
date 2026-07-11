@@ -281,8 +281,11 @@ def measure_te_scat(
     """
     knobs = _probe_knobs(config, benchmark)
     Y, U = slice_coupled_channels(fields, coupled)
+    # The reduced-model source-history window must span the cell's *largest* lag, so band
+    # cells use delay_max (fixed cells have delay_max == D, so this is byte-identical).
+    probe_delay_max = int(cell.delay_max) if int(cell.delay_max) >= 1 else int(cell.D)
     r0 = _r0_gain_over_anchors(
-        Y, U, K=knobs["K"], H=knobs["H"], delay_max=int(cell.D),
+        Y, U, K=knobs["K"], H=knobs["H"], delay_max=probe_delay_max,
         ridge=knobs["ridge"], n_anchors=knobs["n_anchors"], n_seeds=knobs["n_seeds"],
     )
     te_scat = r0["gain"]
@@ -551,9 +554,11 @@ def _print_preflight_table(result: Dict[str, Any]) -> None:
         result: The dict returned by :func:`run_realizability_preflight`.
     """
     grid = result["grid"]
+    lag_desc = (f"bands={grid['lag_bands']}" if grid.get("lag_bands")
+                else f"lag={grid.get('lag_grid')}")
     print(
         "[r0-realizability] pilot grid "
-        f"target_te={grid['target_te_grid']} lag={grid['lag_grid']} "
+        f"target_te={grid['target_te_grid']} {lag_desc} "
         f"n_per_cell={grid['n_per_cell']}"
     )
     coupled = result["coupled_channel"]
@@ -625,19 +630,27 @@ def run_realizability_preflight(
     """
     bench = config["benchmarks"][benchmark]
     ev = bench["eval"]["realizability"]
+    lag_mode = str(bench["mix"].get("lag_mode", "fixed"))
+    # ``lag_grid`` (fixed) / ``lag_bands`` (band) are both forwarded; enumerate_cells_v2
+    # picks the one matching ``mix.lag_mode`` and ignores the other. Under band mode the
+    # pilot's own ``lag_bands`` window must reach enumerate, else it falls back to the full
+    # ``mix.lag_bands`` grid and the pilot is silently un-scoped.
     if pilot:
         pcfg = ev["pilot"]
         te_grid = list(pcfg["target_te_grid"])
-        lag_grid = list(pcfg["lag_grid"])
+        lag_grid = pcfg.get("lag_grid")
+        lag_bands = pcfg.get("lag_bands")
         n = int(n_per_cell if n_per_cell is not None else pcfg["n_per_cell"])
     else:
         mix = bench["mix"]
         te_grid = list(mix["target_te_grid"])
-        lag_grid = list(mix["lag_grid"])
+        lag_grid = mix.get("lag_grid")
+        lag_bands = mix.get("lag_bands")
         n = int(n_per_cell if n_per_cell is not None else mix["n_per_cell_train"])
 
     cells, dropped = enumerate_cells_v2(
-        config, benchmark=benchmark, target_te_grid=te_grid, lag_grid=lag_grid
+        config, benchmark=benchmark, target_te_grid=te_grid,
+        lag_grid=lag_grid, lag_bands=lag_bands,
     )
     if adapter is None:
         from .scattering_adapter import ScatteringAdapter
@@ -649,9 +662,12 @@ def run_realizability_preflight(
         raw = generate_pilot_samples(cell, n, "train", config, benchmark=benchmark)
         fields, _ = adapter.transform_and_normalise(raw["fhr_raw"], raw["up_raw"])
         scat = measure_te_scat(fields, cell, coupled, config=config, benchmark=benchmark)
+        # The raw-space probe scopes its source history to the cell's largest lag, so band
+        # cells use delay_max (fixed cells have delay_max == D -> byte-identical).
+        probe_delay_max = int(cell.delay_max) if int(cell.delay_max) >= 1 else int(cell.D)
         traw = measure_te_raw(
-            raw["fhr_raw"], raw["up_raw"], D=cell.D, config=config, benchmark=benchmark,
-            decimation=adapter.T, trim=adapter.trim,
+            raw["fhr_raw"], raw["up_raw"], D=probe_delay_max, config=config,
+            benchmark=benchmark, decimation=adapter.T, trim=adapter.trim,
         )
         per_cell[cell.cell_id] = {
             "cell_id": int(cell.cell_id),
@@ -677,7 +693,13 @@ def run_realizability_preflight(
         "per_cell": per_cell,
         "dropped": dropped,
         "coupled_channel": dict(coupled),
-        "grid": {"target_te_grid": te_grid, "lag_grid": lag_grid, "n_per_cell": n},
+        "grid": {
+            "target_te_grid": te_grid,
+            "lag_mode": lag_mode,
+            "lag_grid": (list(lag_grid) if lag_grid is not None else None),
+            **({"lag_bands": [list(b) for b in lag_bands]} if lag_bands else {}),
+            "n_per_cell": n,
+        },
     }
     if print_table:
         _print_preflight_table(result)
@@ -1507,18 +1529,24 @@ def _group_per_cell(arrs: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
         arrs: The dict returned by :func:`collect_per_sample_kbar`.
 
     Returns:
-        ``{cell_id: {cell_id, te_inj, te_scat, kbar, delay, frac_phi, held_out, n}}``.
+        ``{cell_id: {cell_id, te_inj, te_scat, kbar, delay, delay_lo, delay_hi, frac_phi,
+        held_out, n}}``. ``delay`` is the per-cell mean lag (a summary); ``delay_lo`` /
+        ``delay_hi`` are the min/max of the per-sample lags, so a band cell's true source
+        band can be taken as their union rather than a single scalar.
     """
     cid = np.asarray(arrs["cell_id"])
     out: Dict[int, Dict[str, Any]] = {}
     for c in np.unique(cid):
         sel = cid == c
+        delay_sel = np.asarray(arrs["delay"])[sel]
         out[int(c)] = {
             "cell_id": int(c),
             "te_inj": _nanmean_safe(np.asarray(arrs["te_inj"])[sel]),
             "te_scat": _nanmean_safe(np.asarray(arrs["te_scat"])[sel]),
             "kbar": _nanmean_safe(np.asarray(arrs["kbar"])[sel]),
-            "delay": int(np.round(np.mean(np.asarray(arrs["delay"])[sel]))),
+            "delay": int(np.round(np.mean(delay_sel))),
+            "delay_lo": int(np.min(delay_sel)) if delay_sel.size else 0,
+            "delay_hi": int(np.max(delay_sel)) if delay_sel.size else 0,
             "frac_phi": _nanmean_safe(np.asarray(arrs["frac_phi"])[sel])
             if "frac_phi" in arrs else float("nan"),
             "pred_gain": _nanmean_safe(np.asarray(arrs["pred_gain"])[sel])
@@ -1913,18 +1941,27 @@ def recover_lags(
     within: List[bool] = []
     for cid, cell in cells_by_id.items():
         D = int(cell["delay"])
-        band = _true_lag_band(D, horizon)
+        # Band cells spread the coupling over per-sample lags [delay_lo, delay_hi], so the
+        # true source band is the union L* = {max(0, delay_lo - H) .. delay_hi - 1}. When
+        # delay_lo == delay_hi (fixed cells) this reduces to _true_lag_band(D, H) exactly.
+        lo_c = int(cell.get("delay_lo", D))
+        hi_c = int(cell.get("delay_hi", D))
+        band = list(range(max(0, lo_c - int(horizon)), hi_c))
         is_null = bool(cell.get("te_inj", 0.0) <= 0.0)
         prof = lag_profiles.get(cid)
         if prof is None:
             per_cell[cid] = {
-                "D": D, "true_band": band, "is_null": is_null,
+                "D": D, "delay_lo": lo_c, "delay_hi": hi_c,
+                "true_band": band, "is_null": is_null,
                 "lag_mass": None, "peak_lag": None, "peak_lag_err": None,
                 "within_tol": None,
             }
             continue
         s = score_lag_profile(prof, band, tolerance=tolerance)
-        per_cell[cid] = {"D": D, "true_band": band, "is_null": is_null, **s}
+        per_cell[cid] = {
+            "D": D, "delay_lo": lo_c, "delay_hi": hi_c,
+            "true_band": band, "is_null": is_null, **s,
+        }
         if not is_null:
             masses.append(s["lag_mass"])
             within.append(s["within_tol"])

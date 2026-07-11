@@ -88,7 +88,10 @@ _STREAM_FHR_NOISE = 5
 _STREAM_UP_DRIFT = 6
 _STREAM_UP_NOISE = 7
 _STREAM_CARRIER = 8
-_N_STREAMS = 9
+#: Per-sample lag-draw substream for ``lag_mode: band`` (§ band mode). Kept separate
+#: so drawing per-sample delays never perturbs the fixed-mode noise realisation.
+_STREAM_DELAY = 9
+_N_STREAMS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,109 @@ def simulate_latent_pair(
     return S[:, :, 0], Y[:, :, 0]
 
 
+def _draw_per_sample_delays(
+    n: int, delay_min: int, delay_max: int, seed: int
+) -> np.ndarray:
+    r"""Draw one delay per sample, $D_i \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$.
+
+    Ported from ``synthetic/generators.py::_draw_per_sample_delays``. The draw is
+    inclusive of both endpoints and uses a substream seeded independently of the
+    latent-noise RNG so a delay draw never perturbs the simulated innovations.
+
+    Args:
+        n: Number of samples.
+        delay_min: Smallest delay (inclusive), $\ge 1$.
+        delay_max: Largest delay (inclusive), $\ge d_{\min}$.
+        seed: Seed for the delay-draw substream.
+
+    Returns:
+        An ``int`` ``np.ndarray`` of shape ``(n,)`` with each entry in
+        $\{d_{\min},\dots,d_{\max}\}$.
+    """
+    if not (1 <= int(delay_min) <= int(delay_max)):
+        raise ValueError(
+            "_draw_per_sample_delays: require 1 <= delay_min <= delay_max, got "
+            f"delay_min={delay_min}, delay_max={delay_max}."
+        )
+    rng = np.random.default_rng(int(seed))
+    return rng.integers(int(delay_min), int(delay_max) + 1, size=int(n))
+
+
+def simulate_latent_pair_band(
+    n: int,
+    T_tot: int,
+    *,
+    r: float,
+    w: float,
+    target_ar: float,
+    B: float,
+    delay_min: int,
+    delay_max: int,
+    sigma2_y: float,
+    sigma2_eta: float,
+    burn_in: int = 500,
+    seed: int = 0,
+    delay_seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Simulate the coupled latent pair with a **per-sample** delay drawn from a band.
+
+    Implements the ``lag_mode: band`` variant of :func:`simulate_latent_pair`. Each
+    sample $i$ draws one fixed lag $D_i \sim \mathrm{Uniform}\{d_{\min},\dots,d_{\max}\}$
+    and is simulated with the delayed coupling
+
+    $$d^{(i)}_k = A_y\,d^{(i)}_{k-1} + B\,c^{(i)}_{k-D_i} + \varepsilon_k .$$
+
+    Rather than touch the audited $(n, M)$ per-sample-delay branch of the analytic
+    simulator, samples are **grouped by their distinct delay value** and each group is
+    simulated by the exact scalar-delay path (:func:`simulate_latent_pair`) with the
+    shared coupling $B$. A tight band has only a handful of distinct delays, so this is
+    a handful of small simulations. The per-group RNG seed is derived deterministically
+    from ``(seed, D_i)`` via :class:`numpy.random.SeedSequence`.
+
+    Args:
+        n: Number of independent samples.
+        T_tot: Kept (post-burn-in) sequence length on the decimated grid.
+        r: Source pole radius.
+        w: Source pole angle in rad/step.
+        target_ar: Target self-coefficient $A_y \in [0, 1)$.
+        B: Coupling strength $B$ (the solved ``B_y_scalar``; shared across delays).
+        delay_min: Smallest delay in the band (inclusive), $\ge 1$.
+        delay_max: Largest delay in the band (inclusive), $\ge d_{\min}$.
+        sigma2_y: Target innovation variance $\sigma_y^2 > 0$.
+        sigma2_eta: Source innovation variance $\sigma_\eta^2 > 0$.
+        burn_in: Warm-up steps discarded per simulation.
+        seed: Base seed for the latent innovations (combined with each delay value).
+        delay_seed: Seed for the per-sample delay draw (an independent substream).
+
+    Returns:
+        A tuple ``(c, d, delays)`` where ``c`` and ``d`` are ``(n, T_tot)`` arrays in
+        **sample order** and ``delays`` is the ``(n,)`` int array of drawn lags $D_i$.
+    """
+    delays = _draw_per_sample_delays(n, delay_min, delay_max, delay_seed)
+    c = np.empty((int(n), int(T_tot)), dtype=np.float64)
+    d = np.empty((int(n), int(T_tot)), dtype=np.float64)
+    for dval in sorted(set(int(x) for x in delays)):
+        idx = np.nonzero(delays == dval)[0]
+        # Deterministic per-group seed: distinct per delay value, stable across runs.
+        group_seed = int(np.random.SeedSequence([int(seed), int(dval)]).generate_state(1)[0])
+        c_g, d_g = simulate_latent_pair(
+            int(idx.size),
+            T_tot,
+            r=r,
+            w=w,
+            target_ar=target_ar,
+            B=B,
+            D=int(dval),
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            burn_in=burn_in,
+            seed=group_seed,
+        )
+        c[idx] = c_g
+        d[idx] = d_g
+    return c, d, delays.astype(np.int64, copy=False)
+
+
 def true_lag_trajectory(n: int, T: int, D: int) -> np.ndarray:
     r"""Per-sample, per-step true source→target delay of shape $(n, T)$ (fixed mode).
 
@@ -241,6 +347,25 @@ def true_lag_trajectory(n: int, T: int, D: int) -> np.ndarray:
         An ``int16`` ``np.ndarray`` of shape ``(n, T)`` filled with $D$.
     """
     return np.full((n, T), int(D), dtype=np.int16)
+
+
+def true_lag_trajectory_per_sample(delays: Sequence[int], T: int) -> np.ndarray:
+    r"""Per-sample, per-step true delay of shape $(n, T)$ for ``lag_mode: band``.
+
+    Each sample $i$ has one constant lag $D_i$ (drawn from the band), so its row is a
+    flat line at $D_i$; the ground-truth lag varies **across** samples but not within a
+    sample's own time axis. Ported from the ``delays_per_sample`` branch of
+    ``synthetic/generators.py::_true_lag_trajectory``.
+
+    Args:
+        delays: The per-sample delays $D_i$, length $n$.
+        T: Sequence length.
+
+    Returns:
+        An ``int16`` ``np.ndarray`` of shape $(n, T)$ with row $i$ filled with $D_i$.
+    """
+    d = np.asarray(delays, dtype=np.int16)
+    return np.ascontiguousarray(np.broadcast_to(d[:, None], (d.shape[0], int(T))))
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +879,9 @@ def generate_cell_raw(
     seed: int = 0,
     te_inj: Optional[float] = None,
     render_mode: Optional[str] = None,
+    lag_mode: str = "fixed",
+    delay_min: Optional[int] = None,
+    delay_max: Optional[int] = None,
 ) -> Dict[str, Any]:
     r"""Generate ``n`` raw FHR/UP pairs for one cell $(B, D)$ (§5–§7, S1-T03b).
 
@@ -782,7 +910,9 @@ def generate_cell_raw(
     Args:
         n: Number of samples to generate.
         B: Coupling strength (the solved ``B_y_scalar``; ``0.0`` for a null cell).
-        D: Fixed source→target lag $D \ge 1$ in decimated steps.
+        D: Fixed source→target lag $D \ge 1$ in decimated steps. Used when
+            ``lag_mode == 'fixed'``; ignored (except as the fallback ``meta['D']``) in
+            ``band`` mode.
         config: The parsed ``config_synth_v2.yaml`` tree.
         benchmark: Active benchmark key under ``benchmarks``.
         seed: Umbrella seed for this cell's generation (spawns independent substreams).
@@ -795,15 +925,26 @@ def generate_cell_raw(
             the known-scattering-channel TE guarantee (the carrier's raison d'être) for
             clinically realistic raw FHR/UP-like traces; its ``one_sided`` shape knob is
             read from ``raw.direct``.
+        lag_mode: ``'fixed'`` (default) uses the single lag ``D`` for every sample;
+            ``'band'`` draws a per-sample lag $D_i \sim \mathrm{Uniform}\{d_{\min},\dots,
+            d_{\max}\}$ (see :func:`simulate_latent_pair_band`). Everything downstream of
+            the latent simulation is per-sample and lag-agnostic, so only ``true_lag_tt``
+            and the returned per-sample ``sample_delay`` differ between modes.
+        delay_min: Smallest per-sample lag (inclusive) in ``band`` mode; ignored in
+            ``fixed`` mode.
+        delay_max: Largest per-sample lag (inclusive) in ``band`` mode; ignored in
+            ``fixed`` mode.
 
     Returns:
         A dict with keys ``fhr_raw`` ``(n, N_raw)``, ``up_raw`` ``(n, N_raw)``,
-        ``true_lag_tt`` ``(n, T_tot)`` int16, ``latents`` (the coupled-pathway
-        intermediates ``c``, ``d``, ``c_tilde``, ``d_tilde``, ``A_u``, ``A_y``,
-        ``carrier_u``, ``carrier_y``, ``u_c``, ``y_d``; in ``direct`` mode ``A_u==u_c``,
-        ``A_y==y_d`` and the carriers are flat ones), and ``meta`` (``D``, ``B``,
-        ``te_inj``, ``render_mode``, ``direct_one_sided``, ``T_tot``, ``n_raw``, ``fs``,
-        ``f_pulse``).
+        ``true_lag_tt`` ``(n, T_tot)`` int16 (per-sample flat in ``band`` mode),
+        ``sample_delay`` ``(n,)`` int (the per-sample lags $D_i$ in ``band`` mode; ``None``
+        in ``fixed`` mode), ``latents`` (the coupled-pathway intermediates ``c``, ``d``,
+        ``c_tilde``, ``d_tilde``, ``A_u``, ``A_y``, ``carrier_u``, ``carrier_y``, ``u_c``,
+        ``y_d``; in ``direct`` mode ``A_u==u_c``, ``A_y==y_d`` and the carriers are flat
+        ones), and ``meta`` (``D``, ``B``, ``te_inj``, ``render_mode``,
+        ``direct_one_sided``, ``T_tot``, ``n_raw``, ``fs``, ``f_pulse``, ``lag_mode``,
+        ``delay_min``, ``delay_max``).
     """
     bench = config["benchmarks"][benchmark]
     data = bench["data"]
@@ -866,18 +1007,47 @@ def generate_cell_raw(
     rng_carrier = np.random.default_rng(streams[_STREAM_CARRIER])
 
     # --- coupled latent pair + AM rendering ---
-    c, d = simulate_latent_pair(
-        n,
-        T_tot,
-        r=r,
-        w=w,
-        target_ar=target_ar,
-        B=B,
-        D=D,
-        sigma2_y=sigma2_y,
-        sigma2_eta=sigma2_eta,
-        seed=_int_seed(streams[_STREAM_LATENT]),
-    )
+    # ``band`` mode draws a per-sample lag D_i ~ U{delay_min..delay_max}; ``fixed`` mode
+    # (default) uses the single lag ``D`` for every sample. Everything below the latent
+    # simulation is per-sample and lag-agnostic, so only the coupled pair and the
+    # ground-truth lag differ between the two modes.
+    if lag_mode == "band":
+        if delay_min is None or delay_max is None:
+            raise ValueError(
+                "generate_cell_raw: lag_mode='band' requires delay_min and delay_max."
+            )
+        c, d, sample_delay = simulate_latent_pair_band(
+            n,
+            T_tot,
+            r=r,
+            w=w,
+            target_ar=target_ar,
+            B=B,
+            delay_min=int(delay_min),
+            delay_max=int(delay_max),
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            seed=_int_seed(streams[_STREAM_LATENT]),
+            delay_seed=_int_seed(streams[_STREAM_DELAY]),
+        )
+    elif lag_mode == "fixed":
+        c, d = simulate_latent_pair(
+            n,
+            T_tot,
+            r=r,
+            w=w,
+            target_ar=target_ar,
+            B=B,
+            D=D,
+            sigma2_y=sigma2_y,
+            sigma2_eta=sigma2_eta,
+            seed=_int_seed(streams[_STREAM_LATENT]),
+        )
+        sample_delay = None
+    else:
+        raise ValueError(
+            f"generate_cell_raw: unknown lag_mode {lag_mode!r} (expected 'fixed' or 'band')."
+        )
     # detrend=False keeps the envelope *strictly* band-limited below the carrier: a
     # re-added endpoint ramp would leak broadband content near f_pulse and slightly
     # contaminate the coupled carrier channel. Edge ringing is discarded by the
@@ -986,10 +1156,19 @@ def generate_cell_raw(
     fhr_raw = mu_fhr[:, None] - y_d + fhrv + accels + fhr_wander + fhr_noise
     up_raw = mu_up[:, None] + u_c + up_drift + up_noise
 
+    # Ground-truth lag: per-sample flat lines at D_i in band mode, a single flat D in
+    # fixed mode. ``sample_delay`` is the (n,) vector of per-sample lags (None in fixed
+    # mode) that the build path stamps into the cache for per-sample TE labelling.
+    if lag_mode == "band":
+        true_lag_tt = true_lag_trajectory_per_sample(sample_delay, T_tot)
+    else:
+        true_lag_tt = true_lag_trajectory(n, T_tot, D)
+
     return {
         "fhr_raw": fhr_raw,
         "up_raw": up_raw,
-        "true_lag_tt": true_lag_trajectory(n, T_tot, D),
+        "true_lag_tt": true_lag_tt,
+        "sample_delay": None if sample_delay is None else np.asarray(sample_delay, dtype=np.int64),
         # ``latents`` carries the coupled-pathway intermediates for the S7-T03 AM
         # envelope/carrier decomposition figure: the decimated latents (c, d), their
         # band-limited upsamples (c_tilde, d_tilde), the strictly-positive envelopes
@@ -1013,6 +1192,9 @@ def generate_cell_raw(
             "fs": fs,
             "f_pulse": f_pulse,
             "fhrv_notch": None if fhrv_notch is None else [float(fhrv_notch[0]), float(fhrv_notch[1])],
+            "lag_mode": lag_mode,
+            "delay_min": None if delay_min is None else int(delay_min),
+            "delay_max": None if delay_max is None else int(delay_max),
         },
     }
 
