@@ -213,13 +213,33 @@ benchmarks:
       # tuning knob.
       cmi:
         configs: [latent, feature_gt, feature_model]
-        latent_lookback: 24     # >= max(D) = 20; longer accrues a log-det bias (Section 11)
-        u_lookback: 24
-        c_lookback: 24
+        # BAND BUGFIX: these MUST span the longest lag. The coupling drives Y+ from source
+        # lags {D-H .. D-1}; at lookback 24 << D=45-75 the whole driving window sits OUTSIDE
+        # U_{<=t} (cmi_v3.py:887-888) -> CMI ~ 0 on every band cell (the `latent` config, which
+        # is supposed to recover TE_inj in nats, reads ~0). 24 was copied from the fixed-lag
+        # config (max D = 20) and never updated -- the single cause of the broken CMI section.
+        # 80 >= D_max(75). Tradeoff: a longer window inflates the CLOSED-FORM gaussian-exact
+        # log-det null bias (cmi_v3.py:496-528), so trust the InfoNCE `cmi_latent` (reads ~0 on
+        # nulls) over `gaussian_exact` here; anchor_stride/max_anchors_per_cell fight the bias.
+        latent_lookback: 80     # >= D_max = 75
+        u_lookback: 80
+        c_lookback: 80
         # Model-free channel reduction, the same slice measure_te_scat makes. At `all` the source
-        # anchor is 24x101 = 2424-dim and the target 30x87 = 2610-dim against a few thousand
+        # anchor is 80x101 = 8080-dim and the target 30x87 = 2610-dim against a few thousand
         # CORRELATED anchors per cell: the critic memorises and the held-out bound falls to -5 nats
-        # or worse -- a valid but vacuous lower bound. At `coupled` the anchors are 24- and 30-dim.
+        # or worse -- a valid but vacuous lower bound. At `coupled` the anchors are 80- and 30-dim
+        # (the source window was 24-dim before the lookback raise above).
+        #
+        # LOOKBACK-80 CAVEAT (both directions): the 80-step window needed to SEE a 45-75-step lag
+        # also (a) inflates the closed-form `gaussian_exact` log-det null bias (cmi_v3.py:496-528)
+        # -> gaussian_exact reads spuriously positive on TE=0 cells, so trust the InfoNCE
+        # `cmi_latent` (~0 on nulls), NOT gaussian_exact; and (b) pushes the 80-dim `coupled`
+        # source anchor toward the same critic-memorisation / vacuous-bound regime this comment
+        # flags for `all`, with no compensating critic knob (bigger critics overfit WORSE here).
+        # So band CMI is DIAGNOSTIC-ONLY: read it as "is the coupling recoverable in nats at all",
+        # watch the held-out InfoNCE for collapse to a vacuous negative bound, and treat a proper
+        # long-lag CMI (per-cell lookback = D+H rather than a global 80, capacity retune) as a
+        # Rung-3 task, not a headline number here.
         u_channels: coupled     # all | coupled (meta.coupled_channel.up_st)
         y_channels: coupled     # all | coupled (meta.coupled_channel.fhr_st)
         anchor_stride: 3

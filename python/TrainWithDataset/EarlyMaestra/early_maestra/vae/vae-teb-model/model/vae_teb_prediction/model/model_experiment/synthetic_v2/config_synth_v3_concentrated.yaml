@@ -1,0 +1,365 @@
+# config_synth_v3_concentrated.yaml -- synthetic_v2 raw -> scattering -> block-TE on
+# SeqVaeLagAttnV3, RUNG 1 of the method-first improvement ladder.
+#
+# Purpose: prove the K_bar-versus-TE mechanism on the EASIEST case before adding difficulty.
+# Both prior runs failed in opposite ways -- the fixed short-lag run (G1_raw_v3) FROZE at
+# epoch 2 (source path never switched on, gamma_inj~0), and the long-band run
+# (G1_raw_v3_band) trained cleanly but drifted to a 6.5-nat coupling-independent KL floor
+# (kbar_null=6.47, gate 0.05). Root cause of both: per-step predictive SNR ~0.5-3%, at which
+# the KL bottleneck has no stable operating point. This config CONCENTRATES the injected
+# signal to raise per-step SNR, STABILISES training against variance collapse, and RETUNES
+# beta with a late up-ramp -- so a stable operating point (kbar_null->0 AND gamma_inj~1) can
+# exist at all. See:
+#   model_experiment/synthetic_v2/SYNTHETIC_V3_SPEC_AND_SPRINTS.md   (build roadmap)
+#   ~/.claude/plans/do-more-investigation-read-functional-sunbeam.md (this plan)
+#
+# Deltas vs config_synth_v3.yaml (everything else is byte-identical) -- grouped by workstream:
+#   A (data, concentrate signal -> raise per-step SNR; forces a FRESH cache):
+#     * raw.am_offset_ratio: 4.0 -> 2.0        (deepen AM: mod_depth_rms 0.0625 -> 0.125)
+#     * data.target_ar:      0.40 -> 0.20      (shorter target memory: kick not smeared over H)
+#     * mix.lag_grid:        [8,12,20] -> [4,8] (short, identifiable, L*={0..D-1} inside horizon)
+#   B (training stability -> kill the freeze):
+#     * model.logvar_clamp:  [-5,3] -> [-3,3]  (variance floor e^-3=0.050 vs 0.0067: no collapse)
+#     * loss_spike_skip.ema_floor: 0.2         (a collapsed EMA can't make 5xEMA un-clearable)
+#   C (objective -> establish a KL equilibrium, S8-T04):
+#     * loss.beta_schedule.kind: linear_warmup_then_ramp (open low, then squeeze the drift-floor)
+#
+# Additive and opt-in: entered only via `run_pipeline_v2.py --config config_synth_v3_concentrated.yaml`.
+# Paths are DEV-relative (pilot on the RTX 4080 first); for the 8xA6000 headline run, point
+# paths.{data_dir,results_dir} at the prod isilon paths and raise ddp.devices, exactly as
+# config_synth_v3_band.yaml does.
+
+experiment:
+  tag: G1_conc_v3              # results/<tag>/<arm>/... (SEPARATE from G1_raw_v3 / _band)
+  # A lag + rendering change re-keys the build fingerprint, so this needs its OWN fresh cache
+  # under its own data_tag; the G1_raw_v2_notch / G1_raw_v3_band caches are never touched.
+  data_tag: G1_conc_v3_shortlag
+  benchmark: G1_raw            # selects the active block under `benchmarks:`
+  seed: 0
+
+runtime:
+  device: auto                 # auto -> cuda if available, else cpu
+  cuda_device: 0               # GPU index for single-GPU runs (dev box)
+  gpus: [0]                    # GPU slot list for task-parallel multi-GPU work
+
+paths:
+  data_dir: ./data             # .npz split caches -> synthetic_v2/data/G1_raw/<data_tag>/
+  results_dir: ./results       # checkpoints / figures / reports -> synthetic_v2/results/<tag>/<arm>/
+
+# --- deterministic seeds (S0-T01): DGP, inverter Monte-Carlo, and shuffle -------
+seeds:
+  base_seed: 0
+  dgp: 0
+  inverter_mc: 0
+  shuffle: 0
+
+# --- the v2 benchmark. Single pathway: NO m_grid. -------
+benchmarks:
+  G1_raw:
+    data:                      # coupled latent pair on the DECIMATED grid
+      sequence_length: 300     # decimated, after trim
+      horizon: 30              # RESERVE SNR lever: -> 15 (with model.horizon/warmup) if the
+                               # floor persists; per-step SNR = exp(2*TE/(H*M))-1. Held at 30
+                               # for Rung 1 so the architecture matches the band run (clean A/B).
+      K_history: 80            # >= D_max(8) + 2H(60) = 68; 80 is ample.
+      oscillators: [[0.80, 0.10]]   # (r, omega) -> contraction rhythm ~0.004 Hz ; SINGLE pathway
+      target_ar: 0.20          # A: 0.40 -> 0.20. Shorter AR(1) target memory so the source kick
+                               # B*c_{k-D} decays fast across the future block -> the response
+                               # concentrates in the steps just after the lag -> higher per-step SNR.
+      sigma2_y: 1.0
+      sigma2_eta: 0.01
+
+    raw:                       # v2-only raw rendering. f_pulse is TRUE Hz.
+      fs: 4.0
+      n_raw: 5280              # 22 min ; transform input length
+      render_mode: am_carrier  # concentrates the coupling into ~1 scattering channel (keep)
+      f_pulse: 0.06            # Hz : contraction/deceleration pulse-shape carrier.
+      fhrv_notch_enabled: true # protects the coupled channel (keep)
+      am_offset_ratio: 2.0     # A: 4.0 -> 2.0. Deepen AM modulation (mod_depth_rms=1/(4*ratio)
+                               # 0.0625 -> 0.125), raising coupled-channel energy / frac_Phi.
+                               # Within the built-in recommended 1.5-2.5 (raw_generators.py:1366).
+                               # VERIFY with --am-check (adequate=True) and --recover (frac_Phi->~1)
+                               # BEFORE the full build.
+      pulse_train:
+        rate_hz: 0.06
+        duty: 0.5
+      direct:
+        one_sided: true
+      mu_fhr_bpm: [110, 160]
+      mu_up: [5, 25]
+      baseline_wander_std: { fhr: 3.0, up: 2.0 }
+      decel_depth_bpm: [10, 40]
+      contraction_mmHg: [40, 70]
+      fhrv_band_power: { LF: 11.25, MF: 6.25, HF: 2.5 }   # RESERVE lever: lower LF (brackets
+                                                          # f_pulse) to cut competing noise. Held
+                                                          # at v2 values for Rung 1 (notch already
+                                                          # protects the coupled channel).
+      accel: { amp_bpm: [10, 25], rate_per_min: 0.3 }
+      noise_std: { fhr: 0.5, up: 0.5 }
+
+    scattering:                # v2-only transform + normalisation
+      J: 11
+      Q: 4
+      T: 16
+      max_order: 1
+      batch_size: 32
+      phase_min_freq: { fhr: 0.006, up: 0.002 }
+      norm_stats_source: synthetic_pool
+      real_fold_stats_path: null
+
+    mix:                       # cell grid -- NO m_grid (single pathway)
+      target_te_grid: [0.0, 0.5, 1.0, 2.0, 3.0]   # nats, incl. 0.0 null anchor (needed for the gate)
+      lag_grid: [4, 8]         # A: [8,12,20] -> [4,8]. Short, identifiable, D<=H so the true band
+                               # L*={max(0,D-H)..D-1}={0..D-1} lives fully inside the horizon.
+      lag_mode: fixed
+      n_per_cell_train: 800
+      n_per_cell_val: 400
+      n_per_cell_test: 800
+      inverter:
+        n_samples: 12000
+        lo: 1.0e-4
+        hi: 60.0               # ample bracket for B at short lag / te=3.0
+        tol: 0.005
+        max_iter: 40
+
+    eval:
+      realizability:
+        fatal: false
+        frac_threshold: 0.7
+        frac_upper: 1.3
+        ridge: 1.0e-2
+        n_anchors: 3
+        n_seeds: 2
+        pilot:
+          target_te_grid: [0.0, 1.0, 2.0, 3.0]
+          lag_grid: [4, 8]
+          n_per_cell: 384
+        recovery:
+          f_pulse_grid: [0.02, 0.04, 0.06]
+          am_offset_ratio_grid: [1.5, 2.0, 2.5, 4.0]   # includes the chosen 2.0
+          omega_grid: [0.06, 0.10]
+          n_per_cell: 384
+          target_te: 3.0
+          D: 8
+          lag1_autocorr_floor: 0.9
+      null_controls: [shuffle, reverse]
+      lag_mass_threshold: 0.8
+      lag_tolerance_steps: 1
+      kbar_null_threshold: 0.05     # G-D: the decisive gate this rung must pass.
+      kld_analysis:
+        density_variant: kbar
+      calibration:
+        levels: [0.5, 0.8, 0.9, 0.95]
+        n_bins: 20
+        max_samples: 2000
+        te_coverage_level: 0.9
+        te_coverage_tol: 0.10
+      lag_intervention:
+        # Refined low-lag bins to resolve the short true band (D in {4,8} -> L* subset of 0..7).
+        bands:
+          "0-3": [0, 3]
+          "4-7": [4, 7]
+          "8-15": [8, 15]
+          "16-30": [16, 30]
+          "31-60": [31, 60]
+          "61-90": [61, 90]
+        max_samples: 512
+        margin_delta_L: 0.0
+        noop_atol: 1.0e-6
+      cmi:
+        configs: [latent, feature_gt, feature_model]
+        latent_lookback: 24     # >= D_max(8); fine at short lag. (Band rungs must raise this.)
+        u_lookback: 24
+        c_lookback: 24
+        u_channels: coupled
+        y_channels: coupled
+        anchor_stride: 3
+        max_anchors_per_cell: 12000
+        max_samples: 512
+        critic_width: 64
+        critic_depth: 1
+        embed_dim: 16
+        contrastive_batch: 32
+        n_iters: 6000
+        eval_every: 50
+        patience: 15
+        val_frac: 0.25
+        fit_frac: 0.5
+        lr: 1.0e-3
+        n_boot: 2000
+        ceiling_claim_frac: 0.8
+
+# --- model constructor kwargs -------------------------------------------------
+model:
+  class: SeqVaeLagAttnV3
+  sequence_length: 300
+  d_model: 128
+  d_z: 24
+  horizon: 30
+  warmup_period: 30
+  c_y: 87
+  c_u: 101
+  use_up_st: true
+  max_lag: 90
+  num_heads: 4
+  d_head: 32
+  lstm_layers: 2
+  dropout: 0.1
+  decoder_hidden: 128
+  logvar_clamp: [-3.0, 3.0]    # B: floor -5 -> -3 (sigma^2 >= e^-3 = 0.050 vs 0.0067). The
+                               # variance-collapse that feeds the spike-skip freeze cannot reach
+                               # the pathological near-zero-NLL regime. Config-only -> the model
+                               # default and test_v3_logvar_floor.py are unaffected.
+  mu_scale: 5.0
+  delta_mu_scale: 3.0
+  latent_stats_momentum: 0.01
+  attention_grad_checkpoint: false
+  head_structured_latent: true
+  horizon_depth: 3
+  horizon_kernel: 3
+  horizon_film: true
+  encoder_extra_dilations: [8, 16]
+
+  v3:
+    causal_norm: true
+    posterior_logvar: residual
+    logvar_bound: smooth
+    delta_logvar_scale: 2.0
+    kld_support: anchor
+    lag_bias_init: alibi_decay     # short true lags -> the recent-lag prior HELPS here; keep
+                                   # default slope (no alibi_slope_scale). Soften only at Rung 2+.
+    use_entmax: true
+    freeze_unused_attn_proj: true
+    lambda_perm: 0.0
+    perm_every_n_batches: 4
+
+curriculum:
+  enabled: false
+
+# --- loss: the FIXED objective, held identical across all three arms --------------------
+loss:
+  kld_beta: 0.001
+  lambda_full: 1.0
+  lambda_base: 0.5
+  likelihood: gaussian_nll
+  sigma_obs: learned           # decoder emits logvar_full -> per-horizon NLL / CRPS / coverage.
+                               # (A homoscedastic warm-up was considered but starves logvar_full
+                               # of gradient -> DDP find_unused_parameters=False would crash; the
+                               # logvar_clamp floor above is the DDP-safe collapse guard instead.)
+  free_bits: 0.0               # kld_train == kld_raw -> kbar is an honest TE surrogate.
+  detach_baseline_in_full: true
+  # C (S8-T04): open the zero-KL bottleneck LOW (start->end over warmup_epochs) so the source
+  # path switches on, HOLD it open, then RAMP beta UP (end->ramp_end over
+  # [ramp_start_epoch, ramp_end_epoch)) to squeeze the coupling-independent KL drift-floor down
+  # toward the earned KL while the signal dims are already anchored by the reconstruction
+  # gradient. This is the direct fix for "K grows without a fixed point at fixed low beta".
+  # end/ramp_end are STARTING values -- sweep them on the FULL run (not the 200-step pilot),
+  # gating on kbar_null->0 and kld_active_frac (target >~30% active, gamma_inj~1).
+  beta_schedule:
+    kind: linear_warmup_then_ramp
+    start: 1.0e-5
+    end: 3.0e-4              # bottleneck-open beta (band run used a flat 1e-3 and floored)
+    warmup_epochs: 20
+    ramp_end: 3.0e-3        # squeeze target
+    ramp_start_epoch: 55    # begin squeezing after the source path has earned its gain
+    ramp_end_epoch: 90      # reach ramp_end by 90, hold to the end (epochs=100)
+
+# --- loss-spike circuit breaker (TOP-LEVEL, NOT under `loss:`) --------------------------
+loss_spike_skip:
+  enabled: true
+  multiplier: 5.0
+  ema_momentum: 0.02
+  warmup_batches: 100
+  warn_on_skip: true
+  max_consecutive_skips: 25
+  ema_floor: 0.2         # B: with a healthy gaussian_nll loss ~0.7-0.85, 5*0.2=1.0 sits just
+                         # above it, so a collapsed EMA can never freeze training, yet a genuine
+                         # >2x explosion still trips. 0.0 would reproduce the old (freeze-prone)
+                         # behaviour.
+
+# --- the three-arm ablation ladder --------
+arms:
+  parity:
+    model:
+      v3:
+        causal_norm: false
+        posterior_logvar: independent
+        logvar_bound: clamp
+        kld_support: full
+        lag_bias_init: normal
+        use_entmax: false
+  v3_noncausal:
+    model:
+      v3:
+        causal_norm: false
+  v3_prod:
+    model:
+      v3:
+        causal_norm: true
+
+# --- DataLoader knobs ------------------------------------
+dataset:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  mmap: auto
+
+# --- multi-GPU DDP training ---------------------------------------------------
+ddp:
+  devices: 8                   # PROD (8xA6000); a --pilot run uses train.devices=1
+  strategy: auto
+  precision: 32-true
+  sync_batchnorm: true
+  lr_scaling: false
+  warmup_epochs: 5
+  num_sanity_val_steps: 0
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  early_stopping:
+    enabled: false
+    monitor: val/total_loss
+    mode: min
+    patience: 15
+    min_delta: 0.0
+
+# --- optimiser / training loop ---------------------------
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+  epochs: 100
+  batch_size: 32
+  grad_clip_norm: 0.5
+  # [10, 90] (not the v2 [10,50]) so the beta up-ramp / squeeze (ep55-90) runs at LR=1e-4,
+  # NOT 1e-5. The squeeze needs optimizer authority to move the posterior and drive kbar_null
+  # down; at a 100x-decayed LR it would only inflate the KL term without reducing the floor.
+  # LR: 1e-3 (0-9) -> 1e-4 (10-89, covers source-path opening AND the squeeze) -> 1e-5 (90-99 settle).
+  lr_milestones: [10, 90]
+  lr_gamma: 0.1
+
+# --- training-curve plotting -----------------------------
+plotting:
+  enabled: true
+  plot_every: 10
+  html: true
+
+# --- training driver knobs ----------------------------------------------------
+# Pilot params + pilot_beta_schedule are held IDENTICAL to config_synth_v3.yaml so
+# test_train_v3_pilot.py's EPS_OPEN/EPS_GAP thresholds still apply. The pilot is a
+# stability + bottleneck-opens smoke test; the headline uses loss.beta_schedule above.
+train:
+  pilot_epochs: 20
+  pilot_limit_train_batches: 20
+  pilot_limit_val_batches: 4
+  pilot_batch_size: 16
+  devices: 1
+  pilot_beta_schedule:
+    kind: linear_warmup
+    start: 1.0e-5
+    end: 1.0e-4
+    warmup_epochs: 2
+
+# --- optional beta-selection stage (default OFF) ------------------------------
+beta_select:
+  enabled: false
+  beta_grid: [1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3]
+  epochs: 5
