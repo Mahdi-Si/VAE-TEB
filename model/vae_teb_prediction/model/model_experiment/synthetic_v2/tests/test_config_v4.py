@@ -126,3 +126,48 @@ def test_am_carrier_arm_points_at_am_data_tag(config: dict) -> None:
     arm = config["arms"]["am_carrier_prod"]
     assert arm["experiment"]["data_tag"] == "G1_raw_v4_am"
     assert arm["benchmarks"]["G1_raw_v4"]["raw"]["render_mode"] == "am_carrier"
+
+
+# ---------------------------------------------------------------------------
+# S2-T06 / S8-T01: the am_carrier BUILD config (config_synth_v4_am.yaml).
+# ---------------------------------------------------------------------------
+_AM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config_synth_v4_am.yaml"
+
+
+@pytest.fixture(scope="module")
+def am_config() -> dict:
+    r"""Parse ``config_synth_v4_am.yaml`` once for the module."""
+    with open(_AM_CONFIG_PATH, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def test_am_config_builds_am_cache(am_config: dict) -> None:
+    r"""The am build config renders ``am_carrier`` under the ``G1_raw_v4_am`` data_tag."""
+    assert am_config["experiment"]["data_tag"] == "G1_raw_v4_am"
+    assert am_config["benchmarks"]["G1_raw_v4"]["raw"]["render_mode"] == "am_carrier"
+    # The model_raw 4-key schema is intact (the reused trainer reads it byte-for-byte).
+    for key in ("general_config", "model_config", "dataset_config", "advanced_config"):
+        assert key in am_config, f"am config missing model_raw key: {key}"
+    assert am_config["dataset_config"]["dataloader_config"]["dataset_kwargs"]["trim_minutes"] is None
+
+
+def test_am_config_in_sync_with_direct(config: dict, am_config: dict) -> None:
+    r"""The am config differs from the direct config ONLY in the am-specific keys (drift guard).
+
+    A full sibling config can silently drift from the primary; this asserts every block except the
+    two am-specific keys (``experiment.data_tag`` / ``raw.render_mode``) and the mlflow labels is
+    byte-identical, so an edit to one must be mirrored to the other.
+    """
+    import copy
+
+    a = copy.deepcopy(am_config)
+    d = copy.deepcopy(config)
+    # Normalise the three intentional am differences, then require exact equality.
+    a["experiment"]["data_tag"] = d["experiment"]["data_tag"]
+    a["benchmarks"]["G1_raw_v4"]["raw"]["render_mode"] = \
+        d["benchmarks"]["G1_raw_v4"]["raw"]["render_mode"]
+    a["advanced_config"]["tracking"]["mlflow"]["run_name"] = \
+        d["advanced_config"]["tracking"]["mlflow"]["run_name"]
+    a["advanced_config"]["tracking"]["mlflow"]["tags"]["variant"] = \
+        d["advanced_config"]["tracking"]["mlflow"]["tags"]["variant"]
+    assert a == d, "config_synth_v4_am.yaml has drifted from config_synth_v4.yaml beyond the am keys"
