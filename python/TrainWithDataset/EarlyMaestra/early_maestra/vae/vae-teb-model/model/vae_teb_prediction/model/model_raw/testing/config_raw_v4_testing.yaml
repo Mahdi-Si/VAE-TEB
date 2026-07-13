@@ -1,0 +1,135 @@
+# Testing config for the raw-signal VAE-TEB v4 (`SeqVaeRawV4`) evaluation pipeline (S7-T02).
+#
+# Mirrors `config_tiny.yaml` at the TINY geometry (raw_len=512, decimation=16 -> T=28) so
+# `run_tests` can be driven end-to-end off the tiny-checkpoint fixture with an in-memory loader
+# (no GPU, no real HDF5). `run_full_test_pipeline` reads this only to resolve the checkpoint /
+# output-dir defaults and (when not using `loader_override`) the dataloader settings; the model is
+# rebuilt from the checkpoint's stamped `model_kwargs`, so these `VAE_model.*` values are the
+# fallback legacy path, not the primary one. MLflow disabled.
+
+general_config:
+  tag: raw_v4_testing
+  cuda_devices: [0]
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 2
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 2
+    test: 2
+  folders_config:
+    out_dir_base: ./_raw_v4_testing_artifacts
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001
+    free_bits: 0.1
+
+    likelihood: gaussian_nll
+    sigma_obs: learned
+    detach_baseline_in_full: true
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    d_model: 128
+    d_z: 24
+    horizon: 4
+    warmup_period: 2
+    sequence_length: 28
+    c_y: 87
+    c_u: 101
+    use_up_st: true
+    lstm_layers: 1
+    dropout: 0.0
+    decoder_hidden: 64
+    logvar_clamp: [-5.0, 3.0]
+
+    causal_norm: true
+    logvar_bound: smooth
+    posterior_logvar: residual
+    delta_logvar_scale: 2.0
+    kld_support: anchor
+    lambda_perm: 0.0
+    perm_every_n_batches: 2
+
+    max_lag: 8
+    num_heads: 4
+    d_head: 32
+    use_entmax: true
+    attention_grad_checkpoint: false
+    lag_smoothness_lambda: 1.0e-3
+    lag_bias_init: alibi_decay
+    head_structured_latent: true
+    freeze_unused_attn_proj: true
+
+    horizon_refine:
+      depth: 2
+      kernel: 3
+      film: true
+
+    encoder:
+      extra_dilations: []
+      temporal_backbone: lstm
+
+    loss_spike_skip:
+      enabled: true
+      multiplier: 5.0
+      ema_momentum: 0.02
+      warmup_batches: 100
+      warn_on_skip: true
+      max_consecutive_skips: 25
+
+    raw_len: 512
+    decimation: 16
+    frontend:
+      stages: [2, 2, 2, 2]
+      channels: [16, 32, 64, 128]
+      d_raw: 128
+      antialias: true
+      antialias_kernel: binomial5
+      gated: true
+      norm_kind: causal_group_norm
+      norm_num_groups: 8
+      first_kernels_fhr: [7, 31, 65]
+      first_kernels_up: [15, 65, 129]
+      decoder_head: learned_basis
+      basis_size: 4
+      dropout: 0.0
+      crop: 2
+
+    lambda_lp: 0.5
+    lambda_smooth: 0.1
+    lowpass_scales: [4, 16, 32, 60]
+
+  warm_start_from: null
+  core_model_checkpoint: null
+
+dataset_config:
+  vae_train_datasets: []
+  vae_test_datasets: []
+  stat_path: null
+  # Optional empirical-TE CSV for the G11 CMI comparison (absent -> the empirical column skips).
+  empirical_te_csv: null
+  dataloader_config:
+    num_workers: 0
+    prefetch_factor: 2
+    normalize_fields: ['fhr', 'up']
+    dataset_kwargs:
+      pin_memory: false
+      load_fields: ['fhr', 'up', 'weight', 'target', 'epoch', 'guid']
+      cache_size: 8
+      trim_minutes: null
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+  tracking:
+    mlflow:
+      enabled: false
