@@ -1,28 +1,39 @@
-r"""S0-T05: staged orchestrator skeleton for ``synthetic_v4`` (raw-model validation).
+r"""S0-T05 / S7-T01..T03: staged orchestrator for ``synthetic_v4`` (raw-model validation).
 
 A *dedicated* driver (not a plugin on ``run_pipeline_v2``) because the v2/v3 orchestrator reads
 the v2/v3-schema ``config["model"]["horizon"]`` / ``resolved_model_class_name(config["model"])``,
 which a ``model_raw``-schema v4 config does not carry. The **schema-agnostic** pieces
-(:func:`load_config`, :func:`resolve_arm`, ``_run_dir``, ``_results_dir``) are imported and reused;
-only the stage registry is forked so v4 stages register into their own table rather than the v2
-one.
+(:func:`load_config`, :func:`resolve_arm`, ``_run_dir``, ``_results_dir``, ``resolve_cache_dir``)
+are imported and reused; only the stage registry is forked so v4 stages register into their own
+table rather than the v2 one.
 
 Each later sprint's stage module (``realizability_v4``, ``data_previews_v4``, ``build_dataset_v4``,
 ``eval_v4`` ...) calls :func:`register_stage_v4` at import; :func:`_load_stage_plugins` imports
 them warn-don't-gate, so a not-yet-landed stage is simply absent from ``--stage`` rather than an
-import error. This Sprint-0 skeleton dispatches a single stage (no arm sweep, no DDP subprocess
-yet) and prints help when given no stage.
+import error.
+
+Sprint 7 adds the sweep driver on top of the skeleton (S7-T01/T02/T03):
+
+* **Model-free stages** (``build`` / ``realizability`` / ``data_previews`` / ``arms_report``) run
+  **once** at the arm-less ``results/<tag>/`` root.
+* **Per-arm stages** (``train`` / ``test_plots`` / ``eval`` / ``report``) loop over
+  ``config.arms`` when no explicit ``--arm`` is given, else run the single named arm (this second
+  path is also the DDP-safe subprocess re-entry point).
+* **Split-scoped stages** (``eval`` / ``test_plots`` / ``report``) additionally fan out over every
+  cached split, writing per-split artifacts under ``results/<tag>/<arm>/<split>/``.
+* ``--dry-run`` prints the resolved plan (arms + per-arm run dirs) and dispatches nothing.
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
+import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 _MODULE_FILE = Path(__file__).resolve()
 _MODULE_DIR = _MODULE_FILE.parent
@@ -38,10 +49,12 @@ if __name__ == "__main__" and _QUALNAME not in sys.modules:
     sys.modules[_QUALNAME] = sys.modules[__name__]
 
 from model.vae_teb_prediction.model.model_experiment.synthetic_v2.arms_v4 import (  # noqa: E402
+    list_arms,
     resolve_arm_v4,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic_v2.reuse_v4 import (  # noqa: E402
     load_config,
+    resolve_cache_dir,
 )
 from model.vae_teb_prediction.model.model_experiment.synthetic_v2.run_pipeline_v2 import (  # noqa: E402
     _results_dir,
@@ -50,6 +63,14 @@ from model.vae_teb_prediction.model.model_experiment.synthetic_v2.run_pipeline_v
 
 #: The v4 default ``--config``.
 _DEFAULT_CONFIG = _MODULE_DIR / "config_synth_v4.yaml"
+
+#: Dataset splits, in the canonical fan-out order.
+_ALL_SPLITS = ("train", "val", "test")
+
+#: Model-dependent stages that additionally fan out over every cached split, writing per-split
+#: artifacts under ``results/<tag>/<arm>/<split>/``. (``train`` is per-arm but split-independent;
+#: ``arms_report`` resolves splits internally, so neither belongs here.)
+_SPLIT_SCOPED_STAGES = frozenset({"eval", "test_plots", "report"})
 
 
 # =============================================================================
@@ -76,8 +97,23 @@ class StageContextV4:
     args: Optional[argparse.Namespace] = None
 
     def run_dir(self) -> Path:
-        r"""``results/<tag>/<arm>/`` (or ``results/<tag>/`` when arm-less)."""
+        r"""``results/<tag>/<arm>/`` (or ``results/<tag>/`` when arm-less).
+
+        This is the **arm root** -- checkpoints (``final.ckpt`` / ``best.ckpt``) live here and are
+        split-independent, so training writes and every stage discovers the checkpoint from it.
+        """
         return _run_dir(self.config, self.benchmark, self.arm)
+
+    def output_dir(self) -> Path:
+        r"""The per-artifact output root, split-scoped when a split is set (S7-T03).
+
+        A split-scoped stage (``eval`` / ``test_plots`` / ``report``) writes its per-split
+        artifacts under ``results/<tag>/<arm>/<split>/`` so ``--split all`` grades every split into
+        a distinct directory without collision; with ``split is None`` this collapses to
+        :meth:`run_dir` (the single-arm / pre-fan-out layout the Sprint 4-6 stages assumed).
+        """
+        base = self.run_dir()
+        return base / self.split if self.split else base
 
     def results_dir(self) -> Path:
         r"""``results/<tag>/`` -- the arm-independent root."""
@@ -144,7 +180,11 @@ _STAGE_PLUGIN_MODULES_V4 = (
     "realizability_v4",
     "data_previews_v4",
     "build_dataset_v4",
+    "trainer_v4",
+    "eval_runner_v4",
     "eval_v4",
+    "final_report_v4",
+    "arms_report_v4",
 )
 
 
@@ -157,6 +197,168 @@ def _load_stage_plugins() -> None:
             continue  # stage not landed yet
         except Exception as exc:  # noqa: BLE001 -- a broken optional stage must not gate startup
             print(f"[plugin] {name} failed to import: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+# =============================================================================
+# Split fan-out + DDP-safe subprocess dispatch (S7-T02 / S7-T03)
+# =============================================================================
+def _resolve_splits(config: Dict[str, Any], benchmark: str,
+                    split: Optional[str]) -> List[str]:
+    r"""Resolve which cached splits a split-scoped stage should process (S7-T03).
+
+    ``split`` of ``None`` / ``"all"`` selects **every** split whose cache ``.npz`` exists (in
+    ``train, val, test`` order); an explicit name restricts to that one. Falls back to ``["val"]``
+    when nothing is discoverable yet (e.g. before a build), matching the shared eval runner's
+    default split.
+
+    Args:
+        config: The (arm-resolved) config tree.
+        benchmark: Active benchmark key under ``benchmarks``.
+        split: ``None`` / ``"all"`` for every present split, or a single split name.
+
+    Returns:
+        The ordered list of split names to process.
+    """
+    present: List[str] = []
+    try:
+        cache_dir = Path(resolve_cache_dir(config, benchmark=benchmark))
+        present = [s for s in _ALL_SPLITS if (cache_dir / f"{s}.npz").is_file()]
+    except Exception:  # noqa: BLE001 -- cache path not resolvable yet (pre-build)
+        present = []
+    if split in (None, "", "all", "ALL"):
+        return present or ["val"]
+    return [str(split)]
+
+
+def _stage_subprocess_cmd_v4(config_path: Any, stage: str, *,
+                             arm: Optional[str] = None, pilot: bool = False,
+                             split: Optional[str] = None) -> List[str]:
+    r"""Build the argv vector that re-enters this driver for one arm's ``stage`` (S7-T02).
+
+    The train stage is dispatched as a fresh subprocess so Lightning owns a clean DDP process
+    group per arm (re-entering the *same* module file via ``-m`` keeps one stage registry). Only
+    flags this driver's own parser accepts are appended -- ``--arm`` / ``--pilot`` / ``--split`` --
+    so the child is a single-arm, in-process dispatch (never a nested sweep).
+
+    Args:
+        config_path: Path to ``config_synth_v4.yaml`` (threaded to the child verbatim).
+        stage: The stage the child runs (typically ``"train"``).
+        arm: The arm to resolve in the child (its explicit ``--arm`` disables the child's sweep).
+        pilot: Forward ``--pilot`` when set.
+        split: Forward ``--split`` when set.
+
+    Returns:
+        The subprocess argv list, ``[python, -m, <qualname>, --config, ..., --stage, ...]``.
+    """
+    cmd: List[str] = [sys.executable, "-m", _QUALNAME,
+                      "--config", str(config_path), "--stage", stage]
+    if arm:
+        cmd += ["--arm", str(arm)]
+    if pilot:
+        cmd += ["--pilot"]
+    if split:
+        cmd += ["--split", str(split)]
+    return cmd
+
+
+def _run_subprocess(cmd: Sequence[str], *, dry_run: bool = False) -> int:
+    r"""Run a child driver process from the repo root; ``dry_run`` prints and returns 0."""
+    if dry_run:
+        print("[dry-run] " + " ".join(str(c) for c in cmd))
+        return 0
+    proc = subprocess.run(list(cmd), cwd=str(_REPO_ROOT))
+    return int(proc.returncode)
+
+
+# =============================================================================
+# Sweep driver (S7-T01)
+# =============================================================================
+def _dispatch_for_arm(config: Dict[str, Any], benchmark: str, spec: StageSpecV4,
+                      arm: Optional[str], args: argparse.Namespace) -> int:
+    r"""Resolve ``arm`` and dispatch ``spec`` once (or once per cached split when split-scoped).
+
+    Args:
+        config: The base (un-arm-resolved) config tree.
+        benchmark: Active benchmark key.
+        spec: The stage to dispatch.
+        arm: The arm to resolve, or ``None`` (model-free / arm-less).
+        args: The parsed CLI namespace (``pilot`` / ``split`` / ``dry_run``).
+
+    Returns:
+        ``0`` on success, else the first non-zero stage return code (worst-case OR).
+    """
+    arm_cfg = resolve_arm_v4(config, arm)
+    if spec.name in _SPLIT_SCOPED_STAGES:
+        rc = 0
+        for s in _resolve_splits(arm_cfg, benchmark, args.split):
+            ctx = StageContextV4(config=arm_cfg, benchmark=benchmark, arm=arm,
+                                 split=s, pilot=args.pilot, args=args)
+            rc = rc or _dispatch_stage_v4(spec, ctx)
+        return rc
+    ctx = StageContextV4(config=arm_cfg, benchmark=benchmark, arm=arm,
+                         split=args.split, pilot=args.pilot, args=args)
+    return _dispatch_stage_v4(spec, ctx)
+
+
+def _sweep_arms(config: Dict[str, Any], args: argparse.Namespace) -> List[Optional[str]]:
+    r"""The arm list a model-dependent sweep iterates.
+
+    An explicit ``--arm`` selects that single arm; otherwise the sweep iterates every configured arm
+    **in the config's declared order** (not alphabetically), so the ``config_synth_v4.yaml`` author's
+    intent holds: the direct headline arm ``prod`` runs first and the ``am_carrier_prod`` probe --
+    which reads a *separate* cache that a direct-only run has not built -- runs last. ``[None]`` when
+    the config declares no ``arms`` block.
+    """
+    if args.arm:
+        return [args.arm]
+    return list((config.get("arms") or {}).keys()) or [None]
+
+
+def run_sweep(args: argparse.Namespace, config: Dict[str, Any], benchmark: str,
+              spec: StageSpecV4) -> int:
+    r"""Drive one stage across the arm ladder (S7-T01).
+
+    Model-free stages run **once** at the arm-less root; model-dependent stages loop the arms,
+    dispatching ``train`` as a DDP-safe subprocess per arm and every other stage in-process (with
+    split fan-out for the split-scoped stages). ``--dry-run`` prints the resolved plan and
+    dispatches nothing.
+
+    Args:
+        args: The parsed CLI namespace.
+        config: The base config tree (arms resolved per-arm inside).
+        benchmark: Active benchmark key.
+        spec: The stage to sweep.
+
+    Returns:
+        ``0`` on success, else the first non-zero return code.
+    """
+    if not spec.model_dependent:
+        if args.dry_run:
+            print(f"[plan] stage={spec.name!r} (model-free) -> {_run_dir(config, benchmark)}")
+            return 0
+        return _dispatch_for_arm(config, benchmark, spec, None, args)
+
+    arms = _sweep_arms(config, args)
+    if args.dry_run:
+        print(f"[plan] stage={spec.name!r} over {len(arms)} arm(s):")
+        for arm in arms:
+            splits = (_resolve_splits(resolve_arm_v4(config, arm), benchmark, args.split)
+                      if spec.name in _SPLIT_SCOPED_STAGES else [None])
+            for s in splits:
+                run_dir = _run_dir(config, benchmark, arm)
+                tail = f"/{s}" if s else ""
+                print(f"  - arm={arm!r:>20} -> {run_dir}{tail}")
+        return 0
+
+    rc = 0
+    for arm in arms:
+        if spec.name == "train":
+            cmd = _stage_subprocess_cmd_v4(args.config, "train", arm=arm,
+                                           pilot=args.pilot, split=args.split)
+            rc = rc or _run_subprocess(cmd)
+        else:
+            rc = rc or _dispatch_for_arm(config, benchmark, spec, arm, args)
+    return rc
 
 
 # =============================================================================
@@ -179,11 +381,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="short/pilot run (small grids, few samples)")
     parser.add_argument("--split", default=None, choices=["train", "val", "test"],
                         help="a single split, or omit for all cached splits")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the resolved arm/split plan and dispatch nothing")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    r"""Dispatch a single stage (or print help when no ``--stage`` is given)."""
+    r"""Drive one stage: sweep the arm ladder, or dispatch a single arm (S7-T01).
+
+    A model-dependent stage with no explicit ``--arm`` (or any ``--dry-run``) enters
+    :func:`run_sweep`; an explicit ``--arm`` (the subprocess re-entry / single-arm path) and every
+    model-free stage dispatch once. Prints help when given no ``--stage``.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -200,11 +409,14 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
+    # Sweep when: a dry-run plan is requested, OR a model-dependent stage was invoked without an
+    # explicit arm and the config declares an arm ladder. An explicit ``--arm`` (the subprocess
+    # re-entry) and every model-free stage take the single-dispatch path below.
+    if args.dry_run or (spec.model_dependent and args.arm is None and bool(list_arms(config))):
+        return run_sweep(args, config, benchmark, spec)
+
     arm = args.arm if spec.model_dependent else None
-    config = resolve_arm_v4(config, arm)
-    ctx = StageContextV4(config=config, benchmark=benchmark, arm=arm,
-                         split=args.split, pilot=args.pilot, args=args)
-    return _dispatch_stage_v4(spec, ctx)
+    return _dispatch_for_arm(config, benchmark, spec, arm, args)
 
 
 if __name__ == "__main__":

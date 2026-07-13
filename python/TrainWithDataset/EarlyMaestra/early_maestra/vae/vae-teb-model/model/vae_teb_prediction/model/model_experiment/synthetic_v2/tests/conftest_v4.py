@@ -21,6 +21,7 @@ Fixtures:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable, Dict, Tuple
 
@@ -32,6 +33,8 @@ __all__ = [
     "source_exploiting_outputs",
     "planted_lag_te_lag_map",
     "tiny_raw_checkpoint",
+    "tiny_cache_v4",
+    "synth_metrics_v4",
 ]
 
 #: The default injected-TE ladder shared by the fabricated fixtures (matches the config grid).
@@ -150,3 +153,145 @@ def tiny_raw_checkpoint(tmp_path: Path) -> Tuple[Path, dict]:
     path = tmp_path / "tiny_raw_v4.ckpt"
     torch.save(checkpoint, path)
     return path, kwargs
+
+
+@pytest.fixture
+def synth_metrics_v4(tmp_path: Path) -> Dict[str, object]:
+    r"""Fabricate a v4 ``metrics.json`` + ``per_sample_eval.npz`` pair on disk (S7-T04/T05).
+
+    Builds a *schema-faithful* eval artifact set -- the exact top-level keys and nested structure
+    :func:`eval_v4.run_eval_v4` writes (un-suffixed ``calibration.gamma``, top-level
+    ``null_cell_gate`` with a ``ceiling``, ``prediction_controls.overall`` with the ``shuffled``
+    control, ``lag_recovery.per_cell``, ``te_raw_gate``) -- populated from a linear
+    $\bar K = \gamma\,\mathrm{TE}_{\mathrm{inj}}$ signal so the report/visualizer tests can render
+    every figure and section from a fixture rather than a trained model. No model is loaded.
+
+    Returns:
+        ``{"metrics": dict, "per_sample": {arrays}, "metrics_path": Path, "npz_path": Path,
+        "run_dir": Path}`` -- both files are written under ``tmp_path / "prod"``.
+    """
+    rng = np.random.default_rng(7)
+    gamma, alpha, reps = 0.8, 0.02, 24
+    ladder = _TE_LADDER
+    te = np.repeat(np.asarray(ladder, dtype=float), reps)
+    cell_id = np.repeat(np.arange(len(ladder), dtype=np.int64), reps)
+    delay = np.full(te.shape, 8, dtype=np.int64)
+    kbar = alpha + gamma * te + rng.normal(0.0, 0.05, size=te.shape)
+    # Source-exploiting forecast losses: feat < base, and the permuted-source loss is worse.
+    base_loss = 1.0 - 0.15 * te + rng.normal(0.0, 0.01, size=te.shape)
+    feat_loss = base_loss - 0.20 * te + rng.normal(0.0, 0.01, size=te.shape)
+    feat_loss_shuffled = base_loss + 0.10 * te + rng.normal(0.0, 0.01, size=te.shape)
+    per_sample: Dict[str, np.ndarray] = {
+        "kbar": kbar, "kbar_postwarm": kbar, "te_inj": te,
+        "te_scat": np.full(te.shape, np.nan), "cell_id": cell_id, "delay": delay,
+        "held_out": np.zeros(te.shape, dtype=np.int64),
+        "feat_loss": feat_loss, "base_loss": base_loss,
+        "pred_gain": base_loss - feat_loss, "feat_loss_shuffled": feat_loss_shuffled,
+    }
+
+    # Per-cell reductions (one row per ladder level), matching calibration.per_cell.
+    per_cell = []
+    for k, te_lvl in enumerate(ladder):
+        sel = cell_id == k
+        per_cell.append({"cell_id": int(k), "te_inj": float(te_lvl),
+                         "kbar": float(kbar[sel].mean()), "delay": 8, "n": int(sel.sum())})
+
+    signal_ids = [c["cell_id"] for c in per_cell if c["te_inj"] > 0]
+    metrics: Dict[str, object] = {
+        "model_class": "SeqVaeRawV4", "arm": "prod", "render_mode": "direct",
+        "kld_support": "anchor", "n_samples": int(te.size),
+        "calibration": {
+            "kld_support": "anchor", "gamma": gamma, "alpha": alpha, "r2": 0.98,
+            "spearman": 1.0, "monotonic": True, "n_cells": len(per_cell),
+            "n_samples": int(te.size), "gamma_sample": gamma, "alpha_sample": alpha,
+            "r2_sample": 0.97,
+            "by_lag": {"8": {"gamma": gamma, "alpha": alpha, "r2": 0.97, "n": int(te.size)}},
+            "kld_variants": {}, "per_cell": per_cell,
+        },
+        "null_cell_gate": {"mean": float(kbar[cell_id == 0].mean()), "std": 0.05,
+                           "ci_lo": 0.0, "ci_hi": 0.05, "n_cells": 1, "ceiling": 0.05,
+                           "pass": True},
+        "prediction_controls": {
+            "controls": ["shuffled"], "n_signal_cells": len(signal_ids),
+            "overall": {
+                "feat_loss": float(feat_loss.mean()), "base_loss": float(base_loss.mean()),
+                "feat_loss_shuffled": float(feat_loss_shuffled.mean()),
+                "shuffle_penalty_shuffled": float((feat_loss_shuffled - feat_loss).mean()),
+                "ordering_pass_shuffled": True, "ordering_pass": True, "ordering_pass_frac": 1.0,
+            },
+            "per_cell": {},
+        },
+        "lag_recovery": {
+            "per_cell": {
+                str(c["cell_id"]): {
+                    "D": 8, "delay_lo": 8, "delay_hi": 8, "true_band": list(range(0, 8)),
+                    "is_null": c["te_inj"] == 0.0,
+                    "lag_mass": 0.05 if c["te_inj"] == 0.0 else 0.9,
+                    "peak_lag": None if c["te_inj"] == 0.0 else 8,
+                    "peak_lag_err": None if c["te_inj"] == 0.0 else 0,
+                    "within_tol": None if c["te_inj"] == 0.0 else True,
+                }
+                for c in per_cell
+            },
+            "mean_lag_mass": 0.9, "frac_within_tol": 1.0, "lag_mass_threshold": 0.8,
+            "tolerance": 1, "mean_lag_mass_pass": True,
+        },
+        "te_raw_gate": {"gate": {"passed": True}, "constants": {"frac_threshold": 0.30},
+                        "source": "realizability.json"},
+    }
+
+    run_dir = tmp_path / "prod"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2)
+    npz_path = run_dir / "per_sample_eval.npz"
+    np.savez_compressed(str(npz_path), **per_sample)
+    return {"metrics": metrics, "per_sample": per_sample, "metrics_path": metrics_path,
+            "npz_path": npz_path, "run_dir": run_dir}
+
+
+@pytest.fixture(scope="session")
+def tiny_cache_v4(tmp_path_factory: pytest.TempPathFactory) -> Dict[str, object]:
+    r"""Build a tiny but **full-geometry** ($5280$) v4 raw cache once for the whole session.
+
+    Loads ``config_synth_v4.yaml`` and calls :func:`build_dataset_v4.build_all_v4` with a small
+    ``grid_override`` (one null + one signal cell) and ``n_override`` (a handful of rows per split)
+    into a session ``tmp`` dir. The raw waveforms are the real $5280$-sample length on the $330$-step
+    decimated grid; only the cell count and ``n`` shrink, so the cache is cheap yet
+    geometry-compatible with a production-geometry model
+    (``model_raw.testing.conftest.make_small_prod_raw_model``). Shared by the Sprint 3-6 dataset /
+    datamodule / batch-contract / eval tests.
+
+    Returns:
+        ``{"config": dict, "cache_dir": Path, "cells": list, "grid": dict, "n_override": dict}``.
+    """
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v4 import (
+        build_all_v4,
+    )
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.cells_v4 import (
+        enumerate_cells_v4,
+    )
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.reuse_v4 import load_config
+
+    config_path = Path(__file__).resolve().parents[1] / "config_synth_v4.yaml"
+    config = load_config(str(config_path))
+    grid = {"target_te_grid": [0.0, 2.0], "lag_grid": [8]}
+    n_override = {"train": 8, "val": 4, "test": 4}
+
+    cache_dir = tmp_path_factory.mktemp("tiny_cache_v4")
+    build_all_v4(
+        config, benchmark="G1_raw_v4", out_dir=cache_dir,
+        grid_override=grid, n_override=n_override,
+    )
+    cells, _ = enumerate_cells_v4(
+        config, benchmark="G1_raw_v4",
+        target_te_grid=grid["target_te_grid"], lag_grid=grid["lag_grid"],
+    )
+    return {
+        "config": config,
+        "cache_dir": Path(cache_dir),
+        "cells": cells,
+        "grid": grid,
+        "n_override": n_override,
+    }

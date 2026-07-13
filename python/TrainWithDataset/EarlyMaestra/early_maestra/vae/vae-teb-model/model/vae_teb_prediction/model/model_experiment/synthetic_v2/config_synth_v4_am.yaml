@@ -1,0 +1,372 @@
+# config_synth_v4_am.yaml -- the AM-CARRIER build config for synthetic_v4 (S2-T06).
+#
+# This sibling of `config_synth_v4.yaml` exists ONLY to BUILD the am_carrier `.npz` cache
+# (`experiment.data_tag: G1_raw_v4_am`, `benchmarks.G1_raw_v4.raw.render_mode: am_carrier`) with
+#   python -m ...run_pipeline_v4 --config config_synth_v4_am.yaml --stage build
+# The `build` stage is model-free (runs arm-less), so it cannot resolve the `am_carrier_prod` arm's
+# render-mode overlay; this base-level render_mode is what makes an arm-less build emit am_carrier.
+# Once the cache exists, TRAIN / EVAL the am arm from the PRIMARY `config_synth_v4.yaml` with
+# `--arm am_carrier_prod` (that arm re-keys `experiment.data_tag` to `G1_raw_v4_am`, so it reads
+# this cache). Keep every other key in sync with the direct config -- only the two am-specific keys
+# (+ the mlflow labels below) differ.
+#
+# HYBRID SCHEMA. This file carries BOTH:
+#   (1) the `model_raw` 4-key model schema -- `general_config` / `model_config` /
+#       `dataset_config` / `advanced_config` -- mirroring `model_raw/config_raw_v4.yaml`, so the
+#       reused `GraphModelVaeTebRawV4Trainer.{setup_config, create_model, train_model}` read it
+#       byte-for-byte (Sprint 4+); and
+#   (2) synthetic-only top-level blocks -- `experiment` / `paths` / `seeds` /
+#       `benchmarks.G1_raw_v4` / `arms` -- read ONLY by the v4 data/eval stages
+#       (`run_pipeline_v4`, `cells_v4`, `te_raw_v4`, `realizability_v4`, `build_dataset_v4`,
+#       `eval_v4`). The trainer ignores the extra top-level keys; the v4 stages ignore the
+#       model_raw keys.
+#
+# The raw waveform goes STRAIGHT to the model: NO scattering transform, NO AM demodulation.
+# `benchmarks.G1_raw_v4.raw.render_mode: direct` with `direct.one_sided: false` (bipolar)
+# carries the exact linear c->d coupling into the raw signal so K-bar calibrates against the
+# analytic TE_inj. A sibling `config_synth_v4_am.yaml` (Sprint 2, S2-T06) renders `am_carrier`
+# under a distinct `data_tag` for the single `am_carrier_prod` probe arm.
+#
+# Dev defaults: `general_config.cuda_devices: [0]` and a repo-relative `out_dir_base`
+# (single RTX 4080 pilot); the 8xA6000 headline run overrides these + `paths` on the prod box.
+# The concentrated DGP recipe (single pathway M=1, short identifiable lag D=8, target_ar 0.20,
+# TE ladder + null) mirrors `config_synth_v3_concentrated.yaml` -- it raises per-step SNR so the
+# injected TE stays raw-extractable (see memory: G1_mix / concentrated-ladder).
+
+# ===========================================================================
+# Synthetic-only blocks (read by the v4 data/eval stages)
+# ===========================================================================
+experiment:
+  tag: G1_raw_v4                 # results/<tag>/<arm>/...
+  # A render-mode / lag change re-keys the build fingerprint, so this cache is keyed on its own
+  # `data_tag`; the am_carrier cache lives under `G1_raw_v4_am`. `resolve_cache_dir` keys the
+  # cache leaf on `data_tag` (falling back to `tag`), so the two caches coexist.
+  data_tag: G1_raw_v4_am         # AM cache: data/<benchmark>/G1_raw_v4_am/{train,val,test}.npz
+  benchmark: G1_raw_v4           # selects the active block under `benchmarks:`
+  seed: 0
+
+paths:
+  data_dir: ./data               # .npz split caches -> synthetic_v2/data/G1_raw_v4/<data_tag>/
+  results_dir: ./results         # realizability.json / previews / metrics -> results/<tag>/...
+
+seeds:
+  base_seed: 0
+  dgp: 0
+  inverter_mc: 0
+  shuffle: 0
+
+# ===========================================================================
+# model_raw 4-key schema (mirrors config_raw_v4.yaml; consumed by the reused trainer)
+# ===========================================================================
+general_config:
+  tag: raw_v4_baseline
+  cuda_devices: [0]              # DEV: single RTX 4080. Prod overrides to [0..7].
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 32                    # front end runs 16x-longer sequences than v3
+    test: 32
+  folders_config:
+    out_dir_base: ./results/model_raw_out   # DEV-relative; prod overrides to the isilon path
+
+model_config:
+  VAE_model:
+    # --- KL / beta schedule (inherited from v3): anneal UP so K grows from zero-init ----
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001
+    free_bits: 0.1
+
+    # --- Likelihood (G7): learned per-sample variance over the raw forecast ----------
+    likelihood: gaussian_nll
+    sigma_obs: learned
+    detach_baseline_in_full: true
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # --- Backbone widths (identical to v3; the core sees (B, 300, 128)) --------------
+    d_model: 128
+    d_z: 24
+    horizon: 30
+    warmup_period: 30
+    sequence_length: 300
+    c_y: 87                      # vestigial: sizes the inherited adapter v4 replaces with F_y
+    c_u: 101                     # vestigial: sizes the inherited adapter v4 replaces with F_u
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
+
+    # --- v3 scientific-cleanliness flags (G0-G6), inherited verbatim -----------------
+    causal_norm: true
+    logvar_bound: smooth
+    posterior_logvar: residual
+    delta_logvar_scale: 2.0
+    kld_support: anchor
+    lambda_perm: 0.0
+    perm_every_n_batches: 4
+
+    # --- Attention (inherited) -------------------------------------------------------
+    max_lag: 90
+    num_heads: 4
+    d_head: 32
+    use_entmax: true
+    attention_grad_checkpoint: false
+    lag_smoothness_lambda: 1.0e-3
+    lag_bias_init: alibi_decay
+    head_structured_latent: true
+    freeze_unused_attn_proj: true
+
+    horizon_refine:
+      depth: 3
+      kernel: 3
+      film: true
+      attn: false
+
+    encoder:
+      extra_dilations: [8, 16]
+      temporal_backbone: lstm
+
+    loss_spike_skip:
+      enabled: true
+      multiplier: 5.0
+      ema_momentum: 0.02
+      warmup_batches: 100
+      warn_on_skip: true
+      max_consecutive_skips: 25
+
+    # --- RAW-SPECIFIC (v4) -----------------------------------------------------------
+    raw_len: 5280
+    decimation: 16
+
+    frontend:
+      stages: [2, 2, 2, 2]          # [16] = single stride-16 ablation (arm: single_stride)
+      channels: [32, 64, 96, 128]
+      d_raw: 128
+      antialias: true
+      antialias_kernel: binomial5
+      gated: true
+      norm_kind: causal_group_norm  # G0-in-front-end (causal_group_norm | cln | channel_affine)
+      norm_num_groups: 8
+      first_kernels_fhr: [7, 31, 65]
+      first_kernels_up: [15, 65, 129]
+      decoder_head: learned_basis
+      basis_size: 8
+      dropout: 0.05
+
+    lambda_lp: 0.5
+    lambda_smooth: 0.1
+    lowpass_scales: [4, 16, 32, 60]
+
+  warm_start_from: null
+  core_model_checkpoint: null
+
+dataset_config:
+  # The synthetic pipeline builds its own loaders from the .npz cache (SyntheticRawDataModuleV4,
+  # Sprint 3); these HDF5 dataset paths are inert for synthetic runs but retained so the
+  # inherited trainer schema validates. `dataloader_config` mirrors config_raw_v4.yaml.
+  vae_train_datasets: []
+  vae_test_datasets: []
+  stat_path: null
+  kfold_base_path: null
+  num_folds: 10
+  classifier_train_datasets: []
+  classifier_val_datasets: []
+  classifier_test_datasets: []
+
+  dataloader_config:
+    num_workers: 4
+    prefetch_factor: 4
+    normalize_fields: ['fhr', 'up']
+    dataset_kwargs:
+      pin_memory: false
+      load_fields: ['fhr', 'up', 'weight', 'target', 'epoch', 'cs_label', 'bg_label', 'guid']
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: null
+      epoch_max: -48000
+      label: null
+      cache_size: 10000
+      # Untrimmed: the model needs the full 5280/330; MUST be null for raw_len=5280.
+      trim_minutes: null
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-raw-v4-synth
+      run_name: synth_v4_am
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: synth_v4_am
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+    loss_plotting:
+      max_history_size: 10000
+    raw_plotting:
+      enabled: true
+      plot_frequency: 1
+      num_examples: 2
+      file_format: "pdf"
+      forecast_anchor_frac: 0.6
+
+# ===========================================================================
+# The concentrated DGP benchmark (single pathway M=1; NO m_grid). Direct render.
+# ===========================================================================
+benchmarks:
+  G1_raw_v4:
+    data:                        # coupled latent pair (the analytic inverter simulates on this)
+      sequence_length: 330       # UNTRIMMED decimated grid (raw_len/decimation); vestigial for raw
+      horizon: 30                # H : block-TE horizon
+      K_history: 80              # >= D_max(8) + 2H(60); 80 is ample
+      oscillators: [[0.80, 0.10]]   # (r, omega) -> contraction rhythm; SINGLE pathway
+      target_ar: 0.20            # short AR(1) target memory -> response concentrates after the lag
+      sigma2_y: 1.0
+      sigma2_eta: 0.01
+
+    raw:                         # raw rendering. render_mode=direct: NO carrier, NO AM.
+      fs: 4.0
+      n_raw: 5280                # 22 min ; the model crops the central 300 tokens internally
+      render_mode: am_carrier    # {am_carrier, pulse_train, direct} -- AM build (S2-T06)
+      direct:
+        one_sided: false         # BIPOLAR: preserves the exact linear c->d coupling for calibration
+      f_pulse: 0.06              # Hz (used by the am_carrier probe; inert envelope in direct mode)
+      fhrv_notch_enabled: true   # disabled internally in direct mode (protects the am coupled channel)
+      am_offset_ratio: 2.0       # am_carrier only (mod_depth_rms = 1/(4*ratio))
+      pulse_train:
+        rate_hz: 0.06
+        duty: 0.5
+      mu_fhr_bpm: [110, 160]
+      mu_up: [5, 25]
+      baseline_wander_std: { fhr: 3.0, up: 2.0 }
+      decel_depth_bpm: [10, 40]
+      contraction_mmHg: [40, 70]
+      fhrv_band_power: { LF: 11.25, MF: 6.25, HF: 2.5 }
+      accel: { amp_bpm: [10, 25], rate_per_min: 0.3 }
+      noise_std: { fhr: 0.5, up: 0.5 }
+
+    scattering:                  # NOT used by the direct model path; retained so the am_carrier
+                                 # FHRV notch + am realizability probe can read Q.
+      J: 11
+      Q: 4
+      T: 16
+      max_order: 1
+      batch_size: 32
+      phase_min_freq: { fhr: 0.006, up: 0.002 }
+      norm_stats_source: synthetic_pool
+      real_fold_stats_path: null
+
+    mix:                         # cell grid -- NO m_grid (single pathway)
+      target_te_grid: [0.0, 0.5, 1.0, 2.0, 3.0]   # nats, incl. 0.0 null anchor (the gate needs it)
+      lag_grid: [8]              # fixed identifiable D=8 (D<=H so L*={0..D-1} lives inside horizon)
+      lag_mode: fixed
+      cells_per_level: 1         # replicate each (te,D) cell this many times (independent seeds)
+      n_per_cell_train: 800
+      n_per_cell_val: 400
+      n_per_cell_test: 800
+      inverter:
+        n_samples: 12000
+        lo: 1.0e-4
+        hi: 60.0
+        tol: 0.005
+        max_iter: 40
+
+    eval:
+      realizability:
+        fatal: false
+        # LOOSE decidable bounds (S1 decision): the pytest gate asserts te_raw>0 & monotone &
+        # null<=null_ceiling; frac_threshold/frac_upper are RECORDED seeds for the S6 tight gate,
+        # re-fit empirically by the S1-T03 pre-flight, NOT a Sprint-1 blocker.
+        frac_threshold: 0.30     # recorded lower bound (loose)
+        frac_upper: 3.0          # recorded upper bound (loose)
+        null_ceiling: 0.05       # null-cell te_raw must sit below this (block-nats)
+        ridge: 1.0e-2
+        n_anchors: 3
+        n_seeds: 2
+        pilot:                   # the --pilot realizability sweep (small n, subset of the ladder)
+          target_te_grid: [0.0, 1.0, 2.0, 3.0]
+          lag_grid: [8]
+          n_per_cell: 384
+
+# ===========================================================================
+# Arm ladder (deep-merged over the whole config; deltas author under the model_raw paths).
+# `frontend_noncausal` cannot express a forbidden norm through config (the model's
+# assert_no_time_pooling_norm would refuse to build), so it is selected BY CLASS via the
+# `_leaky_class: true` marker, consumed by the synthetic-side LeakyRawFrontendSeqVaeRawV4 in
+# S4-T02. The other arms author directly under model_config.VAE_model.* / experiment.
+# ===========================================================================
+arms:
+  prod: {}                       # the base config: causal front end (the headline arm)
+
+  frontend_noncausal:            # G0-in-front-end negative control (selected by class)
+    _leaky_class: true
+
+  single_stride:
+    model_config:
+      VAE_model:
+        frontend:
+          stages: [16]
+
+  no_antialias:
+    model_config:
+      VAE_model:
+        frontend:
+          antialias: false
+
+  no_gated:
+    model_config:
+      VAE_model:
+        frontend:
+          gated: false
+
+  disable_source:
+    model_config:
+      VAE_model:
+        disable_source: true
+
+  am_carrier_prod:               # trained on the am_carrier cache (distinct data_tag)
+    experiment:
+      data_tag: G1_raw_v4_am
+    benchmarks:
+      G1_raw_v4:
+        raw:
+          render_mode: am_carrier
