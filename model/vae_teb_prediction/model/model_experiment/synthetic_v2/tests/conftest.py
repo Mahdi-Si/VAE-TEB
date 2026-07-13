@@ -23,6 +23,20 @@ def pytest_configure(config) -> None:
     config.addinivalue_line(
         "markers", "slow: heavy integration test (real transform); skip with -m 'not slow'"
     )
+    # synthetic_v4 (raw-model) suite marker (S0-T06); select with -m v4, exclude with -m "not v4".
+    config.addinivalue_line(
+        "markers", "v4: synthetic_v4 raw-model validation test; select with -m v4"
+    )
+
+
+# ---------------------------------------------------------------------------
+# synthetic_v4 fabricated fixtures (S0-T06): defined in ``conftest_v4.py`` and re-exported here
+# so they are visible suite-wide. Heavy imports inside those fixtures stay lazy, so this star
+# import is cheap at collection and leaves the v2/v3 suites untouched.
+# ---------------------------------------------------------------------------
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+from conftest_v4 import *  # noqa: E402,F401,F403
 
 
 # ---------------------------------------------------------------------------
