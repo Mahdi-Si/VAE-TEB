@@ -1,0 +1,262 @@
+# Raw-signal VAE-TEB v4 ablation config (S8-T05): plain GELU activation (no gated tanh*sigmoid)
+# Derived from ../config_raw_v4.yaml by flipping a SINGLE flag; every other setting is
+# byte-identical to the baseline so the ablation is clean. See vae-teb-raw-model.md §16.
+#
+# v4 is the raw-input fork of the v3 scientific-cleanliness model. It replaces the two fixed
+# scattering/phase adapters with two learned, strictly-causal, anti-aliased multiscale front ends
+# over the raw 4 Hz FHR/UP signals, and replaces the feature-domain forecast with a raw
+# future-FHR forecast. The entire v3 information architecture (G0-G11) is inherited unchanged.
+#
+# This file mirrors `config_lag_attn_v3.yaml`'s 4-key layout (general_config / model_config /
+# dataset_config / advanced_config). Raw-specific model kwargs (`frontend`, `raw_len`,
+# `decimation`, and the raw loss weights) nest under `model_config.VAE_model`, alongside the v3
+# nested groups `horizon_refine`/`encoder`; the v4 trainer's `_build_model_kwargs` forwards them.
+#
+# S4-T03 status: authoritative loss-weight scales and flags fixed here; `config_raw_v4_smoke.yaml`
+# is the single-GPU memory/OOM tuning harness (S5-T01), whose measured `batch_size`/front-end
+# `channels`/`accumulate_grad_batches` are then copied back here. `c_y`/`c_u`/`use_up_st` are
+# retained only so the inherited `SeqVaeLagAttnV3.__init__` constructs its (then-replaced) adapters
+# validly.
+#
+# Geometry note: the loader keeps the full 22-minute raw window (`trim_minutes: null`,
+# raw_len 5280 / decimated 330). The front end runs on all 5280 samples and the model crops the
+# central 300 tokens (20 min) AFTER the transform -- mirroring v3's "transform-then-trim"
+# edge-effect removal (left 1 min = causal context, right 1 min = forecast headroom). The stats
+# file was computed at trim_minutes=1.0; because fhr/up normalisation is a single global scalar
+# the mismatch is negligible. Acceptance is asserted at the config level (the loader must stay
+# untrimmed, `trim_minutes: null`) in `test_trainer.py::test_config_build_*`.
+
+general_config:
+  tag: raw_v4_ablation_plain_activation
+
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  lr: 0.001
+  lr_milestone: [1000]
+  checkpoint_frequency: 1
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  # Memory (S5-T01, measured synthetic @ production geometry raw_len=5280, 3.53M params):
+  # RTX 4080 (12.9 GB) fp32 peak -- B=8 ~3.9 GB, B=16 ~7.6 GB, B=48 ~11.4 GB (fits); bf16-mixed
+  # roughly halves it (B=8 ~1.5 GB). batch_size=32 (~7.6 GB fp32) leaves ample headroom on the
+  # prod A6000 (48 GB) -- it can be raised there; confirm the final value with a smoke on that box.
+  batch_size:
+    train: 32          # smaller than v3 (128): the front end runs 16x-longer sequences
+    test: 32
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/raw_v4
+
+model_config:
+  VAE_model:
+    # --- KL / beta schedule (inherited from v3) ---------------------------
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001
+    free_bits: 0.1
+
+    # --- Likelihood (G7): learned per-sample variance over the raw forecast --
+    likelihood: gaussian_nll
+    sigma_obs: learned
+    detach_baseline_in_full: true
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # --- Backbone widths (identical to v3; the core sees (B, 300, 128)) -----
+    d_model: 128
+    d_z: 24
+    horizon: 30            # H = 30 low-rate steps = 2 min forecast
+    warmup_period: 30
+    sequence_length: 300   # low-rate token grid (after crop)
+    c_y: 87                # vestigial: sizes the inherited adapter that v4 replaces with F_y
+    c_u: 101               # vestigial: sizes the inherited adapter that v4 replaces with F_u
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    latent_stats_momentum: 0.01
+
+    # --- v3 scientific-cleanliness flags (G0-G6), inherited verbatim --------
+    causal_norm: true          # G0: CausalGroupNorm in the encoders (extended to the front end)
+    logvar_bound: smooth       # G2
+    posterior_logvar: residual # G1
+    delta_logvar_scale: 2.0
+    kld_support: anchor        # G3
+    lambda_perm: 0.0           # G6: readout-only source-permutation control
+    perm_every_n_batches: 4
+
+    # --- Attention (inherited) ---------------------------------------------
+    max_lag: 90
+    num_heads: 4
+    d_head: 32
+    use_entmax: true
+    attention_grad_checkpoint: false
+    lag_smoothness_lambda: 1.0e-3
+    lag_bias_init: alibi_decay # G5
+    head_structured_latent: true
+    freeze_unused_attn_proj: true
+
+    horizon_refine:
+      depth: 3
+      kernel: 3
+      film: true
+      attn: false
+
+    encoder:
+      extra_dilations: [8, 16]
+      temporal_backbone: lstm
+
+    loss_spike_skip:
+      enabled: true
+      multiplier: 5.0
+      ema_momentum: 0.02
+      warmup_batches: 100
+      warn_on_skip: true
+      max_consecutive_skips: 25
+
+    # =====================================================================
+    # RAW-SPECIFIC (v4) -- consumed by SeqVaeRawV4.__init__ (Sprint 2+)
+    # =====================================================================
+    # Raw geometry (config-driven; geometry.py asserts the derived identities).
+    raw_len: 5280
+    decimation: 16
+
+    # Learned causal front end (Sprint 1). All ablation switches are
+    # construction-gated (only the selected branch is built).
+    frontend:
+      stages: [2, 2, 2, 2]       # progressive stride-2; [16] = single stride-16 ablation
+      channels: [32, 64, 96, 128]
+      d_raw: 128                 # = d_model, so the encoders see (B, 300, 128)
+      antialias: true
+      antialias_kernel: binomial5   # causal low-pass FIR before each decimation
+      gated: false               # ABLATION: plain GELU (vs gated tanh*sigmoid)
+      norm_kind: causal_group_norm  # G0-in-front-end: causal_group_norm | cln | channel_affine
+      norm_num_groups: 8         # must divide every stage channel count
+      first_kernels_fhr: [7, 31, 65]
+      first_kernels_up: [15, 65, 129]
+      decoder_head: learned_basis   # learned_basis | linear (raw within-block head, Sprint 2)
+      basis_size: 8              # K_b smooth within-block functions (learned_basis only)
+      dropout: 0.05
+
+    # Raw forecast auxiliary losses (§10). Rationale: the learned-variance NLL dominates the
+    # objective (order ~1e0-1e1 nats), so the auxiliary terms are kept sub-dominant -- lambda_lp=0.5
+    # (multi-scale trend, in normalized-FHR^2 units) and lambda_smooth=0.1 (first-difference L1) keep
+    # each aux term at roughly 0.1-0.5x the NLL magnitude, enough to shape the trend/slope without
+    # overpowering the likelihood. Re-tuned empirically against the logged losses in S5-T01.
+    lambda_lp: 0.5
+    lambda_smooth: 0.1
+    lowpass_scales: [4, 16, 32, 60]   # seconds (block-average widths at 4 Hz)
+
+  # Best-effort warm-start from a v3 checkpoint (shared submodules align; the front end and raw
+  # decoder heads train from init). Null by default (from scratch).
+  warm_start_from: null
+  core_model_checkpoint: null
+
+dataset_config:
+    vae_train_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_no_cs.hdf5
+    vae_test_datasets:
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_cs.hdf5
+      - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_no_cs.hdf5
+
+    stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/stats.hdf5
+
+    kfold_base_path: /data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_20_sec_delay/k_fold_cross_validation_dataset
+    num_folds: 10
+    classifier_train_datasets: []
+    classifier_val_datasets: []
+    classifier_test_datasets: []
+
+    dataloader_config:
+      num_workers: 4
+      prefetch_factor: 4
+      # Raw model normalizes ONLY the raw fhr/up (scalar z-score); the decimated
+      # scattering fields are not consumed.
+      normalize_fields: ['fhr', 'up']
+      dataset_kwargs:
+        pin_memory: false
+        # Raw fhr/up (5280) + decimated weight/target (330 -- labels/analyses only) + metadata.
+        load_fields:
+          [
+            'fhr',
+            'up',
+            'weight',
+            'target',
+            'epoch',
+            'cs_label',
+            'bg_label',
+            'guid',
+          ]
+        allowed_guids: null
+        cs_label: null
+        bg_label: null
+        epoch_min: null
+        epoch_max: -48000
+        label: null
+        cache_size: 10000
+        # Untrimmed: keep the full 22-min window; the model crops to 300 tokens after the front
+        # end (see the geometry note above). trim_minutes MUST be null for raw_len=5280/330.
+        trim_minutes: null
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    # S5-T03: bf16-mixed validated at production geometry (loss finite, logvar within the smooth
+    # [-5,3] bound) via testing/test_gpu_smoke.py -- set "bf16-mixed" here to enable it in prod.
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+
+  memory:
+    enable_memory_monitoring: false
+    memory_threshold_gb: 60.0
+    memory_log_frequency: 500
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-raw-v4
+      run_name: raw_v4_ablation_plain_activation
+      artifact_location: null
+      log_model: true
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: raw_v4
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    loss_plotting:
+      max_history_size: 10000
+
+    # Raw predicted-vs-true FHR overlays (denormalized bpm); wired in S5-T05/T06.
+    raw_plotting:
+      enabled: true
+      plot_frequency: 1
+      num_examples: 2
+      file_format: "pdf"
+      forecast_anchor_frac: 0.6
