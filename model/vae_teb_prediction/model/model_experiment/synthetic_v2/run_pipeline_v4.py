@@ -438,6 +438,12 @@ _PIPELINE: Dict[str, Any] = {
     # GPUs for a PROD run (Lightning ``devices``; >1 -> DDP). Ignored in pilot mode (forced to [0]).
     # This is the prod 8x A6000 box; trim the list to match the machine you launch on.
     "cuda_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    # Per-epoch raw FHR/UP forecast plots DURING training. Off by default: it imports ``utils.style``
+    # (a repo module that must be present/importable on the box -- note ``utils/style.py`` is untracked,
+    # so a git checkout or a partial deploy will not have it), and per-epoch PDF plotting across a
+    # multi-arm DDP sweep is expensive. The report / test_plots stages produce the figures instead.
+    # Set True only if ``utils/style.py`` is importable on this machine.
+    "raw_plotting": False,
     # Arms to sweep, in this order. [] -> every configured arm. This is the full DIRECT-cache headline
     # ladder; ``am_carrier_prod`` reads a SEPARATE am cache (build config_synth_v4_am.yaml first), so
     # it is run in its own pass, not here.
@@ -511,6 +517,11 @@ def _edit_and_run() -> int:
     # exactly these arms in this order.
     orig_arms = config.get("arms", {}) or {}
     config["arms"] = {arm: orig_arms.get(arm, {}) for arm in arms}
+
+    # Keep training headless: no per-epoch raw plotting unless explicitly enabled (avoids the
+    # ``utils.style`` import; the figures come from the report / test_plots stages).
+    config.setdefault("advanced_config", {}).setdefault("callbacks", {}).setdefault(
+        "raw_plotting", {})["enabled"] = bool(plan.get("raw_plotting", False))
 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cfg_path, "w", encoding="utf-8") as handle:
