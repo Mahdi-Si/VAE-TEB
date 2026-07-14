@@ -419,5 +419,151 @@ def main(argv: Optional[List[str]] = None) -> int:
     return _dispatch_for_arm(config, benchmark, spec, arm, args)
 
 
+# =============================================================================
+# Edit-and-run driver (no CLI args -> run the toggled stages; mirrors run_pipeline_v2.py)
+# =============================================================================
+#: Edit these, then just hit ▶ Run (no CLI args needed). The *config* controls WHAT each stage does
+#: (grid, arms' deltas, model, beta schedule, thresholds); this dict controls WHICH stages + arms run,
+#: on HOW MANY GPUs. Nothing runs unless toggled on. Passing ANY CLI argument bypasses this and uses
+#: the argparse CLI in :func:`main` instead, so both entry styles coexist.
+#:
+#: PROD / FINAL (default below): ``pilot: False`` runs the FULL config grid, full training with
+#: **multi-GPU DDP** over ``cuda_devices``, into the config's real tag/paths -- ``train`` is dispatched
+#: through :func:`run_sweep` as a DDP-safe subprocess per arm (so Lightning owns a clean 8-GPU process
+#: group; the subprocess re-enters ``--stage train --arm X``, never this driver).
+#: DEV smoke: set ``pilot: True`` -> tiny grid + a single GPU + a few epochs, isolated under
+#: ``pilot_v4_out/`` so it never clobbers a headline run.
+_PIPELINE: Dict[str, Any] = {
+    "pilot": False,
+    # GPUs for a PROD run (Lightning ``devices``; >1 -> DDP). Ignored in pilot mode (forced to [0]).
+    # This is the prod 8x A6000 box; trim the list to match the machine you launch on.
+    "cuda_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    # Arms to sweep, in this order. [] -> every configured arm. This is the full DIRECT-cache headline
+    # ladder; ``am_carrier_prod`` reads a SEPARATE am cache (build config_synth_v4_am.yaml first), so
+    # it is run in its own pass, not here.
+    "arms": ["prod", "frontend_noncausal", "single_stride", "no_antialias", "no_gated",
+             "disable_source"],
+    "split": "val",                 # split to grade (eval / report / arms_report); None -> all splits
+    "stages": {                     # flip any to False to skip it (stages are resumable)
+        "build": True,              #   generate the raw .npz cache (needed before train/eval)
+        "realizability": True,      #   model-free te_raw gate -> realizability.json
+        "data_previews": False,     #   raw FHR/UP overlay figures per cell
+        "train": True,              #   train each arm (DDP subprocess per arm when >1 GPU)
+        "eval": True,               #   grade each arm -> <arm>/<split>/metrics.json
+        "report": True,             #   per-arm markdown report + figures
+        "arms_report": True,        #   one cross-arm gate table at the tag root
+    },
+    # Pilot-only grid (ignored when pilot is False -> the config's full grid is built instead).
+    "te_grid": [0.0, 2.0], "lag_grid": [8], "n_per_split": {"train": 8, "val": 4, "test": 4},
+}
+
+#: Split-scoped stages that take a ``--split`` (train is split-independent; model-free stages ignore it).
+_SPLIT_FLAG_STAGES = frozenset({"eval", "report", "arms_report"})
+#: Execution order for the edit-and-run driver (``build`` is handled specially, before the rest).
+_DRIVER_STAGE_ORDER = ("realizability", "data_previews", "train", "eval", "report", "arms_report")
+
+
+def _edit_and_run() -> int:
+    r"""Run the stages toggled in :data:`_PIPELINE` with no CLI args (hit ▶ Run).
+
+    Every model-dependent stage is dispatched through :func:`main` **without** an explicit ``--arm``,
+    so the tested :func:`run_sweep` machinery drives the arm loop: ``train`` becomes a DDP-safe
+    subprocess per arm (each subprocess lets Lightning own a clean multi-GPU DDP process group over
+    ``cuda_devices``), while ``eval`` / ``report`` run in-process per arm with split fan-out.
+    Crucially, ``train`` is **never** called in-process here -- an in-process multi-GPU fit would make
+    Lightning re-launch this arg-less script and re-enter :func:`_edit_and_run` on every rank.
+
+    In ``pilot`` mode the run is forced to a single GPU and retargeted to an isolated ``pilot_v4`` tag
+    under ``pilot_v4_out/``. Returns ``0``; raises on the first non-zero stage return code.
+    """
+    import copy
+
+    import yaml
+
+    from model.vae_teb_prediction.model.model_experiment.synthetic_v2.build_dataset_v4 import (
+        build_all_v4,
+    )
+
+    plan = _PIPELINE
+    config = copy.deepcopy(load_config(str(_DEFAULT_CONFIG)))
+    benchmark = str(config.get("experiment", {}).get("benchmark", "G1_raw_v4"))
+    arms = list(plan["arms"]) if plan["arms"] else list((config.get("arms") or {}).keys())
+
+    # GPU selection: pilot forces a single device; a prod run uses the configured list (>1 -> DDP).
+    devices = [0] if plan["pilot"] else list(plan["cuda_devices"])
+    config.setdefault("general_config", {})["cuda_devices"] = devices
+
+    if plan["pilot"]:
+        out_dir = _MODULE_DIR / "pilot_v4_out"
+        config["experiment"] = {**config.get("experiment", {}),
+                                "tag": "pilot_v4", "data_tag": "pilot_v4_direct"}
+        config["paths"] = {"data_dir": str(out_dir / "data"),
+                           "results_dir": str(out_dir / "results")}
+        config.setdefault("general_config", {}).setdefault("folders_config", {})[
+            "out_dir_base"] = str(out_dir / "train_out")
+        config.setdefault("advanced_config", {}).setdefault("tracking", {}).setdefault(
+            "mlflow", {})["enabled"] = False
+        cfg_path = out_dir / "config_run_v4.yaml"
+    else:
+        cfg_path = _MODULE_DIR / "config_run_v4.yaml"
+
+    # Narrow the arm block to the selection so a no-arm sweep (train / eval / arms_report) iterates
+    # exactly these arms in this order.
+    orig_arms = config.get("arms", {}) or {}
+    config["arms"] = {arm: orig_arms.get(arm, {}) for arm in arms}
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+    base = ["--config", str(cfg_path)]
+    pilot_flag = ["--pilot"] if plan["pilot"] else []
+    split_flag = ["--split", plan["split"]] if plan["split"] else []
+    stages = plan["stages"]
+
+    def _banner(msg: str) -> None:
+        print(f"\n{'=' * 78}\n>>> {msg}\n{'=' * 78}", flush=True)
+
+    def _run(extra: List[str], label: str) -> None:
+        _banner(label)
+        rc = main(base + extra)
+        if rc != 0:
+            raise RuntimeError(f"stage failed ({label}): return code {rc}")
+
+    mode = "tiny pilot grid, 1 GPU" if plan["pilot"] else f"full grid, {len(devices)} GPU(s) (DDP)"
+    print(f"[run] {'PILOT' if plan['pilot'] else 'PROD'} sweep: arms={arms} ({mode})")
+
+    # build is a direct call (so the pilot grid override applies; prod builds the config's full grid).
+    if stages.get("build"):
+        _banner(f"build cache  arms={arms}")
+        cache_dir = Path(resolve_cache_dir(config, benchmark=benchmark))
+        overrides = (dict(grid_override={"target_te_grid": plan["te_grid"],
+                                         "lag_grid": plan["lag_grid"]},
+                          n_override=dict(plan["n_per_split"])) if plan["pilot"] else {})
+        build_all_v4(config, benchmark=benchmark, out_dir=cache_dir, **overrides)
+        print(f"[build] cache -> {cache_dir}")
+
+    # Every other toggled stage -> main() WITHOUT --arm, so run_sweep drives the arm loop and, for
+    # train, the DDP-safe subprocess-per-arm dispatch.
+    for name in _DRIVER_STAGE_ORDER:
+        if not stages.get(name):
+            continue
+        extra = ["--stage", name, *pilot_flag]
+        if name in _SPLIT_FLAG_STAGES:
+            extra += split_flag
+        _run(extra, name)
+
+    root = _results_dir(config, benchmark)
+    _banner("DONE -- artifacts")
+    print(f"  results root : {root}")
+    print(f"  arms report  : {root / 'arms_report_v4.md'}")
+    for arm in arms:
+        run_dir = _run_dir(config, benchmark, arm)
+        print(f"  [{arm}] ckpt   : {run_dir / 'final.ckpt'}")
+        print(f"  [{arm}] metrics: {run_dir / (plan['split'] or 'val') / 'metrics.json'}")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # No CLI args -> run the _PIPELINE toggles (hit ▶ Run). Any argument -> the argparse CLI in
+    # main() (also the DDP-safe `--stage train` subprocess re-entry). Mirrors run_pipeline_v2.py.
+    raise SystemExit(main() if len(sys.argv) > 1 else _edit_and_run())
