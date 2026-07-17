@@ -1,0 +1,44 @@
+# Local smoke variant: one epoch, one device, a committed 4-sample shard.
+#
+# Everything not named here is inherited from v3.yaml -- including the settings that are
+# correctness requirements rather than preferences (causal_norm, compile: false, the spike
+# breaker's ema_floor), which is the point: a variant that re-stated them could drift from them.
+#
+# The geometry stays real. sequence_length, the channel counts and trim_minutes match the shipped
+# config, because the committed shard carries the real field shapes; only the model's widths shrink
+# so a CPU forward is fast. That keeps this a test of the actual data contract.
+#
+#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3_tiny.yaml
+base: v3.yaml
+
+general_config:
+  tag: lag_attn_tiny
+  cuda_devices: [0]
+  epochs: 1
+  batch_size: {train: 2, test: 2}
+  folders_config: {out_dir_base: output/teb_vae_tiny}
+
+model_config:
+  VAE_model:
+    d_model: 32          # = num_heads * d_head
+    d_z: 8               # divisible by num_heads, required by head_structured_latent
+    d_head: 8
+    max_lag: 8
+    lstm_layers: 1
+    dropout: 0.0
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root.
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for 4 samples
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # a smoke run is not a result
+  callbacks:
+    lag_attn_plotting:
+      enabled: false

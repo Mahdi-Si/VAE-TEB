@@ -1,0 +1,176 @@
+"""Config-gated loss-spike circuit breaker: train-only, EMA threshold, escape hatch,
+metric selection, and DDP MAX/MIN skip synchronisation.
+
+The breaker logic is exercised directly through ``_apply_spike_breaker`` (which never
+touches ``self.log``); the train-only gate is exercised through the step dispatcher with
+logging stubbed out. Skips are zero-gradient steps, so a skipped batch yields all-zero
+gradients rather than a ``None`` return.
+"""
+import torch
+from torch.distributed import ReduceOp
+
+from train.test_utils import FakeStrategy, FakeTrainer, TinyLightningModel
+
+
+def _cfg(**overrides):
+    cfg = {
+        "enabled": True,
+        "multiplier": 5.0,
+        "ema_decay": 0.02,
+        "ema_floor": 0.0,
+        "warmup_batches": 0,
+        "max_consecutive_skips": 25,
+        "comparison_metric": "total_loss",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _model(**kwargs):
+    return TinyLightningModel(compile_model=False, **kwargs)
+
+
+def _feed(model, value, cfg, main=None):
+    """Run one breaker decision on a scalar loss; return (metrics, returned_loss)."""
+    metrics = {"total_loss": torch.tensor(float(value))}
+    if main is not None:
+        metrics["main_loss"] = torch.tensor(float(main))
+    loss = torch.tensor(float(value), requires_grad=True)
+    out = model._apply_spike_breaker(loss, metrics, cfg)
+    return metrics, out
+
+
+# --- S4-T01: gate, train-only, non-finite guard, zero-grad skip ----------------
+
+def test_breaker_off_returns_raw_loss(monkeypatch):
+    model = _model()  # no spike_breaker -> disabled
+    monkeypatch.setattr(model, "log", lambda *a, **k: None)
+    x, y = torch.randn(2, 4), torch.randn(2, 4)
+    out = model.training_step((x, y), 0)
+    expected = torch.nn.functional.mse_loss(model.model(x), y)
+    assert torch.allclose(out, expected)
+
+
+def test_nonfinite_train_batch_is_zero_gradient_step():
+    model = _model()
+    metrics, out = _feed(model, float("nan"), _cfg())
+    assert metrics["spike_skipped"].item() == 1.0
+    assert torch.isfinite(out).item()  # the returned loss is finite despite the NaN input
+    model.zero_grad(set_to_none=True)
+    out.backward()
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert all(p.grad is not None for p in trainable)
+    assert all(torch.count_nonzero(p.grad) == 0 for p in trainable)
+
+
+def test_val_stage_never_triggers(monkeypatch):
+    model = _model(spike_breaker=_cfg())
+    monkeypatch.setattr(model, "log", lambda *a, **k: None)
+    x, y = torch.full((2, 4), float("nan")), torch.zeros(2, 4)
+    out = model.validation_step((x, y), 0)
+    # val is untouched by the breaker: the real (non-finite) loss is returned as-is.
+    assert not torch.isfinite(out).item()
+
+
+def test_nonfinite_returned_loss_skips_even_in_main_loss_mode():
+    # The guard must protect the backpropagated total_loss: a NaN total_loss with a
+    # finite watched main_loss must still skip, not corrupt the weights.
+    model = _model()
+    cfg = _cfg(comparison_metric="main_loss")
+    metrics = {"total_loss": torch.tensor(1.0), "main_loss": torch.tensor(1.0)}
+    out = model._apply_spike_breaker(torch.tensor(float("nan"), requires_grad=True), metrics, cfg)
+    assert metrics["spike_skipped"].item() == 1.0
+    assert torch.isfinite(out).item()
+
+
+def test_skip_overwrites_poisoned_loss_metric():
+    # A skipped NaN loss must not reach the logger as NaN and poison the epoch aggregate.
+    model = _model()
+    metrics = {"total_loss": torch.tensor(float("nan"))}
+    model._apply_spike_breaker(torch.tensor(float("nan"), requires_grad=True), metrics, _cfg())
+    assert torch.isfinite(metrics["total_loss"]).item()
+
+
+# --- S4-T02: EMA-multiplier threshold + ema_floor ------------------------------
+
+def test_threshold_skips_spike_and_ema_not_polluted():
+    model = _model()
+    cfg = _cfg(multiplier=5.0, ema_decay=0.5)
+    _feed(model, 1.0, cfg)                     # seed EMA = 1.0
+    assert model._spike_ema_loss == 1.0
+    metrics, _ = _feed(model, 100.0, cfg)      # 100 > 5*1 -> skip
+    assert metrics["spike_skipped"].item() == 1.0
+    assert model._spike_ema_loss == 1.0        # a skipped spike must not move the EMA
+    metrics, _ = _feed(model, 1.0, cfg)        # normal loss trains again
+    assert metrics["spike_skipped"].item() == 0.0
+
+
+def test_ema_floor_clamps_comparison_base():
+    # With a floor, the comparison base cannot drop below it, so a mid-size loss stays
+    # under threshold; without the floor the same loss spikes.
+    with_floor = _model()
+    _feed(with_floor, 1.0, _cfg(ema_floor=10.0))
+    metrics, _ = _feed(with_floor, 40.0, _cfg(ema_floor=10.0))   # 40 vs 5*max(1,10)=50
+    assert metrics["spike_skipped"].item() == 0.0
+
+    no_floor = _model()
+    _feed(no_floor, 1.0, _cfg(ema_floor=0.0))
+    metrics, _ = _feed(no_floor, 40.0, _cfg(ema_floor=0.0))      # 40 vs 5*1=5
+    assert metrics["spike_skipped"].item() == 1.0
+
+
+# --- S4-T03: escape hatch + comparison_metric ----------------------------------
+
+def test_escape_hatch_force_accepts_after_cap():
+    n = 3
+    model = _model()
+    cfg = _cfg(max_consecutive_skips=n)
+    _feed(model, 1.0, cfg)                      # seed EMA = 1.0
+    for _ in range(n):                          # n consecutive spikes -> n skips
+        metrics, _ = _feed(model, 100.0, cfg)
+        assert metrics["spike_skipped"].item() == 1.0
+    metrics, _ = _feed(model, 100.0, cfg)       # the (n+1)th spike is force-accepted
+    assert metrics["spike_skipped"].item() == 0.0
+    assert model._spike_forced_accepts_total == 1
+    assert model._spike_ema_loss == 100.0       # EMA hard re-seeded on force-accept
+
+
+def test_comparison_metric_watches_main_loss():
+    model = _model()
+    cfg = _cfg(comparison_metric="main_loss")
+    _feed(model, 1.0, cfg, main=1.0)                 # seed EMA from main_loss = 1.0
+    metrics, _ = _feed(model, 1000.0, cfg, main=1.0)  # total huge but main normal -> train
+    assert metrics["spike_skipped"].item() == 0.0
+    metrics, _ = _feed(model, 1.0, cfg, main=100.0)   # main spikes -> skip
+    assert metrics["spike_skipped"].item() == 1.0
+
+
+# --- S4-T04: DDP skip-decision sync --------------------------------------------
+
+def test_reduce_uses_max_on_skip_path():
+    model = _model()
+    trainer = FakeTrainer(world_size=2)
+    trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)  # other rank skips
+    model._trainer = trainer
+    # local False, other True, MAX -> skip if any rank skips.
+    assert model._reduce_spike_decision(False, "max") is True
+    assert trainer.strategy.reduce_calls[-1] == ReduceOp.MAX
+
+
+def test_reduce_uses_min_on_force_path():
+    model = _model()
+    trainer = FakeTrainer(world_size=2)
+    trainer.strategy = FakeStrategy(world_size=2, other_value=0.0)  # other rank vetoes force
+    model._trainer = trainer
+    # local True, other False, MIN -> force-accept only if every rank agrees.
+    assert model._reduce_spike_decision(True, "min") is False
+    assert trainer.strategy.reduce_calls[-1] == ReduceOp.MIN
+
+
+def test_reduce_is_noop_on_single_device():
+    model = _model()
+    trainer = FakeTrainer(world_size=1)
+    trainer.strategy = FakeStrategy(world_size=1, other_value=1.0)
+    model._trainer = trainer
+    assert model._reduce_spike_decision(False, "max") is False  # flag returned unchanged
+    assert trainer.strategy.reduce_calls == []                  # reduce never called

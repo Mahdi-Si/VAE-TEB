@@ -2,6 +2,7 @@
 general_config:
   tag: core_model_with_l8
 
+  seed: 42  # Global RNG seed; seeds Python/NumPy/torch and DataLoader workers
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]  # List of GPU device IDs to use
   lr: 0.001  # Learning rate (can reduce to 0.00005 for Stage 2 freeze mode)
   lr_milestone: [500]  # Epochs at which to decay learning rate
@@ -75,17 +76,47 @@ dataset_config:
 # Advanced Training Configuration
 advanced_config:
   trainer:
-    precision: "16-mixed"
+    # bf16-mixed avoids the fp16 GradScaler loss-scale-collapse failure mode on
+    # Ada/Ampere (no dynamic loss scaling); identical behaviour otherwise.
+    precision: "bf16-mixed"
     gradient_clip_val: 0.5
     gradient_clip_algorithm: "norm"
-    sync_batchnorm: true
+    sync_batchnorm: true               # Effective only with >1 device (guarded in build_trainer)
     deterministic: false
     benchmark: true
+    compile: true                      # torch.compile the wrapped model (opt-out via false)
+    log_every_n_steps: 1
+    num_sanity_val_steps: 0
+    use_distributed_sampler: true      # false when the DataModule owns the sampler
+    profiler: simple                   # 'simple' | 'advanced' | null (off)
 
-  memory:
-    enable_memory_monitoring: false    # Set to true if OOM errors occur
-    memory_threshold_gb: 60.0
-    memory_log_frequency: 500
+  logging:
+    # Console + file run logs (metrics go to MLflow, not here).
+    # Each run writes train_results/full.log (human) and run.jsonl (JSON Lines).
+    # Under DDP every rank writes its own file -- rank 0 keeps the plain name,
+    # others get a .rank{N} suffix -- because N ranks sharing one file corrupts it
+    # (each rank would enforce its own rotation on it). The console is rank 0 only.
+    console_level: INFO
+    file_level: INFO
+    json_log: true                     # write the JSON Lines mirror of the run log
+    # diagnose renders every local variable in a traceback; a training_step frame
+    # holds the input batch, so it is forced off for the on-disk sinks and this key
+    # only affects the (non-persisted) console. Leave false unless debugging locally.
+    console_diagnose: false
+    rotation: "100 MB"
+    retention: "14 days"
+
+  spike_breaker:
+    # Loss-spike circuit breaker. Disabled by default -> the training step is unchanged.
+    # When enabled, a batch whose watched loss exceeds multiplier * max(EMA, ema_floor)
+    # takes a zero-gradient step instead of a real update (train stage only).
+    enabled: false
+    multiplier: 5.0                    # spike threshold as a multiple of the loss EMA
+    ema_decay: 0.02                    # EMA momentum; updated only on accepted batches
+    ema_floor: 0.0                     # floor on the comparison base (guards a collapsed EMA)
+    warmup_batches: 100                # never skip during the first this-many batches
+    max_consecutive_skips: 25          # force-accept after this many skips (anti-deadlock)
+    comparison_metric: total_loss      # 'total_loss' (returned loss) | 'main_loss' (metrics)
 
   tracking:
     mlflow:
@@ -94,7 +125,8 @@ advanced_config:
       experiment_name: seqvae-teb
       run_name: null
       artifact_location: null
-      log_model: false
+      log_model: true                  # log + register the final eager model (when enabled)
+      log_checkpoints: false           # Lightning checkpoint-weight artifacts; off to avoid double-store
       log_config_artifact: true
       tags:
         project: teb_vae
@@ -106,6 +138,7 @@ advanced_config:
       monitor: "val/total_loss"
       patience: 30
       min_delta: 0.0001
+      mode: "min"
 
     model_checkpoint:
       monitor: "val/total_loss"

@@ -217,47 +217,16 @@ def sparse_normalize(
 
 
 # =============================================================================
-# Checkpoint model-class guard (S0-T04)
+# Checkpoint model-class guard
 # =============================================================================
 
-
-def check_model_class(ckpt: Any, active_cls_name: str) -> None:
-    r"""Guard that a checkpoint's ``model_class`` matches the active alias class.
-
-    Runs on the raw checkpoint dict BEFORE any ``SeqVaeLagAttn(**model_kwargs)``
-    reconstruction. Because the v1/v2 constructors are keyword-only with no
-    ``**kwargs``, loading a v2 checkpoint's ``model_kwargs`` into v1 (or vice
-    versa) would otherwise raise a cryptic ``TypeError`` at construction; this
-    guard fails first with an actionable message.
-
-    Args:
-        ckpt: The deserialised checkpoint dict (non-dicts are skipped).
-        active_cls_name: ``__name__`` of the currently-active alias class, e.g.
-            ``"SeqVaeLagAttnV1"`` or ``"SeqVaeLagAttnV2"``.
-
-    Raises:
-        ValueError: If the checkpoint records a ``model_class`` differing from
-            ``active_cls_name``.
-    """
-    if not isinstance(ckpt, dict):
-        return
-    stored = ckpt.get("model_class")
-    if stored is None:
-        warnings.warn(
-            "checkpoint has no 'model_class' field (pre-guard checkpoint); "
-            f"assuming it matches the active class {active_cls_name!r}. The "
-            "rebuild will still fail loudly if the constructor kwargs are "
-            "incompatible.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return
-    if str(stored) != str(active_cls_name):
-        raise ValueError(
-            f"checkpoint model_class={stored!r} does not match the active model "
-            f"class {active_cls_name!r}. Toggle the SeqVaeLagAttn alias import to "
-            f"the matching version before loading this checkpoint."
-        )
+# ``check_model_class`` now lives in ``train/graph_models_utils.py``, beside the checkpoint
+# loaders and the ``model_class`` stamp it reads. It never had any knowledge of this module --
+# it is ~20 generic lines over a framework-written field -- and keeping it here forced every
+# consumer that wanted a checkpoint guard to import this 3000-line module for it.
+#
+# Re-exported so the existing importers of this name keep resolving unchanged.
+from train.graph_models_utils import check_model_class  # noqa: F401  (re-export)
 
 
 # =============================================================================

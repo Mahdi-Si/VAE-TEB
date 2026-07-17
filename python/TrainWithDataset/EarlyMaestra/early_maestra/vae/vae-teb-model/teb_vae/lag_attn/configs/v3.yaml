@@ -1,0 +1,332 @@
+# Lag-attentive residual VAE-TEB: the production training configuration.
+#
+# The model forecasts a decimated FHR scattering/phase-harmonic stream from its own causal
+# history, conditioned on a lag-attended UP source. The per-step KL between the source-conditioned
+# posterior and the history-only prior is the transfer-entropy surrogate the whole design exists to
+# make readable, which is why several settings below are correctness requirements rather than
+# preferences. Those are marked.
+#
+# Prerequisites:
+#   * HDF5 datasets produced by `hdf5_dataset/new_pipeline/create_new_pipeline.py`, which writes
+#     `up_st` (43 channels, log-normalised) and `up_ph` (58 channels, asinh-normalised) as
+#     first-class datasets alongside `fhr_st` and `fhr_ph`.
+#   * The stats file at `stat_path` regenerated after any dataset rebuild by
+#     `hdf5_dataset/calculate_dataset_stats.py`, with a matching `trim_minutes`.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3.yaml
+#
+# Ablation toggle: `use_up_st: true` -> source stream = concat(up_st, up_ph), c_u=101.
+# `use_up_st: false` -> source stream = up_ph alone, c_u=58. The constructor rejects a mismatch.
+
+general_config:
+  tag: lag_attn_baseline
+
+  seed: 42
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  lr: 0.001
+  lr_milestone: [1000]      # singular; the experiment driver reads this exact key
+  plot_frequency: 1
+  epochs: 5000
+  accumulate_grad_batches: 1
+  batch_size:
+    train: 128
+    test: 128
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn
+
+model_config:
+  VAE_model:
+    # --- KL / beta schedule (calibrated ELBO) ----------------------------------
+    # Resolved per-epoch by the task's beta schedule. `linear_warmup` ramps beta from `start` to
+    # `end` over the first `warmup_epochs` epochs, then holds. A weak early beta lets the residual
+    # decoder learn to use z before the bottleneck tightens for a calibrated TE reading.
+    #
+    # Retune `end` empirically against the logged `kld_raw` trajectory. The KL starts at exactly 0
+    # (the posterior log-variance is a zero-init residual around the prior) and grows only as the
+    # source pathway earns it, and the anchor KL support drops the last `horizon` steps from the
+    # denominator -- both change the natural KL scale.
+    beta_schedule:
+      kind: linear_warmup
+      start: 1.0e-4
+      end: 0.1
+      warmup_epochs: 50
+    kld_beta: 0.001        # fallback when beta_schedule.kind == constant
+    free_bits: 0.1         # nats per latent dim per step; 0.0 disables
+
+    # --- Reconstruction likelihood --------------------------------------------
+    # `sigma_obs: learned` makes the loss consume the decoder logvar_full/logvar_base heads, giving
+    # a heteroscedastic per-point predictive Gaussian (the calibration report needs this) and
+    # keeping every parameter in DDP's expectation set, which is what earns plain 'ddp'. A positive
+    # float (e.g. 1.0) reduces this to a fixed-variance debug run -- and, because it starves the
+    # logvar heads, forces the slower ddp_find_unused_parameters_true.
+    likelihood: gaussian_nll
+    sigma_obs: learned
+
+    # Baseline/residual gradient separation: the full head's gradient does not flow back into the
+    # baseline path, so the baseline stays an honest source-free reference.
+    detach_baseline_in_full: true
+
+    # Feature-loss weighting.
+    lambda_full: 1.0
+    lambda_base: 0.5
+
+    # --- Backbone widths -------------------------------------------------------
+    d_model: 128
+    d_z: 24
+    horizon: 30            # H_d = 30 decimated steps = 2 min forecast
+    warmup_period: 30      # first 2 minutes ignored in both feature and KL losses
+    sequence_length: 300
+    c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
+    c_u: 101               # 43 (up_st) + 58 (up_ph); must be 58 when use_up_st=false
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    decoder_hidden: 128
+    logvar_clamp: [-5.0, 3.0]
+    # Latent stabilisers: saturation magnitudes of the tanh-bounded latent heads.
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    delta_logvar_scale: 2.0
+
+    # --- Causal history states (REQUIRED for the KL to mean anything) -----------
+    # nn.GroupNorm over a (B, C, T) tensor reduces over every non-batch dim inside a group -- i.e.
+    # over (C/G, T) -- so its statistics pool ACROSS TIME and H_y[t] becomes a function of Y[>t].
+    # The "prior" p(z_t | Y_<=t) then secretly conditions on the future and K_t is not a
+    # transfer-entropy surrogate at all, whatever the rest of the design does. Measured leak into
+    # target_state[t] from resampling y[>t]: ~3.4% relative at T=300, 0.0 with causal_norm on.
+    #
+    # 'true' swaps the 10 encoder GroupNorms for CausalGroupNorm (same parameter names and shapes).
+    # The decoders and the shared horizon core are deliberately untouched: their GroupNorms pool
+    # over the forecast-horizon axis within one anchor, mixing that anchor's outputs rather than
+    # its inputs across time (probed: zero leak).
+    causal_norm: true
+
+    # --- KL support ------------------------------------------------------------
+    # 'anchor' trains the KL only over supervised anchors [warmup, T-horizon); 'full' extends it to
+    # every post-warmup step, including the tail steps whose forecast targets run off the end of
+    # the sequence and are therefore unsupervised.
+    kld_support: anchor
+
+    # --- Source-permutation control: READOUT ONLY ------------------------------
+    # The control deranges UP across the batch and reports
+    #   K_shuffled = KL( q(z | Y, pi(U)) || p(z | Y) ).
+    # It is fused into the single main forward (the source encoder is batch-independent, so
+    # permuting `source_state` equals re-encoding pi(U)), which keeps it inside one backward.
+    #
+    # lambda_perm > 0 would ALSO add lambda_perm * K_shuffled to the loss. It is deliberately 0.
+    # Measured on a causal, source-coupled synthetic task (fresh batches, held-out eval), with the
+    # model demonstrably using the source (feat_loss 3.87 vs base_loss 14.20):
+    #
+    #   lambda_perm=0.0  ->  K_true 6.04  K_shuffled 6.62   ratio 1.10
+    #   lambda_perm=0.0  ->  K_true 6.37  K_shuffled 6.49   ratio 1.02   (seed 1)
+    #   lambda_perm=0.5  ->  K_true 3.00  K_shuffled 2.51   ratio 0.84
+    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
+    #   lambda_perm=0.5  ->  K_true 0.00  K_shuffled 0.00   SOURCE PATH COLLAPSED
+    #
+    # Two conclusions. (1) KL(q||p) measures "the source moved my belief", not "...correctly": a
+    # deranged UP is still a UP, and the posterior -- trained only on matched pairs -- reacts to it
+    # out of distribution, so K_shuffled >= K_true even for a model that plainly uses the source.
+    # kld_raw alone is therefore NOT a source-specific TE surrogate. (2) The only way L_perm can
+    # suppress K_shuffled is to teach the posterior to ignore mismatched sources, which competes
+    # directly with using the source at all; in 2 of 4 seeds it destroyed the source pathway
+    # outright while total_loss still looked healthy.
+    #
+    # The control that DOES discriminate lives in prediction space and needs no auxiliary loss --
+    # logged every validation step as `feat_loss_shuffled`:
+    #     feat_loss  <  base_loss  <  feat_loss_shuffled
+    #     (3.87)        (14.20)       (26.32)
+    # i.e. a wrong source is worse than no source. Watch `shuffle_penalty`
+    # (= feat_loss_shuffled - feat_loss) stay large and positive, and `pred_gap`
+    # (= base_loss - feat_loss) stay positive.
+    #
+    # Set lambda_perm > 0 only as a deliberate experiment, and watch pred_gap: a collapsed run has
+    # pred_gap ~ 0 and kld_raw ~ 0 together.
+    lambda_perm: 0.0
+    perm_every_n_batches: 4
+
+    # --- Attention -------------------------------------------------------------
+    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    num_heads: 4
+    d_head: 32
+    use_entmax: true       # exact zeros in the lag distribution, not merely small weights
+    attention_grad_checkpoint: false
+    lag_smoothness_lambda: 1.0e-3
+    # Lag-bias init. 'alibi_decay' seeds a learnable (num_heads, L) attention-score bias with a
+    # per-head negative slope -m_h * ell, giving a physiologic short-lag prior. 'normal' is flat
+    # and adds no bias parameter.
+    lag_bias_init: alibi_decay
+
+    # Head-structured latent: the posterior consumes per-head attention summaries, so the KL
+    # decomposes additively per head and `te_lag_map` is readable per lag.
+    head_structured_latent: true
+
+    # With head_structured_latent=true the posterior consumes A_heads, so the attention's output
+    # projection lag_attn.W_o feeds only the diagnostic `attended_source` key: it receives no
+    # gradient and the optimiser never updates it. Freezing it is numerically a no-op, but it drops
+    # the parameter from DDP's expectation set so the run can use plain 'ddp' instead of
+    # ddp_find_unused_parameters_true. Set false to keep W_o trainable -- the strategy selector
+    # then falls back automatically.
+    freeze_unused_attn_proj: true
+
+    # --- Shared horizon decoder core -------------------------------------------
+    horizon_refine:
+      depth: 3
+      kernel: 3
+      film: true
+
+    # Append dilated conv blocks to both encoders for a longer receptive field.
+    encoder:
+      extra_dilations: [8, 16]
+
+  core_model_checkpoint: null
+
+
+dataset_config:
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_no_cs.hdf5
+
+  # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
+  # here yields None and silently disables normalization, so the entry point guards it explicitly.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/stats.hdf5
+
+  dataloader_config:
+    num_workers: 4
+    prefetch_factor: 4
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+    dataset_kwargs:
+      pin_memory: false
+      # The five fields the model consumes, plus the three the diagnostic plots need. `target`,
+      # `epoch`, `cs_label` and `bg_label` are classifier-era fields this model never reads.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+        ]
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: null
+      epoch_max: -48000
+      label: null
+      cache_size: 10000
+      # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only warns.
+      trim_minutes: 1.0
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    gradient_clip_val: 0.5
+    gradient_clip_algorithm: "norm"
+    # ANDed with (num_devices > 1) by the experiment driver, so this is off either way on one GPU.
+    sync_batchnorm: false
+    deterministic: false
+    benchmark: true
+    # REQUIRED false, permanently. Four independent things in this model break TorchInductor:
+    # nn.LSTM in the encoders, torch.utils.checkpoint inside the attention, and the
+    # data-dependent boolean-mask indexing that computes kld_active_frac on every forward.
+    compile: false
+    log_every_n_steps: 1
+    num_sanity_val_steps: 0
+    # Keep true: the data module builds plain loaders on purpose and relies on Lightning to inject
+    # the DistributedSampler and call set_epoch each epoch.
+    use_distributed_sampler: true
+    profiler: simple
+
+  logging:
+    console_level: INFO
+    file_level: INFO
+    json_log: true
+    console_diagnose: false
+    rotation: "100 MB"
+    retention: "14 days"
+
+  # Loss-spike circuit breaker, deliberately configured as a NON-FINITE GUARD ONLY.
+  #
+  # The breaker's relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a
+  # loss bounded below by zero. This model's main_loss is a Gaussian NLL with a learned observation
+  # variance and goes negative routinely. Once the EMA is negative, `max(EMA, 0.0)` is 0.0 and the
+  # test degenerates to `watched > 0` -- so an ordinary batch that lands just above zero during the
+  # sign crossing is declared a spike, its gradient is discarded, and the value logged as
+  # train/main_loss is replaced by the EMA. Measured: EMA -0.5 with batches at +0.3/+0.6/+0.2/+0.4
+  # skips 4 of 4 and logs -0.5 for each. The EMA only updates on accepted batches, so it stays
+  # negative and the bias persists: the run silently drops its hardest batches. No value of
+  # ema_floor fixes this -- a negative floor makes the threshold negative and skips nearly
+  # everything; 0.0 is as good as the relative test gets here.
+  #
+  # (The trainer this replaced gated on `ema_before > 0.0`, so its breaker simply went inert once
+  # the EMA turned negative. It was never protecting a negative-loss run either.)
+  #
+  # So: ema_floor is set far above any reachable loss, which switches the relative test off. The
+  # non-finite check does not consult the threshold at all, so NaN/inf still trigger the
+  # zero-gradient skip -- and that is the protection worth keeping, because it is what stops a NaN
+  # loss writing NaN gradients into the weights. What is given up is detection of a *positive*
+  # blow-up during early training while the EMA is still positive.
+  #
+  # Revisit once the real sign and scale of main_loss have been measured at production scale: if it
+  # stays positive throughout, a real ema_floor and relative detection become usable again.
+  spike_breaker:
+    enabled: true
+    multiplier: 5.0
+    ema_decay: 0.02        # EMA smoothing (smaller = longer memory); reported, not acted on
+    warmup_batches: 100    # priming window before gating activates
+    comparison_metric: main_loss
+    # >> any reachable loss: relative detection off, NaN/inf guard on. The exponent sign is not
+    # decoration -- YAML parses `1.0e9` as a string, which validate_config rejects as not a float.
+    ema_floor: 1.0e+9
+    # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch and
+    # hard-re-seed the EMA to it. 0 disables the hatch.
+    max_consecutive_skips: 25
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-attn
+      run_name: lag_attn_baseline
+      artifact_location: null
+      # Logs and registers the final eager model at fit end, via the run-logging callback the
+      # trainer builder attaches automatically.
+      log_model: true
+      # Lightning's own per-checkpoint weight artifacts. Off: the ModelCheckpoint directory is the
+      # single copy. Deleting this key silently falls back to log_model and double-stores weights.
+      log_checkpoints: false
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    lag_attn_plotting:
+      enabled: true
+      plot_frequency: 1                 # plot every validation epoch
+      num_examples: 2                   # 2 samples per trigger
+      file_format: "pdf"
+      forecast_channels: [0, 43, 80]    # st[0], ph[0], ph[37]
+      forecast_anchor_frac: 0.6         # anchor at 60% of the sequence

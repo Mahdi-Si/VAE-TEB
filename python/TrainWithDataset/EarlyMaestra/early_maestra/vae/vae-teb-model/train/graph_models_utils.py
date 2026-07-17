@@ -1,5 +1,6 @@
 import contextlib
 import os
+import warnings
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -278,6 +279,50 @@ def load_checkpoint_strict(
         return model
     logger.error("Checkpoint keys did not align with any discovered module")
     return None
+
+
+def check_model_class(ckpt: Any, active_cls_name: str) -> None:
+    r"""Guard that a checkpoint's ``model_class`` matches the class about to load it.
+
+    Reads the field :meth:`train.pl_model_base.LightningModelBase.on_save_checkpoint` stamps, and
+    is the only enforcement point for it. Run this on the raw checkpoint dict **before** any
+    ``Model(**model_kwargs)`` reconstruction: model constructors in this repo are keyword-only
+    with no ``**kwargs``, so loading one version's ``model_kwargs`` into another would otherwise
+    raise a cryptic ``TypeError`` at construction. This guard fails first, with a message naming
+    both classes.
+
+    A checkpoint with no ``model_class`` warns rather than raises: checkpoints predating the stamp
+    are legitimate, and the rebuild still fails loudly if the kwargs are genuinely incompatible.
+
+    Args:
+        ckpt: The deserialised checkpoint. Non-dicts are skipped, so a bare state-dict is not an
+            error -- it simply carries no claim to check.
+        active_cls_name: ``__name__`` of the class that is about to load it.
+
+    Raises:
+        ValueError: If the checkpoint records a ``model_class`` differing from
+            ``active_cls_name``.
+    """
+    if not isinstance(ckpt, dict):
+        return
+    stored = ckpt.get("model_class")
+    if stored is None:
+        warnings.warn(
+            "checkpoint has no 'model_class' field (pre-guard checkpoint); "
+            f"assuming it matches the active class {active_cls_name!r}. The "
+            "rebuild will still fail loudly if the constructor kwargs are "
+            "incompatible.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    if str(stored) != str(active_cls_name):
+        raise ValueError(
+            f"checkpoint model_class={stored!r} does not match the active model "
+            f"class {active_cls_name!r}. Load this checkpoint with the class that "
+            f"wrote it, or point the run at a checkpoint written by "
+            f"{active_cls_name!r}."
+        )
 
 
 def denormalize_signal_data(normalized_data: torch.Tensor, field_name: str, normalization_stats: dict) -> torch.Tensor:

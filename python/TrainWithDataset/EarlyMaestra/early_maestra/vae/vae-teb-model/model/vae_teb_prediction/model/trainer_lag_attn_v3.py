@@ -92,50 +92,13 @@ _EXPECTED_UNEXPECTED_PREFIXES: Tuple[str, ...] = ("posterior_head.logvar_post_he
 # =============================================================================
 # Callbacks
 # =============================================================================
-class MetricsHistoryCsvCallback(Callback):
-    """Dump :class:`MetricsLoggingCallback`'s in-memory history to a CSV at fit end.
 
-    ``MetricsLoggingCallback`` accumulates ``self.history`` but never writes it anywhere and
-    nothing in the v1 trainer consumes ``as_dict()``. Rather than edit the shared
-    ``train/callbacks.py``, v3 attaches this thin writer so the new KL/perm diagnostics land
-    in a file that survives the run.
-    """
-
-    def __init__(self, source: MetricsLoggingCallback, output_dir: str) -> None:
-        """Initialize.
-
-        Args:
-            source: The ``MetricsLoggingCallback`` whose history to serialise.
-            output_dir: Directory receiving ``metrics_history.csv``.
-        """
-        super().__init__()
-        self.source = source
-        self.output_dir = output_dir
-
-    def _write(self) -> Optional[str]:
-        import pandas as pd
-
-        history = self.source.as_dict()
-        if not history:
-            return None
-        os.makedirs(self.output_dir, exist_ok=True)
-        path = os.path.join(self.output_dir, "metrics_history.csv")
-        frame = pd.DataFrame(history)
-        frame.insert(0, "epoch", range(len(frame)))
-        frame.to_csv(path, index=False)
-        return path
-
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
-        """Rewrite the CSV each validation epoch so a killed run still leaves history."""
-        if trainer.is_global_zero and not trainer.sanity_checking:
-            self._write()
-
-    def on_fit_end(self, trainer, pl_module) -> None:  # type: ignore[override]
-        """Write the final history CSV on rank zero."""
-        if trainer.is_global_zero:
-            path = self._write()
-            if path:
-                logger.info(f"metrics history written to {path}")
+# ``MetricsHistoryCsvCallback`` now lives in ``train/callbacks.py``. It never had any model
+# knowledge -- it takes a ``MetricsLoggingCallback``, calls ``as_dict()``, and writes a CSV --
+# and its presence here was only ever an unwillingness to edit the shared callbacks module.
+#
+# Re-exported so existing importers of this name keep resolving unchanged.
+from train.callbacks import MetricsHistoryCsvCallback  # noqa: F401,E402  (re-export)
 
 
 # =============================================================================
