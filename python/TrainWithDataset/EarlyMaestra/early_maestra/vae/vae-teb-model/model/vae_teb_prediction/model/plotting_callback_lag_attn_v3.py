@@ -1,5 +1,10 @@
 r"""Training-time diagnostic plots for :class:`SeqVaeLagAttnV3` (S4-T09).
 
+FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
+not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
+import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
+freezes ``SeqVaeRawV4``'s base.
+
 **Decision and rationale.** v3 emits every forward key v1 does, so v1's 12-row diagnostic
 figure renders unchanged and is reused verbatim through
 :func:`~model.vae_teb_prediction.model.plotting_callback_lag_attn_v1._build_diagnostic_figure`

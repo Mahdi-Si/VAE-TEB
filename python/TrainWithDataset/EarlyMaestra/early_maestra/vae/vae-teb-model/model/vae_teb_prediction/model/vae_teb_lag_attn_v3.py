@@ -1,5 +1,10 @@
 r"""Lag-Attentive Residual VAE-TEB (v3).
 
+FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
+not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
+import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
+freezes ``SeqVaeRawV4``'s base.
+
 This module implements :class:`SeqVaeLagAttnV3`, a *scientific-cleanliness* fork of
 :class:`~model.vae_teb_prediction.model.vae_teb_lag_attn_v1.SeqVaeLagAttnV1`. It keeps
 v1's architecture byte-for-byte (all backbone blocks are imported unchanged) and changes

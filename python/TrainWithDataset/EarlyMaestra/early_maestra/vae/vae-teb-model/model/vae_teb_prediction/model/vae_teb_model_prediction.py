@@ -10,22 +10,12 @@ from typing import List
 import math
 import copy
 
-from utils.custom_logger import setup_logging
 # from model.model_utils import *
 
-setup_logging(
-    log_to_file=True,
-    log_to_console=True,
-    file_path="my_service.log",
-    file_level="DEBUG",
-    console_level="INFO",
-    rotation="100 MB",
-    retention="14 days",
-    compression="zip",
-    serialize=False,
-    backtrace=True,
-    diagnose=False,
-)
+# Logging is configured once per run by GraphModelBase.setup_config(), never at
+# import time: setup_logging() reconfigures loguru process-wide, so importing this
+# module after setup_config() used to tear down the run's sinks and redirect the
+# whole run into a stray my_service.log in the working directory.
 
 from loguru import logger as log
 import logging as std_logging

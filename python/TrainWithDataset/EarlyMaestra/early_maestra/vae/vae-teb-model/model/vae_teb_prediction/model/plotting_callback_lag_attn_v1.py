@@ -1,5 +1,10 @@
 """Diagnostic plotting callback for :class:`SeqVaeLagAttnV1` training.
 
+FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
+not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
+import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
+freezes ``SeqVaeRawV4``'s base.
+
 Generates a consolidated multi-row publication-quality figure on every
 validation epoch (gated by ``plot_frequency``). Style helpers are imported
 from :mod:`utils.style` so training diagnostics and

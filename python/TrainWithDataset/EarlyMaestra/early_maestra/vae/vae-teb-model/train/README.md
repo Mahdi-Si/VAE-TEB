@@ -14,6 +14,7 @@ File map:
 | `train/config.yaml` | The shipped reference config |
 | `train/test_utils.py` | Test doubles (`make_graph_model`, `TinyLightningModel`, fake MLflow/Trainer/Strategy) |
 | `train/tests/` | 17 test modules + `conftest.py` |
+| `teb_vae/lag_attn/` | Out of tree: the flattened lag-attention model tree (net, task, trainer, plotter) that `model/` is being retired into; the first production `build_trainer` consumer. Its contract lives in `teb_vae/lag_attn/DESIGN.md` |
 | `utils/mlflow_utils.py` | Out of tree: the `log_artifact_to_mlflow` rank-0 upload seam, shared by `train/` and the plotters |
 | `utils/seqvae_plot_callbacks.py` | Out of tree, listed here because §5 sends you there: the SeqVAE-coupled plotting callbacks |
 

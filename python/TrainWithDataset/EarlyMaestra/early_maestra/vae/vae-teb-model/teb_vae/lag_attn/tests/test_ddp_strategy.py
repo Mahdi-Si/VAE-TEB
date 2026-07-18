@@ -25,7 +25,7 @@ import torch
 
 from teb_vae.lag_attn.tests.conftest import make_stub_batch
 
-_V3 = Path(__file__).resolve().parents[1] / "configs" / "v3.yaml"
+_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def trainer(tmp_path):
     """
     from teb_vae.lag_attn.trainer import LagAttnTrainer
 
-    driver = LagAttnTrainer(config_file_path=str(_V3))
+    driver = LagAttnTrainer(config_file_path=str(_CONFIG))
     driver.output_base_dir = str(tmp_path)
     driver.train_results_dir = str(tmp_path / "train_results")
     return driver

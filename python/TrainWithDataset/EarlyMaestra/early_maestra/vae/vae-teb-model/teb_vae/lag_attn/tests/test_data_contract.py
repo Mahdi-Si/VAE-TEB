@@ -21,7 +21,7 @@ from teb_vae.lag_attn.config import load_config
 from train.data_module import GraphDataModule
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_TINY_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "v3_tiny.yaml"
+_TINY_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "tiny.yaml"
 
 #: What the trim arithmetic must produce from the committed shard: 330 - 2*(240//16) = 300.
 _EXPECTED_T = 300

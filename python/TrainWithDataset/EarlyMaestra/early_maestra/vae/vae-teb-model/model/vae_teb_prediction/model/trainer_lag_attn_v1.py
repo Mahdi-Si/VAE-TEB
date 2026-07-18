@@ -1,5 +1,10 @@
 """Lightning wrapper + Graph-model trainer for ``SeqVaeLagAttn``.
 
+FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
+not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
+import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
+freezes ``SeqVaeRawV4``'s base.
+
 This file mirrors the layout of :mod:`model.vae_teb_prediction.training.trainer`
 but targets the new lag-attentive v1 model defined in
 :mod:`model.vae_teb_prediction.model.vae_teb_lag_attn_v1`. The two trainers

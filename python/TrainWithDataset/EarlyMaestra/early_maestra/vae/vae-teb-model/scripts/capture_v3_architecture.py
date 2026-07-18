@@ -1,8 +1,8 @@
 """Serialise the architecture of ``SeqVaeLagAttnV3`` to a JSON fixture.
 
 ``teb_vae.lag_attn`` is a rebuild of the model at
-``model/vae_teb_prediction/model/vae_teb_lag_attn_v3.py``, flattened out of a three-level
-inheritance chain. The rebuild is not checkpoint-compatible and is not asserted to be
+``model/vae_teb_prediction/model/vae_teb_lag_attn_v3.py`` -- the now-deprecated predecessor tree --
+flattened out of a three-level inheritance chain. The rebuild is not checkpoint-compatible and is not asserted to be
 bit-identical, so the thing that has to be proved is *structural*: the same modules, the same
 shapes, the same parameter count, the same forward and loss contracts.
 
@@ -31,7 +31,7 @@ stronger golden-tensor comparison later, should a retrain ever diverge from a pu
 Run from the repository root::
 
     .venv/Scripts/python.exe scripts/capture_v3_architecture.py \\
-        --out teb_vae/lag_attn/tests/fixtures/v3_architecture.json
+        --out teb_vae/lag_attn/tests/fixtures/architecture.json
 """
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ PROD_KWARGS: Dict[str, Any] = dict(
     freeze_unused_attn_proj=True,
 )
 
-# What config_lag_attn_v3.yaml actually ships, at the tiny geometry.
+# What teb_vae/lag_attn/configs/default.yaml actually ships, at the tiny geometry.
 #
 # PROD_KWARGS leaves four shipped flags at their constructor defaults, and each one gates real
 # modules: `head_structured_latent` swaps the flat posterior for a per-head one (an extra norm
@@ -200,7 +200,7 @@ def main() -> None:
         default="prod",
         choices=sorted(VARIANTS),
         help="Which geometry to capture: 'prod' is the original suite's flag set, 'shipped' "
-        "adds the four flags config_lag_attn_v3.yaml actually sets.",
+        "adds the four flags teb_vae/lag_attn/configs/default.yaml actually sets.",
     )
     args = parser.parse_args()
 

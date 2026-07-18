@@ -26,7 +26,7 @@ from train.callbacks import (
     _unreachable_metric_names,
 )
 
-_V3 = Path(__file__).resolve().parents[1] / "configs" / "v3.yaml"
+_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def trainer(tmp_path):
     ``setup_config`` is never called -- it would seed, open log sinks and probe MLflow -- so the
     directories are assigned directly.
     """
-    driver = LagAttnTrainer(config_file_path=str(_V3))
+    driver = LagAttnTrainer(config_file_path=str(_CONFIG))
     driver.output_base_dir = str(tmp_path)
     driver.train_results_dir = str(tmp_path / "train_results")
     driver.model_checkpoint_dir = str(tmp_path / "model_checkpoints")

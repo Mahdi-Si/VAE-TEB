@@ -6,13 +6,13 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
 .. code-block:: bash
 
     # Single GPU / local smoke
-    python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3_tiny.yaml
+    python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/tiny.yaml
 
-    # Prod box. The rank count must equal len(general_config.cuda_devices) -- v3.yaml ships 7 --
+    # Prod box. The rank count must equal len(general_config.cuda_devices) -- default.yaml ships 7 --
     # or Lightning rejects the device/world-size mismatch at Trainer construction. Export the
     # stamp so ranks 1..N-1 share rank 0's run directory.
     TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
-        -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3.yaml
+        -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/default.yaml
 
 Everything about *running* an experiment -- run directories, seeding, log sinks, MLflow, the
 ``Trainer`` itself -- is the framework's. This module supplies the three things the framework
@@ -285,6 +285,25 @@ class LagAttnTrainer(GraphModelBase):
             self.checkpoint_callback,
         ]
 
+        # The diagnostic plotter is opt-in and pulls matplotlib, so it is imported only when the
+        # config asks for it -- a smoke run that disables it pays neither the import nor the
+        # per-epoch figure cost.
+        plot_config = callbacks_config.get("lag_attn_plotting", {}) or {}
+        if plot_config.get("enabled", False):
+            from teb_vae.lag_attn.plotting import LagAttnPlotCallback
+
+            callback_list.append(
+                LagAttnPlotCallback(
+                    output_dir=self.train_results_dir,
+                    plot_frequency=plot_config.get("plot_frequency", 1),
+                    num_examples=plot_config.get("num_examples", 2),
+                    file_format=plot_config.get("file_format", "pdf"),
+                    forecast_channels=plot_config.get("forecast_channels", (0, 43, 80)),
+                    forecast_anchor_frac=plot_config.get("forecast_anchor_frac", 0.6),
+                    mlflow_logger=self.mlflow_logger,
+                )
+            )
+
         trainer = self.build_trainer(callback_list, model=self.pl_model)
         trainer.fit(self.pl_model, train_loader, validation_loader)
         return trainer
@@ -337,6 +356,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to the YAML config, e.g. teb_vae/lag_attn/configs/v3.yaml. Run from the repo root.",
+        help="Path to the YAML config, e.g. teb_vae/lag_attn/configs/default.yaml. Run from the repo root.",
     )
     main(parser.parse_args().config)
