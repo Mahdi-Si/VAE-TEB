@@ -15,4 +15,7 @@ model/output/
 .output
 documents/
 .venv/
-.claude/
+.claude/mlruns/
+mlruns/
+mlartifacts/
+mlflow.db

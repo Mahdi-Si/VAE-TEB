@@ -1,5 +1,10 @@
 """Lag-Attentive Residual VAE-TEB (v1).
 
+FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
+not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
+import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
+freezes ``SeqVaeRawV4``'s base.
+
 This module implements the ``SeqVaeLagAttnV1`` model specified in
 ``model/vae_teb_prediction/model/new_architecture.md``. It is a source-pure
 variant of the original :class:`SeqVae` that:

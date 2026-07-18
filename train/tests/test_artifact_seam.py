@@ -4,7 +4,7 @@ The seam is a no-op when tracking is disabled or off the zero rank, uploads exac
 through the run-bound client on rank 0, and swallows tracking errors so plotting can
 never kill training.
 """
-from train.callbacks import log_artifact_to_mlflow
+from utils.mlflow_utils import log_artifact_to_mlflow
 from train.test_utils import FakeMLflowLogger, FakeTrainer
 
 

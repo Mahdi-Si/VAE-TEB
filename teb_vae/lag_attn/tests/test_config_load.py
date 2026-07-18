@@ -22,8 +22,8 @@ from teb_vae.lag_attn.config import load_config, resolve_config_file
 from train.test_utils import make_graph_model
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
-_V3 = _CONFIG_DIR / "v3.yaml"
-_V3_TINY = _CONFIG_DIR / "v3_tiny.yaml"
+_CONFIG = _CONFIG_DIR / "default.yaml"
+_TINY = _CONFIG_DIR / "tiny.yaml"
 
 #: The fourteen keys that must exist. Nine are checked by ``validate_config``; the other five are
 #: read with a bare index in ``GraphModelBase.__init__``, which runs *before* the validator -- so a
@@ -95,20 +95,20 @@ def _has(config, dotted) -> bool:
 
 
 @pytest.fixture
-def v3():
-    return load_config(str(_V3))
+def shipped():
+    return load_config(str(_CONFIG))
 
 
 @pytest.fixture
 def tiny():
-    return load_config(str(_V3_TINY))
+    return load_config(str(_TINY))
 
 
 # --------------------------------------------------------------------------------------
 # The shipped config
 # --------------------------------------------------------------------------------------
-def test_every_effectively_required_key_is_present(v3):
-    missing = [path for path in _REQUIRED_PATHS if not _has(v3, path)]
+def test_every_effectively_required_key_is_present(shipped):
+    missing = [path for path in _REQUIRED_PATHS if not _has(shipped, path)]
     assert missing == []
 
 
@@ -119,30 +119,30 @@ def test_the_shipped_config_validates_with_no_unknown_or_dead_key_warnings(tmp_p
     not the absence of an exception -- is the assertion that matters. This is what makes "no key in
     this file reaches nothing" enforceable for ``advanced_config`` rather than aspirational.
     """
-    graph_model = make_graph_model(_V3, **{"general_config.folders_config.out_dir_base": str(tmp_path)})
+    graph_model = make_graph_model(_CONFIG, **{"general_config.folders_config.out_dir_base": str(tmp_path)})
 
     graph_model.validate_config()
 
     assert [m for m in loguru_warnings if "config:" in m] == []
 
 
-def test_no_dropped_key_has_crept_back(v3):
-    present = [path for path in _DROPPED_PATHS if _has(v3, path)]
+def test_no_dropped_key_has_crept_back(shipped):
+    present = [path for path in _DROPPED_PATHS if _has(shipped, path)]
     assert present == []
 
 
-def test_compile_is_off_and_stays_off(v3):
+def test_compile_is_off_and_stays_off(shipped):
     """Not a preference. LSTM, checkpointed attention and data-dependent mask indexing each break
     inductor independently, so this is a correctness setting with a comment to match."""
-    assert v3["advanced_config"]["trainer"]["compile"] is False
+    assert shipped["advanced_config"]["trainer"]["compile"] is False
 
 
-def test_causal_norm_is_on(v3):
+def test_causal_norm_is_on(shipped):
     """With it off the prior conditions on the future and the reported KL is not a TE surrogate."""
-    assert v3["model_config"]["VAE_model"]["causal_norm"] is True
+    assert shipped["model_config"]["VAE_model"]["causal_norm"] is True
 
 
-def test_the_breaker_is_configured_as_a_non_finite_guard_only(v3):
+def test_the_breaker_is_configured_as_a_non_finite_guard_only(shipped):
     r"""The relative test cannot work on a loss that goes negative, so it is switched off.
 
     ``max(EMA, ema_floor)`` collapses to the floor once the EMA is negative, and at a $0.0$ floor
@@ -151,7 +151,7 @@ def test_the_breaker_is_configured_as_a_non_finite_guard_only(v3):
     while the non-finite guard, which never consults the threshold, keeps a NaN from reaching the
     weights.
     """
-    breaker = v3["advanced_config"]["spike_breaker"]
+    breaker = shipped["advanced_config"]["spike_breaker"]
 
     assert breaker["enabled"] is True  # the non-finite guard is the point
     assert breaker["comparison_metric"] == "main_loss"
@@ -159,7 +159,7 @@ def test_the_breaker_is_configured_as_a_non_finite_guard_only(v3):
     assert breaker["ema_decay"] == 0.02  # the framework's spelling of the old ema_momentum
 
 
-def test_the_shipped_config_earns_plain_ddp(v3):
+def test_the_shipped_config_earns_plain_ddp(shipped):
     """The three flags whose combination decides the strategy.
 
     Learned observation variance keeps the decoder logvar heads in DDP's expectation set, and
@@ -167,14 +167,14 @@ def test_the_shipped_config_earns_plain_ddp(v3):
     latents leave without a gradient. Together they are what make find_unused_parameters
     unnecessary; the strategy selector asserts the consequence.
     """
-    vae = v3["model_config"]["VAE_model"]
+    vae = shipped["model_config"]["VAE_model"]
     assert vae["likelihood"] == "gaussian_nll"
     assert vae["sigma_obs"] == "learned"
     assert vae["head_structured_latent"] is True
     assert vae["freeze_unused_attn_proj"] is True
 
 
-def test_mlflow_registers_the_final_model_without_double_storing_weights(v3):
+def test_mlflow_registers_the_final_model_without_double_storing_weights(shipped):
     """``log_model`` is not dead and is not a synonym for ``log_checkpoints``.
 
     ``log_model`` drives the run-logging callback the trainer builder attaches, which logs and
@@ -182,14 +182,14 @@ def test_mlflow_registers_the_final_model_without_double_storing_weights(v3):
     weight artifacts and falls back to ``log_model`` when absent -- so omitting it while
     ``log_model: true`` silently turns checkpoint uploading on and stores the weights twice.
     """
-    mlflow = v3["advanced_config"]["tracking"]["mlflow"]
+    mlflow = shipped["advanced_config"]["tracking"]["mlflow"]
     assert mlflow["log_model"] is True
     assert mlflow["log_checkpoints"] is False
 
 
-def test_load_fields_covers_what_the_model_and_plots_read_and_nothing_else(v3):
+def test_load_fields_covers_what_the_model_and_plots_read_and_nothing_else(shipped):
     load_fields = set(
-        v3["dataset_config"]["dataloader_config"]["dataset_kwargs"]["load_fields"]
+        shipped["dataset_config"]["dataloader_config"]["dataset_kwargs"]["load_fields"]
     )
     # The five the model consumes: two target streams, two source streams, and the validity mask.
     assert {"fhr_st", "fhr_ph", "up_st", "up_ph", "weight"} <= load_fields
@@ -199,20 +199,20 @@ def test_load_fields_covers_what_the_model_and_plots_read_and_nothing_else(v3):
     assert load_fields.isdisjoint({"target", "epoch", "cs_label", "bg_label"})
 
 
-def test_the_source_stream_width_agrees_with_the_ablation_toggle(v3):
+def test_the_source_stream_width_agrees_with_the_ablation_toggle(shipped):
     """The constructor rejects a mismatch, but it does so after a config has already shipped."""
-    vae = v3["model_config"]["VAE_model"]
+    vae = shipped["model_config"]["VAE_model"]
     assert vae["c_u"] == (101 if vae["use_up_st"] else 58)
 
 
-def test_lr_milestone_is_singular(v3):
+def test_lr_milestone_is_singular(shipped):
     """The experiment driver reads the singular key with a bare index.
 
     The Lightning module's constructor argument is the plural ``lr_milestones``; the config key is
     singular. A config that spelled it plural would raise ``KeyError`` from the constructor.
     """
-    assert "lr_milestone" in v3["general_config"]
-    assert "lr_milestones" not in v3["general_config"]
+    assert "lr_milestone" in shipped["general_config"]
+    assert "lr_milestones" not in shipped["general_config"]
 
 
 # --------------------------------------------------------------------------------------
@@ -225,24 +225,24 @@ def test_the_tiny_variant_names_only_its_deltas():
     settings would be a copy that drifts, which is what a subclass-per-variant tree already proved.
     """
     lines = [
-        line for line in _V3_TINY.read_text(encoding="utf-8").splitlines()
+        line for line in _TINY.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    assert len(lines) < 30, f"v3_tiny.yaml carries {len(lines)} non-comment lines; it should be deltas only"
+    assert len(lines) < 30, f"tiny.yaml carries {len(lines)} non-comment lines; it should be deltas only"
 
 
-def test_the_tiny_variant_inherits_the_settings_it_does_not_name(tiny, v3):
+def test_the_tiny_variant_inherits_the_settings_it_does_not_name(tiny, shipped):
     """Including every correctness requirement, which is why it must not re-state them."""
     assert tiny["advanced_config"]["trainer"]["compile"] is False
     assert tiny["model_config"]["VAE_model"]["causal_norm"] is True
     assert tiny["advanced_config"]["spike_breaker"]["ema_floor"] >= 1.0e9
     # The real geometry: the committed shard carries the real field shapes.
     assert tiny["model_config"]["VAE_model"]["sequence_length"] == 300
-    assert tiny["model_config"]["VAE_model"]["c_y"] == v3["model_config"]["VAE_model"]["c_y"]
-    assert tiny["model_config"]["VAE_model"]["c_u"] == v3["model_config"]["VAE_model"]["c_u"]
+    assert tiny["model_config"]["VAE_model"]["c_y"] == shipped["model_config"]["VAE_model"]["c_y"]
+    assert tiny["model_config"]["VAE_model"]["c_u"] == shipped["model_config"]["VAE_model"]["c_u"]
     assert (
         tiny["dataset_config"]["dataloader_config"]["dataset_kwargs"]["trim_minutes"]
-        == v3["dataset_config"]["dataloader_config"]["dataset_kwargs"]["trim_minutes"]
+        == shipped["dataset_config"]["dataloader_config"]["dataset_kwargs"]["trim_minutes"]
     )
 
 
@@ -277,7 +277,7 @@ def test_the_resolved_tiny_variant_validates(tmp_path, loguru_warnings):
     The driver reads a config path and does not know about ``base:``; handed the raw file it would
     see a config missing almost every required key. Resolve-then-write is the seam.
     """
-    resolved = resolve_config_file(str(_V3_TINY), str(tmp_path))
+    resolved = resolve_config_file(str(_TINY), str(tmp_path))
     graph_model = make_graph_model(
         resolved, **{"general_config.folders_config.out_dir_base": str(tmp_path)}
     )

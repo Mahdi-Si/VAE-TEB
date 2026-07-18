@@ -1,57 +1,26 @@
-"""Diagnostic plotting callback for :class:`SeqVaeLagAttnV1` training.
+r"""Validation-epoch diagnostic plotting for the lag-attention VAE.
 
-FROZEN. Superseded by the flattened tree at ``teb_vae/lag_attn/``; fixes and new work land there,
-not here. Kept only because ``model_experiment/``, ``model_raw/`` and ``new_classifier/`` still
-import this lag-attention cluster -- delete it once those retire. Freezing v1 and v3 together also
-freezes ``SeqVaeRawV4``'s base.
+Two figures per validation sample, from a single forward pass:
 
-Generates a consolidated multi-row publication-quality figure on every
-validation epoch (gated by ``plot_frequency``). Style helpers are imported
-from :mod:`utils.style` so training diagnostics and
-test-time figures share the same visual language.
+1. A twelve-row consolidated diagnostic. Every row shares one physical-time x-axis (seconds, from
+   ``0`` to ``R / fs_raw``) so a vertical line cuts every panel at the same instant. Rows: the raw
+   FHR/UP trace (only when those fields are loaded), the stacked FHR and UP feature heatmaps, the
+   latent ``z``, posterior-vs-prior means, per-dim and total KL, the lag-attention matrix with its
+   argmax overlay, two TE-lag-attribution maps (raw p99-clipped and column-normalised), and two
+   forecast reconstructions (overlap-averaged and stride-``H_d`` concatenated).
 
-The layout follows :mod:`model.vae_teb_prediction.testing.plot_single_samples`:
-every panel is stacked in a single column, and **every main axes has the
-exact same width** irrespective of whether the row shows a colorbar. This is
-achieved with a 2-column :class:`matplotlib.gridspec.GridSpec` whose second
-column is a narrow fixed-width slot reserved for the colorbar. Rows that are
-line plots (raw signals, KL/entropy traces) simply hide their reserved cax,
-so the main axes width is still driven by the same gridspec column and stays
-perfectly aligned with every heatmap row above and below it.
+2. A companion figure carrying the three signals the model exists to produce: the learned
+   predictive band :math:`\mu_{\mathrm{full}} \pm 2\sigma_{\mathrm{full}}` against the true future
+   :math:`Y^{+}` (G7), the per-dim raw KL against the active-fraction threshold (G4), and the
+   source-permutation negative control :math:`K_{\mathrm{true}}` vs :math:`K_{\mathrm{shuffled}}`
+   (G6). The control reuses the states the forward already computed via
+   :func:`~teb_vae.lag_attn.nets.controls.perm_kl_from_forward`; it is only drawn when the batch is
+   large enough to derange (:math:`B \geq 2`).
 
-Every row uses the same x-axis: **time in seconds, from 0 to R / fs_raw**
-(typically ``R = 4800``, ``fs_raw = 4 Hz`` → 1200 s). The raw FHR/UP trace,
-the decimated feature heatmaps, the latent heatmap, the KLD maps, the lag
-attention, and both forecast rows are all aligned column-for-column — so a
-vertical line through any time point cuts every row at the same physical
-instant.
-
-Row layout (top-to-bottom, every row is a full-width single axes):
-
-0.  Raw FHR + UP — twin y-axes (optional, only if ``fhr``/``up`` are loaded).
-1.  FHR features — stacked ``[fhr_st | fhr_ph]`` heatmap (87, T) with a
-    horizontal separator at the st/ph boundary.
-2.  UP features — stacked ``[up_st | up_ph]`` heatmap (101, T) with a
-    separator at the st/ph boundary. Collapses to just ``up_ph`` (58, T)
-    when ``use_up_st=False``.
-3.  Latent ``z`` heatmap (d_z, T).
-4.  Posterior μ vs prior μ stacked heatmap (2·d_z, T) with separator.
-5.  KLD per latent dim — single ``(d_z, T)`` imshow (``magma``, vmin=0),
-    aligned with every other row.
-6.  Total KLD per time step + attention entropy (twin-axis trace).
-7.  Lag attention matrix (L, T) with the argmax-lag-per-step overlay.
-8.  TE lag attribution — raw ``kld_per_t × mean_alpha`` with the colour
-    range clipped to the 99th percentile so rare attention spikes don't
-    black-out the rest.
-9.  TE lag attribution — column-normalised (each time step divided by its
-    own max) so the lag-selection pattern is visible even when the per-step
-    KL is tiny. Columns with effectively zero KL are masked to NaN.
-10. Average forecast ``μ_full`` as an ``(C_y, T)`` imshow — overlap-averaged
-    per-anchor horizons across **all** feature channels (87 rows), with a
-    white separator at the fhr_st ↔ fhr_ph boundary.
-11. Single-horizon forecast ``μ_full`` as an ``(C_y, T)`` imshow —
-    non-overlapping stride-``H_d`` concatenation across all feature
-    channels, with the same channel separator.
+The callback never raises into the training loop: it wraps generation in a broad ``try/except`` and
+only warns, and every saved file is routed to MLflow through the rank-0 artifact seam
+:func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer, not
+``nets/``, so it may depend on matplotlib, Lightning and ``utils`` -- but never on ``model/``.
 """
 from __future__ import annotations
 
@@ -69,30 +38,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
 
-from utils.style import (
-    COLOR_BLACK,
-    COLOR_BLUE,
-    COLOR_GREEN,
-    COLOR_LIGHT_GRAY,
-    COLOR_ORANGE,
-    COLOR_PURPLE,
-    COLOR_VERMILLION,
+from teb_vae.lag_attn.nets import controls  # noqa: E402
+from utils.mlflow_utils import log_artifact_to_mlflow  # noqa: E402
+from utils.style import (  # noqa: E402
     SAVE_DPI,
     apply_publication_style,
     save_figure,
     style_axes,
 )
 
+# The figures depend on these exact hues, so they are fixed here as literals rather than pulled from
+# ``utils.style`` (whose palette is a different, evolving set). Only the colours the two builders
+# actually draw with are kept.
 COLOR_BLUE = "#3F72AF"
 COLOR_ORANGE = "#FFB200"
 COLOR_GREEN = "#46D855"
-COLOR_SKY = "#00ADB5"
 COLOR_PURPLE = "#5642EB"
 COLOR_VERMILLION = "#F23F04"
 COLOR_GRAY = "#393E46"
 COLOR_BLACK = "#000000"
 COLOR_LIGHT_GRAY = "#EEEEEE"
-COLOR_SAGE = "#A3E782"
+
+#: Per-dim KL below this (nats) marks an inactive latent dimension in the companion's G4 panel.
+_KLD_ACTIVE_EPS = 1e-2
+
+
 # =============================================================================
 # Small helpers
 # =============================================================================
@@ -169,10 +139,10 @@ def _time_axes(
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Return ``(time_raw_sec, time_dec_sec, t_max_sec)`` for unified alignment.
 
-    All diagnostic rows share a single physical-time axis. Raw FHR/UP trace
-    lives on ``time_raw`` (step ``1/fs_raw``); decimated features / latents
-    live on ``time_dec`` (step ``t_max / T``). The imshow ``extent`` and the
-    ``ax.set_xlim`` call for every axes both use ``(0.0, t_max_sec)``.
+    All diagnostic rows share a single physical-time axis. The raw FHR/UP trace lives on
+    ``time_raw`` (step ``1/fs_raw``); decimated features / latents live on ``time_dec`` (step
+    ``t_max / T``). The imshow ``extent`` and the ``ax.set_xlim`` call for every axes both use
+    ``(0.0, t_max_sec)``.
 
     Args:
         T: Number of decimated steps (e.g. 300).
@@ -182,8 +152,8 @@ def _time_axes(
     Returns:
         Tuple ``(time_raw, time_dec, t_max_sec)``:
         - ``time_raw``: ``(R,)`` seconds axis for the raw signal.
-        - ``time_dec``: ``(T,)`` seconds axis for decimated tensors; step
-          centres at ``0, Δ, 2Δ, …`` with ``Δ = t_max / T``.
+        - ``time_dec``: ``(T,)`` seconds axis for decimated tensors; step centres at
+          ``0, Δ, 2Δ, …`` with ``Δ = t_max / T``.
         - ``t_max_sec``: total window length in seconds (``R / fs_raw``).
     """
     t_max = float(R) / float(fs_raw)
@@ -195,13 +165,12 @@ def _time_axes(
 def _attach_lag_seconds_axis(
     ax: Any, step_seconds: float, delta_up_seconds: float
 ) -> Any:
-    r"""Add a right-hand secondary y-axis in physical seconds (arch spec section 27).
+    r"""Add a right-hand secondary y-axis in physical seconds.
 
     Maps a decimated lag index $\ell$ to $\mathrm{lag}_{\mathrm{phys}}(\ell) =
-    s\,\ell + \Delta_{UP}$ (``step_seconds`` $s$, ``delta_up_seconds``
-    $\Delta_{UP}$), so the lag panels read in both model-lag and physical-second
-    coordinates. Non-fatal: any Matplotlib error is swallowed so plotting never
-    crashes training.
+    s\,\ell + \Delta_{UP}$ (``step_seconds`` $s$, ``delta_up_seconds`` $\Delta_{UP}$), so the lag
+    panels read in both model-lag and physical-second coordinates. Non-fatal: any Matplotlib error
+    is swallowed so plotting never crashes training.
 
     Args:
         ax: The lag-panel axes (primary y is the decimated lag $\ell$).
@@ -256,11 +225,10 @@ def _average_forecast_per_channel(
 ) -> np.ndarray:
     """Average overlapping per-anchor horizon forecasts onto the decimated axis.
 
-    Anchor ``t ∈ [warmup, T - H_d)`` contributes its per-horizon prediction
-    ``mu_pred[t, h, :]`` to the target decimated index ``τ = t + 1 + h``.
-    The returned array averages every anchor's contribution to each ``τ``.
-    Positions with no contributing anchor are set to ``NaN`` (so they render
-    as gaps in a matplotlib imshow, or masked cells in a heatmap).
+    Anchor ``t ∈ [warmup, T - H_d)`` contributes its per-horizon prediction ``mu_pred[t, h, :]`` to
+    the target decimated index ``τ = t + 1 + h``. The returned array averages every anchor's
+    contribution to each ``τ``. Positions with no contributing anchor are set to ``NaN`` (so they
+    render as gaps in a matplotlib imshow, or masked cells in a heatmap).
 
     Args:
         mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
@@ -296,9 +264,9 @@ def _concat_single_forecasts(
 ) -> np.ndarray:
     """Non-overlapping, stride-``H_d`` concatenation of per-anchor horizons.
 
-    Starting at ``t = warmup``, walk forward in strides of ``H_d`` anchors;
-    each anchor contributes its full horizon slice ``[t+1, t+1+H_d)`` to the
-    output. Any positions not covered are ``NaN`` so imshow masks them.
+    Starting at ``t = warmup``, walk forward in strides of ``H_d`` anchors; each anchor contributes
+    its full horizon slice ``[t+1, t+1+H_d)`` to the output. Any positions not covered are ``NaN``
+    so imshow masks them.
 
     Args:
         mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
@@ -328,9 +296,8 @@ def _stack_feature_blocks(
         bottom: ``(C_bot, T)`` lower block, or ``None``.
 
     Returns:
-        ``(stacked, separator_row)`` where ``separator_row`` is the y-position
-        of the boundary between the two blocks (``C_top - 0.5``), or ``None``
-        when only the top block is present.
+        ``(stacked, separator_row)`` where ``separator_row`` is the y-position of the boundary
+        between the two blocks (``C_top - 0.5``), or ``None`` when only the top block is present.
     """
     if bottom is None:
         return top, None
@@ -341,8 +308,8 @@ def _stack_feature_blocks(
 def _safe_vabs(arr: np.ndarray) -> float:
     """Return a strictly-positive symmetric colour-limit for a ``bwr`` imshow.
 
-    Ignores NaN/Inf entries. Falls back to ``1.0`` if the array has no finite
-    values or the finite max is zero.
+    Ignores NaN/Inf entries. Falls back to ``1.0`` if the array has no finite values or the finite
+    max is zero.
     """
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
@@ -351,8 +318,23 @@ def _safe_vabs(arr: np.ndarray) -> float:
     return vabs if vabs > 0.0 else 1.0
 
 
+def _future_target(y_st: torch.Tensor, y_ph: torch.Tensor, horizon: int) -> torch.Tensor:
+    r"""Unfold :math:`Y^{+}`: at anchor :math:`t`, the window ``Y[t+1 : t+1+H]``.
+
+    Args:
+        y_st: FHR scattering features ``(B, T, 43)``.
+        y_ph: FHR phase features ``(B, T, 44)``.
+        horizon: Forecast horizon :math:`H_d`.
+
+    Returns:
+        ``(B, T - H_d, H_d, C_y)``.
+    """
+    Y = torch.cat([y_st, y_ph], dim=-1)
+    return Y[:, 1:, :].unfold(dimension=1, size=horizon, step=1).permute(0, 1, 3, 2)
+
+
 # =============================================================================
-# Figure builder
+# Figure builders
 # =============================================================================
 
 
@@ -370,8 +352,6 @@ def _build_diagnostic_figure(
     guid: str,
     warmup: int,
     horizon: int,
-    forecast_channels: Tuple[int, ...],
-    forecast_anchor_frac: float,
     beta: float,
     feat_loss: float,
     base_loss: float,
@@ -381,19 +361,17 @@ def _build_diagnostic_figure(
 ) -> Any:
     """Build the full diagnostic figure for one validation sample.
 
-    The figure is laid out as a **single column** of full-width axes using a
-    2-column :class:`GridSpec` — column 0 hosts the main axes, column 1 is a
-    narrow fixed-width slot for the colorbar axes. Line-plot rows hide their
-    reserved cax so the main-axes widths stay perfectly aligned row-to-row
-    regardless of whether a colorbar is visible.
+    The figure is laid out as a **single column** of full-width axes using a 2-column
+    :class:`GridSpec` — column 0 hosts the main axes, column 1 is a narrow fixed-width slot for the
+    colorbar axes. Line-plot rows hide their reserved cax so the main-axes widths stay perfectly
+    aligned row-to-row regardless of whether a colorbar is visible.
 
     Args:
-        outs: Forward-output dict from :meth:`SeqVaeLagAttnV1.forward`.
+        outs: Forward-output dict from the model's ``forward``.
         y_st: FHR scattering features ``(B, T, 43)``.
         y_ph: FHR phase features ``(B, T, 44)``.
         up_st: UP scattering features ``(B, T, 43)``, or ``None`` if absent.
-        up_ph: UP self-phase harmonics ``(B, T, 58)`` — first-class HDF5 field
-            with its own per-channel asinh stats.
+        up_ph: UP self-phase harmonics ``(B, T, 58)``.
         fhr_raw: Raw FHR trace ``(B, R)`` or ``None``.
         up_raw: Raw UP trace ``(B, R)`` or ``None``.
         sample_idx: Index into the batch.
@@ -401,23 +379,17 @@ def _build_diagnostic_figure(
         guid: GUID string for the figure title.
         warmup: Warmup period ``T_w`` (for shading invalid regions).
         horizon: Decimated forecast horizon ``H_d``.
-        forecast_channels: Kept for backward compatibility with the callback
-            config; no longer used — the new forecast rows draw every feature
-            channel as a full imshow instead of per-channel line plots.
-        forecast_anchor_frac: Kept for backward compatibility with the
-            callback config; no longer used by the new forecast rows.
-        beta: Current KL weight.
-        feat_loss: Current ``L_feat`` (full-forecast MSE).
-        base_loss: Current ``L_base`` (baseline-forecast MSE).
+        beta: Scheduled KL weight for this epoch.
+        feat_loss: Current ``L_feat`` (full-forecast reconstruction).
+        base_loss: Current ``L_base`` (baseline-forecast reconstruction).
         kld_loss: Current ``L_KL`` (mean KL).
+        step_seconds: Decimated step duration in seconds (for the lag second-axis).
+        delta_up_seconds: Fixed preprocessing UP shift in seconds.
 
     Returns:
-        The constructed :class:`matplotlib.figure.Figure`. The caller is
-        responsible for saving and closing it.
+        The constructed :class:`matplotlib.figure.Figure`. The caller is responsible for saving and
+        closing it.
     """
-    # Legacy kwargs kept in the signature for back-compat — no longer used.
-    del forecast_channels, forecast_anchor_frac
-
     i = sample_idx
 
     # ---- Numpy views of the relevant tensors for this sample ---------------
@@ -458,9 +430,9 @@ def _build_diagnostic_figure(
     eps = 1e-12
     attn_entropy_per_step = -(mean_alpha * np.log(mean_alpha + eps)).sum(axis=-1)
 
-    # Full-sequence forecast reductions on mu_full only (the residual-
-    # corrected prediction). The baseline mu_base is tracked in the loss via
-    # lambda_base but is not drawn here to keep the layout compact.
+    # Full-sequence forecast reductions on mu_full only (the residual-corrected prediction). The
+    # baseline mu_base is tracked in the loss via lambda_base but is not drawn here to keep the
+    # layout compact.
     avg_full = _average_forecast_per_channel(mu_full_np, T, H_d, warmup)
     concat_full = _concat_single_forecasts(mu_full_np, T, H_d, warmup)
 
@@ -473,8 +445,8 @@ def _build_diagnostic_figure(
         assert fhr_raw is not None and up_raw is not None
         R = int(_np(fhr_raw[i]).ravel().shape[0])
     else:
-        # Fall back to the nominal 16× decimation so downstream math is
-        # still well-defined when the raw signal is missing from the batch.
+        # Fall back to the nominal 16× decimation so downstream math is still well-defined when the
+        # raw signal is missing from the batch.
         R = T * 16
     time_raw, time_dec, t_max = _time_axes(T, R, fs_raw=fs_raw)
 
@@ -483,10 +455,9 @@ def _build_diagnostic_figure(
     # ------------------------------------------------------------------
     apply_publication_style()
 
-    # One full-width axes per row. The two TE-lag panels and the two
-    # forecast panels are each their own row — no nested gridspecs — so that
-    # every main axes lives in column 0 of the top-level gridspec and ends
-    # up with exactly the same width.
+    # One full-width axes per row. The two TE-lag panels and the two forecast panels are each their
+    # own row — no nested gridspecs — so every main axes lives in column 0 of the top-level gridspec
+    # and ends up with exactly the same width.
     row_specs = []  # (name, height_ratio)
     if has_raw:
         row_specs.append(("raw", 0.9))
@@ -508,8 +479,8 @@ def _build_diagnostic_figure(
     total_height = sum(height_ratios) * 2.6
     fig = plt.figure(figsize=(14, total_height))
 
-    # 2-column gridspec: col 0 = main axes, col 1 = narrow cax. All rows
-    # share col 0, so the main axes widths are identical.
+    # 2-column gridspec: col 0 = main axes, col 1 = narrow cax. All rows share col 0, so the main
+    # axes widths are identical.
     gs = GridSpec(
         n_rows, 2, figure=fig,
         height_ratios=height_ratios,
@@ -529,9 +500,6 @@ def _build_diagnostic_figure(
         cbar = fig.colorbar(im, cax=cax)
         cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
         cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
-        # Cast to Any so matplotlib's ``Spine | None`` typing quirk (the
-        # ``Spine.set_*`` methods confuse pyright) doesn't produce false
-        # positives; the runtime behaviour is unchanged.
         outline: Any = cbar.outline
         if outline is not None:
             outline.set_linewidth(0.6)
@@ -591,7 +559,7 @@ def _build_diagnostic_figure(
         extent=[0.0, t_max, fhr_stack.shape[0] - 0.5, -0.5],
     )
     ax.set_title(
-        "FHR features \u2014 scattering (rows 0-42)  |  phase (rows 43-86)",
+        "FHR features — scattering (rows 0-42)  |  phase (rows 43-86)",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
@@ -607,11 +575,11 @@ def _build_diagnostic_figure(
     if up_st_np is not None:
         up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (101, T)
         title_up = (
-            "UP features \u2014 scattering (rows 0-42)  |  self-phase (rows 43-100)"
+            "UP features — scattering (rows 0-42)  |  self-phase (rows 43-100)"
         )
     else:
         up_stack, up_sep = up_ph_np.T, None                               # (58, T)
-        title_up = "UP features \u2014 self-phase only (up_st absent)"
+        title_up = "UP features — self-phase only (up_st absent)"
     vabs_up = _safe_vabs(up_stack)
     im = ax.imshow(
         up_stack, aspect="auto", cmap="bwr", origin="upper",
@@ -654,10 +622,10 @@ def _build_diagnostic_figure(
     )
     ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
     ax.set_yticks([d_z // 2, d_z + d_z // 2])
-    ax.set_yticklabels(["Posterior \u03bc", "Prior \u03bc\u2070"])
+    ax.set_yticklabels(["Posterior μ", "Prior μ⁰"])
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_title(
-        "Posterior vs Prior means (TEB residual = posterior \u2212 prior)",
+        "Posterior vs Prior means (TEB residual = posterior − prior)",
         fontsize=9, pad=6,
     )
     _style_heatmap_spines(ax)
@@ -676,16 +644,8 @@ def _build_diagnostic_figure(
         vmin=0.0, vmax=vmax_kld,
         extent=[0.0, t_max, -0.5, d_z - 0.5],
     )
-    # Under v2 the flat mu_post / logvar_post are law-of-total-variance mixture
-    # moments, so this closed-form per-dim KL is a moment-matched *proxy*: it no
-    # longer row-sums to ``kld_per_t`` (the exact decomposed $K_t = K^R + K^Z$
-    # shown in the Total-KL panel below). Annotate it so the two KL panels read
-    # as mutually consistent (S6-T01). v2 is detected by its decomposed KL key.
-    _kld_proxy = "kld_content" in outs
     ax.set_title(
-        f"KLD per latent dim (d_z={d_z} rows) \u2014 max={kld_max:.3f} nats"
-        + (" \u2014 moment-matched proxy (exact $K_t$ in Total-KL panel)"
-           if _kld_proxy else ""),
+        f"KLD per latent dim (d_z={d_z} rows) — max={kld_max:.3f} nats",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
@@ -735,12 +695,12 @@ def _build_diagnostic_figure(
         linewidth=0.9, alpha=0.9, label="argmax lag",
     )
     ax.set_title(
-        f"Lag attention \u2014 mean over {attn_np.shape[1]} heads "
+        f"Lag attention — mean over {attn_np.shape[1]} heads "
         f"(L={L} = 0..{L - 1})",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     _style_heatmap_spines(ax)
@@ -748,11 +708,10 @@ def _build_diagnostic_figure(
     _finalise_time_axis(ax)
 
     # ---- Rows: TE lag attribution — raw and column-normalised ------------
-    # Raw: colour range clipped to the 99th percentile so rare attention
-    # spikes don't black-out the rest. Column-normalised: each time step
-    # divided by its own max so the lag-selection pattern is visible even
-    # when the per-step KL is tiny. Columns with effectively zero KL are
-    # masked to NaN so imshow leaves them blank.
+    # Raw: colour range clipped to the 99th percentile so rare attention spikes don't black-out the
+    # rest. Column-normalised: each time step divided by its own max so the lag-selection pattern is
+    # visible even when the per-step KL is tiny. Columns with effectively zero KL are masked to NaN
+    # so imshow leaves them blank.
     te_map = te_lag_np.T                                             # (L, T)
     te_map = np.where(np.isfinite(te_map) & (te_map > 0.0), te_map, 0.0)
     te_global_max = float(te_map.max()) if te_map.size else 0.0
@@ -771,12 +730,12 @@ def _build_diagnostic_figure(
         vmin=0.0, vmax=vmax_te_p99,
     )
     ax.set_title(
-        "TE lag attribution (KL \u00d7 mean-\u03b1) \u2014 p99-clipped "
+        "TE lag attribution (KL × mean-α) — p99-clipped "
         f"(vmax={vmax_te_p99:.3e}, max={te_global_max:.3e})",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "KL weight")
@@ -785,33 +744,32 @@ def _build_diagnostic_figure(
     ax, cax = row_axes("te_lag_norm")
     col_max = te_map.max(axis=0, keepdims=True)                      # (1, T)
     col_threshold = max(1e-12, te_global_max * 1e-6)
-    valid_cols = col_max > col_threshold                             # (1, T)
+    valid_cols = col_max > col_threshold                            # (1, T)
     denom = np.where(valid_cols, col_max, 1.0)
-    te_norm = np.where(valid_cols, te_map / denom, np.nan)           # (L, T)
+    te_norm = np.where(valid_cols, te_map / denom, np.nan)          # (L, T)
     im = ax.imshow(
         te_norm, aspect="auto", cmap="viridis", origin="lower",
         extent=[0.0, t_max, -0.5, L - 0.5],
         vmin=0.0, vmax=1.0,
     )
     ax.set_title(
-        "TE lag attribution \u2014 column-normalised "
+        "TE lag attribution — column-normalised "
         "(dominant lag per time step, independent of KL magnitude)",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("Lag \u2113 (0 = current)", fontsize=8)
+    ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
     _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Column-norm")
     _finalise_time_axis(ax)
 
     # ---- Rows: Forecast — avg and single, imshow over all channels ------
-    # Both rows draw μ_full across all 87 feature channels (fhr_st on rows
-    # 0..42, fhr_ph on rows 43..86, with a white separator line between
-    # them). The first row is the overlap-averaged forecast, the second is
-    # the stride-H_d single-window concatenation. A shared symmetric colour
-    # range is used across both rows so the two imshows are directly
-    # comparable, driven by the larger of the two finite ranges.
+    # Both rows draw μ_full across all 87 feature channels (fhr_st on rows 0..42, fhr_ph on rows
+    # 43..86, with a white separator line between them). The first row is the overlap-averaged
+    # forecast, the second is the stride-H_d single-window concatenation. A shared symmetric colour
+    # range is used across both rows so the two imshows are directly comparable, driven by the
+    # larger of the two finite ranges.
     forecast_stack = np.concatenate(
         [avg_full[np.isfinite(avg_full)], concat_full[np.isfinite(concat_full)]]
     )
@@ -831,7 +789,7 @@ def _build_diagnostic_figure(
     )
     ax.axhline(st_ch - 0.5, color="white", linewidth=1.2, linestyle="--")
     ax.set_title(
-        "Average forecast \u03bc_full \u2014 overlap-averaged per-anchor "
+        "Average forecast μ_full — overlap-averaged per-anchor "
         f"horizons (all {C_y} channels, H_d={H_d})",
         fontsize=9, pad=6,
     )
@@ -850,7 +808,7 @@ def _build_diagnostic_figure(
     )
     ax.axhline(st_ch - 0.5, color="white", linewidth=1.2, linestyle="--")
     ax.set_title(
-        "Single-horizon forecast \u03bc_full \u2014 non-overlapping "
+        "Single-horizon forecast μ_full — non-overlapping "
         f"concat (stride H_d={H_d}, all {C_y} channels)",
         fontsize=9, pad=6,
     )
@@ -862,10 +820,129 @@ def _build_diagnostic_figure(
 
     # ---- Super title -------------------------------------------------------
     fig.suptitle(
-        f"LagAttn v1 diagnostics  \u2014  epoch {epoch}  sample {sample_idx}  "
-        f"guid {guid}  \u2022  \u03b2={beta:.4g}  "
+        f"LagAttn diagnostics  —  epoch {epoch}  sample {sample_idx}  "
+        f"guid {guid}  •  β={beta:.4g}  "
         f"L_feat={feat_loss:.4f}  L_base={base_loss:.4f}  KL={kld_loss:.4e}",
         fontsize=11, color=COLOR_PURPLE, y=1.002,
+    )
+    return fig
+
+
+def _build_companion_figure(
+    *,
+    outs: Dict[str, Any],
+    y_st: torch.Tensor,
+    y_ph: torch.Tensor,
+    kld_shuffled_per_t: torch.Tensor,
+    sample_idx: int,
+    epoch: int,
+    guid: str,
+    warmup: int,
+    horizon: int,
+    forecast_channels: Tuple[int, ...],
+    forecast_anchor_frac: float,
+    kld_active_frac: float,
+    kld_shuffled_scalar: float,
+) -> Any:
+    r"""Build the three-panel companion figure for one sample (G4, G6, G7).
+
+    Args:
+        outs: Forward-output dict from the model's ``forward``.
+        y_st: FHR scattering features ``(B, T, 43)``.
+        y_ph: FHR phase features ``(B, T, 44)``.
+        kld_shuffled_per_t: ``(B, T)`` per-step KL under the deranged source, from
+            :func:`~teb_vae.lag_attn.nets.controls.perm_kl_from_forward`.
+        sample_idx: Index into the batch.
+        epoch: Current training epoch.
+        guid: GUID string for the figure title.
+        warmup: Warmup period ``T_w``.
+        horizon: Decimated forecast horizon ``H_d``.
+        forecast_channels: Channels shown in the predictive-band row.
+        forecast_anchor_frac: Fractional position of the drawn anchor.
+        kld_active_frac: Fraction of latent dims above the activity threshold.
+        kld_shuffled_scalar: The support-masked mean shuffled KL, for the ratio annotation.
+
+    Returns:
+        The constructed :class:`matplotlib.figure.Figure`.
+    """
+    s = sample_idx
+    T = int(y_st.shape[1])
+    anchor = int(np.clip(round(forecast_anchor_frac * T), warmup, max(T - horizon - 1, warmup)))
+
+    y_plus = _future_target(y_st, y_ph, horizon)  # (B, T-H, H, C)
+    mu_full = _np(outs["mu_full"][s, anchor])  # (H, C)
+    sigma_full = np.exp(0.5 * _np(outs["logvar_full"][s, anchor]))
+    truth = _np(y_plus[s, anchor])  # (H, C)
+
+    fig = plt.figure(figsize=(16, 9))
+    grid = fig.add_gridspec(2, len(forecast_channels), height_ratios=[1.0, 1.0], hspace=0.45)
+
+    # --- Row 1: learned predictive band, one panel per channel (G7) ----------
+    steps = np.arange(1, horizon + 1)
+    for i, ch in enumerate(forecast_channels):
+        ax = fig.add_subplot(grid[0, i])
+        if ch >= mu_full.shape[-1]:
+            ax.set_visible(False)
+            continue
+        mu_c, sd_c, y_c = mu_full[:, ch], sigma_full[:, ch], truth[:, ch]
+        ax.fill_between(steps, mu_c - 2 * sd_c, mu_c + 2 * sd_c, color=COLOR_BLUE,
+                        alpha=0.22, linewidth=0, label=r"$\mu \pm 2\sigma$")
+        ax.plot(steps, mu_c, color=COLOR_BLUE, linewidth=1.6, label=r"$\mu_{\mathrm{full}}$")
+        ax.plot(steps, y_c, color=COLOR_VERMILLION, linewidth=1.4, linestyle="--",
+                label=r"$Y^{+}$")
+        cover = float(np.mean(np.abs(y_c - mu_c) <= 2 * sd_c))
+        ax.set_title(f"channel {ch} @ anchor {anchor}  (2$\\sigma$ coverage {cover:.0%})")
+        ax.set_xlabel("horizon step $h$")
+        ax.set_ylabel("feature value" if i == 0 else "")
+        style_axes(ax)
+        if i == 0:
+            ax.legend(loc="best", frameon=False, fontsize=8)
+
+    # --- Row 2 left: per-dim raw KL + active threshold (G4) ------------------
+    ax = fig.add_subplot(grid[1, 0])
+    mu_p, lv_p = outs["mu_prior"][s], outs["logvar_prior"][s]
+    mu_q, lv_q = outs["mu_post"][s], outs["logvar_post"][s]
+    per_dim = _np(
+        0.5 * (lv_p - lv_q + (lv_q.exp() + (mu_q - mu_p).pow(2)) / lv_p.exp() - 1.0)
+    )[warmup:].mean(axis=0)
+    dims = np.arange(per_dim.shape[0])
+    colors = [COLOR_ORANGE if v > _KLD_ACTIVE_EPS else COLOR_GRAY for v in per_dim]
+    ax.bar(dims, per_dim, color=colors, edgecolor=COLOR_BLACK, linewidth=0.4)
+    ax.axhline(_KLD_ACTIVE_EPS, color=COLOR_VERMILLION, linestyle=":", linewidth=1.2,
+               label=rf"active threshold $\epsilon={_KLD_ACTIVE_EPS}$")
+    ax.set_yscale("symlog", linthresh=_KLD_ACTIVE_EPS)
+    ax.set_title(f"raw per-dim KL   (active fraction {kld_active_frac:.2f})")
+    ax.set_xlabel("latent dim $j$")
+    ax.set_ylabel(r"$\overline{K_j}$ [nats]")
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    style_axes(ax)
+
+    # --- Row 2 rest: K_true vs K_shuffled per step (G6) -----------------------
+    ax = fig.add_subplot(grid[1, 1:])
+    k_true = _np(outs["kld_per_t"][s])
+    k_shuf = _np(kld_shuffled_per_t[s])
+    t_axis = np.arange(T)
+    ax.plot(t_axis, k_true, color=COLOR_BLUE, linewidth=1.4, label=r"$K_{\mathrm{true}}$")
+    ax.plot(t_axis, k_shuf, color=COLOR_VERMILLION, linewidth=1.2, alpha=0.85,
+            label=r"$K_{\mathrm{shuffled}}$ (deranged UP)")
+    ax.axvspan(0, warmup, color=COLOR_GRAY, alpha=0.15, linewidth=0)
+    ax.axvspan(max(T - horizon, 0), T, color=COLOR_GRAY, alpha=0.15, linewidth=0)
+    in_support = k_true[warmup:max(T - horizon, warmup)]
+    k_true_mean = float(np.mean(in_support)) if in_support.size else 0.0
+    ratio = kld_shuffled_scalar / max(k_true_mean, 1e-8)
+    ax.set_title(
+        "source-permutation control  "
+        rf"($K_{{\mathrm{{shuffled}}}}/K_{{\mathrm{{raw}}}} \approx {ratio:.2f}$; "
+        "shaded = outside the training KL support)"
+    )
+    ax.set_xlabel("time step $t$")
+    ax.set_ylabel(r"$K_t$ [nats]")
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    style_axes(ax)
+
+    fig.suptitle(
+        f"SeqVaeLagAttn diagnostics — epoch {epoch}, sample {sample_idx}, guid {guid[:16]}",
+        fontsize=12,
     )
     return fig
 
@@ -875,41 +952,40 @@ def _build_diagnostic_figure(
 # =============================================================================
 
 
-class LagAttnV1PlotCallback(Callback):
-    """Periodic diagnostic-plot callback for :class:`SeqVaeLagAttnV1` training.
+class LagAttnPlotCallback(Callback):
+    r"""Periodic diagnostic-plot callback for the lag-attention VAE.
 
-    Runs on ``on_validation_epoch_end``, every ``plot_frequency`` epochs,
-    generating ``num_examples`` figures per trigger (rank-0 only).
+    Runs on ``on_validation_epoch_end``, every ``plot_frequency`` epochs, generating
+    ``num_examples`` figure pairs (the twelve-row diagnostic plus the companion) per trigger,
+    rank-0 only. Each saved file is routed to MLflow through the shared rank-0 artifact seam when a
+    logger is attached.
 
     Args:
-        output_dir: Directory under which to write ``lag_attn_v1_diagnostics``.
+        output_dir: Directory under which to write the ``subdir`` folder.
         plot_frequency: Plot every N validation epochs.
         num_examples: Number of samples from the first validation batch.
         file_format: Output image format (``"pdf"`` or ``"png"``).
-        mlflow_logger: Optional MLflow logger — each saved file is registered
-            as a run artifact when set.
-        forecast_channels: Kept for backward compatibility with existing
-            config files. The new forecast rows are full imshows over every
-            feature channel, so this value is no longer used.
-        forecast_anchor_frac: Kept for backward compatibility with existing
-            config files. No longer used — the new forecast rows show the
-            full-sequence averaged/concatenated maps instead of an anchor
-            single-shot.
+        mlflow_logger: Optional MLflow logger — each saved file is registered as a run artifact
+            when set.
+        forecast_channels: Channels shown in the companion's predictive-band row.
+        forecast_anchor_frac: Fractional position of the anchor whose forecast window is drawn.
+        subdir: Name of the output subdirectory created under ``output_dir``.
     """
 
     def __init__(
         self,
         output_dir: Union[str, Path],
-        plot_frequency: int = 5,
+        plot_frequency: int = 1,
         num_examples: int = 2,
         *,
         file_format: str = "pdf",
         mlflow_logger: Any = None,
         forecast_channels: Tuple[int, ...] = (0, 43, 80),
         forecast_anchor_frac: float = 0.6,
+        subdir: str = "lag_attn_diagnostics",
     ) -> None:
         super().__init__()
-        self.output_dir = Path(output_dir) / "lag_attn_v1_diagnostics"
+        self.output_dir = Path(output_dir) / subdir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plot_frequency = max(1, int(plot_frequency))
         self.num_examples = max(1, int(num_examples))
@@ -921,9 +997,8 @@ class LagAttnV1PlotCallback(Callback):
     # ------------------------------------------------------------------
     # Lightning hook
     # ------------------------------------------------------------------
-
     def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
-        """Generate diagnostic plots at the configured frequency."""
+        """Generate diagnostic plots at the configured frequency (rank-0 only)."""
         if not getattr(trainer, "is_global_zero", True):
             return
         if getattr(trainer, "sanity_checking", False):
@@ -934,137 +1009,119 @@ class LagAttnV1PlotCallback(Callback):
 
         batch = _first_validation_batch(trainer)
         if batch is None:
-            logger.debug("LagAttnV1PlotCallback: no validation batch available.")
+            logger.debug("LagAttnPlotCallback: no validation batch available.")
             return
 
         try:
-            self._generate_plots(batch, pl_module, epoch)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"LagAttnV1PlotCallback failed: {exc}")
+            self._generate_plots(trainer, batch, pl_module, epoch)
+        except Exception as exc:  # noqa: BLE001 — plotting must never crash training
+            # A builder or save that raises mid-way leaves its figure open; on a repeatable error
+            # those would accumulate in Matplotlib's global registry epoch after epoch. Drop any
+            # that survived. The success path already closes every figure via ``save_figure``.
+            plt.close("all")
+            logger.warning(f"LagAttnPlotCallback failed: {exc}")
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-
-    def _log_artifact(self, path: Path) -> None:
-        """Register ``path`` as an MLflow artifact if a logger is attached."""
-        if self._mlflow_logger is None:
-            return
-        try:
-            self._mlflow_logger.experiment.log_artifact(
-                self._mlflow_logger.run_id, str(path),
-            )
-        except Exception as exc:  # noqa: BLE001 — plotting must never crash training
-            logger.debug(f"MLflow artifact logging failed: {exc}")
-
     @torch.no_grad()
-    def _generate_plots(self, batch: Any, pl_module: Any, epoch: int) -> None:
-        """Run the model forward + loss on the batch and build figures."""
-        # Move the batch to the PL module's device using Lightning's own helper.
-        batch = pl_module.transfer_batch_to_device(
-            batch, pl_module.device, dataloader_idx=0,
-        )
+    def _generate_plots(self, trainer, batch: Any, pl_module: Any, epoch: int) -> None:
+        """One forward pass; write the diagnostic figure and the companion per sample.
+
+        Reuses the task's own ``_build_source_stream`` and ``_resolve_beta`` so the figures reflect
+        exactly the objective the run is optimising: the plotted $\\beta$ is the *scheduled* value
+        for the epoch, and the reported loss terms use the run's own likelihood, observation-noise
+        and free-bits settings rather than the model defaults.
+        """
+        batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
         model = pl_module.orig_model
-        use_up_st = bool(getattr(model, "use_up_st", False))
 
-        y_st = batch.fhr_st
-        y_ph = batch.fhr_ph
+        y_st, y_ph = batch.fhr_st, batch.fhr_ph
         up_ph = _get_field(batch, "up_ph")
-        if up_ph is None:
-            logger.warning(
-                "LagAttnV1PlotCallback: batch has no `up_ph` field; skipping "
-                "this epoch's plots. Make sure 'up_ph' is in "
-                "dataset_kwargs.load_fields."
-            )
-            return
-
-        up_st: Optional[torch.Tensor] = None
-        if use_up_st:
-            up_st_field = _get_field(batch, "up_st")
-            if up_st_field is None:
-                logger.warning(
-                    "LagAttnV1PlotCallback: use_up_st=True but batch has no "
-                    "`up_st` field; skipping this epoch's plots."
-                )
-                return
-            up_st = up_st_field
-            # Narrow both Optional[Tensor] locals for the type checker before
-            # torch.cat — pyright loses the prior None-checks across the
-            # ``use_up_st`` branch and otherwise flags the list literal.
-            assert up_st is not None and up_ph is not None
-            u_stream = torch.cat([up_st, up_ph], dim=-1)
-        else:
-            u_stream = up_ph
-
-        fhr_raw = _get_field(batch, "fhr")
-        up_raw = _get_field(batch, "up")
+        up_st = _get_field(batch, "up_st") if bool(getattr(model, "use_up_st", False)) else None
+        # Delegates the up_st/up_ph channel assembly and its clear error messages to the task.
+        u_stream = pl_module._build_source_stream(batch)
 
         was_training = pl_module.training
         pl_module.eval()
         try:
             outs = model(y_st, y_ph, u_stream)
-            # Current-beta lookup: prefer hparam, fall back to 0.0
-            beta = float(pl_module.hparams.get("kld_beta", 0.0))
-            lambda_full = float(pl_module.hparams.get("lambda_full", 1.0))
-            lambda_base = float(pl_module.hparams.get("lambda_base", 0.5))
+
+            # The scheduled beta for this epoch, not the raw hparam: the two differ under any beta
+            # schedule, and the raw hparam is only the schedule's start value.
+            beta = float(pl_module._resolve_beta(pl_module.current_epoch))
+            hparams = pl_module.hparams
             loss_dict = model.compute_loss(
                 forward_outputs=outs,
                 y_st=y_st,
                 y_ph=y_ph,
                 beta=beta,
-                lambda_full=lambda_full,
-                lambda_base=lambda_base,
+                lambda_full=float(hparams.get("lambda_full", 1.0)),
+                lambda_base=float(hparams.get("lambda_base", 0.5)),
+                likelihood=str(hparams.get("likelihood", "mse")),
+                sigma_obs=hparams.get("sigma_obs", 1.0),
+                free_bits=float(hparams.get("free_bits", 0.0)),
+                detach_baseline_in_full=bool(hparams.get("detach_baseline_in_full", False)),
+                lambda_lag=float(hparams.get("lambda_lag", 0.0)),
             )
-            feat_loss = float(loss_dict["feat_loss"].detach().cpu())
-            base_loss = float(loss_dict["base_loss"].detach().cpu())
-            kld_loss = float(loss_dict["kld_loss"].detach().cpu())
+            feat_loss = float(loss_dict["feat_loss"])
+            base_loss = float(loss_dict["base_loss"])
+            kld_loss = float(loss_dict["kld_loss"])
+            kld_active_frac = float(loss_dict.get("kld_active_frac", 0.0))
 
             warmup = int(getattr(model, "warmup_period", 0))
             horizon = int(getattr(model, "horizon", 30))
-            # Physical-time lag axis (arch spec section 27). Read guarded so a v1
-            # model (which lacks these attrs) still renders the lag panels.
             step_seconds = float(getattr(model, "step_seconds", 4.0))
             delta_up_seconds = float(getattr(model, "delta_up_seconds", 0.0))
+
+            # Negative control, reusing the states the forward above already computed -- no
+            # re-encode. Only meaningful when the batch is large enough to derange.
+            perm_out = None
+            if y_st.shape[0] >= 2:
+                gen = torch.Generator().manual_seed(epoch)
+                perm_out = controls.perm_kl_from_forward(model, outs, generator=gen)
 
             num_samples = min(self.num_examples, y_st.shape[0])
             for s in range(num_samples):
                 guid = _guid_of(batch, s)
                 fig = _build_diagnostic_figure(
-                    outs=outs,
-                    y_st=y_st,
-                    y_ph=y_ph,
-                    up_st=up_st,
-                    up_ph=up_ph,
-                    fhr_raw=fhr_raw,
-                    up_raw=up_raw,
-                    sample_idx=s,
-                    epoch=epoch,
-                    guid=guid,
-                    warmup=warmup,
-                    horizon=horizon,
+                    outs=outs, y_st=y_st, y_ph=y_ph, up_st=up_st, up_ph=up_ph,
+                    fhr_raw=_get_field(batch, "fhr"), up_raw=_get_field(batch, "up"),
+                    sample_idx=s, epoch=epoch, guid=guid, warmup=warmup, horizon=horizon,
+                    beta=beta, feat_loss=feat_loss, base_loss=base_loss, kld_loss=kld_loss,
+                    step_seconds=step_seconds, delta_up_seconds=delta_up_seconds,
+                )
+                path = self.output_dir / (
+                    f"lag_attn_epoch{epoch:04d}_sample{s}_{guid[:16]}.{self.file_format}"
+                )
+                save_figure(fig, path, dpi=SAVE_DPI, close=True)
+                log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
+
+                if perm_out is None:
+                    continue
+                companion = _build_companion_figure(
+                    outs=outs, y_st=y_st, y_ph=y_ph,
+                    kld_shuffled_per_t=perm_out["kld_shuffled_per_t"],
+                    sample_idx=s, epoch=epoch, guid=guid, warmup=warmup, horizon=horizon,
                     forecast_channels=self.forecast_channels,
                     forecast_anchor_frac=self.forecast_anchor_frac,
-                    beta=beta,
-                    feat_loss=feat_loss,
-                    base_loss=base_loss,
-                    kld_loss=kld_loss,
-                    step_seconds=step_seconds,
-                    delta_up_seconds=delta_up_seconds,
+                    kld_active_frac=kld_active_frac,
+                    kld_shuffled_scalar=float(perm_out["kld_shuffled"]),
                 )
-                fname = (
-                    f"lag_attn_v1_epoch{epoch:04d}_sample{s}_"
-                    f"{guid[:16]}.{self.file_format}"
+                path = self.output_dir / (
+                    f"lag_attn_epoch{epoch:04d}_sample{s}_{guid[:16]}"
+                    f"_control.{self.file_format}"
                 )
-                save_path = self.output_dir / fname
-                save_figure(fig, save_path, dpi=SAVE_DPI, close=True)
-                self._log_artifact(save_path)
+                save_figure(companion, path, dpi=SAVE_DPI, close=True)
+                log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
+
             logger.info(
-                f"LagAttnV1PlotCallback: saved {num_samples} figure(s) "
-                f"for epoch {epoch} to {self.output_dir}"
+                f"LagAttnPlotCallback: saved {num_samples} figure pair(s) for epoch "
+                f"{epoch} to {self.output_dir}"
             )
         finally:
             if was_training:
                 pl_module.train()
 
 
-__all__ = ["LagAttnV1PlotCallback"]
+__all__ = ["LagAttnPlotCallback"]

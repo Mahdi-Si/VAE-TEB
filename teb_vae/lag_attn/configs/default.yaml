@@ -14,7 +14,7 @@
 #     `hdf5_dataset/calculate_dataset_stats.py`, with a matching `trim_minutes`.
 #
 # Run from the repo root:
-#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3.yaml
+#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/default.yaml
 #
 # Ablation toggle: `use_up_st: true` -> source stream = concat(up_st, up_ph), c_u=101.
 # `use_up_st: false` -> source stream = up_ph alone, c_u=58. The constructor rejects a mismatch.

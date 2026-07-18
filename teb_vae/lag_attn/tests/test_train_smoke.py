@@ -32,7 +32,7 @@ from train.graph_models_utils import check_model_class, load_checkpoint_strict
 from train.test_utils import FakeMLflowLogger
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_TINY = _REPO_ROOT / "teb_vae" / "lag_attn" / "configs" / "v3_tiny.yaml"
+_TINY = _REPO_ROOT / "teb_vae" / "lag_attn" / "configs" / "tiny.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -255,3 +255,52 @@ def test_the_final_model_would_be_registered(fit):
     run_logging = next(cb for cb in callbacks if isinstance(cb, MLflowRunLoggingCallback))
 
     assert run_logging._log_model is True
+
+
+def test_the_default_tiny_run_writes_no_diagnostic_plots(fit):
+    """``lag_attn_plotting.enabled: false`` in the tiny config: the plotter is never constructed."""
+    driver, _ = fit
+
+    assert not (Path(driver.train_results_dir) / "lag_attn_diagnostics").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Diagnostic plotting, enabled
+# --------------------------------------------------------------------------------------
+def test_enabling_the_plotter_writes_both_figures_into_the_run_directory(tmp_path_factory):
+    """A short fit with plotting on leaves the diagnostic and its companion on disk.
+
+    A separate fit from the module-scoped one, because it must run with a different config -- the
+    tiny config ships the plotter off so the rest of the suite stays fast.
+    """
+    tmp_path = tmp_path_factory.mktemp("smoke_plots")
+    config = load_config(str(_TINY))
+    config["general_config"]["folders_config"]["out_dir_base"] = str(tmp_path)
+    config["general_config"]["epochs"] = 2
+    dataset = config["dataset_config"]
+    for key in ("vae_train_datasets", "vae_test_datasets"):
+        dataset[key] = [str(_REPO_ROOT / path) for path in dataset[key]]
+    dataset["stat_path"] = str(_REPO_ROOT / dataset["stat_path"])
+    config["advanced_config"]["trainer"]["profiler"] = None
+    # Turn the plotter on. One example keeps it to a single figure pair per validation epoch.
+    config["advanced_config"]["callbacks"]["lag_attn_plotting"] = {
+        "enabled": True,
+        "plot_frequency": 1,
+        "num_examples": 1,
+    }
+
+    config_path = tmp_path / "resolved.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    from train.data_module import GraphDataModule
+
+    driver = LagAttnTrainer(config_file_path=str(config_path))
+    driver.setup_config()
+    data_module = GraphDataModule(driver.config)
+    driver.create_model()
+    driver.train_model(data_module.train_dataloader(), data_module.val_dataloader())
+
+    plot_dir = Path(driver.train_results_dir) / "lag_attn_diagnostics"
+    names = [p.name for p in plot_dir.glob("*.pdf")]
+    assert any(not name.endswith("_control.pdf") for name in names), "no diagnostic figure written"
+    assert any(name.endswith("_control.pdf") for name in names), "no companion figure written"

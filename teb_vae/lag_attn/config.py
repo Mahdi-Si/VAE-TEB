@@ -5,8 +5,8 @@ key, ``base:``, naming a parent config whose contents this one inherits:
 
 .. code-block:: yaml
 
-    # v3_tiny.yaml
-    base: v3.yaml
+    # tiny.yaml
+    base: default.yaml
     general_config:
       epochs: 1          # only what actually differs
 
@@ -128,7 +128,7 @@ def resolve_config_file(config_path: str, out_dir: str) -> str:
 
     ``GraphModelBase.__init__`` takes a config **path**, not a dict, so a merged config
     reaches it only via a file. The written document is also the run's provenance record --
-    every inherited value is explicit in it, which a config that only says ``base: v3.yaml``
+    every inherited value is explicit in it, which a config that only says ``base: default.yaml``
     is not.
 
     Args:

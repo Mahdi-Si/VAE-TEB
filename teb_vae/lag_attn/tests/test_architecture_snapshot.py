@@ -42,8 +42,8 @@ _FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
 # (variant, fixture filename, the kwargs the rebuild is built with).
 _VARIANTS = [
-    ("prod", "v3_architecture.json", PROD_KWARGS),
-    ("shipped", "v3_architecture_shipped.json", SHIPPED_KWARGS),
+    ("prod", "architecture.json", PROD_KWARGS),
+    ("shipped", "architecture_shipped.json", SHIPPED_KWARGS),
 ]
 
 # Every intentional difference between the original and the rebuild. Each entry says what
@@ -140,9 +140,9 @@ def test_the_two_geometries_are_actually_different(capsys):
     a duplicate of the first, and the production-only structure would go back to being untested
     with no test turning red.
     """
-    prod = json.loads((_FIXTURE_DIR / "v3_architecture.json").read_text(encoding="utf-8"))
+    prod = json.loads((_FIXTURE_DIR / "architecture.json").read_text(encoding="utf-8"))
     shipped = json.loads(
-        (_FIXTURE_DIR / "v3_architecture_shipped.json").read_text(encoding="utf-8")
+        (_FIXTURE_DIR / "architecture_shipped.json").read_text(encoding="utf-8")
     )
 
     assert shipped["total_params"] > prod["total_params"]

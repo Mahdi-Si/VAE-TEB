@@ -1,6 +1,6 @@
 # Local smoke variant: one epoch, one device, a committed 4-sample shard.
 #
-# Everything not named here is inherited from v3.yaml -- including the settings that are
+# Everything not named here is inherited from default.yaml -- including the settings that are
 # correctness requirements rather than preferences (causal_norm, compile: false, the spike
 # breaker's ema_floor), which is the point: a variant that re-stated them could drift from them.
 #
@@ -8,8 +8,8 @@
 # config, because the committed shard carries the real field shapes; only the model's widths shrink
 # so a CPU forward is fast. That keeps this a test of the actual data contract.
 #
-#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/v3_tiny.yaml
-base: v3.yaml
+#   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/tiny.yaml
+base: default.yaml
 
 general_config:
   tag: lag_attn_tiny

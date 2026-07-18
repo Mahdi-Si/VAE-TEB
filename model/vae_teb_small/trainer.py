@@ -4,8 +4,8 @@ from train.callbacks import (
     LossPlotCallback,
     HyperparameterLoggingCallback,
     MetricsLoggingCallback,
-    PlottingCallBack
 )
+from utils.seqvae_plot_callbacks import PlottingCallBack
 
 from loguru import logger
 

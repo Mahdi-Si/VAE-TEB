@@ -21,7 +21,7 @@ import yaml
 from teb_vae.lag_attn import trainer as trainer_module
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_TINY = _REPO_ROOT / "teb_vae" / "lag_attn" / "configs" / "v3_tiny.yaml"
+_TINY = _REPO_ROOT / "teb_vae" / "lag_attn" / "configs" / "tiny.yaml"
 
 
 @pytest.fixture
@@ -93,7 +93,7 @@ def test_the_base_chain_is_resolved_before_the_driver_reads_it(monkeypatch, tmp_
 
     assert seen["path"] != str(_TINY), "the driver was handed the unresolved file"
     assert "base" not in seen["config"]
-    # Inherited from v3.yaml, and absent from v3_tiny.yaml itself.
+    # Inherited from default.yaml, and absent from tiny.yaml itself.
     assert seen["config"]["model_config"]["VAE_model"]["causal_norm"] is True
     assert seen["config"]["general_config"]["epochs"] == 1  # ...with the variant's override intact
 

@@ -70,7 +70,7 @@ PROD_KWARGS = dict(
     freeze_unused_attn_proj=True,  # only bites when head_structured_latent=True
 )
 
-# What config_lag_attn_v3.yaml actually ships, at the tiny geometry.
+# What configs/default.yaml actually ships, at the tiny geometry.
 #
 # Each of these four gates real modules that PROD_KWARGS never builds: the per-head posterior,
 # the FiLM generator, a third refine block, and two extra conv blocks per encoder. Testing only
