@@ -15,29 +15,35 @@ class DatasetStatsCalculator:
     """
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
 
-    Updated for the v3 coefficient selection (J=11, Q=4, T=16) with ``up_ph``
-    promoted to a first-class field:
+    Every channel count is read from the HDF5 itself (``shape[0]`` of each
+    field), and the per-channel transform is chosen by field name, so this
+    class adapts automatically whenever the coefficient selection changes.
+    The counts quoted below are the current values at the production geometry
+    (J=11, Q=4, T=16, shape=5280), not assumptions baked into the code.
 
-    - FHR scattering: 43 coefficients (first order, channel 0 regular,
-      others log-transformed).
-    - FHR phase: 44 selected coefficients (all asinh-transformed).
-    - FHR-UP cross-phase (``fhr_up_ph``): cross-channel coefficients only
-      (no longer concatenated with the UP self-phase block). All
-      asinh-transformed. Cross-phase: two-band selection with UP cap 0.05 Hz.
-    - UP scattering (``up_st``, 43 channels): channel 0 regular, channels
-      1-42 log-transformed (same structure as ``fhr_st``).
-    - UP self-phase (``up_ph``): standalone field with its own per-channel
-      asinh stats. Autocorr + harmonic-2 + harmonic-3 (``min_freq=0.002``).
+    - FHR scattering (``fhr_st``, 43): channel 0 regular, channels 1-42
+      log-transformed. Stored unmasked — the width is fixed by the filter bank.
+    - FHR self-phase (``fhr_ph``, 66): all asinh-transformed. Selected on the
+      0.008-1.0 Hz band crossed with harmonic steps k in {4, 6, 8}.
+    - FHR-UP cross-phase (``fhr_up_ph``, 79): cross-channel coefficients only
+      (not concatenated with the UP self-phase block). All asinh-transformed.
+      Two-band selection with the UP cap at 0.05 Hz.
+    - UP scattering (``up_st``, 43): channel 0 regular, channels 1-42
+      log-transformed (same structure as ``fhr_st``).
+    - UP self-phase (``up_ph``, 15): standalone field with its own per-channel
+      asinh stats. Selected on the 0.008-0.05 Hz contraction band crossed with
+      harmonic steps k in {4, 6, 8}.
+
+    See ``hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md`` for the selection
+    rationale.
 
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
 
-    Transformation strategy:
-    - fhr_st (43 channels): channel 0 regular, channels 1-42 log-transformed
-    - up_st (43 channels): channel 0 regular, channels 1-42 log-transformed (same as fhr_st)
-    - fhr_ph (44 channels): all asinh-transformed for phase stability
-    - fhr_up_ph (n_cross channels): all asinh-transformed for cross-channel phase
-    - up_ph (n_up_phase channels): all asinh-transformed for UP self-phase stability
+    Note:
+        Statistics must be recomputed whenever the channel selection changes —
+        a stats file keyed to the old widths will broadcast-fail against the
+        new data in ``normalize_tensor_data``.
     """
 
     def __init__(self, trim_minutes: Optional[float] = None, device: Optional[str] = None):
@@ -62,14 +68,16 @@ class DatasetStatsCalculator:
 
         # Define transformations for optimal coefficient selection
         # LOG normalization for scattering coefficients (except order 0)
+        # These configs are channel-count agnostic: 'all_except_0' and 'all'
+        # are expanded against the width read from each HDF5 field.
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude channel 0)
+            'fhr_st': 'all_except_0',  # every scattering coefficient except order 0
             'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
 
         # ASINH normalization for phase coefficients (better for phase data)
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',     # All 44 selected FHR phase coefficients
+            'fhr_ph': 'all',     # FHR self-phase harmonics
             'fhr_up_ph': 'all',  # FHR↔UP cross-channel phase coefficients
             'up_ph': 'all',      # UP self-phase harmonics
         }
@@ -411,11 +419,11 @@ class DatasetStatsCalculator:
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
             f.attrs['description'] = (
-                'Statistics for v3 selection: 43 FHR scattering (log), '
-                '43 UP scattering (log), 44 FHR phase (asinh), '
-                'cross-channel phase fhr_up_ph (asinh), '
-                'UP self-phase up_ph (asinh). up_ph is now a first-class field '
-                'with its own per-channel stats.'
+                'Per-channel statistics. fhr_st / up_st: channel 0 regular, '
+                'the rest log(x + eps). fhr_ph / fhr_up_ph / up_ph: all '
+                'asinh(x). Widths are taken from the source HDF5, so this file '
+                'is only valid for datasets built with the same channel '
+                'selection.'
             )
             
             # Save statistics for each field
@@ -543,10 +551,10 @@ class DatasetStatsCalculator:
         print("\n" + "="*60)
         print("DATASET STATISTICS SUMMARY")
         print("="*60)
-        print("Note: Two-band v2 coefficient selection with specialized transformations:")
-        print("- FHR scattering (43 ch): channel 0 regular, others log(x + 1e-6)")
-        print("- FHR phase (44 ch): all asinh(x) transformed")
-        print("- FHR-UP cross-phase + UP self-phase: all asinh(x) transformed")
+        print("Per-field transformations (channel counts read from the data):")
+        print("- fhr_st / up_st: channel 0 regular, others log(x + 1e-6)")
+        print("- fhr_ph: all asinh(x) transformed")
+        print("- fhr_up_ph / up_ph: all asinh(x) transformed")
         
         for field, field_stats in stats.items():
             print(f"\n{field.upper()}:")
@@ -980,9 +988,14 @@ if __name__ == "__main__":
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            'description': 'Statistics for v3 selection (J=11, Q=4, T=16): scattering + phase + cross-phase + UP self-phase'
+            'description': 'Statistics (J=11, Q=4, T=16): FHR/UP scattering + FHR self-phase + cross-phase + UP self-phase'
         },
-        trim_minutes=2,
+        # Must match the loader's trim_minutes, because statistics are
+        # accumulated over the trimmed region only. Production uses 1.0
+        # (240 raw samples / 15 decimated steps per end -> 300-step,
+        # 20-minute model input). A mismatch normalises with the wrong
+        # mean/std and only produces a warnings.warn at load time.
+        trim_minutes=1.0,
         device=device,
         plot_histograms=True,  # Enable histogram plotting
         max_histogram_samples=50000

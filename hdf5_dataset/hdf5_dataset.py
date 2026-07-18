@@ -151,10 +151,19 @@ def create_initial_hdf5(
     """
     Create a new HDF5 file with empty, resizable datasets for signal storage.
 
-    Updated for v3 coefficient selection (J=11, Q=4, T=16):
+    DEPRECATED — this is the pre-split legacy schema, used only by
+    ``create_hdf5_dataset.py`` and the synthetic fixtures in
+    ``guid_hdf5_dataset.py``. It concatenates the UP self-phase into
+    ``fhr_up_ph`` and emits no ``up_ph`` dataset, and it hardcodes the
+    ``fhr_ph`` width at 44. The current writer is
+    ``new_pipeline/create_new_pipeline.py``, which sizes ``fhr_ph`` and
+    ``up_ph`` from their selections and records per-channel provenance in
+    ``sel_*`` attrs.
+
+    Legacy layout (J=11, Q=4, T=16):
         - FHR scattering: 43 coefficients (first order only)
-        - FHR phase: 44 coefficients (optimal selection)
-        - FHR-UP cross-phase + UP self-phase: dynamic count (computed by compute_scattering_masks)
+        - FHR phase: 44 coefficients (legacy selector)
+        - FHR-UP cross-phase + UP self-phase: dynamic count, concatenated
         - UP scattering (optional): 43 coefficients (first order only)
 
     Datasets created (first dim unlimited):
@@ -396,17 +405,22 @@ class CombinedHDF5Dataset(Dataset):
     """
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
 
-    With Scattering transform (J=11, Q=4, T=16) and v3 coefficient selection:
+    With Scattering transform (J=11, Q=4, T=16). Channel counts below are the
+    current production values; nothing in this class depends on them — widths
+    come from the data and the stats file, and the per-channel transform is
+    chosen by field name:
     - FHR scattering (``fhr_st``): 43 coefficients (first order)
-    - FHR phase (``fhr_ph``): 44 selected coefficients
-    - FHR↔UP cross-channel phase (``fhr_up_ph``): ``n_cross`` coefficients
+    - FHR self-phase (``fhr_ph``): 66 selected coefficients
+    - FHR↔UP cross-channel phase (``fhr_up_ph``): 79 coefficients
     - UP scattering (``up_st``): 43 coefficients (first order)
-    - UP self-phase (``up_ph``): ``n_up_phase`` coefficients
+    - UP self-phase (``up_ph``): 15 selected coefficients
 
     All multi-channel scattering/phase fields are first-class HDF5 datasets
     with their own per-channel statistics. ``up_ph`` is no longer virtually
     sliced from ``fhr_up_ph`` — each of the five fields flows through the
-    same normalisation code path.
+    same normalisation code path. The two self-phase fields also carry
+    ``sel_*`` attrs describing which wavelet pair each channel came from; see
+    ``PHASE_HARMONIC_CHANNEL_SELECTION.md``.
 
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
@@ -489,11 +503,11 @@ class CombinedHDF5Dataset(Dataset):
         # says (see `_load_normalization_stats`); what is kept here is a
         # sensible fallback used only when no stats file is provided.
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # 42 of 43 scattering coefficients (exclude order 0)
+            'fhr_st': 'all_except_0',  # every scattering coefficient except order 0
             'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
         }
         self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',     # All 44 selected FHR phase coefficients
+            'fhr_ph': 'all',     # FHR self-phase harmonics
             'fhr_up_ph': 'all',  # FHR↔UP cross-channel phase coefficients
             'up_ph': 'all',      # UP self-phase harmonics (first-class field)
         }

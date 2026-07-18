@@ -715,7 +715,12 @@ def _run_smoke_test() -> None:
     hdf5_path = os.path.join(tmpdir, "test.hdf5")
     print(f"Temp dir: {tmpdir}")
 
-    # Parameters matching current dataset (v3, 22-min segments).
+    # LEGACY pre-split layout (22-min segments): fhr_up_ph holds cross-phase
+    # concatenated with UP self-phase and there is no up_ph dataset. The
+    # current pipeline (new_pipeline/create_new_pipeline.py) produces
+    # fhr_ph=66 / fhr_up_ph=79 / up_ph=15 instead, so this fixture does NOT
+    # exercise the shape CombinedHDF5Dataset sees in production — in
+    # particular nothing here covers the up_ph path.
     len_signal = 5280
     len_sequence = 330
     n_cross_phase_channels = 137

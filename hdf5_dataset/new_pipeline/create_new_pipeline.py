@@ -127,6 +127,109 @@ N_DURATION_BINS = 3  # quantile tertiles: short / medium / long labour
 
 NO_BG_SUBGROUPS = {"healthy_no_bg_cs", "healthy_no_bg_no_cs"}
 
+# ---------------------------------------------------------------------------
+# Phase-harmonic channel selection
+# ---------------------------------------------------------------------------
+# Full rationale, measurements and rejected alternatives:
+#   hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md
+#
+# A phase-harmonic coefficient pairs two wavelets $(\psi_i, \psi_j)$ and is
+# large only when their phases are locked at ratio $p = \xi_j / \xi_i$. The
+# selection is therefore a band in true Hz (which frequencies may participate)
+# crossed with a set of harmonic steps $k$ on the $p = 2^{k/Q}$ power grid
+# (which phase relationships to keep).
+SCATTERING_Q = 4
+SAMPLING_RATE_HZ = 4.0
+
+# Band edges $(\min, \max)$ in true Hz, inclusive at both ends.
+#
+# Lower edge 0.008 Hz is the analysis-window floor (doc §3.1): a Gabor wavelet
+# at $\xi$ has time envelope $\sigma_t = 1/(2\pi\sigma)$, and below ~0.008 Hz
+# its $\pm 3\sigma_t$ support exceeds the 1200 s trimmed segment, so the
+# coefficient measures reflection padding rather than signal.
+#
+# FHR upper edge 1.0 Hz is the beat-series Nyquist limit (doc §3.2): FHR is a
+# rate derived from beat detection at 110-160 bpm and resampled to 4 Hz, so
+# content above ~1 Hz is interpolation artifact, not physiology.
+#
+# UP upper edge 0.05 Hz is the contraction band (doc §3.2, §7): a contraction
+# is a 45-90 s pulse recurring every 2-3 min, so essentially all uterine energy
+# is below 0.05 Hz. This matches the cap already used by the cross-channel
+# selector `select_fhr_up_cross_coefficients_v2`.
+FHR_PHASE_BAND_HZ = (0.008, 1.00)
+UP_PHASE_BAND_HZ = (0.008, 0.05)
+
+# Harmonic steps $k$, giving powers $p = 2^{k/Q}$: k=4 -> p=2 (one octave,
+# waveform asymmetry), k=6 -> p=2.83, k=8 -> p=4 (two octaves, coupling between
+# well-separated rhythms).
+#
+# $k = 0$ (the diagonal, $p = 1$) is excluded: it reduces to
+# $C_{i,i,1} = \phi * |z_i|^2$, which is near-collinear with the
+# $\phi * |z_i|$ scattering channel already stored alongside it (doc §5,
+# median $|r| = 0.967$ measured on synthetic FHR). The phase block earns its
+# place through the off-diagonal terms, which encode what the scattering
+# modulus discards.
+#
+# Yields fhr_ph = 66 and up_ph = 15 at the production geometry.
+# To retain the diagonal, set this to (0, 4, 6, 8) -> fhr_ph = 94, up_ph = 26.
+PHASE_HARMONIC_K_STEPS = (4, 6, 8)
+
+# Relative tolerance on the power match $|p - 2^{k/Q}| < \text{tol} \cdot 2^{k/Q}$.
+# Relative rather than absolute because the power grid is geometric: a fixed
+# absolute window is far too permissive at large $p$ and too strict at small
+# $p$. (An absolute tolerance is why the legacy selector's
+# `harmonic_ratios=[2, 3]` silently matches zero harmonic-3 coefficients —
+# $\log_2 3 = 1.585$ needs $k = 6.34$, which is off-grid. See doc §3.3.)
+PHASE_POWER_REL_TOL = 0.05
+
+
+@dataclass(frozen=True)
+class PhaseChannelSelection:
+    r"""A phase-harmonic channel selection together with its provenance.
+
+    Bundles the boolean pair mask with per-channel metadata describing every
+    selected coefficient, so the width written into the HDF5 and the metadata
+    describing those channels cannot drift apart. Previously the ``fhr_ph``
+    width was a literal ``44`` in :func:`create_initial_hdf5` while the data
+    written was ``phase_mask.sum()`` wide — this type makes that desync
+    unrepresentable.
+
+    All arrays are ordered identically to the channel axis of the stored
+    coefficient block, i.e. the order produced by boolean-indexing the
+    phase-pair axis with :attr:`mask` (ascending pair index).
+
+    Index convention follows
+    ``KymatioPhaseScattering1D._build_coupling_indices``, which keeps pairs
+    satisfying $\xi_i \le \xi_j$. So ``i`` is the **lower**-frequency filter of
+    the pair, ``j`` the higher, and ``power`` $= \xi_j / \xi_i \ge 1$. This
+    matches the ``freq_hz_secondary`` $= \xi_i$ / ``freq_hz_primary`` $= \xi_j$
+    convention used in ``band_partition.py``.
+
+    Attributes:
+        mask: Bool tensor over the phase-pair axis, shape ``(n_pairs,)``.
+        i: Lower-frequency filter index per channel, shape ``(n_channels,)``.
+        j: Higher-frequency filter index per channel, shape ``(n_channels,)``.
+        xi_i_hz: $\xi_i$ in Hz, shape ``(n_channels,)``.
+        xi_j_hz: $\xi_j$ in Hz, shape ``(n_channels,)``.
+        power: Harmonic ratio $p = \xi_j / \xi_i$, shape ``(n_channels,)``.
+        band_hz: The $(\min, \max)$ Hz band the mask was built from.
+        k_steps: The harmonic steps $k$ the mask was built from.
+    """
+
+    mask: torch.Tensor
+    i: np.ndarray
+    j: np.ndarray
+    xi_i_hz: np.ndarray
+    xi_j_hz: np.ndarray
+    power: np.ndarray
+    band_hz: Tuple[float, float]
+    k_steps: Tuple[int, ...]
+
+    @property
+    def n_channels(self) -> int:
+        """Number of selected channels — the width of the stored block."""
+        return int(self.i.shape[0])
+
 
 # ============================================================================
 # Verbosity helpers
@@ -300,33 +403,73 @@ def deduplicate_segments(
 # ============================================================================
 # HDF5 I/O
 # ============================================================================
+def _write_selection_attrs(dataset, selection: PhaseChannelSelection) -> None:
+    r"""Attach per-channel selection provenance to a coefficient dataset.
+
+    Lets any consumer recover what each channel means — which wavelet pair, at
+    which frequencies, at which harmonic ratio — without re-deriving the
+    selection from the filter bank.
+
+    Note:
+        These attrs are currently **write-only**: nothing in the repository
+        reads them yet. They exist so the re-derivation in
+        ``band_partition.py`` (which calls the legacy
+        ``select_fhr_phase_coefficients`` and would build a 44-channel map
+        against 66-channel data) can be replaced by reading provenance off the
+        dataset. That migration is outstanding and lives outside
+        ``hdf5_dataset/``; until it lands, the stale-channel-map problem is
+        still live — it just fails loudly on the count mismatch rather than
+        silently.
+
+    Per-channel arrays are ordered to match the channel axis. ``sel_i`` is the
+    **lower**-frequency filter of the pair and ``sel_j`` the higher, so
+    ``sel_power`` $= \xi_j / \xi_i \ge 1$.
+
+    Args:
+        dataset: Target HDF5 dataset (``fhr_ph`` or ``up_ph``).
+        selection: The selection the dataset was sized from.
+    """
+    dataset.attrs["sel_i"] = selection.i
+    dataset.attrs["sel_j"] = selection.j
+    dataset.attrs["sel_xi_i_hz"] = selection.xi_i_hz
+    dataset.attrs["sel_xi_j_hz"] = selection.xi_j_hz
+    dataset.attrs["sel_power"] = selection.power
+    dataset.attrs["sel_band_hz"] = np.asarray(selection.band_hz, dtype=np.float32)
+    dataset.attrs["sel_k_steps"] = np.asarray(selection.k_steps, dtype=np.int32)
+
+
 def create_initial_hdf5(
     path: str,
     len_signal: int,
-    n_channels: int,
-    len_sequence: int = 300,
-    n_cross_phase_channels: int = 62,
+    len_sequence: int,
+    fhr_ph_selection: PhaseChannelSelection,
+    n_cross_phase_channels: int,
     n_up_st_channels: int = 0,
-    n_up_ph_channels: int = 0,
+    up_ph_selection: Optional[PhaseChannelSelection] = None,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
-    Includes v3 scattering layout and the ``second_stage_onset`` field.
-    ``fhr_up_ph`` now contains only the FHR↔UP cross-channel phase
-    coefficients; the UP self-phase harmonics live in a separate
-    first-class ``up_ph`` dataset with their own per-channel asinh stats.
+    ``fhr_up_ph`` contains only the FHR↔UP cross-channel phase coefficients;
+    the UP self-phase harmonics live in a separate first-class ``up_ph``
+    dataset with their own per-channel asinh stats.
+
+    The two self-phase blocks are sized from their selections rather than from
+    a channel count, so the stored width and the mask applied at write time
+    cannot disagree. Both also carry ``sel_*`` provenance attrs describing
+    every channel (see :func:`_write_selection_attrs`).
 
     Args:
         path: Output HDF5 file path (overwrites if exists).
         len_signal: Raw signal length (e.g. 5760).
-        n_channels: Total phase + cross-phase channels.
+        fhr_ph_selection: Selection for ``fhr_ph``; supplies its width and
+            provenance attrs.
         len_sequence: Sequence dimension length.
         n_cross_phase_channels: Channels for ``fhr_up_ph`` (pure cross-phase,
             equals ``masks["n_cross"]``).
         n_up_st_channels: Number of UP scattering channels (0 = do not create
             ``up_st`` dataset).
-        n_up_ph_channels: Number of UP self-phase harmonic channels (0 = do not
-            create ``up_ph`` dataset). Equals ``masks["n_up_phase"]``.
+        up_ph_selection: Selection for ``up_ph``; ``None`` = do not create the
+            ``up_ph`` dataset.
     """
     try:
         os.remove(path)
@@ -352,6 +495,9 @@ def create_initial_hdf5(
             chunks=(chunk_n, len_signal),
             compression="lzf",
         )
+        # fhr_st width is fixed by the filter bank, not by a selection: one
+        # order-0 channel plus 42 first-order wavelets at J=11, Q=4. The whole
+        # scattering block is stored unmasked.
         h5f.create_dataset(
             "fhr_st",
             shape=(0, 43, len_sequence),
@@ -360,14 +506,19 @@ def create_initial_hdf5(
             chunks=(chunk_n, 43, len_sequence),
             compression="lzf",
         )
-        h5f.create_dataset(
+        # fhr_ph width comes from the selection, never a literal. A hardcoded
+        # width here is what previously pinned this dataset to 44 channels
+        # regardless of the mask actually applied at write time.
+        n_fhr_ph = fhr_ph_selection.n_channels
+        fhr_ph_ds = h5f.create_dataset(
             "fhr_ph",
-            shape=(0, 44, len_sequence),
-            maxshape=(None, 44, len_sequence),
+            shape=(0, n_fhr_ph, len_sequence),
+            maxshape=(None, n_fhr_ph, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, 44, len_sequence),
+            chunks=(chunk_n, n_fhr_ph, len_sequence),
             compression="lzf",
         )
+        _write_selection_attrs(fhr_ph_ds, fhr_ph_selection)
         h5f.create_dataset(
             "fhr_up_ph",
             shape=(0, n_cross_phase_channels, len_sequence),
@@ -388,15 +539,17 @@ def create_initial_hdf5(
             )
         # up_ph: UP self-phase harmonics (optional). First-class field with its
         # own per-channel asinh stats — no longer concatenated into fhr_up_ph.
-        if n_up_ph_channels > 0:
-            h5f.create_dataset(
+        if up_ph_selection is not None:
+            n_up_ph = up_ph_selection.n_channels
+            up_ph_ds = h5f.create_dataset(
                 "up_ph",
-                shape=(0, n_up_ph_channels, len_sequence),
-                maxshape=(None, n_up_ph_channels, len_sequence),
+                shape=(0, n_up_ph, len_sequence),
+                maxshape=(None, n_up_ph, len_sequence),
                 dtype="f4",
-                chunks=(chunk_n, n_up_ph_channels, len_sequence),
+                chunks=(chunk_n, n_up_ph, len_sequence),
                 compression="lzf",
             )
+            _write_selection_attrs(up_ph_ds, up_ph_selection)
         h5f.create_dataset(
             "target",
             shape=(0, len_sequence),
@@ -535,14 +688,152 @@ def append_samples_batch(
 
 
 # ============================================================================
-# Scattering masks (v3)
+# Scattering masks
 # ============================================================================
+def _phase_pair_mask(
+    model: KymatioPhaseScattering1D,
+    min_hz: float,
+    max_hz: Optional[float],
+    k_steps: Tuple[int, ...],
+    fs: Optional[float] = None,
+    Q: Optional[int] = None,
+    tol: Optional[float] = None,
+) -> torch.Tensor:
+    r"""Build a phase-pair mask over a true-Hz band and the $2^{k/Q}$ power grid.
+
+    A pair $(i, j)$ is kept when both centre frequencies lie inside
+    ``[min_hz, max_hz]`` and its power $p = \xi_j / \xi_i$ falls within a
+    *relative* tolerance of $2^{k/Q}$ for some $k$ in ``k_steps``.
+
+    ``model.center_freqs`` holds kymatio's normalised $\xi$ in cycles per
+    sample, so the Hz thresholds are divided by ``fs`` here.
+
+    This deliberately does **not** call
+    ``KymatioPhaseScattering1D.select_fhr_phase_coefficients``: that selector
+    omits the $f_s$ conversion (its ``min_freq`` behaves as a raw $\xi$
+    threshold, so the nominal 0.006 Hz is really 0.024 Hz), has no upper band
+    edge, and uses an absolute power tolerance. Correcting it in place would
+    silently change behaviour at its four other call sites
+    (``create_hdf5_dataset.py``, ``scattering_adapter.py``,
+    ``band_partition.py``), so the selection is rebuilt from the filter bank
+    here instead.
+
+    Because pairs always satisfy $\xi_i \le \xi_j$, requiring both endpoints in
+    band is equivalent to $\xi_i \ge$ ``min_hz`` and $\xi_j \le$ ``max_hz`` —
+    the predicate form used in PHASE_HARMONIC_CHANNEL_SELECTION.md §10.
+
+    Args:
+        model: Constructed transform, supplying ``center_freqs``, ``i_idx``,
+            ``j_idx`` and ``powers``.
+        min_hz: Inclusive lower band edge in Hz.
+        max_hz: Inclusive upper band edge in Hz; ``None`` means unbounded.
+        k_steps: Harmonic steps $k$ to admit.
+        fs: Sampling rate in Hz; ``None`` reads ``SAMPLING_RATE_HZ``.
+        Q: Wavelets per octave, setting the power-grid spacing; ``None`` reads
+            ``SCATTERING_Q``.
+        tol: Relative tolerance on the power match; ``None`` reads
+            ``PHASE_POWER_REL_TOL``.
+
+    Returns:
+        Bool tensor of shape ``(n_pairs,)``, ``True`` for selected pairs.
+    """
+    # Resolved here rather than bound as default arguments, which Python
+    # evaluates once at import: that would make these three constants
+    # un-overridable at runtime while PHASE_HARMONIC_K_STEPS (read at call
+    # time in compute_scattering_masks) stayed patchable — an inconsistency
+    # that silently produces a selection nobody asked for.
+    fs = SAMPLING_RATE_HZ if fs is None else fs
+    Q = SCATTERING_Q if Q is None else Q
+    tol = PHASE_POWER_REL_TOL if tol is None else tol
+
+    cf = model.center_freqs
+    hi = (max_hz / fs) if max_hz is not None else float("inf")
+    in_band = (cf >= min_hz / fs) & (cf <= hi)
+    # Both endpoints of the pair must sit inside the band.
+    pair_ok = in_band[model.i_idx] & in_band[model.j_idx]
+
+    mask = torch.zeros_like(pair_ok)
+    for k in k_steps:
+        target = 2.0 ** (k / Q)
+        # Relative tolerance: the grid is geometric, so a fixed absolute
+        # window would be far too permissive at the large-$p$ end.
+        mask |= pair_ok & (torch.abs(model.powers - target) < tol * target)
+    return mask
+
+
+def _build_phase_selection(
+    model: KymatioPhaseScattering1D,
+    band_hz: Tuple[float, float],
+    k_steps: Tuple[int, ...],
+    fs: Optional[float] = None,
+    label: str = "phase",
+) -> PhaseChannelSelection:
+    r"""Build a phase mask and its per-channel metadata in one pass.
+
+    Args:
+        model: Constructed transform.
+        band_hz: $(\min, \max)$ band edges in Hz.
+        k_steps: Harmonic steps $k$ to admit.
+        fs: Sampling rate in Hz, used to express the metadata in Hz; ``None``
+            reads ``SAMPLING_RATE_HZ``.
+        label: Field name used in the empty-selection error message.
+
+    Returns:
+        The selection, with metadata ordered to match the stored channel axis.
+
+    Raises:
+        ValueError: If the band and $k$-steps admit no pair at all.
+    """
+    fs = SAMPLING_RATE_HZ if fs is None else fs
+    mask = _phase_pair_mask(model, band_hz[0], band_hz[1], k_steps, fs=fs)
+
+    # An empty selection is always a misconfiguration, and it fails badly if
+    # allowed through: a zero-width HDF5 dataset makes h5py reject the chunk
+    # shape with "All chunk dimensions must be positive", naming neither the
+    # field nor the band. Catch it here, where the band is in scope.
+    if not bool(mask.any()):
+        raise ValueError(
+            f"Phase selection for '{label}' is empty: the band "
+            f"{band_hz} Hz with k_steps={k_steps} matches no wavelet pair. "
+            f"The band must span at least the widest harmonic step "
+            f"(k={max(k_steps)} needs a factor of {2.0 ** (max(k_steps) / SCATTERING_Q):.2f} "
+            f"between its edges)."
+        )
+
+    # Boolean indexing preserves ascending pair order, which is exactly the
+    # order the coefficient block is sliced with at write time — so these
+    # arrays line up channel-for-channel with the stored data.
+    i = model.i_idx[mask].cpu().numpy().astype(np.int32)
+    j = model.j_idx[mask].cpu().numpy().astype(np.int32)
+    cf = model.center_freqs.cpu().numpy()
+
+    return PhaseChannelSelection(
+        mask=mask,
+        i=i,
+        j=j,
+        xi_i_hz=(cf[i] * fs).astype(np.float32),
+        xi_j_hz=(cf[j] * fs).astype(np.float32),
+        power=model.powers[mask].cpu().numpy().astype(np.float32),
+        band_hz=band_hz,
+        k_steps=k_steps,
+    )
+
+
 def compute_scattering_masks(
     signal_length: int, scattering_T: int = 16, device=None
 ) -> Dict[str, Any]:
-    """Compute v3 coefficient selection masks once.
+    r"""Compute every coefficient selection once, up front.
 
-    v3: UP cap raised to 0.05 Hz in both bands, UP self-phase added.
+    The two self-phase blocks (``fhr_ph``, ``up_ph``) are selected by true-Hz
+    band crossed with the $2^{k/Q}$ harmonic grid — see the constants at the
+    top of this module and PHASE_HARMONIC_CHANNEL_SELECTION.md for the
+    rationale. The cross-channel block (``fhr_up_ph``) is unchanged: it still
+    uses the two-band selector, whose $k = 0$ term is a genuine UP-to-FHR
+    coupling rather than the redundant self-energy diagonal.
+
+    At the production geometry ($J=11$, $Q=4$, $T=16$, ``shape=5280``,
+    $f_s = 4$ Hz) this yields ``fhr_ph`` = 66, ``fhr_up_ph`` = 79 and
+    ``up_ph`` = 15.
 
     Args:
         signal_length: Raw signal length (e.g. 5280).
@@ -550,43 +841,129 @@ def compute_scattering_masks(
         device: Torch device.
 
     Returns:
-        Dict with masks, channel counts, and metadata.
+        Dict with two :class:`PhaseChannelSelection` objects
+        (``fhr_ph_selection``, ``up_ph_selection``), the cross-phase mask
+        (``cross_mask``), its channel count (``n_cross``) and its selector
+        metadata (``cross_metadata``).
     """
     tmp_model = KymatioPhaseScattering1D(
         J=11,
-        Q=4,
+        Q=SCATTERING_Q,
         T=scattering_T,
         shape=signal_length,
         device=device,
         tukey_alpha=None,
         max_order=1,
     )
-    phase_sel = tmp_model.select_fhr_phase_coefficients(min_freq=0.006)
-    phase_mask = phase_sel["optimal_mask"]
+    fhr_ph_selection = _build_phase_selection(
+        tmp_model, FHR_PHASE_BAND_HZ, PHASE_HARMONIC_K_STEPS, label="fhr_ph"
+    )
+    up_ph_selection = _build_phase_selection(
+        tmp_model, UP_PHASE_BAND_HZ, PHASE_HARMONIC_K_STEPS, label="up_ph"
+    )
 
+    # fhr_up_ph is unchanged: still the two-band cross-channel selector with
+    # the UP cap at 0.05 Hz. Its i/j semantics differ from the self-phase
+    # blocks (UP filter vs FHR filter, not low vs high), so it is intentionally
+    # not wrapped in a PhaseChannelSelection.
     cross_sel = tmp_model.select_fhr_up_cross_coefficients_v2(
         band_a_up_max_hz=0.05, band_b_up_max_hz=0.05
     )
     cross_mask = cross_sel["cross_mask"]
 
-    up_phase_sel = tmp_model.select_fhr_phase_coefficients(min_freq=0.002)
-    up_phase_mask = up_phase_sel["optimal_mask"]
-
-    n_phase = int(phase_mask.sum().item())
-    n_cross = int(cross_mask.sum().item())
-    n_up_phase = int(up_phase_mask.sum().item())
-    n_combined_cross = n_cross + n_up_phase
-
     return {
-        "phase_mask": phase_mask,
+        "fhr_ph_selection": fhr_ph_selection,
+        "up_ph_selection": up_ph_selection,
         "cross_mask": cross_mask,
-        "up_phase_mask": up_phase_mask,
-        "n_phase": n_phase,
-        "n_cross": n_cross,
-        "n_up_phase": n_up_phase,
-        "n_combined_cross": n_combined_cross,
+        "n_cross": int(cross_mask.sum().item()),
         "cross_metadata": cross_sel.get("metadata", {}),
     }
+
+
+def _validate_geometry(
+    hdf5_path: str,
+    st_model: KymatioPhaseScattering1D,
+    phase_mask: torch.Tensor,
+    cross_mask: torch.Tensor,
+    up_phase_mask: torch.Tensor,
+) -> None:
+    """Fail fast on a geometry mismatch, before any transform work is done.
+
+    Two independent things can disagree, and both are silent-until-late
+    without this check:
+
+    1. **Pair axis.** The masks are built against the filter bank inside
+       :func:`compute_scattering_masks`; they are applied to the one built
+       here. If those banks differ (``J``, ``Q``, or ``shape``), the mask has
+       the wrong length and ``phase_corr[mask, :]`` raises ``IndexError``.
+       That raise lands in the per-record ``except Exception`` below, so
+       *every* record fails identically, the run reports success, and a full
+       set of empty HDF5 files ships as if validated.
+    2. **Stored widths.** Every dataset this writer fills must exist and be
+       exactly as wide as the block written into it. A dataset that is absent
+       is worse than one that is mis-sized: ``append_samples_batch`` skips
+       missing optional fields silently, so the coefficients are computed and
+       then dropped on the floor with no error and no warning.
+
+    All five coefficient blocks are required because this writer
+    unconditionally computes all five.
+
+    Args:
+        hdf5_path: The file about to be filled.
+        st_model: The transform whose output the masks will index.
+        phase_mask: FHR self-phase mask.
+        cross_mask: FHR-UP cross-phase mask.
+        up_phase_mask: UP self-phase mask.
+
+    Raises:
+        ValueError: On a pair-axis mismatch, a missing dataset, or a width
+            mismatch, naming the field and both numbers.
+    """
+    n_pairs = len(st_model.i_idx)
+    for field_name, mask in (
+        ("fhr_ph", phase_mask),
+        ("fhr_up_ph", cross_mask),
+        ("up_ph", up_phase_mask),
+    ):
+        if int(mask.shape[0]) != n_pairs:
+            raise ValueError(
+                f"Phase-pair axis mismatch for '{field_name}': the mask spans "
+                f"{int(mask.shape[0])} pairs but this transform produces "
+                f"{n_pairs}. The masks were built against a different filter "
+                f"bank — check that J, Q (SCATTERING_Q) and the signal length "
+                f"match between compute_scattering_masks and this writer."
+            )
+
+    # Scattering width is fixed by the filter bank: one order-0 channel plus
+    # one per first-order wavelet. Derived, not assumed, so a J/Q change is
+    # caught here instead of as an h5py broadcast error mid-run.
+    n_scattering = 1 + len(st_model.center_freqs)
+    expected_widths = {
+        "fhr_st": n_scattering,
+        "up_st": n_scattering,
+        "fhr_ph": int(phase_mask.sum().item()),
+        "fhr_up_ph": int(cross_mask.sum().item()),
+        "up_ph": int(up_phase_mask.sum().item()),
+    }
+    with h5py.File(hdf5_path, "r") as h5f:
+        for field_name, n_expected in expected_widths.items():
+            if field_name not in h5f:
+                raise ValueError(
+                    f"Dataset '{field_name}' is missing from {hdf5_path}, but "
+                    f"this writer computes it for every segment. It would be "
+                    f"silently discarded by append_samples_batch. Check that "
+                    f"create_initial_hdf5 was given n_up_st_channels and "
+                    f"up_ph_selection."
+                )
+            n_on_disk = int(h5f[field_name].shape[1])
+            if n_on_disk != n_expected:
+                raise ValueError(
+                    f"Channel-count mismatch for '{field_name}' in "
+                    f"{hdf5_path}: the dataset is {n_on_disk} channels wide "
+                    f"but {n_expected} channels will be written. The HDF5 was "
+                    f"created with a different selection or filter bank than "
+                    f"the one being applied."
+                )
 
 
 # ============================================================================
@@ -1626,14 +2003,19 @@ def create_hdf5_dataset_from_records_list(
     scattering_T = 16
     signal_length = int(base_block_size * 1.5)
 
+    # Q must match the bank the masks were built against in
+    # compute_scattering_masks; the pair-axis check below enforces that, but
+    # sharing the constant keeps the two from drifting in the first place.
     st_model = KymatioPhaseScattering1D(
-        J=11, Q=4, T=scattering_T, shape=signal_length,
+        J=11, Q=SCATTERING_Q, T=scattering_T, shape=signal_length,
         device=device, tukey_alpha=None, max_order=1,
     )
 
-    phase_mask = precomputed_masks["phase_mask"].to(device)
+    phase_mask = precomputed_masks["fhr_ph_selection"].mask.to(device)
     cross_mask = precomputed_masks["cross_mask"].to(device)
-    up_phase_mask = precomputed_masks["up_phase_mask"].to(device)
+    up_phase_mask = precomputed_masks["up_ph_selection"].mask.to(device)
+
+    _validate_geometry(hdf5_path, st_model, phase_mask, cross_mask, up_phase_mask)
 
     errors_list: List[str] = []
     guid_tracking: Optional[Dict[str, GuidTrackingEntry]] = (
@@ -1941,8 +2323,6 @@ def _build_hdf5_for_partition(
     masks: Dict[str, Any],
     labor_onset_map: Dict[str, float],
     second_stage_map: Dict[str, float],
-    n_combined_cross: int,
-    total_channels: int,
     sequence_length: int,
     run_guid_analysis: bool,
     scatter_batch_size: int,
@@ -1956,8 +2336,6 @@ def _build_hdf5_for_partition(
         masks: Scattering masks dict.
         labor_onset_map: GUID -> TLO seconds.
         second_stage_map: GUID -> second stage seconds.
-        n_combined_cross: Combined cross-phase channel count.
-        total_channels: Total channel count.
         sequence_length: Sequence dimension length.
         run_guid_analysis: Whether to run GUID analysis.
         scatter_batch_size: Scattering batch size.
@@ -1965,7 +2343,8 @@ def _build_hdf5_for_partition(
     """
     os.makedirs(part_dir, exist_ok=True)
     n_cross = int(masks["n_cross"])
-    n_up_phase = int(masks["n_up_phase"])
+    fhr_ph_selection = masks["fhr_ph_selection"]
+    up_ph_selection = masks["up_ph_selection"]
     for sg, records in subgroups.items():
         if not records:
             continue
@@ -1974,12 +2353,12 @@ def _build_hdf5_for_partition(
         create_initial_hdf5(
             path=hdf5_file,
             len_signal=SIGNAL_LENGTH,
-            n_channels=total_channels,
+            fhr_ph_selection=fhr_ph_selection,
             len_sequence=sequence_length,
             # fhr_up_ph now holds only the cross-channel phase coefficients.
             n_cross_phase_channels=n_cross,
             n_up_st_channels=43,
-            n_up_ph_channels=n_up_phase,
+            up_ph_selection=up_ph_selection,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -2041,11 +2420,21 @@ def create_new_pipeline(
     # Compute scattering masks once
     logger.info("Computing scattering masks (v3)...")
     masks = compute_scattering_masks(SIGNAL_LENGTH, scattering_T=16)
-    n_combined_cross = masks["n_combined_cross"]
-    total_channels = masks["n_phase"] + n_combined_cross
+    fhr_ph_sel = masks["fhr_ph_selection"]
+    up_ph_sel = masks["up_ph_selection"]
+    # Log the resolved layout and the active selection parameters: this is the
+    # operator's confirmation that the intended variant is running, and it
+    # surfaces c_y / c_u so a stale model config is caught before the run ends.
     logger.info(
-        f"v3 layout: {masks['n_phase']} phase + {masks['n_cross']} cross + "
-        f"{masks['n_up_phase']} UP self-phase = {total_channels} total"
+        f"Channel layout: fhr_st=43 + fhr_ph={fhr_ph_sel.n_channels} "
+        f"(c_y={43 + fhr_ph_sel.n_channels}), "
+        f"up_st=43 + up_ph={up_ph_sel.n_channels} "
+        f"(c_u={43 + up_ph_sel.n_channels}), "
+        f"fhr_up_ph={masks['n_cross']}"
+    )
+    logger.info(
+        f"Phase selection: k_steps={PHASE_HARMONIC_K_STEPS}, "
+        f"fhr_band={FHR_PHASE_BAND_HZ} Hz, up_band={UP_PHASE_BAND_HZ} Hz"
     )
 
     sequence_length = SIGNAL_LENGTH // 16
@@ -2055,8 +2444,6 @@ def create_new_pipeline(
         masks=masks,
         labor_onset_map=labor_onset_map,
         second_stage_map=second_stage_map,
-        n_combined_cross=n_combined_cross,
-        total_channels=total_channels,
         sequence_length=sequence_length,
         scatter_batch_size=scatter_batch_size,
         verbose=verbose,
@@ -2262,19 +2649,18 @@ def create_new_pipeline(
     ]
 
     pretrain_n_cross = int(masks["n_cross"])
-    pretrain_n_up_phase = int(masks["n_up_phase"])
     for fname, records, cs, bg in pretrain_sets:
         hdf5_file = os.path.join(pretrain_path, fname)
         logger.info(f"Creating {fname} ({len(records)} GUIDs)...")
         create_initial_hdf5(
             path=hdf5_file,
             len_signal=SIGNAL_LENGTH,
-            n_channels=total_channels,
+            fhr_ph_selection=fhr_ph_sel,
             len_sequence=sequence_length,
             # fhr_up_ph now holds only the cross-channel phase coefficients.
             n_cross_phase_channels=pretrain_n_cross,
             n_up_st_channels=43,
-            n_up_ph_channels=pretrain_n_up_phase,
+            up_ph_selection=up_ph_sel,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
