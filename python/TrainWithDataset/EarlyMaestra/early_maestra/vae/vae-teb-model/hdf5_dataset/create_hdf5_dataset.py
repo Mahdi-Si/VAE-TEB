@@ -1,3 +1,27 @@
+"""DEPRECATED legacy HDF5 writer.
+
+Superseded by ``hdf5_dataset/new_pipeline/create_new_pipeline.py``, which is
+the writer in current use. Retained only to rebuild pre-existing datasets.
+
+Two ways its output differs from the new pipeline's, both load-bearing:
+
+1. **Layout.** It concatenates the cross-channel phase and the UP self-phase
+   into a single ``fhr_up_ph`` block and emits no ``up_ph`` dataset. The new
+   pipeline stores ``fhr_up_ph`` (cross-phase only) and ``up_ph`` as separate
+   first-class fields with their own per-channel statistics.
+2. **Channel selection.** It still selects ``fhr_ph`` and ``up_ph`` through
+   ``select_fhr_phase_coefficients`` (44 and 58 channels), which compares its
+   ``min_freq`` argument against kymatio's normalised $\\xi$ without dividing
+   by $f_s$ — so the nominal 0.006 / 0.002 Hz floors are really 0.024 /
+   0.008 Hz. The new pipeline selects on true-Hz bands crossed with the
+   $2^{k/Q}$ harmonic grid (66 and 15 channels) and records per-channel
+   provenance in ``sel_*`` HDF5 attrs, which datasets from this writer lack.
+
+Datasets produced here are therefore **not** interchangeable with new-pipeline
+output. Do not extend this file; new channel-selection work belongs in
+``create_new_pipeline.py``. See ``hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md``.
+"""
+
 from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 import torch.utils.data
 import matplotlib
